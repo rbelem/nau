@@ -4,7 +4,7 @@
 
 Rust CLI tool. GPL v3 (`LICENSE`).
 
-Early stage — single initial commit, no code yet.
+Planning phase — 8-phase roadmap defined, no code yet.
 
 ## Quickstart (once `Cargo.toml` exists)
 
@@ -33,6 +33,14 @@ cargo fmt             # format
 - `cargo fmt` before committing.
 - Keep `clippy` clean — treat warnings as errors.
 - Conventional commits for commit messages.
+
+## Planning
+
+- `PROJECT.md` — project context, core value, constraints, key decisions
+- `REQUIREMENTS.md` — 17 v1 requirements with REQ-IDs
+- `ROADMAP.md` — 8 vertical MVP phases
+- `STATE.md` — project progress and decisions log
+- `config.json` — workflow preferences (interactive, fine granularity, inherit model)
 
 <!-- GSD:project-start source:PROJECT.md -->
 ## Project

@@ -9,8 +9,8 @@ See: `.planning/PROJECT.md` (updated 2026-05-16 after initialization)
 
 ## Current Phase
 
-**Phase:** None (initializing)
-**Status:** Pending
+**Phase:** 1 — Hello, shoot
+**Status:** Pending (next to execute)
 **Started:** —
 **Plan:** —
 
@@ -42,4 +42,4 @@ None currently.
 
 ---
 
-*Last updated: 2026-05-16 after initialization*
+*Last updated: 2026-05-16 after initialization audit*

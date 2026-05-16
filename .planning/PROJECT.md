@@ -16,14 +16,13 @@ Define any Snap package with a simple Lua file — no Snapcraft YAML needed. Pac
 
 ### Active
 
-- [ ] **REQ-CLI-01**: CLI accepts a Lua file input and optional output flags via `clap`
-- [ ] **REQ-LUA-01**: Embedded Lua (`mlua`) evaluates the config file with injected globals
-- [ ] **REQ-LUA-02**: Lua DSL supports table-based declarations (Neovim-style) for app metadata, permissions, apps
-- [ ] **REQ-LUA-03**: Lua DSL supports composable/functional patterns (Nix-inspired) — overrides, imports
-- [ ] **REQ-META-01**: Tool maps processed Lua values to Rust structs matching the Snap package format
-- [ ] **REQ-META-02**: Tool generates `meta/snap.yaml` from the struct data
-- [ ] **REQ-BUILD-01**: Tool assembles the snap directory structure and runs `mksquashfs` to produce `.snap`
-- [ ] **REQ-VALID-01**: Tool validates the Lua config and reports clear errors for missing/invalid fields
+17 v1 requirements across 5 categories, documented in [`REQUIREMENTS.md`](REQUIREMENTS.md):
+
+- **CLI** (4) — `shoot build shoot.lua`, `--file`, `--arch`, `--output`
+- **Lua DSL** (5) — mlua eval, Neovim-style tables, multi-output flakes, composable patterns, error messages
+- **Metadata** (3) — Rust structs for Snap format, YAML generation, multi-arch metadata
+- **Build** (3) — directory assembly, mksquashfs, multi-arch builds
+- **Validation** (2) — config validation, clear error guidance
 
 ### Out of Scope
 
@@ -37,6 +36,8 @@ Define any Snap package with a simple Lua file — no Snapcraft YAML needed. Pac
 - User maintains snaps today and hits the limits of YAML: no conditionals, loops, or composability
 - Looking for a Devbox-like experience: declare intent in config, tool handles the complexity
 - Nix (reproducibility, derivations) + Neovim (Lua tables as config) = design north star
+- CLI modeled after `nix build`: standard `shoot.lua` in current dir, `shoot build [output]` for specific outputs
+- Multi-output architecture: one `shoot.lua` can declare multiple snaps (different apps, different archs), like Nix flakes
 - The Snap format itself is well-understood: `meta/snap.yaml` layout, SquashFS packaging, slot/plug permissions
 - Rust is the right fit for a CLI that embeds a Lua runtime and does filesystem operations
 
@@ -57,10 +58,14 @@ Define any Snap package with a simple Lua file — no Snapcraft YAML needed. Pac
 | Nix + Neovim inspired DSL | Combines composability (Nix) with ergonomic Lua (Neovim) | — Pending |
 | Rust stable only | Avoids nightly churn, matches project convention | — Pending |
 | Single-snap v1, system images later | Manageable scope; system images add model assertions, gadget snaps | — Pending |
+| Nix flake CLI design | `shoot build` reads `shoot.lua` from current dir, like `nix build` reads `flake.nix` | — Pending |
+| Multi-output flake architecture | One `shoot.lua` declares multiple snaps (multiple outputs), like Nix flake outputs | — Pending |
+| Vertical MVP phase structure | Each phase delivers an end-to-end user capability, not horizontal layers | — Pending |
+| Interactive workflow mode | Manual approval at each step (YOLO disabled) | — Pending |
 
 ---
 
-*Last updated: 2026-05-16 after initialization*
+*Last updated: 2026-05-16 after initialization audit*
 
 ## Evolution
 
