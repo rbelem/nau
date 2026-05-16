@@ -68,28 +68,28 @@ Deferred to future release. Tracked but not in current roadmap.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CLI-01 | — | Pending |
-| CLI-02 | — | Pending |
-| CLI-03 | — | Pending |
-| CLI-04 | — | Pending |
-| LUA-01 | — | Pending |
-| LUA-02 | — | Pending |
-| LUA-03 | — | Pending |
-| LUA-04 | — | Pending |
-| LUA-05 | — | Pending |
-| META-01 | — | Pending |
-| META-02 | — | Pending |
-| META-03 | — | Pending |
-| BUILD-01 | — | Pending |
-| BUILD-02 | — | Pending |
-| BUILD-03 | — | Pending |
-| VAL-01 | — | Pending |
-| VAL-02 | — | Pending |
+| CLI-01 | Phase 1 | Pending |
+| CLI-02 | Phase 1/8 | Pending |
+| CLI-03 | Phase 1/6 | Pending |
+| CLI-04 | Phase 1 | Pending |
+| LUA-01 | Phase 1 | Pending |
+| LUA-02 | Phase 2 | Pending |
+| LUA-03 | Phase 8 | Pending |
+| LUA-04 | Phase 7 | Pending |
+| LUA-05 | Phase 2 | Pending |
+| META-01 | Phase 3 | Pending |
+| META-02 | Phase 4 | Pending |
+| META-03 | Phase 4/6 | Pending |
+| BUILD-01 | Phase 5 | Pending |
+| BUILD-02 | Phase 5 | Pending |
+| BUILD-03 | Phase 6 | Pending |
+| VAL-01 | Phase 2 | Pending |
+| VAL-02 | Phase 2 | Pending |
 
 **Coverage:**
 - v1 requirements: 17 total
-- Mapped to phases: 0
-- Unmapped: 17 ⚠️
+- Mapped to phases: 17
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-05-16*
