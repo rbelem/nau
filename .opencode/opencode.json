@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "read": {
+      "/home/rodrigo/Workspace/github.com/rbelem/shoot/.opencode/get-shit-done/*": "allow"
+    },
+    "external_directory": {
+      "/home/rodrigo/Workspace/github.com/rbelem/shoot/.opencode/get-shit-done/*": "allow"
+    }
+  }
+}
