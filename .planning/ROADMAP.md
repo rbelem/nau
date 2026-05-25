@@ -96,17 +96,16 @@
 
 ---
 
-## Phase 8: Multi-Output Flakes
-**Goal:** Declare multiple snaps in one `shoot.lua` and build specific outputs
+## Phase 8: Batch Builds & Output Naming
+**Goal:** Build all outputs from a multi-output `shoot.lua` with correct file naming
 **Mode:** mvp
 **Success Criteria:**
-1. Users declare multiple named outputs in the Lua DSL (flakes-style)
-2. `shoot build <output>` builds a specific output
-3. `shoot build` (no args) builds all outputs
-4. Outputs can share common module configs
-5. Tests: multi-output builds produce correct individual snaps
+1. `shoot build` (no args) builds all declared outputs in sequence
+2. Output files follow `[name]_[version]_[arch].snap` naming per output
+3. `--output` flag works for single-output builds, auto-names for batch builds
+4. Tests: batch build produces all correct `.snap` files
 
-**Requirements:** LUA-03, CLI-02
+**Requirements:** LUA-03 (designed in Phase 1), CLI-02
 
 ---
 
@@ -115,12 +114,12 @@
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | CLI-01 | Phase 1 | Pending |
-| CLI-02 | Phase 1/8 | Pending |
+| CLI-02 | Phase 1 | Pending |
 | CLI-03 | Phase 1/6 | Pending |
 | CLI-04 | Phase 1 | Pending |
 | LUA-01 | Phase 1 | Pending |
 | LUA-02 | Phase 2 | Pending |
-| LUA-03 | Phase 8 | Pending |
+| LUA-03 | Phase 1 | Pending |
 | LUA-04 | Phase 7 | Pending |
 | LUA-05 | Phase 2 | Pending |
 | META-01 | Phase 3 | Pending |
