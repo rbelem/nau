@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use clap::Parser;
-use shoot::cli::{Cli, Command};
+use shoot::cli::{Cli, Command, IndexCommand};
 use shoot::image::ImageDeclaration;
+use shoot::index::{IndexEntry, PackageIndex, StoreRef};
 use shoot::lock::{LockFile, SourceLockEntry};
 use shoot::snap::SourceSpec;
 
@@ -48,6 +49,8 @@ fn main() -> miette::Result<()> {
             source_date_epoch,
             lockfile_path,
         ),
+
+        Command::Index(sub) => cmd_index(sub),
     }
 }
 
@@ -62,12 +65,10 @@ fn cmd_build(
     source_date_epoch: Option<String>,
     lockfile_path: String,
 ) -> miette::Result<()> {
-    // Set SOURCE_DATE_EPOCH from CLI flag if provided
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
     }
 
-    // Load existing lockfile (if any)
     let lock_path = Path::new(&lockfile_path);
     let mut lockfile = LockFile::load(lock_path)?.unwrap_or_else(|| LockFile {
         version: 1,
@@ -75,13 +76,11 @@ fn cmd_build(
         snaps: HashMap::new(),
     });
 
-    // Evaluate the Lua config
     let all_outputs = shoot::lua::evaluate_file(&file)?;
 
     let stage_dir = std::path::Path::new(&stage);
     let output_dir = std::path::Path::new(&output);
 
-    // Filter to requested output name if specified
     let iter: Vec<(&String, &shoot::snap::SnapMeta)> = match &output_name {
         Some(name) => {
             let meta = all_outputs
@@ -101,7 +100,6 @@ fn cmd_build(
         for a in &archs {
             println!("  {}/{}:", name, a);
 
-            // For URL-only sources, check lockfile for a pinned hash
             if let Some(SourceSpec::Unverified(ref url)) = meta.source {
                 if lockfile.lookup_source(url).is_some() {
                     eprintln!("  ℹ using lockfile hash for {url}");
@@ -117,7 +115,6 @@ fn cmd_build(
         }
     }
 
-    // Update lockfile with observed source hashes
     let mut changed = false;
     for info in &all_source_info {
         if !lockfile.sources.contains_key(&info.url) {
@@ -163,12 +160,11 @@ fn cmd_image(
     source_date_epoch: Option<String>,
     lockfile_path: String,
 ) -> miette::Result<()> {
-    // Set SOURCE_DATE_EPOCH from CLI flag if provided
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
     }
+    std::env::set_var("SHOOT_ARCH", &arch);
 
-    // Load existing lockfile
     let lock_path = Path::new(&lockfile_path);
     let mut lockfile = LockFile::load(lock_path)?.unwrap_or_else(|| LockFile {
         version: 1,
@@ -176,13 +172,11 @@ fn cmd_image(
         snaps: HashMap::new(),
     });
 
-    // Evaluate the Lua config and extract image declarations
     let lua = shoot::lua::new_lua(&file)?;
     let images = shoot::lua::evaluate_images(&lua, &file)?;
 
     let output_dir = Path::new(&output);
 
-    // Determine cache dir
     let cache_dir = cache.map_or_else(
         || {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -191,7 +185,6 @@ fn cmd_image(
         |c| Path::new(&c).to_path_buf(),
     );
 
-    // Filter to requested image name if specified
     let iter: Vec<(&String, &ImageDeclaration)> = match &output_name {
         Some(name) => {
             let img = images
@@ -226,10 +219,94 @@ fn cmd_image(
         lock_changed = true;
     }
 
-    // Save lockfile with any new snap pins
     if lock_changed {
         lockfile.save(lock_path)?;
         eprintln!("  ✓ lockfile updated: {}", lockfile_path);
+    }
+
+    Ok(())
+}
+
+// ── Index command ──
+
+fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
+    match sub {
+        IndexCommand::List { index } => {
+            let path = Path::new(&index);
+            let idx = if path.exists() {
+                PackageIndex::load(path)?
+            } else {
+                PackageIndex::load_or_default(path)?
+            };
+
+            println!("Package index: {} entries", idx.snaps.len());
+            println!();
+            for entry in &idx.snaps {
+                let kind = if entry.store.is_some() {
+                    "store"
+                } else if entry.source.is_some() {
+                    "source"
+                } else {
+                    "unknown"
+                };
+                let pins = entry
+                    .pins
+                    .as_ref()
+                    .map(|p| p.len().to_string())
+                    .unwrap_or_else(|| "-".into());
+                println!("  {:<20} {}    pins: {}", entry.name, kind, pins);
+            }
+        }
+
+        IndexCommand::Add {
+            name,
+            summary,
+            store_name,
+            channel,
+            index,
+        } => {
+            let path = Path::new(&index);
+            let mut idx = if path.exists() {
+                PackageIndex::load(path)?
+            } else {
+                PackageIndex {
+                    version: 1,
+                    snaps: vec![],
+                }
+            };
+
+            let entry = IndexEntry {
+                name: name.clone(),
+                summary,
+                store: Some(StoreRef {
+                    name: store_name,
+                    channel,
+                }),
+                pins: None,
+                source: None,
+                build: None,
+                apps: None,
+            };
+
+            idx.upsert(entry);
+            idx.save(path)?;
+            eprintln!("  ✓ added '{}' to index", name);
+        }
+
+        IndexCommand::Resolve { index, channel } => {
+            let path = Path::new(&index);
+            let mut idx = if path.exists() {
+                PackageIndex::load(path)?
+            } else {
+                eprintln!("  index file not found at {}", index);
+                return Ok(());
+            };
+
+            eprintln!("Resolving snap pins from store (channel: {channel})...");
+            idx.resolve_all(&channel)?;
+            idx.save(path)?;
+            eprintln!("  ✓ index updated: {}", index);
+        }
     }
 
     Ok(())

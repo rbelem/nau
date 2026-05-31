@@ -220,6 +220,22 @@ function image(opts)
     return opts
 end
 
+--- Look up a snap in the package index and return a pin table.
+-- The index file (package-index.json) contains pre-resolved snap pins
+-- and source definitions for common snaps.
+-- @param name  The snap name in the index
+-- @return a pin table consumable by image() or snap()
+-- @usage index("core22")
+-- @usage index("hello") -- source-based snap
+function index(name)
+    if type(name) ~= "string" then
+        error("index(): expected a string name, got " .. type(name), 2)
+    end
+    -- Return a proxy table; Rust handles the actual lookup.
+    -- This function is replaced by the Rust implementation at init time.
+    return { name = name, _index = true }
+end
+
 function pin(name, opts)
     if type(name) ~= "string" then
         error("pin(): expected a string name, got " .. type(name), 2)

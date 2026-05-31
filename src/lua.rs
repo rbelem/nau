@@ -31,6 +31,22 @@ pub fn new_lua(path: &str) -> miette::Result<mlua::Lua> {
             });
     }
 
+    // Register the index() function from Rust (handles file I/O)
+    let arch = std::env::var("SHOOT_ARCH").unwrap_or_else(|_| "amd64".into());
+    let index_path_env = std::env::var("SHOOT_INDEX_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
+
+    let index_fn = lua
+        .create_function(move |lua_ctx, name: String| {
+            crate::index::lua_index_entry(lua_ctx, name, arch.clone(), index_path_env.clone())
+        })
+        .map_err(|e| miette::miette!("failed to register index(): {e}"))?;
+
+    lua.globals()
+        .set("index", index_fn)
+        .map_err(|e| miette::miette!("failed to set index global: {e}"))?;
+
     Ok(lua)
 }
 

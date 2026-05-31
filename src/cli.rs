@@ -83,6 +83,54 @@ pub enum Command {
         #[arg(long, default_value = "shoot.lock")]
         lockfile: String,
     },
+
+    /// Manage the package index (list, add, resolve)
+    #[command(subcommand)]
+    Index(IndexCommand),
+}
+
+/// Subcommands for `shoot index`.
+#[derive(clap::Subcommand)]
+pub enum IndexCommand {
+    /// List snaps in the package index
+    List {
+        /// Path to the package index file (default: package-index.json)
+        #[arg(long, default_value = crate::index::DEFAULT_INDEX)]
+        index: String,
+    },
+
+    /// Add a snap to the package index
+    Add {
+        /// Snap name
+        name: String,
+
+        /// Summary/description
+        #[arg(long)]
+        summary: Option<String>,
+
+        /// Store name (defaults to the snap name)
+        #[arg(long)]
+        store_name: Option<String>,
+
+        /// Channel (default: latest/stable)
+        #[arg(long, default_value = "latest/stable")]
+        channel: String,
+
+        /// Path to the package index file (default: package-index.json)
+        #[arg(long, default_value = crate::index::DEFAULT_INDEX)]
+        index: String,
+    },
+
+    /// Resolve store snap pins: query the Snap Store for each entry
+    Resolve {
+        /// Path to the package index file (default: package-index.json)
+        #[arg(long, default_value = crate::index::DEFAULT_INDEX)]
+        index: String,
+
+        /// Channel to resolve from (default: latest/stable)
+        #[arg(long, default_value = "latest/stable")]
+        channel: String,
+    },
 }
 
 #[cfg(test)]
