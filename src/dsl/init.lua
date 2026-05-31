@@ -125,3 +125,46 @@ function app(opts)
 
     return opts
 end
+
+--- Deep-merge two tables. Returns a new table — neither input is mutated.
+-- For each key in `overrides`:
+--   - If both values are tables, recurse.
+--   - Otherwise the override value wins.
+-- Arrays are replaced, not merged element-by-element.
+-- @param base  The base table (may be nil)
+-- @param overrides  The overriding table (may be nil)
+-- @return a new merged table
+-- @usage local cfg = merge(require("common"), { name = "my-snap" })
+--- Check if a table is used as an array (keys are 1..n consecutive integers).
+local function _is_array(t)
+    local count = #t
+    if count == 0 then return false end
+    for k in pairs(t) do
+        if type(k) ~= "number" or k < 1 or k > count or math.floor(k) ~= k then
+            return false
+        end
+    end
+    return true
+end
+
+function merge(base, overrides)
+    if base == nil then return overrides end
+    if overrides == nil then return base end
+
+    local result = {}
+    -- Copy base keys
+    for k, v in pairs(base) do
+        result[k] = v
+    end
+    -- Apply overrides
+    for k, v in pairs(overrides) do
+        if type(result[k]) == "table" and type(v) == "table" and not _is_array(v) then
+            -- Both are dict-like tables: deep merge
+            result[k] = merge(result[k], v)
+        else
+            -- Arrays and scalars: replace outright
+            result[k] = v
+        end
+    end
+    return result
+end
