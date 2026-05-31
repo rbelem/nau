@@ -1,6 +1,166 @@
 {
   "lockfile_version": "1",
   "packages": {
+    "autoconf@latest": {
+      "last_modified": "2026-05-21T08:15:18Z",
+      "resolved": "github:NixOS/nixpkgs/4a29d733e8a7d5b824c3d8c958a946a9867b3eb2#autoconf",
+      "source": "devbox-search",
+      "version": "2.73",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/z81cjs7gbr38jza8a9rslfb9x0nyywn1-autoconf-2.73",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/gby6jfsjzmjwxwgswlxdx75i57zl2nb7-autoconf-2.73-doc"
+            }
+          ],
+          "store_path": "/nix/store/z81cjs7gbr38jza8a9rslfb9x0nyywn1-autoconf-2.73"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/d8dbw6kvqzfmdnjv722yriflrx4rlykb-autoconf-2.73",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/0bfq3980sll24xkk7i414gsxyw22jl42-autoconf-2.73-doc"
+            }
+          ],
+          "store_path": "/nix/store/d8dbw6kvqzfmdnjv722yriflrx4rlykb-autoconf-2.73"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/5lpllx2pbgclzs2zdrss9hfcbwrdwnmb-autoconf-2.73",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/sp3v3qb440px74xdilwmzlq2mdsdg91j-autoconf-2.73-doc"
+            }
+          ],
+          "store_path": "/nix/store/5lpllx2pbgclzs2zdrss9hfcbwrdwnmb-autoconf-2.73"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/c3g361js93jz2xx8lx6mnmqg76lghxxh-autoconf-2.73",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/jvf8qvsfkmgqi83cg1fkb3clfwhq4lsg-autoconf-2.73-doc"
+            }
+          ],
+          "store_path": "/nix/store/c3g361js93jz2xx8lx6mnmqg76lghxxh-autoconf-2.73"
+        }
+      }
+    },
+    "automake@latest": {
+      "last_modified": "2026-05-21T08:15:18Z",
+      "resolved": "github:NixOS/nixpkgs/4a29d733e8a7d5b824c3d8c958a946a9867b3eb2#automake",
+      "source": "devbox-search",
+      "version": "1.18.1",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/2p90i81rx0qh27izydnpa3h2w2zyf2ah-automake-1.18.1",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/2p90i81rx0qh27izydnpa3h2w2zyf2ah-automake-1.18.1"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/rql2r4fdgys2f9wmx9hmcf2qjna96p1a-automake-1.18.1",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/rql2r4fdgys2f9wmx9hmcf2qjna96p1a-automake-1.18.1"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/pkqvi5snnhjy9gi9rnrid3rg62r2l931-automake-1.18.1",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/pkqvi5snnhjy9gi9rnrid3rg62r2l931-automake-1.18.1"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/6c9ac94g1wwn7rgghbhddpxsz4p5l24b-automake-1.18.1",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/6c9ac94g1wwn7rgghbhddpxsz4p5l24b-automake-1.18.1"
+        }
+      }
+    },
+    "bison@latest": {
+      "last_modified": "2026-05-21T08:15:18Z",
+      "resolved": "github:NixOS/nixpkgs/4a29d733e8a7d5b824c3d8c958a946a9867b3eb2#bison",
+      "source": "devbox-search",
+      "version": "3.8.2",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/v7z36kkh1npbjsfcf6qyvpc2hzzbwjrh-bison-3.8.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/v7z36kkh1npbjsfcf6qyvpc2hzzbwjrh-bison-3.8.2"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/2dq5v36rskyn1d2r7xadhvk690vrz9m4-bison-3.8.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/2dq5v36rskyn1d2r7xadhvk690vrz9m4-bison-3.8.2"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/z7x772jkpgp9d3npgrlg0088gfrp5iha-bison-3.8.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/z7x772jkpgp9d3npgrlg0088gfrp5iha-bison-3.8.2"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/xnrdzhzdkwpjcdl3rzqmqpaa8sn7g870-bison-3.8.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/xnrdzhzdkwpjcdl3rzqmqpaa8sn7g870-bison-3.8.2"
+        }
+      }
+    },
     "cargo@1.95.0": {
       "last_modified": "2026-05-21T08:15:18Z",
       "resolved": "github:NixOS/nixpkgs/4a29d733e8a7d5b824c3d8c958a946a9867b3eb2#cargo",

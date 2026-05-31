@@ -64,7 +64,7 @@ function snap(opts)
     -- Optional string fields
     local string_fields = {
         "summary", "description", "license", "grade", "confinement",
-        "source", "stage",
+        "source", "stage", "build",
     }
     for _, field in ipairs(string_fields) do
         check_string(opts[field], "snap", field)

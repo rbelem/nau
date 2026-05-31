@@ -29,6 +29,11 @@ pub struct SnapMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub architectures: Option<Vec<String>>,
 
+    /// Build command (shell). If set, tool fetches source and runs build
+    /// before snap assembly. Skipped in YAML — build-time only.
+    #[serde(skip)]
+    pub build: Option<String>,
+
     #[serde(default = "default_grade")]
     pub grade: String,
 
@@ -94,6 +99,7 @@ impl SnapMeta {
         let grade = get_opt_string(table, "grade")?.unwrap_or_else(default_grade);
         let confinement = get_opt_string(table, "confinement")?.unwrap_or_else(default_confinement);
         let architectures = get_opt_string_array(table, "architectures")?;
+        let build = get_opt_string(table, "build")?;
 
         let apps = get_opt_table(table, "apps")?
             .map(|apps_table| {
@@ -125,6 +131,7 @@ impl SnapMeta {
             description,
             license,
             source,
+            build,
             architectures,
             grade,
             confinement,
@@ -261,6 +268,9 @@ pub fn build_snap(
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
 
+    // 1. Run build phase (download source, run build command) if configured
+    run_build(meta, stage_dir)?;
+
     // Clone meta with architecture filtered to the target arch
     let mut arch_meta = meta.clone();
     arch_meta.architectures = Some(vec![arch.to_string()]);
@@ -300,6 +310,113 @@ pub fn build_snap(
     }
 
     Ok(output_filename)
+}
+
+/// Run the build phase: download source, extract, and execute build command.
+///
+/// Only runs if `meta.build` is set. Downloads the tarball from `meta.source`
+/// (if it's a URL), extracts it, and runs the build shell command with
+/// `$STAGE` pointing to the stage directory and `$SRC` pointing to the
+/// downloaded/extracted source.
+fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<()> {
+    let build_cmd = match &meta.build {
+        Some(cmd) => cmd,
+        None => return Ok(()),
+    };
+
+    let Some(source_url) = &meta.source else {
+        return Err(miette::miette!(
+            "build is set but no source URL — add 'source = \"...\"' to snap()"
+        ));
+    };
+
+    if !source_url.starts_with("http://") && !source_url.starts_with("https://") {
+        return Err(miette::miette!(
+            "build requires a URL source, got: {}",
+            source_url
+        ));
+    }
+
+    let build_dir = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
+    let build_path = build_dir.path();
+
+    // 1. Download source tarball
+    let filename = source_url.rsplit('/').next().unwrap_or("source.tar.gz");
+    let tarball = build_path.join(filename);
+
+    let status = std::process::Command::new("curl")
+        .args(["-fsSL", "-o", &tarball.to_string_lossy(), source_url])
+        .status()
+        .map_err(|e| miette::miette!("curl not found: {}", e))?;
+
+    if !status.success() {
+        return Err(miette::miette!("failed to download {}", source_url));
+    }
+
+    // 2. Extract tarball and find source root
+    let is_tarball = filename.ends_with(".tar.gz")
+        || filename.ends_with(".tar.xz")
+        || filename.ends_with(".tgz");
+    if is_tarball {
+        let tarball_str = tarball.to_string_lossy().to_string();
+        let status = std::process::Command::new("tar")
+            .arg("xaf")
+            .arg(&tarball_str)
+            .current_dir(build_path)
+            .status()
+            .map_err(|e| miette::miette!("tar not found: {}", e))?;
+        if !status.success() {
+            return Err(miette::miette!("failed to extract {}", filename));
+        }
+    }
+
+    // 3. Find the source root (the single top-level dir after extraction)
+    let src_dir = find_source_root(build_path);
+    let work_dir: &Path = src_dir.as_deref().unwrap_or(build_path);
+
+    // 4. Create stage dir and run build
+    std::fs::create_dir_all(stage_dir)
+        .map_err(|e| miette::miette!("failed to create stage dir: {}", e))?;
+
+    // Convert stage_dir to absolute path (DESTDIR requires absolute)
+    let abs_stage = std::fs::canonicalize(stage_dir)
+        .unwrap_or_else(|_| stage_dir.to_path_buf());
+
+    let status = std::process::Command::new("sh")
+        .args(["-c", build_cmd])
+        .env("STAGE", &abs_stage)
+        .env("SRC", work_dir)
+        .current_dir(work_dir)
+        .status()
+        .map_err(|e| miette::miette!("failed to execute build: {}", e))?;
+
+    if !status.success() {
+        return Err(miette::miette!("build command exited with error"));
+    }
+
+    Ok(())
+}
+
+/// Find the single top-level directory in a path (the source root
+/// after extracting a tarball). If there's more than one entry or
+/// no entry, returns None.
+fn find_source_root(dir: &Path) -> Option<std::path::PathBuf> {
+    let mut entries: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(read) = std::fs::read_dir(dir) {
+        for entry in read.flatten() {
+            if entry.file_type().map_or(false, |t| t.is_dir())
+                && !entry.file_name().to_string_lossy().starts_with('.')
+            {
+                entries.push(entry.path());
+            }
+        }
+    }
+    if entries.len() == 1 {
+        Some(entries.into_iter().next().unwrap())
+    } else {
+        None
+    }
 }
 
 /// Determine the set of architectures to build.

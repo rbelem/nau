@@ -7,7 +7,10 @@
     "clippy@1.95.0",
     "cargo@1.95.0",
     "rustc@1.95.0",
-    "squashfsTools@4.7.5"
+    "squashfsTools@4.7.5",
+    "autoconf@latest",
+    "automake@latest",
+    "bison@latest"
   ],
   "shell": {
     "init_hook": [
