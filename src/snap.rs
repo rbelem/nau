@@ -9,7 +9,7 @@ use serde::Serialize;
 /// Top-level metadata for one snap output.
 ///
 /// Maps directly to the `meta/snap.yaml` schema that snapd expects.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SnapMeta {
     pub name: String,
     pub version: String,
@@ -48,7 +48,7 @@ fn default_confinement() -> String {
 }
 
 /// An app declared inside a snap.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SnapApp {
     pub command: String,
 
@@ -245,42 +245,46 @@ impl SnapMeta {
     }
 }
 
-// ── Phase 5: Snap directory assembly + SquashFS packaging ──
+// ── Phase 5/6: Snap directory assembly + SquashFS packaging ──
 
-/// Build a `.snap` package from a `SnapMeta` and stage directory.
+/// Build a `.snap` package for a single architecture.
 ///
-/// Returns the path to the produced `.snap` file.
-pub fn build_snap(meta: &SnapMeta, stage_dir: &Path, output_dir: &Path) -> miette::Result<String> {
+/// The `arch` parameter controls which architecture appears in the
+/// `meta/snap.yaml` and the output filename `{name}_{version}_{arch}.snap`.
+/// Returns the output filename (not the full path).
+pub fn build_snap(
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    output_dir: &Path,
+    arch: &str,
+) -> miette::Result<String> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
 
-    // 1. Write meta/snap.yaml
+    // Clone meta with architecture filtered to the target arch
+    let mut arch_meta = meta.clone();
+    arch_meta.architectures = Some(vec![arch.to_string()]);
+
+    // 2. Write meta/snap.yaml
     let meta_dir = build_dir.path().join("meta");
     std::fs::create_dir_all(&meta_dir)
         .map_err(|e| miette::miette!("failed to create meta/ directory: {}", e))?;
 
-    let yaml = meta.to_yaml()?;
+    let yaml = arch_meta.to_yaml()?;
     std::fs::write(meta_dir.join("snap.yaml"), &yaml)
         .map_err(|e| miette::miette!("failed to write meta/snap.yaml: {}", e))?;
 
-    // 2. Copy stage contents into build root
+    // 3. Copy stage contents into build root
     if stage_dir.exists() {
         cp_r(stage_dir, build_dir.path())
             .map_err(|e| miette::miette!("failed to copy from {:?}: {}", stage_dir, e))?;
     }
 
-    // 3. Determine output path
-    let arch = meta
-        .architectures
-        .as_ref()
-        .and_then(|a| a.first())
-        .map(|s| s.as_str())
-        .unwrap_or("all");
-
+    // 4. Output filename
     let output_filename = format!("{}_{}_{}.snap", meta.name, meta.version, arch);
     let output_path = output_dir.join(&output_filename);
 
-    // 4. Run mksquashfs
+    // 5. Run mksquashfs
     let status = std::process::Command::new("mksquashfs")
         .arg(build_dir.path())
         .arg(&output_path)
@@ -296,6 +300,22 @@ pub fn build_snap(meta: &SnapMeta, stage_dir: &Path, output_dir: &Path) -> miett
     }
 
     Ok(output_filename)
+}
+
+/// Determine the set of architectures to build.
+///
+/// * If `cli_archs` is non-empty, use those (from `--arch` flags).
+/// * Otherwise use the architectures declared in `meta`.
+/// * If neither is set, default to `["all"]`.
+pub fn resolve_archs(meta: &SnapMeta, cli_archs: &[String]) -> Vec<String> {
+    if !cli_archs.is_empty() {
+        cli_archs.to_vec()
+    } else {
+        meta.architectures
+            .clone()
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| vec!["all".to_string()])
+    }
 }
 
 /// Recursive copy of directory contents into destination.
@@ -516,7 +536,7 @@ mod tests {
         assert!(!yaml.contains("description:")); // skipped
     }
 
-    // ── Phase 5 tests: build pipeline ──
+    // ── Phase 5/6 tests: build pipeline ──
 
     #[test]
     fn test_build_snap_creates_snap_file() {
@@ -544,7 +564,7 @@ mod tests {
         let stage_dir = std::path::Path::new("test-fixtures");
         let output_dir = tempfile::tempdir().unwrap();
 
-        let result = build_snap(&meta, stage_dir, output_dir.path());
+        let result = build_snap(&meta, stage_dir, output_dir.path(), "amd64");
         assert!(result.is_ok());
 
         let snap_name = result.unwrap();
@@ -568,5 +588,126 @@ mod tests {
             stdout.contains("meta/snap.yaml"),
             "snap should contain meta/snap.yaml"
         );
+    }
+
+    #[test]
+    fn test_build_multi_arch() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "multi-test",
+                    version = "2.0",
+                    architectures = { "amd64", "arm64" },
+                    apps = {
+                        hello = app { command = "bin/hello" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let stage_dir = std::path::Path::new("test-fixtures");
+
+        // Build amd64
+        let snap_amd64 = build_snap(&meta, stage_dir, output_dir.path(), "amd64").unwrap();
+        assert_eq!(snap_amd64, "multi-test_2.0_amd64.snap");
+        assert!(output_dir.path().join(&snap_amd64).exists());
+
+        // Build arm64
+        let snap_arm64 = build_snap(&meta, stage_dir, output_dir.path(), "arm64").unwrap();
+        assert_eq!(snap_arm64, "multi-test_2.0_arm64.snap");
+        assert!(output_dir.path().join(&snap_arm64).exists());
+
+        // Verify both have correct arch in YAML
+        for (arch, snap_name) in [("amd64", &snap_amd64), ("arm64", &snap_arm64)] {
+            let check = std::process::Command::new("unsquashfs")
+                .args(["-l", &output_dir.path().join(snap_name).to_string_lossy()])
+                .output()
+                .expect("unsquashfs should be available");
+            let stdout = String::from_utf8_lossy(&check.stdout);
+            assert!(
+                stdout.contains("meta/snap.yaml"),
+                "{arch}: missing snap.yaml"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_archs_defaults_to_meta() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "t",
+                    version = "1",
+                    architectures = { "amd64", "arm64" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let archs = resolve_archs(&meta, &[]);
+        assert_eq!(archs, vec!["amd64", "arm64"]);
+    }
+
+    #[test]
+    fn test_resolve_archs_cli_overrides_meta() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "t",
+                    version = "1",
+                    architectures = { "amd64", "arm64" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let archs = resolve_archs(&meta, &["arm64".to_string()]);
+        assert_eq!(archs, vec!["arm64"]);
+    }
+
+    #[test]
+    fn test_resolve_archs_defaults_to_all() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "t",
+                    version = "1",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let archs = resolve_archs(&meta, &[]);
+        assert_eq!(archs, vec!["all"]);
     }
 }

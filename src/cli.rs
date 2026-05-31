@@ -26,6 +26,11 @@ pub enum Command {
         /// Output directory for the .snap file (default: current dir)
         #[arg(short, long, default_value = ".")]
         output: String,
+
+        /// Build only for specific architecture(s). Repeat for multiple.
+        /// Default: build for all architectures declared in the config.
+        #[arg(short = 'A', long)]
+        arch: Vec<String>,
     },
 }
 
@@ -46,10 +51,12 @@ mod tests {
             file,
             stage,
             output,
+            arch,
         } = &cli.command;
         assert_eq!(file, "shoot.lua");
         assert_eq!(stage, "./stage/");
         assert_eq!(output, ".");
+        assert!(arch.is_empty());
     }
 
     #[test]
@@ -80,6 +87,21 @@ mod tests {
         let Command::Build { stage, output, .. } = &cli.command;
         assert_eq!(stage, "/tmp/stage");
         assert_eq!(output, "/tmp/out");
+    }
+
+    #[test]
+    fn test_build_with_single_arch() {
+        let cli = Cli::try_parse_from(["shoot", "build", "--arch", "arm64"]).unwrap();
+        let Command::Build { arch, .. } = &cli.command;
+        assert_eq!(arch, &["arm64"]);
+    }
+
+    #[test]
+    fn test_build_with_multi_arch() {
+        let cli =
+            Cli::try_parse_from(["shoot", "build", "--arch", "amd64", "-A", "arm64"]).unwrap();
+        let Command::Build { arch, .. } = &cli.command;
+        assert_eq!(arch, &["amd64", "arm64"]);
     }
 
     #[test]
