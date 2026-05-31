@@ -31,6 +31,10 @@ pub enum Command {
         /// Default: build for all architectures declared in the config.
         #[arg(short = 'A', long)]
         arch: Vec<String>,
+
+        /// Output name to build (from shoot.lua outputs table).
+        /// Default: build all outputs.
+        output_name: Option<String>,
     },
 }
 
@@ -52,11 +56,13 @@ mod tests {
             stage,
             output,
             arch,
+            output_name,
         } = &cli.command;
         assert_eq!(file, "shoot.lua");
         assert_eq!(stage, "./stage/");
         assert_eq!(output, ".");
         assert!(arch.is_empty());
+        assert!(output_name.is_none());
     }
 
     #[test]
@@ -102,6 +108,36 @@ mod tests {
             Cli::try_parse_from(["shoot", "build", "--arch", "amd64", "-A", "arm64"]).unwrap();
         let Command::Build { arch, .. } = &cli.command;
         assert_eq!(arch, &["amd64", "arm64"]);
+    }
+
+    #[test]
+    fn test_build_with_positional_output_name() {
+        let cli = Cli::try_parse_from(["shoot", "build", "server"]).unwrap();
+        let Command::Build { output_name, .. } = &cli.command;
+        assert_eq!(output_name.as_deref(), Some("server"));
+    }
+
+    #[test]
+    fn test_build_with_positional_and_flags() {
+        let cli = Cli::try_parse_from([
+            "shoot",
+            "build",
+            "cli",
+            "--file",
+            "multi.lua",
+            "--arch",
+            "arm64",
+        ])
+        .unwrap();
+        let Command::Build {
+            output_name,
+            file,
+            arch,
+            ..
+        } = &cli.command;
+        assert_eq!(output_name.as_deref(), Some("cli"));
+        assert_eq!(file, "multi.lua");
+        assert_eq!(arch, &["arm64"]);
     }
 
     #[test]

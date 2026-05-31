@@ -10,19 +10,32 @@ fn main() -> miette::Result<()> {
             stage,
             output,
             arch,
+            output_name,
         } => {
-            let outputs = shoot::lua::evaluate_file(&file)?;
+            let all_outputs = shoot::lua::evaluate_file(&file)?;
 
             let stage_dir = std::path::Path::new(&stage);
             let output_dir = std::path::Path::new(&output);
 
-            for meta in outputs.values() {
+            // Filter to requested output name if specified
+            let iter: Vec<(&String, &shoot::snap::SnapMeta)> = match &output_name {
+                Some(name) => {
+                    let meta = all_outputs.get(name).ok_or_else(|| {
+                        miette::miette!("output '{}' not found in {}", name, file)
+                    })?;
+                    vec![(name, meta)]
+                }
+                None => all_outputs.iter().collect(),
+            };
+
+            for (name, meta) in iter {
                 let archs = shoot::snap::resolve_archs(meta, &arch);
 
+                println!("Building {} ({})...", name, meta.version);
                 for a in &archs {
-                    println!("Building {} v{} ({})...", meta.name, meta.version, a);
+                    println!("  {}/{}:", name, a);
                     let snap_name = shoot::snap::build_snap(meta, stage_dir, output_dir, a)?;
-                    println!("  ✓ {snap_name}");
+                    println!("    ✓ {snap_name}");
                 }
             }
         }
