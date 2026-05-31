@@ -87,6 +87,9 @@ pub enum Command {
     /// Manage the package index (list, add, resolve)
     #[command(subcommand)]
     Index(IndexCommand),
+
+    /// Check system readiness (required tools)
+    Doctor,
 }
 
 /// Subcommands for `shoot index`.

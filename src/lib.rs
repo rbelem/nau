@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod doctor;
 pub mod dsl;
 pub mod image;
 pub mod index;

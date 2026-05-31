@@ -51,6 +51,8 @@ fn main() -> miette::Result<()> {
         ),
 
         Command::Index(sub) => cmd_index(sub),
+
+        Command::Doctor => cmd_doctor(),
     }
 }
 
@@ -224,6 +226,17 @@ fn cmd_image(
         eprintln!("  ✓ lockfile updated: {}", lockfile_path);
     }
 
+    Ok(())
+}
+
+// ── Doctor command ──
+
+fn cmd_doctor() -> miette::Result<()> {
+    let checks = shoot::doctor::run_all();
+    shoot::doctor::print_report(&checks);
+    if !shoot::doctor::all_ok(&checks) {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
