@@ -1,0 +1,11 @@
+[package]
+name = "shoot"
+version = "0.1.0"
+edition = "2021"
+description = "Build Snap packages from Lua declarations"
+license = "GPL-3.0-only"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+mlua = { version = "0.10", features = ["lua54"] }
+miette = { version = "7", features = ["fancy"] }
