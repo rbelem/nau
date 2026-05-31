@@ -64,10 +64,24 @@ function snap(opts)
     -- Optional string fields
     local string_fields = {
         "summary", "description", "license", "grade", "confinement",
-        "source", "stage", "build",
+        "stage", "build",
     }
     for _, field in ipairs(string_fields) do
         check_string(opts[field], "snap", field)
+    end
+
+    -- source: string (legacy) or table { url, sha256? }
+    if opts.source ~= nil then
+        if type(opts.source) == "table" then
+            if type(opts.source.url) ~= "string" then
+                error("snap(): source.url must be a string, got " .. type(opts.source.url), 2)
+            end
+            if opts.source.sha256 ~= nil and type(opts.source.sha256) ~= "string" then
+                error("snap(): source.sha256 must be a string, got " .. type(opts.source.sha256), 2)
+            end
+        elseif type(opts.source) ~= "string" then
+            error("snap(): source must be a string or table, got " .. type(opts.source), 2)
+        end
     end
 
     -- Optional table fields
@@ -145,6 +159,93 @@ local function _is_array(t)
         end
     end
     return true
+end
+
+--- Pin a snap from the Snap Store by name, optionally fixing revision
+-- and content hash for reproducibility.
+-- @param name  The snap name (e.g. "core22", "pc-kernel")
+-- @param opts  (optional) table with `revision` (number) and/or `sha3_384` (string)
+-- @return a pin table consumable by image()
+-- @usage pin("core22", { revision = 1847, sha3_384 = "abc..." })
+--- Declare a system image composed from multiple snaps.
+-- @param opts table with fields: name, version, base (required),
+--   kernel, gadget, snaps (optional arrays of pins)
+-- @return the validated opts table
+-- @usage image {
+--     name = "my-system",
+--     version = "1.0.0",
+--     base = pin("core22"),
+--     kernel = pin("pc-kernel"),
+--     snaps = { pin("lxd") },
+-- }
+function image(opts)
+    if type(opts) ~= "table" then
+        error("image(): expected a table, got " .. type(opts), 2)
+    end
+
+    -- Required fields
+    local required = { "name", "version", "base" }
+    for _, f in ipairs(required) do
+        if opts[f] == nil then
+            error(string.format("image(): missing required field '%s'", f), 2)
+        end
+    end
+
+    -- Type checks
+    if type(opts.name) ~= "string" then
+        error("image(): 'name' must be a string, got " .. type(opts.name), 2)
+    end
+    if type(opts.version) ~= "string" then
+        error("image(): 'version' must be a string, got " .. type(opts.version), 2)
+    end
+
+    -- Optional fields: kernel, gadget, snaps
+    if opts.kernel ~= nil and type(opts.kernel) ~= "table" then
+        error("image(): 'kernel' must be a pin table, got " .. type(opts.kernel), 2)
+    end
+    if opts.gadget ~= nil and type(opts.gadget) ~= "table" then
+        error("image(): 'gadget' must be a pin table, got " .. type(opts.gadget), 2)
+    end
+    if opts.snaps ~= nil then
+        if type(opts.snaps) ~= "table" then
+            error("image(): 'snaps' must be an array, got " .. type(opts.snaps), 2)
+        end
+        for i, s in ipairs(opts.snaps) do
+            if type(s) ~= "table" then
+                error(string.format("image(): snaps[%d] must be a pin, got %s", i, type(s)), 2)
+            end
+        end
+    end
+
+    return opts
+end
+
+function pin(name, opts)
+    if type(name) ~= "string" then
+        error("pin(): expected a string name, got " .. type(name), 2)
+    end
+
+    local result = { name = name }
+
+    if opts ~= nil then
+        if type(opts) ~= "table" then
+            error("pin(): opts must be a table, got " .. type(opts), 2)
+        end
+        if opts.revision ~= nil then
+            if type(opts.revision) ~= "number" then
+                error("pin(): revision must be a number, got " .. type(opts.revision), 2)
+            end
+            result.revision = opts.revision
+        end
+        if opts.sha3_384 ~= nil then
+            if type(opts.sha3_384) ~= "string" then
+                error("pin(): sha3_384 must be a string, got " .. type(opts.sha3_384), 2)
+            end
+            result.sha3_384 = opts.sha3_384
+        end
+    end
+
+    return result
 end
 
 function merge(base, overrides)

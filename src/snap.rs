@@ -1,8 +1,100 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 
 use mlua::Value;
 use serde::Serialize;
+use serde::Serializer;
+use sha2::Digest;
+
+// ── Snap pinning (references to external snaps) ──
+
+/// A reference to a snap from the Snap Store, optionally pinned by revision
+/// and content hash for reproducibility.
+///
+/// Created by the `pin()` DSL function:
+/// ```lua
+/// pin("core22")                                    -- name only
+/// pin("core22", { revision = 1847 })               -- + revision
+/// pin("core22", { revision = 1847, sha3_384 = "…" }) -- fully pinned
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapRef {
+    pub name: String,
+    pub revision: Option<u32>,
+    /// sha3-384 hex digest (lowercase, without prefix).
+    pub sha3_384: Option<String>,
+}
+
+impl SnapRef {
+    /// Create from a Lua pin table (validated by the DSL).
+    pub fn from_pin_table(table: &mlua::Table) -> miette::Result<Self> {
+        let name: String = table
+            .get("name")
+            .map_err(|_| miette::miette!("pin(): missing required field 'name'"))?;
+        let revision: Option<u32> = table.get("revision").ok();
+        let sha3_384: Option<String> = table.get("sha3_384").ok();
+
+        Ok(SnapRef {
+            name,
+            revision,
+            sha3_384,
+        })
+    }
+}
+
+// ── Reproducible builds: source pinning ──
+
+/// How a source was specified: bare URL, or URL + pinning hash.
+#[derive(Debug, Clone)]
+pub enum SourceSpec {
+    /// Just a URL — no hash verification (legacy).
+    Unverified(String),
+    /// URL + expected SHA-256 hash for pinning.
+    Pinned { url: String, sha256: String },
+}
+
+impl SourceSpec {
+    pub fn url(&self) -> &str {
+        match self {
+            SourceSpec::Unverified(url) => url,
+            SourceSpec::Pinned { url, .. } => url,
+        }
+    }
+
+    /// The SHA-256 hash the source is expected to have, if pinned.
+    pub fn expected_sha256(&self) -> Option<&str> {
+        match self {
+            SourceSpec::Unverified(_) => None,
+            SourceSpec::Pinned { sha256, .. } => Some(sha256),
+        }
+    }
+}
+
+/// Serialize as a plain URL string (for `meta/snap.yaml` backward compat).
+impl Serialize for SourceSpec {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.url().serialize(serializer)
+    }
+}
+
+// ── Build result ──
+
+/// Info about a downloaded source, for lockfile recording.
+#[derive(Debug, Clone)]
+pub struct SourceInfo {
+    pub url: String,
+    pub sha256: String,
+}
+
+/// Result of building one snap, including lockfile-relevant metadata.
+#[derive(Debug)]
+pub struct BuildResult {
+    /// The output `.snap` filename (e.g. `hello_2.10_amd64.snap`).
+    pub snap_filename: String,
+    /// Source info if a source was downloaded and processed.
+    pub source_info: Option<SourceInfo>,
+}
 
 // ── Phase 3: Snap metadata structs ──
 
@@ -24,7 +116,7 @@ pub struct SnapMeta {
     pub license: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    pub source: Option<SourceSpec>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub architectures: Option<Vec<String>>,
@@ -95,7 +187,7 @@ impl SnapMeta {
         let summary = get_opt_string(table, "summary")?;
         let description = get_opt_string(table, "description")?;
         let license = get_opt_string(table, "license")?;
-        let source = get_opt_string(table, "source")?;
+        let source = get_source_spec(table)?;
         let grade = get_opt_string(table, "grade")?.unwrap_or_else(default_grade);
         let confinement = get_opt_string(table, "confinement")?.unwrap_or_else(default_confinement);
         let architectures = get_opt_string_array(table, "architectures")?;
@@ -217,6 +309,33 @@ fn get_opt_table(table: &mlua::Table, key: &str) -> miette::Result<Option<mlua::
     }
 }
 
+/// Extract `source` which can be a string (legacy) or table `{ url, sha256? }`.
+fn get_source_spec(table: &mlua::Table) -> miette::Result<Option<SourceSpec>> {
+    let value: Value = table.get("source").unwrap_or(Value::Nil);
+    match value {
+        Value::String(s) => Ok(Some(SourceSpec::Unverified(
+            s.to_str()
+                .map_err(|e| miette::miette!("{}", e))?
+                .to_string(),
+        ))),
+        Value::Table(t) => {
+            let url: String = t
+                .get("url")
+                .map_err(|_| miette::miette!("source table: missing required 'url' field"))?;
+            let sha256: Option<String> = t.get("sha256").ok();
+            Ok(match sha256 {
+                Some(h) => Some(SourceSpec::Pinned { url, sha256: h }),
+                None => Some(SourceSpec::Unverified(url)),
+            })
+        }
+        Value::Nil => Ok(None),
+        other => Err(miette::miette!(
+            "snap meta: 'source' must be a string or table, got {}",
+            other.type_name()
+        )),
+    }
+}
+
 fn get_opt_map(table: &mlua::Table, key: &str) -> miette::Result<Option<HashMap<String, String>>> {
     match table
         .get::<Value>(key)
@@ -264,12 +383,12 @@ pub fn build_snap(
     stage_dir: &Path,
     output_dir: &Path,
     arch: &str,
-) -> miette::Result<String> {
+) -> miette::Result<BuildResult> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
 
     // 1. Run build phase (download source, run build command) if configured
-    run_build(meta, stage_dir)?;
+    let source_info = run_build(meta, stage_dir)?;
 
     // Clone meta with architecture filtered to the target arch
     let mut arch_meta = meta.clone();
@@ -294,14 +413,22 @@ pub fn build_snap(
     let output_filename = format!("{}_{}_{}.snap", meta.name, meta.version, arch);
     let output_path = output_dir.join(&output_filename);
 
-    // 5. Run mksquashfs
-    let status = std::process::Command::new("mksquashfs")
+    // 5. Run mksquashfs with optional SOURCE_DATE_EPOCH
+    let mut mksquashfs = std::process::Command::new("mksquashfs");
+    mksquashfs
         .arg(build_dir.path())
         .arg(&output_path)
         .arg("-noappend")
         .arg("-comp")
         .arg("xz")
-        .arg("-all-root")
+        .arg("-all-root");
+
+    // Reproducible timestamps via SOURCE_DATE_EPOCH.
+    // mksquashfs 4.4+ reads this env var natively — we just need to
+    // ensure it's propagated into the child process.
+    // (We set it in main.rs from the --source-date-epoch flag.)
+
+    let status = mksquashfs
         .status()
         .map_err(|e| miette::miette!("failed to execute mksquashfs: {}", e))?;
 
@@ -309,26 +436,36 @@ pub fn build_snap(
         return Err(miette::miette!("mksquashfs exited with error"));
     }
 
-    Ok(output_filename)
+    Ok(BuildResult {
+        snap_filename: output_filename,
+        source_info,
+    })
 }
 
 /// Run the build phase: download source, extract, and execute build command.
 ///
 /// Only runs if `meta.build` is set. Downloads the tarball from `meta.source`
-/// (if it's a URL), extracts it, and runs the build shell command with
-/// `$STAGE` pointing to the stage directory and `$SRC` pointing to the
-/// downloaded/extracted source.
-fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<()> {
+/// (if it's a URL), extracts it, verifies SHA-256 (if pinned), and runs the
+/// build shell command with `$STAGE` pointing to the stage directory and
+/// `$SRC` pointing to the downloaded/extracted source.
+///
+/// Returns `SourceInfo` with the computed SHA-256 if a source was downloaded.
+fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceInfo>> {
     let build_cmd = match &meta.build {
         Some(cmd) => cmd,
-        None => return Ok(()),
+        None => return Ok(None),
     };
 
-    let Some(source_url) = &meta.source else {
-        return Err(miette::miette!(
-            "build is set but no source URL — add 'source = \"...\"' to snap()"
-        ));
+    let source_spec = match &meta.source {
+        Some(s) => s,
+        None => {
+            return Err(miette::miette!(
+                "build is set but no source — add 'source = \"...\"' to snap()"
+            ));
+        }
     };
+
+    let source_url = source_spec.url();
 
     if !source_url.starts_with("http://") && !source_url.starts_with("https://") {
         return Err(miette::miette!(
@@ -354,7 +491,25 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<()> {
         return Err(miette::miette!("failed to download {}", source_url));
     }
 
-    // 2. Extract tarball and find source root
+    // 2. Compute SHA-256 of downloaded file
+    let computed_sha256 = sha256_file(&tarball)?;
+
+    // 3. Verify against pinned hash
+    if let Some(expected) = source_spec.expected_sha256() {
+        if computed_sha256 != expected {
+            return Err(miette::miette!(
+                "SHA-256 mismatch for {}:\n  expected: {}\n  got:      {}",
+                source_url,
+                expected,
+                computed_sha256
+            ));
+        }
+        eprintln!("  ✓ SHA-256 verified: {computed_sha256}");
+    } else {
+        eprintln!("  source hash (not pinned): {computed_sha256} (add to source.sha256 to pin)");
+    }
+
+    // 4. Extract tarball and find source root
     let is_tarball = filename.ends_with(".tar.gz")
         || filename.ends_with(".tar.xz")
         || filename.ends_with(".tgz");
@@ -371,11 +526,11 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<()> {
         }
     }
 
-    // 3. Find the source root (the single top-level dir after extraction)
+    // 5. Find the source root (the single top-level dir after extraction)
     let src_dir = find_source_root(build_path);
     let work_dir: &Path = src_dir.as_deref().unwrap_or(build_path);
 
-    // 4. Create stage dir and run build
+    // 6. Create stage dir and run build
     std::fs::create_dir_all(stage_dir)
         .map_err(|e| miette::miette!("failed to create stage dir: {}", e))?;
 
@@ -385,7 +540,29 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<()> {
     // Run build — either inside a bubblewrap sandbox or directly
     run_build_command(build_cmd, build_path, work_dir, &abs_stage)?;
 
-    Ok(())
+    Ok(Some(SourceInfo {
+        url: source_url.to_string(),
+        sha256: computed_sha256,
+    }))
+}
+
+/// Compute SHA-256 of a file (streaming, memory-efficient for large files).
+fn sha256_file(path: &Path) -> miette::Result<String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| miette::miette!("failed to open {}: {}", path.display(), e))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| miette::miette!("failed to read {}: {}", path.display(), e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let hash = hasher.finalize();
+    Ok(hash.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 /// Run a build command, optionally wrapped in a bubblewrap sandbox.
@@ -514,7 +691,7 @@ fn find_source_root(dir: &Path) -> Option<std::path::PathBuf> {
     let mut entries: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(read) = std::fs::read_dir(dir) {
         for entry in read.flatten() {
-            if entry.file_type().map_or(false, |t| t.is_dir())
+            if entry.file_type().is_ok_and(|t| t.is_dir())
                 && !entry.file_name().to_string_lossy().starts_with('.')
             {
                 entries.push(entry.path());
@@ -605,6 +782,157 @@ mod tests {
                 other => Err(miette::miette!("expected table, got {}", other.type_name())),
             }
         }
+    }
+
+    // ── SourceSpec tests ──
+
+    #[test]
+    fn test_source_spec_unverified() {
+        let s = SourceSpec::Unverified("https://example.com/tarball.tar.gz".into());
+        assert_eq!(s.url(), "https://example.com/tarball.tar.gz");
+        assert!(s.expected_sha256().is_none());
+    }
+
+    #[test]
+    fn test_source_spec_pinned() {
+        let hash = "e9b1d4d5f3c0b2a1d9c8f7e6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b";
+        let s = SourceSpec::Pinned {
+            url: "https://example.com/tarball.tar.gz".into(),
+            sha256: hash.into(),
+        };
+        assert_eq!(s.url(), "https://example.com/tarball.tar.gz");
+        assert_eq!(s.expected_sha256(), Some(hash));
+    }
+
+    #[test]
+    fn test_source_spec_serialize_as_url() {
+        let s = SourceSpec::Pinned {
+            url: "https://example.com/pkg.tar.gz".into(),
+            sha256: "abc123".into(),
+        };
+        let yaml = serde_yaml::to_string(&s).unwrap();
+        assert_eq!(yaml.trim(), "https://example.com/pkg.tar.gz");
+    }
+
+    #[test]
+    fn test_source_spec_dsl_string() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "legacy",
+                    version = "1.0",
+                    source = "https://example.com/old.tar.gz",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        match meta.source {
+            Some(SourceSpec::Unverified(url)) => {
+                assert_eq!(url, "https://example.com/old.tar.gz");
+            }
+            other => panic!("expected Unverified, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_source_spec_dsl_table_pinned() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "pinned",
+                    version = "1.0",
+                    source = {
+                        url = "https://example.com/pkg.tar.gz",
+                        sha256 = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        match meta.source {
+            Some(SourceSpec::Pinned { url, sha256 }) => {
+                assert_eq!(url, "https://example.com/pkg.tar.gz");
+                assert_eq!(
+                    sha256,
+                    "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                );
+            }
+            other => panic!("expected Pinned, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_source_spec_dsl_table_no_hash() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "no-hash",
+                    version = "1.0",
+                    source = {
+                        url = "https://example.com/pkg.tar.gz",
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        match meta.source {
+            Some(SourceSpec::Unverified(url)) => {
+                assert_eq!(url, "https://example.com/pkg.tar.gz");
+            }
+            other => panic!("expected Unverified, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_source_none_when_unset() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "no-source",
+                    version = "1.0",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert!(meta.source.is_none());
+    }
+
+    #[test]
+    fn test_sha256_file_known_content() {
+        // Create a temp file with known content and verify its hash
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, b"hello world\n").unwrap();
+        let hash = super::sha256_file(&path).unwrap();
+        // SHA-256 of "hello world\n"
+        assert_eq!(
+            hash,
+            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
     }
 
     // ── Phase 3 tests: struct conversion ──
@@ -793,10 +1121,12 @@ mod tests {
         let result = build_snap(&meta, stage_dir, output_dir.path(), "amd64");
         assert!(result.is_ok());
 
-        let snap_name = result.unwrap();
-        assert_eq!(snap_name, "test-snap_0.1.0_amd64.snap");
+        let build_result = result.unwrap();
+        assert_eq!(build_result.snap_filename, "test-snap_0.1.0_amd64.snap");
+        // No source pinned, so source_info is None
+        assert!(build_result.source_info.is_none());
 
-        let snap_path = output_dir.path().join(&snap_name);
+        let snap_path = output_dir.path().join(&build_result.snap_filename);
         assert!(
             snap_path.exists(),
             "snap file should exist at {:?}",
@@ -844,25 +1174,28 @@ mod tests {
 
         // Build amd64
         let snap_amd64 = build_snap(&meta, stage_dir, output_dir.path(), "amd64").unwrap();
-        assert_eq!(snap_amd64, "multi-test_2.0_amd64.snap");
-        assert!(output_dir.path().join(&snap_amd64).exists());
+        assert_eq!(snap_amd64.snap_filename, "multi-test_2.0_amd64.snap");
+        assert!(output_dir.path().join(&snap_amd64.snap_filename).exists());
 
         // Build arm64
         let snap_arm64 = build_snap(&meta, stage_dir, output_dir.path(), "arm64").unwrap();
-        assert_eq!(snap_arm64, "multi-test_2.0_arm64.snap");
-        assert!(output_dir.path().join(&snap_arm64).exists());
+        assert_eq!(snap_arm64.snap_filename, "multi-test_2.0_arm64.snap");
+        assert!(output_dir.path().join(&snap_arm64.snap_filename).exists());
 
         // Verify both have correct arch in YAML
-        for (arch, snap_name) in [("amd64", &snap_amd64), ("arm64", &snap_arm64)] {
+        for snap_result in [&snap_amd64, &snap_arm64] {
             let check = std::process::Command::new("unsquashfs")
-                .args(["-l", &output_dir.path().join(snap_name).to_string_lossy()])
+                .args([
+                    "-l",
+                    &output_dir
+                        .path()
+                        .join(&snap_result.snap_filename)
+                        .to_string_lossy(),
+                ])
                 .output()
                 .expect("unsquashfs should be available");
             let stdout = String::from_utf8_lossy(&check.stdout);
-            assert!(
-                stdout.contains("meta/snap.yaml"),
-                "{arch}: missing snap.yaml"
-            );
+            assert!(stdout.contains("meta/snap.yaml"), "missing snap.yaml");
         }
     }
 

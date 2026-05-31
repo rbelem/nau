@@ -1,0 +1,39 @@
+# CI for shoot — Rust CLI tool that builds Snap packages from Lua declarations.
+#
+# Uses devbox for reproducible toolchain (Rust, squashfs-tools, bubblewrap).
+# Verifies: build, test, lint, format.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install devbox
+        uses: jetify-com/devbox-install-action@v0.12.0
+        with:
+          project-path: .
+
+      - name: Build
+        run: devbox run -- cargo build --locked
+
+      - name: Test
+        run: devbox run -- cargo test --locked
+
+      - name: Lint (clippy)
+        run: devbox run -- cargo clippy --locked -- -D warnings
+
+      - name: Format check
+        run: devbox run -- cargo fmt --check

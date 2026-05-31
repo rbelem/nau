@@ -18,9 +18,12 @@
       "echo 'Welcome to devbox!' > /dev/null"
     ],
     "scripts": {
-      "test": [
-        "echo \"Error: no test specified\" && exit 1"
-      ]
+      "build": "cargo build",
+      "test": "cargo test",
+      "clippy": "cargo clippy -- -D warnings",
+      "fmt": "cargo fmt",
+      "fmt-check": "cargo fmt --check",
+      "check": "cargo test && cargo clippy -- -D warnings && cargo fmt --check"
     }
   }
 }

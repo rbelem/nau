@@ -22,8 +22,13 @@ return {
         grade = "stable",
         confinement = "strict",
 
-        -- Source URL — downloaded by shoot when `build` is set
-        source = "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-1.8.1.tar.gz",
+        -- Source URL + pinned SHA-256 for reproducible builds.
+        -- On first build, shoot verifies the hash. On rebuild, the lockfile
+        -- captures it so even bare URLs become pinned.
+        source = {
+            url = "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-1.8.1.tar.gz",
+            sha256 = "300281f5a6690c9b5dc2966a6cf64d80fa6ea464d6753676a2ccac42b4b1bc8a",
+        },
 
         -- Shell commands to build. $STAGE points to the stage directory.
         -- Runs inside the extracted source tree.
