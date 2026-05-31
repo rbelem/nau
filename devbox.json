@@ -10,7 +10,8 @@
     "squashfsTools@4.7.5",
     "autoconf@latest",
     "automake@latest",
-    "bison@latest"
+    "bison@latest",
+    "bubblewrap@latest"
   ],
   "shell": {
     "init_hook": [

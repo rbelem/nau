@@ -380,19 +380,128 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<()> {
         .map_err(|e| miette::miette!("failed to create stage dir: {}", e))?;
 
     // Convert stage_dir to absolute path (DESTDIR requires absolute)
-    let abs_stage = std::fs::canonicalize(stage_dir)
-        .unwrap_or_else(|_| stage_dir.to_path_buf());
+    let abs_stage = std::fs::canonicalize(stage_dir).unwrap_or_else(|_| stage_dir.to_path_buf());
 
-    let status = std::process::Command::new("sh")
-        .args(["-c", build_cmd])
-        .env("STAGE", &abs_stage)
-        .env("SRC", work_dir)
-        .current_dir(work_dir)
-        .status()
-        .map_err(|e| miette::miette!("failed to execute build: {}", e))?;
+    // Run build — either inside a bubblewrap sandbox or directly
+    run_build_command(build_cmd, build_path, work_dir, &abs_stage)?;
 
-    if !status.success() {
-        return Err(miette::miette!("build command exited with error"));
+    Ok(())
+}
+
+/// Run a build command, optionally wrapped in a bubblewrap sandbox.
+///
+/// `build_path` is the root build directory (host-side).
+/// `work_dir` is the source root (inside `build_path`).
+/// Inside the sandbox the build dir is mounted at `/build` and
+/// `$SRC` points to the source subdirectory.
+/// If `bwrap` is unavailable, falls back to direct execution.
+fn run_build_command(
+    cmd: &str,
+    build_path: &Path,
+    work_dir: &Path,
+    stage_dir: &Path,
+) -> miette::Result<()> {
+    // Detect bubblewrap
+    let bwrap = std::process::Command::new("which")
+        .arg("bwrap")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        });
+
+    if let Some(bwrap_bin) = bwrap {
+        // Determine the source path relative to /build inside the sandbox
+        let inner_src = if work_dir == build_path {
+            Path::new("/build").to_path_buf()
+        } else {
+            let rel = work_dir.strip_prefix(build_path).unwrap_or(Path::new(""));
+            Path::new("/build").join(rel)
+        };
+
+        let mut cmd_proc = std::process::Command::new(&bwrap_bin);
+        cmd_proc
+            .arg("--unshare-user")
+            .arg("--unshare-pid")
+            .arg("--unshare-ipc")
+            .arg("--unshare-net")
+            .arg("--proc")
+            .arg("/proc")
+            .arg("--dev")
+            .arg("/dev")
+            // Mount build dir at /build inside sandbox
+            .arg("--bind")
+            .arg(build_path)
+            .arg("/build")
+            // Mount stage dir at its absolute host path
+            .arg("--bind")
+            .arg(stage_dir)
+            .arg(stage_dir)
+            // Read-only system paths for toolchain
+            .arg("--ro-bind")
+            .arg("/usr")
+            .arg("/usr")
+            .arg("--ro-bind")
+            .arg("/lib")
+            .arg("/lib");
+        if Path::new("/lib64").exists() {
+            cmd_proc.arg("--ro-bind").arg("/lib64").arg("/lib64");
+        }
+        // Nix store (for NixOS/devbox builds)
+        if Path::new("/nix").exists() {
+            cmd_proc.arg("--ro-bind").arg("/nix").arg("/nix");
+        }
+        // Essential system paths (for shebangs, etc.)
+        if Path::new("/bin").exists() {
+            cmd_proc.arg("--ro-bind").arg("/bin").arg("/bin");
+        }
+        if Path::new("/run/current-system").exists() {
+            cmd_proc
+                .arg("--ro-bind")
+                .arg("/run/current-system")
+                .arg("/run/current-system");
+        }
+        // Private /tmp for build temp files
+        cmd_proc
+            .arg("--tmpfs")
+            .arg("/tmp")
+            .arg("--chdir")
+            .arg(&inner_src)
+            .env("STAGE", stage_dir)
+            .env("SRC", &inner_src)
+            .arg("sh")
+            .arg("-c")
+            .arg(cmd);
+
+        let status = cmd_proc
+            .status()
+            .map_err(|e| miette::miette!("bwrap execution failed: {}", e))?;
+
+        if !status.success() {
+            return Err(miette::miette!(
+                "build command exited with error (in sandbox)"
+            ));
+        }
+    } else {
+        // Fallback: run directly on host (no sandbox)
+        let status = std::process::Command::new("sh")
+            .args(["-c", cmd])
+            .env("STAGE", stage_dir)
+            .env("SRC", work_dir)
+            .current_dir(work_dir)
+            .status()
+            .map_err(|e| miette::miette!("failed to execute build: {}", e))?;
+
+        if !status.success() {
+            return Err(miette::miette!("build command exited with error"));
+        }
     }
 
     Ok(())
