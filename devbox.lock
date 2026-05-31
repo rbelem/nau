@@ -389,6 +389,54 @@
           "store_path": "/nix/store/1x0ba5x31jqzhhk02qz4lxkznmp6q3nl-rustfmt-1.95.0"
         }
       }
+    },
+    "squashfsTools@4.7.5": {
+      "last_modified": "2026-05-21T08:15:18Z",
+      "resolved": "github:NixOS/nixpkgs/4a29d733e8a7d5b824c3d8c958a946a9867b3eb2#squashfsTools",
+      "source": "devbox-search",
+      "version": "4.7.5",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/g3jf39z4ihnglzgysjx5qpp4f1hckh5i-squashfs-4.7.5",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/g3jf39z4ihnglzgysjx5qpp4f1hckh5i-squashfs-4.7.5"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/r4qhgjk089qscgdwmvnjw9hqhx0dagyl-squashfs-4.7.5",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/r4qhgjk089qscgdwmvnjw9hqhx0dagyl-squashfs-4.7.5"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/bf7p63cnpii9fq0kxlhxaw4pmrv30i36-squashfs-4.7.5",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/bf7p63cnpii9fq0kxlhxaw4pmrv30i36-squashfs-4.7.5"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/p42q8hjiphnms28ym8pwq7mbs9snl0f2-squashfs-4.7.5",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/p42q8hjiphnms28ym8pwq7mbs9snl0f2-squashfs-4.7.5"
+        }
+      }
     }
   }
 }

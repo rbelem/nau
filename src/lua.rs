@@ -3,14 +3,17 @@ use std::collections::HashMap;
 use miette::{IntoDiagnostic, WrapErr};
 use mlua::Value;
 
-/// A named output configuration, keyed by output name (e.g. "default", "server", "cli").
-pub type Outputs = HashMap<String, Value>;
+use crate::snap::SnapMeta;
 
-/// Evaluate a Lua file and return the table of named outputs.
+/// Named outputs from a `shoot.lua`, fully converted to owned Rust types.
+pub type Outputs = HashMap<String, SnapMeta>;
+
+/// Evaluate a Lua file and return the converted snap outputs.
 ///
-/// The file must return a Lua table (`{ default = { ... }, ... }`).
+/// The file must return a Lua table of snap declarations.
 /// The shoot DSL globals (`snap()`, `app()`) are injected before evaluation.
-/// Returns `Err` if the file cannot be read, is invalid Lua, or does not return a table.
+/// All Lua data is converted to owned `SnapMeta` structs before returning
+/// (the mlua state is dropped within this function).
 pub fn evaluate_file(path: &str) -> miette::Result<Outputs> {
     let lua = mlua::Lua::new();
     let source = std::fs::read_to_string(path)
@@ -30,7 +33,8 @@ pub fn evaluate_file(path: &str) -> miette::Result<Outputs> {
             let mut outputs = Outputs::new();
             for pair in table.pairs::<String, Value>() {
                 let (key, value) = pair.map_err(|e| miette::miette!("{}", e))?;
-                outputs.insert(key, value);
+                let meta = SnapMeta::from_lua_value(&value)?;
+                outputs.insert(key, meta);
             }
             Ok(outputs)
         }

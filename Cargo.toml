@@ -9,3 +9,6 @@ license = "GPL-3.0-only"
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.10", features = ["lua54"] }
 miette = { version = "7", features = ["fancy"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tempfile = "3"

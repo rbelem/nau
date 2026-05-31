@@ -6,7 +6,8 @@
     "rustfmt@1.95.0",
     "clippy@1.95.0",
     "cargo@1.95.0",
-    "rustc@1.95.0"
+    "rustc@1.95.0",
+    "squashfsTools@4.7.5"
   ],
   "shell": {
     "init_hook": [
