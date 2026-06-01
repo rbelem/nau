@@ -168,32 +168,31 @@ fn topological_sort(nodes: &[DepNode]) -> Vec<DepNode> {
     result
 }
 
-/// Load SnapMeta by package name or path, falling back to embedded packages.
+/// Load SnapMeta by package name or path, falling back to input sources.
 ///
 /// Resolution order:
 /// 1. Filesystem path or resolved pkgs/<letter>/<name>.lua
-/// 2. Embedded pkgs/ store (compiled into binary via rust-embed)
+/// 2. Package source inputs (cached GitHub repos, local paths)
 pub fn load_meta(name_or_path: &str) -> miette::Result<SnapMeta> {
-    // Try embedded store first (handles both filesystem and embedded)
-    match crate::embedded::resolve_pkg(name_or_path) {
-        crate::embedded::PkgResult::File(path) => {
+    match crate::pkg_source::resolve_pkg(name_or_path) {
+        crate::pkg_source::PkgResult::File(path) => {
             let outputs = crate::lua::evaluate_file(&path)?;
             outputs
                 .into_values()
                 .next()
                 .ok_or_else(|| miette::miette!("no outputs found in '{}'", path))
         }
-        crate::embedded::PkgResult::Embedded { path, content } => {
-            let outputs = crate::lua::evaluate_string(&path, &content)?;
+        crate::pkg_source::PkgResult::Found { content, .. } => {
+            let outputs = crate::lua::evaluate_string(name_or_path, &content)?;
             outputs
                 .into_values()
                 .next()
-                .ok_or_else(|| miette::miette!("no outputs found in embedded '{}'", path))
+                .ok_or_else(|| miette::miette!("no outputs found in package '{}'", name_or_path))
         }
-        crate::embedded::PkgResult::NotFound => {
+        crate::pkg_source::PkgResult::NotFound => {
             let path = resolve_path(name_or_path);
             Err(miette::miette!(
-                "package '{}' not found at {:?} (not on disk or embedded)",
+                "package '{}' not found at {:?} (not on disk or in input sources)",
                 name_or_path,
                 path
             ))
@@ -201,34 +200,9 @@ pub fn load_meta(name_or_path: &str) -> miette::Result<SnapMeta> {
     }
 }
 
-/// Resolve a package name to a path: try pkgs/<letter>/<name>.lua first,
-/// then fall back to the raw path (for absolute/relative paths).
+/// Resolve a package name to a path: checks local file system and input sources.
 pub fn resolve_path(name_or_path: &str) -> PathBuf {
-    if name_or_path.contains('/') || name_or_path.ends_with(".lua") {
-        return PathBuf::from(name_or_path);
-    }
-
-    let first = name_or_path
-        .chars()
-        .next()
-        .unwrap_or('x')
-        .to_ascii_lowercase();
-    let pkg_base = PathBuf::from("pkgs").join(first.to_string());
-
-    // Try pkgs/<letter>/<name>.lua (single file)
-    let single = pkg_base.join(format!("{}.lua", name_or_path));
-    if single.exists() {
-        return single;
-    }
-
-    // Try pkgs/<letter>/<name>/init.lua (directory package)
-    let dir_pkg = pkg_base.join(name_or_path).join("init.lua");
-    if dir_pkg.exists() {
-        return dir_pkg;
-    }
-
-    // Fall back to the raw name as a file path
-    PathBuf::from(name_or_path)
+    crate::pkg_source::resolve_path(name_or_path)
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use shoot::cli::{CacheCommand, Cli, Command, IndexCommand};
 use shoot::image::ImageDeclaration;
 use shoot::index::{IndexEntry, PackageIndex, StoreRef};
 use shoot::lock::{LockFile, SourceLockEntry};
-use shoot::snap::SourceSpec;
+use shoot::snap::{PackageInput, SourceSpec};
 
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
@@ -128,43 +128,32 @@ fn main() -> miette::Result<()> {
 }
 
 // ── Package name resolution ──
-// If file doesn't exist on disk, try resolving as a package name from pkgs/
-// or from the embedded store (compiled into the binary).
+// If file doesn't exist on disk, try resolving as a package name from
+// local pkgs/ or from initialized input sources.
 
 fn resolve_file(file: &str) -> String {
     if Path::new(file).exists() {
         return file.to_string();
     }
-    match shoot::embedded::resolve_pkg(file) {
-        shoot::embedded::PkgResult::File(path) => {
+    match shoot::pkg_source::resolve_pkg(file) {
+        shoot::pkg_source::PkgResult::File(path) => {
             eprintln!("  ℹ resolved '{}' to {}", file, path);
             path
         }
-        shoot::embedded::PkgResult::Embedded { path, .. } => {
-            eprintln!("  ℹ using embedded package '{}'", file);
-            format!("embedded://{}", path)
+        shoot::pkg_source::PkgResult::Found { path, content } => {
+            eprintln!("  ℹ using package '{}' ({})", file, path);
+            // Write to temp file for evaluation (Lua needs a real file for require())
+            let tmp = std::env::temp_dir().join(format!("shoot-{}.lua", file));
+            let _ = std::fs::write(&tmp, &content);
+            tmp.to_string_lossy().to_string()
         }
-        shoot::embedded::PkgResult::NotFound => file.to_string(),
+        shoot::pkg_source::PkgResult::NotFound => file.to_string(),
     }
 }
 
-/// Evaluate a file path or embedded source, returning snap outputs.
+/// Evaluate a file path or resolved package source, returning snap outputs.
 fn evaluate_file_or_embedded(file: &str) -> miette::Result<shoot::lua::Outputs> {
-    if let Some(embedded_path) = file.strip_prefix("embedded://") {
-        // Load from embedded store
-        if let Some(pkg) = shoot::embedded::Pkgs::get(embedded_path) {
-            let content = std::str::from_utf8(pkg.data.as_ref())
-                .unwrap_or("")
-                .to_string();
-            return shoot::lua::evaluate_string(embedded_path, &content);
-        }
-        Err(miette::miette!(
-            "embedded package '{}' not found",
-            embedded_path
-        ))
-    } else {
-        shoot::lua::evaluate_file(file)
-    }
+    shoot::lua::evaluate_file(file)
 }
 
 // ── Build command ──
@@ -199,8 +188,80 @@ fn cmd_build(
     target: Option<String>,
     json: bool,
 ) -> miette::Result<()> {
-    let file = resolve_file(&file);
+    // Initialize package source inputs
+    // 1. If the config file exists, extract its global inputs first
+    // 2. Otherwise fall back to the default input (github:rbelem/shoot/main)
+    let original_file = file.clone();
+    let file_exists = Path::new(&original_file).exists();
 
+    if file_exists {
+        // Extract global inputs from the config file and use those
+        match shoot::lua::evaluate_file_with_inputs(&original_file) {
+            Ok(eval) => {
+                shoot::pkg_source::init_global_inputs(&eval.global_inputs)?;
+                // We already have the outputs — use them directly
+                let all_outputs = eval.outputs;
+                return run_build(
+                    all_outputs,
+                    file, // unresolved — run_build handles it
+                    stage,
+                    output,
+                    arch,
+                    output_name,
+                    source_date_epoch,
+                    lockfile_path,
+                    all,
+                    cache,
+                    cache_max_size,
+                    target,
+                    json,
+                );
+            }
+            Err(_) => {
+                // Fall through to the normal path
+            }
+        }
+    }
+
+    // No config file or it failed — use default input and resolve by name
+    shoot::pkg_source::init_global_inputs(&HashMap::new())?;
+    let file = resolve_file(&file);
+    let all_outputs = evaluate_file_or_embedded(&file)?;
+
+    run_build(
+        all_outputs,
+        file,
+        stage,
+        output,
+        arch,
+        output_name,
+        source_date_epoch,
+        lockfile_path,
+        all,
+        cache,
+        cache_max_size,
+        target,
+        json,
+    )
+}
+
+/// Inner build logic after outputs are resolved.
+#[allow(clippy::too_many_arguments)]
+fn run_build(
+    all_outputs: shoot::lua::Outputs,
+    file: String,
+    stage: String,
+    output: String,
+    arch: Vec<String>,
+    output_name: Option<String>,
+    source_date_epoch: Option<String>,
+    lockfile_path: String,
+    all: bool,
+    cache: Option<String>,
+    cache_max_size: Option<String>,
+    target: Option<String>,
+    json: bool,
+) -> miette::Result<()> {
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
     }
@@ -211,8 +272,6 @@ fn cmd_build(
         sources: HashMap::new(),
         snaps: HashMap::new(),
     });
-
-    let all_outputs = evaluate_file_or_embedded(&file)?;
 
     let stage_dir = std::path::Path::new(&stage);
     let output_dir = std::path::Path::new(&output);
@@ -418,6 +477,8 @@ fn cmd_build(
 // ── Order command (--order flag) ──
 
 fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Result<()> {
+    // Initialize global inputs (default if no config)
+    shoot::pkg_source::init_global_inputs(&HashMap::new())?;
     let file = resolve_file(file);
     let all_outputs = evaluate_file_or_embedded(&file)?;
 
@@ -498,6 +559,7 @@ fn cmd_deps(
     flat: bool,
     json: bool,
 ) -> miette::Result<()> {
+    shoot::pkg_source::init_global_inputs(&HashMap::new())?;
     let names = vec![package.clone()];
     let nodes = shoot::deps::resolve_deps(&names, recursive)?;
 
@@ -575,6 +637,7 @@ fn cmd_image(
     lockfile_path: String,
     json: bool,
 ) -> miette::Result<()> {
+    shoot::pkg_source::init_global_inputs(&HashMap::new())?;
     let file = resolve_file(&file);
 
     if let Some(ref epoch) = source_date_epoch {
@@ -818,58 +881,11 @@ fn fuzzy_score(query: &str, target: &str) -> u32 {
 }
 
 fn cmd_search(query: &str, json: bool) {
+    // Ensure global inputs are initialized for iter_packages
+    let _ = shoot::pkg_source::init_global_inputs(&HashMap::new());
+
+    let candidates = shoot::pkg_source::iter_packages();
     let mut scored: Vec<(u32, String)> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Collect all candidate names
-    let mut candidates: Vec<String> = Vec::new();
-
-    // Search filesystem pkgs/ first
-    let fs_base = Path::new("pkgs");
-    if fs_base.exists() {
-        if let Ok(entries) = std::fs::read_dir(fs_base) {
-            for entry in entries.flatten() {
-                let letter = entry.path();
-                let dir_name = letter.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !letter.is_dir() || dir_name == "lib" || dir_name.starts_with('.') {
-                    continue;
-                }
-                if let Ok(files) = std::fs::read_dir(&letter) {
-                    for file in files.flatten() {
-                        let path = file.path();
-                        let name = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if seen.insert(name.clone()) {
-                            candidates.push(name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Search embedded pkgs/
-    for epath in shoot::embedded::iter_embedded() {
-        let parts: Vec<&str> = epath.split('/').collect();
-        if parts.len() == 3 && parts[2] != "init.lua" {
-            continue;
-        }
-        if parts.len() == 2 && parts[0] == "lib" {
-            continue;
-        }
-        if let Some(name) = epath
-            .strip_suffix(".lua")
-            .and_then(|p| p.split('/').next_back())
-        {
-            let s = name.to_string();
-            if seen.insert(s.clone()) {
-                candidates.push(s);
-            }
-        }
-    }
 
     // Score all candidates
     for name in &candidates {
@@ -919,6 +935,39 @@ fn cmd_completion(shell: clap_complete::Shell) -> miette::Result<()> {
 
 fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
     match sub {
+        IndexCommand::Update { file } => {
+            let inputs = if Path::new(&file).exists() {
+                match shoot::lua::evaluate_file_with_inputs(&file) {
+                    Ok(eval) => eval.global_inputs,
+                    Err(_) => {
+                        eprintln!("  could not read inputs from '{file}', using default");
+                        HashMap::new()
+                    }
+                }
+            } else {
+                HashMap::new()
+            };
+
+            if inputs.is_empty() {
+                let default = PackageInput {
+                    url: "github:rbelem/shoot/main".into(),
+                };
+                eprintln!("  Updating default package index...");
+                if let Err(e) = shoot::pkg_source::refresh_input(&default) {
+                    eprintln!("  ✗ failed: {e}");
+                } else {
+                    eprintln!("  ✓ default package index updated");
+                }
+            } else {
+                for (name, input) in &inputs {
+                    eprintln!("  Updating input '{name}'...");
+                    match shoot::pkg_source::refresh_input(input) {
+                        Ok(_) => eprintln!("  ✓ '{name}' updated"),
+                        Err(e) => eprintln!("  ✗ '{name}' failed: {e}"),
+                    }
+                }
+            }
+        }
         IndexCommand::List { index } => {
             let path = Path::new(&index);
             let idx = if path.exists() {

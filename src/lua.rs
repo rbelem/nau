@@ -4,7 +4,7 @@ use miette::{IntoDiagnostic, WrapErr};
 use mlua::Value;
 
 use crate::image::ImageDeclaration;
-use crate::snap::SnapMeta;
+use crate::snap::{PackageInput, SnapMeta};
 
 /// Named outputs from a `shoot.lua`, fully converted to owned Rust types.
 pub type Outputs = HashMap<String, SnapMeta>;
@@ -92,6 +92,90 @@ pub fn evaluate_file(path: &str) -> miette::Result<Outputs> {
         .into_diagnostic()
         .wrap_err_with(|| format!("could not read {}", path))?;
     evaluate_string(path, &source)
+}
+
+// ── Evaluation with global inputs ──
+
+/// Result of evaluating a Lua file, including global inputs.
+pub struct EvalOutput {
+    pub outputs: Outputs,
+    pub global_inputs: HashMap<String, PackageInput>,
+}
+
+/// Evaluate Lua source and return both outputs and global inputs.
+pub fn evaluate_string_with_inputs(label: &str, source: &str) -> miette::Result<EvalOutput> {
+    let lua = new_lua(label)?;
+
+    let result: Value = lua
+        .load(source)
+        .eval()
+        .map_err(|e| miette::miette!("{}: {}", label, e))?;
+
+    let global_inputs = extract_inputs_from_lua(&lua)?;
+
+    match result {
+        Value::Table(table) => {
+            let mut outputs = Outputs::new();
+            for pair in table.pairs::<String, Value>() {
+                let (key, value) = pair.map_err(|e| miette::miette!("{}: {}", label, e))?;
+                if let Ok(meta) = SnapMeta::from_lua_value(&value) {
+                    outputs.insert(key, meta);
+                }
+            }
+            Ok(EvalOutput {
+                outputs,
+                global_inputs,
+            })
+        }
+        other => Err(miette::miette!(
+            "{} must return a table of outputs, got {}",
+            label,
+            other.type_name()
+        )),
+    }
+}
+
+/// Evaluate a Lua file and return both outputs and global inputs.
+pub fn evaluate_file_with_inputs(path: &str) -> miette::Result<EvalOutput> {
+    let source = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("could not read {}", path))?;
+    evaluate_string_with_inputs(path, &source)
+}
+
+/// Extract the global `inputs` table from an evaluated Lua state.
+/// Returns an empty map if no inputs are set.
+fn extract_inputs_from_lua(lua: &mlua::Lua) -> miette::Result<HashMap<String, PackageInput>> {
+    let globals = lua.globals();
+    let value: mlua::Value = globals.get("inputs").unwrap_or(mlua::Value::Nil);
+    match value {
+        Value::Table(t) => {
+            let mut inputs = HashMap::new();
+            for pair in t.pairs::<String, Value>() {
+                let (name, val) = pair.map_err(|e| miette::miette!("inputs entry: {e}"))?;
+                match val {
+                    Value::Table(input_table) => {
+                        let url: String = input_table
+                            .get("url")
+                            .map_err(|_| miette::miette!("inputs['{name}']: missing 'url'"))?;
+                        inputs.insert(name, PackageInput { url });
+                    }
+                    other => {
+                        return Err(miette::miette!(
+                            "inputs['{name}'] must be a table, got {}",
+                            other.type_name()
+                        ));
+                    }
+                }
+            }
+            Ok(inputs)
+        }
+        Value::Nil => Ok(HashMap::new()),
+        other => Err(miette::miette!(
+            "'inputs' must be a table, got {}",
+            other.type_name()
+        )),
+    }
 }
 
 /// Evaluate a Lua file and extract image declarations.

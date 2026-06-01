@@ -258,6 +258,15 @@ pub enum IndexCommand {
         #[arg(long, default_value = "latest/stable")]
         channel: String,
     },
+
+    /// Update package source inputs (re-fetch GitHub repositories).
+    /// Ensures the local cache matches the remote.
+    Update {
+        /// Path to the Lua config file (default: shoot.lua).
+        /// If not found, updates the default package index.
+        #[arg(short, long, default_value = "shoot.lua")]
+        file: String,
+    },
 }
 
 #[cfg(test)]

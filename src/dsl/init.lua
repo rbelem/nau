@@ -103,6 +103,21 @@ function snap(opts)
     check_table(opts.plugs, "snap", "plugs")
     check_table(opts.slots, "snap", "slots")
 
+    -- inputs: table of name → { url } (package source, inspired by Nix inputs)
+    if opts.inputs ~= nil then
+        if type(opts.inputs) ~= "table" then
+            error("snap(): 'inputs' must be a table, got " .. type(opts.inputs), 2)
+        end
+        for name, input_def in pairs(opts.inputs) do
+            if type(input_def) ~= "table" then
+                error(string.format("snap(): inputs['%s'] must be a table, got %s", name, type(input_def)), 2)
+            end
+            if type(input_def.url) ~= "string" then
+                error(string.format("snap(): inputs['%s'].url must be a string", name), 2)
+            end
+        end
+    end
+
     -- apps: table mapping string -> app definition
     check_table(opts.apps, "snap", "apps")
     if opts.apps ~= nil then

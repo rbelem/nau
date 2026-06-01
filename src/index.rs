@@ -357,6 +357,7 @@ impl PackageIndex {
             requires: vec![],
             target: None,
             toolchain: None,
+            inputs: None,
             apps,
         })
     }
@@ -439,7 +440,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("package-index.json");
 
-        let mut index = PackageIndex {
+        let index = PackageIndex {
             version: 1,
             snaps: vec![sample_entry()],
         };

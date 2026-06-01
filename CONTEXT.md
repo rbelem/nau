@@ -13,10 +13,13 @@ _Avoid_: config file, manifest, snapcraft.yaml
 **Snap output**: One named snap declaration inside a `shoot.lua`. Single-snap projects use the `default` key; multi-output projects name them (`server`, `cli`).
 _Avoid_: target, artifact, build product
 
-**Package**: A static snap definition in `pkgs/` — either single-file (`pkgs/<letter>/<name>.lua`) or directory (`pkgs/<letter>/<name>/init.lua`).
+**Package**: A static snap definition — either single-file (`pkgs/<letter>/<name>.lua`) or directory (`pkgs/<letter>/<name>/init.lua`).
 _Avoid_: recipe, formula, formula file
 
 **Package type**: `source` (build from upstream tarball), `meta` (dependency group, no build), `store` (pulled from Snap Store, no local source).
+
+**Input**: A package source declaration, inspired by Nix flake inputs. URL schemes: `github:user/repo[/branch]` (shallow-cloned to `~/.cache/shoot/inputs/`) or `path:/local/dir` (local filesystem). Declared as a Lua global before the return statement in `shoot.lua`, or per-snap via `inputs` on a `snap()` declaration. If no inputs are declared, a default `github:rbelem/shoot/main` is used at runtime.
+_Avoid_: registry, flake, source declaration
 
 **Toolchain**: A meta-package (`type = "meta"`) that aggregates compiler, linker, and runtime libraries needed to build source packages. Named by GNU triplet: `toolchain-<compiler>-<libc>-<arch>`.
 
@@ -63,3 +66,23 @@ _Avoid_: depends, deps, links
 **Dev**: How do I build an entire system image from these?
 
 **Domain expert**: Write an `image()` declaration with a base snap, kernel, gadget, and any extra snaps. `shoot image shoot.lua` resolves everything from the Snap Store, extracts the base as a rootfs, merges kernel modules, and packs the result into a SquashFS `.img`.
+
+**Dev**: The default input fetches from `github:rbelem/shoot/main`. Can I use a different repo?
+
+**Domain expert**: Set a global `inputs` table at the top of your `shoot.lua`:
+```lua
+inputs = {
+    mypkgs = { url = "github:myorg/mypackages/main" },
+}
+```
+Packages are resolved from your input's `pkgs/` directory. You can also use a local path:
+```lua
+inputs = {
+    localpkgs = { url = "path:/home/me/custom-pkgs" },
+}
+```
+Per-snap inputs work the same way, declared inside a `snap()` table.
+
+**Dev**: What if I don't have a `shoot.lua` at all?
+
+**Domain expert**: `shoot build hello` auto-fetches the default input (`github:rbelem/shoot/main`) on first run. It's cached in `~/.cache/shoot/inputs/`. Run `shoot index update` to refresh.

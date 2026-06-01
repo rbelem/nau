@@ -98,6 +98,20 @@ pub struct BuildResult {
     pub source_info: Option<SourceInfo>,
 }
 
+// ── Package inputs (inspired by Nix flake inputs) ──
+
+/// A package input source — declares where to fetch package definitions from.
+///
+/// URL schemes:
+///   `github:user/repo[/branch]` — GitHub repository (cloned shallow)
+///   `path:/local/dir`            — Local filesystem path
+#[derive(Debug, Clone, Serialize)]
+pub struct PackageInput {
+    /// URL in Nix-inspired format (e.g. "github:rbelem/shoot/main",
+    /// "path:/home/user/pkgs").
+    pub url: String,
+}
+
 // ── Phase 3: Snap metadata structs ──
 
 /// Top-level metadata for one snap output.
@@ -146,6 +160,12 @@ pub struct SnapMeta {
     /// Build/runtime dependencies. Skipped in YAML — build metadata only.
     #[serde(skip)]
     pub requires: Vec<String>,
+
+    /// Package input references. Maps input name to a URL.
+    /// Example: `{ packages = { url = "github:rbelem/shoot/main" } }`
+    /// Skipped in YAML — build metadata only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<HashMap<String, PackageInput>>,
 
     /// Cross-compilation target triplet (e.g. "x86_64-linux-gnu", "aarch64-linux-gnu").
     /// When set, the build sandbox sets CC/CXX/LD/etc to the cross-compiler and
@@ -224,6 +244,7 @@ impl SnapMeta {
         let requires: Vec<String> = table.get("requires").unwrap_or_default();
         let target: Option<String> = get_opt_string(table, "target")?;
         let toolchain: Option<String> = get_opt_string(table, "toolchain")?;
+        let inputs: Option<HashMap<String, PackageInput>> = get_package_inputs(table)?;
 
         let apps = get_opt_table(table, "apps")?
             .map(|apps_table| {
@@ -264,6 +285,7 @@ impl SnapMeta {
             requires,
             target,
             toolchain,
+            inputs,
             apps,
         })
     }
@@ -395,6 +417,41 @@ fn get_opt_map(table: &mlua::Table, key: &str) -> miette::Result<Option<HashMap<
         }
         Value::Nil => Ok(None),
         _ => Ok(None),
+    }
+}
+
+/// Extract `inputs` table: maps name → PackageInput { url }.
+fn get_package_inputs(
+    table: &mlua::Table,
+) -> miette::Result<Option<HashMap<String, PackageInput>>> {
+    let value: Value = table.get("inputs").unwrap_or(Value::Nil);
+    match value {
+        Value::Table(t) => {
+            let mut inputs = HashMap::new();
+            for pair in t.pairs::<String, Value>() {
+                let (name, val) = pair.map_err(|e| miette::miette!("inputs entry: {e}"))?;
+                match val {
+                    Value::Table(input_table) => {
+                        let url: String = input_table
+                            .get("url")
+                            .map_err(|_| miette::miette!("inputs['{name}']: missing 'url'"))?;
+                        inputs.insert(name, PackageInput { url });
+                    }
+                    other => {
+                        return Err(miette::miette!(
+                            "inputs['{name}'] must be a table, got {}",
+                            other.type_name()
+                        ));
+                    }
+                }
+            }
+            Ok(Some(inputs))
+        }
+        Value::Nil => Ok(None),
+        other => Err(miette::miette!(
+            "'inputs' must be a table, got {}",
+            other.type_name()
+        )),
     }
 }
 

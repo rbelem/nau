@@ -23,3 +23,6 @@ target
 # OpenCode / GSD local state
 .opencode/gsd-install-state.json
 .opencode/gsd-file-manifest.json
+
+# CodeGraph index
+.codegraph/

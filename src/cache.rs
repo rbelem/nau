@@ -322,6 +322,7 @@ mod tests {
             requires: vec![],
             target: None,
             toolchain: None,
+            inputs: None,
             apps: std::collections::HashMap::new(),
         }
     }
@@ -343,6 +344,7 @@ mod tests {
             requires: vec![],
             target: None,
             toolchain: None,
+            inputs: None,
             apps: std::collections::HashMap::new(),
         }
     }
