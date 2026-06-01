@@ -21,6 +21,8 @@ fn main() -> miette::Result<()> {
             source_date_epoch,
             lockfile: lockfile_path,
             order,
+            all,
+            cache,
         } => {
             if order {
                 return cmd_order(&file, &output_name);
@@ -33,6 +35,8 @@ fn main() -> miette::Result<()> {
                 output_name,
                 source_date_epoch,
                 lockfile_path,
+                all,
+                cache,
             )
         }
 
@@ -71,6 +75,7 @@ fn main() -> miette::Result<()> {
 
 // ── Build command ──
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_build(
     file: String,
     stage: String,
@@ -79,6 +84,8 @@ fn cmd_build(
     output_name: Option<String>,
     source_date_epoch: Option<String>,
     lockfile_path: String,
+    all: bool,
+    cache: Option<String>,
 ) -> miette::Result<()> {
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
@@ -96,6 +103,15 @@ fn cmd_build(
     let stage_dir = std::path::Path::new(&stage);
     let output_dir = std::path::Path::new(&output);
 
+    // Initialize binary cache if --cache was specified or --all is set
+    let pkg_cache = if all || cache.is_some() {
+        Some(shoot::cache::PackageCache::new(
+            cache.map(std::path::PathBuf::from),
+        ))
+    } else {
+        None
+    };
+
     let iter: Vec<(&String, &shoot::snap::SnapMeta)> = match &output_name {
         Some(name) => {
             let meta = all_outputs
@@ -105,6 +121,68 @@ fn cmd_build(
         }
         None => all_outputs.iter().collect(),
     };
+
+    // If --all, resolve and build transitive dependencies first
+    if all {
+        let mut all_deps: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (_name, meta) in &iter {
+            if !meta.requires.is_empty() {
+                if let Ok(deps) = shoot::deps::resolve_dep_names(&meta.requires, true) {
+                    for dep in &deps {
+                        if seen.insert(dep.clone()) {
+                            all_deps.push(dep.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !all_deps.is_empty() {
+            eprintln!("── Building {} dependencies ──", all_deps.len());
+            for dep_name in &all_deps {
+                // Try to load the dependency as a package from pkgs/
+                let dep_meta = match shoot::deps::load_meta(dep_name) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("  ⚠ skipping dependency '{}': {}", dep_name, e);
+                        continue;
+                    }
+                };
+
+                // Check cache first
+                if let Some(ref cache) = pkg_cache {
+                    if let Some(_cached_path) = cache.lookup(&dep_meta, "amd64") {
+                        eprintln!("  ✓ {} (cached)", dep_name);
+                        continue;
+                    }
+                }
+
+                let dep_archs = shoot::snap::resolve_archs(&dep_meta, &arch);
+                for a in &dep_archs {
+                    eprintln!("  building {} ({})...", dep_name, a);
+                    let dep_stage = tempfile::tempdir()
+                        .map_err(|e| miette::miette!("failed to create temp stage: {}", e))?;
+
+                    match shoot::snap::build_snap(&dep_meta, dep_stage.path(), output_dir, a) {
+                        Ok(result) => {
+                            eprintln!("    ✓ {}", result.snap_filename);
+                            // Store in cache
+                            if let Some(ref cache) = pkg_cache {
+                                if let Err(e) = cache.store(&dep_meta, &result, a, output_dir) {
+                                    eprintln!("  ⚠ cache store failed: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  ⚠ build failed for '{}': {}", dep_name, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let mut all_source_info: Vec<shoot::snap::SourceInfo> = Vec::new();
 
@@ -238,7 +316,7 @@ fn cmd_deps(package: String, recursive: bool, tree: bool, flat: bool) -> miette:
     } else {
         // Default: show the package with its direct requires
         if let Some(pkg) = nodes.first() {
-            println!("{} {}: {}", package, "v1.0", pkg.name);
+            println!("{} v1.0: {}", package, pkg.name);
             if pkg.requires.is_empty() {
                 println!("  No dependencies");
             } else {

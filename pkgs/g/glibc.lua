@@ -19,6 +19,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "linux-headers" },
         source = {
             url = "https://ftp.gnu.org/gnu/glibc/glibc-2.41.tar.xz",
         },

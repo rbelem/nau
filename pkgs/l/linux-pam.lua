@@ -18,6 +18,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://github.com/linux-pam/linux-pam/releases/download/v1.7.0/Linux-PAM-1.7.0.tar.xz",
         },

@@ -18,6 +18,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-1.11.1.tar.bz2",
         },

@@ -18,6 +18,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz",
         },

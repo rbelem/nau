@@ -18,6 +18,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://ftp.gnu.org/gnu/findutils/findutils-4.10.0.tar.xz",
         },

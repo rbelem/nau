@@ -17,6 +17,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://gitlab.freedesktop.org/polkit/polkit/-/archive/127/polkit-127.tar.gz",
         },

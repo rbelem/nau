@@ -160,7 +160,41 @@ extensions were added after MVP completion:
 **Features:**
 - ✅ `shoot deps` subcommand: dependency tree resolution
 - ✅ `shoot build --order`: print build order without building
+- ✅ `shoot build --all`: build all transitive dependencies before the target
+- ✅ `shoot build --cache`: local binary cache at `~/.cache/shoot/pkgs/`, keyed by source SHA-256
 - ✅ `shoot doctor`: system readiness checks
+
+### Toolchain Bootstrap & Cross-Compilation (Phase 13 — ✅ Complete)
+**Features:**
+- ✅ `target` field on `snap()`: declare cross-compilation triplet
+- ✅ `toolchain` field on `snap()`: select which toolchain to use for building
+- ✅ Cross-compilation env vars in build sandbox (CC, CXX, LD, AR, CONFIGURE_TARGET, etc.)
+- ✅ Cross-sysroot mount in bubblewrap sandbox
+- ✅ Stage 0/1 GCC bootstrap packages
+- ✅ `toolchain-bootstrap` meta-package orchestrator
+
+### Examples Expansion (Phase 14 — ✅ Complete)
+**Features:**
+- ✅ `build-hello/`: single source package build
+- ✅ `store-snap/`: pulling from Snap Store
+- ✅ `multi-output/`: one file, multiple snaps
+- ✅ `composable/`: require + merge pattern
+- ✅ `toolchain-demo/`: building with default toolchain
+- ✅ `toolchain-bootstrap/`: 3-stage cross-compiler bootstrap
+
+---
+
+### Toolchain Bootstrap (Phase 13 — ✅ Complete)
+**Goal:** Cross-compilation support with 3-stage bootstrap from host compiler
+**Features:**
+- ✅ `target` field on `snap()`: declare cross-compilation triplet (e.g. `x86_64-linux-gnu`)
+- ✅ `toolchain` field on `snap()`: select which toolchain to use for building
+- ✅ Cross-compilation env vars in build sandbox: CC, CXX, LD, AR, AS, RANLIB, STRIP, CONFIGURE_TARGET, CROSS_COMPILE, HOST, BUILD
+- ✅ Cross-sysroot mount in bubblewrap sandbox: `/usr/<triplet>` mounted when target is set
+- ✅ Stage 0 GCC bootstrap package: minimal C-only cross-compiler from host
+- ✅ Stage 1 GCC bootstrap package: full C/C++ cross-compiler from stage0
+- ✅ Toolchain bootstrap meta-package: orchestrates stage0→stage1→full toolchain
+- ✅ `examples/packages/toolchain-bootstrap/`: ready-to-use bootstrap example
 
 ---
 

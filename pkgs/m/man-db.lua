@@ -17,6 +17,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://download.savannah.gnu.org/releases/man-db/man-db-2.13.1.tar.xz",
         },

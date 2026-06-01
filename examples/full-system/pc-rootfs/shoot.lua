@@ -9,7 +9,7 @@
 --   - systemd-boot bootloader
 --
 -- Build:
---   shoot image --file examples/pc-rootfs/shoot.lua --arch amd64
+--   shoot image --file examples/full-system/pc-rootfs/shoot.lua --arch amd64
 --
 -- Requires:
 --   package-index.json with resolved snaps (shoot index resolve)

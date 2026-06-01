@@ -18,6 +18,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://mirrors.edge.kernel.org/pub/linux/utils/net/iproute2/iproute2-6.13.0.tar.xz",
         },

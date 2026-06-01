@@ -18,6 +18,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://mirrors.edge.kernel.org/pub/linux/network/wireless/iwd-3.4.tar.xz",
         },

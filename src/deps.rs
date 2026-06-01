@@ -20,10 +20,7 @@ pub struct DepNode {
 ///
 /// `seeds` can be package names (resolved via pkgs/) or paths to shoot.lua files.
 /// Returns packages in topological build order (leaf dependencies first).
-pub fn resolve_deps(
-    seeds: &[String],
-    recursive: bool,
-) -> miette::Result<Vec<DepNode>> {
+pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<DepNode>> {
     let mut nodes: Vec<DepNode> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut pending: Vec<String> = seeds.to_vec();
@@ -67,7 +64,7 @@ pub fn resolve_dep_names(seeds: &[String], recursive: bool) -> miette::Result<Ve
 }
 
 /// Format deps as a tree string.
-pub fn format_tree(seeds: &[String], recursive: bool) -> miette::Result<String> {
+pub fn format_tree(seeds: &[String], _recursive: bool) -> miette::Result<String> {
     let nodes = resolve_deps(seeds, true)?;
     let mut output = String::new();
 
@@ -78,7 +75,10 @@ pub fn format_tree(seeds: &[String], recursive: bool) -> miette::Result<String> 
     for node in &nodes {
         for dep in &node.requires {
             if all_names.contains(dep) {
-                children.entry(node.name.clone()).or_default().push(dep.clone());
+                children
+                    .entry(node.name.clone())
+                    .or_default()
+                    .push(dep.clone());
             }
         }
     }
@@ -100,14 +100,6 @@ fn print_tree_node(
     depth: usize,
 ) {
     let indent = "  ".repeat(depth);
-    let prefix = if depth == 0 {
-        "".to_string()
-    } else if depth == 1 {
-        "├─ ".to_string()
-    } else {
-        "│  ".repeat(depth - 1) + "├─ "
-    };
-
     output.push_str(&format!("{}{}\n", indent, name));
 
     if let Some(deps) = children.get(name.trim()) {
@@ -177,7 +169,7 @@ fn topological_sort(nodes: &[DepNode]) -> Vec<DepNode> {
 }
 
 /// Load SnapMeta from a shoot.lua file, resolving the path by package name.
-fn load_meta(name_or_path: &str) -> miette::Result<SnapMeta> {
+pub fn load_meta(name_or_path: &str) -> miette::Result<SnapMeta> {
     let path = resolve_path(name_or_path);
     if !path.exists() {
         return Err(miette::miette!(
@@ -265,17 +257,31 @@ mod tests {
         assert!(p.to_string_lossy().ends_with("pkgs/g/gcc.lua"));
 
         // File path -> raw path
-        let p = resolve_path("examples/system-base/shoot.lua");
-        assert!(p.to_string_lossy().ends_with("examples/system-base/shoot.lua"));
+        let p = resolve_path("examples/full-system/system-base/shoot.lua");
+        assert!(p
+            .to_string_lossy()
+            .ends_with("examples/full-system/system-base/shoot.lua"));
     }
 
     #[test]
     fn test_topological_sort_linear() {
         let nodes = vec![
-            DepNode { name: "d".into(), requires: vec!["c".into()] },
-            DepNode { name: "c".into(), requires: vec!["b".into()] },
-            DepNode { name: "b".into(), requires: vec!["a".into()] },
-            DepNode { name: "a".into(), requires: vec![] },
+            DepNode {
+                name: "d".into(),
+                requires: vec!["c".into()],
+            },
+            DepNode {
+                name: "c".into(),
+                requires: vec!["b".into()],
+            },
+            DepNode {
+                name: "b".into(),
+                requires: vec!["a".into()],
+            },
+            DepNode {
+                name: "a".into(),
+                requires: vec![],
+            },
         ];
 
         let sorted = topological_sort(&nodes);

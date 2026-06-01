@@ -55,10 +55,10 @@ pub struct DiskLayout {
 #[derive(Debug, Clone)]
 pub struct Partition {
     pub name: String,
-    pub size: String,           // e.g. "512M", "0" for remaining
-    pub fs: String,             // e.g. "vfat", "btrfs", "ext4"
-    pub mount: String,          // mount point
-    pub options: Vec<String>,   // mount options
+    pub size: String,         // e.g. "512M", "0" for remaining
+    pub fs: String,           // e.g. "vfat", "btrfs", "ext4"
+    pub mount: String,        // mount point
+    pub options: Vec<String>, // mount options
 }
 
 /// Swap configuration.
@@ -295,12 +295,12 @@ fn get_partitions(table: &mlua::Table) -> miette::Result<Vec<Partition>> {
                         let name: String = pt
                             .get("name")
                             .map_err(|_| miette::miette!("partition: missing 'name'"))?;
-                        let size: String = pt.get("size").map_err(|_| {
-                            miette::miette!("partition '{}': missing 'size'", name)
-                        })?;
-                        let fs: String = pt.get("fs").map_err(|_| {
-                            miette::miette!("partition '{}': missing 'fs'", name)
-                        })?;
+                        let size: String = pt
+                            .get("size")
+                            .map_err(|_| miette::miette!("partition '{}': missing 'size'", name))?;
+                        let fs: String = pt
+                            .get("fs")
+                            .map_err(|_| miette::miette!("partition '{}': missing 'fs'", name))?;
                         let mount: String = pt.get("mount").map_err(|_| {
                             miette::miette!("partition '{}': missing 'mount'", name)
                         })?;
@@ -404,11 +404,8 @@ fn resolve_image_snaps(
                         }
                         // If index has a store name, try resolving with it
                         if let Some(ref store) = entry.store {
-                            let store_name = store
-                                .name
-                                .as_deref()
-                                .unwrap_or(&snap_ref.name)
-                                .to_string();
+                            let store_name =
+                                store.name.as_deref().unwrap_or(&snap_ref.name).to_string();
                             let resolved_pin = SnapRef {
                                 name: store_name,
                                 revision: pin.revision,
@@ -795,10 +792,7 @@ pub fn build_disk_image(
         std::fs::create_dir_all(&sysctl_dir).into_diagnostic()?;
         let sysctl_content = image.sysctl.join("\n") + "\n";
         std::fs::write(sysctl_dir.join("99-shoot.conf"), &sysctl_content).into_diagnostic()?;
-        eprintln!(
-            "  ✓ sysctl written ({} entries)",
-            image.sysctl.len()
-        );
+        eprintln!("  ✓ sysctl written ({} entries)", image.sysctl.len());
     }
 
     // 7. Write manifest
@@ -860,11 +854,7 @@ pub fn build_disk_image(
         let size_mb = parse_size_mb(&part.size, total_mb - part_start_mb);
         let end_mb = part_start_mb + size_mb;
 
-        let fs_type = if part.fs == "vfat" {
-            "fat32"
-        } else {
-            &part.fs
-        };
+        let fs_type = if part.fs == "vfat" { "fat32" } else { &part.fs };
         let status = std::process::Command::new("parted")
             .args([
                 "-s",

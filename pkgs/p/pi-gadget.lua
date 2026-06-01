@@ -29,5 +29,7 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
     },
 }

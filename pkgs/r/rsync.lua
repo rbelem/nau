@@ -19,6 +19,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://download.samba.org/pub/rsync/rsync-3.4.1.tar.gz",
         },

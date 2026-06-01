@@ -50,6 +50,18 @@ pub enum Command {
         /// Print dependency build order and exit (no build).
         #[arg(long)]
         order: bool,
+
+        /// Build all transitive dependencies before building the requested output(s).
+        /// Deps are built in topological order and stored in the binary cache.
+        /// Use --cache to control where cached builds are stored.
+        #[arg(long)]
+        all: bool,
+
+        /// Binary cache directory for built packages (default: ~/.cache/shoot/pkgs).
+        /// Cached builds are keyed by source SHA-256, so rebuilds only happen when
+        /// source changes. Combine with --all to build full dependency trees efficiently.
+        #[arg(long)]
+        cache: Option<String>,
     },
 
     /// Build a system image from pinned snaps

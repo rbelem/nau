@@ -18,6 +18,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://github.com/shadow-maint/shadow/releases/download/4.17.4/shadow-4.17.4.tar.gz",
         },

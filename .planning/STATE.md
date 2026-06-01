@@ -28,9 +28,11 @@ See: `.planning/REQUIREMENTS.md` (updated 2026-06-01)
 ## Project Stats
 
 - **105 packages** in `pkgs/` (Ubuntu-style pool layout)
-- **4 examples** in `examples/` (system-base, pc-rootfs, pi-rootfs)
-- **DSL extensions:** `type`, `requires`, `aliases` fields
-- **Dependency resolution:** `shoot deps` + `shoot build --order`
+- **9 examples** in `examples/full-system/` (system-base, pc-rootfs, pi-rootfs, store-snap) and `examples/packages/` (build-hello, composable, multi-output, toolchain-bootstrap, toolchain-demo)
+- **DSL extensions:** `type`, `requires`, `aliases`, `target`, `toolchain` fields
+- **Dependency resolution:** `shoot deps` + `shoot build --order` + `shoot build --all`
+- **Binary cache:** `~/.cache/shoot/pkgs/` keyed by source SHA-256 — skip rebuilds when source unchanged
+- **Cross-compilation:** `target` field sets CC/CXX/LD/AR env vars + mounts cross-sysroot
 - **Image assembly:** `shoot image` with GPT disk, kernel params, bootloader
 - **Package index:** `package-index.json` with store pins and alias resolution
 
@@ -48,6 +50,9 @@ See: `.planning/REQUIREMENTS.md` (updated 2026-06-01)
 | 2026-06-01 | GNU target triplet for toolchain naming | Standard convention: `<compiler>-<libc>-<arch>` |
 | 2026-06-01 | `type` field on snap() | Distinguish source/meta/store packages |
 | 2026-06-01 | `requires` + `aliases` fields | Declare dependencies and alternative names |
+| 2026-06-01 | `target` + `toolchain` fields on snap() | Cross-compilation support + toolchain selection in DSL |
+| 2026-06-01 | Cross-compilation env vars in build sandbox | GNU triplet naming convention for CC/CXX/LD/AR etc. |
+| 2026-06-01 | 3-stage GCC bootstrap (stage0→stage1→stage2) | Break circular toolchain dependency, self-hosting path |
 
 ## Blockers
 

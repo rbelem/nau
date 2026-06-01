@@ -18,6 +18,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://gitlab.freedesktop.org/accountsservice/accountsservice/-/archive/23.13.9/accountsservice-23.13.9.tar.gz",
         },

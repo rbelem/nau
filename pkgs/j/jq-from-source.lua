@@ -39,6 +39,8 @@ return {
         }, " && "),
 
         architectures = { "amd64" },
+        type = "source",
+        requires = { "glibc" },
 
         apps = {
             jq = app {

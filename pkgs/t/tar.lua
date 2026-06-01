@@ -17,6 +17,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://ftp.gnu.org/gnu/tar/tar-1.35.tar.xz",
         },

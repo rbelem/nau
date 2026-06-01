@@ -17,6 +17,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://gnupg.org/ftp/gcrypt/gnupg/gnupg-2.5.5.tar.bz2",
         },

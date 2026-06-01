@@ -117,7 +117,7 @@ vim pkgs/<first-letter>/<name>/init.lua
 
 **Resolve dependencies:** `shoot deps pkgs/g/gcc --recursive --flat`
 
-**Check build order:** `shoot build --order --file examples/system-base/shoot.lua`
+**Check build order:** `shoot build --order --file examples/full-system/system-base/shoot.lua`
 
 **Register in index:** `shoot index add <name> --alias <alias>`
 

@@ -19,6 +19,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://www.greenwoodsoftware.com/less/less-661.tar.gz",
         },

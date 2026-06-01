@@ -9,7 +9,7 @@
 --   - u-boot bootloader (from gadget snap)
 --
 -- Build:
---   shoot image --file examples/pi-rootfs/shoot.lua --arch arm64
+--   shoot image --file examples/full-system/pi-rootfs/shoot.lua --arch arm64
 --
 -- Requires:
 --   package-index.json with resolved snaps (shoot index resolve)

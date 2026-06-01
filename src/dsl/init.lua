@@ -66,7 +66,7 @@ function snap(opts)
     -- Optional string fields
     local string_fields = {
         "summary", "description", "license", "grade", "confinement",
-        "stage", "build", "type",
+        "stage", "build", "type", "target", "toolchain",
     }
     -- Validate type field against known values
     if opts.type ~= nil then

@@ -27,5 +27,7 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf", "ppc64el", "s390x" },
+        type = "source",
+        requires = { "glibc" },
     },
 }

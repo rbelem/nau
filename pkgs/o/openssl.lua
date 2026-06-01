@@ -18,6 +18,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc", "zlib" },
         source = {
             url = "https://www.openssl.org/source/openssl-3.4.1.tar.gz",
         },

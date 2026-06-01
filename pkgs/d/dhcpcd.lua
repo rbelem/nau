@@ -18,6 +18,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://github.com/NetworkConfiguration/dhcpcd/releases/download/v10.1.0/dhcpcd-10.1.0.tar.xz",
         },

@@ -1,7 +1,7 @@
 -- Minimal rootfs for QEMU/KVM, using the 11 essential packages
 -- defined in pkgs/s/system-base/.
 --
--- Build:   shoot image --file examples/system-base/shoot.lua --arch amd64
+-- Build:   shoot image --file examples/full-system/system-base/shoot.lua --arch amd64
 -- Boot:    qemu-system-x86_64 -m 2G -smp 2 -enable-kvm       \
 --            -drive file=system-base_1.0.0_amd64.img,if=virtio \
 --            -serial mon:stdio

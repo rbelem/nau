@@ -145,6 +145,18 @@ pub struct SnapMeta {
     #[serde(skip)]
     pub requires: Vec<String>,
 
+    /// Cross-compilation target triplet (e.g. "x86_64-linux-gnu", "aarch64-linux-gnu").
+    /// When set, the build sandbox sets CC/CXX/LD/etc to the cross-compiler and
+    /// exports CONFIGURE_TARGET for autotools-based packages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+
+    /// Name of the toolchain meta-package to use for builds (e.g. "toolchain-gcc-gnu-x86_64").
+    /// Controls which compiler/linker are mounted into the build sandbox.
+    /// Default: host system toolchain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain: Option<String>,
+
     #[serde(default)]
     pub apps: HashMap<String, SnapApp>,
 }
@@ -208,6 +220,8 @@ impl SnapMeta {
         let type_: Option<String> = table.get("type").ok();
         let aliases: Vec<String> = table.get("aliases").unwrap_or_default();
         let requires: Vec<String> = table.get("requires").unwrap_or_default();
+        let target: Option<String> = get_opt_string(table, "target")?;
+        let toolchain: Option<String> = get_opt_string(table, "toolchain")?;
 
         let apps = get_opt_table(table, "apps")?
             .map(|apps_table| {
@@ -246,6 +260,8 @@ impl SnapMeta {
             type_,
             aliases,
             requires,
+            target,
+            toolchain,
             apps,
         })
     }
@@ -557,7 +573,13 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
     let abs_stage = std::fs::canonicalize(stage_dir).unwrap_or_else(|_| stage_dir.to_path_buf());
 
     // Run build — either inside a bubblewrap sandbox or directly
-    run_build_command(build_cmd, build_path, work_dir, &abs_stage)?;
+    run_build_command(
+        build_cmd,
+        build_path,
+        work_dir,
+        &abs_stage,
+        meta.target.as_deref(),
+    )?;
 
     Ok(Some(SourceInfo {
         url: source_url.to_string(),
@@ -591,11 +613,19 @@ fn sha256_file(path: &Path) -> miette::Result<String> {
 /// Inside the sandbox the build dir is mounted at `/build` and
 /// `$SRC` points to the source subdirectory.
 /// If `bwrap` is unavailable, falls back to direct execution.
+///
+/// Cross-compilation support:
+/// - If `target` is set, env vars CC, CXX, LD, AR, etc. are set to
+///   `{target}-{tool}` (using the GNU cross-compiler naming convention).
+/// - `CONFIGURE_TARGET` is exported for autotools-based packages.
+/// - The cross-toolchain sysroot is expected at the standard host path
+///   `/usr/{target}` or can be provided via `CROSS_SYSROOT`.
 fn run_build_command(
     cmd: &str,
     build_path: &Path,
     work_dir: &Path,
     stage_dir: &Path,
+    target: Option<&str>,
 ) -> miette::Result<()> {
     // Detect bubblewrap
     let bwrap = std::process::Command::new("which")
@@ -612,6 +642,32 @@ fn run_build_command(
                 Some(s)
             }
         });
+
+    // Build cross-compilation environment variables if target is set.
+    // These follow the GNU cross-compiler naming convention:
+    //   CC = <target>-gcc, CXX = <target>-g++, etc.
+    let cross_env = if let Some(triplet) = target {
+        let mut env = Vec::new();
+        env.push(("CONFIGURE_TARGET", triplet.to_string()));
+        env.push(("CC", format!("{}-gcc", triplet)));
+        env.push(("CXX", format!("{}-g++", triplet)));
+        env.push(("LD", format!("{}-ld", triplet)));
+        env.push(("AR", format!("{}-ar", triplet)));
+        env.push(("AS", format!("{}-as", triplet)));
+        env.push(("RANLIB", format!("{}-ranlib", triplet)));
+        env.push(("STRIP", format!("{}-strip", triplet)));
+        env.push(("OBJCOPY", format!("{}-objcopy", triplet)));
+        env.push(("OBJDUMP", format!("{}-objdump", triplet)));
+        env.push(("NM", format!("{}-nm", triplet)));
+        env.push(("PKG_CONFIG", format!("{}-pkg-config", triplet)));
+        // Standard autotools cross-compilation vars
+        env.push(("BUILD", std::env::consts::ARCH.to_string()));
+        env.push(("HOST", triplet.to_string()));
+        env.push(("CROSS_COMPILE", format!("{}-", triplet)));
+        Some(env)
+    } else {
+        None
+    };
 
     if let Some(bwrap_bin) = bwrap {
         // Determine the source path relative to /build inside the sandbox
@@ -664,6 +720,13 @@ fn run_build_command(
                 .arg("/run/current-system")
                 .arg("/run/current-system");
         }
+        // Cross-compilation sysroot mount
+        if let Some(triplet) = target {
+            let sysroot = Path::new("/usr").join(triplet);
+            if sysroot.exists() {
+                cmd_proc.arg("--ro-bind").arg(&sysroot).arg(&sysroot);
+            }
+        }
         // Private /tmp for build temp files
         cmd_proc
             .arg("--tmpfs")
@@ -671,10 +734,14 @@ fn run_build_command(
             .arg("--chdir")
             .arg(&inner_src)
             .env("STAGE", stage_dir)
-            .env("SRC", &inner_src)
-            .arg("sh")
-            .arg("-c")
-            .arg(cmd);
+            .env("SRC", &inner_src);
+        // Apply cross-compilation env vars
+        if let Some(ref env) = cross_env {
+            for (key, val) in env {
+                cmd_proc.env(key, val);
+            }
+        }
+        cmd_proc.arg("sh").arg("-c").arg(cmd);
 
         let status = cmd_proc
             .status()
@@ -687,11 +754,20 @@ fn run_build_command(
         }
     } else {
         // Fallback: run directly on host (no sandbox)
-        let status = std::process::Command::new("sh")
+        let mut cmd_proc = std::process::Command::new("sh");
+        cmd_proc
             .args(["-c", cmd])
             .env("STAGE", stage_dir)
-            .env("SRC", work_dir)
-            .current_dir(work_dir)
+            .env("SRC", work_dir);
+        // Apply cross-compilation env vars
+        if let Some(ref env) = cross_env {
+            for (key, val) in env {
+                cmd_proc.env(key, val);
+            }
+        }
+        cmd_proc.current_dir(work_dir);
+
+        let status = cmd_proc
             .status()
             .map_err(|e| miette::miette!("failed to execute build: {}", e))?;
 

@@ -31,6 +31,8 @@ return {
 
         -- Supported architectures
         architectures = { "amd64", "arm64" },
+        type = "source",
+        requires = { "glibc" },
 
         -- Apps declared in the snap
         apps = {

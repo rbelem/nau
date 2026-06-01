@@ -27,6 +27,8 @@ return {
         confinement = "strict",
         source = "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-1.8.1.tar.gz",
         architectures = { "amd64", "arm64" },
+        type = "source",
+        requires = { "glibc" },
         stage = "./stage/",
         apps = {
             -- Compose from the shared CLI template, override with jq-specific values

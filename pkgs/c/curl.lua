@@ -17,6 +17,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc", "zlib", "openssl" },
         source = {
             url = "https://curl.se/download/curl-8.12.1.tar.xz",
         },

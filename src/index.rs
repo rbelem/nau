@@ -355,6 +355,8 @@ impl PackageIndex {
             type_: None,
             aliases: vec![],
             requires: vec![],
+            target: None,
+            toolchain: None,
             apps,
         })
     }

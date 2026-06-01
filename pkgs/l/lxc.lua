@@ -19,6 +19,8 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
+        type = "source",
+        requires = { "glibc" },
         source = {
             url = "https://github.com/lxc/lxc/releases/download/lxc-6.0.2/lxc-6.0.2.tar.gz",
         },
