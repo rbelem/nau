@@ -7,6 +7,8 @@ use serde::Serialize;
 use serde::Serializer;
 use sha2::Digest;
 
+use crate::output;
+
 // ── Snap pinning (references to external snaps) ──
 
 /// A reference to a snap from the Snap Store, optionally pinned by revision
@@ -449,6 +451,7 @@ pub fn build_snap(
     let output_path = output_dir.join(&output_filename);
 
     // 5. Run mksquashfs with optional SOURCE_DATE_EPOCH
+    let pack_spinner = output::spinner(&format!("packaging {} as .snap...", meta.name));
     let mut mksquashfs = std::process::Command::new("mksquashfs");
     mksquashfs
         .arg(build_dir.path())
@@ -468,8 +471,16 @@ pub fn build_snap(
         .map_err(|e| miette::miette!("failed to execute mksquashfs: {}", e))?;
 
     if !status.success() {
+        output::finish_err(&pack_spinner, &format!("packaging {} failed", meta.name));
         return Err(miette::miette!("mksquashfs exited with error"));
     }
+    output::finish_ok(
+        &pack_spinner,
+        &format!(
+            "packaged {}.snap",
+            &output_filename[..output_filename.len().min(60)]
+        ),
+    );
 
     Ok(BuildResult {
         snap_filename: output_filename,
@@ -513,18 +524,23 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
     let build_path = build_dir.path();
 
+    let pkg_label = format!("{} {}", meta.name, meta.version);
+
     // 1. Download source tarball
     let filename = source_url.rsplit('/').next().unwrap_or("source.tar.gz");
     let tarball = build_path.join(filename);
 
+    let dl_spinner = output::spinner(&format!("downloading {}...", pkg_label));
     let status = std::process::Command::new("curl")
         .args(["-fsSL", "-o", &tarball.to_string_lossy(), source_url])
         .status()
         .map_err(|e| miette::miette!("curl not found: {}", e))?;
 
     if !status.success() {
+        output::finish_err(&dl_spinner, &format!("download failed: {}", meta.name));
         return Err(miette::miette!("failed to download {}", source_url));
     }
+    output::finish_ok(&dl_spinner, &format!("downloaded {}", meta.name));
 
     // 2. Compute SHA-256 of downloaded file
     let computed_sha256 = sha256_file(&tarball)?;
@@ -539,9 +555,12 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
                 computed_sha256
             ));
         }
-        eprintln!("  ✓ SHA-256 verified: {computed_sha256}");
-    } else {
-        eprintln!("  source hash (not pinned): {computed_sha256} (add to source.sha256 to pin)");
+        output::ok(format!("SHA-256 verified: {:.16}...", computed_sha256));
+    } else if !output::is_json() {
+        output::info(format!(
+            "source hash: {:.16}... (add to source.sha256 to pin)",
+            computed_sha256
+        ));
     }
 
     // 4. Extract tarball and find source root
@@ -549,6 +568,7 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
         || filename.ends_with(".tar.xz")
         || filename.ends_with(".tgz");
     if is_tarball {
+        let xtract_spinner = output::spinner(&format!("extracting {}...", meta.name));
         let tarball_str = tarball.to_string_lossy().to_string();
         let status = std::process::Command::new("tar")
             .arg("xaf")
@@ -557,8 +577,13 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
             .status()
             .map_err(|e| miette::miette!("tar not found: {}", e))?;
         if !status.success() {
+            output::finish_err(
+                &xtract_spinner,
+                &format!("extraction failed: {}", meta.name),
+            );
             return Err(miette::miette!("failed to extract {}", filename));
         }
+        output::finish_ok(&xtract_spinner, &format!("extracted {}", meta.name));
     }
 
     // 5. Find the source root (the single top-level dir after extraction)
@@ -573,6 +598,7 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
     let abs_stage = std::fs::canonicalize(stage_dir).unwrap_or_else(|_| stage_dir.to_path_buf());
 
     // Run build — either inside a bubblewrap sandbox or directly
+    let build_spinner = output::spinner(&format!("building {}...", meta.name));
     run_build_command(
         build_cmd,
         build_path,
@@ -580,6 +606,7 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
         &abs_stage,
         meta.target.as_deref(),
     )?;
+    output::finish_ok(&build_spinner, &format!("built {}", meta.name));
 
     Ok(Some(SourceInfo {
         url: source_url.to_string(),
