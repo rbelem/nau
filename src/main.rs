@@ -756,9 +756,73 @@ fn cmd_cache(sub: CacheCommand) -> miette::Result<()> {
 
 // ── Search command ──
 
+/// Fuzzy match score between query and target (0 = no match, higher = better).
+///
+/// Scoring:
+/// - Exact match: 100
+/// - Prefix match: 90
+/// - Subsequence match: proportional to consecutive/total matched, minus gap penalty
+fn fuzzy_score(query: &str, target: &str) -> u32 {
+    let q = query.to_lowercase();
+    let t = target.to_lowercase();
+
+    if q.is_empty() || t.is_empty() {
+        return 0;
+    }
+
+    if t == q {
+        return 100;
+    }
+    if t.starts_with(&q) {
+        return 90;
+    }
+    if t.contains(&q) {
+        return 80;
+    }
+
+    // Subsequence matching: characters of query appear in order in target
+    let q_chars: Vec<char> = q.chars().collect();
+    let t_chars: Vec<char> = t.chars().collect();
+    let mut qi = 0;
+    let mut prev_match: Option<usize> = None;
+    let mut consecutive = 0u32;
+    let mut max_consecutive = 0u32;
+    let mut gaps = 0u32;
+
+    for (ti, tc) in t_chars.iter().enumerate() {
+        if qi < q_chars.len() && *tc == q_chars[qi] {
+            if let Some(prev) = prev_match {
+                if ti == prev + 1 {
+                    consecutive += 1;
+                } else {
+                    gaps += (ti - prev - 1) as u32;
+                    consecutive = 0;
+                }
+            } else {
+                consecutive = 1;
+            }
+            max_consecutive = max_consecutive.max(consecutive);
+            prev_match = Some(ti);
+            qi += 1;
+        }
+    }
+
+    if qi < q_chars.len() {
+        return 0; // not all query chars matched
+    }
+
+    let base = 60u32;
+    let consec_bonus = (max_consecutive.saturating_sub(1)) * 5;
+    let gap_penalty = gaps.min(20);
+    base + consec_bonus - gap_penalty
+}
+
 fn cmd_search(query: &str, json: bool) {
-    let query_lower = query.to_lowercase();
-    let mut results: Vec<String> = Vec::new();
+    let mut scored: Vec<(u32, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Collect all candidate names
+    let mut candidates: Vec<String> = Vec::new();
 
     // Search filesystem pkgs/ first
     let fs_base = Path::new("pkgs");
@@ -768,7 +832,7 @@ fn cmd_search(query: &str, json: bool) {
                 let letter = entry.path();
                 let dir_name = letter.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if !letter.is_dir() || dir_name == "lib" || dir_name.starts_with('.') {
-                    continue; // skip pkgs/lib/ and hidden dirs
+                    continue;
                 }
                 if let Ok(files) = std::fs::read_dir(&letter) {
                     for file in files.flatten() {
@@ -778,8 +842,8 @@ fn cmd_search(query: &str, json: bool) {
                             .and_then(|s| s.to_str())
                             .unwrap_or("")
                             .to_string();
-                        if name.contains(&query_lower) && !results.contains(&name) {
-                            results.push(name);
+                        if seen.insert(name.clone()) {
+                            candidates.push(name);
                         }
                     }
                 }
@@ -788,29 +852,38 @@ fn cmd_search(query: &str, json: bool) {
     }
 
     // Search embedded pkgs/
-    for path in shoot::embedded::iter_embedded() {
-        // path is like "g/gcc.lua" — extract the package name
-        // Skip helper files: pkgs/lib/*, pkgs/<l>/<pkg>/lib.lua (not init.lua)
-        let parts: Vec<&str> = path.split('/').collect();
+    for epath in shoot::embedded::iter_embedded() {
+        let parts: Vec<&str> = epath.split('/').collect();
         if parts.len() == 3 && parts[2] != "init.lua" {
-            continue; // skip helpers inside dir packages like j/jq/lib.lua
+            continue;
         }
         if parts.len() == 2 && parts[0] == "lib" {
-            continue; // skip pkgs/lib/* helper files
+            continue;
         }
-        if let Some(name) = path
+        if let Some(name) = epath
             .strip_suffix(".lua")
             .and_then(|p| p.split('/').next_back())
         {
-            if !results.contains(&name.to_string()) && name.contains(&query_lower) {
-                results.push(name.to_string());
+            let s = name.to_string();
+            if seen.insert(s.clone()) {
+                candidates.push(s);
             }
         }
     }
 
-    results.sort();
+    // Score all candidates
+    for name in &candidates {
+        let score = fuzzy_score(query, name);
+        if score > 0 {
+            scored.push((score, name.clone()));
+        }
+    }
+
+    // Sort: highest score first, then alphabetically
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
     if json {
+        let results: Vec<&str> = scored.iter().map(|(_, n)| n.as_str()).collect();
         println!(
             "{}",
             serde_json::json!({
@@ -821,13 +894,13 @@ fn cmd_search(query: &str, json: bool) {
         );
     } else {
         eprintln!("Packages matching '{}':", query);
-        if results.is_empty() {
+        if scored.is_empty() {
             eprintln!("  (no matches)");
         } else {
-            for name in &results {
+            for (_, name) in &scored {
                 eprintln!("  {}", name);
             }
-            eprintln!("  {} package(s) found", results.len());
+            eprintln!("  {} package(s) found", scored.len());
         }
     }
 }
