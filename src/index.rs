@@ -352,6 +352,7 @@ impl PackageIndex {
             architectures: None,
             grade: "stable".into(),
             confinement: "strict".into(),
+            type_: None,
             aliases: vec![],
             requires: vec![],
             apps,

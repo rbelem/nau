@@ -132,10 +132,17 @@ pub struct SnapMeta {
     #[serde(default = "default_confinement")]
     pub confinement: String,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Package type: "source" (build from source), "meta" (dependencies only),
+    /// "store" (from Snap Store). Inferred from presence of source/build fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_: Option<String>,
+
+    /// Alternative names this package is known by. Skipped in YAML — build metadata only.
+    #[serde(skip)]
     pub aliases: Vec<String>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Build/runtime dependencies. Skipped in YAML — build metadata only.
+    #[serde(skip)]
     pub requires: Vec<String>,
 
     #[serde(default)]
@@ -198,6 +205,7 @@ impl SnapMeta {
         let confinement = get_opt_string(table, "confinement")?.unwrap_or_else(default_confinement);
         let architectures = get_opt_string_array(table, "architectures")?;
         let build = get_opt_string(table, "build")?;
+        let type_: Option<String> = table.get("type").ok();
         let aliases: Vec<String> = table.get("aliases").unwrap_or_default();
         let requires: Vec<String> = table.get("requires").unwrap_or_default();
 
@@ -235,6 +243,7 @@ impl SnapMeta {
             architectures,
             grade,
             confinement,
+            type_,
             aliases,
             requires,
             apps,

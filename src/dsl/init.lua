@@ -61,11 +61,23 @@ function snap(opts)
         end
     end
 
+    local valid_types = { "source", "meta", "store" }
+
     -- Optional string fields
     local string_fields = {
         "summary", "description", "license", "grade", "confinement",
-        "stage", "build",
+        "stage", "build", "type",
     }
+    -- Validate type field against known values
+    if opts.type ~= nil then
+        local found = false
+        for _, t in ipairs(valid_types) do
+            if opts.type == t then found = true; break end
+        end
+        if not found then
+            error("snap(): 'type' must be one of: source, meta, store", 2)
+        end
+    end
     for _, field in ipairs(string_fields) do
         check_string(opts[field], "snap", field)
     end
