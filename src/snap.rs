@@ -132,6 +132,12 @@ pub struct SnapMeta {
     #[serde(default = "default_confinement")]
     pub confinement: String,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+
     #[serde(default)]
     pub apps: HashMap<String, SnapApp>,
 }
@@ -192,6 +198,8 @@ impl SnapMeta {
         let confinement = get_opt_string(table, "confinement")?.unwrap_or_else(default_confinement);
         let architectures = get_opt_string_array(table, "architectures")?;
         let build = get_opt_string(table, "build")?;
+        let aliases: Vec<String> = table.get("aliases").unwrap_or_default();
+        let requires: Vec<String> = table.get("requires").unwrap_or_default();
 
         let apps = get_opt_table(table, "apps")?
             .map(|apps_table| {
@@ -227,6 +235,8 @@ impl SnapMeta {
             architectures,
             grade,
             confinement,
+            aliases,
+            requires,
             apps,
         })
     }

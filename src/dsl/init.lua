@@ -86,6 +86,8 @@ function snap(opts)
 
     -- Optional table fields
     check_string_array(opts.architectures, "snap", "architectures")
+    check_string_array(opts.aliases, "snap", "aliases")
+    check_string_array(opts.requires, "snap", "requires")
     check_table(opts.plugs, "snap", "plugs")
     check_table(opts.slots, "snap", "slots")
 

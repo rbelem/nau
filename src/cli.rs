@@ -119,6 +119,10 @@ pub enum IndexCommand {
         #[arg(long, default_value = "latest/stable")]
         channel: String,
 
+        /// Alternative name(s) this snap is known by (repeatable)
+        #[arg(long)]
+        alias: Vec<String>,
+
         /// Path to the package index file (default: package-index.json)
         #[arg(long, default_value = crate::index::DEFAULT_INDEX)]
         index: String,

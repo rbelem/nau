@@ -287,6 +287,7 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
             summary,
             store_name,
             channel,
+            alias,
             index,
         } => {
             let path = Path::new(&index);
@@ -310,6 +311,7 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
                 source: None,
                 build: None,
                 apps: None,
+                aliases: alias,
             };
 
             idx.upsert(entry);

@@ -77,6 +77,10 @@ pub struct IndexEntry {
     /// App declarations (for source-based snaps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps: Option<HashMap<String, IndexApp>>,
+
+    /// Alternative names this package is known by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 /// A reference to a snap in the Snap Store.
@@ -143,6 +147,7 @@ pub fn default_entries() -> Vec<IndexEntry> {
             source: None,
             build: None,
             apps: None,
+            aliases: vec![],
         },
         IndexEntry {
             name: "pc-kernel".into(),
@@ -155,6 +160,7 @@ pub fn default_entries() -> Vec<IndexEntry> {
             source: None,
             build: None,
             apps: None,
+            aliases: vec![],
         },
         IndexEntry {
             name: "pi-gadget".into(),
@@ -167,6 +173,7 @@ pub fn default_entries() -> Vec<IndexEntry> {
             source: None,
             build: None,
             apps: None,
+            aliases: vec![],
         },
         IndexEntry {
             name: "lxd".into(),
@@ -179,6 +186,7 @@ pub fn default_entries() -> Vec<IndexEntry> {
             source: None,
             build: None,
             apps: None,
+            aliases: vec![],
         },
     ]
 }
@@ -218,6 +226,15 @@ impl PackageIndex {
     /// Find an entry by name.
     pub fn find(&self, name: &str) -> Option<&IndexEntry> {
         self.snaps.iter().find(|e| e.name == name)
+    }
+
+    /// Find an entry by name or alias.
+    pub fn find_by_name_or_alias(&self, name: &str) -> Option<&IndexEntry> {
+        self.find(name).or_else(|| {
+            self.snaps
+                .iter()
+                .find(|e| e.aliases.iter().any(|a| a == name))
+        })
     }
 
     /// Find an entry by name (mutable).
@@ -335,6 +352,8 @@ impl PackageIndex {
             architectures: None,
             grade: "stable".into(),
             confinement: "strict".into(),
+            aliases: vec![],
+            requires: vec![],
             apps,
         })
     }
@@ -371,7 +390,7 @@ pub fn lua_index_entry(
 ) -> mlua::Result<mlua::Table> {
     let index = PackageIndex::load_or_default(&index_path).map_err(mlua::Error::external)?;
 
-    let entry = index.find(&name).ok_or_else(|| {
+    let entry = index.find_by_name_or_alias(&name).ok_or_else(|| {
         mlua::Error::external(miette::miette!(
             "snap '{}' not found in package index",
             name
@@ -408,6 +427,7 @@ mod tests {
             source: None,
             build: None,
             apps: None,
+            aliases: vec![],
         }
     }
 
@@ -503,6 +523,7 @@ mod tests {
                 )]
                 .into(),
             ),
+            aliases: vec![],
         };
 
         let meta = PackageIndex::entry_to_snap_meta(&entry).unwrap();
@@ -525,6 +546,7 @@ mod tests {
             source: None,
             build: None,
             apps: None,
+            aliases: vec![],
         };
 
         // Store-only entries have no source, so to_snap_meta returns None
