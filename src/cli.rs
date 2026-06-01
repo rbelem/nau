@@ -151,6 +151,16 @@ pub enum Command {
         json: bool,
     },
 
+    /// Search available packages by name or keyword
+    Search {
+        /// Search query (package name or partial match)
+        query: String,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Check system readiness (required tools)
     Doctor,
 

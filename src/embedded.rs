@@ -18,12 +18,20 @@
 
 use std::path::Path;
 
-use rust_embed::RustEmbed;
+use rust_embed::{Embed, RustEmbed};
 
 /// Embedded `pkgs/` directory — all package `.lua` files at compile time.
 #[derive(RustEmbed)]
 #[folder = "pkgs/"]
 pub struct Pkgs;
+
+/// Iterate over all embedded package paths.
+/// Returns paths like "g/gcc.lua", "b/bash.lua".
+pub fn iter_embedded() -> Vec<String> {
+    let mut paths: Vec<String> = <Pkgs as Embed>::iter().map(|p| p.to_string()).collect();
+    paths.sort();
+    paths
+}
 
 // Default index entries are in `index.rs::default_entries()` — no separate
 // file needed since they're already compiled into the binary.

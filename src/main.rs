@@ -111,6 +111,12 @@ fn main() -> miette::Result<()> {
             r
         }
 
+        Command::Search { query, json } => {
+            shoot::output::set_mode(json);
+            cmd_search(&query, json);
+            Ok(())
+        }
+
         Command::Index(sub) => cmd_index(sub),
 
         Command::Doctor => cmd_doctor(),
@@ -746,6 +752,84 @@ fn cmd_cache(sub: CacheCommand) -> miette::Result<()> {
         }
     }
     Ok(())
+}
+
+// ── Search command ──
+
+fn cmd_search(query: &str, json: bool) {
+    let query_lower = query.to_lowercase();
+    let mut results: Vec<String> = Vec::new();
+
+    // Search filesystem pkgs/ first
+    let fs_base = Path::new("pkgs");
+    if fs_base.exists() {
+        if let Ok(entries) = std::fs::read_dir(fs_base) {
+            for entry in entries.flatten() {
+                let letter = entry.path();
+                let dir_name = letter.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !letter.is_dir() || dir_name == "lib" || dir_name.starts_with('.') {
+                    continue; // skip pkgs/lib/ and hidden dirs
+                }
+                if let Ok(files) = std::fs::read_dir(&letter) {
+                    for file in files.flatten() {
+                        let path = file.path();
+                        let name = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if name.contains(&query_lower) && !results.contains(&name) {
+                            results.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Search embedded pkgs/
+    for path in shoot::embedded::iter_embedded() {
+        // path is like "g/gcc.lua" — extract the package name
+        // Skip helper files: pkgs/lib/*, pkgs/<l>/<pkg>/lib.lua (not init.lua)
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() == 3 && parts[2] != "init.lua" {
+            continue; // skip helpers inside dir packages like j/jq/lib.lua
+        }
+        if parts.len() == 2 && parts[0] == "lib" {
+            continue; // skip pkgs/lib/* helper files
+        }
+        if let Some(name) = path
+            .strip_suffix(".lua")
+            .and_then(|p| p.split('/').next_back())
+        {
+            if !results.contains(&name.to_string()) && name.contains(&query_lower) {
+                results.push(name.to_string());
+            }
+        }
+    }
+
+    results.sort();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "command": "search",
+                "query": query,
+                "results": results
+            })
+        );
+    } else {
+        eprintln!("Packages matching '{}':", query);
+        if results.is_empty() {
+            eprintln!("  (no matches)");
+        } else {
+            for name in &results {
+                eprintln!("  {}", name);
+            }
+            eprintln!("  {} package(s) found", results.len());
+        }
+    }
 }
 
 // ── Completion command ──
