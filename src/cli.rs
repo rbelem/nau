@@ -62,6 +62,11 @@ pub enum Command {
         /// source changes. Combine with --all to build full dependency trees efficiently.
         #[arg(long)]
         cache: Option<String>,
+
+        /// Output structured JSON instead of human-friendly colored output.
+        /// Useful for tooling, CI, or machine parsing.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Build a system image from pinned snaps
@@ -98,6 +103,10 @@ pub enum Command {
         /// Path to lockfile (default: shoot.lock).
         #[arg(long, default_value = "shoot.lock")]
         lockfile: String,
+
+        /// Output structured JSON instead of human-friendly colored output.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Manage the package index (list, add, resolve)
@@ -120,6 +129,10 @@ pub enum Command {
         /// Print flat, ordered list (build order)
         #[arg(long)]
         flat: bool,
+
+        /// Output structured JSON instead of human-friendly colored output.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Check system readiness (required tools)

@@ -7,5 +7,6 @@ pub mod image;
 pub mod index;
 pub mod lock;
 pub mod lua;
+pub mod output;
 pub mod snap;
 pub mod store;

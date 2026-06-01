@@ -23,11 +23,15 @@ fn main() -> miette::Result<()> {
             order,
             all,
             cache,
+            json,
         } => {
+            shoot::output::set_mode(json);
             if order {
-                return cmd_order(&file, &output_name);
+                let r = cmd_order(&file, &output_name, json);
+                shoot::output::flush_json("order");
+                return r;
             }
-            cmd_build(
+            let r = cmd_build(
                 file,
                 stage,
                 output,
@@ -37,7 +41,10 @@ fn main() -> miette::Result<()> {
                 lockfile_path,
                 all,
                 cache,
-            )
+                json,
+            );
+            shoot::output::flush_json("build");
+            r
         }
 
         Command::Image {
@@ -49,23 +56,36 @@ fn main() -> miette::Result<()> {
             output_name,
             source_date_epoch,
             lockfile: lockfile_path,
-        } => cmd_image(
-            file,
-            output,
-            arch,
-            channel,
-            cache,
-            output_name,
-            source_date_epoch,
-            lockfile_path,
-        ),
+            json,
+        } => {
+            shoot::output::set_mode(json);
+            let r = cmd_image(
+                file,
+                output,
+                arch,
+                channel,
+                cache,
+                output_name,
+                source_date_epoch,
+                lockfile_path,
+                json,
+            );
+            shoot::output::flush_json("image");
+            r
+        }
 
         Command::Deps {
             package,
             recursive,
             tree,
             flat,
-        } => cmd_deps(package, recursive, tree, flat),
+            json,
+        } => {
+            shoot::output::set_mode(json);
+            let r = cmd_deps(package, recursive, tree, flat, json);
+            shoot::output::flush_json("deps");
+            r
+        }
 
         Command::Index(sub) => cmd_index(sub),
 
@@ -86,6 +106,7 @@ fn cmd_build(
     lockfile_path: String,
     all: bool,
     cache: Option<String>,
+    json: bool,
 ) -> miette::Result<()> {
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
@@ -140,13 +161,14 @@ fn cmd_build(
         }
 
         if !all_deps.is_empty() {
-            eprintln!("── Building {} dependencies ──", all_deps.len());
+            if !json {
+                eprintln!("── Building {} dependencies ──", all_deps.len());
+            }
             for dep_name in &all_deps {
-                // Try to load the dependency as a package from pkgs/
                 let dep_meta = match shoot::deps::load_meta(dep_name) {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("  ⚠ skipping dependency '{}': {}", dep_name, e);
+                        shoot::output::warn(format!("skipping dependency '{}': {}", dep_name, e));
                         continue;
                     }
                 };
@@ -154,29 +176,34 @@ fn cmd_build(
                 // Check cache first
                 if let Some(ref cache) = pkg_cache {
                     if let Some(_cached_path) = cache.lookup(&dep_meta, "amd64") {
-                        eprintln!("  ✓ {} (cached)", dep_name);
+                        if !json {
+                            shoot::output::ok(format!("{} (cached)", dep_name));
+                        }
                         continue;
                     }
                 }
 
                 let dep_archs = shoot::snap::resolve_archs(&dep_meta, &arch);
                 for a in &dep_archs {
-                    eprintln!("  building {} ({})...", dep_name, a);
+                    if !json {
+                        shoot::output::status(format!("building {} ({})...", dep_name, a));
+                    }
                     let dep_stage = tempfile::tempdir()
                         .map_err(|e| miette::miette!("failed to create temp stage: {}", e))?;
 
                     match shoot::snap::build_snap(&dep_meta, dep_stage.path(), output_dir, a) {
                         Ok(result) => {
-                            eprintln!("    ✓ {}", result.snap_filename);
-                            // Store in cache
+                            if !json {
+                                shoot::output::ok(&result.snap_filename);
+                            }
                             if let Some(ref cache) = pkg_cache {
                                 if let Err(e) = cache.store(&dep_meta, &result, a, output_dir) {
-                                    eprintln!("  ⚠ cache store failed: {}", e);
+                                    shoot::output::warn(format!("cache store failed: {}", e));
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("  ⚠ build failed for '{}': {}", dep_name, e);
+                            shoot::output::warn(format!("build failed for '{}': {}", dep_name, e));
                         }
                     }
                 }
@@ -188,19 +215,33 @@ fn cmd_build(
 
     for (name, meta) in iter {
         let archs = shoot::snap::resolve_archs(meta, &arch);
+        if !json {
+            eprintln!("Building {} ({})...", name, meta.version);
+        }
 
-        println!("Building {} ({})...", name, meta.version);
         for a in &archs {
-            println!("  {}/{}:", name, a);
+            if !json {
+                shoot::output::status(format!("{}/{}:", name, a));
+            }
 
             if let Some(SourceSpec::Unverified(ref url)) = meta.source {
                 if lockfile.lookup_source(url).is_some() {
-                    eprintln!("  ℹ using lockfile hash for {url}");
+                    shoot::output::info(format!("using lockfile hash for {url}"));
                 }
             }
 
             let result = shoot::snap::build_snap(meta, stage_dir, output_dir, a)?;
-            println!("    ✓ {}", result.snap_filename);
+            if !json {
+                shoot::output::ok(&result.snap_filename);
+            } else {
+                shoot::output::record_build_result(shoot::output::BuildResultJson {
+                    name: meta.name.clone(),
+                    version: meta.version.clone(),
+                    arch: a.clone(),
+                    filename: result.snap_filename.clone(),
+                    sha256: result.source_info.as_ref().map(|s| s.sha256.clone()),
+                });
+            }
 
             if let Some(info) = result.source_info {
                 all_source_info.push(info);
@@ -223,17 +264,17 @@ fn cmd_build(
 
     if changed {
         lockfile.save(lock_path)?;
-        eprintln!("  ✓ lockfile updated: {}", lockfile_path);
+        shoot::output::ok(format!("lockfile updated: {}", lockfile_path));
     }
 
-    if !all_source_info.is_empty() {
+    if !all_source_info.is_empty() && !json {
         for info in &all_source_info {
             let status = if lockfile.sources.contains_key(&info.url) {
                 "pinned"
             } else {
                 "recorded"
             };
-            eprintln!("  source {status}: {:16} {}", info.sha256, info.url);
+            shoot::output::status(format!("source {status}: {:16} {}", info.sha256, info.url));
         }
     }
 
@@ -242,7 +283,7 @@ fn cmd_build(
 
 // ── Order command (--order flag) ──
 
-fn cmd_order(file: &str, output_name: &Option<String>) -> miette::Result<()> {
+fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Result<()> {
     let all_outputs = shoot::lua::evaluate_file(file)?;
 
     let iter: Vec<&shoot::snap::SnapMeta> = match output_name {
@@ -256,19 +297,41 @@ fn cmd_order(file: &str, output_name: &Option<String>) -> miette::Result<()> {
     };
 
     for meta in &iter {
-        println!("Package: {} {}", meta.name, meta.version);
-
-        if meta.requires.is_empty() {
-            println!("  No dependencies");
+        if json {
+            if meta.requires.is_empty() {
+                continue;
+            }
+            let seen: std::collections::HashSet<&str> =
+                meta.requires.iter().map(|s| s.as_str()).collect();
+            if let Ok(order) = shoot::deps::resolve_dep_names(&meta.requires, true) {
+                for dep in &order {
+                    let kind = if seen.contains(dep.as_str()) {
+                        "direct"
+                    } else {
+                        "transitive"
+                    };
+                    shoot::output::record_order_result(shoot::output::OrderResultJson {
+                        name: dep.clone(),
+                        kind: kind.to_string(),
+                    });
+                }
+            }
             continue;
         }
 
-        println!("  Direct requires:");
-        for dep in &meta.requires {
-            println!("    - {}", dep);
+        eprintln!("Package: {} {}", meta.name, meta.version);
+
+        if meta.requires.is_empty() {
+            eprintln!("  No dependencies");
+            continue;
         }
 
-        println!("  Resolved build order (transitive):");
+        eprintln!("  Direct requires:");
+        for dep in &meta.requires {
+            eprintln!("    - {}", dep);
+        }
+
+        eprintln!("  Resolved build order (transitive):");
         match shoot::deps::resolve_dep_names(&meta.requires, true) {
             Ok(order) => {
                 let seen: std::collections::HashSet<&str> =
@@ -279,11 +342,11 @@ fn cmd_order(file: &str, output_name: &Option<String>) -> miette::Result<()> {
                     } else {
                         "transitive"
                     };
-                    println!("    {:4} {}", marker, dep);
+                    eprintln!("    {:4} {}", marker, dep);
                 }
             }
             Err(e) => {
-                println!("    ⚠ could not resolve: {}", e);
+                eprintln!("    ⚠ could not resolve: {}", e);
             }
         }
     }
@@ -293,39 +356,67 @@ fn cmd_order(file: &str, output_name: &Option<String>) -> miette::Result<()> {
 
 // ── Deps command ──
 
-fn cmd_deps(package: String, recursive: bool, tree: bool, flat: bool) -> miette::Result<()> {
-    // Load the package
+fn cmd_deps(
+    package: String,
+    recursive: bool,
+    tree: bool,
+    flat: bool,
+    json: bool,
+) -> miette::Result<()> {
     let names = vec![package.clone()];
     let nodes = shoot::deps::resolve_deps(&names, recursive)?;
 
     if nodes.is_empty() {
-        println!("No dependencies found for '{}'", package);
+        if json {
+            return Ok(());
+        }
+        eprintln!("No dependencies found for '{}'", package);
+        return Ok(());
+    }
+
+    if json {
+        let seen: std::collections::HashSet<&str> = nodes
+            .iter()
+            .flat_map(|n| &n.requires)
+            .map(|s| s.as_str())
+            .collect();
+        for node in &nodes {
+            let kind = if seen.contains(node.name.as_str()) {
+                "direct"
+            } else {
+                "transitive"
+            };
+            shoot::output::record_dep_result(shoot::output::DepResultJson {
+                name: node.name.clone(),
+                requires: node.requires.clone(),
+                kind: kind.to_string(),
+            });
+        }
         return Ok(());
     }
 
     if tree && recursive {
-        println!("Dependency tree for '{}':", package);
+        eprintln!("Dependency tree for '{}':", package);
         let tree_str = shoot::deps::format_tree(&names, true)?;
-        println!("{}", tree_str);
+        eprintln!("{}", tree_str);
     } else if flat {
         let names_only: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
-        println!("Build order for '{}':", package);
+        eprintln!("Build order for '{}':", package);
         for (i, name) in names_only.iter().enumerate() {
-            println!("  {}. {}", i + 1, name);
+            eprintln!("  {}. {}", i + 1, name);
         }
     } else {
-        // Default: show the package with its direct requires
         if let Some(pkg) = nodes.first() {
-            println!("{} v1.0: {}", package, pkg.name);
+            eprintln!("{} v1.0: {}", package, pkg.name);
             if pkg.requires.is_empty() {
-                println!("  No dependencies");
+                eprintln!("  No dependencies");
             } else {
-                println!("  Requires:");
+                eprintln!("  Requires:");
                 for dep in &pkg.requires {
-                    println!("    - {}", dep);
+                    eprintln!("    - {}", dep);
                 }
                 if recursive {
-                    println!("  (use --tree or --flat for full transitive resolution)");
+                    eprintln!("  (use --tree or --flat for full transitive resolution)");
                 }
             }
         }
@@ -346,6 +437,7 @@ fn cmd_image(
     output_name: Option<String>,
     source_date_epoch: Option<String>,
     lockfile_path: String,
+    json: bool,
 ) -> miette::Result<()> {
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
@@ -385,7 +477,9 @@ fn cmd_image(
     let mut lock_changed = false;
 
     for (name, image_decl) in iter {
-        println!("Building image: {} ({})...", name, image_decl.version);
+        if !json {
+            eprintln!("Building image: {} ({})...", name, image_decl.version);
+        }
 
         let result = if image_decl.disk.is_some() {
             shoot::image::build_disk_image(
@@ -407,19 +501,29 @@ fn cmd_image(
             )?
         };
 
-        println!(
-            "  ✓ {}",
-            result
-                .file_name()
-                .unwrap_or(result.as_ref())
-                .to_string_lossy()
-        );
+        let fname = result
+            .file_name()
+            .unwrap_or(result.as_ref())
+            .to_string_lossy()
+            .to_string();
+
+        if json {
+            shoot::output::record_build_result(shoot::output::BuildResultJson {
+                name: name.clone(),
+                version: image_decl.version.clone(),
+                arch: arch.clone(),
+                filename: fname,
+                sha256: None,
+            });
+        } else {
+            shoot::output::ok(&fname);
+        }
         lock_changed = true;
     }
 
     if lock_changed {
         lockfile.save(lock_path)?;
-        eprintln!("  ✓ lockfile updated: {}", lockfile_path);
+        shoot::output::ok(format!("lockfile updated: {}", lockfile_path));
     }
 
     Ok(())
@@ -448,8 +552,8 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
                 PackageIndex::load_or_default(path)?
             };
 
-            println!("Package index: {} entries", idx.snaps.len());
-            println!();
+            eprintln!("Package index: {} entries", idx.snaps.len());
+            eprintln!();
             for entry in &idx.snaps {
                 let kind = if entry.store.is_some() {
                     "store"
@@ -463,7 +567,7 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
                     .as_ref()
                     .map(|p| p.len().to_string())
                     .unwrap_or_else(|| "-".into());
-                println!("  {:<20} {}    pins: {}", entry.name, kind, pins);
+                eprintln!("  {:<20} {}    pins: {}", entry.name, kind, pins);
             }
         }
 
@@ -501,7 +605,7 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
 
             idx.upsert(entry);
             idx.save(path)?;
-            eprintln!("  ✓ added '{}' to index", name);
+            shoot::output::ok(format!("added '{}' to index", name));
         }
 
         IndexCommand::Resolve { index, channel } => {
@@ -516,7 +620,7 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
             eprintln!("Resolving snap pins from store (channel: {channel})...");
             idx.resolve_all(&channel)?;
             idx.save(path)?;
-            eprintln!("  ✓ index updated: {}", index);
+            shoot::output::ok(format!("index updated: {}", index));
         }
     }
 
