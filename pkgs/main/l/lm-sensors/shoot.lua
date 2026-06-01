@@ -1,0 +1,26 @@
+-- lm-sensors: Hardware monitoring sensors tools
+--
+-- Source: https://github.com/lm-sensors/lm-sensors
+-- Provides sensors, sensord, and libsensors for hardware monitoring.
+
+return {
+    default = snap {
+        name = "lm-sensors",
+        version = "3.6",
+        summary = "Hardware monitoring sensors tools",
+        description = [[
+            lm-sensors provides tools for monitoring temperatures,
+            voltages, fan speeds, and other hardware health metrics on
+            Linux systems. Includes the sensors command for displaying
+            sensor readings, sensord for logging, and the libsensors
+            library for applications to access sensor data.
+        ]],
+        grade = "stable",
+        confinement = "strict",
+        architectures = { "amd64", "arm64", "armhf" },
+        source = {
+            url = "https://github.com/lm-sensors/lm-sensors/archive/refs/tags/V3-6-1.tar.gz",
+        },
+        build = "make prefix=/usr && make install PREFIX=/usr DESTDIR=$STAGE",
+    },
+}
