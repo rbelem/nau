@@ -20,15 +20,21 @@ fn main() -> miette::Result<()> {
             output_name,
             source_date_epoch,
             lockfile: lockfile_path,
-        } => cmd_build(
-            file,
-            stage,
-            output,
-            arch,
-            output_name,
-            source_date_epoch,
-            lockfile_path,
-        ),
+            order,
+        } => {
+            if order {
+                return cmd_order(&file, &output_name);
+            }
+            cmd_build(
+                file,
+                stage,
+                output,
+                arch,
+                output_name,
+                source_date_epoch,
+                lockfile_path,
+            )
+        }
 
         Command::Image {
             file,
@@ -49,6 +55,13 @@ fn main() -> miette::Result<()> {
             source_date_epoch,
             lockfile_path,
         ),
+
+        Command::Deps {
+            package,
+            recursive,
+            tree,
+            flat,
+        } => cmd_deps(package, recursive, tree, flat),
 
         Command::Index(sub) => cmd_index(sub),
 
@@ -143,6 +156,100 @@ fn cmd_build(
                 "recorded"
             };
             eprintln!("  source {status}: {:16} {}", info.sha256, info.url);
+        }
+    }
+
+    Ok(())
+}
+
+// ── Order command (--order flag) ──
+
+fn cmd_order(file: &str, output_name: &Option<String>) -> miette::Result<()> {
+    let all_outputs = shoot::lua::evaluate_file(file)?;
+
+    let iter: Vec<&shoot::snap::SnapMeta> = match output_name {
+        Some(name) => {
+            let meta = all_outputs
+                .get(name)
+                .ok_or_else(|| miette::miette!("output '{}' not found in {}", name, file))?;
+            vec![meta]
+        }
+        None => all_outputs.values().collect(),
+    };
+
+    for meta in &iter {
+        println!("Package: {} {}", meta.name, meta.version);
+
+        if meta.requires.is_empty() {
+            println!("  No dependencies");
+            continue;
+        }
+
+        println!("  Direct requires:");
+        for dep in &meta.requires {
+            println!("    - {}", dep);
+        }
+
+        println!("  Resolved build order (transitive):");
+        match shoot::deps::resolve_dep_names(&meta.requires, true) {
+            Ok(order) => {
+                let seen: std::collections::HashSet<&str> =
+                    meta.requires.iter().map(|s| s.as_str()).collect();
+                for dep in &order {
+                    let marker = if seen.contains(dep.as_str()) {
+                        "direct"
+                    } else {
+                        "transitive"
+                    };
+                    println!("    {:4} {}", marker, dep);
+                }
+            }
+            Err(e) => {
+                println!("    ⚠ could not resolve: {}", e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Deps command ──
+
+fn cmd_deps(package: String, recursive: bool, tree: bool, flat: bool) -> miette::Result<()> {
+    // Load the package
+    let names = vec![package.clone()];
+    let nodes = shoot::deps::resolve_deps(&names, recursive)?;
+
+    if nodes.is_empty() {
+        println!("No dependencies found for '{}'", package);
+        return Ok(());
+    }
+
+    if tree && recursive {
+        println!("Dependency tree for '{}':", package);
+        let tree_str = shoot::deps::format_tree(&names, true)?;
+        println!("{}", tree_str);
+    } else if flat {
+        let names_only: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+        println!("Build order for '{}':", package);
+        for (i, name) in names_only.iter().enumerate() {
+            println!("  {}. {}", i + 1, name);
+        }
+    } else {
+        // Default: show the package with its direct requires
+        if let Some(pkg) = nodes.first() {
+            println!("{} {}: {}", package, "v1.0", pkg.name);
+            if pkg.requires.is_empty() {
+                println!("  No dependencies");
+            } else {
+                println!("  Requires:");
+                for dep in &pkg.requires {
+                    println!("    - {}", dep);
+                }
+                if recursive {
+                    println!("  (use --tree or --flat for full transitive resolution)");
+                }
+            }
         }
     }
 

@@ -46,6 +46,10 @@ pub enum Command {
         /// Locks source hashes for reproducible builds.
         #[arg(long, default_value = "shoot.lock")]
         lockfile: String,
+
+        /// Print dependency build order and exit (no build).
+        #[arg(long)]
+        order: bool,
     },
 
     /// Build a system image from pinned snaps
@@ -87,6 +91,24 @@ pub enum Command {
     /// Manage the package index (list, add, resolve)
     #[command(subcommand)]
     Index(IndexCommand),
+
+    /// Show dependency tree for a package
+    Deps {
+        /// Package name or path to shoot.lua file
+        package: String,
+
+        /// Resolve all transitive dependencies (recursive)
+        #[arg(long)]
+        recursive: bool,
+
+        /// Display as tree (requires --recursive)
+        #[arg(long)]
+        tree: bool,
+
+        /// Print flat, ordered list (build order)
+        #[arg(long)]
+        flat: bool,
+    },
 
     /// Check system readiness (required tools)
     Doctor,
