@@ -39,4 +39,4 @@ devbox run -- check        # full check (test + clippy + fmt)
 - **Image assembly**: compose snaps into reproducible rootfs — ✓
 - **CI/CD**: GitHub Actions with devbox — ✓
 
-See `CONTEXT.md`, `docs/adr/`, and `.planning/` for architecture docs.
+See `CONTEXT.md` (domain glossary) and `docs/adr/` (architecture decisions) for docs.

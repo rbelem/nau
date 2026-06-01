@@ -1,84 +1,65 @@
 # shoot
 
-A Rust CLI tool that builds Snap packages from Lua declarations. Replaces Snapcraft's YAML with a programmable, composable Lua DSL.
+A Rust CLI that builds Snap packages from Lua declarations — like Nix for Snapcraft.
 
 ## Language
 
-**snap**:
-A self-contained Linux package format (.snap file) containing one or more apps, metadata, and permissions. The build artifact of `shoot`.
-_Avoid_: Package, bundle
+**Snap**: A self-contained Linux application package (`.snap` file) installable by `snapd`.
+_Avoid_: AppImage, Flatpak, container image
 
-**snap declaration**:
-The Lua block inside `shoot.lua` that describes a single snap. Contains name, version, summary, description, apps, plugs, and slots.
+**shoot.lua**: The entry-point configuration file. Returns a table of named snap outputs.
+_Avoid_: config file, manifest, snapcraft.yaml
 
-**app**:
-An executable entry point within a snap, defined in `meta/snap.yaml`. A snap can declare multiple apps. Not the entire application — just the command the system runs to start it.
-_Avoid_: Binary, program (when referring to the entry point)
+**Snap output**: One named snap declaration inside a `shoot.lua`. Single-snap projects use the `default` key; multi-output projects name them (`server`, `cli`).
+_Avoid_: target, artifact, build product
 
-**output**:
-A named snap declaration in a multi-output `shoot.lua`. Like Nix flake outputs, one config can declare multiple snaps under different output names.
+**Package**: A static snap definition in `pkgs/` — either single-file (`pkgs/<letter>/<name>.lua`) or directory (`pkgs/<letter>/<name>/init.lua`).
+_Avoid_: recipe, formula, formula file
 
-**shoot.lua**:
-The root Lua config file. `shoot build` reads it from the current directory by default (or `--file` override). Defines one or more snap declarations.
+**Package type**: `source` (build from upstream tarball), `meta` (dependency group, no build), `store` (pulled from Snap Store, no local source).
 
-**Shootfile**:
-Alternative name for `shoot.lua`. Not the primary name — included for recognition.
+**Toolchain**: A meta-package (`type = "meta"`) that aggregates compiler, linker, and runtime libraries needed to build source packages. Named by GNU triplet: `toolchain-<compiler>-<libc>-<arch>`.
 
-**Lua for data description, not scripting**:
-`shoot.lua` is evaluated as a data-description language. The script returns a well-structured table — you can use loops, conditionals, and helper functions in Lua, but the result is deterministic and side-effect-free. This gives users Lua's expressiveness (unlike Snapcraft YAML) while keeping evaluation predictable (Nix-like).
-_Avoid_: Imperative scripting, side effects during config evaluation
+**Stage**: The temporary directory where built binaries are installed during a snap build (`$STAGE` env var). Contents are copied into the snap root before SquashFS packaging.
+_Avoid_: destdir, install prefix, output dir
 
-**Library dependency model**: Snaps bundle their own dependencies. There is no global shared library store (unlike Nix). When a snap needs a shared library, the user stages it alongside the binaries under `--stage`. For sharing libraries between installed snaps, use the Snap content interface (slot/plug) — a producer snap exposes `$SNAP/lib` as a slot, a consumer snap mounts it at `$SNAP/extra-libs`. This is orthogonal to the build-time staging model; `shoot` just generates the correct entries in `meta/snap.yaml` when the DSL declares `plugs`/`slots`.
-_Avoid_: Expecting shoot to resolve library dependencies, shared system library directories
+**Build sandbox**: A bubblewrap-isolated environment where source builds execute. Provides read-only system paths, private `/tmp`, and `$STAGE`/`$SRC` env vars.
+_Avoid_: container, chroot, jail
 
-**Schema is Lua-defined, not Rust-defined**:
-The DSL **is** the schema. Injected Lua globals (`snap`, `app`, etc.) validate their arguments at evaluation time — types, required fields, relationships. Rust receives pre-validated data with no struct-level validation. This mirrors Nix: `mkDerivation` is the schema, not an external type definition.
-_Avoid_: Dual validation (Lua + Rust), Rust structs as source of truth
+**Bootstrap**: The 3-stage process of building a compiler toolchain from a host compiler: stage0 (minimal C-only cross-compiler) → stage1 (full C/C++ cross-compiler) → stage2 (verification rebuild).
+_Avoid_: cross-compile setup, toolchain init
 
-**CLI flag discipline**:
-CLI flags are added only in the phase that gives them behavior. `--arch` waits until Phase 6 (multi-arch). `--output` (output path) waits until Phase 5 (snap assembly). Output selection in Phase 8 uses a positional arg: `shoot build <output-name>`, not `--output`.
-_Avoid_: Stub flags with no behavior
+**Package index**: The `package-index.json` file mapping snap names to store pins or source definitions. Queried by the `index()` DSL function.
+_Avoid_: registry, catalog, database
 
-**Binary staging**:
-For v1, `--stage` takes a directory path (default `./stage/`). Binaries and libraries are copied from there into the snap assembly. Composability (stage as a merge of multiple sources from imported modules) is deferred to Phase 7 when the composable DSL lands.
-_Avoid_: Build-time dependency resolution, stagedir as a list in v1
+**Requires**: A snap's build dependencies, declared as a string array in the `snap()` table. Resolved transitively by `shoot deps` and `shoot build --all`.
+_Avoid_: depends, deps, links
 
-**Structured error reporting from day one**:
-Lua errors from injected globals are wrapped with file/line context from `mlua`. Rust errors use `miette` or `color-eyre` for rich diagnostics. Both produce the same format: `[ERROR] shoot.lua:12:3: missing required field 'name'`. No separate error-polish phase — the error UX is part of each phase from the start.
-_Avoid_: println errors, deferring error UX to later
+**Aliases**: Alternative names a package is known by. Toolchain `toolchain-gcc-gnu-x86_64` has aliases `toolchain-x86_64` and `toolchain`.
 
-**Injected globals return values, not mutate state**:
-`snap(...)` returns a validated table. The user assembles outputs explicitly and returns them from `shoot.lua`. This is Nix-style: `stdenv.mkDerivation` returns a derivation, `flake.nix` returns outputs. Makes composability natural (imports return tables you can merge), and `return` is the single contract point between Lua and Rust.
-_Avoid_: Mutation-based registration, implicit output collection
+**Target**: The cross-compilation GNU triplet (e.g. `x86_64-linux-gnu`, `aarch64-linux-gnu`). When set, the build sandbox exports `CC=<target>-gcc`, `CXX=<target>-g++`, etc.
 
-**Outputs as first-class concept**:
-`shoot.lua` always returns a table of named outputs. Single-snap configs return `{ default = { ... } }`. Multi-output configs return `{ server = { ... }, cli = { ... } }`. `shoot build` builds all; `shoot build <name>` builds one. Designed from day one (ADR-0003) — no Phase 8 retrofit needed.
-_Avoid_: Single-value return type, late addition of multi-output
+**Image**: A bootable disk image (`.img`) assembled from multiple snaps — base, kernel, gadget, and application snaps. Declared via the `image()` DSL function.
 
-**Phase 3 scope**:
-Phase 3 (Snap Metadata Mapping) is scoped to defining Rust structs (`SnapMetadata`, `SnapApp`, etc.) and testing the extraction contract. The actual mapping from Lua tables to structs is trivial (field extraction from pre-validated data) — the value of the phase is getting the type definitions right, not the conversion logic.
+## Flagged ambiguities
 
-**System dependency model**:
-Dependencies are checked at use time, not upfront. `mksquashfs` is only checked when the build reaches the packaging step — `shoot build --dry-run` and validation work without it. `shoot doctor` gives proactive system readiness (checks for `mksquashfs`, `snap`, etc.). If `snap` CLI is absent, interface validation is silently skipped.
-_Avoid_: Hard startup failures for missing tools, requiring snapd on cross-compile hosts
-
-**Composable DSL scope (Phase 7)**:
-Phase 7 adds a single `merge(base, overrides)` injected global for recursive deep merge of config tables. No priority system (`mkDefault`/`mkForce`) — Snap configs have shallow override depth (apps, plugs), not nested option trees. `require` + `merge` covers composability.
-_Avoid_: Nix priority system, custom DSL for overrides
-
-**Test strategy**:
-Lua validation tests are inline in Rust via `mlua`. Rust tests inject the same globals, evaluate Lua snippets, and assert on returned tables. One test runner (`cargo test`), unified CI. Integration tests spawn `shoot build` and validate the output `.snap` with `unsquashfs`.
-_Avoid_: Separate test frameworks, dual test infrastructure
-
-**Interface validation from snapd**:
-Plug and slot interface names are validated against a cached snapshot from `snapd`. On first `shoot build`, Rust runs `snap interface --all`, parses the interface names, and caches them in `~/.cache/shoot/interfaces.json`. The interface list is injected into Lua globals. Unknown names produce a warning (not error) — the build proceeds. If `snap` CLI isn't available, validation is skipped (graceful degradation for cross-compile hosts). `shoot build --refresh-interfaces` forces a re-fetch.
-_Avoid_: Hardcoded interface lists, hard errors on unknown interfaces, build failures when snapd is absent
+- **"Build"** can mean: (a) the `shoot build` CLI command, (b) a source package's compile step (`snap { build = "..." }`), or (c) the build sandbox environment. Use "build command", "build script", and "build sandbox" respectively.
+- **"Package"** can refer to a Lua declaration in `pkgs/` or to the Snap Store concept of a snap. Use "package index entry" or "store snap" to disambiguate.
 
 ## Example dialogue
 
-> **Dev:** I want to build my app as a snap.
-> **Expert:** Start by creating a `shoot.lua`. Declare a snap with name, version, and the apps you want.
-> **Dev:** I have a web server and a cron job — should I put them in one snap or two?
-> **Expert:** Either works. If they share lifecycle, put both apps in one snap. If they need to update independently, declare two outputs in your `shoot.lua` and build each separately.
-> **Dev:** So I'd do `shoot build server` and `shoot build cron`?
-> **Expert:** Yes, or `shoot build` with no args builds all outputs.
+**Dev**: I want to add a new source package. Do I just drop a `.lua` file in `pkgs/`?
+
+**Domain expert**: Yes. Drop `pkgs/f/foo.lua` with a `snap()` declaration. Set `type = "source"`, add its upstream tarball URL and build script, and declare its `requires` — at minimum `{ "glibc" }`.
+
+**Dev**: What if foo needs a cross-compiler? Do I need to configure that separately?
+
+**Domain expert**: Add `target = "aarch64-linux-gnu"` to the snap declaration. The build sandbox will set `CC=aarch64-linux-gnu-gcc`, etc. If foo needs the full toolchain, add `"toolchain"` to its requires — it resolves to `toolchain-gcc-gnu-x86_64`.
+
+**Dev**: And if I want to produce two snaps with different configs?
+
+**Domain expert**: Return a table with two keys: `{ server = snap { ... }, foo = snap { ... } }`. Use `merge(require("base"), { name = "foo", ... })` to avoid repeating shared fields.
+
+**Dev**: How do I build an entire system image from these?
+
+**Domain expert**: Write an `image()` declaration with a base snap, kernel, gadget, and any extra snaps. `shoot image shoot.lua` resolves everything from the Snap Store, extracts the base as a rootfs, merges kernel modules, and packs the result into a SquashFS `.img`.

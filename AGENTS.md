@@ -34,13 +34,14 @@ cargo fmt             # format
 - Keep `clippy` clean — treat warnings as errors.
 - Conventional commits for commit messages.
 
-## Planning
+## Planning (archived)
 
-- `PROJECT.md` — project context, core value, constraints, key decisions
-- `REQUIREMENTS.md` — 17 v1 requirements with REQ-IDs
-- `ROADMAP.md` — 8 vertical MVP phases
-- `STATE.md` — project progress and decisions log
-- `config.json` — workflow preferences (interactive, fine granularity, inherit model)
+Planning moved to grill-with-docs format. Historical files live in `.planning/archive/`:
+
+- `CONTEXT.md` — domain glossary, canonical terms, flagged ambiguities
+- `docs/adr/` — architecture decision records
+- `.planning/archive/ROADMAP.md` — phased implementation history
+- `.planning/archive/REQUIREMENTS.md` — 17 v1 requirements
 
 <!-- GSD:project-start source:PROJECT.md -->
 ## Project
