@@ -378,7 +378,78 @@ fn resolve_image_snaps(
             snap_ref.clone()
         };
 
-        let snap = StoreClient::resolve(&pin, channel, arch)?;
+        // Try Snap Store first, then fall back to package index
+        let snap = match StoreClient::resolve(&pin, channel, arch) {
+            Ok(s) => s,
+            Err(_) => {
+                // Try resolving through the package index
+                let index_path = std::path::PathBuf::from(crate::index::DEFAULT_INDEX);
+                if let Ok(idx) = crate::index::PackageIndex::load_or_default(&index_path) {
+                    if let Some(entry) = idx.find_by_name_or_alias(&snap_ref.name) {
+                        // Check if the index already has pre-resolved pins for this arch
+                        if let Some(ref pins) = entry.pins {
+                            if let Some(pin_entry) = pins.get(arch) {
+                                eprintln!(
+                                    "  ℹ {}: using pre-resolved pin from index (rev {})",
+                                    snap_ref.name, pin_entry.revision
+                                );
+                                resolved.push(ResolvedSnap {
+                                    name: snap_ref.name.clone(),
+                                    revision: pin_entry.revision,
+                                    sha3_384: pin_entry.sha3_384.clone(),
+                                    download_url: String::new(),
+                                });
+                                continue;
+                            }
+                        }
+                        // If index has a store name, try resolving with it
+                        if let Some(ref store) = entry.store {
+                            let store_name = store
+                                .name
+                                .as_deref()
+                                .unwrap_or(&snap_ref.name)
+                                .to_string();
+                            let resolved_pin = SnapRef {
+                                name: store_name,
+                                revision: pin.revision,
+                                sha3_384: pin.sha3_384,
+                            };
+                            match StoreClient::resolve(&resolved_pin, &store.channel, arch) {
+                                Ok(s) => {
+                                    eprintln!(
+                                        "  ℹ {}: resolved via index (store: {})",
+                                        snap_ref.name, resolved_pin.name
+                                    );
+                                    s
+                                }
+                                Err(e) => {
+                                    return Err(miette::miette!(
+                                        "cannot resolve '{}': not in Snap Store or package index ({})",
+                                        snap_ref.name, e
+                                    ));
+                                }
+                            }
+                        } else {
+                            return Err(miette::miette!(
+                                "cannot resolve '{}': found in index but has no store reference",
+                                snap_ref.name
+                            ));
+                        }
+                    } else {
+                        return Err(miette::miette!(
+                            "cannot resolve '{}': not in Snap Store or package index",
+                            snap_ref.name
+                        ));
+                    }
+                } else {
+                    return Err(miette::miette!(
+                        "cannot resolve '{}': not in Snap Store",
+                        snap_ref.name
+                    ));
+                }
+            }
+        };
+
         eprintln!(
             "  ✓ {} revision {} — sha3-384: {}",
             snap.name,
