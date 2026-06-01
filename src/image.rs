@@ -25,6 +25,48 @@ use crate::lock::LockFile;
 use crate::snap::SnapRef;
 use crate::store::{ResolvedSnap, StoreClient};
 
+// ── Additional types ──
+
+/// Kernel snap reference plus kernel configuration.
+#[derive(Debug, Clone)]
+pub struct KernelEntry {
+    pub snap: SnapRef,
+    pub params: Vec<String>,
+    pub modules: Vec<String>,
+    pub modprobe_config: Option<String>,
+}
+
+/// Bootloader configuration for disk images.
+#[derive(Debug, Clone)]
+pub struct BootloaderConfig {
+    pub type_: String, // "systemd-boot" or "grub"
+    pub timeout: u32,
+}
+
+/// Full disk layout definition.
+#[derive(Debug, Clone)]
+pub struct DiskLayout {
+    pub label: String, // "gpt" or "mbr"
+    pub partitions: Vec<Partition>,
+    pub swap: Option<SwapConfig>,
+}
+
+/// One partition in the disk layout.
+#[derive(Debug, Clone)]
+pub struct Partition {
+    pub name: String,
+    pub size: String,           // e.g. "512M", "0" for remaining
+    pub fs: String,             // e.g. "vfat", "btrfs", "ext4"
+    pub mount: String,          // mount point
+    pub options: Vec<String>,   // mount options
+}
+
+/// Swap configuration.
+#[derive(Debug, Clone)]
+pub struct SwapConfig {
+    pub size: String, // e.g. "8G"
+}
+
 // ── Image declaration ──
 
 /// A declarative image composed from multiple snaps.
@@ -45,9 +87,12 @@ pub struct ImageDeclaration {
     pub name: String,
     pub version: String,
     pub base: SnapRef,
-    pub kernel: Option<SnapRef>,
+    pub kernel: Option<KernelEntry>,
     pub gadget: Option<SnapRef>,
     pub extra_snaps: Vec<SnapRef>,
+    pub bootloader: Option<BootloaderConfig>,
+    pub disk: Option<DiskLayout>,
+    pub sysctl: Vec<String>,
 }
 
 /// Serialize as the name string (for `meta/snap.yaml`).
@@ -68,9 +113,16 @@ impl ImageDeclaration {
             get_required(table, "version").map_err(|e| miette::miette!("image(): {e}"))?;
 
         let base = get_required_snap_ref(table, "base")?;
-        let kernel = get_opt_snap_ref(table, "kernel")?;
+        let kernel = get_opt_kernel_entry(table)?;
         let gadget = get_opt_snap_ref(table, "gadget")?;
         let extra_snaps = get_snap_ref_array(table, "snaps")?;
+
+        // NEW: bootloader
+        let bootloader = get_opt_bootloader(table)?;
+        // NEW: disk layout
+        let disk = get_opt_disk_layout(table)?;
+        // NEW: sysctl
+        let sysctl: Vec<String> = table.get("sysctl").unwrap_or_default();
 
         Ok(ImageDeclaration {
             name,
@@ -79,6 +131,9 @@ impl ImageDeclaration {
             kernel,
             gadget,
             extra_snaps,
+            bootloader,
+            disk,
+            sysctl,
         })
     }
 
@@ -86,7 +141,7 @@ impl ImageDeclaration {
     pub fn all_snaps(&self) -> Vec<&SnapRef> {
         let mut snaps: Vec<&SnapRef> = vec![&self.base];
         if let Some(ref k) = self.kernel {
-            snaps.push(k);
+            snaps.push(&k.snap);
         }
         if let Some(ref g) = self.gadget {
             snaps.push(g);
@@ -157,6 +212,139 @@ fn get_snap_ref_array(table: &mlua::Table, key: &str) -> miette::Result<Vec<Snap
         Value::Nil => Ok(Vec::new()),
         other => Err(miette::miette!(
             "image(): '{key}' must be an array of pins, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+fn get_opt_kernel_entry(table: &mlua::Table) -> miette::Result<Option<KernelEntry>> {
+    match table
+        .get::<Value>("kernel")
+        .map_err(|e| miette::miette!("kernel: {e}"))?
+    {
+        Value::Table(t) => {
+            let snap = SnapRef::from_pin_table(&t)?;
+            let params: Vec<String> = t.get("params").unwrap_or_default();
+            let modules: Vec<String> = t.get("modules").unwrap_or_default();
+            let modprobe_config: Option<String> = t.get("modprobe_config").ok();
+            Ok(Some(KernelEntry {
+                snap,
+                params,
+                modules,
+                modprobe_config,
+            }))
+        }
+        Value::Nil => Ok(None),
+        other => Err(miette::miette!(
+            "image(): 'kernel' must be a pin table, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+fn get_opt_bootloader(table: &mlua::Table) -> miette::Result<Option<BootloaderConfig>> {
+    match table
+        .get::<Value>("bootloader")
+        .map_err(|e| miette::miette!("bootloader: {e}"))?
+    {
+        Value::Table(t) => {
+            let type_: String = t.get("type").unwrap_or_else(|_| "systemd-boot".into());
+            let timeout: u32 = t.get("timeout").unwrap_or(3);
+            Ok(Some(BootloaderConfig { type_, timeout }))
+        }
+        Value::Nil => Ok(None),
+        other => Err(miette::miette!(
+            "image(): 'bootloader' must be a table, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+fn get_opt_disk_layout(table: &mlua::Table) -> miette::Result<Option<DiskLayout>> {
+    match table
+        .get::<Value>("disk")
+        .map_err(|e| miette::miette!("disk: {e}"))?
+    {
+        Value::Table(t) => {
+            let label: String = t.get("label").unwrap_or_else(|_| "gpt".into());
+            let partitions = get_partitions(&t)?;
+            let swap = get_opt_swap(&t)?;
+            Ok(Some(DiskLayout {
+                label,
+                partitions,
+                swap,
+            }))
+        }
+        Value::Nil => Ok(None),
+        other => Err(miette::miette!(
+            "image(): 'disk' must be a table, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+fn get_partitions(table: &mlua::Table) -> miette::Result<Vec<Partition>> {
+    let mut partitions = Vec::new();
+    let parts: Value = table.get("partitions").unwrap_or(Value::Nil);
+    match parts {
+        Value::Table(t) => {
+            for pair in t.pairs::<usize, Value>() {
+                let (_, value) = pair.map_err(|e| miette::miette!("partitions[n]: {e}"))?;
+                match value {
+                    Value::Table(pt) => {
+                        let name: String = pt
+                            .get("name")
+                            .map_err(|_| miette::miette!("partition: missing 'name'"))?;
+                        let size: String = pt.get("size").map_err(|_| {
+                            miette::miette!("partition '{}': missing 'size'", name)
+                        })?;
+                        let fs: String = pt.get("fs").map_err(|_| {
+                            miette::miette!("partition '{}': missing 'fs'", name)
+                        })?;
+                        let mount: String = pt.get("mount").map_err(|_| {
+                            miette::miette!("partition '{}': missing 'mount'", name)
+                        })?;
+                        let options: Vec<String> = pt.get("options").unwrap_or_default();
+                        partitions.push(Partition {
+                            name,
+                            size,
+                            fs,
+                            mount,
+                            options,
+                        });
+                    }
+                    other => {
+                        return Err(miette::miette!(
+                            "each partition must be a table, got {}",
+                            other.type_name()
+                        ))
+                    }
+                }
+            }
+        }
+        Value::Nil => {}
+        other => {
+            return Err(miette::miette!(
+                "'partitions' must be a table, got {}",
+                other.type_name()
+            ))
+        }
+    }
+    Ok(partitions)
+}
+
+fn get_opt_swap(table: &mlua::Table) -> miette::Result<Option<SwapConfig>> {
+    match table
+        .get::<Value>("swap")
+        .map_err(|e| miette::miette!("swap: {e}"))?
+    {
+        Value::Table(t) => {
+            let size: String = t.get("size").unwrap_or_else(|_| "0".into());
+            Ok(Some(SwapConfig { size }))
+        }
+        Value::Nil => Ok(None),
+        other => Err(miette::miette!(
+            "image(): 'disk.swap' must be a table, got {}",
             other.type_name()
         )),
     }
@@ -288,14 +476,14 @@ pub fn build_image(
     }
 
     // 6. Merge kernel snap if provided
-    if let Some(ref kernel_ref) = image.kernel {
+    if let Some(ref kernel_entry) = image.kernel {
         if has_unsquashfs {
-            let kernel_snap = resolved.iter().find(|s| s.name == kernel_ref.name);
+            let kernel_snap = resolved.iter().find(|s| s.name == kernel_entry.snap.name);
             if let Some(ks) = kernel_snap {
                 let k_filename = format!("{}_{}_{}.snap", ks.name, ks.revision, ks.sha3_384);
                 let kpath = cache_dir.join(&k_filename);
 
-                eprintln!("  merging kernel snap: {}", kernel_ref.name);
+                eprintln!("  merging kernel snap: {}", kernel_entry.snap.name);
                 let kernel_img = tempfile::tempdir().map_err(|e| miette::miette!("{e}"))?;
                 let kernel_dir = kernel_img.path().to_path_buf();
 
@@ -324,6 +512,34 @@ pub fn build_image(
                 }
             }
         }
+    }
+
+    // 6b. Write kernel cmdline if params provided
+    if let Some(ref kernel_entry) = image.kernel {
+        if !kernel_entry.params.is_empty() {
+            let cmdline = kernel_entry.params.join(" ");
+            let kernel_dir = root.join("etc");
+            std::fs::create_dir_all(&kernel_dir)
+                .into_diagnostic()
+                .wrap_err("creating /etc")?;
+            std::fs::write(kernel_dir.join("kernelcmdline"), &cmdline)
+                .into_diagnostic()
+                .wrap_err("writing kernel cmdline")?;
+            eprintln!("  ✓ kernel cmdline: {cmdline}");
+        }
+    }
+
+    // 6c. Write sysctl if provided
+    if !image.sysctl.is_empty() {
+        let sysctl_dir = root.join("etc").join("sysctl.d");
+        std::fs::create_dir_all(&sysctl_dir)
+            .into_diagnostic()
+            .wrap_err("creating /etc/sysctl.d")?;
+        let sysctl_content = image.sysctl.join("\n") + "\n";
+        std::fs::write(sysctl_dir.join("99-shoot.conf"), &sysctl_content)
+            .into_diagnostic()
+            .wrap_err("writing sysctl")?;
+        eprintln!("  ✓ sysctl written ({} entries)", image.sysctl.len());
     }
 
     // 7. Create snap directory and copy all snap files
@@ -393,6 +609,385 @@ pub fn build_image(
     Ok(output_path)
 }
 
+/// Build a full disk image with partitions.
+pub fn build_disk_image(
+    image: &ImageDeclaration,
+    output_dir: &Path,
+    cache_dir: &Path,
+    channel: &str,
+    arch: &str,
+    lockfile: &mut LockFile,
+) -> miette::Result<PathBuf> {
+    // 1. Resolve all snaps
+    let resolved = resolve_image_snaps(image, lockfile, channel, arch)?;
+
+    // 2. Download and verify all snaps
+    let mut snap_paths: Vec<(String, ResolvedSnap)> = Vec::new();
+    for snap in &resolved {
+        let path = StoreClient::download(snap, cache_dir)?;
+        StoreClient::verify(&path, &snap.sha3_384)?;
+        eprintln!(
+            "  ✓ {} revision {} — sha3-384 verified",
+            snap.name, snap.revision
+        );
+        snap_paths.push((snap.name.clone(), snap.clone()));
+    }
+
+    let has_unsquashfs = std::process::Command::new("which")
+        .arg("unsquashfs")
+        .output()
+        .ok()
+        .is_some_and(|o| o.status.success());
+
+    let build_dir = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create build directory: {e}"))?;
+    let root = build_dir.path().to_path_buf();
+
+    // 3. Extract base snap
+    let base_snap = resolved
+        .iter()
+        .find(|s| s.name == image.base.name)
+        .ok_or_else(|| miette::miette!("base snap '{}' not resolved", image.base.name))?;
+    let base_filename = format!(
+        "{}_{}_{}.snap",
+        base_snap.name, base_snap.revision, base_snap.sha3_384
+    );
+    let base_path = cache_dir.join(&base_filename);
+
+    if has_unsquashfs {
+        eprintln!("  extracting base snap into {:?}", root);
+        let status = std::process::Command::new("unsquashfs")
+            .args([
+                "-d",
+                &root.to_string_lossy(),
+                "-no-xattrs",
+                &base_path.to_string_lossy(),
+            ])
+            .status()
+            .map_err(|e| miette::miette!("unsquashfs not found: {e}"))?;
+        let exit_code = status.code().unwrap_or(1);
+        if exit_code >= 128 {
+            return Err(miette::miette!(
+                "failed to unsquashfs base snap '{}'",
+                image.base.name
+            ));
+        }
+    }
+
+    // 4. Merge kernel modules
+    if let Some(ref kernel_entry) = image.kernel {
+        if has_unsquashfs {
+            let kernel_snap = resolved.iter().find(|s| s.name == kernel_entry.snap.name);
+            if let Some(ks) = kernel_snap {
+                let k_filename = format!("{}_{}_{}.snap", ks.name, ks.revision, ks.sha3_384);
+                let kpath = cache_dir.join(&k_filename);
+                eprintln!("  merging kernel snap: {}", kernel_entry.snap.name);
+                let kernel_img = tempfile::tempdir().map_err(|e| miette::miette!("{e}"))?;
+                let kernel_dir = kernel_img.path().to_path_buf();
+                let status = std::process::Command::new("unsquashfs")
+                    .args([
+                        "-d",
+                        &kernel_dir.to_string_lossy(),
+                        "-no-xattrs",
+                        &kpath.to_string_lossy(),
+                    ])
+                    .status()
+                    .map_err(|e| miette::miette!("unsquashfs: {e}"))?;
+                if status.code().unwrap_or(1) < 128 {
+                    for dir in ["lib/modules", "lib/firmware"] {
+                        let src = kernel_dir.join(dir);
+                        let dst = root.join(dir);
+                        if src.exists() {
+                            std::fs::create_dir_all(dst.parent().unwrap()).into_diagnostic()?;
+                            cp_r(&src, &dst)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Write kernel cmdline
+    if let Some(ref kernel_entry) = image.kernel {
+        if !kernel_entry.params.is_empty() {
+            let cmdline = kernel_entry.params.join(" ");
+            let kernel_dir = root.join("etc");
+            std::fs::create_dir_all(&kernel_dir).into_diagnostic()?;
+            std::fs::write(kernel_dir.join("kernelcmdline"), &cmdline).into_diagnostic()?;
+            eprintln!("  ✓ kernel cmdline: {cmdline}");
+        }
+    }
+
+    // 6. Write sysctl
+    if !image.sysctl.is_empty() {
+        let sysctl_dir = root.join("etc").join("sysctl.d");
+        std::fs::create_dir_all(&sysctl_dir).into_diagnostic()?;
+        let sysctl_content = image.sysctl.join("\n") + "\n";
+        std::fs::write(sysctl_dir.join("99-shoot.conf"), &sysctl_content).into_diagnostic()?;
+        eprintln!(
+            "  ✓ sysctl written ({} entries)",
+            image.sysctl.len()
+        );
+    }
+
+    // 7. Write manifest
+    let manifest_path = root.join("image-manifest.json");
+    let manifest = ImageManifest::from_resolved(image, &snap_paths, arch);
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| miette::miette!("failed to serialize manifest: {e}"))?;
+    std::fs::write(&manifest_path, &manifest_json).into_diagnostic()?;
+
+    // 8. Create disk image
+    let disk_layout = image
+        .disk
+        .as_ref()
+        .ok_or_else(|| miette::miette!("disk() must declare partitions for disk image"))?;
+
+    let output_filename = if arch == "all" {
+        format!("{}_{}.img", image.name, image.version)
+    } else {
+        format!("{}_{}_{}.img", image.name, image.version, arch)
+    };
+    let output_path = output_dir.join(&output_filename);
+    std::fs::create_dir_all(output_dir).into_diagnostic()?;
+
+    // Calculate total image size: sum partitions + swap + 4M for GPT headers
+    let total_mb = calculate_disk_size_mb(disk_layout);
+    eprintln!("  creating disk image: {} MB", total_mb);
+
+    let img_path = build_dir.path().join("disk.img");
+    let status = std::process::Command::new("dd")
+        .args([
+            "if=/dev/zero",
+            &format!("of={}", img_path.display()),
+            "bs=1M",
+            &format!("count={}", total_mb),
+        ])
+        .status()
+        .map_err(|e| miette::miette!("dd not found: {e}"))?;
+    if !status.success() {
+        return Err(miette::miette!("dd failed to create disk image"));
+    }
+
+    // Partition with parted
+    let status = std::process::Command::new("parted")
+        .args([
+            "-s",
+            &img_path.to_string_lossy(),
+            "mklabel",
+            &disk_layout.label,
+        ])
+        .status()
+        .map_err(|e| miette::miette!("parted not found: {e}"))?;
+    if !status.success() {
+        return Err(miette::miette!("parted failed to create partition table"));
+    }
+
+    // Create partitions
+    let mut part_start_mb = 4u64; // after GPT
+    for (part_num, part) in disk_layout.partitions.iter().enumerate() {
+        let size_mb = parse_size_mb(&part.size, total_mb - part_start_mb);
+        let end_mb = part_start_mb + size_mb;
+
+        let fs_type = if part.fs == "vfat" {
+            "fat32"
+        } else {
+            &part.fs
+        };
+        let status = std::process::Command::new("parted")
+            .args([
+                "-s",
+                &img_path.to_string_lossy(),
+                "mkpart",
+                "primary",
+                fs_type,
+                &format!("{}MB", part_start_mb),
+                &format!("{}MB", end_mb),
+            ])
+            .status()
+            .map_err(|e| miette::miette!("parted: {e}"))?;
+        if !status.success() {
+            return Err(miette::miette!(
+                "parted failed to create partition '{}'",
+                part.name
+            ));
+        }
+
+        // ESP flag on first partition
+        if part_num == 0 {
+            let status = std::process::Command::new("parted")
+                .args(["-s", &img_path.to_string_lossy(), "set", "1", "esp", "on"])
+                .status()
+                .map_err(|e| miette::miette!("parted: {e}"))?;
+            if !status.success() {
+                eprintln!("  ⚠ failed to set ESP flag");
+            }
+        }
+
+        part_start_mb = end_mb;
+    }
+
+    // Swap partition
+    if let Some(ref swap) = disk_layout.swap {
+        let swap_size = parse_size_mb(&swap.size, 0);
+        if swap_size > 0 {
+            let end_mb = part_start_mb + swap_size;
+            let status = std::process::Command::new("parted")
+                .args([
+                    "-s",
+                    &img_path.to_string_lossy(),
+                    "mkpart",
+                    "primary",
+                    "linux-swap",
+                    &format!("{}MB", part_start_mb),
+                    &format!("{}MB", end_mb),
+                ])
+                .status()
+                .map_err(|e| miette::miette!("parted: {e}"))?;
+            if !status.success() {
+                return Err(miette::miette!("parted failed to create swap partition"));
+            }
+        }
+    }
+
+    // Set up loopback device
+    let losetup_out = std::process::Command::new("losetup")
+        .args(["--show", "-fP", &img_path.to_string_lossy()])
+        .output()
+        .map_err(|e| miette::miette!("losetup not found: {e}"))?;
+    if !losetup_out.status.success() {
+        return Err(miette::miette!("losetup failed"));
+    }
+    let loop_dev = String::from_utf8_lossy(&losetup_out.stdout)
+        .trim()
+        .to_string();
+    eprintln!("  loop device: {}", loop_dev);
+
+    // Format and populate partitions
+    let part_prefix = format!("{}p", loop_dev);
+    for (i, part) in disk_layout.partitions.iter().enumerate() {
+        let part_dev = format!("{}{}", part_prefix, i + 1);
+        let mount_pt = build_dir.path().join(&part.name);
+        std::fs::create_dir_all(&mount_pt).into_diagnostic()?;
+
+        if part.fs == "vfat" {
+            let status = std::process::Command::new("mkfs.vfat")
+                .args(["-F", "32", "-n", &part.name, &part_dev])
+                .status()
+                .map_err(|e| miette::miette!("mkfs.vfat not found: {e}"))?;
+            if !status.success() {
+                eprintln!("  ⚠ mkfs.vfat failed for {}", part.name);
+            }
+        } else if part.fs == "btrfs" {
+            let status = std::process::Command::new("mkfs.btrfs")
+                .args(["-f", "-L", &part.name, &part_dev])
+                .status()
+                .map_err(|e| miette::miette!("mkfs.btrfs not found: {e}"))?;
+            if !status.success() {
+                eprintln!("  ⚠ mkfs.btrfs failed for {}", part.name);
+            }
+        } else {
+            let status = std::process::Command::new("mkfs.ext4")
+                .args(["-F", "-L", &part.name, &part_dev])
+                .status()
+                .map_err(|e| miette::miette!("mkfs.ext4 not found: {e}"))?;
+            if !status.success() {
+                eprintln!("  ⚠ mkfs.ext4 failed for {}", part.name);
+            }
+        }
+
+        // Mount and populate
+        let mount_str = mount_pt.to_string_lossy().into_owned();
+        let status = std::process::Command::new("mount")
+            .args([&part_dev, &mount_str])
+            .status()
+            .map_err(|e| miette::miette!("mount not found: {e}"))?;
+        if status.success() {
+            if i == 0 && part.fs == "vfat" {
+                // ESP: create EFI/boot directory, copy systemd-boot
+                let efi_dir = mount_pt.join("EFI").join("BOOT");
+                std::fs::create_dir_all(&efi_dir).into_diagnostic()?;
+                // Try to find systemd-bootx64.efi on the host
+                let boot_efi = efi_dir.join("BOOTX64.EFI");
+                if !boot_efi.exists() {
+                    if let Ok(efi_status) = std::process::Command::new("sh")
+                        .args([
+                            "-c",
+                            "find /usr/lib/systemd/boot -name '*.efi' 2>/dev/null | head -1",
+                        ])
+                        .output()
+                    {
+                        let src = String::from_utf8_lossy(&efi_status.stdout)
+                            .trim()
+                            .to_string();
+                        if !src.is_empty() {
+                            let _ = std::fs::copy(&src, efi_dir.join("BOOTX64.EFI"));
+                            let _ = std::fs::copy(&src, efi_dir.join("systemd-bootx64.efi"));
+                        }
+                    }
+                }
+                eprintln!("  ✓ ESP: {} (vfat)", part.name);
+            } else {
+                // Root partition: copy rootfs
+                cp_r(&root, &mount_pt)?;
+                eprintln!("  ✓ {}: {} populated", part.name, part.fs);
+            }
+            // Unmount
+            let _ = std::process::Command::new("umount")
+                .arg(&mount_str)
+                .status();
+        }
+    }
+
+    // Detach loop device
+    let _ = std::process::Command::new("losetup")
+        .args(["-d", &loop_dev])
+        .status();
+
+    // 9. Copy final image to output
+    std::fs::copy(&img_path, &output_path).into_diagnostic()?;
+    eprintln!(
+        "  ✓ disk image built: {} ({} MB)",
+        output_filename, total_mb
+    );
+
+    // 10. Update lockfile
+    for snap in &resolved {
+        lockfile.record_snap(&snap.to_snap_ref());
+    }
+
+    Ok(output_path)
+}
+
+/// Parse a size string like "512M" or "4G" or "0" to MB.
+fn parse_size_mb(size: &str, default_if_zero: u64) -> u64 {
+    let size = size.trim();
+    if size == "0" {
+        return default_if_zero.max(256);
+    }
+    if let Some(n) = size.strip_suffix('G').or_else(|| size.strip_suffix('g')) {
+        n.parse::<u64>().unwrap_or(1) * 1024
+    } else if let Some(n) = size.strip_suffix('M').or_else(|| size.strip_suffix('m')) {
+        n.parse::<u64>().unwrap_or(256)
+    } else if let Some(n) = size.strip_suffix('K').or_else(|| size.strip_suffix('k')) {
+        n.parse::<u64>().unwrap_or(256) / 1024 + 1
+    } else {
+        size.parse::<u64>().unwrap_or(default_if_zero.max(256))
+    }
+}
+
+/// Calculate total disk size in MB.
+fn calculate_disk_size_mb(layout: &DiskLayout) -> u64 {
+    let mut total = 4u64; // GPT headers
+    for part in &layout.partitions {
+        total += parse_size_mb(&part.size, 1024);
+    }
+    if let Some(ref swap) = layout.swap {
+        total += parse_size_mb(&swap.size, 0);
+    }
+    total
+}
+
 // ── Image manifest ──
 
 #[derive(Debug, Clone, Serialize)]
@@ -423,7 +1018,7 @@ impl ImageManifest {
             .map(|(name, snap)| {
                 let role = if *name == image.base.name {
                     "base"
-                } else if image.kernel.as_ref().is_some_and(|k| k.name == *name) {
+                } else if image.kernel.as_ref().is_some_and(|k| k.snap.name == *name) {
                     "kernel"
                 } else if image.gadget.as_ref().is_some_and(|g| g.name == *name) {
                     "gadget"
@@ -528,7 +1123,8 @@ mod tests {
         assert_eq!(decl.base.name, "core22");
         assert_eq!(decl.base.revision, Some(1847));
         assert_eq!(decl.base.sha3_384.as_deref(), Some("abc"));
-        assert_eq!(decl.kernel.as_ref().unwrap().name, "pc-kernel");
+        assert_eq!(decl.kernel.as_ref().unwrap().snap.name, "pc-kernel");
+        assert_eq!(decl.kernel.as_ref().unwrap().snap.revision, Some(1241));
         assert_eq!(decl.gadget.as_ref().unwrap().name, "pi-gadget");
         assert_eq!(decl.extra_snaps.len(), 2);
         assert_eq!(decl.extra_snaps[0].name, "lxd");
@@ -626,10 +1222,15 @@ mod tests {
                 revision: Some(1),
                 sha3_384: Some("a".into()),
             },
-            kernel: Some(SnapRef {
-                name: "pc-kernel".into(),
-                revision: Some(2),
-                sha3_384: Some("b".into()),
+            kernel: Some(KernelEntry {
+                snap: SnapRef {
+                    name: "pc-kernel".into(),
+                    revision: Some(2),
+                    sha3_384: Some("b".into()),
+                },
+                params: vec![],
+                modules: vec![],
+                modprobe_config: None,
             }),
             gadget: Some(SnapRef {
                 name: "pi-gadget".into(),
@@ -641,6 +1242,9 @@ mod tests {
                 revision: Some(4),
                 sha3_384: Some("d".into()),
             }],
+            bootloader: None,
+            disk: None,
+            sysctl: vec![],
         };
 
         let snaps: Vec<(String, ResolvedSnap)> = vec![
@@ -688,5 +1292,117 @@ mod tests {
         assert_eq!(manifest.snaps[1].role, "kernel");
         assert_eq!(manifest.snaps[2].role, "gadget");
         assert_eq!(manifest.snaps[3].role, "app");
+    }
+
+    #[test]
+    fn test_image_with_kernel_params() {
+        let lua = lua_env();
+        let value: Value = lua
+            .load(
+                r#"
+                return image {
+                    name = "kparams",
+                    version = "1.0",
+                    base = pin("core22"),
+                    kernel = pin("pc-kernel", { params = { "quiet", "splash" } }),
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        let table = match value {
+            Value::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+
+        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let kernel = decl.kernel.as_ref().unwrap();
+        assert_eq!(kernel.snap.name, "pc-kernel");
+        assert_eq!(kernel.params, vec!["quiet", "splash"]);
+        assert!(kernel.modules.is_empty());
+        assert!(kernel.modprobe_config.is_none());
+    }
+
+    #[test]
+    fn test_image_with_bootloader() {
+        let lua = lua_env();
+        let value: Value = lua
+            .load(
+                r#"
+                return image {
+                    name = "boot",
+                    version = "1.0",
+                    base = pin("core22"),
+                    bootloader = { type = "grub", timeout = 5 },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        let table = match value {
+            Value::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+
+        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let bl = decl.bootloader.as_ref().unwrap();
+        assert_eq!(bl.type_, "grub");
+        assert_eq!(bl.timeout, 5);
+    }
+
+    #[test]
+    fn test_image_with_disk_layout() {
+        let lua = lua_env();
+        let value: Value = lua
+            .load(
+                r#"
+                return image {
+                    name = "disk",
+                    version = "1.0",
+                    base = pin("core22"),
+                    disk = {
+                        label = "gpt",
+                        partitions = {
+                            { name = "ESP", size = "512M", fs = "vfat", mount = "/boot/efi" },
+                            { name = "root", size = "4G", fs = "ext4", mount = "/" },
+                        },
+                        swap = { size = "2G" },
+                    },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        let table = match value {
+            Value::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+
+        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let disk = decl.disk.as_ref().unwrap();
+        assert_eq!(disk.label, "gpt");
+        assert_eq!(disk.partitions.len(), 2);
+        assert_eq!(disk.partitions[0].name, "ESP");
+        assert_eq!(disk.partitions[0].size, "512M");
+        assert_eq!(disk.partitions[0].fs, "vfat");
+        assert_eq!(disk.partitions[1].name, "root");
+        assert_eq!(disk.partitions[1].fs, "ext4");
+        let swap = disk.swap.as_ref().unwrap();
+        assert_eq!(swap.size, "2G");
+    }
+
+    #[test]
+    fn test_parse_size_mb() {
+        assert_eq!(parse_size_mb("512M", 0), 512);
+        assert_eq!(parse_size_mb("4G", 0), 4096);
+        assert_eq!(parse_size_mb("1024K", 0), 2); // 1024/1024 + 1 (ceiling)
+        assert_eq!(parse_size_mb("0", 1024), 1024);
+        assert_eq!(parse_size_mb("0", 0), 256);
+        assert_eq!(parse_size_mb("2048", 0), 2048);
+        assert_eq!(parse_size_mb("1g", 0), 1024);
+        assert_eq!(parse_size_mb("256m", 0), 256);
     }
 }

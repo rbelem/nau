@@ -168,15 +168,30 @@ end
 -- @return a pin table consumable by image()
 -- @usage pin("core22", { revision = 1847, sha3_384 = "abc..." })
 --- Declare a system image composed from multiple snaps.
--- @param opts table with fields: name, version, base (required),
---   kernel, gadget, snaps (optional arrays of pins)
+-- @param opts table with fields:
+--   name, version, base (required)
+--   kernel (pin table, optionally merged with params/modules),
+--   gadget, snaps (optional arrays of pins)
+--   bootloader (table with type, timeout),
+--   disk (table with label, partitions, swap),
+--   sysctl (array of "key=value" strings)
 -- @return the validated opts table
 -- @usage image {
 --     name = "my-system",
 --     version = "1.0.0",
 --     base = pin("core22"),
---     kernel = pin("pc-kernel"),
+--     kernel = merge(pin("pc-kernel"), { params = { "quiet" } }),
+--     gadget = pin("pc-gadget"),
 --     snaps = { pin("lxd") },
+--     bootloader = { type = "systemd-boot", timeout = 3 },
+--     disk = {
+--         label = "gpt",
+--         partitions = {
+--             { name = "boot", size = "512M", fs = "vfat", mount = "/boot" },
+--             { name = "root", size = "0", fs = "btrfs", mount = "/" },
+--         },
+--         swap = { size = "8G" },
+--     },
 -- }
 function image(opts)
     if type(opts) ~= "table" then
@@ -215,6 +230,72 @@ function image(opts)
                 error(string.format("image(): snaps[%d] must be a pin, got %s", i, type(s)), 2)
             end
         end
+    end
+
+    -- Optional kernel config fields (merged with kernel pin table)
+    if opts.kernel ~= nil then
+        if opts.kernel.params ~= nil then
+            check_string_array(opts.kernel.params, "image", "kernel.params")
+        end
+        if opts.kernel.modules ~= nil then
+            check_string_array(opts.kernel.modules, "image", "kernel.modules")
+        end
+        if opts.kernel.modprobe_config ~= nil and type(opts.kernel.modprobe_config) ~= "string" then
+            error("image(): 'kernel.modprobe_config' must be a string, got " .. type(opts.kernel.modprobe_config), 2)
+        end
+    end
+
+    -- Optional bootloader config
+    if opts.bootloader ~= nil then
+        if type(opts.bootloader) ~= "table" then
+            error("image(): 'bootloader' must be a table, got " .. type(opts.bootloader), 2)
+        end
+        if opts.bootloader.type ~= nil and type(opts.bootloader.type) ~= "string" then
+            error("image(): 'bootloader.type' must be a string, got " .. type(opts.bootloader.type), 2)
+        end
+        if opts.bootloader.timeout ~= nil and type(opts.bootloader.timeout) ~= "number" then
+            error("image(): 'bootloader.timeout' must be a number, got " .. type(opts.bootloader.timeout), 2)
+        end
+    end
+
+    -- Optional disk layout
+    if opts.disk ~= nil then
+        if type(opts.disk) ~= "table" then
+            error("image(): 'disk' must be a table, got " .. type(opts.disk), 2)
+        end
+        if opts.disk.label ~= nil and type(opts.disk.label) ~= "string" then
+            error("image(): 'disk.label' must be a string, got " .. type(opts.disk.label), 2)
+        end
+        if opts.disk.partitions ~= nil then
+            if type(opts.disk.partitions) ~= "table" then
+                error("image(): 'disk.partitions' must be a table, got " .. type(opts.disk.partitions), 2)
+            end
+            for i, p in ipairs(opts.disk.partitions) do
+                if type(p) ~= "table" then
+                    error(string.format("image(): disk.partitions[%d] must be a table, got %s", i, type(p)), 2)
+                end
+                check_string(p.name, "image", string.format("disk.partitions[%d].name", i))
+                check_string(p.size, "image", string.format("disk.partitions[%d].size", i))
+                check_string(p.fs, "image", string.format("disk.partitions[%d].fs", i))
+                check_string(p.mount, "image", string.format("disk.partitions[%d].mount", i))
+                if p.options ~= nil then
+                    check_string_array(p.options, "image", string.format("disk.partitions[%d].options", i))
+                end
+            end
+        end
+        if opts.disk.swap ~= nil then
+            if type(opts.disk.swap) ~= "table" then
+                error("image(): 'disk.swap' must be a table, got " .. type(opts.disk.swap), 2)
+            end
+            if opts.disk.swap.size ~= nil and type(opts.disk.swap.size) ~= "string" then
+                error("image(): 'disk.swap.size' must be a string, got " .. type(opts.disk.swap.size), 2)
+            end
+        end
+    end
+
+    -- Optional sysctl entries (array of "key=value" strings)
+    if opts.sysctl ~= nil then
+        check_string_array(opts.sysctl, "image", "sysctl")
     end
 
     return opts
@@ -258,6 +339,12 @@ function pin(name, opts)
                 error("pin(): sha3_384 must be a string, got " .. type(opts.sha3_384), 2)
             end
             result.sha3_384 = opts.sha3_384
+        end
+        -- Pass through all extra fields (e.g. params, modules for kernel pins)
+        for k, v in pairs(opts) do
+            if k ~= "revision" and k ~= "sha3_384" then
+                result[k] = v
+            end
         end
     end
 

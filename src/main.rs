@@ -202,14 +202,25 @@ fn cmd_image(
     for (name, image_decl) in iter {
         println!("Building image: {} ({})...", name, image_decl.version);
 
-        let result = shoot::image::build_image(
-            image_decl,
-            output_dir,
-            &cache_dir,
-            &channel,
-            &arch,
-            &mut lockfile,
-        )?;
+        let result = if image_decl.disk.is_some() {
+            shoot::image::build_disk_image(
+                image_decl,
+                output_dir,
+                &cache_dir,
+                &channel,
+                &arch,
+                &mut lockfile,
+            )?
+        } else {
+            shoot::image::build_image(
+                image_decl,
+                output_dir,
+                &cache_dir,
+                &channel,
+                &arch,
+                &mut lockfile,
+            )?
+        };
 
         println!(
             "  ✓ {}",
