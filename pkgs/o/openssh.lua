@@ -18,7 +18,7 @@ return {
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
-        requires = { "glibc" },
+        requires = { "glibc", "openssl", "zlib" },
         source = {
             url = "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-9.9p2.tar.gz",
         },

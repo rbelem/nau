@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use clap::Parser;
-use shoot::cli::{Cli, Command, IndexCommand};
+use shoot::cache::PackageCache;
+use shoot::cli::{CacheCommand, Cli, Command, IndexCommand};
 use shoot::image::ImageDeclaration;
 use shoot::index::{IndexEntry, PackageIndex, StoreRef};
 use shoot::lock::{LockFile, SourceLockEntry};
@@ -23,6 +24,7 @@ fn main() -> miette::Result<()> {
             order,
             all,
             cache,
+            target,
             json,
         } => {
             shoot::output::set_mode(json);
@@ -41,6 +43,7 @@ fn main() -> miette::Result<()> {
                 lockfile_path,
                 all,
                 cache,
+                target,
                 json,
             );
             shoot::output::flush_json("build");
@@ -90,6 +93,10 @@ fn main() -> miette::Result<()> {
         Command::Index(sub) => cmd_index(sub),
 
         Command::Doctor => cmd_doctor(),
+
+        Command::Completion { shell } => cmd_completion(shell),
+
+        Command::Cache(sub) => cmd_cache(sub),
     }
 }
 
@@ -106,6 +113,7 @@ fn cmd_build(
     lockfile_path: String,
     all: bool,
     cache: Option<String>,
+    target: Option<String>,
     json: bool,
 ) -> miette::Result<()> {
     if let Some(ref epoch) = source_date_epoch {
@@ -133,15 +141,41 @@ fn cmd_build(
         None
     };
 
-    let iter: Vec<(&String, &shoot::snap::SnapMeta)> = match &output_name {
+    // If --target is set, override on all snap meta structs
+    let iter: Vec<(&String, shoot::snap::SnapMeta)> = match &output_name {
         Some(name) => {
-            let meta = all_outputs
+            let mut meta = all_outputs
                 .get(name)
-                .ok_or_else(|| miette::miette!("output '{}' not found in {}", name, file))?;
+                .ok_or_else(|| miette::miette!("output '{}' not found in {}", name, file))?
+                .clone();
+            if let Some(ref t) = target {
+                meta.target = Some(t.clone());
+                if !json {
+                    shoot::output::info(format!("target: {t}"));
+                }
+            }
             vec![(name, meta)]
         }
-        None => all_outputs.iter().collect(),
+        None => {
+            let mut vec: Vec<(&String, shoot::snap::SnapMeta)> = Vec::new();
+            for (name, meta_ref) in &all_outputs {
+                let mut meta = meta_ref.clone();
+                if let Some(ref t) = target {
+                    meta.target = Some(t.clone());
+                }
+                vec.push((name, meta));
+            }
+            if let Some(ref t) = target {
+                if !json {
+                    shoot::output::info(format!("target: {t}"));
+                }
+            }
+            vec
+        }
     };
+
+    // Also apply target to dep builds
+    let effective_target = target.clone();
 
     // If --all, resolve and build transitive dependencies first
     if all {
@@ -165,13 +199,18 @@ fn cmd_build(
                 eprintln!("── Building {} dependencies ──", all_deps.len());
             }
             for dep_name in &all_deps {
-                let dep_meta = match shoot::deps::load_meta(dep_name) {
+                let mut dep_meta = match shoot::deps::load_meta(dep_name) {
                     Ok(m) => m,
                     Err(e) => {
                         shoot::output::warn(format!("skipping dependency '{}': {}", dep_name, e));
                         continue;
                     }
                 };
+
+                // Apply --target to deps as well
+                if let Some(ref t) = effective_target {
+                    dep_meta.target = Some(t.clone());
+                }
 
                 // Check cache first
                 if let Some(ref cache) = pkg_cache {
@@ -213,7 +252,7 @@ fn cmd_build(
 
     let mut all_source_info: Vec<shoot::snap::SourceInfo> = Vec::new();
 
-    for (name, meta) in iter {
+    for (name, meta) in &iter {
         let archs = shoot::snap::resolve_archs(meta, &arch);
         if !json {
             eprintln!("Building {} ({})...", name, meta.version);
@@ -537,6 +576,84 @@ fn cmd_doctor() -> miette::Result<()> {
     if !shoot::doctor::all_ok(&checks) {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+// ── Index command ──
+
+// ── Cache command ──
+
+fn cmd_cache(sub: CacheCommand) -> miette::Result<()> {
+    match sub {
+        CacheCommand::Info { cache } => {
+            let cache = PackageCache::new(cache.map(std::path::PathBuf::from));
+            let info = cache.info()?;
+            eprintln!("Cache directory: {}", info.root.display());
+            eprintln!("Unique source entries: {}", info.entries);
+            eprintln!("Cached packages: {}", info.packages);
+            eprintln!(
+                "Disk usage: {}",
+                if info.size_bytes > 1_000_000_000 {
+                    format!("{:.1} GB", info.size_bytes as f64 / 1_000_000_000.0)
+                } else if info.size_bytes > 1_000_000 {
+                    format!("{:.1} MB", info.size_bytes as f64 / 1_000_000.0)
+                } else {
+                    format!("{} bytes", info.size_bytes)
+                }
+            );
+        }
+        CacheCommand::Clear { cache, force } => {
+            let cache = PackageCache::new(cache.map(std::path::PathBuf::from));
+            let info = cache.info()?;
+            if info.entries == 0 {
+                eprintln!("Cache is already empty at {}", info.root.display());
+                return Ok(());
+            }
+            if !force {
+                eprintln!(
+                    "This will remove {} cached packages ({} entries, {:.1} MB).",
+                    info.packages,
+                    info.entries,
+                    info.size_bytes as f64 / 1_000_000.0
+                );
+                eprintln!("Use --force to confirm.");
+                return Ok(());
+            }
+            cache.clear()?;
+            shoot::output::ok("cache cleared");
+        }
+        CacheCommand::Prune { days, cache, force } => {
+            let cache = PackageCache::new(cache.map(std::path::PathBuf::from));
+            if !force {
+                eprintln!(
+                    "This will remove cache entries not accessed in {} days.",
+                    days
+                );
+                eprintln!("Use --force to confirm.");
+                return Ok(());
+            }
+            let removed = cache.prune(days)?;
+            if removed > 0 {
+                shoot::output::ok(format!(
+                    "pruned {} cache entr{}",
+                    removed,
+                    if removed == 1 { "y" } else { "ies" }
+                ));
+            } else {
+                eprintln!("Nothing to prune.");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Completion command ──
+
+fn cmd_completion(shell: clap_complete::Shell) -> miette::Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
     Ok(())
 }
 

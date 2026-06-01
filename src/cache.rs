@@ -30,6 +30,15 @@ use sha2::Digest;
 
 use crate::snap::{BuildResult, SnapMeta};
 
+/// Cache statistics.
+#[derive(Debug, Clone)]
+pub struct CacheInfo {
+    pub entries: usize,
+    pub packages: usize,
+    pub size_bytes: u64,
+    pub root: std::path::PathBuf,
+}
+
 /// Default cache directory name under `~/.cache/shoot/`.
 const DEFAULT_CACHE_SUBDIR: &str = "pkgs";
 
@@ -148,6 +157,73 @@ impl PackageCache {
                 .map_err(|e| miette::miette!("failed to clear cache {:?}: {}", self.root, e))?;
         }
         Ok(())
+    }
+
+    /// Gather cache statistics.
+    pub fn info(&self) -> miette::Result<CacheInfo> {
+        let mut entries = 0usize;
+        let mut packages = 0usize;
+        let mut size_bytes = 0u64;
+
+        if self.root.exists() {
+            for entry in std::fs::read_dir(&self.root)
+                .map_err(|e| miette::miette!("failed to read cache {:?}: {}", self.root, e))?
+            {
+                let entry =
+                    entry.map_err(|e| miette::miette!("failed to read cache entry: {}", e))?;
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    entries += 1;
+                    let dir = entry.path();
+                    for file in std::fs::read_dir(&dir)
+                        .map_err(|e| miette::miette!("failed to read cache dir: {}", e))?
+                    {
+                        let file =
+                            file.map_err(|e| miette::miette!("failed to read cache file: {}", e))?;
+                        if file.file_type().is_ok_and(|t| t.is_file()) {
+                            packages += 1;
+                            size_bytes += file.metadata().map(|m| m.len()).unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(CacheInfo {
+            entries,
+            packages,
+            size_bytes,
+            root: self.root.clone(),
+        })
+    }
+
+    /// Prune cache entries not accessed in `max_days` days.
+    /// Removes entire hash directories for stale sources.
+    pub fn prune(&self, max_days: u64) -> miette::Result<u64> {
+        let now = std::time::SystemTime::now();
+        let max_age = std::time::Duration::from_secs(max_days * 86400);
+        let mut removed = 0u64;
+
+        if self.root.exists() {
+            for entry in std::fs::read_dir(&self.root)
+                .map_err(|e| miette::miette!("failed to read cache {:?}: {}", self.root, e))?
+            {
+                let entry =
+                    entry.map_err(|e| miette::miette!("failed to read cache entry: {}", e))?;
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    // Check access time of the directory itself
+                    if let Ok(modified) = entry.path().metadata().and_then(|m| m.modified()) {
+                        if now.duration_since(modified).unwrap_or_default() > max_age {
+                            std::fs::remove_dir_all(entry.path()).map_err(|e| {
+                                miette::miette!("failed to remove {:?}: {}", entry.path(), e)
+                            })?;
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(removed)
     }
 }
 

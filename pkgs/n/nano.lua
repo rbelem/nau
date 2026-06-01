@@ -19,7 +19,7 @@ return {
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
-        requires = { "glibc" },
+        requires = { "glibc", "ncurses" },
         source = {
             url = "https://nano-editor.org/dist/v8/nano-8.3.tar.xz",
         },

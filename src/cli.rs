@@ -63,6 +63,13 @@ pub enum Command {
         #[arg(long)]
         cache: Option<String>,
 
+        /// Override cross-compilation target for all packages.
+        /// Sets the GNU target triplet (e.g. "aarch64-linux-gnu") and exports
+        /// CC/CXX/LD/AR environment variables in the build sandbox.
+        /// Overrides the `target` field on individual snap() declarations.
+        #[arg(long)]
+        target: Option<String>,
+
         /// Output structured JSON instead of human-friendly colored output.
         /// Useful for tooling, CI, or machine parsing.
         #[arg(long)]
@@ -137,6 +144,53 @@ pub enum Command {
 
     /// Check system readiness (required tools)
     Doctor,
+
+    /// Generate shell completion scripts
+    Completion {
+        /// Shell to generate completions for (bash, zsh, fish, powershell, elvish)
+        shell: clap_complete::Shell,
+    },
+
+    /// Manage the binary package cache
+    #[command(subcommand)]
+    Cache(CacheCommand),
+}
+
+/// Subcommands for `shoot cache`.
+#[derive(clap::Subcommand)]
+pub enum CacheCommand {
+    /// Show cache statistics (entries, packages, disk usage)
+    Info {
+        /// Cache directory (default: ~/.cache/shoot/pkgs)
+        #[arg(long)]
+        cache: Option<String>,
+    },
+
+    /// Remove all cached packages
+    Clear {
+        /// Cache directory (default: ~/.cache/shoot/pkgs)
+        #[arg(long)]
+        cache: Option<String>,
+
+        /// Skip confirmation prompt
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Remove cache entries not accessed in N days (default: 30)
+    Prune {
+        /// Maximum age in days (default: 30)
+        #[arg(long, default_value_t = 30)]
+        days: u64,
+
+        /// Cache directory (default: ~/.cache/shoot/pkgs)
+        #[arg(long)]
+        cache: Option<String>,
+
+        /// Skip confirmation prompt
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 /// Subcommands for `shoot index`.
@@ -382,6 +436,139 @@ mod tests {
                 assert_eq!(source_date_epoch.as_deref(), Some("0"));
             }
             _ => panic!("expected Image"),
+        }
+    }
+
+    // ── New flag tests ──
+
+    #[test]
+    fn test_build_all_flag() {
+        match parse_build(&["shoot", "build", "--all"]) {
+            Command::Build { all, .. } => assert!(all),
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn test_build_cache_flag() {
+        match parse_build(&["shoot", "build", "--cache", "/tmp/cache"]) {
+            Command::Build { cache, .. } => {
+                assert_eq!(cache.as_deref(), Some("/tmp/cache"));
+            }
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn test_build_json_flag() {
+        match parse_build(&["shoot", "build", "--json"]) {
+            Command::Build { json, .. } => assert!(json),
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn test_build_target_flag() {
+        match parse_build(&["shoot", "build", "--target", "aarch64-linux-gnu"]) {
+            Command::Build { target, .. } => {
+                assert_eq!(target.as_deref(), Some("aarch64-linux-gnu"));
+            }
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn test_image_json_flag() {
+        match parse_build(&["shoot", "image", "--json"]) {
+            Command::Image { json, .. } => assert!(json),
+            _ => panic!("expected Image"),
+        }
+    }
+
+    #[test]
+    fn test_deps_json_flag() {
+        let args = ["shoot", "deps", "glibc", "--json"];
+        let cmd = Cli::try_parse_from(args).unwrap().command;
+        match cmd {
+            Command::Deps { json, .. } => assert!(json),
+            _ => panic!("expected Deps"),
+        }
+    }
+
+    #[test]
+    fn test_build_all_flags_combo() {
+        match parse_build(&[
+            "shoot",
+            "build",
+            "--all",
+            "--cache",
+            "/tmp/cache",
+            "--json",
+            "--target",
+            "aarch64-linux-gnu",
+        ]) {
+            Command::Build {
+                all,
+                cache,
+                json,
+                target,
+                ..
+            } => {
+                assert!(all);
+                assert_eq!(cache.as_deref(), Some("/tmp/cache"));
+                assert!(json);
+                assert_eq!(target.as_deref(), Some("aarch64-linux-gnu"));
+            }
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn test_completion_bash() {
+        match Cli::try_parse_from(["shoot", "completion", "bash"])
+            .unwrap()
+            .command
+        {
+            Command::Completion { shell } => {
+                assert_eq!(shell, clap_complete::Shell::Bash);
+            }
+            _ => panic!("expected Completion"),
+        }
+    }
+
+    #[test]
+    fn test_cache_info() {
+        match Cli::try_parse_from(["shoot", "cache", "info"])
+            .unwrap()
+            .command
+        {
+            Command::Cache(CacheCommand::Info { .. }) => {}
+            _ => panic!("expected Cache Info"),
+        }
+    }
+
+    #[test]
+    fn test_cache_clear() {
+        match Cli::try_parse_from(["shoot", "cache", "clear", "--force"])
+            .unwrap()
+            .command
+        {
+            Command::Cache(CacheCommand::Clear { force, .. }) => assert!(force),
+            _ => panic!("expected Cache Clear"),
+        }
+    }
+
+    #[test]
+    fn test_cache_prune() {
+        match Cli::try_parse_from(["shoot", "cache", "prune", "--days", "60", "--force"])
+            .unwrap()
+            .command
+        {
+            Command::Cache(CacheCommand::Prune { days, force, .. }) => {
+                assert_eq!(days, 60);
+                assert!(force);
+            }
+            _ => panic!("expected Cache Prune"),
         }
     }
 }
