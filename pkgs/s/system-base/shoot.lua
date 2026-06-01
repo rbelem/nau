@@ -12,7 +12,7 @@
 --     -drive file=system-base_1.0.0_amd64.img,if=virtio \
 --     -serial mon:stdio
 --
--- The 11 essential packages:
+-- The 13 essential packages + 2 meta-packages:
 --   pc-kernel  → Linux kernel + virtio modules
 --   pc-gadget  → EFI bootloader configuration
 --   systemd    → init, udev, journald, service manager
@@ -24,6 +24,8 @@
 --   kmod       → modprobe, lsmod, depmod
 --   util-linux → mount, reboot, dmesg, lsblk, fdisk
 --   procps     → ps, kill, top, uptime, w
+--   toolchain  → default compiler (resolves via alias to gcc-gnu)
+--   build-deps → make, autotools, pkg-config
 
 return {
     ["system-base"] = image {
@@ -73,6 +75,10 @@ return {
             pin("kmod"),
             pin("util-linux"),
             pin("procps"),
+            -- Toolchain (resolved via alias → toolchain-gcc-gnu-x86_64)
+            pin("toolchain"),
+            -- Build tools (make, autotools, pkg-config)
+            pin("build-deps"),
         },
 
         -- Disk layout suitable for QEMU virtio
