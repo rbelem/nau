@@ -21,6 +21,7 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64" },
+        type = "meta",
         aliases = {
             "toolchain-gcc-glibc-x86_64",
             "toolchain-x86_64",

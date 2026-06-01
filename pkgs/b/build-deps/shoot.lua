@@ -22,6 +22,7 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64" },
+        type = "meta",
         aliases = { "build-essential" },
         requires = {
             "make", "autoconf", "automake", "libtool", "m4",

@@ -20,6 +20,7 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64" },
+        type = "meta",
         aliases = {
             "toolchain-clang-glibc-x86_64",
         },
