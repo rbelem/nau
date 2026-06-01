@@ -24,6 +24,7 @@ fn main() -> miette::Result<()> {
             order,
             all,
             cache,
+            cache_max_size,
             target,
             json,
         } => {
@@ -43,6 +44,7 @@ fn main() -> miette::Result<()> {
                 lockfile_path,
                 all,
                 cache,
+                cache_max_size,
                 target,
                 json,
             );
@@ -56,6 +58,7 @@ fn main() -> miette::Result<()> {
             arch,
             channel,
             cache,
+            cache_max_size,
             output_name,
             source_date_epoch,
             lockfile: lockfile_path,
@@ -68,6 +71,7 @@ fn main() -> miette::Result<()> {
                 arch,
                 channel,
                 cache,
+                cache_max_size,
                 output_name,
                 source_date_epoch,
                 lockfile_path,
@@ -100,7 +104,38 @@ fn main() -> miette::Result<()> {
     }
 }
 
+// ── Package name resolution ──
+// If file doesn't exist on disk, try resolving as a package name from pkgs/.
+
+fn resolve_file(file: &str) -> String {
+    if Path::new(file).exists() {
+        return file.to_string();
+    }
+    let resolved = shoot::deps::resolve_path(file);
+    if resolved.exists() {
+        eprintln!("  ℹ resolved '{}' to {:?}", file, resolved);
+        resolved.to_string_lossy().to_string()
+    } else {
+        file.to_string()
+    }
+}
+
 // ── Build command ──
+
+/// Parse a size string like "500M" or "2G" into bytes.
+fn parse_size(input: &str) -> Option<u64> {
+    let input = input.trim();
+    let (num, mult) = if let Some(n) = input.strip_suffix('G').or_else(|| input.strip_suffix('g')) {
+        (n.parse::<u64>().ok()?, 1_000_000_000)
+    } else if let Some(n) = input.strip_suffix('M').or_else(|| input.strip_suffix('m')) {
+        (n.parse::<u64>().ok()?, 1_000_000)
+    } else if let Some(n) = input.strip_suffix('K').or_else(|| input.strip_suffix('k')) {
+        (n.parse::<u64>().ok()?, 1_000)
+    } else {
+        (input.parse::<u64>().ok()?, 1)
+    };
+    Some(num * mult)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_build(
@@ -113,9 +148,12 @@ fn cmd_build(
     lockfile_path: String,
     all: bool,
     cache: Option<String>,
+    cache_max_size: Option<String>,
     target: Option<String>,
     json: bool,
 ) -> miette::Result<()> {
+    let file = resolve_file(&file);
+
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
     }
@@ -133,13 +171,23 @@ fn cmd_build(
     let output_dir = std::path::Path::new(&output);
 
     // Initialize binary cache if --cache was specified or --all is set
-    let pkg_cache = if all || cache.is_some() {
-        Some(shoot::cache::PackageCache::new(
-            cache.map(std::path::PathBuf::from),
-        ))
-    } else {
-        None
-    };
+    let pkg_cache: Option<shoot::cache::PackageCache> =
+        if all || cache.is_some() || cache_max_size.is_some() {
+            let mut pc = shoot::cache::PackageCache::new(cache.map(std::path::PathBuf::from));
+            if let Some(ref size_str) = cache_max_size {
+                if let Some(bytes) = parse_size(size_str) {
+                    pc = pc.with_max_size(bytes);
+                    if !json {
+                        shoot::output::info(format!("max cache size: {}", size_str));
+                    }
+                } else if !json {
+                    shoot::output::warn(format!("invalid cache size: {}", size_str));
+                }
+            }
+            Some(pc)
+        } else {
+            None
+        };
 
     // If --target is set, override on all snap meta structs
     let iter: Vec<(&String, shoot::snap::SnapMeta)> = match &output_name {
@@ -323,7 +371,8 @@ fn cmd_build(
 // ── Order command (--order flag) ──
 
 fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Result<()> {
-    let all_outputs = shoot::lua::evaluate_file(file)?;
+    let file = resolve_file(file);
+    let all_outputs = shoot::lua::evaluate_file(&file)?;
 
     let iter: Vec<&shoot::snap::SnapMeta> = match output_name {
         Some(name) => {
@@ -473,11 +522,14 @@ fn cmd_image(
     arch: String,
     channel: String,
     cache: Option<String>,
+    _cache_max_size: Option<String>,
     output_name: Option<String>,
     source_date_epoch: Option<String>,
     lockfile_path: String,
     json: bool,
 ) -> miette::Result<()> {
+    let file = resolve_file(&file);
+
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
     }

@@ -189,7 +189,7 @@ pub fn load_meta(name_or_path: &str) -> miette::Result<SnapMeta> {
 
 /// Resolve a package name to a path: try pkgs/<letter>/<name>.lua first,
 /// then fall back to the raw path (for absolute/relative paths).
-fn resolve_path(name_or_path: &str) -> PathBuf {
+pub fn resolve_path(name_or_path: &str) -> PathBuf {
     if name_or_path.contains('/') || name_or_path.ends_with(".lua") {
         return PathBuf::from(name_or_path);
     }

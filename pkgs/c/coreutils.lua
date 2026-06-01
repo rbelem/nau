@@ -6,7 +6,7 @@
 return {
     default = snap {
         name = "coreutils",
-        version = "9.6",
+        version = "9.11",
         summary = "Basic file, shell, and text manipulation utilities",
         description = [[
             GNU Coreutils includes all of the basic command-line text and
@@ -30,7 +30,7 @@ return {
         type = "source",
         requires = { "glibc" },
         source = {
-            url = "https://ftp.gnu.org/gnu/coreutils/coreutils-9.6.tar.xz",
+            url = "https://ftp.gnu.org/gnu/coreutils/coreutils-9.11.tar.xz",
         },
         build = "./configure --prefix=/usr --without-selinux && make && make install DESTDIR=$STAGE",
     },

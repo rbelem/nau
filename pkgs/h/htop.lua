@@ -6,7 +6,7 @@
 return {
     default = snap {
         name = "htop",
-        version = "3.3",
+        version = "3.5.1",
         summary = "Interactive process viewer",
         description = [[
             htop is an interactive process viewer for Unix systems. It is
@@ -21,7 +21,7 @@ return {
         type = "source",
         requires = { "glibc", "ncurses" },
         source = {
-            url = "https://github.com/htop-dev/htop/archive/refs/tags/3.3.0.tar.gz",
+            url = "https://github.com/htop-dev/htop/archive/refs/tags/3.5.1.tar.gz",
         },
         build = "./autogen.sh && ./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
     },

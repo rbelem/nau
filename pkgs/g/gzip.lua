@@ -6,7 +6,7 @@
 return {
     default = snap {
         name = "gzip",
-        version = "1.13",
+        version = "1.14",
         summary = "GNU compression utility",
         description = [[
             GNU gzip is a popular data compression program. It uses the
@@ -21,7 +21,7 @@ return {
         type = "source",
         requires = { "glibc" },
         source = {
-            url = "https://ftp.gnu.org/gnu/gzip/gzip-1.13.tar.xz",
+            url = "https://ftp.gnu.org/gnu/gzip/gzip-1.14.tar.xz",
         },
         build = "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
     },

@@ -6,7 +6,7 @@
 return {
     default = snap {
         name = "systemd",
-        version = "256",
+        version = "260.2",
         summary = "System and service manager for Linux",
         description = [[
             systemd is a suite of basic building blocks for a Linux system.
@@ -20,7 +20,7 @@ return {
         type = "source",
         requires = { "glibc", "libcap" },
         source = {
-            url = "https://github.com/systemd/systemd/archive/v256.tar.gz",
+            url = "https://github.com/systemd/systemd/archive/v260.2.tar.gz",
         },
         build = "meson setup build --prefix=/usr -Dmode=release && ninja -C build && DESTDIR=$STAGE ninja -C build install",
     },

@@ -6,7 +6,7 @@
 return {
     default = snap {
         name = "curl",
-        version = "8.12",
+        version = "8.20.0",
         summary = "Command-line tool for transferring data with URLs",
         description = [[
             curl is a command-line tool for transferring data with URL
@@ -20,7 +20,7 @@ return {
         type = "source",
         requires = { "glibc", "zlib", "openssl" },
         source = {
-            url = "https://curl.se/download/curl-8.12.1.tar.xz",
+            url = "https://curl.se/download/curl-8.20.0.tar.xz",
         },
         build = "./configure --prefix=/usr --with-openssl && make && make install DESTDIR=$STAGE",
     },

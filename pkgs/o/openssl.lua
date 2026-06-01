@@ -7,7 +7,7 @@
 return {
     default = snap {
         name = "openssl",
-        version = "3.4.1",
+        version = "3.6.2",
         summary = "Cryptography and SSL/TLS toolkit",
         description = [[
             OpenSSL is a robust, commercial-grade, full-featured toolkit for
@@ -21,7 +21,7 @@ return {
         type = "source",
         requires = { "glibc", "zlib" },
         source = {
-            url = "https://www.openssl.org/source/openssl-3.4.1.tar.gz",
+            url = "https://www.openssl.org/source/openssl-3.6.2.tar.gz",
         },
         build = "./Configure --prefix=/usr --openssldir=/etc/ssl && make && make install DESTDIR=$STAGE",
     },

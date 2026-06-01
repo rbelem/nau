@@ -49,6 +49,9 @@ const NO_SOURCE_HASH: &str = "none";
 #[derive(Debug, Clone)]
 pub struct PackageCache {
     root: PathBuf,
+    /// Maximum cache size in bytes. When exceeded, oldest entries are pruned
+    /// automatically on store. `None` means unlimited.
+    max_size: Option<u64>,
 }
 
 impl PackageCache {
@@ -63,7 +66,17 @@ impl PackageCache {
                 .join("shoot")
                 .join(DEFAULT_CACHE_SUBDIR)
         });
-        PackageCache { root }
+        PackageCache {
+            root,
+            max_size: None,
+        }
+    }
+
+    /// Set maximum cache size in bytes. Auto-prune triggers on store()
+    /// when total size exceeds this threshold.
+    pub fn with_max_size(mut self, bytes: u64) -> Self {
+        self.max_size = Some(bytes);
+        self
     }
 
     /// Get the cache root path.
@@ -147,6 +160,15 @@ impl PackageCache {
             })?;
         }
 
+        // Auto-prune if max_size is configured
+        if let Some(max) = self.max_size {
+            if let Ok(info) = self.info() {
+                if info.size_bytes > max {
+                    let _ = self.prune_stale(max);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -221,6 +243,58 @@ impl PackageCache {
                     }
                 }
             }
+        }
+
+        Ok(removed)
+    }
+
+    /// Prune oldest entries until total size is under `target_bytes`.
+    /// Removes entire source-hash directories (one entry = all cached packages
+    /// built from one source tarball), oldest modification time first.
+    fn prune_stale(&self, target_bytes: u64) -> miette::Result<u64> {
+        let mut removed = 0u64;
+
+        if !self.root.exists() {
+            return Ok(0);
+        }
+
+        // Collect entries with their modification times and sizes
+        let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf, u64)> = Vec::new();
+        for entry in std::fs::read_dir(&self.root)
+            .map_err(|e| miette::miette!("failed to read cache: {}", e))?
+        {
+            let entry = entry.map_err(|e| miette::miette!("failed to read cache entry: {}", e))?;
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let mut dir_size = 0u64;
+                if let Ok(files) = std::fs::read_dir(entry.path()) {
+                    for file in files.flatten() {
+                        if file.file_type().is_ok_and(|t| t.is_file()) {
+                            dir_size += file.metadata().map(|m| m.len()).unwrap_or(0);
+                        }
+                    }
+                }
+                let modified = entry
+                    .path()
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                entries.push((modified, entry.path(), dir_size));
+            }
+        }
+
+        // Sort by modification time (oldest first)
+        entries.sort_by_key(|(m, _, _)| *m);
+
+        // Remove oldest entries until under target
+        let mut total: u64 = entries.iter().map(|(_, _, s)| s).sum();
+        for (_, path, size) in &entries {
+            if total <= target_bytes {
+                break;
+            }
+            std::fs::remove_dir_all(path)
+                .map_err(|e| miette::miette!("failed to remove {:?}: {}", path, e))?;
+            total -= size;
+            removed += 1;
         }
 
         Ok(removed)

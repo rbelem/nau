@@ -6,7 +6,7 @@
 return {
     default = snap {
         name = "zlib",
-        version = "1.3",
+        version = "1.3.2",
         summary = "Compression library",
         description = [[
             zlib is a massively-spiffy yet seriously-not-bloated
@@ -21,7 +21,7 @@ return {
         type = "source",
         requires = { "glibc" },
         source = {
-            url = "https://zlib.net/zlib-1.3.1.tar.gz",
+            url = "https://zlib.net/zlib-1.3.2.tar.gz",
         },
         build = "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
     },

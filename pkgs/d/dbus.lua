@@ -6,7 +6,7 @@
 return {
     default = snap {
         name = "dbus",
-        version = "1.16",
+        version = "1.16.2",
         summary = "D-Bus message bus daemon and utilities",
         description = [[
             D-Bus is a message bus system, a simple way for applications to

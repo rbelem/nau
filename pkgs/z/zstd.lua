@@ -6,7 +6,7 @@
 return {
     default = snap {
         name = "zstd",
-        version = "1.5",
+        version = "1.5.7",
         summary = "Zstandard fast real-time compression",
         description = [[
             Zstandard is a fast lossless compression algorithm, targeting

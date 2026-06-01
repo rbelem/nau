@@ -6,7 +6,7 @@
 return {
     default = snap {
         name = "glibc",
-        version = "2.41",
+        version = "2.43",
         summary = "GNU C Library",
         description = [[
             glibc is the GNU Project's implementation of the C standard
@@ -22,7 +22,7 @@ return {
         type = "source",
         requires = { "linux-headers" },
         source = {
-            url = "https://ftp.gnu.org/gnu/glibc/glibc-2.41.tar.xz",
+            url = "https://ftp.gnu.org/gnu/glibc/glibc-2.43.tar.xz",
         },
         build = "mkdir build && cd build && ../configure --prefix=/usr --disable-profile --enable-kernel=5.4 && make && make install install_root=$STAGE",
     },

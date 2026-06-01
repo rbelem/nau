@@ -63,6 +63,11 @@ pub enum Command {
         #[arg(long)]
         cache: Option<String>,
 
+        /// Maximum cache size (e.g. "500M", "2G"). When exceeded, oldest entries
+        /// are pruned automatically. Only applies when --cache is set or --all is used.
+        #[arg(long)]
+        cache_max_size: Option<String>,
+
         /// Override cross-compilation target for all packages.
         /// Sets the GNU target triplet (e.g. "aarch64-linux-gnu") and exports
         /// CC/CXX/LD/AR environment variables in the build sandbox.
@@ -97,6 +102,10 @@ pub enum Command {
         /// Cache directory for downloaded snaps (default: ~/.cache/shoot/snaps)
         #[arg(long)]
         cache: Option<String>,
+
+        /// Maximum cache size (e.g. "500M", "2G"). Auto-prunes oldest entries.
+        #[arg(long)]
+        cache_max_size: Option<String>,
 
         /// Image output name to build (from shoot.lua images table).
         /// Default: build the first image found.
