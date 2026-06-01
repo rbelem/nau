@@ -1,51 +1,57 @@
--- Ubuntu Core base rootfs with full disk image layout
+-- Ubuntu Core 22.04 rootfs image for Raspberry Pi (arm64)
 --
--- Build with: shoot image --file examples/rootfs/shoot.lua
--- Produces a full GPT disk image with ESP + btrfs root + swap.
+-- Compose a bootable disk image with:
+--   - core22 base rootfs
+--   - pi-kernel with boot params
+--   - pi-gadget boot config (u-boot)
+--   - snapd + network-manager
+--   - GPT disk: ESP (vfat) + root (ext4) + swap
+--   - u-boot bootloader (from gadget snap)
 --
--- Before running, ensure:
---   package-index.json exists (shoot index resolve)
---   sudo or losetup/mount permissions for disk image creation
+-- Build:
+--   shoot image --file examples/pi-rootfs/shoot.lua --arch arm64
+--
+-- Requires:
+--   package-index.json with resolved snaps (shoot index resolve)
+--   parted, losetup, mkfs.vfat, mkfs.ext4, dd on PATH
 
 return {
     rootfs = image {
-        name = "ubuntu-core-rootfs",
+        name = "ubuntu-core-pi",
         version = "22.04",
 
-        -- Base filesystem from core22 snap
         base = index("core22"),
 
-        -- Kernel snap with boot parameters
-        kernel = merge(pin("pc-kernel"), {
+        kernel = merge(pin("pi-kernel"), {
             params = {
                 "quiet",
                 "splash",
+                "console=serial0,115200",
                 "console=tty1",
                 "net.ifnames=0",
                 "systemd.unified_cgroup_hierarchy=1",
+                "dwc_otg.lpm_enable=0",
+                "rootwait",
             },
             modules = {
-                "nvme",
-                "thunderbolt",
-                "usb_storage",
+                "dwc2",
+                "vc4",
+                "bcm2835_dma",
             },
         }),
 
-        -- Gadget for x86_64 PC hardware
-        gadget = index("pc-gadget"),
+        gadget = index("pi-gadget"),
 
-        -- Extra snaps
         snaps = {
             index("snapd"),
+            index("network-manager"),
         },
 
-        -- Bootloader config
         bootloader = {
             type = "systemd-boot",
             timeout = 3,
         },
 
-        -- Full disk partition layout (creates a bootable .img)
         disk = {
             label = "gpt",
             partitions = {
@@ -57,24 +63,20 @@ return {
                 },
                 {
                     name = "root",
-                    size = "0",  -- remaining disk space
-                    fs = "btrfs",
+                    size = "0",
+                    fs = "ext4",
                     mount = "/",
                     options = {
-                        "subvol=rootfs",
-                        "compress=zstd",
                         "noatime",
-                        "ssd",
-                        "discard=async",
+                        "discard",
                     },
                 },
             },
             swap = {
-                size = "8G",
+                size = "4G",
             },
         },
 
-        -- Kernel sysctl tuning
         sysctl = {
             "vm.swappiness=100",
             "kernel.kptr_restrict=2",
