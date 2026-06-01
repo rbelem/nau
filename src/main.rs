@@ -29,6 +29,23 @@ fn main() -> miette::Result<()> {
             json,
         } => {
             shoot::output::set_mode(json);
+            // If --file is default and doesn't exist, try output_name as package name
+            let file = if file == "shoot.lua" && !Path::new("shoot.lua").exists() {
+                if let Some(ref name) = output_name {
+                    resolve_file(name)
+                } else {
+                    file
+                }
+            } else {
+                resolve_file(&file)
+            };
+            // If file came from embedded resolution, the positional arg was
+            // used as the package name, not as an output filter.
+            let output_name = if file.starts_with("embedded://") {
+                None
+            } else {
+                output_name
+            };
             if order {
                 let r = cmd_order(&file, &output_name, json);
                 shoot::output::flush_json("order");
@@ -105,18 +122,42 @@ fn main() -> miette::Result<()> {
 }
 
 // ── Package name resolution ──
-// If file doesn't exist on disk, try resolving as a package name from pkgs/.
+// If file doesn't exist on disk, try resolving as a package name from pkgs/
+// or from the embedded store (compiled into the binary).
 
 fn resolve_file(file: &str) -> String {
     if Path::new(file).exists() {
         return file.to_string();
     }
-    let resolved = shoot::deps::resolve_path(file);
-    if resolved.exists() {
-        eprintln!("  ℹ resolved '{}' to {:?}", file, resolved);
-        resolved.to_string_lossy().to_string()
+    match shoot::embedded::resolve_pkg(file) {
+        shoot::embedded::PkgResult::File(path) => {
+            eprintln!("  ℹ resolved '{}' to {}", file, path);
+            path
+        }
+        shoot::embedded::PkgResult::Embedded { path, .. } => {
+            eprintln!("  ℹ using embedded package '{}'", file);
+            format!("embedded://{}", path)
+        }
+        shoot::embedded::PkgResult::NotFound => file.to_string(),
+    }
+}
+
+/// Evaluate a file path or embedded source, returning snap outputs.
+fn evaluate_file_or_embedded(file: &str) -> miette::Result<shoot::lua::Outputs> {
+    if let Some(embedded_path) = file.strip_prefix("embedded://") {
+        // Load from embedded store
+        if let Some(pkg) = shoot::embedded::Pkgs::get(embedded_path) {
+            let content = std::str::from_utf8(pkg.data.as_ref())
+                .unwrap_or("")
+                .to_string();
+            return shoot::lua::evaluate_string(embedded_path, &content);
+        }
+        Err(miette::miette!(
+            "embedded package '{}' not found",
+            embedded_path
+        ))
     } else {
-        file.to_string()
+        shoot::lua::evaluate_file(file)
     }
 }
 
@@ -165,7 +206,7 @@ fn cmd_build(
         snaps: HashMap::new(),
     });
 
-    let all_outputs = shoot::lua::evaluate_file(&file)?;
+    let all_outputs = evaluate_file_or_embedded(&file)?;
 
     let stage_dir = std::path::Path::new(&stage);
     let output_dir = std::path::Path::new(&output);
@@ -372,7 +413,7 @@ fn cmd_build(
 
 fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Result<()> {
     let file = resolve_file(file);
-    let all_outputs = shoot::lua::evaluate_file(&file)?;
+    let all_outputs = evaluate_file_or_embedded(&file)?;
 
     let iter: Vec<&shoot::snap::SnapMeta> = match output_name {
         Some(name) => {
@@ -543,7 +584,15 @@ fn cmd_image(
     });
 
     let lua = shoot::lua::new_lua(&file)?;
-    let images = shoot::lua::evaluate_images(&lua, &file)?;
+    let images = if let Some(_embedded) = file.strip_prefix("embedded://") {
+        // Embedded packages are single snaps, not images — return empty
+        if !shoot::output::is_json() {
+            shoot::output::warn(format!("'{}' is a package, not an image", file));
+        }
+        std::collections::HashMap::new()
+    } else {
+        shoot::lua::evaluate_images(&lua, &file)?
+    };
 
     let output_dir = Path::new(&output);
 

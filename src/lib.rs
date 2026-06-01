@@ -3,6 +3,7 @@ pub mod cli;
 pub mod deps;
 pub mod doctor;
 pub mod dsl;
+pub mod embedded;
 pub mod image;
 pub mod index;
 pub mod lock;

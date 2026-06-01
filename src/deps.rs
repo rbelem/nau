@@ -168,23 +168,37 @@ fn topological_sort(nodes: &[DepNode]) -> Vec<DepNode> {
     result
 }
 
-/// Load SnapMeta from a shoot.lua file, resolving the path by package name.
+/// Load SnapMeta by package name or path, falling back to embedded packages.
+///
+/// Resolution order:
+/// 1. Filesystem path or resolved pkgs/<letter>/<name>.lua
+/// 2. Embedded pkgs/ store (compiled into binary via rust-embed)
 pub fn load_meta(name_or_path: &str) -> miette::Result<SnapMeta> {
-    let path = resolve_path(name_or_path);
-    if !path.exists() {
-        return Err(miette::miette!(
-            "package '{}' not found at {:?}",
-            name_or_path,
-            path
-        ));
+    // Try embedded store first (handles both filesystem and embedded)
+    match crate::embedded::resolve_pkg(name_or_path) {
+        crate::embedded::PkgResult::File(path) => {
+            let outputs = crate::lua::evaluate_file(&path)?;
+            outputs
+                .into_values()
+                .next()
+                .ok_or_else(|| miette::miette!("no outputs found in '{}'", path))
+        }
+        crate::embedded::PkgResult::Embedded { path, content } => {
+            let outputs = crate::lua::evaluate_string(&path, &content)?;
+            outputs
+                .into_values()
+                .next()
+                .ok_or_else(|| miette::miette!("no outputs found in embedded '{}'", path))
+        }
+        crate::embedded::PkgResult::NotFound => {
+            let path = resolve_path(name_or_path);
+            Err(miette::miette!(
+                "package '{}' not found at {:?} (not on disk or embedded)",
+                name_or_path,
+                path
+            ))
+        }
     }
-
-    let outputs = crate::lua::evaluate_file(&path.to_string_lossy())?;
-    // Return the first output's meta
-    outputs
-        .into_values()
-        .next()
-        .ok_or_else(|| miette::miette!("no outputs found in '{}'", name_or_path))
 }
 
 /// Resolve a package name to a path: try pkgs/<letter>/<name>.lua first,

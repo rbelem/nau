@@ -50,6 +50,37 @@ pub fn new_lua(path: &str) -> miette::Result<mlua::Lua> {
     Ok(lua)
 }
 
+/// Evaluate Lua source content and return the converted snap outputs.
+///
+/// Like `evaluate_file` but takes the Lua source string directly instead of
+/// reading from disk. Used for embedded packages that don't exist as files.
+pub fn evaluate_string(label: &str, source: &str) -> miette::Result<Outputs> {
+    let lua = new_lua(label)?;
+
+    let result: Value = lua
+        .load(source)
+        .eval()
+        .map_err(|e| miette::miette!("{}: {}", label, e))?;
+
+    match result {
+        Value::Table(table) => {
+            let mut outputs = Outputs::new();
+            for pair in table.pairs::<String, Value>() {
+                let (key, value) = pair.map_err(|e| miette::miette!("{}: {}", label, e))?;
+                if let Ok(meta) = SnapMeta::from_lua_value(&value) {
+                    outputs.insert(key, meta);
+                }
+            }
+            Ok(outputs)
+        }
+        other => Err(miette::miette!(
+            "{} must return a table of outputs, got {}",
+            label,
+            other.type_name()
+        )),
+    }
+}
+
 /// Evaluate a Lua file and return the converted snap outputs.
 ///
 /// The file must return a Lua table of snap declarations.
@@ -57,35 +88,10 @@ pub fn new_lua(path: &str) -> miette::Result<mlua::Lua> {
 /// All Lua data is converted to owned `SnapMeta` structs before returning
 /// (the mlua state is dropped within this function).
 pub fn evaluate_file(path: &str) -> miette::Result<Outputs> {
-    let lua = new_lua(path)?;
     let source = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("could not read {}", path))?;
-
-    let result: Value = lua
-        .load(&source)
-        .eval()
-        .map_err(|e| miette::miette!("{}", e))?;
-
-    match result {
-        Value::Table(table) => {
-            let mut outputs = Outputs::new();
-            for pair in table.pairs::<String, Value>() {
-                let (key, value) = pair.map_err(|e| miette::miette!("{}", e))?;
-                // Try snap meta first
-                if let Ok(meta) = SnapMeta::from_lua_value(&value) {
-                    outputs.insert(key, meta);
-                }
-                // Silently skip non-snap entries (images, etc.)
-            }
-            Ok(outputs)
-        }
-        other => Err(miette::miette!(
-            "{} must return a table of outputs, got {}",
-            path,
-            other.type_name()
-        )),
-    }
+    evaluate_string(path, &source)
 }
 
 /// Evaluate a Lua file and extract image declarations.
