@@ -195,25 +195,30 @@ fn load_meta(name_or_path: &str) -> miette::Result<SnapMeta> {
         .ok_or_else(|| miette::miette!("no outputs found in '{}'", name_or_path))
 }
 
-/// Resolve a package name to a path: try pkgs/<letter>/<name>/shoot.lua first,
+/// Resolve a package name to a path: try pkgs/<letter>/<name>.lua first,
 /// then fall back to the raw path (for absolute/relative paths).
 fn resolve_path(name_or_path: &str) -> PathBuf {
     if name_or_path.contains('/') || name_or_path.ends_with(".lua") {
         return PathBuf::from(name_or_path);
     }
 
-    // Try pkgs/<first-letter>/<name>/shoot.lua
     let first = name_or_path
         .chars()
         .next()
         .unwrap_or('x')
         .to_ascii_lowercase();
-    let pkg_path = PathBuf::from("pkgs")
-        .join(first.to_string())
-        .join(name_or_path)
-        .join("shoot.lua");
-    if pkg_path.exists() {
-        return pkg_path;
+    let pkg_base = PathBuf::from("pkgs").join(first.to_string());
+
+    // Try pkgs/<letter>/<name>.lua (single file)
+    let single = pkg_base.join(format!("{}.lua", name_or_path));
+    if single.exists() {
+        return single;
+    }
+
+    // Try pkgs/<letter>/<name>/init.lua (directory package)
+    let dir_pkg = pkg_base.join(name_or_path).join("init.lua");
+    if dir_pkg.exists() {
+        return dir_pkg;
     }
 
     // Fall back to the raw name as a file path
@@ -255,10 +260,9 @@ mod tests {
 
     #[test]
     fn test_resolve_path() {
-        // Package name -> pkgs path
+        // Package name -> pkgs/<letter>/<name>.lua (single file)
         let p = resolve_path("gcc");
-        assert!(p.to_string_lossy().contains("pkgs/g/gcc/shoot.lua"));
-        assert!(p.to_string_lossy().ends_with("shoot.lua"));
+        assert!(p.to_string_lossy().ends_with("pkgs/g/gcc.lua"));
 
         // File path -> raw path
         let p = resolve_path("examples/system-base/shoot.lua");

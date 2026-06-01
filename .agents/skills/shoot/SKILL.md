@@ -20,10 +20,11 @@ shoot doctor                   # system readiness check
 105 packages at `pkgs/` — Ubuntu pool convention:
 
 ```
-pkgs/<first-letter>/<name>/shoot.lua
-pkgs/s/systemd/shoot.lua    # systemd init
-pkgs/g/gcc/shoot.lua        # GCC compiler
-pkgs/t/toolchain/...        # meta-toolchain
+pkgs/<first-letter>/<name>.lua        # single-file package (most)
+pkgs/<first-letter>/<name>/init.lua   # multi-file package (with helpers)
+pkgs/s/systemd.lua          # systemd init (single file)
+pkgs/g/gcc.lua              # GCC compiler (single file)
+pkgs/j/jq/init.lua          # jq (multi-file, has lib.lua)
 ```
 
 Every package defines `type`, `requires`, and optionally `aliases`:
@@ -103,10 +104,15 @@ return { ["system"] = image {
 
 ## Common Tasks for AI Agents
 
-**Add a new package definition:**
+**Add a new package definition (single file):**
 ```bash
-mkdir -p pkgs/<first-letter>/<name>
-vim pkgs/<first-letter>/<name>/shoot.lua
+vim pkgs/<first-letter>/<name>.lua
+```
+
+**Add a new package definition (multi-file, with helpers):**
+```bash
+mkdir pkgs/<first-letter>/<name>
+vim pkgs/<first-letter>/<name>/init.lua
 ```
 
 **Resolve dependencies:** `shoot deps pkgs/g/gcc --recursive --flat`
