@@ -6,10 +6,10 @@
 > emerging distro/image format. Every borrowed idea cites its source brief; conflicts between the
 > three philosophies are arbitrated explicitly rather than silently.
 > **Companion docs:**
-> - `.planning/ubuntu-core-synthesis.md` — existing UC synthesis (built upon, not duplicated)
-> - `.planning/ubuntu-core-runtime-brief.md`, `.planning/ubuntu-core-build-brief.md`
-> - `.planning/fedora-silverblue-runtime-brief.md`, `.planning/fedora-silverblue-build-brief.md`
-> - `.planning/nixos-architecture-brief.md`
+> - `.planning/ubuntu-core-synthesis.md` → moved to `docs/research/ubuntu-core-synthesis.md` (existing UC synthesis — built upon, not duplicated)
+> - `docs/research/ubuntu-core-runtime-brief.md`, `docs/research/ubuntu-core-build-brief.md`
+> - `docs/research/fedora-silverblue-runtime-brief.md`, `docs/research/fedora-silverblue-build-brief.md`
+> - `docs/research/nixos-architecture-brief.md`
 > - `docs/nix-language-design-lessons.md`, `docs/gap-analysis-snapcraft-nix.md`
 > - `.planning/archive/ROADMAP.md` (phase numbers referenced throughout)
 > **Date:** August 2026

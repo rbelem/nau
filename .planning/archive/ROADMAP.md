@@ -224,7 +224,150 @@ extensions were added after MVP completion:
 
 ---
 
-*Last updated: 2026-06-01 — fully updated to reflect actual project state*
+---
+
+## Phase 15: Complete snap.yaml Coverage
+**Status:** 🔲 Pending
+**Goal:** Support all commonly-used snap.yaml fields (layout, hooks, typed
+plugs/slots, global environment, icon, compression, type, adopt-info)
+**Mode:** feature
+**Success Criteria:**
+1. [ ] `layout` field with bind/bind-file/symlink/tmpfs types
+2. [ ] `hooks` field (install, configure, pre-refresh, post-refresh, remove)
+3. [ ] Typed plugs/slots with interface, attributes, content tags
+4. [ ] Global `environment` field
+5. [ ] All new fields round-trip through Lua DSL → Rust struct → YAML
+6. [ ] Tests pass, clippy clean
+
+**See:** `docs/gap-analysis-snapcraft-nix.md` §5 — Phase 15
+
+---
+
+## Phase 16: Package Inputs Lockfile
+**Status:** 🔲 Pending
+**Goal:** Reproducible builds with locked input revisions
+**Mode:** feature
+**Success Criteria:**
+1. [ ] `shoot.lock` extended with `inputs` section pinning revision + hash
+2. [ ] `shoot build --update <input>` refreshes a specific input
+3. [ ] `shoot lock` subcommand for lockfile maintenance without building
+4. [ ] `--offline` mode uses only cached/locked inputs
+5. [ ] Tests pass, clippy clean
+
+**See:** `docs/gap-analysis-snapcraft-nix.md` §5 — Phase 16
+
+---
+
+## Phase 17: Plugin System (MVP)
+**Status:** 🔲 Pending
+**Goal:** Language/build-system plugins beyond raw shell commands
+**Mode:** feature
+**Success Criteria:**
+1. [ ] Rust plugin trait: `pull()` / `build()` / `stage()` / `prime()`
+2. [ ] `cargo` plugin: cargo build + binary discovery
+3. [ ] `make` plugin: configure/make/make install
+4. [ ] `plugin` and `plugin_opts` DSL fields
+5. [ ] Auto-detect plugin from project structure (Cargo.toml, Makefile)
+6. [ ] Tests pass, clippy clean
+
+**See:** `docs/gap-analysis-snapcraft-nix.md` §5 — Phase 17
+
+---
+
+## Phase 18: Multi-Part Builds
+**Status:** 🔲 Pending
+**Goal:** Assemble a single snap from multiple build parts
+**Mode:** feature
+**Success Criteria:**
+1. [ ] `parts` table in snap() DSL with per-part plugins
+2. [ ] Stage/prime lifecycle with merge semantics
+3. [ ] `after` ordering between parts
+4. [ ] Part-level file filtering (stage-files, prime-files)
+5. [ ] Parallel part building
+6. [ ] `--use-lxd` build provider flag
+7. [ ] Tests pass, clippy clean
+
+**See:** `docs/gap-analysis-snapcraft-nix.md` §5 — Phase 18
+
+---
+
+## Phase 19: Content/Layout Interfaces
+**Status:** 🔲 Pending
+**Goal:** Content-sharing between snaps + filesystem layouts
+**Mode:** feature
+**Success Criteria:**
+1. [ ] Typed content interface declarations (slots + plugs with interface key)
+2. [ ] Layout bind-mount/symlink/tmpfs generation in snap.yaml
+3. [ ] `default-provider` in DSL
+4. [ ] Tests pass, clippy clean
+
+---
+
+## Phase 20: CI/CD Integration
+**Status:** 🔲 Pending
+**Goal:** Build snaps in CI pipelines
+**Mode:** feature
+**Success Criteria:**
+1. [ ] GitHub Action: `rbelem/shoot-action` (install, build, output .snap)
+2. [ ] `shoot upload` — Snap Store upload
+3. [ ] `shoot release --channel` — channel release
+4. [ ] Tests pass, clippy clean
+
+---
+
+## Phase 21: NixOS-Inspired Module System
+**Status:** 🔲 Pending
+**Goal:** Declarative system assembly with typed options
+**Mode:** feature
+**Success Criteria:**
+1. [ ] Lua `option()` function: declare typed options with defaults
+2. [ ] `mkIf(condition, config)` for conditional snap inclusion
+3. [ ] `mkMerge(list)` and `mkForce(value)` for override priorities
+4. [ ] Recursive module evaluation
+5. [ ] Tests pass, clippy clean
+
+---
+
+## Phase 22: Content-Addressed Store
+**Status:** 🔲 Pending
+**Goal:** Nix-style content-addressed build cache for full reproducibility
+**Mode:** feature
+**Success Criteria:**
+1. [ ] Build output addressed by (source_hash + dep_hashes + script_hash)
+2. [ ] Reference-counted GC (Nix-style reachability from roots)
+3. [ ] `shoot why-depends` — show why a part is included
+4. [ ] Binary cache export/import
+5. [ ] Tests pass, clippy clean
+
+---
+
+## Coverage (Updated)
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| CLI-01 | Phase 1 | Done ✓ |
+| CLI-02 | Phase 1/8 | Done ✓ |
+| CLI-03 | Phase 1/6 | Done ✓ |
+| CLI-04 | Phase 1 | Done ✓ |
+| LUA-01 | Phase 1 | Done ✓ |
+| LUA-02 | Phase 2 | Done ✓ |
+| LUA-03 | Phase 8 | Done ✓ |
+| LUA-04 | Phase 7 | Done ✓ |
+| LUA-05 | Phase 2 | Done ✓ |
+| META-01 | Phase 3 | Done ✓ |
+| META-02 | Phase 4 | Done ✓ |
+| META-03 | Phase 4/6 | Done ✓ |
+| BUILD-01 | Phase 5 | Done ✓ |
+| BUILD-02 | Phase 5 | Done ✓ |
+| BUILD-03 | Phase 6 | Done ✓ |
+| VAL-01 | Phase 2 | Done ✓ |
+| VAL-02 | Phase 2 | Done ✓ |
+
+**All 17 v1 requirements Done ✓**
+
+---
+
+*Last updated: 2026-06-01 — gap analysis added, 8 new phases defined*
 
 ## Status Key
 
