@@ -32,8 +32,8 @@ pub fn new_lua(path: &str) -> miette::Result<mlua::Lua> {
     }
 
     // Register the index() function from Rust (handles file I/O)
-    let arch = std::env::var("SHOOT_ARCH").unwrap_or_else(|_| "amd64".into());
-    let index_path_env = std::env::var("SHOOT_INDEX_PATH")
+    let arch = std::env::var("SHUTTLE_ARCH").unwrap_or_else(|_| "amd64".into());
+    let index_path_env = std::env::var("SHUTTLE_INDEX_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
 

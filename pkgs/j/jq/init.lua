@@ -5,7 +5,7 @@
 --
 -- Nix:       pkgs.jq (stdenv.mkDerivation, fetchurl, autoreconfHook + bison)
 -- Snapcraft: autotools plugin with source tarball
--- Shoot:     declarative Lua with composable templates
+-- Shuttle:    declarative Lua with composable templates
 --
 -- Per ADR-0003: returns a table of named outputs.
 -- Single-snap configs return { default = { ... } }.

@@ -728,7 +728,7 @@ fn cmd_image(
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
     }
-    std::env::set_var("SHOOT_ARCH", &arch);
+    std::env::set_var("SHUTTLE_ARCH", &arch);
 
     let lock_path = Path::new(&lockfile_path);
     let mut lockfile = LockFile::load(lock_path)?.unwrap_or_else(|| LockFile {

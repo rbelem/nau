@@ -1,8 +1,8 @@
-# Research: Embeddable Scripting Languages for Shoot
+# Research: Embeddable Scripting Languages for Shuttle
 
 **Date:** 2026-08-29
 **Status:** Complete
-**Context:** Evaluating scripting language options for Shoot, which currently uses Lua via `mlua`. Key concern is sandboxing for untrusted/AI-generated code.
+**Context:** Evaluating scripting language options for Shuttle, which currently uses Lua via `mlua`. Key concern is sandboxing for untrusted/AI-generated code.
 
 ---
 
@@ -18,7 +18,7 @@
 
 ## Assessment Table
 
-| Language | Rust Crate | Maturity | Sandboxing | Determinism | Performance | Maintenance (2025-2026) | Shoot Fit |
+| Language | Rust Crate | Maturity | Sandboxing | Determinism | Performance | Maintenance (2025-2026) | Shuttle Fit |
 |---|---|---|---|---|---|---|---|
 | **Starlark** | `starlark-rust` | Production (Buck2, Aspect CLI) | ✅ Built-in, Rust-native | ✅ By design | Fast (compiled) | **Active** — Buck2 drives it | ★★★★★ |
 | **Nickel** | `nickel-lang` (Rust lib) | Production (Tweag, ~4.1k★) | ⚠️ N/A (pure config, no I/O) | ✅ By design | Fast (compiled) | **Active** — commercial backing | ★★★★☆ |
@@ -48,7 +48,7 @@
 - No dynamic imports, no `eval()`, no `exec()`
 - Global interpreter lock prevents side effects between evaluations
 - Deterministic iteration order (hash randomization disabled by default)
-- Pure data in → pure data out — exactly what Shoot needs
+- Pure data in → pure data out — exactly what Shuttle needs
 
 **Precedent:**
 - Buck2: Meta's production build system, millions of builds/day
@@ -61,7 +61,7 @@
 - `load()` for modular imports (controlled by host)
 - Strong typing with `type()` checks and `provider` pattern
 
-**Fit for Shoot:**
+**Fit for Shuttle:**
 ```python
 # snap.star — equivalent of current snap.lua
 def snap():
@@ -86,7 +86,7 @@ def snap():
     )
 ```
 
-**Concern:** Starlark is more restrictive than Lua — no metatables, no runtime code generation. This is a *feature* for security but limits DSL flexibility. Shoot's current Lua DSL relies on `__index` metamethods for convenience (`snap apps.myapp.plugs`), which Starlark can't do — you'd use explicit function calls instead.
+**Concern:** Starlark is more restrictive than Lua — no metatables, no runtime code generation. This is a *feature* for security but limits DSL flexibility. Shuttle's current Lua DSL relies on `__index` metamethods for convenience (`snap apps.myapp.plugs`), which Starlark can't do — you'd use explicit function calls instead.
 
 ---
 
@@ -98,7 +98,7 @@ def snap():
 
 **Determinism:** Guaranteed — no randomness, no time, no external state.
 
-**Fit for Shoot:**
+**Fit for Shuttle:**
 ```nickel
 {
   snap = {
@@ -116,7 +116,7 @@ def snap():
 }
 ```
 
-**Concern:** Nickel is designed for *configuration*, not *imperative build logic*. If Shoot needs conditional logic, loops over fetched data, or complex part assembly, Nickel may be too restrictive. Also, Nickel's Rust embedding (`nickel-lang` crate) is newer and less battle-tested than `starlark-rust`.
+**Concern:** Nickel is designed for *configuration*, not *imperative build logic*. If Shuttle needs conditional logic, loops over fetched data, or complex part assembly, Nickel may be too restrictive. Also, Nickel's Rust embedding (`nickel-lang` crate) is newer and less battle-tested than `starlark-rust`.
 
 ---
 
@@ -132,7 +132,7 @@ def snap():
 
 **Determinism:** Achievable — no C FFI means no `math.random` from liblua, and you can hook or remove any non-deterministic stdlib function.
 
-**Concern:** Still experimental (~700★). May have performance gaps vs C Lua. Fewer eyeballs = more risk. If Shoot needs production reliability *now*, piccolo is premature.
+**Concern:** Still experimental (~700★). May have performance gaps vs C Lua. Fewer eyeballs = more risk. If Shuttle needs production reliability *now*, piccolo is premature.
 
 ---
 
@@ -141,7 +141,7 @@ def snap():
 **Why re-evaluate:** mlua sandboxing is a denylist approach against a C API with a large attack surface. Every new `require` or FFI call is a potential escape. For *untrusted* code (AI-generated, user-submitted), this is a losing game — you're always one missed denylist entry away from a sandbox escape.
 
 **When to keep Lua/mlua:**
-- If the code is *trusted* (Shoot's own DSL, reviewed package definitions)
+- If the code is *trusted* (Shuttle's own DSL, reviewed package definitions)
 - If metaprogramming flexibility (metatables, `__index`) is non-negotiable
 - If Lua ecosystem libraries (luarocks) add value
 
@@ -176,7 +176,7 @@ def snap():
 
 ## Recommendation
 
-**For Shoot's use case (declarative Snap package builds, potentially AI-generated code):**
+**For Shuttle's use case (declarative Snap package builds, potentially AI-generated code):**
 
 **Starlark-rust** is the strongest choice. It's:
 - Battle-tested in Buck2 (Meta's production build system)
@@ -184,7 +184,7 @@ def snap():
 - Python-like syntax (familiar to most developers)
 - Pure Rust — no C FFI, no FFI sandboxing concerns
 
-**Trade-off:** Starlark is more restrictive than Lua. You lose metatables and runtime code generation. For Shoot's DSL, this means:
+**Trade-off:** Starlark is more restrictive than Lua. You lose metatables and runtime code generation. For Shuttle's DSL, this means:
 - Explicit function calls instead of `__index` magic
 - No runtime metaprogramming (but Starlark has `load()` for controlled imports)
 - Records instead of dynamic tables

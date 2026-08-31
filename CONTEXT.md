@@ -53,7 +53,7 @@ _Avoid_: cache, registry, spool
 **Generation**: A pinned selection of base-image version + package set + configuration that boots as one unit. Rollback means booting a previous generation; GC is rooted at generations (ADR-0012).
 _Avoid_: profile, snapshot, deployment
 
-**Image manifest**: The flat, serializable, signed result of evaluating `image()` — partitions, UKI/roothash digests, package lists. The shoot-side analog of a model assertion (ADR-0011).
+**Image manifest**: The flat, serializable, signed result of evaluating `image()` — partitions, UKI/roothash digests, package lists. The shuttle-side analog of a model assertion (ADR-0011).
 _Avoid_: model assertion, lockfile (the lockfile pins *inputs*; the manifest describes the *system*)
 
 **Install**: An on-device operation that adds a package to the store and the current generation without mutating the base (`shuttle install`, ADR-0012).

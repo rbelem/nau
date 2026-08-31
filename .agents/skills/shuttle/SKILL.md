@@ -1,4 +1,4 @@
-# shoot — Snap Package Builder
+# shuttle — Snap Package Builder
 
 A Rust CLI tool that builds Snap packages from Lua declarations.
 Replaces Snapcraft YAML with a programmable, composable Lua DSL.
@@ -6,13 +6,13 @@ Replaces Snapcraft YAML with a programmable, composable Lua DSL.
 ## Quick Reference
 
 ```bash
-shoot build shoot.lua          # build snaps from source
-shoot image shoot.lua          # build bootable disk image
-shoot deps <pkg> --recursive  # dependency tree
-shoot build --order            # print build order
-shoot index add <name>         # register in package index
-shoot index resolve            # resolve store pins
-shoot doctor                   # system readiness check
+shuttle build shuttle.lua          # build snaps from source
+shuttle image shuttle.lua          # build bootable disk image
+shuttle deps <pkg> --recursive  # dependency tree
+shuttle build --order            # print build order
+shuttle index add <name>         # register in package index
+shuttle index resolve            # resolve store pins
+shuttle doctor                   # system readiness check
 ```
 
 ## Package Index
@@ -115,11 +115,11 @@ mkdir pkgs/<first-letter>/<name>
 vim pkgs/<first-letter>/<name>/init.lua
 ```
 
-**Resolve dependencies:** `shoot deps pkgs/g/gcc --recursive --flat`
+**Resolve dependencies:** `shuttle deps pkgs/g/gcc --recursive --flat`
 
-**Check build order:** `shoot build --order --file examples/full-system/system-base/shoot.lua`
+**Check build order:** `shuttle build --order --file examples/full-system/system-base/shuttle.lua`
 
-**Register in index:** `shoot index add <name> --alias <alias>`
+**Register in index:** `shuttle index add <name> --alias <alias>`
 
 **Test:** `devbox run test` (93 tests, clippy clean)
 

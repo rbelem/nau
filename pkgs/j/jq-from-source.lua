@@ -7,7 +7,7 @@
 -- Compare with:
 --   Nix:       stdenv.mkDerivation { src = fetchurl { ... }; ... }
 --   Snapcraft: parts: { jq: { plugin: autotools; source: ... } }
---   Shoot:     snap { source = "...", build = "...", stage = "./stage/" }
+--   Shuttle:    snap { source = "...", build = "...", stage = "./stage/" }
 
 return {
     default = snap {
