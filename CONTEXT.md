@@ -1,6 +1,6 @@
 # shuttle
 
-A Rust CLI that builds Snap packages from Lua declarations — like Nix for Snapcraft.
+A Rust CLI that builds Snap packages from Lua declarations — like Nix for Snapcraft. Formerly named *shoot* (renamed 2026-08, ADR-0010).
 
 ## Language
 
@@ -43,6 +43,21 @@ _Avoid_: depends, deps, links
 **Target**: The cross-compilation GNU triplet (e.g. `x86_64-linux-gnu`, `aarch64-linux-gnu`). When set, the build sandbox exports `CC=<target>-gcc`, `CXX=<target>-g++`, etc.
 
 **Image**: A bootable disk image (`.img`) assembled from multiple snaps — base, kernel, gadget, and application snaps. Declared via the `image()` DSL function.
+
+**ShuttleOS**: The Linux distribution assembled by shuttle — an immutable verity-protected base updated via A/B, plus a content-addressed package store on the state partition (ADR-0011/0012).
+_Avoid_: shoot distro, shuttle distro
+
+**Store**: The content-addressed, file-level repository of package content — local build cache (`~/.cache/shuttle/`) and on-device under the state partition. Packages are signed manifests of store file hashes, not monolithic blobs (ADR-0012).
+_Avoid_: cache, registry, spool
+
+**Generation**: A pinned selection of base-image version + package set + configuration that boots as one unit. Rollback means booting a previous generation; GC is rooted at generations (ADR-0012).
+_Avoid_: profile, snapshot, deployment
+
+**Image manifest**: The flat, serializable, signed result of evaluating `image()` — partitions, UKI/roothash digests, package lists. The shoot-side analog of a model assertion (ADR-0011).
+_Avoid_: model assertion, lockfile (the lockfile pins *inputs*; the manifest describes the *system*)
+
+**Install**: An on-device operation that adds a package to the store and the current generation without mutating the base (`shuttle install`, ADR-0012).
+_Avoid_: snap install, layering
 
 ## Flagged ambiguities
 
