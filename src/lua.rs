@@ -9,16 +9,22 @@ use crate::snap::{PackageInput, SnapMeta};
 /// Named outputs from a `shuttle.lua`, fully converted to owned Rust types.
 pub type Outputs = HashMap<String, SnapMeta>;
 
-/// Create a Lua instance with DSL globals injected and package.path configured.
+/// Create a Luau instance with the DSL globals injected and package.path configured.
 pub fn new_lua(path: &str) -> miette::Result<mlua::Lua> {
-    let lua = mlua::Lua::new();
+    // Reduced Luau stdlib: no `io`, limited `os` (clock/date/time only),
+    // read-only `debug`. First line of defense per ADR-0010 Decision 4 —
+    // process-level bounding (subprocess + rlimits) lands in a later lane.
+    let lua = mlua::Lua::new_with(mlua::StdLib::ALL_SAFE, mlua::LuaOptions::default())
+        .map_err(|e| miette::miette!("failed to create Luau VM: {e}"))?;
 
     // Inject DSL globals before evaluating the user's config
     lua.load(crate::dsl::INIT_LUA)
         .exec()
         .map_err(|e| miette::miette!("failed to initialize shuttle DSL: {}", e))?;
 
-    // Configure package.path so require() can find sibling .lua files
+    // Configure package.path so require() can find sibling .lua files.
+    // mlua's Luau backend ships its own `package` table + require loader
+    // honoring these templates (ADR-0010: lockfile-backed resolver lands later).
     if let Some(parent) = std::path::Path::new(path).parent() {
         let parent_str = parent.to_string_lossy().replace('\\', "/");
         let pkg_path = format!("{parent_str}/?.lua;{parent_str}/?/init.lua;");
