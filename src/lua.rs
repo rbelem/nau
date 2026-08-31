@@ -67,8 +67,13 @@ pub fn evaluate_string(label: &str, source: &str) -> miette::Result<Outputs> {
             let mut outputs = Outputs::new();
             for pair in table.pairs::<String, Value>() {
                 let (key, value) = pair.map_err(|e| miette::miette!("{}: {}", label, e))?;
-                if let Ok(meta) = SnapMeta::from_lua_value(&value) {
-                    outputs.insert(key, meta);
+                match SnapMeta::from_lua_value(&value) {
+                    Ok(meta) => {
+                        outputs.insert(key, meta);
+                    }
+                    Err(e) => {
+                        crate::output::warn(format!("skipping output '{key}' from {label}: {e}"))
+                    }
                 }
             }
             Ok(outputs)
@@ -118,8 +123,13 @@ pub fn evaluate_string_with_inputs(label: &str, source: &str) -> miette::Result<
             let mut outputs = Outputs::new();
             for pair in table.pairs::<String, Value>() {
                 let (key, value) = pair.map_err(|e| miette::miette!("{}: {}", label, e))?;
-                if let Ok(meta) = SnapMeta::from_lua_value(&value) {
-                    outputs.insert(key, meta);
+                match SnapMeta::from_lua_value(&value) {
+                    Ok(meta) => {
+                        outputs.insert(key, meta);
+                    }
+                    Err(e) => {
+                        crate::output::warn(format!("skipping output '{key}' from {label}: {e}"))
+                    }
                 }
             }
             Ok(EvalOutput {
@@ -198,8 +208,13 @@ pub fn evaluate_images(
             for pair in table.pairs::<String, Value>() {
                 let (key, value) = pair.map_err(|e| miette::miette!("{}", e))?;
                 if let Value::Table(t) = value {
-                    if let Ok(decl) = ImageDeclaration::from_lua_table(&t) {
-                        images.insert(key, decl);
+                    match ImageDeclaration::from_lua_table(&t) {
+                        Ok(decl) => {
+                            images.insert(key, decl);
+                        }
+                        Err(e) => {
+                            crate::output::warn(format!("skipping image '{key}' from {path}: {e}"))
+                        }
                     }
                 }
             }
@@ -286,6 +301,20 @@ mod tests {
         let result = evaluate_file(path);
         assert!(result.is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_broken_output_is_skipped_with_warning_not_silently_dropped() {
+        let source = r#"
+        return {
+            good = snap { name = "good-snap", version = "1.0" },
+            bad = "not-a-snap-table",
+        }
+        "#;
+        let outputs = evaluate_string("test-broken", source)
+            .expect("broken output should warn and be skipped, not fail the eval");
+        assert_eq!(outputs.len(), 1, "only the valid output should be kept");
+        assert!(outputs.contains_key("good"));
     }
 
     #[test]
