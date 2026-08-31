@@ -26,6 +26,8 @@ fn main() -> miette::Result<()> {
             cache,
             cache_max_size,
             target,
+            update,
+            offline,
             json,
         } => {
             shoot::output::set_mode(json);
@@ -63,6 +65,8 @@ fn main() -> miette::Result<()> {
                 cache,
                 cache_max_size,
                 target,
+                update,
+                offline,
                 json,
             );
             shoot::output::flush_json("build");
@@ -120,6 +124,8 @@ fn main() -> miette::Result<()> {
         Command::Index(sub) => cmd_index(sub),
 
         Command::Doctor => cmd_doctor(),
+
+        Command::Lock { file, lockfile } => cmd_lock(file, lockfile),
 
         Command::Completion { shell } => cmd_completion(shell),
 
@@ -186,8 +192,16 @@ fn cmd_build(
     cache: Option<String>,
     cache_max_size: Option<String>,
     target: Option<String>,
+    update: Option<String>,
+    offline: bool,
     json: bool,
 ) -> miette::Result<()> {
+    if update.is_some() && offline {
+        return Err(miette::miette!(
+            "--update needs network access and cannot be combined with --offline"
+        ));
+    }
+
     // Initialize package source inputs
     // 1. If the config file exists, extract its global inputs first
     // 2. Otherwise fall back to the default input (github:rbelem/shoot/main)
@@ -198,7 +212,17 @@ fn cmd_build(
         // Extract global inputs from the config file and use those
         match shoot::lua::evaluate_file_with_inputs(&original_file) {
             Ok(eval) => {
-                shoot::pkg_source::init_global_inputs(&eval.global_inputs)?;
+                let lockfile = prepare_inputs(
+                    &eval.global_inputs,
+                    &lockfile_path,
+                    update.as_deref(),
+                    offline,
+                )?;
+                shoot::pkg_source::init_global_inputs_with(
+                    &eval.global_inputs,
+                    &lockfile.inputs,
+                    offline,
+                )?;
                 // We already have the outputs — use them directly
                 let all_outputs = eval.outputs;
                 return run_build(
@@ -224,7 +248,9 @@ fn cmd_build(
     }
 
     // No config file or it failed — use default input and resolve by name
-    shoot::pkg_source::init_global_inputs(&HashMap::new())?;
+    let default_inputs = default_input_map();
+    let lockfile = prepare_inputs(&default_inputs, &lockfile_path, update.as_deref(), offline)?;
+    shoot::pkg_source::init_global_inputs_with(&default_inputs, &lockfile.inputs, offline)?;
     let file = resolve_file(&file);
     let all_outputs = evaluate_file_or_embedded(&file)?;
 
@@ -243,6 +269,61 @@ fn cmd_build(
         target,
         json,
     )
+}
+
+/// The default input map used when no config file is present.
+fn default_input_map() -> HashMap<String, PackageInput> {
+    let mut m = HashMap::new();
+    m.insert(
+        shoot::pkg_source::DEFAULT_INPUT_NAME.to_string(),
+        PackageInput {
+            url: shoot::pkg_source::DEFAULT_INPUT_URL.to_string(),
+        },
+    );
+    m
+}
+
+/// Handle `--update` and first-build pin recording for package inputs,
+/// saving the lockfile when it changed. Returns the lockfile to resolve
+/// inputs against.
+fn prepare_inputs(
+    inputs: &HashMap<String, PackageInput>,
+    lockfile_path: &str,
+    update: Option<&str>,
+    offline: bool,
+) -> miette::Result<LockFile> {
+    let lock_path = Path::new(lockfile_path);
+    let mut lockfile = LockFile::load(lock_path)?.unwrap_or_else(|| LockFile {
+        version: 1,
+        sources: HashMap::new(),
+        snaps: HashMap::new(),
+        inputs: HashMap::new(),
+    });
+
+    let mut changed = false;
+    if let Some(name) = update {
+        // --update <input> refreshes one pin; bare --update refreshes all.
+        let names: Vec<&str> = if name.is_empty() {
+            Vec::new()
+        } else {
+            vec![name]
+        };
+        let n = shoot::pkg_source::update_input_pins(inputs, &names, &mut lockfile)?;
+        changed |= n > 0;
+        if n > 0 {
+            shoot::output::ok(format!("updated {n} input pin(s)"));
+        }
+    } else if !offline {
+        // Record-once: pin inputs missing from the lockfile (first build).
+        let n = shoot::pkg_source::ensure_input_pins(inputs, &mut lockfile)?;
+        changed |= n > 0;
+    }
+
+    if changed {
+        lockfile.save(lock_path)?;
+        shoot::output::ok(format!("lockfile updated: {lockfile_path}"));
+    }
+    Ok(lockfile)
 }
 
 /// Inner build logic after outputs are resolved.
@@ -271,6 +352,7 @@ fn run_build(
         version: 1,
         sources: HashMap::new(),
         snaps: HashMap::new(),
+        inputs: HashMap::new(),
     });
 
     let stage_dir = std::path::Path::new(&stage);
@@ -650,6 +732,7 @@ fn cmd_image(
         version: 1,
         sources: HashMap::new(),
         snaps: HashMap::new(),
+        inputs: HashMap::new(),
     });
 
     let lua = shoot::lua::new_lua(&file)?;
@@ -746,6 +829,50 @@ fn cmd_doctor() -> miette::Result<()> {
     if !shoot::doctor::all_ok(&checks) {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+// ── Lock command ──
+
+/// `shoot lock`: resolve/refresh all input pins without building.
+fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
+    let inputs = if Path::new(&file).exists() {
+        match shoot::lua::evaluate_file_with_inputs(&file) {
+            Ok(eval) if !eval.global_inputs.is_empty() => eval.global_inputs,
+            Ok(_) => {
+                eprintln!("  no inputs declared in '{file}', using default");
+                default_input_map()
+            }
+            Err(e) => {
+                return Err(miette::miette!("failed to read inputs from '{file}': {e}"));
+            }
+        }
+    } else {
+        eprintln!("  no config at '{file}', using default input");
+        default_input_map()
+    };
+
+    let lock_path = Path::new(&lockfile_path);
+    let mut lockfile = LockFile::load(lock_path)?.unwrap_or_else(|| LockFile {
+        version: 1,
+        sources: HashMap::new(),
+        snaps: HashMap::new(),
+        inputs: HashMap::new(),
+    });
+
+    // Empty names = refresh every declared input.
+    let n = shoot::pkg_source::update_input_pins(&inputs, &[], &mut lockfile)?;
+
+    for (name, entry) in &lockfile.inputs {
+        if entry.local {
+            eprintln!("  {name}: local (unlocked)");
+        } else if let Some(rev) = &entry.revision {
+            eprintln!("  {name}: pinned to {}", rev.get(..7).unwrap_or(rev));
+        }
+    }
+
+    lockfile.save(lock_path)?;
+    shoot::output::ok(format!("{n} input(s) locked -> {lockfile_path}"));
     Ok(())
 }
 

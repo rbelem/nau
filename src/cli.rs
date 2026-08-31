@@ -75,6 +75,16 @@ pub enum Command {
         #[arg(long)]
         target: Option<String>,
 
+        /// Re-resolve input(s) to their latest branch head and update the
+        /// lockfile pins before building. Pass an input name to update one
+        /// input; omit the value to update all inputs.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        update: Option<String>,
+
+        /// Use only cached/locked inputs — never touch the network.
+        #[arg(long)]
+        offline: bool,
+
         /// Output structured JSON instead of human-friendly colored output.
         /// Useful for tooling, CI, or machine parsing.
         #[arg(long)]
@@ -163,6 +173,20 @@ pub enum Command {
 
     /// Check system readiness (required tools)
     Doctor,
+
+    /// Resolve and refresh all input pins in the lockfile (no build).
+    /// Pins each github input to its current branch head and records a
+    /// content hash; `path:` inputs are marked local (unlocked).
+    Lock {
+        /// Path to the Lua config file (default: shoot.lua).
+        /// If not found, locks the default package index input.
+        #[arg(short, long, default_value = "shoot.lua")]
+        file: String,
+
+        /// Path to lockfile (default: shoot.lock).
+        #[arg(long, default_value = "shoot.lock")]
+        lockfile: String,
+    },
 
     /// Generate shell completion scripts
     Completion {
@@ -502,6 +526,62 @@ mod tests {
                 assert_eq!(target.as_deref(), Some("aarch64-linux-gnu"));
             }
             _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn test_build_update_one_input() {
+        match parse_build(&["shoot", "build", "--update", "pkgs"]) {
+            Command::Build { update, .. } => assert_eq!(update.as_deref(), Some("pkgs")),
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn test_build_update_all_inputs() {
+        match parse_build(&["shoot", "build", "--update"]) {
+            Command::Build { update, .. } => assert_eq!(update.as_deref(), Some("")),
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn test_build_offline_flag() {
+        match parse_build(&["shoot", "build", "--offline"]) {
+            Command::Build { offline, .. } => assert!(offline),
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn test_lock_subcommand_defaults() {
+        match Cli::try_parse_from(["shoot", "lock"]).unwrap().command {
+            Command::Lock { file, lockfile } => {
+                assert_eq!(file, "shoot.lua");
+                assert_eq!(lockfile, "shoot.lock");
+            }
+            _ => panic!("expected Lock"),
+        }
+    }
+
+    #[test]
+    fn test_lock_subcommand_flags() {
+        match Cli::try_parse_from([
+            "shoot",
+            "lock",
+            "--file",
+            "cfg.lua",
+            "--lockfile",
+            "other.lock",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Lock { file, lockfile } => {
+                assert_eq!(file, "cfg.lua");
+                assert_eq!(lockfile, "other.lock");
+            }
+            _ => panic!("expected Lock"),
         }
     }
 

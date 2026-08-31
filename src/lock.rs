@@ -26,12 +26,43 @@ pub struct LockFile {
     /// sha3-384 that was observed when first resolved.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub snaps: HashMap<String, SnapLockEntry>,
+
+    /// Package inputs keyed by input name. Each entry pins the input to the
+    /// exact revision (git commit SHA) observed at lock time. `path:` inputs
+    /// are recorded as local and never pinned.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub inputs: HashMap<String, InputLockEntry>,
 }
 
 /// A single source entry in the lockfile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceLockEntry {
     pub sha256: String,
+}
+
+/// A single package-input entry in the lockfile.
+///
+/// `github:` inputs carry `revision` (resolved branch-head commit SHA) and
+/// `sha256` (content hash of the input tree). `path:` inputs only carry
+/// `local = true` — they are resolved from the filesystem and unlocked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputLockEntry {
+    /// Resolved git commit SHA of the branch head at lock time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+
+    /// SHA-256 over the input's content tree (excluding `.git`) at lock time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+
+    /// True for `path:` inputs — always resolved from the local filesystem.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub local: bool,
+}
+
+/// `skip_serializing_if` helper: omit `local = false` from the lockfile.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A single snap entry in the lockfile.
@@ -124,6 +155,7 @@ mod tests {
             version: 1,
             sources,
             snaps,
+            inputs: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&lock).unwrap();
@@ -162,6 +194,7 @@ mod tests {
             version: 1,
             sources,
             snaps: HashMap::new(),
+            inputs: HashMap::new(),
         };
 
         lock.save(&path).unwrap();
@@ -183,6 +216,7 @@ mod tests {
             version: 1,
             sources: HashMap::new(),
             snaps: HashMap::new(),
+            inputs: HashMap::new(),
         };
 
         let snap = SnapRef {
@@ -218,6 +252,7 @@ mod tests {
             version: 1,
             sources: HashMap::new(),
             snaps,
+            inputs: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&lock).unwrap();
@@ -228,5 +263,65 @@ mod tests {
         );
         assert!(json.contains("revision"), "JSON should contain revision");
         assert!(json.contains("core22"));
+    }
+
+    #[test]
+    fn test_input_lock_roundtrip() {
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "packages".to_string(),
+            InputLockEntry {
+                revision: Some("c0ffee1234567890c0ffee1234567890c0ffee123".to_string()),
+                sha256: Some(
+                    "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef".to_string(),
+                ),
+                local: false,
+            },
+        );
+        inputs.insert(
+            "local-pkgs".to_string(),
+            InputLockEntry {
+                revision: None,
+                sha256: None,
+                local: true,
+            },
+        );
+
+        let lock = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs,
+        };
+
+        let json = serde_json::to_string_pretty(&lock).unwrap();
+        assert!(json.contains("\"inputs\""), "should contain inputs section");
+        assert!(json.contains("revision"));
+        assert!(json.contains("local"));
+        // local = false is skipped to keep the file readable
+        assert!(!json.contains("false"), "local=false should be omitted");
+
+        let back: LockFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.inputs.len(), 2);
+        assert_eq!(
+            back.inputs["packages"].revision.as_deref(),
+            Some("c0ffee1234567890c0ffee1234567890c0ffee123")
+        );
+        assert_eq!(
+            back.inputs["packages"].sha256.as_deref(),
+            Some("beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef")
+        );
+        assert!(!back.inputs["packages"].local);
+        assert!(back.inputs["local-pkgs"].local);
+        assert!(back.inputs["local-pkgs"].revision.is_none());
+    }
+
+    #[test]
+    fn test_lockfile_without_inputs_backcompat() {
+        // Pre-Phase-16 lockfiles have no `inputs` key — must still load.
+        let json = r#"{ "version": 1, "sources": {}, "snaps": {} }"#;
+        let lock: LockFile = serde_json::from_str(json).unwrap();
+        assert_eq!(lock.version, 1);
+        assert!(lock.inputs.is_empty());
     }
 }
