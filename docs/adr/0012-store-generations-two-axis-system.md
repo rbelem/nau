@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-08-31). Extends ADR-0011 (runtime ownership, native target). Naming invariant per ADR-0010 applies throughout.
+Accepted (2026-08-31). Extends ADR-0011 (runtime ownership, native target). Naming invariant per ADR-0013 applies throughout.
 
 ## Context
 
@@ -15,7 +15,7 @@ The owner set two destination requirements: Nix-style **per-file dedup inside pa
 3. **Generations** pin base-version + package set + configuration as one bootable selection. `shoot rollback` boots the previous generation. GC is reachability-rooted at generations and lockfiles. Generations make retention ~free (file-level sharing).
 4. **Presentation of installed trees**: composefs-class merge (metadata EROFS naming fs-verity-backed content) merged read-only at boot via systemd-sysext — pending a kernel-config audit of shipped kernels; fallback: materialize per-generation EROFS/squashfs extension images from the store (same UX, weaker sharing). composefs for the *base* image stays deferred (ADR-0011).
 5. **Runtime commands (Phase 24b)**: `shuttle install/remove/upgrade/rollback` on-device — fetch, verify against signed manifests, write store, emit hardened units (same deploy path as build-time assembly, Phase 24a), activate, bump generation, GC.
-6. **`.snap` is an export format only** (Snap Store compatibility, a standing project constraint); the native format is the store + manifest pair. Lockfiles and manifests are name-agnostic; digests never embed the project name (format-version numbers instead, per ADR-0010).
+6. **`.snap` is an export format only** (Snap Store compatibility, a standing project constraint); the native format is the store + manifest pair. Lockfiles and manifests are name-agnostic; digests never embed the project name (format-version numbers instead, per ADR-0013).
 7. Distribution of images/store content rides ordinary OCI registries (Phase 25); chunk-level wire dedup is the escalation for metered devices, never static deltas.
 
 ## Alternatives considered

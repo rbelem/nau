@@ -1,6 +1,6 @@
 # shuttle
 
-A Rust CLI that builds Snap packages from Lua declarations — like Nix for Snapcraft. Formerly named *shoot* (renamed 2026-08, ADR-0010).
+A Rust CLI that builds Snap packages from Lua declarations — like Nix for Snapcraft. Formerly named *shoot* (renamed 2026-08, ADR-0013).
 
 ## Language
 

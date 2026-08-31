@@ -407,7 +407,7 @@ Answered in a grill session (decision set ratified by the owner; full rationale 
 | # | Question | Resolution |
 |---|---|---|
 | Q1 | Does shoot own the runtime? | **Yes — shuttle owns day-2** (updates, rollback, installs, health). Phases 22b/24 de-gated. |
-| Q2 | ADR-0009 spike | **Ran and accepted** (2026-08-30); Nickel path confirmed; Phase 21 waits for the language decision that already landed. |
+| Q2 | ADR-0009 spike | **Ran; owner invoked the Luau fallback** — ADR-0010 supersedes ADR-0009 (Nickel retained as evaluation record). Phase 21 lands in Luau. |
 | Q3/Q4 | State contract; snapd-compatible vs snapd-free | **Native snapd-free.** UC-compat is a gated future profile (manifest IR target-agnostic, `target = native \| uc-seed` at assembly). Hybrid rejected: two runtime owners. T6 staged position stands. |
 | Q5 | Daemon law | Amended: no privileged *long-lived* daemon; emitted systemd units/timers + short-lived commands. sysupdate complies. |
 | Q6 | Sequence | Confirmed, extended (below). |
@@ -427,7 +427,7 @@ GC) → 24a → 24 → 24b → 25`. (ADR-0009 spike completed 2026-08-30, ahead 
 
 **Rename (2026-08-31):** shoot → **shuttle** (CLI/package manager); the distro is **ShuttleOS**.
 GitHub repo renamed with redirects; historical artifacts untouched; naming invariant recorded in
-ADR-0010 (paths carry the name, concepts never, digests never). Council had unanimously recommended
+ADR-0013 (paths carry the name, concepts never, digests never). Council had unanimously recommended
 against "shuttle" (shuttle.dev PATH collision, crates.io awslabs holder, SEO); owner accepted the
 tax knowingly in favor of the two-name split.
 
