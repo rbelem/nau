@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-08-30) — all six Decision-8 spike gates passed (20/20 checks, `spike/REPORT.md`); embed target pinned: `nickel-lang-core` `=0.18.0`. Supersedes ADR-0002.
+Superseded by [ADR-0010](0010-package-language-luau.md) (2026-08-31, owner decision: Luau). The spike passed all six gates and the record stands as evidence; the subprocess/IPC isolation design and gate suite carry over. Originally: Accepted (2026-08-30) — all six Decision-8 spike gates passed (20/20 checks, `spike/REPORT.md`); embed target pinned: `nickel-lang-core` `=0.18.0`. Supersedes ADR-0002.
 
 ## Context
 
