@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed. Ratification is gated on the spike acceptance criteria in §Decision 8 — mark `Accepted` only after every gate passes; a failed gate triggers the Luau fallback tripwire (§Decision 9). Supersedes ADR-0002.
+Accepted (2026-08-30) — all six Decision-8 spike gates passed (20/20 checks, `spike/REPORT.md`); embed target pinned: `nickel-lang-core` `=0.18.0`. Supersedes ADR-0002.
 
 ## Context
 
@@ -66,7 +66,9 @@ A census of further Lua dialects (Titan, Astro, Pluto, Fennel, MoonScript, YueSc
 
 ### Migration
 
-1. Spike per §Decision 8 (three packages: `hello`; `jq` — exercises the library layer; `system-base` — exercises `merge`/`pin`/`index`).
+Spike results and constraints: `spike/REPORT.md` (crate bake-off, verified API surface, seven API gotchas). Migration-relevant spike findings: Nickel numbers deserialize as floats — numeric fields (e.g. `revision`) must coerce explicitly at the serde boundary; the `%inmem_src%:` import rewrite is regex-based in the spike and should move to an AST pass (`nickel_lang_parser::traverse`) in production; `index()` ships as host-materialized data crossing the IPC boundary (no Rust-callback primops exist in the public API).
+
+1. Spike per §Decision 8 (three packages: `hello`; `jq` — exercises the library layer; `system-base` — exercises `merge`/`pin`/`index`). **Complete — all gates passed.**
 2. Re-express `src/dsl/init.lua` — the DSL prelude (`snap()`, `merge()`, `pin()`, `index()`) — as Nickel contracts + stdlib functions. **This is the largest single work item** and precedes any definition porting.
 3. Port `pkgs/lib/` (`cli`, `daemon`, `desktop`): these are parameterized constructors with overrides-merging — a real port to Nickel functions with merge priorities, **not a codemod**.
 4. Codemod the 112 leaf definitions (data literals map directly; `merge()` maps to Nickel merge).

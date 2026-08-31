@@ -1,0 +1,41 @@
+{
+  "entries": {
+    "pc-gadget": {
+      "name": "pc-gadget",
+      "summary": "Gadget snap for pc (EFI bootloader configuration)",
+      "aliases": [],
+      "pins": {
+        "amd64": {
+          "revision": 18,
+          "sha3_384": "b5f1c8e6a2d4f7b9c0e3a1d6f8b2c4e6a9d1f3b5c7e9a2d4f6b8c0e3a5d7f9b1"
+        },
+        "arm64": {
+          "revision": 18,
+          "sha3_384": "c6a2d8e4f0b7a3c5e9d1f8b4a6c0e2d7f9b3a5c1e8d0f7b4a6c2e9d1f3b5a7c9"
+        }
+      }
+    },
+    "pc-kernel": {
+      "name": "pc-kernel",
+      "summary": "Linux kernel for pc (generic, virtio modules)",
+      "aliases": ["kernel"],
+      "pins": {
+        "amd64": {
+          "revision": 1847,
+          "sha3_384": "e7bba49dc406968eb0a127e2c405c268c4abe875120f2c4930129800624bd937618069adbcc47cf3762aceddd1c4b977"
+        }
+      }
+    },
+    "systemd": {
+      "name": "systemd",
+      "summary": "systemd init system, udev, journald",
+      "aliases": [],
+      "pins": {
+        "amd64": {
+          "revision": 255,
+          "sha3_384": "a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6"
+        }
+      }
+    }
+  }
+}
