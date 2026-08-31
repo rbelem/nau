@@ -1,4 +1,4 @@
-//! serde schema for golden-parity extraction + shoot-check diagnostics (ADR-0009 Decision 3/4/8).
+//! serde schema for golden-parity extraction + shuttle-check diagnostics (ADR-0009 Decision 3/4/8).
 
 use serde::{Deserialize, Serialize};
 
@@ -78,7 +78,7 @@ pub struct ImageDef {
     pub sysctl: Option<Vec<String>>,
 }
 
-/// Machine-checkable shape for shoot-check diagnostics (Decision 8: JSON with
+/// Machine-checkable shape for shuttle-check diagnostics (Decision 8: JSON with
 /// span + expected/actual, schema-validated). `validate_diagnostics` enforces this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostic {

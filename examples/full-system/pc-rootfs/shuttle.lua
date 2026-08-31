@@ -1,50 +1,52 @@
--- Ubuntu Core 22.04 rootfs image for Raspberry Pi (arm64)
+-- Ubuntu Core 22.04 rootfs image for x86_64 PC hardware
 --
 -- Compose a bootable disk image with:
 --   - core22 base rootfs
---   - pi-kernel with boot params
---   - pi-gadget boot config (u-boot)
---   - snapd + network-manager
---   - GPT disk: ESP (vfat) + root (ext4) + swap
---   - u-boot bootloader (from gadget snap)
+--   - pc-kernel with boot params
+--   - pc-gadget boot config
+--   - snapd + network-manager + lxd
+--   - GPT disk: ESP (vfat) + root (btrfs) + swap
+--   - systemd-boot bootloader
 --
 -- Build:
---   shoot image --file examples/full-system/pi-rootfs/shoot.lua --arch arm64
+--   shuttle image --file examples/full-system/pc-rootfs/shuttle.lua --arch amd64
 --
 -- Requires:
---   package-index.json with resolved snaps (shoot index resolve)
---   parted, losetup, mkfs.vfat, mkfs.ext4, dd on PATH
+--   package-index.json with resolved snaps (shuttle index resolve)
+--   parted, losetup, mkfs.vfat, mkfs.btrfs, dd on PATH
+--   sudo or permissions for loop device + mount
 
 return {
     rootfs = image {
-        name = "ubuntu-core-pi",
+        name = "ubuntu-core-pc",
         version = "22.04",
 
         base = index("core22"),
 
-        kernel = merge(pin("pi-kernel"), {
+        kernel = merge(pin("pc-kernel"), {
             params = {
                 "quiet",
                 "splash",
-                "console=serial0,115200",
                 "console=tty1",
                 "net.ifnames=0",
                 "systemd.unified_cgroup_hierarchy=1",
-                "dwc_otg.lpm_enable=0",
-                "rootwait",
+                "module.sig_enforce=1",
+                "lockdown=confidentiality",
             },
             modules = {
-                "dwc2",
-                "vc4",
-                "bcm2835_dma",
+                "nvme",
+                "thunderbolt",
+                "usb_storage",
+                "intel_lpss_pci",
             },
         }),
 
-        gadget = index("pi-gadget"),
+        gadget = index("pc-gadget"),
 
         snaps = {
             index("snapd"),
             index("network-manager"),
+            index("lxd"),
         },
 
         bootloader = {
@@ -64,16 +66,19 @@ return {
                 {
                     name = "root",
                     size = "0",
-                    fs = "ext4",
+                    fs = "btrfs",
                     mount = "/",
                     options = {
+                        "subvol=@",
+                        "compress=zstd",
                         "noatime",
-                        "discard",
+                        "ssd",
+                        "discard=async",
                     },
                 },
             },
             swap = {
-                size = "4G",
+                size = "8G",
             },
         },
 
@@ -81,6 +86,8 @@ return {
             "vm.swappiness=100",
             "kernel.kptr_restrict=2",
             "kernel.dmesg_restrict=1",
+            "net.ipv4.conf.all.rp_filter=1",
+            "net.ipv4.tcp_syncookies=1",
         },
     },
 }

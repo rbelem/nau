@@ -1,4 +1,4 @@
-# pkgs — shoot package index
+# pkgs — shuttle package index
 
 Ubuntu-style pool layout for Snap package definitions.
 Inspired by https://archive.ubuntu.com/ubuntu/ubuntu/pool/main/
@@ -35,7 +35,7 @@ pkgs/o/openssl.lua          # package: openssl (single file)
 
 ## Usage with the index
 
-The `shoot index` command can scan `pkgs/` to build `package-index.json`,
+The `shuttle index` command can scan `pkgs/` to build `package-index.json`,
 which the `index()` DSL function uses at require time.
 
 ## Adding a package

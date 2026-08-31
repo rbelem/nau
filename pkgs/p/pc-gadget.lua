@@ -4,7 +4,7 @@
 -- hardware-specific configuration for x86_64 Ubuntu Core devices.
 --
 -- Register in package index:
---   shoot index add pc-gadget --summary "PC gadget snap"
+--   shuttle index add pc-gadget --summary "PC gadget snap"
 --
 -- Usage:
 --   image {

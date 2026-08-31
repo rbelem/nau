@@ -5,7 +5,7 @@
 -- snap runtime environment.
 --
 -- Register in package index:
---   shoot index add snapd --summary "Snap daemon"
+--   shuttle index add snapd --summary "Snap daemon"
 --
 -- Usage:
 --   image {

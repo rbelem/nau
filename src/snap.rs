@@ -107,7 +107,7 @@ pub struct BuildResult {
 ///   `path:/local/dir`            — Local filesystem path
 #[derive(Debug, Clone, Serialize)]
 pub struct PackageInput {
-    /// URL in Nix-inspired format (e.g. "github:rbelem/shoot/main",
+    /// URL in Nix-inspired format (e.g. "github:rbelem/shuttle/main",
     /// "path:/home/user/pkgs").
     pub url: String,
 }
@@ -162,7 +162,7 @@ pub struct SnapMeta {
     pub requires: Vec<String>,
 
     /// Package input references. Maps input name to a URL.
-    /// Example: `{ packages = { url = "github:rbelem/shoot/main" } }`
+    /// Example: `{ packages = { url = "github:rbelem/shuttle/main" } }`
     /// Skipped in YAML — build metadata only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<HashMap<String, PackageInput>>,

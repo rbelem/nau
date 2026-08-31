@@ -1,4 +1,4 @@
--- CLI app template for shoot packages.
+-- CLI app template for shuttle packages.
 -- Returns an app config table suitable for merge().
 --
 -- Usage:

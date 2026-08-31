@@ -18,12 +18,12 @@ use nickel_lang_core::program::ProgramBuilder;
 use serde::Deserialize as _;
 use serde_json::Value;
 
-/// Host-visible alias so store sources can `import "shoot-prelude"`; rewritten
+/// Host-visible alias so store sources can `import "shuttle-prelude"`; rewritten
 /// to the in-memory prelude seed. ponytail: string-level rewrite via regex —
 /// Nickel imports are always literal strings, but production should do this at
 /// the AST level (parse -> traverse -> rewrite) to survive imports inside
 /// comments/strings.
-pub const PRELUDE_ALIAS: &str = "shoot-prelude";
+pub const PRELUDE_ALIAS: &str = "shuttle-prelude";
 pub const PRELUDE_NAME: &str = "prelude.ncl";
 
 /// Rewrite every `import "<path>"` in a definition source to the `%inmem_src%:`
@@ -198,7 +198,7 @@ pub mod stable_probe {
     }
 }
 
-/// Flatten shoot's package index (entries with per-arch pins) to the record the
+/// Flatten shuttle's package index (entries with per-arch pins) to the record the
 /// prelude's `index()` consults: name -> { revision, sha3_384 } for the target arch.
 pub fn index_entries_for_arch(index_json: &Value, arch: &str) -> Value {
     let mut out = serde_json::Map::new();

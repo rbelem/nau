@@ -1,4 +1,4 @@
--- shoot DSL — injected globals for snap declarations
+-- shuttle DSL — injected globals for snap declarations
 --
 -- Per ADR-0002: Lua DSL is the schema source of truth.
 -- These functions validate arguments at eval time.

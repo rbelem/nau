@@ -10,10 +10,10 @@
 --   3. Override with `merge()` — deep merge for tables, replace for scalars
 --
 -- Usage:
---   shoot build --file examples/packages/composable/shoot.lua
+--   shuttle build --file examples/packages/composable/shuttle.lua
 --   → builds both web and tools snaps from the shared base
 --
---   shoot build --file examples/packages/composable/shoot.lua --order
+--   shuttle build --file examples/packages/composable/shuttle.lua --order
 --   → shows build order
 
 local base = require("base")

@@ -4,8 +4,8 @@
 -- Linux system under QEMU/KVM and reach a shell prompt.
 --
 -- Build:
---   1. Build each dependency:  shoot build --file pkgs/<path>/shoot.lua
---   2. Assemble the image:     shoot image --file pkgs/s/system-base/shoot.lua
+--   1. Build each dependency:  shuttle build --file pkgs/<path>/shuttle.lua
+--   2. Assemble the image:     shuttle image --file pkgs/s/system-base/shuttle.lua
 --
 -- Boot with QEMU:
 --   qemu-system-x86_64 -m 2G -smp 2 -enable-kvm       \

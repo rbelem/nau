@@ -1,7 +1,7 @@
 -- jq built from source — alternate config showing the `build` field.
 --
--- This demonstrates shoot's source-fetch + build pipeline.
--- shoot downloads the tarball, extracts it, and runs the build command
+-- This demonstrates shuttle's source-fetch + build pipeline.
+-- shuttle downloads the tarball, extracts it, and runs the build command
 -- with $STAGE pointing to the stage directory.
 --
 -- Compare with:
@@ -23,7 +23,7 @@ return {
         confinement = "strict",
 
         -- Source URL + pinned SHA-256 for reproducible builds.
-        -- On first build, shoot verifies the hash. On rebuild, the lockfile
+        -- On first build, shuttle verifies the hash. On rebuild, the lockfile
         -- captures it so even bare URLs become pinned.
         source = {
             url = "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-1.8.1.tar.gz",

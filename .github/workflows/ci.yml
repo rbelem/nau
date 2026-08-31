@@ -1,4 +1,4 @@
-# CI for shoot — Rust CLI tool that builds Snap packages from Lua declarations.
+# CI for shuttle — Rust CLI tool that builds Snap packages from Lua declarations.
 #
 # Uses devbox for reproducible toolchain (Rust, squashfs-tools, bubblewrap).
 # Verifies: build, test, lint, format.

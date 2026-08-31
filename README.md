@@ -1,4 +1,4 @@
-# shoot
+# shuttle
 
 Build Snap packages from Lua declarations.
 
@@ -10,10 +10,10 @@ YAML needed. Pins all inputs by content hash for reproducible builds.
 
 ```bash
 # Build a snap from source
-shoot build --file examples/jq-from-source/shoot.lua
+shuttle build --file examples/jq-from-source/shuttle.lua
 
 # Build a system image from pinned snaps
-shoot image --file shoot.lua --source-date-epoch 0
+shuttle image --file shuttle.lua --source-date-epoch 0
 ```
 
 ## Dev Environment (devbox)

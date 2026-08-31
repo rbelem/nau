@@ -1,7 +1,7 @@
 # Language Design Lessons from the Nix/Guix Family
 
 **Date:** 2026-08-29  
-**Status:** Research report — informs shoot's Lua DSL evolution decisions  
+**Status:** Research report — informs shuttle's Lua DSL evolution decisions  
 **Sources:** Nix manual, Lix project, Nickel blog/docs, Starlark spec, Dhall design docs, Pkl docs, Guix papers, arXiv literature review (Zwinger 2026)
 
 ---
@@ -10,7 +10,7 @@
 
 Twenty years of Nix language design reveal a clear pattern: **reproducibility is a runtime property, not a language property.** Nix's strict functional expression language does not inherently produce reproducible builds — the daemon, content-addressed store, fixed-output derivations, and source filtering do. The language is merely a string-context bridge between human intent and the store.
 
-This report surveys Nix, Lix, Tvix, Nickel, Starlark, CUE, Dhall, Pkl, and Guix/Guile to extract what a package manager's configuration language should borrow and what it should avoid. The core finding for shoot: **Lua's simplicity is an asset, not a liability**, provided shoot enforces the right runtime constraints (sandboxing, content hashing, input locking) rather than trying to make the language itself guarantee reproducibility.
+This report surveys Nix, Lix, Tvix, Nickel, Starlark, CUE, Dhall, Pkl, and Guix/Guile to extract what a package manager's configuration language should borrow and what it should avoid. The core finding for shuttle: **Lua's simplicity is an asset, not a liability**, provided shuttle enforces the right runtime constraints (sandboxing, content hashing, input locking) rather than trying to make the language itself guarantee reproducibility.
 
 ---
 
@@ -20,7 +20,7 @@ This report surveys Nix, Lix, Tvix, Nickel, Starlark, CUE, Dhall, Pkl, and Guix/
 
 Nix is dynamically typed with no gradual typing path. Type errors surface at evaluation time deep in attribute chains, producing inscrutable error messages. The community has documented this extensively (CuBeRJAN/nix-problems, Zwinger 2026).
 
-**Lesson for shoot:** Lua is also dynamically typed, but shoot's DSL is data-description (ADR-0002: `snap()` validates its argument table and returns it unchanged). The Rust side (`SnapMeta::from_lua_table`) provides the type boundary. This is the right architecture — don't add a type system to Lua; keep the type boundary at the Rust Lua-table extraction layer.
+**Lesson for shuttle:** Lua is also dynamically typed, but shuttle's DSL is data-description (ADR-0002: `snap()` validates its argument table and returns it unchanged). The Rust side (`SnapMeta::from_lua_table`) provides the type boundary. This is the right architecture — don't add a type system to Lua; keep the type boundary at the Rust Lua-table extraction layer.
 
 ### 2.2 Laziness as a Footgun
 
@@ -31,13 +31,13 @@ Nix uses lazy evaluation by default. This enables elegant infinite structures bu
 
 Tvix (Google/TVL's Rust rewrite) explicitly dropped lazy trees from CppNix's implementation. Lix has also deferred lazy trees and plans a "functionally equivalent replacement."
 
-**Lesson for shoot:** Lua's eager evaluation is the right default for a build DSL. Build configurations should be evaluated once, completely, and predictably. Lazy evaluation adds complexity without benefit for data-description languages.
+**Lesson for shuttle:** Lua's eager evaluation is the right default for a build DSL. Build configurations should be evaluated once, completely, and predictably. Lazy evaluation adds complexity without benefit for data-description languages.
 
 ### 2.3 The `with` Scoping Problem
 
 Nix's `with` attribute set destructuring introduces names into scope without explicit binding, creating name shadowing and making it impossible to determine where a name came from by reading the code.
 
-**Lesson for shoot:** Lua's `local` scoping and `require()` module system are already clean. Don't introduce `with`-like shortcuts that pollute scope.
+**Lesson for shuttle:** Lua's `local` scoping and `require()` module system are already clean. Don't introduce `with`-like shortcuts that pollute scope.
 
 ### 2.4 Evaluation Performance
 
@@ -45,13 +45,13 @@ Nix evaluation is notoriously slow for large expressions (Nixpkgs is ~80K packag
 
 Nickel has seen ~10x performance improvement since 1.0 through a bytecode interpreter and other optimizations.
 
-**Lesson for shoot:** Lua is already fast (LuaJIT is among the fastest scripting runtimes). mlua provides Rust-side integration. shoot's DSL is small (a few hundred lines of Lua at most), so eval performance is a non-issue. Don't optimize for scale you don't have.
+**Lesson for shuttle:** Lua is already fast (LuaJIT is among the fastest scripting runtimes). mlua provides Rust-side integration. shuttle's DSL is small (a few hundred lines of Lua at most), so eval performance is a non-issue. Don't optimize for scale you don't have.
 
 ### 2.5 No Standard Library Versioning
 
 Nixpkgs grows ~50K lines/month. There's no mechanism to version or freeze the standard library independently of the language. Lix is addressing this with "a robust language versioning system" that allows evolution "without sacrificing backwards-compatibility or correctness."
 
-**Lesson for shoot:** shoot's Lua standard library is minimal and defined in `src/dsl/init.lua`. The package inputs system (`github:user/repo[/branch]`) already provides versioning at the input level. No additional mechanism needed.
+**Lesson for shuttle:** shuttle's Lua standard library is minimal and defined in `src/dsl/init.lua`. The package inputs system (`github:user/repo[/branch]`) already provides versioning at the input level. No additional mechanism needed.
 
 ---
 
@@ -76,7 +76,7 @@ Nixpkgs grows ~50K lines/month. There's no mechanism to version or freeze the st
 
 Three independent groups (CppNix upstream, Tvix, Lix) are all wrestling with the same problems: evaluation performance, language evolution, and backward compatibility. This confirms that Nix's language design has fundamental scalability issues that can't be patched incrementally.
 
-**Lesson for shoot:** Avoid building a language that needs rewriting. Lua is stable, fast, and has decades of embedded use. The DSL layer on top should be small enough to rewrite if needed, but the base language won't need it.
+**Lesson for shuttle:** Avoid building a language that needs rewriting. Lua is stable, fast, and has decades of embedded use. The DSL layer on top should be small enough to rewrite if needed, but the base language won't need it.
 
 ---
 
@@ -94,7 +94,7 @@ Nickel was explicitly designed as "an evolution of the Nix language." Key design
 
 **Status (2026):** Stable at 1.0+, active development. 86 contributors, ~5000 commits. Package management added in v1.11. Nix compatibility is experimental. Language server with contract-aware diagnostics.
 
-**Lesson for shoot:** Nickel's merging model (`mkMerge`, `mkIf`, `mkForce` equivalents) is powerful for modular configuration but requires a custom language. shoot's Lua `merge()` function is simpler but sufficient for Snap packaging. If shoot ever needs NixOS-level modularity, Nickel's design is the reference — but Lua + Rust-side module resolution is a viable middle ground.
+**Lesson for shuttle:** Nickel's merging model (`mkMerge`, `mkIf`, `mkForce` equivalents) is powerful for modular configuration but requires a custom language. shuttle's Lua `merge()` function is simpler but sufficient for Snap packaging. If shuttle ever needs NixOS-level modularity, Nickel's design is the reference — but Lua + Rust-side module resolution is a viable middle ground.
 
 ### 4.2 Guix/Guile — The Two-Tier Approach
 
@@ -105,7 +105,7 @@ Guix uses Guile Scheme (a full general-purpose Lisp) as its configuration langua
 - **Full Lisp power:** Users can write arbitrary code in package definitions
 - **Tradeoff:** Less hermetic than Nix. Guix builds are reproducible because of the store, not the language
 
-**Lesson for shoot:** Lua occupies a similar position to Guile — it's a general-purpose language used as an EDSL host. shoot should embrace this: let users write normal Lua code (loops, conditionals, functions) and provide DSL functions (`snap()`, `merge()`, `pin()`) as the domain-specific layer. Don't try to make Lua hermetic; make the build sandbox hermetic.
+**Lesson for shuttle:** Lua occupies a similar position to Guile — it's a general-purpose language used as an EDSL host. shuttle should embrace this: let users write normal Lua code (loops, conditionals, functions) and provide DSL functions (`snap()`, `merge()`, `pin()`) as the domain-specific layer. Don't try to make Lua hermetic; make the build sandbox hermetic.
 
 ### 4.3 Starlark — Determinism by Restriction
 
@@ -118,7 +118,7 @@ Starlark (Bazel's language) is a restricted Python subset designed for determini
 
 **However:** Buck2 (Meta's build system) uses Starlark but **allows recursion**, contradicting the core Starlark constraint. This shows that even the creators of Starlark found the restrictions too limiting in practice.
 
-**Lesson for shoot:** Determinism constraints in the language are the wrong place to enforce build reproducibility. Buck2's relaxation of Starlark's recursion ban proves the community will work around language restrictions. Enforce determinism at the runtime level (sandbox, content hashing, input locking) rather than the language level.
+**Lesson for shuttle:** Determinism constraints in the language are the wrong place to enforce build reproducibility. Buck2's relaxation of Starlark's recursion ban proves the community will work around language restrictions. Enforce determinism at the runtime level (sandbox, content hashing, input locking) rather than the language level.
 
 ### 4.4 CUE — Unification-Based Configuration
 
@@ -130,7 +130,7 @@ CUE uses a constraint-based unification model where values are refined through u
 
 **Status (2026):** In maintenance mode. The unification model is elegant but the learning curve is steep and the community has not grown as hoped.
 
-**Lesson for shoot:** CUE's unification model is too complex for package management. The merge semantics should be simple table merging, not constraint unification.
+**Lesson for shuttle:** CUE's unification model is too complex for package management. The merge semantics should be simple table merging, not constraint unification.
 
 ### 4.5 Dhall — Totality by Design
 
@@ -143,7 +143,7 @@ Dhall guarantees that all programs terminate (total language):
 
 **Status (2026):** Declining adoption. The totality guarantees are too restrictive for practical configuration. The author has stepped back from active development.
 
-**Lesson for shoot:** Totality guarantees are overkill for a build DSL. Users should be able to write loops and conditionals freely. Termination is guaranteed by the runtime (process timeout), not the language.
+**Lesson for shuttle:** Totality guarantees are overkill for a build DSL. Users should be able to write loops and conditionals freely. Termination is guaranteed by the runtime (process timeout), not the language.
 
 ### 4.6 Pkl — Apple's Configuration Language
 
@@ -155,7 +155,7 @@ Pkl (Apple, 2024) takes a different approach:
 - **IDE integration** with language server
 - **Embeddable** as a library in application code
 
-**Lesson for shoot:** Pkl's schema-with-validation pattern is interesting but its focus is application configuration, not build systems. The code generation approach (schema → typed classes) is relevant if shoot ever needs to generate snap.yaml from Lua, but the current approach (Lua → Rust struct → YAML) already achieves this.
+**Lesson for shuttle:** Pkl's schema-with-validation pattern is interesting but its focus is application configuration, not build systems. The code generation approach (schema → typed classes) is relevant if shuttle ever needs to generate snap.yaml from Lua, but the current approach (Lua → Rust struct → YAML) already achieves this.
 
 ---
 
@@ -192,14 +192,14 @@ A package manager's configuration language **should** be:
 - Fast to evaluate (Lua/LuaJIT is fast)
 
 The reproducibility guarantees should come from:
-- Build sandboxing (bubblewrap, already implemented in shoot)
+- Build sandboxing (bubblewrap, already implemented in shuttle)
 - Content-addressed caching (SHA-256 keyed, needs full input hashing)
 - Input locking (lockfile pinning revisions)
 - Source filtering (exclude `.git`, build artifacts)
 
-### 5.3 shoot's Architecture Is Correct
+### 5.3 shuttle's Architecture Is Correct
 
-shoot's current design aligns with this insight:
+shuttle's current design aligns with this insight:
 - **Lua DSL** = data-description (ADR-0002), not hermetic computation
 - **Rust host** = type safety, performance, sandbox management
 - **bubblewrap sandbox** = hermetic builds
@@ -210,7 +210,7 @@ shoot's current design aligns with this insight:
 
 ## 6. Comparison Table
 
-| Property | Nix | Nickel | Starlark | Guix/Guile | CUE | Dhall | Pkl | shoot (Lua) |
+| Property | Nix | Nickel | Starlark | Guix/Guile | CUE | Dhall | Pkl | shuttle (Lua) |
 |----------|-----|--------|----------|------------|-----|-------|-----|-------------|
 | **Type system** | Dynamic, untyped | Gradual (types + contracts) | Dynamic, untyped | Dynamic (Lisp) | Structural (unification) | Strong, static | Strong, typed schemas | Dynamic (Lua) |
 | **Evaluation** | Lazy | Lazy (with contract boundaries) | Eager | Eager (Scheme) | Eager | Eager | Eager | Eager |
@@ -223,11 +223,11 @@ shoot's current design aligns with this insight:
 | **Ecosystem size** | Nixpkgs (~100K packages) | Small (experimental) | Bazel ecosystem | GNU ecosystem | Small | Small | Growing (Apple) | Tiny (Snap packages) |
 | **Learnability** | Steep (unique language) | Moderate (Nix-like + types) | Easy (Python subset) | Steep (Lisp) | Steep (unification) | Moderate (Haskell-like) | Easy (config-like) | Easy (Lua) |
 | **Embeddability** | Standalone | Library (Rust/Python/C/Go) | Library (Go, Rust, Java) | Standalone | Library (Go) | Library (Haskell) | Library (JVM/Swift/Go) | Library (mlua in Rust) |
-| **Active development** | Yes (CppNix + Lix + Tvix) | Yes (Tweag) | Yes (Bazel) | Yes (GNU) | Maintenance | Declining | Yes (Apple) | Yes (shoot) |
+| **Active development** | Yes (CppNix + Lix + Tvix) | Yes (Tweag) | Yes (Bazel) | Yes (GNU) | Maintenance | Declining | Yes (Apple) | Yes (shuttle) |
 
 ---
 
-## 7. Implications for shoot's Lua DSL
+## 7. Implications for shuttle's Lua DSL
 
 ### 7.1 What to Keep
 
@@ -254,7 +254,7 @@ shoot's current design aligns with this insight:
 
 ### 7.4 Architecture Validation
 
-shoot's architecture (Lua DSL + Rust host + bubblewrap sandbox + content-addressed cache) is **aligned with the consensus** of 20 years of package manager language design:
+shuttle's architecture (Lua DSL + Rust host + bubblewrap sandbox + content-addressed cache) is **aligned with the consensus** of 20 years of package manager language design:
 
 - The language should be simple and familiar (Lua ✓)
 - Reproducibility comes from the runtime (sandbox + store ✓)

@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "shoot",
+    name = "shuttle",
     version,
     about = "Build Snap packages from Lua declarations"
 )]
@@ -15,8 +15,8 @@ pub struct Cli {
 pub enum Command {
     /// Build a snap from a Lua declaration file
     Build {
-        /// Path to the Lua config file (default: shoot.lua)
-        #[arg(short, long, default_value = "shoot.lua")]
+        /// Path to the Lua config file (default: shuttle.lua)
+        #[arg(short, long, default_value = "shuttle.lua")]
         file: String,
 
         /// Directory containing pre-built binaries (default: ./stage/)
@@ -32,7 +32,7 @@ pub enum Command {
         #[arg(short = 'A', long)]
         arch: Vec<String>,
 
-        /// Output name to build (from shoot.lua outputs table).
+        /// Output name to build (from shuttle.lua outputs table).
         /// Default: build all outputs.
         output_name: Option<String>,
 
@@ -42,9 +42,9 @@ pub enum Command {
         #[arg(long)]
         source_date_epoch: Option<String>,
 
-        /// Path to lockfile (default: shoot.lock).
+        /// Path to lockfile (default: shuttle.lock).
         /// Locks source hashes for reproducible builds.
-        #[arg(long, default_value = "shoot.lock")]
+        #[arg(long, default_value = "shuttle.lock")]
         lockfile: String,
 
         /// Print dependency build order and exit (no build).
@@ -57,7 +57,7 @@ pub enum Command {
         #[arg(long)]
         all: bool,
 
-        /// Binary cache directory for built packages (default: ~/.cache/shoot/pkgs).
+        /// Binary cache directory for built packages (default: ~/.cache/shuttle/pkgs).
         /// Cached builds are keyed by source SHA-256, so rebuilds only happen when
         /// source changes. Combine with --all to build full dependency trees efficiently.
         #[arg(long)]
@@ -93,8 +93,8 @@ pub enum Command {
 
     /// Build a system image from pinned snaps
     Image {
-        /// Path to the Lua config file (default: shoot.lua)
-        #[arg(short, long, default_value = "shoot.lua")]
+        /// Path to the Lua config file (default: shuttle.lua)
+        #[arg(short, long, default_value = "shuttle.lua")]
         file: String,
 
         /// Output directory for the .img file (default: current dir)
@@ -109,7 +109,7 @@ pub enum Command {
         #[arg(long, default_value = "latest/stable")]
         channel: String,
 
-        /// Cache directory for downloaded snaps (default: ~/.cache/shoot/snaps)
+        /// Cache directory for downloaded snaps (default: ~/.cache/shuttle/snaps)
         #[arg(long)]
         cache: Option<String>,
 
@@ -117,7 +117,7 @@ pub enum Command {
         #[arg(long)]
         cache_max_size: Option<String>,
 
-        /// Image output name to build (from shoot.lua images table).
+        /// Image output name to build (from shuttle.lua images table).
         /// Default: build the first image found.
         output_name: Option<String>,
 
@@ -126,8 +126,8 @@ pub enum Command {
         #[arg(long)]
         source_date_epoch: Option<String>,
 
-        /// Path to lockfile (default: shoot.lock).
-        #[arg(long, default_value = "shoot.lock")]
+        /// Path to lockfile (default: shuttle.lock).
+        #[arg(long, default_value = "shuttle.lock")]
         lockfile: String,
 
         /// Output structured JSON instead of human-friendly colored output.
@@ -141,7 +141,7 @@ pub enum Command {
 
     /// Show dependency tree for a package
     Deps {
-        /// Package name or path to shoot.lua file
+        /// Package name or path to shuttle.lua file
         package: String,
 
         /// Resolve all transitive dependencies (recursive)
@@ -178,13 +178,13 @@ pub enum Command {
     /// Pins each github input to its current branch head and records a
     /// content hash; `path:` inputs are marked local (unlocked).
     Lock {
-        /// Path to the Lua config file (default: shoot.lua).
+        /// Path to the Lua config file (default: shuttle.lua).
         /// If not found, locks the default package index input.
-        #[arg(short, long, default_value = "shoot.lua")]
+        #[arg(short, long, default_value = "shuttle.lua")]
         file: String,
 
-        /// Path to lockfile (default: shoot.lock).
-        #[arg(long, default_value = "shoot.lock")]
+        /// Path to lockfile (default: shuttle.lock).
+        #[arg(long, default_value = "shuttle.lock")]
         lockfile: String,
     },
 
@@ -199,19 +199,19 @@ pub enum Command {
     Cache(CacheCommand),
 }
 
-/// Subcommands for `shoot cache`.
+/// Subcommands for `shuttle cache`.
 #[derive(clap::Subcommand)]
 pub enum CacheCommand {
     /// Show cache statistics (entries, packages, disk usage)
     Info {
-        /// Cache directory (default: ~/.cache/shoot/pkgs)
+        /// Cache directory (default: ~/.cache/shuttle/pkgs)
         #[arg(long)]
         cache: Option<String>,
     },
 
     /// Remove all cached packages
     Clear {
-        /// Cache directory (default: ~/.cache/shoot/pkgs)
+        /// Cache directory (default: ~/.cache/shuttle/pkgs)
         #[arg(long)]
         cache: Option<String>,
 
@@ -226,7 +226,7 @@ pub enum CacheCommand {
         #[arg(long, default_value_t = 30)]
         days: u64,
 
-        /// Cache directory (default: ~/.cache/shoot/pkgs)
+        /// Cache directory (default: ~/.cache/shuttle/pkgs)
         #[arg(long)]
         cache: Option<String>,
 
@@ -236,7 +236,7 @@ pub enum CacheCommand {
     },
 }
 
-/// Subcommands for `shoot index`.
+/// Subcommands for `shuttle index`.
 #[derive(clap::Subcommand)]
 pub enum IndexCommand {
     /// List snaps in the package index
@@ -286,9 +286,9 @@ pub enum IndexCommand {
     /// Update package source inputs (re-fetch GitHub repositories).
     /// Ensures the local cache matches the remote.
     Update {
-        /// Path to the Lua config file (default: shoot.lua).
+        /// Path to the Lua config file (default: shuttle.lua).
         /// If not found, updates the default package index.
-        #[arg(short, long, default_value = "shoot.lua")]
+        #[arg(short, long, default_value = "shuttle.lua")]
         file: String,
     },
 }
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_build_defaults() {
-        match parse_build(&["shoot", "build"]) {
+        match parse_build(&["shuttle", "build"]) {
             Command::Build {
                 file,
                 stage,
@@ -318,7 +318,7 @@ mod tests {
                 output_name,
                 ..
             } => {
-                assert_eq!(file, "shoot.lua");
+                assert_eq!(file, "shuttle.lua");
                 assert_eq!(stage, "./stage/");
                 assert_eq!(output, ".");
                 assert!(arch.is_empty());
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_build_with_file_flag() {
-        match parse_build(&["shoot", "build", "--file", "my-snap.lua"]) {
+        match parse_build(&["shuttle", "build", "--file", "my-snap.lua"]) {
             Command::Build { file, .. } => assert_eq!(file, "my-snap.lua"),
             _ => panic!("expected Build"),
         }
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_build_with_short_file_flag() {
-        match parse_build(&["shoot", "build", "-f", "other.lua"]) {
+        match parse_build(&["shuttle", "build", "-f", "other.lua"]) {
             Command::Build { file, .. } => assert_eq!(file, "other.lua"),
             _ => panic!("expected Build"),
         }
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn test_build_with_stage_and_output() {
         match parse_build(&[
-            "shoot",
+            "shuttle",
             "build",
             "--stage",
             "/tmp/stage",
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_build_with_single_arch() {
-        match parse_build(&["shoot", "build", "--arch", "arm64"]) {
+        match parse_build(&["shuttle", "build", "--arch", "arm64"]) {
             Command::Build { arch, .. } => assert_eq!(arch, &["arm64"]),
             _ => panic!("expected Build"),
         }
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_build_with_multi_arch() {
-        match parse_build(&["shoot", "build", "--arch", "amd64", "-A", "arm64"]) {
+        match parse_build(&["shuttle", "build", "--arch", "amd64", "-A", "arm64"]) {
             Command::Build { arch, .. } => assert_eq!(arch, &["amd64", "arm64"]),
             _ => panic!("expected Build"),
         }
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_build_with_positional_output_name() {
-        match parse_build(&["shoot", "build", "server"]) {
+        match parse_build(&["shuttle", "build", "server"]) {
             Command::Build { output_name, .. } => {
                 assert_eq!(output_name.as_deref(), Some("server"))
             }
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn test_build_with_positional_and_flags() {
         match parse_build(&[
-            "shoot",
+            "shuttle",
             "build",
             "cli",
             "--file",
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_image_defaults() {
-        match parse_build(&["shoot", "image"]) {
+        match parse_build(&["shuttle", "image"]) {
             Command::Image {
                 file,
                 output,
@@ -425,7 +425,7 @@ mod tests {
                 output_name,
                 ..
             } => {
-                assert_eq!(file, "shoot.lua");
+                assert_eq!(file, "shuttle.lua");
                 assert_eq!(output, ".");
                 assert_eq!(arch, "amd64");
                 assert_eq!(channel, "latest/stable");
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn test_image_with_flags() {
         match parse_build(&[
-            "shoot",
+            "shuttle",
             "image",
             "--file",
             "my-image.lua",
@@ -475,13 +475,13 @@ mod tests {
 
     #[test]
     fn test_missing_subcommand_fails() {
-        let result = Cli::try_parse_from(["shoot"]);
+        let result = Cli::try_parse_from(["shuttle"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_image_source_date_epoch() {
-        match parse_build(&["shoot", "image", "--source-date-epoch", "0"]) {
+        match parse_build(&["shuttle", "image", "--source-date-epoch", "0"]) {
             Command::Image {
                 source_date_epoch, ..
             } => {
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_build_all_flag() {
-        match parse_build(&["shoot", "build", "--all"]) {
+        match parse_build(&["shuttle", "build", "--all"]) {
             Command::Build { all, .. } => assert!(all),
             _ => panic!("expected Build"),
         }
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_build_cache_flag() {
-        match parse_build(&["shoot", "build", "--cache", "/tmp/cache"]) {
+        match parse_build(&["shuttle", "build", "--cache", "/tmp/cache"]) {
             Command::Build { cache, .. } => {
                 assert_eq!(cache.as_deref(), Some("/tmp/cache"));
             }
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_build_json_flag() {
-        match parse_build(&["shoot", "build", "--json"]) {
+        match parse_build(&["shuttle", "build", "--json"]) {
             Command::Build { json, .. } => assert!(json),
             _ => panic!("expected Build"),
         }
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_build_target_flag() {
-        match parse_build(&["shoot", "build", "--target", "aarch64-linux-gnu"]) {
+        match parse_build(&["shuttle", "build", "--target", "aarch64-linux-gnu"]) {
             Command::Build { target, .. } => {
                 assert_eq!(target.as_deref(), Some("aarch64-linux-gnu"));
             }
@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_build_update_one_input() {
-        match parse_build(&["shoot", "build", "--update", "pkgs"]) {
+        match parse_build(&["shuttle", "build", "--update", "pkgs"]) {
             Command::Build { update, .. } => assert_eq!(update.as_deref(), Some("pkgs")),
             _ => panic!("expected Build"),
         }
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_build_update_all_inputs() {
-        match parse_build(&["shoot", "build", "--update"]) {
+        match parse_build(&["shuttle", "build", "--update"]) {
             Command::Build { update, .. } => assert_eq!(update.as_deref(), Some("")),
             _ => panic!("expected Build"),
         }
@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_build_offline_flag() {
-        match parse_build(&["shoot", "build", "--offline"]) {
+        match parse_build(&["shuttle", "build", "--offline"]) {
             Command::Build { offline, .. } => assert!(offline),
             _ => panic!("expected Build"),
         }
@@ -555,10 +555,10 @@ mod tests {
 
     #[test]
     fn test_lock_subcommand_defaults() {
-        match Cli::try_parse_from(["shoot", "lock"]).unwrap().command {
+        match Cli::try_parse_from(["shuttle", "lock"]).unwrap().command {
             Command::Lock { file, lockfile } => {
-                assert_eq!(file, "shoot.lua");
-                assert_eq!(lockfile, "shoot.lock");
+                assert_eq!(file, "shuttle.lua");
+                assert_eq!(lockfile, "shuttle.lock");
             }
             _ => panic!("expected Lock"),
         }
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn test_lock_subcommand_flags() {
         match Cli::try_parse_from([
-            "shoot",
+            "shuttle",
             "lock",
             "--file",
             "cfg.lua",
@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn test_image_json_flag() {
-        match parse_build(&["shoot", "image", "--json"]) {
+        match parse_build(&["shuttle", "image", "--json"]) {
             Command::Image { json, .. } => assert!(json),
             _ => panic!("expected Image"),
         }
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_deps_json_flag() {
-        let args = ["shoot", "deps", "glibc", "--json"];
+        let args = ["shuttle", "deps", "glibc", "--json"];
         let cmd = Cli::try_parse_from(args).unwrap().command;
         match cmd {
             Command::Deps { json, .. } => assert!(json),
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn test_build_all_flags_combo() {
         match parse_build(&[
-            "shoot",
+            "shuttle",
             "build",
             "--all",
             "--cache",
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_completion_bash() {
-        match Cli::try_parse_from(["shoot", "completion", "bash"])
+        match Cli::try_parse_from(["shuttle", "completion", "bash"])
             .unwrap()
             .command
         {
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_cache_info() {
-        match Cli::try_parse_from(["shoot", "cache", "info"])
+        match Cli::try_parse_from(["shuttle", "cache", "info"])
             .unwrap()
             .command
         {
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn test_cache_clear() {
-        match Cli::try_parse_from(["shoot", "cache", "clear", "--force"])
+        match Cli::try_parse_from(["shuttle", "cache", "clear", "--force"])
             .unwrap()
             .command
         {
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_cache_prune() {
-        match Cli::try_parse_from(["shoot", "cache", "prune", "--days", "60", "--force"])
+        match Cli::try_parse_from(["shuttle", "cache", "prune", "--days", "60", "--force"])
             .unwrap()
             .command
         {

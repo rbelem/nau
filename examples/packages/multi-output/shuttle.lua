@@ -1,6 +1,6 @@
 -- multi-output: One file, multiple snaps
 --
--- Demonstrates the multi-output structure: a single shoot.lua declares
+-- Demonstrates the multi-output structure: a single shuttle.lua declares
 -- multiple snaps, each with its own name, version, apps, and build
 -- configuration. Build them all at once or select specific outputs.
 --
@@ -8,13 +8,13 @@
 --   return { server = snap { ... }, cli    = snap { ... } }
 --
 -- Usage:
---   shoot build --file examples/packages/multi-output/shoot.lua
+--   shuttle build --file examples/packages/multi-output/shuttle.lua
 --   → builds both server and cli snaps
 --
---   shoot build --file examples/packages/multi-output/shoot.lua server
+--   shuttle build --file examples/packages/multi-output/shuttle.lua server
 --   → builds only the server snap
 --
---   shoot build --file examples/packages/multi-output/shoot.lua --order
+--   shuttle build --file examples/packages/multi-output/shuttle.lua --order
 --   → shows build order for all outputs
 
 return {

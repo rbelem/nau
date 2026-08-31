@@ -9,7 +9,7 @@
 local base = {
     name = "unnamed",
     version = "0.0.0",
-    summary = "A snap built with shoot",
+    summary = "A snap built with shuttle",
     description = "Override this with your own description.",
     grade = "stable",
     confinement = "strict",

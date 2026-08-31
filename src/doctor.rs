@@ -1,7 +1,7 @@
-//! System readiness checks — `shoot doctor`.
+//! System readiness checks — `shuttle doctor`.
 //!
 //! Verifies that all required tools are installed and working before
-//! attempting a build. Run via `shoot doctor`.
+//! attempting a build. Run via `shuttle doctor`.
 
 /// Result of one dependency check.
 #[derive(Debug)]
@@ -118,7 +118,7 @@ fn check_squashfs_version() -> Check {
 pub fn print_report(checks: &[Check]) {
     let mut all_ok = true;
 
-    println!("shoot doctor — system readiness check");
+    println!("shuttle doctor — system readiness check");
     println!();
 
     for check in checks {

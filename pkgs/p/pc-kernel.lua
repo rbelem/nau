@@ -5,7 +5,7 @@
 -- modules/firmware merged into /lib/modules and /lib/firmware).
 --
 -- Register in package index:
---   shoot index add pc-kernel --summary "Generic PC kernel snap"
+--   shuttle index add pc-kernel --summary "Generic PC kernel snap"
 --
 -- Usage:
 --   image {

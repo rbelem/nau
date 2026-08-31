@@ -282,7 +282,7 @@ fn imports() -> Result<()> {
     r.gate(rejected_leak, "direct file import rejected (import \"/etc/passwd\")", &describe_run(&run2));
 
     // 3. Canary: a real file next to an empty-cwd child must be unreachable.
-    let canary = std::env::temp_dir().join("shoot-spike-canary.ncl");
+    let canary = std::env::temp_dir().join("shuttle-spike-canary.ncl");
     std::fs::write(&canary, "{ canary = true }\n")?;
     let canary_src = format!("{{ x = import {:?} }}", canary.to_string_lossy());
     let run3 = gates::run_isolated_source(&canary_src, "canary.ncl")?;
@@ -331,7 +331,7 @@ fn latency() -> Result<()> {
     let median_eval = evals.get(evals.len() / 2).copied().unwrap_or(f64::INFINITY);
     r.gate(
         median_wall < 100.0,
-        "shoot check < 100ms including subprocess spawn",
+        "shuttle check < 100ms including subprocess spawn",
         &format!("median wall={median_wall:.1}ms (eval-only={median_eval:.1}ms, spawn+IPC={:.1}ms)", median_wall - median_eval),
     );
 

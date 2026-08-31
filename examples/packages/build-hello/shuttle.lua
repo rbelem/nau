@@ -5,20 +5,20 @@
 -- FTP server, configured, compiled, and assembled into a .snap.
 --
 -- Usage:
---   shoot build --file examples/packages/build-hello/shoot.lua
+--   shuttle build --file examples/packages/build-hello/shuttle.lua
 --   → produces hello_2.10_amd64.snap
 --
---   shoot build --file examples/packages/build-hello/shoot.lua --order
+--   shuttle build --file examples/packages/build-hello/shuttle.lua --order
 --   → shows build order (requires glibc)
 
 return {
     default = snap {
         name = "hello",
         version = "2.10",
-        summary = "GNU Hello, built from source with shoot",
+        summary = "GNU Hello, built from source with shuttle",
         description = [[
             GNU hello prints a friendly greeting. This example shows
-            how shoot builds a package entirely from source — fetch,
+            how shuttle builds a package entirely from source — fetch,
             configure, make, install, and snap — in one command.
         ]],
         license = "GPL-3.0-or-later",

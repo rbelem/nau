@@ -1,15 +1,15 @@
 //! Package source resolution — fetch package definitions from declared inputs.
 //!
-//! Inspired by Nix flake inputs, shoot supports:
+//! Inspired by Nix flake inputs, shuttle supports:
 //! - `github:user/repo[/branch]` — shallow clone from GitHub
 //! - `path:/local/directory`     — local filesystem path
 //!
-//! Global inputs (declared at the top of `shoot.lua` before the return statement)
+//! Global inputs (declared at the top of `shuttle.lua` before the return statement)
 //! power the package index. Per-snap inputs declare additional sources.
 //!
-//! GitHub URLs are cached in `~/.cache/shoot/inputs/<hash>/` after a shallow
+//! GitHub URLs are cached in `~/.cache/shuttle/inputs/<hash>/` after a shallow
 //! clone. Local paths are used directly. If no inputs are configured, a default
-//! input (`github:rbelem/shoot/main`) is used as fallback so `shoot build <pkg>`
+//! input (`github:rbelem/shuttle/main`) is used as fallback so `shuttle build <pkg>`
 //! works out of the box.
 
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ fn sha256_hex(input: &str) -> String {
 }
 
 /// Default input URL used when no inputs are configured.
-pub const DEFAULT_INPUT_URL: &str = "github:rbelem/shoot/main";
+pub const DEFAULT_INPUT_URL: &str = "github:rbelem/shuttle/main";
 
 /// Default input name for the fallback.
 pub const DEFAULT_INPUT_NAME: &str = "packages";
@@ -42,7 +42,7 @@ pub const DEFAULT_INPUT_NAME: &str = "packages";
 /// Home-directory cache root for fetched inputs.
 fn cache_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".cache/shoot/inputs")
+    PathBuf::from(home).join(".cache/shuttle/inputs")
 }
 
 /// Cache directory for a given github: URL.
@@ -123,7 +123,7 @@ pub fn resolve_input_with(
             if &actual != expected {
                 return Err(miette::miette!(
                     "input '{url}' content changed since lock (lockfile: {expected}, cache: {actual}); \
-                     run 'shoot lock' or 'shoot build --update' to refresh the pin"
+                     run 'shuttle lock' or 'shuttle build --update' to refresh the pin"
                 ));
             }
         }
@@ -179,7 +179,7 @@ fn fetch_github(owner: &str, repo: &str, branch: &str, dest: &Path) -> miette::R
     Ok(())
 }
 
-/// Re-fetch a cached GitHub input (for `shoot index update`).
+/// Re-fetch a cached GitHub input (for `shuttle index update`).
 pub fn refresh_input(input: &PackageInput) -> miette::Result<()> {
     let url = &input.url;
     if let Some((owner, repo, branch)) = parse_github_url(url) {
@@ -433,9 +433,9 @@ static GLOBAL_PATHS: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
 
 /// Initialize global package source paths from a set of inputs.
 ///
-/// Called during `shoot build` / `shoot deps` / etc. before any package
+/// Called during `shuttle build` / `shuttle deps` / etc. before any package
 /// resolution. If `inputs` is empty, the default input
-/// (`github:rbelem/shoot/main`) is used. This can be called multiple times —
+/// (`github:rbelem/shuttle/main`) is used. This can be called multiple times —
 /// later calls override earlier ones (e.g. when a config file specifies inputs).
 pub fn init_global_inputs(inputs: &HashMap<String, PackageInput>) -> miette::Result<()> {
     init_global_inputs_with(inputs, &HashMap::new(), false)
@@ -602,7 +602,7 @@ pub fn resolve_path(name_or_path: &str) -> PathBuf {
 }
 
 /// Iterate over all available package names from all sources.
-/// Used by `shoot search`.
+/// Used by `shuttle search`.
 pub fn iter_packages() -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut names = Vec::new();
@@ -694,17 +694,17 @@ mod tests {
 
     #[test]
     fn test_resolve_path_contains_slash() {
-        let p = resolve_path("examples/full-system/system-base/shoot.lua");
+        let p = resolve_path("examples/full-system/system-base/shuttle.lua");
         assert!(p
             .to_string_lossy()
-            .ends_with("examples/full-system/system-base/shoot.lua"));
+            .ends_with("examples/full-system/system-base/shuttle.lua"));
     }
 
     #[test]
-    fn test_cache_root_contains_shoot() {
+    fn test_cache_root_contains_shuttle() {
         let root = cache_root();
         let s = root.to_string_lossy();
-        assert!(s.contains(".cache/shoot/inputs"));
+        assert!(s.contains(".cache/shuttle/inputs"));
     }
 
     #[test]
@@ -768,7 +768,7 @@ mod tests {
     #[test]
     fn test_offline_uncached_input_errors() {
         let input = PackageInput {
-            url: "github:shoot-test-nonexistent-xyz/nope".into(),
+            url: "github:shuttle-test-nonexistent-xyz/nope".into(),
         };
         let err = resolve_input_with(&input, None, true)
             .unwrap_err()

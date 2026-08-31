@@ -4,7 +4,7 @@
 -- and hardware configuration for Raspberry Pi Ubuntu Core devices.
 --
 -- Register in package index:
---   shoot index add pi-gadget --summary "Raspberry Pi gadget snap"
+--   shuttle index add pi-gadget --summary "Raspberry Pi gadget snap"
 --
 -- Usage:
 --   image {

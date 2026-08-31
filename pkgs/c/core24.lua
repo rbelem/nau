@@ -4,7 +4,7 @@
 -- Downloads from Snap Store, consumed by image() DSL.
 --
 -- Register in package index:
---   shoot index add core24 --summary "Runtime based on Ubuntu 24.04"
+--   shuttle index add core24 --summary "Runtime based on Ubuntu 24.04"
 --
 -- Usage in an image declaration:
 --   image {

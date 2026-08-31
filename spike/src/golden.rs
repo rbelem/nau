@@ -25,7 +25,7 @@ pub fn pkg_src(rel: &str) -> Result<String> {
         .with_context(|| format!("reading golden package {rel}"))
 }
 
-/// Rust-host index() mirroring shoot's src/index.rs::lua_index_entry +
+/// Rust-host index() mirroring shuttle's src/index.rs::lua_index_entry +
 /// entry_to_lua_table (reads the same package-index.json the Nickel path gets).
 fn register_index(lua: &Lua, index_path: &std::path::Path, arch: &'static str) -> Result<()> {
     let raw = std::fs::read_to_string(index_path)
@@ -81,7 +81,7 @@ pub fn eval_lua_pkg(index_path: &std::path::Path, pkg_rel_path: &str) -> Result<
     register_index(&lua, index_path, "amd64")?;
 
     let src = pkg_src(pkg_rel_path)?;
-    // Mirror shoot's require() setup: the package's own directory is on the
+    // Mirror shuttle's require() setup: the package's own directory is on the
     // module path (pkgs/j/jq/lib.lua is required as "lib").
     let pkg_dir = repo_root().join(pkg_rel_path).parent().unwrap().to_string_lossy().into_owned();
     lua.load(format!("package.path = {pkg_dir:?} .. '/?.lua;' .. package.path"))

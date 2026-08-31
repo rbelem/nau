@@ -1,6 +1,6 @@
 //! Binary package cache — store and retrieve built `.snap` files by source hash.
 //!
-//! The cache lives at `~/.cache/shoot/pkgs/` (configurable via `--cache`).
+//! The cache lives at `~/.cache/shuttle/pkgs/` (configurable via `--cache`).
 //! Each cached snap is stored as:
 //!
 //! ```text
@@ -39,7 +39,7 @@ pub struct CacheInfo {
     pub root: std::path::PathBuf,
 }
 
-/// Default cache directory name under `~/.cache/shoot/`.
+/// Default cache directory name under `~/.cache/shuttle/`.
 const DEFAULT_CACHE_SUBDIR: &str = "pkgs";
 
 /// Magic string for packages without source (meta/store types).
@@ -57,13 +57,13 @@ pub struct PackageCache {
 impl PackageCache {
     /// Create a new cache at the specified directory.
     ///
-    /// If `dir` is `None`, defaults to `~/.cache/shoot/pkgs/`.
+    /// If `dir` is `None`, defaults to `~/.cache/shuttle/pkgs/`.
     pub fn new(dir: Option<PathBuf>) -> Self {
         let root = dir.unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             Path::new(&home)
                 .join(".cache")
-                .join("shoot")
+                .join("shuttle")
                 .join(DEFAULT_CACHE_SUBDIR)
         });
         PackageCache {
@@ -354,7 +354,7 @@ mod tests {
         let cache = PackageCache::new(None);
         let expected = Path::new(&std::env::var("HOME").unwrap())
             .join(".cache")
-            .join("shoot")
+            .join("shuttle")
             .join("pkgs");
         assert_eq!(cache.root(), expected);
     }

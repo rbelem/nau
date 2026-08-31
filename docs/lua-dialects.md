@@ -1,6 +1,6 @@
 # Lua Dialect Census (2024-2026)
 
-Comprehensive survey of Lua dialects, variants, and superset languages for the **shoot** Rust CLI's package-definition DSL decision. Focus: anything beyond already-evaluated candidates (Lua 5.4, LuaJIT, Teal, Luau, Pallene, Ravi, Amulet, Candy, Nelua, TypeScriptToLua).
+Comprehensive survey of Lua dialects, variants, and superset languages for the **shuttle** Rust CLI's package-definition DSL decision. Focus: anything beyond already-evaluated candidates (Lua 5.4, LuaJIT, Teal, Luau, Pallene, Ravi, Amulet, Candy, Nelua, TypeScriptToLua).
 
 Date: 2026-08-30.
 
@@ -20,7 +20,7 @@ Date: 2026-08-30.
 | **Embed from Rust** | Self-hosted compiler in Lua/Fennel. Could embed via mlua, or shell to `fennel --compile`. No Rust library. |
 | **Maintenance** | Very active. Moved off GitHub to SourceHut (`sr.ht/~technomancy/fennel`). 2.6k GitHub stars (mirror). Annual community surveys (2023-2025). In Debian main. |
 | **Community** | ~200 survey respondents (2025). Active IRC/Matrix chat. Used in Neovim ecosystem (Fennel plugins), LÖVE2D games, TIC-80 fantasy consoles. |
-| **Verdict** | **Wrong shape for shoot.** Lisp syntax is hostile to AI-authored package defs. No types = no validation loop value. Great for game scripting, not declarative config. |
+| **Verdict** | **Wrong shape for shuttle.** Lisp syntax is hostile to AI-authored package defs. No types = no validation loop value. Great for game scripting, not declarative config. |
 
 #### MoonScript
 
@@ -80,7 +80,7 @@ Date: 2026-08-30.
 | **Embed from Rust** | Monorepo with own runtime. Would need C FFI integration. |
 | **Maintenance** | Early stage. Small community. |
 | **Community** | Minimal. |
-| **Verdict** | **"Sovereign" = breaks Lua ecosystem compatibility.** Own runtime means no standard Lua tooling works. Wrong direction for shoot. |
+| **Verdict** | **"Sovereign" = breaks Lua ecosystem compatibility.** Own runtime means no standard Lua tooling works. Wrong direction for shuttle. |
 
 ---
 
@@ -96,7 +96,7 @@ Date: 2026-08-30.
 | **Embed from Rust** | Written in Lua/LuaJIT. Has its own LSP (for VSCode). No Rust library. |
 | **Maintenance** | **Active.** Ongoing development. TypeScript port exists (`nattlua-ts`). |
 | **Community** | Very small. Niche tooling for advanced users. |
-| **Verdict** | **Most interesting typing model in this census.** Literal types, range types, type functions are powerful. But: LuaJIT-only (not Lua 5.4/5.5), self-hosted in Lua (no Rust embed path), very small community. The type system ideas are worth stealing for shoot's validation layer, but NattLua itself doesn't fit. |
+| **Verdict** | **Most interesting typing model in this census.** Literal types, range types, type functions are powerful. But: LuaJIT-only (not Lua 5.4/5.5), self-hosted in Lua (no Rust embed path), very small community. The type system ideas are worth stealing for shuttle's validation layer, but NattLua itself doesn't fit. |
 
 #### Fuse
 
@@ -144,7 +144,7 @@ Date: 2026-08-30.
 | **Embed from Rust** | Written in Standard ML. No Rust bindings. |
 | **Maintenance** | **Active.** Presented at ML Workshop 2025. Regular releases. |
 | **Community** | ML academic community. Very niche. |
-| **Verdict** | **Wrong language entirely.** It's SML, not a Lua dialect. Interesting that it compiles to Lua, but irrelevant for shoot. |
+| **Verdict** | **Wrong language entirely.** It's SML, not a Lua dialect. Interesting that it compiles to Lua, but irrelevant for shuttle. |
 
 #### Clue (revisit — more detail)
 
@@ -172,7 +172,7 @@ Already covered above. Key fact: **only Rust-native compiler in this census** be
 
 ## 2. Rust-Native Lua Tooling Ecosystem
 
-This is the ecosystem we'd build shoot's validation/LSP layer on top of.
+This is the ecosystem we'd build shuttle's validation/LSP layer on top of.
 
 ### full-moon (Rust Lua Parser)
 

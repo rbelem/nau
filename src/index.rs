@@ -1,7 +1,7 @@
 //! Package index — a local registry of known snaps with pre-resolved pins.
 //!
 //! The index file (`package-index.json`) stores snap definitions that can be
-//! used as shorthand in `shoot.lua` via the `index()` DSL function.
+//! used as shorthand in `shuttle.lua` via the `index()` DSL function.
 //!
 //! # Index format
 //!
@@ -131,7 +131,7 @@ pub struct IndexApp {
     pub slots: Option<Vec<String>>,
 }
 
-// ── Default index (bundled with shoot) ──
+// ── Default index (bundled with shuttle) ──
 
 /// Built-in index entries for well-known snaps.
 pub fn default_entries() -> Vec<IndexEntry> {

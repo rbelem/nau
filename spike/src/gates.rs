@@ -90,7 +90,7 @@ pub fn inputs_for_inline(src: &str, name: &str) -> Result<NickelInputs> {
     })
 }
 
-/// Map Nickel's codespan JSON diagnostics to the shoot-check schema (Decision 4/8).
+/// Map Nickel's codespan JSON diagnostics to the shuttle-check schema (Decision 4/8).
 /// Extracts expected/actual heuristically from contract-blame messages; null when absent.
 pub fn to_diagnostics(nickel_json: &str, files: &nickel_lang_core::files::Files) -> Result<DiagnosticSet> {
     let wrapper: serde_json::Value = serde_json::from_str(nickel_json)?;

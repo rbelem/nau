@@ -352,7 +352,7 @@ fn get_opt_swap(table: &mlua::Table) -> miette::Result<Option<SwapConfig>> {
 
 // ── Image output ──
 
-/// Named image outputs from a `shoot.lua`.
+/// Named image outputs from a `shuttle.lua`.
 pub type ImageOutputs = HashMap<String, ImageDeclaration>;
 
 // ── Image assembly pipeline ──
@@ -604,7 +604,7 @@ pub fn build_image(
             .into_diagnostic()
             .wrap_err("creating /etc/sysctl.d")?;
         let sysctl_content = image.sysctl.join("\n") + "\n";
-        std::fs::write(sysctl_dir.join("99-shoot.conf"), &sysctl_content)
+        std::fs::write(sysctl_dir.join("99-shuttle.conf"), &sysctl_content)
             .into_diagnostic()
             .wrap_err("writing sysctl")?;
         eprintln!("  ✓ sysctl written ({} entries)", image.sysctl.len());
@@ -791,7 +791,7 @@ pub fn build_disk_image(
         let sysctl_dir = root.join("etc").join("sysctl.d");
         std::fs::create_dir_all(&sysctl_dir).into_diagnostic()?;
         let sysctl_content = image.sysctl.join("\n") + "\n";
-        std::fs::write(sysctl_dir.join("99-shoot.conf"), &sysctl_content).into_diagnostic()?;
+        std::fs::write(sysctl_dir.join("99-shuttle.conf"), &sysctl_content).into_diagnostic()?;
         eprintln!("  ✓ sysctl written ({} entries)", image.sysctl.len());
     }
 

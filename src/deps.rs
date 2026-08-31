@@ -1,8 +1,8 @@
 //! Dependency resolution — resolve requires fields into build order.
 //!
-//! Traverses `requires` fields declared in `shoot.lua` files and returns
-//! a topologically sorted build order. Used by `shoot deps` and
-//! `shoot build --order`.
+//! Traverses `requires` fields declared in `shuttle.lua` files and returns
+//! a topologically sorted build order. Used by `shuttle deps` and
+//! `shuttle build --order`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ pub struct DepNode {
 
 /// Resolve transitive dependencies for a list of seed packages.
 ///
-/// `seeds` can be package names (resolved via pkgs/) or paths to shoot.lua files.
+/// `seeds` can be package names (resolved via pkgs/) or paths to shuttle.lua files.
 /// Returns packages in topological build order (leaf dependencies first).
 pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<DepNode>> {
     let mut nodes: Vec<DepNode> = Vec::new();
@@ -245,10 +245,10 @@ mod tests {
         assert!(p.to_string_lossy().ends_with("pkgs/g/gcc.lua"));
 
         // File path -> raw path
-        let p = resolve_path("examples/full-system/system-base/shoot.lua");
+        let p = resolve_path("examples/full-system/system-base/shuttle.lua");
         assert!(p
             .to_string_lossy()
-            .ends_with("examples/full-system/system-base/shoot.lua"));
+            .ends_with("examples/full-system/system-base/shuttle.lua"));
     }
 
     #[test]

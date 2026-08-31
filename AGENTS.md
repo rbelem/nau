@@ -1,4 +1,4 @@
-# shoot — AGENTS.md
+# shuttle — AGENTS.md
 
 ## Project
 
@@ -46,9 +46,9 @@ Planning moved to grill-with-docs format. Historical files live in `.planning/ar
 <!-- GSD:project-start source:PROJECT.md -->
 ## Project
 
-**shoot**
+**shuttle**
 
-A Rust CLI tool that builds Snap packages from Lua declarations. Inspired by Nix's declarative reproducibility and Neovim's Lua-based configurability, `shoot` replaces Snapcraft's YAML with a programmable, composable Lua DSL. Single snaps first — growing toward full Ubuntu Core image assembly.
+A Rust CLI tool that builds Snap packages from Lua declarations. Inspired by Nix's declarative reproducibility and Neovim's Lua-based configurability, `shuttle` replaces Snapcraft's YAML with a programmable, composable Lua DSL. Single snaps first — growing toward full Ubuntu Core image assembly (the ShuttleOS distro).
 
 **Core Value:** Define any Snap package with a simple Lua file — no Snapcraft YAML needed. Packaged, composable, version-controllable.
 
@@ -108,7 +108,7 @@ Do not make direct repo edits outside a GSD workflow unless the user explicitly 
 
 ### Issue tracker
 
-Issues are tracked in GitHub Issues on `rbelem/shoot`. See `docs/agents/issue-tracker.md`.
+Issues are tracked in GitHub Issues on `rbelem/shuttle`. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

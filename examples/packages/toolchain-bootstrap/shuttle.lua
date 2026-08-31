@@ -1,6 +1,6 @@
 -- Toolchain Bootstrap Example
 --
--- Demonstrates the 3-stage GCC bootstrap process using the shoot
+-- Demonstrates the 3-stage GCC bootstrap process using the shuttle
 -- package index. The bootstrap builds a complete cross-compiler
 -- toolchain starting from the host system's compiler.
 --
@@ -11,13 +11,13 @@
 --
 -- Usage:
 --   # Show the build order (all 20+ deps resolved)
---   shoot build --order --file examples/packages/toolchain-bootstrap/shoot.lua
+--   shuttle build --order --file examples/packages/toolchain-bootstrap/shuttle.lua
 --
 --   # Build the full bootstrap
---   shoot build --file examples/packages/toolchain-bootstrap/shoot.lua
+--   shuttle build --file examples/packages/toolchain-bootstrap/shuttle.lua
 --
 --   # Check deps for the toolchain
---   shoot deps stage0-gcc --recursive --tree
+--   shuttle deps stage0-gcc --recursive --tree
 --
 -- After bootstrap, the output toolchain is at:
 --   ./stage0-gcc_14.2.0_amd64.snap

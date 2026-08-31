@@ -1,9 +1,9 @@
 [package]
-name = "shoot-nickel-spike"
+name = "shuttle-nickel-spike"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "ADR-0009 spike: Nickel embed feasibility for shoot package definitions"
+description = "ADR-0009 spike: Nickel embed feasibility for shuttle package definitions"
 
 [dependencies]
 # Bake-off candidates — both present; the spike picks one.

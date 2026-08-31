@@ -251,7 +251,7 @@ Dialect {
 Compile-time control over which language constructs exist. A user who
 writes `while True: pass` gets a parse error, not a runtime error.
 
-**Verdict:** Starlark wins. The `Dialect` struct is exactly what shoot needs
+**Verdict:** Starlark wins. The `Dialect` struct is exactly what shuttle needs
 to enforce "no loops, no FFI, only declarative package definitions" at parse
 time. Nickel has no equivalent.
 
@@ -275,8 +275,8 @@ time. Nickel has no equivalent.
 - Bad for: config composition patterns (every merge forces evaluation).
 
 **Verdict:** For a package-definition DSL where users write declarative
-configs that compose via merge, Nickel's laziness is natural. For shoot,
-which needs `shoot check` to validate without building, Nickel's lazy
+configs that compose via merge, Nickel's laziness is natural. For shuttle,
+which needs `shuttle check` to validate without building, Nickel's lazy
 evaluation means you can inspect config structure without triggering
 expensive build steps. Starlark's eagerness would require guard patterns.
 
@@ -298,7 +298,7 @@ expensive build steps. Starlark's eagerness would require guard patterns.
 - **proto Starlark** (various): Custom dialects for specific domains.
 
 **Verdict:** Buck2 proves Starlark can handle massive scale. Organist
-is a closer analog to shoot — it embeds Nickel for the same "declarative
+is a closer analog to shuttle — it embeds Nickel for the same "declarative
 config" use case. Both have real production embedders.
 
 ---
@@ -343,16 +343,16 @@ Dialect { enable_load: true, .. }
 - No relative import by default — must configure resolver
 - Buck2 has a sophisticated import system with cell/module/package hierarchy
 
-**Verdict:** Nickel's import system is simpler and sufficient for shoot.
+**Verdict:** Nickel's import system is simpler and sufficient for shuttle.
 The `extend_env` mechanism allows host code to inject functions/values
 that Nickel code can use without `import`. Starlark's `load()` is more
 structured but requires resolver setup.
 
 ---
 
-## 10. Killer Test: `shoot check` Validation Loop
+## 10. Killer Test: `shuttle check` Validation Loop
 
-The core use case: user writes a Lua-like package definition, shoot
+The core use case: user writes a Lua-like package definition, shuttle
 evaluates it, extracts the result, validates it, and returns machine-readable
 diagnostics.
 
@@ -375,7 +375,7 @@ struct BuildDef {
     script: String,
 }
 
-fn shoot_check(source: &str) -> Result<PackageDef, Vec<Diagnostic>> {
+fn shuttle_check(source: &str) -> Result<PackageDef, Vec<Diagnostic>> {
     let mut ctx = Context::new();
     let result = ctx.eval_deep(source);
     
@@ -398,7 +398,7 @@ fn shoot_check(source: &str) -> Result<PackageDef, Vec<Diagnostic>> {
 }
 
 // Usage
-let result = shoot_check(r#"
+let result = shuttle_check(r#"
   {
     name = "my-snap",
     version = "1.0",
@@ -423,7 +423,7 @@ use starlark::environment::{Globals, Module};
 use starlark::eval::Evaluator;
 use starlark::syntax::{Dialect, parse};
 
-fn shoot_check(source: &str) -> Result<PackageDef, Vec<Diagnostic>> {
+fn shuttle_check(source: &str) -> Result<PackageDef, Vec<Diagnostic>> {
     let dialect = Dialect {
         enable_def: true,
         enable_lambda: false,    // no lambdas in package defs
@@ -437,7 +437,7 @@ fn shoot_check(source: &str) -> Result<PackageDef, Vec<Diagnostic>> {
     let globals = Globals::standard();
     let module = Module::new();
     
-    match parse("shoot.snap", &dialect, source) {
+    match parse("shuttle.snap", &dialect, source) {
         Ok(ast) => {
             let mut eval = Evaluator::new(&module);
             match eval.eval_module(&ast, &globals) {
@@ -492,13 +492,13 @@ fn shoot_check(source: &str) -> Result<PackageDef, Vec<Diagnostic>> {
 
 **Nickel is the better choice.** Here's why:
 
-1. **Serde integration is killer.** The `to_serde()` path means shoot can
+1. **Serde integration is killer.** The `to_serde()` path means shuttle can
    define Rust structs matching the expected package schema and get validated
    conversion for free. With Starlark, you'd build a manual extraction layer
    that's error-prone and tedious to maintain.
 
 2. **Diagnostics are production-ready.** `ErrorFormat::Json` gives you
-   machine-readable errors out of the box — exactly what `shoot check` needs.
+   machine-readable errors out of the box — exactly what `shuttle check` needs.
    Starlark requires parsing error strings.
 
 3. **Laziness matches the DSL.** Package definitions are declarative configs.
@@ -507,10 +507,10 @@ fn shoot_check(source: &str) -> Result<PackageDef, Vec<Diagnostic>> {
 
 4. **The high-level `Context` API is simple.** Three calls: `new()`,
    `eval_deep()`, `to_serde()`. That's the entire embedding surface for
-   shoot's MVP.
+   shuttle's MVP.
 
 5. **The dialect gap is solvable.** Nickel lacks Starlark's `Dialect` struct,
-   but shoot can enforce restrictions via:
+   but shuttle can enforce restrictions via:
    - AST filtering post-parse (reject `while`, `for`, etc.)
    - Restricted imports (don't add dangerous paths to `import_paths`)
    - Contract-based validation (tag the result type)
@@ -528,7 +528,7 @@ Dialect {
 ```
 
 This is a feature request, not a blocker. The current workaround (AST
-filtering) is sufficient for shoot's MVP.
+filtering) is sufficient for shuttle's MVP.
 
 ### Migration Path
 

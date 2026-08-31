@@ -7,7 +7,7 @@ use crate::snap::SnapRef;
 
 /// A lockfile captures resolved hashes of all build inputs for reproducibility.
 ///
-/// On first build: creates `shoot.lock` with SHA-256 of every downloaded source
+/// On first build: creates `shuttle.lock` with SHA-256 of every downloaded source
 /// and sha3-384 of every pinned snap.
 /// On subsequent builds: lockfile entries pin inputs even if the DSL only
 /// specified names/channels.
@@ -75,7 +75,7 @@ pub struct SnapLockEntry {
 
 impl LockFile {
     /// Default lockfile filename.
-    pub const FILENAME: &'static str = "shoot.lock";
+    pub const FILENAME: &'static str = "shuttle.lock";
 
     /// Load lockfile from disk. Returns `None` if the file doesn't exist.
     pub fn load(path: &Path) -> miette::Result<Option<Self>> {
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn test_lockfile_save_and_reload() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shoot.lock");
+        let path = dir.path().join("shuttle.lock");
 
         let mut sources = HashMap::new();
         sources.insert(

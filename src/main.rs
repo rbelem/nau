@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use clap::Parser;
-use shoot::cache::PackageCache;
-use shoot::cli::{CacheCommand, Cli, Command, IndexCommand};
-use shoot::image::ImageDeclaration;
-use shoot::index::{IndexEntry, PackageIndex, StoreRef};
-use shoot::lock::{LockFile, SourceLockEntry};
-use shoot::snap::{PackageInput, SourceSpec};
+use shuttle::cache::PackageCache;
+use shuttle::cli::{CacheCommand, Cli, Command, IndexCommand};
+use shuttle::image::ImageDeclaration;
+use shuttle::index::{IndexEntry, PackageIndex, StoreRef};
+use shuttle::lock::{LockFile, SourceLockEntry};
+use shuttle::snap::{PackageInput, SourceSpec};
 
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
@@ -30,9 +30,9 @@ fn main() -> miette::Result<()> {
             offline,
             json,
         } => {
-            shoot::output::set_mode(json);
+            shuttle::output::set_mode(json);
             // If --file is default and doesn't exist, try output_name as package name
-            let file = if file == "shoot.lua" && !Path::new("shoot.lua").exists() {
+            let file = if file == "shuttle.lua" && !Path::new("shuttle.lua").exists() {
                 if let Some(ref name) = output_name {
                     resolve_file(name)
                 } else {
@@ -50,7 +50,7 @@ fn main() -> miette::Result<()> {
             };
             if order {
                 let r = cmd_order(&file, &output_name, json);
-                shoot::output::flush_json("order");
+                shuttle::output::flush_json("order");
                 return r;
             }
             let r = cmd_build(
@@ -69,7 +69,7 @@ fn main() -> miette::Result<()> {
                 offline,
                 json,
             );
-            shoot::output::flush_json("build");
+            shuttle::output::flush_json("build");
             r
         }
 
@@ -85,7 +85,7 @@ fn main() -> miette::Result<()> {
             lockfile: lockfile_path,
             json,
         } => {
-            shoot::output::set_mode(json);
+            shuttle::output::set_mode(json);
             let r = cmd_image(
                 file,
                 output,
@@ -98,7 +98,7 @@ fn main() -> miette::Result<()> {
                 lockfile_path,
                 json,
             );
-            shoot::output::flush_json("image");
+            shuttle::output::flush_json("image");
             r
         }
 
@@ -109,14 +109,14 @@ fn main() -> miette::Result<()> {
             flat,
             json,
         } => {
-            shoot::output::set_mode(json);
+            shuttle::output::set_mode(json);
             let r = cmd_deps(package, recursive, tree, flat, json);
-            shoot::output::flush_json("deps");
+            shuttle::output::flush_json("deps");
             r
         }
 
         Command::Search { query, json } => {
-            shoot::output::set_mode(json);
+            shuttle::output::set_mode(json);
             cmd_search(&query, json);
             Ok(())
         }
@@ -141,25 +141,25 @@ fn resolve_file(file: &str) -> String {
     if Path::new(file).exists() {
         return file.to_string();
     }
-    match shoot::pkg_source::resolve_pkg(file) {
-        shoot::pkg_source::PkgResult::File(path) => {
+    match shuttle::pkg_source::resolve_pkg(file) {
+        shuttle::pkg_source::PkgResult::File(path) => {
             eprintln!("  ℹ resolved '{}' to {}", file, path);
             path
         }
-        shoot::pkg_source::PkgResult::Found { path, content } => {
+        shuttle::pkg_source::PkgResult::Found { path, content } => {
             eprintln!("  ℹ using package '{}' ({})", file, path);
             // Write to temp file for evaluation (Lua needs a real file for require())
-            let tmp = std::env::temp_dir().join(format!("shoot-{}.lua", file));
+            let tmp = std::env::temp_dir().join(format!("shuttle-{}.lua", file));
             let _ = std::fs::write(&tmp, &content);
             tmp.to_string_lossy().to_string()
         }
-        shoot::pkg_source::PkgResult::NotFound => file.to_string(),
+        shuttle::pkg_source::PkgResult::NotFound => file.to_string(),
     }
 }
 
 /// Evaluate a file path or resolved package source, returning snap outputs.
-fn evaluate_file_or_embedded(file: &str) -> miette::Result<shoot::lua::Outputs> {
-    shoot::lua::evaluate_file(file)
+fn evaluate_file_or_embedded(file: &str) -> miette::Result<shuttle::lua::Outputs> {
+    shuttle::lua::evaluate_file(file)
 }
 
 // ── Build command ──
@@ -204,13 +204,13 @@ fn cmd_build(
 
     // Initialize package source inputs
     // 1. If the config file exists, extract its global inputs first
-    // 2. Otherwise fall back to the default input (github:rbelem/shoot/main)
+    // 2. Otherwise fall back to the default input (github:rbelem/shuttle/main)
     let original_file = file.clone();
     let file_exists = Path::new(&original_file).exists();
 
     if file_exists {
         // Extract global inputs from the config file and use those
-        match shoot::lua::evaluate_file_with_inputs(&original_file) {
+        match shuttle::lua::evaluate_file_with_inputs(&original_file) {
             Ok(eval) => {
                 let lockfile = prepare_inputs(
                     &eval.global_inputs,
@@ -218,7 +218,7 @@ fn cmd_build(
                     update.as_deref(),
                     offline,
                 )?;
-                shoot::pkg_source::init_global_inputs_with(
+                shuttle::pkg_source::init_global_inputs_with(
                     &eval.global_inputs,
                     &lockfile.inputs,
                     offline,
@@ -250,7 +250,7 @@ fn cmd_build(
     // No config file or it failed — use default input and resolve by name
     let default_inputs = default_input_map();
     let lockfile = prepare_inputs(&default_inputs, &lockfile_path, update.as_deref(), offline)?;
-    shoot::pkg_source::init_global_inputs_with(&default_inputs, &lockfile.inputs, offline)?;
+    shuttle::pkg_source::init_global_inputs_with(&default_inputs, &lockfile.inputs, offline)?;
     let file = resolve_file(&file);
     let all_outputs = evaluate_file_or_embedded(&file)?;
 
@@ -275,9 +275,9 @@ fn cmd_build(
 fn default_input_map() -> HashMap<String, PackageInput> {
     let mut m = HashMap::new();
     m.insert(
-        shoot::pkg_source::DEFAULT_INPUT_NAME.to_string(),
+        shuttle::pkg_source::DEFAULT_INPUT_NAME.to_string(),
         PackageInput {
-            url: shoot::pkg_source::DEFAULT_INPUT_URL.to_string(),
+            url: shuttle::pkg_source::DEFAULT_INPUT_URL.to_string(),
         },
     );
     m
@@ -308,20 +308,20 @@ fn prepare_inputs(
         } else {
             vec![name]
         };
-        let n = shoot::pkg_source::update_input_pins(inputs, &names, &mut lockfile)?;
+        let n = shuttle::pkg_source::update_input_pins(inputs, &names, &mut lockfile)?;
         changed |= n > 0;
         if n > 0 {
-            shoot::output::ok(format!("updated {n} input pin(s)"));
+            shuttle::output::ok(format!("updated {n} input pin(s)"));
         }
     } else if !offline {
         // Record-once: pin inputs missing from the lockfile (first build).
-        let n = shoot::pkg_source::ensure_input_pins(inputs, &mut lockfile)?;
+        let n = shuttle::pkg_source::ensure_input_pins(inputs, &mut lockfile)?;
         changed |= n > 0;
     }
 
     if changed {
         lockfile.save(lock_path)?;
-        shoot::output::ok(format!("lockfile updated: {lockfile_path}"));
+        shuttle::output::ok(format!("lockfile updated: {lockfile_path}"));
     }
     Ok(lockfile)
 }
@@ -329,7 +329,7 @@ fn prepare_inputs(
 /// Inner build logic after outputs are resolved.
 #[allow(clippy::too_many_arguments)]
 fn run_build(
-    all_outputs: shoot::lua::Outputs,
+    all_outputs: shuttle::lua::Outputs,
     file: String,
     stage: String,
     output: String,
@@ -359,17 +359,17 @@ fn run_build(
     let output_dir = std::path::Path::new(&output);
 
     // Initialize binary cache if --cache was specified or --all is set
-    let pkg_cache: Option<shoot::cache::PackageCache> =
+    let pkg_cache: Option<shuttle::cache::PackageCache> =
         if all || cache.is_some() || cache_max_size.is_some() {
-            let mut pc = shoot::cache::PackageCache::new(cache.map(std::path::PathBuf::from));
+            let mut pc = shuttle::cache::PackageCache::new(cache.map(std::path::PathBuf::from));
             if let Some(ref size_str) = cache_max_size {
                 if let Some(bytes) = parse_size(size_str) {
                     pc = pc.with_max_size(bytes);
                     if !json {
-                        shoot::output::info(format!("max cache size: {}", size_str));
+                        shuttle::output::info(format!("max cache size: {}", size_str));
                     }
                 } else if !json {
-                    shoot::output::warn(format!("invalid cache size: {}", size_str));
+                    shuttle::output::warn(format!("invalid cache size: {}", size_str));
                 }
             }
             Some(pc)
@@ -378,7 +378,7 @@ fn run_build(
         };
 
     // If --target is set, override on all snap meta structs
-    let iter: Vec<(&String, shoot::snap::SnapMeta)> = match &output_name {
+    let iter: Vec<(&String, shuttle::snap::SnapMeta)> = match &output_name {
         Some(name) => {
             let mut meta = all_outputs
                 .get(name)
@@ -387,13 +387,13 @@ fn run_build(
             if let Some(ref t) = target {
                 meta.target = Some(t.clone());
                 if !json {
-                    shoot::output::info(format!("target: {t}"));
+                    shuttle::output::info(format!("target: {t}"));
                 }
             }
             vec![(name, meta)]
         }
         None => {
-            let mut vec: Vec<(&String, shoot::snap::SnapMeta)> = Vec::new();
+            let mut vec: Vec<(&String, shuttle::snap::SnapMeta)> = Vec::new();
             for (name, meta_ref) in &all_outputs {
                 let mut meta = meta_ref.clone();
                 if let Some(ref t) = target {
@@ -403,7 +403,7 @@ fn run_build(
             }
             if let Some(ref t) = target {
                 if !json {
-                    shoot::output::info(format!("target: {t}"));
+                    shuttle::output::info(format!("target: {t}"));
                 }
             }
             vec
@@ -420,7 +420,7 @@ fn run_build(
 
         for (_name, meta) in &iter {
             if !meta.requires.is_empty() {
-                if let Ok(deps) = shoot::deps::resolve_dep_names(&meta.requires, true) {
+                if let Ok(deps) = shuttle::deps::resolve_dep_names(&meta.requires, true) {
                     for dep in &deps {
                         if seen.insert(dep.clone()) {
                             all_deps.push(dep.clone());
@@ -435,10 +435,10 @@ fn run_build(
                 eprintln!("── Building {} dependencies ──", all_deps.len());
             }
             for dep_name in &all_deps {
-                let mut dep_meta = match shoot::deps::load_meta(dep_name) {
+                let mut dep_meta = match shuttle::deps::load_meta(dep_name) {
                     Ok(m) => m,
                     Err(e) => {
-                        shoot::output::warn(format!("skipping dependency '{}': {}", dep_name, e));
+                        shuttle::output::warn(format!("skipping dependency '{}': {}", dep_name, e));
                         continue;
                     }
                 };
@@ -452,33 +452,36 @@ fn run_build(
                 if let Some(ref cache) = pkg_cache {
                     if let Some(_cached_path) = cache.lookup(&dep_meta, "amd64") {
                         if !json {
-                            shoot::output::ok(format!("{} (cached)", dep_name));
+                            shuttle::output::ok(format!("{} (cached)", dep_name));
                         }
                         continue;
                     }
                 }
 
-                let dep_archs = shoot::snap::resolve_archs(&dep_meta, &arch);
+                let dep_archs = shuttle::snap::resolve_archs(&dep_meta, &arch);
                 for a in &dep_archs {
                     if !json {
-                        shoot::output::status(format!("building {} ({})...", dep_name, a));
+                        shuttle::output::status(format!("building {} ({})...", dep_name, a));
                     }
                     let dep_stage = tempfile::tempdir()
                         .map_err(|e| miette::miette!("failed to create temp stage: {}", e))?;
 
-                    match shoot::snap::build_snap(&dep_meta, dep_stage.path(), output_dir, a) {
+                    match shuttle::snap::build_snap(&dep_meta, dep_stage.path(), output_dir, a) {
                         Ok(result) => {
                             if !json {
-                                shoot::output::ok(&result.snap_filename);
+                                shuttle::output::ok(&result.snap_filename);
                             }
                             if let Some(ref cache) = pkg_cache {
                                 if let Err(e) = cache.store(&dep_meta, &result, a, output_dir) {
-                                    shoot::output::warn(format!("cache store failed: {}", e));
+                                    shuttle::output::warn(format!("cache store failed: {}", e));
                                 }
                             }
                         }
                         Err(e) => {
-                            shoot::output::warn(format!("build failed for '{}': {}", dep_name, e));
+                            shuttle::output::warn(format!(
+                                "build failed for '{}': {}",
+                                dep_name, e
+                            ));
                         }
                     }
                 }
@@ -486,30 +489,30 @@ fn run_build(
         }
     }
 
-    let mut all_source_info: Vec<shoot::snap::SourceInfo> = Vec::new();
+    let mut all_source_info: Vec<shuttle::snap::SourceInfo> = Vec::new();
 
     for (name, meta) in &iter {
-        let archs = shoot::snap::resolve_archs(meta, &arch);
+        let archs = shuttle::snap::resolve_archs(meta, &arch);
         if !json {
             eprintln!("Building {} ({})...", name, meta.version);
         }
 
         for a in &archs {
             if !json {
-                shoot::output::status(format!("{}/{}:", name, a));
+                shuttle::output::status(format!("{}/{}:", name, a));
             }
 
             if let Some(SourceSpec::Unverified(ref url)) = meta.source {
                 if lockfile.lookup_source(url).is_some() {
-                    shoot::output::info(format!("using lockfile hash for {url}"));
+                    shuttle::output::info(format!("using lockfile hash for {url}"));
                 }
             }
 
-            let result = shoot::snap::build_snap(meta, stage_dir, output_dir, a)?;
+            let result = shuttle::snap::build_snap(meta, stage_dir, output_dir, a)?;
             if !json {
-                shoot::output::ok(&result.snap_filename);
+                shuttle::output::ok(&result.snap_filename);
             } else {
-                shoot::output::record_build_result(shoot::output::BuildResultJson {
+                shuttle::output::record_build_result(shuttle::output::BuildResultJson {
                     name: meta.name.clone(),
                     version: meta.version.clone(),
                     arch: a.clone(),
@@ -539,7 +542,7 @@ fn run_build(
 
     if changed {
         lockfile.save(lock_path)?;
-        shoot::output::ok(format!("lockfile updated: {}", lockfile_path));
+        shuttle::output::ok(format!("lockfile updated: {}", lockfile_path));
     }
 
     if !all_source_info.is_empty() && !json {
@@ -549,7 +552,7 @@ fn run_build(
             } else {
                 "recorded"
             };
-            shoot::output::status(format!("source {status}: {:16} {}", info.sha256, info.url));
+            shuttle::output::status(format!("source {status}: {:16} {}", info.sha256, info.url));
         }
     }
 
@@ -560,11 +563,11 @@ fn run_build(
 
 fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Result<()> {
     // Initialize global inputs (default if no config)
-    shoot::pkg_source::init_global_inputs(&HashMap::new())?;
+    shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
     let file = resolve_file(file);
     let all_outputs = evaluate_file_or_embedded(&file)?;
 
-    let iter: Vec<&shoot::snap::SnapMeta> = match output_name {
+    let iter: Vec<&shuttle::snap::SnapMeta> = match output_name {
         Some(name) => {
             let meta = all_outputs
                 .get(name)
@@ -581,14 +584,14 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
             }
             let seen: std::collections::HashSet<&str> =
                 meta.requires.iter().map(|s| s.as_str()).collect();
-            if let Ok(order) = shoot::deps::resolve_dep_names(&meta.requires, true) {
+            if let Ok(order) = shuttle::deps::resolve_dep_names(&meta.requires, true) {
                 for dep in &order {
                     let kind = if seen.contains(dep.as_str()) {
                         "direct"
                     } else {
                         "transitive"
                     };
-                    shoot::output::record_order_result(shoot::output::OrderResultJson {
+                    shuttle::output::record_order_result(shuttle::output::OrderResultJson {
                         name: dep.clone(),
                         kind: kind.to_string(),
                     });
@@ -610,7 +613,7 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
         }
 
         eprintln!("  Resolved build order (transitive):");
-        match shoot::deps::resolve_dep_names(&meta.requires, true) {
+        match shuttle::deps::resolve_dep_names(&meta.requires, true) {
             Ok(order) => {
                 let seen: std::collections::HashSet<&str> =
                     meta.requires.iter().map(|s| s.as_str()).collect();
@@ -641,9 +644,9 @@ fn cmd_deps(
     flat: bool,
     json: bool,
 ) -> miette::Result<()> {
-    shoot::pkg_source::init_global_inputs(&HashMap::new())?;
+    shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
     let names = vec![package.clone()];
-    let nodes = shoot::deps::resolve_deps(&names, recursive)?;
+    let nodes = shuttle::deps::resolve_deps(&names, recursive)?;
 
     if nodes.is_empty() {
         if json {
@@ -665,7 +668,7 @@ fn cmd_deps(
             } else {
                 "transitive"
             };
-            shoot::output::record_dep_result(shoot::output::DepResultJson {
+            shuttle::output::record_dep_result(shuttle::output::DepResultJson {
                 name: node.name.clone(),
                 requires: node.requires.clone(),
                 kind: kind.to_string(),
@@ -676,7 +679,7 @@ fn cmd_deps(
 
     if tree && recursive {
         eprintln!("Dependency tree for '{}':", package);
-        let tree_str = shoot::deps::format_tree(&names, true)?;
+        let tree_str = shuttle::deps::format_tree(&names, true)?;
         eprintln!("{}", tree_str);
     } else if flat {
         let names_only: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
@@ -719,7 +722,7 @@ fn cmd_image(
     lockfile_path: String,
     json: bool,
 ) -> miette::Result<()> {
-    shoot::pkg_source::init_global_inputs(&HashMap::new())?;
+    shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
     let file = resolve_file(&file);
 
     if let Some(ref epoch) = source_date_epoch {
@@ -735,15 +738,15 @@ fn cmd_image(
         inputs: HashMap::new(),
     });
 
-    let lua = shoot::lua::new_lua(&file)?;
+    let lua = shuttle::lua::new_lua(&file)?;
     let images = if let Some(_embedded) = file.strip_prefix("embedded://") {
         // Embedded packages are single snaps, not images — return empty
-        if !shoot::output::is_json() {
-            shoot::output::warn(format!("'{}' is a package, not an image", file));
+        if !shuttle::output::is_json() {
+            shuttle::output::warn(format!("'{}' is a package, not an image", file));
         }
         std::collections::HashMap::new()
     } else {
-        shoot::lua::evaluate_images(&lua, &file)?
+        shuttle::lua::evaluate_images(&lua, &file)?
     };
 
     let output_dir = Path::new(&output);
@@ -751,7 +754,7 @@ fn cmd_image(
     let cache_dir = cache.map_or_else(
         || {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            Path::new(&home).join(".cache/shoot/snaps")
+            Path::new(&home).join(".cache/shuttle/snaps")
         },
         |c| Path::new(&c).to_path_buf(),
     );
@@ -774,7 +777,7 @@ fn cmd_image(
         }
 
         let result = if image_decl.disk.is_some() {
-            shoot::image::build_disk_image(
+            shuttle::image::build_disk_image(
                 image_decl,
                 output_dir,
                 &cache_dir,
@@ -783,7 +786,7 @@ fn cmd_image(
                 &mut lockfile,
             )?
         } else {
-            shoot::image::build_image(
+            shuttle::image::build_image(
                 image_decl,
                 output_dir,
                 &cache_dir,
@@ -800,7 +803,7 @@ fn cmd_image(
             .to_string();
 
         if json {
-            shoot::output::record_build_result(shoot::output::BuildResultJson {
+            shuttle::output::record_build_result(shuttle::output::BuildResultJson {
                 name: name.clone(),
                 version: image_decl.version.clone(),
                 arch: arch.clone(),
@@ -808,14 +811,14 @@ fn cmd_image(
                 sha256: None,
             });
         } else {
-            shoot::output::ok(&fname);
+            shuttle::output::ok(&fname);
         }
         lock_changed = true;
     }
 
     if lock_changed {
         lockfile.save(lock_path)?;
-        shoot::output::ok(format!("lockfile updated: {}", lockfile_path));
+        shuttle::output::ok(format!("lockfile updated: {}", lockfile_path));
     }
 
     Ok(())
@@ -824,9 +827,9 @@ fn cmd_image(
 // ── Doctor command ──
 
 fn cmd_doctor() -> miette::Result<()> {
-    let checks = shoot::doctor::run_all();
-    shoot::doctor::print_report(&checks);
-    if !shoot::doctor::all_ok(&checks) {
+    let checks = shuttle::doctor::run_all();
+    shuttle::doctor::print_report(&checks);
+    if !shuttle::doctor::all_ok(&checks) {
         std::process::exit(1);
     }
     Ok(())
@@ -834,10 +837,10 @@ fn cmd_doctor() -> miette::Result<()> {
 
 // ── Lock command ──
 
-/// `shoot lock`: resolve/refresh all input pins without building.
+/// `shuttle lock`: resolve/refresh all input pins without building.
 fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
     let inputs = if Path::new(&file).exists() {
-        match shoot::lua::evaluate_file_with_inputs(&file) {
+        match shuttle::lua::evaluate_file_with_inputs(&file) {
             Ok(eval) if !eval.global_inputs.is_empty() => eval.global_inputs,
             Ok(_) => {
                 eprintln!("  no inputs declared in '{file}', using default");
@@ -861,7 +864,7 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
     });
 
     // Empty names = refresh every declared input.
-    let n = shoot::pkg_source::update_input_pins(&inputs, &[], &mut lockfile)?;
+    let n = shuttle::pkg_source::update_input_pins(&inputs, &[], &mut lockfile)?;
 
     for (name, entry) in &lockfile.inputs {
         if entry.local {
@@ -872,7 +875,7 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
     }
 
     lockfile.save(lock_path)?;
-    shoot::output::ok(format!("{n} input(s) locked -> {lockfile_path}"));
+    shuttle::output::ok(format!("{n} input(s) locked -> {lockfile_path}"));
     Ok(())
 }
 
@@ -917,7 +920,7 @@ fn cmd_cache(sub: CacheCommand) -> miette::Result<()> {
                 return Ok(());
             }
             cache.clear()?;
-            shoot::output::ok("cache cleared");
+            shuttle::output::ok("cache cleared");
         }
         CacheCommand::Prune { days, cache, force } => {
             let cache = PackageCache::new(cache.map(std::path::PathBuf::from));
@@ -931,7 +934,7 @@ fn cmd_cache(sub: CacheCommand) -> miette::Result<()> {
             }
             let removed = cache.prune(days)?;
             if removed > 0 {
-                shoot::output::ok(format!(
+                shuttle::output::ok(format!(
                     "pruned {} cache entr{}",
                     removed,
                     if removed == 1 { "y" } else { "ies" }
@@ -1009,9 +1012,9 @@ fn fuzzy_score(query: &str, target: &str) -> u32 {
 
 fn cmd_search(query: &str, json: bool) {
     // Ensure global inputs are initialized for iter_packages
-    let _ = shoot::pkg_source::init_global_inputs(&HashMap::new());
+    let _ = shuttle::pkg_source::init_global_inputs(&HashMap::new());
 
-    let candidates = shoot::pkg_source::iter_packages();
+    let candidates = shuttle::pkg_source::iter_packages();
     let mut scored: Vec<(u32, String)> = Vec::new();
 
     // Score all candidates
@@ -1064,7 +1067,7 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
     match sub {
         IndexCommand::Update { file } => {
             let inputs = if Path::new(&file).exists() {
-                match shoot::lua::evaluate_file_with_inputs(&file) {
+                match shuttle::lua::evaluate_file_with_inputs(&file) {
                     Ok(eval) => eval.global_inputs,
                     Err(_) => {
                         eprintln!("  could not read inputs from '{file}', using default");
@@ -1077,10 +1080,10 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
 
             if inputs.is_empty() {
                 let default = PackageInput {
-                    url: "github:rbelem/shoot/main".into(),
+                    url: "github:rbelem/shuttle/main".into(),
                 };
                 eprintln!("  Updating default package index...");
-                if let Err(e) = shoot::pkg_source::refresh_input(&default) {
+                if let Err(e) = shuttle::pkg_source::refresh_input(&default) {
                     eprintln!("  ✗ failed: {e}");
                 } else {
                     eprintln!("  ✓ default package index updated");
@@ -1088,7 +1091,7 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
             } else {
                 for (name, input) in &inputs {
                     eprintln!("  Updating input '{name}'...");
-                    match shoot::pkg_source::refresh_input(input) {
+                    match shuttle::pkg_source::refresh_input(input) {
                         Ok(_) => eprintln!("  ✓ '{name}' updated"),
                         Err(e) => eprintln!("  ✗ '{name}' failed: {e}"),
                     }
@@ -1156,7 +1159,7 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
 
             idx.upsert(entry);
             idx.save(path)?;
-            shoot::output::ok(format!("added '{}' to index", name));
+            shuttle::output::ok(format!("added '{}' to index", name));
         }
 
         IndexCommand::Resolve { index, channel } => {
@@ -1171,7 +1174,7 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
             eprintln!("Resolving snap pins from store (channel: {channel})...");
             idx.resolve_all(&channel)?;
             idx.save(path)?;
-            shoot::output::ok(format!("index updated: {}", index));
+            shuttle::output::ok(format!("index updated: {}", index));
         }
     }
 

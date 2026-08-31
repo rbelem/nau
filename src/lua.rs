@@ -6,7 +6,7 @@ use mlua::Value;
 use crate::image::ImageDeclaration;
 use crate::snap::{PackageInput, SnapMeta};
 
-/// Named outputs from a `shoot.lua`, fully converted to owned Rust types.
+/// Named outputs from a `shuttle.lua`, fully converted to owned Rust types.
 pub type Outputs = HashMap<String, SnapMeta>;
 
 /// Create a Lua instance with DSL globals injected and package.path configured.
@@ -16,7 +16,7 @@ pub fn new_lua(path: &str) -> miette::Result<mlua::Lua> {
     // Inject DSL globals before evaluating the user's config
     lua.load(crate::dsl::INIT_LUA)
         .exec()
-        .map_err(|e| miette::miette!("failed to initialize shoot DSL: {}", e))?;
+        .map_err(|e| miette::miette!("failed to initialize shuttle DSL: {}", e))?;
 
     // Configure package.path so require() can find sibling .lua files
     if let Some(parent) = std::path::Path::new(path).parent() {
@@ -89,7 +89,7 @@ pub fn evaluate_string(label: &str, source: &str) -> miette::Result<Outputs> {
 /// Evaluate a Lua file and return the converted snap outputs.
 ///
 /// The file must return a Lua table of snap declarations.
-/// The shoot DSL globals (`snap()`, `app()`) are injected before evaluation.
+/// The shuttle DSL globals (`snap()`, `app()`) are injected before evaluation.
 /// All Lua data is converted to owned `SnapMeta` structs before returning
 /// (the mlua state is dropped within this function).
 pub fn evaluate_file(path: &str) -> miette::Result<Outputs> {
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_file_requires_table() {
-        let path = "/tmp/test_shoot_non_table.lua";
+        let path = "/tmp/test_shuttle_non_table.lua";
         std::fs::write(path, "return 42").unwrap();
         let result = evaluate_file(path);
         assert!(result.is_err());
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn test_hello_example_roundtrip() {
-        // Match the examples/hello/shoot.lua structure
+        // Match the examples/hello/shuttle.lua structure
         let result = eval_with_dsl(
             r#"
             return {
@@ -802,7 +802,7 @@ mod tests {
         assert_eq!(meta.name, "my-composed-app");
         assert_eq!(meta.version, "1.0.0");
         // From the base template via merge
-        assert_eq!(meta.summary.as_deref(), Some("A snap built with shoot"));
+        assert_eq!(meta.summary.as_deref(), Some("A snap built with shuttle"));
         assert_eq!(meta.grade, "stable");
         assert_eq!(meta.confinement, "strict");
     }
