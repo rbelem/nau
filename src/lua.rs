@@ -61,40 +61,177 @@ pub struct EvalOutput {
     pub global_inputs: HashMap<String, PackageInput>,
 }
 
-/// Evaluate Lua source and return both outputs and global inputs.
-///
-/// Runs through the bounded subprocess worker (see [`evaluate_string`]).
-pub fn evaluate_string_with_inputs(label: &str, source: &str) -> miette::Result<EvalOutput> {
-    let ok = run_worker_for(label, source)?;
-    for diag in &ok.diagnostics {
-        crate::output::warn(diag);
+/// One validation/eval diagnostic with structured fields (ADR-0010 Decisions
+/// 2-3). Line-level spans land later with the Luau analyzer; `label`
+/// (definition path) plus `key` (output name) locate the problem for now.
+#[derive(Debug, Clone)]
+pub struct CheckDiagnostic {
+    /// Definition the diagnostic belongs to (eval label / file path).
+    pub label: String,
+    /// Output key, when the diagnostic is about one output.
+    pub key: Option<String>,
+    /// What the schema expected, when the message states it.
+    pub expected: Option<String>,
+    /// What the definition actually had, when the message states it.
+    pub actual: Option<String>,
+    /// The full diagnostic message.
+    pub message: String,
+}
+
+/// Everything one checked eval produced: the outputs that survived
+/// validation, every warn-and-continue diagnostic, and the hard eval error
+/// when the eval itself failed (ADR-0010 Decision 3 — no silent drops).
+#[derive(Debug, Clone)]
+pub struct CheckedEval {
+    pub outputs: Outputs,
+    pub global_inputs: HashMap<String, PackageInput>,
+    pub diagnostics: Vec<CheckDiagnostic>,
+    /// Set when the eval failed hard; `outputs`/`global_inputs` are then empty.
+    pub error: Option<String>,
+}
+
+/// Lift the output key out of a child diagnostic like
+/// `skipping output 'KEY' from LABEL: ...` so JSON consumers can locate it.
+fn child_diag_key(diag: &str) -> Option<String> {
+    let rest = diag.strip_prefix("skipping output '")?;
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+/// Pull expected/actual out of a validation message like
+/// `'architectures[1]' must be a string, got integer`. Conservative:
+/// unmatched messages yield `(None, None)` and `message` stays authoritative.
+fn parse_expected_actual(message: &str) -> (Option<String>, Option<String>) {
+    const NEEDLE: &str = "must be a ";
+    const GOT: &str = ", got ";
+    let Some(i) = message.find(NEEDLE) else {
+        return (None, None);
+    };
+    let rest = &message[i + NEEDLE.len()..];
+    match rest.find(GOT) {
+        Some(j) => (
+            Some(rest[..j].to_string()),
+            Some(rest[j + GOT.len()..].to_string()),
+        ),
+        None => (None, None),
+    }
+}
+
+/// Evaluate Lua source for `shuttle check`: the exact same bounded
+/// subprocess path and Rust-side validation as
+/// [`evaluate_string_with_inputs`], but every warn-and-continue diagnostic
+/// comes back as data instead of being printed, and hard eval failures are
+/// reported in-band (ADR-0010 Decisions 2-3).
+pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
+    fn failed(diagnostics: Vec<CheckDiagnostic>, error: String) -> CheckedEval {
+        CheckedEval {
+            outputs: Outputs::new(),
+            global_inputs: HashMap::new(),
+            diagnostics,
+            error: Some(error),
+        }
+    }
+
+    let mut diagnostics: Vec<CheckDiagnostic> = Vec::new();
+    let ok = match run_worker_for(label, source) {
+        Ok(ok) => ok,
+        Err(e) => return failed(diagnostics, format!("{e:#}")),
+    };
+    for d in &ok.diagnostics {
+        diagnostics.push(CheckDiagnostic {
+            label: label.to_string(),
+            key: child_diag_key(d),
+            expected: None,
+            actual: None,
+            message: d.clone(),
+        });
     }
 
     let lua = mlua::Lua::new();
     let mut outputs = Outputs::new();
     for (key, json) in &ok.outputs {
-        let value = json_to_lua(&lua, json)
-            .map_err(|e| miette::miette!("{label}: output '{key}' conversion failed: {e}"))?;
+        let value = match json_to_lua(&lua, json) {
+            Ok(v) => v,
+            Err(e) => {
+                return failed(
+                    diagnostics,
+                    format!("{label}: output '{key}' conversion failed: {e}"),
+                )
+            }
+        };
         match SnapMeta::from_lua_value(&value) {
             Ok(meta) => {
                 outputs.insert(key.clone(), meta);
             }
-            Err(e) => crate::output::warn(format!("skipping output '{key}' from {label}: {e}")),
+            Err(e) => {
+                let (expected, actual) = parse_expected_actual(&e.to_string());
+                diagnostics.push(CheckDiagnostic {
+                    label: label.to_string(),
+                    key: Some(key.clone()),
+                    expected,
+                    actual,
+                    message: format!("skipping output '{key}' from {label}: {e}"),
+                });
+            }
         }
     }
 
     // Rehydrate the global `inputs` table in the scratch VM so the existing
     // extraction (and its error messages) applies unchanged.
-    let inputs_value = json_to_lua(&lua, &ok.global_inputs)
-        .map_err(|e| miette::miette!("{label}: inputs conversion failed: {e}"))?;
-    lua.globals()
-        .set("inputs", inputs_value)
-        .map_err(|e| miette::miette!("failed to set inputs global: {e}"))?;
-    let global_inputs = extract_inputs_from_lua(&lua)?;
+    let inputs_value = match json_to_lua(&lua, &ok.global_inputs) {
+        Ok(v) => v,
+        Err(e) => {
+            return failed(
+                diagnostics,
+                format!("{label}: inputs conversion failed: {e}"),
+            )
+        }
+    };
+    if let Err(e) = lua.globals().set("inputs", inputs_value) {
+        return failed(diagnostics, format!("failed to set inputs global: {e}"));
+    }
+    let global_inputs = match extract_inputs_from_lua(&lua) {
+        Ok(i) => i,
+        Err(e) => return failed(diagnostics, format!("{e:#}")),
+    };
 
-    Ok(EvalOutput {
+    CheckedEval {
         outputs,
         global_inputs,
+        diagnostics,
+        error: None,
+    }
+}
+
+/// [`check_string_with_inputs`] for a file path; an unreadable file comes
+/// back as a hard-error [`CheckedEval`] so `shuttle check` reports it
+/// uniformly in both output modes.
+pub fn check_file_with_inputs(path: &str) -> CheckedEval {
+    match std::fs::read_to_string(path) {
+        Ok(source) => check_string_with_inputs(path, &source),
+        Err(e) => CheckedEval {
+            outputs: Outputs::new(),
+            global_inputs: HashMap::new(),
+            diagnostics: Vec::new(),
+            error: Some(format!("could not read {path}: {e}")),
+        },
+    }
+}
+
+/// Evaluate Lua source and return both outputs and global inputs.
+///
+/// Runs through the bounded subprocess worker (see [`evaluate_string`]).
+pub fn evaluate_string_with_inputs(label: &str, source: &str) -> miette::Result<EvalOutput> {
+    let checked = check_string_with_inputs(label, source);
+    for diag in &checked.diagnostics {
+        crate::output::warn(&diag.message);
+    }
+    if let Some(err) = checked.error {
+        return Err(miette::miette!("{err}"));
+    }
+    Ok(EvalOutput {
+        outputs: checked.outputs,
+        global_inputs: checked.global_inputs,
     })
 }
 
@@ -757,5 +894,34 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(val, mlua::Value::Integer(1));
+    }
+
+    // ── Check diagnostics (ADR-0010 Decisions 2-3) ──
+
+    #[test]
+    fn test_parse_expected_actual_from_type_message() {
+        let (expected, actual) =
+            super::parse_expected_actual("'architectures[1]' must be a string, got integer");
+        assert_eq!(expected.as_deref(), Some("string"));
+        assert_eq!(actual.as_deref(), Some("integer"));
+    }
+
+    #[test]
+    fn test_parse_expected_actual_leaves_plain_messages_unset() {
+        let (expected, actual) = super::parse_expected_actual("missing required field 'name'");
+        assert_eq!(expected, None);
+        assert_eq!(actual, None);
+    }
+
+    #[test]
+    fn test_child_diag_key_lifts_output_name() {
+        assert_eq!(
+            super::child_diag_key("skipping output 'bad' from x.lua: unsupported value type"),
+            Some("bad".to_string())
+        );
+        assert_eq!(
+            super::child_diag_key("skipping output from x.lua: iteration error"),
+            None
+        );
     }
 }

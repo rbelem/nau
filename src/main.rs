@@ -125,6 +125,11 @@ fn main() -> miette::Result<()> {
 
         Command::Doctor => cmd_doctor(),
 
+        Command::Check { file, json } => {
+            shuttle::output::set_mode(json);
+            cmd_check(&file, json)
+        }
+
         Command::Lock { file, lockfile } => cmd_lock(file, lockfile),
 
         Command::Completion { shell } => cmd_completion(shell),
@@ -210,6 +215,13 @@ fn cmd_build(
     let original_file = file.clone();
     let file_exists = Path::new(&original_file).exists();
 
+    // Strategy 1: eval the config file directly (uses its declared inputs).
+    // If it fails we keep the error: the fallback below may re-evaluate the
+    // same source (resolve_file returns the same existing path), and when
+    // that second attempt also fails, the real diagnostic is the first one —
+    // discarding it turned a hostile busy-loop file into a silent 2×5s eval
+    // that reported only the fallback's error.
+    let mut direct_eval_error: Option<String> = None;
     if file_exists {
         // Extract global inputs from the config file and use those
         match shuttle::lua::evaluate_file_with_inputs(&original_file) {
@@ -243,8 +255,8 @@ fn cmd_build(
                     json,
                 );
             }
-            Err(_) => {
-                // Fall through to the normal path
+            Err(e) => {
+                direct_eval_error = Some(format!("{e:#}"));
             }
         }
     }
@@ -254,7 +266,14 @@ fn cmd_build(
     let lockfile = prepare_inputs(&default_inputs, &lockfile_path, update.as_deref(), offline)?;
     shuttle::pkg_source::init_global_inputs_with(&default_inputs, &lockfile.inputs, offline)?;
     let file = resolve_file(&file);
-    let all_outputs = evaluate_file_or_embedded(&file)?;
+    let all_outputs = evaluate_file_or_embedded(&file).map_err(|e| match &direct_eval_error {
+        Some(first) => miette::miette!(
+            "evaluating '{}' failed: {first}; fallback resolution of '{}' also failed: {e:#}",
+            original_file,
+            file
+        ),
+        None => e,
+    })?;
 
     run_build(
         all_outputs,
@@ -831,6 +850,77 @@ fn cmd_doctor() -> miette::Result<()> {
     let checks = shuttle::doctor::run_all();
     shuttle::doctor::print_report(&checks);
     if !shuttle::doctor::all_ok(&checks) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+// ── Check command ──
+
+/// `shuttle check`: run one definition through the bounded subprocess eval
+/// and Rust-side schema validation (ADR-0010 Decisions 2-3) and report
+/// every diagnostic. Deterministic, no build, no store access — the AI
+/// feedback-loop entry point. Exits 1 when the definition has any problem.
+fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
+    let checked = shuttle::lua::check_file_with_inputs(file);
+
+    // A hard eval failure is a diagnostic too, so both output modes carry
+    // the complete problem list in one shape.
+    let mut diagnostics = checked.diagnostics.clone();
+    if let Some(err) = &checked.error {
+        diagnostics.push(shuttle::lua::CheckDiagnostic {
+            label: file.to_string(),
+            key: None,
+            expected: None,
+            actual: None,
+            message: err.clone(),
+        });
+    }
+    let ok = checked.error.is_none() && diagnostics.is_empty();
+
+    if json {
+        let mut names: Vec<String> = checked.outputs.keys().cloned().collect();
+        names.sort();
+        let diags: Vec<serde_json::Value> = diagnostics
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "label": d.label,
+                    "key": d.key,
+                    "expected": d.expected,
+                    "actual": d.actual,
+                    "message": d.message,
+                })
+            })
+            .collect();
+        let report = serde_json::json!({
+            "file": file,
+            "ok": ok,
+            "outputs": names,
+            "diagnostics": diags,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else if ok {
+        let names: Vec<String> = checked.outputs.keys().cloned().collect();
+        let list = if names.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", names.join(", "))
+        };
+        shuttle::output::ok(format!("ok: {} output(s){list}", names.len()));
+    } else {
+        for d in &diagnostics {
+            match &d.key {
+                Some(key) => shuttle::output::err(format!("{}[{key}]: {}", d.label, d.message)),
+                None => shuttle::output::err(&d.message),
+            }
+        }
+    }
+
+    if !ok {
         std::process::exit(1);
     }
     Ok(())

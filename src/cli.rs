@@ -174,6 +174,18 @@ pub enum Command {
     /// Check system readiness (required tools)
     Doctor,
 
+    /// Validate a Lua definition without building: bounded subprocess eval
+    /// plus Rust-side schema checks, printing every diagnostic (ADR-0010
+    /// Decisions 2-3). The fast AI feedback-loop entry point.
+    Check {
+        /// Path to the Lua definition file
+        file: String,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Resolve and refresh all input pins in the lockfile (no build).
     /// Pins each github input to its current branch head and records a
     /// content hash; `path:` inputs are marked local (unlocked).
@@ -634,6 +646,20 @@ mod tests {
                 assert_eq!(target.as_deref(), Some("aarch64-linux-gnu"));
             }
             _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn test_check_with_json_flag() {
+        match Cli::try_parse_from(["shuttle", "check", "cfg.lua", "--json"])
+            .unwrap()
+            .command
+        {
+            Command::Check { file, json } => {
+                assert_eq!(file, "cfg.lua");
+                assert!(json);
+            }
+            _ => panic!("expected Check"),
         }
     }
 

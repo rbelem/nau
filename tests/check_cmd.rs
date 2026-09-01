@@ -1,0 +1,204 @@
+//! `shuttle check` integration tests (ADR-0010 Decisions 2-3).
+//!
+//! Drives the real binary over the real subprocess-eval path: success
+//! reporting, failing definitions (exit code + diagnostics), and the
+//! `--json` report shape that the AI feedback loop consumes.
+
+use std::process::Command;
+
+fn run_check(dir: &std::path::Path, json: bool) -> (Option<i32>, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    cmd.arg("check").arg("shuttle.lua").current_dir(dir);
+    if json {
+        cmd.arg("--json");
+    }
+    let out = cmd.output().expect("failed to spawn shuttle check");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn write_def(dir: &std::path::Path, source: &str) {
+    std::fs::write(dir.join("shuttle.lua"), source).unwrap();
+}
+
+const GOOD_DEF: &str = r#"
+return {
+    default = snap {
+        name = "checked-snap",
+        version = "1.2.3",
+    },
+}
+"#;
+
+// ── Success ──
+
+#[test]
+fn check_success_exits_zero_and_lists_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    write_def(dir.path(), GOOD_DEF);
+    let (code, stdout, stderr) = run_check(dir.path(), false);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("ok: 1 output(s)") && stderr.contains("default"),
+        "must report the output count and name, got: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "human mode writes to stderr only: {stdout}"
+    );
+}
+
+#[test]
+fn check_success_multi_output_lists_every_name() {
+    let dir = tempfile::tempdir().unwrap();
+    write_def(
+        dir.path(),
+        r#"
+return {
+    zeta = snap { name = "z", version = "1" },
+    alpha = snap { name = "a", version = "1" },
+}
+"#,
+    );
+    let (code, _, stderr) = run_check(dir.path(), false);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("ok: 2 output(s)") && stderr.contains("zeta") && stderr.contains("alpha"),
+        "got: {stderr}"
+    );
+}
+
+// ── Failing definitions (human mode) ──
+
+#[test]
+fn check_schema_skip_exits_one_with_diagnostics() {
+    // Eval succeeds but the Rust-side validation rejects one output:
+    // warn-and-continue must surface as a diagnostic + exit 1, and the
+    // valid output must still be reported.
+    let dir = tempfile::tempdir().unwrap();
+    write_def(
+        dir.path(),
+        r#"
+return {
+    good = snap { name = "fine", version = "1.0" },
+    bad = "not-a-snap-table",
+}
+"#,
+    );
+    let (code, _, stderr) = run_check(dir.path(), false);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("bad") && stderr.contains("expected a table from snap(), got string"),
+        "diagnostic must name the output and the problem, got: {stderr}"
+    );
+}
+
+#[test]
+fn check_hard_eval_failure_exits_one() {
+    // snap() validates eagerly at eval time: name = 42 fails inside the
+    // bounded subprocess and the error must come back as a diagnostic.
+    let dir = tempfile::tempdir().unwrap();
+    write_def(
+        dir.path(),
+        r#"return { default = snap { name = 42, version = "1.0" } }"#,
+    );
+    let (code, _, stderr) = run_check(dir.path(), false);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("field 'name' must be a string"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+fn check_syntax_error_exits_one() {
+    let dir = tempfile::tempdir().unwrap();
+    write_def(dir.path(), "return { default = ");
+    let (code, _, stderr) = run_check(dir.path(), false);
+    assert_eq!(code, Some(1));
+    assert!(!stderr.trim().is_empty(), "a diagnostic must be printed");
+}
+
+#[test]
+fn check_missing_file_exits_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run_check(dir.path(), false);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("could not read shuttle.lua"),
+        "got: {stderr}"
+    );
+}
+
+// ── JSON mode ──
+
+#[test]
+fn check_json_success_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    write_def(dir.path(), GOOD_DEF);
+    let (code, stdout, _) = run_check(dir.path(), true);
+    assert_eq!(code, Some(0));
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON on stdout");
+    assert_eq!(v["file"], "shuttle.lua");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["outputs"], serde_json::json!(["default"]));
+    assert_eq!(v["diagnostics"], serde_json::json!([]));
+}
+
+#[test]
+fn check_json_failure_shape_has_structured_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    write_def(
+        dir.path(),
+        r#"
+return {
+    good = snap { name = "fine", version = "1.0" },
+    bad = "not-a-snap-table",
+}
+"#,
+    );
+    let (code, stdout, _) = run_check(dir.path(), true);
+    assert_eq!(code, Some(1));
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON on stdout");
+    assert_eq!(v["file"], "shuttle.lua");
+    assert_eq!(v["ok"], false);
+    // The output that passed validation is still listed.
+    assert_eq!(v["outputs"], serde_json::json!(["good"]));
+
+    let diags = v["diagnostics"].as_array().expect("diagnostics array");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0]["label"], "shuttle.lua");
+    assert_eq!(diags[0]["key"], "bad");
+    assert_eq!(diags[0]["expected"], serde_json::Value::Null);
+    assert_eq!(diags[0]["actual"], serde_json::Value::Null);
+    let msg = diags[0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("expected a table from snap(), got string"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn check_json_hard_error_carries_diagnostic_with_null_key() {
+    let dir = tempfile::tempdir().unwrap();
+    write_def(dir.path(), "return 42");
+    let (code, stdout, _) = run_check(dir.path(), true);
+    assert_eq!(code, Some(1));
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON on stdout");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["outputs"], serde_json::json!([]));
+    let diags = v["diagnostics"].as_array().unwrap();
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0]["key"], serde_json::Value::Null);
+    assert!(
+        diags[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must return a table of outputs, got integer"),
+        "got: {}",
+        diags[0]["message"]
+    );
+}
