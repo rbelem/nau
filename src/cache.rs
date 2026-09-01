@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::Digest;
 
-use crate::snap::{BuildResult, SnapMeta};
+use crate::snap::{BuildResult, SnapMeta, SnapPart};
 
 /// Cache statistics.
 #[derive(Debug, Clone)]
@@ -44,6 +44,19 @@ const DEFAULT_CACHE_SUBDIR: &str = "pkgs";
 
 /// Magic string for packages without source (meta/store types).
 const NO_SOURCE_HASH: &str = "none";
+
+/// Canonical JSON for a parts spec, used in cache keys: parts sorted by
+/// name (BTreeMap order), each with its command and `after` edges. Any
+/// change to names, commands, or edges changes the key.
+fn canonical_parts_json(parts: &std::collections::BTreeMap<String, SnapPart>) -> String {
+    let items: Vec<serde_json::Value> = parts
+        .iter()
+        .map(|(name, part)| {
+            serde_json::json!({ "name": name, "build": part.build, "after": part.after })
+        })
+        .collect();
+    serde_json::to_string(&items).unwrap_or_else(|_| "unserializable".to_string())
+}
 
 /// Binary package cache for built snaps.
 #[derive(Debug, Clone)]
@@ -88,6 +101,10 @@ impl PackageCache {
     ///
     /// For source packages, this is the SHA-256 of the source URL + version
     /// (since we haven't downloaded the source yet at check time).
+    /// Multi-part builds fold the full parts spec (names + commands + after
+    /// edges) into the key as canonical JSON, so any spec change invalidates
+    /// cached artifacts. Single-part keys are unchanged — warm caches built
+    /// from the implicit-part form (`build = "..."`) stay valid.
     /// For meta/store packages, returns `"none"`.
     fn source_key(meta: &SnapMeta) -> String {
         match meta.type_ {
@@ -98,7 +115,11 @@ impl PackageCache {
                     .as_ref()
                     .map(|s| s.url().to_string())
                     .unwrap_or_default();
-                let input = format!("{}:{}:{}", meta.name, meta.version, url);
+                let mut input = format!("{}:{}:{}", meta.name, meta.version, url);
+                if let Some(parts) = &meta.parts {
+                    input.push(':');
+                    input.push_str(&canonical_parts_json(parts));
+                }
                 let hash = sha2::Sha256::digest(input.as_bytes());
                 hash.iter()
                     .map(|b| format!("{:02x}", b))
@@ -314,6 +335,7 @@ mod tests {
             license: None,
             source: Some(crate::snap::SourceSpec::Unverified(url.into())),
             build: Some("make".into()),
+            parts: None,
             architectures: Some(vec!["amd64".into()]),
             grade: "stable".into(),
             confinement: "strict".into(),
@@ -345,6 +367,7 @@ mod tests {
             license: None,
             source: None,
             build: None,
+            parts: None,
             architectures: Some(vec!["amd64".into()]),
             grade: "stable".into(),
             confinement: "strict".into(),
@@ -404,6 +427,72 @@ mod tests {
         let key1 = PackageCache::source_key(&meta);
         let key2 = PackageCache::source_key(&meta);
         assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_source_key_single_part_unchanged_by_parts_support() {
+        // Back-compat contract: a meta without `parts` must key exactly as
+        // before multi-part support existed (name:version:url, no suffix).
+        let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        let expected_input = "hello:1.0:https://example.com/hello.tar.gz";
+        let expected: String = sha2::Sha256::digest(expected_input.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(PackageCache::source_key(&meta), expected);
+    }
+
+    #[test]
+    fn test_source_key_varies_with_parts_spec() {
+        let mut meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        meta.build = None;
+        meta.parts = Some(
+            [(
+                "core",
+                SnapPart {
+                    build: "make".into(),
+                    after: vec![],
+                },
+            )]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        );
+        let with_parts = PackageCache::source_key(&meta);
+
+        // Different command → different key
+        let mut meta2 = meta.clone();
+        if let Some(parts) = &mut meta2.parts {
+            parts.get_mut("core").unwrap().build = "make all".into();
+        }
+        assert_ne!(with_parts, PackageCache::source_key(&meta2));
+
+        // New part name → different key
+        let mut meta3 = meta.clone();
+        if let Some(parts) = &mut meta3.parts {
+            parts.insert(
+                "ui".into(),
+                SnapPart {
+                    build: "npm build".into(),
+                    after: vec![],
+                },
+            );
+        }
+        assert_ne!(with_parts, PackageCache::source_key(&meta3));
+
+        // Added `after` edge → different key
+        let mut meta4 = meta.clone();
+        if let Some(parts) = &mut meta4.parts {
+            parts.get_mut("core").unwrap().after = vec!["ui".into()];
+        }
+        assert_ne!(with_parts, PackageCache::source_key(&meta4));
+
+        // Same spec → same key
+        let mut meta5 = meta.clone();
+        if let Some(parts) = &mut meta5.parts {
+            parts.get_mut("core").unwrap().after = vec![];
+        }
+        assert_eq!(with_parts, PackageCache::source_key(&meta5));
     }
 
     #[test]

@@ -349,6 +349,7 @@ impl PackageIndex {
                 })
                 .or_else(|| Some(SourceSpec::Unverified(source.url.clone()))),
             build: entry.build.clone(),
+            parts: None,
             architectures: None,
             grade: "stable".into(),
             confinement: "strict".into(),

@@ -142,6 +142,13 @@ pub struct SnapMeta {
     #[serde(skip)]
     pub build: Option<String>,
 
+    /// Multi-part build: part name → build spec. Parts run sequentially in
+    /// `after`-dependency order into a shared `$STAGE`. Mutually exclusive
+    /// with `build` (enforced in the DSL, re-checked at build time).
+    /// Skipped in YAML — build-time only.
+    #[serde(default, skip)]
+    pub parts: Option<BTreeMap<String, SnapPart>>,
+
     #[serde(default = "default_grade")]
     pub grade: String,
 
@@ -350,6 +357,18 @@ pub struct SnapHook {
     pub source: String,
 }
 
+/// One part of a multi-part build: a shell command plus optional `after`
+/// dependencies (names of parts that must complete first).
+///
+/// Per-part sources/inputs are future work — today every part shares the
+/// snap's single source and identical sandbox env/inputs; only the command
+/// and the ordering edges are per-part.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapPart {
+    pub build: String,
+    pub after: Vec<String>,
+}
+
 // ── Conversion from Lua (Phase 3) ──
 //
 // Per ADR-0002: Lua validates at eval time so Rust is a passive consumer.
@@ -392,6 +411,7 @@ impl SnapMeta {
         let confinement = get_opt_string(table, "confinement")?.unwrap_or_else(default_confinement);
         let architectures = get_opt_string_array(table, "architectures")?;
         let build = get_opt_string(table, "build")?;
+        let parts = get_opt_parts(table)?;
         let type_: Option<String> = table.get("type").ok();
         let icon_source = get_opt_string(table, "icon")?;
         let icon = icon_target_from_source(icon_source.as_deref())?;
@@ -438,6 +458,7 @@ impl SnapMeta {
             license,
             source,
             build,
+            parts,
             architectures,
             grade,
             confinement,
@@ -801,6 +822,48 @@ fn get_opt_hooks(table: &mlua::Table) -> miette::Result<Option<BTreeMap<String, 
     Ok(Some(hooks))
 }
 
+/// Extract `parts`: part name → { build, after? }. The Lua layer validates
+/// the schema (non-empty, string commands, known/acyclic `after`); this is
+/// the passive conversion boundary.
+fn get_opt_parts(table: &mlua::Table) -> miette::Result<Option<BTreeMap<String, SnapPart>>> {
+    let Some(t) = get_opt_table(table, "parts")? else {
+        return Ok(None);
+    };
+    let mut parts = BTreeMap::new();
+    for pair in t.pairs::<String, Value>() {
+        let (name, value) = pair.map_err(|e| miette::miette!("parts entry: {e}"))?;
+        match value {
+            Value::Table(pt) => {
+                let build = pt.get::<String>("build").map_err(|_| {
+                    miette::miette!("parts['{name}']: 'build' must be a string command")
+                })?;
+                let mut after = Vec::new();
+                if let Value::Table(at) = pt.get::<Value>("after").unwrap_or(Value::Nil) {
+                    for dep in at.pairs::<usize, Value>() {
+                        let (_, v) =
+                            dep.map_err(|e| miette::miette!("parts['{name}'].after: {e}"))?;
+                        if let Value::String(s) = v {
+                            after.push(
+                                s.to_str()
+                                    .map_err(|e| miette::miette!("{}", e))?
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                parts.insert(name, SnapPart { build, after });
+            }
+            other => {
+                return Err(miette::miette!(
+                    "parts['{name}'] must be a table, got {}",
+                    other.type_name()
+                ));
+            }
+        }
+    }
+    Ok(Some(parts))
+}
+
 /// Extract a snap-level `plugs`/`slots` map: name → bare interface string
 /// (back-compat) or attribute table. Two string-array back-compat forms are
 /// accepted: map form (`plugs = { network = "network" }`) and array form
@@ -997,19 +1060,40 @@ pub fn build_snap(
     })
 }
 
-/// Run the build phase: download source, extract, and execute build command.
+/// Subdirectory of the build tree holding the shared downloaded/extracted
+/// source in multi-part builds. Part work dirs are siblings of it, so the
+/// name is reserved as a part name.
+const SOURCE_DIR_NAME: &str = "source";
+
+/// Run the build phase: download source, extract, and execute build command(s).
 ///
-/// Only runs if `meta.build` is set. Downloads the tarball from `meta.source`
-/// (if it's a URL), extracts it, verifies SHA-256 (if pinned), and runs the
-/// build shell command with `$STAGE` pointing to the stage directory and
-/// `$SRC` pointing to the downloaded/extracted source.
+/// Single-part form (`build = "..."`): one command runs with `$STAGE`
+/// pointing to the stage directory and `$SRC` to the downloaded/extracted
+/// source — unchanged since before parts existed.
+///
+/// Multi-part form (`parts = { ... }`): the source is downloaded and
+/// extracted once, then each part runs sequentially in `after`-dependency
+/// order (see [`order_parts`]) in its own work dir under the build tree,
+/// all installing into the shared stage.
 ///
 /// Returns `SourceInfo` with the computed SHA-256 if a source was downloaded.
 fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceInfo>> {
-    let build_cmd = match &meta.build {
-        Some(cmd) => cmd,
-        None => return Ok(None),
-    };
+    // Build plan: `parts` and `build` are mutually exclusive (the DSL
+    // enforces this; re-checked here for non-DSL constructors).
+    match (&meta.parts, &meta.build) {
+        (Some(_), Some(_)) => {
+            return Err(miette::miette!(
+                "snap has both 'build' and 'parts' — use one or the other"
+            ));
+        }
+        (Some(parts), None) if parts.is_empty() => {
+            return Err(miette::miette!("'parts' must not be empty"));
+        }
+        (Some(_), None) => {} // multi-part mode
+        (None, Some(_)) => {} // single-part mode
+        (None, None) => return Ok(None),
+    }
+    let parts_mode = meta.parts.is_some();
 
     let source_spec = match &meta.source {
         Some(s) => s,
@@ -1072,7 +1156,17 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
         ));
     }
 
-    // 4. Extract tarball and find source root
+    // 4. Extract the tarball into the shared source dir (parts mode keeps
+    // part work dirs separate) or the build tree root (single-part mode,
+    // unchanged layout).
+    let extract_dir: std::path::PathBuf = if parts_mode {
+        let dir = build_path.join(SOURCE_DIR_NAME);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| miette::miette!("failed to create source dir: {}", e))?;
+        dir
+    } else {
+        build_path.to_path_buf()
+    };
     let is_tarball = filename.ends_with(".tar.gz")
         || filename.ends_with(".tar.xz")
         || filename.ends_with(".tgz");
@@ -1082,6 +1176,8 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
         let status = std::process::Command::new("tar")
             .arg("xaf")
             .arg(&tarball_str)
+            .arg("-C")
+            .arg(&extract_dir)
             .current_dir(build_path)
             .status()
             .map_err(|e| miette::miette!("tar not found: {}", e))?;
@@ -1095,32 +1191,143 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
         output::finish_ok(&xtract_spinner, &format!("extracted {}", meta.name));
     }
 
-    // 5. Find the source root (the single top-level dir after extraction)
-    let src_dir = find_source_root(build_path);
-    let work_dir: &Path = src_dir.as_deref().unwrap_or(build_path);
+    // 5. `$SRC` points at the source root (the single top-level dir after
+    // extraction, if there is exactly one) — shared and identical for every
+    // part in multi-part mode.
+    let src_root = find_source_root(&extract_dir).unwrap_or_else(|| extract_dir.clone());
 
-    // 6. Create stage dir and run build
+    // 6. Create stage dir and run the build plan
     std::fs::create_dir_all(stage_dir)
         .map_err(|e| miette::miette!("failed to create stage dir: {}", e))?;
 
     // Convert stage_dir to absolute path (DESTDIR requires absolute)
     let abs_stage = std::fs::canonicalize(stage_dir).unwrap_or_else(|_| stage_dir.to_path_buf());
 
-    // Run build — either inside a bubblewrap sandbox or directly
-    let build_spinner = output::spinner(&format!("building {}...", meta.name));
-    run_build_command(
-        build_cmd,
-        build_path,
-        work_dir,
-        &abs_stage,
-        meta.target.as_deref(),
-    )?;
-    output::finish_ok(&build_spinner, &format!("built {}", meta.name));
+    if parts_mode {
+        let parts = meta
+            .parts
+            .as_ref()
+            .expect("parts_mode implies a parts spec");
+        run_parts(
+            parts,
+            build_path,
+            &src_root,
+            &abs_stage,
+            meta.target.as_deref(),
+        )?;
+    } else {
+        // Single-part: cwd and $SRC both point at the source root, as before.
+        let build_cmd = meta.build.as_deref().ok_or_else(|| {
+            miette::miette!("internal: neither parts nor build plan for {}", meta.name)
+        })?;
+        let build_spinner = output::spinner(&format!("building {}...", meta.name));
+        run_build_command(
+            build_cmd,
+            build_path,
+            &src_root,
+            &src_root,
+            &abs_stage,
+            meta.target.as_deref(),
+            None,
+        )?;
+        output::finish_ok(&build_spinner, &format!("built {}", meta.name));
+    }
 
     Ok(Some(SourceInfo {
         url: source_url.to_string(),
         sha256: computed_sha256,
     }))
+}
+
+/// Deterministic execution order for parts: a part is runnable once every
+/// `after` dependency has completed; parts with no `after` are runnable
+/// immediately. Among ready parts the name-sorted one runs first — the
+/// documented deterministic tie-break (Lua tables don't preserve order, so
+/// any non-`after` ordering is intentionally unspecified beyond this
+/// determinism).
+pub fn order_parts(parts: &BTreeMap<String, SnapPart>) -> miette::Result<Vec<String>> {
+    for name in parts.keys() {
+        validate_part_name(name)?;
+    }
+    let mut order = Vec::with_capacity(parts.len());
+    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while order.len() < parts.len() {
+        // Smallest ready part name.
+        let next = parts
+            .iter()
+            .filter(|(name, part)| {
+                !done.contains(name.as_str())
+                    && part.after.iter().all(|dep| done.contains(dep.as_str()))
+            })
+            .map(|(name, _)| name)
+            .min()
+            .cloned();
+        let Some(next) = next else {
+            let stuck: Vec<String> = parts
+                .keys()
+                .filter(|name| !done.contains(name.as_str()))
+                .cloned()
+                .collect();
+            return Err(miette::miette!(
+                "circular or unsatisfiable dependency among parts: {}",
+                stuck.join(", ")
+            ));
+        };
+        done.insert(next.clone());
+        order.push(next);
+    }
+    Ok(order)
+}
+
+/// Part names become directory names under the build tree; keep them plain,
+/// and reserve the shared source dir name.
+fn validate_part_name(name: &str) -> miette::Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(miette::miette!(
+            "invalid part name '{name}': must be a plain directory name (no '/', '.', '..')"
+        ));
+    }
+    if name == SOURCE_DIR_NAME {
+        return Err(miette::miette!(
+            "invalid part name '{name}': reserved for the shared build source directory"
+        ));
+    }
+    Ok(())
+}
+
+/// Run named parts sequentially in dependency order (v1 — no parallelism).
+///
+/// Each part runs in its own work dir under the build tree
+/// (`<build-tree>/<part-name>/`) with `$STAGE` shared across parts — the
+/// integration point: every part installs into the same stage. `$PART_NAME`
+/// holds the running part's name. The whole build tree (shared source dir
+/// included) is visible in every sandbox and sandbox env/inputs are
+/// identical for every part; per-part sources/inputs are future work.
+fn run_parts(
+    parts: &BTreeMap<String, SnapPart>,
+    build_tree: &Path,
+    src_dir: &Path,
+    stage_dir: &Path,
+    target: Option<&str>,
+) -> miette::Result<()> {
+    for name in order_parts(parts)? {
+        let part = parts.get(&name).expect("name comes from the same map");
+        let part_dir = build_tree.join(&name);
+        std::fs::create_dir_all(&part_dir)
+            .map_err(|e| miette::miette!("failed to create work dir for part '{name}': {}", e))?;
+        let spinner = output::spinner(&format!("[{name}] building..."));
+        run_build_command(
+            &part.build,
+            build_tree,
+            &part_dir,
+            src_dir,
+            stage_dir,
+            target,
+            Some(&name),
+        )?;
+        output::finish_ok(&spinner, &format!("[{name}] built"));
+    }
+    Ok(())
 }
 
 /// Compute SHA-256 of a file (streaming, memory-efficient for large files).
@@ -1145,10 +1352,14 @@ fn sha256_file(path: &Path) -> miette::Result<String> {
 /// Run a build command, optionally wrapped in a bubblewrap sandbox.
 ///
 /// `build_path` is the root build directory (host-side).
-/// `work_dir` is the source root (inside `build_path`).
+/// `work_dir` is the command's working directory (inside `build_path`).
+/// `src_dir` is the source root `$SRC` points at (inside `build_path`;
+/// equals `work_dir` for single-part builds).
 /// Inside the sandbox the build dir is mounted at `/build` and
 /// `$SRC` points to the source subdirectory.
 /// If `bwrap` is unavailable, falls back to direct execution.
+///
+/// `part_name` is set for multi-part builds and exported as `$PART_NAME`.
 ///
 /// Cross-compilation support:
 /// - If `target` is set, env vars CC, CXX, LD, AR, etc. are set to
@@ -1160,18 +1371,21 @@ fn run_build_command(
     cmd: &str,
     build_path: &Path,
     work_dir: &Path,
+    src_dir: &Path,
     stage_dir: &Path,
     target: Option<&str>,
+    part_name: Option<&str>,
 ) -> miette::Result<()> {
     let bwrap_bin = detect_bwrap();
     let cross_env = cross_compile_env(target);
 
     if let Some(bwrap_bin) = bwrap_bin {
         run_bwrapped(
-            &bwrap_bin, cmd, build_path, work_dir, stage_dir, target, &cross_env,
+            &bwrap_bin, cmd, build_path, work_dir, src_dir, stage_dir, target, &cross_env,
+            part_name,
         )
     } else {
-        run_direct(cmd, work_dir, stage_dir, &cross_env)
+        run_direct(cmd, work_dir, src_dir, stage_dir, &cross_env, part_name)
     }
 }
 /// Detect the bubblewrap binary, if available.
@@ -1246,22 +1460,29 @@ fn bind_system_ro_paths(cmd: &mut std::process::Command) {
 }
 
 /// Run the build command inside a bubblewrap sandbox.
+#[allow(clippy::too_many_arguments)]
 fn run_bwrapped(
     bwrap_bin: &str,
     cmd: &str,
     build_path: &Path,
     work_dir: &Path,
+    src_dir: &Path,
     stage_dir: &Path,
     target: Option<&str>,
     cross_env: &[(&'static str, String)],
+    part_name: Option<&str>,
 ) -> miette::Result<()> {
-    // Determine the source path relative to /build inside the sandbox
-    let inner_src = if work_dir == build_path {
-        Path::new("/build").to_path_buf()
-    } else {
-        let rel = work_dir.strip_prefix(build_path).unwrap_or(Path::new(""));
-        Path::new("/build").join(rel)
+    // Map a host path under the build dir to its sandbox path under /build.
+    let to_inner = |p: &Path| -> std::path::PathBuf {
+        if p == build_path {
+            Path::new("/build").to_path_buf()
+        } else {
+            let rel = p.strip_prefix(build_path).unwrap_or(Path::new(""));
+            Path::new("/build").join(rel)
+        }
     };
+    let inner_src = to_inner(src_dir);
+    let inner_cwd = to_inner(work_dir);
 
     let mut cmd_proc = std::process::Command::new(bwrap_bin);
     cmd_proc
@@ -1273,6 +1494,11 @@ fn run_bwrapped(
         .arg("/proc")
         .arg("--dev")
         .arg("/dev")
+        // Private /tmp for build temp files. Mounted BEFORE the binds below:
+        // bwrap applies mounts in argument order, so a later stage bind must
+        // win over the tmpfs for stage dirs that live under /tmp.
+        .arg("--tmpfs")
+        .arg("/tmp")
         // Mount build dir at /build inside sandbox
         .arg("--bind")
         .arg(build_path)
@@ -1289,14 +1515,14 @@ fn run_bwrapped(
             cmd_proc.arg("--ro-bind").arg(&sysroot).arg(&sysroot);
         }
     }
-    // Private /tmp for build temp files
     cmd_proc
-        .arg("--tmpfs")
-        .arg("/tmp")
         .arg("--chdir")
-        .arg(&inner_src)
+        .arg(&inner_cwd)
         .env("STAGE", stage_dir)
         .env("SRC", &inner_src);
+    if let Some(name) = part_name {
+        cmd_proc.env("PART_NAME", name);
+    }
     apply_cross_env(&mut cmd_proc, cross_env);
     cmd_proc.arg("sh").arg("-c").arg(cmd);
 
@@ -1316,14 +1542,19 @@ fn run_bwrapped(
 fn run_direct(
     cmd: &str,
     work_dir: &Path,
+    src_dir: &Path,
     stage_dir: &Path,
     cross_env: &[(&'static str, String)],
+    part_name: Option<&str>,
 ) -> miette::Result<()> {
     let mut cmd_proc = std::process::Command::new("sh");
     cmd_proc
         .args(["-c", cmd])
         .env("STAGE", stage_dir)
-        .env("SRC", work_dir);
+        .env("SRC", src_dir);
+    if let Some(name) = part_name {
+        cmd_proc.env("PART_NAME", name);
+    }
     apply_cross_env(&mut cmd_proc, cross_env);
     cmd_proc.current_dir(work_dir);
 
@@ -2851,5 +3082,452 @@ mod tests {
         // compression = "lzo" was wired into mksquashfs — an invalid -comp
         // value would have failed the build above.
         assert_eq!(meta.compression.as_deref(), Some("lzo"));
+    }
+
+    // ── Phase 18 tests: multi-part builds ──
+
+    #[test]
+    fn test_parts_dsl_roundtrip() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "multi",
+                    version = "1.0",
+                    parts = {
+                        ui = { build = "npm run build", after = { "core" } },
+                        core = { build = "make" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let parts = meta.parts.as_ref().expect("parts extracted");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts["core"].build, "make");
+        assert!(parts["core"].after.is_empty());
+        assert_eq!(parts["ui"].build, "npm run build");
+        assert_eq!(parts["ui"].after, vec!["core".to_string()]);
+        assert!(meta.build.is_none());
+    }
+
+    #[test]
+    fn test_implicit_single_part_back_compat() {
+        // `build = "..."` stays valid and never produces parts.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "legacy",
+                    version = "1.0",
+                    build = "make && make install DESTDIR=$STAGE",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(
+            meta.build.as_deref(),
+            Some("make && make install DESTDIR=$STAGE")
+        );
+        assert!(meta.parts.is_none());
+    }
+
+    #[test]
+    fn test_parts_stay_out_of_snap_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "multi",
+                    version = "1.0",
+                    parts = { core = { build = "make" } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let yaml = meta.to_yaml().unwrap();
+        assert!(!yaml.contains("parts:"));
+        assert!(!yaml.contains("build:"));
+    }
+
+    fn eval_parts_source_error(lua_source: &str) -> String {
+        let env = LuaEnv::new();
+        let src = format!(
+            r#"
+            return {{
+                default = snap {{
+                    name = "bad-parts",
+                    version = "1.0",
+                    {lua_source}
+                }},
+            }}
+            "#
+        );
+        env.eval(&src).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn test_parts_conflict_with_build_dsl() {
+        let err =
+            eval_parts_source_error(r#"build = "make", parts = { core = { build = "make" } }"#);
+        assert!(
+            err.contains("mutually exclusive"),
+            "error should mention the build/parts conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_must_be_table_dsl() {
+        let err = eval_parts_source_error(r#"parts = "core""#);
+        assert!(
+            err.contains("'parts' must be a table"),
+            "error should mention parts type: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_must_not_be_empty_dsl() {
+        let err = eval_parts_source_error("parts = {}");
+        assert!(
+            err.contains("'parts' must not be empty"),
+            "error should mention empty parts: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_entry_must_be_table_dsl() {
+        let err = eval_parts_source_error(r#"parts = { core = "make" }"#);
+        assert!(
+            err.contains("parts['core'] must be a table"),
+            "error should mention part type: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_build_must_be_non_empty_string_dsl() {
+        let err = eval_parts_source_error("parts = { core = { after = {} } }");
+        assert!(
+            err.contains("parts['core'].build must be a non-empty string"),
+            "error should mention missing build: {err}"
+        );
+
+        let err = eval_parts_source_error(r#"parts = { core = { build = "" } }"#);
+        assert!(
+            err.contains("parts['core'].build must be a non-empty string"),
+            "error should mention empty build: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_after_must_be_string_array_dsl() {
+        let err =
+            eval_parts_source_error(r#"parts = { core = { build = "make", after = "libs" } }"#);
+        assert!(
+            err.contains("parts['core'].after must be an array"),
+            "error should mention after type: {err}"
+        );
+
+        let err =
+            eval_parts_source_error(r#"parts = { core = { build = "make", after = { 42 } } }"#);
+        assert!(
+            err.contains("parts['core'].after[1] must be a string"),
+            "error should mention after element type: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_unknown_after_dsl() {
+        let err =
+            eval_parts_source_error(r#"parts = { core = { build = "make", after = { "libs" } } }"#);
+        assert!(
+            err.contains("parts['core'].after references unknown part 'libs'"),
+            "error should mention the unknown part: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_self_cycle_dsl() {
+        let err = eval_parts_source_error(r#"parts = { a = { build = "make", after = { "a" } } }"#);
+        assert!(
+            err.contains("circular dependency in parts: a -> a"),
+            "error should report the cycle path: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_two_node_cycle_dsl() {
+        let err = eval_parts_source_error(
+            r#"
+            parts = {
+                a = { build = "make", after = { "b" } },
+                b = { build = "make", after = { "a" } },
+            }
+            "#,
+        );
+        assert!(
+            err.contains("circular dependency in parts") && err.contains("->"),
+            "error should report the cycle path: {err}"
+        );
+    }
+
+    #[test]
+    fn test_order_parts_dependency_respecting_with_name_tiebreak() {
+        // Diamond: libs has no after and is the only runnable part first;
+        // among {app, cli, zzz} after libs completes, name order applies.
+        let parts: BTreeMap<String, SnapPart> = [
+            (
+                "app",
+                SnapPart {
+                    build: "make app".into(),
+                    after: vec!["libs".into()],
+                },
+            ),
+            (
+                "cli",
+                SnapPart {
+                    build: "make cli".into(),
+                    after: vec!["libs".into()],
+                },
+            ),
+            (
+                "libs",
+                SnapPart {
+                    build: "make libs".into(),
+                    after: vec![],
+                },
+            ),
+            (
+                "zzz",
+                SnapPart {
+                    build: "make zzz".into(),
+                    after: vec![],
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        assert_eq!(
+            order_parts(&parts).unwrap(),
+            vec!["libs", "app", "cli", "zzz"]
+        );
+    }
+
+    #[test]
+    fn test_order_parts_chain() {
+        let parts: BTreeMap<String, SnapPart> = [
+            (
+                "c",
+                SnapPart {
+                    build: "c".into(),
+                    after: vec!["b".into()],
+                },
+            ),
+            (
+                "b",
+                SnapPart {
+                    build: "b".into(),
+                    after: vec!["a".into()],
+                },
+            ),
+            (
+                "a",
+                SnapPart {
+                    build: "a".into(),
+                    after: vec![],
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        assert_eq!(order_parts(&parts).unwrap(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_order_parts_rejects_cycle_in_rust() {
+        // Non-DSL constructors can bypass Lua validation; the scheduler
+        // must not hang.
+        let parts: BTreeMap<String, SnapPart> = [
+            (
+                "a",
+                SnapPart {
+                    build: "a".into(),
+                    after: vec!["b".into()],
+                },
+            ),
+            (
+                "b",
+                SnapPart {
+                    build: "b".into(),
+                    after: vec!["a".into()],
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        let err = order_parts(&parts).unwrap_err().to_string();
+        assert!(
+            err.contains("circular or unsatisfiable dependency among parts"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_order_parts_rejects_invalid_names() {
+        let make = |name: &str| {
+            BTreeMap::from([(
+                name.to_string(),
+                SnapPart {
+                    build: "true".into(),
+                    after: vec![],
+                },
+            )])
+        };
+        assert!(order_parts(&make("source")).is_err()); // reserved
+        assert!(order_parts(&make("a/b")).is_err());
+        assert!(order_parts(&make("..")).is_err());
+        assert!(order_parts(&make(".")).is_err());
+    }
+
+    #[test]
+    fn test_run_parts_ordering_shared_stage_and_part_env() {
+        let tree = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let abs_stage = std::fs::canonicalize(stage.path()).unwrap();
+        std::fs::create_dir_all(tree.path().join(SOURCE_DIR_NAME)).unwrap();
+
+        let parts: BTreeMap<String, SnapPart> = [
+            (
+                "b",
+                SnapPart {
+                    // Proves: $PART_NAME, `after` blocked until `a` was done
+                    // (its marker exists), and cwd is b's own work dir.
+                    build: r#"test "$PART_NAME" = "b" && test -f "$STAGE/a.done" && pwd > "$STAGE/b.pwd""#.into(),
+                    after: vec!["a".into()],
+                },
+            ),
+            (
+                "a",
+                SnapPart {
+                    build: r#"test "$PART_NAME" = "a" && touch "$STAGE/a.done""#.into(),
+                    after: vec![],
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        run_parts(
+            &parts,
+            tree.path(),
+            &tree.path().join(SOURCE_DIR_NAME),
+            &abs_stage,
+            None,
+        )
+        .unwrap();
+
+        // Shared stage: both parts installed into the same dir.
+        assert!(abs_stage.join("a.done").exists(), "a must have run");
+        let pwd = std::fs::read_to_string(abs_stage.join("b.pwd")).unwrap();
+        let pwd = pwd.trim_end();
+        assert!(
+            pwd.ends_with("/b"),
+            "b must run in its own work dir under the build tree, got: {pwd}"
+        );
+        assert!(tree.path().join("b").is_dir());
+    }
+
+    #[test]
+    fn test_run_parts_fails_when_after_dependency_missing_marker() {
+        // If ordering were violated, b's marker check would fail.
+        let tree = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let abs_stage = std::fs::canonicalize(stage.path()).unwrap();
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "b",
+            SnapPart {
+                build: r#"test -f "$STAGE/never-created""#.into(),
+                after: vec![],
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        assert!(run_parts(&parts, tree.path(), tree.path(), &abs_stage, None).is_err());
+    }
+
+    #[test]
+    fn test_run_build_rejects_build_and_parts_conflict() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "conflict", version = "1.0", build = "make" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let mut meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        meta.parts = Some(BTreeMap::from([(
+            "core".to_string(),
+            SnapPart {
+                build: "make".into(),
+                after: vec![],
+            },
+        )]));
+
+        let err = run_build(&meta, Path::new("/nonexistent-stage"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both 'build' and 'parts'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_run_build_rejects_empty_parts() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "empty-parts", version = "1.0" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let mut meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        meta.build = None;
+        meta.parts = Some(BTreeMap::new());
+
+        let err = run_build(&meta, Path::new("/nonexistent-stage"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'parts' must not be empty"), "got: {err}");
     }
 }

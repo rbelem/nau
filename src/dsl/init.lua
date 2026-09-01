@@ -226,6 +226,92 @@ function snap(opts)
         end
     end
 
+    -- parts: multi-part builds. Mutually exclusive with `build` (a snap has
+    -- either one command or named parts, never both). Each part needs a
+    -- non-empty string `build` command and may list `after` dependencies.
+    -- Lua tables don't preserve order, so execution order is derived from
+    -- `after` at build time: a part runs once all its `after` parts are
+    -- done; parts with no `after` are runnable immediately.
+    if opts.parts ~= nil then
+        if opts.build ~= nil then
+            error("snap(): 'build' and 'parts' are mutually exclusive — move the command into parts['<name>'].build", 2)
+        end
+        if type(opts.parts) ~= "table" then
+            error("snap(): 'parts' must be a table, got " .. type(opts.parts), 2)
+        end
+        local names = {}
+        local count = 0
+        for name, part in pairs(opts.parts) do
+            count = count + 1
+            names[name] = true
+            if type(part) ~= "table" then
+                error(string.format(
+                    "snap(): parts['%s'] must be a table, got %s", name, type(part)), 2)
+            end
+            if type(part.build) ~= "string" or part.build == "" then
+                error(string.format(
+                    "snap(): parts['%s'].build must be a non-empty string, got %s",
+                    name, type(part.build)), 2)
+            end
+            if part.after ~= nil then
+                if type(part.after) ~= "table" then
+                    error(string.format(
+                        "snap(): parts['%s'].after must be an array of part names, got %s",
+                        name, type(part.after)), 2)
+                end
+                for i, dep in ipairs(part.after) do
+                    if type(dep) ~= "string" then
+                        error(string.format(
+                            "snap(): parts['%s'].after[%d] must be a string, got %s",
+                            name, i, type(dep)), 2)
+                    end
+                end
+            end
+        end
+        if count == 0 then
+            error("snap(): 'parts' must not be empty", 2)
+        end
+        -- `after` references must name existing parts
+        for name, part in pairs(opts.parts) do
+            for _, dep in ipairs(part.after or {}) do
+                if not names[dep] then
+                    error(string.format(
+                        "snap(): parts['%s'].after references unknown part '%s'",
+                        name, dep), 2)
+                end
+            end
+        end
+        -- The `after` graph must be acyclic; report the cycle path.
+        local IN_PROGRESS, DONE = 1, 2
+        local state = {}
+        local path = {}
+        local function visit(n)
+            state[n] = IN_PROGRESS
+            table.insert(path, n)
+            for _, dep in ipairs(opts.parts[n].after or {}) do
+                if state[dep] == IN_PROGRESS then
+                    local cycle, seen = {}, false
+                    for _, step in ipairs(path) do
+                        if step == dep then seen = true end
+                        if seen then table.insert(cycle, step) end
+                    end
+                    table.insert(cycle, dep)
+                    error("snap(): circular dependency in parts: " .. table.concat(cycle, " -> "), 2)
+                end
+                if state[dep] == nil then
+                    visit(dep)
+                end
+            end
+            table.remove(path)
+            state[n] = DONE
+        end
+        for name in pairs(opts.parts) do
+            if state[name] == nil then
+                visit(name)
+            end
+        end
+    end
+
     -- inputs: table of name → { url } (package source, inspired by Nix inputs)
     if opts.inputs ~= nil then
         if type(opts.inputs) ~= "table" then
