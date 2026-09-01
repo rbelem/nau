@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use miette::{IntoDiagnostic, WrapErr};
 
+use crate::analysis::Span;
 use crate::image::ImageDeclaration;
 use crate::snap::{PackageInput, SnapMeta};
 
@@ -62,8 +63,14 @@ pub struct EvalOutput {
 }
 
 /// One validation/eval diagnostic with structured fields (ADR-0010 Decisions
-/// 2-3). Line-level spans land later with the Luau analyzer; `label`
-/// (definition path) plus `key` (output name) locate the problem for now.
+/// 2-3). `span` is set only for analyzer-stage diagnostics (1-based spans
+/// from the Luau type checker); eval-stage diagnostics locate the problem
+/// with `label` (definition path) plus `key` (output name).
+///
+/// JSON shape decision: each diagnostic serializes as a self-contained object
+/// with one optional nested `"span"` field
+/// (`{begin_line, begin_col, end_line, end_col}` or `null`) — per-diagnostic
+/// span fields, not a separate top-level `"spans"` array.
 #[derive(Debug, Clone)]
 pub struct CheckDiagnostic {
     /// Definition the diagnostic belongs to (eval label / file path).
@@ -76,6 +83,23 @@ pub struct CheckDiagnostic {
     pub actual: Option<String>,
     /// The full diagnostic message.
     pub message: String,
+    /// Analyzer source span; `None` for eval-stage diagnostics.
+    pub span: Option<Span>,
+}
+
+impl CheckDiagnostic {
+    /// Diagnostic for one analyzer error (span set, eval fields empty).
+    pub fn from_analyzer(label: &str, d: crate::analysis::Diagnostic) -> CheckDiagnostic {
+        let span = d.span();
+        CheckDiagnostic {
+            label: label.to_string(),
+            key: None,
+            expected: None,
+            actual: None,
+            message: d.message,
+            span: Some(span),
+        }
+    }
 }
 
 /// Everything one checked eval produced: the outputs that survived
@@ -144,6 +168,7 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
             expected: None,
             actual: None,
             message: d.clone(),
+            span: None,
         });
     }
 
@@ -171,6 +196,7 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
                     expected,
                     actual,
                     message: format!("skipping output '{key}' from {label}: {e}"),
+                    span: None,
                 });
             }
         }

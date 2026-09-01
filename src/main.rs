@@ -857,66 +857,62 @@ fn cmd_doctor() -> miette::Result<()> {
 
 // ── Check command ──
 
-/// `shuttle check`: run one definition through the bounded subprocess eval
-/// and Rust-side schema validation (ADR-0010 Decisions 2-3) and report
-/// every diagnostic. Deterministic, no build, no store access — the AI
-/// feedback-loop entry point. Exits 1 when the definition has any problem.
+/// `shuttle check`: run one definition through the analyzer gate first
+/// (ADR-0010 Decision 2 — in-process `--!strict` type checking; fast fail
+/// with spanned diagnostics before any subprocess work), then the existing
+/// bounded subprocess eval + Rust-side schema validation (Decisions 3-5).
+/// Deterministic, no build, no store access — the AI feedback-loop entry
+/// point. Exits 1 when the definition has any problem.
 fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
-    let checked = shuttle::lua::check_file_with_inputs(file);
+    // Stage 1 — analyzer gate. A definition that does not type-check never
+    // reaches the eval stage.
+    let analyzer_diagnostics = shuttle::analysis::check_definition_file(file);
+    let mut diagnostics: Vec<shuttle::lua::CheckDiagnostic> = analyzer_diagnostics
+        .into_iter()
+        .map(|d| shuttle::lua::CheckDiagnostic::from_analyzer(file, d))
+        .collect();
 
-    // A hard eval failure is a diagnostic too, so both output modes carry
-    // the complete problem list in one shape.
-    let mut diagnostics = checked.diagnostics.clone();
-    if let Some(err) = &checked.error {
-        diagnostics.push(shuttle::lua::CheckDiagnostic {
-            label: file.to_string(),
-            key: None,
-            expected: None,
-            actual: None,
-            message: err.clone(),
-        });
+    // Stage 2 — bounded subprocess eval + Rust-side validation (unchanged
+    // path; the analyzer is check-only). `None` when stage 1 failed fast.
+    let checked = if diagnostics.is_empty() {
+        Some(shuttle::lua::check_file_with_inputs(file))
+    } else {
+        None
+    };
+
+    if let Some(checked) = &checked {
+        diagnostics.extend(checked.diagnostics.clone());
+        // A hard eval failure is a diagnostic too, so both output modes carry
+        // the complete problem list in one shape.
+        if let Some(err) = &checked.error {
+            diagnostics.push(shuttle::lua::CheckDiagnostic {
+                label: file.to_string(),
+                key: None,
+                expected: None,
+                actual: None,
+                message: err.clone(),
+                span: None,
+            });
+        }
     }
-    let ok = checked.error.is_none() && diagnostics.is_empty();
+    let ok = checked.as_ref().is_some_and(|c| c.error.is_none()) && diagnostics.is_empty();
+
+    let outputs: Vec<String> = checked
+        .as_ref()
+        .map(|c| {
+            let mut names: Vec<String> = c.outputs.keys().cloned().collect();
+            names.sort();
+            names
+        })
+        .unwrap_or_default();
 
     if json {
-        let mut names: Vec<String> = checked.outputs.keys().cloned().collect();
-        names.sort();
-        let diags: Vec<serde_json::Value> = diagnostics
-            .iter()
-            .map(|d| {
-                serde_json::json!({
-                    "label": d.label,
-                    "key": d.key,
-                    "expected": d.expected,
-                    "actual": d.actual,
-                    "message": d.message,
-                })
-            })
-            .collect();
-        let report = serde_json::json!({
-            "file": file,
-            "ok": ok,
-            "outputs": names,
-            "diagnostics": diags,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
-        );
+        report_check_json(file, &outputs, &diagnostics);
     } else if ok {
-        let names: Vec<String> = checked.outputs.keys().cloned().collect();
-        let list = if names.is_empty() {
-            String::new()
-        } else {
-            format!(": {}", names.join(", "))
-        };
-        shuttle::output::ok(format!("ok: {} output(s){list}", names.len()));
+        report_check_ok(&outputs);
     } else {
         for d in &diagnostics {
-            match &d.key {
-                Some(key) => shuttle::output::err(format!("{}[{key}]: {}", d.label, d.message)),
-                None => shuttle::output::err(&d.message),
-            }
+            report_check_diagnostic(d);
         }
     }
 
@@ -924,6 +920,65 @@ fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `--json` report: every diagnostic is self-contained — one optional nested
+/// `"span"` object (per-diagnostic span fields, not a top-level `"spans"`
+/// array).
+fn report_check_json(
+    file: &str,
+    outputs: &[String],
+    diagnostics: &[shuttle::lua::CheckDiagnostic],
+) {
+    let diags: Vec<serde_json::Value> = diagnostics
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "label": d.label,
+                "key": d.key,
+                "expected": d.expected,
+                "actual": d.actual,
+                "message": d.message,
+                "span": d.span.as_ref().map(|s| serde_json::json!({
+                    "begin_line": s.begin_line,
+                    "begin_col": s.begin_col,
+                    "end_line": s.end_line,
+                    "end_col": s.end_col,
+                })),
+            })
+        })
+        .collect();
+    let report = serde_json::json!({
+        "file": file,
+        "ok": diagnostics.is_empty(),
+        "outputs": outputs,
+        "diagnostics": diags,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+fn report_check_ok(outputs: &[String]) {
+    let list = if outputs.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", outputs.join(", "))
+    };
+    shuttle::output::ok(format!("ok: {} output(s){list}", outputs.len()));
+}
+
+fn report_check_diagnostic(d: &shuttle::lua::CheckDiagnostic) {
+    match (&d.key, &d.span) {
+        (Some(key), _) => shuttle::output::err(format!("{}[{key}]: {}", d.label, d.message)),
+        // Analyzer diagnostics print with their 1-based begin span.
+        (None, Some(s)) => shuttle::output::err(format!(
+            "{}:{}:{}: {}",
+            d.label, s.begin_line, s.begin_col, d.message
+        )),
+        (None, None) => shuttle::output::err(&d.message),
+    }
 }
 
 // ── Lock command ──

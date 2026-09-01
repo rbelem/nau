@@ -169,7 +169,7 @@ fn attack_child_memory_wall_survives() {
 local ok, e = pcall(string.rep, "a", 600 * 1024 * 1024)
 return { ok = tostring(ok), err = tostring(e):sub(1, 60), name = "x", version = "1" }
 "#;
-    let r = run("attack-mem-wall", &src);
+    let r = run("attack-mem-wall", src);
     let elapsed = start.elapsed();
     eprintln!(
         "[INFO] memory wall (600MB): status={}, wall={elapsed:?}, rss={}kB, ok={}",
@@ -201,7 +201,7 @@ return { marker = "real", name = "x", version = "1" }
         "eval must complete untouched"
     );
     let fake = match &r.outcome {
-        Some(WorkerOutcome::Ok(ok)) => ok.outputs.get("fake").is_some(),
+        Some(WorkerOutcome::Ok(ok)) => ok.outputs.contains_key("fake"),
         _ => false,
     };
     assert!(!fake, "smuggled fake outcome must be ignored");

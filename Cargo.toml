@@ -19,3 +19,9 @@ indicatif = "0.18"
 owo-colors = "4"
 libc = "0.2"
 clap_complete = "4"
+
+[build-dependencies]
+# Luau analyzer build (see build.rs + shim/): upstream C++ compiled with cc.
+cc = { version = "1.2", features = ["parallel"] }
+flate2 = "1"
+tar = "0.4"

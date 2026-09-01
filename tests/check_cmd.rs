@@ -202,3 +202,160 @@ fn check_json_hard_error_carries_diagnostic_with_null_key() {
         diags[0]["message"]
     );
 }
+
+// ── Analyzer gate (ADR-0010 Decision 2, stage 1 of `shuttle check`) ──
+
+/// A `name = 42`-style type error against an explicit annotation: the
+/// analyzer stage reports it with a 1-based span and fast-fails before the
+/// eval stage runs (the eval schema error for the same problem never
+/// appears).
+const ANALYZER_TYPE_ERROR: &str = r#"
+local meta: { name: string, version: string } = {
+    name = 42,
+    version = "1.0",
+}
+return { default = snap(meta) }
+"#;
+
+#[test]
+fn check_analyzer_type_error_fast_fails_with_span_json() {
+    let dir = tempfile::tempdir().unwrap();
+    write_def(dir.path(), ANALYZER_TYPE_ERROR);
+    let (code, stdout, _) = run_check(dir.path(), true);
+    assert_eq!(code, Some(1));
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON on stdout");
+    assert_eq!(v["ok"], false);
+    let diags = v["diagnostics"].as_array().expect("diagnostics array");
+    assert!(!diags.is_empty(), "analyzer must flag the type error: {v}");
+    let span = &diags[0]["span"];
+    assert!(
+        !span.is_null(),
+        "analyzer diagnostics carry spans: {}",
+        diags[0]
+    );
+    assert_eq!(span["begin_line"], 2, "1-based line of the constructor");
+    assert!(span["begin_col"].as_u64().unwrap() >= 1);
+    let msg = diags[0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("number") && msg.contains("string"),
+        "spanned type error must mention the types: {msg}"
+    );
+}
+
+#[test]
+fn check_analyzer_type_error_fast_fails_before_eval_human() {
+    let dir = tempfile::tempdir().unwrap();
+    write_def(dir.path(), ANALYZER_TYPE_ERROR);
+    let (code, _, stderr) = run_check(dir.path(), false);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("shuttle.lua:2:"),
+        "human output must carry the 1-based span: {stderr}"
+    );
+    // Fast fail: the eval stage (which would report the same problem as a
+    // schema error, "field 'name' must be a string") never ran.
+    assert!(
+        !stderr.contains("must be a string, got"),
+        "eval stage must be skipped when the analyzer gate fails: {stderr}"
+    );
+}
+
+#[test]
+fn check_cross_module_require_type_error_is_spanned() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("pkg")).unwrap();
+    std::fs::write(
+        dir.path().join("pkg/apptpl.lua"),
+        r#"
+local M = {}
+function M.app(opts: { command: string }): { command: string }
+    return opts
+end
+return M
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("pkg/shuttle.lua"),
+        r#"
+local tpl = require("apptpl")
+
+return {
+    default = snap {
+        name = tpl.app({ command = 42 }).command,
+        version = "1.0",
+    },
+}
+"#,
+    )
+    .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    cmd.arg("check").arg("pkg/shuttle.lua").arg("--json");
+    let out = cmd.current_dir(dir.path()).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid JSON");
+    let diags = v["diagnostics"].as_array().expect("diagnostics array");
+    assert!(!diags.is_empty(), "type error must cross the boundary: {v}");
+    let msg = diags[0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("number") && msg.contains("string"),
+        "cross-module type error: {msg}"
+    );
+    assert!(
+        !diags[0]["span"].is_null(),
+        "spanned at the definition side: {}",
+        diags[0]
+    );
+}
+
+#[test]
+fn check_real_pkgs_file_passes_analyzer_gate() {
+    // A real corpus definition must type-check cleanly against the typed
+    // prelude (injected globals bound, require resolution live) — the
+    // "no false positives" property of the gate.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    cmd.arg("check").arg("pkgs/h/hello.lua").arg("--json");
+    let out = cmd
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid JSON");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["diagnostics"], serde_json::json!([]));
+}
+
+#[test]
+fn check_unresolved_require_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    write_def(
+        dir.path(),
+        r#"local x = require("nowhere") return { default = x }"#,
+    );
+    let (code, _, stderr) = run_check(dir.path(), false);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("Unknown require"),
+        "gate fails closed on unresolvable requires: {stderr}"
+    );
+}
+
+#[test]
+fn check_wall_latency_stays_sub_second() {
+    // The latency target for `shuttle check` is <100ms wall including the
+    // eval subprocess (ADR-0010 Decision 8); measured manually on release
+    // builds (see analyzer integration report). CI machines are noisy, so
+    // this test is a coarse regression tripwire at 1s, not the target proof.
+    let dir = tempfile::tempdir().unwrap();
+    write_def(dir.path(), GOOD_DEF);
+    let start = std::time::Instant::now();
+    let (code, _, _) = run_check(dir.path(), false);
+    let elapsed = start.elapsed();
+    assert_eq!(code, Some(0));
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "check took {elapsed:?}; subprocess+analyzer path regressed"
+    );
+}
