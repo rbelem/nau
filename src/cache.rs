@@ -1,26 +1,31 @@
-//! Binary package cache — store and retrieve built `.snap` files by source hash.
+//! Binary package cache — store and retrieve built `.snap` files by
+//! build-input closure hash.
 //!
 //! The cache lives at `~/.cache/shuttle/pkgs/` (configurable via `--cache`).
 //! Each cached snap is stored as:
 //!
 //! ```text
-//! <cache_dir>/<source_sha256>/<name>_<version>_<arch>.snap
+//! <cache_dir>/v2:<closure_sha256>/<name>_<version>_<arch>.snap
 //! ```
 //!
-//! The source SHA-256 is the hash of the downloaded source tarball (or `none`
-//! for meta/store packages that have no source). This means:
-//! - Same source tarball → same hash → cached build reused
-//! - Source changes → new hash → fresh build
-//! - No source (meta packages) → always rebuilt (fast, no-op)
+//! The directory key is `v2:` + SHA-256 over the canonical build-input
+//! closure ([`BuildClosure`]): source identity, parts spec, cross-compilation
+//! target, and the resolved `requires` closure. Any change to any of these
+//! changes the key and forces a fresh build (gap-analysis §4.3: the cache is
+//! keyed by the full input closure, not just the source tarball). The `v2:`
+//! prefix version-bumps deliberately: keys from the old source-only format
+//! simply miss once and rebuild — an accepted one-time cold-cache break.
+//! Meta/store packages (closure source `none`) are never cached.
 //!
 //! Usage:
 //! ```rust,ignore
 //! let cache = PackageCache::new(Some("/path/to/cache"));
-//! if let Some(path) = cache.lookup(&meta, "amd64") {
+//! let closure = BuildClosure::for_meta(&meta, requires);
+//! if let Some(path) = cache.lookup(&meta, "amd64", &closure) {
 //!     // use cached build
 //! } else {
 //!     let result = build_snap(&meta, ...)?;
-//!     cache.store(&meta, &result, "amd64")?;
+//!     cache.store(&meta, &result, &result_dir, &closure)?;
 //! }
 //! ```
 
@@ -44,6 +49,141 @@ const DEFAULT_CACHE_SUBDIR: &str = "pkgs";
 
 /// Magic string for packages without source (meta/store types).
 const NO_SOURCE_HASH: &str = "none";
+
+/// Closure format version and cache-key prefix. These MUST move together:
+/// bump both when the closure schema changes so old entries can never be
+/// served for a new format (no silent key collisions across formats).
+const CLOSURE_FORMAT_VERSION: u32 = 2;
+const KEY_PREFIX: &str = "v2";
+
+/// Target value for builds without an explicit cross-compilation triplet.
+const NATIVE_TARGET: &str = "native";
+
+/// SHA-256 hex digest of a string.
+fn sha256_hex(input: &str) -> String {
+    let hash = sha2::Sha256::digest(input.as_bytes());
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One member of the resolved `requires` closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiresMember {
+    pub name: String,
+    /// Resolved revision (lockfile pin) or declared version, when known.
+    pub pin: Option<String>,
+    /// Content hash of the dependency, when available from lockfile data.
+    ///
+    /// `None` marks an unpinned store dependency: its reproducibility is
+    /// version-pinned at best — the cache key cannot detect content changes
+    /// behind the version (known limitation, see `requires` in
+    /// [`BuildClosure`]).
+    pub hash: Option<String>,
+}
+
+/// The canonical build-input closure: every input that can change the built
+/// artifact (gap-analysis §4.3, Phase 22 task 1).
+///
+/// Serialized to deterministic JSON (sorted keys via serde_json's BTreeMap,
+/// `requires` sorted by name and deduplicated):
+///
+/// ```json
+/// {
+///   "format_version": 2,
+///   "parts": "<canonical parts JSON>",
+///   "requires": [{"hash": "…|null", "name": "…", "pin": "…|null"}],
+///   "source": "<sha256 of name:version:url, or none>",
+///   "target": "<triplet or native>"
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct BuildClosure {
+    /// SHA-256 over `name:version:url` (`none` for meta/store packages).
+    /// The tarball content hash is pinned separately in `shuttle.lock` and
+    /// verified at download time, so the key never needs the download.
+    pub source: String,
+    /// Canonical parts JSON ([`canonical_parts_json`]); empty when no parts.
+    pub parts: String,
+    /// Cross-compilation target triplet, or `native`.
+    pub target: String,
+    /// Resolved requires closure, sorted by name, deduplicated.
+    pub requires: Vec<RequiresMember>,
+}
+
+impl BuildClosure {
+    /// Build the closure for a snap meta from resolved requires members.
+    /// Members are sorted by name and deduplicated so dependency traversal
+    /// order never affects the key.
+    pub fn for_meta(meta: &SnapMeta, requires: Vec<RequiresMember>) -> Self {
+        let mut requires = requires;
+        requires.sort_by(|a, b| a.name.cmp(&b.name));
+        requires.dedup_by(|a, b| a.name == b.name);
+        let parts = meta
+            .parts
+            .as_ref()
+            .map(canonical_parts_json)
+            .unwrap_or_default();
+        BuildClosure {
+            source: source_identity_hash(meta),
+            parts,
+            target: meta
+                .target
+                .clone()
+                .unwrap_or_else(|| NATIVE_TARGET.to_string()),
+            requires,
+        }
+    }
+
+    /// Deterministic canonical JSON serialization of the closure.
+    pub fn canonical_json(&self) -> String {
+        let requires: Vec<serde_json::Value> = self
+            .requires
+            .iter()
+            .map(|m| serde_json::json!({ "name": m.name, "pin": m.pin, "hash": m.hash }))
+            .collect();
+        serde_json::json!({
+            "format_version": CLOSURE_FORMAT_VERSION,
+            "source": self.source,
+            "parts": self.parts,
+            "target": self.target,
+            "requires": requires,
+        })
+        .to_string()
+    }
+
+    /// Version-prefixed cache key: `v2:<sha256 of canonical JSON>`.
+    pub fn cache_key(&self) -> String {
+        format!("{}:{}", KEY_PREFIX, sha256_hex(&self.canonical_json()))
+    }
+}
+
+/// Resolve a requires member from lockfile data only (no I/O, safe offline).
+/// Returns `None` when the snap has no lock pin — the caller falls back to
+/// declared-version pinning with `hash: None`.
+pub fn pinned_member(name: &str, lock: &crate::lock::LockFile) -> Option<RequiresMember> {
+    lock.snaps.get(name).map(|snap| RequiresMember {
+        name: name.to_string(),
+        pin: Some(snap.revision.to_string()),
+        hash: Some(snap.sha3_384.clone()),
+    })
+}
+
+/// SHA-256 over the source identity: `name:version:url` (or `none` for
+/// meta/store packages). This is the source component of the closure — the
+/// parts spec is hashed separately, and the downloaded tarball's content
+/// hash is pinned in `shuttle.lock` and verified at download time.
+fn source_identity_hash(meta: &SnapMeta) -> String {
+    match meta.type_ {
+        Some(ref t) if t == "source" => {
+            let url = meta
+                .source
+                .as_ref()
+                .map(|s| s.url().to_string())
+                .unwrap_or_default();
+            sha256_hex(&format!("{}:{}:{}", meta.name, meta.version, url))
+        }
+        _ => NO_SOURCE_HASH.to_string(),
+    }
+}
 
 /// Canonical JSON for a parts spec, used in cache keys: parts sorted by
 /// name (BTreeMap order), each with its command and `after` edges. Any
@@ -116,46 +256,14 @@ impl PackageCache {
         &self.root
     }
 
-    /// Compute the source hash key for a snap meta.
-    ///
-    /// For source packages, this is the SHA-256 of the source URL + version
-    /// (since we haven't downloaded the source yet at check time).
-    /// Multi-part builds fold the full parts spec (names + commands + after
-    /// edges) into the key as canonical JSON, so any spec change invalidates
-    /// cached artifacts. Single-part keys are unchanged — warm caches built
-    /// from the implicit-part form (`build = "..."`) stay valid.
-    /// For meta/store packages, returns `"none"`.
-    fn source_key(meta: &SnapMeta) -> String {
-        match meta.type_ {
-            Some(ref t) if t == "source" => {
-                // Hash the source URL + version to get a cache key
-                let url = meta
-                    .source
-                    .as_ref()
-                    .map(|s| s.url().to_string())
-                    .unwrap_or_default();
-                let mut input = format!("{}:{}:{}", meta.name, meta.version, url);
-                if let Some(parts) = &meta.parts {
-                    input.push(':');
-                    input.push_str(&canonical_parts_json(parts));
-                }
-                let hash = sha2::Sha256::digest(input.as_bytes());
-                hash.iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<String>()
-            }
-            _ => NO_SOURCE_HASH.to_string(),
-        }
-    }
-
-    /// Check if a snap is already cached for the given architecture.
+    /// Check if a snap is already cached for the given architecture under the
+    /// given build-input closure.
     ///
     /// Returns `Some(path)` if the cached snap exists, `None` otherwise.
-    pub fn lookup(&self, meta: &SnapMeta, arch: &str) -> Option<PathBuf> {
-        let key = Self::source_key(meta);
+    pub fn lookup(&self, meta: &SnapMeta, arch: &str, closure: &BuildClosure) -> Option<PathBuf> {
         let cached = self
             .root
-            .join(&key)
+            .join(closure.cache_key())
             .join(format!("{}_{}_{}.snap", meta.name, meta.version, arch));
         if cached.exists() {
             Some(cached)
@@ -164,25 +272,24 @@ impl PackageCache {
         }
     }
 
-    /// Store a built snap in the cache.
+    /// Store a built snap in the cache under its build-input closure.
     ///
     /// Copies the built snap file from `result.snap_filename` (in the output
-    /// directory where it was built) into the cache tree.
+    /// directory where it was built) into the cache tree. No-op for meta/store
+    /// packages (closure source `none`) — they are trivial and always rebuilt.
     pub fn store(
         &self,
-        meta: &SnapMeta,
+        _meta: &SnapMeta,
         result: &BuildResult,
-        _arch: &str,
         output_dir: &Path,
+        closure: &BuildClosure,
     ) -> miette::Result<()> {
-        let key = Self::source_key(meta);
-
         // Don't cache meta/store packages (they're empty/trivial)
-        if key == NO_SOURCE_HASH {
+        if closure.source == NO_SOURCE_HASH {
             return Ok(());
         }
 
-        let cache_dir = self.root.join(&key);
+        let cache_dir = self.root.join(closure.cache_key());
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| miette::miette!("failed to create cache dir {:?}: {}", cache_dir, e))?;
 
@@ -426,43 +533,70 @@ mod tests {
     }
 
     #[test]
-    fn test_source_key_meta_package() {
+    fn test_closure_source_meta_package() {
         let meta = make_meta_meta("build-deps");
-        assert_eq!(PackageCache::source_key(&meta), "none");
+        let closure = BuildClosure::for_meta(&meta, vec![]);
+        assert_eq!(closure.source, "none");
     }
 
     #[test]
-    fn test_source_key_source_package() {
+    fn test_closure_key_format_v2() {
         let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
-        let key = PackageCache::source_key(&meta);
-        // Should be a 64-char hex string
-        assert_eq!(key.len(), 64);
-        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        let key = BuildClosure::for_meta(&meta, vec![]).cache_key();
+        // "v2:" prefix + 64-char hex digest
+        let hex = key.strip_prefix("v2:").expect("key must be v2-prefixed");
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn test_source_key_deterministic() {
+    fn test_closure_canonical_json_schema() {
         let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
-        let key1 = PackageCache::source_key(&meta);
-        let key2 = PackageCache::source_key(&meta);
+        let closure = BuildClosure::for_meta(
+            &meta,
+            vec![RequiresMember {
+                name: "zlib".into(),
+                pin: Some("1.3".into()),
+                hash: None,
+            }],
+        );
+        let expected_source = sha256_hex("hello:1.0:https://example.com/hello.tar.gz");
+        // Locks the exact deterministic schema: sorted keys, null hashes.
+        assert_eq!(
+            closure.canonical_json(),
+            format!(
+                r#"{{"format_version":2,"parts":"","requires":[{{"hash":null,"name":"zlib","pin":"1.3"}}],"source":"{expected_source}","target":"native"}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn test_closure_key_stable_when_nothing_changes() {
+        let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        let requires = vec![RequiresMember {
+            name: "zlib".into(),
+            pin: Some("1.3".into()),
+            hash: Some("abc".into()),
+        }];
+        let key1 = BuildClosure::for_meta(&meta, requires.clone()).cache_key();
+        let key2 = BuildClosure::for_meta(&meta, requires).cache_key();
         assert_eq!(key1, key2);
     }
 
     #[test]
-    fn test_source_key_single_part_unchanged_by_parts_support() {
-        // Back-compat contract: a meta without `parts` must key exactly as
-        // before multi-part support existed (name:version:url, no suffix).
+    fn test_closure_key_varies_with_source_change() {
+        // The old format test pinned byte-compat with the pre-closure key;
+        // v2 deliberately breaks that (one cold-cache rebuild on upgrade).
         let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
-        let expected_input = "hello:1.0:https://example.com/hello.tar.gz";
-        let expected: String = sha2::Sha256::digest(expected_input.as_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        assert_eq!(PackageCache::source_key(&meta), expected);
+        let changed = make_source_meta("hello", "https://example.com/hello-v2.tar.gz");
+        assert_ne!(
+            BuildClosure::for_meta(&meta, vec![]).cache_key(),
+            BuildClosure::for_meta(&changed, vec![]).cache_key()
+        );
     }
 
     #[test]
-    fn test_source_key_varies_with_parts_spec() {
+    fn test_closure_key_varies_with_parts_spec() {
         let mut meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
         meta.build = None;
         meta.parts = Some(
@@ -479,14 +613,17 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
         );
-        let with_parts = PackageCache::source_key(&meta);
+        let with_parts = BuildClosure::for_meta(&meta, vec![]).cache_key();
 
         // Different command → different key
         let mut meta2 = meta.clone();
         if let Some(parts) = &mut meta2.parts {
             parts.get_mut("core").unwrap().build = "make all".into();
         }
-        assert_ne!(with_parts, PackageCache::source_key(&meta2));
+        assert_ne!(
+            with_parts,
+            BuildClosure::for_meta(&meta2, vec![]).cache_key()
+        );
 
         // New part name → different key
         let mut meta3 = meta.clone();
@@ -501,21 +638,28 @@ mod tests {
                 },
             );
         }
-        assert_ne!(with_parts, PackageCache::source_key(&meta3));
+        assert_ne!(
+            with_parts,
+            BuildClosure::for_meta(&meta3, vec![]).cache_key()
+        );
 
         // Added `after` edge → different key
         let mut meta4 = meta.clone();
         if let Some(parts) = &mut meta4.parts {
             parts.get_mut("core").unwrap().after = vec!["ui".into()];
         }
-        assert_ne!(with_parts, PackageCache::source_key(&meta4));
+        assert_ne!(
+            with_parts,
+            BuildClosure::for_meta(&meta4, vec![]).cache_key()
+        );
 
-        // Same spec → same key
+        // No parts at all → different key again
         let mut meta5 = meta.clone();
-        if let Some(parts) = &mut meta5.parts {
-            parts.get_mut("core").unwrap().after = vec![];
-        }
-        assert_eq!(with_parts, PackageCache::source_key(&meta5));
+        meta5.parts = None;
+        assert_ne!(
+            with_parts,
+            BuildClosure::for_meta(&meta5, vec![]).cache_key()
+        );
     }
 
     #[test]
@@ -568,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn test_source_key_varies_with_plugin_and_options() {
+    fn test_closure_key_varies_with_plugin_and_options() {
         let mut meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
         meta.build = None;
         meta.parts = Some(
@@ -585,7 +729,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
         );
-        let base = PackageCache::source_key(&meta);
+        let base = BuildClosure::for_meta(&meta, vec![]).cache_key();
 
         // Different plugin → different key
         let mut meta2 = meta.clone();
@@ -596,7 +740,7 @@ mod tests {
             .get_mut("core")
             .unwrap()
             .plugin = Some("cmake".into());
-        assert_ne!(base, PackageCache::source_key(&meta2));
+        assert_ne!(base, BuildClosure::for_meta(&meta2, vec![]).cache_key());
 
         // Option added → different key
         let mut meta3 = meta.clone();
@@ -613,7 +757,7 @@ mod tests {
             )]
             .into(),
         );
-        let with_options = PackageCache::source_key(&meta3);
+        let with_options = BuildClosure::for_meta(&meta3, vec![]).cache_key();
         assert_ne!(base, with_options);
 
         // Option value changed → different key
@@ -631,28 +775,121 @@ mod tests {
             )]
             .into(),
         );
-        assert_ne!(with_options, PackageCache::source_key(&meta4));
+        assert_ne!(
+            with_options,
+            BuildClosure::for_meta(&meta4, vec![]).cache_key()
+        );
 
         // Identical options → same key
-        assert_eq!(with_options, PackageCache::source_key(&meta3));
-
-        // Sorted-key canonicalization: same options inserted in a different
-        // container (BTreeMap normalizes anyway) → same key
-        let mut meta5 = meta3.clone();
-        meta5
-            .parts
-            .as_mut()
-            .unwrap()
-            .get_mut("core")
-            .unwrap()
-            .plugin_options = Some(
-            [(
-                "target".to_string(),
-                crate::plugins::PluginValue::Str("all".into()),
-            )]
-            .into(),
+        assert_eq!(
+            with_options,
+            BuildClosure::for_meta(&meta3, vec![]).cache_key()
         );
-        assert_eq!(with_options, PackageCache::source_key(&meta5));
+    }
+
+    #[test]
+    fn test_closure_key_varies_with_target() {
+        let mut meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        meta.target = None;
+        let native = BuildClosure::for_meta(&meta, vec![]).cache_key();
+
+        meta.target = Some("aarch64-linux-gnu".into());
+        let aarch64 = BuildClosure::for_meta(&meta, vec![]).cache_key();
+
+        meta.target = Some("x86_64-linux-gnu".into());
+        let x86_64 = BuildClosure::for_meta(&meta, vec![]).cache_key();
+
+        assert_ne!(native, aarch64);
+        assert_ne!(native, x86_64);
+        assert_ne!(aarch64, x86_64);
+
+        // No target → stable "native" default
+        meta.target = None;
+        assert_eq!(native, BuildClosure::for_meta(&meta, vec![]).cache_key());
+    }
+
+    #[test]
+    fn test_closure_key_varies_with_require_revision() {
+        let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        let member = |pin: Option<&str>, hash: Option<&str>| RequiresMember {
+            name: "zlib".into(),
+            pin: pin.map(str::to_string),
+            hash: hash.map(str::to_string),
+        };
+
+        let base = BuildClosure::for_meta(&meta, vec![member(Some("1.3"), None)]).cache_key();
+
+        // Pin (revision/version) changed → different key
+        let repinned = BuildClosure::for_meta(&meta, vec![member(Some("1.3.1"), None)]).cache_key();
+        assert_ne!(base, repinned);
+
+        // Lock hash appeared for the same pin → different key
+        let hashed =
+            BuildClosure::for_meta(&meta, vec![member(Some("1.3"), Some("aa"))]).cache_key();
+        assert_ne!(base, hashed);
+
+        // New dep in the closure → different key
+        let mut two = vec![member(Some("1.3"), None)];
+        two.push(RequiresMember {
+            name: "gmp".into(),
+            pin: Some("6.3".into()),
+            hash: None,
+        });
+        assert_ne!(base, BuildClosure::for_meta(&meta, two.clone()).cache_key());
+
+        // Same members → same key
+        assert_eq!(
+            BuildClosure::for_meta(&meta, two.clone()).cache_key(),
+            BuildClosure::for_meta(&meta, two).cache_key()
+        );
+    }
+
+    #[test]
+    fn test_closure_requires_sorted_and_deduplicated() {
+        let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        let member = |name: &str| RequiresMember {
+            name: name.to_string(),
+            pin: None,
+            hash: None,
+        };
+
+        // Same deps in different traversal order → identical key
+        let order_a = vec![member("zlib"), member("gmp"), member("mpfr")];
+        let order_b = vec![member("mpfr"), member("zlib"), member("gmp")];
+        assert_eq!(
+            BuildClosure::for_meta(&meta, order_a).cache_key(),
+            BuildClosure::for_meta(&meta, order_b).cache_key()
+        );
+
+        // Duplicates collapse to one member
+        let dup = vec![member("zlib"), member("zlib")];
+        let closure = BuildClosure::for_meta(&meta, dup);
+        assert_eq!(closure.requires.len(), 1);
+        assert_eq!(closure.requires[0].name, "zlib");
+    }
+
+    #[test]
+    fn test_pinned_member_from_lock_data() {
+        // Lock-only data (no I/O, works offline) resolves pin + content hash.
+        let mut lock = crate::lock::LockFile {
+            version: 1,
+            sources: std::collections::HashMap::new(),
+            snaps: std::collections::HashMap::new(),
+            inputs: std::collections::HashMap::new(),
+        };
+        lock.record_snap(&crate::snap::SnapRef {
+            name: "core22".into(),
+            revision: Some(1847),
+            sha3_384: Some("abc123".into()),
+        });
+
+        let member = pinned_member("core22", &lock).expect("pinned snap resolves");
+        assert_eq!(member.name, "core22");
+        assert_eq!(member.pin.as_deref(), Some("1847"));
+        assert_eq!(member.hash.as_deref(), Some("abc123"));
+
+        // Unpinned snap → None (caller falls back to version-pin, hash null)
+        assert!(pinned_member("unknown", &lock).is_none());
     }
 
     #[test]
@@ -660,7 +897,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = PackageCache::new(Some(dir.path().to_path_buf()));
         let meta = make_source_meta("missing", "https://example.com/missing.tar.gz");
-        assert!(cache.lookup(&meta, "amd64").is_none());
+        let closure = BuildClosure::for_meta(&meta, vec![]);
+        assert!(cache.lookup(&meta, "amd64", &closure).is_none());
     }
 
     #[test]
@@ -668,6 +906,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = PackageCache::new(Some(dir.path().to_path_buf()));
         let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        let closure = BuildClosure::for_meta(&meta, vec![]);
 
         let output_dir = tempfile::tempdir().unwrap();
         let snap_path = output_dir.path().join("hello_1.0_amd64.snap");
@@ -679,12 +918,56 @@ mod tests {
         };
 
         cache
-            .store(&meta, &result, "amd64", output_dir.path())
+            .store(&meta, &result, output_dir.path(), &closure)
             .unwrap();
 
-        let cached = cache.lookup(&meta, "amd64");
+        let cached = cache.lookup(&meta, "amd64", &closure);
         assert!(cached.is_some(), "should find cached snap");
         assert!(cached.unwrap().exists(), "cached file should exist");
+        // Cached under the closure key directory
+        assert!(dir
+            .path()
+            .join(closure.cache_key())
+            .join("hello_1.0_amd64.snap")
+            .exists());
+    }
+
+    #[test]
+    fn test_lookup_differs_by_target_and_requires() {
+        // Same meta, different closure → different key dir → no stale hits.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PackageCache::new(Some(dir.path().to_path_buf()));
+        let mut meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        let output_dir = tempfile::tempdir().unwrap();
+        let snap_path = output_dir.path().join("hello_1.0_amd64.snap");
+        std::fs::write(&snap_path, b"fake snap content").unwrap();
+        let result = BuildResult {
+            snap_filename: "hello_1.0_amd64.snap".into(),
+            source_info: None,
+        };
+
+        let closure = BuildClosure::for_meta(&meta, vec![]);
+        cache
+            .store(&meta, &result, output_dir.path(), &closure)
+            .unwrap();
+        assert!(cache.lookup(&meta, "amd64", &closure).is_some());
+
+        // Target change → miss
+        meta.target = Some("aarch64-linux-gnu".into());
+        let other_target = BuildClosure::for_meta(&meta, vec![]);
+        assert!(cache.lookup(&meta, "amd64", &other_target).is_none());
+
+        // Requires revision change → miss
+        meta.target = None;
+        let other_reqs = BuildClosure::for_meta(
+            &meta,
+            vec![RequiresMember {
+                name: "zlib".into(),
+                pin: Some("1.3".into()),
+                hash: None,
+            }],
+        );
+        assert!(cache.lookup(&meta, "amd64", &other_reqs).is_none());
     }
 
     #[test]
@@ -692,6 +975,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = PackageCache::new(Some(dir.path().to_path_buf()));
         let meta = make_meta_meta("build-deps");
+        let closure = BuildClosure::for_meta(&meta, vec![]);
 
         // store should be a no-op for meta packages
         let output_dir = tempfile::tempdir().unwrap();
@@ -701,11 +985,11 @@ mod tests {
             source_info: None,
         };
         cache
-            .store(&meta, &result, "amd64", output_dir.path())
+            .store(&meta, &result, output_dir.path(), &closure)
             .unwrap();
 
         // Should not find it
-        assert!(cache.lookup(&meta, "amd64").is_none());
+        assert!(cache.lookup(&meta, "amd64", &closure).is_none());
     }
 
     #[test]
@@ -715,6 +999,7 @@ mod tests {
 
         // Store something
         let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        let closure = BuildClosure::for_meta(&meta, vec![]);
         let output_dir = tempfile::tempdir().unwrap();
         let snap_path = output_dir.path().join("hello_1.0_amd64.snap");
         std::fs::write(&snap_path, b"fake snap content").unwrap();
@@ -723,11 +1008,11 @@ mod tests {
             source_info: None,
         };
         cache
-            .store(&meta, &result, "amd64", output_dir.path())
+            .store(&meta, &result, output_dir.path(), &closure)
             .unwrap();
 
         // Verify it's there
-        assert!(cache.lookup(&meta, "amd64").is_some());
+        assert!(cache.lookup(&meta, "amd64", &closure).is_some());
 
         // Clear
         cache.clear().unwrap();

@@ -347,6 +347,65 @@ fn prepare_inputs(
     Ok(lockfile)
 }
 
+/// Build the canonical build-input closure for a snap: source identity +
+/// parts spec + cross-compilation target + resolved requires closure
+/// (gap-analysis §4.3). Computed once per snap per build, after requires
+/// resolution; every cache lookup/store uses the key derived from it.
+///
+/// Requires resolution uses lockfile pins when present (no I/O); unpinned
+/// deps are resolved from already-initialized local input caches — this
+/// never fetches. With `--offline` an unfetchable input fails earlier, in
+/// `init_global_inputs_with`, exactly as before this existed.
+fn build_closure(
+    meta: &shuttle::snap::SnapMeta,
+    lockfile: &LockFile,
+) -> shuttle::cache::BuildClosure {
+    let mut names: Vec<String> = if meta.requires.is_empty() {
+        Vec::new()
+    } else {
+        shuttle::deps::resolve_dep_names(&meta.requires, true).unwrap_or_default()
+    };
+    names.sort();
+    names.dedup();
+    let requires = names
+        .iter()
+        .map(|name| requires_member(name, lockfile))
+        .collect();
+    shuttle::cache::BuildClosure::for_meta(meta, requires)
+}
+
+/// Resolve one requires-closure member. A lockfile pin (revision +
+/// sha3-384) wins — pure data, safe offline. Otherwise the dep's declared
+/// version pins it with `hash: None`: an unpinned store dep is only
+/// version-pinned, so content changes behind the version cannot invalidate
+/// the cache key (known limitation; `shuttle lock` and image builds record
+/// snap pins that close this gap).
+fn requires_member(name: &str, lockfile: &LockFile) -> shuttle::cache::RequiresMember {
+    if let Some(member) = shuttle::cache::pinned_member(name, lockfile) {
+        return member;
+    }
+    let pin = shuttle::deps::load_meta(name).ok().map(|meta| meta.version);
+    shuttle::cache::RequiresMember {
+        name: name.to_string(),
+        pin,
+        hash: None,
+    }
+}
+
+/// True when every arch `dep` will be built for is already cached under its
+/// closure key. Replaces the old hardcoded `"amd64"` lookup, which could
+/// serve a stale amd64 artifact for an aarch64 build of the same source.
+fn dep_fully_cached(
+    cache: &shuttle::cache::PackageCache,
+    closure: &shuttle::cache::BuildClosure,
+    dep_meta: &shuttle::snap::SnapMeta,
+    cli_archs: &[String],
+) -> bool {
+    shuttle::snap::resolve_archs(dep_meta, cli_archs)
+        .iter()
+        .all(|a| cache.lookup(dep_meta, a, closure).is_some())
+}
+
 /// Inner build logic after outputs are resolved.
 #[allow(clippy::too_many_arguments)]
 fn run_build(
@@ -469,9 +528,19 @@ fn run_build(
                     dep_meta.target = Some(t.clone());
                 }
 
-                // Check cache first
-                if let Some(ref cache) = pkg_cache {
-                    if let Some(_cached_path) = cache.lookup(&dep_meta, "amd64") {
+                // Closure key for this dep: source + parts + target +
+                // requires closure, built once per dep; both the lookup and
+                // the store below use it.
+                let dep_closure = if pkg_cache.is_some() {
+                    Some(build_closure(&dep_meta, &lockfile))
+                } else {
+                    None
+                };
+
+                // Check cache first: skip the dep only when every resolved
+                // arch is cached under its closure key.
+                if let (Some(cache), Some(closure)) = (pkg_cache.as_ref(), dep_closure.as_ref()) {
+                    if dep_fully_cached(cache, closure, &dep_meta, &arch) {
                         if !json {
                             shuttle::output::ok(format!("{} (cached)", dep_name));
                         }
@@ -492,8 +561,11 @@ fn run_build(
                             if !json {
                                 shuttle::output::ok(&result.snap_filename);
                             }
-                            if let Some(ref cache) = pkg_cache {
-                                if let Err(e) = cache.store(&dep_meta, &result, a, output_dir) {
+                            if let (Some(cache), Some(closure)) =
+                                (pkg_cache.as_ref(), dep_closure.as_ref())
+                            {
+                                if let Err(e) = cache.store(&dep_meta, &result, output_dir, closure)
+                                {
                                     shuttle::output::warn(format!("cache store failed: {}", e));
                                 }
                             }
