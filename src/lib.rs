@@ -5,6 +5,7 @@ pub mod doctor;
 pub mod dsl;
 pub mod image;
 pub mod index;
+pub mod isolate;
 pub mod lock;
 pub mod lua;
 pub mod output;

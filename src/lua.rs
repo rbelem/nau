@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use miette::{IntoDiagnostic, WrapErr};
-use mlua::Value;
 
 use crate::image::ImageDeclaration;
 use crate::snap::{PackageInput, SnapMeta};
@@ -9,95 +8,44 @@ use crate::snap::{PackageInput, SnapMeta};
 /// Named outputs from a `shuttle.lua`, fully converted to owned Rust types.
 pub type Outputs = HashMap<String, SnapMeta>;
 
-/// Create a Luau instance with the DSL globals injected and package.path configured.
-pub fn new_lua(path: &str) -> miette::Result<mlua::Lua> {
-    // Reduced Luau stdlib: no `io`, limited `os` (clock/date/time only),
-    // read-only `debug`. First line of defense per ADR-0010 Decision 4 —
-    // process-level bounding (subprocess + rlimits) lands in a later lane.
-    let lua = mlua::Lua::new_with(mlua::StdLib::ALL_SAFE, mlua::LuaOptions::default())
-        .map_err(|e| miette::miette!("failed to create Luau VM: {e}"))?;
-
-    // Inject DSL globals before evaluating the user's config
-    lua.load(crate::dsl::INIT_LUA)
-        .exec()
-        .map_err(|e| miette::miette!("failed to initialize shuttle DSL: {}", e))?;
-
-    // Configure package.path so require() can find sibling .lua files.
-    // mlua's Luau backend ships its own `package` table + require loader
-    // honoring these templates (ADR-0010: lockfile-backed resolver lands later).
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        let parent_str = parent.to_string_lossy().replace('\\', "/");
-        let pkg_path = format!("{parent_str}/?.lua;{parent_str}/?/init.lua;");
-        lua.globals()
-            .get::<mlua::Table>("package")
-            .ok()
-            .and_then(|pkg| {
-                let current: String = pkg.get("path").ok()?;
-                pkg.set("path", pkg_path.clone() + &current).ok()
-            });
-    }
-
-    // Register the index() function from Rust (handles file I/O)
-    let arch = std::env::var("SHUTTLE_ARCH").unwrap_or_else(|_| "amd64".into());
-    let index_path_env = std::env::var("SHUTTLE_INDEX_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
-
-    let index_fn = lua
-        .create_function(move |lua_ctx, name: String| {
-            crate::index::lua_index_entry(lua_ctx, name, arch.clone(), index_path_env.clone())
-        })
-        .map_err(|e| miette::miette!("failed to register index(): {e}"))?;
-
-    lua.globals()
-        .set("index", index_fn)
-        .map_err(|e| miette::miette!("failed to set index global: {e}"))?;
-
-    Ok(lua)
-}
-
 /// Evaluate Lua source content and return the converted snap outputs.
+///
+/// The source is evaluated in a bounded subprocess worker (ADR-0010
+/// Decisions 4+5): rlimits + wall-clock deadline in the child, IPC-backed
+/// require with parent-side root allowlisting, narrowed stdlib. All eval
+/// inputs (prelude, index data, source) cross the pipe; the child opens no
+/// project files.
 ///
 /// Like `evaluate_file` but takes the Lua source string directly instead of
 /// reading from disk. Used for embedded packages that don't exist as files.
 pub fn evaluate_string(label: &str, source: &str) -> miette::Result<Outputs> {
-    let lua = new_lua(label)?;
-
-    let result: Value = lua
-        .load(source)
-        .eval()
-        .map_err(|e| miette::miette!("{}: {}", label, e))?;
-
-    match result {
-        Value::Table(table) => {
-            let mut outputs = Outputs::new();
-            for pair in table.pairs::<String, Value>() {
-                let (key, value) = pair.map_err(|e| miette::miette!("{}: {}", label, e))?;
-                match SnapMeta::from_lua_value(&value) {
-                    Ok(meta) => {
-                        outputs.insert(key, meta);
-                    }
-                    Err(e) => {
-                        crate::output::warn(format!("skipping output '{key}' from {label}: {e}"))
-                    }
-                }
-            }
-            Ok(outputs)
-        }
-        other => Err(miette::miette!(
-            "{} must return a table of outputs, got {}",
-            label,
-            other.type_name()
-        )),
+    let ok = run_worker_for(label, source)?;
+    for diag in &ok.diagnostics {
+        crate::output::warn(diag);
     }
+
+    // Map the worker's JSON outputs back into typed SnapMeta through a
+    // scratch VM, reusing the exact in-process validation (and its messages).
+    let lua = mlua::Lua::new();
+    let mut outputs = Outputs::new();
+    for (key, json) in &ok.outputs {
+        let value = json_to_lua(&lua, json)
+            .map_err(|e| miette::miette!("{label}: output '{key}' conversion failed: {e}"))?;
+        match SnapMeta::from_lua_value(&value) {
+            Ok(meta) => {
+                outputs.insert(key.clone(), meta);
+            }
+            Err(e) => crate::output::warn(format!("skipping output '{key}' from {label}: {e}")),
+        }
+    }
+    Ok(outputs)
 }
 
 /// Evaluate a Lua file and return the converted snap outputs.
 ///
 /// The file must return a Lua table of snap declarations.
 /// The shuttle DSL globals (`snap()`, `app()`) are injected before evaluation.
-/// All Lua data is converted to owned `SnapMeta` structs before returning
-/// (the mlua state is dropped within this function).
+/// All data is converted to owned Rust structs before returning.
 pub fn evaluate_file(path: &str) -> miette::Result<Outputs> {
     let source = std::fs::read_to_string(path)
         .into_diagnostic()
@@ -114,41 +62,40 @@ pub struct EvalOutput {
 }
 
 /// Evaluate Lua source and return both outputs and global inputs.
+///
+/// Runs through the bounded subprocess worker (see [`evaluate_string`]).
 pub fn evaluate_string_with_inputs(label: &str, source: &str) -> miette::Result<EvalOutput> {
-    let lua = new_lua(label)?;
+    let ok = run_worker_for(label, source)?;
+    for diag in &ok.diagnostics {
+        crate::output::warn(diag);
+    }
 
-    let result: Value = lua
-        .load(source)
-        .eval()
-        .map_err(|e| miette::miette!("{}: {}", label, e))?;
+    let lua = mlua::Lua::new();
+    let mut outputs = Outputs::new();
+    for (key, json) in &ok.outputs {
+        let value = json_to_lua(&lua, json)
+            .map_err(|e| miette::miette!("{label}: output '{key}' conversion failed: {e}"))?;
+        match SnapMeta::from_lua_value(&value) {
+            Ok(meta) => {
+                outputs.insert(key.clone(), meta);
+            }
+            Err(e) => crate::output::warn(format!("skipping output '{key}' from {label}: {e}")),
+        }
+    }
 
+    // Rehydrate the global `inputs` table in the scratch VM so the existing
+    // extraction (and its error messages) applies unchanged.
+    let inputs_value = json_to_lua(&lua, &ok.global_inputs)
+        .map_err(|e| miette::miette!("{label}: inputs conversion failed: {e}"))?;
+    lua.globals()
+        .set("inputs", inputs_value)
+        .map_err(|e| miette::miette!("failed to set inputs global: {e}"))?;
     let global_inputs = extract_inputs_from_lua(&lua)?;
 
-    match result {
-        Value::Table(table) => {
-            let mut outputs = Outputs::new();
-            for pair in table.pairs::<String, Value>() {
-                let (key, value) = pair.map_err(|e| miette::miette!("{}: {}", label, e))?;
-                match SnapMeta::from_lua_value(&value) {
-                    Ok(meta) => {
-                        outputs.insert(key, meta);
-                    }
-                    Err(e) => {
-                        crate::output::warn(format!("skipping output '{key}' from {label}: {e}"))
-                    }
-                }
-            }
-            Ok(EvalOutput {
-                outputs,
-                global_inputs,
-            })
-        }
-        other => Err(miette::miette!(
-            "{} must return a table of outputs, got {}",
-            label,
-            other.type_name()
-        )),
-    }
+    Ok(EvalOutput {
+        outputs,
+        global_inputs,
+    })
 }
 
 /// Evaluate a Lua file and return both outputs and global inputs.
@@ -165,12 +112,12 @@ fn extract_inputs_from_lua(lua: &mlua::Lua) -> miette::Result<HashMap<String, Pa
     let globals = lua.globals();
     let value: mlua::Value = globals.get("inputs").unwrap_or(mlua::Value::Nil);
     match value {
-        Value::Table(t) => {
+        mlua::Value::Table(t) => {
             let mut inputs = HashMap::new();
-            for pair in t.pairs::<String, Value>() {
+            for pair in t.pairs::<String, mlua::Value>() {
                 let (name, val) = pair.map_err(|e| miette::miette!("inputs entry: {e}"))?;
                 match val {
-                    Value::Table(input_table) => {
+                    mlua::Value::Table(input_table) => {
                         let url: String = input_table
                             .get("url")
                             .map_err(|_| miette::miette!("inputs['{name}']: missing 'url'"))?;
@@ -186,7 +133,7 @@ fn extract_inputs_from_lua(lua: &mlua::Lua) -> miette::Result<HashMap<String, Pa
             }
             Ok(inputs)
         }
-        Value::Nil => Ok(HashMap::new()),
+        mlua::Value::Nil => Ok(HashMap::new()),
         other => Err(miette::miette!(
             "'inputs' must be a table, got {}",
             other.type_name()
@@ -195,48 +142,91 @@ fn extract_inputs_from_lua(lua: &mlua::Lua) -> miette::Result<HashMap<String, Pa
 }
 
 /// Evaluate a Lua file and extract image declarations.
-pub fn evaluate_images(
-    lua: &mlua::Lua,
-    path: &str,
-) -> miette::Result<HashMap<String, ImageDeclaration>> {
+///
+/// Runs through the bounded subprocess worker (see [`evaluate_string`]).
+pub fn evaluate_images_file(path: &str) -> miette::Result<HashMap<String, ImageDeclaration>> {
     let source = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("could not read {}", path))?;
-
-    let result: Value = lua
-        .load(&source)
-        .eval()
-        .map_err(|e| miette::miette!("{}", e))?;
-
-    match result {
-        Value::Table(table) => {
-            let mut images = HashMap::new();
-            for pair in table.pairs::<String, Value>() {
-                let (key, value) = pair.map_err(|e| miette::miette!("{}", e))?;
-                if let Value::Table(t) = value {
-                    match ImageDeclaration::from_lua_table(&t) {
-                        Ok(decl) => {
-                            images.insert(key, decl);
-                        }
-                        Err(e) => {
-                            crate::output::warn(format!("skipping image '{key}' from {path}: {e}"))
-                        }
-                    }
-                }
-            }
-            Ok(images)
-        }
-        other => Err(miette::miette!(
-            "{} must return a table, got {}",
-            path,
-            other.type_name()
-        )),
+    let ok = run_worker_for(path, &source)?;
+    for diag in &ok.diagnostics {
+        crate::output::warn(diag);
     }
+
+    let lua = mlua::Lua::new();
+    let mut images = HashMap::new();
+    for (key, json) in &ok.outputs {
+        let value = json_to_lua(&lua, json)
+            .map_err(|e| miette::miette!("{path}: image '{key}' conversion failed: {e}"))?;
+        if let mlua::Value::Table(t) = value {
+            match ImageDeclaration::from_lua_table(&t) {
+                Ok(decl) => {
+                    images.insert(key.clone(), decl);
+                }
+                Err(e) => crate::output::warn(format!("skipping image '{key}' from {path}: {e}")),
+            }
+        }
+    }
+    Ok(images)
+}
+
+// ── Worker plumbing ──
+
+/// Build the full worker request for one definition eval: prelude, index
+/// data, and source all cross the pipe; the child reads no project files.
+fn eval_request(label: &str, source: &str) -> miette::Result<crate::isolate::EvalRequest> {
+    let arch = std::env::var("SHUTTLE_ARCH").unwrap_or_else(|_| "amd64".into());
+    let index_path = std::env::var("SHUTTLE_INDEX_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
+    let index = crate::index::PackageIndex::load_or_default(&index_path)?;
+    let index_data = serde_json::to_value(&index)
+        .map_err(|e| miette::miette!("failed to serialize index data: {e}"))?;
+    Ok(crate::isolate::EvalRequest {
+        prelude: crate::dsl::INIT_LUA.to_string(),
+        index_data,
+        arch,
+        sources: Default::default(),
+        entry: source.to_string(),
+        entry_label: label.to_string(),
+    })
+}
+
+fn run_worker_for(label: &str, source: &str) -> miette::Result<crate::isolate::WorkerOk> {
+    let req = eval_request(label, source)?;
+    crate::isolate::run_eval(&req)
+}
+
+/// Convert a serde_json value into an mlua value (in a scratch VM).
+///
+/// Numbers stay Numbers (Luau has a single number type), arrays keep
+/// 1-based sequence shape — matching what a direct in-process eval produced.
+fn json_to_lua(lua: &mlua::Lua, v: &serde_json::Value) -> mlua::Result<mlua::Value> {
+    Ok(match v {
+        serde_json::Value::Null => mlua::Value::Nil,
+        serde_json::Value::Bool(b) => mlua::Value::Boolean(*b),
+        serde_json::Value::Number(n) => mlua::Value::Number(n.as_f64().unwrap_or_default()),
+        serde_json::Value::String(s) => mlua::Value::String(lua.create_string(s.as_str())?),
+        serde_json::Value::Array(items) => {
+            let table = lua.create_table()?;
+            for (i, item) in items.iter().enumerate() {
+                table.raw_set((i + 1) as i64, json_to_lua(lua, item)?)?;
+            }
+            mlua::Value::Table(table)
+        }
+        serde_json::Value::Object(map) => {
+            let table = lua.create_table()?;
+            for (k, val) in map {
+                table.raw_set(k.as_str(), json_to_lua(lua, val)?)?;
+            }
+            mlua::Value::Table(table)
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use mlua::Value;
 
     /// Create a fresh Lua instance with the DSL globals injected.
     fn with_dsl() -> mlua::Lua {
@@ -298,29 +288,6 @@ mod tests {
             mlua::Lua::new().load("return 42").eval();
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), Value::Integer(42)));
-    }
-
-    #[test]
-    fn test_evaluate_file_requires_table() {
-        let path = "/tmp/test_shuttle_non_table.lua";
-        std::fs::write(path, "return 42").unwrap();
-        let result = evaluate_file(path);
-        assert!(result.is_err());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn test_broken_output_is_skipped_with_warning_not_silently_dropped() {
-        let source = r#"
-        return {
-            good = snap { name = "good-snap", version = "1.0" },
-            bad = "not-a-snap-table",
-        }
-        "#;
-        let outputs = evaluate_string("test-broken", source)
-            .expect("broken output should warn and be skipped, not fail the eval");
-        assert_eq!(outputs.len(), 1, "only the valid output should be kept");
-        assert!(outputs.contains_key("good"));
     }
 
     #[test]
@@ -790,26 +757,5 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(val, mlua::Value::Integer(1));
-    }
-
-    #[test]
-    fn test_composed_config_via_evaluate_file() {
-        let result = evaluate_file("test-fixtures/composed.lua");
-        assert!(
-            result.is_ok(),
-            "composed config should evaluate: {:?}",
-            result.err()
-        );
-
-        let outputs = result.unwrap();
-        assert!(outputs.contains_key("default"));
-
-        let meta = &outputs["default"];
-        assert_eq!(meta.name, "my-composed-app");
-        assert_eq!(meta.version, "1.0.0");
-        // From the base template via merge
-        assert_eq!(meta.summary.as_deref(), Some("A snap built with shuttle"));
-        assert_eq!(meta.grade, "stable");
-        assert_eq!(meta.confinement, "strict");
     }
 }

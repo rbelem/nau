@@ -130,6 +130,8 @@ fn main() -> miette::Result<()> {
         Command::Completion { shell } => cmd_completion(shell),
 
         Command::Cache(sub) => cmd_cache(sub),
+
+        Command::EvalWorker => shuttle::isolate::worker_main(),
     }
 }
 
@@ -738,7 +740,6 @@ fn cmd_image(
         inputs: HashMap::new(),
     });
 
-    let lua = shuttle::lua::new_lua(&file)?;
     let images = if let Some(_embedded) = file.strip_prefix("embedded://") {
         // Embedded packages are single snaps, not images — return empty
         if !shuttle::output::is_json() {
@@ -746,7 +747,7 @@ fn cmd_image(
         }
         std::collections::HashMap::new()
     } else {
-        shuttle::lua::evaluate_images(&lua, &file)?
+        shuttle::lua::evaluate_images_file(&file)?
     };
 
     let output_dir = Path::new(&output);

@@ -495,6 +495,14 @@ fn global_pkgs_paths() -> HashMap<String, PathBuf> {
         .unwrap_or_default()
 }
 
+/// Directories of the initialized global input sources.
+///
+/// These are the allowlisted roots the eval subprocess resolver may serve
+/// `require()` requests from (see `crate::isolate::SourceResolver`).
+pub fn resolver_roots() -> Vec<PathBuf> {
+    global_pkgs_paths().into_values().collect()
+}
+
 // ── Package resolution ──
 
 /// Result of resolving a package.

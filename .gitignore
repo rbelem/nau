@@ -13,6 +13,11 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Build outputs from definition builds and smoke tests
+*.snap
+shuttle.lock
+stage/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
