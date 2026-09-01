@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::Path;
 
@@ -148,10 +148,66 @@ pub struct SnapMeta {
     #[serde(default = "default_confinement")]
     pub confinement: String,
 
-    /// Package type: "source" (build from source), "meta" (dependencies only),
-    /// "store" (from Snap Store). Inferred from presence of source/build fields.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Snap type. Doubles as a shuttle build classification
+    /// ("source"/"meta"/"store" — build-time only, skipped in YAML) and the
+    /// snapd `type` field ("app"/"base"/"gadget"/"kernel"/"snapd").
+    /// snapd defaults to "app", so `type:` is only emitted for the non-app
+    /// snapd types.
+    #[serde(
+        default,
+        rename = "type",
+        skip_serializing_if = "skip_internal_or_default_type"
+    )]
     pub type_: Option<String>,
+
+    /// Name of the part whose metadata (version/summary/description) this
+    /// snap adopts, per snapd's adopt-info semantics. Part-metadata
+    /// extraction doesn't exist yet (v1): adopt-info is emitted verbatim
+    /// and only relaxes the requirement for `version` in the DSL.
+    #[serde(
+        default,
+        rename = "adopt-info",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub adopt_info: Option<String>,
+
+    /// Source path of the icon file from the DSL (e.g. "icon.png").
+    /// Build-time only — the file is copied to `meta/gui/icon.<ext>` and
+    /// the `icon` field below points there, as snapd expects.
+    #[serde(skip)]
+    pub icon_source: Option<String>,
+
+    /// Path of the icon inside the snap (e.g. "meta/gui/icon.png").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+
+    /// SquashFS compression for mksquashfs ("xz" or "lzo"). Build-time only
+    /// — snap.yaml has no compression field; it's a property of the image.
+    #[serde(default, skip)]
+    pub compression: Option<String>,
+
+    /// Global environment variables applied to every app in the snap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<BTreeMap<String, String>>,
+
+    /// Filesystem layout overrides: target path → one of bind/bind-file/
+    /// symlink/tmpfs, matching snapd's `layout:` schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<BTreeMap<String, LayoutEntry>>,
+
+    /// Hook scripts: hook name → command. The source script is copied to
+    /// `meta/hooks/<name>` during build; `command` points there per snapd
+    /// convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<BTreeMap<String, SnapHook>>,
+
+    /// Typed snap-level plugs: name → interface name or attribute table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugs: Option<BTreeMap<String, SnapPlug>>,
+
+    /// Typed snap-level slots: name → interface name or attribute table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<BTreeMap<String, SnapPlug>>,
 
     /// Alternative names this package is known by. Skipped in YAML — build metadata only.
     #[serde(skip)]
@@ -183,6 +239,12 @@ pub struct SnapMeta {
     pub apps: HashMap<String, SnapApp>,
 }
 
+/// Skip `type:` in snap.yaml for shuttle build classifications
+/// ("source"/"meta"/"store") and snapd's default ("app").
+fn skip_internal_or_default_type(t: &Option<String>) -> bool {
+    !matches!(t.as_deref(), Some("base" | "gadget" | "kernel" | "snapd"))
+}
+
 fn default_grade() -> String {
     "stable".to_string()
 }
@@ -206,7 +268,86 @@ pub struct SnapApp {
     pub slots: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment: Option<HashMap<String, String>>,
+    pub environment: Option<BTreeMap<String, String>>,
+}
+
+// ── Phase 15: snap.yaml coverage structs ──
+
+/// tmpfs layout spec: bare `true` or `{ size = "…" }`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum TmpfsSpec {
+    Bare(bool),
+    Sized { size: String },
+}
+
+/// One `layout:` entry — exactly one of bind / bind-file / symlink / tmpfs.
+/// Serializes as a single-key plain map, matching snapd's schema:
+/// `bind: $SNAP/...`, `bind-file: $SNAP_DATA/...`, `symlink: ...`,
+/// `tmpfs: true|{ size: ... }`.
+///
+/// Hand-written (not `#[derive(Serialize)]`) because serde_yaml renders
+/// derived enum variants with `!Tag` annotations, which snapd rejects.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayoutEntry {
+    Bind(String),
+    BindFile(String),
+    Symlink(String),
+    Tmpfs(TmpfsSpec),
+}
+
+impl serde::Serialize for LayoutEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            LayoutEntry::Bind(v) => map.serialize_entry("bind", v)?,
+            LayoutEntry::BindFile(v) => map.serialize_entry("bind-file", v)?,
+            LayoutEntry::Symlink(v) => map.serialize_entry("symlink", v)?,
+            LayoutEntry::Tmpfs(spec) => map.serialize_entry("tmpfs", spec)?,
+        }
+        map.end()
+    }
+}
+
+/// A typed plug or slot: `interface` plus string-valued attributes
+/// flattened beside it in snap.yaml:
+///
+/// ```yaml
+/// plugs:
+///   shared-data:
+///     interface: content
+///     content: my-content
+///     target: $SNAP/data
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlugSlot {
+    pub interface: String,
+
+    /// Interface-specific attributes (content, target, default_provider, …).
+    #[serde(flatten)]
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// A snap-level plug or slot value: a bare interface name (back-compat,
+/// `plugs = { "network" }`) or a typed attribute table.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum SnapPlug {
+    Name(String),
+    Typed(PlugSlot),
+}
+
+/// A hook: `command` is the in-snap path snapd executes (always
+/// `meta/hooks/<name>`, per snapcraft convention); `source` is the script
+/// path from the DSL, copied to that location at build time.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapHook {
+    pub command: String,
+
+    /// Source script path from the DSL (build-time only, skipped in YAML).
+    #[serde(skip)]
+    pub source: String,
 }
 
 // ── Conversion from Lua (Phase 3) ──
@@ -230,7 +371,19 @@ impl SnapMeta {
     /// Convert a validated Lua table (from `snap()`) into a `SnapMeta`.
     pub fn from_lua_table(table: &mlua::Table) -> miette::Result<Self> {
         let name = get_required_string(table, "name")?;
-        let version = get_required_string(table, "version")?;
+        let adopt_info = get_opt_string(table, "adopt_info")?;
+        // With adopt-info, snapd takes version (and summary/description)
+        // from the adopted part. Part-metadata extraction doesn't exist
+        // yet (v1), so version falls back to a placeholder when adopted.
+        let version = match get_opt_string(table, "version")? {
+            Some(v) => v,
+            None if adopt_info.is_some() => "0".to_string(),
+            None => {
+                return Err(miette::miette!(
+                    "snap meta: field 'version' is required but invalid: missing, and no adopt_info set"
+                ))
+            }
+        };
         let summary = get_opt_string(table, "summary")?;
         let description = get_opt_string(table, "description")?;
         let license = get_opt_string(table, "license")?;
@@ -240,6 +393,14 @@ impl SnapMeta {
         let architectures = get_opt_string_array(table, "architectures")?;
         let build = get_opt_string(table, "build")?;
         let type_: Option<String> = table.get("type").ok();
+        let icon_source = get_opt_string(table, "icon")?;
+        let icon = icon_target_from_source(icon_source.as_deref())?;
+        let compression = get_opt_string(table, "compression")?;
+        let environment = get_opt_string_map(table, "environment")?;
+        let layout = get_opt_layout(table)?;
+        let hooks = get_opt_hooks(table)?;
+        let plugs = get_opt_plug_map(table, "plugs")?;
+        let slots = get_opt_plug_map(table, "slots")?;
         let aliases: Vec<String> = table.get("aliases").unwrap_or_default();
         let requires: Vec<String> = table.get("requires").unwrap_or_default();
         let target: Option<String> = get_opt_string(table, "target")?;
@@ -281,12 +442,172 @@ impl SnapMeta {
             grade,
             confinement,
             type_,
+            adopt_info,
+            icon_source,
+            icon,
+            compression,
+            environment,
+            layout,
+            hooks,
+            plugs,
+            slots,
             aliases,
             requires,
             target,
             toolchain,
             inputs,
             apps,
+        })
+    }
+}
+
+/// Map an icon source path to its in-snap target (`meta/gui/icon.<ext>`),
+/// preserving the extension as snapd expects.
+fn icon_target_from_source(source: Option<&str>) -> miette::Result<Option<String>> {
+    let Some(src) = source else {
+        return Ok(None);
+    };
+    let ext = Path::new(src)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .ok_or_else(|| {
+            miette::miette!(
+                "snap meta: 'icon' must have a file extension (e.g. icon.png), got '{src}'"
+            )
+        })?;
+    Ok(Some(format!("meta/gui/icon.{ext}")))
+}
+
+impl LayoutEntry {
+    /// Convert a validated Lua layout entry (exactly one of
+    /// bind/bind_file/symlink/tmpfs) into a `LayoutEntry`.
+    fn from_lua_table(target: &str, t: &mlua::Table) -> miette::Result<Self> {
+        let bind = get_opt_entry_string(t, target, "bind")?;
+        let bind_file = get_opt_entry_string(t, target, "bind_file")?;
+        let symlink = get_opt_entry_string(t, target, "symlink")?;
+        let tmpfs = get_opt_tmpfs(t, target)?;
+
+        let count = bind.is_some() as u8
+            + bind_file.is_some() as u8
+            + symlink.is_some() as u8
+            + tmpfs.is_some() as u8;
+        if count == 0 {
+            return Err(miette::miette!(
+                "layout['{target}'] must have exactly one of bind, bind_file, symlink, tmpfs"
+            ));
+        }
+        if count > 1 {
+            return Err(miette::miette!(
+                "layout['{target}'] must have exactly one of bind, bind_file, symlink, tmpfs (got {count})"
+            ));
+        }
+
+        Ok(match (bind, bind_file, symlink, tmpfs) {
+            (Some(v), None, None, None) => LayoutEntry::Bind(v),
+            (None, Some(v), None, None) => LayoutEntry::BindFile(v),
+            (None, None, Some(v), None) => LayoutEntry::Symlink(v),
+            (None, None, None, Some(v)) => LayoutEntry::Tmpfs(v),
+            _ => unreachable!("exactly-one constraint checked above"),
+        })
+    }
+}
+
+/// Read an optional string value from a layout entry table.
+fn get_opt_entry_string(
+    t: &mlua::Table,
+    target: &str,
+    key: &str,
+) -> miette::Result<Option<String>> {
+    match t.get::<Value>(key).unwrap_or(Value::Nil) {
+        Value::String(s) => Ok(Some(
+            s.to_str()
+                .map_err(|e| miette::miette!("{}", e))?
+                .to_string(),
+        )),
+        Value::Nil => Ok(None),
+        other => Err(miette::miette!(
+            "layout['{target}'].{key} must be a string, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// Read the optional tmpfs spec: bare `true` or a table with optional
+/// string `size` (an empty table counts as bare).
+fn get_opt_tmpfs(t: &mlua::Table, target: &str) -> miette::Result<Option<TmpfsSpec>> {
+    match t.get::<Value>("tmpfs").unwrap_or(Value::Nil) {
+        Value::Boolean(true) => Ok(Some(TmpfsSpec::Bare(true))),
+        Value::Boolean(false) => Err(miette::miette!(
+            "layout['{target}'].tmpfs must be true or a table with optional string 'size'"
+        )),
+        Value::Table(tt) => Ok(Some(match tt.get::<Value>("size").unwrap_or(Value::Nil) {
+            Value::String(s) => TmpfsSpec::Sized {
+                size: s
+                    .to_str()
+                    .map_err(|e| miette::miette!("{}", e))?
+                    .to_string(),
+            },
+            Value::Nil => TmpfsSpec::Bare(true),
+            other => {
+                return Err(miette::miette!(
+                    "layout['{target}'].tmpfs.size must be a string, got {}",
+                    other.type_name()
+                ));
+            }
+        })),
+        Value::Nil => Ok(None),
+        other => Err(miette::miette!(
+            "layout['{target}'].tmpfs must be true or a table, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+impl PlugSlot {
+    /// Convert a validated Lua plug/slot attribute table (required string
+    /// `interface` plus string-valued attributes) into a `PlugSlot`.
+    fn from_lua_table(label: &str, t: &mlua::Table) -> miette::Result<Self> {
+        let interface = match t.get::<Value>("interface").unwrap_or(Value::Nil) {
+            Value::String(s) => s
+                .to_str()
+                .map_err(|e| miette::miette!("{}", e))?
+                .to_string(),
+            other => {
+                return Err(miette::miette!(
+                    "{label}.interface must be a string, got {}",
+                    other.type_name()
+                ));
+            }
+        };
+
+        let mut attributes = BTreeMap::new();
+        for pair in t.pairs::<String, Value>() {
+            let (k, v) = pair.map_err(|e| miette::miette!("{label}: {e}"))?;
+            if k == "interface" {
+                continue;
+            }
+            match v {
+                Value::String(s) => {
+                    attributes.insert(
+                        k,
+                        s.to_str()
+                            .map_err(|e| miette::miette!("{}", e))?
+                            .to_string(),
+                    );
+                }
+                other => {
+                    return Err(miette::miette!(
+                        "{label}.{k} must be a string, got {}",
+                        other.type_name()
+                    ));
+                }
+            }
+        }
+
+        Ok(PlugSlot {
+            interface,
+            attributes,
         })
     }
 }
@@ -298,7 +619,7 @@ impl SnapApp {
         let daemon = get_opt_string(table, "daemon")?;
         let plugs = get_opt_string_array(table, "plugs")?;
         let slots = get_opt_string_array(table, "slots")?;
-        let environment = get_opt_map(table, "environment")?;
+        let environment = get_opt_string_map(table, "environment")?;
 
         Ok(SnapApp {
             command,
@@ -395,13 +716,16 @@ fn get_source_spec(table: &mlua::Table) -> miette::Result<Option<SourceSpec>> {
     }
 }
 
-fn get_opt_map(table: &mlua::Table, key: &str) -> miette::Result<Option<HashMap<String, String>>> {
+fn get_opt_string_map(
+    table: &mlua::Table,
+    key: &str,
+) -> miette::Result<Option<BTreeMap<String, String>>> {
     match table
         .get::<Value>(key)
         .map_err(|e| miette::miette!("{}", e))?
     {
         Value::Table(t) => {
-            let mut map = HashMap::new();
+            let mut map = BTreeMap::new();
             for pair in t.pairs::<String, Value>() {
                 let (k, v) = pair.map_err(|e| miette::miette!("{}: {}", key, e))?;
                 if let Value::String(s) = v {
@@ -418,6 +742,125 @@ fn get_opt_map(table: &mlua::Table, key: &str) -> miette::Result<Option<HashMap<
         Value::Nil => Ok(None),
         _ => Ok(None),
     }
+}
+
+/// Extract `layout`: target path → exactly one of bind/bind_file/symlink/tmpfs.
+fn get_opt_layout(table: &mlua::Table) -> miette::Result<Option<BTreeMap<String, LayoutEntry>>> {
+    let Some(t) = get_opt_table(table, "layout")? else {
+        return Ok(None);
+    };
+    let mut layout = BTreeMap::new();
+    for pair in t.pairs::<String, Value>() {
+        let (target, value) = pair.map_err(|e| miette::miette!("layout entry: {e}"))?;
+        match value {
+            Value::Table(entry_table) => {
+                let entry = LayoutEntry::from_lua_table(&target, &entry_table)?;
+                layout.insert(target, entry);
+            }
+            other => {
+                return Err(miette::miette!(
+                    "layout['{target}'] must be a table, got {}",
+                    other.type_name()
+                ));
+            }
+        }
+    }
+    Ok(Some(layout))
+}
+
+/// Extract `hooks`: hook name → script path. `command` follows snapd
+/// convention: scripts live at `meta/hooks/<name>` (build_snap copies them
+/// there from the DSL's source path).
+fn get_opt_hooks(table: &mlua::Table) -> miette::Result<Option<BTreeMap<String, SnapHook>>> {
+    let Some(t) = get_opt_table(table, "hooks")? else {
+        return Ok(None);
+    };
+    let mut hooks = BTreeMap::new();
+    for pair in t.pairs::<String, Value>() {
+        let (name, value) = pair.map_err(|e| miette::miette!("hooks entry: {e}"))?;
+        let script = match value {
+            Value::String(s) => s
+                .to_str()
+                .map_err(|e| miette::miette!("{}", e))?
+                .to_string(),
+            other => {
+                return Err(miette::miette!(
+                    "hooks['{name}'] must be a string script path, got {}",
+                    other.type_name()
+                ));
+            }
+        };
+        hooks.insert(
+            name.clone(),
+            SnapHook {
+                command: format!("meta/hooks/{name}"),
+                source: script,
+            },
+        );
+    }
+    Ok(Some(hooks))
+}
+
+/// Extract a snap-level `plugs`/`slots` map: name → bare interface string
+/// (back-compat) or attribute table. Two string-array back-compat forms are
+/// accepted: map form (`plugs = { network = "network" }`) and array form
+/// (`plugs = { "network" }`, where the interface name doubles as the key).
+fn get_opt_plug_map(
+    table: &mlua::Table,
+    key: &str,
+) -> miette::Result<Option<BTreeMap<String, SnapPlug>>> {
+    let Some(t) = get_opt_table(table, key)? else {
+        return Ok(None);
+    };
+    let mut map = BTreeMap::new();
+    for pair in t.pairs::<Value, Value>() {
+        let (k, v) = pair.map_err(|e| miette::miette!("{key} entry: {e}"))?;
+        let entry = match (&k, &v) {
+            // Map form: `plugs = { network = "network" }`
+            (Value::String(name), Value::String(iface)) => {
+                let iface = iface
+                    .to_str()
+                    .map_err(|e| miette::miette!("{}", e))?
+                    .to_string();
+                let name = name
+                    .to_str()
+                    .map_err(|e| miette::miette!("{}", e))?
+                    .to_string();
+                (name, SnapPlug::Name(iface))
+            }
+            // Map form with attributes: `plugs = { shared = { interface = … } }`
+            (Value::String(name), Value::Table(tt)) => {
+                let name = name
+                    .to_str()
+                    .map_err(|e| miette::miette!("{}", e))?
+                    .to_string();
+                let plug = PlugSlot::from_lua_table(&format!("{key}['{name}']"), tt)?;
+                (name, SnapPlug::Typed(plug))
+            }
+            // Array back-compat: `plugs = { "network" }`
+            (Value::Integer(_), Value::String(iface)) => {
+                let iface = iface
+                    .to_str()
+                    .map_err(|e| miette::miette!("{}", e))?
+                    .to_string();
+                (iface.clone(), SnapPlug::Name(iface))
+            }
+            (Value::Integer(i), other) => {
+                return Err(miette::miette!(
+                    "{key}[{i}] must be a string interface name, got {}",
+                    other.type_name()
+                ));
+            }
+            (other, _) => {
+                return Err(miette::miette!(
+                    "{key}: unsupported key type {}",
+                    other.type_name()
+                ));
+            }
+        };
+        map.insert(entry.0, entry.1);
+    }
+    Ok(Some(map))
 }
 
 /// Extract `inputs` table: maps name → PackageInput { url }.
@@ -497,6 +940,14 @@ pub fn build_snap(
     std::fs::write(meta_dir.join("snap.yaml"), &yaml)
         .map_err(|e| miette::miette!("failed to write meta/snap.yaml: {}", e))?;
 
+    // 2b. Copy hook scripts to meta/hooks/<name> — the location the emitted
+    // `hooks: <name>: command:` entries point at (snapd convention).
+    copy_hook_scripts(&arch_meta, build_dir.path())?;
+
+    // 2c. Copy the icon to meta/gui/icon.<ext> — the location the emitted
+    // `icon:` field points at.
+    copy_icon(&arch_meta, build_dir.path())?;
+
     // 3. Copy stage contents into build root
     if stage_dir.exists() {
         cp_r(stage_dir, build_dir.path())
@@ -509,13 +960,14 @@ pub fn build_snap(
 
     // 5. Run mksquashfs with optional SOURCE_DATE_EPOCH
     let pack_spinner = output::spinner(&format!("packaging {} as .snap...", meta.name));
+    let compression = meta.compression.as_deref().unwrap_or("xz");
     let mut mksquashfs = std::process::Command::new("mksquashfs");
     mksquashfs
         .arg(build_dir.path())
         .arg(&output_path)
         .arg("-noappend")
         .arg("-comp")
-        .arg("xz")
+        .arg(compression)
         .arg("-all-root");
 
     // Reproducible timestamps via SOURCE_DATE_EPOCH.
@@ -711,8 +1163,20 @@ fn run_build_command(
     stage_dir: &Path,
     target: Option<&str>,
 ) -> miette::Result<()> {
-    // Detect bubblewrap
-    let bwrap = std::process::Command::new("which")
+    let bwrap_bin = detect_bwrap();
+    let cross_env = cross_compile_env(target);
+
+    if let Some(bwrap_bin) = bwrap_bin {
+        run_bwrapped(
+            &bwrap_bin, cmd, build_path, work_dir, stage_dir, target, &cross_env,
+        )
+    } else {
+        run_direct(cmd, work_dir, stage_dir, &cross_env)
+    }
+}
+/// Detect the bubblewrap binary, if available.
+fn detect_bwrap() -> Option<String> {
+    std::process::Command::new("which")
         .arg("bwrap")
         .output()
         .ok()
@@ -725,141 +1189,151 @@ fn run_build_command(
             } else {
                 Some(s)
             }
-        });
+        })
+}
 
-    // Build cross-compilation environment variables if target is set.
-    // These follow the GNU cross-compiler naming convention:
-    //   CC = <target>-gcc, CXX = <target>-g++, etc.
-    let cross_env = if let Some(triplet) = target {
-        let mut env = Vec::new();
-        env.push(("CONFIGURE_TARGET", triplet.to_string()));
-        env.push(("CC", format!("{}-gcc", triplet)));
-        env.push(("CXX", format!("{}-g++", triplet)));
-        env.push(("LD", format!("{}-ld", triplet)));
-        env.push(("AR", format!("{}-ar", triplet)));
-        env.push(("AS", format!("{}-as", triplet)));
-        env.push(("RANLIB", format!("{}-ranlib", triplet)));
-        env.push(("STRIP", format!("{}-strip", triplet)));
-        env.push(("OBJCOPY", format!("{}-objcopy", triplet)));
-        env.push(("OBJDUMP", format!("{}-objdump", triplet)));
-        env.push(("NM", format!("{}-nm", triplet)));
-        env.push(("PKG_CONFIG", format!("{}-pkg-config", triplet)));
-        // Standard autotools cross-compilation vars
-        env.push(("BUILD", std::env::consts::ARCH.to_string()));
-        env.push(("HOST", triplet.to_string()));
-        env.push(("CROSS_COMPILE", format!("{}-", triplet)));
-        Some(env)
+/// Build cross-compilation environment variables if target is set.
+/// These follow the GNU cross-compiler naming convention:
+///   CC = <target>-gcc, CXX = <target>-g++, etc.
+fn cross_compile_env(target: Option<&str>) -> Vec<(&'static str, String)> {
+    let Some(triplet) = target else {
+        return Vec::new();
+    };
+    let mut env = Vec::new();
+    env.push(("CONFIGURE_TARGET", triplet.to_string()));
+    env.push(("CC", format!("{}-gcc", triplet)));
+    env.push(("CXX", format!("{}-g++", triplet)));
+    env.push(("LD", format!("{}-ld", triplet)));
+    env.push(("AR", format!("{}-ar", triplet)));
+    env.push(("AS", format!("{}-as", triplet)));
+    env.push(("RANLIB", format!("{}-ranlib", triplet)));
+    env.push(("STRIP", format!("{}-strip", triplet)));
+    env.push(("OBJCOPY", format!("{}-objcopy", triplet)));
+    env.push(("OBJDUMP", format!("{}-objdump", triplet)));
+    env.push(("NM", format!("{}-nm", triplet)));
+    env.push(("PKG_CONFIG", format!("{}-pkg-config", triplet)));
+    // Standard autotools cross-compilation vars
+    env.push(("BUILD", std::env::consts::ARCH.to_string()));
+    env.push(("HOST", triplet.to_string()));
+    env.push(("CROSS_COMPILE", format!("{}-", triplet)));
+    env
+}
+
+/// Apply cross-compilation env vars to a command.
+fn apply_cross_env(cmd: &mut std::process::Command, cross_env: &[(&'static str, String)]) {
+    for (key, val) in cross_env {
+        cmd.env(key, val);
+    }
+}
+
+/// Read-only bind of `path` into the sandbox, if it exists on the host.
+fn ro_bind_if_exists(cmd: &mut std::process::Command, path: &str) {
+    if Path::new(path).exists() {
+        cmd.arg("--ro-bind").arg(path).arg(path);
+    }
+}
+
+/// Read-only system paths for toolchain, shebangs, and Nix/devbox builds.
+fn bind_system_ro_paths(cmd: &mut std::process::Command) {
+    cmd.arg("--ro-bind").arg("/usr").arg("/usr");
+    cmd.arg("--ro-bind").arg("/lib").arg("/lib");
+    ro_bind_if_exists(cmd, "/lib64");
+    // Nix store (for NixOS/devbox builds)
+    ro_bind_if_exists(cmd, "/nix");
+    // Essential system paths (for shebangs, etc.)
+    ro_bind_if_exists(cmd, "/bin");
+    ro_bind_if_exists(cmd, "/run/current-system");
+}
+
+/// Run the build command inside a bubblewrap sandbox.
+fn run_bwrapped(
+    bwrap_bin: &str,
+    cmd: &str,
+    build_path: &Path,
+    work_dir: &Path,
+    stage_dir: &Path,
+    target: Option<&str>,
+    cross_env: &[(&'static str, String)],
+) -> miette::Result<()> {
+    // Determine the source path relative to /build inside the sandbox
+    let inner_src = if work_dir == build_path {
+        Path::new("/build").to_path_buf()
     } else {
-        None
+        let rel = work_dir.strip_prefix(build_path).unwrap_or(Path::new(""));
+        Path::new("/build").join(rel)
     };
 
-    if let Some(bwrap_bin) = bwrap {
-        // Determine the source path relative to /build inside the sandbox
-        let inner_src = if work_dir == build_path {
-            Path::new("/build").to_path_buf()
-        } else {
-            let rel = work_dir.strip_prefix(build_path).unwrap_or(Path::new(""));
-            Path::new("/build").join(rel)
-        };
-
-        let mut cmd_proc = std::process::Command::new(&bwrap_bin);
-        cmd_proc
-            .arg("--unshare-user")
-            .arg("--unshare-pid")
-            .arg("--unshare-ipc")
-            .arg("--unshare-net")
-            .arg("--proc")
-            .arg("/proc")
-            .arg("--dev")
-            .arg("/dev")
-            // Mount build dir at /build inside sandbox
-            .arg("--bind")
-            .arg(build_path)
-            .arg("/build")
-            // Mount stage dir at its absolute host path
-            .arg("--bind")
-            .arg(stage_dir)
-            .arg(stage_dir)
-            // Read-only system paths for toolchain
-            .arg("--ro-bind")
-            .arg("/usr")
-            .arg("/usr")
-            .arg("--ro-bind")
-            .arg("/lib")
-            .arg("/lib");
-        if Path::new("/lib64").exists() {
-            cmd_proc.arg("--ro-bind").arg("/lib64").arg("/lib64");
-        }
-        // Nix store (for NixOS/devbox builds)
-        if Path::new("/nix").exists() {
-            cmd_proc.arg("--ro-bind").arg("/nix").arg("/nix");
-        }
-        // Essential system paths (for shebangs, etc.)
-        if Path::new("/bin").exists() {
-            cmd_proc.arg("--ro-bind").arg("/bin").arg("/bin");
-        }
-        if Path::new("/run/current-system").exists() {
-            cmd_proc
-                .arg("--ro-bind")
-                .arg("/run/current-system")
-                .arg("/run/current-system");
-        }
-        // Cross-compilation sysroot mount
-        if let Some(triplet) = target {
-            let sysroot = Path::new("/usr").join(triplet);
-            if sysroot.exists() {
-                cmd_proc.arg("--ro-bind").arg(&sysroot).arg(&sysroot);
-            }
-        }
-        // Private /tmp for build temp files
-        cmd_proc
-            .arg("--tmpfs")
-            .arg("/tmp")
-            .arg("--chdir")
-            .arg(&inner_src)
-            .env("STAGE", stage_dir)
-            .env("SRC", &inner_src);
-        // Apply cross-compilation env vars
-        if let Some(ref env) = cross_env {
-            for (key, val) in env {
-                cmd_proc.env(key, val);
-            }
-        }
-        cmd_proc.arg("sh").arg("-c").arg(cmd);
-
-        let status = cmd_proc
-            .status()
-            .map_err(|e| miette::miette!("bwrap execution failed: {}", e))?;
-
-        if !status.success() {
-            return Err(miette::miette!(
-                "build command exited with error (in sandbox)"
-            ));
-        }
-    } else {
-        // Fallback: run directly on host (no sandbox)
-        let mut cmd_proc = std::process::Command::new("sh");
-        cmd_proc
-            .args(["-c", cmd])
-            .env("STAGE", stage_dir)
-            .env("SRC", work_dir);
-        // Apply cross-compilation env vars
-        if let Some(ref env) = cross_env {
-            for (key, val) in env {
-                cmd_proc.env(key, val);
-            }
-        }
-        cmd_proc.current_dir(work_dir);
-
-        let status = cmd_proc
-            .status()
-            .map_err(|e| miette::miette!("failed to execute build: {}", e))?;
-
-        if !status.success() {
-            return Err(miette::miette!("build command exited with error"));
+    let mut cmd_proc = std::process::Command::new(bwrap_bin);
+    cmd_proc
+        .arg("--unshare-user")
+        .arg("--unshare-pid")
+        .arg("--unshare-ipc")
+        .arg("--unshare-net")
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--dev")
+        .arg("/dev")
+        // Mount build dir at /build inside sandbox
+        .arg("--bind")
+        .arg(build_path)
+        .arg("/build")
+        // Mount stage dir at its absolute host path
+        .arg("--bind")
+        .arg(stage_dir)
+        .arg(stage_dir);
+    bind_system_ro_paths(&mut cmd_proc);
+    // Cross-compilation sysroot mount
+    if let Some(triplet) = target {
+        let sysroot = Path::new("/usr").join(triplet);
+        if sysroot.exists() {
+            cmd_proc.arg("--ro-bind").arg(&sysroot).arg(&sysroot);
         }
     }
+    // Private /tmp for build temp files
+    cmd_proc
+        .arg("--tmpfs")
+        .arg("/tmp")
+        .arg("--chdir")
+        .arg(&inner_src)
+        .env("STAGE", stage_dir)
+        .env("SRC", &inner_src);
+    apply_cross_env(&mut cmd_proc, cross_env);
+    cmd_proc.arg("sh").arg("-c").arg(cmd);
 
+    let status = cmd_proc
+        .status()
+        .map_err(|e| miette::miette!("bwrap execution failed: {}", e))?;
+
+    if !status.success() {
+        return Err(miette::miette!(
+            "build command exited with error (in sandbox)"
+        ));
+    }
+    Ok(())
+}
+
+/// Fallback: run the build command directly on host (no sandbox).
+fn run_direct(
+    cmd: &str,
+    work_dir: &Path,
+    stage_dir: &Path,
+    cross_env: &[(&'static str, String)],
+) -> miette::Result<()> {
+    let mut cmd_proc = std::process::Command::new("sh");
+    cmd_proc
+        .args(["-c", cmd])
+        .env("STAGE", stage_dir)
+        .env("SRC", work_dir);
+    apply_cross_env(&mut cmd_proc, cross_env);
+    cmd_proc.current_dir(work_dir);
+
+    let status = cmd_proc
+        .status()
+        .map_err(|e| miette::miette!("failed to execute build: {}", e))?;
+
+    if !status.success() {
+        return Err(miette::miette!("build command exited with error"));
+    }
     Ok(())
 }
 
@@ -882,6 +1356,48 @@ fn find_source_root(dir: &Path) -> Option<std::path::PathBuf> {
     } else {
         None
     }
+}
+
+/// Copy hook scripts from the DSL's source paths into `<build_root>/meta/hooks/<name>`.
+///
+/// Relative paths resolve against the current working directory (the
+/// project directory `shuttle build` runs from).
+fn copy_hook_scripts(meta: &SnapMeta, build_root: &Path) -> miette::Result<()> {
+    let Some(hooks) = &meta.hooks else {
+        return Ok(());
+    };
+    let hooks_dir = build_root.join("meta").join("hooks");
+    for (name, hook) in hooks {
+        std::fs::create_dir_all(&hooks_dir)
+            .map_err(|e| miette::miette!("failed to create meta/hooks/: {}", e))?;
+        let src = Path::new(&hook.source);
+        if !src.is_file() {
+            return Err(miette::miette!(
+                "hook '{name}': script not found: {} (relative paths resolve from the project directory)",
+                hook.source
+            ));
+        }
+        std::fs::copy(src, hooks_dir.join(name))
+            .map_err(|e| miette::miette!("failed to copy hook '{name}': {}", e))?;
+    }
+    Ok(())
+}
+
+/// Copy the icon source file to `<build_root>/<icon>` (meta/gui/icon.<ext>).
+fn copy_icon(meta: &SnapMeta, build_root: &Path) -> miette::Result<()> {
+    let (Some(src), Some(target)) = (&meta.icon_source, &meta.icon) else {
+        return Ok(());
+    };
+    let dst = build_root.join(target);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| miette::miette!("failed to create {}: {}", parent.display(), e))?;
+    }
+    if !Path::new(src).is_file() {
+        return Err(miette::miette!("icon: file not found: {src}"));
+    }
+    std::fs::copy(src, &dst).map_err(|e| miette::miette!("failed to copy icon {src}: {e}"))?;
+    Ok(())
 }
 
 /// Determine the set of architectures to build.
@@ -1447,5 +1963,893 @@ mod tests {
 
         let archs = resolve_archs(&meta, &[]);
         assert_eq!(archs, vec!["all"]);
+    }
+
+    // ── Phase 15 tests: complete snap.yaml coverage ──
+
+    #[test]
+    fn test_layout_dsl_and_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "laid-out",
+                    version = "1.0",
+                    layout = {
+                        ["/etc/myapp.conf"] = { bind_file = "$SNAP_DATA/etc/myapp.conf" },
+                        ["/var/run/myapp"] = { symlink = "$SNAP_COMMON/run" },
+                        ["/usr/share/fonts"] = { bind = "$SNAP/fonts" },
+                        ["/tmp/cache"] = { tmpfs = { size = "100M" } },
+                        ["/run/lock"] = { tmpfs = true },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let layout = meta.layout.as_ref().unwrap();
+        assert_eq!(layout.len(), 5);
+        assert_eq!(
+            layout["/etc/myapp.conf"],
+            LayoutEntry::BindFile("$SNAP_DATA/etc/myapp.conf".into())
+        );
+        assert_eq!(
+            layout["/var/run/myapp"],
+            LayoutEntry::Symlink("$SNAP_COMMON/run".into())
+        );
+        assert_eq!(
+            layout["/usr/share/fonts"],
+            LayoutEntry::Bind("$SNAP/fonts".into())
+        );
+        assert_eq!(
+            layout["/tmp/cache"],
+            LayoutEntry::Tmpfs(TmpfsSpec::Sized {
+                size: "100M".into()
+            })
+        );
+        assert_eq!(
+            layout["/run/lock"],
+            LayoutEntry::Tmpfs(TmpfsSpec::Bare(true))
+        );
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("layout:"));
+        assert!(yaml.contains("bind-file: $SNAP_DATA/etc/myapp.conf"));
+        assert!(yaml.contains("symlink: $SNAP_COMMON/run"));
+        assert!(yaml.contains("bind: $SNAP/fonts"));
+        assert!(yaml.contains("size: 100M"));
+    }
+
+    #[test]
+    fn test_layout_validation_errors() {
+        let env = LuaEnv::new();
+        // No type key
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = {} },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "layout['/etc/x'] must have exactly one of bind, bind_file, symlink, tmpfs"
+            ),
+            "got: {err}"
+        );
+
+        // Two type keys
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = { bind = "$SNAP/a", symlink = "$SNAP/b" } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "layout['/etc/x'] must have exactly one of bind, bind_file, symlink, tmpfs (got 2)"
+            ),
+            "got: {err}"
+        );
+
+        // Non-string bind value
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = { bind = 42 } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("layout['/etc/x'].bind must be a string, got number"),
+            "got: {err}"
+        );
+
+        // Bad tmpfs value
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = { tmpfs = "yes" } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "layout['/etc/x'].tmpfs must be true or a table with optional string 'size'"
+            ),
+            "got: {err}"
+        );
+
+        // tmpfs table with non-string size
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = { tmpfs = { size = 100 } } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("layout['/etc/x'].tmpfs.size must be a string, got number"),
+            "got: {err}"
+        );
+
+        // Entry not a table
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = "bind" },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("layout['/etc/x'] must be a table, got string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_hooks_dsl_struct_and_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "hooked",
+                    version = "1.0",
+                    hooks = {
+                        configure = "scripts/configure.sh",
+                        install = "scripts/install.sh",
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let hooks = meta.hooks.as_ref().unwrap();
+        assert_eq!(hooks["configure"].command, "meta/hooks/configure");
+        assert_eq!(hooks["configure"].source, "scripts/configure.sh");
+        assert_eq!(hooks["install"].command, "meta/hooks/install");
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("hooks:"));
+        assert!(yaml.contains("command: meta/hooks/configure"));
+        assert!(yaml.contains("command: meta/hooks/install"));
+        // Source paths are build-time only — never in snap.yaml.
+        assert!(!yaml.contains("scripts/configure.sh"));
+    }
+
+    #[test]
+    fn test_hooks_validation_error() {
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "h", version = "1",
+                    hooks = { configure = 42 },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("hooks['configure'] must be a string script path, got number"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_typed_plugs_and_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "plugged",
+                    version = "1.0",
+                    plugs = {
+                        network = { interface = "network" },
+                        ["shared-data"] = {
+                            interface = "content",
+                            content = "my-content",
+                            target = "$SNAP/data",
+                            default_provider = "producer",
+                        },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let plugs = meta.plugs.as_ref().unwrap();
+        match &plugs["network"] {
+            SnapPlug::Typed(p) => {
+                assert_eq!(p.interface, "network");
+                assert!(p.attributes.is_empty());
+            }
+            other => panic!("expected Typed plug, got {other:?}"),
+        }
+        match &plugs["shared-data"] {
+            SnapPlug::Typed(p) => {
+                assert_eq!(p.interface, "content");
+                assert_eq!(
+                    p.attributes.get("content").map(String::as_str),
+                    Some("my-content")
+                );
+                assert_eq!(
+                    p.attributes.get("target").map(String::as_str),
+                    Some("$SNAP/data")
+                );
+                assert_eq!(
+                    p.attributes.get("default_provider").map(String::as_str),
+                    Some("producer")
+                );
+            }
+            other => panic!("expected Typed plug, got {other:?}"),
+        }
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("plugs:"));
+        assert!(yaml.contains("interface: content"));
+        assert!(yaml.contains("content: my-content"));
+        assert!(yaml.contains("target: $SNAP/data"));
+        assert!(yaml.contains("default_provider: producer"));
+    }
+
+    #[test]
+    fn test_string_plugs_back_compat() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "legacy-plugs",
+                    version = "1.0",
+                    plugs = { "network", "network-bind" },
+                    slots = { "home" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        assert_eq!(
+            meta.plugs.as_ref().unwrap()["network"],
+            SnapPlug::Name("network".into())
+        );
+        assert_eq!(
+            meta.plugs.as_ref().unwrap()["network-bind"],
+            SnapPlug::Name("network-bind".into())
+        );
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("network: network"));
+        assert!(yaml.contains("network-bind: network-bind"));
+        assert!(yaml.contains("home: home"));
+    }
+
+    #[test]
+    fn test_typed_slots_and_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "slotted",
+                    version = "1.0",
+                    slots = {
+                        ["shared-data"] = {
+                            interface = "content",
+                            content = "my-content",
+                            read = "$SNAP/data",
+                        },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let slots = meta.slots.as_ref().unwrap();
+        match &slots["shared-data"] {
+            SnapPlug::Typed(p) => {
+                assert_eq!(p.interface, "content");
+                assert_eq!(
+                    p.attributes.get("content").map(String::as_str),
+                    Some("my-content")
+                );
+            }
+            other => panic!("expected Typed slot, got {other:?}"),
+        }
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("slots:"));
+        assert!(yaml.contains("interface: content"));
+    }
+
+    #[test]
+    fn test_plug_map_validation_errors() {
+        let env = LuaEnv::new();
+
+        // Non-string, non-table value
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "p", version = "1",
+                    plugs = { network = 42 },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("plugs['network'] must be a string or table, got number"),
+            "got: {err}"
+        );
+
+        // Typed entry without interface
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "p", version = "1",
+                    plugs = { shared = { content = "x" } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("plugs['shared'].interface must be a string, got nil"),
+            "got: {err}"
+        );
+
+        // Non-string attribute
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "p", version = "1",
+                    slots = { shared = { interface = "content", content = 7 } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("slots['shared'].content must be a string, got number"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_global_environment_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "envy",
+                    version = "1.0",
+                    environment = { MY_VAR = "hello", OTHER_VAR = "world" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let env_map = meta.environment.as_ref().unwrap();
+        assert_eq!(env_map.get("MY_VAR").map(String::as_str), Some("hello"));
+        assert_eq!(env_map.get("OTHER_VAR").map(String::as_str), Some("world"));
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("environment:"));
+        assert!(yaml.contains("MY_VAR: hello"));
+        assert!(yaml.contains("OTHER_VAR: world"));
+    }
+
+    #[test]
+    fn test_environment_validation_error() {
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "e", version = "1",
+                    environment = { VAR = 42 },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("environment['VAR'] must be a string, got number"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_icon_target_and_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "iconic",
+                    version = "1.0",
+                    icon = "assets/logo.png",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        assert_eq!(meta.icon_source.as_deref(), Some("assets/logo.png"));
+        assert_eq!(meta.icon.as_deref(), Some("meta/gui/icon.png"));
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("icon: meta/gui/icon.png"));
+        // Source path stays out of snap.yaml.
+        assert!(!yaml.contains("assets/logo.png"));
+    }
+
+    #[test]
+    fn test_icon_requires_extension() {
+        let env = LuaEnv::new();
+        let result = env.eval(
+            r#"
+            return {
+                default = snap {
+                    name = "i", version = "1",
+                    icon = "assets/README",
+                },
+            }
+            "#,
+        );
+        // DSL accepts the string; Rust derivation rejects the missing extension.
+        let table = result.unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'icon' must have a file extension"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_compression_validation() {
+        let env = LuaEnv::new();
+        for comp in ["xz", "lzo"] {
+            let table = env
+                .eval(&format!(
+                    r#"
+                    return {{
+                        default = snap {{
+                            name = "c", version = "1",
+                            compression = "{comp}",
+                        }},
+                    }}
+                    "#
+                ))
+                .unwrap();
+            let default_table: mlua::Table = table.get("default").unwrap();
+            let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+            assert_eq!(meta.compression.as_deref(), Some(comp));
+        }
+
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "c", version = "1",
+                    compression = "lzip",
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'compression' must be one of: xz, lzo"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_type_snapd_types_emitted() {
+        let env = LuaEnv::new();
+
+        // base emits type: base
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "b", version = "1", type = "base" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("type: base"), "got: {yaml}");
+
+        // app is snapd's default — omitted
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "a", version = "1", type = "app" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let yaml = meta.to_yaml().unwrap();
+        assert!(!yaml.contains("type:"), "got: {yaml}");
+
+        // Internal build classifications stay out of snap.yaml
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "s", version = "1", type = "source" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.type_.as_deref(), Some("source")); // build metadata preserved
+        let yaml = meta.to_yaml().unwrap();
+        assert!(!yaml.contains("type:"), "got: {yaml}");
+    }
+
+    #[test]
+    fn test_type_validation_error() {
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "t", version = "1", type = "os" },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "'type' must be one of: source, meta, store, app, base, gadget, kernel, snapd"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_adopt_info_relaxes_version() {
+        let env = LuaEnv::new();
+
+        // adopt-info without version: accepted, version placeholder
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "adopted",
+                    adopt_info = "my-part",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.adopt_info.as_deref(), Some("my-part"));
+        assert_eq!(meta.version, "0"); // placeholder — no part extraction yet
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("adopt-info: my-part"), "got: {yaml}");
+
+        // adopt-info with explicit version: version preserved
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "adopted",
+                    version = "2.5",
+                    adopt_info = "my-part",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.version, "2.5");
+    }
+
+    #[test]
+    fn test_version_still_required_without_adopt_info() {
+        let env = LuaEnv::new();
+        let result = env.eval(
+            r#"
+            return {
+                default = snap { name = "strict" },
+            }
+            "#,
+        );
+        // Lua-side rejection
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing required field 'version'"),
+            "got: {err}"
+        );
+
+        // Rust-side rejection (table smuggled past Lua validation)
+        let table = env
+            .eval(
+                r#"
+            return { default = { name = "strict" } }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("field 'version' is required"), "got: {err}");
+    }
+
+    // ── Phase 15 integration: all new fields at once ──
+
+    #[test]
+    fn test_phase15_all_fields_snap_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "my-app",
+                    version = "1.0",
+                    summary = "Full-coverage app",
+                    description = "Exercises every Phase 15 field",
+                    type = "app",
+                    compression = "lzo",
+                    icon = "my-icon.svg",
+                    adopt_info = nil, -- explicit version above
+                    environment = { APP_MODE = "production" },
+                    layout = {
+                        ["/etc/myapp.conf"] = { bind_file = "$SNAP_DATA/etc/myapp.conf" },
+                        ["/var/run/myapp"] = { symlink = "$SNAP_COMMON/run" },
+                        ["/var/cache/myapp"] = { tmpfs = { size = "100M" } },
+                    },
+                    hooks = {
+                        configure = "scripts/configure.sh",
+                        install = "scripts/install.sh",
+                    },
+                    plugs = {
+                        network = { interface = "network" },
+                        ["shared-data"] = {
+                            interface = "content",
+                            content = "my-content",
+                            target = "$SNAP/data",
+                            default_provider = "producer",
+                        },
+                    },
+                    slots = {
+                        ["shared-data"] = { interface = "content", content = "my-content" },
+                    },
+                    apps = {
+                        hello = app { command = "bin/hello" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let yaml = meta.to_yaml().unwrap();
+
+        // layout block
+        assert!(yaml.contains("layout:"));
+        assert!(yaml.contains("bind-file: $SNAP_DATA/etc/myapp.conf"));
+        assert!(yaml.contains("symlink: $SNAP_COMMON/run"));
+        assert!(yaml.contains("tmpfs:"));
+        assert!(yaml.contains("size: 100M"));
+
+        // hooks block
+        assert!(yaml.contains("hooks:"));
+        assert!(yaml.contains("configure:"));
+        assert!(yaml.contains("command: meta/hooks/configure"));
+        assert!(yaml.contains("install:"));
+        assert!(yaml.contains("command: meta/hooks/install"));
+
+        // plugs/slots blocks
+        assert!(yaml.contains("plugs:"));
+        assert!(yaml.contains("network:"));
+        assert!(yaml.contains("shared-data:"));
+        assert!(yaml.contains("interface: content"));
+        assert!(yaml.contains("default_provider: producer"));
+        assert!(yaml.contains("slots:"));
+
+        // global environment, icon, compression (build-only), type (default omitted)
+        assert!(yaml.contains("environment:"));
+        assert!(yaml.contains("APP_MODE: production"));
+        assert!(yaml.contains("icon: meta/gui/icon.svg"));
+        assert!(!yaml.contains("compression")); // build-time only
+        assert!(!yaml.contains("type:")); // app is snapd's default
+    }
+
+    #[test]
+    fn test_phase15_build_copies_hooks_icon_and_compression() {
+        // Real files for hook scripts and the icon (absolute paths).
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("scripts")).unwrap();
+        std::fs::write(
+            project.path().join("scripts/configure.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::write(project.path().join("my-icon.png"), b"fake png bytes").unwrap();
+
+        let env = LuaEnv::new();
+        let src = format!(
+            r#"
+            return {{
+                default = snap {{
+                    name = "phase15-build",
+                    version = "1.0",
+                    compression = "lzo",
+                    icon = "{}",
+                    hooks = {{
+                        configure = "{}",
+                    }},
+                }},
+            }}
+            "#,
+            project.path().join("my-icon.png").display(),
+            project.path().join("scripts/configure.sh").display(),
+        );
+        let table = env.eval(&src).unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let stage_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let result = build_snap(&meta, stage_dir.path(), output_dir.path(), "amd64").unwrap();
+        let snap_path = output_dir.path().join(&result.snap_filename);
+        assert!(snap_path.exists());
+
+        // Hook script and icon must be inside the snap.
+        let listing = std::process::Command::new("unsquashfs")
+            .args(["-l", &snap_path.to_string_lossy()])
+            .output()
+            .expect("unsquashfs should be available");
+        let stdout = String::from_utf8_lossy(&listing.stdout);
+        assert!(stdout.contains("meta/hooks/configure"), "got: {stdout}");
+        assert!(stdout.contains("meta/gui/icon.png"), "got: {stdout}");
+
+        // Extract snap.yaml and check the emitted hook command + icon path.
+        let extract_dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("unsquashfs")
+            .args([
+                "-f",
+                "-d",
+                &extract_dir.path().to_string_lossy(),
+                &snap_path.to_string_lossy(),
+                "meta/snap.yaml",
+            ])
+            .status()
+            .expect("unsquashfs should be available");
+        assert!(status.success());
+        let yaml = std::fs::read_to_string(extract_dir.path().join("meta/snap.yaml")).unwrap();
+        assert!(
+            yaml.contains("command: meta/hooks/configure"),
+            "got: {yaml}"
+        );
+        assert!(yaml.contains("icon: meta/gui/icon.png"), "got: {yaml}");
+
+        // compression = "lzo" was wired into mksquashfs — an invalid -comp
+        // value would have failed the build above.
+        assert_eq!(meta.compression.as_deref(), Some("lzo"));
     }
 }

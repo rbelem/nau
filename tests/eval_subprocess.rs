@@ -306,3 +306,94 @@ fn composed_config_via_evaluate_file() {
     assert_eq!(meta.grade, "stable");
     assert_eq!(meta.confinement, "strict");
 }
+
+// ── Phase 15: complete snap.yaml coverage round-trip ──
+
+#[test]
+fn phase15_fields_survive_subprocess_round_trip() {
+    // The full Phase 15 surface must survive the real worker subprocess:
+    // Lua eval → lua_to_json → json_to_lua → SnapMeta.
+    use shuttle::snap::{LayoutEntry, SnapPlug, TmpfsSpec};
+
+    let outputs = evaluate_string(
+        "phase15-round-trip",
+        r#"
+        return {
+            default = snap {
+                name = "round-trip",
+                version = "3.1",
+                type = "gadget",
+                compression = "xz",
+                icon = "icon.svg",
+                environment = { VAR_A = "a", VAR_B = "b" },
+                layout = {
+                    ["/etc/app.conf"] = { bind_file = "$SNAP_DATA/etc/app.conf" },
+                    ["/run/app"] = { tmpfs = true },
+                    ["/var/app"] = { tmpfs = { size = "10M" } },
+                },
+                hooks = { configure = "scripts/configure.sh" },
+                plugs = {
+                    network = "network",
+                    ["shared-data"] = {
+                        interface = "content",
+                        content = "c1",
+                        target = "$SNAP/data",
+                    },
+                },
+                slots = {
+                    ["content-slot"] = { interface = "content", content = "c1" },
+                },
+            },
+        }
+        "#,
+    )
+    .expect("round-trip eval must succeed");
+
+    let meta = &outputs["default"];
+    assert_eq!(meta.name, "round-trip");
+    assert_eq!(meta.type_.as_deref(), Some("gadget"));
+    assert_eq!(meta.compression.as_deref(), Some("xz"));
+    assert_eq!(meta.icon.as_deref(), Some("meta/gui/icon.svg"));
+    assert_eq!(
+        meta.environment
+            .as_ref()
+            .unwrap()
+            .get("VAR_A")
+            .map(String::as_str),
+        Some("a")
+    );
+    let layout = meta.layout.as_ref().unwrap();
+    assert_eq!(
+        layout["/etc/app.conf"],
+        LayoutEntry::BindFile("$SNAP_DATA/etc/app.conf".into())
+    );
+    assert_eq!(
+        layout["/run/app"],
+        LayoutEntry::Tmpfs(TmpfsSpec::Bare(true))
+    );
+    assert_eq!(
+        layout["/var/app"],
+        LayoutEntry::Tmpfs(TmpfsSpec::Sized { size: "10M".into() })
+    );
+    let hooks = meta.hooks.as_ref().unwrap();
+    assert_eq!(hooks["configure"].command, "meta/hooks/configure");
+    assert_eq!(hooks["configure"].source, "scripts/configure.sh");
+    assert_eq!(
+        meta.plugs.as_ref().unwrap()["network"],
+        SnapPlug::Name("network".into())
+    );
+    match &meta.plugs.as_ref().unwrap()["shared-data"] {
+        SnapPlug::Typed(p) => {
+            assert_eq!(p.interface, "content");
+            assert_eq!(
+                p.attributes.get("target").map(String::as_str),
+                Some("$SNAP/data")
+            );
+        }
+        other => panic!("expected Typed plug, got {other:?}"),
+    }
+    match &meta.slots.as_ref().unwrap()["content-slot"] {
+        SnapPlug::Typed(p) => assert_eq!(p.interface, "content"),
+        other => panic!("expected Typed slot, got {other:?}"),
+    }
+}

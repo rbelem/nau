@@ -39,6 +39,35 @@ local function check_string_array(val, label, field)
     end
 end
 
+--- Validate a plugs/slots map: name → bare interface string (back-compat)
+--- or table with required string `interface` plus string-valued attributes.
+local function check_plug_map(val, field)
+    check_table(val, "snap", field)
+    if val == nil then return end
+    for name, def in pairs(val) do
+        if type(def) == "string" then
+            -- bare interface name (back-compat)
+        elseif type(def) == "table" then
+            if type(def.interface) ~= "string" then
+                error(string.format(
+                    "snap(): %s['%s'].interface must be a string, got %s",
+                    field, name, type(def.interface)), 2)
+            end
+            for k, v in pairs(def) do
+                if k ~= "interface" and type(v) ~= "string" then
+                    error(string.format(
+                        "snap(): %s['%s'].%s must be a string, got %s",
+                        field, name, k, type(v)), 2)
+                end
+            end
+        else
+            error(string.format(
+                "snap(): %s['%s'] must be a string or table, got %s",
+                field, name, type(def)), 2)
+        end
+    end
+end
+
 --- Declare a snap output.
 -- @param opts table with snap metadata fields
 -- @return the validated opts table
@@ -48,8 +77,13 @@ function snap(opts)
         error("snap(): expected a table, got " .. type(opts), 2)
     end
 
-    -- Required fields
-    local required_fields = { "name", "version" }
+    -- Required fields. With adopt-info, snapd takes version (and
+    -- summary/description) from the adopted part's metadata, so version
+    -- is optional; name is always required.
+    local required_fields = { "name" }
+    if opts.adopt_info == nil then
+        table.insert(required_fields, "version")
+    end
     for _, field in ipairs(required_fields) do
         if opts[field] == nil then
             error(string.format("snap(): missing required field '%s'", field), 2)
@@ -61,12 +95,17 @@ function snap(opts)
         end
     end
 
-    local valid_types = { "source", "meta", "store" }
+    -- "source"/"meta"/"store" are shuttle build classifications (not
+    -- emitted to snap.yaml); "app"/"base"/"gadget"/"kernel"/"snapd" are
+    -- the snapd snap types (emitted except "app", the default).
+    local valid_types = { "source", "meta", "store",
+                          "app", "base", "gadget", "kernel", "snapd" }
 
     -- Optional string fields
     local string_fields = {
         "summary", "description", "license", "grade", "confinement",
         "stage", "build", "type", "target", "toolchain",
+        "icon", "compression", "adopt_info",
     }
     -- Validate type field against known values
     if opts.type ~= nil then
@@ -75,7 +114,18 @@ function snap(opts)
             if opts.type == t then found = true; break end
         end
         if not found then
-            error("snap(): 'type' must be one of: source, meta, store", 2)
+            error("snap(): 'type' must be one of: source, meta, store, app, base, gadget, kernel, snapd", 2)
+        end
+    end
+    -- compression: only what both snapd-era tooling and mksquashfs accept
+    if opts.compression ~= nil then
+        local valid_compressions = { "xz", "lzo" }
+        local found = false
+        for _, c in ipairs(valid_compressions) do
+            if opts.compression == c then found = true; break end
+        end
+        if not found then
+            error("snap(): 'compression' must be one of: xz, lzo", 2)
         end
     end
     for _, field in ipairs(string_fields) do
@@ -100,8 +150,81 @@ function snap(opts)
     check_string_array(opts.architectures, "snap", "architectures")
     check_string_array(opts.aliases, "snap", "aliases")
     check_string_array(opts.requires, "snap", "requires")
-    check_table(opts.plugs, "snap", "plugs")
-    check_table(opts.slots, "snap", "slots")
+
+    -- plugs/slots: name → interface string (back-compat) or attribute
+    -- table with required string `interface` (typed form)
+    check_plug_map(opts.plugs, "plugs")
+    check_plug_map(opts.slots, "slots")
+
+    -- environment: global env vars, string → string map
+    if opts.environment ~= nil then
+        check_table(opts.environment, "snap", "environment")
+        for k, v in pairs(opts.environment) do
+            if type(v) ~= "string" then
+                error(string.format(
+                    "snap(): environment['%s'] must be a string, got %s",
+                    k, type(v)), 2)
+            end
+        end
+    end
+
+    -- layout: target path → exactly one of bind/bind_file/symlink/tmpfs
+    if opts.layout ~= nil then
+        check_table(opts.layout, "snap", "layout")
+        local layout_kinds = { "bind", "bind_file", "symlink", "tmpfs" }
+        for target, entry in pairs(opts.layout) do
+            if type(entry) ~= "table" then
+                error(string.format(
+                    "snap(): layout['%s'] must be a table, got %s",
+                    target, type(entry)), 2)
+            end
+            local count = 0
+            for _, kind in ipairs(layout_kinds) do
+                if entry[kind] ~= nil then
+                    count = count + 1
+                    if kind == "tmpfs" then
+                        local v = entry.tmpfs
+                        if type(v) == "boolean" and v ~= true then
+                            error(string.format(
+                                "snap(): layout['%s'].tmpfs must be true or a table with optional string 'size', got %s",
+                                target, tostring(v)), 2)
+                        elseif type(v) == "table" then
+                            if v.size ~= nil and type(v.size) ~= "string" then
+                                error(string.format(
+                                    "snap(): layout['%s'].tmpfs.size must be a string, got %s",
+                                    target, type(v.size)), 2)
+                            end
+                        elseif type(v) ~= "table" and type(v) ~= "boolean" then
+                            error(string.format(
+                                "snap(): layout['%s'].tmpfs must be true or a table with optional string 'size', got %s",
+                                target, type(v)), 2)
+                        end
+                    elseif type(entry[kind]) ~= "string" then
+                        error(string.format(
+                            "snap(): layout['%s'].%s must be a string, got %s",
+                            target, kind, type(entry[kind])), 2)
+                    end
+                end
+            end
+            if count ~= 1 then
+                error(string.format(
+                    "snap(): layout['%s'] must have exactly one of bind, bind_file, symlink, tmpfs (got %d)",
+                    target, count), 2)
+            end
+        end
+    end
+
+    -- hooks: hook name → script path (copied to meta/hooks/<name> at build)
+    if opts.hooks ~= nil then
+        check_table(opts.hooks, "snap", "hooks")
+        for name, script in pairs(opts.hooks) do
+            if type(script) ~= "string" then
+                error(string.format(
+                    "snap(): hooks['%s'] must be a string script path, got %s",
+                    name, type(script)), 2)
+            end
+        end
+    end
 
     -- inputs: table of name → { url } (package source, inspired by Nix inputs)
     if opts.inputs ~= nil then
