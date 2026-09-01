@@ -346,7 +346,7 @@ fn eval_request(label: &str, source: &str) -> miette::Result<crate::isolate::Eva
     let index_data = serde_json::to_value(&index)
         .map_err(|e| miette::miette!("failed to serialize index data: {e}"))?;
     Ok(crate::isolate::EvalRequest {
-        prelude: crate::dsl::INIT_LUA.to_string(),
+        prelude: crate::dsl::prelude(),
         index_data,
         arch,
         sources: Default::default(),
@@ -394,7 +394,7 @@ mod tests {
     /// Create a fresh Lua instance with the DSL globals injected.
     fn with_dsl() -> mlua::Lua {
         let lua = mlua::Lua::new();
-        lua.load(crate::dsl::INIT_LUA)
+        lua.load(crate::dsl::prelude())
             .exec()
             .expect("failed to load DSL globals");
         lua

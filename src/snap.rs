@@ -363,10 +363,20 @@ pub struct SnapHook {
 /// Per-part sources/inputs are future work — today every part shares the
 /// snap's single source and identical sandbox env/inputs; only the command
 /// and the ordering edges are per-part.
+///
+/// A part may instead select a built-in builder plugin (ADR-0014): `plugin`
+/// names the plugin and `plugin_options` carries its raw options table.
+/// `build` and `plugin` are mutually exclusive (a plugin IS the build);
+/// plugin parts carry an empty `build` marker string.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapPart {
     pub build: String,
     pub after: Vec<String>,
+    /// Built-in builder plugin name (ADR-0014). Build-time only.
+    pub plugin: Option<String>,
+    /// Raw plugin options (deep-validated by the plugin at the Rust
+    /// boundary). Build-time only — never emitted to snap.yaml.
+    pub plugin_options: Option<BTreeMap<String, crate::plugins::PluginValue>>,
 }
 
 // ── Conversion from Lua (Phase 3) ──
@@ -422,7 +432,14 @@ impl SnapMeta {
         let plugs = get_opt_plug_map(table, "plugs")?;
         let slots = get_opt_plug_map(table, "slots")?;
         let aliases: Vec<String> = table.get("aliases").unwrap_or_default();
-        let requires: Vec<String> = table.get("requires").unwrap_or_default();
+        let mut requires: Vec<String> = table.get("requires").unwrap_or_default();
+        // Plugin parts contribute extra requires (e.g. `cargo` pulls the
+        // rust toolchain package) — expanded and deep-validated here so the
+        // Rust boundary is the single choke point (ADR-0014 Decisions 3-4).
+        // Dependency resolution reads this same field.
+        if let Some(parts) = &parts {
+            append_plugin_requires(parts, &mut requires)?;
+        }
         let target: Option<String> = get_opt_string(table, "target")?;
         let toolchain: Option<String> = get_opt_string(table, "toolchain")?;
         let inputs: Option<HashMap<String, PackageInput>> = get_package_inputs(table)?;
@@ -822,9 +839,11 @@ fn get_opt_hooks(table: &mlua::Table) -> miette::Result<Option<BTreeMap<String, 
     Ok(Some(hooks))
 }
 
-/// Extract `parts`: part name → { build, after? }. The Lua layer validates
-/// the schema (non-empty, string commands, known/acyclic `after`); this is
-/// the passive conversion boundary.
+/// Extract `parts`: part name → { build | plugin, after?, options? }. The
+/// Lua layer validates the schema (non-empty string command or known plugin
+/// name, known/acyclic `after`, table options); this is the passive
+/// conversion boundary. Plugin options are only shape-typed here — deep
+/// validation happens at the plugin boundary ([`crate::plugins::expand`]).
 fn get_opt_parts(table: &mlua::Table) -> miette::Result<Option<BTreeMap<String, SnapPart>>> {
     let Some(t) = get_opt_table(table, "parts")? else {
         return Ok(None);
@@ -834,9 +853,16 @@ fn get_opt_parts(table: &mlua::Table) -> miette::Result<Option<BTreeMap<String, 
         let (name, value) = pair.map_err(|e| miette::miette!("parts entry: {e}"))?;
         match value {
             Value::Table(pt) => {
-                let build = pt.get::<String>("build").map_err(|_| {
-                    miette::miette!("parts['{name}']: 'build' must be a string command")
-                })?;
+                let plugin = get_part_plugin(&name, &pt)?;
+                let build = if plugin.is_some() {
+                    // Plugin parts carry an empty marker: the plugin IS the
+                    // build (ADR-0014 Decision 2).
+                    String::new()
+                } else {
+                    pt.get::<String>("build").map_err(|_| {
+                        miette::miette!("parts['{name}']: 'build' must be a string command")
+                    })?
+                };
                 let mut after = Vec::new();
                 if let Value::Table(at) = pt.get::<Value>("after").unwrap_or(Value::Nil) {
                     for dep in at.pairs::<usize, Value>() {
@@ -851,7 +877,16 @@ fn get_opt_parts(table: &mlua::Table) -> miette::Result<Option<BTreeMap<String, 
                         }
                     }
                 }
-                parts.insert(name, SnapPart { build, after });
+                let plugin_options = get_part_options(&name, &pt)?;
+                parts.insert(
+                    name,
+                    SnapPart {
+                        build,
+                        after,
+                        plugin,
+                        plugin_options,
+                    },
+                );
             }
             other => {
                 return Err(miette::miette!(
@@ -862,6 +897,147 @@ fn get_opt_parts(table: &mlua::Table) -> miette::Result<Option<BTreeMap<String, 
         }
     }
     Ok(Some(parts))
+}
+
+/// Extract one part's `plugin` name, if any.
+fn get_part_plugin(name: &str, pt: &mlua::Table) -> miette::Result<Option<String>> {
+    match pt.get::<Value>("plugin").unwrap_or(Value::Nil) {
+        Value::Nil => Ok(None),
+        Value::String(s) => Ok(Some(
+            s.to_str()
+                .map_err(|e| miette::miette!("{}", e))?
+                .to_string(),
+        )),
+        other => Err(miette::miette!(
+            "parts['{name}'].plugin must be a string, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// Extract one part's `options` table into raw [`PluginValue`]s. Table
+/// values become arrays (integer keys, order-preserving) or string maps
+/// (string keys); mixing the two shapes is an error.
+fn get_part_options(
+    name: &str,
+    pt: &mlua::Table,
+) -> miette::Result<Option<BTreeMap<String, crate::plugins::PluginValue>>> {
+    match pt.get::<Value>("options").unwrap_or(Value::Nil) {
+        Value::Nil => Ok(None),
+        Value::Table(t) => {
+            let mut options = BTreeMap::new();
+            for pair in t.pairs::<Value, Value>() {
+                let (key, value) =
+                    pair.map_err(|e| miette::miette!("parts['{name}'].options: {e}"))?;
+                let key = match key {
+                    Value::String(s) => s
+                        .to_str()
+                        .map_err(|e| miette::miette!("{}", e))?
+                        .to_string(),
+                    other => {
+                        return Err(miette::miette!(
+                            "parts['{name}'].options: unsupported key type {}",
+                            other.type_name()
+                        ));
+                    }
+                };
+                let label = format!("parts['{name}'].options['{key}']");
+                options.insert(key, plugin_value_from_lua(&label, &value)?);
+            }
+            Ok(Some(options))
+        }
+        other => Err(miette::miette!(
+            "parts['{name}'].options must be a table, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// Convert one plugin option value into a [`crate::plugins::PluginValue`].
+fn plugin_value_from_lua(
+    label: &str,
+    value: &Value,
+) -> miette::Result<crate::plugins::PluginValue> {
+    match value {
+        Value::String(s) => Ok(crate::plugins::PluginValue::Str(lua_str(s)?)),
+        Value::Table(t) => plugin_table_value(label, t),
+        other => Err(miette::miette!(
+            "{label} must be a string, array of strings, or table of strings, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// Classify an option table: all-integer keys → ordered array of strings,
+/// all-string keys → string map, empty → empty map, mixed → error.
+fn plugin_table_value(label: &str, t: &mlua::Table) -> miette::Result<crate::plugins::PluginValue> {
+    let mut items: Vec<(usize, String)> = Vec::new();
+    let mut map = BTreeMap::new();
+    for pair in t.pairs::<Value, Value>() {
+        let (key, value) = pair.map_err(|e| miette::miette!("{label}: {e}"))?;
+        match (key, value) {
+            (Value::Integer(i), Value::String(s)) => items.push((i.max(0) as usize, lua_str(&s)?)),
+            (Value::String(k), Value::String(s)) => {
+                map.insert(lua_str(&k)?, lua_str(&s)?);
+            }
+            (key, Value::String(_)) => {
+                return Err(miette::miette!(
+                    "{label}: unsupported key type {}",
+                    key.type_name()
+                ));
+            }
+            (_, value) => {
+                return Err(miette::miette!(
+                    "{label}: option values must be strings, got {}",
+                    value.type_name()
+                ));
+            }
+        }
+    }
+    if !items.is_empty() && !map.is_empty() {
+        return Err(miette::miette!(
+            "{label}: cannot mix array and string-key entries"
+        ));
+    }
+    if items.is_empty() && map.is_empty() {
+        return Ok(crate::plugins::PluginValue::Map(map));
+    }
+    if !map.is_empty() {
+        return Ok(crate::plugins::PluginValue::Map(map));
+    }
+    items.sort_by_key(|(index, _)| *index);
+    Ok(crate::plugins::PluginValue::Arr(
+        items.into_iter().map(|(_, s)| s).collect(),
+    ))
+}
+
+/// Copy an mlua string into an owned Rust String.
+fn lua_str(s: &mlua::String) -> miette::Result<String> {
+    s.to_str()
+        .map_err(|e| miette::miette!("{}", e))
+        .map(|s| s.to_string())
+}
+
+/// Append every plugin part's `extra_requires` to the snap's effective
+/// requires (deduplicated, declaration order preserved). Also surfaces the
+/// plugin boundary's named validation errors, prefixed with the part name.
+fn append_plugin_requires(
+    parts: &BTreeMap<String, SnapPart>,
+    requires: &mut Vec<String>,
+) -> miette::Result<()> {
+    for (name, part) in parts {
+        let Some(plugin) = &part.plugin else {
+            continue;
+        };
+        let plan = crate::plugins::expand(plugin, part.plugin_options.as_ref())
+            .map_err(|e| miette::miette!("parts['{name}']: {e}"))?;
+        for require in plan.extra_requires {
+            if !requires.contains(&require) {
+                requires.push(require);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Extract a snap-level `plugs`/`slots` map: name → bare interface string
@@ -1229,6 +1405,7 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
             &abs_stage,
             meta.target.as_deref(),
             None,
+            &[],
         )?;
         output::finish_ok(&build_spinner, &format!("built {}", meta.name));
     }
@@ -1312,22 +1489,44 @@ fn run_parts(
 ) -> miette::Result<()> {
     for name in order_parts(parts)? {
         let part = parts.get(&name).expect("name comes from the same map");
+        let plan = part_build_plan(&name, part)?;
         let part_dir = build_tree.join(&name);
         std::fs::create_dir_all(&part_dir)
             .map_err(|e| miette::miette!("failed to create work dir for part '{name}': {}", e))?;
         let spinner = output::spinner(&format!("[{name}] building..."));
-        run_build_command(
-            &part.build,
-            build_tree,
-            &part_dir,
-            src_dir,
-            stage_dir,
-            target,
-            Some(&name),
-        )?;
+        for cmd in &plan.commands {
+            run_build_command(
+                cmd,
+                build_tree,
+                &part_dir,
+                src_dir,
+                stage_dir,
+                target,
+                Some(&name),
+                &plan.env,
+            )?;
+        }
         output::finish_ok(&spinner, &format!("[{name}] built"));
     }
     Ok(())
+}
+
+/// The command sequence a part runs. Plugin parts expand to their
+/// declarative [`crate::plugins::BuildPlan`] (ADR-0014 Decision 4) — the
+/// plugin cannot execute arbitrary logic beyond the commands it emits.
+/// Command parts run their single `build` command unchanged.
+fn part_build_plan(name: &str, part: &SnapPart) -> miette::Result<crate::plugins::BuildPlan> {
+    match (&part.plugin, part.build.is_empty()) {
+        (Some(plugin), true) => crate::plugins::expand(plugin, part.plugin_options.as_ref()),
+        (Some(_), false) | (None, true) => Err(miette::miette!(
+            "part '{name}' must have exactly one of 'build' or 'plugin'"
+        )),
+        (None, false) => Ok(crate::plugins::BuildPlan {
+            commands: vec![part.build.clone()],
+            env: Vec::new(),
+            extra_requires: Vec::new(),
+        }),
+    }
 }
 
 /// Compute SHA-256 of a file (streaming, memory-efficient for large files).
@@ -1367,6 +1566,10 @@ fn sha256_file(path: &Path) -> miette::Result<String> {
 /// - `CONFIGURE_TARGET` is exported for autotools-based packages.
 /// - The cross-toolchain sysroot is expected at the standard host path
 ///   `/usr/{target}` or can be provided via `CROSS_SYSROOT`.
+///
+/// `extra_env` carries plugin BuildPlan env vars (ADR-0014 Decision 4),
+/// exported to the command in both sandboxed and direct modes.
+#[allow(clippy::too_many_arguments)]
 fn run_build_command(
     cmd: &str,
     build_path: &Path,
@@ -1375,6 +1578,7 @@ fn run_build_command(
     stage_dir: &Path,
     target: Option<&str>,
     part_name: Option<&str>,
+    extra_env: &[(String, String)],
 ) -> miette::Result<()> {
     let bwrap_bin = detect_bwrap();
     let cross_env = cross_compile_env(target);
@@ -1382,10 +1586,12 @@ fn run_build_command(
     if let Some(bwrap_bin) = bwrap_bin {
         run_bwrapped(
             &bwrap_bin, cmd, build_path, work_dir, src_dir, stage_dir, target, &cross_env,
-            part_name,
+            part_name, extra_env,
         )
     } else {
-        run_direct(cmd, work_dir, src_dir, stage_dir, &cross_env, part_name)
+        run_direct(
+            cmd, work_dir, src_dir, stage_dir, &cross_env, part_name, extra_env,
+        )
     }
 }
 /// Detect the bubblewrap binary, if available.
@@ -1471,6 +1677,7 @@ fn run_bwrapped(
     target: Option<&str>,
     cross_env: &[(&'static str, String)],
     part_name: Option<&str>,
+    extra_env: &[(String, String)],
 ) -> miette::Result<()> {
     // Map a host path under the build dir to its sandbox path under /build.
     let to_inner = |p: &Path| -> std::path::PathBuf {
@@ -1524,6 +1731,7 @@ fn run_bwrapped(
         cmd_proc.env("PART_NAME", name);
     }
     apply_cross_env(&mut cmd_proc, cross_env);
+    apply_extra_env(&mut cmd_proc, extra_env);
     cmd_proc.arg("sh").arg("-c").arg(cmd);
 
     let status = cmd_proc
@@ -1546,6 +1754,7 @@ fn run_direct(
     stage_dir: &Path,
     cross_env: &[(&'static str, String)],
     part_name: Option<&str>,
+    extra_env: &[(String, String)],
 ) -> miette::Result<()> {
     let mut cmd_proc = std::process::Command::new("sh");
     cmd_proc
@@ -1556,6 +1765,7 @@ fn run_direct(
         cmd_proc.env("PART_NAME", name);
     }
     apply_cross_env(&mut cmd_proc, cross_env);
+    apply_extra_env(&mut cmd_proc, extra_env);
     cmd_proc.current_dir(work_dir);
 
     let status = cmd_proc
@@ -1566,6 +1776,13 @@ fn run_direct(
         return Err(miette::miette!("build command exited with error"));
     }
     Ok(())
+}
+
+/// Export plugin BuildPlan env vars to a command (ADR-0014 Decision 4).
+fn apply_extra_env(cmd: &mut std::process::Command, extra_env: &[(String, String)]) {
+    for (key, val) in extra_env {
+        cmd.env(key, val);
+    }
 }
 
 /// Find the single top-level directory in a path (the source root
@@ -1691,7 +1908,7 @@ mod tests {
     impl LuaEnv {
         fn new() -> Self {
             let lua = mlua::Lua::new();
-            lua.load(crate::dsl::INIT_LUA)
+            lua.load(crate::dsl::prelude())
                 .exec()
                 .expect("DSL init failed");
             LuaEnv { lua }
@@ -3296,6 +3513,8 @@ mod tests {
                 SnapPart {
                     build: "make app".into(),
                     after: vec!["libs".into()],
+                    plugin: None,
+                    plugin_options: None,
                 },
             ),
             (
@@ -3303,6 +3522,8 @@ mod tests {
                 SnapPart {
                     build: "make cli".into(),
                     after: vec!["libs".into()],
+                    plugin: None,
+                    plugin_options: None,
                 },
             ),
             (
@@ -3310,6 +3531,8 @@ mod tests {
                 SnapPart {
                     build: "make libs".into(),
                     after: vec![],
+                    plugin: None,
+                    plugin_options: None,
                 },
             ),
             (
@@ -3317,6 +3540,8 @@ mod tests {
                 SnapPart {
                     build: "make zzz".into(),
                     after: vec![],
+                    plugin: None,
+                    plugin_options: None,
                 },
             ),
         ]
@@ -3338,6 +3563,8 @@ mod tests {
                 SnapPart {
                     build: "c".into(),
                     after: vec!["b".into()],
+                    plugin: None,
+                    plugin_options: None,
                 },
             ),
             (
@@ -3345,6 +3572,8 @@ mod tests {
                 SnapPart {
                     build: "b".into(),
                     after: vec!["a".into()],
+                    plugin: None,
+                    plugin_options: None,
                 },
             ),
             (
@@ -3352,6 +3581,8 @@ mod tests {
                 SnapPart {
                     build: "a".into(),
                     after: vec![],
+                    plugin: None,
+                    plugin_options: None,
                 },
             ),
         ]
@@ -3372,6 +3603,8 @@ mod tests {
                 SnapPart {
                     build: "a".into(),
                     after: vec!["b".into()],
+                    plugin: None,
+                    plugin_options: None,
                 },
             ),
             (
@@ -3379,6 +3612,8 @@ mod tests {
                 SnapPart {
                     build: "b".into(),
                     after: vec!["a".into()],
+                    plugin: None,
+                    plugin_options: None,
                 },
             ),
         ]
@@ -3401,6 +3636,8 @@ mod tests {
                 SnapPart {
                     build: "true".into(),
                     after: vec![],
+                    plugin: None,
+                    plugin_options: None,
                 },
             )])
         };
@@ -3425,13 +3662,16 @@ mod tests {
                     // (its marker exists), and cwd is b's own work dir.
                     build: r#"test "$PART_NAME" = "b" && test -f "$STAGE/a.done" && pwd > "$STAGE/b.pwd""#.into(),
                     after: vec!["a".into()],
+                    plugin: None,
+                    plugin_options: None,
                 },
             ),
             (
                 "a",
                 SnapPart {
                     build: r#"test "$PART_NAME" = "a" && touch "$STAGE/a.done""#.into(),
-                    after: vec![],
+                    after: vec![], plugin: None,
+ plugin_options: None,
                 },
             ),
         ]
@@ -3471,6 +3711,8 @@ mod tests {
             SnapPart {
                 build: r#"test -f "$STAGE/never-created""#.into(),
                 after: vec![],
+                plugin: None,
+                plugin_options: None,
             },
         )]
         .into_iter()
@@ -3499,6 +3741,8 @@ mod tests {
             SnapPart {
                 build: "make".into(),
                 after: vec![],
+                plugin: None,
+                plugin_options: None,
             },
         )]));
 
@@ -3529,5 +3773,651 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("'parts' must not be empty"), "got: {err}");
+    }
+
+    // ── ADR-0014: built-in builder plugins ──
+
+    #[test]
+    fn test_plugin_part_dsl_roundtrip() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "plugins",
+                    version = "1.0",
+                    parts = {
+                        core = {
+                            plugin = "make",
+                            options = { target = "all" },
+                        },
+                        docs = { build = "true", after = { "core" } },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let parts = meta.parts.as_ref().expect("parts extracted");
+        let core = &parts["core"];
+        assert_eq!(core.plugin.as_deref(), Some("make"));
+        assert_eq!(core.build, "", "plugin parts carry an empty build marker");
+        assert_eq!(
+            core.plugin_options.as_ref().expect("options extracted")["target"],
+            crate::plugins::PluginValue::Str("all".into())
+        );
+        assert!(parts["docs"].plugin.is_none());
+        // Plugin must not leak into snap.yaml.
+        let yaml = meta.to_yaml().unwrap();
+        assert!(!yaml.contains("parts:"));
+        assert!(!yaml.contains("options"));
+    }
+
+    #[test]
+    fn test_plugin_conflicts_with_build_dsl() {
+        let err =
+            eval_parts_source_error(r#"parts = { core = { plugin = "make", build = "make" } }"#);
+        assert!(
+            err.contains("parts['core'] must have exactly one of 'build' or 'plugin'"),
+            "error should mention the per-part conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn test_plugin_unknown_name_dsl() {
+        let err = eval_parts_source_error(r#"parts = { core = { plugin = "gmake" } }"#);
+        assert!(
+            err.contains("parts['core'].plugin must be one of:")
+                && err.contains("autotools")
+                && err.contains("cargo")
+                && err.contains("cmake")
+                && err.contains("make")
+                && err.contains("gmake"),
+            "error should list available plugins: {err}"
+        );
+    }
+
+    #[test]
+    fn test_plugin_must_be_string_dsl() {
+        let err = eval_parts_source_error("parts = { core = { plugin = 42 } }");
+        assert!(
+            err.contains("parts['core'].plugin must be a non-empty string"),
+            "got: {err}"
+        );
+        let err = eval_parts_source_error(r#"parts = { core = { plugin = "" } }"#);
+        assert!(
+            err.contains("parts['core'].plugin must be a non-empty string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_plugin_options_must_be_table_dsl() {
+        let err =
+            eval_parts_source_error(r#"parts = { core = { plugin = "make", options = "x" } }"#);
+        assert!(
+            err.contains("parts['core'].options must be a table"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_plugin_options_deep_validated_at_rust_boundary() {
+        // The Lua layer accepts any options table; the named error comes
+        // from the plugin boundary (ADR-0014 Decision 3).
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "bad-options",
+                    version = "1.0",
+                    parts = { core = { plugin = "cargo", options = { channel = "fork" } } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("parts['core']")
+                && err.contains("cargo: option 'channel' must be one of: stable, beta, nightly"),
+            "got: {err}"
+        );
+
+        // Wrong option type.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "bad-options",
+                    version = "1.0",
+                    parts = { core = { plugin = "cargo", options = { channel = { "stable" } } } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cargo: option 'channel' must be a string"),
+            "got: {err}"
+        );
+
+        // Unknown option.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "bad-options",
+                    version = "1.0",
+                    parts = { core = { plugin = "make", options = { jobs = "4" } } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("make: unknown option 'jobs'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_cargo_plugin_appends_toolchain_require() {
+        // ADR-0014 Decision 4: extra_requires land in the snap's effective
+        // requires (the same field dependency resolution reads).
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "rust-app",
+                    version = "1.0",
+                    requires = { "zlib" },
+                    parts = { core = { plugin = "cargo", options = { channel = "beta" } } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(
+            meta.requires,
+            vec!["zlib".to_string(), "toolchain-gcc-gnu-x86_64".to_string()]
+        );
+
+        // Deduplicated on repeat plugin parts.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "rust-app",
+                    version = "1.0",
+                    parts = {
+                        a = { plugin = "cargo" },
+                        b = { plugin = "cargo", after = { "a" } },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.requires, vec!["toolchain-gcc-gnu-x86_64".to_string()]);
+    }
+
+    #[test]
+    fn test_part_build_plan_rejects_corrupt_parts() {
+        // Non-DSL constructors can bypass Lua validation.
+        let both = SnapPart {
+            build: "make".into(),
+            after: vec![],
+            plugin: Some("make".into()),
+            plugin_options: None,
+        };
+        let err = part_build_plan("core", &both).unwrap_err().to_string();
+        assert!(
+            err.contains("part 'core' must have exactly one of 'build' or 'plugin'"),
+            "got: {err}"
+        );
+
+        let neither = SnapPart {
+            build: String::new(),
+            after: vec![],
+            plugin: None,
+            plugin_options: None,
+        };
+        let err = part_build_plan("core", &neither).unwrap_err().to_string();
+        assert!(
+            err.contains("part 'core' must have exactly one of 'build' or 'plugin'"),
+            "got: {err}"
+        );
+    }
+
+    // ── ADR-0014 E2E: plugin parts through run_parts ──
+    //
+    // Every host tool is stubbed (a stage-local PATH prepend), so these run
+    // identically with and without bwrap: the stub directory lives under the
+    // stage, which the sandbox binds at its absolute host path. Stubbed:
+    // `make`, `cmake`, `cargo`. `sh` and coreutils are real. The `configure`
+    // fixture for autotools is a plain sh script written by the test — no
+    // real autotools involved. No network access is needed or performed.
+
+    /// Prepend `dir` to PATH for the duration of `f`, restoring afterwards
+    /// (even if `f` panics). Serialized: PATH is process-global, so parallel
+    /// E2E tests must not interleave set/restore.
+    fn with_path_prepend<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", dir.display()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::env::set_var("PATH", old);
+        drop(guard);
+        result.unwrap()
+    }
+
+    /// The path `$SRC` expands to for commands: the build tree is mounted at
+    /// `/build` inside the bwrap sandbox, so assertions on expanded `$SRC`
+    /// must expect the sandbox path there (host path in direct mode).
+    fn expected_src(src: &Path) -> std::path::PathBuf {
+        if detect_bwrap().is_some() {
+            Path::new("/build").join(SOURCE_DIR_NAME)
+        } else {
+            src.to_path_buf()
+        }
+    }
+
+    /// Create an executable stub script at `dir/<name>`.
+    fn write_stub(dir: &Path, name: &str, body: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Shared plugin-E2E scaffolding: build tree with a source dir, stage
+    /// (canonicalized, like run_build does for DESTDIR), and the stub dir
+    /// under the stage.
+    struct PluginE2e {
+        tree: tempfile::TempDir,
+        src: std::path::PathBuf,
+        stage: std::path::PathBuf,
+        stubs: std::path::PathBuf,
+        _stage_dir: tempfile::TempDir,
+    }
+
+    impl PluginE2e {
+        fn new() -> Self {
+            let tree = tempfile::tempdir().unwrap();
+            let stage_dir = tempfile::tempdir().unwrap();
+            let stage = std::fs::canonicalize(stage_dir.path()).unwrap();
+            let src = tree.path().join(SOURCE_DIR_NAME);
+            std::fs::create_dir_all(&src).unwrap();
+            let stubs = stage.join(".stubs");
+            std::fs::create_dir_all(&stubs).unwrap();
+            PluginE2e {
+                tree,
+                src,
+                stage,
+                stubs,
+                _stage_dir: stage_dir,
+            }
+        }
+
+        fn invocations(&self) -> String {
+            std::fs::read_to_string(self.stage.join("invocations.log")).unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn test_e2e_make_plugin_expands_and_installs_into_stage() {
+        let e2e = PluginE2e::new();
+        std::fs::write(
+            e2e.src.join("Makefile"),
+            "# real Makefile (unused by the stub; proves -C $SRC wiring)\n",
+        )
+        .unwrap();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+# DESTDIR arrives as a make command-line arg (make install DESTDIR=...), not env.
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+if [ -n "$DESTDIR" ]; then
+  mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/hello"
+fi
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("make".into()),
+                plugin_options: Some(
+                    [(
+                        "target".to_string(),
+                        crate::plugins::PluginValue::Str("all".into()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+        });
+
+        let inner_src = expected_src(&e2e.src);
+        let log = e2e.invocations();
+        assert!(
+            log.contains(&format!("make -C {} all", inner_src.display())),
+            "build command must run make against $SRC with the target: {log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "make -C {} install DESTDIR={}",
+                inner_src.display(),
+                e2e.stage.display()
+            )),
+            "install command must honor DESTDIR=$STAGE: {log}"
+        );
+        assert!(e2e.stage.join("usr/bin/hello").exists());
+    }
+
+    #[test]
+    fn test_e2e_autotools_plugin_configures_vpath_and_installs_into_stage() {
+        let e2e = PluginE2e::new();
+        // Fake configure: records its args and emits a Makefile in the cwd
+        // (the part work dir — a VPATH build).
+        std::fs::write(
+            e2e.src.join("configure"),
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > configure.log\ncat > Makefile <<'EOF'\nall:\n\t: > built\ninstall:\n\tmkdir -p $(DESTDIR)/usr/bin && : > $(DESTDIR)/usr/bin/demo\nEOF\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            e2e.src.join("configure"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+# DESTDIR arrives as a make command-line arg, not env.
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+case " $* " in
+  *" install "*)
+    mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/demo" ;;
+  *) : > built ;;
+esac
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "lib",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("autotools".into()),
+                plugin_options: Some(
+                    [(
+                        "args".to_string(),
+                        crate::plugins::PluginValue::Arr(vec![
+                            "--disable-nls".into(),
+                            "--with-ssl".into(),
+                        ]),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+        });
+
+        // configure ran with --prefix=/usr and the args, in order, and its
+        // output landed in the part work dir (not $SRC).
+        let configure_log =
+            std::fs::read_to_string(e2e.tree.path().join("lib/configure.log")).unwrap();
+        let lines: Vec<&str> = configure_log.lines().collect();
+        assert_eq!(lines, vec!["--prefix=/usr", "--disable-nls", "--with-ssl"]);
+        assert!(
+            !e2e.src.join("Makefile").exists(),
+            "configure must not write into $SRC"
+        );
+        assert!(
+            e2e.tree.path().join("lib/built").exists(),
+            "make ran in the work dir"
+        );
+
+        let log = e2e.invocations();
+        assert!(
+            log.contains("make \n"),
+            "plain make must run before install: {log}"
+        );
+        assert!(
+            log.contains(&format!("make install DESTDIR={}", e2e.stage.display())),
+            "install must honor DESTDIR=$STAGE: {log}"
+        );
+        assert!(e2e.stage.join("usr/bin/demo").exists());
+    }
+
+    #[test]
+    fn test_e2e_cmake_plugin_configures_builds_and_installs_into_stage() {
+        let e2e = PluginE2e::new();
+        write_stub(
+            &e2e.stubs,
+            "cmake",
+            r#"printf 'cmake %s\n' "$*" >> "$STAGE/invocations.log"
+case "$1" in
+  -S) mkdir -p build ;;
+  --build) : ;;
+  --install)
+    printf 'DESTDIR=%s\n' "$DESTDIR" >> "$STAGE/invocations.log"
+    mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/app" ;;
+esac
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("cmake".into()),
+                plugin_options: Some(
+                    [
+                        (
+                            "generator".to_string(),
+                            crate::plugins::PluginValue::Str("Ninja".into()),
+                        ),
+                        (
+                            "defines".to_string(),
+                            crate::plugins::PluginValue::Map(
+                                [("USE_SSL".to_string(), "ON".to_string())]
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+        });
+
+        let inner_src = expected_src(&e2e.src);
+        let log = e2e.invocations();
+        assert!(
+            log.contains(&format!(
+                "cmake -S {} -B build -G Ninja -DUSE_SSL=ON -DCMAKE_INSTALL_PREFIX=/usr",
+                inner_src.display()
+            )),
+            "configure must point at $SRC with generator + defines: {log}"
+        );
+        assert!(log.contains("cmake --build build"), "must build: {log}");
+        assert!(
+            log.contains("cmake --install build")
+                && log.contains(&format!("DESTDIR={}", e2e.stage.display())),
+            "install must honor DESTDIR=$STAGE: {log}"
+        );
+        assert!(e2e.stage.join("usr/bin/app").exists());
+    }
+
+    #[test]
+    fn test_e2e_cargo_plugin_runs_stubbed_toolchain_with_channel_env() {
+        let e2e = PluginE2e::new();
+        // Stub cargo: logs the invocation AND the channel env the plugin
+        // exported, then "installs" a binary into $STAGE/bin.
+        write_stub(
+            &e2e.stubs,
+            "cargo",
+            r#"printf 'cargo %s\n' "$*" >> "$STAGE/invocations.log"
+printf 'RUSTUP_TOOLCHAIN=%s\n' "$RUSTUP_TOOLCHAIN" >> "$STAGE/invocations.log"
+mkdir -p "$STAGE/bin" && : > "$STAGE/bin/app"
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("cargo".into()),
+                plugin_options: Some(
+                    [(
+                        "channel".to_string(),
+                        crate::plugins::PluginValue::Str("nightly".into()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+        });
+
+        let inner_src = expected_src(&e2e.src);
+        let log = e2e.invocations();
+        assert!(
+            log.contains(&format!(
+                "cargo install --path {} --root {}",
+                inner_src.display(),
+                e2e.stage.display()
+            )),
+            "cargo must build from $SRC and install into $STAGE: {log}"
+        );
+        assert!(
+            log.contains("RUSTUP_TOOLCHAIN=nightly"),
+            "channel option must be exported as RUSTUP_TOOLCHAIN: {log}"
+        );
+        assert!(e2e.stage.join("bin/app").exists());
+    }
+
+    #[test]
+    fn test_e2e_plugin_and_command_parts_share_stage_and_ordering() {
+        // Mixed spec: a command part, then a plugin part after it — both
+        // install into the same shared $STAGE in `after` order.
+        let e2e = PluginE2e::new();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+# DESTDIR arrives as a make command-line arg, not env.
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+if [ -n "$DESTDIR" ]; then
+  printf 'saw=%s\n' "$(cat "$STAGE/a.done" 2>/dev/null)" >> "$STAGE/invocations.log"
+  mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/hello"
+fi
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [
+            (
+                "a",
+                SnapPart {
+                    build: "printf 'first\\n' > \"$STAGE/a.done\"".into(),
+                    after: vec![],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+            (
+                "b",
+                SnapPart {
+                    build: String::new(),
+                    after: vec!["a".into()],
+                    plugin: Some("make".into()),
+                    plugin_options: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+        });
+
+        let log = e2e.invocations();
+        assert!(
+            log.contains("saw=first"),
+            "plugin part must run after the command part and see its stage output: {log}"
+        );
+        assert!(e2e.stage.join("usr/bin/hello").exists());
     }
 }

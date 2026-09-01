@@ -232,6 +232,14 @@ function snap(opts)
     -- Lua tables don't preserve order, so execution order is derived from
     -- `after` at build time: a part runs once all its `after` parts are
     -- done; parts with no `after` are runnable immediately.
+    --
+    -- plugin (ADR-0014): a part may select a built-in builder plugin
+    -- instead of a raw command. `build` and `plugin` are mutually exclusive
+    -- per part (a plugin IS the build). Plugin options go in `options`;
+    -- per ADR-0014 Decision 3, Lua only checks that the plugin is a known
+    -- name (registry injected as `shuttle_plugins` by the Rust prelude) and
+    -- that options are a table — deep option validation lives in Rust at
+    -- the plugin boundary and produces named errors.
     if opts.parts ~= nil then
         if opts.build ~= nil then
             error("snap(): 'build' and 'parts' are mutually exclusive — move the command into parts['<name>'].build", 2)
@@ -248,7 +256,33 @@ function snap(opts)
                 error(string.format(
                     "snap(): parts['%s'] must be a table, got %s", name, type(part)), 2)
             end
-            if type(part.build) ~= "string" or part.build == "" then
+            if part.plugin ~= nil then
+                if part.build ~= nil then
+                    error(string.format(
+                        "snap(): parts['%s'] must have exactly one of 'build' or 'plugin'", name), 2)
+                end
+                if type(part.plugin) ~= "string" or part.plugin == "" then
+                    error(string.format(
+                        "snap(): parts['%s'].plugin must be a non-empty string, got %s",
+                        name, type(part.plugin)), 2)
+                end
+                if part.options ~= nil and type(part.options) ~= "table" then
+                    error(string.format(
+                        "snap(): parts['%s'].options must be a table, got %s",
+                        name, type(part.options)), 2)
+                end
+                local known = shuttle_plugins
+                if known ~= nil and known[part.plugin] ~= true then
+                    local available = {}
+                    for plugin_name in pairs(known) do
+                        available[#available + 1] = plugin_name
+                    end
+                    table.sort(available)
+                    error(string.format(
+                        "snap(): parts['%s'].plugin must be one of: %s (got '%s')",
+                        name, table.concat(available, ", "), part.plugin), 2)
+                end
+            elseif type(part.build) ~= "string" or part.build == "" then
                 error(string.format(
                     "snap(): parts['%s'].build must be a non-empty string, got %s",
                     name, type(part.build)), 2)

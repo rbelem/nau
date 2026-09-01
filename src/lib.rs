@@ -11,5 +11,6 @@ pub mod lock;
 pub mod lua;
 pub mod output;
 pub mod pkg_source;
+pub mod plugins;
 pub mod snap;
 pub mod store;

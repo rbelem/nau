@@ -47,12 +47,31 @@ const NO_SOURCE_HASH: &str = "none";
 
 /// Canonical JSON for a parts spec, used in cache keys: parts sorted by
 /// name (BTreeMap order), each with its command and `after` edges. Any
-/// change to names, commands, or edges changes the key.
+/// change to names, commands, or edges changes the key. Plugin parts
+/// additionally fold in the plugin name, the plugin registry version, and
+/// the canonical (sorted-key) options map, so any option change invalidates
+/// the cache (ADR-0014 Decision 5). Parts without a plugin serialize exactly
+/// as before — single-command specs keep byte-identical keys.
 fn canonical_parts_json(parts: &std::collections::BTreeMap<String, SnapPart>) -> String {
     let items: Vec<serde_json::Value> = parts
         .iter()
         .map(|(name, part)| {
-            serde_json::json!({ "name": name, "build": part.build, "after": part.after })
+            let mut obj =
+                serde_json::json!({ "name": name, "build": part.build, "after": part.after });
+            if let Some(plugin) = &part.plugin {
+                obj["plugin"] = serde_json::Value::String(plugin.clone());
+                obj["plugin_version"] =
+                    serde_json::Value::String(crate::plugins::REGISTRY_VERSION.to_string());
+                if let Some(options) = &part.plugin_options {
+                    obj["options"] = serde_json::Value::Object(
+                        options
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.to_json()))
+                            .collect(),
+                    );
+                }
+            }
+            obj
         })
         .collect();
     serde_json::to_string(&items).unwrap_or_else(|_| "unserializable".to_string())
@@ -452,6 +471,8 @@ mod tests {
                 SnapPart {
                     build: "make".into(),
                     after: vec![],
+                    plugin: None,
+                    plugin_options: None,
                 },
             )]
             .into_iter()
@@ -475,6 +496,8 @@ mod tests {
                 SnapPart {
                     build: "npm build".into(),
                     after: vec![],
+                    plugin: None,
+                    plugin_options: None,
                 },
             );
         }
@@ -493,6 +516,143 @@ mod tests {
             parts.get_mut("core").unwrap().after = vec![];
         }
         assert_eq!(with_parts, PackageCache::source_key(&meta5));
+    }
+
+    #[test]
+    fn test_canonical_parts_json_locked_for_command_parts() {
+        // Parts without a plugin must serialize byte-identically to the
+        // pre-plugin format (serde_json's default map sorts keys).
+        let parts: std::collections::BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: "make".into(),
+                after: vec!["libs".into()],
+                plugin: None,
+                plugin_options: None,
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(
+            super::canonical_parts_json(&parts),
+            r#"[{"after":["libs"],"build":"make","name":"core"}]"#
+        );
+    }
+
+    #[test]
+    fn test_canonical_parts_json_folds_plugin_identity_and_options() {
+        let parts: std::collections::BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("make".into()),
+                plugin_options: Some(
+                    [(
+                        "target".to_string(),
+                        crate::plugins::PluginValue::Str("all".into()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(
+            super::canonical_parts_json(&parts),
+            r#"[{"after":[],"build":"","name":"core","options":{"target":"all"},"plugin":"make","plugin_version":"1"}]"#
+        );
+    }
+
+    #[test]
+    fn test_source_key_varies_with_plugin_and_options() {
+        let mut meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        meta.build = None;
+        meta.parts = Some(
+            [(
+                "core",
+                SnapPart {
+                    build: String::new(),
+                    after: vec![],
+                    plugin: Some("make".into()),
+                    plugin_options: None,
+                },
+            )]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        );
+        let base = PackageCache::source_key(&meta);
+
+        // Different plugin → different key
+        let mut meta2 = meta.clone();
+        meta2
+            .parts
+            .as_mut()
+            .unwrap()
+            .get_mut("core")
+            .unwrap()
+            .plugin = Some("cmake".into());
+        assert_ne!(base, PackageCache::source_key(&meta2));
+
+        // Option added → different key
+        let mut meta3 = meta.clone();
+        meta3
+            .parts
+            .as_mut()
+            .unwrap()
+            .get_mut("core")
+            .unwrap()
+            .plugin_options = Some(
+            [(
+                "target".to_string(),
+                crate::plugins::PluginValue::Str("all".into()),
+            )]
+            .into(),
+        );
+        let with_options = PackageCache::source_key(&meta3);
+        assert_ne!(base, with_options);
+
+        // Option value changed → different key
+        let mut meta4 = meta3.clone();
+        meta4
+            .parts
+            .as_mut()
+            .unwrap()
+            .get_mut("core")
+            .unwrap()
+            .plugin_options = Some(
+            [(
+                "target".to_string(),
+                crate::plugins::PluginValue::Str("install".into()),
+            )]
+            .into(),
+        );
+        assert_ne!(with_options, PackageCache::source_key(&meta4));
+
+        // Identical options → same key
+        assert_eq!(with_options, PackageCache::source_key(&meta3));
+
+        // Sorted-key canonicalization: same options inserted in a different
+        // container (BTreeMap normalizes anyway) → same key
+        let mut meta5 = meta3.clone();
+        meta5
+            .parts
+            .as_mut()
+            .unwrap()
+            .get_mut("core")
+            .unwrap()
+            .plugin_options = Some(
+            [(
+                "target".to_string(),
+                crate::plugins::PluginValue::Str("all".into()),
+            )]
+            .into(),
+        );
+        assert_eq!(with_options, PackageCache::source_key(&meta5));
     }
 
     #[test]
