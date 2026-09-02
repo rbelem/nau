@@ -964,9 +964,10 @@ fn plugin_value_from_lua(
 ) -> miette::Result<crate::plugins::PluginValue> {
     match value {
         Value::String(s) => Ok(crate::plugins::PluginValue::Str(lua_str(s)?)),
+        Value::Boolean(b) => Ok(crate::plugins::PluginValue::Bool(*b)),
         Value::Table(t) => plugin_table_value(label, t),
         other => Err(miette::miette!(
-            "{label} must be a string, array of strings, or table of strings, got {}",
+            "{label} must be a string, boolean, array of strings, or table of strings, got {}",
             other.type_name()
         )),
     }
@@ -4097,6 +4098,46 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("make: unknown option 'jobs'"), "got: {err}");
+
+        // Booleans and string maps pass the boundary (registry v2 growth:
+        // make `install`, autotools `in_source`, make `variables`).
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "grown-options",
+                    version = "1.0",
+                    parts = {
+                        core = {
+                            plugin = "make",
+                            options = {
+                                install = false,
+                                variables = { CFLAGS = "-O2" },
+                            },
+                        },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let options = meta.parts.as_ref().expect("parts extracted")["core"]
+            .plugin_options
+            .as_ref()
+            .expect("options extracted");
+        assert_eq!(options["install"], crate::plugins::PluginValue::Bool(false));
+        assert_eq!(
+            options["variables"],
+            crate::plugins::PluginValue::Map(
+                [("CFLAGS".to_string(), "-O2".to_string())]
+                    .into_iter()
+                    .collect()
+            )
+        );
     }
 
     #[test]
@@ -4306,13 +4347,236 @@ fi
         );
         assert!(
             log.contains(&format!(
-                "make -C {} install DESTDIR={}",
+                "make -C {} PREFIX=/usr install DESTDIR={}",
                 inner_src.display(),
                 e2e.stage.display()
             )),
-            "install command must honor DESTDIR=$STAGE: {log}"
+            "install command must honor PREFIX=/usr + DESTDIR=$STAGE: {log}"
         );
         assert!(e2e.stage.join("usr/bin/hello").exists());
+    }
+
+    #[test]
+    fn test_e2e_make_plugin_variables_reach_command_line() {
+        let e2e = PluginE2e::new();
+        std::fs::write(
+            e2e.src.join("Makefile"),
+            "# real Makefile (unused by the stub; proves -C $SRC wiring)\n",
+        )
+        .unwrap();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+# DESTDIR arrives as a make command-line arg (make install DESTDIR=...), not env.
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+if [ -n "$DESTDIR" ]; then
+  mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/hello"
+fi
+"#,
+        );
+
+        // pciutils-shaped part: PREFIX supplied via variables (which replaces
+        // the prefix-derived one), inserted out of order to prove sorting.
+        let parts: BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("make".into()),
+                plugin_options: Some(
+                    [(
+                        "variables".to_string(),
+                        crate::plugins::PluginValue::Map(
+                            [
+                                ("ZFLAG".to_string(), "1".to_string()),
+                                ("AFLAG".to_string(), "2".to_string()),
+                                ("PREFIX".to_string(), "/usr".to_string()),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+        });
+
+        let inner_src = expected_src(&e2e.src);
+        let log = e2e.invocations();
+        let vars = "AFLAG=2 PREFIX=/usr ZFLAG=1";
+        assert!(
+            log.contains(&format!("make -C {} {vars}", inner_src.display())),
+            "variables must reach the build command line, sorted: {log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "make -C {} {vars} install DESTDIR={}",
+                inner_src.display(),
+                e2e.stage.display()
+            )),
+            "variables must reach the install command line: {log}"
+        );
+        assert!(e2e.stage.join("usr/bin/hello").exists());
+    }
+
+    #[test]
+    fn test_e2e_make_plugin_install_false_skips_install_step() {
+        let e2e = PluginE2e::new();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+if [ -n "$DESTDIR" ]; then
+  mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/hello"
+fi
+"#,
+        );
+
+        // Lib-only part (bzip2 shared-lib pattern): staging is arranged by
+        // an earlier part; install = false must emit no install step.
+        let parts: BTreeMap<String, SnapPart> = [(
+            "lib",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("make".into()),
+                plugin_options: Some(
+                    [(
+                        "install".to_string(),
+                        crate::plugins::PluginValue::Bool(false),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+        });
+
+        let inner_src = expected_src(&e2e.src);
+        let log = e2e.invocations();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "install = false must emit exactly one command: {log}"
+        );
+        assert_eq!(
+            lines[0],
+            format!("make -C {}", inner_src.display()),
+            "and it must be the build command only: {log}"
+        );
+        assert!(
+            !e2e.stage.join("usr/bin/hello").exists(),
+            "no install step means nothing was staged"
+        );
+    }
+
+    #[test]
+    fn test_e2e_autotools_in_source_configures_in_src() {
+        let e2e = PluginE2e::new();
+        // Non-autoconf configure (dhcpcd-style): writes its Makefile next to
+        // itself, in $SRC — regardless of the caller's cwd. This is exactly
+        // the layout the VPATH expansion breaks.
+        std::fs::write(
+            e2e.src.join("configure"),
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/configure.log\"\ncat > \"$(dirname \"$0\")/Makefile\" <<'EOF'\nall:\n\t: > \"$(dirname \"$0\")/built\"\ninstall:\n\tmkdir -p $(DESTDIR)/usr/sbin && : > $(DESTDIR)/usr/sbin/dhcpcd\nEOF\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            e2e.src.join("configure"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+case " $* " in
+  *" install "*)
+    mkdir -p "$DESTDIR/usr/sbin" && : > "$DESTDIR/usr/sbin/dhcpcd" ;;
+  *) : > built ;;
+esac
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "lib",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("autotools".into()),
+                plugin_options: Some(
+                    [
+                        (
+                            "in_source".to_string(),
+                            crate::plugins::PluginValue::Bool(true),
+                        ),
+                        (
+                            "args".to_string(),
+                            crate::plugins::PluginValue::Arr(vec!["--sysconfdir=/etc".into()]),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+        });
+
+        // configure ran inside $SRC with --prefix=/usr and the args, and its
+        // Makefile landed there; make's `built` marker followed (cwd = $SRC).
+        let configure_log = std::fs::read_to_string(e2e.src.join("configure.log")).unwrap();
+        let lines: Vec<&str> = configure_log.lines().collect();
+        assert_eq!(lines, vec!["--prefix=/usr", "--sysconfdir=/etc"]);
+        assert!(
+            e2e.src.join("Makefile").exists() && e2e.src.join("built").exists(),
+            "in_source build must run entirely inside $SRC"
+        );
+        assert!(
+            !e2e.tree.path().join("lib/built").exists(),
+            "nothing may land in the VPATH work dir"
+        );
+
+        let log = e2e.invocations();
+        assert!(
+            log.contains("make \n"),
+            "plain make must run before install: {log}"
+        );
+        assert!(
+            log.contains(&format!("make install DESTDIR={}", e2e.stage.display())),
+            "install must honor DESTDIR=$STAGE: {log}"
+        );
+        assert!(e2e.stage.join("usr/sbin/dhcpcd").exists());
     }
 
     #[test]

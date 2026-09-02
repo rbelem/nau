@@ -707,7 +707,49 @@ mod tests {
         .collect();
         assert_eq!(
             super::canonical_parts_json(&parts),
-            r#"[{"after":[],"build":"","name":"core","options":{"target":"all"},"plugin":"make","plugin_version":"1"}]"#
+            r#"[{"after":[],"build":"","name":"core","options":{"target":"all"},"plugin":"make","plugin_version":"2"}]"#
+        );
+    }
+
+    #[test]
+    fn test_canonical_parts_json_make_growth_options_canonical() {
+        // Registry-v2 options fold in canonically: option keys sorted,
+        // `variables` map sorted, booleans as JSON booleans.
+        let parts: std::collections::BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("make".into()),
+                plugin_options: Some(
+                    [
+                        (
+                            "variables".to_string(),
+                            crate::plugins::PluginValue::Map(
+                                [
+                                    ("ZED".to_string(), "1".to_string()),
+                                    ("ALPHA".to_string(), "2".to_string()),
+                                ]
+                                .into_iter()
+                                .collect(),
+                            ),
+                        ),
+                        (
+                            "install".to_string(),
+                            crate::plugins::PluginValue::Bool(false),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(
+            super::canonical_parts_json(&parts),
+            r#"[{"after":[],"build":"","name":"core","options":{"install":false,"variables":{"ALPHA":"2","ZED":"1"}},"plugin":"make","plugin_version":"2"}]"#
         );
     }
 
@@ -785,6 +827,64 @@ mod tests {
             with_options,
             BuildClosure::for_meta(&meta3, vec![]).cache_key()
         );
+    }
+
+    #[test]
+    fn test_closure_key_varies_with_make_variables() {
+        // Registry-v2 make options: `variables` (and booleans like `install`)
+        // must fold into the key like any other option.
+        let make_part = |options| SnapPart {
+            build: String::new(),
+            after: vec![],
+            plugin: Some("make".into()),
+            plugin_options: options,
+        };
+        let variables = |value: &str| {
+            Some(
+                [(
+                    "variables".to_string(),
+                    crate::plugins::PluginValue::Map(
+                        [("CFLAGS".to_string(), value.to_string())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+            )
+        };
+
+        let meta = |part: SnapPart| {
+            let mut m = make_source_meta("hello", "https://example.com/hello.tar.gz");
+            m.build = None;
+            m.parts = Some([("core".to_string(), part)].into_iter().collect());
+            BuildClosure::for_meta(&m, vec![]).cache_key()
+        };
+
+        let base = meta(make_part(None));
+        let with_vars = meta(make_part(variables("-O2")));
+        assert_ne!(base, with_vars, "adding variables must change the key");
+
+        let changed = meta(make_part(variables("-O3")));
+        assert_ne!(with_vars, changed, "a variable value change must rekey");
+
+        assert_eq!(
+            meta(make_part(variables("-O2"))),
+            with_vars,
+            "identical variables must keep the key warm"
+        );
+
+        // install = false changes the expansion → must change the key.
+        let mut part = make_part(None);
+        part.plugin_options = Some(
+            [(
+                "install".to_string(),
+                crate::plugins::PluginValue::Bool(false),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_ne!(base, meta(part));
     }
 
     #[test]

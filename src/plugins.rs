@@ -19,8 +19,11 @@ use std::collections::BTreeMap;
 
 /// Version of the built-in plugin registry. Folded into cache keys for
 /// plugin parts (ADR-0014 Decision 5): a shuttle release that changes plugin
-/// expansion invalidates cached artifacts built by older plugins.
-pub const REGISTRY_VERSION: &str = "1";
+/// expansion invalidates cached artifacts built by older plugins. Bumped to
+/// "2" when `make` gained `variables`/`prefix`/`install` and `autotools`
+/// gained `prefix`/`in_source` (the `make` install line now carries
+/// `PREFIX=/usr` by default — v1-cached `make` artifacts are stale).
+pub const REGISTRY_VERSION: &str = "2";
 
 /// The toolchain package `cargo` parts add to the snap's effective requires.
 ///
@@ -35,16 +38,18 @@ const CARGO_REQUIRES: &str = "toolchain-gcc-gnu-x86_64";
 #[derive(Debug, Clone, PartialEq)]
 pub enum PluginValue {
     Str(String),
+    Bool(bool),
     Arr(Vec<String>),
     Map(BTreeMap<String, String>),
 }
 
 impl PluginValue {
     /// Canonical JSON for cache keys: maps serialize with sorted keys
-    /// (BTreeMap), arrays keep order.
+    /// (BTreeMap), arrays keep order, booleans map to JSON booleans.
     pub fn to_json(&self) -> serde_json::Value {
         match self {
             PluginValue::Str(s) => serde_json::Value::String(s.clone()),
+            PluginValue::Bool(b) => serde_json::Value::Bool(*b),
             PluginValue::Arr(items) => serde_json::Value::Array(
                 items
                     .iter()
@@ -77,6 +82,7 @@ pub struct BuildPlan {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum OptionKind {
     Str,
+    Bool,
     Arr,
     Map,
 }
@@ -85,8 +91,9 @@ impl OptionKind {
     fn expects(self) -> &'static str {
         match self {
             OptionKind::Str => "a string",
+            OptionKind::Bool => "true or false",
             OptionKind::Arr => "an array of strings",
-            OptionKind::Map => "a table of strings",
+            OptionKind::Map => "a string→string map",
         }
     }
 
@@ -94,6 +101,7 @@ impl OptionKind {
         matches!(
             (self, value),
             (OptionKind::Str, PluginValue::Str(_))
+                | (OptionKind::Bool, PluginValue::Bool(_))
                 | (OptionKind::Arr, PluginValue::Arr(_))
                 | (OptionKind::Map, PluginValue::Map(_))
         )
@@ -111,8 +119,13 @@ struct PluginSpec {
     options: &'static [OptionSpec],
 }
 
-/// The v1 registry (ADR-0014 Decision 6): intentionally minimal option sets,
-/// grown by demand.
+/// The built-in registry (ADR-0014 Decision 6): option sets grown by demand.
+///
+/// v2 growth came from dogfood friction blocking real packages: `make`
+/// `variables`/`prefix` unblock pciutils, zstd and lm-sensors; `autotools`
+/// `in_source` unblocks dhcpcd (non-autoconf configure); `make` `install`
+/// supports lib-only parts that stage via their own explicit install part
+/// (the bzip2 shared-lib pattern).
 const PLUGINS: &[PluginSpec] = &[
     PluginSpec {
         name: "make",
@@ -125,6 +138,21 @@ const PLUGINS: &[PluginSpec] = &[
             OptionSpec {
                 name: "makefile",
                 kind: OptionKind::Str,
+                required: false,
+            },
+            OptionSpec {
+                name: "variables",
+                kind: OptionKind::Map,
+                required: false,
+            },
+            OptionSpec {
+                name: "prefix",
+                kind: OptionKind::Str,
+                required: false,
+            },
+            OptionSpec {
+                name: "install",
+                kind: OptionKind::Bool,
                 required: false,
             },
         ],
@@ -154,11 +182,23 @@ const PLUGINS: &[PluginSpec] = &[
     },
     PluginSpec {
         name: "autotools",
-        options: &[OptionSpec {
-            name: "args",
-            kind: OptionKind::Arr,
-            required: false,
-        }],
+        options: &[
+            OptionSpec {
+                name: "args",
+                kind: OptionKind::Arr,
+                required: false,
+            },
+            OptionSpec {
+                name: "prefix",
+                kind: OptionKind::Str,
+                required: false,
+            },
+            OptionSpec {
+                name: "in_source",
+                kind: OptionKind::Bool,
+                required: false,
+            },
+        ],
     },
 ];
 
@@ -278,9 +318,38 @@ fn opt_map<'a>(
         })
 }
 
+fn opt_bool(opts: &[(&'static str, &PluginValue)], key: &str) -> Option<bool> {
+    opts.iter()
+        .find(|(name, _)| *name == key)
+        .and_then(|(_, v)| match v {
+            PluginValue::Bool(b) => Some(*b),
+            _ => None,
+        })
+}
+
 /// `make` part: build + install into `$STAGE`. The Makefile lives in `$SRC`
 /// (part work dirs are siblings of the shared source dir), so commands run
 /// there via `make -C`.
+///
+/// Options (ADR-0014 §6 growth — dogfood friction from pciutils, zstd,
+/// lm-sensors and lib-only parts):
+///
+/// - `variables`: string→string map emitted as `VAR=VALUE` arguments on both
+///   commands, canonicalized to sorted order. This is how non-autoconf
+///   Makefiles get their prefix (pciutils' `PREFIX=/usr`) and build flags.
+/// - `prefix`: install prefix, default `"usr"` (emitted as `PREFIX=/usr` —
+///   the corpus convention, `make install PREFIX=/usr DESTDIR=$STAGE`).
+///   Leading slashes in the value are normalized (`"/opt"` and `"opt"` both
+///   give `PREFIX=/opt`). Emitted on the install command only; build-time
+///   prefix spellings (zstd/lm-sensors' lowercase `prefix=/usr`) belong in
+///   `variables`. A `variables` entry named `PREFIX` replaces the
+///   prefix-derived one.
+/// - `install`: default `true`. When `false` the plan ends after the build
+///   command — for lib-only or custom-Makefile parts that stage files via
+///   their own explicit install part (the bzip2 shared-lib pattern). With
+///   no raw command channel on plugin parts, staging then is entirely the
+///   part author's responsibility; choosing `install = false` without
+///   arranging staging yields a part that installs nothing, by design.
 fn make_plan(opts: &[(&'static str, &PluginValue)]) -> BuildPlan {
     let file_arg = match opt_str(opts, "makefile") {
         Some(f) => format!(" -f {f}"),
@@ -290,11 +359,33 @@ fn make_plan(opts: &[(&'static str, &PluginValue)]) -> BuildPlan {
         Some(t) => format!(" {t}"),
         None => String::new(),
     };
+    let install = opt_bool(opts, "install").unwrap_or(true);
+    let prefix = opt_str(opts, "prefix")
+        .unwrap_or("usr")
+        .trim_start_matches('/');
+    let variables = opt_map(opts, "variables");
+    // BTreeMap iteration keeps the emitted order canonical regardless of the
+    // definition's table order.
+    let mut var_args = String::new();
+    if let Some(vars) = variables {
+        for (key, value) in vars {
+            var_args.push_str(&format!(" {key}={value}"));
+        }
+    }
+    // The install command carries the prefix; an explicit `variables` PREFIX
+    // entry replaces the derived one instead of doubling it.
+    let mut install_args = var_args.clone();
+    if !variables.is_some_and(|vars| vars.contains_key("PREFIX")) {
+        install_args.push_str(&format!(" PREFIX=/{prefix}"));
+    }
+    let mut commands = vec![format!("make -C $SRC{var_args}{file_arg}{target_arg}")];
+    if install {
+        commands.push(format!(
+            "make -C $SRC{install_args}{file_arg} install DESTDIR=$STAGE"
+        ));
+    }
     BuildPlan {
-        commands: vec![
-            format!("make -C $SRC{file_arg}{target_arg}"),
-            format!("make -C $SRC{file_arg} install DESTDIR=$STAGE"),
-        ],
+        commands,
         env: Vec::new(),
         extra_requires: Vec::new(),
     }
@@ -353,19 +444,44 @@ fn cmake_plan(opts: &[(&'static str, &PluginValue)]) -> BuildPlan {
 /// build, install into `$STAGE` — the convention used by the repo's
 /// hand-written `./configure --prefix=/usr && make install DESTDIR=$STAGE`
 /// builds.
+///
+/// Options (ADR-0014 §6 growth — dogfood friction from dhcpcd):
+///
+/// - `prefix`: configure prefix, default `"usr"` (the corpus
+///   `--prefix=/usr DESTDIR=$STAGE` convention; leading slashes in the value
+///   are normalized).
+/// - `in_source`: default `false`. When `true`, configure and make run in
+///   `$SRC` directly — for non-autoconf configure scripts (dhcpcd's) that
+///   write their Makefile into the source dir, which breaks the VPATH
+///   `mkdir + $SRC/configure` layout.
 fn autotools_plan(opts: &[(&'static str, &PluginValue)]) -> BuildPlan {
     let args = match opt_arr(opts, "args") {
         [] => String::new(),
         items => format!(" {}", items.join(" ")),
     };
-    BuildPlan {
-        commands: vec![
-            format!("$SRC/configure --prefix=/usr{args}"),
-            "make".to_string(),
-            "make install DESTDIR=$STAGE".to_string(),
-        ],
-        env: Vec::new(),
-        extra_requires: Vec::new(),
+    let prefix = opt_str(opts, "prefix")
+        .unwrap_or("usr")
+        .trim_start_matches('/');
+    if opt_bool(opts, "in_source").unwrap_or(false) {
+        BuildPlan {
+            commands: vec![
+                format!("cd $SRC && ./configure --prefix=/{prefix}{args}"),
+                "cd $SRC && make".to_string(),
+                "cd $SRC && make install DESTDIR=$STAGE".to_string(),
+            ],
+            env: Vec::new(),
+            extra_requires: Vec::new(),
+        }
+    } else {
+        BuildPlan {
+            commands: vec![
+                format!("$SRC/configure --prefix=/{prefix}{args}"),
+                "make".to_string(),
+                "make install DESTDIR=$STAGE".to_string(),
+            ],
+            env: Vec::new(),
+            extra_requires: Vec::new(),
+        }
     }
 }
 
@@ -402,7 +518,10 @@ mod tests {
         let plan = expand_map("make", &[]).unwrap();
         assert_eq!(
             plan.commands,
-            vec!["make -C $SRC", "make -C $SRC install DESTDIR=$STAGE",]
+            vec![
+                "make -C $SRC",
+                "make -C $SRC PREFIX=/usr install DESTDIR=$STAGE",
+            ]
         );
         assert!(plan.env.is_empty());
         assert!(plan.extra_requires.is_empty());
@@ -416,8 +535,91 @@ mod tests {
             plan.commands,
             vec![
                 "make -C $SRC -f Makefile.linux all",
-                "make -C $SRC -f Makefile.linux install DESTDIR=$STAGE",
+                "make -C $SRC PREFIX=/usr -f Makefile.linux install DESTDIR=$STAGE",
             ]
+        );
+    }
+
+    #[test]
+    fn test_expand_make_variables_sorted_on_both_commands() {
+        // Inserted out of order; the emitted command line must be canonical.
+        // A variables PREFIX entry replaces the prefix-derived one.
+        let mut options = BTreeMap::new();
+        options.insert(
+            "variables".to_string(),
+            PluginValue::Map(
+                [
+                    ("ZED".to_string(), "1".to_string()),
+                    ("ALPHA".to_string(), "2".to_string()),
+                    ("PREFIX".to_string(), "/opt/tools".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        let plan = expand("make", Some(&options)).unwrap();
+        assert_eq!(
+            plan.commands,
+            vec![
+                "make -C $SRC ALPHA=2 PREFIX=/opt/tools ZED=1",
+                "make -C $SRC ALPHA=2 PREFIX=/opt/tools ZED=1 install DESTDIR=$STAGE",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expand_make_prefix_default_and_override() {
+        // Default prefix is "usr" (locked by test_expand_make_defaults);
+        // override changes the install line only.
+        let plan = expand_map("make", &[("prefix", "/opt")]).unwrap();
+        assert_eq!(
+            plan.commands,
+            vec![
+                "make -C $SRC",
+                "make -C $SRC PREFIX=/opt install DESTDIR=$STAGE",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expand_make_install_false_emits_build_only() {
+        let mut options = BTreeMap::new();
+        options.insert("install".to_string(), PluginValue::Bool(false));
+        let plan = expand("make", Some(&options)).unwrap();
+        assert_eq!(plan.commands, vec!["make -C $SRC"]);
+
+        // Same shape with variables: the build line still carries them.
+        options.insert(
+            "variables".to_string(),
+            PluginValue::Map(
+                [("CFLAGS".to_string(), "-O2".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        let plan = expand("make", Some(&options)).unwrap();
+        assert_eq!(plan.commands, vec!["make -C $SRC CFLAGS=-O2"]);
+    }
+
+    #[test]
+    fn test_expand_make_variables_must_be_map() {
+        let err = expand_map("make", &[("variables", "CFLAGS=-O2")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("make: option 'variables' must be a string→string map"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_expand_make_install_must_be_boolean() {
+        let err = expand_map("make", &[("install", "no")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("make: option 'install' must be true or false"),
+            "got: {err}"
         );
     }
 
@@ -523,6 +725,67 @@ mod tests {
         assert_eq!(plan.commands[0], "$SRC/configure --prefix=/usr");
     }
 
+    #[test]
+    fn test_expand_autotools_prefix_override() {
+        let plan = expand_map("autotools", &[("prefix", "/opt")]).unwrap();
+        assert_eq!(
+            plan.commands,
+            vec![
+                "$SRC/configure --prefix=/opt",
+                "make",
+                "make install DESTDIR=$STAGE",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expand_autotools_in_source_runs_in_src() {
+        // Non-autoconf configure (dhcpcd): everything runs in $SRC directly
+        // instead of the VPATH work-dir layout.
+        let mut options = BTreeMap::new();
+        options.insert("in_source".to_string(), PluginValue::Bool(true));
+        options.insert("prefix".to_string(), PluginValue::Str("/opt".into()));
+        options.insert(
+            "args".to_string(),
+            PluginValue::Arr(vec!["--sysconfdir=/etc".into()]),
+        );
+        let plan = expand("autotools", Some(&options)).unwrap();
+        assert_eq!(
+            plan.commands,
+            vec![
+                "cd $SRC && ./configure --prefix=/opt --sysconfdir=/etc",
+                "cd $SRC && make",
+                "cd $SRC && make install DESTDIR=$STAGE",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expand_autotools_in_source_defaults_false_keeps_vpath() {
+        let mut options = BTreeMap::new();
+        options.insert("in_source".to_string(), PluginValue::Bool(false));
+        let plan = expand("autotools", Some(&options)).unwrap();
+        assert_eq!(
+            plan.commands,
+            vec![
+                "$SRC/configure --prefix=/usr",
+                "make",
+                "make install DESTDIR=$STAGE",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expand_autotools_in_source_must_be_boolean() {
+        let err = expand_map("autotools", &[("in_source", "yes")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("autotools: option 'in_source' must be true or false"),
+            "got: {err}"
+        );
+    }
+
     // ── Schema validation (ADR-0014 Decision 3 named errors) ──
 
     #[test]
@@ -531,7 +794,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("make: unknown option 'jobs' (available: target, makefile)"),
+            err.contains(
+                "make: unknown option 'jobs' (available: target, makefile, variables, prefix, install)"
+            ),
             "got: {err}"
         );
     }
@@ -591,6 +856,14 @@ mod tests {
             serde_json::to_string(&PluginValue::Arr(vec!["b".into(), "a".into()]).to_json())
                 .unwrap(),
             r#"["b","a"]"#
+        );
+        assert_eq!(
+            serde_json::to_string(&PluginValue::Bool(true).to_json()).unwrap(),
+            "true"
+        );
+        assert_eq!(
+            serde_json::to_string(&PluginValue::Bool(false).to_json()).unwrap(),
+            "false"
         );
     }
 }
