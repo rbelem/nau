@@ -11,7 +11,9 @@
     "autoconf@latest",
     "automake@latest",
     "bison@latest",
-    "bubblewrap@latest"
+    "bubblewrap@latest",
+    "gnumake@latest",
+    "flex@latest"
   ],
   "shell": {
     "init_hook": [
