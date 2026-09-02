@@ -6,15 +6,12 @@
 return {
     default = snap {
         name = "smartmontools",
-        version = "7.4",
-        summary = "S.M.A.R.T. monitoring tools for hard drives",
-        description = [[
-            smartmontools contains utilities that control and monitor
-            computer storage systems using the Self-Monitoring, Analysis,
-            and Reporting Technology (S.M.A.R.T.) system built into most
-            modern ATA/SATA, SCSI/SAS and NVMe disks. Includes smartctl
-            for one-shot queries and smartd for continuous monitoring.
-        ]],
+        -- adopt-info end-to-end: version/summary/description are extracted
+        -- at build time from the adopted part (configure.ac AC_INIT gives
+        -- the version). Nothing is hardcoded here — the real version lands
+        -- in snap.yaml and the output filename, and `shuttle check` shows
+        -- the identity as adopted-at-build.
+        adopt_info = "tools",
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
@@ -23,13 +20,21 @@ return {
         source = {
             url = "https://downloads.sourceforge.net/smartmontools/smartmontools-7.4.tar.gz",
         },
-        -- Build via the autotools plugin (expands to exactly the original
-        -- `./configure --prefix=/usr --sysconfdir=/etc && make && make
-        -- install DESTDIR=$STAGE`, VPATH-style).
+        -- Build via the autotools plugin in-source (expands to exactly the
+        -- original `cd $SRC && ./configure --prefix=/usr --sysconfdir=/etc
+        -- && make && make install DESTDIR=$STAGE` — see the in_source note
+        -- below for why VPATH does not work for this package).
         parts = {
             tools = {
                 plugin = "autotools",
-                options = { args = { "--sysconfdir=/etc" } },
+                options = {
+                    args = { "--sysconfdir=/etc" },
+                    -- smartmontools' automake depfile bootstrapping fails
+                    -- under the plugin's VPATH layout (config.status
+                    -- "bootstrapping makefile fragments"); it builds
+                    -- in-source, as the pre-plugin command did.
+                    in_source = true,
+                },
             },
         },
         -- smartctl for one-shot queries; smartd as a snapd-managed daemon.

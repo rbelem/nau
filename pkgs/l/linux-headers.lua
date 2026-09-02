@@ -1,6 +1,12 @@
 -- linux-headers: Linux kernel header files for 7.0
 --
 -- Source: https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.0.tar.xz
+--
+-- Staged via the make plugin's build-only form (`install = false` — the
+-- headers_install target IS the staging step; the kernel tree has no
+-- `install` target we want). `variables` carries ARCH and
+-- INSTALL_HDR_PATH=$STAGE/usr onto the single command.
+
 return {
     default = snap {
         name = "linux-headers",
@@ -16,6 +22,15 @@ other programs that need to interact with the kernel at a low level.]],
         type = "source",
         requires = {},
         source = { url = "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.0.tar.xz" },
-        build = "make headers_install ARCH=x86_64 INSTALL_HDR_PATH=$STAGE/usr",
+        parts = {
+            headers = {
+                plugin = "make",
+                options = {
+                    target = "headers_install",
+                    install = false,
+                    variables = { ARCH = "x86_64", INSTALL_HDR_PATH = "$STAGE/usr" },
+                },
+            },
+        },
     },
 }

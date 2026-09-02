@@ -3,6 +3,10 @@
 -- Source: https://roy.marples.name/projects/dhcpcd/
 -- Provides automatic IPv4 and IPv6 network configuration via DHCP.
 -- Lightweight alternative to dhclient/NetworkManager for minimal systems.
+--
+-- Built via the autotools plugin in-source (dhcpcd ships a non-autoconf
+-- configure script that writes its Makefile into the source dir, which
+-- breaks the plugin's default VPATH layout — dogfood round 1 friction).
 
 return {
     default = snap {
@@ -23,6 +27,14 @@ return {
         source = {
             url = "https://github.com/NetworkConfiguration/dhcpcd/releases/download/v10.1.0/dhcpcd-10.1.0.tar.xz",
         },
-        build = "./configure --prefix=/usr --sysconfdir=/etc --rundir=/run --dbdir=/var/lib/dhcpcd && make && make install DESTDIR=$STAGE",
+        parts = {
+            dhcpcd = {
+                plugin = "autotools",
+                options = {
+                    in_source = true,
+                    args = { "--sysconfdir=/etc", "--rundir=/run", "--dbdir=/var/lib/dhcpcd" },
+                },
+            },
+        },
     },
 }

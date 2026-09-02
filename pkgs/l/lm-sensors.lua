@@ -2,6 +2,10 @@
 --
 -- Source: https://github.com/lm-sensors/lm-sensors
 -- Provides sensors, sensord, and libsensors for hardware monitoring.
+--
+-- Built via the make plugin: lm-sensors' Makefile spells the install root
+-- lowercase `prefix` (build-time spelling, so it belongs in `variables`
+-- where it reaches both commands).
 
 return {
     default = snap {
@@ -23,6 +27,11 @@ return {
         source = {
             url = "https://github.com/lm-sensors/lm-sensors/archive/refs/tags/V3-6-1.tar.gz",
         },
-        build = "make prefix=/usr && make install PREFIX=/usr DESTDIR=$STAGE",
+        parts = {
+            lm_sensors = {
+                plugin = "make",
+                options = { variables = { prefix = "/usr" } },
+            },
+        },
     },
 }

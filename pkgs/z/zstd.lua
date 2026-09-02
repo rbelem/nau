@@ -2,6 +2,10 @@
 --
 -- Source: https://github.com/facebook/zstd
 -- Provides the zstd compression utility and library.
+--
+-- Built via the make plugin: zstd's build-time spelling is lowercase
+-- `prefix` (it belongs in `variables` so it reaches both commands); the
+-- install command carries the plugin's derived PREFIX=/usr as well.
 
 return {
     default = snap {
@@ -23,6 +27,11 @@ return {
         source = {
             url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
         },
-        build = "make prefix=/usr && make install PREFIX=/usr DESTDIR=$STAGE",
+        parts = {
+            zstd = {
+                plugin = "make",
+                options = { variables = { prefix = "/usr" } },
+            },
+        },
     },
 }

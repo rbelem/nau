@@ -2,6 +2,11 @@
 --
 -- Source: https://mirrors.edge.kernel.org/pub/software/utils/pciutils/
 -- Provides lspci, setpci, and the PCI device database.
+--
+-- Built via the make plugin: pciutils is non-autoconf, and PREFIX must be
+-- given at build time too (it bakes runtime paths into the binaries) — the
+-- `variables` map applies PREFIX=/usr to both commands, fixing the
+-- usr/local leakage observed in dogfood round 1.
 
 return {
     default = snap {
@@ -23,6 +28,11 @@ return {
         source = {
             url = "https://mirrors.edge.kernel.org/pub/software/utils/pciutils/pciutils-3.13.0.tar.xz",
         },
-        build = "make PREFIX=/usr DESTDIR=$STAGE install",
+        parts = {
+            pciutils = {
+                plugin = "make",
+                options = { variables = { PREFIX = "/usr" } },
+            },
+        },
     },
 }
