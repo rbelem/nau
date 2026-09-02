@@ -19,6 +19,10 @@ indicatif = "0.18"
 owo-colors = "4"
 libc = "0.2"
 clap_complete = "4"
+# The Rust-side definition parser (single parser for require seeding,
+# literal-require enforcement, and schema-diagnostic spans). The `luau`
+# feature is load-bearing: definitions are Luau, incl. type annotations.
+full_moon = { version = "2", features = ["luau"] }
 
 [build-dependencies]
 # Luau analyzer build (see build.rs + shim/): upstream C++ compiled with cc.

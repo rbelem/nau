@@ -17,6 +17,13 @@
 //!     in-process.
 //!   * [`check_once`] / [`Checker`] — raw analyzer access (spike parity).
 //!
+//! Unified parse (RULESET_VERSION): the Rust-side gate runs on ONE parse —
+//! full-moon (luau feature), the full Luau dialect incl. type annotations.
+//! One AST feeds require seeding ([`ast_requires`]), the named
+//! literal-require gate ([`LITERAL_REQUIRE_MESSAGE`]), and schema-stage
+//! spans ([`locate_output_key`]); the earlier ad-hoc text scanners and the
+//! `shuttle_locate_output_key` FFI are gone.
+//!
 //! Strict-mode policy: definitions are checked in strict mode. Mode
 //! hot-comments that would downgrade the gate (`--!nonstrict` /
 //! `--!nocheck`) are rejected with a named diagnostic before analysis runs
@@ -40,6 +47,13 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_double, c_int, c_uint, c_void, CString};
 
+use full_moon::ast::{
+    self, Call, Expression, Field, FunctionArgs, FunctionCall, LastStmt, Prefix, Suffix,
+};
+use full_moon::node::Node;
+use full_moon::tokenizer::{TokenReference, TokenType};
+use full_moon::visitors::Visitor;
+
 use serde::{Deserialize, Serialize};
 
 /// The typed prelude loaded into every definition checker: binds the globals
@@ -59,6 +73,29 @@ const MAX_SEED_MODULES: usize = 64;
 /// eval stage stays the real resource bound (subprocess + rlimits,
 /// src/isolate.rs), this one keeps the gate itself finite.
 pub const ANALYZER_TIME_LIMIT_SECS: f64 = 10.0;
+
+/// Version of the parse-level gate rule set applied to untrusted definition
+/// sources (same pattern as `REGISTRY_VERSION`, src/plugins.rs, so anything
+/// that caches or fingerprints gate behavior can key on it):
+///
+/// 1. hot-comment mode rejection (`--!nonstrict` / `--!nocheck`,
+///    [`mode_downgrade_diagnostic`]);
+/// 2. literal-require enforcement ([`LITERAL_REQUIRE_MESSAGE`]);
+/// 3. AST-derived require seeding ([`ast_requires`], full-moon).
+///
+/// Bump whenever a rule changes meaning. v1 is the first versioned rule
+/// set: the full-moon unified parse (single Rust-side parser feeding
+/// require seeding, literal-require enforcement, and schema-diagnostic
+/// spans) replacing the earlier ad-hoc text scanners.
+pub const RULESET_VERSION: &str = "1";
+
+/// The named fail-closed diagnostic for a `require()` whose argument is not
+/// a string literal. Computed/concatenated/variable requires cannot be
+/// resolved by the analyzer's `resolveModule` (it only understands
+/// `AstExprConstantString`), so the gate refuses them by name instead of
+/// leaving them to fail as opaque `Unknown require` errors — or worse, to
+/// pass silently when the use site is never checked.
+pub const LITERAL_REQUIRE_MESSAGE: &str = "require argument must be a string literal";
 
 /// One analyzer diagnostic, mapped from `Luau::TypeError`.
 ///
@@ -132,16 +169,6 @@ extern "C" {
     ) -> c_int;
     fn shuttle_timeout_hits(result: *mut c_void) -> c_int;
     fn shuttle_check_result_free(result: *mut c_void);
-    fn shuttle_locate_output_key(
-        source: *const c_char,
-        source_len: usize,
-        key: *const c_char,
-        key_len: usize,
-        begin_line: *mut c_uint,
-        begin_col: *mut c_uint,
-        end_line: *mut c_uint,
-        end_col: *mut c_uint,
-    ) -> c_int;
 }
 
 /// Read a result handle into owned Rust diagnostics, then free the handle.
@@ -413,15 +440,34 @@ fn check_inputs(label: &str, source: &str) -> Result<BTreeMap<String, String>, D
     if let Some(d) = mode_downgrade_diagnostic(source) {
         return Err(d);
     }
-    Ok(collect_required_sources(label, source))
+    if let Err(e) = parse_definition(source) {
+        // The full-moon parse is the gate's parse (RULESET_VERSION): a
+        // source it cannot read cannot be require-seeded soundly, so the
+        // gate refuses it before analysis instead of guessing at a partial
+        // require set.
+        return Err(Diagnostic {
+            begin_line: 1,
+            begin_col: 1,
+            end_line: 1,
+            end_col: 0,
+            message: format!("definition does not parse as Luau: {e}"),
+        });
+    }
+    collect_required_sources(label, source)
 }
 
-/// Transitively resolve every constant `require()` reachable from `source`
-/// through the eval path's resolver (entry directory, `pkgs/`, initialized
-/// input roots), returning name → source. Modules the resolver cannot serve
-/// stay out of the map and fail closed as "Unknown require" diagnostics at
-/// the use site.
-fn collect_required_sources(label: &str, source: &str) -> BTreeMap<String, String> {
+/// Transitively resolve every `require()` reachable from `source` through
+/// the eval path's resolver (entry directory, `pkgs/`, initialized input
+/// roots), returning name → source. The require list is derived from the
+/// full-moon AST ([`ast_requires`]), not a text scan. Modules the resolver
+/// cannot serve stay out of the map and fail closed as "Unknown require"
+/// diagnostics at the use site. Any non-literal require encountered on the
+/// walk — entry or seeded module — fails closed with
+/// [`LITERAL_REQUIRE_MESSAGE`].
+fn collect_required_sources(
+    label: &str,
+    source: &str,
+) -> Result<BTreeMap<String, String>, Diagnostic> {
     let resolver = crate::isolate::SourceResolver::for_build(label);
     let mut sources = BTreeMap::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -429,7 +475,34 @@ fn collect_required_sources(label: &str, source: &str) -> BTreeMap<String, Strin
     queue.push_back(source.to_string());
     let mut budget = MAX_SEED_MODULES;
     while let Some(src) = queue.pop_front() {
-        for name in scan_requires(&src) {
+        let scan = match parse_definition(&src) {
+            Ok(ast) => ast_requires(&ast),
+            // Queued sources were accepted by check_inputs' parse gate
+            // before being enqueued (modules re-check defensively here);
+            // an unparseable module cannot be seeded soundly.
+            Err(e) => {
+                return Err(Diagnostic {
+                    begin_line: 1,
+                    begin_col: 1,
+                    end_line: 1,
+                    end_col: 0,
+                    message: format!("required module does not parse as Luau: {e}"),
+                })
+            }
+        };
+        if let Some(span) = scan.non_literal_span {
+            return Err(Diagnostic {
+                begin_line: span.begin_line,
+                begin_col: span.begin_col,
+                end_line: span.end_line,
+                end_col: span.end_col,
+                message: format!(
+                    "{LITERAL_REQUIRE_MESSAGE}; computed requires cannot be \
+                     resolved by the analyzer gate"
+                ),
+            });
+        }
+        for name in scan.literals {
             if !seen.insert(name.clone()) {
                 continue;
             }
@@ -443,7 +516,7 @@ fn collect_required_sources(label: &str, source: &str) -> BTreeMap<String, Strin
             }
         }
     }
-    sources
+    Ok(sources)
 }
 
 /// Reject mode-downgrading hot comments in a definition source with a named
@@ -618,113 +691,259 @@ fn skip_long_bracket(b: &[u8], i: usize, level: usize) -> usize {
 /// arguments as in `return merge({ default = ... }, ...)`). Fields of tables
 /// nested inside other tables are never output keys and are not matched.
 ///
-/// Best-effort span for schema-stage diagnostics: `None` when the source
-/// does not parse, has no such field, or builds the returned table some
-/// other way (e.g. mutates a local). The parser is the vendored Luau one —
-/// the same AST the analyzer stage sees.
+/// The span is derived from the same full-moon AST the gate uses
+/// ([`RULESET_VERSION`]) — one parser, no FFI. Per the council standard for
+/// schema-stage spans: a *unique* exact match yields the key's source span;
+/// an ambiguous match (the same key declared more than once) or a computed
+/// key yields `None` (`span: null` for consumers). A wrong span is never
+/// produced: no heuristics, no first-match-wins. `None` also when the source
+/// does not parse or builds the returned table some other way (e.g. mutates
+/// a local).
 pub fn locate_output_key(source: &str, key: &str) -> Option<Span> {
     if source.contains('\0') || key.contains('\0') {
         return None;
     }
-    let c_source = CString::new(source).ok()?;
-    let c_key = CString::new(key).ok()?;
-    let (mut bl, mut bc, mut el, mut ec) = (0u32, 0u32, 0u32, 0u32);
-    // SAFETY: both C strings are valid for the call and have no interior
-    // NUL (checked above); the out-params are stack locals.
-    let found = unsafe {
-        shuttle_locate_output_key(
-            c_source.as_ptr().cast(),
-            source.len(),
-            c_key.as_ptr().cast(),
-            key.len(),
-            &mut bl,
-            &mut bc,
-            &mut el,
-            &mut ec,
-        )
-    } == 0;
-    found.then_some(Span {
-        begin_line: bl,
-        begin_col: bc,
-        end_line: el,
-        end_col: ec,
+    let ast = parse_definition(source).ok()?;
+    let mut hits: Vec<Span> = Vec::new();
+    if let Some(LastStmt::Return(ret)) = ast.nodes().last_stmt() {
+        for value in ret.returns().iter() {
+            collect_key_field_spans(value, key, &mut hits);
+        }
+    }
+    if hits.len() == 1 {
+        hits.pop()
+    } else {
+        // Zero matches (missing, computed, or built some other way) or an
+        // ambiguous match: "not localizable", never a guess.
+        None
+    }
+}
+
+/// The full-moon AST of a definition source, with a clean parse required:
+/// `Err` names the first tokenizer/syntax problem. This is the gate's parse
+/// ([`RULESET_VERSION`]) — the single Rust-side parser feeding require
+/// seeding, literal-require enforcement, and schema-diagnostic spans.
+fn parse_definition(source: &str) -> Result<full_moon::ast::Ast, String> {
+    full_moon::parse(source).map_err(|errors| {
+        errors
+            .first()
+            .map(|e| {
+                // Tokenizer errors carry a position; AST errors do not
+                // expose one uniformly, so the message stands alone there.
+                match e {
+                    full_moon::Error::TokenizerError(te) => {
+                        let pos = te.position();
+                        format!("{} (at line {})", e, pos.line())
+                    }
+                    full_moon::Error::AstError(_) => e.to_string(),
+                }
+            })
+            .unwrap_or_else(|| "unknown parse failure".to_string())
     })
 }
 
-/// Constant-string `require` arguments in `source`, in order of appearance.
-/// Handles `require("x")`, `require 'x'`, and `require[[x]]`.
-///
-/// Only literal strings are returned — exactly the shape the analyzer's
-/// `resolveModule` understands (`AstExprConstantString`); computed requires
-/// are left unseeded and fail closed inside Luau itself. Known limitation:
-/// the word `require` inside string/comment text can produce a
-/// false-positive literal — harmless, since such a "name" never resolves to
-/// a module and nothing gets seeded for it.
-fn scan_requires(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let bytes = source.as_bytes();
-    let mut i = 0;
-    while let Some(rel) = source[i..].find("require") {
-        let start = i + rel;
-        i = start + "require".len();
-        if !word_boundary(bytes, start, i) {
-            continue;
+/// One parse of a source, all `require` call sites classified:
+/// string-literal arguments ([`RequireScan::literals`], the require-seeding
+/// list) and every other argument shape
+/// ([`RequireScan::non_literal_span`], the first non-literal site, for the
+/// named [`LITERAL_REQUIRE_MESSAGE`] diagnostic).
+#[derive(Default, Debug)]
+struct RequireScan {
+    literals: Vec<String>,
+    non_literal_span: Option<Span>,
+}
+
+/// Derive the require classification of an already-parsed definition from
+/// its AST. The visitor walks every expression position — local requires,
+/// requires inside function bodies, requires inside table constructors —
+/// so nothing the analyzer could resolve goes unseeded, and comments /
+/// string *contents* can never produce phantom sites (they are not call
+/// nodes, unlike in the old text scanner).
+fn ast_requires(ast: &full_moon::ast::Ast) -> RequireScan {
+    let mut scan = RequireScan::default();
+    let mut visitor = RequireVisitor(&mut scan);
+    visitor.visit_ast(ast);
+    scan
+}
+
+struct RequireVisitor<'a>(&'a mut RequireScan);
+
+impl RequireVisitor<'_> {
+    /// Classify one call chain from its prefix + suffixes — shared by
+    /// [`Visitor::visit_function_call`] (plain calls like
+    /// `require("mod")`) and [`Visitor::visit_var_expression`] (call
+    /// *chains* like `require("mod").field` / `require("mod"):method()`,
+    /// which full-moon models as a `VarExpression`, not a `FunctionCall`).
+    fn scan_call<'s>(&mut self, prefix: &Prefix, suffixes: impl Iterator<Item = &'s Suffix>) {
+        if !matches!(prefix, Prefix::Name(name) if name.token().to_string() == "require") {
+            return;
         }
-        if let Some((name, next)) = require_arg(source, i) {
-            names.push(name);
-            i = next;
+        let mut suffixes = suffixes;
+        let Some(Suffix::Call(Call::AnonymousCall(args))) = suffixes.next() else {
+            return;
+        };
+        match require_arg_class(args) {
+            Some(Ok(name)) => self.0.literals.push(name),
+            Some(Err(())) if self.0.non_literal_span.is_none() => {
+                self.0.non_literal_span = non_literal_site_span(prefix, args);
+            }
+            Some(Err(())) => {}
+            // Not an argument-bearing call shape at all (`require` indexed
+            // but not called directly on this node): not a require site.
+            None => {}
         }
     }
-    names
 }
 
-/// True when `require` at `bytes[start..end]` is a whole word.
-fn word_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
-    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    (start == 0 || !ident(bytes[start - 1])) && (end >= bytes.len() || !ident(bytes[end]))
+impl Visitor for RequireVisitor<'_> {
+    fn visit_function_call(&mut self, call: &FunctionCall) {
+        self.scan_call(call.prefix(), call.suffixes());
+    }
+
+    fn visit_var_expression(&mut self, call: &ast::VarExpression) {
+        self.scan_call(call.prefix(), call.suffixes());
+    }
 }
 
-/// Parse the argument of a `require` call starting just past the keyword.
-/// Handles `require("x")`, `require 'x'`, and `require[[x]]` (Lua's
-/// string-call sugar). Returns the literal string and the position after it.
-fn require_arg(source: &str, i: usize) -> Option<(String, usize)> {
-    let b = source.as_bytes();
-    let after_ws = skip_ws(b, i);
-    let j = match b.get(after_ws) {
-        Some(b'(') => skip_ws(b, after_ws + 1),
-        Some(b'"' | b'\'') => after_ws,
-        Some(b'[') if b.get(after_ws + 1) == Some(&b'[') => after_ws,
+/// Span of the require call site, reconstructed from the prefix (call
+/// start) and the argument-bearing suffix (call end).
+fn non_literal_site_span(prefix: &Prefix, args: &impl Node) -> Option<Span> {
+    let start = match prefix {
+        Prefix::Name(name) => name.token().start_position(),
+        Prefix::Expression(expr) => expr.start_position()?,
+        // `#[non_exhaustive]` upstream; no other prefix shapes today.
         _ => return None,
     };
-    if j >= b.len() {
-        return None;
+    let end = args.end_position()?;
+    Some(Span {
+        begin_line: start.line() as u32,
+        begin_col: start.character() as u32,
+        end_line: end.line() as u32,
+        end_col: end.character().saturating_sub(1) as u32,
+    })
+}
+/// Classify the argument of a require call: `Some(Ok(name))` a string
+/// literal (quoted or long-bracket — exactly the shape the analyzer's
+/// `resolveModule` understands), `Some(Err(()))` any other argument shape
+/// (computed, concatenated, variable, table, wrong arity), `None` when
+/// `args` is not an argument list at all.
+fn require_arg_class(args: &FunctionArgs) -> Option<Result<String, ()>> {
+    match args {
+        FunctionArgs::Parentheses { arguments, .. } => {
+            let mut iter = arguments.iter();
+            match (iter.next(), iter.next()) {
+                (Some(expr), None) => match string_literal_value(expr) {
+                    Some(name) => Some(Ok(name)),
+                    None => Some(Err(())),
+                },
+                _ => Some(Err(())),
+            }
+        }
+        FunctionArgs::String(token) => Some(Ok(string_token_value(token))),
+        FunctionArgs::TableConstructor(_) => Some(Err(())),
+        // `#[non_exhaustive]` upstream: future argument shapes are not
+        // literals the analyzer could resolve.
+        _ => Some(Err(())),
     }
-    string_literal_at(source, b, j)
 }
 
-/// Skip ASCII whitespace from `j`.
-fn skip_ws(b: &[u8], mut j: usize) -> usize {
-    while j < b.len() && b[j].is_ascii_whitespace() {
-        j += 1;
-    }
-    j
-}
-
-/// Read a Lua string literal at `j` (`"..."`, `'...'`, or `[[...]]`).
-/// Returns the literal contents and the position after the closing delimiter.
-fn string_literal_at(source: &str, b: &[u8], j: usize) -> Option<(String, usize)> {
-    match b[j] {
-        quote @ (b'"' | b'\'') => {
-            let start = j + 1;
-            let end = start + source[start..].find(quote as char)?;
-            Some((source[start..end].to_string(), end + 1))
-        }
-        b'[' if b.get(j + 1) == Some(&b'[') => {
-            let start = j + 2;
-            let end = start + source[start..].find("]]")?;
-            Some((source[start..end].to_string(), end + 2))
-        }
+/// The string-literal contents of an expression, when the expression *is* a
+/// plain string literal — no type assertion (`"x" :: any` is not the plain
+/// constant the analyzer's `resolveModule` accepts), no concatenation.
+fn string_literal_value(expr: &Expression) -> Option<String> {
+    match expr {
+        Expression::String(token) => Some(string_token_value(token)),
         _ => None,
+    }
+}
+
+/// The literal contents of a string token (quotes stripped by the
+/// tokenizer; escapes are preserved verbatim, which require names and
+/// output keys never use — and unlike the old text scanner, an escaped
+/// quote can no longer truncate or leak the value).
+fn string_token_value(token: &TokenReference) -> String {
+    match token.token().token_type() {
+        TokenType::StringLiteral { literal, .. } => literal.to_string(),
+        // Unreachable for expression-position strings; raw token text is
+        // the safe fallback (it simply never matches a real name).
+        _ => token.token().to_string(),
+    }
+}
+
+/// 1-based span of an AST node in the analyzer's convention (begin 1-based;
+/// end line 1-based, end column exclusive-0-based — the same numbers the
+/// C++ analyzer diagnostics carry, so downstream printers need no special
+/// casing).
+fn node_span(node: &impl Node) -> Option<Span> {
+    let (start, end) = node.range()?;
+    Some(Span {
+        begin_line: start.line() as u32,
+        begin_col: start.character() as u32,
+        end_line: end.line() as u32,
+        end_col: end.character().saturating_sub(1) as u32,
+    })
+}
+
+/// Collect the spans of every *direct* field named `key` inside an
+/// expression that is a value of a top-level `return` statement — the
+/// full-moon port of the vendored parser's `findKeyField`. Tables reached
+/// through call arguments count (`return merge({ a = 1 }, {})`, including
+/// chained-call forms); fields of tables nested inside other tables do not
+/// (values are never descended into). All matches are collected so callers
+/// can distinguish unique from ambiguous.
+fn collect_key_field_spans(expr: &Expression, key: &str, hits: &mut Vec<Span>) {
+    match expr {
+        Expression::Parentheses { expression, .. } => {
+            collect_key_field_spans(expression, key, hits);
+        }
+        Expression::FunctionCall(call) => {
+            for suffix in call.suffixes() {
+                let args = match suffix {
+                    Suffix::Call(Call::AnonymousCall(args)) => args,
+                    Suffix::Call(Call::MethodCall(method)) => method.args(),
+                    // `#[non_exhaustive]` upstream; indexing suffixes don't
+                    // add call arguments.
+                    _ => continue,
+                };
+                match args {
+                    FunctionArgs::Parentheses { arguments, .. } => {
+                        for arg in arguments.iter() {
+                            collect_key_field_spans(arg, key, hits);
+                        }
+                    }
+                    FunctionArgs::TableConstructor(table) => {
+                        collect_table_field_spans(table, key, hits);
+                    }
+                    FunctionArgs::String(_) => {}
+                    _ => {}
+                }
+            }
+        }
+        Expression::TableConstructor(table) => collect_table_field_spans(table, key, hits),
+        _ => {}
+    }
+}
+
+/// Direct `key`-named fields of one table constructor. Unbracketed keys are
+/// identifier tokens; bracketed keys are the inner string expression
+/// (`["key"]`) — its span, like the analyzer's, starts at the quote.
+fn collect_table_field_spans(table: &ast::TableConstructor, key: &str, hits: &mut Vec<Span>) {
+    for field in table.fields().iter() {
+        match field {
+            Field::NameKey { key: name, .. } if name.token().to_string() == key => {
+                if let Some(span) = node_span(name) {
+                    hits.push(span);
+                }
+            }
+            Field::ExpressionKey { key: expr, .. }
+                if string_literal_value(expr).as_deref() == Some(key) =>
+            {
+                if let Some(span) = node_span(expr) {
+                    hits.push(span);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1038,25 +1257,182 @@ return { default = snap { name = s, version = "1" } }"#;
         assert!(check_definition("word-extension", src).is_empty());
     }
 
-    // ── require scanner ──
+    // ── Require seeding from the AST (replaces the text scanner) ──
+
+    fn literal_requires(source: &str) -> Vec<String> {
+        let ast = parse_definition(source).expect("test source must parse");
+        ast_requires(&ast).literals
+    }
 
     #[test]
-    fn scan_requires_finds_constant_strings() {
+    fn ast_requires_finds_constant_strings_in_all_positions() {
         let src = r#"
 local a = require("base")
 local b = require 'single'
 local c = require([[long]])
 local d = require("pkgs.lib.cli")
+local t = { tpl = require("from-table"), plain = 1 }
+local function f()
+    if b == "x" then
+        return require("from-function-body")
+    end
+    return nil
+end
 local e = myrequire(fn)
-local f = require(variable)
 local g = requireNotWord("nope")
 "#;
-        let names = scan_requires(src);
-        let expected = ["base", "single", "long", "pkgs.lib.cli"];
-        assert_eq!(names.len(), expected.len(), "got: {names:?}");
-        for (got, want) in names.iter().zip(expected) {
-            assert_eq!(got, want);
+        let names = literal_requires(src);
+        let expected = [
+            "base",
+            "single",
+            "long",
+            "pkgs.lib.cli",
+            "from-table",
+            "from-function-body",
+        ];
+        assert_eq!(names, expected, "every literal site, in visit order");
+    }
+
+    #[test]
+    fn ast_requires_ignores_comments_strings_and_non_calls() {
+        let src = r#"
+-- require("in-comment")
+local s = "require(\"in-string\")"
+local r = require
+r("indirect-call-is-not-a-site")
+"#;
+        assert!(
+            literal_requires(src).is_empty(),
+            "got: {:?}",
+            literal_requires(src)
+        );
+    }
+
+    #[test]
+    fn ast_requires_handles_escaped_quotes_whole() {
+        // The old text scanner stopped at the escaped quote and produced a
+        // truncated name; the AST keeps the whole literal interior.
+        let names = literal_requires(r#"local a = require("we\"ird")"#);
+        assert_eq!(names, [r#"we\"ird"#]);
+    }
+
+    #[test]
+    fn ast_requires_marks_non_literal_argument_sites_with_spans() {
+        let scan = ast_requires(&parse_definition("local x = require(variable)").unwrap());
+        assert!(scan.literals.is_empty());
+        let span = scan.non_literal_span.expect("variable require is a site");
+        // `require(variable)` — the whole call expression.
+        assert_eq!((span.begin_line, span.begin_col), (1, 11));
+        assert_eq!((span.end_line, span.end_col), (1, 27));
+
+        for src in [
+            r#"return require("a" .. "b")"#,     // concatenation
+            r#"return require()"#,               // no argument
+            r#"return require("a", "b")"#,       // wrong arity
+            r#"return require({ name = "t" })"#, // table argument
+            r#"return require(someFn("a"))"#,    // computed by call
+        ] {
+            let scan = ast_requires(&parse_definition(src).unwrap());
+            assert!(
+                scan.non_literal_span.is_some(),
+                "non-literal site must be named: {src}"
+            );
         }
+    }
+
+    #[test]
+    fn ast_requires_accepts_chained_require_loads() {
+        // Indexing the loaded module does not hide the literal require.
+        let names = literal_requires(r#"local v = require("mod").field"#);
+        assert_eq!(names, ["mod"]);
+        let names = literal_requires(r#"local v = require("mod"):method()"#);
+        assert_eq!(names, ["mod"]);
+    }
+
+    #[test]
+    fn literal_require_is_a_named_fail_closed_diagnostic() {
+        // Without the gate this source would pass analysis in nonstrict-
+        // shaped ways; the point is the gate fires FIRST with its own name,
+        // and no analysis diagnostics leak.
+        let src = "local tpl = require(tpl_name)\nreturn { default = tpl }";
+        let diags = check_definition("literal-require", src);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0]
+                .message
+                .starts_with("require argument must be a string literal"),
+            "got: {:?}",
+            diags[0].message
+        );
+        // Spanned at the call site (line 1, col 13 — `require(tpl_name)`).
+        assert_eq!(
+            (
+                diags[0].begin_line,
+                diags[0].begin_col,
+                diags[0].end_line,
+                diags[0].end_col
+            ),
+            (1, 13, 1, 29)
+        );
+    }
+
+    #[test]
+    fn literal_require_gate_fires_before_analysis() {
+        // A misspelled global WOULD produce an analyzer diagnostic; the
+        // literal-require rejection must win and be the only diagnostic.
+        let src = "local tpl = require(\"a\" .. \"b\")\nreturn { default = snp {} }";
+        let diags = check_definition("literal-require-first", src);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].message.contains("string literal"),
+            "got: {:?}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn literal_require_in_a_required_module_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let label = write_module(
+            dir.path(),
+            "shuttle.lua",
+            r#"
+local tpl = require("shady")
+return { default = tpl.output }
+"#,
+        );
+        write_module(
+            dir.path(),
+            "shady.lua",
+            r#"
+local computed = "computed"
+local m = { output = require(computed) }
+return m
+"#,
+        );
+        let diags = check_definition(&label, &std::fs::read_to_string(&label).unwrap());
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0]
+                .message
+                .starts_with("require argument must be a string literal"),
+            "module-level computed requires fail closed too: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unparseable_definition_is_a_named_rejection() {
+        // The full-moon parse is the gate's parse: a source it cannot read
+        // cannot be require-seeded soundly, so the gate refuses it by name.
+        let diags = check_definition("unparseable", "return {");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0]
+                .message
+                .starts_with("definition does not parse as Luau"),
+            "got: {:?}",
+            diags[0].message
+        );
     }
 
     // ── Analyzer wall-clock bound (moduleTimeLimitSec, REPORT.md §5) ──
@@ -1083,7 +1459,7 @@ local g = requireNotWord("nope")
         assert!(diags.is_empty(), "10s must be generous, got: {diags:?}");
     }
 
-    // ── Schema-stage span localization (locate_output_key) ──
+    // ── Schema-stage span localization (locate_output_key, same AST) ──
 
     #[test]
     fn locate_output_key_finds_direct_field_with_exact_position() {
@@ -1120,5 +1496,42 @@ local g = requireNotWord("nope")
         // Built through a local: the sound answer is "not localizable".
         let via_local = "local t = { default = snap {} } return t";
         assert_eq!(locate_output_key(via_local, "default"), None);
+    }
+
+    #[test]
+    fn locate_output_key_is_none_for_ambiguous_matches() {
+        // The same output key declared twice in the returned table: two
+        // candidates, no honest single span.
+        let duplicate = r#"return {
+    default = snap { name = "a", version = "1" },
+    default = snap { name = "b", version = "2" },
+}"#;
+        assert_eq!(locate_output_key(duplicate, "default"), None);
+        // Distinct keys are still unique and localizable in the same source.
+        let span = locate_output_key(duplicate, "default");
+        assert!(span.is_none());
+        assert!(locate_output_key(duplicate, "nonexistent").is_none());
+        let unique = r#"return {
+    srv = snap { name = "a", version = "1" },
+    other = snap { name = "b", version = "2" },
+}"#;
+        let span = locate_output_key(unique, "srv").expect("unique match");
+        assert_eq!((span.begin_line, span.begin_col), (2, 5));
+
+        // Two candidate tables across separate return values are equally
+        // ambiguous.
+        let two_values = "return { default = 1 }, { default = 2 }";
+        assert_eq!(locate_output_key(two_values, "default"), None);
+    }
+
+    #[test]
+    fn locate_output_key_is_none_for_computed_keys() {
+        // A computed key is not a literal the gate can vouch for.
+        let computed =
+            "local k = \"default\"\nreturn { [k] = snap { name = \"x\", version = \"1\" } }";
+        assert_eq!(locate_output_key(computed, "default"), None);
+        // While a bracketed *literal* key stays localizable.
+        let literal = "return { [\"default\"] = snap {} }";
+        assert!(locate_output_key(literal, "default").is_some());
     }
 }

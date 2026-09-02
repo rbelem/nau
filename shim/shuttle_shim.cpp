@@ -91,40 +91,10 @@ struct FixedConfigResolver final : Luau::ConfigResolver
     }
 };
 
-// True when the constant-string expression holds exactly `key` (Record table
-// fields store an unquoted AstExprConstantString; General fields store the
-// bracket expression, which is a constant string for `["key"] = v`).
-bool keyMatches(const Luau::AstExpr* expr, const char* key, size_t keyLen)
-{
-    const auto* str = expr->as<Luau::AstExprConstantString>();
-    return str != nullptr && str->value.size == keyLen && memcmp(str->value.data, key, keyLen) == 0;
-}
-
-// Find a *direct* table field named `key` inside an expression that is a
-// value of a top-level `return` statement. Tables reached through calls
-// count (`return merge({ a = 1 }, {})`); fields of tables nested inside
-// other tables do not (an output is a field of the returned table itself,
-// never a field of a nested value). Returns the key expression on a hit so
-// callers get its exact source location.
-const Luau::AstExpr* findKeyField(const Luau::AstExpr* expr, const char* key, size_t keyLen)
-{
-    if (expr == nullptr)
-        return nullptr;
-    if (const auto* group = expr->as<Luau::AstExprGroup>())
-        return findKeyField(group->expr, key, keyLen);
-    if (const auto* call = expr->as<Luau::AstExprCall>())
-    {
-        for (const Luau::AstExpr* arg : call->args)
-            if (const Luau::AstExpr* hit = findKeyField(arg, key, keyLen))
-                return hit;
-        return nullptr;
-    }
-    if (const auto* table = expr->as<Luau::AstExprTable>())
-        for (const Luau::AstExprTable::Item& item : table->items)
-            if (item.key != nullptr && keyMatches(item.key, key, keyLen))
-                return item.key;
-    return nullptr;
-}
+// Locate-output-key support moved to the Rust side: full-moon (with the
+// `luau` feature) is the single Rust-side parser and derives schema-stage
+// spans from the same AST the gate uses for require seeding — no FFI needed
+// for localization. The C++ side remains purely the type analyzer.
 
 } // namespace
 
@@ -298,60 +268,6 @@ extern "C"
     int shuttle_timeout_hits(ShuttleCheckResult* result)
     {
         return result ? result->timeoutHits : 0;
-    }
-
-    // Locate the *direct* field `key` of a table that is a value of a
-    // top-level `return` statement — the declaration site of output `key` in
-    // a shuttle definition (`return { default = snap { ... } }`). Tables
-    // reached through call arguments count (`return merge({ a = 1 }, {})`).
-    //
-    // Returns 0 and fills the out-params (1-based begin line/col, end line
-    // and exclusive end col, same convention as shuttle_error_at) on a hit;
-    // -1 when the source does not parse, has no such field, or on internal
-    // failure — localization is best-effort, callers treat -1 as "no span".
-    int shuttle_locate_output_key(
-        const char* source,
-        size_t sourceLen,
-        const char* key,
-        size_t keyLen,
-        unsigned* beginLine,
-        unsigned* beginCol,
-        unsigned* endLine,
-        unsigned* endCol
-    )
-    {
-        if (source == nullptr || key == nullptr)
-            return -1;
-        try
-        {
-            Luau::Allocator allocator;
-            Luau::AstNameTable names(allocator);
-            Luau::ParseResult result = Luau::Parser::parse(source, sourceLen, names, allocator, Luau::ParseOptions());
-            if (result.root == nullptr || !result.errors.empty())
-                return -1;
-            for (Luau::AstStat* stat : result.root->body)
-            {
-                const auto* ret = stat->as<Luau::AstStatReturn>();
-                if (ret == nullptr)
-                    continue;
-                for (const Luau::AstExpr* value : ret->list)
-                {
-                    if (const Luau::AstExpr* hit = findKeyField(value, key, keyLen))
-                    {
-                        *beginLine = hit->location.begin.line + 1;
-                        *beginCol = hit->location.begin.column + 1;
-                        *endLine = hit->location.end.line + 1;
-                        *endCol = hit->location.end.column; // exclusive end column (CLI convention)
-                        return 0;
-                    }
-                }
-            }
-            return -1;
-        }
-        catch (...)
-        {
-            return -1;
-        }
     }
 
     void shuttle_check_result_free(ShuttleCheckResult* result)
