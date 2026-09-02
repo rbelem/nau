@@ -26,6 +26,32 @@ devbox run -- fmt-check    # formatting check
 devbox run -- check        # full check (test + clippy + fmt)
 ```
 
+## Networking
+
+The build sandbox has **no network** (it unshares the network namespace):
+build commands cannot download anything. Fetch sources up front via the
+definition's `source` / `inputs` instead.
+
+Also disable build-time downloads — e.g. for CMake, pass
+`-DBUILD_TESTING=OFF` so FetchContent doesn't try to clone test
+dependencies at build time. When a build command fails and its output
+looks like a download attempt (curl/wget/fetch/clone/download), shuttle
+prints a best-effort no-network hint; the match is advisory, not exact.
+
+## Porting a single `build` to `parts`
+
+Commands in `parts` each run in a **fresh work directory**; `$SRC` points
+at the shared source checkout. A command that ran at the source root under
+a single `build` must target it explicitly in a part:
+
+| single `build`              | `parts` form                    |
+| --------------------------- | ------------------------------- |
+| `./configure --prefix=/usr` | `$SRC/configure --prefix=/usr`  |
+| `make`                      | `make -C $SRC`                  |
+
+See `pkgs/b/bzip2.lua` for a real three-part example — every command uses
+`make -C $SRC` and installs into the shared `$STAGE`.
+
 ## Project State
 
 - **Phase 1**: CLI scaffold + mlua eval — ✓

@@ -9,6 +9,19 @@ use crate::snap::{PackageInput, SnapMeta};
 /// Named outputs from a `shuttle.lua`, fully converted to owned Rust types.
 pub type Outputs = HashMap<String, SnapMeta>;
 
+/// Directory of the definition file a label points at, threaded into each
+/// output so build-time file references (hooks, icons) resolve relative to
+/// the definition first. Labels that aren't file paths (embedded
+/// definitions, bare names) yield `None` and callers fall back to the CWD.
+fn definition_dir_from_label(label: &str) -> Option<std::path::PathBuf> {
+    let parent = std::path::Path::new(label).parent()?;
+    if parent.as_os_str().is_empty() {
+        None
+    } else {
+        Some(parent.to_path_buf())
+    }
+}
+
 /// Evaluate Lua source content and return the converted snap outputs.
 ///
 /// The source is evaluated in a bounded subprocess worker (ADR-0010
@@ -33,7 +46,8 @@ pub fn evaluate_string(label: &str, source: &str) -> miette::Result<Outputs> {
         let value = json_to_lua(&lua, json)
             .map_err(|e| miette::miette!("{label}: output '{key}' conversion failed: {e}"))?;
         match SnapMeta::from_lua_value(&value) {
-            Ok(meta) => {
+            Ok(mut meta) => {
+                meta.definition_dir = definition_dir_from_label(label);
                 outputs.insert(key.clone(), meta);
             }
             Err(e) => crate::output::warn(format!("skipping output '{key}' from {label}: {e}")),
@@ -185,7 +199,8 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
             }
         };
         match SnapMeta::from_lua_value(&value) {
-            Ok(meta) => {
+            Ok(mut meta) => {
+                meta.definition_dir = definition_dir_from_label(label);
                 outputs.insert(key.clone(), meta);
             }
             Err(e) => {
@@ -743,6 +758,30 @@ mod tests {
     }
 
     #[test]
+    fn test_app_rejects_unknown_field() {
+        let result = eval_with_dsl(
+            r#"
+            return app {
+                command = "bin/myservice",
+                restart_condition = "on-abnormal",
+            }
+            "#,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field 'restart_condition'"),
+            "error should name the unknown field: {}",
+            err
+        );
+        assert!(
+            err.contains("valid fields: command, daemon, plugs, slots, environment"),
+            "error should list the valid fields: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_snap_defaults_grade_and_confinement() {
         let lua = with_dsl();
         let result: Value = lua
@@ -949,5 +988,22 @@ mod tests {
             super::child_diag_key("skipping output from x.lua: iteration error"),
             None
         );
+    }
+
+    // ── Definition-relative resolution plumbing ──
+
+    #[test]
+    fn test_definition_dir_from_label() {
+        assert_eq!(
+            super::definition_dir_from_label("pkgs/s/mypkg/shuttle.lua"),
+            Some(std::path::PathBuf::from("pkgs/s/mypkg"))
+        );
+        assert_eq!(
+            super::definition_dir_from_label("/abs/dir/shuttle.lua"),
+            Some(std::path::PathBuf::from("/abs/dir"))
+        );
+        // Bare labels (embedded definitions) carry no directory.
+        assert_eq!(super::definition_dir_from_label("shuttle.lua"), None);
+        assert_eq!(super::definition_dir_from_label("embedded:test"), None);
     }
 }

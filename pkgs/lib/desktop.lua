@@ -3,7 +3,7 @@
 --
 -- Usage:
 --   local desktop = require("pkgs.lib.desktop")
---   apps = { myapp = desktop.app { command = "bin/myapp", desktop = "myapp.desktop" } }
+--   apps = { myapp = desktop.app { command = "bin/myapp" } }
 
 local M = {}
 

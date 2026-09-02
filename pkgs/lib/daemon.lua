@@ -8,13 +8,12 @@
 local M = {}
 
 --- Build a daemon app definition.
--- @param overrides: optional fields (command, plugs, restart_condition, etc.)
+-- @param overrides: optional fields (command, plugs, daemon, etc.)
 -- @return app config table
 function M.app(overrides)
     return merge({
         command = "bin/service",
         daemon = "simple",
-        restart_condition = "on-abnormal",
         plugs = { "network", "network-bind" },
     }, overrides or {})
 end

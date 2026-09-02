@@ -106,6 +106,36 @@ return { default = snap { name = "with-inputs", version = "1.0" } }
     assert_eq!(out.global_inputs["core"].url, "github:core/core22/main");
 }
 
+// ── Definition-relative resolution plumbing ──
+
+#[test]
+fn file_label_threads_definition_dir_into_outputs() {
+    // A file-path label must land in every output's definition_dir so
+    // hook/icon paths resolve relative to the definition first.
+    let dir = tempfile::tempdir().unwrap();
+    let def = dir.path().join("shuttle.lua");
+    std::fs::write(
+        &def,
+        r#"return { default = snap { name = "wired", version = "1.0" } }"#,
+    )
+    .unwrap();
+    let checked = shuttle::lua::check_file_with_inputs(def.to_str().unwrap());
+    assert!(checked.error.is_none(), "{:?}", checked.error);
+    let meta = &checked.outputs["default"];
+    assert_eq!(meta.definition_dir.as_deref(), Some(dir.path()));
+}
+
+#[test]
+fn embedded_label_has_no_definition_dir() {
+    let checked = shuttle::lua::check_string_with_inputs(
+        "embedded:test",
+        r#"return { default = snap { name = "embedded-snap", version = "1.0" } }"#,
+    );
+    assert!(checked.error.is_none(), "{:?}", checked.error);
+    let meta = &checked.outputs["default"];
+    assert!(meta.definition_dir.is_none());
+}
+
 // ── Resolver policy (parent side) ──
 
 #[test]

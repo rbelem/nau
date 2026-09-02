@@ -369,6 +369,7 @@ impl PackageIndex {
             toolchain: None,
             inputs: None,
             apps,
+            definition_dir: None,
         })
     }
 

@@ -481,6 +481,7 @@ mod tests {
             toolchain: None,
             inputs: None,
             apps: std::collections::HashMap::new(),
+            definition_dir: None,
         }
     }
 
@@ -513,6 +514,7 @@ mod tests {
             toolchain: None,
             inputs: None,
             apps: std::collections::HashMap::new(),
+            definition_dir: None,
         }
     }
 

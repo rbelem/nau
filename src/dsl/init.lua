@@ -409,6 +409,36 @@ function app(opts)
     check_string_array(opts.slots, "app", "slots")
     check_table(opts.environment, "app", "environment")
 
+    -- Unknown fields are rejected, not silently dropped: anything this
+    -- schema doesn't know would otherwise vanish between the DSL and the
+    -- emitted snap.yaml (e.g. a template emitting `restart_condition`).
+    -- This list must match the Rust-side conversion in snap.rs exactly.
+    local known_fields = {
+        command = true,
+        daemon = true,
+        plugs = true,
+        slots = true,
+        environment = true,
+    }
+    local unknown = {}
+    for k in pairs(opts) do
+        if not known_fields[k] then
+            table.insert(unknown, k)
+        end
+    end
+    table.sort(unknown)
+    if #unknown > 0 then
+        local list = {}
+        for _, k in ipairs(unknown) do
+            table.insert(list, string.format("'%s'", k))
+        end
+        error(string.format(
+            "app(): unknown field%s %s (valid fields: command, daemon, plugs, slots, environment)",
+            #unknown == 1 and "" or "s",
+            table.concat(list, ", ")
+        ), 2)
+    end
+
     return opts
 end
 

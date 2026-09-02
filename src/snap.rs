@@ -248,6 +248,14 @@ pub struct SnapMeta {
 
     #[serde(default)]
     pub apps: HashMap<String, SnapApp>,
+
+    /// Directory of the definition file this output came from, threaded
+    /// from the eval label in `lua.rs`. Used to resolve build-time file
+    /// references (hook scripts, icon) relative to the definition first;
+    /// `None` for non-file labels (embedded definitions) and non-DSL
+    /// constructors, which fall back to the process CWD. Build-time only.
+    #[serde(skip)]
+    pub definition_dir: Option<std::path::PathBuf>,
 }
 
 /// Skip `type:` in snap.yaml for shuttle build classifications
@@ -455,7 +463,7 @@ impl SnapMeta {
                     let (name, value) = pair.map_err(|e| miette::miette!("apps entry: {}", e))?;
                     match value {
                         Value::Table(t) => {
-                            apps.insert(name, SnapApp::from_lua_table(&t)?);
+                            apps.insert(name.clone(), SnapApp::from_lua_table(&name, &t)?);
                         }
                         other => {
                             return Err(miette::miette!(
@@ -499,6 +507,7 @@ impl SnapMeta {
             toolchain,
             inputs,
             apps,
+            definition_dir: None,
         })
     }
 }
@@ -656,7 +665,37 @@ impl PlugSlot {
 
 impl SnapApp {
     /// Convert a validated Lua table (from `app()`) into a `SnapApp`.
-    pub fn from_lua_table(table: &mlua::Table) -> miette::Result<Self> {
+    /// `name` is the app's key in `apps`, used to name errors.
+    ///
+    /// Unknown fields are rejected here (not silently dropped): anything
+    /// the schema doesn't know would otherwise vanish between the DSL and
+    /// the emitted snap.yaml — the same silent-drop bug class as outputs
+    /// (e.g. a template emitting `restart_condition`, which the schema
+    /// never supported).
+    pub fn from_lua_table(name: &str, table: &mlua::Table) -> miette::Result<Self> {
+        let mut unknown: Vec<String> = Vec::new();
+        for pair in table.pairs::<String, Value>() {
+            let (k, _) = pair.map_err(|e| miette::miette!("app '{name}': {e}"))?;
+            if !matches!(
+                k.as_str(),
+                "command" | "daemon" | "plugs" | "slots" | "environment"
+            ) {
+                unknown.push(k);
+            }
+        }
+        if !unknown.is_empty() {
+            unknown.sort();
+            let list = unknown
+                .iter()
+                .map(|k| format!("'{k}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(miette::miette!(
+                "app '{name}': unknown field{} {list} (valid fields: command, daemon, plugs, slots, environment)",
+                if unknown.len() == 1 { "" } else { "s" },
+            ));
+        }
+
         let command = get_required_string(table, "command")?;
         let daemon = get_opt_string(table, "daemon")?;
         let plugs = get_opt_string_array(table, "plugs")?;
@@ -1787,6 +1826,58 @@ fn ro_bind_if_exists(cmd: &mut std::process::Command, path: &str) {
     }
 }
 
+/// Best-effort markers that a failed build was trying to reach the network.
+/// The sandbox unshares the net, so a build that downloads anything fails
+/// confusingly — sources must come from the definition instead.
+const NETWORK_FETCH_MARKERS: [&str; 5] = ["curl", "wget", "fetch", "clon", "download"];
+
+/// True if captured build output looks like a failed download attempt
+/// (best-effort substring match over the lowercased text).
+fn stderr_suggests_network_fetch(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    NETWORK_FETCH_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// One-line hint printed when a failed build looks like it tried to
+/// download something. Best-effort: matched against the build's stderr
+/// text, not a parser.
+fn warn_no_network_hint(stderr: &str) {
+    if stderr_suggests_network_fetch(stderr) {
+        output::warn(
+            "build failed and its output mentions a download (sandbox has no network — fetch sources via the definition's source/inputs)",
+        );
+    }
+}
+
+/// Spawn a build command, forwarding its stderr to our stderr line-by-line
+/// (output still streams live) while also collecting it, so a failure can
+/// be inspected. Reading to EOF before reaping avoids pipe deadlock.
+fn run_build_child(
+    mut cmd_proc: std::process::Command,
+) -> std::io::Result<(std::process::ExitStatus, String)> {
+    use std::io::BufRead;
+    use std::process::Stdio;
+    cmd_proc.stderr(Stdio::piped());
+    let mut child = cmd_proc.spawn()?;
+    let collected = match child.stderr.take() {
+        Some(stderr) => std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stderr);
+            let mut collected = String::new();
+            for line in reader.lines().map_while(Result::ok) {
+                eprintln!("{line}");
+                collected.push_str(&line);
+                collected.push('\n');
+            }
+            collected
+        })
+        .join()
+        .unwrap_or_default(),
+        None => String::new(),
+    };
+    let status = child.wait()?;
+    Ok((status, collected))
+}
+
 /// Read-only system paths for toolchain, shebangs, and Nix/devbox builds.
 fn bind_system_ro_paths(cmd: &mut std::process::Command) {
     cmd.arg("--ro-bind").arg("/usr").arg("/usr");
@@ -1868,11 +1959,11 @@ fn run_bwrapped(
     apply_extra_env(&mut cmd_proc, extra_env);
     cmd_proc.arg("sh").arg("-c").arg(cmd);
 
-    let status = cmd_proc
-        .status()
-        .map_err(|e| miette::miette!("bwrap execution failed: {}", e))?;
+    let (status, stderr_text) =
+        run_build_child(cmd_proc).map_err(|e| miette::miette!("bwrap execution failed: {}", e))?;
 
     if !status.success() {
+        warn_no_network_hint(&stderr_text);
         return Err(miette::miette!(
             "build command exited with error (in sandbox)"
         ));
@@ -1902,11 +1993,11 @@ fn run_direct(
     apply_extra_env(&mut cmd_proc, extra_env);
     cmd_proc.current_dir(work_dir);
 
-    let status = cmd_proc
-        .status()
-        .map_err(|e| miette::miette!("failed to execute build: {}", e))?;
+    let (status, stderr_text) =
+        run_build_child(cmd_proc).map_err(|e| miette::miette!("failed to execute build: {}", e))?;
 
     if !status.success() {
+        warn_no_network_hint(&stderr_text);
         return Err(miette::miette!("build command exited with error"));
     }
     Ok(())
@@ -1940,10 +2031,53 @@ fn find_source_root(dir: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Resolve a build-time file reference (hook script, icon) from the DSL.
+///
+/// Absolute paths pass through unchanged. Relative paths resolve against
+/// the definition file's directory first — so a definition in a subpackage
+/// dir can reference sibling files regardless of where `shuttle build` runs
+/// — falling back to the process CWD for definitions that predate
+/// definition-relative resolution (and for `definition_dir: None`).
+fn resolve_definition_relative(definition_dir: Option<&Path>, path: &str) -> std::path::PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    if let Some(dir) = definition_dir {
+        let candidate = dir.join(p);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    p.to_path_buf()
+}
+
+/// True if `path` has the owner execute bit set.
+fn is_owner_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o100 != 0)
+        .unwrap_or(false)
+}
+
+/// Warning for a hook script whose mode lacks owner+x: snapd executes hooks
+/// directly, so a non-executable copy would never run. `None` when the
+/// script is executable.
+fn hook_exec_warning(name: &str, src: &Path) -> Option<String> {
+    if is_owner_executable(src) {
+        return None;
+    }
+    Some(format!(
+        "hook '{name}': '{}' is not executable (mode lacks owner x) — snapd runs hooks directly; chmod +x the source file",
+        src.display()
+    ))
+}
+
 /// Copy hook scripts from the DSL's source paths into `<build_root>/meta/hooks/<name>`.
 ///
-/// Relative paths resolve against the current working directory (the
-/// project directory `shuttle build` runs from).
+/// Relative paths resolve against the definition file's directory first,
+/// then the project directory `shuttle build` runs from. A script whose
+/// mode lacks owner+x is copied but warned about — snapd would never run it.
 fn copy_hook_scripts(meta: &SnapMeta, build_root: &Path) -> miette::Result<()> {
     let Some(hooks) = &meta.hooks else {
         return Ok(());
@@ -1952,20 +2086,26 @@ fn copy_hook_scripts(meta: &SnapMeta, build_root: &Path) -> miette::Result<()> {
     for (name, hook) in hooks {
         std::fs::create_dir_all(&hooks_dir)
             .map_err(|e| miette::miette!("failed to create meta/hooks/: {}", e))?;
-        let src = Path::new(&hook.source);
+        let src = resolve_definition_relative(meta.definition_dir.as_deref(), &hook.source);
         if !src.is_file() {
             return Err(miette::miette!(
-                "hook '{name}': script not found: {} (relative paths resolve from the project directory)",
+                "hook '{name}': script not found: {} (relative paths resolve from the definition's directory, then the project directory)",
                 hook.source
             ));
         }
-        std::fs::copy(src, hooks_dir.join(name))
+        if let Some(warning) = hook_exec_warning(name, &src) {
+            output::warn(warning);
+        }
+        std::fs::copy(&src, hooks_dir.join(name))
             .map_err(|e| miette::miette!("failed to copy hook '{name}': {}", e))?;
     }
     Ok(())
 }
 
 /// Copy the icon source file to `<build_root>/<icon>` (meta/gui/icon.<ext>).
+///
+/// Relative paths resolve against the definition file's directory first,
+/// then the project directory (see [`resolve_definition_relative`]).
 fn copy_icon(meta: &SnapMeta, build_root: &Path) -> miette::Result<()> {
     let (Some(src), Some(target)) = (&meta.icon_source, &meta.icon) else {
         return Ok(());
@@ -1975,10 +2115,14 @@ fn copy_icon(meta: &SnapMeta, build_root: &Path) -> miette::Result<()> {
         std::fs::create_dir_all(parent)
             .map_err(|e| miette::miette!("failed to create {}: {}", parent.display(), e))?;
     }
-    if !Path::new(src).is_file() {
-        return Err(miette::miette!("icon: file not found: {src}"));
+    let src_path = resolve_definition_relative(meta.definition_dir.as_deref(), src);
+    if !src_path.is_file() {
+        return Err(miette::miette!(
+            "icon: file not found: {src} (relative paths resolve from the definition's directory, then the project directory)"
+        ));
     }
-    std::fs::copy(src, &dst).map_err(|e| miette::miette!("failed to copy icon {src}: {e}"))?;
+    std::fs::copy(&src_path, &dst)
+        .map_err(|e| miette::miette!("failed to copy icon {src}: {e}"))?;
     Ok(())
 }
 
@@ -2296,11 +2440,150 @@ mod tests {
             Value::Table(t) => t,
             _ => panic!("expected table"),
         };
-        let app = SnapApp::from_lua_table(&table).unwrap();
+        let app = SnapApp::from_lua_table("serve", &table).unwrap();
 
         assert_eq!(app.command, "bin/serve");
         assert_eq!(app.daemon.as_deref(), Some("simple"));
         assert!(app.plugs.is_none());
+    }
+
+    #[test]
+    fn test_app_unknown_field_rejected_with_named_error() {
+        // Hand-built app table (bypasses the DSL's app()): the Rust-side
+        // conversion must reject unknown fields naming the app, not drop
+        // them silently.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "drifted",
+                version = "1.0",
+                apps = {
+                    svc = {
+                        command = "bin/svc",
+                        restart_condition = "on-abnormal",
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let err = SnapMeta::from_lua_table(&table).unwrap_err().to_string();
+        assert!(
+            err.contains("app 'svc': unknown field 'restart_condition'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_app_unknown_field_lists_valid_fields() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "drifted",
+                version = "1.0",
+                apps = { svc = { command = "bin/svc", desktop = "x.desktop" } },
+            }
+            "#,
+            )
+            .unwrap();
+        let err = SnapMeta::from_lua_table(&table).unwrap_err().to_string();
+        assert!(err.contains("unknown field 'desktop'"), "got: {err}");
+        assert!(
+            err.contains("valid fields: command, daemon, plugs, slots, environment"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_app_known_fields_still_accepted() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "ok",
+                version = "1.0",
+                apps = {
+                    svc = {
+                        command = "bin/svc",
+                        daemon = "simple",
+                        plugs = { "network" },
+                        slots = { "s" },
+                        environment = { MODE = "x" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let meta = SnapMeta::from_lua_table(&table).unwrap();
+        let app = &meta.apps["svc"];
+        assert_eq!(app.daemon.as_deref(), Some("simple"));
+        assert_eq!(app.environment.as_ref().unwrap()["MODE"], "x");
+    }
+
+    // ── pkgs/lib templates validate against the app schema (drift guard) ──
+
+    /// Run one pkgs/lib template's `M.app` through the DSL's app() and the
+    /// Rust conversion — the exact path a definition's apps table takes.
+    fn template_app_validates(template: &str, template_name: &str) {
+        let env = LuaEnv::new();
+        let src = format!(
+            "return (function()\nlocal M = (function()\n{}end)()\n\
+             return snap {{\nname = \"tmpl\", version = \"1.0\",\n\
+             apps = {{ svc = M.app {{ command = \"bin/svc\" }} }},\n}}\nend)()",
+            template
+        );
+        let value: Value = env.lua.load(&src).eval().unwrap();
+        let table = match value {
+            Value::Table(t) => t,
+            other => panic!("expected table, got {}", other.type_name()),
+        };
+        let meta = SnapMeta::from_lua_table(&table)
+            .unwrap_or_else(|e| panic!("{template_name} template must validate: {e}"));
+        assert_eq!(meta.apps["svc"].command, "bin/svc");
+    }
+
+    #[test]
+    fn test_daemon_template_validates() {
+        template_app_validates(include_str!("../pkgs/lib/daemon.lua"), "daemon");
+    }
+
+    #[test]
+    fn test_cli_template_validates() {
+        template_app_validates(include_str!("../pkgs/lib/cli.lua"), "cli");
+    }
+
+    #[test]
+    fn test_desktop_template_validates() {
+        template_app_validates(include_str!("../pkgs/lib/desktop.lua"), "desktop");
+    }
+
+    #[test]
+    fn test_daemon_template_emits_no_schema_unknown_keys() {
+        // The drift this guards against: daemon.lua used to emit
+        // restart_condition, which the schema silently dropped.
+        let env = LuaEnv::new();
+        let src = format!(
+            "M = (function()\n{}end)()\nreturn M.app {{ command = \"bin/x\" }}",
+            include_str!("../pkgs/lib/daemon.lua")
+        );
+        let app_value: Value = env.lua.load(&src).set_name("daemon.lua").eval().unwrap();
+        let app_table = match app_value {
+            Value::Table(t) => t,
+            other => panic!("expected app table, got {}", other.type_name()),
+        };
+        assert!(
+            app_table
+                .get::<Value>("restart_condition")
+                .unwrap()
+                .is_nil(),
+            "daemon template must not emit keys outside the app schema"
+        );
     }
 
     // ── Phase 4 tests: YAML output ──
@@ -2805,6 +3088,159 @@ mod tests {
             err.contains("hooks['configure'] must be a string script path, got number"),
             "got: {err}"
         );
+    }
+
+    // ── Hook/icon source resolution (definition-relative) ──
+
+    /// Set the owner execute bit on `path`.
+    fn chmod_owner_x(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(perms.mode() | 0o100);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// Meta for one hook resolved against `definition_dir`.
+    fn hook_meta(env: &LuaEnv, script_ref: &str) -> SnapMeta {
+        let src = format!(
+            r#"
+            return snap {{
+                name = "hooked", version = "1.0",
+                hooks = {{ configure = "{}" }},
+            }}
+            "#,
+            script_ref
+        );
+        SnapMeta::from_lua_table(&env.eval(&src).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_hook_resolves_relative_to_definition() {
+        // A definition in a subdirectory referencing a sibling script must
+        // build regardless of the process CWD.
+        let project = tempfile::tempdir().unwrap();
+        let def_dir = project.path().join("pkgs/s/mypkg");
+        std::fs::create_dir_all(&def_dir).unwrap();
+        let script = def_dir.join("configure.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        chmod_owner_x(&script);
+
+        let env = LuaEnv::new();
+        let mut meta = hook_meta(&env, "configure.sh");
+        meta.definition_dir = Some(def_dir.clone());
+
+        let build_root = tempfile::tempdir().unwrap();
+        super::copy_hook_scripts(&meta, build_root.path()).unwrap();
+        let copied = build_root.path().join("meta/hooks/configure");
+        assert!(copied.is_file(), "hook must be copied into the snap");
+        let content = std::fs::read_to_string(&copied).unwrap();
+        assert!(content.contains("exit 0"), "copied content must match");
+    }
+
+    #[test]
+    fn test_hook_missing_reports_both_resolution_roots() {
+        let project = tempfile::tempdir().unwrap();
+        let def_dir = project.path().join("def");
+        std::fs::create_dir_all(&def_dir).unwrap();
+
+        let env = LuaEnv::new();
+        let mut meta = hook_meta(&env, "nowhere.sh");
+        meta.definition_dir = Some(def_dir);
+
+        let build_root = tempfile::tempdir().unwrap();
+        let err = super::copy_hook_scripts(&meta, build_root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("hook 'configure': script not found: nowhere.sh"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("definition's directory, then the project directory"),
+            "error must name both resolution roots: {err}"
+        );
+    }
+
+    #[test]
+    fn test_hook_warns_when_not_executable() {
+        // Default 0o644 — no execute bit. The hook is copied (the emitted
+        // snap.yaml already points at meta/hooks/configure) but a warning
+        // is raised instead of the copy passing silently.
+        let project = tempfile::tempdir().unwrap();
+        let def_dir = project.path().join("def");
+        std::fs::create_dir_all(&def_dir).unwrap();
+        let script = def_dir.join("configure.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(
+            super::hook_exec_warning("configure", &script).is_some(),
+            "non-executable script must produce a warning"
+        );
+
+        let env = LuaEnv::new();
+        let mut meta = hook_meta(&env, "configure.sh");
+        meta.definition_dir = Some(def_dir);
+
+        let build_root = tempfile::tempdir().unwrap();
+        super::copy_hook_scripts(&meta, build_root.path()).unwrap();
+        assert!(build_root.path().join("meta/hooks/configure").is_file());
+    }
+
+    #[test]
+    fn test_hook_exec_warning_none_when_executable() {
+        let project = tempfile::tempdir().unwrap();
+        let script = project.path().join("configure.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        chmod_owner_x(&script);
+        assert!(super::hook_exec_warning("configure", &script).is_none());
+    }
+
+    #[test]
+    fn test_icon_resolves_relative_to_definition() {
+        let project = tempfile::tempdir().unwrap();
+        let def_dir = project.path().join("assets-nested");
+        std::fs::create_dir_all(&def_dir).unwrap();
+        std::fs::write(def_dir.join("logo.png"), b"fake png").unwrap();
+
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "iconic", version = "1.0",
+                icon = "logo.png",
+            }
+            "#,
+            )
+            .unwrap();
+        let mut meta = SnapMeta::from_lua_table(&table).unwrap();
+        meta.definition_dir = Some(def_dir);
+
+        let build_root = tempfile::tempdir().unwrap();
+        super::copy_icon(&meta, build_root.path()).unwrap();
+        let copied = build_root.path().join("meta/gui/icon.png");
+        assert!(copied.is_file(), "icon must be copied into the snap");
+    }
+
+    // ── Build-failure network hint (sandbox unshares the net) ──
+
+    #[test]
+    fn test_stderr_suggests_network_fetch() {
+        assert!(super::stderr_suggests_network_fetch(
+            "curl: (6) Could not resolve host: example.com"
+        ));
+        assert!(super::stderr_suggests_network_fetch(
+            "wget: unable to resolve host address 'example.com'"
+        ));
+        assert!(super::stderr_suggests_network_fetch(
+            "Performing download step (download, verify, extract) for 'dep'"
+        ));
+        assert!(super::stderr_suggests_network_fetch(
+            "Cloning into 'lib'..."
+        ));
+        assert!(!super::stderr_suggests_network_fetch(
+            "make: *** [Makefile:42: all] Error 1"
+        ));
+        assert!(!super::stderr_suggests_network_fetch(""));
     }
 
     #[test]
