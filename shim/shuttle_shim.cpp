@@ -29,9 +29,12 @@
 #include "Luau/Error.h"
 #include "Luau/FileResolver.h"
 #include "Luau/Frontend.h"
+#include "Luau/Parser.h"
 #include "Luau/TypeArena.h"
 #include "Luau/TypeInfer.h"
 
+#include <cmath>
+#include <cstring>
 #include <exception>
 #include <string>
 #include <unordered_map>
@@ -88,6 +91,41 @@ struct FixedConfigResolver final : Luau::ConfigResolver
     }
 };
 
+// True when the constant-string expression holds exactly `key` (Record table
+// fields store an unquoted AstExprConstantString; General fields store the
+// bracket expression, which is a constant string for `["key"] = v`).
+bool keyMatches(const Luau::AstExpr* expr, const char* key, size_t keyLen)
+{
+    const auto* str = expr->as<Luau::AstExprConstantString>();
+    return str != nullptr && str->value.size == keyLen && memcmp(str->value.data, key, keyLen) == 0;
+}
+
+// Find a *direct* table field named `key` inside an expression that is a
+// value of a top-level `return` statement. Tables reached through calls
+// count (`return merge({ a = 1 }, {})`); fields of tables nested inside
+// other tables do not (an output is a field of the returned table itself,
+// never a field of a nested value). Returns the key expression on a hit so
+// callers get its exact source location.
+const Luau::AstExpr* findKeyField(const Luau::AstExpr* expr, const char* key, size_t keyLen)
+{
+    if (expr == nullptr)
+        return nullptr;
+    if (const auto* group = expr->as<Luau::AstExprGroup>())
+        return findKeyField(group->expr, key, keyLen);
+    if (const auto* call = expr->as<Luau::AstExprCall>())
+    {
+        for (const Luau::AstExpr* arg : call->args)
+            if (const Luau::AstExpr* hit = findKeyField(arg, key, keyLen))
+                return hit;
+        return nullptr;
+    }
+    if (const auto* table = expr->as<Luau::AstExprTable>())
+        for (const Luau::AstExprTable::Item& item : table->items)
+            if (item.key != nullptr && keyMatches(item.key, key, keyLen))
+                return item.key;
+    return nullptr;
+}
+
 } // namespace
 
 struct ShuttleChecker
@@ -117,13 +155,22 @@ extern "C"
     //
     // `prelude` is a Mode::Definition definition-file source (declare
     // statements) or NULL/0 for no prelude.
-    ShuttleChecker* shuttle_checker_new(int strict, const char* prelude, size_t preludeLen)
+    //
+    // `moduleTimeLimitSec` is the per-module wall-clock bound handed to the
+    // type solver (FrontendOptions::moduleTimeLimitSec, upstream 0.663): the
+    // solver throws TimeLimitError when it runs past the deadline and the
+    // module lands in CheckResult::timeoutHits. NaN means "no limit" (the
+    // upstream default, std::nullopt); 0.0 is a valid (immediately expiring)
+    // bound — that is what tests use to make timeouts deterministic.
+    ShuttleChecker* shuttle_checker_new(int strict, const char* prelude, size_t preludeLen, double moduleTimeLimitSec)
     {
         auto* checker = new ShuttleChecker();
         checker->configResolver.defaultConfig.mode = strict ? Luau::Mode::Strict : Luau::Mode::Nonstrict;
         Luau::FrontendOptions options;
         options.retainFullTypeGraphs = false;
         options.runLintChecks = false;
+        if (!std::isnan(moduleTimeLimitSec))
+            options.moduleTimeLimitSec = moduleTimeLimitSec;
         checker->frontend = new Luau::Frontend(&checker->fileResolver, &checker->configResolver, options);
         Luau::registerBuiltinGlobals(*checker->frontend, checker->frontend->globals);
         if (prelude != nullptr && preludeLen > 0)
@@ -251,6 +298,60 @@ extern "C"
     int shuttle_timeout_hits(ShuttleCheckResult* result)
     {
         return result ? result->timeoutHits : 0;
+    }
+
+    // Locate the *direct* field `key` of a table that is a value of a
+    // top-level `return` statement — the declaration site of output `key` in
+    // a shuttle definition (`return { default = snap { ... } }`). Tables
+    // reached through call arguments count (`return merge({ a = 1 }, {})`).
+    //
+    // Returns 0 and fills the out-params (1-based begin line/col, end line
+    // and exclusive end col, same convention as shuttle_error_at) on a hit;
+    // -1 when the source does not parse, has no such field, or on internal
+    // failure — localization is best-effort, callers treat -1 as "no span".
+    int shuttle_locate_output_key(
+        const char* source,
+        size_t sourceLen,
+        const char* key,
+        size_t keyLen,
+        unsigned* beginLine,
+        unsigned* beginCol,
+        unsigned* endLine,
+        unsigned* endCol
+    )
+    {
+        if (source == nullptr || key == nullptr)
+            return -1;
+        try
+        {
+            Luau::Allocator allocator;
+            Luau::AstNameTable names(allocator);
+            Luau::ParseResult result = Luau::Parser::parse(source, sourceLen, names, allocator, Luau::ParseOptions());
+            if (result.root == nullptr || !result.errors.empty())
+                return -1;
+            for (Luau::AstStat* stat : result.root->body)
+            {
+                const auto* ret = stat->as<Luau::AstStatReturn>();
+                if (ret == nullptr)
+                    continue;
+                for (const Luau::AstExpr* value : ret->list)
+                {
+                    if (const Luau::AstExpr* hit = findKeyField(value, key, keyLen))
+                    {
+                        *beginLine = hit->location.begin.line + 1;
+                        *beginCol = hit->location.begin.column + 1;
+                        *endLine = hit->location.end.line + 1;
+                        *endCol = hit->location.end.column; // exclusive end column (CLI convention)
+                        return 0;
+                    }
+                }
+            }
+            return -1;
+        }
+        catch (...)
+        {
+            return -1;
+        }
     }
 
     void shuttle_check_result_free(ShuttleCheckResult* result)

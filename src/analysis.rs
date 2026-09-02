@@ -20,9 +20,18 @@
 //! acceptable because the Rust-side schema validation runs regardless
 //! (ADR-0010 Decision 3); rejecting mode hot-comments is future work
 //! (REPORT.md recommendation 3).
+//!
+//! Wall-clock bound: every definition check runs under a generous analyzer
+//! time limit ([`ANALYZER_TIME_LIMIT_SECS`], wired to upstream's
+//! `FrontendOptions::moduleTimeLimitSec`). A module that exceeds the bound
+//! is aborted by the solver and reported as a single
+//! `analysis timed out after Ns` diagnostic — `shuttle check` fails closed
+//! (the eval stage never sees a source the analyzer could not finish). The
+//! eval stage has its own subprocess rlimits (src/isolate.rs); this bound is
+//! the analyzer stage's own.
 
 use std::collections::{HashSet, VecDeque};
-use std::ffi::{c_char, c_int, c_uint, c_void, CString};
+use std::ffi::{c_char, c_double, c_int, c_uint, c_void, CString};
 
 /// The typed prelude loaded into every definition checker: binds the globals
 /// the eval prelude injects at runtime (`snap`, `merge`, `pin`, `index`,
@@ -33,6 +42,14 @@ pub const PRELUDE_DEFS: &str = include_str!("shuttle-prelude.d.luau");
 /// Matches the scale of real corpora (templates + their deps); anything
 /// beyond this fails closed as "Unknown require" diagnostics.
 const MAX_SEED_MODULES: usize = 64;
+
+/// Wall-clock bound on the strict-analyzer stage of `shuttle check`, in
+/// seconds (analyzer-spike REPORT.md §5 deferred `moduleTimeLimitSec`; now
+/// wired). Generous by design: a cold in-process check of a corpus-scale
+/// definition is ~1.4ms, so 10s only fires on pathological sources — the
+/// eval stage stays the real resource bound (subprocess + rlimits,
+/// src/isolate.rs), this one keeps the gate itself finite.
+pub const ANALYZER_TIME_LIMIT_SECS: f64 = 10.0;
 
 /// One analyzer diagnostic, mapped from `Luau::TypeError`.
 ///
@@ -73,6 +90,9 @@ extern "C" {
         strict: c_int,
         prelude: *const c_char,
         prelude_len: usize,
+        // NaN = no limit; anything else is the literal bound in seconds
+        // (0.0 is a valid, immediately-expiring bound — the test hook).
+        module_time_limit_secs: c_double,
     ) -> *mut c_void;
     fn shuttle_checker_free(checker: *mut c_void);
     fn shuttle_checker_seed_module(
@@ -100,6 +120,16 @@ extern "C" {
     ) -> c_int;
     fn shuttle_timeout_hits(result: *mut c_void) -> c_int;
     fn shuttle_check_result_free(result: *mut c_void);
+    fn shuttle_locate_output_key(
+        source: *const c_char,
+        source_len: usize,
+        key: *const c_char,
+        key_len: usize,
+        begin_line: *mut c_uint,
+        begin_col: *mut c_uint,
+        end_line: *mut c_uint,
+        end_col: *mut c_uint,
+    ) -> c_int;
 }
 
 /// Read a result handle into owned Rust diagnostics, then free the handle.
@@ -150,6 +180,9 @@ unsafe fn collect_diagnostics(result: *mut c_void) -> (Vec<Diagnostic>, u32) {
 /// single-threaded state. Use one per thread (or per subprocess).
 pub struct Checker {
     inner: *mut c_void,
+    /// The per-module wall-clock bound handed to the C++ constructor
+    /// (`None` = unbounded), kept so timeout diagnostics can name it.
+    time_limit_secs: Option<f64>,
 }
 
 impl Checker {
@@ -158,28 +191,35 @@ impl Checker {
     /// the builtin type graph — this is the cold-start cost (see REPORT.md
     /// latency numbers).
     pub fn new(strict: bool) -> Checker {
-        Checker::with_prelude(strict, "")
+        Checker::with_prelude(strict, "", None)
     }
 
     /// Create a strict analyzer with shuttle's typed prelude bound, so
     /// definitions using the injected globals (`snap`, `merge`, `pin`,
     /// `index`, `app`, `image`) check cleanly.
     pub fn for_definitions() -> Checker {
-        Checker::with_prelude(true, PRELUDE_DEFS)
+        Checker::with_prelude(true, PRELUDE_DEFS, Some(ANALYZER_TIME_LIMIT_SECS))
     }
 
-    fn with_prelude(strict: bool, prelude: &str) -> Checker {
+    fn with_prelude(strict: bool, prelude: &str, time_limit_secs: Option<f64>) -> Checker {
         let prelude_ptr = if prelude.is_empty() {
             std::ptr::null()
         } else {
             prelude.as_ptr().cast::<c_char>()
         };
+        // NaN is the C++ "no limit" sentinel; `Some(0.0)` crosses as a
+        // literal (immediately-expiring) bound.
+        let limit_arg = time_limit_secs.unwrap_or(f64::NAN);
         // SAFETY: returns a fresh handle or dies inside C++ (no error return
         // path); null-check on the Rust side. `prelude` is only read during
         // construction; the copied sources outlive the call.
-        let inner = unsafe { shuttle_checker_new(strict as c_int, prelude_ptr, prelude.len()) };
+        let inner =
+            unsafe { shuttle_checker_new(strict as c_int, prelude_ptr, prelude.len(), limit_arg) };
         assert!(!inner.is_null(), "shuttle_checker_new returned null");
-        Checker { inner }
+        Checker {
+            inner,
+            time_limit_secs,
+        }
     }
 
     /// Make an extra module visible to `require("name")` and to `readSource`
@@ -205,6 +245,34 @@ impl Checker {
     /// Type-check `source` as module `name` in the checker's mode.
     /// Panics on FFI-contract violation (NUL byte), which is a caller bug.
     pub fn check(&mut self, name: &str, source: &str) -> Vec<Diagnostic> {
+        self.check_collect(name, source).0
+    }
+
+    /// Like [`Checker::check`], but honors the checker's time limit: when any
+    /// module hit the bound, the (partial, unreliable) result set is replaced
+    /// by a single `analysis timed out after Ns` diagnostic — the fail-closed
+    /// shape `shuttle check` consumes. Unbounded checkers behave like
+    /// [`Checker::check`].
+    pub fn check_bounded(&mut self, name: &str, source: &str) -> Vec<Diagnostic> {
+        let (diagnostics, timeouts) = self.check_collect(name, source);
+        if timeouts == 0 {
+            return diagnostics;
+        }
+        let after = match self.time_limit_secs {
+            Some(secs) => format!(" after {secs}s"),
+            None => String::new(),
+        };
+        vec![Diagnostic {
+            begin_line: 1,
+            begin_col: 1,
+            end_line: 1,
+            end_col: 0,
+            message: format!("analysis timed out{after}"),
+        }]
+    }
+
+    /// Run the FFI check and read the result handle back.
+    fn check_collect(&mut self, name: &str, source: &str) -> (Vec<Diagnostic>, u32) {
         let c_name = CString::new(name).expect("module name contains NUL");
         assert!(!source.contains('\0'), "source contains NUL byte");
         // SAFETY: valid handle; C++ copies both strings.
@@ -217,14 +285,7 @@ impl Checker {
             )
         };
         // SAFETY: fresh handle from the call above.
-        unsafe { collect_diagnostics(result) }.0
-    }
-
-    /// Number of modules that hit the internal time limit in the last check
-    /// (always 0 here — `moduleTimeLimitSec` is not set by the shim).
-    pub fn timeout_hits(&self) -> u32 {
-        // SAFETY: valid handle.
-        unsafe { shuttle_timeout_hits(self.inner) }.max(0) as u32
+        unsafe { collect_diagnostics(result) }
     }
 }
 
@@ -242,12 +303,23 @@ pub fn check_once(name: &str, source: &str, strict: bool) -> Vec<Diagnostic> {
     checker.check(name, source)
 }
 
-/// Check one shuttle definition: strict mode, typed prelude bound, and
-/// constant `require()` names resolved (transitively) through the same
-/// allowlisted-root policy as the eval subprocess
-/// ([`crate::isolate::SourceResolver`]). Unresolvable requires stay unseeded
-/// and fail closed as analyzer diagnostics at the use site.
+/// Check one shuttle definition: strict mode, typed prelude bound,
+/// [`ANALYZER_TIME_LIMIT_SECS`] wall-clock bound, and constant `require()`
+/// names resolved (transitively) through the same allowlisted-root policy as
+/// the eval subprocess ([`crate::isolate::SourceResolver`]). Unresolvable
+/// requires stay unseeded and fail closed as analyzer diagnostics at the use
+/// site.
 pub fn check_definition(label: &str, source: &str) -> Vec<Diagnostic> {
+    check_definition_with_limit(label, source, Some(ANALYZER_TIME_LIMIT_SECS))
+}
+
+/// [`check_definition`] with an injectable time bound: `None` disables the
+/// limit, `Some(0.0)` expires immediately (the deterministic hook tests use).
+pub fn check_definition_with_limit(
+    label: &str,
+    source: &str,
+    time_limit_secs: Option<f64>,
+) -> Vec<Diagnostic> {
     if source.contains('\0') {
         // A NUL byte cannot cross the length-delimited-but-NUL-checked FFI
         // contract; report it instead of panicking on author input.
@@ -259,9 +331,9 @@ pub fn check_definition(label: &str, source: &str) -> Vec<Diagnostic> {
             message: "definition source contains a NUL byte; not type-checkable".to_string(),
         }];
     }
-    let mut checker = Checker::for_definitions();
+    let mut checker = Checker::with_prelude(true, PRELUDE_DEFS, time_limit_secs);
     seed_required_modules(&mut checker, label, source);
-    checker.check(label, source)
+    checker.check_bounded(label, source)
 }
 
 /// [`check_definition`] for a file path. An unreadable file yields no
@@ -272,6 +344,45 @@ pub fn check_definition_file(path: &str) -> Vec<Diagnostic> {
         Ok(source) => check_definition(path, &source),
         Err(_) => Vec::new(),
     }
+}
+
+/// Locate the declaration site of output `key` in a definition `source`: the
+/// *direct* field `key` of a table that is a value of a top-level `return`
+/// statement (`return { default = snap { ... } }`, also through call
+/// arguments as in `return merge({ default = ... }, ...)`). Fields of tables
+/// nested inside other tables are never output keys and are not matched.
+///
+/// Best-effort span for schema-stage diagnostics: `None` when the source
+/// does not parse, has no such field, or builds the returned table some
+/// other way (e.g. mutates a local). The parser is the vendored Luau one —
+/// the same AST the analyzer stage sees.
+pub fn locate_output_key(source: &str, key: &str) -> Option<Span> {
+    if source.contains('\0') || key.contains('\0') {
+        return None;
+    }
+    let c_source = CString::new(source).ok()?;
+    let c_key = CString::new(key).ok()?;
+    let (mut bl, mut bc, mut el, mut ec) = (0u32, 0u32, 0u32, 0u32);
+    // SAFETY: both C strings are valid for the call and have no interior
+    // NUL (checked above); the out-params are stack locals.
+    let found = unsafe {
+        shuttle_locate_output_key(
+            c_source.as_ptr().cast(),
+            source.len(),
+            c_key.as_ptr().cast(),
+            key.len(),
+            &mut bl,
+            &mut bc,
+            &mut el,
+            &mut ec,
+        )
+    } == 0;
+    found.then_some(Span {
+        begin_line: bl,
+        begin_col: bc,
+        end_line: el,
+        end_col: ec,
+    })
 }
 
 /// Seed every transitively required module reachable from `source` into the
@@ -604,5 +715,68 @@ local g = requireNotWord("nope")
         for (got, want) in names.iter().zip(expected) {
             assert_eq!(got, want);
         }
+    }
+
+    // ── Analyzer wall-clock bound (moduleTimeLimitSec, REPORT.md §5) ──
+
+    #[test]
+    fn zero_limit_times_out_fail_closed() {
+        // Some(0.0) expires immediately — the deterministic injection hook.
+        let diags = check_definition_with_limit("timeout", CLEAN, Some(0.0));
+        assert_eq!(
+            diags.len(),
+            1,
+            "partial results must be replaced by one timeout diagnostic: {diags:?}"
+        );
+        assert!(
+            diags[0].message.contains("analysis timed out after 0s"),
+            "got: {:?}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn production_limit_does_not_fire_on_corpus_scale_sources() {
+        let diags = check_definition_with_limit("generous", CLEAN, Some(ANALYZER_TIME_LIMIT_SECS));
+        assert!(diags.is_empty(), "10s must be generous, got: {diags:?}");
+    }
+
+    // ── Schema-stage span localization (locate_output_key) ──
+
+    #[test]
+    fn locate_output_key_finds_direct_field_with_exact_position() {
+        let src = "\nreturn {\n    good = snap { name = \"fine\" },\n    bad = \"nope\",\n}\n";
+        let span = locate_output_key(src, "bad").expect("direct field must be found");
+        assert_eq!((span.begin_line, span.begin_col), (4, 5));
+        assert_eq!((span.end_line, span.end_col), (4, 7), "end col exclusive");
+    }
+
+    #[test]
+    fn locate_output_key_handles_bracketed_and_call_arg_forms() {
+        let bracketed = "return { [\"srv\"] = snap {} }";
+        let span = locate_output_key(bracketed, "srv").expect("bracketed string key");
+        // The key expression is the string literal, so the span starts at
+        // its opening quote, not the bracket.
+        assert_eq!((span.begin_line, span.begin_col), (1, 11));
+
+        let via_call = "\nreturn merge({\n    default = snap { name = \"m\" },\n}, {})";
+        let span = locate_output_key(via_call, "default").expect("table behind call args");
+        assert_eq!((span.begin_line, span.begin_col), (3, 5));
+    }
+
+    #[test]
+    fn locate_output_key_is_none_for_nested_missing_or_unparsed() {
+        // A field of a *nested* table is not an output key.
+        let nested = "return { wrapper = { default = snap {} } }";
+        assert_eq!(locate_output_key(nested, "default"), None);
+        assert_eq!(
+            locate_output_key("return { good = snap {} }", "missing"),
+            None
+        );
+        // Source that does not parse has no localizable positions.
+        assert_eq!(locate_output_key("return {", "default"), None);
+        // Built through a local: the sound answer is "not localizable".
+        let via_local = "local t = { default = snap {} } return t";
+        assert_eq!(locate_output_key(via_local, "default"), None);
     }
 }

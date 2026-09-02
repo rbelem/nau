@@ -1165,11 +1165,13 @@ fn cmd_doctor() -> miette::Result<()> {
 // ── Check command ──
 
 /// `shuttle check`: run one definition through the analyzer gate first
-/// (ADR-0010 Decision 2 — in-process `--!strict` type checking; fast fail
-/// with spanned diagnostics before any subprocess work), then the existing
-/// bounded subprocess eval + Rust-side schema validation (Decisions 3-5).
-/// Deterministic, no build, no store access — the AI feedback-loop entry
-/// point. Exits 1 when the definition has any problem.
+/// (ADR-0010 Decision 2 — in-process `--!strict` type checking under a
+/// 10s wall-clock bound that fails closed with an `analysis timed out`
+/// diagnostic; fast fail with spanned diagnostics before any subprocess
+/// work), then the existing bounded subprocess eval + Rust-side schema
+/// validation (Decisions 3-5). Deterministic, no build, no store access —
+/// the AI feedback-loop entry point. Exits 1 when the definition has any
+/// problem.
 fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
     // Stage 1 — analyzer gate. A definition that does not type-check never
     // reaches the eval stage.
@@ -1293,7 +1295,14 @@ fn report_check_ok(outputs: &[(String, String)]) {
 
 fn report_check_diagnostic(d: &shuttle::lua::CheckDiagnostic) {
     match (&d.key, &d.span) {
-        (Some(key), _) => shuttle::output::err(format!("{}[{key}]: {}", d.label, d.message)),
+        // Keyed diagnostics with a located declaration site show both: the
+        // file:line:col prefix (grep-friendly, matches the analyzer arm)
+        // plus the output key in brackets.
+        (Some(key), Some(s)) => shuttle::output::err(format!(
+            "{}:{}:{}: [{key}] {}",
+            d.label, s.begin_line, s.begin_col, d.message
+        )),
+        (Some(key), None) => shuttle::output::err(format!("{}[{key}]: {}", d.label, d.message)),
         // Analyzer diagnostics print with their 1-based begin span.
         (None, Some(s)) => shuttle::output::err(format!(
             "{}:{}:{}: {}",

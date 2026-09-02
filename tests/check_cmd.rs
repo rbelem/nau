@@ -342,6 +342,80 @@ fn check_unresolved_require_fails_closed() {
     );
 }
 
+// ── Schema-stage spans (localization of post-eval validation errors) ──
+
+#[test]
+fn check_schema_diagnostic_carries_located_span_json() {
+    // The schema error for output `bad` points at its declaration site:
+    // `bad = "not-a-snap-table"` sits on line 4, column 5 of this source
+    // (leading newline makes line 1 empty).
+    let dir = tempfile::tempdir().unwrap();
+    write_def(
+        dir.path(),
+        r#"
+return {
+    good = snap { name = "fine", version = "1.0" },
+    bad = "not-a-snap-table",
+}
+"#,
+    );
+    let (code, stdout, _) = run_check(dir.path(), true);
+    assert_eq!(code, Some(1));
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON on stdout");
+    let diags = v["diagnostics"].as_array().expect("diagnostics array");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0]["key"], "bad");
+    let span = &diags[0]["span"];
+    assert!(
+        !span.is_null(),
+        "schema diagnostics for keyed outputs must localize: {}",
+        diags[0]
+    );
+    assert_eq!(span["begin_line"], 4, "line of `bad = ...`: {span}");
+    assert_eq!(span["begin_col"], 5, "column of `bad`: {span}");
+}
+
+#[test]
+fn check_schema_diagnostic_prints_position_human() {
+    let dir = tempfile::tempdir().unwrap();
+    write_def(
+        dir.path(),
+        r#"
+return {
+    good = snap { name = "fine", version = "1.0" },
+    bad = "not-a-snap-table",
+}
+"#,
+    );
+    let (code, _, stderr) = run_check(dir.path(), false);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("shuttle.lua:4:5: [bad]"),
+        "human output must point at the declaration site: {stderr}"
+    );
+}
+
+// ── Analyzer wall-clock bound (fail closed) ──
+
+#[test]
+fn check_reports_timeout_diagnostic_and_exits_one() {
+    // The production 10s bound cannot be tripped cheaply by a test source;
+    // the bound's *mechanics* (abort + single `analysis timed out`
+    // diagnostic, eval-grade partial results discarded) are exercised here
+    // through the injected bound on the library entry point — the same
+    // diagnostic `shuttle check` prints and exits 1 on
+    // (see analysis.rs `zero_limit_times_out_fail_closed` for the unit-level
+    // contract).
+    let source = "return { default = snap { name = \"t\", version = \"1\" } }";
+    let diags = shuttle::analysis::check_definition_with_limit("timeout-test", source, Some(0.0));
+    assert_eq!(diags.len(), 1, "partial results are discarded: {diags:?}");
+    assert!(
+        diags[0].message.contains("analysis timed out"),
+        "got: {:?}",
+        diags[0].message
+    );
+}
+
 #[test]
 fn check_wall_latency_stays_sub_second() {
     // The latency target for `shuttle check` is <100ms wall including the

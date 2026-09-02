@@ -77,9 +77,12 @@ pub struct EvalOutput {
 }
 
 /// One validation/eval diagnostic with structured fields (ADR-0010 Decisions
-/// 2-3). `span` is set only for analyzer-stage diagnostics (1-based spans
-/// from the Luau type checker); eval-stage diagnostics locate the problem
-/// with `label` (definition path) plus `key` (output name).
+/// 2-3). `span` is set when the problem localizes to a source position:
+/// analyzer-stage diagnostics carry the Luau type checker's 1-based spans,
+/// and schema-stage (post-eval validation) diagnostics carry the located
+/// declaration site of the offending output key (`locate_output_key`).
+/// Diagnostics that cannot be localized keep `span: None` and locate the
+/// problem with `label` (definition path) plus `key` (output name).
 ///
 /// JSON shape decision: each diagnostic serializes as a self-contained object
 /// with one optional nested `"span"` field
@@ -97,7 +100,8 @@ pub struct CheckDiagnostic {
     pub actual: Option<String>,
     /// The full diagnostic message.
     pub message: String,
-    /// Analyzer source span; `None` for eval-stage diagnostics.
+    /// Source span when the problem localizes to a position; `None`
+    /// otherwise.
     pub span: Option<Span>,
 }
 
@@ -176,13 +180,16 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
         Err(e) => return failed(diagnostics, format!("{e:#}")),
     };
     for d in &ok.diagnostics {
+        let key = child_diag_key(d);
         diagnostics.push(CheckDiagnostic {
             label: label.to_string(),
-            key: child_diag_key(d),
+            span: key
+                .as_deref()
+                .and_then(|k| crate::analysis::locate_output_key(source, k)),
+            key,
             expected: None,
             actual: None,
             message: d.clone(),
-            span: None,
         });
     }
 
@@ -211,7 +218,7 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
                     expected,
                     actual,
                     message: format!("skipping output '{key}' from {label}: {e}"),
-                    span: None,
+                    span: crate::analysis::locate_output_key(source, key),
                 });
             }
         }
