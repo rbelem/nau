@@ -447,12 +447,7 @@ fn run_build(
     }
 
     let lock_path = Path::new(&lockfile_path);
-    let mut lockfile = LockFile::load(lock_path)?.unwrap_or_else(|| LockFile {
-        version: 1,
-        sources: HashMap::new(),
-        snaps: HashMap::new(),
-        inputs: HashMap::new(),
-    });
+    let mut lockfile = load_lockfile_or_default(lock_path)?;
 
     // Stage policy: an explicitly passed --stage belongs to the user — it
     // must be empty to start and is never wiped. The default ./stage/ is
@@ -461,33 +456,99 @@ fn run_build(
     let stage_dir = std::path::Path::new(&stage_path);
     let output_dir = std::path::Path::new(&output);
 
-    // Initialize binary cache if --cache was specified or --all is set
-    let pkg_cache: Option<shuttle::cache::PackageCache> =
-        if all || cache.is_some() || cache_max_size.is_some() {
-            let mut pc = shuttle::cache::PackageCache::new(cache.map(std::path::PathBuf::from));
-            if let Some(ref size_str) = cache_max_size {
-                if let Some(bytes) = parse_size(size_str) {
-                    pc = pc.with_max_size(bytes);
-                    if !json {
-                        shuttle::output::info(format!("max cache size: {}", size_str));
-                    }
-                } else if !json {
-                    shuttle::output::warn(format!("invalid cache size: {}", size_str));
-                }
-            }
-            Some(pc)
-        } else {
-            None
-        };
+    let pkg_cache = init_pkg_cache(all, cache, cache_max_size, json);
 
-    // If --target is set, override on all snap meta structs
-    let iter: Vec<(&String, shuttle::snap::SnapMeta)> = match &output_name {
+    let iter = select_outputs(&all_outputs, &output_name, &file, target.as_ref(), json)?;
+
+    // If --all, resolve and build transitive dependencies first
+    if all {
+        let all_deps = collect_dep_names(&iter);
+        build_all_deps(
+            &all_deps,
+            target.as_ref(),
+            pkg_cache.as_ref(),
+            &arch,
+            output_dir,
+            &lockfile,
+            json,
+        )?;
+    }
+
+    let all_source_info = build_outputs(
+        &iter,
+        &arch,
+        stage_dir,
+        stage_policy,
+        output_dir,
+        &lockfile,
+        json,
+    )?;
+
+    persist_new_sources(
+        &mut lockfile,
+        lock_path,
+        &all_source_info,
+        &lockfile_path,
+        json,
+    )?;
+
+    Ok(())
+}
+
+/// Load the lockfile at `lock_path`, falling back to an empty v1 lockfile
+/// when it does not exist yet.
+fn load_lockfile_or_default(lock_path: &Path) -> miette::Result<LockFile> {
+    Ok(LockFile::load(lock_path)?.unwrap_or_else(|| LockFile {
+        version: 1,
+        sources: HashMap::new(),
+        snaps: HashMap::new(),
+        inputs: HashMap::new(),
+    }))
+}
+
+/// Initialize the binary cache when --cache/--cache-max-size was given or
+/// --all is set; `None` means the build runs uncached.
+fn init_pkg_cache(
+    all: bool,
+    cache: Option<String>,
+    cache_max_size: Option<String>,
+    json: bool,
+) -> Option<shuttle::cache::PackageCache> {
+    if !(all || cache.is_some() || cache_max_size.is_some()) {
+        return None;
+    }
+
+    let mut pc = shuttle::cache::PackageCache::new(cache.map(std::path::PathBuf::from));
+    if let Some(ref size_str) = cache_max_size {
+        if let Some(bytes) = parse_size(size_str) {
+            pc = pc.with_max_size(bytes);
+            if !json {
+                shuttle::output::info(format!("max cache size: {}", size_str));
+            }
+        } else if !json {
+            shuttle::output::warn(format!("invalid cache size: {}", size_str));
+        }
+    }
+    Some(pc)
+}
+
+/// Select the outputs to build: the --output-name pick when given, else
+/// every output in the file. Applies --target to each selected meta
+/// (announced once in text mode).
+fn select_outputs<'a>(
+    all_outputs: &'a shuttle::lua::Outputs,
+    output_name: &'a Option<String>,
+    file: &str,
+    target: Option<&String>,
+    json: bool,
+) -> miette::Result<Vec<(&'a String, shuttle::snap::SnapMeta)>> {
+    let iter: Vec<(&String, shuttle::snap::SnapMeta)> = match output_name {
         Some(name) => {
             let mut meta = all_outputs
                 .get(name)
                 .ok_or_else(|| miette::miette!("output '{}' not found in {}", name, file))?
                 .clone();
-            if let Some(ref t) = target {
+            if let Some(t) = target {
                 meta.target = Some(t.clone());
                 if !json {
                     shuttle::output::info(format!("target: {t}"));
@@ -497,14 +558,14 @@ fn run_build(
         }
         None => {
             let mut vec: Vec<(&String, shuttle::snap::SnapMeta)> = Vec::new();
-            for (name, meta_ref) in &all_outputs {
+            for (name, meta_ref) in all_outputs {
                 let mut meta = meta_ref.clone();
-                if let Some(ref t) = target {
+                if let Some(t) = target {
                     meta.target = Some(t.clone());
                 }
                 vec.push((name, meta));
             }
-            if let Some(ref t) = target {
+            if let Some(t) = target {
                 if !json {
                     shuttle::output::info(format!("target: {t}"));
                 }
@@ -512,147 +573,224 @@ fn run_build(
             vec
         }
     };
+    Ok(iter)
+}
 
-    // Also apply target to dep builds
-    let effective_target = target.clone();
+/// Collect the unique dependency names of every selected output, in
+/// first-seen order.
+fn collect_dep_names(iter: &[(&String, shuttle::snap::SnapMeta)]) -> Vec<String> {
+    let mut all_deps: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // If --all, resolve and build transitive dependencies first
-    if all {
-        let mut all_deps: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for (_name, meta) in &iter {
-            if !meta.requires.is_empty() {
-                if let Ok(deps) = shuttle::deps::resolve_dep_names(&meta.requires, true) {
-                    for dep in &deps {
-                        if seen.insert(dep.clone()) {
-                            all_deps.push(dep.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        if !all_deps.is_empty() {
-            if !json {
-                eprintln!("── Building {} dependencies ──", all_deps.len());
-            }
-            for dep_name in &all_deps {
-                let mut dep_meta = match shuttle::deps::load_meta(dep_name) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        shuttle::output::warn(format!("skipping dependency '{}': {}", dep_name, e));
-                        continue;
-                    }
-                };
-
-                // Apply --target to deps as well
-                if let Some(ref t) = effective_target {
-                    dep_meta.target = Some(t.clone());
-                }
-
-                // Closure key for this dep: source + parts + target +
-                // requires closure, built once per dep; both the lookup and
-                // the store below use it.
-                let dep_closure = if pkg_cache.is_some() {
-                    Some(build_closure(&dep_meta, &lockfile))
-                } else {
-                    None
-                };
-
-                // Check cache first: skip the dep only when every resolved
-                // arch is cached under its closure key.
-                if let (Some(cache), Some(closure)) = (pkg_cache.as_ref(), dep_closure.as_ref()) {
-                    if dep_fully_cached(cache, closure, &dep_meta, &arch) {
-                        if !json {
-                            shuttle::output::ok(format!("{} (cached)", dep_name));
-                        }
-                        continue;
-                    }
-                }
-
-                let dep_archs = shuttle::snap::resolve_archs(&dep_meta, &arch);
-                for a in &dep_archs {
-                    shuttle::snap::check_cross_build(a, dep_meta.target.as_deref())?;
-                    if !json {
-                        shuttle::output::status(format!("building {} ({})...", dep_name, a));
-                    }
-                    let dep_stage = tempfile::tempdir()
-                        .map_err(|e| miette::miette!("failed to create temp stage: {}", e))?;
-
-                    match shuttle::snap::build_snap(
-                        &dep_meta,
-                        dep_stage.path(),
-                        output_dir,
-                        a,
-                        shuttle::snap::StagePolicy::Default,
-                    ) {
-                        Ok(result) => {
-                            if !json {
-                                shuttle::output::ok(&result.snap_filename);
-                            }
-                            if let (Some(cache), Some(closure)) =
-                                (pkg_cache.as_ref(), dep_closure.as_ref())
-                            {
-                                if let Err(e) = cache.store(&dep_meta, &result, output_dir, closure)
-                                {
-                                    shuttle::output::warn(format!("cache store failed: {}", e));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            shuttle::output::warn(format!(
-                                "build failed for '{}': {}",
-                                dep_name, e
-                            ));
-                        }
+    for (_name, meta) in iter {
+        if !meta.requires.is_empty() {
+            if let Ok(deps) = shuttle::deps::resolve_dep_names(&meta.requires, true) {
+                for dep in &deps {
+                    if seen.insert(dep.clone()) {
+                        all_deps.push(dep.clone());
                     }
                 }
             }
         }
     }
+    all_deps
+}
 
+/// Resolve and build every transitive dependency of the selected outputs
+/// (--all mode), consulting the binary cache per dep when one is active.
+#[allow(clippy::too_many_arguments)]
+fn build_all_deps(
+    dep_names: &[String],
+    effective_target: Option<&String>,
+    pkg_cache: Option<&shuttle::cache::PackageCache>,
+    cli_archs: &[String],
+    output_dir: &Path,
+    lockfile: &LockFile,
+    json: bool,
+) -> miette::Result<()> {
+    if dep_names.is_empty() {
+        return Ok(());
+    }
+    if !json {
+        eprintln!("── Building {} dependencies ──", dep_names.len());
+    }
+    for dep_name in dep_names {
+        let mut dep_meta = match shuttle::deps::load_meta(dep_name) {
+            Ok(m) => m,
+            Err(e) => {
+                shuttle::output::warn(format!("skipping dependency '{}': {}", dep_name, e));
+                continue;
+            }
+        };
+
+        // Apply --target to deps as well
+        if let Some(t) = effective_target {
+            dep_meta.target = Some(t.clone());
+        }
+
+        // Closure key for this dep: source + parts + target + requires
+        // closure, built once per dep; both the lookup and the store below
+        // use it.
+        let dep_closure = pkg_cache.map(|_| build_closure(&dep_meta, lockfile));
+
+        // Check cache first: skip the dep only when every resolved arch is
+        // cached under its closure key.
+        if let (Some(cache), Some(closure)) = (pkg_cache, dep_closure.as_ref()) {
+            if dep_fully_cached(cache, closure, &dep_meta, cli_archs) {
+                if !json {
+                    shuttle::output::ok(format!("{} (cached)", dep_name));
+                }
+                continue;
+            }
+        }
+
+        let dep_archs = shuttle::snap::resolve_archs(&dep_meta, cli_archs);
+        build_dep_archs(
+            dep_name,
+            &dep_meta,
+            &dep_archs,
+            output_dir,
+            pkg_cache,
+            dep_closure.as_ref(),
+            json,
+        )?;
+    }
+    Ok(())
+}
+
+/// Build one dependency across its resolved archs, storing each artifact in
+/// the binary cache when one is active.
+fn build_dep_archs(
+    dep_name: &str,
+    dep_meta: &shuttle::snap::SnapMeta,
+    dep_archs: &[String],
+    output_dir: &Path,
+    pkg_cache: Option<&shuttle::cache::PackageCache>,
+    dep_closure: Option<&shuttle::cache::BuildClosure>,
+    json: bool,
+) -> miette::Result<()> {
+    for a in dep_archs {
+        shuttle::snap::check_cross_build(a, dep_meta.target.as_deref())?;
+        if !json {
+            shuttle::output::status(format!("building {} ({})...", dep_name, a));
+        }
+        let dep_stage = tempfile::tempdir()
+            .map_err(|e| miette::miette!("failed to create temp stage: {}", e))?;
+
+        match shuttle::snap::build_snap(
+            dep_meta,
+            dep_stage.path(),
+            output_dir,
+            a,
+            shuttle::snap::StagePolicy::Default,
+        ) {
+            Ok(result) => {
+                if !json {
+                    shuttle::output::ok(&result.snap_filename);
+                }
+                if let (Some(cache), Some(closure)) = (pkg_cache, dep_closure) {
+                    if let Err(e) = cache.store(dep_meta, &result, output_dir, closure) {
+                        shuttle::output::warn(format!("cache store failed: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                shuttle::output::warn(format!("build failed for '{}': {}", dep_name, e));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build every selected output across its resolved archs, collecting the
+/// source infos recorded during the builds (for lockfile pinning).
+fn build_outputs(
+    iter: &[(&String, shuttle::snap::SnapMeta)],
+    cli_archs: &[String],
+    stage_dir: &Path,
+    stage_policy: shuttle::snap::StagePolicy,
+    output_dir: &Path,
+    lockfile: &LockFile,
+    json: bool,
+) -> miette::Result<Vec<shuttle::snap::SourceInfo>> {
     let mut all_source_info: Vec<shuttle::snap::SourceInfo> = Vec::new();
 
-    for (name, meta) in &iter {
-        let archs = shuttle::snap::resolve_archs(meta, &arch);
+    for (name, meta) in iter {
+        let archs = shuttle::snap::resolve_archs(meta, cli_archs);
         if !json {
             eprintln!("Building {} ({})...", name, meta.version);
         }
 
         for a in &archs {
-            shuttle::snap::check_cross_build(a, meta.target.as_deref())?;
-            if !json {
-                shuttle::output::status(format!("{}/{}:", name, a));
-            }
-
-            if let Some(SourceSpec::Unverified(ref url)) = meta.source {
-                if lockfile.lookup_source(url).is_some() {
-                    shuttle::output::info(format!("using lockfile hash for {url}"));
-                }
-            }
-
-            let result = shuttle::snap::build_snap(meta, stage_dir, output_dir, a, stage_policy)?;
-            if !json {
-                shuttle::output::ok(&result.snap_filename);
-            } else {
-                shuttle::output::record_build_result(shuttle::output::BuildResultJson {
-                    name: meta.name.clone(),
-                    version: meta.version.clone(),
-                    arch: a.clone(),
-                    filename: result.snap_filename.clone(),
-                    sha256: result.source_info.as_ref().map(|s| s.sha256.clone()),
-                });
-            }
-
-            if let Some(info) = result.source_info {
+            if let Some(info) = build_one_arch(
+                name,
+                meta,
+                a,
+                stage_dir,
+                stage_policy,
+                output_dir,
+                lockfile,
+                json,
+            )? {
                 all_source_info.push(info);
             }
         }
     }
 
+    Ok(all_source_info)
+}
+
+/// Build a single output for one arch. Returns the source info captured by
+/// the build, if any, for the caller's lockfile update.
+#[allow(clippy::too_many_arguments)]
+fn build_one_arch(
+    name: &str,
+    meta: &shuttle::snap::SnapMeta,
+    arch: &str,
+    stage_dir: &Path,
+    stage_policy: shuttle::snap::StagePolicy,
+    output_dir: &Path,
+    lockfile: &LockFile,
+    json: bool,
+) -> miette::Result<Option<shuttle::snap::SourceInfo>> {
+    shuttle::snap::check_cross_build(arch, meta.target.as_deref())?;
+    if !json {
+        shuttle::output::status(format!("{}/{}:", name, arch));
+    }
+
+    if let Some(SourceSpec::Unverified(ref url)) = meta.source {
+        if lockfile.lookup_source(url).is_some() {
+            shuttle::output::info(format!("using lockfile hash for {url}"));
+        }
+    }
+
+    let result = shuttle::snap::build_snap(meta, stage_dir, output_dir, arch, stage_policy)?;
+    if !json {
+        shuttle::output::ok(&result.snap_filename);
+    } else {
+        shuttle::output::record_build_result(shuttle::output::BuildResultJson {
+            name: meta.name.clone(),
+            version: meta.version.clone(),
+            arch: arch.to_string(),
+            filename: result.snap_filename.clone(),
+            sha256: result.source_info.as_ref().map(|s| s.sha256.clone()),
+        });
+    }
+
+    Ok(result.source_info)
+}
+
+/// Pin newly observed source hashes into the lockfile (saving it when
+/// anything changed) and report each source in text mode.
+fn persist_new_sources(
+    lockfile: &mut LockFile,
+    lock_path: &Path,
+    source_info: &[shuttle::snap::SourceInfo],
+    lockfile_path: &str,
+    json: bool,
+) -> miette::Result<()> {
     let mut changed = false;
-    for info in &all_source_info {
+    for info in source_info {
         if !lockfile.sources.contains_key(&info.url) {
             lockfile.sources.insert(
                 info.url.clone(),
@@ -669,8 +807,8 @@ fn run_build(
         shuttle::output::ok(format!("lockfile updated: {}", lockfile_path));
     }
 
-    if !all_source_info.is_empty() && !json {
-        for info in &all_source_info {
+    if !source_info.is_empty() && !json {
+        for info in source_info {
             let status = if lockfile.sources.contains_key(&info.url) {
                 "pinned"
             } else {
@@ -703,60 +841,68 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
 
     for meta in &iter {
         if json {
-            if meta.requires.is_empty() {
-                continue;
-            }
-            let seen: std::collections::HashSet<&str> =
-                meta.requires.iter().map(|s| s.as_str()).collect();
-            if let Ok(order) = shuttle::deps::resolve_dep_names(&meta.requires, true) {
-                for dep in &order {
-                    let kind = if seen.contains(dep.as_str()) {
-                        "direct"
-                    } else {
-                        "transitive"
-                    };
-                    shuttle::output::record_order_result(shuttle::output::OrderResultJson {
-                        name: dep.clone(),
-                        kind: kind.to_string(),
-                    });
-                }
-            }
-            continue;
-        }
-
-        eprintln!("Package: {} {}", meta.name, meta.version);
-
-        if meta.requires.is_empty() {
-            eprintln!("  No dependencies");
-            continue;
-        }
-
-        eprintln!("  Direct requires:");
-        for dep in &meta.requires {
-            eprintln!("    - {}", dep);
-        }
-
-        eprintln!("  Resolved build order (transitive):");
-        match shuttle::deps::resolve_dep_names(&meta.requires, true) {
-            Ok(order) => {
-                let seen: std::collections::HashSet<&str> =
-                    meta.requires.iter().map(|s| s.as_str()).collect();
-                for dep in &order {
-                    let marker = if seen.contains(dep.as_str()) {
-                        "direct"
-                    } else {
-                        "transitive"
-                    };
-                    eprintln!("    {:4} {}", marker, dep);
-                }
-            }
-            Err(e) => {
-                eprintln!("    ⚠ could not resolve: {}", e);
-            }
+            report_order_json(meta);
+        } else {
+            report_order_human(meta);
         }
     }
 
     Ok(())
+}
+
+/// JSON-mode order report for one output.
+fn report_order_json(meta: &shuttle::snap::SnapMeta) {
+    if meta.requires.is_empty() {
+        return;
+    }
+    let seen: std::collections::HashSet<&str> = meta.requires.iter().map(|s| s.as_str()).collect();
+    if let Ok(order) = shuttle::deps::resolve_dep_names(&meta.requires, true) {
+        for dep in &order {
+            let kind = if seen.contains(dep.as_str()) {
+                "direct"
+            } else {
+                "transitive"
+            };
+            shuttle::output::record_order_result(shuttle::output::OrderResultJson {
+                name: dep.clone(),
+                kind: kind.to_string(),
+            });
+        }
+    }
+}
+
+/// Text-mode order report for one output.
+fn report_order_human(meta: &shuttle::snap::SnapMeta) {
+    eprintln!("Package: {} {}", meta.name, meta.version);
+
+    if meta.requires.is_empty() {
+        eprintln!("  No dependencies");
+        return;
+    }
+
+    eprintln!("  Direct requires:");
+    for dep in &meta.requires {
+        eprintln!("    - {}", dep);
+    }
+
+    eprintln!("  Resolved build order (transitive):");
+    match shuttle::deps::resolve_dep_names(&meta.requires, true) {
+        Ok(order) => {
+            let seen: std::collections::HashSet<&str> =
+                meta.requires.iter().map(|s| s.as_str()).collect();
+            for dep in &order {
+                let marker = if seen.contains(dep.as_str()) {
+                    "direct"
+                } else {
+                    "transitive"
+                };
+                eprintln!("    {:4} {}", marker, dep);
+            }
+        }
+        Err(e) => {
+            eprintln!("    ⚠ could not resolve: {}", e);
+        }
+    }
 }
 
 // ── Deps command ──
@@ -781,28 +927,46 @@ fn cmd_deps(
     }
 
     if json {
-        let seen: std::collections::HashSet<&str> = nodes
-            .iter()
-            .flat_map(|n| &n.requires)
-            .map(|s| s.as_str())
-            .collect();
-        for node in &nodes {
-            let kind = if seen.contains(node.name.as_str()) {
-                "direct"
-            } else {
-                "transitive"
-            };
-            shuttle::output::record_dep_result(shuttle::output::DepResultJson {
-                name: node.name.clone(),
-                requires: node.requires.clone(),
-                kind: kind.to_string(),
-            });
-        }
-        return Ok(());
+        report_deps_json(&nodes);
+    } else {
+        report_deps_human(&package, &nodes, tree, recursive, flat)?;
     }
 
+    Ok(())
+}
+
+/// JSON-mode dependency report.
+fn report_deps_json(nodes: &[shuttle::deps::DepNode]) {
+    let seen: std::collections::HashSet<&str> = nodes
+        .iter()
+        .flat_map(|n| &n.requires)
+        .map(|s| s.as_str())
+        .collect();
+    for node in nodes {
+        let kind = if seen.contains(node.name.as_str()) {
+            "direct"
+        } else {
+            "transitive"
+        };
+        shuttle::output::record_dep_result(shuttle::output::DepResultJson {
+            name: node.name.clone(),
+            requires: node.requires.clone(),
+            kind: kind.to_string(),
+        });
+    }
+}
+
+/// Text-mode dependency report (tree / flat / direct-requires views).
+fn report_deps_human(
+    package: &str,
+    nodes: &[shuttle::deps::DepNode],
+    tree: bool,
+    recursive: bool,
+    flat: bool,
+) -> miette::Result<()> {
     if tree && recursive {
         eprintln!("Dependency tree for '{}':", package);
+        let names = vec![package.to_string()];
         let tree_str = shuttle::deps::format_tree(&names, true)?;
         eprintln!("{}", tree_str);
     } else if flat {
@@ -811,19 +975,17 @@ fn cmd_deps(
         for (i, name) in names_only.iter().enumerate() {
             eprintln!("  {}. {}", i + 1, name);
         }
-    } else {
-        if let Some(pkg) = nodes.first() {
-            eprintln!("{} v1.0: {}", package, pkg.name);
-            if pkg.requires.is_empty() {
-                eprintln!("  No dependencies");
-            } else {
-                eprintln!("  Requires:");
-                for dep in &pkg.requires {
-                    eprintln!("    - {}", dep);
-                }
-                if recursive {
-                    eprintln!("  (use --tree or --flat for full transitive resolution)");
-                }
+    } else if let Some(pkg) = nodes.first() {
+        eprintln!("{} v1.0: {}", package, pkg.name);
+        if pkg.requires.is_empty() {
+            eprintln!("  No dependencies");
+        } else {
+            eprintln!("  Requires:");
+            for dep in &pkg.requires {
+                eprintln!("    - {}", dep);
+            }
+            if recursive {
+                eprintln!("  (use --tree or --flat for full transitive resolution)");
             }
         }
     }
@@ -855,95 +1017,137 @@ fn cmd_image(
     std::env::set_var("SHUTTLE_ARCH", &arch);
 
     let lock_path = Path::new(&lockfile_path);
-    let mut lockfile = LockFile::load(lock_path)?.unwrap_or_else(|| LockFile {
-        version: 1,
-        sources: HashMap::new(),
-        snaps: HashMap::new(),
-        inputs: HashMap::new(),
-    });
+    let mut lockfile = load_lockfile_or_default(lock_path)?;
 
-    let images = if let Some(_embedded) = file.strip_prefix("embedded://") {
-        // Embedded packages are single snaps, not images — return empty
-        if !shuttle::output::is_json() {
-            shuttle::output::warn(format!("'{}' is a package, not an image", file));
-        }
-        std::collections::HashMap::new()
-    } else {
-        shuttle::lua::evaluate_images_file(&file)?
-    };
-
+    let images = resolve_images(&file)?;
     let output_dir = Path::new(&output);
+    let cache_dir = image_cache_dir(cache.as_deref());
+    let iter = select_images(&images, &output_name, &file)?;
 
-    let cache_dir = cache.map_or_else(
-        || {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            Path::new(&home).join(".cache/shuttle/snaps")
-        },
-        |c| Path::new(&c).to_path_buf(),
-    );
-
-    let iter: Vec<(&String, &ImageDeclaration)> = match &output_name {
-        Some(name) => {
-            let img = images
-                .get(name)
-                .ok_or_else(|| miette::miette!("image '{}' not found in {}", name, file))?;
-            vec![(name, img)]
-        }
-        None => images.iter().collect(),
-    };
-
-    let mut lock_changed = false;
-
-    for (name, image_decl) in iter {
-        if !json {
-            eprintln!("Building image: {} ({})...", name, image_decl.version);
-        }
-
-        let result = if image_decl.disk.is_some() {
-            shuttle::image::build_disk_image(
-                image_decl,
-                output_dir,
-                &cache_dir,
-                &channel,
-                &arch,
-                &mut lockfile,
-            )?
-        } else {
-            shuttle::image::build_image(
-                image_decl,
-                output_dir,
-                &cache_dir,
-                &channel,
-                &arch,
-                &mut lockfile,
-            )?
-        };
-
-        let fname = result
-            .file_name()
-            .unwrap_or(result.as_ref())
-            .to_string_lossy()
-            .to_string();
-
-        if json {
-            shuttle::output::record_build_result(shuttle::output::BuildResultJson {
-                name: name.clone(),
-                version: image_decl.version.clone(),
-                arch: arch.clone(),
-                filename: fname,
-                sha256: None,
-            });
-        } else {
-            shuttle::output::ok(&fname);
-        }
-        lock_changed = true;
-    }
+    // Every selected image records lockfile pins as it builds.
+    let lock_changed = !iter.is_empty();
+    build_images(
+        &iter,
+        output_dir,
+        &cache_dir,
+        &channel,
+        &arch,
+        &mut lockfile,
+        json,
+    )?;
 
     if lock_changed {
         lockfile.save(lock_path)?;
         shuttle::output::ok(format!("lockfile updated: {}", lockfile_path));
     }
 
+    Ok(())
+}
+
+/// Load the image declarations for `file`. Embedded packages are single
+/// snaps, not images — reported and treated as "no images".
+fn resolve_images(file: &str) -> miette::Result<HashMap<String, ImageDeclaration>> {
+    if let Some(_embedded) = file.strip_prefix("embedded://") {
+        // Embedded packages are single snaps, not images — return empty
+        if !shuttle::output::is_json() {
+            shuttle::output::warn(format!("'{}' is a package, not an image", file));
+        }
+        Ok(std::collections::HashMap::new())
+    } else {
+        shuttle::lua::evaluate_images_file(file)
+    }
+}
+
+/// Resolve the image cache directory: the --cache override, else the
+/// default under $HOME.
+fn image_cache_dir(cache: Option<&str>) -> std::path::PathBuf {
+    cache.map_or_else(
+        || {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            Path::new(&home).join(".cache/shuttle/snaps")
+        },
+        |c| Path::new(c).to_path_buf(),
+    )
+}
+
+/// Select the images to build: the --output-name pick when given, else
+/// every declared image.
+fn select_images<'a>(
+    images: &'a HashMap<String, ImageDeclaration>,
+    output_name: &'a Option<String>,
+    file: &str,
+) -> miette::Result<Vec<(&'a String, &'a ImageDeclaration)>> {
+    match output_name {
+        Some(name) => {
+            let img = images
+                .get(name)
+                .ok_or_else(|| miette::miette!("image '{}' not found in {}", name, file))?;
+            Ok(vec![(name, img)])
+        }
+        None => Ok(images.iter().collect()),
+    }
+}
+
+/// Build every selected image, mutating the lockfile as pins are recorded.
+fn build_images(
+    iter: &[(&String, &ImageDeclaration)],
+    output_dir: &Path,
+    cache_dir: &Path,
+    channel: &str,
+    arch: &str,
+    lockfile: &mut LockFile,
+    json: bool,
+) -> miette::Result<()> {
+    for (name, image_decl) in iter {
+        if !json {
+            eprintln!("Building image: {} ({})...", name, image_decl.version);
+        }
+
+        build_one_image(
+            name, image_decl, output_dir, cache_dir, channel, arch, lockfile, json,
+        )?;
+    }
+    Ok(())
+}
+
+/// Build one image (disk image when a disk size is declared, else a plain
+/// image) and report the result.
+#[allow(clippy::too_many_arguments)]
+fn build_one_image(
+    name: &str,
+    image_decl: &ImageDeclaration,
+    output_dir: &Path,
+    cache_dir: &Path,
+    channel: &str,
+    arch: &str,
+    lockfile: &mut LockFile,
+    json: bool,
+) -> miette::Result<()> {
+    let result = if image_decl.disk.is_some() {
+        shuttle::image::build_disk_image(
+            image_decl, output_dir, cache_dir, channel, arch, lockfile,
+        )?
+    } else {
+        shuttle::image::build_image(image_decl, output_dir, cache_dir, channel, arch, lockfile)?
+    };
+
+    let fname = result
+        .file_name()
+        .unwrap_or(result.as_ref())
+        .to_string_lossy()
+        .to_string();
+
+    if json {
+        shuttle::output::record_build_result(shuttle::output::BuildResultJson {
+            name: name.to_string(),
+            version: image_decl.version.clone(),
+            arch: arch.to_string(),
+            filename: fname,
+            sha256: None,
+        });
+    } else {
+        shuttle::output::ok(&fname);
+    }
     Ok(())
 }
 
@@ -1150,63 +1354,81 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
 fn cmd_cache(sub: CacheCommand) -> miette::Result<()> {
     match sub {
         CacheCommand::Info { cache } => {
-            let cache = PackageCache::new(cache.map(std::path::PathBuf::from));
-            let info = cache.info()?;
-            eprintln!("Cache directory: {}", info.root.display());
-            eprintln!("Unique source entries: {}", info.entries);
-            eprintln!("Cached packages: {}", info.packages);
-            eprintln!(
-                "Disk usage: {}",
-                if info.size_bytes > 1_000_000_000 {
-                    format!("{:.1} GB", info.size_bytes as f64 / 1_000_000_000.0)
-                } else if info.size_bytes > 1_000_000 {
-                    format!("{:.1} MB", info.size_bytes as f64 / 1_000_000.0)
-                } else {
-                    format!("{} bytes", info.size_bytes)
-                }
-            );
+            cache_info(PackageCache::new(cache.map(std::path::PathBuf::from)))
         }
-        CacheCommand::Clear { cache, force } => {
-            let cache = PackageCache::new(cache.map(std::path::PathBuf::from));
-            let info = cache.info()?;
-            if info.entries == 0 {
-                eprintln!("Cache is already empty at {}", info.root.display());
-                return Ok(());
-            }
-            if !force {
-                eprintln!(
-                    "This will remove {} cached packages ({} entries, {:.1} MB).",
-                    info.packages,
-                    info.entries,
-                    info.size_bytes as f64 / 1_000_000.0
-                );
-                eprintln!("Use --force to confirm.");
-                return Ok(());
-            }
-            cache.clear()?;
-            shuttle::output::ok("cache cleared");
+        CacheCommand::Clear { cache, force } => cache_clear(
+            PackageCache::new(cache.map(std::path::PathBuf::from)),
+            force,
+        ),
+        CacheCommand::Prune { days, cache, force } => cache_prune(
+            days,
+            PackageCache::new(cache.map(std::path::PathBuf::from)),
+            force,
+        ),
+    }
+}
+
+/// `shuttle cache info`: print cache statistics.
+fn cache_info(cache: PackageCache) -> miette::Result<()> {
+    let info = cache.info()?;
+    eprintln!("Cache directory: {}", info.root.display());
+    eprintln!("Unique source entries: {}", info.entries);
+    eprintln!("Cached packages: {}", info.packages);
+    eprintln!(
+        "Disk usage: {}",
+        if info.size_bytes > 1_000_000_000 {
+            format!("{:.1} GB", info.size_bytes as f64 / 1_000_000_000.0)
+        } else if info.size_bytes > 1_000_000 {
+            format!("{:.1} MB", info.size_bytes as f64 / 1_000_000.0)
+        } else {
+            format!("{} bytes", info.size_bytes)
         }
-        CacheCommand::Prune { days, cache, force } => {
-            let cache = PackageCache::new(cache.map(std::path::PathBuf::from));
-            if !force {
-                eprintln!(
-                    "This will remove cache entries not accessed in {} days.",
-                    days
-                );
-                eprintln!("Use --force to confirm.");
-                return Ok(());
-            }
-            let removed = cache.prune(days)?;
-            if removed > 0 {
-                shuttle::output::ok(format!(
-                    "pruned {} cache entr{}",
-                    removed,
-                    if removed == 1 { "y" } else { "ies" }
-                ));
-            } else {
-                eprintln!("Nothing to prune.");
-            }
-        }
+    );
+    Ok(())
+}
+
+/// `shuttle cache clear`: remove all cached packages, guarded by `--force`.
+fn cache_clear(cache: PackageCache, force: bool) -> miette::Result<()> {
+    let info = cache.info()?;
+    if info.entries == 0 {
+        eprintln!("Cache is already empty at {}", info.root.display());
+        return Ok(());
+    }
+    if !force {
+        eprintln!(
+            "This will remove {} cached packages ({} entries, {:.1} MB).",
+            info.packages,
+            info.entries,
+            info.size_bytes as f64 / 1_000_000.0
+        );
+        eprintln!("Use --force to confirm.");
+        return Ok(());
+    }
+    cache.clear()?;
+    shuttle::output::ok("cache cleared");
+    Ok(())
+}
+
+/// `shuttle cache prune`: remove cache entries not accessed in `days`,
+/// guarded by `--force`.
+fn cache_prune(days: u64, cache: PackageCache, force: bool) -> miette::Result<()> {
+    if !force {
+        eprintln!(
+            "This will remove cache entries not accessed in {} days.",
+            days
+        );
+        eprintln!("Use --force to confirm.");
+        return Ok(());
+    }
+    let removed = cache.prune(days)?;
+    if removed > 0 {
+        shuttle::output::ok(format!(
+            "pruned {} cache entr{}",
+            removed,
+            if removed == 1 { "y" } else { "ies" }
+        ));
+    } else {
+        eprintln!("Nothing to prune.");
     }
     Ok(())
 }
@@ -1330,65 +1552,10 @@ fn cmd_completion(shell: clap_complete::Shell) -> miette::Result<()> {
 fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
     match sub {
         IndexCommand::Update { file } => {
-            let inputs = if Path::new(&file).exists() {
-                match shuttle::lua::evaluate_file_with_inputs(&file) {
-                    Ok(eval) => eval.global_inputs,
-                    Err(_) => {
-                        eprintln!("  could not read inputs from '{file}', using default");
-                        HashMap::new()
-                    }
-                }
-            } else {
-                HashMap::new()
-            };
-
-            if inputs.is_empty() {
-                let default = PackageInput {
-                    url: "github:rbelem/shuttle/main".into(),
-                };
-                eprintln!("  Updating default package index...");
-                if let Err(e) = shuttle::pkg_source::refresh_input(&default) {
-                    eprintln!("  ✗ failed: {e}");
-                } else {
-                    eprintln!("  ✓ default package index updated");
-                }
-            } else {
-                for (name, input) in &inputs {
-                    eprintln!("  Updating input '{name}'...");
-                    match shuttle::pkg_source::refresh_input(input) {
-                        Ok(_) => eprintln!("  ✓ '{name}' updated"),
-                        Err(e) => eprintln!("  ✗ '{name}' failed: {e}"),
-                    }
-                }
-            }
+            index_update(&file);
+            Ok(())
         }
-        IndexCommand::List { index } => {
-            let path = Path::new(&index);
-            let idx = if path.exists() {
-                PackageIndex::load(path)?
-            } else {
-                PackageIndex::load_or_default(path)?
-            };
-
-            eprintln!("Package index: {} entries", idx.snaps.len());
-            eprintln!();
-            for entry in &idx.snaps {
-                let kind = if entry.store.is_some() {
-                    "store"
-                } else if entry.source.is_some() {
-                    "source"
-                } else {
-                    "unknown"
-                };
-                let pins = entry
-                    .pins
-                    .as_ref()
-                    .map(|p| p.len().to_string())
-                    .unwrap_or_else(|| "-".into());
-                eprintln!("  {:<20} {}    pins: {}", entry.name, kind, pins);
-            }
-        }
-
+        IndexCommand::List { index } => index_list(&index),
         IndexCommand::Add {
             name,
             summary,
@@ -1396,52 +1563,131 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
             channel,
             alias,
             index,
-        } => {
-            let path = Path::new(&index);
-            let mut idx = if path.exists() {
-                PackageIndex::load(path)?
-            } else {
-                PackageIndex {
-                    version: 1,
-                    snaps: vec![],
-                }
-            };
+        } => index_add(name, summary, store_name, channel, alias, index),
+        IndexCommand::Resolve { index, channel } => index_resolve(&index, &channel),
+    }
+}
 
-            let entry = IndexEntry {
-                name: name.clone(),
-                summary,
-                store: Some(StoreRef {
-                    name: store_name,
-                    channel,
-                }),
-                pins: None,
-                source: None,
-                build: None,
-                apps: None,
-                aliases: alias,
-            };
-
-            idx.upsert(entry);
-            idx.save(path)?;
-            shuttle::output::ok(format!("added '{}' to index", name));
+/// `shuttle index update`: refresh package inputs from the config file, or
+/// the default input when the file is absent/unreadable/empty.
+fn index_update(file: &str) {
+    let inputs = if Path::new(file).exists() {
+        match shuttle::lua::evaluate_file_with_inputs(file) {
+            Ok(eval) => eval.global_inputs,
+            Err(_) => {
+                eprintln!("  could not read inputs from '{file}', using default");
+                HashMap::new()
+            }
         }
+    } else {
+        HashMap::new()
+    };
 
-        IndexCommand::Resolve { index, channel } => {
-            let path = Path::new(&index);
-            let mut idx = if path.exists() {
-                PackageIndex::load(path)?
-            } else {
-                eprintln!("  index file not found at {}", index);
-                return Ok(());
-            };
-
-            eprintln!("Resolving snap pins from store (channel: {channel})...");
-            idx.resolve_all(&channel)?;
-            idx.save(path)?;
-            shuttle::output::ok(format!("index updated: {}", index));
+    if inputs.is_empty() {
+        let default = PackageInput {
+            url: "github:rbelem/shuttle/main".into(),
+        };
+        eprintln!("  Updating default package index...");
+        if let Err(e) = shuttle::pkg_source::refresh_input(&default) {
+            eprintln!("  ✗ failed: {e}");
+        } else {
+            eprintln!("  ✓ default package index updated");
+        }
+    } else {
+        for (name, input) in &inputs {
+            eprintln!("  Updating input '{name}'...");
+            match shuttle::pkg_source::refresh_input(input) {
+                Ok(_) => eprintln!("  ✓ '{name}' updated"),
+                Err(e) => eprintln!("  ✗ '{name}' failed: {e}"),
+            }
         }
     }
+}
 
+/// `shuttle index list`: print every index entry with its kind and pin
+/// count.
+fn index_list(index: &str) -> miette::Result<()> {
+    let path = Path::new(index);
+    let idx = if path.exists() {
+        PackageIndex::load(path)?
+    } else {
+        PackageIndex::load_or_default(path)?
+    };
+
+    eprintln!("Package index: {} entries", idx.snaps.len());
+    eprintln!();
+    for entry in &idx.snaps {
+        let kind = if entry.store.is_some() {
+            "store"
+        } else if entry.source.is_some() {
+            "source"
+        } else {
+            "unknown"
+        };
+        let pins = entry
+            .pins
+            .as_ref()
+            .map(|p| p.len().to_string())
+            .unwrap_or_else(|| "-".into());
+        eprintln!("  {:<20} {}    pins: {}", entry.name, kind, pins);
+    }
+    Ok(())
+}
+
+/// `shuttle index add`: upsert a store-backed entry and save the index.
+fn index_add(
+    name: String,
+    summary: Option<String>,
+    store_name: Option<String>,
+    channel: String,
+    alias: Vec<String>,
+    index: String,
+) -> miette::Result<()> {
+    let path = Path::new(&index);
+    let mut idx = if path.exists() {
+        PackageIndex::load(path)?
+    } else {
+        PackageIndex {
+            version: 1,
+            snaps: vec![],
+        }
+    };
+
+    let entry = IndexEntry {
+        name: name.clone(),
+        summary,
+        store: Some(StoreRef {
+            name: store_name,
+            channel,
+        }),
+        pins: None,
+        source: None,
+        build: None,
+        apps: None,
+        aliases: alias,
+    };
+
+    idx.upsert(entry);
+    idx.save(path)?;
+    shuttle::output::ok(format!("added '{}' to index", name));
+    Ok(())
+}
+
+/// `shuttle index resolve`: query the Snap Store for every entry's pins and
+/// save the updated index.
+fn index_resolve(index: &str, channel: &str) -> miette::Result<()> {
+    let path = Path::new(index);
+    let mut idx = if path.exists() {
+        PackageIndex::load(path)?
+    } else {
+        eprintln!("  index file not found at {}", index);
+        return Ok(());
+    };
+
+    eprintln!("Resolving snap pins from store (channel: {channel})...");
+    idx.resolve_all(channel)?;
+    idx.save(path)?;
+    shuttle::output::ok(format!("index updated: {}", index));
     Ok(())
 }
 
