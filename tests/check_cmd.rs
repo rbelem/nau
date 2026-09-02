@@ -395,6 +395,36 @@ return {
     );
 }
 
+// ── Hot-comment downgrade rejection (gate integrity, REPORT.md rec 3) ──
+
+#[test]
+fn check_hot_comment_downgrade_exits_one_with_named_diagnostic() {
+    // Without the rejection this definition would pass the gate: nonstrict
+    // mode does not flag unknown globals. The rejection must come from the
+    // analyzer gate BEFORE eval, exit 1, and be the only diagnostic.
+    let dir = tempfile::tempdir().unwrap();
+    write_def(
+        dir.path(),
+        "--!nonstrict\nreturn { default = snp { name = \"x\" } }",
+    );
+    let (code, stdout, stderr) = run_check(dir.path(), false);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("--!nonstrict") && stderr.contains("host-controlled"),
+        "diagnostic must name the offending comment, got: {stderr}"
+    );
+    // Fast fail: the eval stage never ran (it would have validated the snap
+    // and reported `snp` differently or passed it).
+    assert!(
+        !stderr.contains("ok:"),
+        "gate must fail, not fall through to eval: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "human mode writes to stderr only: {stdout}"
+    );
+}
+
 // ── Analyzer wall-clock bound (fail closed) ──
 
 #[test]
@@ -402,10 +432,11 @@ fn check_reports_timeout_diagnostic_and_exits_one() {
     // The production 10s bound cannot be tripped cheaply by a test source;
     // the bound's *mechanics* (abort + single `analysis timed out`
     // diagnostic, eval-grade partial results discarded) are exercised here
-    // through the injected bound on the library entry point — the same
-    // diagnostic `shuttle check` prints and exits 1 on
-    // (see analysis.rs `zero_limit_times_out_fail_closed` for the unit-level
-    // contract).
+    // through the injected bound on the test-only in-process entry point —
+    // the same normalization the `__check-worker` child applies for
+    // `shuttle check` (see tests/attack_isolation.rs
+    // `attack_worker_timeout_is_single_fail_closed_diagnostic` for the
+    // subprocess-level contract).
     let source = "return { default = snap { name = \"t\", version = \"1\" } }";
     let diags = shuttle::analysis::check_definition_with_limit("timeout-test", source, Some(0.0));
     assert_eq!(diags.len(), 1, "partial results are discarded: {diags:?}");

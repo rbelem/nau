@@ -13,6 +13,13 @@
 //! The parent is the import-policy authority: it resolves `require()` names
 //! only from allowlisted roots and rejects everything else before the source
 //! ever crosses the boundary.
+//!
+//! The strict-analyzer stage of `shuttle check` runs the same way: the
+//! parent spawns `shuttle __check-worker`, ships the definition plus every
+//! parent-resolved module source as one JSON request, and reads one JSON
+//! diagnostics array back. The analyzer never runs on untrusted sources
+//! in-process; timeouts (wall-clock kill or the in-worker analyzer bound)
+//! reach the caller as a single fail-closed diagnostic.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -29,9 +36,11 @@ use serde_json::Value;
 pub const WALL_DEADLINE: Duration = Duration::from_secs(5);
 const RLIMIT_AS_BYTES: u64 = 512 * 1024 * 1024;
 const RLIMIT_CPU_SECS: u64 = 5;
-/// VM-level memory limit (raises a clean Luau "not enough memory" error
-/// before RLIMIT_AS would kill the process).
-const VM_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+/// VM-level memory limit: the Luau "not enough memory" error must be able to
+/// fire before RLIMIT_AS kills the process, so the cap sits 128MB BELOW
+/// RLIMIT_AS (512MB). At equality the Rust/C++ base memory plus a full VM
+/// heap tripped the rlimit first and the clean-VM-error path was dead code.
+const VM_MEMORY_LIMIT: usize = 384 * 1024 * 1024;
 /// Max nesting depth accepted when serializing outputs to JSON.
 const MAX_JSON_DEPTH: usize = 128;
 /// Module names at or over PATH_MAX can never resolve on Linux; capping the
@@ -64,6 +73,29 @@ pub struct EvalRequest {
 #[serde(tag = "req")]
 enum ChildRequest {
     Source { name: String },
+}
+
+/// Parent → child: the complete strict-analyzer input set for one
+/// definition (`__check-worker`, the analyzer-stage twin of
+/// [`EvalRequest`]). One line on the child's stdin; the child opens no
+/// files — every required module's source is pre-resolved by the parent and
+/// shipped in `sources`.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CheckRequest {
+    /// Display name of the definition (chunk name / diagnostic context).
+    pub label: String,
+    /// The definition source to type-check.
+    pub entry: String,
+    /// Modules pre-resolved by the parent (require() visibility in the
+    /// analyzer; same allowlisted-root policy as the eval resolver).
+    pub sources: BTreeMap<String, String>,
+    /// Per-module analyzer bound in seconds handed to upstream's
+    /// `moduleTimeLimitSec`. Production always sends
+    /// [`crate::analysis::ANALYZER_TIME_LIMIT_SECS`]; `None` means no
+    /// in-worker bound (the parent's wall-clock killer still bounds the
+    /// child). `Some(0.0)` expires immediately — the deterministic hook
+    /// tests use.
+    pub time_limit_secs: Option<f64>,
 }
 
 /// Parent → child: reply to a source request.
@@ -512,15 +544,15 @@ fn worker_stdlib() -> mlua::StdLib {
         | mlua::StdLib::MATH
 }
 
-fn set_rlimits() -> Result<(), String> {
+fn set_rlimits(cpu_secs: u64) -> Result<(), String> {
     use libc::{rlimit, setrlimit, RLIMIT_AS, RLIMIT_CPU, RLIMIT_FSIZE, RLIMIT_NOFILE};
     let mem = rlimit {
         rlim_cur: RLIMIT_AS_BYTES,
         rlim_max: RLIMIT_AS_BYTES,
     };
     let cpu = rlimit {
-        rlim_cur: RLIMIT_CPU_SECS,
-        rlim_max: RLIMIT_CPU_SECS,
+        rlim_cur: cpu_secs,
+        rlim_max: cpu_secs,
     };
     let fsize = rlimit {
         rlim_cur: 0,
@@ -875,7 +907,7 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
 /// Entry point for `shuttle __eval-worker`. Reads one JSON request from
 /// stdin, evaluates, writes one JSON outcome to stdout, exits.
 pub fn worker_main() -> miette::Result<()> {
-    if let Err(e) = set_rlimits() {
+    if let Err(e) = set_rlimits(RLIMIT_CPU_SECS) {
         eprintln!("eval worker: {e}");
         std::process::exit(1);
     }
@@ -897,9 +929,255 @@ pub fn worker_main() -> miette::Result<()> {
 
 use miette::{IntoDiagnostic as _, WrapErr as _};
 
+// ── Check worker (strict-analyzer stage subprocess) ──
+
+/// Wall-clock bound on the `__check-worker` child. Sits above
+/// [`crate::analysis::ANALYZER_TIME_LIMIT_SECS`] (10s) so the analyzer's own
+/// bound normally fires first with the clean `analysis timed out after 10s`
+/// diagnostic; the killer is the backstop for a child the in-worker bound
+/// cannot stop (e.g. wedged in the parser).
+pub const CHECK_WALL_DEADLINE: Duration = Duration::from_secs(12);
+/// CPU rlimit for the check worker. The analyzer is CPU-bound and allowed
+/// 10s of solver time, so the CPU cap (15s) sits above the wall-clock
+/// deadline: the wall-clock killer and the in-worker 10s bound are the
+/// operative limits, and SIGKILL-by-rlimit only fires if the killer thread
+/// itself failed.
+const CHECK_RLIMIT_CPU_SECS: u64 = 15;
+
+/// Child → parent: the check outcome (the worker's diagnostics array,
+/// already normalized by `check_bounded` — a fired analyzer time limit
+/// comes back as the single `analysis timed out` diagnostic).
+pub type CheckOutcome = Vec<crate::analysis::Diagnostic>;
+
+/// Full parent-side result of one check-worker run (containment evidence
+/// and tests).
+pub struct CheckRun {
+    pub status: RunStatus,
+    pub wall_ms: f64,
+    pub outcome: Option<CheckOutcome>,
+}
+
+/// Spawn the check worker, ship the request, enforce the wall-clock
+/// deadline. Mirrors [`run_eval_raw`] minus the require-serving loop: the
+/// check worker receives every module source in the request and opens no
+/// files, so the protocol is strictly one request line in, one outcome line
+/// out. The parent survives every child death and returns a clean error
+/// instead.
+pub fn run_check_raw(req: &CheckRequest) -> miette::Result<CheckRun> {
+    let start = Instant::now();
+    // cwd is an empty scratch dir — same hygiene as the eval worker.
+    let scratch = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create check scratch dir: {e}"))?;
+    let mut child = Command::new(worker_exe())
+        .arg("__check-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .current_dir(scratch.path())
+        .spawn()
+        .map_err(|e| {
+            miette::miette!(
+                "failed to spawn check worker at '{}': {e}",
+                worker_exe().display()
+            )
+        })?;
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let stdout = child.stdout.take().expect("child stdout");
+
+    if let Err(e) = write_line(&mut stdin, req) {
+        // Reap the child so a failed ship can't leave a zombie behind.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(miette::miette!(
+            "failed to ship check request to worker: {e}"
+        ));
+    }
+    // The child reads exactly one line and answers once.
+    drop(stdin);
+
+    // Wall-clock enforcer: identical pattern to the eval worker's killer.
+    let killer_child = Arc::new(Mutex::new(child));
+    let killer = {
+        let killer_child = Arc::clone(&killer_child);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + CHECK_WALL_DEADLINE;
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    if let Ok(mut c) = killer_child.lock() {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                    break;
+                }
+                if let Ok(mut c) = killer_child.lock() {
+                    if c.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20).min(deadline - now));
+            }
+        })
+    };
+
+    // Read the single outcome line.
+    let mut outcome = None;
+    let mut status = RunStatus::Ok;
+    {
+        let mut reader = BufReader::new(stdout);
+        match read_line_capped(&mut reader, MAX_LINE_BYTES) {
+            Ok(Some(line)) => match serde_json::from_slice::<CheckOutcome>(&line) {
+                Ok(diags) => outcome = Some(diags),
+                Err(_) => {
+                    status = RunStatus::BrokenPipe(
+                        "unexpected line from check worker (protocol violation)".into(),
+                    );
+                }
+            },
+            // Clean EOF: no outcome here — classify via exit status below.
+            Ok(None) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                status = RunStatus::BrokenPipe(
+                    "protocol violation: check worker sent an over-long line".into(),
+                );
+            }
+            Err(_) => {
+                status = RunStatus::BrokenPipe("read failed (child died mid-request?)".into());
+            }
+        }
+    }
+
+    if outcome.is_none() && matches!(status, RunStatus::Ok) {
+        let mut c = killer_child
+            .lock()
+            .map_err(|_| miette::miette!("check worker bookkeeping failed (mutex poisoned)"))?;
+        match c.wait() {
+            Ok(st) if st.code().is_some() => status = RunStatus::Exit(st.code().unwrap()),
+            Ok(st) => {
+                use std::os::unix::process::ExitStatusExt as _;
+                let sig = st
+                    .signal()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                status = if start.elapsed() >= CHECK_WALL_DEADLINE - Duration::from_millis(200) {
+                    RunStatus::TimedOut
+                } else {
+                    RunStatus::Signalled(format!(
+                        "signal {sig} before deadline (child died on its own)"
+                    ))
+                };
+            }
+            Err(e) => status = RunStatus::BrokenPipe(format!("wait: {e}")),
+        }
+    }
+    killer.join().unwrap_or(());
+
+    // A child death at/after the deadline IS the timeout, whatever the pipe
+    // reported first (same 200ms margin as the eval worker).
+    if outcome.is_none()
+        && !matches!(status, RunStatus::Ok)
+        && start.elapsed() >= CHECK_WALL_DEADLINE - Duration::from_millis(200)
+    {
+        status = RunStatus::TimedOut;
+    }
+
+    Ok(CheckRun {
+        status,
+        wall_ms: start.elapsed().as_secs_f64() * 1000.0,
+        outcome,
+    })
+}
+
+/// Run one strict-analyzer check in the worker. The parent always survives:
+/// contained child failures (wall-clock timeout, crash, protocol garbage)
+/// come back as fail-closed diagnostics, never as a panic or an Err. Only
+/// parent-side infrastructure failures (spawn, bookkeeping) return Err.
+pub fn run_check(req: &CheckRequest) -> miette::Result<CheckOutcome> {
+    let run = run_check_raw(req)?;
+    if let Some(diags) = run.outcome {
+        return Ok(diags);
+    }
+    let message = if matches!(run.status, RunStatus::TimedOut) {
+        format!(
+            "analysis timed out after {}s (check worker killed at the wall-clock deadline; partial results discarded)",
+            CHECK_WALL_DEADLINE.as_secs()
+        )
+    } else {
+        format!(
+            "analyzer worker failed ({}); the definition is not verified",
+            run.status.describe()
+        )
+    };
+    Ok(vec![crate::analysis::Diagnostic {
+        begin_line: 1,
+        begin_col: 1,
+        end_line: 1,
+        end_col: 0,
+        message,
+    }])
+}
+
+/// The child-side check: gate-integrity last line, seed the parent-resolved
+/// modules, run the bounded strict check.
+fn run_check_worker(req: &CheckRequest) -> CheckOutcome {
+    // A check worker must never analyze a source whose mode hot-comments
+    // downgrade the gate, even if a future parent-side caller forgets the
+    // pre-spawn scan — same shared rejection as [`crate::analysis::check_inputs`].
+    if let Some(d) = crate::analysis::mode_downgrade_diagnostic(&req.entry) {
+        return vec![d];
+    }
+    let mut checker = crate::analysis::Checker::for_definitions_with_limit(req.time_limit_secs);
+    for (name, source) in &req.sources {
+        checker.seed_module(name, source);
+    }
+    checker.check_bounded(&req.label, &req.entry)
+}
+
+/// Entry point for `shuttle __check-worker` (the strict-analyzer stage
+/// subprocess). One JSON request on stdin, one JSON diagnostics array on
+/// stdout, exit.
+pub fn check_worker_main() -> miette::Result<()> {
+    if let Err(e) = set_rlimits(CHECK_RLIMIT_CPU_SECS) {
+        eprintln!("check worker: {e}");
+        std::process::exit(1);
+    }
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .into_diagnostic()
+        .wrap_err("check worker: failed to read request")?;
+    let req: CheckRequest = serde_json::from_str(line.trim())
+        .map_err(|e| miette::miette!("check worker: bad request: {e}"))?;
+
+    let outcome = run_check_worker(&req);
+    let mut out = std::io::stdout().lock();
+    write_line(&mut out, &outcome)
+        .map_err(|e| miette::miette!("check worker: failed to write outcome: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vm_memory_limit_stays_128mb_below_rlimit_as() {
+        // Regression: at VM_MEMORY_LIMIT == RLIMIT_AS the Rust/C++ base
+        // memory plus a full VM heap tripped RLIMIT_AS first, so the clean
+        // Luau "not enough memory" error path was dead code. The VM cap
+        // must leave headroom under the rlimit.
+        assert_eq!(VM_MEMORY_LIMIT, 384 * 1024 * 1024);
+        assert_eq!(RLIMIT_AS_BYTES - VM_MEMORY_LIMIT as u64, 128 * 1024 * 1024);
+        // The check worker's wall-clock deadline must sit above the
+        // analyzer's own bound so the clean in-worker timeout normally wins.
+        assert!(
+            CHECK_WALL_DEADLINE
+                > std::time::Duration::from_secs_f64(crate::analysis::ANALYZER_TIME_LIMIT_SECS),
+            "wall-clock killer must be the backstop, not the primary bound"
+        );
+    }
 
     fn resolver_with_root(dir: &std::path::Path) -> SourceResolver {
         SourceResolver {

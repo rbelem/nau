@@ -34,12 +34,12 @@ fn main() -> miette::Result<()> {
             // If --file is default and doesn't exist, try output_name as package name
             let file = if file == "shuttle.lua" && !Path::new("shuttle.lua").exists() {
                 if let Some(ref name) = output_name {
-                    resolve_file(name)
+                    resolve_file(name)?
                 } else {
                     file
                 }
             } else {
-                resolve_file(&file)
+                resolve_file(&file)?
             };
             // If file came from embedded resolution, the positional arg was
             // used as the package name, not as an output filter.
@@ -137,6 +137,8 @@ fn main() -> miette::Result<()> {
         Command::Cache(sub) => cmd_cache(sub),
 
         Command::EvalWorker => shuttle::isolate::worker_main(),
+
+        Command::CheckWorker => shuttle::isolate::check_worker_main(),
     }
 }
 
@@ -144,23 +146,22 @@ fn main() -> miette::Result<()> {
 // If file doesn't exist on disk, try resolving as a package name from
 // local pkgs/ or from initialized input sources.
 
-fn resolve_file(file: &str) -> String {
+fn resolve_file(file: &str) -> miette::Result<String> {
     if Path::new(file).exists() {
-        return file.to_string();
+        return Ok(file.to_string());
     }
     match shuttle::pkg_source::resolve_pkg(file) {
-        shuttle::pkg_source::PkgResult::File(path) => {
-            eprintln!("  ℹ resolved '{}' to {}", file, path);
-            path
-        }
+        shuttle::pkg_source::PkgResult::File(path) => Ok(path),
         shuttle::pkg_source::PkgResult::Found { path, content } => {
             eprintln!("  ℹ using package '{}' ({})", file, path);
-            // Write to temp file for evaluation (Lua needs a real file for require())
-            let tmp = std::env::temp_dir().join(format!("shuttle-{}.lua", file));
-            let _ = std::fs::write(&tmp, &content);
-            tmp.to_string_lossy().to_string()
+            // Materialize into a fresh private temp dir (never the shared,
+            // predictable $TMPDIR): the definition path's parent becomes the
+            // eval/check resolver's allowlisted root, so it must be this
+            // invocation's private directory only — never /tmp.
+            let tmp = shuttle::pkg_source::materialize_embedded(&content)?;
+            Ok(tmp.to_string_lossy().to_string())
         }
-        shuttle::pkg_source::PkgResult::NotFound => file.to_string(),
+        shuttle::pkg_source::PkgResult::NotFound => Ok(file.to_string()),
     }
 }
 
@@ -265,7 +266,7 @@ fn cmd_build(
     let default_inputs = default_input_map();
     let lockfile = prepare_inputs(&default_inputs, &lockfile_path, update.as_deref(), offline)?;
     shuttle::pkg_source::init_global_inputs_with(&default_inputs, &lockfile.inputs, offline)?;
-    let file = resolve_file(&file);
+    let file = resolve_file(&file)?;
     let all_outputs = evaluate_file_or_embedded(&file).map_err(|e| match &direct_eval_error {
         Some(first) => miette::miette!(
             "evaluating '{}' failed: {first}; fallback resolution of '{}' also failed: {e:#}",
@@ -826,7 +827,7 @@ fn persist_new_sources(
 fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Result<()> {
     // Initialize global inputs (default if no config)
     shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
-    let file = resolve_file(file);
+    let file = resolve_file(file)?;
     let all_outputs = evaluate_file_or_embedded(&file)?;
 
     let iter: Vec<&shuttle::snap::SnapMeta> = match output_name {
@@ -1009,7 +1010,7 @@ fn cmd_image(
     json: bool,
 ) -> miette::Result<()> {
     shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
-    let file = resolve_file(&file);
+    let file = resolve_file(&file)?;
 
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
@@ -1165,13 +1166,13 @@ fn cmd_doctor() -> miette::Result<()> {
 // ── Check command ──
 
 /// `shuttle check`: run one definition through the analyzer gate first
-/// (ADR-0010 Decision 2 — in-process `--!strict` type checking under a
-/// 10s wall-clock bound that fails closed with an `analysis timed out`
-/// diagnostic; fast fail with spanned diagnostics before any subprocess
-/// work), then the existing bounded subprocess eval + Rust-side schema
-/// validation (Decisions 3-5). Deterministic, no build, no store access —
-/// the AI feedback-loop entry point. Exits 1 when the definition has any
-/// problem.
+/// (ADR-0010 Decision 2 — `--!strict` type checking in the bounded
+/// `__check-worker` subprocess, fail-closed on timeout with a single
+/// `analysis timed out` diagnostic; fast fail with spanned diagnostics
+/// before any eval work), then the existing bounded subprocess eval +
+/// Rust-side schema validation (Decisions 3-5). Deterministic, no build, no
+/// store access — the AI feedback-loop entry point. Exits 1 when the
+/// definition has any problem.
 fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
     // Stage 1 — analyzer gate. A definition that does not type-check never
     // reaches the eval stage.

@@ -219,6 +219,13 @@ pub enum Command {
     /// (ADR-0010 Decisions 4+5). Not part of the public CLI.
     #[command(name = "__eval-worker", hide = true)]
     EvalWorker,
+
+    /// Internal: analyzer worker process (hidden). Re-executed by the parent
+    /// to run the strict-analyzer gate over untrusted definitions in a
+    /// bounded subprocess (containment parity with `__eval-worker`). Not
+    /// part of the public CLI.
+    #[command(name = "__check-worker", hide = true)]
+    CheckWorker,
 }
 
 /// Subcommands for `shuttle cache`.

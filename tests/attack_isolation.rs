@@ -1,11 +1,11 @@
-//! THROWAWAY adversarial probes for the eval-isolation implementation.
-//! Run with: cargo test --test attack_tmp -- --nocapture
-//! Deleted after the audit; NOT part of the suite.
+//! Adversarial probes for the isolation boundaries (eval + analyzer
+//! subprocesses). Every test asserts the same core property: the PARENT
+//! survives and fails closed.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use shuttle::isolate::{self, EvalRequest, SourceResolver, WorkerOutcome};
+use shuttle::isolate::{self, CheckRequest, EvalRequest, SourceResolver, WorkerOutcome};
 
 fn request(label: &str, source: &str) -> EvalRequest {
     EvalRequest {
@@ -589,4 +589,174 @@ fn attack_resolver_hostile_names() {
         assert!(res.is_err(), "name {bad:?} must not resolve");
         eprintln!("[INFO] resolve({bad:?}) = {:?}", res.unwrap_err());
     }
+}
+
+// ── Analyzer-stage probes (`__check-worker`) ──
+
+fn check_request(label: &str, source: &str) -> CheckRequest {
+    CheckRequest {
+        label: label.to_string(),
+        entry: source.to_string(),
+        sources: BTreeMap::new(),
+        time_limit_secs: Some(shuttle::analysis::ANALYZER_TIME_LIMIT_SECS),
+    }
+}
+
+/// A deep local-variable nesting chain: Luau's complexity guard must reject
+/// it with a diagnostic, quickly, without wedging or OOM-ing either side.
+#[test]
+fn attack_analyzer_nesting_bomb_is_contained() {
+    let depth = 20_000;
+    let mut src = String::with_capacity(depth * 20);
+    src.push_str("local t0 = {}\n");
+    for i in 1..depth {
+        src.push_str(&format!("local t{i} = {{ t{} }}\n", i - 1));
+    }
+    src.push_str(&format!("return {{ v = t{} ~= nil }}\n", depth - 1));
+
+    let start = Instant::now();
+    let run = isolate::run_check_raw(&check_request("attack-type-bomb", &src))
+        .expect("PARENT MUST SURVIVE the analyzer nesting bomb");
+    let elapsed = start.elapsed();
+    eprintln!(
+        "[INFO] nesting bomb: status={}, wall={elapsed:?}, diags={}",
+        run.status.describe(),
+        run.outcome.as_ref().map(|d| d.len()).unwrap_or(0)
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "parent must regain control quickly, took {elapsed:?}"
+    );
+    let diags = run
+        .outcome
+        .expect("worker must answer (or the killer must classify) — never hang");
+    assert!(
+        !diags.is_empty(),
+        "fail closed: a nesting bomb must yield a diagnostic, never a pass"
+    );
+}
+
+/// A source that genuinely burns analyzer-solver time (hundreds of thousands
+/// of field assignments): with an injected 0.5s per-module bound, the
+/// in-worker `moduleTimeLimitSec` must abort it mid-flight and the parent
+/// must see exactly one fail-closed timeout diagnostic — no partial results.
+#[test]
+fn attack_analyzer_time_bomb_abort_mid_flight() {
+    let n = 400_000;
+    let mut src = String::with_capacity(n * 20 + 32);
+    src.push_str("local t = {}\n");
+    for i in 0..n {
+        src.push_str(&format!("t.f{i} = '{i}'\n"));
+    }
+    src.push_str("return { v = t.f0 ~= nil }\n");
+
+    let mut req = check_request("attack-time-bomb", &src);
+    // 0.5s << the ~9s this source needs on the reference debug build, so the
+    // in-worker bound (not the parent killer) fires on any plausible machine.
+    req.time_limit_secs = Some(0.5);
+
+    let start = Instant::now();
+    let diags = isolate::run_check(&req).expect("PARENT MUST SURVIVE the analyzer time bomb");
+    let elapsed = start.elapsed();
+    eprintln!(
+        "[INFO] time bomb aborted in {elapsed:?} with {} diag(s)",
+        diags.len()
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "parent must regain control quickly, took {elapsed:?}"
+    );
+    assert_eq!(
+        diags.len(),
+        1,
+        "partial results must be discarded for one timeout diagnostic: {diags:?}"
+    );
+    assert!(
+        diags[0].message.contains("analysis timed out after 0.5s"),
+        "got: {:?}",
+        diags[0].message
+    );
+}
+
+/// The in-worker immediate-expiry bound through the real subprocess: the
+/// timeout reaches the parent as ONE diagnostic and nothing else.
+#[test]
+fn attack_worker_timeout_is_single_fail_closed_diagnostic() {
+    let mut req = check_request("attack-check-timeout", "return { v = 1 }");
+    req.time_limit_secs = Some(0.0);
+    let diags = isolate::run_check(&req).expect("parent must survive");
+    assert_eq!(diags.len(), 1, "exactly one diagnostic: {diags:?}");
+    assert!(
+        diags[0].message.contains("analysis timed out after 0s"),
+        "got: {:?}",
+        diags[0].message
+    );
+}
+
+/// A hot-comment downgrade attempt must be rejected by the worker itself
+/// (the child-side last-line check), even when the request arrives without
+/// the parent-side pre-spawn scan.
+#[test]
+fn attack_hot_comment_downgrade_rejected_through_worker() {
+    let diags = isolate::run_check(&check_request(
+        "attack-hot-comment",
+        "--!nonstrict\nreturn { default = snap { name = \"x\", version = \"1\" } }",
+    ))
+    .expect("parent must survive");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0].message.contains("nonstrict") && diags[0].message.contains("host-controlled"),
+        "got: {:?}",
+        diags[0].message
+    );
+}
+
+/// Regression (resolver-root containment): an embedded package's definition
+/// is materialized into a fresh private tempdir, and that dir — never /tmp —
+/// must be the only allowlisted resolver root derived from it. A decoy world-
+/// writable file sitting in /tmp must NOT be require()-able.
+#[test]
+fn attack_embedded_pkg_resolver_root_is_private_tmpdir_not_tmp() {
+    let label = shuttle::pkg_source::materialize_embedded(
+        "return { default = snap { name = \"embedded\", version = \"1\" } }",
+    )
+    .expect("embedded materialization must succeed");
+    let label = label.to_str().unwrap();
+    let parent = std::path::Path::new(label)
+        .parent()
+        .expect("definition must live inside the private tempdir");
+    assert!(
+        parent.starts_with(std::env::temp_dir()),
+        "materialization lives under the system temp dir: {label}"
+    );
+    assert_ne!(
+        parent.canonicalize().unwrap(),
+        std::env::temp_dir().canonicalize().unwrap(),
+        "the resolver root must be a private dir, NEVER /tmp itself"
+    );
+
+    let resolver = SourceResolver::for_build(label);
+
+    // The private tempdir IS the root: a sibling module resolves.
+    std::fs::write(parent.join("helper.lua"), "return { v = 7 }").unwrap();
+    assert!(
+        resolver.resolve("helper").is_ok(),
+        "sibling modules inside the private tempdir must resolve"
+    );
+
+    // /tmp is NOT a root: a world-writable decoy sitting there must not be
+    // reachable, even though it exists and the name is well-formed.
+    let stem = format!("zzz-embedded-decoy-{}", std::process::id());
+    std::fs::write(
+        std::env::temp_dir().join(format!("{stem}.lua")),
+        "return { leaked = 'PASSWORD' }",
+    )
+    .unwrap();
+    let err = resolver
+        .resolve(&stem)
+        .expect_err("/tmp itself must not be an allowlisted root for embedded packages");
+    assert!(
+        err.contains("not found in allowlisted roots"),
+        "decoy must fall through the allowlist, got: {err}"
+    );
 }

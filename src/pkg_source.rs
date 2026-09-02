@@ -569,6 +569,49 @@ pub fn resolve_pkg(name: &str) -> PkgResult {
     PkgResult::NotFound
 }
 
+/// Materialize an embedded package's source into a fresh, unpredictable,
+/// private temp dir and return the definition path inside it.
+///
+/// Security (resolver-root containment): the returned definition path
+/// doubles as the eval/check stages' resolver entry, and
+/// `SourceResolver::for_build` allowlists the entry file's parent — so the
+/// write target determines the whole require() attack surface. The old
+/// predictable, world-writable `$TMPDIR/shuttle-<name>.lua` made that root
+/// `/tmp` itself, letting `require("anything")` read any `/tmp/*.lua` into
+/// eval. Here the tempdir is fresh and mode 0700 (created by `tempfile`),
+/// and the definition is created with `create_new` so a pre-planted symlink
+/// can never be followed — the resolver root becomes this invocation's
+/// private directory ONLY, never `/tmp`.
+///
+/// The tempdir handle is kept alive for the process lifetime: dropping it
+/// would unlink the definition out from under the eval/check stages.
+pub fn materialize_embedded(content: &str) -> miette::Result<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let dir = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create embedded-package temp dir: {e}"))?;
+    let path = dir.path().join("shuttle.lua");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| miette::miette!("failed to create {}: {e}", path.display()))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| miette::miette!("failed to write {}: {e}", path.display()))?;
+
+    EMBEDDED_TEMPDIRS
+        .lock()
+        .map_err(|e| miette::miette!("embedded temp dir registry poisoned: {e}"))?
+        .push(dir);
+    Ok(path)
+}
+
+/// Embedded-package materializations kept alive for the process lifetime
+/// (see [`materialize_embedded`]).
+static EMBEDDED_TEMPDIRS: Mutex<Vec<tempfile::TempDir>> = Mutex::new(Vec::new());
+
 /// Resolve a package name to a filesystem path (for non-Lua resolution).
 /// Follows the same lookup order as `resolve_pkg` but returns a path only,
 /// without loading content.
