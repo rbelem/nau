@@ -16,6 +16,14 @@ to run builds as fast as possible.]],
         type = "source",
         requires = {},
         source = { url = "https://github.com/ninja-build/ninja/archive/refs/tags/v1.12.1.tar.gz" },
-        build = "cmake -B build -DCMAKE_INSTALL_PREFIX=/usr && cmake --build build && DESTDIR=$STAGE cmake --install build",
+        parts = {
+            ninja = {
+                plugin = "cmake",
+                -- The sandbox has no network; without this ninja's CMake
+                -- FetchContent tries to download googletest at build time.
+                -- Tests are not installed into the snap anyway.
+                options = { defines = { BUILD_TESTING = "OFF" } },
+            },
+        },
     },
 }

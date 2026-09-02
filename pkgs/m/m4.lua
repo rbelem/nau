@@ -16,6 +16,8 @@ Autoconf and other GNU build tools depend on M4 for macro expansion.]],
         type = "source",
         requires = {},
         source = { url = "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz" },
-        build = "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
+        parts = {
+            m4 = { plugin = "autotools" },
+        },
     },
 }

@@ -23,6 +23,20 @@ return {
         source = {
             url = "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz",
         },
-        build = "make -f Makefile-libbz2_so && make && make install PREFIX=$STAGE/usr",
+        -- Split of the original compound build into ordered parts: the
+        -- shared object library first, then the tools, then install.
+        -- All parts share $SRC; every command targets it with -C because
+        -- part work dirs start empty.
+        parts = {
+            ["shared-lib"] = { build = "make -C $SRC -f Makefile-libbz2_so" },
+            tools = {
+                build = "make -C $SRC",
+                after = { "shared-lib" },
+            },
+            install = {
+                build = "make -C $SRC install PREFIX=$STAGE/usr",
+                after = { "tools" },
+            },
+        },
     },
 }

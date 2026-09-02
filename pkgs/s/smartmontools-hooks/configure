@@ -1,0 +1,8 @@
+#!/bin/sh
+# configure hook for the smartmontools snap: seed the state directory.
+#
+# /var/lib/smartmontools is layout-bound to $SNAP_DATA/var/lib/smartmontools
+# (see smartmontools.lua); snapd creates $SNAP_DATA itself but not the
+# nested state dir smartd expects to own. Runs on install and every
+# `snap set` change.
+mkdir -p "$SNAP_DATA/var/lib/smartmontools"

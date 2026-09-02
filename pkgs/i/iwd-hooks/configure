@@ -1,0 +1,7 @@
+#!/bin/sh
+# configure hook for the iwd snap: seed the state directory.
+#
+# /var/lib/iwd is layout-bound to $SNAP_DATA/var/lib/iwd (see iwd.lua);
+# snapd creates $SNAP_DATA itself but not the nested path iwd expects to
+# own for network profiles. Runs on install and every `snap set` change.
+mkdir -p "$SNAP_DATA/var/lib/iwd"
