@@ -19,9 +19,13 @@ pub enum Command {
         #[arg(short, long, default_value = "shuttle.lua")]
         file: String,
 
-        /// Directory containing pre-built binaries (default: ./stage/)
-        #[arg(short, long, default_value = "./stage/")]
-        stage: String,
+        /// Directory containing pre-built binaries (default: ./stage/).
+        /// The default ./stage/ is shuttle-managed: wiped before every
+        /// build phase so stale files cannot leak into a snap. A directory
+        /// passed explicitly via --stage is never wiped — it must be empty
+        /// (or new), or the build is refused.
+        #[arg(short, long)]
+        stage: Option<String>,
 
         /// Output directory for the .snap file (default: current dir)
         #[arg(short, long, default_value = ".")]
@@ -337,7 +341,9 @@ mod tests {
                 ..
             } => {
                 assert_eq!(file, "shuttle.lua");
-                assert_eq!(stage, "./stage/");
+                // No --stage flag: default stage, tracked as None so the
+                // build knows it may wipe shuttle's own ./stage/.
+                assert_eq!(stage, None);
                 assert_eq!(output, ".");
                 assert!(arch.is_empty());
                 assert!(output_name.is_none());
@@ -373,7 +379,7 @@ mod tests {
             "/tmp/out",
         ]) {
             Command::Build { stage, output, .. } => {
-                assert_eq!(stage, "/tmp/stage");
+                assert_eq!(stage, Some("/tmp/stage".to_string()));
                 assert_eq!(output, "/tmp/out");
             }
             _ => panic!("expected Build"),

@@ -189,7 +189,7 @@ fn parse_size(input: &str) -> Option<u64> {
 #[allow(clippy::too_many_arguments)]
 fn cmd_build(
     file: String,
-    stage: String,
+    stage: Option<String>,
     output: String,
     arch: Vec<String>,
     output_name: Option<String>,
@@ -406,12 +406,31 @@ fn dep_fully_cached(
         .all(|a| cache.lookup(dep_meta, a, closure).is_some())
 }
 
+/// Resolve the `--stage` CLI flag into (path, policy) and enforce the
+/// explicit-stage precondition: a user-chosen directory that already has
+/// contents is refused up front — never wiped.
+fn resolve_stage(
+    stage: Option<String>,
+) -> miette::Result<(std::path::PathBuf, shuttle::snap::StagePolicy)> {
+    match stage {
+        Some(path) => {
+            let policy = shuttle::snap::StagePolicy::Explicit;
+            shuttle::snap::check_explicit_stage(Path::new(&path))?;
+            Ok((std::path::PathBuf::from(path), policy))
+        }
+        None => Ok((
+            std::path::PathBuf::from("./stage/"),
+            shuttle::snap::StagePolicy::Default,
+        )),
+    }
+}
+
 /// Inner build logic after outputs are resolved.
 #[allow(clippy::too_many_arguments)]
 fn run_build(
     all_outputs: shuttle::lua::Outputs,
     file: String,
-    stage: String,
+    stage: Option<String>,
     output: String,
     arch: Vec<String>,
     output_name: Option<String>,
@@ -435,7 +454,11 @@ fn run_build(
         inputs: HashMap::new(),
     });
 
-    let stage_dir = std::path::Path::new(&stage);
+    // Stage policy: an explicitly passed --stage belongs to the user — it
+    // must be empty to start and is never wiped. The default ./stage/ is
+    // shuttle-managed scratch, wiped before every build phase (snap.rs).
+    let (stage_path, stage_policy) = resolve_stage(stage)?;
+    let stage_dir = std::path::Path::new(&stage_path);
     let output_dir = std::path::Path::new(&output);
 
     // Initialize binary cache if --cache was specified or --all is set
@@ -550,13 +573,20 @@ fn run_build(
 
                 let dep_archs = shuttle::snap::resolve_archs(&dep_meta, &arch);
                 for a in &dep_archs {
+                    shuttle::snap::check_cross_build(a, dep_meta.target.as_deref())?;
                     if !json {
                         shuttle::output::status(format!("building {} ({})...", dep_name, a));
                     }
                     let dep_stage = tempfile::tempdir()
                         .map_err(|e| miette::miette!("failed to create temp stage: {}", e))?;
 
-                    match shuttle::snap::build_snap(&dep_meta, dep_stage.path(), output_dir, a) {
+                    match shuttle::snap::build_snap(
+                        &dep_meta,
+                        dep_stage.path(),
+                        output_dir,
+                        a,
+                        shuttle::snap::StagePolicy::Default,
+                    ) {
                         Ok(result) => {
                             if !json {
                                 shuttle::output::ok(&result.snap_filename);
@@ -591,6 +621,7 @@ fn run_build(
         }
 
         for a in &archs {
+            shuttle::snap::check_cross_build(a, meta.target.as_deref())?;
             if !json {
                 shuttle::output::status(format!("{}/{}:", name, a));
             }
@@ -601,7 +632,7 @@ fn run_build(
                 }
             }
 
-            let result = shuttle::snap::build_snap(meta, stage_dir, output_dir, a)?;
+            let result = shuttle::snap::build_snap(meta, stage_dir, output_dir, a, stage_policy)?;
             if !json {
                 shuttle::output::ok(&result.snap_filename);
             } else {
@@ -969,17 +1000,22 @@ fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
     }
     let ok = checked.as_ref().is_some_and(|c| c.error.is_none()) && diagnostics.is_empty();
 
-    let outputs: Vec<String> = checked
+    let outputs: Vec<(String, String)> = checked
         .as_ref()
         .map(|c| {
-            let mut names: Vec<String> = c.outputs.keys().cloned().collect();
-            names.sort();
-            names
+            let mut pairs: Vec<(String, String)> = c
+                .outputs
+                .iter()
+                .map(|(name, meta)| (name.clone(), meta.version.clone()))
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            pairs
         })
         .unwrap_or_default();
 
     if json {
-        report_check_json(file, &outputs, &diagnostics);
+        let names: Vec<String> = outputs.iter().map(|(n, _)| n.clone()).collect();
+        report_check_json(file, &names, &diagnostics);
     } else if ok {
         report_check_ok(&outputs);
     } else {
@@ -1032,13 +1068,23 @@ fn report_check_json(
     );
 }
 
-fn report_check_ok(outputs: &[String]) {
+/// Success message for `shuttle check` — each output shown with its
+/// version so the declared identity is visible, not just the name.
+fn check_ok_message(outputs: &[(String, String)]) -> String {
     let list = if outputs.is_empty() {
         String::new()
     } else {
-        format!(": {}", outputs.join(", "))
+        let items: Vec<String> = outputs
+            .iter()
+            .map(|(name, version)| format!("{name} {version}"))
+            .collect();
+        format!(": {}", items.join(", "))
     };
-    shuttle::output::ok(format!("ok: {} output(s){list}", outputs.len()));
+    format!("ok: {} output(s){list}", outputs.len())
+}
+
+fn report_check_ok(outputs: &[(String, String)]) {
+    shuttle::output::ok(check_ok_message(outputs));
 }
 
 fn report_check_diagnostic(d: &shuttle::lua::CheckDiagnostic) {
@@ -1397,4 +1443,22 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_ok_message_prints_identity() {
+        let outputs = vec![
+            ("bzip2".to_string(), "1.0.8".to_string()),
+            ("hello".to_string(), "2.10".to_string()),
+        ];
+        assert_eq!(
+            check_ok_message(&outputs),
+            "ok: 2 output(s): bzip2 1.0.8, hello 2.10"
+        );
+        assert_eq!(check_ok_message(&[]), "ok: 0 output(s)");
+    }
 }

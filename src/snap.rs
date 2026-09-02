@@ -131,7 +131,11 @@ pub struct SnapMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Source identity (URL + optional pinned hash). Build-time only —
+    /// snapd's snap.yaml schema has no top-level `source:` key, so emitting
+    /// it risks rejecting the snap. Identity lives in the lockfile
+    /// (`sources:`) and the binary-cache closure instead.
+    #[serde(skip)]
     pub source: Option<SourceSpec>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1149,22 +1153,139 @@ impl SnapMeta {
 
 // ── Phase 5/6: Snap directory assembly + SquashFS packaging ──
 
+/// Who owns the stage directory for a build.
+///
+/// Tracks whether `--stage` was passed explicitly (the CLI flag is
+/// `Option<String>`; `None` means shuttle's default `./stage/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagePolicy {
+    /// No `--stage` flag: the stage is shuttle-owned scratch space. Its
+    /// contents are wiped whenever a build phase is about to populate it,
+    /// so leftovers from previous builds can never leak into a new snap.
+    /// (A build-less snap — pre-built binaries staged by hand — never
+    /// reaches the wipe: its stage is the input, not an output.)
+    Default,
+    /// `--stage` passed explicitly: the directory belongs to the user and
+    /// is never wiped. It must be empty (or new) to start; `shuttle build`
+    /// refuses up front otherwise — see [`check_explicit_stage`].
+    Explicit,
+}
+
+/// One-time guard at the start of `shuttle build`: an explicitly passed
+/// `--stage` directory that already exists and is non-empty is refused.
+/// shuttle never deletes a user-chosen directory.
+pub fn check_explicit_stage(stage_dir: &Path) -> miette::Result<()> {
+    let nonempty = stage_dir.exists()
+        && std::fs::read_dir(stage_dir)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+    if nonempty {
+        return Err(miette::miette!(
+            "stage directory '{}' exists and is not empty — refusing to build. \
+             shuttle never deletes a directory passed via --stage; pass a fresh \
+             (empty or new) directory, or omit --stage to let shuttle wipe and \
+             manage its default './stage/' automatically.",
+            stage_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Wipe and recreate the shuttle-owned default stage. Only called right
+/// before a build phase populates it.
+fn clear_stage_dir(stage_dir: &Path) -> miette::Result<()> {
+    if stage_dir.exists() {
+        std::fs::remove_dir_all(stage_dir).map_err(|e| {
+            miette::miette!("failed to clear stage dir {}: {}", stage_dir.display(), e)
+        })?;
+    }
+    std::fs::create_dir_all(stage_dir)
+        .map_err(|e| miette::miette!("failed to create stage dir {}: {}", stage_dir.display(), e))
+}
+
+/// Host architecture in snapd naming ("amd64", "arm64", …). Rust's
+/// `consts::ARCH` passes through unchanged for other targets.
+pub fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Leading-component architecture of a GNU target triplet.
+/// "aarch64-linux-gnu" → Some("arm64"), "x86_64-linux-gnu" → Some("amd64"),
+/// "arm-linux-gnueabihf" → Some("armhf"). Unknown vendor/OS suffixes are not
+/// interpreted: the first component maps by the rules above, else identity.
+fn triplet_arch(triplet: &str) -> Option<&str> {
+    let first = triplet.split('-').next()?;
+    match first {
+        "x86_64" | "amd64" => Some("amd64"),
+        "aarch64" | "arm64" => Some("arm64"),
+        "arm" => Some("armhf"),
+        other => Some(other),
+    }
+}
+
+/// Refuse builds whose requested architecture cannot be produced honestly.
+///
+/// Building for a foreign arch without a cross toolchain silently produces
+/// `arm64`-named snaps full of host binaries. Allowed when:
+/// * the arch is `"all"` (arch-independent), or
+/// * it matches the host arch, or
+/// * a cross toolchain is configured for exactly that arch (a `--target`
+///   triplet — or the snap's own `target` field — whose leading component
+///   names the requested arch).
+pub fn check_cross_build(arch: &str, target: Option<&str>) -> miette::Result<()> {
+    if arch == "all" || arch == host_arch() {
+        return Ok(());
+    }
+    if target.is_some_and(|t| triplet_arch(t) == Some(arch)) {
+        return Ok(());
+    }
+    let hint = match arch {
+        "arm64" => "aarch64-linux-gnu",
+        "amd64" => "x86_64-linux-gnu",
+        _ => "<triplet>",
+    };
+    Err(match target {
+        Some(t) => miette::miette!(
+            "refusing to build for '{arch}' on this {host} host: --target '{t}' does \
+             not select an {arch} toolchain (expected a triplet like {hint}); the \
+             build would silently pack {host} binaries into an {arch} snap",
+            host = host_arch(),
+        ),
+        None => miette::miette!(
+            "refusing to build for '{arch}' on this {host} host: no cross toolchain \
+             is configured, so the snap would silently contain {host} binaries. \
+             Pass --target <triplet> (e.g. --target {hint}) to select a cross \
+             toolchain, or build for '{host}'",
+            host = host_arch(),
+        ),
+    })
+}
+
 /// Build a `.snap` package for a single architecture.
 ///
 /// The `arch` parameter controls which architecture appears in the
 /// `meta/snap.yaml` and the output filename `{name}_{version}_{arch}.snap`.
+/// `stage_policy` selects stage hygiene: under [`StagePolicy::Default`] the
+/// stage is wiped before a build phase populates it; under
+/// [`StagePolicy::Explicit`] it is never wiped (an existing non-empty
+/// explicit stage is rejected up front by [`check_explicit_stage`]).
 /// Returns the output filename (not the full path).
 pub fn build_snap(
     meta: &SnapMeta,
     stage_dir: &Path,
     output_dir: &Path,
     arch: &str,
+    stage_policy: StagePolicy,
 ) -> miette::Result<BuildResult> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
 
     // 1. Run build phase (download source, run build command) if configured
-    let source_info = run_build(meta, stage_dir)?;
+    let source_info = run_build(meta, stage_dir, stage_policy)?;
 
     // Clone meta with architecture filtered to the target arch
     let mut arch_meta = meta.clone();
@@ -1253,7 +1374,11 @@ const SOURCE_DIR_NAME: &str = "source";
 /// all installing into the shared stage.
 ///
 /// Returns `SourceInfo` with the computed SHA-256 if a source was downloaded.
-fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceInfo>> {
+fn run_build(
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    stage_policy: StagePolicy,
+) -> miette::Result<Option<SourceInfo>> {
     // Build plan: `parts` and `build` are mutually exclusive (the DSL
     // enforces this; re-checked here for non-DSL constructors).
     match (&meta.parts, &meta.build) {
@@ -1372,7 +1497,14 @@ fn run_build(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<Option<SourceI
     // part in multi-part mode.
     let src_root = find_source_root(&extract_dir).unwrap_or_else(|| extract_dir.clone());
 
-    // 6. Create stage dir and run the build plan
+    // 6. Create stage dir and run the build plan. Stage hygiene: the
+    // default stage is shuttle-owned scratch — wipe it so leftovers from
+    // previous builds can never leak into this snap (observed: pciutils
+    // files inside a bzip2 snap). An explicit --stage belongs to the user:
+    // it was verified empty before the build started and is never wiped.
+    if stage_policy == StagePolicy::Default {
+        clear_stage_dir(stage_dir)?;
+    }
     std::fs::create_dir_all(stage_dir)
         .map_err(|e| miette::miette!("failed to create stage dir: {}", e))?;
 
@@ -1589,6 +1721,7 @@ fn run_build_command(
             part_name, extra_env,
         )
     } else {
+        output::warn("sandbox unavailable — building WITHOUT isolation");
         run_direct(
             cmd, work_dir, src_dir, stage_dir, &cross_env, part_name, extra_env,
         )
@@ -2261,7 +2394,13 @@ mod tests {
         let stage_dir = std::path::Path::new("test-fixtures");
         let output_dir = tempfile::tempdir().unwrap();
 
-        let result = build_snap(&meta, stage_dir, output_dir.path(), "amd64");
+        let result = build_snap(
+            &meta,
+            stage_dir,
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Default,
+        );
         assert!(result.is_ok());
 
         let build_result = result.unwrap();
@@ -2316,12 +2455,26 @@ mod tests {
         let stage_dir = std::path::Path::new("test-fixtures");
 
         // Build amd64
-        let snap_amd64 = build_snap(&meta, stage_dir, output_dir.path(), "amd64").unwrap();
+        let snap_amd64 = build_snap(
+            &meta,
+            stage_dir,
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Default,
+        )
+        .unwrap();
         assert_eq!(snap_amd64.snap_filename, "multi-test_2.0_amd64.snap");
         assert!(output_dir.path().join(&snap_amd64.snap_filename).exists());
 
         // Build arm64
-        let snap_arm64 = build_snap(&meta, stage_dir, output_dir.path(), "arm64").unwrap();
+        let snap_arm64 = build_snap(
+            &meta,
+            stage_dir,
+            output_dir.path(),
+            "arm64",
+            StagePolicy::Default,
+        )
+        .unwrap();
         assert_eq!(snap_arm64.snap_filename, "multi-test_2.0_arm64.snap");
         assert!(output_dir.path().join(&snap_arm64.snap_filename).exists());
 
@@ -3263,7 +3416,14 @@ mod tests {
 
         let stage_dir = tempfile::tempdir().unwrap();
         let output_dir = tempfile::tempdir().unwrap();
-        let result = build_snap(&meta, stage_dir.path(), output_dir.path(), "amd64").unwrap();
+        let result = build_snap(
+            &meta,
+            stage_dir.path(),
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Default,
+        )
+        .unwrap();
         let snap_path = output_dir.path().join(&result.snap_filename);
         assert!(snap_path.exists());
 
@@ -3746,7 +3906,7 @@ mod tests {
             },
         )]));
 
-        let err = run_build(&meta, Path::new("/nonexistent-stage"))
+        let err = run_build(&meta, Path::new("/nonexistent-stage"), StagePolicy::Default)
             .unwrap_err()
             .to_string();
         assert!(err.contains("both 'build' and 'parts'"), "got: {err}");
@@ -3769,7 +3929,7 @@ mod tests {
         meta.build = None;
         meta.parts = Some(BTreeMap::new());
 
-        let err = run_build(&meta, Path::new("/nonexistent-stage"))
+        let err = run_build(&meta, Path::new("/nonexistent-stage"), StagePolicy::Default)
             .unwrap_err()
             .to_string();
         assert!(err.contains("'parts' must not be empty"), "got: {err}");
@@ -4419,5 +4579,175 @@ fi
             "plugin part must run after the command part and see its stage output: {log}"
         );
         assert!(e2e.stage.join("usr/bin/hello").exists());
+    }
+
+    // ── Stage hygiene (stage-reuse correctness) ──
+
+    #[test]
+    fn test_clear_stage_dir_wipes_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(stage.join("usr/bin")).unwrap();
+        std::fs::write(stage.join("usr/bin/pciutils"), b"stale").unwrap();
+
+        clear_stage_dir(&stage).unwrap();
+
+        assert!(stage.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&stage).unwrap().count(),
+            0,
+            "default stage must be wiped before a build populates it"
+        );
+    }
+
+    #[test]
+    fn test_check_explicit_stage_refuses_nonempty() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("user-file"), b"precious").unwrap();
+
+        let err = check_explicit_stage(&stage).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--stage"),
+            "error should point at --stage handling: {msg}"
+        );
+        assert!(
+            stage.join("user-file").exists(),
+            "an explicit stage is never deleted"
+        );
+    }
+
+    #[test]
+    fn test_check_explicit_stage_allows_empty_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(check_explicit_stage(&empty).is_ok());
+
+        let missing = dir.path().join("missing");
+        assert!(check_explicit_stage(&missing).is_ok());
+    }
+
+    #[test]
+    fn test_buildless_snap_keeps_default_stage_contents() {
+        // A build-less snap's stage is the INPUT (pre-built binaries staged
+        // by hand) — the Default-policy wipe only fires when a build phase
+        // populates the stage, so the pre-built workflow still works.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "prebuilt",
+                    version = "1",
+                    apps = { hello = app { command = "bin/hello" } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let stage_dir = tempfile::tempdir().unwrap();
+        let bin = stage_dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("hello"), b"#!/bin/sh\necho hi\n").unwrap();
+
+        let output_dir = tempfile::tempdir().unwrap();
+        build_snap(
+            &meta,
+            stage_dir.path(),
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Default,
+        )
+        .unwrap();
+
+        assert!(
+            bin.join("hello").exists(),
+            "build-less snap must consume, not wipe, the pre-populated stage"
+        );
+    }
+
+    // ── Cross-build arch guard ──
+
+    #[test]
+    fn test_check_cross_build_allows_host_arch() {
+        assert!(check_cross_build(host_arch(), None).is_ok());
+    }
+
+    #[test]
+    fn test_check_cross_build_allows_all() {
+        assert!(check_cross_build("all", None).is_ok());
+    }
+
+    #[test]
+    fn test_check_cross_build_refuses_foreign_arch_without_target() {
+        let other = if host_arch() == "amd64" {
+            "arm64"
+        } else {
+            "amd64"
+        };
+        let err = check_cross_build(other, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--target"),
+            "error must explain the --target escape hatch: {msg}"
+        );
+        assert!(msg.contains(other));
+    }
+
+    #[test]
+    fn test_check_cross_build_allows_matching_target() {
+        assert!(check_cross_build("arm64", Some("aarch64-linux-gnu")).is_ok());
+        assert!(check_cross_build("amd64", Some("x86_64-linux-gnu")).is_ok());
+        // A target for a DIFFERENT arch does not unlock the build.
+        assert!(check_cross_build("arm64", Some("x86_64-linux-gnu")).is_err());
+    }
+
+    #[test]
+    fn test_triplet_arch_mapping() {
+        assert_eq!(triplet_arch("aarch64-linux-gnu"), Some("arm64"));
+        assert_eq!(triplet_arch("x86_64-linux-gnu"), Some("amd64"));
+        assert_eq!(triplet_arch("arm-linux-gnueabihf"), Some("armhf"));
+        assert_eq!(triplet_arch("riscv64-linux-gnu"), Some("riscv64"));
+    }
+
+    // ── snap.yaml schema honesty ──
+
+    #[test]
+    fn test_yaml_omits_top_level_source_key() {
+        // snapd's schema has no top-level `source:` key; emitting it risks
+        // rejection. Source identity lives in the lockfile/cache instead.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "s", version = "1",
+                    source = "https://example.com/pkg.tar.gz",
+                    build = "make",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert!(
+            meta.source.is_some(),
+            "source identity still tracked in meta"
+        );
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(
+            !yaml.contains("source"),
+            "snap.yaml must not carry a source key, got: {yaml}"
+        );
     }
 }
