@@ -719,7 +719,9 @@ fn build_outputs(
     for (name, meta) in iter {
         let archs = shuttle::snap::resolve_archs(meta, cli_archs);
         if !json {
-            eprintln!("Building {} ({})...", name, meta.version);
+            // adopt-info snaps show their adopted-at-build identity here,
+            // never the "0" placeholder.
+            eprintln!("Building {} ({})...", name, meta.display_version());
         }
 
         for a in &archs {
@@ -771,7 +773,9 @@ fn build_one_arch(
     } else {
         shuttle::output::record_build_result(shuttle::output::BuildResultJson {
             name: meta.name.clone(),
-            version: meta.version.clone(),
+            // The version the build actually resolved to (extracted for
+            // adopt-info snaps — never the declared placeholder).
+            version: result.version.clone(),
             arch: arch.to_string(),
             filename: result.snap_filename.clone(),
             sha256: result.source_info.as_ref().map(|s| s.sha256.clone()),
@@ -1213,7 +1217,9 @@ fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
             let mut pairs: Vec<(String, String)> = c
                 .outputs
                 .iter()
-                .map(|(name, meta)| (name.clone(), meta.version.clone()))
+                // adopt-info outputs have no version until build time — the
+                // placeholder must never read as a declared version.
+                .map(|(name, meta)| (name.clone(), meta.display_version().to_string()))
                 .collect();
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             pairs

@@ -355,6 +355,7 @@ impl PackageIndex {
             confinement: "strict".into(),
             type_: None,
             adopt_info: None,
+            version_adopted: false,
             icon_source: None,
             icon: None,
             compression: None,

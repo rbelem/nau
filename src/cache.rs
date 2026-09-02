@@ -261,6 +261,13 @@ impl PackageCache {
     ///
     /// Returns `Some(path)` if the cached snap exists, `None` otherwise.
     pub fn lookup(&self, meta: &SnapMeta, arch: &str, closure: &BuildClosure) -> Option<PathBuf> {
+        // adopt-info snaps have no version until build time: their closure
+        // key hashes the placeholder, which cannot distinguish two upstream
+        // versions behind one URL. Never serve them from cache — a
+        // placeholder-keyed hit could be a wrong-version serve.
+        if meta.adopt_info.is_some() {
+            return None;
+        }
         let cached = self
             .root
             .join(closure.cache_key())
@@ -277,15 +284,18 @@ impl PackageCache {
     /// Copies the built snap file from `result.snap_filename` (in the output
     /// directory where it was built) into the cache tree. No-op for meta/store
     /// packages (closure source `none`) — they are trivial and always rebuilt.
+    /// Also a no-op for adopt-info snaps: their placeholder closure key cannot
+    /// distinguish upstream versions, so caching them risks a wrong-version
+    /// serve (they are rebuilt every time instead).
     pub fn store(
         &self,
-        _meta: &SnapMeta,
+        meta: &SnapMeta,
         result: &BuildResult,
         output_dir: &Path,
         closure: &BuildClosure,
     ) -> miette::Result<()> {
         // Don't cache meta/store packages (they're empty/trivial)
-        if closure.source == NO_SOURCE_HASH {
+        if closure.source == NO_SOURCE_HASH || meta.adopt_info.is_some() {
             return Ok(());
         }
 
@@ -467,6 +477,7 @@ mod tests {
             confinement: "strict".into(),
             type_: Some("source".into()),
             adopt_info: None,
+            version_adopted: false,
             icon_source: None,
             icon: None,
             compression: None,
@@ -500,6 +511,7 @@ mod tests {
             confinement: "strict".into(),
             type_: Some("meta".into()),
             adopt_info: None,
+            version_adopted: false,
             icon_source: None,
             icon: None,
             compression: None,
@@ -1016,6 +1028,7 @@ mod tests {
 
         let result = BuildResult {
             snap_filename: "hello_1.0_amd64.snap".into(),
+            version: "1.0".into(),
             source_info: None,
         };
 
@@ -1045,6 +1058,7 @@ mod tests {
         std::fs::write(&snap_path, b"fake snap content").unwrap();
         let result = BuildResult {
             snap_filename: "hello_1.0_amd64.snap".into(),
+            version: "1.0".into(),
             source_info: None,
         };
 
@@ -1084,6 +1098,7 @@ mod tests {
         // BuildResult with any filename (won't be stored)
         let result = BuildResult {
             snap_filename: "build-deps_1.0_amd64.snap".into(),
+            version: "1.0".into(),
             source_info: None,
         };
         cache
@@ -1107,6 +1122,7 @@ mod tests {
         std::fs::write(&snap_path, b"fake snap content").unwrap();
         let result = BuildResult {
             snap_filename: "hello_1.0_amd64.snap".into(),
+            version: "1.0".into(),
             source_info: None,
         };
         cache

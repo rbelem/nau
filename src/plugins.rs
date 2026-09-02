@@ -16,6 +16,7 @@
 //! shared stage exactly like hand-written build commands do.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Version of the built-in plugin registry. Folded into cache keys for
 /// plugin parts (ADR-0014 Decision 5): a shuttle release that changes plugin
@@ -485,6 +486,229 @@ fn autotools_plan(opts: &[(&'static str, &PluginValue)]) -> BuildPlan {
     }
 }
 
+// ── adopt-info rung 3: plugin-owned metadata extraction ──
+
+/// One version value extracted from a pinned source tree, with the file it
+/// came from (provenance feeds warnings and disagreement errors).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractedVersion {
+    pub value: String,
+    /// File the value came from, relative to the source root.
+    pub from: String,
+}
+
+/// Plugin-owned version extraction for adopt-info snaps: scan the pinned
+/// source tree (post-unpack) for the plugin's canonical version
+/// declaration. Deterministic line patterns only — no regex engine, no
+/// TOML/JSON parser.
+///
+/// All candidate files are scanned and every hit returned, so two
+/// *disagreeing* sources within the part are detected by the caller (which
+/// hard-errors instead of arbitrarily picking one). A plugin with no
+/// canonical version file (`make` Makefiles declare nothing standard)
+/// yields no hits. Build-time only: nothing here feeds the parts cache key
+/// (ADR-0014 Decision 5), so [`REGISTRY_VERSION`] is unaffected.
+pub fn extract_versions(plugin: &str, src: &Path) -> Vec<ExtractedVersion> {
+    match plugin {
+        "autotools" => extract_autotools(src),
+        "cargo" => extract_cargo(src),
+        "cmake" => extract_cmake(src),
+        "meson" => extract_meson(src),
+        _ => Vec::new(),
+    }
+}
+
+/// Read a file relative to the source root, if it exists and is UTF-8.
+fn read_source_file(src: &Path, name: &str) -> Option<String> {
+    std::fs::read_to_string(src.join(name)).ok()
+}
+
+/// `autotools`: the version is the second `AC_INIT` argument, in any of the
+/// configure script template variants (a tree may carry several; every hit
+/// is returned so disagreement is detectable).
+fn extract_autotools(src: &Path) -> Vec<ExtractedVersion> {
+    let mut hits = Vec::new();
+    for name in ["configure.ac", "configure.in", "configure.ac.in"] {
+        let Some(content) = read_source_file(src, name) else {
+            continue;
+        };
+        // First AC_INIT in a file wins for that file.
+        for line in content.lines() {
+            let Some(rest) = line.trim().strip_prefix("AC_INIT") else {
+                continue;
+            };
+            let Some(args) = macro_args(rest) else {
+                continue;
+            };
+            if let Some(v) = unquoted(nth_macro_arg(args, 1)) {
+                if !v.is_empty() {
+                    hits.push(ExtractedVersion {
+                        value: v,
+                        from: name.to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    hits
+}
+
+/// Contents of the parenthesized argument list that follows `s` (m4 macro
+/// invocations are single-line in practice; the list ends at the last ')'
+/// on the line).
+fn macro_args(s: &str) -> Option<&str> {
+    let s = s.trim_start().strip_prefix('(')?;
+    let end = s.rfind(')')?;
+    Some(&s[..end])
+}
+
+/// Split a macro argument list on top-level commas (m4 quote brackets `[]`
+/// shield commas) and return the `n`-th argument, unquoted.
+fn nth_macro_arg(args: &str, n: usize) -> Option<String> {
+    let mut depth = 0usize;
+    let mut fields: Vec<String> = vec![String::new()];
+    for c in args.chars() {
+        match c {
+            '[' => {
+                depth += 1;
+                fields.last_mut().unwrap().push(c);
+            }
+            ']' if depth > 0 => {
+                depth -= 1;
+                fields.last_mut().unwrap().push(c);
+            }
+            ',' if depth == 0 => fields.push(String::new()),
+            c => fields.last_mut().unwrap().push(c),
+        }
+    }
+    fields.into_iter().nth(n)
+}
+
+/// Trim whitespace and strip one layer of m4 brackets or quotes.
+fn unquoted(arg: Option<String>) -> Option<String> {
+    let mut v = arg?.trim().to_string();
+    for (open, close) in [('[', ']'), ('\'', '\'')] {
+        if let Some(inner) = v.strip_prefix(open).and_then(|s| s.strip_suffix(close)) {
+            v = inner.trim().to_string();
+            break;
+        }
+    }
+    Some(v)
+}
+
+/// `cargo`: the `version` key in the `[package]` section of `Cargo.toml`.
+/// Section-aware so dependency `version = "…"` keys elsewhere in the file
+/// can never be mistaken for the crate's own version.
+fn extract_cargo(src: &Path) -> Vec<ExtractedVersion> {
+    let Some(content) = read_source_file(src, "Cargo.toml") else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    let mut in_package = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed.eq_ignore_ascii_case("[package]");
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(value) = toml_string_field(trimmed, "version") {
+            hits.push(ExtractedVersion {
+                value,
+                from: "Cargo.toml".to_string(),
+            });
+            break;
+        }
+    }
+    hits
+}
+
+/// Value of a `key = "…"` line (bare string form only — tables and arrays
+/// are not version declarations).
+fn toml_string_field(line: &str, key: &str) -> Option<String> {
+    let (k, v) = line.split_once('=')?;
+    if k.trim() != key {
+        return None;
+    }
+    let v = v.trim();
+    let inner = v.strip_prefix('"')?.strip_suffix('"')?;
+    Some(inner.to_string())
+}
+
+/// `cmake`: `project(<NAME> VERSION <ver> …)` in the top-level
+/// `CMakeLists.txt` (the version keyword argument).
+fn extract_cmake(src: &Path) -> Vec<ExtractedVersion> {
+    let Some(content) = read_source_file(src, "CMakeLists.txt") else {
+        return Vec::new();
+    };
+    for line in content.lines() {
+        let lower = lowercase(line.trim_start());
+        let Some(rest) = lower.strip_prefix("project(") else {
+            continue;
+        };
+        let mut tokens = rest.split_whitespace();
+        while let Some(tok) = tokens.next() {
+            if tok.eq_ignore_ascii_case("VERSION") {
+                if let Some(v) = tokens.next() {
+                    let v = v.trim_end_matches([')', ',']);
+                    if !v.is_empty() {
+                        return vec![ExtractedVersion {
+                            value: v.to_string(),
+                            from: "CMakeLists.txt".to_string(),
+                        }];
+                    }
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn lowercase(s: &str) -> String {
+    s.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// `meson`: the `version` keyword argument of `project()` in the top-level
+/// `meson.build`. The call commonly spans lines, so the kwarg is searched
+/// for on its own terms (`version : '…'` with any spacing); a match also
+/// requires a quote right after the colon, which non-kwarg text (e.g. the
+/// word inside an error message string) does not produce.
+fn extract_meson(src: &Path) -> Vec<ExtractedVersion> {
+    let Some(content) = read_source_file(src, "meson.build") else {
+        return Vec::new();
+    };
+    for line in content.lines() {
+        let lower = lowercase(line);
+        let Some(idx) = lower.find("version") else {
+            continue;
+        };
+        let Some(after) = line[idx + "version".len()..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let after = after.trim_start();
+        let Some(quote) = after.chars().next() else {
+            continue;
+        };
+        if quote != '\'' && quote != '"' {
+            continue;
+        }
+        let inner = &after[1..];
+        if let Some(end) = inner.find(quote) {
+            let v = &inner[..end];
+            if !v.is_empty() {
+                return vec![ExtractedVersion {
+                    value: v.to_string(),
+                    from: "meson.build".to_string(),
+                }];
+            }
+        }
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,5 +1089,178 @@ mod tests {
             serde_json::to_string(&PluginValue::Bool(false).to_json()).unwrap(),
             "false"
         );
+    }
+
+    // ── adopt-info rung 3: plugin-owned version extractors ──
+
+    fn fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            if let Some(parent) = Path::new(name).parent() {
+                std::fs::create_dir_all(dir.path().join(parent)).unwrap();
+            }
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        dir
+    }
+
+    fn versions(plugin: &str, files: &[(&str, &str)]) -> Vec<ExtractedVersion> {
+        let dir = fixture(files);
+        extract_versions(plugin, dir.path())
+    }
+
+    #[test]
+    fn test_extract_autotools_ac_init_bracketed_and_bare() {
+        let hits = versions(
+            "autotools",
+            &[(
+                "configure.ac",
+                "AC_INIT([smartmontools], [7.4], [bugs@example.org])\n",
+            )],
+        );
+        assert_eq!(
+            hits,
+            vec![ExtractedVersion {
+                value: "7.4".into(),
+                from: "configure.ac".into()
+            }]
+        );
+
+        // Unbracketed form and extra spacing around the macro.
+        let hits = versions("autotools", &[("configure.ac", "  AC_INIT(foo, 1.2.3)\n")]);
+        assert_eq!(hits[0].value, "1.2.3");
+    }
+
+    #[test]
+    fn test_extract_autotools_scan_configure_in_variant() {
+        // No configure.ac — the configure.in variant carries the version.
+        let hits = versions("autotools", &[("configure.in", "AC_INIT(pkg, 0.9.1)\n")]);
+        assert_eq!(hits[0].value, "0.9.1");
+        assert_eq!(hits[0].from, "configure.in");
+    }
+
+    #[test]
+    fn test_extract_autotools_all_hits_returned_for_disagreement() {
+        // Both variants present: every hit must be returned so the caller
+        // can hard-error on disagreement instead of picking one.
+        let hits = versions(
+            "autotools",
+            &[
+                ("configure.ac", "AC_INIT([pkg], [1.0])\n"),
+                ("configure.in", "AC_INIT([pkg], [2.0])\n"),
+            ],
+        );
+        assert_eq!(
+            hits,
+            vec![
+                ExtractedVersion {
+                    value: "1.0".into(),
+                    from: "configure.ac".into()
+                },
+                ExtractedVersion {
+                    value: "2.0".into(),
+                    from: "configure.in".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_cargo_package_section_only() {
+        let hits = versions(
+            "cargo",
+            &[(
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.8.2\"\nedition = \"2021\"\n\n\
+                 [dependencies]\nserde = { version = \"1.0\", features = [\"derive\"] }\ntoml = \"0.5\"\n",
+            )],
+        );
+        assert_eq!(
+            hits,
+            vec![ExtractedVersion {
+                value: "0.8.2".into(),
+                from: "Cargo.toml".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_extract_cmake_project_version_token() {
+        let hits = versions(
+            "cmake",
+            &[(
+                "CMakeLists.txt",
+                "cmake_minimum_required(VERSION 3.16)\nproject(XZ VERSION 5.6.4 LANGUAGES C)\n",
+            )],
+        );
+        assert_eq!(
+            hits,
+            vec![ExtractedVersion {
+                value: "5.6.4".into(),
+                from: "CMakeLists.txt".into()
+            }]
+        );
+
+        // A project() without VERSION yields nothing (not a false pick).
+        let hits = versions("cmake", &[("CMakeLists.txt", "project(ninja CXX)\n")]);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_extract_meson_version_kwarg_multiline() {
+        // project() calls commonly span lines — the kwarg is what counts.
+        let hits = versions(
+            "meson",
+            &[(
+                "meson.build",
+                "project('foo', 'c',\n  version: '1.10.0',\n  license: 'GPL2+')\n",
+            )],
+        );
+        assert_eq!(
+            hits,
+            vec![ExtractedVersion {
+                value: "1.10.0".into(),
+                from: "meson.build".into()
+            }]
+        );
+
+        // Same-line form and loose spacing around the colon.
+        let hits = versions(
+            "meson",
+            &[("meson.build", "project('foo', version : '2.0')\n")],
+        );
+        assert_eq!(hits[0].value, "2.0");
+    }
+
+    #[test]
+    fn test_extract_meson_ignores_non_kwarg_version_text() {
+        // "version" inside a string with no quoted value after the colon
+        // must not produce a hit.
+        let hits = versions(
+            "meson",
+            &[(
+                "meson.build",
+                "error('version: unsupported')\nproject('x')\n",
+            )],
+        );
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_extract_make_has_no_canonical_version_file() {
+        let hits = versions(
+            "make",
+            &[("Makefile", "VERSION = 1.2.3\nPREFIX ?= /usr/local\n")],
+        );
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_extract_versions_absent_files_yield_no_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(extract_versions("autotools", dir.path()).is_empty());
+        assert!(extract_versions("cargo", dir.path()).is_empty());
+        assert!(extract_versions("cmake", dir.path()).is_empty());
+        assert!(extract_versions("meson", dir.path()).is_empty());
     }
 }

@@ -94,6 +94,10 @@ pub struct SourceInfo {
 pub struct BuildResult {
     /// The output `.snap` filename (e.g. `hello_2.10_amd64.snap`).
     pub snap_filename: String,
+    /// The snap version actually built: the declared version, or the
+    /// version extracted at build time for adopt-info snaps (the declared
+    /// placeholder never reaches the filename).
+    pub version: String,
     /// Source info if a source was downloaded and processed.
     pub source_info: Option<SourceInfo>,
 }
@@ -172,15 +176,19 @@ pub struct SnapMeta {
     pub type_: Option<String>,
 
     /// Name of the part whose metadata (version/summary/description) this
-    /// snap adopts, per snapd's adopt-info semantics. Part-metadata
-    /// extraction doesn't exist yet (v1): adopt-info is emitted verbatim
-    /// and only relaxes the requirement for `version` in the DSL.
-    #[serde(
-        default,
-        rename = "adopt-info",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// snap adopts. Build-time only — snapd's snap.yaml schema has no
+    /// `adopt-info` key (it is a snapcraft build-time key), so it is never
+    /// emitted: the concrete values are extracted from the built part at
+    /// build time (see [`extract_adopted_meta`]) and written into snap.yaml.
+    #[serde(skip)]
     pub adopt_info: Option<String>,
+
+    /// True when `version` is the adopt-info placeholder ("0") — no
+    /// explicit version was declared and the real one arrives at build
+    /// time. Marks the placeholder so no identity output ever presents it
+    /// as declared. Skipped in YAML — build metadata only.
+    #[serde(skip)]
+    pub version_adopted: bool,
 
     /// Source path of the icon file from the DSL (e.g. "icon.png").
     /// Build-time only — the file is copied to `meta/gui/icon.<ext>` and
@@ -413,12 +421,15 @@ impl SnapMeta {
     pub fn from_lua_table(table: &mlua::Table) -> miette::Result<Self> {
         let name = get_required_string(table, "name")?;
         let adopt_info = get_opt_string(table, "adopt_info")?;
-        // With adopt-info, snapd takes version (and summary/description)
-        // from the adopted part. Part-metadata extraction doesn't exist
-        // yet (v1), so version falls back to a placeholder when adopted.
-        let version = match get_opt_string(table, "version")? {
-            Some(v) => v,
-            None if adopt_info.is_some() => "0".to_string(),
+        // With adopt-info, version (and summary/description) are adopted
+        // from the named part at build time (see `extract_adopted_meta`).
+        // Until then a "0" placeholder stands in for the schema; it is
+        // marked with `version_adopted` so no identity output ever
+        // presents it as a declared version, and a build without
+        // extractable metadata fails hard instead of shipping it.
+        let (version, version_adopted) = match get_opt_string(table, "version")? {
+            Some(v) => (v, false),
+            None if adopt_info.is_some() => ("0".to_string(), true),
             None => {
                 return Err(miette::miette!(
                     "snap meta: field 'version' is required but invalid: missing, and no adopt_info set"
@@ -482,6 +493,7 @@ impl SnapMeta {
         Ok(SnapMeta {
             name,
             version,
+            version_adopted,
             summary,
             description,
             license,
@@ -1189,6 +1201,17 @@ impl SnapMeta {
         serde_yaml::to_string(self)
             .map_err(|e| miette::miette!("failed to serialize snap metadata to YAML: {}", e))
     }
+
+    /// The version to show in identity output (`shuttle check`, build
+    /// status): an adopt-info snap has no declared version until build
+    /// time, and the "0" placeholder must never read as one.
+    pub fn display_version(&self) -> &str {
+        if self.adopt_info.is_some() && self.version_adopted {
+            "(version adopted at build)"
+        } else {
+            &self.version
+        }
+    }
 }
 
 // ── Phase 5/6: Snap directory assembly + SquashFS packaging ──
@@ -1325,11 +1348,30 @@ pub fn build_snap(
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
 
     // 1. Run build phase (download source, run build command) if configured
-    let source_info = run_build(meta, stage_dir, stage_policy)?;
+    let outcome = run_build(meta, stage_dir, stage_policy)?;
 
     // Clone meta with architecture filtered to the target arch
     let mut arch_meta = meta.clone();
     arch_meta.architectures = Some(vec![arch.to_string()]);
+
+    // 1b. Apply adopt-info metadata extracted at build time (post-build by
+    // design: the adopted part's files and the pinned tree are what the
+    // ladder reads). The extracted version feeds the snap.yaml AND the
+    // output filename — version identity is only honest once extracted.
+    if let Some(adopted) = &outcome.adopted {
+        for warning in &adopted.warnings {
+            output::warn(warning);
+        }
+        if let Some(v) = &adopted.version {
+            arch_meta.version = v.value.clone();
+        }
+        if arch_meta.summary.is_none() {
+            arch_meta.summary = adopted.summary.clone();
+        }
+        if arch_meta.description.is_none() {
+            arch_meta.description = adopted.description.clone();
+        }
+    }
 
     // 2. Write meta/snap.yaml
     let meta_dir = build_dir.path().join("meta");
@@ -1354,8 +1396,9 @@ pub fn build_snap(
             .map_err(|e| miette::miette!("failed to copy from {:?}: {}", stage_dir, e))?;
     }
 
-    // 4. Output filename
-    let output_filename = format!("{}_{}_{}.snap", meta.name, meta.version, arch);
+    // 4. Output filename — built from the resolved arch_meta so an
+    // adopt-info snap is named by its real extracted version.
+    let output_filename = format!("{}_{}_{}.snap", arch_meta.name, arch_meta.version, arch);
     let output_path = output_dir.join(&output_filename);
 
     // 5. Run mksquashfs with optional SOURCE_DATE_EPOCH
@@ -1393,7 +1436,8 @@ pub fn build_snap(
 
     Ok(BuildResult {
         snap_filename: output_filename,
-        source_info,
+        version: arch_meta.version.clone(),
+        source_info: outcome.source,
     })
 }
 
@@ -1401,6 +1445,14 @@ pub fn build_snap(
 /// source in multi-part builds. Part work dirs are siblings of it, so the
 /// name is reserved as a part name.
 const SOURCE_DIR_NAME: &str = "source";
+
+/// What a build phase produced: lockfile-relevant source info plus the
+/// adopt-info metadata extracted from the built part, if any.
+#[derive(Debug, Default)]
+struct BuildOutcome {
+    source: Option<SourceInfo>,
+    adopted: Option<AdoptedMeta>,
+}
 
 /// Run the build phase: download source, extract, and execute build command(s).
 ///
@@ -1413,12 +1465,16 @@ const SOURCE_DIR_NAME: &str = "source";
 /// order (see [`order_parts`]) in its own work dir under the build tree,
 /// all installing into the shared stage.
 ///
-/// Returns `SourceInfo` with the computed SHA-256 if a source was downloaded.
+/// When the snap declares `adopt-info`, the adopted part's metadata is
+/// extracted after the parts have built (see [`extract_adopted_meta`]).
+///
+/// Returns the [`BuildOutcome`]: `SourceInfo` with the computed SHA-256 if
+/// a source was downloaded, and the extracted adopt metadata if any.
 fn run_build(
     meta: &SnapMeta,
     stage_dir: &Path,
     stage_policy: StagePolicy,
-) -> miette::Result<Option<SourceInfo>> {
+) -> miette::Result<BuildOutcome> {
     // Build plan: `parts` and `build` are mutually exclusive (the DSL
     // enforces this; re-checked here for non-DSL constructors).
     match (&meta.parts, &meta.build) {
@@ -1432,9 +1488,29 @@ fn run_build(
         }
         (Some(_), None) => {} // multi-part mode
         (None, Some(_)) => {} // single-part mode
-        (None, None) => return Ok(None),
+        (None, None) => {
+            // adopt-info names a part to adopt from — a snap with nothing
+            // built has nothing to adopt from.
+            if let Some(part) = &meta.adopt_info {
+                return Err(miette::miette!(
+                    "adopt-info names part '{part}' but the snap has no source or parts to adopt from"
+                ));
+            }
+            return Ok(BuildOutcome::default());
+        }
     }
     let parts_mode = meta.parts.is_some();
+
+    // adopt-info names a parts: entry to adopt from — a single-`build` snap
+    // has no part, so the definition can never work. Fail before any
+    // download work.
+    if let Some(part) = &meta.adopt_info {
+        if !parts_mode {
+            return Err(miette::miette!(
+                "adopt-info names part '{part}' but the snap has no parts (adopt-info refers to a parts: entry)"
+            ));
+        }
+    }
 
     let source_spec = match &meta.source {
         Some(s) => s,
@@ -1458,7 +1534,7 @@ fn run_build(
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
     let build_path = build_dir.path();
 
-    let pkg_label = format!("{} {}", meta.name, meta.version);
+    let pkg_label = format!("{} {}", meta.name, meta.display_version());
 
     // 1. Download source tarball
     let filename = source_url.rsplit('/').next().unwrap_or("source.tar.gz");
@@ -1582,10 +1658,340 @@ fn run_build(
         output::finish_ok(&build_spinner, &format!("built {}", meta.name));
     }
 
-    Ok(Some(SourceInfo {
-        url: source_url.to_string(),
-        sha256: computed_sha256,
+    // 7. adopt-info: extract the adopted part's metadata now that the
+    //    named part has built — the pinned source tree is unpacked and the
+    //    part's files are staged (the two read-only inputs of the ladder).
+    //    Post-build by design: version feeds the snap filename and cache
+    //    identity, so it must come from what was actually built, and a
+    //    missing version hard-errors here instead of shipping "0".
+    let adopted = extract_adopted_meta(meta, &src_root, &abs_stage)?;
+
+    Ok(BuildOutcome {
+        source: Some(SourceInfo {
+            url: source_url.to_string(),
+            sha256: computed_sha256,
+        }),
+        adopted,
+    })
+}
+
+// ── adopt-info: build-time metadata extraction ──
+
+/// Metadata extracted at build time for an adopt-info snap. Only the fields
+/// the ladder actually found are present — explicit DSL fields never move.
+#[derive(Debug, Clone, Default)]
+pub struct AdoptedMeta {
+    /// The extracted version, with where it came from. `None` when the
+    /// snap declared an explicit version (which wins, with a warning).
+    pub version: Option<ExtractedField>,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    /// Human-readable warnings for the caller to print (explicit-field
+    /// divergence etc.).
+    pub warnings: Vec<String>,
+}
+
+/// A value extracted from the build tree, with where it came from.
+#[derive(Debug, Clone)]
+pub struct ExtractedField {
+    pub value: String,
+    pub from: String,
+}
+
+/// snapd caps the adoptable identity fields (see [`check_adopt_cap`]).
+const SNAPD_ADOPT_FIELD_MAX: usize = 32;
+
+/// The adopt-info extraction ladder for one snap, run at build time after
+/// the named part has built:
+///
+/// 1. An explicit `version` in the definition wins outright — with a
+///    warning, because version feeds the cache identity and the snap
+///    filename, so silently diverging from the adopted metadata would be a
+///    reproducibility lie. Explicit summary/description win per-field,
+///    silently (they feed no identity).
+/// 2. `$STAGE/snap/metadata.json` — snapcraft's own convention file.
+/// 3. The adopted part's plugin reads the pinned source tree post-unpack
+///    (autotools `AC_INIT`, `Cargo.toml [package]`, CMake
+///    `project(VERSION)`, meson `project(version:)`); two extracted
+///    sources within the part disagreeing on version is a hard error —
+///    never an arbitrary pick.
+/// 4. An installed AppStream `metainfo.xml` under
+///    `$STAGE/usr/share/metainfo` supplies summary/description (snapcraft
+///    parse-info precedent).
+///
+/// The ladder is per-field: each field takes the first rung that provides
+/// it. A version that no rung provides is a hard error — the "0"
+/// placeholder never survives into snap.yaml.
+fn extract_adopted_meta(
+    meta: &SnapMeta,
+    src_root: &Path,
+    stage: &Path,
+) -> miette::Result<Option<AdoptedMeta>> {
+    let Some(adopt_name) = &meta.adopt_info else {
+        return Ok(None);
+    };
+
+    let Some(parts) = &meta.parts else {
+        return Err(miette::miette!(
+            "adopt-info names part '{adopt_name}' but the snap has no parts (adopt-info refers to a parts: entry)"
+        ));
+    };
+    let part = parts.get(adopt_name).ok_or_else(|| {
+        miette::miette!(
+            "adopt-info names part '{adopt_name}' but the snap has no such part (parts: {})",
+            parts.keys().cloned().collect::<Vec<_>>().join(", ")
+        )
+    })?;
+
+    let mut warnings = Vec::new();
+
+    // ── version ──
+    let version = if !meta.version_adopted {
+        let explicit = &meta.version;
+        match extract_version_from_rungs(adopt_name, part, src_root, stage)? {
+            Some(found) => warnings.push(format!(
+                "adopt-info: explicit version '{explicit}' wins over the extracted version '{}' (from {}) — \
+                 version feeds the cache identity and the snap filename, so this divergence is deliberate only if kept",
+                found.value, found.from
+            )),
+            None => warnings.push(format!(
+                "adopt-info: explicit version '{explicit}' wins (no version metadata found to adopt from part '{adopt_name}')"
+            )),
+        }
+        None
+    } else {
+        match extract_version_from_rungs(adopt_name, part, src_root, stage)? {
+            Some(found) => {
+                check_adopt_cap("version", &found.value, &found.from)?;
+                Some(found)
+            }
+            None => {
+                return Err(miette::miette!(
+                    "adopt-info: no version metadata found for part '{adopt_name}' (plugin '{}'); \
+                     snapd requires a real version — declare version = \"…\" explicitly, or ship \
+                     snap/metadata.json or plugin metadata in the source",
+                    part.plugin.as_deref().unwrap_or("(none)")
+                ));
+            }
+        }
+    };
+
+    // ── summary/description ──
+    let json_summary = metadata_json_field(stage, "summary")?;
+    let json_description = metadata_json_field(stage, "description")?;
+    let (metainfo_summary, metainfo_description, metainfo_from) =
+        metainfo_summary_description(stage)?;
+
+    let summary = if meta.summary.is_some() {
+        None
+    } else if let Some(s) = json_summary {
+        check_adopt_cap("summary", &s, "snap/metadata.json")?;
+        Some(s)
+    } else if let Some(s) = metainfo_summary {
+        check_adopt_cap("summary", &s, &metainfo_from)?;
+        Some(s)
+    } else {
+        None
+    };
+
+    let description = if meta.description.is_some() {
+        None
+    } else if let Some(d) = json_description {
+        check_adopt_cap("description", &d, "snap/metadata.json")?;
+        Some(d)
+    } else if let Some(d) = metainfo_description {
+        check_adopt_cap("description", &d, &metainfo_from)?;
+        Some(d)
+    } else {
+        None
+    };
+
+    Ok(Some(AdoptedMeta {
+        version,
+        summary,
+        description,
+        warnings,
     }))
+}
+
+/// Rungs 2-3 for the version field: `$STAGE/snap/metadata.json`, then the
+/// part's plugin reading the pinned source tree. More than one distinct
+/// extracted value within the part is a hard error (never an arbitrary
+/// pick); agreeing sources collapse to one hit.
+fn extract_version_from_rungs(
+    part_name: &str,
+    part: &SnapPart,
+    src_root: &Path,
+    stage: &Path,
+) -> miette::Result<Option<ExtractedField>> {
+    if let Some(v) = metadata_json_field(stage, "version")? {
+        return Ok(Some(ExtractedField {
+            value: v,
+            from: "snap/metadata.json".to_string(),
+        }));
+    }
+
+    let Some(plugin) = &part.plugin else {
+        return Ok(None);
+    };
+    let hits = crate::plugins::extract_versions(plugin, src_root);
+    let mut distinct: Vec<&crate::plugins::ExtractedVersion> = Vec::new();
+    for hit in &hits {
+        if distinct.iter().any(|d| d.value == hit.value) {
+            continue;
+        }
+        distinct.push(hit);
+    }
+    match distinct.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(ExtractedField {
+            value: one.value.clone(),
+            from: one.from.clone(),
+        })),
+        many => {
+            let listed = many
+                .iter()
+                .map(|h| format!("{} says '{}'", h.from, h.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(miette::miette!(
+                "adopt-info: conflicting version metadata within part '{part_name}' ({plugin}): \
+                 {listed} — fix the source metadata; shuttle never picks arbitrarily"
+            ))
+        }
+    }
+}
+
+/// Read a string field from `$STAGE/snap/metadata.json` (snapcraft's
+/// convention file). A present-but-unparsable file is a hard error —
+/// silently ignoring it would bury a broken stage.
+fn metadata_json_field(stage: &Path, field: &str) -> miette::Result<Option<String>> {
+    let path = stage.join("snap").join("metadata.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| miette::miette!("adopt-info: failed to read {}: {}", path.display(), e))?;
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| miette::miette!("adopt-info: {} is not valid JSON: {e}", path.display()))?;
+    Ok(value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
+}
+
+/// Summary/description from an installed AppStream metainfo file (snapcraft
+/// parse-info precedent): the first `*.metainfo.xml` / `*.appdata.xml` in
+/// `$STAGE/usr/share/metainfo`, name-sorted for determinism. Minimal
+/// deterministic scan — no XML crate.
+fn metainfo_summary_description(
+    stage: &Path,
+) -> miette::Result<(Option<String>, Option<String>, String)> {
+    let dir = stage.join("usr/share/metainfo");
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|e| miette::miette!("adopt-info: failed to read {}: {}", dir.display(), e))?
+        {
+            let entry = entry
+                .map_err(|e| miette::miette!("adopt-info: failed to read metainfo entry: {e}"))?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".metainfo.xml") || name.ends_with(".appdata.xml") {
+                candidates.push(entry.path());
+            }
+        }
+    }
+    candidates.sort();
+    let Some(path) = candidates.into_iter().next() else {
+        return Ok((None, None, String::new()));
+    };
+    let from = format!(
+        "usr/share/metainfo/{}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| miette::miette!("adopt-info: failed to read {}: {}", path.display(), e))?;
+    let summary = xml_element_text(&content, "summary");
+    let description = xml_element_text(&content, "description").map(|d| xml_paragraphs(&d));
+    Ok((summary, description, from))
+}
+
+/// Inner text of the first `<tag>` element in an XML document, whitespace-
+/// collapsed. Handles attribute soup on the open tag (`<summary
+/// xml:lang="en">`); self-closing or unclosed elements yield nothing.
+fn xml_element_text(content: &str, tag: &str) -> Option<String> {
+    xml_element_span(content, tag)
+        .map(|(inner, _)| inner.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// (inner text, remainder after the closing tag) of the first `<tag>`
+/// element. Skips false positives like `<summaryfoo>`.
+fn xml_element_span<'a>(content: &'a str, tag: &str) -> Option<(&'a str, &'a str)> {
+    let open = format!("<{tag}");
+    let mut search = content;
+    loop {
+        let idx = search.find(&open)?;
+        let after = &search[idx + open.len()..];
+        if !(after.starts_with('>')
+            || after.starts_with(' ')
+            || after.starts_with('\t')
+            || after.starts_with('\n'))
+        {
+            search = after;
+            continue;
+        }
+        let gt = after.find('>')?;
+        let body = &after[gt + 1..];
+        let close = format!("</{tag}>");
+        let close_idx = body.find(&close)?;
+        return Some((&body[..close_idx], &body[close_idx + close.len()..]));
+    }
+}
+
+/// Description text: the `<p>` paragraphs inside an AppStream
+/// `<description>`, joined by blank lines (markdown-ish, the convention
+/// snapcraft parse-info follows). Falls back to the tag-stripped inner text
+/// when the element holds no paragraphs.
+fn xml_paragraphs(description_inner: &str) -> String {
+    let mut paragraphs = Vec::new();
+    let mut rest = description_inner;
+    while let Some((inner, remainder)) = xml_element_span(rest, "p") {
+        paragraphs.push(inner.split_whitespace().collect::<Vec<_>>().join(" "));
+        rest = remainder;
+    }
+    if paragraphs.is_empty() {
+        return strip_tags(description_inner);
+    }
+    paragraphs.join("\n\n")
+}
+
+/// Remove `<…>` markup from a string.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Enforce snapd's field limit on an extracted value — error, never
+/// truncate (a truncated summary or version would be published as if it
+/// were the source's own).
+fn check_adopt_cap(field: &str, value: &str, from: &str) -> miette::Result<()> {
+    if value.chars().count() > SNAPD_ADOPT_FIELD_MAX {
+        return Err(miette::miette!(
+            "adopt-info: extracted {field} \"{value}\" (from {from}) exceeds snapd's \
+             {SNAPD_ADOPT_FIELD_MAX}-character limit — shorten the source metadata or declare \
+             the field explicitly instead"
+        ));
+    }
+    Ok(())
 }
 
 /// Deterministic execution order for parts: a part is runnable once every
@@ -3663,7 +4069,8 @@ mod tests {
     fn test_adopt_info_relaxes_version() {
         let env = LuaEnv::new();
 
-        // adopt-info without version: accepted, version placeholder
+        // adopt-info without version: accepted, version placeholder —
+        // marked as adopted so it never reads as a declared version.
         let table = env
             .eval(
                 r#"
@@ -3679,12 +4086,20 @@ mod tests {
         let default_table: mlua::Table = table.get("default").unwrap();
         let meta = SnapMeta::from_lua_table(&default_table).unwrap();
         assert_eq!(meta.adopt_info.as_deref(), Some("my-part"));
-        assert_eq!(meta.version, "0"); // placeholder — no part extraction yet
+        assert_eq!(meta.version, "0"); // placeholder — resolved at build time
+        assert!(meta.version_adopted);
+        assert_eq!(meta.display_version(), "(version adopted at build)");
 
+        // adopt-info is a snapcraft build-time key, not snapd schema — it
+        // must never be emitted into snap.yaml (same bug class as `source:`).
         let yaml = meta.to_yaml().unwrap();
-        assert!(yaml.contains("adopt-info: my-part"), "got: {yaml}");
+        assert!(
+            !yaml.contains("adopt-info"),
+            "adopt-info must not be emitted to snap.yaml, got: {yaml}"
+        );
 
-        // adopt-info with explicit version: version preserved
+        // adopt-info with explicit version: version preserved and marked
+        // declared.
         let table = env
             .eval(
                 r#"
@@ -3701,6 +4116,314 @@ mod tests {
         let default_table: mlua::Table = table.get("default").unwrap();
         let meta = SnapMeta::from_lua_table(&default_table).unwrap();
         assert_eq!(meta.version, "2.5");
+        assert!(!meta.version_adopted);
+        assert_eq!(meta.display_version(), "2.5");
+    }
+
+    // ── adopt-info: build-time extraction ladder ──
+
+    /// Eval a definition with adopt-info into a SnapMeta.
+    fn adopt_meta(lua_snap_body: &str) -> SnapMeta {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(&format!(
+                "return {{ default = snap {{ {lua_snap_body} }} }}"
+            ))
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        SnapMeta::from_lua_table(&default_table).unwrap()
+    }
+
+    /// A source tree + stage pair for extraction fixtures, with `files`
+    /// written under `src_root` or `stage` respectively.
+    fn adopt_fixtures(
+        src_files: &[(&str, &str)],
+        stage_files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, tempfile::TempDir) {
+        let src = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        for (name, content) in src_files {
+            std::fs::write(src.path().join(name), content).unwrap();
+        }
+        for (name, content) in stage_files {
+            let path = stage.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        (src, stage)
+    }
+
+    #[test]
+    fn test_adopt_info_metadata_json_supplies_fields() {
+        let meta = adopt_meta(
+            r#"name = "adopted", adopt_info = "core", parts = { core = { plugin = "make" } }"#,
+        );
+        let (src, stage) = adopt_fixtures(
+            &[],
+            &[(
+                "snap/metadata.json",
+                r#"{"version": "7.4", "summary": "Adopted summary", "description": "Adopted description"}"#,
+            )],
+        );
+        let adopted = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap()
+            .expect("adopt metadata extracted");
+        let version = adopted.version.expect("version extracted");
+        assert_eq!(version.value, "7.4");
+        assert_eq!(version.from, "snap/metadata.json");
+        assert_eq!(adopted.summary.as_deref(), Some("Adopted summary"));
+        assert_eq!(adopted.description, Some("Adopted description".into()));
+        assert!(adopted.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_adopt_info_metadata_json_unparsable_is_an_error() {
+        let meta = adopt_meta(
+            r#"name = "adopted", adopt_info = "core", parts = { core = { plugin = "make" } }"#,
+        );
+        let (src, stage) = adopt_fixtures(&[], &[("snap/metadata.json", "{not json")]);
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not valid JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn test_adopt_info_explicit_version_wins_with_warning() {
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", version = "2.5", adopt_info = "core",
+            parts = { core = { plugin = "autotools" } }
+            "#,
+        );
+        let (src, stage) = adopt_fixtures(
+            &[("configure.ac", "AC_INIT([adopted], [7.4])\n")],
+            &[("snap/metadata.json", r#"{"summary": "Stage summary"}"#)],
+        );
+        let adopted = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap()
+            .unwrap();
+        // Explicit version wins outright — it feeds cache identity and the
+        // snap filename, so it never moves silently.
+        assert!(adopted.version.is_none());
+        assert_eq!(meta.version, "2.5");
+        // The divergence is warned about, naming both sides.
+        assert!(
+            adopted
+                .warnings
+                .iter()
+                .any(|w| w.contains("explicit version '2.5' wins")
+                    && w.contains("7.4")
+                    && w.contains("configure.ac")),
+            "got: {:?}",
+            adopted.warnings
+        );
+        // Explicit version wins per-field only: summary still adopted.
+        assert_eq!(adopted.summary.as_deref(), Some("Stage summary"));
+    }
+
+    #[test]
+    fn test_adopt_info_plugin_extractors_on_fixture_trees() {
+        // The registry plugins with canonical version files (meson has an
+        // extractor too, but no plugin — tested at the plugins.rs level).
+        let cases: Vec<(&str, &str, &str, &str)> = vec![
+            // (plugin, fixture file, fixture content, expected version)
+            (
+                "autotools",
+                "configure.ac",
+                "AC_INIT([pkg], [7.4])\n",
+                "7.4",
+            ),
+            (
+                "cargo",
+                "Cargo.toml",
+                "[package]\nname = \"pkg\"\nversion = \"0.8.2\"\n",
+                "0.8.2",
+            ),
+            (
+                "cmake",
+                "CMakeLists.txt",
+                "project(pkg VERSION 5.6.4 LANGUAGES C)\n",
+                "5.6.4",
+            ),
+        ];
+        for (plugin, file, content, expected) in cases {
+            let meta = adopt_meta(&format!(
+                r#"name = "adopted", adopt_info = "core", parts = {{ core = {{ plugin = "{plugin}" }} }}"#
+            ));
+            let (src, stage) = adopt_fixtures(&[(file, content)], &[]);
+            let adopted = extract_adopted_meta(&meta, src.path(), stage.path())
+                .unwrap_or_else(|e| panic!("{plugin}: {e}"))
+                .unwrap();
+            let version = adopted
+                .version
+                .unwrap_or_else(|| panic!("{plugin}: no version extracted"));
+            assert_eq!(version.value, expected, "plugin {plugin}");
+            assert!(!version.from.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_adopt_info_version_disagreement_is_an_error() {
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "autotools" } }
+            "#,
+        );
+        let (src, stage) = adopt_fixtures(
+            &[
+                ("configure.ac", "AC_INIT([pkg], [1.0])\n"),
+                ("configure.in", "AC_INIT([pkg], [2.0])\n"),
+            ],
+            &[],
+        );
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("conflicting version metadata within part 'core'")
+                && err.contains("configure.ac says '1.0'")
+                && err.contains("configure.in says '2.0'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_adopt_info_absent_version_is_an_error_never_placeholder() {
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "autotools" } }
+            "#,
+        );
+        // No metadata anywhere — extraction must fail, never fall back to "0".
+        let (src, stage) = adopt_fixtures(&[], &[]);
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no version metadata found for part 'core'"),
+            "got: {err}"
+        );
+
+        // A make part has no canonical version file either — same error,
+        // naming the plugin.
+        let meta = adopt_meta(
+            r#"name = "adopted", adopt_info = "core", parts = { core = { plugin = "make" } }"#,
+        );
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plugin 'make'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_adopt_info_field_caps_error_never_truncate() {
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        let long_version = "a".repeat(33);
+        let (src, stage) = adopt_fixtures(
+            &[],
+            &[(
+                "snap/metadata.json",
+                &format!(r#"{{"version": "{long_version}"}}"#),
+            )],
+        );
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("exceeds snapd's 32-character limit"),
+            "got: {err}"
+        );
+
+        // Same for an over-long summary.
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        let long_summary = "s".repeat(33);
+        let (src, stage) = adopt_fixtures(
+            &[],
+            &[(
+                "snap/metadata.json",
+                &format!(r#"{{"version": "1.0", "summary": "{long_summary}"}}"#),
+            )],
+        );
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("extracted summary") && err.contains("32-character limit"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_adopt_info_metainfo_supplies_summary_description() {
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        let (src, stage) = adopt_fixtures(
+            &[],
+            &[(
+                "snap/metadata.json",
+                r#"{"version": "7.4"}"#,
+            ),
+            (
+                "usr/share/metainfo/pkg.metainfo.xml",
+                "<component>\n  <summary>  Short one-line summary </summary>\n  <description>\n\
+                 <p>First.</p>\n<p xml:lang=\"en\">Second.</p>\n\
+                 </description>\n</component>\n",
+            )],
+        );
+        let adopted = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap()
+            .unwrap();
+        // Version comes from rung 2 (metadata.json); summary/description
+        // per-field from the metainfo rung.
+        assert_eq!(adopted.version.unwrap().value, "7.4");
+        assert_eq!(adopted.summary.as_deref(), Some("Short one-line summary"));
+        assert_eq!(adopted.description.as_deref(), Some("First.\n\nSecond."));
+    }
+
+    #[test]
+    fn test_adopt_info_names_must_reference_a_real_part() {
+        // Unknown part name.
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "nope",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        let (src, stage) = adopt_fixtures(&[], &[]);
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("adopt-info names part 'nope'") && err.contains("no such part"),
+            "got: {err}"
+        );
+
+        // No parts at all (single `build` snap).
+        let meta = adopt_meta(r#"name = "adopted", adopt_info = "core", build = "true""#);
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("has no parts (adopt-info refers to a parts: entry)"),
+            "got: {err}"
+        );
     }
 
     #[test]
