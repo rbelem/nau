@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mlua::Value;
 use serde::Serialize;
@@ -2288,6 +2288,209 @@ fn ro_bind_if_exists(cmd: &mut std::process::Command, path: &str) {
     }
 }
 
+/// Host path roots bound read-only into the build sandbox (see
+/// [`bind_system_ro_paths`]). This is the sandbox's entire view of the host
+/// filesystem: a build tool resolves inside the sandbox only if its PATH
+/// entry lives under one of these roots. Entries elsewhere (e.g. a
+/// project's `.devbox` profile dir) are invisible to sandboxed builds, and
+/// a `nix store` garbage collection can delete `/nix/store` paths a stale
+/// shell still exports — both turn a working host setup into an obscure
+/// mid-build failure. Doctor and the sandboxed build runner resolve tools
+/// against this same list so that failure mode becomes a named pre-flight
+/// diagnostic instead.
+pub const SANDBOX_RO_ROOTS: [&str; 6] = [
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/nix",
+    "/bin",
+    "/run/current-system",
+];
+
+/// The process PATH split into absolute directory entries. Relative and
+/// empty entries are dropped — the sandbox only ever mirrors absolute host
+/// paths.
+pub fn path_entries() -> Vec<PathBuf> {
+    std::env::var("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .filter(|e| e.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True if `path` lives under a sandbox bind root ([`SANDBOX_RO_ROOTS`])
+/// — the sandbox binds those roots at the same host path, so anything
+/// under them is visible to a sandboxed build. Component-wise, so a
+/// sibling prefix (`/usrlocal`) does not match.
+pub fn sandbox_visible(path: &Path) -> bool {
+    SANDBOX_RO_ROOTS.iter().any(|root| path.starts_with(root))
+}
+
+/// PATH entries the sandbox can actually see: under a bind root AND still
+/// present on the host. A garbage-collected `/nix/store/...` entry is
+/// bound via `/nix` but its directory no longer exists — it resolves
+/// nothing and is dropped, matching what the sandbox would see.
+pub fn sandbox_visible_entries(entries: &[PathBuf]) -> Vec<PathBuf> {
+    sandbox_visible_entries_with(entries, &[])
+}
+
+/// Like [`sandbox_visible_entries`], but `extra_roots` are host paths the
+/// sandbox binds at their own location — the stage dir is rw-bound at its
+/// host path, so tools under it resolve inside the sandbox.
+pub fn sandbox_visible_entries_with(entries: &[PathBuf], extra_roots: &[PathBuf]) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .filter(|e| {
+            (sandbox_visible(e) || extra_roots.iter().any(|r| e.starts_with(r))) && e.is_dir()
+        })
+        .cloned()
+        .collect()
+}
+
+/// First existing, executable match for `name` in `entries` (PATH order —
+/// the same resolution `sh` performs).
+pub fn resolve_in_path(name: &str, entries: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    entries
+        .iter()
+        .map(|entry| entry.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+/// Shell keywords and POSIX sh builtins — never resolved through PATH.
+const SHELL_WORDS: [&str; 59] = [
+    "if", "then", "else", "elif", "fi", "do", "done", "case", "esac", "while", "until", "for",
+    "in", "function", "select", "time", "{", "}", "!", "[[", "]]", ":", ".", "alias", "bg",
+    "break", "cd", "command", "continue", "echo", "eval", "exec", "exit", "export", "false", "fg",
+    "getopts", "hash", "jobs", "kill", "local", "printf", "pwd", "read", "readonly", "return",
+    "set", "shift", "test", "times", "trap", "true", "type", "ulimit", "umask", "unalias", "unset",
+    "wait", "[",
+];
+
+/// Command words in `cmd` that `sh` would resolve through PATH: the first
+/// word of each `&&`/`||`/`;`/`|`/newline-separated segment, after
+/// skipping leading variable assignments (`DESTDIR=$STAGE cmake ...`).
+/// Only `&&` separates commands — a lone `&` is a background mark or part
+/// of a redirection (`2>&1`) and must not split the segment. Words naming
+/// a direct path, a variable, a glob, or a shell builtin resolve outside
+/// PATH and are not probed.
+fn path_resolved_words(cmd: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for chunk in cmd.split("&&") {
+        for segment in chunk.split(['|', ';', '\n']) {
+            for word in segment.split_whitespace() {
+                if is_variable_assignment(word) {
+                    continue;
+                }
+                let word = unquote(word);
+                if is_path_resolved_word(word) {
+                    words.push(word.to_string());
+                }
+                break;
+            }
+        }
+    }
+    words
+}
+
+/// True if `word` (unquoted) is a bare command name the shell resolves
+/// through PATH — no path separators, variables, globs, redirections,
+/// quotes, or shell keywords/builtins.
+fn is_path_resolved_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && !word.contains(['/', '$', '`', '<', '>', '*', '?', '[', '"', '\''])
+        && !SHELL_WORDS.contains(&word)
+}
+
+/// Strip one layer of matching surrounding quotes.
+fn unquote(word: &str) -> &str {
+    let quoted = word.len() >= 2
+        && (word.starts_with('"') && word.ends_with('"')
+            || word.starts_with('\'') && word.ends_with('\''));
+    if quoted {
+        &word[1..word.len() - 1]
+    } else {
+        word
+    }
+}
+
+/// True for `NAME=value` words — environment assignments prefixing a
+/// command, not the command itself.
+fn is_variable_assignment(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) => {
+            let mut chars = name.chars();
+            match chars.next() {
+                Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+                _ => return false,
+            }
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// Fail a sandboxed build BEFORE running it when its command needs a tool
+/// the sandbox cannot see. Each PATH-resolved command word is resolved
+/// against the sandbox-visible PATH ([`sandbox_visible_entries`]); an
+/// invisible tool becomes a named error instead of an obscure mid-build
+/// failure (e.g. autotools `config.status` breaking because `make` sat
+/// only on an unbound PATH entry or was garbage-collected out of
+/// /nix/store). Tools shadowed by an unbound entry but also present under
+/// a bind root resolve fine and pass.
+pub fn preflight_sandbox_tools(cmd: &str, entries: &[PathBuf]) -> miette::Result<()> {
+    preflight_sandbox_tools_with(cmd, entries, &[])
+}
+
+/// Like [`preflight_sandbox_tools`], with `extra_roots`: host paths the
+/// sandbox binds at their own location (the stage dir), so PATH entries
+/// under them count as sandbox-visible.
+pub fn preflight_sandbox_tools_with(
+    cmd: &str,
+    entries: &[PathBuf],
+    extra_roots: &[PathBuf],
+) -> miette::Result<()> {
+    let visible = sandbox_visible_entries_with(entries, extra_roots);
+    for word in path_resolved_words(cmd) {
+        if resolve_in_path(&word, &visible).is_some() {
+            continue;
+        }
+        return Err(sandbox_tool_error(&word, entries));
+    }
+    Ok(())
+}
+
+/// The named, actionable error for a build tool the sandbox cannot see.
+fn sandbox_tool_error(tool: &str, entries: &[PathBuf]) -> miette::Error {
+    let roots = SANDBOX_RO_ROOTS.join(", ");
+    match resolve_in_path(tool, entries) {
+        Some(host_path) => miette::miette!(
+            "tool '{tool}' resolves on the host to '{host}' via PATH entry '{entry}', which is \
+             outside the sandbox bind roots ({roots}) — sandboxed builds cannot see it. \
+             Fix: install it system-wide or under another bound root (devbox profile dirs \
+             like .devbox/nix/profile are not bound).",
+            host = host_path.display(),
+            entry = host_path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+        None => miette::miette!(
+            "tool '{tool}' was not found in any sandbox-visible PATH directory (bind roots: \
+             {roots}). Fix: install it — e.g. add its package to devbox.json and re-run from \
+             a fresh devbox shell (a 'nix store' GC can remove /nix/store paths a stale shell \
+             still exports on PATH).",
+        ),
+    }
+}
+
 /// Best-effort markers that a failed build was trying to reach the network.
 /// The sandbox unshares the net, so a build that downloads anything fails
 /// confusingly — sources must come from the definition instead.
@@ -2341,15 +2544,14 @@ fn run_build_child(
 }
 
 /// Read-only system paths for toolchain, shebangs, and Nix/devbox builds.
+/// The bind set is [`SANDBOX_RO_ROOTS`] — doctor's sandbox-visibility
+/// check and the build pre-flight resolve tools against the same list.
+/// Each root is bound only when it exists (bwrap errors on missing bind
+/// sources; the FHS roots exist on every host where sandboxed builds run).
 fn bind_system_ro_paths(cmd: &mut std::process::Command) {
-    cmd.arg("--ro-bind").arg("/usr").arg("/usr");
-    cmd.arg("--ro-bind").arg("/lib").arg("/lib");
-    ro_bind_if_exists(cmd, "/lib64");
-    // Nix store (for NixOS/devbox builds)
-    ro_bind_if_exists(cmd, "/nix");
-    // Essential system paths (for shebangs, etc.)
-    ro_bind_if_exists(cmd, "/bin");
-    ro_bind_if_exists(cmd, "/run/current-system");
+    for root in SANDBOX_RO_ROOTS {
+        ro_bind_if_exists(cmd, root);
+    }
 }
 
 /// Run the build command inside a bubblewrap sandbox.
@@ -2366,6 +2568,11 @@ fn run_bwrapped(
     part_name: Option<&str>,
     extra_env: &[(String, String)],
 ) -> miette::Result<()> {
+    // Tool resolution must work the way the sandbox will see it — fail
+    // here, naming the tool, instead of mid-build (see
+    // `preflight_sandbox_tools_with`). The stage dir is bound at its own
+    // host path, so PATH entries under it are visible.
+    preflight_sandbox_tools_with(cmd, &path_entries(), &[stage_dir.to_path_buf()])?;
     // Map a host path under the build dir to its sandbox path under /build.
     let to_inner = |p: &Path| -> std::path::PathBuf {
         if p == build_path {
@@ -6300,5 +6507,181 @@ fi
             !yaml.contains("source"),
             "snap.yaml must not carry a source key, got: {yaml}"
         );
+    }
+
+    // ── sandbox tool visibility (bind roots, build pre-flight) ──
+
+    use std::path::PathBuf;
+
+    fn write_exec(dir: &Path, name: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn sandbox_visible_matches_bind_roots_componentwise() {
+        assert!(sandbox_visible(Path::new("/usr/bin/make")));
+        assert!(sandbox_visible(Path::new(
+            "/nix/store/abc-gnumake-4.4.1/bin/make"
+        )));
+        assert!(sandbox_visible(Path::new("/run/current-system/sw/bin/ls")));
+        // Component-wise: a sibling prefix must not match.
+        assert!(!sandbox_visible(Path::new("/usrlocal/bin/make")));
+        assert!(!sandbox_visible(Path::new("/nixpkgs/bin/make")));
+        // The failure fixtures: unbound profile dirs and relative paths.
+        assert!(!sandbox_visible(Path::new(
+            "/home/u/proj/.devbox/nix/profile/default/bin/bison"
+        )));
+        assert!(!sandbox_visible(Path::new("relative/bin/make")));
+    }
+
+    #[test]
+    fn sandbox_visible_entries_keep_bound_existing_dirs_only() {
+        let unbound = tempfile::tempdir().unwrap();
+        // Whichever bind root exists on this host (FHS /usr, or /nix on a
+        // NixOS/devbox box).
+        let bound_root = SANDBOX_RO_ROOTS
+            .iter()
+            .find(|r| Path::new(r).is_dir())
+            .map(PathBuf::from)
+            .expect("test host must have at least one sandbox bind root");
+        // A /nix path that does not exist is invisible exactly like a
+        // garbage-collected store path — bound via /nix, resolves nothing.
+        let entries = vec![
+            bound_root.clone(),
+            unbound.path().to_path_buf(),
+            PathBuf::from("/nix/store/00000000000000000000000000000000-gnumake-4.4.1/bin"),
+        ];
+        assert_eq!(sandbox_visible_entries(&entries), vec![bound_root]);
+    }
+
+    #[test]
+    fn resolve_in_path_follows_path_order_and_checks_exec() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        write_exec(first.path(), "tool-probe");
+        let entries = vec![second.path().to_path_buf(), first.path().to_path_buf()];
+        assert_eq!(
+            resolve_in_path("tool-probe", &entries),
+            Some(first.path().join("tool-probe"))
+        );
+        // A non-executable file is not resolved.
+        std::fs::write(first.path().join("plain"), "").unwrap();
+        assert_eq!(resolve_in_path("plain", &entries), None);
+        assert_eq!(resolve_in_path("absent", &entries), None);
+    }
+
+    #[test]
+    fn preflight_names_tool_visible_only_on_unbound_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "make");
+        let entries = vec![dir.path().to_path_buf()];
+        let err = preflight_sandbox_tools("make -C $SRC", &entries)
+            .expect_err("tool on an unbound PATH entry must fail preflight");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("make"), "error must name the tool: {msg}");
+        assert!(
+            msg.contains(&dir.path().display().to_string()),
+            "error must name the invisible PATH entry: {msg}"
+        );
+        assert!(msg.contains("not bound"), "error must carry the fix: {msg}");
+    }
+
+    #[test]
+    fn preflight_names_tool_missing_after_store_gc() {
+        // A garbage-collected /nix/store entry: under a bind root but the
+        // dir no longer exists — invisible to the sandbox.
+        let entries = vec![
+            PathBuf::from("/nix/store/00000000000000000000000000000000-gnumake-4.4.1/bin"),
+            PathBuf::from("/usr/bin"),
+        ];
+        let err = preflight_sandbox_tools("make-gc-victim", &entries)
+            .expect_err("a GC'd store path must fail preflight");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("make-gc-victim"),
+            "error must name the tool: {msg}"
+        );
+        assert!(
+            msg.contains("GC"),
+            "error must mention the GC failure mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_probes_only_bare_path_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = vec![dir.path().to_path_buf()];
+        // Nothing here resolves through PATH: assignments, direct paths,
+        // variables, builtins, redirections are all skipped.
+        preflight_sandbox_tools(
+            "DESTDIR=$STAGE ./configure --prefix=/usr && $SRC/configure --prefix=/usr \
+             && cd $SRC && echo built > log 2>&1",
+            &entries,
+        )
+        .expect("no bare PATH-resolved words to probe");
+    }
+
+    #[test]
+    fn preflight_probes_each_segments_command() {
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "flex");
+        let entries = vec![dir.path().to_path_buf()];
+        // The second segment's command is probed even though the first
+        // segment's word (./configure) is a direct path.
+        let err = preflight_sandbox_tools("./configure --prefix=/usr && flex -o out", &entries)
+            .expect_err("flex is only on an unbound entry");
+        assert!(format!("{err:#}").contains("flex"));
+    }
+
+    #[test]
+    fn preflight_probes_command_after_assignment_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "bison");
+        let entries = vec![dir.path().to_path_buf()];
+        let err = preflight_sandbox_tools("BISON_PKGDATADIR=$SRC bison -d grammar.y", &entries)
+            .expect_err("assignment prefixes must not hide the command");
+        assert!(format!("{err:#}").contains("bison"));
+    }
+
+    #[test]
+    fn preflight_accepts_tools_under_the_stage_bind() {
+        // The stage dir is rw-bound at its own host path, so stub tools
+        // under it (the plugin-e2e harness pattern) are sandbox-visible.
+        let stage = tempfile::tempdir().unwrap();
+        let stubs = stage.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_exec(&stubs, "cmake");
+        let entries = vec![stubs];
+        let stage_root = stage.path().to_path_buf();
+        preflight_sandbox_tools_with(
+            "DESTDIR=$STAGE cmake -S $SRC -B build",
+            &entries,
+            std::slice::from_ref(&stage_root),
+        )
+        .expect("stage-bound tools are visible to the sandbox");
+        // The same setup fails without the stage bind.
+        assert!(preflight_sandbox_tools_with("cmake -S $SRC", &entries, &[]).is_err());
+    }
+
+    #[test]
+    fn bind_system_ro_paths_binds_declared_roots_that_exist() {
+        let mut cmd = std::process::Command::new("true");
+        bind_system_ro_paths(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for root in SANDBOX_RO_ROOTS {
+            if !Path::new(root).exists() {
+                continue;
+            }
+            assert!(
+                args.windows(3).any(|w| w == ["--ro-bind", root, root]),
+                "expected --ro-bind {root} {root}, got {args:?}"
+            );
+        }
     }
 }
