@@ -21,6 +21,7 @@ use mlua::Value;
 use serde::Serialize;
 use serde::Serializer;
 
+use crate::doctor;
 use crate::lock::LockFile;
 use crate::snap::{self, SnapRef};
 use crate::store::{ResolvedSnap, StoreClient};
@@ -682,9 +683,15 @@ pub fn build_image(
 /// ADR-0011 step (a): when a kernel is declared, a UKI (Unified Kernel
 /// Image) is assembled with `ukify` and installed on the ESP at
 /// `EFI/Linux/<name>_<version>.efi` alongside a `loader/loader.conf`, so
-/// declared kernel params land on the real boot cmdline. Every condition
-/// that would yield an unbootable image — missing ukify, missing sd-stub,
-/// no kernel payload, no root partition — fails closed.
+/// declared kernel params land on the real boot cmdline. ADR-0011 step (c):
+/// the root partition is populated first, then dm-verity is formatted over
+/// it (`veritysetup`) into an auto-appended hash partition, and the captured
+/// roothash is embedded in the UKI cmdline (explicit
+/// `systemd.verity_root_data`/`systemd.verity_root_hash` by-partuuid
+/// devices — boot needs no dm-verity type GUIDs). Every condition that
+/// would yield an unbootable or unverifiable image — missing ukify, missing
+/// sd-stub, missing veritysetup, no kernel payload, no root partition —
+/// fails closed, before any partition is formatted.
 pub fn build_disk_image(
     image: &ImageDeclaration,
     output_dir: &Path,
@@ -762,62 +769,134 @@ pub fn build_disk_image(
     let output_path = output_dir.join(&output_filename);
     std::fs::create_dir_all(output_dir).into_diagnostic()?;
 
+    // 6. ADR-0011 step (c) pre-flight — kernel images need ukify, the
+    // sd-stub, and veritysetup; fail closed BEFORE any destructive step
+    // (dd/parted/mkfs), so an unbootable or unverifiable image is never
+    // half-written. The kernel config audit is warn-only: dm-verity needs
+    // CONFIG_DM_VERITY=y, but a config-less payload is common and the
+    // kernel decides at boot, so the audit never fails the build.
+    let verity = image.kernel.is_some();
+    if verity {
+        preflight_disk_tools_with(
+            find_ukify().as_deref(),
+            find_efi_stub().as_deref(),
+            find_veritysetup().as_deref(),
+        )?;
+        if let Some(payload) = kernel_payload.as_ref() {
+            doctor::audit_kernel_verity_config(&root, &payload.version);
+        }
+    }
+
+    // 6b. Effective layout: kernel images get a dm-verity hash partition
+    // appended after the declared partitions — existing indices never shift
+    // and the parted flow is untouched.
+    let mut effective_layout = disk_layout.clone();
+    let hash_partition_index = if verity {
+        Some(append_verity_hash_partition(&mut effective_layout)?)
+    } else {
+        None
+    };
+
     // Calculate total image size: sum partitions + swap + 4M for GPT headers
-    let total_mb = calculate_disk_size_mb(disk_layout);
+    let total_mb = calculate_disk_size_mb(&effective_layout);
     eprintln!("  creating disk image: {} MB", total_mb);
 
-    // 6. Create and partition the raw image — GPT PARTUUIDs exist from
+    // 7. Create and partition the raw image — GPT PARTUUIDs exist from
     // parted mkpart time, before anything is formatted or copied.
     let img_path = build_dir.path().join("disk.img");
-    create_partitions(&img_path, disk_layout, total_mb)?;
+    create_partitions(&img_path, &effective_layout, total_mb)?;
 
-    // 7. Attach the image to a loop device with partition scanning.
+    // 8. Attach the image to a loop device with partition scanning.
     let loop_dev = attach_loop(&img_path)?;
 
-    // 8. ADR-0011 step (a): assemble the UKI — compose the cmdline from
-    // declared kernel parts plus root=PARTUUID (captured from the loop
-    // device's partitions), shell out to `ukify`, and capture the boot
-    // facts. Missing tools or payload fail closed here, before any
-    // partition is formatted, so an unbootable image is never emitted.
-    let (uki, uki_stage) = assemble_uki(
-        image,
-        kernel_payload.as_ref(),
-        &loop_dev,
-        disk_layout,
-        build_dir.path(),
-    )?;
+    // 9. ADR-0011 step (c): the pipeline order below is mandatory — the root
+    // partition is populated and UNMOUNTED first, then dm-verity formats it
+    // (the data device must be final before hashing; a cmdline is immutable
+    // once the UKI is later signed), then the UKI embeds the captured
+    // roothash in its cmdline.
+    let (uki, uki_stage, populated_root) = if verity {
+        // 9a. Rootfs-level manifest only: boot facts (cmdline, roothash) are
+        // unknowable until after verity format, and a post-format write
+        // would break the Merkle tree. The root partition therefore carries
+        // the content manifest; the authoritative boot-facts manifest is
+        // written below and lands on the remaining partitions.
+        write_manifest(&root, image, &snap_paths, arch, None)?;
+        // 9b. Populate the root partition, then leave it unmounted —
+        // veritysetup format requires the data device quiescent.
+        populate_root_partition(&effective_layout, &loop_dev, &root, build_dir.path())?;
+        // 9c. Format dm-verity over the root (data) device into the hash
+        // partition and capture the root hash — fail closed on parse.
+        let root_idx = root_partition_index(&effective_layout)?;
+        let root_dev = partition_dev(&loop_dev, root_idx);
+        let hash_idx = hash_partition_index.expect("verity ⇒ hash partition was appended");
+        let hash_dev = partition_dev(&loop_dev, hash_idx);
+        let roothash = verity_format(&root_dev, &hash_dev)?;
+        eprintln!("  ✓ dm-verity formatted over {}", root_dev);
+        let hash_partuuid = partuuid_of(&hash_dev);
+        if hash_partuuid.is_none() {
+            eprintln!(
+                "  ⚠ hash PARTUUID unresolvable — cmdline carries the documented \
+                 nil-GUID placeholder"
+            );
+        }
+        let verity_args = VerityBootArgs {
+            roothash,
+            hash_partuuid,
+        };
+        // 9d. ADR-0011 step (a): assemble the UKI with the verity trailer.
+        let (uki, stage) = assemble_uki(
+            image,
+            kernel_payload.as_ref(),
+            &loop_dev,
+            &effective_layout,
+            build_dir.path(),
+            Some(&verity_args),
+        )?;
+        (uki, stage, Some(root_idx))
+    } else {
+        // Kernel-free images boot without a UKI — no verity, no trailer.
+        let (uki, stage) = assemble_uki(
+            image,
+            kernel_payload.as_ref(),
+            &loop_dev,
+            &effective_layout,
+            build_dir.path(),
+            None,
+        )?;
+        (uki, stage, None)
+    };
 
-    // 9. Write manifest — threaded with the boot facts the image boots with
-    let manifest_path = root.join("image-manifest.json");
-    let manifest = ImageManifest::from_resolved(image, &snap_paths, arch, uki.as_ref());
-    let manifest_json = serde_json::to_string_pretty(&manifest)
-        .map_err(|e| miette::miette!("failed to serialize manifest: {e}"))?;
-    std::fs::write(&manifest_path, &manifest_json).into_diagnostic()?;
+    // 10. Write the authoritative manifest — threaded with the boot facts
+    // the image boots with, including the dm-verity roothash (step (c)).
+    write_manifest(&root, image, &snap_paths, arch, uki.as_ref())?;
 
-    // 10. Format and populate partitions (the ESP gets the UKI + loader.conf)
-    populate_partitions(
+    // 11. Format and populate the remaining partitions — the ESP gets the
+    // UKI + loader.conf; other data partitions receive the staged rootfs
+    // (with the authoritative manifest). The root partition is skipped: it
+    // was populated and verity-formatted above.
+    let populate = PopulateCtx {
         image,
-        disk_layout,
-        &loop_dev,
-        build_dir.path(),
-        &root,
-        uki.as_ref(),
-        &uki_stage,
-    )?;
+        loop_dev: &loop_dev,
+        build_dir: build_dir.path(),
+        root: &root,
+        uki: uki.as_ref(),
+        uki_stage: &uki_stage,
+    };
+    populate_remaining_partitions(&populate, &effective_layout, populated_root)?;
 
     // Detach loop device
     let _ = std::process::Command::new("losetup")
         .args(["-d", &loop_dev])
         .status();
 
-    // 11. Copy final image to output
+    // 12. Copy final image to output
     std::fs::copy(&img_path, &output_path).into_diagnostic()?;
     eprintln!(
         "  ✓ disk image built: {} ({} MB)",
         output_filename, total_mb
     );
 
-    // 12. Update lockfile
+    // 13. Update lockfile
     for snap in &resolved {
         lockfile.record_snap(&snap.to_snap_ref());
     }
@@ -1029,43 +1108,104 @@ fn attach_loop(img_path: &Path) -> miette::Result<String> {
     Ok(dev)
 }
 
-/// Format every declared partition on the attached loop device and
-/// populate it: partition 1 when vfat is the ESP (systemd-boot fallback
-/// binary, UKI, loader.conf); every other partition receives the staged
-/// rootfs.
-fn populate_partitions(
-    image: &ImageDeclaration,
+/// Shared context for the populate stage — everything the per-partition
+/// workers need besides the partition itself.
+struct PopulateCtx<'a> {
+    image: &'a ImageDeclaration,
+    loop_dev: &'a str,
+    build_dir: &'a Path,
+    root: &'a Path,
+    uki: Option<&'a UkiFacts>,
+    uki_stage: &'a Path,
+}
+
+/// Format, mount, and populate ONLY the root partition (mount = "/") from
+/// the staged rootfs, then unmount it. ADR-0011 step (c): `veritysetup
+/// format` needs the data device final and quiescent, so the root goes
+/// first and stays unmounted. A mount failure here fails closed — an empty
+/// verity data device would brick the boot — unlike the historical
+/// silent-skip on the other partitions.
+fn populate_root_partition(
     layout: &DiskLayout,
     loop_dev: &str,
-    build_dir: &Path,
     root: &Path,
-    uki: Option<&UkiFacts>,
-    uki_stage: &Path,
+    build_dir: &Path,
 ) -> miette::Result<()> {
-    let part_prefix = format!("{loop_dev}p");
-    for (i, part) in layout.partitions.iter().enumerate() {
-        let part_dev = format!("{part_prefix}{}", i + 1);
-        let mount_pt = build_dir.join(&part.name);
-        std::fs::create_dir_all(&mount_pt).into_diagnostic()?;
+    let idx = root_partition_index(layout)?;
+    let part = &layout.partitions[idx];
+    let part_dev = partition_dev(loop_dev, idx);
+    let mount_pt = build_dir.join(&part.name);
+    std::fs::create_dir_all(&mount_pt).into_diagnostic()?;
 
-        format_partition(&part_dev, part)?;
-        if !mount_device(&part_dev, &mount_pt)? {
+    format_partition(&part_dev, part)?;
+    if !mount_device(&part_dev, &mount_pt)? {
+        return Err(miette::miette!(
+            "failed to mount root partition '{}' ({part_dev}) — refusing to \
+             dm-verity-format an unpopulated root",
+            part.name
+        ));
+    }
+    cp_r(root, &mount_pt)?;
+    eprintln!("  ✓ {}: {} populated", part.name, part.fs);
+    // Unmount
+    let _ = std::process::Command::new("umount")
+        .arg(mount_pt.to_string_lossy().as_ref())
+        .status();
+    Ok(())
+}
+
+/// Format and populate every partition EXCEPT the root (already populated
+/// before dm-verity formatting, [`populate_root_partition`]) and the
+/// auto-appended verity-hash partition (raw `veritysetup` output — never
+/// mounted or mkfs'd). Partition 1 when vfat is the ESP (systemd-boot
+/// fallback binary, UKI, loader.conf); every other partition receives the
+/// staged rootfs.
+fn populate_remaining_partitions(
+    ctx: &PopulateCtx,
+    layout: &DiskLayout,
+    populated_root: Option<usize>,
+) -> miette::Result<()> {
+    let part_prefix = format!("{}p", ctx.loop_dev);
+    for (i, part) in layout.partitions.iter().enumerate() {
+        if Some(i) == populated_root || part.name == VERITY_HASH_PART_NAME {
             continue;
         }
-        if i == 0 && part.fs == "vfat" {
-            populate_esp(&mount_pt.join("EFI").join("BOOT"))?;
-            install_uki(image, &mount_pt, uki, uki_stage)?;
-            eprintln!("  ✓ ESP: {} (vfat)", part.name);
-        } else {
-            // Root (or data) partition: copy the staged rootfs
-            cp_r(root, &mount_pt)?;
-            eprintln!("  ✓ {}: {} populated", part.name, part.fs);
-        }
-        // Unmount
-        let _ = std::process::Command::new("umount")
-            .arg(mount_pt.to_string_lossy().as_ref())
-            .status();
+        populate_side_partition(ctx, i, part, &part_prefix)?;
     }
+    Ok(())
+}
+
+/// Format, mount, populate, and unmount one non-root partition: the ESP
+/// (partition 1, vfat) gets the systemd-boot fallback + UKI; other data
+/// partitions receive the staged rootfs. A mount failure leaves the
+/// partition unpopulated (historical silent-skip behavior).
+fn populate_side_partition(
+    ctx: &PopulateCtx,
+    index: usize,
+    part: &Partition,
+    part_prefix: &str,
+) -> miette::Result<()> {
+    let part_dev = format!("{part_prefix}{}", index + 1);
+    let mount_pt = ctx.build_dir.join(&part.name);
+    std::fs::create_dir_all(&mount_pt).into_diagnostic()?;
+
+    format_partition(&part_dev, part)?;
+    if !mount_device(&part_dev, &mount_pt)? {
+        return Ok(());
+    }
+    if index == 0 && part.fs == "vfat" {
+        populate_esp(&mount_pt.join("EFI").join("BOOT"))?;
+        install_uki(ctx.image, &mount_pt, ctx.uki, ctx.uki_stage)?;
+        eprintln!("  ✓ ESP: {} (vfat)", part.name);
+    } else {
+        // Data partition: copy the staged rootfs
+        cp_r(ctx.root, &mount_pt)?;
+        eprintln!("  ✓ {}: {} populated", part.name, part.fs);
+    }
+    // Unmount
+    let _ = std::process::Command::new("umount")
+        .arg(mount_pt.to_string_lossy().as_ref())
+        .status();
     Ok(())
 }
 
@@ -1098,6 +1238,234 @@ fn mount_device(part_dev: &str, mount_pt: &Path) -> miette::Result<bool> {
         .status()
         .map_err(|e| miette::miette!("mount not found: {e}"))?;
     Ok(status.success())
+}
+
+// ── dm-verity over the root partition (ADR-0011 step (c)) ──
+
+/// Name of the auto-appended dm-verity hash partition. It is formatted only
+/// implicitly by `veritysetup format` — never mkfs'd, never mounted — and
+/// is identified by this name in the populate stage.
+const VERITY_HASH_PART_NAME: &str = "verity-hash";
+
+/// `veritysetup format` stdout marker of the root hash line.
+const ROOT_HASH_PREFIX: &str = "Root hash:";
+
+/// dm-verity boot arguments captured during `veritysetup format` and
+/// threaded into UKI assembly.
+struct VerityBootArgs {
+    /// 64-hex sha256 root hash from `veritysetup format`.
+    roothash: String,
+    /// GPT PARTUUID of the hash partition, when resolvable.
+    hash_partuuid: Option<String>,
+}
+
+/// Index of the declared root partition (mount = "/") — fail closed when
+/// absent: both the UKI `root=` target and dm-verity formatting need it.
+fn root_partition_index(layout: &DiskLayout) -> miette::Result<usize> {
+    layout
+        .partitions
+        .iter()
+        .position(|p| p.mount == "/")
+        .ok_or_else(|| {
+            miette::miette!(
+                "disk layout declares no root partition (mount = \"/\") — the UKI needs \
+                 a root= target; refusing to build an unbootable image"
+            )
+        })
+}
+
+/// Loop-device partition path for a 0-based layout index (index 0 → p1).
+fn partition_dev(loop_dev: &str, index: usize) -> String {
+    format!("{loop_dev}p{}", index + 1)
+}
+
+/// Size in bytes of the dm-verity hash partition for a data device of
+/// `data_bytes`: with sha256 over 4K data blocks and 4K hash blocks, one
+/// hash block covers 512 KiB of data (128 × 32-byte digests), so the Merkle
+/// tree needs ceil(data_bytes / 4096 / 128) 4K blocks; +1 MiB slack covers
+/// the veritysetup superblock and alignment; floored at 2 MiB so tiny roots
+/// still get a usable partition.
+fn verity_hash_partition_bytes(data_bytes: u64) -> u64 {
+    (data_bytes.div_ceil(4096 * 128) * 4096 + 1024 * 1024).max(2 * 1024 * 1024)
+}
+
+/// Append the dm-verity hash partition for the root device at the END of
+/// the layout — existing partition indices never shift. Returns the new
+/// partition's index.
+///
+/// The root size is parsed the same way [`calculate_disk_size_mb`] does
+/// ("0"/fill roots use the same 1024 MB default): overshooting the hash
+/// area is harmless, undersizing it fails `veritysetup format`.
+fn append_verity_hash_partition(layout: &mut DiskLayout) -> miette::Result<usize> {
+    let root_idx = root_partition_index(layout)?;
+    let root_mb = parse_size_mb(&layout.partitions[root_idx].size, 1024);
+    let hash_bytes = verity_hash_partition_bytes(root_mb * 1024 * 1024);
+    let hash_mb = hash_bytes.div_ceil(1024 * 1024);
+    layout.partitions.push(Partition {
+        name: VERITY_HASH_PART_NAME.to_string(),
+        size: format!("{hash_mb}M"),
+        // "ext2" is a valid parted fs-type hint for both GPT and MBR labels;
+        // the partition is never mkfs'd (see VERITY_HASH_PART_NAME).
+        fs: "ext2".to_string(),
+        mount: String::new(),
+        options: vec![],
+    });
+    Ok(layout.partitions.len() - 1)
+}
+
+/// Resolve `veritysetup` with the same bind-aware PATH resolution ukify
+/// uses ([`find_ukify`]).
+fn find_veritysetup() -> Option<PathBuf> {
+    snap::resolve_in_path("veritysetup", &snap::path_entries())
+}
+
+/// Host tool pre-flight for kernel disk images — fail closed BEFORE any
+/// destructive step (dd/parted/mkfs) so an unbootable or unverifiable image
+/// is never half-written. Each Option is the host resolution of a required
+/// tool; None fires the matching doctor-hinted error without running
+/// anything (mirrors [`build_uki_with`]'s injected-tool pattern).
+fn preflight_disk_tools_with(
+    ukify: Option<&Path>,
+    stub: Option<&Path>,
+    veritysetup: Option<&Path>,
+) -> miette::Result<()> {
+    if ukify.is_none() {
+        return Err(miette::miette!(
+            "ukify not found on PATH — a kernel disk image cannot boot without a UKI, \
+             so refusing to produce an unbootable image. Run 'shuttle doctor' and \
+             install ukify (systemd >= 254; e.g. apt install systemd-ukify or add \
+             systemd to devbox.json packages)"
+        ));
+    }
+    if stub.is_none() {
+        return Err(miette::miette!(
+            "systemd sd-stub (linuxx64.efi.stub) not found — the UKI cannot be assembled \
+             without it. Run 'shuttle doctor'; checked locations: {}",
+            EFI_STUB_CANDIDATES.join(", ")
+        ));
+    }
+    if veritysetup.is_none() {
+        return Err(miette::miette!(
+            "veritysetup not found on PATH — dm-verity over the root partition cannot \
+             be formatted, so refusing to emit an unverifiable boot path. Run \
+             'shuttle doctor' and install veritysetup (cryptsetup >= 2.4; e.g. \
+             apt install cryptsetup or add cryptsetup to devbox.json packages)"
+        ));
+    }
+    Ok(())
+}
+
+/// `veritysetup format` invocation (ADR-0011 step (c)): sha256 over 4K data
+/// and hash blocks, on-disk format 1. `veritysetup` is injected so the
+/// fail-closed behavior is testable on hosts without cryptsetup;
+/// [`verity_format`] resolves it from the host. Returns the root hash
+/// printed on stdout.
+fn verity_format_with(
+    veritysetup: Option<&Path>,
+    data_dev: &str,
+    hash_dev: &str,
+) -> miette::Result<String> {
+    let Some(tool) = veritysetup else {
+        return Err(miette::miette!(
+            "veritysetup not found on PATH — dm-verity over the root partition cannot \
+             be formatted, so refusing to emit an unverifiable boot path. Run \
+             'shuttle doctor' and install veritysetup (cryptsetup >= 2.4; e.g. \
+             apt install cryptsetup or add cryptsetup to devbox.json packages)"
+        ));
+    };
+    let out = std::process::Command::new(tool)
+        .args([
+            "format",
+            "--hash",
+            "sha256",
+            "--data-block-size",
+            "4096",
+            "--hash-block-size",
+            "4096",
+            "--format",
+            "1",
+            data_dev,
+            hash_dev,
+        ])
+        .output()
+        .map_err(|e| miette::miette!("failed to run veritysetup: {e}"))?;
+    if !out.status.success() {
+        return Err(miette::miette!(
+            "veritysetup format failed ({}): {}",
+            out.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    parse_roothash(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Format dm-verity over `data_dev` into `hash_dev` with host-resolved
+/// veritysetup (fail-closed when absent).
+fn verity_format(data_dev: &str, hash_dev: &str) -> miette::Result<String> {
+    verity_format_with(find_veritysetup().as_deref(), data_dev, hash_dev)
+}
+
+/// Extract the root hash from `veritysetup format` stdout — the
+/// `Root hash: <64-hex>` line. Anything else fails closed: a mangled hash
+/// would be baked into a cmdline that is immutable once signed.
+fn parse_roothash(stdout: &str) -> miette::Result<String> {
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with(ROOT_HASH_PREFIX))
+        .ok_or_else(|| {
+            miette::miette!(
+                "veritysetup format printed no '{ROOT_HASH_PREFIX}' line — refusing to \
+                 guess the root hash"
+            )
+        })?;
+    let hash = line[ROOT_HASH_PREFIX.len()..].trim();
+    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(hash.to_ascii_lowercase())
+    } else {
+        Err(miette::miette!(
+            "veritysetup printed a malformed root hash ({hash:?}) — expected 64 hex chars"
+        ))
+    }
+}
+
+/// The dm-verity trailing cmdline args (ADR-0011 step (c)): the roothash
+/// plus EXPLICIT by-partuuid data/hash devices, so boot needs no dm-verity
+/// type GUIDs and the parted flow is untouched. Unresolvable PARTUUIDs fall
+/// back to the documented nil-GUID placeholder — loud failure at boot, no
+/// silent boot from the wrong volume.
+fn verity_trailing(
+    roothash: &str,
+    root_partuuid: Option<&str>,
+    hash_partuuid: Option<&str>,
+) -> Vec<String> {
+    vec![
+        format!("roothash={roothash}"),
+        format!(
+            "systemd.verity_root_data=/dev/disk/by-partuuid/{}",
+            root_partuuid.unwrap_or(NIL_PARTUUID)
+        ),
+        format!(
+            "systemd.verity_root_hash=/dev/disk/by-partuuid/{}",
+            hash_partuuid.unwrap_or(NIL_PARTUUID)
+        ),
+    ]
+}
+
+/// Serialize and write the image manifest into the staged rootfs.
+fn write_manifest(
+    root: &Path,
+    image: &ImageDeclaration,
+    snaps: &[(String, ResolvedSnap)],
+    arch: &str,
+    boot: Option<&UkiFacts>,
+) -> miette::Result<()> {
+    let manifest = ImageManifest::from_resolved(image, snaps, arch, boot);
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| miette::miette!("failed to serialize manifest: {e}"))?;
+    std::fs::write(root.join("image-manifest.json"), manifest_json)
+        .into_diagnostic()
+        .wrap_err("writing manifest")?;
+    Ok(())
 }
 
 /// Copy the systemd-boot fallback binary onto the ESP (EFI/BOOT). When no
@@ -1170,6 +1538,9 @@ struct UkiFacts {
     cmdline: String,
     uki_filename: String,
     esp_partuuid: Option<String>,
+    /// dm-verity root hash embedded in the cmdline (ADR-0011 step (c));
+    /// None for images that boot without verity.
+    roothash: Option<String>,
 }
 
 /// GPT PARTUUID emitted when the real root PARTUUID could not be resolved.
@@ -1311,11 +1682,12 @@ fn uki_filename(image: &ImageDeclaration) -> String {
 }
 
 /// Compose the UKI kernel command line from parts — never one opaque
-/// string. A UKI's `.cmdline` section is immutable once built, and
-/// dm-verity boot will later append `roothash=` (Secure Boot will sign the
-/// result), so composition stays programmatic: declared kernel params
+/// string. A UKI's `.cmdline` section is immutable once built, and dm-verity
+/// boot (ADR-0011 step (c)) appends `roothash=` plus the explicit verity
+/// device arguments ([`verity_trailing`]) and Secure Boot will later sign
+/// the result, so composition stays programmatic: declared kernel params
 /// first (user intent), then the `root=` argument derived from the target
-/// root partition, then trailing verity args (reserved, appended last).
+/// root partition, then the trailing verity args (appended last).
 fn compose_cmdline(params: &[String], root_partuuid: Option<&str>, trailing: &[String]) -> String {
     let mut args: Vec<String> = params.to_vec();
     args.push(match root_partuuid {
@@ -1411,13 +1783,16 @@ fn build_uki(
 /// Compose the cmdline, build the UKI into `stage_dir`, and capture the
 /// boot facts for the manifest. The facts are `None` only for kernel-free
 /// images (nothing to boot, no UKI needed); the staged UKI path is empty
-/// then and never used.
+/// then and never used. `verity` carries the ADR-0011 step (c) format-time
+/// roothash — Some exactly when the build verity-formatted the root
+/// partition (kernel images).
 fn assemble_uki(
     image: &ImageDeclaration,
     payload: Option<&KernelPayload>,
     loop_dev: &str,
     layout: &DiskLayout,
     stage_dir: &Path,
+    verity: Option<&VerityBootArgs>,
 ) -> miette::Result<(Option<UkiFacts>, PathBuf)> {
     let Some(entry) = image.kernel.as_ref() else {
         return Ok((None, PathBuf::new()));
@@ -1429,16 +1804,7 @@ fn assemble_uki(
             entry.snap.name
         ));
     };
-    let root_idx = layout
-        .partitions
-        .iter()
-        .position(|p| p.mount == "/")
-        .ok_or_else(|| {
-            miette::miette!(
-                "disk layout declares no root partition (mount = \"/\") — the UKI needs \
-                 a root= target; refusing to build an unbootable image"
-            )
-        })?;
+    let root_idx = root_partition_index(layout)?;
 
     // GPT PARTUUIDs exist from parted mkpart time; `losetup -P` exposes the
     // partition devices before anything is formatted. ESP is partition 1.
@@ -1451,7 +1817,16 @@ fn assemble_uki(
         );
     }
 
-    let cmdline = compose_cmdline(&entry.params, root_partuuid.as_deref(), &[]);
+    let trailing: Vec<String> = verity
+        .map(|v| {
+            verity_trailing(
+                &v.roothash,
+                root_partuuid.as_deref(),
+                v.hash_partuuid.as_deref(),
+            )
+        })
+        .unwrap_or_default();
+    let cmdline = compose_cmdline(&entry.params, root_partuuid.as_deref(), &trailing);
     let filename = uki_filename(image);
     let uki_stage = stage_dir.join(&filename);
     let os_release = write_uki_os_release(stage_dir, image)?;
@@ -1470,6 +1845,7 @@ fn assemble_uki(
             cmdline,
             uki_filename: filename,
             esp_partuuid,
+            roothash: verity.map(|v| v.roothash.clone()),
         }),
         uki_stage,
     ))
@@ -1532,7 +1908,7 @@ pub struct ImageManifest {
     pub kernel_version: Option<String>,
 
     /// Composed UKI cmdline actually installed on the ESP (declared params
-    /// + root= [+ future roothash=]).
+    /// + root= + verity trailer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cmdline: Option<String>,
 
@@ -1543,6 +1919,11 @@ pub struct ImageManifest {
     /// GPT PARTUUID of the ESP, when resolvable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub esp_partuuid: Option<String>,
+
+    /// dm-verity root hash embedded in the UKI cmdline (ADR-0011 step (c))
+    /// — the hash lives on the dedicated trailing verity-hash partition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roothash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1591,6 +1972,7 @@ impl ImageManifest {
             cmdline: boot.map(|b| b.cmdline.clone()),
             uki: boot.map(|b| b.uki_filename.clone()),
             esp_partuuid: boot.and_then(|b| b.esp_partuuid.clone()),
+            roothash: boot.and_then(|b| b.roothash.clone()),
         }
     }
 }
@@ -1849,6 +2231,7 @@ mod tests {
         assert!(manifest.cmdline.is_none());
         assert!(manifest.uki.is_none());
         assert!(manifest.esp_partuuid.is_none());
+        assert!(manifest.roothash.is_none());
     }
 
     #[test]
@@ -1996,6 +2379,286 @@ mod tests {
         );
         assert_eq!(full, format!("{base} roothash=9f86d081"));
         assert!(full.ends_with("root=PARTUUID=abcd roothash=9f86d081"));
+    }
+
+    // ── dm-verity over the root partition (ADR-0011 step (c)) ──
+
+    #[test]
+    fn verity_cmdline_composes_root_then_roothash_then_devices() {
+        // Exact trailer shape: roothash= first, then the explicit
+        // by-partuuid data/hash devices — boot needs no dm-verity type
+        // GUIDs, and every verity argument lands AFTER root=.
+        let trailing = verity_trailing(
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            Some("1234abcd-00aa-bbcc-ddee-ff0011223344"),
+            Some("abcdef01-00aa-bbcc-ddee-ff0011223344"),
+        );
+        let cmdline = compose_cmdline(
+            &["quiet".to_string()],
+            Some("1234abcd-00aa-bbcc-ddee-ff0011223344"),
+            &trailing,
+        );
+        assert_eq!(
+            cmdline,
+            "quiet root=PARTUUID=1234abcd-00aa-bbcc-ddee-ff0011223344 \
+             roothash=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 \
+             systemd.verity_root_data=/dev/disk/by-partuuid/1234abcd-00aa-bbcc-ddee-ff0011223344 \
+             systemd.verity_root_hash=/dev/disk/by-partuuid/abcdef01-00aa-bbcc-ddee-ff0011223344"
+        );
+        let root = cmdline.find("root=PARTUUID=").unwrap();
+        assert!(cmdline.find("roothash=").unwrap() > root, "{cmdline}");
+        assert!(
+            cmdline.find("systemd.verity_root_hash=").unwrap() > root,
+            "{cmdline}"
+        );
+    }
+
+    #[test]
+    fn verity_trailer_falls_back_to_nil_guid() {
+        // Unresolvable PARTUUIDs carry the documented nil-GUID placeholder:
+        // loud failure at boot, never a silent boot from the wrong volume.
+        let hash = "a".repeat(64);
+        let trailing = verity_trailing(&hash, None, None);
+        assert_eq!(
+            trailing,
+            vec![
+                format!("roothash={hash}"),
+                format!("systemd.verity_root_data=/dev/disk/by-partuuid/{NIL_PARTUUID}"),
+                format!("systemd.verity_root_hash=/dev/disk/by-partuuid/{NIL_PARTUUID}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn roothash_parse_extracts_sha256_hex() {
+        // Real veritysetup shape: padded labels, the hash value lowercase
+        // hex. Uppercase input is normalized.
+        let out = "UUID:                     882db884-0000-0000-0000-000000000000\n\
+                   Hash type:                1\n\
+                   Data blocks:              8\n\
+                   Data block size:          4096\n\
+                   Hash block size:          4096\n\
+                   Hash algorithm:           sha256\n\
+                   Salt:                     0000...\n\
+                   Root hash:            9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08\n";
+        assert_eq!(
+            parse_roothash(out).unwrap(),
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    #[test]
+    fn roothash_parse_fails_closed_without_marker() {
+        let err = parse_roothash("UUID: 882db884\nHash algorithm: sha256\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Root hash:") && msg.contains("refusing"),
+            "missing-marker failure must be loud: {msg}"
+        );
+    }
+
+    #[test]
+    fn roothash_parse_fails_closed_on_malformed_hash() {
+        for bad in [
+            "Root hash: 9f86",
+            "Root hash: not-hex-at-all-aaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let err = parse_roothash(bad).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("malformed root hash"),
+                "malformed hash must be refused: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn verity_hash_size_follows_formula() {
+        // sha256/4K: one 4K hash block covers 512 KiB of data.
+        // 1 GiB root → 2048 hash blocks (8 MiB) + 1 MiB slack = 9 MiB.
+        assert_eq!(
+            verity_hash_partition_bytes(1024 * 1024 * 1024),
+            9 * 1024 * 1024
+        );
+        // 512 MiB → 1024 blocks (4 MiB) + 1 MiB = 5 MiB.
+        assert_eq!(
+            verity_hash_partition_bytes(512 * 1024 * 1024),
+            5 * 1024 * 1024
+        );
+        // Ceil rounds partial blocks up: 128 MiB + 1 byte → 257 blocks.
+        assert_eq!(
+            verity_hash_partition_bytes(128 * 1024 * 1024 + 1),
+            257 * 4096 + 1024 * 1024
+        );
+        // Minimum 2 MiB floor for tiny roots.
+        assert_eq!(verity_hash_partition_bytes(0), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn verity_hash_partition_is_appended_last_without_shifting_indices() {
+        let mut layout = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![
+                Partition {
+                    name: "ESP".into(),
+                    size: "512M".into(),
+                    fs: "vfat".into(),
+                    mount: "/boot/efi".into(),
+                    options: vec![],
+                },
+                Partition {
+                    name: "root".into(),
+                    size: "4G".into(),
+                    fs: "ext4".into(),
+                    mount: "/".into(),
+                    options: vec![],
+                },
+            ],
+            swap: None,
+        };
+        let idx = append_verity_hash_partition(&mut layout).unwrap();
+        assert_eq!(idx, 2, "hash partition goes last");
+        assert_eq!(layout.partitions[0].name, "ESP", "indices never shift");
+        assert_eq!(layout.partitions[1].name, "root");
+        assert_eq!(layout.partitions[2].name, VERITY_HASH_PART_NAME);
+        // 4 GiB root: 1048576 4K blocks / 128 = 8192 hash blocks = 32 MiB
+        // + 1 MiB slack = 33 MiB.
+        assert_eq!(layout.partitions[2].size, "33M");
+    }
+
+    #[test]
+    fn verity_hash_partition_requires_a_root_partition() {
+        let mut layout = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![Partition {
+                name: "data".into(),
+                size: "1G".into(),
+                fs: "ext4".into(),
+                mount: "/data".into(),
+                options: vec![],
+            }],
+            swap: None,
+        };
+        let err = append_verity_hash_partition(&mut layout).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("root partition"),
+            "no-root failure must be loud: {err:#}"
+        );
+    }
+
+    #[test]
+    fn preflight_ukify_missing_fails_closed_with_doctor_hint() {
+        let err = preflight_disk_tools_with(
+            None,
+            Some(Path::new("/usr/lib/systemd/boot/efi/linuxx64.efi.stub")),
+            Some(Path::new("/usr/sbin/veritysetup")),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ukify") && msg.contains("shuttle doctor"),
+            "fail-closed error must name ukify and the doctor hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_stub_missing_fails_closed() {
+        let err = preflight_disk_tools_with(
+            Some(Path::new("/usr/bin/ukify")),
+            None,
+            Some(Path::new("/usr/sbin/veritysetup")),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sd-stub") && msg.contains("linuxx64.efi.stub"),
+            "fail-closed error must name the stub: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_veritysetup_missing_fails_closed_with_doctor_hint() {
+        let err = preflight_disk_tools_with(
+            Some(Path::new("/usr/bin/ukify")),
+            Some(Path::new("/usr/lib/systemd/boot/efi/linuxx64.efi.stub")),
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("veritysetup") && msg.contains("shuttle doctor"),
+            "fail-closed error must name veritysetup and the doctor hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_all_tools_present_passes() {
+        preflight_disk_tools_with(
+            Some(Path::new("/usr/bin/ukify")),
+            Some(Path::new("/usr/lib/systemd/boot/efi/linuxx64.efi.stub")),
+            Some(Path::new("/usr/sbin/veritysetup")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verity_format_without_veritysetup_fails_closed() {
+        // Injected None: the fail-closed path fires before any device is
+        // touched, so device names are irrelevant.
+        let err = verity_format_with(None, "/dev/loop0p2", "/dev/loop0p3").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("veritysetup") && msg.contains("shuttle doctor"),
+            "fail-closed error must name veritysetup and the doctor hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn manifest_threads_roothash_from_boot_facts() {
+        let decl = ImageDeclaration {
+            name: "verity".into(),
+            version: "1.0".into(),
+            base: SnapRef {
+                name: "core22".into(),
+                revision: None,
+                sha3_384: None,
+            },
+            kernel: None,
+            gadget: None,
+            extra_snaps: vec![],
+            bootloader: None,
+            disk: None,
+            sysctl: vec![],
+        };
+        let snaps: Vec<(String, ResolvedSnap)> = vec![(
+            "core22".into(),
+            ResolvedSnap {
+                name: "core22".into(),
+                revision: 1,
+                sha3_384: "a".into(),
+                download_url: "".into(),
+            },
+        )];
+        let hash = "ab".repeat(32);
+        let facts = UkiFacts {
+            kernel_version: "6.8.0".into(),
+            cmdline: format!("ro roothash={hash}"),
+            uki_filename: "verity_1.0.efi".into(),
+            esp_partuuid: Some("esp".into()),
+            roothash: Some(hash.clone()),
+        };
+        let manifest = ImageManifest::from_resolved(&decl, &snaps, "amd64", Some(&facts));
+        assert_eq!(manifest.roothash.as_deref(), Some(hash.as_str()));
+        let v = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(v["roothash"], hash, "roothash must serialize: {v}");
+
+        // No boot facts → the field is skipped, never null.
+        let plain = ImageManifest::from_resolved(&decl, &snaps, "amd64", None);
+        let v2 = serde_json::to_value(&plain).unwrap();
+        assert!(
+            v2.get("roothash").is_none(),
+            "roothash must be skipped: {v2}"
+        );
     }
 
     #[test]

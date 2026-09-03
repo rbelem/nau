@@ -100,6 +100,7 @@ pub fn run_all() -> Vec<Check> {
         check_squashfs_version(),
         check_ukify(),
         check_efi_stub(),
+        check_veritysetup(),
     ];
     checks.extend(check_sandbox_tools_with(&snap::path_entries()));
     checks
@@ -159,6 +160,110 @@ fn check_efi_stub() -> Check {
             ),
         ),
     }
+}
+
+/// Check that veritysetup is resolvable. Kernel disk images (ADR-0011 step
+/// (c)) format dm-verity over the root partition with the real
+/// `veritysetup` CLI and fail closed without it, so a missing veritysetup
+/// must be named before any build starts.
+fn check_veritysetup() -> Check {
+    match snap::resolve_in_path("veritysetup", &snap::path_entries()) {
+        Some(path) => Check::ok_at("veritysetup", format!("resolves to {path:?}")),
+        None => Check::missing(
+            "veritysetup",
+            "kernel disk images need veritysetup for dm-verity (cryptsetup >= 2.4) — \
+             e.g. apt install cryptsetup, or add cryptsetup to devbox.json packages",
+        ),
+    }
+}
+
+/// Outcome of the kernel dm-verity config audit ([`audit_kernel_verity_config`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerityConfigAudit {
+    /// CONFIG_DM_VERITY=y found in the config at this path.
+    Confirmed(PathBuf),
+    /// A kernel config exists at this path but CONFIG_DM_VERITY=y is absent.
+    Unconfirmed(PathBuf),
+    /// No kernel config source found — support cannot be confirmed either
+    /// way (common: many kernel snaps ship no config).
+    NoConfig,
+}
+
+/// Audit the kernel payload for dm-verity support (ADR-0011 step (c)).
+/// Best-effort by design: looks for a config source under `payload_dir`
+/// (`boot/config-<version>`, any `boot/config-*`, or
+/// `lib/modules/<version>/config*`) and warns — NEVER fails — when
+/// CONFIG_DM_VERITY=y cannot be confirmed. Absent VERIFY_ROOTHASH_SIG only
+/// means no signature enforcement, so only DM_VERITY itself is checked;
+/// the kernel decides at boot whether dm-verity is actually available.
+pub fn audit_kernel_verity_config(payload_dir: &Path, kernel_version: &str) -> VerityConfigAudit {
+    let outcome = find_kernel_config(payload_dir, kernel_version)
+        .map(|path| {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.lines().any(|l| l.trim() == "CONFIG_DM_VERITY=y") {
+                VerityConfigAudit::Confirmed(path)
+            } else {
+                VerityConfigAudit::Unconfirmed(path)
+            }
+        })
+        .unwrap_or(VerityConfigAudit::NoConfig);
+    match &outcome {
+        VerityConfigAudit::Confirmed(path) => eprintln!(
+            "  ✓ kernel dm-verity: CONFIG_DM_VERITY=y ({})",
+            path.display()
+        ),
+        VerityConfigAudit::Unconfirmed(path) => eprintln!(
+            "  ⚠ kernel config {} lacks CONFIG_DM_VERITY=y — dm-verity boot \
+             (ADR-0011 step (c)) may fail on this kernel",
+            path.display()
+        ),
+        VerityConfigAudit::NoConfig => eprintln!(
+            "  ⚠ no kernel config (boot/config-*, lib/modules/{kernel_version}/config*) \
+             found — cannot confirm CONFIG_DM_VERITY=y; dm-verity boot \
+             (ADR-0011 step (c)) may fail on this kernel"
+        ),
+    }
+    outcome
+}
+
+/// Locate the best kernel config source under the payload dir, first hit
+/// wins: `boot/config-<version>`, then any `boot/config-*`, then
+/// `lib/modules/<version>/config*` (sorted for determinism).
+fn find_kernel_config(payload_dir: &Path, kernel_version: &str) -> Option<PathBuf> {
+    let mut candidates = vec![payload_dir
+        .join("boot")
+        .join(format!("config-{kernel_version}"))];
+    let boot = payload_dir.join("boot");
+    if let Ok(read) = std::fs::read_dir(&boot) {
+        let mut globs: Vec<PathBuf> = read
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("config-"))
+            })
+            .collect();
+        globs.sort();
+        candidates.extend(globs);
+    }
+    let modules = payload_dir.join("lib").join("modules").join(kernel_version);
+    if let Ok(read) = std::fs::read_dir(&modules) {
+        let mut globs: Vec<PathBuf> = read
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("config"))
+            })
+            .collect();
+        globs.sort();
+        candidates.extend(globs);
+    }
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 /// Check bubblewrap with a basic no-op invocation.
@@ -348,6 +453,88 @@ mod tests {
                 "missing UKI readiness check for {name}"
             );
         }
+    }
+
+    #[test]
+    fn run_all_includes_verity_check() {
+        let checks = run_all();
+        assert!(
+            checks.iter().any(|c| c.name == "veritysetup"),
+            "missing veritysetup readiness check"
+        );
+    }
+
+    #[test]
+    fn veritysetup_check_hint_names_cryptsetup_when_missing() {
+        let check = check_veritysetup();
+        match check.status {
+            CheckStatus::Ok => assert!(check.hint.is_some()),
+            _ => {
+                let hint = check.hint.as_deref().unwrap_or_default();
+                assert!(
+                    hint.contains("cryptsetup"),
+                    "hint must name the fix: {hint}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kernel_config_audit_confirms_dm_verity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("boot").join("config-6.8.0-42-generic");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "CONFIG_CRYPTO_SHA256=y\nCONFIG_DM_VERITY=y\nCONFIG_BLK_DEV_DM=y\n",
+        )
+        .unwrap();
+        assert_eq!(
+            audit_kernel_verity_config(dir.path(), "6.8.0-42-generic"),
+            VerityConfigAudit::Confirmed(config)
+        );
+    }
+
+    #[test]
+    fn kernel_config_audit_warns_when_dm_verity_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("boot").join("config-6.8.0");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "CONFIG_CRYPTO_SHA256=y\n# CONFIG_DM_VERITY is not set\n",
+        )
+        .unwrap();
+        assert_eq!(
+            audit_kernel_verity_config(dir.path(), "6.8.0"),
+            VerityConfigAudit::Unconfirmed(config)
+        );
+    }
+
+    #[test]
+    fn kernel_config_audit_without_config_is_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            audit_kernel_verity_config(dir.path(), "6.8.0"),
+            VerityConfigAudit::NoConfig
+        );
+    }
+
+    #[test]
+    fn kernel_config_audit_finds_modules_tree_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir
+            .path()
+            .join("lib")
+            .join("modules")
+            .join("6.8.0")
+            .join("config");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "CONFIG_DM_VERITY=y\n").unwrap();
+        assert!(matches!(
+            audit_kernel_verity_config(dir.path(), "6.8.0"),
+            VerityConfigAudit::Confirmed(_)
+        ));
     }
 
     #[test]

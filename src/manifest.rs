@@ -190,7 +190,7 @@ pub struct ImageEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_version: Option<String>,
 
-    /// Composed UKI cmdline (declared params + root= [+ future roothash=])
+    /// Composed UKI cmdline (declared params + root= + verity trailer)
     /// — build fact, populated by `shuttle image`, never by eval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmdline: Option<String>,
@@ -202,6 +202,11 @@ pub struct ImageEntry {
     /// ESP GPT PARTUUID — build fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub esp_partuuid: Option<String>,
+
+    /// dm-verity root hash embedded in the UKI cmdline (ADR-0011 step (c))
+    /// — build fact, populated by `shuttle image`, never by eval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roothash: Option<String>,
 
     /// Image artifact state — always unbuilt from eval.
     pub artifact: Artifact,
@@ -458,8 +463,8 @@ fn image_entry(
 
     // ADR-0011 step (a): the declared kernel config is part of the IR —
     // eval echoes what was declared. Build facts (kernel_version, cmdline,
-    // uki, esp_partuuid) are only known once `shuttle image` assembles the
-    // UKI, so they stay None (skipped) here.
+    // uki, esp_partuuid, roothash) are only known once `shuttle image`
+    // assembles the UKI, so they stay None (skipped) here.
     let kernel = image.kernel.as_ref();
     let kernel_params = kernel
         .filter(|k| !k.params.is_empty())
@@ -484,6 +489,7 @@ fn image_entry(
         cmdline: None,
         uki: None,
         esp_partuuid: None,
+        roothash: None,
         artifact: Artifact::unbuilt(),
     })
 }
@@ -774,7 +780,13 @@ mod tests {
         let m = manifest_for(HashMap::from([("system".to_string(), kernel_image())])).unwrap();
         let v: serde_json::Value = serde_json::from_str(&m.to_json().unwrap()).unwrap();
         let img = &v["images"]["system"];
-        for field in ["kernel_version", "cmdline", "uki", "esp_partuuid"] {
+        for field in [
+            "kernel_version",
+            "cmdline",
+            "uki",
+            "esp_partuuid",
+            "roothash",
+        ] {
             assert!(img.get(field).is_none(), "{field} must be skipped: {img}");
         }
     }
@@ -792,6 +804,7 @@ mod tests {
             "cmdline",
             "uki",
             "esp_partuuid",
+            "roothash",
         ] {
             assert!(img.get(field).is_none(), "{field} must be skipped: {img}");
         }
