@@ -1698,8 +1698,13 @@ pub struct ExtractedField {
     pub from: String,
 }
 
-/// snapd caps the adoptable identity fields (see [`check_adopt_cap`]).
-const SNAPD_ADOPT_FIELD_MAX: usize = 32;
+/// snapd's real per-field limits for the adoptable identity fields (snapd
+/// `snap/validate.go`): version ≤ 32 *bytes* (with a constrained charset),
+/// summary ≤ 128 Unicode codepoints, description ≤ 4096 codepoints —
+/// version is the only byte-measured field (see [`check_adopt_cap`]).
+const SNAPD_VERSION_MAX_BYTES: usize = 32;
+const SNAPD_SUMMARY_MAX_CHARS: usize = 128;
+const SNAPD_DESCRIPTION_MAX_CHARS: usize = 4096;
 
 /// The adopt-info extraction ladder for one snap, run at build time after
 /// the named part has built:
@@ -1980,14 +1985,65 @@ fn strip_tags(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Enforce snapd's field limit on an extracted value — error, never
+/// Enforce snapd's per-field limits on an extracted value — error, never
 /// truncate (a truncated summary or version would be published as if it
-/// were the source's own).
+/// were the source's own; snapd likewise `fmt.Errorf`s every over-limit
+/// field rather than cutting it, `snap/validate.go`). Version counts bytes;
+/// summary and description count Unicode codepoints.
 fn check_adopt_cap(field: &str, value: &str, from: &str) -> miette::Result<()> {
-    if value.chars().count() > SNAPD_ADOPT_FIELD_MAX {
+    match field {
+        "version" => {
+            if value.len() > SNAPD_VERSION_MAX_BYTES {
+                return Err(miette::miette!(
+                    "adopt-info: extracted version \"{value}\" (from {from}) exceeds snapd's \
+                     {SNAPD_VERSION_MAX_BYTES}-byte limit — shorten the source metadata or \
+                     declare the field explicitly instead"
+                ));
+            }
+            if !is_snapd_version_charset_ok(value) {
+                return Err(miette::miette!(
+                    "adopt-info: extracted version \"{value}\" (from {from}) does not match \
+                     snapd's version charset (must start and end with a letter or digit; \
+                     interior characters may also be one of : . + ~ -)"
+                ));
+            }
+            Ok(())
+        }
+        "summary" => check_adopt_text_cap("summary", value, from, SNAPD_SUMMARY_MAX_CHARS),
+        "description" => {
+            check_adopt_text_cap("description", value, from, SNAPD_DESCRIPTION_MAX_CHARS)
+        }
+        other => unreachable!("unknown adopt-info field {other:?}"),
+    }
+}
+
+/// snapd's version charset (`snap/validate.go`): one or more characters,
+/// starting with a letter or digit, ending with a letter/digit/`+`/`~`, and
+/// interior characters may additionally be one of `:`, `.`, `+`, `~`, `-`.
+/// All classes are ASCII (so ≤ 32 bytes follows from the shape); non-ASCII
+/// never matches. Hand-rolled to keep a regex dependency out of this path.
+fn is_snapd_version_charset_ok(v: &str) -> bool {
+    let alnum = |c: char| c.is_ascii_alphanumeric();
+    let tail = |c: char| alnum(c) || matches!(c, '+' | '~');
+    let interior = |c: char| tail(c) || matches!(c, ':' | '.' | '-');
+    let mut chars = v.chars();
+    match chars.next() {
+        Some(first) => {
+            alnum(first)
+                && chars.all(interior)
+                && v.chars().next_back().is_some_and(tail)
+                && v.len() <= SNAPD_VERSION_MAX_BYTES
+        }
+        None => false,
+    }
+}
+
+/// snapd counts summary/description in Unicode codepoints (not bytes).
+fn check_adopt_text_cap(field: &str, value: &str, from: &str, max: usize) -> miette::Result<()> {
+    if value.chars().count() > max {
         return Err(miette::miette!(
             "adopt-info: extracted {field} \"{value}\" (from {from}) exceeds snapd's \
-             {SNAPD_ADOPT_FIELD_MAX}-character limit — shorten the source metadata or declare \
+             {max}-character limit — shorten the source metadata or declare \
              the field explicitly instead"
         ));
     }
@@ -4326,6 +4382,8 @@ mod tests {
             parts = { core = { plugin = "make" } }
             "#,
         );
+        // Over-limit version (33 bytes > snapd's 32-byte cap): snapd
+        // measures version in bytes.
         let long_version = "a".repeat(33);
         let (src, stage) = adopt_fixtures(
             &[],
@@ -4337,19 +4395,10 @@ mod tests {
         let err = extract_adopted_meta(&meta, src.path(), stage.path())
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("exceeds snapd's 32-character limit"),
-            "got: {err}"
-        );
+        assert!(err.contains("exceeds snapd's 32-byte limit"), "got: {err}");
 
-        // Same for an over-long summary.
-        let meta = adopt_meta(
-            r#"
-            name = "adopted", adopt_info = "core",
-            parts = { core = { plugin = "make" } }
-            "#,
-        );
-        let long_summary = "s".repeat(33);
+        // Same for an over-long summary (129 codepoints > 128)...
+        let long_summary = "s".repeat(129);
         let (src, stage) = adopt_fixtures(
             &[],
             &[(
@@ -4361,9 +4410,88 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("extracted summary") && err.contains("32-character limit"),
+            err.contains("extracted summary") && err.contains("128-character limit"),
             "got: {err}"
         );
+
+        // ...and an over-long description (4097 codepoints > 4096).
+        let long_description = "d".repeat(4097);
+        let (src, stage) = adopt_fixtures(
+            &[],
+            &[(
+                "snap/metadata.json",
+                &format!(r#"{{"version": "1.0", "description": "{long_description}"}}"#),
+            )],
+        );
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("extracted description") && err.contains("4096-character limit"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_adopt_info_field_caps_at_limit_pass() {
+        // At-limit values pass: version counts BYTES, summary/description
+        // count Unicode codepoints — 128 'é' are 256 bytes but exactly at
+        // snapd's 128-codepoint summary cap.
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        let version = "a".repeat(32);
+        let summary = "é".repeat(128);
+        let description = "é".repeat(4096);
+        let metadata = format!(
+            r#"{{"version": "{version}", "summary": "{summary}", "description": "{description}"}}"#
+        );
+        let (src, stage) = adopt_fixtures(&[], &[("snap/metadata.json", &metadata)]);
+        let adopted = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap()
+            .expect("at-limit values must pass");
+        assert_eq!(adopted.version.unwrap().value, version);
+        assert_eq!(adopted.summary.as_deref(), Some(summary.as_str()));
+        assert_eq!(adopted.description.as_deref(), Some(description.as_str()));
+    }
+
+    #[test]
+    fn test_adopt_info_version_charset_is_enforced() {
+        // snapd also constrains the version charset (snap/validate.go):
+        // starts alphanumeric, ends alphanumeric or `+`/`~`, interior may
+        // additionally be one of `: . + ~ -` — same hard-error stance.
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        let cases: &[(&str, bool)] = &[
+            ("7.4", true),
+            ("1.0-beta+build.2", true),
+            ("2", true),
+            ("-1.0", false),     // must start alphanumeric
+            ("1.", false),       // must end alphanumeric or +/~
+            ("1.0 beta", false), // space is not in the charset
+            ("1.0λ", false),     // non-ASCII never matches
+            ("", false),         // empty is not a version
+        ];
+        for (version, ok) in cases {
+            let metadata = format!(r#"{{"version": "{version}"}}"#);
+            let (src, stage) = adopt_fixtures(&[], &[("snap/metadata.json", &metadata)]);
+            let result = extract_adopted_meta(&meta, src.path(), stage.path());
+            assert_eq!(result.is_ok(), *ok, "version {version:?}: got {result:?}");
+        }
+        // The rejection names the charset, not the length.
+        let (src, stage) =
+            adopt_fixtures(&[], &[("snap/metadata.json", r#"{"version": "1.0 beta"}"#)]);
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("version charset"), "got: {err}");
     }
 
     #[test]

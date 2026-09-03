@@ -72,8 +72,8 @@ return {{ leaked = tostring(ok), err = tostring(err):sub(1, 120), name = "x", ve
     assert_eq!(out_str(&r, "leaked"), "false", "MUST NOT load the decoy");
     let err = out_str(&r, "err");
     assert!(
-        err.contains("not found in allowlisted roots"),
-        "absolute decoy must fall through the allowlist, got: {err}"
+        err.contains("rejected absolute path"),
+        "absolute decoy must be rejected at the policy layer, got: {err}"
     );
     eprintln!("[PASS] dot-prefix absolute candidate rejected: {err}");
 }
@@ -572,7 +572,7 @@ fn attack_resolver_hostile_names() {
         res.is_err(),
         "absolute-dot trick must not resolve the decoy"
     );
-    assert!(res.unwrap_err().contains("not found"));
+    assert!(res.unwrap_err().contains("rejected absolute path"));
 
     for bad in [
         "a\0b",

@@ -221,6 +221,16 @@ impl SourceResolver {
             ));
         }
         let rel = name.replace('.', "/");
+        // The mapping must stay relative: `root.join` replaces its base with
+        // an absolute segment, so a name whose dot-to-slash result begins
+        // with '/' (e.g. "...." → "////") synthesizes an absolute candidate.
+        // Reject with the same named error as the explicit '/' check instead
+        // of relying on the downstream canonicalize+prefix check.
+        if rel.starts_with('/') {
+            return Err(format!(
+                "resolver: rejected absolute path {name:?}: outside allowlisted roots"
+            ));
+        }
         for root in &self.roots {
             for cand in [
                 root.join(format!("{rel}.lua")),
@@ -1218,6 +1228,30 @@ mod tests {
         let resolver = resolver_with_root(dir.path());
         let err = resolver.resolve("/etc/passwd").unwrap_err();
         assert!(err.contains("rejected"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolver_rejects_dot_to_slash_absolute_synthesis() {
+        // Regression: `name.replace('.', "/")` can synthesize an absolute
+        // candidate ("...." → "////"), and `root.join` replaces its base
+        // with an absolute segment. A dot-to-slash result that starts with
+        // '/' must be rejected at the same layer as the explicit '/' check,
+        // not left to the downstream canonicalize+prefix check.
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = resolver_with_root(dir.path());
+        for hostile in ["....", "...", ".", "..hidden"] {
+            let err = resolver.resolve(hostile).unwrap_err();
+            assert!(
+                err.contains("rejected absolute path") && err.contains(hostile),
+                "name {hostile:?}: got: {err}"
+            );
+        }
+        // Normal dotted names still resolve through the same mapping.
+        std::fs::create_dir_all(dir.path().join("foo/bar")).unwrap();
+        std::fs::write(dir.path().join("foo/bar/baz.lua"), "return {}").unwrap();
+        std::fs::write(dir.path().join("top.lua"), "return {}").unwrap();
+        assert!(resolver.resolve("foo.bar.baz").is_ok());
+        assert!(resolver.resolve("top").is_ok());
     }
 
     #[test]
