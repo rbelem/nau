@@ -25,6 +25,10 @@ use crate::snap::SnapRef;
 struct SnapInfoResponse {
     #[serde(rename = "channel-map")]
     channel_map: Vec<ChannelMapEntry>,
+    /// Store snap id (top-level `snap-id`); bound by the snap-revision
+    /// assertion cross-check when present.
+    #[serde(rename = "snap-id", default)]
+    snap_id: Option<String>,
 }
 
 /// One entry in the channel map.
@@ -50,7 +54,6 @@ struct ChannelInfo {
 struct DownloadInfo {
     #[serde(rename = "sha3-384")]
     sha3_384: String,
-    #[allow(dead_code)]
     size: u64,
     url: String,
 }
@@ -157,6 +160,36 @@ impl StoreClient {
                      expected {expected_hash}, store has {sha3_384}",
                     pin.name
                 ));
+            }
+        }
+
+        // ADR-0011 step (b): the digest and URL above come from one unsigned
+        // channel-map response (TOFU). Break it by requiring a signed
+        // snap-revision assertion binding digest → (snap-id, revision, size)
+        // under the Canonical-rooted key chain before the URL is trusted.
+        let pinned_by_user = pin.revision.is_some() && pin.sha3_384.is_some();
+        if let Err(e) = crate::r#assert::verify_revision(
+            &pin.name,
+            info.snap_id.as_deref(),
+            store_revision,
+            &sha3_384,
+            Some(entry.download.size),
+        ) {
+            match e {
+                crate::r#assert::AssertError::Network { .. } if pinned_by_user => {
+                    eprintln!(
+                        "warning: snap '{}': assertion store unreachable ({e}); \
+                         proceeding on the explicit lockfile/index pin — \
+                         first-seen continuity only, not cryptographic proof",
+                        pin.name
+                    );
+                }
+                _ => {
+                    return Err(miette::miette!(
+                        "snap '{}': refusing to trust the store response: {e}",
+                        pin.name
+                    ));
+                }
             }
         }
 

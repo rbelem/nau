@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod assert;
 pub mod cache;
 pub mod cli;
 pub mod deps;
