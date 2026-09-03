@@ -47,9 +47,14 @@ fn cache_root() -> PathBuf {
 
 /// Cache directory for a given github: URL.
 fn github_cache_dir(owner: &str, repo: &str, branch: &str) -> PathBuf {
+    github_cache_dir_in(&cache_root(), owner, repo, branch)
+}
+
+/// [`github_cache_dir`] under an explicit cache root (test injection).
+fn github_cache_dir_in(root: &Path, owner: &str, repo: &str, branch: &str) -> PathBuf {
     let key = format!("github:{owner}/{repo}/{branch}");
     let hash = sha256_hex(&key);
-    cache_root().join(&hash[..16])
+    root.join(&hash[..16])
 }
 
 // ── Input resolution ──
@@ -89,6 +94,16 @@ pub fn resolve_input_with(
     pin: Option<&InputLockEntry>,
     offline: bool,
 ) -> miette::Result<PathBuf> {
+    resolve_input_in(&cache_root(), input, pin, offline)
+}
+
+/// [`resolve_input_with`] under an explicit cache root (test injection).
+fn resolve_input_in(
+    root: &Path,
+    input: &PackageInput,
+    pin: Option<&InputLockEntry>,
+    offline: bool,
+) -> miette::Result<PathBuf> {
     let url = &input.url;
 
     if let Some(local) = url.strip_prefix("path:") {
@@ -109,7 +124,7 @@ pub fn resolve_input_with(
     };
 
     if let Some(sha) = pin.and_then(|p| p.revision.as_deref()) {
-        let dir = pinned_cache_dir(owner, repo, sha);
+        let dir = pinned_cache_dir_in(root, owner, repo, sha);
         if !dir.exists() {
             if offline {
                 return Err(miette::miette!(
@@ -130,7 +145,7 @@ pub fn resolve_input_with(
         return Ok(dir);
     }
 
-    let cache_dir = github_cache_dir(owner, repo, branch);
+    let cache_dir = github_cache_dir_in(root, owner, repo, branch);
     if !cache_dir.exists() {
         if offline {
             return Err(miette::miette!(
@@ -201,9 +216,14 @@ pub fn refresh_input(input: &PackageInput) -> miette::Result<()> {
 /// Cache directory for a github input pinned to a specific commit SHA.
 /// Separate from the branch-head cache so pins never move.
 fn pinned_cache_dir(owner: &str, repo: &str, sha: &str) -> PathBuf {
+    pinned_cache_dir_in(&cache_root(), owner, repo, sha)
+}
+
+/// [`pinned_cache_dir`] under an explicit cache root (test injection).
+fn pinned_cache_dir_in(root: &Path, owner: &str, repo: &str, sha: &str) -> PathBuf {
     let key = format!("github:{owner}/{repo}@{sha}");
     let hash = sha256_hex(&key);
-    cache_root().join(&hash[..16])
+    root.join(&hash[..16])
 }
 
 /// Run a git command, failing with its stderr on error.
@@ -382,30 +402,48 @@ pub fn lock_input_entry(input: &PackageInput) -> miette::Result<InputLockEntry> 
 
 /// Record lock entries for declared inputs missing from the lockfile
 /// (first-build behavior — same record-once rule as source hashes).
-/// Returns the number of pins recorded.
+/// All entries are resolved before any is recorded: a failure on one input
+/// leaves the lockfile untouched. Returns the number of pins recorded.
 pub fn ensure_input_pins(
     inputs: &HashMap<String, PackageInput>,
     lock: &mut LockFile,
 ) -> miette::Result<usize> {
-    let mut n = 0;
+    let mut resolved = Vec::new();
     for (name, input) in inputs {
         if lock.inputs.contains_key(name) {
             continue;
         }
-        let entry = lock_input_entry(input)?;
-        lock.inputs.insert(name.clone(), entry);
-        n += 1;
+        resolved.push((name.clone(), lock_input_entry(input)?));
+    }
+    let n = resolved.len();
+    for (name, entry) in resolved {
+        lock.inputs.insert(name, entry);
     }
     Ok(n)
 }
 
+/// One applied input-pin refresh, for old→new reporting.
+#[derive(Debug, Clone)]
+pub struct InputPinUpdate {
+    pub name: String,
+    /// Revision before the refresh (`None` when newly pinned).
+    pub old: Option<String>,
+    /// Revision after the refresh (`None` for local, unlocked inputs).
+    pub new: Option<String>,
+    /// True for `path:` inputs (marker entry, no revision).
+    pub local: bool,
+}
+
 /// Re-resolve inputs to their latest revision and update their pins.
-/// Empty `names` updates all declared inputs. Returns pins updated.
+/// Empty `names` updates all declared inputs. Every pin is resolved before
+/// any is written: a failure on one input (e.g. network down mid-loop)
+/// leaves the lockfile exactly as it was — never a half-updated lock.
+/// Returns one [`InputPinUpdate`] per refreshed input.
 pub fn update_input_pins(
     inputs: &HashMap<String, PackageInput>,
     names: &[&str],
     lock: &mut LockFile,
-) -> miette::Result<usize> {
+) -> miette::Result<Vec<InputPinUpdate>> {
     for name in names {
         if !inputs.contains_key(*name) {
             let declared: Vec<&str> = inputs.keys().map(|s| s.as_str()).collect();
@@ -415,16 +453,27 @@ pub fn update_input_pins(
             ));
         }
     }
-    let mut n = 0;
+    let mut resolved = Vec::new();
     for (name, input) in inputs {
         if !names.is_empty() && !names.contains(&name.as_str()) {
             continue;
         }
-        let entry = lock_input_entry(input)?;
-        lock.inputs.insert(name.clone(), entry);
-        n += 1;
+        resolved.push((name.clone(), lock_input_entry(input)?));
     }
-    Ok(n)
+    let mut updates = Vec::new();
+    for (name, entry) in resolved {
+        let old = lock.inputs.get(&name).and_then(|e| e.revision.clone());
+        let new = entry.revision.clone();
+        let local = entry.local;
+        lock.inputs.insert(name.clone(), entry);
+        updates.push(InputPinUpdate {
+            name,
+            old,
+            new,
+            local,
+        });
+    }
+    Ok(updates)
 }
 
 // ── Global input state (re-initializable) ──
@@ -891,8 +940,191 @@ mod tests {
         assert_eq!(n, 0);
 
         // update forces a refresh of the entry
-        let n = update_input_pins(&inputs, &[], &mut lock).unwrap();
-        assert_eq!(n, 1);
+        let updates = update_input_pins(&inputs, &[], &mut lock).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].local);
+        assert!(updates[0].old.is_none() && updates[0].new.is_none());
         assert!(lock.inputs["local"].local);
+    }
+
+    /// Seed a fake pinned input tree under a test cache root and pin it.
+    fn seed_pinned(
+        root: &Path,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+        body: &[u8],
+    ) -> (PackageInput, InputLockEntry) {
+        let dir = pinned_cache_dir_in(root, owner, repo, sha);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pkgs.lua"), body).unwrap();
+        let entry = InputLockEntry {
+            revision: Some(sha.to_string()),
+            sha256: Some(content_hash(&dir).unwrap()),
+            local: false,
+        };
+        (
+            PackageInput {
+                url: format!("github:{owner}/{repo}/main"),
+            },
+            entry,
+        )
+    }
+
+    #[test]
+    fn test_pinned_input_roundtrip_and_hash_verified() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, pin) = seed_pinned(
+            root.path(),
+            "shuttle-test-fixture",
+            "roundtrip",
+            "1111111111111111111111111111111111111111",
+            b"contents",
+        );
+
+        // Pinned + cache present + hash matches → resolves to the pinned dir.
+        let resolved = resolve_input_in(root.path(), &input, Some(&pin), false).unwrap();
+        assert_eq!(
+            resolved,
+            pinned_cache_dir_in(
+                root.path(),
+                "shuttle-test-fixture",
+                "roundtrip",
+                "1111111111111111111111111111111111111111"
+            )
+        );
+    }
+
+    #[test]
+    fn test_pinned_input_mismatch_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, pin) = seed_pinned(
+            root.path(),
+            "shuttle-test-fixture",
+            "tampered",
+            "2222222222222222222222222222222222222222",
+            b"original",
+        );
+
+        // Tamper with the cached tree after locking.
+        let dir = pinned_cache_dir_in(
+            root.path(),
+            "shuttle-test-fixture",
+            "tampered",
+            "2222222222222222222222222222222222222222",
+        );
+        std::fs::write(dir.join("pkgs.lua"), b"tampered").unwrap();
+
+        let err = resolve_input_in(root.path(), &input, Some(&pin), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("content changed since lock"),
+            "named mismatch error required, got: {err}"
+        );
+        assert!(
+            err.contains("shuttle build --update"),
+            "error must point at the refresh path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_offline_pinned_input_absent_no_fetch_no_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        // Pin exists in the lockfile, but the pinned cache dir is absent —
+        // exactly the "inputs absent from cache" offline scenario.
+        let input = PackageInput {
+            url: "github:shuttle-test-fixture/absent/main".into(),
+        };
+        let pin = InputLockEntry {
+            revision: Some("3333333333333333333333333333333333333333".to_string()),
+            sha256: Some("deadbeef".to_string()),
+            local: false,
+        };
+
+        let err = resolve_input_in(root.path(), &input, Some(&pin), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pinned to 3333333333333333333333333333333333333333")
+                && err.contains("--offline prevents fetching"),
+            "named offline error required, got: {err}"
+        );
+
+        // No fetch may have been attempted: the cache root must still be empty.
+        let created: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            created.is_empty(),
+            "offline mode must not create cache dirs (no fetch), found: {created:?}"
+        );
+    }
+
+    #[test]
+    fn test_update_input_pins_all_or_nothing_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "good".to_string(),
+            PackageInput {
+                url: format!("path:{}", dir.path().display()),
+            },
+        );
+        inputs.insert(
+            "bad".to_string(),
+            PackageInput {
+                url: "ftp://not-supported".into(),
+            },
+        );
+
+        let mut lock = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs: HashMap::new(),
+        };
+        // Pre-pin "good" with a revision that a path: refresh would change
+        // (path entries carry no revision), so partial application is observable.
+        lock.inputs.insert(
+            "good".to_string(),
+            InputLockEntry {
+                revision: Some("oldrev".to_string()),
+                sha256: None,
+                local: false,
+            },
+        );
+
+        assert!(update_input_pins(&inputs, &[], &mut lock).is_err());
+        // The lockfile map is exactly as before: "good" not re-resolved,
+        // "bad" never inserted. All-or-nothing.
+        assert_eq!(lock.inputs.len(), 1);
+        assert_eq!(lock.inputs["good"].revision.as_deref(), Some("oldrev"));
+        assert!(!lock.inputs.contains_key("bad"));
+    }
+
+    #[test]
+    fn test_update_input_pins_reports_old_to_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "pkg".to_string(),
+            PackageInput {
+                url: format!("path:{}", dir.path().display()),
+            },
+        );
+        let mut lock = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs: HashMap::new(),
+        };
+
+        // First update: new pin (old = None).
+        let updates = update_input_pins(&inputs, &["pkg"], &mut lock).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].name, "pkg");
+        assert!(updates[0].old.is_none(), "fresh pin has no old revision");
     }
 }

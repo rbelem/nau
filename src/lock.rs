@@ -89,13 +89,40 @@ impl LockFile {
         Ok(Some(lock))
     }
 
-    /// Save lockfile to disk.
+    /// Save lockfile to disk atomically: serialize to a temp file in the
+    /// target's directory, then rename over the target. A crash or failure
+    /// mid-write leaves the previous lockfile intact — readers never see a
+    /// half-written file.
     pub fn save(&self, path: &Path) -> miette::Result<()> {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| miette::miette!("failed to serialize lockfile: {}", e))?;
         let content = content + "\n";
-        std::fs::write(path, &content)
-            .map_err(|e| miette::miette!("failed to write {}: {}", path.display(), e))?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let tmp = parent.join(format!(
+            ".{}.tmp-{}",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("shuttle.lock"),
+            std::process::id()
+        ));
+        let cleanup = |tmp: &Path| {
+            let _ = std::fs::remove_file(tmp);
+        };
+        if let Err(e) = std::fs::write(&tmp, &content) {
+            cleanup(&tmp);
+            return Err(miette::miette!("failed to write {}: {}", tmp.display(), e));
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            cleanup(&tmp);
+            return Err(miette::miette!(
+                "failed to finalize {}: {}",
+                path.display(),
+                e
+            ));
+        }
         Ok(())
     }
 
@@ -323,5 +350,59 @@ mod tests {
         let lock: LockFile = serde_json::from_str(json).unwrap();
         assert_eq!(lock.version, 1);
         assert!(lock.inputs.is_empty());
+    }
+
+    #[test]
+    fn test_save_atomic_no_temp_residue_and_replaces_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shuttle.lock");
+
+        let lock = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs: HashMap::new(),
+        };
+        lock.save(&path).unwrap();
+        assert!(path.exists());
+
+        // Saving again (replace) must still leave exactly one file in the
+        // directory: the lockfile itself. No `.tmp-*` residue may survive.
+        lock.save(&path).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, vec!["shuttle.lock".to_string()], "no temp residue");
+    }
+
+    #[test]
+    fn test_save_failure_leaves_existing_lockfile_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shuttle.lock");
+        let lock = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs: HashMap::new(),
+        };
+        lock.save(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // A save whose temp file cannot be created (parent "dir" is a file)
+        // must fail without touching the existing lockfile or leaving residue
+        // next to it.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad_path = blocker.join("nested").join("shuttle.lock");
+        assert!(lock.save(&bad_path).is_err());
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after, "failed save must not modify the lockfile");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries.len(), 2, "only lockfile + blocker, no temp residue");
     }
 }

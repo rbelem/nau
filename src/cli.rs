@@ -202,6 +202,10 @@ pub enum Command {
         /// Path to lockfile (default: shuttle.lock).
         #[arg(long, default_value = "shuttle.lock")]
         lockfile: String,
+
+        /// Output structured JSON with pin state instead of human output.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Generate shell completion scripts
@@ -587,9 +591,14 @@ mod tests {
     #[test]
     fn test_lock_subcommand_defaults() {
         match Cli::try_parse_from(["shuttle", "lock"]).unwrap().command {
-            Command::Lock { file, lockfile } => {
+            Command::Lock {
+                file,
+                lockfile,
+                json,
+            } => {
                 assert_eq!(file, "shuttle.lua");
                 assert_eq!(lockfile, "shuttle.lock");
+                assert!(!json);
             }
             _ => panic!("expected Lock"),
         }
@@ -608,9 +617,23 @@ mod tests {
         .unwrap()
         .command
         {
-            Command::Lock { file, lockfile } => {
+            Command::Lock { file, lockfile, .. } => {
                 assert_eq!(file, "cfg.lua");
                 assert_eq!(lockfile, "other.lock");
+            }
+            _ => panic!("expected Lock"),
+        }
+    }
+
+    #[test]
+    fn test_lock_subcommand_json_flag() {
+        match Cli::try_parse_from(["shuttle", "lock", "--json", "--lockfile", "p.lock"])
+            .unwrap()
+            .command
+        {
+            Command::Lock { lockfile, json, .. } => {
+                assert!(json);
+                assert_eq!(lockfile, "p.lock");
             }
             _ => panic!("expected Lock"),
         }

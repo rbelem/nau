@@ -262,3 +262,30 @@ pub struct DoctorOutputJson {
     pub all_ok: bool,
     pub checks: Vec<DoctorCheckJson>,
 }
+
+// ── Lock JSON ──
+
+/// One pinned input for `shuttle lock --json`.
+#[derive(Debug, Clone, Serialize)]
+pub struct LockPinJson {
+    pub name: String,
+    /// True for `path:` inputs — resolved from the filesystem, unlocked.
+    pub local: bool,
+    /// Pinned commit SHA (`github:` inputs only; null for local inputs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// Pinned content hash (`github:` inputs only; null for local inputs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+/// Top-level JSON lock output.
+#[derive(Debug, Clone, Serialize)]
+pub struct LockOutputJson {
+    pub command: String,
+    pub lockfile: String,
+    /// Number of pins refreshed by this invocation.
+    pub updated: usize,
+    /// Full pin state of the lockfile after the operation.
+    pub pins: Vec<LockPinJson>,
+}

@@ -130,7 +130,14 @@ fn main() -> miette::Result<()> {
             cmd_check(&file, json)
         }
 
-        Command::Lock { file, lockfile } => cmd_lock(file, lockfile),
+        Command::Lock {
+            file,
+            lockfile,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            cmd_lock(file, lockfile)
+        }
 
         Command::Completion { shell } => cmd_completion(shell),
 
@@ -330,11 +337,11 @@ fn prepare_inputs(
         } else {
             vec![name]
         };
-        let n = shuttle::pkg_source::update_input_pins(inputs, &names, &mut lockfile)?;
-        changed |= n > 0;
-        if n > 0 {
-            shuttle::output::ok(format!("updated {n} input pin(s)"));
+        let updates = shuttle::pkg_source::update_input_pins(inputs, &names, &mut lockfile)?;
+        for u in &updates {
+            shuttle::output::status(pin_update_line(u));
         }
+        changed |= !updates.is_empty();
     } else if !offline {
         // Record-once: pin inputs missing from the lockfile (first build).
         let n = shuttle::pkg_source::ensure_input_pins(inputs, &mut lockfile)?;
@@ -1321,13 +1328,27 @@ fn report_check_diagnostic(d: &shuttle::lua::CheckDiagnostic) {
 
 // ── Lock command ──
 
+/// Human-readable old→new line for one refreshed input pin.
+fn pin_update_line(u: &shuttle::pkg_source::InputPinUpdate) -> String {
+    let short = |s: &Option<String>| s.as_deref().map(|r| r.get(..7).unwrap_or(r).to_string());
+    if u.local {
+        return format!("{}: local (unlocked)", u.name);
+    }
+    match (short(&u.old), short(&u.new)) {
+        (Some(old), Some(new)) if old != new => format!("{}: {} -> {}", u.name, old, new),
+        (Some(rev), _) => format!("{}: {} (unchanged)", u.name, rev),
+        (None, Some(new)) => format!("{}: new pin {}", u.name, new),
+        (None, None) => format!("{}: no revision resolved", u.name),
+    }
+}
+
 /// `shuttle lock`: resolve/refresh all input pins without building.
 fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
     let inputs = if Path::new(&file).exists() {
         match shuttle::lua::evaluate_file_with_inputs(&file) {
             Ok(eval) if !eval.global_inputs.is_empty() => eval.global_inputs,
             Ok(_) => {
-                eprintln!("  no inputs declared in '{file}', using default");
+                shuttle::output::info(format!("no inputs declared in '{file}', using default"));
                 default_input_map()
             }
             Err(e) => {
@@ -1335,7 +1356,7 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
             }
         }
     } else {
-        eprintln!("  no config at '{file}', using default input");
+        shuttle::output::info(format!("no config at '{file}', using default input"));
         default_input_map()
     };
 
@@ -1347,19 +1368,50 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
         inputs: HashMap::new(),
     });
 
-    // Empty names = refresh every declared input.
-    let n = shuttle::pkg_source::update_input_pins(&inputs, &[], &mut lockfile)?;
+    // Empty names = refresh every declared input. All pins are resolved
+    // before any is applied: a failed refresh never half-updates the lock.
+    let updates = shuttle::pkg_source::update_input_pins(&inputs, &[], &mut lockfile)?;
 
+    for u in &updates {
+        shuttle::output::status(pin_update_line(u));
+    }
     for (name, entry) in &lockfile.inputs {
         if entry.local {
-            eprintln!("  {name}: local (unlocked)");
+            shuttle::output::status(format!("{name}: local (unlocked)"));
         } else if let Some(rev) = &entry.revision {
-            eprintln!("  {name}: pinned to {}", rev.get(..7).unwrap_or(rev));
+            shuttle::output::status(format!("{name}: pinned to {}", rev.get(..7).unwrap_or(rev)));
         }
     }
 
     lockfile.save(lock_path)?;
-    shuttle::output::ok(format!("{n} input(s) locked -> {lockfile_path}"));
+
+    if shuttle::output::is_json() {
+        let mut pins: Vec<shuttle::output::LockPinJson> = lockfile
+            .inputs
+            .iter()
+            .map(|(name, e)| shuttle::output::LockPinJson {
+                name: name.clone(),
+                local: e.local,
+                revision: e.revision.clone(),
+                sha256: e.sha256.clone(),
+            })
+            .collect();
+        pins.sort_by(|a, b| a.name.cmp(&b.name));
+        let out = shuttle::output::LockOutputJson {
+            command: "lock".to_string(),
+            lockfile: lockfile_path.clone(),
+            updated: updates.len(),
+            pins,
+        };
+        let json = serde_json::to_string_pretty(&out)
+            .map_err(|e| miette::miette!("failed to serialize lock output: {e}"))?;
+        println!("{json}");
+    } else {
+        shuttle::output::ok(format!(
+            "{} input(s) locked -> {lockfile_path}",
+            updates.len()
+        ));
+    }
     Ok(())
 }
 
