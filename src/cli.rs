@@ -208,6 +208,47 @@ pub enum Command {
         json: bool,
     },
 
+    /// Evaluate a definition and emit the image manifest IR (no build).
+    /// Deterministic: the same definition + lockfile always produce
+    /// byte-identical JSON. Resolution is data-only (definition pins,
+    /// lockfile, package index) — fully pinned projects eval offline; the
+    /// --offline flag additionally forbids fetching uncached inputs.
+    Eval {
+        /// Path to the Lua config file (default: shuttle.lua)
+        #[arg(short, long, default_value = "shuttle.lua")]
+        file: String,
+
+        /// Write the manifest to this file atomically (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Only evaluate this output or image (from the definition's
+        /// returned table). Default: everything declared.
+        output_name: Option<String>,
+
+        /// Target architecture for image contents (default: amd64)
+        #[arg(short, long, default_value = "amd64")]
+        arch: String,
+
+        /// Snap channel for the resolution context (default: latest/stable)
+        #[arg(long, default_value = "latest/stable")]
+        channel: String,
+
+        /// Path to lockfile (default: shuttle.lock).
+        /// Pins source hashes and snap revisions for reproducible evals.
+        #[arg(long, default_value = "shuttle.lock")]
+        lockfile: String,
+
+        /// Use only pinned/cached inputs — never touch the network.
+        #[arg(long)]
+        offline: bool,
+
+        /// Suppress human-readable status output (the manifest is JSON
+        /// either way).
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Generate shell completion scripts
     Completion {
         /// Shell to generate completions for (bash, zsh, fish, powershell, elvish)

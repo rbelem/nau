@@ -9,6 +9,7 @@ pub mod index;
 pub mod isolate;
 pub mod lock;
 pub mod lua;
+pub mod manifest;
 pub mod output;
 pub mod pkg_source;
 pub mod plugins;

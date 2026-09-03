@@ -139,6 +139,28 @@ fn main() -> miette::Result<()> {
             cmd_lock(file, lockfile)
         }
 
+        Command::Eval {
+            file,
+            output,
+            output_name,
+            arch,
+            channel,
+            lockfile: lockfile_path,
+            offline,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            cmd_eval(
+                file,
+                output,
+                output_name,
+                arch,
+                channel,
+                lockfile_path,
+                offline,
+            )
+        }
+
         Command::Completion { shell } => cmd_completion(shell),
 
         Command::Cache(sub) => cmd_cache(sub),
@@ -1411,6 +1433,95 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
             "{} input(s) locked -> {lockfile_path}",
             updates.len()
         ));
+    }
+    Ok(())
+}
+
+// ── Eval command ──
+
+/// `shuttle eval`: evaluate a definition and emit the image manifest IR
+/// (Phase 23, cross-distro-synthesis §5). No build, no store writes.
+///
+/// Resolution is data-only — definition pins, the Phase 16 lockfile, and
+/// pre-resolved package-index pins — so a fully pinned project evals
+/// offline and the result is a deterministic function of the definition +
+/// lockfile. `--offline` additionally forbids fetching uncached package
+/// inputs (named fail-closed error, same as build). Unresolvable pins and
+/// missing lock entries fail closed: no partial manifest is ever written.
+#[allow(clippy::too_many_arguments)]
+fn cmd_eval(
+    file: String,
+    output: Option<String>,
+    output_name: Option<String>,
+    arch: String,
+    channel: String,
+    lockfile_path: String,
+    offline: bool,
+) -> miette::Result<()> {
+    let file = resolve_file(&file)?;
+    // Image resolution (index pins are per-arch) and the DSL's `arch`
+    // global both key off this.
+    std::env::set_var("SHUTTLE_ARCH", &arch);
+
+    let lock_path = Path::new(&lockfile_path);
+    let mut lockfile = load_lockfile_or_default(lock_path)?;
+
+    // Definition eval: snap outputs + global inputs, through the bounded
+    // subprocess worker.
+    let eval = shuttle::lua::evaluate_file_with_inputs(&file)?;
+
+    // Materialize declared package inputs through their Phase 16 pins.
+    // Online: record missing pins first (record-once, like build). Offline:
+    // uncached/pinned inputs fail with the named "--offline prevents
+    // fetching" error. The lockfile is only saved after materialization
+    // succeeds, so a failed eval records nothing.
+    let mut pins_recorded = false;
+    if !eval.global_inputs.is_empty() {
+        if !offline {
+            let n = shuttle::pkg_source::ensure_input_pins(&eval.global_inputs, &mut lockfile)?;
+            pins_recorded |= n > 0;
+        }
+        shuttle::pkg_source::init_global_inputs_with(
+            &eval.global_inputs,
+            &lockfile.inputs,
+            offline,
+        )?;
+        if pins_recorded {
+            lockfile.save(lock_path)?;
+        }
+    }
+
+    // Image declarations (a second bounded eval of the same file, sharing
+    // the worker output table with the snap outputs).
+    let images = resolve_images(&file)?;
+
+    let manifest = shuttle::manifest::build_manifest(
+        &eval.outputs,
+        &images,
+        &eval.global_inputs,
+        &lockfile,
+        &arch,
+        &channel,
+        output_name.as_deref(),
+    )?;
+
+    match output {
+        Some(ref out_path) => {
+            manifest.write_atomic(Path::new(out_path))?;
+            if !shuttle::output::is_json() {
+                shuttle::output::ok(format!(
+                    "manifest -> {out_path} ({} output(s), {} image(s))",
+                    manifest.outputs.len(),
+                    manifest.images.len()
+                ));
+            }
+        }
+        None => {
+            let json = manifest.to_json()?;
+            // to_json ends with a newline; print without adding another so
+            // stdout bytes == file bytes.
+            print!("{json}");
+        }
     }
     Ok(())
 }
