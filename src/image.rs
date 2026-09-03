@@ -22,7 +22,7 @@ use serde::Serialize;
 use serde::Serializer;
 
 use crate::lock::LockFile;
-use crate::snap::SnapRef;
+use crate::snap::{self, SnapRef};
 use crate::store::{ResolvedSnap, StoreClient};
 
 // ── Additional types ──
@@ -627,9 +627,9 @@ pub fn build_image(
         }
     }
 
-    // 8. Write manifest
+    // 8. Write manifest — the squashfs path has no ESP/UKI, so no boot facts
     let manifest_path = root.join("image-manifest.json");
-    let manifest = ImageManifest::from_resolved(image, &snap_paths, arch);
+    let manifest = ImageManifest::from_resolved(image, &snap_paths, arch, None);
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|e| miette::miette!("failed to serialize manifest: {e}"))?;
     std::fs::write(&manifest_path, &manifest_json)
@@ -678,6 +678,13 @@ pub fn build_image(
 }
 
 /// Build a full disk image with partitions.
+///
+/// ADR-0011 step (a): when a kernel is declared, a UKI (Unified Kernel
+/// Image) is assembled with `ukify` and installed on the ESP at
+/// `EFI/Linux/<name>_<version>.efi` alongside a `loader/loader.conf`, so
+/// declared kernel params land on the real boot cmdline. Every condition
+/// that would yield an unbootable image — missing ukify, missing sd-stub,
+/// no kernel payload, no root partition — fails closed.
 pub fn build_disk_image(
     image: &ImageDeclaration,
     output_dir: &Path,
@@ -711,7 +718,126 @@ pub fn build_disk_image(
         .map_err(|e| miette::miette!("failed to create build directory: {e}"))?;
     let root = build_dir.path().to_path_buf();
 
-    // 3. Extract base snap
+    // 3. Extract base snap and merge the kernel payload
+    let kernel_payload = extract_base_and_kernel(
+        image,
+        &resolved,
+        cache_dir,
+        &root,
+        build_dir.path(),
+        has_unsquashfs,
+    )?;
+
+    // 4. Write kernel cmdline (legacy etc/kernelcmdline echo — the real
+    // boot cmdline now lives in the UKI, step 8)
+    if let Some(ref kernel_entry) = image.kernel {
+        if !kernel_entry.params.is_empty() {
+            let cmdline = kernel_entry.params.join(" ");
+            let kernel_dir = root.join("etc");
+            std::fs::create_dir_all(&kernel_dir).into_diagnostic()?;
+            std::fs::write(kernel_dir.join("kernelcmdline"), &cmdline).into_diagnostic()?;
+            eprintln!("  ✓ kernel cmdline: {cmdline}");
+        }
+    }
+
+    // 5. Write sysctl
+    if !image.sysctl.is_empty() {
+        let sysctl_dir = root.join("etc").join("sysctl.d");
+        std::fs::create_dir_all(&sysctl_dir).into_diagnostic()?;
+        let sysctl_content = image.sysctl.join("\n") + "\n";
+        std::fs::write(sysctl_dir.join("99-shuttle.conf"), &sysctl_content).into_diagnostic()?;
+        eprintln!("  ✓ sysctl written ({} entries)", image.sysctl.len());
+    }
+
+    let disk_layout = image
+        .disk
+        .as_ref()
+        .ok_or_else(|| miette::miette!("disk() must declare partitions for disk image"))?;
+
+    let output_filename = if arch == "all" {
+        format!("{}_{}.img", image.name, image.version)
+    } else {
+        format!("{}_{}_{}.img", image.name, image.version, arch)
+    };
+    let output_path = output_dir.join(&output_filename);
+    std::fs::create_dir_all(output_dir).into_diagnostic()?;
+
+    // Calculate total image size: sum partitions + swap + 4M for GPT headers
+    let total_mb = calculate_disk_size_mb(disk_layout);
+    eprintln!("  creating disk image: {} MB", total_mb);
+
+    // 6. Create and partition the raw image — GPT PARTUUIDs exist from
+    // parted mkpart time, before anything is formatted or copied.
+    let img_path = build_dir.path().join("disk.img");
+    create_partitions(&img_path, disk_layout, total_mb)?;
+
+    // 7. Attach the image to a loop device with partition scanning.
+    let loop_dev = attach_loop(&img_path)?;
+
+    // 8. ADR-0011 step (a): assemble the UKI — compose the cmdline from
+    // declared kernel parts plus root=PARTUUID (captured from the loop
+    // device's partitions), shell out to `ukify`, and capture the boot
+    // facts. Missing tools or payload fail closed here, before any
+    // partition is formatted, so an unbootable image is never emitted.
+    let (uki, uki_stage) = assemble_uki(
+        image,
+        kernel_payload.as_ref(),
+        &loop_dev,
+        disk_layout,
+        build_dir.path(),
+    )?;
+
+    // 9. Write manifest — threaded with the boot facts the image boots with
+    let manifest_path = root.join("image-manifest.json");
+    let manifest = ImageManifest::from_resolved(image, &snap_paths, arch, uki.as_ref());
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| miette::miette!("failed to serialize manifest: {e}"))?;
+    std::fs::write(&manifest_path, &manifest_json).into_diagnostic()?;
+
+    // 10. Format and populate partitions (the ESP gets the UKI + loader.conf)
+    populate_partitions(
+        image,
+        disk_layout,
+        &loop_dev,
+        build_dir.path(),
+        &root,
+        uki.as_ref(),
+        &uki_stage,
+    )?;
+
+    // Detach loop device
+    let _ = std::process::Command::new("losetup")
+        .args(["-d", &loop_dev])
+        .status();
+
+    // 11. Copy final image to output
+    std::fs::copy(&img_path, &output_path).into_diagnostic()?;
+    eprintln!(
+        "  ✓ disk image built: {} ({} MB)",
+        output_filename, total_mb
+    );
+
+    // 12. Update lockfile
+    for snap in &resolved {
+        lockfile.record_snap(&snap.to_snap_ref());
+    }
+
+    Ok(output_path)
+}
+
+/// Extract the base snap as the rootfs foundation, then merge the kernel
+/// snap's modules/firmware. Returns the located kernel boot payload when a
+/// kernel is declared; the payload feeds UKI assembly (ADR-0011 step (a))
+/// later in the build.
+fn extract_base_and_kernel(
+    image: &ImageDeclaration,
+    resolved: &[ResolvedSnap],
+    cache_dir: &Path,
+    root: &Path,
+    work_dir: &Path,
+    has_unsquashfs: bool,
+) -> miette::Result<Option<KernelPayload>> {
+    // 3a. Extract base snap
     let base_snap = resolved
         .iter()
         .find(|s| s.name == image.base.name)
@@ -742,91 +868,59 @@ pub fn build_disk_image(
         }
     }
 
-    // 4. Merge kernel modules
-    if let Some(ref kernel_entry) = image.kernel {
-        if has_unsquashfs {
-            let kernel_snap = resolved.iter().find(|s| s.name == kernel_entry.snap.name);
-            if let Some(ks) = kernel_snap {
-                let k_filename = format!("{}_{}_{}.snap", ks.name, ks.revision, ks.sha3_384);
-                let kpath = cache_dir.join(&k_filename);
-                eprintln!("  merging kernel snap: {}", kernel_entry.snap.name);
-                let kernel_img = tempfile::tempdir().map_err(|e| miette::miette!("{e}"))?;
-                let kernel_dir = kernel_img.path().to_path_buf();
-                let status = std::process::Command::new("unsquashfs")
-                    .args([
-                        "-d",
-                        &kernel_dir.to_string_lossy(),
-                        "-no-xattrs",
-                        &kpath.to_string_lossy(),
-                    ])
-                    .status()
-                    .map_err(|e| miette::miette!("unsquashfs: {e}"))?;
-                if status.code().unwrap_or(1) < 128 {
-                    for dir in ["lib/modules", "lib/firmware"] {
-                        let src = kernel_dir.join(dir);
-                        let dst = root.join(dir);
-                        if src.exists() {
-                            std::fs::create_dir_all(dst.parent().unwrap()).into_diagnostic()?;
-                            cp_r(&src, &dst)?;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 5. Write kernel cmdline
-    if let Some(ref kernel_entry) = image.kernel {
-        if !kernel_entry.params.is_empty() {
-            let cmdline = kernel_entry.params.join(" ");
-            let kernel_dir = root.join("etc");
-            std::fs::create_dir_all(&kernel_dir).into_diagnostic()?;
-            std::fs::write(kernel_dir.join("kernelcmdline"), &cmdline).into_diagnostic()?;
-            eprintln!("  ✓ kernel cmdline: {cmdline}");
-        }
-    }
-
-    // 6. Write sysctl
-    if !image.sysctl.is_empty() {
-        let sysctl_dir = root.join("etc").join("sysctl.d");
-        std::fs::create_dir_all(&sysctl_dir).into_diagnostic()?;
-        let sysctl_content = image.sysctl.join("\n") + "\n";
-        std::fs::write(sysctl_dir.join("99-shuttle.conf"), &sysctl_content).into_diagnostic()?;
-        eprintln!("  ✓ sysctl written ({} entries)", image.sysctl.len());
-    }
-
-    // 7. Write manifest
-    let manifest_path = root.join("image-manifest.json");
-    let manifest = ImageManifest::from_resolved(image, &snap_paths, arch);
-    let manifest_json = serde_json::to_string_pretty(&manifest)
-        .map_err(|e| miette::miette!("failed to serialize manifest: {e}"))?;
-    std::fs::write(&manifest_path, &manifest_json).into_diagnostic()?;
-
-    // 8. Create disk image
-    let disk_layout = image
-        .disk
-        .as_ref()
-        .ok_or_else(|| miette::miette!("disk() must declare partitions for disk image"))?;
-
-    let output_filename = if arch == "all" {
-        format!("{}_{}.img", image.name, image.version)
-    } else {
-        format!("{}_{}_{}.img", image.name, image.version, arch)
+    // 3b. Merge kernel modules and locate the boot payload
+    let Some(kernel_entry) = image.kernel.as_ref() else {
+        return Ok(None);
     };
-    let output_path = output_dir.join(&output_filename);
-    std::fs::create_dir_all(output_dir).into_diagnostic()?;
+    let Some(ks) = resolved.iter().find(|s| s.name == kernel_entry.snap.name) else {
+        return Ok(None);
+    };
+    let k_filename = format!("{}_{}_{}.snap", ks.name, ks.revision, ks.sha3_384);
+    let kpath = cache_dir.join(&k_filename);
+    eprintln!("  merging kernel snap: {}", kernel_entry.snap.name);
+    let kernel_dir = work_dir.join("kernel-snap");
+    let status = std::process::Command::new("unsquashfs")
+        .args([
+            "-d",
+            &kernel_dir.to_string_lossy(),
+            "-no-xattrs",
+            &kpath.to_string_lossy(),
+        ])
+        .status()
+        .map_err(|e| miette::miette!("unsquashfs: {e}"))?;
+    if status.code().unwrap_or(1) >= 128 {
+        return Err(miette::miette!(
+            "failed to unsquashfs kernel snap '{}'",
+            kernel_entry.snap.name
+        ));
+    }
+    for dir in ["lib/modules", "lib/firmware"] {
+        let src = kernel_dir.join(dir);
+        let dst = root.join(dir);
+        if src.exists() {
+            std::fs::create_dir_all(dst.parent().unwrap()).into_diagnostic()?;
+            cp_r(&src, &dst)?;
+        }
+    }
+    // Fail closed on a payload that cannot boot the image.
+    let payload = locate_kernel_payload(&kernel_dir, root).map_err(|e| {
+        miette::miette!(
+            "kernel snap '{}': {e}; refusing to build a disk image that cannot boot",
+            kernel_entry.snap.name
+        )
+    })?;
+    Ok(Some(payload))
+}
 
-    // Calculate total image size: sum partitions + swap + 4M for GPT headers
-    let total_mb = calculate_disk_size_mb(disk_layout);
-    eprintln!("  creating disk image: {} MB", total_mb);
-
-    let img_path = build_dir.path().join("disk.img");
+/// Create the raw disk image with dd, lay out partitions with parted, and
+/// set the ESP flag on the first partition.
+fn create_partitions(img_path: &Path, layout: &DiskLayout, total_mb: u64) -> miette::Result<()> {
     let status = std::process::Command::new("dd")
         .args([
             "if=/dev/zero",
             &format!("of={}", img_path.display()),
             "bs=1M",
-            &format!("count={}", total_mb),
+            &format!("count={total_mb}"),
         ])
         .status()
         .map_err(|e| miette::miette!("dd not found: {e}"))?;
@@ -834,23 +928,16 @@ pub fn build_disk_image(
         return Err(miette::miette!("dd failed to create disk image"));
     }
 
-    // Partition with parted
     let status = std::process::Command::new("parted")
-        .args([
-            "-s",
-            &img_path.to_string_lossy(),
-            "mklabel",
-            &disk_layout.label,
-        ])
+        .args(["-s", &img_path.to_string_lossy(), "mklabel", &layout.label])
         .status()
         .map_err(|e| miette::miette!("parted not found: {e}"))?;
     if !status.success() {
         return Err(miette::miette!("parted failed to create partition table"));
     }
 
-    // Create partitions
     let mut part_start_mb = 4u64; // after GPT
-    for (part_num, part) in disk_layout.partitions.iter().enumerate() {
+    for (part_num, part) in layout.partitions.iter().enumerate() {
         let size_mb = parse_size_mb(&part.size, total_mb - part_start_mb);
         let end_mb = part_start_mb + size_mb;
 
@@ -874,150 +961,531 @@ pub fn build_disk_image(
             ));
         }
 
-        // ESP flag on first partition
         if part_num == 0 {
-            let status = std::process::Command::new("parted")
-                .args(["-s", &img_path.to_string_lossy(), "set", "1", "esp", "on"])
-                .status()
-                .map_err(|e| miette::miette!("parted: {e}"))?;
-            if !status.success() {
-                eprintln!("  ⚠ failed to set ESP flag");
-            }
+            set_esp_flag(img_path);
         }
 
         part_start_mb = end_mb;
     }
 
-    // Swap partition
-    if let Some(ref swap) = disk_layout.swap {
-        let swap_size = parse_size_mb(&swap.size, 0);
-        if swap_size > 0 {
-            let end_mb = part_start_mb + swap_size;
-            let status = std::process::Command::new("parted")
-                .args([
-                    "-s",
-                    &img_path.to_string_lossy(),
-                    "mkpart",
-                    "primary",
-                    "linux-swap",
-                    &format!("{}MB", part_start_mb),
-                    &format!("{}MB", end_mb),
-                ])
-                .status()
-                .map_err(|e| miette::miette!("parted: {e}"))?;
-            if !status.success() {
-                return Err(miette::miette!("parted failed to create swap partition"));
-            }
-        }
+    if let Some(ref swap) = layout.swap {
+        create_swap_partition(img_path, swap, part_start_mb)?;
     }
+    Ok(())
+}
 
-    // Set up loopback device
-    let losetup_out = std::process::Command::new("losetup")
+/// Set the GPT esp flag on partition 1; a failure is reported but not
+/// fatal (matching the historical behavior — the vfat fs still works).
+fn set_esp_flag(img_path: &Path) {
+    let status = std::process::Command::new("parted")
+        .args(["-s", &img_path.to_string_lossy(), "set", "1", "esp", "on"])
+        .status();
+    if !status.is_ok_and(|s| s.success()) {
+        eprintln!("  ⚠ failed to set ESP flag");
+    }
+}
+
+/// Add the declared swap partition (if any) after the data partitions.
+fn create_swap_partition(
+    img_path: &Path,
+    swap: &SwapConfig,
+    part_start_mb: u64,
+) -> miette::Result<()> {
+    let swap_size = parse_size_mb(&swap.size, 0);
+    if swap_size == 0 {
+        return Ok(());
+    }
+    let end_mb = part_start_mb + swap_size;
+    let status = std::process::Command::new("parted")
+        .args([
+            "-s",
+            &img_path.to_string_lossy(),
+            "mkpart",
+            "primary",
+            "linux-swap",
+            &format!("{}MB", part_start_mb),
+            &format!("{}MB", end_mb),
+        ])
+        .status()
+        .map_err(|e| miette::miette!("parted: {e}"))?;
+    if !status.success() {
+        return Err(miette::miette!("parted failed to create swap partition"));
+    }
+    Ok(())
+}
+
+/// Attach the disk image to a free loop device with partition scanning
+/// (`-P`), so partition devices exist for PARTUUID capture.
+fn attach_loop(img_path: &Path) -> miette::Result<String> {
+    let out = std::process::Command::new("losetup")
         .args(["--show", "-fP", &img_path.to_string_lossy()])
         .output()
         .map_err(|e| miette::miette!("losetup not found: {e}"))?;
-    if !losetup_out.status.success() {
+    if !out.status.success() {
         return Err(miette::miette!("losetup failed"));
     }
-    let loop_dev = String::from_utf8_lossy(&losetup_out.stdout)
-        .trim()
-        .to_string();
-    eprintln!("  loop device: {}", loop_dev);
+    let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    eprintln!("  loop device: {}", dev);
+    Ok(dev)
+}
 
-    // Format and populate partitions
-    let part_prefix = format!("{}p", loop_dev);
-    for (i, part) in disk_layout.partitions.iter().enumerate() {
-        let part_dev = format!("{}{}", part_prefix, i + 1);
-        let mount_pt = build_dir.path().join(&part.name);
+/// Format every declared partition on the attached loop device and
+/// populate it: partition 1 when vfat is the ESP (systemd-boot fallback
+/// binary, UKI, loader.conf); every other partition receives the staged
+/// rootfs.
+fn populate_partitions(
+    image: &ImageDeclaration,
+    layout: &DiskLayout,
+    loop_dev: &str,
+    build_dir: &Path,
+    root: &Path,
+    uki: Option<&UkiFacts>,
+    uki_stage: &Path,
+) -> miette::Result<()> {
+    let part_prefix = format!("{loop_dev}p");
+    for (i, part) in layout.partitions.iter().enumerate() {
+        let part_dev = format!("{part_prefix}{}", i + 1);
+        let mount_pt = build_dir.join(&part.name);
         std::fs::create_dir_all(&mount_pt).into_diagnostic()?;
 
-        if part.fs == "vfat" {
-            let status = std::process::Command::new("mkfs.vfat")
-                .args(["-F", "32", "-n", &part.name, &part_dev])
-                .status()
-                .map_err(|e| miette::miette!("mkfs.vfat not found: {e}"))?;
-            if !status.success() {
-                eprintln!("  ⚠ mkfs.vfat failed for {}", part.name);
-            }
-        } else if part.fs == "btrfs" {
-            let status = std::process::Command::new("mkfs.btrfs")
-                .args(["-f", "-L", &part.name, &part_dev])
-                .status()
-                .map_err(|e| miette::miette!("mkfs.btrfs not found: {e}"))?;
-            if !status.success() {
-                eprintln!("  ⚠ mkfs.btrfs failed for {}", part.name);
-            }
+        format_partition(&part_dev, part)?;
+        if !mount_device(&part_dev, &mount_pt)? {
+            continue;
+        }
+        if i == 0 && part.fs == "vfat" {
+            populate_esp(&mount_pt.join("EFI").join("BOOT"))?;
+            install_uki(image, &mount_pt, uki, uki_stage)?;
+            eprintln!("  ✓ ESP: {} (vfat)", part.name);
         } else {
-            let status = std::process::Command::new("mkfs.ext4")
-                .args(["-F", "-L", &part.name, &part_dev])
-                .status()
-                .map_err(|e| miette::miette!("mkfs.ext4 not found: {e}"))?;
-            if !status.success() {
-                eprintln!("  ⚠ mkfs.ext4 failed for {}", part.name);
-            }
+            // Root (or data) partition: copy the staged rootfs
+            cp_r(root, &mount_pt)?;
+            eprintln!("  ✓ {}: {} populated", part.name, part.fs);
         }
+        // Unmount
+        let _ = std::process::Command::new("umount")
+            .arg(mount_pt.to_string_lossy().as_ref())
+            .status();
+    }
+    Ok(())
+}
 
-        // Mount and populate
-        let mount_str = mount_pt.to_string_lossy().into_owned();
-        let status = std::process::Command::new("mount")
-            .args([&part_dev, &mount_str])
-            .status()
-            .map_err(|e| miette::miette!("mount not found: {e}"))?;
-        if status.success() {
-            if i == 0 && part.fs == "vfat" {
-                // ESP: create EFI/boot directory, copy systemd-boot
-                let efi_dir = mount_pt.join("EFI").join("BOOT");
-                std::fs::create_dir_all(&efi_dir).into_diagnostic()?;
-                // Try to find systemd-bootx64.efi on the host
-                let boot_efi = efi_dir.join("BOOTX64.EFI");
-                if !boot_efi.exists() {
-                    if let Ok(efi_status) = std::process::Command::new("sh")
-                        .args([
-                            "-c",
-                            "find /usr/lib/systemd/boot -name '*.efi' 2>/dev/null | head -1",
-                        ])
-                        .output()
-                    {
-                        let src = String::from_utf8_lossy(&efi_status.stdout)
-                            .trim()
-                            .to_string();
-                        if !src.is_empty() {
-                            let _ = std::fs::copy(&src, efi_dir.join("BOOTX64.EFI"));
-                            let _ = std::fs::copy(&src, efi_dir.join("systemd-bootx64.efi"));
-                        }
-                    }
-                }
-                eprintln!("  ✓ ESP: {} (vfat)", part.name);
-            } else {
-                // Root partition: copy rootfs
-                cp_r(&root, &mount_pt)?;
-                eprintln!("  ✓ {}: {} populated", part.name, part.fs);
-            }
-            // Unmount
-            let _ = std::process::Command::new("umount")
-                .arg(&mount_str)
-                .status();
+/// mkfs a partition device; a formatting failure is reported but not fatal
+/// (matching the historical behavior — the mount attempt below decides).
+fn format_partition(part_dev: &str, part: &Partition) -> miette::Result<()> {
+    let (tool, flags): (&str, &[&str]) = match part.fs.as_str() {
+        "vfat" => ("mkfs.vfat", &["-F", "32", "-n"]),
+        "btrfs" => ("mkfs.btrfs", &["-f", "-L"]),
+        _ => ("mkfs.ext4", &["-F", "-L"]),
+    };
+    let status = std::process::Command::new(tool)
+        .args(flags)
+        .arg(&part.name)
+        .arg(part_dev)
+        .status()
+        .map_err(|e| miette::miette!("{tool} not found: {e}"))?;
+    if !status.success() {
+        eprintln!("  ⚠ {tool} failed for {}", part.name);
+    }
+    Ok(())
+}
+
+/// Mount a formatted partition device. False when the mount failed — the
+/// partition is then left unpopulated (historical silent-skip behavior).
+fn mount_device(part_dev: &str, mount_pt: &Path) -> miette::Result<bool> {
+    let mount_str = mount_pt.to_string_lossy().into_owned();
+    let status = std::process::Command::new("mount")
+        .args([part_dev, &mount_str])
+        .status()
+        .map_err(|e| miette::miette!("mount not found: {e}"))?;
+    Ok(status.success())
+}
+
+/// Copy the systemd-boot fallback binary onto the ESP (EFI/BOOT). When no
+/// host systemd-boot EFI binary is found the ESP simply lacks the fallback
+/// — the UKI + loader path does not depend on it.
+fn populate_esp(efi_boot: &Path) -> miette::Result<()> {
+    std::fs::create_dir_all(efi_boot).into_diagnostic()?;
+    if efi_boot.join("BOOTX64.EFI").exists() {
+        return Ok(());
+    }
+    if let Ok(out) = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "find /usr/lib/systemd/boot -name '*.efi' 2>/dev/null | head -1",
+        ])
+        .output()
+    {
+        let src = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !src.is_empty() {
+            let _ = std::fs::copy(&src, efi_boot.join("BOOTX64.EFI"));
+            let _ = std::fs::copy(&src, efi_boot.join("systemd-bootx64.efi"));
         }
     }
+    Ok(())
+}
 
-    // Detach loop device
-    let _ = std::process::Command::new("losetup")
-        .args(["-d", &loop_dev])
-        .status();
-
-    // 9. Copy final image to output
-    std::fs::copy(&img_path, &output_path).into_diagnostic()?;
+/// Install the UKI and the systemd-boot loader config onto the mounted
+/// ESP. Type-2 UKIs in EFI/Linux/*.efi are auto-discovered by systemd-boot
+/// — no per-entry loader file is needed.
+fn install_uki(
+    image: &ImageDeclaration,
+    esp_mount: &Path,
+    uki: Option<&UkiFacts>,
+    uki_stage: &Path,
+) -> miette::Result<()> {
+    let Some(facts) = uki else {
+        return Ok(());
+    };
+    let efi_linux = esp_mount.join("EFI").join("Linux");
+    std::fs::create_dir_all(&efi_linux).into_diagnostic()?;
+    std::fs::copy(uki_stage, efi_linux.join(&facts.uki_filename))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("installing {}", facts.uki_filename))?;
+    let loader_dir = esp_mount.join("loader");
+    std::fs::create_dir_all(&loader_dir).into_diagnostic()?;
+    std::fs::write(loader_dir.join("loader.conf"), loader_conf(image)).into_diagnostic()?;
     eprintln!(
-        "  ✓ disk image built: {} ({} MB)",
-        output_filename, total_mb
+        "  ✓ UKI installed: EFI/Linux/{} (cmdline: {})",
+        facts.uki_filename, facts.cmdline
     );
+    Ok(())
+}
 
-    // 10. Update lockfile
-    for snap in &resolved {
-        lockfile.record_snap(&snap.to_snap_ref());
+// ── UKI assembly (ADR-0011 step (a)) ──
+
+/// A kernel snap's boot assets, located per the payload convention in
+/// [`locate_kernel_payload`].
+#[derive(Debug)]
+struct KernelPayload {
+    kernel: PathBuf,
+    initrd: PathBuf,
+    version: String,
+}
+
+/// Boot facts captured during UKI assembly (ADR-0011 step (a)) and threaded
+/// into the build manifest — the image records what will actually boot,
+/// not just what was packed.
+struct UkiFacts {
+    kernel_version: String,
+    cmdline: String,
+    uki_filename: String,
+    esp_partuuid: Option<String>,
+}
+
+/// GPT PARTUUID emitted when the real root PARTUUID could not be resolved.
+/// Documented placeholder strategy: the nil GUID makes the failure loud —
+/// nothing can mount a partition that does not exist, so the image never
+/// silently boots from the wrong volume. In practice the real PARTUUID is
+/// captured: parted assigns GPT GUIDs at mkpart time and `losetup -P`
+/// exposes the partition devices before the UKI is built.
+const NIL_PARTUUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Standard locations of the systemd sd-stub for x86_64 — all under the
+/// sandbox bind roots ([`crate::snap::SANDBOX_RO_ROOTS`]).
+const EFI_STUB_CANDIDATES: [&str; 3] = [
+    "/usr/lib/systemd/boot/efi/linuxx64.efi.stub",
+    "/usr/local/lib/systemd/boot/efi/linuxx64.efi.stub",
+    "/run/current-system/sw/lib/systemd/boot/efi/linuxx64.efi.stub",
+];
+
+/// Kernel-snap payload convention (ADR-0011 step (a)) — defined explicitly
+/// because no convention existed: pkgs/*-kernel.lua snaps are source-type
+/// with no packed kernel. After the snap is extracted, boot assets are read
+/// from the payload in this fixed order, with the version taken from the
+/// merged rootfs module tree (`lib/modules/<version>` — the only kernel
+/// payload path this repo already merges):
+///
+///   kernel: boot/vmlinuz-<ver> → boot/vmlinuz → vmlinuz-<ver> → vmlinuz
+///   initrd: boot/initrd.img-<ver> → boot/initrd.img → initrd.img → initrd
+///
+/// Raw kernel binaries only: a snapd-style `kernel.img` squashfs payload is
+/// not unpacked (that is gadget-stage behavior, out of scope).
+fn locate_kernel_payload(kernel_dir: &Path, root: &Path) -> miette::Result<KernelPayload> {
+    let version = discover_kernel_version(root)?;
+    let kernel = first_existing([
+        kernel_dir.join("boot").join(format!("vmlinuz-{version}")),
+        kernel_dir.join("boot").join("vmlinuz"),
+        kernel_dir.join(format!("vmlinuz-{version}")),
+        kernel_dir.join("vmlinuz"),
+    ])
+    .ok_or_else(|| {
+        miette::miette!(
+            "payload has no kernel image (searched boot/vmlinuz-{version}, boot/vmlinuz, \
+             vmlinuz-{version}, vmlinuz)"
+        )
+    })?;
+    let initrd = first_existing([
+        kernel_dir
+            .join("boot")
+            .join(format!("initrd.img-{version}")),
+        kernel_dir.join("boot").join("initrd.img"),
+        kernel_dir.join("initrd.img"),
+        kernel_dir.join("initrd"),
+    ])
+    .ok_or_else(|| {
+        miette::miette!(
+            "payload has no initrd (searched boot/initrd.img-{version}, boot/initrd.img, \
+             initrd.img, initrd)"
+        )
+    })?;
+    Ok(KernelPayload {
+        kernel,
+        initrd,
+        version,
+    })
+}
+
+/// First path in `candidates` that exists as a file.
+fn first_existing(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Kernel version from the merged rootfs module tree: the single directory
+/// under `lib/modules/`. Ambiguous or absent trees fail closed.
+fn discover_kernel_version(root: &Path) -> miette::Result<String> {
+    let modules_dir = root.join("lib").join("modules");
+    let mut versions: Vec<String> = std::fs::read_dir(&modules_dir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading {}", modules_dir.display()))?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    versions.sort();
+    match versions.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(miette::miette!(
+            "no kernel module tree (lib/modules/<version>) in the merged rootfs — \
+             the kernel snap carries no recognizable version"
+        )),
+        many => Err(miette::miette!(
+            "ambiguous kernel module trees {many:?} in the merged rootfs — a kernel \
+             snap must carry exactly one lib/modules/<version>"
+        )),
+    }
+}
+
+/// GPT PARTUUID of a loop-device partition (e.g. /dev/loop0p2), read
+/// host-side with lsblk (util-linux — the same tool family the disk build
+/// already requires). None when lsblk is absent or the partition carries
+/// no GPT entry.
+fn partuuid_of(part_dev: &str) -> Option<String> {
+    let out = std::process::Command::new("lsblk")
+        .args(["-no", "PARTUUID", part_dev])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Resolve ukify with the same bind-aware PATH resolution the sandbox
+/// toolchain uses ([`crate::snap::resolve_in_path`]). ukify runs host-side
+/// — like mksquashfs/dd — so the full host PATH is the right search set;
+/// the shared helper keeps one resolution behavior across shuttle.
+fn find_ukify() -> Option<PathBuf> {
+    snap::resolve_in_path("ukify", &snap::path_entries())
+}
+
+/// Locate the systemd sd-stub the UKI is built on.
+fn find_efi_stub() -> Option<PathBuf> {
+    for candidate in EFI_STUB_CANDIDATES {
+        let path = Path::new(candidate);
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Filename of the UKI on the ESP (systemd-boot auto-discovers Type-2 UKIs
+/// in EFI/Linux/, and the loader.conf default pattern keys off this name).
+fn uki_filename(image: &ImageDeclaration) -> String {
+    format!("{}_{}.efi", image.name, image.version)
+}
+
+/// Compose the UKI kernel command line from parts — never one opaque
+/// string. A UKI's `.cmdline` section is immutable once built, and
+/// dm-verity boot will later append `roothash=` (Secure Boot will sign the
+/// result), so composition stays programmatic: declared kernel params
+/// first (user intent), then the `root=` argument derived from the target
+/// root partition, then trailing verity args (reserved, appended last).
+fn compose_cmdline(params: &[String], root_partuuid: Option<&str>, trailing: &[String]) -> String {
+    let mut args: Vec<String> = params.to_vec();
+    args.push(match root_partuuid {
+        Some(uuid) => format!("root=PARTUUID={uuid}"),
+        None => format!("root=PARTUUID={NIL_PARTUUID}"),
+    });
+    args.extend(trailing.iter().cloned());
+    args.join(" ")
+}
+
+/// Deterministic os-release for the UKI: no timestamps, no host facts —
+/// the same definition always yields byte-identical boot assets.
+fn write_uki_os_release(stage_dir: &Path, image: &ImageDeclaration) -> miette::Result<PathBuf> {
+    let path = stage_dir.join("os-release");
+    std::fs::write(
+        &path,
+        format!(
+            "ID=shuttle\nNAME=\"{name}\"\nVERSION_ID={version}\nPRETTY_NAME=\"shuttle {name} {version}\"\n",
+            name = image.name,
+            version = image.version,
+        ),
+    )
+    .into_diagnostic()?;
+    Ok(path)
+}
+
+/// Build one UKI with the real `ukify` CLI. `ukify` and `stub` are
+/// injected so the fail-closed behavior is testable on hosts without
+/// systemd's tools; [`build_uki`] resolves them from the host.
+fn build_uki_with(
+    ukify: Option<&Path>,
+    stub: Option<&Path>,
+    kernel: &Path,
+    initrd: &Path,
+    cmdline: &str,
+    os_release: &Path,
+    output: &Path,
+) -> miette::Result<()> {
+    let Some(ukify) = ukify else {
+        return Err(miette::miette!(
+            "ukify not found on PATH — a kernel disk image cannot boot without a UKI, \
+             so refusing to produce an unbootable image. Run 'shuttle doctor' and \
+             install ukify (systemd >= 254; e.g. apt install systemd-ukify or add \
+             systemd to devbox.json packages)"
+        ));
+    };
+    let Some(stub) = stub else {
+        return Err(miette::miette!(
+            "systemd sd-stub (linuxx64.efi.stub) not found — the UKI cannot be assembled \
+             without it. Run 'shuttle doctor'; checked locations: {}",
+            EFI_STUB_CANDIDATES.join(", ")
+        ));
+    };
+    let status = std::process::Command::new(ukify)
+        .arg("build")
+        .arg(format!("--linux={}", kernel.display()))
+        .arg(format!("--initrd={}", initrd.display()))
+        .arg(format!("--cmdline={cmdline}"))
+        .arg(format!("--os-release=@{}", os_release.display()))
+        .arg(format!("--stub={}", stub.display()))
+        .arg(format!("--output={}", output.display()))
+        .status()
+        .map_err(|e| miette::miette!("failed to run ukify: {e}"))?;
+    if !status.success() || !output.is_file() {
+        return Err(miette::miette!(
+            "ukify failed to build the UKI — the disk image would not boot; \
+             refusing to emit it"
+        ));
+    }
+    Ok(())
+}
+
+/// Build the UKI with host-resolved ukify and sd-stub (fail-closed when
+/// either is absent).
+fn build_uki(
+    kernel: &Path,
+    initrd: &Path,
+    cmdline: &str,
+    os_release: &Path,
+    output: &Path,
+) -> miette::Result<()> {
+    build_uki_with(
+        find_ukify().as_deref(),
+        find_efi_stub().as_deref(),
+        kernel,
+        initrd,
+        cmdline,
+        os_release,
+        output,
+    )
+}
+
+/// Compose the cmdline, build the UKI into `stage_dir`, and capture the
+/// boot facts for the manifest. The facts are `None` only for kernel-free
+/// images (nothing to boot, no UKI needed); the staged UKI path is empty
+/// then and never used.
+fn assemble_uki(
+    image: &ImageDeclaration,
+    payload: Option<&KernelPayload>,
+    loop_dev: &str,
+    layout: &DiskLayout,
+    stage_dir: &Path,
+) -> miette::Result<(Option<UkiFacts>, PathBuf)> {
+    let Some(entry) = image.kernel.as_ref() else {
+        return Ok((None, PathBuf::new()));
+    };
+    let Some(payload) = payload else {
+        return Err(miette::miette!(
+            "kernel snap '{}' declared but its boot payload was not extracted — \
+             refusing to build a disk image that cannot boot",
+            entry.snap.name
+        ));
+    };
+    let root_idx = layout
+        .partitions
+        .iter()
+        .position(|p| p.mount == "/")
+        .ok_or_else(|| {
+            miette::miette!(
+                "disk layout declares no root partition (mount = \"/\") — the UKI needs \
+                 a root= target; refusing to build an unbootable image"
+            )
+        })?;
+
+    // GPT PARTUUIDs exist from parted mkpart time; `losetup -P` exposes the
+    // partition devices before anything is formatted. ESP is partition 1.
+    let root_partuuid = partuuid_of(&format!("{loop_dev}p{}", root_idx + 1));
+    let esp_partuuid = partuuid_of(&format!("{loop_dev}p1"));
+    if root_partuuid.is_none() {
+        eprintln!(
+            "  ⚠ root PARTUUID unresolvable — cmdline carries the documented \
+             nil-GUID placeholder (see compose_cmdline)"
+        );
     }
 
-    Ok(output_path)
+    let cmdline = compose_cmdline(&entry.params, root_partuuid.as_deref(), &[]);
+    let filename = uki_filename(image);
+    let uki_stage = stage_dir.join(&filename);
+    let os_release = write_uki_os_release(stage_dir, image)?;
+    build_uki(
+        &payload.kernel,
+        &payload.initrd,
+        &cmdline,
+        &os_release,
+        &uki_stage,
+    )?;
+    eprintln!("  ✓ UKI built: {filename}");
+
+    Ok((
+        Some(UkiFacts {
+            kernel_version: payload.version.clone(),
+            cmdline,
+            uki_filename: filename,
+            esp_partuuid,
+        }),
+        uki_stage,
+    ))
+}
+
+/// systemd-boot loader configuration at the ESP root. Type-2 UKIs in
+/// EFI/Linux/*.efi are auto-discovered — no per-entry loader file needed —
+/// but the timeout and default pattern live here.
+fn loader_conf(image: &ImageDeclaration) -> String {
+    let timeout = image.bootloader.as_ref().map(|b| b.timeout).unwrap_or(3);
+    // `default` is a glob: any UKI built for this image name matches,
+    // regardless of version.
+    format!(
+        "# Generated by shuttle — do not edit.\ntimeout {timeout}\ndefault {}_*\n",
+        image.name
+    )
 }
 
 /// Parse a size string like "512M" or "4G" or "0" to MB.
@@ -1057,6 +1525,24 @@ pub struct ImageManifest {
     pub version: String,
     pub arch: String,
     pub snaps: Vec<ImageSnapEntry>,
+
+    /// Kernel version of the packed payload (lib/modules/<ver>) — set when
+    /// the image declares a kernel (ADR-0011 step (a)).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_version: Option<String>,
+
+    /// Composed UKI cmdline actually installed on the ESP (declared params
+    /// + root= [+ future roothash=]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+
+    /// UKI filename on the ESP (EFI/Linux/<uki>).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uki: Option<String>,
+
+    /// GPT PARTUUID of the ESP, when resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub esp_partuuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1073,6 +1559,7 @@ impl ImageManifest {
         image: &ImageDeclaration,
         snaps: &[(String, ResolvedSnap)],
         arch: &str,
+        boot: Option<&UkiFacts>,
     ) -> Self {
         let entries: Vec<ImageSnapEntry> = snaps
             .iter()
@@ -1100,6 +1587,10 @@ impl ImageManifest {
             version: image.version.clone(),
             arch: arch.to_string(),
             snaps: entries,
+            kernel_version: boot.map(|b| b.kernel_version.clone()),
+            cmdline: boot.map(|b| b.cmdline.clone()),
+            uki: boot.map(|b| b.uki_filename.clone()),
+            esp_partuuid: boot.and_then(|b| b.esp_partuuid.clone()),
         }
     }
 }
@@ -1347,12 +1838,17 @@ mod tests {
             ),
         ];
 
-        let manifest = ImageManifest::from_resolved(&decl, &snaps, "amd64");
+        let manifest = ImageManifest::from_resolved(&decl, &snaps, "amd64", None);
         assert_eq!(manifest.snaps.len(), 4);
         assert_eq!(manifest.snaps[0].role, "base");
         assert_eq!(manifest.snaps[1].role, "kernel");
         assert_eq!(manifest.snaps[2].role, "gadget");
         assert_eq!(manifest.snaps[3].role, "app");
+        // Kernel-free image: boot facts stay absent.
+        assert!(manifest.kernel_version.is_none());
+        assert!(manifest.cmdline.is_none());
+        assert!(manifest.uki.is_none());
+        assert!(manifest.esp_partuuid.is_none());
     }
 
     #[test]
@@ -1465,5 +1961,182 @@ mod tests {
         assert_eq!(parse_size_mb("2048", 0), 2048);
         assert_eq!(parse_size_mb("1g", 0), 1024);
         assert_eq!(parse_size_mb("256m", 0), 256);
+    }
+
+    // ── UKI assembly (ADR-0011 step (a)) ──
+
+    #[test]
+    fn cmdline_composes_params_then_root() {
+        let cmdline = compose_cmdline(
+            &["quiet".to_string(), "console=ttyS0".to_string()],
+            Some("1234abcd-00aa-bbcc-ddee-ff0011223344"),
+            &[],
+        );
+        assert_eq!(
+            cmdline,
+            "quiet console=ttyS0 root=PARTUUID=1234abcd-00aa-bbcc-ddee-ff0011223344"
+        );
+    }
+
+    #[test]
+    fn cmdline_placeholder_root_is_nil_guid() {
+        let cmdline = compose_cmdline(&[], None, &[]);
+        assert_eq!(cmdline, format!("root=PARTUUID={NIL_PARTUUID}"));
+    }
+
+    #[test]
+    fn cmdline_leaves_room_for_verity_trailer() {
+        // Future dm-verity boot appends roothash= — composition is
+        // programmatic from parts so the trailer lands after root=.
+        let base = compose_cmdline(&["ro".to_string()], Some("abcd"), &[]);
+        let full = compose_cmdline(
+            &["ro".to_string()],
+            Some("abcd"),
+            &["roothash=9f86d081".to_string()],
+        );
+        assert_eq!(full, format!("{base} roothash=9f86d081"));
+        assert!(full.ends_with("root=PARTUUID=abcd roothash=9f86d081"));
+    }
+
+    #[test]
+    fn kernel_payload_discovery_follows_convention() {
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("lib/modules/6.8.0-42-generic")).unwrap();
+        std::fs::create_dir_all(kdir.path().join("boot")).unwrap();
+        std::fs::write(kdir.path().join("boot/vmlinuz-6.8.0-42-generic"), "K").unwrap();
+        std::fs::write(kdir.path().join("boot/initrd.img-6.8.0-42-generic"), "I").unwrap();
+
+        let payload = locate_kernel_payload(kdir.path(), root.path()).unwrap();
+        assert_eq!(payload.version, "6.8.0-42-generic");
+        assert_eq!(
+            payload.kernel,
+            kdir.path().join("boot/vmlinuz-6.8.0-42-generic")
+        );
+        assert_eq!(
+            payload.initrd,
+            kdir.path().join("boot/initrd.img-6.8.0-42-generic")
+        );
+    }
+
+    #[test]
+    fn kernel_payload_missing_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("lib/modules/6.8.0")).unwrap();
+        let err = locate_kernel_payload(kdir.path(), root.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("vmlinuz"),
+            "error must name the missing kernel asset: {err:#}"
+        );
+    }
+
+    #[test]
+    fn kernel_version_missing_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let err = discover_kernel_version(root.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("lib/modules"),
+            "error must name the module tree: {err:#}"
+        );
+    }
+
+    #[test]
+    fn uki_without_ukify_fails_closed_with_doctor_hint() {
+        // Injected None ukify: the fail-closed path fires before any file
+        // is touched, so dummy paths are safe.
+        let err = build_uki_with(
+            None,
+            Some(Path::new("/usr/lib/systemd/boot/efi/linuxx64.efi.stub")),
+            Path::new("/nonexistent/vmlinuz"),
+            Path::new("/nonexistent/initrd"),
+            "quiet",
+            Path::new("/nonexistent/os-release"),
+            Path::new("/nonexistent/out.efi"),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ukify") && msg.contains("shuttle doctor"),
+            "fail-closed error must name ukify and the doctor hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn uki_without_stub_fails_closed() {
+        // A fake executable ukify proves the stub check fires BEFORE the
+        // command runs — the fake must never be executed.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("ukify");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = build_uki_with(
+            Some(&fake),
+            None,
+            Path::new("/nonexistent/vmlinuz"),
+            Path::new("/nonexistent/initrd"),
+            "quiet",
+            Path::new("/nonexistent/os-release"),
+            Path::new("/nonexistent/out.efi"),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sd-stub") && msg.contains("linuxx64.efi.stub"),
+            "fail-closed error must name the stub: {msg}"
+        );
+    }
+
+    #[test]
+    fn uki_filename_is_deterministic() {
+        let image = ImageDeclaration {
+            name: "my-system".into(),
+            version: "1.2.3".into(),
+            base: SnapRef {
+                name: "core22".into(),
+                revision: None,
+                sha3_384: None,
+            },
+            kernel: None,
+            gadget: None,
+            extra_snaps: vec![],
+            bootloader: None,
+            disk: None,
+            sysctl: vec![],
+        };
+        assert_eq!(uki_filename(&image), "my-system_1.2.3.efi");
+        assert_eq!(
+            loader_conf(&image),
+            "# Generated by shuttle — do not edit.\ntimeout 3\ndefault my-system_*\n"
+        );
+    }
+
+    #[test]
+    fn loader_conf_uses_declared_timeout() {
+        let image = ImageDeclaration {
+            name: "my-system".into(),
+            version: "1.2.3".into(),
+            base: SnapRef {
+                name: "core22".into(),
+                revision: None,
+                sha3_384: None,
+            },
+            kernel: None,
+            gadget: None,
+            extra_snaps: vec![],
+            bootloader: Some(BootloaderConfig {
+                type_: "systemd-boot".into(),
+                timeout: 5,
+            }),
+            disk: None,
+            sysctl: vec![],
+        };
+        assert!(
+            loader_conf(&image).contains("timeout 5"),
+            "declared bootloader timeout must win: {}",
+            loader_conf(&image)
+        );
     }
 }

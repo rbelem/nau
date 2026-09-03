@@ -3,7 +3,7 @@
 //! Verifies that all required tools are installed and working before
 //! attempting a build. Run via `shuttle doctor`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::snap;
 
@@ -98,6 +98,8 @@ pub fn run_all() -> Vec<Check> {
         check_cmd("tar", "install tar (e.g. apt install tar)"),
         check_bwrap(),
         check_squashfs_version(),
+        check_ukify(),
+        check_efi_stub(),
     ];
     checks.extend(check_sandbox_tools_with(&snap::path_entries()));
     checks
@@ -115,6 +117,47 @@ fn check_cmd(name: &'static str, hint: &'static str) -> Check {
         Check::ok(name)
     } else {
         Check::missing(name, hint)
+    }
+}
+
+/// Standard locations of the systemd sd-stub for x86_64, shared with the
+/// image builder ([`crate::image`]) — all under the sandbox bind roots.
+pub const EFI_STUB_CANDIDATES: [&str; 3] = [
+    "/usr/lib/systemd/boot/efi/linuxx64.efi.stub",
+    "/usr/local/lib/systemd/boot/efi/linuxx64.efi.stub",
+    "/run/current-system/sw/lib/systemd/boot/efi/linuxx64.efi.stub",
+];
+
+/// Check that ukify is resolvable. Kernel disk images (ADR-0011 step (a))
+/// build a UKI with the real `ukify` CLI and fail closed without it, so a
+/// missing ukify must be named before any build starts.
+fn check_ukify() -> Check {
+    match snap::resolve_in_path("ukify", &snap::path_entries()) {
+        Some(path) => Check::ok_at("ukify", format!("resolves to {path:?}")),
+        None => Check::missing(
+            "ukify",
+            "kernel disk images need ukify to build the UKI (systemd >= 254) — \
+             e.g. apt install systemd-ukify, or add systemd to devbox.json packages",
+        ),
+    }
+}
+
+/// Check that the systemd sd-stub the UKI is built on is present.
+fn check_efi_stub() -> Check {
+    match EFI_STUB_CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|p| p.is_file())
+    {
+        Some(path) => Check::ok_at("linuxx64.efi.stub", format!("found at {}", path.display())),
+        None => Check::missing(
+            "linuxx64.efi.stub",
+            format!(
+                "the UKI sd-stub was not found in any of: {} — install systemd's \
+                 boot stub (ships with systemd >= 254)",
+                EFI_STUB_CANDIDATES.join(", ")
+            ),
+        ),
     }
 }
 
@@ -293,6 +336,34 @@ mod tests {
                 checks.iter().any(|c| c.name == format!("sandbox: {tool}")),
                 "missing sandbox visibility check for {tool}"
             );
+        }
+    }
+
+    #[test]
+    fn run_all_includes_uki_checks() {
+        let checks = run_all();
+        for name in ["ukify", "linuxx64.efi.stub"] {
+            assert!(
+                checks.iter().any(|c| c.name == name),
+                "missing UKI readiness check for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn uki_stub_check_names_candidates_when_missing() {
+        let check = check_efi_stub();
+        // On hosts with the stub this is Ok; either way the check must be
+        // one of the two with a meaningful hint path.
+        match check.status {
+            CheckStatus::Ok => assert!(check.hint.is_some()),
+            _ => {
+                let hint = check.hint.as_deref().unwrap_or_default();
+                assert!(
+                    hint.contains("/usr/lib/systemd/boot/efi/linuxx64.efi.stub"),
+                    "hint must name the stub candidates: {hint}"
+                );
+            }
         }
     }
 

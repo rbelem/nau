@@ -172,6 +172,37 @@ pub struct ImageEntry {
     /// then extras sorted by name.
     pub snaps: Vec<ManifestSnap>,
 
+    /// Declared kernel params (ADR-0011 step (a)) — threaded through eval
+    /// instead of dropped; image builds compose them into the UKI cmdline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_params: Option<Vec<String>>,
+
+    /// Declared kernel modules to force-load at boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_modules: Option<Vec<String>>,
+
+    /// Declared modprobe.d configuration written into the image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_modprobe_config: Option<String>,
+
+    /// Kernel version of the packed payload (lib/modules/<ver>) — build
+    /// fact, populated by `shuttle image`, never by eval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_version: Option<String>,
+
+    /// Composed UKI cmdline (declared params + root= [+ future roothash=])
+    /// — build fact, populated by `shuttle image`, never by eval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+
+    /// UKI filename on the ESP (EFI/Linux/<uki>) — build fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uki: Option<String>,
+
+    /// ESP GPT PARTUUID — build fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub esp_partuuid: Option<String>,
+
     /// Image artifact state — always unbuilt from eval.
     pub artifact: Artifact,
 }
@@ -425,6 +456,19 @@ fn image_entry(
         )?);
     }
 
+    // ADR-0011 step (a): the declared kernel config is part of the IR —
+    // eval echoes what was declared. Build facts (kernel_version, cmdline,
+    // uki, esp_partuuid) are only known once `shuttle image` assembles the
+    // UKI, so they stay None (skipped) here.
+    let kernel = image.kernel.as_ref();
+    let kernel_params = kernel
+        .filter(|k| !k.params.is_empty())
+        .map(|k| k.params.clone());
+    let kernel_modules = kernel
+        .filter(|k| !k.modules.is_empty())
+        .map(|k| k.modules.clone());
+    let kernel_modprobe_config = kernel.and_then(|k| k.modprobe_config.clone());
+
     Ok(ImageEntry {
         name: image.name.clone(),
         version: image.version.clone(),
@@ -433,6 +477,13 @@ fn image_entry(
         bootloader: image.bootloader.as_ref().map(|b| b.type_.clone()),
         disk_label: image.disk.as_ref().map(|d| d.label.clone()),
         snaps,
+        kernel_params,
+        kernel_modules,
+        kernel_modprobe_config,
+        kernel_version: None,
+        cmdline: None,
+        uki: None,
+        esp_partuuid: None,
         artifact: Artifact::unbuilt(),
     })
 }
@@ -668,6 +719,82 @@ mod tests {
             "latest/stable",
             None,
         )
+    }
+
+    // ── Kernel config threading (ADR-0011 step (a)) ──
+
+    fn kernel_image() -> ImageDeclaration {
+        ImageDeclaration {
+            name: "kernel-system".into(),
+            version: "2.0.0".into(),
+            base: pinned("core22", 1847, HASH_A),
+            kernel: Some(crate::image::KernelEntry {
+                snap: pinned("pc-kernel", 1241, HASH_B),
+                params: vec!["quiet".into(), "console=ttyS0".into()],
+                modules: vec!["btrfs".into()],
+                modprobe_config: Some("options btrfs workspace_mirror=/vols\n".into()),
+            }),
+            gadget: None,
+            extra_snaps: vec![],
+            bootloader: None,
+            disk: None,
+            sysctl: vec![],
+        }
+    }
+
+    fn manifest_for(images: HashMap<String, ImageDeclaration>) -> miette::Result<ImageManifest> {
+        build_manifest(
+            &Outputs::new(),
+            &images,
+            &HashMap::new(),
+            &empty_lockfile(),
+            "amd64",
+            "latest/stable",
+            None,
+        )
+    }
+
+    #[test]
+    fn kernel_params_modules_modprobe_survive_image_entry() {
+        let m = manifest_for(HashMap::from([("system".to_string(), kernel_image())])).unwrap();
+        let entry = m.images.get("system").unwrap();
+        assert_eq!(
+            entry.kernel_params,
+            Some(vec!["quiet".to_string(), "console=ttyS0".to_string()])
+        );
+        assert_eq!(entry.kernel_modules, Some(vec!["btrfs".to_string()]));
+        assert_eq!(
+            entry.kernel_modprobe_config.as_deref(),
+            Some("options btrfs workspace_mirror=/vols\n")
+        );
+    }
+
+    #[test]
+    fn kernel_build_facts_stay_skipped_from_eval() {
+        let m = manifest_for(HashMap::from([("system".to_string(), kernel_image())])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&m.to_json().unwrap()).unwrap();
+        let img = &v["images"]["system"];
+        for field in ["kernel_version", "cmdline", "uki", "esp_partuuid"] {
+            assert!(img.get(field).is_none(), "{field} must be skipped: {img}");
+        }
+    }
+
+    #[test]
+    fn kernel_free_image_omits_every_kernel_field() {
+        let m = manifest_with_image(pinned("core22", 1847, HASH_A), vec![]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&m.to_json().unwrap()).unwrap();
+        let img = &v["images"]["system"];
+        for field in [
+            "kernel_params",
+            "kernel_modules",
+            "kernel_modprobe_config",
+            "kernel_version",
+            "cmdline",
+            "uki",
+            "esp_partuuid",
+        ] {
+            assert!(img.get(field).is_none(), "{field} must be skipped: {img}");
+        }
     }
 
     // ── Schema ──
