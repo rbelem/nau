@@ -182,11 +182,33 @@ fn check_veritysetup() -> Check {
 pub enum VerityConfigAudit {
     /// CONFIG_DM_VERITY=y found in the config at this path.
     Confirmed(PathBuf),
+    /// The kernel version carries prior in-guest boot proof of dm-verity
+    /// (module load + `status: verified` activation), even though the
+    /// shipped config lacks CONFIG_DM_VERITY=y (=m from the initrd works
+    /// identically) or no config file exists. Value is the provenance note.
+    ConfirmedByProof(&'static str),
     /// A kernel config exists at this path but CONFIG_DM_VERITY=y is absent.
     Unconfirmed(PathBuf),
     /// No kernel config source found — support cannot be confirmed either
     /// way (common: many kernel snaps ship no config).
     NoConfig,
+}
+
+/// Kernel versions whose dm-verity support was behaviorally verified in
+/// QEMU missions (module load + `veritysetup status: verified` from the
+/// dm device), with provenance. Checked when the config-based audit would
+/// otherwise report Unconfirmed or NoConfig.
+const KNOWN_GOOD_VERITY_KERNELS: &[(&str, &str)] = &[(
+    "6.18.45",
+    "nixpkgs linux 6.18.45: DM_VERITY=m + CRYPTO_SHA256=y proven in-guest \
+     (QEMU verity mission 2026-09-04, ADR-0011 kernel-config audit)",
+)];
+
+fn known_good_verity_kernel(version: &str) -> Option<&'static str> {
+    KNOWN_GOOD_VERITY_KERNELS
+        .iter()
+        .find(|(v, _)| *v == version)
+        .map(|(_, note)| *note)
 }
 
 /// Audit the kernel payload for dm-verity support (ADR-0011 step (c)).
@@ -207,10 +229,22 @@ pub fn audit_kernel_verity_config(payload_dir: &Path, kernel_version: &str) -> V
             }
         })
         .unwrap_or(VerityConfigAudit::NoConfig);
+    // Boot proof trumps a missing or =y-less config: dm-verity may ship as
+    // a module from the initrd (see ADR-0011 kernel-config audit).
+    let outcome = match outcome {
+        VerityConfigAudit::Confirmed(_) => outcome,
+        _ => match known_good_verity_kernel(kernel_version) {
+            Some(note) => VerityConfigAudit::ConfirmedByProof(note),
+            None => outcome,
+        },
+    };
     match &outcome {
         VerityConfigAudit::Confirmed(path) => eprintln!(
             "  ✓ kernel dm-verity: CONFIG_DM_VERITY=y ({})",
             path.display()
+        ),
+        VerityConfigAudit::ConfirmedByProof(note) => eprintln!(
+            "  ✓ kernel {kernel_version}: dm-verity confirmed by prior boot proof ({note})"
         ),
         VerityConfigAudit::Unconfirmed(path) => eprintln!(
             "  ⚠ kernel config {} lacks CONFIG_DM_VERITY=y — dm-verity boot \
@@ -535,6 +569,43 @@ mod tests {
             audit_kernel_verity_config(dir.path(), "6.8.0"),
             VerityConfigAudit::Confirmed(_)
         ));
+    }
+
+    #[test]
+    fn kernel_config_audit_confirms_known_good_kernel_without_config() {
+        // nix 6.18.45 ships no config file in its payload but has in-guest
+        // boot proof (ADR-0011 kernel-config audit, 2026-09-04).
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            audit_kernel_verity_config(dir.path(), "6.18.45"),
+            VerityConfigAudit::ConfirmedByProof(_)
+        ));
+    }
+
+    #[test]
+    fn kernel_config_audit_boot_proof_overrides_absent_y() {
+        // The nix kernel config has DM_VERITY=m (not =y); boot proof wins.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("boot").join("config-6.18.45");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "# CONFIG_DM_VERITY is not set\n").unwrap();
+        assert!(matches!(
+            audit_kernel_verity_config(dir.path(), "6.18.45"),
+            VerityConfigAudit::ConfirmedByProof(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_kernel_version_still_unconfirmed_without_y() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("boot").join("config-6.18.45");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "# CONFIG_DM_VERITY is not set\n").unwrap();
+        // A different version string with the same config stays Unconfirmed.
+        assert_eq!(
+            audit_kernel_verity_config(dir.path(), "6.18.46"),
+            VerityConfigAudit::Unconfirmed(config)
+        );
     }
 
     #[test]

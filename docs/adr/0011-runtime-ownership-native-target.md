@@ -30,3 +30,25 @@ Verified starting point (council-verified, file:line): today's images have **zer
 **Positive**: parity-or-better with UC on integrity, boot, and update trust, kernel-enforced; one coherent trust domain; all machinery is stock systemd/kernel — no daemons, offline-first preserved.
 
 **Negative**: dynamic per-app confinement (interfaces, D-Bus mediation, home remap) is genuinely absent — GUI apps wanting snap-strict semantics have no native answer; self-managed keys concentrate trust in the key ceremony (mitigated by (4e)); shipped kernels must be audited for the dm-verity signature config; images from before this ADR could not boot or run apps — no migration path is owed.
+
+---
+
+## Kernel-config audit (closed 2026-09-04)
+
+Supersedes the standing "remaining open" item ("shipped kernels must be audited for the dm-verity signature config") and the Context caveat *"images likely cannot boot"* — Superseded 2026-09-04: a shuttle-assembled disk with a shuttle-built UKI booted to a dm-verity-verified root, and userspace (busybox PID1 and systemd 261.1) ran **from** the verified device (QEMU missions, evidence `/tmp/opencode/shuttle-verity/` and `/tmp/opencode/shuttle-userspace/`, 2026-09-04).
+
+Config source: nix kernel 6.18.45 build config, `/nix/store/qb1vm5aig0w3vp40bs508aif5fjqhky2-linux-6.18.45-dev/lib/modules/6.18.45/build/.config` (modules output `/nix/store/nggv3k0czjx0x245gsmbijnwvy1p0yyn-linux-6.18.45-modules`). Behavioral confirmation from `/tmp/opencode/shuttle-verity/logs/boot.log`.
+
+| Option | Status | Evidence |
+|---|---|---|
+| `CONFIG_VIRTIO_BLK` | `=m` (module) | `.config`; guest: `virtio_blk virtio1: [vda] …` (boot.log:412) |
+| `CONFIG_VIRTIO_PCI` | `=m` (module) | `.config`; guest insmod + `/proc/modules` Live (boot.log:402-411) |
+| `CONFIG_DM_VERITY` | `=m` (module) | `.config`; guest `veritysetup status`: `type: VERITY / status: verified` (boot.log:462-463) |
+| `CONFIG_BLK_DEV_DM` (dm-mod) | `=m` (module) | `.config`; `/proc/modules` `dm_mod … Live` (boot.log:430) |
+| `CONFIG_EXT4_FS` | `=m` (module) | `.config`; verified root mounted ext4 ro (boot.log:447) |
+| `CONFIG_CRYPTO_SHA256` | `=y` (built-in) | `.config`; dmesg `verity: sha256 using "sha256-lib"` (boot.log:445) |
+| `CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG` | **not set (absent)** | `.config`: `# CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG is not set` |
+
+**VERIFY_ROOTHASH_SIG consequence**: the kernel performs no roothash signature verification against the system keyring — the signature-enforcement path of step (c) is unavailable on this kernel. Per the ADR's declared fallback, roothash trust binds via the signed UKI cmdline only; enabling signature enforcement would require a rebuilt kernel with this option (and provisioned keyring keys).
+
+**Module-in-initrd requirement**: virtio block/PCI, dm-mod, dm-verity, and ext4 are all `=m`, so every shipped kernel image must carry these modules in its initrd — a bare kernel + busybox initrd cannot even see the disk (the disk-mission no-vda finding: no `vda` until `virtio_blk` is loaded). The proven recipe ships the flat dep closures (13 modules for this kernel) and insmods them in dependency order from `/init`. `doctor`'s kernel audit treats `CONFIG_DM_VERITY=m` kernels with boot proof as confirmed (`ConfirmedByProof`), not Unconfirmed.

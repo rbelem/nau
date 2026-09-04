@@ -435,3 +435,14 @@ tax knowingly in favor of the two-name split.
 (vanilla vs Ubuntu-patched swappability); BlastOff-class namesake monitoring for ShuttleOS
 (GitHub org `shuttleos` stale-claimed; shuttleos.com unrelated; `.dev/.org/.io` available);
 UC-profile demand; 3-way `/etc` merge promotion trigger.
+
+**Superseded 2026-09-04:** the pc-kernel `CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG` audit is
+closed (ADR-0011 "Kernel-config audit"): nix kernel 6.18.45 has the option **not set** — no
+roothash signature enforcement on this kernel; the declared UKI/PCR fallback (roothash bound
+via signed UKI cmdline) is the operative path. Same boot proof supersedes the *"Phase 24 —
+Transactional image updates + rollback (gated on Q1; speculative until then)"* framing
+(§ "Post-Q1 ordering" above and elsewhere): Q1 was resolved by ADR-0011 (shuttle owns the
+runtime, Phase 24 de-gated) and the QEMU missions (2026-09-04, `/tmp/opencode/shuttle-verity/`,
+`/tmp/opencode/shuttle-userspace/`) proved a shuttle-assembled disk boots to a dm-verity
+verified root with userspace running from the verified device — image bootability and
+dm-verity activation are no longer speculative.
