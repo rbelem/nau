@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use shuttle::cache::PackageCache;
@@ -1504,6 +1504,34 @@ fn cmd_eval(
         &channel,
         output_name.as_deref(),
     )?;
+
+    // ADR-0011 step (d): opt-in manifest signing. A key at
+    // ~/.config/shuttle/secret-key attests the canonical bytes (signatures
+    // map excluded); an absent key keeps `signatures` {} with a note —
+    // eval never fails on signing and never generates keys (that is the
+    // image build's deliberate engagement; mandated signing is step (e)).
+    let mut manifest = manifest;
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    match shuttle::sign::load_secret_key(&home) {
+        Ok(Some(kp)) => match shuttle::sign::canonical_bytes(&manifest) {
+            Ok(bytes) => {
+                let sig = shuttle::sign::sign_bytes(&bytes, &kp);
+                manifest
+                    .signatures
+                    .insert(kp.key_id(), serde_json::Value::String(sig));
+                eprintln!("  ✓ manifest signed (key id {})", kp.key_id());
+            }
+            Err(e) => eprintln!("  ⚠ signing skipped: {e:#}"),
+        },
+        Ok(None) => {
+            eprintln!(
+                "  ℹ no signing key at {} — signatures left empty (opt-in until \
+                 ceremony)",
+                shuttle::sign::secret_key_path(&home).display()
+            );
+        }
+        Err(e) => eprintln!("  ⚠ signing skipped: {e:#}"),
+    }
 
     match output {
         Some(ref out_path) => {

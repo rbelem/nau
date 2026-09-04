@@ -568,6 +568,9 @@ function image(opts)
         if opts.disk.label ~= nil and type(opts.disk.label) ~= "string" then
             error("image(): 'disk.label' must be a string, got " .. type(opts.disk.label), 2)
         end
+        if opts.disk.ab ~= nil and type(opts.disk.ab) ~= "boolean" then
+            error("image(): 'disk.ab' must be a boolean, got " .. type(opts.disk.ab), 2)
+        end
         if opts.disk.partitions ~= nil then
             if type(opts.disk.partitions) ~= "table" then
                 error("image(): 'disk.partitions' must be a table, got " .. type(opts.disk.partitions), 2)
@@ -598,6 +601,11 @@ function image(opts)
     -- Optional sysctl entries (array of "key=value" strings)
     if opts.sysctl ~= nil then
         check_string_array(opts.sysctl, "image", "sysctl")
+    end
+
+    -- Optional sysupdate payload source (ADR-0011 step d)
+    if opts.update_source ~= nil and type(opts.update_source) ~= "string" then
+        error("image(): 'update_source' must be a string URL, got " .. type(opts.update_source), 2)
     end
 
     return opts

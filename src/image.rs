@@ -50,6 +50,14 @@ pub struct DiskLayout {
     pub label: String, // "gpt" or "mbr"
     pub partitions: Vec<Partition>,
     pub swap: Option<SwapConfig>,
+    /// A/B slot updates (ADR-0011 step (d)). Opt-in, default off —
+    /// kernel-free and single-slot images build byte-identically without
+    /// it. When set, the root (and its dm-verity hash partition, for kernel
+    /// images) is cloned into a same-size slot B after slot A, sysupdate
+    /// transfer files are emitted when `update_source` is declared, and GPT
+    /// type GUIDs + PARTLABELs are applied so systemd-sysupdate can match
+    /// the slots. Requires a "gpt" label.
+    pub ab: bool,
 }
 
 /// One partition in the disk layout.
@@ -94,6 +102,11 @@ pub struct ImageDeclaration {
     pub bootloader: Option<BootloaderConfig>,
     pub disk: Option<DiskLayout>,
     pub sysctl: Vec<String>,
+    /// Base URL of the systemd-sysupdate payload source (ADR-0011 step
+    /// (d)); transfer files are emitted only when set — a local-source
+    /// transfer would carry no verification, and unverifiable update
+    /// config is never emitted silently.
+    pub update_source: Option<String>,
 }
 
 /// Serialize as the name string (for `meta/snap.yaml`).
@@ -124,6 +137,22 @@ impl ImageDeclaration {
         let disk = get_opt_disk_layout(table)?;
         // NEW: sysctl
         let sysctl: Vec<String> = table.get("sysctl").unwrap_or_default();
+        // ADR-0011 step (d): optional sysupdate payload source URL
+        let update_source = match table
+            .get::<Value>("update_source")
+            .map_err(|e| miette::miette!("image(): update_source: {e}"))?
+        {
+            Value::String(s) => Some(
+                s.to_str()
+                    .map_err(|e| miette::miette!("image(): update_source: {e}"))?
+                    .to_string(),
+            ),
+            Value::Nil => None,
+            other => Err(miette::miette!(
+                "image(): 'update_source' must be a string URL, got {}",
+                other.type_name()
+            ))?,
+        };
 
         Ok(ImageDeclaration {
             name,
@@ -135,6 +164,7 @@ impl ImageDeclaration {
             bootloader,
             disk,
             sysctl,
+            update_source,
         })
     }
 
@@ -270,10 +300,14 @@ fn get_opt_disk_layout(table: &mlua::Table) -> miette::Result<Option<DiskLayout>
             let label: String = t.get("label").unwrap_or_else(|_| "gpt".into());
             let partitions = get_partitions(&t)?;
             let swap = get_opt_swap(&t)?;
+            // ADR-0011 step (d): opt-in A/B slots — default off so existing
+            // (kernel-free, single-slot) definitions behave identically.
+            let ab: bool = t.get("ab").unwrap_or(false);
             Ok(Some(DiskLayout {
                 label,
                 partitions,
                 swap,
+                ab,
             }))
         }
         Value::Nil => Ok(None),
@@ -769,6 +803,43 @@ pub fn build_disk_image(
     let output_path = output_dir.join(&output_filename);
     std::fs::create_dir_all(output_dir).into_diagnostic()?;
 
+    // 5c. ADR-0011 step (d): systemd-sysupdate transfer files into the
+    // staged rootfs (both slots carry them). Emitted only for a declared
+    // update_source — a local-source transfer would carry no verification,
+    // and unverifiable update config is never emitted silently.
+    if let Some(ref disk) = image.disk {
+        if disk.ab {
+            if image.update_source.is_some() {
+                write_sysupdate_transfers(&root, image, disk)?;
+            } else {
+                eprintln!(
+                    "  ℹ disk.ab = true without update_source — sysupdate transfer \
+                     files skipped (a local-source transfer carries no verification)"
+                );
+            }
+        }
+    }
+
+    // 5d. ADR-0011 step (d): when the image declares an update source, the
+    // update public key is embedded for the device-side verify path
+    // (/etc/shuttle/update-key.pub). A missing local key is created here —
+    // a build with an update source is a deliberate signing engagement.
+    if image.update_source.is_some() {
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+        let kp = match crate::sign::load_secret_key(&home)? {
+            Some(kp) => kp,
+            None => crate::sign::create_secret_key(&home)?,
+        };
+        let key_path = root.join(crate::sign::PUBKEY_EMBED_PATH);
+        std::fs::create_dir_all(key_path.parent().unwrap()).into_diagnostic()?;
+        std::fs::write(&key_path, crate::sign::public_key_file(&kp)).into_diagnostic()?;
+        eprintln!(
+            "  ✓ update public key embedded: /{} (key id {})",
+            crate::sign::PUBKEY_EMBED_PATH,
+            kp.key_id()
+        );
+    }
+
     // 6. ADR-0011 step (c) pre-flight — kernel images need ukify, the
     // sd-stub, and veritysetup; fail closed BEFORE any destructive step
     // (dd/parted/mkfs), so an unbootable or unverifiable image is never
@@ -788,14 +859,23 @@ pub fn build_disk_image(
     }
 
     // 6b. Effective layout: kernel images get a dm-verity hash partition
-    // appended after the declared partitions — existing indices never shift
-    // and the parted flow is untouched.
+    // appended after the declared partitions, and `disk.ab = true` clones
+    // the root (+ hash) into slot B — existing indices never shift and the
+    // parted flow is untouched.
     let mut effective_layout = disk_layout.clone();
-    let hash_partition_index = if verity {
-        Some(append_verity_hash_partition(&mut effective_layout)?)
-    } else {
-        None
-    };
+    let slots = expand_ab_slots(&mut effective_layout, verity)?;
+    if slots.roots.len() > 1 {
+        eprintln!(
+            "  ✓ A/B slots: root at partitions {:?} (+ hash partitions {:?})",
+            slots.roots.iter().map(|i| i + 1).collect::<Vec<_>>(),
+            slots
+                .hashes
+                .iter()
+                .flatten()
+                .map(|i| i + 1)
+                .collect::<Vec<_>>(),
+        );
+    }
 
     // Calculate total image size: sum partitions + swap + 4M for GPT headers
     let total_mb = calculate_disk_size_mb(&effective_layout);
@@ -805,34 +885,74 @@ pub fn build_disk_image(
     // parted mkpart time, before anything is formatted or copied.
     let img_path = build_dir.path().join("disk.img");
     create_partitions(&img_path, &effective_layout, total_mb)?;
+    // ADR-0011 step (d): A/B layouts additionally get GPT partition type
+    // GUIDs + PARTLABELs so systemd-sysupdate can match the slots.
+    apply_gpt_slot_metadata(&img_path, image, &effective_layout, &slots)?;
 
     // 8. Attach the image to a loop device with partition scanning.
     let loop_dev = attach_loop(&img_path)?;
 
-    // 9. ADR-0011 step (c): the pipeline order below is mandatory — the root
-    // partition is populated and UNMOUNTED first, then dm-verity formats it
+    // 9. ADR-0011 step (c): the pipeline order below is mandatory — each
+    // root slot is populated and UNMOUNTED first, then dm-verity formats it
     // (the data device must be final before hashing; a cmdline is immutable
     // once the UKI is later signed), then the UKI embeds the captured
     // roothash in its cmdline.
-    let (uki, uki_stage, populated_root) = if verity {
+    let (uki, uki_stage, populated_roots) = if verity {
         // 9a. Rootfs-level manifest only: boot facts (cmdline, roothash) are
         // unknowable until after verity format, and a post-format write
         // would break the Merkle tree. The root partition therefore carries
         // the content manifest; the authoritative boot-facts manifest is
         // written below and lands on the remaining partitions.
         write_manifest(&root, image, &snap_paths, arch, None)?;
-        // 9b. Populate the root partition, then leave it unmounted —
-        // veritysetup format requires the data device quiescent.
-        populate_root_partition(&effective_layout, &loop_dev, &root, build_dir.path())?;
-        // 9c. Format dm-verity over the root (data) device into the hash
-        // partition and capture the root hash — fail closed on parse.
-        let root_idx = root_partition_index(&effective_layout)?;
-        let root_dev = partition_dev(&loop_dev, root_idx);
-        let hash_idx = hash_partition_index.expect("verity ⇒ hash partition was appended");
-        let hash_dev = partition_dev(&loop_dev, hash_idx);
-        let roothash = verity_format(&root_dev, &hash_dev)?;
-        eprintln!("  ✓ dm-verity formatted over {}", root_dev);
-        let hash_partuuid = partuuid_of(&hash_dev);
+        // 9b-c. Per slot, in order: populate the root partition, then leave
+        // it unmounted — veritysetup format requires the data device
+        // quiescent — then format dm-verity over it into the slot's hash
+        // partition. Slot B (A/B layouts) is populated and verity-formatted
+        // identically: a same-version twin sharing slot A's roothash (same
+        // data + same explicit salt), making it a usable day-one rollback
+        // target. Any roothash divergence fails closed.
+        let shared_salt = if effective_layout.ab {
+            Some(random_salt_hex()?)
+        } else {
+            None
+        };
+        let mut slot_roothash: Option<String> = None;
+        for (s, &root_idx) in slots.roots.iter().enumerate() {
+            let part_label = format!("{}_{}_{}", image.name, image.version, slot_suffix(s));
+            populate_root_partition_at(
+                &effective_layout,
+                root_idx,
+                &loop_dev,
+                &root,
+                build_dir.path(),
+            )?;
+            let root_dev = partition_dev(&loop_dev, root_idx);
+            let hash_idx = slots.hashes[s].expect("verity ⇒ hash partition was appended");
+            let hash_dev = partition_dev(&loop_dev, hash_idx);
+            let roothash = verity_format(&root_dev, &hash_dev, shared_salt.as_deref())?;
+            eprintln!(
+                "  ✓ dm-verity formatted over {root_dev} (slot {} / {part_label})",
+                slot_suffix(s)
+            );
+            match &slot_roothash {
+                None => slot_roothash = Some(roothash),
+                Some(first) if *first == roothash => {}
+                Some(first) => {
+                    return Err(miette::miette!(
+                        "slot twin roothash mismatch (slot a: {first}, slot {}: \
+                         {roothash}) — the A/B roots must be byte-identical twins; \
+                         refusing an image whose rollback slot cannot be verified",
+                        slot_suffix(s)
+                    ));
+                }
+            }
+        }
+        let roothash = slot_roothash.expect("verity branch formats at least one slot");
+        // The UKI boots slot A: its hash PARTUUID is slot A's hash device.
+        let hash_partuuid = partuuid_of(&partition_dev(
+            &loop_dev,
+            slots.hashes[0].expect("verity ⇒ hash partition was appended"),
+        ));
         if hash_partuuid.is_none() {
             eprintln!(
                 "  ⚠ hash PARTUUID unresolvable — cmdline carries the documented \
@@ -843,7 +963,8 @@ pub fn build_disk_image(
             roothash,
             hash_partuuid,
         };
-        // 9d. ADR-0011 step (a): assemble the UKI with the verity trailer.
+        // 9d. ADR-0011 step (a): assemble the UKI with the verity trailer;
+        // `root=` stays slot A (first declared root).
         let (uki, stage) = assemble_uki(
             image,
             kernel_payload.as_ref(),
@@ -852,7 +973,7 @@ pub fn build_disk_image(
             build_dir.path(),
             Some(&verity_args),
         )?;
-        (uki, stage, Some(root_idx))
+        (uki, stage, slots.skip_indices())
     } else {
         // Kernel-free images boot without a UKI — no verity, no trailer.
         let (uki, stage) = assemble_uki(
@@ -863,7 +984,7 @@ pub fn build_disk_image(
             build_dir.path(),
             None,
         )?;
-        (uki, stage, None)
+        (uki, stage, slots.skip_indices())
     };
 
     // 10. Write the authoritative manifest — threaded with the boot facts
@@ -872,8 +993,9 @@ pub fn build_disk_image(
 
     // 11. Format and populate the remaining partitions — the ESP gets the
     // UKI + loader.conf; other data partitions receive the staged rootfs
-    // (with the authoritative manifest). The root partition is skipped: it
-    // was populated and verity-formatted above.
+    // (with the authoritative manifest). The root slots and verity-hash
+    // partitions are skipped: they were populated and verity-formatted
+    // above (slot B's identical staged rootfs makes it the rollback twin).
     let populate = PopulateCtx {
         image,
         loop_dev: &loop_dev,
@@ -882,7 +1004,7 @@ pub fn build_disk_image(
         uki: uki.as_ref(),
         uki_stage: &uki_stage,
     };
-    populate_remaining_partitions(&populate, &effective_layout, populated_root)?;
+    populate_remaining_partitions(&populate, &effective_layout, &populated_roots)?;
 
     // Detach loop device
     let _ = std::process::Command::new("losetup")
@@ -1119,19 +1241,19 @@ struct PopulateCtx<'a> {
     uki_stage: &'a Path,
 }
 
-/// Format, mount, and populate ONLY the root partition (mount = "/") from
-/// the staged rootfs, then unmount it. ADR-0011 step (c): `veritysetup
-/// format` needs the data device final and quiescent, so the root goes
-/// first and stays unmounted. A mount failure here fails closed — an empty
-/// verity data device would brick the boot — unlike the historical
+/// Format, mount, and populate ONLY the given root slot partition (mount =
+/// "/") from the staged rootfs, then unmount it. ADR-0011 step (c):
+/// `veritysetup format` needs the data device final and quiescent, so each
+/// root goes first and stays unmounted. A mount failure here fails closed —
+/// an empty verity data device would brick the boot — unlike the historical
 /// silent-skip on the other partitions.
-fn populate_root_partition(
+fn populate_root_partition_at(
     layout: &DiskLayout,
+    idx: usize,
     loop_dev: &str,
     root: &Path,
     build_dir: &Path,
 ) -> miette::Result<()> {
-    let idx = root_partition_index(layout)?;
     let part = &layout.partitions[idx];
     let part_dev = partition_dev(loop_dev, idx);
     let mount_pt = build_dir.join(&part.name);
@@ -1154,20 +1276,20 @@ fn populate_root_partition(
     Ok(())
 }
 
-/// Format and populate every partition EXCEPT the root (already populated
-/// before dm-verity formatting, [`populate_root_partition`]) and the
-/// auto-appended verity-hash partition (raw `veritysetup` output — never
-/// mounted or mkfs'd). Partition 1 when vfat is the ESP (systemd-boot
-/// fallback binary, UKI, loader.conf); every other partition receives the
-/// staged rootfs.
+/// Format and populate every partition EXCEPT the root slots (already
+/// populated before dm-verity formatting, [`populate_root_partition_at`])
+/// and the auto-appended verity-hash partitions (raw `veritysetup` output —
+/// never mounted or mkfs'd) — both carried in `skip`. Partition 1 when vfat
+/// is the ESP (systemd-boot fallback binary, UKI, loader.conf); every other
+/// partition receives the staged rootfs.
 fn populate_remaining_partitions(
     ctx: &PopulateCtx,
     layout: &DiskLayout,
-    populated_root: Option<usize>,
+    skip: &[usize],
 ) -> miette::Result<()> {
     let part_prefix = format!("{}p", ctx.loop_dev);
     for (i, part) in layout.partitions.iter().enumerate() {
-        if Some(i) == populated_root || part.name == VERITY_HASH_PART_NAME {
+        if skip.contains(&i) || part.name == VERITY_HASH_PART_NAME {
             continue;
         }
         populate_side_partition(ctx, i, part, &part_prefix)?;
@@ -1259,19 +1381,115 @@ struct VerityBootArgs {
     hash_partuuid: Option<String>,
 }
 
-/// Index of the declared root partition (mount = "/") — fail closed when
-/// absent: both the UKI `root=` target and dm-verity formatting need it.
-fn root_partition_index(layout: &DiskLayout) -> miette::Result<usize> {
+/// Indices of ALL declared root partitions (mount = "/"), in declaration
+/// order — the ordered A/B slots (ADR-0011 step (d)). Slot A is the first;
+/// slot B (when `disk.ab = true`) is appended by [`expand_ab_slots`].
+fn root_partition_indices(layout: &DiskLayout) -> Vec<usize> {
     layout
         .partitions
         .iter()
-        .position(|p| p.mount == "/")
+        .enumerate()
+        .filter(|(_, p)| p.mount == "/")
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Index of the FIRST declared root partition (mount = "/") — the slot A
+/// the factory UKI boots. Fail closed when absent: both the UKI `root=`
+/// target and dm-verity formatting need it.
+fn root_partition_index(layout: &DiskLayout) -> miette::Result<usize> {
+    root_partition_indices(layout)
+        .first()
+        .copied()
         .ok_or_else(|| {
             miette::miette!(
                 "disk layout declares no root partition (mount = \"/\") — the UKI needs \
-                 a root= target; refusing to build an unbootable image"
+             a root= target; refusing to build an unbootable image"
             )
         })
+}
+
+/// Slot bookkeeping after layout expansion: ordered root-slot indices and
+/// the per-slot dm-verity hash partition index (`Some` exactly when the
+/// build verity-formats).
+#[derive(Debug, Clone)]
+struct Slots {
+    roots: Vec<usize>,
+    hashes: Vec<Option<usize>>,
+}
+
+impl Slots {
+    /// Indices populate must skip: every slot root and every verity hash
+    /// partition (already populated + formatted before this stage).
+    fn skip_indices(&self) -> Vec<usize> {
+        let mut skip: Vec<usize> = self
+            .roots
+            .iter()
+            .copied()
+            .chain(self.hashes.iter().flatten().copied())
+            .collect();
+        skip.sort_unstable();
+        skip
+    }
+}
+
+/// Expand the effective layout for A/B slots (ADR-0011 step (d)): each
+/// declared root gets its dm-verity hash partition appended (kernel images),
+/// then `disk.ab = true` clones the (single) declared root + its hash into a
+/// same-size, same-fs slot B directly after slot A — the day-one rollback
+/// twin. Existing indices never shift. Requires "gpt" (sysupdate slot
+/// matching keys off GPT type GUIDs) and exactly one declared root (slot B
+/// is derived, not declared).
+fn expand_ab_slots(layout: &mut DiskLayout, verity: bool) -> miette::Result<Slots> {
+    if layout.ab && layout.label != "gpt" {
+        return Err(miette::miette!(
+            "disk.ab = true requires label = \"gpt\" — systemd-sysupdate matches A/B \
+             slots by GPT partition type GUIDs, which MBR cannot carry"
+        ));
+    }
+    let mut roots = root_partition_indices(layout);
+    if verity && roots.is_empty() {
+        return Err(miette::miette!(
+            "disk layout declares no root partition (mount = \"/\") — dm-verity needs \
+             a root data device; refusing to build an unverifiable image"
+        ));
+    }
+    let mut hashes: Vec<Option<usize>> = vec![None; roots.len()];
+    if verity {
+        for i in 0..roots.len() {
+            hashes[i] = Some(append_verity_hash_partition_at(layout, roots[i])?);
+        }
+    }
+    if layout.ab {
+        if roots.len() != 1 {
+            return Err(miette::miette!(
+                "disk.ab = true requires exactly one declared root partition (mount = \
+                 \"/\"); found {} — slot B is derived from the root, not declared",
+                roots.len()
+            ));
+        }
+        let a = roots[0];
+        // Clone AFTER slot A's hash partition so slot B stays contiguous
+        // behind slot A. Same size/fs/options; mount stays "/" — the clone
+        // is a full root slot, not a data partition.
+        let root_a = layout.partitions[a].clone();
+        layout.partitions.push(Partition {
+            name: format!("{}_b", root_a.name),
+            ..root_a
+        });
+        roots.push(layout.partitions.len() - 1);
+        if let Some(h) = hashes[0] {
+            let hash_a = layout.partitions[h].clone();
+            layout.partitions.push(Partition {
+                name: format!("{}_b", hash_a.name),
+                ..hash_a
+            });
+            hashes.push(Some(layout.partitions.len() - 1));
+        } else {
+            hashes.push(None);
+        }
+    }
+    Ok(Slots { roots, hashes })
 }
 
 /// Loop-device partition path for a 0-based layout index (index 0 → p1).
@@ -1296,8 +1514,10 @@ fn verity_hash_partition_bytes(data_bytes: u64) -> u64 {
 /// The root size is parsed the same way [`calculate_disk_size_mb`] does
 /// ("0"/fill roots use the same 1024 MB default): overshooting the hash
 /// area is harmless, undersizing it fails `veritysetup format`.
-fn append_verity_hash_partition(layout: &mut DiskLayout) -> miette::Result<usize> {
-    let root_idx = root_partition_index(layout)?;
+fn append_verity_hash_partition_at(
+    layout: &mut DiskLayout,
+    root_idx: usize,
+) -> miette::Result<usize> {
     let root_mb = parse_size_mb(&layout.partitions[root_idx].size, 1024);
     let hash_bytes = verity_hash_partition_bytes(root_mb * 1024 * 1024);
     let hash_mb = hash_bytes.div_ceil(1024 * 1024);
@@ -1355,15 +1575,41 @@ fn preflight_disk_tools_with(
     Ok(())
 }
 
+/// veritysetup argv for a sha256/4K format-1 invocation, optional pinned
+/// salt, devices last.
+fn verity_format_args(salt: Option<&str>, data_dev: &str, hash_dev: &str) -> Vec<String> {
+    let mut args = vec![
+        "format".to_string(),
+        "--hash".to_string(),
+        "sha256".to_string(),
+        "--data-block-size".to_string(),
+        "4096".to_string(),
+        "--hash-block-size".to_string(),
+        "4096".to_string(),
+        "--format".to_string(),
+        "1".to_string(),
+    ];
+    if let Some(salt) = salt {
+        args.push("--salt".to_string());
+        args.push(salt.to_string());
+    }
+    args.push(data_dev.to_string());
+    args.push(hash_dev.to_string());
+    args
+}
+
 /// `veritysetup format` invocation (ADR-0011 step (c)): sha256 over 4K data
 /// and hash blocks, on-disk format 1. `veritysetup` is injected so the
 /// fail-closed behavior is testable on hosts without cryptsetup;
 /// [`verity_format`] resolves it from the host. Returns the root hash
-/// printed on stdout.
+/// printed on stdout. `salt` pins the format salt explicitly — A/B slot
+/// twins format with the SAME salt so byte-identical data yields the SAME
+/// roothash (the roothash covers data + salt, not the hash superblock).
 fn verity_format_with(
     veritysetup: Option<&Path>,
     data_dev: &str,
     hash_dev: &str,
+    salt: Option<&str>,
 ) -> miette::Result<String> {
     let Some(tool) = veritysetup else {
         return Err(miette::miette!(
@@ -1373,20 +1619,9 @@ fn verity_format_with(
              apt install cryptsetup or add cryptsetup to devbox.json packages)"
         ));
     };
+    let args = verity_format_args(salt, data_dev, hash_dev);
     let out = std::process::Command::new(tool)
-        .args([
-            "format",
-            "--hash",
-            "sha256",
-            "--data-block-size",
-            "4096",
-            "--hash-block-size",
-            "4096",
-            "--format",
-            "1",
-            data_dev,
-            hash_dev,
-        ])
+        .args(&args)
         .output()
         .map_err(|e| miette::miette!("failed to run veritysetup: {e}"))?;
     if !out.status.success() {
@@ -1400,9 +1635,10 @@ fn verity_format_with(
 }
 
 /// Format dm-verity over `data_dev` into `hash_dev` with host-resolved
-/// veritysetup (fail-closed when absent).
-fn verity_format(data_dev: &str, hash_dev: &str) -> miette::Result<String> {
-    verity_format_with(find_veritysetup().as_deref(), data_dev, hash_dev)
+/// veritysetup (fail-closed when absent). `salt` pins the format salt
+/// (A/B slot twins share one salt so identical data → identical roothash).
+fn verity_format(data_dev: &str, hash_dev: &str, salt: Option<&str>) -> miette::Result<String> {
+    verity_format_with(find_veritysetup().as_deref(), data_dev, hash_dev, salt)
 }
 
 /// Extract the root hash from `veritysetup format` stdout — the
@@ -1449,6 +1685,292 @@ fn verity_trailing(
             hash_partuuid.unwrap_or(NIL_PARTUUID)
         ),
     ]
+}
+
+// ── A/B slots + systemd-sysupdate (ADR-0011 step (d)) ──
+
+/// GPT partition type GUIDs systemd-sysupdate matches slots by (x86-64
+/// types). Set on the image at build time via sfdisk; the UKI boot path
+/// needs none of them (cmdline carries explicit by-partuuid devices), but
+/// sysupdate's MatchPartitionType does.
+pub const ESP_TYPE_GUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
+pub const ROOT_TYPE_GUID_X86_64: &str = "4f68bce3-e8cd-4db1-96e7-fbcaf984b709";
+pub const VERITY_TYPE_GUID_X86_64: &str = "2c7357ed-ebd2-46d9-aec1-23d437ec2bf5";
+
+/// Slot letter for the n-th root slot (0 → "a", 1 → "b").
+fn slot_suffix(slot: usize) -> &'static str {
+    const SUFFIXES: [&str; 2] = ["a", "b"];
+    SUFFIXES[slot % SUFFIXES.len()]
+}
+
+/// GPT PARTLABEL of root slot `slot` — the label scheme sysupdate's
+/// MatchPattern keys off: `{image}_{version}_{a|b}` (36-char GPT label
+/// budget; longer names degrade to a documented sfdisk warning).
+fn slot_partlabel(image_name: &str, image_version: &str, slot: usize) -> String {
+    format!("{image_name}_{image_version}_{}", slot_suffix(slot))
+}
+
+/// GPT PARTLABEL of the dm-verity hash partition of root slot `slot`:
+/// `{image}_{version}_hash_{a|b}`.
+fn hash_partlabel(image_name: &str, image_version: &str, slot: usize) -> String {
+    format!("{image_name}_{image_version}_hash_{}", slot_suffix(slot))
+}
+
+/// MatchPattern for root slot partitions: the two slot labels (version
+/// wildcarded) plus the documented `_empty` fallback for factory partitions
+/// not yet labeled. First pattern wins for newly created partitions.
+fn root_match_pattern(image_name: &str) -> String {
+    format!("{image_name}_@v_a {image_name}_@v_b {image_name}_empty")
+}
+
+/// MatchPattern for verity-hash slot partitions.
+fn hash_match_pattern(image_name: &str) -> String {
+    format!("{image_name}_@v_hash_a {image_name}_@v_hash_b {image_name}_hash_empty")
+}
+
+/// 64-hex random salt from /dev/urandom — shared across A/B slot formats so
+/// byte-identical twins produce the same roothash.
+fn random_salt_hex() -> miette::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom")
+        .map_err(|e| miette::miette!("cannot open /dev/urandom: {e}"))?;
+    let mut bytes = [0u8; 32];
+    f.read_exact(&mut bytes)
+        .map_err(|e| miette::miette!("cannot read salt from /dev/urandom: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Apply GPT slot metadata (type GUIDs + PARTLABELs) for A/B layouts via
+/// `sfdisk` (util-linux — same tool family as the build's losetup; the
+/// parted `type` command needs 3.5+, sgdisk is not required). Runs on the
+/// raw image file BEFORE loop attach, so the loop scan exposes final
+/// metadata. Fail-open, never silent: a missing or failing sfdisk warns
+/// loudly — sysupdate partition matching degrades, the image still boots —
+/// mirroring the historical ESP-flag posture.
+fn apply_gpt_slot_metadata(
+    img_path: &Path,
+    image: &ImageDeclaration,
+    layout: &DiskLayout,
+    slots: &Slots,
+) -> miette::Result<()> {
+    if !layout.ab {
+        return Ok(());
+    }
+    let sfdisk = match std::process::Command::new("which")
+        .arg("sfdisk")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    {
+        Some(_) => "sfdisk",
+        None => {
+            eprintln!(
+                "  ⚠ sfdisk not found — GPT type GUIDs + PARTLABELs NOT set; \
+                 systemd-sysupdate will be unable to match the A/B slots by \
+                 MatchPartitionType/MatchPattern (documented fail-open: install \
+                 util-linux sfdisk for sysupdate-capable images)"
+            );
+            return Ok(());
+        }
+    };
+    // (partition number 1-based, type GUID, PARTLABEL)
+    let mut ops: Vec<(usize, &str, Option<String>)> = Vec::new();
+    if layout.partitions[0].fs == "vfat" {
+        ops.push((1, ESP_TYPE_GUID, None));
+    }
+    for (s, &idx) in slots.roots.iter().enumerate() {
+        ops.push((
+            idx + 1,
+            ROOT_TYPE_GUID_X86_64,
+            Some(slot_partlabel(&image.name, &image.version, s)),
+        ));
+    }
+    for (s, hash) in slots.hashes.iter().enumerate() {
+        if let Some(idx) = hash {
+            ops.push((
+                idx + 1,
+                VERITY_TYPE_GUID_X86_64,
+                Some(hash_partlabel(&image.name, &image.version, s)),
+            ));
+        }
+    }
+    for (partno, type_guid, label) in ops {
+        let set = |flag: &str, value: &str| -> miette::Result<()> {
+            let status = std::process::Command::new(sfdisk)
+                .args([
+                    flag,
+                    &img_path.to_string_lossy(),
+                    &partno.to_string(),
+                    value,
+                ])
+                .status()
+                .map_err(|e| miette::miette!("sfdisk not runnable: {e}"))?;
+            if !status.success() {
+                // Raw-file images may warn about partition re-read; treat
+                // nonzero as degraded metadata, never a silent skip.
+                eprintln!(
+                    "  ⚠ sfdisk {flag} failed for partition {partno} ({value}) — \
+                     sysupdate slot matching may miss this partition (fail-open)"
+                );
+            }
+            Ok(())
+        };
+        set("--part-type", type_guid)?;
+        if let Some(ref label) = label {
+            set("--part-label", label)?;
+        }
+    }
+    eprintln!(
+        "  ✓ GPT slot metadata: {} type GUIDs + PARTLABELs (root/verity per slot)",
+        slots.roots.len() + slots.hashes.iter().flatten().count()
+    );
+    Ok(())
+}
+
+/// sysupdate.d file name prefix for shuttle-generated transfers — ordering
+/// keeps root+verity ahead of the UKI within one sysupdate transaction.
+const SYSUPDATE_DIR: &str = "usr/lib/sysupdate.d";
+
+/// Emit the systemd-sysupdate transfer files into the staged rootfs
+/// (`/usr/lib/sysupdate.d/`), pre-populate, so both slots carry them.
+/// Called only for `disk.ab = true` images with a declared
+/// `update_source`. Artifacts share one `@v` version: `{v}/root.img`,
+/// `{v}/verity-hash.img`, `{v}/{name}_@v.efi` under the base URL.
+fn write_sysupdate_transfers(
+    root: &Path,
+    image: &ImageDeclaration,
+    disk: &DiskLayout,
+) -> miette::Result<()> {
+    let dir = root.join(SYSUPDATE_DIR);
+    std::fs::create_dir_all(&dir).into_diagnostic()?;
+    let root_mb = parse_size_mb(
+        &disk
+            .partitions
+            .iter()
+            .find(|p| p.mount == "/")
+            .map(|p| p.size.clone())
+            .unwrap_or_else(|| "1024".into()),
+        1024,
+    );
+    let files = [
+        ("50-root.transfer", root_transfer(&image.name, root_mb)),
+        (
+            "50-verity.transfer",
+            hash_transfer(&image.name, verity_hash_partition_mb(disk)),
+        ),
+        ("60-uki.transfer", uki_transfer(&image.name)),
+    ];
+    for (name, content) in files {
+        std::fs::write(dir.join(name), content)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("writing sysupdate.d/{name}"))?;
+    }
+    eprintln!(
+        "  ✓ sysupdate transfers: {SYSUPDATE_DIR}/50-root, 50-verity, 60-uki \
+         (source: {})",
+        image.update_source.as_deref().unwrap_or("")
+    );
+    Ok(())
+}
+
+/// Hash-partition size in MB for MinSize, mirroring the appended hash
+/// partition for the layout's root.
+fn verity_hash_partition_mb(disk: &DiskLayout) -> u64 {
+    let root_mb = parse_size_mb(
+        &disk
+            .partitions
+            .iter()
+            .find(|p| p.mount == "/")
+            .map(|p| p.size.clone())
+            .unwrap_or_else(|| "1024".into()),
+        1024,
+    );
+    verity_hash_partition_bytes(root_mb * 1024 * 1024).div_ceil(1024 * 1024)
+}
+
+fn transfer_header() -> String {
+    // Requires systemd >= 256 (PathRelativeTo=boot needs >= 254; the
+    // tries-suffix install flow is stable from 256 on).
+    "# Generated by shuttle (ADR-0011 step d) — do not edit.\n\
+     # systemd-sysupdate >= 256 recommended (PathRelativeTo=boot needs >= 254).\n"
+        .to_string()
+}
+
+/// Root slot partition transfer: in-place update of the two root slots,
+/// matched by the x86-64 root type GUID + the slot label scheme.
+fn root_transfer(image_name: &str, min_size_mb: u64) -> String {
+    format!(
+        "{header}\n\
+         [Transfer]\n\
+         ProtectVersion=%A\n\
+         \n\
+         [Source]\n\
+         Type=url-file\n\
+         Path=%v/root.img\n\
+         \n\
+         [Target]\n\
+         Type=partition\n\
+         Path=in-places\n\
+         MatchPartitionType={ROOT_TYPE_GUID_X86_64}\n\
+         MatchPattern={pattern}\n\
+         MinSize={min_size_mb}M\n\
+         InstancesMax=2\n",
+        header = transfer_header(),
+        pattern = root_match_pattern(image_name),
+    )
+}
+
+/// Verity-hash slot partition transfer — rewritten together with its root
+/// slot (both artifacts carry the same @v; the roothash is build-time
+/// embedded in the UKI cmdline and never modified at update time).
+fn hash_transfer(image_name: &str, min_size_mb: u64) -> String {
+    format!(
+        "{header}\n\
+         [Transfer]\n\
+         ProtectVersion=%A\n\
+         \n\
+         [Source]\n\
+         Type=url-file\n\
+         Path=%v/verity-hash.img\n\
+         \n\
+         [Target]\n\
+         Type=partition\n\
+         Path=in-places\n\
+         MatchPartitionType={VERITY_TYPE_GUID_X86_64}\n\
+         MatchPattern={pattern}\n\
+         MinSize={min_size_mb}M\n\
+         InstancesMax=2\n",
+        header = transfer_header(),
+        pattern = hash_match_pattern(image_name),
+    )
+}
+
+/// UKI regular-file transfer: installed under $BOOT/EFI/Linux with
+/// boot-try counters added by sysupdate AT INSTALL (the factory UKI ships
+/// without counters — always-good). systemd-boot's Automatic Boot
+/// Assessment counts TriesLeft down and systemd-bless-boot.service clears
+/// the counters on a good boot. The factory filename stays
+/// `{name}_{version}.efi` (tries-compatible).
+fn uki_transfer(image_name: &str) -> String {
+    format!(
+        "{header}\n\
+         [Transfer]\n\
+         ProtectVersion=%A\n\
+         \n\
+         [Source]\n\
+         Type=url-file\n\
+         Path=%v/{image_name}_@v.efi\n\
+         \n\
+         [Target]\n\
+         Type=regular-file\n\
+         Path=EFI/Linux\n\
+         PathRelativeTo=boot\n\
+         MatchPattern={image_name}_@v+@l-@d.efi {image_name}_@v+3-0.efi {image_name}_@v.efi\n\
+         TriesLeft=3\n\
+         TriesDone=0\n\
+         InstancesMax=2\n",
+        header = transfer_header(),
+    )
 }
 
 /// Serialize and write the image manifest into the staged rootfs.
@@ -2179,6 +2701,7 @@ mod tests {
             bootloader: None,
             disk: None,
             sysctl: vec![],
+            update_source: None,
         };
 
         let snaps: Vec<(String, ResolvedSnap)> = vec![
@@ -2515,8 +3038,9 @@ mod tests {
                 },
             ],
             swap: None,
+            ab: false,
         };
-        let idx = append_verity_hash_partition(&mut layout).unwrap();
+        let idx = append_verity_hash_partition_at(&mut layout, 1).unwrap();
         assert_eq!(idx, 2, "hash partition goes last");
         assert_eq!(layout.partitions[0].name, "ESP", "indices never shift");
         assert_eq!(layout.partitions[1].name, "root");
@@ -2538,8 +3062,11 @@ mod tests {
                 options: vec![],
             }],
             swap: None,
+            ab: false,
         };
-        let err = append_verity_hash_partition(&mut layout).unwrap_err();
+        // Expansion (verity on) fails closed before any partitioning: no
+        // root means no data device to hash.
+        let err = expand_ab_slots(&mut layout, true).unwrap_err();
         assert!(
             format!("{err:#}").contains("root partition"),
             "no-root failure must be loud: {err:#}"
@@ -2605,7 +3132,7 @@ mod tests {
     fn verity_format_without_veritysetup_fails_closed() {
         // Injected None: the fail-closed path fires before any device is
         // touched, so device names are irrelevant.
-        let err = verity_format_with(None, "/dev/loop0p2", "/dev/loop0p3").unwrap_err();
+        let err = verity_format_with(None, "/dev/loop0p2", "/dev/loop0p3", None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("veritysetup") && msg.contains("shuttle doctor"),
@@ -2629,6 +3156,7 @@ mod tests {
             bootloader: None,
             disk: None,
             sysctl: vec![],
+            update_source: None,
         };
         let snaps: Vec<(String, ResolvedSnap)> = vec![(
             "core22".into(),
@@ -2768,6 +3296,7 @@ mod tests {
             bootloader: None,
             disk: None,
             sysctl: vec![],
+            update_source: None,
         };
         assert_eq!(uki_filename(&image), "my-system_1.2.3.efi");
         assert_eq!(
@@ -2795,11 +3324,360 @@ mod tests {
             }),
             disk: None,
             sysctl: vec![],
+            update_source: None,
         };
         assert!(
             loader_conf(&image).contains("timeout 5"),
             "declared bootloader timeout must win: {}",
             loader_conf(&image)
         );
+    }
+
+    // ── A/B slots + sysupdate (ADR-0011 step (d)) ──
+
+    fn esp() -> Partition {
+        Partition {
+            name: "ESP".into(),
+            size: "512M".into(),
+            fs: "vfat".into(),
+            mount: "/boot/efi".into(),
+            options: vec![],
+        }
+    }
+
+    fn root_part() -> Partition {
+        Partition {
+            name: "root".into(),
+            size: "4G".into(),
+            fs: "ext4".into(),
+            mount: "/".into(),
+            options: vec![],
+        }
+    }
+
+    fn ab_layout() -> DiskLayout {
+        DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![esp(), root_part()],
+            swap: None,
+            ab: true,
+        }
+    }
+
+    #[test]
+    fn ab_flag_defaults_off_and_parses_opt_in() {
+        let lua = lua_env();
+        let off: Value = lua
+            .load(
+                r#"
+                return image {
+                    name = "d", version = "1", base = pin("core22"),
+                    disk = { partitions = { { name = "root", size = "4G", fs = "ext4", mount = "/" } } },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let decl = ImageDeclaration::from_lua_table(off.as_table().unwrap()).unwrap();
+        assert!(!decl.disk.as_ref().unwrap().ab, "ab defaults off");
+        assert!(decl.update_source.is_none(), "update_source defaults off");
+
+        let on: Value = lua
+            .load(
+                r#"
+                return image {
+                    name = "d", version = "1", base = pin("core22"),
+                    update_source = "https://updates.example.com/os/",
+                    disk = { ab = true, partitions = { { name = "root", size = "4G", fs = "ext4", mount = "/" } } },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let decl = ImageDeclaration::from_lua_table(on.as_table().unwrap()).unwrap();
+        assert!(decl.disk.as_ref().unwrap().ab, "disk.ab = true parses");
+        assert_eq!(
+            decl.update_source.as_deref(),
+            Some("https://updates.example.com/os/"),
+            "update_source parses"
+        );
+    }
+
+    #[test]
+    fn ab_expansion_clones_root_and_hash_into_slot_b() {
+        let mut layout = ab_layout();
+        let slots = expand_ab_slots(&mut layout, true).unwrap();
+        // [ESP, root_a, hash_a, root_b, hash_b]
+        assert_eq!(slots.roots, vec![1, 3], "slot A first, slot B after hash_a");
+        assert_eq!(slots.hashes, vec![Some(2), Some(4)]);
+        assert_eq!(layout.partitions.len(), 5);
+
+        let b = &layout.partitions[3];
+        assert_eq!(b.name, "root_b", "slot B name carries the _b suffix");
+        assert_eq!(b.mount, "/", "slot B IS a root slot, not a data partition");
+        assert_eq!(b.fs, "ext4", "same fs as slot A");
+        assert_eq!(b.size, "4G", "same size as slot A");
+        // Indices never shift.
+        assert_eq!(layout.partitions[0].name, "ESP");
+        assert_eq!(layout.partitions[1].name, "root");
+        assert_eq!(layout.partitions[2].name, VERITY_HASH_PART_NAME);
+        assert_eq!(
+            layout.partitions[4].name,
+            format!("{VERITY_HASH_PART_NAME}_b")
+        );
+    }
+
+    #[test]
+    fn ab_expansion_without_verity_has_no_hash_partitions() {
+        let mut layout = ab_layout();
+        let slots = expand_ab_slots(&mut layout, false).unwrap();
+        // [ESP, root_a, root_b]
+        assert_eq!(slots.roots, vec![1, 2]);
+        assert_eq!(slots.hashes, vec![None, None]);
+        assert_eq!(layout.partitions.len(), 3, "ESP + two roots, no hashes");
+        assert_eq!(layout.partitions[2].name, "root_b");
+    }
+
+    #[test]
+    fn ab_skip_indices_cover_all_slots_and_hashes() {
+        let mut layout = ab_layout();
+        let slots = expand_ab_slots(&mut layout, true).unwrap();
+        assert_eq!(slots.skip_indices(), vec![1, 2, 3, 4]);
+        // The ESP (0) stays in the populate stage.
+        assert!(!slots.skip_indices().contains(&0));
+    }
+
+    #[test]
+    fn ab_expansion_doubles_root_and_hash_disk_contributions() {
+        let base = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![esp(), root_part()],
+            swap: None,
+            ab: false,
+        };
+        // Single-slot (ab off) adds only its hash partition (4G root → 33M).
+        let mut single = base.clone();
+        let _ = expand_ab_slots(&mut single, true).unwrap();
+        let mut ab = ab_layout();
+        let _ = expand_ab_slots(&mut ab, true).unwrap();
+        assert_eq!(
+            calculate_disk_size_mb(&single),
+            calculate_disk_size_mb(&base) + 33
+        );
+        // Slot B mirrors root + hash exactly, on top of the single-slot image.
+        assert_eq!(
+            calculate_disk_size_mb(&ab) - calculate_disk_size_mb(&single),
+            4096 + 33
+        );
+    }
+
+    #[test]
+    fn ab_requires_gpt_label() {
+        let mut layout = ab_layout();
+        layout.label = "mbr".into();
+        let err = expand_ab_slots(&mut layout, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("gpt"),
+            "MBR + ab must fail closed: {err:#}"
+        );
+    }
+
+    #[test]
+    fn ab_requires_exactly_one_declared_root() {
+        let mut layout = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![root_part(), root_part()],
+            swap: None,
+            ab: true,
+        };
+        let err = expand_ab_slots(&mut layout, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("exactly one declared root"),
+            "two declared roots must fail closed: {err:#}"
+        );
+    }
+
+    #[test]
+    fn root_partition_indices_orders_declared_roots() {
+        let layout = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![esp(), root_part(), esp(), root_part()],
+            swap: None,
+            ab: false,
+        };
+        assert_eq!(root_partition_indices(&layout), vec![1, 3]);
+        // Slot A stays the UKI root target.
+        assert_eq!(root_partition_index(&layout).unwrap(), 1);
+    }
+
+    #[test]
+    fn slot_label_scheme_is_versioned_and_slot_suffixed() {
+        assert_eq!(slot_suffix(0), "a");
+        assert_eq!(slot_suffix(1), "b");
+        assert_eq!(slot_partlabel("os", "1.2.3", 0), "os_1.2.3_a");
+        assert_eq!(slot_partlabel("os", "1.2.3", 1), "os_1.2.3_b");
+        assert_eq!(hash_partlabel("os", "1.2.3", 0), "os_1.2.3_hash_a");
+        assert_eq!(hash_partlabel("os", "1.2.3", 1), "os_1.2.3_hash_b");
+    }
+
+    #[test]
+    fn sysupdate_type_guids_are_the_documented_x86_64_ids() {
+        assert_eq!(ESP_TYPE_GUID, "c12a7328-f81f-11d2-ba4b-00a0c93ec93b");
+        assert_eq!(
+            ROOT_TYPE_GUID_X86_64,
+            "4f68bce3-e8cd-4db1-96e7-fbcaf984b709"
+        );
+        assert_eq!(
+            VERITY_TYPE_GUID_X86_64,
+            "2c7357ed-ebd2-46d9-aec1-23d437ec2bf5"
+        );
+    }
+
+    #[test]
+    fn root_transfer_carries_ab_slot_contract() {
+        let t = root_transfer("os", 4096);
+        assert!(t.contains("[Transfer]"), "sections: {t}");
+        assert!(t.contains("[Source]"), "sections: {t}");
+        assert!(t.contains("[Target]"), "sections: {t}");
+        assert!(
+            t.lines().any(|l| l.trim() == "ProtectVersion=%A"),
+            "every transfer protects %A: {t}"
+        );
+        assert!(t.contains("Type=url-file"), "remote source: {t}");
+        assert!(t.contains("Path=%v/root.img"), "versioned artifact: {t}");
+        assert!(t.contains("Type=partition"), "partition target: {t}");
+        assert!(t.contains("Path=in-places"), "in-place slots: {t}");
+        assert!(
+            t.contains(&format!("MatchPartitionType={ROOT_TYPE_GUID_X86_64}")),
+            "matched by x86-64 root TYPE UUID: {t}"
+        );
+        let pattern = t.lines().find(|l| l.starts_with("MatchPattern=")).unwrap();
+        assert_eq!(
+            pattern, "MatchPattern=os_@v_a os_@v_b os_empty",
+            "both slot labels + the _empty factory fallback: {t}"
+        );
+        assert!(t.contains("MinSize=4096M"), "slot size floor: {t}");
+        assert!(t.contains("InstancesMax=2"), "A/B = two instances: {t}");
+        assert!(
+            !t.contains("Instances="),
+            "no Instances= key (it would override InstancesMax): {t}"
+        );
+    }
+
+    #[test]
+    fn hash_transfer_matches_verity_type_and_shares_version() {
+        let t = hash_transfer("os", 33);
+        assert!(
+            t.contains(&format!("MatchPartitionType={VERITY_TYPE_GUID_X86_64}")),
+            "matched by the verity TYPE UUID: {t}"
+        );
+        assert!(
+            t.contains("Path=%v/verity-hash.img"),
+            "versioned artifact: {t}"
+        );
+        assert_eq!(
+            t.lines().find(|l| l.starts_with("MatchPattern=")).unwrap(),
+            "MatchPattern=os_@v_hash_a os_@v_hash_b os_hash_empty",
+            "hash slot labels mirror the root scheme: {t}"
+        );
+        assert!(t.contains("ProtectVersion=%A"));
+        assert!(t.contains("InstancesMax=2"));
+        assert!(t.contains("MinSize=33M"));
+    }
+
+    #[test]
+    fn uki_transfer_installs_with_tries_and_boot_relative_path() {
+        let t = uki_transfer("os");
+        assert!(
+            t.lines().any(|l| l.trim() == "ProtectVersion=%A"),
+            "ProtectVersion everywhere: {t}"
+        );
+        assert!(t.contains("Type=regular-file"), "UKI is a file target: {t}");
+        assert!(t.contains("Path=EFI/Linux"), "UKI install dir: {t}");
+        assert!(
+            t.contains("PathRelativeTo=boot"),
+            "regular-file target resolves against $BOOT: {t}"
+        );
+        let pattern = t
+            .lines()
+            .find(|l| l.starts_with("MatchPattern="))
+            .unwrap()
+            .to_string();
+        assert!(
+            pattern.contains("os_@v+@l-@d.efi"),
+            "tries-suffix pattern: {pattern}"
+        );
+        assert!(
+            pattern.contains("os_@v+3-0.efi"),
+            "install-time counter state (TriesLeft=3/TriesDone=0): {pattern}"
+        );
+        assert!(
+            pattern.contains("os_@v.efi"),
+            "factory UKI ships counter-less and still matches: {pattern}"
+        );
+        assert!(
+            t.lines().any(|l| l.trim() == "TriesLeft=3"),
+            "TriesLeft in [Target]: {t}"
+        );
+        assert!(
+            t.lines().any(|l| l.trim() == "TriesDone=0"),
+            "TriesDone in [Target]: {t}"
+        );
+        assert!(t.contains("InstancesMax=2"));
+        assert!(t.contains("Path=%v/os_@v.efi"), "versioned artifact: {t}");
+    }
+
+    #[test]
+    fn factory_uki_filename_stays_tries_compatible() {
+        // sysupdate adds +3-0 counters at install; the build emits the
+        // counter-less name so a fresh image is always-good (no countdown).
+        assert_eq!(uki_filename(&mini_decl("os", "1.2.3")), "os_1.2.3.efi");
+        assert!(!uki_filename(&mini_decl("os", "1.2.3")).contains('+'));
+    }
+
+    fn mini_decl(name: &str, version: &str) -> ImageDeclaration {
+        ImageDeclaration {
+            name: name.into(),
+            version: version.into(),
+            base: SnapRef {
+                name: "core22".into(),
+                revision: None,
+                sha3_384: None,
+            },
+            kernel: None,
+            gadget: None,
+            extra_snaps: vec![],
+            bootloader: None,
+            disk: None,
+            sysctl: vec![],
+            update_source: None,
+        }
+    }
+
+    #[test]
+    fn verity_salt_flag_is_threaded_into_the_invocation_shape() {
+        // The AB twin contract: same data + same salt ⇒ same roothash. The
+        // salt is passed as an explicit --salt argument (before the
+        // devices), so both slot formats can share one value.
+        let salt = "a".repeat(64);
+        let with = verity_format_args(Some(&salt), "DATA", "HASH");
+        assert_eq!(&with[9], "--salt");
+        assert_eq!(&with[10], &salt);
+        assert_eq!(&with[11], "DATA", "devices come last");
+        assert_eq!(&with[12], "HASH");
+        let without = verity_format_args(None, "DATA", "HASH");
+        assert_eq!(without.len(), 11, "no salt flag by default");
+        assert!(
+            !without.iter().any(|a| a == "--salt"),
+            "non-AB single-slot keeps the historical random-salt invocation"
+        );
+    }
+
+    #[test]
+    fn random_salt_is_64_hex_chars() {
+        let salt = random_salt_hex().unwrap();
+        assert_eq!(salt.len(), 64, "32 bytes hex: {salt}");
+        assert!(salt.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(random_salt_hex().unwrap(), salt, "fresh entropy per call");
     }
 }

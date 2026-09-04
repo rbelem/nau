@@ -208,6 +208,16 @@ pub struct ImageEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roothash: Option<String>,
 
+    /// A/B slot updates enabled (`disk.ab = true`, ADR-0011 step (d)).
+    /// Omitted when false so single-slot manifests stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disk_ab: bool,
+
+    /// Declared update source base URL (ADR-0011 step (d)) — the base the
+    /// emitted sysupdate transfer files fetch versioned payloads from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_source: Option<String>,
+
     /// Image artifact state — always unbuilt from eval.
     pub artifact: Artifact,
 }
@@ -490,6 +500,8 @@ fn image_entry(
         uki: None,
         esp_partuuid: None,
         roothash: None,
+        disk_ab: image.disk.as_ref().map(|d| d.ab).unwrap_or(false),
+        update_source: image.update_source.clone(),
         artifact: Artifact::unbuilt(),
     })
 }
@@ -708,6 +720,7 @@ mod tests {
             bootloader: None,
             disk: None,
             sysctl: vec![],
+            update_source: None,
         }
     }
 
@@ -745,6 +758,7 @@ mod tests {
             bootloader: None,
             disk: None,
             sysctl: vec![],
+            update_source: None,
         }
     }
 
@@ -773,6 +787,39 @@ mod tests {
             entry.kernel_modprobe_config.as_deref(),
             Some("options btrfs workspace_mirror=/vols\n")
         );
+    }
+
+    // ── Update config echo (ADR-0011 step (d)) ──
+
+    #[test]
+    fn ab_and_update_source_echo_when_declared_and_stay_absent_otherwise() {
+        // Default: both fields omitted — single-slot manifests are
+        // byte-identical to pre-(d) output.
+        let plain = manifest_with_image(pinned("core22", 1847, HASH_A), vec![]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&plain.to_json().unwrap()).unwrap();
+        assert!(v["images"]["system"].get("disk_ab").is_none(), "{v}");
+        assert!(v["images"]["system"].get("update_source").is_none(), "{v}");
+
+        // Declared: echoed so downstream consumers see the update config.
+        let mut decl = image_with_snaps(pinned("core22", 1847, HASH_A), vec![]);
+        decl.update_source = Some("https://updates.example.com/os/".into());
+        decl.disk = Some(crate::image::DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![],
+            swap: None,
+            ab: true,
+        });
+        let m = manifest_for(HashMap::from([("system".to_string(), decl)])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&m.to_json().unwrap()).unwrap();
+        assert_eq!(v["images"]["system"]["disk_ab"], true, "{v}");
+        assert_eq!(
+            v["images"]["system"]["update_source"],
+            "https://updates.example.com/os/"
+        );
+
+        // Roundtrip stays byte-stable with the new fields present.
+        let back: ImageManifest = serde_json::from_str(&m.to_json().unwrap()).unwrap();
+        assert_eq!(back.to_json().unwrap(), m.to_json().unwrap());
     }
 
     #[test]

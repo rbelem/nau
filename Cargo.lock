@@ -2047,6 +2047,7 @@ dependencies = [
  "cc",
  "clap",
  "clap_complete",
+ "ed25519-dalek",
  "flate2",
  "full_moon",
  "indicatif",
