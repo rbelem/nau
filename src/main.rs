@@ -177,6 +177,8 @@ fn main() -> miette::Result<()> {
             username,
             password_stdin,
             insecure_http,
+            mount_from,
+            record,
             json,
         } => {
             shuttle::output::set_mode(json);
@@ -189,6 +191,8 @@ fn main() -> miette::Result<()> {
                 username.as_deref(),
                 password_stdin,
                 insecure_http,
+                mount_from.as_deref(),
+                record.as_deref(),
             )
         }
 
@@ -198,6 +202,9 @@ fn main() -> miette::Result<()> {
             username,
             password_stdin,
             insecure_http,
+            expect,
+            install,
+            state_dir,
             json,
         } => {
             shuttle::output::set_mode(json);
@@ -207,6 +214,9 @@ fn main() -> miette::Result<()> {
                 username.as_deref(),
                 password_stdin,
                 insecure_http,
+                expect.as_deref(),
+                install,
+                state_dir,
             )
         }
 
@@ -1803,6 +1813,8 @@ fn cmd_push(
     username: Option<&str>,
     password_stdin: bool,
     insecure_http: bool,
+    mount_from: Option<&str>,
+    record: Option<&str>,
 ) -> miette::Result<()> {
     let auth = registry_auth(username, password_stdin)?;
     let reference = shuttle::oci::Reference::parse(reference)?;
@@ -1817,23 +1829,83 @@ fn cmd_push(
         "bundle {} v{} ({}) → tag '{}'",
         plan.meta.name, plan.meta.version, plan.meta.arch, plan.tag
     ));
-    let report = shuttle::oci::push(&reference, &plan, auth, insecure_http)?;
+    let report = shuttle::oci::push(&reference, &plan, auth, insecure_http, mount_from)?;
+    if let Some(rec) = record {
+        shuttle::oci::write_built_record(Path::new(rec), &plan)?;
+        shuttle::output::ok(format!("built-manifest record written to {rec}"));
+    }
     print_report(&report);
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_pull(
     reference: &str,
     out_dir: String,
     username: Option<&str>,
     password_stdin: bool,
     insecure_http: bool,
+    expect: Option<&str>,
+    install: bool,
+    state_dir: Option<String>,
 ) -> miette::Result<()> {
     let auth = registry_auth(username, password_stdin)?;
     let reference = shuttle::oci::Reference::parse(reference)?;
-    let report = shuttle::oci::pull(&reference, Path::new(&out_dir), auth, insecure_http)?;
+    let expected = match expect {
+        Some(p) => Some(shuttle::oci::read_built_record(Path::new(p))?),
+        None => None,
+    };
+    let mut report = shuttle::oci::pull(
+        &reference,
+        Path::new(&out_dir),
+        auth,
+        insecure_http,
+        expected.as_ref(),
+    )?;
+    if install {
+        let install_report = install_pulled(&report, state_dir.as_deref())?;
+        print_install_summary(&install_report);
+        report.install = Some(install_report);
+    }
     print_report(&report);
     Ok(())
+}
+
+/// `pull --install`: resolve revisions for the pulled `.snap` payloads
+/// from the local lockfile pins and install them as one generation.
+/// The revision-resolution rule lives in
+/// [`shuttle::oci::pending_from_blob`]; unpinned or divergent blobs are
+/// refused there (fail-closed).
+fn install_pulled(
+    report: &shuttle::oci::PullReportJson,
+    state_dir: Option<&str>,
+) -> miette::Result<shuttle::runtime::InstallReport> {
+    let lock_path = Path::new(LockFile::FILENAME);
+    let lockfile = LockFile::load(lock_path)?.ok_or_else(|| {
+        miette::miette!(
+            "no {} in the current directory — --install resolves revisions \
+             from lockfile pins; pull without --install to keep the files",
+            lock_path.display()
+        )
+    })?;
+    let mut pending: Vec<PendingSnap> = Vec::new();
+    for f in &report.files {
+        if f.path.ends_with(".snap") {
+            pending.push(shuttle::oci::pending_from_blob(
+                Path::new(&f.path),
+                &lockfile,
+            )?);
+        }
+    }
+    if pending.is_empty() {
+        miette::bail!("pulled bundle contains no .snap payloads — nothing to install");
+    }
+    let store = RuntimeStore::from_state_dir(state_dir);
+    store.install_batch(
+        &pending,
+        &SignatureEnvelope::default(),
+        &RuntimeTools::from_host(),
+    )
 }
 
 /// Resolve + download + verify one snap from the store (the store's
@@ -1979,7 +2051,7 @@ fn resolve_targets(
     Ok(resolved)
 }
 
-fn print_install_report(report: &shuttle::runtime::InstallReport) {
+fn print_install_summary(report: &shuttle::runtime::InstallReport) {
     for note in &report.notes {
         shuttle::output::info(note);
     }
@@ -1996,6 +2068,10 @@ fn print_install_report(report: &shuttle::runtime::InstallReport) {
             ));
         }
     }
+}
+
+fn print_install_report(report: &shuttle::runtime::InstallReport) {
+    print_install_summary(report);
     print_report(report);
 }
 

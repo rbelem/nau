@@ -259,18 +259,36 @@ pub enum PinSource {
     Index,
 }
 
-/// Build artifact state. Eval never builds; Phase 22b's store will extend
-/// this with content addressing.
+/// Build artifact state. Eval never builds; it only ever reports
+/// [`ArtifactState::Unbuilt`]. The `Built` state exists for host-side
+/// records only (`shuttle push --record` / `pull --expect`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArtifactState {
     Unbuilt,
+    Built,
+}
+
+/// One built blob in a [`Built`][ArtifactState::Built] artifact: the
+/// OCI content address plus transport metadata. Never emitted by eval —
+/// eval manifests stay byte-identical (`blobs` serializes to nothing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuiltBlob {
+    /// `sha256:<64 lowercase hex>` content digest (the OCI blob digest).
+    pub digest: String,
+    pub size: u64,
+    pub media_type: String,
 }
 
 /// An artifact reference in the IR.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub state: ArtifactState,
+    /// Per-blob content addresses — populated only in host-side
+    /// built-manifest records; eval emits `unbuilt` with an empty list,
+    /// which serializes to nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobs: Vec<BuiltBlob>,
 }
 
 impl Artifact {
@@ -278,6 +296,7 @@ impl Artifact {
     pub fn unbuilt() -> Self {
         Artifact {
             state: ArtifactState::Unbuilt,
+            blobs: Vec::new(),
         }
     }
 }
@@ -890,6 +909,41 @@ mod tests {
             v["images"]["system"]["artifact"].get("sha256").is_none()
                 && v["images"]["system"]["artifact"].get("path").is_none(),
             "no invented hashes or paths on unbuilt artifacts: {v}"
+        );
+    }
+
+    #[test]
+    fn built_artifact_serializes_blobs_unbuilt_stays_omitted() {
+        // Built (host-side records only): state + per-blob facts round-trip.
+        let built = Artifact {
+            state: ArtifactState::Built,
+            blobs: vec![BuiltBlob {
+                digest: format!("sha256:{}", "a".repeat(64)),
+                size: 7,
+                media_type: "application/vnd.shuttle.snap.v1".into(),
+            }],
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&built).unwrap()).unwrap();
+        assert_eq!(v["state"], "built");
+        assert_eq!(
+            v["blobs"][0]["digest"],
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(v["blobs"][0]["size"], 7);
+        assert_eq!(
+            v["blobs"][0]["media_type"],
+            "application/vnd.shuttle.snap.v1"
+        );
+
+        // Unbuilt (eval): the blobs list must NOT appear — eval manifests
+        // stay byte-identical (byte-stability + sign canonical tests).
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&Artifact::unbuilt()).unwrap()).unwrap();
+        assert_eq!(v["state"], "unbuilt");
+        assert!(
+            v.get("blobs").is_none(),
+            "unbuilt artifact must not emit blobs: {v}"
         );
     }
 

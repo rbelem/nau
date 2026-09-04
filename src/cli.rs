@@ -298,6 +298,19 @@ pub enum Command {
         #[arg(long)]
         insecure_http: bool,
 
+        /// Attempt cross-repo blob mounts from this source repository
+        /// (`POST ...?mount=<digest>&from=<repo>`) before uploading:
+        /// a 201 response reuses the bytes already in the registry (no
+        /// transfer). Default: empty = mounts skipped.
+        #[arg(long)]
+        mount_from: Option<String>,
+
+        /// Write the built-manifest record (the manifest Artifact
+        /// extension: per-blob sha256 digest, size, media type) to this
+        /// file after a successful push. `pull --expect` consumes it.
+        #[arg(long)]
+        record: Option<String>,
+
         /// Output structured JSON instead of human-friendly output.
         #[arg(long)]
         json: bool,
@@ -328,6 +341,23 @@ pub enum Command {
         /// Talk plain http:// (no TLS) — intended for local registries.
         #[arg(long)]
         insecure_http: bool,
+
+        /// Verify received blobs against a built-manifest record (from
+        /// `push --record`) IN ADDITION to the OCI descriptors —
+        /// fail-closed on any digest, size, or media-type mismatch.
+        #[arg(long)]
+        expect: Option<String>,
+
+        /// Install pulled `.snap` payloads into the state root after the
+        /// download. Revisions resolve from the `shuttle.lock` pins in
+        /// the current directory (matched by sha3-384); unpinned or
+        /// divergent blobs are refused (use plain pull to keep files).
+        #[arg(long)]
+        install: bool,
+
+        /// State root for --install (default: /var/lib/shuttle).
+        #[arg(long)]
+        state_dir: Option<String>,
 
         /// Output structured JSON instead of human-friendly output.
         #[arg(long)]
@@ -1110,6 +1140,8 @@ mod tests {
                 username,
                 password_stdin,
                 insecure_http,
+                mount_from,
+                record,
                 json,
             } => {
                 assert_eq!(reference, "localhost:5000/team/app");
@@ -1119,6 +1151,8 @@ mod tests {
                 assert!(username.is_none());
                 assert!(!password_stdin);
                 assert!(!insecure_http);
+                assert!(mount_from.is_none());
+                assert!(record.is_none());
                 assert!(!json);
             }
             _ => panic!("expected Push"),
@@ -1189,6 +1223,9 @@ mod tests {
                 username,
                 password_stdin,
                 insecure_http,
+                expect,
+                install,
+                state_dir,
                 json,
             } => {
                 assert_eq!(reference, "ghcr.io/owner/repo:v1");
@@ -1196,6 +1233,9 @@ mod tests {
                 assert!(username.is_none());
                 assert!(!password_stdin);
                 assert!(!insecure_http);
+                assert!(expect.is_none());
+                assert!(!install);
+                assert!(state_dir.is_none());
                 assert!(!json);
             }
             _ => panic!("expected Pull"),
@@ -1214,6 +1254,11 @@ mod tests {
             "ci",
             "--password-stdin",
             "--insecure-http",
+            "--expect",
+            "built.json",
+            "--install",
+            "--state-dir",
+            "st",
             "--json",
         ])
         .unwrap()
@@ -1224,6 +1269,9 @@ mod tests {
                 username,
                 password_stdin,
                 insecure_http,
+                expect,
+                install,
+                state_dir,
                 json,
                 ..
             } => {
@@ -1231,6 +1279,9 @@ mod tests {
                 assert_eq!(username.as_deref(), Some("ci"));
                 assert!(password_stdin);
                 assert!(insecure_http);
+                assert_eq!(expect.as_deref(), Some("built.json"));
+                assert!(install);
+                assert_eq!(state_dir.as_deref(), Some("st"));
                 assert!(json);
             }
             _ => panic!("expected Pull"),

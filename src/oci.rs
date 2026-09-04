@@ -16,8 +16,9 @@
 //! - `HEAD /v2/<repo>/blobs/<digest>` — dedup probe (200 → skip upload).
 //! - `POST /v2/<repo>/blobs/uploads/?digest=<digest>` — monolithic blob
 //!   upload (201 = done; 202 = follow `Location` with a finalizing empty
-//!   `PUT ...&digest=`). Cross-repo mount (`?mount=&from=`) and chunked
-//!   uploads are documented follow-ups.
+//!   `PUT ...&digest=`). Cross-repo mount (`?mount=&from=`, tried first
+//!   with `--mount-from`) is implemented; chunked uploads remain a
+//!   documented follow-up.
 //! - `PUT /v2/<repo>/manifests/<tag>` — the bundle manifest.
 //! - `GET /v2/<repo>/manifests/<ref>` + `GET .../blobs/<digest>` — pull,
 //!   every blob digest-verified on receipt (fail-closed).
@@ -58,9 +59,12 @@
 //! # (insecure-http only needed because registry:2 ships without TLS)
 //! ```
 //!
-//! The signed binding of pushed artifacts to the eval manifest is the
-//! documented follow-up (needs the manifest.rs `Artifact` extension);
-//! this phase pushes payload blobs + a transport manifest only.
+//! The signed binding of pushed artifacts to build facts uses the
+//! manifest.rs `Artifact` extension ([`BuiltBlob`]): `push --record`
+//! writes the host-side built-manifest record, `pull --expect` verifies
+//! received blobs against it fail-closed; `pull --install` resolves
+//! revisions from `shuttle.lock` pins and hands [`PendingSnap`]s to
+//! `install_batch`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -72,8 +76,11 @@ use miette::miette;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-use crate::manifest::MANIFEST_VERSION;
+use crate::lock::LockFile;
+use crate::manifest::{Artifact, ArtifactState, BuiltBlob, MANIFEST_VERSION};
 use crate::output;
+use crate::runtime::PendingSnap;
+use crate::store::sha3_384_file;
 
 // ── Media types ──
 
@@ -385,6 +392,16 @@ pub struct Auth {
 }
 
 // ── Client ──
+
+/// Outcome of one blob upload ([`Client::upload_blob`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobUpload {
+    /// Bytes were transferred (monolithic POST, or a 202 upload session
+    /// finalized via the Location PUT).
+    Uploaded,
+    /// The registry mounted the blob cross-repo — no bytes transferred.
+    Mounted,
+}
 
 enum Method {
     Get,
@@ -710,17 +727,34 @@ impl Client {
         }
     }
 
-    /// Monolithic blob upload: `POST .../blobs/uploads/?digest=<digest>`
-    /// with the file as the body. 201 = done; 202 = follow the Location
-    /// with a finalizing empty PUT. (Cross-repo mount and chunked uploads
-    /// are documented follow-ups, not implemented here.)
-    pub fn upload_blob(&self, file: &Path, digest: &str) -> miette::Result<()> {
+    /// Upload one blob, optionally attempting a cross-repo mount first:
+    /// `POST .../blobs/uploads/?mount=<digest>&from=<from_repo>`.
+    /// 201 = the registry mounted the blob from `from_repo` (no bytes
+    /// transferred) → [`BlobUpload::Mounted`]. 202 = no mount; the
+    /// returned `Location` names the upload session, finalized with the
+    /// digest PUT → [`BlobUpload::Uploaded`]. Without `mount_from` this
+    /// is the plain monolithic upload (`?digest=<digest>`), always
+    /// [`BlobUpload::Uploaded`]. (Chunked uploads remain a documented
+    /// follow-up.)
+    pub fn upload_blob(
+        &self,
+        file: &Path,
+        digest: &str,
+        mount_from: Option<&str>,
+    ) -> miette::Result<BlobUpload> {
         validate_digest(digest)?;
-        let url = format!(
-            "{}/v2/{}/blobs/uploads/?digest={digest}",
-            self.base_url(),
-            self.reference.repo
-        );
+        let url = match mount_from {
+            Some(from) => format!(
+                "{}/v2/{}/blobs/uploads/?mount={digest}&from={from}",
+                self.base_url(),
+                self.reference.repo
+            ),
+            None => format!(
+                "{}/v2/{}/blobs/uploads/?digest={digest}",
+                self.base_url(),
+                self.reference.repo
+            ),
+        };
         let req = Request {
             method: Method::Post,
             url: url.clone(),
@@ -732,7 +766,11 @@ impl Client {
         };
         let resp = self.request(&req)?;
         match resp.status {
-            201 => Ok(()),
+            201 => Ok(if mount_from.is_some() {
+                BlobUpload::Mounted
+            } else {
+                BlobUpload::Uploaded
+            }),
             202 => {
                 let location = resp
                     .header("location")
@@ -749,7 +787,7 @@ impl Client {
                 };
                 let r2 = self.request(&finalize)?;
                 if r2.status == 201 {
-                    Ok(())
+                    Ok(BlobUpload::Uploaded)
                 } else {
                     Err(miette!(
                         "blob finalize PUT returned HTTP {} for {digest}",
@@ -1386,6 +1424,9 @@ pub struct PushedBlobJson {
     pub size: u64,
     /// True when the HEAD probe found the blob already in the registry.
     pub existed: bool,
+    /// True when the registry mounted the blob cross-repo
+    /// (`--mount-from`) instead of receiving the bytes (deduped-reused).
+    pub mounted: bool,
 }
 
 /// `shuttle push --json` payload.
@@ -1413,24 +1454,33 @@ pub struct PullReportJson {
     pub reference: String,
     pub manifest_digest: String,
     pub files: Vec<PulledFileJson>,
+    /// Present when `pull --install` installed the pulled `.snap`
+    /// payloads into a state root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install: Option<crate::runtime::InstallReport>,
 }
 
 /// Push a bundle (real client). See [`push_with`] for the injected form.
+/// `mount_from` (the `--mount-from` repository) attempts cross-repo blob
+/// mounts before uploading; `None` (or an empty repo) skips mounts.
 pub fn push(
     reference: &Reference,
     plan: &PushPlan,
     auth: Auth,
     insecure_http: bool,
+    mount_from: Option<&str>,
 ) -> miette::Result<PushReportJson> {
     let client = Client::new(reference.clone(), auth, insecure_http)?;
-    push_with(&client, reference, plan)
+    push_with(&client, reference, plan, mount_from)
 }
 
 fn push_with(
     client: &Client,
     reference: &Reference,
     plan: &PushPlan,
+    mount_from: Option<&str>,
 ) -> miette::Result<PushReportJson> {
+    let mount_from = mount_from.filter(|r| !r.is_empty());
     let sp = output::spinner("checking registry API version...");
     client.version_check()?;
     output::finish_ok(
@@ -1443,12 +1493,24 @@ fn push_with(
         let short = &a.digest[..19.min(a.digest.len())];
         let sp = output::spinner(&format!("checking blob {short}..."));
         let existed = client.blob_exists(&a.digest)?;
+        let mut mounted = false;
         if existed {
             output::finish_ok(&sp, &format!("{} already in registry", a.title));
         } else {
             sp.set_message(format!("uploading {} ({} bytes)...", a.title, a.size));
-            client.upload_blob(&a.path, &a.digest)?;
-            output::finish_ok(&sp, &format!("{} uploaded", a.title));
+            let upload = client.upload_blob(&a.path, &a.digest, mount_from)?;
+            mounted = upload == BlobUpload::Mounted;
+            match upload {
+                BlobUpload::Mounted => output::finish_ok(
+                    &sp,
+                    &format!(
+                        "{} mounted from registry (cross-repo dedup via '{}')",
+                        a.title,
+                        mount_from.unwrap_or_default()
+                    ),
+                ),
+                BlobUpload::Uploaded => output::finish_ok(&sp, &format!("{} uploaded", a.title)),
+            }
         }
         blobs.push(PushedBlobJson {
             file: a.title.clone(),
@@ -1456,6 +1518,7 @@ fn push_with(
             digest: a.digest.clone(),
             size: a.size,
             existed,
+            mounted,
         });
     }
 
@@ -1479,25 +1542,31 @@ fn push_with(
 }
 
 /// Pull a bundle (real client). See [`pull_with`] for the injected form.
+/// `expect` (from `pull --expect`) verifies received blobs against a
+/// built-manifest record IN ADDITION to the OCI descriptors.
 pub fn pull(
     reference: &Reference,
     out_dir: &Path,
     auth: Auth,
     insecure_http: bool,
+    expect: Option<&Artifact>,
 ) -> miette::Result<PullReportJson> {
     let client = Client::new(reference.clone(), auth, insecure_http)?;
-    pull_with(&client, reference, out_dir)
+    pull_with(&client, reference, out_dir, expect)
 }
 
 /// Pull a bundle: manifest → per-blob digest-verified download into
 /// `out_dir`, files named by their `org.opencontainers.image.title`
 /// annotation (i.e. the original `{name}_{version}_{arch}.snap` names —
-/// shaped for a future `PendingSnap`-based local install wiring, which
-/// is intentionally NOT hooked up to the CLI this phase).
+/// shaped for the `--install` PendingSnap wiring). When `expect` is
+/// given, every layer must appear in the record with matching size and
+/// media type, and every record blob must arrive — any deviation fails
+/// closed (fail-closed on top of the OCI descriptor sha256 checks).
 fn pull_with(
     client: &Client,
     reference: &Reference,
     out_dir: &Path,
+    expect: Option<&Artifact>,
 ) -> miette::Result<PullReportJson> {
     let ref_part = match (reference.tag.as_deref(), reference.digest.as_deref()) {
         (Some(t), _) => t.to_string(),
@@ -1530,6 +1599,9 @@ fn pull_with(
 
     std::fs::create_dir_all(out_dir)
         .map_err(|e| miette!("failed to create {}: {e}", out_dir.display()))?;
+    let expect_map: Option<HashMap<&str, &BuiltBlob>> =
+        expect.map(|e| e.blobs.iter().map(|b| (b.digest.as_str(), b)).collect());
+    let mut matched: HashSet<&str> = HashSet::new();
     let mut seen = HashSet::new();
     let mut files = Vec::new();
     for layer in &pulled.manifest.layers {
@@ -1548,11 +1620,58 @@ fn pull_with(
         let sp = output::spinner(&format!("fetching {title}..."));
         let size = client.pull_blob(&layer.digest, &dest)?;
         output::finish_ok(&sp, &format!("{title} — sha256 verified"));
+        if let Some(map) = &expect_map {
+            let Some(blob) = map.get(layer.digest.as_str()) else {
+                let _ = std::fs::remove_file(&dest);
+                miette::bail!(
+                    "pulled blob {} ('{title}') is not in the expected \
+                     built-manifest record — refusing to accept it (fail-closed; \
+                     file removed)",
+                    layer.digest
+                );
+            };
+            if blob.size != layer.size {
+                let _ = std::fs::remove_file(&dest);
+                miette::bail!(
+                    "blob {} size {} disagrees with the built-manifest record \
+                     ({}) — refusing (fail-closed; file removed)",
+                    layer.digest,
+                    layer.size,
+                    blob.size
+                );
+            }
+            if blob.media_type != layer.media_type {
+                let _ = std::fs::remove_file(&dest);
+                miette::bail!(
+                    "blob {} media type '{}' disagrees with the built-manifest \
+                     record ('{}') — refusing (fail-closed; file removed)",
+                    layer.digest,
+                    layer.media_type,
+                    blob.media_type
+                );
+            }
+            matched.insert(layer.digest.as_str());
+        }
         files.push(PulledFileJson {
             path: dest.to_string_lossy().into_owned(),
             digest: layer.digest.clone(),
             size,
         });
+    }
+    if let Some(map) = &expect_map {
+        let missing: Vec<&str> = map
+            .keys()
+            .filter(|d| !matched.contains(*d))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            miette::bail!(
+                "built-manifest record not satisfied — {} expected blob(s) \
+                 missing from the pulled manifest: {} (fail-closed)",
+                missing.len(),
+                missing.join(", ")
+            );
+        }
     }
 
     Ok(PullReportJson {
@@ -1560,7 +1679,105 @@ fn pull_with(
         reference: reference.display(),
         manifest_digest: pulled.digest,
         files,
+        install: None,
     })
+}
+
+// ── pull --install wiring ──
+
+/// Resolve one pulled `.snap` blob into a [`PendingSnap`].
+///
+/// # Revision-resolution rule (the Phase 25 documented follow-up)
+///
+/// The artifact filename carries `{name}_{version}_{arch}` — the store
+/// revision is NOT in the filename. It is resolved from the local
+/// lockfile ([`LockFile`]) by matching the blob's sha3-384 against the
+/// pinned entry for the parsed name:
+///
+/// - name pinned and sha3-384 matches → that pin's revision;
+/// - name pinned but sha3-384 differs → named refusal (the pulled
+///   content diverged from the lock — installing it would put a
+///   foreign payload behind a trusted dedup key);
+/// - name absent from the lockfile → named refusal to install an
+///   unpinned blob; plain `pull` (without `--install`) still writes
+///   the files.
+///
+/// [`install_batch`][crate::runtime::RuntimeStore::install_batch]'s
+/// dedup key (name+revision+sha3-384) therefore only ever sees
+/// lockfile-backed revisions. The filename parser is the SAME one push
+/// uses ([`parse_artifact_filename`], ambiguous-underscore rejection
+/// included); the payload path is passed through untouched and install
+/// re-verifies sha3-384 fail-closed on its own.
+pub fn pending_from_blob(payload: &Path, lockfile: &LockFile) -> miette::Result<PendingSnap> {
+    let (name, _version, _arch) = parse_artifact_filename(payload)?;
+    let sha3_384 = sha3_384_file(payload)?;
+    let entry = lockfile.snaps.get(&name).ok_or_else(|| {
+        miette!(
+            "'{name}' has no {pin} entry — refusing to install a blob whose \
+             store revision cannot be established; use plain `pull` (without \
+             --install) or `shuttle lock` the snap first",
+            pin = LockFile::FILENAME
+        )
+    })?;
+    if entry.sha3_384 != sha3_384 {
+        miette::bail!(
+            "'{name}' pulled blob sha3-384 {sha3_384} does not match the \
+             lockfile pin ({}) — refusing to install (fail-closed)",
+            entry.sha3_384
+        );
+    }
+    Ok(PendingSnap {
+        name,
+        revision: entry.revision,
+        sha3_384,
+        payload_path: payload.to_path_buf(),
+    })
+}
+
+// ── Built-manifest record (the manifest.rs Artifact extension, host-side) ──
+
+/// The [`Artifact`] record for a pushed plan: `built`, with one
+/// [`BuiltBlob`] (sha256 content address, size, media type) per artifact.
+pub fn built_record(plan: &PushPlan) -> Artifact {
+    Artifact {
+        state: ArtifactState::Built,
+        blobs: plan
+            .artifacts
+            .iter()
+            .map(|a| BuiltBlob {
+                digest: a.digest.clone(),
+                size: a.size,
+                media_type: a.media_type.to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// Write the host-side built-manifest record (`shuttle push --record`):
+/// the [`Artifact`] extension JSON for the pushed blobs.
+pub fn write_built_record(path: &Path, plan: &PushPlan) -> miette::Result<()> {
+    let mut json = serde_json::to_vec_pretty(&built_record(plan))
+        .map_err(|e| miette!("built-manifest record serialization: {e}"))?;
+    json.push(b'\n');
+    std::fs::write(path, json).map_err(|e| miette!("failed to write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Load a built-manifest record (`pull --expect`), refusing anything that
+/// is not a populated built artifact (fail-closed).
+pub fn read_built_record(path: &Path) -> miette::Result<Artifact> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| miette!("failed to read {}: {e}", path.display()))?;
+    let artifact: Artifact = serde_json::from_str(&text)
+        .map_err(|e| miette!("invalid built-manifest record {}: {e}", path.display()))?;
+    if artifact.state != ArtifactState::Built || artifact.blobs.is_empty() {
+        miette::bail!(
+            "{}: not a built-manifest record — needs state \"built\" and at \
+             least one blob",
+            path.display()
+        );
+    }
+    Ok(artifact)
 }
 
 // ── Tests (hermetic — fake CommandRunner, no network) ──
@@ -1714,6 +1931,10 @@ mod tests {
     }
 
     fn manifest_bytes(layer_digest: &str, title: &str) -> Vec<u8> {
+        manifest_bytes_with_size(layer_digest, title, 5)
+    }
+
+    fn manifest_bytes_with_size(layer_digest: &str, title: &str, size: u64) -> Vec<u8> {
         serde_json::json!({
             "schemaVersion": 2,
             "mediaType": MEDIA_TYPE_MANIFEST,
@@ -1726,7 +1947,7 @@ mod tests {
             "layers": [{
                 "mediaType": MEDIA_TYPE_SNAP,
                 "digest": layer_digest,
-                "size": 5,
+                "size": size,
                 "annotations": { TITLE_ANNOTATION: title }
             }]
         })
@@ -1921,7 +2142,7 @@ mod tests {
         let reference = Reference::parse("localhost:5000/team/app").unwrap();
         let plan = plan_push(dir.path(), &[], None, &reference).unwrap();
         let client = test_client("localhost:5000/team/app", fr);
-        let report = push_with(&client, &reference, &plan).unwrap();
+        let report = push_with(&client, &reference, &plan, None).unwrap();
 
         assert_eq!(report.blobs.len(), 1);
         assert!(report.blobs[0].existed);
@@ -1969,7 +2190,7 @@ mod tests {
         let reference = Reference::parse("localhost:5000/team/app").unwrap();
         let plan = plan_push(dir.path(), &[], None, &reference).unwrap();
         let client = test_client("localhost:5000/team/app", fr);
-        let report = push_with(&client, &reference, &plan).unwrap();
+        let report = push_with(&client, &reference, &plan, None).unwrap();
 
         assert!(!report.blobs[0].existed);
         assert!(report.manifest_digest.starts_with("sha256:"));
@@ -2000,7 +2221,7 @@ mod tests {
 
         let reference = Reference::parse("localhost:5000/team/app:v1").unwrap();
         let client = test_client("localhost:5000/team/app:v1", fr);
-        let report = pull_with(&client, &reference, out.path()).unwrap();
+        let report = pull_with(&client, &reference, out.path(), None).unwrap();
 
         let dest = out.path().join("app_1.0.0_amd64.snap");
         assert_eq!(std::fs::read(&dest).unwrap(), payload);
@@ -2029,7 +2250,7 @@ mod tests {
 
         let reference = Reference::parse("localhost:5000/team/app:v1").unwrap();
         let client = test_client("localhost:5000/team/app:v1", fr);
-        let err = pull_with(&client, &reference, out.path()).unwrap_err();
+        let err = pull_with(&client, &reference, out.path(), None).unwrap_err();
         assert!(err.to_string().contains("digest mismatch"), "{err}");
         assert!(!out.path().join("app_1.0.0_amd64.snap").exists());
     }
@@ -2052,7 +2273,7 @@ mod tests {
 
         let reference = Reference::parse(&format!("localhost:5000/team/app@{expected}")).unwrap();
         let client = test_client(&format!("localhost:5000/team/app@{expected}"), fr);
-        let err = pull_with(&client, &reference, out.path()).unwrap_err();
+        let err = pull_with(&client, &reference, out.path(), None).unwrap_err();
         assert!(
             err.to_string().contains("manifest digest mismatch"),
             "{err}"
@@ -2065,7 +2286,7 @@ mod tests {
         let fr = FakeRunner::new();
         let client = test_client("localhost:5000/team/app", fr);
         let reference = Reference::parse("localhost:5000/team/app").unwrap();
-        let err = pull_with(&client, &reference, out.path()).unwrap_err();
+        let err = pull_with(&client, &reference, out.path(), None).unwrap_err();
         assert!(err.to_string().contains("tag or @digest"), "{err}");
     }
 
@@ -2215,5 +2436,290 @@ mod tests {
             get("www-authenticate").as_deref(),
             Some("Bearer realm=\"r\"")
         );
+    }
+
+    // ── pull --install wiring (revision from lockfile pins) ──
+
+    fn lock_with(name: &str, revision: u32, sha3_384: &str) -> LockFile {
+        let mut lock = LockFile {
+            version: 1,
+            sources: Default::default(),
+            snaps: Default::default(),
+            inputs: Default::default(),
+        };
+        lock.snaps.insert(
+            name.to_string(),
+            crate::lock::SnapLockEntry {
+                revision,
+                sha3_384: sha3_384.to_string(),
+            },
+        );
+        lock
+    }
+
+    #[test]
+    fn pending_from_blob_resolves_revision_from_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = write_artifact(dir.path(), "app_1.0.0_amd64.snap", b"payload");
+        let sha3 = crate::store::sha3_384_file(&payload).unwrap();
+        let lock = lock_with("app", 7, &sha3);
+
+        let pending = pending_from_blob(&payload, &lock).unwrap();
+        assert_eq!(pending.name, "app");
+        assert_eq!(pending.revision, 7);
+        assert_eq!(pending.sha3_384, sha3);
+        assert_eq!(pending.payload_path, payload);
+    }
+
+    #[test]
+    fn pending_from_blob_refuses_unpinned_divergent_and_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = write_artifact(dir.path(), "app_1.0.0_amd64.snap", b"payload");
+        let sha3 = crate::store::sha3_384_file(&payload).unwrap();
+
+        // name absent from the lockfile → unpinned refusal
+        let lock = lock_with("other", 7, &sha3);
+        let err = pending_from_blob(&payload, &lock).unwrap_err().to_string();
+        assert!(err.contains("no shuttle.lock entry"), "{err}");
+        assert!(err.contains("plain `pull`"), "{err}");
+
+        // pinned but content diverged → fail-closed
+        let lock = lock_with("app", 7, &"f".repeat(96));
+        let err = pending_from_blob(&payload, &lock).unwrap_err().to_string();
+        assert!(err.contains("does not match the lockfile pin"), "{err}");
+
+        // ambiguous filename rejected by the SHARED push parser
+        let amb = write_artifact(dir.path(), "a_b_c_d.snap", b"payload");
+        let lock = lock_with("a", 1, "x");
+        let err = pending_from_blob(&amb, &lock).unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    // ── cross-repo blob mount ──
+
+    #[test]
+    fn push_mount_201_skips_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        write_artifact(dir.path(), "app_1.0.0_amd64.snap", b"payload");
+
+        let fr = FakeRunner::new();
+        fr.when(|a| url_of(a).ends_with("/v2/"), ok_200());
+        fr.when(
+            |a| has_flag(a, "--head") && url_of(a).contains("/blobs/"),
+            responder(404, &[], Vec::new()), // missing locally → try mount
+        );
+        // The mount POST must carry BOTH mount= and from= — a monolithic
+        // digest= POST would match nothing and panic the fake.
+        fr.when(
+            |a| {
+                has_flag_value(a, "-X", "POST")
+                    && url_of(a).contains("/blobs/uploads/")
+                    && url_of(a).contains("mount=sha256:")
+                    && url_of(a).contains("from=team/base")
+            },
+            responder(201, &[], Vec::new()), // mounted, no Location
+        );
+        fr.when(
+            |a| has_flag_value(a, "-X", "PUT") && url_of(a).contains("/manifests/"),
+            responder(201, &[], Vec::new()),
+        );
+
+        let reference = Reference::parse("localhost:5000/team/app").unwrap();
+        let plan = plan_push(dir.path(), &[], None, &reference).unwrap();
+        let client = test_client("localhost:5000/team/app", fr);
+        let report = push_with(&client, &reference, &plan, Some("team/base")).unwrap();
+
+        assert!(!report.blobs[0].existed);
+        assert!(
+            report.blobs[0].mounted,
+            "mount 201 must report mounted: true"
+        );
+    }
+
+    #[test]
+    fn push_mount_202_falls_back_to_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        write_artifact(dir.path(), "app_1.0.0_amd64.snap", b"payload");
+
+        let fr = FakeRunner::new();
+        fr.when(|a| url_of(a).ends_with("/v2/"), ok_200());
+        fr.when(
+            |a| has_flag(a, "--head") && url_of(a).contains("/blobs/"),
+            responder(404, &[], Vec::new()),
+        );
+        fr.when(
+            |a| has_flag_value(a, "-X", "POST") && url_of(a).contains("mount=sha256:"),
+            responder(
+                202, // no mount — registry opened an upload session
+                &[("Location", "/v2/team/app/blobs/uploads/uuid2")],
+                Vec::new(),
+            ),
+        );
+        fr.when(
+            |a| {
+                has_flag_value(a, "-X", "PUT")
+                    && url_of(a).contains("uploads/uuid2")
+                    && url_of(a).contains("digest=sha256:")
+            },
+            responder(201, &[], Vec::new()),
+        );
+        fr.when(
+            |a| has_flag_value(a, "-X", "PUT") && url_of(a).contains("/manifests/"),
+            responder(201, &[], Vec::new()),
+        );
+
+        let reference = Reference::parse("localhost:5000/team/app").unwrap();
+        let plan = plan_push(dir.path(), &[], None, &reference).unwrap();
+        let client = test_client("localhost:5000/team/app", fr);
+        let report = push_with(&client, &reference, &plan, Some("team/base")).unwrap();
+
+        assert!(!report.blobs[0].mounted);
+        assert!(!report.blobs[0].existed);
+    }
+
+    #[test]
+    fn push_without_mount_from_uses_monolithic_post() {
+        let dir = tempfile::tempdir().unwrap();
+        write_artifact(dir.path(), "app_1.0.0_amd64.snap", b"payload");
+
+        let fr = FakeRunner::new();
+        fr.when(|a| url_of(a).ends_with("/v2/"), ok_200());
+        fr.when(
+            |a| has_flag(a, "--head") && url_of(a).contains("/blobs/"),
+            responder(404, &[], Vec::new()),
+        );
+        // Plain path: digest= POST, never a mount= POST.
+        fr.when(
+            |a| {
+                has_flag_value(a, "-X", "POST")
+                    && url_of(a).contains("digest=sha256:")
+                    && !url_of(a).contains("mount=")
+            },
+            responder(201, &[], Vec::new()),
+        );
+        fr.when(
+            |a| has_flag_value(a, "-X", "PUT") && url_of(a).contains("/manifests/"),
+            responder(201, &[], Vec::new()),
+        );
+
+        let reference = Reference::parse("localhost:5000/team/app").unwrap();
+        let plan = plan_push(dir.path(), &[], None, &reference).unwrap();
+        let client = test_client("localhost:5000/team/app", fr);
+        let report = push_with(&client, &reference, &plan, None).unwrap();
+        assert!(!report.blobs[0].mounted);
+    }
+
+    // ── built-manifest record (Artifact extension) ──
+
+    #[test]
+    fn built_record_roundtrip_and_pull_expect_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_artifact(dir.path(), "app_1.0.0_amd64.snap", b"payload");
+        let reference = Reference::parse("localhost:5000/team/app").unwrap();
+        let plan = plan_push(dir.path(), &[], None, &reference).unwrap();
+
+        let rec_path = dir.path().join("built.json");
+        write_built_record(&rec_path, &plan).unwrap();
+        let record = read_built_record(&rec_path).unwrap();
+        // roundtrip: file bytes equal the in-memory record
+        let a = serde_json::to_value(built_record(&plan)).unwrap();
+        let b = serde_json::to_value(&record).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b["state"], "built");
+        assert_eq!(b["blobs"][0]["media_type"], MEDIA_TYPE_SNAP);
+
+        // pull verified against the record — same payload, same digest
+        let out = tempfile::tempdir().unwrap();
+        let layer_digest = plan.artifacts[0].digest.clone();
+        let fr = FakeRunner::new();
+        fr.when(|a| url_of(a).ends_with("/v2/"), ok_200());
+        fr.when(
+            |a| url_of(a).contains("/manifests/v1"),
+            responder(
+                200,
+                &[],
+                manifest_bytes_with_size(
+                    &layer_digest,
+                    "app_1.0.0_amd64.snap",
+                    b"payload".len() as u64,
+                ),
+            ),
+        );
+        fr.when(
+            |a| url_of(a).contains("/blobs/sha256:"),
+            responder(200, &[], b"payload".to_vec()),
+        );
+        let client = test_client("localhost:5000/team/app:v1", fr);
+        let pull_ref = Reference::parse("localhost:5000/team/app:v1").unwrap();
+        let report = pull_with(&client, &pull_ref, out.path(), Some(&record)).unwrap();
+        assert_eq!(report.files.len(), 1);
+    }
+
+    #[test]
+    fn pull_expect_tamper_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_artifact(dir.path(), "app_1.0.0_amd64.snap", b"payload");
+        let reference = Reference::parse("localhost:5000/team/app").unwrap();
+        let plan = plan_push(dir.path(), &[], None, &reference).unwrap();
+        let layer_digest = plan.artifacts[0].digest.clone();
+
+        let pull_with_record = |record: Artifact| -> miette::Result<PullReportJson> {
+            let out = tempfile::tempdir().unwrap();
+            let fr = FakeRunner::new();
+            fr.when(|a| url_of(a).ends_with("/v2/"), ok_200());
+            fr.when(
+                |a| url_of(a).contains("/manifests/v1"),
+                responder(
+                    200,
+                    &[],
+                    manifest_bytes_with_size(
+                        &layer_digest,
+                        "app_1.0.0_amd64.snap",
+                        b"payload".len() as u64,
+                    ),
+                ),
+            );
+            fr.when(
+                |a| url_of(a).contains("/blobs/sha256:"),
+                responder(200, &[], b"payload".to_vec()),
+            );
+            let client = test_client("localhost:5000/team/app:v1", fr);
+            let pull_ref = Reference::parse("localhost:5000/team/app:v1").unwrap();
+            pull_with(&client, &pull_ref, out.path(), Some(&record))
+        };
+
+        // size tampered (OCI descriptor says 5)
+        let mut wrong_size = built_record(&plan);
+        wrong_size.blobs[0].size = 999;
+        let err = pull_with_record(wrong_size).unwrap_err().to_string();
+        assert!(err.contains("size"), "{err}");
+
+        // digest absent from the record (foreign blob)
+        let mut foreign = built_record(&plan);
+        foreign.blobs[0].digest = format!("sha256:{}", sha256_hex(b"other"));
+        let err = pull_with_record(foreign).unwrap_err().to_string();
+        assert!(
+            err.contains("not in the expected built-manifest record"),
+            "{err}"
+        );
+
+        // record with a blob the manifest never delivers → missing
+        let mut extra = built_record(&plan);
+        extra.blobs.push(BuiltBlob {
+            digest: format!("sha256:{}", sha256_hex(b"missing")),
+            size: 1,
+            media_type: MEDIA_TYPE_SNAP.into(),
+        });
+        let err = pull_with_record(extra).unwrap_err().to_string();
+        assert!(err.contains("missing from the pulled manifest"), "{err}");
+    }
+
+    #[test]
+    fn read_built_record_rejects_unbuilt_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("r.json");
+        std::fs::write(&p, serde_json::to_vec(&Artifact::unbuilt()).unwrap()).unwrap();
+        let err = read_built_record(&p).unwrap_err().to_string();
+        assert!(err.contains("not a built-manifest record"), "{err}");
     }
 }
