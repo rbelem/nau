@@ -1267,7 +1267,10 @@ fn populate_root_partition_at(
     let mount_pt = build_dir.join(&part.name);
     std::fs::create_dir_all(&mount_pt).into_diagnostic()?;
 
-    format_partition(&part_dev, part)?;
+    // The verity branch: this root IS the verity data device — pin the fs
+    // to 4 KiB blocks (VERITY_BLOCK_SIZE) or the mount over the verity
+    // mapping fails ("bad block size 1024").
+    format_partition(&part_dev, part, true)?;
     if !mount_device(&part_dev, &mount_pt)? {
         return Err(miette::miette!(
             "failed to mount root partition '{}' ({part_dev}) — refusing to \
@@ -1319,7 +1322,8 @@ fn populate_side_partition(
     let mount_pt = ctx.build_dir.join(&part.name);
     std::fs::create_dir_all(&mount_pt).into_diagnostic()?;
 
-    format_partition(&part_dev, part)?;
+    // Side partitions (ESP, data) are never verity data devices.
+    format_partition(&part_dev, part, false)?;
     if !mount_device(&part_dev, &mount_pt)? {
         return Ok(());
     }
@@ -1339,16 +1343,49 @@ fn populate_side_partition(
     Ok(())
 }
 
+/// mkfs tool + leading flags for one partition filesystem (the label and
+/// device args are appended by the caller). `verity` marks the partition as
+/// a dm-verity data device (a root slot in the verity branch): the
+/// filesystem is then pinned to [`VERITY_BLOCK_SIZE`] blocks so it mounts
+/// over the verity mapping — ext4 via `-b`, btrfs via nodesize +
+/// sectorsize. vfat + verity fails closed: FAT has no block-size knob and
+/// cannot serve as a verity data device.
+fn mkfs_flags_for(fs: &str, verity: bool) -> miette::Result<(&'static str, Vec<String>)> {
+    let bs = VERITY_BLOCK_SIZE.to_string();
+    let (tool, flags): (&'static str, Vec<String>) = match (fs, verity) {
+        ("vfat", true) => {
+            return Err(miette::miette!(
+                "root filesystem 'vfat' is incompatible with dm-verity — FAT has no \
+                 {VERITY_BLOCK_SIZE}-byte block-size knob and cannot be a verity data \
+                 device; declare an ext4 (or btrfs) root"
+            ));
+        }
+        ("vfat", false) => ("mkfs.vfat", vec!["-F".into(), "32".into(), "-n".into()]),
+        ("btrfs", true) => (
+            "mkfs.btrfs",
+            vec![
+                "-f".into(),
+                "--nodesize".into(),
+                bs.clone(),
+                "--sectorsize".into(),
+                bs,
+                "-L".into(),
+            ],
+        ),
+        ("btrfs", false) => ("mkfs.btrfs", vec!["-f".into(), "-L".into()]),
+        (_, true) => ("mkfs.ext4", vec!["-F".into(), "-b".into(), bs, "-L".into()]),
+        (_, false) => ("mkfs.ext4", vec!["-F".into(), "-L".into()]),
+    };
+    Ok((tool, flags))
+}
+
 /// mkfs a partition device; a formatting failure is reported but not fatal
 /// (matching the historical behavior — the mount attempt below decides).
-fn format_partition(part_dev: &str, part: &Partition) -> miette::Result<()> {
-    let (tool, flags): (&str, &[&str]) = match part.fs.as_str() {
-        "vfat" => ("mkfs.vfat", &["-F", "32", "-n"]),
-        "btrfs" => ("mkfs.btrfs", &["-f", "-L"]),
-        _ => ("mkfs.ext4", &["-F", "-L"]),
-    };
+/// The `verity` precondition check fails closed before any command runs.
+fn format_partition(part_dev: &str, part: &Partition, verity: bool) -> miette::Result<()> {
+    let (tool, flags) = mkfs_flags_for(&part.fs, verity)?;
     let status = std::process::Command::new(tool)
-        .args(flags)
+        .args(&flags)
         .arg(&part.name)
         .arg(part_dev)
         .status()
@@ -1371,6 +1408,16 @@ fn mount_device(part_dev: &str, mount_pt: &Path) -> miette::Result<bool> {
 }
 
 // ── dm-verity over the root partition (ADR-0011 step (c)) ──
+
+/// Block size shared by `veritysetup format` (--data-block-size /
+/// --hash-block-size) AND the root mkfs invocation (ext4 `-b`, btrfs
+/// nodesize/sectorsize). dm-verity hashes the data device in these blocks,
+/// so a root filesystem built with smaller blocks cannot mount over the
+/// verity mapping: a 1 KiB-block ext4 root fails with "bad block size
+/// 1024". Proven in QEMU — the identical verity setup mounts fine
+/// (veritysetup status `verified`) once the rootfs is built with 4 KiB
+/// blocks. ONE constant so the two argv builders cannot drift.
+const VERITY_BLOCK_SIZE: u32 = 4096;
 
 /// Name of the auto-appended dm-verity hash partition. It is formatted only
 /// implicitly by `veritysetup format` — never mkfs'd, never mounted — and
@@ -1586,14 +1633,15 @@ fn preflight_disk_tools_with(
 /// veritysetup argv for a sha256/4K format-1 invocation, optional pinned
 /// salt, devices last.
 fn verity_format_args(salt: Option<&str>, data_dev: &str, hash_dev: &str) -> Vec<String> {
+    let bs = VERITY_BLOCK_SIZE.to_string();
     let mut args = vec![
         "format".to_string(),
         "--hash".to_string(),
         "sha256".to_string(),
         "--data-block-size".to_string(),
-        "4096".to_string(),
+        bs.clone(),
         "--hash-block-size".to_string(),
-        "4096".to_string(),
+        bs,
         "--format".to_string(),
         "1".to_string(),
     ];
@@ -3678,6 +3726,89 @@ mod tests {
         assert!(
             !without.iter().any(|a| a == "--salt"),
             "non-AB single-slot keeps the historical random-salt invocation"
+        );
+    }
+
+    #[test]
+    fn mkfs_pins_4k_blocks_only_under_verity() {
+        // The QEMU-proven boot bug: dm-verity hashes 4K data blocks, so the
+        // root fs MUST be built with matching blocks — a 1 KiB-block ext4
+        // root fails to mount over the verity mapping ("bad block size
+        // 1024"). The shared constant's value is asserted exactly here.
+        assert_eq!(VERITY_BLOCK_SIZE, 4096);
+
+        let (tool, flags) = mkfs_flags_for("ext4", true).unwrap();
+        assert_eq!(tool, "mkfs.ext4");
+        let bs = VERITY_BLOCK_SIZE.to_string();
+        let pos = flags
+            .iter()
+            .position(|f| f == "-b")
+            .expect("verity ext4 pins -b");
+        assert_eq!(flags[pos + 1], bs, "-b takes the shared constant");
+
+        let (tool, flags) = mkfs_flags_for("ext4", false).unwrap();
+        assert_eq!(tool, "mkfs.ext4");
+        assert_eq!(
+            flags,
+            vec!["-F", "-L"],
+            "non-verity keeps the historical argv (no -b)"
+        );
+    }
+
+    #[test]
+    fn mkfs_btrfs_pins_nodesize_and_sectorsize_only_under_verity() {
+        let bs = VERITY_BLOCK_SIZE.to_string();
+        let (tool, flags) = mkfs_flags_for("btrfs", true).unwrap();
+        assert_eq!(tool, "mkfs.btrfs");
+        let n = flags
+            .iter()
+            .position(|f| f == "--nodesize")
+            .expect("verity btrfs pins --nodesize");
+        let s = flags
+            .iter()
+            .position(|f| f == "--sectorsize")
+            .expect("verity btrfs pins --sectorsize");
+        assert_eq!(flags[n + 1], bs);
+        assert_eq!(flags[s + 1], bs);
+
+        let (tool, flags) = mkfs_flags_for("btrfs", false).unwrap();
+        assert_eq!(tool, "mkfs.btrfs");
+        assert_eq!(flags, vec!["-f", "-L"], "non-verity keeps historical flags");
+    }
+
+    #[test]
+    fn mkfs_vfat_root_under_verity_fails_closed() {
+        let err = mkfs_flags_for("vfat", true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("vfat"), "error names the fs: {msg}");
+        assert!(
+            msg.to_lowercase().contains("verity"),
+            "error names the conflict: {msg}"
+        );
+        // Non-verity vfat (the ESP) keeps the historical flags.
+        let (tool, flags) = mkfs_flags_for("vfat", false).unwrap();
+        assert_eq!(tool, "mkfs.vfat");
+        assert_eq!(flags, vec!["-F", "32", "-n"]);
+    }
+
+    #[test]
+    fn verity_block_size_constant_feeds_both_arg_builders() {
+        // One constant, two consumers: the root mkfs flags and
+        // veritysetup's --data-block-size/--hash-block-size must agree or
+        // the root cannot mount over the verity device.
+        let bs = VERITY_BLOCK_SIZE.to_string();
+        let (_, flags) = mkfs_flags_for("ext4", true).unwrap();
+        assert!(flags.windows(2).any(|w| w[0] == "-b" && w[1] == bs));
+        let args = verity_format_args(None, "DATA", "HASH");
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--data-block-size" && w[1] == bs),
+            "veritysetup data blocks share the constant: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--hash-block-size" && w[1] == bs),
+            "veritysetup hash blocks share the constant: {args:?}"
         );
     }
 
