@@ -168,6 +168,48 @@ fn main() -> miette::Result<()> {
 
         Command::Runtime(sub) => cmd_runtime(sub),
 
+        Command::Push {
+            reference,
+            dir,
+            snap,
+            image,
+            tag,
+            username,
+            password_stdin,
+            insecure_http,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            cmd_push(
+                &reference,
+                &dir,
+                &snap,
+                &image,
+                tag.as_deref(),
+                username.as_deref(),
+                password_stdin,
+                insecure_http,
+            )
+        }
+
+        Command::Pull {
+            reference,
+            out_dir,
+            username,
+            password_stdin,
+            insecure_http,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            cmd_pull(
+                &reference,
+                out_dir,
+                username.as_deref(),
+                password_stdin,
+                insecure_http,
+            )
+        }
+
         Command::EvalWorker => shuttle::isolate::worker_main(),
 
         Command::CheckWorker => shuttle::isolate::check_worker_main(),
@@ -1717,6 +1759,81 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
             runtime_gc(prune, state_dir)
         }
     }
+}
+
+// ── OCI registry push/pull (Phase 25) ──
+
+/// Assemble registry credentials from the CLI flags: anonymous by
+/// default; `--username` requires `--password-stdin` (fail-closed) and
+/// the password is read as one line from stdin.
+fn registry_auth(
+    username: Option<&str>,
+    password_stdin: bool,
+) -> miette::Result<shuttle::oci::Auth> {
+    match (username, password_stdin) {
+        (Some(user), true) => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|e| miette::miette!("failed to read password from stdin: {e}"))?;
+            let password = line.trim_end_matches(['\n', '\r']).to_string();
+            if password.is_empty() {
+                miette::bail!("no password received on stdin (provide one line)");
+            }
+            Ok(shuttle::oci::Auth {
+                username: Some(user.to_string()),
+                password: Some(password),
+            })
+        }
+        (Some(_), false) => {
+            miette::bail!("--password-stdin is required with --username (no interactive prompt)")
+        }
+        (None, true) => miette::bail!("--username is required with --password-stdin"),
+        (None, false) => Ok(shuttle::oci::Auth::default()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_push(
+    reference: &str,
+    dir: &str,
+    snap: &[String],
+    image: &[String],
+    tag: Option<&str>,
+    username: Option<&str>,
+    password_stdin: bool,
+    insecure_http: bool,
+) -> miette::Result<()> {
+    let auth = registry_auth(username, password_stdin)?;
+    let reference = shuttle::oci::Reference::parse(reference)?;
+    let explicit: Vec<PathBuf> = snap.iter().chain(image).map(PathBuf::from).collect();
+    for p in &explicit {
+        if !p.exists() {
+            miette::bail!("artifact {} does not exist", p.display());
+        }
+    }
+    let plan = shuttle::oci::plan_push(Path::new(dir), &explicit, tag, &reference)?;
+    shuttle::output::info(format!(
+        "bundle {} v{} ({}) → tag '{}'",
+        plan.meta.name, plan.meta.version, plan.meta.arch, plan.tag
+    ));
+    let report = shuttle::oci::push(&reference, &plan, auth, insecure_http)?;
+    print_report(&report);
+    Ok(())
+}
+
+fn cmd_pull(
+    reference: &str,
+    out_dir: String,
+    username: Option<&str>,
+    password_stdin: bool,
+    insecure_http: bool,
+) -> miette::Result<()> {
+    let auth = registry_auth(username, password_stdin)?;
+    let reference = shuttle::oci::Reference::parse(reference)?;
+    let report = shuttle::oci::pull(&reference, Path::new(&out_dir), auth, insecure_http)?;
+    print_report(&report);
+    Ok(())
 }
 
 /// Resolve + download + verify one snap from the store (the store's

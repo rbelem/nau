@@ -255,6 +255,85 @@ pub enum Command {
         shell: clap_complete::Shell,
     },
 
+    /// Push built artifacts (`.snap`/`.img`) to an OCI registry as one
+    /// OCI image manifest bundle (Phase 25). Blobs are sha256-content-
+    /// addressed; blobs already in the registry are skipped.
+    Push {
+        /// Destination reference: [registry[:port]/]repo[:tag|@digest].
+        /// An explicit registry host is required (e.g. localhost:5000/ns/repo,
+        /// ghcr.io/owner/repo) — the docker.io implicit default is
+        /// deliberately out of scope. Pushing by @digest is an error.
+        reference: String,
+
+        /// Directory to auto-discover artifacts in (*.snap, *.img;
+        /// default: current dir, matching build/image --output)
+        #[arg(short = 'd', long, default_value = ".")]
+        dir: String,
+
+        /// Explicit artifact file(s) to push (repeatable; overrides --dir
+        /// discovery). Extension decides the layer media type.
+        #[arg(long)]
+        snap: Vec<String>,
+
+        /// Explicit disk image file(s) to push (repeatable; overrides
+        /// --dir discovery).
+        #[arg(long)]
+        image: Vec<String>,
+
+        /// Tag to push under (default: <name>-<version> derived from the
+        /// artifact file names and sanitized to the registry tag charset).
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Registry username (requires --password-stdin).
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Read the registry password from stdin (one line, no echo).
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// Talk plain http:// (no TLS) — intended for local registries
+        /// (e.g. registry:2 on localhost:5000). Refused otherwise.
+        #[arg(long)]
+        insecure_http: bool,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Pull an artifact bundle from an OCI registry: fetch the manifest,
+    /// download every blob with sha256 verification (fail-closed on any
+    /// mismatch), and write the files under their original names.
+    Pull {
+        /// Source reference: [registry[:port]/]repo[:tag|@digest]. An
+        /// explicit registry host is required. A tag or @digest is
+        /// required — there is no default tag. When pulled by @digest,
+        /// the received manifest itself is digest-verified.
+        reference: String,
+
+        /// Directory to write pulled artifact files into (default: current dir)
+        #[arg(short, long, default_value = ".")]
+        out_dir: String,
+
+        /// Registry username (requires --password-stdin).
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Read the registry password from stdin (one line, no echo).
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// Talk plain http:// (no TLS) — intended for local registries.
+        #[arg(long)]
+        insecure_http: bool,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Manage the binary package cache
     #[command(subcommand)]
     Cache(CacheCommand),
@@ -1011,6 +1090,150 @@ mod tests {
                 assert!(!all);
             }
             _ => panic!("expected Runtime Upgrade named"),
+        }
+    }
+
+    // ── OCI push/pull (Phase 25) ──
+
+    #[test]
+    fn test_push_defaults() {
+        match Cli::try_parse_from(["shuttle", "push", "localhost:5000/team/app"])
+            .unwrap()
+            .command
+        {
+            Command::Push {
+                reference,
+                dir,
+                snap,
+                image,
+                tag,
+                username,
+                password_stdin,
+                insecure_http,
+                json,
+            } => {
+                assert_eq!(reference, "localhost:5000/team/app");
+                assert_eq!(dir, ".");
+                assert!(snap.is_empty() && image.is_empty());
+                assert!(tag.is_none());
+                assert!(username.is_none());
+                assert!(!password_stdin);
+                assert!(!insecure_http);
+                assert!(!json);
+            }
+            _ => panic!("expected Push"),
+        }
+    }
+
+    #[test]
+    fn test_push_flags() {
+        match Cli::try_parse_from([
+            "shuttle",
+            "push",
+            "localhost:5000/team/app",
+            "--dir",
+            "out",
+            "--snap",
+            "a_1.0_amd64.snap",
+            "--image",
+            "b_1.0_amd64.img",
+            "--tag",
+            "v2",
+            "--username",
+            "ci",
+            "--password-stdin",
+            "--insecure-http",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Push {
+                dir,
+                snap,
+                image,
+                tag,
+                username,
+                password_stdin,
+                insecure_http,
+                json,
+                ..
+            } => {
+                assert_eq!(dir, "out");
+                assert_eq!(snap, ["a_1.0_amd64.snap"]);
+                assert_eq!(image, ["b_1.0_amd64.img"]);
+                assert_eq!(tag.as_deref(), Some("v2"));
+                assert_eq!(username.as_deref(), Some("ci"));
+                assert!(password_stdin);
+                assert!(insecure_http);
+                assert!(json);
+            }
+            _ => panic!("expected Push"),
+        }
+    }
+
+    #[test]
+    fn test_push_requires_reference() {
+        assert!(Cli::try_parse_from(["shuttle", "push"]).is_err());
+    }
+
+    #[test]
+    fn test_pull_defaults() {
+        match Cli::try_parse_from(["shuttle", "pull", "ghcr.io/owner/repo:v1"])
+            .unwrap()
+            .command
+        {
+            Command::Pull {
+                reference,
+                out_dir,
+                username,
+                password_stdin,
+                insecure_http,
+                json,
+            } => {
+                assert_eq!(reference, "ghcr.io/owner/repo:v1");
+                assert_eq!(out_dir, ".");
+                assert!(username.is_none());
+                assert!(!password_stdin);
+                assert!(!insecure_http);
+                assert!(!json);
+            }
+            _ => panic!("expected Pull"),
+        }
+    }
+
+    #[test]
+    fn test_pull_flags() {
+        match Cli::try_parse_from([
+            "shuttle",
+            "pull",
+            "localhost:5000/team/app",
+            "--out-dir",
+            "pulled",
+            "--username",
+            "ci",
+            "--password-stdin",
+            "--insecure-http",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Pull {
+                out_dir,
+                username,
+                password_stdin,
+                insecure_http,
+                json,
+                ..
+            } => {
+                assert_eq!(out_dir, "pulled");
+                assert_eq!(username.as_deref(), Some("ci"));
+                assert!(password_stdin);
+                assert!(insecure_http);
+                assert!(json);
+            }
+            _ => panic!("expected Pull"),
         }
     }
 }

@@ -2000,7 +2000,11 @@ plugs:
 
         let report = f
             .store
-            .install_batch(std::slice::from_ref(&pending), &SignatureEnvelope::default(), &tools)
+            .install_batch(
+                std::slice::from_ref(&pending),
+                &SignatureEnvelope::default(),
+                &tools,
+            )
             .unwrap();
         assert!(!report.noop);
         assert_eq!(report.generation, Some(1));
@@ -2123,7 +2127,11 @@ plugs:
             payload_path: payload,
         };
         f.store
-            .install_batch(std::slice::from_ref(&pending), &SignatureEnvelope::default(), &tools)
+            .install_batch(
+                std::slice::from_ref(&pending),
+                &SignatureEnvelope::default(),
+                &tools,
+            )
             .unwrap();
         let report = f
             .store

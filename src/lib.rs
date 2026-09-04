@@ -12,6 +12,7 @@ pub mod lint;
 pub mod lock;
 pub mod lua;
 pub mod manifest;
+pub mod oci;
 pub mod output;
 pub mod pkg_source;
 pub mod plugins;
