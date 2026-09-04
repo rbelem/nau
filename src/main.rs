@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use shuttle::cache::PackageCache;
-use shuttle::cli::{CacheCommand, Cli, Command, IndexCommand};
+use shuttle::cli::{CacheCommand, Cli, Command, IndexCommand, RuntimeCommand};
 use shuttle::image::ImageDeclaration;
 use shuttle::index::{IndexEntry, PackageIndex, StoreRef};
 use shuttle::lock::{LockFile, SourceLockEntry};
-use shuttle::snap::{PackageInput, SourceSpec};
+use shuttle::runtime::{changed_pins, PendingSnap, RuntimeStore, RuntimeTools, SignatureEnvelope};
+use shuttle::snap::{PackageInput, SnapRef, SourceSpec};
 
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
@@ -164,6 +165,8 @@ fn main() -> miette::Result<()> {
         Command::Completion { shell } => cmd_completion(shell),
 
         Command::Cache(sub) => cmd_cache(sub),
+
+        Command::Runtime(sub) => cmd_runtime(sub),
 
         Command::EvalWorker => shuttle::isolate::worker_main(),
 
@@ -1663,6 +1666,265 @@ fn cache_prune(days: u64, cache: PackageCache, force: bool) -> miette::Result<()
     } else {
         eprintln!("Nothing to prune.");
     }
+    Ok(())
+}
+
+// ── Runtime command (ADR-0012 step 5, Phase 24b) ──
+
+fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
+    match sub {
+        RuntimeCommand::Install {
+            name,
+            channel,
+            state_dir,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            runtime_install(&name, &channel, state_dir)
+        }
+        RuntimeCommand::Remove {
+            name,
+            state_dir,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            runtime_remove(&name, state_dir)
+        }
+        RuntimeCommand::Upgrade {
+            name,
+            all,
+            channel,
+            state_dir,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            runtime_upgrade(name, all, &channel, state_dir)
+        }
+        RuntimeCommand::Rollback {
+            generation,
+            state_dir,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            runtime_rollback(generation, state_dir)
+        }
+        RuntimeCommand::Gc {
+            prune,
+            state_dir,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            runtime_gc(prune, state_dir)
+        }
+    }
+}
+
+/// Resolve + download + verify one snap from the store (the store's
+/// fail-closed snap-revision assertion path is reused, never
+/// reimplemented) into the state root's downloads dir.
+fn runtime_fetch(name: &str, channel: &str, downloads: &Path) -> miette::Result<PendingSnap> {
+    let arch = shuttle::snap::host_arch();
+    let pin = SnapRef {
+        name: name.to_string(),
+        revision: None,
+        sha3_384: None,
+    };
+    let resolved = shuttle::store::StoreClient::resolve(&pin, channel, arch)?;
+    let payload = shuttle::store::StoreClient::download(&resolved, downloads)?;
+    shuttle::store::StoreClient::verify(&payload, &resolved.sha3_384)?;
+    shuttle::output::ok(format!(
+        "{name} revision {} — sha3-384 verified",
+        resolved.revision
+    ));
+    Ok(PendingSnap {
+        name: name.to_string(),
+        revision: resolved.revision,
+        sha3_384: resolved.sha3_384,
+        payload_path: payload,
+    })
+}
+
+fn print_report<T: serde::Serialize>(value: &T) {
+    if shuttle::output::is_json() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_default()
+        );
+    }
+}
+
+fn runtime_install(name: &str, channel: &str, state_dir: Option<String>) -> miette::Result<()> {
+    let store = RuntimeStore::from_state_dir(state_dir.as_deref());
+    let pending = runtime_fetch(name, channel, &store.downloads_dir())?;
+    let report = store.install_batch(
+        &[pending],
+        &SignatureEnvelope::default(),
+        &RuntimeTools::from_host(),
+    )?;
+    print_install_report(&report);
+    Ok(())
+}
+
+fn runtime_remove(name: &str, state_dir: Option<String>) -> miette::Result<()> {
+    let store = RuntimeStore::from_state_dir(state_dir.as_deref());
+    let report = store.remove(name, &RuntimeTools::from_host())?;
+    shuttle::output::ok(format!(
+        "removed {name} — generation {} active",
+        report.generation
+    ));
+    for note in &report.notes {
+        shuttle::output::info(note);
+    }
+    print_report(&report);
+    Ok(())
+}
+
+fn runtime_upgrade(
+    name: Option<String>,
+    _all: bool,
+    channel: &str,
+    state_dir: Option<String>,
+) -> miette::Result<()> {
+    let store = RuntimeStore::from_state_dir(state_dir.as_deref());
+    store.recover()?;
+    let active = active_or_err(&store)?;
+    let targets = upgrade_targets(&active, &name)?;
+    let resolved = resolve_targets(&targets, channel)?;
+    let changed = changed_pins(&resolved, &active.packages);
+    if changed.is_empty() {
+        shuttle::output::ok("everything already at its channel head — no-op, no new generation");
+        print_report(&serde_json::json!({ "noop": true, "changed": [] }));
+        return Ok(());
+    }
+    let pending = fetch_changed(&store, &changed, channel)?;
+    let report = store.install_batch(
+        &pending,
+        &SignatureEnvelope::default(),
+        &RuntimeTools::from_host(),
+    )?;
+    print_install_report(&report);
+    Ok(())
+}
+
+fn active_or_err(store: &RuntimeStore) -> miette::Result<shuttle::runtime::Generation> {
+    store
+        .active_generation()?
+        .ok_or_else(|| miette::miette!("nothing installed — no active generation to upgrade"))
+}
+
+fn fetch_changed(
+    store: &RuntimeStore,
+    changed: &[String],
+    channel: &str,
+) -> miette::Result<Vec<PendingSnap>> {
+    let mut pending = Vec::new();
+    for target in changed {
+        pending.push(runtime_fetch(target, channel, &store.downloads_dir())?);
+    }
+    Ok(pending)
+}
+
+/// `upgrade <name>` targets one installed snap; anything else (bare
+/// `upgrade` or `--all`) targets the whole installed set.
+fn upgrade_targets(
+    active: &shuttle::runtime::Generation,
+    name: &Option<String>,
+) -> miette::Result<Vec<String>> {
+    if let Some(n) = name {
+        if !active.packages.contains_key(n) {
+            return Err(miette::miette!(
+                "package '{n}' is not installed (generation {})",
+                active.n
+            ));
+        }
+        return Ok(vec![n.clone()]);
+    }
+    Ok(active.packages.keys().cloned().collect())
+}
+
+/// Re-resolve each target at its channel head (data-only until the
+/// change comparison decides whether anything downloads).
+fn resolve_targets(
+    targets: &[String],
+    channel: &str,
+) -> miette::Result<Vec<(String, u32, String)>> {
+    let arch = shuttle::snap::host_arch();
+    let mut resolved = Vec::new();
+    for target in targets {
+        let pin = SnapRef {
+            name: target.clone(),
+            revision: None,
+            sha3_384: None,
+        };
+        let r = shuttle::store::StoreClient::resolve(&pin, channel, arch)?;
+        resolved.push((target.clone(), r.revision, r.sha3_384));
+    }
+    Ok(resolved)
+}
+
+fn print_install_report(report: &shuttle::runtime::InstallReport) {
+    for note in &report.notes {
+        shuttle::output::info(note);
+    }
+    if report.noop {
+        shuttle::output::ok("already installed at this revision — no-op");
+    } else {
+        for installed in &report.installed {
+            shuttle::output::ok(format!(
+                "installed {} {} (revision {}) into generation {}",
+                installed.name,
+                installed.version,
+                installed.revision,
+                report.generation.unwrap_or(0)
+            ));
+        }
+    }
+    print_report(report);
+}
+
+fn runtime_rollback(generation: Option<u64>, state_dir: Option<String>) -> miette::Result<()> {
+    let store = RuntimeStore::from_state_dir(state_dir.as_deref());
+    let report = store.rollback(generation, &RuntimeTools::from_host())?;
+    shuttle::output::ok(format!(
+        "rolled back generation {} -> {}",
+        report.from, report.to
+    ));
+    if !report.started.is_empty() {
+        shuttle::output::info(format!("started: {}", report.started.join(", ")));
+    }
+    if !report.stopped.is_empty() {
+        shuttle::output::info(format!("stopped: {}", report.stopped.join(", ")));
+    }
+    for note in &report.notes {
+        shuttle::output::info(note);
+    }
+    print_report(&report);
+    Ok(())
+}
+
+fn runtime_gc(prune: bool, state_dir: Option<String>) -> miette::Result<()> {
+    let store = RuntimeStore::from_state_dir(state_dir.as_deref());
+    let report = store.gc(prune)?;
+    if !report.generations_removed.is_empty() {
+        shuttle::output::ok(format!(
+            "pruned generation(s): {}",
+            report
+                .generations_removed
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if report.blobs_removed == 0 {
+        shuttle::output::ok("store clean — nothing to sweep");
+    } else {
+        shuttle::output::ok(format!(
+            "swept {} blob(s), {} bytes reclaimed",
+            report.blobs_removed, report.bytes_reclaimed
+        ));
+    }
+    print_report(&report);
     Ok(())
 }
 

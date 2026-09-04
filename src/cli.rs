@@ -259,6 +259,13 @@ pub enum Command {
     #[command(subcommand)]
     Cache(CacheCommand),
 
+    /// Manage on-device installs: generations + file-level content store
+    /// (ADR-0012 step 5, Phase 24b). Operates on a state root (default
+    /// /var/lib/shuttle) holding generations/, store/ blobs, and the
+    /// `active` symlink.
+    #[command(subcommand)]
+    Runtime(RuntimeCommand),
+
     /// Internal: evaluation worker process (hidden). Re-executed by the
     /// parent to evaluate untrusted definitions in a bounded subprocess
     /// (ADR-0010 Decisions 4+5). Not part of the public CLI.
@@ -307,6 +314,110 @@ pub enum CacheCommand {
         /// Skip confirmation prompt
         #[arg(long, default_value_t = false)]
         force: bool,
+    },
+}
+
+/// Subcommands for `shuttle runtime` (ADR-0012 step 5, Phase 24b):
+/// on-device install/remove/upgrade/rollback/gc over generations.
+#[derive(clap::Subcommand)]
+pub enum RuntimeCommand {
+    /// Install a snap on-device: resolve, download, verify, unpack into
+    /// the content store, and activate a new generation (sysext tree +
+    /// unit reconciliation).
+    Install {
+        /// Snap name to install
+        name: String,
+
+        /// Snap channel to resolve from (default: latest/stable)
+        #[arg(long, default_value = "latest/stable")]
+        channel: String,
+
+        /// State root for generations + content store
+        /// (default: /var/lib/shuttle)
+        #[arg(long)]
+        state_dir: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove an installed snap: activate a new generation without it,
+    /// stop/disable its units, and unlink its sysext tree (best-effort).
+    Remove {
+        /// Snap name to remove
+        name: String,
+
+        /// State root for generations + content store
+        /// (default: /var/lib/shuttle)
+        #[arg(long)]
+        state_dir: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Upgrade installed snaps to their channel head. Only snaps whose
+    /// resolved revision changed produce a new generation — no changes
+    /// is a noted no-op.
+    Upgrade {
+        /// Snap name to upgrade (default: all installed snaps)
+        name: Option<String>,
+
+        /// Upgrade every installed snap
+        #[arg(long)]
+        all: bool,
+
+        /// Snap channel to resolve from (default: latest/stable)
+        #[arg(long, default_value = "latest/stable")]
+        channel: String,
+
+        /// State root for generations + content store
+        /// (default: /var/lib/shuttle)
+        #[arg(long)]
+        state_dir: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Roll back to a previous generation (default: the one before the
+    /// active one): flips the `active` symlink, relinks sysext trees,
+    /// and reconciles daemon units.
+    Rollback {
+        /// Generation number to roll back to (default: previous)
+        generation: Option<u64>,
+
+        /// State root for generations + content store
+        /// (default: /var/lib/shuttle)
+        #[arg(long)]
+        state_dir: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Garbage-collect the content store (mark-sweep over every
+    /// generation manifest). Default keeps every generation; --prune
+    /// additionally drops all but the active and previous generations
+    /// before the sweep.
+    Gc {
+        /// Also drop all generations except active + previous before
+        /// sweeping unreferenced blobs.
+        #[arg(long)]
+        prune: bool,
+
+        /// State root for generations + content store
+        /// (default: /var/lib/shuttle)
+        #[arg(long)]
+        state_dir: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -786,6 +897,120 @@ mod tests {
                 assert!(force);
             }
             _ => panic!("expected Cache Prune"),
+        }
+    }
+
+    #[test]
+    fn test_runtime_install_defaults() {
+        match Cli::try_parse_from(["shuttle", "runtime", "install", "hello"])
+            .unwrap()
+            .command
+        {
+            Command::Runtime(RuntimeCommand::Install {
+                name,
+                channel,
+                state_dir,
+                json,
+            }) => {
+                assert_eq!(name, "hello");
+                assert_eq!(channel, "latest/stable");
+                assert_eq!(state_dir, None);
+                assert!(!json);
+            }
+            _ => panic!("expected Runtime Install"),
+        }
+    }
+
+    #[test]
+    fn test_runtime_install_flags() {
+        match Cli::try_parse_from([
+            "shuttle",
+            "runtime",
+            "install",
+            "hello",
+            "--channel",
+            "latest/edge",
+            "--state-dir",
+            "/tmp/state",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Runtime(RuntimeCommand::Install {
+                channel,
+                state_dir,
+                json,
+                ..
+            }) => {
+                assert_eq!(channel, "latest/edge");
+                assert_eq!(state_dir.as_deref(), Some("/tmp/state"));
+                assert!(json);
+            }
+            _ => panic!("expected Runtime Install"),
+        }
+    }
+
+    #[test]
+    fn test_runtime_remove_and_rollback_and_gc() {
+        match Cli::try_parse_from(["shuttle", "runtime", "remove", "hello", "--json"])
+            .unwrap()
+            .command
+        {
+            Command::Runtime(RuntimeCommand::Remove { name, json, .. }) => {
+                assert_eq!(name, "hello");
+                assert!(json);
+            }
+            _ => panic!("expected Runtime Remove"),
+        }
+        match Cli::try_parse_from(["shuttle", "runtime", "rollback", "3"])
+            .unwrap()
+            .command
+        {
+            Command::Runtime(RuntimeCommand::Rollback { generation, .. }) => {
+                assert_eq!(generation, Some(3));
+            }
+            _ => panic!("expected Runtime Rollback"),
+        }
+        match Cli::try_parse_from(["shuttle", "runtime", "rollback"])
+            .unwrap()
+            .command
+        {
+            Command::Runtime(RuntimeCommand::Rollback { generation, .. }) => {
+                assert_eq!(generation, None);
+            }
+            _ => panic!("expected Runtime Rollback default"),
+        }
+        match Cli::try_parse_from(["shuttle", "runtime", "gc", "--prune"])
+            .unwrap()
+            .command
+        {
+            Command::Runtime(RuntimeCommand::Gc { prune, .. }) => assert!(prune),
+            _ => panic!("expected Runtime Gc"),
+        }
+    }
+
+    #[test]
+    fn test_runtime_upgrade_all() {
+        match Cli::try_parse_from(["shuttle", "runtime", "upgrade", "--all"])
+            .unwrap()
+            .command
+        {
+            Command::Runtime(RuntimeCommand::Upgrade { name, all, .. }) => {
+                assert_eq!(name, None);
+                assert!(all);
+            }
+            _ => panic!("expected Runtime Upgrade"),
+        }
+        match Cli::try_parse_from(["shuttle", "runtime", "upgrade", "hello"])
+            .unwrap()
+            .command
+        {
+            Command::Runtime(RuntimeCommand::Upgrade { name, all, .. }) => {
+                assert_eq!(name.as_deref(), Some("hello"));
+                assert!(!all);
+            }
+            _ => panic!("expected Runtime Upgrade named"),
         }
     }
 }

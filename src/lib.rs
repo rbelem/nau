@@ -15,6 +15,7 @@ pub mod manifest;
 pub mod output;
 pub mod pkg_source;
 pub mod plugins;
+pub mod runtime;
 pub mod sign;
 pub mod snap;
 pub mod store;
