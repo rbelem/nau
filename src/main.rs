@@ -1240,6 +1240,20 @@ fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
     }
     let ok = checked.as_ref().is_some_and(|c| c.error.is_none()) && diagnostics.is_empty();
 
+    // ADR-0011 step (g): the confinement lint over the evaluated outputs
+    // (Rust-side stage 2, never the Lua analyzer). WARNING severity — the
+    // lint NEVER adds a failure mode: `ok` above is computed before it
+    // runs, and its findings travel a separate channel (warn output /
+    // `"lint"` JSON array), never the diagnostics list.
+    let lint: Vec<shuttle::lint::LintWarning> = checked
+        .as_ref()
+        .filter(|c| c.error.is_none())
+        .map(|c| shuttle::lint::confinement_lint(&c.outputs))
+        .unwrap_or_default();
+    for w in &lint {
+        shuttle::output::warn(&w.message);
+    }
+
     let outputs: Vec<(String, String)> = checked
         .as_ref()
         .map(|c| {
@@ -1257,7 +1271,7 @@ fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
 
     if json {
         let names: Vec<String> = outputs.iter().map(|(n, _)| n.clone()).collect();
-        report_check_json(file, &names, &diagnostics);
+        report_check_json(file, &names, &diagnostics, &lint);
     } else if ok {
         report_check_ok(&outputs);
     } else {
@@ -1274,11 +1288,13 @@ fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
 
 /// `--json` report: every diagnostic is self-contained — one optional nested
 /// `"span"` object (per-diagnostic span fields, not a top-level `"spans"`
-/// array).
+/// array). `"lint"` carries the confinement lint warnings (step (g)) —
+/// warnings, never failures; they never appear in `"diagnostics"`.
 fn report_check_json(
     file: &str,
     outputs: &[String],
     diagnostics: &[shuttle::lua::CheckDiagnostic],
+    lint: &[shuttle::lint::LintWarning],
 ) {
     let diags: Vec<serde_json::Value> = diagnostics
         .iter()
@@ -1298,11 +1314,21 @@ fn report_check_json(
             })
         })
         .collect();
+    let lint_json: Vec<serde_json::Value> = lint
+        .iter()
+        .map(|w| {
+            serde_json::json!({
+                "key": w.key,
+                "message": w.message,
+            })
+        })
+        .collect();
     let report = serde_json::json!({
         "file": file,
         "ok": diagnostics.is_empty(),
         "outputs": outputs,
         "diagnostics": diags,
+        "lint": lint_json,
     });
     println!(
         "{}",

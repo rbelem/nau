@@ -840,6 +840,14 @@ pub fn build_disk_image(
         );
     }
 
+    // 5e. ADR-0011 step (f), Phase 24a: app execution — materialize the
+    // command binaries of shoot-built app snaps into /usr/bin/<snap>-<app>
+    // and emit hardened systemd units (plus enablement) for
+    // daemon-bearing apps. Written here, after payload staging and BEFORE
+    // root populate + dm-verity: binaries and units must be inside the
+    // hashed tree — the same write-before-hash constraint as the manifest.
+    crate::units::emit_app_runtime(&snap_paths, cache_dir, &root, has_unsquashfs)?;
+
     // 6. ADR-0011 step (c) pre-flight — kernel images need ukify, the
     // sd-stub, and veritysetup; fail closed BEFORE any destructive step
     // (dd/parted/mkfs), so an unbootable or unverifiable image is never
