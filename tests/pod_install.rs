@@ -11,7 +11,15 @@
 //! The tests gate on the external toolchain the chain needs
 //! (mksquashfs/unsquashfs/curl/tar), same skip pattern as the runtime
 //! store tests in `src/runtime.rs`.
+//!
+//! Issue #5 adds: `update` moves constrained packages to the newest
+//! matching versions (repin + generation bump, held when the candidate
+//! moves past the constraint); `rollback` flips ONLY the pod's
+//! `current` link and farm (system state untouched); `gc --prune`
+//! drops unreferenced pod generations and frees their exclusive blobs
+//! while live generations keep theirs.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -135,13 +143,31 @@ fn write_pkg(
     port: u16,
     tarball: &str,
 ) {
+    write_pkg_version(project, name, app, bin, "1.0", marker, port, tarball);
+}
+
+/// [`write_pkg`] with an explicit declared version — the version feeds
+/// meta/snap.yaml inside the payload, so a version move changes the
+/// payload's content identity (which is what the no-op detector
+/// compares).
+#[allow(clippy::too_many_arguments)]
+fn write_pkg_version(
+    project: &Path,
+    name: &str,
+    app: &str,
+    bin: &str,
+    version: &str,
+    marker: &str,
+    port: u16,
+    tarball: &str,
+) {
     let letter = name.chars().next().unwrap().to_ascii_lowercase();
     let dir = project.join("pkgs").join(letter.to_string());
     std::fs::create_dir_all(&dir).unwrap();
     let lua = format!(
         r#"return {{ default = snap {{
     name = "{name}",
-    version = "1.0",
+    version = "{version}",
     source = "http://127.0.0.1:{port}/{tarball}",
     build = "mkdir -p $STAGE/bin && echo '#!/bin/sh' > $STAGE/bin/{bin} && echo 'echo {marker}' >> $STAGE/bin/{bin} && chmod +x $STAGE/bin/{bin}",
     apps = {{ {app} = {{ command = "bin/{bin}" }} }},
@@ -569,3 +595,448 @@ gated_test!(degraded_mode_without_squashfs_tools_installs_nothing, {
         "nothing exposed"
     );
 });
+
+// ── Issue #5: update ──
+
+/// The version a package is pinned at in the pod's lockfile.
+fn lock_pin(root: &Path, pod: &str, name: &str) -> Option<String> {
+    let lock: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(pod_dir(root, pod).join("shuttle.lock")).unwrap(),
+    )
+    .unwrap();
+    lock["packages"][name]["version"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Run the farm entry `name` and return its stdout (the fixture
+/// binaries echo their marker).
+fn farm_output(farm: &Path, name: &str) -> String {
+    let out = Command::new(farm.join(name))
+        .output()
+        .expect("run farm binary");
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+gated_test!(
+    update_moves_constrained_package_to_newest_matching_version,
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let port = serve_dir(server.path());
+        make_tarball(server.path(), "tool");
+        // The package collection says 14.1; the pod declares `tool@14`.
+        write_pkg_version(
+            project.path(),
+            "tool",
+            "tool",
+            "tool",
+            "14.1",
+            "tool-14.1-ran",
+            port,
+            "tool.tar.gz",
+        );
+
+        let (code, _, stderr) = run(project.path(), root.path(), &["add", "tool@14"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert_eq!(current_generation(root.path(), "default"), 1);
+        assert_eq!(
+            lock_pin(root.path(), "default", "tool").as_deref(),
+            Some("14.1")
+        );
+        assert_eq!(
+            farm_output(&current_farm(root.path(), "default"), "tool"),
+            "tool-14.1-ran"
+        );
+
+        // Upstream moves: the package collection now says 14.4 — still a
+        // 14.x, so `update` must adopt it (newest 14.x), repin, and bump.
+        write_pkg_version(
+            project.path(),
+            "tool",
+            "tool",
+            "tool",
+            "14.4",
+            "tool-14.4-ran",
+            port,
+            "tool.tar.gz",
+        );
+
+        let (code, _, stderr) = run(project.path(), root.path(), &["update", "tool"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(
+            stderr.contains("updated 'tool'") && stderr.contains("14.1") && stderr.contains("14.4"),
+            "update must report the version move: {stderr}"
+        );
+        assert_eq!(
+            generation_count(root.path(), "default"),
+            2,
+            "update must bump the generation"
+        );
+        assert_eq!(current_generation(root.path(), "default"), 2);
+        assert_eq!(
+            lock_pin(root.path(), "default", "tool").as_deref(),
+            Some("14.4")
+        );
+        assert_eq!(
+            farm_output(&current_farm(root.path(), "default"), "tool"),
+            "tool-14.4-ran",
+            "farm must follow the newer content"
+        );
+    }
+);
+
+gated_test!(update_holds_when_newest_candidate_breaks_constraint, {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "tool");
+    write_pkg_version(
+        project.path(),
+        "tool",
+        "tool",
+        "tool",
+        "14.1",
+        "tool-14.1-ran",
+        port,
+        "tool.tar.gz",
+    );
+    let (code, _, stderr) = run(project.path(), root.path(), &["add", "tool@14"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    // Upstream jumps the major: 15.0 is NOT a 14.x — `pkg@14` holds.
+    write_pkg_version(
+        project.path(),
+        "tool",
+        "tool",
+        "tool",
+        "15.0",
+        "tool-15-ran",
+        port,
+        "tool.tar.gz",
+    );
+    let (code, _, stderr) = run(project.path(), root.path(), &["update"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("held 'tool'") && stderr.contains("14"),
+        "update must report the held package: {stderr}"
+    );
+    assert_eq!(
+        generation_count(root.path(), "default"),
+        1,
+        "a held package must not bump the generation"
+    );
+    assert_eq!(
+        lock_pin(root.path(), "default", "tool").as_deref(),
+        Some("14.1")
+    );
+    assert_eq!(
+        farm_output(&current_farm(root.path(), "default"), "tool"),
+        "tool-14.1-ran",
+        "held package keeps its installed content"
+    );
+});
+
+gated_test!(update_bare_spec_moves_to_newest_and_noops_when_current, {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "tool");
+    write_pkg_version(
+        project.path(),
+        "tool",
+        "tool",
+        "tool",
+        "14.1",
+        "tool-14.1-ran",
+        port,
+        "tool.tar.gz",
+    );
+    let (code, _, stderr) = run(project.path(), root.path(), &["add", "tool"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    // Bare spec = newest available: 15.0 is adopted with no constraint.
+    write_pkg_version(
+        project.path(),
+        "tool",
+        "tool",
+        "tool",
+        "15.0",
+        "tool-15-ran",
+        port,
+        "tool.tar.gz",
+    );
+    let (code, _, stderr) = run(project.path(), root.path(), &["update"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("updated 'tool'"), "stderr: {stderr}");
+    assert_eq!(generation_count(root.path(), "default"), 2);
+    assert_eq!(
+        lock_pin(root.path(), "default", "tool").as_deref(),
+        Some("15.0")
+    );
+    assert_eq!(
+        farm_output(&current_farm(root.path(), "default"), "tool"),
+        "tool-15-ran"
+    );
+
+    // Already current → a no-op with no new generation.
+    let (code, _, stderr) = run(project.path(), root.path(), &["update"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("no new generation"),
+        "already-current update must report its no-op: {stderr}"
+    );
+    assert_eq!(generation_count(root.path(), "default"), 2);
+    assert_eq!(current_generation(root.path(), "default"), 2);
+});
+
+// ── Issue #5: rollback ──
+
+/// Recursively snapshot a directory tree: rel path → kind + content /
+/// symlink target. Used to prove a directory was untouched.
+fn snapshot_tree(path: &Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    fn walk(path: &Path, base: &Path, out: &mut BTreeMap<String, String>) {
+        let rel = path
+            .strip_prefix(base)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if path.is_symlink() {
+            out.insert(
+                rel,
+                format!("link:{}", std::fs::read_link(path).unwrap().display()),
+            );
+            return;
+        }
+        if path.is_dir() {
+            out.insert(rel, "dir".to_string());
+            for entry in std::fs::read_dir(path).unwrap().filter_map(|e| e.ok()) {
+                walk(&entry.path(), base, out);
+            }
+        } else {
+            out.insert(rel, format!("file:{}", std::fs::read(path).unwrap().len()));
+        }
+    }
+    walk(path, path, &mut out);
+    out
+}
+
+gated_test!(
+    rollback_flips_current_and_farm_leaving_system_state_untouched,
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let port = serve_dir(server.path());
+        make_tarball(server.path(), "hello");
+        make_tarball(server.path(), "other");
+        write_pkg(
+            project.path(),
+            "hello",
+            "hello",
+            "hello",
+            "pod-hello-ran",
+            port,
+            "hello.tar.gz",
+        );
+        write_pkg(
+            project.path(),
+            "other",
+            "otool",
+            "otool",
+            "pod-other-ran",
+            port,
+            "other.tar.gz",
+        );
+
+        let (code, _, stderr) = run(project.path(), root.path(), &["add", "hello"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        let (code, _, stderr) = run(project.path(), root.path(), &["add", "other"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert_eq!(current_generation(root.path(), "default"), 2);
+        let farm2 = current_farm(root.path(), "default");
+        assert!(farm2.join("hello").exists() && farm2.join("otool").exists());
+
+        // A fake system state root: generations, a store blob, and the
+        // `active` link. The pod must never touch it.
+        let system = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(system.path().join("generations/1")).unwrap();
+        std::fs::write(system.path().join("generations/1/manifest.json"), "{}").unwrap();
+        std::fs::create_dir_all(system.path().join("store/aa")).unwrap();
+        std::fs::write(system.path().join("store/aa/systemblob"), b"system").unwrap();
+        std::os::unix::fs::symlink("generations/1", system.path().join("active")).unwrap();
+        let system_before = snapshot_tree(system.path());
+
+        // Roll back: the pod's `current` flips to the previous generation.
+        let (code, _, stderr) = run(project.path(), root.path(), &["rollback"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(
+            stderr.contains("2 -> 1"),
+            "rollback must report the flip: {stderr}"
+        );
+        assert_eq!(
+            generation_count(root.path(), "default"),
+            2,
+            "rollback must not create generations"
+        );
+        assert_eq!(current_generation(root.path(), "default"), 1);
+
+        // The farm follows: the newer generation's `otool` disappears.
+        let farm1 = current_farm(root.path(), "default");
+        assert!(
+            !farm1.join("otool").exists(),
+            "binaries the newer generation added must be withdrawn"
+        );
+        assert!(farm1.join("hello").exists());
+        assert_eq!(
+            farm_output(&farm1, "hello"),
+            "pod-hello-ran",
+            "the rolled-back binary still executes"
+        );
+
+        // The pod's store `active` link flipped with `current` (they move
+        // together), and the system state is byte-for-byte untouched.
+        let active_target =
+            std::fs::read_link(pod_dir(root.path(), "default").join("active")).unwrap();
+        assert_eq!(active_target, Path::new("generations/1"));
+        assert_eq!(
+            snapshot_tree(system.path()),
+            system_before,
+            "bootable system state must be untouched by a pod rollback"
+        );
+    }
+);
+
+// ── Issue #5: gc ──
+
+/// The store blob hash of one app binary in a generation's manifest.
+fn manifest_apps_blob(root: &Path, pod: &str, gen: u64, pkg: &str, app: &str) -> String {
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            pod_dir(root, pod)
+                .join("generations")
+                .join(gen.to_string())
+                .join("manifest.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    manifest["packages"][pkg]["apps"][app]
+        .as_str()
+        .expect("manifest must record the app's store content")
+        .to_string()
+}
+
+fn blob_path(root: &Path, pod: &str, hash: &str) -> PathBuf {
+    pod_dir(root, pod).join("store").join(&hash[..2]).join(hash)
+}
+
+gated_test!(
+    gc_prunes_unreferenced_generations_and_frees_exclusive_blobs,
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let port = serve_dir(server.path());
+        make_tarball(server.path(), "hello");
+        make_tarball(server.path(), "other");
+        write_pkg(
+            project.path(),
+            "hello",
+            "hello",
+            "hello",
+            "pod-hello-ran",
+            port,
+            "hello.tar.gz",
+        );
+        write_pkg(
+            project.path(),
+            "other",
+            "otool",
+            "otool",
+            "pod-other-ran",
+            port,
+            "other.tar.gz",
+        );
+
+        // gen1: hello. gen2: hello+other. gen3: other (hello removed).
+        // gen4: other + hello rebuilt with NEW content (re-added at a new
+        // version) — so the old hello binary blob is exclusive to the
+        // generations GC will prune.
+        let (code, _, stderr) = run(project.path(), root.path(), &["add", "hello"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        let (code, _, stderr) = run(project.path(), root.path(), &["add", "other"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        let (code, _, stderr) = run(project.path(), root.path(), &["remove", "hello"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        write_pkg_version(
+            project.path(),
+            "hello",
+            "hello",
+            "hello",
+            "14.2",
+            "pod-hello-2-ran",
+            port,
+            "hello.tar.gz",
+        );
+        let (code, _, stderr) = run(project.path(), root.path(), &["add", "hello@14"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert_eq!(generation_count(root.path(), "default"), 4);
+
+        // The old hello binary blob: exclusive to gens 1+2 (pruned).
+        let old_blob = manifest_apps_blob(root.path(), "default", 1, "hello", "hello");
+        // The new hello + other blobs: referenced by live gens 3+4.
+        let new_blob = manifest_apps_blob(root.path(), "default", 4, "hello", "hello");
+        let other_blob = manifest_apps_blob(root.path(), "default", 3, "other", "otool");
+        assert_ne!(old_blob, new_blob, "fixture must produce distinct content");
+        assert!(blob_path(root.path(), "default", &old_blob).exists());
+        assert!(blob_path(root.path(), "default", &new_blob).exists());
+        assert!(blob_path(root.path(), "default", &other_blob).exists());
+
+        // GC without --prune sweeps nothing: every blob is still
+        // referenced by some generation manifest.
+        let (code, _, stderr) = run(project.path(), root.path(), &["gc"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert_eq!(generation_count(root.path(), "default"), 4);
+        assert!(
+            blob_path(root.path(), "default", &old_blob).exists(),
+            "no-prune gc must keep referenced blobs"
+        );
+
+        // --prune drops gens 1+2 (beyond current + previous); the old
+        // hello blob — exclusive to the pruned set — sweeps free, while
+        // blobs of the live generations survive. Farm/current untouched.
+        let (code, _, stderr) = run(project.path(), root.path(), &["gc", "--prune"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(
+            stderr.contains("pruned generation(s): 1, 2"),
+            "gc --prune must report the pruned generations: {stderr}"
+        );
+        assert_eq!(
+            generation_count(root.path(), "default"),
+            2,
+            "current + previous survive"
+        );
+        assert_eq!(current_generation(root.path(), "default"), 4);
+        let farm = current_farm(root.path(), "default");
+        assert!(farm.join("hello").exists(), "live content stays exposed");
+        assert!(farm.join("otool").exists());
+        assert!(
+            !blob_path(root.path(), "default", &old_blob).exists(),
+            "exclusive blobs of the pruned generations must be freed: {old_blob}"
+        );
+        assert!(
+            blob_path(root.path(), "default", &new_blob).exists(),
+            "live content must survive"
+        );
+        assert!(
+            blob_path(root.path(), "default", &other_blob).exists(),
+            "blobs shared with live generations must survive"
+        );
+    }
+);

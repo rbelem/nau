@@ -1824,7 +1824,89 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             }
             Ok(())
         }
+        PodCommand::Update { packages, root } => {
+            let root = shuttle::pod::pod_root(root.as_deref());
+            let report = shuttle::pod::update_pod(&root, pod_name, &packages)?;
+            print_pod_update_report(&report);
+            Ok(())
+        }
+        PodCommand::Rollback { generation, root } => cmd_pod_rollback(pod_name, generation, root),
+        PodCommand::Gc { prune, root } => cmd_pod_gc(pod_name, prune, root),
     }
+}
+
+/// Report the update outcome for `shuttle pod update`: a no-op says so,
+/// updates name the version moves, held packages explain their
+/// constraint, and the current generation closes the story.
+fn print_pod_update_report(report: &shuttle::pod::PodUpdateReport) {
+    if report.updated.is_empty() && report.held.is_empty() {
+        shuttle::output::ok(format!(
+            "pod '{}' is already at its newest matching versions — no new generation",
+            report.pod
+        ));
+    }
+    for entry in &report.updated {
+        let from = entry.from.as_deref().unwrap_or("(unpinned)");
+        shuttle::output::ok(format!("updated '{}' {} -> {}", entry.name, from, entry.to));
+    }
+    for held in &report.held {
+        let pinned = held.pinned.as_deref().unwrap_or("(unpinned)");
+        shuttle::output::warn(format!(
+            "held '{}' at {} (constraint @{:?}: newest available {} does not match)",
+            held.name, pinned, held.constraint, held.candidate
+        ));
+    }
+    if let Some(n) = report.generation {
+        shuttle::output::info(format!("generation {n} current"));
+    }
+    print_report(report);
+}
+
+/// `shuttle pod rollback`: report the flip (from → to) and the farm now
+/// behind the pod's `current` link.
+fn cmd_pod_rollback(
+    pod_name: &str,
+    generation: Option<u64>,
+    root: Option<String>,
+) -> miette::Result<()> {
+    let root = shuttle::pod::pod_root(root.as_deref());
+    let report = shuttle::pod::rollback_pod(&root, pod_name, generation)?;
+    shuttle::output::ok(format!(
+        "pod '{}' rolled back generation {} -> {}",
+        report.pod, report.from, report.to
+    ));
+    if let Some(farm) = &report.farm {
+        shuttle::output::info(format!("farm: {}", farm.display()));
+    }
+    print_report(&report);
+    Ok(())
+}
+
+/// `shuttle pod gc`: report pruned generations and swept blobs.
+fn cmd_pod_gc(pod_name: &str, prune: bool, root: Option<String>) -> miette::Result<()> {
+    let root = shuttle::pod::pod_root(root.as_deref());
+    let report = shuttle::pod::gc_pod(&root, pod_name, prune)?;
+    if !report.generations_removed.is_empty() {
+        shuttle::output::ok(format!(
+            "pruned generation(s): {}",
+            report
+                .generations_removed
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if report.blobs_removed == 0 {
+        shuttle::output::ok("pod store clean — nothing to sweep");
+    } else {
+        shuttle::output::ok(format!(
+            "swept {} blob(s), {} bytes reclaimed",
+            report.blobs_removed, report.bytes_reclaimed
+        ));
+    }
+    print_report(&report);
+    Ok(())
 }
 
 /// Report the reconcile outcome for `shuttle pod sync`: a no-op says

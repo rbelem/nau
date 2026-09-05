@@ -376,11 +376,12 @@ pub enum Command {
     Runtime(RuntimeCommand),
 
     /// Manage user-level pods (CONTEXT.md: Pod). `shuttle pod [--name <n>]
-    /// <verb>`: imperative edits to one pod's declaration + lockfile pins.
+    /// <verb>`: imperative edits to one pod's declaration + lockfile pins,
+    /// reconciled into that pod's store, generation chain, and bin farm.
     /// `--name` selects the pod (default: `default`) and must appear before
     /// the verb; `add` initializes an unknown pod, read verbs fail on
-    /// unknown pods. No builds, binaries, or generations yet — later
-    /// tickets.
+    /// unknown pods. Rollback and GC are pod-scoped — system generations
+    /// are never touched.
     Pod {
         /// Pod to operate on (default: `default`). Belongs to the `pod`
         /// command itself, so it goes before the verb:
@@ -592,6 +593,50 @@ pub enum PodCommand {
 
     /// List the selected pod's packages with their resolved versions.
     List {
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
+    },
+
+    /// Update the selected pod's packages to the newest versions
+    /// matching their constraints (`pkg@14` = newest 14.x, bare `pkg` =
+    /// newest available): repins the lockfile, rebuilds only what
+    /// changed, and bumps the generation. A no-op when every package is
+    /// already at its newest matching version; constrained packages
+    /// whose newest candidate no longer matches are held at their pin.
+    Update {
+        /// Package names to update (default: all declared packages).
+        packages: Vec<String>,
+
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
+    },
+
+    /// Roll the selected pod back to a previous generation (default:
+    /// the one before the current): flips that pod's `current` link
+    /// only — never reboots, never touches system generations. Binaries
+    /// the newer generation added disappear from the farm.
+    Rollback {
+        /// Generation number to roll back to (default: previous).
+        generation: Option<u64>,
+
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
+    },
+
+    /// Garbage-collect the selected pod's content store: mark-sweep
+    /// over every pod generation manifest. `--prune` additionally drops
+    /// all but the pod's current + previous generations before
+    /// sweeping, freeing their exclusive blobs (live generations keep
+    /// theirs). System generations are never eligible.
+    Gc {
+        /// Also drop all pod generations except current + previous
+        /// before sweeping unreferenced blobs.
+        #[arg(long)]
+        prune: bool,
+
         /// Pod state root (see `pod add --root`).
         #[arg(long)]
         root: Option<String>,

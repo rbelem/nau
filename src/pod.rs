@@ -15,6 +15,17 @@
 //! `current` link flipped after every mutation; `shuttle pod sync`
 //! re-runs the whole reconcile (hand-edited `pod.lua` included) and is a
 //! no-op — no new generation — when nothing changed.
+//!
+//! Issue #5: pods move forward deliberately and backward safely.
+//! `shuttle pod update` re-resolves every declared package to the newest
+//! version matching its constraint, repins the lockfile, and reconciles
+//! (only what changed is rebuilt — content identity is the no-op
+//! detector). `shuttle pod rollback` flips ONLY that pod's `current`
+//! link to a previous generation through the store's rollback machinery
+//! (system generations are never touched); the farm follows, so binaries
+//! the newer generation added disappear. `shuttle pod gc [--prune]`
+//! reuses the store's mark-sweep: unreferenced pod generations are
+//! pruned and their exclusive blobs freed, live generations keep theirs.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -623,6 +634,282 @@ pub fn remove_package(
     })
 }
 
+// ── Update (issue #5) ──
+
+/// One package moved by `pod update`.
+#[derive(Debug, Serialize)]
+pub struct PodUpdateEntry {
+    pub name: String,
+    /// The version the package was pinned at before the update (None
+    /// when it had no pin yet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The version the package is now pinned at.
+    pub to: String,
+}
+
+/// One package `pod update` held back: its constraint no longer matches
+/// the newest available version, so the pin stays put.
+#[derive(Debug, Serialize)]
+pub struct PodUpdateHeld {
+    pub name: String,
+    /// The version the package stays pinned at (None when unpinned).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<String>,
+    /// The candidate version that was rejected by the constraint.
+    pub candidate: String,
+    /// The constraint that rejected it.
+    pub constraint: String,
+}
+
+/// Report for `shuttle pod update`.
+#[derive(Debug, Serialize)]
+pub struct PodUpdateReport {
+    pub pod: String,
+    /// Packages re-pinned at a newer matching version.
+    pub updated: Vec<PodUpdateEntry>,
+    /// Packages held back: newest candidate fails their constraint.
+    pub held: Vec<PodUpdateHeld>,
+    /// Packages already at their newest matching version.
+    pub unchanged: Vec<String>,
+    /// The generation now current (absent under the degraded
+    /// no-squashfs mode or when nothing moved).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
+/// True when `version` satisfies a dotted-numeric `constraint`: every
+/// constraint component must equal the version's corresponding
+/// component (`14` matches `14` and `14.x.y`; `1.2` matches `1.2.9`;
+/// `15` does not match `14.x`). Non-numeric components compare as
+/// exact strings.
+pub fn version_matches_constraint(version: &str, constraint: &str) -> bool {
+    let vc: Vec<&str> = version.split('.').collect();
+    let cc: Vec<&str> = constraint.split('.').collect();
+    if cc.len() > vc.len() {
+        return false;
+    }
+    for (c, v) in cc.iter().zip(vc.iter()) {
+        let matched = match (c.parse::<u64>(), v.parse::<u64>()) {
+            (Ok(cn), Ok(vn)) => cn == vn,
+            _ => *c == *v,
+        };
+        if !matched {
+            return false;
+        }
+    }
+    true
+}
+
+/// Update a pod's packages to the newest versions matching their
+/// constraints: re-resolve each declared package (all of them, or only
+/// the named ones), repin the lockfile for every version that moved,
+/// then reconcile — the store, farm, and generation follow the pins.
+/// Constraint-honoring: `pkg@14` adopts the candidate only while it is
+/// a 14.x; otherwise the package is held at its pin.
+pub fn update_pod(
+    root: &Path,
+    pod_name: &str,
+    targets: &[String],
+) -> miette::Result<PodUpdateReport> {
+    validate_pod_name(pod_name)?;
+    let decl = load_declaration(root, pod_name)?;
+
+    // An explicit target set must name declared packages (a trailing
+    // `@constraint` on the CLI argument is ignored, like `remove`).
+    let wanted: Option<std::collections::BTreeSet<String>> = if targets.is_empty() {
+        None
+    } else {
+        let mut set = std::collections::BTreeSet::new();
+        for target in targets {
+            let name = parse_pod_package(target)?.name;
+            let declared = decl
+                .packages
+                .iter()
+                .any(|spec| parse_pod_package(spec).is_ok_and(|s| s.name == name));
+            if !declared {
+                miette::bail!("package '{name}' is not in pod '{pod_name}'");
+            }
+            set.insert(name);
+        }
+        Some(set)
+    };
+
+    // Resolution outcome for one package, decided BEFORE any state is
+    // touched (an unresolvable declared package fails the whole update
+    // with nothing repinned).
+    enum Move {
+        Updated {
+            name: String,
+            from: Option<String>,
+            to: String,
+            constraint: Option<String>,
+        },
+        Held {
+            name: String,
+            pinned: Option<String>,
+            candidate: String,
+            constraint: String,
+        },
+        Unchanged(String),
+    }
+
+    let lock_path = pod_lock_path(root, pod_name);
+    let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    let mut moves = Vec::new();
+    for spec_str in &decl.packages {
+        let spec = parse_pod_package(spec_str)?;
+        if let Some(wanted) = &wanted {
+            if !wanted.contains(&spec.name) {
+                continue;
+            }
+        }
+        let candidate = crate::deps::load_meta(&spec.name)
+            .map_err(|e| miette::miette!("cannot update '{}': {e}", spec.name))?
+            .version;
+        let pin = lock.packages.get(&spec.name).map(|e| e.version.clone());
+        match (&spec.constraint, pin.as_deref()) {
+            (Some(constraint), _) if !version_matches_constraint(&candidate, constraint) => {
+                moves.push(Move::Held {
+                    name: spec.name,
+                    pinned: pin,
+                    candidate,
+                    constraint: constraint.clone(),
+                });
+            }
+            (_, Some(pinned)) if pinned == candidate => moves.push(Move::Unchanged(spec.name)),
+            (constraint, _) => moves.push(Move::Updated {
+                name: spec.name,
+                from: pin,
+                to: candidate,
+                constraint: constraint.clone(),
+            }),
+        }
+    }
+
+    // Repin what moved, then reconcile (the shared path — the store,
+    // farm, and generation follow the pins).
+    let mut updated = Vec::new();
+    let mut held = Vec::new();
+    let mut unchanged = Vec::new();
+    let mut dirty = false;
+    for mv in moves {
+        match mv {
+            Move::Unchanged(name) => unchanged.push(name),
+            Move::Held {
+                name,
+                pinned,
+                candidate,
+                constraint,
+            } => held.push(PodUpdateHeld {
+                name,
+                pinned,
+                candidate,
+                constraint,
+            }),
+            Move::Updated {
+                name,
+                from,
+                to,
+                constraint,
+            } => {
+                lock.packages.insert(
+                    name.clone(),
+                    PodPackageLockEntry {
+                        version: to.clone(),
+                        constraint,
+                    },
+                );
+                dirty = true;
+                updated.push(PodUpdateEntry { name, from, to });
+            }
+        }
+    }
+    if dirty {
+        lock.save(&lock_path)?;
+    }
+
+    let sync = sync_pod(root, pod_name)?;
+    Ok(PodUpdateReport {
+        pod: pod_name.to_string(),
+        updated,
+        held,
+        unchanged,
+        generation: sync.generation,
+    })
+}
+
+// ── Rollback (issue #5) ──
+
+/// Report for `shuttle pod rollback`.
+#[derive(Debug, Serialize)]
+pub struct PodRollbackReport {
+    pub pod: String,
+    /// The generation the pod was on before the rollback.
+    pub from: u64,
+    /// The generation the pod's `current` link now points at.
+    pub to: u64,
+    /// The farm directory now behind `current`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub farm: Option<PathBuf>,
+}
+
+/// Roll a pod back to a previous generation (default: the one before
+/// the current): the store's rollback machinery flips that pod's
+/// `active` link and relinks its sysext trees, then the bin farm is
+/// re-emitted for the target generation and `current` follows — so
+/// binaries the newer generation added disappear from the farm.
+///
+/// Pod-scoped by construction: the per-pod [`RuntimeStore`] lives
+/// entirely inside the pod's state directory, so no system generation,
+/// boot entry, or other pod is touched. No reboot is performed.
+pub fn rollback_pod(
+    root: &Path,
+    pod_name: &str,
+    target: Option<u64>,
+) -> miette::Result<PodRollbackReport> {
+    validate_pod_name(pod_name)?;
+    let dir = pod_dir(root, pod_name);
+    let store = pod_store(&dir);
+    let tools = crate::runtime::RuntimeTools::from_host();
+    let report = store.rollback(target, &tools)?;
+
+    // The farm + `current` follow the flipped generation. Re-emitting
+    // is idempotent and heals a farm that predates a lost emit.
+    let gen = store.active_generation()?.ok_or_else(|| {
+        miette::miette!("rollback left pod '{pod_name}' with no active generation")
+    })?;
+    let farm = crate::farm::emit(&store, &gen)?;
+    crate::farm::flip_current(&dir, gen.n)?;
+
+    Ok(PodRollbackReport {
+        pod: pod_name.to_string(),
+        from: report.from,
+        to: report.to,
+        farm: Some(farm),
+    })
+}
+
+// ── GC (issue #5) ──
+
+/// Garbage-collect a pod's content store: the shared mark-sweep over
+/// every pod generation manifest (issue #3's per-pod store, no parallel
+/// implementation). With `--prune`, all but the pod's current +
+/// previous generations are dropped first — their exclusive blobs then
+/// sweep free, while blobs shared with (or referenced by) live
+/// generations survive. System generations are never eligible: the
+/// store root is the pod's own state directory.
+pub fn gc_pod(
+    root: &Path,
+    pod_name: &str,
+    prune: bool,
+) -> miette::Result<crate::runtime::GcReport> {
+    validate_pod_name(pod_name)?;
+    let dir = pod_dir(root, pod_name);
+    let store = pod_store(&dir);
+    store.gc(prune)
+}
+
 /// Report for the pod reconcile (`shuttle pod sync`, and the tail of
 /// every add/remove).
 #[derive(Debug, Serialize)]
@@ -636,6 +923,11 @@ pub struct PodSyncReport {
     pub installed: Vec<String>,
     /// Names removed from the store by this reconcile.
     pub removed: Vec<String>,
+    /// Names HELD at their lockfile pins this reconcile: the package
+    /// collection resolves a newer version but the pin (and the active
+    /// generation's content) say otherwise — `shuttle pod update` moves
+    /// them deliberately (issue #5).
+    pub held: Vec<String>,
     /// The generation now current (absent when the pod has nothing
     /// installed).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -661,7 +953,19 @@ pub fn pod_store(pod_dir: &Path) -> crate::runtime::RuntimeStore {
 ///
 /// Idempotent: run with no changes, install finds everything already
 /// installed at the same content, removes nothing — no new generation.
+///
+/// The reconcile is pin-aware (issue #5): the lockfile pin is the source
+/// of truth for what stays installed. When a declared package's pin
+/// differs from the freshly resolved candidate AND the active generation
+/// already carries the pinned version, the package is HELD at its store
+/// content — not rebuilt at the candidate (that is what `shuttle pod
+/// update` is for). Otherwise it builds normally.
 pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
+    reconcile_pod(root, pod_name)
+}
+
+/// The reconcile proper (see [`sync_pod`]).
+fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     validate_pod_name(pod_name)?;
     let decl = load_declaration(root, pod_name)?;
     let dir = pod_dir(root, pod_name);
@@ -669,6 +973,7 @@ pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
         .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
     let store = pod_store(&dir);
     let tools = crate::runtime::RuntimeTools::from_host();
+    let active = store.active_generation()?;
 
     // Resolve + build every declared package through the normal build
     // path. Resolution happens before any store state moves: a
@@ -679,8 +984,11 @@ pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     // proceed; they never unpack).
     let can_install = tools.unsquashfs.is_some() && crate::runtime::tool_on_path("mksquashfs");
     let mut pending = Vec::new();
+    let mut held = Vec::new();
     let mut declared_names = std::collections::BTreeSet::new();
     if can_install {
+        let lock_path = pod_lock_path(root, pod_name);
+        let lock = LockFile::load(&lock_path)?;
         for spec_str in &decl.packages {
             let spec = parse_pod_package(spec_str)?;
             let meta = crate::deps::load_meta(&spec.name).map_err(|e| {
@@ -691,6 +999,23 @@ pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
                 )
             })?;
             declared_names.insert(meta.name.clone());
+            // Hold at the pin: the lockfile says one version, the
+            // package collection now resolves another, and the active
+            // generation already carries the pinned content. Rebuilding
+            // would move the pod forward silently — update does that
+            // deliberately, the reconcile never does.
+            if let Some(pin) = lock.as_ref().and_then(|l| l.packages.get(&spec.name)) {
+                if pin.version != meta.version
+                    && active.as_ref().is_some_and(|g| {
+                        g.packages
+                            .get(&spec.name)
+                            .is_some_and(|p| p.version == pin.version)
+                    })
+                {
+                    held.push(meta.name.clone());
+                    continue;
+                }
+            }
             pending.push(build_pending_snap(&store, &meta)?);
         }
     } else if !decl.packages.is_empty() {
@@ -739,6 +1064,7 @@ pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
         noop: installed.is_empty() && removed.is_empty(),
         installed,
         removed,
+        held,
         generation,
         farm,
     })
@@ -927,5 +1253,25 @@ pod {
         assert!(validate_pod_name("..").is_err());
         assert!(validate_pod_name("../escape").is_err());
         assert!(validate_pod_name("a/b").is_err());
+    }
+
+    #[test]
+    fn test_version_matches_constraint() {
+        // `pkg@14` means newest 14.x.
+        assert!(version_matches_constraint("14", "14"));
+        assert!(version_matches_constraint("14.1", "14"));
+        assert!(version_matches_constraint("14.4.9", "14"));
+        assert!(version_matches_constraint("1.2.9", "1.2"));
+        // A newer major must NOT match an older constraint.
+        assert!(!version_matches_constraint("15.0", "14"));
+        assert!(!version_matches_constraint("2.0", "1.2"));
+        // Constraint longer than version: not satisfiable.
+        assert!(!version_matches_constraint("14", "14.1"));
+        // Numeric compare, not string prefix ("10" is not "1").
+        assert!(!version_matches_constraint("10.5", "1"));
+        assert!(version_matches_constraint("10.5", "10"));
+        // Non-numeric components compare as exact strings.
+        assert!(version_matches_constraint("14a", "14a"));
+        assert!(!version_matches_constraint("14b", "14a"));
     }
 }
