@@ -1121,6 +1121,10 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     let mut pending = Vec::new();
     let mut held = Vec::new();
     let mut declared_names = std::collections::BTreeSet::new();
+    // Desktop application-ID claims of the post-state package set
+    // (issue #7): collected in declaration order, resolved for
+    // collisions BEFORE any store write.
+    let mut desktop_claims = Vec::new();
     // Version pins the reconcile moved (overlay wins over the pin):
     // recorded only after the build succeeded, applied only after the
     // install succeeded — a failed reconcile leaves the pin in place.
@@ -1154,6 +1158,17 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
             // deliberately, the reconcile never does. An overlay entry
             // skips the hold: it is this pod's explicit, layered
             // decision (overlay > own packages > collection).
+            // Desktop application-ID claims (issue #7): a package with
+            // an overlay sits on the overlay layer (later layer wins);
+            // a plain package sits on the base layer. A HELD package
+            // claims through the ACTIVE generation's recorded desktops
+            // (that is the content that stays installed), at the base
+            // layer — the hold is the absence of an overlay decision.
+            let layer = if overlay.is_some() {
+                crate::farm::ClaimLayer::Layer
+            } else {
+                crate::farm::ClaimLayer::Base
+            };
             if overlay.is_none() {
                 if let Some(pin) = lock.packages.get(&spec.name) {
                     if pin.version != meta.version
@@ -1164,10 +1179,20 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
                         })
                     {
                         held.push(meta.name.clone());
+                        if let Some(installed_pkg) =
+                            active.as_ref().and_then(|g| g.packages.get(&spec.name))
+                        {
+                            push_desktop_claims(
+                                &mut desktop_claims,
+                                installed_pkg,
+                                crate::farm::ClaimLayer::Base,
+                            );
+                        }
                         continue;
                     }
                 }
             }
+            push_meta_desktop_claims(&mut desktop_claims, &meta, layer);
             // An effective version different from the pin repins the
             // lockfile: the pin records what the pod actually builds.
             if lock.packages.get(&spec.name).map(|e| e.version.as_str())
@@ -1186,6 +1211,10 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     } else if !decl.packages.is_empty() {
         warn_degraded_install();
     }
+
+    // Desktop app-ID collision check (issue #7) — BEFORE any store
+    // write, so a same-precedence collision fails with zero writes.
+    resolve_desktop_claims(&desktop_claims)?;
 
     // Install the changed set (a no-op batch creates no generation).
     let mut installed = Vec::new();
@@ -1229,6 +1258,9 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
         }
         None => {
             crate::farm::clear_current(&dir)?;
+            // Nothing active exposes nothing: the user-level launcher
+            // surface is withdrawn along with the farm (issue #7).
+            crate::desktop::clear(&store)?;
             (None, None)
         }
     };
@@ -1242,6 +1274,91 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
         generation,
         farm,
     })
+}
+
+/// One claim on a desktop application ID (issue #7): which package
+/// claims the id, at which precedence layer.
+#[derive(Debug, Clone)]
+struct DesktopClaim {
+    app_id: String,
+    pkg: String,
+    layer: crate::farm::ClaimLayer,
+}
+
+/// Collect the desktop application-ID claims of a freshly resolved meta
+/// (a package about to be built): every app carrying a `desktop` field.
+fn push_meta_desktop_claims(
+    claims: &mut Vec<DesktopClaim>,
+    meta: &crate::snap::SnapMeta,
+    layer: crate::farm::ClaimLayer,
+) {
+    for (app_id, app) in &meta.apps {
+        if app.desktop.is_some() {
+            claims.push(DesktopClaim {
+                app_id: app_id.clone(),
+                pkg: meta.name.clone(),
+                layer,
+            });
+        }
+    }
+}
+
+/// Collect the desktop application-ID claims of an already-installed
+/// package (a held pin): the ids recorded in its manifest entry.
+fn push_desktop_claims(
+    claims: &mut Vec<DesktopClaim>,
+    pkg: &crate::runtime::InstalledPackage,
+    layer: crate::farm::ClaimLayer,
+) {
+    for app_id in pkg.desktops.keys() {
+        claims.push(DesktopClaim {
+            app_id: app_id.clone(),
+            pkg: pkg.name.clone(),
+            layer,
+        });
+    }
+}
+
+/// Resolve desktop application-ID collisions across the post-state
+/// package set (issue #7). Same-precedence duplicates are a hard error
+/// (zero writes — this runs before the install); a higher layer
+/// overriding a lower one, or a lower one being shadowed, warns and the
+/// higher layer wins. Declaration order breaks ties: the later package
+/// is the incoming claim.
+fn resolve_desktop_claims(claims: &[DesktopClaim]) -> miette::Result<()> {
+    let mut incumbent: BTreeMap<String, DesktopClaim> = BTreeMap::new();
+    for claim in claims {
+        let Some(existing) = incumbent.get(&claim.app_id) else {
+            incumbent.insert(claim.app_id.clone(), claim.clone());
+            continue;
+        };
+        match crate::farm::classify_collision(existing.layer, claim.layer) {
+            crate::farm::CollisionVerdict::Error => {
+                miette::bail!(
+                    "application id '{}' is declared by both '{}' and '{}' at the same \
+                     precedence — same-precedence desktop app-ID collision; rename one of \
+                     the apps or drop one of the packages",
+                    claim.app_id,
+                    existing.pkg,
+                    claim.pkg
+                );
+            }
+            crate::farm::CollisionVerdict::Override => {
+                crate::output::warn(format!(
+                    "application id '{}' from '{}' overrides '{}' (overlay layer wins)",
+                    claim.app_id, claim.pkg, existing.pkg
+                ));
+                incumbent.insert(claim.app_id.clone(), claim.clone());
+            }
+            crate::farm::CollisionVerdict::Shadowed => {
+                crate::output::warn(format!(
+                    "application id '{}' from '{}' is shadowed by '{}' (lower layer loses)",
+                    claim.app_id, claim.pkg, existing.pkg
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Degraded-mode banner for `pod add` when the squashfs pair is absent:

@@ -296,6 +296,12 @@ pub struct SnapApp {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<BTreeMap<String, String>>,
+
+    /// Path to the app's `.desktop` file inside the snap (like snapd's
+    /// `desktop:` app key; issue #7). The pod launcher emitter parses it
+    /// at install time and generates the user-level entry from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<String>,
 }
 
 // ── Phase 15: snap.yaml coverage structs ──
@@ -690,7 +696,7 @@ impl SnapApp {
             let (k, _) = pair.map_err(|e| miette::miette!("app '{name}': {e}"))?;
             if !matches!(
                 k.as_str(),
-                "command" | "daemon" | "plugs" | "slots" | "environment"
+                "command" | "daemon" | "plugs" | "slots" | "environment" | "desktop"
             ) {
                 unknown.push(k);
             }
@@ -703,7 +709,7 @@ impl SnapApp {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(miette::miette!(
-                "app '{name}': unknown field{} {list} (valid fields: command, daemon, plugs, slots, environment)",
+                "app '{name}': unknown field{} {list} (valid fields: command, daemon, plugs, slots, environment, desktop)",
                 if unknown.len() == 1 { "" } else { "s" },
             ));
         }
@@ -713,6 +719,10 @@ impl SnapApp {
         let plugs = get_opt_string_array(table, "plugs")?;
         let slots = get_opt_string_array(table, "slots")?;
         let environment = get_opt_string_map(table, "environment")?;
+        let desktop = get_opt_string(table, "desktop")?;
+        if let Some(d) = &desktop {
+            validate_desktop_path(name, d)?;
+        }
 
         Ok(SnapApp {
             command,
@@ -720,8 +730,34 @@ impl SnapApp {
             plugs,
             slots,
             environment,
+            desktop,
         })
     }
+}
+
+/// Validate a `desktop` app field: a package-relative payload path to the
+/// app's `.desktop` file. Must be relative (the payload root is implicit),
+/// must not escape the payload with `..`, and must name a `.desktop` file
+/// (snapd's own constraint on the app key).
+fn validate_desktop_path(app: &str, path: &str) -> miette::Result<()> {
+    if path.is_empty() {
+        miette::bail!("app '{app}': 'desktop' must not be empty");
+    }
+    if path.starts_with('/') {
+        miette::bail!(
+            "app '{app}': 'desktop' must be a path inside the snap (relative), got {path:?}"
+        );
+    }
+    if Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        miette::bail!("app '{app}': 'desktop' must not contain '..' (got {path:?})");
+    }
+    if !path.ends_with(".desktop") {
+        miette::bail!("app '{app}': 'desktop' must name a .desktop file, got {path:?}");
+    }
+    Ok(())
 }
 
 // ── Lua table extraction helpers ──
@@ -3152,19 +3188,55 @@ mod tests {
             .eval(
                 r#"
             return snap {
-                name = "drifted",
+                name = "desktoped",
                 version = "1.0",
-                apps = { svc = { command = "bin/svc", desktop = "x.desktop" } },
+                apps = { svc = { command = "bin/svc", desktop = "share/applications/svc.desktop" } },
             }
             "#,
             )
             .unwrap();
-        let err = SnapMeta::from_lua_table(&table).unwrap_err().to_string();
-        assert!(err.contains("unknown field 'desktop'"), "got: {err}");
-        assert!(
-            err.contains("valid fields: command, daemon, plugs, slots, environment"),
-            "got: {err}"
+        let meta = SnapMeta::from_lua_table(&table).unwrap();
+        assert_eq!(
+            meta.apps["svc"].desktop.as_deref(),
+            Some("share/applications/svc.desktop")
         );
+        // The field flows into the emitted snap.yaml (the payload's
+        // meta/snap.yaml is what the install-time launcher recorder
+        // reads, issue #7).
+        let yaml = meta.to_yaml().unwrap();
+        assert!(
+            yaml.contains("desktop: share/applications/svc.desktop"),
+            "yaml: {yaml}"
+        );
+    }
+
+    #[test]
+    fn test_app_desktop_field_is_validated() {
+        let env = LuaEnv::new();
+        let cases: &[(&str, &str)] = &[
+            ("absolute path", "/etc/x.desktop"),
+            ("parent escape", "../x.desktop"),
+            ("wrong extension", "share/applications/x.txt"),
+            ("empty", ""),
+        ];
+        for (what, value) in cases {
+            let table = env
+                .eval(&format!(
+                    r#"
+                return snap {{
+                    name = "bad",
+                    version = "1.0",
+                    apps = {{ svc = {{ command = "bin/svc", desktop = "{value}" }} }},
+                }}
+                "#
+                ))
+                .unwrap();
+            let err = SnapMeta::from_lua_table(&table).unwrap_err().to_string();
+            assert!(
+                err.contains("'desktop'"),
+                "{what}: error must name the field, got: {err}"
+            );
+        }
     }
 
     #[test]

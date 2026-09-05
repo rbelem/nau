@@ -362,6 +362,11 @@ pub struct PayloadSnap {
     pub snap_type: Option<String>,
     #[serde(default)]
     pub confinement: Option<String>,
+    /// The snap-level icon target inside the payload (e.g.
+    /// `meta/gui/icon.png`) — the icon the desktop launcher links
+    /// alongside the generated entry (issue #7).
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default)]
     pub apps: BTreeMap<String, PayloadApp>,
     #[serde(default)]
@@ -380,6 +385,10 @@ pub struct PayloadApp {
     pub plugs: Vec<String>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Path to the app's `.desktop` file inside the payload (issue #7,
+    /// like snapd's `desktop:` app key) — the launcher's metadata source.
+    #[serde(default)]
+    pub desktop: Option<String>,
 }
 
 /// A snap-level plug value in a payload `meta/snap.yaml`: a bare

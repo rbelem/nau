@@ -275,6 +275,7 @@ mod tests {
             plugs,
             slots: None,
             environment: None,
+            desktop: None,
         }
     }
 

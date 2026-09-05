@@ -198,6 +198,9 @@ fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, Stri
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
+    // The desktop launcher surface (issue #7) writes to the user data
+    // home — redirect it inside the test's tempdir, never the real home.
+    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
     let out = cmd.output().expect("failed to spawn shuttle pod");
     (
         out.status.code(),
@@ -577,6 +580,8 @@ gated_test!(degraded_mode_without_squashfs_tools_installs_nothing, {
         .arg(root.path());
     cmd.current_dir(project.path());
     cmd.env("PATH", "/nonexistent-empty-path");
+    // Redirect the launcher surface into the test's tempdir (issue #7).
+    cmd.env("SHUTTLE_DATA_HOME", root.path().join("data-home"));
     let out = cmd.output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");

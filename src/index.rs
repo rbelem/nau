@@ -129,6 +129,10 @@ pub struct IndexApp {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<Vec<String>>,
+
+    /// Path to the app's `.desktop` file inside the snap (issue #7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<String>,
 }
 
 // ── Default index (bundled with shuttle) ──
@@ -327,6 +331,7 @@ impl PackageIndex {
                                 plugs: app.plugs.clone(),
                                 slots: app.slots.clone(),
                                 environment: None,
+                                desktop: app.desktop.clone(),
                             },
                         )
                     })
@@ -535,6 +540,7 @@ mod tests {
                         daemon: None,
                         plugs: None,
                         slots: None,
+                        desktop: None,
                     },
                 )]
                 .into(),

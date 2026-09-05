@@ -122,6 +122,47 @@ pub struct InstalledPackage {
     /// store. Empty for packages without apps and store-recorded snaps.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub apps: BTreeMap<String, String>,
+    /// Desktop-launcher metadata per GUI app (issue #7), parsed from the
+    /// package's `.desktop` file at install time and recorded in the
+    /// manifest so the launcher emitter rebuilds entries from the
+    /// manifest alone — rollback re-emits without re-unpacking. Empty
+    /// for packages without GUI apps.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub desktops: BTreeMap<String, DesktopLauncher>,
+}
+
+/// One GUI app's desktop-launcher metadata (issue #7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopLauncher {
+    /// `Name=` of the source `.desktop` file (falls back to the app id
+    /// in the generated entry when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `GenericName=` of the source file, passed through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generic_name: Option<String>,
+    /// `Comment=` of the source file, passed through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Menu categories, split from the source file's `Categories=`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+    /// `Icon=` of the source file, passed through ONLY when the package
+    /// ships no icon blob (a theme icon name); when the package ships
+    /// one, the emitter substitutes the pod-namespaced link name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_ref: Option<String>,
+    /// The package's shipped icon, ingested into the store at install
+    /// time and linked by the launcher emitter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<DesktopIcon>,
+}
+
+/// An icon blob in the content store plus its file extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopIcon {
+    pub sha256: String,
+    pub ext: String,
 }
 
 /// One bootable selection: base version + package set + content hashes.
@@ -938,6 +979,7 @@ impl RuntimeStore {
                         Vec::new(),
                         Vec::new(),
                         BTreeMap::new(),
+                        BTreeMap::new(),
                     ),
                     planner_notes: Vec::new(),
                     entries: Vec::new(),
@@ -951,6 +993,7 @@ impl RuntimeStore {
                 // the payload metadata (Phase 24a planner).
                 let entries = self.ingest_tree(&extract, "meta")?;
                 let runtime = plan_payload_runtime(&meta, &entries, snap)?;
+                let desktops = self.record_desktops(&meta, &extract)?;
                 let pkg_units = runtime.units.iter().map(|u| u.unit_name.clone()).collect();
                 Ok(PreparedSnap {
                     pkg: self.recorded_package(
@@ -959,6 +1002,7 @@ impl RuntimeStore {
                         entry_hashes(&entries),
                         pkg_units,
                         runtime.apps,
+                        desktops,
                     ),
                     planner_notes: runtime.notes,
                     entries,
@@ -1011,6 +1055,7 @@ impl RuntimeStore {
         files: Vec<String>,
         units: Vec<String>,
         apps: BTreeMap<String, String>,
+        desktops: BTreeMap<String, DesktopLauncher>,
     ) -> InstalledPackage {
         InstalledPackage {
             name: snap.name.clone(),
@@ -1020,6 +1065,7 @@ impl RuntimeStore {
             files,
             units,
             apps,
+            desktops,
         }
     }
 
@@ -1030,6 +1076,76 @@ impl RuntimeStore {
         let mut entries = Vec::new();
         self.ingest_dir(src, src, true, skip, &mut entries)?;
         Ok(entries)
+    }
+
+    /// Record the desktop-launcher metadata of one ShootBuilt payload
+    /// (issue #7): for every app carrying a `desktop:` field, parse its
+    /// `.desktop` file out of the extracted payload and, when the snap
+    /// ships an icon (`meta/gui/icon.<ext>`), ingest that icon into the
+    /// content store. The result is recorded in the package's manifest
+    /// entry so the launcher emitter rebuilds entries from the manifest
+    /// alone (rollback re-emits without re-unpacking).
+    ///
+    /// A declared `.desktop` file or a declared icon that is missing from
+    /// the payload is a hard error — a GUI package that cannot produce a
+    /// resolvable launcher must fail the install, not leak a broken menu
+    /// entry.
+    fn record_desktops(
+        &self,
+        meta: &PayloadSnap,
+        extract: &Path,
+    ) -> miette::Result<BTreeMap<String, DesktopLauncher>> {
+        let mut out = BTreeMap::new();
+        for (app_name, app) in &meta.apps {
+            let Some(desktop_rel) = &app.desktop else {
+                continue;
+            };
+            let desktop_path = payload_subpath(extract, desktop_rel)
+                .map_err(|e| miette::miette!("app '{app_name}': {e}"))?;
+            let text = std::fs::read_to_string(&desktop_path).map_err(|e| {
+                miette::miette!(
+                    "app '{app_name}': cannot read declared .desktop file {}: {e}",
+                    desktop_path.display()
+                )
+            })?;
+            let source = crate::desktop::parse_source(
+                &text,
+                &format!("{}:{app_name}", meta.name.as_deref().unwrap_or("snap")),
+            )?;
+            let icon = match &meta.icon {
+                Some(icon_rel) => Some(self.ingest_icon(extract, icon_rel)?),
+                None => None,
+            };
+            out.insert(
+                app_name.clone(),
+                DesktopLauncher {
+                    name: source.name,
+                    generic_name: source.generic_name,
+                    comment: source.comment,
+                    categories: source.categories,
+                    icon_ref: source.icon_ref,
+                    icon,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// Content-address one icon file into the store and return its
+    /// DesktopIcon record (sha256 + extension).
+    fn ingest_icon(&self, extract: &Path, icon_rel: &str) -> miette::Result<DesktopIcon> {
+        let path = payload_subpath(extract, icon_rel)?;
+        let sha256 = sha256_file(&path)?;
+        self.blob_store(&path, &sha256)?;
+        let ext = Path::new(icon_rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if ext.is_empty() {
+            miette::bail!("snap icon {icon_rel:?} has no file extension");
+        }
+        Ok(DesktopIcon { sha256, ext })
     }
 
     fn ingest_dir(
@@ -1447,6 +1563,30 @@ fn entry_hashes(entries: &[TreeEntry]) -> Vec<String> {
         .collect()
 }
 
+/// Resolve a payload-relative path (a declared `.desktop` file, the snap
+/// icon) under an extracted payload root. The path must be relative and
+/// must not escape the payload with `..` — the declared path is metadata
+/// the payload author controls, so it is validated before use.
+fn payload_subpath(root: &Path, rel: &str) -> miette::Result<PathBuf> {
+    if rel.is_empty() {
+        miette::bail!("payload path must not be empty");
+    }
+    if rel.starts_with('/') {
+        miette::bail!("payload path must be relative to the payload root, got {rel:?}");
+    }
+    let path = root.join(rel);
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| miette::miette!("payload root {}: {e}", root.display()))?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| miette::miette!("payload path {rel:?}: {e}"))?;
+    if !canonical.starts_with(&canonical_root) {
+        miette::bail!("payload path {rel:?} escapes the payload root");
+    }
+    Ok(canonical)
+}
+
 /// Planned runtime for one ShootBuilt payload: daemon units, the
 /// renamed-command-binary hardlink specs, and planner warnings.
 struct PayloadRuntime {
@@ -1814,6 +1954,7 @@ mod tests {
             files,
             units: units.iter().map(|s| s.to_string()).collect(),
             apps: BTreeMap::new(),
+            desktops: BTreeMap::new(),
         }
     }
 
@@ -2536,6 +2677,7 @@ plugs:
                 files: vec![],
                 units: vec![],
                 apps: BTreeMap::new(),
+                desktops: BTreeMap::new(),
             },
         );
         installed.insert(
@@ -2548,6 +2690,7 @@ plugs:
                 files: vec![],
                 units: vec![],
                 apps: BTreeMap::new(),
+                desktops: BTreeMap::new(),
             },
         );
         let resolved = vec![
