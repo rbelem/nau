@@ -26,6 +26,18 @@
 //! the newer generation added disappear. `shuttle pod gc [--prune]`
 //! reuses the store's mark-sweep: unreferenced pod generations are
 //! pruned and their exclusive blobs freed, live generations keep theirs.
+//!
+//! Issue #6: inline code-only overlays. An `overlay = { pkg = { ... } }`
+//! entry in a pod's own `pod.lua` patches that package's resolved
+//! declaration for THIS pod only — the shared collection and every other
+//! pod resolve the unmodified package. Layering (CONTEXT.md: Overlay):
+//! shared collection → own packages (the pod's declaration + lockfile
+//! pins hold the build against collection drift) → overlay, later wins.
+//! Overlay fields are a validated whitelist (`version`, `build`); an
+//! overlay version pin flows into the lockfile pin, the built payload,
+//! the generation manifest, and the farm binary. Overlay validation
+//! (key names a declared package, fields in the whitelist) runs before
+//! any mutation.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -354,6 +366,82 @@ fn lua_type_name(value: &mlua::Value) -> &'static str {
     }
 }
 
+// ── Overlays (issue #6) ──
+
+/// The fields an overlay entry may patch on a resolved package
+/// declaration (issue #6: version pins, build tweaks). Anything else is
+/// rejected with the allowed set named.
+const OVERLAY_FIELDS: &[&str] = &["version", "build"];
+
+/// Apply one overlay entry (a plain-data patch table) onto a resolved
+/// [`SnapMeta`]. This is the top layer of the pod resolution chain
+/// (CONTEXT.md: Overlay): later layers win, upstream declarations are
+/// never modified.
+///
+/// Only string-valued whitelisted fields (`version`, `build`) are
+/// patched; unknown fields and non-string values fail naming
+/// `overlay.<pkg>.<field>`.
+fn apply_overlay(
+    meta: &mut crate::snap::SnapMeta,
+    patch: &serde_json::Value,
+) -> miette::Result<()> {
+    let Some(obj) = patch.as_object() else {
+        miette::bail!("overlay entry must be a table of fields, got {}", patch);
+    };
+    for (key, value) in obj {
+        let Some(s) = value.as_str() else {
+            miette::bail!("overlay field '{key}' must be a string, got {value}");
+        };
+        match key.as_str() {
+            "version" => meta.version = s.to_string(),
+            "build" => meta.build = Some(s.to_string()),
+            other => miette::bail!(
+                "unsupported overlay field '{other}' (allowed: {})",
+                OVERLAY_FIELDS.join(", ")
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Validate a declaration's overlay entries BEFORE any mutation: every
+/// overlay key must name a package the pod builds (its declared
+/// `packages` — loaded pods join that set in #8), and every entry must
+/// be a patch of whitelisted string fields. Run at the top of every
+/// mutating verb so a bad overlay fails with a clear error and zero
+/// writes.
+fn validate_overlays(decl: &PodDeclaration, pod_name: &str) -> miette::Result<()> {
+    let declared: HashSet<String> = decl
+        .packages
+        .iter()
+        .filter_map(|spec| parse_pod_package(spec).ok().map(|p| p.name))
+        .collect();
+    for (pkg, patch) in &decl.overlay {
+        if !declared.contains(pkg) {
+            miette::bail!(
+                "overlay targets package '{pkg}', which pod '{pod_name}' does not declare \
+                 — overlays apply to packages the pod builds (declared in 'packages'); \
+                 overlaying a nonexistent package is an error",
+            );
+        }
+        let Some(obj) = patch.as_object() else {
+            miette::bail!("overlay.{pkg} must be a table of fields");
+        };
+        for (key, value) in obj {
+            if !OVERLAY_FIELDS.contains(&key.as_str()) {
+                miette::bail!(
+                    "overlay.{pkg}.{key}: unsupported overlay field '{key}' (allowed: {})",
+                    OVERLAY_FIELDS.join(", ")
+                );
+            }
+            if value.as_str().is_none() {
+                miette::bail!("'overlay.{pkg}.{key}' must be a string, got {value}");
+            }
+        }
+    }
+    Ok(())
+}
+
 // ── Rendering ──
 
 /// Render a declaration back to `pod.lua` source. Only populated sections
@@ -545,7 +633,17 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
             );
         }
     }
+    // The spec joins the declaration before overlay validation: an
+    // overlay for the package being added is written ahead of the add.
     decl.packages.push(spec_str.to_string());
+    validate_overlays(&decl, pod_name)?;
+    // The overlay entry for this package is the top layer: pin the
+    // EFFECTIVE version, not the collection's (issue #6).
+    let mut meta = meta;
+    if let Some(patch) = decl.overlay.get(&spec.name) {
+        apply_overlay(&mut meta, patch)
+            .map_err(|e| miette::miette!("cannot add '{}' with its overlay: {e}", spec.name))?;
+    }
 
     let dir = pod_dir(root, pod_name);
     std::fs::create_dir_all(&dir)
@@ -714,6 +812,8 @@ pub fn update_pod(
 ) -> miette::Result<PodUpdateReport> {
     validate_pod_name(pod_name)?;
     let decl = load_declaration(root, pod_name)?;
+    // Fail fast on a malformed overlay, before any resolution or repin.
+    validate_overlays(&decl, pod_name)?;
 
     // An explicit target set must name declared packages (a trailing
     // `@constraint` on the CLI argument is ignored, like `remove`).
@@ -764,27 +864,51 @@ pub fn update_pod(
                 continue;
             }
         }
-        let candidate = crate::deps::load_meta(&spec.name)
-            .map_err(|e| miette::miette!("cannot update '{}': {e}", spec.name))?
-            .version;
-        let pin = lock.packages.get(&spec.name).map(|e| e.version.clone());
-        match (&spec.constraint, pin.as_deref()) {
-            (Some(constraint), _) if !version_matches_constraint(&candidate, constraint) => {
-                moves.push(Move::Held {
-                    name: spec.name,
-                    pinned: pin,
-                    candidate,
-                    constraint: constraint.clone(),
-                });
-            }
-            (_, Some(pinned)) if pinned == candidate => moves.push(Move::Unchanged(spec.name)),
-            (constraint, _) => moves.push(Move::Updated {
-                name: spec.name,
-                from: pin,
-                to: candidate,
-                constraint: constraint.clone(),
-            }),
+        // The candidate resolves through the pod's overlay layer (issue
+        // #6): an overlay version pin IS the candidate — the overlay
+        // beats both the collection and the package's constraint, so the
+        // update lands the pod on the pinned version (or reports it
+        // already current) instead of fighting the overlay.
+        let mut candidate_meta = crate::deps::load_meta(&spec.name)
+            .map_err(|e| miette::miette!("cannot update '{}': {e}", spec.name))?;
+        let overlay = decl.overlay.get(&spec.name);
+        if let Some(patch) = overlay {
+            apply_overlay(&mut candidate_meta, patch)
+                .map_err(|e| miette::miette!("cannot update '{}': {e}", spec.name))?;
         }
+        let candidate = candidate_meta.version;
+        let pin = lock.packages.get(&spec.name).map(|e| e.version.clone());
+        let mv = if overlay.is_some() {
+            if pin.as_deref() == Some(candidate.as_str()) {
+                Move::Unchanged(spec.name.clone())
+            } else {
+                Move::Updated {
+                    name: spec.name.clone(),
+                    from: pin.clone(),
+                    to: candidate.clone(),
+                    constraint: spec.constraint.clone(),
+                }
+            }
+        } else {
+            match (&spec.constraint, pin.as_deref()) {
+                (Some(constraint), _) if !version_matches_constraint(&candidate, constraint) => {
+                    Move::Held {
+                        name: spec.name,
+                        pinned: pin,
+                        candidate,
+                        constraint: constraint.clone(),
+                    }
+                }
+                (_, Some(pinned)) if pinned == candidate => Move::Unchanged(spec.name),
+                (constraint, _) => Move::Updated {
+                    name: spec.name,
+                    from: pin,
+                    to: candidate,
+                    constraint: constraint.clone(),
+                },
+            }
+        };
+        moves.push(mv);
     }
 
     // Repin what moved, then reconcile (the shared path — the store,
@@ -968,6 +1092,10 @@ pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
 fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     validate_pod_name(pod_name)?;
     let decl = load_declaration(root, pod_name)?;
+    // Overlay validation happens FIRST, before any mutation (issue #6):
+    // a declaration overlaying a nonexistent package or carrying an
+    // unsupported field fails here with zero writes.
+    validate_overlays(&decl, pod_name)?;
     let dir = pod_dir(root, pod_name);
     std::fs::create_dir_all(&dir)
         .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
@@ -982,39 +1110,76 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     // unpacked, so the reconcile installs nothing — warn loudly and
     // keep the declaration half authoritative (removals below still
     // proceed; they never unpack).
+    //
+    // Layering (issue #6, CONTEXT.md: Overlay): each package resolves
+    // from the shared collection, then through the pod's own pin (the
+    // hold below keeps collection drift from moving the pod silently),
+    // then through the pod's overlay entry — later wins. An overlay
+    // entry suppresses the hold (an explicit per-pod customization is a
+    // decision, not drift) and its version pin flows into the lockfile.
     let can_install = tools.unsquashfs.is_some() && crate::runtime::tool_on_path("mksquashfs");
     let mut pending = Vec::new();
     let mut held = Vec::new();
     let mut declared_names = std::collections::BTreeSet::new();
+    // Version pins the reconcile moved (overlay wins over the pin):
+    // recorded only after the build succeeded, applied only after the
+    // install succeeded — a failed reconcile leaves the pin in place.
+    let mut repins: Vec<(String, PodPackageLockEntry)> = Vec::new();
+    let lock_path = pod_lock_path(root, pod_name);
+    let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
     if can_install {
-        let lock_path = pod_lock_path(root, pod_name);
-        let lock = LockFile::load(&lock_path)?;
         for spec_str in &decl.packages {
             let spec = parse_pod_package(spec_str)?;
-            let meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+            let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
                 miette::miette!(
                     "cannot build declared package '{}': {e} (declaration at {})",
                     spec.name,
                     pod_lua_path(root, pod_name).display()
                 )
             })?;
+            let overlay = decl.overlay.get(&spec.name);
+            if let Some(patch) = overlay {
+                apply_overlay(&mut meta, patch).map_err(|e| {
+                    miette::miette!(
+                        "cannot build declared package '{}' with its overlay: {e}",
+                        spec.name
+                    )
+                })?;
+            }
             declared_names.insert(meta.name.clone());
             // Hold at the pin: the lockfile says one version, the
             // package collection now resolves another, and the active
             // generation already carries the pinned content. Rebuilding
             // would move the pod forward silently — update does that
-            // deliberately, the reconcile never does.
-            if let Some(pin) = lock.as_ref().and_then(|l| l.packages.get(&spec.name)) {
-                if pin.version != meta.version
-                    && active.as_ref().is_some_and(|g| {
-                        g.packages
-                            .get(&spec.name)
-                            .is_some_and(|p| p.version == pin.version)
-                    })
-                {
-                    held.push(meta.name.clone());
-                    continue;
+            // deliberately, the reconcile never does. An overlay entry
+            // skips the hold: it is this pod's explicit, layered
+            // decision (overlay > own packages > collection).
+            if overlay.is_none() {
+                if let Some(pin) = lock.packages.get(&spec.name) {
+                    if pin.version != meta.version
+                        && active.as_ref().is_some_and(|g| {
+                            g.packages
+                                .get(&spec.name)
+                                .is_some_and(|p| p.version == pin.version)
+                        })
+                    {
+                        held.push(meta.name.clone());
+                        continue;
+                    }
                 }
+            }
+            // An effective version different from the pin repins the
+            // lockfile: the pin records what the pod actually builds.
+            if lock.packages.get(&spec.name).map(|e| e.version.as_str())
+                != Some(meta.version.as_str())
+            {
+                repins.push((
+                    spec.name.clone(),
+                    PodPackageLockEntry {
+                        version: meta.version.clone(),
+                        constraint: spec.constraint.clone(),
+                    },
+                ));
             }
             pending.push(build_pending_snap(&store, &meta)?);
         }
@@ -1029,6 +1194,15 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
         if !report.noop {
             installed = report.installed.iter().map(|s| s.name.clone()).collect();
         }
+    }
+
+    // Overlay-driven repins (issue #6): applied only after the installs
+    // succeeded, so a failed reconcile leaves the pin untouched.
+    if !repins.is_empty() {
+        for (name, entry) in repins {
+            lock.packages.insert(name, entry);
+        }
+        lock.save(&lock_path)?;
     }
 
     // Remove store packages the declaration dropped. Removal never
@@ -1253,6 +1427,109 @@ pod {
         assert!(validate_pod_name("..").is_err());
         assert!(validate_pod_name("../escape").is_err());
         assert!(validate_pod_name("a/b").is_err());
+    }
+
+    /// Bare SnapMeta with every optional field empty (mirrors the test
+    /// helper in manifest.rs).
+    fn bare_meta(name: &str, version: &str) -> crate::snap::SnapMeta {
+        use std::collections::HashMap;
+        crate::snap::SnapMeta {
+            name: name.into(),
+            version: version.into(),
+            summary: None,
+            description: None,
+            license: None,
+            source: None,
+            build: None,
+            parts: None,
+            architectures: None,
+            grade: "stable".into(),
+            confinement: "strict".into(),
+            type_: None,
+            adopt_info: None,
+            version_adopted: false,
+            icon_source: None,
+            icon: None,
+            compression: None,
+            environment: None,
+            layout: None,
+            hooks: None,
+            plugs: None,
+            slots: None,
+            aliases: vec![],
+            requires: vec![],
+            target: None,
+            toolchain: None,
+            inputs: None,
+            apps: HashMap::new(),
+            definition_dir: None,
+        }
+    }
+
+    #[test]
+    fn test_apply_overlay_patches_whitelisted_fields() {
+        let mut meta = bare_meta("tool", "14.4");
+        apply_overlay(
+            &mut meta,
+            &serde_json::json!({"version": "9.9", "build": "echo hi"}),
+        )
+        .unwrap();
+        assert_eq!(meta.version, "9.9");
+        assert_eq!(meta.build.as_deref(), Some("echo hi"));
+    }
+
+    #[test]
+    fn test_apply_overlay_rejects_unknown_and_non_string_fields() {
+        let mut meta = bare_meta("tool", "1");
+        let err = apply_overlay(&mut meta, &serde_json::json!({"grade": "devel"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("grade") && err.contains("version") && err.contains("build"),
+            "error must name the field and the allowed set: {err}"
+        );
+        let err = apply_overlay(&mut meta, &serde_json::json!({"version": 9}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'version'") && err.contains("string"),
+            "non-string values must be rejected: {err}"
+        );
+        // A rejected patch must leave the meta untouched.
+        assert_eq!(meta.version, "1");
+    }
+
+    #[test]
+    fn test_validate_overlays_rejects_undeclared_key_before_mutation() {
+        let decl = evaluate_pod_source(
+            "test",
+            r#"pod {
+    packages = { "jq" },
+    overlay = { ghost = { version = "1.0" } },
+}"#,
+        )
+        .unwrap();
+        let err = validate_overlays(&decl, "work").unwrap_err().to_string();
+        assert!(
+            err.contains("ghost") && err.contains("does not declare"),
+            "error must name the undeclared overlay target: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_overlays_accepts_declared_keys() {
+        let decl = evaluate_pod_source(
+            "test",
+            r#"pod {
+    packages = { "jq", "ripgrep@14" },
+    overlay = {
+        jq = { version = "1.8" },
+        ripgrep = { build = "echo hi" },
+    },
+}"#,
+        )
+        .unwrap();
+        validate_overlays(&decl, "work").unwrap();
     }
 
     #[test]
