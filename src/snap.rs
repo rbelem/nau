@@ -1381,22 +1381,35 @@ pub fn check_cross_build(arch: &str, target: Option<&str>) -> miette::Result<()>
     })
 }
 
-/// Author build-time launcher wrappers for interpreter-based apps (issue #9).
+/// Author build-time launcher wrappers (issues #9 and #10).
 ///
-/// An app declaring `interpreter` (e.g. `interpreter = "node"`) whose
-/// command binary is a **script** (no native ELF magic) gets a launcher
-/// wrapper authored into the store payload at build time, the nix
-/// `makeWrapper`/`wrapProgram` analogy: the original script is preserved
-/// at a sibling `<command>.real` path (still shipped in the payload) and
-/// the app's command path is replaced by a wrapper that single-`exec`s the
-/// interpreter with the script's content-addressed store path, e.g.
-/// `exec "node" "$POD/store/aa/<sha256>" "$@"`. The pod farm's direct
-/// symlink then points at the wrapper and resolves to a working launcher.
-/// Native-ELF command binaries get no wrapper; apps without an
-/// `interpreter` are never touched.
+/// Two cases, both authored into the store payload at build time — the nix
+/// `makeWrapper`/`wrapProgram` analogy — so the pod farm's direct symlink
+/// points at a working launcher and the farm never adds shims:
+///
+/// 1. **Interpreter script (issue #9).** An app declaring `interpreter`
+///    (e.g. `interpreter = "node"`) whose command binary is a **script**
+///    (no native ELF magic) gets a wrapper: the original script is preserved
+///    at a sibling `<command>.real` path (still shipped in the payload) and
+///    the command path is replaced by a wrapper that single-`exec`s the
+///    interpreter with the script's content-addressed store path, e.g.
+///    `exec "node" "$POD/store/aa/<sha256>" "$@"`.
+///
+/// 2. **Native-ELF with bundled runtime libs (issue #10 part B).** A native
+///    ELF command binary that needs shared libraries the payload itself
+///    ships (`libjq.so.1`, `libonig.so.5` for jq — separate content-
+///    addressed store blobs, NOT on the binary's runpath) gets a wrapper:
+///    the real ELF is preserved at `<command>.real` and the command path is
+///    replaced by a wrapper that sets `LD_LIBRARY_PATH` to the active
+///    generation's name-preserving lib dir (where those blobs are
+///    hardlinked) and single-`exec`s the real binary's store blob.
+///
+/// Native-ELF packages whose libs are already resolvable (no bundled libs)
+/// get NO wrapper; apps without an `interpreter` were never touched by #9
+/// and only get wrapped by #10 when they bundle a runtime lib.
 ///
 /// Runs only when a pod store is provided (the build is a pod build) —
-/// `pod_store` is used to bake the script's future store blob path, which
+/// `pod_store` is used to bake the command's future store blob path, which
 /// is only defined for a pod content store.
 fn emit_build_wrappers(
     meta: &SnapMeta,
@@ -1404,10 +1417,7 @@ fn emit_build_wrappers(
     pod_store: &crate::runtime::RuntimeStore,
 ) -> miette::Result<()> {
     for (app_name, app) in &meta.apps {
-        let Some(interpreter) = &app.interpreter else {
-            continue;
-        };
-        if interpreter.is_empty() {
+        if app.interpreter.as_deref() == Some("") {
             return Err(miette::miette!(
                 "app '{app_name}': 'interpreter' must not be empty"
             ));
@@ -1421,59 +1431,145 @@ fn emit_build_wrappers(
             // planner's fail-closed lookup — nothing to wrap.
             continue;
         }
+
         if is_elf(&entry) {
-            // Native ELF — no wrapper (issue #9).
-            continue;
+            // Issue #10 part B: native-ELF wrapper ONLY when the payload
+            // bundles a runtime lib the binary needs (separate store blob
+            // not on its runpath). Already-resolvable ELFs stay unwrapped.
+            let lib_dirs = bundled_runtime_lib_dirs(&entry, stage_dir);
+            if lib_dirs.is_empty() {
+                continue;
+            }
+            emit_elf_lib_wrapper(app_name, &entry, &lib_dirs, meta, pod_store)?;
+        } else {
+            // Issue #9: interpreter-script wrapper.
+            let Some(interpreter) = &app.interpreter else {
+                continue;
+            };
+            emit_script_wrapper(app_name, &entry, interpreter, pod_store)?;
         }
-
-        // Preserve the original script in the payload at a sibling path, then
-        // replace the command path with the wrapper. The wrapper references
-        // the script by its content-addressed store blob path (computed here
-        // at build time from the script's sha256 — deterministic, so ingest
-        // later stores it at the same path).
-        let file_name = entry
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let script_path = entry.with_file_name(format!("{file_name}.real"));
-        std::fs::rename(&entry, &script_path).map_err(|e| {
-            miette::miette!(
-                "app '{app_name}': preserving interpreter script {}: {e}",
-                script_path.display()
-            )
-        })?;
-        let script_sha256 = sha256_file(&script_path).map_err(|e| {
-            miette::miette!(
-                "app '{app_name}': hashing interpreter script {}: {e}",
-                script_path.display()
-            )
-        })?;
-        let script_store_path = pod_store.blob_path(&script_sha256);
-
-        let wrapper = format!(
-            "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
-            interpreter,
-            script_store_path.display()
-        );
-        std::fs::write(&entry, wrapper).map_err(|e| {
-            miette::miette!(
-                "app '{app_name}': writing interpreter wrapper {}: {e}",
-                entry.display()
-            )
-        })?;
-        make_owner_executable(&entry).map_err(|e| {
-            miette::miette!(
-                "app '{app_name}': making wrapper executable {}: {e}",
-                entry.display()
-            )
-        })?;
     }
     Ok(())
 }
 
+/// Author the interpreter-script wrapper (issue #9) for a command path
+/// that is a shebang/script (not native ELF).
+fn emit_script_wrapper(
+    app_name: &str,
+    entry: &Path,
+    interpreter: &str,
+    pod_store: &crate::runtime::RuntimeStore,
+) -> miette::Result<()> {
+    // Preserve the original script in the payload at a sibling path, then
+    // replace the command path with the wrapper. The wrapper references
+    // the script by its content-addressed store blob path (computed here
+    // at build time from the script's sha256 — deterministic, so ingest
+    // later stores it at the same path).
+    let file_name = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let script_path = entry.with_file_name(format!("{file_name}.real"));
+    std::fs::rename(entry, &script_path).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': preserving interpreter script {}: {e}",
+            script_path.display()
+        )
+    })?;
+    let script_sha256 = sha256_file(&script_path).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': hashing interpreter script {}: {e}",
+            script_path.display()
+        )
+    })?;
+    let script_store_path = pod_store.blob_path(&script_sha256);
+
+    let wrapper = format!(
+        "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
+        interpreter,
+        script_store_path.display()
+    );
+    write_wrapper(app_name, entry, &wrapper)
+}
+
+/// Author the native-ELF runtime-lib wrapper (issue #10 part B): preserves
+/// the real ELF at `<command>.real`, then replaces the command path with a
+/// wrapper that sets `LD_LIBRARY_PATH` to the active generation's
+/// name-preserving lib dirs (where the payload's bundled runtime blobs are
+/// hardlinked) and single-`exec`s the real binary's store blob.
+fn emit_elf_lib_wrapper(
+    app_name: &str,
+    entry: &Path,
+    lib_dirs: &[std::path::PathBuf],
+    meta: &SnapMeta,
+    pod_store: &crate::runtime::RuntimeStore,
+) -> miette::Result<()> {
+    let file_name = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let real_path = entry.with_file_name(format!("{file_name}.real"));
+    std::fs::rename(entry, &real_path).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': preserving native-ELF {}: {e}",
+            real_path.display()
+        )
+    })?;
+    let real_sha256 = sha256_file(&real_path).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': hashing native-ELF {}: {e}",
+            real_path.display()
+        )
+    })?;
+    let real_store_path = pod_store.blob_path(&real_sha256);
+
+    // The payload's bundled libs are materialized (by name) under the
+    // generation tree at `extensions/<pkg>/usr/<rel-dir>`; the pod's
+    // `active` link points at the current generation. The wrapper resolves
+    // its own store blob path to derive the pod root, then points
+    // LD_LIBRARY_PATH at those name-preserving lib dirs.
+    let ld_paths: Vec<String> = lib_dirs
+        .iter()
+        .map(|rel| {
+            format!(
+                "$PODROOT/active/extensions/{}/usr/{}",
+                meta.name,
+                rel.display()
+            )
+        })
+        .collect();
+    let wrapper = format!(
+        "#!/bin/sh\n\
+         SCRIPT=\"$(readlink -f \"$0\")\"\n\
+         BLODIR=\"$(dirname \"$SCRIPT\")\"\n\
+         PODROOT=\"$(dirname \"$(dirname \"$BLODIR\")\")\"\n\
+         export LD_LIBRARY_PATH=\"{}\"\n\
+         exec \"{}\" \"$@\"\n",
+        ld_paths.join(":"),
+        real_store_path.display()
+    );
+    write_wrapper(app_name, entry, &wrapper)
+}
+
+/// Write a launcher wrapper at `entry` and mark it owner-executable.
+fn write_wrapper(app_name: &str, entry: &Path, wrapper: &str) -> miette::Result<()> {
+    std::fs::write(entry, wrapper).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': writing launcher wrapper {}: {e}",
+            entry.display()
+        )
+    })?;
+    make_owner_executable(entry).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': making wrapper executable {}: {e}",
+            entry.display()
+        )
+    })
+}
+
 /// True when `path` is a native ELF binary (its first four bytes are the
-/// ELF magic). Used by [`emit_build_wrappers`] to leave native binaries
-/// unwrapped.
+/// ELF magic). Used by [`emit_build_wrappers`] to route a command path to
+/// the native-ELF vs interpreter-script wrapper logic.
 fn is_elf(path: &Path) -> bool {
     let Ok(mut f) = std::fs::File::open(path) else {
         return false;
@@ -1489,6 +1585,195 @@ fn make_owner_executable(path: &Path) -> std::io::Result<()> {
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(perms.mode() | 0o755);
     std::fs::set_permissions(path, perms)
+}
+
+/// ELF class / byte-order of a file's ELF header, if it is an ELF.
+fn elf_class_endian(bytes: &[u8]) -> Option<(u8, u8)> {
+    if bytes.len() < 16 || &bytes[..4] != b"\x7fELF" {
+        return None;
+    }
+    Some((bytes[4], bytes[5])) // EI_CLASS, EI_DATA
+}
+
+/// Read one endian-aware unsigned integer from `bytes` at `off`.
+fn read_uint(bytes: &[u8], off: usize, size: usize, big: bool) -> Option<u64> {
+    if off.checked_add(size)? > bytes.len() {
+        return None;
+    }
+    let slice = &bytes[off..off + size];
+    Some(if big {
+        slice.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
+    } else {
+        slice
+            .iter()
+            .rev()
+            .fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
+    })
+}
+
+/// Shared-library SONAMEs listed in an ELF's `DT_NEEDED` dynamic entries.
+/// Minimal, dependency-free ELF parser (ELF32/ELF64, either byte order):
+/// walks the program headers to `PT_DYNAMIC`, reads `DT_NEEDED` offsets
+/// into the `DT_STRTAB` string table. A statically-linked binary returns
+/// an empty list; an unparseable (non-ELF/truncated) binary returns
+/// `None`.
+fn elf_needed_libs(path: &Path) -> Option<Vec<String>> {
+    const PT_DYNAMIC: u64 = 2;
+    const DT_NULL: u64 = 0;
+    const DT_NEEDED: u64 = 1;
+    const DT_STRTAB: u64 = 5;
+    let bytes = std::fs::read(path).ok()?;
+    let (class, data) = elf_class_endian(&bytes)?;
+    let big = data == 2; // ELFDATA2MSB
+    let is64 = class == 2; // ELFCLASS64
+    let (phoff, _phentsize, phnum) = if is64 {
+        (
+            read_uint(&bytes, 0x20, 8, big)?,
+            read_uint(&bytes, 0x36, 2, big)?,
+            read_uint(&bytes, 0x38, 2, big)?,
+        )
+    } else {
+        (
+            read_uint(&bytes, 0x1c, 4, big)?,
+            read_uint(&bytes, 0x2a, 2, big)?,
+            read_uint(&bytes, 0x2c, 2, big)?,
+        )
+    };
+    let (entry_size, offset_off, filesz_off) = if is64 {
+        (56usize, 8usize, 32usize)
+    } else {
+        (32usize, 4usize, 16usize)
+    };
+    // Locate PT_DYNAMIC's file range.
+    let mut dyn_range = None;
+    for i in 0..phnum {
+        let off = phoff as usize + (i as usize) * entry_size;
+        let p_type = read_uint(&bytes, off, 4, big)?;
+        if p_type == PT_DYNAMIC {
+            let p_offset = read_uint(&bytes, off + offset_off, if is64 { 8 } else { 4 }, big)?;
+            let p_filesz = read_uint(&bytes, off + filesz_off, if is64 { 8 } else { 4 }, big)?;
+            dyn_range = Some((p_offset as usize, p_filesz as usize));
+            break;
+        }
+    }
+    let (dyn_off, dyn_sz) = dyn_range?;
+    let (tag_size, val_size) = if is64 {
+        (8usize, 8usize)
+    } else {
+        (4usize, 4usize)
+    };
+    let mut strtab = None;
+    let mut needed = Vec::new();
+    let mut i = dyn_off;
+    let end = dyn_off + dyn_sz;
+    while i + tag_size + val_size <= end {
+        let tag = read_uint(&bytes, i, tag_size, big)?;
+        let val = read_uint(&bytes, i + tag_size, val_size, big)?;
+        if tag == DT_NULL {
+            break;
+        }
+        if tag == DT_NEEDED {
+            needed.push(val as usize);
+        } else if tag == DT_STRTAB {
+            strtab = Some(val as usize);
+        }
+        i += tag_size + val_size;
+    }
+    let strtab = strtab?;
+    Some(
+        needed
+            .into_iter()
+            .filter_map(|n| {
+                // Read a NUL-terminated C string at strtab + n.
+                let j = strtab + n;
+                let mut end0 = j;
+                while end0 < bytes.len() && bytes[end0] != 0 {
+                    end0 += 1;
+                }
+                if end0 >= bytes.len() {
+                    return None;
+                }
+                Some(String::from_utf8_lossy(&bytes[j..end0]).into_owned())
+            })
+            .collect(),
+    )
+}
+
+/// Relative (to the stage root) parent directories of shared libraries the
+/// payload itself ships that an ELF needs — i.e. runtime libs that will be
+/// separate content-addressed store blobs and are NOT resolvable from the
+/// binary's own runpath/system dirs. A package whose ELF needs no bundled
+/// lib is self-resolvable and needs no wrapper (issue #10 part B).
+fn bundled_runtime_lib_dirs(elf_path: &Path, stage_dir: &Path) -> Vec<std::path::PathBuf> {
+    let Some(needed) = elf_needed_libs(elf_path) else {
+        return Vec::new();
+    };
+    if needed.is_empty() {
+        return Vec::new();
+    }
+    // Walk the stage once, mapping each shared-library basename to its
+    // parent dir relative to the stage root.
+    let mut by_name: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    collect_shared_libs(stage_dir, stage_dir, &mut by_name);
+    let mut dirs = Vec::new();
+    for soname in &needed {
+        let found = by_name.iter().find_map(|(name, rel_dir)| {
+            if name == soname
+                || name
+                    .strip_prefix(soname.as_str())
+                    .is_some_and(|s| s.starts_with('.'))
+            {
+                Some(rel_dir.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(dir) = found {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
+/// Recursively record `(shared-lib basename → parent dir rel to root)`
+/// for every regular `.so`/`.so.<n>` file under `dir`.
+fn collect_shared_libs(
+    root: &Path,
+    dir: &Path,
+    out: &mut std::collections::HashMap<String, std::path::PathBuf>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_shared_libs(root, &path, out);
+        } else if path.is_file() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_shared_lib_name(&name) {
+                if let Ok(rel_dir) = path.parent().unwrap_or(root).strip_prefix(root) {
+                    out.insert(name, rel_dir.to_path_buf());
+                }
+            }
+        }
+    }
+}
+
+/// True for a shared-library filename (`lib*.so[.<digits>]` or a bare
+/// `*.so`).
+fn is_shared_lib_name(name: &str) -> bool {
+    let Some(dot) = name.rfind(".so") else {
+        return false;
+    };
+    let (base, rest) = name.split_at(dot);
+    let rest = &rest[3..]; // past ".so"
+    !base.is_empty()
+        && rest.chars().all(|c| c == '.' || c.is_ascii_digit())
+        && (rest.is_empty() || rest.starts_with('.'))
 }
 
 /// Build a `.snap` package for a single architecture.
@@ -2519,14 +2804,31 @@ pub fn sandbox_visible_entries(entries: &[PathBuf]) -> Vec<PathBuf> {
 /// Like [`sandbox_visible_entries`], but `extra_roots` are host paths the
 /// sandbox binds at their own location — the stage dir is rw-bound at its
 /// host path, so tools under it resolve inside the sandbox.
+///
+/// Each entry is first resolved to its canonical path (symlinks followed):
+/// a devbox/nix profile dir like `$PROJECT/.devbox/nix/profile/default/bin`
+/// is a symlink into `/nix/store`, so canonicalizing maps it onto a bound
+/// root and keeps the tools it exposes usable inside the sandbox (the
+/// sandbox binds `/nix`, but binds the *profile* dir nowhere). Entries that
+/// do not exist (a garbage-collected store path, a missing dir) resolve to
+/// nothing and are dropped, matching what the sandbox would see.
 pub fn sandbox_visible_entries_with(entries: &[PathBuf], extra_roots: &[PathBuf]) -> Vec<PathBuf> {
     entries
         .iter()
+        .filter_map(|e| std::fs::canonicalize(e).ok())
         .filter(|e| {
             (sandbox_visible(e) || extra_roots.iter().any(|r| e.starts_with(r))) && e.is_dir()
         })
-        .cloned()
         .collect()
+}
+
+/// The `PATH` the sandbox can actually see for the given `extra_roots`
+/// (a colon-joined [`sandbox_visible_entries_with`]) — used as the
+/// hermetic sandbox `PATH` so inherited host env (devbox/nix-shell paths
+/// that are NOT bound) never leaks into the build.
+pub fn sandbox_path(extra_roots: &[PathBuf]) -> std::ffi::OsString {
+    let entries = sandbox_visible_entries_with(&path_entries(), extra_roots);
+    std::env::join_paths(entries).unwrap_or_default()
 }
 
 /// First existing, executable match for `name` in `entries` (PATH order —
@@ -2796,9 +3098,15 @@ fn run_bwrapped(
             cmd_proc.arg("--ro-bind").arg(&sysroot).arg(&sysroot);
         }
     }
+    cmd_proc.arg("--chdir").arg(&inner_cwd);
+    // Hermetic sandbox (issue #10): drop the inherited host env so
+    // `NIX_LD`/`NIX_CFLAGS_COMPILE`/devbox PATH cannot leak host-nix store
+    // paths into built artifacts, then export a controlled PATH limited to
+    // the sandbox-visible toolchain dirs (symlinks canonicalized onto the
+    // bound roots — see `sandbox_visible_entries_with`) plus the build vars.
+    cmd_proc.env_clear();
     cmd_proc
-        .arg("--chdir")
-        .arg(&inner_cwd)
+        .env("PATH", sandbox_path(&[stage_dir.to_path_buf()]))
         .env("STAGE", stage_dir)
         .env("SRC", &inner_src);
     if let Some(name) = part_name {
@@ -7051,5 +7359,166 @@ mod wrapper_tests {
             "#!/bin/sh\necho hi\n"
         );
         assert!(!stage.path().join("bin/plain.real").exists());
+    }
+
+    // ── Issue #10 part B: native-ELF runtime-lib wrappers ──
+
+    /// True when a C compiler (`$CC` or `cc`) is available to build the
+    /// native-ELF fixtures.
+    fn cc_available() -> bool {
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+        std::process::Command::new(&cc)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Compile a tiny shared library (SONAME `lib<n>.so.1`) and an
+    /// executable linking it, into `stage/usr/lib` and `stage/usr/bin`.
+    /// Returns the app path. Gated on `cc_available()`.
+    fn build_c_fixture(stage: &Path, name: &str) -> Option<std::path::PathBuf> {
+        if !cc_available() {
+            return None;
+        }
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+        let libdir = stage.join("usr/lib");
+        let bindir = stage.join("usr/bin");
+        let srcdir = stage.join("src");
+        std::fs::create_dir_all(&libdir).unwrap();
+        std::fs::create_dir_all(&bindir).unwrap();
+        std::fs::create_dir_all(&srcdir).unwrap();
+        let sym = format!("lib{name}");
+        let hdr = srcdir.join(format!("{sym}.c"));
+        std::fs::write(&hdr, format!("int {name}_value(void){{ return 42; }}\n")).unwrap();
+        std::fs::write(
+            srcdir.join(format!("{name}.c")),
+            format!(
+                "#include <stdio.h>\nint {name}_value(void);\nint main(){{ printf(\"{name}-ran %d\\n\", {name}_value()); return 0; }}\n"
+            ),
+        )
+        .unwrap();
+        let so1 = libdir.join(format!("{sym}.so.1"));
+        let so = libdir.join(format!("{sym}.so"));
+        let status = std::process::Command::new(&cc)
+            .args([
+                "-shared",
+                "-fPIC",
+                &format!("-Wl,-soname,{sym}.so.1"),
+                "-o",
+                so1.to_str().unwrap(),
+                hdr.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "building shared lib failed");
+        // A non-symlink `lib<name>.so` (same bytes) so `-l<name>` links
+        // against it; the SONAME `lib<name>.so.1` is what the binary needs
+        // at runtime and what the bundled-lib detector keys on.
+        std::fs::copy(&so1, &so).unwrap();
+        let app = bindir.join(name);
+        let out = std::process::Command::new(&cc)
+            .args([
+                "-o",
+                app.to_str().unwrap(),
+                srcdir.join(format!("{name}.c")).to_str().unwrap(),
+                &format!("-L{}", libdir.display()),
+                &format!("-l{name}"),
+            ])
+            .output()
+            .unwrap();
+        if !out.status.success() {
+            panic!(
+                "linking app failed: {}\nlibdir={}\napp={}",
+                String::from_utf8_lossy(&out.stderr),
+                libdir.display(),
+                app.display(),
+            );
+        }
+        Some(app)
+    }
+
+    #[test]
+    fn is_shared_lib_name_matches_so_and_soname_variants() {
+        assert!(is_shared_lib_name("libjq.so"));
+        assert!(is_shared_lib_name("libjq.so.1"));
+        assert!(is_shared_lib_name("libonig.so.5.5.0"));
+        assert!(!is_shared_lib_name("jq"));
+        assert!(!is_shared_lib_name("libjq.a"));
+        assert!(!is_shared_lib_name("libjq.so.1.extra"));
+        assert!(!is_shared_lib_name(".so"));
+    }
+
+    #[test]
+    fn elf_needed_libs_reads_the_test_binary_dynamic_deps() {
+        // The test binary itself is a real native ELF with DT_NEEDED libs
+        // (libc at minimum); the parser must return names, not fail.
+        let exe = std::env::current_exe().unwrap();
+        let needed = elf_needed_libs(&exe);
+        assert!(needed.is_some(), "current exe must parse as ELF");
+        let needed = needed.unwrap();
+        assert!(!needed.is_empty(), "test binary must have DT_NEEDED libs");
+        assert!(
+            needed.iter().any(|n| n.contains("libc")),
+            "test binary must need libc, got {needed:?}"
+        );
+    }
+
+    #[test]
+    fn native_elf_with_bundled_lib_gets_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let Some(app) = build_c_fixture(stage.path(), "jtool") else {
+            eprintln!("skipping: no C compiler available");
+            return;
+        };
+        let meta = meta_with_app("jtool", "usr/bin/jtool", None);
+
+        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+
+        let wrapper = std::fs::read_to_string(&app).unwrap();
+        assert!(
+            wrapper.starts_with("#!/bin/sh"),
+            "native-ELF with bundled lib must be wrapped: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("LD_LIBRARY_PATH"),
+            "wrapper must set LD_LIBRARY_PATH: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("usr/lib"),
+            "wrapper must point at the payload lib dir: {wrapper}"
+        );
+        // The real ELF is preserved at the sibling `.real` path.
+        let real = app.with_file_name("jtool.real");
+        assert!(real.is_file(), "real ELF must be preserved as jtool.real");
+        let real_sha = sha256_file(&real).unwrap();
+        assert!(
+            wrapper.contains(&store.blob_path(&real_sha).display().to_string()),
+            "wrapper must exec the real binary's store blob: {wrapper}"
+        );
+    }
+
+    #[test]
+    fn native_elf_without_bundled_lib_gets_no_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let Some(app) = build_c_fixture(stage.path(), "ktool") else {
+            eprintln!("skipping: no C compiler available");
+            return;
+        };
+        // Remove the bundled lib: the app now needs only system libs.
+        std::fs::remove_file(stage.path().join("usr/lib/libktool.so.1")).unwrap();
+        std::fs::remove_file(stage.path().join("usr/lib/libktool.so")).unwrap();
+        let meta = meta_with_app("ktool", "usr/bin/ktool", None);
+
+        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+
+        // Still the real ELF (magic), no `.real` sibling, no wrapper.
+        assert!(is_elf(&app), "app must remain a native ELF");
+        assert!(
+            !app.with_file_name("ktool.real").exists(),
+            "no .real sibling for a resolvable ELF"
+        );
     }
 }
