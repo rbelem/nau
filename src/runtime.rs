@@ -116,6 +116,14 @@ pub struct InstalledPackage {
     /// Daemon unit names this package contributed (empty for plain
     /// apps) — the unit reconciliation set difference works over these.
     pub units: Vec<String>,
+    /// The composition precedence layer this package was installed at
+    /// (issue #8): what a loaded pod provided (`Loaded`), the pod's own
+    /// declaration (`Own`), or the pod's overlay (`Overlay`). The farm
+    /// and launcher emitters iterate in this order so the higher layer
+    /// wins a shared binary or desktop-entry name. Manifests from
+    /// before the field default to `Own`.
+    #[serde(default)]
+    pub layer: crate::farm::ClaimLayer,
     /// App name → sha256 of the app's command binary in the store.
     /// The farm emitter's source of truth (pod farm, `farm.rs`): each
     /// entry becomes a direct symlink from the farm into the content
@@ -207,13 +215,16 @@ pub struct Journal {
 /// A resolved, downloaded, not-yet-installed snap. Resolution/download
 /// happen ABOVE this type (the CLI uses [`crate::store`]; tests feed
 /// pre-made payloads) — install re-verifies sha3-384 fail-closed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PendingSnap {
     pub name: String,
     pub revision: u32,
     pub sha3_384: String,
     /// Path to the downloaded `.snap` payload.
     pub payload_path: PathBuf,
+    /// The composition precedence layer to record the package at
+    /// (issue #8). Store/pull installs land at `Own` (the default).
+    pub layer: crate::farm::ClaimLayer,
 }
 
 /// A channel-side manifest signature envelope (ADR-0011 step (d)): the
@@ -1064,6 +1075,7 @@ impl RuntimeStore {
             sha3_384: snap.sha3_384.clone(),
             files,
             units,
+            layer: snap.layer,
             apps,
             desktops,
         }
@@ -1953,6 +1965,7 @@ mod tests {
             sha3_384: "abc".into(),
             files,
             units: units.iter().map(|s| s.to_string()).collect(),
+            layer: crate::farm::ClaimLayer::Own,
             apps: BTreeMap::new(),
             desktops: BTreeMap::new(),
         }
@@ -2193,6 +2206,7 @@ plugs:
             revision: 7,
             sha3_384: sha3_384_file(&payload).unwrap(),
             payload_path: payload,
+            ..Default::default()
         };
 
         let report = f
@@ -2322,6 +2336,7 @@ plugs:
             revision: 7,
             sha3_384: sha3_384_file(&payload).unwrap(),
             payload_path: payload,
+            ..Default::default()
         };
         f.store
             .install_batch(
@@ -2364,6 +2379,7 @@ plugs:
             revision: 7,
             sha3_384: sha3_384_file(p).unwrap(),
             payload_path: p.to_path_buf(),
+            ..Default::default()
         };
         f.store
             .install_batch(
@@ -2439,6 +2455,7 @@ plugs:
             revision: 1,
             sha3_384: sha3_384_file(&payload).unwrap(),
             payload_path: payload,
+            ..Default::default()
         };
         let err = f
             .store
@@ -2470,6 +2487,7 @@ plugs:
             revision: 7,
             sha3_384: sha3_384_file(&payload).unwrap(),
             payload_path: payload,
+            ..Default::default()
         };
         f.store
             .install_batch(&[pending], &SignatureEnvelope::default(), &tools)
@@ -2676,6 +2694,7 @@ plugs:
                 sha3_384: "aaa".into(),
                 files: vec![],
                 units: vec![],
+                layer: crate::farm::ClaimLayer::Own,
                 apps: BTreeMap::new(),
                 desktops: BTreeMap::new(),
             },
@@ -2689,6 +2708,7 @@ plugs:
                 sha3_384: "bbb".into(),
                 files: vec![],
                 units: vec![],
+                layer: crate::farm::ClaimLayer::Own,
                 apps: BTreeMap::new(),
                 desktops: BTreeMap::new(),
             },

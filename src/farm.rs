@@ -21,7 +21,9 @@
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
-use crate::runtime::{Generation, RuntimeStore};
+use serde::{Deserialize, Serialize};
+
+use crate::runtime::{Generation, InstalledPackage, RuntimeStore};
 
 /// The farm directory inside a generation: `<root>/generations/<n>/farm`.
 pub const FARM_DIR: &str = "farm";
@@ -33,14 +35,22 @@ pub const CURRENT_LINK: &str = "current";
 // ── ID-collision classifier (shared, not desktop-specific) ──
 
 /// The precedence layer a claim on a shared ID (a desktop application ID
-/// today, a binary name under loads, #8) comes from. Derived from the pod
-/// layering chain (CONTEXT.md: Overlay): a package as declared is
-/// `Base`; a package patched by this pod's overlay is `Layer`, which
-/// strictly dominates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// or a binary name) comes from. Derived from the pod composition chain
+/// (CONTEXT.md: Pod, Overlay — issue #8): a package provided by a loaded
+/// pod is `Loaded` (lowest); the loading pod's own declaration is `Own`;
+/// a package patched by this pod's inline overlay is `Overlay`, which
+/// strictly dominates. A pod never sits below what it loads: the loading
+/// pod wins cross-layer binary conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ClaimLayer {
-    Base,
-    Layer,
+    /// Provided by a loaded pod (issue #8) — the composition floor.
+    Loaded,
+    /// This pod's own declared packages.
+    #[default]
+    Own,
+    /// This pod's inline overlay — the top layer.
+    Overlay,
 }
 
 /// The verdict for two claims on the same ID.
@@ -69,6 +79,37 @@ pub fn classify_collision(incumbent: ClaimLayer, incoming: ClaimLayer) -> Collis
     }
 }
 
+/// Packages of a generation in deterministic LAYER order (issue #8):
+/// lower precedence first (`Loaded` < `Own` < `Overlay`), package name
+/// breaking ties. Consumers that emit a shared name (farm links,
+/// desktop entries) iterate in this order so a later entry overwrites
+/// an earlier one and the HIGHER layer wins the shared name — the
+/// loading pod's own content beats what it loaded.
+pub fn layered_packages(gen: &Generation) -> Vec<&InstalledPackage> {
+    let mut pkgs: Vec<&InstalledPackage> = gen.packages.values().collect();
+    pkgs.sort_by_key(|p| (p.layer, p.name.clone()));
+    pkgs
+}
+
+/// Warn about one name collision resolved at emit time (activation).
+/// Generations this code produces are collision-checked at mutation
+/// time (`pod.rs` claim resolution), so emit only ever sees cross-layer
+/// overrides (warn: higher layer wins) or same-precedence duplicates
+/// from pre-#8 manifests (warn: deterministic replacement). Never
+/// silent, never fatal — a rollback must always be able to re-emit.
+pub fn warn_emit_collision(kind: &str, id: &str, winner: &str, loser: &str, same_layer: bool) {
+    if same_layer {
+        crate::output::warn(format!(
+            "{kind} '{id}' is shipped by both '{winner}' and '{loser}' at the same \
+             precedence (pre-composition manifest) — '{winner}' wins deterministically"
+        ));
+    } else {
+        crate::output::warn(format!(
+            "{kind} '{id}' from '{winner}' overrides '{loser}' (higher layer wins)"
+        ));
+    }
+}
+
 /// Farm directory of generation `n`.
 pub fn farm_dir(store: &RuntimeStore, n: u64) -> PathBuf {
     store.generation_dir(n).join(FARM_DIR)
@@ -77,9 +118,12 @@ pub fn farm_dir(store: &RuntimeStore, n: u64) -> PathBuf {
 /// Emit (rebuild) the farm for generation `n` from its manifest and
 /// return the farm path.
 ///
-/// Package order is the manifest's BTreeMap order, so farm collisions
-/// (two packages exporting the same app name) resolve deterministically:
-/// the later package wins, exactly like the last entry of a PATH.
+/// Packages iterate in LAYER order ([`layered_packages`], issue #8), so
+/// a binary name shared across the composition resolves to the highest
+/// layer: the loading pod's own package overrides a loaded pod's with a
+/// warning; a same-precedence duplicate (only possible in pre-#8
+/// manifests) warns and resolves deterministically by package name.
+/// Cross-layer shadowing is never silent.
 pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
     let farm = farm_dir(store, gen.n);
     if farm.exists() {
@@ -88,8 +132,19 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
     }
     std::fs::create_dir_all(&farm)
         .map_err(|e| miette::miette!("creating farm {}: {e}", farm.display()))?;
-    for pkg in gen.packages.values() {
+    let mut seen: std::collections::BTreeMap<&str, (&str, ClaimLayer)> = Default::default();
+    for pkg in layered_packages(gen) {
         for (app, hash) in &pkg.apps {
+            if let Some((incumbent_pkg, incumbent_layer)) = seen.get(app.as_str()) {
+                warn_emit_collision(
+                    "binary",
+                    app,
+                    &pkg.name,
+                    incumbent_pkg,
+                    *incumbent_layer == pkg.layer,
+                );
+            }
+            seen.insert(app, (&pkg.name, pkg.layer));
             let link = farm.join(app);
             // Same-content collisions leave identical links; differing
             // content must not accumulate — replace, never merge.
@@ -173,6 +228,7 @@ mod tests {
                 sha3_384: "abc".into(),
                 files: vec![],
                 units: vec![],
+                layer: ClaimLayer::Own,
                 apps: apps
                     .iter()
                     .map(|(a, h)| (a.to_string(), h.to_string()))
@@ -279,6 +335,7 @@ mod tests {
                 sha3_384: "abc".into(),
                 files: vec![],
                 units: vec![],
+                layer: ClaimLayer::Own,
                 apps: apps
                     .iter()
                     .map(|(a, h)| (a.to_string(), h.to_string()))
@@ -400,11 +457,14 @@ mod tests {
 
     #[test]
     fn classifier_same_precedence_errors_layer_overrides() {
-        use ClaimLayer::{Base, Layer};
+        use ClaimLayer::{Loaded, Overlay, Own};
         use CollisionVerdict::*;
-        assert_eq!(classify_collision(Base, Base), Error);
-        assert_eq!(classify_collision(Layer, Layer), Error);
-        assert_eq!(classify_collision(Base, Layer), Override);
-        assert_eq!(classify_collision(Layer, Base), Shadowed);
+        assert_eq!(classify_collision(Own, Own), Error);
+        assert_eq!(classify_collision(Overlay, Overlay), Error);
+        assert_eq!(classify_collision(Loaded, Loaded), Error);
+        assert_eq!(classify_collision(Loaded, Own), Override);
+        assert_eq!(classify_collision(Own, Overlay), Override);
+        assert_eq!(classify_collision(Overlay, Own), Shadowed);
+        assert_eq!(classify_collision(Own, Loaded), Shadowed);
     }
 }

@@ -160,8 +160,20 @@ pub fn emit_in(
     let mut keep: BTreeSet<String> = BTreeSet::new();
 
     let farm = store.root().join(crate::farm::CURRENT_LINK);
-    for pkg in gen.packages.values() {
+    let mut seen: std::collections::BTreeMap<&str, (&str, crate::farm::ClaimLayer)> =
+        Default::default();
+    for pkg in crate::farm::layered_packages(gen) {
         for (app_id, launcher) in &pkg.desktops {
+            if let Some((incumbent_pkg, incumbent_layer)) = seen.get(app_id.as_str()) {
+                crate::farm::warn_emit_collision(
+                    "application id",
+                    app_id,
+                    &pkg.name,
+                    incumbent_pkg,
+                    *incumbent_layer == pkg.layer,
+                );
+            }
+            seen.insert(app_id, (&pkg.name, pkg.layer));
             let exec = farm.join(app_id);
             let icon = if launcher.icon.is_some() {
                 Some(icon_name(pod, app_id))

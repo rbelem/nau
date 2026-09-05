@@ -2094,6 +2094,7 @@ fn runtime_fetch(name: &str, channel: &str, downloads: &Path) -> miette::Result<
         revision: resolved.revision,
         sha3_384: resolved.sha3_384,
         payload_path: payload,
+        ..Default::default()
     })
 }
 

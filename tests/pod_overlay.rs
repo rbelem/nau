@@ -461,7 +461,8 @@ gated_test!(overlay_nonexistent_package_fails_before_any_mutation, {
     let (code, _, stderr) = run(project.path(), root.path(), &["sync"]);
     assert_eq!(code, Some(1), "must fail: {stderr}");
     assert!(
-        stderr.contains("ghost") && stderr.contains("does not declare"),
+        stderr.contains("ghost")
+            && (stderr.contains("does not build") || stderr.contains("does not declare")),
         "error must name the nonexistent overlay target: {stderr}"
     );
     // Zero writes: the declaration is NOT re-rendered (still exactly the

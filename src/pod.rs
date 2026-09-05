@@ -38,6 +38,43 @@
 //! the generation manifest, and the farm binary. Overlay validation
 //! (key names a declared package, fields in the whitelist) runs before
 //! any mutation.
+//!
+//! Issue #8: pod composition. A pod declares `loads = { "base" }` and
+//! resolves as: shared collection < loaded pods (in listed order) < its
+//! own packages < its inline overlay. Semantics, chosen here and
+//! binding for later tickets:
+//!
+//! - **Read-only consumption**: a pod never mutates a pod it loads. The
+//!   loading pod reads the loaded pod's active generation (its package
+//!   versions + its overlay map) and nothing else; the loaded pod's
+//!   lockfile is not consulted because the generation already records
+//!   the versions that hold there. A loaded pod with no active
+//!   generation yet contributes its declaration resolved the way its
+//!   own first sync would resolve (overlay applied, live version) —
+//!   the composition is live-following, never pinned across pods.
+//! - **The version that executes**: a loaded package is rebuilt into
+//!   the loading pod's store with the version its loaded generation
+//!   records (same overlay build inputs), so the loading pod executes
+//!   what the loaded pod executes. Rebuilt content is deterministic
+//!   (fixed build epoch), so a no-change sync installs nothing new.
+//! - **Rollback/update interplay**: rolling back (or updating) a loaded
+//!   pod rewrites only THAT pod; the loading pod's generation stays put
+//!   and picks the change up on its next reconcile (`sync`, `add`,
+//!   `remove`, `update` all reconcile).
+//! - **Precedence**: the loading pod's own declaration wins a name
+//!   clash with a loaded pod outright (same package name = same
+//!   identity: the loaded copy never enters the composition). Shared
+//!   BINARY names across DIFFERENT packages go through the shared
+//!   collision classifier (`crate::farm::classify_collision`,
+//!   generalized to `Loaded` < `Own` < `Overlay` layers): a higher
+//!   layer overrides with a warning naming winner and loser; two
+//!   packages at the same precedence shipping the same binary are a
+//!   hard error. Conflicts evaluate at mutation time (before any store
+//!   write) and again at activation time (the farm/launcher emitters
+//!   warn on every collision they resolve — no silent shadowing path).
+//! - **Failure before mutation**: loading a nonexistent pod, or any
+//!   load cycle (self-load included), fails validation before a single
+//!   write, with the offending pod / the full cycle named.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -405,23 +442,29 @@ fn apply_overlay(
 }
 
 /// Validate a declaration's overlay entries BEFORE any mutation: every
-/// overlay key must name a package the pod builds (its declared
-/// `packages` — loaded pods join that set in #8), and every entry must
-/// be a patch of whitelisted string fields. Run at the top of every
-/// mutating verb so a bad overlay fails with a clear error and zero
-/// writes.
-fn validate_overlays(decl: &PodDeclaration, pod_name: &str) -> miette::Result<()> {
-    let declared: HashSet<String> = decl
+/// overlay key must name a package the pod builds — its declared
+/// `packages` or one provided by a pod it loads (issue #8; an overlay
+/// targeting a loaded package is this pod's top-layer decision) — and
+/// every entry must be a patch of whitelisted string fields. Run at the
+/// top of every mutating verb so a bad overlay fails with a clear error
+/// and zero writes.
+fn validate_overlays(root: &Path, decl: &PodDeclaration, pod_name: &str) -> miette::Result<()> {
+    let mut declared: HashSet<String> = decl
         .packages
         .iter()
         .filter_map(|spec| parse_pod_package(spec).ok().map(|p| p.name))
         .collect();
+    // Loaded pods join the targetable set (issue #8), sub-loads
+    // included. A `loads` entry naming a nonexistent pod already failed
+    // `validate_loads`; here a missing declaration simply contributes
+    // no names.
+    declared.extend(loaded_package_names(root, decl)?);
     for (pkg, patch) in &decl.overlay {
         if !declared.contains(pkg) {
             miette::bail!(
-                "overlay targets package '{pkg}', which pod '{pod_name}' does not declare \
-                 — overlays apply to packages the pod builds (declared in 'packages'); \
-                 overlaying a nonexistent package is an error",
+                "overlay targets package '{pkg}', which pod '{pod_name}' does not build \
+                 — overlays apply to packages the pod declares in 'packages' or loads \
+                 (issue #8); overlaying a nonexistent package is an error",
             );
         }
         let Some(obj) = patch.as_object() else {
@@ -609,11 +652,159 @@ pub fn load_declaration(root: &Path, pod_name: &str) -> miette::Result<PodDeclar
     evaluate_pod_file(&path)
 }
 
+// ── Loads (issue #8) ──
+
+/// Validate a pod's `loads` BEFORE any mutation: every loaded pod name
+/// is valid and its declaration exists, and the load graph reachable
+/// from `pod_name` contains no cycle (a self-load is a cycle of length
+/// one). Pure reads — safe to run at the top of every mutating verb.
+pub fn validate_loads(root: &Path, pod_name: &str, decl: &PodDeclaration) -> miette::Result<()> {
+    for loaded in &decl.loads {
+        validate_pod_name(loaded)
+            .map_err(|e| miette::miette!("pod '{pod_name}' loads '{loaded}': {e}"))?;
+        let path = pod_lua_path(root, loaded);
+        if !path.exists() {
+            miette::bail!(
+                "pod '{pod_name}' loads '{loaded}', but pod '{loaded}' has no declaration \
+                 at {} — create the loaded pod first \
+                 (`shuttle pod --name {loaded} add <package>` initializes it)",
+                path.display()
+            );
+        }
+    }
+    detect_load_cycle(root, pod_name, decl)
+}
+
+/// DFS over the load graph reachable from `start`: a pod revisited on
+/// the current path is a cycle, named in full (`work -> base -> work`).
+/// Fully-explored pods are memoized — a DAG branch is walked once.
+fn detect_load_cycle(root: &Path, start: &str, start_decl: &PodDeclaration) -> miette::Result<()> {
+    fn visit(
+        root: &Path,
+        pod: &str,
+        decl: &PodDeclaration,
+        stack: &mut Vec<String>,
+        done: &mut HashSet<String>,
+    ) -> miette::Result<()> {
+        stack.push(pod.to_string());
+        let result = (|| {
+            for loaded in &decl.loads {
+                if let Some(pos) = stack.iter().position(|p| p == loaded) {
+                    let mut cycle: Vec<String> = stack[pos..].to_vec();
+                    cycle.push(loaded.clone());
+                    miette::bail!("pod load cycle detected: {}", cycle.join(" -> "));
+                }
+                if done.contains(loaded) {
+                    continue;
+                }
+                let loaded_decl = load_declaration(root, loaded)?;
+                visit(root, loaded, &loaded_decl, stack, done)?;
+            }
+            Ok(())
+        })();
+        stack.pop();
+        done.insert(pod.to_string());
+        result
+    }
+    let mut stack = Vec::new();
+    let mut done = HashSet::new();
+    visit(root, start, start_decl, &mut stack, &mut done)
+}
+
+/// What one loaded pod contributes to the loading pod's composition:
+/// the package versions it currently executes (its active generation —
+/// read-only) or, when it has no generation yet, the versions its own
+/// first sync would build (declaration + its overlays, live). Sub-loads
+/// are folded in beneath its own packages (same precedence rules one
+/// level down), so a chain resolves through this one call.
+struct LoadedContribution {
+    /// The loaded pod's own overlay entries — applied when re-resolving
+    /// its packages so the rebuilt payload carries the same build
+    /// inputs the loaded pod itself used.
+    overlay: BTreeMap<String, serde_json::Value>,
+    /// Package name → executing version (None: resolve live).
+    packages: BTreeMap<String, Option<String>>,
+}
+
+fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedContribution> {
+    let decl = load_declaration(root, pod_name)?;
+    let store = pod_store(&pod_dir(root, pod_name));
+    if let Some(active) = store.active_generation()? {
+        return Ok(LoadedContribution {
+            overlay: decl.overlay,
+            packages: active
+                .packages
+                .iter()
+                .map(|(name, pkg)| (name.clone(), Some(pkg.version.clone())))
+                .collect(),
+        });
+    }
+    // No generation yet: mirror the loaded pod's own first sync — its
+    // declared packages resolve fresh (overlay applied), its sub-loads
+    // fold in beneath (own packages win the name clash, issue #8).
+    // Acyclicity is guaranteed: `validate_loads` ran before this read.
+    let mut packages = BTreeMap::new();
+    for spec_str in &decl.packages {
+        let spec = parse_pod_package(spec_str)?;
+        let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+            miette::miette!("cannot resolve loaded pod's package '{}': {e}", spec.name)
+        })?;
+        if let Some(patch) = decl.overlay.get(&spec.name) {
+            apply_overlay(&mut meta, patch).map_err(|e| {
+                miette::miette!(
+                    "pod '{pod_name}' overlay of '{}' is invalid: {e}",
+                    spec.name
+                )
+            })?;
+        }
+        packages.insert(spec.name, Some(meta.version));
+    }
+    for loaded in &decl.loads {
+        let sub = loaded_contribution(root, loaded)?;
+        for (name, version) in sub.packages {
+            packages.entry(name).or_insert(version);
+        }
+    }
+    Ok(LoadedContribution {
+        overlay: decl.overlay,
+        packages,
+    })
+}
+
+/// The union of package names the pod's `loads` provide (own names
+/// shadow sub-load names, but the union is what the overlay-target
+/// check needs). Declaration-only, no resolution — read-only and cheap.
+fn loaded_package_names(root: &Path, decl: &PodDeclaration) -> miette::Result<HashSet<String>> {
+    fn collect(
+        root: &Path,
+        decl: &PodDeclaration,
+        visited: &mut HashSet<String>,
+        out: &mut HashSet<String>,
+    ) -> miette::Result<()> {
+        for spec in &decl.packages {
+            if let Ok(parsed) = parse_pod_package(spec) {
+                out.insert(parsed.name);
+            }
+        }
+        for loaded in &decl.loads {
+            if visited.insert(loaded.clone()) {
+                let loaded_decl = load_declaration(root, loaded)?;
+                collect(root, &loaded_decl, visited, out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut visited = HashSet::new();
+    let mut out = HashSet::new();
+    collect(root, decl, &mut visited, &mut out)?;
+    Ok(out)
+}
 /// Add a package to a pod: resolve it from the package collection FIRST
 /// (an unknown package must not modify any state), then record it in
 /// `pod.lua` and pin the resolved version in the lockfile, then
 /// reconcile the declaration into the pod's store, generation chain,
-/// and bin farm (issue #3).
+/// and bin farm (issue #3). Loads are validated (existence + cycles)
+/// before any write (issue #8).
 pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Result<PodAddReport> {
     validate_pod_name(pod_name)?;
     let spec = parse_pod_package(spec_str)?;
@@ -633,10 +824,13 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
             );
         }
     }
+    // Loads must resolve and be acyclic before ANY write (issue #8);
+    // overlays validated against own + loaded packages.
+    validate_loads(root, pod_name, &decl)?;
     // The spec joins the declaration before overlay validation: an
     // overlay for the package being added is written ahead of the add.
     decl.packages.push(spec_str.to_string());
-    validate_overlays(&decl, pod_name)?;
+    validate_overlays(root, &decl, pod_name)?;
     // The overlay entry for this package is the top layer: pin the
     // EFFECTIVE version, not the collection's (issue #6).
     let mut meta = meta;
@@ -644,6 +838,14 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
         apply_overlay(&mut meta, patch)
             .map_err(|e| miette::miette!("cannot add '{}' with its overlay: {e}", spec.name))?;
     }
+    // Binary-collision precheck (issue #8): a same-precedence clash with
+    // the pod's post-state package set must fail BEFORE any write.
+    let new_layer = if decl.overlay.contains_key(&spec.name) {
+        crate::farm::ClaimLayer::Overlay
+    } else {
+        crate::farm::ClaimLayer::Own
+    };
+    precheck_binary_collision(root, &decl, &spec.name, &meta, new_layer)?;
 
     let dir = pod_dir(root, pod_name);
     std::fs::create_dir_all(&dir)
@@ -687,7 +889,8 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
 
 /// Remove a package from a pod: drop it from the declaration and delete
 /// its lockfile pin, then reconcile — the store generation without it
-/// and a farm that no longer exposes its binaries (issue #3).
+/// and a farm that no longer exposes its binaries (issue #3). Loads are
+/// validated before any write (issue #8).
 pub fn remove_package(
     root: &Path,
     pod_name: &str,
@@ -696,6 +899,7 @@ pub fn remove_package(
     validate_pod_name(pod_name)?;
     let spec = parse_pod_package(spec_str)?;
     let mut decl = load_declaration(root, pod_name)?;
+    validate_loads(root, pod_name, &decl)?;
     let before = decl.packages.len();
     decl.packages.retain(|existing| {
         match parse_pod_package(existing) {
@@ -804,7 +1008,8 @@ pub fn version_matches_constraint(version: &str, constraint: &str) -> bool {
 /// the named ones), repin the lockfile for every version that moved,
 /// then reconcile — the store, farm, and generation follow the pins.
 /// Constraint-honoring: `pkg@14` adopts the candidate only while it is
-/// a 14.x; otherwise the package is held at its pin.
+/// a 14.x; otherwise the package is held at its pin. Loads are
+/// validated (existence + cycles) before any write (issue #8).
 pub fn update_pod(
     root: &Path,
     pod_name: &str,
@@ -813,7 +1018,8 @@ pub fn update_pod(
     validate_pod_name(pod_name)?;
     let decl = load_declaration(root, pod_name)?;
     // Fail fast on a malformed overlay, before any resolution or repin.
-    validate_overlays(&decl, pod_name)?;
+    validate_loads(root, pod_name, &decl)?;
+    validate_overlays(root, &decl, pod_name)?;
 
     // An explicit target set must name declared packages (a trailing
     // `@constraint` on the CLI argument is ignored, like `remove`).
@@ -1084,6 +1290,18 @@ pub fn pod_store(pod_dir: &Path) -> crate::runtime::RuntimeStore {
 /// already carries the pinned version, the package is HELD at its store
 /// content — not rebuilt at the candidate (that is what `shuttle pod
 /// update` is for). Otherwise it builds normally.
+///
+/// Composition (issue #8): the pod's `loads` resolve FIRST — each loaded
+/// pod contributes its ACTIVE generation's package versions (read-only;
+/// a loading pod never mutates a pod it loads) or, when it has none yet,
+/// its declaration as its own first sync would build it — folded in
+/// beneath the loading pod's own packages, which win a same-name clash
+/// outright. Loaded and own packages carrying the same BINARY name (across
+/// DIFFERENT package names) run through the shared collision classifier
+/// before any write: a higher layer overrides (warn), a same-precedence
+/// duplicate errors. Loaded packages land at `ClaimLayer::Loaded`, own at
+/// `Own`, overlay-patched at `Overlay`, recorded in the generation
+/// manifest so the farm resamples the same order at activation.
 pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     reconcile_pod(root, pod_name)
 }
@@ -1092,10 +1310,11 @@ pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
 fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     validate_pod_name(pod_name)?;
     let decl = load_declaration(root, pod_name)?;
-    // Overlay validation happens FIRST, before any mutation (issue #6):
-    // a declaration overlaying a nonexistent package or carrying an
-    // unsupported field fails here with zero writes.
-    validate_overlays(&decl, pod_name)?;
+    // Loads (existence + cycles) and overlay validation happen FIRST,
+    // before any mutation (issue #8/#6): a bad declaration fails here
+    // with zero writes.
+    validate_loads(root, pod_name, &decl)?;
+    validate_overlays(root, &decl, pod_name)?;
     let dir = pod_dir(root, pod_name);
     std::fs::create_dir_all(&dir)
         .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
@@ -1111,12 +1330,16 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     // keep the declaration half authoritative (removals below still
     // proceed; they never unpack).
     //
-    // Layering (issue #6, CONTEXT.md: Overlay): each package resolves
+    // Layering (issue #6/#8, CONTEXT.md: Overlay): each package resolves
     // from the shared collection, then through the pod's own pin (the
     // hold below keeps collection drift from moving the pod silently),
-    // then through the pod's overlay entry — later wins. An overlay
-    // entry suppresses the hold (an explicit per-pod customization is a
-    // decision, not drift) and its version pin flows into the lockfile.
+    // then through the pod's overlay entry — later wins. Loaded pods'
+    // packages resolve beneath the pod's own: the version a loaded pod
+    // currently executes (its active generation — live-following, never
+    // pinned across pods) or, when it has no generation, its declaration
+    // as its own first sync would build it. A loading pod never mutates a
+    // pod it loads: only the loaded pod's generation + declaration are
+    // read.
     let can_install = tools.unsquashfs.is_some() && crate::runtime::tool_on_path("mksquashfs");
     let mut pending = Vec::new();
     let mut held = Vec::new();
@@ -1125,13 +1348,41 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     // (issue #7): collected in declaration order, resolved for
     // collisions BEFORE any store write.
     let mut desktop_claims = Vec::new();
+    // Binary-name claims of the post-state package set (issue #8): the
+    // shared collision classifier over loaded/own/overlay layers, run
+    // BEFORE any store write so a same-precedence clash is a hard error
+    // with zero writes.
+    let mut binary_claims: Vec<BinaryClaim> = Vec::new();
     // Version pins the reconcile moved (overlay wins over the pin):
     // recorded only after the build succeeded, applied only after the
     // install succeeded — a failed reconcile leaves the pin in place.
     let mut repins: Vec<(String, PodPackageLockEntry)> = Vec::new();
     let lock_path = pod_lock_path(root, pod_name);
     let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+
+    // Loaded pods, in listed order (issue #8): each contributes its
+    // package versions. The own package set is the name-clash winner, so
+    // a loaded package whose name the pod itself declares never enters
+    // the composition. The loading pod does NOT write the loaded pod.
+    let mut loaded_versions: BTreeMap<String, String> = BTreeMap::new();
+    let mut loaded_overlays: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    {
+        for loaded in &decl.loads {
+            let contribution = loaded_contribution(root, loaded)?;
+            for (name, version) in contribution.packages {
+                loaded_versions
+                    .entry(name)
+                    .or_insert(version.unwrap_or_default());
+            }
+            for (name, patch) in contribution.overlay {
+                loaded_overlays.entry(name).or_insert(patch);
+            }
+        }
+    }
+
     if can_install {
+        // Own packages (in declared order) sit at `Own` (or `Overlay`
+        // when patched) — above anything loaded.
         for spec_str in &decl.packages {
             let spec = parse_pod_package(spec_str)?;
             let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
@@ -1151,23 +1402,10 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
                 })?;
             }
             declared_names.insert(meta.name.clone());
-            // Hold at the pin: the lockfile says one version, the
-            // package collection now resolves another, and the active
-            // generation already carries the pinned content. Rebuilding
-            // would move the pod forward silently — update does that
-            // deliberately, the reconcile never does. An overlay entry
-            // skips the hold: it is this pod's explicit, layered
-            // decision (overlay > own packages > collection).
-            // Desktop application-ID claims (issue #7): a package with
-            // an overlay sits on the overlay layer (later layer wins);
-            // a plain package sits on the base layer. A HELD package
-            // claims through the ACTIVE generation's recorded desktops
-            // (that is the content that stays installed), at the base
-            // layer — the hold is the absence of an overlay decision.
             let layer = if overlay.is_some() {
-                crate::farm::ClaimLayer::Layer
+                crate::farm::ClaimLayer::Overlay
             } else {
-                crate::farm::ClaimLayer::Base
+                crate::farm::ClaimLayer::Own
             };
             if overlay.is_none() {
                 if let Some(pin) = lock.packages.get(&spec.name) {
@@ -1185,7 +1423,12 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
                             push_desktop_claims(
                                 &mut desktop_claims,
                                 installed_pkg,
-                                crate::farm::ClaimLayer::Base,
+                                crate::farm::ClaimLayer::Own,
+                            );
+                            push_installed_binary_claims(
+                                &mut binary_claims,
+                                installed_pkg,
+                                crate::farm::ClaimLayer::Own,
                             );
                         }
                         continue;
@@ -1193,8 +1436,7 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
                 }
             }
             push_meta_desktop_claims(&mut desktop_claims, &meta, layer);
-            // An effective version different from the pin repins the
-            // lockfile: the pin records what the pod actually builds.
+            push_meta_binary_claims(&mut binary_claims, &meta, layer);
             if lock.packages.get(&spec.name).map(|e| e.version.as_str())
                 != Some(meta.version.as_str())
             {
@@ -1206,15 +1448,65 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
                     },
                 ));
             }
-            pending.push(build_pending_snap(&store, &meta)?);
+            pending.push(build_pending_snap(&store, &meta, layer)?);
         }
-    } else if !decl.packages.is_empty() {
+
+        // Loaded packages (issue #8): a loaded pod's package is rebuilt
+        // at the version it currently executes — same overlay build
+        // inputs, so the loading pod executes exactly what the loaded pod
+        // executes. Deterministic build output keeps a no-change reconcile
+        // a no-op. Own packages with the same NAME shadow them outright
+        // (the loaded copy never enters); the name is skipped below.
+        for (name, version) in &loaded_versions {
+            if declared_names.contains(name) {
+                continue;
+            }
+            let mut meta = crate::deps::load_meta(name).map_err(|e| {
+                miette::miette!(
+                    "loaded package '{}' from pod '{}' cannot be resolved: {e}",
+                    name,
+                    pod_name
+                )
+            })?;
+            // Apply the loaded pod's overlay for this package so the
+            // rebuilt payload carries the same build inputs it would get
+            // in the loaded pod itself. The loading pod's own overlay for
+            // this loaded package is the TOP layer: it wins.
+            if let Some(patch) = loaded_overlays.get(name) {
+                apply_overlay(&mut meta, patch).map_err(|e| {
+                    miette::miette!("loaded package '{name}' overlay is invalid: {e}")
+                })?;
+            }
+            if let Some(patch) = decl.overlay.get(name) {
+                apply_overlay(&mut meta, patch).map_err(|e| {
+                    miette::miette!(
+                        "cannot build loaded package '{name}' with this pod's overlay: {e}"
+                    )
+                })?;
+            }
+            // Pin the loaded package at the executing version (a loaded
+            // pod's active generation version wins over collection drift).
+            if !version.is_empty() {
+                meta.version = version.clone();
+            }
+            declared_names.insert(meta.name.clone());
+            push_meta_desktop_claims(&mut desktop_claims, &meta, crate::farm::ClaimLayer::Loaded);
+            push_meta_binary_claims(&mut binary_claims, &meta, crate::farm::ClaimLayer::Loaded);
+            pending.push(build_pending_snap(
+                &store,
+                &meta,
+                crate::farm::ClaimLayer::Loaded,
+            )?);
+        }
+    } else if !decl.packages.is_empty() || !loaded_versions.is_empty() {
         warn_degraded_install();
     }
 
-    // Desktop app-ID collision check (issue #7) — BEFORE any store
-    // write, so a same-precedence collision fails with zero writes.
+    // Desktop app-ID collision check (issue #7) and binary-name
+    // collision check (issue #8) — BEFORE any store write, so a
+    // same-precedence collision fails with zero writes.
     resolve_desktop_claims(&desktop_claims)?;
+    resolve_binary_claims(&binary_claims)?;
 
     // Install the changed set (a no-op batch creates no generation).
     let mut installed = Vec::new();
@@ -1226,7 +1518,10 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     }
 
     // Overlay-driven repins (issue #6): applied only after the installs
-    // succeeded, so a failed reconcile leaves the pin untouched.
+    // succeeded, so a failed reconcile leaves the pin untouched. Loaded
+    // packages are NOT repinned in this pod's lockfile: a loaded pod's
+    // versions live in the loaded pod, and this pod follows them live
+    // (issue #8 — read-only consumption, no cross-pod pins).
     if !repins.is_empty() {
         for (name, entry) in repins {
             lock.packages.insert(name, entry);
@@ -1345,7 +1640,7 @@ fn resolve_desktop_claims(claims: &[DesktopClaim]) -> miette::Result<()> {
             }
             crate::farm::CollisionVerdict::Override => {
                 crate::output::warn(format!(
-                    "application id '{}' from '{}' overrides '{}' (overlay layer wins)",
+                    "application id '{}' from '{}' overrides '{}' (higher layer wins)",
                     claim.app_id, claim.pkg, existing.pkg
                 ));
                 incumbent.insert(claim.app_id.clone(), claim.clone());
@@ -1354,6 +1649,169 @@ fn resolve_desktop_claims(claims: &[DesktopClaim]) -> miette::Result<()> {
                 crate::output::warn(format!(
                     "application id '{}' from '{}' is shadowed by '{}' (lower layer loses)",
                     claim.app_id, claim.pkg, existing.pkg
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Binary-name claims (issue #8) ──
+
+/// Pre-write binary-collision check for `add_package` (issue #8): the
+/// same-precedence clash must fail BEFORE the declaration or lockfile is
+/// written. Collects the binary claims of the post-state package set —
+/// the package being added (already overlaid) plus every existing
+/// declared package — and resolves them. A same-precedence collision
+/// bails (caller writes nothing); a cross-layer override is allowed here
+/// (reconcile warns at activation). Loaded-pod contributions are folded
+/// in at `Loaded` so an add never silently shadows a loaded binary either.
+fn precheck_binary_collision(
+    root: &Path,
+    decl: &PodDeclaration,
+    new_name: &str,
+    new_meta: &crate::snap::SnapMeta,
+    new_layer: crate::farm::ClaimLayer,
+) -> miette::Result<()> {
+    let mut claims: Vec<BinaryClaim> = Vec::new();
+    push_meta_binary_claims(&mut claims, new_meta, new_layer);
+    push_declared_binary_claims(&mut claims, decl, new_name)?;
+    push_loaded_binary_claims(&mut claims, root, decl, new_name)?;
+    resolve_binary_claims(&claims)
+}
+
+/// Collect the binary claims of every declared package except the one
+/// being added, at its layer (own, or overlay when the pod patches it).
+fn push_declared_binary_claims(
+    claims: &mut Vec<BinaryClaim>,
+    decl: &PodDeclaration,
+    new_name: &str,
+) -> miette::Result<()> {
+    for spec_str in &decl.packages {
+        let spec = parse_pod_package(spec_str)?;
+        if spec.name == new_name {
+            continue; // the incoming package's claims are already added
+        }
+        let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+            miette::miette!("cannot check '{}' for a binary collision: {e}", spec.name)
+        })?;
+        if let Some(patch) = decl.overlay.get(&spec.name) {
+            apply_overlay(&mut meta, patch)
+                .map_err(|e| miette::miette!("overlay of '{}' is invalid: {e}", spec.name))?;
+        }
+        let layer = if decl.overlay.contains_key(&spec.name) {
+            crate::farm::ClaimLayer::Overlay
+        } else {
+            crate::farm::ClaimLayer::Own
+        };
+        push_meta_binary_claims(claims, &meta, layer);
+    }
+    Ok(())
+}
+
+/// Collect the binary claims of loaded-pod-provided packages, folded in
+/// at `Loaded` (the composition floor). A name the pod itself declares is
+/// already claimed at a higher layer, so it is skipped here.
+fn push_loaded_binary_claims(
+    claims: &mut Vec<BinaryClaim>,
+    root: &Path,
+    decl: &PodDeclaration,
+    new_name: &str,
+) -> miette::Result<()> {
+    for name in loaded_package_names(root, decl)? {
+        let declared = decl.packages.iter().any(|s| {
+            parse_pod_package(s)
+                .map(|p| p.name == name)
+                .unwrap_or(false)
+        });
+        if declared || name == new_name {
+            continue;
+        }
+        let meta = crate::deps::load_meta(&name).map_err(|e| {
+            miette::miette!("cannot check loaded '{}' for a binary collision: {e}", name)
+        })?;
+        push_meta_binary_claims(claims, &meta, crate::farm::ClaimLayer::Loaded);
+    }
+    Ok(())
+}
+
+/// One claim on a shared binary name (issue #8): which package exports
+/// the binary, at which composition precedence layer. Generalized from
+/// the desktop-ID claim so the shared classifier runs unchanged.
+#[derive(Debug, Clone)]
+struct BinaryClaim {
+    binary: String,
+    pkg: String,
+    layer: crate::farm::ClaimLayer,
+}
+
+/// Collect the binary-name claims of a freshly resolved meta (a package
+/// about to be built): the name of every app the package exports.
+fn push_meta_binary_claims(
+    claims: &mut Vec<BinaryClaim>,
+    meta: &crate::snap::SnapMeta,
+    layer: crate::farm::ClaimLayer,
+) {
+    for app in meta.apps.keys() {
+        claims.push(BinaryClaim {
+            binary: app.clone(),
+            pkg: meta.name.clone(),
+            layer,
+        });
+    }
+}
+
+/// Collect the binary-name claims of an already-installed package (a
+/// held pin): the apps recorded in its manifest entry.
+fn push_installed_binary_claims(
+    claims: &mut Vec<BinaryClaim>,
+    pkg: &crate::runtime::InstalledPackage,
+    layer: crate::farm::ClaimLayer,
+) {
+    for app in pkg.apps.keys() {
+        claims.push(BinaryClaim {
+            binary: app.clone(),
+            pkg: pkg.name.clone(),
+            layer,
+        });
+    }
+}
+
+/// Resolve binary-name collisions across the post-state package set
+/// (issue #8). Same-precedence duplicates are a hard error (zero writes
+/// — this runs before the install); a higher layer overriding a lower
+/// one warns naming winner and loser; a lower layer being shadowed
+/// warns, the higher layer stays. Declaration order breaks ties: the
+/// later claim is the incoming one.
+fn resolve_binary_claims(claims: &[BinaryClaim]) -> miette::Result<()> {
+    let mut incumbent: BTreeMap<String, BinaryClaim> = BTreeMap::new();
+    for claim in claims {
+        let Some(existing) = incumbent.get(&claim.binary) else {
+            incumbent.insert(claim.binary.clone(), claim.clone());
+            continue;
+        };
+        match crate::farm::classify_collision(existing.layer, claim.layer) {
+            crate::farm::CollisionVerdict::Error => {
+                miette::bail!(
+                    "'{}' is shipped by both '{}' and '{}' at the same-precedence \
+                     layer (loaded/own/overlay layering) — rename one of the packages or \
+                     drop one of them",
+                    claim.binary,
+                    existing.pkg,
+                    claim.pkg
+                );
+            }
+            crate::farm::CollisionVerdict::Override => {
+                crate::output::warn(format!(
+                    "binary '{}' from '{}' overrides '{}' (higher layer wins)",
+                    claim.binary, claim.pkg, existing.pkg
+                ));
+                incumbent.insert(claim.binary.clone(), claim.clone());
+            }
+            crate::farm::CollisionVerdict::Shadowed => {
+                crate::output::warn(format!(
+                    "binary '{}' from '{}' is shadowed by '{}' (lower layer loses)",
+                    claim.binary, claim.pkg, existing.pkg
                 ));
             }
         }
@@ -1381,11 +1839,13 @@ const POD_BUILD_EPOCH: &str = "946684800";
 /// Build one declared package into a `.snap` payload with the normal
 /// snap build path (`shuttle::snap::build_snap` — the same pipeline
 /// `shuttle build` uses, sandbox included) and shape it as a pending
-/// store install. Local builds carry revision 0; content identity is
-/// the payload's sha3-384, which is what the no-op detection compares.
+/// store install at the given composition layer. Local builds carry
+/// revision 0; content identity is the payload's sha3-384, which is
+/// what the no-op detection compares.
 fn build_pending_snap(
     store: &crate::runtime::RuntimeStore,
     meta: &crate::snap::SnapMeta,
+    layer: crate::farm::ClaimLayer,
 ) -> miette::Result<crate::runtime::PendingSnap> {
     // mksquashfs 4.4+ reads this natively; only set it when the user
     // hasn't chosen an epoch of their own.
@@ -1405,12 +1865,25 @@ fn build_pending_snap(
     )?;
     let payload = downloads.join(&result.snap_filename);
     let sha3_384 = crate::store::sha3_384_file(&payload)?;
-    Ok(crate::runtime::PendingSnap {
+    Ok(build_pending_snap_at(meta, &payload, sha3_384, layer))
+}
+
+/// Shape a built, content-hashed payload as a [`PendingSnap`] at the
+/// package's composition layer (issue #8). Store/pull installs use the
+/// `Own` default.
+fn build_pending_snap_at(
+    meta: &crate::snap::SnapMeta,
+    payload_path: &Path,
+    sha3_384: String,
+    layer: crate::farm::ClaimLayer,
+) -> crate::runtime::PendingSnap {
+    crate::runtime::PendingSnap {
         name: meta.name.clone(),
         revision: 0,
         sha3_384,
-        payload_path: payload,
-    })
+        payload_path: payload_path.to_path_buf(),
+        layer,
+    }
 }
 
 /// List a pod's packages with resolved versions. Read verbs do not
@@ -1626,9 +2099,12 @@ pod {
 }"#,
         )
         .unwrap();
-        let err = validate_overlays(&decl, "work").unwrap_err().to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = validate_overlays(tmp.path(), &decl, "work")
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.contains("ghost") && err.contains("does not declare"),
+            err.contains("ghost") && err.contains("does not build"),
             "error must name the undeclared overlay target: {err}"
         );
     }
@@ -1646,7 +2122,8 @@ pod {
 }"#,
         )
         .unwrap();
-        validate_overlays(&decl, "work").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        validate_overlays(tmp.path(), &decl, "work").unwrap();
     }
 
     #[test]

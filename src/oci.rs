@@ -1731,6 +1731,7 @@ pub fn pending_from_blob(payload: &Path, lockfile: &LockFile) -> miette::Result<
         revision: entry.revision,
         sha3_384,
         payload_path: payload.to_path_buf(),
+        ..Default::default()
     })
 }
 
