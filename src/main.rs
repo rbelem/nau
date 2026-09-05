@@ -168,7 +168,7 @@ fn main() -> miette::Result<()> {
 
         Command::Runtime(sub) => cmd_runtime(sub),
 
-        Command::Pod(sub) => cmd_pod(sub),
+        Command::Pod { name, command } => cmd_pod(name.as_deref(), command),
 
         Command::Push {
             reference,
@@ -1776,13 +1776,14 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
     }
 }
 
-// ── Pods (issue #2 scaffold) ──
+// ── Pods (issues #2 + #4) ──
 
-fn cmd_pod(sub: PodCommand) -> miette::Result<()> {
+fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
+    let pod_name = name.unwrap_or(shuttle::pod::DEFAULT_POD);
     match sub {
         PodCommand::Add { package, root } => {
             let root = shuttle::pod::pod_root(root.as_deref());
-            let report = shuttle::pod::add_package(&root, shuttle::pod::DEFAULT_POD, &package)?;
+            let report = shuttle::pod::add_package(&root, pod_name, &package)?;
             shuttle::output::ok(format!(
                 "added '{}' ({}) to pod '{}'",
                 report.name, report.version, report.pod
@@ -1791,7 +1792,7 @@ fn cmd_pod(sub: PodCommand) -> miette::Result<()> {
         }
         PodCommand::Remove { package, root } => {
             let root = shuttle::pod::pod_root(root.as_deref());
-            let report = shuttle::pod::remove_package(&root, shuttle::pod::DEFAULT_POD, &package)?;
+            let report = shuttle::pod::remove_package(&root, pod_name, &package)?;
             shuttle::output::ok(format!(
                 "removed '{}' from pod '{}'",
                 report.name, report.pod
@@ -1800,12 +1801,9 @@ fn cmd_pod(sub: PodCommand) -> miette::Result<()> {
         }
         PodCommand::List { root } => {
             let root = shuttle::pod::pod_root(root.as_deref());
-            let entries = shuttle::pod::list_packages(&root, shuttle::pod::DEFAULT_POD)?;
+            let entries = shuttle::pod::list_packages(&root, pod_name)?;
             if entries.is_empty() {
-                shuttle::output::info(format!(
-                    "pod '{}' has no packages",
-                    shuttle::pod::DEFAULT_POD
-                ));
+                shuttle::output::info(format!("pod '{pod_name}' has no packages"));
                 return Ok(());
             }
             let width = entries.iter().map(|e| e.spec.len()).max().unwrap_or(0);

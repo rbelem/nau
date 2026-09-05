@@ -15,8 +15,7 @@ use serde::Serialize;
 
 use crate::lock::{LockFile, PodPackageLockEntry};
 
-/// The implicit pod when no name is given (CLI verb targets; the `--name`
-/// flag arrives with later tickets).
+/// The implicit pod when no `--name` is given (`shuttle pod <verb>`).
 pub const DEFAULT_POD: &str = "default";
 
 /// The pod declaration file, inside the pod's state directory.
@@ -50,6 +49,22 @@ pub fn pod_root(explicit: Option<&str>) -> PathBuf {
 /// lockfile, and — in later tickets — generation links).
 pub fn pod_dir(root: &Path, pod_name: &str) -> PathBuf {
     root.join(pod_name)
+}
+
+/// Validate a pod name: the name becomes a directory under the pod root,
+/// so it must be a single path-safe component (no empty names, no path
+/// separators, not `.` or `..`).
+pub fn validate_pod_name(name: &str) -> miette::Result<()> {
+    if name.is_empty() {
+        miette::bail!("pod name must not be empty");
+    }
+    if name == "." || name == ".." {
+        miette::bail!("pod name '{name}' is not allowed");
+    }
+    if name.chars().any(|c| c == '/' || c == '\\') {
+        miette::bail!("pod name '{name}' must not contain path separators");
+    }
+    Ok(())
 }
 
 /// Path to a pod's `pod.lua`.
@@ -483,6 +498,7 @@ pub fn load_declaration(root: &Path, pod_name: &str) -> miette::Result<PodDeclar
 /// (an unknown package must not modify any state), then record it in
 /// `pod.lua` and pin the resolved version in the lockfile.
 pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Result<PodAddReport> {
+    validate_pod_name(pod_name)?;
     let spec = parse_pod_package(spec_str)?;
 
     // Resolve before touching any state.
@@ -536,6 +552,7 @@ pub fn remove_package(
     pod_name: &str,
     spec_str: &str,
 ) -> miette::Result<PodRemoveReport> {
+    validate_pod_name(pod_name)?;
     let spec = parse_pod_package(spec_str)?;
     let mut decl = load_declaration(root, pod_name)?;
     let before = decl.packages.len();
@@ -565,12 +582,18 @@ pub fn remove_package(
     })
 }
 
-/// List a pod's packages with resolved versions. A pod with no
-/// declaration lists as empty (fresh-root case).
+/// List a pod's packages with resolved versions. Read verbs do not
+/// initialize pods: an unknown pod (no `pod.lua`) is a clear error —
+/// `shuttle pod add` is what initializes a pod.
 pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListEntry>> {
+    validate_pod_name(pod_name)?;
     let decl_path = pod_lua_path(root, pod_name);
     if !decl_path.exists() {
-        return Ok(Vec::new());
+        miette::bail!(
+            "pod '{pod_name}' has no declaration at {} (read verbs do not \
+             initialize pods; `shuttle pod --name {pod_name} add <package>` does)",
+            decl_path.display()
+        );
     }
     let decl = evaluate_pod_file(&decl_path)?;
     let lock = LockFile::load(&pod_lock_path(root, pod_name))?;
@@ -678,5 +701,17 @@ pod {
             pod_lock_path(root, DEFAULT_POD),
             PathBuf::from("/state-root/default/shuttle.lock")
         );
+    }
+
+    #[test]
+    fn test_validate_pod_name() {
+        assert!(validate_pod_name("work").is_ok());
+        assert!(validate_pod_name("work.dev").is_ok());
+        assert!(validate_pod_name(DEFAULT_POD).is_ok());
+        assert!(validate_pod_name("").is_err());
+        assert!(validate_pod_name(".").is_err());
+        assert!(validate_pod_name("..").is_err());
+        assert!(validate_pod_name("../escape").is_err());
+        assert!(validate_pod_name("a/b").is_err());
     }
 }

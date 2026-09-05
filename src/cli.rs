@@ -375,12 +375,22 @@ pub enum Command {
     #[command(subcommand)]
     Runtime(RuntimeCommand),
 
-    /// Manage user-level pods (CONTEXT.md: Pod). Scaffold (issue #2):
-    /// add/remove/list packages in the default pod, round-tripping through
-    /// its `pod.lua` declaration and lockfile pins. No builds, binaries,
-    /// or generations yet — later tickets.
-    #[command(subcommand)]
-    Pod(PodCommand),
+    /// Manage user-level pods (CONTEXT.md: Pod). `shuttle pod [--name <n>]
+    /// <verb>`: imperative edits to one pod's declaration + lockfile pins.
+    /// `--name` selects the pod (default: `default`) and must appear before
+    /// the verb; `add` initializes an unknown pod, read verbs fail on
+    /// unknown pods. No builds, binaries, or generations yet — later
+    /// tickets.
+    Pod {
+        /// Pod to operate on (default: `default`). Belongs to the `pod`
+        /// command itself, so it goes before the verb:
+        /// `shuttle pod --name work add jq`.
+        #[arg(long, value_name = "POD")]
+        name: Option<String>,
+
+        #[command(subcommand)]
+        command: PodCommand,
+    },
 
     /// Internal: evaluation worker process (hidden). Re-executed by the
     /// parent to evaluate untrusted definitions in a bounded subprocess
@@ -537,16 +547,16 @@ pub enum RuntimeCommand {
     },
 }
 
-/// Subcommands for `shuttle pod` (pods, issue #2): imperative edits to
-/// the default pod's declaration + lockfile, mirroring the runtime
-/// command group's lifecycle shape. The `--root` state override travels
-/// with each verb (clap requires subcommand flags after the verb; the
-/// planned `shuttle pod [--name <n>] <verb>` grouping lands with the
-/// --name ticket).
+/// Verbs for `shuttle pod` (pods, issue #2): imperative edits to one
+/// pod's declaration + lockfile, mirroring the runtime command group's
+/// lifecycle shape. The `--root` state override travels with each verb
+/// (test-scoped redirection); `--name` travels on the `pod` command
+/// itself, before the verb (issue #4).
 #[derive(clap::Subcommand)]
 pub enum PodCommand {
-    /// Add a package to the default pod: records it in the pod
+    /// Add a package to the selected pod: records it in the pod
     /// declaration and pins the resolved version in the lockfile.
+    /// (Re)initializes an unknown pod.
     Add {
         /// Package name, optionally with a version constraint
         /// (`name@constraint`, e.g. `ripgrep@14`).
@@ -559,7 +569,7 @@ pub enum PodCommand {
         root: Option<String>,
     },
 
-    /// Remove a package from the default pod: drops the declaration
+    /// Remove a package from the selected pod: drops the declaration
     /// entry and the lockfile pin.
     Remove {
         /// Package name (a trailing `@constraint` is ignored).
@@ -570,7 +580,7 @@ pub enum PodCommand {
         root: Option<String>,
     },
 
-    /// List the default pod's packages with their resolved versions.
+    /// List the selected pod's packages with their resolved versions.
     List {
         /// Pod state root (see `pod add --root`).
         #[arg(long)]
