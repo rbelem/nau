@@ -68,9 +68,16 @@ _Avoid_: system generation, snapshot
 **Overlay**: An inline, code-only patch to an existing package declaration inside `pod.lua`, layered over `pkgs/` and loaded pods. Later layers win; upstream files are never modified.
 _Avoid_: fork, shadow file, patch file
 
+**Confinement**: The runtime isolation level of an installed package/app. Two levels: `unconfined` (runs directly on the host with the user's privileges — the default for simple CLIs) and `confined` (wrapped in a bubblewrap/AppArmor-seccomp sandbox with declared grants — for GUI apps and services). Distinct from the build-time *build sandbox*.
+_Avoid_: strict, classic, full, sandboxed
+
+**Grants**: Declared resource access a `confined` app requests (filesystem paths, network, sockets, devices) — the Lexicon the confinement backend honors. Mirror of snap interfaces / Flatpak finish-args.
+_Avoid_: interfaces, permissions, capabilities
+
 ## Flagged ambiguities
 
 - **"Build"** can mean: (a) the `shuttle build` CLI command, (b) a source package's compile step (`snap { build = "..." }`), or (c) the build sandbox environment. Use "build command", "build script", and "build sandbox" respectively.
+- **"Sandbox"** can mean: (a) the build-time *build sandbox* (bubblewrap, ADR-0004), or (b) runtime *confinement* (level applied to the installed app). They are different axes; use "build sandbox" and "confinement" to disambiguate.
 - **"Package"** can refer to a Lua declaration in `pkgs/` or to the Snap Store concept of a snap. Use "package index entry" or "store snap" to disambiguate.
 
 ## Example dialogue
