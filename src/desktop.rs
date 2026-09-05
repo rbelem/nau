@@ -204,7 +204,7 @@ pub fn emit_in(
 
             // Icon: a pod-namespaced theme icon link into the store blob.
             if let (Some(name), Some(icon)) = (icon.as_deref(), &launcher.icon) {
-                let (size, ext_dir) = icon_theme_dir(&icon.ext);
+                let size = icon_theme_dir(&icon.ext);
                 let dest = icons_root
                     .join("hicolor")
                     .join(size)
@@ -215,7 +215,6 @@ pub fn emit_in(
                         .map_err(|e| miette::miette!("creating {}: {e}", parent.display()))?;
                 }
                 let src = store.blob_path(&icon.sha256);
-                let _ = ext_dir; // reserved for a future scalable/theme split
                 link_or_replace(&src, &dest)?;
             }
         }
@@ -228,13 +227,14 @@ pub fn emit_in(
     Ok(dir)
 }
 
-/// The freedesktop icon theme directory for a given icon extension: SVG
-/// icons are theme-scalable, raster icons use the 256x256 apps slot.
-fn icon_theme_dir(ext: &str) -> (&'static str, &'static str) {
+/// The freedesktop icon theme size subdirectory for a given icon
+/// extension: SVG icons are theme-scalable, raster icons use the 256x256
+/// apps slot.
+fn icon_theme_dir(ext: &str) -> &'static str {
     if ext == "svg" || ext == "svgz" {
-        ("scalable", "scalable")
+        "scalable"
     } else {
-        ("256x256", "256x256")
+        "256x256"
     }
 }
 
@@ -856,21 +856,6 @@ fn validate_categories(cats: &[String]) -> miette::Result<()> {
         miette::bail!("desktop entry needs at least one main category");
     }
     Ok(())
-}
-
-/// Render a `.desktop` document to validate from (test helper pairing
-/// [`render`] + [`validate`] so the test asserts the emitted text passes).
-#[cfg(test)]
-#[allow(dead_code)]
-fn render_and_validate(
-    launcher: &DesktopLauncher,
-    app_id: &str,
-    exec: &std::path::Path,
-    icon: Option<&str>,
-    icon_blob: Option<&std::path::Path>,
-) {
-    let text = render(launcher, app_id, exec, icon);
-    validate(&text, icon, icon_blob).expect("rendered entry must validate");
 }
 
 #[cfg(test)]
