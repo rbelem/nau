@@ -406,18 +406,21 @@ fn lua_type_name(value: &mlua::Value) -> &'static str {
 // ── Overlays (issue #6) ──
 
 /// The fields an overlay entry may patch on a resolved package
-/// declaration (issue #6: version pins, build tweaks). Anything else is
-/// rejected with the allowed set named.
-const OVERLAY_FIELDS: &[&str] = &["version", "build"];
+/// declaration (issue #6: version pins, build tweaks; ticket #11:
+/// confinement override). Anything else is rejected with the allowed set
+/// named.
+const OVERLAY_FIELDS: &[&str] = &["version", "build", "confinement"];
 
 /// Apply one overlay entry (a plain-data patch table) onto a resolved
 /// [`SnapMeta`]. This is the top layer of the pod resolution chain
 /// (CONTEXT.md: Overlay): later layers win, upstream declarations are
 /// never modified.
 ///
-/// Only string-valued whitelisted fields (`version`, `build`) are
-/// patched; unknown fields and non-string values fail naming
-/// `overlay.<pkg>.<field>`.
+/// String-valued whitelisted fields (`version`, `build`) are patched;
+/// `confinement` is special: the string `"unconfined"` clears the
+/// package's grants (the ADR-0016 explicit escape hatch), any other
+/// value must be a plain-data grants table replacing them. Unknown fields
+/// and non-string values fail naming `overlay.<pkg>.<field>`.
 fn apply_overlay(
     meta: &mut crate::snap::SnapMeta,
     patch: &serde_json::Value,
@@ -426,12 +429,32 @@ fn apply_overlay(
         miette::bail!("overlay entry must be a table of fields, got {}", patch);
     };
     for (key, value) in obj {
-        let Some(s) = value.as_str() else {
-            miette::bail!("overlay field '{key}' must be a string, got {value}");
-        };
         match key.as_str() {
-            "version" => meta.version = s.to_string(),
-            "build" => meta.build = Some(s.to_string()),
+            "version" => {
+                let Some(s) = value.as_str() else {
+                    miette::bail!("overlay field '{key}' must be a string, got {value}");
+                };
+                meta.version = s.to_string();
+            }
+            "build" => {
+                let Some(s) = value.as_str() else {
+                    miette::bail!("overlay field '{key}' must be a string, got {value}");
+                };
+                meta.build = Some(s.to_string());
+            }
+            "confinement" => {
+                if value.as_str() == Some("unconfined") {
+                    // ADR-0016 escape hatch: the pod explicitly lifts a
+                    // confined package to unconfined for this pod only.
+                    meta.confined = None;
+                } else {
+                    let json = value.clone();
+                    meta.confined = Some(
+                        confinement_from_overlay(&json)
+                            .map_err(|e| miette::miette!("overlay confinement is invalid: {e}"))?,
+                    );
+                }
+            }
             other => miette::bail!(
                 "unsupported overlay field '{other}' (allowed: {})",
                 OVERLAY_FIELDS.join(", ")
@@ -439,6 +462,65 @@ fn apply_overlay(
         }
     }
     Ok(())
+}
+
+/// Convert a plain-data overlay `confinement` value (already JSON) into a
+/// [`crate::snap::Confinement`]. The overlay path is JSON data (the pod
+/// table was serialized at parse time), so we round-trip through the
+/// grant field parsers by rebuilding a Lua table — that reuses the single
+/// Rust conversion boundary.
+fn confinement_from_overlay(value: &serde_json::Value) -> miette::Result<crate::snap::Confinement> {
+    if value.as_str() == Some("unconfined") {
+        miette::bail!("expected a confinement grants table, got the string \"unconfined\"");
+    }
+    let obj = value.as_object().ok_or_else(|| {
+        miette::miette!("confinement must be a table of grants or the string \"unconfined\"")
+    })?;
+    let lua = mlua::Lua::new();
+    let table = lua.create_table().map_err(|e| miette::miette!("{e}"))?;
+    for (k, v) in obj {
+        let value = json_to_lua(&lua, v)?;
+        table
+            .set(k.as_str(), value)
+            .map_err(|e| miette::miette!("{e}"))?;
+    }
+    crate::snap::confinement_from_lua(&table)
+}
+
+/// Convert a JSON value into a Lua value (for re-parsing overlay data).
+fn json_to_lua(lua: &mlua::Lua, value: &serde_json::Value) -> miette::Result<mlua::Value> {
+    Ok(match value {
+        serde_json::Value::Null => mlua::Value::Nil,
+        serde_json::Value::Bool(b) => mlua::Value::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                mlua::Value::Integer(i as mlua::Integer)
+            } else if let Some(f) = n.as_f64() {
+                mlua::Value::Number(f)
+            } else {
+                mlua::Value::Nil
+            }
+        }
+        serde_json::Value::String(s) => {
+            mlua::Value::String(lua.create_string(s).map_err(|e| miette::miette!("{e}"))?)
+        }
+        serde_json::Value::Array(items) => {
+            let t = lua.create_table().map_err(|e| miette::miette!("{e}"))?;
+            for (i, item) in items.iter().enumerate() {
+                let v = json_to_lua(lua, item)?;
+                t.set(i + 1, v).map_err(|e| miette::miette!("{e}"))?;
+            }
+            mlua::Value::Table(t)
+        }
+        serde_json::Value::Object(map) => {
+            let t = lua.create_table().map_err(|e| miette::miette!("{e}"))?;
+            for (k, item) in map {
+                let v = json_to_lua(lua, item)?;
+                t.set(k.as_str(), v).map_err(|e| miette::miette!("{e}"))?;
+            }
+            mlua::Value::Table(t)
+        }
+    })
 }
 
 /// Validate a declaration's overlay entries BEFORE any mutation: every
@@ -477,7 +559,18 @@ fn validate_overlays(root: &Path, decl: &PodDeclaration, pod_name: &str) -> miet
                     OVERLAY_FIELDS.join(", ")
                 );
             }
-            if value.as_str().is_none() {
+            // `confinement` is either the escape-hatch string
+            // "unconfined" or a grants table; the other fields are strings.
+            if key == "confinement" {
+                if value.as_str() == Some("unconfined") {
+                    continue;
+                }
+                if value.as_object().is_none() {
+                    miette::bail!(
+                        "'overlay.{pkg}.confinement' must be a grants table or the string \"unconfined\", got {value}"
+                    );
+                }
+            } else if value.as_str().is_none() {
                 miette::bail!("'overlay.{pkg}.{key}' must be a string, got {value}");
             }
         }
@@ -2054,6 +2147,7 @@ pod {
             target: None,
             toolchain: None,
             inputs: None,
+            confined: None,
             apps: HashMap::new(),
             definition_dir: None,
         }

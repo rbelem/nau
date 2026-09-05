@@ -170,6 +170,13 @@ fn main() -> miette::Result<()> {
 
         Command::Pod { name, command } => cmd_pod(name.as_deref(), command),
 
+        Command::Run {
+            app,
+            pod,
+            root,
+            app_args,
+        } => cmd_run(pod.as_deref(), root.as_deref(), &app, &app_args),
+
         Command::Push {
             reference,
             dir,
@@ -1834,6 +1841,33 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
         PodCommand::Rollback { generation, root } => cmd_pod_rollback(pod_name, generation, root),
         PodCommand::Gc { prune, root } => cmd_pod_gc(pod_name, prune, root),
     }
+}
+
+/// `shuttle run <app>`: run a confined app from a pod (ADR-0016, ticket
+/// #11). Resolves the pod's active generation to find the package
+/// providing `app`, reads its declared grants, and execs the app inside
+/// the selected backend's sandbox. Confined apps fail closed when the
+/// backend is unavailable — never silently unconfined. `--pod` selects
+/// the pod (default `default`); `--root` overrides the pod state root.
+fn cmd_run(
+    pod: Option<&str>,
+    root: Option<&str>,
+    app: &str,
+    app_args: &[String],
+) -> miette::Result<()> {
+    let pod_name = pod.unwrap_or(shuttle::pod::DEFAULT_POD);
+    shuttle::pod::validate_pod_name(pod_name).map_err(|e| miette::miette!("shuttle run: {e}"))?;
+    let root = shuttle::pod::pod_root(root);
+    let dir = shuttle::pod::pod_dir(&root, pod_name);
+    // Confinement is a runtime concern: the pod must have been reconciled
+    // (a pod with no store/generation fails with a clear error).
+    if !dir.join("generations").is_dir() {
+        return Err(miette::miette!(
+            "pod '{pod_name}' has not been reconciled yet — run `shuttle pod --name {pod_name} \
+             sync` (or `add`) before `shuttle run`"
+        ));
+    }
+    shuttle::confine::run(&dir, pod_name, app, app_args)
 }
 
 /// Report the update outcome for `shuttle pod update`: a no-op says so,

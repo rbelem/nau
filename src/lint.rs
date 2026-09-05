@@ -263,6 +263,7 @@ mod tests {
             target: None,
             toolchain: None,
             inputs: None,
+            confined: None,
             apps: HashMap::new(),
             definition_dir: None,
         }
@@ -277,6 +278,7 @@ mod tests {
             environment: None,
             desktop: None,
             interpreter: None,
+            confined: None,
         }
     }
 

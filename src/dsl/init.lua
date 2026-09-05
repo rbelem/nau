@@ -39,6 +39,41 @@ local function check_string_array(val, label, field)
     end
 end
 
+--- Validate a `confined` grants table (ADR-0016, ticket #11).
+-- A table with optional `backend` (string), `filesystem` (array of
+-- strings), `network` (boolean), `sockets`/`devices` (arrays of strings),
+-- and `backend_options` (table of raw strings). Absent/`nil` = unconfined.
+local function check_confinement(val, label)
+    if val == nil then return end
+    check_table(val, label, "confined")
+    if val == nil then return end
+    if val.backend ~= nil then
+        if type(val.backend) ~= "string" or (val.backend ~= "bwrap" and val.backend ~= "apparmor") then
+            error(string.format(
+                "%s(): confined.backend must be 'bwrap' or 'apparmor', got %s",
+                label, tostring(val.backend)), 3)
+        end
+    end
+    if val.network ~= nil and type(val.network) ~= "boolean" then
+        error(string.format(
+            "%s(): confined.network must be a boolean, got %s",
+            label, type(val.network)), 3)
+    end
+    check_string_array(val.filesystem, label, "confined.filesystem")
+    check_string_array(val.sockets, label, "confined.sockets")
+    check_string_array(val.devices, label, "confined.devices")
+    if val.backend_options ~= nil then
+        check_table(val.backend_options, label, "confined.backend_options")
+        for k, v in pairs(val.backend_options) do
+            if type(v) ~= "string" then
+                error(string.format(
+                    "%s(): confined.backend_options['%s'] must be a string, got %s",
+                    label, tostring(k), type(v)), 3)
+            end
+        end
+    end
+end
+
 --- Validate a plugs/slots map: name → bare interface string (back-compat)
 --- or table with required string `interface` plus string-valued attributes.
 local function check_plug_map(val, field)
@@ -131,6 +166,11 @@ function snap(opts)
     for _, field in ipairs(string_fields) do
         check_string(opts[field], "snap", field)
     end
+
+    -- confined (ADR-0016, ticket #11): grants vocabulary for a confined
+    -- package. A table with backend/filesystem/network/sockets/devices/
+    -- backend_options, all validated for type below.
+    check_confinement(opts.confined, "snap")
 
     -- source: string (legacy) or table { url, sha256? }
     if opts.source ~= nil then
@@ -413,6 +453,8 @@ function app(opts)
             "app(): field 'interpreter' must be a string, got %s", type(opts.interpreter)
         ), 2)
     end
+    -- confined (ADR-0016, ticket #11): per-app confinement override.
+    check_confinement(opts.confined, "app")
 
     -- Unknown fields are rejected, not silently dropped: anything this
     -- schema doesn't know would otherwise vanish between the DSL and the
@@ -426,6 +468,7 @@ function app(opts)
         environment = true,
         desktop = true,
         interpreter = true,
+        confined = true,
     }
     local unknown = {}
     for k in pairs(opts) do
@@ -440,7 +483,7 @@ function app(opts)
             table.insert(list, string.format("'%s'", k))
         end
         error(string.format(
-            "app(): unknown field%s %s (valid fields: command, daemon, plugs, slots, environment, desktop, interpreter)",
+            "app(): unknown field%s %s (valid fields: command, daemon, plugs, slots, environment, desktop, interpreter, confined)",
             #unknown == 1 and "" or "s",
             table.concat(list, ", ")
         ), 2)

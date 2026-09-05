@@ -130,6 +130,25 @@ pub struct InstalledPackage {
     /// store. Empty for packages without apps and store-recorded snaps.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub apps: BTreeMap<String, String>,
+    /// App name → sha256 of the app's confined-launcher wrapper blob in
+    /// the store (ticket #11). Only present for confined apps. The farm
+    /// emitter prefers this over `apps` for a confined app so the farm's
+    /// symlink points at a wrapper that invokes `shuttle run`, while
+    /// `apps` still records the real command binary `shuttle run` execs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub launchers: BTreeMap<String, String>,
+    /// Runtime confinement grants (ADR-0016, ticket #11): the package-level
+    /// `confined` declaration. `Some` = the package is confined (its
+    /// apps default to confined), `None` = unconfined. Recorded from the
+    /// payload's snap.yaml at install time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confined: Option<crate::snap::Confinement>,
+    /// Per-app confinement overrides (ticket #11): app name → grants, only
+    /// for apps whose `confined` differs from the package default. The
+    /// farm emitter and `shuttle run` resolve effective confinement as
+    /// `app_confined.get(app).or(confined.as_ref())`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub app_confined: BTreeMap<String, crate::snap::Confinement>,
     /// Desktop-launcher metadata per GUI app (issue #7), parsed from the
     /// package's `.desktop` file at install time and recorded in the
     /// manifest so the launcher emitter rebuilds entries from the
@@ -991,6 +1010,9 @@ impl RuntimeStore {
                         Vec::new(),
                         BTreeMap::new(),
                         BTreeMap::new(),
+                        None,
+                        BTreeMap::new(),
+                        BTreeMap::new(),
                     ),
                     planner_notes: Vec::new(),
                     entries: Vec::new(),
@@ -1013,6 +1035,9 @@ impl RuntimeStore {
                         entry_hashes(&entries),
                         pkg_units,
                         runtime.apps,
+                        runtime.launchers,
+                        runtime.confined,
+                        runtime.app_confined,
                         desktops,
                     ),
                     planner_notes: runtime.notes,
@@ -1059,6 +1084,7 @@ impl RuntimeStore {
         Ok((meta, version))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn recorded_package(
         &self,
         snap: &PendingSnap,
@@ -1066,6 +1092,9 @@ impl RuntimeStore {
         files: Vec<String>,
         units: Vec<String>,
         apps: BTreeMap<String, String>,
+        launchers: BTreeMap<String, String>,
+        confined: Option<crate::snap::Confinement>,
+        app_confined: BTreeMap<String, crate::snap::Confinement>,
         desktops: BTreeMap<String, DesktopLauncher>,
     ) -> InstalledPackage {
         InstalledPackage {
@@ -1077,6 +1106,9 @@ impl RuntimeStore {
             units,
             layer: snap.layer,
             apps,
+            launchers,
+            confined,
+            app_confined,
             desktops,
         }
     }
@@ -1600,13 +1632,23 @@ fn payload_subpath(root: &Path, rel: &str) -> miette::Result<PathBuf> {
 }
 
 /// Planned runtime for one ShootBuilt payload: daemon units, the
-/// renamed-command-binary hardlink specs, and planner warnings.
+/// renamed-command-binary hardlink specs, confinement launchers, and
+/// planner warnings.
 struct PayloadRuntime {
     units: Vec<DaemonUnit>,
     renames: Vec<(String, String)>,
     /// app name → binary content hash (mirrors the renames; recorded in
     /// the package manifest for the pod farm).
     apps: BTreeMap<String, String>,
+    /// app name → confined-launcher wrapper blob hash (ticket #11). Only
+    /// populated for confined apps; the farm emitter prefers it over
+    /// `apps` for those so the farm symlink invokes `shuttle run`.
+    launchers: BTreeMap<String, String>,
+    /// Package-level confinement grants (ticket #11).
+    confined: Option<crate::snap::Confinement>,
+    /// Per-app confinement overrides (ticket #11): only apps that differ
+    /// from the package default.
+    app_confined: BTreeMap<String, crate::snap::Confinement>,
     notes: Vec<String>,
 }
 
@@ -1629,6 +1671,9 @@ fn plan_payload_runtime(
         units: Vec::new(),
         renames: Vec::new(),
         apps: BTreeMap::new(),
+        launchers: BTreeMap::new(),
+        confined: meta.confined.clone(),
+        app_confined: BTreeMap::new(),
         notes: Vec::new(),
     };
     for (app_name, app) in &meta.apps {
@@ -1641,7 +1686,23 @@ fn plan_payload_runtime(
         let hash = blob_hash_for(entries, &plan.in_snap_binary, &snap.name)?;
         out.renames
             .push((hash.clone(), format!("usr/bin/{}-{}", plan.snap, plan.app)));
-        out.apps.insert(plan.app, hash);
+        out.apps.insert(plan.app.clone(), hash);
+        // Ticket #11: a confined app records its launcher-wrapper blob
+        // (the `<command>.shuttle-launcher` sibling authored at build
+        // time) so the farm symlink points at a `shuttle run` wrapper,
+        // and its per-app confinement override when it differs from the
+        // package default.
+        if let Some(_confined) =
+            crate::snap::Confinement::for_app(app.confined.as_ref(), meta.confined.as_ref())
+        {
+            let launcher_rel = crate::snap::launcher_sibling_rel_path(&plan.in_snap_binary);
+            let launcher_hash = blob_hash_for(entries, &launcher_rel, &snap.name)?;
+            out.launchers.insert(plan.app.clone(), launcher_hash);
+            if let Some(override_conf) = &app.confined {
+                out.app_confined
+                    .insert(plan.app.clone(), override_conf.clone());
+            }
+        }
     }
     Ok(out)
 }
@@ -1967,6 +2028,9 @@ mod tests {
             units: units.iter().map(|s| s.to_string()).collect(),
             layer: crate::farm::ClaimLayer::Own,
             apps: BTreeMap::new(),
+            launchers: BTreeMap::new(),
+            confined: None,
+            app_confined: BTreeMap::new(),
             desktops: BTreeMap::new(),
         }
     }
@@ -2696,6 +2760,9 @@ plugs:
                 units: vec![],
                 layer: crate::farm::ClaimLayer::Own,
                 apps: BTreeMap::new(),
+                launchers: BTreeMap::new(),
+                confined: None,
+                app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
             },
         );
@@ -2710,6 +2777,9 @@ plugs:
                 units: vec![],
                 layer: crate::farm::ClaimLayer::Own,
                 apps: BTreeMap::new(),
+                launchers: BTreeMap::new(),
+                confined: None,
+                app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
             },
         );

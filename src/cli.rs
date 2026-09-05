@@ -393,6 +393,32 @@ pub enum Command {
         command: PodCommand,
     },
 
+    /// Run a confined app from a pod (ADR-0016, ticket #11): resolve the
+    /// app's declared grants, set up the sandbox with the chosen backend,
+    /// then exec the app — transparent to the user (the pod's `current`/
+    /// bin farm symlink points at a wrapper that invokes this). Also the
+    /// future home for env hooks. `--pod` selects the pod (default:
+    /// `default`); a `confined` app on a host where the backend is
+    /// unavailable FAILS CLOSED (never silently runs unconfined).
+    #[command(trailing_var_arg = true)]
+    Run {
+        /// App (binary name) to run from the selected pod.
+        app: String,
+
+        /// Pod to operate on (default: `default`).
+        #[arg(long, value_name = "POD")]
+        pod: Option<String>,
+
+        /// Pod state root (default: $XDG_DATA_HOME/shuttle/pods).
+        #[arg(long)]
+        root: Option<String>,
+
+        /// Arguments passed through to the app. Everything after `--` is
+        /// forwarded verbatim.
+        #[arg(trailing_var_arg = true)]
+        app_args: Vec<String>,
+    },
+
     /// Internal: evaluation worker process (hidden). Re-executed by the
     /// parent to evaluate untrusted definitions in a bounded subprocess
     /// (ADR-0010 Decisions 4+5). Not part of the public CLI.

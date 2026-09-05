@@ -371,6 +371,11 @@ pub struct PayloadSnap {
     pub apps: BTreeMap<String, PayloadApp>,
     #[serde(default)]
     pub plugs: BTreeMap<String, PayloadPlug>,
+    /// Runtime confinement grants (ADR-0016, ticket #11): the package-level
+    /// `confined` declaration, preserved in snap.yaml so the runtime
+    /// emitter records it in the generation manifest. Absent = unconfined.
+    #[serde(default)]
+    pub confined: Option<crate::snap::Confinement>,
 }
 
 /// One app entry in a payload `meta/snap.yaml`.
@@ -389,6 +394,10 @@ pub struct PayloadApp {
     /// like snapd's `desktop:` app key) — the launcher's metadata source.
     #[serde(default)]
     pub desktop: Option<String>,
+    /// Per-app runtime confinement override (ticket #11): wins over the
+    /// snap-level `confined`. Absent = inherit the snap's.
+    #[serde(default)]
+    pub confined: Option<crate::snap::Confinement>,
 }
 
 /// A snap-level plug value in a payload `meta/snap.yaml`: a bare

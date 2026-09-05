@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use mlua::Value;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::Serializer;
 use sha2::Digest;
@@ -236,6 +237,14 @@ pub struct SnapMeta {
     #[serde(skip)]
     pub requires: Vec<String>,
 
+    /// Runtime confinement grants (ADR-0016, ticket #11). Present
+    /// (`Some`) declares the package `confined`; absent is `unconfined`
+    /// (the default for simple CLIs). Emitted into snap.yaml so it
+    /// survives the pod build → install pipeline (the runtime emitter
+    /// records it in the generation manifest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confined: Option<Confinement>,
+
     /// Package input references. Maps input name to a URL.
     /// Example: `{ packages = { url = "github:rbelem/shuttle/main" } }`
     /// Skipped in YAML — build metadata only.
@@ -311,6 +320,163 @@ pub struct SnapApp {
     /// commands get no wrapper.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<String>,
+
+    /// Per-app runtime confinement override (ticket #11): wins over the
+    /// snap-level `confined` for this app. Present (`Some`) declares the
+    /// app confined; `None` inherits the snap's value. Emitted into
+    /// snap.yaml so it survives the pod build → install pipeline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confined: Option<Confinement>,
+}
+
+// ── Runtime confinement (ADR-0016, ticket #11) ──
+
+/// The two runtime confinement levels (ADR-0016 Decision 1): a package
+/// either runs unconfined on the host (the pod farm's direct-symlink
+/// model, the default for simple CLIs) or confined inside a backend
+/// sandbox with declared grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfinementLevel {
+    Unconfined,
+    Confined,
+}
+
+/// The backend keyword selecting the enforcement mechanism (ADR-0016
+/// Decision 3). Both backends honor the SAME shared grants vocabulary, so
+/// they are interchangeable for anything expressible in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendKind {
+    /// bubblewrap (unprivileged user namespaces)
+    #[default]
+    Bwrap,
+    /// AppArmor profile + seccomp filter
+    Apparmor,
+}
+
+impl BackendKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackendKind::Bwrap => "bwrap",
+            BackendKind::Apparmor => "apparmor",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "bwrap" => Some(BackendKind::Bwrap),
+            "apparmor" => Some(BackendKind::Apparmor),
+            _ => None,
+        }
+    }
+}
+
+/// The shared confinement grants vocabulary (ADR-0016 Decision 5) — the
+/// portable contract both backends honor.
+///
+/// Defaults deny: no filesystem mounts, no network, no sockets, no
+/// devices. A package author declares precisely what a confined app may
+/// reach; `backend_options` is the non-portable finetune escape hatch
+/// (warned as lost when switching backends).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Confinement {
+    #[serde(default)]
+    pub backend: BackendKind,
+    /// Filesystem grants: a list of path/host mounts. The portable
+    /// keywords `read` and `write` grant read-only / read-write access to
+    /// the standard host roots; any other entry is a path bound at its
+    /// own location (an optional `ro:`/`rw:` prefix selects the access
+    /// mode, default read-write).
+    #[serde(default)]
+    pub filesystem: Vec<String>,
+    /// Network access: false (default) denies the net namespace.
+    #[serde(default)]
+    pub network: bool,
+    /// Named socket grants (e.g. `wayland`, `x11`, `ssh-auth`, `pulseaudio`,
+    /// `session-bus`).
+    #[serde(default)]
+    pub sockets: Vec<String>,
+    /// Device grants (e.g. `/dev/dri`, `/dev/input`).
+    #[serde(default)]
+    pub devices: Vec<String>,
+    /// Non-portable, backend-specific raw flags (ADR-0016 Decision 4).
+    /// Lost when switching backends — the shared grants remain the
+    /// portability contract.
+    #[serde(default)]
+    pub backend_options: BTreeMap<String, serde_json::Value>,
+}
+
+impl Confinement {
+    /// The per-app effective confinement: an app-level override wins,
+    /// else the package-level one.
+    pub fn for_app<'a>(
+        app_confined: Option<&'a Confinement>,
+        snap_confined: Option<&'a Confinement>,
+    ) -> Option<&'a Confinement> {
+        app_confined.or(snap_confined)
+    }
+}
+
+/// Parse a `confined` value from a Lua table (the DSL validates the shape;
+/// this is the passive Rust conversion boundary).
+pub fn confinement_from_lua(table: &mlua::Table) -> miette::Result<Confinement> {
+    let backend = match table.get::<Value>("backend").unwrap_or(Value::Nil) {
+        Value::Nil => BackendKind::default(),
+        Value::String(s) => BackendKind::from_str(
+            s.to_str()
+                .map_err(|e| miette::miette!("confined.backend: {e}"))?
+                .as_ref(),
+        )
+        .ok_or_else(|| miette::miette!("confined.backend must be 'bwrap' or 'apparmor'"))?,
+        other => {
+            return Err(miette::miette!(
+                "confined.backend must be a string, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    let filesystem = get_opt_string_array(table, "filesystem")?.unwrap_or_default();
+    let network = match table.get::<Value>("network").unwrap_or(Value::Nil) {
+        Value::Nil => false,
+        Value::Boolean(b) => b,
+        other => {
+            return Err(miette::miette!(
+                "confined.network must be a boolean, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    let sockets = get_opt_string_array(table, "sockets")?.unwrap_or_default();
+    let devices = get_opt_string_array(table, "devices")?.unwrap_or_default();
+    let backend_options = get_opt_backend_options(table)?;
+
+    Ok(Confinement {
+        backend,
+        filesystem,
+        network,
+        sockets,
+        devices,
+        backend_options,
+    })
+}
+
+/// Extract `backend_options`: a per-backend map of raw string values.
+fn get_opt_backend_options(
+    table: &mlua::Table,
+) -> miette::Result<BTreeMap<String, serde_json::Value>> {
+    let Some(t) = get_opt_table(table, "backend_options")? else {
+        return Ok(BTreeMap::new());
+    };
+    let mut out = BTreeMap::new();
+    for pair in t.pairs::<String, Value>() {
+        let (key, value) = pair.map_err(|e| miette::miette!("confined.backend_options: {e}"))?;
+        let json = crate::isolate::lua_to_json(&value)
+            .map_err(|e| miette::miette!("confined.backend_options['{key}']: {e}"))?;
+        out.insert(key, json);
+    }
+    Ok(out)
 }
 
 // ── Phase 15: snap.yaml coverage structs ──
@@ -481,6 +647,9 @@ impl SnapMeta {
         let target: Option<String> = get_opt_string(table, "target")?;
         let toolchain: Option<String> = get_opt_string(table, "toolchain")?;
         let inputs: Option<HashMap<String, PackageInput>> = get_package_inputs(table)?;
+        let confined = get_opt_table(table, "confined")?
+            .map(|t| confinement_from_lua(&t))
+            .transpose()?;
 
         let apps = get_opt_table(table, "apps")?
             .map(|apps_table| {
@@ -533,6 +702,7 @@ impl SnapMeta {
             target,
             toolchain,
             inputs,
+            confined,
             apps,
             definition_dir: None,
         })
@@ -712,6 +882,7 @@ impl SnapApp {
                     | "environment"
                     | "desktop"
                     | "interpreter"
+                    | "confined"
             ) {
                 unknown.push(k);
             }
@@ -724,7 +895,7 @@ impl SnapApp {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(miette::miette!(
-                "app '{name}': unknown field{} {list} (valid fields: command, daemon, plugs, slots, environment, desktop, interpreter)",
+                "app '{name}': unknown field{} {list} (valid fields: command, daemon, plugs, slots, environment, desktop, interpreter, confined)",
                 if unknown.len() == 1 { "" } else { "s" },
             ));
         }
@@ -739,6 +910,9 @@ impl SnapApp {
             validate_desktop_path(name, d)?;
         }
         let interpreter = get_opt_string(table, "interpreter")?;
+        let confined = get_opt_table(table, "confined")?
+            .map(|t| confinement_from_lua(&t))
+            .transpose()?;
 
         Ok(SnapApp {
             command,
@@ -748,6 +922,7 @@ impl SnapApp {
             environment,
             desktop,
             interpreter,
+            confined,
         })
     }
 }
@@ -1432,6 +1607,16 @@ fn emit_build_wrappers(
             continue;
         }
 
+        // Ticket #11: a confined app gets a separate launcher wrapper blob
+        // (at `<command>.shuttle-launcher`) that invokes `shuttle run`. The
+        // farm's direct symlink for a confined app points at this wrapper,
+        // so `which`/PATH stay truthful while `shuttle run` sets up the
+        // sandbox. The real command binary stays untouched — `apps[app]`
+        // still records it and `shuttle run` execs it inside the sandbox.
+        if Confinement::for_app(app.confined.as_ref(), meta.confined.as_ref()).is_some() {
+            emit_confined_launcher(app_name, &entry, pod_store)?;
+        }
+
         if is_elf(&entry) {
             // Issue #10 part B: native-ELF wrapper ONLY when the payload
             // bundles a runtime lib the binary needs (separate store blob
@@ -1549,6 +1734,46 @@ fn emit_elf_lib_wrapper(
         real_store_path.display()
     );
     write_wrapper(app_name, entry, &wrapper)
+}
+
+/// Author the confined app launcher (ADR-0016 ticket #11): a wrapper blob
+/// at `<command>.shuttle-launcher` that single-`exec`s `shuttle run` for
+/// the app. The wrapper derives its pod from its own store-blob path (the
+/// #10 `readlink -f $0` pattern): `store/<aa>/<hash>` sits two levels
+/// under the pod root, whose basename is the pod name.
+///
+/// The farm's direct symlink for a confined app points at this wrapper;
+/// `shuttle run` resolves the app's grants from the pod's generation
+/// manifest and execs the real command binary inside the sandbox.
+fn emit_confined_launcher(
+    app_name: &str,
+    entry: &Path,
+    _pod_store: &crate::runtime::RuntimeStore,
+) -> miette::Result<()> {
+    let launcher_path = launcher_sibling_path(entry);
+    let wrapper = format!(
+        "#!/bin/sh\nSELF=\"$(readlink -f \"$0\")\"\nPODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SELF\")\")\")\"\nPOD=\"$(basename \"$PODROOT\")\"\nexec shuttle run --pod \"$POD\" --root \"$(dirname \"$PODROOT\")\" {app_name} \"$@\"\n"
+    );
+    write_wrapper(app_name, &launcher_path, &wrapper)
+}
+
+/// The sibling path of a command entry that carries the confined launcher
+/// wrapper (e.g. `usr/bin/app` → `usr/bin/app.shuttle-launcher`).
+pub fn launcher_sibling_path(entry: &Path) -> PathBuf {
+    let mut name = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.push_str(".shuttle-launcher");
+    entry.with_file_name(name)
+}
+
+/// The relative payload path of a command's confined launcher wrapper
+/// (e.g. `usr/bin/app` → `usr/bin/app.shuttle-launcher`), for the
+/// install-time planner to locate the wrapper blob in the payload tree.
+pub fn launcher_sibling_rel_path(command_rel: &str) -> String {
+    let path = Path::new(command_rel);
+    launcher_sibling_path(path).to_string_lossy().into_owned()
 }
 
 /// Write a launcher wrapper at `entry` and mark it owner-executable.
@@ -7239,6 +7464,7 @@ mod wrapper_tests {
             environment: None,
             desktop: None,
             interpreter: interpreter.map(|s| s.to_string()),
+            confined: None,
         };
         let mut apps = HashMap::new();
         apps.insert(app_name.to_string(), app);
@@ -7270,6 +7496,7 @@ mod wrapper_tests {
             inputs: None,
             target: None,
             toolchain: None,
+            confined: None,
             apps,
             definition_dir: None,
         }

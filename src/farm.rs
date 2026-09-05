@@ -149,8 +149,24 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
             // Same-content collisions leave identical links; differing
             // content must not accumulate — replace, never merge.
             let _ = std::fs::remove_file(&link);
-            let (aa, _) = hash.split_at(2.min(hash.len()));
-            let target = format!("../../../store/{aa}/{hash}");
+            // Ticket #11: a confined app's farm entry points at its
+            // confined-launcher wrapper (which invokes `shuttle run`),
+            // not the raw command binary. This keeps `which`/PATH truthful
+            // while the sandbox is set up transparently. The wrapper blob
+            // is recorded in `launchers`; effective confinement is the
+            // per-app override or the package default.
+            let effective_confined = pkg
+                .app_confined
+                .get(app)
+                .or(pkg.confined.as_ref())
+                .is_some();
+            let target_hash = if effective_confined {
+                pkg.launchers.get(app).unwrap_or(hash)
+            } else {
+                hash
+            };
+            let (aa, _) = target_hash.split_at(2.min(target_hash.len()));
+            let target = format!("../../../store/{aa}/{target_hash}");
             std::os::unix::fs::symlink(&target, &link)
                 .map_err(|e| miette::miette!("linking {} -> {}: {e}", link.display(), target))?;
         }
@@ -234,6 +250,9 @@ mod tests {
                     .map(|(a, h)| (a.to_string(), h.to_string()))
                     .collect(),
                 desktops: BTreeMap::new(),
+                launchers: BTreeMap::new(),
+                confined: None,
+                app_confined: BTreeMap::new(),
             },
         );
         Generation {
@@ -243,6 +262,75 @@ mod tests {
             created_epoch: 0,
             boot_entry: None,
         }
+    }
+
+    /// A generation fixture with confined apps: `confined` grants plus a
+    /// launcher-wrapper hash per app (ticket #11).
+    fn gen_with_confined_apps(
+        n: u64,
+        pkg: &str,
+        apps: &[(&str, &str)],
+        launchers: &[(&str, &str)],
+    ) -> Generation {
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            pkg.to_string(),
+            crate::runtime::InstalledPackage {
+                name: pkg.to_string(),
+                version: "1.0".into(),
+                revision: 1,
+                sha3_384: "abc".into(),
+                files: vec![],
+                units: vec![],
+                layer: ClaimLayer::Own,
+                apps: apps
+                    .iter()
+                    .map(|(a, h)| (a.to_string(), h.to_string()))
+                    .collect(),
+                launchers: launchers
+                    .iter()
+                    .map(|(a, h)| (a.to_string(), h.to_string()))
+                    .collect(),
+                confined: Some(crate::snap::Confinement {
+                    backend: crate::snap::BackendKind::Bwrap,
+                    filesystem: vec!["write".into()],
+                    network: false,
+                    sockets: vec![],
+                    devices: vec![],
+                    backend_options: BTreeMap::new(),
+                }),
+                app_confined: BTreeMap::new(),
+                desktops: BTreeMap::new(),
+            },
+        );
+        Generation {
+            n,
+            base_version: "24.04".into(),
+            packages,
+            created_epoch: 0,
+            boot_entry: None,
+        }
+    }
+
+    #[test]
+    fn confined_farm_links_point_at_the_launcher_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        for hash in ["aa11", "bb22"] {
+            let blob = store.blob_path(hash);
+            std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+            std::fs::write(&blob, b"content").unwrap();
+        }
+        let gen = gen_with_confined_apps(1, "guiapp", &[("myapp", "aa11")], &[("myapp", "bb22")]);
+        let farm = emit(&store, &gen).unwrap();
+        let link = farm.join("myapp");
+        let target = std::fs::read_link(&link).unwrap();
+        assert!(
+            target.ends_with("store/bb/bb22"),
+            "confined farm entry must point at the launcher wrapper, got {target:?}"
+        );
+        // The wrapper blob is the executed content, not the raw binary.
+        assert_eq!(std::fs::read(link).unwrap(), b"content");
     }
 
     #[test]
@@ -340,6 +428,9 @@ mod tests {
                     .iter()
                     .map(|(a, h)| (a.to_string(), h.to_string()))
                     .collect(),
+                launchers: BTreeMap::new(),
+                confined: None,
+                app_confined: BTreeMap::new(),
                 desktops: desktops
                     .iter()
                     .map(|(a, l)| (a.to_string(), l.clone()))

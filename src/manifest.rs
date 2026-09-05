@@ -706,6 +706,7 @@ mod tests {
             target: None,
             toolchain: None,
             inputs: None,
+            confined: None,
             apps: HashMap::new(),
             definition_dir: None,
         }

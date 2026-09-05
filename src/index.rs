@@ -333,6 +333,7 @@ impl PackageIndex {
                                 environment: None,
                                 desktop: app.desktop.clone(),
                                 interpreter: None,
+                                confined: None,
                             },
                         )
                     })
@@ -375,6 +376,7 @@ impl PackageIndex {
             target: None,
             toolchain: None,
             inputs: None,
+            confined: None,
             apps,
             definition_dir: None,
         })
