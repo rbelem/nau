@@ -71,7 +71,7 @@ _Avoid_: fork, shadow file, patch file
 **Confinement**: The runtime isolation level of an installed package/app. Two levels: `unconfined` (runs directly on the host with the user's privileges — the default for simple CLIs) and `confined` (wrapped in a bubblewrap/AppArmor-seccomp sandbox with declared grants — for GUI apps and services). Distinct from the build-time *build sandbox*.
 _Avoid_: strict, classic, full, sandboxed
 
-**Grants**: Declared resource access a `confined` app requests (filesystem paths, network, sockets, devices) — the Lexicon the confinement backend honors. Mirror of snap interfaces / Flatpak finish-args.
+**Grants**: Declared resource access a `confined` app requests (filesystem paths, network, sockets, devices) — the shared vocabulary any confinement backend honors. A package may add a non-portable `backend_options` sub-table for backend-specific raw flags beyond the shared vocabulary.
 _Avoid_: interfaces, permissions, capabilities
 
 ## Flagged ambiguities
