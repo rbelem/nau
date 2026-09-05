@@ -990,6 +990,7 @@ mod tests {
             sources: std::collections::HashMap::new(),
             snaps: std::collections::HashMap::new(),
             inputs: std::collections::HashMap::new(),
+            packages: std::collections::HashMap::new(),
         };
         lock.record_snap(&crate::snap::SnapRef {
             name: "core22".into(),

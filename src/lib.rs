@@ -16,6 +16,7 @@ pub mod oci;
 pub mod output;
 pub mod pkg_source;
 pub mod plugins;
+pub mod pod;
 pub mod runtime;
 pub mod sign;
 pub mod snap;

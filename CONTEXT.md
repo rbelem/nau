@@ -59,6 +59,15 @@ _Avoid_: model assertion, lockfile (the lockfile pins *inputs*; the manifest des
 **Install**: An on-device operation that adds a package to the store and the current generation without mutating the base (`shuttle install`, ADR-0012).
 _Avoid_: snap install, layering
 
+**Pod**: A named user-level package selection owned by one user; the small shuttle served by the system mothership. Each pod has its own packages, overlays, lockfile, and generation chain; rollback switches that pod only.
+_Avoid_: global, profile, environment
+
+**Pod generation**: A pinned selection of one pod's packages + overlays + loaded pods at one point in time. Rollback switches that pod's `current` link only; it never reboots or touches system generations.
+_Avoid_: system generation, snapshot
+
+**Overlay**: An inline, code-only patch to an existing package declaration inside `pod.lua`, layered over `pkgs/` and loaded pods. Later layers win; upstream files are never modified.
+_Avoid_: fork, shadow file, patch file
+
 ## Flagged ambiguities
 
 - **"Build"** can mean: (a) the `shuttle build` CLI command, (b) a source package's compile step (`snap { build = "..." }`), or (c) the build sandbox environment. Use "build command", "build script", and "build sandbox" respectively.

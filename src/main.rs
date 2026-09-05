@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use shuttle::cache::PackageCache;
-use shuttle::cli::{CacheCommand, Cli, Command, IndexCommand, RuntimeCommand};
+use shuttle::cli::{CacheCommand, Cli, Command, IndexCommand, PodCommand, RuntimeCommand};
 use shuttle::image::ImageDeclaration;
 use shuttle::index::{IndexEntry, PackageIndex, StoreRef};
 use shuttle::lock::{LockFile, SourceLockEntry};
@@ -167,6 +167,8 @@ fn main() -> miette::Result<()> {
         Command::Cache(sub) => cmd_cache(sub),
 
         Command::Runtime(sub) => cmd_runtime(sub),
+
+        Command::Pod(sub) => cmd_pod(sub),
 
         Command::Push {
             reference,
@@ -404,6 +406,7 @@ fn prepare_inputs(
         sources: HashMap::new(),
         snaps: HashMap::new(),
         inputs: HashMap::new(),
+        packages: HashMap::new(),
     });
 
     let mut changed = false;
@@ -588,6 +591,7 @@ fn load_lockfile_or_default(lock_path: &Path) -> miette::Result<LockFile> {
         sources: HashMap::new(),
         snaps: HashMap::new(),
         inputs: HashMap::new(),
+        packages: HashMap::new(),
     }))
 }
 
@@ -1469,6 +1473,7 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
         sources: HashMap::new(),
         snaps: HashMap::new(),
         inputs: HashMap::new(),
+        packages: HashMap::new(),
     });
 
     // Empty names = refresh every declared input. All pins are resolved
@@ -1767,6 +1772,53 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
         } => {
             shuttle::output::set_mode(json);
             runtime_gc(prune, state_dir)
+        }
+    }
+}
+
+// ── Pods (issue #2 scaffold) ──
+
+fn cmd_pod(sub: PodCommand) -> miette::Result<()> {
+    match sub {
+        PodCommand::Add { package, root } => {
+            let root = shuttle::pod::pod_root(root.as_deref());
+            let report = shuttle::pod::add_package(&root, shuttle::pod::DEFAULT_POD, &package)?;
+            shuttle::output::ok(format!(
+                "added '{}' ({}) to pod '{}'",
+                report.name, report.version, report.pod
+            ));
+            Ok(())
+        }
+        PodCommand::Remove { package, root } => {
+            let root = shuttle::pod::pod_root(root.as_deref());
+            let report = shuttle::pod::remove_package(&root, shuttle::pod::DEFAULT_POD, &package)?;
+            shuttle::output::ok(format!(
+                "removed '{}' from pod '{}'",
+                report.name, report.pod
+            ));
+            Ok(())
+        }
+        PodCommand::List { root } => {
+            let root = shuttle::pod::pod_root(root.as_deref());
+            let entries = shuttle::pod::list_packages(&root, shuttle::pod::DEFAULT_POD)?;
+            if entries.is_empty() {
+                shuttle::output::info(format!(
+                    "pod '{}' has no packages",
+                    shuttle::pod::DEFAULT_POD
+                ));
+                return Ok(());
+            }
+            let width = entries.iter().map(|e| e.spec.len()).max().unwrap_or(0);
+            for entry in &entries {
+                let version = entry.version.as_deref().unwrap_or("(unresolved)");
+                shuttle::output::status(format!(
+                    "{:<width$}  {}",
+                    entry.spec,
+                    version,
+                    width = width
+                ));
+            }
+            Ok(())
         }
     }
 }

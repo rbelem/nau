@@ -32,6 +32,12 @@ pub struct LockFile {
     /// are recorded as local and never pinned.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub inputs: HashMap<String, InputLockEntry>,
+
+    /// Pod package pins (pods, issue #2). Per-pod lockfiles live in the
+    /// pod state directory and record the resolved version of every
+    /// declared package, keyed by package name.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub packages: HashMap<String, PodPackageLockEntry>,
 }
 
 /// A single source entry in the lockfile.
@@ -65,6 +71,18 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// A pod package pin (pods, issue #2): the resolved version observed when
+/// the package was added to a pod, plus the declared constraint (if any).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PodPackageLockEntry {
+    /// Resolved package version (from the package declaration).
+    pub version: String,
+
+    /// Version constraint from the declaration (`name@constraint`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
+}
+
 /// A single snap entry in the lockfile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapLockEntry {
@@ -76,6 +94,17 @@ pub struct SnapLockEntry {
 impl LockFile {
     /// Default lockfile filename.
     pub const FILENAME: &'static str = "shuttle.lock";
+
+    /// A fresh, empty lockfile at the current format version.
+    pub fn empty() -> Self {
+        LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs: HashMap::new(),
+            packages: HashMap::new(),
+        }
+    }
 
     /// Load lockfile from disk. Returns `None` if the file doesn't exist.
     pub fn load(path: &Path) -> miette::Result<Option<Self>> {
@@ -183,6 +212,7 @@ mod tests {
             sources,
             snaps,
             inputs: HashMap::new(),
+            packages: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&lock).unwrap();
@@ -222,6 +252,7 @@ mod tests {
             sources,
             snaps: HashMap::new(),
             inputs: HashMap::new(),
+            packages: HashMap::new(),
         };
 
         lock.save(&path).unwrap();
@@ -244,6 +275,7 @@ mod tests {
             sources: HashMap::new(),
             snaps: HashMap::new(),
             inputs: HashMap::new(),
+            packages: HashMap::new(),
         };
 
         let snap = SnapRef {
@@ -280,6 +312,7 @@ mod tests {
             sources: HashMap::new(),
             snaps,
             inputs: HashMap::new(),
+            packages: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&lock).unwrap();
@@ -319,6 +352,7 @@ mod tests {
             sources: HashMap::new(),
             snaps: HashMap::new(),
             inputs,
+            packages: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&lock).unwrap();
@@ -362,6 +396,7 @@ mod tests {
             sources: HashMap::new(),
             snaps: HashMap::new(),
             inputs: HashMap::new(),
+            packages: HashMap::new(),
         };
         lock.save(&path).unwrap();
         assert!(path.exists());
@@ -385,6 +420,7 @@ mod tests {
             sources: HashMap::new(),
             snaps: HashMap::new(),
             inputs: HashMap::new(),
+            packages: HashMap::new(),
         };
         lock.save(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();

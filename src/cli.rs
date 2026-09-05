@@ -375,6 +375,13 @@ pub enum Command {
     #[command(subcommand)]
     Runtime(RuntimeCommand),
 
+    /// Manage user-level pods (CONTEXT.md: Pod). Scaffold (issue #2):
+    /// add/remove/list packages in the default pod, round-tripping through
+    /// its `pod.lua` declaration and lockfile pins. No builds, binaries,
+    /// or generations yet — later tickets.
+    #[command(subcommand)]
+    Pod(PodCommand),
+
     /// Internal: evaluation worker process (hidden). Re-executed by the
     /// parent to evaluate untrusted definitions in a bounded subprocess
     /// (ADR-0010 Decisions 4+5). Not part of the public CLI.
@@ -527,6 +534,47 @@ pub enum RuntimeCommand {
         /// Output structured JSON instead of human-friendly output.
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Subcommands for `shuttle pod` (pods, issue #2): imperative edits to
+/// the default pod's declaration + lockfile, mirroring the runtime
+/// command group's lifecycle shape. The `--root` state override travels
+/// with each verb (clap requires subcommand flags after the verb; the
+/// planned `shuttle pod [--name <n>] <verb>` grouping lands with the
+/// --name ticket).
+#[derive(clap::Subcommand)]
+pub enum PodCommand {
+    /// Add a package to the default pod: records it in the pod
+    /// declaration and pins the resolved version in the lockfile.
+    Add {
+        /// Package name, optionally with a version constraint
+        /// (`name@constraint`, e.g. `ripgrep@14`).
+        package: String,
+
+        /// Pod state root (default: $XDG_DATA_HOME/shuttle/pods, i.e.
+        /// ~/.local/share/shuttle/pods). Overridable via SHUTTLE_POD_ROOT.
+        /// Tests redirect this into tempdirs.
+        #[arg(long)]
+        root: Option<String>,
+    },
+
+    /// Remove a package from the default pod: drops the declaration
+    /// entry and the lockfile pin.
+    Remove {
+        /// Package name (a trailing `@constraint` is ignored).
+        package: String,
+
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
+    },
+
+    /// List the default pod's packages with their resolved versions.
+    List {
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
     },
 }
 

@@ -725,6 +725,7 @@ mod tests {
             sources: HashMap::new(),
             snaps: HashMap::new(),
             inputs: HashMap::new(),
+            packages: HashMap::new(),
         }
     }
 

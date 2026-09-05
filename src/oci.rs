@@ -2446,6 +2446,7 @@ mod tests {
             sources: Default::default(),
             snaps: Default::default(),
             inputs: Default::default(),
+            packages: Default::default(),
         };
         lock.snaps.insert(
             name.to_string(),
