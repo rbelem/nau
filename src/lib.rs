@@ -5,6 +5,7 @@ pub mod cli;
 pub mod deps;
 pub mod doctor;
 pub mod dsl;
+pub mod farm;
 pub mod image;
 pub mod index;
 pub mod isolate;

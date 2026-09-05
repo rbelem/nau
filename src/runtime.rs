@@ -116,6 +116,12 @@ pub struct InstalledPackage {
     /// Daemon unit names this package contributed (empty for plain
     /// apps) — the unit reconciliation set difference works over these.
     pub units: Vec<String>,
+    /// App name → sha256 of the app's command binary in the store.
+    /// The farm emitter's source of truth (pod farm, `farm.rs`): each
+    /// entry becomes a direct symlink from the farm into the content
+    /// store. Empty for packages without apps and store-recorded snaps.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub apps: BTreeMap<String, String>,
 }
 
 /// One bootable selection: base version + package set + content hashes.
@@ -285,6 +291,14 @@ fn is_executable(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+/// Whether an external tool is on the host PATH. Public seam for the pod
+/// install path, which degrades (warn + skip, no store state touched)
+/// when the squashfs pair is missing instead of failing an add whose
+/// declaration half is already complete.
+pub fn tool_on_path(tool: &str) -> bool {
+    find_on_path(tool).is_some()
+}
+
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()
@@ -363,7 +377,10 @@ impl RuntimeStore {
         self.root.join("generations")
     }
 
-    fn generation_dir(&self, n: u64) -> PathBuf {
+    /// Directory of generation `n` (manifest + per-package extension
+    /// trees + the farm). Public for the pod farm emitter (`farm.rs`),
+    /// which hangs per-generation artifacts off it.
+    pub fn generation_dir(&self, n: u64) -> PathBuf {
         self.generations_dir().join(n.to_string())
     }
 
@@ -375,7 +392,10 @@ impl RuntimeStore {
         self.root.join("store")
     }
 
-    fn blob_path(&self, sha256: &str) -> PathBuf {
+    /// Path of the content blob with hash `sha256` (`store/<aa>/<sha>`).
+    /// Public for the pod farm emitter, whose farm entries are direct
+    /// symlinks into the store.
+    pub fn blob_path(&self, sha256: &str) -> PathBuf {
         let (aa, _) = sha256.split_at(2.min(sha256.len()));
         self.store_dir().join(aa).join(sha256)
     }
@@ -584,9 +604,11 @@ impl RuntimeStore {
         for p in &prepared {
             packages.insert(p.pkg.name.clone(), p.pkg.clone());
         }
+        let staged: std::collections::BTreeSet<String> =
+            prepared.iter().map(|p| p.pkg.name.clone()).collect();
 
         self.begin_journal("install", n);
-        self.stage_generation(n, &packages, &prepared)?;
+        self.stage_generation(n, &packages, &prepared, &staged)?;
         self.write_journal("install", n, JournalState::Staging);
         std::fs::rename(self.staging_dir(n), self.generation_dir(n))
             .into_diagnostic()
@@ -654,7 +676,7 @@ impl RuntimeStore {
         let n = self.next_generation_number()?;
         let prepared: Vec<PreparedSnap> = Vec::new();
         self.begin_journal("remove", n);
-        self.stage_generation(n, &packages, &prepared)?;
+        self.stage_generation(n, &packages, &prepared, &Default::default())?;
         self.write_journal("remove", n, JournalState::Staging);
         std::fs::rename(self.staging_dir(n), self.generation_dir(n))
             .into_diagnostic()
@@ -910,7 +932,13 @@ impl RuntimeStore {
                     snap.name
                 ));
                 Ok(PreparedSnap {
-                    pkg: self.recorded_package(snap, &version, Vec::new(), Vec::new()),
+                    pkg: self.recorded_package(
+                        snap,
+                        &version,
+                        Vec::new(),
+                        Vec::new(),
+                        BTreeMap::new(),
+                    ),
                     planner_notes: Vec::new(),
                     entries: Vec::new(),
                     units: Vec::new(),
@@ -925,7 +953,13 @@ impl RuntimeStore {
                 let runtime = plan_payload_runtime(&meta, &entries, snap)?;
                 let pkg_units = runtime.units.iter().map(|u| u.unit_name.clone()).collect();
                 Ok(PreparedSnap {
-                    pkg: self.recorded_package(snap, &version, entry_hashes(&entries), pkg_units),
+                    pkg: self.recorded_package(
+                        snap,
+                        &version,
+                        entry_hashes(&entries),
+                        pkg_units,
+                        runtime.apps,
+                    ),
                     planner_notes: runtime.notes,
                     entries,
                     units: runtime.units,
@@ -976,6 +1010,7 @@ impl RuntimeStore {
         version: &MetaVersion,
         files: Vec<String>,
         units: Vec<String>,
+        apps: BTreeMap<String, String>,
     ) -> InstalledPackage {
         InstalledPackage {
             name: snap.name.clone(),
@@ -984,6 +1019,7 @@ impl RuntimeStore {
             sha3_384: snap.sha3_384.clone(),
             files,
             units,
+            apps,
         }
     }
 
@@ -1178,6 +1214,7 @@ impl RuntimeStore {
         n: u64,
         packages: &BTreeMap<String, InstalledPackage>,
         prepared: &[PreparedSnap],
+        staged: &std::collections::BTreeSet<String>,
     ) -> miette::Result<()> {
         let staging = self.staging_dir(n);
         std::fs::create_dir_all(&staging)
@@ -1186,7 +1223,7 @@ impl RuntimeStore {
         for p in prepared {
             self.stage_package(&staging, p)?;
         }
-        self.carry_forward_trees(packages, &staging)?;
+        self.carry_forward_trees(packages, &staging, staged)?;
         let gen = Generation {
             n,
             base_version: read_base_os_release().1,
@@ -1261,11 +1298,18 @@ impl RuntimeStore {
         &self,
         packages: &BTreeMap<String, InstalledPackage>,
         staging: &Path,
+        staged: &std::collections::BTreeSet<String>,
     ) -> miette::Result<()> {
         let Some(active) = self.active_generation()? else {
             return Ok(());
         };
         for name in packages.keys() {
+            // Packages freshly staged above already have their NEW tree
+            // in the staging dir — carrying their OLD tree over it would
+            // collide (a changed revision must replace, not merge).
+            if staged.contains(name) {
+                continue;
+            }
             let src = self.generation_dir(active.n).join("extensions").join(name);
             if !src.exists() {
                 continue;
@@ -1408,6 +1452,9 @@ fn entry_hashes(entries: &[TreeEntry]) -> Vec<String> {
 struct PayloadRuntime {
     units: Vec<DaemonUnit>,
     renames: Vec<(String, String)>,
+    /// app name → binary content hash (mirrors the renames; recorded in
+    /// the package manifest for the pod farm).
+    apps: BTreeMap<String, String>,
     notes: Vec<String>,
 }
 
@@ -1429,6 +1476,7 @@ fn plan_payload_runtime(
     let mut out = PayloadRuntime {
         units: Vec::new(),
         renames: Vec::new(),
+        apps: BTreeMap::new(),
         notes: Vec::new(),
     };
     for (app_name, app) in &meta.apps {
@@ -1440,7 +1488,8 @@ fn plan_payload_runtime(
         }
         let hash = blob_hash_for(entries, &plan.in_snap_binary, &snap.name)?;
         out.renames
-            .push((hash, format!("usr/bin/{}-{}", plan.snap, plan.app)));
+            .push((hash.clone(), format!("usr/bin/{}-{}", plan.snap, plan.app)));
+        out.apps.insert(plan.app, hash);
     }
     Ok(out)
 }
@@ -1764,6 +1813,7 @@ mod tests {
             sha3_384: "abc".into(),
             files,
             units: units.iter().map(|s| s.to_string()).collect(),
+            apps: BTreeMap::new(),
         }
     }
 
@@ -1822,6 +1872,12 @@ mod tests {
     /// Pack a minimal shoot-built payload with mksquashfs (units.rs
     /// test pattern); None when the squashfs tools are unavailable.
     fn pack_payload(dir: &Path) -> Option<PathBuf> {
+        pack_payload_with(dir, "exec true")
+    }
+
+    /// [`pack_payload`] with an injectable build-marker: two payloads
+    /// built with different markers have different content hashes.
+    fn pack_payload_with(dir: &Path, marker: &str) -> Option<PathBuf> {
         if !has_tool("unsquashfs") || !has_tool("mksquashfs") {
             eprintln!("skipping: unsquashfs/mksquashfs unavailable");
             return None;
@@ -1848,7 +1904,7 @@ plugs:
 ",
         )
         .unwrap();
-        std::fs::write(tree.join("bin/myservice"), "#!/bin/sh\nexec true\n").unwrap();
+        std::fs::write(tree.join("bin/myservice"), format!("#!/bin/sh\n{marker}\n")).unwrap();
         // A payload-internal symlink: recreated, never followed.
         std::os::unix::fs::symlink("myservice", tree.join("bin/myservice-link")).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -2143,6 +2199,70 @@ plugs:
     }
 
     #[test]
+    fn reinstall_changed_payload_replaces_tree_without_collision() {
+        // A changed revision must REPLACE the carried tree, not
+        // hardlink over it: carry-forward of the old tree onto the
+        // freshly staged new one used to fail with "File exists"
+        // (observed via the pod sync path, issue #3).
+        let work = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let Some(payload_a) = pack_payload_with(&work.path().join("a"), "exec true") else {
+            return; // gated
+        };
+        let Some(payload_b) = pack_payload_with(&work.path().join("b"), "exec false") else {
+            return;
+        };
+        let Some(tools) = gated_tools(work.path()) else {
+            return;
+        };
+        let f = fixture();
+        let make_pending = |p: &Path| PendingSnap {
+            name: "my-snap".into(),
+            revision: 7,
+            sha3_384: sha3_384_file(p).unwrap(),
+            payload_path: p.to_path_buf(),
+        };
+        f.store
+            .install_batch(
+                &[make_pending(&payload_a)],
+                &SignatureEnvelope::default(),
+                &tools,
+            )
+            .unwrap();
+
+        let report = f
+            .store
+            .install_batch(
+                &[make_pending(&payload_b)],
+                &SignatureEnvelope::default(),
+                &tools,
+            )
+            .unwrap();
+        assert!(!report.noop, "changed sha3 is a real install");
+        assert_eq!(report.generation, Some(2));
+        assert_eq!(f.store.generations().unwrap().len(), 2);
+
+        // The new generation's tree carries the NEW content only.
+        let renamed = f
+            .store
+            .generation_dir(2)
+            .join("extensions/my-snap/usr/bin/my-snap-srv");
+        let content = std::fs::read_to_string(&renamed).unwrap();
+        assert!(
+            content.contains("exec false"),
+            "generation 2 tree must carry the changed content, got: {content}"
+        );
+        let gen = f.store.active_generation().unwrap().unwrap();
+        assert_eq!(
+            gen.packages["my-snap"].sha3_384,
+            sha3_384_file(&payload_b).unwrap(),
+            "manifest pins the new content address"
+        );
+    }
+
+    #[test]
     fn install_infrastructure_payload_is_refused() {
         let work = match tempfile::tempdir() {
             Ok(d) => d,
@@ -2415,6 +2535,7 @@ plugs:
                 sha3_384: "aaa".into(),
                 files: vec![],
                 units: vec![],
+                apps: BTreeMap::new(),
             },
         );
         installed.insert(
@@ -2426,6 +2547,7 @@ plugs:
                 sha3_384: "bbb".into(),
                 files: vec![],
                 units: vec![],
+                apps: BTreeMap::new(),
             },
         );
         let resolved = vec![

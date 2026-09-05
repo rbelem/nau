@@ -5,8 +5,16 @@
 //! declaration in a pod's `pod.lua`; resolve package versions from the
 //! shared package collection (`pkgs/` + inputs); pin the resolved versions
 //! in the pod's lockfile. `shuttle pod add/remove/list` round-trip through
-//! the declaration file. No builds, generations, farm, or activation —
-//! those arrive in later tickets.
+//! the declaration file.
+//!
+//! Issue #3: `add`/`remove` reconcile the declaration into the pod's
+//! generation chain through the shared runtime store (`crate::runtime`,
+//! pointed at the pod's state directory — no forked store), building each
+//! declared package with the normal snap build path. The bin farm
+//! (`crate::farm`) is re-emitted for the active generation and the pod's
+//! `current` link flipped after every mutation; `shuttle pod sync`
+//! re-runs the whole reconcile (hand-edited `pod.lua` included) and is a
+//! no-op — no new generation — when nothing changed.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -450,6 +458,11 @@ pub struct PodAddReport {
     pub name: String,
     pub constraint: Option<String>,
     pub version: String,
+    /// The generation the package was installed into, when the store
+    /// and farm were reconciled (None under the degraded no-squashfs
+    /// mode or when install was a no-op).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
     #[serde(skip)]
     pub pod_dir: PathBuf,
 }
@@ -459,6 +472,9 @@ pub struct PodAddReport {
 pub struct PodRemoveReport {
     pub pod: String,
     pub name: String,
+    /// The generation the removal produced (see [`PodAddReport`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 /// One entry for `pod list`.
@@ -496,7 +512,9 @@ pub fn load_declaration(root: &Path, pod_name: &str) -> miette::Result<PodDeclar
 
 /// Add a package to a pod: resolve it from the package collection FIRST
 /// (an unknown package must not modify any state), then record it in
-/// `pod.lua` and pin the resolved version in the lockfile.
+/// `pod.lua` and pin the resolved version in the lockfile, then
+/// reconcile the declaration into the pod's store, generation chain,
+/// and bin farm (issue #3).
 pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Result<PodAddReport> {
     validate_pod_name(pod_name)?;
     let spec = parse_pod_package(spec_str)?;
@@ -536,17 +554,31 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
     );
     lock.save(&lock_path)?;
 
+    // The declaration is the source of truth; the store reconcile
+    // follows it. A failed reconcile (unbuildable package) leaves the
+    // declaration + pin in place — fix the package and re-run
+    // `shuttle pod sync`.
+    let sync = sync_pod(root, pod_name)?;
+    if let Some(n) = sync.generation {
+        crate::output::ok(format!(
+            "installed '{}' into pod '{pod_name}' (generation {n})",
+            spec.name
+        ));
+    }
+
     Ok(PodAddReport {
         pod: pod_name.to_string(),
         name: spec.name,
         constraint: spec.constraint,
         version: meta.version,
+        generation: sync.generation,
         pod_dir: dir,
     })
 }
 
 /// Remove a package from a pod: drop it from the declaration and delete
-/// its lockfile pin.
+/// its lockfile pin, then reconcile — the store generation without it
+/// and a farm that no longer exposes its binaries (issue #3).
 pub fn remove_package(
     root: &Path,
     pod_name: &str,
@@ -576,9 +608,191 @@ pub fn remove_package(
         lock.save(&lock_path)?;
     }
 
+    let sync = sync_pod(root, pod_name)?;
+    if let Some(n) = sync.generation {
+        crate::output::ok(format!(
+            "removed '{}' from pod '{pod_name}' (generation {n})",
+            spec.name
+        ));
+    }
+
     Ok(PodRemoveReport {
         pod: pod_name.to_string(),
         name: spec.name,
+        generation: sync.generation,
+    })
+}
+
+/// Report for the pod reconcile (`shuttle pod sync`, and the tail of
+/// every add/remove).
+#[derive(Debug, Serialize)]
+pub struct PodSyncReport {
+    pub pod: String,
+    /// True when the reconcile changed nothing: every declared package
+    /// already installed at the same content and nothing installed that
+    /// isn't declared. No new generation, no farm churn.
+    pub noop: bool,
+    /// Names installed by this reconcile.
+    pub installed: Vec<String>,
+    /// Names removed from the store by this reconcile.
+    pub removed: Vec<String>,
+    /// The generation now current (absent when the pod has nothing
+    /// installed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    /// The farm directory now behind the pod's `current` link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub farm: Option<PathBuf>,
+}
+
+/// The runtime store of one pod: the shared runtime store module
+/// pointed at the pod's state directory (issue #3 seam — no forked
+/// store). The sysext presentation links are kept INSIDE the pod dir so
+/// a per-user pod never writes to the system extensions directory.
+pub fn pod_store(pod_dir: &Path) -> crate::runtime::RuntimeStore {
+    crate::runtime::RuntimeStore::new(pod_dir.to_path_buf())
+        .with_extensions_link_dir(pod_dir.join("extensions"))
+}
+
+/// Reconcile a pod's declaration into its store: build every declared
+/// package through the normal snap build path, install the changed set
+/// as a new generation, remove store packages the declaration dropped,
+/// then re-emit the active generation's bin farm and flip `current`.
+///
+/// Idempotent: run with no changes, install finds everything already
+/// installed at the same content, removes nothing — no new generation.
+pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
+    validate_pod_name(pod_name)?;
+    let decl = load_declaration(root, pod_name)?;
+    let dir = pod_dir(root, pod_name);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
+    let store = pod_store(&dir);
+    let tools = crate::runtime::RuntimeTools::from_host();
+
+    // Resolve + build every declared package through the normal build
+    // path. Resolution happens before any store state moves: a
+    // declaration naming an unknown package fails the whole reconcile.
+    // Degraded mode: without the squashfs pair nothing can be built or
+    // unpacked, so the reconcile installs nothing — warn loudly and
+    // keep the declaration half authoritative (removals below still
+    // proceed; they never unpack).
+    let can_install = tools.unsquashfs.is_some() && crate::runtime::tool_on_path("mksquashfs");
+    let mut pending = Vec::new();
+    let mut declared_names = std::collections::BTreeSet::new();
+    if can_install {
+        for spec_str in &decl.packages {
+            let spec = parse_pod_package(spec_str)?;
+            let meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+                miette::miette!(
+                    "cannot build declared package '{}': {e} (declaration at {})",
+                    spec.name,
+                    pod_lua_path(root, pod_name).display()
+                )
+            })?;
+            declared_names.insert(meta.name.clone());
+            pending.push(build_pending_snap(&store, &meta)?);
+        }
+    } else if !decl.packages.is_empty() {
+        warn_degraded_install();
+    }
+
+    // Install the changed set (a no-op batch creates no generation).
+    let mut installed = Vec::new();
+    if !pending.is_empty() {
+        let report = store.install_batch(&pending, &Default::default(), &tools)?;
+        if !report.noop {
+            installed = report.installed.iter().map(|s| s.name.clone()).collect();
+        }
+    }
+
+    // Remove store packages the declaration dropped. Removal never
+    // unpacks, so it proceeds even in degraded mode. A package the
+    // degraded mode never installed is simply absent — skip it.
+    let mut removed = Vec::new();
+    if let Some(active) = store.active_generation()? {
+        for name in active.packages.keys() {
+            if declared_names.contains(name) {
+                continue;
+            }
+            store.remove(name, &tools)?;
+            removed.push(name.clone());
+        }
+    }
+
+    // Present whatever is now active. Nothing active → nothing exposed.
+    let active = store.active_generation()?;
+    let (generation, farm) = match &active {
+        Some(gen) => {
+            let farm = crate::farm::emit(&store, gen)?;
+            crate::farm::flip_current(&dir, gen.n)?;
+            (Some(gen.n), Some(farm))
+        }
+        None => {
+            crate::farm::clear_current(&dir)?;
+            (None, None)
+        }
+    };
+
+    Ok(PodSyncReport {
+        pod: pod_name.to_string(),
+        noop: installed.is_empty() && removed.is_empty(),
+        installed,
+        removed,
+        generation,
+        farm,
+    })
+}
+
+/// Degraded-mode banner for `pod add` when the squashfs pair is absent:
+/// the declaration is written, the install is deferred to
+/// `shuttle pod sync` once the tools exist.
+pub(crate) fn warn_degraded_install() {
+    crate::output::warn(
+        "unsquashfs/mksquashfs not found — packages declared but not \
+         installed; install squashfs-tools and run `shuttle pod sync`",
+    );
+}
+
+/// Epoch stamped into pod-built payloads so the same content builds to
+/// the same bytes on every sync (mksquashfs embeds build time otherwise
+/// — verified: two builds of an identical tree differ without this, and
+/// match with it). The no-op detection compares payload sha3-384s, so
+/// reproducibility IS the idempotency guarantee.
+const POD_BUILD_EPOCH: &str = "946684800";
+
+/// Build one declared package into a `.snap` payload with the normal
+/// snap build path (`shuttle::snap::build_snap` — the same pipeline
+/// `shuttle build` uses, sandbox included) and shape it as a pending
+/// store install. Local builds carry revision 0; content identity is
+/// the payload's sha3-384, which is what the no-op detection compares.
+fn build_pending_snap(
+    store: &crate::runtime::RuntimeStore,
+    meta: &crate::snap::SnapMeta,
+) -> miette::Result<crate::runtime::PendingSnap> {
+    // mksquashfs 4.4+ reads this natively; only set it when the user
+    // hasn't chosen an epoch of their own.
+    if std::env::var_os("SOURCE_DATE_EPOCH").is_none() {
+        std::env::set_var("SOURCE_DATE_EPOCH", POD_BUILD_EPOCH);
+    }
+    let stage = tempfile::tempdir().map_err(|e| miette::miette!("temp stage dir: {e}"))?;
+    let downloads = store.downloads_dir();
+    std::fs::create_dir_all(&downloads)
+        .map_err(|e| miette::miette!("creating {}: {e}", downloads.display()))?;
+    let result = crate::snap::build_snap(
+        meta,
+        stage.path(),
+        &downloads,
+        crate::snap::host_arch(),
+        crate::snap::StagePolicy::Default,
+    )?;
+    let payload = downloads.join(&result.snap_filename);
+    let sha3_384 = crate::store::sha3_384_file(&payload)?;
+    Ok(crate::runtime::PendingSnap {
+        name: meta.name.clone(),
+        revision: 0,
+        sha3_384,
+        payload_path: payload,
     })
 }
 

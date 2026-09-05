@@ -1799,6 +1799,12 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             ));
             Ok(())
         }
+        PodCommand::Sync { root } => {
+            let root = shuttle::pod::pod_root(root.as_deref());
+            let report = shuttle::pod::sync_pod(&root, pod_name)?;
+            print_pod_sync_report(&report);
+            Ok(())
+        }
         PodCommand::List { root } => {
             let root = shuttle::pod::pod_root(root.as_deref());
             let entries = shuttle::pod::list_packages(&root, pod_name)?;
@@ -1819,6 +1825,32 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Report the reconcile outcome for `shuttle pod sync`: a no-op says
+/// so (no new generation), changes name what moved, and the current
+/// generation + farm path close the story.
+fn print_pod_sync_report(report: &shuttle::pod::PodSyncReport) {
+    if report.noop {
+        shuttle::output::ok(format!(
+            "pod '{}' already matches its declaration — no new generation",
+            report.pod
+        ));
+    } else {
+        for name in &report.installed {
+            shuttle::output::ok(format!("installed {name}"));
+        }
+        for name in &report.removed {
+            shuttle::output::ok(format!("removed {name}"));
+        }
+    }
+    if let Some(n) = report.generation {
+        shuttle::output::info(format!("generation {n} current"));
+    }
+    if let Some(farm) = &report.farm {
+        shuttle::output::info(format!("farm: {}", farm.display()));
+    }
+    print_report(report);
 }
 
 // ── OCI registry push/pull (Phase 25) ──

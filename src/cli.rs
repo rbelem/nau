@@ -580,6 +580,16 @@ pub enum PodCommand {
         root: Option<String>,
     },
 
+    /// Reconcile the selected pod's declaration into its store: build
+    /// every declared package, install the changed set as a new
+    /// generation, remove dropped ones, and refresh the bin farm behind
+    /// the pod's `current` link. A no-op when nothing changed.
+    Sync {
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
+    },
+
     /// List the selected pod's packages with their resolved versions.
     List {
         /// Pod state root (see `pod add --root`).
