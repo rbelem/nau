@@ -13,7 +13,8 @@
     "bison@latest",
     "bubblewrap@latest",
     "gnumake@latest",
-    "flex@latest"
+    "flex@latest",
+    "patchelf@latest"
   ],
   "shell": {
     "init_hook": [

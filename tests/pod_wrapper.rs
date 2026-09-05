@@ -112,6 +112,11 @@ fn make_tarball(server_dir: &Path, name: &str) {
     let pkg = server_dir.join(name);
     std::fs::create_dir_all(&pkg).unwrap();
     std::fs::write(pkg.join("README"), "fixture source\n").unwrap();
+    std::fs::write(
+        pkg.join("hello.c"),
+        "#include <stdio.h>\nint main(void){ printf(\"native-elf-ran\\n\"); return 0; }\n",
+    )
+    .unwrap();
     let status = Command::new("tar")
         .args([
             "czf",
@@ -166,9 +171,9 @@ fn write_pkg_interpreter(project: &Path, name: &str, app: &str, port: u16, tarba
     std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
 }
 
-/// A native-ELF package: `build` copies a real ELF (`/bin/sh`) into
-/// `$STAGE/bin/<bin>`. Even with an `interpreter` declared, an ELF command
-/// binary must get NO wrapper (issue #9).
+/// A native-ELF package: `build` compiles a tiny C program (links only the
+/// system C library) into `$STAGE/bin/<bin>`. Even with an `interpreter`
+/// declared, an ELF command binary must get NO wrapper (issue #9).
 fn write_pkg_elf(project: &Path, name: &str, app: &str, port: u16, tarball: &str) {
     let letter = name.chars().next().unwrap().to_ascii_lowercase();
     let dir = project.join("pkgs").join(letter.to_string());
@@ -178,7 +183,7 @@ fn write_pkg_elf(project: &Path, name: &str, app: &str, port: u16, tarball: &str
     name = "{name}",
     version = "1.0",
     source = "http://127.0.0.1:{port}/{tarball}",
-    build = "mkdir -p $STAGE/bin && cp /bin/sh $STAGE/bin/{app} && chmod +x $STAGE/bin/{app}",
+    build = "mkdir -p $STAGE/bin && gcc -o $STAGE/bin/{app} $SRC/hello.c && chmod +x $STAGE/bin/{app}",
     apps = {{ {app} = {{ command = "bin/{app}", interpreter = "python3" }} }},
 }} }}
 "#
@@ -366,12 +371,6 @@ gated_test!(native_elf_package_gets_no_wrapper, {
     make_tarball(server.path(), "elftool");
     write_pkg_elf(project.path(), "elftool", "elftool", port, "elftool.tar.gz");
 
-    // Copying /bin/sh requires the sandbox to resolve it; skip if absent.
-    if !has_tool("sh") {
-        eprintln!("skipping: /bin/sh not available for the native-ELF fixture");
-        return;
-    }
-
     let (code, _, stderr) = run(project.path(), root.path(), &["add", "elftool"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
 
@@ -388,8 +387,9 @@ gated_test!(native_elf_package_gets_no_wrapper, {
         &bytes[..4.min(bytes.len())]
     );
 
-    // It EXECUTES as the real ELF (here a shell) — not via a wrapper.
-    let out = run_farm_binary(&farm, "elftool", &["-c", "echo native-elf-ran"]);
+    // It EXECUTES as the real ELF (compiled from $SRC/hello.c) — not via a
+    // wrapper.
+    let out = run_farm_binary(&farm, "elftool", &[]);
     assert!(
         out.contains("native-elf-ran"),
         "native ELF farm binary must execute directly: {out:?}"

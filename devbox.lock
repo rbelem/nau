@@ -525,6 +525,54 @@
         }
       }
     },
+    "patchelf@latest": {
+      "last_modified": "2026-08-27T07:16:00Z",
+      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#patchelf",
+      "source": "devbox-search",
+      "version": "0.15.2",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/7vn62k5h1icga04q1cl279dca2478b9r-patchelf-0.15.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/7vn62k5h1icga04q1cl279dca2478b9r-patchelf-0.15.2"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/0ilfyzqa907lj2bjg42qc30qr45nhwcn-patchelf-0.15.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/0ilfyzqa907lj2bjg42qc30qr45nhwcn-patchelf-0.15.2"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/76na5qznmaxm568j5b3ahxqxy43g6pz1-patchelf-0.15.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/76na5qznmaxm568j5b3ahxqxy43g6pz1-patchelf-0.15.2"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/fpig164lz7fcipbndn61sfd2y2yq363n-patchelf-0.15.2",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/fpig164lz7fcipbndn61sfd2y2yq363n-patchelf-0.15.2"
+        }
+      }
+    },
     "pkg-config@latest": {
       "last_modified": "2025-11-23T21:50:36Z",
       "resolved": "github:NixOS/nixpkgs/ee09932cedcef15aaf476f9343d1dea2cb77e261#pkg-config",

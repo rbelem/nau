@@ -278,8 +278,15 @@ gated_test!(native_elf_without_bundled_lib_gets_no_wrapper, {
         eprintln!("skipping: /bin/sh not available");
         return;
     }
-    // A tiny tarball so `$SRC` resolves (content unused by the build).
-    std::fs::create_dir_all(server.path().join("emptytool")).unwrap();
+    // A tiny tarball carrying a C source the build compiles into a native
+    // ELF that links only the system C library (no bundled runtime libs).
+    let empty_dir = server.path().join("emptytool");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    std::fs::write(
+        empty_dir.join("hello.c"),
+        "#include <stdio.h>\nint main(void){ printf(\"no-wrapper-ok\\n\"); return 0; }\n",
+    )
+    .unwrap();
     let status = Command::new("tar")
         .args([
             "czf",
@@ -291,8 +298,11 @@ gated_test!(native_elf_without_bundled_lib_gets_no_wrapper, {
         .unwrap();
     assert!(status.success(), "tar failed");
 
-    // A package whose build copies a system ELF (/bin/sh) — no bundled libs,
-    // so it must get NO wrapper (issue #9 + #10: libs already resolvable).
+    // A package whose build compiles a tiny native ELF (links only the
+    // system C lib — no bundled runtime libs) → it must get NO wrapper
+    // (issue #9 + #10: libs already resolvable). A gcc hello-world (not a
+    // copied nix bash, which needs nix-only readline) stays portable after
+    // ticket #12 repoints the interpreter to the system loader.
     let dir = project.path().join("pkgs").join("e");
     std::fs::create_dir_all(&dir).unwrap();
     let lua = format!(
@@ -300,7 +310,7 @@ gated_test!(native_elf_without_bundled_lib_gets_no_wrapper, {
     name = "etool",
     version = "1.0",
     source = "http://127.0.0.1:{port}/emptytool.tar.gz",
-    build = "mkdir -p $STAGE/usr/bin && cp /bin/sh $STAGE/usr/bin/etool && chmod +x $STAGE/usr/bin/etool",
+    build = "mkdir -p $STAGE/usr/bin && gcc -o $STAGE/usr/bin/etool $SRC/hello.c && chmod +x $STAGE/usr/bin/etool",
     apps = {{ etool = {{ command = "usr/bin/etool" }} }},
 }} }}
 "#
@@ -324,8 +334,8 @@ gated_test!(native_elf_without_bundled_lib_gets_no_wrapper, {
         "no .real sibling for an already-resolvable ELF"
     );
 
-    // It EXECUTES directly as the real ELF (a shell).
-    let out = run_farm_binary(&farm, "etool", &["-c", "echo no-wrapper-ok"]);
+    // It EXECUTES directly as the real ELF.
+    let out = run_farm_binary(&farm, "etool", &[]);
     assert!(
         out.contains("no-wrapper-ok"),
         "native ELF farm binary must execute directly: {out:?}"

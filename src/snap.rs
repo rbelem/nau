@@ -1812,6 +1812,28 @@ fn make_owner_executable(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, perms)
 }
 
+/// Add the owner-write bit so a build-time tool (patchelf) can rewrite a
+/// possibly read-only ELF in place. Returns the original mode to restore.
+fn with_write_permission(path: &Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::metadata(path)?.permissions();
+    let mode = perms.mode();
+    let mut perms = perms;
+    perms.set_mode(mode | 0o200);
+    std::fs::set_permissions(path, perms)?;
+    Ok(mode)
+}
+
+/// Restore the original mode captured by [`with_write_permission`].
+fn restore_write_permission(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(perms) = std::fs::metadata(path) {
+        let mut perms = perms.permissions();
+        perms.set_mode(mode);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
 /// ELF class / byte-order of a file's ELF header, if it is an ELF.
 fn elf_class_endian(bytes: &[u8]) -> Option<(u8, u8)> {
     if bytes.len() < 16 || &bytes[..4] != b"\x7fELF" {
@@ -1924,6 +1946,249 @@ fn elf_needed_libs(path: &Path) -> Option<Vec<String>> {
     )
 }
 
+/// ELF machine type (`e_machine`) of a file, if it is an ELF.
+fn elf_machine(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
+        return None;
+    }
+    read_uint(bytes, 0x12, 2, bytes[5] == 2) // EI_DATA: MSB=2
+}
+
+/// The `PT_INTERP` interpreter string of an ELF (e.g.
+/// `/nix/store/...-/lib/ld-linux-x86-64.so.2`), or `None` if the ELF has no
+/// interpreter (a static binary) or is unparseable.
+fn elf_interpreter(path: &Path) -> Option<String> {
+    const PT_INTERP: u64 = 3;
+    let bytes = std::fs::read(path).ok()?;
+    let (class, data) = elf_class_endian(&bytes)?;
+    let big = data == 2;
+    let is64 = class == 2;
+    let (phoff, phnum) = if is64 {
+        (
+            read_uint(&bytes, 0x20, 8, big)?,
+            read_uint(&bytes, 0x38, 2, big)?,
+        )
+    } else {
+        (
+            read_uint(&bytes, 0x1c, 4, big)?,
+            read_uint(&bytes, 0x2c, 2, big)?,
+        )
+    };
+    let (entry_size, offset_off, filesz_off) = if is64 {
+        (56usize, 8usize, 32usize)
+    } else {
+        (32usize, 4usize, 16usize)
+    };
+    for i in 0..phnum {
+        let off = phoff as usize + (i as usize) * entry_size;
+        let p_type = read_uint(&bytes, off, 4, big)?;
+        if p_type != PT_INTERP {
+            continue;
+        }
+        let p_offset = read_uint(&bytes, off + offset_off, if is64 { 8 } else { 4 }, big)?;
+        let p_filesz = read_uint(&bytes, off + filesz_off, if is64 { 8 } else { 4 }, big)?;
+        let start = p_offset as usize;
+        let end = start + p_filesz as usize;
+        if end > bytes.len() || end <= start {
+            return None;
+        }
+        // The string is NUL-terminated within PT_INTERP's file range.
+        let str_bytes = &bytes[start..end];
+        let nul = str_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(str_bytes.len());
+        return Some(String::from_utf8_lossy(&str_bytes[..nul]).into_owned());
+    }
+    None
+}
+
+/// The `DT_RUNPATH`/`DT_RPATH` string of an ELF, or `None` if the dynamic
+/// section carries neither (or the ELF is unparseable).
+fn elf_runpath(path: &Path) -> Option<String> {
+    const DT_RUNPATH: u64 = 29;
+    const DT_RPATH: u64 = 15;
+    let bytes = std::fs::read(path).ok()?;
+    let (class, data) = elf_class_endian(&bytes)?;
+    let big = data == 2;
+    let is64 = class == 2;
+    let (phoff, _phentsize, phnum) = if is64 {
+        (
+            read_uint(&bytes, 0x20, 8, big)?,
+            read_uint(&bytes, 0x36, 2, big)?,
+            read_uint(&bytes, 0x38, 2, big)?,
+        )
+    } else {
+        (
+            read_uint(&bytes, 0x1c, 4, big)?,
+            read_uint(&bytes, 0x2a, 2, big)?,
+            read_uint(&bytes, 0x2c, 2, big)?,
+        )
+    };
+    let (entry_size, offset_off, filesz_off) = if is64 {
+        (56usize, 8usize, 32usize)
+    } else {
+        (32usize, 4usize, 16usize)
+    };
+    let mut dyn_range = None;
+    for i in 0..phnum {
+        let off = phoff as usize + (i as usize) * entry_size;
+        let p_type = read_uint(&bytes, off, 4, big)?;
+        if p_type == 2
+        /* PT_DYNAMIC */
+        {
+            let p_offset = read_uint(&bytes, off + offset_off, if is64 { 8 } else { 4 }, big)?;
+            let p_filesz = read_uint(&bytes, off + filesz_off, if is64 { 8 } else { 4 }, big)?;
+            dyn_range = Some((p_offset as usize, p_filesz as usize));
+            break;
+        }
+    }
+    let (dyn_off, dyn_sz) = dyn_range?;
+    let (tag_size, val_size) = if is64 {
+        (8usize, 8usize)
+    } else {
+        (4usize, 4usize)
+    };
+    let mut strtab = None;
+    let mut rpath_off = None;
+    let mut i = dyn_off;
+    let end = dyn_off + dyn_sz;
+    while i + tag_size + val_size <= end {
+        let tag = read_uint(&bytes, i, tag_size, big)?;
+        let val = read_uint(&bytes, i + tag_size, val_size, big)?;
+        if tag == 0
+        /* DT_NULL */
+        {
+            break;
+        }
+        if tag == DT_RUNPATH || tag == DT_RPATH {
+            // Either tag marks a runtime search path we must not leave
+            // pointing into the build machine's nix store. (Detection only;
+            // `patchelf` clears both when it rewrites.)
+            rpath_off = Some(val as usize);
+        } else if tag == 5
+        /* DT_STRTAB */
+        {
+            strtab = Some(val as usize);
+        }
+        i += tag_size + val_size;
+    }
+    let (strtab, rpath_off) = (strtab?, rpath_off?);
+    let j = strtab + rpath_off;
+    if j >= bytes.len() {
+        return None;
+    }
+    let mut end0 = j;
+    while end0 < bytes.len() && bytes[end0] != 0 {
+        end0 += 1;
+    }
+    Some(String::from_utf8_lossy(&bytes[j..end0]).into_owned())
+}
+
+/// The system ELF interpreter path a non-nix Linux host provides for the
+/// given ELF machine type (e.g. x86-64 → `/lib64/ld-linux-x86-64.so.2`).
+/// This is the interpreter a pod-built binary will use so it runs on a
+/// host without the build machine's nix store.
+fn system_elf_interpreter_for(machine: u64) -> String {
+    match machine {
+        62 => "/lib64/ld-linux-x86-64.so.2".to_string(), // EM_X86_64
+        183 => "/lib/ld-linux-aarch64.so.1".to_string(), // EM_AARCH64
+        // Unknown arch: keep the standard `lib/`-relative location for the
+        // interpreter basename; correct for the common glibc loaders.
+        _ => "/lib64/ld-linux.so.2".to_string(),
+    }
+}
+
+/// Find the `patchelf` binary on PATH (used to repoint an ELF
+/// interpreter/RUNPATH at build time). Returns `None` when unavailable.
+fn find_patchelf() -> Option<String> {
+    std::process::Command::new("which")
+        .arg("patchelf")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        })
+}
+
+/// Rewrite a native command binary's ELF interpreter and RUNPATH so it runs
+/// on a non-nix host (ticket #12). A nix-toolchain build bakes the build
+/// machine's `/nix/store/...-glibc.../ld-linux-x86-64.so.2` as the
+/// interpreter and `/nix/store/.../lib` paths into RUNPATH; a plain host has
+/// neither. At build time we repoint the interpreter at the system loader
+/// (`/lib64/ld-linux-x86-64.so.2`) and clear RUNPATH so runtime libs resolve
+/// from the host's default search path plus the #10 pod library wrapper's
+/// `LD_LIBRARY_PATH` — never the build machine's nix store.
+///
+/// Returns the number of ELF binaries repointed. Binaries whose interpreter
+/// and RUNPATH already carry no `/nix/store` reference are left untouched.
+fn repair_elf_for_portability(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<usize> {
+    let patchelf = find_patchelf();
+    let mut repaired = 0usize;
+    for (app_name, app) in &meta.apps {
+        let Some(cmd_path) = crate::units::resolve_command_path(&app.command) else {
+            continue;
+        };
+        let entry = stage_dir.join(&cmd_path);
+        if !entry.is_file() || !is_elf(&entry) {
+            continue;
+        }
+        let needs_interp = elf_interpreter(&entry)
+            .map(|i| i.contains("/nix/store/"))
+            .unwrap_or(false);
+        let needs_rpath = elf_runpath(&entry)
+            .map(|r| r.contains("/nix/store/"))
+            .unwrap_or(false);
+        if !needs_interp && !needs_rpath {
+            continue;
+        }
+        let Some(patchelf) = patchelf.as_ref() else {
+            return Err(miette::miette!(
+                "app '{app_name}': native-ELF {cmd_path} references the build machine's \
+                 /nix/store toolchain in its interpreter/RUNPATH (ticket #12), but 'patchelf' is \
+                 not on PATH — install it (e.g. add patchelf to devbox.json) so pod builds can \
+                 repoint the interpreter to a non-nix system loader",
+            ));
+        };
+        // Derive the system interpreter from the ELF's machine type.
+        let bytes = std::fs::read(&entry)
+            .map_err(|e| miette::miette!("app '{app_name}': reading {cmd_path}: {e}"))?;
+        let machine = elf_machine(&bytes).unwrap_or(62); // default x86-64
+        let interpreter = system_elf_interpreter_for(machine);
+        // patchelf rewrites the file in place, so a copied read-only ELF
+        // (e.g. `cp /bin/sh $STAGE/...`) needs a write bit during repair.
+        let saved = with_write_permission(&entry).map_err(|e| {
+            miette::miette!("app '{app_name}': making {cmd_path} writable for patchelf: {e}")
+        })?;
+        let status = std::process::Command::new(patchelf)
+            .arg("--set-interpreter")
+            .arg(&interpreter)
+            .arg("--set-rpath")
+            .arg("")
+            .arg(&entry)
+            .status()
+            .map_err(|e| {
+                miette::miette!("app '{app_name}': running patchelf on {cmd_path}: {e}")
+            })?;
+        restore_write_permission(&entry, saved);
+        if !status.success() {
+            return Err(miette::miette!(
+                "app '{app_name}': patchelf failed on {cmd_path} (exit {:?})",
+                status.code()
+            ));
+        }
+        repaired += 1;
+    }
+    Ok(repaired)
+}
+
 /// Relative (to the stage root) parent directories of shared libraries the
 /// payload itself ships that an ELF needs — i.e. runtime libs that will be
 /// separate content-addressed store blobs and are NOT resolvable from the
@@ -2031,7 +2296,18 @@ pub fn build_snap(
     // 1. Run build phase (download source, run build command) if configured
     let outcome = run_build(meta, stage_dir, stage_policy)?;
 
-    // 1a. Author build-time launcher wrappers into the stage for
+    // 1a. Repair native-ELF command binaries for portability (ticket #12):
+    // a nix-toolchain build bakes `/nix/store/...` interpreter + RUNPATH
+    // into a built binary, which a non-nix host cannot execute. Repoint the
+    // interpreter at the system loader and clear RUNPATH at build time
+    // (never host-side). Only pod builds export binaries to a host, so this
+    // runs when a pod store is provided. patchelf is a build tool the pod
+    // build path provides.
+    if pod_store.is_some() {
+        repair_elf_for_portability(meta, stage_dir)?;
+    }
+
+    // 1b. Author build-time launcher wrappers into the stage for
     // interpreter-based apps (issue #9): an app declaring `interpreter`
     // whose command binary is a script (no native ELF) gets its command
     // path replaced by a single-`exec` wrapper referencing the script's
@@ -2044,7 +2320,7 @@ pub fn build_snap(
     let mut arch_meta = meta.clone();
     arch_meta.architectures = Some(vec![arch.to_string()]);
 
-    // 1b. Apply adopt-info metadata extracted at build time (post-build by
+    // 1c. Apply adopt-info metadata extracted at build time (post-build by
     // design: the adopted part's files and the pinned tree are what the
     // ladder reads). The extracted version feeds the snap.yaml AND the
     // output filename — version identity is only honest once extracted.
