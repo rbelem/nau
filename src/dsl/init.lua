@@ -408,6 +408,11 @@ function app(opts)
     check_string_array(opts.plugs, "app", "plugs")
     check_string_array(opts.slots, "app", "slots")
     check_table(opts.environment, "app", "environment")
+    if opts.interpreter ~= nil and type(opts.interpreter) ~= "string" then
+        error(string.format(
+            "app(): field 'interpreter' must be a string, got %s", type(opts.interpreter)
+        ), 2)
+    end
 
     -- Unknown fields are rejected, not silently dropped: anything this
     -- schema doesn't know would otherwise vanish between the DSL and the
@@ -419,6 +424,8 @@ function app(opts)
         plugs = true,
         slots = true,
         environment = true,
+        desktop = true,
+        interpreter = true,
     }
     local unknown = {}
     for k in pairs(opts) do
@@ -433,7 +440,7 @@ function app(opts)
             table.insert(list, string.format("'%s'", k))
         end
         error(string.format(
-            "app(): unknown field%s %s (valid fields: command, daemon, plugs, slots, environment)",
+            "app(): unknown field%s %s (valid fields: command, daemon, plugs, slots, environment, desktop, interpreter)",
             #unknown == 1 and "" or "s",
             table.concat(list, ", ")
         ), 2)

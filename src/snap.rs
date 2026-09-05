@@ -302,6 +302,15 @@ pub struct SnapApp {
     /// at install time and generates the user-level entry from it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desktop: Option<String>,
+
+    /// For an interpreter-based app (issue #9): the interpreter the app's
+    /// command script runs under (e.g. `node`). When a pod build emits a
+    /// command binary that is a script (not a native ELF), a launcher
+    /// wrapper is authored into the store payload at build time so the
+    /// farm's direct symlink points at a working wrapper. Native-ELF
+    /// commands get no wrapper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<String>,
 }
 
 // ── Phase 15: snap.yaml coverage structs ──
@@ -696,7 +705,13 @@ impl SnapApp {
             let (k, _) = pair.map_err(|e| miette::miette!("app '{name}': {e}"))?;
             if !matches!(
                 k.as_str(),
-                "command" | "daemon" | "plugs" | "slots" | "environment" | "desktop"
+                "command"
+                    | "daemon"
+                    | "plugs"
+                    | "slots"
+                    | "environment"
+                    | "desktop"
+                    | "interpreter"
             ) {
                 unknown.push(k);
             }
@@ -709,7 +724,7 @@ impl SnapApp {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(miette::miette!(
-                "app '{name}': unknown field{} {list} (valid fields: command, daemon, plugs, slots, environment, desktop)",
+                "app '{name}': unknown field{} {list} (valid fields: command, daemon, plugs, slots, environment, desktop, interpreter)",
                 if unknown.len() == 1 { "" } else { "s" },
             ));
         }
@@ -723,6 +738,7 @@ impl SnapApp {
         if let Some(d) = &desktop {
             validate_desktop_path(name, d)?;
         }
+        let interpreter = get_opt_string(table, "interpreter")?;
 
         Ok(SnapApp {
             command,
@@ -731,6 +747,7 @@ impl SnapApp {
             slots,
             environment,
             desktop,
+            interpreter,
         })
     }
 }
@@ -1364,6 +1381,116 @@ pub fn check_cross_build(arch: &str, target: Option<&str>) -> miette::Result<()>
     })
 }
 
+/// Author build-time launcher wrappers for interpreter-based apps (issue #9).
+///
+/// An app declaring `interpreter` (e.g. `interpreter = "node"`) whose
+/// command binary is a **script** (no native ELF magic) gets a launcher
+/// wrapper authored into the store payload at build time, the nix
+/// `makeWrapper`/`wrapProgram` analogy: the original script is preserved
+/// at a sibling `<command>.real` path (still shipped in the payload) and
+/// the app's command path is replaced by a wrapper that single-`exec`s the
+/// interpreter with the script's content-addressed store path, e.g.
+/// `exec "node" "$POD/store/aa/<sha256>" "$@"`. The pod farm's direct
+/// symlink then points at the wrapper and resolves to a working launcher.
+/// Native-ELF command binaries get no wrapper; apps without an
+/// `interpreter` are never touched.
+///
+/// Runs only when a pod store is provided (the build is a pod build) —
+/// `pod_store` is used to bake the script's future store blob path, which
+/// is only defined for a pod content store.
+fn emit_build_wrappers(
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    pod_store: &crate::runtime::RuntimeStore,
+) -> miette::Result<()> {
+    for (app_name, app) in &meta.apps {
+        let Some(interpreter) = &app.interpreter else {
+            continue;
+        };
+        if interpreter.is_empty() {
+            return Err(miette::miette!(
+                "app '{app_name}': 'interpreter' must not be empty"
+            ));
+        }
+        let Some(cmd_path) = crate::units::resolve_command_path(&app.command) else {
+            continue;
+        };
+        let entry = stage_dir.join(&cmd_path);
+        if !entry.is_file() {
+            // A missing command binary is caught later by the install-time
+            // planner's fail-closed lookup — nothing to wrap.
+            continue;
+        }
+        if is_elf(&entry) {
+            // Native ELF — no wrapper (issue #9).
+            continue;
+        }
+
+        // Preserve the original script in the payload at a sibling path, then
+        // replace the command path with the wrapper. The wrapper references
+        // the script by its content-addressed store blob path (computed here
+        // at build time from the script's sha256 — deterministic, so ingest
+        // later stores it at the same path).
+        let file_name = entry
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let script_path = entry.with_file_name(format!("{file_name}.real"));
+        std::fs::rename(&entry, &script_path).map_err(|e| {
+            miette::miette!(
+                "app '{app_name}': preserving interpreter script {}: {e}",
+                script_path.display()
+            )
+        })?;
+        let script_sha256 = sha256_file(&script_path).map_err(|e| {
+            miette::miette!(
+                "app '{app_name}': hashing interpreter script {}: {e}",
+                script_path.display()
+            )
+        })?;
+        let script_store_path = pod_store.blob_path(&script_sha256);
+
+        let wrapper = format!(
+            "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
+            interpreter,
+            script_store_path.display()
+        );
+        std::fs::write(&entry, wrapper).map_err(|e| {
+            miette::miette!(
+                "app '{app_name}': writing interpreter wrapper {}: {e}",
+                entry.display()
+            )
+        })?;
+        make_owner_executable(&entry).map_err(|e| {
+            miette::miette!(
+                "app '{app_name}': making wrapper executable {}: {e}",
+                entry.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// True when `path` is a native ELF binary (its first four bytes are the
+/// ELF magic). Used by [`emit_build_wrappers`] to leave native binaries
+/// unwrapped.
+fn is_elf(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && &magic == b"\x7fELF"
+}
+
+/// Set the owner-execute bit plus read for group/other so a wrapper is
+/// runnable from the farm the way a built binary is.
+fn make_owner_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(path, perms)
+}
+
 /// Build a `.snap` package for a single architecture.
 ///
 /// The `arch` parameter controls which architecture appears in the
@@ -1372,6 +1499,13 @@ pub fn check_cross_build(arch: &str, target: Option<&str>) -> miette::Result<()>
 /// stage is wiped before a build phase populates it; under
 /// [`StagePolicy::Explicit`] it is never wiped (an existing non-empty
 /// explicit stage is rejected up front by [`check_explicit_stage`]).
+///
+/// `pod_store` is `Some` only when building into a pod's store (issue #9):
+/// it is what a build-time interpreter wrapper bakes the script's
+/// content-addressed store path from (see [`emit_build_wrappers`]). The
+/// generic `shuttle build` path passes `None` — those builds have no store
+/// to bake and produce no wrappers.
+///
 /// Returns the output filename (not the full path).
 pub fn build_snap(
     meta: &SnapMeta,
@@ -1379,12 +1513,22 @@ pub fn build_snap(
     output_dir: &Path,
     arch: &str,
     stage_policy: StagePolicy,
+    pod_store: Option<&crate::runtime::RuntimeStore>,
 ) -> miette::Result<BuildResult> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
 
     // 1. Run build phase (download source, run build command) if configured
     let outcome = run_build(meta, stage_dir, stage_policy)?;
+
+    // 1a. Author build-time launcher wrappers into the stage for
+    // interpreter-based apps (issue #9): an app declaring `interpreter`
+    // whose command binary is a script (no native ELF) gets its command
+    // path replaced by a single-`exec` wrapper referencing the script's
+    // content-addressed store path. Only pod builds provide a store.
+    if let Some(store) = pod_store {
+        emit_build_wrappers(meta, stage_dir, store)?;
+    }
 
     // Clone meta with architecture filtered to the target arch
     let mut arch_meta = meta.clone();
@@ -3425,6 +3569,7 @@ mod tests {
             output_dir.path(),
             "amd64",
             StagePolicy::Default,
+            None,
         );
         assert!(result.is_ok());
 
@@ -3486,6 +3631,7 @@ mod tests {
             output_dir.path(),
             "amd64",
             StagePolicy::Default,
+            None,
         )
         .unwrap();
         assert_eq!(snap_amd64.snap_filename, "multi-test_2.0_amd64.snap");
@@ -3498,6 +3644,7 @@ mod tests {
             output_dir.path(),
             "arm64",
             StagePolicy::Default,
+            None,
         )
         .unwrap();
         assert_eq!(snap_arm64.snap_filename, "multi-test_2.0_arm64.snap");
@@ -4989,6 +5136,7 @@ mod tests {
             output_dir.path(),
             "amd64",
             StagePolicy::Default,
+            None,
         )
         .unwrap();
         let snap_path = output_dir.path().join(&result.snap_filename);
@@ -6494,6 +6642,7 @@ fi
             output_dir.path(),
             "amd64",
             StagePolicy::Default,
+            None,
         )
         .unwrap();
 
@@ -6755,5 +6904,152 @@ fi
                 "expected --ro-bind {root} {root}, got {args:?}"
             );
         }
+    }
+}
+
+/// Issue #9: build-time interpreter wrappers (see [`emit_build_wrappers`]).
+#[cfg(test)]
+mod wrapper_tests {
+    use super::*;
+
+    fn stage_file(stage: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+        let p = stage.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// Minimal SnapMeta carrying a single declared app (all other fields
+    /// default to their empty/None values — `emit_build_wrappers` only
+    /// reads `name`, `apps[].command`, and `apps[].interpreter`).
+    fn meta_with_app(app_name: &str, command: &str, interpreter: Option<&str>) -> SnapMeta {
+        let app = SnapApp {
+            command: command.to_string(),
+            daemon: None,
+            plugs: None,
+            slots: None,
+            environment: None,
+            desktop: None,
+            interpreter: interpreter.map(|s| s.to_string()),
+        };
+        let mut apps = HashMap::new();
+        apps.insert(app_name.to_string(), app);
+        SnapMeta {
+            name: "pkg".into(),
+            version: "1.0".into(),
+            summary: None,
+            description: None,
+            license: None,
+            source: None,
+            architectures: None,
+            build: None,
+            parts: None,
+            grade: "stable".into(),
+            confinement: "strict".into(),
+            type_: None,
+            adopt_info: None,
+            version_adopted: false,
+            icon_source: None,
+            icon: None,
+            compression: None,
+            environment: None,
+            layout: None,
+            hooks: None,
+            plugs: None,
+            slots: None,
+            aliases: Vec::new(),
+            requires: Vec::new(),
+            inputs: None,
+            target: None,
+            toolchain: None,
+            apps,
+            definition_dir: None,
+        }
+    }
+
+    fn store_fixture(dir: &Path) -> crate::runtime::RuntimeStore {
+        crate::runtime::RuntimeStore::new(dir.to_path_buf())
+    }
+
+    #[test]
+    fn is_elf_detects_magic() {
+        let stage = tempfile::tempdir().unwrap();
+        let elf = stage_file(stage.path(), "bin/t", b"\x7fELFrest");
+        assert!(is_elf(&elf));
+        let script = stage_file(stage.path(), "bin/s", b"#!/bin/sh\necho hi\n");
+        assert!(!is_elf(&script));
+        let empty = stage_file(stage.path(), "bin/e", b"");
+        assert!(!is_elf(&empty));
+        let missing = stage.path().join("bin/nope");
+        assert!(!is_elf(&missing));
+    }
+
+    #[test]
+    fn interpreter_app_wraps_a_script_at_build_time() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "bin/zg",
+            b"#!/usr/bin/env node\nconsole.log('zg')\n",
+        );
+        let meta = meta_with_app("zg", "bin/zg", Some("node"));
+
+        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+
+        // The command path is now the wrapper: a single exec of the
+        // interpreter with the script's content-addressed store path.
+        let wrapper = std::fs::read_to_string(&script).unwrap();
+        assert!(wrapper.starts_with("#!/bin/sh\n"));
+        assert!(
+            wrapper.contains("exec \"node\""),
+            "wrapper must exec the interpreter: {wrapper}"
+        );
+        let store_blob = store.blob_path(&sha256_file(&stage.path().join("bin/zg.real")).unwrap());
+        assert!(
+            wrapper.contains(&store_blob.display().to_string()),
+            "wrapper must bake the script's store path: {wrapper}"
+        );
+
+        // The original script is preserved at the sibling `.real` path.
+        let real = stage.path().join("bin/zg.real");
+        assert!(real.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "#!/usr/bin/env node\nconsole.log('zg')\n"
+        );
+    }
+
+    #[test]
+    fn native_elf_command_gets_no_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        // A minimal ELF magic-prefixed binary is enough — is_elf keys on
+        // the magic; the build path never wraps a real ELF.
+        let elf = stage_file(stage.path(), "bin/ztool", b"\x7fELF\x02\x01\x01rest");
+        let meta = meta_with_app("ztool", "bin/ztool", Some("node"));
+
+        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+
+        // The command binary is untouched (still the ELF magic), and no
+        // sibling `.real` script was created.
+        assert_eq!(std::fs::read(&elf).unwrap(), b"\x7fELF\x02\x01\x01rest");
+        assert!(!stage.path().join("bin/ztool.real").exists());
+    }
+
+    #[test]
+    fn no_interpreter_means_no_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(stage.path(), "bin/plain", b"#!/bin/sh\necho hi\n");
+        let meta = meta_with_app("plain", "bin/plain", None);
+
+        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+        assert!(!stage.path().join("bin/plain.real").exists());
     }
 }

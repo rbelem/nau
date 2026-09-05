@@ -1862,6 +1862,9 @@ fn build_pending_snap(
         &downloads,
         crate::snap::host_arch(),
         crate::snap::StagePolicy::Default,
+        // Issue #9: a pod build supplies its store so build-time interpreter
+        // wrappers can bake the script's content-addressed store path.
+        Some(store),
     )?;
     let payload = downloads.join(&result.snap_filename);
     let sha3_384 = crate::store::sha3_384_file(&payload)?;

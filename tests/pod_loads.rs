@@ -237,16 +237,6 @@ fn farm_output(farm: &Path, name: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-fn lock_pin(root: &Path, pod: &str, name: &str) -> Option<String> {
-    let lock: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(pod_dir(root, pod).join("shuttle.lock")).unwrap(),
-    )
-    .unwrap();
-    lock["packages"][name]["version"]
-        .as_str()
-        .map(str::to_string)
-}
-
 /// The recorded version of one package in a generation manifest.
 fn manifest_version(root: &Path, pod: &str, gen: u64, pkg: &str) -> String {
     let manifest: serde_json::Value = serde_json::from_str(

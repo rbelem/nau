@@ -332,6 +332,7 @@ impl PackageIndex {
                                 slots: app.slots.clone(),
                                 environment: None,
                                 desktop: app.desktop.clone(),
+                                interpreter: None,
                             },
                         )
                     })

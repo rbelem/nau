@@ -772,6 +772,7 @@ fn build_dep_archs(
             output_dir,
             a,
             shuttle::snap::StagePolicy::Default,
+            None,
         ) {
             Ok(result) => {
                 if !json {
@@ -855,7 +856,7 @@ fn build_one_arch(
         }
     }
 
-    let result = shuttle::snap::build_snap(meta, stage_dir, output_dir, arch, stage_policy)?;
+    let result = shuttle::snap::build_snap(meta, stage_dir, output_dir, arch, stage_policy, None)?;
     if !json {
         shuttle::output::ok(&result.snap_filename);
     } else {

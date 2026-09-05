@@ -276,6 +276,7 @@ mod tests {
             slots: None,
             environment: None,
             desktop: None,
+            interpreter: None,
         }
     }
 
