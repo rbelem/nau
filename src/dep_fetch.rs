@@ -457,12 +457,20 @@ fn verify_sri(path: &Path, integrity: &str) -> miette::Result<()> {
 
 // ── pip ──
 
-/// One pinned requirement from a pip lock (`name==version --hash=sha256:…`).
+/// One pinned requirement from a pip lock.
+///
+/// Two lock formats resolve to this shape (sniffed by content, see
+/// [`parse_pip_pins`]): pip-compile `requirements.lock` lines
+/// (`name==version --hash=sha256:…`, resolved against a PEP 503 index)
+/// and `uv.lock` entries (wheel URLs carried directly in the lock).
 struct PipPin {
     name: String,
     version: String,
-    /// sha256 hex hashes from the lock (pip-compile style). Empty = TOFU.
+    /// sha256 hex hashes from the lock. Empty = TOFU (verify against the
+    /// index anchor hash; warn when neither exists).
     hashes: Vec<String>,
+    /// Direct wheel URL (uv.lock). `None` = resolve on the index page.
+    url: Option<String>,
 }
 
 /// Parse a pinned requirements lock (pip-compile output: continuation
@@ -492,6 +500,141 @@ fn parse_pip_requirements(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
         }
     }
     Ok(out)
+}
+
+/// Parse a pip lock in either supported format. The format is sniffed by
+/// content: a `uv.lock` is TOML with `[[package]]` tables; a
+/// `requirements.lock` is the pip-compile line format. Both resolve to
+/// the same pin list.
+fn parse_pip_pins(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
+    let text = String::from_utf8_lossy(bytes);
+    if text.contains("[[package]]") {
+        parse_uv_lock(bytes)
+    } else {
+        parse_pip_requirements(bytes)
+    }
+}
+
+// ── uv.lock format (uv's cross-platform Python lockfile) ──
+
+#[derive(serde::Deserialize)]
+struct UvLock {
+    package: Vec<UvPackage>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct UvPackage {
+    name: String,
+    version: String,
+    /// Registry packages carry `{ registry = "https://…" }`; editable,
+    /// virtual, directory, and git sources are skipped (they have no
+    /// immutable artifact to fetch).
+    source: Option<UvSource>,
+    wheels: Option<Vec<UvWheel>>,
+}
+
+#[derive(serde::Deserialize)]
+struct UvSource {
+    registry: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct UvWheel {
+    url: String,
+    /// `"sha256:<hex>"`.
+    hash: Option<String>,
+}
+
+/// Extract pip pins from a uv.lock: every registry-sourced package whose
+/// lock carries a wheel this platform can run (see [`wheel_tags_match`]).
+/// Packages without a matching wheel are skipped with a warning — sdist-only
+/// packages (which would need a build, ADR-0017 Decision 2) and
+/// other-platform binary wheels both land here, so the warning names them.
+fn parse_uv_lock(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
+    let text = String::from_utf8_lossy(bytes);
+    let lock: UvLock =
+        toml::from_str(&text).map_err(|e| miette::miette!("uv.lock is not valid TOML: {e}"))?;
+    let mut out = Vec::new();
+    for pkg in &lock.package {
+        let Some(wheels) = &pkg.wheels else {
+            crate::output::warn(format!(
+                "uv.lock: {} {} has no wheels (sdist-only or non-registry source) — skipped",
+                pkg.name, pkg.version
+            ));
+            continue;
+        };
+        if !matches!(
+            pkg.source.as_ref().and_then(|s| s.registry.as_deref()),
+            Some(_)
+        ) {
+            crate::output::warn(format!(
+                "uv.lock: {} {} is not from a registry — skipped",
+                pkg.name, pkg.version
+            ));
+            continue;
+        }
+        let norm = normalize_name(&pkg.name);
+        let Some(wheel) = wheels.iter().find(|w| {
+            let filename = w.url.rsplit('/').next().unwrap_or("");
+            is_matching_wheel(filename, &norm, &pkg.version) && wheel_tags_match(filename)
+        }) else {
+            crate::output::warn(format!(
+                "uv.lock: {} {} has no wheel for this platform — skipped",
+                pkg.name, pkg.version
+            ));
+            continue;
+        };
+        out.push(PipPin {
+            name: pkg.name.clone(),
+            version: pkg.version.clone(),
+            hashes: wheel
+                .hash
+                .as_deref()
+                .and_then(|h| h.strip_prefix("sha256:"))
+                .map(|h| vec![h.to_string()])
+                .unwrap_or_default(),
+            url: Some(wheel.url.clone()),
+        });
+    }
+    Ok(out)
+}
+
+/// Can this host run the wheel? Checks the `{python}-{abi}-{platform}`
+/// tag triple of a wheel filename against linux x86_64 and the CPython 3
+/// ABI line: universal wheels (`py3-none-any`, `abi3`) and `cp3x` wheels
+/// for the 3.9+ line on linux x86_64. Tag-gated foreign-platform wheels
+/// (macOS, Windows, aarch64) never match.
+fn wheel_tags_match(filename: &str) -> bool {
+    let Some(without_ext) = filename.strip_suffix(".whl") else {
+        return false;
+    };
+    // Tag triple: `{name}-{version}-{python}-{abi}-{platform}` — peel
+    // platform, then abi, then python from the right (name+version,
+    // already matched by is_matching_wheel, is discarded).
+    let Some((rest, platform)) = without_ext.rsplit_once('-') else {
+        return false;
+    };
+    let Some((rest, abi)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    let Some((_, python)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    let platform_ok = platform == "any"
+        || (platform.contains("linux")
+            && !platform.contains("musl")
+            && platform.contains("x86_64"));
+    // `abi3` wheels run on any CPython 3 newer than the python tag, so a
+    // cp36-abi3 wheel is fine on 3.9+; plain cp3x wheels must be 3.9+.
+    let python_ok = python == "py3"
+        || python == "py2.py3"
+        || (python.starts_with("cp3") && python[3..].parse::<u8>().is_ok_and(|n| n >= 9))
+        || (abi == "abi3" && python.starts_with("cp3") && python[3..].parse::<u8>().is_ok());
+    let abi_ok = abi == "none"
+        || abi == "abi3"
+        || (abi.starts_with("cp3") && abi[3..].parse::<u8>().is_ok_and(|n| n >= 9));
+    platform_ok && python_ok && abi_ok
 }
 
 /// Parse one logical requirement line; `None` for non-requirement lines
@@ -527,6 +670,7 @@ fn parse_requirement_line(line: &str) -> miette::Result<Option<PipPin>> {
             name,
             version,
             hashes,
+            url: None,
         })),
         _ => Ok(None),
     }
@@ -541,7 +685,7 @@ fn fetch_pip_closure(
 ) -> miette::Result<()> {
     let index = spec.index.as_deref().unwrap_or(DEFAULT_PIP_INDEX);
     let lock_bytes = read_source_file(src_root, &spec.lock)?;
-    let pins = parse_pip_requirements(&lock_bytes)?;
+    let pins = parse_pip_pins(&lock_bytes)?;
     crate::output::info(format!(
         "pip closure: {} package(s) from {} via {index}",
         pins.len(),
@@ -553,10 +697,36 @@ fn fetch_pip_closure(
     Ok(())
 }
 
-/// Resolve one pin to a wheel on the index's project page, download it,
-/// and verify it against the lock's hash (authoritative) or the page's
-/// anchor hash (TOFU when the lock carries no hash).
+/// Resolve one pin to a wheel and download it, verifying integrity.
+/// A pin with a direct URL (uv.lock) is fetched straight from the lock;
+/// otherwise the pin resolves on the index's project page. Either way
+/// the wheel is verified against the pin's hash (authoritative) or the
+/// page's anchor hash (TOFU when the lock carries no hash).
 fn fetch_pip_wheel(pin: &PipPin, index: &str, tree: &Path, work: &Path) -> miette::Result<()> {
+    if let Some(url) = &pin.url {
+        let filename = url.rsplit('/').next().unwrap_or("wheel.whl");
+        let dest = tree.join(filename);
+        http_get_to_file(url, &dest)?;
+        return match pin.hashes.first() {
+            Some(hash) => {
+                let actual = sha256_file(&dest)?;
+                if !constant_eq(actual.as_bytes(), hash.as_bytes()) {
+                    let _ = std::fs::remove_file(&dest);
+                    miette::bail!(
+                        "pip: wheel {filename} hash mismatch: expected {hash}, got {actual}"
+                    );
+                }
+                Ok(())
+            }
+            None => {
+                let actual = sha256_file(&dest)?;
+                crate::output::warn(format!(
+                    "pip: wheel {filename} fetched unpinned (hash {actual:.16}… — pin it in the lock)"
+                ));
+                Ok(())
+            }
+        };
+    }
     let page_url = format!(
         "{}/{}/",
         index.trim_end_matches('/'),
@@ -568,7 +738,7 @@ fn fetch_pip_wheel(pin: &PipPin, index: &str, tree: &Path, work: &Path) -> miett
     let found = anchors.iter().find_map(|(href, text)| {
         let candidate = if !text.is_empty() { text } else { href };
         let candidate = candidate.rsplit('/').next().unwrap_or(candidate);
-        is_matching_wheel(candidate, &match_name, &pin.version)
+        (is_matching_wheel(candidate, &match_name, &pin.version) && wheel_tags_match(candidate))
             .then(|| (href.clone(), candidate.to_string()))
     });
     let Some((href, filename)) = found else {
@@ -1093,6 +1263,100 @@ flask[async]==3.0.0 # pinned with extras
         // Extras stripped, trailing comment stripped.
         assert_eq!(pins[2].name, "flask");
         assert_eq!(pins[2].version, "3.0.0");
+    }
+
+    #[test]
+    fn parse_uv_lock_selects_platform_wheel_and_skips_the_rest() {
+        let lock = r#"
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "whichllm"
+version = "0.5.16"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.example/whichllm-0.5.16-py3-none-any.whl", hash = "sha256:aaaa" },
+]
+
+[[package]]
+name = "psutil"
+version = "7.0.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.example/psutil-7.0.0-cp36-abi3-macosx_11_0_arm64.whl", hash = "sha256:bbbb" },
+    { url = "https://files.example/psutil-7.0.0-cp36-abi3-manylinux_2_12_x86_64.manylinux2010_x86_64.whl", hash = "sha256:cccc" },
+    { url = "https://files.example/psutil-7.0.0-cp36-abi3-win_amd64.whl", hash = "sha256:dddd" },
+]
+
+[[package]]
+name = "dbgpu"
+version = "2025.12"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.example/dbgpu-2025.12.tar.gz", hash = "sha256:eeee" }
+
+[[package]]
+name = "local-tool"
+version = "1.0.0"
+source = { editable = "." }
+"#;
+        let pins = parse_pip_pins(lock.as_bytes()).unwrap();
+        // dbgpu (sdist-only) and local-tool (editable) are skipped with a
+        // warning; the whichllm and psutil closures survive.
+        assert_eq!(pins.len(), 2);
+        assert_eq!(pins[0].name, "whichllm");
+        assert!(pins[0]
+            .url
+            .as_deref()
+            .unwrap()
+            .ends_with("py3-none-any.whl"));
+        assert_eq!(pins[0].hashes, vec!["aaaa"]);
+        // The linux manylinux wheel, not the first (macOS) entry.
+        assert_eq!(pins[1].name, "psutil");
+        assert!(pins[1].url.as_deref().unwrap().contains("manylinux"));
+        assert_eq!(pins[1].hashes, vec!["cccc"]);
+    }
+
+    #[test]
+    fn uv_lock_sniffed_over_requirements_format() {
+        // A uv.lock routes to the TOML parser even via the shared entry.
+        let lock = "[[package]]\nname = \"x\"\nversion = \"1.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://f/x-1.0-py3-none-any.whl\" }]\n";
+        let pins = parse_pip_pins(lock.as_bytes()).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].name, "x");
+        // A requirements file never sniffs as uv.lock (no [[package]]).
+        let req = "certifi==2024.2.2\n";
+        let pins = parse_pip_pins(req.as_bytes()).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].name, "certifi");
+        assert!(pins[0].url.is_none());
+    }
+
+    #[test]
+    fn wheel_tags_gate_foreign_platforms() {
+        assert!(wheel_tags_match("x-1.0-py3-none-any.whl"));
+        assert!(wheel_tags_match("x-1.0-py2.py3-none-any.whl"));
+        // abi3 with an old python tag: stable ABI, fine on 3.9+.
+        assert!(wheel_tags_match(
+            "p-1.0-cp36-abi3-manylinux_2_12_x86_64.manylinux2010_x86_64.whl"
+        ));
+        assert!(wheel_tags_match(
+            "p-1.0-cp312-cp312-manylinux_2_17_x86_64.whl"
+        ));
+        // aarch64 platform: linux but not x86_64.
+        assert!(!wheel_tags_match(
+            "p-1.0-cp39-cp39-manylinux2014_aarch64.whl"
+        ));
+        assert!(!wheel_tags_match("p-1.0-cp39-cp39-macosx_11_0_arm64.whl"));
+        assert!(!wheel_tags_match("p-1.0-cp39-cp39-win_amd64.whl"));
+        // musl is not the glibc runtime.
+        assert!(!wheel_tags_match(
+            "p-1.0-cp312-cp312-musllinux_1_1_x86_64.whl"
+        ));
+        // Pre-3.9 ABI line is out of support.
+        assert!(!wheel_tags_match(
+            "p-1.0-cp38-cp38-manylinux_2_17_x86_64.whl"
+        ));
     }
 
     #[test]
