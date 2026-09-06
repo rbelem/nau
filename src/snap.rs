@@ -1750,10 +1750,24 @@ fn wrap_app(
         // bundles a runtime lib the binary needs (separate store blob
         // not on its runpath). Already-resolvable ELFs stay unwrapped.
         let lib_dirs = bundled_runtime_lib_dirs(&entry, stage_dir);
-        if lib_dirs.is_empty() {
-            return Ok(());
+        if stage_bundles_python_stdlib(stage_dir, Path::new(&cmd_path)) {
+            // CPython resolves its stdlib from its own on-disk path: a
+            // flat content-addressed blob would strand it ("Could not
+            // find platform independent libraries"), so it must exec
+            // from the generation's extension tree — the same shape the
+            // #13 script tree wrapper uses for interpreter scripts.
+            emit_elf_tree_wrapper(
+                app_name,
+                &entry,
+                &meta.name,
+                Path::new(&cmd_path),
+                &lib_dirs,
+            )
+        } else if lib_dirs.is_empty() {
+            Ok(())
+        } else {
+            emit_elf_lib_wrapper(app_name, &entry, &lib_dirs, meta, pod_store)
         }
-        emit_elf_lib_wrapper(app_name, &entry, &lib_dirs, meta, pod_store)
     } else {
         // Issue #9: interpreter-script wrapper.
         let Some(interpreter) = &app.interpreter else {
@@ -1783,6 +1797,28 @@ fn real_sibling_name(file_name: &str) -> String {
         Some((stem, ext)) if !stem.is_empty() => format!("{stem}.real.{ext}"),
         _ => format!("{file_name}.real"),
     }
+}
+
+/// True when the payload stages a CPython stdlib tree beside the command
+/// (`<prefix>/lib/python3.*/` next to `<prefix>/bin/<cmd>`): such an ELF
+/// locates its stdlib relative to its own path at runtime, so it must
+/// exec from the generation's extension tree — a flat content-addressed
+/// store blob would leave it without a stdlib.
+fn stage_bundles_python_stdlib(stage_dir: &Path, cmd_path: &Path) -> bool {
+    let Some(bin_dir) = cmd_path.parent() else {
+        return false;
+    };
+    let Some(prefix) = bin_dir.parent() else {
+        return false;
+    };
+    let lib = stage_dir.join(prefix).join("lib");
+    std::fs::read_dir(&lib)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("python3."))
+        })
+        .unwrap_or(false)
 }
 
 /// Author the interpreter-script wrapper (issue #9) for a command path
@@ -1859,6 +1895,26 @@ fn emit_script_tree_wrapper(
         None => real_sibling_name(cmd_rel),
     };
     let tree_script = format!("$PODROOT/active/extensions/{pkg_name}/usr/{cmd_rel_real}");
+    // Python does not discover staged wheels by adjacency the way Node's
+    // require() walks up from the script: site-packages must be handed to
+    // the interpreter via PYTHONPATH. The variable is SCRUBBED first, not
+    // appended to: an inherited host PYTHONPATH (e.g. a devbox profile's
+    // site-packages) shadows the pod tree's modules with foreign
+    // installations — the same failure the hermes-agent packaging had to
+    // scrub around.
+    let pythonpath_block = if interpreter.starts_with("python") {
+        format!(
+            "\n         PKGROOT=\"$PODROOT/active/extensions/{pkg_name}/usr\"\n\
+             PYTHONPATH=\"\"\n\
+             for sp in \"$PKGROOT\"/usr/lib/python3.*/site-packages; do\n\
+             \x20 [ -d \"$sp\" ] && PYTHONPATH=\"${{PYTHONPATH:+$PYTHONPATH:}}$sp\"\n\
+             done\n\
+             export PYTHONPATH\n\
+             export SHUTTLE_PYTHONPATH=\"$PYTHONPATH\"\n"
+        )
+    } else {
+        String::new()
+    };
     // The farm symlink resolves to the wrapper blob at
     // `<podroot>/store/<aa>/<hash>` — three dirnames to the pod root
     // (same derivation as the #10 ELF lib wrapper).
@@ -1866,7 +1922,75 @@ fn emit_script_tree_wrapper(
         "#!/bin/sh\n\
          SCRIPT=\"$(readlink -f \"$0\")\"\n\
          PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+         {pythonpath_block}\
          exec \"{interpreter}\" \"{tree_script}\"\n"
+    );
+    write_wrapper(app_name, entry, &wrapper)
+}
+
+/// Author the native-ELF tree wrapper: like [`emit_script_tree_wrapper`],
+/// the command execs from the active generation's extension tree instead
+/// of a flat content-addressed blob — required when the binary resolves
+/// bundled resources relative to its own path (CPython's stdlib
+/// discovery, detected by [`stage_bundles_python_stdlib`]). Bundled
+/// runtime libs (the #10 LD_LIBRARY_PATH set) still resolve, now from the
+/// tree's name-preserving lib dirs.
+fn emit_elf_tree_wrapper(
+    app_name: &str,
+    entry: &Path,
+    pkg_name: &str,
+    cmd_rel: &Path,
+    lib_dirs: &[PathBuf],
+) -> miette::Result<()> {
+    let file_name = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let real_path = entry.with_file_name(real_sibling_name(&file_name));
+    std::fs::rename(entry, &real_path).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': preserving native-ELF {}: {e}",
+            real_path.display()
+        )
+    })?;
+    let cmd_rel_real = match cmd_rel.to_string_lossy().rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/{}", real_sibling_name(file)),
+        None => real_sibling_name(&cmd_rel.to_string_lossy()),
+    };
+    let tree_elf = format!("$PODROOT/active/extensions/{pkg_name}/usr/{cmd_rel_real}");
+    let ld_paths: Vec<String> = lib_dirs
+        .iter()
+        .map(|rel| {
+            format!(
+                "$PODROOT/active/extensions/{}/usr/{}",
+                pkg_name,
+                rel.display()
+            )
+        })
+        .collect();
+    let ld_line = if ld_paths.is_empty() {
+        String::new()
+    } else {
+        format!("export LD_LIBRARY_PATH=\"{}\"\n", ld_paths.join(":"))
+    };
+    // The only ELF that takes this wrapper is a prefix-relative runtime
+    // (CPython, detected by stage_bundles_python_stdlib). Its sys.path
+    // inherits the host's PYTHONPATH, which would shadow the pod's
+    // stdlib/site-packages with foreign installations — scrub it, but
+    // honor SHUTTLE_PYTHONPATH: the reserved channel a pod app wrapper
+    // uses to hand the interpreter its own site-packages (an app wrapper
+    // execs this wrapper as its interpreter).
+    // The farm symlink resolves to the wrapper blob at
+    // `<podroot>/store/<aa>/<hash>` — three dirnames to the pod root
+    // (same derivation as the #10 ELF lib wrapper).
+    let wrapper = format!(
+        "#!/bin/sh\n\
+         SCRIPT=\"$(readlink -f \"$0\")\"\n\
+         PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+         {ld_line}\
+         PYTHONPATH=\"${{SHUTTLE_PYTHONPATH:-}}\"\n\
+         export PYTHONPATH\n\
+         exec \"{tree_elf}\" \"$@\"\n"
     );
     write_wrapper(app_name, entry, &wrapper)
 }
@@ -8151,7 +8275,7 @@ mod wrapper_tests {
     fn interpreter_wrapper_preserves_extension() {
         let stage = tempfile::tempdir().unwrap();
         let store = store_fixture(&stage.path().join("store"));
-        let script = stage_file(
+        let _script = stage_file(
             stage.path(),
             "lib/cli/index.js",
             b"#!/usr/bin/env node\nconsole.log('zg')\n",
@@ -8178,6 +8302,67 @@ mod wrapper_tests {
         assert_eq!(real_sibling_name("zdemo"), "zdemo.real");
         // A dotfile has no extension — append.
         assert_eq!(real_sibling_name(".profile"), ".profile.real");
+    }
+
+    #[test]
+    fn python_stdlib_elf_gets_tree_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        // A CPython payload: the interpreter ELF plus its stdlib tree.
+        let elf = stage_file(
+            stage.path(),
+            "usr/bin/python3.12",
+            b"\x7fELF\x02\x01\x01rest",
+        );
+        std::fs::create_dir_all(stage.path().join("usr/lib/python3.12")).unwrap();
+        std::fs::write(stage.path().join("usr/lib/python3.12/os.py"), b"# stdlib\n").unwrap();
+        let meta = meta_with_app("python3", "usr/bin/python3.12", None);
+
+        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+
+        // The command path became a wrapper that execs the ELF from the
+        // generation's extension tree (stdlib discovery needs its tree,
+        // not a flat store blob). The tree places the stage content under
+        // extensions/<pkg>/usr/, so the stage-relative usr/bin path doubles.
+        let wrapper = std::fs::read_to_string(elf).unwrap();
+        assert!(
+            wrapper.contains("extensions/pkg/usr/usr/bin/python3.real.12"),
+            "wrapper must exec the tree ELF: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("readlink -f"),
+            "PODROOT derivation: {wrapper}"
+        );
+        // The preserved sibling keeps the ELF and the extension segment.
+        let real = stage.path().join("usr/bin/python3.real.12");
+        assert_eq!(std::fs::read(&real).unwrap(), b"\x7fELF\x02\x01\x01rest");
+    }
+
+    #[test]
+    fn python_tree_script_sets_pythonpath_for_site_packages() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "usr/bin/tool",
+            b"#!/usr/bin/env python3\nimport tool\n",
+        );
+        // meta_with_app names the package "pkg"; give it a deps closure so
+        // the app runs from the extension tree.
+        let mut meta = meta_with_app("tool", "usr/bin/tool", Some("python3"));
+        meta.deps = Some(crate::snap::PackageDeps {
+            npm: None,
+            pip: None,
+        });
+
+        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+
+        let wrapper = std::fs::read_to_string(script).unwrap();
+        assert!(
+            wrapper.contains("lib/python3.*/site-packages"),
+            "wrapper must put the tree's site-packages on PYTHONPATH: {wrapper}"
+        );
+        assert!(wrapper.contains("export PYTHONPATH"), "{wrapper}");
     }
 
     #[test]
