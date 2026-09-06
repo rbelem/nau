@@ -23,7 +23,7 @@
 //! archive bytes = the pod-store blob name, so content addressing and the
 //! lock pin are the same number.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -295,9 +295,83 @@ fn parse_npm_lock(bytes: &[u8]) -> miette::Result<Vec<NpmArtifact>> {
     Ok(out)
 }
 
+/// Glob match with `*` (any run of chars, including `/`) and `?`
+/// (exactly one char). Patterns match the FULL lock key. Iterative
+/// two-pointer scan with single-star backtracking: after a mismatch, the
+/// last seen `*` absorbs one more character and the suffix match retries.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut mark = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+/// Apply the fetch-side exclusion globs (issue #14): artifacts whose key
+/// matches any pattern are dropped BEFORE any download — never fetched,
+/// never extracted, and therefore never archived, so the `deps_hash`
+/// inherently pins the post-filter closure. One warn per dropped key,
+/// then an info summary count, then a warn for any pattern that matched
+/// nothing (a typo would otherwise silently fetch what it meant to
+/// exclude).
+fn apply_npm_exclude(mut artifacts: Vec<NpmArtifact>, exclude: &[String]) -> Vec<NpmArtifact> {
+    let total = artifacts.len();
+    let mut matched = vec![false; exclude.len()];
+    artifacts.retain(|artifact| {
+        match exclude
+            .iter()
+            .position(|pattern| glob_match(pattern, &artifact.key))
+        {
+            Some(i) => {
+                matched[i] = true;
+                crate::output::warn(format!(
+                    "npm closure: excluding '{}' (matched deps.npm.exclude '{}')",
+                    artifact.key, exclude[i]
+                ));
+                false
+            }
+            None => true,
+        }
+    });
+    crate::output::info(format!(
+        "npm exclude: {} of {total} package(s) dropped by deps.npm.exclude",
+        total - artifacts.len()
+    ));
+    for (pattern, hit) in exclude.iter().zip(&matched) {
+        if !hit {
+            crate::output::warn(format!(
+                "npm closure: exclude pattern '{pattern}' matched nothing (typo?)"
+            ));
+        }
+    }
+    artifacts
+}
+
 /// Fetch every npm artifact into the materialized tree: entry
 /// `node_modules/<path>` unpacks (tarball root stripped) at
 /// `tree/node_modules/<path>` — the npm ci layout.
+///
+/// `spec.exclude` (issue #14) filters the parsed lock BEFORE any
+/// download: an excluded key is never downloaded, never extracted, and
+/// never enters the canonical archive — the `deps_hash` inherently pins
+/// the post-filter closure.
 fn fetch_npm_closure(
     spec: &DepsLockSpec,
     src_root: &Path,
@@ -305,7 +379,10 @@ fn fetch_npm_closure(
     work: &Path,
 ) -> miette::Result<()> {
     let lock_bytes = read_source_file(src_root, &spec.lock)?;
-    let artifacts = parse_npm_lock(&lock_bytes)?;
+    let mut artifacts = parse_npm_lock(&lock_bytes)?;
+    if !spec.exclude.is_empty() {
+        artifacts = apply_npm_exclude(artifacts, &spec.exclude);
+    }
     crate::output::info(format!(
         "npm closure: {} package(s) from {}",
         artifacts.len(),
@@ -532,6 +609,19 @@ struct UvPackage {
     /// immutable artifact to fetch).
     source: Option<UvSource>,
     wheels: Option<Vec<UvWheel>>,
+    /// Regular dependency edges (`dependencies = [{ name = "…" }]`).
+    dependencies: Option<Vec<UvDep>>,
+    /// Dev-only dependency edges (TOML `dev-dependencies`) — the input
+    /// to the dev/prod split (issue #14).
+    dev_dependencies: Option<Vec<UvDep>>,
+}
+
+/// One entry of a uv.lock dependency array. Only the name matters for
+/// the dev/prod split; version/marker specs are ignored (serde drops
+/// unknown fields by default).
+#[derive(serde::Deserialize)]
+struct UvDep {
+    name: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -551,63 +641,160 @@ struct UvWheel {
 /// Packages without a matching wheel are skipped with a warning — sdist-only
 /// packages (which would need a build, ADR-0017 Decision 2) and
 /// other-platform binary wheels both land here, so the warning names them.
+///
+/// Dev-only packages (see [`dev_only_names`], issue #14) are skipped
+/// before any wheel check, with ONE aggregated warning naming what was
+/// dropped — the dev-dependency split keeps devtool-class closures
+/// (pytest, ruff, pyarrow) out of the fetch.
 fn parse_uv_lock(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
     let text = String::from_utf8_lossy(bytes);
     let lock: UvLock =
         toml::from_str(&text).map_err(|e| miette::miette!("uv.lock is not valid TOML: {e}"))?;
+    let dev_only = dev_only_names(&lock.package);
     let mut out = Vec::new();
+    let mut dev_skipped: Vec<String> = Vec::new();
     for pkg in &lock.package {
-        let Some(wheels) = &pkg.wheels else {
-            crate::output::warn(format!(
-                "uv.lock: {} {} has no wheels (sdist-only or non-registry source) — skipped",
-                pkg.name, pkg.version
-            ));
-            continue;
-        };
-        if pkg
-            .source
-            .as_ref()
-            .and_then(|s| s.registry.as_deref())
-            .is_none()
-        {
-            crate::output::warn(format!(
-                "uv.lock: {} {} is not from a registry — skipped",
-                pkg.name, pkg.version
-            ));
+        if dev_only.contains(&normalize_name(&pkg.name)) {
+            dev_skipped.push(pkg.name.clone());
             continue;
         }
-        let norm = normalize_name(&pkg.name);
-        let Some(wheel) = wheels.iter().find(|w| {
-            let filename = w.url.rsplit('/').next().unwrap_or("");
-            // Wheel filenames keep the distribution's original spelling
-            // (pydantic_core-…, typing_extensions-…) — normalize the
-            // filename's name segment before the prefix match, which
-            // compares PEP 503-normalized names.
-            let normed = match filename.split_once('-') {
-                Some((name_seg, rest)) => format!("{}-{}", normalize_name(name_seg), rest),
-                None => filename.to_string(),
-            };
-            is_matching_wheel(&normed, &norm, &pkg.version) && wheel_tags_match(filename)
-        }) else {
-            crate::output::warn(format!(
-                "uv.lock: {} {} has no wheel for this platform — skipped",
-                pkg.name, pkg.version
-            ));
-            continue;
-        };
-        out.push(PipPin {
-            name: pkg.name.clone(),
-            version: pkg.version.clone(),
-            hashes: wheel
-                .hash
-                .as_deref()
-                .and_then(|h| h.strip_prefix("sha256:"))
-                .map(|h| vec![h.to_string()])
-                .unwrap_or_default(),
-            url: Some(wheel.url.clone()),
-        });
+        if let Some(pin) = pin_for_package(pkg) {
+            out.push(pin);
+        }
+    }
+    if !dev_skipped.is_empty() {
+        crate::output::warn(format!(
+            "uv.lock: skipping {} dev-only package(s): {}",
+            dev_skipped.len(),
+            truncated_name_list(&dev_skipped)
+        ));
     }
     Ok(out)
+}
+
+/// One non-dev package's pip pin: its best platform wheel (see
+/// [`wheel_tags_match`]). Skips with a warning and returns `None` for
+/// packages with no wheels (sdist-only), non-registry sources, and no
+/// wheel for this platform.
+fn pin_for_package(pkg: &UvPackage) -> Option<PipPin> {
+    let Some(wheels) = &pkg.wheels else {
+        crate::output::warn(format!(
+            "uv.lock: {} {} has no wheels (sdist-only or non-registry source) — skipped",
+            pkg.name, pkg.version
+        ));
+        return None;
+    };
+    if pkg
+        .source
+        .as_ref()
+        .and_then(|s| s.registry.as_deref())
+        .is_none()
+    {
+        crate::output::warn(format!(
+            "uv.lock: {} {} is not from a registry — skipped",
+            pkg.name, pkg.version
+        ));
+        return None;
+    }
+    let norm = normalize_name(&pkg.name);
+    let Some(wheel) = wheels.iter().find(|w| {
+        let filename = w.url.rsplit('/').next().unwrap_or("");
+        // Wheel filenames keep the distribution's original spelling
+        // (pydantic_core-…, typing_extensions-…) — normalize the
+        // filename's name segment before the prefix match, which
+        // compares PEP 503-normalized names.
+        let normed = match filename.split_once('-') {
+            Some((name_seg, rest)) => format!("{}-{}", normalize_name(name_seg), rest),
+            None => filename.to_string(),
+        };
+        is_matching_wheel(&normed, &norm, &pkg.version) && wheel_tags_match(filename)
+    }) else {
+        crate::output::warn(format!(
+            "uv.lock: {} {} has no wheel for this platform — skipped",
+            pkg.name, pkg.version
+        ));
+        return None;
+    };
+    Some(PipPin {
+        name: pkg.name.clone(),
+        version: pkg.version.clone(),
+        hashes: wheel
+            .hash
+            .as_deref()
+            .and_then(|h| h.strip_prefix("sha256:"))
+            .map(|h| vec![h.to_string()])
+            .unwrap_or_default(),
+        url: Some(wheel.url.clone()),
+    })
+}
+
+/// The PEP 503-normalized names of packages that exist ONLY for
+/// development (issue #14): the transitive closure of every package's
+/// `dev-dependencies`, minus the closure reachable from the packages
+/// shuttle installs from source. Those prod roots are every NON-registry
+/// source (editable/virtual/directory/git — their regular dependency
+/// closure IS the wanted closure). Fail-safe: a lock with no
+/// source-installed package has no reliable dev/prod split, so an empty
+/// prod root set yields an empty set (fetch everything).
+fn dev_only_names(pkgs: &[UvPackage]) -> BTreeSet<String> {
+    let dev_roots: BTreeSet<String> = pkgs
+        .iter()
+        .flat_map(|p| p.dev_dependencies.iter().flatten())
+        .map(|d| normalize_name(&d.name))
+        .collect();
+    let prod_roots: BTreeSet<String> = pkgs
+        .iter()
+        .filter(|p| {
+            p.source
+                .as_ref()
+                .and_then(|s| s.registry.as_deref())
+                .is_none()
+        })
+        .flat_map(|p| p.dependencies.iter().flatten())
+        .map(|d| normalize_name(&d.name))
+        .collect();
+    if prod_roots.is_empty() {
+        return BTreeSet::new();
+    }
+    let dev = reachable_from(pkgs, &dev_roots);
+    let prod = reachable_from(pkgs, &prod_roots);
+    dev.difference(&prod).cloned().collect()
+}
+
+/// Transitive closure of `roots` over every package's regular
+/// (`dependencies`) edges — normalized names, roots included.
+fn reachable_from(pkgs: &[UvPackage], roots: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for pkg in pkgs {
+        let from = normalize_name(&pkg.name);
+        let deps = pkg
+            .dependencies
+            .iter()
+            .flatten()
+            .map(|d| normalize_name(&d.name));
+        edges.entry(from).or_default().extend(deps);
+    }
+    let mut seen = BTreeSet::new();
+    let mut queue: Vec<&String> = roots.iter().collect();
+    while let Some(name) = queue.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(deps) = edges.get(name) {
+            queue.extend(deps.iter());
+        }
+    }
+    seen
+}
+
+/// The dev-skip warning's name list: at most 8 names, then ", …".
+fn truncated_name_list(names: &[String]) -> String {
+    const MAX_NAMES: usize = 8;
+    if names.len() <= MAX_NAMES {
+        names.join(", ")
+    } else {
+        format!("{}, …", names[..MAX_NAMES].join(", "))
+    }
 }
 
 /// Can this host run the wheel? Checks the `{python}-{abi}-{platform}`
@@ -1253,6 +1440,59 @@ mod tests {
     }
 
     #[test]
+    fn glob_match_semantics() {
+        // Literal.
+        assert!(glob_match("node_modules/a", "node_modules/a"));
+        assert!(!glob_match("node_modules/a", "node_modules/b"));
+        // `*` mid-pattern.
+        assert!(glob_match("node_modules/*-core", "node_modules/@x/py-core"));
+        // `*` crosses `/`.
+        assert!(glob_match(
+            "node_modules/@node-llama-cpp/*",
+            "node_modules/@node-llama-cpp/llama-cpp-sys/bindings"
+        ));
+        // `?` is exactly one char (not zero, not two).
+        assert!(glob_match("node_modules/a?", "node_modules/ab"));
+        assert!(!glob_match("node_modules/a?", "node_modules/a"));
+        assert!(!glob_match("node_modules/a?", "node_modules/abc"));
+        // No match: no star to backtrack through.
+        assert!(!glob_match("node_modules/a*", "other/b"));
+        // Pattern longer than text.
+        assert!(!glob_match("node_modules/abcdef", "node_modules/abc"));
+        // Trailing star: any suffix, empty included.
+        assert!(glob_match(
+            "node_modules/b*",
+            "node_modules/beta/lib/index.js"
+        ));
+        assert!(glob_match("node_modules/b*", "node_modules/b"));
+        assert!(glob_match("*", "anything/else"));
+    }
+
+    #[test]
+    fn npm_exclude_filters_artifacts_before_fetch() {
+        let lock = r#"{
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "dependencies": { "a": "1.0.0", "beta": "2.0.0" } },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+                },
+                "node_modules/beta": {
+                    "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/beta/-/beta-2.0.0.tgz"
+                }
+            }
+        }"#;
+        let artifacts = parse_npm_lock(lock.as_bytes()).unwrap();
+        assert_eq!(artifacts.len(), 2);
+        let kept = apply_npm_exclude(artifacts, &["node_modules/b*".to_string()]);
+        assert_eq!(kept.len(), 1, "only 'a' survives the b* glob");
+        assert_eq!(kept[0].key, "node_modules/a");
+        assert_eq!(kept[0].url, "https://registry.npmjs.org/a/-/a-1.0.0.tgz");
+    }
+
+    #[test]
     fn parse_pip_lock_continuations_and_hashes() {
         let req = "\
 # pip-compile output
@@ -1344,6 +1584,92 @@ source = { editable = "." }
             .unwrap()
             .contains("manylinux_2_17_x86_64"));
         assert_eq!(pins[2].hashes, vec!["ffff"]);
+    }
+
+    #[test]
+    fn uv_dev_split_skips_dev_only_subgraph() {
+        let text = r#"
+version = 1
+requires-python = ">=3.9"
+
+[[package]]
+name = "app"
+version = "1.0"
+source = { editable = "." }
+dependencies = [{ name = "prod" }]
+dev-dependencies = [{ name = "devtool" }]
+
+[[package]]
+name = "prod"
+version = "2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://f/prod-2.0-py3-none-any.whl", hash = "sha256:pppp" },
+]
+
+[[package]]
+name = "devtool"
+version = "3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [{ name = "devtrans" }]
+wheels = [
+    { url = "https://f/devtool-3.0-py3-none-any.whl", hash = "sha256:dddd" },
+]
+
+[[package]]
+name = "devtrans"
+version = "4.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://f/devtrans-4.0-py3-none-any.whl", hash = "sha256:tttt" },
+]
+"#;
+        // The dev-only set, computed directly: devtool plus its transitive
+        // devtrans — prod is reachable from the editable root and stays.
+        let lock: UvLock = toml::from_str(text).unwrap();
+        let dev_only = dev_only_names(&lock.package);
+        assert_eq!(
+            dev_only,
+            BTreeSet::from(["devtool".to_string(), "devtrans".to_string()])
+        );
+
+        // parse_uv_lock skips the dev-only set BEFORE the wheel checks:
+        // both dev wheels exist and match this platform, yet only prod pins.
+        let pins = parse_uv_lock(text.as_bytes()).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].name, "prod");
+        assert_eq!(pins[0].hashes, vec!["pppp"]);
+    }
+
+    #[test]
+    fn uv_dev_split_fail_safe_without_source_installed_root() {
+        // No editable/virtual/git package → no reliable prod roots →
+        // nothing is dev-only (fetch everything), even though the lock
+        // carries dev-dependencies.
+        let text = r#"
+version = 1
+
+[[package]]
+name = "app"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+dev-dependencies = [{ name = "devtool" }]
+wheels = [
+    { url = "https://f/app-1.0-py3-none-any.whl", hash = "sha256:aaaa" },
+]
+
+[[package]]
+name = "devtool"
+version = "2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://f/devtool-2.0-py3-none-any.whl", hash = "sha256:bbbb" },
+]
+"#;
+        let lock: UvLock = toml::from_str(text).unwrap();
+        assert!(dev_only_names(&lock.package).is_empty());
+        let pins = parse_uv_lock(text.as_bytes()).unwrap();
+        assert_eq!(pins.len(), 2);
     }
 
     #[test]

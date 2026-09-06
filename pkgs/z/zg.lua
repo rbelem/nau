@@ -5,9 +5,11 @@
 -- The npm closure resolves from upstream's package-lock.json (439
 -- entries, fetched as pure tarball GETs with SRI verification), the
 -- sandbox build compiles the TypeScript with the closure's own
--- typescript, and @node-llama-cpp is excluded from the stage: its
--- prebuilt CUDA/Vulkan backends cannot resolve here and zg
--- dynamic-imports it in try/catch (same pruning the devbox flake did).
+-- typescript. The @node-llama-cpp backends are excluded at FETCH time
+-- via deps.npm.exclude (issue #14): their prebuilt CUDA/Vulkan wheels
+-- cannot load here and zg dynamic-imports them in try/catch (same
+-- pruning the devbox flake did), so they are never downloaded, never
+-- extracted, and never pinned into the closure hash.
 
 return {
     default = snap {
@@ -33,7 +35,10 @@ return {
         },
 
         deps = {
-            npm = { lock = "package-lock.json" },
+            npm = {
+                lock = "package-lock.json",
+                exclude = { "node_modules/@node-llama-cpp/*" },
+            },
         },
 
         build = table.concat({
@@ -43,8 +48,9 @@ return {
             "node node_modules/typescript/bin/tsc -p tsconfig.json",
             "mkdir -p $STAGE/usr/lib/node_modules/@zvec/zvec-grep",
             "cp -r dist package.json $STAGE/usr/lib/node_modules/@zvec/zvec-grep/",
-            -- Stage the full closure except the llama backends (see header).
-            "tar -C \"$SHUTTLE_DEPS_DIR\" -cf - --exclude='./node_modules/@node-llama-cpp' node_modules | tar -C $STAGE/usr/lib/node_modules/@zvec/zvec-grep -xf -",
+            -- Stage the whole closure (the llama backends never reached
+            -- it — excluded at fetch time, see header).
+            "tar -C \"$SHUTTLE_DEPS_DIR\" -cf - node_modules | tar -C $STAGE/usr/lib/node_modules/@zvec/zvec-grep -xf -",
         }, " && "),
 
         type = "source",

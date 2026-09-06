@@ -129,7 +129,8 @@ pub struct PackageDeps {
 }
 
 /// One ecosystem resolver's spec: its lockfile (relative to the source
-/// root) and, for index-driven ecosystems, the index to resolve against.
+/// root), the index to resolve against (index-driven ecosystems), and —
+/// npm only — fetch-side exclusion globs over lock keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepsLockSpec {
     /// Lockfile path relative to the source root (e.g.
@@ -138,6 +139,10 @@ pub struct DepsLockSpec {
     /// Package index URL (pip only; default: the official PyPI simple
     /// index). npm resolves from the lockfile's own `resolved` URLs.
     pub index: Option<String>,
+    /// Glob patterns (`*` / `?`) matched against lock keys
+    /// (`node_modules/...`, full-key match); any key matching one is
+    /// never fetched (npm only, issue #14).
+    pub exclude: Vec<String>,
 }
 
 // ── Phase 3: Snap metadata structs ──
@@ -790,19 +795,7 @@ fn package_deps_from_lua(t: &mlua::Table) -> miette::Result<PackageDeps> {
         };
         match key.as_str() {
             "npm" | "pip" => {
-                let lock = get_opt_string(&value, "lock")?.ok_or_else(|| {
-                    miette::miette!("deps.{key}: field 'lock' is required (lockfile path relative to the source root)")
-                })?;
-                if lock.is_empty() {
-                    return Err(miette::miette!("deps.{key}: 'lock' must not be empty"));
-                }
-                if lock.starts_with('/') {
-                    return Err(miette::miette!(
-                        "deps.{key}: 'lock' is relative to the source root — got absolute path '{lock}'"
-                    ));
-                }
-                let index = get_opt_string(&value, "index")?;
-                let spec = DepsLockSpec { lock, index };
+                let spec = deps_lock_spec_from_lua(&key, &value)?;
                 if key == "npm" {
                     npm = Some(spec);
                 } else {
@@ -822,6 +815,62 @@ fn package_deps_from_lua(t: &mlua::Table) -> miette::Result<PackageDeps> {
         ));
     }
     Ok(PackageDeps { npm, pip })
+}
+
+/// Parse one resolver's spec table: `lock` (required, relative to the
+/// source root), `index` (optional), and — npm only — `exclude` globs
+/// over lock keys (issue #14). pip rejects `exclude`: its fetch side
+/// has no lock keys to glob, only whole wheel pins.
+fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLockSpec> {
+    let lock = get_opt_string(t, "lock")?.ok_or_else(|| {
+        miette::miette!(
+            "deps.{key}: field 'lock' is required (lockfile path relative to the source root)"
+        )
+    })?;
+    if lock.is_empty() {
+        return Err(miette::miette!("deps.{key}: 'lock' must not be empty"));
+    }
+    if lock.starts_with('/') {
+        return Err(miette::miette!(
+            "deps.{key}: 'lock' is relative to the source root — got absolute path '{lock}'"
+        ));
+    }
+    let index = get_opt_string(t, "index")?;
+    let exclude = match key {
+        "npm" => npm_exclude_from_lua(t)?,
+        _ => {
+            if pip_exclude_present(t) {
+                return Err(miette::miette!(
+                    "deps.pip: 'exclude' is not supported (npm only)"
+                ));
+            }
+            Vec::new()
+        }
+    };
+    Ok(DepsLockSpec {
+        lock,
+        index,
+        exclude,
+    })
+}
+
+/// The npm `exclude` globs: an optional string array; empty patterns are
+/// rejected (an empty glob is always a typo, never a filter).
+fn npm_exclude_from_lua(t: &mlua::Table) -> miette::Result<Vec<String>> {
+    let Some(exclude) = get_opt_string_array(t, "exclude")? else {
+        return Ok(Vec::new());
+    };
+    if exclude.iter().any(String::is_empty) {
+        return Err(miette::miette!(
+            "deps.npm: 'exclude' entries must not be empty"
+        ));
+    }
+    Ok(exclude)
+}
+
+/// True when a pip spec table carries an `exclude` key (any value).
+fn pip_exclude_present(t: &mlua::Table) -> bool {
+    !matches!(t.get::<Value>("exclude").unwrap_or(Value::Nil), Value::Nil)
 }
 
 /// Map an icon source path to its in-snap target (`meta/gui/icon.<ext>`),

@@ -821,3 +821,277 @@ gated_test!(
         );
     }
 );
+
+// ── deps.npm.exclude: excluded lock keys are never fetched (issue #14) ──
+
+/// Fixture for the npm `exclude` e2e: the app's lock has two deps, and
+/// the declaration excludes one (`ndrop`) — its tarball must never be
+/// requested, and the kept dep still builds and runs.
+fn write_npm_exclude_pkg(project: &Path, server: &Path, port: u16) {
+    let name = "znxapp";
+    let dir = project.join("pkgs/z");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Both tarballs exist on the registry server: a regression that
+    // fetches the excluded one would succeed against a 200, and the
+    // request log would catch it.
+    let dep_tgz = write_npm_dep(server, "ndep", "1.0.0", "kept-dep-ran", None);
+    let integrity = sri_sha512(&dep_tgz);
+    let drop_tgz = write_npm_dep(server, "ndrop", "9.9.9", "dropped-dep-ran", None);
+    let drop_integrity = sri_sha512(&drop_tgz);
+
+    let approot = server.join("exapproot");
+    let _ = std::fs::remove_dir_all(&approot);
+    std::fs::create_dir_all(&approot).unwrap();
+    let lock = format!(
+        r#"{{
+  "name": "{name}",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {{
+    "": {{ "name": "{name}", "version": "1.0.0", "dependencies": {{ "ndep": "1.0.0", "ndrop": "9.9.9" }} }},
+    "node_modules/ndep": {{
+      "version": "1.0.0",
+      "resolved": "http://127.0.0.1:{port}/registry/ndep/-/ndep-1.0.0.tgz",
+      "integrity": "{integrity}"
+    }},
+    "node_modules/ndrop": {{
+      "version": "9.9.9",
+      "resolved": "http://127.0.0.1:{port}/registry/ndep/-/ndrop-9.9.9.tgz",
+      "integrity": "{drop_integrity}"
+    }}
+  }}
+}}
+"#
+    );
+    std::fs::write(approot.join("package-lock.json"), lock).unwrap();
+    std::fs::write(
+        approot.join("cli.js"),
+        "const d = require(\"ndep\");\nconsole.log(d.say());\n",
+    )
+    .unwrap();
+    tar_czf(server, "ex-src.tar.gz", "exapproot");
+
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "{name}",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/ex-src.tar.gz",
+    deps = {{ npm = {{ lock = "package-lock.json", exclude = {{ "node_modules/ndrop" }} }} }},
+    build = "mkdir -p $STAGE/lib/node_modules/{name} && cp $SRC/cli.js $STAGE/lib/node_modules/{name}/cli.js && cp -r \"$SHUTTLE_DEPS_DIR/node_modules\" $STAGE/lib/node_modules/{name}/node_modules",
+    apps = {{ {name} = {{ command = "lib/node_modules/{name}/cli.js", interpreter = "node" }} }},
+}} }}
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
+gated_test!(npm_exclude_never_fetches_the_excluded_tarball, &["node"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_npm_exclude_pkg(project.path(), server.path(), port);
+
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "add", "znxapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+
+    // The excluded tarball was NEVER requested; the kept dep was.
+    assert_eq!(
+        requests_for(&log, "/registry/ndep/-/ndrop"),
+        0,
+        "excluded dep must never be fetched; requests: {:#?}",
+        log.lock().unwrap()
+    );
+    assert!(
+        requests_for(&log, "/registry/ndep/-/ndep-1.0.0.tgz") >= 1,
+        "the kept dep must be fetched; requests: {:#?}",
+        log.lock().unwrap()
+    );
+
+    // SAFETY: nothing executed a dependency lifecycle script on the host.
+    assert_no_canary(&[project.path(), root.path(), server.path()]);
+
+    // The build ran against the post-filter closure: the farm serves the
+    // app with its kept dependency.
+    let farm = current_farm(root.path(), "default");
+    let out = run_farm_app(&farm, "znxapp");
+    assert!(
+        out.contains("kept-dep-ran"),
+        "farm app must run the kept dep: {out:?}"
+    );
+});
+
+// ── uv.lock dev-dependency split: dev wheels are never fetched (issue #14) ──
+
+/// Write a minimal wheel (a zip) under `server/wheels/` and return its
+/// sha256 (the uv.lock `hash` pin).
+fn write_uv_wheel(server: &Path, name: &str, version: &str, say: &str) -> String {
+    let build = server.join("uvwheelbuild");
+    let _ = std::fs::remove_dir_all(&build);
+    std::fs::create_dir_all(build.join(name)).unwrap();
+    std::fs::write(
+        build.join(format!("{name}/__init__.py")),
+        format!("def say():\n    return \"{say}\"\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(server.join("wheels")).unwrap();
+    let wheel = server.join(format!("wheels/{name}-{version}-py3-none-any.whl"));
+    let _ = std::fs::remove_file(&wheel);
+    let status = Command::new("python3")
+        .arg("-m")
+        .arg("zipfile")
+        .arg("-c")
+        .arg(&wheel)
+        .arg(name)
+        .current_dir(&build)
+        .status()
+        .expect("python3 spawn");
+    assert!(status.success(), "python3 -m zipfile -c failed");
+    sha256_hex(&std::fs::read(&wheel).unwrap())
+}
+
+/// Fixture for the uv dev-split e2e: an editable root with a prod dep
+/// (`prod`) and a dev dep (`devtool`, transitively `devtrans`).
+fn write_uv_devsplit_pkg(project: &Path, server: &Path, name: &str, port: u16) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let dir = project.join("pkgs").join(letter.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let prod_hash = write_uv_wheel(server, "prod", "1.0", "prod-dep-ran");
+    let devtool_hash = write_uv_wheel(server, "devtool", "1.0", "devtool-ran");
+    let devtrans_hash = write_uv_wheel(server, "devtrans", "1.0", "devtrans-ran");
+
+    let approot = server.join("uvapproot");
+    let _ = std::fs::remove_dir_all(&approot);
+    std::fs::create_dir_all(&approot).unwrap();
+    let lock = format!(
+        r#"
+version = 1
+requires-python = ">=3.9"
+
+[[package]]
+name = "{name}"
+version = "1.0"
+source = {{ editable = "." }}
+dependencies = [{{ name = "prod" }}]
+dev-dependencies = [{{ name = "devtool" }}]
+
+[[package]]
+name = "prod"
+version = "1.0"
+source = {{ registry = "https://pypi.org/simple" }}
+wheels = [
+    {{ url = "http://127.0.0.1:{port}/wheels/prod-1.0-py3-none-any.whl", hash = "sha256:{prod_hash}" }},
+]
+
+[[package]]
+name = "devtool"
+version = "1.0"
+source = {{ registry = "https://pypi.org/simple" }}
+dependencies = [{{ name = "devtrans" }}]
+wheels = [
+    {{ url = "http://127.0.0.1:{port}/wheels/devtool-1.0-py3-none-any.whl", hash = "sha256:{devtool_hash}" }},
+]
+
+[[package]]
+name = "devtrans"
+version = "1.0"
+source = {{ registry = "https://pypi.org/simple" }}
+wheels = [
+    {{ url = "http://127.0.0.1:{port}/wheels/devtrans-1.0-py3-none-any.whl", hash = "sha256:{devtrans_hash}" }},
+]
+"#
+    );
+    std::fs::write(approot.join("uv.lock"), lock).unwrap();
+    std::fs::write(
+        approot.join("main.py"),
+        "import os, sys\n\
+         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), \"site-packages\"))\n\
+         import prod\n\
+         print(prod.say())\n",
+    )
+    .unwrap();
+    tar_czf(server, "uv-src.tar.gz", "uvapproot");
+
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "{name}",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/uv-src.tar.gz",
+    deps = {{ pip = {{ lock = "uv.lock", index = "http://127.0.0.1:{port}/simple" }} }},
+    build = "mkdir -p $STAGE/lib/pymods/site-packages && python3 -m zipfile -e \"$SHUTTLE_DEPS_DIR/prod-1.0-py3-none-any.whl\" $STAGE/lib/pymods/site-packages && cp $SRC/main.py $STAGE/lib/pymods/main.py",
+    apps = {{ {name} = {{ command = "lib/pymods/main.py", interpreter = "python3" }} }},
+}} }}
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
+gated_test!(uv_dev_split_never_fetches_dev_wheels, &["python3"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_uv_devsplit_pkg(project.path(), server.path(), "zuvapp", port);
+
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "add", "zuvapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+
+    // Dev wheels (direct and transitive) were NEVER requested; the prod
+    // wheel was.
+    assert_eq!(
+        requests_for(&log, "/wheels/devtool"),
+        0,
+        "dev wheel must never be fetched; requests: {:#?}",
+        log.lock().unwrap()
+    );
+    assert_eq!(
+        requests_for(&log, "/wheels/devtrans"),
+        0,
+        "transitive dev wheel must never be fetched; requests: {:#?}",
+        log.lock().unwrap()
+    );
+    assert!(
+        requests_for(&log, "/wheels/prod") >= 1,
+        "the prod wheel must be fetched; requests: {:#?}",
+        log.lock().unwrap()
+    );
+
+    // The build ran: the farm serves the app with its prod dependency.
+    let farm = current_farm(root.path(), "default");
+    let out = run_farm_app(&farm, "zuvapp");
+    assert!(
+        out.contains("prod-dep-ran"),
+        "farm app must run the prod dep: {out:?}"
+    );
+});
+
+// ── deps.pip `exclude` is a parse-time hard error (npm only) ──
+
+gated_test!(pip_exclude_rejected_at_parse, &[], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_pip_pkg(project.path(), server.path(), "pyxapp", "x", port);
+
+    // Amend the declaration to carry the unsupported option.
+    let lua_path = project.path().join("pkgs/p/pyxapp.lua");
+    let lua = std::fs::read_to_string(&lua_path).unwrap().replace(
+        "lock = \"requirements.lock\"",
+        "lock = \"requirements.lock\", exclude = { \"pcalc\" }",
+    );
+    std::fs::write(&lua_path, lua).unwrap();
+
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "add", "pyxapp"]);
+    assert_ne!(code, Some(0), "pip exclude must be rejected: {stdout}");
+    assert!(
+        stderr.contains("'exclude' is not supported (npm only)"),
+        "failure must name the unsupported option: {stderr}"
+    );
+    // The rejection is a parse-time hard error: nothing was fetched.
+    assert_eq!(requests_for(&log, "/wheels/"), 0);
+});
