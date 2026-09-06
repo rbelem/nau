@@ -612,8 +612,36 @@ struct UvPackage {
     /// Regular dependency edges (`dependencies = [{ name = "…" }]`).
     dependencies: Option<Vec<UvDep>>,
     /// Dev-only dependency edges (TOML `dev-dependencies`) — the input
-    /// to the dev/prod split (issue #14).
-    dev_dependencies: Option<Vec<UvDep>>,
+    /// to the dev/prod split (issue #14). Two shapes exist in the wild:
+    /// the grouped table (`[package.dev-dependencies]` with one key per
+    /// group, uv's current format) and a plain array (older locks).
+    dev_dependencies: Option<UvDevDeps>,
+}
+
+/// The two `dev-dependencies` shapes, flattened to the same name list
+/// (see [`UvDevDeps::names`]).
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum UvDevDeps {
+    /// uv's current format: a table keyed by group name, each group an
+    /// array of entries (`dev = [{ name = "pytest" }, …]`).
+    Groups(BTreeMap<String, Vec<UvDep>>),
+    /// Older locks: one flat array of entries.
+    Flat(Vec<UvDep>),
+}
+
+impl UvDevDeps {
+    /// Every dependency name across all groups (order: group key, then
+    /// array order — BTreeMap keeps it deterministic).
+    fn names(&self) -> impl Iterator<Item = &str> {
+        match self {
+            UvDevDeps::Groups(groups) => {
+                Box::new(groups.values().flatten().map(|d| d.name.as_str()))
+                    as Box<dyn Iterator<Item = &str>>
+            }
+            UvDevDeps::Flat(deps) => Box::new(deps.iter().map(|d| d.name.as_str())),
+        }
+    }
 }
 
 /// One entry of a uv.lock dependency array. Only the name matters for
@@ -739,8 +767,8 @@ fn pin_for_package(pkg: &UvPackage) -> Option<PipPin> {
 fn dev_only_names(pkgs: &[UvPackage]) -> BTreeSet<String> {
     let dev_roots: BTreeSet<String> = pkgs
         .iter()
-        .flat_map(|p| p.dev_dependencies.iter().flatten())
-        .map(|d| normalize_name(&d.name))
+        .flat_map(|p| p.dev_dependencies.iter().flat_map(UvDevDeps::names))
+        .map(normalize_name)
         .collect();
     let prod_roots: BTreeSet<String> = pkgs
         .iter()
@@ -1639,6 +1667,52 @@ wheels = [
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].name, "prod");
         assert_eq!(pins[0].hashes, vec!["pppp"]);
+    }
+
+    #[test]
+    fn uv_dev_split_handles_both_dev_dependencies_shapes() {
+        // uv's current format: [package.dev-dependencies] is a TABLE
+        // keyed by group name (the shape of the real whichllm lock).
+        let grouped = r#"
+version = 1
+
+[[package]]
+name = "app"
+version = "1.0"
+source = { editable = "." }
+dependencies = [{ name = "prod" }]
+
+[package.dev-dependencies]
+dev = [{ name = "pytest" }, { name = "pyarrow" }]
+lint = [{ name = "ruff" }]
+
+[[package]]
+name = "prod"
+version = "2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://f/prod-2.0-py3-none-any.whl" }]
+
+[[package]]
+name = "pytest"
+version = "3.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://f/pytest-3.0-py3-none-any.whl" }]
+"#;
+        let lock: UvLock = toml::from_str(grouped).unwrap();
+        let dev_only = dev_only_names(&lock.package);
+        assert!(
+            dev_only.contains("pytest")
+                && dev_only.contains("pyarrow")
+                && dev_only.contains("ruff")
+        );
+        assert!(!dev_only.contains("prod"));
+        // The flat array shape (older locks) flattens to the same roots.
+        let flat = grouped.replace(
+            "[package.dev-dependencies]\ndev = [{ name = \"pytest\" }, { name = \"pyarrow\" }]\nlint = [{ name = \"ruff\" }]",
+            "dev-dependencies = [{ name = \"pytest\" }, { name = \"pyarrow\" }, { name = \"ruff\" }]",
+        );
+        let lock: UvLock = toml::from_str(&flat).unwrap();
+        assert_eq!(dev_only_names(&lock.package), dev_only);
     }
 
     #[test]
