@@ -265,6 +265,8 @@ mod tests {
             inputs: None,
             confined: None,
             apps: HashMap::new(),
+            deps: None,
+            floating: false,
             definition_dir: None,
         }
     }

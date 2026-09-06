@@ -24,6 +24,11 @@ sha2 = "0.10"
 sha3 = "0.10"
 tempfile = "3"
 indicatif = "0.18"
+# Dependency-closure fetch (ADR-0017, issue #13): npm registry tarballs are
+# gzip tarballs — decode + extract with the same crates build.rs already
+# vendors (kept at identical versions; no new vendored code).
+flate2 = "1"
+tar = "0.4"
 owo-colors = "4"
 libc = "0.2"
 clap_complete = "4"
@@ -35,5 +40,14 @@ full_moon = { version = "2", features = ["luau"] }
 [build-dependencies]
 # Luau analyzer build (see build.rs + shim/): upstream C++ compiled with cc.
 cc = { version = "1.2", features = ["parallel"] }
+# build.rs unpacks the vendored Luau analyzer tarball.
+flate2 = "1"
+tar = "0.4"
+
+[dev-dependencies]
+# Dependency-fetch integration tests (issue #13): compute npm SRI
+# integrity and wheel hashes for the loopback registry fixtures.
+sha2 = "0.10"
+base64 = "0.22"
 flate2 = "1"
 tar = "0.4"

@@ -117,6 +117,29 @@ pub struct PackageInput {
     pub url: String,
 }
 
+/// Dependency-closure declaration (ADR-0017, issue #13): which ecosystem
+/// resolvers a package needs and where their lockfiles live. Coexists with
+/// `source` (hybrid), stands alone, or is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageDeps {
+    /// npm resolver: `deps = { npm = { lock = "package-lock.json" } }`.
+    pub npm: Option<DepsLockSpec>,
+    /// pip resolver: `deps = { pip = { lock = "requirements.lock" } }`.
+    pub pip: Option<DepsLockSpec>,
+}
+
+/// One ecosystem resolver's spec: its lockfile (relative to the source
+/// root) and, for index-driven ecosystems, the index to resolve against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepsLockSpec {
+    /// Lockfile path relative to the source root (e.g.
+    /// "package-lock.json", "requirements.lock").
+    pub lock: String,
+    /// Package index URL (pip only; default: the official PyPI simple
+    /// index). npm resolves from the lockfile's own `resolved` URLs.
+    pub index: Option<String>,
+}
+
 // ── Phase 3: Snap metadata structs ──
 
 /// Top-level metadata for one snap output.
@@ -265,6 +288,21 @@ pub struct SnapMeta {
 
     #[serde(default)]
     pub apps: HashMap<String, SnapApp>,
+
+    /// Dependency-closure declaration (ADR-0017, issue #13): ecosystem
+    /// resolvers with their lockfiles, e.g.
+    /// `deps = { npm = { lock = "package-lock.json" } }`. Build-time only —
+    /// never emitted into snap.yaml (the closure ships as ordinary payload
+    /// files; the resolver spec has no runtime meaning).
+    #[serde(skip)]
+    pub deps: Option<PackageDeps>,
+
+    /// Float mode (ADR-0017, issue #13): opt-in per package via the
+    /// declaration (`floating = true`) or a pod overlay. Locked (default,
+    /// false): sync never re-fetches a cached closure. Floating: sync
+    /// re-resolves and records the new hash — still hash-verified.
+    #[serde(skip)]
+    pub floating: bool,
 
     /// Directory of the definition file this output came from, threaded
     /// from the eval label in `lua.rs`. Used to resolve build-time file
@@ -650,6 +688,28 @@ impl SnapMeta {
         let confined = get_opt_table(table, "confined")?
             .map(|t| confinement_from_lua(&t))
             .transpose()?;
+        let deps = get_opt_table(table, "deps")?
+            .map(|t| package_deps_from_lua(&t))
+            .transpose()?;
+        // A dependency closure resolves from the source tree (the lockfile
+        // ships in the source tarball), so `deps` without `source` can
+        // never fetch. Fail at the parse boundary, not mid-fetch.
+        if deps.is_some() && source.is_none() {
+            return Err(miette::miette!(
+                "snap meta: 'deps' requires 'source' — the lockfile resolves from the package source tree"
+            ));
+        }
+        let floating = match table.get::<mlua::Value>("floating") {
+            Ok(mlua::Value::Boolean(b)) => b,
+            Ok(mlua::Value::Nil) => false,
+            Ok(other) => {
+                return Err(miette::miette!(
+                    "snap meta: field 'floating' must be a boolean, got {}",
+                    other.type_name()
+                ))
+            }
+            Err(_) => false,
+        };
 
         let apps = get_opt_table(table, "apps")?
             .map(|apps_table| {
@@ -704,9 +764,64 @@ impl SnapMeta {
             inputs,
             confined,
             apps,
+            deps,
+            floating,
             definition_dir: None,
         })
     }
+}
+
+/// Parse the `deps` table (ADR-0017): `{ npm = { lock = ... }, pip = { lock
+/// = ..., index = ... } }` — at least one resolver, known keys only, every
+/// resolver carrying a non-empty string `lock`.
+fn package_deps_from_lua(t: &mlua::Table) -> miette::Result<PackageDeps> {
+    let mut npm = None;
+    let mut pip = None;
+    for pair in t.pairs::<String, mlua::Value>() {
+        let (key, value) = pair.map_err(|e| miette::miette!("deps entry: {e}"))?;
+        let value = match value {
+            mlua::Value::Table(t) => t,
+            other => {
+                return Err(miette::miette!(
+                    "deps['{key}'] must be a table, got {}",
+                    other.type_name()
+                ))
+            }
+        };
+        match key.as_str() {
+            "npm" | "pip" => {
+                let lock = get_opt_string(&value, "lock")?.ok_or_else(|| {
+                    miette::miette!("deps.{key}: field 'lock' is required (lockfile path relative to the source root)")
+                })?;
+                if lock.is_empty() {
+                    return Err(miette::miette!("deps.{key}: 'lock' must not be empty"));
+                }
+                if lock.starts_with('/') {
+                    return Err(miette::miette!(
+                        "deps.{key}: 'lock' is relative to the source root — got absolute path '{lock}'"
+                    ));
+                }
+                let index = get_opt_string(&value, "index")?;
+                let spec = DepsLockSpec { lock, index };
+                if key == "npm" {
+                    npm = Some(spec);
+                } else {
+                    pip = Some(spec);
+                }
+            }
+            other => {
+                return Err(miette::miette!(
+                    "deps: unknown resolver '{other}' (supported: npm, pip)"
+                ))
+            }
+        }
+    }
+    if npm.is_none() && pip.is_none() {
+        return Err(miette::miette!(
+            "deps must name at least one resolver: npm or pip"
+        ));
+    }
+    Ok(PackageDeps { npm, pip })
 }
 
 /// Map an icon source path to its in-snap target (`meta/gui/icon.<ext>`),
@@ -1592,49 +1707,70 @@ fn emit_build_wrappers(
     pod_store: &crate::runtime::RuntimeStore,
 ) -> miette::Result<()> {
     for (app_name, app) in &meta.apps {
-        if app.interpreter.as_deref() == Some("") {
-            return Err(miette::miette!(
-                "app '{app_name}': 'interpreter' must not be empty"
-            ));
-        }
-        let Some(cmd_path) = crate::units::resolve_command_path(&app.command) else {
-            continue;
-        };
-        let entry = stage_dir.join(&cmd_path);
-        if !entry.is_file() {
-            // A missing command binary is caught later by the install-time
-            // planner's fail-closed lookup — nothing to wrap.
-            continue;
-        }
-
-        // Ticket #11: a confined app gets a separate launcher wrapper blob
-        // (at `<command>.shuttle-launcher`) that invokes `shuttle run`. The
-        // farm's direct symlink for a confined app points at this wrapper,
-        // so `which`/PATH stay truthful while `shuttle run` sets up the
-        // sandbox. The real command binary stays untouched — `apps[app]`
-        // still records it and `shuttle run` execs it inside the sandbox.
-        if Confinement::for_app(app.confined.as_ref(), meta.confined.as_ref()).is_some() {
-            emit_confined_launcher(app_name, &entry, pod_store)?;
-        }
-
-        if is_elf(&entry) {
-            // Issue #10 part B: native-ELF wrapper ONLY when the payload
-            // bundles a runtime lib the binary needs (separate store blob
-            // not on its runpath). Already-resolvable ELFs stay unwrapped.
-            let lib_dirs = bundled_runtime_lib_dirs(&entry, stage_dir);
-            if lib_dirs.is_empty() {
-                continue;
-            }
-            emit_elf_lib_wrapper(app_name, &entry, &lib_dirs, meta, pod_store)?;
-        } else {
-            // Issue #9: interpreter-script wrapper.
-            let Some(interpreter) = &app.interpreter else {
-                continue;
-            };
-            emit_script_wrapper(app_name, &entry, interpreter, pod_store)?;
-        }
+        wrap_app(app_name, app, meta, stage_dir, pod_store)?;
     }
     Ok(())
+}
+
+/// Wrap one app's command, if it qualifies (see [`emit_build_wrappers`]).
+fn wrap_app(
+    app_name: &str,
+    app: &SnapApp,
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    pod_store: &crate::runtime::RuntimeStore,
+) -> miette::Result<()> {
+    if app.interpreter.as_deref() == Some("") {
+        return Err(miette::miette!(
+            "app '{app_name}': 'interpreter' must not be empty"
+        ));
+    }
+    let Some(cmd_path) = crate::units::resolve_command_path(&app.command) else {
+        return Ok(());
+    };
+    let entry = stage_dir.join(&cmd_path);
+    if !entry.is_file() {
+        // A missing command binary is caught later by the install-time
+        // planner's fail-closed lookup — nothing to wrap.
+        return Ok(());
+    }
+
+    // Ticket #11: a confined app gets a separate launcher wrapper blob
+    // (at `<command>.shuttle-launcher`) that invokes `shuttle run`. The
+    // farm's direct symlink for a confined app points at this wrapper,
+    // so `which`/PATH stay truthful while `shuttle run` sets up the
+    // sandbox. The real command binary stays untouched — `apps[app]`
+    // still records it and `shuttle run` execs it inside the sandbox.
+    if Confinement::for_app(app.confined.as_ref(), meta.confined.as_ref()).is_some() {
+        emit_confined_launcher(app_name, &entry, pod_store)?;
+    }
+
+    if is_elf(&entry) {
+        // Issue #10 part B: native-ELF wrapper ONLY when the payload
+        // bundles a runtime lib the binary needs (separate store blob
+        // not on its runpath). Already-resolvable ELFs stay unwrapped.
+        let lib_dirs = bundled_runtime_lib_dirs(&entry, stage_dir);
+        if lib_dirs.is_empty() {
+            return Ok(());
+        }
+        emit_elf_lib_wrapper(app_name, &entry, &lib_dirs, meta, pod_store)
+    } else {
+        // Issue #9: interpreter-script wrapper.
+        let Some(interpreter) = &app.interpreter else {
+            return Ok(());
+        };
+        if meta.deps.is_some() {
+            // ADR-0017 (issue #13): with a dependency closure the app
+            // must run from the generation's extension tree, where the
+            // staged `node_modules`/site-packages sit next to the
+            // script (require()/sys.path resolve relative to the
+            // script). A file-blob store path (the #9 default) would
+            // strand the interpreter with no modules beside it.
+            emit_script_tree_wrapper(app_name, &entry, interpreter, &meta.name, &cmd_path)
+        } else {
+            emit_script_wrapper(app_name, &entry, interpreter, pod_store)
+        }
+    }
 }
 
 /// Author the interpreter-script wrapper (issue #9) for a command path
@@ -1673,6 +1809,45 @@ fn emit_script_wrapper(
         "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
         interpreter,
         script_store_path.display()
+    );
+    write_wrapper(app_name, entry, &wrapper)
+}
+
+/// Author the interpreter-script wrapper for a package WITH a dependency
+/// closure (ADR-0017, issue #13): same preserve-and-replace shape as
+/// [`emit_script_wrapper`], but the wrapper execs the `.real` script from
+/// the active generation's extension tree —
+/// `$PODROOT/active/extensions/<pkg>/usr/<command>.real` — where modules
+/// staged next to it (`node_modules`, site-packages) resolve. PODROOT is
+/// derived from the wrapper's own store-blob path (`store/<aa>/<hash>`),
+/// the same derivation the #10 ELF lib wrapper uses.
+fn emit_script_tree_wrapper(
+    app_name: &str,
+    entry: &Path,
+    interpreter: &str,
+    pkg_name: &str,
+    cmd_rel: &str,
+) -> miette::Result<()> {
+    let file_name = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let script_path = entry.with_file_name(format!("{file_name}.real"));
+    std::fs::rename(entry, &script_path).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': preserving interpreter script {}: {e}",
+            script_path.display()
+        )
+    })?;
+    let tree_script = format!("$PODROOT/active/extensions/{pkg_name}/usr/{cmd_rel}.real");
+    // The farm symlink resolves to the wrapper blob at
+    // `<podroot>/store/<aa>/<hash>` — three dirnames to the pod root
+    // (same derivation as the #10 ELF lib wrapper).
+    let wrapper = format!(
+        "#!/bin/sh\n\
+         SCRIPT=\"$(readlink -f \"$0\")\"\n\
+         PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+         exec \"{interpreter}\" \"{tree_script}\"\n"
     );
     write_wrapper(app_name, entry, &wrapper)
 }
@@ -2136,57 +2311,132 @@ fn repair_elf_for_portability(meta: &SnapMeta, stage_dir: &Path) -> miette::Resu
         let Some(cmd_path) = crate::units::resolve_command_path(&app.command) else {
             continue;
         };
-        let entry = stage_dir.join(&cmd_path);
-        if !entry.is_file() || !is_elf(&entry) {
-            continue;
+        repaired += repair_command_elf(
+            app_name,
+            &cmd_path,
+            &stage_dir.join(&cmd_path),
+            patchelf.as_ref(),
+        )?;
+    }
+    // ADR-0017 (issue #13): prebuilt native addons inside a fetched
+    // dependency closure (`.node`/`.so`/bundled executables under
+    // `node_modules`) get the same build-time ELF repair as commands, so
+    // a nix-built prebuild's interpreter/RUNPATH resolves on any host.
+    if meta.deps.is_some() {
+        let mut elves = Vec::new();
+        collect_stage_elves(stage_dir, &mut elves);
+        for path in elves {
+            repaired += repair_closure_elf(&path, patchelf.as_ref())?;
         }
-        let needs_interp = elf_interpreter(&entry)
-            .map(|i| i.contains("/nix/store/"))
-            .unwrap_or(false);
-        let needs_rpath = elf_runpath(&entry)
-            .map(|r| r.contains("/nix/store/"))
-            .unwrap_or(false);
-        if !needs_interp && !needs_rpath {
-            continue;
-        }
-        let Some(patchelf) = patchelf.as_ref() else {
-            return Err(miette::miette!(
-                "app '{app_name}': native-ELF {cmd_path} references the build machine's \
-                 /nix/store toolchain in its interpreter/RUNPATH (ticket #12), but 'patchelf' is \
-                 not on PATH — install it (e.g. add patchelf to devbox.json) so pod builds can \
-                 repoint the interpreter to a non-nix system loader",
-            ));
-        };
-        // Derive the system interpreter from the ELF's machine type.
-        let bytes = std::fs::read(&entry)
-            .map_err(|e| miette::miette!("app '{app_name}': reading {cmd_path}: {e}"))?;
-        let machine = elf_machine(&bytes).unwrap_or(62); // default x86-64
-        let interpreter = system_elf_interpreter_for(machine);
-        // patchelf rewrites the file in place, so a copied read-only ELF
-        // (e.g. `cp /bin/sh $STAGE/...`) needs a write bit during repair.
-        let saved = with_write_permission(&entry).map_err(|e| {
-            miette::miette!("app '{app_name}': making {cmd_path} writable for patchelf: {e}")
-        })?;
-        let status = std::process::Command::new(patchelf)
-            .arg("--set-interpreter")
-            .arg(&interpreter)
-            .arg("--set-rpath")
-            .arg("")
-            .arg(&entry)
-            .status()
-            .map_err(|e| {
-                miette::miette!("app '{app_name}': running patchelf on {cmd_path}: {e}")
-            })?;
-        restore_write_permission(&entry, saved);
-        if !status.success() {
-            return Err(miette::miette!(
-                "app '{app_name}': patchelf failed on {cmd_path} (exit {:?})",
-                status.code()
-            ));
-        }
-        repaired += 1;
     }
     Ok(repaired)
+}
+
+/// The command-binary repair (ticket #12): repoint a nix interpreter at
+/// the system loader and clear the nix RUNPATH. Returns 1 when repaired.
+fn repair_command_elf(
+    app_name: &str,
+    cmd_path: &str,
+    entry: &Path,
+    patchelf: Option<&String>,
+) -> miette::Result<usize> {
+    if !entry.is_file() || !is_elf(entry) {
+        return Ok(0);
+    }
+    if !elf_has_nix_refs(entry) {
+        return Ok(0);
+    }
+    repair_elf_on_host(app_name, cmd_path, entry, patchelf, "")
+}
+
+/// True when the ELF's interpreter OR RUNPATH references the build
+/// machine's /nix/store (a nix-toolchain build baked in).
+fn elf_has_nix_refs(entry: &Path) -> bool {
+    let nix_interp = elf_interpreter(entry)
+        .map(|i| i.contains("/nix/store/"))
+        .unwrap_or(false);
+    let nix_rpath = elf_runpath(entry)
+        .map(|r| r.contains("/nix/store/"))
+        .unwrap_or(false);
+    nix_interp || nix_rpath
+}
+
+/// Shared patchelf invocation: set the system interpreter (when the ELF
+/// has one) and set RUNPATH to `rpath`, returning 1 on success.
+fn repair_elf_on_host(
+    label: &str,
+    display_path: &str,
+    entry: &Path,
+    patchelf: Option<&String>,
+    rpath: &str,
+) -> miette::Result<usize> {
+    let Some(patchelf) = patchelf else {
+        return Err(miette::miette!(
+            "{label}: native-ELF {display_path} references the build machine's \
+             /nix/store toolchain in its interpreter/RUNPATH (ticket #12), but 'patchelf' is \
+             not on PATH — install it (e.g. add patchelf to devbox.json) so pod builds can \
+             repoint the interpreter to a non-nix system loader",
+        ));
+    };
+    // Derive the system interpreter from the ELF's machine type.
+    let bytes = std::fs::read(entry)
+        .map_err(|e| miette::miette!("{label}: reading {display_path}: {e}"))?;
+    let machine = elf_machine(&bytes).unwrap_or(62); // default x86-64
+    let interpreter = system_elf_interpreter_for(machine);
+    // patchelf rewrites the file in place, so a copied read-only ELF
+    // (e.g. `cp /bin/sh $STAGE/...`) needs a write bit during repair.
+    let saved = with_write_permission(entry).map_err(|e| {
+        miette::miette!("{label}: making {display_path} writable for patchelf: {e}")
+    })?;
+    let mut cmd = std::process::Command::new(patchelf);
+    if elf_interpreter(entry).is_some() {
+        cmd.arg("--set-interpreter").arg(&interpreter);
+    }
+    cmd.arg("--set-rpath").arg(rpath).arg(entry);
+    let status = cmd
+        .status()
+        .map_err(|e| miette::miette!("{label}: running patchelf on {display_path}: {e}"))?;
+    restore_write_permission(entry, saved);
+    if !status.success() {
+        return Err(miette::miette!(
+            "{label}: patchelf failed on {display_path} (exit {:?})",
+            status.code()
+        ));
+    }
+    Ok(1)
+}
+
+/// Repair one ELF found in the staged dependency closure (ADR-0017):
+/// bundled executables get the full command treatment (interpreter + clear
+/// RUNPATH); shared objects (`.node`/`.so` — no PT_INTERP) keep sibling
+/// resolution with RUNPATH `$ORIGIN` and simply drop the nix leak.
+fn repair_closure_elf(entry: &Path, patchelf: Option<&String>) -> miette::Result<usize> {
+    let rel = entry.to_string_lossy().to_string();
+    if elf_interpreter(entry).is_some() {
+        return repair_elf_on_host("deps closure", &rel, entry, patchelf, "");
+    }
+    if elf_runpath(entry)
+        .map(|r| r.contains("/nix/store/"))
+        .unwrap_or(false)
+    {
+        return repair_elf_on_host("deps closure", &rel, entry, patchelf, "$ORIGIN");
+    }
+    Ok(0)
+}
+
+/// Collect every ELF regular file under `dir` (depth-first, symlink-free).
+fn collect_stage_elves(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => collect_stage_elves(&path, out),
+            Ok(t) if t.is_file() && is_elf(&path) => out.push(path),
+            _ => {}
+        }
+    }
 }
 
 /// Relative (to the stage root) parent directories of shared libraries the
@@ -2289,12 +2539,13 @@ pub fn build_snap(
     arch: &str,
     stage_policy: StagePolicy,
     pod_store: Option<&crate::runtime::RuntimeStore>,
+    deps_dir: Option<&Path>,
 ) -> miette::Result<BuildResult> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
 
     // 1. Run build phase (download source, run build command) if configured
-    let outcome = run_build(meta, stage_dir, stage_policy)?;
+    let outcome = run_build(meta, stage_dir, stage_policy, deps_dir)?;
 
     // 1a. Repair native-ELF command binaries for portability (ticket #12):
     // a nix-toolchain build bakes `/nix/store/...` interpreter + RUNPATH
@@ -2440,6 +2691,7 @@ fn run_build(
     meta: &SnapMeta,
     stage_dir: &Path,
     stage_policy: StagePolicy,
+    deps_dir: Option<&Path>,
 ) -> miette::Result<BuildOutcome> {
     // Build plan: `parts` and `build` are mutually exclusive (the DSL
     // enforces this; re-checked here for non-DSL constructors).
@@ -2604,6 +2856,7 @@ fn run_build(
             &src_root,
             &abs_stage,
             meta.target.as_deref(),
+            deps_dir,
         )?;
     } else {
         // Single-part: cwd and $SRC both point at the source root, as before.
@@ -2620,6 +2873,7 @@ fn run_build(
             meta.target.as_deref(),
             None,
             &[],
+            deps_dir,
         )?;
         output::finish_ok(&build_spinner, &format!("built {}", meta.name));
     }
@@ -3086,6 +3340,7 @@ fn run_parts(
     src_dir: &Path,
     stage_dir: &Path,
     target: Option<&str>,
+    deps_dir: Option<&Path>,
 ) -> miette::Result<()> {
     for name in order_parts(parts)? {
         let part = parts.get(&name).expect("name comes from the same map");
@@ -3104,6 +3359,7 @@ fn run_parts(
                 target,
                 Some(&name),
                 &plan.env,
+                deps_dir,
             )?;
         }
         output::finish_ok(&spinner, &format!("[{name}] built"));
@@ -3179,6 +3435,7 @@ fn run_build_command(
     target: Option<&str>,
     part_name: Option<&str>,
     extra_env: &[(String, String)],
+    deps_dir: Option<&Path>,
 ) -> miette::Result<()> {
     let bwrap_bin = detect_bwrap();
     let cross_env = cross_compile_env(target);
@@ -3186,12 +3443,12 @@ fn run_build_command(
     if let Some(bwrap_bin) = bwrap_bin {
         run_bwrapped(
             &bwrap_bin, cmd, build_path, work_dir, src_dir, stage_dir, target, &cross_env,
-            part_name, extra_env,
+            part_name, extra_env, deps_dir,
         )
     } else {
         output::warn("sandbox unavailable — building WITHOUT isolation");
         run_direct(
-            cmd, work_dir, src_dir, stage_dir, &cross_env, part_name, extra_env,
+            cmd, work_dir, src_dir, stage_dir, &cross_env, part_name, extra_env, deps_dir,
         )
     }
 }
@@ -3272,6 +3529,11 @@ pub const SANDBOX_RO_ROOTS: [&str; 6] = [
     "/bin",
     "/run/current-system",
 ];
+
+/// Where the fetched dependency closure (ADR-0017, issue #13) is mounted
+/// inside the build sandbox (read-only), and what `$SHUTTLE_DEPS_DIR`
+/// points the build command at.
+pub const SANDBOX_DEPS_DIR: &str = "/shuttle-deps";
 
 /// The process PATH split into absolute directory entries. Relative and
 /// empty entries are dropped — the sandbox only ever mirrors absolute host
@@ -3550,6 +3812,7 @@ fn run_bwrapped(
     cross_env: &[(&'static str, String)],
     part_name: Option<&str>,
     extra_env: &[(String, String)],
+    deps_dir: Option<&Path>,
 ) -> miette::Result<()> {
     // Tool resolution must work the way the sandbox will see it — fail
     // here, naming the tool, instead of mid-build (see
@@ -3591,6 +3854,12 @@ fn run_bwrapped(
         .arg("--bind")
         .arg(stage_dir)
         .arg(stage_dir);
+    // Dependency closure (ADR-0017, issue #13): the fetched tree is bound
+    // READ-ONLY at a fixed sandbox path — the only view of the closure a
+    // build gets. It is never writable and never the shared host cache.
+    if let Some(deps) = deps_dir {
+        cmd_proc.arg("--ro-bind").arg(deps).arg(SANDBOX_DEPS_DIR);
+    }
     bind_system_ro_paths(&mut cmd_proc);
     // Cross-compilation sysroot mount
     if let Some(triplet) = target {
@@ -3610,6 +3879,9 @@ fn run_bwrapped(
         .env("PATH", sandbox_path(&[stage_dir.to_path_buf()]))
         .env("STAGE", stage_dir)
         .env("SRC", &inner_src);
+    if deps_dir.is_some() {
+        cmd_proc.env("SHUTTLE_DEPS_DIR", SANDBOX_DEPS_DIR);
+    }
     if let Some(name) = part_name {
         cmd_proc.env("PART_NAME", name);
     }
@@ -3630,6 +3902,7 @@ fn run_bwrapped(
 }
 
 /// Fallback: run the build command directly on host (no sandbox).
+#[allow(clippy::too_many_arguments)]
 fn run_direct(
     cmd: &str,
     work_dir: &Path,
@@ -3638,12 +3911,18 @@ fn run_direct(
     cross_env: &[(&'static str, String)],
     part_name: Option<&str>,
     extra_env: &[(String, String)],
+    deps_dir: Option<&Path>,
 ) -> miette::Result<()> {
     let mut cmd_proc = std::process::Command::new("sh");
     cmd_proc
         .args(["-c", cmd])
         .env("STAGE", stage_dir)
         .env("SRC", src_dir);
+    // No sandbox means no read-only bind — the closure tree is exposed at
+    // its host path (degraded mode only; the bwrap path binds it RO).
+    if let Some(deps) = deps_dir {
+        cmd_proc.env("SHUTTLE_DEPS_DIR", deps);
+    }
     if let Some(name) = part_name {
         cmd_proc.env("PART_NAME", name);
     }
@@ -4379,6 +4658,7 @@ mod tests {
             "amd64",
             StagePolicy::Default,
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -4441,6 +4721,7 @@ mod tests {
             "amd64",
             StagePolicy::Default,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(snap_amd64.snap_filename, "multi-test_2.0_amd64.snap");
@@ -4453,6 +4734,7 @@ mod tests {
             output_dir.path(),
             "arm64",
             StagePolicy::Default,
+            None,
             None,
         )
         .unwrap();
@@ -5946,6 +6228,7 @@ mod tests {
             "amd64",
             StagePolicy::Default,
             None,
+            None,
         )
         .unwrap();
         let snap_path = output_dir.path().join(&result.snap_filename);
@@ -6369,6 +6652,7 @@ mod tests {
             &tree.path().join(SOURCE_DIR_NAME),
             &abs_stage,
             None,
+            None,
         )
         .unwrap();
 
@@ -6403,7 +6687,7 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v))
         .collect();
 
-        assert!(run_parts(&parts, tree.path(), tree.path(), &abs_stage, None).is_err());
+        assert!(run_parts(&parts, tree.path(), tree.path(), &abs_stage, None, None).is_err());
     }
 
     #[test]
@@ -6430,9 +6714,14 @@ mod tests {
             },
         )]));
 
-        let err = run_build(&meta, Path::new("/nonexistent-stage"), StagePolicy::Default)
-            .unwrap_err()
-            .to_string();
+        let err = run_build(
+            &meta,
+            Path::new("/nonexistent-stage"),
+            StagePolicy::Default,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("both 'build' and 'parts'"), "got: {err}");
     }
 
@@ -6453,9 +6742,14 @@ mod tests {
         meta.build = None;
         meta.parts = Some(BTreeMap::new());
 
-        let err = run_build(&meta, Path::new("/nonexistent-stage"), StagePolicy::Default)
-            .unwrap_err()
-            .to_string();
+        let err = run_build(
+            &meta,
+            Path::new("/nonexistent-stage"),
+            StagePolicy::Default,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("'parts' must not be empty"), "got: {err}");
     }
 
@@ -6859,7 +7153,7 @@ fi
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
         });
 
         let inner_src = expected_src(&e2e.src);
@@ -6932,7 +7226,7 @@ fi
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
         });
 
         let inner_src = expected_src(&e2e.src);
@@ -6992,7 +7286,7 @@ fi
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
         });
 
         let inner_src = expected_src(&e2e.src);
@@ -7073,7 +7367,7 @@ esac
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
         });
 
         // configure ran inside $SRC with --prefix=/usr and the args, and its
@@ -7158,7 +7452,7 @@ esac
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
         });
 
         // configure ran with --prefix=/usr and the args, in order, and its
@@ -7236,7 +7530,7 @@ esac
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
         });
 
         let inner_src = expected_src(&e2e.src);
@@ -7292,7 +7586,7 @@ mkdir -p "$STAGE/bin" && : > "$STAGE/bin/app"
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
         });
 
         let inner_src = expected_src(&e2e.src);
@@ -7357,7 +7651,7 @@ fi
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None).unwrap();
+            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
         });
 
         let log = e2e.invocations();
@@ -7451,6 +7745,7 @@ fi
             output_dir.path(),
             "amd64",
             StagePolicy::Default,
+            None,
             None,
         )
         .unwrap();
@@ -7774,6 +8069,8 @@ mod wrapper_tests {
             toolchain: None,
             confined: None,
             apps,
+            deps: None,
+            floating: false,
             definition_dir: None,
         }
     }

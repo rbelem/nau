@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use shuttle::cache::PackageCache;
-use shuttle::cli::{CacheCommand, Cli, Command, IndexCommand, PodCommand, RuntimeCommand};
+use shuttle::cli::{
+    CacheCommand, Cli, Command, DepsCommand, IndexCommand, PodCommand, RuntimeCommand,
+};
 use shuttle::image::ImageDeclaration;
 use shuttle::index::{IndexEntry, PackageIndex, StoreRef};
 use shuttle::lock::{LockFile, SourceLockEntry};
@@ -103,18 +105,31 @@ fn main() -> miette::Result<()> {
             r
         }
 
-        Command::Deps {
-            package,
-            recursive,
-            tree,
-            flat,
-            json,
-        } => {
-            shuttle::output::set_mode(json);
-            let r = cmd_deps(package, recursive, tree, flat, json);
-            shuttle::output::flush_json("deps");
-            r
-        }
+        Command::Deps(sub) => match sub {
+            DepsCommand::Show {
+                package,
+                recursive,
+                tree,
+                flat,
+                json,
+            } => {
+                shuttle::output::set_mode(json);
+                let r = cmd_deps(package, recursive, tree, flat, json);
+                shuttle::output::flush_json("deps");
+                r
+            }
+            DepsCommand::Fetch {
+                name,
+                root,
+                latest,
+                json,
+            } => {
+                shuttle::output::set_mode(json);
+                let r = cmd_deps_fetch(name.as_deref(), root.as_deref(), latest);
+                shuttle::output::flush_json("deps");
+                r
+            }
+        },
 
         Command::Search { query, json } => {
             shuttle::output::set_mode(json);
@@ -780,6 +795,8 @@ fn build_dep_archs(
             a,
             shuttle::snap::StagePolicy::Default,
             None,
+            // Plain recursive builds have no pod dependency closure.
+            None,
         ) {
             Ok(result) => {
                 if !json {
@@ -863,7 +880,8 @@ fn build_one_arch(
         }
     }
 
-    let result = shuttle::snap::build_snap(meta, stage_dir, output_dir, arch, stage_policy, None)?;
+    let result =
+        shuttle::snap::build_snap(meta, stage_dir, output_dir, arch, stage_policy, None, None)?;
     if !json {
         shuttle::output::ok(&result.snap_filename);
     } else {
@@ -1007,6 +1025,39 @@ fn report_order_human(meta: &shuttle::snap::SnapMeta) {
 }
 
 // ── Deps command ──
+
+/// `shuttle deps fetch` (ADR-0017, issue #13): force a dependency-closure
+/// fetch for the pod's interpreted packages. Reports each fetched closure
+/// (and whether content moved) plus locked packages left untouched.
+fn cmd_deps_fetch(pod: Option<&str>, root: Option<&str>, latest: bool) -> miette::Result<()> {
+    let pod_name = pod.unwrap_or(shuttle::pod::DEFAULT_POD);
+    let root = shuttle::pod::pod_root(root);
+    let report = shuttle::pod::fetch_pod_deps(&root, pod_name, latest)?;
+    for entry in &report.fetched {
+        if entry.changed {
+            shuttle::output::ok(format!(
+                "fetched dependency closure for '{}' ({:.12}…)",
+                entry.name, entry.deps_hash
+            ));
+        } else {
+            shuttle::output::info(format!(
+                "dependency closure for '{}' re-fetched, content unchanged ({:.12}…)",
+                entry.name, entry.deps_hash
+            ));
+        }
+    }
+    for name in &report.skipped {
+        shuttle::output::info(format!(
+            "skipped '{name}': locked and its closure pin is cached (use --latest to re-resolve)"
+        ));
+    }
+    if report.fetched.is_empty() && report.skipped.is_empty() {
+        shuttle::output::info(format!(
+            "pod '{pod_name}' declares no dependency closures (deps = {{ npm = ... }} / pip)"
+        ));
+    }
+    Ok(())
+}
 
 fn cmd_deps(
     package: String,
@@ -1823,10 +1874,13 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             let width = entries.iter().map(|e| e.spec.len()).max().unwrap_or(0);
             for entry in &entries {
                 let version = entry.version.as_deref().unwrap_or("(unresolved)");
+                // Float marking (ADR-0017): floating packages say so.
+                let tag = if entry.floating { " (float)" } else { "" };
                 shuttle::output::status(format!(
-                    "{:<width$}  {}",
+                    "{:<width$}  {}{}",
                     entry.spec,
                     version,
+                    tag,
                     width = width
                 ));
             }

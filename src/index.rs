@@ -378,6 +378,8 @@ impl PackageIndex {
             inputs: None,
             confined: None,
             apps,
+            deps: None,
+            floating: false,
             definition_dir: None,
         })
     }

@@ -3,6 +3,7 @@ pub mod assert;
 pub mod cache;
 pub mod cli;
 pub mod confine;
+pub mod dep_fetch;
 pub mod deps;
 pub mod desktop;
 pub mod doctor;

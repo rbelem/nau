@@ -407,9 +407,9 @@ fn lua_type_name(value: &mlua::Value) -> &'static str {
 
 /// The fields an overlay entry may patch on a resolved package
 /// declaration (issue #6: version pins, build tweaks; ticket #11:
-/// confinement override). Anything else is rejected with the allowed set
-/// named.
-const OVERLAY_FIELDS: &[&str] = &["version", "build", "confinement"];
+/// confinement override; ticket #13: float mode). Anything else is
+/// rejected with the allowed set named.
+const OVERLAY_FIELDS: &[&str] = &["version", "build", "confinement", "floating"];
 
 /// Apply one overlay entry (a plain-data patch table) onto a resolved
 /// [`SnapMeta`]. This is the top layer of the pod resolution chain
@@ -442,18 +442,12 @@ fn apply_overlay(
                 };
                 meta.build = Some(s.to_string());
             }
-            "confinement" => {
-                if value.as_str() == Some("unconfined") {
-                    // ADR-0016 escape hatch: the pod explicitly lifts a
-                    // confined package to unconfined for this pod only.
-                    meta.confined = None;
-                } else {
-                    let json = value.clone();
-                    meta.confined = Some(
-                        confinement_from_overlay(&json)
-                            .map_err(|e| miette::miette!("overlay confinement is invalid: {e}"))?,
-                    );
-                }
+            "confinement" => apply_confinement_overlay(meta, value)?,
+            "floating" => {
+                let Some(b) = value.as_bool() else {
+                    miette::bail!("overlay field '{key}' must be a boolean, got {value}");
+                };
+                meta.floating = b;
             }
             other => miette::bail!(
                 "unsupported overlay field '{other}' (allowed: {})",
@@ -461,6 +455,24 @@ fn apply_overlay(
             ),
         }
     }
+    Ok(())
+}
+
+/// Apply one overlay `confinement` value: the escape-hatch string
+/// "unconfined" lifts confinement for this pod, a grants table replaces it.
+fn apply_confinement_overlay(
+    meta: &mut crate::snap::SnapMeta,
+    value: &serde_json::Value,
+) -> miette::Result<()> {
+    if value.as_str() == Some("unconfined") {
+        meta.confined = None;
+        return Ok(());
+    }
+    let json = value.clone();
+    meta.confined = Some(
+        confinement_from_overlay(&json)
+            .map_err(|e| miette::miette!("overlay confinement is invalid: {e}"))?,
+    );
     Ok(())
 }
 
@@ -549,31 +561,51 @@ fn validate_overlays(root: &Path, decl: &PodDeclaration, pod_name: &str) -> miet
                  (issue #8); overlaying a nonexistent package is an error",
             );
         }
-        let Some(obj) = patch.as_object() else {
-            miette::bail!("overlay.{pkg} must be a table of fields");
-        };
-        for (key, value) in obj {
-            if !OVERLAY_FIELDS.contains(&key.as_str()) {
-                miette::bail!(
-                    "overlay.{pkg}.{key}: unsupported overlay field '{key}' (allowed: {})",
-                    OVERLAY_FIELDS.join(", ")
-                );
-            }
-            // `confinement` is either the escape-hatch string
-            // "unconfined" or a grants table; the other fields are strings.
-            if key == "confinement" {
-                if value.as_str() == Some("unconfined") {
-                    continue;
-                }
-                if value.as_object().is_none() {
-                    miette::bail!(
-                        "'overlay.{pkg}.confinement' must be a grants table or the string \"unconfined\", got {value}"
-                    );
-                }
-            } else if value.as_str().is_none() {
-                miette::bail!("'overlay.{pkg}.{key}' must be a string, got {value}");
-            }
+        validate_overlay_entry(pkg, patch)?;
+    }
+    Ok(())
+}
+
+/// Validate one overlay entry's fields against the whitelist.
+fn validate_overlay_entry(pkg: &str, patch: &serde_json::Value) -> miette::Result<()> {
+    let Some(obj) = patch.as_object() else {
+        miette::bail!("overlay.{pkg} must be a table of fields");
+    };
+    for (key, value) in obj {
+        if !OVERLAY_FIELDS.contains(&key.as_str()) {
+            miette::bail!(
+                "overlay.{pkg}.{key}: unsupported overlay field '{key}' (allowed: {})",
+                OVERLAY_FIELDS.join(", ")
+            );
         }
+        validate_overlay_value(pkg, key, value)?;
+    }
+    Ok(())
+}
+
+/// Type-check one overlay field value: `confinement` is either the
+/// escape-hatch string "unconfined" or a grants table; `floating` is a
+/// boolean (ADR-0017); the other fields are strings.
+fn validate_overlay_value(pkg: &str, key: &str, value: &serde_json::Value) -> miette::Result<()> {
+    if key == "confinement" {
+        if value.as_str() == Some("unconfined") {
+            return Ok(());
+        }
+        if value.as_object().is_none() {
+            miette::bail!(
+                "'overlay.{pkg}.confinement' must be a grants table or the string \"unconfined\", got {value}"
+            );
+        }
+        return Ok(());
+    }
+    if key == "floating" {
+        if value.as_bool().is_none() {
+            miette::bail!("'overlay.{pkg}.floating' must be a boolean, got {value}");
+        }
+        return Ok(());
+    }
+    if value.as_str().is_none() {
+        miette::bail!("'overlay.{pkg}.{key}' must be a string, got {value}");
     }
     Ok(())
 }
@@ -724,6 +756,9 @@ pub struct PodListEntry {
     pub version: Option<String>,
     /// True when the version came from the lockfile pin.
     pub pinned: bool,
+    /// Float mode (ADR-0017, issue #13): the package opts in via its
+    /// declaration or a pod overlay; sync re-resolves its closure.
+    pub floating: bool,
 }
 
 /// Load a pod declaration; a missing `pod.lua` yields the empty default
@@ -949,11 +984,15 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
 
     let lock_path = pod_lock_path(root, pod_name);
     let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    // Re-adding keeps an existing deps pin (ADR-0017): the closure content
+    // did not change — the next sync re-verifies it as usual.
+    let existing_deps = lock.packages.get(&spec.name).and_then(|e| e.deps.clone());
     lock.packages.insert(
         spec.name.clone(),
         PodPackageLockEntry {
             version: meta.version.clone(),
             constraint: spec.constraint.clone(),
+            deps: existing_deps,
         },
     );
     lock.save(&lock_path)?;
@@ -1236,11 +1275,16 @@ pub fn update_pod(
                 to,
                 constraint,
             } => {
+                // A version move never invalidates the deps pin
+                // (ADR-0017): the closure is pinned by its own content
+                // hash; sync re-verifies it against the new source.
+                let deps = lock.packages.get(&name).and_then(|e| e.deps.clone());
                 lock.packages.insert(
                     name.clone(),
                     PodPackageLockEntry {
                         version: to.clone(),
                         constraint,
+                        deps,
                     },
                 );
                 dirty = true;
@@ -1450,6 +1494,11 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
     // recorded only after the build succeeded, applied only after the
     // install succeeded — a failed reconcile leaves the pin in place.
     let mut repins: Vec<(String, PodPackageLockEntry)> = Vec::new();
+    // Dependency-closure pins moved by this reconcile (ADR-0017): a
+    // float whose closure changed at constant version. Version repins
+    // above carry their deps pin inside the entry; this catches the
+    // version-stayed case.
+    let mut deps_pins: Vec<(String, crate::lock::PackageDepsLock)> = Vec::new();
     let lock_path = pod_lock_path(root, pod_name);
     let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
 
@@ -1530,18 +1579,33 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
             }
             push_meta_desktop_claims(&mut desktop_claims, &meta, layer);
             push_meta_binary_claims(&mut binary_claims, &meta, layer);
-            if lock.packages.get(&spec.name).map(|e| e.version.as_str())
-                != Some(meta.version.as_str())
-            {
+            // Dependency closure first (ADR-0017 Decision 7): fetch or
+            // verify BEFORE the sandboxed offline build consumes it.
+            let deps_pin = ensure_own_deps(&store, &lock, &meta, &spec.name).map_err(|e| {
+                miette::miette!("cannot fetch dependency closure for '{}': {e}", spec.name)
+            })?;
+            let version_changed = lock.packages.get(&spec.name).map(|e| e.version.as_str())
+                != Some(meta.version.as_str());
+            if version_changed {
+                // A repin carries the existing deps pin forward
+                // (ADR-0017): content-addressed, re-verified by sync.
+                let deps = deps_pin
+                    .clone()
+                    .or_else(|| lock.packages.get(&spec.name).and_then(|e| e.deps.clone()));
                 repins.push((
                     spec.name.clone(),
                     PodPackageLockEntry {
                         version: meta.version.clone(),
                         constraint: spec.constraint.clone(),
+                        deps,
                     },
                 ));
+            } else if let Some(pin) = &deps_pin {
+                // Same version, moved closure (float): the repin path
+                // above doesn't fire — record the pin separately.
+                deps_pins.push((spec.name.clone(), pin.clone()));
             }
-            pending.push(build_pending_snap(&store, &meta, layer)?);
+            pending.push(build_pending_snap(&store, &meta, layer, deps_pin.as_ref())?);
         }
 
         // Loaded packages (issue #8): a loaded pod's package is rebuilt
@@ -1589,6 +1653,7 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
                 &store,
                 &meta,
                 crate::farm::ClaimLayer::Loaded,
+                None,
             )?);
         }
     } else if !decl.packages.is_empty() || !loaded_versions.is_empty() {
@@ -1610,14 +1675,29 @@ fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
         }
     }
 
-    // Overlay-driven repins (issue #6): applied only after the installs
-    // succeeded, so a failed reconcile leaves the pin untouched. Loaded
-    // packages are NOT repinned in this pod's lockfile: a loaded pod's
-    // versions live in the loaded pod, and this pod follows them live
-    // (issue #8 — read-only consumption, no cross-pod pins).
-    if !repins.is_empty() {
+    // Overlay-driven repins (issue #6) and moved dependency-closure pins
+    // (ADR-0017): applied only after the installs succeeded, so a failed
+    // reconcile leaves the pin untouched. Loaded packages are NOT
+    // repinned in this pod's lockfile: a loaded pod's versions live in
+    // the loaded pod, and this pod follows them live (issue #8 —
+    // read-only consumption, no cross-pod pins).
+    if !repins.is_empty() || !deps_pins.is_empty() {
         for (name, entry) in repins {
             lock.packages.insert(name, entry);
+        }
+        for (name, deps) in deps_pins {
+            if let Some(entry) = lock.packages.get_mut(&name) {
+                entry.deps = Some(deps);
+            } else {
+                lock.packages.insert(
+                    name,
+                    PodPackageLockEntry {
+                        version: String::new(),
+                        constraint: None,
+                        deps: Some(deps),
+                    },
+                );
+            }
         }
         lock.save(&lock_path)?;
     }
@@ -1935,16 +2015,36 @@ const POD_BUILD_EPOCH: &str = "946684800";
 /// store install at the given composition layer. Local builds carry
 /// revision 0; content identity is the payload's sha3-384, which is
 /// what the no-op detection compares.
+///
+/// A package with a `deps` declaration builds against its verified,
+/// store-mounted dependency closure (ADR-0017): the pin must exist —
+/// own packages fetch it in [`ensure_own_deps`] right before this call;
+/// a loaded package has no pin here and fails with a clear error (deps
+/// resolve in the pod that declares the package).
 fn build_pending_snap(
     store: &crate::runtime::RuntimeStore,
     meta: &crate::snap::SnapMeta,
     layer: crate::farm::ClaimLayer,
+    deps_pin: Option<&crate::lock::PackageDepsLock>,
 ) -> miette::Result<crate::runtime::PendingSnap> {
     // mksquashfs 4.4+ reads this natively; only set it when the user
     // hasn't chosen an epoch of their own.
     if std::env::var_os("SOURCE_DATE_EPOCH").is_none() {
         std::env::set_var("SOURCE_DATE_EPOCH", POD_BUILD_EPOCH);
     }
+    let deps_dir = match (meta.deps.as_ref(), deps_pin) {
+        (Some(_), Some(pin)) => Some(crate::dep_fetch::materialize_deps_entry(
+            store,
+            &pin.deps_hash,
+        )?),
+        (Some(_), None) => miette::bail!(
+            "package '{}' declares deps but no closure pin exists for it here — \
+             dependency closures resolve in the pod that declares the package \
+             (`shuttle deps fetch`)",
+            meta.name
+        ),
+        (None, _) => None,
+    };
     let stage = tempfile::tempdir().map_err(|e| miette::miette!("temp stage dir: {e}"))?;
     let downloads = store.downloads_dir();
     std::fs::create_dir_all(&downloads)
@@ -1958,10 +2058,30 @@ fn build_pending_snap(
         // Issue #9: a pod build supplies its store so build-time interpreter
         // wrappers can bake the script's content-addressed store path.
         Some(store),
+        deps_dir.as_ref().map(|d| d.path()),
     )?;
     let payload = downloads.join(&result.snap_filename);
     let sha3_384 = crate::store::sha3_384_file(&payload)?;
     Ok(build_pending_snap_at(meta, &payload, sha3_384, layer))
+}
+
+/// Fetch (or verify the cached) dependency closure for an own pod package
+/// BEFORE the sandboxed build consumes it (ADR-0017 Decision 7: add/sync
+/// auto-fetch). Returns the pin to merge into the lockfile; `None` when
+/// the package declares no deps.
+fn ensure_own_deps(
+    store: &crate::runtime::RuntimeStore,
+    lock: &LockFile,
+    meta: &crate::snap::SnapMeta,
+    pkg_name: &str,
+) -> miette::Result<Option<crate::lock::PackageDepsLock>> {
+    if meta.deps.is_none() {
+        return Ok(None);
+    }
+    let prev = lock.packages.get(pkg_name).and_then(|e| e.deps.clone());
+    crate::dep_fetch::ensure_pod_deps(store, meta, prev.as_ref(), meta.floating)
+        .map(Some)
+        .map_err(|e| miette::miette!("package '{pkg_name}': {e}"))
 }
 
 /// Shape a built, content-hashed payload as a [`PendingSnap`] at the
@@ -2012,15 +2132,121 @@ pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListE
                 Err(_) => (None, false),
             },
         };
+        // Float marking (ADR-0017): the overlay wins, else the
+        // declaration itself. Resolution failure is not a float.
+        let floating = match decl
+            .overlay
+            .get(&spec.name)
+            .and_then(|p| p.get("floating"))
+            .and_then(|v| v.as_bool())
+        {
+            Some(b) => b,
+            None => crate::deps::load_meta(&spec.name)
+                .map(|m| m.floating)
+                .unwrap_or(false),
+        };
         entries.push(PodListEntry {
             spec: spec_str.clone(),
             name: spec.name,
             constraint: spec.constraint,
             version,
             pinned,
+            floating,
         });
     }
     Ok(entries)
+}
+
+// ── Dependency fetch (ADR-0017, issue #13) ──
+
+/// One fetched (or verified) dependency closure in a
+/// [`DepsFetchReport`].
+#[derive(Debug, Serialize)]
+pub struct DepsFetchedEntry {
+    pub name: String,
+    pub deps_hash: String,
+    /// True when this fetch moved the closure content (float mode or a
+    /// first fetch).
+    pub changed: bool,
+}
+
+/// Report for `shuttle deps fetch`.
+#[derive(Debug, Serialize)]
+pub struct DepsFetchReport {
+    pub pod: String,
+    /// Packages whose closure was (re-)fetched and re-pinned.
+    pub fetched: Vec<DepsFetchedEntry>,
+    /// Locked packages whose pin is cached — untouched (no re-fetch).
+    pub skipped: Vec<String>,
+}
+
+/// Explicit dependency-closure fetch for every declared package with a
+/// `deps` section (ADR-0017 Decision 7): the float path and the "always
+/// latest" knob. `latest` re-resolves even locked packages. Writes the
+/// moved pins to the pod lockfile; no build, no install.
+pub fn fetch_pod_deps(
+    root: &Path,
+    pod_name: &str,
+    latest: bool,
+) -> miette::Result<DepsFetchReport> {
+    validate_pod_name(pod_name)?;
+    let decl = load_declaration(root, pod_name)?;
+    // Same validation-first discipline as sync: a bad declaration fails
+    // with zero writes.
+    validate_loads(root, pod_name, &decl)?;
+    validate_overlays(root, &decl, pod_name)?;
+    let dir = pod_dir(root, pod_name);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
+    let store = pod_store(&dir);
+    let lock_path = pod_lock_path(root, pod_name);
+    let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+
+    let mut report = DepsFetchReport {
+        pod: pod_name.to_string(),
+        fetched: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for spec_str in &decl.packages {
+        let spec = parse_pod_package(spec_str)?;
+        let mut meta = crate::deps::load_meta(&spec.name)?;
+        if let Some(patch) = decl.overlay.get(&spec.name) {
+            apply_overlay(&mut meta, patch)?;
+        }
+        let Some(_) = meta.deps.as_ref() else {
+            continue;
+        };
+        let floating = meta.floating || latest;
+        let prev = lock.packages.get(&spec.name).and_then(|e| e.deps.clone());
+        // Locked + cached = the no-refetch guarantee; say so and move on.
+        if !floating {
+            if let Some(p) = &prev {
+                if store.blob_path(&p.deps_hash).exists() {
+                    report.skipped.push(spec.name.clone());
+                    continue;
+                }
+            }
+        }
+        let old_hash = prev.as_ref().map(|p| p.deps_hash.clone());
+        let pin = crate::dep_fetch::ensure_pod_deps(&store, &meta, prev.as_ref(), floating)
+            .map_err(|e| miette::miette!("package '{}': {e}", spec.name))?;
+        let changed = old_hash.as_deref() != Some(pin.deps_hash.as_str());
+        lock.packages
+            .entry(spec.name.clone())
+            .or_insert_with(|| PodPackageLockEntry {
+                version: meta.version.clone(),
+                constraint: spec.constraint.clone(),
+                deps: None,
+            })
+            .deps = Some(pin.clone());
+        report.fetched.push(DepsFetchedEntry {
+            name: spec.name.clone(),
+            deps_hash: pin.deps_hash,
+            changed,
+        });
+    }
+    lock.save(&lock_path)?;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -2149,6 +2375,8 @@ pod {
             inputs: None,
             confined: None,
             apps: HashMap::new(),
+            deps: None,
+            floating: false,
             definition_dir: None,
         }
     }

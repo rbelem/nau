@@ -493,6 +493,8 @@ mod tests {
             inputs: None,
             confined: None,
             apps: std::collections::HashMap::new(),
+            deps: None,
+            floating: false,
             definition_dir: None,
         }
     }
@@ -528,6 +530,8 @@ mod tests {
             inputs: None,
             confined: None,
             apps: std::collections::HashMap::new(),
+            deps: None,
+            floating: false,
             definition_dir: None,
         }
     }

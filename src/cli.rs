@@ -143,27 +143,10 @@ pub enum Command {
     #[command(subcommand)]
     Index(IndexCommand),
 
-    /// Show dependency tree for a package
-    Deps {
-        /// Package name or path to shuttle.lua file
-        package: String,
-
-        /// Resolve all transitive dependencies (recursive)
-        #[arg(long)]
-        recursive: bool,
-
-        /// Display as tree (requires --recursive)
-        #[arg(long)]
-        tree: bool,
-
-        /// Print flat, ordered list (build order)
-        #[arg(long)]
-        flat: bool,
-
-        /// Output structured JSON instead of human-friendly colored output.
-        #[arg(long)]
-        json: bool,
-    },
+    /// Show dependency tree for a package, or fetch dependency closures
+    /// for interpreted packages (ADR-0017, issue #13).
+    #[command(subcommand)]
+    Deps(DepsCommand),
 
     /// Search available packages by name or keyword
     Search {
@@ -431,6 +414,55 @@ pub enum Command {
     /// part of the public CLI.
     #[command(name = "__check-worker", hide = true)]
     CheckWorker,
+}
+
+/// Subcommands for `shuttle deps`.
+#[derive(clap::Subcommand)]
+pub enum DepsCommand {
+    /// Show dependency tree for a package
+    Show {
+        /// Package name or path to shuttle.lua file
+        package: String,
+
+        /// Resolve all transitive dependencies (recursive)
+        #[arg(long)]
+        recursive: bool,
+
+        /// Display as tree (requires --recursive)
+        #[arg(long)]
+        tree: bool,
+
+        /// Print flat, ordered list (build order)
+        #[arg(long)]
+        flat: bool,
+
+        /// Output structured JSON instead of human-friendly colored output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Fetch dependency closures for a pod's interpreted packages
+    /// (ADR-0017, issue #13): resolve + download npm/pip closures into the
+    /// pod store and record their pins in the pod lockfile. `pod add`/
+    /// `pod sync` auto-fetch; this command forces a re-fetch without a
+    /// build. `--latest` re-resolves even locked packages.
+    Fetch {
+        /// Pod to operate on (default: `default`).
+        #[arg(long, value_name = "POD")]
+        name: Option<String>,
+
+        /// Pod state root (default: $XDG_DATA_HOME/shuttle/pods).
+        #[arg(long)]
+        root: Option<String>,
+
+        /// Re-resolve latest closures even for locked packages.
+        #[arg(long)]
+        latest: bool,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subcommands for `shuttle cache`.
@@ -1049,11 +1081,24 @@ mod tests {
 
     #[test]
     fn test_deps_json_flag() {
-        let args = ["shuttle", "deps", "glibc", "--json"];
+        let args = ["shuttle", "deps", "show", "glibc", "--json"];
         let cmd = Cli::try_parse_from(args).unwrap().command;
         match cmd {
-            Command::Deps { json, .. } => assert!(json),
-            _ => panic!("expected Deps"),
+            Command::Deps(DepsCommand::Show { json, .. }) => assert!(json),
+            _ => panic!("expected Deps::Show"),
+        }
+    }
+
+    #[test]
+    fn test_deps_fetch_parses() {
+        let args = ["shuttle", "deps", "fetch", "--name", "work", "--latest"];
+        let cmd = Cli::try_parse_from(args).unwrap().command;
+        match cmd {
+            Command::Deps(DepsCommand::Fetch { name, latest, .. }) => {
+                assert_eq!(name.as_deref(), Some("work"));
+                assert!(latest);
+            }
+            _ => panic!("expected Deps::Fetch"),
         }
     }
 

@@ -401,6 +401,48 @@ function snap(opts)
         end
     end
 
+    -- deps: dependency-closure resolvers (ADR-0017, issue #13).
+    -- `deps = { npm = { lock = "package-lock.json" } }` or
+    -- `deps = { pip = { lock = "requirements.lock", index = "https://..." } }`.
+    -- Coexists with `source` (hybrid) or stands alone with it; the
+    -- lockfile resolves from the source tree, so `source` is required.
+    if opts.deps ~= nil then
+        if type(opts.deps) ~= "table" then
+            error("snap(): 'deps' must be a table, got " .. type(opts.deps), 2)
+        end
+        local resolvers = {}
+        for eco, resolver in pairs(opts.deps) do
+            if eco ~= "npm" and eco ~= "pip" then
+                error(string.format(
+                    "snap(): deps: unknown resolver '%s' (supported: npm, pip)", eco), 2)
+            end
+            if type(resolver) ~= "table" then
+                error(string.format("snap(): deps['%s'] must be a table, got %s", eco, type(resolver)), 2)
+            end
+            if type(resolver.lock) ~= "string" or #resolver.lock == 0 then
+                error(string.format(
+                    "snap(): deps.%s: field 'lock' is required (lockfile path relative to the source root)", eco), 2)
+            end
+            if resolver.index ~= nil and type(resolver.index) ~= "string" then
+                error(string.format("snap(): deps.%s.index must be a string", eco), 2)
+            end
+            table.insert(resolvers, eco)
+        end
+        if #resolvers == 0 then
+            error("snap(): deps must name at least one resolver: npm or pip", 2)
+        end
+        if opts.source == nil then
+            error("snap(): 'deps' requires 'source' — the lockfile resolves from the package source tree", 2)
+        end
+    end
+
+    -- floating: opt-in float mode (ADR-0017, issue #13). Locked (default,
+    -- false) never re-fetches a cached closure; floating re-resolves on
+    -- every sync, records the new hash, and stays hash-verified.
+    if opts.floating ~= nil and type(opts.floating) ~= "boolean" then
+        error("snap(): 'floating' must be a boolean, got " .. type(opts.floating), 2)
+    end
+
     -- apps: table mapping string -> app definition
     check_table(opts.apps, "snap", "apps")
     if opts.apps ~= nil then

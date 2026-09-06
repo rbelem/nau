@@ -81,6 +81,31 @@ pub struct PodPackageLockEntry {
     /// Version constraint from the declaration (`name@constraint`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraint: Option<String>,
+
+    /// Dependency-closure pin (ADR-0017, issue #13): the content hash of
+    /// the fetched interpreted-package dependency closure (npm/pip) and
+    /// the date it was last (re-)fetched. Absent for packages without a
+    /// `deps` declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deps: Option<PackageDepsLock>,
+}
+
+/// The dependency-closure pin for one pod package (ADR-0017, issue #13).
+///
+/// `deps_hash` is the SHA-256 of the canonical archive of the materialized
+/// dependency tree (sorted paths + contents — the NAR-style digest). The
+/// pod store holds the closure as one content-addressed blob named by this
+/// hash; the sandbox build verifies the blob against it before mounting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageDepsLock {
+    /// SHA-256 (hex) of the canonical closure archive = the store blob name.
+    pub deps_hash: String,
+
+    /// Date of the last content-changing fetch (`YYYY-MM-DD`). Float-mode
+    /// bookkeeping: kept stable across fetches that resolve to the same
+    /// content, updated when a floating re-fetch moves the closure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
 }
 
 /// A single snap entry in the lockfile.

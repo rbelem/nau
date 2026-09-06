@@ -14,7 +14,9 @@
     "bubblewrap@latest",
     "gnumake@latest",
     "flex@latest",
-    "patchelf@latest"
+    "patchelf@latest",
+    "nodejs@latest",
+    "python3@latest"
   ],
   "shell": {
     "init_hook": [
