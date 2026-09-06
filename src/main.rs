@@ -1892,9 +1892,37 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             print_pod_update_report(&report);
             Ok(())
         }
+        PodCommand::Rebuild {
+            package,
+            latest,
+            root,
+        } => cmd_pod_rebuild(pod_name, &package, latest, root),
         PodCommand::Rollback { generation, root } => cmd_pod_rollback(pod_name, generation, root),
         PodCommand::Gc { prune, root } => cmd_pod_gc(pod_name, prune, root),
     }
+}
+
+/// `shuttle pod rebuild <pkg>` (issue #15): rebuild one declared
+/// package at its pins, reusing the cached dependency closure (or
+/// deliberately moving it with `--latest`).
+fn cmd_pod_rebuild(
+    pod_name: &str,
+    package: &str,
+    latest: bool,
+    root: Option<String>,
+) -> miette::Result<()> {
+    let root = shuttle::pod::pod_root(root.as_deref());
+    let report = shuttle::pod::rebuild_package(&root, pod_name, package, latest)?;
+    let mut line = format!(
+        "rebuilt '{}' ({}) in pod '{}'",
+        report.name, report.version, report.pod
+    );
+    if let Some(n) = report.generation {
+        line.push_str(&format!(" (generation {n})"));
+    }
+    shuttle::output::ok(line);
+    print_report(&report);
+    Ok(())
 }
 
 /// `shuttle run <app>`: run a confined app from a pod (ADR-0016, ticket

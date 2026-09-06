@@ -734,6 +734,23 @@ pub struct PodAddReport {
     pub pod_dir: PathBuf,
 }
 
+/// Report for a successful `pod rebuild` (issue #15).
+#[derive(Debug, Serialize)]
+pub struct PodRebuildReport {
+    pub pod: String,
+    pub name: String,
+    pub version: String,
+    /// True when the rebuild deliberately moved the dependency-closure
+    /// pin (`--latest`): the fresh closure hash differed from the
+    /// previous pin's, or the package had no deps pin yet (ADR-0017
+    /// Decision 5).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deps_pin_moved: bool,
+    /// The generation the rebuild produced (see [`PodAddReport`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
 /// Report for a successful `pod remove`.
 #[derive(Debug, Serialize)]
 pub struct PodRemoveReport {
@@ -946,7 +963,8 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
         let parsed = parse_pod_package(existing)?;
         if parsed.name == spec.name {
             miette::bail!(
-                "package '{}' is already in pod '{}' (remove it first to change its pin)",
+                "package '{}' is already in pod '{}' (remove it first to change its \
+                 constraint; `shuttle pod sync` rebuilds it at its pins)",
                 spec.name,
                 pod_name
             );
@@ -1064,6 +1082,71 @@ pub fn remove_package(
     Ok(PodRemoveReport {
         pod: pod_name.to_string(),
         name: spec.name,
+        generation: sync.generation,
+    })
+}
+
+/// Rebuild ONE declared package at its pins (issue #15): the version
+/// pin and the dependency-closure pin stay put — the cached closure is
+/// reused with zero fetches (unlike the remove+add workaround, which
+/// drops the deps pin and re-fetches the whole closure) — and the sync
+/// hold check is bypassed for this one package, so a package HELD at
+/// its pin is rebuilt at ITS version, not the collection candidate.
+/// `--latest` re-resolves the dependency closure instead (`deps fetch
+/// --latest` semantics), deliberately moving the pin (ADR-0017
+/// Decision 5).
+///
+/// Zero writes when the package is not declared in the pod.
+pub fn rebuild_package(
+    root: &Path,
+    pod_name: &str,
+    spec_str: &str,
+    latest: bool,
+) -> miette::Result<PodRebuildReport> {
+    validate_pod_name(pod_name)?;
+    let spec = parse_pod_package(spec_str)?;
+    let decl = load_declaration(root, pod_name)?;
+    let declared = decl
+        .packages
+        .iter()
+        .any(|existing| parse_pod_package(existing).is_ok_and(|p| p.name == spec.name));
+    if !declared {
+        miette::bail!("package '{}' is not in pod '{}'", spec.name, pod_name);
+    }
+
+    let (sync, deps_pin_moved) = reconcile_pod_scoped(root, pod_name, Some(&spec.name), latest)?;
+
+    // The version the package now executes: its (kept or freshly
+    // repinned) lockfile pin, else a live resolution. The deps pin
+    // beside it names the moved closure (ADR-0017 Decision 5: the
+    // lockfile IS the pin record).
+    let lock = LockFile::load(&pod_lock_path(root, pod_name))?.unwrap_or_else(LockFile::empty);
+    let entry = lock.packages.get(&spec.name);
+    let version = entry
+        .map(|e| e.version.as_str())
+        .filter(|v| !v.is_empty())
+        .map_or_else(
+            || {
+                crate::deps::load_meta(&spec.name)
+                    .map(|m| m.version)
+                    .unwrap_or_default()
+            },
+            str::to_string,
+        );
+    if deps_pin_moved {
+        if let Some(deps) = entry.and_then(|e| e.deps.as_ref()) {
+            crate::output::ok(format!(
+                "moved dependency closure for '{}': {:.12}… (recorded in shuttle.lock)",
+                spec.name, deps.deps_hash
+            ));
+        }
+    }
+
+    Ok(PodRebuildReport {
+        pod: pod_name.to_string(),
+        name: spec.name,
+        version,
+        deps_pin_moved,
         generation: sync.generation,
     })
 }
@@ -1440,307 +1523,648 @@ pub fn pod_store(pod_dir: &Path) -> crate::runtime::RuntimeStore {
 /// `Own`, overlay-patched at `Overlay`, recorded in the generation
 /// manifest so the farm resamples the same order at activation.
 pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
-    reconcile_pod(root, pod_name)
+    reconcile_pod_scoped(root, pod_name, None, false).map(|(report, _)| report)
 }
 
-/// The reconcile proper (see [`sync_pod`]).
-fn reconcile_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
+/// What the scoped reconcile does with one own package before the
+/// build (issue #15).
+enum OwnScope {
+    /// Plain-sync hold: recorded + claims contributed, stores nothing.
+    Held,
+    /// Off-scope rebuild skip: claims contributed, stores nothing.
+    SkipInstalled,
+    /// Build, with the meta possibly pinned back to the version pin.
+    Build,
+}
+
+/// Claims for a package that keeps its installed store content (the
+/// hold path, and the scoped rebuild's off-scope skip, issue #15): the
+/// generation must still present the package's desktop IDs and
+/// binaries, so they are claimed from the INSTALLED package record
+/// rather than from a freshly resolved meta.
+fn hold_style_skip_claims(
+    desktop_claims: &mut Vec<DesktopClaim>,
+    binary_claims: &mut Vec<BinaryClaim>,
+    installed_pkg: &crate::runtime::InstalledPackage,
+) {
+    push_desktop_claims(desktop_claims, installed_pkg, crate::farm::ClaimLayer::Own);
+    push_installed_binary_claims(binary_claims, installed_pkg, crate::farm::ClaimLayer::Own);
+}
+
+/// True when a freshly resolved own package would be HELD at its
+/// lockfile pin (issue #5): the pin disagrees with the collection
+/// candidate AND the active generation already carries the pinned
+/// version — the pin plus the installed content win over collection
+/// drift.
+fn held_at_pin(
+    lock: &LockFile,
+    name: &str,
+    meta_version: &str,
+    active: Option<&crate::runtime::Generation>,
+) -> bool {
+    let Some(pin) = lock.packages.get(name) else {
+        return false;
+    };
+    pin.version != meta_version
+        && active.is_some_and(|g| {
+            g.packages
+                .get(name)
+                .is_some_and(|p| p.version == pin.version)
+        })
+}
+
+/// Decide what one own package does in a scoped reconcile BEFORE any
+/// build (issue #15): an off-scope package keeps its installed store
+/// content (claims from the installed record, no build — or a normal
+/// build when the generation lacks it, so a generation always contains
+/// everything declared); the SELECTED package of a scoped rebuild
+/// bypasses the hold but keeps its pin, while a plain sync holds.
+/// `scoped` is true when the reconcile targets one package
+/// (`only.is_some()`); `overlay` is true when the package has an
+/// overlay (overlay packages never hold).
+fn scope_own_package(
+    ctx: &ReconcileCtx<'_>,
+    selected: bool,
+    scoped: bool,
+    overlay: bool,
+    meta: &mut crate::snap::SnapMeta,
+    build: &mut ReconcileBuild,
+) -> OwnScope {
+    if !selected {
+        if let Some(installed_pkg) = ctx.active.and_then(|g| g.packages.get(&meta.name)) {
+            hold_style_skip_claims(
+                &mut build.desktop_claims,
+                &mut build.binary_claims,
+                installed_pkg,
+            );
+            return OwnScope::SkipInstalled;
+        }
+        return OwnScope::Build;
+    }
+    if overlay || !held_at_pin(ctx.lock, &meta.name, &meta.version, ctx.active) {
+        return OwnScope::Build;
+    }
+    if !scoped {
+        // Plain sync holds (issue #5): the pin plus the active
+        // generation's content win over collection drift.
+        build.held.push(meta.name.clone());
+        if let Some(installed_pkg) = ctx.active.and_then(|g| g.packages.get(&meta.name)) {
+            hold_style_skip_claims(
+                &mut build.desktop_claims,
+                &mut build.binary_claims,
+                installed_pkg,
+            );
+        }
+        return OwnScope::Held;
+    }
+    // Rebuild bypasses the hold (issue #15) but KEEPS THE PIN: build
+    // at the pinned version, not the collection candidate — never
+    // recorded as held (the deliberate version move is `pod update`'s
+    // job). Pinning the meta to the executing version mirrors the
+    // loaded-packages path.
+    meta.version = ctx.lock.packages[&meta.name].version.clone();
+    OwnScope::Build
+}
+
+/// True when a scoped reconcile deliberately moved a package's
+/// dependency-closure pin (issue #15 `--latest`): only a forced-float
+/// ensure counts, and the pin moved when the fresh closure hash differs
+/// from the pre-existing pin's — or when there was no pin yet.
+fn deps_pin_moved(
+    force_float: bool,
+    prev_entry: Option<&PodPackageLockEntry>,
+    fresh: Option<&crate::lock::PackageDepsLock>,
+) -> bool {
+    force_float
+        && fresh.is_some_and(|new| {
+            prev_entry.is_none_or(|e| {
+                e.deps
+                    .as_ref()
+                    .is_none_or(|old| old.deps_hash != new.deps_hash)
+            })
+        })
+}
+
+/// Record one own package's pin movement after its build succeeded: a
+/// version change repins (carrying the deps pin forward, ADR-0017); a
+/// version kept with a fresh closure pin records the deps pin
+/// separately (float).
+fn record_pin_movement(
+    repins: &mut Vec<(String, PodPackageLockEntry)>,
+    deps_pins: &mut Vec<(String, crate::lock::PackageDepsLock)>,
+    lock: &LockFile,
+    spec: &PodPackageSpec,
+    meta: &crate::snap::SnapMeta,
+    deps_pin: Option<&crate::lock::PackageDepsLock>,
+) {
+    let version_changed =
+        lock.packages.get(&spec.name).map(|e| e.version.as_str()) != Some(meta.version.as_str());
+    if version_changed {
+        // A repin carries the existing deps pin forward (ADR-0017):
+        // content-addressed, re-verified by sync.
+        let deps = deps_pin
+            .cloned()
+            .or_else(|| lock.packages.get(&spec.name).and_then(|e| e.deps.clone()));
+        repins.push((
+            spec.name.clone(),
+            PodPackageLockEntry {
+                version: meta.version.clone(),
+                constraint: spec.constraint.clone(),
+                deps,
+            },
+        ));
+    } else if let Some(pin) = deps_pin {
+        // Same version, moved closure (float): the repin path above
+        // doesn't fire — record the pin separately.
+        deps_pins.push((spec.name.clone(), pin.clone()));
+    }
+}
+
+/// The reconcile proper (see [`sync_pod`]). `only` scopes it to ONE
+/// declared package — the `pod rebuild` core (issue #15): the selected
+/// package rebuilds at its pins, every other installed package keeps
+/// its store content. `float_deps` makes the selected package's
+/// dependency ensure float regardless of its own float mode
+/// (`rebuild --latest`): the closure is re-resolved and its pin moved
+/// deliberately (ADR-0017 Decision 5). Returns the report plus whether
+/// the selected package's deps pin moved.
+fn reconcile_pod_scoped(
+    root: &Path,
+    pod_name: &str,
+    only: Option<&str>,
+    float_deps: bool,
+) -> miette::Result<(PodSyncReport, bool)> {
+    let mut state = prepare_reconcile(root, pod_name)?;
+    let mut build = ReconcileBuild::default();
+    collect_pending(&mut state, only, float_deps, &mut build)?;
+    let installed = install_pending(&mut state, &mut build)?;
+
+    // Overlay-driven repins (issue #6) and moved dependency-closure pins
+    // (ADR-0017): applied only after the installs succeeded, so a failed
+    // reconcile leaves the pin untouched.
+    apply_pin_updates(
+        &mut state.lock,
+        &build.repins,
+        &build.deps_pins,
+        &state.lock_path,
+    )?;
+    // Remove store packages the declaration dropped.
+    let removed = remove_undeclared(&state.store, &state.tools, &build.declared_names)?;
+    // Present whatever is now active. Nothing active → nothing exposed.
+    let (generation, farm) = present_active(&state.store, &state.dir)?;
+
+    Ok((
+        PodSyncReport {
+            pod: pod_name.to_string(),
+            noop: installed.is_empty() && removed.is_empty(),
+            installed,
+            removed,
+            held: build.held,
+            generation,
+            farm,
+        },
+        build.deps_moved,
+    ))
+}
+
+/// Validated inputs + pod state for one scoped reconcile: everything
+/// the build phases need, opened before any store write.
+struct ReconcileState {
+    root: PathBuf,
+    pod_name: String,
+    decl: PodDeclaration,
+    dir: PathBuf,
+    store: crate::runtime::RuntimeStore,
+    tools: crate::runtime::RuntimeTools,
+    active: Option<crate::runtime::Generation>,
+    lock: LockFile,
+    lock_path: PathBuf,
+    loaded_versions: BTreeMap<String, String>,
+    loaded_overlays: BTreeMap<String, serde_json::Value>,
+}
+
+/// Validate a pod declaration for a reconcile BEFORE any mutation
+/// (issue #8/#6): name, loads (existence + cycles), overlays — a bad
+/// declaration fails here with zero writes.
+fn validate_reconcile_inputs(root: &Path, pod_name: &str) -> miette::Result<PodDeclaration> {
     validate_pod_name(pod_name)?;
     let decl = load_declaration(root, pod_name)?;
-    // Loads (existence + cycles) and overlay validation happen FIRST,
-    // before any mutation (issue #8/#6): a bad declaration fails here
-    // with zero writes.
     validate_loads(root, pod_name, &decl)?;
     validate_overlays(root, &decl, pod_name)?;
+    Ok(decl)
+}
+
+/// Prepare one scoped reconcile: validate the declaration, open the
+/// pod's store + lockfile, read the active generation, and fold the
+/// `loads` graph (issue #8). The create_dir_all is the pod state-dir
+/// bootstrap (issue #3).
+fn prepare_reconcile(root: &Path, pod_name: &str) -> miette::Result<ReconcileState> {
+    let decl = validate_reconcile_inputs(root, pod_name)?;
     let dir = pod_dir(root, pod_name);
     std::fs::create_dir_all(&dir)
         .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
     let store = pod_store(&dir);
     let tools = crate::runtime::RuntimeTools::from_host();
     let active = store.active_generation()?;
-
-    // Resolve + build every declared package through the normal build
-    // path. Resolution happens before any store state moves: a
-    // declaration naming an unknown package fails the whole reconcile.
-    // Degraded mode: without the squashfs pair nothing can be built or
-    // unpacked, so the reconcile installs nothing — warn loudly and
-    // keep the declaration half authoritative (removals below still
-    // proceed; they never unpack).
-    //
-    // Layering (issue #6/#8, CONTEXT.md: Overlay): each package resolves
-    // from the shared collection, then through the pod's own pin (the
-    // hold below keeps collection drift from moving the pod silently),
-    // then through the pod's overlay entry — later wins. Loaded pods'
-    // packages resolve beneath the pod's own: the version a loaded pod
-    // currently executes (its active generation — live-following, never
-    // pinned across pods) or, when it has no generation, its declaration
-    // as its own first sync would build it. A loading pod never mutates a
-    // pod it loads: only the loaded pod's generation + declaration are
-    // read.
-    let can_install = tools.unsquashfs.is_some() && crate::runtime::tool_on_path("mksquashfs");
-    let mut pending = Vec::new();
-    let mut held = Vec::new();
-    let mut declared_names = std::collections::BTreeSet::new();
-    // Desktop application-ID claims of the post-state package set
-    // (issue #7): collected in declaration order, resolved for
-    // collisions BEFORE any store write.
-    let mut desktop_claims = Vec::new();
-    // Binary-name claims of the post-state package set (issue #8): the
-    // shared collision classifier over loaded/own/overlay layers, run
-    // BEFORE any store write so a same-precedence clash is a hard error
-    // with zero writes.
-    let mut binary_claims: Vec<BinaryClaim> = Vec::new();
-    // Version pins the reconcile moved (overlay wins over the pin):
-    // recorded only after the build succeeded, applied only after the
-    // install succeeded — a failed reconcile leaves the pin in place.
-    let mut repins: Vec<(String, PodPackageLockEntry)> = Vec::new();
-    // Dependency-closure pins moved by this reconcile (ADR-0017): a
-    // float whose closure changed at constant version. Version repins
-    // above carry their deps pin inside the entry; this catches the
-    // version-stayed case.
-    let mut deps_pins: Vec<(String, crate::lock::PackageDepsLock)> = Vec::new();
-    let lock_path = pod_lock_path(root, pod_name);
-    let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
-
     // Loaded pods, in listed order (issue #8): each contributes its
-    // package versions. The own package set is the name-clash winner, so
-    // a loaded package whose name the pod itself declares never enters
-    // the composition. The loading pod does NOT write the loaded pod.
-    let mut loaded_versions: BTreeMap<String, String> = BTreeMap::new();
-    let mut loaded_overlays: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    {
-        for loaded in &decl.loads {
-            let contribution = loaded_contribution(root, loaded)?;
-            for (name, version) in contribution.packages {
-                loaded_versions
-                    .entry(name)
-                    .or_insert(version.unwrap_or_default());
-            }
-            for (name, patch) in contribution.overlay {
-                loaded_overlays.entry(name).or_insert(patch);
-            }
-        }
-    }
+    // package versions. The own package set is the name-clash winner,
+    // so a loaded package whose name the pod itself declares never
+    // enters the composition. The loading pod does NOT write the
+    // loaded pod.
+    let (loaded_versions, loaded_overlays) = loaded_contributions(root, &decl)?;
+    let lock_path = pod_lock_path(root, pod_name);
+    let lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    Ok(ReconcileState {
+        root: root.to_path_buf(),
+        pod_name: pod_name.to_string(),
+        decl,
+        dir,
+        store,
+        tools,
+        active,
+        lock,
+        lock_path,
+        loaded_versions,
+        loaded_overlays,
+    })
+}
 
+/// Build every package the scope demands (own packages first — the
+/// scoped decisions of issue #15 — then loaded packages, issue #8).
+/// Degraded mode: without the squashfs pair nothing can be built or
+/// unpacked, so the reconcile installs nothing — warn loudly and keep
+/// the declaration half authoritative.
+fn collect_pending(
+    state: &mut ReconcileState,
+    only: Option<&str>,
+    float_deps: bool,
+    build: &mut ReconcileBuild,
+) -> miette::Result<()> {
+    let can_install =
+        state.tools.unsquashfs.is_some() && crate::runtime::tool_on_path("mksquashfs");
     if can_install {
-        // Own packages (in declared order) sit at `Own` (or `Overlay`
-        // when patched) — above anything loaded.
-        for spec_str in &decl.packages {
-            let spec = parse_pod_package(spec_str)?;
-            let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
-                miette::miette!(
-                    "cannot build declared package '{}': {e} (declaration at {})",
-                    spec.name,
-                    pod_lua_path(root, pod_name).display()
-                )
-            })?;
-            let overlay = decl.overlay.get(&spec.name);
-            if let Some(patch) = overlay {
-                apply_overlay(&mut meta, patch).map_err(|e| {
-                    miette::miette!(
-                        "cannot build declared package '{}' with its overlay: {e}",
-                        spec.name
-                    )
-                })?;
-            }
-            declared_names.insert(meta.name.clone());
-            let layer = if overlay.is_some() {
-                crate::farm::ClaimLayer::Overlay
-            } else {
-                crate::farm::ClaimLayer::Own
-            };
-            if overlay.is_none() {
-                if let Some(pin) = lock.packages.get(&spec.name) {
-                    if pin.version != meta.version
-                        && active.as_ref().is_some_and(|g| {
-                            g.packages
-                                .get(&spec.name)
-                                .is_some_and(|p| p.version == pin.version)
-                        })
-                    {
-                        held.push(meta.name.clone());
-                        if let Some(installed_pkg) =
-                            active.as_ref().and_then(|g| g.packages.get(&spec.name))
-                        {
-                            push_desktop_claims(
-                                &mut desktop_claims,
-                                installed_pkg,
-                                crate::farm::ClaimLayer::Own,
-                            );
-                            push_installed_binary_claims(
-                                &mut binary_claims,
-                                installed_pkg,
-                                crate::farm::ClaimLayer::Own,
-                            );
-                        }
-                        continue;
-                    }
-                }
-            }
-            push_meta_desktop_claims(&mut desktop_claims, &meta, layer);
-            push_meta_binary_claims(&mut binary_claims, &meta, layer);
-            // Dependency closure first (ADR-0017 Decision 7): fetch or
-            // verify BEFORE the sandboxed offline build consumes it.
-            let deps_pin = ensure_own_deps(&store, &lock, &meta, &spec.name).map_err(|e| {
-                miette::miette!("cannot fetch dependency closure for '{}': {e}", spec.name)
-            })?;
-            let version_changed = lock.packages.get(&spec.name).map(|e| e.version.as_str())
-                != Some(meta.version.as_str());
-            if version_changed {
-                // A repin carries the existing deps pin forward
-                // (ADR-0017): content-addressed, re-verified by sync.
-                let deps = deps_pin
-                    .clone()
-                    .or_else(|| lock.packages.get(&spec.name).and_then(|e| e.deps.clone()));
-                repins.push((
-                    spec.name.clone(),
-                    PodPackageLockEntry {
-                        version: meta.version.clone(),
-                        constraint: spec.constraint.clone(),
-                        deps,
-                    },
-                ));
-            } else if let Some(pin) = &deps_pin {
-                // Same version, moved closure (float): the repin path
-                // above doesn't fire — record the pin separately.
-                deps_pins.push((spec.name.clone(), pin.clone()));
-            }
-            pending.push(build_pending_snap(&store, &meta, layer, deps_pin.as_ref())?);
-        }
-
-        // Loaded packages (issue #8): a loaded pod's package is rebuilt
-        // at the version it currently executes — same overlay build
-        // inputs, so the loading pod executes exactly what the loaded pod
-        // executes. Deterministic build output keeps a no-change reconcile
-        // a no-op. Own packages with the same NAME shadow them outright
-        // (the loaded copy never enters); the name is skipped below.
-        for (name, version) in &loaded_versions {
-            if declared_names.contains(name) {
-                continue;
-            }
-            let mut meta = crate::deps::load_meta(name).map_err(|e| {
-                miette::miette!(
-                    "loaded package '{}' from pod '{}' cannot be resolved: {e}",
-                    name,
-                    pod_name
-                )
-            })?;
-            // Apply the loaded pod's overlay for this package so the
-            // rebuilt payload carries the same build inputs it would get
-            // in the loaded pod itself. The loading pod's own overlay for
-            // this loaded package is the TOP layer: it wins.
-            if let Some(patch) = loaded_overlays.get(name) {
-                apply_overlay(&mut meta, patch).map_err(|e| {
-                    miette::miette!("loaded package '{name}' overlay is invalid: {e}")
-                })?;
-            }
-            if let Some(patch) = decl.overlay.get(name) {
-                apply_overlay(&mut meta, patch).map_err(|e| {
-                    miette::miette!(
-                        "cannot build loaded package '{name}' with this pod's overlay: {e}"
-                    )
-                })?;
-            }
-            // Pin the loaded package at the executing version (a loaded
-            // pod's active generation version wins over collection drift).
-            if !version.is_empty() {
-                meta.version = version.clone();
-            }
-            declared_names.insert(meta.name.clone());
-            push_meta_desktop_claims(&mut desktop_claims, &meta, crate::farm::ClaimLayer::Loaded);
-            push_meta_binary_claims(&mut binary_claims, &meta, crate::farm::ClaimLayer::Loaded);
-            pending.push(build_pending_snap(
-                &store,
-                &meta,
-                crate::farm::ClaimLayer::Loaded,
-                None,
-            )?);
-        }
-    } else if !decl.packages.is_empty() || !loaded_versions.is_empty() {
+        let ctx = ReconcileCtx {
+            store: &state.store,
+            lock: &state.lock,
+            active: state.active.as_ref(),
+            root: &state.root,
+            pod_name: &state.pod_name,
+        };
+        collect_own_packages(&ctx, &state.decl, only, float_deps, build)?;
+        collect_loaded_packages(
+            &ctx,
+            &state.decl,
+            &state.loaded_versions,
+            &state.loaded_overlays,
+            build,
+        )?;
+    } else if !state.decl.packages.is_empty() || !state.loaded_versions.is_empty() {
         warn_degraded_install();
     }
+    Ok(())
+}
 
-    // Desktop app-ID collision check (issue #7) and binary-name
-    // collision check (issue #8) — BEFORE any store write, so a
-    // same-precedence collision fails with zero writes.
-    resolve_desktop_claims(&desktop_claims)?;
-    resolve_binary_claims(&binary_claims)?;
-
-    // Install the changed set (a no-op batch creates no generation).
+/// Resolve the claim collisions (issues #7/#8 — BEFORE any store write,
+/// so a same-precedence collision fails with zero writes) and install
+/// the changed set (a no-op batch creates no generation). Returns the
+/// names the install moved.
+fn install_pending(
+    state: &mut ReconcileState,
+    build: &mut ReconcileBuild,
+) -> miette::Result<Vec<String>> {
+    resolve_desktop_claims(&build.desktop_claims)?;
+    resolve_binary_claims(&build.binary_claims)?;
     let mut installed = Vec::new();
-    if !pending.is_empty() {
-        let report = store.install_batch(&pending, &Default::default(), &tools)?;
+    if !build.pending.is_empty() {
+        let report =
+            state
+                .store
+                .install_batch(&build.pending, &Default::default(), &state.tools)?;
         if !report.noop {
             installed = report.installed.iter().map(|s| s.name.clone()).collect();
         }
     }
+    Ok(installed)
+}
 
-    // Overlay-driven repins (issue #6) and moved dependency-closure pins
-    // (ADR-0017): applied only after the installs succeeded, so a failed
-    // reconcile leaves the pin untouched. Loaded packages are NOT
-    // repinned in this pod's lockfile: a loaded pod's versions live in
-    // the loaded pod, and this pod follows them live (issue #8 —
-    // read-only consumption, no cross-pod pins).
-    if !repins.is_empty() || !deps_pins.is_empty() {
-        for (name, entry) in repins {
-            lock.packages.insert(name, entry);
+/// Shared inputs for the build phases of one scoped reconcile: the pod
+/// store, the pre-reconcile lockfile, and the active generation when
+/// one exists.
+struct ReconcileCtx<'a> {
+    store: &'a crate::runtime::RuntimeStore,
+    lock: &'a LockFile,
+    active: Option<&'a crate::runtime::Generation>,
+    root: &'a Path,
+    pod_name: &'a str,
+}
+
+/// Everything the build phases of one scoped reconcile accumulate:
+/// packages awaiting install, claims, pin movements, and whether the
+/// selected package's deps pin moved (issue #15).
+#[derive(Default)]
+struct ReconcileBuild {
+    /// Packages resolved + built, awaiting install.
+    pending: Vec<crate::runtime::PendingSnap>,
+    /// Names held at their pins this reconcile (plain sync, issue #5).
+    held: Vec<String>,
+    /// Package names of the post-state (own + loaded).
+    declared_names: std::collections::BTreeSet<String>,
+    /// Desktop application-ID claims of the post-state package set
+    /// (issue #7): collected in declaration order, resolved for
+    /// collisions BEFORE any store write.
+    desktop_claims: Vec<DesktopClaim>,
+    /// Binary-name claims of the post-state package set (issue #8): the
+    /// shared collision classifier over loaded/own/overlay layers, run
+    /// BEFORE any store write so a same-precedence clash is a hard error
+    /// with zero writes.
+    binary_claims: Vec<BinaryClaim>,
+    /// Version pins the reconcile moved (overlay wins over the pin):
+    /// recorded only after the build succeeded, applied only after the
+    /// install succeeded — a failed reconcile leaves the pin in place.
+    repins: Vec<(String, PodPackageLockEntry)>,
+    /// Dependency-closure pins moved by this reconcile (ADR-0017): a
+    /// float whose closure changed at constant version. Version repins
+    /// above carry their deps pin inside the entry; this catches the
+    /// version-stayed case.
+    deps_pins: Vec<(String, crate::lock::PackageDepsLock)>,
+    /// Whether the selected package's deps pin moved (issue #15).
+    deps_moved: bool,
+}
+
+/// Fold the `loads` graph one level deep (issue #8): each loaded pod
+/// contributes its active generation's package versions (or, with none
+/// yet, its declaration as its own first sync would resolve) and its
+/// overlay map.
+fn loaded_contributions(
+    root: &Path,
+    decl: &PodDeclaration,
+) -> miette::Result<(
+    BTreeMap<String, String>,
+    BTreeMap<String, serde_json::Value>,
+)> {
+    let mut loaded_versions: BTreeMap<String, String> = BTreeMap::new();
+    let mut loaded_overlays: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for loaded in &decl.loads {
+        let contribution = loaded_contribution(root, loaded)?;
+        for (name, version) in contribution.packages {
+            loaded_versions
+                .entry(name)
+                .or_insert(version.unwrap_or_default());
         }
-        for (name, deps) in deps_pins {
-            if let Some(entry) = lock.packages.get_mut(&name) {
-                entry.deps = Some(deps);
-            } else {
-                lock.packages.insert(
-                    name,
-                    PodPackageLockEntry {
-                        version: String::new(),
-                        constraint: None,
-                        deps: Some(deps),
-                    },
-                );
-            }
+        for (name, patch) in contribution.overlay {
+            loaded_overlays.entry(name).or_insert(patch);
         }
-        lock.save(&lock_path)?;
     }
+    Ok((loaded_versions, loaded_overlays))
+}
 
-    // Remove store packages the declaration dropped. Removal never
-    // unpacks, so it proceeds even in degraded mode. A package the
-    // degraded mode never installed is simply absent — skip it.
+/// Resolve one declared own package through the collection + the pod's
+/// overlay layer (issue #6: the overlay wins over the collection).
+fn resolve_own_meta(
+    root: &Path,
+    pod_name: &str,
+    spec: &PodPackageSpec,
+    overlay: &BTreeMap<String, serde_json::Value>,
+) -> miette::Result<crate::snap::SnapMeta> {
+    let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+        miette::miette!(
+            "cannot build declared package '{}': {e} (declaration at {})",
+            spec.name,
+            pod_lua_path(root, pod_name).display()
+        )
+    })?;
+    if let Some(patch) = overlay.get(&spec.name) {
+        apply_overlay(&mut meta, patch).map_err(|e| {
+            miette::miette!(
+                "cannot build declared package '{}' with its overlay: {e}",
+                spec.name
+            )
+        })?;
+    }
+    Ok(meta)
+}
+
+/// Resolve + build the pod's OWN packages (in declared order, issue
+/// #3): each resolves collection → pin (hold) → overlay, later wins,
+/// then builds after its dependency closure is ensured (ADR-0017
+/// Decision 7). The scoped-reconcile decisions (issue #15) come from
+/// [`scope_own_package`].
+fn collect_own_packages(
+    ctx: &ReconcileCtx<'_>,
+    decl: &PodDeclaration,
+    only: Option<&str>,
+    float_deps: bool,
+    build: &mut ReconcileBuild,
+) -> miette::Result<()> {
+    for spec_str in &decl.packages {
+        let spec = parse_pod_package(spec_str)?;
+        let mut meta = resolve_own_meta(ctx.root, ctx.pod_name, &spec, &decl.overlay)?;
+        build.declared_names.insert(meta.name.clone());
+        let overlay = decl.overlay.contains_key(&spec.name);
+        let layer = if overlay {
+            crate::farm::ClaimLayer::Overlay
+        } else {
+            crate::farm::ClaimLayer::Own
+        };
+        let selected = only.is_none_or(|n| n == spec.name.as_str());
+        if let OwnScope::Build =
+            scope_own_package(ctx, selected, only.is_some(), overlay, &mut meta, build)
+        {
+            build_own_package(ctx, &spec, &meta, layer, float_deps && selected, build)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build one own package that survived scoping: contribute its claims,
+/// ensure its dependency closure, record pin movements, and queue the
+/// pending build (issue #3/#15).
+fn build_own_package(
+    ctx: &ReconcileCtx<'_>,
+    spec: &PodPackageSpec,
+    meta: &crate::snap::SnapMeta,
+    layer: crate::farm::ClaimLayer,
+    force_float: bool,
+    build: &mut ReconcileBuild,
+) -> miette::Result<()> {
+    push_meta_desktop_claims(&mut build.desktop_claims, meta, layer);
+    push_meta_binary_claims(&mut build.binary_claims, meta, layer);
+    // Dependency closure first (ADR-0017 Decision 7): fetch or verify
+    // BEFORE the sandboxed offline build consumes it. `force_float`
+    // floats the closure regardless of the meta's own float mode
+    // (issue #15 --latest).
+    let deps_pin = ensure_own_deps(ctx.store, ctx.lock, meta, &spec.name, force_float)
+        .map_err(|e| miette::miette!("cannot fetch dependency closure for '{}': {e}", spec.name))?;
+    let prev_entry = ctx.lock.packages.get(&spec.name);
+    if deps_pin_moved(force_float, prev_entry, deps_pin.as_ref()) {
+        build.deps_moved = true;
+    }
+    record_pin_movement(
+        &mut build.repins,
+        &mut build.deps_pins,
+        ctx.lock,
+        spec,
+        meta,
+        deps_pin.as_ref(),
+    );
+    build.pending.push(build_pending_snap(
+        ctx.store,
+        meta,
+        layer,
+        deps_pin.as_ref(),
+    )?);
+    Ok(())
+}
+
+/// Resolve a loaded pod's package through BOTH overlay layers (issue
+/// #8): the loaded pod's own overlay (so the rebuilt payload carries
+/// the same build inputs it would get in the loaded pod itself)
+/// beneath the loading pod's overlay — the top layer wins.
+fn resolve_loaded_meta(
+    name: &str,
+    pod_name: &str,
+    loaded_patch: Option<&serde_json::Value>,
+    own_patch: Option<&serde_json::Value>,
+) -> miette::Result<crate::snap::SnapMeta> {
+    let mut meta = crate::deps::load_meta(name).map_err(|e| {
+        miette::miette!("loaded package '{name}' from pod '{pod_name}' cannot be resolved: {e}")
+    })?;
+    if let Some(patch) = loaded_patch {
+        apply_overlay(&mut meta, patch)
+            .map_err(|e| miette::miette!("loaded package '{name}' overlay is invalid: {e}"))?;
+    }
+    if let Some(patch) = own_patch {
+        apply_overlay(&mut meta, patch).map_err(|e| {
+            miette::miette!("cannot build loaded package '{name}' with this pod's overlay: {e}")
+        })?;
+    }
+    Ok(meta)
+}
+
+/// Rebuild the LOADED packages (issue #8): each at the version its pod
+/// currently executes — same overlay build inputs, so the loading pod
+/// executes exactly what the loaded pod executes. Deterministic build
+/// output keeps a no-change reconcile a no-op. Own packages with the
+/// same NAME shadow them outright (the loaded copy never enters).
+fn collect_loaded_packages(
+    ctx: &ReconcileCtx<'_>,
+    decl: &PodDeclaration,
+    loaded_versions: &BTreeMap<String, String>,
+    loaded_overlays: &BTreeMap<String, serde_json::Value>,
+    build: &mut ReconcileBuild,
+) -> miette::Result<()> {
+    for (name, version) in loaded_versions {
+        if build.declared_names.contains(name) {
+            continue;
+        }
+        let mut meta = resolve_loaded_meta(
+            name,
+            ctx.pod_name,
+            loaded_overlays.get(name),
+            decl.overlay.get(name),
+        )?;
+        // Pin the loaded package at the executing version (a loaded
+        // pod's active generation version wins over collection drift).
+        if !version.is_empty() {
+            meta.version = version.clone();
+        }
+        build.declared_names.insert(meta.name.clone());
+        push_meta_desktop_claims(
+            &mut build.desktop_claims,
+            &meta,
+            crate::farm::ClaimLayer::Loaded,
+        );
+        push_meta_binary_claims(
+            &mut build.binary_claims,
+            &meta,
+            crate::farm::ClaimLayer::Loaded,
+        );
+        build.pending.push(build_pending_snap(
+            ctx.store,
+            &meta,
+            crate::farm::ClaimLayer::Loaded,
+            None,
+        )?);
+    }
+    Ok(())
+}
+
+/// Apply overlay-driven repins (issue #6) and moved dependency-closure
+/// pins (ADR-0017) to the lockfile — called only after the installs
+/// succeeded, so a failed reconcile leaves the pins untouched. Loaded
+/// packages are NOT repinned in this pod's lockfile: a loaded pod's
+/// versions live in the loaded pod, and this pod follows them live
+/// (issue #8 — read-only consumption, no cross-pod pins).
+fn apply_pin_updates(
+    lock: &mut LockFile,
+    repins: &[(String, PodPackageLockEntry)],
+    deps_pins: &[(String, crate::lock::PackageDepsLock)],
+    lock_path: &Path,
+) -> miette::Result<()> {
+    if repins.is_empty() && deps_pins.is_empty() {
+        return Ok(());
+    }
+    for (name, entry) in repins {
+        lock.packages.insert(name.clone(), entry.clone());
+    }
+    for (name, deps) in deps_pins {
+        if let Some(entry) = lock.packages.get_mut(name) {
+            entry.deps = Some(deps.clone());
+        } else {
+            lock.packages.insert(
+                name.clone(),
+                PodPackageLockEntry {
+                    version: String::new(),
+                    constraint: None,
+                    deps: Some(deps.clone()),
+                },
+            );
+        }
+    }
+    lock.save(lock_path)
+}
+
+/// Remove store packages the declaration dropped. Removal never
+/// unpacks, so it proceeds even in degraded mode. A package the
+/// degraded mode never installed is simply absent — skip it.
+fn remove_undeclared(
+    store: &crate::runtime::RuntimeStore,
+    tools: &crate::runtime::RuntimeTools,
+    declared_names: &std::collections::BTreeSet<String>,
+) -> miette::Result<Vec<String>> {
     let mut removed = Vec::new();
     if let Some(active) = store.active_generation()? {
         for name in active.packages.keys() {
             if declared_names.contains(name) {
                 continue;
             }
-            store.remove(name, &tools)?;
+            store.remove(name, tools)?;
             removed.push(name.clone());
         }
     }
+    Ok(removed)
+}
 
-    // Present whatever is now active. Nothing active → nothing exposed.
+/// Present whatever is now active: re-emit the bin farm for the active
+/// generation and flip the pod's `current` link. Nothing active →
+/// nothing exposed: the farm and the user-level launcher surface are
+/// withdrawn along with it (issue #7).
+fn present_active(
+    store: &crate::runtime::RuntimeStore,
+    dir: &Path,
+) -> miette::Result<(Option<u64>, Option<PathBuf>)> {
     let active = store.active_generation()?;
-    let (generation, farm) = match &active {
+    Ok(match &active {
         Some(gen) => {
-            let farm = crate::farm::emit(&store, gen)?;
-            crate::farm::flip_current(&dir, gen.n)?;
+            let farm = crate::farm::emit(store, gen)?;
+            crate::farm::flip_current(dir, gen.n)?;
             (Some(gen.n), Some(farm))
         }
         None => {
-            crate::farm::clear_current(&dir)?;
-            // Nothing active exposes nothing: the user-level launcher
-            // surface is withdrawn along with the farm (issue #7).
-            crate::desktop::clear(&store)?;
+            crate::farm::clear_current(dir)?;
+            crate::desktop::clear(store)?;
             (None, None)
         }
-    };
-
-    Ok(PodSyncReport {
-        pod: pod_name.to_string(),
-        noop: installed.is_empty() && removed.is_empty(),
-        installed,
-        removed,
-        held,
-        generation,
-        farm,
     })
 }
 
@@ -2067,19 +2491,23 @@ fn build_pending_snap(
 
 /// Fetch (or verify the cached) dependency closure for an own pod package
 /// BEFORE the sandboxed build consumes it (ADR-0017 Decision 7: add/sync
-/// auto-fetch). Returns the pin to merge into the lockfile; `None` when
-/// the package declares no deps.
+/// auto-fetch). `force_float` floats the closure regardless of the
+/// meta's own float mode — the `pod rebuild --latest` seam (issue #15,
+/// ADR-0017 Decision 5). Returns the pin to merge into the lockfile;
+/// `None` when the package declares no deps.
 fn ensure_own_deps(
     store: &crate::runtime::RuntimeStore,
     lock: &LockFile,
     meta: &crate::snap::SnapMeta,
     pkg_name: &str,
+    force_float: bool,
 ) -> miette::Result<Option<crate::lock::PackageDepsLock>> {
     if meta.deps.is_none() {
         return Ok(None);
     }
     let prev = lock.packages.get(pkg_name).and_then(|e| e.deps.clone());
-    crate::dep_fetch::ensure_pod_deps(store, meta, prev.as_ref(), meta.floating)
+    let floating = force_float || meta.floating;
+    crate::dep_fetch::ensure_pod_deps(store, meta, prev.as_ref(), floating)
         .map(Some)
         .map_err(|e| miette::miette!("package '{pkg_name}': {e}"))
 }

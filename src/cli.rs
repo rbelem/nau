@@ -671,6 +671,27 @@ pub enum PodCommand {
         root: Option<String>,
     },
 
+    /// Rebuild one declared package from the selected pod (issue #15):
+    /// builds it again at ITS pins (version pin + dependency-closure
+    /// pin) and installs the result — the cached closure is reused,
+    /// never re-fetched, and the sync hold check is bypassed for this
+    /// one package. `--latest` additionally re-resolves the dependency
+    /// closure, moving the deps pin deliberately (ADR-0017 Decision 5).
+    Rebuild {
+        /// Package name to rebuild (must be declared in the pod).
+        package: String,
+
+        /// Also re-resolve the dependency closure (`deps fetch
+        /// --latest` semantics): moves the deps pin deliberately,
+        /// recording a fresh `fetched_at` (ADR-0017 Decision 5).
+        #[arg(long)]
+        latest: bool,
+
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
+    },
+
     /// Roll the selected pod back to a previous generation (default:
     /// the one before the current): flips that pod's `current` link
     /// only — never reboots, never touches system generations. Binaries

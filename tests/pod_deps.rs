@@ -1095,3 +1095,227 @@ gated_test!(pip_exclude_rejected_at_parse, &[], {
     // The rejection is a parse-time hard error: nothing was fetched.
     assert_eq!(requests_for(&log, "/wheels/"), 0);
 });
+
+// ── `pod rebuild` (issue #15): rebuild one package at its pins ──
+
+/// The version pin recorded in the pod lockfile (None when absent).
+fn lock_version_pin(root: &Path, pod: &str, pkg: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Lock {
+        packages: std::collections::BTreeMap<String, Entry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        version: String,
+    }
+    let text = std::fs::read_to_string(pod_dir(root, pod).join("shuttle.lock")).ok()?;
+    let lock: Lock = serde_json::from_str(&text).ok()?;
+    lock.packages.get(pkg).map(|e| e.version.clone())
+}
+
+gated_test!(rebuild_reuses_cached_closure_without_refetch, &["node"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_npm_pkg(
+        project.path(),
+        server.path(),
+        "zrapp",
+        "rebuild-dep",
+        port,
+        false,
+    );
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zrapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let fetches_before = requests_for(&log, "/registry/");
+    assert!(fetches_before >= 1, "add must fetch the closure");
+    let (hash_before, _) = lock_deps_pin(root.path(), "default", "zrapp");
+
+    // The rebuild must reuse the cached closure: zero registry GETs,
+    // deps pin untouched.
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "rebuild", "zrapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+    assert_eq!(
+        requests_for(&log, "/registry/"),
+        fetches_before,
+        "rebuild must not re-fetch the cached closure; requests: {:#?}",
+        log.lock().unwrap()
+    );
+    let (hash_after, _) = lock_deps_pin(root.path(), "default", "zrapp");
+    assert_eq!(hash_before, hash_after, "rebuild keeps the deps pin");
+
+    // SAFETY: nothing executed a dependency lifecycle script on the host.
+    assert_no_canary(&[project.path(), root.path(), server.path()]);
+});
+
+gated_test!(rebuild_latest_repins_moved_closure, &["node"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_npm_pkg(
+        project.path(),
+        server.path(),
+        "zrapp",
+        "latest-dep-v1",
+        port,
+        false,
+    );
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zrapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let (hash_a, fetched_at_a) = lock_deps_pin(root.path(), "default", "zrapp");
+    assert!(fetched_at_a.is_some(), "add records fetched_at");
+    let fetches_after_add = requests_for(&log, "/registry/");
+
+    // Upstream moves: same URL, new closure content (new tarball bytes
+    // + integrity in the lockfile the re-resolve would fetch).
+    write_npm_pkg(
+        project.path(),
+        server.path(),
+        "zrapp",
+        "latest-dep-v2",
+        port,
+        false,
+    );
+
+    // --latest re-resolves the closure deliberately and moves the pin.
+    let (code, stdout, stderr) = run(
+        project.path(),
+        root.path(),
+        &["pod", "rebuild", "zrapp", "--latest"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+    assert!(
+        requests_for(&log, "/registry/") > fetches_after_add,
+        "--latest must re-fetch the closure; requests: {:#?}",
+        log.lock().unwrap()
+    );
+    let (hash_b, fetched_at_b) = lock_deps_pin(root.path(), "default", "zrapp");
+    assert_ne!(hash_a, hash_b, "a moved closure gets a new deps_hash");
+    assert!(fetched_at_b.is_some(), "the moved pin keeps fetched_at");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("moved dependency closure"),
+        "rebuild must report the moved pin: {combined}"
+    );
+
+    // The farm serves the NEW closure content.
+    let out = run_farm_app(&current_farm(root.path(), "default"), "zrapp");
+    assert!(
+        out.contains("latest-dep-v2"),
+        "farm serves the moved closure: {out:?}"
+    );
+});
+
+gated_test!(rebuild_bypasses_hold_at_pinned_version, &["node"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_npm_pkg(
+        project.path(),
+        server.path(),
+        "zrapp",
+        "hold-dep",
+        port,
+        false,
+    );
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zrapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let fetches_before = requests_for(&log, "/registry/");
+
+    // Collection drift: the package now resolves 2.0 while the pin
+    // holds 1.0.
+    let lua_path = project.path().join("pkgs/z/zrapp.lua");
+    let lua = std::fs::read_to_string(&lua_path)
+        .unwrap()
+        .replace("version = \"1.0\"", "version = \"2.0\"");
+    std::fs::write(&lua_path, lua).unwrap();
+
+    // A plain sync HOLDS the package: no rebuild, no re-fetch, pin
+    // untouched (a no-change reconcile is a no-op).
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+    let sync_out = format!("{stdout}{stderr}");
+    assert!(
+        sync_out.contains("already matches its declaration"),
+        "held sync must be a no-op: {sync_out}"
+    );
+    assert_eq!(
+        lock_version_pin(root.path(), "default", "zrapp").as_deref(),
+        Some("1.0"),
+        "sync must hold the package at its pin"
+    );
+    assert_eq!(
+        requests_for(&log, "/registry/"),
+        fetches_before,
+        "held sync must not re-fetch"
+    );
+
+    // The rebuild bypasses the hold AT THE PIN: success, still 1.0 —
+    // rebuilt at the pinned version, not drifted to 2.0.
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "rebuild", "zrapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+    assert_eq!(
+        lock_version_pin(root.path(), "default", "zrapp").as_deref(),
+        Some("1.0"),
+        "rebuild must rebuild at the pinned version, not move to 2.0"
+    );
+    assert_eq!(
+        requests_for(&log, "/registry/"),
+        fetches_before,
+        "rebuild at the pin must reuse the cached closure"
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("(1.0)"),
+        "rebuild reports the pinned version: {combined}"
+    );
+});
+
+gated_test!(rebuild_unknown_package_fails_without_writes, &["node"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, _log) = serve_dir(server.path());
+    write_npm_pkg(
+        project.path(),
+        server.path(),
+        "zrapp",
+        "unknown-dep",
+        port,
+        false,
+    );
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zrapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let lock_path = pod_dir(root.path(), "default").join("shuttle.lock");
+    let before = std::fs::read(&lock_path).unwrap();
+
+    let (code, stdout, stderr) = run(
+        project.path(),
+        root.path(),
+        &["pod", "rebuild", "notdeclared"],
+    );
+    assert_ne!(
+        code,
+        Some(0),
+        "rebuild of an undeclared package must fail: {stdout}"
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("is not in pod"),
+        "error must name the undeclared package: {combined}"
+    );
+    let after = std::fs::read(&lock_path).unwrap();
+    assert_eq!(
+        before, after,
+        "a failed rebuild must not write the lockfile"
+    );
+});
