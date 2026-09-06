@@ -564,10 +564,12 @@ fn parse_uv_lock(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
             ));
             continue;
         };
-        if !matches!(
-            pkg.source.as_ref().and_then(|s| s.registry.as_deref()),
-            Some(_)
-        ) {
+        if pkg
+            .source
+            .as_ref()
+            .and_then(|s| s.registry.as_deref())
+            .is_none()
+        {
             crate::output::warn(format!(
                 "uv.lock: {} {} is not from a registry — skipped",
                 pkg.name, pkg.version
@@ -577,7 +579,15 @@ fn parse_uv_lock(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
         let norm = normalize_name(&pkg.name);
         let Some(wheel) = wheels.iter().find(|w| {
             let filename = w.url.rsplit('/').next().unwrap_or("");
-            is_matching_wheel(filename, &norm, &pkg.version) && wheel_tags_match(filename)
+            // Wheel filenames keep the distribution's original spelling
+            // (pydantic_core-…, typing_extensions-…) — normalize the
+            // filename's name segment before the prefix match, which
+            // compares PEP 503-normalized names.
+            let normed = match filename.split_once('-') {
+                Some((name_seg, rest)) => format!("{}-{}", normalize_name(name_seg), rest),
+                None => filename.to_string(),
+            };
+            is_matching_wheel(&normed, &norm, &pkg.version) && wheel_tags_match(filename)
         }) else {
             crate::output::warn(format!(
                 "uv.lock: {} {} has no wheel for this platform — skipped",
@@ -1290,6 +1300,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pydantic-core"
+version = "2.41.5"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.example/pydantic_core-2.41.5-cp312-cp312-manylinux_2_17_x86_64.whl", hash = "sha256:ffff" },
+    { url = "https://files.example/pydantic_core-2.41.5-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:abab" },
+]
+
+[[package]]
 name = "dbgpu"
 version = "2025.12"
 source = { registry = "https://pypi.org/simple" }
@@ -1302,8 +1321,9 @@ source = { editable = "." }
 "#;
         let pins = parse_pip_pins(lock.as_bytes()).unwrap();
         // dbgpu (sdist-only) and local-tool (editable) are skipped with a
-        // warning; the whichllm and psutil closures survive.
-        assert_eq!(pins.len(), 2);
+        // warning; the whichllm, psutil, and pydantic-core closures
+        // survive.
+        assert_eq!(pins.len(), 3);
         assert_eq!(pins[0].name, "whichllm");
         assert!(pins[0]
             .url
@@ -1315,6 +1335,15 @@ source = { editable = "." }
         assert_eq!(pins[1].name, "psutil");
         assert!(pins[1].url.as_deref().unwrap().contains("manylinux"));
         assert_eq!(pins[1].hashes, vec!["cccc"]);
+        // Underscore distributions match their normalized lock name, and
+        // the linux wheel wins over the macOS one.
+        assert_eq!(pins[2].name, "pydantic-core");
+        assert!(pins[2]
+            .url
+            .as_deref()
+            .unwrap()
+            .contains("manylinux_2_17_x86_64"));
+        assert_eq!(pins[2].hashes, vec!["ffff"]);
     }
 
     #[test]
