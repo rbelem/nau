@@ -584,10 +584,15 @@ gated_test!(degraded_mode_without_squashfs_tools_installs_nothing, {
     cmd.env("SHUTTLE_DATA_HOME", root.path().join("data-home"));
     let out = cmd.output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    // Fail closed (issue #16): a reconcile without the squashfs pair
+    // must NOT report success (the old degraded path installed nothing
+    // but still walked the removal phase) — it exits nonzero naming the
+    // missing tools, while the declaration half (pod.lua + lock) is
+    // written for the retry.
+    assert_ne!(out.status.code(), Some(0), "stderr: {stderr}");
     assert!(
-        stderr.contains("not installed") && stderr.contains("pod sync"),
-        "degraded mode must warn loudly: {stderr}"
+        stderr.contains("mksquashfs"),
+        "degraded reconcile must name the missing tools: {stderr}"
     );
     assert!(pod_dir(root.path(), "default").join("pod.lua").exists());
     assert_eq!(

@@ -1319,3 +1319,280 @@ gated_test!(rebuild_unknown_package_fails_without_writes, &["node"], {
         "a failed rebuild must not write the lockfile"
     );
 });
+
+// ── Degraded reconcile (issue #16): fail closed + no wipe ──
+//
+// `pod sync`/`pod rebuild` without the squashfs pair used to run the
+// removal phase against an EMPTY declared set, wiping every installed
+// package generation by generation. Build-capable verbs must fail
+// closed; the removal flow must keep working without the wipe.
+
+/// Run shuttle with an EMPTY PATH: `find_on_path` resolves nothing, so
+/// the reconcile runs degraded (no squashfs pair). The binary is
+/// invoked by absolute path; degraded paths exec no external tools, so
+/// the empty PATH is safe for the assertion phase.
+fn run_degraded(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    cmd.args(args).arg("--root").arg(root);
+    cmd.current_dir(project);
+    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("PATH", "");
+    let out = cmd.output().expect("failed to spawn shuttle");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The sorted entry names of the pod's active bin farm.
+fn farm_listing(farm: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(farm)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The invariants a degraded verb must leave untouched: the
+/// active-generation link, the farm listing, and the lockfile bytes.
+fn snapshot_pod(root: &Path, pod: &str) -> (PathBuf, Vec<String>, Vec<u8>) {
+    let link = std::fs::read_link(pod_dir(root, pod).join("current")).unwrap();
+    let farm = farm_listing(&current_farm(root, pod));
+    assert!(
+        !farm.is_empty(),
+        "fixture must be installed before degrading"
+    );
+    let lock = std::fs::read(pod_dir(root, pod).join("shuttle.lock")).unwrap();
+    (link, farm, lock)
+}
+
+gated_test!(
+    degraded_rebuild_fails_closed_leaving_generation_and_farm_intact,
+    &["node"],
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let (port, _log) = serve_dir(server.path());
+        write_npm_pkg(
+            project.path(),
+            server.path(),
+            "zdgapp",
+            "degraded-a",
+            port,
+            false,
+        );
+
+        // Install with the full toolchain present.
+        let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zdgapp"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        let (link, farm, lock) = snapshot_pod(root.path(), "default");
+        let lock_path = pod_dir(root.path(), "default").join("shuttle.lock");
+
+        // Degraded rebuild: must FAIL CLOSED, touching nothing.
+        let (code, stdout, stderr) =
+            run_degraded(project.path(), root.path(), &["pod", "rebuild", "zdgapp"]);
+        assert_ne!(code, Some(0), "degraded rebuild must fail: {stdout}");
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            combined.contains("mksquashfs"),
+            "failure must name the missing squashfs tools: {combined}"
+        );
+        assert_eq!(
+            std::fs::read_link(pod_dir(root.path(), "default").join("current")).unwrap(),
+            link,
+            "degraded rebuild must not move the active generation"
+        );
+        assert_eq!(
+            farm_listing(&current_farm(root.path(), "default")),
+            farm,
+            "degraded rebuild must not churn the bin farm"
+        );
+        assert_eq!(
+            std::fs::read(&lock_path).unwrap(),
+            lock,
+            "degraded rebuild must not write the lockfile"
+        );
+
+        // SAFETY: the degraded run execs nothing, least of all lifecycle scripts.
+        assert_no_canary(&[project.path(), root.path(), server.path()]);
+    }
+);
+
+gated_test!(degraded_sync_fails_closed_the_same_way, &["node"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, _log) = serve_dir(server.path());
+    write_npm_pkg(
+        project.path(),
+        server.path(),
+        "zdsapp",
+        "degraded-s",
+        port,
+        false,
+    );
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zdsapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let (link, farm, lock) = snapshot_pod(root.path(), "default");
+    let lock_path = pod_dir(root.path(), "default").join("shuttle.lock");
+
+    // Degraded sync: the same fail-closed contract as rebuild.
+    let (code, stdout, stderr) = run_degraded(project.path(), root.path(), &["pod", "sync"]);
+    assert_ne!(code, Some(0), "degraded sync must fail: {stdout}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("mksquashfs"),
+        "failure must name the missing squashfs tools: {combined}"
+    );
+    assert_eq!(
+        std::fs::read_link(pod_dir(root.path(), "default").join("current")).unwrap(),
+        link,
+        "degraded sync must not move the active generation"
+    );
+    assert_eq!(
+        farm_listing(&current_farm(root.path(), "default")),
+        farm,
+        "degraded sync must not churn the bin farm"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock,
+        "degraded sync must not write the lockfile"
+    );
+});
+
+gated_test!(degraded_remove_still_works_without_wiping, &["node"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, _log) = serve_dir(server.path());
+
+    // Two node fixture packages. The second fixture rewrites the shared
+    // dep tarball, so install order matters: A's closure is already in
+    // the content-addressed store (pin-verified) when B's fixture lands.
+    write_npm_pkg(
+        project.path(),
+        server.path(),
+        "zdaapp",
+        "removed-a-ran",
+        port,
+        false,
+    );
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zdaapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    write_npm_pkg(
+        project.path(),
+        server.path(),
+        "zdbapp",
+        "kept-b-ran",
+        port,
+        false,
+    );
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zdbapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let farm = current_farm(root.path(), "default");
+    assert!(farm_listing(&farm).contains(&"zdaapp".to_string()));
+    assert!(farm_listing(&farm).contains(&"zdbapp".to_string()));
+
+    // Degraded remove: must succeed (removals never unpack) WITHOUT
+    // wiping the still-declared package.
+    let (code, stdout, stderr) =
+        run_degraded(project.path(), root.path(), &["pod", "remove", "zdaapp"]);
+    assert_eq!(code, Some(0), "degraded remove must work: {stderr}{stdout}");
+
+    // The new generation dropped ONLY pkg-a: the farm no longer exposes
+    // it, pkg-b is still exposed AND still executes through the farm.
+    let farm = current_farm(root.path(), "default");
+    let listing = farm_listing(&farm);
+    assert!(
+        !listing.contains(&"zdaapp".to_string()),
+        "removed package must leave the farm: {listing:?}"
+    );
+    assert!(
+        listing.contains(&"zdbapp".to_string()),
+        "declared package must survive the degraded remove: {listing:?}"
+    );
+    let out = run_farm_app(&farm, "zdbapp");
+    assert!(
+        out.contains("kept-b-ran"),
+        "surviving package must still execute: {out:?}"
+    );
+    // The active-generation link still resolves — the chain did not
+    // collapse to an empty generation.
+    assert!(pod_dir(root.path(), "default").join("current").exists());
+
+    // SAFETY: nothing executed a dependency lifecycle script on the host.
+    assert_no_canary(&[project.path(), root.path(), server.path()]);
+});
+
+gated_test!(
+    degraded_remove_warns_only_for_uninstalled_declared,
+    &["node"],
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let (port, _log) = serve_dir(server.path());
+
+        write_npm_pkg(
+            project.path(),
+            server.path(),
+            "zdaapp",
+            "a-ran",
+            port,
+            false,
+        );
+        let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zdaapp"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        write_npm_pkg(
+            project.path(),
+            server.path(),
+            "zdbapp",
+            "b-ran",
+            port,
+            false,
+        );
+        let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zdbapp"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+
+        // Hand-edit the declaration (allowed; malformed fails validation) to
+        // declare a third package that was never installed — no fixture, no
+        // build: the degraded path records declared names WITHOUT resolving.
+        let pod_lua = pod_dir(root.path(), "default").join("pod.lua");
+        std::fs::write(
+        &pod_lua,
+        "-- Pod declaration, maintained by `shuttle pod add/remove`.\npod {\n    packages = { \"zdaapp\", \"zdbapp\", \"zdcapp\" },\n}\n",
+    )
+    .unwrap();
+
+        // Degraded remove of the installed zdaapp: exit 0, and the warning
+        // names ONLY the genuinely-uninstalled zdcapp — zdbapp is installed
+        // and must not be called out.
+        let (code, stdout, stderr) =
+            run_degraded(project.path(), root.path(), &["pod", "remove", "zdaapp"]);
+        assert_eq!(code, Some(0), "degraded remove must work: {stderr}{stdout}");
+        assert!(
+            stderr.contains("declared but not installed: zdcapp"),
+            "warning must name the missing package: {stderr}"
+        );
+        assert!(
+            !stderr.contains("zdbapp"),
+            "installed package must not be flagged missing: {stderr}"
+        );
+
+        let farm = current_farm(root.path(), "default");
+        let listing = farm_listing(&farm);
+        assert!(!listing.contains(&"zdaapp".to_string()), "{listing:?}");
+        assert!(listing.contains(&"zdbapp".to_string()), "{listing:?}");
+        let out = run_farm_app(&farm, "zdbapp");
+        assert!(out.contains("b-ran"), "{out:?}");
+
+        // SAFETY: nothing executed a dependency lifecycle script on the host.
+        assert_no_canary(&[project.path(), root.path(), server.path()]);
+    }
+);

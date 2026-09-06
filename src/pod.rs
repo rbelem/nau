@@ -1040,7 +1040,10 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
 /// Remove a package from a pod: drop it from the declaration and delete
 /// its lockfile pin, then reconcile — the store generation without it
 /// and a farm that no longer exposes its binaries (issue #3). Loads are
-/// validated before any write (issue #8).
+/// validated before any write (issue #8). Works without the squashfs
+/// pair (issue #16): the degraded reconcile records the remaining
+/// declared set without building, so only the dropped package (plus
+/// genuinely undeclared strays) leaves the store.
 pub fn remove_package(
     root: &Path,
     pod_name: &str,
@@ -1071,7 +1074,11 @@ pub fn remove_package(
         lock.save(&lock_path)?;
     }
 
-    let sync = sync_pod(root, pod_name)?;
+    // Degraded-safe (issue #16): removals never unpack, so the
+    // reconcile proceeds without the squashfs pair — and its declared
+    // set is recorded WITHOUT building, so only the dropped package
+    // (plus genuinely undeclared strays) is removed.
+    let (sync, _) = reconcile_pod_scoped(root, pod_name, None, false, true)?;
     if let Some(n) = sync.generation {
         crate::output::ok(format!(
             "removed '{}' from pod '{pod_name}' (generation {n})",
@@ -1114,7 +1121,8 @@ pub fn rebuild_package(
         miette::bail!("package '{}' is not in pod '{}'", spec.name, pod_name);
     }
 
-    let (sync, deps_pin_moved) = reconcile_pod_scoped(root, pod_name, Some(&spec.name), latest)?;
+    let (sync, deps_pin_moved) =
+        reconcile_pod_scoped(root, pod_name, Some(&spec.name), latest, false)?;
 
     // The version the package now executes: its (kept or freshly
     // repinned) lockfile pin, else a live resolution. The deps pin
@@ -1523,7 +1531,7 @@ pub fn pod_store(pod_dir: &Path) -> crate::runtime::RuntimeStore {
 /// `Own`, overlay-patched at `Overlay`, recorded in the generation
 /// manifest so the farm resamples the same order at activation.
 pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
-    reconcile_pod_scoped(root, pod_name, None, false).map(|(report, _)| report)
+    reconcile_pod_scoped(root, pod_name, None, false, false).map(|(report, _)| report)
 }
 
 /// What the scoped reconcile does with one own package before the
@@ -1688,13 +1696,20 @@ fn record_pin_movement(
 /// (`rebuild --latest`): the closure is re-resolved and its pin moved
 /// deliberately (ADR-0017 Decision 5). Returns the report plus whether
 /// the selected package's deps pin moved.
+///
+/// `allow_degraded` (issue #16): when the squashfs pair is absent,
+/// build-capable verbs (`sync`, `rebuild`) fail closed BEFORE any
+/// store/lock/farm mutation, while the removal flow (`allow_degraded`)
+/// proceeds — nothing builds, but the declared set is still recorded
+/// so the removal phase drops only genuinely undeclared packages.
 fn reconcile_pod_scoped(
     root: &Path,
     pod_name: &str,
     only: Option<&str>,
     float_deps: bool,
+    allow_degraded: bool,
 ) -> miette::Result<(PodSyncReport, bool)> {
-    let mut state = prepare_reconcile(root, pod_name)?;
+    let mut state = prepare_reconcile(root, pod_name, allow_degraded)?;
     let mut build = ReconcileBuild::default();
     collect_pending(&mut state, only, float_deps, &mut build)?;
     let installed = install_pending(&mut state, &mut build)?;
@@ -1754,17 +1769,36 @@ fn validate_reconcile_inputs(root: &Path, pod_name: &str) -> miette::Result<PodD
     Ok(decl)
 }
 
+/// True when the host can build and unpack payloads: the squashfs pair
+/// is on PATH. The single install-capability gate — the degraded
+/// guard and the build phase must agree.
+fn install_capable(tools: &crate::runtime::RuntimeTools) -> bool {
+    tools.unsquashfs.is_some() && crate::runtime::tool_on_path("mksquashfs")
+}
+
 /// Prepare one scoped reconcile: validate the declaration, open the
 /// pod's store + lockfile, read the active generation, and fold the
 /// `loads` graph (issue #8). The create_dir_all is the pod state-dir
-/// bootstrap (issue #3).
-fn prepare_reconcile(root: &Path, pod_name: &str) -> miette::Result<ReconcileState> {
+/// bootstrap (issue #3). Degraded guard (issue #16): a build-capable
+/// verb fails closed BEFORE the create_dir_all — the first mutation —
+/// while the removal flow (`allow_degraded`) proceeds.
+fn prepare_reconcile(
+    root: &Path,
+    pod_name: &str,
+    allow_degraded: bool,
+) -> miette::Result<ReconcileState> {
     let decl = validate_reconcile_inputs(root, pod_name)?;
+    let tools = crate::runtime::RuntimeTools::from_host();
+    if !allow_degraded && !install_capable(&tools) {
+        miette::bail!(
+            "cannot reconcile pod '{pod_name}': mksquashfs/unsquashfs not found on PATH \
+             — install squashfs-tools and re-run"
+        );
+    }
     let dir = pod_dir(root, pod_name);
     std::fs::create_dir_all(&dir)
         .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
     let store = pod_store(&dir);
-    let tools = crate::runtime::RuntimeTools::from_host();
     let active = store.active_generation()?;
     // Loaded pods, in listed order (issue #8): each contributes its
     // package versions. The own package set is the name-clash winner,
@@ -1791,18 +1825,18 @@ fn prepare_reconcile(root: &Path, pod_name: &str) -> miette::Result<ReconcileSta
 
 /// Build every package the scope demands (own packages first — the
 /// scoped decisions of issue #15 — then loaded packages, issue #8).
-/// Degraded mode: without the squashfs pair nothing can be built or
-/// unpacked, so the reconcile installs nothing — warn loudly and keep
-/// the declaration half authoritative.
+/// Degraded mode (removal flow only, issue #16): without the squashfs
+/// pair nothing can be built or unpacked, so the reconcile installs
+/// nothing — the declared set is still recorded WITHOUT building (so
+/// the removal phase never wipes declared packages) and the degraded
+/// warning is loud when declared packages remain uninstalled.
 fn collect_pending(
     state: &mut ReconcileState,
     only: Option<&str>,
     float_deps: bool,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
-    let can_install =
-        state.tools.unsquashfs.is_some() && crate::runtime::tool_on_path("mksquashfs");
-    if can_install {
+    if install_capable(&state.tools) {
         let ctx = ReconcileCtx {
             store: &state.store,
             lock: &state.lock,
@@ -1818,10 +1852,53 @@ fn collect_pending(
             &state.loaded_overlays,
             build,
         )?;
-    } else if !state.decl.packages.is_empty() || !state.loaded_versions.is_empty() {
-        warn_degraded_install();
+        return Ok(());
     }
+    collect_degraded_names(&state.decl, &state.loaded_versions, build);
+    warn_degraded_missing(state, build);
     Ok(())
+}
+
+/// Warn when the degraded reconcile leaves declared packages
+/// uninstalled (issue #16): only names in the post-state declared set
+/// that the active generation does not carry — a degraded removal whose
+/// remaining packages are all installed stays silent.
+fn warn_degraded_missing(state: &ReconcileState, build: &ReconcileBuild) {
+    let installed: std::collections::BTreeSet<String> = state
+        .active
+        .as_ref()
+        .map(|g| g.packages.keys().cloned().collect())
+        .unwrap_or_default();
+    let missing: Vec<String> = build
+        .declared_names
+        .difference(&installed)
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        crate::output::warn(format!(
+            "unsquashfs/mksquashfs not found — declared but not installed: {}; \
+             install squashfs-tools and run `shuttle pod sync`",
+            missing.join(", ")
+        ));
+    }
+}
+
+/// Record the post-state package names WITHOUT building (degraded
+/// removal, issue #16): own names from the declaration, loaded names
+/// from the folded contributions — the same sets the build path
+/// records via `declared_names`, so `remove_undeclared` drops only
+/// genuinely undeclared packages and never wipes declared ones.
+fn collect_degraded_names(
+    decl: &PodDeclaration,
+    loaded_versions: &BTreeMap<String, String>,
+    build: &mut ReconcileBuild,
+) {
+    for spec_str in &decl.packages {
+        if let Ok(spec) = parse_pod_package(spec_str) {
+            build.declared_names.insert(spec.name);
+        }
+    }
+    build.declared_names.extend(loaded_versions.keys().cloned());
 }
 
 /// Resolve the claim collisions (issues #7/#8 — BEFORE any store write,
@@ -2419,13 +2496,6 @@ fn resolve_binary_claims(claims: &[BinaryClaim]) -> miette::Result<()> {
 /// Degraded-mode banner for `pod add` when the squashfs pair is absent:
 /// the declaration is written, the install is deferred to
 /// `shuttle pod sync` once the tools exist.
-pub(crate) fn warn_degraded_install() {
-    crate::output::warn(
-        "unsquashfs/mksquashfs not found — packages declared but not \
-         installed; install squashfs-tools and run `shuttle pod sync`",
-    );
-}
-
 /// Epoch stamped into pod-built payloads so the same content builds to
 /// the same bytes on every sync (mksquashfs embeds build time otherwise
 /// — verified: two builds of an identical tree differ without this, and
