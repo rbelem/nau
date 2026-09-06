@@ -1773,6 +1773,18 @@ fn wrap_app(
     }
 }
 
+/// The preserved-script sibling name. Inserts `.real` before the final
+/// extension when there is one (`index.js` → `index.real.js`), else
+/// appends (`zdemo` → `zdemo.real`). The extension must survive: Node's
+/// ESM loader dispatches on it and rejects `index.js.real` with
+/// ERR_UNKNOWN_FILE_EXTENSION.
+fn real_sibling_name(file_name: &str) -> String {
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}.real.{ext}"),
+        _ => format!("{file_name}.real"),
+    }
+}
+
 /// Author the interpreter-script wrapper (issue #9) for a command path
 /// that is a shebang/script (not native ELF).
 fn emit_script_wrapper(
@@ -1790,7 +1802,7 @@ fn emit_script_wrapper(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let script_path = entry.with_file_name(format!("{file_name}.real"));
+    let script_path = entry.with_file_name(real_sibling_name(&file_name));
     std::fs::rename(entry, &script_path).map_err(|e| {
         miette::miette!(
             "app '{app_name}': preserving interpreter script {}: {e}",
@@ -1832,14 +1844,21 @@ fn emit_script_tree_wrapper(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let script_path = entry.with_file_name(format!("{file_name}.real"));
+    let script_path = entry.with_file_name(real_sibling_name(&file_name));
     std::fs::rename(entry, &script_path).map_err(|e| {
         miette::miette!(
             "app '{app_name}': preserving interpreter script {}: {e}",
             script_path.display()
         )
     })?;
-    let tree_script = format!("$PODROOT/active/extensions/{pkg_name}/usr/{cmd_rel}.real");
+    // The extension-preserving sibling in the extension tree (same rule
+    // as the preserve-rename above, applied to the command's relative
+    // path — the tree path must name the SAME file).
+    let cmd_rel_real = match cmd_rel.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/{}", real_sibling_name(file)),
+        None => real_sibling_name(cmd_rel),
+    };
+    let tree_script = format!("$PODROOT/active/extensions/{pkg_name}/usr/{cmd_rel_real}");
     // The farm symlink resolves to the wrapper blob at
     // `<podroot>/store/<aa>/<hash>` — three dirnames to the pod root
     // (same derivation as the #10 ELF lib wrapper).
@@ -1868,7 +1887,7 @@ fn emit_elf_lib_wrapper(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let real_path = entry.with_file_name(format!("{file_name}.real"));
+    let real_path = entry.with_file_name(real_sibling_name(&file_name));
     std::fs::rename(entry, &real_path).map_err(|e| {
         miette::miette!(
             "app '{app_name}': preserving native-ELF {}: {e}",
@@ -8126,6 +8145,39 @@ mod wrapper_tests {
             std::fs::read_to_string(&real).unwrap(),
             "#!/usr/bin/env node\nconsole.log('zg')\n"
         );
+    }
+
+    #[test]
+    fn interpreter_wrapper_preserves_extension() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "lib/cli/index.js",
+            b"#!/usr/bin/env node\nconsole.log('zg')\n",
+        );
+        let meta = meta_with_app("zg", "lib/cli/index.js", Some("node"));
+
+        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+
+        // The preserved sibling keeps the extension (node's ESM loader
+        // dispatches on it) — `index.real.js`, not `index.js.real`.
+        let real = stage.path().join("lib/cli/index.real.js");
+        assert!(real.is_file(), "extension must survive the .real rename");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "#!/usr/bin/env node\nconsole.log('zg')\n"
+        );
+    }
+
+    #[test]
+    fn real_sibling_name_inserts_before_extension() {
+        assert_eq!(real_sibling_name("index.js"), "index.real.js");
+        assert_eq!(real_sibling_name("cli.mjs"), "cli.real.mjs");
+        assert_eq!(real_sibling_name("index.min.js"), "index.min.real.js");
+        assert_eq!(real_sibling_name("zdemo"), "zdemo.real");
+        // A dotfile has no extension — append.
+        assert_eq!(real_sibling_name(".profile"), ".profile.real");
     }
 
     #[test]
