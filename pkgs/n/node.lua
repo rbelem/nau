@@ -1,4 +1,4 @@
--- Node.js: JavaScript runtime built on Chrome's V8 (LTS line 22).
+-- Node.js: JavaScript runtime built on Chrome's V8 (current line 26).
 --
 -- Ported from the devbox global profile into a shuttle source package.
 -- Uses the official prebuilt linux-x64 binaries (same artifact class as
@@ -9,13 +9,13 @@
 return {
     default = snap {
         name = "node",
-        version = "22.23.2",
-        summary = "Node.js JavaScript runtime (V8, LTS 22)",
+        version = "26.7.0",
+        summary = "Node.js JavaScript runtime (V8, current 26)",
         description = [[
             Node.js is a JavaScript runtime built on Chrome's V8
             JavaScript engine, executing JS outside the browser with an
             event-driven, non-blocking I/O model. This package ships the
-            official prebuilt linux-x64 binaries of the LTS 22 line,
+            official prebuilt linux-x64 binaries of the current 26 line,
             which interpreter-based pod packages (e.g. zg) exec at
             runtime via their `interpreter = "node"` app wrappers.
         ]],
@@ -25,8 +25,8 @@ return {
         architectures = { "amd64" },
 
         source = {
-            url = "https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz",
-            sha256 = "d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307",
+            url = "https://nodejs.org/dist/v26.7.0/node-v26.7.0-linux-x64.tar.xz",
+            sha256 = "982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee",
         },
 
         -- The tarball root is node-v<version>-linux-x64/ and $SRC points
