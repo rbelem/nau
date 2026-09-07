@@ -68,6 +68,8 @@ return {
                 .. "'fi' "
                 .. "'exec \"$APP\" \"$@\"' "
                 .. "> $STAGE/usr/bin/hermes-desktop",
+            "mkdir -p $STAGE/usr/share/applications",
+            "printf '%s\\n' \"[Desktop Entry]\" 'Type=Application' 'Name=Hermes Desktop' 'GenericName=Hermes Agent GUI' 'Comment=The Hermes Agent desktop app — memory, skills, agents, outside the terminal' 'Exec=/usr/bin/hermes-desktop' 'Terminal=false' 'Categories=Development;' > $STAGE/usr/share/applications/hermes-desktop.desktop",
             "chmod +x $STAGE/usr/bin/hermes-desktop",
         }, " && "),
 
@@ -77,6 +79,7 @@ return {
         apps = {
             ["hermes-desktop"] = app {
                 command = "usr/bin/hermes-desktop",
+                desktop = "usr/share/applications/hermes-desktop.desktop",
             },
         },
     },
