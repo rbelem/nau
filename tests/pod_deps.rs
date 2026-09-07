@@ -238,7 +238,9 @@ fn write_npm_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16
     std::fs::write(approot.join("package-lock.json"), lock).unwrap();
     std::fs::write(
         approot.join("cli.js"),
-        "const d = require(\"ndep\");\nconsole.log(d.say());\n",
+        // The argv echo proves the build-time wrapper forwards the tool's
+        // arguments through its single exec (issue #9).
+        "const d = require(\"ndep\");\nconsole.log(d.say());\nconsole.log(process.argv.slice(2).join(\" \"));\n",
     )
     .unwrap();
     tar_czf(server, "app-src.tar.gz", "approot");
@@ -322,7 +324,8 @@ fn write_pip_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16
         "import os, sys\n\
          sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), \"site-packages\"))\n\
          import pcalc\n\
-         print(pcalc.say())\n",
+         print(pcalc.say())\n\
+         print(\" \".join(sys.argv[1:]))\n",
     )
     .unwrap();
     tar_czf(server, "py-src.tar.gz", "pyapproot");
@@ -374,8 +377,15 @@ fn current_farm(root: &Path, pod: &str) -> PathBuf {
 /// tools a wrapper needs: readlink, dirname, the interpreter) — the
 /// farm-executes acceptance criterion.
 fn run_farm_app(farm: &Path, app: &str) -> String {
+    run_farm_app_args(farm, app, &[])
+}
+
+/// Run a farm app with extra argv (issue #9: the wrapper must forward the
+/// tool's arguments through its single exec).
+fn run_farm_app_args(farm: &Path, app: &str, args: &[&str]) -> String {
     let host_path = std::env::var("PATH").unwrap_or_default();
     let out = Command::new(app)
+        .args(args)
         .env("PATH", format!("{}:{}", farm.display(), host_path))
         .output()
         .expect("spawn farm app");
@@ -467,6 +477,13 @@ gated_test!(node_deps_fetch_build_and_farm_executes, &["node"], {
         out.contains("node-dep-ran"),
         "node app must run its fetched dependency: {out:?}"
     );
+
+    // Issue #9: the tree wrapper's single exec forwards the tool's args.
+    let out = run_farm_app_args(&farm, "zndapp", &["--flag", "positional"]);
+    assert!(
+        out.contains("--flag positional"),
+        "node farm app must receive forwarded arguments: {out:?}"
+    );
 });
 
 // ── Acceptance: Python closure fetch → offline build → farm executes ──
@@ -497,6 +514,13 @@ gated_test!(pip_deps_fetch_build_and_farm_executes, &["python3"], {
     assert!(
         out.contains("python-dep-ran"),
         "python app must run its fetched dependency: {out:?}"
+    );
+
+    // Issue #9: the tree wrapper's single exec forwards the tool's args.
+    let out = run_farm_app_args(&farm, "pycapp", &["--flag", "positional"]);
+    assert!(
+        out.contains("--flag positional"),
+        "python farm app must receive forwarded arguments: {out:?}"
     );
 });
 

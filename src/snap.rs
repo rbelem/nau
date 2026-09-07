@@ -1966,13 +1966,15 @@ fn emit_script_tree_wrapper(
     };
     // The farm symlink resolves to the wrapper blob at
     // `<podroot>/store/<aa>/<hash>` — three dirnames to the pod root
-    // (same derivation as the #10 ELF lib wrapper).
+    // (same derivation as the #10 ELF lib wrapper). Args forward to the
+    // tool exactly like the flat #9 wrapper (`exec "$i" "$s" "$@"`) — a
+    // deps-closure CLI takes arguments just the same.
     let wrapper = format!(
         "#!/bin/sh\n\
          SCRIPT=\"$(readlink -f \"$0\")\"\n\
          PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
          {pythonpath_block}\
-         exec \"{interpreter}\" \"{tree_script}\"\n"
+         exec \"{interpreter}\" \"{tree_script}\" \"$@\"\n"
     );
     write_wrapper(app_name, entry, &wrapper)
 }
@@ -8412,6 +8414,60 @@ mod wrapper_tests {
             "wrapper must put the tree's site-packages on PYTHONPATH: {wrapper}"
         );
         assert!(wrapper.contains("export PYTHONPATH"), "{wrapper}");
+        // Issue #9 criterion: a single exec that forwards the tool's
+        // arguments (`exec "$interpreter" "$script" "$@"`).
+        assert!(
+            wrapper.contains("exec \"python3\" \"$PODROOT/"),
+            "wrapper must exec the tree script: {wrapper}"
+        );
+        assert_eq!(
+            wrapper
+                .lines()
+                .filter(|l| l.trim_start().starts_with("exec "))
+                .count(),
+            1,
+            "wrapper must contain exactly one exec: {wrapper}"
+        );
+        assert!(
+            wrapper.trim_end().ends_with("\"$@\""),
+            "tree wrapper must forward the tool's arguments: {wrapper}"
+        );
+    }
+
+    #[test]
+    fn node_tree_script_forwards_args_without_pythonpath() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "lib/node_modules/tool/cli.js",
+            b"#!/usr/bin/env node\nrequire('dep')\n",
+        );
+        // A node interpreter app WITH a deps closure runs from the
+        // extension tree (ADR-0017) — issue #9's Node-style package. Node
+        // resolves modules by adjacency, so unlike python there is no
+        // PYTHONPATH block, but the args still forward.
+        let mut meta = meta_with_app("tool", "lib/node_modules/tool/cli.js", Some("node"));
+        meta.deps = Some(crate::snap::PackageDeps {
+            npm: None,
+            pip: None,
+        });
+
+        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+
+        let wrapper = std::fs::read_to_string(script).unwrap();
+        assert!(
+            wrapper.contains("extensions/pkg/usr/lib/node_modules/tool/cli.real.js"),
+            "wrapper must exec the tree script: {wrapper}"
+        );
+        assert!(
+            !wrapper.contains("PYTHONPATH"),
+            "node needs no PYTHONPATH handoff: {wrapper}"
+        );
+        assert!(
+            wrapper.trim_end().ends_with("\"$@\""),
+            "tree wrapper must forward the tool's arguments: {wrapper}"
+        );
     }
 
     #[test]
