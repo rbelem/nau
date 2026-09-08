@@ -762,6 +762,12 @@ pub fn build_disk_image(
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {e}"))?;
     let root = build_dir.path().to_path_buf();
+    // Scratch dir for build ARTIFACTS (disk.img, standalone partition files,
+    // UKI stage, kernel-snap extraction) — deliberately separate from
+    // build_dir, because build_dir IS the staged rootfs: anything left here
+    // would be copied into the partitions by `mkfs.ext4 -d`.
+    let scratch = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create scratch directory: {e}"))?;
 
     // 3. Extract base snap and merge the kernel payload
     let kernel_payload = extract_base_and_kernel(
@@ -769,7 +775,7 @@ pub fn build_disk_image(
         &resolved,
         cache_dir,
         &root,
-        build_dir.path(),
+        scratch.path(),
         has_unsquashfs,
     )?;
 
@@ -908,7 +914,7 @@ pub fn build_disk_image(
 
     // 7. Create and partition the raw image — GPT PARTUUIDs exist from
     // parted mkpart time, before anything is formatted or copied.
-    let img_path = build_dir.path().join("disk.img");
+    let img_path = scratch.path().join("disk.img");
     create_partitions(&img_path, &effective_layout, total_mb)?;
     // ADR-0011 step (d): A/B layouts additionally get GPT partition type
     // GUIDs + PARTLABELs so systemd-sysupdate can match the slots.
@@ -959,7 +965,29 @@ pub fn build_disk_image(
         let root_idx = slots.roots[0];
         refuse_non_ext4_vfat(&effective_layout.partitions[root_idx])?;
         let part_label = format!("{}_{}_{}", image.name, image.version, slot_suffix(0));
-        let root_file = extent_file(build_dir.path(), "root.img", &extents[root_idx])?;
+        // 9a. Rootfs-level manifest only: boot facts (cmdline, roothash) are
+        // unknowable until after verity format, and a post-format write would
+        // break the Merkle tree. The root partition therefore carries the
+        // content manifest (boot = None); the authoritative boot-facts
+        // manifest is written below and lands on the remaining partitions.
+        write_manifest(&root, image, &snap_paths, arch, None)?;
+        // Unprivileged populate prerequisite: snap packaging ships sentinel
+        // dirs with no-owner-read modes (snapd's `var/lib/snapd/void` is
+        // 111 --x--x--x), which `mkfs.ext4 -d` cannot scan without root.
+        // Normalize to owner-accessible (u+rwX) before any `-d` populate;
+        // the adjusted modes are what the filesystem — and the verity hash
+        // over it — will carry.
+        let status = std::process::Command::new("chmod")
+            .args(["-R", "u+rwX", root.to_string_lossy().as_ref()])
+            .status()
+            .map_err(|e| miette::miette!("chmod not found: {e}"))?;
+        if !status.success() {
+            return Err(miette::miette!(
+                "chmod -R u+rwX failed on the staged rootfs — refusing to populate \
+                 from a tree mkfs cannot scan"
+            ));
+        }
+        let root_file = extent_file(scratch.path(), "root.img", &extents[root_idx])?;
         // Root populate failure fails closed (exit status carries it): an
         // empty verity data device would brick the boot — unlike the
         // historical silent-skip on the other partitions.
@@ -975,7 +1003,7 @@ pub fn build_disk_image(
             effective_layout.partitions[root_idx].name, effective_layout.partitions[root_idx].fs
         );
         let hash_idx = slots.hashes[0].expect("verity ⇒ hash partition was appended");
-        let hash_file = extent_file(build_dir.path(), "verity-hash.img", &extents[hash_idx])?;
+        let hash_file = extent_file(scratch.path(), "verity-hash.img", &extents[hash_idx])?;
         let roothash = verity_format(
             &root_file.to_string_lossy(),
             &hash_file.to_string_lossy(),
@@ -1015,7 +1043,7 @@ pub fn build_disk_image(
             kernel_payload.as_ref(),
             &extents,
             &effective_layout,
-            build_dir.path(),
+            scratch.path(),
             Some(&verity_args),
         )?;
         (uki, stage, slots.skip_indices())
@@ -1026,7 +1054,7 @@ pub fn build_disk_image(
             kernel_payload.as_ref(),
             &extents,
             &effective_layout,
-            build_dir.path(),
+            scratch.path(),
             None,
         )?;
         (uki, stage, slots.skip_indices())
@@ -1046,7 +1074,7 @@ pub fn build_disk_image(
     let populate = PopulateCtx {
         image,
         extents: &extents,
-        build_dir: build_dir.path(),
+        scratch_dir: scratch.path(),
         root: &root,
         uki: uki.as_ref(),
         uki_stage: &uki_stage,
@@ -1363,7 +1391,7 @@ fn read_partition_extents(
 struct PopulateCtx<'a> {
     image: &'a ImageDeclaration,
     extents: &'a [PartitionExtent],
-    build_dir: &'a Path,
+    scratch_dir: &'a Path,
     root: &'a Path,
     uki: Option<&'a UkiFacts>,
     uki_stage: &'a Path,
@@ -1561,13 +1589,13 @@ fn populate_side_partition(
 ) -> miette::Result<()> {
     refuse_non_ext4_vfat(part)?;
     let extent = &ctx.extents[index];
-    let part_file = extent_file(ctx.build_dir, &format!("part-{}.img", index + 1), extent)?;
+    let part_file = extent_file(ctx.scratch_dir, &format!("part-{}.img", index + 1), extent)?;
     if index == 0 && part.fs == "vfat" {
         build_esp_partition(ctx, &part_file, part)?;
     } else {
         build_data_partition(ctx, &part_file, part, extent)?;
     }
-    splice_into(&ctx.build_dir.join("disk.img"), &part_file, extent)
+    splice_into(&ctx.scratch_dir.join("disk.img"), &part_file, extent)
 }
 
 /// mkfs.vfat the standalone ESP file and copy the staged boot tree on with
@@ -1579,7 +1607,7 @@ fn build_esp_partition(
     part_file: &Path,
     part: &Partition,
 ) -> miette::Result<()> {
-    let esp_stage = ctx.build_dir.join("esp-staging");
+    let esp_stage = ctx.scratch_dir.join("esp-staging");
     populate_esp(&esp_stage.join("EFI").join("BOOT"))?;
     install_uki(ctx.image, &esp_stage, ctx.uki, ctx.uki_stage)?;
     let (tool, flags) = mkfs_flags_for("vfat", false)?;
@@ -2347,18 +2375,39 @@ fn populate_esp(efi_boot: &Path) -> miette::Result<()> {
     if efi_boot.join("BOOTX64.EFI").exists() {
         return Ok(());
     }
-    if let Ok(out) = std::process::Command::new("sh")
-        .args([
-            "-c",
-            "find /usr/lib/systemd/boot -name '*.efi' 2>/dev/null | head -1",
-        ])
-        .output()
-    {
-        let src = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !src.is_empty() {
-            let _ = std::fs::copy(&src, efi_boot.join("BOOTX64.EFI"));
-            let _ = std::fs::copy(&src, efi_boot.join("systemd-bootx64.efi"));
+    // systemd-boot fallback binary: exact name first (a `*.efi` glob would
+    // also match linuxx64.efi.stub — the WRONG binary for BOOTX64.EFI),
+    // across the standard FHS roots and the NixOS system profile.
+    const BOOT_ROOTS: [&str; 3] = [
+        "/usr/lib/systemd/boot",
+        "/usr/local/lib/systemd/boot",
+        "/run/current-system/sw/lib/systemd/boot",
+    ];
+    let mut src: Option<PathBuf> = None;
+    for root in BOOT_ROOTS {
+        let root = Path::new(root);
+        let exact = root.join("efi/systemd-bootx64.efi");
+        if exact.is_file() {
+            src = Some(exact);
+            break;
         }
+        if let Ok(out) = std::process::Command::new("find")
+            .arg(root)
+            .arg("-name")
+            .arg("systemd-boot*.efi")
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let hit = stdout.lines().next().unwrap_or("");
+            if !hit.trim().is_empty() {
+                src = Some(PathBuf::from(hit.trim()));
+                break;
+            }
+        }
+    }
+    if let Some(src) = src {
+        let _ = std::fs::copy(&src, efi_boot.join("BOOTX64.EFI"));
+        let _ = std::fs::copy(&src, efi_boot.join("systemd-bootx64.efi"));
     }
     Ok(())
 }
