@@ -712,20 +712,24 @@ pub fn build_image(
     Ok(output_path)
 }
 
-/// Build a full disk image with partitions.
+/// Build a full disk image with partitions — fully unprivileged: every
+/// partition is built as a standalone file at its read-back extent and
+/// spliced into the image; no loop device is attached and nothing is
+/// mounted.
 ///
 /// ADR-0011 step (a): when a kernel is declared, a UKI (Unified Kernel
 /// Image) is assembled with `ukify` and installed on the ESP at
 /// `EFI/Linux/<name>_<version>.efi` alongside a `loader/loader.conf`, so
 /// declared kernel params land on the real boot cmdline. ADR-0011 step (c):
-/// the root partition is populated first, then dm-verity is formatted over
-/// it (`veritysetup`) into an auto-appended hash partition, and the captured
-/// roothash is embedded in the UKI cmdline (explicit
-/// `systemd.verity_root_data`/`systemd.verity_root_hash` by-partuuid
-/// devices — boot needs no dm-verity type GUIDs). Every condition that
-/// would yield an unbootable or unverifiable image — missing ukify, missing
-/// sd-stub, missing veritysetup, no kernel payload, no root partition —
-/// fails closed, before any partition is formatted.
+/// the root partition file is populated first, then dm-verity is formatted
+/// over the quiescent file (`veritysetup`) into an auto-appended hash
+/// partition, and the captured roothash is embedded in the UKI cmdline
+/// (explicit `systemd.verity_root_data`/`systemd.verity_root_hash`
+/// by-partuuid devices — boot needs no dm-verity type GUIDs). Every
+/// condition that would yield an unbootable or unverifiable image —
+/// missing ukify, missing sd-stub, missing veritysetup, missing mtools or
+/// mkfs tools, no kernel payload, no root partition — fails closed, before
+/// any partition is formatted.
 pub fn build_disk_image(
     image: &ImageDeclaration,
     output_dir: &Path,
@@ -866,6 +870,19 @@ pub fn build_disk_image(
         }
     }
 
+    // 6a. Unprivileged populate pre-flight — the standalone-partition-file
+    // build formats and fills partitions with these host tools and leaves
+    // no loop device behind that could hide a missing one; fail closed
+    // BEFORE dd, mirroring the verity pre-flight above.
+    let populate_tools = [
+        ("sfdisk", find_host_tool("sfdisk")),
+        ("mmd", find_host_tool("mmd")),
+        ("mcopy", find_host_tool("mcopy")),
+        ("mkfs.ext4", find_host_tool("mkfs.ext4")),
+        ("mkfs.vfat", find_host_tool("mkfs.vfat")),
+    ];
+    preflight_populate_tools_with(&populate_tools)?;
+
     // 6b. Effective layout: kernel images get a dm-verity hash partition
     // appended after the declared partitions, and `disk.ab = true` clones
     // the root (+ hash) into slot B — existing indices never shift and the
@@ -897,14 +914,29 @@ pub fn build_disk_image(
     // GUIDs + PARTLABELs so systemd-sysupdate can match the slots.
     apply_gpt_slot_metadata(&img_path, image, &effective_layout, &slots)?;
 
-    // 8. Attach the image to a loop device with partition scanning.
-    let loop_dev = attach_loop(&img_path)?;
+    // 8. Read back the authoritative partition extents with one `sfdisk -J`
+    // call — parted's "MB" units are decimal (10^6) and sector-aligned
+    // ("36MB" lands on sector 69632), so the in-memory MB ledger is never
+    // trusted for byte offsets. Every partition needing content is then
+    // built as a standalone file at its exact extent size and spliced in.
+    let expected_partitions = effective_layout.partitions.len()
+        + usize::from(
+            effective_layout
+                .swap
+                .as_ref()
+                .is_some_and(|s| parse_size_mb(&s.size, 0) > 0),
+        );
+    let extents = read_partition_extents(&img_path, expected_partitions)?;
+    eprintln!(
+        "  ✓ partition table read back: {} partitions at verified extents",
+        extents.len()
+    );
 
-    // 9. ADR-0011 step (c): the pipeline order below is mandatory — each
-    // root slot is populated and UNMOUNTED first, then dm-verity formats it
-    // (the data device must be final before hashing; a cmdline is immutable
-    // once the UKI is later signed), then the UKI embeds the captured
-    // roothash in its cmdline.
+    // 9. ADR-0011 step (c): the pipeline order below is mandatory — the
+    // root partition file is populated first and stays quiescent, then
+    // dm-verity formats the file (the data device must be final before
+    // hashing; a cmdline is immutable once the UKI is later signed), then
+    // the UKI embeds the captured roothash in its cmdline.
     let (uki, uki_stage, populated_roots) = if verity {
         // 9a. Rootfs-level manifest only: boot facts (cmdline, roothash) are
         // unknowable until after verity format, and a post-format write
@@ -912,55 +944,60 @@ pub fn build_disk_image(
         // the content manifest; the authoritative boot-facts manifest is
         // written below and lands on the remaining partitions.
         write_manifest(&root, image, &snap_paths, arch, None)?;
-        // 9b-c. Per slot, in order: populate the root partition, then leave
-        // it unmounted — veritysetup format requires the data device
-        // quiescent — then format dm-verity over it into the slot's hash
-        // partition. Slot B (A/B layouts) is populated and verity-formatted
-        // identically: a same-version twin sharing slot A's roothash (same
-        // data + same explicit salt), making it a usable day-one rollback
-        // target. Any roothash divergence fails closed.
+        // 9b-c. The root partition FILE is built once — populated and then
+        // dm-verity-formatted (data quiescent) — and spliced into slot A;
+        // A/B layouts splice byte-identical copies into every other slot.
+        // Same data + same explicit salt (`shared_salt`) by construction:
+        // one format, one roothash, identical bytes behind every slot —
+        // the historical per-slot roothash-match assert is subsumed, and
+        // slot B stays a usable day-one rollback twin.
         let shared_salt = if effective_layout.ab {
             Some(random_salt_hex()?)
         } else {
             None
         };
-        let mut slot_roothash: Option<String> = None;
-        for (s, &root_idx) in slots.roots.iter().enumerate() {
-            let part_label = format!("{}_{}_{}", image.name, image.version, slot_suffix(s));
-            populate_root_partition_at(
-                &effective_layout,
-                root_idx,
-                &loop_dev,
-                &root,
-                build_dir.path(),
-            )?;
-            let root_dev = partition_dev(&loop_dev, root_idx);
-            let hash_idx = slots.hashes[s].expect("verity ⇒ hash partition was appended");
-            let hash_dev = partition_dev(&loop_dev, hash_idx);
-            let roothash = verity_format(&root_dev, &hash_dev, shared_salt.as_deref())?;
+        let root_idx = slots.roots[0];
+        refuse_non_ext4_vfat(&effective_layout.partitions[root_idx])?;
+        let part_label = format!("{}_{}_{}", image.name, image.version, slot_suffix(0));
+        let root_file = extent_file(build_dir.path(), "root.img", &extents[root_idx])?;
+        // Root populate failure fails closed (exit status carries it): an
+        // empty verity data device would brick the boot — unlike the
+        // historical silent-skip on the other partitions.
+        build_ext4_partition(
+            &root_file,
+            &root,
+            &effective_layout.partitions[root_idx],
+            &extents[root_idx],
+            true,
+        )?;
+        eprintln!(
+            "  ✓ {}: {} populated (slot a / {part_label}, standalone file)",
+            effective_layout.partitions[root_idx].name, effective_layout.partitions[root_idx].fs
+        );
+        let hash_idx = slots.hashes[0].expect("verity ⇒ hash partition was appended");
+        let hash_file = extent_file(build_dir.path(), "verity-hash.img", &extents[hash_idx])?;
+        let roothash = verity_format(
+            &root_file.to_string_lossy(),
+            &hash_file.to_string_lossy(),
+            shared_salt.as_deref(),
+        )?;
+        eprintln!(
+            "  ✓ dm-verity formatted over {} (slot a / {part_label})",
+            root_file.display()
+        );
+        splice_into(&img_path, &root_file, &extents[root_idx])?;
+        splice_into(&img_path, &hash_file, &extents[hash_idx])?;
+        for (s, &r) in slots.roots.iter().enumerate().skip(1) {
+            let h = slots.hashes[s].expect("verity ⇒ hash partition was appended");
+            splice_into(&img_path, &root_file, &extents[r])?;
+            splice_into(&img_path, &hash_file, &extents[h])?;
             eprintln!(
-                "  ✓ dm-verity formatted over {root_dev} (slot {} / {part_label})",
+                "  ✓ slot {} spliced byte-identical from slot a (rollback twin)",
                 slot_suffix(s)
             );
-            match &slot_roothash {
-                None => slot_roothash = Some(roothash),
-                Some(first) if *first == roothash => {}
-                Some(first) => {
-                    return Err(miette::miette!(
-                        "slot twin roothash mismatch (slot a: {first}, slot {}: \
-                         {roothash}) — the A/B roots must be byte-identical twins; \
-                         refusing an image whose rollback slot cannot be verified",
-                        slot_suffix(s)
-                    ));
-                }
-            }
         }
-        let roothash = slot_roothash.expect("verity branch formats at least one slot");
-        // The UKI boots slot A: its hash PARTUUID is slot A's hash device.
-        let hash_partuuid = partuuid_of(&partition_dev(
-            &loop_dev,
-            slots.hashes[0].expect("verity ⇒ hash partition was appended"),
-        ));
+        // The UKI boots slot A: its hash PARTUUID is slot A's hash extent.
+        let hash_partuuid = extents[hash_idx].partuuid.clone();
         if hash_partuuid.is_none() {
             eprintln!(
                 "  ⚠ hash PARTUUID unresolvable — cmdline carries the documented \
@@ -976,7 +1013,7 @@ pub fn build_disk_image(
         let (uki, stage) = assemble_uki(
             image,
             kernel_payload.as_ref(),
-            &loop_dev,
+            &extents,
             &effective_layout,
             build_dir.path(),
             Some(&verity_args),
@@ -987,7 +1024,7 @@ pub fn build_disk_image(
         let (uki, stage) = assemble_uki(
             image,
             kernel_payload.as_ref(),
-            &loop_dev,
+            &extents,
             &effective_layout,
             build_dir.path(),
             None,
@@ -999,25 +1036,22 @@ pub fn build_disk_image(
     // the image boots with, including the dm-verity roothash (step (c)).
     write_manifest(&root, image, &snap_paths, arch, uki.as_ref())?;
 
-    // 11. Format and populate the remaining partitions — the ESP gets the
-    // UKI + loader.conf; other data partitions receive the staged rootfs
-    // (with the authoritative manifest). The root slots and verity-hash
-    // partitions are skipped: they were populated and verity-formatted
-    // above (slot B's identical staged rootfs makes it the rollback twin).
+    // 11. Format and populate the remaining partitions as standalone files
+    // spliced at their read-back extents — the ESP gets the UKI +
+    // loader.conf via mtools (no mount); other data partitions receive the
+    // staged rootfs (with the authoritative manifest) through `mkfs.ext4
+    // -d`. The root slots and verity-hash partitions are skipped: they were
+    // populated and verity-formatted above (slot B's spliced bytes make it
+    // the rollback twin).
     let populate = PopulateCtx {
         image,
-        loop_dev: &loop_dev,
+        extents: &extents,
         build_dir: build_dir.path(),
         root: &root,
         uki: uki.as_ref(),
         uki_stage: &uki_stage,
     };
     populate_remaining_partitions(&populate, &effective_layout, &populated_roots)?;
-
-    // Detach loop device
-    let _ = std::process::Command::new("losetup")
-        .args(["-d", &loop_dev])
-        .status();
 
     // 12. Copy final image to output
     std::fs::copy(&img_path, &output_path).into_diagnostic()?;
@@ -1223,128 +1257,377 @@ fn create_swap_partition(
     Ok(())
 }
 
-/// Attach the disk image to a free loop device with partition scanning
-/// (`-P`), so partition devices exist for PARTUUID capture.
-fn attach_loop(img_path: &Path) -> miette::Result<String> {
-    let out = std::process::Command::new("losetup")
-        .args(["--show", "-fP", &img_path.to_string_lossy()])
+/// One partition's authoritative geometry + GPT PARTUUID, read back from
+/// the finished partition table. `start_bytes`/`size_bytes` are derived
+/// from sfdisk's 512-byte-sector `start`/`size` fields (scaled by the
+/// table's reported sector-size when present); the vec index equals the
+/// parted partition number - 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartitionExtent {
+    start_bytes: u64,
+    size_bytes: u64,
+    partuuid: Option<String>,
+}
+
+/// Parse `sfdisk -J` JSON into partition extents. Fail closed: a missing
+/// partitiontable, a missing/invalid start or size, or unparseable JSON is
+/// an error — a guessed offset would splice a filesystem over the wrong
+/// partition.
+fn parse_partition_extents(json: &str) -> miette::Result<Vec<PartitionExtent>> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+        miette::miette!(
+            "sfdisk -J printed unparseable JSON ({e}) — refusing to guess partition offsets"
+        )
+    })?;
+    let table = value.get("partitiontable").ok_or_else(|| {
+        miette::miette!(
+            "sfdisk -J output carries no 'partitiontable' — refusing to guess \
+             partition offsets"
+        )
+    })?;
+    let sector_size = table
+        .get("sector-size")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(512);
+    let partitions = table
+        .get("partitions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            miette::miette!(
+                "sfdisk -J output carries no 'partitiontable.partitions' array — \
+                 refusing to guess partition offsets"
+            )
+        })?;
+    partitions
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let sector = |key: &str| -> miette::Result<u64> {
+                part.get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "sfdisk -J partition {} carries no valid '{key}' sector \
+                             field — refusing to guess partition offsets",
+                            i + 1
+                        )
+                    })
+            };
+            Ok(PartitionExtent {
+                start_bytes: sector("start")? * sector_size,
+                size_bytes: sector("size")? * sector_size,
+                partuuid: part
+                    .get("uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+/// Read the authoritative partition geometry back from the finished image
+/// with one `sfdisk -J` call. `expected` is the partition count
+/// [`create_partitions`] laid out (declared partitions + swap); a mismatch
+/// fails closed — populating from misaligned extents would corrupt
+/// neighboring partitions.
+fn read_partition_extents(
+    img_path: &Path,
+    expected: usize,
+) -> miette::Result<Vec<PartitionExtent>> {
+    let out = std::process::Command::new("sfdisk")
+        .args(["-J", &img_path.to_string_lossy()])
         .output()
-        .map_err(|e| miette::miette!("losetup not found: {e}"))?;
+        .map_err(|e| miette::miette!("sfdisk not found: {e}"))?;
     if !out.status.success() {
-        return Err(miette::miette!("losetup failed"));
+        return Err(miette::miette!(
+            "sfdisk -J failed reading back the partition table ({}): {}",
+            out.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
-    let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    eprintln!("  loop device: {}", dev);
-    Ok(dev)
+    let extents = parse_partition_extents(&String::from_utf8_lossy(&out.stdout))?;
+    if extents.len() != expected {
+        return Err(miette::miette!(
+            "partition table read-back found {} partitions but the layout created \
+             {expected} — refusing to populate from misaligned extents",
+            extents.len()
+        ));
+    }
+    Ok(extents)
 }
 
 /// Shared context for the populate stage — everything the per-partition
-/// workers need besides the partition itself.
+/// workers need besides the partition itself. Partition geometry comes
+/// from the read-back [`PartitionExtent`]s; every partition is built as a
+/// standalone file and spliced, so nothing here is a device path.
 struct PopulateCtx<'a> {
     image: &'a ImageDeclaration,
-    loop_dev: &'a str,
+    extents: &'a [PartitionExtent],
     build_dir: &'a Path,
     root: &'a Path,
     uki: Option<&'a UkiFacts>,
     uki_stage: &'a Path,
 }
 
-/// Format, mount, and populate ONLY the given root slot partition (mount =
-/// "/") from the staged rootfs, then unmount it. ADR-0011 step (c):
-/// `veritysetup format` needs the data device final and quiescent, so each
-/// root goes first and stays unmounted. A mount failure here fails closed —
-/// an empty verity data device would brick the boot — unlike the historical
-/// silent-skip on the other partitions.
-fn populate_root_partition_at(
-    layout: &DiskLayout,
-    idx: usize,
-    loop_dev: &str,
-    root: &Path,
-    build_dir: &Path,
-) -> miette::Result<()> {
-    let part = &layout.partitions[idx];
-    let part_dev = partition_dev(loop_dev, idx);
-    let mount_pt = build_dir.join(&part.name);
-    std::fs::create_dir_all(&mount_pt).into_diagnostic()?;
+/// Create (or truncate) a standalone partition file at the EXACT extent
+/// size — a larger file would make [`splice_into`] overrun the next
+/// partition; a smaller one would splice short. Sparse, zero-filled.
+fn extent_file(build_dir: &Path, name: &str, extent: &PartitionExtent) -> miette::Result<PathBuf> {
+    let path = build_dir.join(name);
+    let f = std::fs::File::create(&path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("creating {}", path.display()))?;
+    f.set_len(extent.size_bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("sizing {} to {} bytes", path.display(), extent.size_bytes))?;
+    Ok(path)
+}
 
-    // The verity branch: this root IS the verity data device — pin the fs
-    // to 4 KiB blocks (VERITY_BLOCK_SIZE) or the mount over the verity
-    // mapping fails ("bad block size 1024").
-    format_partition(&part_dev, part, true)?;
-    if !mount_device(&part_dev, &mount_pt)? {
+/// Splice a fully-built standalone partition file into the image at its
+/// extent offset — in-process `io::copy` bounded by `.take()`, so neither
+/// a mis-sized source nor a future regression can overrun the next
+/// partition.
+fn splice_into(img: &Path, part_file: &Path, extent: &PartitionExtent) -> miette::Result<()> {
+    use std::io::{Read, Seek, Write};
+    let mut dst = std::fs::OpenOptions::new()
+        .write(true)
+        .open(img)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("opening {}", img.display()))?;
+    dst.seek(std::io::SeekFrom::Start(extent.start_bytes))
+        .into_diagnostic()
+        .wrap_err("seeking into the disk image")?;
+    let src = std::fs::File::open(part_file)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("opening {}", part_file.display()))?;
+    let copied = std::io::copy(&mut src.take(extent.size_bytes), &mut dst)
+        .into_diagnostic()
+        .wrap_err("splicing a partition into the disk image")?;
+    if copied != extent.size_bytes {
         return Err(miette::miette!(
-            "failed to mount root partition '{}' ({part_dev}) — refusing to \
-             dm-verity-format an unpopulated root",
-            part.name
+            "partition file {} is {} bytes short of its extent — refusing to splice \
+             a short partition (the tail would carry stale image bytes)",
+            part_file.display(),
+            extent.size_bytes - copied
         ));
     }
-    cp_r(root, &mount_pt)?;
-    eprintln!("  ✓ {}: {} populated", part.name, part.fs);
-    // Unmount
-    let _ = std::process::Command::new("umount")
-        .arg(mount_pt.to_string_lossy().as_ref())
-        .status();
+    dst.flush().into_diagnostic()?;
     Ok(())
 }
 
-/// Format and populate every partition EXCEPT the root slots (already
-/// populated before dm-verity formatting, [`populate_root_partition_at`])
-/// and the auto-appended verity-hash partitions (raw `veritysetup` output —
-/// never mounted or mkfs'd) — both carried in `skip`. Partition 1 when vfat
-/// is the ESP (systemd-boot fallback binary, UKI, loader.conf); every other
-/// partition receives the staged rootfs.
+/// Fail closed on filesystems the file-based (unprivileged) build cannot
+/// populate: `mkfs.btrfs` cannot fill a filesystem from a directory tree,
+/// so btrfs needs a loop-device backend.
+fn refuse_non_ext4_vfat(part: &Partition) -> miette::Result<()> {
+    match part.fs.as_str() {
+        "ext4" | "vfat" => Ok(()),
+        other => Err(miette::miette!(
+            "partition '{}' declares filesystem '{other}' — the unprivileged image \
+             build supports ext4 and vfat; btrfs needs a loop-device backend",
+            part.name
+        )),
+    }
+}
+
+/// mkfs + populate a standalone ext4 partition file from a staged tree in
+/// one `mkfs.ext4 -d` pass — no mount, no root. The file must already be
+/// truncated to the exact extent ([`extent_file`]); the block count pins
+/// the filesystem inside it (mkfs may leave an unused tail — fine, it can
+/// never overrun). The verity variant pins [`VERITY_BLOCK_SIZE`] fs blocks
+/// via [`mkfs_flags_for`] so the root mounts over its dm-verity mapping.
+fn build_ext4_partition(
+    part_file: &Path,
+    staged_root: &Path,
+    part: &Partition,
+    extent: &PartitionExtent,
+    verity: bool,
+) -> miette::Result<()> {
+    let (tool, flags) = mkfs_flags_for(&part.fs, verity)?;
+    let block_count = (extent.size_bytes / u64::from(VERITY_BLOCK_SIZE)).to_string();
+    let mut args: Vec<String> = flags;
+    args.push(part.name.clone()); // label — mkfs_flags_for ends its flags with the label option
+    args.push("-d".into());
+    args.push(staged_root.to_string_lossy().into_owned());
+    args.push(part_file.to_string_lossy().into_owned());
+    args.push(block_count);
+    let status = std::process::Command::new(tool)
+        .args(&args)
+        .status()
+        .map_err(|e| miette::miette!("{tool} not found: {e}"))?;
+    if !status.success() {
+        return Err(miette::miette!(
+            "{tool} -d failed to build the {} partition '{}' (exit {})",
+            part.fs,
+            part.name,
+            status.code().unwrap_or(1)
+        ));
+    }
+    Ok(())
+}
+
+/// Sorted-walk helper for [`mtools_populate_vfat`]: relative paths of
+/// every file and directory under `staged`, parents before children.
+fn collect_staged_entries(
+    staged: &Path,
+    rel: &Path,
+    out: &mut Vec<(String, bool)>,
+) -> miette::Result<()> {
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(staged)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading {}", staged.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .into_diagnostic()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let child_rel = rel.join(entry.file_name());
+        if entry.path().is_dir() {
+            out.push((child_rel.to_string_lossy().into_owned(), true));
+            collect_staged_entries(&entry.path(), &child_rel, out)?;
+        } else {
+            out.push((child_rel.to_string_lossy().into_owned(), false));
+        }
+    }
+    Ok(())
+}
+
+/// Populate a standalone vfat file (the ESP) with mtools — no mount, no
+/// root. The staged tree is walked in sorted order (directories before
+/// their contents fall out of a lexicographic sort: a parent path is a
+/// strict prefix of its children) so the FAT layout is deterministic;
+/// each directory is created with `mmd`, each file copied with `mcopy`.
+/// Only the exit status decides — mkfs/mtools may print benign warnings
+/// (e.g. "less than suggested minimum clusters" on small extents).
+fn mtools_populate_vfat(vfat_file: &Path, staged: &Path) -> miette::Result<()> {
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    collect_staged_entries(staged, Path::new(""), &mut entries)?;
+    entries.sort();
+    for (rel, is_dir) in entries {
+        let target = format!("::/{rel}");
+        if is_dir {
+            let status = std::process::Command::new("mmd")
+                .args(["-i", &vfat_file.to_string_lossy(), &target])
+                .status()
+                .map_err(|e| miette::miette!("mmd not found: {e}"))?;
+            if !status.success() {
+                return Err(miette::miette!("mmd failed creating {target} on the ESP"));
+            }
+        } else {
+            let status = std::process::Command::new("mcopy")
+                .args(["-i", &vfat_file.to_string_lossy()])
+                .arg(staged.join(&rel))
+                .arg(&target)
+                .status()
+                .map_err(|e| miette::miette!("mcopy not found: {e}"))?;
+            if !status.success() {
+                return Err(miette::miette!("mcopy failed copying /{rel} onto the ESP"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build and splice every partition EXCEPT the root slots (already
+/// populated + verity-formatted in [`build_disk_image`] step 9) and the
+/// auto-appended verity-hash partitions (raw `veritysetup` output — never
+/// mkfs'd, never mounted) — both carried in `skip`. Partition 1 when vfat
+/// is the ESP (systemd-boot fallback binary, UKI, loader.conf — staged
+/// into a tree and copied on with mtools); every other partition receives
+/// the staged rootfs through `mkfs.ext4 -d`.
 fn populate_remaining_partitions(
     ctx: &PopulateCtx,
     layout: &DiskLayout,
     skip: &[usize],
 ) -> miette::Result<()> {
-    let part_prefix = format!("{}p", ctx.loop_dev);
     for (i, part) in layout.partitions.iter().enumerate() {
         if skip.contains(&i) || part.name == VERITY_HASH_PART_NAME {
             continue;
         }
-        populate_side_partition(ctx, i, part, &part_prefix)?;
+        populate_side_partition(ctx, i, part)?;
     }
     Ok(())
 }
 
-/// Format, mount, populate, and unmount one non-root partition: the ESP
-/// (partition 1, vfat) gets the systemd-boot fallback + UKI; other data
-/// partitions receive the staged rootfs. A mount failure leaves the
-/// partition unpopulated (historical silent-skip behavior).
+/// Build one non-root partition as a standalone file and splice it in:
+/// the ESP (partition 1, vfat) is mkfs.vfat'd and populated with mtools
+/// from the staged EFI tree; other data partitions receive the staged
+/// rootfs via `mkfs.ext4 -d`. Failures here leave the partition
+/// unpopulated (historical warn-not-fatal side-partition behavior); a
+/// btrfs (or other unpopulatable) filesystem fails closed
+/// ([`refuse_non_ext4_vfat`]).
 fn populate_side_partition(
     ctx: &PopulateCtx,
     index: usize,
     part: &Partition,
-    part_prefix: &str,
 ) -> miette::Result<()> {
-    let part_dev = format!("{part_prefix}{}", index + 1);
-    let mount_pt = ctx.build_dir.join(&part.name);
-    std::fs::create_dir_all(&mount_pt).into_diagnostic()?;
+    refuse_non_ext4_vfat(part)?;
+    let extent = &ctx.extents[index];
+    let part_file = extent_file(ctx.build_dir, &format!("part-{}.img", index + 1), extent)?;
+    if index == 0 && part.fs == "vfat" {
+        build_esp_partition(ctx, &part_file, part)?;
+    } else {
+        build_data_partition(ctx, &part_file, part, extent)?;
+    }
+    splice_into(&ctx.build_dir.join("disk.img"), &part_file, extent)
+}
 
-    // Side partitions (ESP, data) are never verity data devices.
-    format_partition(&part_dev, part, false)?;
-    if !mount_device(&part_dev, &mount_pt)? {
+/// mkfs.vfat the standalone ESP file and copy the staged boot tree on with
+/// mtools (no offset syntax needed — the file IS the partition).
+/// Warn-not-fatal: a failure leaves the ESP unpopulated (historical
+/// side-partition behavior — the mount attempt used to decide).
+fn build_esp_partition(
+    ctx: &PopulateCtx,
+    part_file: &Path,
+    part: &Partition,
+) -> miette::Result<()> {
+    let esp_stage = ctx.build_dir.join("esp-staging");
+    populate_esp(&esp_stage.join("EFI").join("BOOT"))?;
+    install_uki(ctx.image, &esp_stage, ctx.uki, ctx.uki_stage)?;
+    let (tool, flags) = mkfs_flags_for("vfat", false)?;
+    let mut args: Vec<String> = flags;
+    args.push(part.name.clone()); // -n label
+    args.push(part_file.to_string_lossy().into_owned());
+    let status = std::process::Command::new(tool)
+        .args(&args)
+        .status()
+        .map_err(|e| miette::miette!("{tool} not found: {e}"))?;
+    if !status.success() {
+        eprintln!("  ⚠ {tool} failed for {} — ESP left unpopulated", part.name);
         return Ok(());
     }
-    if index == 0 && part.fs == "vfat" {
-        populate_esp(&mount_pt.join("EFI").join("BOOT"))?;
-        install_uki(ctx.image, &mount_pt, ctx.uki, ctx.uki_stage)?;
-        eprintln!("  ✓ ESP: {} (vfat)", part.name);
-    } else {
-        // Data partition: copy the staged rootfs
-        cp_r(ctx.root, &mount_pt)?;
-        eprintln!("  ✓ {}: {} populated", part.name, part.fs);
+    if let Err(e) = mtools_populate_vfat(part_file, &esp_stage) {
+        eprintln!(
+            "  ⚠ mtools failed populating the ESP ({}): {e:#}",
+            part.name
+        );
+        return Ok(());
     }
-    // Unmount
-    let _ = std::process::Command::new("umount")
-        .arg(mount_pt.to_string_lossy().as_ref())
-        .status();
+    eprintln!("  ✓ ESP: {} (vfat)", part.name);
+    Ok(())
+}
+
+/// mkfs + populate one data partition from the staged rootfs (authoritative
+/// manifest included) through `mkfs.ext4 -d`, then splice it in.
+/// Warn-not-fatal: a failure leaves the partition unpopulated (historical
+/// side-partition behavior — the mount attempt used to decide).
+fn build_data_partition(
+    ctx: &PopulateCtx,
+    part_file: &Path,
+    part: &Partition,
+    extent: &PartitionExtent,
+) -> miette::Result<()> {
+    if let Err(e) = build_ext4_partition(part_file, ctx.root, part, extent, false) {
+        eprintln!(
+            "  ⚠ {}: {} populate failed ({e:#}) — partition left unpopulated",
+            part.name, part.fs
+        );
+        return Ok(());
+    }
+    eprintln!("  ✓ {}: {} populated", part.name, part.fs);
     Ok(())
 }
 
 /// mkfs tool + leading flags for one partition filesystem (the label and
-/// device args are appended by the caller). `verity` marks the partition as
+/// remaining args are appended by the caller). `verity` marks the partition as
 /// a dm-verity data device (a root slot in the verity branch): the
 /// filesystem is then pinned to [`VERITY_BLOCK_SIZE`] blocks so it mounts
 /// over the verity mapping — ext4 via `-b`, btrfs via nodesize +
@@ -1377,34 +1660,6 @@ fn mkfs_flags_for(fs: &str, verity: bool) -> miette::Result<(&'static str, Vec<S
         (_, false) => ("mkfs.ext4", vec!["-F".into(), "-L".into()]),
     };
     Ok((tool, flags))
-}
-
-/// mkfs a partition device; a formatting failure is reported but not fatal
-/// (matching the historical behavior — the mount attempt below decides).
-/// The `verity` precondition check fails closed before any command runs.
-fn format_partition(part_dev: &str, part: &Partition, verity: bool) -> miette::Result<()> {
-    let (tool, flags) = mkfs_flags_for(&part.fs, verity)?;
-    let status = std::process::Command::new(tool)
-        .args(&flags)
-        .arg(&part.name)
-        .arg(part_dev)
-        .status()
-        .map_err(|e| miette::miette!("{tool} not found: {e}"))?;
-    if !status.success() {
-        eprintln!("  ⚠ {tool} failed for {}", part.name);
-    }
-    Ok(())
-}
-
-/// Mount a formatted partition device. False when the mount failed — the
-/// partition is then left unpopulated (historical silent-skip behavior).
-fn mount_device(part_dev: &str, mount_pt: &Path) -> miette::Result<bool> {
-    let mount_str = mount_pt.to_string_lossy().into_owned();
-    let status = std::process::Command::new("mount")
-        .args([part_dev, &mount_str])
-        .status()
-        .map_err(|e| miette::miette!("mount not found: {e}"))?;
-    Ok(status.success())
 }
 
 // ── dm-verity over the root partition (ADR-0011 step (c)) ──
@@ -1547,11 +1802,6 @@ fn expand_ab_slots(layout: &mut DiskLayout, verity: bool) -> miette::Result<Slot
     Ok(Slots { roots, hashes })
 }
 
-/// Loop-device partition path for a 0-based layout index (index 0 → p1).
-fn partition_dev(loop_dev: &str, index: usize) -> String {
-    format!("{loop_dev}p{}", index + 1)
-}
-
 /// Size in bytes of the dm-verity hash partition for a data device of
 /// `data_bytes`: with sha256 over 4K data blocks and 4K hash blocks, one
 /// hash block covers 512 KiB of data (128 × 32-byte digests), so the Merkle
@@ -1630,6 +1880,45 @@ fn preflight_disk_tools_with(
     Ok(())
 }
 
+/// Host tool pre-flight for the unprivileged populate stage: the disk
+/// build formats and fills standalone partition files with these tools
+/// (extent read-back via sfdisk, ESP via mtools, ext4/vfat via mkfs), so a
+/// missing one fails closed BEFORE dd — half-written images are never
+/// emitted. `required` pairs each tool name with its host resolution.
+fn preflight_populate_tools_with(required: &[(&str, Option<PathBuf>)]) -> miette::Result<()> {
+    for (name, resolved) in required {
+        if resolved.is_none() {
+            let package = populate_tool_package(name);
+            return Err(miette::miette!(
+                "{name} not found on PATH — the disk build reads back partition \
+                 extents and formats + populates standalone partition files with \
+                 it, so refusing to start. Run 'shuttle doctor' and install it \
+                 (e.g. apt install {package} or add {package} to devbox.json \
+                 packages)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// OS package that ships each pre-flighted populate tool (doctor hint).
+fn populate_tool_package(name: &str) -> &'static str {
+    match name {
+        "sfdisk" => "util-linux",
+        "mmd" | "mcopy" => "mtools",
+        "mkfs.ext4" => "e2fsprogs",
+        "mkfs.vfat" => "dosfstools",
+        _ => "the matching OS package",
+    }
+}
+
+/// Resolve a host build tool with the shared bind-aware PATH resolution
+/// ([`crate::snap::resolve_in_path`]) — the same search set as
+/// [`find_ukify`]/[`find_veritysetup`].
+fn find_host_tool(name: &str) -> Option<PathBuf> {
+    snap::resolve_in_path(name, &snap::path_entries())
+}
+
 /// veritysetup argv for a sha256/4K format-1 invocation, optional pinned
 /// salt, devices last.
 fn verity_format_args(salt: Option<&str>, data_dev: &str, hash_dev: &str) -> Vec<String> {
@@ -1693,6 +1982,8 @@ fn verity_format_with(
 /// Format dm-verity over `data_dev` into `hash_dev` with host-resolved
 /// veritysetup (fail-closed when absent). `salt` pins the format salt
 /// (A/B slot twins share one salt so identical data → identical roothash).
+/// In the unprivileged flow both "devices" are standalone partition files
+/// — veritysetup format/verify run userspace and accept plain files.
 fn verity_format(data_dev: &str, hash_dev: &str, salt: Option<&str>) -> miette::Result<String> {
     verity_format_with(find_veritysetup().as_deref(), data_dev, hash_dev, salt)
 }
@@ -1797,12 +2088,14 @@ fn random_salt_hex() -> miette::Result<String> {
 }
 
 /// Apply GPT slot metadata (type GUIDs + PARTLABELs) for A/B layouts via
-/// `sfdisk` (util-linux — same tool family as the build's losetup; the
+/// `sfdisk` (util-linux — the same tool the extents read-back uses; the
 /// parted `type` command needs 3.5+, sgdisk is not required). Runs on the
-/// raw image file BEFORE loop attach, so the loop scan exposes final
+/// raw image file BEFORE the extents read-back, so the table carries final
 /// metadata. Fail-open, never silent: a missing or failing sfdisk warns
 /// loudly — sysupdate partition matching degrades, the image still boots —
-/// mirroring the historical ESP-flag posture.
+/// mirroring the historical ESP-flag posture. (The unprivileged populate
+/// pre-flight already fails closed on a missing sfdisk; this guard covers
+/// a resolve-vs-which PATH mismatch.)
 fn apply_gpt_slot_metadata(
     img_path: &Path,
     image: &ImageDeclaration,
@@ -2125,8 +2418,8 @@ struct UkiFacts {
 /// Documented placeholder strategy: the nil GUID makes the failure loud —
 /// nothing can mount a partition that does not exist, so the image never
 /// silently boots from the wrong volume. In practice the real PARTUUID is
-/// captured: parted assigns GPT GUIDs at mkpart time and `losetup -P`
-/// exposes the partition devices before the UKI is built.
+/// captured: parted assigns GPT GUIDs at mkpart time and `sfdisk -J` reads
+/// them back from the finished table before the UKI is built.
 const NIL_PARTUUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Standard locations of the systemd sd-stub for x86_64 — all under the
@@ -2211,26 +2504,6 @@ fn discover_kernel_version(root: &Path) -> miette::Result<String> {
             "ambiguous kernel module trees {many:?} in the merged rootfs — a kernel \
              snap must carry exactly one lib/modules/<version>"
         )),
-    }
-}
-
-/// GPT PARTUUID of a loop-device partition (e.g. /dev/loop0p2), read
-/// host-side with lsblk (util-linux — the same tool family the disk build
-/// already requires). None when lsblk is absent or the partition carries
-/// no GPT entry.
-fn partuuid_of(part_dev: &str) -> Option<String> {
-    let out = std::process::Command::new("lsblk")
-        .args(["-no", "PARTUUID", part_dev])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
     }
 }
 
@@ -2367,7 +2640,7 @@ fn build_uki(
 fn assemble_uki(
     image: &ImageDeclaration,
     payload: Option<&KernelPayload>,
-    loop_dev: &str,
+    extents: &[PartitionExtent],
     layout: &DiskLayout,
     stage_dir: &Path,
     verity: Option<&VerityBootArgs>,
@@ -2384,10 +2657,11 @@ fn assemble_uki(
     };
     let root_idx = root_partition_index(layout)?;
 
-    // GPT PARTUUIDs exist from parted mkpart time; `losetup -P` exposes the
-    // partition devices before anything is formatted. ESP is partition 1.
-    let root_partuuid = partuuid_of(&format!("{loop_dev}p{}", root_idx + 1));
-    let esp_partuuid = partuuid_of(&format!("{loop_dev}p1"));
+    // GPT PARTUUIDs exist from parted mkpart time and are read back from
+    // the finished table (`sfdisk -J`) before anything is formatted. ESP
+    // is partition 1 (extent index 0).
+    let root_partuuid = extents[root_idx].partuuid.clone();
+    let esp_partuuid = extents[0].partuuid.clone();
     if root_partuuid.is_none() {
         eprintln!(
             "  ⚠ root PARTUUID unresolvable — cmdline carries the documented \
@@ -3818,5 +4092,212 @@ mod tests {
         assert_eq!(salt.len(), 64, "32 bytes hex: {salt}");
         assert!(salt.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(random_salt_hex().unwrap(), salt, "fresh entropy per call");
+    }
+
+    // ── Unprivileged partition assembly (file-based extents) ──
+
+    /// Realistic `sfdisk -J` shape (validated host output): 512-byte
+    /// sectors, hyphenated-uppercase GPT PARTUUIDs, and a partition whose
+    /// uuid is null (swap-like entries / sparse GPT entries).
+    const SFDISK_J_FIXTURE: &str = r#"{
+      "partitiontable": {
+        "label": "gpt",
+        "id": "9F86D081-0000-0000-0000-000000000000",
+        "sector-size": 512,
+        "grain": 512,
+        "partitions": [
+         {
+          "node": "loop0p1",
+          "start": 8192,
+          "size": 61440,
+          "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+          "uuid": "ECEBC506-9E2D-4A62-9B0D-3B17F8A41C10"
+         },
+         {
+          "node": "loop0p2",
+          "start": 69632,
+          "size": 204800,
+          "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+          "uuid": "11223344-5566-7788-99AA-BBCCDDEEFF00"
+         },
+         {
+          "node": "loop0p3",
+          "start": 274432,
+          "size": 204800,
+          "type": "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F",
+          "uuid": null
+         }
+        ]
+      }
+    }"#;
+
+    #[test]
+    fn partition_extents_parse_sectors_bytes_and_partuuids() {
+        let extents = parse_partition_extents(SFDISK_J_FIXTURE).unwrap();
+        assert_eq!(extents.len(), 3);
+        assert_eq!(extents[0].start_bytes, 8192 * 512);
+        assert_eq!(extents[0].size_bytes, 61440 * 512);
+        assert_eq!(
+            extents[0].partuuid.as_deref(),
+            Some("ECEBC506-9E2D-4A62-9B0D-3B17F8A41C10")
+        );
+        // Index = parted partition number - 1, in table order.
+        assert_eq!(extents[1].start_bytes, 69632 * 512);
+        assert_eq!(extents[1].size_bytes, 204800 * 512);
+        // A null uuid is the documented Option path — never an error.
+        assert_eq!(extents[2].partuuid, None);
+    }
+
+    #[test]
+    fn partition_extents_scale_by_reported_sector_size() {
+        let json = r#"{"partitiontable":{"sector-size":4096,"partitions":[
+            {"start":8,"size":16,"uuid":null}]}}"#;
+        let extents = parse_partition_extents(json).unwrap();
+        assert_eq!(extents[0].start_bytes, 8 * 4096);
+        assert_eq!(extents[0].size_bytes, 16 * 4096);
+    }
+
+    #[test]
+    fn partition_extents_default_to_512b_sectors() {
+        // The validated minimal host shape: no sector-size key at all.
+        let json = r#"{"partitiontable":{"partitions":[{"start":8192,"size":61440,"uuid":"X"}]}}"#;
+        let extents = parse_partition_extents(json).unwrap();
+        assert_eq!(extents[0].start_bytes, 8192 * 512);
+        assert_eq!(extents[0].size_bytes, 61440 * 512);
+    }
+
+    #[test]
+    fn partition_extents_fail_closed_without_table_or_sectors() {
+        for bad in [
+            r#"{"something":1}"#,
+            r#"{"partitiontable":{}}"#,
+            r#"{"partitiontable":{"partitions":[{"size":10}]}}"#,
+            r#"{"partitiontable":{"partitions":[{"start":10}]}}"#,
+            r#"{"partitiontable":{"partitions":[{"start":null,"size":10}]}}"#,
+            "not json",
+        ] {
+            let err = parse_partition_extents(bad).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("refusing"),
+                "must refuse to guess offsets: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn splice_places_exact_bytes_at_the_extent_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("img");
+        std::fs::write(&img, vec![0xFFu8; 16]).unwrap();
+        let part = dir.path().join("part.img");
+        std::fs::write(&part, vec![0xAAu8; 8]).unwrap();
+        let extent = PartitionExtent {
+            start_bytes: 4,
+            size_bytes: 8,
+            partuuid: None,
+        };
+        splice_into(&img, &part, &extent).unwrap();
+        let bytes = std::fs::read(&img).unwrap();
+        assert_eq!(bytes.len(), 16, "image size never changes");
+        assert!(bytes[..4].iter().all(|&b| b == 0xFF));
+        assert!(bytes[4..12].iter().all(|&b| b == 0xAA));
+        assert!(bytes[12..].iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn splice_refuses_a_short_partition_file() {
+        // take() bounds the copy so an oversized source can never overrun
+        // the next partition; a short source fails closed instead of
+        // splicing stale image bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("img");
+        std::fs::write(&img, vec![0xFFu8; 16]).unwrap();
+        let part = dir.path().join("part.img");
+        std::fs::write(&part, vec![0xAAu8; 4]).unwrap();
+        let extent = PartitionExtent {
+            start_bytes: 4,
+            size_bytes: 8,
+            partuuid: None,
+        };
+        let err = splice_into(&img, &part, &extent).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("short"),
+            "short splice must be loud: {err:#}"
+        );
+    }
+
+    #[test]
+    fn extent_file_is_truncated_to_the_exact_extent() {
+        let dir = tempfile::tempdir().unwrap();
+        let extent = PartitionExtent {
+            start_bytes: 0,
+            size_bytes: 4096,
+            partuuid: None,
+        };
+        let path = extent_file(dir.path(), "p.img", &extent).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+        // Re-creating truncates — a reused name never grows past its
+        // extent (an oversized file would make the splice overrun).
+        let smaller = PartitionExtent {
+            start_bytes: 0,
+            size_bytes: 1024,
+            partuuid: None,
+        };
+        let path = extent_file(dir.path(), "p.img", &smaller).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024);
+    }
+
+    #[test]
+    fn unprivileged_build_refuses_btrfs_fail_closed() {
+        let part = Partition {
+            name: "data".into(),
+            size: "1G".into(),
+            fs: "btrfs".into(),
+            mount: "/data".into(),
+            options: vec![],
+        };
+        let err = refuse_non_ext4_vfat(&part).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ext4 and vfat") && msg.contains("loop-device"),
+            "btrfs refusal must name the unprivileged constraint: {msg}"
+        );
+        // The supported pair passes.
+        for fs in ["ext4", "vfat"] {
+            let part = Partition {
+                fs: fs.into(),
+                ..part.clone()
+            };
+            refuse_non_ext4_vfat(&part).unwrap();
+        }
+    }
+
+    #[test]
+    fn preflight_populate_tools_missing_fails_closed_with_doctor_hint() {
+        let err = preflight_populate_tools_with(&[
+            ("sfdisk", Some(PathBuf::from("/usr/bin/sfdisk"))),
+            ("mmd", None),
+            ("mcopy", Some(PathBuf::from("/usr/bin/mcopy"))),
+            ("mkfs.ext4", Some(PathBuf::from("/usr/sbin/mkfs.ext4"))),
+            ("mkfs.vfat", Some(PathBuf::from("/usr/sbin/mkfs.vfat"))),
+        ])
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mmd") && msg.contains("shuttle doctor") && msg.contains("mtools"),
+            "fail-closed error must name the tool, the doctor hint, and the package: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_populate_tools_all_present_passes() {
+        preflight_populate_tools_with(&[
+            ("sfdisk", Some(PathBuf::from("/usr/bin/sfdisk"))),
+            ("mmd", Some(PathBuf::from("/usr/bin/mmd"))),
+            ("mcopy", Some(PathBuf::from("/usr/bin/mcopy"))),
+            ("mkfs.ext4", Some(PathBuf::from("/usr/sbin/mkfs.ext4"))),
+            ("mkfs.vfat", Some(PathBuf::from("/usr/sbin/mkfs.vfat"))),
+        ])
+        .unwrap();
     }
 }
