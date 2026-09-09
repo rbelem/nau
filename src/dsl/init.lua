@@ -403,9 +403,10 @@ function snap(opts)
         end
     end
 
-    -- deps: dependency-closure resolvers (ADR-0017, issue #13).
-    -- `deps = { npm = { lock = "package-lock.json" } }` or
-    -- `deps = { pip = { lock = "requirements.lock", index = "https://..." } }`.
+    -- deps: dependency-closure resolvers (ADR-0017, issues #13/#36).
+    -- `deps = { npm = { lock = "package-lock.json" } }`,
+    -- `deps = { pip = { lock = "requirements.lock", index = "https://..." } }`, or
+    -- `deps = { cargo = { lock = "Cargo.lock" } }`.
     -- Coexists with `source` (hybrid) or stands alone with it; the
     -- lockfile resolves from the source tree, so `source` is required.
     if opts.deps ~= nil then
@@ -414,9 +415,9 @@ function snap(opts)
         end
         local resolvers = {}
         for eco, resolver in pairs(opts.deps) do
-            if eco ~= "npm" and eco ~= "pip" then
+            if eco ~= "npm" and eco ~= "pip" and eco ~= "cargo" then
                 error(string.format(
-                    "snap(): deps: unknown resolver '%s' (supported: npm, pip)", eco), 2)
+                    "snap(): deps: unknown resolver '%s' (supported: npm, pip, cargo)", eco), 2)
             end
             if type(resolver) ~= "table" then
                 error(string.format("snap(): deps['%s'] must be a table, got %s", eco, type(resolver)), 2)
@@ -431,7 +432,7 @@ function snap(opts)
             table.insert(resolvers, eco)
         end
         if #resolvers == 0 then
-            error("snap(): deps must name at least one resolver: npm or pip", 2)
+            error("snap(): deps must name at least one resolver: npm, pip, or cargo", 2)
         end
         if opts.source == nil then
             error("snap(): 'deps' requires 'source' — the lockfile resolves from the package source tree", 2)

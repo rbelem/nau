@@ -1,21 +1,25 @@
-//! Dependency-closure fetch for interpreted packages (ADR-0017, issue #13).
+//! Dependency-closure fetch for interpreted and registry-built packages
+//! (ADR-0017, issues #13/#36).
 //!
-//! Interpreter-based packages (Node/Python CLIs) declare a `deps` closure —
-//! an ecosystem resolver plus its lockfile. This module implements the
-//! **fetch phase**: a pure downloader that runs OUTSIDE the build sandbox
-//! with network, resolves the dependency closure from the lockfile, and
-//! materializes it into a deterministic tree. The tree is digested
-//! NAR-style (sorted paths + contents) into a `deps_hash`, recorded in the
-//! pod's `shuttle.lock`, and stored as ONE content-addressed pod-store
-//! blob. The sandbox build later verifies that hash and mounts the entry
-//! read-only (`$SHUTTLE_DEPS_DIR`).
+//! Packages declare a `deps` closure — an ecosystem resolver plus its
+//! lockfile. This module implements the **fetch phase**: a pure downloader
+//! that runs OUTSIDE the build sandbox with network, resolves the
+//! dependency closure from the lockfile, and materializes it into a
+//! deterministic tree. The tree is digested NAR-style (sorted paths +
+//! contents) into a `deps_hash`, recorded in the pod's `shuttle.lock`, and
+//! stored as ONE content-addressed pod-store blob. The sandbox build later
+//! verifies that hash and mounts the entry read-only
+//! (`$SHUTTLE_DEPS_DIR`).
 //!
 //! Safety property (council-reviewed): **the fetch never executes
 //! lifecycle/install scripts on the host.** npm closures come from tarball
 //! GETs driven by the resolved lock (never `npm install`); pip closures
-//! are wheels fetched from a PEP 503 simple index (never `pip install`).
-//! Extraction is data-only — any install scripts ship inert inside the
-//! tree and only ever run, if at all, inside the offline sandbox.
+//! are wheels fetched from a PEP 503 simple index (never `pip install`);
+//! cargo closures are `.crate` downloads verified against the Cargo.lock
+//! checksums and extracted data-only into a `cargo vendor`-equivalent
+//! tree (never `cargo fetch`/`cargo build`). Extraction is data-only —
+//! any build scripts ship inert inside the tree and only ever run, if at
+//! all, inside the offline sandbox.
 //!
 //! The canonical archive format ("SHDEP") is a minimal, deterministic
 //! serialization: entries sorted by path, normalized modes (0755/0644 by
@@ -38,6 +42,12 @@ use crate::snap::{DepsLockSpec, SnapMeta};
 /// Default PyPI simple index for pip resolvers (overridable per resolver
 /// via `deps.pip.index` — tests point it at a loopback server).
 pub const DEFAULT_PIP_INDEX: &str = "https://pypi.org/simple";
+
+/// Default crates.io API base for cargo resolvers: `.crate` downloads are
+/// `GET {api}/{name}/{version}/download`, verified against the Cargo.lock
+/// checksum. Overridable per resolver via `deps.cargo.index` — tests point
+/// it at a loopback server (same seam as `deps.pip.index`).
+pub const DEFAULT_CRATES_API: &str = "https://crates.io/api/v1/crates";
 
 // ── Orchestration ──
 
@@ -134,6 +144,9 @@ fn fetch_deps_closure(
     }
     if let Some(pip) = &deps.pip {
         fetch_pip_closure(pip, &src_root, &tree, work.path())?;
+    }
+    if let Some(cargo) = &deps.cargo {
+        fetch_cargo_closure(cargo, &src_root, &tree, work.path())?;
     }
     let bytes = pack_canonical(&tree)?;
     write_store_blob(store, &bytes)
@@ -1099,6 +1112,184 @@ fn resolve_url(base: &str, href: &str) -> String {
     segments.join("/")
 }
 
+// ── cargo ──
+
+/// One crate pinned by Cargo.lock: its exact name/version and the
+/// registry checksum the fetch verifies the downloaded `.crate` against.
+#[derive(Debug)]
+struct CargoCrate {
+    name: String,
+    version: String,
+    checksum: String,
+}
+
+/// The `[[package]]` shape Cargo.lock actually carries for this resolver.
+/// `source`/`checksum` are absent for path/workspace members (they ship
+/// inside the package source tree and are never fetched).
+#[derive(serde::Deserialize)]
+struct CargoLockPackage {
+    name: String,
+    version: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    checksum: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CargoLockFile {
+    #[serde(default)]
+    package: Vec<CargoLockPackage>,
+}
+
+/// Parse Cargo.lock (lockfileVersion 3 and 4 share the registry entry
+/// shape): every `registry+https://...crates.io...` package is one
+/// artifact to fetch. Path/workspace members are skipped (they ship in
+/// the source tree); git dependencies and third-party registries are
+/// rejected — there is no crates.io download URL to verify them against.
+/// The lockfile drives the fetch — no cargo on the host.
+fn parse_cargo_lock(bytes: &[u8]) -> miette::Result<Vec<CargoCrate>> {
+    let lock: CargoLockFile = toml::from_str(
+        std::str::from_utf8(bytes)
+            .map_err(|e| miette::miette!("Cargo.lock is not valid UTF-8: {e}"))?,
+    )
+    .map_err(|e| miette::miette!("Cargo.lock is not valid TOML: {e}"))?;
+    let mut out = Vec::new();
+    for pkg in lock.package {
+        let Some(source) = &pkg.source else {
+            // Path/workspace member — resolved from the package source tree.
+            continue;
+        };
+        if source.starts_with("git+") {
+            miette::bail!(
+                "Cargo.lock: crate '{} {}' comes from a git dependency ({source}) — \
+                 git dependencies cannot be vendored from a registry; \
+                 vendor them into the source tree instead",
+                pkg.name,
+                pkg.version
+            );
+        }
+        if !(source.contains("crates.io")) {
+            miette::bail!(
+                "Cargo.lock: crate '{} {}' resolves against a non-crates.io registry \
+                 ({source}) — only crates.io registry crates can be fetched",
+                pkg.name,
+                pkg.version
+            );
+        }
+        let Some(checksum) = pkg.checksum else {
+            miette::bail!(
+                "Cargo.lock: crates.io crate '{} {}' has no checksum — \
+                 refusing an unverifiable artifact",
+                pkg.name,
+                pkg.version
+            );
+        };
+        out.push(CargoCrate {
+            name: pkg.name,
+            version: pkg.version,
+            checksum,
+        });
+    }
+    // Deterministic fetch order.
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+    Ok(out)
+}
+
+/// Fetch every Cargo.lock crate into a `cargo vendor`-equivalent tree:
+/// `tree/vendor/<name>-<version>/` holding the extracted `.crate` source
+/// (tarball root stripped) plus a `.cargo-checksum.json` declaring every
+/// file's sha256 and the original `.crate` checksum in `package` — the
+/// exact contract cargo's directory source enforces. The lockfile's
+/// checksum verifies each download BEFORE extraction, so the closure hash
+/// pins lockfile-verified content.
+fn fetch_cargo_closure(
+    spec: &DepsLockSpec,
+    src_root: &Path,
+    tree: &Path,
+    work: &Path,
+) -> miette::Result<()> {
+    let api = spec.index.as_deref().unwrap_or(DEFAULT_CRATES_API);
+    let lock_bytes = read_source_file(src_root, &spec.lock)?;
+    let crates = parse_cargo_lock(&lock_bytes)?;
+    crate::output::info(format!(
+        "cargo closure: {} crate(s) from {}",
+        crates.len(),
+        spec.lock
+    ));
+    let vendor = tree.join("vendor");
+    std::fs::create_dir_all(&vendor)
+        .map_err(|e| miette::miette!("creating {}: {e}", vendor.display()))?;
+    let dl = work.join("cargo-dl");
+    std::fs::create_dir_all(&dl).map_err(|e| miette::miette!("creating {}: {e}", dl.display()))?;
+    for c in &crates {
+        let url = format!("{api}/{}/{}/download", c.name, c.version);
+        let crate_file = dl.join(format!("{}-{}.crate", c.name, c.version));
+        http_get_to_file(&url, &crate_file)?;
+        let actual = sha256_file(&crate_file)?;
+        if !constant_eq(actual.as_bytes(), c.checksum.as_bytes()) {
+            let _ = std::fs::remove_file(&crate_file);
+            miette::bail!(
+                "cargo: crate {}-{} hash mismatch: expected {}, got {actual}",
+                c.name,
+                c.version,
+                c.checksum
+            );
+        }
+        let dest = vendor.join(format!("{}-{}", c.name, c.version));
+        extract_npm_tarball(&crate_file, &dest)
+            .map_err(|e| miette::miette!("cargo '{}-{}': {e}", c.name, c.version))?;
+        write_cargo_checksums(&dest, &c.checksum)?;
+    }
+    Ok(())
+}
+
+/// Write a vendored crate's `.cargo-checksum.json`: every regular file's
+/// sha256 (relative path, sorted) plus the `.crate`'s registry checksum
+/// under `package`. Without this file cargo's directory source refuses
+/// the crate; with it, cargo re-verifies the tree at build time.
+fn write_cargo_checksums(crate_dir: &Path, package_checksum: &str) -> miette::Result<()> {
+    let mut files = BTreeMap::new();
+    let mut stack = vec![crate_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = std::fs::read_dir(&dir)
+            .map_err(|e| miette::miette!("reading {}: {e}", dir.display()))?;
+        for entry in read.flatten() {
+            let path = entry.path();
+            let meta = entry
+                .metadata()
+                .map_err(|e| miette::miette!("stat {}: {e}", path.display()))?;
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.file_type().is_symlink() {
+                miette::bail!(
+                    "vendored crate {}: symlink entries are not supported ({})",
+                    crate_dir.display(),
+                    path.display()
+                );
+            } else {
+                let rel = path
+                    .strip_prefix(crate_dir)
+                    .expect("entry under the crate dir")
+                    .to_string_lossy()
+                    .into_owned();
+                // The checksum file is cargo's own metadata — never listed
+                // inside itself (mirrors `cargo vendor`, and keeps the
+                // function idempotent).
+                if rel == ".cargo-checksum.json" {
+                    continue;
+                }
+                let digest = sha256_file(&path)?;
+                files.insert(rel, digest);
+            }
+        }
+    }
+    let json = serde_json::json!({ "files": files, "package": package_checksum });
+    let out = crate_dir.join(".cargo-checksum.json");
+    std::fs::write(&out, json.to_string())
+        .map_err(|e| miette::miette!("writing {}: {e}", out.display()))
+}
+
 // ── Canonical archive (SHDEP) ──
 
 /// Deterministically serialize a materialized tree: entries sorted by
@@ -1326,10 +1517,20 @@ fn write_store_blob(store: &RuntimeStore, bytes: &[u8]) -> miette::Result<String
 
 // ── Small shared helpers ──
 
-/// curl download (the codebase's one network mechanism).
+/// curl download (the codebase's one network mechanism). A User-Agent is
+/// mandatory registry etiquette — crates.io 403s requests without one.
 fn http_get_to_file(url: &str, dest: &Path) -> miette::Result<()> {
     let status = std::process::Command::new("curl")
-        .args(["-fsSL", "-o"])
+        .args([
+            "-fsSL",
+            "-A",
+            concat!(
+                "shuttle/",
+                env!("CARGO_PKG_VERSION"),
+                " (dependency-closure fetch)"
+            ),
+            "-o",
+        ])
         .arg(dest)
         .arg(url)
         .status()
@@ -1942,5 +2143,175 @@ wheels = [
         assert!(verify_sri(&f, "sha512-AAAA").is_err());
         // Unsupported-only algorithm must fail, not silently pass.
         assert!(verify_sri(&f, "sha1-AAAA").is_err());
+    }
+
+    const CRATE_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+    #[test]
+    fn parse_cargo_lock_skips_members_sorts_registry_crates() {
+        // v3 shape; the v4 locks keep the same registry entry fields.
+        let lock = format!(
+            r#"
+# This file is automatically @generated by Cargo.
+version = 3
+
+[[package]]
+name = "statix"
+version = "0.5.8"
+dependencies = ["libc"]
+
+[[package]]
+name = "libc"
+version = "0.2.169"
+source = "{CRATE_IO}"
+checksum = "a60553f9a9e039a333b4e9b20573b9e9b9c0bb3a11e201ccc48ef4283456d673"
+
+[[package]]
+name = "aho-corasick"
+version = "0.7.18"
+source = "{CRATE_IO}"
+checksum = "1e37cfd5e7657ada45f742d6e99ca5788580b5c529dc78faf11ece6dc702656f"
+
+[[package]]
+name = "lib-member"
+version = "0.1.0"
+"#
+        );
+        let crates = parse_cargo_lock(lock.as_bytes()).unwrap();
+        // Workspace/path members (statix, lib-member) are skipped; the
+        // registry closure is sorted by name.
+        assert_eq!(crates.len(), 2);
+        assert_eq!(crates[0].name, "aho-corasick");
+        assert_eq!(crates[1].name, "libc");
+        assert_eq!(
+            crates[1].checksum,
+            "a60553f9a9e039a333b4e9b20573b9e9b9c0bb3a11e201ccc48ef4283456d673"
+        );
+    }
+
+    #[test]
+    fn parse_cargo_lock_rejects_git_dependency() {
+        let lock = r#"
+version = 3
+
+[[package]]
+name = "upstream"
+version = "0.1.0"
+source = "git+https://github.com/example/upstream#abc123"
+checksum = "1e37cfd5e7657ada45f742d6e99ca5788580b5c529dc78faf11ece6dc702656f"
+"#;
+        let err = parse_cargo_lock(lock.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("git dependency"), "{err}");
+    }
+
+    #[test]
+    fn parse_cargo_lock_rejects_registry_crate_without_checksum() {
+        let lock = format!(
+            r#"
+version = 3
+
+[[package]]
+name = "libc"
+version = "0.2.169"
+source = "{CRATE_IO}"
+"#
+        );
+        let err = parse_cargo_lock(lock.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("no checksum"), "{err}");
+    }
+
+    #[test]
+    fn parse_cargo_lock_rejects_non_crates_io_registry() {
+        let lock = r#"
+version = 3
+
+[[package]]
+name = "internal"
+version = "1.0.0"
+source = "registry+https://registry.example.com/index/"
+checksum = "1e37cfd5e7657ada45f742d6e99ca5788580b5c529dc78faf11ece6dc702656f"
+"#;
+        let err = parse_cargo_lock(lock.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("non-crates.io registry"), "{err}");
+    }
+
+    /// A `.crate` is a gzipped tarball rooted at `<name>-<version>/` — the
+    /// same shape the extraction path strips. Built in-process so the test
+    /// stays hermetic.
+    fn build_crate_tgz(dir: &Path, name: &str, version: &str, say: &str) -> Vec<u8> {
+        let root = dir.join(format!("{name}-{version}"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            format!("pub fn say() -> &'static str {{ \"{say}\" }}\n"),
+        )
+        .unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_dir_all(format!("{name}-{version}"), &root)
+            .unwrap();
+        builder.finish().unwrap();
+        let tar_bytes = builder.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar_bytes).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn cargo_crate_extracts_to_vendor_layout_with_checksum_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = build_crate_tgz(dir.path(), "pcrate", "0.1.0", "vendored");
+        let crate_file = dir.path().join("pcrate-0.1.0.crate");
+        std::fs::write(&crate_file, &bytes).unwrap();
+
+        let tree = dir.path().join("tree");
+        let vendor = tree.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        let dest = vendor.join("pcrate-0.1.0");
+        extract_npm_tarball(&crate_file, &dest).unwrap();
+        let checksum = sha256_file(&crate_file).unwrap();
+        write_cargo_checksums(&dest, &checksum).unwrap();
+
+        // The extracted crate source, tarball root stripped.
+        assert_eq!(
+            std::fs::read_to_string(dest.join("src/lib.rs")).unwrap(),
+            "pub fn say() -> &'static str { \"vendored\" }\n"
+        );
+        // The checksum file lists every file's sha256 plus the .crate
+        // checksum in `package` — the contract cargo's directory source
+        // enforces.
+        let text = std::fs::read_to_string(dest.join(".cargo-checksum.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let files = value["files"].as_object().unwrap();
+        assert!(files.contains_key("Cargo.toml"));
+        assert!(files.contains_key("src/lib.rs"));
+        assert_eq!(files.len(), 2);
+        let lib_sha = files["src/lib.rs"].as_str().unwrap();
+        let expected: String = Sha256::digest(b"pub fn say() -> &'static str { \"vendored\" }\n")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(lib_sha, expected);
+        assert_eq!(value["package"].as_str().unwrap(), checksum);
+    }
+
+    #[test]
+    fn cargo_checksum_file_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let crate_dir = dir.path().join("c-1.0.0");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(crate_dir.join("src/a.rs"), "a").unwrap();
+        std::fs::write(crate_dir.join("src/b.rs"), "b").unwrap();
+        write_cargo_checksums(&crate_dir, "deadbeef").unwrap();
+        let first = std::fs::read_to_string(crate_dir.join(".cargo-checksum.json")).unwrap();
+        write_cargo_checksums(&crate_dir, "deadbeef").unwrap();
+        let second = std::fs::read_to_string(crate_dir.join(".cargo-checksum.json")).unwrap();
+        assert_eq!(first, second, "checksum file must be byte-deterministic");
+        assert!(first.contains("\"package\":\"deadbeef\""), "{first}");
     }
 }

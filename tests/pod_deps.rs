@@ -1120,6 +1120,258 @@ gated_test!(pip_exclude_rejected_at_parse, &[], {
     assert_eq!(requests_for(&log, "/wheels/"), 0);
 });
 
+// ── cargo fixture (issue #36): crates served on the loopback, lock-pinned ──
+
+/// Build a minimal `.crate` (gzipped tarball rooted at `pcrate-0.1.0/`)
+/// and serve it at the crates.io download path the resolver fetches.
+/// Returns the crate's sha256 — the checksum the fixture's Cargo.lock
+/// pins. `say` is what the dependency returns at runtime: the closure's
+/// identity.
+fn write_cargo_dep_crate(server: &Path, say: &str) -> String {
+    let build = server.join("cratebuild");
+    let _ = std::fs::remove_dir_all(&build);
+    let root = build.join("pcrate-0.1.0");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"pcrate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    // A build script that must NEVER execute on the host (ADR-0017
+    // Decision 2) — same canary assertion as the npm postinstall
+    // fixture. Inside the sandbox it legitimately runs (cargo build
+    // scripts do) and its write lands on the read-only vendor mount,
+    // which the `let _ =` tolerates: the build stays green, and a host
+    // execution is still betrayed by the marker in the CWD.
+    std::fs::write(
+        root.join("build.rs"),
+        "fn main() { let _ = std::fs::write(\"HOST_CANARY_WAS_TOUCHED\", \"x\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        format!("pub fn say() -> &'static str {{ \"{say}\" }}\n"),
+    )
+    .unwrap();
+    let dl = server.join("api/v1/crates/pcrate/0.1.0");
+    std::fs::create_dir_all(&dl).unwrap();
+    let crate_path = dl.join("download");
+    let _ = std::fs::remove_file(&crate_path);
+    let status = Command::new("tar")
+        .args(["czf"])
+        .arg(&crate_path)
+        .args(["-C"])
+        .arg(&build)
+        .arg("pcrate-0.1.0")
+        .status()
+        .unwrap();
+    assert!(status.success(), "tar czf failed");
+    sha256_hex(&std::fs::read(&crate_path).unwrap())
+}
+
+/// Write the cargo fixture: a single-crate app whose Cargo.lock pins
+/// `pcrate` (loopback-served), plus the shuttle package building it
+/// OFFLINE against the mounted vendor closure.
+fn write_cargo_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let dir = project.join("pkgs").join(letter.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let checksum = write_cargo_dep_crate(server, say);
+
+    let approot = server.join("cargoapproot");
+    let _ = std::fs::remove_dir_all(&approot);
+    std::fs::create_dir_all(approot.join("src")).unwrap();
+    std::fs::write(
+        approot.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[dependencies]\npcrate = \"0.1\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        approot.join("src/main.rs"),
+        "fn main() {\n    println!(\"{}\", pcrate::say());\n    println!(\n        \"{}\",\n        std::env::args().skip(1).collect::<Vec<_>>().join(\" \")\n    );\n}\n",
+    )
+    .unwrap();
+    // Hand-written v3 lock — the same registry-entry shape real locks
+    // (v3 and v4) carry, pinned to the loopback crate's checksum.
+    std::fs::write(
+        approot.join("Cargo.lock"),
+        format!(
+            "version = 3\n\n[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\ndependencies = [\"pcrate\"]\n\n[[package]]\nname = \"pcrate\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"
+        ),
+    )
+    .unwrap();
+    tar_czf(server, "cargo-src.tar.gz", "cargoapproot");
+
+    let lua = r#"return { default = snap {
+    name = "@NAME@",
+    version = "1.0",
+    source = "http://127.0.0.1:@PORT@/cargo-src.tar.gz",
+    deps = { cargo = { lock = "Cargo.lock", index = "http://127.0.0.1:@PORT@/api/v1/crates" } },
+    build = table.concat({
+        "export CARGO_HOME=/tmp/shuttle-cargo-home CARGO_NET_OFFLINE=true",
+        "mkdir -p \"$CARGO_HOME\"",
+        "printf '[source.crates-io]\\nreplace-with = \"shuttle-vendored\"\\n\\n[source.shuttle-vendored]\\ndirectory = \"%s\"\\n' \"$SHUTTLE_DEPS_DIR/vendor\" > \"$CARGO_HOME/config.toml\"",
+        "cargo install --path $SRC --root $STAGE",
+    }, " && "),
+    apps = { @NAME@ = { command = "bin/@NAME@" } },
+} }
+"#
+    .replace("@NAME@", name)
+    .replace("@PORT@", &port.to_string());
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
+// ── Acceptance: cargo closure fetch → offline build → farm executes ──
+
+gated_test!(
+    cargo_deps_fetch_build_and_farm_executes,
+    &["cargo", "rustc", "cc"],
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let (port, log) = serve_dir(server.path());
+        write_cargo_pkg(
+            project.path(),
+            server.path(),
+            "zcrapp",
+            "cargo-dep-ran",
+            port,
+        );
+
+        // pod add auto-fetches the closure, builds offline, installs.
+        let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "add", "zcrapp"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+
+        // The closure pin is recorded in the pod lockfile with fetched_at.
+        let (hash, fetched_at) = lock_deps_pin(root.path(), "default", "zcrapp");
+        assert_eq!(hash.len(), 64, "deps_hash is a sha256 hex digest");
+        assert!(fetched_at.is_some(), "first fetch records fetched_at");
+
+        // The closure store entry exists, content-addressed by the pin.
+        let blob = pod_dir(root.path(), "default")
+            .join("store")
+            .join(&hash[..2])
+            .join(&hash);
+        assert!(blob.exists(), "closure blob at {}", blob.display());
+
+        // The fetch hit the crates.io download path on the loopback.
+        assert!(
+            requests_for(&log, "/api/v1/crates/pcrate/0.1.0/download") >= 1,
+            "the resolver must fetch the pinned crate: {:#?}",
+            log.lock().unwrap()
+        );
+
+        // SAFETY: nothing executed the dependency's build script on the host.
+        assert_no_canary(&[project.path(), root.path(), server.path()]);
+
+        // The farm binary executes — it linked the VENDORED dependency,
+        // so printing `say()` proves the offline closure was consumed.
+        let farm = current_farm(root.path(), "default");
+        let out = run_farm_app(&farm, "zcrapp");
+        assert!(
+            out.contains("cargo-dep-ran"),
+            "cargo app must run its vendored dependency: {out:?}"
+        );
+
+        // Native ELF: the single-exec wrapper story still forwards args.
+        let out = run_farm_app_args(&farm, "zcrapp", &["--flag", "positional"]);
+        assert!(
+            out.contains("--flag positional"),
+            "cargo farm app must receive forwarded arguments: {out:?}"
+        );
+    }
+);
+
+// ── A tampered cargo closure fails the build (hash mismatch) ──
+
+gated_test!(
+    tampered_cargo_closure_fails_build,
+    &["cargo", "rustc", "cc"],
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let (port, _log) = serve_dir(server.path());
+        write_cargo_pkg(
+            project.path(),
+            server.path(),
+            "ztampp",
+            "tamper-target",
+            port,
+        );
+
+        let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "ztampp"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+
+        // Flip a byte inside the stored closure blob (same path, different
+        // content) — the build-time verification must fail closed.
+        let (hash, _) = lock_deps_pin(root.path(), "default", "ztampp");
+        let blob = pod_dir(root.path(), "default")
+            .join("store")
+            .join(&hash[..2])
+            .join(&hash);
+        let mut bytes = std::fs::read(&blob).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&blob, &bytes).unwrap();
+
+        let (code, _, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+        assert_ne!(code, Some(0), "tampered closure must fail the build");
+        assert!(
+            stderr.contains("hash mismatch") || stderr.contains("corrupted"),
+            "failure must name the hash mismatch: {stderr}"
+        );
+    }
+);
+
+// ── A changed Cargo.lock moves the deps_hash (cache invalidation) ──
+
+gated_test!(
+    cargo_lock_change_moves_the_deps_hash,
+    &["cargo", "rustc", "cc"],
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let (port, log) = serve_dir(server.path());
+        write_cargo_pkg(project.path(), server.path(), "zlkapp", "lock-v1", port);
+
+        let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zlkapp"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        let (hash_a, _) = lock_deps_pin(root.path(), "default", "zlkapp");
+        let fetches_after_add = requests_for(&log, "/api/v1/crates/");
+
+        // Upstream moves: same crate URL, new bytes (new `say`) — the lock
+        // pins the new checksum, so the closure content and its hash move.
+        write_cargo_pkg(project.path(), server.path(), "zlkapp", "lock-v2", port);
+
+        // --latest re-resolves the closure deliberately and moves the pin.
+        let (code, stdout, stderr) = run(
+            project.path(),
+            root.path(),
+            &["pod", "rebuild", "zlkapp", "--latest"],
+        );
+        assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+        assert!(
+            requests_for(&log, "/api/v1/crates/") > fetches_after_add,
+            "--latest must re-fetch the moved closure; requests: {:#?}",
+            log.lock().unwrap()
+        );
+        let (hash_b, _) = lock_deps_pin(root.path(), "default", "zlkapp");
+        assert_ne!(hash_a, hash_b, "a changed Cargo.lock moves the deps_hash");
+
+        // The farm serves the NEW closure content.
+        let out = run_farm_app(&current_farm(root.path(), "default"), "zlkapp");
+        assert!(
+            out.contains("lock-v2"),
+            "farm serves the moved closure: {out:?}"
+        );
+    }
+);
+
 // ── `pod rebuild` (issue #15): rebuild one package at its pins ──
 
 /// The version pin recorded in the pod lockfile (None when absent).

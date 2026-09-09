@@ -140,8 +140,10 @@ pub struct DepsLockSpec {
     /// Lockfile path relative to the source root (e.g.
     /// "package-lock.json", "requirements.lock").
     pub lock: String,
-    /// Package index URL (pip only; default: the official PyPI simple
-    /// index). npm resolves from the lockfile's own `resolved` URLs.
+    /// Package index / registry API URL (index-driven ecosystems;
+    /// default: the official one — pip's PyPI simple index, cargo's
+    /// crates.io API base). npm resolves from the lockfile's own
+    /// `resolved` URLs. Tests point the override at a loopback server.
     pub index: Option<String>,
     /// Glob patterns (`*` / `?`) matched against lock keys
     /// (`node_modules/...`, full-key match); any key matching one is
@@ -850,11 +852,12 @@ fn package_deps_from_lua(t: &mlua::Table) -> miette::Result<PackageDeps> {
 }
 
 /// Parse one resolver's spec table: `lock` (required, relative to the
-/// source root), `index` (optional, pip only), and — npm only — `exclude`
-/// globs over lock keys (issue #14). pip and cargo reject `exclude`: pip
-/// has no lock keys to glob, and cargo vendoring has no exclusion seam —
-/// a Cargo.lock IS the closure, so partial vendoring would break the
-/// offline build it exists to serve.
+/// source root), `index` (optional registry override — pip's PEP 503
+/// index, cargo's crates.io API base), and — npm only — `exclude`
+/// globs over lock keys (issue #14). pip and cargo reject `exclude`:
+/// pip has no lock keys to glob, and cargo vendoring has no exclusion
+/// seam — a Cargo.lock IS the closure, so partial vendoring would break
+/// the offline build it exists to serve.
 fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLockSpec> {
     let lock = get_opt_string(t, "lock")?.ok_or_else(|| {
         miette::miette!(
@@ -870,12 +873,6 @@ fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLoc
         ));
     }
     let index = get_opt_string(t, "index")?;
-    if key == "cargo" && index.is_some() {
-        return Err(miette::miette!(
-            "deps.cargo: 'index' is not supported — crates resolve from the lockfile \
-             checksums against crates.io"
-        ));
-    }
     let exclude = match key {
         "npm" => npm_exclude_from_lua(t)?,
         _ => {
