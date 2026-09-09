@@ -32,6 +32,10 @@ indicatif = "0.18"
 # vendors (kept at identical versions; no new vendored code).
 flate2 = "1"
 tar = "0.4"
+# Go module zips (ADR-0017 extension, issue #40): the module proxy serves
+# each module as a ZIP archive (not a tar), read in-process at fetch time
+# with the standard library's DEFLATE stack — data-only, nothing executes.
+zip = "2"
 owo-colors = "4"
 libc = "0.2"
 clap_complete = "4"
@@ -54,3 +58,6 @@ sha2 = "0.10"
 base64 = "0.22"
 flate2 = "1"
 tar = "0.4"
+# Go module zip construction for the go resolver fixtures (issue #40):
+# the loopback proxy serves a real module zip in the proxy archive shape.
+zip = "2"

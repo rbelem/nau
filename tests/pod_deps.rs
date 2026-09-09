@@ -1372,6 +1372,264 @@ gated_test!(
     }
 );
 
+// ── go fixture (issue #40): modules served on the loopback, go.sum-pinned ──
+
+/// Build a real Go module zip (the proxy archive shape, rooted at
+/// `<module>@<version>/`) plus its `.mod`/`.info` under the loopback
+/// server, and return the go.sum hash lines for the module's zip and
+/// go.mod. `say` is what the dependency's exported function returns —
+/// the closure's identity.
+fn write_go_dep_module(server: &Path, module: &str, version: &str, say: &str) -> (String, String) {
+    let escaped = module.replace('!', "!");
+    let mdir = server.join(format!("{escaped}/@v"));
+    let _ = std::fs::remove_dir_all(server.join(&escaped));
+    std::fs::create_dir_all(&mdir).unwrap();
+    let mod_text = format!("module {module}\n\ngo 1.21\n");
+    let go_text = format!("package godep\n\nfunc Say() string {{ return \"{say}\" }}\n");
+    // The archive root is `<module>@<version>/` per the proxy contract.
+    let root = format!("{module}@{version}/");
+    let zip_path = mdir.join(format!("{version}.zip"));
+    let opts =
+        zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+    {
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        zw.start_file(format!("{root}go.mod"), opts).unwrap();
+        zw.write_all(mod_text.as_bytes()).unwrap();
+        zw.start_file(format!("{root}godep.go"), opts).unwrap();
+        zw.write_all(go_text.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    }
+    std::fs::write(mdir.join(format!("{version}.mod")), &mod_text).unwrap();
+    std::fs::write(
+        mdir.join(format!("{version}.info")),
+        format!(r#"{{"Version":"{version}","Time":"2026-01-01T00:00:00Z"}}"#),
+    )
+    .unwrap();
+    // go.sum hash lines.
+    let zip_h = go_dirhash_zip(&zip_path);
+    let mod_h = go_dirhash_file(mod_text.as_bytes());
+    (zip_h, mod_h)
+}
+
+/// The Go dirhash (`h1:`) over a module zip member list, exactly as the
+/// resolver computes it — reimplemented here so the fixture's go.sum
+/// matches what shuttle's fetch verifies.
+fn go_dirhash_zip(zip_path: &Path) -> String {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path).unwrap()).unwrap();
+    let mut hashes: Vec<(String, String)> = Vec::new();
+    for i in 0..archive.len() {
+        let mut m = archive.by_index(i).unwrap();
+        if m.is_dir() {
+            continue;
+        }
+        let name = m.name().to_string();
+        let mut d = Sha256::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = m.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            d.update(&buf[..n]);
+        }
+        let final_d = d.finalize();
+        hashes.push((name, final_d.iter().map(|b| format!("{b:02x}")).collect()));
+    }
+    hashes.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = Sha256::new();
+    for (name, sha) in &hashes {
+        h.update(format!("{sha}  {name}\n").as_bytes());
+    }
+    format!(
+        "h1:{}",
+        base64::engine::general_purpose::STANDARD.encode(h.finalize())
+    )
+}
+
+/// The single-file Go dirhash (`h1:`) over a go.mod's bytes.
+fn go_dirhash_file(bytes: &[u8]) -> String {
+    let inner = Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let mut h = Sha256::new();
+    h.update(format!("{inner}  go.mod\n").as_bytes());
+    format!(
+        "h1:{}",
+        base64::engine::general_purpose::STANDARD.encode(h.finalize())
+    )
+}
+
+/// Write the go fixture: a single-module app whose go.mod requires
+/// `gdmodule` (loopback-served), plus the shuttle package building it
+/// OFFLINE via a `file://` GOPROXY onto the mounted closure.
+fn write_go_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let dir = project.join("pkgs").join(letter.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let (zip_h, mod_h) = write_go_dep_module(server, "shuttle.test/godep", "v1.0.0", say);
+
+    let approot = server.join("goapproot");
+    let _ = std::fs::remove_dir_all(&approot);
+    std::fs::create_dir_all(&approot).unwrap();
+    std::fs::write(
+        approot.join("go.mod"),
+        "module shuttle.test/app\n\ngo 1.21\n\nrequire shuttle.test/godep v1.0.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        approot.join("go.sum"),
+        format!("shuttle.test/godep v1.0.0 {zip_h}\nshuttle.test/godep v1.0.0/go.mod {mod_h}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        approot.join("main.go"),
+        "package main\n\nimport (\n\t\"fmt\"\n\t\"shuttle.test/godep\"\n)\n\nfunc main() {\n\tfmt.Println(godep.Say())\n}\n",
+    )
+    .unwrap();
+    tar_czf(server, "go-src.tar.gz", "goapproot");
+
+    let lua = r#"return { default = snap {
+    name = "@NAME@",
+    version = "1.0",
+    source = "http://127.0.0.1:@PORT@/go-src.tar.gz",
+    deps = { go = { mods = "go.mod", index = "http://127.0.0.1:@PORT@" } },
+    build = table.concat({
+        "export GOMODCACHE=/tmp/shuttle-go-cache GOPROXY=\"file://$SHUTTLE_DEPS_DIR/cache/download\"",
+        "export GOFLAGS=-mod=mod GOSUMDB=off GOPATH=/tmp/shuttle-go-cache",
+        "mkdir -p \"$GOMODCACHE\"",
+        "go build -o $STAGE/@NAME@ .",
+    }, " && "),
+    apps = { @NAME@ = { command = "@NAME@" } },
+} }
+"#
+    .replace("@NAME@", name)
+    .replace("@PORT@", &port.to_string());
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
+// ── Acceptance: go closure fetch → offline build → farm executes ──
+
+gated_test!(go_deps_fetch_build_and_farm_executes, &["go"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_go_pkg(project.path(), server.path(), "zgoapp", "go-dep-ran", port);
+
+    // pod add auto-fetches the closure, builds offline, installs.
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "add", "zgoapp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+
+    // The closure pin is recorded in the pod lockfile with fetched_at.
+    let (hash, fetched_at) = lock_deps_pin(root.path(), "default", "zgoapp");
+    assert_eq!(hash.len(), 64, "deps_hash is a sha256 hex digest");
+    assert!(fetched_at.is_some(), "first fetch records fetched_at");
+
+    // The closure store entry exists, content-addressed by the pin.
+    let blob = pod_dir(root.path(), "default")
+        .join("store")
+        .join(&hash[..2])
+        .join(&hash);
+    assert!(blob.exists(), "closure blob at {}", blob.display());
+
+    // The fetch hit the proxy zip path on the loopback.
+    assert!(
+        requests_for(&log, "/shuttle.test/godep/@v/") >= 1,
+        "the resolver must fetch the pinned module: {:#?}",
+        log.lock().unwrap()
+    );
+
+    // The farm binary executes — it linked the module-cached
+    // dependency, so printing `say()` proves the offline closure was
+    // consumed.
+    let farm = current_farm(root.path(), "default");
+    let out = run_farm_app(&farm, "zgoapp");
+    assert!(
+        out.contains("go-dep-ran"),
+        "go app must run its module dependency: {out:?}"
+    );
+});
+
+// ── A tampered go closure fails the build (hash mismatch) ──
+
+gated_test!(tampered_go_closure_fails_build, &["go"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, _log) = serve_dir(server.path());
+    write_go_pkg(
+        project.path(),
+        server.path(),
+        "zgotmp",
+        "tamper-target",
+        port,
+    );
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zgotmp"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    // Flip a byte inside the stored closure blob (same path, different
+    // content) — the build-time verification must fail closed.
+    let (hash, _) = lock_deps_pin(root.path(), "default", "zgotmp");
+    let blob = pod_dir(root.path(), "default")
+        .join("store")
+        .join(&hash[..2])
+        .join(&hash);
+    let mut bytes = std::fs::read(&blob).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&blob, &bytes).unwrap();
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+    assert_ne!(code, Some(0), "tampered closure must fail the build");
+    assert!(
+        stderr.contains("hash mismatch") || stderr.contains("corrupted"),
+        "failure must name the hash mismatch: {stderr}"
+    );
+});
+
+// ── A changed go.sum moves the deps_hash (cache invalidation) ──
+
+gated_test!(go_sum_change_moves_the_deps_hash, &["go"], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_go_pkg(project.path(), server.path(), "zgolck", "lock-v1", port);
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zgolck"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let (hash_a, _) = lock_deps_pin(root.path(), "default", "zgolck");
+    let fetches_after_add = requests_for(&log, "/shuttle.test/godep/@v/");
+
+    // Upstream moves: same module, new bytes (new `say`) — the go.sum
+    // pins the new zip hash, so the closure content and its hash move.
+    write_go_pkg(project.path(), server.path(), "zgolck", "lock-v2", port);
+
+    // --latest re-resolves the closure deliberately and moves the pin.
+    let (code, stdout, stderr) = run(
+        project.path(),
+        root.path(),
+        &["pod", "rebuild", "zgolck", "--latest"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+    assert!(
+        requests_for(&log, "/shuttle.test/godep/@v/") > fetches_after_add,
+        "--latest must re-fetch the moved closure; requests: {:#?}",
+        log.lock().unwrap()
+    );
+    let (hash_b, _) = lock_deps_pin(root.path(), "default", "zgolck");
+    assert_ne!(hash_a, hash_b, "a changed go.sum moves the deps_hash");
+
+    // The farm serves the NEW closure content.
+    let out = run_farm_app(&current_farm(root.path(), "default"), "zgolck");
+    assert!(
+        out.contains("lock-v2"),
+        "farm serves the moved closure: {out:?}"
+    );
+});
+
 // ── `pod rebuild` (issue #15): rebuild one package at its pins ──
 
 /// The version pin recorded in the pod lockfile (None when absent).

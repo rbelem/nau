@@ -131,6 +131,10 @@ pub struct PackageDeps {
     /// (issue #36). Fetches every registry crate the lockfile pins into a
     /// `cargo vendor`-equivalent tree.
     pub cargo: Option<DepsLockSpec>,
+    /// go resolver: `deps = { go = { mods = "go.mod" } }` (issue #40).
+    /// Resolves go.mod + go.sum from the source tree and fetches every
+    /// module closure into the Go module cache layout.
+    pub go: Option<DepsLockSpec>,
 }
 
 /// One ecosystem resolver's spec: its lockfile (relative to the source
@@ -139,12 +143,17 @@ pub struct PackageDeps {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepsLockSpec {
     /// Lockfile path relative to the source root (e.g.
-    /// "package-lock.json", "requirements.lock").
+    /// "package-lock.json", "requirements.lock", "go.mod").
     pub lock: String,
+    /// Hash/checksum source path relative to the source root (go only:
+    /// the go.sum sibling, required). Cargo/npm/pip read their checksums
+    /// from the lockfile itself, so those leave this `None`.
+    pub sum: Option<String>,
     /// Package index / registry API URL (index-driven ecosystems;
     /// default: the official one — pip's PyPI simple index, cargo's
-    /// crates.io API base). npm resolves from the lockfile's own
-    /// `resolved` URLs. Tests point the override at a loopback server.
+    /// crates.io API base, go's GOPROXY). npm resolves from the
+    /// lockfile's own `resolved` URLs. Tests point the override at a
+    /// loopback server.
     pub index: Option<String>,
     /// Glob patterns (`*` / `?`) matched against lock keys
     /// (`node_modules/...`, full-key match); any key matching one is
@@ -838,12 +847,14 @@ impl SnapMeta {
 }
 
 /// Parse the `deps` table (ADR-0017): `{ npm = { lock = ... }, pip = { lock
-/// = ..., index = ... }, cargo = { lock = ... } }` — at least one resolver,
-/// known keys only, every resolver carrying a non-empty string `lock`.
+/// = ..., index = ... }, cargo = { lock = ... }, go = { mods = ... } }` —
+/// at least one resolver, known keys only, every resolver carrying a
+/// non-empty string `lock` (or `mods` for go).
 fn package_deps_from_lua(t: &mlua::Table) -> miette::Result<PackageDeps> {
     let mut npm = None;
     let mut pip = None;
     let mut cargo = None;
+    let mut go = None;
     for pair in t.pairs::<String, mlua::Value>() {
         let (key, value) = pair.map_err(|e| miette::miette!("deps entry: {e}"))?;
         let value = match value {
@@ -856,42 +867,58 @@ fn package_deps_from_lua(t: &mlua::Table) -> miette::Result<PackageDeps> {
             }
         };
         match key.as_str() {
-            "npm" | "pip" | "cargo" => {
+            "npm" | "pip" | "cargo" | "go" => {
                 let spec = deps_lock_spec_from_lua(&key, &value)?;
                 match key.as_str() {
                     "npm" => npm = Some(spec),
                     "pip" => pip = Some(spec),
-                    _ => cargo = Some(spec),
+                    "cargo" => cargo = Some(spec),
+                    _ => go = Some(spec),
                 }
             }
             other => {
                 return Err(miette::miette!(
-                    "deps: unknown resolver '{other}' (supported: npm, pip, cargo)"
+                    "deps: unknown resolver '{other}' (supported: npm, pip, cargo, go)"
                 ))
             }
         }
     }
-    if npm.is_none() && pip.is_none() && cargo.is_none() {
+    if npm.is_none() && pip.is_none() && cargo.is_none() && go.is_none() {
         return Err(miette::miette!(
-            "deps must name at least one resolver: npm, pip, or cargo"
+            "deps must name at least one resolver: npm, pip, cargo, or go"
         ));
     }
-    Ok(PackageDeps { npm, pip, cargo })
+    Ok(PackageDeps {
+        npm,
+        pip,
+        cargo,
+        go,
+    })
 }
 
 /// Parse one resolver's spec table: `lock` (required, relative to the
 /// source root), `index` (optional registry override — pip's PEP 503
-/// index, cargo's crates.io API base), and — npm only — `exclude`
-/// globs over lock keys (issue #14). pip and cargo reject `exclude`:
-/// pip has no lock keys to glob, and cargo vendoring has no exclusion
-/// seam — a Cargo.lock IS the closure, so partial vendoring would break
-/// the offline build it exists to serve.
+/// index, cargo's crates.io API base, go's GOPROXY), and — npm only —
+/// `exclude` globs over lock keys (issue #14). pip, cargo, and go reject
+/// `exclude`: pip has no lock keys to glob, and a lockfile is the complete
+/// closure — partial vendoring would break the offline build it exists to
+/// serve.
+///
+/// go (issue #40) accepts `mods` as an alias for `lock` (the ticket's
+/// `deps = { go = { mods = "go.mod" } }`), plus an optional `sum` — the
+/// go.sum path; when omitted it defaults to the sibling of `mods` with the
+/// `.mod` extension replaced by `.sum` (go.mod → go.sum is the Go
+/// toolchain's own invariant). Both files must exist in the source tree.
 fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLockSpec> {
-    let lock = get_opt_string(t, "lock")?.ok_or_else(|| {
-        miette::miette!(
-            "deps.{key}: field 'lock' is required (lockfile path relative to the source root)"
-        )
-    })?;
+    // go uses `mods` (the go.mod path); every other resolver uses `lock`.
+    let lock = go_mods_alias(key, t)?
+        .or(get_opt_string(t, "lock")?)
+        .ok_or_else(|| {
+            miette::miette!(
+                "deps.{key}: field 'lock'{} is required (lockfile path relative to the source root)",
+                if key == "go" { " (or 'mods')" } else { "" }
+            )
+        })?;
     if lock.is_empty() {
         return Err(miette::miette!("deps.{key}: 'lock' must not be empty"));
     }
@@ -901,6 +928,11 @@ fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLoc
         ));
     }
     let index = get_opt_string(t, "index")?;
+    // go.sum: optional, defaults to the sibling of go.mod (go.mod → go.sum).
+    let sum = match key {
+        "go" => Some(go_sum_path(t, &lock)?),
+        _ => None,
+    };
     let exclude = match key {
         "npm" => npm_exclude_from_lua(t)?,
         _ => {
@@ -914,9 +946,44 @@ fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLoc
     };
     Ok(DepsLockSpec {
         lock,
+        sum,
         index,
         exclude,
     })
+}
+
+/// go's `mods` alias for the lockfile path (only accepted for the go
+/// resolver; other resolvers reject the key as unknown).
+fn go_mods_alias(key: &str, t: &mlua::Table) -> miette::Result<Option<String>> {
+    if key != "go" {
+        if get_opt_string(t, "mods")?.is_some() {
+            return Err(miette::miette!(
+                "deps.{key}: 'mods' is a go-only field (use 'lock')"
+            ));
+        }
+        return Ok(None);
+    }
+    get_opt_string(t, "mods")
+}
+
+/// The go.sum path: the explicit `sum` field, or the go.mod path with its
+/// `.mod` extension replaced by `.sum` (Go's own convention). If go.mod
+/// has no `.mod` extension (unusual), `go.sum` is the literal sibling.
+fn go_sum_path(t: &mlua::Table, go_mod: &str) -> miette::Result<String> {
+    if let Some(sum) = get_opt_string(t, "sum")? {
+        if sum.starts_with('/') {
+            return Err(miette::miette!(
+                "deps.go: 'sum' is relative to the source root — got absolute path '{sum}'"
+            ));
+        }
+        return Ok(sum);
+    }
+    let sum = if let Some(stem) = go_mod.strip_suffix(".mod") {
+        format!("{stem}.sum")
+    } else {
+        format!("{go_mod}.sum")
+    };
+    Ok(sum)
 }
 
 /// The npm `exclude` globs: an optional string array; empty patterns are
@@ -9877,6 +9944,7 @@ mod wrapper_tests {
             npm: None,
             pip: None,
             cargo: None,
+            go: None,
         });
 
         emit_build_wrappers(&meta, stage.path(), &store).unwrap();
@@ -9925,6 +9993,7 @@ mod wrapper_tests {
             npm: None,
             pip: None,
             cargo: None,
+            go: None,
         });
 
         emit_build_wrappers(&meta, stage.path(), &store).unwrap();

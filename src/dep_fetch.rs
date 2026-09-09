@@ -17,9 +17,12 @@
 //! are wheels fetched from a PEP 503 simple index (never `pip install`);
 //! cargo closures are `.crate` downloads verified against the Cargo.lock
 //! checksums and extracted data-only into a `cargo vendor`-equivalent
-//! tree (never `cargo fetch`/`cargo build`). Extraction is data-only —
-//! any build scripts ship inert inside the tree and only ever run, if at
-//! all, inside the offline sandbox.
+//! tree (never `cargo fetch`/`cargo build`); go closures are `.zip`
+//! downloads from a GOPROXY, verified against the go.sum `h1:` dirhash,
+//! and materialized into the Go module cache layout (never `go mod
+//! download`). Extraction is data-only — any build scripts ship inert
+//! inside the tree and only ever run, if at all, inside the offline
+//! sandbox.
 //!
 //! The canonical archive format ("SHDEP") is a minimal, deterministic
 //! serialization: entries sorted by path, normalized modes (0755/0644 by
@@ -48,6 +51,13 @@ pub const DEFAULT_PIP_INDEX: &str = "https://pypi.org/simple";
 /// checksum. Overridable per resolver via `deps.cargo.index` — tests point
 /// it at a loopback server (same seam as `deps.pip.index`).
 pub const DEFAULT_CRATES_API: &str = "https://crates.io/api/v1/crates";
+
+/// Default GOPROXY base for go resolvers: module zips/mods/info are
+/// `GET {proxy}/{module}/@v/{version}.zip|.mod|.info`. The proxy zip
+/// layout IS the Go module cache layout — no repacking on the consumer
+/// side. Overridable per resolver via `deps.go.index` — tests point it
+/// at a loopback server (same seam as `deps.pip.index`).
+pub const DEFAULT_GO_PROXY: &str = "https://proxy.golang.org";
 
 // ── Orchestration ──
 
@@ -147,6 +157,9 @@ fn fetch_deps_closure(
     }
     if let Some(cargo) = &deps.cargo {
         fetch_cargo_closure(cargo, &src_root, &tree, work.path())?;
+    }
+    if let Some(go) = &deps.go {
+        fetch_go_closure(go, &src_root, &tree)?;
     }
     let bytes = pack_canonical(&tree)?;
     write_store_blob(store, &bytes)
@@ -1290,6 +1303,362 @@ fn write_cargo_checksums(crate_dir: &Path, package_checksum: &str) -> miette::Re
         .map_err(|e| miette::miette!("writing {}: {e}", out.display()))
 }
 
+// ── go ──
+
+/// One module pinned by go.mod + go.sum: its module path and the version
+/// string `go.sum` records (already `vX.Y.Z` with a possible `+incompatible`
+/// or `+upgrade` build tag — the literal proxy path segment). The path +
+/// version is both the proxy fetch key and the cache directory element.
+#[derive(Debug)]
+struct GoModule {
+    path: String,
+    version: String,
+}
+
+/// Parse a `go.mod`'s `require` blocks: every `module@version` line —
+/// direct and indirect, with or without a `// indirect` comment — is one
+/// artifact to fetch. `go 1.17+` pruned module graphs carry the full
+/// closure in the main module's go.mod, so this is complete; the standard
+/// library is never listed (it ships with the toolchain and is skipped
+/// implicitly).
+///
+/// The go.mod drives the require list (the fetch key set); go.sum carries
+/// the hashes that verify each artifact. Local `replace` directives are
+/// NOT followed here — they are a source-tree concern (the replaced
+/// module ships in the source tree or is fetched at its own proxy path)
+/// and are resolved at build time by the Go toolchain against the same
+/// offline cache.
+fn parse_go_requires(bytes: &[u8]) -> miette::Result<Vec<GoModule>> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| miette::miette!("go.mod is not valid UTF-8: {e}"))?;
+    let mut out = Vec::new();
+    let mut in_require_block = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        // A `require (` block closes on `)`. Block form and single-line
+        // form are both accepted.
+        if line.starts_with(')') {
+            in_require_block = false;
+            continue;
+        }
+        if !in_require_block {
+            if line.starts_with("require (") {
+                in_require_block = true;
+                continue;
+            }
+            // Single-line: `require module version`.
+            if !line.starts_with("require ") {
+                continue;
+            }
+            let spec = line.trim_start_matches("require ").trim();
+            let Some((path, version)) = split_require_spec(spec) else {
+                miette::bail!("go.mod: malformed require line: '{line}'");
+            };
+            out.push(GoModule {
+                path: path.to_string(),
+                version: version.to_string(),
+            });
+            continue;
+        }
+        let Some((path, version)) = split_require_spec(line) else {
+            miette::bail!("go.mod: malformed require entry: '{line}'");
+        };
+        out.push(GoModule {
+            path: path.to_string(),
+            version: version.to_string(),
+        });
+    }
+    if in_require_block {
+        miette::bail!("go.mod: unterminated require block");
+    }
+    // Stable fetch order.
+    out.sort_by(|a, b| a.path.cmp(&b.path).then(a.version.cmp(&b.version)));
+    Ok(out)
+}
+
+/// Split a `require` spec line into (path, version). A trailing `//`
+/// comment and any `// indirect` marker are stripped. Globs and `v0.0.0`
+/// pseudo-versions pass through verbatim (they are exact index keys).
+fn split_require_spec(spec: &str) -> Option<(&str, &str)> {
+    let spec = spec.split("//").next()?.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let mut parts = spec.split_whitespace();
+    let path = parts.next()?;
+    let version = parts.next()?;
+    // A third non-comment token is malformed; `//` comments already split.
+    if parts.next().is_some() {
+        return None;
+    }
+    if path.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((path, version))
+}
+
+/// Fetch every go.mod module from the proxy into the Go module cache
+/// layout: `tree/cache/download/<encoded module path>/@v/<version>.info`,
+/// `.mod`, `.zip`, and `.ziphash`. The `<version>` is the module cache
+/// path's sumdb-safe element — for a module with a normal `vX.Y.Z`
+/// version this is the version itself; `+incompatible` is written with
+/// its literal `+` in the escaped path (escaping only affects the module
+/// path, never the version element).
+///
+/// `tree/cache/download` is the `$GOPATH/pkg/mod/cache/download` layout,
+/// so a build wired with `GOMODCACHE`/`GOPATH` onto the extracted closure
+/// (or a `file://` GOPROXY onto the download dir) resolves every module
+/// OFFLINE — the proxy zip layout IS the cache layout.
+fn fetch_go_closure(spec: &DepsLockSpec, src_root: &Path, tree: &Path) -> miette::Result<()> {
+    let proxy = spec.index.as_deref().unwrap_or(DEFAULT_GO_PROXY);
+    let mod_bytes = read_source_file(src_root, &spec.lock)?;
+    let sum_path = spec.sum.as_deref().unwrap_or("go.sum");
+    let sum_bytes = read_source_file(src_root, sum_path)?;
+    let modules = parse_go_requires(&mod_bytes)?;
+    let sums = parse_go_sum(&sum_bytes)?;
+    crate::output::info(format!(
+        "go closure: {} module(s) from {} (go.sum)",
+        modules.len(),
+        spec.lock
+    ));
+    let dl_base = tree.join("cache").join("download");
+    std::fs::create_dir_all(&dl_base)
+        .map_err(|e| miette::miette!("creating {}: {e}", dl_base.display()))?;
+    for m in &modules {
+        let (zip_line, mod_line) =
+            sums.get(&(m.path.clone(), m.version.clone()))
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "go.sum: module '{} {}' is required by go.mod but has no hash — \
+                     run `go mod tidy` upstream to generate a complete go.sum",
+                        m.path,
+                        m.version
+                    )
+                })?;
+        fetch_go_module(proxy, &dl_base, m, zip_line, mod_line)?;
+    }
+    Ok(())
+}
+
+/// Fetch one module's `.info`, `.mod`, `.zip`, and `.ziphash` into the
+/// cache download dir, verifying the `.mod` and `.zip` against their
+/// go.sum dirhashes. Writes directly into the closure tree: a fetch
+/// failure bails before `pack_canonical` runs, so no partial module ever
+/// enters the archival blob.
+fn fetch_go_module(
+    proxy: &str,
+    dl_base: &Path,
+    module: &GoModule,
+    zip_line: &str,
+    mod_line: &str,
+) -> miette::Result<()> {
+    let escaped = escape_module_path(&module.path);
+    let atv = dl_base.join(&escaped).join("@v");
+    std::fs::create_dir_all(&atv)
+        .map_err(|e| miette::miette!("creating {}: {e}", atv.display()))?;
+    go_fetch_verify(&atv, proxy, &escaped, module, zip_line, mod_line)
+}
+
+/// One module's four cache entries: fetch each artifact, verify the
+/// content-addressed pair (`zip` + `mod`) against go.sum, write the
+/// cache's own `.ziphash` marker.
+fn go_fetch_verify(
+    atv: &Path,
+    proxy: &str,
+    escaped: &str,
+    module: &GoModule,
+    zip_line: &str,
+    mod_line: &str,
+) -> miette::Result<()> {
+    let v = &module.version;
+    let url = |name: &str| format!("{proxy}/{escaped}/@v/{v}.{name}");
+    // .info — the proxy's version metadata. Not covered by dirhash (the
+    // hash is over the module's files, not the .info), but the cache
+    // entry's presence is what `go` requires to consider a version
+    // resolved. Fetched once; content is not content-addressed.
+    let info = atv.join(format!("{v}.info"));
+    go_fetch_once(&url("info"), &info)?;
+    // .mod — covered by the go.sum `<version>/go.mod` hash (the
+    // single-file dirhash `h1:`). Verified before the zip so the cache
+    // never settles a .mod whose bytes disagree with the pin.
+    let mod_path = atv.join(format!("{v}.mod"));
+    go_fetch_once(&url("mod"), &mod_path)?;
+    verify_go_dirhash(&mod_path, mod_line, &module.path, v)?;
+    // .zip — the source archive, verified against the go.sum `<version>`
+    // dirhash over the zip's file list.
+    let zip_path = atv.join(format!("{v}.zip"));
+    go_fetch_once(&url("zip"), &zip_path)?;
+    verify_go_dirhash(&zip_path, zip_line, &module.path, v)?;
+    // .ziphash — the line `go` itself writes into the cache, the cache's
+    // own integrity marker. Mirrors cmd/go's exact bytes so an
+    // already-populated cache and our closure are interchangeable.
+    let ziphash_path = atv.join(format!("{v}.ziphash"));
+    std::fs::write(
+        &ziphash_path,
+        format!("{} {} {}\n", module.path, v, zip_line),
+    )
+    .map_err(|e| miette::miette!("writing {}: {e}", ziphash_path.display()))?;
+    Ok(())
+}
+
+/// GET a proxy artifact at `url` once (skip when the cache entry already
+/// exists). Used for the `.info`/`.mod`/`.zip` fetches.
+fn go_fetch_once(url: &str, dest: &Path) -> miette::Result<()> {
+    if dest.exists() {
+        return Ok(());
+    }
+    http_get_to_file(url, dest)
+}
+
+/// Parse a go.sum into `(module path, version) → (zip dirhash, mod
+/// dirhash)`. Two record shapes coexist:
+///   `<path> <version> <dirhash>` — the module zip hash
+///   `<path> <version>/go.mod <dirhash>` — the go.mod file hash
+/// `go.sum` is append-only; the LAST occurrence of a key wins (a later
+/// `go mod tidy` may add a second hash for the same version).
+fn parse_go_sum(bytes: &[u8]) -> miette::Result<BTreeMap<(String, String), (String, String)>> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| miette::miette!("go.sum is not valid UTF-8: {e}"))?;
+    let mut map: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let path = parts.next().unwrap_or("");
+        let version = parts.next().unwrap_or("");
+        let hash = parts.next().unwrap_or("");
+        if parts.next().is_some() {
+            miette::bail!("go.sum:{lineno}: malformed line: '{line}'");
+        }
+        if path.is_empty() || version.is_empty() || hash.is_empty() {
+            miette::bail!("go.sum:{lineno}: malformed line: '{line}'");
+        }
+        if !hash.starts_with("h1:") {
+            miette::bail!(
+                "go.sum:{lineno}: unsupported hash '{hash}' (only h1: dirhashes are verifiable) \
+                 — regenerate go.sum with `go mod tidy`"
+            );
+        }
+        let (key, is_mod) = match version.strip_suffix("/go.mod") {
+            Some(mod_ver) => ((path.to_string(), mod_ver.to_string()), true),
+            None => ((path.to_string(), version.to_string()), false),
+        };
+        let entry = map.entry(key).or_default();
+        if is_mod {
+            entry.1 = hash.to_string();
+        } else {
+            entry.0 = hash.to_string();
+        }
+    }
+    Ok(map)
+}
+
+/// The Go module dirhash (`h1:`) over a file: either a ZIP archive's file
+/// list (module zip) or a single `go.mod` text file. The zip form hashes
+/// each member's SHA-256 (base64, standard alphabet, no padding) plus the
+/// member's full archive-path name; the single-file form is
+/// `sha256(bytes)  go.mod`. Both are the exact formulas cmd/go's
+/// `golang.org/x/mod/sumdb/dirhash` implements.
+fn go_dirhash(path: &Path) -> miette::Result<String> {
+    if path.extension().is_some_and(|e| e == "zip") {
+        go_zip_dirhash(path)
+    } else {
+        let bytes =
+            std::fs::read(path).map_err(|e| miette::miette!("reading {}: {e}", path.display()))?;
+        Ok(go_dirhash_bytes(&bytes, "go.mod"))
+    }
+}
+
+/// The dirhash over a module zip: `<zip sha256>  <full member path>` for
+/// every member, sorted by path, then SHA-256 over that list, base64 std.
+fn go_zip_dirhash(path: &Path) -> miette::Result<String> {
+    let file = File::open(path).map_err(|e| miette::miette!("opening {}: {e}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| miette::miette!("reading zip {}: {e}", path.display()))?;
+    let mut hashes: Vec<(String, String)> = Vec::new();
+    for i in 0..archive.len() {
+        let mut member = archive
+            .by_index(i)
+            .map_err(|e| miette::miette!("zip entry {}: {e}", i))?;
+        if member.is_dir() {
+            continue;
+        }
+        let name = member.name().to_string();
+        let mut digest = Sha256::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = member
+                .read(&mut buf)
+                .map_err(|e| miette::miette!("zip member {name}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            digest.update(&buf[..n]);
+        }
+        // The inner member hash is the file's sha256 in HEX (dirhash
+        // Hash1 over each member), not base64 — only the final aggregate
+        // is base64-encoded under the `h1:` prefix.
+        hashes.push((name, hex(&digest.finalize())));
+    }
+    hashes.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = Sha256::new();
+    for (name, sha) in &hashes {
+        h.update(format!("{sha}  {name}\n").as_bytes());
+    }
+    Ok(format!("h1:{}", go_base64(&h.finalize())))
+}
+
+/// The single-file dirhash: `sha256(bytes)  go.mod`.
+fn go_dirhash_bytes(bytes: &[u8], name: &str) -> String {
+    let inner = hex(&Sha256::digest(bytes));
+    let mut h = Sha256::new();
+    h.update(format!("{inner}  {name}\n").as_bytes());
+    format!("h1:{}", go_base64(&h.finalize()))
+}
+
+fn go_base64(digest: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(digest)
+}
+
+/// Verify a fetched artifact against its pinned go.sum dirhash. A
+/// mismatch is an error (never a silent skip) — the closure hash pins the
+/// tree, the dirhash pins each input.
+fn verify_go_dirhash(
+    path: &Path,
+    expected: &str,
+    module: &str,
+    version: &str,
+) -> miette::Result<()> {
+    let actual = go_dirhash(path)?;
+    if !constant_eq(actual.as_bytes(), expected.as_bytes()) {
+        let _ = std::fs::remove_file(path);
+        miette::bail!(
+            "go: module {}@{} hash mismatch: expected {expected}, got {actual}",
+            module,
+            version
+        );
+    }
+    Ok(())
+}
+
+/// Escaping for a module path as a proxy/cache path element: uppercase
+/// letters are emitted as `!<lowercase>` (Go module path escaping, the
+/// `module.EscapePath` rule). Lowercase and punctuation pass through.
+fn escape_module_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars() {
+        if ch.is_ascii_uppercase() {
+            out.push('!');
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 // ── Canonical archive (SHDEP) ──
 
 /// Deterministically serialize a materialized tree: entries sorted by
@@ -2313,5 +2682,173 @@ checksum = "1e37cfd5e7657ada45f742d6e99ca5788580b5c529dc78faf11ece6dc702656f"
         let second = std::fs::read_to_string(crate_dir.join(".cargo-checksum.json")).unwrap();
         assert_eq!(first, second, "checksum file must be byte-deterministic");
         assert!(first.contains("\"package\":\"deadbeef\""), "{first}");
+    }
+
+    // ── go (issue #40) ──
+
+    #[test]
+    fn parse_go_requires_reads_block_and_single_line() {
+        let gomod = r#"module shuttle.test/app
+
+go 1.21
+
+require (
+    github.com/foo/bar v1.2.3
+    golang.org/x/text v0.39.0 // indirect
+)
+
+require github.com/only/one v0.1.0
+"#;
+        let mods = parse_go_requires(gomod.as_bytes()).unwrap();
+        // Stably sorted by path.
+        assert_eq!(mods.len(), 3);
+        assert_eq!(mods[0].path, "github.com/foo/bar");
+        assert_eq!(mods[0].version, "v1.2.3");
+        assert_eq!(mods[1].path, "github.com/only/one");
+        assert_eq!(mods[2].path, "golang.org/x/text");
+        assert_eq!(mods[2].version, "v0.39.0");
+    }
+
+    #[test]
+    fn parse_go_requires_rejects_malformed_entry() {
+        let gomod = "module shuttle.test/app\n\nrequire (\n    github.com/foo/bar\n)\n";
+        let err = parse_go_requires(gomod.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("malformed require"), "{err}");
+    }
+
+    #[test]
+    fn parse_go_requires_rejects_unterminated_block() {
+        let gomod = "module shuttle.test/app\n\nrequire (\n    github.com/foo/bar v1.2.3\n";
+        let err = parse_go_requires(gomod.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("unterminated"), "{err}");
+    }
+
+    #[test]
+    fn parse_go_sum_merges_zip_and_mod_hashes() {
+        // go.sum records both the module zip hash and its /go.mod hash.
+        let gosum =
+            "shuttle.test/godep v1.0.0 h1:AAAA=\nshuttle.test/godep v1.0.0/go.mod h1:BBBB=\n";
+        let map = parse_go_sum(gosum.as_bytes()).unwrap();
+        let (zip, gm) = map
+            .get(&("shuttle.test/godep".to_string(), "v1.0.0".to_string()))
+            .unwrap();
+        assert_eq!(zip, "h1:AAAA=");
+        assert_eq!(gm, "h1:BBBB=");
+    }
+
+    #[test]
+    fn parse_go_sum_rejects_non_dirhash() {
+        let gosum = "shuttle.test/godep v1.0.0 sha256:abcd=\n";
+        let err = parse_go_sum(gosum.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("only h1:"), "{err}");
+    }
+
+    #[test]
+    fn go_dirhash_matches_hermetic_known_vector() {
+        // A hand-computed dirhash over two files — the exact formula cmd/go
+        // applies. This pins the algorithm so a refactor of the hashing
+        // cannot silently drift from what go.sum records.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("shuttle.test:godep@v1.0.0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("godep.go"),
+            "package godep\n\nfunc Say() string { return \"go-dep-ran\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("go.mod"),
+            "module shuttle.test/godep\n\ngo 1.21\n",
+        )
+        .unwrap();
+        let zip_path = dir.path().join("m.zip");
+        write_module_zip(&root, &zip_path, "shuttle.test/godep", "v1.0.0");
+        let h = go_dirhash(&zip_path).unwrap();
+        assert_eq!(
+            h, "h1:yMDzDvc+Re9CZLHq89VV1qk0bouZyBD8jp0rMUe+Okc=",
+            "zip dirhash"
+        );
+        // The single-file .mod form over the same go.mod.
+        let mod_path = dir.path().join("go.mod");
+        std::fs::copy(root.join("go.mod"), &mod_path).unwrap();
+        let mh = go_dirhash(&mod_path).unwrap();
+        assert_eq!(
+            mh, "h1:svH/m3yrhSlYgOqmdsXQf46ptt9MS3zJ/plYAGCJHwo=",
+            ".mod dirhash"
+        );
+    }
+
+    #[test]
+    fn escape_module_path_escapes_uppercase() {
+        assert_eq!(
+            escape_module_path("github.com/Google/foo"),
+            "github.com/!google/foo"
+        );
+        assert_eq!(
+            escape_module_path("github.com/maximhq/bifrost/core"),
+            "github.com/maximhq/bifrost/core"
+        );
+    }
+
+    #[test]
+    fn go_module_zip_dirhash_is_deterministic_and_order_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Build two zips with identical content in different member
+        // insertion order.
+        let mut a = zip::ZipWriter::new(std::fs::File::create(dir.path().join("a.zip")).unwrap());
+        let mut b = zip::ZipWriter::new(std::fs::File::create(dir.path().join("b.zip")).unwrap());
+        let afile = b"package a\n";
+        let bfile = b"package b\n";
+        // a.zip: b then a; b.zip: a then b.
+        for (writer, order) in [
+            (a, vec![("b.go", bfile), ("a.go", afile)]),
+            (b, vec![("a.go", afile), ("b.go", bfile)]),
+        ] {
+            let mut writer = writer;
+            for (name, bytes) in order {
+                let opts = zip::write::FileOptions::<()>::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                writer.start_file(name, opts).unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let ha = go_dirhash(&dir.path().join("a.zip")).unwrap();
+        let hb = go_dirhash(&dir.path().join("b.zip")).unwrap();
+        assert_eq!(ha, hb, "dirhash must sort members, not trust archive order");
+    }
+
+    /// Write a module zip with a single top-level directory member
+    /// `<module>@<version>/`, the proxy's archive shape (files only; the
+    /// top-level dir member is implied by the path prefix).
+    fn write_module_zip(root: &Path, dest: &Path, module: &str, version: &str) {
+        let prefix = format!("{module}@{version}/");
+        let opts = zip::write::FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut zipw = zip::ZipWriter::new(std::fs::File::create(dest).unwrap());
+        for path in walk(root) {
+            let rel = path.strip_prefix(root).unwrap();
+            let name = format!("{prefix}{}", rel.to_string_lossy());
+            zipw.start_file(name, opts).unwrap();
+            zipw.write_all(&std::fs::read(&path).unwrap()).unwrap();
+        }
+        zipw.finish().unwrap();
+    }
+
+    fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
     }
 }

@@ -450,10 +450,11 @@ function snap(opts)
         end
     end
 
-    -- deps: dependency-closure resolvers (ADR-0017, issues #13/#36).
+    -- deps: dependency-closure resolvers (ADR-0017, issues #13/#36/#40).
     -- `deps = { npm = { lock = "package-lock.json" } }`,
-    -- `deps = { pip = { lock = "requirements.lock", index = "https://..." } }`, or
-    -- `deps = { cargo = { lock = "Cargo.lock" } }`.
+    -- `deps = { pip = { lock = "requirements.lock", index = "https://..." } }`,
+    -- `deps = { cargo = { lock = "Cargo.lock" } }`, or
+    -- `deps = { go = { mods = "go.mod" } }`.
     -- Coexists with `source` (hybrid) or stands alone with it; the
     -- lockfile resolves from the source tree, so `source` is required.
     if opts.deps ~= nil then
@@ -462,24 +463,31 @@ function snap(opts)
         end
         local resolvers = {}
         for eco, resolver in pairs(opts.deps) do
-            if eco ~= "npm" and eco ~= "pip" and eco ~= "cargo" then
+            if eco ~= "npm" and eco ~= "pip" and eco ~= "cargo" and eco ~= "go" then
                 error(string.format(
-                    "snap(): deps: unknown resolver '%s' (supported: npm, pip, cargo)", eco), 2)
+                    "snap(): deps: unknown resolver '%s' (supported: npm, pip, cargo, go)", eco), 2)
             end
             if type(resolver) ~= "table" then
                 error(string.format("snap(): deps['%s'] must be a table, got %s", eco, type(resolver)), 2)
             end
-            if type(resolver.lock) ~= "string" or #resolver.lock == 0 then
+            local lock_field = resolver.lock
+            if eco == "go" and (resolver.mods ~= nil or lock_field == nil) then
+                lock_field = resolver.mods
+            end
+            if type(lock_field) ~= "string" or #lock_field == 0 then
                 error(string.format(
                     "snap(): deps.%s: field 'lock' is required (lockfile path relative to the source root)", eco), 2)
             end
             if resolver.index ~= nil and type(resolver.index) ~= "string" then
                 error(string.format("snap(): deps.%s.index must be a string", eco), 2)
             end
+            if eco == "go" and resolver.sum ~= nil and type(resolver.sum) ~= "string" then
+                error("snap(): deps.go.sum must be a string", 2)
+            end
             table.insert(resolvers, eco)
         end
         if #resolvers == 0 then
-            error("snap(): deps must name at least one resolver: npm, pip, or cargo", 2)
+            error("snap(): deps must name at least one resolver: npm, pip, cargo, or go", 2)
         end
         if opts.source == nil then
             error("snap(): 'deps' requires 'source' — the lockfile resolves from the package source tree", 2)
