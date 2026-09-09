@@ -15,6 +15,9 @@ compiler environment, supporting out-of-source and cross-platform builds.]],
         type = "source",
         requires = {},
         source = { url = "https://github.com/Kitware/CMake/releases/download/v3.31.0/cmake-3.31.0.tar.gz" },
-        build = "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
+        -- -DCMAKE_USE_OPENSSL=OFF: the sandbox has no OpenSSL and cmake's
+        -- bundled-curl crypto features are unused by its consumers (the
+        -- pool ninja build). Bootstrap fails hard without this flag.
+        build = "./configure --prefix=/usr -- -DCMAKE_USE_OPENSSL=OFF && make && make install DESTDIR=$STAGE",
     },
 }

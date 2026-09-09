@@ -15,19 +15,26 @@ to run builds as fast as possible.]],
         architectures = { "amd64" },
         type = "source",
         requires = {},
-        -- ninja's cmake plugin expands to `cmake` commands; cmake is a
-        -- build-time-only tool, so it is a build_dep (never a runtime
-        -- requires). It materializes into the merged build prefix.
+        -- ninja's build drives cmake; cmake is a build-time-only tool, so
+        -- it is a build_dep (never a runtime requires). It materializes
+        -- into the merged build prefix.
         build_deps = { "cmake" },
         source = { url = "https://github.com/ninja-build/ninja/archive/refs/tags/v1.12.1.tar.gz" },
-        parts = {
-            ninja = {
-                plugin = "cmake",
+        -- Hand-rolled cmake invocation instead of the `cmake` plugin: the
+        -- plugin emits a bare `cmake` command word, which the sandbox tool
+        -- preflight resolves against the HOST PATH only — pool cmake lives
+        -- in the merged build prefix, so the preflight rejects it. Invoke
+        -- it by its explicit $SHUTTLE_BUILD_PREFIX path (the same pattern
+        -- pkgs/m/meson.lua uses for pool meson).
+        build = table.concat({
+            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/cmake\" -S $SRC -B build " ..
+                "-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr " ..
                 -- The sandbox has no network; without this ninja's CMake
                 -- FetchContent tries to download googletest at build time.
                 -- Tests are not installed into the snap anyway.
-                options = { defines = { BUILD_TESTING = "OFF" } },
-            },
-        },
+                "-DBUILD_TESTING=OFF",
+            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/cmake\" --build build",
+            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/cmake\" --install build",
+        }, " && "),
     },
 }

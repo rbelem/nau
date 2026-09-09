@@ -32,6 +32,11 @@ return {
             "./configure --prefix=/usr --disable-static --disable-pcre2-16 --disable-pcre2-32",
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
+            -- libtool .la metadata embeds the configure-time prefix
+            -- (/shuttle-build-prefix) and is obsolete at runtime — consumers
+            -- use the .so libs and .pc pkg-config files. Strip so the build
+            -- prefix cannot leak.
+            "find $STAGE/usr/lib -name '*.la' -delete",
         }, " && "),
 
         type = "source",

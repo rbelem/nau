@@ -37,17 +37,28 @@ return {
             sha256 = "88afe0c20e52030218924ac37d0c81c59b4b5f3ae3752c8c6d7470c7d365886c",
         },
 
-        -- The launcher heredoc needs real newlines, so the build plan is
-        -- one long-bracket string (&& chain still fails fast).
-        build = [[mkdir -p $STAGE/usr/lib/python3.12/site-packages $STAGE/usr/bin &&
-cp -r $SRC/mesonbuild $STAGE/usr/lib/python3.12/site-packages/ &&
-cat > $STAGE/usr/bin/meson <<'EOF'
-#!/bin/sh
-exec "${SHUTTLE_BUILD_PREFIX:-/shuttle-build-prefix}/usr/bin/python3" -c 'import sys; from mesonbuild.mesonmain import main; sys.exit(main())' "$@"
-EOF
-chmod +x $STAGE/usr/bin/meson]],
+        -- The launcher is emitted with printf, not a heredoc: the sandbox
+        -- tool preflight tokenizes the build command per segment and would
+        -- probe heredoc terminator lines (EOF) and `-c '…;…'` fragments as
+        -- missing sandbox commands. The launcher runs mesonmain as a module
+        -- (-m; its __main__ guard calls main) so no inline python is needed.
+        build = table.concat({
+            "mkdir -p $STAGE/usr/lib/python3.12/site-packages $STAGE/usr/bin",
+            "cp -r $SRC/mesonbuild $STAGE/usr/lib/python3.12/site-packages/",
+            "printf '%s\\n' '#!/bin/sh' 'exec \"${SHUTTLE_BUILD_PREFIX:-/shuttle-build-prefix}/usr/bin/python3\" -m mesonbuild.mesonmain \"$@\"' > $STAGE/usr/bin/meson",
+            "chmod +x $STAGE/usr/bin/meson",
+        }, " && "),
 
         type = "source",
         requires = { "glibc", "python" },
+
+        -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22/#19): the
+        -- launcher's ${SHUTTLE_BUILD_PREFIX:-/shuttle-build-prefix} fallback
+        -- is its entire purpose — resolving the pool python inside the merged
+        -- build prefix — so a text hit on the bare marker is by design. The
+        -- reference is the exact marker string (text-scan Leak.reference),
+        -- matching the scan's silencing gate. meson is a build_deps-only
+        -- tool, never a runtime payload; silenced here, visibly logged.
+        leaks_ok = { "/shuttle-build-prefix" },
     },
 }

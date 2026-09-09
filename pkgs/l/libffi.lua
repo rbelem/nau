@@ -31,6 +31,16 @@ return {
             "./configure --prefix=/usr --disable-static",
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
+            -- libtool .la metadata embeds the configure-time prefix
+            -- (/shuttle-build-prefix) and is obsolete at runtime — consumers
+            -- use the .so libs and .pc pkg-config files. Strip so the build
+            -- prefix cannot leak.
+            "find $STAGE/usr -name '*.la' -delete",
+            -- install-info's dir index conflicts in the merged build
+            -- prefix (glibc ships its own usr/share/info/dir with different
+            -- content — ADR-0018 identical-content rule). Dead weight in a
+            -- pool payload: nothing in a pod reads info pages.
+            "rm -f $STAGE/usr/share/info/dir",
         }, " && "),
 
         type = "source",
