@@ -16,6 +16,16 @@ translation files. It is a core dependency for many GNU packages.]],
         type = "source",
         requires = {},
         source = { url = "https://ftp.gnu.org/gnu/gettext/gettext-0.22.5.tar.xz" },
-        build = "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
+        -- --without-libpsl n/a; gettext is a plain autotools build. The
+        -- usr/share/info/dir index file it installs conflicts with glibc's
+        -- in the merged build prefix (ADR-0018 hard-error on differing
+        -- content) and is a generated index that no pool consumer reads —
+        -- strip it.
+        build = table.concat({
+            "./configure --prefix=/usr",
+            "make -j$(nproc)",
+            "make install DESTDIR=$STAGE",
+            "find $STAGE/usr/share/info -maxdepth 1 -name dir -delete",
+        }, " && "),
     },
 }

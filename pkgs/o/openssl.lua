@@ -23,6 +23,13 @@ return {
         source = {
             url = "https://www.openssl.org/source/openssl-3.6.2.tar.gz",
         },
-        build = "./Configure --prefix=/usr --openssldir=/etc/ssl && make && make install DESTDIR=$STAGE",
+        -- --libdir=lib: openssl's Configure defaults to lib64 on x86_64, but
+        -- the pool merged-prefix convention (ADR-0018) is a single /usr tree
+        -- where consumers look in usr/lib (LDFLAGS/PKG_CONFIG_PATH only cover
+        -- usr/lib and usr/lib/pkgconfig). Without this, curl's configure
+        -- cannot detect OpenSSL ("--with-openssl was given but OpenSSL could
+        -- not be detected") because its .pc files and .so libs land in
+        -- usr/lib64, outside the build-prefix lookup paths.
+        build = "./Configure --prefix=/usr --libdir=lib --openssldir=/etc/ssl && make && make install DESTDIR=$STAGE",
     },
 }

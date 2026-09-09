@@ -16,6 +16,11 @@ This build uses the internal glib to avoid external dependencies.]],
         type = "source",
         requires = {},
         source = { url = "https://pkgconfig.freedesktop.org/releases/pkg-config-0.29.2.tar.gz" },
-        build = "./configure --prefix=/usr --with-internal-glib && make && make install DESTDIR=$STAGE",
+        -- pkg-config 0.29.2's bundled glib (goption.c) uses `bool` as a struct
+        -- member name; on GCC with a C99+ default dialect `bool` is a keyword,
+        -- so `gboolean bool;` fails ("two or more data types", "expected
+        -- identifier before 'bool'"). Compile with the C89 GNU dialect where
+        -- `bool` is a plain identifier, restoring the source's assumption.
+        build = "./configure --prefix=/usr --with-internal-glib && make CFLAGS=\"-std=gnu89\" && make install DESTDIR=$STAGE",
     },
 }

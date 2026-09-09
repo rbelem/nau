@@ -36,7 +36,14 @@ return {
         }, " && "),
 
         type = "source",
-        requires = { "glibc" },
+        -- Prebuilt self-contained .NET binary; links libz (zlib) plus
+        -- glibc/libstdc++ at runtime. libstdc++ comes from the pool
+        -- libstdcpp package, which currently FAILS to build on the modern
+        -- toolchain (pre-existing pool defect — tzdb.cc 'mutex does not name
+        -- a type' from a configure feature-detection miss, see pool
+        -- libstdcpp). Listed here as glibc+zlib (the buildable closure);
+        -- libstdcpp is the documented runtime blocker for full GCM use.
+        requires = { "glibc", "zlib" },
 
         apps = {
             ["git-credential-manager"] = app {
