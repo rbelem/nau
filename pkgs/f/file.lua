@@ -33,6 +33,10 @@ return {
             "./configure --prefix=/usr --disable-static",
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
+            -- libtool .la metadata (libmagic.la) embeds the merged build
+            -- prefix; nothing consumes it at runtime — strip
+            -- (libstdcpp/curl/gmp/jq precedent).
+            "find $STAGE -name '*.la' -type f -delete",
         }, " && "),
 
         type = "source",
