@@ -29,6 +29,10 @@ return {
             "./configure --prefix=/usr --disable-maintainer-mode",
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
+            -- libtool .la metadata (libonig.la, libjq.la) embeds the merged
+            -- build prefix; nothing consumes them at runtime — strip
+            -- (libstdcpp/curl/gmp precedent).
+            "find $STAGE -name '*.la' -type f -delete",
         }, " && "),
 
         type = "source",
