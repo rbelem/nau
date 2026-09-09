@@ -129,6 +129,8 @@ pub struct BuildResultJson {
 pub struct DepResultJson {
     pub name: String,
     pub requires: Vec<String>,
+    /// Build-time-only dependencies (ADR-0018, issue #17).
+    pub build_deps: Vec<String>,
     pub kind: String, // "direct" or "transitive"
 }
 

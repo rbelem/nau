@@ -265,6 +265,13 @@ pub struct SnapMeta {
     #[serde(skip)]
     pub requires: Vec<String>,
 
+    /// Build-time-only dependencies (ADR-0018, issue #17): payloads are
+    /// mounted into the build sandbox for the duration of the build (merged
+    /// prefix, [`SANDBOX_BUILD_PREFIX`]) and never enter the runtime
+    /// closure. Skipped in YAML — build metadata only.
+    #[serde(skip)]
+    pub build_deps: Vec<String>,
+
     /// Runtime confinement grants (ADR-0016, ticket #11). Present
     /// (`Some`) declares the package `confined`; absent is `unconfined`
     /// (the default for simple CLIs). Emitted into snap.yaml so it
@@ -680,6 +687,10 @@ impl SnapMeta {
         let slots = get_opt_plug_map(table, "slots")?;
         let aliases: Vec<String> = table.get("aliases").unwrap_or_default();
         let mut requires: Vec<String> = table.get("requires").unwrap_or_default();
+        // Build-time-only dependencies (ADR-0018): same shape and validation
+        // treatment as `requires` (the Lua DSL checks the array; unknown
+        // names are rejected at resolution, exactly like `requires` names).
+        let build_deps: Vec<String> = table.get("build_deps").unwrap_or_default();
         // Plugin parts contribute extra requires (e.g. `cargo` pulls the
         // rust toolchain package) — expanded and deep-validated here so the
         // Rust boundary is the single choke point (ADR-0014 Decisions 3-4).
@@ -764,6 +775,7 @@ impl SnapMeta {
             slots,
             aliases,
             requires,
+            build_deps,
             target,
             toolchain,
             inputs,
@@ -2725,7 +2737,13 @@ fn is_shared_lib_name(name: &str) -> bool {
 /// generic `shuttle build` path passes `None` — those builds have no store
 /// to bake and produce no wrappers.
 ///
+/// `deps_dir` is the fetched interpreted-deps closure (ADR-0017) bound
+/// read-only into the sandbox; `build_prefix` is the merged `/usr`-like
+/// prefix of `requires` + `build_deps` payloads (ADR-0018, issue #17),
+/// likewise bound read-only. Both are `None` for builds that need neither.
+///
 /// Returns the output filename (not the full path).
+#[allow(clippy::too_many_arguments)]
 pub fn build_snap(
     meta: &SnapMeta,
     stage_dir: &Path,
@@ -2734,12 +2752,13 @@ pub fn build_snap(
     stage_policy: StagePolicy,
     pod_store: Option<&crate::runtime::RuntimeStore>,
     deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
 ) -> miette::Result<BuildResult> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
 
     // 1. Run build phase (download source, run build command) if configured
-    let outcome = run_build(meta, stage_dir, stage_policy, deps_dir)?;
+    let outcome = run_build(meta, stage_dir, stage_policy, deps_dir, build_prefix)?;
 
     // 1a. Repair native-ELF command binaries for portability (ticket #12):
     // a nix-toolchain build bakes `/nix/store/...` interpreter + RUNPATH
@@ -2886,6 +2905,7 @@ fn run_build(
     stage_dir: &Path,
     stage_policy: StagePolicy,
     deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
 ) -> miette::Result<BuildOutcome> {
     // Build plan: `parts` and `build` are mutually exclusive (the DSL
     // enforces this; re-checked here for non-DSL constructors).
@@ -3051,6 +3071,7 @@ fn run_build(
             &abs_stage,
             meta.target.as_deref(),
             deps_dir,
+            build_prefix,
         )?;
     } else {
         // Single-part: cwd and $SRC both point at the source root, as before.
@@ -3068,6 +3089,7 @@ fn run_build(
             None,
             &[],
             deps_dir,
+            build_prefix,
         )?;
         output::finish_ok(&build_spinner, &format!("built {}", meta.name));
     }
@@ -3535,6 +3557,7 @@ fn run_parts(
     stage_dir: &Path,
     target: Option<&str>,
     deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
 ) -> miette::Result<()> {
     for name in order_parts(parts)? {
         let part = parts.get(&name).expect("name comes from the same map");
@@ -3554,6 +3577,7 @@ fn run_parts(
                 Some(&name),
                 &plan.env,
                 deps_dir,
+                build_prefix,
             )?;
         }
         output::finish_ok(&spinner, &format!("[{name}] built"));
@@ -3630,19 +3654,38 @@ fn run_build_command(
     part_name: Option<&str>,
     extra_env: &[(String, String)],
     deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
 ) -> miette::Result<()> {
     let bwrap_bin = detect_bwrap();
     let cross_env = cross_compile_env(target);
 
     if let Some(bwrap_bin) = bwrap_bin {
         run_bwrapped(
-            &bwrap_bin, cmd, build_path, work_dir, src_dir, stage_dir, target, &cross_env,
-            part_name, extra_env, deps_dir,
+            &bwrap_bin,
+            cmd,
+            build_path,
+            work_dir,
+            src_dir,
+            stage_dir,
+            target,
+            &cross_env,
+            part_name,
+            extra_env,
+            deps_dir,
+            build_prefix,
         )
     } else {
         output::warn("sandbox unavailable — building WITHOUT isolation");
         run_direct(
-            cmd, work_dir, src_dir, stage_dir, &cross_env, part_name, extra_env, deps_dir,
+            cmd,
+            work_dir,
+            src_dir,
+            stage_dir,
+            &cross_env,
+            part_name,
+            extra_env,
+            deps_dir,
+            build_prefix,
         )
     }
 }
@@ -3728,6 +3771,39 @@ pub const SANDBOX_RO_ROOTS: [&str; 6] = [
 /// inside the build sandbox (read-only), and what `$SHUTTLE_DEPS_DIR`
 /// points the build command at.
 pub const SANDBOX_DEPS_DIR: &str = "/shuttle-deps";
+
+/// Where the merged build prefix (ADR-0018 Decision 2, issue #17) is
+/// mounted inside the build sandbox (read-only), and what
+/// `$SHUTTLE_BUILD_PREFIX` points the build command at. The prefix holds
+/// the payload files of the package's `requires` + `build_deps` entries,
+/// merged into one `/usr`-like tree, so `./configure`, `pkg-config`, and
+/// compilers consume pool libraries unmodified.
+pub const SANDBOX_BUILD_PREFIX: &str = "/shuttle-build-prefix";
+
+/// The env a build command sees for the merged build prefix: the prefix
+/// root plus the standard variables that steer `./configure`, `pkg-config`,
+/// and the compiler at it. `prefix` is the path AS THE BUILD SEES IT — the
+/// sandbox path under bwrap, the host path in degraded direct mode.
+///
+/// `PKG_CONFIG_SYSROOT_DIR` makes pkg-config rewrite the `/usr`-rooted
+/// paths baked into pool `.pc` files onto the prefix (ncurses ships
+/// `prefix=/usr` in its `.pc`); `CPPFLAGS`/`LDFLAGS` cover configure's
+/// header/link probes when no `.pc` file exists.
+pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("SHUTTLE_BUILD_PREFIX", prefix.to_string()),
+        ("CPPFLAGS", format!("-I{}/usr/include", prefix)),
+        ("LDFLAGS", format!("-L{}/usr/lib", prefix)),
+        (
+            "PKG_CONFIG_PATH",
+            format!(
+                "{}/usr/lib/pkgconfig:{}/usr/share/pkgconfig",
+                prefix, prefix
+            ),
+        ),
+        ("PKG_CONFIG_SYSROOT_DIR", prefix.to_string()),
+    ]
+}
 
 /// The process PATH split into absolute directory entries. Relative and
 /// empty entries are dropped — the sandbox only ever mirrors absolute host
@@ -4007,6 +4083,7 @@ fn run_bwrapped(
     part_name: Option<&str>,
     extra_env: &[(String, String)],
     deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
 ) -> miette::Result<()> {
     // Tool resolution must work the way the sandbox will see it — fail
     // here, naming the tool, instead of mid-build (see
@@ -4054,6 +4131,16 @@ fn run_bwrapped(
     if let Some(deps) = deps_dir {
         cmd_proc.arg("--ro-bind").arg(deps).arg(SANDBOX_DEPS_DIR);
     }
+    // Merged build prefix (ADR-0018 Decision 2, issue #17): the payloads of
+    // `requires` + `build_deps`, merged into one /usr-like tree, bound
+    // READ-ONLY at a fixed sandbox path — the same discipline as the deps
+    // closure above.
+    if let Some(prefix) = build_prefix {
+        cmd_proc
+            .arg("--ro-bind")
+            .arg(prefix)
+            .arg(SANDBOX_BUILD_PREFIX);
+    }
     bind_system_ro_paths(&mut cmd_proc);
     // Cross-compilation sysroot mount
     if let Some(triplet) = target {
@@ -4075,6 +4162,11 @@ fn run_bwrapped(
         .env("SRC", &inner_src);
     if deps_dir.is_some() {
         cmd_proc.env("SHUTTLE_DEPS_DIR", SANDBOX_DEPS_DIR);
+    }
+    if build_prefix.is_some() {
+        for (key, val) in build_prefix_env(SANDBOX_BUILD_PREFIX) {
+            cmd_proc.env(key, val);
+        }
     }
     if let Some(name) = part_name {
         cmd_proc.env("PART_NAME", name);
@@ -4106,6 +4198,7 @@ fn run_direct(
     part_name: Option<&str>,
     extra_env: &[(String, String)],
     deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
 ) -> miette::Result<()> {
     let mut cmd_proc = std::process::Command::new("sh");
     cmd_proc
@@ -4116,6 +4209,14 @@ fn run_direct(
     // its host path (degraded mode only; the bwrap path binds it RO).
     if let Some(deps) = deps_dir {
         cmd_proc.env("SHUTTLE_DEPS_DIR", deps);
+    }
+    // Same for the merged build prefix: exposed at its host path with the
+    // prefix env pointing there (degraded mode only).
+    if let Some(prefix) = build_prefix {
+        let host = prefix.to_string_lossy().into_owned();
+        for (key, val) in build_prefix_env(&host) {
+            cmd_proc.env(key, val);
+        }
     }
     if let Some(name) = part_name {
         cmd_proc.env("PART_NAME", name);
@@ -4853,6 +4954,7 @@ mod tests {
             StagePolicy::Default,
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -4916,6 +5018,7 @@ mod tests {
             StagePolicy::Default,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(snap_amd64.snap_filename, "multi-test_2.0_amd64.snap");
@@ -4928,6 +5031,7 @@ mod tests {
             output_dir.path(),
             "arm64",
             StagePolicy::Default,
+            None,
             None,
             None,
         )
@@ -6423,6 +6527,7 @@ mod tests {
             StagePolicy::Default,
             None,
             None,
+            None,
         )
         .unwrap();
         let snap_path = output_dir.path().join(&result.snap_filename);
@@ -6847,6 +6952,7 @@ mod tests {
             &abs_stage,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -6881,7 +6987,16 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v))
         .collect();
 
-        assert!(run_parts(&parts, tree.path(), tree.path(), &abs_stage, None, None).is_err());
+        assert!(run_parts(
+            &parts,
+            tree.path(),
+            tree.path(),
+            &abs_stage,
+            None,
+            None,
+            None
+        )
+        .is_err());
     }
 
     #[test]
@@ -6913,6 +7028,7 @@ mod tests {
             Path::new("/nonexistent-stage"),
             StagePolicy::Default,
             None,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -6940,6 +7056,7 @@ mod tests {
             &meta,
             Path::new("/nonexistent-stage"),
             StagePolicy::Default,
+            None,
             None,
         )
         .unwrap_err()
@@ -7152,6 +7269,89 @@ mod tests {
     }
 
     #[test]
+    fn test_build_deps_parse() {
+        // ADR-0018 (issue #17): build_deps parses alongside requires,
+        // validates as a string array, and never reaches snap.yaml
+        // (build metadata only, like requires).
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "linked-app",
+                    version = "1.0",
+                    requires = { "glibc", "ncurses" },
+                    build_deps = { "ncurses", "pkgconf" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(
+            meta.build_deps,
+            vec!["ncurses".to_string(), "pkgconf".to_string()]
+        );
+        assert_eq!(
+            meta.requires,
+            vec!["glibc".to_string(), "ncurses".to_string()]
+        );
+
+        // Build metadata only — never emitted into snap.yaml.
+        let yaml = meta.to_yaml().unwrap();
+        assert!(
+            !yaml.contains("build_deps"),
+            "yaml must not carry build_deps: {yaml}"
+        );
+        assert!(
+            !yaml.contains("requires"),
+            "yaml must not carry requires: {yaml}"
+        );
+
+        // Absent → empty.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "plain", version = "1.0" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert!(meta.build_deps.is_empty());
+    }
+
+    #[test]
+    fn test_build_deps_rejects_non_string_entries() {
+        // Same validation treatment as `requires` (the shared
+        // check_string_array gate in the DSL).
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "bad",
+                    version = "1.0",
+                    build_deps = { "ok", 123 },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("build_deps"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
     fn test_cargo_plugin_appends_toolchain_require() {
         // ADR-0014 Decision 4: extra_requires land in the snap's effective
         // requires (the same field dependency resolution reads).
@@ -7347,7 +7547,16 @@ fi
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         });
 
         let inner_src = expected_src(&e2e.src);
@@ -7420,7 +7629,16 @@ fi
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         });
 
         let inner_src = expected_src(&e2e.src);
@@ -7480,7 +7698,16 @@ fi
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         });
 
         let inner_src = expected_src(&e2e.src);
@@ -7561,7 +7788,16 @@ esac
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         });
 
         // configure ran inside $SRC with --prefix=/usr and the args, and its
@@ -7646,7 +7882,16 @@ esac
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         });
 
         // configure ran with --prefix=/usr and the args, in order, and its
@@ -7724,7 +7969,16 @@ esac
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         });
 
         let inner_src = expected_src(&e2e.src);
@@ -7780,7 +8034,16 @@ mkdir -p "$STAGE/bin" && : > "$STAGE/bin/app"
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         });
 
         let inner_src = expected_src(&e2e.src);
@@ -7845,7 +8108,16 @@ fi
         .collect();
 
         with_path_prepend(&e2e.stubs, || {
-            run_parts(&parts, e2e.tree.path(), &e2e.src, &e2e.stage, None, None).unwrap();
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         });
 
         let log = e2e.invocations();
@@ -7939,6 +8211,7 @@ fi
             output_dir.path(),
             "amd64",
             StagePolicy::Default,
+            None,
             None,
             None,
         )
@@ -8054,6 +8327,28 @@ fi
             "/home/u/proj/.devbox/nix/profile/default/bin/bison"
         )));
         assert!(!sandbox_visible(Path::new("relative/bin/make")));
+    }
+
+    #[test]
+    fn build_prefix_env_points_everything_at_the_prefix() {
+        // ADR-0018 (issue #17): the env a build sees for the merged prefix —
+        // root, configure probes, and pkg-config with the sysroot rewrite
+        // that fixes `/usr`-rooted .pc files.
+        let env = build_prefix_env("/shuttle-build-prefix");
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing {k}"))
+        };
+        assert_eq!(get("SHUTTLE_BUILD_PREFIX"), "/shuttle-build-prefix");
+        assert_eq!(get("CPPFLAGS"), "-I/shuttle-build-prefix/usr/include");
+        assert_eq!(get("LDFLAGS"), "-L/shuttle-build-prefix/usr/lib");
+        assert_eq!(
+            get("PKG_CONFIG_PATH"),
+            "/shuttle-build-prefix/usr/lib/pkgconfig:/shuttle-build-prefix/usr/share/pkgconfig"
+        );
+        assert_eq!(get("PKG_CONFIG_SYSROOT_DIR"), "/shuttle-build-prefix");
     }
 
     #[test]
@@ -8258,6 +8553,7 @@ mod wrapper_tests {
             slots: None,
             aliases: Vec::new(),
             requires: Vec::new(),
+            build_deps: Vec::new(),
             inputs: None,
             target: None,
             toolchain: None,

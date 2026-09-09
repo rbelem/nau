@@ -470,10 +470,11 @@ fn build_closure(
     meta: &shuttle::snap::SnapMeta,
     lockfile: &LockFile,
 ) -> shuttle::cache::BuildClosure {
-    let mut names: Vec<String> = if meta.requires.is_empty() {
+    let seeds = build_dep_seeds(meta);
+    let mut names: Vec<String> = if seeds.is_empty() {
         Vec::new()
     } else {
-        shuttle::deps::resolve_dep_names(&meta.requires, true).unwrap_or_default()
+        shuttle::deps::resolve_dep_names(&seeds, true).unwrap_or_default()
     };
     names.sort();
     names.dedup();
@@ -590,6 +591,7 @@ fn run_build(
         stage_dir,
         stage_policy,
         output_dir,
+        pkg_cache.as_ref(),
         &lockfile,
         json,
     )?;
@@ -688,14 +690,16 @@ fn select_outputs<'a>(
 }
 
 /// Collect the unique dependency names of every selected output, in
-/// first-seen order.
+/// first-seen order. Seeds are the build-time dependency union
+/// (`requires` ∪ `build_deps`) — both kinds get built (ADR-0018).
 fn collect_dep_names(iter: &[(&String, shuttle::snap::SnapMeta)]) -> Vec<String> {
     let mut all_deps: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (_name, meta) in iter {
-        if !meta.requires.is_empty() {
-            if let Ok(deps) = shuttle::deps::resolve_dep_names(&meta.requires, true) {
+        let seeds = build_dep_seeds(meta);
+        if !seeds.is_empty() {
+            if let Ok(deps) = shuttle::deps::resolve_dep_names(&seeds, true) {
                 for dep in &deps {
                     if seen.insert(dep.clone()) {
                         all_deps.push(dep.clone());
@@ -705,6 +709,143 @@ fn collect_dep_names(iter: &[(&String, shuttle::snap::SnapMeta)]) -> Vec<String>
         }
     }
     all_deps
+}
+
+/// The declared build-time dependency seeds of `meta`: `requires` ∪
+/// `build_deps`, deduplicated, declaration order preserved (ADR-0018).
+fn build_dep_seeds(meta: &shuttle::snap::SnapMeta) -> Vec<String> {
+    let mut seeds: Vec<String> = Vec::new();
+    for dep in meta.requires.iter().chain(&meta.build_deps) {
+        if !seeds.contains(dep) {
+            seeds.push(dep.clone());
+        }
+    }
+    seeds
+}
+
+/// Resolve `meta`'s build-time dependency closure (`requires` ∪
+/// `build_deps`, transitively), ensure every member's built payload is
+/// available, and materialize the merged `/usr`-like build prefix
+/// (ADR-0018 Decision 2, issue #17). Returns `None` when the package runs
+/// no build or declares neither list — nothing to bind into the sandbox.
+///
+/// Unknown dependency names reject exactly like unknown `requires` names:
+/// the resolver's "package 'x' not found" error propagates.
+#[allow(clippy::too_many_arguments)]
+fn ensure_build_prefix(
+    meta: &shuttle::snap::SnapMeta,
+    arch: &str,
+    output_dir: &Path,
+    pkg_cache: Option<&PackageCache>,
+    lockfile: &LockFile,
+    json: bool,
+    building: &mut Vec<String>,
+) -> miette::Result<Option<shuttle::build_prefix::MergedPrefix>> {
+    // Only source builds consume a build prefix — meta/store snaps and
+    // fetch-only declarations never run a build command.
+    if meta.build.is_none() && meta.parts.is_none() {
+        return Ok(None);
+    }
+    let seeds = build_dep_seeds(meta);
+    if seeds.is_empty() {
+        return Ok(None);
+    }
+    let closure_names = shuttle::deps::resolve_dep_names(&seeds, true)?;
+    let mut payloads = Vec::new();
+    for name in closure_names {
+        let dep_meta = shuttle::deps::load_meta(&name)?;
+        let snap = ensure_dep_payload(
+            &name, &dep_meta, arch, output_dir, pkg_cache, lockfile, json, building,
+        )?;
+        payloads.push(shuttle::build_prefix::Payload { pkg: name, snap });
+    }
+    let merged = shuttle::build_prefix::materialize_merged_prefix(&payloads)?;
+    if !json && !payloads.is_empty() {
+        let names: Vec<&str> = payloads.iter().map(|p| p.pkg.as_str()).collect();
+        shuttle::output::status(format!(
+            "build prefix: merged {} payload(s) — {}",
+            payloads.len(),
+            names.join(", ")
+        ));
+    }
+    Ok(Some(merged))
+}
+
+/// Ensure one dependency's built payload is available for the merged build
+/// prefix: the output dir first (a previous build or `--all` may have
+/// produced it), then the binary cache, else build it now — giving the
+/// dependency its own merged prefix first, because its build may need its
+/// own build-time deps (ADR-0018 applies to every source build).
+///
+/// `building` is the in-progress stack for cycle detection: a circular
+/// requires/build_deps chain cannot be materialized and fails with a clear
+/// chain instead of recursing forever.
+#[allow(clippy::too_many_arguments)]
+fn ensure_dep_payload(
+    name: &str,
+    dep_meta: &shuttle::snap::SnapMeta,
+    arch: &str,
+    output_dir: &Path,
+    pkg_cache: Option<&PackageCache>,
+    lockfile: &LockFile,
+    json: bool,
+    building: &mut Vec<String>,
+) -> miette::Result<PathBuf> {
+    let filename = format!("{}_{}_{}.snap", name, dep_meta.version, arch);
+    let in_output = output_dir.join(&filename);
+    if in_output.exists() {
+        return Ok(in_output);
+    }
+
+    // Closure key for the cache lookup/store (same computation the --all
+    // dep path uses).
+    let closure = pkg_cache.map(|_| build_closure(dep_meta, lockfile));
+    if let (Some(cache), Some(closure)) = (pkg_cache, closure.as_ref()) {
+        if let Some(cached) = cache.lookup(dep_meta, arch, closure) {
+            return Ok(cached);
+        }
+    }
+
+    if building.iter().any(|n| n == name) {
+        miette::bail!(
+            "circular dependency while building '{name}': {} → {name}",
+            building.join(" → ")
+        );
+    }
+    building.push(name.to_string());
+
+    let dep_prefix = ensure_build_prefix(
+        dep_meta, arch, output_dir, pkg_cache, lockfile, json, building,
+    )?;
+
+    shuttle::snap::check_cross_build(arch, dep_meta.target.as_deref())?;
+    if !json {
+        shuttle::output::status(format!("building dependency {name} ({arch})..."));
+    }
+    let stage = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create temp stage for {name}: {e}"))?;
+    let result = shuttle::snap::build_snap(
+        dep_meta,
+        stage.path(),
+        output_dir,
+        arch,
+        shuttle::snap::StagePolicy::Default,
+        // Dependency builds have no pod store and no interpreted closure.
+        None,
+        None,
+        dep_prefix.as_ref().map(|t| t.path()),
+    )?;
+    if !json {
+        shuttle::output::ok(&result.snap_filename);
+    }
+    if let (Some(cache), Some(closure)) = (pkg_cache, closure.as_ref()) {
+        if let Err(e) = cache.store(dep_meta, &result, output_dir, closure) {
+            shuttle::output::warn(format!("cache store failed: {e}"));
+        }
+    }
+
+    building.pop();
+    Ok(output_dir.join(&result.snap_filename))
 }
 
 /// Resolve and build every transitive dependency of the selected outputs
@@ -763,6 +904,7 @@ fn build_all_deps(
             output_dir,
             pkg_cache,
             dep_closure.as_ref(),
+            lockfile,
             json,
         )?;
     }
@@ -770,7 +912,10 @@ fn build_all_deps(
 }
 
 /// Build one dependency across its resolved archs, storing each artifact in
-/// the binary cache when one is active.
+/// the binary cache when one is active. Each arch's build gets the merged
+/// build prefix of its own build-time deps (ADR-0018 applies to every
+/// source build, dependencies included).
+#[allow(clippy::too_many_arguments)]
 fn build_dep_archs(
     dep_name: &str,
     dep_meta: &shuttle::snap::SnapMeta,
@@ -778,6 +923,7 @@ fn build_dep_archs(
     output_dir: &Path,
     pkg_cache: Option<&shuttle::cache::PackageCache>,
     dep_closure: Option<&shuttle::cache::BuildClosure>,
+    lockfile: &LockFile,
     json: bool,
 ) -> miette::Result<()> {
     for a in dep_archs {
@@ -788,6 +934,17 @@ fn build_dep_archs(
         let dep_stage = tempfile::tempdir()
             .map_err(|e| miette::miette!("failed to create temp stage: {}", e))?;
 
+        let mut building: Vec<String> = vec![dep_name.to_string()];
+        let build_prefix = ensure_build_prefix(
+            dep_meta,
+            a,
+            output_dir,
+            pkg_cache,
+            lockfile,
+            json,
+            &mut building,
+        )?;
+
         match shuttle::snap::build_snap(
             dep_meta,
             dep_stage.path(),
@@ -797,6 +954,7 @@ fn build_dep_archs(
             None,
             // Plain recursive builds have no pod dependency closure.
             None,
+            build_prefix.as_ref().map(|p| p.path()),
         ) {
             Ok(result) => {
                 if !json {
@@ -818,12 +976,14 @@ fn build_dep_archs(
 
 /// Build every selected output across its resolved archs, collecting the
 /// source infos recorded during the builds (for lockfile pinning).
+#[allow(clippy::too_many_arguments)]
 fn build_outputs(
     iter: &[(&String, shuttle::snap::SnapMeta)],
     cli_archs: &[String],
     stage_dir: &Path,
     stage_policy: shuttle::snap::StagePolicy,
     output_dir: &Path,
+    pkg_cache: Option<&PackageCache>,
     lockfile: &LockFile,
     json: bool,
 ) -> miette::Result<Vec<shuttle::snap::SourceInfo>> {
@@ -845,6 +1005,7 @@ fn build_outputs(
                 stage_dir,
                 stage_policy,
                 output_dir,
+                pkg_cache,
                 lockfile,
                 json,
             )? {
@@ -866,6 +1027,7 @@ fn build_one_arch(
     stage_dir: &Path,
     stage_policy: shuttle::snap::StagePolicy,
     output_dir: &Path,
+    pkg_cache: Option<&PackageCache>,
     lockfile: &LockFile,
     json: bool,
 ) -> miette::Result<Option<shuttle::snap::SourceInfo>> {
@@ -880,8 +1042,30 @@ fn build_one_arch(
         }
     }
 
-    let result =
-        shuttle::snap::build_snap(meta, stage_dir, output_dir, arch, stage_policy, None, None)?;
+    // Merged build prefix (ADR-0018, issue #17): the payloads of this
+    // package's `requires` + `build_deps`, built-or-fetched and merged,
+    // bound read-only into the build sandbox.
+    let mut building: Vec<String> = vec![name.to_string()];
+    let build_prefix = ensure_build_prefix(
+        meta,
+        arch,
+        output_dir,
+        pkg_cache,
+        lockfile,
+        json,
+        &mut building,
+    )?;
+
+    let result = shuttle::snap::build_snap(
+        meta,
+        stage_dir,
+        output_dir,
+        arch,
+        stage_policy,
+        None,
+        None,
+        build_prefix.as_ref().map(|p| p.path()),
+    )?;
     if !json {
         shuttle::output::ok(&result.snap_filename);
     } else {
@@ -969,13 +1153,15 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
     Ok(())
 }
 
-/// JSON-mode order report for one output.
+/// JSON-mode order report for one output. Seeds resolution with the
+/// build-time dependency union (`requires` ∪ `build_deps`).
 fn report_order_json(meta: &shuttle::snap::SnapMeta) {
-    if meta.requires.is_empty() {
+    let seeds = build_dep_seeds(meta);
+    if seeds.is_empty() {
         return;
     }
-    let seen: std::collections::HashSet<&str> = meta.requires.iter().map(|s| s.as_str()).collect();
-    if let Ok(order) = shuttle::deps::resolve_dep_names(&meta.requires, true) {
+    let seen: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
+    if let Ok(order) = shuttle::deps::resolve_dep_names(&seeds, true) {
         for dep in &order {
             let kind = if seen.contains(dep.as_str()) {
                 "direct"
@@ -994,7 +1180,7 @@ fn report_order_json(meta: &shuttle::snap::SnapMeta) {
 fn report_order_human(meta: &shuttle::snap::SnapMeta) {
     eprintln!("Package: {} {}", meta.name, meta.version);
 
-    if meta.requires.is_empty() {
+    if meta.requires.is_empty() && meta.build_deps.is_empty() {
         eprintln!("  No dependencies");
         return;
     }
@@ -1004,11 +1190,18 @@ fn report_order_human(meta: &shuttle::snap::SnapMeta) {
         eprintln!("    - {}", dep);
     }
 
+    if !meta.build_deps.is_empty() {
+        eprintln!("  Direct build_deps:");
+        for dep in &meta.build_deps {
+            eprintln!("    - {}", dep);
+        }
+    }
+
     eprintln!("  Resolved build order (transitive):");
-    match shuttle::deps::resolve_dep_names(&meta.requires, true) {
+    let seeds = build_dep_seeds(meta);
+    match shuttle::deps::resolve_dep_names(&seeds, true) {
         Ok(order) => {
-            let seen: std::collections::HashSet<&str> =
-                meta.requires.iter().map(|s| s.as_str()).collect();
+            let seen: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
             for dep in &order {
                 let marker = if seen.contains(dep.as_str()) {
                     "direct"
@@ -1091,7 +1284,7 @@ fn cmd_deps(
 fn report_deps_json(nodes: &[shuttle::deps::DepNode]) {
     let seen: std::collections::HashSet<&str> = nodes
         .iter()
-        .flat_map(|n| &n.requires)
+        .flat_map(|n| n.requires.iter().chain(&n.build_deps))
         .map(|s| s.as_str())
         .collect();
     for node in nodes {
@@ -1103,6 +1296,7 @@ fn report_deps_json(nodes: &[shuttle::deps::DepNode]) {
         shuttle::output::record_dep_result(shuttle::output::DepResultJson {
             name: node.name.clone(),
             requires: node.requires.clone(),
+            build_deps: node.build_deps.clone(),
             kind: kind.to_string(),
         });
     }
@@ -1129,12 +1323,18 @@ fn report_deps_human(
         }
     } else if let Some(pkg) = nodes.first() {
         eprintln!("{} v1.0: {}", package, pkg.name);
-        if pkg.requires.is_empty() {
+        if pkg.requires.is_empty() && pkg.build_deps.is_empty() {
             eprintln!("  No dependencies");
         } else {
             eprintln!("  Requires:");
             for dep in &pkg.requires {
                 eprintln!("    - {}", dep);
+            }
+            if !pkg.build_deps.is_empty() {
+                eprintln!("  Build deps:");
+                for dep in &pkg.build_deps {
+                    eprintln!("    - {}", dep);
+                }
             }
             if recursive {
                 eprintln!("  (use --tree or --flat for full transitive resolution)");

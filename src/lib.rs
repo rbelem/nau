@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod assert;
+pub mod build_prefix;
 pub mod cache;
 pub mod cli;
 pub mod confine;

@@ -2553,6 +2553,10 @@ fn build_pending_snap(
         // wrappers can bake the script's content-addressed store path.
         Some(store),
         deps_dir.as_ref().map(|d| d.path()),
+        // Pod builds do not materialize the merged build prefix yet —
+        // ADR-0018 build-time visibility lands for `shuttle build` first
+        // (issue #17 scope); pod wiring follows separately.
+        None,
     )?;
     let payload = downloads.join(&result.snap_filename);
     let sha3_384 = crate::store::sha3_384_file(&payload)?;
@@ -2868,6 +2872,7 @@ pod {
             slots: None,
             aliases: vec![],
             requires: vec![],
+            build_deps: vec![],
             target: None,
             toolchain: None,
             inputs: None,

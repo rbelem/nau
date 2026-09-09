@@ -260,6 +260,7 @@ mod tests {
             slots: None,
             aliases: vec![],
             requires: vec![],
+            build_deps: vec![],
             target: None,
             toolchain: None,
             inputs: None,

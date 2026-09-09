@@ -1,8 +1,14 @@
-//! Dependency resolution — resolve requires fields into build order.
+//! Dependency resolution — resolve requires/build_deps fields into build order.
 //!
-//! Traverses `requires` fields declared in `shuttle.lua` files and returns
-//! a topologically sorted build order. Used by `shuttle deps` and
-//! `shuttle build --order`.
+//! Traverses `requires` and `build_deps` fields declared in `shuttle.lua`
+//! files and returns a topologically sorted build order. Used by
+//! `shuttle deps` and `shuttle build --order`.
+//!
+//! `requires` are runtime dependencies (ADR-0018); `build_deps` are
+//! build-time-only. Both edges order a build (a dependency must exist
+//! before whatever consumes it), so resolution and the topological sort
+//! walk both; only the runtime `requires` edges shape the `deps` tree
+//! display and closure reporting.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -14,6 +20,21 @@ use crate::snap::SnapMeta;
 pub struct DepNode {
     pub name: String,
     pub requires: Vec<String>,
+    pub build_deps: Vec<String>,
+}
+
+impl DepNode {
+    /// Every dependency edge of this node: `requires` + `build_deps`,
+    /// deduplicated, declaration order preserved.
+    pub fn all_deps(&self) -> Vec<String> {
+        let mut all = Vec::new();
+        for dep in self.requires.iter().chain(&self.build_deps) {
+            if !all.contains(dep) {
+                all.push(dep.clone());
+            }
+        }
+        all
+    }
 }
 
 /// Resolve transitive dependencies for a list of seed packages.
@@ -37,14 +58,21 @@ pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<Dep
             .filter(|r| !r.is_empty())
             .cloned()
             .collect();
+        let build_deps: Vec<String> = meta
+            .build_deps
+            .iter()
+            .filter(|r| !r.is_empty())
+            .cloned()
+            .collect();
 
         nodes.push(DepNode {
             name: name.clone(),
             requires: requires.clone(),
+            build_deps: build_deps.clone(),
         });
 
         if recursive {
-            for dep in &requires {
+            for dep in requires.iter().chain(&build_deps) {
                 if !visited.contains(dep) {
                     pending.push(dep.clone());
                 }
@@ -110,6 +138,9 @@ fn print_tree_node(
 }
 
 /// Topological sort (Kahn's algorithm): leaf dependencies first.
+///
+/// Edges come from both `requires` and `build_deps` — either kind of
+/// dependency must build before its consumer.
 fn topological_sort(nodes: &[DepNode]) -> Vec<DepNode> {
     let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
     let name_set: HashSet<&str> = names.iter().map(|n| n.as_str()).collect();
@@ -120,8 +151,15 @@ fn topological_sort(nodes: &[DepNode]) -> Vec<DepNode> {
 
     for node in nodes {
         in_degree.entry(&node.name).or_insert(0);
-        for dep in &node.requires {
-            if name_set.contains(dep.as_str()) {
+        // Both edge kinds borrow from `node` (which outlives the sort).
+        let mut edges: Vec<&str> = Vec::new();
+        for dep in node.requires.iter().chain(&node.build_deps) {
+            if !edges.contains(&dep.as_str()) {
+                edges.push(dep.as_str());
+            }
+        }
+        for dep in edges {
+            if name_set.contains(dep) {
                 adj.entry(dep).or_default().push(&node.name);
                 *in_degree.entry(&node.name).or_insert(0) += 1;
             } else {
@@ -215,14 +253,17 @@ mod tests {
             DepNode {
                 name: "gcc".into(),
                 requires: vec!["gmp".into(), "mpfr".into()],
+                build_deps: vec![],
             },
             DepNode {
                 name: "mpfr".into(),
                 requires: vec!["gmp".into()],
+                build_deps: vec![],
             },
             DepNode {
                 name: "gmp".into(),
                 requires: vec![],
+                build_deps: vec![],
             },
         ];
 
@@ -257,18 +298,22 @@ mod tests {
             DepNode {
                 name: "d".into(),
                 requires: vec!["c".into()],
+                build_deps: vec![],
             },
             DepNode {
                 name: "c".into(),
                 requires: vec!["b".into()],
+                build_deps: vec![],
             },
             DepNode {
                 name: "b".into(),
                 requires: vec!["a".into()],
+                build_deps: vec![],
             },
             DepNode {
                 name: "a".into(),
                 requires: vec![],
+                build_deps: vec![],
             },
         ];
 
@@ -286,5 +331,41 @@ mod tests {
         assert!(a < b);
         assert!(b < c);
         assert!(c < d);
+    }
+
+    /// Build_deps edges order a build exactly like requires edges: a
+    /// build-time dependency must be built before whatever consumes it
+    /// (ADR-0018, issue #17).
+    #[test]
+    fn test_topological_sort_build_deps_order() {
+        let nodes = vec![
+            DepNode {
+                name: "app".into(),
+                requires: vec![],
+                build_deps: vec!["libdev".into()],
+            },
+            DepNode {
+                name: "libdev".into(),
+                requires: vec![],
+                build_deps: vec![],
+            },
+        ];
+
+        let sorted = topological_sort(&nodes);
+        let names: Vec<&str> = sorted.iter().map(|n| n.name.as_str()).collect();
+        let libdev = names.iter().position(|&n| n == "libdev").unwrap();
+        let app = names.iter().position(|&n| n == "app").unwrap();
+        assert!(libdev < app, "build_deps must build before their consumer");
+    }
+
+    /// all_deps merges both edge kinds, deduplicated.
+    #[test]
+    fn test_all_deps_dedupes() {
+        let node = DepNode {
+            name: "app".into(),
+            requires: vec!["glibc".into(), "ncurses".into()],
+            build_deps: vec!["ncurses".into()],
+        };
+        assert_eq!(node.all_deps(), vec!["glibc", "ncurses"]);
     }
 }

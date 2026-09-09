@@ -23,6 +23,6 @@ return {
         source = {
             url = "https://ftp.gnu.org/gnu/ncurses/ncurses-6.5.tar.gz",
         },
-        build = "./configure --prefix=/usr --with-shared --with-termlib --enable-pc-files && make && make install DESTDIR=$STAGE",
+        build = "./configure --prefix=/usr --with-shared --with-termlib --enable-pc-files --without-cxx-binding --with-pkg-config-libdir=/usr/lib/pkgconfig && make && make install DESTDIR=$STAGE",
     },
 }
