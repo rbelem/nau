@@ -558,7 +558,10 @@ end
 --- Pin a snap from the Snap Store by name, optionally fixing revision
 -- and content hash for reproducibility.
 -- @param name  The snap name (e.g. "core22", "pc-kernel")
--- @param opts  (optional) table with `revision` (number) and/or `sha3_384` (string)
+-- @param opts  (optional) table with `revision` (number), `sha3_384`
+--              (string), and — for image() kernel/gadget entries only —
+--              `channel` (string, ADR-0019: pins the store channel,
+--              skipping base-track derivation and the declared-base check)
 -- @return a pin table consumable by image()
 -- @usage pin("core22", { revision = 1847, sha3_384 = "abc..." })
 --- Declare a system image composed from multiple snaps.
@@ -614,6 +617,15 @@ function image(opts)
     end
     if opts.gadget ~= nil and type(opts.gadget) ~= "table" then
         error("image(): 'gadget' must be a pin table, got " .. type(opts.gadget), 2)
+    end
+    -- ADR-0019 escape hatch: an explicit `channel` opt on the kernel or
+    -- gadget pin skips base-track derivation and the declared-base check
+    -- (the override is recorded in the build output).
+    if opts.kernel ~= nil and opts.kernel.channel ~= nil and type(opts.kernel.channel) ~= "string" then
+        error("image(): 'kernel.channel' must be a string, got " .. type(opts.kernel.channel), 2)
+    end
+    if opts.gadget ~= nil and opts.gadget.channel ~= nil and type(opts.gadget.channel) ~= "string" then
+        error("image(): 'gadget.channel' must be a string, got " .. type(opts.gadget.channel), 2)
     end
     if opts.snaps ~= nil then
         if type(opts.snaps) ~= "table" then

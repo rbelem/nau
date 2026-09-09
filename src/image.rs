@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
 use mlua::Value;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::Serializer;
 
@@ -35,6 +36,13 @@ pub struct KernelEntry {
     pub params: Vec<String>,
     pub modules: Vec<String>,
     pub modprobe_config: Option<String>,
+    /// ADR-0019 escape hatch: an author-pinned store channel (e.g.
+    /// "latest/stable") carried on the kernel pin entry
+    /// (`pin("pc-kernel", { channel = "…" })`). When set, resolution uses
+    /// the channel verbatim — no base-track derivation — and the
+    /// declared-base check is skipped; the override is logged at build
+    /// time.
+    pub channel: Option<String>,
 }
 
 /// Bootloader configuration for disk images.
@@ -98,6 +106,11 @@ pub struct ImageDeclaration {
     pub base: SnapRef,
     pub kernel: Option<KernelEntry>,
     pub gadget: Option<SnapRef>,
+    /// ADR-0019 escape hatch for the gadget entry — an author-pinned store
+    /// channel (`gadget = pin("pc", { channel = "…" })`). Semantics match
+    /// [`KernelEntry::channel`]: verbatim channel, no track derivation, no
+    /// declared-base check, logged override.
+    pub gadget_channel: Option<String>,
     pub extra_snaps: Vec<SnapRef>,
     pub bootloader: Option<BootloaderConfig>,
     pub disk: Option<DiskLayout>,
@@ -129,6 +142,7 @@ impl ImageDeclaration {
         let base = get_required_snap_ref(table, "base")?;
         let kernel = get_opt_kernel_entry(table)?;
         let gadget = get_opt_snap_ref(table, "gadget")?;
+        let gadget_channel = get_opt_pin_channel(table, "gadget")?;
         let extra_snaps = get_snap_ref_array(table, "snaps")?;
 
         // NEW: bootloader
@@ -160,6 +174,7 @@ impl ImageDeclaration {
             base,
             kernel,
             gadget,
+            gadget_channel,
             extra_snaps,
             bootloader,
             disk,
@@ -258,11 +273,13 @@ fn get_opt_kernel_entry(table: &mlua::Table) -> miette::Result<Option<KernelEntr
             let params: Vec<String> = t.get("params").unwrap_or_default();
             let modules: Vec<String> = t.get("modules").unwrap_or_default();
             let modprobe_config: Option<String> = t.get("modprobe_config").ok();
+            let channel = get_opt_pin_channel(table, "kernel")?;
             Ok(Some(KernelEntry {
                 snap,
                 params,
                 modules,
                 modprobe_config,
+                channel,
             }))
         }
         Value::Nil => Ok(None),
@@ -270,6 +287,29 @@ fn get_opt_kernel_entry(table: &mlua::Table) -> miette::Result<Option<KernelEntr
             "image(): 'kernel' must be a pin table, got {}",
             other.type_name()
         )),
+    }
+}
+
+/// Read the ADR-0019 explicit `channel` opt off a kernel/gadget pin table
+/// (`pin("pc-kernel", { channel = "22/stable" })`). The DSL passes unknown
+/// pin fields through, so the opt reaches this boundary without being part
+/// of [`SnapRef`]; an author-pinned channel escapes track derivation and
+/// the declared-base check.
+fn get_opt_pin_channel(table: &mlua::Table, key: &str) -> miette::Result<Option<String>> {
+    match table.get::<Value>(key).unwrap_or(Value::Nil) {
+        Value::Table(t) => match t.get::<Value>("channel").unwrap_or(Value::Nil) {
+            Value::Nil => Ok(None),
+            Value::String(s) => Ok(Some(
+                s.to_str()
+                    .map_err(|e| miette::miette!("{key}.channel: {e}"))?
+                    .to_string(),
+            )),
+            other => Err(miette::miette!(
+                "image(): '{key}.channel' must be a string, got {}",
+                other.type_name()
+            )),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -392,7 +432,188 @@ pub type ImageOutputs = HashMap<String, ImageDeclaration>;
 
 // ── Image assembly pipeline ──
 
+// ── ADR-0019: base-aware kernel/gadget resolution ──
+
+/// The role an image snap plays; kernel and gadget snaps ride the image
+/// base's store track (ADR-0019), base and extra snaps never do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapRole {
+    Base,
+    Kernel,
+    Gadget,
+    Extra,
+}
+
+/// Derive the store channel track from an image base name:
+/// "core22" → Some("22"), "core26" → Some("26"); bases without a numeric
+/// series ("core", custom bases) derive nothing.
+fn base_track(base_name: &str) -> Option<&str> {
+    let series = base_name.strip_prefix("core")?;
+    if !series.is_empty() && series.bytes().all(|b| b.is_ascii_digit()) {
+        Some(series)
+    } else {
+        None
+    }
+}
+
+/// Replace the track of a "track/risk" (or bare risk) channel, keeping the
+/// risk: "latest/stable" + track "22" → "22/stable"; "stable" → "22/stable".
+fn channel_on_track(channel: &str, track: &str) -> String {
+    // Mirrors the StoreClient channel parse: one part is a risk, two parts
+    // are track/risk.
+    let risk = channel.split('/').nth(1).unwrap_or(channel);
+    format!("{track}/{risk}")
+}
+
+/// The effective store channel for a kernel/gadget image snap (ADR-0019).
+///
+/// An author-pinned channel (`channel` opt on the pin entry) wins verbatim
+/// and marks the override; otherwise the image base's track replaces the
+/// default track ("core22" + "latest/stable" → "22/stable" — the
+/// `latest` kernel line carries the legacy 4.4 ESM payloads); a base with
+/// no numeric series leaves the channel untouched.
+///
+/// Returns `(channel, override_used)`.
+fn image_snap_channel(
+    default_channel: &str,
+    base_name: &str,
+    explicit: Option<&str>,
+) -> (String, bool) {
+    if let Some(explicit) = explicit {
+        return (explicit.to_string(), true);
+    }
+    match base_track(base_name) {
+        Some(track) => (channel_on_track(default_channel, track), false),
+        None => (default_channel.to_string(), false),
+    }
+}
+
+/// The declared `base:` of a downloaded snap's `meta/snap.yaml`, if the
+/// metadata carries one.
+#[derive(Debug, Deserialize)]
+struct PayloadBase {
+    #[serde(rename = "base")]
+    base: Option<String>,
+}
+
+fn snap_yaml_base(yaml_text: &str) -> Option<String> {
+    serde_yaml::from_str::<PayloadBase>(yaml_text)
+        .ok()
+        .and_then(|meta| meta.base)
+        .filter(|b| !b.is_empty())
+}
+
+/// ADR-0019 backstop: a resolved kernel/gadget snap whose declared base
+/// mismatches the image base fails the build, naming both. A snap with no
+/// declared base skips the check (and says so) — store metadata quality is
+/// outside shuttle's control.
+fn check_declared_base(
+    role: &str,
+    snap_name: &str,
+    declared_base: Option<&str>,
+    image_base: &str,
+) -> miette::Result<()> {
+    match declared_base {
+        None => {
+            eprintln!(
+                "  ℹ {role} {snap_name}: declares no base (or meta/snap.yaml unreadable) \
+                 — ADR-0019 base check skipped"
+            );
+            Ok(())
+        }
+        Some(declared) if declared == image_base => Ok(()),
+        Some(declared) => Err(miette::miette!(
+            "{role} snap '{snap_name}' declares base '{declared}' but the image base is \
+             '{image_base}' — refusing to pair them (ADR-0019): the mismatch is silent at \
+             build time and bricks at first boot. To accept it deliberately, pin an \
+             explicit channel on the {role} entry, e.g. \
+             {role} = pin(\"{snap_name}\", {{ channel = \"latest/stable\" }})"
+        )),
+    }
+}
+
+/// Read the declared `base:` out of a downloaded snap payload by
+/// single-file extracting `meta/snap.yaml` (same tool + flags as the
+/// runtime emitter). `Ok(None)` means the metadata could not be read or
+/// carries no base — the caller logs the skip.
+fn payload_declared_base(payload: &Path) -> Option<String> {
+    let work = tempfile::tempdir().ok()?;
+    let extract_dir = work.path().join("extract");
+    let status = std::process::Command::new("unsquashfs")
+        .args([
+            "-no-xattrs",
+            "-d",
+            &extract_dir.to_string_lossy(),
+            &payload.to_string_lossy(),
+            "meta/snap.yaml",
+        ])
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    let yaml_text = std::fs::read_to_string(extract_dir.join("meta").join("snap.yaml")).ok()?;
+    snap_yaml_base(&yaml_text)
+}
+
+/// ADR-0019 enforcement point: after the kernel/gadget payloads are
+/// downloaded and hash-verified, their declared `base:` must match the
+/// image base (mismatch = build error) or be absent (logged skip). An
+/// author-pinned channel is the recorded override for both the track
+/// derivation and this check.
+fn enforce_base_contract(
+    image: &ImageDeclaration,
+    resolved: &[ResolvedSnap],
+    cache_dir: &Path,
+    has_unsquashfs: bool,
+) -> miette::Result<()> {
+    let checks = [
+        (
+            image.kernel.as_ref().map(|k| k.snap.name.as_str()),
+            "kernel",
+            image.kernel.as_ref().and_then(|k| k.channel.as_ref()),
+        ),
+        (
+            image.gadget.as_ref().map(|g| g.name.as_str()),
+            "gadget",
+            image.gadget_channel.as_ref(),
+        ),
+    ];
+    for (entry, role, explicit) in checks {
+        let Some(name) = entry else {
+            continue;
+        };
+        if let Some(channel) = explicit {
+            eprintln!(
+                "  ⚠ {role} {name}: author-pinned channel '{channel}' — ADR-0019 base \
+                 check skipped (recorded override)"
+            );
+            continue;
+        }
+        if !has_unsquashfs {
+            eprintln!(
+                "  ⚠ {role} {name}: unsquashfs unavailable — ADR-0019 declared-base \
+                 check skipped"
+            );
+            continue;
+        }
+        let Some(snap) = resolved.iter().find(|s| s.name == name) else {
+            continue;
+        };
+        let payload = cache_dir.join(format!(
+            "{}_{}_{}.snap",
+            snap.name, snap.revision, snap.sha3_384
+        ));
+        let declared_base = payload_declared_base(&payload);
+        check_declared_base(role, name, declared_base.as_deref(), &image.base.name)?;
+    }
+    Ok(())
+}
+
 /// Resolve all snaps in an image declaration, using the lockfile for defaults.
+///
+/// Kernel and gadget snaps resolve from the image base's store track
+/// (ADR-0019) unless the author pinned an explicit channel on the entry.
 fn resolve_image_snaps(
     image: &ImageDeclaration,
     lockfile: &LockFile,
@@ -401,7 +622,18 @@ fn resolve_image_snaps(
 ) -> miette::Result<Vec<ResolvedSnap>> {
     let mut resolved = Vec::new();
 
-    for snap_ref in image.all_snaps() {
+    let mut entries: Vec<(&SnapRef, SnapRole)> = vec![(&image.base, SnapRole::Base)];
+    if let Some(ref k) = image.kernel {
+        entries.push((&k.snap, SnapRole::Kernel));
+    }
+    if let Some(ref g) = image.gadget {
+        entries.push((g, SnapRole::Gadget));
+    }
+    for s in &image.extra_snaps {
+        entries.push((s, SnapRole::Extra));
+    }
+
+    for (snap_ref, role) in entries {
         let pin = if snap_ref.revision.is_none() || snap_ref.sha3_384.is_none() {
             if let Some(locked) = lockfile.lookup_snap(&snap_ref.name) {
                 eprintln!("  ℹ {}: using lockfile pin", snap_ref.name);
@@ -413,8 +645,36 @@ fn resolve_image_snaps(
             snap_ref.clone()
         };
 
+        // ADR-0019: kernel/gadget snaps ride the image base's track unless
+        // the author pinned an explicit channel on the entry.
+        let (effective_channel, override_used) = match role {
+            SnapRole::Kernel => image_snap_channel(
+                channel,
+                &image.base.name,
+                image.kernel.as_ref().and_then(|k| k.channel.as_deref()),
+            ),
+            SnapRole::Gadget => {
+                image_snap_channel(channel, &image.base.name, image.gadget_channel.as_deref())
+            }
+            SnapRole::Base | SnapRole::Extra => (channel.to_string(), false),
+        };
+        if override_used {
+            eprintln!(
+                "  ⚠ {}: author-pinned channel '{effective_channel}' — ADR-0019 track \
+                 derivation + base check skipped (recorded override)",
+                snap_ref.name
+            );
+        } else if matches!(role, SnapRole::Kernel | SnapRole::Gadget)
+            && effective_channel != channel
+        {
+            eprintln!(
+                "  ℹ {}: image base {} → channel {effective_channel} (ADR-0019)",
+                snap_ref.name, image.base.name
+            );
+        }
+
         // Try Snap Store first, then fall back to package index
-        let snap = match StoreClient::resolve(&pin, channel, arch) {
+        let snap = match StoreClient::resolve(&pin, &effective_channel, arch) {
             Ok(s) => s,
             Err(_) => {
                 // Try resolving through the package index
@@ -437,7 +697,11 @@ fn resolve_image_snaps(
                                 continue;
                             }
                         }
-                        // If index has a store name, try resolving with it
+                        // If index has a store name, try resolving with it.
+                        // ADR-0019: the derived track wins over the index's
+                        // store channel for kernel/gadget roles too — the
+                        // empirical failure came from an index entry
+                        // carrying the default `latest` track.
                         if let Some(ref store) = entry.store {
                             let store_name =
                                 store.name.as_deref().unwrap_or(&snap_ref.name).to_string();
@@ -446,7 +710,7 @@ fn resolve_image_snaps(
                                 revision: pin.revision,
                                 sha3_384: pin.sha3_384,
                             };
-                            match StoreClient::resolve(&resolved_pin, &store.channel, arch) {
+                            match StoreClient::resolve(&resolved_pin, &effective_channel, arch) {
                                 Ok(s) => {
                                     eprintln!(
                                         "  ℹ {}: resolved via index (store: {})",
@@ -524,6 +788,10 @@ pub fn build_image(
         .output()
         .ok()
         .is_some_and(|o| o.status.success());
+
+    // 3a. ADR-0019: the kernel/gadget payloads must declare the image's
+    // base — mismatch fails the build before anything is assembled.
+    enforce_base_contract(image, &resolved, cache_dir, has_unsquashfs)?;
 
     // 4. Create staging directory
     let build_dir = tempfile::tempdir()
@@ -758,6 +1026,10 @@ pub fn build_disk_image(
         .output()
         .ok()
         .is_some_and(|o| o.status.success());
+
+    // ADR-0019: the kernel/gadget payloads must declare the image's base —
+    // mismatch fails the build before anything is assembled.
+    enforce_base_contract(image, &resolved, cache_dir, has_unsquashfs)?;
 
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {e}"))?;
@@ -3066,12 +3338,14 @@ mod tests {
                 params: vec![],
                 modules: vec![],
                 modprobe_config: None,
+                channel: None,
             }),
             gadget: Some(SnapRef {
                 name: "pi-gadget".into(),
                 revision: Some(3),
                 sha3_384: Some("c".into()),
             }),
+            gadget_channel: None,
             extra_snaps: vec![SnapRef {
                 name: "my-app".into(),
                 revision: Some(4),
@@ -3531,6 +3805,7 @@ mod tests {
             },
             kernel: None,
             gadget: None,
+            gadget_channel: None,
             extra_snaps: vec![],
             bootloader: None,
             disk: None,
@@ -3671,6 +3946,7 @@ mod tests {
             },
             kernel: None,
             gadget: None,
+            gadget_channel: None,
             extra_snaps: vec![],
             bootloader: None,
             disk: None,
@@ -3696,6 +3972,7 @@ mod tests {
             },
             kernel: None,
             gadget: None,
+            gadget_channel: None,
             extra_snaps: vec![],
             bootloader: Some(BootloaderConfig {
                 type_: "systemd-boot".into(),
@@ -4025,6 +4302,7 @@ mod tests {
             },
             kernel: None,
             gadget: None,
+            gadget_channel: None,
             extra_snaps: vec![],
             bootloader: None,
             disk: None,
@@ -4348,5 +4626,182 @@ mod tests {
             ("mkfs.vfat", Some(PathBuf::from("/usr/sbin/mkfs.vfat"))),
         ])
         .unwrap();
+    }
+
+    // ── ADR-0019: base-aware kernel/gadget resolution ──
+
+    #[test]
+    fn base_track_derives_the_numeric_series() {
+        assert_eq!(base_track("core22"), Some("22"));
+        assert_eq!(base_track("core24"), Some("24"));
+        assert_eq!(base_track("core26"), Some("26"));
+        // Non-numeric or differently-shaped bases derive nothing.
+        assert_eq!(base_track("core"), None);
+        assert_eq!(base_track("core-x"), None);
+        assert_eq!(base_track("my-base"), None);
+        assert_eq!(base_track(""), None);
+    }
+
+    #[test]
+    fn core22_kernel_pin_without_channel_resolves_from_22_stable() {
+        // The empirical incident: pin("pc-kernel") in a core22 image used
+        // to resolve `latest/stable` — a Xenial 4.4 ESM kernel whose initrd
+        // has no dm-verity and enforces the UC18 boot contract. ADR-0019
+        // derives the base's track instead.
+        let (channel, override_used) = image_snap_channel("latest/stable", "core22", None);
+        assert_eq!(channel, "22/stable");
+        assert!(!override_used);
+
+        let (channel, _) = image_snap_channel("latest/stable", "core26", None);
+        assert_eq!(channel, "26/stable");
+        // A bare risk channel derives a full track/risk channel.
+        let (channel, _) = image_snap_channel("stable", "core22", None);
+        assert_eq!(channel, "22/stable");
+        // Non-numeric bases leave the channel untouched.
+        let (channel, _) = image_snap_channel("latest/stable", "core", None);
+        assert_eq!(channel, "latest/stable");
+    }
+
+    #[test]
+    fn explicit_channel_in_pin_is_untouched() {
+        let (channel, override_used) =
+            image_snap_channel("latest/stable", "core22", Some("latest/stable"));
+        assert_eq!(channel, "latest/stable", "author channel must win verbatim");
+        assert!(override_used, "explicit channel is a recorded override");
+
+        let (channel, _) = image_snap_channel("latest/stable", "core22", Some("4.4/stable"));
+        assert_eq!(channel, "4.4/stable");
+    }
+
+    #[test]
+    fn declared_base_mismatch_fails_naming_both() {
+        let err = check_declared_base("kernel", "pc-kernel", Some("core"), "core22").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pc-kernel") && msg.contains("core") && msg.contains("core22"),
+            "error must name the snap and both bases: {msg}"
+        );
+        assert!(msg.contains("ADR-0019"), "error must cite the ADR: {msg}");
+
+        // Gadget snaps get the same backstop.
+        let err = check_declared_base("gadget", "pc", Some("core18"), "core24").unwrap_err();
+        assert!(format!("{err:#}").contains("'core24'"));
+    }
+
+    #[test]
+    fn matching_declared_base_passes() {
+        check_declared_base("kernel", "pc-kernel", Some("core22"), "core22").unwrap();
+        check_declared_base("gadget", "pc", Some("core24"), "core24").unwrap();
+    }
+
+    #[test]
+    fn snap_yaml_base_parses_declared_base_or_none() {
+        assert_eq!(
+            snap_yaml_base("name: pc-kernel\nversion: 5.15.0\ntype: kernel\nbase: core22\n"),
+            Some("core22".into())
+        );
+        // No base declaration → None (the check logs its skip).
+        assert_eq!(
+            snap_yaml_base("name: legacy\nversion: 4.4\ntype: kernel\n"),
+            None
+        );
+        assert_eq!(snap_yaml_base("base:\n"), None);
+        assert_eq!(snap_yaml_base("not: [valid: yaml"), None);
+    }
+
+    #[test]
+    fn dsl_kernel_and_gadget_channel_opts_parse() {
+        let lua = lua_env();
+        let value: Value = lua
+            .load(
+                r#"
+                return image {
+                    name = "override",
+                    version = "1.0",
+                    base = pin("core22"),
+                    kernel = pin("pc-kernel", { channel = "latest/stable" }),
+                    gadget = pin("pc", { channel = "24/stable" }),
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let table = match value {
+            Value::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        assert_eq!(
+            decl.kernel.as_ref().unwrap().channel.as_deref(),
+            Some("latest/stable")
+        );
+        assert_eq!(decl.gadget_channel.as_deref(), Some("24/stable"));
+    }
+
+    #[test]
+    fn dsl_rejects_non_string_channel_opt() {
+        let lua = lua_env();
+        let result: std::result::Result<Value, mlua::Error> = lua
+            .load(
+                r#"
+                return image {
+                    name = "bad",
+                    version = "1.0",
+                    base = pin("core22"),
+                    kernel = pin("pc-kernel", { channel = 22 }),
+                }
+                "#,
+            )
+            .eval();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("'kernel.channel' must be a string"),
+            "type error must name the field"
+        );
+    }
+
+    #[test]
+    fn base_contract_skips_overridden_kernel_without_touching_disk() {
+        // The author-pinned channel is the recorded override: the check
+        // returns before the payload is even located, so a missing payload
+        // cannot fail it.
+        let image = ImageDeclaration {
+            name: "override".into(),
+            version: "1.0".into(),
+            base: SnapRef {
+                name: "core22".into(),
+                revision: None,
+                sha3_384: None,
+            },
+            kernel: Some(KernelEntry {
+                snap: SnapRef {
+                    name: "pc-kernel".into(),
+                    revision: Some(3720),
+                    sha3_384: Some("deadbeef".into()),
+                },
+                params: vec![],
+                modules: vec![],
+                modprobe_config: None,
+                channel: Some("latest/stable".into()),
+            }),
+            gadget: None,
+            gadget_channel: None,
+            extra_snaps: vec![],
+            bootloader: None,
+            disk: None,
+            sysctl: vec![],
+            update_source: None,
+        };
+        let resolved = vec![ResolvedSnap {
+            name: "pc-kernel".into(),
+            revision: 3720,
+            sha3_384: "deadbeef".into(),
+            download_url: String::new(),
+        }];
+        let cache = tempfile::tempdir().unwrap();
+        enforce_base_contract(&image, &resolved, cache.path(), true).unwrap();
     }
 }
