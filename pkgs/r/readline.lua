@@ -23,6 +23,13 @@ return {
         source = {
             url = "https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz",
         },
-        build = "./configure --prefix=/usr --with-shared && make && make install DESTDIR=$STAGE",
+        build = table.concat({
+            "./configure --prefix=/usr --with-shared && make && make install DESTDIR=$STAGE",
+            -- The install-info-generated usr/share/info/dir index differs
+            -- from glibc's, and the merged build prefix requires identical
+            -- content at shared paths (same escape as libffi/gettext).
+            -- glibc's copy survives as the index.
+            "rm -f $STAGE/usr/share/info/dir",
+        }, " && "),
     },
 }
