@@ -10,15 +10,18 @@
 -- Runtime deps: glibc, zlib, openssl, curl, pcre2 — all link-time AND
 -- runtime libraries, so they go in `requires` (which per ADR-0018 also
 -- materializes into the merged build prefix so the build can find them).
--- The toolchain (compiler) and pkg-config are build-time-only, so they go
--- in `build_deps`.
+-- perl (issue #34): runtime for git's perl-side helpers (git-send-email,
+-- git-svn, git-add--interactive...) and build-time only as a probe target
+-- — the pool perl lands in the merged prefix, the build's PATH prepends
+-- its bin, and git's Makefile perl probes succeed, so the perl-built
+-- helpers ship with a /usr/bin/perl shebang that resolves inside a pod
+-- closure. The toolchain (compiler) and pkg-config are build-time-only,
+-- so they go in `build_deps`.
 --
--- Not included: perl (git-send-email and some contrib scripts) and tcl/tk
--- (gitk/git-gui) are NOT in the pool — built with NO_PERL/NO_TCLTK, so this
--- is the full git binary + C-side gettext i18n without those optional
--- runtime languages. A perl pool port is the follow-up for git-send-email.
+-- Not included: tcl/tk (gitk/git-gui) is NOT in the pool — built with
+-- NO_TCLTK.
 --
--- Requires: glibc, zlib, openssl, curl, pcre2
+-- Requires: glibc, zlib, openssl, curl, pcre2, perl
 -- build_deps: pkg-config, gettext
 
 return {
@@ -77,7 +80,7 @@ return {
         }, " && "),
 
         type = "source",
-        requires = { "glibc", "zlib", "openssl", "curl", "pcre2" },
+        requires = { "glibc", "zlib", "openssl", "curl", "pcre2", "perl" },
         -- pkg-config: git's own Makefile probes libcurl/libpcre2 via
         -- pkg-config-provided metadata (curl-config/pcre2-config are the
         -- primary probes; pkg-config backs the USE_LIBPCRE2 detection).

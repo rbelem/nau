@@ -36,14 +36,13 @@ return {
         }, " && "),
 
         type = "source",
-        -- Prebuilt self-contained .NET binary; links libz (zlib) plus
-        -- glibc/libstdc++ at runtime. libstdc++ comes from the pool
-        -- libstdcpp package, which currently FAILS to build on the modern
-        -- toolchain (pre-existing pool defect — tzdb.cc 'mutex does not name
-        -- a type' from a configure feature-detection miss, see pool
-        -- libstdcpp). Listed here as glibc+zlib (the buildable closure);
-        -- libstdcpp is the documented runtime blocker for full GCM use.
-        requires = { "glibc", "zlib" },
+        -- Runtime deps: glibc, zlib, and the C++ runtime — GCM is a prebuilt
+        -- .NET binary whose ELF has DT_NEEDED libgcc_s.so.1 + libstdc++.so.6
+        -- (its libSkiaSharp.so additionally wants libfontconfig.so.1 at first
+        -- graphical use, which is not in the pool yet — CLI use never dlopens
+        -- it). libstdcpp pulls libgcc transitively; listed explicitly for
+        -- clarity of the runtime contract.
+        requires = { "glibc", "zlib", "libstdcpp", "libgcc" },
 
         apps = {
             ["git-credential-manager"] = app {
