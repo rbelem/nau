@@ -39,6 +39,10 @@ for building GCC, MPFR, and MPC.]],
             -- payload rather than ship build-host paths (libstdcpp/curl
             -- precedent).
             "find $STAGE -name '*.la' -type f -delete",
+            -- The info index is regenerated per-package; in a merged build
+            -- prefix its content differs across packages and conflicts.
+            -- Strip it so prefix merging stays content-identical.
+            "find $STAGE -name 'dir' -path '*/share/info/*' -delete",
         }, " && "),
     },
 }
