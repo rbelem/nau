@@ -689,6 +689,9 @@ function image(opts)
                 check_string(p.size, "image", string.format("disk.partitions[%d].size", i))
                 check_string(p.fs, "image", string.format("disk.partitions[%d].fs", i))
                 check_string(p.mount, "image", string.format("disk.partitions[%d].mount", i))
+                if p.role ~= nil then
+                    check_string(p.role, "image", string.format("disk.partitions[%d].role", i))
+                end
                 if p.options ~= nil then
                     check_string_array(p.options, "image", string.format("disk.partitions[%d].options", i))
                 end

@@ -27,4 +27,5 @@ pub mod runtime;
 pub mod sign;
 pub mod snap;
 pub mod store;
+pub mod uc;
 pub mod units;

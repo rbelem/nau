@@ -27,6 +27,51 @@ use crate::lock::LockFile;
 use crate::snap::{self, SnapRef};
 use crate::store::{ResolvedSnap, StoreClient};
 
+#[cfg(test)]
+pub mod test_support {
+    //! Shared test fixtures — a minimal UC image declaration usable from
+    //! sibling module tests (e.g. [`crate::uc`]). Constructing an
+    //! [`ImageDeclaration`] requires private-adjacent fields; this small
+    //! builder keeps sibling test modules from duplicating it.
+
+    use super::{ImageDeclaration, KernelEntry};
+    use crate::snap::SnapRef;
+
+    pub fn sample_image() -> ImageDeclaration {
+        ImageDeclaration {
+            name: "test-uc".into(),
+            version: "1.0.0".into(),
+            base: SnapRef {
+                name: "core24".into(),
+                revision: Some(42),
+                sha3_384: Some("aabb".into()),
+            },
+            kernel: Some(KernelEntry {
+                snap: SnapRef {
+                    name: "pc-kernel".into(),
+                    revision: Some(7),
+                    sha3_384: Some("ccdd".into()),
+                },
+                params: vec![],
+                modules: vec![],
+                modprobe_config: None,
+                channel: None,
+            }),
+            gadget: Some(SnapRef {
+                name: "pc".into(),
+                revision: Some(9),
+                sha3_384: Some("eeff".into()),
+            }),
+            gadget_channel: None,
+            extra_snaps: vec![],
+            bootloader: None,
+            disk: None,
+            sysctl: vec![],
+            update_source: None,
+        }
+    }
+}
+
 // ── Additional types ──
 
 /// Kernel snap reference plus kernel configuration.
@@ -76,6 +121,13 @@ pub struct Partition {
     pub fs: String,           // e.g. "vfat", "btrfs", "ext4"
     pub mount: String,        // mount point
     pub options: Vec<String>, // mount options
+    /// UC gadget role (issue #32): `"system-seed"`, `"system-boot"`,
+    /// `"system-data"` (or `"system-save"`). Only honored when the image
+    /// base is a UC coreN base; the role selects the UC PARTLABEL
+    /// (`ubuntu-seed` / `ubuntu-boot` / `ubuntu-data`) and the populate
+    /// routing (seed / boot / data). Empty for non-UC partitions — the
+    /// simplified path is untouched.
+    pub role: String,
 }
 
 /// Swap configuration.
@@ -380,12 +432,16 @@ fn get_partitions(table: &mlua::Table) -> miette::Result<Vec<Partition>> {
                             miette::miette!("partition '{}': missing 'mount'", name)
                         })?;
                         let options: Vec<String> = pt.get("options").unwrap_or_default();
+                        // UC gadget role (issue #32) — optional; only honored
+                        // under a UC base.
+                        let role: String = pt.get("role").unwrap_or_default();
                         partitions.push(Partition {
                             name,
                             size,
                             fs,
                             mount,
                             options,
+                            role,
                         });
                     }
                     other => {
@@ -447,7 +503,7 @@ enum SnapRole {
 /// Derive the store channel track from an image base name:
 /// "core22" → Some("22"), "core26" → Some("26"); bases without a numeric
 /// series ("core", custom bases) derive nothing.
-fn base_track(base_name: &str) -> Option<&str> {
+pub(crate) fn base_track(base_name: &str) -> Option<&str> {
     let series = base_name.strip_prefix("core")?;
     if !series.is_empty() && series.bytes().all(|b| b.is_ascii_digit()) {
         Some(series)
@@ -1180,6 +1236,22 @@ pub fn build_disk_image(
         );
     }
 
+    // 6c. Ubuntu Core seed/role-model wiring (issue #32): when the image
+    // base is a UC coreN base AND the layout marks a partition with a UC
+    // gadget role (system-seed/boot/data), remap those partitions to their
+    // UC PARTLABELs and stage the seed + modeenv trees. The role remap
+    // happens BEFORE partitioning so the parted-created GPT PARTLABELs come
+    // out as `ubuntu-seed`/`ubuntu-boot`/`ubuntu-data`. Non-UC bases (and
+    // coreN bases without a role-marked partition) are untouched, keeping
+    // the simplified path bit-identical.
+    let uc = setup_uc_context(
+        image,
+        &mut effective_layout,
+        scratch.path(),
+        arch,
+        &resolved,
+    )?;
+
     // Calculate total image size: sum partitions + swap + 4M for GPT headers
     let total_mb = calculate_disk_size_mb(&effective_layout);
     eprintln!("  creating disk image: {} MB", total_mb);
@@ -1350,6 +1422,7 @@ pub fn build_disk_image(
         root: &root,
         uki: uki.as_ref(),
         uki_stage: &uki_stage,
+        uc: uc.as_ref(),
     };
     populate_remaining_partitions(&populate, &effective_layout, &populated_roots)?;
 
@@ -1710,6 +1783,32 @@ struct PopulateCtx<'a> {
     root: &'a Path,
     uki: Option<&'a UkiFacts>,
     uki_stage: &'a Path,
+    /// Ubuntu Core seed/role-model staging (issue #32). `None` for the
+    /// non-UC/unsimplified path — content routing falls back to the
+    /// historical behavior.
+    uc: Option<&'a UcCtx>,
+}
+
+/// Ubuntu Core seed/role-model context threaded into the populate stage.
+/// Carries the staged seed tree (`ubuntu-seed`) and boot tree
+/// (`ubuntu-boot` with `device/modeenv`) built by [`setup_uc_context`].
+struct UcCtx {
+    seed_stage: PathBuf,
+    boot_stage: PathBuf,
+}
+
+impl PopulateCtx<'_> {
+    /// The staged tree a UC role-marked partition should be populated from,
+    /// or `None` when the partition carries no UC role (falls through to the
+    /// ESP/data behavior).
+    fn uc_route_stage(&self, part: &Partition) -> Option<&Path> {
+        let uc = self.uc?;
+        match partition_uc_role(part)? {
+            crate::uc::ROLE_SEED => Some(&uc.seed_stage),
+            crate::uc::ROLE_BOOT => Some(&uc.boot_stage),
+            _ => None,
+        }
+    }
 }
 
 /// Create (or truncate) a standalone partition file at the EXACT extent
@@ -1905,7 +2004,13 @@ fn populate_side_partition(
     refuse_non_ext4_vfat(part)?;
     let extent = &ctx.extents[index];
     let part_file = extent_file(ctx.scratch_dir, &format!("part-{}.img", index + 1), extent)?;
-    if index == 0 && part.fs == "vfat" {
+    // Ubuntu Core routing (issue #32): a role-marked seed/boot partition is
+    // populated from its dedicated staged tree (seed / modeenv), never the
+    // rootfs — the UC role model replaces the simplified "everything is the
+    // rootfs" routing for those partitions.
+    if let Some(stage) = ctx.uc_route_stage(part) {
+        build_staged_partition(&part_file, part, stage, extent)?;
+    } else if index == 0 && part.fs == "vfat" {
         build_esp_partition(ctx, &part_file, part)?;
     } else {
         build_data_partition(ctx, &part_file, part, extent)?;
@@ -1945,6 +2050,24 @@ fn build_esp_partition(
         return Ok(());
     }
     eprintln!("  ✓ ESP: {} (vfat)", part.name);
+    Ok(())
+}
+
+/// mkfs + populate one partition from a dedicated staged tree (the UC seed
+/// or boot tree) through `mkfs.ext4 -d`. Unlike the historical
+/// warn-not-fatal side-partition behavior, a UC seed/boot populate failure
+/// is FATAL: an `ubuntu-seed`/`ubuntu-boot` that cannot be read would leave
+/// snap-bootstrap without a model/seed/modeenv and stop at `cannot detect
+/// mode` — a silently-broken UC image is worse than a loud build failure.
+fn build_staged_partition(
+    part_file: &Path,
+    part: &Partition,
+    stage: &Path,
+    extent: &PartitionExtent,
+) -> miette::Result<()> {
+    build_ext4_partition(part_file, stage, part, extent, false)
+        .wrap_err_with(|| format!("UC {} partition '{}' populate failed", part.fs, part.name))?;
+    eprintln!("  ✓ {}: {} populated (UC staged tree)", part.name, part.fs);
     Ok(())
 }
 
@@ -2177,6 +2300,7 @@ fn append_verity_hash_partition_at(
         fs: "ext2".to_string(),
         mount: String::new(),
         options: vec![],
+        role: String::new(),
     });
     Ok(layout.partitions.len() - 1)
 }
@@ -2517,6 +2641,116 @@ fn apply_gpt_slot_metadata(
         slots.roots.len() + slots.hashes.iter().flatten().count()
     );
     Ok(())
+}
+
+// ── Ubuntu Core seed / role-model wiring (issue #32) ──
+
+/// UC gadget role of a partition, inferred from its explicit `role` opt or
+/// its `ubuntu-*` PARTLABEL name. Returns the gadget role (`system-seed`,
+/// `system-boot`, `system-data`) when the partition participates in the UC
+/// role model; `None` for ordinary partitions (the simplified path).
+fn partition_uc_role(part: &Partition) -> Option<&'static str> {
+    // Explicit role opt wins; a recognized role maps to a UC PARTLABEL.
+    if crate::uc::role_partlabel(&part.role).is_some() {
+        return crate::uc::role_partlabel(&part.role).and_then(uc_role_for_partlabel);
+    }
+    // Infer from the PARTLABEL name.
+    uc_role_for_partlabel(&part.name)
+}
+
+/// Map a UC PARTLABEL name back to its gadget role.
+fn uc_role_for_partlabel(label: &str) -> Option<&'static str> {
+    match label {
+        crate::uc::UC_SEED_PART => Some(crate::uc::ROLE_SEED),
+        crate::uc::UC_BOOT_PART => Some(crate::uc::ROLE_BOOT),
+        crate::uc::UC_DATA_PART => Some(crate::uc::ROLE_DATA),
+        _ => None,
+    }
+}
+
+/// Activate the Ubuntu Core seed/role-model path (issue #32).
+///
+/// Active only when BOTH conditions hold:
+/// - the image base is a UC coreN base (`core22`/`core24`/`core26` …), and
+/// - the layout declares at least one partition with a UC gadget role
+///   (`role = "system-seed"` … or a `ubuntu-*` name).
+///
+/// When active, role-marked partitions are remapped to their UC PARTLABEL
+/// (`ubuntu-seed`/`ubuntu-boot`/`ubuntu-data`) — the remap runs BEFORE
+/// partitioning so the parted-created GPT PARTLABELs come out correct — and
+/// the seed tree (`seed.yaml` + signed model assertion) and boot tree
+/// (`device/modeenv`) are staged into scratch dirs for the populate stage.
+///
+/// Non-UC bases, and coreN bases that mark no partition for a UC role, are
+/// returned as `Ok(None)` unchanged — the simplified path is bit-identical.
+fn setup_uc_context(
+    image: &ImageDeclaration,
+    layout: &mut DiskLayout,
+    scratch: &Path,
+    arch: &str,
+    resolved: &[ResolvedSnap],
+) -> miette::Result<Option<UcCtx>> {
+    if !crate::uc::is_uc_base(&image.base.name) {
+        return Ok(None);
+    }
+    let any_role = layout
+        .partitions
+        .iter()
+        .any(|p| partition_uc_role(p).is_some());
+    if !any_role {
+        eprintln!(
+            "  ℹ image base {} is Ubuntu Core but no partition declares a UC gadget role \
+             (role = \"system-seed\"/\"system-boot\"/\"system-data\") — simplified path kept",
+            image.base.name
+        );
+        return Ok(None);
+    }
+
+    // Remap role-marked partitions to their UC PARTLABEL. This mutates the
+    // effective layout BEFORE `create_partitions` so parted's mkpart emits
+    // the right GPT names (and `mkfs` labels).
+    for part in &mut layout.partitions {
+        if let Some(role) = partition_uc_role(part) {
+            if let Some(label) = crate::uc::role_partlabel(role) {
+                if part.name != label {
+                    eprintln!(
+                        "  ✓ UC role {role}: partition '{}' → PARTLABEL '{label}'",
+                        part.name
+                    );
+                    part.name = label.to_string();
+                }
+            }
+        }
+    }
+
+    // Build the signed model assertion and stage the seed + modeenv trees.
+    let model = crate::uc::ModelAssertion::from_image(image, arch)?;
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let kp = match crate::sign::load_secret_key(&home)? {
+        Some(kp) => kp,
+        None => crate::sign::create_secret_key(&home)?,
+    };
+    let seed_stage = scratch.join("uc-seed-staging");
+    crate::uc::emit_seed(&seed_stage, image, resolved, &model, &kp)?;
+    let label = crate::uc::recovery_label(image);
+    let boot_stage = scratch.join("uc-boot-staging");
+    let kernel_name = image.kernel.as_ref().map(|k| k.snap.name.as_str());
+    let gadget_name = image.gadget.as_ref().map(|g| g.name.as_str());
+    crate::uc::emit_modeenv(
+        &boot_stage,
+        &label,
+        kernel_name,
+        &image.base.name,
+        gadget_name,
+    )?;
+    eprintln!(
+        "  ✓ UC seed + modeenv staged (recovery system label {label}, key id {})",
+        kp.key_id()
+    );
+    Ok(Some(UcCtx {
+        seed_stage,
+        boot_stage,
+    }))
 }
 
 /// sysupdate.d file name prefix for shuttle-generated transfers — ordering
@@ -3574,6 +3808,7 @@ mod tests {
             fs: "ext4".into(),
             mount: "/".into(),
             options: vec![],
+            role: String::new(),
         }
     }
 
@@ -3606,6 +3841,189 @@ mod tests {
         // of the declared name. MBR has no PARTLABEL to set.
         assert_eq!(mkpart_name("mbr", &part_named("root")), "primary");
         assert_eq!(mkpart_name("mbr", &part_named("")), "primary");
+    }
+
+    // ── Ubuntu Core role/seed wiring (issue #32) ──
+
+    #[test]
+    fn partition_uc_role_detects_role_opt_and_ubuntu_names() {
+        // Explicit role opt.
+        let mut p = part_named("p1");
+        p.role = "system-seed".into();
+        assert_eq!(partition_uc_role(&p), Some("system-seed"));
+        // Inferred from a ubuntu-* PARTLABEL name.
+        assert_eq!(
+            partition_uc_role(&part_named("ubuntu-boot")),
+            Some("system-boot")
+        );
+        assert_eq!(
+            partition_uc_role(&part_named("ubuntu-data")),
+            Some("system-data")
+        );
+        assert_eq!(
+            partition_uc_role(&part_named("ubuntu-seed")),
+            Some("system-seed")
+        );
+        // Ordinary partitions carry no UC role.
+        assert_eq!(partition_uc_role(&part_named("root")), None);
+        assert_eq!(partition_uc_role(&part_named("esp")), None);
+        // An unimplemented role (system-save) is not routed.
+        let mut p = part_named("p1");
+        p.role = "system-save".into();
+        assert_eq!(partition_uc_role(&p), None);
+    }
+
+    fn uc_layout() -> DiskLayout {
+        DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![
+                Partition {
+                    name: "esp".into(),
+                    size: "128M".into(),
+                    fs: "vfat".into(),
+                    mount: "/boot/efi".into(),
+                    options: vec![],
+                    role: String::new(),
+                },
+                Partition {
+                    name: "esp-data".into(),
+                    size: "2G".into(),
+                    fs: "ext4".into(),
+                    mount: "/".into(),
+                    options: vec![],
+                    role: String::new(),
+                },
+                Partition {
+                    name: "seedpool".into(),
+                    size: "1G".into(),
+                    fs: "ext4".into(),
+                    mount: "/seed".into(),
+                    options: vec![],
+                    role: "system-seed".into(),
+                },
+                Partition {
+                    name: "bootpool".into(),
+                    size: "512M".into(),
+                    fs: "ext4".into(),
+                    mount: "/boot".into(),
+                    options: vec![],
+                    role: "system-boot".into(),
+                },
+            ],
+            swap: None,
+            ab: false,
+        }
+    }
+
+    #[test]
+    fn setup_uc_context_remaps_role_partitions_and_stages() {
+        let image = test_support::sample_image();
+        assert!(crate::uc::is_uc_base(&image.base.name));
+        let mut layout = uc_layout();
+        let scratch = tempfile::tempdir().unwrap();
+        let uc = setup_uc_context(&image, &mut layout, scratch.path(), "amd64", &[])
+            .unwrap()
+            .expect("UC base + role partitions ⇒ UC active");
+        // Role partitions remapped to their UC PARTLABEL; unmarked ones keep
+        // their names (the simplified path is untouched).
+        assert_eq!(layout.partitions[2].name, "ubuntu-seed");
+        assert_eq!(layout.partitions[3].name, "ubuntu-boot");
+        assert_eq!(layout.partitions[0].name, "esp");
+        assert_eq!(layout.partitions[1].name, "esp-data");
+        // Seed + boot trees staged.
+        assert!(uc.seed_stage.join("seed.yaml").exists());
+        assert!(uc.boot_stage.join("device").join("modeenv").exists());
+        // The staged boot tree's modeenv declares a run mode (snap-bootstrap
+        // stops at "cannot detect mode" without it).
+        let modeenv =
+            std::fs::read_to_string(uc.boot_stage.join("device").join("modeenv")).unwrap();
+        assert!(modeenv.starts_with("mode=run\n"));
+        // The staged recovery-system model assertion is a signed assertion
+        // that roundtrips with the project's keychain.
+        let sys = std::fs::read_dir(uc.seed_stage.join("systems"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.is_dir())
+            .expect("a recovery-system label dir");
+        let model_text = std::fs::read_to_string(sys.join("model")).unwrap();
+        assert!(model_text.contains("type: model"));
+        assert!(model_text.contains("base: core24"));
+    }
+
+    #[test]
+    fn setup_uc_context_is_inactive_for_non_uc_base() {
+        let mut image = test_support::sample_image();
+        image.base.name = "my-base".into();
+        assert!(!crate::uc::is_uc_base(&image.base.name));
+        let mut layout = uc_layout();
+        let scratch = tempfile::tempdir().unwrap();
+        let uc = setup_uc_context(&image, &mut layout, scratch.path(), "amd64", &[]).unwrap();
+        assert!(uc.is_none(), "non-UC base keeps the simplified path");
+        // Names unchanged — no remap.
+        assert_eq!(layout.partitions[2].name, "seedpool");
+    }
+
+    #[test]
+    fn setup_uc_context_is_inactive_without_role_partitions() {
+        let image = test_support::sample_image();
+        let mut layout = uc_layout();
+        // Strip every role so no partition participates in the UC model.
+        for p in &mut layout.partitions {
+            p.role.clear();
+            if p.name == "seedpool" {
+                p.name = "seed".into();
+            }
+            if p.name == "bootpool" {
+                p.name = "bootd".into();
+            }
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let uc = setup_uc_context(&image, &mut layout, scratch.path(), "amd64", &[]).unwrap();
+        assert!(
+            uc.is_none(),
+            "no UC role-marked partition ⇒ simplified path kept"
+        );
+    }
+
+    #[test]
+    fn uc_route_stage_routes_seed_and_boot_trees() {
+        let seed_dir = Path::new("/seed");
+        let boot_dir = Path::new("/boot");
+        let uc = UcCtx {
+            seed_stage: seed_dir.to_path_buf(),
+            boot_stage: boot_dir.to_path_buf(),
+        };
+        let ctx = PopulateCtx {
+            image: &test_support::sample_image(),
+            extents: &[],
+            scratch_dir: Path::new("/scratch"),
+            root: Path::new("/root"),
+            uki: None,
+            uki_stage: Path::new("/stage"),
+            uc: Some(&uc),
+        };
+        assert_eq!(
+            ctx.uc_route_stage(&part_named("seedpool")),
+            None,
+            "no role ⇒ no route"
+        );
+        let mut seed = part_named("seedpool");
+        seed.role = "system-seed".into();
+        assert_eq!(ctx.uc_route_stage(&seed), Some(seed_dir));
+        let mut boot = part_named("bootpool");
+        boot.role = "system-boot".into();
+        assert_eq!(ctx.uc_route_stage(&boot), Some(boot_dir));
+        // No UC ctx at all ⇒ no routing (simplified path).
+        let empty = PopulateCtx {
+            image: &test_support::sample_image(),
+            extents: &[],
+            scratch_dir: Path::new("/scratch"),
+            root: Path::new("/root"),
+            uki: None,
+            uki_stage: Path::new("/stage"),
+            uc: None,
+        };
+        assert_eq!(empty.uc_route_stage(&seed), None);
     }
 
     #[test]
@@ -3787,6 +4205,7 @@ mod tests {
                     fs: "vfat".into(),
                     mount: "/boot/efi".into(),
                     options: vec![],
+                    role: String::new(),
                 },
                 Partition {
                     name: "root".into(),
@@ -3794,6 +4213,7 @@ mod tests {
                     fs: "ext4".into(),
                     mount: "/".into(),
                     options: vec![],
+                    role: String::new(),
                 },
             ],
             swap: None,
@@ -3819,6 +4239,7 @@ mod tests {
                 fs: "ext4".into(),
                 mount: "/data".into(),
                 options: vec![],
+                role: String::new(),
             }],
             swap: None,
             ab: false,
@@ -4104,6 +4525,7 @@ mod tests {
             fs: "vfat".into(),
             mount: "/boot/efi".into(),
             options: vec![],
+            role: String::new(),
         }
     }
 
@@ -4114,6 +4536,7 @@ mod tests {
             fs: "ext4".into(),
             mount: "/".into(),
             options: vec![],
+            role: String::new(),
         }
     }
 
@@ -4688,6 +5111,7 @@ mod tests {
             fs: "btrfs".into(),
             mount: "/data".into(),
             options: vec![],
+            role: String::new(),
         };
         let err = refuse_non_ext4_vfat(&part).unwrap_err();
         let msg = format!("{err:#}");
