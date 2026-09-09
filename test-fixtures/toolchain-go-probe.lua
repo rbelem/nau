@@ -34,11 +34,12 @@ return {
 
         build_deps = { "go" },
 
-        -- Plain word/redirect commands only: the sandbox preflight
-        -- parses command words, and $() nesting confuses it.
+        -- Natural $() nesting passes the sandbox preflight (issue #39):
+        -- substitution interiors are runtime sub-commands, not build
+        -- commands.
         build = table.concat({
-            "go version",
-            "go version > go-version.txt && grep -q 'go1.27.1 linux/amd64' go-version.txt",
+            "v=$(go version) && echo \"$v\" > go-version.txt",
+            "grep -q 'go1.27.1 linux/amd64' go-version.txt",
             "go env GOROOT > goroot.txt && grep -q '/' goroot.txt",
             "cat go-version.txt goroot.txt",
         }, " && "),

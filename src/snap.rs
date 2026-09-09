@@ -126,6 +126,10 @@ pub struct PackageDeps {
     pub npm: Option<DepsLockSpec>,
     /// pip resolver: `deps = { pip = { lock = "requirements.lock" } }`.
     pub pip: Option<DepsLockSpec>,
+    /// cargo resolver: `deps = { cargo = { lock = "Cargo.lock" } }`
+    /// (issue #36). Fetches every registry crate the lockfile pins into a
+    /// `cargo vendor`-equivalent tree.
+    pub cargo: Option<DepsLockSpec>,
 }
 
 /// One ecosystem resolver's spec: its lockfile (relative to the source
@@ -804,11 +808,12 @@ impl SnapMeta {
 }
 
 /// Parse the `deps` table (ADR-0017): `{ npm = { lock = ... }, pip = { lock
-/// = ..., index = ... } }` — at least one resolver, known keys only, every
-/// resolver carrying a non-empty string `lock`.
+/// = ..., index = ... }, cargo = { lock = ... } }` — at least one resolver,
+/// known keys only, every resolver carrying a non-empty string `lock`.
 fn package_deps_from_lua(t: &mlua::Table) -> miette::Result<PackageDeps> {
     let mut npm = None;
     let mut pip = None;
+    let mut cargo = None;
     for pair in t.pairs::<String, mlua::Value>() {
         let (key, value) = pair.map_err(|e| miette::miette!("deps entry: {e}"))?;
         let value = match value {
@@ -821,33 +826,35 @@ fn package_deps_from_lua(t: &mlua::Table) -> miette::Result<PackageDeps> {
             }
         };
         match key.as_str() {
-            "npm" | "pip" => {
+            "npm" | "pip" | "cargo" => {
                 let spec = deps_lock_spec_from_lua(&key, &value)?;
-                if key == "npm" {
-                    npm = Some(spec);
-                } else {
-                    pip = Some(spec);
+                match key.as_str() {
+                    "npm" => npm = Some(spec),
+                    "pip" => pip = Some(spec),
+                    _ => cargo = Some(spec),
                 }
             }
             other => {
                 return Err(miette::miette!(
-                    "deps: unknown resolver '{other}' (supported: npm, pip)"
+                    "deps: unknown resolver '{other}' (supported: npm, pip, cargo)"
                 ))
             }
         }
     }
-    if npm.is_none() && pip.is_none() {
+    if npm.is_none() && pip.is_none() && cargo.is_none() {
         return Err(miette::miette!(
-            "deps must name at least one resolver: npm or pip"
+            "deps must name at least one resolver: npm, pip, or cargo"
         ));
     }
-    Ok(PackageDeps { npm, pip })
+    Ok(PackageDeps { npm, pip, cargo })
 }
 
 /// Parse one resolver's spec table: `lock` (required, relative to the
-/// source root), `index` (optional), and — npm only — `exclude` globs
-/// over lock keys (issue #14). pip rejects `exclude`: its fetch side
-/// has no lock keys to glob, only whole wheel pins.
+/// source root), `index` (optional, pip only), and — npm only — `exclude`
+/// globs over lock keys (issue #14). pip and cargo reject `exclude`: pip
+/// has no lock keys to glob, and cargo vendoring has no exclusion seam —
+/// a Cargo.lock IS the closure, so partial vendoring would break the
+/// offline build it exists to serve.
 fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLockSpec> {
     let lock = get_opt_string(t, "lock")?.ok_or_else(|| {
         miette::miette!(
@@ -863,12 +870,18 @@ fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLoc
         ));
     }
     let index = get_opt_string(t, "index")?;
+    if key == "cargo" && index.is_some() {
+        return Err(miette::miette!(
+            "deps.cargo: 'index' is not supported — crates resolve from the lockfile \
+             checksums against crates.io"
+        ));
+    }
     let exclude = match key {
         "npm" => npm_exclude_from_lua(t)?,
         _ => {
             if pip_exclude_present(t) {
                 return Err(miette::miette!(
-                    "deps.pip: 'exclude' is not supported (npm only)"
+                    "deps.{key}: 'exclude' is not supported (npm only)"
                 ));
             }
             Vec::new()
@@ -2785,8 +2798,9 @@ fn is_shared_lib_name(name: &str) -> bool {
 ///
 /// `leak_scan` supplies the post-build leak scan's resolution data (ADR-0018
 /// Decision 3): which payloads are runtime members and which are build-only.
-/// `None` skips the scan (pod builds and other paths that do not yet wire
-/// the merged prefix).
+/// `None` skips the scan. Every wired build path scans (issue #35): pool
+/// and pod builds alike pass listings resolved against the merged build
+/// prefix — empty listings when the build materialized no prefix.
 ///
 /// Returns the output filename (not the full path).
 #[allow(clippy::too_many_arguments)]
@@ -2832,9 +2846,9 @@ pub fn build_snap(
     // references that resolve only into build-only payloads or into the
     // merged build prefix ([`SANDBOX_BUILD_PREFIX`]). Hard error on a hit;
     // `leaks_ok` entries silence named hits (visibly logged); a clean scan
-    // emits one status line. Runs when the build materialized a prefix (the
-    // `shuttle build` path); pod builds skip it until merged-prefix wiring
-    // lands there.
+    // emits one status line. All wired build paths run it (issue #35):
+    // pool and pod builds pass listings against their merged prefix, or
+    // empty listings when the build materialized none.
     if let Some(listings) = leak_scan {
         let report = crate::leak_scan::scan_stage(stage_dir, listings, &meta.leaks_ok)?;
         report.enforce()?;
@@ -3964,10 +3978,15 @@ const SHELL_WORDS: [&str; 59] = [
 /// whose lines otherwise surface as phantom segments (empirically
 /// `tool 'from'` off a Python launcher heredoc) — and separators inside
 /// quotes, where they are argument text (`sh -c 'a; b'` runs ONE command,
-/// `sh`).
+/// `sh`). Command-substitution interiors never probe either (issue #39):
+/// a `$(...)` is a runtime sub-command of the outer command — and an
+/// assignment like `v=$(go version)` otherwise tears into interior words
+/// (`version)`) that surface as phantom missing tools.
 fn path_resolved_words(cmd: &str) -> Vec<String> {
+    let heredoc_stripped = strip_heredoc_bodies(cmd);
+    let stripped = strip_command_substitutions(&heredoc_stripped);
     let mut words = Vec::new();
-    for segment in split_segments(&strip_heredoc_bodies(cmd)) {
+    for segment in split_segments(&stripped) {
         for word in segment.split_whitespace() {
             if is_variable_assignment(word) {
                 continue;
@@ -4017,6 +4036,56 @@ fn strip_heredoc_bodies(cmd: &str) -> std::borrow::Cow<'_, str> {
     } else {
         std::borrow::Cow::Owned(kept.join("\n"))
     }
+}
+
+/// Replace every `$( ... )` command-substitution span in `cmd` with a bare
+/// `$`: the interior is a sub-command the outer command consumes at
+/// runtime — not a build command of its own — so its words must never
+/// probe, and its `|`/`;`/`&&` must not split segments. The scan is
+/// paren-depth aware (nested substitutions and subshells like
+/// `$(a $(b))` close at the matching `)`, as does `$((...))` arithmetic)
+/// and quote-aware (`")"` is argument text; a substitution inside double
+/// quotes still evaluates, one inside single quotes does not). The `$`
+/// placeholder keeps the surrounding word non-PATH-resolvable
+/// (`foo$(x)bar` stays `$`-tainted). Input without `$(` comes back
+/// unchanged (borrowed).
+fn strip_command_substitutions(cmd: &str) -> std::borrow::Cow<'_, str> {
+    if !cmd.contains("$(") {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+    let bytes = cmd.as_bytes();
+    let mut kept = String::with_capacity(cmd.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    // Open command-substitution parens; 0 = outside any substitution.
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'$' if !in_single && bytes.get(i + 1) == Some(&b'(') => {
+                let opening = depth == 0;
+                depth += 1;
+                if opening {
+                    kept.push('$');
+                }
+                i += 1; // skip the `(`
+            }
+            b'(' if depth > 0 && !in_single && !in_double => depth += 1,
+            b')' if depth > 0 && !in_single && !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    i += 1;
+                    continue; // closing paren: dropped with the interior
+                }
+            }
+            _ if depth > 0 => {} // substitution interior — dropped
+            b => kept.push(char::from(b)),
+        }
+        i += 1;
+    }
+    std::borrow::Cow::Owned(kept)
 }
 
 /// The heredoc delimiter a line's `<<` redirection opens: `Some((delimiter,
@@ -4389,7 +4458,14 @@ fn run_bwrapped(
     cmd_proc
         .env("PATH", std::env::join_paths(&path_dirs).unwrap_or_default())
         .env("STAGE", stage_dir)
-        .env("SRC", &inner_src);
+        .env("SRC", &inner_src)
+        // Default HOME (issue #39): the cleared env leaves cargo — and
+        // cmake-method dependency lookups (meson's cmake method) — refusing
+        // to run without one. The sandbox's private /tmp tmpfs is the one
+        // writable scratch path every build has, so it is the HOME of last
+        // resort; build scripts may still export their own, and the cross /
+        // extra env applied below overrides this default.
+        .env("HOME", "/tmp");
     if deps_dir.is_some() {
         cmd_proc.env("SHUTTLE_DEPS_DIR", SANDBOX_DEPS_DIR);
     }
@@ -8866,6 +8942,51 @@ fi
     }
 
     #[test]
+    fn path_resolved_words_skip_command_substitutions() {
+        // Issue #39: the interior of a `$(...)` is a runtime sub-command,
+        // not a build command — and an assignment like `v=$(go version)`
+        // tears under whitespace-splitting into interior words (`version)`)
+        // that surfaced as phantom missing tools. Interiors never probe,
+        // nested substitutions close at the matching paren, and separators
+        // inside them never split segments.
+        assert_eq!(
+            path_resolved_words("ver=$(go version) && echo \"$ver\""),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            path_resolved_words("echo \"go $(go version)\" > go-version.txt"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            path_resolved_words("x=$(echo $(cat a.txt)) && grep -q p x"),
+            vec!["grep".to_string()]
+        );
+        assert_eq!(
+            path_resolved_words("out=$(go env GOROOT | head -1) && cp \"$out\" y"),
+            vec!["cp".to_string()]
+        );
+    }
+
+    #[test]
+    fn preflight_accepts_nested_command_substitutions() {
+        // The empirical false positive (issue #39): the go-probe fixture
+        // needed a redirect-form workaround because `v=$(go version)` made
+        // the parser probe the interior word `version)` as a missing
+        // sandbox tool. Substitution interiors are consumed at runtime;
+        // only the outer commands probe.
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "grep");
+        let entries = vec![dir.path().to_path_buf()];
+        let root = dir.path().to_path_buf();
+        preflight_sandbox_tools_with(
+            "ver=$(go version) && grep -q 'go1.27.1' ver.txt",
+            &entries,
+            std::slice::from_ref(&root),
+        )
+        .expect("command-substitution interiors never probe");
+    }
+
+    #[test]
     fn bind_system_ro_paths_binds_declared_roots_that_exist() {
         let mut cmd = std::process::Command::new("true");
         bind_system_ro_paths(&mut cmd);
@@ -9086,6 +9207,7 @@ mod wrapper_tests {
         meta.deps = Some(crate::snap::PackageDeps {
             npm: None,
             pip: None,
+            cargo: None,
         });
 
         emit_build_wrappers(&meta, stage.path(), &store).unwrap();
@@ -9133,6 +9255,7 @@ mod wrapper_tests {
         meta.deps = Some(crate::snap::PackageDeps {
             npm: None,
             pip: None,
+            cargo: None,
         });
 
         emit_build_wrappers(&meta, stage.path(), &store).unwrap();

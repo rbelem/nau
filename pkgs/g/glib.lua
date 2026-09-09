@@ -51,13 +51,6 @@ return {
             -- the merged build prefix, whose bin dir leads the sandbox
             -- PATH (issue #33) — bare command words resolve to the pool
             -- tools, and the preflight probes them there too.
-            -- The sandbox does not bind /etc, so getpwuid cannot resolve
-            -- the build user and HOME is unset — cmake's dependency
-            -- lookups (meson's cmake method, used for the optional
-            -- bash-completion probe) abort with "Could not determine
-            -- home directory". /tmp need not exist; it is only a string
-            -- for ~ expansion.
-            "export HOME=/tmp",
             "meson setup build --prefix=/usr " ..
                 "-Dselinux=disabled -Dlibmount=disabled -Dsysprof=disabled " ..
                 "-Dnls=disabled -Dman-pages=disabled -Ddocumentation=false " ..

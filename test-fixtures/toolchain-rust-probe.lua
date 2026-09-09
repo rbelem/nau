@@ -35,11 +35,10 @@ return {
 
         build_deps = { "rust" },
 
-        -- Plain word/redirect commands only: the sandbox preflight
-        -- parses command words, and $() nesting confuses it. cargo
-        -- refuses to run without HOME (rustc doesn't care).
+        -- cargo needs HOME: the sandbox defaults it to the private /tmp
+        -- (issue #39), so no explicit export is needed.
         build = table.concat({
-            "HOME=/tmp cargo --version > cargo-version.txt",
+            "cargo --version > cargo-version.txt",
             "rustc --version > rustc-version.txt",
             "grep -q '^cargo 1.98.1' cargo-version.txt",
             "grep -q '^rustc 1.98.1' rustc-version.txt",
