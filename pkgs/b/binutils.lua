@@ -16,6 +16,6 @@ archives, and binaries. This build targets x86_64-linux-gnu.]],
         type = "source",
         requires = {},
         source = { url = "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz" },
-        build = "./configure --prefix=/usr --target=x86_64-linux-gnu && make && make install DESTDIR=$STAGE",
+        build = "./configure --prefix=/usr --target=x86_64-linux-gnu --disable-gprofng --disable-werror && make && make install DESTDIR=$STAGE",
     },
 }
