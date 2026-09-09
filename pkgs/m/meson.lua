@@ -6,10 +6,10 @@
 -- A pip install would need setuptools plus network for the build
 -- backend, which the hermetic build sandbox does not have.
 --
--- The launcher resolves python through the merged build prefix
--- ($SHUTTLE_BUILD_PREFIX, ADR-0018) — meson is a build-time-only
--- tool: consumers list it in `build_deps` together with python
--- (pulled transitively) and prepend the prefix bin dir to PATH.
+-- The launcher resolves python through PATH: the merged build prefix's
+-- bin dir leads the sandbox PATH (issue #33), and meson is a
+-- build-time-only tool — consumers list it in `build_deps` together with
+-- python (pulled transitively), so bare `python3` is the pool python.
 -- site-packages path pins pool python 3.12.
 --
 -- Requires: glibc (python), python
@@ -37,28 +37,19 @@ return {
             sha256 = "88afe0c20e52030218924ac37d0c81c59b4b5f3ae3752c8c6d7470c7d365886c",
         },
 
-        -- The launcher is emitted with printf, not a heredoc: the sandbox
-        -- tool preflight tokenizes the build command per segment and would
-        -- probe heredoc terminator lines (EOF) and `-c '…;…'` fragments as
-        -- missing sandbox commands. The launcher runs mesonmain as a module
-        -- (-m; its __main__ guard calls main) so no inline python is needed.
+        -- The launcher resolves python by bare name (PATH carries the
+        -- merged build prefix's bin dir first — issue #33), so no build
+        -- prefix marker text ships in the payload. The launcher runs
+        -- mesonmain as a module (-m; its __main__ guard calls main) so
+        -- no inline python is needed.
         build = table.concat({
             "mkdir -p $STAGE/usr/lib/python3.12/site-packages $STAGE/usr/bin",
             "cp -r $SRC/mesonbuild $STAGE/usr/lib/python3.12/site-packages/",
-            "printf '%s\\n' '#!/bin/sh' 'exec \"${SHUTTLE_BUILD_PREFIX:-/shuttle-build-prefix}/usr/bin/python3\" -m mesonbuild.mesonmain \"$@\"' > $STAGE/usr/bin/meson",
+            "printf '%s\\n' '#!/bin/sh' 'exec python3 -m mesonbuild.mesonmain \"$@\"' > $STAGE/usr/bin/meson",
             "chmod +x $STAGE/usr/bin/meson",
         }, " && "),
 
         type = "source",
         requires = { "glibc", "python" },
-
-        -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22/#19): the
-        -- launcher's ${SHUTTLE_BUILD_PREFIX:-/shuttle-build-prefix} fallback
-        -- is its entire purpose — resolving the pool python inside the merged
-        -- build prefix — so a text hit on the bare marker is by design. The
-        -- reference is the exact marker string (text-scan Leak.reference),
-        -- matching the scan's silencing gate. meson is a build_deps-only
-        -- tool, never a runtime payload; silenced here, visibly logged.
-        leaks_ok = { "/shuttle-build-prefix" },
     },
 }

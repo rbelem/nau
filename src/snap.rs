@@ -3913,9 +3913,11 @@ pub fn sandbox_visible_entries_with(entries: &[PathBuf], extra_roots: &[PathBuf]
 }
 
 /// The `PATH` the sandbox can actually see for the given `extra_roots`
-/// (a colon-joined [`sandbox_visible_entries_with`]) — used as the
-/// hermetic sandbox `PATH` so inherited host env (devbox/nix-shell paths
-/// that are NOT bound) never leaks into the build.
+/// (a colon-joined [`sandbox_visible_entries_with`]) — the hermetic
+/// sandbox PATH baseline so inherited host env (devbox/nix-shell paths
+/// that are NOT bound) never leaks into the build. The sandboxed build
+/// ([`run_bwrapped`]) prepends the merged build prefix's bin dir when one
+/// is bound, so build_deps tooling shadows coincidental host tools.
 pub fn sandbox_path(extra_roots: &[PathBuf]) -> std::ffi::OsString {
     let entries = sandbox_visible_entries_with(&path_entries(), extra_roots);
     std::env::join_paths(entries).unwrap_or_default()
@@ -3952,23 +3954,171 @@ const SHELL_WORDS: [&str; 59] = [
 /// of a redirection (`2>&1`) and must not split the segment. Words naming
 /// a direct path, a variable, a glob, or a shell builtin resolve outside
 /// PATH and are not probed.
+///
+/// Two kinds of non-command text never probe (issue #33): heredoc bodies
+/// and their terminator lines — text the redirecting command consumes,
+/// whose lines otherwise surface as phantom segments (empirically
+/// `tool 'from'` off a Python launcher heredoc) — and separators inside
+/// quotes, where they are argument text (`sh -c 'a; b'` runs ONE command,
+/// `sh`).
 fn path_resolved_words(cmd: &str) -> Vec<String> {
     let mut words = Vec::new();
-    for chunk in cmd.split("&&") {
-        for segment in chunk.split(['|', ';', '\n']) {
-            for word in segment.split_whitespace() {
-                if is_variable_assignment(word) {
-                    continue;
-                }
-                let word = unquote(word);
-                if is_path_resolved_word(word) {
-                    words.push(word.to_string());
-                }
-                break;
+    for segment in split_segments(&strip_heredoc_bodies(cmd)) {
+        for word in segment.split_whitespace() {
+            if is_variable_assignment(word) {
+                continue;
             }
+            let word = unquote(word);
+            if is_path_resolved_word(word) {
+                words.push(word.to_string());
+            }
+            break;
         }
     }
     words
+}
+
+/// Drop heredoc bodies (and their terminator lines) from `cmd`: after a
+/// `<<DELIM` redirection every following line up to the line that is
+/// exactly `DELIM` is text the redirecting command consumes — not commands
+/// of their own. The line carrying the redirection is kept. Input without
+/// a heredoc operator comes back unchanged (borrowed).
+fn strip_heredoc_bodies(cmd: &str) -> std::borrow::Cow<'_, str> {
+    if !cmd.contains("<<") {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    // Some while inside a heredoc body: (delimiter, `<<-` dash form —
+    // leading tabs allowed on the terminator line).
+    let mut body: Option<(String, bool)> = None;
+    for line in cmd.split('\n') {
+        if let Some((delimiter, dash)) = &body {
+            let candidate = if *dash {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if candidate.trim_end() == delimiter {
+                body = None;
+            }
+            continue;
+        }
+        if let Some((delimiter, dash)) = heredoc_delimiter(line) {
+            body = Some((delimiter, dash));
+        }
+        kept.push(line);
+    }
+    if kept.len() == cmd.split('\n').count() {
+        std::borrow::Cow::Borrowed(cmd)
+    } else {
+        std::borrow::Cow::Owned(kept.join("\n"))
+    }
+}
+
+/// The heredoc delimiter a line's `<<` redirection opens: `Some((delimiter,
+/// dash-form))`. Quoted delimiters (`<<'EOF'`, `<<"EOF"`) unquote; a
+/// space-separated one (`cat << EOF`) is found after the blanks. `None`
+/// when the line opens no heredoc: `<<` inside quotes is argument text,
+/// `<<<` is a here-string, and the heuristic requires a plausible
+/// delimiter word (alphabetic/underscore/quoted first char — arithmetic
+/// like `$((1<<10))` is not a heredoc).
+fn heredoc_delimiter(line: &str) -> Option<(String, bool)> {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'<' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'<') => {
+                if bytes.get(i + 2) == Some(&b'<') {
+                    i += 2; // `<<<` here-string — no body lines follow
+                } else if let Some(d) = heredoc_delimiter_after(line, i + 2) {
+                    return Some(d);
+                }
+                // An implausible delimiter (arithmetic `1<<10`) keeps the
+                // scan going — a real heredoc may open later on the line.
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse the `<<` redirection at byte offset `op` (just past the two
+/// `<`): an optional `-` dash form, then the delimiter word — attached,
+/// or after blanks — quoted or bare. Shell metacharacters end a bare
+/// delimiter word just like blanks do.
+fn heredoc_delimiter_after(line: &str, op: usize) -> Option<(String, bool)> {
+    let bytes = line.as_bytes();
+    let dash = bytes.get(op) == Some(&b'-');
+    let word_start = if dash { op + 1 } else { op };
+    if let Some(word) = delimited_word(line, word_start) {
+        return Some((word, dash));
+    }
+    // Space-separated form: `cat << EOF`.
+    let mut k = word_start;
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    delimited_word(line, k).map(|word| (word, dash))
+}
+
+/// The bare-or-quoted delimiter word starting at `start`, if one is
+/// present and plausible (first char alphabetic, `_`, or a quote — a
+/// digit-leading word is arithmetic like `$((1<<10))`, not a heredoc).
+fn delimited_word(line: &str, start: usize) -> Option<String> {
+    let bytes = line.as_bytes();
+    let quoted = matches!(bytes.get(start), Some(b'\'') | Some(b'"'));
+    let mut end = start;
+    while end < bytes.len() {
+        let b = bytes[end];
+        if b.is_ascii_whitespace() || matches!(b, b';' | b'&' | b'(' | b')' | b'|') {
+            break;
+        }
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    let word = line[start..end].trim_matches(|c| c == '\'' || c == '"');
+    let plausible = !word.is_empty()
+        && (quoted || word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'));
+    plausible.then(|| word.to_string())
+}
+
+/// Split `cmd` into command segments at the separators `sh` honors — `&&`,
+/// `||`, `|`, `;`, newline — skipping separators inside single or double
+/// quotes, where they are argument text. A lone `&` never splits
+/// (background mark / redirection).
+fn split_segments(cmd: &str) -> Vec<&str> {
+    let bytes = cmd.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'&' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'&') => {
+                segments.push(&cmd[start..i]);
+                i += 1;
+                start = i + 1;
+            }
+            b'|' | b';' | b'\n' if !in_single && !in_double => {
+                segments.push(&cmd[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    segments.push(&cmd[start..]);
+    segments
 }
 
 /// True if `word` (unquoted) is a bare command name the shell resolves
@@ -4145,8 +4295,18 @@ fn run_bwrapped(
     // Tool resolution must work the way the sandbox will see it — fail
     // here, naming the tool, instead of mid-build (see
     // `preflight_sandbox_tools_with`). The stage dir is bound at its own
-    // host path, so PATH entries under it are visible.
-    preflight_sandbox_tools_with(cmd, &path_entries(), &[stage_dir.to_path_buf()])?;
+    // host path, so PATH entries under it are visible. The merged build
+    // prefix's bin dir joins the probe set the same way: the sandbox PATH
+    // (below) carries it, so bare `cmake`/`ninja`/`meson` from build_deps
+    // resolve exactly as they will inside the sandbox (issue #33).
+    let prefix_bin = build_prefix.map(|p| p.join("usr/bin"));
+    let mut entries = path_entries();
+    let mut extra_roots = vec![stage_dir.to_path_buf()];
+    if let Some(bin) = &prefix_bin {
+        entries.push(bin.clone());
+        extra_roots.push(bin.clone());
+    }
+    preflight_sandbox_tools_with(cmd, &entries, &extra_roots)?;
     // Map a host path under the build dir to its sandbox path under /build.
     let to_inner = |p: &Path| -> std::path::PathBuf {
         if p == build_path {
@@ -4212,9 +4372,18 @@ fn run_bwrapped(
     // paths into built artifacts, then export a controlled PATH limited to
     // the sandbox-visible toolchain dirs (symlinks canonicalized onto the
     // bound roots — see `sandbox_visible_entries_with`) plus the build vars.
+    // With a merged build prefix, its bin dir leads the PATH (issue #33):
+    // build_deps are the declared source of build tooling, so pool
+    // cmake/ninja/meson shadow coincidental host tools of the same name —
+    // and inside the sandbox the prefix is bound at SANDBOX_BUILD_PREFIX,
+    // which is the entry the PATH carries.
     cmd_proc.env_clear();
+    let mut path_dirs = sandbox_visible_entries_with(&path_entries(), &[stage_dir.to_path_buf()]);
+    if prefix_bin.is_some() {
+        path_dirs.insert(0, Path::new(SANDBOX_BUILD_PREFIX).join("usr/bin"));
+    }
     cmd_proc
-        .env("PATH", sandbox_path(&[stage_dir.to_path_buf()]))
+        .env("PATH", std::env::join_paths(&path_dirs).unwrap_or_default())
         .env("STAGE", stage_dir)
         .env("SRC", &inner_src);
     if deps_dir.is_some() {
@@ -4274,6 +4443,12 @@ fn run_direct(
         for (key, val) in build_prefix_env(&host) {
             cmd_proc.env(key, val);
         }
+        // Degraded mode keeps the sandbox's tool order (issue #33): the
+        // prefix bin dir first, so bare cmake/ninja/meson resolve to the
+        // pool build_deps tooling, not coincidental host tools.
+        let mut path_dirs = vec![prefix.join("usr/bin")];
+        path_dirs.extend(path_entries());
+        cmd_proc.env("PATH", std::env::join_paths(&path_dirs).unwrap_or_default());
     }
     if let Some(name) = part_name {
         cmd_proc.env("PART_NAME", name);
@@ -8588,6 +8763,102 @@ fi
         .expect("stage-bound tools are visible to the sandbox");
         // The same setup fails without the stage bind.
         assert!(preflight_sandbox_tools_with("cmake -S $SRC", &entries, &[]).is_err());
+    }
+
+    #[test]
+    fn preflight_accepts_tools_in_the_merged_build_prefix() {
+        // build_deps tooling materializes into the merged build prefix
+        // (issue #33): its bin dir joins the preflight probe set the same
+        // way the sandbox PATH carries it, so a build script invoking bare
+        // `cmake` (a build_dep) passes preflight instead of erroring on a
+        // host PATH that has no cmake.
+        let prefix = tempfile::tempdir().unwrap();
+        let bin = prefix.path().join("usr/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_exec(&bin, "cmake");
+        let entries = vec![bin];
+        let prefix_root = prefix.path().to_path_buf();
+        preflight_sandbox_tools_with(
+            "cmake -S $SRC -B build -DCMAKE_INSTALL_PREFIX=/usr",
+            &entries,
+            std::slice::from_ref(&prefix_root),
+        )
+        .expect("merged-prefix tools are visible to the sandbox");
+        // Without the prefix root the same command fails preflight.
+        assert!(preflight_sandbox_tools_with("cmake -S $SRC", &entries, &[]).is_err());
+    }
+
+    #[test]
+    fn preflight_heredoc_bodies_and_terminators_never_probe() {
+        // The empirical false positive (issue #33): a launcher-emitting
+        // build whose heredoc body carries `from x import y` lines — the
+        // parser probed `from` (and the `EOF` terminator) as missing
+        // sandbox commands. Heredoc text is not a command: only `cat` is
+        // probed, and it resolves via the tempdir bind root.
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "cat");
+        let entries = vec![dir.path().to_path_buf()];
+        let root = dir.path().to_path_buf();
+        preflight_sandbox_tools_with(
+            "cat > launcher <<'PYEOF'\n\
+             #!/bin/sh\n\
+             from mesonbuild.mesonmain import main\n\
+             import sys; sys.exit(main())\n\
+             PYEOF",
+            &entries,
+            std::slice::from_ref(&root),
+        )
+        .expect("heredoc bodies and terminator lines are text, not commands");
+    }
+
+    #[test]
+    fn preflight_quoted_fragments_are_argument_text() {
+        // `sh -c 'a; b'` runs ONE command (`sh`) — separators inside
+        // quotes are argument text, so `b` must not be probed (issue #33).
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "sh");
+        let entries = vec![dir.path().to_path_buf()];
+        let root = dir.path().to_path_buf();
+        preflight_sandbox_tools_with(
+            "sh -c 'mkdir -p out; exec make install'",
+            &entries,
+            std::slice::from_ref(&root),
+        )
+        .expect("quoted ; fragments are one command's argument text");
+    }
+
+    #[test]
+    fn path_resolved_words_skip_heredocs_and_quoted_separators() {
+        // Real commands around heredocs and quoted fragments still probe;
+        // bodies, terminator lines, and quoted separators do not.
+        assert_eq!(
+            path_resolved_words("cmake -S $SRC && cat <<EOF\nfrom x import y\nEOF\nninja -C build"),
+            vec!["cmake".to_string(), "cat".to_string(), "ninja".to_string()]
+        );
+        assert_eq!(
+            path_resolved_words("sh -c 'a; b | c' && make"),
+            vec!["sh".to_string(), "make".to_string()]
+        );
+    }
+
+    #[test]
+    fn path_resolved_words_heredoc_delimiter_variants() {
+        // Dash form with a space-separated delimiter and a tab-indented
+        // terminator; the body never probes.
+        assert_eq!(
+            path_resolved_words("cat <<- EOM\nbody line\n\tEOM\nstrip"),
+            vec!["cat".to_string(), "strip".to_string()]
+        );
+        // `<<<` is a here-string (no body); arithmetic `1<<10` is no
+        // heredoc either.
+        assert_eq!(
+            path_resolved_words("cat <<< text && strip"),
+            vec!["cat".to_string(), "strip".to_string()]
+        );
+        assert_eq!(
+            path_resolved_words("expr $((1<<10)) + 0 && strip"),
+            vec!["expr".to_string(), "strip".to_string()]
+        );
     }
 
     #[test]

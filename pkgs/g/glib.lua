@@ -7,8 +7,8 @@
 -- closures), pcre2 (GRegex) and zlib (gresource/gzlib) are link-time
 -- AND runtime requires.
 --
--- The build prepends the prefix bin dir to PATH so the pool
--- meson/ninja/pkg-config/python are the ones invoked, and pkg-config
+-- The prefix bin dir leads the sandbox PATH (issue #33), so bare
+-- meson/ninja/pkg-config resolve to the pool tools, and pkg-config
 -- resolves pool .pc files through the PKG_CONFIG_PATH /
 -- PKG_CONFIG_SYSROOT_DIR the sandbox already exports.
 --
@@ -47,12 +47,10 @@ return {
         },
 
         build = table.concat({
-            -- Pool meson/ninja/pkg-config live in the merged build
-            -- prefix; the sandbox does not extend PATH to it, and the
-            -- sandbox tool preflight only accepts PATH-resolved bare
-            -- command words, so every tool is invoked by its explicit
-            -- $SHUTTLE_BUILD_PREFIX path.
-            "export PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\"",
+            -- Pool meson/ninja/pkg-config come from build_deps and live in
+            -- the merged build prefix, whose bin dir leads the sandbox
+            -- PATH (issue #33) — bare command words resolve to the pool
+            -- tools, and the preflight probes them there too.
             -- The sandbox does not bind /etc, so getpwuid cannot resolve
             -- the build user and HOME is unset — cmake's dependency
             -- lookups (meson's cmake method, used for the optional
@@ -60,14 +58,14 @@ return {
             -- home directory". /tmp need not exist; it is only a string
             -- for ~ expansion.
             "export HOME=/tmp",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/meson\" setup build --prefix=/usr " ..
+            "meson setup build --prefix=/usr " ..
                 "-Dselinux=disabled -Dlibmount=disabled -Dsysprof=disabled " ..
                 "-Dnls=disabled -Dman-pages=disabled -Ddocumentation=false " ..
                 "-Dtests=false -Dinstalled_tests=false -Dlibelf=disabled " ..
                 "-Dintrospection=disabled -Ddtrace=disabled -Dsystemtap=disabled " ..
                 "-Dglib_debug=disabled",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build",
-            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build install",
+            "ninja -C build",
+            "DESTDIR=$STAGE ninja -C build install",
         }, " && "),
 
         type = "source",

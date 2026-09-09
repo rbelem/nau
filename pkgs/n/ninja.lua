@@ -21,20 +21,20 @@ to run builds as fast as possible.]],
         build_deps = { "cmake" },
         source = { url = "https://github.com/ninja-build/ninja/archive/refs/tags/v1.12.1.tar.gz" },
         -- Hand-rolled cmake invocation instead of the `cmake` plugin: the
-        -- plugin emits a bare `cmake` command word, which the sandbox tool
-        -- preflight resolves against the HOST PATH only — pool cmake lives
-        -- in the merged build prefix, so the preflight rejects it. Invoke
-        -- it by its explicit $SHUTTLE_BUILD_PREFIX path (the same pattern
-        -- pkgs/m/meson.lua uses for pool meson).
+        -- plugin's declarative form pins nothing extra here, and the
+        -- explicit flags (no FetchContent tests) stay visible. Pool cmake
+        -- materializes into the merged build prefix whose bin dir leads
+        -- the sandbox PATH (issue #33), so bare `cmake` resolves to it —
+        -- no explicit $SHUTTLE_BUILD_PREFIX path needed.
         build = table.concat({
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/cmake\" -S $SRC -B build " ..
+            "cmake -S $SRC -B build " ..
                 "-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr " ..
                 -- The sandbox has no network; without this ninja's CMake
                 -- FetchContent tries to download googletest at build time.
                 -- Tests are not installed into the snap anyway.
                 "-DBUILD_TESTING=OFF",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/cmake\" --build build",
-            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/cmake\" --install build",
+            "cmake --build build",
+            "DESTDIR=$STAGE cmake --install build",
         }, " && "),
     },
 }
