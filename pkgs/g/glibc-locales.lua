@@ -31,6 +31,11 @@ return {
         },
 
         build = table.concat({
+            -- Same glibc 2.43 source as the pool glibc package: guard
+            -- mount.h's unconditional OPEN_TREE_CLONE / OPEN_TREE_CLOEXEC
+            -- definitions so they yield to the pool linux-headers
+            -- <linux/mount.h> (see pkgs/g/glibc.lua).
+            "sed -i -e '/^#define OPEN_TREE_CLONE[[:space:]]/i #ifndef OPEN_TREE_CLONE' -e '/^#define OPEN_TREE_CLOEXEC[[:space:]]/a #endif' sysdeps/unix/sysv/linux/sys/mount.h",
             "mkdir build",
             "cd build && ../configure --prefix=/usr --disable-profile --enable-kernel=5.4",
             "make -j$(nproc)",

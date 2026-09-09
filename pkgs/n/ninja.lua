@@ -15,6 +15,10 @@ to run builds as fast as possible.]],
         architectures = { "amd64" },
         type = "source",
         requires = {},
+        -- ninja's cmake plugin expands to `cmake` commands; cmake is a
+        -- build-time-only tool, so it is a build_dep (never a runtime
+        -- requires). It materializes into the merged build prefix.
+        build_deps = { "cmake" },
         source = { url = "https://github.com/ninja-build/ninja/archive/refs/tags/v1.12.1.tar.gz" },
         parts = {
             ninja = {
