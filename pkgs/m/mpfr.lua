@@ -22,6 +22,10 @@ a required dependency for GCC's internal computations.]],
             -- (dependency_libs) as gmp; nothing consumes libtool archives
             -- at runtime, so strip them (libstdcpp/curl/gmp precedent).
             "find $STAGE -name '*.la' -type f -delete",
+            -- The info index is regenerated per-package; strip it so the
+            -- merged build prefix stays content-identical (gmp/m4/binutils
+            -- precedent).
+            "find $STAGE -name 'dir' -path '*/share/info/*' -delete",
         }, " && "),
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as libstdcpp/gmp's neighbors: the nix gcc wrapper bakes

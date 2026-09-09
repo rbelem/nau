@@ -16,6 +16,15 @@ archives, and binaries. This build targets x86_64-linux-gnu.]],
         type = "source",
         requires = {},
         source = { url = "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz" },
-        build = "./configure --prefix=/usr --target=x86_64-linux-gnu --disable-gprofng --disable-werror && make && make install DESTDIR=$STAGE",
+        build = table.concat({
+            "./configure --prefix=/usr --target=x86_64-linux-gnu --disable-gprofng --disable-werror",
+            "make -j$(nproc)",
+            "make install DESTDIR=$STAGE",
+            -- Binutils ships makeinfo-generated info pages + a regenerated
+            -- share/info/dir index; in a merged build prefix dir differs
+            -- across packages and conflicts (gmp/m4 precedent). Strip it so
+            -- prefix merging stays content-identical.
+            "find $STAGE -name 'dir' -path '*/share/info/*' -delete",
+        }, " && "),
     },
 }
