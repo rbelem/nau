@@ -54,10 +54,13 @@ return {
         }, " && "),
 
         type = "source",
-        -- glibc for the runtime loader; gcc's libstdc++ backs the native
-        -- .node addons (onnxruntime/sharp/zvec bindings) via the #10
-        -- LD_LIBRARY_PATH wrapper machinery.
-        requires = { "glibc", "gcc" },
+        -- glibc for the runtime loader; libstdcpp + libgcc for the C++ runtime
+        -- that backs the native .node addons (onnxruntime/sharp/zvec bindings)
+        -- via the #10 LD_LIBRARY_PATH wrapper machinery. The dedicated pool
+        -- runtime packages (issue #34) provide libstdc++.so.6/libgcc_s.so.1;
+        -- a full GCC source build is disproportionate for a runtime-only need
+        -- and its fixinc/sysroot bootstrap is a separate concern.
+        requires = { "glibc", "libstdcpp", "libgcc" },
 
         apps = {
             zg = app {
