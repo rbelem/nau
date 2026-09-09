@@ -243,6 +243,7 @@ mod tests {
             description: None,
             license: None,
             source: None,
+            sources: None,
             architectures: None,
             build: None,
             parts: None,

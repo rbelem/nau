@@ -1013,7 +1013,7 @@ fn build_outputs(
         }
 
         for a in &archs {
-            if let Some(info) = build_one_arch(
+            for info in build_one_arch(
                 name,
                 meta,
                 a,
@@ -1032,8 +1032,9 @@ fn build_outputs(
     Ok(all_source_info)
 }
 
-/// Build a single output for one arch. Returns the source info captured by
-/// the build, if any, for the caller's lockfile update.
+/// Build a single output for one arch. Returns the source infos captured
+/// by the build (one per materialized source), for the caller's lockfile
+/// update.
 #[allow(clippy::too_many_arguments)]
 fn build_one_arch(
     name: &str,
@@ -1045,7 +1046,7 @@ fn build_one_arch(
     pkg_cache: Option<&PackageCache>,
     lockfile: &LockFile,
     json: bool,
-) -> miette::Result<Option<shuttle::snap::SourceInfo>> {
+) -> miette::Result<Vec<shuttle::snap::SourceInfo>> {
     shuttle::snap::check_cross_build(arch, meta.target.as_deref())?;
     if !json {
         shuttle::output::status(format!("{}/{}:", name, arch));
@@ -1101,11 +1102,23 @@ fn build_one_arch(
             version: result.version.clone(),
             arch: arch.to_string(),
             filename: result.snap_filename.clone(),
-            sha256: result.source_info.as_ref().map(|s| s.sha256.clone()),
+            sha256: result.source_infos.first().map(|s| s.sha256.clone()),
+            // Multi-source builds (issue #41) report every pinned source;
+            // single-source builds keep the flat `sha256` field only.
+            sources: (!result.source_infos.is_empty()).then(|| {
+                result
+                    .source_infos
+                    .iter()
+                    .map(|i| shuttle::output::SourcePinJson {
+                        url: i.url.clone(),
+                        sha256: i.sha256.clone(),
+                    })
+                    .collect()
+            }),
         });
     }
 
-    Ok(result.source_info)
+    Ok(result.source_infos)
 }
 
 /// Pin newly observed source hashes into the lockfile (saving it when
@@ -1558,6 +1571,7 @@ fn build_one_image(
             arch: arch.to_string(),
             filename: fname,
             sha256: None,
+            sources: None,
         });
     } else {
         shuttle::output::ok(&fname);

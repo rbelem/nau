@@ -122,6 +122,18 @@ pub struct BuildResultJson {
     pub arch: String,
     pub filename: String,
     pub sha256: Option<String>,
+    /// Multi-source builds (issue #41): every materialized source with
+    /// its verified hash. `None` (and absent from the JSON) for
+    /// single-source builds, which keep the flat `sha256` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<SourcePinJson>>,
+}
+
+/// One multi-source entry for JSON output (issue #41).
+#[derive(Debug, Clone, Serialize)]
+pub struct SourcePinJson {
+    pub url: String,
+    pub sha256: String,
 }
 
 /// One dependency entry for JSON output.

@@ -388,6 +388,53 @@ function snap(opts)
         end
     end
 
+    -- sources: multi-source build inputs (issue #41). A map of
+    -- name → { url, sha256 }; each source downloads, verifies, and
+    -- extracts into its own `$SRC/<name>/` tree. Mutually exclusive with
+    -- `source` (one tree at the build root vs named trees). Unlike
+    -- `source`, sha256 is REQUIRED per entry — a multi-source build
+    -- declares its inputs explicitly, so there is no TOFU story for a
+    -- hash nobody pinned.
+    if opts.sources ~= nil then
+        if opts.source ~= nil then
+            error("snap(): 'source' and 'sources' are mutually exclusive — use one tree or named trees, not both", 2)
+        end
+        if type(opts.sources) ~= "table" then
+            error("snap(): 'sources' must be a table of name → { url, sha256 }, got " .. type(opts.sources), 2)
+        end
+        local count = 0
+        for name, spec in pairs(opts.sources) do
+            count = count + 1
+            if type(name) ~= "string" or name == "" or name == "." or name == ".." or name:find("/", 1, true) then
+                error(string.format(
+                    "snap(): sources['%s']: source names must be plain directory names (no '/', '.', '..')",
+                    tostring(name)), 2)
+            end
+            if name == "source" then
+                error("snap(): sources['source'] — the name 'source' is reserved", 2)
+            end
+            if opts.parts ~= nil and opts.parts[name] ~= nil then
+                error(string.format(
+                    "snap(): sources['%s'] collides with parts['%s'] — source trees and part work dirs share the build tree",
+                    name, name), 2)
+            end
+            if type(spec) ~= "table" then
+                error(string.format("snap(): sources['%s'] must be a table { url, sha256 }, got %s", name, type(spec)), 2)
+            end
+            if type(spec.url) ~= "string" then
+                error(string.format("snap(): sources['%s'].url must be a string, got %s", name, type(spec.url)), 2)
+            end
+            if type(spec.sha256) ~= "string" then
+                error(string.format(
+                    "snap(): sources['%s'].sha256 is required and must be a string (multi-source builds are always hash-pinned), got %s",
+                    name, type(spec.sha256)), 2)
+            end
+        end
+        if count == 0 then
+            error("snap(): 'sources' must not be empty — declare a 'source' instead", 2)
+        end
+    end
+
     -- inputs: table of name → { url } (package source, inspired by Nix inputs)
     if opts.inputs ~= nil then
         if type(opts.inputs) ~= "table" then

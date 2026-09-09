@@ -3052,6 +3052,7 @@ pod {
             description: None,
             license: None,
             source: None,
+            sources: None,
             build: None,
             parts: None,
             architectures: None,

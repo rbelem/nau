@@ -104,7 +104,14 @@ pub struct BuildClosure {
     /// SHA-256 over `name:version:url` (`none` for meta/store packages).
     /// The tarball content hash is pinned separately in `shuttle.lock` and
     /// verified at download time, so the key never needs the download.
+    /// Multi-source snaps (issue #41) fold every named source's
+    /// name/url/hash into this component.
     pub source: String,
+    /// Multi-source closure members (issue #41), sorted by name — the
+    /// explicit, diff-legible mirror of the identity folded into
+    /// `source`. Empty for single-source and meta/store packages (kept
+    /// out of the canonical JSON so their keys stay byte-identical).
+    pub sources: Vec<SourceClosureMember>,
     /// Canonical parts JSON ([`canonical_parts_json`]); empty when no parts.
     pub parts: String,
     /// Cross-compilation target triplet, or `native`.
@@ -136,8 +143,23 @@ impl BuildClosure {
             .as_ref()
             .map(canonical_parts_json)
             .unwrap_or_default();
+        // Multi-source identity (issue #41): every named source's url +
+        // pinned hash joins the closure, so a changed or swapped source
+        // invalidates the key. BTreeMap iteration is sorted, so the JSON
+        // is canonical.
+        let sources: Vec<SourceClosureMember> = meta
+            .sources
+            .iter()
+            .flatten()
+            .map(|(name, spec)| SourceClosureMember {
+                name: name.clone(),
+                url: spec.url().to_string(),
+                sha256: spec.expected_sha256().unwrap_or_default().to_string(),
+            })
+            .collect();
         BuildClosure {
             source: source_identity_hash(meta),
+            sources,
             parts,
             target: meta
                 .target
@@ -153,21 +175,45 @@ impl BuildClosure {
         let member = |m: &RequiresMember| serde_json::json!({ "name": m.name, "pin": m.pin, "hash": m.hash });
         let requires: Vec<serde_json::Value> = self.requires.iter().map(member).collect();
         let build_deps: Vec<serde_json::Value> = self.build_deps.iter().map(member).collect();
-        serde_json::json!({
+        let mut json = serde_json::json!({
             "format_version": CLOSURE_FORMAT_VERSION,
             "source": self.source,
             "parts": self.parts,
             "target": self.target,
             "requires": requires,
             "build_deps": build_deps,
-        })
-        .to_string()
+        });
+        // Multi-source members fold in only when present: single-source
+        // packages keep byte-identical keys (and the `source` component
+        // already hashes multi-source identity via
+        // [`source_identity_hash`], so the explicit list is redundancy
+        // that makes key diffs legible, not correctness load-bearing).
+        if !self.sources.is_empty() {
+            json["sources"] = serde_json::Value::Array(
+                self.sources
+                    .iter()
+                    .map(
+                        |s| serde_json::json!({ "name": s.name, "url": s.url, "sha256": s.sha256 }),
+                    )
+                    .collect(),
+            );
+        }
+        json.to_string()
     }
 
     /// Version-prefixed cache key: `v2:<sha256 of canonical JSON>`.
     pub fn cache_key(&self) -> String {
         format!("{}:{}", KEY_PREFIX, sha256_hex(&self.canonical_json()))
     }
+}
+
+/// One multi-source closure member (issue #41): a named source's identity
+/// as it participates in the cache key.
+#[derive(Debug, Clone)]
+pub struct SourceClosureMember {
+    pub name: String,
+    pub url: String,
+    pub sha256: String,
 }
 
 /// Resolve a requires member from lockfile data only (no I/O, safe offline).
@@ -185,9 +231,25 @@ pub fn pinned_member(name: &str, lock: &crate::lock::LockFile) -> Option<Require
 /// meta/store packages). This is the source component of the closure — the
 /// parts spec is hashed separately, and the downloaded tarball's content
 /// hash is pinned in `shuttle.lock` and verified at download time.
+///
+/// Multi-source snaps (issue #41) fold each named source's
+/// `name=url:sha256` into the identity (sorted, BTreeMap order): every
+/// entry is hash-pinned by definition, so a changed pin invalidates the
+/// key even before any download happens.
 fn source_identity_hash(meta: &SnapMeta) -> String {
     match meta.type_ {
         Some(ref t) if t == "source" => {
+            if let Some(sources) = &meta.sources {
+                let mut acc = format!("{}:{}", meta.name, meta.version);
+                for (name, spec) in sources {
+                    acc.push_str(&format!(
+                        "|{name}={}:{}",
+                        spec.url(),
+                        spec.expected_sha256().unwrap_or_default()
+                    ));
+                }
+                return sha256_hex(&acc);
+            }
             let url = meta
                 .source
                 .as_ref()
@@ -484,6 +546,7 @@ mod tests {
             description: None,
             license: None,
             source: Some(crate::snap::SourceSpec::Unverified(url.into())),
+            sources: None,
             build: Some("make".into()),
             parts: None,
             architectures: Some(vec!["amd64".into()]),
@@ -523,6 +586,7 @@ mod tests {
             description: None,
             license: None,
             source: None,
+            sources: None,
             build: None,
             parts: None,
             architectures: Some(vec!["amd64".into()]),
@@ -661,6 +725,50 @@ mod tests {
             BuildClosure::for_meta(&meta, vec![], vec![]).cache_key(),
             BuildClosure::for_meta(&changed, vec![], vec![]).cache_key()
         );
+    }
+
+    #[test]
+    fn test_closure_key_varies_with_multi_source_change() {
+        use std::collections::BTreeMap;
+        let make_multi = |one_hash: &str| {
+            let mut meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+            meta.source = None;
+            meta.sources = Some(BTreeMap::from([
+                (
+                    "one".into(),
+                    crate::snap::SourceSpec::Pinned {
+                        url: "https://example.com/one.tar.gz".into(),
+                        sha256: one_hash.into(),
+                    },
+                ),
+                (
+                    "two".into(),
+                    crate::snap::SourceSpec::Pinned {
+                        url: "https://example.com/two.tar.gz".into(),
+                        sha256: "bbbb".into(),
+                    },
+                ),
+            ]));
+            meta
+        };
+        let changed =
+            make_multi("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+        let original =
+            make_multi("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+        let key_orig = BuildClosure::for_meta(&original, vec![], vec![]).cache_key();
+        let key_changed = BuildClosure::for_meta(&changed, vec![], vec![]).cache_key();
+        // One source's pin change invalidates the key.
+        assert_ne!(key_orig, key_changed);
+        // Both keys are deterministic.
+        assert_eq!(
+            key_orig,
+            BuildClosure::for_meta(&original, vec![], vec![]).cache_key()
+        );
+        // The canonical JSON carries the explicit per-source pins (sorted
+        // by name), so a key diff is legible.
+        let json = BuildClosure::for_meta(&original, vec![], vec![]).canonical_json();
+        assert!(json.contains("\"one\""), "json: {json}");
+        assert!(json.contains("\"two\""), "json: {json}");
     }
 
     #[test]
@@ -1096,7 +1204,7 @@ mod tests {
         let result = BuildResult {
             snap_filename: "hello_1.0_amd64.snap".into(),
             version: "1.0".into(),
-            source_info: None,
+            source_infos: Vec::new(),
         };
 
         cache
@@ -1126,7 +1234,7 @@ mod tests {
         let result = BuildResult {
             snap_filename: "hello_1.0_amd64.snap".into(),
             version: "1.0".into(),
-            source_info: None,
+            source_infos: Vec::new(),
         };
 
         let closure = BuildClosure::for_meta(&meta, vec![], vec![]);
@@ -1167,7 +1275,7 @@ mod tests {
         let result = BuildResult {
             snap_filename: "build-deps_1.0_amd64.snap".into(),
             version: "1.0".into(),
-            source_info: None,
+            source_infos: Vec::new(),
         };
         cache
             .store(&meta, &result, output_dir.path(), &closure)
@@ -1191,7 +1299,7 @@ mod tests {
         let result = BuildResult {
             snap_filename: "hello_1.0_amd64.snap".into(),
             version: "1.0".into(),
-            source_info: None,
+            source_infos: Vec::new(),
         };
         cache
             .store(&meta, &result, output_dir.path(), &closure)

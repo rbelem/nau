@@ -364,6 +364,7 @@ mod tests {
             description: None,
             license: None,
             source: None,
+            sources: None,
             build: Some("make".into()),
             parts: None,
             architectures: Some(vec!["amd64".into()]),

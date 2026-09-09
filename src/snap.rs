@@ -99,8 +99,9 @@ pub struct BuildResult {
     /// version extracted at build time for adopt-info snaps (the declared
     /// placeholder never reaches the filename).
     pub version: String,
-    /// Source info if a source was downloaded and processed.
-    pub source_info: Option<SourceInfo>,
+    /// Source info per materialized source (one for a single `source`;
+    /// one per named tree for a `sources` map).
+    pub source_infos: Vec<SourceInfo>,
 }
 
 // ── Package inputs (inspired by Nix flake inputs) ──
@@ -176,6 +177,14 @@ pub struct SnapMeta {
     /// (`sources:`) and the binary-cache closure instead.
     #[serde(skip)]
     pub source: Option<SourceSpec>,
+
+    /// Multi-source build inputs (issue #41): name → pinned source. Each
+    /// entry downloads, verifies, and extracts into `$SRC/<name>/`.
+    /// Mutually exclusive with `source` (enforced in the DSL, re-checked
+    /// at the parse boundary). Build-time only — snap.yaml has no such
+    /// key; identity lives in the lockfile and the cache closure.
+    #[serde(default, skip)]
+    pub sources: Option<BTreeMap<String, SourceSpec>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub architectures: Option<Vec<String>>,
@@ -684,6 +693,14 @@ impl SnapMeta {
         let description = get_opt_string(table, "description")?;
         let license = get_opt_string(table, "license")?;
         let source = get_source_spec(table)?;
+        let sources = get_sources_spec(table)?;
+        // One build tree shape at a time: a single tree at the build root
+        // (`source`) or named trees under `$SRC` (`sources`) — never both.
+        if source.is_some() && sources.is_some() {
+            return Err(miette::miette!(
+                "snap meta: 'source' and 'sources' are mutually exclusive — use one tree or named trees, not both"
+            ));
+        }
         let grade = get_opt_string(table, "grade")?.unwrap_or_else(default_grade);
         let confinement = get_opt_string(table, "confinement")?.unwrap_or_else(default_confinement);
         let architectures = get_opt_string_array(table, "architectures")?;
@@ -730,9 +747,19 @@ impl SnapMeta {
         // A dependency closure resolves from the source tree (the lockfile
         // ships in the source tarball), so `deps` without `source` can
         // never fetch. Fail at the parse boundary, not mid-fetch.
+        // Multi-source (`sources`) has no single tree for a lockfile to
+        // ship in — the single-source requirement covers it too.
         if deps.is_some() && source.is_none() {
             return Err(miette::miette!(
                 "snap meta: 'deps' requires 'source' — the lockfile resolves from the package source tree"
+            ));
+        }
+        // The adopt-info ladder reads ONE pinned source tree (its
+        // extractors resolve relative to `$SRC`). With named sources there
+        // is no single tree to read — reject instead of guessing.
+        if adopt_info.is_some() && sources.is_some() {
+            return Err(miette::miette!(
+                "snap meta: 'adopt_info' is not supported with 'sources' — the adoption ladder reads a single source tree"
             ));
         }
         let floating = match table.get::<mlua::Value>("floating") {
@@ -778,6 +805,7 @@ impl SnapMeta {
             description,
             license,
             source,
+            sources,
             build,
             parts,
             architectures,
@@ -1236,6 +1264,71 @@ fn get_source_spec(table: &mlua::Table) -> miette::Result<Option<SourceSpec>> {
             other.type_name()
         )),
     }
+}
+
+/// Extract `sources` — the multi-source build-input map (issue #41):
+/// `{ <name> = { url, sha256 }, ... }`. Unlike `source`, `sha256` is
+/// REQUIRED per entry: a multi-source build declares its inputs
+/// explicitly, so TOFU (trust-on-first-use) has no story for a hash
+/// nobody pinned. Names become directory names under the build tree, so
+/// they must be plain (no `/`, `.`, `..`) and never `source` — that name
+/// is reserved for the shared single-source tree of parts builds.
+/// Non-DSL constructors get the same validation the Lua DSL applies
+/// (ADR-0002: Lua is the schema source of truth; Rust re-checks because
+/// it is a passive consumer of pre-validated tables only in the DSL path).
+fn get_sources_spec(table: &mlua::Table) -> miette::Result<Option<BTreeMap<String, SourceSpec>>> {
+    let value: Value = table.get("sources").unwrap_or(Value::Nil);
+    match value {
+        Value::Nil => Ok(None),
+        Value::Table(t) => {
+            let mut map = BTreeMap::new();
+            for pair in t.pairs::<String, Value>() {
+                let (name, value) = pair.map_err(|e| miette::miette!("sources entry: {e}"))?;
+                validate_source_name(&name)?;
+                let Value::Table(spec) = value else {
+                    return Err(miette::miette!(
+                        "sources['{name}'] must be a table {{ url, sha256 }}, got {}",
+                        value.type_name()
+                    ));
+                };
+                let url: String = spec.get("url").map_err(|_| {
+                    miette::miette!("sources['{name}']: missing required 'url' field")
+                })?;
+                let sha256: String = spec.get("sha256").map_err(|_| {
+                    miette::miette!(
+                        "sources['{name}'].sha256 is required (multi-source builds are always hash-pinned)"
+                    )
+                })?;
+                map.insert(name, SourceSpec::Pinned { url, sha256 });
+            }
+            if map.is_empty() {
+                return Err(miette::miette!(
+                    "'sources' must not be empty — declare a 'source' instead"
+                ));
+            }
+            Ok(Some(map))
+        }
+        other => Err(miette::miette!(
+            "'sources' must be a table of name → {{ url, sha256 }}, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// Source (and part) names become directory names under the build tree;
+/// keep them plain, and reserve the shared source dir name.
+fn validate_source_name(name: &str) -> miette::Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(miette::miette!(
+            "invalid source name '{name}': must be a plain directory name (no '/', '.', '..')"
+        ));
+    }
+    if name == SOURCE_DIR_NAME {
+        return Err(miette::miette!(
+            "invalid source name '{name}': reserved for the shared build source directory"
+        ));
+    }
+    Ok(())
 }
 
 fn get_opt_string_map(
@@ -2938,7 +3031,7 @@ pub fn build_snap(
     Ok(BuildResult {
         snap_filename: output_filename,
         version: arch_meta.version.clone(),
-        source_info: outcome.source,
+        source_infos: outcome.sources,
     })
 }
 
@@ -2951,7 +3044,9 @@ const SOURCE_DIR_NAME: &str = "source";
 /// adopt-info metadata extracted from the built part, if any.
 #[derive(Debug, Default)]
 struct BuildOutcome {
-    source: Option<SourceInfo>,
+    /// One entry per materialized source (single `source` → one entry;
+    /// `sources` map → one per named tree).
+    sources: Vec<SourceInfo>,
     adopted: Option<AdoptedMeta>,
 }
 
@@ -3013,6 +3108,33 @@ fn run_build(
                 "adopt-info names part '{part}' but the snap has no parts (adopt-info refers to a parts: entry)"
             ));
         }
+    }
+
+    // Multi-source mode (issue #41): every declared source downloads,
+    // verifies, and extracts into its own `$SRC/<name>/` tree, then
+    // execution proceeds exactly as single-source — the build script
+    // (or each part) addresses each tree at `$SRC/<name>`. The parse
+    // boundary guarantees mutual exclusion with `source`; re-checked
+    // here for non-DSL constructors.
+    if meta.source.is_some() && meta.sources.is_some() {
+        return Err(miette::miette!(
+            "snap has both 'source' and 'sources' — use one or the other"
+        ));
+    }
+    if let Some(sources) = &meta.sources {
+        if meta.adopt_info.is_some() {
+            return Err(miette::miette!(
+                "adopt-info is not supported with 'sources' — the adoption ladder reads a single source tree"
+            ));
+        }
+        return run_multi_source_build(
+            meta,
+            sources,
+            stage_dir,
+            stage_policy,
+            deps_dir,
+            build_prefix,
+        );
     }
 
     let source_spec = match &meta.source {
@@ -3174,11 +3296,194 @@ fn run_build(
     let adopted = extract_adopted_meta(meta, &src_root, &abs_stage)?;
 
     Ok(BuildOutcome {
-        source: Some(SourceInfo {
+        sources: vec![SourceInfo {
             url: source_url.to_string(),
             sha256: computed_sha256,
-        }),
+        }],
         adopted,
+    })
+}
+
+/// Multi-source build phase (issue #41): materialize every named source,
+/// then run the build plan exactly like the single-source flow.
+///
+/// Materialization contract, per entry (sorted by name — BTreeMap order):
+/// download with curl, verify the pinned SHA-256 (mandatory — the parse
+/// boundary and the DSL both reject unpinned entries), then land the tree
+/// at `<build-tree>/<name>/`. Tarballs extract with the same single-top-dir
+/// flattening the single-source path applies via `find_source_root`, so
+/// `foo-1.2.tar.gz` unpacked under source name `foo` puts its contents at
+/// `$SRC/foo/` — not `$SRC/foo/foo-1.2/`. Non-tarball entries (a .deb, a
+/// bare binary) land as the file `$SRC/<name>` — addressable by exactly
+/// the name the build script declared.
+///
+/// `$SRC` points at the build tree root, so the build script addresses
+/// each tree at `$SRC/<name>`. In parts mode every part sees the same
+/// `$SRC` (trees are siblings of part work dirs; name collisions are
+/// rejected in the DSL and at the parse boundary). `cwd` is the build
+/// tree root in single-part mode.
+fn run_multi_source_build(
+    meta: &SnapMeta,
+    sources: &std::collections::BTreeMap<String, SourceSpec>,
+    stage_dir: &Path,
+    stage_policy: StagePolicy,
+    deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
+) -> miette::Result<BuildOutcome> {
+    let build_dir = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
+    let build_path = build_dir.path();
+
+    let mut infos = Vec::with_capacity(sources.len());
+    for (name, spec) in sources {
+        // A source tree and a part work dir share the build tree: a name
+        // collision would overwrite. The DSL rejects it; this is the
+        // non-DSL constructor backstop.
+        if meta.parts.as_ref().is_some_and(|p| p.contains_key(name)) {
+            return Err(miette::miette!(
+                "source '{name}' collides with a part of the same name — source trees and part work dirs share the build tree"
+            ));
+        }
+        infos.push(fetch_and_extract_source(name, spec, build_path)?);
+    }
+
+    // Stage hygiene mirrors the single-source path: wipe shuttle-owned
+    // scratch stage, never an explicit --stage.
+    if stage_policy == StagePolicy::Default {
+        clear_stage_dir(stage_dir)?;
+    }
+    std::fs::create_dir_all(stage_dir)
+        .map_err(|e| miette::miette!("failed to create stage dir: {}", e))?;
+    let abs_stage = std::fs::canonicalize(stage_dir).unwrap_or_else(|_| stage_dir.to_path_buf());
+
+    if let Some(parts) = &meta.parts {
+        run_parts(
+            parts,
+            build_path,
+            build_path,
+            &abs_stage,
+            meta.target.as_deref(),
+            deps_dir,
+            build_prefix,
+        )?;
+    } else {
+        let build_cmd = meta.build.as_deref().ok_or_else(|| {
+            miette::miette!("internal: neither parts nor build plan for {}", meta.name)
+        })?;
+        let build_spinner = output::spinner(&format!("building {}...", meta.name));
+        run_build_command(
+            build_cmd,
+            build_path,
+            build_path,
+            build_path,
+            &abs_stage,
+            meta.target.as_deref(),
+            None,
+            &[],
+            deps_dir,
+            build_prefix,
+        )?;
+        output::finish_ok(&build_spinner, &format!("built {}", meta.name));
+    }
+
+    Ok(BuildOutcome {
+        sources: infos,
+        adopted: None,
+    })
+}
+
+/// Download, verify, and extract one named source into `<build>/<name>`
+/// (see [`run_multi_source_build`] for the layout contract).
+fn fetch_and_extract_source(
+    name: &str,
+    spec: &SourceSpec,
+    build_path: &Path,
+) -> miette::Result<SourceInfo> {
+    let url = spec.url();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(miette::miette!(
+            "sources['{name}'] requires an http(s) URL, got: {url}"
+        ));
+    }
+    // The parse boundary and the DSL both require a pinned hash; this is
+    // the last line of defense for non-DSL constructors.
+    let Some(expected) = spec.expected_sha256() else {
+        return Err(miette::miette!(
+            "sources['{name}'] must be sha256-pinned: multi-source builds are always hash-verified"
+        ));
+    };
+
+    // Download to a hidden scratch name so it can never collide with a
+    // source tree directory.
+    let tarball = build_path.join(format!(".dl-{name}.download"));
+    let dl_spinner = output::spinner(&format!("downloading source '{name}'..."));
+    let status = std::process::Command::new("curl")
+        .args(["-fsSL", "-o", &tarball.to_string_lossy(), url])
+        .status()
+        .map_err(|e| miette::miette!("curl not found: {}", e))?;
+    if !status.success() {
+        output::finish_err(&dl_spinner, &format!("download failed: {name}"));
+        return Err(miette::miette!(
+            "failed to download {url} (source '{name}')"
+        ));
+    }
+    output::finish_ok(&dl_spinner, &format!("downloaded source '{name}'"));
+
+    let computed = sha256_file(&tarball)?;
+    if computed != expected {
+        return Err(miette::miette!(
+            "SHA-256 mismatch for source '{name}' ({url}):\n  expected: {expected}\n  got:      {computed}"
+        ));
+    }
+    output::ok(format!(
+        "SHA-256 verified for '{name}': {:.16}...",
+        computed
+    ));
+
+    let target = build_path.join(name);
+    let filename = url.rsplit('/').next().unwrap_or("source");
+    let is_tarball = filename.ends_with(".tar.gz")
+        || filename.ends_with(".tar.xz")
+        || filename.ends_with(".tgz");
+    if is_tarball {
+        // Extract into a hidden scratch dir, then flatten the single
+        // top-level dir (if any) onto `<build>/<name>` — one rename in
+        // both cases.
+        let scratch = build_path.join(format!(".extract-{name}"));
+        std::fs::create_dir_all(&scratch)
+            .map_err(|e| miette::miette!("failed to create extract dir for '{name}': {}", e))?;
+        let xtract_spinner = output::spinner(&format!("extracting source '{name}'..."));
+        let status = std::process::Command::new("tar")
+            .arg("xaf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(&scratch)
+            .status()
+            .map_err(|e| miette::miette!("tar not found: {}", e))?;
+        if !status.success() {
+            output::finish_err(&xtract_spinner, &format!("extraction failed: {name}"));
+            return Err(miette::miette!(
+                "failed to extract {filename} (source '{name}')"
+            ));
+        }
+        output::finish_ok(&xtract_spinner, &format!("extracted source '{name}'"));
+        match find_source_root(&scratch) {
+            Some(top) => std::fs::rename(&top, &target)
+                .map_err(|e| miette::miette!("failed to move source tree '{name}': {}", e))?,
+            None => std::fs::rename(&scratch, &target)
+                .map_err(|e| miette::miette!("failed to move source tree '{name}': {}", e))?,
+        }
+        let _ = std::fs::remove_dir(&scratch);
+    } else {
+        // Non-tarball (a .deb, a bare binary): the file lands AT
+        // `$SRC/<name>`, addressable by its declared source name.
+        std::fs::rename(&tarball, &target)
+            .map_err(|e| miette::miette!("failed to move source '{name}': {}", e))?;
+    }
+
+    Ok(SourceInfo {
+        url: url.to_string(),
+        sha256: computed,
     })
 }
 
@@ -5270,8 +5575,8 @@ mod tests {
 
         let build_result = result.unwrap();
         assert_eq!(build_result.snap_filename, "test-snap_0.1.0_amd64.snap");
-        // No source pinned, so source_info is None
-        assert!(build_result.source_info.is_none());
+        // No source pinned, so source_infos is empty
+        assert!(build_result.source_infos.is_empty());
 
         let snap_path = output_dir.path().join(&build_result.snap_filename);
         assert!(
@@ -7377,6 +7682,372 @@ mod tests {
         assert!(err.contains("'parts' must not be empty"), "got: {err}");
     }
 
+    // ── Issue #41: multi-source build inputs ──
+
+    /// Serve a directory's files over loopback HTTP and return the port.
+    /// The thread runs for the process's lifetime (tests are not
+    /// concurrent enough to exhaust the listener's backlog).
+    fn serve_dir(dir: &Path) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let root = dir.to_path_buf();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                loop {
+                    use std::io::Read;
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&data);
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                use std::io::Write;
+                let mut file = root.join(path.trim_start_matches('/'));
+                if file.is_dir() {
+                    file = file.join("index.html");
+                }
+                let (status, body) = match std::fs::read(&file) {
+                    Ok(b) => ("200 OK", b),
+                    Err(_) => ("404 Not Found", b"not found".to_vec()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    /// Make a tarball in `dir` containing exactly one top-level directory
+    /// `top/` with a single file `echo.txt`; returns the tarball bytes.
+    fn make_single_root_tarball(dir: &Path, top: &str) -> Vec<u8> {
+        let payload = dir.join("payload");
+        std::fs::create_dir_all(payload.join(top)).unwrap();
+        std::fs::write(payload.join(top).join("echo.txt"), top).unwrap();
+        let tar = std::process::Command::new("tar")
+            .args(["czf", "-", "-C"])
+            .arg(&payload)
+            .arg(top)
+            .output()
+            .unwrap();
+        assert!(tar.status.success(), "tar failed");
+        tar.stdout
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let d = sha2::Sha256::digest(bytes);
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Build a SnapMeta with a two-source declaration and a build command
+    /// that asserts both trees are present at `$SRC/<name>/`.
+    fn two_source_meta(env: &LuaEnv, port: u16, h1: &str, h2: &str) -> SnapMeta {
+        let table = env
+            .eval(&format!(
+                r#"
+            return {{
+                default = snap {{
+                    name = "two-src",
+                    version = "1.0",
+                    type = "source",
+                    sources = {{
+                        foo = {{ url = "http://127.0.0.1:{port}/foo.tar.gz", sha256 = "{h1}" }},
+                        bar = {{ url = "http://127.0.0.1:{port}/bar.tar.gz", sha256 = "{h2}" }},
+                    }},
+                    build = 'test -d "$SRC/foo" && test -d "$SRC/bar" && touch "$STAGE/ok"',
+                }},
+            }}
+            "#,
+            ))
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        SnapMeta::from_lua_table(&default_table).unwrap()
+    }
+
+    #[test]
+    fn test_multi_source_parse_roundtrip() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "multi",
+                    version = "1.0",
+                    type = "source",
+                    sources = {
+                        one = { url = "http://example.com/one.tar.gz", sha256 = "aaaa" },
+                        two = { url = "http://example.com/two.tar.gz", sha256 = "bbbb" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let sources = meta.sources.as_ref().expect("sources parsed");
+        assert_eq!(sources.len(), 2);
+        assert!(sources["one"].expected_sha256().is_some());
+        assert!(sources["two"].expected_sha256().is_some());
+        // BTreeMap order is sorted by name.
+        assert_eq!(sources.keys().next().map(String::as_str), Some("one"));
+        // Not emitted into snap.yaml (build-time only).
+        let yaml = meta.to_yaml().unwrap();
+        assert!(!yaml.contains("sources:"));
+    }
+
+    #[test]
+    fn test_multi_source_rejects_alongside_single_source() {
+        // The DSL rejects the declaration, but the Rust boundary must too
+        // (a non-DSL constructor could produce both). Build a raw table
+        // bypassing the DSL so the Rust conversion receives both keys.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = {
+                    name = "conflict", version = "1.0",
+                    source = { url = "http://example.com/a.tar.gz" },
+                    sources = { a = { url = "http://example.com/b.tar.gz", sha256 = "cc" } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn test_multi_source_rejects_empty_map() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = {
+                    name = "empty", version = "1.0",
+                    sources = {},
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'sources' must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn test_multi_source_rejects_missing_sha256() {
+        let env = LuaEnv::new();
+        // The Lua DSL rejects unpinned entries before Rust sees them.
+        let result: Result<mlua::Value, mlua::Error> = env
+            .lua
+            .load(
+                r#"
+            return snap {
+                name = "unpinned", version = "1.0",
+                sources = { a = { url = "http://example.com/a.tar.gz" } },
+            }
+            "#,
+            )
+            .eval();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("sha256"), "got: {err}");
+    }
+
+    #[test]
+    fn test_fetch_and_extract_source_flat_lands_at_name_dir() {
+        // `find_source_root` flattening: foo-1.2.tar.gz with a single
+        // top-level dir lands at `<build>/<name>`/ contents, NOT
+        // <build>/<name>/<name>-1.2/.
+        let server = tempfile::tempdir().unwrap();
+        let bytes = make_single_root_tarball(server.path(), "foo-1.2");
+        std::fs::write(server.path().join("foo.tar.gz"), &bytes).unwrap();
+        let port = serve_dir(server.path());
+        let hash = sha256_hex(&bytes);
+
+        let build = tempfile::tempdir().unwrap();
+        let spec = SourceSpec::Pinned {
+            url: format!("http://127.0.0.1:{port}/foo.tar.gz"),
+            sha256: hash.clone(),
+        };
+        let info = fetch_and_extract_source("foo", &spec, build.path()).unwrap();
+        assert_eq!(info.url, spec.url());
+        assert_eq!(info.sha256, hash);
+        // The flattening landed the *contents* of foo-1.2 at $SRC/foo.
+        assert!(build.path().join("foo/echo.txt").exists());
+        assert!(!build.path().join("foo/foo-1.2").exists());
+    }
+
+    #[test]
+    fn test_fetch_and_extract_source_non_tarball_lands_as_file() {
+        let server = tempfile::tempdir().unwrap();
+        let bytes = b"deb-data-placeholder".to_vec();
+        std::fs::write(server.path().join("deps.deb"), &bytes).unwrap();
+        let port = serve_dir(server.path());
+        let hash = sha256_hex(&bytes);
+
+        let build = tempfile::tempdir().unwrap();
+        let spec = SourceSpec::Pinned {
+            url: format!("http://127.0.0.1:{port}/deps.deb"),
+            sha256: hash.clone(),
+        };
+        let info = fetch_and_extract_source("deps", &spec, build.path()).unwrap();
+        assert_eq!(info.sha256, hash);
+        // Non-tarball lands at $SRC/<name> as the file itself, addressable
+        // by its declared source name.
+        assert_eq!(std::fs::read(build.path().join("deps")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn test_fetch_and_extract_source_hash_mismatch_fails() {
+        let server = tempfile::tempdir().unwrap();
+        let bytes = make_single_root_tarball(server.path(), "pkg");
+        std::fs::write(server.path().join("pkg.tar.gz"), &bytes).unwrap();
+        let port = serve_dir(server.path());
+
+        let build = tempfile::tempdir().unwrap();
+        let spec = SourceSpec::Pinned {
+            url: format!("http://127.0.0.1:{port}/pkg.tar.gz"),
+            sha256: "deadbeef".repeat(8), // wrong
+        };
+        let err = fetch_and_extract_source("pkg", &spec, build.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SHA-256 mismatch"), "got: {err}");
+        assert!(err.contains("expected: deadbeef"), "got: {err}");
+    }
+
+    #[test]
+    fn test_run_build_two_source_materialization() {
+        // Full two-source build: both trees present at $SRC/<name>/; the
+        // build command verifies and writes into the stage. This is the
+        // acceptance demo of the mechanism.
+        let server = tempfile::tempdir().unwrap();
+        let foo = make_single_root_tarball(server.path(), "foo-1.0");
+        let bar = make_single_root_tarball(server.path(), "bar-2.0");
+        std::fs::write(server.path().join("foo.tar.gz"), &foo).unwrap();
+        std::fs::write(server.path().join("bar.tar.gz"), &bar).unwrap();
+        let port = serve_dir(server.path());
+        let h1 = sha256_hex(&foo);
+        let h2 = sha256_hex(&bar);
+
+        let env = LuaEnv::new();
+        let meta = two_source_meta(&env, port, &h1, &h2);
+
+        let stage = tempfile::tempdir().unwrap();
+        let outcome = run_build(&meta, stage.path(), StagePolicy::Default, None, None).unwrap();
+        // Two source infos recorded — one per named source, in BTreeMap
+        // (sorted-by-name) order.
+        assert_eq!(outcome.sources.len(), 2);
+        assert_eq!(
+            outcome.sources[0].url,
+            format!("http://127.0.0.1:{port}/bar.tar.gz")
+        );
+        assert_eq!(
+            outcome.sources[1].url,
+            format!("http://127.0.0.1:{port}/foo.tar.gz")
+        );
+        assert_eq!(outcome.sources[0].sha256, h2);
+        assert_eq!(outcome.sources[1].sha256, h1);
+        // The build command's `touch $STAGE/ok` ran (both trees were seen).
+        assert!(stage.path().join("ok").exists());
+    }
+
+    #[test]
+    fn test_run_build_two_source_hash_mismatch_fails_precisely() {
+        let server = tempfile::tempdir().unwrap();
+        let foo = make_single_root_tarball(server.path(), "foo-1.0");
+        let bar = make_single_root_tarball(server.path(), "bar-2.0");
+        std::fs::write(server.path().join("foo.tar.gz"), &foo).unwrap();
+        std::fs::write(server.path().join("bar.tar.gz"), &bar).unwrap();
+        let port = serve_dir(server.path());
+        let h1 = sha256_hex(&foo);
+        let h2 = sha256_hex(&bar);
+
+        let env = LuaEnv::new();
+        // Corrupt hash for the SECOND source: the error must name it
+        // precisely (and its pin) after a real download.
+        let mut meta = two_source_meta(&env, port, &h1, &h2);
+        let wrong = "feedfacedeadbeef".repeat(8);
+        let sources = meta.sources.as_mut().unwrap();
+        *sources.get_mut("bar").unwrap() = SourceSpec::Pinned {
+            url: format!("http://127.0.0.1:{port}/bar.tar.gz"),
+            sha256: wrong,
+        };
+
+        let stage = tempfile::tempdir().unwrap();
+        let err = run_build(&meta, stage.path(), StagePolicy::Default, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("source 'bar'"), "got: {err}");
+        assert!(err.contains("SHA-256 mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn test_multi_source_rejects_bad_names() {
+        let env = LuaEnv::new();
+        for bad in ["a/b", "..", ".", "source"] {
+            // The Lua DSL rejects these names before Rust sees them; for
+            // the ones it lets through, the Rust boundary must catch.
+            let result: Result<mlua::Value, mlua::Error> = env
+                .lua
+                .load(&format!(
+                    r#"
+                return snap {{
+                    name = "bad", version = "1.0",
+                    sources = {{ ["{bad}"] = {{ url = "http://x/a.tar.gz", sha256 = "aa" }} }},
+                }}
+                "#
+                ))
+                .eval();
+            match result {
+                Err(e) => {
+                    let err = e.to_string();
+                    assert!(
+                        err.contains("directory name") || err.contains("reserved"),
+                        "name '{bad}' should be rejected by the DSL, got: {err}"
+                    );
+                }
+                Ok(value) => {
+                    // DSL accepted it (or did not reach it); Rust must
+                    // reject at the parse boundary.
+                    let table = match value {
+                        Value::Table(t) => t,
+                        _ => panic!("expected table"),
+                    };
+                    let err = SnapMeta::from_lua_table(&table).unwrap_err().to_string();
+                    assert!(
+                        err.contains("source name") || err.contains("reserved"),
+                        "name '{bad}' should be rejected, got: {err}"
+                    );
+                }
+            }
+        }
+    }
+
     // ── ADR-0014: built-in builder plugins ──
 
     #[test]
@@ -9038,6 +9709,7 @@ mod wrapper_tests {
             description: None,
             license: None,
             source: None,
+            sources: None,
             architectures: None,
             build: None,
             parts: None,

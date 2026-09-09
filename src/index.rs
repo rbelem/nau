@@ -355,6 +355,7 @@ impl PackageIndex {
                     sha256: sha,
                 })
                 .or_else(|| Some(SourceSpec::Unverified(source.url.clone()))),
+            sources: None,
             build: entry.build.clone(),
             parts: None,
             architectures: None,
