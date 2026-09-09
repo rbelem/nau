@@ -272,6 +272,13 @@ pub struct SnapMeta {
     #[serde(skip)]
     pub build_deps: Vec<String>,
 
+    /// Named post-build leak-scan exceptions (ADR-0018 Decision 3, issue
+    /// #22): exact-match entries that silence a detected build-only
+    /// reference. Exceptions stay greppable in the definition; a hit is
+    /// still visibly logged. Skipped in YAML — build metadata only.
+    #[serde(skip)]
+    pub leaks_ok: Vec<String>,
+
     /// Runtime confinement grants (ADR-0016, ticket #11). Present
     /// (`Some`) declares the package `confined`; absent is `unconfined`
     /// (the default for simple CLIs). Emitted into snap.yaml so it
@@ -691,6 +698,10 @@ impl SnapMeta {
         // treatment as `requires` (the Lua DSL checks the array; unknown
         // names are rejected at resolution, exactly like `requires` names).
         let build_deps: Vec<String> = table.get("build_deps").unwrap_or_default();
+        // Post-build leak-scan exceptions (ADR-0018 Decision 3): exact-match
+        // strings that silence a named build-only reference. Same array
+        // validation as the other name lists.
+        let leaks_ok: Vec<String> = table.get("leaks_ok").unwrap_or_default();
         // Plugin parts contribute extra requires (e.g. `cargo` pulls the
         // rust toolchain package) — expanded and deep-validated here so the
         // Rust boundary is the single choke point (ADR-0014 Decisions 3-4).
@@ -776,6 +787,7 @@ impl SnapMeta {
             aliases,
             requires,
             build_deps,
+            leaks_ok,
             target,
             toolchain,
             inputs,
@@ -2742,6 +2754,11 @@ fn is_shared_lib_name(name: &str) -> bool {
 /// prefix of `requires` + `build_deps` payloads (ADR-0018, issue #17),
 /// likewise bound read-only. Both are `None` for builds that need neither.
 ///
+/// `leak_scan` supplies the post-build leak scan's resolution data (ADR-0018
+/// Decision 3): which payloads are runtime members and which are build-only.
+/// `None` skips the scan (pod builds and other paths that do not yet wire
+/// the merged prefix).
+///
 /// Returns the output filename (not the full path).
 #[allow(clippy::too_many_arguments)]
 pub fn build_snap(
@@ -2753,6 +2770,7 @@ pub fn build_snap(
     pod_store: Option<&crate::runtime::RuntimeStore>,
     deps_dir: Option<&Path>,
     build_prefix: Option<&Path>,
+    leak_scan: Option<&crate::leak_scan::PayloadListings>,
 ) -> miette::Result<BuildResult> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
@@ -2778,6 +2796,19 @@ pub fn build_snap(
     // content-addressed store path. Only pod builds provide a store.
     if let Some(store) = pod_store {
         emit_build_wrappers(meta, stage_dir, store)?;
+    }
+
+    // 1b'. Post-build leak scan (ADR-0018 Decision 3, issue #22): after the
+    // package's staging completes, every produced file is scanned for
+    // references that resolve only into build-only payloads or into the
+    // merged build prefix ([`SANDBOX_BUILD_PREFIX`]). Hard error on a hit;
+    // `leaks_ok` entries silence named hits (visibly logged); a clean scan
+    // emits one status line. Runs when the build materialized a prefix (the
+    // `shuttle build` path); pod builds skip it until merged-prefix wiring
+    // lands there.
+    if let Some(listings) = leak_scan {
+        let report = crate::leak_scan::scan_stage(stage_dir, listings, &meta.leaks_ok)?;
+        report.enforce()?;
     }
 
     // Clone meta with architecture filtered to the target arch
@@ -4955,6 +4986,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -5019,6 +5051,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(snap_amd64.snap_filename, "multi-test_2.0_amd64.snap");
@@ -5031,6 +5064,7 @@ mod tests {
             output_dir.path(),
             "arm64",
             StagePolicy::Default,
+            None,
             None,
             None,
             None,
@@ -6528,6 +6562,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let snap_path = output_dir.path().join(&result.snap_filename);
@@ -7324,6 +7359,47 @@ mod tests {
         let default_table: mlua::Table = table.get("default").unwrap();
         let meta = SnapMeta::from_lua_table(&default_table).unwrap();
         assert!(meta.build_deps.is_empty());
+        assert!(meta.leaks_ok.is_empty());
+    }
+
+    #[test]
+    fn test_leaks_ok_parse() {
+        // ADR-0018 Decision 3 (issue #22): leaks_ok parses as a string
+        // array alongside requires/build_deps; build metadata only (never
+        // emitted to snap.yaml).
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "linked-app",
+                    version = "1.0",
+                    build_deps = { "ncurses", "pkgconf" },
+                    leaks_ok = {
+                        "/shuttle-build-prefix/usr/lib",
+                        "libncurses.so.6",
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(
+            meta.leaks_ok,
+            vec![
+                "/shuttle-build-prefix/usr/lib".to_string(),
+                "libncurses.so.6".to_string()
+            ]
+        );
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(
+            !yaml.contains("leaks_ok"),
+            "yaml must not carry leaks_ok: {yaml}"
+        );
     }
 
     #[test]
@@ -8214,6 +8290,7 @@ fi
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -8554,6 +8631,7 @@ mod wrapper_tests {
             aliases: Vec::new(),
             requires: Vec::new(),
             build_deps: Vec::new(),
+            leaks_ok: Vec::new(),
             inputs: None,
             target: None,
             toolchain: None,

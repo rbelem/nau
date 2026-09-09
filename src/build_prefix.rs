@@ -23,7 +23,7 @@
 //! the binary cache) is data-only unpacked with `unsquashfs` — never
 //! executed, never mounted.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// One dependency payload to merge: the source package name (for conflict
@@ -50,6 +50,46 @@ impl MergedPrefix {
     /// The `/usr`-like prefix tree to bind into the build sandbox.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Every payload's file basenames (recursive — sonames live in
+    /// `usr/lib`), keyed by source package name — the leak scan's
+    /// resolution data (ADR-0018 Decision 3): a DT_NEEDED soname must
+    /// resolve into a runtime payload, not a build-only one.
+    ///
+    /// Returns the per-package basenames at every depth under the unpacked
+    /// payload. The merged tree is read here; the per-package unpack dirs
+    /// live beside it.
+    pub fn payload_files(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut out = BTreeMap::new();
+        let Ok(payloads) = std::fs::read_dir(self.work.path().join("payloads")) else {
+            return out;
+        };
+        for entry in payloads.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let pkg = entry.file_name().to_string_lossy().into_owned();
+            let mut names = BTreeSet::new();
+            collect_basenames(&entry.path(), &mut names);
+            out.insert(pkg, names);
+        }
+        out
+    }
+}
+
+/// Recursively collect the basenames of every entry (files, dirs,
+/// symlinks) below `dir`.
+fn collect_basenames(dir: &Path, out: &mut BTreeSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        out.insert(name.clone());
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            collect_basenames(&entry.path(), out);
+        }
     }
 }
 
@@ -457,5 +497,32 @@ mod tests {
     fn empty_payload_list_yields_empty_prefix() {
         let merged = materialize_merged_prefix(&[]).unwrap();
         assert!(merged.path().is_dir());
+    }
+
+    /// payload_files lists every basename at every depth — the leak scan's
+    /// resolution data (ADR-0018 Decision 3). A soname lives in usr/lib, a
+    /// layer below the payload root.
+    #[test]
+    fn payload_files_lists_recursive_basenames() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = make_snap(
+            &tmp.path().join("libfoo"),
+            &[("usr/lib/libfoo.so.1", "x"), ("usr/include/libfoo.h", "h")],
+            &[("usr/lib/libfoo.so", "libfoo.so.1")],
+        );
+        let merged = materialize_merged_prefix(&[Payload {
+            pkg: "libfoo".into(),
+            snap,
+        }])
+        .unwrap();
+        let files = merged.payload_files();
+        let libfoo = files.get("libfoo").expect("libfoo payload listed");
+        assert!(libfoo.contains("libfoo.so.1"), "soname basename listed");
+        assert!(libfoo.contains("libfoo.so"), "symlink basename listed");
+        assert!(libfoo.contains("libfoo.h"), "header basename listed");
     }
 }

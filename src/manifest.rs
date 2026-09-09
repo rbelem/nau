@@ -22,7 +22,7 @@
 //!       "name": "demo-app",
 //!       "version": "1.2.3",
 //!       "archs": ["amd64"],
-//!       "closure_key": "v2:…64 hex…",
+//!       "closure_key": "v3:…64 hex…",
 //!       "artifact": { "state": "unbuilt" }
 //!     }
 //!   },
@@ -586,6 +586,9 @@ fn resolve_snap_pin(
 /// data only (mirrors the build path: lockfile pins win; unpinned deps pin
 /// by declared version with `hash: None`). A requires closure that cannot
 /// resolve at all is an unresolvable input — fail closed.
+///
+/// `build_deps` join the closure (ADR-0018 Decision 4, issue #22): a
+/// changed build dependency invalidates the key, matching the build path.
 fn closure_key_for(meta: &SnapMeta, lockfile: &LockFile) -> miette::Result<String> {
     let mut names: Vec<String> = if meta.requires.is_empty() {
         Vec::new()
@@ -600,7 +603,14 @@ fn closure_key_for(meta: &SnapMeta, lockfile: &LockFile) -> miette::Result<Strin
     names.sort();
     names.dedup();
     let requires = names.iter().map(|n| requires_member(n, lockfile)).collect();
-    Ok(crate::cache::BuildClosure::for_meta(meta, requires).cache_key())
+    let mut dep_names = meta.build_deps.clone();
+    dep_names.sort();
+    dep_names.dedup();
+    let build_deps = dep_names
+        .iter()
+        .map(|n| requires_member(n, lockfile))
+        .collect();
+    Ok(crate::cache::BuildClosure::for_meta(meta, requires, build_deps).cache_key())
 }
 
 /// One requires-closure member: lockfile pin when present (pure data),
@@ -704,6 +714,7 @@ mod tests {
             aliases: vec![],
             requires: vec![],
             build_deps: vec![],
+            leaks_ok: vec![],
             target: None,
             toolchain: None,
             inputs: None,
@@ -730,6 +741,7 @@ mod tests {
             snaps: HashMap::new(),
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         }
     }
 
@@ -1201,7 +1213,7 @@ mod tests {
         assert_eq!(entry.version.as_deref(), Some("1.2.3"));
         let key = entry.closure_key.as_deref().unwrap();
         assert!(
-            key.starts_with("v2:"),
+            key.starts_with("v3:"),
             "Phase 22a closure key required: {key}"
         );
         assert_eq!(entry.artifact.state, ArtifactState::Unbuilt);

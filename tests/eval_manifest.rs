@@ -180,7 +180,7 @@ fn eval_manifest_carries_version_inputs_outputs_images_signatures() {
         .as_str()
         .expect("closure key");
     assert!(
-        key.starts_with("v2:"),
+        key.starts_with("v3:"),
         "Phase 22a closure key required: {v}"
     );
     assert_eq!(v["outputs"]["app"]["artifact"]["state"], "unbuilt");
@@ -442,5 +442,5 @@ return { mylib = snap { name = "mylib", version = "0.1.0" } }
     let key = v["outputs"]["app"]["closure_key"]
         .as_str()
         .expect("closure key");
-    assert!(key.starts_with("v2:"), "{v}");
+    assert!(key.starts_with("v3:"), "{v}");
 }

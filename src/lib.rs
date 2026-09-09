@@ -13,6 +13,7 @@ pub mod farm;
 pub mod image;
 pub mod index;
 pub mod isolate;
+pub mod leak_scan;
 pub mod lint;
 pub mod lock;
 pub mod lua;

@@ -20,7 +20,7 @@
 //! Usage:
 //! ```rust,ignore
 //! let cache = PackageCache::new(Some("/path/to/cache"));
-//! let closure = BuildClosure::for_meta(&meta, requires);
+//! let closure = BuildClosure::for_meta(&meta, requires, build_deps);
 //! if let Some(path) = cache.lookup(&meta, "amd64", &closure) {
 //!     // use cached build
 //! } else {
@@ -53,8 +53,11 @@ const NO_SOURCE_HASH: &str = "none";
 /// Closure format version and cache-key prefix. These MUST move together:
 /// bump both when the closure schema changes so old entries can never be
 /// served for a new format (no silent key collisions across formats).
-const CLOSURE_FORMAT_VERSION: u32 = 2;
-const KEY_PREFIX: &str = "v2";
+///
+/// v3 adds `build_deps` to the closure (ADR-0018 Decision 4, issue #22):
+/// a changed build dependency must invalidate the cache key.
+const CLOSURE_FORMAT_VERSION: u32 = 3;
+const KEY_PREFIX: &str = "v3";
 
 /// Target value for builds without an explicit cross-compilation triplet.
 const NATIVE_TARGET: &str = "native";
@@ -88,9 +91,10 @@ pub struct RequiresMember {
 ///
 /// ```json
 /// {
-///   "format_version": 2,
+///   "format_version": 3,
 ///   "parts": "<canonical parts JSON>",
 ///   "requires": [{"hash": "…|null", "name": "…", "pin": "…|null"}],
+///   "build_deps": [{"hash": "…|null", "name": "…", "pin": "…|null"}],
 ///   "source": "<sha256 of name:version:url, or none>",
 ///   "target": "<triplet or native>"
 /// }
@@ -107,16 +111,26 @@ pub struct BuildClosure {
     pub target: String,
     /// Resolved requires closure, sorted by name, deduplicated.
     pub requires: Vec<RequiresMember>,
+    /// Resolved build_deps closure (ADR-0018 Decision 4), sorted by name,
+    /// deduplicated. A changed build dependency invalidates the key.
+    pub build_deps: Vec<RequiresMember>,
 }
 
 impl BuildClosure {
     /// Build the closure for a snap meta from resolved requires members.
     /// Members are sorted by name and deduplicated so dependency traversal
     /// order never affects the key.
-    pub fn for_meta(meta: &SnapMeta, requires: Vec<RequiresMember>) -> Self {
+    pub fn for_meta(
+        meta: &SnapMeta,
+        requires: Vec<RequiresMember>,
+        build_deps: Vec<RequiresMember>,
+    ) -> Self {
         let mut requires = requires;
         requires.sort_by(|a, b| a.name.cmp(&b.name));
         requires.dedup_by(|a, b| a.name == b.name);
+        let mut build_deps = build_deps;
+        build_deps.sort_by(|a, b| a.name.cmp(&b.name));
+        build_deps.dedup_by(|a, b| a.name == b.name);
         let parts = meta
             .parts
             .as_ref()
@@ -130,22 +144,22 @@ impl BuildClosure {
                 .clone()
                 .unwrap_or_else(|| NATIVE_TARGET.to_string()),
             requires,
+            build_deps,
         }
     }
 
     /// Deterministic canonical JSON serialization of the closure.
     pub fn canonical_json(&self) -> String {
-        let requires: Vec<serde_json::Value> = self
-            .requires
-            .iter()
-            .map(|m| serde_json::json!({ "name": m.name, "pin": m.pin, "hash": m.hash }))
-            .collect();
+        let member = |m: &RequiresMember| serde_json::json!({ "name": m.name, "pin": m.pin, "hash": m.hash });
+        let requires: Vec<serde_json::Value> = self.requires.iter().map(member).collect();
+        let build_deps: Vec<serde_json::Value> = self.build_deps.iter().map(member).collect();
         serde_json::json!({
             "format_version": CLOSURE_FORMAT_VERSION,
             "source": self.source,
             "parts": self.parts,
             "target": self.target,
             "requires": requires,
+            "build_deps": build_deps,
         })
         .to_string()
     }
@@ -489,6 +503,7 @@ mod tests {
             aliases: vec![],
             requires: vec![],
             build_deps: vec![],
+            leaks_ok: vec![],
             target: None,
             toolchain: None,
             inputs: None,
@@ -527,6 +542,7 @@ mod tests {
             aliases: vec![],
             requires: vec![],
             build_deps: vec![],
+            leaks_ok: vec![],
             target: None,
             toolchain: None,
             inputs: None,
@@ -557,16 +573,17 @@ mod tests {
     #[test]
     fn test_closure_source_meta_package() {
         let meta = make_meta_meta("build-deps");
-        let closure = BuildClosure::for_meta(&meta, vec![]);
+        let closure = BuildClosure::for_meta(&meta, vec![], vec![]);
         assert_eq!(closure.source, "none");
     }
 
     #[test]
-    fn test_closure_key_format_v2() {
+    fn test_closure_key_format_v3() {
         let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
-        let key = BuildClosure::for_meta(&meta, vec![]).cache_key();
-        // "v2:" prefix + 64-char hex digest
-        let hex = key.strip_prefix("v2:").expect("key must be v2-prefixed");
+        let key = BuildClosure::for_meta(&meta, vec![], vec![]).cache_key();
+        // "v3:" prefix + 64-char hex digest (v3 adds build_deps to the
+        // closure—ADR-0018 Decision 4, issue #22).
+        let hex = key.strip_prefix("v3:").expect("key must be v3-prefixed");
         assert_eq!(hex.len(), 64);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -581,13 +598,14 @@ mod tests {
                 pin: Some("1.3".into()),
                 hash: None,
             }],
+            vec![],
         );
         let expected_source = sha256_hex("hello:1.0:https://example.com/hello.tar.gz");
         // Locks the exact deterministic schema: sorted keys, null hashes.
         assert_eq!(
             closure.canonical_json(),
             format!(
-                r#"{{"format_version":2,"parts":"","requires":[{{"hash":null,"name":"zlib","pin":"1.3"}}],"source":"{expected_source}","target":"native"}}"#
+                r#"{{"build_deps":[],"format_version":3,"parts":"","requires":[{{"hash":null,"name":"zlib","pin":"1.3"}}],"source":"{expected_source}","target":"native"}}"#
             )
         );
     }
@@ -600,9 +618,37 @@ mod tests {
             pin: Some("1.3".into()),
             hash: Some("abc".into()),
         }];
-        let key1 = BuildClosure::for_meta(&meta, requires.clone()).cache_key();
-        let key2 = BuildClosure::for_meta(&meta, requires).cache_key();
+        let key1 = BuildClosure::for_meta(&meta, requires.clone(), vec![]).cache_key();
+        let key2 = BuildClosure::for_meta(&meta, requires, vec![]).cache_key();
         assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_closure_key_varies_with_build_deps() {
+        // ADR-0018 Decision 4 (issue #22): a changed build dependency
+        // invalidates the cache key, forcing a rebuild. The build_deps
+        // member mirrors the requires member shape (pin + content hash).
+        let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        let dep = |pin: Option<&str>, hash: Option<&str>| RequiresMember {
+            name: "pkgconf".into(),
+            pin: pin.map(str::to_string),
+            hash: hash.map(str::to_string),
+        };
+        let no_deps = BuildClosure::for_meta(&meta, vec![], vec![]).cache_key();
+        let with_dep =
+            BuildClosure::for_meta(&meta, vec![], vec![dep(Some("2.2"), None)]).cache_key();
+        assert_ne!(no_deps, with_dep, "a build_dep must change the key");
+
+        let repinned =
+            BuildClosure::for_meta(&meta, vec![], vec![dep(Some("2.3"), None)]).cache_key();
+        assert_ne!(
+            with_dep, repinned,
+            "a build_dep pin change must change the key"
+        );
+
+        // Same build_dep → identical key (sorted, deduplicated).
+        let again = BuildClosure::for_meta(&meta, vec![], vec![dep(Some("2.2"), None)]).cache_key();
+        assert_eq!(with_dep, again);
     }
 
     #[test]
@@ -612,8 +658,8 @@ mod tests {
         let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
         let changed = make_source_meta("hello", "https://example.com/hello-v2.tar.gz");
         assert_ne!(
-            BuildClosure::for_meta(&meta, vec![]).cache_key(),
-            BuildClosure::for_meta(&changed, vec![]).cache_key()
+            BuildClosure::for_meta(&meta, vec![], vec![]).cache_key(),
+            BuildClosure::for_meta(&changed, vec![], vec![]).cache_key()
         );
     }
 
@@ -635,7 +681,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
         );
-        let with_parts = BuildClosure::for_meta(&meta, vec![]).cache_key();
+        let with_parts = BuildClosure::for_meta(&meta, vec![], vec![]).cache_key();
 
         // Different command → different key
         let mut meta2 = meta.clone();
@@ -644,7 +690,7 @@ mod tests {
         }
         assert_ne!(
             with_parts,
-            BuildClosure::for_meta(&meta2, vec![]).cache_key()
+            BuildClosure::for_meta(&meta2, vec![], vec![]).cache_key()
         );
 
         // New part name → different key
@@ -662,7 +708,7 @@ mod tests {
         }
         assert_ne!(
             with_parts,
-            BuildClosure::for_meta(&meta3, vec![]).cache_key()
+            BuildClosure::for_meta(&meta3, vec![], vec![]).cache_key()
         );
 
         // Added `after` edge → different key
@@ -672,7 +718,7 @@ mod tests {
         }
         assert_ne!(
             with_parts,
-            BuildClosure::for_meta(&meta4, vec![]).cache_key()
+            BuildClosure::for_meta(&meta4, vec![], vec![]).cache_key()
         );
 
         // No parts at all → different key again
@@ -680,7 +726,7 @@ mod tests {
         meta5.parts = None;
         assert_ne!(
             with_parts,
-            BuildClosure::for_meta(&meta5, vec![]).cache_key()
+            BuildClosure::for_meta(&meta5, vec![], vec![]).cache_key()
         );
     }
 
@@ -793,7 +839,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
         );
-        let base = BuildClosure::for_meta(&meta, vec![]).cache_key();
+        let base = BuildClosure::for_meta(&meta, vec![], vec![]).cache_key();
 
         // Different plugin → different key
         let mut meta2 = meta.clone();
@@ -804,7 +850,10 @@ mod tests {
             .get_mut("core")
             .unwrap()
             .plugin = Some("cmake".into());
-        assert_ne!(base, BuildClosure::for_meta(&meta2, vec![]).cache_key());
+        assert_ne!(
+            base,
+            BuildClosure::for_meta(&meta2, vec![], vec![]).cache_key()
+        );
 
         // Option added → different key
         let mut meta3 = meta.clone();
@@ -821,7 +870,7 @@ mod tests {
             )]
             .into(),
         );
-        let with_options = BuildClosure::for_meta(&meta3, vec![]).cache_key();
+        let with_options = BuildClosure::for_meta(&meta3, vec![], vec![]).cache_key();
         assert_ne!(base, with_options);
 
         // Option value changed → different key
@@ -841,13 +890,13 @@ mod tests {
         );
         assert_ne!(
             with_options,
-            BuildClosure::for_meta(&meta4, vec![]).cache_key()
+            BuildClosure::for_meta(&meta4, vec![], vec![]).cache_key()
         );
 
         // Identical options → same key
         assert_eq!(
             with_options,
-            BuildClosure::for_meta(&meta3, vec![]).cache_key()
+            BuildClosure::for_meta(&meta3, vec![], vec![]).cache_key()
         );
     }
 
@@ -880,7 +929,7 @@ mod tests {
             let mut m = make_source_meta("hello", "https://example.com/hello.tar.gz");
             m.build = None;
             m.parts = Some([("core".to_string(), part)].into_iter().collect());
-            BuildClosure::for_meta(&m, vec![]).cache_key()
+            BuildClosure::for_meta(&m, vec![], vec![]).cache_key()
         };
 
         let base = meta(make_part(None));
@@ -913,13 +962,13 @@ mod tests {
     fn test_closure_key_varies_with_target() {
         let mut meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
         meta.target = None;
-        let native = BuildClosure::for_meta(&meta, vec![]).cache_key();
+        let native = BuildClosure::for_meta(&meta, vec![], vec![]).cache_key();
 
         meta.target = Some("aarch64-linux-gnu".into());
-        let aarch64 = BuildClosure::for_meta(&meta, vec![]).cache_key();
+        let aarch64 = BuildClosure::for_meta(&meta, vec![], vec![]).cache_key();
 
         meta.target = Some("x86_64-linux-gnu".into());
-        let x86_64 = BuildClosure::for_meta(&meta, vec![]).cache_key();
+        let x86_64 = BuildClosure::for_meta(&meta, vec![], vec![]).cache_key();
 
         assert_ne!(native, aarch64);
         assert_ne!(native, x86_64);
@@ -927,7 +976,10 @@ mod tests {
 
         // No target → stable "native" default
         meta.target = None;
-        assert_eq!(native, BuildClosure::for_meta(&meta, vec![]).cache_key());
+        assert_eq!(
+            native,
+            BuildClosure::for_meta(&meta, vec![], vec![]).cache_key()
+        );
     }
 
     #[test]
@@ -939,15 +991,17 @@ mod tests {
             hash: hash.map(str::to_string),
         };
 
-        let base = BuildClosure::for_meta(&meta, vec![member(Some("1.3"), None)]).cache_key();
+        let base =
+            BuildClosure::for_meta(&meta, vec![member(Some("1.3"), None)], vec![]).cache_key();
 
         // Pin (revision/version) changed → different key
-        let repinned = BuildClosure::for_meta(&meta, vec![member(Some("1.3.1"), None)]).cache_key();
+        let repinned =
+            BuildClosure::for_meta(&meta, vec![member(Some("1.3.1"), None)], vec![]).cache_key();
         assert_ne!(base, repinned);
 
         // Lock hash appeared for the same pin → different key
-        let hashed =
-            BuildClosure::for_meta(&meta, vec![member(Some("1.3"), Some("aa"))]).cache_key();
+        let hashed = BuildClosure::for_meta(&meta, vec![member(Some("1.3"), Some("aa"))], vec![])
+            .cache_key();
         assert_ne!(base, hashed);
 
         // New dep in the closure → different key
@@ -957,12 +1011,15 @@ mod tests {
             pin: Some("6.3".into()),
             hash: None,
         });
-        assert_ne!(base, BuildClosure::for_meta(&meta, two.clone()).cache_key());
+        assert_ne!(
+            base,
+            BuildClosure::for_meta(&meta, two.clone(), vec![]).cache_key()
+        );
 
         // Same members → same key
         assert_eq!(
-            BuildClosure::for_meta(&meta, two.clone()).cache_key(),
-            BuildClosure::for_meta(&meta, two).cache_key()
+            BuildClosure::for_meta(&meta, two.clone(), vec![]).cache_key(),
+            BuildClosure::for_meta(&meta, two, vec![]).cache_key()
         );
     }
 
@@ -979,13 +1036,13 @@ mod tests {
         let order_a = vec![member("zlib"), member("gmp"), member("mpfr")];
         let order_b = vec![member("mpfr"), member("zlib"), member("gmp")];
         assert_eq!(
-            BuildClosure::for_meta(&meta, order_a).cache_key(),
-            BuildClosure::for_meta(&meta, order_b).cache_key()
+            BuildClosure::for_meta(&meta, order_a, vec![]).cache_key(),
+            BuildClosure::for_meta(&meta, order_b, vec![]).cache_key()
         );
 
         // Duplicates collapse to one member
         let dup = vec![member("zlib"), member("zlib")];
-        let closure = BuildClosure::for_meta(&meta, dup);
+        let closure = BuildClosure::for_meta(&meta, dup, vec![]);
         assert_eq!(closure.requires.len(), 1);
         assert_eq!(closure.requires[0].name, "zlib");
     }
@@ -999,6 +1056,7 @@ mod tests {
             snaps: std::collections::HashMap::new(),
             inputs: std::collections::HashMap::new(),
             packages: std::collections::HashMap::new(),
+            build_deps: std::collections::HashMap::new(),
         };
         lock.record_snap(&crate::snap::SnapRef {
             name: "core22".into(),
@@ -1020,7 +1078,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = PackageCache::new(Some(dir.path().to_path_buf()));
         let meta = make_source_meta("missing", "https://example.com/missing.tar.gz");
-        let closure = BuildClosure::for_meta(&meta, vec![]);
+        let closure = BuildClosure::for_meta(&meta, vec![], vec![]);
         assert!(cache.lookup(&meta, "amd64", &closure).is_none());
     }
 
@@ -1029,7 +1087,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = PackageCache::new(Some(dir.path().to_path_buf()));
         let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
-        let closure = BuildClosure::for_meta(&meta, vec![]);
+        let closure = BuildClosure::for_meta(&meta, vec![], vec![]);
 
         let output_dir = tempfile::tempdir().unwrap();
         let snap_path = output_dir.path().join("hello_1.0_amd64.snap");
@@ -1071,7 +1129,7 @@ mod tests {
             source_info: None,
         };
 
-        let closure = BuildClosure::for_meta(&meta, vec![]);
+        let closure = BuildClosure::for_meta(&meta, vec![], vec![]);
         cache
             .store(&meta, &result, output_dir.path(), &closure)
             .unwrap();
@@ -1079,7 +1137,7 @@ mod tests {
 
         // Target change → miss
         meta.target = Some("aarch64-linux-gnu".into());
-        let other_target = BuildClosure::for_meta(&meta, vec![]);
+        let other_target = BuildClosure::for_meta(&meta, vec![], vec![]);
         assert!(cache.lookup(&meta, "amd64", &other_target).is_none());
 
         // Requires revision change → miss
@@ -1091,6 +1149,7 @@ mod tests {
                 pin: Some("1.3".into()),
                 hash: None,
             }],
+            vec![],
         );
         assert!(cache.lookup(&meta, "amd64", &other_reqs).is_none());
     }
@@ -1100,7 +1159,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = PackageCache::new(Some(dir.path().to_path_buf()));
         let meta = make_meta_meta("build-deps");
-        let closure = BuildClosure::for_meta(&meta, vec![]);
+        let closure = BuildClosure::for_meta(&meta, vec![], vec![]);
 
         // store should be a no-op for meta packages
         let output_dir = tempfile::tempdir().unwrap();
@@ -1125,7 +1184,7 @@ mod tests {
 
         // Store something
         let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
-        let closure = BuildClosure::for_meta(&meta, vec![]);
+        let closure = BuildClosure::for_meta(&meta, vec![], vec![]);
         let output_dir = tempfile::tempdir().unwrap();
         let snap_path = output_dir.path().join("hello_1.0_amd64.snap");
         std::fs::write(&snap_path, b"fake snap content").unwrap();

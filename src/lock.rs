@@ -38,6 +38,13 @@ pub struct LockFile {
     /// declared package, keyed by package name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub packages: HashMap<String, PodPackageLockEntry>,
+
+    /// Build-dependency pins (ADR-0018 Decision 4, issue #22). Each entry
+    /// pins a build-time-only dependency to the resolved version observed
+    /// at lock time, so a changed build_dep is recorded and reproducible.
+    /// The lockfile IS the pin record (ADR-0017 Decision 5).
+    #[serde(default, skip_serializing_if = "is_empty_build_deps")]
+    pub build_deps: HashMap<String, BuildDepsLockEntry>,
 }
 
 /// A single source entry in the lockfile.
@@ -69,6 +76,35 @@ pub struct InputLockEntry {
 /// `skip_serializing_if` helper: omit `local = false` from the lockfile.
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// `skip_serializing_if` helper: omit an empty `build_deps` map from older
+/// lockfiles (backcompat with pre-ADR-0018 lockfiles).
+fn is_empty_build_deps(m: &HashMap<String, BuildDepsLockEntry>) -> bool {
+    m.is_empty()
+}
+
+/// A single build-dependency pin (ADR-0018 Decision 4, issue #22): the
+/// resolved version observed when the dependency first entered the build
+/// closure, plus the optional content hash when the lockfile has it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildDepsLockEntry {
+    /// Resolved version (declared version or lockfile pin) of the
+    /// build-time-only dependency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+
+    /// Content hash (sha3-384) when recorded by a prior lock/snap pin;
+    /// `None` for a pure declared-version pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+/// The resolved-pin shape [`LockFile::record_build_dep`] records — the
+/// build_deps member of a `shuttle.lock` entry.
+pub struct BuildDepPin {
+    pub pin: Option<String>,
+    pub hash: Option<String>,
 }
 
 /// A pod package pin (pods, issue #2): the resolved version observed when
@@ -128,6 +164,7 @@ impl LockFile {
             snaps: HashMap::new(),
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         }
     }
 
@@ -206,6 +243,23 @@ impl LockFile {
                 });
         }
     }
+
+    /// Look up a build-dep pin by name (ADR-0018 Decision 4, issue #22).
+    pub fn lookup_build_dep(&self, name: &str) -> Option<&BuildDepsLockEntry> {
+        self.build_deps.get(name)
+    }
+
+    /// Record a build-dep pin in the lockfile (ADR-0018 Decision 4). A
+    /// first observation records whatever `pin`/`hash` are known; a pin
+    /// already present is left untouched (record-once, like sources).
+    pub fn record_build_dep(&mut self, name: &str, pin: &BuildDepPin) {
+        self.build_deps
+            .entry(name.to_string())
+            .or_insert(BuildDepsLockEntry {
+                pin: pin.pin.clone(),
+                hash: pin.hash.clone(),
+            });
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +292,7 @@ mod tests {
             snaps,
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&lock).unwrap();
@@ -278,6 +333,7 @@ mod tests {
             snaps: HashMap::new(),
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
 
         lock.save(&path).unwrap();
@@ -301,6 +357,7 @@ mod tests {
             snaps: HashMap::new(),
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
 
         let snap = SnapRef {
@@ -322,6 +379,79 @@ mod tests {
     }
 
     #[test]
+    fn test_build_deps_lock_record_and_lookup() {
+        // ADR-0018 Decision 4 (issue #22): build_deps are pinned in the
+        // lockfile — the lockfile IS the pin record.
+        let mut lock = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs: HashMap::new(),
+            packages: HashMap::new(),
+            build_deps: HashMap::new(),
+        };
+
+        lock.record_build_dep(
+            "ncurses",
+            &BuildDepPin {
+                pin: Some("6.4".into()),
+                hash: Some("abc123".into()),
+            },
+        );
+        assert_eq!(lock.build_deps.len(), 1);
+        let looked = lock.lookup_build_dep("ncurses").unwrap();
+        assert_eq!(looked.pin.as_deref(), Some("6.4"));
+        assert_eq!(looked.hash.as_deref(), Some("abc123"));
+
+        // Recording again does not overwrite (record-once).
+        lock.record_build_dep(
+            "ncurses",
+            &BuildDepPin {
+                pin: Some("6.5".into()),
+                hash: None,
+            },
+        );
+        assert_eq!(lock.build_deps.len(), 1);
+        assert_eq!(
+            lock.lookup_build_dep("ncurses").unwrap().pin.as_deref(),
+            Some("6.4")
+        );
+
+        // Lookup miss → None.
+        assert!(lock.lookup_build_dep("missing").is_none());
+    }
+
+    #[test]
+    fn test_build_deps_serialization_and_backcompat() {
+        let mut build_deps = HashMap::new();
+        build_deps.insert(
+            "pkgconf".to_string(),
+            BuildDepsLockEntry {
+                pin: Some("2.2".into()),
+                hash: None,
+            },
+        );
+        let lock = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs: HashMap::new(),
+            packages: HashMap::new(),
+            build_deps,
+        };
+        let json = serde_json::to_string_pretty(&lock).unwrap();
+        assert!(json.contains("build_deps"), "should serialize build_deps");
+        assert!(json.contains("pkgconf"));
+        let back: LockFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.build_deps.len(), 1);
+
+        // Pre-ADR-0018 lockfile (no build_deps key) still loads.
+        let legacy = r#"{ "version": 1, "sources": {}, "snaps": {} }"#;
+        let old: LockFile = serde_json::from_str(legacy).unwrap();
+        assert!(old.build_deps.is_empty());
+    }
+
+    #[test]
     fn test_lockfile_serialization_format() {
         let mut snaps = HashMap::new();
         snaps.insert(
@@ -338,6 +468,7 @@ mod tests {
             snaps,
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&lock).unwrap();
@@ -378,6 +509,7 @@ mod tests {
             snaps: HashMap::new(),
             inputs,
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&lock).unwrap();
@@ -422,6 +554,7 @@ mod tests {
             snaps: HashMap::new(),
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
         lock.save(&path).unwrap();
         assert!(path.exists());
@@ -446,6 +579,7 @@ mod tests {
             snaps: HashMap::new(),
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
         lock.save(&path).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();

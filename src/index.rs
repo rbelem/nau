@@ -374,6 +374,7 @@ impl PackageIndex {
             aliases: vec![],
             requires: vec![],
             build_deps: vec![],
+            leaks_ok: vec![],
             target: None,
             toolchain: None,
             inputs: None,

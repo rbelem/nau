@@ -2557,6 +2557,9 @@ fn build_pending_snap(
         // ADR-0018 build-time visibility lands for `shuttle build` first
         // (issue #17 scope); pod wiring follows separately.
         None,
+        // No build prefix → no leak-scan resolution data (issue #22 scope
+        // is `shuttle build`; pod wiring follows with the prefix).
+        None,
     )?;
     let payload = downloads.join(&result.snap_filename);
     let sha3_384 = crate::store::sha3_384_file(&payload)?;
@@ -2873,6 +2876,7 @@ pod {
             aliases: vec![],
             requires: vec![],
             build_deps: vec![],
+            leaks_ok: vec![],
             target: None,
             toolchain: None,
             inputs: None,

@@ -191,6 +191,7 @@ function snap(opts)
     check_string_array(opts.aliases, "snap", "aliases")
     check_string_array(opts.requires, "snap", "requires")
     check_string_array(opts.build_deps, "snap", "build_deps")
+    check_string_array(opts.leaks_ok, "snap", "leaks_ok")
 
     -- plugs/slots: name → interface string (back-compat) or attribute
     -- table with required string `interface` (typed form)

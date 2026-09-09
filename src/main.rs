@@ -429,6 +429,7 @@ fn prepare_inputs(
         snaps: HashMap::new(),
         inputs: HashMap::new(),
         packages: HashMap::new(),
+        build_deps: HashMap::new(),
     });
 
     let mut changed = false;
@@ -482,7 +483,16 @@ fn build_closure(
         .iter()
         .map(|name| requires_member(name, lockfile))
         .collect();
-    shuttle::cache::BuildClosure::for_meta(meta, requires)
+    // Build deps join the closure so a changed build_dep invalidates the
+    // cache key (ADR-0018 Decision 4, issue #22).
+    let mut dep_names = meta.build_deps.clone();
+    dep_names.sort();
+    dep_names.dedup();
+    let build_deps = dep_names
+        .iter()
+        .map(|name| requires_member(name, lockfile))
+        .collect();
+    shuttle::cache::BuildClosure::for_meta(meta, requires, build_deps)
 }
 
 /// Resolve one requires-closure member. A lockfile pin (revision +
@@ -604,6 +614,10 @@ fn run_build(
         json,
     )?;
 
+    // Pin build-time-only dependencies into the lockfile (ADR-0018 Decision
+    // 4, issue #22): the lockfile IS the build_deps pin record.
+    persist_build_deps_pins(&mut lockfile, lock_path, &iter, &lockfile_path)?;
+
     Ok(())
 }
 
@@ -616,6 +630,7 @@ fn load_lockfile_or_default(lock_path: &Path) -> miette::Result<LockFile> {
         snaps: HashMap::new(),
         inputs: HashMap::new(),
         packages: HashMap::new(),
+        build_deps: HashMap::new(),
     }))
 }
 
@@ -723,6 +738,27 @@ fn build_dep_seeds(meta: &shuttle::snap::SnapMeta) -> Vec<String> {
     seeds
 }
 
+/// The leak-scan resolution data (ADR-0018 Decision 3, issue #22) for one
+/// build: every payload the merged build prefix materialized (`requires` ∪
+/// `build_deps`), split into runtime-closure members (transitive
+/// `requires`) vs build-only. A DT_NEEDED soname must resolve into a
+/// runtime payload or the package's own stage — never a build-only one.
+fn leak_scan_listings(
+    meta: &shuttle::snap::SnapMeta,
+    prefix: &shuttle::build_prefix::MergedPrefix,
+) -> miette::Result<shuttle::leak_scan::PayloadListings> {
+    let mut listings = shuttle::leak_scan::PayloadListings::default();
+    if !meta.requires.is_empty() {
+        listings.runtime = shuttle::deps::resolve_dep_names(&meta.requires, true)?
+            .into_iter()
+            .collect();
+    }
+    for (pkg, files) in prefix.payload_files() {
+        listings.payloads.insert(pkg, files);
+    }
+    Ok(listings)
+}
+
 /// Resolve `meta`'s build-time dependency closure (`requires` ∪
 /// `build_deps`, transitively), ensure every member's built payload is
 /// available, and materialize the merged `/usr`-like build prefix
@@ -824,6 +860,11 @@ fn ensure_dep_payload(
     }
     let stage = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create temp stage for {name}: {e}"))?;
+    let scan_listings = match &dep_prefix {
+        Some(p) => leak_scan_listings(dep_meta, p)?,
+        None => shuttle::leak_scan::PayloadListings::default(),
+    };
+
     let result = shuttle::snap::build_snap(
         dep_meta,
         stage.path(),
@@ -834,6 +875,7 @@ fn ensure_dep_payload(
         None,
         None,
         dep_prefix.as_ref().map(|t| t.path()),
+        Some(&scan_listings),
     )?;
     if !json {
         shuttle::output::ok(&result.snap_filename);
@@ -945,6 +987,11 @@ fn build_dep_archs(
             &mut building,
         )?;
 
+        let scan_listings = match &build_prefix {
+            Some(p) => leak_scan_listings(dep_meta, p)?,
+            None => shuttle::leak_scan::PayloadListings::default(),
+        };
+
         match shuttle::snap::build_snap(
             dep_meta,
             dep_stage.path(),
@@ -955,6 +1002,7 @@ fn build_dep_archs(
             // Plain recursive builds have no pod dependency closure.
             None,
             build_prefix.as_ref().map(|p| p.path()),
+            Some(&scan_listings),
         ) {
             Ok(result) => {
                 if !json {
@@ -1056,6 +1104,15 @@ fn build_one_arch(
         &mut building,
     )?;
 
+    // Post-build leak-scan resolution data (ADR-0018 Decision 3, issue
+    // #22): every build runs the scan; when no prefix was materialized
+    // there are no payloads, so the listings are empty and the scan just
+    // reports zero build-only refs.
+    let scan_listings = match &build_prefix {
+        Some(p) => leak_scan_listings(meta, p)?,
+        None => shuttle::leak_scan::PayloadListings::default(),
+    };
+
     let result = shuttle::snap::build_snap(
         meta,
         stage_dir,
@@ -1065,6 +1122,7 @@ fn build_one_arch(
         None,
         None,
         build_prefix.as_ref().map(|p| p.path()),
+        Some(&scan_listings),
     )?;
     if !json {
         shuttle::output::ok(&result.snap_filename);
@@ -1121,6 +1179,43 @@ fn persist_new_sources(
         }
     }
 
+    Ok(())
+}
+
+/// Pin build-time-only dependencies (`build_deps`) into the lockfile
+/// (ADR-0018 Decision 4, issue #22). Each declared build_dep is recorded
+/// with the resolved version (lockfile pin wins; else declared version) —
+/// the same resolution the binary-cache closure uses — so a changed build
+/// dependency is recorded and reproducible. The lockfile IS the pin record
+/// (ADR-0017 Decision 5).
+fn persist_build_deps_pins(
+    lockfile: &mut LockFile,
+    lock_path: &Path,
+    iter: &[(&String, shuttle::snap::SnapMeta)],
+    lockfile_path: &str,
+) -> miette::Result<()> {
+    let mut changed = false;
+    for (_name, meta) in iter {
+        for dep in &meta.build_deps {
+            if lockfile.lookup_build_dep(dep).is_some() {
+                continue;
+            }
+            let member = requires_member(dep, lockfile);
+            lockfile.record_build_dep(
+                dep,
+                &shuttle::lock::BuildDepPin {
+                    pin: member.pin.clone(),
+                    hash: member.hash.clone(),
+                },
+            );
+            changed = true;
+        }
+    }
+
+    if changed {
+        lockfile.save(lock_path)?;
+        shuttle::output::ok(format!("lockfile updated: {lockfile_path}"));
+    }
     Ok(())
 }
 
@@ -1733,6 +1828,7 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
         snaps: HashMap::new(),
         inputs: HashMap::new(),
         packages: HashMap::new(),
+        build_deps: HashMap::new(),
     });
 
     // Empty names = refresh every declared input. All pins are resolved

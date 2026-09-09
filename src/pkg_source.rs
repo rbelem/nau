@@ -907,6 +907,7 @@ mod tests {
             snaps: HashMap::new(),
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
         let err = update_input_pins(&inputs, &["nope"], &mut lock)
             .unwrap_err()
@@ -930,6 +931,7 @@ mod tests {
             snaps: HashMap::new(),
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
 
         // ensure records the local marker once
@@ -1087,6 +1089,7 @@ mod tests {
             snaps: HashMap::new(),
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
         // Pre-pin "good" with a revision that a path: refresh would change
         // (path entries carry no revision), so partial application is observable.
@@ -1123,6 +1126,7 @@ mod tests {
             snaps: HashMap::new(),
             inputs: HashMap::new(),
             packages: HashMap::new(),
+            build_deps: HashMap::new(),
         };
 
         // First update: new pin (old = None).
