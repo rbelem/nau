@@ -471,7 +471,7 @@ fn build_closure(
     meta: &shuttle::snap::SnapMeta,
     lockfile: &LockFile,
 ) -> shuttle::cache::BuildClosure {
-    let seeds = build_dep_seeds(meta);
+    let seeds = shuttle::deps::build_dep_seeds(meta);
     let mut names: Vec<String> = if seeds.is_empty() {
         Vec::new()
     } else {
@@ -712,7 +712,7 @@ fn collect_dep_names(iter: &[(&String, shuttle::snap::SnapMeta)]) -> Vec<String>
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (_name, meta) in iter {
-        let seeds = build_dep_seeds(meta);
+        let seeds = shuttle::deps::build_dep_seeds(meta);
         if !seeds.is_empty() {
             if let Ok(deps) = shuttle::deps::resolve_dep_names(&seeds, true) {
                 for dep in &deps {
@@ -724,50 +724,6 @@ fn collect_dep_names(iter: &[(&String, shuttle::snap::SnapMeta)]) -> Vec<String>
         }
     }
     all_deps
-}
-
-/// The declared build-time dependency seeds of `meta`: `requires` ∪
-/// `build_deps`, deduplicated, declaration order preserved (ADR-0018).
-///
-/// A seed naming the package itself is the self-host marker (issue #33):
-/// the package builds that dependency's payload — a glibc-from-source
-/// package IS its own glibc — so the payload must not materialize into
-/// the merged build prefix. It would inject the pool payload's installed
-/// headers (`-I/shuttle-build-prefix/usr/include` via `CPPFLAGS`) ahead
-/// of the package's own build tree, and the build compiles against the
-/// pool copy (empirically: glibc's gen-as-const probes die on pool
-/// glibc headers). The runtime closure keeps the entry; only the
-/// build-time view drops it.
-fn build_dep_seeds(meta: &shuttle::snap::SnapMeta) -> Vec<String> {
-    let mut seeds: Vec<String> = Vec::new();
-    for dep in meta.requires.iter().chain(&meta.build_deps) {
-        if dep == &meta.name || seeds.contains(dep) {
-            continue;
-        }
-        seeds.push(dep.clone());
-    }
-    seeds
-}
-
-/// The leak-scan resolution data (ADR-0018 Decision 3, issue #22) for one
-/// build: every payload the merged build prefix materialized (`requires` ∪
-/// `build_deps`), split into runtime-closure members (transitive
-/// `requires`) vs build-only. A DT_NEEDED soname must resolve into a
-/// runtime payload or the package's own stage — never a build-only one.
-fn leak_scan_listings(
-    meta: &shuttle::snap::SnapMeta,
-    prefix: &shuttle::build_prefix::MergedPrefix,
-) -> miette::Result<shuttle::leak_scan::PayloadListings> {
-    let mut listings = shuttle::leak_scan::PayloadListings::default();
-    if !meta.requires.is_empty() {
-        listings.runtime = shuttle::deps::resolve_dep_names(&meta.requires, true)?
-            .into_iter()
-            .collect();
-    }
-    for (pkg, files) in prefix.payload_files() {
-        listings.payloads.insert(pkg, files);
-    }
-    Ok(listings)
 }
 
 /// Resolve `meta`'s build-time dependency closure (`requires` ∪
@@ -793,7 +749,7 @@ fn ensure_build_prefix(
     if meta.build.is_none() && meta.parts.is_none() {
         return Ok(None);
     }
-    let seeds = build_dep_seeds(meta);
+    let seeds = shuttle::deps::build_dep_seeds(meta);
     if seeds.is_empty() {
         return Ok(None);
     }
@@ -872,7 +828,7 @@ fn ensure_dep_payload(
     let stage = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create temp stage for {name}: {e}"))?;
     let scan_listings = match &dep_prefix {
-        Some(p) => leak_scan_listings(dep_meta, p)?,
+        Some(p) => shuttle::leak_scan::listings_for_build(dep_meta, p)?,
         None => shuttle::leak_scan::PayloadListings::default(),
     };
 
@@ -999,7 +955,7 @@ fn build_dep_archs(
         )?;
 
         let scan_listings = match &build_prefix {
-            Some(p) => leak_scan_listings(dep_meta, p)?,
+            Some(p) => shuttle::leak_scan::listings_for_build(dep_meta, p)?,
             None => shuttle::leak_scan::PayloadListings::default(),
         };
 
@@ -1120,7 +1076,7 @@ fn build_one_arch(
     // there are no payloads, so the listings are empty and the scan just
     // reports zero build-only refs.
     let scan_listings = match &build_prefix {
-        Some(p) => leak_scan_listings(meta, p)?,
+        Some(p) => shuttle::leak_scan::listings_for_build(meta, p)?,
         None => shuttle::leak_scan::PayloadListings::default(),
     };
 
@@ -1262,7 +1218,7 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
 /// JSON-mode order report for one output. Seeds resolution with the
 /// build-time dependency union (`requires` ∪ `build_deps`).
 fn report_order_json(meta: &shuttle::snap::SnapMeta) {
-    let seeds = build_dep_seeds(meta);
+    let seeds = shuttle::deps::build_dep_seeds(meta);
     if seeds.is_empty() {
         return;
     }
@@ -1304,7 +1260,7 @@ fn report_order_human(meta: &shuttle::snap::SnapMeta) {
     }
 
     eprintln!("  Resolved build order (transitive):");
-    let seeds = build_dep_seeds(meta);
+    let seeds = shuttle::deps::build_dep_seeds(meta);
     match shuttle::deps::resolve_dep_names(&seeds, true) {
         Ok(order) => {
             let seen: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
@@ -2971,55 +2927,6 @@ fn index_resolve(index: &str, channel: &str) -> miette::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn seeds_meta(name: &str, requires: &[&str], build_deps: &[&str]) -> shuttle::snap::SnapMeta {
-        shuttle::snap::SnapMeta {
-            name: name.into(),
-            version: "1.0".into(),
-            summary: None,
-            description: None,
-            license: None,
-            source: None,
-            build: Some("make".into()),
-            parts: None,
-            architectures: Some(vec!["amd64".into()]),
-            grade: "stable".into(),
-            confinement: "strict".into(),
-            type_: Some("source".into()),
-            adopt_info: None,
-            version_adopted: false,
-            icon_source: None,
-            icon: None,
-            compression: None,
-            environment: None,
-            layout: None,
-            hooks: None,
-            plugs: None,
-            slots: None,
-            aliases: vec![],
-            requires: requires.iter().map(|s| s.to_string()).collect(),
-            build_deps: build_deps.iter().map(|s| s.to_string()).collect(),
-            leaks_ok: vec![],
-            target: None,
-            toolchain: None,
-            inputs: None,
-            confined: None,
-            apps: std::collections::HashMap::new(),
-            deps: None,
-            floating: false,
-            definition_dir: None,
-        }
-    }
-
-    #[test]
-    fn build_dep_seeds_drop_self_referenced_payloads() {
-        // Self-host marker (issue #33): a requires entry naming the
-        // package itself declares the package builds that payload — it
-        // must not seed the merged build prefix (pool headers would
-        // shadow its own build tree). Regular deps pass through.
-        let meta = seeds_meta("glibc", &["glibc", "linux-headers"], &["glibc", "make"]);
-        assert_eq!(build_dep_seeds(&meta), vec!["linux-headers", "make"]);
-    }
 
     #[test]
     fn test_check_ok_message_prints_identity() {

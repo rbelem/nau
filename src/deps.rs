@@ -91,6 +91,29 @@ pub fn resolve_dep_names(seeds: &[String], recursive: bool) -> miette::Result<Ve
     Ok(nodes.into_iter().map(|n| n.name).collect())
 }
 
+/// The declared build-time dependency seeds of `meta`: `requires` ∪
+/// `build_deps`, deduplicated, declaration order preserved (ADR-0018).
+///
+/// A seed naming the package itself is the self-host marker (issue #33):
+/// the package builds that dependency's payload — a glibc-from-source
+/// package IS its own glibc — so the payload must not materialize into
+/// the merged build prefix. It would inject the pool payload's installed
+/// headers (`-I/shuttle-build-prefix/usr/include` via `CPPFLAGS`) ahead
+/// of the package's own build tree, and the build compiles against the
+/// pool copy (empirically: glibc's gen-as-const probes die on pool
+/// glibc headers). The runtime closure keeps the entry; only the
+/// build-time view drops it.
+pub fn build_dep_seeds(meta: &SnapMeta) -> Vec<String> {
+    let mut seeds: Vec<String> = Vec::new();
+    for dep in meta.requires.iter().chain(&meta.build_deps) {
+        if dep == &meta.name || seeds.contains(dep) {
+            continue;
+        }
+        seeds.push(dep.clone());
+    }
+    seeds
+}
+
 /// Format deps as a tree string.
 pub fn format_tree(seeds: &[String], _recursive: bool) -> miette::Result<String> {
     let nodes = resolve_deps(seeds, true)?;
@@ -331,6 +354,55 @@ mod tests {
         assert!(a < b);
         assert!(b < c);
         assert!(c < d);
+    }
+
+    fn seeds_meta(name: &str, requires: &[&str], build_deps: &[&str]) -> SnapMeta {
+        SnapMeta {
+            name: name.into(),
+            version: "1.0".into(),
+            summary: None,
+            description: None,
+            license: None,
+            source: None,
+            build: Some("make".into()),
+            parts: None,
+            architectures: Some(vec!["amd64".into()]),
+            grade: "stable".into(),
+            confinement: "strict".into(),
+            type_: Some("source".into()),
+            adopt_info: None,
+            version_adopted: false,
+            icon_source: None,
+            icon: None,
+            compression: None,
+            environment: None,
+            layout: None,
+            hooks: None,
+            plugs: None,
+            slots: None,
+            aliases: vec![],
+            requires: requires.iter().map(|s| s.to_string()).collect(),
+            build_deps: build_deps.iter().map(|s| s.to_string()).collect(),
+            leaks_ok: vec![],
+            target: None,
+            toolchain: None,
+            inputs: None,
+            confined: None,
+            apps: std::collections::HashMap::new(),
+            deps: None,
+            floating: false,
+            definition_dir: None,
+        }
+    }
+
+    #[test]
+    fn build_dep_seeds_drop_self_referenced_payloads() {
+        // Self-host marker (issue #33): a requires entry naming the
+        // package itself declares the package builds that payload — it
+        // must not seed the merged build prefix (pool headers would
+        // shadow its own build tree). Regular deps pass through.
+        let meta = seeds_meta("glibc", &["glibc", "linux-headers"], &["glibc", "make"]);
+        assert_eq!(build_dep_seeds(&meta), vec!["linux-headers", "make"]);
     }
 
     /// Build_deps edges order a build exactly like requires edges: a

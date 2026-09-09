@@ -1852,6 +1852,11 @@ fn collect_pending(
             &state.loaded_overlays,
             build,
         )?;
+        // Runtime requires closure (issue #35): after the full post-state
+        // package set is known, every requires member the declared
+        // packages don't already provide is built and installed into the
+        // pod so the farm links it.
+        install_requires_closure(&ctx, build)?;
         return Ok(());
     }
     collect_degraded_names(&state.decl, &state.loaded_versions, build);
@@ -1966,6 +1971,11 @@ struct ReconcileBuild {
     deps_pins: Vec<(String, crate::lock::PackageDepsLock)>,
     /// Whether the selected package's deps pin moved (issue #15).
     deps_moved: bool,
+    /// The `requires` seeds of every post-state package (own + loaded,
+    /// resolved metas): the runtime-closure union the pod must carry
+    /// (issue #35). Seeds, not members — the pass resolves them
+    /// transitively once the full declared set is known.
+    requires_seeds: Vec<String>,
 }
 
 /// Fold the `loads` graph one level deep (issue #8): each loaded pod
@@ -2037,6 +2047,9 @@ fn collect_own_packages(
         let spec = parse_pod_package(spec_str)?;
         let mut meta = resolve_own_meta(ctx.root, ctx.pod_name, &spec, &decl.overlay)?;
         build.declared_names.insert(meta.name.clone());
+        // Runtime-closure seeds (issue #35): the declared package's own
+        // requires — the overlay-won meta is what the pod executes.
+        build.requires_seeds.extend(meta.requires.iter().cloned());
         let overlay = decl.overlay.contains_key(&spec.name);
         let layer = if overlay {
             crate::farm::ClaimLayer::Overlay
@@ -2146,6 +2159,9 @@ fn collect_loaded_packages(
             meta.version = version.clone();
         }
         build.declared_names.insert(meta.name.clone());
+        // Runtime-closure seeds (issue #35): loaded packages need their
+        // requires members in THIS pod's store too.
+        build.requires_seeds.extend(meta.requires.iter().cloned());
         push_meta_desktop_claims(
             &mut build.desktop_claims,
             &meta,
@@ -2162,6 +2178,60 @@ fn collect_loaded_packages(
             crate::farm::ClaimLayer::Loaded,
             None,
         )?);
+    }
+    Ok(())
+}
+
+/// Install the runtime requires closure into the pod (issue #35): every
+/// transitive `requires` member of the post-state packages that the
+/// declared set doesn't already provide is resolved, built
+/// ([`ensure_pod_dep_payload`]) and queued for installation, so the
+/// generation carries the libraries/tools its packages require and the
+/// farm links them.
+///
+/// Members provided by the declaration (own/overlay/loaded) are skipped —
+/// the declared copy wins. Members already in the active generation keep
+/// their store content (a no-op sync stays a no-op) but are recorded into
+/// the post-state set so [`remove_undeclared`] never wipes a live closure
+/// member — and a requires edge that disappears drops the orphaned member
+/// on the next sync.
+///
+/// Members install at the `Loaded` layer (the composition floor): a
+/// declared package's binaries/desktop entries always outrank dependency
+/// contributions. No desktop/binary claims are collected for them — a
+/// collision resolves at farm emission by layer precedence instead of
+/// failing the reconcile.
+fn install_requires_closure(
+    ctx: &ReconcileCtx<'_>,
+    build: &mut ReconcileBuild,
+) -> miette::Result<()> {
+    if build.requires_seeds.is_empty() {
+        return Ok(());
+    }
+    let members = crate::deps::resolve_dep_names(&build.requires_seeds, true)?;
+    let active_names: std::collections::BTreeSet<String> = ctx
+        .active
+        .map(|g| g.packages.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut building: Vec<String> = Vec::new();
+    for name in members {
+        if build.declared_names.contains(&name) {
+            continue;
+        }
+        if active_names.contains(&name) {
+            build.declared_names.insert(name);
+            continue;
+        }
+        let dep_meta = crate::deps::load_meta(&name)?;
+        let payload = ensure_pod_dep_payload(ctx.store, &name, &dep_meta, &mut building)?;
+        let sha3_384 = crate::store::sha3_384_file(&payload)?;
+        build.pending.push(build_pending_snap_at(
+            &dep_meta,
+            &payload,
+            sha3_384,
+            crate::farm::ClaimLayer::Loaded,
+        ));
+        build.declared_names.insert(name);
     }
     Ok(())
 }
@@ -2503,6 +2573,16 @@ fn resolve_binary_claims(claims: &[BinaryClaim]) -> miette::Result<()> {
 /// reproducibility IS the idempotency guarantee.
 const POD_BUILD_EPOCH: &str = "946684800";
 
+/// Stamp the pod build epoch unless the user chose one. Called by every
+/// pod-side build entry point (own/loaded packages and closure-member
+/// payloads) so nested builds inherit a deterministic timestamp even when
+/// the outer build skipped it.
+fn set_pod_build_epoch() {
+    if std::env::var_os("SOURCE_DATE_EPOCH").is_none() {
+        std::env::set_var("SOURCE_DATE_EPOCH", POD_BUILD_EPOCH);
+    }
+}
+
 /// Build one declared package into a `.snap` payload with the normal
 /// snap build path (`shuttle::snap::build_snap` — the same pipeline
 /// `shuttle build` uses, sandbox included) and shape it as a pending
@@ -2515,17 +2595,21 @@ const POD_BUILD_EPOCH: &str = "946684800";
 /// own packages fetch it in [`ensure_own_deps`] right before this call;
 /// a loaded package has no pin here and fails with a clear error (deps
 /// resolve in the pod that declares the package).
+///
+/// A package with `requires`/`build_deps` builds against the merged
+/// build prefix (ADR-0018, issue #35 — the same machinery the pool
+/// `shuttle build` path uses): every closure member's payload is
+/// ensured in the pod's downloads dir ([`ensure_pod_dep_payload`]) and
+/// materialized into one `/usr`-like tree bound read-only into the
+/// sandbox. The leak scan runs on the same data — pod-built payloads
+/// carry no build-only references.
 fn build_pending_snap(
     store: &crate::runtime::RuntimeStore,
     meta: &crate::snap::SnapMeta,
     layer: crate::farm::ClaimLayer,
     deps_pin: Option<&crate::lock::PackageDepsLock>,
 ) -> miette::Result<crate::runtime::PendingSnap> {
-    // mksquashfs 4.4+ reads this natively; only set it when the user
-    // hasn't chosen an epoch of their own.
-    if std::env::var_os("SOURCE_DATE_EPOCH").is_none() {
-        std::env::set_var("SOURCE_DATE_EPOCH", POD_BUILD_EPOCH);
-    }
+    set_pod_build_epoch();
     let deps_dir = match (meta.deps.as_ref(), deps_pin) {
         (Some(_), Some(pin)) => Some(crate::dep_fetch::materialize_deps_entry(
             store,
@@ -2538,6 +2622,15 @@ fn build_pending_snap(
             meta.name
         ),
         (None, _) => None,
+    };
+    // Merged build prefix (ADR-0018, issue #35): `requires` ∪ `build_deps`
+    // payloads ensured + merged, exactly like the pool path. None when the
+    // package runs no build or declares neither list.
+    let mut building: Vec<String> = vec![meta.name.clone()];
+    let build_prefix = pod_build_prefix(store, meta, &mut building)?;
+    let scan_listings = match &build_prefix {
+        Some(p) => Some(crate::leak_scan::listings_for_build(meta, p)?),
+        None => Some(crate::leak_scan::PayloadListings::default()),
     };
     let stage = tempfile::tempdir().map_err(|e| miette::miette!("temp stage dir: {e}"))?;
     let downloads = store.downloads_dir();
@@ -2553,17 +2646,119 @@ fn build_pending_snap(
         // wrappers can bake the script's content-addressed store path.
         Some(store),
         deps_dir.as_ref().map(|d| d.path()),
-        // Pod builds do not materialize the merged build prefix yet —
-        // ADR-0018 build-time visibility lands for `shuttle build` first
-        // (issue #17 scope); pod wiring follows separately.
-        None,
-        // No build prefix → no leak-scan resolution data (issue #22 scope
-        // is `shuttle build`; pod wiring follows with the prefix).
-        None,
+        build_prefix.as_ref().map(|p| p.path()),
+        scan_listings.as_ref(),
     )?;
     let payload = downloads.join(&result.snap_filename);
     let sha3_384 = crate::store::sha3_384_file(&payload)?;
     Ok(build_pending_snap_at(meta, &payload, sha3_384, layer))
+}
+
+/// Resolve `meta`'s build-time dependency closure (`requires` ∪
+/// `build_deps`, transitively), ensure every member's payload is
+/// available in the pod ([`ensure_pod_dep_payload`]), and materialize the
+/// merged `/usr`-like build prefix (ADR-0018 Decision 2). The pod-side
+/// twin of the pool path's `ensure_build_prefix`: `None` when the package
+/// runs no build or declares neither list — nothing to bind.
+///
+/// The returned [`MergedPrefix`] owns its tempdir — the caller must keep
+/// it alive for as long as the build runs.
+fn pod_build_prefix(
+    store: &crate::runtime::RuntimeStore,
+    meta: &crate::snap::SnapMeta,
+    building: &mut Vec<String>,
+) -> miette::Result<Option<crate::build_prefix::MergedPrefix>> {
+    // Only source builds consume a build prefix — meta/store snaps and
+    // fetch-only declarations never run a build command.
+    if meta.build.is_none() && meta.parts.is_none() {
+        return Ok(None);
+    }
+    let seeds = crate::deps::build_dep_seeds(meta);
+    if seeds.is_empty() {
+        return Ok(None);
+    }
+    let closure_names = crate::deps::resolve_dep_names(&seeds, true)?;
+    let mut payloads = Vec::new();
+    for name in closure_names {
+        let dep_meta = crate::deps::load_meta(&name)?;
+        let snap = ensure_pod_dep_payload(store, &name, &dep_meta, building)?;
+        payloads.push(crate::build_prefix::Payload { pkg: name, snap });
+    }
+    let merged = crate::build_prefix::materialize_merged_prefix(&payloads)?;
+    if !payloads.is_empty() {
+        let names: Vec<&str> = payloads.iter().map(|p| p.pkg.as_str()).collect();
+        crate::output::status(format!(
+            "build prefix: merged {} payload(s) — {}",
+            payloads.len(),
+            names.join(", ")
+        ));
+    }
+    Ok(Some(merged))
+}
+
+/// Ensure one requires/build_deps member's built payload is available for
+/// the merged build prefix: the pod's downloads dir first (a previous sync
+/// or an earlier build this reconcile produced it), else build it there
+/// now — giving the dependency its own merged prefix first, because its
+/// build may need its own build-time deps (ADR-0018 applies to every
+/// source build, pod builds included).
+///
+/// `building` is the in-progress stack for cycle detection: a circular
+/// requires/build_deps chain fails with a clear chain instead of
+/// recursing forever.
+fn ensure_pod_dep_payload(
+    store: &crate::runtime::RuntimeStore,
+    name: &str,
+    dep_meta: &crate::snap::SnapMeta,
+    building: &mut Vec<String>,
+) -> miette::Result<std::path::PathBuf> {
+    set_pod_build_epoch();
+    let downloads = store.downloads_dir();
+    std::fs::create_dir_all(&downloads)
+        .map_err(|e| miette::miette!("creating {}: {e}", downloads.display()))?;
+    let existing = downloads.join(format!(
+        "{}_{}_{}.snap",
+        name,
+        dep_meta.version,
+        crate::snap::host_arch()
+    ));
+    if existing.exists() {
+        return Ok(existing);
+    }
+
+    if building.iter().any(|n| n == name) {
+        miette::bail!(
+            "circular dependency while building '{name}': {} → {name}",
+            building.join(" → ")
+        );
+    }
+    building.push(name.to_string());
+
+    // The dependency's own build prefix (its requires ∪ build_deps,
+    // transitively — a dep build is a build like any other, ADR-0018).
+    let dep_prefix = pod_build_prefix(store, dep_meta, building)?;
+    let scan_listings = match &dep_prefix {
+        Some(p) => Some(crate::leak_scan::listings_for_build(dep_meta, p)?),
+        None => Some(crate::leak_scan::PayloadListings::default()),
+    };
+
+    let stage =
+        tempfile::tempdir().map_err(|e| miette::miette!("temp stage dir for {name}: {e}"))?;
+    let result = crate::snap::build_snap(
+        dep_meta,
+        stage.path(),
+        &downloads,
+        crate::snap::host_arch(),
+        crate::snap::StagePolicy::Default,
+        // Same pod-store treatment as any pod build (issue #9 wrappers,
+        // #12 ELF repair): the payload may expose host-run binaries.
+        Some(store),
+        None,
+        dep_prefix.as_ref().map(|p| p.path()),
+        scan_listings.as_ref(),
+    )?;
+    building.pop();
+    Ok(downloads.join(&result.snap_filename))
 }
 
 /// Fetch (or verify the cached) dependency closure for an own pod package

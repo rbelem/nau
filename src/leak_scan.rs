@@ -142,6 +142,27 @@ impl ScanReport {
     }
 }
 
+/// The leak-scan resolution data (ADR-0018 Decision 3, issue #22) for one
+/// build: every payload the merged build prefix materialized (`requires` ∪
+/// `build_deps`), split into runtime-closure members (transitive
+/// `requires`) vs build-only. A DT_NEEDED soname must resolve into a
+/// runtime payload or the package's own stage — never a build-only one.
+pub fn listings_for_build(
+    meta: &crate::snap::SnapMeta,
+    prefix: &crate::build_prefix::MergedPrefix,
+) -> miette::Result<PayloadListings> {
+    let mut listings = PayloadListings::default();
+    if !meta.requires.is_empty() {
+        listings.runtime = crate::deps::resolve_dep_names(&meta.requires, true)?
+            .into_iter()
+            .collect();
+    }
+    for (pkg, files) in prefix.payload_files() {
+        listings.payloads.insert(pkg, files);
+    }
+    Ok(listings)
+}
+
 /// Scan every produced file under `stage` (ADR-0018 Decision 3).
 ///
 /// `leaks_ok` entries silence hits whose [`Leak::reference`] matches
