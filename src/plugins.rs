@@ -2,8 +2,9 @@
 //!
 //! Plugins are compiled into shuttle: a part selects one with
 //! `plugin = "<name>"` plus an options table, and the plugin expands to a
-//! declarative [`BuildPlan`] (commands + env + extra requires) consumed by
-//! the existing `run_parts` machinery. No dynamic plugin loading in v1.
+//! declarative [`BuildPlan`] (commands + env + extra requires/build_deps)
+//! consumed by the existing `run_parts` machinery. No dynamic plugin
+//! loading in v1.
 //!
 //! Per ADR-0014 Decision 3, this module is the validation boundary: the Lua
 //! DSL only checks that `plugin` names a known plugin and that options are a
@@ -26,14 +27,18 @@ use std::path::Path;
 /// `PREFIX=/usr` by default — v1-cached `make` artifacts are stale).
 pub const REGISTRY_VERSION: &str = "2";
 
-/// The toolchain package `cargo` parts add to the snap's effective requires.
+/// The toolchain package `cargo` parts add to the snap's effective
+/// `build_deps` (ADR-0018 Decision 5, issue #26): the rust toolchain is a
+/// build-time-only dependency — it enters the merged build prefix so the
+/// sandboxed `cargo install` finds it, and never the runtime closure or a
+/// pod.
 ///
 /// Chosen over the generic `toolchain` alias on purpose: alias names live
 /// only as data inside the package's Lua (and in the store index), while
 /// dependency resolution (`deps::load_meta` → `pkg_source::resolve_pkg`) is
 /// purely path-based (`pkgs/t/<name>.lua`). Only the concrete package name
 /// resolves.
-const CARGO_REQUIRES: &str = "toolchain-gcc-gnu-x86_64";
+const CARGO_BUILD_DEP: &str = "toolchain-gcc-gnu-x86_64";
 
 /// One option value from a definition's plugin options table.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,8 +81,12 @@ pub struct BuildPlan {
     pub commands: Vec<String>,
     pub env: Vec<(String, String)>,
     /// Appended to the snap's effective `requires` so dependency resolution
-    /// and the cache see the full closure (ADR-0014 Decision 4).
+    /// and the cache see the full runtime closure (ADR-0014 Decision 4).
     pub extra_requires: Vec<String>,
+    /// Appended to the snap's effective `build_deps` so the toolchain
+    /// reaches the build sandbox's merged prefix but never the runtime
+    /// closure (ADR-0018 Decision 5, issue #26).
+    pub extra_build_deps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -389,14 +398,16 @@ fn make_plan(opts: &[(&'static str, &PluginValue)]) -> BuildPlan {
         commands,
         env: Vec::new(),
         extra_requires: Vec::new(),
+        extra_build_deps: Vec::new(),
     }
 }
 
 /// `cargo` part: build the crate found in `$SRC` and install its binaries
 /// into `$STAGE/bin` via `cargo install --root`. An explicit channel rides
 /// as `RUSTUP_TOOLCHAIN` (rustup's selection env var), and the rust
-/// toolchain package is added to the snap's requires so the sandbox stays
-/// hermetic.
+/// toolchain package is added to the snap's `build_deps` so the sandbox
+/// stays hermetic (ADR-0018 Decision 5: build-time only, never a runtime
+/// closure member).
 fn cargo_plan(opts: &[(&'static str, &PluginValue)]) -> miette::Result<BuildPlan> {
     let mut env = Vec::new();
     if let Some(channel) = opt_str(opts, "channel") {
@@ -410,7 +421,8 @@ fn cargo_plan(opts: &[(&'static str, &PluginValue)]) -> miette::Result<BuildPlan
     Ok(BuildPlan {
         commands: vec!["cargo install --path $SRC --root $STAGE".to_string()],
         env,
-        extra_requires: vec![CARGO_REQUIRES.to_string()],
+        extra_requires: Vec::new(),
+        extra_build_deps: vec![CARGO_BUILD_DEP.to_string()],
     })
 }
 
@@ -438,6 +450,7 @@ fn cmake_plan(opts: &[(&'static str, &PluginValue)]) -> BuildPlan {
         ],
         env: Vec::new(),
         extra_requires: Vec::new(),
+        extra_build_deps: Vec::new(),
     }
 }
 
@@ -472,6 +485,7 @@ fn autotools_plan(opts: &[(&'static str, &PluginValue)]) -> BuildPlan {
             ],
             env: Vec::new(),
             extra_requires: Vec::new(),
+            extra_build_deps: Vec::new(),
         }
     } else {
         BuildPlan {
@@ -482,6 +496,7 @@ fn autotools_plan(opts: &[(&'static str, &PluginValue)]) -> BuildPlan {
             ],
             env: Vec::new(),
             extra_requires: Vec::new(),
+            extra_build_deps: Vec::new(),
         }
     }
 }
@@ -749,6 +764,7 @@ mod tests {
         );
         assert!(plan.env.is_empty());
         assert!(plan.extra_requires.is_empty());
+        assert!(plan.extra_build_deps.is_empty());
     }
 
     #[test]
@@ -850,7 +866,7 @@ mod tests {
     // ── cargo ──
 
     #[test]
-    fn test_expand_cargo_channel_sets_env_and_requires() {
+    fn test_expand_cargo_channel_sets_env_and_build_dep() {
         let plan = expand_map("cargo", &[("channel", "nightly")]).unwrap();
         assert_eq!(
             plan.commands,
@@ -860,14 +876,16 @@ mod tests {
             plan.env,
             vec![("RUSTUP_TOOLCHAIN".to_string(), "nightly".to_string())]
         );
-        assert_eq!(plan.extra_requires, vec![CARGO_REQUIRES]);
+        assert!(plan.extra_requires.is_empty());
+        assert_eq!(plan.extra_build_deps, vec![CARGO_BUILD_DEP]);
     }
 
     #[test]
     fn test_expand_cargo_defaults() {
         let plan = expand_map("cargo", &[]).unwrap();
         assert!(plan.env.is_empty());
-        assert_eq!(plan.extra_requires, vec![CARGO_REQUIRES]);
+        assert!(plan.extra_requires.is_empty());
+        assert_eq!(plan.extra_build_deps, vec![CARGO_BUILD_DEP]);
     }
 
     #[test]

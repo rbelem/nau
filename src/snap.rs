@@ -697,17 +697,20 @@ impl SnapMeta {
         // Build-time-only dependencies (ADR-0018): same shape and validation
         // treatment as `requires` (the Lua DSL checks the array; unknown
         // names are rejected at resolution, exactly like `requires` names).
-        let build_deps: Vec<String> = table.get("build_deps").unwrap_or_default();
+        let mut build_deps: Vec<String> = table.get("build_deps").unwrap_or_default();
         // Post-build leak-scan exceptions (ADR-0018 Decision 3): exact-match
         // strings that silence a named build-only reference. Same array
         // validation as the other name lists.
         let leaks_ok: Vec<String> = table.get("leaks_ok").unwrap_or_default();
-        // Plugin parts contribute extra requires (e.g. `cargo` pulls the
-        // rust toolchain package) — expanded and deep-validated here so the
-        // Rust boundary is the single choke point (ADR-0014 Decisions 3-4).
-        // Dependency resolution reads this same field.
+        // Plugin parts contribute extra requires and extra build_deps —
+        // expanded and deep-validated here so the Rust boundary is the
+        // single choke point (ADR-0014 Decisions 3-4). Runtime toolchains
+        // are gone: plugin toolchains land in `build_deps`, so they reach
+        // the build sandbox but never the runtime closure (ADR-0018
+        // Decision 5, issue #26). Dependency resolution reads these fields.
         if let Some(parts) = &parts {
             append_plugin_requires(parts, &mut requires)?;
+            append_plugin_build_deps(parts, &mut build_deps)?;
         }
         let target: Option<String> = get_opt_string(table, "target")?;
         let toolchain: Option<String> = get_opt_string(table, "toolchain")?;
@@ -1497,15 +1500,37 @@ fn append_plugin_requires(
     parts: &BTreeMap<String, SnapPart>,
     requires: &mut Vec<String>,
 ) -> miette::Result<()> {
+    append_plugin_field(parts, |plan| &plan.extra_requires, requires)
+}
+
+/// Append every plugin part's `extra_build_deps` to the snap's effective
+/// `build_deps` (deduplicated, declaration order preserved) — the path
+/// plugin toolchains take into the build sandbox without entering the
+/// runtime closure (ADR-0018 Decision 5, issue #26).
+fn append_plugin_build_deps(
+    parts: &BTreeMap<String, SnapPart>,
+    build_deps: &mut Vec<String>,
+) -> miette::Result<()> {
+    append_plugin_field(parts, |plan| &plan.extra_build_deps, build_deps)
+}
+
+/// Shared append helper: expand each plugin part once and push its
+/// contributed names (deduplicated, declaration order preserved) into
+/// `target`, prefixed with the part name on a named validation error.
+fn append_plugin_field(
+    parts: &BTreeMap<String, SnapPart>,
+    pick: impl Fn(&crate::plugins::BuildPlan) -> &Vec<String>,
+    target: &mut Vec<String>,
+) -> miette::Result<()> {
     for (name, part) in parts {
         let Some(plugin) = &part.plugin else {
             continue;
         };
         let plan = crate::plugins::expand(plugin, part.plugin_options.as_ref())
             .map_err(|e| miette::miette!("parts['{name}']: {e}"))?;
-        for require in plan.extra_requires {
-            if !requires.contains(&require) {
-                requires.push(require);
+        for dep in pick(&plan) {
+            if !target.contains(dep) {
+                target.push(dep.clone());
             }
         }
     }
@@ -3630,6 +3655,7 @@ fn part_build_plan(name: &str, part: &SnapPart) -> miette::Result<crate::plugins
             commands: vec![part.build.clone()],
             env: Vec::new(),
             extra_requires: Vec::new(),
+            extra_build_deps: Vec::new(),
         }),
     }
 }
@@ -7428,9 +7454,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cargo_plugin_appends_toolchain_require() {
-        // ADR-0014 Decision 4: extra_requires land in the snap's effective
-        // requires (the same field dependency resolution reads).
+    fn test_cargo_plugin_appends_toolchain_as_build_dep_not_requires() {
+        // ADR-0018 Decision 5 (issue #26): plugin toolchains land in
+        // `build_deps` — they reach the build sandbox's merged prefix but
+        // never the runtime closure. `requires` must NOT carry the
+        // toolchain.
         let env = LuaEnv::new();
         let table = env
             .eval(
@@ -7448,9 +7476,10 @@ mod tests {
             .unwrap();
         let default_table: mlua::Table = table.get("default").unwrap();
         let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.requires, vec!["zlib".to_string()]);
         assert_eq!(
-            meta.requires,
-            vec!["zlib".to_string(), "toolchain-gcc-gnu-x86_64".to_string()]
+            meta.build_deps,
+            vec!["toolchain-gcc-gnu-x86_64".to_string()]
         );
 
         // Deduplicated on repeat plugin parts.
@@ -7473,7 +7502,11 @@ mod tests {
             .unwrap();
         let default_table: mlua::Table = table.get("default").unwrap();
         let meta = SnapMeta::from_lua_table(&default_table).unwrap();
-        assert_eq!(meta.requires, vec!["toolchain-gcc-gnu-x86_64".to_string()]);
+        assert!(meta.requires.is_empty());
+        assert_eq!(
+            meta.build_deps,
+            vec!["toolchain-gcc-gnu-x86_64".to_string()]
+        );
     }
 
     #[test]
