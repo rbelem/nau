@@ -40,17 +40,23 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
         )
     })?;
 
+    // Issue #37: a multi-file app execs its ASSEMBLED binary — the
+    // hardlinked leaf in the generation's assembly subtree, whose
+    // directory holds the recorded siblings — so
+    // relative-to-executable resolution works here exactly as it does
+    // through the farm (the pod state root is bound read-only into the
+    // sandbox, so the subtree resolves inside it too). Single-binary
+    // apps keep the lone content blob.
+    let bin = exec_target(&store, gen.n, pkg_name, pkg, app, real_hash);
+
     // Effective confinement: the per-app override, else the package default.
     let Some(confined) = pkg.app_confined.get(app).or(pkg.confined.as_ref()) else {
         // Unconfined app reached `shuttle run` directly — exec the real
         // binary with no sandbox (the farm never routes an unconfined app
         // here).
-        let bin = store.blob_path(real_hash);
         return exec_direct(&bin, args);
     };
 
-    // The real command binary `shuttle run` execs inside the sandbox.
-    let bin = store.blob_path(real_hash);
     if !bin.is_file() {
         return Err(miette::miette!(
             "confined app '{app}' (package '{pkg_name}'): command binary \
@@ -62,6 +68,23 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
     match confined.backend {
         BackendKind::Bwrap => run_bwrap(pod_dir, app, confined, &bin, args),
         BackendKind::Apparmor => run_apparmor(pod_name, app, confined, &bin, args),
+    }
+}
+
+/// The binary `shuttle run` execs for `app` (issue #37): the assembled
+/// leaf in the generation's assembly subtree when the package records a
+/// sibling assembly for the app, else the lone content blob.
+fn exec_target(
+    store: &crate::runtime::RuntimeStore,
+    gen_n: u64,
+    pkg_name: &str,
+    pkg: &crate::runtime::InstalledPackage,
+    app: &str,
+    real_hash: &str,
+) -> PathBuf {
+    match pkg.assembly.get(app) {
+        Some(asm) => crate::farm::assembly_bin_path(store, gen_n, pkg_name, asm),
+        None => store.blob_path(real_hash),
     }
 }
 
@@ -440,5 +463,52 @@ mod tests {
     fn profile_name_is_deterministic_and_namespaced() {
         assert_eq!(profile_name("default", "app"), "shuttle-default-app");
         assert_eq!(profile_name("work", "gui"), "shuttle-work-gui");
+    }
+
+    // ── Issue #37: shuttle run resolves multi-file apps via the assembly ──
+
+    #[test]
+    fn exec_target_prefers_the_assembly_leaf_for_multifile_apps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::runtime::RuntimeStore::new(tmp.path().to_path_buf());
+        let asm = crate::farm::AppAssembly {
+            binary: "usr/bin/gcm".into(),
+            files: [("libSkiaSharp.so".to_string(), "cc33".to_string())]
+                .into_iter()
+                .collect(),
+            links: BTreeMap::new(),
+        };
+        let mut pkg = crate::runtime::InstalledPackage {
+            name: "git-credential-manager".into(),
+            version: "1.0".into(),
+            revision: 1,
+            sha3_384: "abc".into(),
+            files: vec![],
+            units: vec![],
+            layer: crate::farm::ClaimLayer::Own,
+            apps: [("gcm".to_string(), "aa11".to_string())]
+                .into_iter()
+                .collect(),
+            launchers: BTreeMap::new(),
+            assembly: [("gcm".to_string(), asm)].into_iter().collect(),
+            confined: None,
+            app_confined: BTreeMap::new(),
+            desktops: BTreeMap::new(),
+        };
+        // Multi-file app: exec the assembled leaf, not the lone blob —
+        // the leaf's directory carries the recorded sibling.
+        let target = exec_target(&store, 3, &pkg.name, &pkg, "gcm", "aa11");
+        assert_eq!(
+            target,
+            store
+                .generation_dir(3)
+                .join(crate::farm::ASSEMBLY_DIR)
+                .join("git-credential-manager")
+                .join("usr/bin/gcm")
+        );
+        // Single-binary app: unchanged lone content blob.
+        pkg.assembly.clear();
+        let target = exec_target(&store, 3, &pkg.name, &pkg, "gcm", "aa11");
+        assert_eq!(target, store.blob_path("aa11"));
     }
 }

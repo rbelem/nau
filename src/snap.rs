@@ -1890,7 +1890,11 @@ fn wrap_app(
 /// appends (`zdemo` → `zdemo.real`). The extension must survive: Node's
 /// ESM loader dispatches on it and rejects `index.js.real` with
 /// ERR_UNKNOWN_FILE_EXTENSION.
-fn real_sibling_name(file_name: &str) -> String {
+/// The sibling name a build-time wrapper preserves the real entry under
+/// (`<stem>.real.<ext>`, or `<file>.real` without an extension).
+/// Public for the install path, which must recognize wrapper-managed
+/// commands (issue #37).
+pub(crate) fn real_sibling_name(file_name: &str) -> String {
     match file_name.rsplit_once('.') {
         Some((stem, ext)) if !stem.is_empty() => format!("{stem}.real.{ext}"),
         _ => format!("{file_name}.real"),

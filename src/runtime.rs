@@ -137,6 +137,16 @@ pub struct InstalledPackage {
     /// `apps` still records the real command binary `shuttle run` execs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub launchers: BTreeMap<String, String>,
+    /// Multi-file app payloads (issue #37): app name → the app's
+    /// in-payload binary path plus the sibling content recorded beside
+    /// it at install time. The pod farm builds multi-file packages a
+    /// per-package assembly subtree from this (`crate::farm`), so
+    /// relative-to-executable sibling reads (`pi`'s package.json,
+    /// git-credential-manager's libSkiaSharp.so) resolve beside the
+    /// executed binary; single-binary packages record nothing here and
+    /// keep the bare direct farm link.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub assembly: BTreeMap<String, crate::farm::AppAssembly>,
     /// Runtime confinement grants (ADR-0016, ticket #11): the package-level
     /// `confined` declaration. `Some` = the package is confined (its
     /// apps default to confined), `None` = unconfined. Recorded from the
@@ -1010,6 +1020,7 @@ impl RuntimeStore {
                         Vec::new(),
                         BTreeMap::new(),
                         BTreeMap::new(),
+                        BTreeMap::new(),
                         None,
                         BTreeMap::new(),
                         BTreeMap::new(),
@@ -1036,6 +1047,7 @@ impl RuntimeStore {
                         pkg_units,
                         runtime.apps,
                         runtime.launchers,
+                        runtime.assembly,
                         runtime.confined,
                         runtime.app_confined,
                         desktops,
@@ -1093,6 +1105,7 @@ impl RuntimeStore {
         units: Vec<String>,
         apps: BTreeMap<String, String>,
         launchers: BTreeMap<String, String>,
+        assembly: BTreeMap<String, crate::farm::AppAssembly>,
         confined: Option<crate::snap::Confinement>,
         app_confined: BTreeMap<String, crate::snap::Confinement>,
         desktops: BTreeMap<String, DesktopLauncher>,
@@ -1107,6 +1120,7 @@ impl RuntimeStore {
             layer: snap.layer,
             apps,
             launchers,
+            assembly,
             confined,
             app_confined,
             desktops,
@@ -1644,6 +1658,10 @@ struct PayloadRuntime {
     /// populated for confined apps; the farm emitter prefers it over
     /// `apps` for those so the farm symlink invokes `shuttle run`.
     launchers: BTreeMap<String, String>,
+    /// app name → sibling assembly (issue #37), only for apps whose
+    /// payload directory carries content beside the binary; recorded in
+    /// the package manifest for the farm's assembly subtree.
+    assembly: BTreeMap<String, crate::farm::AppAssembly>,
     /// Package-level confinement grants (ticket #11).
     confined: Option<crate::snap::Confinement>,
     /// Per-app confinement overrides (ticket #11): only apps that differ
@@ -1672,6 +1690,7 @@ fn plan_payload_runtime(
         renames: Vec::new(),
         apps: BTreeMap::new(),
         launchers: BTreeMap::new(),
+        assembly: BTreeMap::new(),
         confined: meta.confined.clone(),
         app_confined: BTreeMap::new(),
         notes: Vec::new(),
@@ -1687,6 +1706,12 @@ fn plan_payload_runtime(
         out.renames
             .push((hash.clone(), format!("usr/bin/{}-{}", plan.snap, plan.app)));
         out.apps.insert(plan.app.clone(), hash);
+        // Issue #37: record the payload content beside the command
+        // binary so the pod farm can assemble multi-file packages.
+        let asm = sibling_assembly(entries, &plan.in_snap_binary);
+        if !asm.is_empty() {
+            out.assembly.insert(plan.app.clone(), asm);
+        }
         // Ticket #11: a confined app records its launcher-wrapper blob
         // (the `<command>.shuttle-launcher` sibling authored at build
         // time) so the farm symlink points at a `shuttle run` wrapper,
@@ -1714,6 +1739,66 @@ fn blob_hash_for(entries: &[TreeEntry], rel: &str, snap_name: &str) -> miette::R
             "command binary '{rel}' not found in payload '{snap_name}'"
         )),
     }
+}
+
+/// Record one app's sibling assembly (issue #37): every payload entry
+/// under the command binary's directory other than the binary itself,
+/// with paths relative to that directory so the farm can reproduce the
+/// layout beside the assembled binary. A payload that ships the binary
+/// alone yields an empty assembly — the manifest stays unchanged and
+/// the farm keeps the bare direct link.
+///
+/// A command carrying the build-time wrapper's `.real` sibling
+/// (issues #9/#10/#13) is wrapper-managed: the wrapper resolves the
+/// real entry and its own path derivations from the command's STORE
+/// blob location, so it must keep the bare store link — no assembly is
+/// recorded for it.
+fn sibling_assembly(entries: &[TreeEntry], in_snap_binary: &str) -> crate::farm::AppAssembly {
+    let mut asm = crate::farm::AppAssembly {
+        binary: in_snap_binary.to_string(),
+        files: BTreeMap::new(),
+        links: BTreeMap::new(),
+    };
+    let Some(dir) = Path::new(in_snap_binary).parent() else {
+        return asm;
+    };
+    if dir.as_os_str().is_empty() {
+        return asm;
+    }
+    let file_name = in_snap_binary
+        .rsplit_once('/')
+        .map(|(_, f)| f)
+        .unwrap_or(in_snap_binary);
+    let wrapper_real_rel = dir.join(crate::snap::real_sibling_name(file_name));
+    if entries
+        .iter()
+        .any(|e| e.rel() == wrapper_real_rel.to_string_lossy())
+    {
+        // Wrapper-managed command (issues #9/#10/#13) — no assembly.
+        return crate::farm::AppAssembly::default();
+    }
+    for entry in entries {
+        let rel = entry.rel();
+        if rel == in_snap_binary {
+            continue;
+        }
+        let Ok(rest) = Path::new(rel).strip_prefix(dir) else {
+            continue;
+        };
+        let rel_to_binary = rest.to_string_lossy().into_owned();
+        if rel_to_binary.is_empty() {
+            continue;
+        }
+        match entry {
+            TreeEntry::Blob { sha256, .. } => {
+                asm.files.insert(rel_to_binary, sha256.clone());
+            }
+            TreeEntry::Symlink { target, .. } => {
+                asm.links.insert(rel_to_binary, target.clone());
+            }
+        }
+    }
+    asm
 }
 
 /// Unit reconciliation set difference between two generations: units to
@@ -2029,6 +2114,7 @@ mod tests {
             layer: crate::farm::ClaimLayer::Own,
             apps: BTreeMap::new(),
             launchers: BTreeMap::new(),
+            assembly: BTreeMap::new(),
             confined: None,
             app_confined: BTreeMap::new(),
             desktops: BTreeMap::new(),
@@ -2761,6 +2847,7 @@ plugs:
                 layer: crate::farm::ClaimLayer::Own,
                 apps: BTreeMap::new(),
                 launchers: BTreeMap::new(),
+                assembly: BTreeMap::new(),
                 confined: None,
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
@@ -2778,6 +2865,7 @@ plugs:
                 layer: crate::farm::ClaimLayer::Own,
                 apps: BTreeMap::new(),
                 launchers: BTreeMap::new(),
+                assembly: BTreeMap::new(),
                 confined: None,
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
@@ -2798,6 +2886,108 @@ plugs:
                 "brand-new".to_string()
             ]
         );
+    }
+
+    // ── Sibling assembly recording (issue #37) ──
+
+    #[test]
+    fn sibling_assembly_captures_payload_content_beside_the_binary() {
+        let entries = vec![
+            TreeEntry::Blob {
+                rel: "usr/bin/pi".into(),
+                sha256: "h1".into(),
+            },
+            TreeEntry::Blob {
+                rel: "usr/bin/package.json".into(),
+                sha256: "h2".into(),
+            },
+            TreeEntry::Blob {
+                rel: "usr/bin/theme/now.txt".into(),
+                sha256: "h3".into(),
+            },
+            TreeEntry::Symlink {
+                rel: "usr/bin/export-html".into(),
+                target: "theme/export-html".into(),
+            },
+            // Not beside the binary: stays out of the assembly.
+            TreeEntry::Blob {
+                rel: "usr/share/doc/readme".into(),
+                sha256: "h4".into(),
+            },
+            TreeEntry::Blob {
+                rel: "bin/other".into(),
+                sha256: "h5".into(),
+            },
+        ];
+        let asm = sibling_assembly(&entries, "usr/bin/pi");
+        assert_eq!(asm.binary, "usr/bin/pi");
+        assert_eq!(
+            asm.files,
+            [
+                ("package.json".to_string(), "h2".to_string()),
+                ("theme/now.txt".to_string(), "h3".to_string()),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+        );
+        assert_eq!(
+            asm.links,
+            [("export-html".to_string(), "theme/export-html".to_string())]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+        );
+        assert!(!asm.is_empty());
+    }
+
+    #[test]
+    fn sibling_assembly_is_empty_for_a_lone_binary_payload() {
+        let entries = vec![
+            TreeEntry::Blob {
+                rel: "usr/bin/rg".into(),
+                sha256: "h1".into(),
+            },
+            TreeEntry::Blob {
+                rel: "usr/share/man/rg.1".into(),
+                sha256: "h2".into(),
+            },
+        ];
+        let asm = sibling_assembly(&entries, "usr/bin/rg");
+        assert!(asm.is_empty());
+        assert_eq!(asm.binary, "usr/bin/rg");
+    }
+
+    #[test]
+    fn sibling_assembly_skips_wrapper_managed_commands() {
+        // Issues #9/#10/#13: the command path was replaced by a
+        // build-time wrapper, the real entry preserved at the `.real`
+        // sibling. The wrapper derives its own paths from the command's
+        // STORE blob location, so the command must keep the bare store
+        // link — no assembly.
+        let entries = vec![
+            TreeEntry::Blob {
+                rel: "bin/pytool".into(),
+                sha256: "wrapper".into(),
+            },
+            TreeEntry::Blob {
+                rel: "bin/pytool.real".into(),
+                sha256: "script".into(),
+            },
+        ];
+        let asm = sibling_assembly(&entries, "bin/pytool");
+        assert!(asm.is_empty());
+        // The extension-inserting variant (`cli.js` → `cli.real.js`).
+        let entries = vec![
+            TreeEntry::Blob {
+                rel: "bin/cli.js".into(),
+                sha256: "wrapper".into(),
+            },
+            TreeEntry::Blob {
+                rel: "bin/cli.real.js".into(),
+                sha256: "script".into(),
+            },
+        ];
+        let asm = sibling_assembly(&entries, "bin/cli.js");
+        assert!(asm.is_empty());
     }
 
     // ── Signature verify hook ──
