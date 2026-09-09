@@ -17,7 +17,17 @@ Autoconf and other GNU build tools depend on M4 for macro expansion.]],
         requires = {},
         source = { url = "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz" },
         parts = {
-            m4 = { plugin = "autotools" },
+            m4 = {
+                plugin = "autotools",
+                options = {
+                    -- CFLAGS -std=gnu17: m4 1.4.19's gnulib-era sources
+                    -- predate C23; the sandbox gcc (16.x) defaults to C23
+                    -- where old-style declarations/conversions hard-error.
+                    -- Pin the gnu17 dialect (with -O2 restated, since this
+                    -- replaces the autotools default CFLAGS).
+                    args = { "CFLAGS=\"-O2 -std=gnu17\"" },
+                },
+            },
         },
     },
 }
