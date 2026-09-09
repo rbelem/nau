@@ -35,8 +35,11 @@ _Avoid_: cross-compile setup, toolchain init
 **Package index**: The `package-index.json` file mapping snap names to store pins or source definitions. Queried by the `index()` DSL function.
 _Avoid_: registry, catalog, database
 
-**Requires**: A snap's build dependencies, declared as a string array in the `snap()` table. Resolved transitively by `shuttle deps` and `shuttle build --all`.
-_Avoid_: depends, deps, links
+**Requires**: A package's runtime dependencies, declared as a string array in the `snap()` table. Everything listed enters the runtime closure (pod/generation) transitively; resolved by `shuttle deps` and `shuttle build --all`. A package that links a library at build time lists it here *and* in `build_deps` — the explicit-duplication norm (Gentoo DEPEND/RDEPEND, conda host/run).
+_Avoid_: depends, deps, links, build dependencies
+
+**Build dependency**: A package's build-time-only dependencies, declared as `build_deps` in the `snap()` table. Visible inside the build sandbox for the duration of the build; never enters the runtime closure. Compilers, pkg-config, codegen tools, and build-time-only libraries are build dependencies (ADR-0018).
+_Avoid_: makedepends, nativeBuildInputs, build requires
 
 **Aliases**: Alternative names a package is known by. Toolchain `toolchain-gcc-gnu-x86_64` has aliases `toolchain-x86_64` and `toolchain`.
 
