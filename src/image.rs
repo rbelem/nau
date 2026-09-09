@@ -1455,6 +1455,52 @@ fn extract_base_and_kernel(
     Ok(Some(payload))
 }
 
+/// GPT partition name passed to `parted mkpart` — the partition's declared
+/// `name` becomes BOTH the GPT PARTLABEL (matched by the UC initrd's
+/// `90-ubuntu-core-partitions.rules` as `ID_PART_ENTRY_NAME`) and the mkfs
+/// filesystem label, so the two never diverge. For GPT labels the first
+/// positional arg after `mkpart` IS the partition name; for MBR (msdos)
+/// labels it is the partition TYPE, which the code always hardcodes to
+/// `"primary"`. A partition with no declared name defaults to `"primary"`
+/// so existing non-UC images are byte-identical.
+fn mkpart_name(label: &str, part: &Partition) -> String {
+    if label == "gpt" {
+        if part.name.is_empty() {
+            "primary".to_string()
+        } else {
+            part.name.clone()
+        }
+    } else {
+        "primary".to_string()
+    }
+}
+
+/// Build the `parted mkpart` argv for one partition (name, fs-type, start,
+/// end) so the GPT PARTLABEL source is unit-testable without running
+/// parted. `mkpart_name` supplies the partition name / MBR type.
+fn parted_mkpart_args(
+    img_path: &Path,
+    label: &str,
+    part: &Partition,
+    start_mb: u64,
+    end_mb: u64,
+) -> Vec<String> {
+    let fs_type = if part.fs == "vfat" {
+        "fat32".to_string()
+    } else {
+        part.fs.clone()
+    };
+    vec![
+        "-s".to_string(),
+        img_path.to_string_lossy().into_owned(),
+        "mkpart".to_string(),
+        mkpart_name(label, part),
+        fs_type,
+        format!("{start_mb}MB"),
+        format!("{end_mb}MB"),
+    ]
+}
+
 /// Create the raw disk image with dd, lay out partitions with parted, and
 /// set the ESP flag on the first partition.
 fn create_partitions(img_path: &Path, layout: &DiskLayout, total_mb: u64) -> miette::Result<()> {
@@ -1484,17 +1530,14 @@ fn create_partitions(img_path: &Path, layout: &DiskLayout, total_mb: u64) -> mie
         let size_mb = parse_size_mb(&part.size, total_mb - part_start_mb);
         let end_mb = part_start_mb + size_mb;
 
-        let fs_type = if part.fs == "vfat" { "fat32" } else { &part.fs };
         let status = std::process::Command::new("parted")
-            .args([
-                "-s",
-                &img_path.to_string_lossy(),
-                "mkpart",
-                "primary",
-                fs_type,
-                &format!("{}MB", part_start_mb),
-                &format!("{}MB", end_mb),
-            ])
+            .args(parted_mkpart_args(
+                img_path,
+                &layout.label,
+                part,
+                part_start_mb,
+                end_mb,
+            ))
             .status()
             .map_err(|e| miette::miette!("parted: {e}"))?;
         if !status.success() {
@@ -3520,6 +3563,69 @@ mod tests {
         assert_eq!(parse_size_mb("2048", 0), 2048);
         assert_eq!(parse_size_mb("1g", 0), 1024);
         assert_eq!(parse_size_mb("256m", 0), 256);
+    }
+
+    // ── GPT PARTLABEL from the partition name (UC boot prerequisite) ──
+
+    fn part_named(name: &str) -> Partition {
+        Partition {
+            name: name.into(),
+            size: "512M".into(),
+            fs: "ext4".into(),
+            mount: "/".into(),
+            options: vec![],
+        }
+    }
+
+    #[test]
+    fn mkpart_name_gpt_uses_declared_name_as_partlabel() {
+        // The UC initrd matches ID_PART_ENTRY_NAME (the GPT PARTLABEL), so a
+        // declared name must become the PARTLABEL — not the hardcoded
+        // "primary". part.name also becomes the mkfs label (elsewhere), so
+        // the two no longer diverge.
+        assert_eq!(mkpart_name("gpt", &part_named("esp")), "esp");
+        assert_eq!(mkpart_name("gpt", &part_named("root")), "root");
+        assert_eq!(mkpart_name("gpt", &part_named("writable")), "writable");
+        assert_eq!(
+            mkpart_name("gpt", &part_named("ubuntu-seed")),
+            "ubuntu-seed"
+        );
+    }
+
+    #[test]
+    fn mkpart_name_gpt_defaults_primary_when_unnamed() {
+        // Partitions with no declared name fall back to "primary", so
+        // existing non-UC (unlabelled) images are byte-identical.
+        assert_eq!(mkpart_name("gpt", &part_named("")), "primary");
+    }
+
+    #[test]
+    fn mkpart_name_mbr_keeps_primary_type() {
+        // MBR (msdos) labels interpret the first positional after `mkpart`
+        // as the partition TYPE, not a name — always "primary", regardless
+        // of the declared name. MBR has no PARTLABEL to set.
+        assert_eq!(mkpart_name("mbr", &part_named("root")), "primary");
+        assert_eq!(mkpart_name("mbr", &part_named("")), "primary");
+    }
+
+    #[test]
+    fn parted_mkpart_args_thread_the_partlabel_name() {
+        // The argv handed to `parted mkpart` carries the declared name in the
+        // name slot (position 3) alongside the fs-type, start and end.
+        let img = Path::new("/tmp/disk.img");
+        let args = parted_mkpart_args(img, "gpt", &part_named("writable"), 4, 4100);
+        assert_eq!(
+            args,
+            vec![
+                "-s",
+                "/tmp/disk.img",
+                "mkpart",
+                "writable",
+                "ext4",
+                "4MB",
+                "4100MB",
+            ]
+        );
     }
 
     // ── UKI assembly (ADR-0011 step (a)) ──
