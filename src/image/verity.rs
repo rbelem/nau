@@ -123,6 +123,22 @@ pub(crate) fn expand_ab_slots(layout: &mut DiskLayout, verity: bool) -> miette::
             ));
         }
         let a = roots[0];
+        // The persistent state partition (ADR-0023) is never cloned into a
+        // slot: it holds the shuttle store and must survive every flip,
+        // not be a second, divergent copy. It is also never a root, so it
+        // cannot reach the clone below — this guard keeps a future
+        // refactor from silently cloning it.
+        if layout.partitions[a]
+            .role
+            .eq_ignore_ascii_case(crate::image::ROLE_STATE)
+        {
+            return Err(miette::miette!(
+                "partition '{}' is the root slot but carries role = \"{}\" — the state \
+                 partition must not be an A/B root (ADR-0023)",
+                layout.partitions[a].name,
+                crate::image::ROLE_STATE
+            ));
+        }
         // Clone AFTER slot A's hash partition so slot B stays contiguous
         // behind slot A. Same size/fs/options; mount stays "/" — the clone
         // is a full root slot, not a data partition.

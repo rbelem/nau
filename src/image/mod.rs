@@ -789,6 +789,17 @@ pub(crate) fn build_disk_image_with(
     // hashed tree — the same write-before-hash constraint as the manifest.
     crate::units::emit_app_runtime(runner, &snap_paths, cache_dir, &root, has_unsquashfs)?;
 
+    // 5f. ADR-0023: the persistent state partition and the mutable-/var
+    // split. Only images that ask for it (a native `role = "state"` /
+    // UC `system-data` partition, or a declared update_source) get the
+    // emission — a plain native image is byte-comparable to before.
+    // Written here, BEFORE root populate + dm-verity, so /etc/fstab and
+    // the tmpfiles land inside the hashed tree.
+    if needs_state_split(image, disk_layout) {
+        let split = resolve_state_split(image, disk_layout)?;
+        emit_state_split(&root, &split)?;
+    }
+
     // 6. ADR-0011 step (c) pre-flight — kernel images need ukify, the
     // sd-stub, and veritysetup; fail closed BEFORE any destructive step
     // (dd/parted/mkfs), so an unbootable or unverifiable image is never
@@ -1206,11 +1217,13 @@ pub(super) fn cp_r(src: &Path, dst: &Path) -> miette::Result<()> {
 mod boot;
 mod partition;
 mod staging;
+mod state;
 mod verity;
 
 pub(crate) use boot::*;
 pub(crate) use partition::*;
 pub(crate) use staging::*;
+pub(crate) use state::*;
 pub(crate) use verity::*;
 
 // Genuinely public partition-type GUIDs keep their original `pub` surface.
@@ -1778,6 +1791,318 @@ mod tests {
             uc: None,
         };
         assert_eq!(empty.uc_route_stage(&seed), None);
+    }
+
+    // ── State partition role + /var split (ADR-0023) ──
+
+    fn state_layout() -> DiskLayout {
+        DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![
+                Partition {
+                    name: "esp".into(),
+                    size: "128M".into(),
+                    fs: "vfat".into(),
+                    mount: "/boot/efi".into(),
+                    options: vec![],
+                    role: String::new(),
+                },
+                Partition {
+                    name: "root".into(),
+                    size: "2G".into(),
+                    fs: "ext4".into(),
+                    mount: "/".into(),
+                    options: vec![],
+                    role: String::new(),
+                },
+                Partition {
+                    name: "state".into(),
+                    size: "4G".into(),
+                    fs: "ext4".into(),
+                    mount: "/var/lib".into(),
+                    options: vec![],
+                    role: ROLE_STATE.into(),
+                },
+            ],
+            swap: None,
+            ab: false,
+        }
+    }
+
+    #[test]
+    fn state_role_is_classified_for_native_images() {
+        let mut p = part_named("persist");
+        assert!(!is_state_partition(&p), "a plain partition is not state");
+        p.role = ROLE_STATE.into();
+        assert!(is_state_role(&p.role));
+        assert!(
+            is_state_partition(&p),
+            "native role = \"state\" maps to state"
+        );
+        // UC system-data describes the same runtime concept.
+        let mut uc = part_named("writable");
+        uc.role = crate::uc::ROLE_DATA.into();
+        assert!(is_state_partition(&uc));
+        // ...and by its ubuntu-data PARTLABEL too.
+        assert!(is_state_partition(&part_named("ubuntu-data")));
+        // Root / ESP / swap are never state.
+        assert!(!is_state_partition(&part_named("root")));
+        assert!(!is_state_partition(&part_named("esp")));
+    }
+
+    #[test]
+    fn state_role_on_a_uc_base_still_remaps_system_data() {
+        // A UC image keeps its gadget role spelling; partition_uc_role is
+        // unchanged, and the same partition is classified as state.
+        let mut layout = uc_layout();
+        for p in &mut layout.partitions {
+            if p.name == "seedpool" {
+                p.name = "statepool".into();
+                p.role = crate::uc::ROLE_DATA.into();
+                p.mount = "/var/lib".into();
+            }
+        }
+        assert_eq!(
+            partition_uc_role(&layout.partitions[2]),
+            Some(crate::uc::ROLE_DATA)
+        );
+        assert!(is_state_partition(&layout.partitions[2]));
+    }
+
+    #[test]
+    fn needs_state_split_is_opt_in() {
+        let image = test_support::sample_image(); // no update_source, core24
+                                                  // Plain native layout, no role → historical behavior.
+        let plain = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![part_named("root")],
+            swap: None,
+            ab: false,
+        };
+        assert!(!needs_state_split(&image, &plain));
+        // A state role activates the split.
+        assert!(needs_state_split(&image, &state_layout()));
+        // An update_source activates it even without a declared role.
+        let mut updating = image.clone();
+        updating.update_source = Some("https://example.invalid/updates/".into());
+        assert!(needs_state_split(&updating, &plain));
+    }
+
+    #[test]
+    fn state_split_fails_closed_without_a_state_partition() {
+        let plain = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![part_named("root")],
+            swap: None,
+            ab: false,
+        };
+        let image = test_support::sample_image();
+        let err = resolve_state_split(&image, &plain).unwrap_err().to_string();
+        assert!(
+            err.contains("no state partition")
+                && err.contains("role = \"state\"")
+                && err.contains(crate::runtime::DEFAULT_STATE_DIR)
+                && err.contains(crate::runtime::DEFAULT_EXTENSIONS_LINK_DIR),
+            "precise fail-closed message: {err}"
+        );
+
+        // The update_source trigger names itself in the message.
+        let mut updating = image.clone();
+        updating.update_source = Some("https://example.invalid/updates/".into());
+        let err = resolve_state_split(&updating, &plain)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("update_source"), "names the trigger: {err}");
+    }
+
+    #[test]
+    fn state_split_resolves_partlabel_and_submount_scope() {
+        let image = test_support::sample_image();
+        let split = resolve_state_split(&image, &state_layout()).unwrap();
+        assert_eq!(split.partlabel, "state");
+        assert_eq!(split.var_submount_partlabel, "", "no /var/* child mount");
+
+        // A declared partition under /var scopes the tmpfs mount.
+        let mut layout = state_layout();
+        layout.partitions.push(Partition {
+            name: "docker".into(),
+            size: "8G".into(),
+            fs: "ext4".into(),
+            mount: "/var/lib/docker".into(),
+            options: vec![],
+            role: String::new(),
+        });
+        let split = resolve_state_split(&image, &layout).unwrap();
+        assert_eq!(split.var_submount_partlabel, "docker");
+    }
+
+    #[test]
+    fn fstab_mounts_state_at_var_lib_and_var_volatile() {
+        let split = StateSplit {
+            partlabel: "state".into(),
+            var_submount_partlabel: String::new(),
+        };
+        let fstab = fstab_content(&split);
+        // Persistent state partition → /var/lib, by PARTLABEL.
+        assert!(
+            fstab.contains("PARTLABEL=state /var/lib auto defaults,nofail"),
+            "state mount line: {fstab}"
+        );
+        // /var itself is tmpfs — volatile skeleton.
+        assert!(
+            fstab.contains("tmpfs /var tmpfs mode=0755,nosuid,nodev"),
+            "volatile /var line: {fstab}"
+        );
+        // The state mount never routes through the verity root.
+        assert!(
+            !fstab.contains("/dev/mapper") && !fstab.contains("verity_root"),
+            "no verity device in fstab: {fstab}"
+        );
+    }
+
+    #[test]
+    fn fstab_scopes_var_tmpfs_to_a_var_submount() {
+        let split = StateSplit {
+            partlabel: "writable".into(),
+            var_submount_partlabel: "docker".into(),
+        };
+        let fstab = fstab_content(&split);
+        assert!(
+            fstab.contains("x-systemd.requires-mounts-for=/dev/disk/by-partlabel/docker"),
+            "tmpfs must require the /var/lib subvolume mount: {fstab}"
+        );
+    }
+
+    #[test]
+    fn tmpfiles_create_the_state_and_volatile_var_skeleton() {
+        let state = state_tmpfiles_content();
+        assert!(state.contains("d /var/lib 0755 root root -"));
+        assert!(state.contains("d /var/lib/shuttle 0755 root root -"));
+        assert!(state.contains("d /var/lib/extensions 0755 root root -"));
+
+        let var = var_tmpfiles_content();
+        for dir in ["/var", "/var/run", "/var/tmp", "/var/cache", "/var/log"] {
+            assert!(
+                var.contains(&format!("d {dir} 0755 root root -")),
+                "tmpfiles create {dir}: {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn emit_state_split_writes_fstab_and_tmpfiles_into_the_rootfs() {
+        let root = tempfile::tempdir().unwrap();
+        let split = StateSplit {
+            partlabel: "state".into(),
+            var_submount_partlabel: String::new(),
+        };
+        emit_state_split(root.path(), &split).unwrap();
+        assert!(root.path().join(FSTAB_PATH).is_file());
+        assert!(root.path().join(STATE_TMPFILES_PATH).is_file());
+        assert!(root.path().join(VAR_TMPFILES_PATH).is_file());
+        let fstab = std::fs::read_to_string(root.path().join(FSTAB_PATH)).unwrap();
+        assert!(fstab.contains("PARTLABEL=state /var/lib"));
+    }
+
+    #[test]
+    fn state_partition_is_not_cloned_into_slot_b() {
+        // A/B with a root + a state partition: only the root is cloned.
+        let mut layout = state_layout();
+        layout.ab = true;
+        let slots = expand_ab_slots(&mut layout, false).unwrap();
+        assert_eq!(slots.roots, vec![1, 3], "root A + its slot-B twin");
+        // Slot B is the root twin; no second state partition appears.
+        let state_parts: Vec<&Partition> = layout
+            .partitions
+            .iter()
+            .filter(|p| is_state_partition(p))
+            .collect();
+        assert_eq!(state_parts.len(), 1, "state is never cloned: {layout:?}");
+        assert_eq!(state_parts[0].name, "state");
+        let clones: Vec<&Partition> = layout
+            .partitions
+            .iter()
+            .filter(|p| p.name.ends_with("_b"))
+            .collect();
+        assert_eq!(clones.len(), 1, "exactly one slot-B twin: {clones:?}");
+        assert_eq!(clones[0].name, "root_b");
+    }
+
+    #[test]
+    fn expand_ab_slots_refuses_a_state_role_root() {
+        let mut layout = state_layout();
+        layout.ab = true;
+        // Mark the root as state: the clone guard must fail closed rather
+        // than turn the persistent partition into a slot twin.
+        layout.partitions[1].role = ROLE_STATE.into();
+        let err = expand_ab_slots(&mut layout, false).unwrap_err().to_string();
+        assert!(
+            err.contains("must not be an A/B root"),
+            "state root refused: {err}"
+        );
+    }
+
+    #[test]
+    fn disk_role_parses_state_and_uc_roles_through_the_dsl() {
+        let lua = lua_env();
+        let value: Value = lua
+            .load(
+                r#"
+                return image {
+                    name = "native",
+                    version = "1.0.0",
+                    base = pin("my-base"),
+                    disk = {
+                        label = "gpt",
+                        partitions = {
+                            { name = "esp", size = "512M", fs = "vfat", mount = "/boot/efi" },
+                            { name = "root", size = "2G", fs = "ext4", mount = "/" },
+                            { name = "state", size = "4G", fs = "ext4", mount = "/var/lib",
+                              role = "state" },
+                            { name = "seed", size = "1G", fs = "ext4", mount = "/seed",
+                              role = "system-seed" },
+                        },
+                    },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let table = match value {
+            Value::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let disk = decl.disk.as_ref().unwrap();
+        assert_eq!(disk.partitions[2].role, "state");
+        assert!(is_state_partition(&disk.partitions[2]));
+        assert_eq!(disk.partitions[3].role, "system-seed");
+        assert!(!is_state_partition(&disk.partitions[3]));
+    }
+
+    #[test]
+    fn no_state_role_emits_no_split_artifacts_into_the_rootfs() {
+        // Regression guard (ADR-0023): a plain native image must add NO
+        // fstab, no tmpfiles.d and no /var mount. The emit function is
+        // gated by `needs_state_split`; assert the gate is false and the
+        // rootfs is untouched.
+        let image = test_support::sample_image();
+        let plain = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![part_named("root")],
+            swap: None,
+            ab: false,
+        };
+        assert!(!needs_state_split(&image, &plain));
+        let root = tempfile::tempdir().unwrap();
+        // Simulate the pipeline's conditional emission.
+        if needs_state_split(&image, &plain) {
+            let split = resolve_state_split(&image, &plain).unwrap();
+            emit_state_split(root.path(), &split).unwrap();
+        }
+        assert!(!root.path().join(FSTAB_PATH).exists());
+        assert!(!root.path().join(STATE_TMPFILES_PATH).exists());
+        assert!(!root.path().join(VAR_TMPFILES_PATH).exists());
     }
 
     #[test]
@@ -3209,6 +3534,15 @@ mod tests {
             calls: Mutex<Vec<Vec<String>>>,
             arch: String,
             digest: String,
+            /// `etc/fstab` contents observed in a populate source tree — the
+            /// staged rootfs the fake `mkfs.ext4 -d` reads is removed when
+            /// the build returns, so the fake captures the emitted split
+            /// here for the ADR-0023 assertions.
+            fstabs: Mutex<Vec<String>>,
+            /// Relative split paths (`fstab`, tmpfiles) observed in a
+            /// populate source tree — proves both presence (state images)
+            /// and absence (regression guard).
+            split_paths: Mutex<Vec<String>>,
         }
 
         impl E2eRunner {
@@ -3217,11 +3551,21 @@ mod tests {
                     calls: Mutex::new(Vec::new()),
                     arch: arch.to_string(),
                     digest: digest.to_string(),
+                    fstabs: Mutex::new(Vec::new()),
+                    split_paths: Mutex::new(Vec::new()),
                 }
             }
 
             fn calls(&self) -> Vec<Vec<String>> {
                 self.calls.lock().unwrap().clone()
+            }
+
+            fn fstabs(&self) -> Vec<String> {
+                self.fstabs.lock().unwrap().clone()
+            }
+
+            fn split_paths(&self) -> Vec<String> {
+                self.split_paths.lock().unwrap().clone()
             }
 
             fn saw(&self, program: &str) -> bool {
@@ -3254,18 +3598,21 @@ mod tests {
             .into_bytes()
         }
 
-        /// The `sfdisk -J` read-back for the disk fixture's three partitions
-        /// (ESP 64M, root 256M, data 256M) at 512-byte sectors.
-        fn sfdisk_json() -> Vec<u8> {
+        /// The `sfdisk -J` read-back for the disk fixture's partitions at
+        /// 512-byte sectors. `n` partitions are synthesized, each 256M,
+        /// contiguous — enough for the pipeline's extents read-back.
+        fn sfdisk_json(n: usize) -> Vec<u8> {
+            let parts: Vec<serde_json::Value> = (0..n)
+                .map(|i| {
+                    serde_json::json!({
+                        "start": 2048 + i * 524288,
+                        "size": 524288,
+                        "uuid": format!("{:08x}-1111-1111-1111-111111111111", i + 1),
+                    })
+                })
+                .collect();
             serde_json::json!({
-                "partitiontable": {
-                    "sector-size": 512,
-                    "partitions": [
-                        { "start": 2048, "size": 131072, "uuid": "11111111-1111-1111-1111-111111111111" },
-                        { "start": 133120, "size": 524288, "uuid": "22222222-2222-2222-2222-222222222222" },
-                        { "start": 657408, "size": 524288, "uuid": "33333333-3333-3333-3333-333333333333" }
-                    ]
-                }
+                "partitiontable": { "sector-size": 512, "partitions": parts }
             })
             .to_string()
             .into_bytes()
@@ -3343,9 +3690,41 @@ mod tests {
                         Ok(out(0, Vec::new()))
                     }
                     "parted" | "mkfs.vfat" | "mkfs.ext4" | "mmd" | "mcopy" | "find" => {
+                        // For the ADR-0023 split, capture the emitted fstab
+                        // from the populate source tree (removed when the
+                        // build returns) before answering.
+                        if program == "mkfs.ext4" {
+                            if let Some(dir) = arg_after(argv, "-d") {
+                                if let Ok(fstab) =
+                                    std::fs::read_to_string(Path::new(dir).join(FSTAB_PATH))
+                                {
+                                    self.fstabs.lock().unwrap().push(fstab);
+                                }
+                                for rel in [FSTAB_PATH, STATE_TMPFILES_PATH, VAR_TMPFILES_PATH] {
+                                    if Path::new(dir).join(rel).exists() {
+                                        self.split_paths.lock().unwrap().push(rel.to_string());
+                                    }
+                                }
+                            }
+                        }
                         Ok(out(0, Vec::new()))
                     }
-                    "sfdisk" => Ok(out(0, sfdisk_json())),
+                    "sfdisk" => {
+                        // Partition count: one `parted mkpart` per partition
+                        // (plus swap uses mkpart too), so count the recorded
+                        // mkpart calls.
+                        let n = self
+                            .calls
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|c| {
+                                c.first().is_some_and(|p| p == "parted")
+                                    && c.iter().any(|a| a == "mkpart")
+                            })
+                            .count();
+                        Ok(out(0, sfdisk_json(n)))
+                    }
                     "mksquashfs" => {
                         // Materialize the packed artifact as a JSON listing of
                         // the staged rootfs — the in-process structure the
@@ -3608,6 +3987,213 @@ mod tests {
                     >= 4,
                 "mklabel + one mkpart per partition + esp flag: {calls:?}"
             );
+        }
+
+        /// Serialize PATH mutation across parallel tests (PATH is
+        /// process-global) and restore it afterwards, even on panic.
+        static STUB_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        struct PathGuard {
+            old: String,
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                std::env::set_var("PATH", &self.old);
+            }
+        }
+
+        /// Put no-op stubs for the disk pre-flight tools on the process
+        /// PATH so `find_host_tool` resolves them and `build_disk_image_with`
+        /// is not blocked before it runs. The fake runner answers every
+        /// actual invocation, so the stubs are never executed. Returns a
+        /// guard that restores PATH on drop.
+        fn stub_disk_tool_path(stub_dir: &Path) -> PathGuard {
+            use std::os::unix::fs::PermissionsExt;
+            let lock = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            for tool in ["sfdisk", "mmd", "mcopy", "mkfs.ext4", "mkfs.vfat"] {
+                let path = stub_dir.join(tool);
+                std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let old = std::env::var("PATH").unwrap_or_default();
+            std::env::set_var("PATH", format!("{}:{old}", stub_dir.display()));
+            PathGuard { old, _lock: lock }
+        }
+
+        #[test]
+        fn build_disk_image_with_state_role_emits_the_var_split() {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let _path_guard = stub_disk_tool_path(stub_dir.path());
+
+            let (_cache_dir, cache, digest) = cache_fixture();
+            let image = ImageDeclaration {
+                name: "e2estate".into(),
+                version: "1.0.0".into(),
+                base: pinned_base(&digest),
+                kernel: None,
+                gadget: None,
+                gadget_channel: None,
+                extra_snaps: vec![],
+                bootloader: None,
+                disk: Some(DiskLayout {
+                    label: "gpt".into(),
+                    partitions: vec![
+                        Partition {
+                            name: "UEFI".into(),
+                            size: "64M".into(),
+                            fs: "vfat".into(),
+                            mount: "/boot/efi".into(),
+                            options: vec![],
+                            role: String::new(),
+                        },
+                        Partition {
+                            name: "root".into(),
+                            size: "256M".into(),
+                            fs: "ext4".into(),
+                            mount: "/".into(),
+                            options: vec![],
+                            role: String::new(),
+                        },
+                        Partition {
+                            name: "state".into(),
+                            size: "256M".into(),
+                            fs: "ext4".into(),
+                            mount: "/var/lib".into(),
+                            options: vec![],
+                            role: ROLE_STATE.into(),
+                        },
+                    ],
+                    swap: None,
+                    ab: false,
+                }),
+                sysctl: vec![],
+                update_source: None,
+            };
+
+            let output = tempfile::tempdir().unwrap();
+            let runner = E2eRunner::new("amd64", &digest);
+            let mut lockfile = LockFile::empty();
+            let img = build_disk_image_with(
+                &runner,
+                &image,
+                output.path(),
+                &cache,
+                "latest/stable",
+                "amd64",
+                &mut lockfile,
+            )
+            .expect("disk build with a state role must complete");
+            assert!(img.is_file(), "disk artifact written: {}", img.display());
+            // The split was emitted into the staged rootfs before populate.
+            // The fake captured /etc/fstab out of each `mkfs.ext4 -d`
+            // source tree (the staged root is removed once the build
+            // returns), so assert the emitted split directly.
+            let calls = runner.calls();
+            assert!(runner.saw("sfdisk"));
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.first().is_some_and(|p| p == "parted")
+                        && c.iter().any(|a| a == "state")),
+                "the state partition is declared to parted: {calls:?}"
+            );
+            let fstabs = runner.fstabs();
+            assert!(
+                fstabs
+                    .iter()
+                    .any(|f| f.contains("PARTLABEL=state /var/lib")),
+                "state mount in an emitted fstab: {fstabs:?}"
+            );
+            assert!(
+                fstabs
+                    .iter()
+                    .any(|f| f.contains("tmpfs /var tmpfs mode=0755,nosuid,nodev")),
+                "volatile /var in an emitted fstab: {fstabs:?}"
+            );
+            let split_paths = runner.split_paths();
+            for rel in [FSTAB_PATH, STATE_TMPFILES_PATH, VAR_TMPFILES_PATH] {
+                assert!(
+                    split_paths.iter().any(|p| p == rel),
+                    "state image emits {rel}: {split_paths:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn build_disk_image_without_state_role_emits_no_split_files() {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let _path_guard = stub_disk_tool_path(stub_dir.path());
+
+            let (_cache_dir, cache, digest) = cache_fixture();
+            let image = ImageDeclaration {
+                name: "e2eplain".into(),
+                version: "1.0.0".into(),
+                base: pinned_base(&digest),
+                kernel: None,
+                gadget: None,
+                gadget_channel: None,
+                extra_snaps: vec![],
+                bootloader: None,
+                disk: Some(DiskLayout {
+                    label: "gpt".into(),
+                    partitions: vec![
+                        Partition {
+                            name: "UEFI".into(),
+                            size: "64M".into(),
+                            fs: "vfat".into(),
+                            mount: "/boot/efi".into(),
+                            options: vec![],
+                            role: String::new(),
+                        },
+                        Partition {
+                            name: "root".into(),
+                            size: "256M".into(),
+                            fs: "ext4".into(),
+                            mount: "/".into(),
+                            options: vec![],
+                            role: String::new(),
+                        },
+                        Partition {
+                            name: "data".into(),
+                            size: "256M".into(),
+                            fs: "ext4".into(),
+                            mount: "/data".into(),
+                            options: vec![],
+                            role: String::new(),
+                        },
+                    ],
+                    swap: None,
+                    ab: false,
+                }),
+                sysctl: vec![],
+                update_source: None,
+            };
+
+            let output = tempfile::tempdir().unwrap();
+            let runner = E2eRunner::new("amd64", &digest);
+            let mut lockfile = LockFile::empty();
+            let img = build_disk_image_with(
+                &runner,
+                &image,
+                output.path(),
+                &cache,
+                "latest/stable",
+                "amd64",
+                &mut lockfile,
+            )
+            .expect("plain disk build must complete");
+            assert!(img.is_file());
+            // The staged rootfs the runner saw must carry no ADR-0023
+            // artifacts: the fake captures every split path it sees in a
+            // populate source tree, and a plain image emits none.
+            let split_paths = runner.split_paths();
+            assert!(
+                split_paths.is_empty(),
+                "plain image must emit no split artifacts: {split_paths:?}"
+            );
+            assert!(runner.fstabs().is_empty(), "no fstab for a plain image");
         }
     }
 }
