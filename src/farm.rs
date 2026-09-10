@@ -350,6 +350,28 @@ fn hardlink_assembly_blob(store: &RuntimeStore, dest: &Path, sha256: &str) -> mi
     std::fs::create_dir_all(parent)
         .map_err(|e| miette::miette!("creating assembly dir {}: {e}", parent.display()))?;
     let blob = store.blob_path(sha256);
+    // Idempotent: a payload may record the command binary AND the same
+    // path as a sibling (e.g. bun ships `usr/bin/bunx`, and the binary's
+    // own entry can collide with a sibling entry). A prior emit of this
+    // generation can also leave the leaf in place. If `dest` already
+    // points at the same blob, nothing to do; otherwise drop the stale
+    // leaf and relink (replace, never fail).
+    if let Ok(meta) = std::fs::symlink_metadata(dest) {
+        if meta.file_type().is_file() {
+            use std::os::unix::fs::MetadataExt;
+            let same = std::fs::metadata(dest)
+                .and_then(|d| {
+                    std::fs::metadata(&blob).map(|b| (d.dev(), d.ino()) == (b.dev(), b.ino()))
+                })
+                .unwrap_or(false);
+            if same {
+                return Ok(());
+            }
+        }
+        std::fs::remove_file(dest).map_err(|e| {
+            miette::miette!("replacing stale assembly entry {}: {e}", dest.display())
+        })?;
+    }
     std::fs::hard_link(&blob, dest).map_err(|e| {
         if e.raw_os_error() == Some(libc::EXDEV) {
             miette::miette!(
