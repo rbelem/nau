@@ -25,9 +25,5 @@ stage/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# OpenCode / GSD local state
-.opencode/gsd-install-state.json
-.opencode/gsd-file-manifest.json
-
 # CodeGraph index
 .codegraph/

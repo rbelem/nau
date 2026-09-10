@@ -1,4 +1,3 @@
-<!-- generated-by: gsd-doc-writer -->
 # Cross-Distro Synthesis — Best of Each World for shoot
 
 > **Purpose:** Single design synthesis combining the three research streams — Ubuntu Core, Fedora
