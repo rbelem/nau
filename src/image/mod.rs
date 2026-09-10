@@ -3491,9 +3491,9 @@ mod tests {
             // e2fsprogs fails closed BEFORE any runner call. This test instead
             // drives the disk-side partition pipeline — `create_partitions`,
             // `read_partition_extents`, `apply_gpt_slot_metadata`, and
-            // `populate_remaining_partitions` — through the fake runner,
-            // proving every tool call in partition.rs/verity.rs is routed
-            // through the seam and the image is spliced in process.
+            // `populate_remaining_partitions` (with NO skip, so the root
+            // populate also runs) — through the fake runner, proving every
+            // tool call in partition.rs/verity.rs is routed through the seam.
             let work = tempfile::tempdir().unwrap();
             let runner = E2eRunner::new("amd64", "unused");
             let layout = DiskLayout {
@@ -3535,10 +3535,6 @@ mod tests {
             assert_eq!(extents.len(), 3, "read-back yields every partition");
             assert_eq!(extents[1].size_bytes, 256 * 1024 * 1024);
 
-            let slots = Slots {
-                roots: vec![1],
-                hashes: vec![None],
-            };
             let image = ImageDeclaration {
                 name: "e2edisk".into(),
                 version: "2.0.0".into(),
@@ -3565,7 +3561,22 @@ mod tests {
                 uki_stage: Path::new(""),
                 uc: None,
             };
-            populate_remaining_partitions(&runner, &ctx, &layout, &slots.roots).unwrap();
+            // Empty skip list: the root partition (index 1) is populated too.
+            // A `roots: vec![1]` skip list would silently bypass the
+            // assembled-rootfs `mkfs.ext4 -d` path this test exists to cover.
+            populate_remaining_partitions(&runner, &ctx, &layout, &[]).unwrap();
+
+            // `apply_gpt_slot_metadata` returns early unless `layout.ab`, so
+            // drive it with an A/B twin to prove slot metadata reaches the seam.
+            let ab_layout = DiskLayout {
+                ab: true,
+                ..layout.clone()
+            };
+            let slots = Slots {
+                roots: vec![1],
+                hashes: vec![None],
+            };
+            apply_gpt_slot_metadata(&runner, &img_path, &image, &ab_layout, &slots).unwrap();
 
             // Seam proof: each disk-side tool was routed through the runner.
             let calls = runner.calls();
@@ -3573,8 +3584,17 @@ mod tests {
             assert!(runner.saw("parted"), "parted through the runner");
             assert!(runner.saw("sfdisk"), "sfdisk read-back through the runner");
             assert!(runner.saw("mkfs.vfat"), "ESP mkfs through the runner");
-            assert!(runner.saw("mkfs.ext4"), "data mkfs through the runner");
             assert!(runner.saw("mmd"), "mtools mmd through the runner");
+            // Exactly two mkfs.ext4: the data partition AND the populated
+            // root. One would mean the root populate was skipped.
+            let mkfs_ext4 = calls
+                .iter()
+                .filter(|c| c.first().is_some_and(|p| p == "mkfs.ext4"))
+                .count();
+            assert_eq!(
+                mkfs_ext4, 2,
+                "data + populated root both formatted: {calls:?}"
+            );
             let sf = calls
                 .iter()
                 .find(|c| c.first().is_some_and(|p| p == "sfdisk"))

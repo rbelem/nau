@@ -1876,6 +1876,10 @@ fn run_degraded(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, Str
     cmd.current_dir(project);
     cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
     cmd.env("PATH", "");
+    // Belt-and-braces with the empty PATH above: the empty PATH already
+    // makes find_on_path resolve no systemd tool, but state the intent
+    // explicitly so this stays off the bus if the PATH assumption changes.
+    cmd.env("SHUTTLE_SYSTEMD", "off");
     let out = cmd.output().expect("failed to spawn shuttle");
     (
         out.status.code(),
