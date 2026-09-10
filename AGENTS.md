@@ -1,119 +1,27 @@
 # shuttle — AGENTS.md
 
-## Project
+Rust CLI that builds Snap packages from Lua declarations — a programmable
+replacement for Snapcraft's YAML. GPL-3.0-only, Linux-only. Formerly named
+*shoot* (ADR-0013). Package manager: Cargo, pinned through devbox (not npm).
 
-Rust CLI tool. GPL v3 (`LICENSE`).
+## Build, test, lint
 
-Planning phase — 8-phase roadmap defined, no code yet.
-
-## Quickstart (once `Cargo.toml` exists)
+Use the pinned devbox toolchain — do not assume the system `cargo` matches:
 
 ```bash
-cargo build           # debug build
-cargo build --release # release build
-cargo run             # run the binary
-cargo test            # all tests
-cargo test <name>     # single test / test file
-cargo clippy          # lint (warnings are errors)
-cargo fmt             # format
+devbox run -- build       # cargo build
+devbox run -- test        # cargo test (unit + integration)
+devbox run -- clippy      # cargo clippy -- -D warnings
+devbox run -- fmt-check   # cargo fmt --check
+devbox run -- check       # test + clippy + fmt-check
 ```
 
-## Build artifacts
+Run `devbox run -- check` before committing or pushing. Clippy warnings are errors.
 
-`debug/`, `target/`, `*.rs.bk`, `*.pdb`, `**/mutants.out/` — all gitignored.
+## Detail docs
 
-## Testing
-
-- Tests live in `src/` alongside code (Rust convention).
-- No integration test fixtures or external services needed at this stage.
-- `cargo test` is the single command.
-
-## Conventions
-
-- `cargo fmt` before committing.
-- Keep `clippy` clean — treat warnings as errors.
-- Conventional commits for commit messages.
-
-## Planning (archived)
-
-Planning moved to grill-with-docs format. Historical files live in `.planning/archive/`:
-
-- `CONTEXT.md` — domain glossary, canonical terms, flagged ambiguities
-- `docs/adr/` — architecture decision records
-- `.planning/archive/ROADMAP.md` — phased implementation history
-- `.planning/archive/REQUIREMENTS.md` — 17 v1 requirements
-
-<!-- GSD:project-start source:PROJECT.md -->
-## Project
-
-**shuttle**
-
-A Rust CLI tool that builds Snap packages from Lua declarations. Inspired by Nix's declarative reproducibility and Neovim's Lua-based configurability, `shuttle` replaces Snapcraft's YAML with a programmable, composable Lua DSL. Single snaps first — growing toward full Ubuntu Core image assembly (the ShuttleOS distro).
-
-**Core Value:** Define any Snap package with a simple Lua file — no Snapcraft YAML needed. Packaged, composable, version-controllable.
-
-### Constraints
-
-- **Language**: Rust stable only — no nightly features
-- **Platform**: Linux (snaps target Linux; `mksquashfs` is Linux-native)
-- **Output**: Standard `.snap` format compatible with `snapd`
-- **License**: GPL v3 (inherited from project)
-<!-- GSD:project-end -->
-
-<!-- GSD:stack-start source:STACK.md -->
-## Technology Stack
-
-Technology stack not yet documented. Will populate after codebase mapping or first phase.
-<!-- GSD:stack-end -->
-
-<!-- GSD:conventions-start source:CONVENTIONS.md -->
-## Conventions
-
-Conventions not yet established. Will populate as patterns emerge during development.
-<!-- GSD:conventions-end -->
-
-<!-- GSD:architecture-start source:ARCHITECTURE.md -->
-## Architecture
-
-Architecture not yet mapped. Follow existing patterns found in the codebase.
-<!-- GSD:architecture-end -->
-
-<!-- GSD:skills-start source:skills/ -->
-## Project Skills
-
-No project skills found. Add skills to any of: `.claude/skills/`, `.agents/skills/`, `.cursor/skills/`, `.github/skills/`, or `.codex/skills/` with a `SKILL.md` index file.
-<!-- GSD:skills-end -->
-
-<!-- GSD:workflow-start source:GSD defaults -->
-## GSD Workflow Enforcement
-
-Before using Edit, Write, or other file-changing tools, start work through a GSD command so planning artifacts and execution context stay in sync.
-
-Use these entry points:
-- `/gsd-quick` for small fixes, doc updates, and ad-hoc tasks
-- `/gsd-debug` for investigation and bug fixing
-- `/gsd-execute-phase` for planned phase work
-
-Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
-<!-- GSD:workflow-end -->
-
-<!-- GSD:profile-start -->
-## Developer Profile
-
-> Profile not yet configured. Run `/gsd-profile-user` to generate your developer profile.
-> This section is managed by `generate-claude-profile` -- do not edit manually.
-<!-- GSD:profile-end -->
-
-## Agent skills
-
-### Issue tracker
-
-Issues are tracked in GitHub Issues on `rbelem/shuttle`. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-The five canonical triage roles use default label names. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+- [Build & test](docs/agents/build-and-test.md) — commands, test layout, gates
+- [Git workflow](docs/agents/git-workflow.md) — commits, generated files
+- [Planning & docs](docs/agents/planning-and-docs.md) — grill-with-docs, CONTEXT.md, ADRs
+- [Project context](docs/agents/project-context.md) — constraints, stack, where things live
+- [Domain model](docs/agents/domain.md) · [Issue tracker](docs/agents/issue-tracker.md) · [Triage labels](docs/agents/triage-labels.md)
