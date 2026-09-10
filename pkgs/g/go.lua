@@ -69,11 +69,18 @@ return {
         requires = {},
 
         apps = {
+            -- Point at the usr/bin WRAPPER, not usr/lib/go/bin/go: the
+            -- raw binary is GOROOT-trimmed and resolves its root relative
+            -- to its own location, which breaks under the farm/assembly
+            -- relayout. The wrapper execs its sibling `../lib/go/bin/go`
+            -- from a stable usr/bin position, so GOROOT lands at
+            -- usr/lib/go from the store tree, the merged build prefix, or
+            -- a pod assembly alike.
             go = app {
-                command = "usr/lib/go/bin/go",
+                command = "usr/bin/go",
             },
             gofmt = app {
-                command = "usr/lib/go/bin/gofmt",
+                command = "usr/bin/gofmt",
             },
         },
     },
