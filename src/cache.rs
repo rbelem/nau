@@ -5,16 +5,17 @@
 //! Each cached snap is stored as:
 //!
 //! ```text
-//! <cache_dir>/v2:<closure_sha256>/<name>_<version>_<arch>.snap
+//! <cache_dir>/v4:<closure_sha256>/<name>_<version>_<arch>.snap
 //! ```
 //!
-//! The directory key is `v2:` + SHA-256 over the canonical build-input
-//! closure ([`BuildClosure`]): source identity, parts spec, cross-compilation
-//! target, and the resolved `requires` closure. Any change to any of these
-//! changes the key and forces a fresh build (gap-analysis §4.3: the cache is
-//! keyed by the full input closure, not just the source tarball). The `v2:`
-//! prefix version-bumps deliberately: keys from the old source-only format
-//! simply miss once and rebuild — an accepted one-time cold-cache break.
+//! The directory key is `v4:` + SHA-256 over the canonical build-input
+//! closure ([`BuildClosure`]): source identity, parts spec (including the
+//! single-command `build` form), cross-compilation target, and the resolved
+//! `requires` closure. Any change to any of these changes the key and forces
+//! a fresh build (gap-analysis §4.3: the cache is keyed by the full input
+//! closure, not just the source tarball). The `v4:` prefix version-bumps
+//! deliberately: keys from older formats simply miss once and rebuild — an
+//! accepted one-time cold-cache break.
 //! Meta/store packages (closure source `none`) are never cached.
 //!
 //! Usage:
@@ -56,8 +57,14 @@ const NO_SOURCE_HASH: &str = "none";
 ///
 /// v3 adds `build_deps` to the closure (ADR-0018 Decision 4, issue #22):
 /// a changed build dependency must invalidate the cache key.
-const CLOSURE_FORMAT_VERSION: u32 = 3;
-const KEY_PREFIX: &str = "v3";
+///
+/// v4 folds the single-command `build` field into the `parts` component
+/// when a snap has no `parts` table (the pre-parts form `build = "..."`).
+/// Before v4 a changed build script with a constant source/version/url
+/// produced an identical cache key and served a stale artifact. The `v4:`
+/// prefix cold-misses old v3 entries once.
+const CLOSURE_FORMAT_VERSION: u32 = 4;
+const KEY_PREFIX: &str = "v4";
 
 /// Target value for builds without an explicit cross-compilation triplet.
 const NATIVE_TARGET: &str = "native";
@@ -91,7 +98,7 @@ pub struct RequiresMember {
 ///
 /// ```json
 /// {
-///   "format_version": 3,
+///   "format_version": 4,
 ///   "parts": "<canonical parts JSON>",
 ///   "requires": [{"hash": "…|null", "name": "…", "pin": "…|null"}],
 ///   "build_deps": [{"hash": "…|null", "name": "…", "pin": "…|null"}],
@@ -113,6 +120,9 @@ pub struct BuildClosure {
     /// out of the canonical JSON so their keys stay byte-identical).
     pub sources: Vec<SourceClosureMember>,
     /// Canonical parts JSON ([`canonical_parts_json`]); empty when no parts.
+    /// When a snap has no `parts` table, carries the single-command `build`
+    /// field in the same one-element-parts shape (v4), so a changed build
+    /// script invalidates the key.
     pub parts: String,
     /// Cross-compilation target triplet, or `native`.
     pub target: String,
@@ -138,11 +148,27 @@ impl BuildClosure {
         let mut build_deps = build_deps;
         build_deps.sort_by(|a, b| a.name.cmp(&b.name));
         build_deps.dedup_by(|a, b| a.name == b.name);
-        let parts = meta
-            .parts
-            .as_ref()
-            .map(canonical_parts_json)
-            .unwrap_or_default();
+        let parts = match meta.parts.as_ref() {
+            Some(parts) => canonical_parts_json(parts),
+            // Pre-parts single-command form (`build = "..."`): the build
+            // script IS the build spec, so it must participate in the key
+            // (v4). Serialize in the same `[{name,build,after}]` shape as a
+            // one-element parts table so a snap that migrates from
+            // `build = "x"` to `parts = { core = { build = "x" } }` keeps
+            // as much key stability as the format allows.
+            None => meta
+                .build
+                .as_ref()
+                .map(|build| {
+                    serde_json::to_string(&vec![serde_json::json!({
+                        "name": "core",
+                        "build": build,
+                        "after": Vec::<String>::new(),
+                    })])
+                    .unwrap_or_else(|_| "unserializable".to_string())
+                })
+                .unwrap_or_default(),
+        };
         // Multi-source identity (issue #41): every named source's url +
         // pinned hash joins the closure, so a changed or swapped source
         // invalidates the key. BTreeMap iteration is sorted, so the JSON
@@ -201,7 +227,7 @@ impl BuildClosure {
         json.to_string()
     }
 
-    /// Version-prefixed cache key: `v2:<sha256 of canonical JSON>`.
+    /// Version-prefixed cache key: `v4:<sha256 of canonical JSON>`.
     pub fn cache_key(&self) -> String {
         format!("{}:{}", KEY_PREFIX, sha256_hex(&self.canonical_json()))
     }
@@ -642,14 +668,39 @@ mod tests {
     }
 
     #[test]
-    fn test_closure_key_format_v3() {
+    fn test_closure_key_format_v4() {
         let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
         let key = BuildClosure::for_meta(&meta, vec![], vec![]).cache_key();
-        // "v3:" prefix + 64-char hex digest (v3 adds build_deps to the
-        // closure—ADR-0018 Decision 4, issue #22).
-        let hex = key.strip_prefix("v3:").expect("key must be v3-prefixed");
+        // "v4:" prefix + 64-char hex digest (v4 folds the single-command
+        // `build` field into the key; v3 added build_deps).
+        let hex = key.strip_prefix("v4:").expect("key must be v4-prefixed");
         assert_eq!(hex.len(), 64);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_closure_key_varies_with_single_build_command() {
+        // v4 regression: the pre-parts form `build = "..."` (no `parts`
+        // table) must participate in the cache key. Before v4, a changed
+        // build script with an unchanged source produced an identical key
+        // and served a stale artifact (issue: cache-key hole).
+        let meta = make_source_meta("hello", "https://example.com/hello.tar.gz");
+        assert_eq!(meta.parts, None);
+        let original = BuildClosure::for_meta(&meta, vec![], vec![]).cache_key();
+
+        let mut changed = meta.clone();
+        changed.build = Some("make all".into());
+        let changed_key = BuildClosure::for_meta(&changed, vec![], vec![]).cache_key();
+
+        assert_ne!(
+            original, changed_key,
+            "a changed single-command build script must rekey"
+        );
+        // Same build script → stable key.
+        assert_eq!(
+            original,
+            BuildClosure::for_meta(&meta, vec![], vec![]).cache_key()
+        );
     }
 
     #[test]
@@ -666,10 +717,12 @@ mod tests {
         );
         let expected_source = sha256_hex("hello:1.0:https://example.com/hello.tar.gz");
         // Locks the exact deterministic schema: sorted keys, null hashes.
+        // v4: the single-command `build` field folds into `parts` (the
+        // pre-parts form), so a changed build script invalidates the key.
         assert_eq!(
             closure.canonical_json(),
             format!(
-                r#"{{"build_deps":[],"format_version":3,"parts":"","requires":[{{"hash":null,"name":"zlib","pin":"1.3"}}],"source":"{expected_source}","target":"native"}}"#
+                r#"{{"build_deps":[],"format_version":4,"parts":"[{{\"after\":[],\"build\":\"make\",\"name\":\"core\"}}]","requires":[{{"hash":null,"name":"zlib","pin":"1.3"}}],"source":"{expected_source}","target":"native"}}"#
             )
         );
     }

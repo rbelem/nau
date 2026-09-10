@@ -269,6 +269,32 @@ fn attack_globals_enumeration_and_fenv_escape_attempts() {
     );
 }
 
+const MATH_RANDOM_SCRIPT: &str = r#"
+-- determinism gate: math.random/randomseed must be removed from the worker
+-- (MATH stdlib is loaded, but wall-clock seeding would make manifest output
+-- nondeterministic and cache keys unstable).
+return {
+  has_random = tostring(math.random),
+  has_randomseed = tostring(math.randomseed),
+  name = "x", version = "1",
+}
+"#;
+
+#[test]
+fn attack_math_random_removed_from_worker() {
+    let r = run("attack-math-random", MATH_RANDOM_SCRIPT);
+    assert_eq!(
+        out_str(&r, "has_random"),
+        "nil",
+        "math.random must be removed from the worker VM (determinism)"
+    );
+    assert_eq!(
+        out_str(&r, "has_randomseed"),
+        "nil",
+        "math.randomseed must be removed from the worker VM (determinism)"
+    );
+}
+
 fn contains_name(globals: &str, name: &str) -> bool {
     globals.split(',').any(|g| g == name)
 }

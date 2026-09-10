@@ -138,7 +138,7 @@ pub struct SnapOutputEntry {
     /// Architectures the output builds for.
     pub archs: Vec<String>,
 
-    /// Phase 22a canonical build closure key (`v2:<sha256>`): the content
+    /// Phase 22a canonical build closure key (`v4:<sha256>`): the content
     /// address the binary cache stores this output under. The most precise
     /// addressing available before Phase 22b's file-level store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1214,7 +1214,7 @@ mod tests {
         assert_eq!(entry.version.as_deref(), Some("1.2.3"));
         let key = entry.closure_key.as_deref().unwrap();
         assert!(
-            key.starts_with("v3:"),
+            key.starts_with("v4:"),
             "Phase 22a closure key required: {key}"
         );
         assert_eq!(entry.artifact.state, ArtifactState::Unbuilt);

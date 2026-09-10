@@ -742,6 +742,17 @@ fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
         .set("print", print_fn)
         .map_err(|e| miette::miette!("{e}"))?;
 
+    // The MATH stdlib is loaded, but `math.random` is seeded from the wall
+    // clock by the Luau VM — a manifest that calls it produces nondeterministic
+    // recipe data that flows into cache keys. Remove both doors (ADR-0010
+    // Decision 4 determinism; `os` is already excluded by the stdlib mask).
+    if let Ok(math) = lua.globals().get::<mlua::Table>("math") {
+        math.set("random", mlua::Value::Nil)
+            .map_err(|e| miette::miette!("failed to remove math.random: {e}"))?;
+        math.set("randomseed", mlua::Value::Nil)
+            .map_err(|e| miette::miette!("failed to remove math.randomseed: {e}"))?;
+    }
+
     install_require(&lua, &req.sources)?;
 
     Ok(lua)

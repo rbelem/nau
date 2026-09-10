@@ -693,6 +693,9 @@ fn select_outputs<'a>(
                 }
                 vec.push((name, meta));
             }
+            // `Outputs` is a HashMap: without a stable sort, multi-output
+            // definitions build in nondeterministic order run to run.
+            vec.sort_by(|(a, _), (b, _)| a.cmp(b));
             if let Some(t) = target {
                 if !json {
                     shuttle::output::info(format!("target: {t}"));
@@ -1214,7 +1217,13 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
                 .ok_or_else(|| miette::miette!("output '{}' not found in {}", name, file))?;
             vec![meta]
         }
-        None => all_outputs.values().collect(),
+        None => {
+            // `Outputs` is a HashMap: sort for deterministic multi-output
+            // report order run to run.
+            let mut metas: Vec<(&String, &shuttle::snap::SnapMeta)> = all_outputs.iter().collect();
+            metas.sort_by(|(a, _), (b, _)| a.cmp(b));
+            metas.into_iter().map(|(_, meta)| meta).collect()
+        }
     };
 
     for meta in &iter {
