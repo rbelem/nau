@@ -40,7 +40,11 @@
 //! Activation links the tree into `<extensions-link-dir>/<pkg>` (default
 //! `/var/lib/extensions/<pkg>`) and runs `systemd-sysext refresh`,
 //! `systemctl daemon-reload`, and unit enable/start — all best-effort:
-//! warn, never fail, when the binary is absent.
+//! warn, never fail, when the binary is absent. Production resolves those
+//! binaries with [`RuntimeTools::from_host`]; the test-aware
+//! [`RuntimeTools::for_pod_runtime`] resolves them to `None` when
+//! `SHUTTLE_SYSTEMD` is `off`/`0`/`no`, or when the host has no systemd
+//! (`/run/systemd/system` absent) — so tests never reach the system bus.
 //!
 //! # Generations
 //!
@@ -350,6 +354,68 @@ impl RuntimeTools {
             bootctl: find_on_path("bootctl"),
         }
     }
+
+    /// Resolve the tools the way the POD paths want them: the host
+    /// binaries, but with the system-bus set (`systemd-sysext`,
+    /// `systemctl`, `bootctl`) resolved to `None` when the host has no
+    /// systemd at all, or when [`systemd_disabled`] says so.
+    ///
+    /// Production on a systemd host is byte-identical to [`from_host`];
+    /// the fallbacks only fire where running the real tools could never
+    /// succeed (a container without `/run/systemd/system`) or where the
+    /// caller explicitly opted out. `unsquashfs` is never suppressed: it
+    /// unpacks payloads and has nothing to do with the system bus.
+    ///
+    /// [`from_host`]: RuntimeTools::from_host
+    pub fn for_pod_runtime() -> RuntimeTools {
+        let mut tools = RuntimeTools::from_host();
+        if systemd_disabled() {
+            tools.systemd_sysext = None;
+            tools.systemctl = None;
+            tools.bootctl = None;
+        }
+        tools
+    }
+
+    /// Suppress the system-bus tools (test seam / explicit opt-out):
+    /// `systemd-sysext`, `systemctl` and `bootctl` become `None`, so
+    /// `activate` and the unit helpers skip them without touching any
+    /// bus. `unsquashfs` is kept.
+    pub fn without_systemd(mut self) -> RuntimeTools {
+        self.systemd_sysext = None;
+        self.systemctl = None;
+        self.bootctl = None;
+        self
+    }
+}
+
+/// `SHUTTLE_SYSTEMD` semantics for the system-bus tools:
+///
+/// - `off` / `0` / `no` → suppress them (tests pin this to keep the
+///   suite off the real bus).
+/// - `on` / `1` / `yes`  → always resolve them from the host PATH, even
+///   on a host without `/run/systemd/system` (explicit override).
+/// - unset / anything else → suppress them when the host has no
+///   systemd ([`systemd_present`]); otherwise resolve from the host.
+fn systemd_disabled() -> bool {
+    match std::env::var("SHUTTLE_SYSTEMD")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "0" | "no" => true,
+        "on" | "1" | "yes" => false,
+        _ => !systemd_present(),
+    }
+}
+
+/// Whether the host runs systemd: `/run/systemd/system` exists on every
+/// booted systemd host (it is the `RuntimeDirectory` of systemd itself).
+/// Pod deployments are not systemd-scoped, so their runtime paths do not
+/// need the system bus.
+fn systemd_present() -> bool {
+    Path::new("/run/systemd/system").exists()
 }
 
 fn find_on_path(tool: &str) -> Option<PathBuf> {
@@ -700,8 +766,8 @@ impl RuntimeStore {
             .iter()
             .flat_map(|p| p.units.iter().map(|u| u.unit_name.clone()))
             .collect();
-        let mut activate_notes = self.activate(n, tools)?;
-        notes.append(&mut activate_notes);
+        let activator = self.activate(n, tools)?;
+        notes.extend(activator.notes);
         for unit in &new_units {
             run_best_effort(
                 &tools.systemctl,
@@ -772,8 +838,8 @@ impl RuntimeStore {
                 &mut notes,
             );
         }
-        let mut activate_notes = self.activate(n, tools)?;
-        notes.append(&mut activate_notes);
+        let activator = self.activate(n, tools)?;
+        notes.extend(activator.notes);
 
         std::fs::remove_file(self.journal_path())
             .into_diagnostic()
@@ -841,8 +907,8 @@ impl RuntimeStore {
         let (started, stopped) = reconcile_units(&active.packages, &target_gen.packages);
 
         self.begin_journal("rollback", to);
-        let mut activate_notes = self.activate(to, tools)?;
-        notes.append(&mut activate_notes);
+        let activator = self.activate(to, tools)?;
+        notes.extend(activator.notes);
         for unit in &started {
             run_best_effort(
                 &tools.systemctl,
@@ -1515,23 +1581,42 @@ impl RuntimeStore {
     /// the generation carries, refresh sysext + daemon-reload
     /// (best-effort). Idempotent — every runtime command can heal a
     /// partially-activated state by re-running activation.
-    fn activate(&self, n: u64, tools: &RuntimeTools) -> miette::Result<Vec<String>> {
+    ///
+    /// The refresh/reload steps warn when their tool is missing or
+    /// failing. `skipped` counts the ones that were deliberately not run
+    /// (tool absent, `/run/systemd/system` missing, or `SHUTTLE_SYSTEMD`
+    /// opted out) — a silent no-op is reported distinctly from a tool
+    /// that ran and failed, so "nothing was exercised" is never mistaken
+    /// for a successful reload.
+    fn activate(&self, n: u64, tools: &RuntimeTools) -> miette::Result<ActivateReport> {
         let mut notes = Vec::new();
         self.flip_active(n)?;
         self.relink_extension_trees(n)?;
-        run_best_effort(
+        let sysext = run_best_effort(
             &tools.systemd_sysext,
             &["refresh"],
             "systemd-sysext refresh",
             &mut notes,
         );
-        run_best_effort(
+        let reload = run_best_effort(
             &tools.systemctl,
             &["daemon-reload"],
             "systemctl daemon-reload",
             &mut notes,
         );
-        Ok(notes)
+        let skipped = [sysext, reload]
+            .into_iter()
+            .filter(|r| *r == ToolOutcome::Skipped)
+            .count();
+        if skipped > 0 {
+            let note = format!(
+                "activation: {skipped} systemd step(s) skipped — system bus not in use \
+                 (no systemd tools resolved)"
+            );
+            crate::output::info(&note);
+            notes.push(note);
+        }
+        Ok(ActivateReport { notes, skipped })
     }
 
     /// Rebuild the sysext links for generation `n`: every tree under
@@ -2009,28 +2094,58 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> miette::Result<()>
 
 /// Best-effort shell-out: a missing tool or a failing command warns and
 /// continues — presentation hiccups must never corrupt durable state.
-fn run_best_effort(tool: &Option<PathBuf>, args: &[&str], what: &str, notes: &mut Vec<String>) {
+/// Returns whether the tool actually ran ([`ToolOutcome::Skipped`] when
+/// it is absent, so callers can report "not exercised" distinctly from
+/// "exited nonzero").
+fn run_best_effort(
+    tool: &Option<PathBuf>,
+    args: &[&str],
+    what: &str,
+    notes: &mut Vec<String>,
+) -> ToolOutcome {
     let Some(tool) = tool else {
-        let note = format!("{what}: skipped ({})", args[0]);
+        let note = format!("{what}: skipped (systemd not in use — {} not run)", args[0]);
         crate::output::warn(&note);
         notes.push(note);
-        return;
+        return ToolOutcome::Skipped;
     };
     match std::process::Command::new(tool).args(args).status() {
         Ok(status) if status.success() => {
             crate::output::ok(what);
+            ToolOutcome::Ran
         }
         Ok(status) => {
             let note = format!("{what}: exited {:?} (continuing)", status.code());
             crate::output::warn(&note);
             notes.push(note);
+            ToolOutcome::Ran
         }
         Err(e) => {
             let note = format!("{what}: {e} (continuing)");
             crate::output::warn(&note);
             notes.push(note);
+            ToolOutcome::Ran
         }
     }
+}
+
+/// Whether a best-effort tool ran ([`Ran`]) or was deliberately not
+/// invoked because it is absent ([`Skipped`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolOutcome {
+    Ran,
+    Skipped,
+}
+
+/// What one activation did: the notes to surface, and how many of the
+/// system-bus steps were deliberately skipped rather than run.
+struct ActivateReport {
+    notes: Vec<String>,
+    /// Count of system-bus steps skipped because their tool is absent.
+    /// Kept on the report so callers (and tests) can assert the
+    /// skipped-vs-failed distinction without parsing notes.
+    #[allow(dead_code)]
+    skipped: usize,
 }
 
 fn sha256_file(path: &Path) -> miette::Result<String> {
@@ -2743,6 +2858,93 @@ plugs:
             format!("{err:#}").contains("no previous generation below 1"),
             "named error: {err:#}"
         );
+    }
+
+    // ── Activation: skipped tools vs failed tools (issue #66) ──
+
+    /// `activate` with every system-bus tool absent reports the skips
+    /// distinctly from a tool that ran and failed: the notes say
+    /// "skipped", and no fake tool is ever executed.
+    #[test]
+    fn activate_without_tools_reports_skips_not_failures() {
+        let f = fixture();
+        seed_generation(&f.store, 1, BTreeMap::new());
+        let report = f.store.activate(1, &RuntimeTools::default()).unwrap();
+        assert_eq!(report.skipped, 2, "sysext refresh + daemon-reload skipped");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("systemd-sysext refresh: skipped")),
+            "sysext skip must be named: {:?}",
+            report.notes
+        );
+        assert!(
+            report.notes.iter().all(|n| !n.contains("exited")),
+            "absent tools must never look like failures: {:?}",
+            report.notes
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("system bus not in use")),
+            "the no-op must be visible as a skip: {:?}",
+            report.notes
+        );
+    }
+
+    /// A tool that runs and FAILS is reported as a failure, not a skip —
+    /// the distinction the issue asks for. Exit 3 is not success.
+    #[test]
+    fn activate_with_failing_tool_reports_failure_not_skip() {
+        let work = tempfile::tempdir().unwrap();
+        let fail: PathBuf = work.path().join("fail-tool");
+        std::fs::write(&fail, "#!/bin/sh\nexit 3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fail, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let tools = RuntimeTools {
+            systemd_sysext: Some(fail.clone()),
+            systemctl: Some(fail),
+            ..RuntimeTools::default()
+        };
+        let f = fixture();
+        seed_generation(&f.store, 1, BTreeMap::new());
+        let report = f.store.activate(1, &tools).unwrap();
+        assert_eq!(report.skipped, 0, "a failing tool RAN, it was not skipped");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("systemd-sysext refresh: exited")),
+            "failure must be named: {:?}",
+            report.notes
+        );
+        assert!(
+            report.notes.iter().all(|n| !n.contains("skipped")),
+            "a run tool must never be reported as skipped: {:?}",
+            report.notes
+        );
+    }
+
+    /// The test-aware constructor suppresses every system-bus tool while
+    /// keeping the unpacker, so tests can never reach the host bus.
+    #[test]
+    fn for_pod_runtime_suppresses_systemd_tools_only() {
+        let tools = RuntimeTools {
+            unsquashfs: Some(PathBuf::from("/fake/unsquashfs")),
+            systemd_sysext: Some(PathBuf::from("/fake/systemd-sysext")),
+            systemctl: Some(PathBuf::from("/fake/systemctl")),
+            bootctl: Some(PathBuf::from("/fake/bootctl")),
+        }
+        .without_systemd();
+        assert_eq!(tools.unsquashfs, Some(PathBuf::from("/fake/unsquashfs")));
+        assert_eq!(tools.systemd_sysext, None);
+        assert_eq!(tools.systemctl, None);
+        assert_eq!(tools.bootctl, None);
     }
 
     // ── GC ──

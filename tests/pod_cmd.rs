@@ -20,6 +20,8 @@ fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, Stri
     // The desktop launcher surface (issue #7) writes to the user data
     // home — redirect it inside the test's tempdir, never the real home.
     cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    // Keep pod activation off the host systemd bus (issue #66).
+    cmd.env("SHUTTLE_SYSTEMD", "off");
     let out = cmd.output().expect("failed to spawn shuttle pod");
     (
         out.status.code(),

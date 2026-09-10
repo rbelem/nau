@@ -351,6 +351,11 @@ fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, Stri
     cmd.args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    // Keep the suite off the real systemd bus: without this, a pod command
+    // that activates reaches `systemctl daemon-reload` on the host bus and
+    // pops a polkit prompt (locally) or silently swallows "Access denied"
+    // (CI). Tests that genuinely want the system tools override this.
+    cmd.env("SHUTTLE_SYSTEMD", "off");
     let out = cmd.output().expect("failed to spawn shuttle");
     (
         out.status.code(),
@@ -2130,3 +2135,202 @@ gated_test!(
         assert_no_canary(&[project.path(), root.path(), server.path()]);
     }
 );
+
+// ── Issue #66: pod activation runs against injected tools, never the
+//    real system bus (no polkit prompt, no swallowed "Access denied") ──
+
+/// A fake systemd tool that records its invocation by writing `marker`
+/// and appending its argv to `<marker>.argv`; `exit_code` controls
+/// success. Pure POSIX redirection — no external `touch` (the test runs
+/// the binary with a PATH that carries only the fake tools). Mirrors the
+/// runtime unit tests' `fake_tool`.
+fn fake_systemd_tool(dir: &Path, name: &str, marker: &Path, exit_code: i32) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{argv}'\n: > '{marker}'\nexit {exit_code}\n",
+            argv = marker.with_extension("argv").display(),
+            marker = marker.display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+/// Seed one generation manifest + sysext tree directly under a pod's
+/// state dir — enough for `pod rollback` to reach activation without a
+/// payload build (the store layout is a plain directory contract).
+fn seed_pod_generation(pod_dir: &Path, n: u64, pkg: &str, unit: &str) {
+    use shuttle::farm::ClaimLayer;
+    use shuttle::runtime::{Generation, InstalledPackage};
+
+    let mut packages = std::collections::BTreeMap::new();
+    packages.insert(
+        pkg.to_string(),
+        InstalledPackage {
+            name: pkg.to_string(),
+            version: "1.0".into(),
+            revision: n as u32,
+            sha3_384: format!("{n:0>96}"),
+            files: Vec::new(),
+            units: if unit.is_empty() {
+                Vec::new()
+            } else {
+                vec![unit.to_string()]
+            },
+            layer: ClaimLayer::Own,
+            apps: std::collections::BTreeMap::new(),
+            launchers: std::collections::BTreeMap::new(),
+            assembly: std::collections::BTreeMap::new(),
+            confined: None,
+            app_confined: std::collections::BTreeMap::new(),
+            desktops: std::collections::BTreeMap::new(),
+        },
+    );
+    let gen = Generation {
+        n,
+        base_version: "24.04".into(),
+        packages,
+        created_epoch: 0,
+        boot_entry: None,
+    };
+    let gen_dir = pod_dir.join("generations").join(n.to_string());
+    std::fs::create_dir_all(gen_dir.join("extensions").join(pkg)).unwrap();
+    // A minimal sysext tree: activation relinks whatever the generation
+    // carries, so the tree must exist on disk.
+    std::fs::write(
+        gen_dir
+            .join("extensions")
+            .join(pkg)
+            .join(format!("release.{pkg}")),
+        "ID=_any\n",
+    )
+    .unwrap();
+    std::fs::write(
+        gen_dir.join("manifest.json"),
+        serde_json::to_string(&gen).unwrap(),
+    )
+    .unwrap();
+}
+
+/// `pod rollback` must reach activation and run the injected systemd
+/// tools — proving the pod path consults the RuntimeTools seam instead
+/// of hardcoding the host system bus. Fake tools touch markers and
+/// report "skipped (systemd not in use)" for the tools we leave None.
+#[test]
+fn pod_rollback_activates_with_injected_tools_never_the_host_bus() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let tools_bin = tempfile::tempdir().unwrap();
+
+    // Two generations, active = 2, so `pod rollback` targets generation 1
+    // and drives `RuntimeStore::rollback` -> `activate`.
+    let pd = pod_dir(root.path(), "default");
+    std::fs::create_dir_all(&pd).unwrap();
+    seed_pod_generation(&pd, 1, "my-snap", "");
+    seed_pod_generation(&pd, 2, "my-snap", "");
+    std::os::unix::fs::symlink("generations/2", pd.join("active")).unwrap();
+
+    let sysext_marker = tools_bin.path().join("sysext.marker");
+    let systemctl_marker = tools_bin.path().join("systemctl.marker");
+    fake_systemd_tool(tools_bin.path(), "systemd-sysext", &sysext_marker, 0);
+    fake_systemd_tool(tools_bin.path(), "systemctl", &systemctl_marker, 0);
+
+    // Real binary, explicit root; PATH carries ONLY the fake tools (+ the
+    // shell) and SHUTTLE_SYSTEMD=on overrides the suite's default `off`,
+    // so the pod path resolves the fakes rather than suppressing them.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    cmd.args(["pod", "rollback", "--root"])
+        .arg(root.path())
+        .current_dir(project.path())
+        .env("SHUTTLE_DATA_HOME", root.path().join("data-home"))
+        .env("SHUTTLE_POD_TOOLS", "")
+        .env("SHUTTLE_SYSTEMD", "on")
+        .env("PATH", tools_bin.path());
+    let out = cmd.output().expect("failed to spawn shuttle pod rollback");
+    let code = out.status.code();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+
+    // The injected tools RAN — the pod path used the seam, not the host.
+    assert!(
+        sysext_marker.exists(),
+        "systemd-sysext refresh must run the injected tool; stderr: {stderr}"
+    );
+    assert!(
+        systemctl_marker.exists(),
+        "systemctl daemon-reload must run the injected tool; stderr: {stderr}"
+    );
+    let sysext_argv = std::fs::read_to_string(sysext_marker.with_extension("argv")).unwrap();
+    let systemctl_argv = std::fs::read_to_string(systemctl_marker.with_extension("argv")).unwrap();
+    assert!(
+        sysext_argv.contains("refresh"),
+        "sysext argv: {sysext_argv:?}"
+    );
+    assert!(
+        systemctl_argv.contains("daemon-reload"),
+        "systemctl argv: {systemctl_argv:?}"
+    );
+
+    // The rollback lande: active now points at generation 1.
+    assert_eq!(
+        std::fs::read_link(pd.join("active")).unwrap(),
+        Path::new("generations/1")
+    );
+}
+
+/// With no systemd tools resolved (the suite default), activation reports
+/// the skip distinctly instead of a fake success — the "silent no-op"
+/// the issue calls out. `SHUTTLE_POD_TOOLS=absent` resolves every tool to
+/// None at the CLI seam.
+#[test]
+fn pod_rollback_reports_skipped_systemd_tools_distinctly() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let pd = pod_dir(root.path(), "default");
+    std::fs::create_dir_all(&pd).unwrap();
+    seed_pod_generation(&pd, 1, "my-snap", "");
+    seed_pod_generation(&pd, 2, "my-snap", "");
+    std::os::unix::fs::symlink("generations/2", pd.join("active")).unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    cmd.args(["pod", "rollback", "--root"])
+        .arg(root.path())
+        .current_dir(project.path())
+        .env("SHUTTLE_DATA_HOME", root.path().join("data-home"))
+        .env("SHUTTLE_POD_TOOLS", "absent");
+    let out = cmd.output().expect("failed to spawn shuttle pod rollback");
+    let code = out.status.code();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "rollback without tools must still succeed: {combined}"
+    );
+
+    // Skip is reported, and never as a failure or success.
+    assert!(
+        combined.contains("skipped"),
+        "activation must report the skip: {combined}"
+    );
+    assert!(
+        combined.contains("system bus not in use"),
+        "the no-op must be visible: {combined}"
+    );
+    assert!(
+        !combined.contains("exited"),
+        "an absent tool must not read as a failure: {combined}"
+    );
+}

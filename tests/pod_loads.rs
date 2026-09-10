@@ -176,6 +176,8 @@ fn run_named(
     cmd.args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    // Keep pod activation off the host systemd bus (issue #66).
+    cmd.env("SHUTTLE_SYSTEMD", "off");
     let out = cmd.output().expect("failed to spawn shuttle pod");
     (
         out.status.code(),

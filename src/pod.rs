@@ -1078,7 +1078,7 @@ pub fn remove_package(
     // reconcile proceeds without the squashfs pair — and its declared
     // set is recorded WITHOUT building, so only the dropped package
     // (plus genuinely undeclared strays) is removed.
-    let (sync, _) = reconcile_pod_scoped(root, pod_name, None, false, true)?;
+    let (sync, _) = reconcile_pod_scoped(root, pod_name, None, false, true, &pod_runtime_tools())?;
     if let Some(n) = sync.generation {
         crate::output::ok(format!(
             "removed '{}' from pod '{pod_name}' (generation {n})",
@@ -1121,8 +1121,14 @@ pub fn rebuild_package(
         miette::bail!("package '{}' is not in pod '{}'", spec.name, pod_name);
     }
 
-    let (sync, deps_pin_moved) =
-        reconcile_pod_scoped(root, pod_name, Some(&spec.name), latest, false)?;
+    let (sync, deps_pin_moved) = reconcile_pod_scoped(
+        root,
+        pod_name,
+        Some(&spec.name),
+        latest,
+        false,
+        &pod_runtime_tools(),
+    )?;
 
     // The version the package now executes: its (kept or freshly
     // repinned) lockfile pin, else a live resolution. The deps pin
@@ -1426,11 +1432,21 @@ pub fn rollback_pod(
     pod_name: &str,
     target: Option<u64>,
 ) -> miette::Result<PodRollbackReport> {
+    rollback_pod_with(root, pod_name, target, &pod_runtime_tools())
+}
+
+/// [`rollback_pod`] with injected runtime tools — the seam the pod tests
+/// use to prove activation runs without touching the host system bus.
+pub fn rollback_pod_with(
+    root: &Path,
+    pod_name: &str,
+    target: Option<u64>,
+    tools: &crate::runtime::RuntimeTools,
+) -> miette::Result<PodRollbackReport> {
     validate_pod_name(pod_name)?;
     let dir = pod_dir(root, pod_name);
     let store = pod_store(&dir);
-    let tools = crate::runtime::RuntimeTools::from_host();
-    let report = store.rollback(target, &tools)?;
+    let report = store.rollback(target, tools)?;
 
     // The farm + `current` follow the flipped generation. Re-emitting
     // is idempotent and heals a farm that predates a lost emit.
@@ -1504,6 +1520,21 @@ pub fn pod_store(pod_dir: &Path) -> crate::runtime::RuntimeStore {
         .with_extensions_link_dir(pod_dir.join("extensions"))
 }
 
+/// Runtime tools for the pod paths. Default: the host binaries with the
+/// system-bus set suppressed when the host has no systemd or
+/// `SHUTTLE_SYSTEMD` opts out (see [`RuntimeTools::for_pod_runtime`]).
+///
+/// `SHUTTLE_POD_TOOLS=absent` is a test-only seam (issue #66): it
+/// resolves every tool to `None`, so `pod sync`/`pod rollback` reach
+/// activation with no external tool at all and cannot touch the host
+/// system bus. Production never sets it.
+fn pod_runtime_tools() -> crate::runtime::RuntimeTools {
+    match std::env::var("SHUTTLE_POD_TOOLS").as_deref() {
+        Ok("absent") => crate::runtime::RuntimeTools::default(),
+        _ => crate::runtime::RuntimeTools::for_pod_runtime(),
+    }
+}
+
 /// Reconcile a pod's declaration into its store: build every declared
 /// package through the normal snap build path, install the changed set
 /// as a new generation, remove store packages the declaration dropped,
@@ -1531,7 +1562,8 @@ pub fn pod_store(pod_dir: &Path) -> crate::runtime::RuntimeStore {
 /// `Own`, overlay-patched at `Overlay`, recorded in the generation
 /// manifest so the farm resamples the same order at activation.
 pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
-    reconcile_pod_scoped(root, pod_name, None, false, false).map(|(report, _)| report)
+    reconcile_pod_scoped(root, pod_name, None, false, false, &pod_runtime_tools())
+        .map(|(report, _)| report)
 }
 
 /// What the scoped reconcile does with one own package before the
@@ -1708,8 +1740,9 @@ fn reconcile_pod_scoped(
     only: Option<&str>,
     float_deps: bool,
     allow_degraded: bool,
+    tools: &crate::runtime::RuntimeTools,
 ) -> miette::Result<(PodSyncReport, bool)> {
-    let mut state = prepare_reconcile(root, pod_name, allow_degraded)?;
+    let mut state = prepare_reconcile(root, pod_name, allow_degraded, tools)?;
     let mut build = ReconcileBuild::default();
     collect_pending(&mut state, only, float_deps, &mut build)?;
     let installed = install_pending(&mut state, &mut build)?;
@@ -1786,10 +1819,10 @@ fn prepare_reconcile(
     root: &Path,
     pod_name: &str,
     allow_degraded: bool,
+    tools: &crate::runtime::RuntimeTools,
 ) -> miette::Result<ReconcileState> {
     let decl = validate_reconcile_inputs(root, pod_name)?;
-    let tools = crate::runtime::RuntimeTools::from_host();
-    if !allow_degraded && !install_capable(&tools) {
+    if !allow_degraded && !install_capable(tools) {
         miette::bail!(
             "cannot reconcile pod '{pod_name}': mksquashfs/unsquashfs not found on PATH \
              — install squashfs-tools and re-run"
@@ -1814,7 +1847,7 @@ fn prepare_reconcile(
         decl,
         dir,
         store,
-        tools,
+        tools: tools.clone(),
         active,
         lock,
         lock_path,

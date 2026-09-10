@@ -157,6 +157,9 @@ fn run(
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    // Keep pod activation off the host systemd bus (issue #66); explicit
+    // per-call env overrides below still win.
+    cmd.env("SHUTTLE_SYSTEMD", "off");
     for (k, v) in env {
         cmd.env(k, v);
     }

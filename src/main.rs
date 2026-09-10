@@ -2471,7 +2471,7 @@ fn install_pulled(
     store.install_batch(
         &pending,
         &SignatureEnvelope::default(),
-        &RuntimeTools::from_host(),
+        &RuntimeTools::for_pod_runtime(),
     )
 }
 
@@ -2516,7 +2516,7 @@ fn runtime_install(name: &str, channel: &str, state_dir: Option<String>) -> miet
     let report = store.install_batch(
         &[pending],
         &SignatureEnvelope::default(),
-        &RuntimeTools::from_host(),
+        &RuntimeTools::for_pod_runtime(),
     )?;
     print_install_report(&report);
     Ok(())
@@ -2524,7 +2524,7 @@ fn runtime_install(name: &str, channel: &str, state_dir: Option<String>) -> miet
 
 fn runtime_remove(name: &str, state_dir: Option<String>) -> miette::Result<()> {
     let store = RuntimeStore::from_state_dir(state_dir.as_deref());
-    let report = store.remove(name, &RuntimeTools::from_host())?;
+    let report = store.remove(name, &RuntimeTools::for_pod_runtime())?;
     shuttle::output::ok(format!(
         "removed {name} — generation {} active",
         report.generation
@@ -2557,7 +2557,7 @@ fn runtime_upgrade(
     let report = store.install_batch(
         &pending,
         &SignatureEnvelope::default(),
-        &RuntimeTools::from_host(),
+        &RuntimeTools::for_pod_runtime(),
     )?;
     print_install_report(&report);
     Ok(())
@@ -2645,7 +2645,7 @@ fn print_install_report(report: &shuttle::runtime::InstallReport) {
 
 fn runtime_rollback(generation: Option<u64>, state_dir: Option<String>) -> miette::Result<()> {
     let store = RuntimeStore::from_state_dir(state_dir.as_deref());
-    let report = store.rollback(generation, &RuntimeTools::from_host())?;
+    let report = store.rollback(generation, &RuntimeTools::for_pod_runtime())?;
     shuttle::output::ok(format!(
         "rolled back generation {} -> {}",
         report.from, report.to

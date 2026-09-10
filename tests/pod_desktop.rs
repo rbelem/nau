@@ -183,6 +183,8 @@ fn run(
     // The launcher surface is redirected — never the real home or the
     // real ~/.local/share/applications.
     cmd.env("SHUTTLE_DATA_HOME", data_home);
+    // Keep pod activation off the host systemd bus (issue #66).
+    cmd.env("SHUTTLE_SYSTEMD", "off");
     let out = cmd.output().expect("failed to spawn shuttle pod");
     (
         out.status.code(),
