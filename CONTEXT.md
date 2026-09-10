@@ -56,6 +56,15 @@ _Avoid_: cache, registry, spool
 **Generation**: A pinned selection of base-image version + package set + configuration that boots as one unit. Rollback means booting a previous generation; GC is rooted at generations (ADR-0012).
 _Avoid_: profile, snapshot, deployment
 
+**State partition**: The persistent, non-verity partition that survives A/B flips — mounted at `/var/lib`, holding the store, extension links, and device identity. Everything else under `/var` is volatile (tmpfs + tmpfiles). Declared as a partition with `role = "state"` (native) or `"system-data"` (UC). (ADR-0023)
+_Avoid_: data partition, writable partition, persistent volume
+
+**Boot assessment**: The try-boot mechanism that marks a booted generation good via `boot-complete.target` and reverts after `TriesLeft` is exhausted. Stock systemd (`systemd-bless-boot`), not shuttle-owned logic. (ADR-0024)
+_Avoid_: health check, boot verification, watchdog
+
+**Key ceremony**: Generating, rotating (minting and promoting a new key), and revoking signing keys, plus distributing the trusted key set to devices so revoked keys are refused at install/update time. (ADR-0024)
+_Avoid_: key management, PKI
+
 **Image manifest**: The flat, serializable, signed result of evaluating `image()` — partitions, UKI/roothash digests, package lists. The shuttle-side analog of a model assertion (ADR-0011).
 _Avoid_: model assertion, lockfile (the lockfile pins *inputs*; the manifest describes the *system*)
 
