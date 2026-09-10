@@ -2486,7 +2486,8 @@ fn runtime_fetch(name: &str, channel: &str, downloads: &Path) -> miette::Result<
         sha3_384: None,
     };
     let resolved = shuttle::store::StoreClient::resolve(&pin, channel, arch)?;
-    let payload = shuttle::store::StoreClient::download(&resolved, downloads)?;
+    let payload =
+        shuttle::store::StoreClient::download(&shuttle::command::RealRunner, &resolved, downloads)?;
     shuttle::store::StoreClient::verify(&payload, &resolved.sha3_384)?;
     shuttle::output::ok(format!(
         "{name} revision {} — sha3-384 verified",

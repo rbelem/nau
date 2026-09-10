@@ -341,45 +341,16 @@ fn split_params(s: &str) -> Vec<&str> {
 }
 
 // ── Command runner seam ──
+//
+// The generic adapter lives in [`crate::command`] (the image pipeline shares
+// it); this client consumes it verbatim. Its additional fake contract:
+//
+// The client parses response data from FILES, never from stdout:
+// - `argv[0]` is the program name (`curl`), the URL is the last argument;
+// - `-D <path>`: the HTTP status line + headers must be written there;
+// - `-o <path>`: the response body must be written there.
 
-/// Result of one injected command run.
-#[derive(Debug, Clone)]
-pub struct RunnerOutput {
-    pub code: i32,
-    pub stdout: Vec<u8>,
-    pub stderr: String,
-}
-
-/// Injectable command seam (the `RuntimeTools` precedent): production
-/// uses [`CurlRunner`] (a real `curl` subprocess); hermetic tests inject
-/// fakes.
-///
-/// # Fake contract
-///
-/// The client parses response data from FILES, never from stdout:
-/// - `argv[0]` is the program name (`curl`), the URL is the last argument;
-/// - `-D <path>`: the HTTP status line + headers must be written there;
-/// - `-o <path>`: the response body must be written there.
-pub trait CommandRunner {
-    fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput>;
-}
-
-/// The real runner: executes `curl` with the exact argv the client built.
-pub struct CurlRunner;
-
-impl CommandRunner for CurlRunner {
-    fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput> {
-        let (program, args) = argv.split_first().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command argv")
-        })?;
-        let out = std::process::Command::new(program).args(args).output()?;
-        Ok(RunnerOutput {
-            code: out.status.code().unwrap_or(-1),
-            stdout: out.stdout,
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
-    }
-}
+pub use crate::command::{CommandRunner, CurlRunner, RunnerOutput};
 
 // ── Authentication ──
 
@@ -457,7 +428,7 @@ impl RawResponse {
 /// bearer token in memory for its lifetime; sync + single-threaded by
 /// construction (the CLI is sync).
 pub struct Client {
-    runner: Box<dyn CommandRunner>,
+    runner: Box<dyn crate::command::CommandRunner>,
     reference: Reference,
     auth: Auth,
     insecure_http: bool,
@@ -477,7 +448,7 @@ impl Client {
         reference: Reference,
         auth: Auth,
         insecure_http: bool,
-        runner: Box<dyn CommandRunner>,
+        runner: Box<dyn crate::command::CommandRunner>,
     ) -> miette::Result<Client> {
         if auth.username.is_some() != auth.password.is_some() {
             miette::bail!("--username and --password-stdin must be provided together");

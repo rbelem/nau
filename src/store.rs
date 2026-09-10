@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use sha3::Digest;
 
+use crate::command::CommandRunner;
 use crate::snap::SnapRef;
 
 // ── API response types ──
@@ -91,18 +92,24 @@ impl StoreClient {
     /// Query the store for a snap's metadata.
     ///
     /// Returns the channel map for all architectures and tracks.
-    fn query_info(name: &str) -> miette::Result<SnapInfoResponse> {
+    fn query_info_with(runner: &dyn CommandRunner, name: &str) -> miette::Result<SnapInfoResponse> {
         let url = format!("https://api.snapcraft.io/v2/snaps/info/{name}");
 
-        let output = std::process::Command::new("curl")
-            .args(["-s", "-H", "Snap-Device-Series: 16", &url])
-            .output()
+        let argv = vec![
+            "curl".to_string(),
+            "-s".to_string(),
+            "-H".to_string(),
+            "Snap-Device-Series: 16".to_string(),
+            url,
+        ];
+        let output = runner
+            .run(&argv)
             .map_err(|e| miette::miette!("curl not found: {e}"))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.code != 0 {
             return Err(miette::miette!(
-                "failed to query snap store for '{name}': {stderr}"
+                "failed to query snap store for '{name}': {}",
+                output.stderr.trim()
             ));
         }
 
@@ -116,8 +123,18 @@ impl StoreClient {
     /// If the pin has `revision` and `sha3_384`, it uses those directly
     /// (no store query needed). Otherwise it queries the store.
     pub fn resolve(pin: &SnapRef, channel: &str, arch: &str) -> miette::Result<ResolvedSnap> {
+        Self::resolve_with(&crate::command::RealRunner, pin, channel, arch)
+    }
+
+    /// [`Self::resolve`] with the host tool runner injected.
+    pub fn resolve_with(
+        runner: &dyn CommandRunner,
+        pin: &SnapRef,
+        channel: &str,
+        arch: &str,
+    ) -> miette::Result<ResolvedSnap> {
         // If fully pinned, we still need the download URL from the store
-        let info = Self::query_info(&pin.name)?;
+        let info = Self::query_info_with(runner, &pin.name)?;
 
         // Parse the channel as "track/risk" (e.g. "latest/stable")
         let parts: Vec<&str> = channel.split('/').collect();
@@ -168,7 +185,8 @@ impl StoreClient {
         // snap-revision assertion binding digest → (snap-id, revision, size)
         // under the Canonical-rooted key chain before the URL is trusted.
         let pinned_by_user = pin.revision.is_some() && pin.sha3_384.is_some();
-        if let Err(e) = crate::r#assert::verify_revision(
+        if let Err(e) = crate::r#assert::verify_revision_with(
+            runner,
             &pin.name,
             info.snap_id.as_deref(),
             store_revision,
@@ -204,7 +222,11 @@ impl StoreClient {
     /// Download a resolved snap to the given directory.
     ///
     /// Returns the path to the downloaded `.snap` file.
-    pub fn download(resolved: &ResolvedSnap, output_dir: &Path) -> miette::Result<PathBuf> {
+    pub fn download(
+        runner: &dyn CommandRunner,
+        resolved: &ResolvedSnap,
+        output_dir: &Path,
+    ) -> miette::Result<PathBuf> {
         let filename = format!(
             "{}_{}_{}.snap",
             resolved.name, resolved.revision, resolved.sha3_384
@@ -219,17 +241,18 @@ impl StoreClient {
         std::fs::create_dir_all(output_dir)
             .map_err(|e| miette::miette!("failed to create {:?}: {e}", output_dir))?;
 
-        let status = std::process::Command::new("curl")
-            .args([
-                "-fsSL",
-                "-o",
-                &output_path.to_string_lossy(),
-                &resolved.download_url,
-            ])
-            .status()
+        let argv = vec![
+            "curl".to_string(),
+            "-fsSL".to_string(),
+            "-o".to_string(),
+            output_path.to_string_lossy().into_owned(),
+            resolved.download_url.clone(),
+        ];
+        let out = runner
+            .run(&argv)
             .map_err(|e| miette::miette!("curl not found: {e}"))?;
 
-        if !status.success() {
+        if out.code != 0 {
             return Err(miette::miette!(
                 "failed to download snap '{}' revision {}",
                 resolved.name,
@@ -259,13 +282,14 @@ impl StoreClient {
 
     /// Resolve, download, and verify a pinned snap in one step.
     pub fn fetch(
+        runner: &dyn CommandRunner,
         pin: &SnapRef,
         channel: &str,
         arch: &str,
         cache_dir: &Path,
     ) -> miette::Result<PathBuf> {
         let resolved = Self::resolve(pin, channel, arch)?;
-        let path = Self::download(&resolved, cache_dir)?;
+        let path = Self::download(runner, &resolved, cache_dir)?;
         Self::verify(&path, &resolved.sha3_384)?;
         eprintln!(
             "  ✓ {} revision {} — sha3-384 verified",

@@ -56,28 +56,37 @@ pub(crate) fn parted_mkpart_args(
 /// Create the raw disk image with dd, lay out partitions with parted, and
 /// set the ESP flag on the first partition.
 pub(crate) fn create_partitions(
+    runner: &dyn CommandRunner,
     img_path: &Path,
     layout: &DiskLayout,
     total_mb: u64,
 ) -> miette::Result<()> {
-    let status = std::process::Command::new("dd")
-        .args([
-            "if=/dev/zero",
-            &format!("of={}", img_path.display()),
-            "bs=1M",
-            &format!("count={total_mb}"),
-        ])
-        .status()
+    let argv: Vec<String> = vec![
+        "dd".to_string(),
+        "if=/dev/zero".to_string(),
+        format!("of={}", img_path.display()),
+        "bs=1M".to_string(),
+        format!("count={total_mb}"),
+    ];
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("dd not found: {e}"))?;
-    if !status.success() {
+    if out.code != 0 {
         return Err(miette::miette!("dd failed to create disk image"));
     }
 
-    let status = std::process::Command::new("parted")
-        .args(["-s", &img_path.to_string_lossy(), "mklabel", &layout.label])
-        .status()
+    let argv: Vec<String> = [
+        "parted".to_string(),
+        "-s".to_string(),
+        img_path.to_string_lossy().into_owned(),
+        "mklabel".to_string(),
+        layout.label.clone(),
+    ]
+    .to_vec();
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("parted not found: {e}"))?;
-    if !status.success() {
+    if out.code != 0 {
         return Err(miette::miette!("parted failed to create partition table"));
     }
 
@@ -86,17 +95,19 @@ pub(crate) fn create_partitions(
         let size_mb = parse_size_mb(&part.size, total_mb - part_start_mb);
         let end_mb = part_start_mb + size_mb;
 
-        let status = std::process::Command::new("parted")
-            .args(parted_mkpart_args(
+        let argv = std::iter::once("parted".to_string())
+            .chain(parted_mkpart_args(
                 img_path,
                 &layout.label,
                 part,
                 part_start_mb,
                 end_mb,
             ))
-            .status()
+            .collect::<Vec<String>>();
+        let out = runner
+            .run(&argv)
             .map_err(|e| miette::miette!("parted: {e}"))?;
-        if !status.success() {
+        if out.code != 0 {
             return Err(miette::miette!(
                 "parted failed to create partition '{}'",
                 part.name
@@ -104,31 +115,38 @@ pub(crate) fn create_partitions(
         }
 
         if part_num == 0 {
-            set_esp_flag(img_path);
+            set_esp_flag(runner, img_path);
         }
 
         part_start_mb = end_mb;
     }
 
     if let Some(ref swap) = layout.swap {
-        create_swap_partition(img_path, swap, part_start_mb)?;
+        create_swap_partition(runner, img_path, swap, part_start_mb)?;
     }
     Ok(())
 }
 
 /// Set the GPT esp flag on partition 1; a failure is reported but not
 /// fatal (matching the historical behavior — the vfat fs still works).
-pub(crate) fn set_esp_flag(img_path: &Path) {
-    let status = std::process::Command::new("parted")
-        .args(["-s", &img_path.to_string_lossy(), "set", "1", "esp", "on"])
-        .status();
-    if !status.is_ok_and(|s| s.success()) {
+pub(crate) fn set_esp_flag(runner: &dyn CommandRunner, img_path: &Path) {
+    let argv = vec![
+        "parted".to_string(),
+        "-s".to_string(),
+        img_path.to_string_lossy().into_owned(),
+        "set".to_string(),
+        "1".to_string(),
+        "esp".to_string(),
+        "on".to_string(),
+    ];
+    if !runner.run(&argv).is_ok_and(|o| o.code == 0) {
         eprintln!("  ⚠ failed to set ESP flag");
     }
 }
 
 /// Add the declared swap partition (if any) after the data partitions.
 pub(crate) fn create_swap_partition(
+    runner: &dyn CommandRunner,
     img_path: &Path,
     swap: &SwapConfig,
     part_start_mb: u64,
@@ -138,19 +156,20 @@ pub(crate) fn create_swap_partition(
         return Ok(());
     }
     let end_mb = part_start_mb + swap_size;
-    let status = std::process::Command::new("parted")
-        .args([
-            "-s",
-            &img_path.to_string_lossy(),
-            "mkpart",
-            "primary",
-            "linux-swap",
-            &format!("{}MB", part_start_mb),
-            &format!("{}MB", end_mb),
-        ])
-        .status()
+    let argv: Vec<String> = vec![
+        "parted".to_string(),
+        "-s".to_string(),
+        img_path.to_string_lossy().into_owned(),
+        "mkpart".to_string(),
+        "primary".to_string(),
+        "linux-swap".to_string(),
+        format!("{}MB", part_start_mb),
+        format!("{}MB", end_mb),
+    ];
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("parted: {e}"))?;
-    if !status.success() {
+    if out.code != 0 {
         return Err(miette::miette!("parted failed to create swap partition"));
     }
     Ok(())
@@ -230,18 +249,23 @@ pub(crate) fn parse_partition_extents(json: &str) -> miette::Result<Vec<Partitio
 /// fails closed — populating from misaligned extents would corrupt
 /// neighboring partitions.
 pub(crate) fn read_partition_extents(
+    runner: &dyn CommandRunner,
     img_path: &Path,
     expected: usize,
 ) -> miette::Result<Vec<PartitionExtent>> {
-    let out = std::process::Command::new("sfdisk")
-        .args(["-J", &img_path.to_string_lossy()])
-        .output()
+    let argv = vec![
+        "sfdisk".to_string(),
+        "-J".to_string(),
+        img_path.to_string_lossy().into_owned(),
+    ];
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("sfdisk not found: {e}"))?;
-    if !out.status.success() {
+    if out.code != 0 {
         return Err(miette::miette!(
             "sfdisk -J failed reading back the partition table ({}): {}",
-            out.status.code().unwrap_or(1),
-            String::from_utf8_lossy(&out.stderr).trim()
+            crate::command::exit_code(&out),
+            out.stderr.trim()
         ));
     }
     let extents = parse_partition_extents(&String::from_utf8_lossy(&out.stdout))?;
@@ -369,6 +393,7 @@ pub(crate) fn refuse_non_ext4_vfat(part: &Partition) -> miette::Result<()> {
 /// never overrun). The verity variant pins [`VERITY_BLOCK_SIZE`] fs blocks
 /// via [`mkfs_flags_for`] so the root mounts over its dm-verity mapping.
 pub(crate) fn build_ext4_partition(
+    runner: &dyn CommandRunner,
     part_file: &Path,
     staged_root: &Path,
     part: &Partition,
@@ -383,16 +408,16 @@ pub(crate) fn build_ext4_partition(
     args.push(staged_root.to_string_lossy().into_owned());
     args.push(part_file.to_string_lossy().into_owned());
     args.push(block_count);
-    let status = std::process::Command::new(tool)
-        .args(&args)
-        .status()
+    let argv: Vec<String> = std::iter::once(tool.to_string()).chain(args).collect();
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("{tool} not found: {e}"))?;
-    if !status.success() {
+    if out.code != 0 {
         return Err(miette::miette!(
             "{tool} -d failed to build the {} partition '{}' (exit {})",
             part.fs,
             part.name,
-            status.code().unwrap_or(1)
+            crate::command::exit_code(&out)
         ));
     }
     Ok(())
@@ -430,28 +455,41 @@ pub(crate) fn collect_staged_entries(
 /// each directory is created with `mmd`, each file copied with `mcopy`.
 /// Only the exit status decides — mkfs/mtools may print benign warnings
 /// (e.g. "less than suggested minimum clusters" on small extents).
-pub(crate) fn mtools_populate_vfat(vfat_file: &Path, staged: &Path) -> miette::Result<()> {
+pub(crate) fn mtools_populate_vfat(
+    runner: &dyn CommandRunner,
+    vfat_file: &Path,
+    staged: &Path,
+) -> miette::Result<()> {
     let mut entries: Vec<(String, bool)> = Vec::new();
     collect_staged_entries(staged, Path::new(""), &mut entries)?;
     entries.sort();
     for (rel, is_dir) in entries {
         let target = format!("::/{rel}");
         if is_dir {
-            let status = std::process::Command::new("mmd")
-                .args(["-i", &vfat_file.to_string_lossy(), &target])
-                .status()
+            let argv = vec![
+                "mmd".to_string(),
+                "-i".to_string(),
+                vfat_file.to_string_lossy().into_owned(),
+                target.clone(),
+            ];
+            let out = runner
+                .run(&argv)
                 .map_err(|e| miette::miette!("mmd not found: {e}"))?;
-            if !status.success() {
+            if out.code != 0 {
                 return Err(miette::miette!("mmd failed creating {target} on the ESP"));
             }
         } else {
-            let status = std::process::Command::new("mcopy")
-                .args(["-i", &vfat_file.to_string_lossy()])
-                .arg(staged.join(&rel))
-                .arg(&target)
-                .status()
+            let argv = vec![
+                "mcopy".to_string(),
+                "-i".to_string(),
+                vfat_file.to_string_lossy().into_owned(),
+                staged.join(&rel).to_string_lossy().into_owned(),
+                target.clone(),
+            ];
+            let out = runner
+                .run(&argv)
                 .map_err(|e| miette::miette!("mcopy not found: {e}"))?;
-            if !status.success() {
+            if out.code != 0 {
                 return Err(miette::miette!("mcopy failed copying /{rel} onto the ESP"));
             }
         }
@@ -467,6 +505,7 @@ pub(crate) fn mtools_populate_vfat(vfat_file: &Path, staged: &Path) -> miette::R
 /// into a tree and copied on with mtools); every other partition receives
 /// the staged rootfs through `mkfs.ext4 -d`.
 pub(crate) fn populate_remaining_partitions(
+    runner: &dyn CommandRunner,
     ctx: &PopulateCtx,
     layout: &DiskLayout,
     skip: &[usize],
@@ -475,7 +514,7 @@ pub(crate) fn populate_remaining_partitions(
         if skip.contains(&i) || part.name == VERITY_HASH_PART_NAME {
             continue;
         }
-        populate_side_partition(ctx, i, part)?;
+        populate_side_partition(runner, ctx, i, part)?;
     }
     Ok(())
 }
@@ -488,6 +527,7 @@ pub(crate) fn populate_remaining_partitions(
 /// btrfs (or other unpopulatable) filesystem fails closed
 /// ([`refuse_non_ext4_vfat`]).
 pub(crate) fn populate_side_partition(
+    runner: &dyn CommandRunner,
     ctx: &PopulateCtx,
     index: usize,
     part: &Partition,
@@ -500,11 +540,11 @@ pub(crate) fn populate_side_partition(
     // rootfs — the UC role model replaces the simplified "everything is the
     // rootfs" routing for those partitions.
     if let Some(stage) = ctx.uc_route_stage(part) {
-        build_staged_partition(&part_file, part, stage, extent)?;
+        build_staged_partition(runner, &part_file, part, stage, extent)?;
     } else if index == 0 && part.fs == "vfat" {
-        build_esp_partition(ctx, &part_file, part)?;
+        build_esp_partition(runner, ctx, &part_file, part)?;
     } else {
-        build_data_partition(ctx, &part_file, part, extent)?;
+        build_data_partition(runner, ctx, &part_file, part, extent)?;
     }
     splice_into(&ctx.scratch_dir.join("disk.img"), &part_file, extent)
 }
@@ -514,26 +554,27 @@ pub(crate) fn populate_side_partition(
 /// Warn-not-fatal: a failure leaves the ESP unpopulated (historical
 /// side-partition behavior — the mount attempt used to decide).
 pub(crate) fn build_esp_partition(
+    runner: &dyn CommandRunner,
     ctx: &PopulateCtx,
     part_file: &Path,
     part: &Partition,
 ) -> miette::Result<()> {
     let esp_stage = ctx.scratch_dir.join("esp-staging");
-    populate_esp(&esp_stage.join("EFI").join("BOOT"))?;
+    populate_esp(runner, &esp_stage.join("EFI").join("BOOT"))?;
     install_uki(ctx.image, &esp_stage, ctx.uki, ctx.uki_stage)?;
     let (tool, flags) = mkfs_flags_for("vfat", false)?;
     let mut args: Vec<String> = flags;
     args.push(part.name.clone()); // -n label
     args.push(part_file.to_string_lossy().into_owned());
-    let status = std::process::Command::new(tool)
-        .args(&args)
-        .status()
+    let argv: Vec<String> = std::iter::once(tool.to_string()).chain(args).collect();
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("{tool} not found: {e}"))?;
-    if !status.success() {
+    if out.code != 0 {
         eprintln!("  ⚠ {tool} failed for {} — ESP left unpopulated", part.name);
         return Ok(());
     }
-    if let Err(e) = mtools_populate_vfat(part_file, &esp_stage) {
+    if let Err(e) = mtools_populate_vfat(runner, part_file, &esp_stage) {
         eprintln!(
             "  ⚠ mtools failed populating the ESP ({}): {e:#}",
             part.name
@@ -551,12 +592,13 @@ pub(crate) fn build_esp_partition(
 /// snap-bootstrap without a model/seed/modeenv and stop at `cannot detect
 /// mode` — a silently-broken UC image is worse than a loud build failure.
 pub(crate) fn build_staged_partition(
+    runner: &dyn CommandRunner,
     part_file: &Path,
     part: &Partition,
     stage: &Path,
     extent: &PartitionExtent,
 ) -> miette::Result<()> {
-    build_ext4_partition(part_file, stage, part, extent, false)
+    build_ext4_partition(runner, part_file, stage, part, extent, false)
         .wrap_err_with(|| format!("UC {} partition '{}' populate failed", part.fs, part.name))?;
     eprintln!("  ✓ {}: {} populated (UC staged tree)", part.name, part.fs);
     Ok(())
@@ -567,12 +609,13 @@ pub(crate) fn build_staged_partition(
 /// Warn-not-fatal: a failure leaves the partition unpopulated (historical
 /// side-partition behavior — the mount attempt used to decide).
 pub(crate) fn build_data_partition(
+    runner: &dyn CommandRunner,
     ctx: &PopulateCtx,
     part_file: &Path,
     part: &Partition,
     extent: &PartitionExtent,
 ) -> miette::Result<()> {
-    if let Err(e) = build_ext4_partition(part_file, ctx.root, part, extent, false) {
+    if let Err(e) = build_ext4_partition(runner, part_file, ctx.root, part, extent, false) {
         eprintln!(
             "  ⚠ {}: {} populate failed ({e:#}) — partition left unpopulated",
             part.name, part.fs

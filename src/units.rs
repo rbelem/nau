@@ -45,6 +45,7 @@ use std::path::Path;
 use miette::{IntoDiagnostic, WrapErr};
 use serde::Deserialize;
 
+use crate::command::CommandRunner;
 use crate::store::ResolvedSnap;
 
 // ── Planner input/output ──
@@ -475,6 +476,7 @@ pub fn classify(snap_type: Option<&str>) -> RuntimeClass {
 /// binary) are warn-and-continue — one inert snap never fails an image
 /// build. Staged-rootfs write failures are hard errors.
 pub fn emit_app_runtime(
+    runner: &dyn CommandRunner,
     snaps: &[(String, ResolvedSnap)],
     cache_dir: &Path,
     root: &Path,
@@ -494,7 +496,7 @@ pub fn emit_app_runtime(
             eprintln!("  ⚠ {name}: payload missing from cache — app execution skipped");
             continue;
         }
-        match emit_one_snap(name, &payload, root) {
+        match emit_one_snap(runner, name, &payload, root) {
             Ok(warnings) => {
                 for w in &warnings {
                     eprintln!("  ⚠ {w}");
@@ -512,24 +514,30 @@ pub fn emit_app_runtime(
 /// Emit runtime for one payload: classify, extract binaries, write
 /// units. Warnings are returned; hard failures mean the rootfs cannot
 /// be written and abort the build.
-fn emit_one_snap(name: &str, payload: &Path, root: &Path) -> miette::Result<Vec<String>> {
+fn emit_one_snap(
+    runner: &dyn CommandRunner,
+    name: &str,
+    payload: &Path,
+    root: &Path,
+) -> miette::Result<Vec<String>> {
     let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
     let extract_dir = work.path().join("extract");
 
     // 1. Read meta/snap.yaml out of the payload (single-file
     //    extraction, same tool + flags as the base-rootfs flow).
-    let status = std::process::Command::new("unsquashfs")
-        .args([
-            "-no-xattrs",
-            "-d",
-            &extract_dir.to_string_lossy(),
-            &payload.to_string_lossy(),
-            "meta/snap.yaml",
-        ])
-        .status()
+    let argv = vec![
+        "unsquashfs".to_string(),
+        "-no-xattrs".to_string(),
+        "-d".to_string(),
+        extract_dir.to_string_lossy().into_owned(),
+        payload.to_string_lossy().into_owned(),
+        "meta/snap.yaml".to_string(),
+    ];
+    let status = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("unsquashfs: {e}"))?;
     let yaml_path = extract_dir.join("meta").join("snap.yaml");
-    if !status.success() || !yaml_path.exists() {
+    if status.code != 0 || !yaml_path.exists() {
         return Err(miette::miette!("meta/snap.yaml not extractable"));
     }
     let yaml_text = std::fs::read_to_string(&yaml_path)
@@ -575,15 +583,18 @@ fn emit_one_snap(name: &str, payload: &Path, root: &Path) -> miette::Result<Vec<
     for plan in &plans {
         file_args.push(plan.in_snap_binary.clone());
     }
-    let status = std::process::Command::new("unsquashfs")
-        .arg("-no-xattrs")
-        .arg("-d")
-        .arg(extract_dir.join("files"))
-        .arg(payload)
-        .args(&file_args)
-        .status()
+    let mut argv = vec![
+        "unsquashfs".to_string(),
+        "-no-xattrs".to_string(),
+        "-d".to_string(),
+        extract_dir.join("files").to_string_lossy().into_owned(),
+        payload.to_string_lossy().into_owned(),
+    ];
+    argv.extend(file_args.iter().cloned());
+    let status = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("unsquashfs: {e}"))?;
-    if !status.success() {
+    if status.code != 0 {
         return Err(miette::miette!(
             "app binaries not extractable ({} …)",
             file_args.first().map(String::as_str).unwrap_or("?")
@@ -1056,7 +1067,14 @@ plugs:
         )];
 
         let root = tempfile::tempdir().unwrap();
-        let warnings = emit_app_runtime(&snap_paths, cache.path(), root.path(), true).unwrap();
+        let warnings = emit_app_runtime(
+            &crate::command::RealRunner,
+            &snap_paths,
+            cache.path(),
+            root.path(),
+            true,
+        )
+        .unwrap();
 
         // Binary staged at the documented path, executable.
         let staged = root.path().join("usr/bin/my-snap-srv");
@@ -1131,7 +1149,14 @@ plugs:
         )];
 
         let root = tempfile::tempdir().unwrap();
-        let warnings = emit_app_runtime(&snap_paths, cache.path(), root.path(), true).unwrap();
+        let warnings = emit_app_runtime(
+            &crate::command::RealRunner,
+            &snap_paths,
+            cache.path(),
+            root.path(),
+            true,
+        )
+        .unwrap();
         assert!(warnings.is_empty());
         assert!(
             !root.path().join("usr/bin").exists(),
@@ -1152,7 +1177,14 @@ plugs:
                 download_url: String::new(),
             },
         )];
-        let warnings = emit_app_runtime(&snap_paths, cache.path(), root.path(), false).unwrap();
+        let warnings = emit_app_runtime(
+            &crate::command::RealRunner,
+            &snap_paths,
+            cache.path(),
+            root.path(),
+            false,
+        )
+        .unwrap();
         assert!(warnings.is_empty());
         assert!(!root.path().join("usr/bin").exists(), "nothing staged");
     }

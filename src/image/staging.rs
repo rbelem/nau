@@ -112,20 +112,19 @@ pub(crate) fn check_declared_base(
 /// single-file extracting `meta/snap.yaml` (same tool + flags as the
 /// runtime emitter). `Ok(None)` means the metadata could not be read or
 /// carries no base — the caller logs the skip.
-pub(crate) fn payload_declared_base(payload: &Path) -> Option<String> {
+pub(crate) fn payload_declared_base(runner: &dyn CommandRunner, payload: &Path) -> Option<String> {
     let work = tempfile::tempdir().ok()?;
     let extract_dir = work.path().join("extract");
-    let status = std::process::Command::new("unsquashfs")
-        .args([
-            "-no-xattrs",
-            "-d",
-            &extract_dir.to_string_lossy(),
-            &payload.to_string_lossy(),
-            "meta/snap.yaml",
-        ])
-        .status()
-        .ok()?;
-    if !status.success() {
+    let argv = vec![
+        "unsquashfs".to_string(),
+        "-no-xattrs".to_string(),
+        "-d".to_string(),
+        extract_dir.to_string_lossy().into_owned(),
+        payload.to_string_lossy().into_owned(),
+        "meta/snap.yaml".to_string(),
+    ];
+    let out = runner.run(&argv).ok()?;
+    if out.code != 0 {
         return None;
     }
     let yaml_text = std::fs::read_to_string(extract_dir.join("meta").join("snap.yaml")).ok()?;
@@ -138,6 +137,7 @@ pub(crate) fn payload_declared_base(payload: &Path) -> Option<String> {
 /// author-pinned channel is the recorded override for both the track
 /// derivation and this check.
 pub(crate) fn enforce_base_contract(
+    runner: &dyn CommandRunner,
     image: &ImageDeclaration,
     resolved: &[ResolvedSnap],
     cache_dir: &Path,
@@ -180,7 +180,7 @@ pub(crate) fn enforce_base_contract(
             "{}_{}_{}.snap",
             snap.name, snap.revision, snap.sha3_384
         ));
-        let declared_base = payload_declared_base(&payload);
+        let declared_base = payload_declared_base(runner, &payload);
         check_declared_base(role, name, declared_base.as_deref(), &image.base.name)?;
     }
     Ok(())
@@ -191,6 +191,7 @@ pub(crate) fn enforce_base_contract(
 /// Kernel and gadget snaps resolve from the image base's store track
 /// (ADR-0019) unless the author pinned an explicit channel on the entry.
 fn resolve_image_snaps(
+    runner: &dyn CommandRunner,
     image: &ImageDeclaration,
     lockfile: &LockFile,
     channel: &str,
@@ -250,7 +251,7 @@ fn resolve_image_snaps(
         }
 
         // Try Snap Store first, then fall back to package index
-        let snap = match StoreClient::resolve(&pin, &effective_channel, arch) {
+        let snap = match StoreClient::resolve_with(runner, &pin, &effective_channel, arch) {
             Ok(s) => s,
             Err(_) => {
                 // Try resolving through the package index
@@ -286,7 +287,12 @@ fn resolve_image_snaps(
                                 revision: pin.revision,
                                 sha3_384: pin.sha3_384,
                             };
-                            match StoreClient::resolve(&resolved_pin, &effective_channel, arch) {
+                            match StoreClient::resolve_with(
+                                runner,
+                                &resolved_pin,
+                                &effective_channel,
+                                arch,
+                            ) {
                                 Ok(s) => {
                                     eprintln!(
                                         "  ℹ {}: resolved via index (store: {})",
@@ -372,6 +378,7 @@ pub(crate) struct StagedRootfs {
 /// snap as the rootfs foundation and merge the kernel modules/firmware per
 /// `policy`. `build_image` and `build_disk_image` both route through here.
 pub(crate) fn stage_rootfs(
+    runner: &dyn CommandRunner,
     image: &ImageDeclaration,
     cache_dir: &Path,
     channel: &str,
@@ -379,25 +386,31 @@ pub(crate) fn stage_rootfs(
     lockfile: &mut LockFile,
     policy: KernelPayloadPolicy,
 ) -> miette::Result<StagedRootfs> {
-    let resolved = resolve_image_snaps(image, lockfile, channel, arch)?;
-    let snap_paths = download_and_verify(&resolved, cache_dir)?;
+    let resolved = resolve_image_snaps(runner, image, lockfile, channel, arch)?;
+    let snap_paths = download_and_verify(runner, &resolved, cache_dir)?;
 
-    let has_unsquashfs = std::process::Command::new("which")
-        .arg("unsquashfs")
-        .output()
+    let has_unsquashfs = runner
+        .run(&["which".to_string(), "unsquashfs".to_string()])
         .ok()
-        .is_some_and(|o| o.status.success());
+        .is_some_and(|o| o.code == 0);
 
     // ADR-0019: the kernel/gadget payloads must declare the image's base —
     // mismatch fails the build before anything is assembled.
-    enforce_base_contract(image, &resolved, cache_dir, has_unsquashfs)?;
+    enforce_base_contract(runner, image, &resolved, cache_dir, has_unsquashfs)?;
 
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {e}"))?;
     let root = build_dir.path().to_path_buf();
 
-    let payload =
-        extract_base_and_kernel(image, &resolved, cache_dir, &root, has_unsquashfs, policy)?;
+    let payload = extract_base_and_kernel(
+        runner,
+        image,
+        &resolved,
+        cache_dir,
+        &root,
+        has_unsquashfs,
+        policy,
+    )?;
 
     Ok(StagedRootfs {
         build_dir,
@@ -412,12 +425,13 @@ pub(crate) fn stage_rootfs(
 /// Download and sha3-384-verify every resolved snap into the cache, returning
 /// the `(name, snap)` pairs later stages consume.
 pub(crate) fn download_and_verify(
+    runner: &dyn CommandRunner,
     resolved: &[ResolvedSnap],
     cache_dir: &Path,
 ) -> miette::Result<Vec<(String, ResolvedSnap)>> {
     let mut snap_paths: Vec<(String, ResolvedSnap)> = Vec::new();
     for snap in resolved {
-        let path = StoreClient::download(snap, cache_dir)?;
+        let path = StoreClient::download(runner, snap, cache_dir)?;
         StoreClient::verify(&path, &snap.sha3_384)?;
         eprintln!(
             "  ✓ {} revision {} — sha3-384 verified",
@@ -433,6 +447,7 @@ pub(crate) fn download_and_verify(
 /// kernel is declared AND `policy` requires one; the payload feeds UKI
 /// assembly (ADR-0011 step (a)) later in the build.
 pub(crate) fn extract_base_and_kernel(
+    runner: &dyn CommandRunner,
     image: &ImageDeclaration,
     resolved: &[ResolvedSnap],
     cache_dir: &Path,
@@ -440,8 +455,24 @@ pub(crate) fn extract_base_and_kernel(
     has_unsquashfs: bool,
     policy: KernelPayloadPolicy,
 ) -> miette::Result<Option<KernelPayload>> {
-    extract_base(image, resolved, cache_dir, root, has_unsquashfs, policy)?;
-    merge_kernel(image, resolved, cache_dir, root, has_unsquashfs, policy)
+    extract_base(
+        runner,
+        image,
+        resolved,
+        cache_dir,
+        root,
+        has_unsquashfs,
+        policy,
+    )?;
+    merge_kernel(
+        runner,
+        image,
+        resolved,
+        cache_dir,
+        root,
+        has_unsquashfs,
+        policy,
+    )
 }
 
 /// Base-snap extraction. Message-for-message identical to the historical
@@ -449,6 +480,7 @@ pub(crate) fn extract_base_and_kernel(
 /// the historical `extract_base_and_kernel` under
 /// [`KernelPayloadPolicy::Required`].
 fn extract_base(
+    runner: &dyn CommandRunner,
     image: &ImageDeclaration,
     resolved: &[ResolvedSnap],
     cache_dir: &Path,
@@ -467,7 +499,7 @@ fn extract_base(
     let base_path = cache_dir.join(&base_filename);
 
     if has_unsquashfs {
-        run_base_unsquashfs(&base_path, root, &image.base.name, policy)?;
+        run_base_unsquashfs(runner, &base_path, root, &image.base.name, policy)?;
     } else if policy == KernelPayloadPolicy::BestEffort {
         eprintln!("  ⚠ unsquashfs not found — base snap not extracted");
     }
@@ -482,22 +514,24 @@ fn extract_base(
 /// Run the base-snap unsquashfs and enforce the policy's failure posture,
 /// preserving each path's historical messages exactly.
 fn run_base_unsquashfs(
+    runner: &dyn CommandRunner,
     base_path: &Path,
     root: &Path,
     base_name: &str,
     policy: KernelPayloadPolicy,
 ) -> miette::Result<()> {
     eprintln!("  extracting base snap into {:?}", root);
-    let status = std::process::Command::new("unsquashfs")
-        .args([
-            "-d",
-            &root.to_string_lossy(),
-            "-no-xattrs",
-            &base_path.to_string_lossy(),
-        ])
-        .status()
+    let argv = vec![
+        "unsquashfs".to_string(),
+        "-d".to_string(),
+        root.to_string_lossy().into_owned(),
+        "-no-xattrs".to_string(),
+        base_path.to_string_lossy().into_owned(),
+    ];
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("unsquashfs not found: {e}"))?;
-    let exit_code = status.code().unwrap_or(1);
+    let exit_code = crate::command::exit_code(&out);
     if exit_code >= 128 {
         return Err(match policy {
             KernelPayloadPolicy::BestEffort => {
@@ -529,6 +563,7 @@ fn report_rootfs_extracted(root: &Path, base_name: &str) {
 /// payload); fail-closed under [`KernelPayloadPolicy::Required`] (error on
 /// unsquashfs failure, require a locatable payload).
 fn merge_kernel(
+    runner: &dyn CommandRunner,
     image: &ImageDeclaration,
     resolved: &[ResolvedSnap],
     cache_dir: &Path,
@@ -553,7 +588,7 @@ fn merge_kernel(
     // Short-lived extraction scratch; the located payload points into `root`.
     let kernel_work = tempfile::tempdir().map_err(|e| miette::miette!("{e}"))?;
     let kernel_dir = kernel_work.path().join("kernel-snap");
-    if !unsquashfs_kernel(&kpath, &kernel_dir, &kernel_entry.snap.name, policy)? {
+    if !unsquashfs_kernel(runner, &kpath, &kernel_dir, &kernel_entry.snap.name, policy)? {
         return Ok(None);
     }
     copy_kernel_tree(&kernel_dir, root)?;
@@ -575,21 +610,23 @@ fn merge_kernel(
 /// `Ok(false)` when best-effort policy tolerates the failure, and `Err` when
 /// required policy fails closed.
 fn unsquashfs_kernel(
+    runner: &dyn CommandRunner,
     kpath: &Path,
     kernel_dir: &Path,
     snap_name: &str,
     policy: KernelPayloadPolicy,
 ) -> miette::Result<bool> {
-    let status = std::process::Command::new("unsquashfs")
-        .args([
-            "-d",
-            &kernel_dir.to_string_lossy(),
-            "-no-xattrs",
-            &kpath.to_string_lossy(),
-        ])
-        .status()
+    let argv = vec![
+        "unsquashfs".to_string(),
+        "-d".to_string(),
+        kernel_dir.to_string_lossy().into_owned(),
+        "-no-xattrs".to_string(),
+        kpath.to_string_lossy().into_owned(),
+    ];
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("unsquashfs: {e}"))?;
-    if status.code().unwrap_or(1) < 128 {
+    if crate::command::exit_code(&out) < 128 {
         return Ok(true);
     }
     match policy {

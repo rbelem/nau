@@ -21,6 +21,7 @@ use mlua::Value;
 use serde::Serialize;
 use serde::Serializer;
 
+use crate::command::CommandRunner;
 use crate::doctor;
 use crate::lock::LockFile;
 use crate::snap::SnapRef;
@@ -485,6 +486,12 @@ fn get_opt_swap(table: &mlua::Table) -> miette::Result<Option<SwapConfig>> {
 /// Named image outputs from a `shuttle.lua`.
 pub type ImageOutputs = HashMap<String, ImageDeclaration>;
 
+/// The production image runner: every host tool the pipeline invokes runs
+/// through this adapter. (`RealRunner` executes the exact argv handed to it;
+/// `build_image`/`build_disk_image` pass this unit value down. Kept a named
+/// alias so the seam has ONE production spelling for the whole pipeline.)
+pub(crate) use crate::command::RealRunner as ImageTools;
+
 // ── Image assembly pipeline ──
 
 /// Build a rootfs image from an image declaration.
@@ -496,9 +503,32 @@ pub fn build_image(
     arch: &str,
     lockfile: &mut LockFile,
 ) -> miette::Result<PathBuf> {
+    build_image_with(
+        &ImageTools,
+        image,
+        output_dir,
+        cache_dir,
+        channel,
+        arch,
+        lockfile,
+    )
+}
+
+/// [`build_image`] with the host tool runner injected — the seam a fake
+/// runner drives end to end in-process.
+pub(crate) fn build_image_with(
+    runner: &dyn CommandRunner,
+    image: &ImageDeclaration,
+    output_dir: &Path,
+    cache_dir: &Path,
+    channel: &str,
+    arch: &str,
+    lockfile: &mut LockFile,
+) -> miette::Result<PathBuf> {
     // 1-6. Shared staging: resolve + download/verify + ADR-0019 base
     // contract + base extraction + best-effort kernel merge (issue #57).
     let staged = stage_rootfs(
+        runner,
         image,
         cache_dir,
         channel,
@@ -577,20 +607,21 @@ pub fn build_image(
         .into_diagnostic()
         .wrap_err_with(|| format!("creating output dir {:?}", output_dir))?;
 
-    let mut mksquashfs = std::process::Command::new("mksquashfs");
-    mksquashfs
-        .arg(&root)
-        .arg(&output_path)
-        .arg("-noappend")
-        .arg("-comp")
-        .arg("xz")
-        .arg("-all-root");
+    let argv = vec![
+        "mksquashfs".to_string(),
+        root.to_string_lossy().into_owned(),
+        output_path.to_string_lossy().into_owned(),
+        "-noappend".to_string(),
+        "-comp".to_string(),
+        "xz".to_string(),
+        "-all-root".to_string(),
+    ];
 
-    let status = mksquashfs
-        .status()
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("mksquashfs not found: {e}"))?;
 
-    if !status.success() {
+    if out.code != 0 {
         return Err(miette::miette!(
             "mksquashfs exited with error while creating image"
         ));
@@ -632,6 +663,28 @@ pub fn build_disk_image(
     arch: &str,
     lockfile: &mut LockFile,
 ) -> miette::Result<PathBuf> {
+    build_disk_image_with(
+        &ImageTools,
+        image,
+        output_dir,
+        cache_dir,
+        channel,
+        arch,
+        lockfile,
+    )
+}
+
+/// [`build_disk_image`] with the host tool runner injected.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_disk_image_with(
+    runner: &dyn CommandRunner,
+    image: &ImageDeclaration,
+    output_dir: &Path,
+    cache_dir: &Path,
+    channel: &str,
+    arch: &str,
+    lockfile: &mut LockFile,
+) -> miette::Result<PathBuf> {
     // Scratch dir for build ARTIFACTS (disk.img, standalone partition files,
     // UKI stage) — deliberately separate from the staged rootfs, because the
     // rootfs dir IS what gets copied into the partitions by `mkfs.ext4 -d`.
@@ -642,6 +695,7 @@ pub fn build_disk_image(
     // contract + base extraction + fail-closed kernel merge with the boot
     // payload (issue #57). `Required` preserves the disk build's behavior.
     let staged = stage_rootfs(
+        runner,
         image,
         cache_dir,
         channel,
@@ -733,7 +787,7 @@ pub fn build_disk_image(
     // daemon-bearing apps. Written here, after payload staging and BEFORE
     // root populate + dm-verity: binaries and units must be inside the
     // hashed tree — the same write-before-hash constraint as the manifest.
-    crate::units::emit_app_runtime(&snap_paths, cache_dir, &root, has_unsquashfs)?;
+    crate::units::emit_app_runtime(runner, &snap_paths, cache_dir, &root, has_unsquashfs)?;
 
     // 6. ADR-0011 step (c) pre-flight — kernel images need ukify, the
     // sd-stub, and veritysetup; fail closed BEFORE any destructive step
@@ -808,10 +862,10 @@ pub fn build_disk_image(
     // 7. Create and partition the raw image — GPT PARTUUIDs exist from
     // parted mkpart time, before anything is formatted or copied.
     let img_path = scratch.path().join("disk.img");
-    create_partitions(&img_path, &effective_layout, total_mb)?;
+    create_partitions(runner, &img_path, &effective_layout, total_mb)?;
     // ADR-0011 step (d): A/B layouts additionally get GPT partition type
     // GUIDs + PARTLABELs so systemd-sysupdate can match the slots.
-    apply_gpt_slot_metadata(&img_path, image, &effective_layout, &slots)?;
+    apply_gpt_slot_metadata(runner, &img_path, image, &effective_layout, &slots)?;
 
     // 8. Read back the authoritative partition extents with one `sfdisk -J`
     // call — parted's "MB" units are decimal (10^6) and sector-aligned
@@ -825,7 +879,7 @@ pub fn build_disk_image(
                 .as_ref()
                 .is_some_and(|s| parse_size_mb(&s.size, 0) > 0),
         );
-    let extents = read_partition_extents(&img_path, expected_partitions)?;
+    let extents = read_partition_extents(runner, &img_path, expected_partitions)?;
     eprintln!(
         "  ✓ partition table read back: {} partitions at verified extents",
         extents.len()
@@ -864,11 +918,16 @@ pub fn build_disk_image(
         // Normalize to owner-accessible (u+rwX) before any `-d` populate;
         // the adjusted modes are what the filesystem — and the verity hash
         // over it — will carry.
-        let status = std::process::Command::new("chmod")
-            .args(["-R", "u+rwX", root.to_string_lossy().as_ref()])
-            .status()
+        let root_arg = root.to_string_lossy().into_owned();
+        let status = runner
+            .run(&[
+                "chmod".to_string(),
+                "-R".to_string(),
+                "u+rwX".to_string(),
+                root_arg,
+            ])
             .map_err(|e| miette::miette!("chmod not found: {e}"))?;
-        if !status.success() {
+        if status.code != 0 {
             return Err(miette::miette!(
                 "chmod -R u+rwX failed on the staged rootfs — refusing to populate \
                  from a tree mkfs cannot scan"
@@ -879,6 +938,7 @@ pub fn build_disk_image(
         // empty verity data device would brick the boot — unlike the
         // historical silent-skip on the other partitions.
         build_ext4_partition(
+            runner,
             &root_file,
             &root,
             &effective_layout.partitions[root_idx],
@@ -892,6 +952,7 @@ pub fn build_disk_image(
         let hash_idx = slots.hashes[0].expect("verity ⇒ hash partition was appended");
         let hash_file = extent_file(scratch.path(), "verity-hash.img", &extents[hash_idx])?;
         let roothash = verity_format(
+            runner,
             &root_file.to_string_lossy(),
             &hash_file.to_string_lossy(),
             shared_salt.as_deref(),
@@ -926,6 +987,7 @@ pub fn build_disk_image(
         // 9d. ADR-0011 step (a): assemble the UKI with the verity trailer;
         // `root=` stays slot A (first declared root).
         let (uki, stage) = assemble_uki(
+            runner,
             image,
             kernel_payload.as_ref(),
             &extents,
@@ -937,6 +999,7 @@ pub fn build_disk_image(
     } else {
         // Kernel-free images boot without a UKI — no verity, no trailer.
         let (uki, stage) = assemble_uki(
+            runner,
             image,
             kernel_payload.as_ref(),
             &extents,
@@ -967,7 +1030,7 @@ pub fn build_disk_image(
         uki_stage: &uki_stage,
         uc: uc.as_ref(),
     };
-    populate_remaining_partitions(&populate, &effective_layout, &populated_roots)?;
+    populate_remaining_partitions(runner, &populate, &effective_layout, &populated_roots)?;
 
     // 12. Copy final image to output
     std::fs::copy(&img_path, &output_path).into_diagnostic()?;
@@ -2003,7 +2066,8 @@ mod tests {
     fn verity_format_without_veritysetup_fails_closed() {
         // Injected None: the fail-closed path fires before any device is
         // touched, so device names are irrelevant.
-        let err = verity_format_with(None, "/dev/loop0p2", "/dev/loop0p3", None).unwrap_err();
+        let err = verity_format_with(&ImageTools, None, "/dev/loop0p2", "/dev/loop0p3", None)
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("veritysetup") && msg.contains("shuttle doctor"),
@@ -2109,6 +2173,7 @@ mod tests {
         // Injected None ukify: the fail-closed path fires before any file
         // is touched, so dummy paths are safe.
         let err = build_uki_with(
+            &ImageTools,
             None,
             Some(Path::new("/usr/lib/systemd/boot/efi/linuxx64.efi.stub")),
             Path::new("/nonexistent/vmlinuz"),
@@ -2136,6 +2201,7 @@ mod tests {
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let err = build_uki_with(
+            &ImageTools,
             Some(&fake),
             None,
             Path::new("/nonexistent/vmlinuz"),
@@ -3023,7 +3089,7 @@ mod tests {
             download_url: String::new(),
         }];
         let cache = tempfile::tempdir().unwrap();
-        enforce_base_contract(&image, &resolved, cache.path(), true).unwrap();
+        enforce_base_contract(&ImageTools, &image, &resolved, cache.path(), true).unwrap();
     }
 
     // ── Shared staging + kernel-payload policy (issue #57) ──
@@ -3054,6 +3120,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
 
         let payload = extract_base_and_kernel(
+            &ImageTools,
             &image,
             &resolved,
             cache.path(),
@@ -3098,6 +3165,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
 
         let result = extract_base_and_kernel(
+            &ImageTools,
             &image,
             &resolved,
             cache.path(),
@@ -3109,5 +3177,417 @@ mod tests {
             result.is_err(),
             "required policy must fail closed when the kernel payload cannot be staged"
         );
+    }
+
+    // ── End-to-end pipeline driven by a fake runner (issue #58) ──
+    //
+    // The FIRST test that drives `build_image` / `build_disk_image` end to
+    // end with NO host tooling and NO network: a single fake
+    // `CommandRunner` answers every subprocess the pipeline would spawn —
+    // store query, assertion fetch, download, unsquashfs, parted, sfdisk,
+    // mkfs, mmd/mcopy, mksquashfs — and records the exact argv every call.
+    // The test asserts BOTH the built artifact's in-process structure and
+    // that the expected tools were invoked through the seam. If production
+    // bypassed the seam the fake would see nothing and the argv assertions
+    // would fail; the real tools are not on PATH in the gate anyway.
+
+    mod command_seam {
+        use super::*;
+        use crate::command::{CommandRunner, RunnerOutput};
+        use std::sync::Mutex;
+
+        /// The production base pin used by the e2e fixtures; the dummy
+        /// payload's real sha3-384 is patched in at fixture time.
+        const BASE_NAME: &str = "e2etest-base";
+        const BASE_REV: u32 = 42;
+        const BASE_VER: &str = "6.8.0";
+
+        /// Fake runner: records every argv and answers each tool from the
+        /// scripted table. Any unrecognised invocation panics, so a
+        /// bypassed (or unexpected) tool call is a hard test failure.
+        struct E2eRunner {
+            calls: Mutex<Vec<Vec<String>>>,
+            arch: String,
+            digest: String,
+        }
+
+        impl E2eRunner {
+            fn new(arch: &str, digest: &str) -> E2eRunner {
+                E2eRunner {
+                    calls: Mutex::new(Vec::new()),
+                    arch: arch.to_string(),
+                    digest: digest.to_string(),
+                }
+            }
+
+            fn calls(&self) -> Vec<Vec<String>> {
+                self.calls.lock().unwrap().clone()
+            }
+
+            fn saw(&self, program: &str) -> bool {
+                self.calls()
+                    .iter()
+                    .any(|c| c.first().is_some_and(|p| p == program))
+            }
+        }
+
+        fn out(code: i32, stdout: Vec<u8>) -> RunnerOutput {
+            RunnerOutput {
+                code,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+
+        /// The channel-map JSON `query_info_with` parses. The download URL
+        /// is never fetched (the fixture pre-places the cache file).
+        fn channel_map_json(name: &str, revision: u32, digest: &str, arch: &str) -> Vec<u8> {
+            serde_json::json!({
+                "snap-id": "e2etestsnapid",
+                "channel-map": [{
+                    "channel": { "architecture": arch, "name": name, "track": "latest", "risk": "stable" },
+                    "download": { "sha3-384": digest, "size": 11, "url": format!("https://example.invalid/{name}.snap") },
+                    "revision": revision
+                }]
+            })
+            .to_string()
+            .into_bytes()
+        }
+
+        /// The `sfdisk -J` read-back for the disk fixture's three partitions
+        /// (ESP 64M, root 256M, data 256M) at 512-byte sectors.
+        fn sfdisk_json() -> Vec<u8> {
+            serde_json::json!({
+                "partitiontable": {
+                    "sector-size": 512,
+                    "partitions": [
+                        { "start": 2048, "size": 131072, "uuid": "11111111-1111-1111-1111-111111111111" },
+                        { "start": 133120, "size": 524288, "uuid": "22222222-2222-2222-2222-222222222222" },
+                        { "start": 657408, "size": 524288, "uuid": "33333333-3333-3333-3333-333333333333" }
+                    ]
+                }
+            })
+            .to_string()
+            .into_bytes()
+        }
+
+        fn arg_after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+            argv.iter()
+                .position(|a| a == flag)
+                .and_then(|i| argv.get(i + 1))
+                .map(String::as_str)
+        }
+
+        /// Stage a rootfs tree the way a real `unsquashfs -d <dir>` would:
+        /// a `bin/` dir (so the pipeline reports a real rootfs) and a single
+        /// `lib/modules/<ver>/` tree (so kernel-version discovery works).
+        fn stage_rootfs_tree(dir: &str) {
+            std::fs::create_dir_all(Path::new(dir).join("bin")).unwrap();
+            std::fs::create_dir_all(
+                Path::new(dir)
+                    .join("usr")
+                    .join("lib")
+                    .join("modules")
+                    .join(BASE_VER),
+            )
+            .unwrap();
+            std::fs::write(Path::new(dir).join("bin").join("busybox"), b"ELF").unwrap();
+        }
+
+        impl CommandRunner for E2eRunner {
+            fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput> {
+                self.calls.lock().unwrap().push(argv.to_vec());
+                let program = argv.first().map(String::as_str).unwrap_or("");
+                match program {
+                    "which" => Ok(out(0, Vec::new())), // unsquashfs + sfdisk present
+                    "curl" => {
+                        let url = argv.last().map(String::as_str).unwrap_or("");
+                        if url.contains("/assertions/") {
+                            // Transport failure ⇒ tolerated for a user-pinned
+                            // snap (never a parse failure, which fails closed).
+                            Ok(RunnerOutput {
+                                code: 7,
+                                stdout: Vec::new(),
+                                stderr: "could not resolve host".into(),
+                            })
+                        } else {
+                            Ok(out(
+                                0,
+                                channel_map_json(BASE_NAME, BASE_REV, &self.digest, &self.arch),
+                            ))
+                        }
+                    }
+                    "unsquashfs" => {
+                        if argv.iter().any(|a| a == "meta/snap.yaml") {
+                            // No app metadata in the fixture — warn-and-skip.
+                            return Ok(out(1, Vec::new()));
+                        }
+                        if let Some(dir) = arg_after(argv, "-d") {
+                            stage_rootfs_tree(dir);
+                        }
+                        Ok(out(0, Vec::new()))
+                    }
+                    "dd" => {
+                        // count=<MB> is carried as the 5th arg.
+                        let mb: u64 = argv
+                            .iter()
+                            .find_map(|a| a.strip_prefix("count="))
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or(0);
+                        let of = argv
+                            .iter()
+                            .find_map(|a| a.strip_prefix("of="))
+                            .expect("dd argv must carry of=");
+                        let f = std::fs::File::create(of).unwrap();
+                        f.set_len(mb * 1024 * 1024).unwrap();
+                        Ok(out(0, Vec::new()))
+                    }
+                    "parted" | "mkfs.vfat" | "mkfs.ext4" | "mmd" | "mcopy" | "find" => {
+                        Ok(out(0, Vec::new()))
+                    }
+                    "sfdisk" => Ok(out(0, sfdisk_json())),
+                    "mksquashfs" => {
+                        // Materialize the packed artifact as a JSON listing of
+                        // the staged rootfs — the in-process structure the
+                        // test asserts without unpacking anything.
+                        let root = &argv[1];
+                        let output = &argv[2];
+                        let mut names: Vec<String> = Vec::new();
+                        let mut stack = vec![std::path::PathBuf::from(root)];
+                        while let Some(dir) = stack.pop() {
+                            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                                let path = entry.path();
+                                let rel = path
+                                    .strip_prefix(root)
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .into_owned();
+                                if path.is_dir() {
+                                    stack.push(path.clone());
+                                }
+                                names.push(rel);
+                            }
+                        }
+                        names.sort();
+                        std::fs::write(output, serde_json::to_vec(&names).unwrap()).unwrap();
+                        Ok(out(0, Vec::new()))
+                    }
+                    other => panic!("unexpected tool invocation: {other} ({argv:?})"),
+                }
+            }
+        }
+
+        // ── fixtures ──
+
+        /// A cache dir with a dummy `<name>_<rev>_<digest>.snap` whose real
+        /// sha3-384 the fake store query reports back.
+        fn cache_fixture() -> (tempfile::TempDir, PathBuf, String) {
+            let dir = tempfile::tempdir().unwrap();
+            let payload = dir.path().join("payload.snap");
+            std::fs::write(&payload, b"dummy-snap").unwrap();
+            let digest = crate::store::sha3_384_file(&payload).unwrap();
+            let named = dir
+                .path()
+                .join(format!("{BASE_NAME}_{BASE_REV}_{digest}.snap"));
+            std::fs::rename(&payload, &named).unwrap();
+            let cache = dir.path().to_path_buf();
+            (dir, cache, digest)
+        }
+
+        fn pinned_base(digest: &str) -> SnapRef {
+            SnapRef {
+                name: BASE_NAME.into(),
+                revision: Some(BASE_REV),
+                sha3_384: Some(digest.to_string()),
+            }
+        }
+
+        #[test]
+        fn build_image_with_fake_runner_packs_orchestrated_rootfs() {
+            let (_cache_dir, cache, digest) = cache_fixture();
+
+            let image = ImageDeclaration {
+                name: "e2e".into(),
+                version: "1.0.0".into(),
+                base: pinned_base(&digest),
+                kernel: None,
+                gadget: None,
+                gadget_channel: None,
+                extra_snaps: vec![],
+                bootloader: None,
+                disk: None,
+                sysctl: vec![],
+                update_source: None,
+            };
+
+            let output = tempfile::tempdir().unwrap();
+            let runner = E2eRunner::new("amd64", &digest);
+
+            let mut lockfile = LockFile::empty();
+            let img = build_image_with(
+                &runner,
+                &image,
+                output.path(),
+                &cache,
+                "latest/stable",
+                "amd64",
+                &mut lockfile,
+            )
+            .expect("build_image must complete through the fake runner");
+
+            // Artifact exists at the documented path.
+            assert!(img.is_file(), "image artifact written: {}", img.display());
+            assert_eq!(img.file_name().unwrap(), "e2e_1.0.0_amd64.img");
+
+            // The fake `mksquashfs` recorded the staged rootfs as JSON —
+            // assert the assembled structure in-process, no unpacking.
+            let packed: Vec<String> =
+                serde_json::from_slice(&std::fs::read(&img).unwrap()).unwrap();
+            let snap_entry = format!("snap/{BASE_NAME}_{BASE_REV}_{digest}.snap");
+            assert!(
+                packed.iter().any(|p| p == &snap_entry),
+                "packed rootfs carries the bundled snap: {packed:?}"
+            );
+            assert!(
+                packed.iter().any(|p| p == "image-manifest.json"),
+                "packed rootfs carries the manifest: {packed:?}"
+            );
+            assert!(
+                packed.iter().any(|p| p == "bin"),
+                "packed rootfs carries the extracted base tree: {packed:?}"
+            );
+
+            // Seam proof: the expected tools were invoked through the
+            // runner — never as real subprocesses.
+            let calls = runner.calls();
+            assert!(
+                calls.iter().any(|c| c == &["which", "unsquashfs"]),
+                "unsquashfs availability checked through the runner: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.first().is_some_and(|p| p == "unsquashfs")
+                        && c.iter().any(|a| a == "-no-xattrs")),
+                "base snap extracted through the runner: {calls:?}"
+            );
+            let mk = calls
+                .iter()
+                .find(|c| c.first().is_some_and(|p| p == "mksquashfs"))
+                .expect("mksquashfs routed through the runner");
+            assert_eq!(mk[3..], ["-noappend", "-comp", "xz", "-all-root"]);
+            assert!(
+                !runner.saw("sfdisk") && !runner.saw("parted"),
+                "the squashfs-only path must not partition"
+            );
+        }
+
+        #[test]
+        fn disk_partition_pipeline_drives_every_tool_through_the_runner() {
+            // The full `build_disk_image` cannot be driven hermetically yet:
+            // its populate pre-flight resolves `sfdisk`/`mkfs.*`/`mmd`/`mcopy`
+            // from the HOST PATH (`find_host_tool`, the injected-Option<&Path>
+            // precedent that #58 deliberately keeps), so a host without
+            // e2fsprogs fails closed BEFORE any runner call. This test instead
+            // drives the disk-side partition pipeline — `create_partitions`,
+            // `read_partition_extents`, `apply_gpt_slot_metadata`, and
+            // `populate_remaining_partitions` — through the fake runner,
+            // proving every tool call in partition.rs/verity.rs is routed
+            // through the seam and the image is spliced in process.
+            let work = tempfile::tempdir().unwrap();
+            let runner = E2eRunner::new("amd64", "unused");
+            let layout = DiskLayout {
+                label: "gpt".into(),
+                partitions: vec![
+                    Partition {
+                        name: "UEFI".into(),
+                        size: "64M".into(),
+                        fs: "vfat".into(),
+                        mount: "/boot/efi".into(),
+                        options: vec![],
+                        role: String::new(),
+                    },
+                    Partition {
+                        name: "root".into(),
+                        size: "256M".into(),
+                        fs: "ext4".into(),
+                        mount: "/".into(),
+                        options: vec![],
+                        role: String::new(),
+                    },
+                    Partition {
+                        name: "data".into(),
+                        size: "256M".into(),
+                        fs: "ext4".into(),
+                        mount: "/data".into(),
+                        options: vec![],
+                        role: String::new(),
+                    },
+                ],
+                swap: None,
+                ab: false,
+            };
+            let img_path = work.path().join("disk.img");
+            create_partitions(&runner, &img_path, &layout, 580).unwrap();
+            assert!(img_path.is_file(), "dd formed the raw image");
+
+            let extents = read_partition_extents(&runner, &img_path, 3).unwrap();
+            assert_eq!(extents.len(), 3, "read-back yields every partition");
+            assert_eq!(extents[1].size_bytes, 256 * 1024 * 1024);
+
+            let slots = Slots {
+                roots: vec![1],
+                hashes: vec![None],
+            };
+            let image = ImageDeclaration {
+                name: "e2edisk".into(),
+                version: "2.0.0".into(),
+                base: pinned_base("unused"),
+                kernel: None,
+                gadget: None,
+                gadget_channel: None,
+                extra_snaps: vec![],
+                bootloader: None,
+                disk: None,
+                sysctl: vec![],
+                update_source: None,
+            };
+            let root = tempfile::tempdir().unwrap();
+            let esp = root.path().join("EFI").join("BOOT");
+            std::fs::create_dir_all(&esp).unwrap();
+
+            let ctx = PopulateCtx {
+                image: &image,
+                extents: &extents,
+                scratch_dir: work.path(),
+                root: root.path(),
+                uki: None,
+                uki_stage: Path::new(""),
+                uc: None,
+            };
+            populate_remaining_partitions(&runner, &ctx, &layout, &slots.roots).unwrap();
+
+            // Seam proof: each disk-side tool was routed through the runner.
+            let calls = runner.calls();
+            assert!(runner.saw("dd"), "dd through the runner: {calls:?}");
+            assert!(runner.saw("parted"), "parted through the runner");
+            assert!(runner.saw("sfdisk"), "sfdisk read-back through the runner");
+            assert!(runner.saw("mkfs.vfat"), "ESP mkfs through the runner");
+            assert!(runner.saw("mkfs.ext4"), "data mkfs through the runner");
+            assert!(runner.saw("mmd"), "mtools mmd through the runner");
+            let sf = calls
+                .iter()
+                .find(|c| c.first().is_some_and(|p| p == "sfdisk"))
+                .expect("sfdisk read-back recorded");
+            assert_eq!(sf[1], "-J", "extents are read back with -J: {sf:?}");
+            assert!(
+                calls
+                    .iter()
+                    .filter(|c| c.first().is_some_and(|p| p == "parted"))
+                    .count()
+                    >= 4,
+                "mklabel + one mkpart per partition + esp flag: {calls:?}"
+            );
+        }
     }
 }

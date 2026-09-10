@@ -175,7 +175,7 @@ pub(crate) fn write_manifest(
 /// Copy the systemd-boot fallback binary onto the ESP (EFI/BOOT). When no
 /// host systemd-boot EFI binary is found the ESP simply lacks the fallback
 /// — the UKI + loader path does not depend on it.
-pub(crate) fn populate_esp(efi_boot: &Path) -> miette::Result<()> {
+pub(crate) fn populate_esp(runner: &dyn CommandRunner, efi_boot: &Path) -> miette::Result<()> {
     std::fs::create_dir_all(efi_boot).into_diagnostic()?;
     if efi_boot.join("BOOTX64.EFI").exists() {
         return Ok(());
@@ -196,12 +196,13 @@ pub(crate) fn populate_esp(efi_boot: &Path) -> miette::Result<()> {
             src = Some(exact);
             break;
         }
-        if let Ok(out) = std::process::Command::new("find")
-            .arg(root)
-            .arg("-name")
-            .arg("systemd-boot*.efi")
-            .output()
-        {
+        let argv = vec![
+            "find".to_string(),
+            root.to_string_lossy().into_owned(),
+            "-name".to_string(),
+            "systemd-boot*.efi".to_string(),
+        ];
+        if let Ok(out) = runner.run(&argv) {
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             let hit = stdout.lines().next().unwrap_or("");
             if !hit.trim().is_empty() {
@@ -432,7 +433,9 @@ pub(crate) fn write_uki_os_release(
 /// Build one UKI with the real `ukify` CLI. `ukify` and `stub` are
 /// injected so the fail-closed behavior is testable on hosts without
 /// systemd's tools; [`build_uki`] resolves them from the host.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_uki_with(
+    runner: &dyn CommandRunner,
     ukify: Option<&Path>,
     stub: Option<&Path>,
     kernel: &Path,
@@ -456,17 +459,20 @@ pub(crate) fn build_uki_with(
             EFI_STUB_CANDIDATES.join(", ")
         ));
     };
-    let status = std::process::Command::new(ukify)
-        .arg("build")
-        .arg(format!("--linux={}", kernel.display()))
-        .arg(format!("--initrd={}", initrd.display()))
-        .arg(format!("--cmdline={cmdline}"))
-        .arg(format!("--os-release=@{}", os_release.display()))
-        .arg(format!("--stub={}", stub.display()))
-        .arg(format!("--output={}", output.display()))
-        .status()
+    let argv = vec![
+        ukify.to_string_lossy().into_owned(),
+        "build".to_string(),
+        format!("--linux={}", kernel.display()),
+        format!("--initrd={}", initrd.display()),
+        format!("--cmdline={cmdline}"),
+        format!("--os-release=@{}", os_release.display()),
+        format!("--stub={}", stub.display()),
+        format!("--output={}", output.display()),
+    ];
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("failed to run ukify: {e}"))?;
-    if !status.success() || !output.is_file() {
+    if out.code != 0 || !output.is_file() {
         return Err(miette::miette!(
             "ukify failed to build the UKI — the disk image would not boot; \
              refusing to emit it"
@@ -478,6 +484,7 @@ pub(crate) fn build_uki_with(
 /// Build the UKI with host-resolved ukify and sd-stub (fail-closed when
 /// either is absent).
 pub(crate) fn build_uki(
+    runner: &dyn CommandRunner,
     kernel: &Path,
     initrd: &Path,
     cmdline: &str,
@@ -485,6 +492,7 @@ pub(crate) fn build_uki(
     output: &Path,
 ) -> miette::Result<()> {
     build_uki_with(
+        runner,
         find_ukify().as_deref(),
         find_efi_stub().as_deref(),
         kernel,
@@ -502,6 +510,7 @@ pub(crate) fn build_uki(
 /// roothash — Some exactly when the build verity-formatted the root
 /// partition (kernel images).
 pub(crate) fn assemble_uki(
+    runner: &dyn CommandRunner,
     image: &ImageDeclaration,
     payload: Option<&KernelPayload>,
     extents: &[PartitionExtent],
@@ -547,6 +556,7 @@ pub(crate) fn assemble_uki(
     let uki_stage = stage_dir.join(&filename);
     let os_release = write_uki_os_release(stage_dir, image)?;
     build_uki(
+        runner,
         &payload.kernel,
         &payload.initrd,
         &cmdline,

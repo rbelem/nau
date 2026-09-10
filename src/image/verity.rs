@@ -302,6 +302,7 @@ pub(crate) fn verity_format_args(
 /// twins format with the SAME salt so byte-identical data yields the SAME
 /// roothash (the roothash covers data + salt, not the hash superblock).
 pub(crate) fn verity_format_with(
+    runner: &dyn CommandRunner,
     veritysetup: Option<&Path>,
     data_dev: &str,
     hash_dev: &str,
@@ -316,15 +317,17 @@ pub(crate) fn verity_format_with(
         ));
     };
     let args = verity_format_args(salt, data_dev, hash_dev);
-    let out = std::process::Command::new(tool)
-        .args(&args)
-        .output()
+    let argv: Vec<String> = std::iter::once(tool.to_string_lossy().into_owned())
+        .chain(args)
+        .collect();
+    let out = runner
+        .run(&argv)
         .map_err(|e| miette::miette!("failed to run veritysetup: {e}"))?;
-    if !out.status.success() {
+    if out.code != 0 {
         return Err(miette::miette!(
             "veritysetup format failed ({}): {}",
-            out.status.code().unwrap_or(1),
-            String::from_utf8_lossy(&out.stderr).trim()
+            crate::command::exit_code(&out),
+            out.stderr.trim()
         ));
     }
     parse_roothash(&String::from_utf8_lossy(&out.stdout))
@@ -336,11 +339,18 @@ pub(crate) fn verity_format_with(
 /// In the unprivileged flow both "devices" are standalone partition files
 /// — veritysetup format/verify run userspace and accept plain files.
 pub(crate) fn verity_format(
+    runner: &dyn CommandRunner,
     data_dev: &str,
     hash_dev: &str,
     salt: Option<&str>,
 ) -> miette::Result<String> {
-    verity_format_with(find_veritysetup().as_deref(), data_dev, hash_dev, salt)
+    verity_format_with(
+        runner,
+        find_veritysetup().as_deref(),
+        data_dev,
+        hash_dev,
+        salt,
+    )
 }
 
 /// Extract the root hash from `veritysetup format` stdout — the
@@ -452,6 +462,7 @@ pub(crate) fn random_salt_hex() -> miette::Result<String> {
 /// pre-flight already fails closed on a missing sfdisk; this guard covers
 /// a resolve-vs-which PATH mismatch.)
 pub(crate) fn apply_gpt_slot_metadata(
+    runner: &dyn CommandRunner,
     img_path: &Path,
     image: &ImageDeclaration,
     layout: &DiskLayout,
@@ -460,11 +471,10 @@ pub(crate) fn apply_gpt_slot_metadata(
     if !layout.ab {
         return Ok(());
     }
-    let sfdisk = match std::process::Command::new("which")
-        .arg("sfdisk")
-        .output()
+    let sfdisk = match runner
+        .run(&["which".to_string(), "sfdisk".to_string()])
         .ok()
-        .filter(|o| o.status.success())
+        .filter(|o| o.code == 0)
     {
         Some(_) => "sfdisk",
         None => {
@@ -500,16 +510,17 @@ pub(crate) fn apply_gpt_slot_metadata(
     }
     for (partno, type_guid, label) in ops {
         let set = |flag: &str, value: &str| -> miette::Result<()> {
-            let status = std::process::Command::new(sfdisk)
-                .args([
-                    flag,
-                    &img_path.to_string_lossy(),
-                    &partno.to_string(),
-                    value,
-                ])
-                .status()
+            let argv = vec![
+                sfdisk.to_string(),
+                flag.to_string(),
+                img_path.to_string_lossy().into_owned(),
+                partno.to_string(),
+                value.to_string(),
+            ];
+            let out = runner
+                .run(&argv)
                 .map_err(|e| miette::miette!("sfdisk not runnable: {e}"))?;
-            if !status.success() {
+            if out.code != 0 {
                 // Raw-file images may warn about partition re-read; treat
                 // nonzero as degraded metadata, never a silent skip.
                 eprintln!(

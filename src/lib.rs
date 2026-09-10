@@ -3,6 +3,7 @@ pub mod assert;
 pub mod build_prefix;
 pub mod cache;
 pub mod cli;
+pub mod command;
 pub mod confine;
 pub mod dep_fetch;
 pub mod deps;

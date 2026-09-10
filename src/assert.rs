@@ -627,26 +627,31 @@ fn verify_chain(
 /// Fetch one raw assertion via curl (same transport pattern as
 /// `store.rs::query_info`; `Accept` selects the raw signed format — the
 /// default `*/*` returns JSON instead).
-fn fetch_assertion(_name: &str, url: &str) -> Result<String, AssertError> {
-    let output = std::process::Command::new("curl")
-        .args([
-            "-sSf",
-            "--max-time",
-            "30",
-            "-H",
-            "Snap-Device-Series: 16",
-            "-H",
-            "Accept: application/x.ubuntu.assertion",
-            url,
-        ])
-        .output()
+fn fetch_assertion(
+    runner: &dyn crate::command::CommandRunner,
+    _name: &str,
+    url: &str,
+) -> Result<String, AssertError> {
+    let argv = vec![
+        "curl".to_string(),
+        "-sSf".to_string(),
+        "--max-time".to_string(),
+        "30".to_string(),
+        "-H".to_string(),
+        "Snap-Device-Series: 16".to_string(),
+        "-H".to_string(),
+        "Accept: application/x.ubuntu.assertion".to_string(),
+        url.to_string(),
+    ];
+    let output = runner
+        .run(&argv)
         .map_err(|e| network(url.to_string(), format!("curl not found: {e}")))?;
 
-    if !output.status.success() {
+    if output.code != 0 {
         let detail = if output.stderr.is_empty() {
-            format!("curl exited with {}", output.status)
+            format!("curl exited with {}", crate::command::exit_code(&output))
         } else {
-            String::from_utf8_lossy(&output.stderr).trim().to_string()
+            output.stderr.trim().to_string()
         };
         return Err(network(url.to_string(), detail));
     }
@@ -671,14 +676,35 @@ pub fn verify_revision(
     sha3_384_hex: &str,
     size: Option<u64>,
 ) -> Result<(), AssertError> {
+    verify_revision_with(
+        &crate::command::RealRunner,
+        name,
+        snap_id,
+        revision,
+        sha3_384_hex,
+        size,
+    )
+}
+
+/// [`verify_revision`] with the host tool runner injected (the image
+/// pipeline threads its own runner so assertion fetches are as injectable
+/// as the rest of the build).
+pub fn verify_revision_with(
+    runner: &dyn crate::command::CommandRunner,
+    name: &str,
+    snap_id: Option<&str>,
+    revision: u32,
+    sha3_384_hex: &str,
+    size: Option<u64>,
+) -> Result<(), AssertError> {
     let digest_bytes = hex_decode(name, "store digest", sha3_384_hex)?;
     let digest_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest_bytes);
     let sr_url = format!("{STORE_API}/v2/assertions/snap-revision/{digest_b64}");
-    let snap_revision_raw = fetch_assertion(name, &sr_url)?;
+    let snap_revision_raw = fetch_assertion(runner, name, &sr_url)?;
 
     let key_id = parse_assertion(name, &snap_revision_raw)?.sign_key_id;
     let ak_url = format!("{STORE_API}/v2/assertions/account-key/{key_id}");
-    let account_key_raw = fetch_assertion(name, &ak_url)?;
+    let account_key_raw = fetch_assertion(runner, name, &ak_url)?;
 
     verify_chain(
         name,
