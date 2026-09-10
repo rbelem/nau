@@ -22,7 +22,7 @@
 //!       "name": "demo-app",
 //!       "version": "1.2.3",
 //!       "archs": ["amd64"],
-//!       "closure_key": "v3:…64 hex…",
+//!       "closure_key": "v4:…64 hex…",
 //!       "artifact": { "state": "unbuilt" }
 //!     }
 //!   },

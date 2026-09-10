@@ -695,7 +695,7 @@ fn select_outputs<'a>(
             }
             // `Outputs` is a HashMap: without a stable sort, multi-output
             // definitions build in nondeterministic order run to run.
-            vec.sort_by(|(a, _), (b, _)| a.cmp(b));
+            vec.sort_by_key(|(a, _)| *a);
             if let Some(t) = target {
                 if !json {
                     shuttle::output::info(format!("target: {t}"));
@@ -1221,7 +1221,7 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
             // `Outputs` is a HashMap: sort for deterministic multi-output
             // report order run to run.
             let mut metas: Vec<(&String, &shuttle::snap::SnapMeta)> = all_outputs.iter().collect();
-            metas.sort_by(|(a, _), (b, _)| a.cmp(b));
+            metas.sort_by_key(|(name, _)| *name);
             metas.into_iter().map(|(_, meta)| meta).collect()
         }
     };
