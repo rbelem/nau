@@ -60,27 +60,50 @@ return {
         build = table.concat({
             "mkdir -p $STAGE/usr/lib $STAGE/usr/bin",
             "cp -a $SRC $STAGE/usr/lib/go",
-            "printf '%s\\n' '#!/bin/sh' 'exec \"$(dirname \"$0\")/../lib/go/bin/go\" \"$@\"' > $STAGE/usr/bin/go",
-            "printf '%s\\n' '#!/bin/sh' 'exec \"$(dirname \"$0\")/../lib/go/bin/gofmt\" \"$@\"' > $STAGE/usr/bin/gofmt",
-            "chmod +x $STAGE/usr/bin/go $STAGE/usr/bin/gofmt",
+            -- Wrappers resolve $0 through symlinks before deriving the
+            -- toolchain path: the farm exposes the app as a symlink
+            -- (current/go -> apps/go/usr/lib/go/go), so a bare `dirname $0`
+            -- points at the farm dir, not the GOROOT. readlink -f gives the
+            -- real script path; its dirname is where bin/ and the GOROOT
+            -- src/pkg trees live. Three single-substitution lines (no
+            -- nesting) so the preflight PATH probe does not mis-split them.
+            --
+            -- usr/bin wrappers: build-time PATH exposure (a build_deps
+            -- consumer invokes bare `go`/`gofmt` in the merged prefix).
+            "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\")' 'd=$(dirname -- \"$p\")' 'exec \"$d/../lib/go/bin/go\" \"$@\"' > $STAGE/usr/bin/go",
+            "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\")' 'd=$(dirname -- \"$p\")' 'exec \"$d/../lib/go/bin/gofmt\" \"$@\"' > $STAGE/usr/bin/gofmt",
+            -- GOROOT-root launchers: the farm app commands. The app
+            -- assembly (issue #37) captures only the command binary's
+            -- parent directory, so a command under usr/lib/go/bin would
+            -- hardlink the trimmed go/gofmt binaries alone and strand the
+            -- GOROOT src/pkg trees — go then dies "binary is trimmed and
+            -- GOROOT is not set". A launcher AT usr/lib/go makes the
+            -- assembly root usr/lib/go, so the whole GOROOT ships beside
+            -- the binary and the resolved script dir is the GOROOT root.
+            "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\")' 'd=$(dirname -- \"$p\")' 'exec \"$d/bin/go\" \"$@\"' > $STAGE/usr/lib/go/go",
+            "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\")' 'd=$(dirname -- \"$p\")' 'exec \"$d/bin/gofmt\" \"$@\"' > $STAGE/usr/lib/go/gofmt",
+            "chmod +x $STAGE/usr/bin/go $STAGE/usr/bin/gofmt $STAGE/usr/lib/go/go $STAGE/usr/lib/go/gofmt",
         }, " && "),
 
         type = "source",
         requires = {},
 
         apps = {
-            -- Point at the usr/bin WRAPPER, not usr/lib/go/bin/go: the
-            -- raw binary is GOROOT-trimmed and resolves its root relative
-            -- to its own location, which breaks under the farm/assembly
-            -- relayout. The wrapper execs its sibling `../lib/go/bin/go`
-            -- from a stable usr/bin position, so GOROOT lands at
-            -- usr/lib/go from the store tree, the merged build prefix, or
-            -- a pod assembly alike.
+            -- command is the GOROOT-root launcher (usr/lib/go/go), not the
+            -- bare usr/lib/go/bin/go: the go binary resolves GOROOT relative
+            -- to /proc/self/exe, so a farm symlink straight at the trimmed
+            -- binary (or an assembly of just usr/lib/go/bin) dies with
+            -- "cannot find GOROOT directory: binary is trimmed and GOROOT is
+            -- not set". The launcher execs $(dirname $0)/bin/go, so the
+            -- assembly rooted at usr/lib/go carries the GOROOT trees and the
+            -- binary lands GOROOT at the assembled usr/lib/go. (Supersedes
+            -- the interim usr/bin-wrapper app command, which left the farm
+            -- assembly without the usr/lib/go tree — issue #46's gap.)
             go = app {
-                command = "usr/bin/go",
+                command = "usr/lib/go/go",
             },
             gofmt = app {
-                command = "usr/bin/gofmt",
+                command = "usr/lib/go/gofmt",
             },
         },
     },
