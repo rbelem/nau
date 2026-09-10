@@ -10,6 +10,7 @@ pub mod deps;
 pub mod desktop;
 pub mod doctor;
 pub mod dsl;
+pub mod emit;
 pub mod farm;
 pub mod image;
 pub mod index;

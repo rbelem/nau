@@ -632,24 +632,10 @@ fn emit_one_snap(
             // Plain app: binary only, no unit.
             continue;
         };
-        let unit_dir = root.join("usr/lib/systemd/system");
-        std::fs::create_dir_all(&unit_dir)
-            .into_diagnostic()
-            .wrap_err("creating /usr/lib/systemd/system")?;
-        std::fs::write(unit_dir.join(&unit.unit_name), &unit.text)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("writing {}", unit.unit_name))?;
+        let unit_rel = Path::new("usr/lib/systemd/system").join(&unit.unit_name);
+        crate::emit::write_unit(root, &unit_rel, &unit.text)?;
         // Build-time enablement: multi-user.target.wants symlink.
-        let wants = root
-            .join("etc/systemd/system/multi-user.target.wants")
-            .join(&unit.unit_name);
-        std::fs::create_dir_all(wants.parent().unwrap())
-            .into_diagnostic()
-            .wrap_err("creating multi-user.target.wants")?;
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(format!("../{}", unit.unit_name), &wants)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("linking {}", wants.display()))?;
+        crate::emit::enable_unit(root, "multi-user.target", &unit.unit_name)?;
     }
 
     Ok(plans.into_iter().flat_map(|p| p.warnings).collect())
