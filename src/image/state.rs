@@ -91,6 +91,19 @@ pub(crate) fn needs_state_split(image: &ImageDeclaration, layout: &DiskLayout) -
     layout.partitions.iter().any(is_state_partition) || image.update_source.is_some()
 }
 
+/// Does the image emit the systemd-sysupdate transfer definitions **and**
+/// their trigger units?
+///
+/// Both require an A/B disk and a declared `update_source`: a single-slot
+/// layout has no slot to flip to, and a local-source transfer would carry
+/// no verification — unverifiable update config is never emitted or
+/// triggered silently (ADR-0011 step (d), ADR-0024 §2). One predicate
+/// drives the transfer files and the timer/service pair so they cannot
+/// drift apart.
+pub(crate) fn emits_sysupdate(image: &ImageDeclaration, layout: &DiskLayout) -> bool {
+    layout.ab && image.update_source.is_some()
+}
+
 /// The `/var` split, resolved against the effective partition table
 /// before anything is formatted.
 #[derive(Debug, Clone, PartialEq, Eq)]
