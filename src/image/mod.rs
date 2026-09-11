@@ -539,6 +539,7 @@ pub(crate) fn build_image_with(
     let root = staged.root;
     let resolved = staged.resolved;
     let snap_paths = staged.snap_paths;
+    let _kernel_snap_dir = staged.kernel_snap_dir; // #61 gate reads its config
     let _build_dir = staged.build_dir; // keep the staged rootfs alive
 
     // 6b. Write kernel cmdline if params provided
@@ -707,6 +708,7 @@ pub(crate) fn build_disk_image_with(
     let resolved = staged.resolved;
     let snap_paths = staged.snap_paths;
     let kernel_payload = staged.payload;
+    let kernel_snap_dir = staged.kernel_snap_dir;
     let has_unsquashfs = staged.has_unsquashfs;
     let _build_dir = staged.build_dir; // keep the staged rootfs alive
 
@@ -819,6 +821,13 @@ pub(crate) fn build_disk_image_with(
         )?;
         if let Some(payload) = kernel_payload.as_ref() {
             doctor::audit_kernel_verity_config(&root, &payload.version);
+            // ADR-0024 §1 hard gate: the initrd must carry the boot-chain
+            // modules the kernel config builds as modules. Fail closed
+            // BEFORE any destructive step — a kernel that cannot see its
+            // own disk is a brick, not a warning. The config is re-read
+            // from the extracted kernel-snap tree (staging keeps it alive).
+            let config_dir = kernel_snap_dir.as_ref().map(|d| d.path()).unwrap_or(&root);
+            audit_initrd_modules(runner, config_dir, payload)?;
         }
     }
 
@@ -2582,6 +2591,231 @@ WantedBy=multi-user.target
         );
     }
 
+    // ── Initrd boot-chain module gate (ADR-0024 §1) ──
+
+    /// A fake runner for the gate: answers every decompressor with the
+    /// supplied stdout, recording calls (an uncompressed initrd needs none).
+    struct GateRunner {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        stdout: Vec<u8>,
+    }
+
+    impl GateRunner {
+        fn new(stdout: Vec<u8>) -> GateRunner {
+            GateRunner {
+                calls: std::sync::Mutex::new(Vec::new()),
+                stdout,
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::command::CommandRunner for GateRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            Ok(crate::command::RunnerOutput {
+                code: 0,
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Minimal `newc` cpio archive carrying `members` and a trailer.
+    fn gate_newc_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let align4 = |n: usize| (n + 3) & !3;
+        let member = |name: &str, data: &[u8]| -> Vec<u8> {
+            let mut out = format!(
+                "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+                1,
+                0o100644,
+                0,
+                0,
+                1,
+                0,
+                data.len(),
+                0,
+                0,
+                0,
+                0,
+                name.len() + 1,
+                0,
+            )
+            .into_bytes();
+            assert_eq!(out.len(), 110);
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+            out.resize(align4(out.len()), 0);
+            out.extend_from_slice(data);
+            out.resize(align4(out.len()), 0);
+            out
+        };
+        let mut out = Vec::new();
+        for (name, data) in members {
+            out.extend_from_slice(&member(name, data));
+        }
+        out.extend_from_slice(&member("TRAILER!!!", b""));
+        out
+    }
+
+    /// A kernel payload fixture at `payload_dir` whose initrd carries the
+    /// given `.ko` members; returns the payload the gate consumes.
+    fn gate_payload(
+        payload_dir: &Path,
+        kernel_version: &str,
+        initrd_members: &[(&str, &[u8])],
+        initrd_bytes: Option<&[u8]>,
+    ) -> KernelPayload {
+        let boot = payload_dir.join("boot");
+        std::fs::create_dir_all(&boot).unwrap();
+        let initrd = boot.join(format!("initrd.img-{kernel_version}"));
+        let bytes = match initrd_bytes {
+            Some(b) => b.to_vec(),
+            None => gate_newc_archive(initrd_members),
+        };
+        std::fs::write(&initrd, bytes).unwrap();
+        std::fs::write(boot.join(format!("vmlinuz-{kernel_version}")), b"K").unwrap();
+        KernelPayload {
+            kernel: boot.join(format!("vmlinuz-{kernel_version}")),
+            initrd,
+            version: kernel_version.to_string(),
+        }
+    }
+
+    fn gate_write_config(payload_dir: &Path, kernel_version: &str, body: &str) {
+        let boot = payload_dir.join("boot");
+        std::fs::create_dir_all(&boot).unwrap();
+        std::fs::write(boot.join(format!("config-{kernel_version}")), body).unwrap();
+    }
+
+    const GATE_ALL_MODULES_M: &str = "\
+CONFIG_VIRTIO_BLK=m
+CONFIG_VIRTIO_PCI=m
+CONFIG_DM_MOD=m
+CONFIG_DM_VERITY=m
+CONFIG_EXT4_FS=m
+";
+
+    #[test]
+    fn gate_missing_module_fails_closed_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        gate_write_config(dir.path(), "6.8.0", GATE_ALL_MODULES_M);
+        // Every module but virtio_blk.
+        let payload = gate_payload(
+            dir.path(),
+            "6.8.0",
+            &[
+                ("kernels/6.8.0/virtio_pci.ko", b"k"),
+                ("kernels/6.8.0/dm_mod.ko", b"k"),
+                ("kernels/6.8.0/dm-verity.ko.xz", b"k"),
+                ("kernels/6.8.0/ext4.ko", b"k"),
+            ],
+            None,
+        );
+        let runner = GateRunner::new(Vec::new());
+        let err = audit_initrd_modules(&runner, dir.path(), &payload).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("virtio_blk"),
+            "the error must name the missing module: {msg}"
+        );
+        assert!(
+            msg.contains("config-6.8.0"),
+            "the error must name the config provenance: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_complete_module_set_builds_green() {
+        let dir = tempfile::tempdir().unwrap();
+        gate_write_config(dir.path(), "6.8.0", GATE_ALL_MODULES_M);
+        let payload = gate_payload(
+            dir.path(),
+            "6.8.0",
+            &[
+                ("kernels/6.8.0/virtio_blk.ko", b"k"),
+                ("kernels/6.8.0/virtio_pci.ko.gz", b"k"),
+                ("kernels/6.8.0/dm_mod.ko", b"k"),
+                ("kernels/6.8.0/dm-verity.ko.zst", b"k"),
+                ("kernels/6.8.0/ext4.ko", b"k"),
+            ],
+            None,
+        );
+        let runner = GateRunner::new(Vec::new());
+        audit_initrd_modules(&runner, dir.path(), &payload)
+            .expect("a complete initrd must pass the gate");
+    }
+
+    #[test]
+    fn gate_built_in_modules_need_no_initrd() {
+        let dir = tempfile::tempdir().unwrap();
+        gate_write_config(
+            dir.path(),
+            "6.8.0",
+            "CONFIG_VIRTIO_BLK=y\nCONFIG_EXT4_FS=y\n",
+        );
+        // An otherwise unreadable initrd is irrelevant when nothing is a module.
+        let payload = gate_payload(dir.path(), "6.8.0", &[], Some(b"garbage"));
+        let runner = GateRunner::new(Vec::new());
+        audit_initrd_modules(&runner, dir.path(), &payload)
+            .expect("a fully built-in config requires nothing from the initrd");
+    }
+
+    #[test]
+    fn gate_without_kernel_config_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = gate_payload(
+            dir.path(),
+            "6.8.0",
+            &[("kernels/6.8.0/virtio_blk.ko", b"k")],
+            None,
+        );
+        let runner = GateRunner::new(Vec::new());
+        let err = audit_initrd_modules(&runner, dir.path(), &payload).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no kernel config") && msg.contains("must not ship"),
+            "an unavailable config must fail closed precisely: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_unrecognized_initrd_format_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        gate_write_config(dir.path(), "6.8.0", "CONFIG_VIRTIO_BLK=m\n");
+        let payload = gate_payload(dir.path(), "6.8.0", &[], Some(b"random bytes, no magic"));
+        let runner = GateRunner::new(Vec::new());
+        let err = audit_initrd_modules(&runner, dir.path(), &payload).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unrecognized initrd format"),
+            "an unreadable initrd must fail closed naming the format: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_routes_decompression_through_the_runner() {
+        // A gzip-magic initrd: the gate must call `gzip -dc` through the
+        // injected runner, never a real subprocess.
+        let dir = tempfile::tempdir().unwrap();
+        gate_write_config(dir.path(), "6.8.0", "CONFIG_VIRTIO_BLK=m\n");
+        // Fixed gzip header is enough to select gzip; the fake runner
+        // answers with a real newc archive carrying the module.
+        let mut initrd = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03];
+        initrd.extend_from_slice(b"ignored-because-the-runner-answers");
+        let payload = gate_payload(dir.path(), "6.8.0", &[], Some(&initrd));
+        let runner = GateRunner::new(gate_newc_archive(&[("kernels/6.8.0/virtio_blk.ko", b"k")]));
+        audit_initrd_modules(&runner, dir.path(), &payload)
+            .expect("fake gzip output satisfies gate");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "one decompressor call: {calls:?}");
+        assert_eq!(calls[0][0], "gzip");
+        assert_eq!(calls[0][1], "-dc");
+    }
+
     #[test]
     fn uki_without_ukify_fails_closed_with_doctor_hint() {
         // Injected None ukify: the fail-closed path fires before any file
@@ -3544,7 +3778,7 @@ WantedBy=multi-user.target
         )
         .expect("best-effort staging must not fail closed");
         assert!(
-            payload.is_none(),
+            payload.0.is_none(),
             "best-effort staging never requires a boot payload"
         );
         // Nothing was extracted — the staged tree stays empty.

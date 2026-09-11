@@ -335,6 +335,61 @@ pub(crate) fn locate_kernel_payload(
     })
 }
 
+/// Build-time hard gate (ADR-0024 §1): the resolved kernel's initrd must
+/// carry every boot-chain module its config builds as a module
+/// (`virtio_blk`, `virtio_pci`, `dm_mod`, `dm-verity`, `ext4` on the
+/// audited kernels). A kernel whose initrd cannot see its own disk is a
+/// brick, so this FAILS CLOSED — an unavailable config, an unreadable or
+/// unrecognized initrd, and a missing module are all hard errors naming
+/// the exact cause. The required set is derived from the kernel config
+/// ([`doctor::inspect_initrd_modules`]), never hardcoded.
+pub(crate) fn audit_initrd_modules(
+    runner: &dyn CommandRunner,
+    payload_dir: &Path,
+    payload: &KernelPayload,
+) -> miette::Result<()> {
+    use crate::doctor::InitrdModuleAudit;
+    match doctor::inspect_initrd_modules(runner, payload_dir, &payload.version, &payload.initrd) {
+        InitrdModuleAudit::Satisfied(modules) if modules.is_empty() => {
+            eprintln!(
+                "  ✓ initrd module audit: kernel {} builds the boot chain in — no \
+                 initrd modules required",
+                payload.version
+            );
+            Ok(())
+        }
+        InitrdModuleAudit::Satisfied(modules) => {
+            eprintln!(
+                "  ✓ initrd module audit: kernel {} initrd carries {}",
+                payload.version,
+                modules.join(", ")
+            );
+            Ok(())
+        }
+        InitrdModuleAudit::Missing { config, missing } => Err(miette::miette!(
+            "kernel {} initrd is missing boot-chain module(s): {} (required by {}); \
+             the kernel cannot see its own disk at boot — refusing to build a disk \
+             image that cannot boot (ADR-0024 §1)",
+            payload.version,
+            missing.join(", "),
+            config.display()
+        )),
+        InitrdModuleAudit::NoConfig => Err(miette::miette!(
+            "no kernel config found for {} under {} — cannot derive the required \
+             boot-chain modules, and a kernel whose initrd cannot be verified must \
+             not ship; refusing to build a disk image that cannot boot (ADR-0024 §1)",
+            payload.version,
+            payload_dir.display()
+        )),
+        InitrdModuleAudit::Unreadable(reason) => Err(miette::miette!(
+            "kernel {} initrd {} could not be read: {reason}; refusing to build a \
+             disk image that cannot boot (ADR-0024 §1)",
+            payload.version,
+            payload.initrd.display()
+        )),
+    }
+}
+
 /// First path in `candidates` that exists as a file.
 pub(crate) fn first_existing(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())

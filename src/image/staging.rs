@@ -367,6 +367,11 @@ pub(crate) struct StagedRootfs {
     pub(crate) resolved: Vec<ResolvedSnap>,
     pub(crate) snap_paths: Vec<(String, ResolvedSnap)>,
     pub(crate) payload: Option<KernelPayload>,
+    /// The extracted kernel-snap tree the boot payload was located in,
+    /// alive for the whole build so the ADR-0024 §1 initrd-module gate can
+    /// re-read the kernel config (`boot/config-<ver>`) from it. `None` for
+    /// kernel-free builds and best-effort builds that merged no kernel.
+    pub(crate) kernel_snap_dir: Option<tempfile::TempDir>,
     /// Whether a host `unsquashfs` was found (the disk build threads this
     /// into app-runtime emission).
     pub(crate) has_unsquashfs: bool,
@@ -402,7 +407,7 @@ pub(crate) fn stage_rootfs(
         .map_err(|e| miette::miette!("failed to create build directory: {e}"))?;
     let root = build_dir.path().to_path_buf();
 
-    let payload = extract_base_and_kernel(
+    let (payload, kernel_snap_dir) = extract_base_and_kernel(
         runner,
         image,
         &resolved,
@@ -418,6 +423,7 @@ pub(crate) fn stage_rootfs(
         resolved,
         snap_paths,
         payload,
+        kernel_snap_dir,
         has_unsquashfs,
     })
 }
@@ -444,8 +450,9 @@ pub(crate) fn download_and_verify(
 
 /// Extract the base snap as the rootfs foundation, then merge the kernel
 /// snap's modules/firmware. Returns the located kernel boot payload when a
-/// kernel is declared AND `policy` requires one; the payload feeds UKI
-/// assembly (ADR-0011 step (a)) later in the build.
+/// kernel is declared AND `policy` requires one, plus the extracted
+/// kernel-snap tree (kept alive so the ADR-0024 §1 initrd-module gate can
+/// re-read the kernel config).
 pub(crate) fn extract_base_and_kernel(
     runner: &dyn CommandRunner,
     image: &ImageDeclaration,
@@ -454,7 +461,7 @@ pub(crate) fn extract_base_and_kernel(
     root: &Path,
     has_unsquashfs: bool,
     policy: KernelPayloadPolicy,
-) -> miette::Result<Option<KernelPayload>> {
+) -> miette::Result<(Option<KernelPayload>, Option<tempfile::TempDir>)> {
     extract_base(
         runner,
         image,
@@ -570,31 +577,33 @@ fn merge_kernel(
     root: &Path,
     has_unsquashfs: bool,
     policy: KernelPayloadPolicy,
-) -> miette::Result<Option<KernelPayload>> {
+) -> miette::Result<(Option<KernelPayload>, Option<tempfile::TempDir>)> {
     // build_image only merged when unsquashfs was available; disk builds
     // attempt unconditionally (and fail closed if it is missing).
     if policy == KernelPayloadPolicy::BestEffort && !has_unsquashfs {
-        return Ok(None);
+        return Ok((None, None));
     }
     let Some(kernel_entry) = image.kernel.as_ref() else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let Some(ks) = resolved.iter().find(|s| s.name == kernel_entry.snap.name) else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let k_filename = format!("{}_{}_{}.snap", ks.name, ks.revision, ks.sha3_384);
     let kpath = cache_dir.join(&k_filename);
     eprintln!("  merging kernel snap: {}", kernel_entry.snap.name);
-    // Short-lived extraction scratch; the located payload points into `root`.
+    // Extraction scratch — the located payload points into `root`, but the
+    // tree is returned alongside it so the ADR-0024 §1 initrd-module gate
+    // can re-read `boot/config-<ver>` after staging returns.
     let kernel_work = tempfile::tempdir().map_err(|e| miette::miette!("{e}"))?;
     let kernel_dir = kernel_work.path().join("kernel-snap");
     if !unsquashfs_kernel(runner, &kpath, &kernel_dir, &kernel_entry.snap.name, policy)? {
-        return Ok(None);
+        return Ok((None, None));
     }
     copy_kernel_tree(&kernel_dir, root)?;
     // The squashfs-only path never needed a boot payload.
     if policy == KernelPayloadPolicy::BestEffort {
-        return Ok(None);
+        return Ok((None, None));
     }
     // Fail closed on a payload that cannot boot the image.
     let payload = locate_kernel_payload(&kernel_dir, root).map_err(|e| {
@@ -603,7 +612,7 @@ fn merge_kernel(
             kernel_entry.snap.name
         )
     })?;
-    Ok(Some(payload))
+    Ok((Some(payload), Some(kernel_work)))
 }
 
 /// Run the kernel-snap unsquashfs. Returns `Ok(true)` to continue merging,
