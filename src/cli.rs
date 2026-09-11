@@ -604,6 +604,21 @@ pub enum RuntimeCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Activate the current generation (ADR-0023 §4). Idempotent and
+    /// boot-safe: a cold store is a clean no-op, and a half-written
+    /// journal is discarded so boot never wedges. The emitted
+    /// `shuttle-runtime-activate.service` oneshot runs this at boot.
+    Activate {
+        /// State root for generations + content store
+        /// (default: /var/lib/shuttle)
+        #[arg(long)]
+        state_dir: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Verbs for `shuttle pod` (pods, issue #2): imperative edits to one
@@ -1301,6 +1316,38 @@ mod tests {
         {
             Command::Runtime(RuntimeCommand::Gc { prune, .. }) => assert!(prune),
             _ => panic!("expected Runtime Gc"),
+        }
+    }
+
+    #[test]
+    fn test_runtime_activate() {
+        match Cli::try_parse_from([
+            "shuttle",
+            "runtime",
+            "activate",
+            "--state-dir",
+            "/tmp/state",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Runtime(RuntimeCommand::Activate { state_dir, json }) => {
+                assert_eq!(state_dir.as_deref(), Some("/tmp/state"));
+                assert!(json);
+            }
+            _ => panic!("expected Runtime Activate"),
+        }
+        // Defaults: no state-dir, human output.
+        match Cli::try_parse_from(["shuttle", "runtime", "activate"])
+            .unwrap()
+            .command
+        {
+            Command::Runtime(RuntimeCommand::Activate { state_dir, json }) => {
+                assert!(state_dir.is_none());
+                assert!(!json);
+            }
+            _ => panic!("expected Runtime Activate defaults"),
         }
     }
 

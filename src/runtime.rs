@@ -754,13 +754,7 @@ impl RuntimeStore {
         let staged: std::collections::BTreeSet<String> =
             prepared.iter().map(|p| p.pkg.name.clone()).collect();
 
-        self.begin_journal("install", n);
-        self.stage_generation(n, &packages, &prepared, &staged)?;
-        self.write_journal("install", n, JournalState::Staging);
-        std::fs::rename(self.staging_dir(n), self.generation_dir(n))
-            .into_diagnostic()
-            .wrap_err_with(|| format!("committing generation {n}"))?;
-        self.write_journal("install", n, JournalState::Committed);
+        self.commit_generation("install", n, &packages, &prepared, &staged)?;
 
         let new_units: Vec<String> = prepared
             .iter()
@@ -777,9 +771,7 @@ impl RuntimeStore {
             );
         }
 
-        std::fs::remove_file(self.journal_path())
-            .into_diagnostic()
-            .wrap_err("clearing journal")?;
+        self.clear_journal()?;
 
         Ok(InstallReport {
             noop: false,
@@ -822,13 +814,7 @@ impl RuntimeStore {
 
         let n = self.next_generation_number()?;
         let prepared: Vec<PreparedSnap> = Vec::new();
-        self.begin_journal("remove", n);
-        self.stage_generation(n, &packages, &prepared, &Default::default())?;
-        self.write_journal("remove", n, JournalState::Staging);
-        std::fs::rename(self.staging_dir(n), self.generation_dir(n))
-            .into_diagnostic()
-            .wrap_err_with(|| format!("committing generation {n}"))?;
-        self.write_journal("remove", n, JournalState::Committed);
+        self.commit_generation("remove", n, &packages, &prepared, &Default::default())?;
 
         for unit in &removed_units {
             run_best_effort(
@@ -841,9 +827,7 @@ impl RuntimeStore {
         let activator = self.activate(n, tools)?;
         notes.extend(activator.notes);
 
-        std::fs::remove_file(self.journal_path())
-            .into_diagnostic()
-            .wrap_err("clearing journal")?;
+        self.clear_journal()?;
 
         Ok(RemoveReport {
             generation: n,
@@ -942,9 +926,7 @@ impl RuntimeStore {
                  completes on reboot"
             )),
         }
-        std::fs::remove_file(self.journal_path())
-            .into_diagnostic()
-            .wrap_err("clearing journal")?;
+        self.clear_journal()?;
 
         Ok(RollbackReport {
             from: active.n,
@@ -1588,7 +1570,11 @@ impl RuntimeStore {
     /// opted out) — a silent no-op is reported distinctly from a tool
     /// that ran and failed, so "nothing was exercised" is never mistaken
     /// for a successful reload.
-    fn activate(&self, n: u64, tools: &RuntimeTools) -> miette::Result<ActivateReport> {
+    ///
+    /// Public since #60: the emitted boot oneshot (and its CLI client)
+    /// calls the same seam the install/remove/rollback paths use, so a
+    /// boot never re-derives a fourth activation variant.
+    pub fn activate(&self, n: u64, tools: &RuntimeTools) -> miette::Result<ActivateReport> {
         let mut notes = Vec::new();
         self.flip_active(n)?;
         self.relink_extension_trees(n)?;
@@ -1617,6 +1603,73 @@ impl RuntimeStore {
             notes.push(note);
         }
         Ok(ActivateReport { notes, skipped })
+    }
+
+    /// Boot-time entry point (ADR-0023 §4, #60): converge a half-written
+    /// journal, then activate whatever `active` already points at.
+    ///
+    /// - **Cold store** (no `active` symlink / no generation): a clean
+    ///   no-op with a note — a fresh device must not fail boot.
+    /// - **Warm store**: `activate(n, tools)` on the current generation.
+    ///
+    /// # Convergence rule for a half-written journal
+    ///
+    /// [`Self::recover`] (used by every *mutating CLI* command) fails
+    /// closed on an unparseable `journal.json` — that is correct for a
+    /// command that is about to mutate durable state, but a boot must
+    /// never wedge on it. `write_json_atomic` makes a *completed* write
+    /// atomic (temp + rename), so a truncated journal can only come from
+    /// an aborted external writer, never from this code's own writes. The
+    /// `active` symlink is the durable source of truth and the flip is
+    /// idempotent, so a boot converges by **discarding the unparseable
+    /// journal and proceeding from disk truth** (the current `active`
+    /// target). The journal is removed so the next mutating command sees
+    /// a clean slate; the corruption is named loudly, never silently.
+    ///
+    /// `recover()`'s own semantics (and its journal-state-machine tests)
+    /// are deliberately untouched: the lenient rule lives only on this
+    /// boot path.
+    pub fn activate_current(&self, tools: &RuntimeTools) -> miette::Result<ActivateCurrentReport> {
+        let mut notes = Vec::new();
+        if let Err(e) = self.recover() {
+            let path = self.journal_path();
+            let note = format!(
+                "boot activation: journal {} unreadable ({e:#}) — discarding it and \
+                 converging from the active symlink (the durable source of truth)",
+                path.display()
+            );
+            crate::output::warn(&note);
+            notes.push(note);
+            // Discard the unparseable journal so the next mutating command
+            // is not blocked by it. A failure to remove is fatal — the
+            // boot path must not proceed while a corrupt journal could
+            // still mislead the next command.
+            std::fs::remove_file(&path)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("discarding corrupt journal {}", path.display()))?;
+        }
+
+        let Some(active) = self.active_generation()? else {
+            let note = "boot activation: no active generation (cold store) — nothing to activate"
+                .to_string();
+            crate::output::info(&note);
+            notes.push(note);
+            return Ok(ActivateCurrentReport {
+                generation: None,
+                noop: true,
+                notes,
+                skipped: 0,
+            });
+        };
+
+        let activator = self.activate(active.n, tools)?;
+        notes.extend(activator.notes);
+        Ok(ActivateCurrentReport {
+            generation: Some(active.n),
+            noop: false,
+            notes,
+            skipped: activator.skipped,
+        })
     }
 
     /// Rebuild the sysext links for generation `n`: every tree under
@@ -1670,6 +1723,43 @@ impl RuntimeStore {
 
     fn begin_journal(&self, op: &str, n: u64) {
         self.write_journal(op, n, JournalState::Started);
+    }
+
+    /// Stage generation `n`, rename it into place, and drive the journal
+    /// through `started → staging → committed` — the shared commit step
+    /// every generation-producing operation runs (#60). Extracted from
+    /// the install/remove sequences so there is ONE spelling of the
+    /// staging→rename→journal state machine, byte-identical to the
+    /// historical inline form.
+    ///
+    /// A caller that only reorganizes existing trees (rollback) does not
+    /// stage and so does not call this; it shares [`Self::clear_journal`]
+    /// and [`Self::activate`] instead.
+    fn commit_generation(
+        &self,
+        op: &str,
+        n: u64,
+        packages: &BTreeMap<String, InstalledPackage>,
+        prepared: &[PreparedSnap],
+        staged: &BTreeSet<String>,
+    ) -> miette::Result<()> {
+        self.begin_journal(op, n);
+        self.stage_generation(n, packages, prepared, staged)?;
+        self.write_journal(op, n, JournalState::Staging);
+        std::fs::rename(self.staging_dir(n), self.generation_dir(n))
+            .into_diagnostic()
+            .wrap_err_with(|| format!("committing generation {n}"))?;
+        self.write_journal(op, n, JournalState::Committed);
+        Ok(())
+    }
+
+    /// Drop the crash-recovery journal once an operation has fully
+    /// finished (generation committed, activation done). The shared tail
+    /// of install/remove/rollback.
+    fn clear_journal(&self) -> miette::Result<()> {
+        std::fs::remove_file(self.journal_path())
+            .into_diagnostic()
+            .wrap_err("clearing journal")
     }
 
     fn write_journal(&self, op: &str, n: u64, state: JournalState) {
@@ -2139,13 +2229,29 @@ enum ToolOutcome {
 
 /// What one activation did: the notes to surface, and how many of the
 /// system-bus steps were deliberately skipped rather than run.
-struct ActivateReport {
-    notes: Vec<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivateReport {
+    pub notes: Vec<String>,
     /// Count of system-bus steps skipped because their tool is absent.
     /// Kept on the report so callers (and tests) can assert the
     /// skipped-vs-failed distinction without parsing notes.
-    #[allow(dead_code)]
-    skipped: usize,
+    pub skipped: usize,
+}
+
+/// What [`RuntimeStore::activate_current`] did — the boot-time entry
+/// point. A cold store is a clean no-op (`generation: None`), never an
+/// error: a fresh device must not fail boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivateCurrentReport {
+    /// The generation activated, or `None` when the store is cold (no
+    /// `active` symlink yet) — a no-op, not a failure.
+    pub generation: Option<u64>,
+    /// True when there was nothing to activate (cold store / no active
+    /// generation).
+    pub noop: bool,
+    pub notes: Vec<String>,
+    /// System-bus steps deliberately skipped (tool absent / not in use).
+    pub skipped: usize,
 }
 
 fn sha256_file(path: &Path) -> miette::Result<String> {
@@ -2449,6 +2555,130 @@ plugs:
             format!("{err:#}").contains("missing generation 9"),
             "named error required: {err:#}"
         );
+    }
+
+    // ── Boot-time activation (#60, ADR-0023 §4) ──
+
+    /// `recover()` keeps failing closed on an unparseable journal — the
+    /// boot path's lenient rule must NOT loosen the mutating-command
+    /// state machine.
+    #[test]
+    fn recover_still_fails_closed_on_a_truncated_journal() {
+        let f = fixture();
+        std::fs::write(f.store.journal_path(), "{\"op\":\"insta").unwrap();
+        let err = f.store.recover().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("corrupt journal"),
+            "mutating commands still fail closed: {err:#}"
+        );
+        assert!(
+            f.store.journal_path().exists(),
+            "recover() must not consume the journal it refused"
+        );
+    }
+
+    /// A cold boot against a half-written journal: the boot path names
+    /// the corruption, discards it, and converges on activating the
+    /// current generation. A second run is the same state (idempotent).
+    #[test]
+    fn activate_current_converges_from_a_truncated_journal() {
+        let f = fixture();
+        seed_generation(&f.store, 1, BTreeMap::new());
+        seed_generation(&f.store, 2, BTreeMap::new());
+        f.store.flip_active(2).unwrap();
+        seed_tree(&f.store, 2, "my-snap");
+
+        // A partial write from an aborted external writer.
+        std::fs::write(f.store.journal_path(), "{\"op\":\"install\",\"targe").unwrap();
+
+        let report = f.store.activate_current(&RuntimeTools::default()).unwrap();
+        assert!(
+            !report.noop,
+            "a warm store activates its current generation"
+        );
+        assert_eq!(report.generation, Some(2));
+        assert!(
+            report.notes.iter().any(|n| n.contains("unreadable")),
+            "the corruption is named, never silent: {:?}",
+            report.notes
+        );
+        assert!(
+            !f.store.journal_path().exists(),
+            "the corrupt journal is discarded"
+        );
+        // Converged: active still points at generation 2, tree relinked.
+        assert_eq!(f.store.active_generation().unwrap().unwrap().n, 2);
+        assert!(f
+            .store
+            .extensions_link_dir
+            .join("my-snap")
+            .symlink_metadata()
+            .is_ok());
+
+        // Idempotent: a second run reaches the same state, not a new one.
+        let second = f.store.activate_current(&RuntimeTools::default()).unwrap();
+        assert_eq!(second.generation, Some(2));
+        assert_eq!(
+            std::fs::read_link(f.store.active_link()).unwrap(),
+            Path::new("generations/2")
+        );
+    }
+
+    /// A cold store (no generations, no `active` link) is a clean no-op —
+    /// a fresh device must not fail boot.
+    #[test]
+    fn activate_current_on_a_cold_store_is_a_clean_noop() {
+        let f = fixture();
+        assert!(!f.store.active_link().exists(), "cold store has no active");
+        let report = f.store.activate_current(&RuntimeTools::default()).unwrap();
+        assert!(report.noop);
+        assert_eq!(report.generation, None);
+        assert!(
+            report.notes.iter().any(|n| n.contains("cold store")),
+            "cold boot is noted: {:?}",
+            report.notes
+        );
+    }
+
+    /// A stale `committed` journal for a missing generation must not wedge
+    /// boot: the boot path discards the journal and activates the current
+    /// generation instead of failing on the dangling target.
+    #[test]
+    fn activate_current_discards_a_committed_journal_for_a_missing_generation() {
+        let f = fixture();
+        seed_generation(&f.store, 1, BTreeMap::new());
+        f.store.flip_active(1).unwrap();
+        f.store.write_journal("install", 9, JournalState::Committed);
+
+        let report = f.store.activate_current(&RuntimeTools::default()).unwrap();
+        assert_eq!(report.generation, Some(1));
+        assert!(!f.store.journal_path().exists());
+    }
+
+    /// `commit_generation` drives the journal through the exact
+    /// state-machine sequence the inline install/remove code did: it
+    /// stages, renames, and leaves `committed` on disk (the caller clears
+    /// it once activation finishes).
+    #[test]
+    fn commit_generation_stages_renames_and_journals_committed() {
+        let f = fixture();
+        // A `committed` journal makes recover() finish the flip; clear it
+        // before exercising the helper directly.
+        f.store
+            .commit_generation("install", 3, &BTreeMap::new(), &[], &BTreeSet::new())
+            .unwrap();
+        assert!(
+            f.store.generation_dir(3).join("manifest.json").is_file(),
+            "staging was renamed into place"
+        );
+        assert!(!f.store.staging_dir(3).exists(), "staging dir consumed");
+        let text = std::fs::read_to_string(f.store.journal_path()).unwrap();
+        let journal: Journal = serde_json::from_str(&text).unwrap();
+        assert_eq!(journal.state, JournalState::Committed);
+        assert_eq!(journal.target_gen, 3);
+        // The shared tail clears it.
+        f.store.clear_journal().unwrap();
+        assert!(!f.store.journal_path().exists());
     }
 
     // ── Install pipeline (gated on squashfs tools) ──

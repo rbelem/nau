@@ -2118,6 +2118,10 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
             shuttle::output::set_mode(json);
             runtime_gc(prune, state_dir)
         }
+        RuntimeCommand::Activate { state_dir, json } => {
+            shuttle::output::set_mode(json);
+            runtime_activate(state_dir)
+        }
     }
 }
 
@@ -2685,6 +2689,28 @@ fn runtime_gc(prune: bool, state_dir: Option<String>) -> miette::Result<()> {
             "swept {} blob(s), {} bytes reclaimed",
             report.blobs_removed, report.bytes_reclaimed
         ));
+    }
+    print_report(&report);
+    Ok(())
+}
+
+/// `shuttle runtime activate` (ADR-0023 §4, #60): activate the current
+/// generation. Boot-safe and idempotent — a cold store is a no-op and a
+/// half-written journal is discarded, so the emitted
+/// `shuttle-runtime-activate.service` oneshot never wedges boot.
+fn runtime_activate(state_dir: Option<String>) -> miette::Result<()> {
+    let store = RuntimeStore::from_state_dir(state_dir.as_deref());
+    let report = store.activate_current(&RuntimeTools::for_pod_runtime())?;
+    if report.noop {
+        shuttle::output::ok("no active generation — nothing to activate");
+    } else {
+        shuttle::output::ok(format!(
+            "activated generation {}",
+            report.generation.unwrap_or(0)
+        ));
+    }
+    for note in &report.notes {
+        shuttle::output::info(note);
     }
     print_report(&report);
     Ok(())
