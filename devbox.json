@@ -18,6 +18,13 @@
     "nodejs@latest",
     "python3@latest",
     "qemu@latest",
+    "e2fsprogs@latest",
+    "parted@latest",
+    "mtools@latest",
+    "dosfstools@latest",
+    "github:NixOS/nixpkgs#pkgsStatic.busybox",
+    "github:NixOS/nixpkgs#pkgsStatic.cryptsetup.bin",
+    "github:NixOS/nixpkgs#pkgsStatic.util-linux.bin",
     "systemdUkify@latest",
     "cryptsetup@latest"
   ],

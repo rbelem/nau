@@ -363,6 +363,230 @@
         }
       }
     },
+    "dosfstools@latest": {
+      "last_modified": "2026-08-27T07:16:00Z",
+      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#dosfstools",
+      "source": "devbox-search",
+      "version": "4.2",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/isasd6r7gw2mf3721yygwmbhkwiass9s-dosfstools-4.2",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/hfy04m8qg7cyz3fgvddzw84x4klbz5zv-dosfstools-4.2-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/z8xbfh6srw98dcrn7kl8wrx4y0f7dnkq-dosfstools-4.2-doc"
+            }
+          ],
+          "store_path": "/nix/store/isasd6r7gw2mf3721yygwmbhkwiass9s-dosfstools-4.2"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/yx4c45l2z2ia58m0hmv91sw12iqp11gm-dosfstools-4.2",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/lc5wzq2hksl3flw2c9c7wnvxcswvqrxk-dosfstools-4.2-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/phi63a9wr0d9hmfixbzcdm42gq8x70gw-dosfstools-4.2-doc"
+            }
+          ],
+          "store_path": "/nix/store/yx4c45l2z2ia58m0hmv91sw12iqp11gm-dosfstools-4.2"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/1c5g5hw9vjaicx3jqhfvz8bdqvh8hvmz-dosfstools-4.2",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/l64nk70yb4w1app1p85yx9zhzcxbkxvp-dosfstools-4.2-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/kl7kkggbis2ilbi7xykrmfq4s70l9j12-dosfstools-4.2-doc"
+            }
+          ],
+          "store_path": "/nix/store/1c5g5hw9vjaicx3jqhfvz8bdqvh8hvmz-dosfstools-4.2"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ifnpj2j6pffqjrh9d6s7fn96add9cp29-dosfstools-4.2",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/12kihknjbzpmwd2d40yl88azsvlirb51-dosfstools-4.2-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/kmazzf6052fvha4rj38ga2b7cy5785gb-dosfstools-4.2-doc"
+            }
+          ],
+          "store_path": "/nix/store/ifnpj2j6pffqjrh9d6s7fn96add9cp29-dosfstools-4.2"
+        }
+      }
+    },
+    "e2fsprogs@latest": {
+      "last_modified": "2026-08-29T00:50:12Z",
+      "resolved": "github:NixOS/nixpkgs/e8be7818e19ada32105a8af937a6a473b38167ca#e2fsprogs",
+      "source": "devbox-search",
+      "version": "1.47.4",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "bin",
+              "path": "/nix/store/8p0kapik0a3ng907pkw2nym08f3jq1hv-e2fsprogs-1.47.4-bin",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/6c8xc4ihab5qnacdfjdf3f4si09mcs9f-e2fsprogs-1.47.4-man",
+              "default": true
+            },
+            {
+              "name": "out",
+              "path": "/nix/store/5xlz1qa5x5s5sgip0g74y0b83mngswl6-e2fsprogs-1.47.4"
+            },
+            {
+              "name": "scripts",
+              "path": "/nix/store/m4mfm5i0pjfahiddpl2xa4x3wag9mj09-e2fsprogs-1.47.4-scripts"
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/sawxrbi9amgaxy7crpgn9vs2hlg509lx-e2fsprogs-1.47.4-dev"
+            },
+            {
+              "name": "info",
+              "path": "/nix/store/hbvc9kzjd9pzr600p35fbxawhyca3yh0-e2fsprogs-1.47.4-info"
+            }
+          ],
+          "store_path": "/nix/store/8p0kapik0a3ng907pkw2nym08f3jq1hv-e2fsprogs-1.47.4-bin"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "bin",
+              "path": "/nix/store/g02rikjs4v596794gar5hv251p14d16q-e2fsprogs-1.47.4-bin",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/cjpn05nhc7klkk4klcw5l6ch92hg9ip7-e2fsprogs-1.47.4-man",
+              "default": true
+            },
+            {
+              "name": "out",
+              "path": "/nix/store/bwdf1vjbwg9q4ny0gj565rfr0pxz5m14-e2fsprogs-1.47.4"
+            },
+            {
+              "name": "scripts",
+              "path": "/nix/store/man0vqb3qwngyl975vhc9lg9x3jpff88-e2fsprogs-1.47.4-scripts"
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/0b1wpg7ll9maka600rb9pim9s2i5m1cj-e2fsprogs-1.47.4-dev"
+            },
+            {
+              "name": "fuse2fs",
+              "path": "/nix/store/3n9iqqa0hhyyccwjwwsfikvj05lr5qb5-e2fsprogs-1.47.4-fuse2fs"
+            },
+            {
+              "name": "info",
+              "path": "/nix/store/2g3yp7f3kqwp8v1847vcvi5fizp5jjr0-e2fsprogs-1.47.4-info"
+            }
+          ],
+          "store_path": "/nix/store/g02rikjs4v596794gar5hv251p14d16q-e2fsprogs-1.47.4-bin"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "bin",
+              "path": "/nix/store/mi2k9magkw6i73f38faf0y8vykz1ijbf-e2fsprogs-1.47.4-bin",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/a4ippiiild8vsl3wmr1ir4m7vlsr7ipv-e2fsprogs-1.47.4-man",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/1sj447pnbzpxbxsqsnmp0mgal9zf785y-e2fsprogs-1.47.4-dev"
+            },
+            {
+              "name": "info",
+              "path": "/nix/store/b9hykf4v78lwd1ln9jvqbqcb920wwn99-e2fsprogs-1.47.4-info"
+            },
+            {
+              "name": "out",
+              "path": "/nix/store/xn82gpihjwq7zgsn6fj2hfn8yg0c5nhx-e2fsprogs-1.47.4"
+            },
+            {
+              "name": "scripts",
+              "path": "/nix/store/kqncqspyz1pf1whvywjgg6fn79a2p0hg-e2fsprogs-1.47.4-scripts"
+            }
+          ],
+          "store_path": "/nix/store/mi2k9magkw6i73f38faf0y8vykz1ijbf-e2fsprogs-1.47.4-bin"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "bin",
+              "path": "/nix/store/wjvj88kk8gv0742k1lwazpxr7lnzgi1a-e2fsprogs-1.47.4-bin",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/qwzmfr59ndkkd21i5qhhyk69why4img9-e2fsprogs-1.47.4-man",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/djdrlx5857j9s6gdyf4qjg5c47y2sss5-e2fsprogs-1.47.4-dev"
+            },
+            {
+              "name": "fuse2fs",
+              "path": "/nix/store/f5ngi8h3b55qp8i2z4pijbwyqaxxm86b-e2fsprogs-1.47.4-fuse2fs"
+            },
+            {
+              "name": "info",
+              "path": "/nix/store/0h21lj102x333qdd0vzfpcghq2dw4i0j-e2fsprogs-1.47.4-info"
+            },
+            {
+              "name": "out",
+              "path": "/nix/store/9qs824bb0n5mlk6kxd3cmbpzdjrniym2-e2fsprogs-1.47.4"
+            },
+            {
+              "name": "scripts",
+              "path": "/nix/store/9s5wij9hyyg826dzqy98svz0p3q6va9i-e2fsprogs-1.47.4-scripts"
+            }
+          ],
+          "store_path": "/nix/store/wjvj88kk8gv0742k1lwazpxr7lnzgi1a-e2fsprogs-1.47.4-bin"
+        }
+      }
+    },
     "flex@latest": {
       "last_modified": "2026-08-27T07:16:00Z",
       "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#flex",
@@ -410,6 +634,18 @@
           "store_path": "/nix/store/ax4vx5qr1d25rq3pcfzsnb5gg9mf695w-flex-2.6.4"
         }
       }
+    },
+    "github:NixOS/nixpkgs#pkgsStatic.busybox": {
+      "last_modified": "2026-09-11T16:26:48Z",
+      "resolved": "github:NixOS/nixpkgs/573136fe94c5b39768d0b261c4cad5fa483c9c01?lastModified=1789144008&narHash=sha256-mig%2FTf3cKxZBFuRKA8D6zq7h5ZHyXXjQjjs2%2FcZ6WrM%3D#pkgsStatic.busybox"
+    },
+    "github:NixOS/nixpkgs#pkgsStatic.cryptsetup.bin": {
+      "last_modified": "2026-09-11T16:26:48Z",
+      "resolved": "github:NixOS/nixpkgs/573136fe94c5b39768d0b261c4cad5fa483c9c01?lastModified=1789144008&narHash=sha256-mig%2FTf3cKxZBFuRKA8D6zq7h5ZHyXXjQjjs2%2FcZ6WrM%3D#pkgsStatic.cryptsetup.bin"
+    },
+    "github:NixOS/nixpkgs#pkgsStatic.util-linux.bin": {
+      "last_modified": "2026-09-11T16:26:48Z",
+      "resolved": "github:NixOS/nixpkgs/573136fe94c5b39768d0b261c4cad5fa483c9c01?lastModified=1789144008&narHash=sha256-mig%2FTf3cKxZBFuRKA8D6zq7h5ZHyXXjQjjs2%2FcZ6WrM%3D#pkgsStatic.util-linux.bin"
     },
     "github:NixOS/nixpkgs/nixpkgs-unstable": {
       "last_modified": "2026-05-27T10:28:13Z",
@@ -587,6 +823,90 @@
         }
       }
     },
+    "mtools@latest": {
+      "last_modified": "2026-08-27T07:16:00Z",
+      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#mtools",
+      "source": "devbox-search",
+      "version": "4.0.49",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/l5vd5m1yzmvagh7r1d5yrj48xwn530ra-mtools-4.0.49",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/1byjxskbk6w32qfl5lac4aw0hmf6128j-mtools-4.0.49-man",
+              "default": true
+            },
+            {
+              "name": "info",
+              "path": "/nix/store/3bxffk4am2h3b8nm285lgmyc0crx0v3d-mtools-4.0.49-info"
+            }
+          ],
+          "store_path": "/nix/store/l5vd5m1yzmvagh7r1d5yrj48xwn530ra-mtools-4.0.49"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/i1wbq7i3x7h6qkgxrz7flcvkgp0ldnq3-mtools-4.0.49",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/1rmhg1q5rj8dc6bx1x4icdgaw7jvlyib-mtools-4.0.49-man",
+              "default": true
+            },
+            {
+              "name": "info",
+              "path": "/nix/store/5z5220v11r94rm3pg7f47zg92mqnbsmp-mtools-4.0.49-info"
+            }
+          ],
+          "store_path": "/nix/store/i1wbq7i3x7h6qkgxrz7flcvkgp0ldnq3-mtools-4.0.49"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/8n3hh3mkk59y3jjx3xqxw7cbx7vlcksj-mtools-4.0.49",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/bisc7gizgx07jsbwdblllmha4qmfh80i-mtools-4.0.49-man",
+              "default": true
+            },
+            {
+              "name": "info",
+              "path": "/nix/store/8ma5hxdyq3i9iw358pz69p6y64mxl2l0-mtools-4.0.49-info"
+            }
+          ],
+          "store_path": "/nix/store/8n3hh3mkk59y3jjx3xqxw7cbx7vlcksj-mtools-4.0.49"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/b16b4gznnn94vqk9vz5l54h1fnxxljqv-mtools-4.0.49",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/nirp3l61hwyfp786cim8961j8bibscs9-mtools-4.0.49-man",
+              "default": true
+            },
+            {
+              "name": "info",
+              "path": "/nix/store/hsz1aj9zz43k7cvdxswp8rl742ph4vqx-mtools-4.0.49-info"
+            }
+          ],
+          "store_path": "/nix/store/b16b4gznnn94vqk9vz5l54h1fnxxljqv-mtools-4.0.49"
+        }
+      }
+    },
     "nodejs@latest": {
       "last_modified": "2026-08-27T23:47:58Z",
       "plugin_version": "0.0.4",
@@ -623,6 +943,60 @@
             }
           ],
           "store_path": "/nix/store/ymlp5q9l64224b9jqpqwp298bgbjv7p9-nodejs-26.8.1"
+        }
+      }
+    },
+    "parted@latest": {
+      "last_modified": "2026-08-29T00:50:12Z",
+      "resolved": "github:NixOS/nixpkgs/e8be7818e19ada32105a8af937a6a473b38167ca#parted",
+      "source": "devbox-search",
+      "version": "3.7",
+      "systems": {
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/p6g18ma16i24vg498m860yak3mj5s03q-parted-3.7",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/jdv5h90g9g75jhi3m0kwg7xg5w26jccx-parted-3.7-man",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/pz447h485q32ryyapps1lbf1sa6vcpr2-parted-3.7-dev"
+            },
+            {
+              "name": "info",
+              "path": "/nix/store/hpgaza2knx200q7livvqygi0j53l3n4d-parted-3.7-info"
+            }
+          ],
+          "store_path": "/nix/store/p6g18ma16i24vg498m860yak3mj5s03q-parted-3.7"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/manav8jxk4h0iz2rha8h9cijg1y86ssd-parted-3.7",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/186w7sdjignv052ww8dswpidk8pjmvg8-parted-3.7-man",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/2gldbqcasllcgzx75cs4zb3pxpj00n0f-parted-3.7-dev"
+            },
+            {
+              "name": "info",
+              "path": "/nix/store/xwjy5a9jp7h9glcmgq5m13rcv961hm1v-parted-3.7-info"
+            }
+          ],
+          "store_path": "/nix/store/manav8jxk4h0iz2rha8h9cijg1y86ssd-parted-3.7"
         }
       }
     },
