@@ -888,7 +888,11 @@ pub(crate) fn build_disk_image_with(
             // BEFORE any destructive step — a kernel that cannot see its
             // own disk is a brick, not a warning. The config is re-read
             // from the extracted kernel-snap tree (staging keeps it alive).
-            let config_dir = kernel_snap_dir.as_ref().map(|d| d.path()).unwrap_or(&root);
+            let config_dir = kernel_snap_dir
+                .as_ref()
+                .map(|d| d.path().join("kernel-snap"))
+                .unwrap_or_else(|| root.clone());
+            let config_dir = config_dir.as_path();
             // Doctor's initrd inventory report line (issue #65) —
             // warn-never-fail; the gate below is the hard one.
             doctor::audit_kernel_initrd_modules(
@@ -1315,7 +1319,34 @@ pub(super) fn cp_r(src: &Path, dst: &Path) -> miette::Result<()> {
                         .into_diagnostic()
                         .wrap_err_with(|| format!("creating {:?}", dest))?;
                     dirs.push(path);
+                } else if let Ok(link) = std::fs::read_link(&path) {
+                    // Preserve symlinks as symlinks. A kernel snap ships
+                    // absolute links into its own runtime assembly path
+                    // (e.g. modules/<ver>/kernel/nvidia-*/nvidia-drm.ko ->
+                    // /var/snap/…/nvidia-driver/nvidia-drm.ko) which does not
+                    // exist on the build host; following them fails the build
+                    // and flattening them would corrupt the staged rootfs.
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)
+                            .into_diagnostic()
+                            .wrap_err_with(|| format!("creating {:?}", parent))?;
+                    }
+                    let _ = std::fs::remove_file(&dest);
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&link, &dest)
+                        .into_diagnostic()
+                        .wrap_err_with(|| format!("linking {:?} to {:?}", dest, link))?;
                 } else {
+                    // The walk pushes sibling directories as it goes, so a
+                    // file can be reached before its own parent has been
+                    // created (the pop order is not depth-first in practice).
+                    // Creating the parent here makes the copy independent of
+                    // traversal order.
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)
+                            .into_diagnostic()
+                            .wrap_err_with(|| format!("creating {:?}", parent))?;
+                    }
                     std::fs::copy(&path, &dest)
                         .into_diagnostic()
                         .wrap_err_with(|| format!("copying {:?} to {:?}", path, dest))?;
