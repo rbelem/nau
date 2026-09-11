@@ -411,16 +411,23 @@ pub enum Command {
         app_args: Vec<String>,
     },
 
-    /// Boot a built disk image in QEMU and assert it reached userspace
-    /// (issue #50). The programmatic "did the image boot?" proof behind
-    /// try-boot/revert: exits non-zero and archives the serial console as
-    /// evidence when the assertion fails.
+    /// Boot a built disk image in QEMU and assert it reached userspace and
+    /// completed shuttle's init handoff (issue #50). The programmatic "did the
+    /// image boot?" proof behind try-boot/revert: exits non-zero and archives
+    /// the serial console as evidence when the assertion fails.
+    ///
+    /// Success requires no kernel panic, a userspace marker, and the
+    /// `SHUTTLE-INIT: switch-root` line shuttle's own `/init` prints after it
+    /// opens dm-verity and hands PID 1 to systemd. Pass `--require` to tighten
+    /// it further — for an A/B image that emits `boot-complete.target`, the
+    /// strongest assertion is `--require "Reached target Boot Completion
+    /// Check"`.
     Test {
         /// Path to the built disk image (`.img`) to boot.
         image: String,
 
         /// Boot timeout in seconds. QEMU is killed when it elapses; a boot
-        /// that produced the userspace markers before the kill still passes.
+        /// that reached the init handoff before the kill still passes.
         #[arg(long, default_value_t = 120)]
         timeout: u64,
 
@@ -435,7 +442,9 @@ pub enum Command {
         log: Option<String>,
 
         /// Extra substring the serial log MUST contain to pass (repeatable).
-        /// Tightens the boot assertion beyond the built-in markers.
+        /// Tightens the boot assertion beyond the built-in markers, e.g.
+        /// `--require "Reached target Boot Completion Check"` for an A/B image
+        /// that emits the try-boot completion target.
         #[arg(long = "require")]
         require: Vec<String>,
 

@@ -2466,6 +2466,8 @@ fn report_test_json(image: &str, log: &Path, outcome: &shuttle::boot_test::Outco
             "markers": outcome.evidence.markers,
             "target": outcome.evidence.target,
             "service": outcome.evidence.service,
+            "handoff": outcome.evidence.handoff,
+            "boot_complete": outcome.evidence.boot_complete,
             "panic": outcome.evidence.panic,
             "activate": outcome.evidence.activate,
         },

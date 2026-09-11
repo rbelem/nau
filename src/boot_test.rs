@@ -22,19 +22,41 @@
 //! 1. no kernel panic, **and**
 //! 2. a userspace marker (`systemd[1]:`, a `Reached target …` line, `Started …`,
 //!    or the `Welcome to …` banner), **and**
-//! 3. at least one service-level line (`Reached target …` or `Started …`).
+//! 3. the shuttle init handoff that this project's own initramfs prints after
+//!    the verified root is mounted and `switch_root` is issued.
 //!
 //! The exact markers live in [`USERSPACE_MARKERS`]/[`PANIC_MARKERS`] and can
 //! be tightened per run with `--require <substring>`.
 //!
-//! # Honest caveat: quiet images
+//! # Why "init handoff", and not any service line
 //!
-//! The examples declare `params = { "quiet", "console=ttyS0" }`. `quiet`
-//! makes the kernel and systemd suppress console output, which can leave the
-//! serial log without the systemd target lines this harness asserts on. A
-//! failure therefore names the possibility explicitly and suggests
-//! `systemd.show_status=1`. The markers are the single place to change when a
-//! real image's boot log is known.
+//! Requiring an arbitrary service line was both too strict and too weak. Too
+//! strict: a `quiet` image that parks on an interactive console prompt — Ubuntu
+//! Core's console-conf, for instance — never prints the generic systemd target
+//! lines, so a perfectly successful boot could not be asserted. Too weak: the
+//! first `Started …` line can come from a unit that failed or was cancelled,
+//! which proves a job was *attempted*, not that the system reached a usable
+//! state.
+//!
+//! The default gate is instead the [`BOOT_HANDOFF_MARKER`] line emitted by
+//! shuttle's own `/init` ([`crate::image`]), immediately before it hands PID 1
+//! to `systemd`. That marker is present in every image shuttle builds, and it
+//! cannot appear unless the whole boot chain this project is responsible for
+//! actually worked: PARTUUID resolved without udev, dm-verity opened, the
+//! verified root mounted read-only, and the handoff issued. It is the closest
+//! thing to "the image booted" that is observable in a `quiet` boot without
+//! relying on a target a given image may not emit.
+//!
+//! # Strict mode: boot-complete.target
+//!
+//! An image built with an A/B disk and an `update_source` additionally emits
+//! `boot-complete.target` and a health gate (ADR-0024 §3), and reaching that
+//! target is what clears the try-boot counters. For those images the strongest
+//! assertion is `--require "Reached target Boot Completion Check"` — the line
+//! systemd prints when the target is reached, and the same condition the
+//! device's own revert logic waits on. It is not the default because a
+//! single-slot image emits no such target, and a default must hold for every
+//! image, not only the A/B ones.
 //!
 //! # Timeout seam
 //!
@@ -66,6 +88,29 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// `--require "Reached target Multi-User System."` is for.
 pub const USERSPACE_MARKERS: &[&str] =
     &["systemd[1]:", "Reached target ", "Started ", "Welcome to "];
+
+/// The line shuttle's own `/init` prints immediately before it hands PID 1 to
+/// `systemd` (see `src/image/initramfs/init`, `main()` step 6).
+///
+/// This is the default "the image booted" proof. It appears in the serial log
+/// only after the whole boot chain this project owns has succeeded: the
+/// `proc`/`sys`/`dev` mounts, the module closure from `/modules.load`, PARTUUID
+/// resolution without udev, `veritysetup open` on the dm-verity mapping, the
+/// read-only mount of the verified root, and the `switch_root` handoff itself.
+/// It is present in every image shuttle builds, unlike `boot-complete.target`,
+/// which only an A/B image with an `update_source` emits.
+pub const BOOT_HANDOFF_MARKER: &str = "SHUTTLE-INIT: switch-root";
+
+/// The systemd line for the completion target an A/B image emits
+/// (`src/image/boot.rs`, `Description=Boot Completion Check`). Reaching this
+/// target clears the try-boot counters, so `--require "Reached target Boot
+/// Completion Check"` is the strongest assertion available for an image that
+/// carries it.
+///
+/// systemd names a target by its `Description=`, not its unit name, which is
+/// why this string is the description. A unit test pins it to the emitted
+/// unit so the two cannot drift.
+pub const BOOT_COMPLETE_MARKER: &str = "Reached target Boot Completion Check";
 
 /// Kernel-panic markers; any one fails the run regardless of exit code or
 /// other evidence.
@@ -198,6 +243,10 @@ pub struct Evidence {
     pub target: Option<String>,
     /// First service-level line (`Reached target …` or `Started …`), if any.
     pub service: Option<String>,
+    /// The shuttle init handoff line, if any.
+    pub handoff: Option<String>,
+    /// First boot-complete line, if any (only an A/B image emits it).
+    pub boot_complete: Option<String>,
     /// First panic marker line, if any.
     pub panic: Option<String>,
     /// The shuttle activation unit was mentioned.
@@ -220,6 +269,14 @@ fn is_service_line(line: &str) -> bool {
     is_target_line(line) || (line.contains("Started ") && line.contains(".service"))
 }
 
+fn is_boot_complete_line(line: &str) -> bool {
+    line.contains(BOOT_COMPLETE_MARKER)
+}
+
+fn is_handoff_line(line: &str) -> bool {
+    line.contains(BOOT_HANDOFF_MARKER)
+}
+
 /// Parse a captured serial console into [`Evidence`]. Pure and hermetic —
 /// the unit tests drive it with synthetic logs.
 pub fn analyze_log(text: &str) -> Evidence {
@@ -239,10 +296,20 @@ pub fn analyze_log(text: &str) -> Evidence {
         .lines()
         .find(|line| is_service_line(line))
         .map(|line| line.trim().to_string());
+    let boot_complete = text
+        .lines()
+        .find(|line| is_boot_complete_line(line))
+        .map(|line| line.trim().to_string());
+    let handoff = text
+        .lines()
+        .find(|line| is_handoff_line(line))
+        .map(|line| line.trim().to_string());
     Evidence {
         userspace: !markers.is_empty(),
         target,
         service,
+        handoff,
+        boot_complete,
         panic,
         activate: text.contains(ACTIVATE_UNIT),
         markers,
@@ -260,8 +327,8 @@ pub enum Failure {
     Timeout,
     /// QEMU finished without reaching userspace (and without a panic).
     NoUserspace,
-    /// Userspace was reached but no service/target line appeared.
-    NoService,
+    /// Userspace was reached but the shuttle init handoff never appeared.
+    NoHandoff,
     /// A `--require` substring was absent from the log.
     MissingRequirement(String),
     /// QEMU itself failed to run (non-zero exit, non-empty stderr).
@@ -275,7 +342,7 @@ impl Failure {
             Failure::Panic => "panic",
             Failure::Timeout => "timeout",
             Failure::NoUserspace => "no-userspace",
-            Failure::NoService => "no-service",
+            Failure::NoHandoff => "no-handoff",
             Failure::MissingRequirement(_) => "missing-requirement",
             Failure::Qemu { .. } => "qemu-error",
         }
@@ -308,9 +375,10 @@ impl Outcome {
         let Some(failure) = &self.failure else {
             let what = self
                 .evidence
-                .target
+                .boot_complete
                 .as_deref()
-                .or(self.evidence.service.as_deref())
+                .or(self.evidence.handoff.as_deref())
+                .or(self.evidence.target.as_deref())
                 .unwrap_or("userspace");
             let activate = if self.evidence.activate {
                 format!("; {ACTIVATE_UNIT} ran")
@@ -334,10 +402,12 @@ impl Outcome {
                 "boot did not reach userspace (no systemd/target marker in the serial log)"
                     .to_string()
             }
-            Failure::NoService => {
-                "userspace reached but no service/target line appeared in the serial log"
-                    .to_string()
-            }
+            Failure::NoHandoff => format!(
+                "userspace reached but no shuttle init handoff ('{BOOT_HANDOFF_MARKER}') in the \
+                 serial log — the image did not boot through shuttle's own initramfs, or the \
+                 boot never got as far as the verify+switch_root handoff; raise --timeout or \
+                 inspect the serial evidence"
+            ),
             Failure::MissingRequirement(needle) => {
                 format!("required marker not found in the serial log: {needle}")
             }
@@ -373,8 +443,8 @@ fn classify(
         }
         return Some(Failure::NoUserspace);
     }
-    if evidence.service.is_none() {
-        return Some(Failure::NoService);
+    if evidence.handoff.is_none() {
+        return Some(Failure::NoHandoff);
     }
     for needle in required {
         if !text.contains(needle) {
@@ -689,6 +759,12 @@ mod tests {
 
     const PASS_LOG: &str = "\
 [    0.000000] Linux version 6.8.0\n\
+SHUTTLE-INIT: start\n\
+SHUTTLE-INIT: modules-loaded\n\
+SHUTTLE-INIT: root=/dev/vda2 hash=/dev/vda3\n\
+SHUTTLE-INIT: verity-open\n\
+SHUTTLE-INIT: mounted\n\
+SHUTTLE-INIT: switch-root\n\
 [    2.100000] systemd[1]: systemd 255 running in system mode.\n\
 [    3.200000] systemd[1]: Reached target Basic System.\n\
 [    4.400000] systemd[1]: Reached target Multi-User System.\n\
@@ -853,12 +929,31 @@ mod tests {
 
     // ── log analysis ──
 
+    /// The strict marker is systemd's rendering of the target's
+    /// `Description=`, so it must track the unit shuttle actually emits. Read
+    /// the emitted unit text and assert the description is the one the marker
+    /// expects; if either side moves, this fails rather than silently never
+    /// matching.
     #[test]
-    fn analyze_userspace_and_service_pass() {
+    fn boot_complete_marker_matches_the_emitted_target_description() {
+        let unit = crate::image::boot_complete_target_content();
+        let description = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("Description="))
+            .expect("emitted boot-complete.target must declare a Description");
+        assert_eq!(
+            BOOT_COMPLETE_MARKER,
+            format!("Reached target {description}"),
+            "systemd renders a target as 'Reached target <Description>.'"
+        );
+    }
+
+    #[test]
+    fn analyze_userspace_and_handoff_pass() {
         let ev = analyze_log(PASS_LOG);
         assert!(ev.userspace);
         assert!(ev.target.is_some());
-        assert!(ev.service.is_some());
+        assert_eq!(ev.handoff.as_deref(), Some("SHUTTLE-INIT: switch-root"));
         assert!(ev.panic.is_none());
     }
 
@@ -866,6 +961,10 @@ mod tests {
     /// initrd booted under QEMU/KVM on 2026-09-11 (see the module docs). This
     /// pins the parser to genuine systemd output, not just a synthetic
     /// fixture. Only the lines the parser keys on are kept.
+    ///
+    /// This is an **initrd** boot, so it never runs shuttle's `/init` and
+    /// prints no handoff marker. It proves userspace is parsed; the default
+    /// gate is covered by [`PASS_LOG`] and [`CONSOLE_CONF_LOG`].
     const REAL_BOOT_EXCERPT: &str = "\
 [    1.975769] systemd[1]: systemd 261.2 running in system mode (+PAM +AUDIT -SELINUX)\n\
 [    1.977862] systemd[1]: Detected virtualization kvm.\n\
@@ -877,7 +976,7 @@ mod tests {
 [    2.086841] systemd[1]: Reached target Timer Units.\n";
 
     #[test]
-    fn analyze_parses_real_boot_excerpt_as_pass() {
+    fn analyze_parses_real_boot_excerpt_userspace() {
         let ev = analyze_log(REAL_BOOT_EXCERPT);
         assert!(ev.userspace, "real systemd output must count as userspace");
         assert!(ev.panic.is_none());
@@ -885,11 +984,16 @@ mod tests {
             ev.target.as_deref(),
             Some("[    2.085533] systemd[1]: Reached target Slice Units.")
         );
-        assert!(ev.service.is_some());
+        assert!(
+            ev.handoff.is_none(),
+            "an initrd excerpt never runs shuttle's /init"
+        );
     }
 
     #[test]
-    fn run_boot_passes_on_real_boot_excerpt() {
+    fn run_boot_without_handoff_fails() {
+        // Userspace is up, but this boot did not go through shuttle's own
+        // initramfs, so the default gate must fail.
         let tmp = tempfile::tempdir().unwrap();
         let test = sample_test(tmp.path(), Accel::Kvm, true);
         let runner = FakeRunner::new(vec![Script {
@@ -898,7 +1002,90 @@ mod tests {
             log: REAL_BOOT_EXCERPT.to_string(),
         }]);
         let out = run_boot(&runner, &test).unwrap();
+        assert_eq!(out.failure, Some(Failure::NoHandoff));
+    }
+
+    /// A *real* console-conf boot: the pc-rootfs image built from pc-kernel
+    /// rev 3654 booted under QEMU/KVM on 2026-09-11, reaching the interactive
+    /// console prompt. Reproduced verbatim (minus ANSI escapes) because it is
+    /// the regression this harness exists for: userspace is up, but a `quiet`
+    /// boot that parks on `Press enter to configure.` prints no generic
+    /// service line.
+    const CONSOLE_CONF_LOG: &str = "\
+BdsDxe: starting Boot0001 \"UEFI Misc Device\"\n\
+SHUTTLE-INIT: start\n\
+SHUTTLE-INIT: modules-loaded\n\
+SHUTTLE-INIT: root=/dev/vda2 hash=/dev/vda3\n\
+SHUTTLE-INIT: verity-open\n\
+[    0.545547] EXT4-fs (dm-0): write access unavailable, skipping orphan cleanup\n\
+SHUTTLE-INIT: mounted\n\
+SHUTTLE-INIT: switch-root\n\
+[    0.786046] systemd[1]: network-manager-networkmanager.service: Two services allocated for the same bus name fi.w1.wpa_supplicant1, refusing operation.\n\
+[FAILED] Failed to start Network Time Synchronization.\n\
+[FAILED] Failed to start Network Time Synchronization.\n\
+/usr/share/subiquity/console-conf-wrapper: line 40: snap: command not found\n\
+Press enter to configure.\n";
+
+    #[test]
+    fn console_conf_boot_passes_on_the_init_handoff() {
+        // The regression case: userspace is up and shuttle's own /init handed
+        // off — this must PASS even though the boot parks on console-conf and
+        // never prints a generic service line.
+        let ev = analyze_log(CONSOLE_CONF_LOG);
+        assert!(ev.userspace, "console-conf proves userspace");
+        assert!(ev.panic.is_none());
+        assert_eq!(ev.handoff.as_deref(), Some("SHUTTLE-INIT: switch-root"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let test = sample_test(tmp.path(), Accel::Kvm, true);
+        let runner = FakeRunner::new(vec![Script {
+            code: 124,
+            stderr: String::new(),
+            log: CONSOLE_CONF_LOG.to_string(),
+        }]);
+        let out = run_boot(&runner, &test).unwrap();
         assert!(out.passed(), "{}", out.message());
+        assert!(out.message().contains("switch-root"), "{}", out.message());
+    }
+
+    #[test]
+    fn strict_require_boot_complete_is_opt_in() {
+        // An A/B image that emits the completion target: --require tightens
+        // the gate to the line the try-boot machinery waits on.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut test = sample_test(tmp.path(), Accel::Kvm, true);
+        test.required = vec![BOOT_COMPLETE_MARKER.to_string()];
+
+        // Without the target line, the handoff alone is not enough.
+        let runner = FakeRunner::new(vec![Script {
+            code: 124,
+            stderr: String::new(),
+            log: CONSOLE_CONF_LOG.to_string(),
+        }]);
+        let out = run_boot(&runner, &test).unwrap();
+        assert_eq!(
+            out.failure,
+            Some(Failure::MissingRequirement(
+                BOOT_COMPLETE_MARKER.to_string()
+            ))
+        );
+
+        // With it, the boot passes and the target line is reported.
+        let log = "\
+SHUTTLE-INIT: switch-root\n\
+[    0.786046] systemd[1]: systemd 255 running in system mode.\n\
+[    4.400000] systemd[1]: Reached target Boot Completion Check.\n";
+        let runner = FakeRunner::new(vec![Script {
+            code: 124,
+            stderr: String::new(),
+            log: log.to_string(),
+        }]);
+        let out = run_boot(&runner, &test).unwrap();
+        assert!(out.passed(), "{}", out.message());
+        assert_eq!(
+            out.evidence.boot_complete.as_deref(),
+            Some("[    4.400000] systemd[1]: Reached target Boot Completion Check.")
+        );
     }
 
     #[test]
@@ -920,7 +1107,7 @@ mod tests {
         let ev = analyze_log(TRUNCATED_LOG);
         assert!(!ev.userspace);
         assert!(ev.target.is_none());
-        assert!(ev.service.is_none());
+        assert!(ev.handoff.is_none());
     }
 
     // ── run_boot: verdicts ──
@@ -970,10 +1157,10 @@ mod tests {
     }
 
     #[test]
-    fn run_boot_no_service_fails() {
+    fn run_boot_no_handoff_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let test = sample_test(tmp.path(), Accel::Kvm, true);
-        // Userspace marker present, but no target/started line.
+        // Userspace marker present, but no shuttle init handoff.
         let log = "[    2.000000] systemd[1]: systemd 255 running in system mode.\n";
         let runner = FakeRunner::new(vec![Script {
             code: 124,
@@ -981,7 +1168,7 @@ mod tests {
             log: log.to_string(),
         }]);
         let out = run_boot(&runner, &test).unwrap();
-        assert_eq!(out.failure, Some(Failure::NoService));
+        assert_eq!(out.failure, Some(Failure::NoHandoff));
     }
 
     #[test]
@@ -1002,7 +1189,6 @@ mod tests {
             ))
         );
     }
-
     #[test]
     fn run_boot_qemu_failure_reported() {
         let tmp = tempfile::tempdir().unwrap();

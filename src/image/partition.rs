@@ -847,9 +847,7 @@ mod tests {
         let layout = DiskLayout {
             label: "gpt".into(),
             partitions: vec![part("root", "0")],
-            swap: Some(SwapConfig {
-                size: "8G".into(),
-            }),
+            swap: Some(SwapConfig { size: "8G".into() }),
             ab: false,
         };
         // 4 (GPT) + root + 8192 (swap); root starts at 4.
@@ -894,7 +892,10 @@ mod tests {
             ab: false,
         };
         // total = 4 + 1024 (root placeholder) + 1024 (data placeholder)
-        assert_eq!(partition_size_mb(&layout, 0, 4 + 1024 + 1024, 4).unwrap(), 1024);
+        assert_eq!(
+            partition_size_mb(&layout, 0, 4 + 1024 + 1024, 4).unwrap(),
+            1024
+        );
     }
 
     /// No room left is a precise fail-closed error, never a silent 0-size
@@ -904,9 +905,7 @@ mod tests {
         let layout = DiskLayout {
             label: "gpt".into(),
             partitions: vec![part("root", "0")],
-            swap: Some(SwapConfig {
-                size: "8G".into(),
-            }),
+            swap: Some(SwapConfig { size: "8G".into() }),
             ab: false,
         };
         let err = partition_size_mb(&layout, 0, 4 + 8192, 4).unwrap_err();
