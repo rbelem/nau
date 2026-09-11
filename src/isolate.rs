@@ -341,6 +341,31 @@ pub fn run_eval(req: &EvalRequest) -> miette::Result<WorkerOk> {
     }
 }
 
+/// Drain a worker's stderr on a background thread, forwarding it to the
+/// parent's own stderr.
+///
+/// The worker runs with `RLIMIT_FSIZE = 0` ([`set_rlimits`]) because it must
+/// never write to a regular file, and `print()` is routed to stderr so it
+/// cannot corrupt the stdout protocol channel. Inheriting the parent's stderr
+/// makes those two rules collide: the child's fd is then whatever the caller
+/// had, and a caller that redirected its own stderr into a log file — an
+/// ordinary `shuttle build > build.log 2>&1`, or `devbox run -- check > log` —
+/// turns the child's first `print()` into an immediate `SIGXFSZ` (signal 25)
+/// death, before it can report any outcome. Piping the child's stderr
+/// decouples the child's fd kind from the caller's environment; this forwarder
+/// preserves the output for the user.
+///
+/// Call after `spawn` and before the parent blocks reading stdout: a full
+/// stderr pipe buffer would otherwise stall the child mid-record.
+fn forward_worker_stderr(child: &mut std::process::Child) -> std::thread::JoinHandle<()> {
+    let mut src = child.stderr.take().expect("child stderr is piped");
+    std::thread::spawn(move || {
+        let mut dst = std::io::stderr();
+        // A closed parent stderr is the caller's problem, not the worker's.
+        let _ = std::io::copy(&mut src, &mut dst);
+    })
+}
+
 /// Like [`run_eval`] but returns the full run (status, wall time, peak RSS)
 /// for containment evidence and tests.
 pub fn run_eval_raw(req: &EvalRequest) -> miette::Result<EvalRun> {
@@ -353,7 +378,7 @@ pub fn run_eval_raw(req: &EvalRequest) -> miette::Result<EvalRun> {
         .arg("__eval-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .current_dir(scratch.path())
         .spawn()
         .map_err(|e| {
@@ -366,11 +391,13 @@ pub fn run_eval_raw(req: &EvalRequest) -> miette::Result<EvalRun> {
 
     let mut stdin = child.stdin.take().expect("child stdin");
     let stdout = child.stdout.take().expect("child stdout");
+    let stderr_forwarder = forward_worker_stderr(&mut child);
 
     if let Err(e) = write_line(&mut stdin, req) {
         // Reap the child so a failed ship can't leave a zombie behind.
         let _ = child.kill();
         let _ = child.wait();
+        let _ = stderr_forwarder.join();
         return Err(miette::miette!(
             "failed to ship eval request to worker: {e}"
         ));
@@ -515,6 +542,9 @@ pub fn run_eval_raw(req: &EvalRequest) -> miette::Result<EvalRun> {
     }
     let max_rss_kb = rss_child.join().unwrap_or(0);
     killer.join().unwrap_or(());
+    // The child is reaped, so its stderr write end is closed and the
+    // forwarder has reached EOF.
+    stderr_forwarder.join().unwrap_or(());
 
     // A child death at/after the deadline IS the timeout, whatever the pipe
     // reported first: the wall-clock SIGKILL closes the pipe, so the reader can
@@ -724,7 +754,10 @@ fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
         .map_err(|e| miette::miette!("failed to set index global: {e}"))?;
 
     // Definitions may call print(); the child's stdout is the IPC channel,
-    // so route print to stderr.
+    // so route print to stderr. The parent pipes that stderr and forwards it
+    // (see `forward_worker_stderr`): the child's stderr fd must NOT be an
+    // inherited regular file, because `RLIMIT_FSIZE = 0` would make this
+    // very call fatal (SIGXFSZ) instead of merely noisy.
     let print_fn = lua
         .create_function(|_, args: mlua::MultiValue| {
             let strs: Vec<String> = args
@@ -993,7 +1026,7 @@ pub fn run_check_raw(req: &CheckRequest) -> miette::Result<CheckRun> {
         .arg("__check-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .current_dir(scratch.path())
         .spawn()
         .map_err(|e| {
@@ -1005,11 +1038,13 @@ pub fn run_check_raw(req: &CheckRequest) -> miette::Result<CheckRun> {
 
     let mut stdin = child.stdin.take().expect("child stdin");
     let stdout = child.stdout.take().expect("child stdout");
+    let stderr_forwarder = forward_worker_stderr(&mut child);
 
     if let Err(e) = write_line(&mut stdin, req) {
         // Reap the child so a failed ship can't leave a zombie behind.
         let _ = child.kill();
         let _ = child.wait();
+        let _ = stderr_forwarder.join();
         return Err(miette::miette!(
             "failed to ship check request to worker: {e}"
         ));
@@ -1093,6 +1128,9 @@ pub fn run_check_raw(req: &CheckRequest) -> miette::Result<CheckRun> {
         }
     }
     killer.join().unwrap_or(());
+    // Child reaped ⇒ the stderr write end is closed and the forwarder has
+    // reached EOF.
+    stderr_forwarder.join().unwrap_or(());
 
     // A child death at/after the deadline IS the timeout, whatever the pipe
     // reported first (same 200ms margin as the eval worker).
