@@ -1366,12 +1366,14 @@ pub(super) fn cp_r(src: &Path, dst: &Path) -> miette::Result<()> {
 // `pub(crate) use` globs re-export every moved item so existing
 // `crate::image::<item>` paths keep resolving without widening visibility.
 mod boot;
+mod initramfs;
 mod partition;
 mod staging;
 mod state;
 mod verity;
 
 pub(crate) use boot::*;
+pub(crate) use initramfs::*;
 pub(crate) use partition::*;
 pub(crate) use staging::*;
 pub(crate) use state::*;

@@ -609,20 +609,67 @@ fn merge_kernel(
     // vmlinuz/initrd convention is first choice; the real Ubuntu Core
     // `pc-kernel` snap's prebuilt `kernel.efi` is the #70 fallback, split
     // with objcopy into a scratch dir kept alive by the returned payload.
+    let payload = locate_payload_for_snap(runner, &kernel_dir, root, &kernel_entry.snap.name)?;
+    Ok((Some(payload), Some(kernel_work)))
+}
+
+/// Locate the kernel snap's boot payload and, for a prebuilt-UKI payload,
+/// replace its Canonical snap-bootstrap initramfs with shuttle's native one
+/// (issue #75). Fails closed with the snap name in every message.
+fn locate_payload_for_snap(
+    runner: &dyn CommandRunner,
+    kernel_dir: &Path,
+    root: &Path,
+    snap_name: &str,
+) -> miette::Result<KernelPayload> {
     let payload = locate_kernel_payload(
         runner,
         find_objcopy().as_deref(),
-        &kernel_dir,
-        &kernel_dir,
+        kernel_dir,
+        kernel_dir,
         root,
     )
     .map_err(|e| {
         miette::miette!(
-            "kernel snap '{}': {e}; refusing to build a disk image that cannot boot",
-            kernel_entry.snap.name
+            "kernel snap '{snap_name}': {e}; refusing to build a disk image that cannot boot"
         )
     })?;
-    Ok((Some(payload), Some(kernel_work)))
+    // Issue #75: a prebuilt `kernel.efi` carries Canonical's snap-bootstrap
+    // initramfs, which cannot honor shuttle's cmdline. Replace it with
+    // shuttle's native initramfs (busybox + veritysetup + the snap's own
+    // module closure) so the built UKI mounts and verifies the shuttle root.
+    // The raw-convention path keeps its own initrd untouched.
+    if !payload.prebuilt_uki {
+        return Ok(payload);
+    }
+    let native = build_native_initramfs_for_snap(kernel_dir, &payload)
+        .map_err(|e| miette::miette!("kernel snap '{snap_name}': {e}"))?;
+    Ok(KernelPayload {
+        initrd: native,
+        ..payload
+    })
+}
+
+/// Build shuttle's native initramfs for a prebuilt-UKI payload (issue #75).
+/// The module tree is `kernel_dir/modules/<version>`; the archive lands in a
+/// subdir of `kernel_dir`, whose `kernel_work` TempDir keeps it alive until
+/// the UKI is assembled. Every input failure names the exact missing file.
+fn build_native_initramfs_for_snap(
+    kernel_dir: &Path,
+    payload: &KernelPayload,
+) -> miette::Result<PathBuf> {
+    let version = payload.version.as_str();
+    let modules_root = kernel_dir.join("modules").join(version);
+    let config = crate::doctor::find_kernel_config(kernel_dir, version).ok_or_else(|| {
+        miette::miette!(
+            "no kernel config found under {} for {version} — cannot derive the \
+             initramfs boot-chain modules, so refusing to build an initramfs \
+             that cannot load its boot chain",
+            kernel_dir.display()
+        )
+    })?;
+    let tools = discover_initramfs_tools()?;
+    build_native_initramfs(&tools, &modules_root, &config, version, kernel_dir)
 }
 
 /// Run the kernel-snap unsquashfs. Returns `Ok(true)` to continue merging,

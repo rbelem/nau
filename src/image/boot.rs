@@ -609,6 +609,13 @@ pub(crate) struct KernelPayload {
     pub(crate) kernel: PathBuf,
     pub(crate) initrd: PathBuf,
     pub(crate) version: String,
+    /// `true` when the kernel and initrd came from a prebuilt Canonical
+    /// `kernel.efi` (the Ubuntu Core `pc-kernel` layout, #70) rather than
+    /// raw `vmlinuz`/`initrd` files. A prebuilt UKI carries Canonical's
+    /// snap-bootstrap initramfs, which mounts a writable `ubuntu-data` and
+    /// never honors shuttle's verity cmdline — the build replaces its initrd
+    /// with shuttle's native one (issue #75). `false` for the raw path.
+    pub(crate) prebuilt_uki: bool,
     /// Keeps UKI-extracted boot assets alive when the payload came from a
     /// prebuilt `kernel.efi` rather than raw files (issue #70). `None` for
     /// the raw path, where the files live in the extracted snap tree.
@@ -622,6 +629,7 @@ impl KernelPayload {
             kernel,
             initrd,
             version,
+            prebuilt_uki: false,
             _scratch: None,
         }
     }
@@ -753,7 +761,13 @@ fn locate_uki_payload(
         extract_pe_section(runner, objcopy, &uki, section, out)?;
     }
     verify_bzimage_version(&kernel, &version)?;
-    Ok(KernelPayload::raw(kernel, initrd, version))
+    Ok(KernelPayload {
+        kernel,
+        initrd,
+        version,
+        prebuilt_uki: true,
+        _scratch: None,
+    })
 }
 
 /// `objcopy -O binary --only-section=<section> <uki> <out>` through the
