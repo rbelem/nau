@@ -75,9 +75,17 @@
 //! Snap downloads go through [`crate::store`]'s resolve path — the
 //! snap-revision assertion verification there is fail-closed and is
 //! reused, never reimplemented. Manifest signatures (ADR-0011 step (d))
-//! verify against the on-device anchor `/etc/shuttle/update-key.pub` or
-//! the `~/.config/shuttle/keys/` keychain when present; an unsigned
-//! manifest proceeds with a note (signing ceremony pending, step (e)).
+//! verify against the on-device trust set `/etc/shuttle/trusted-keys/`
+//! (with `/etc/shuttle/update-key.pub` kept as a single-anchor fallback)
+//! or the `~/.config/shuttle/keys/` keychain when present.
+//!
+//! ADR-0024 §4: the embedded revocation list `/etc/shuttle/revoked-keys`
+//! (one key id per line) is consulted first — a signature under a revoked
+//! id is refused with a precise message, even when another trusted key
+//! also signed. That is what makes "revoked" distinguishable from "never
+//! trusted". An unsigned manifest still proceeds with a note (signing is
+//! opt-in); a signed manifest with no trusted, unrevoked anchor fails
+//! closed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -2031,7 +2039,24 @@ pub fn verify_signatures_at(
     if signatures.is_empty() {
         return Ok(None);
     }
-    // 1. The embedded device anchor (/etc/shuttle/update-key.pub).
+    // 0. ADR-0024 §4 revocation gate. The embedded revocation list lives
+    // beside the device anchor (/etc/shuttle/revoked-keys); the operator
+    // list lives under the keychain dir (~/.config/shuttle/keys/
+    // revoked-keys). A signature under a revoked id is refused BEFORE any
+    // anchor check, so "trusted once, revoked now" cannot be masked by a
+    // dual-signed manifest that a still-trusted key also signed.
+    let revoked = embedded_revoked_keys(anchor, keys)?;
+    crate::sign::reject_revoked(signatures, &revoked)?;
+
+    // 1. The embedded device trust set (/etc/shuttle/trusted-keys/*.pub),
+    //    plus the single-anchor fallback (/etc/shuttle/update-key.pub) for
+    //    images built before the set shape existed.
+    let embedded_chain = crate::sign::Keychain::load_dir(&trusted_keys_dir(anchor))?;
+    for (key_id, public) in embedded_chain.entries_for_verify() {
+        if crate::sign::verify(canonical, signatures, &to_hex(&public)).is_ok() {
+            return Ok(Some(key_id));
+        }
+    }
     if let Ok(text) = std::fs::read_to_string(anchor) {
         if let Some(public_hex) = key_line(&text) {
             if crate::sign::verify(canonical, signatures, public_hex).is_ok() {
@@ -2039,7 +2064,9 @@ pub fn verify_signatures_at(
             }
         }
     }
-    // 2. The operator keychain (~/.config/shuttle/keys/*.pub).
+
+    // 2. The operator keychain (~/.config/shuttle/keys/*.pub). The
+    //    revocation gate ran above, so the closed-set verify is enough.
     let chain = crate::sign::Keychain::load_dir(keys)?;
     match crate::sign::verify_keychain(canonical, signatures, &chain) {
         Ok(key_id) => Ok(Some(key_id)),
@@ -2050,6 +2077,60 @@ pub fn verify_signatures_at(
             keys.display()
         )),
     }
+}
+
+/// The embedded-key-set directory beside a device anchor: for
+/// `/etc/shuttle/update-key.pub` that is `/etc/shuttle/trusted-keys/`.
+fn trusted_keys_dir(anchor: &Path) -> PathBuf {
+    anchor
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("trusted-keys")
+}
+
+/// Read the device revocation list beside the anchor, unioned with the
+/// operator list under the keychain dir. A missing file is an empty list;
+/// the operator side is the local `revoked-keys` the key ceremony writes.
+fn embedded_revoked_keys(anchor: &Path, keys: &Path) -> miette::Result<Vec<String>> {
+    let mut revoked = Vec::new();
+    let device = anchor
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("revoked-keys");
+    if let Ok(text) = std::fs::read_to_string(&device) {
+        revoked.extend(parse_revoked_keys(&text, &device)?);
+    }
+    revoked.extend(crate::sign::read_revoked_keys(keys)?);
+    revoked.sort();
+    revoked.dedup();
+    Ok(revoked)
+}
+
+/// Parse a revocation list body: one 16-hex key id per line, `#` comments
+/// and blanks skipped. Malformed lines are named errors — a corrupt
+/// revocation list is never treated as empty (that would silently bless
+/// revoked keys).
+fn parse_revoked_keys(text: &str, path: &Path) -> miette::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.len() != 16 || !line.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(miette::miette!(
+                "revocation list {} line {} is not a 16-hex key id: {line:?}",
+                path.display(),
+                n + 1
+            ));
+        }
+        ids.push(line.to_ascii_lowercase());
+    }
+    Ok(ids)
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// First non-comment, non-empty line of a two-line public key file.
@@ -3471,5 +3552,109 @@ plugs:
         )
         .unwrap();
         assert_eq!(verified.as_deref(), Some(kp.key_id().as_str()));
+    }
+
+    /// A minimal manifest signed by `kp`.
+    fn manifest_signed_by(
+        kp: &crate::sign::KeyPair,
+    ) -> (Vec<u8>, BTreeMap<String, serde_json::Value>) {
+        let mut manifest = crate::manifest::ImageManifest {
+            manifest_version: crate::manifest::MANIFEST_VERSION,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            images: BTreeMap::new(),
+            signatures: BTreeMap::new(),
+        };
+        crate::sign::cosign(&mut manifest, kp).unwrap();
+        let canonical = crate::sign::canonical_bytes(&manifest).unwrap();
+        (canonical, manifest.signatures)
+    }
+
+    #[test]
+    fn device_trust_set_accepts_an_embedded_anchor() {
+        let home = tempfile::tempdir().unwrap();
+        let kp = crate::sign::create_secret_key(home.path()).unwrap();
+        // The image-embedded shape: anchor dir beside update-key.pub.
+        let anchor_dir = home.path().join("etc/shuttle");
+        crate::sign::install_public_key(&kp, &anchor_dir.join("trusted-keys")).unwrap();
+        let (canonical, sigs) = manifest_signed_by(&kp);
+        let verified = verify_signatures_at(
+            &canonical,
+            &sigs,
+            &anchor_dir.join("update-key.pub"),
+            Path::new("/definitely/not/here"),
+        )
+        .unwrap();
+        assert_eq!(verified.as_deref(), Some(kp.key_id().as_str()));
+    }
+
+    #[test]
+    fn device_revocation_list_refuses_a_revoked_signer() {
+        let home = tempfile::tempdir().unwrap();
+        let revoked = crate::sign::create_secret_key(home.path()).unwrap();
+        let anchor_dir = home.path().join("etc/shuttle");
+        crate::sign::install_public_key(&revoked, &anchor_dir.join("trusted-keys")).unwrap();
+        // The device carries the revocation list beside the anchor.
+        std::fs::write(
+            anchor_dir.join("revoked-keys"),
+            format!("{}\n", revoked.key_id()),
+        )
+        .unwrap();
+
+        let (canonical, sigs) = manifest_signed_by(&revoked);
+        let err = verify_signatures_at(
+            &canonical,
+            &sigs,
+            &anchor_dir.join("update-key.pub"),
+            Path::new("/definitely/not/here"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&revoked.key_id()),
+            "revoked signer refused by id: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("REVOKED"),
+            "refusal is explicit: {err:#}"
+        );
+    }
+
+    #[test]
+    fn device_revocation_refuses_even_when_a_trusted_key_also_signed() {
+        let home = tempfile::tempdir().unwrap();
+        let revoked = crate::sign::create_secret_key(home.path()).unwrap();
+        let trusted = crate::sign::create_secret_key(&home.path().join("other")).unwrap();
+        let anchor_dir = home.path().join("etc/shuttle");
+        crate::sign::install_public_key(&revoked, &anchor_dir.join("trusted-keys")).unwrap();
+        crate::sign::install_public_key(&trusted, &anchor_dir.join("trusted-keys")).unwrap();
+        std::fs::write(
+            anchor_dir.join("revoked-keys"),
+            format!("{}\n", revoked.key_id()),
+        )
+        .unwrap();
+
+        // Dual-signed: revoked + trusted. The trusted signature alone
+        // would verify — revocation must still refuse.
+        let mut manifest = crate::manifest::ImageManifest {
+            manifest_version: crate::manifest::MANIFEST_VERSION,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            images: BTreeMap::new(),
+            signatures: BTreeMap::new(),
+        };
+        crate::sign::cosign(&mut manifest, &revoked).unwrap();
+        crate::sign::cosign(&mut manifest, &trusted).unwrap();
+        let canonical = crate::sign::canonical_bytes(&manifest).unwrap();
+        let err = verify_signatures_at(
+            &canonical,
+            &manifest.signatures,
+            &anchor_dir.join("update-key.pub"),
+            Path::new("/definitely/not/here"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&revoked.key_id()),
+            "revoked signer wins over the trusted co-signer: {err:#}"
+        );
     }
 }

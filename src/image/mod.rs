@@ -769,21 +769,66 @@ pub(crate) fn build_disk_image_with(
         );
     }
 
-    // 5d. ADR-0011 step (d): when the image declares an update source, the
-    // update public key is embedded for the device-side verify path
-    // (/etc/shuttle/update-key.pub). A missing local key is created here —
-    // a build with an update source is a deliberate signing engagement.
+    // 5d. ADR-0024 §4: when the image declares an update source, embed the
+    // trusted key SET (/etc/shuttle/trusted-keys/<id>.pub), the revocation
+    // list (/etc/shuttle/revoked-keys), and the current signing key's
+    // anchor (/etc/shuttle/update-key.pub, kept for backward compatibility).
+    // A missing local key FAILS CLOSED — an ordinary build never mints or
+    // trusts a key (that would contradict "a rotation whose new key has not
+    // been promoted is not trusted"). Keygen is the operator's ceremony.
     if image.update_source.is_some() {
         let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-        let kp = match crate::sign::load_secret_key(&home)? {
-            Some(kp) => kp,
-            None => crate::sign::create_secret_key(&home)?,
-        };
+        let kp = load_signing_key_fail_closed(&home)?;
+
+        // 5d-i. The trusted key set: every local anchor, plus the current
+        // signing key (its anchor is installed by `keygen`/`promote`, but
+        // be defensive — an operator who deleted the anchor still signs).
+        let keys_dir = crate::sign::keys_dir(&home);
+        let trusted_dir = root.join(crate::sign::TRUSTED_KEYS_EMBED_DIR);
+        std::fs::create_dir_all(&trusted_dir).into_diagnostic()?;
+        let chain = crate::sign::Keychain::load_dir(&keys_dir)?;
+        let mut embedded = 0usize;
+        for anchor in &local_anchor_files(&keys_dir)? {
+            let name = anchor
+                .file_name()
+                .expect("anchor file has a name")
+                .to_string_lossy()
+                .into_owned();
+            std::fs::copy(anchor, trusted_dir.join(&name))
+                .into_diagnostic()
+                .wrap_err_with(|| format!("embedding trust anchor {}", anchor.display()))?;
+            embedded += 1;
+        }
+        if !chain.key_ids().contains(&kp.key_id()) {
+            let path = crate::sign::install_public_key(&kp, &trusted_dir)?;
+            eprintln!(
+                "  ℹ embedding the signing key as its own trust anchor: {}",
+                path.file_name().unwrap().to_string_lossy()
+            );
+            embedded += 1;
+        }
+
+        // 5d-ii. The revocation list (ids only, no key material) — the
+        // device distinguisher between "revoked" and "never trusted".
+        let revoked = crate::sign::read_revoked_keys(&keys_dir)?;
+        let revoked_body: String = revoked.iter().map(|id| format!("{id}\n")).collect();
+        std::fs::write(
+            root.join(crate::sign::REVOKED_KEYS_EMBED_PATH),
+            revoked_body,
+        )
+        .into_diagnostic()
+        .wrap_err_with(|| format!("writing /{}", crate::sign::REVOKED_KEYS_EMBED_PATH))?;
+
+        // 5d-iii. Backward-compatible signing-key anchor.
         let key_path = root.join(crate::sign::PUBKEY_EMBED_PATH);
         std::fs::create_dir_all(key_path.parent().unwrap()).into_diagnostic()?;
         std::fs::write(&key_path, crate::sign::public_key_file(&kp)).into_diagnostic()?;
         eprintln!(
-            "  ✓ update public key embedded: /{} (key id {})",
+            "  ✓ update trust material embedded: /{}/ ({} anchor(s), {} revoked) + /{} \
+             (key id {})",
+            crate::sign::TRUSTED_KEYS_EMBED_DIR,
+            embedded,
+            revoked.len(),
             crate::sign::PUBKEY_EMBED_PATH,
             kp.key_id()
         );
@@ -1107,6 +1152,43 @@ pub(super) fn calculate_disk_size_mb(layout: &DiskLayout) -> u64 {
 }
 
 // ── Image manifest ──
+
+/// Load the update signing key for an `update_source` image, FAILING
+/// CLOSED when there is none (ADR-0024 §4). A build never mints or trusts
+/// a key: the ceremony (`shuttle key keygen`) is the operator's, and a
+/// key minted but not promoted must not anchor device verification.
+fn load_signing_key_fail_closed(home: &Path) -> miette::Result<crate::sign::KeyPair> {
+    crate::sign::load_secret_key(home)?.ok_or_else(|| {
+        miette::miette!(
+            "image declares update_source but no signing key exists at {} — run \
+             `shuttle key keygen` first (a build never mints a key: an untrusted key \
+             cannot anchor device verification)",
+            crate::sign::secret_key_path(home).display()
+        )
+    })
+}
+
+/// Every `*.pub` file in a local trust-anchor directory, sorted (the
+/// byte-stable order an image embed needs). A missing directory is an
+/// empty set — the build's no-anchor case fails earlier on the missing
+/// signing key. Mirrors [`crate::sign::Keychain::load_dir`]'s selection.
+fn local_anchor_files(dir: &Path) -> miette::Result<Vec<PathBuf>> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Ok(Vec::new());
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in read {
+        let entry = entry
+            .into_diagnostic()
+            .wrap_err_with(|| format!("reading {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "pub") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageManifest {
@@ -3381,8 +3463,14 @@ WantedBy=timers.target
         ensure_os_release_image_version(root.path(), &image).unwrap();
         let text = std::fs::read_to_string(root.path().join("etc/os-release")).unwrap();
         assert!(text.contains("ID=nixos"), "base keys preserved: {text}");
-        assert!(text.contains("CUSTOM=kept"), "unknown keys preserved: {text}");
-        assert!(text.contains("VERSION_ID=24.11"), "VERSION_ID untouched: {text}");
+        assert!(
+            text.contains("CUSTOM=kept"),
+            "unknown keys preserved: {text}"
+        );
+        assert!(
+            text.contains("VERSION_ID=24.11"),
+            "VERSION_ID untouched: {text}"
+        );
         assert!(
             text.contains("IMAGE_VERSION=1.2.3") && !text.contains("IMAGE_VERSION=stale"),
             "IMAGE_VERSION replaced, not duplicated: {text}"
@@ -4851,5 +4939,44 @@ WantedBy=timers.target
             );
             assert!(runner.fstabs().is_empty(), "no fstab for a plain image");
         }
+    }
+
+    // ── Update-signing embed: fail closed, no auto-mint (ADR-0024 §4) ──
+
+    #[test]
+    fn update_source_without_a_secret_key_fails_closed_without_minting() {
+        let home = tempfile::tempdir().unwrap();
+        let err = load_signing_key_fail_closed(home.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("shuttle key keygen"),
+            "the error tells the operator to run keygen: {err:#}"
+        );
+        assert!(
+            !crate::sign::secret_key_path(home.path()).exists(),
+            "a build must never mint a key"
+        );
+    }
+
+    #[test]
+    fn update_source_with_a_promoted_key_uses_it() {
+        let home = tempfile::tempdir().unwrap();
+        let kp = crate::sign::create_secret_key(home.path()).unwrap();
+        let loaded = load_signing_key_fail_closed(home.path()).unwrap();
+        assert_eq!(loaded, kp);
+    }
+
+    #[test]
+    fn local_anchor_files_lists_only_pub_files_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.pub"), "x").unwrap();
+        std::fs::write(dir.path().join("a.pub"), "x").unwrap();
+        std::fs::write(dir.path().join("revoked-keys"), "x").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        let names: Vec<String> = local_anchor_files(dir.path())
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.pub", "b.pub"]);
     }
 }

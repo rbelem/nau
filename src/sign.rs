@@ -21,6 +21,10 @@
 //!   every `*.pub` file is a trust anchor for multi-key verification.
 //! - Public key in images: `/etc/shuttle/update-key.pub` — the anchor the
 //!   device-side verify path checks manifest signatures against.
+//! - Trusted key SET in images: `/etc/shuttle/trusted-keys/<key-id>.pub`
+//!   plus `/etc/shuttle/revoked-keys` (one revoked id per line) — so a
+//!   device can tell "not trusted anymore" from "never trusted"
+//!   (ADR-0024 §4).
 //!
 //! # Canonical bytes
 //!
@@ -54,9 +58,28 @@ pub const PUBLIC_COMMENT: &str = "untrusted comment: shuttle update public key (
 /// Public key file embedded into image builds when signing is engaged.
 pub const PUBKEY_EMBED_PATH: &str = "etc/shuttle/update-key.pub";
 
+/// Trusted-key-set directory embedded into image builds (ADR-0024 §4).
+/// Every `<key-id>.pub` in it is an anchor the device-side verify path
+/// accepts. The current signing key is also copied to
+/// [`PUBKEY_EMBED_PATH`] for backward compatibility with anchors that
+/// predate the trust-set shape.
+pub const TRUSTED_KEYS_EMBED_DIR: &str = "etc/shuttle/trusted-keys";
+
+/// Revocation list embedded into image builds (ADR-0024 §4): one key id
+/// per line. A device-side verifier consults it so "revoked" is
+/// distinguishable from "never trusted".
+pub const REVOKED_KEYS_EMBED_PATH: &str = "etc/shuttle/revoked-keys";
+
 /// Secret key location under the user's home (`~/.config/shuttle/`).
 pub fn secret_key_path(home: &Path) -> PathBuf {
     home.join(".config").join("shuttle").join("secret-key")
+}
+
+/// Rotation successor secret location under `home`
+/// (`~/.config/shuttle/secret-key.new`, 0600): minted by rotation, moved
+/// into place by promotion.
+pub fn rotation_key_path(home: &Path) -> PathBuf {
+    home.join(".config").join("shuttle").join("secret-key.new")
 }
 
 /// An Ed25519 signing key pair: the seed and its derived public key.
@@ -237,6 +260,14 @@ impl Keychain {
     pub fn key_ids(&self) -> Vec<String> {
         self.entries.iter().map(|(id, _)| id.clone()).collect()
     }
+
+    /// (key id, public key) pairs for callers that verify entry-by-entry
+    /// outside [`verify_keychain`]'s all-or-nothing message (the device
+    /// path tries the embedded set, the legacy anchor, then the operator
+    /// keychain).
+    pub fn entries_for_verify(&self) -> Vec<(String, [u8; 32])> {
+        self.entries.clone()
+    }
 }
 
 /// Install a public key into `dir` as `<key-id>.pub` (the trust-anchor
@@ -277,28 +308,93 @@ pub fn cosign(manifest: &mut ImageManifest, kp: &KeyPair) -> miette::Result<()> 
 /// Requires an existing secret key — rotating nothing is a named error,
 /// not an accident.
 pub fn rotate(home: &Path, manifest: &mut ImageManifest) -> miette::Result<KeyPair> {
+    let successor = mint_rotation_key(home)?;
+    cosign(manifest, &successor)?;
+    Ok(successor)
+}
+
+/// Mint the rotation successor (`secret-key.new`) WITHOUT signing — the
+/// CLI's `shuttle key rotate`, where no manifest is in hand.
+///
+/// `rotate` is split this way because its signing half needs an
+/// [`ImageManifest`] and the operator CLI has none: fabricating one just
+/// to carry a signature would be a lie, and a bare `shuttle key rotate`
+/// is exactly the "mint the successor" ceremony. `rotate` keeps its
+/// dual-sign contract for the build path by calling this, then cosigning.
+///
+/// Requires an existing `secret-key`; refuses to overwrite an existing
+/// `secret-key.new`. The successor is NOT trusted until promoted (its
+/// `keys/<id>.pub` anchor is installed by [`promote_rotation_key`]).
+pub fn mint_rotation_key(home: &Path) -> miette::Result<KeyPair> {
     if load_secret_key(home)?.is_none() {
         return Err(miette::miette!(
-            "no signing key at {} — nothing to rotate",
+            "no signing key at {} — nothing to rotate (run `shuttle key keygen` first)",
             secret_key_path(home).display()
         ));
     }
     let successor = derive_pair(&read_urandom32()?);
-    let new_path = home.join(".config").join("shuttle").join("secret-key.new");
+    let new_path = rotation_key_path(home);
     if new_path.exists() {
         return Err(miette::miette!(
-            "rotation key already exists at {} — refusing to overwrite (finish or abandon \
-             the pending rotation first)",
+            "rotation key already exists at {} — refusing to overwrite (promote it with \
+             `shuttle key promote`, or remove it to abandon the pending rotation)",
             new_path.display()
         ));
     }
     write_secret_key_at(&new_path, &successor)?;
     eprintln!(
-        "  ✓ rotation key minted: {} (key id {})",
+        "  ✓ rotation key minted: {} (key id {}) — not trusted until promoted",
         new_path.display(),
         successor.key_id()
     );
-    cosign(manifest, &successor)?;
+    Ok(successor)
+}
+
+/// Promotion ceremony: move the successor over the active secret key.
+///
+/// This is the half that makes rotation mean anything: until it runs, a
+/// successor minted at `secret-key.new` has no `keys/<id>.pub` anchor, so
+/// the keychain never contains it and [`verify_keychain`] cannot accept
+/// its signature. Promote moves `secret-key.new` → `secret-key`
+/// (overwriting the old secret), then installs the successor's public key
+/// as a trust anchor in `dir`.
+///
+/// Fails closed: absent `secret-key.new` or a malformed successor is a
+/// named error and leaves the existing secret untouched. The old key's
+/// anchor is deliberately left in place — the dual-trust overlap window —
+/// and stays revocable with [`revoke`].
+pub fn promote_rotation_key(home: &Path, dir: &Path) -> miette::Result<KeyPair> {
+    let new_path = rotation_key_path(home);
+    if !new_path.exists() {
+        return Err(miette::miette!(
+            "no rotation key at {} — nothing to promote (mint one with `shuttle key rotate`)",
+            new_path.display()
+        ));
+    }
+    // Parse BEFORE touching the active secret: a malformed `.new` must
+    // never clobber a working key.
+    let text = std::fs::read_to_string(&new_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading {}", new_path.display()))?;
+    let successor = parse_secret_key(&text).wrap_err_with(|| {
+        format!(
+            "rotation key at {} is not a valid secret key — refusing to promote",
+            new_path.display()
+        )
+    })?;
+
+    let active = secret_key_path(home);
+    std::fs::rename(&new_path, &active)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("promoting {} to {}", new_path.display(), active.display()))?;
+    let anchor = install_public_key(&successor, dir)?;
+    eprintln!(
+        "  ✓ rotation promoted: {} → {} (key id {}; anchor {})",
+        new_path.display(),
+        active.display(),
+        successor.key_id(),
+        anchor.display()
+    );
     Ok(successor)
 }
 
@@ -320,6 +416,104 @@ pub fn revoke(dir: &Path, manifest: &mut ImageManifest, key_id: &str) -> miette:
         .wrap_err_with(|| format!("removing {}", pub_path.display()))?;
     manifest.signatures.remove(key_id);
     eprintln!("  ✓ key {key_id} revoked: anchor removed, signature stripped");
+    Ok(())
+}
+
+/// Operator-surface revocation: drop the local trust anchor for `key_id`
+/// and record it in the local revocation list at `dir/revoked-keys`.
+///
+/// Distinct from [`revoke`] in that it names the key even after the
+/// anchor is gone: the local `revoked-keys` file is what the image build
+/// copies into `etc/shuttle/revoked-keys` so a device can tell "revoked"
+/// (anchor absent *and* listed) apart from "never trusted" (anchor absent,
+/// not listed). `revoking an absent anchor is refused unless it is
+/// already listed` — a named error, never a silent no-op.
+pub fn revoke_local(dir: &Path, key_id: &str) -> miette::Result<()> {
+    let pub_path = dir.join(format!("{key_id}.pub"));
+    let listed = read_revoked_keys(dir)?.iter().any(|id| id == key_id);
+    if !pub_path.exists() && !listed {
+        return Err(miette::miette!(
+            "cannot revoke {key_id}: no trust anchor at {} and it is not in the \
+             revocation list",
+            pub_path.display()
+        ));
+    }
+    if pub_path.exists() {
+        std::fs::remove_file(&pub_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("removing {}", pub_path.display()))?;
+    }
+    if !listed {
+        write_revoked_keys(dir, &{
+            let mut ids = read_revoked_keys(dir)?;
+            ids.push(key_id.to_string());
+            ids
+        })?;
+    }
+    eprintln!("  ✓ key {key_id} revoked: anchor removed, listed in revoked-keys");
+    Ok(())
+}
+
+/// Read the `<dir>/revoked-keys` list (one key id per line). A missing
+/// file is an empty list; malformed lines are named errors — a corrupt
+/// revocation list must never be silently treated as empty.
+pub fn read_revoked_keys(dir: &Path) -> miette::Result<Vec<String>> {
+    let path = dir.join("revoked-keys");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.len() != 16 || !line.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(miette::miette!(
+                "revocation list {} line {} is not a 16-hex key id: {line:?}",
+                path.display(),
+                n + 1
+            ));
+        }
+        ids.push(line.to_ascii_lowercase());
+    }
+    Ok(ids)
+}
+
+/// Write the `<dir>/revoked-keys` list, one key id per line, sorted and
+/// deduplicated (deterministic for byte-stable images).
+fn write_revoked_keys(dir: &Path, ids: &[String]) -> miette::Result<()> {
+    std::fs::create_dir_all(dir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("creating {}", dir.display()))?;
+    let mut ids: Vec<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+    ids.sort();
+    ids.dedup();
+    let body: String = ids.iter().map(|id| format!("{id}\n")).collect();
+    let path = dir.join("revoked-keys");
+    std::fs::write(&path, body)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Reject a signature set made under any revoked key id. A signature
+/// entry whose key id appears in `revoked` is a hard refusal BEFORE any
+/// anchor check — "this key was trusted once and is trusted no longer"
+/// must not be masked by a dual-signed manifest that a revoked key also
+/// signed.
+pub fn reject_revoked(
+    signatures: &std::collections::BTreeMap<String, serde_json::Value>,
+    revoked: &[String],
+) -> miette::Result<()> {
+    for key_id in revoked {
+        if signatures.contains_key(key_id) {
+            return Err(miette::miette!(
+                "artifact carries a signature from REVOKED key id {key_id} — refusing to \
+                 install (revoked keys are never trusted again)"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -355,6 +549,27 @@ pub fn verify_keychain(
         missing,
         failed
     ))
+}
+
+/// The device-side trust policy (ADR-0024 §4): a closed key set plus an
+/// explicit revocation list.
+///
+/// - [`reject_revoked`] runs first: a signature under a revoked id is a
+///   hard refusal even if another, still-trusted key also signed.
+/// - Then [`verify_keychain`] over the trusted set: a signature under an
+///   id absent from the set is "never trusted" and fails closed.
+///
+/// Both halves are needed for "revoked" to be distinguishable from
+/// "never trusted": without the revocation list, stripping an anchor is
+/// indistinguishable from never having carried it.
+pub fn verify_trust_set(
+    manifest_bytes: &[u8],
+    signatures: &std::collections::BTreeMap<String, serde_json::Value>,
+    chain: &Keychain,
+    revoked: &[String],
+) -> miette::Result<String> {
+    reject_revoked(signatures, revoked)?;
+    verify_keychain(manifest_bytes, signatures, chain)
 }
 
 /// Verify one base64 signature string under one public key (the single
@@ -856,6 +1071,209 @@ mod tests {
         assert!(
             format!("{err:#}").contains("bad.pub"),
             "corrupt anchor named: {err:#}"
+        );
+    }
+
+    // ── Rotation promotion (ADR-0024 §4) ──
+
+    #[test]
+    fn unpromoted_rotation_is_not_trusted_until_promoted() {
+        let (home, old) = temp_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        install_public_key(&old, dir.path()).unwrap();
+
+        // Mint the successor WITHOUT promoting (the CLI's `key rotate`).
+        let successor = mint_rotation_key(home.path()).unwrap();
+        assert_ne!(successor, old);
+
+        // The active secret is still the old key; `.new` is pending.
+        assert_eq!(load_secret_key(home.path()).unwrap().unwrap(), old);
+        assert!(home.path().join(".config/shuttle/secret-key.new").exists());
+
+        // Before promotion the successor has NO anchor, so a manifest it
+        // signed cannot verify under the keychain.
+        let mut manifest = minimal_manifest();
+        cosign(&mut manifest, &successor).unwrap();
+        let bytes = canonical_bytes(&manifest).unwrap();
+        let chain = Keychain::load_dir(dir.path()).unwrap();
+        let err = verify_keychain(&bytes, &manifest.signatures, &chain).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no trusted signature verifies"),
+            "unpromoted rotation must not be trusted: {err:#}"
+        );
+
+        // Promote flips it: the successor becomes the signing key and its
+        // anchor is installed.
+        let promoted = promote_rotation_key(home.path(), dir.path()).unwrap();
+        assert_eq!(promoted, successor);
+        assert_eq!(load_secret_key(home.path()).unwrap().unwrap(), successor);
+        assert!(!home.path().join(".config/shuttle/secret-key.new").exists());
+        assert!(dir
+            .path()
+            .join(format!("{}.pub", successor.key_id()))
+            .exists());
+        let chain = Keychain::load_dir(dir.path()).unwrap();
+        assert!(chain.key_ids().contains(&successor.key_id()));
+        let verified = verify_keychain(&bytes, &manifest.signatures, &chain).unwrap();
+        assert_eq!(verified, successor.key_id());
+
+        // The old key's anchor was left in place (dual-trust window) and
+        // is still revocable.
+        assert!(dir.path().join(format!("{}.pub", old.key_id())).exists());
+    }
+
+    #[test]
+    fn promote_without_a_rotation_key_is_a_named_error() {
+        let (home, _) = temp_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        let err = promote_rotation_key(home.path(), dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no rotation key"),
+            "absent rotation key named: {err:#}"
+        );
+    }
+
+    #[test]
+    fn promote_a_malformed_rotation_key_is_refused_and_leaves_active_key() {
+        let (home, old) = temp_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        // A `.new` that carries no key material must never clobber the
+        // active secret.
+        std::fs::write(
+            home.path().join(".config/shuttle/secret-key.new"),
+            "untrusted comment: x\nzzzz\n",
+        )
+        .unwrap();
+        let err = promote_rotation_key(home.path(), dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a valid secret key"),
+            "malformed rotation key named: {err:#}"
+        );
+        assert_eq!(
+            load_secret_key(home.path()).unwrap().unwrap(),
+            old,
+            "the active key survived the failed promotion"
+        );
+        assert!(
+            home.path().join(".config/shuttle/secret-key.new").exists(),
+            "the malformed .new is left for the operator to inspect"
+        );
+    }
+
+    // ── Trust set: closed key set, revocation, overlap window ──
+
+    #[test]
+    fn closed_key_set_rejects_an_unknown_signer() {
+        let (_, trusted) = temp_keypair();
+        let (_, stranger) = temp_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        install_public_key(&trusted, dir.path()).unwrap();
+
+        let (bytes, sigs) = signed_manifest(&stranger);
+        let chain = Keychain::load_dir(dir.path()).unwrap();
+        let err = verify_trust_set(&bytes, &sigs, &chain, &[]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no trusted signature verifies"),
+            "unknown signer rejected: {err:#}"
+        );
+    }
+
+    #[test]
+    fn revoked_key_is_rejected_by_name_even_when_another_key_signed() {
+        let (_, revoked) = temp_keypair();
+        let (_, trusted) = temp_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        install_public_key(&revoked, dir.path()).unwrap();
+        install_public_key(&trusted, dir.path()).unwrap();
+
+        // Dual-signed: the revoked key AND a still-trusted key.
+        let mut manifest = minimal_manifest();
+        cosign(&mut manifest, &revoked).unwrap();
+        cosign(&mut manifest, &trusted).unwrap();
+        let bytes = canonical_bytes(&manifest).unwrap();
+        let chain = Keychain::load_dir(dir.path()).unwrap();
+
+        // Without the revocation list the trusted signature verifies.
+        verify_trust_set(&bytes, &manifest.signatures, &chain, &[]).unwrap();
+
+        // With it, the revoked signer is refused BY NAME before anything
+        // else — a revoked key is never trusted again, dual-sign or not.
+        let err = verify_trust_set(&bytes, &manifest.signatures, &chain, &[revoked.key_id()])
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&revoked.key_id()),
+            "revoked id named: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("REVOKED"),
+            "revocation refusal is explicit: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rotation_overlap_window_then_revoke_old_narrows_to_new() {
+        let (home, old) = temp_keypair();
+        let mut manifest = minimal_manifest();
+        cosign(&mut manifest, &old).unwrap();
+        let successor = mint_rotation_key(home.path()).unwrap();
+        cosign(&mut manifest, &successor).unwrap();
+        let bytes = canonical_bytes(&manifest).unwrap();
+
+        // Both anchors present: either signature verifies (the overlap
+        // window a rotation needs to roll out without a flag day).
+        let dir = tempfile::tempdir().unwrap();
+        install_public_key(&old, dir.path()).unwrap();
+        install_public_key(&successor, dir.path()).unwrap();
+        let chain = Keychain::load_dir(dir.path()).unwrap();
+        verify_trust_set(&bytes, &manifest.signatures, &chain, &[]).unwrap();
+
+        // Promote the new key, then revoke the old one.
+        promote_rotation_key(home.path(), dir.path()).unwrap();
+        revoke_local(dir.path(), &old.key_id()).unwrap();
+        assert!(!dir.path().join(format!("{}.pub", old.key_id())).exists());
+        assert_eq!(read_revoked_keys(dir.path()).unwrap(), vec![old.key_id()]);
+
+        // New-only now: the successor verifies, the old fails.
+        let chain = Keychain::load_dir(dir.path()).unwrap();
+        let verified = verify_keychain(&bytes, &manifest.signatures, &chain).unwrap();
+        assert_eq!(verified, successor.key_id());
+
+        // And the revoked id is refused explicitly even though its anchor
+        // is gone (closed set would say "never trusted"; the list says
+        // "revoked").
+        let revoked = read_revoked_keys(dir.path()).unwrap();
+        let err = verify_trust_set(&bytes, &manifest.signatures, &chain, &revoked).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&old.key_id()),
+            "old key named after revoke: {err:#}"
+        );
+    }
+
+    #[test]
+    fn revoke_local_is_named_for_an_unknown_key_and_idempotent_once_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = revoke_local(dir.path(), "deadbeef00112233").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no trust anchor"),
+            "unknown revocation named: {err:#}"
+        );
+
+        let (_, kp) = temp_keypair();
+        install_public_key(&kp, dir.path()).unwrap();
+        revoke_local(dir.path(), &kp.key_id()).unwrap();
+        // A second pass over an already-listed, anchor-less id is fine.
+        revoke_local(dir.path(), &kp.key_id()).unwrap();
+        assert_eq!(read_revoked_keys(dir.path()).unwrap(), vec![kp.key_id()]);
+    }
+
+    #[test]
+    fn malformed_revocation_list_is_a_named_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("revoked-keys"), "not-a-key-id\n").unwrap();
+        let err = read_revoked_keys(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("revoked-keys"),
+            "corrupt revocation list named: {err:#}"
         );
     }
 }

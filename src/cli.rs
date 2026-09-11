@@ -351,6 +351,13 @@ pub enum Command {
     #[command(subcommand)]
     Cache(CacheCommand),
 
+    /// Key ceremony (ADR-0011 step (e), ADR-0024 §4): generate, rotate,
+    /// promote, and revoke the update-manifest signing keys. The operator
+    /// surface over `~/.config/shuttle/` (secret-key, secret-key.new,
+    /// keys/<id>.pub) and the local `keys/revoked-keys` list.
+    #[command(subcommand)]
+    Key(KeyCommand),
+
     /// Manage on-device installs: generations + file-level content store
     /// (ADR-0012 step 5, Phase 24b). Operates on a state root (default
     /// /var/lib/shuttle) holding generations/, store/ blobs, and the
@@ -614,6 +621,76 @@ pub enum RuntimeCommand {
         /// (default: /var/lib/shuttle)
         #[arg(long)]
         state_dir: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Subcommands for `shuttle key` (ADR-0011 step (e), ADR-0024 §4): the
+/// key-ceremony operator surface. `--home` redirects the whole ceremony
+/// away from `$HOME` (tests, alternate operators); it defaults to `HOME`.
+///
+/// - `keygen`  — mint `secret-key` and trust it (install `keys/<id>.pub`).
+/// - `rotate`  — mint the successor `secret-key.new` (NOT trusted yet).
+/// - `promote` — move `secret-key.new` → `secret-key`, install its anchor.
+/// - `revoke`  — drop a trust anchor and list it in `keys/revoked-keys`.
+#[derive(clap::Subcommand)]
+pub enum KeyCommand {
+    /// Generate the update signing key under `--home`. Refuses to
+    /// overwrite an existing key; installs the public key into the trust
+    /// directory so the freshly minted key is immediately trusted.
+    Keygen {
+        /// Key-ceremony home (default: $HOME). The secret key lives at
+        /// `<home>/.config/shuttle/secret-key`, anchors under `keys/`.
+        #[arg(long)]
+        home: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Mint the rotation successor at `<home>/.config/shuttle/secret-key.new`.
+    /// The successor is NOT trusted until `key promote`: it has no anchor,
+    /// so the keychain cannot accept its signature. Requires an existing
+    /// `secret-key`; refuses to overwrite a pending `secret-key.new`.
+    Rotate {
+        /// Key-ceremony home (default: $HOME).
+        #[arg(long)]
+        home: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Promote the pending rotation: `secret-key.new` → `secret-key`,
+    /// overwriting the old secret, then install the successor's public
+    /// key as a trust anchor. The old anchor is left in place (dual-trust
+    /// overlap window) and stays revocable.
+    Promote {
+        /// Key-ceremony home (default: $HOME).
+        #[arg(long)]
+        home: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Revoke `key-id`: remove its trust anchor from the local key
+    /// directory and record it in `keys/revoked-keys` so the build can
+    /// carry the revocation to devices. The key id is the 16-hex prefix
+    /// of the public key.
+    Revoke {
+        /// Key id (first 16 hex chars of the public key).
+        key_id: String,
+
+        /// Key-ceremony home (default: $HOME).
+        #[arg(long)]
+        home: Option<String>,
 
         /// Output structured JSON instead of human-friendly output.
         #[arg(long)]
@@ -1373,6 +1450,73 @@ mod tests {
             }
             _ => panic!("expected Runtime Upgrade named"),
         }
+    }
+
+    // ── Key ceremony (ADR-0024 §4) ──
+
+    #[test]
+    fn test_key_keygen_defaults_and_flags() {
+        match Cli::try_parse_from(["shuttle", "key", "keygen"])
+            .unwrap()
+            .command
+        {
+            Command::Key(KeyCommand::Keygen { home, json }) => {
+                assert!(home.is_none());
+                assert!(!json);
+            }
+            _ => panic!("expected Key Keygen"),
+        }
+        match Cli::try_parse_from(["shuttle", "key", "keygen", "--home", "/tmp/k", "--json"])
+            .unwrap()
+            .command
+        {
+            Command::Key(KeyCommand::Keygen { home, json }) => {
+                assert_eq!(home.as_deref(), Some("/tmp/k"));
+                assert!(json);
+            }
+            _ => panic!("expected Key Keygen with flags"),
+        }
+    }
+
+    #[test]
+    fn test_key_rotate_promote_and_revoke() {
+        match Cli::try_parse_from(["shuttle", "key", "rotate"])
+            .unwrap()
+            .command
+        {
+            Command::Key(KeyCommand::Rotate { home, json }) => {
+                assert!(home.is_none());
+                assert!(!json);
+            }
+            _ => panic!("expected Key Rotate"),
+        }
+        match Cli::try_parse_from(["shuttle", "key", "promote", "--json"])
+            .unwrap()
+            .command
+        {
+            Command::Key(KeyCommand::Promote { json, .. }) => assert!(json),
+            _ => panic!("expected Key Promote"),
+        }
+        match Cli::try_parse_from([
+            "shuttle",
+            "key",
+            "revoke",
+            "deadbeef00112233",
+            "--home",
+            "/tmp/k",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Key(KeyCommand::Revoke { key_id, home, json }) => {
+                assert_eq!(key_id, "deadbeef00112233");
+                assert_eq!(home.as_deref(), Some("/tmp/k"));
+                assert!(!json);
+            }
+            _ => panic!("expected Key Revoke"),
+        }
+        // `revoke` requires its key-id positional.
+        assert!(Cli::try_parse_from(["shuttle", "key", "revoke"]).is_err());
     }
 
     // ── OCI push/pull (Phase 25) ──

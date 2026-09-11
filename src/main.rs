@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use shuttle::cache::PackageCache;
 use shuttle::cli::{
-    CacheCommand, Cli, Command, DepsCommand, IndexCommand, PodCommand, RuntimeCommand,
+    CacheCommand, Cli, Command, DepsCommand, IndexCommand, KeyCommand, PodCommand, RuntimeCommand,
 };
 use shuttle::image::ImageDeclaration;
 use shuttle::index::{IndexEntry, PackageIndex, StoreRef};
@@ -180,6 +180,8 @@ fn main() -> miette::Result<()> {
         Command::Completion { shell } => cmd_completion(shell),
 
         Command::Cache(sub) => cmd_cache(sub),
+
+        Command::Key(sub) => cmd_key(sub),
 
         Command::Runtime(sub) => cmd_runtime(sub),
 
@@ -2068,6 +2070,97 @@ fn cache_prune(days: u64, cache: PackageCache, force: bool) -> miette::Result<()
     } else {
         eprintln!("Nothing to prune.");
     }
+    Ok(())
+}
+
+// ── Key ceremony (ADR-0011 step (e), ADR-0024 §4) ──
+
+/// Resolve the key-ceremony home: the `--home` override, else `$HOME`
+/// (the same default the build path uses). All ceremony state lives under
+/// `<home>/.config/shuttle/`.
+fn key_home(home: Option<String>) -> PathBuf {
+    home.map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())))
+}
+
+fn cmd_key(sub: KeyCommand) -> miette::Result<()> {
+    match sub {
+        KeyCommand::Keygen { home, json } => {
+            shuttle::output::set_mode(json);
+            key_keygen(key_home(home))
+        }
+        KeyCommand::Rotate { home, json } => {
+            shuttle::output::set_mode(json);
+            key_rotate(key_home(home))
+        }
+        KeyCommand::Promote { home, json } => {
+            shuttle::output::set_mode(json);
+            key_promote(key_home(home))
+        }
+        KeyCommand::Revoke { key_id, home, json } => {
+            shuttle::output::set_mode(json);
+            key_revoke(key_home(home), &key_id)
+        }
+    }
+}
+
+/// `shuttle key keygen`: mint the secret key and trust it immediately.
+/// Never prints the seed.
+fn key_keygen(home: PathBuf) -> miette::Result<()> {
+    let kp = shuttle::sign::create_secret_key(&home)?;
+    let anchor = shuttle::sign::install_public_key(&kp, &shuttle::sign::keys_dir(&home))?;
+    shuttle::output::ok(format!(
+        "signing key created: {} (key id {})",
+        shuttle::sign::secret_key_path(&home).display(),
+        kp.key_id()
+    ));
+    shuttle::output::info(format!("trust anchor installed: {}", anchor.display()));
+    print_report(&serde_json::json!({
+        "key_id": kp.key_id(),
+        "secret_key": shuttle::sign::secret_key_path(&home).display().to_string(),
+        "anchor": anchor.display().to_string(),
+    }));
+    Ok(())
+}
+
+/// `shuttle key rotate`: mint `secret-key.new` only. No manifest is in
+/// hand for a bare CLI invocation, so this is the minting half of
+/// `sign::rotate` — the dual-sign half stays on the build path.
+fn key_rotate(home: PathBuf) -> miette::Result<()> {
+    let kp = shuttle::sign::mint_rotation_key(&home)?;
+    shuttle::output::ok(format!(
+        "rotation key minted: {} (key id {}) — not trusted until promoted",
+        shuttle::sign::rotation_key_path(&home).display(),
+        kp.key_id()
+    ));
+    print_report(&serde_json::json!({
+        "key_id": kp.key_id(),
+        "rotation_key": shuttle::sign::rotation_key_path(&home).display().to_string(),
+        "trusted": false,
+    }));
+    Ok(())
+}
+
+/// `shuttle key promote`: move the successor into place and trust it.
+fn key_promote(home: PathBuf) -> miette::Result<()> {
+    let kp = shuttle::sign::promote_rotation_key(&home, &shuttle::sign::keys_dir(&home))?;
+    shuttle::output::ok(format!(
+        "rotation promoted: key id {} is now the signing key",
+        kp.key_id()
+    ));
+    print_report(&serde_json::json!({
+        "key_id": kp.key_id(),
+        "secret_key": shuttle::sign::secret_key_path(&home).display().to_string(),
+        "trusted": true,
+    }));
+    Ok(())
+}
+
+/// `shuttle key revoke`: drop the local anchor and record the revocation.
+fn key_revoke(home: PathBuf, key_id: &str) -> miette::Result<()> {
+    shuttle::sign::revoke_local(&shuttle::sign::keys_dir(&home), key_id)?;
+    shuttle::output::ok(format!("key {key_id} revoked"));
+    print_report(&serde_json::json!({ "key_id": key_id, "revoked": true }));
     Ok(())
 }
 

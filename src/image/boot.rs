@@ -190,17 +190,23 @@ pub(crate) fn ensure_os_release_image_version(
         lines.push("ID=shuttle".into());
         lines.push(format!("NAME=\"{}\"", image.name));
         lines.push(format!("VERSION_ID={}", image.version));
-        lines.push(format!("PRETTY_NAME=\"shuttle {} {}\"", image.name, image.version));
+        lines.push(format!(
+            "PRETTY_NAME=\"shuttle {} {}\"",
+            image.name, image.version
+        ));
     }
     lines.push(format!("IMAGE_VERSION={}", image.version));
-    crate::emit::write_staged_file(root, Path::new("etc/os-release"), &(lines.join("\n") + "\n"))?;
+    crate::emit::write_staged_file(
+        root,
+        Path::new("etc/os-release"),
+        &(lines.join("\n") + "\n"),
+    )?;
     eprintln!(
         "  ✓ etc/os-release: IMAGE_VERSION={} (systemd-sysupdate %A / ProtectVersion)",
         image.version
     );
     Ok(())
 }
-
 
 /// Hash-partition size in MB for MinSize, mirroring the appended hash
 /// partition for the layout's root.
