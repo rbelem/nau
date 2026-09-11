@@ -832,7 +832,13 @@ pub(crate) fn audit_initrd_modules(
         InitrdModuleAudit::Missing { config, missing } => Err(miette::miette!(
             "kernel {} initrd is missing boot-chain module(s): {} (required by {}); \
              the kernel cannot see its own disk at boot — refusing to build a disk \
-             image that cannot boot (ADR-0024 §1)",
+             image that cannot boot (ADR-0024 §1). A stock Ubuntu Core kernel payload \
+             ships Canonical's snap-bootstrap initramfs, which mounts a writable \
+             ubuntu-data and never verifies a shuttle verity root, so a complete \
+             module set would not make it honor this image's cmdline either. \
+             Legitimate exits: a kernel snap in the raw vmlinuz/initrd convention \
+             whose initrd carries the boot-chain modules (or one that builds them in), \
+             or shuttle building its own initramfs (issue #75)",
             payload.version,
             missing.join(", "),
             config.display()
@@ -969,7 +975,10 @@ fn verify_bzimage_version(image: &Path, expected: &str) -> miette::Result<()> {
              refusing to build a disk image that cannot boot"
         ));
     }
-    eprintln!("  ✓ kernel {}: {KERNEL_EFI_NAME} .linux section matches modules/{expected}", image.display());
+    eprintln!(
+        "  ✓ kernel {}: {KERNEL_EFI_NAME} .linux section matches modules/{expected}",
+        image.display()
+    );
     Ok(())
 }
 
