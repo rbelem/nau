@@ -27,7 +27,12 @@ return {
             params = {
                 "quiet",
                 "splash",
+                -- tty1 is the local console; ttyS0 mirrors the boot to the
+                -- serial port so `shuttle test` (QEMU `-serial`) can observe
+                -- userspace. Without a serial console the harness sees an
+                -- empty log even on a successful boot.
                 "console=tty1",
+                "console=ttyS0",
                 "net.ifnames=0",
                 "systemd.unified_cgroup_hierarchy=1",
                 "module.sig_enforce=1",
@@ -65,15 +70,19 @@ return {
                 },
                 {
                     name = "root",
-                    size = "0",
-                    fs = "btrfs",
+                    -- A grow-to-fill "0" root takes the space left after the
+                    -- ESP and swap. That alone is only ~1G here, which the
+                    -- populated core22 rootfs plus LXD overflows (`mkfs.ext4
+                    -- -d` fails with "Could not allocate block"), so the root
+                    -- asks for 3G explicitly and the disk grows to fit.
+                    size = "3G",
+                    -- ext4, not btrfs: the unprivileged file-based build
+                    -- populates with `mkfs.ext4 -d` and has no loop-device
+                    -- backend, so a btrfs root fails closed at populate time.
+                    fs = "ext4",
                     mount = "/",
                     options = {
-                        "subvol=@",
-                        "compress=zstd",
                         "noatime",
-                        "ssd",
-                        "discard=async",
                     },
                 },
             },
