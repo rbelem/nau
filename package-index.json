@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "snaps": [
+    {
+      "name": "core22",
+      "store": {
+        "channel": "latest/stable"
+      }
+    },
+    {
+      "name": "pc-gadget",
+      "store": {
+        "channel": "latest/stable",
+        "name": "pc"
+      }
+    },
+    {
+      "name": "snapd",
+      "store": {
+        "channel": "latest/stable"
+      }
+    },
+    {
+      "name": "network-manager",
+      "store": {
+        "channel": "latest/stable"
+      }
+    },
+    {
+      "name": "lxd",
+      "store": {
+        "channel": "latest/stable"
+      }
+    },
+    {
+      "name": "pc-kernel",
+      "store": {
+        "channel": "latest/stable"
+      }
+    }
+  ]
+}
