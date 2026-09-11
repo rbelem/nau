@@ -405,9 +405,10 @@ pub fn audit_kernel_verity_config(payload_dir: &Path, kernel_version: &str) -> V
 }
 
 /// Locate the best kernel config source under the payload dir, first hit
-/// wins: `boot/config-<version>`, then any `boot/config-*`, then
-/// `lib/modules/<version>/config*` (sorted for determinism). Shared with
-/// the initrd-module build gate (ADR-0024 §1).
+/// wins: `boot/config-<version>`, then any `boot/config-*`, then the
+/// snap-root `config-<version>` (the real Ubuntu Core `pc-kernel` layout,
+/// #70), then `lib/modules/<version>/config*` (sorted for determinism).
+/// Shared with the initrd-module build gate (ADR-0024 §1).
 pub(crate) fn find_kernel_config(payload_dir: &Path, kernel_version: &str) -> Option<PathBuf> {
     let mut candidates = vec![payload_dir
         .join("boot")
@@ -427,6 +428,7 @@ pub(crate) fn find_kernel_config(payload_dir: &Path, kernel_version: &str) -> Op
         globs.sort();
         candidates.extend(globs);
     }
+    candidates.push(payload_dir.join(format!("config-{kernel_version}")));
     let modules = payload_dir.join("lib").join("modules").join(kernel_version);
     if let Ok(read) = std::fs::read_dir(&modules) {
         let mut globs: Vec<PathBuf> = read
@@ -533,6 +535,12 @@ const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4d, 0x18];
 /// `newc` cpio archive magics (`070701` and its CRC variant `070702`).
 const NEWC_MAGICS: [&[u8]; 2] = [b"070701", b"070702"];
 
+/// Upper bound on the number of `newc`/compressed layers a single initrd may
+/// concatenate. Ubuntu Core kernel snaps ship a microcode archive followed by
+/// one compressed main archive; four leaves ample headroom while keeping a
+/// malformed file from spinning the walk.
+const MAX_INITRD_LAYERS: usize = 4;
+
 /// `true` when `data` begins with a `newc` cpio member header.
 fn is_newc(data: &[u8]) -> bool {
     NEWC_MAGICS.iter().any(|magic| data.starts_with(magic))
@@ -560,11 +568,20 @@ fn align4(n: usize) -> usize {
 }
 
 /// Decompress (through the injected [`CommandRunner`]) and walk `initrd`,
-/// returning every cpio member path. An uncompressed `newc` archive is
-/// read directly; a wrapped one is piped through `gzip -dc` / `zstd -dc` /
-/// `xz -dc` / `lz4 -dc` into memory. Fails closed on an unrecognized
-/// format or a failed decompressor — an initrd that cannot be read cannot
-/// be verified.
+/// returning every cpio member path from every concatenated layer.
+///
+/// An initrd may be a *concatenation* of archives: Ubuntu Core kernel snaps
+/// ship an uncompressed `newc` microcode archive followed by a compressed
+/// (e.g. zstd) main archive. The leading archive is walked first; on its
+/// trailer the walk continues past the 4-byte alignment/padding into the next
+/// archive, decompressing it through `gzip -dc` / `zstd -dc` / `xz -dc` /
+/// `lz4 -dc` when it carries a recognized magic or parsing it directly when it
+/// is already `newc`. Members from all layers are unioned — the boot-chain
+/// gate needs module paths from *any* layer to count.
+///
+/// Never silently succeeds: an unrecognized format, a failed decompressor, or
+/// a truncated/unparseable archive is a hard error. A trailing zero-padding
+/// run after the final trailer is normal and does not error.
 pub(crate) fn read_initrd_members(
     runner: &dyn CommandRunner,
     initrd: &Path,
@@ -572,34 +589,114 @@ pub(crate) fn read_initrd_members(
     let raw = std::fs::read(initrd)
         .into_diagnostic()
         .wrap_err_with(|| format!("reading initrd {}", initrd.display()))?;
-    let data = if is_newc(&raw) {
-        raw
-    } else if let Some(program) = decompressor_for(&raw) {
-        let argv = vec![
-            program.to_string(),
-            "-dc".to_string(),
-            initrd.to_string_lossy().into_owned(),
-        ];
-        let out = runner.run(&argv).map_err(|e| {
-            miette::miette!("failed to run {program} for {}: {e}", initrd.display())
-        })?;
-        if out.code != 0 {
-            return Err(miette::miette!(
-                "{program} failed (exit {}) decompressing {} — the initrd cannot be read, \
-                 so the boot-chain modules cannot be verified",
-                out.code,
-                initrd.display()
-            ));
-        }
-        out.stdout
-    } else {
+    if is_newc(&raw) {
+        return walk_concatenated_initrd(runner, initrd, &raw)
+            .wrap_err_with(|| format!("walking initrd {}", initrd.display()));
+    }
+    let Some(program) = decompressor_for(&raw) else {
         return Err(miette::miette!(
             "unrecognized initrd format at {}: not gzip/zstd/xz/lz4 and not a newc cpio \
              archive — refusing to ship a kernel whose initrd cannot be verified",
             initrd.display()
         ));
     };
+    let data = decompress_layer(runner, program, initrd, 0, &raw)?;
     cpio_newc_members(&data).wrap_err_with(|| format!("walking initrd {}", initrd.display()))
+}
+
+/// Walk a concatenation of archives beginning at `raw[0]` (already a `newc`
+/// header). Each layer advances the cursor past its trailer and the padding
+/// that follows; a recognized compressed layer is decompressed whole and its
+/// members collected, ending the walk. Trailing zeros terminate the walk
+/// silently.
+fn walk_concatenated_initrd(
+    runner: &dyn CommandRunner,
+    initrd: &Path,
+    raw: &[u8],
+) -> miette::Result<Vec<String>> {
+    let mut members = Vec::new();
+    let mut offset = 0usize;
+    for _layer in 0..MAX_INITRD_LAYERS {
+        while offset < raw.len() && raw[offset] == 0 {
+            offset += 1;
+        }
+        if offset >= raw.len() {
+            return Ok(members);
+        }
+        let rest = &raw[offset..];
+        if is_newc(rest) {
+            let (mut layer, next) = cpio_newc_members_from(raw, offset)?;
+            members.append(&mut layer);
+            offset = next;
+        } else if let Some(program) = decompressor_for(rest) {
+            let data = decompress_layer(runner, program, initrd, offset, raw)?;
+            let mut layer = cpio_newc_members(&data)?;
+            members.append(&mut layer);
+            return Ok(members);
+        } else {
+            return Err(miette::miette!(
+                "unrecognized initrd format at offset {offset} of {}: not gzip/zstd/xz/lz4 \
+                 and not a newc cpio archive — refusing to ship a kernel whose initrd \
+                 cannot be verified",
+                initrd.display()
+            ));
+        }
+    }
+    Err(miette::miette!(
+        "initrd {} carries more than {MAX_INITRD_LAYERS} concatenated archives — refusing \
+         to verify a malformed initrd",
+        initrd.display()
+    ))
+}
+
+/// Decompress the layer beginning at `offset` in `raw` through the injected
+/// runner. When the layer starts at offset zero it *is* the file, so the
+/// initrd path is handed to the tool directly; a trailing layer is spooled to
+/// a temporary file first.
+fn decompress_layer(
+    runner: &dyn CommandRunner,
+    program: &str,
+    initrd: &Path,
+    offset: usize,
+    raw: &[u8],
+) -> miette::Result<Vec<u8>> {
+    if offset == 0 {
+        return run_decompressor(runner, program, initrd, initrd);
+    }
+    let spool = tempfile::NamedTempFile::new()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("spooling trailing initrd layer from {}", initrd.display()))?;
+    std::fs::write(spool.path(), &raw[offset..])
+        .into_diagnostic()
+        .wrap_err_with(|| format!("spooling trailing initrd layer from {}", initrd.display()))?;
+    run_decompressor(runner, program, initrd, spool.path())
+}
+
+/// Run one injected decompressor (`<program> -dc <input>`) and return its
+/// stdout, failing closed on a spawn error or a non-zero exit.
+fn run_decompressor(
+    runner: &dyn CommandRunner,
+    program: &str,
+    initrd: &Path,
+    input: &Path,
+) -> miette::Result<Vec<u8>> {
+    let argv = vec![
+        program.to_string(),
+        "-dc".to_string(),
+        input.to_string_lossy().into_owned(),
+    ];
+    let out = runner
+        .run(&argv)
+        .map_err(|e| miette::miette!("failed to run {program} for {}: {e}", initrd.display()))?;
+    if out.code != 0 {
+        return Err(miette::miette!(
+            "{program} failed (exit {}) decompressing {} — the initrd cannot be read, \
+             so the boot-chain modules cannot be verified",
+            out.code,
+            initrd.display()
+        ));
+    }
+    Ok(out.stdout)
 }
 
 /// Walk a `newc` cpio archive, collecting member names. The 110-byte ASCII
@@ -607,8 +704,15 @@ pub(crate) fn read_initrd_members(
 /// NUL-terminated name and the file data, each padded to a 4-byte
 /// boundary; the archive ends at the `TRAILER!!!` member.
 pub(crate) fn cpio_newc_members(data: &[u8]) -> miette::Result<Vec<String>> {
+    cpio_newc_members_from(data, 0).map(|(members, _end)| members)
+}
+
+/// Walk one `newc` archive starting at `start`, returning its member names
+/// and the offset just past the aligned `TRAILER!!!` (where a concatenated
+/// archive would begin).
+fn cpio_newc_members_from(data: &[u8], start: usize) -> miette::Result<(Vec<String>, usize)> {
     let mut members = Vec::new();
-    let mut pos = 0usize;
+    let mut pos = start;
     loop {
         if data.len() < pos + 110 {
             return Err(miette::miette!(
@@ -647,12 +751,11 @@ pub(crate) fn cpio_newc_members(data: &[u8]) -> miette::Result<Vec<String>> {
             .filter(|end| *end <= data.len())
             .ok_or_else(|| miette::miette!("truncated cpio member '{name}' data"))?;
         if name == "TRAILER!!!" {
-            break;
+            return Ok((members, align4(data_end)));
         }
         members.push(name);
         pos = align4(data_end);
     }
-    Ok(members)
 }
 
 /// Outcome of the initrd boot-chain module audit
@@ -1501,6 +1604,82 @@ CONFIG_EXT4_FS=y
             format!("{err:#}").contains("gzip failed"),
             "a failed decompressor is a hard error: {err:#}"
         );
+    }
+
+    /// A minimal zstd wrapper: the 4-byte magic plus an opaque body. The
+    /// injected fake runner answers the `zstd` invocation with canned bytes,
+    /// so the body never needs to be a real frame — only the magic matters.
+    fn zstd_wrapped(body: &[u8]) -> Vec<u8> {
+        let mut out = ZSTD_MAGIC.to_vec();
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn initrd_reader_walks_concatenated_newc_and_zstd_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let initrd = dir.path().join("initrd");
+        // Ubuntu Core shape: uncompressed microcode archive first, then a
+        // zstd-wrapped main archive.
+        let microcode = newc_archive(&[("kernel/x86/microcode/AuthenticAMD.bin", b"microcode")]);
+        let main = newc_archive(&[
+            (
+                "usr/lib/modules/5.15.0-186-generic/kernel/drivers/block/virtio_blk.ko",
+                b"blob",
+            ),
+            ("usr/lib/snapd/snap-bootstrap", b"blob"),
+        ]);
+        let mut raw = microcode;
+        raw.extend_from_slice(&[0u8; 12]); // trailer block padding
+        raw.extend_from_slice(&zstd_wrapped(b"opaque zstd frame"));
+        std::fs::write(&initrd, &raw).unwrap();
+        let runner = DecompressRunner::new(main, 0);
+        let members = read_initrd_members(&runner, &initrd).unwrap();
+        assert_eq!(
+            members,
+            vec![
+                "kernel/x86/microcode/AuthenticAMD.bin",
+                "usr/lib/modules/5.15.0-186-generic/kernel/drivers/block/virtio_blk.ko",
+                "usr/lib/snapd/snap-bootstrap",
+            ]
+        );
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "one decompressor invocation: {calls:?}");
+        assert_eq!(calls[0][0], "zstd", "zstd magic selects zstd: {calls:?}");
+        assert_eq!(calls[0][1], "-dc");
+        assert!(
+            !calls[0][2].is_empty(),
+            "a trailing layer is spooled to a real path: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn initrd_reader_accepts_zero_padding_after_final_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let initrd = dir.path().join("initrd");
+        let mut raw = newc_archive(&[("kernels/6.8.0/virtio_blk.ko", b"blob")]);
+        raw.extend_from_slice(&[0u8; 512]); // block-boundary zero fill
+        std::fs::write(&initrd, &raw).unwrap();
+        let runner = DecompressRunner::new(Vec::new(), 0);
+        let members = read_initrd_members(&runner, &initrd).unwrap();
+        assert_eq!(members, vec!["kernels/6.8.0/virtio_blk.ko"]);
+        assert!(runner.calls().is_empty(), "zero padding needs no host tool");
+    }
+
+    #[test]
+    fn initrd_reader_fails_closed_on_garbage_after_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let initrd = dir.path().join("initrd");
+        let mut raw = newc_archive(&[("kernels/6.8.0/virtio_blk.ko", b"blob")]);
+        raw.extend_from_slice(b"not an archive at all");
+        std::fs::write(&initrd, &raw).unwrap();
+        let runner = DecompressRunner::new(Vec::new(), 0);
+        let err = read_initrd_members(&runner, &initrd).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unrecognized initrd format at offset"),
+            "an unrecognized trailing blob is a hard error: {err:#}"
+        );
+        assert!(runner.calls().is_empty(), "no decompressor for garbage");
     }
 
     #[test]
