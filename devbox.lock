@@ -753,6 +753,72 @@
         }
       }
     },
+    "qemu@latest": {
+      "last_modified": "2026-08-27T23:47:58Z",
+      "resolved": "github:NixOS/nixpkgs/7d1a7c21a4c00ea653fc7ed5c083d261340f185f#qemu",
+      "source": "devbox-search",
+      "version": "11.1.0",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/d7zjj9g3g6zsc9ygfw27fkfcg1x490m8-qemu-11.1.0",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/al2g2qjzkzbximhd8bl94lm9r2c5hjcj-qemu-11.1.0-doc"
+            }
+          ],
+          "store_path": "/nix/store/d7zjj9g3g6zsc9ygfw27fkfcg1x490m8-qemu-11.1.0"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/4b5rcpjizwx0iaby9y2l73xsci5lwrzp-qemu-11.1.0",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/2vgq59v50r52dlma54hgva1jbxly00sy-qemu-11.1.0-debug"
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/zh1fgzwh9ggiasy2wigpn00kk7028bqv-qemu-11.1.0-doc"
+            },
+            {
+              "name": "ga",
+              "path": "/nix/store/ryfscv0fawhbpj5q65mp3pxw3iby9qg2-qemu-11.1.0-ga"
+            }
+          ],
+          "store_path": "/nix/store/4b5rcpjizwx0iaby9y2l73xsci5lwrzp-qemu-11.1.0"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/gx222l0zm41h4zqrgpb07nc0brwpv3nk-qemu-11.1.0",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/0in9macig8cvdc8bh5xs42ma9zwmdalv-qemu-11.1.0-debug"
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/yhi36ga0c5dg2mh5xrnp06dmqxxpyc9c-qemu-11.1.0-doc"
+            },
+            {
+              "name": "ga",
+              "path": "/nix/store/bxgc917jljhc2qwk02d6hrr76iw4mg18-qemu-11.1.0-ga"
+            }
+          ],
+          "store_path": "/nix/store/gx222l0zm41h4zqrgpb07nc0brwpv3nk-qemu-11.1.0"
+        }
+      }
+    },
     "rustc@1.95.0": {
       "last_modified": "2026-05-21T08:15:18Z",
       "plugin_version": "0.0.1",
