@@ -1,0 +1,11 @@
+[package]
+name = "analyzer-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Feasibility spike: bind Luau's C++ type analyzer (Luau.Analysis) as a library from Rust"
+
+[build-dependencies]
+cc = { version = "1.2", features = ["parallel"] }
+flate2 = "1"
+tar = "0.4"
