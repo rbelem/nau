@@ -605,8 +605,18 @@ fn merge_kernel(
     if policy == KernelPayloadPolicy::BestEffort {
         return Ok((None, None));
     }
-    // Fail closed on a payload that cannot boot the image.
-    let payload = locate_kernel_payload(&kernel_dir, root).map_err(|e| {
+    // Fail closed on a payload that cannot boot the image. The raw
+    // vmlinuz/initrd convention is first choice; the real Ubuntu Core
+    // `pc-kernel` snap's prebuilt `kernel.efi` is the #70 fallback, split
+    // with objcopy into a scratch dir kept alive by the returned payload.
+    let payload = locate_kernel_payload(
+        runner,
+        find_objcopy().as_deref(),
+        &kernel_dir,
+        &kernel_dir,
+        root,
+    )
+    .map_err(|e| {
         miette::miette!(
             "kernel snap '{}': {e}; refusing to build a disk image that cannot boot",
             kernel_entry.snap.name
@@ -648,10 +658,24 @@ fn unsquashfs_kernel(
 }
 
 /// Copy the merged kernel modules/firmware trees into the staged rootfs.
+///
+/// Two source shapes are mapped: the conventional `lib/modules` +
+/// `lib/firmware` of a source-built kernel snap, and the real Ubuntu Core
+/// `pc-kernel` layout (#70) which carries `modules/` + `firmware/` at the
+/// snap ROOT. The booted runtime needs `/lib/modules/<ver>` either way —
+/// shuttle's native runtime has no snapd to mount the kernel snap, so the
+/// modules must be in the rootfs. `discover_kernel_version` stays
+/// single-source on `lib/modules/`, so this mapping is what makes the UC
+/// layout discoverable.
 fn copy_kernel_tree(kernel_dir: &Path, root: &Path) -> miette::Result<()> {
-    for dir in ["lib/modules", "lib/firmware"] {
-        let src = kernel_dir.join(dir);
-        let dst = root.join(dir);
+    for (src_rel, dst_rel) in [
+        ("lib/modules", "lib/modules"),
+        ("lib/firmware", "lib/firmware"),
+        ("modules", "lib/modules"),
+        ("firmware", "lib/firmware"),
+    ] {
+        let src = kernel_dir.join(src_rel);
+        let dst = root.join(dst_rel);
         if src.exists() {
             std::fs::create_dir_all(dst.parent().unwrap()).into_diagnostic()?;
             cp_r(&src, &dst)?;

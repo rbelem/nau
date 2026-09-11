@@ -2664,7 +2664,9 @@ WantedBy=multi-user.target
         std::fs::write(kdir.path().join("boot/vmlinuz-6.8.0-42-generic"), "K").unwrap();
         std::fs::write(kdir.path().join("boot/initrd.img-6.8.0-42-generic"), "I").unwrap();
 
-        let payload = locate_kernel_payload(kdir.path(), root.path()).unwrap();
+        let payload =
+            locate_kernel_payload(&ImageTools, None, kdir.path(), kdir.path(), root.path())
+                .unwrap();
         assert_eq!(payload.version, "6.8.0-42-generic");
         assert_eq!(
             payload.kernel,
@@ -2681,11 +2683,208 @@ WantedBy=multi-user.target
         let root = tempfile::tempdir().unwrap();
         let kdir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("lib/modules/6.8.0")).unwrap();
-        let err = locate_kernel_payload(kdir.path(), root.path()).unwrap_err();
+        // No raw vmlinuz/initrd and no kernel.efi: the payload is absent.
+        let err = locate_kernel_payload(&ImageTools, None, kdir.path(), kdir.path(), root.path())
+            .unwrap_err();
+        let msg = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("vmlinuz"),
-            "error must name the missing kernel asset: {err:#}"
+            msg.contains("vmlinuz") && msg.contains("kernel.efi"),
+            "error must name the missing kernel assets: {msg}"
         );
+    }
+
+    /// The real Ubuntu Core `pc-kernel` layout (#70): root-level
+    /// `kernel.efi` + `modules/<ver>/` + an empty `modules/<ver>/initrd`
+    /// DIRECTORY. A fake objcopy writes the section payloads; the extracted
+    /// bzImage carries the matching banner, so discovery succeeds.
+    struct ObjcopyRunner {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        banner: String,
+    }
+
+    impl crate::command::CommandRunner for ObjcopyRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            let section = argv[3].clone();
+            let out = &argv[5];
+            let body = if section == "--only-section=.linux" {
+                format!(
+                    "....Linux version {} (buildd@lcy02) #1 SMP....",
+                    self.banner
+                )
+            } else {
+                "newc-initrd".to_string()
+            };
+            std::fs::write(out, body).unwrap();
+            Ok(crate::command::RunnerOutput {
+                code: 0,
+                stdout: Vec::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn uc_kernel_snap_fixture(kdir: &Path, version: &str) {
+        std::fs::create_dir_all(kdir.join("kernel").join("modules").join(version)).unwrap();
+        std::fs::create_dir_all(kdir.join(format!("modules/{version}"))).unwrap();
+        // The real snap ships an EMPTY initrd directory, not a file.
+        std::fs::create_dir_all(kdir.join(format!("modules/{version}/initrd"))).unwrap();
+        std::fs::write(kdir.join("kernel.efi"), b"MZ-fake-uki").unwrap();
+        std::fs::write(
+            kdir.join(format!("config-{version}")),
+            b"CONFIG_DM_VERITY=y\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn kernel_payload_prebuilt_uki_is_split_with_objcopy() {
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        let version = "5.15.0-186-generic";
+        // copy_kernel_tree mirrors modules/<ver> into lib/modules/<ver>.
+        std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
+        uc_kernel_snap_fixture(kdir.path(), version);
+        // The empty modules/<ver>/initrd DIRECTORY must never be selected.
+        std::fs::create_dir_all(kdir.path().join(format!("modules/{version}/initrd"))).unwrap();
+
+        let runner = ObjcopyRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+            banner: version.to_string(),
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let payload = locate_kernel_payload(
+            &runner,
+            Some(Path::new("/usr/bin/objcopy")),
+            scratch.path(),
+            kdir.path(),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(payload.version, version);
+        assert!(payload.kernel.is_file());
+        assert!(payload.initrd.is_file());
+        assert!(payload.kernel.starts_with(scratch.path()));
+
+        let calls = runner.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "one objcopy per section: {calls:?}");
+        assert_eq!(
+            calls[0][..4],
+            ["/usr/bin/objcopy", "-O", "binary", "--only-section=.linux"]
+        );
+        assert_eq!(
+            calls[0][4],
+            kdir.path().join("kernel.efi").to_string_lossy()
+        );
+        assert_eq!(calls[0][5], payload.kernel.to_string_lossy());
+        assert_eq!(calls[1][..4][3], "--only-section=.initrd", "second section");
+        assert_eq!(calls[1][5], payload.initrd.to_string_lossy());
+    }
+
+    #[test]
+    fn kernel_payload_prebuilt_uki_without_objcopy_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        let version = "5.15.0-186-generic";
+        std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
+        uc_kernel_snap_fixture(kdir.path(), version);
+        let scratch = tempfile::tempdir().unwrap();
+
+        let err =
+            locate_kernel_payload(&ImageTools, None, scratch.path(), kdir.path(), root.path())
+                .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("objcopy") && msg.contains("binutils"),
+            "missing objcopy must name the tool and the fix: {msg}"
+        );
+    }
+
+    #[test]
+    fn kernel_payload_prebuilt_uki_version_mismatch_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        let version = "5.15.0-186-generic";
+        std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
+        uc_kernel_snap_fixture(kdir.path(), version);
+        let runner = ObjcopyRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+            banner: "5.15.0-90-generic".to_string(),
+        };
+        let scratch = tempfile::tempdir().unwrap();
+
+        let err = locate_kernel_payload(
+            &runner,
+            Some(Path::new("/usr/bin/objcopy")),
+            scratch.path(),
+            kdir.path(),
+            root.path(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("5.15.0-90-generic") && msg.contains(version),
+            "mismatch must name both versions: {msg}"
+        );
+    }
+
+    #[test]
+    fn kernel_payload_failed_objcopy_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        let version = "5.15.0-186-generic";
+        std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
+        uc_kernel_snap_fixture(kdir.path(), version);
+        let runner = FailingObjcopyRunner;
+        let scratch = tempfile::tempdir().unwrap();
+
+        let err = locate_kernel_payload(
+            &runner,
+            Some(Path::new("/usr/bin/objcopy")),
+            scratch.path(),
+            kdir.path(),
+            root.path(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("objcopy") && msg.contains(".linux"),
+            "a failed section extraction must name the section: {msg}"
+        );
+    }
+
+    struct FailingObjcopyRunner;
+
+    impl crate::command::CommandRunner for FailingObjcopyRunner {
+        fn run(&self, _argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            Ok(crate::command::RunnerOutput {
+                code: 1,
+                stdout: Vec::new(),
+                stderr: "no such section".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn first_existing_never_selects_a_directory_named_initrd() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("initrd");
+        std::fs::create_dir_all(&candidate).unwrap();
+        assert!(
+            first_existing([candidate.clone()]).is_none(),
+            "a directory named initrd is not a boot payload: {candidate:?}"
+        );
+    }
+
+    #[test]
+    fn bzimage_banner_version_reads_the_linux_version_string() {
+        let mut image = vec![0u8; 4096];
+        image.extend_from_slice(b"..Linux version 5.15.0-186-generic (buildd) #1 SMP..");
+        assert_eq!(
+            bzimage_banner_version(&image).as_deref(),
+            Some("5.15.0-186-generic")
+        );
+        assert_eq!(bzimage_banner_version(b"no banner here"), None);
     }
 
     #[test]
@@ -2785,11 +2984,11 @@ WantedBy=multi-user.target
         };
         std::fs::write(&initrd, bytes).unwrap();
         std::fs::write(boot.join(format!("vmlinuz-{kernel_version}")), b"K").unwrap();
-        KernelPayload {
-            kernel: boot.join(format!("vmlinuz-{kernel_version}")),
+        KernelPayload::raw(
+            boot.join(format!("vmlinuz-{kernel_version}")),
             initrd,
-            version: kernel_version.to_string(),
-        }
+            kernel_version.to_string(),
+        )
     }
 
     fn gate_write_config(payload_dir: &Path, kernel_version: &str, body: &str) {

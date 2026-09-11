@@ -609,6 +609,22 @@ pub(crate) struct KernelPayload {
     pub(crate) kernel: PathBuf,
     pub(crate) initrd: PathBuf,
     pub(crate) version: String,
+    /// Keeps UKI-extracted boot assets alive when the payload came from a
+    /// prebuilt `kernel.efi` rather than raw files (issue #70). `None` for
+    /// the raw path, where the files live in the extracted snap tree.
+    pub(crate) _scratch: Option<tempfile::TempDir>,
+}
+
+impl KernelPayload {
+    /// A payload backed by files already on disk (the raw convention path).
+    pub(crate) fn raw(kernel: PathBuf, initrd: PathBuf, version: String) -> KernelPayload {
+        KernelPayload {
+            kernel,
+            initrd,
+            version,
+            _scratch: None,
+        }
+    }
 }
 
 /// Boot facts captured during UKI assembly (ADR-0011 step (a)) and threaded
@@ -640,35 +656,48 @@ pub(crate) const EFI_STUB_CANDIDATES: [&str; 3] = [
     "/run/current-system/sw/lib/systemd/boot/efi/linuxx64.efi.stub",
 ];
 
-/// Kernel-snap payload convention (ADR-0011 step (a)) — defined explicitly
-/// because no convention existed: pkgs/*-kernel.lua snaps are source-type
-/// with no packed kernel. After the snap is extracted, boot assets are read
-/// from the payload in this fixed order, with the version taken from the
-/// merged rootfs module tree (`lib/modules/<version>` — the only kernel
-/// payload path this repo already merges):
+/// Kernel-snap payload convention (ADR-0011 step (a), extended by #70) —
+/// defined explicitly because no convention existed: pkgs/*-kernel.lua snaps
+/// are source-type with no packed kernel. After the snap is extracted, boot
+/// assets are read from the payload in this fixed order, with the version
+/// taken from the merged rootfs module tree (`lib/modules/<version>` — the
+/// only kernel payload path this repo already merges):
 ///
 ///   kernel: boot/vmlinuz-<ver> → boot/vmlinuz → vmlinuz-<ver> → vmlinuz
 ///   initrd: boot/initrd.img-<ver> → boot/initrd.img → initrd.img → initrd
 ///
-/// Raw kernel binaries only: a snapd-style `kernel.img` squashfs payload is
-/// not unpacked (that is gadget-stage behavior, out of scope).
+/// Raw kernel binaries are first choice. When no raw pair is present, the
+/// real Ubuntu Core `pc-kernel` layout (#70) is used instead: a prebuilt
+/// [`KERNEL_EFI_NAME`] UKI at the snap root is split with `objcopy` into its
+/// `.linux`/`.initrd` PE sections and shuttle re-assembles its OWN UKI from
+/// them — the per-image cmdline (root=PARTUUID, dm-verity roothash) must live
+/// INSIDE the signed UKI, and systemd-stub ignores LoadOptions under Secure
+/// Boot when a UKI carries an embedded cmdline. A snapd-style `kernel.img`
+/// squashfs payload is not unpacked (that is gadget-stage behavior).
 pub(crate) fn locate_kernel_payload(
+    runner: &dyn CommandRunner,
+    objcopy: Option<&Path>,
+    scratch: &Path,
     kernel_dir: &Path,
     root: &Path,
 ) -> miette::Result<KernelPayload> {
     let version = discover_kernel_version(root)?;
+    if let Some(payload) = locate_raw_payload(kernel_dir, version.clone())? {
+        return Ok(payload);
+    }
+    locate_uki_payload(runner, objcopy, scratch, kernel_dir, version)
+}
+
+/// The raw `vmlinuz`/`initrd` convention ([`locate_kernel_payload`]). `None`
+/// when either half is absent — the caller then falls back to the prebuilt
+/// UKI (#70).
+fn locate_raw_payload(kernel_dir: &Path, version: String) -> miette::Result<Option<KernelPayload>> {
     let kernel = first_existing([
         kernel_dir.join("boot").join(format!("vmlinuz-{version}")),
         kernel_dir.join("boot").join("vmlinuz"),
         kernel_dir.join(format!("vmlinuz-{version}")),
         kernel_dir.join("vmlinuz"),
-    ])
-    .ok_or_else(|| {
-        miette::miette!(
-            "payload has no kernel image (searched boot/vmlinuz-{version}, boot/vmlinuz, \
-             vmlinuz-{version}, vmlinuz)"
-        )
-    })?;
+    ]);
     let initrd = first_existing([
         kernel_dir
             .join("boot")
@@ -676,18 +705,97 @@ pub(crate) fn locate_kernel_payload(
         kernel_dir.join("boot").join("initrd.img"),
         kernel_dir.join("initrd.img"),
         kernel_dir.join("initrd"),
-    ])
-    .ok_or_else(|| {
-        miette::miette!(
+    ]);
+    match (kernel, initrd) {
+        (Some(kernel), Some(initrd)) => Ok(Some(KernelPayload::raw(kernel, initrd, version))),
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(miette::miette!(
+            "payload has no kernel image (searched boot/vmlinuz-{version}, boot/vmlinuz, \
+             vmlinuz-{version}, vmlinuz)"
+        )),
+        (Some(_), None) => Err(miette::miette!(
             "payload has no initrd (searched boot/initrd.img-{version}, boot/initrd.img, \
              initrd.img, initrd)"
+        )),
+    }
+}
+
+/// The prebuilt-UKI fallback for the real Ubuntu Core `pc-kernel` layout
+/// (#70): `kernel.efi` at the snap root, split into `.linux`/`.initrd` PE
+/// sections via `objcopy`. Both halves must be found and extracted, and the
+/// extracted bzImage banner must agree with the discovered module version —
+/// anything less fails closed with the exact cause.
+fn locate_uki_payload(
+    runner: &dyn CommandRunner,
+    objcopy: Option<&Path>,
+    scratch: &Path,
+    kernel_dir: &Path,
+    version: String,
+) -> miette::Result<KernelPayload> {
+    let uki = first_existing([kernel_dir.join(KERNEL_EFI_NAME)]).ok_or_else(|| {
+        miette::miette!(
+            "payload has no kernel image (searched boot/vmlinuz-{version}, boot/vmlinuz, \
+             vmlinuz-{version}, vmlinuz) and no prebuilt {KERNEL_EFI_NAME} at the snap root"
         )
     })?;
-    Ok(KernelPayload {
-        kernel,
-        initrd,
-        version,
-    })
+    let Some(objcopy) = objcopy else {
+        return Err(miette::miette!(
+            "objcopy not found on PATH — splitting {KERNEL_EFI_NAME} into its .linux/.initrd \
+             sections needs binutils, so refusing to build a disk image that cannot boot. Run \
+             'shuttle doctor' and install binutils"
+        ));
+    };
+    let dir = scratch.join("uki-sections");
+    std::fs::create_dir_all(&dir).into_diagnostic()?;
+    let kernel = dir.join("vmlinuz");
+    let initrd = dir.join("initrd");
+    for (section, out) in [(".linux", &kernel), (".initrd", &initrd)] {
+        extract_pe_section(runner, objcopy, &uki, section, out)?;
+    }
+    verify_bzimage_version(&kernel, &version)?;
+    Ok(KernelPayload::raw(kernel, initrd, version))
+}
+
+/// `objcopy -O binary --only-section=<section> <uki> <out>` through the
+/// injected runner, failing closed on a nonzero exit or a missing output.
+fn extract_pe_section(
+    runner: &dyn CommandRunner,
+    objcopy: &Path,
+    uki: &Path,
+    section: &str,
+    out: &Path,
+) -> miette::Result<()> {
+    let argv = vec![
+        objcopy.to_string_lossy().into_owned(),
+        "-O".to_string(),
+        "binary".to_string(),
+        format!("--only-section={section}"),
+        uki.to_string_lossy().into_owned(),
+        out.to_string_lossy().into_owned(),
+    ];
+    let result = runner.run(&argv).map_err(|e| {
+        miette::miette!(
+            "failed to run objcopy to extract {section} from {}: {e}",
+            uki.display()
+        )
+    })?;
+    if result.code != 0 {
+        return Err(miette::miette!(
+            "objcopy failed to extract {section} from {} (exit {}): {}. The prebuilt UKI \
+             does not carry the section shuttle needs to assemble its own UKI",
+            uki.display(),
+            result.code,
+            result.stderr.trim()
+        ));
+    }
+    if !out.is_file() {
+        return Err(miette::miette!(
+            "objcopy reported success but {section} of {} produced no file at {}",
+            uki.display(),
+            out.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Build-time hard gate (ADR-0024 §1): the resolved kernel's initrd must
@@ -781,6 +889,62 @@ pub(crate) fn discover_kernel_version(root: &Path) -> miette::Result<String> {
 /// the shared helper keeps one resolution behavior across shuttle.
 pub(crate) fn find_ukify() -> Option<PathBuf> {
     snap::resolve_in_path("ukify", &snap::path_entries())
+}
+
+/// The prebuilt UKI name in the real Ubuntu Core `pc-kernel` snap (#70).
+pub(crate) const KERNEL_EFI_NAME: &str = "kernel.efi";
+
+/// Resolve `objcopy` with the same bind-aware PATH resolution
+/// [`find_ukify`] uses. Needed only for the prebuilt-UKI payload fallback
+/// (#70): a `kernel.efi` has no raw `vmlinuz`/`initrd` to read.
+pub(crate) fn find_objcopy() -> Option<PathBuf> {
+    snap::resolve_in_path("objcopy", &snap::path_entries())
+}
+
+/// Length of the bzImage banner probe window. The `Linux version <ver>`
+/// string the kernel's `startup_64` writes sits near the top of the
+/// (compressed) image, well inside the first 64 KiB.
+const BZIMAGE_BANNER_WINDOW: usize = 64 * 1024;
+
+/// Read the version from a bzImage's `Linux version <ver>` banner — the
+/// uncompressed header text baked into the image. `None` when the window
+/// carries no recognizable banner (an unusual or non-bzImage payload).
+pub(crate) fn bzimage_banner_version(image: &[u8]) -> Option<String> {
+    let window = image.get(..image.len().min(BZIMAGE_BANNER_WINDOW))?;
+    let text = String::from_utf8_lossy(window);
+    let rest = text.split("Linux version ").nth(1)?;
+    let version = rest.split_whitespace().next()?;
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
+}
+
+/// Cross-check the extracted bzImage's banner against the ABI version the
+/// `modules/<ver>` tree names (#70). The module directory is authoritative
+/// — `uname -r` reports it — so a snap whose UKI was built for a different
+/// kernel fails closed rather than shipping an initrd/module mismatch.
+fn verify_bzimage_version(image: &Path, expected: &str) -> miette::Result<()> {
+    let bytes = std::fs::read(image)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading extracted kernel {}", image.display()))?;
+    let actual = bzimage_banner_version(&bytes).ok_or_else(|| {
+        miette::miette!(
+            "extracted kernel {} carries no recognizable 'Linux version' banner — cannot \
+             confirm it matches the module tree version {expected}; refusing to build a disk \
+             image that cannot boot",
+            image.display()
+        )
+    })?;
+    if actual != expected {
+        return Err(miette::miette!(
+            "kernel version mismatch: {KERNEL_EFI_NAME}'s .linux section reports '{actual}' but \
+             the module tree is modules/{expected} — the snap's UKI and modules disagree, so \
+             refusing to build a disk image that cannot boot"
+        ));
+    }
+    Ok(())
 }
 
 /// Locate the systemd sd-stub the UKI is built on.
