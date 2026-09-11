@@ -92,7 +92,7 @@ pub(crate) fn create_partitions(
 
     let mut part_start_mb = 4u64; // after GPT
     for (part_num, part) in layout.partitions.iter().enumerate() {
-        let size_mb = parse_size_mb(&part.size, total_mb - part_start_mb);
+        let size_mb = partition_size_mb(layout, part_num, total_mb, part_start_mb)?;
         let end_mb = part_start_mb + size_mb;
 
         let argv = std::iter::once("parted".to_string())
@@ -125,6 +125,54 @@ pub(crate) fn create_partitions(
         create_swap_partition(runner, img_path, swap, part_start_mb)?;
     }
     Ok(())
+}
+
+/// Size in MB for the partition at `index`, starting at `start_mb`.
+///
+/// A declared size of `"0"` means "remaining": it claims what is left after
+/// `start_mb` AND after every partition declared later plus swap. Reserving
+/// the later partitions is load-bearing — `calculate_disk_size_mb` counts
+/// swap into the total, so a grow-to-fill partition that ignored it would
+/// consume the whole device and the following `create_swap_partition`
+/// `mkpart` would run past the end (parted: "failed to create swap
+/// partition"). The verity hash partition appended by
+/// [`super::expand_ab_slots`] is reserved the same way.
+pub(crate) fn partition_size_mb(
+    layout: &DiskLayout,
+    index: usize,
+    total_mb: u64,
+    start_mb: u64,
+) -> miette::Result<u64> {
+    let reserved = reserved_after_mb(layout, index);
+    let available = total_mb.saturating_sub(start_mb).saturating_sub(reserved);
+    if layout.partitions[index].size.trim() == "0" {
+        if available == 0 {
+            return Err(miette::miette!(
+                "partition '{}' requests the remaining space but none is left: \
+                 {reserved} MB is reserved for later partitions and swap on a \
+                 {total_mb} MB disk after a {start_mb} MB start",
+                layout.partitions[index].name
+            ));
+        }
+        return Ok(available);
+    }
+    Ok(parse_size_mb(&layout.partitions[index].size, available))
+}
+
+/// Space (MB) that must remain for every partition declared after `index`
+/// plus swap, using the same placeholder [`calculate_disk_size_mb`] uses for
+/// a "0"-sized partition.
+fn reserved_after_mb(layout: &DiskLayout, index: usize) -> u64 {
+    let later: u64 = layout.partitions[index + 1..]
+        .iter()
+        .map(|p| parse_size_mb(&p.size, 1024))
+        .sum();
+    let swap = layout
+        .swap
+        .as_ref()
+        .map(|s| parse_size_mb(&s.size, 0))
+        .unwrap_or(0);
+    later + swap
 }
 
 /// Set the GPT esp flag on partition 1; a failure is reported but not
@@ -414,10 +462,11 @@ pub(crate) fn build_ext4_partition(
         .map_err(|e| miette::miette!("{tool} not found: {e}"))?;
     if out.code != 0 {
         return Err(miette::miette!(
-            "{tool} -d failed to build the {} partition '{}' (exit {})",
+            "{tool} -d failed to build the {} partition '{}' (exit {}): {}",
             part.fs,
             part.name,
-            crate::command::exit_code(&out)
+            crate::command::exit_code(&out),
+            out.stderr.trim()
         ));
     }
     Ok(())
@@ -773,4 +822,97 @@ pub(crate) fn setup_uc_context(
         seed_stage,
         boot_stage,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::SwapConfig;
+
+    fn part(name: &str, size: &str) -> Partition {
+        Partition {
+            name: name.into(),
+            size: size.into(),
+            fs: "ext4".into(),
+            mount: String::new(),
+            options: vec![],
+            role: String::new(),
+        }
+    }
+
+    /// The flagship layout: a grow-to-fill root followed by swap. The root
+    /// must leave the swap room instead of consuming the whole device.
+    #[test]
+    fn grow_to_fill_partition_reserves_a_later_swap_partition() {
+        let layout = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![part("root", "0")],
+            swap: Some(SwapConfig {
+                size: "8G".into(),
+            }),
+            ab: false,
+        };
+        // 4 (GPT) + root + 8192 (swap); root starts at 4.
+        let total = 4 + 1024 + 8192;
+        let root = partition_size_mb(&layout, 0, total, 4).unwrap();
+        assert_eq!(root, 1024, "grow-to-fill root leaves the 8G swap room");
+        assert_eq!(4 + root + 8192, total, "the ledger closes exactly");
+    }
+
+    /// A grow-to-fill partition with nothing after it still takes the rest.
+    #[test]
+    fn grow_to_fill_partition_takes_the_remainder_when_unreserved() {
+        let layout = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![part("root", "0")],
+            swap: None,
+            ab: false,
+        };
+        assert_eq!(partition_size_mb(&layout, 0, 260, 4).unwrap(), 256);
+    }
+
+    /// Declared sizes are unaffected by later reservations.
+    #[test]
+    fn declared_size_is_not_reduced_by_later_partitions() {
+        let layout = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![part("root", "512M"), part("hash", "2M")],
+            swap: None,
+            ab: false,
+        };
+        assert_eq!(partition_size_mb(&layout, 0, 4096, 4).unwrap(), 512);
+    }
+
+    /// Later "0"-sized partitions use the same 1024 MB placeholder the
+    /// total-size calculation does, so the reservation matches the ledger.
+    #[test]
+    fn later_placeholder_partition_is_reserved_at_the_documented_default() {
+        let layout = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![part("root", "0"), part("data", "0")],
+            swap: None,
+            ab: false,
+        };
+        // total = 4 + 1024 (root placeholder) + 1024 (data placeholder)
+        assert_eq!(partition_size_mb(&layout, 0, 4 + 1024 + 1024, 4).unwrap(), 1024);
+    }
+
+    /// No room left is a precise fail-closed error, never a silent 0-size
+    /// partition.
+    #[test]
+    fn grow_to_fill_with_no_room_left_fails_closed() {
+        let layout = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![part("root", "0")],
+            swap: Some(SwapConfig {
+                size: "8G".into(),
+            }),
+            ab: false,
+        };
+        let err = partition_size_mb(&layout, 0, 4 + 8192, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("no room") || err.to_string().contains("none is left"),
+            "actionable message: {err}"
+        );
+    }
 }
