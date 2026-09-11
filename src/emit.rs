@@ -48,9 +48,27 @@ pub fn write_unit(root: &Path, rel_path: &Path, text: &str) -> miette::Result<()
 /// The symlink is relative (`../<unit_name>`) so the staged rootfs stays
 /// relocatable, matching the in-tree form `systemctl enable` produces.
 pub fn enable_unit(root: &Path, target: &str, unit_name: &str) -> miette::Result<()> {
+    link_unit_into(root, target, "wants", unit_name)
+}
+
+/// Pull a unit into a target with a strong dependency by symlinking it into
+/// `etc/systemd/system/<target>.requires/<unit_name>`.
+///
+/// This is the on-disk form of systemd's `RequiredBy=<target>` (equivalently
+/// `Requires=` from the target): a failing unit blocks the target instead of
+/// merely being wanted by it. Same relative-symlink shape as
+/// [`enable_unit`], which is the `.wants/` case.
+pub fn require_unit(root: &Path, target: &str, unit_name: &str) -> miette::Result<()> {
+    link_unit_into(root, target, "requires", unit_name)
+}
+
+/// Shared body of [`enable_unit`] and [`require_unit`]: symlink `unit_name`
+/// into `etc/systemd/system/<target>.<kind>/`, relative so the staged rootfs
+/// stays relocatable (matching `systemctl enable`/`require`).
+fn link_unit_into(root: &Path, target: &str, kind: &str, unit_name: &str) -> miette::Result<()> {
     let link = root
         .join("etc/systemd/system")
-        .join(format!("{target}.wants"))
+        .join(format!("{target}.{kind}"))
         .join(unit_name);
     let parent = link.parent().expect("enablement link has a parent");
     std::fs::create_dir_all(parent)
@@ -124,6 +142,38 @@ WantedBy=multi-user.target
             std::fs::read_link(&link).unwrap(),
             PathBuf::from("../demo-srv.service"),
             "relative symlink target"
+        );
+    }
+
+    #[test]
+    fn require_unit_creates_correct_relative_symlink() {
+        // The `.requires/` form of enablement (systemd `RequiredBy=`): a
+        // failing unit blocks the target instead of merely being wanted.
+        let root = tempfile::tempdir().unwrap();
+        require_unit(
+            root.path(),
+            "boot-complete.target",
+            "shuttle-boot-health.service",
+        )
+        .unwrap();
+
+        let link = root
+            .path()
+            .join("etc/systemd/system/boot-complete.target.requires/shuttle-boot-health.service");
+        let meta = std::fs::symlink_metadata(&link)
+            .unwrap_or_else(|e| panic!("requires link missing at {}: {e}", link.display()));
+        assert!(meta.file_type().is_symlink(), "requirement is a symlink");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("../shuttle-boot-health.service"),
+            "relative symlink target"
+        );
+        assert!(
+            !root
+                .path()
+                .join("etc/systemd/system/boot-complete.target.wants")
+                .exists(),
+            "require_unit writes requires, not wants"
         );
     }
 
