@@ -38,6 +38,12 @@ fn run_env_root(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, Str
     cmd.env("SHUTTLE_POD_ROOT", root);
     cmd.current_dir(project);
     cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    // Keep pod activation off the host systemd bus (issue #66). This
+    // helper was the one spawn site the #66 sweep missed: its `pod add`
+    // reaches RuntimeStore::activate, which ran `systemctl daemon-reload`
+    // on the host bus and raised a polkit prompt (and a ~25s auth stall)
+    // on every test run.
+    cmd.env("SHUTTLE_SYSTEMD", "off");
     let out = cmd.output().expect("failed to spawn shuttle pod");
     (
         out.status.code(),

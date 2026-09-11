@@ -24,11 +24,11 @@
     ],
     "scripts": {
       "build": "cargo build",
-      "test": "cargo test",
+      "test": "SHUTTLE_SYSTEMD=off cargo test",
       "clippy": "cargo clippy -- -D warnings",
       "fmt": "cargo fmt",
       "fmt-check": "cargo fmt --check",
-      "check": "cargo test && cargo clippy -- -D warnings && cargo fmt --check"
+      "check": "SHUTTLE_SYSTEMD=off cargo test && cargo clippy -- -D warnings && cargo fmt --check"
     }
   }
 }
