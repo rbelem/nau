@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+use crate::boot_test::Accel;
+
 #[derive(Parser)]
 #[command(
     name = "shuttle",
@@ -407,6 +409,44 @@ pub enum Command {
         /// forwarded verbatim.
         #[arg(trailing_var_arg = true)]
         app_args: Vec<String>,
+    },
+
+    /// Boot a built disk image in QEMU and assert it reached userspace
+    /// (issue #50). The programmatic "did the image boot?" proof behind
+    /// try-boot/revert: exits non-zero and archives the serial console as
+    /// evidence when the assertion fails.
+    Test {
+        /// Path to the built disk image (`.img`) to boot.
+        image: String,
+
+        /// Boot timeout in seconds. QEMU is killed when it elapses; a boot
+        /// that produced the userspace markers before the kill still passes.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+
+        /// QEMU accelerator. `kvm` (default) falls back to `tcg` when KVM is
+        /// unavailable — `tcg` is software emulation (much slower).
+        #[arg(long, value_enum, default_value = "kvm")]
+        accel: Accel,
+
+        /// Write the captured serial console here (default:
+        /// `<image>.serial.log`). This is the auditable boot evidence.
+        #[arg(long)]
+        log: Option<String>,
+
+        /// Extra substring the serial log MUST contain to pass (repeatable).
+        /// Tightens the boot assertion beyond the built-in markers.
+        #[arg(long = "require")]
+        require: Vec<String>,
+
+        /// Directory holding the UEFI firmware (`OVMF_CODE.fd`/`OVMF_VARS.fd`
+        /// or the edk2 equivalents). Default: auto-discovered.
+        #[arg(long)]
+        firmware_dir: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Internal: evaluation worker process (hidden). Re-executed by the
@@ -1682,5 +1722,78 @@ mod tests {
             }
             _ => panic!("expected Pull"),
         }
+    }
+
+    // ── QEMU boot-and-assert harness (issue #50) ──
+
+    #[test]
+    fn test_test_defaults() {
+        match Cli::try_parse_from(["shuttle", "test", "disk.img"])
+            .unwrap()
+            .command
+        {
+            Command::Test {
+                image,
+                timeout,
+                accel,
+                log,
+                require,
+                firmware_dir,
+                json,
+            } => {
+                assert_eq!(image, "disk.img");
+                assert_eq!(timeout, 120);
+                assert_eq!(accel, Accel::Kvm);
+                assert!(log.is_none());
+                assert!(require.is_empty());
+                assert!(firmware_dir.is_none());
+                assert!(!json);
+            }
+            _ => panic!("expected Test"),
+        }
+    }
+
+    #[test]
+    fn test_test_flags() {
+        match Cli::try_parse_from([
+            "shuttle",
+            "test",
+            "disk.img",
+            "--timeout",
+            "300",
+            "--accel",
+            "tcg",
+            "--log",
+            "evidence.log",
+            "--require",
+            "first",
+            "--require",
+            "Reached target Multi-User System.",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Test {
+                timeout,
+                accel,
+                log,
+                require,
+                json,
+                ..
+            } => {
+                assert_eq!(timeout, 300);
+                assert_eq!(accel, Accel::Tcg);
+                assert_eq!(log.as_deref(), Some("evidence.log"));
+                assert_eq!(require, ["first", "Reached target Multi-User System."]);
+                assert!(json);
+            }
+            _ => panic!("expected Test"),
+        }
+    }
+
+    #[test]
+    fn test_test_requires_image() {
+        assert!(Cli::try_parse_from(["shuttle", "test"]).is_err());
     }
 }

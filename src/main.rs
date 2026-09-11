@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::Parser;
 use shuttle::cache::PackageCache;
@@ -193,6 +194,19 @@ fn main() -> miette::Result<()> {
             root,
             app_args,
         } => cmd_run(pod.as_deref(), root.as_deref(), &app, &app_args),
+
+        Command::Test {
+            image,
+            timeout,
+            accel,
+            log,
+            require,
+            firmware_dir,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            cmd_test(image, timeout, accel, log, require, firmware_dir, json)
+        }
 
         Command::Push {
             reference,
@@ -2333,6 +2347,133 @@ fn cmd_run(
         ));
     }
     shuttle::confine::run(&dir, pod_name, app, app_args)
+}
+
+// ── Test command (QEMU boot-and-assert, issue #50) ──
+
+/// The resolved host environment for a boot test — everything
+/// [`shuttle::boot_test::BootTest`] needs that is not a flag. Kept separate
+/// from the run so the scratch firmware dir lives across the QEMU call.
+struct TestHost {
+    qemu: PathBuf,
+    timeout_bin: PathBuf,
+    kvm_available: bool,
+    firmware: shuttle::boot_test::Firmware,
+    _scratch: tempfile::TempDir,
+}
+
+/// `shuttle test`: boot a built image in QEMU and assert it reached
+/// userspace. The host-side wrapper around [`shuttle::boot_test::run_boot`]
+/// — it resolves the QEMU/firmware/timeout environment, runs the boot
+/// through the real [`RealRunner`][shuttle::command::RealRunner], prints
+/// the verdict, and exits non-zero when the assertion fails (so this can
+/// gate CI and, later, #63's revert test).
+fn cmd_test(
+    image: String,
+    timeout: u64,
+    accel: shuttle::boot_test::Accel,
+    log: Option<String>,
+    require: Vec<String>,
+    firmware_dir: Option<String>,
+    json: bool,
+) -> miette::Result<()> {
+    let image_path = PathBuf::from(&image);
+    if !image_path.is_file() {
+        return Err(miette::miette!(
+            "image not found: {image} — build it first with `shuttle image` and pass the \
+             resulting *.img"
+        ));
+    }
+    let log_path = log
+        .map(PathBuf::from)
+        .unwrap_or_else(|| shuttle::boot_test::default_log_path(&image_path));
+    let host = resolve_test_host(firmware_dir.as_deref())?;
+
+    let test = shuttle::boot_test::BootTest {
+        image: image_path,
+        log: log_path.clone(),
+        accel,
+        timeout: Duration::from_secs(timeout),
+        firmware: host.firmware,
+        qemu: host.qemu,
+        timeout_bin: host.timeout_bin,
+        kvm_available: host.kvm_available,
+        required: require,
+    };
+
+    if !json {
+        shuttle::output::status(format!("booting {image} (accel {})...", accel.qemu_arg()));
+    }
+    let outcome = shuttle::boot_test::run_boot(&shuttle::command::RealRunner, &test)?;
+    report_test_result(&image, &log_path, &outcome, json);
+
+    if !outcome.passed() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Resolve qemu, `timeout`, KVM availability, and the UEFI firmware (with a
+/// writable VARS copy staged in the returned scratch dir).
+fn resolve_test_host(firmware_dir: Option<&str>) -> miette::Result<TestHost> {
+    let qemu = shuttle::boot_test::resolve_qemu()?;
+    let timeout_bin = shuttle::boot_test::resolve_timeout()?;
+    let scratch = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create scratch dir for firmware: {e}"))?;
+    let firmware =
+        shuttle::boot_test::prepare_firmware(&qemu, firmware_dir.map(Path::new), scratch.path())?;
+    Ok(TestHost {
+        qemu,
+        timeout_bin,
+        kvm_available: shuttle::boot_test::kvm_available(),
+        firmware,
+        _scratch: scratch,
+    })
+}
+
+/// Print the boot verdict (human or JSON) plus the evidence path.
+fn report_test_result(image: &str, log: &Path, outcome: &shuttle::boot_test::Outcome, json: bool) {
+    if json {
+        report_test_json(image, log, outcome);
+        return;
+    }
+    if outcome.passed() {
+        shuttle::output::ok(outcome.message());
+    } else {
+        shuttle::output::err(outcome.message());
+    }
+    shuttle::output::status(format!("serial evidence: {}", log.display()));
+    if !log.is_file() {
+        shuttle::output::warn(format!("no serial log was written at {}", log.display()));
+    }
+}
+
+/// `--json` boot report: the verdict, the accelerator used, the exact argv,
+/// the parsed serial evidence, and the archived log path.
+fn report_test_json(image: &str, log: &Path, outcome: &shuttle::boot_test::Outcome) {
+    let report = serde_json::json!({
+        "command": "test",
+        "image": image,
+        "log": log.display().to_string(),
+        "passed": outcome.passed(),
+        "accel": outcome.accel.qemu_arg(),
+        "timeout_secs": outcome.timeout.as_secs(),
+        "argv": outcome.argv,
+        "failure": outcome.failure.as_ref().map(|f| f.label()),
+        "message": outcome.message(),
+        "evidence": {
+            "userspace": outcome.evidence.userspace,
+            "markers": outcome.evidence.markers,
+            "target": outcome.evidence.target,
+            "service": outcome.evidence.service,
+            "panic": outcome.evidence.panic,
+            "activate": outcome.evidence.activate,
+        },
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+    );
 }
 
 /// Report the update outcome for `shuttle pod update`: a no-op says so,
