@@ -17,7 +17,9 @@
     "patchelf@latest",
     "nodejs@latest",
     "python3@latest",
-    "qemu@latest"
+    "qemu@latest",
+    "systemdUkify@latest",
+    "cryptsetup@latest"
   ],
   "shell": {
     "init_hook": [

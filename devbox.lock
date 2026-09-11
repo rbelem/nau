@@ -301,6 +301,68 @@
         }
       }
     },
+    "cryptsetup@latest": {
+      "last_modified": "2026-08-29T00:50:12Z",
+      "resolved": "github:NixOS/nixpkgs/e8be7818e19ada32105a8af937a6a473b38167ca#cryptsetup",
+      "source": "devbox-search",
+      "version": "2.8.7",
+      "systems": {
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "bin",
+              "path": "/nix/store/38f6dyj063wfns0adzm490d8gd8w2zyn-cryptsetup-2.8.7-bin",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/z0z17g2klxjly3f6jrbpyy6mrzbgj2m0-cryptsetup-2.8.7-man",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/rvl5am0qzsg3i3lqvxxkb338g0i2l6xx-cryptsetup-2.8.7-debug"
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/w519p2y7c3nl19kf4chaxrbsxqkg6afi-cryptsetup-2.8.7-dev"
+            },
+            {
+              "name": "out",
+              "path": "/nix/store/wc1l65cly7wgh4r8r6mz3g0c9ndrf7av-cryptsetup-2.8.7"
+            }
+          ],
+          "store_path": "/nix/store/38f6dyj063wfns0adzm490d8gd8w2zyn-cryptsetup-2.8.7-bin"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "bin",
+              "path": "/nix/store/h80dzawbb1dxya3vapqc1cwlg44jvlq1-cryptsetup-2.8.7-bin",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/f4zwb5czn0h4xldqxv40wb8yli1n39pf-cryptsetup-2.8.7-man",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/n33didya89qbj7ckpn4hgfcdlr4n4dwl-cryptsetup-2.8.7-dev"
+            },
+            {
+              "name": "out",
+              "path": "/nix/store/zxbpvhc7s8sw2xrcl5qqh8y0ibmj3667-cryptsetup-2.8.7"
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/bjbl8f1qx8fqb2ka90cqh7b96a5b1h3n-cryptsetup-2.8.7-debug"
+            }
+          ],
+          "store_path": "/nix/store/h80dzawbb1dxya3vapqc1cwlg44jvlq1-cryptsetup-2.8.7-bin"
+        }
+      }
+    },
     "flex@latest": {
       "last_modified": "2026-08-27T07:16:00Z",
       "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#flex",
@@ -997,6 +1059,60 @@
             }
           ],
           "store_path": "/nix/store/p42q8hjiphnms28ym8pwq7mbs9snl0f2-squashfs-4.7.5"
+        }
+      }
+    },
+    "systemdUkify@latest": {
+      "last_modified": "2026-08-27T07:16:00Z",
+      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#systemdUkify",
+      "source": "devbox-search",
+      "version": "261.2",
+      "systems": {
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/mjz8gn7fl90n6fs79py3l4jr7cwpzsfy-systemd-261.2",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/ppah1lwbra22296skvzl1720ilyxql56-systemd-261.2-man",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/kwrj3asqrzzvlpfcb2h68iyhqlyj13aq-systemd-261.2-debug"
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/asfb53kl6qc14n5g4wr6q9ax1mdqkzj1-systemd-261.2-dev"
+            }
+          ],
+          "store_path": "/nix/store/mjz8gn7fl90n6fs79py3l4jr7cwpzsfy-systemd-261.2"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/if4rihla0wz8pmkb7bakq2n49jr86gri-systemd-261.2",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/pmm8p42ymyn0q0i5krp2rp31qga7fn10-systemd-261.2-man",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/svz1a0n6lm3vqjki8ki0vgsp9his8qfi-systemd-261.2-debug"
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/svyz87nnjw5lcl91kzfnqia8n5bbh995-systemd-261.2-dev"
+            }
+          ],
+          "store_path": "/nix/store/if4rihla0wz8pmkb7bakq2n49jr86gri-systemd-261.2"
         }
       }
     }
