@@ -50,13 +50,26 @@
 //! # Strict mode: boot-complete.target
 //!
 //! An image built with an A/B disk and an `update_source` additionally emits
-//! `boot-complete.target` and a health gate (ADR-0024 §3), and reaching that
-//! target is what clears the try-boot counters. For those images the strongest
-//! assertion is `--require "Reached target Boot Completion Check"` — the line
-//! systemd prints when the target is reached, and the same condition the
-//! device's own revert logic waits on. It is not the default because a
-//! single-slot image emits no such target, and a default must hold for every
-//! image, not only the A/B ones.
+//! `boot-complete.target` and a health gate (ADR-0024 §3), and the target line
+//! is available as `--require "Reached target Boot Completion Check"`.
+//!
+//! **That line is not proof that the try-boot machinery ran.** It is reached
+//! whenever the health unit does not hard-fail, whether or not boot counting
+//! was ever in effect: the factory UKI is installed counterless
+//! (`{name}_{version}.efi`, no `+N-M` suffix — `src/image/boot.rs`), and
+//! `systemd-bless-boot-generator` only pulls `systemd-bless-boot.service` into
+//! the initial transaction when the *selected* entry carries counters. The
+//! counters are written by `systemd-sysupdate` at install time. So on an image
+//! that has never taken a real update, the target is reached with nothing to
+//! mark good and nothing to count down.
+//!
+//! Asserting the machinery therefore requires the ESP, not the console: the
+//! authoritative evidence is the UKI filename losing (or shedding) its `+N-M`
+//! suffix. The serial line conflates "the target was reached" with "the
+//! counter cleared", and those are different claims (see #63).
+//!
+//! It is not the default because a single-slot image emits no such target, and
+//! a default must hold for every image, not only the A/B ones.
 //!
 //! # Timeout seam
 //!
@@ -934,6 +947,9 @@ SHUTTLE-INIT: switch-root\n\
     /// the emitted unit text and assert the description is the one the marker
     /// expects; if either side moves, this fails rather than silently never
     /// matching.
+    ///
+    /// This pins the *string*, not the machinery: reaching the target does not
+    /// by itself prove boot counting was in effect. See the module docs.
     #[test]
     fn boot_complete_marker_matches_the_emitted_target_description() {
         let unit = crate::image::boot_complete_target_content();
