@@ -855,6 +855,10 @@ pub(crate) fn build_disk_image_with(
     // emission — a plain native image is byte-comparable to before.
     // Written here, BEFORE root populate + dm-verity, so /etc/fstab and
     // the tmpfiles land inside the hashed tree.
+    // The doctor readiness twin (issue #65): warn-never-fail, unlike the
+    // fail-closed `resolve_state_split` below. Reports on the same
+    // condition so the build output carries the doctor's named finding.
+    doctor::audit_state_partition(image, disk_layout);
     if needs_state_split(image, disk_layout) {
         let split = resolve_state_split(image, disk_layout)?;
         emit_state_split(&root, &split)?;
@@ -885,6 +889,14 @@ pub(crate) fn build_disk_image_with(
             // own disk is a brick, not a warning. The config is re-read
             // from the extracted kernel-snap tree (staging keeps it alive).
             let config_dir = kernel_snap_dir.as_ref().map(|d| d.path()).unwrap_or(&root);
+            // Doctor's initrd inventory report line (issue #65) —
+            // warn-never-fail; the gate below is the hard one.
+            doctor::audit_kernel_initrd_modules(
+                runner,
+                config_dir,
+                &payload.version,
+                &payload.initrd,
+            );
             audit_initrd_modules(runner, config_dir, payload)?;
         }
     }

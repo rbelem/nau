@@ -87,6 +87,13 @@ const SANDBOX_TOOLS: [(&str, &str); 3] = [
 ];
 
 /// Run all system checks. Returns a list of results.
+///
+/// Host-only checks live here. Checks that need an [`ImageDeclaration`] (the
+/// state-partition readiness and the initrd module inventory) cannot run in
+/// this host-readiness command — `doctor` is invoked with no image — so they
+/// are exposed as builder-context functions called from the image build with
+/// the image in hand, mirroring [`audit_kernel_verity_config`]
+/// (`src/image/mod.rs`). Both never fail the build; they add a report line.
 pub fn run_all() -> Vec<Check> {
     let mut checks = vec![
         check_cmd(
@@ -104,6 +111,7 @@ pub fn run_all() -> Vec<Check> {
         check_ukify(),
         check_efi_stub(),
         check_veritysetup(),
+        check_sysupdate_prereqs(),
     ];
     checks.extend(check_sandbox_tools_with(&snap::path_entries()));
     checks
@@ -177,6 +185,139 @@ fn check_veritysetup() -> Check {
             "kernel disk images need veritysetup for dm-verity (cryptsetup >= 2.4) — \
              e.g. apt install cryptsetup, or add cryptsetup to devbox.json packages",
         ),
+    }
+}
+
+// ── systemd-sysupdate prerequisites (ADR-0024 §1–§2) ──
+
+/// Minimum systemd major version that reads `*.transfer` transfer files
+/// from `sysupdate.d`. As of v257 transfer definitions carry the
+/// `.transfer` extension; <=256 reads `*.conf`, so the `.transfer` files
+/// shuttle emits are silently ignored on an older systemd (systemd-devel
+/// v257.5 report; `sysupdate.d(5)`).
+const SYSUPDATE_TRANSFER_MIN_MAJOR: u32 = 257;
+
+/// Parse the systemd major version from `systemd-sysupdate --version` /
+/// `systemctl --version` output. The first line is `systemd <major>
+/// (<full>)`; the major is the leading integer of the second field. Never
+/// panics: an empty, malformed, or non-numeric version yields `None`.
+fn parse_systemd_major(version_output: &str) -> Option<u32> {
+    let first = version_output.lines().next()?;
+    let second = first.split_whitespace().nth(1)?;
+    // The field is `<major>` or `<major> (<full>)`; take the leading digits.
+    let digits: String = second.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+/// Check the prerequisites of the emitted `systemd-sysupdate` trigger pair
+/// (ADR-0024 §2): the `systemd-sysupdate` binary, `bootctl` (the rollback
+/// path runs `bootctl set-default` in `src/runtime.rs`), and systemd >=
+/// 257 (`.transfer` definitions are silently unread on <=256).
+///
+/// Warn-never-fail: every outcome is a report status. The version is read
+/// from `systemd-sysupdate --version` when the binary exists, falling back
+/// to `systemctl --version`; an undetectable or unparseable version warns
+/// rather than panics.
+fn check_sysupdate_prereqs() -> Check {
+    check_sysupdate_version().into()
+}
+
+/// One [`Check`] for the whole sysupdate prerequisite set, naming the
+/// missing piece precisely.
+fn check_sysupdate_version() -> SysupdatePrereq {
+    let Some(sysupdate) = snap::resolve_in_path("systemd-sysupdate", &snap::path_entries()) else {
+        return SysupdatePrereq::MissingBinary;
+    };
+    if snap::resolve_in_path("bootctl", &snap::path_entries()).is_none() {
+        return SysupdatePrereq::MissingBootctl;
+    }
+    let version = std::process::Command::new(&sysupdate)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .or_else(|| {
+            std::process::Command::new("systemctl")
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        });
+    match version {
+        Some(text) => match parse_systemd_major(&text) {
+            Some(major) if major >= SYSUPDATE_TRANSFER_MIN_MAJOR => {
+                SysupdatePrereq::Ready { major }
+            }
+            Some(major) => SysupdatePrereq::TooOld { major },
+            None => SysupdatePrereq::Undetectable {
+                reason: format!("unparseable version output: {:?}", text.trim()),
+            },
+        },
+        None => SysupdatePrereq::Undetectable {
+            reason: "running 'systemd-sysupdate --version' and 'systemctl --version' \
+                     both failed"
+                .to_string(),
+        },
+    }
+}
+
+/// Outcome of [`check_sysupdate_version`].
+#[derive(Debug, PartialEq, Eq)]
+enum SysupdatePrereq {
+    /// Binary present, systemd new enough to read `.transfer` definitions.
+    Ready { major: u32 },
+    /// `systemd-sysupdate` is not on PATH.
+    MissingBinary,
+    /// `bootctl` is not on PATH — the rollback path cannot select a boot entry.
+    MissingBootctl,
+    /// systemd is present but older than [`SYSUPDATE_TRANSFER_MIN_MAJOR`].
+    TooOld { major: u32 },
+    /// The version could not be read or parsed.
+    Undetectable { reason: String },
+}
+
+impl From<SysupdatePrereq> for Check {
+    fn from(prereq: SysupdatePrereq) -> Check {
+        match prereq {
+            SysupdatePrereq::Ready { major } => Check::ok_at(
+                "systemd-sysupdate",
+                format!("systemd {major} reads *.transfer definitions (needs >= 257)"),
+            ),
+            SysupdatePrereq::MissingBinary => Check::missing(
+                "systemd-sysupdate",
+                "the emitted systemd-sysupdate.timer/service pair needs the \
+                 systemd-sysupdate binary — install systemd >= 257",
+            ),
+            SysupdatePrereq::MissingBootctl => Check::missing(
+                "bootctl",
+                "the sysupdate rollback path runs 'bootctl set-default' — install \
+                 systemd-boot (systemd >= 257)",
+            ),
+            SysupdatePrereq::TooOld { major } => Check::error(
+                "systemd-sysupdate",
+                format!(
+                    "systemd {major} reads sysupdate.d/*.conf, but shuttle emits \
+                     *.transfer — transfer definitions are only read from systemd {min}+; \
+                     upgrade systemd to {min} or newer",
+                    min = SYSUPDATE_TRANSFER_MIN_MAJOR,
+                ),
+            ),
+            SysupdatePrereq::Undetectable { reason } => Check::error(
+                "systemd-sysupdate",
+                format!(
+                    "cannot determine the systemd version ({reason}) — shuttle emits \
+                     *.transfer definitions, which only systemd {min}+ reads; verify the \
+                     target has systemd {min} or newer",
+                    min = SYSUPDATE_TRANSFER_MIN_MAJOR,
+                ),
+            ),
+        }
     }
 }
 
@@ -572,44 +713,154 @@ pub(crate) fn inspect_initrd_modules(
 }
 
 /// Audit the kernel initrd for the boot-chain modules its config requires
-/// (ADR-0024 §1). Non-fatal twin of the build gate: warns — NEVER fails —
-/// so `doctor` can report the same finding the image build enforces.
-/// `payload_dir` is searched for the config ([`find_kernel_config`]);
-/// `initrd` is the resolved kernel's initrd.
+/// (ADR-0024 §1) and yield a [`Check`] for the doctor report surface.
+/// Non-fatal twin of the build gate: warns — NEVER fails — so `doctor` can
+/// report the same finding the image build enforces. `payload_dir` is
+/// searched for the config ([`find_kernel_config`]); `initrd` is the
+/// resolved kernel's initrd. Needs the kernel payload, so it is called from
+/// the image build — not from the host-only [`run_all`].
 pub fn audit_kernel_initrd_modules(
     runner: &dyn CommandRunner,
     payload_dir: &Path,
     kernel_version: &str,
     initrd: &Path,
-) -> InitrdModuleAudit {
+) -> Check {
     let outcome = inspect_initrd_modules(runner, payload_dir, kernel_version, initrd);
-    match &outcome {
-        InitrdModuleAudit::Satisfied(modules) if modules.is_empty() => eprintln!(
-            "  ✓ kernel {kernel_version} initrd: no boot-chain modules required \
-             (all built in)"
+    initrd_modules_check(kernel_version, &outcome)
+}
+
+// ── Builder-context readiness checks (need the image in hand) ──
+
+/// Render the state-partition readiness result as a [`Check`]. Pure so the
+/// pass/warn mapping is unit-testable without a full [`ImageDeclaration`].
+///
+/// `needs_split` is [`crate::image::needs_state_split`]; `state_present` is
+/// whether any declared partition carries the state role. A `Ok` when the
+/// split is not requested, or when it is requested and a state partition
+/// exists; `Missing` naming the affected paths when it is requested but
+/// absent (the build fails closed on this via `resolve_state_split`).
+fn state_partition_check(
+    image_name: &str,
+    needs_split: bool,
+    state_present: bool,
+    paths: [&str; 2],
+) -> Check {
+    if !needs_split {
+        return Check::ok_at(
+            "state partition",
+            "not requested (no state role, no update_source) — no /var split",
+        );
+    }
+    if state_present {
+        return Check::ok_at(
+            "state partition",
+            format!(
+                "declared; {} and {} persist across A/B flips",
+                paths[0], paths[1]
+            ),
+        );
+    }
+    Check::missing(
+        "state partition",
+        format!(
+            "image '{image_name}' needs the /var split (state role or update_source) but \
+             the disk layout declares no role = \"state\" partition — {} and {} would live \
+             in the read-only verity root and be lost on the first A/B flip; declare a \
+             state partition (the build fails closed on this)",
+            paths[0], paths[1]
         ),
-        InitrdModuleAudit::Satisfied(modules) => eprintln!(
-            "  ✓ kernel {kernel_version} initrd carries the boot-chain modules: {}",
-            modules.join(", ")
+    )
+}
+
+/// Builder-context readiness check for the state partition (ADR-0023,
+/// issue #65). Needs the [`ImageDeclaration`] and its [`DiskLayout`], which
+/// the host-only [`run_all`] has no access to — so this is called from the
+/// image build with the image in hand, mirroring
+/// [`audit_kernel_verity_config`]. Warn-never-fail: prints a report line
+/// and returns the [`Check`]; the build's own fail-closed path is
+/// `resolve_state_split`, untouched here.
+pub fn audit_state_partition(
+    image: &crate::image::ImageDeclaration,
+    layout: &crate::image::DiskLayout,
+) -> Check {
+    let needs_split = crate::image::needs_state_split(image, layout);
+    let state_present = layout
+        .partitions
+        .iter()
+        .any(crate::image::is_state_partition);
+    let check = state_partition_check(
+        &image.name,
+        needs_split,
+        state_present,
+        crate::image::state_dirs(),
+    );
+    match &check.status {
+        CheckStatus::Ok => eprintln!("  ✓ doctor: state partition — {}", hint_of(&check)),
+        _ => eprintln!("  ⚠ doctor: state partition — {}", hint_of(&check)),
+    }
+    check
+}
+
+/// `hint` for a report line, or a fallback when a check carries none.
+fn hint_of(check: &Check) -> &str {
+    check.hint.as_deref().unwrap_or("ok")
+}
+
+/// Render an [`InitrdModuleAudit`] as a [`Check`]. Pure so the
+/// Satisfied/Missing/NoConfig/Unreadable mapping is unit-testable without a
+/// real initrd.
+fn initrd_module_check_for(kernel_version: &str, outcome: &InitrdModuleAudit) -> Check {
+    match outcome {
+        InitrdModuleAudit::Satisfied(modules) if modules.is_empty() => Check::ok_at(
+            "initrd module inventory",
+            format!("kernel {kernel_version} builds the boot chain in — no modules required"),
         ),
-        InitrdModuleAudit::Missing { config, missing } => eprintln!(
-            "  ⚠ kernel {kernel_version} initrd is missing boot-chain module(s): {} \
-             (required by {}) — the kernel cannot see its own disk at boot",
-            missing.join(", "),
-            config.display()
+        InitrdModuleAudit::Satisfied(modules) => Check::ok_at(
+            "initrd module inventory",
+            format!(
+                "kernel {kernel_version} initrd carries: {}",
+                modules.join(", ")
+            ),
         ),
-        InitrdModuleAudit::NoConfig => eprintln!(
-            "  ⚠ no kernel config for {kernel_version} under {} — cannot confirm the \
-             initrd carries the boot-chain modules (the build gate fails closed here)",
-            payload_dir.display()
+        InitrdModuleAudit::Missing { config, missing } => Check::missing(
+            "initrd module inventory",
+            format!(
+                "kernel {kernel_version} initrd is missing boot-chain module(s): {} \
+                 (required by {}) — the kernel cannot see its own disk at boot",
+                missing.join(", "),
+                config.display()
+            ),
         ),
-        InitrdModuleAudit::Unreadable(reason) => eprintln!(
-            "  ⚠ kernel {kernel_version} initrd {} could not be read: {reason}",
-            initrd.display()
+        InitrdModuleAudit::NoConfig => Check::missing(
+            "initrd module inventory",
+            format!(
+                "no kernel config for {kernel_version} — cannot derive the required \
+                 boot-chain modules and confirm the initrd carries them"
+            ),
+        ),
+        InitrdModuleAudit::Unreadable(reason) => Check::error(
+            "initrd module inventory",
+            format!("kernel {kernel_version} initrd could not be read: {reason}"),
         ),
     }
-    outcome
 }
+
+/// Build an initrd-inventory [`Check`] from an already-computed
+/// [`InitrdModuleAudit`] outcome and print its report line. Split from
+/// [`inspect_initrd_modules`] so the build computes the audit ONCE and both
+/// renders it here and applies its own hard gate — no duplicate
+/// decompression. Warn-never-fail: the hard gate is the build's own
+/// `audit_initrd_modules`.
+pub fn initrd_modules_check(kernel_version: &str, outcome: &InitrdModuleAudit) -> Check {
+    let check = initrd_module_check_for(kernel_version, outcome);
+    match &check.status {
+        CheckStatus::Ok => eprintln!("  ✓ doctor: {} — {}", check.name, hint_of(&check)),
+        _ => eprintln!("  ⚠ doctor: {} — {}", check.name, hint_of(&check)),
+    }
+    check
+}
+
+// ── Host tooling checks ──
 
 /// Check bubblewrap with a basic no-op invocation.
 fn check_bwrap() -> Check {
@@ -1329,5 +1580,221 @@ CONFIG_EXT4_FS=y
             inspect_initrd_modules(&runner, config.path(), "6.8.0", &initrd),
             InitrdModuleAudit::Satisfied(Vec::new())
         );
+    }
+
+    // ── systemd-sysupdate prerequisites (#65) ──
+
+    #[test]
+    fn run_all_includes_sysupdate_prereq_check() {
+        let checks = run_all();
+        assert!(
+            checks.iter().any(|c| c.name == "systemd-sysupdate"),
+            "missing systemd-sysupdate readiness check"
+        );
+    }
+
+    #[test]
+    fn sysupdate_check_carries_a_hint() {
+        // Whichever branch the host lands on, a non-Ok check names the fix
+        // (the report invariant) and an Ok check explains itself.
+        let check = check_sysupdate_prereqs();
+        assert!(check.hint.is_some(), "check must carry a hint: {check:?}");
+        if !matches!(check.status, CheckStatus::Ok) {
+            let hint = check.hint.as_deref().unwrap_or_default();
+            assert!(
+                hint.contains("257") || hint.contains("systemd"),
+                "hint must name the fix: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_systemd_major_reads_major_from_version_line() {
+        assert_eq!(
+            parse_systemd_major("systemd 261 (261.2)\n+PAM ...\n"),
+            Some(261)
+        );
+        assert_eq!(parse_systemd_major("systemd 256 (256.4)"), Some(256));
+        assert_eq!(parse_systemd_major("systemd 257"), Some(257));
+    }
+
+    #[test]
+    fn parse_systemd_major_never_panics_on_garbage() {
+        assert_eq!(parse_systemd_major(""), None);
+        assert_eq!(parse_systemd_major("no version here"), None);
+        assert_eq!(parse_systemd_major("systemd"), None);
+        assert_eq!(parse_systemd_major("systemd (nope)"), None);
+    }
+
+    #[test]
+    fn sysupdate_version_at_or_above_257_is_ok() {
+        let check: Check = SysupdatePrereq::Ready { major: 257 }.into();
+        assert!(matches!(check.status, CheckStatus::Ok));
+        assert!(check.hint.as_deref().unwrap_or_default().contains("257"));
+    }
+
+    #[test]
+    fn sysupdate_version_below_257_warns_with_precise_hint() {
+        let check: Check = SysupdatePrereq::TooOld { major: 256 }.into();
+        assert!(matches!(check.status, CheckStatus::Error));
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("256") && hint.contains("257") && hint.contains(".transfer"),
+            "hint must name the detected and required versions and the cause: {hint}"
+        );
+    }
+
+    #[test]
+    fn sysupdate_version_undetectable_warns_never_panics() {
+        let check: Check = SysupdatePrereq::Undetectable {
+            reason: "unparseable".into(),
+        }
+        .into();
+        assert!(matches!(check.status, CheckStatus::Error));
+        assert!(check.hint.as_deref().unwrap_or_default().contains("257"));
+    }
+
+    #[test]
+    fn sysupdate_missing_binary_and_bootctl_name_the_fix() {
+        let missing_bin: Check = SysupdatePrereq::MissingBinary.into();
+        assert!(matches!(missing_bin.status, CheckStatus::Missing));
+        assert!(missing_bin
+            .hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("systemd-sysupdate"));
+
+        let missing_bootctl: Check = SysupdatePrereq::MissingBootctl.into();
+        assert!(matches!(missing_bootctl.status, CheckStatus::Missing));
+        assert!(missing_bootctl
+            .hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("bootctl"));
+    }
+
+    // ── State-partition readiness (#65) ──
+
+    #[test]
+    fn state_partition_not_requested_is_ok() {
+        let check = state_partition_check(
+            "img",
+            false,
+            false,
+            ["/var/lib/shuttle", "/var/lib/extensions"],
+        );
+        assert!(matches!(check.status, CheckStatus::Ok));
+        assert!(check.hint.is_some());
+    }
+
+    #[test]
+    fn state_partition_requested_and_present_is_ok() {
+        let check = state_partition_check(
+            "img",
+            true,
+            true,
+            ["/var/lib/shuttle", "/var/lib/extensions"],
+        );
+        assert!(matches!(check.status, CheckStatus::Ok));
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("/var/lib/shuttle"),
+            "hint names the paths: {hint}"
+        );
+    }
+
+    #[test]
+    fn state_partition_requested_but_absent_names_the_paths() {
+        let check = state_partition_check(
+            "img",
+            true,
+            false,
+            ["/var/lib/shuttle", "/var/lib/extensions"],
+        );
+        assert!(matches!(check.status, CheckStatus::Missing));
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("/var/lib/shuttle") && hint.contains("/var/lib/extensions"),
+            "hint must name the affected paths: {hint}"
+        );
+        assert!(hint.contains("img"), "hint names the image: {hint}");
+    }
+
+    // ── Initrd module inventory as a Check (#65) ──
+
+    #[test]
+    fn initrd_inventory_satisfied_lists_modules() {
+        let outcome = InitrdModuleAudit::Satisfied(vec!["ext4".into(), "virtio_blk".into()]);
+        let check = initrd_module_check_for("6.8.0", &outcome);
+        assert!(matches!(check.status, CheckStatus::Ok));
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("ext4") && hint.contains("virtio_blk"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn initrd_inventory_all_built_in_is_ok() {
+        let check = initrd_module_check_for("6.8.0", &InitrdModuleAudit::Satisfied(Vec::new()));
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn initrd_inventory_missing_names_modules_and_config() {
+        let outcome = InitrdModuleAudit::Missing {
+            config: PathBuf::from("/payload/boot/config-6.8.0"),
+            missing: vec!["virtio_blk".into()],
+        };
+        let check = initrd_module_check_for("6.8.0", &outcome);
+        assert!(matches!(check.status, CheckStatus::Missing));
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("virtio_blk"), "names the module: {hint}");
+        assert!(hint.contains("config-6.8.0"), "names the config: {hint}");
+    }
+
+    #[test]
+    fn initrd_inventory_no_config_and_unreadable_warn_with_hints() {
+        let no_config = initrd_module_check_for("6.8.0", &InitrdModuleAudit::NoConfig);
+        assert!(matches!(no_config.status, CheckStatus::Missing));
+        assert!(no_config.hint.is_some());
+
+        let unreadable =
+            initrd_module_check_for("6.8.0", &InitrdModuleAudit::Unreadable("bad magic".into()));
+        assert!(matches!(unreadable.status, CheckStatus::Error));
+        assert!(unreadable
+            .hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("bad magic"));
+    }
+
+    #[test]
+    fn initrd_inventory_check_never_fails_the_caller() {
+        // The Check is a report status, not a Result: even a Missing
+        // outcome is returned (never an Err), which is what makes the
+        // builder-context call warn-never-fail.
+        let config = config_with("CONFIG_VIRTIO_BLK=m\n");
+        let initrd = config.path().join("boot").join("initrd.img-6.8.0");
+        std::fs::write(&initrd, newc_archive(&[("kernels/6.8.0/ext4.ko", b"k")])).unwrap();
+        let runner = DecompressRunner::new(Vec::new(), 0);
+        let check = audit_kernel_initrd_modules(&runner, config.path(), "6.8.0", &initrd);
+        assert!(matches!(check.status, CheckStatus::Missing));
+        assert!(check.hint.is_some());
+    }
+
+    #[test]
+    fn doctor_report_smoke_renders_all_new_checks() {
+        let checks = run_all();
+        let mut with_builder = checks;
+        with_builder.push(Check::missing("state partition", "declare role = state"));
+        with_builder.push(Check::error(
+            "initrd module inventory",
+            "missing virtio_blk",
+        ));
+        // print_report must render every status without panicking, and must
+        // keep reporting a non-Ok result through all_ok.
+        print_report(&with_builder);
+        assert!(!all_ok(&with_builder));
     }
 }
