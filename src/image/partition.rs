@@ -570,11 +570,13 @@ pub(crate) fn populate_remaining_partitions(
 
 /// Build one non-root partition as a standalone file and splice it in:
 /// the ESP (partition 1, vfat) is mkfs.vfat'd and populated with mtools
-/// from the staged EFI tree; other data partitions receive the staged
-/// rootfs via `mkfs.ext4 -d`. Failures here leave the partition
-/// unpopulated (historical warn-not-fatal side-partition behavior); a
-/// btrfs (or other unpopulatable) filesystem fails closed
-/// ([`refuse_non_ext4_vfat`]).
+/// from the staged EFI tree; a `role = "state"` partition is mkfs.ext4'd
+/// EMPTY (a boot-populated persistence surface, never a rootfs copy);
+/// other data partitions receive the staged rootfs via `mkfs.ext4 -d`.
+/// Failures on the data/ESP paths leave the partition unpopulated
+/// (historical warn-not-fatal side-partition behavior), while a state
+/// populate failure fails closed; a btrfs (or other unpopulatable)
+/// filesystem always fails closed ([`refuse_non_ext4_vfat`]).
 pub(crate) fn populate_side_partition(
     runner: &dyn CommandRunner,
     ctx: &PopulateCtx,
@@ -590,12 +592,43 @@ pub(crate) fn populate_side_partition(
     // rootfs" routing for those partitions.
     if let Some(stage) = ctx.uc_route_stage(part) {
         build_staged_partition(runner, &part_file, part, stage, extent)?;
+    } else if super::is_state_partition(part) {
+        build_state_partition(runner, ctx, &part_file, part, extent)?;
     } else if index == 0 && part.fs == "vfat" {
         build_esp_partition(runner, ctx, &part_file, part)?;
     } else {
         build_data_partition(runner, ctx, &part_file, part, extent)?;
     }
     splice_into(&ctx.scratch_dir.join("disk.img"), &part_file, extent)
+}
+
+/// mkfs an EMPTY ext4 filesystem for a `role = "state"` partition
+/// (ADR-0023). The state surface is populated at BOOT by tmpfiles
+/// (`/var/lib/shuttle`, `/var/lib/extensions`) — its correct build-time
+/// content is nothing at all. Populating it from `ctx.root` (the data
+/// path) filled the whole partition with the ~3 GiB rootfs and overflowed
+/// a modest state extent, leaving a zeroed partition where fstab mounts
+/// `PARTLABEL=state`. Failure is FATAL, unlike the historical
+/// warn-not-fatal data behavior: an unformatted state partition is a
+/// mount target on the boot path, so a silently-zeroed one wedges boot.
+pub(crate) fn build_state_partition(
+    runner: &dyn CommandRunner,
+    ctx: &PopulateCtx,
+    part_file: &Path,
+    part: &Partition,
+    extent: &PartitionExtent,
+) -> miette::Result<()> {
+    let empty = ctx.scratch_dir.join("state-staging");
+    std::fs::create_dir_all(&empty)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("creating the empty state staging dir {}", empty.display()))?;
+    build_ext4_partition(runner, part_file, &empty, part, extent, false)
+        .wrap_err_with(|| format!("state partition '{}' populate failed", part.name))?;
+    eprintln!(
+        "  ✓ {}: {} formatted empty (state, boot-populated)",
+        part.name, part.fs
+    );
+    Ok(())
 }
 
 /// mkfs.vfat the standalone ESP file and copy the staged boot tree on with
@@ -912,6 +945,168 @@ mod tests {
         assert!(
             err.to_string().contains("no room") || err.to_string().contains("none is left"),
             "actionable message: {err}"
+        );
+    }
+
+    // ── State partition populate routing + fail-closed (ADR-0023) ──
+
+    /// A runner that records every argv and answers each tool with a
+    /// scripted exit code — enough to drive the ext4 `mkfs -d` seam with
+    /// no real filesystem tooling.
+    struct RecordingRunner {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        mkfs_code: i32,
+    }
+
+    impl RecordingRunner {
+        fn new(mkfs_code: i32) -> RecordingRunner {
+            RecordingRunner {
+                calls: std::sync::Mutex::new(Vec::new()),
+                mkfs_code,
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::command::CommandRunner for RecordingRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            let code = if argv.first().is_some_and(|p| p == "mkfs.ext4") {
+                self.mkfs_code
+            } else {
+                0
+            };
+            Ok(crate::command::RunnerOutput {
+                code,
+                stdout: Vec::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn extent(size_bytes: u64) -> PartitionExtent {
+        PartitionExtent {
+            start_bytes: 1 << 20,
+            size_bytes,
+            partuuid: None,
+        }
+    }
+
+    /// The scratch disk image `splice_into` writes into — a sparse file at
+    /// the partition's offset + size.
+    fn scratch_disk(scratch: &Path, size_bytes: u64) {
+        std::fs::File::create(scratch.join("disk.img"))
+            .unwrap()
+            .set_len((1 << 20) + size_bytes)
+            .unwrap();
+    }
+
+    /// The `-d` source of the sole recorded `mkfs.ext4` invocation.
+    fn mkfs_d_source(calls: &[Vec<String>]) -> String {
+        calls
+            .iter()
+            .find(|c| c.first().is_some_and(|p| p == "mkfs.ext4"))
+            .and_then(|c| c.iter().position(|a| a == "-d").map(|i| c[i + 1].clone()))
+            .expect("a mkfs.ext4 -d invocation was recorded")
+    }
+
+    /// A state partition is mkfs'd from an EMPTY staged dir — never the
+    /// rootfs tree — so the boot-populated surface cannot overflow with a
+    /// full rootfs copy.
+    #[test]
+    fn state_partition_populates_from_an_empty_stage_not_the_rootfs() {
+        let scratch = tempfile::tempdir().unwrap();
+        scratch_disk(scratch.path(), 4 * 1024 * 1024 * 1024);
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::write(rootfs.path().join("kernel.img"), b"rootfs payload").unwrap();
+        let runner = RecordingRunner::new(0);
+        let mut state = part("state", "4G");
+        state.role = "state".into();
+        let image = crate::image::test_support::sample_image();
+        let ctx = PopulateCtx {
+            image: &image,
+            extents: &[extent(4 * 1024 * 1024 * 1024)],
+            scratch_dir: scratch.path(),
+            root: rootfs.path(),
+            uki: None,
+            uki_stage: Path::new(""),
+            uc: None,
+        };
+
+        populate_side_partition(&runner, &ctx, 0, &state).unwrap();
+
+        let source = mkfs_d_source(&runner.calls());
+        assert_ne!(
+            source,
+            rootfs.path().to_string_lossy(),
+            "the state partition must not be populated from the rootfs"
+        );
+        let staged = Path::new(&source);
+        assert!(staged.is_dir(), "the -d source is a real dir: {source}");
+        assert_eq!(
+            std::fs::read_dir(staged).unwrap().count(),
+            0,
+            "the state staging dir is empty: {source}"
+        );
+    }
+
+    /// A state-partition populate failure is FATAL (fail-closed): a zeroed
+    /// state partition is a mount target on the boot path.
+    #[test]
+    fn state_partition_populate_failure_fails_closed() {
+        let scratch = tempfile::tempdir().unwrap();
+        scratch_disk(scratch.path(), 4 * 1024 * 1024 * 1024);
+        let rootfs = tempfile::tempdir().unwrap();
+        let runner = RecordingRunner::new(1);
+        let mut state = part("state", "4G");
+        state.role = "state".into();
+        let image = crate::image::test_support::sample_image();
+        let ctx = PopulateCtx {
+            image: &image,
+            extents: &[extent(4 * 1024 * 1024 * 1024)],
+            scratch_dir: scratch.path(),
+            root: rootfs.path(),
+            uki: None,
+            uki_stage: Path::new(""),
+            uc: None,
+        };
+
+        let err = populate_side_partition(&runner, &ctx, 0, &state).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("state partition 'state' populate failed"),
+            "the failure names the state partition: {err:#}"
+        );
+    }
+
+    /// An ordinary data-partition populate failure still warns and returns
+    /// Ok (the historical side-partition behavior this fix must not change).
+    #[test]
+    fn data_partition_populate_failure_still_warns_and_succeeds() {
+        let scratch = tempfile::tempdir().unwrap();
+        scratch_disk(scratch.path(), 4 * 1024 * 1024 * 1024);
+        let rootfs = tempfile::tempdir().unwrap();
+        let runner = RecordingRunner::new(1);
+        let data = part("data", "4G");
+        let image = crate::image::test_support::sample_image();
+        let ctx = PopulateCtx {
+            image: &image,
+            extents: &[extent(4 * 1024 * 1024 * 1024)],
+            scratch_dir: scratch.path(),
+            root: rootfs.path(),
+            uki: None,
+            uki_stage: Path::new(""),
+            uc: None,
+        };
+
+        populate_side_partition(&runner, &ctx, 0, &data)
+            .expect("data populate warns, does not fail");
+        assert_eq!(
+            mkfs_d_source(&runner.calls()),
+            rootfs.path().to_string_lossy(),
+            "an ordinary data partition still populates from the rootfs"
         );
     }
 }

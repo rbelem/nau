@@ -780,8 +780,14 @@ pub(crate) fn build_disk_image_with(
     // actually run systemd-sysupdate, so the definitions and their trigger
     // cannot drift apart. One predicate drives the pair.
     if emits_sysupdate(image, disk_layout) {
+        // ADR-0024 §3: the ESP-writing consumers carry
+        // `RequiresMountsFor=<esp>` — a `nofail` ESP mount is only a
+        // `wants` in local-fs.target with no ordering relationship, so the
+        // UKI transfer (PathRelativeTo=boot) and bless-boot's rename would
+        // otherwise race the mount.
+        let esp_mount = esp_mount_point(disk_layout);
         write_sysupdate_transfers(&root, image, disk_layout)?;
-        emit_sysupdate_units(&root)?;
+        emit_sysupdate_units(&root, esp_mount)?;
         // The transfers carry ProtectVersion=%A, which resolves to the
         // running system's os-release IMAGE_VERSION= (not VERSION_ID=).
         // Without this the specifier is empty and ProtectVersion protects
@@ -799,6 +805,7 @@ pub(crate) fn build_disk_image_with(
                 .boot_health_exec
                 .as_deref()
                 .unwrap_or(BOOT_HEALTH_EXEC),
+            esp_mount,
         )?;
     } else if disk_layout.ab {
         eprintln!(
@@ -890,9 +897,19 @@ pub(crate) fn build_disk_image_with(
     // fail-closed `resolve_state_split` below. Reports on the same
     // condition so the build output carries the doctor's named finding.
     doctor::audit_state_partition(image, disk_layout);
-    if needs_state_split(image, disk_layout) {
-        let split = resolve_state_split(image, disk_layout)?;
-        emit_state_split(&root, &split)?;
+    // ADR-0024 §3: a declared non-root mount (notably the ESP) must reach
+    // /etc/fstab or `systemd-bless-boot good` cannot find the ESP. The
+    // fstab is emitted when EITHER a declared mount exists OR the state
+    // split is needed; `mounts::fstab_content` composes both in one file.
+    let declared = declared_mounts(disk_layout);
+    let split = needs_state_split(image, disk_layout)
+        .then(|| resolve_state_split(image, disk_layout))
+        .transpose()?;
+    let emits_split = split.is_some();
+    if !declared.is_empty() || emits_split {
+        emit_mounts(&root, &declared, split.as_ref())?;
+    }
+    if emits_split {
         // ADR-0023 §4: the boot-time activation oneshot. Gated with the
         // split — the store lives on the state partition, so without the
         // split there is nothing to activate.
@@ -1398,6 +1415,7 @@ pub(super) fn cp_r(src: &Path, dst: &Path) -> miette::Result<()> {
 // `crate::image::<item>` paths keep resolving without widening visibility.
 mod boot;
 mod initramfs;
+mod mounts;
 mod partition;
 mod staging;
 mod state;
@@ -1405,6 +1423,7 @@ mod verity;
 
 pub(crate) use boot::*;
 pub(crate) use initramfs::*;
+pub(crate) use mounts::*;
 pub(crate) use partition::*;
 pub(crate) use staging::*;
 pub(crate) use state::*;
@@ -2127,7 +2146,7 @@ mod tests {
             partlabel: "state".into(),
             var_submount_partlabel: String::new(),
         };
-        let fstab = fstab_content(&split);
+        let fstab = fstab_content(&[], Some(&split));
         // Persistent state partition → /var/lib, by PARTLABEL.
         assert!(
             fstab.contains("PARTLABEL=state /var/lib auto defaults,nofail"),
@@ -2151,7 +2170,7 @@ mod tests {
             partlabel: "writable".into(),
             var_submount_partlabel: "docker".into(),
         };
-        let fstab = fstab_content(&split);
+        let fstab = fstab_content(&[], Some(&split));
         assert!(
             fstab.contains("x-systemd.requires-mounts-for=/dev/disk/by-partlabel/docker"),
             "tmpfs must require the /var/lib subvolume mount: {fstab}"
@@ -2165,7 +2184,7 @@ mod tests {
         assert!(state.contains("d /var/lib/shuttle 0755 root root -"));
         assert!(state.contains("d /var/lib/extensions 0755 root root -"));
 
-        let var = var_tmpfiles_content();
+        let var = var_tmpfiles_content_with(&[]);
         for dir in ["/var", "/var/run", "/var/tmp", "/var/cache", "/var/log"] {
             assert!(
                 var.contains(&format!("d {dir} 0755 root root -")),
@@ -2175,13 +2194,13 @@ mod tests {
     }
 
     #[test]
-    fn emit_state_split_writes_fstab_and_tmpfiles_into_the_rootfs() {
+    fn emit_mounts_writes_fstab_and_tmpfiles_into_the_rootfs() {
         let root = tempfile::tempdir().unwrap();
         let split = StateSplit {
             partlabel: "state".into(),
             var_submount_partlabel: String::new(),
         };
-        emit_state_split(root.path(), &split).unwrap();
+        emit_mounts(root.path(), &[], Some(&split)).unwrap();
         assert!(root.path().join(FSTAB_PATH).is_file());
         assert!(root.path().join(STATE_TMPFILES_PATH).is_file());
         assert!(root.path().join(VAR_TMPFILES_PATH).is_file());
@@ -2266,11 +2285,13 @@ mod tests {
     }
 
     #[test]
-    fn no_state_role_emits_no_split_artifacts_into_the_rootfs() {
-        // Regression guard (ADR-0023): a plain native image must add NO
-        // fstab, no tmpfiles.d and no /var mount. The emit function is
-        // gated by `needs_state_split`; assert the gate is false and the
-        // rootfs is untouched.
+    fn root_only_image_emits_no_fstab_at_all() {
+        // Regression guard: a genuinely root-only image (no declared
+        // non-root mount, no state role, no update_source) must emit NO
+        // /etc/fstab, no tmpfiles.d and no /var mount — byte-identical to
+        // before this change. The emit is gated on "declared mounts exist
+        // OR the split is needed"; assert both are false and the rootfs is
+        // untouched.
         let image = test_support::sample_image();
         let plain = DiskLayout {
             label: "gpt".into(),
@@ -2279,11 +2300,16 @@ mod tests {
             ab: false,
         };
         assert!(!needs_state_split(&image, &plain));
+        assert!(declared_mounts(&plain).is_empty());
         let root = tempfile::tempdir().unwrap();
         // Simulate the pipeline's conditional emission.
-        if needs_state_split(&image, &plain) {
-            let split = resolve_state_split(&image, &plain).unwrap();
-            emit_state_split(root.path(), &split).unwrap();
+        let declared = declared_mounts(&plain);
+        let split = needs_state_split(&image, &plain)
+            .then(|| resolve_state_split(&image, &plain))
+            .transpose()
+            .unwrap();
+        if !declared.is_empty() || split.is_some() {
+            emit_mounts(root.path(), &declared, split.as_ref()).unwrap();
         }
         assert!(!root.path().join(FSTAB_PATH).exists());
         assert!(!root.path().join(STATE_TMPFILES_PATH).exists());
@@ -3626,7 +3652,7 @@ Type=oneshot
 RemainAfterExit=no
 ExecStart=systemd-sysupdate update
 ";
-        assert_eq!(sysupdate_service_content(), expected);
+        assert_eq!(sysupdate_service_content(None), expected);
     }
 
     #[test]
@@ -3654,7 +3680,7 @@ WantedBy=timers.target
     #[test]
     fn emit_sysupdate_units_writes_units_and_timer_enablement() {
         let root = tempfile::tempdir().unwrap();
-        emit_sysupdate_units(root.path()).unwrap();
+        emit_sysupdate_units(root.path(), None).unwrap();
 
         let service = root.path().join(SYSUPDATE_SERVICE_PATH);
         let timer = root.path().join(SYSUPDATE_TIMER_PATH);
@@ -3694,7 +3720,7 @@ WantedBy=timers.target
         // that agreement — the constant is the default `usr/lib/sysupdate.d`
         // root and the unit deliberately carries no --definitions flag.
         assert_eq!(SYSUPDATE_DIR, "usr/lib/sysupdate.d");
-        let service = sysupdate_service_content();
+        let service = sysupdate_service_content(None);
         assert!(
             service.contains("ExecStart=systemd-sysupdate update"),
             "runs systemd's update machinery: {service}"
@@ -3750,10 +3776,41 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/lib/systemd/systemd-bless-boot good
 ";
-        assert_eq!(bless_boot_service_content(), expected);
+        assert_eq!(bless_boot_service_content(None), expected);
         // The exact stock invocation: helper path + `good` subcommand
         // (`systemd-bless-boot.service(8)` SYNOPSIS + OPTIONS `good`).
         assert_eq!(BLESS_BOOT_EXEC, "/usr/lib/systemd/systemd-bless-boot good");
+    }
+
+    #[test]
+    fn esp_writing_consumers_require_the_esp_mount_when_declared() {
+        // ADR-0024 §3: a `nofail` ESP mount has no ordering relationship
+        // with local-fs.target, so the ESP-writing consumers must carry
+        // `RequiresMountsFor=<esp>`. Unset ⇒ byte-identical to before.
+        assert!(
+            bless_boot_service_content(Some("/boot")).contains("RequiresMountsFor=/boot\n"),
+            "bless-boot (UKI rename) requires the ESP mount"
+        );
+        assert!(
+            sysupdate_service_content(Some("/efi")).contains("RequiresMountsFor=/efi\n"),
+            "sysupdate (PathRelativeTo=boot transfer) requires the ESP mount"
+        );
+        assert!(
+            !bless_boot_service_content(None).contains("RequiresMountsFor"),
+            "no ESP declared ⇒ no RequiresMountsFor line"
+        );
+        assert!(
+            !sysupdate_service_content(None).contains("RequiresMountsFor"),
+            "no ESP declared ⇒ no RequiresMountsFor line"
+        );
+        // The only difference is the one added line.
+        let plain = bless_boot_service_content(None);
+        let with = bless_boot_service_content(Some("/boot"));
+        assert_eq!(
+            with.replace("RequiresMountsFor=/boot\n", ""),
+            plain,
+            "the ESP dependency is purely additive"
+        );
     }
 
     #[test]
@@ -3836,7 +3893,7 @@ RequiredBy=boot-complete.target
     #[test]
     fn emit_boot_assessment_writes_units_and_gates_the_target() {
         let root = tempfile::tempdir().unwrap();
-        emit_boot_assessment(root.path(), BOOT_HEALTH_EXEC).unwrap();
+        emit_boot_assessment(root.path(), BOOT_HEALTH_EXEC, None).unwrap();
 
         for path in [
             BLESS_BOOT_UNIT_PATH,
@@ -3902,7 +3959,7 @@ RequiredBy=boot-complete.target
         // Issue #78: the threaded override lands in the unit on disk, and the
         // rest of the health unit is unchanged.
         let root = tempfile::tempdir().unwrap();
-        emit_boot_assessment(root.path(), "/bin/true").unwrap();
+        emit_boot_assessment(root.path(), "/bin/true", None).unwrap();
 
         let health = std::fs::read_to_string(root.path().join(BOOT_HEALTH_UNIT_PATH)).unwrap();
         assert!(
@@ -3948,7 +4005,7 @@ RequiredBy=boot-complete.target
         let image = mini_decl("os", "1.2.3");
         let disk = ab_layout();
         if emits_sysupdate(&image, &disk) {
-            emit_boot_assessment(root.path(), BOOT_HEALTH_EXEC).unwrap();
+            emit_boot_assessment(root.path(), BOOT_HEALTH_EXEC, None).unwrap();
         }
         for path in [
             BLESS_BOOT_UNIT_PATH,
@@ -3970,7 +4027,7 @@ RequiredBy=boot-complete.target
         let mut disk = ab_layout();
         disk.ab = false;
         if emits_sysupdate(&image, &disk) {
-            emit_boot_assessment(root.path(), BOOT_HEALTH_EXEC).unwrap();
+            emit_boot_assessment(root.path(), BOOT_HEALTH_EXEC, None).unwrap();
         }
         for path in [
             BLESS_BOOT_UNIT_PATH,
@@ -4076,7 +4133,7 @@ RequiredBy=boot-complete.target
         let disk = ab_layout();
         if emits_sysupdate(&image, &disk) {
             write_sysupdate_transfers(root.path(), &image, &disk).unwrap();
-            emit_sysupdate_units(root.path()).unwrap();
+            emit_sysupdate_units(root.path(), None).unwrap();
         }
         assert!(!root.path().join(SYSUPDATE_SERVICE_PATH).exists());
         assert!(!root.path().join(SYSUPDATE_TIMER_PATH).exists());
@@ -4095,7 +4152,7 @@ RequiredBy=boot-complete.target
         disk.ab = false;
         if emits_sysupdate(&image, &disk) {
             write_sysupdate_transfers(root.path(), &image, &disk).unwrap();
-            emit_sysupdate_units(root.path()).unwrap();
+            emit_sysupdate_units(root.path(), None).unwrap();
         }
         assert!(!root.path().join(SYSUPDATE_SERVICE_PATH).exists());
         assert!(!root.path().join(SYSUPDATE_TIMER_PATH).exists());
@@ -5280,6 +5337,18 @@ RequiredBy=boot-complete.target
                             options: vec![],
                             role: ROLE_STATE.into(),
                         },
+                        // A plain data partition: the rootfs-populated
+                        // partition gives the fake's fstab/split capture
+                        // seam a real source tree now that the state
+                        // partition is mkfs'd EMPTY (ADR-0023).
+                        Partition {
+                            name: "data".into(),
+                            size: "128M".into(),
+                            fs: "ext4".into(),
+                            mount: "/data".into(),
+                            options: vec![],
+                            role: String::new(),
+                        },
                     ],
                     swap: None,
                     ab: false,
@@ -5384,6 +5453,18 @@ RequiredBy=boot-complete.target
                             mount: "/var/lib".into(),
                             options: vec![],
                             role: ROLE_STATE.into(),
+                        },
+                        // A plain data partition: the rootfs-populated
+                        // partition gives the fake's split capture seam a
+                        // real source tree now that the state partition is
+                        // mkfs'd EMPTY (ADR-0023).
+                        Partition {
+                            name: "data".into(),
+                            size: "128M".into(),
+                            fs: "ext4".into(),
+                            mount: "/data".into(),
+                            options: vec![],
+                            role: String::new(),
                         },
                     ],
                     swap: None,
@@ -5501,14 +5582,33 @@ RequiredBy=boot-complete.target
             .expect("plain disk build must complete");
             assert!(img.is_file());
             // The staged rootfs the runner saw must carry no ADR-0023
-            // artifacts: the fake captures every split path it sees in a
-            // populate source tree, and a plain image emits none.
+            // state artifacts: no tmpfiles.d, and no state line in the
+            // fstab. It DOES carry the declared-mount fstab (this image
+            // declares an ESP and /data), which is the ADR-0024 §3 fix.
             let split_paths = runner.split_paths();
+            for rel in [STATE_TMPFILES_PATH, VAR_TMPFILES_PATH, ACTIVATE_UNIT_PATH] {
+                assert!(
+                    !split_paths.iter().any(|p| p == rel),
+                    "plain image must emit no state artifact {rel}: {split_paths:?}"
+                );
+            }
+            let fstabs = runner.fstabs();
+            assert_eq!(fstabs.len(), 1, "the declared-mount fstab is emitted");
             assert!(
-                split_paths.is_empty(),
-                "plain image must emit no split artifacts: {split_paths:?}"
+                fstabs[0].contains("PARTLABEL=UEFI /boot/efi auto defaults,nofail"),
+                "ESP mount line: {}",
+                fstabs[0]
             );
-            assert!(runner.fstabs().is_empty(), "no fstab for a plain image");
+            assert!(
+                fstabs[0].contains("PARTLABEL=data /data auto defaults,nofail"),
+                "data mount line: {}",
+                fstabs[0]
+            );
+            assert!(
+                !fstabs[0].contains("PARTLABEL=state /var/lib"),
+                "no state line without the split: {}",
+                fstabs[0]
+            );
         }
     }
 
