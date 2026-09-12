@@ -68,6 +68,7 @@ pub mod test_support {
             disk: None,
             sysctl: vec![],
             update_source: None,
+            boot_health_exec: None,
         }
     }
 }
@@ -172,6 +173,13 @@ pub struct ImageDeclaration {
     /// transfer would carry no verification, and unverifiable update
     /// config is never emitted silently.
     pub update_source: Option<String>,
+    /// Override for the generated `shuttle-boot-health.service`'s
+    /// `ExecStart` (issue #78). Unset keeps [`boot::BOOT_HEALTH_EXEC`],
+    /// so existing images emit a byte-identical unit. Set it to e.g.
+    /// `/bin/true` to satisfy the try-boot health gate on demand, or
+    /// `/bin/false` to fail it deliberately (ADR-0024 §3 fixtures).
+    /// Rust-level only for now — the per-image DSL surface is a follow-up.
+    pub boot_health_exec: Option<String>,
 }
 
 /// Serialize as the name string (for `meta/snap.yaml`).
@@ -219,6 +227,22 @@ impl ImageDeclaration {
                 other.type_name()
             ))?,
         };
+        // Issue #78: optional health-check command override.
+        let boot_health_exec = match table
+            .get::<Value>("boot_health_exec")
+            .map_err(|e| miette::miette!("image(): boot_health_exec: {e}"))?
+        {
+            Value::String(s) => Some(
+                s.to_str()
+                    .map_err(|e| miette::miette!("image(): boot_health_exec: {e}"))?
+                    .to_string(),
+            ),
+            Value::Nil => None,
+            other => Err(miette::miette!(
+                "image(): 'boot_health_exec' must be a string command, got {}",
+                other.type_name()
+            ))?,
+        };
 
         Ok(ImageDeclaration {
             name,
@@ -232,6 +256,7 @@ impl ImageDeclaration {
             disk,
             sysctl,
             update_source,
+            boot_health_exec,
         })
     }
 
@@ -768,7 +793,13 @@ pub(crate) fn build_disk_image_with(
         // so every update would count down to a spurious revert. The health
         // unit gates boot-complete.target, so a boot that passes marks the
         // generation good and a boot that never passes exhausts TriesLeft.
-        emit_boot_assessment(&root)?;
+        emit_boot_assessment(
+            &root,
+            image
+                .boot_health_exec
+                .as_deref()
+                .unwrap_or(BOOT_HEALTH_EXEC),
+        )?;
     } else if disk_layout.ab {
         eprintln!(
             "  ℹ disk.ab = true without update_source — sysupdate transfer \
@@ -1552,6 +1583,7 @@ mod tests {
             disk: None,
             sysctl: vec![],
             update_source: None,
+            boot_health_exec: None,
         };
 
         let snaps: Vec<(String, ResolvedSnap)> = vec![
@@ -2656,6 +2688,7 @@ WantedBy=multi-user.target
             disk: None,
             sysctl: vec![],
             update_source: None,
+            boot_health_exec: None,
         };
         let snaps: Vec<(String, ResolvedSnap)> = vec![(
             "core22".into(),
@@ -3223,6 +3256,7 @@ CONFIG_EXT4_FS=m
             disk: None,
             sysctl: vec![],
             update_source: None,
+            boot_health_exec: None,
         };
         assert_eq!(uki_filename(&image), "my-system_1.2.3.efi");
         assert_eq!(
@@ -3252,6 +3286,7 @@ CONFIG_EXT4_FS=m
             disk: None,
             sysctl: vec![],
             update_source: None,
+            boot_health_exec: None,
         };
         assert!(
             loader_conf(&image).contains("timeout 5"),
@@ -3762,26 +3797,46 @@ ExecStart=shuttle runtime activate
 [Install]
 RequiredBy=boot-complete.target
 ";
-        assert_eq!(boot_health_service_content(), expected);
+        assert_eq!(boot_health_service_content(BOOT_HEALTH_EXEC), expected);
     }
 
     #[test]
     fn boot_health_command_is_the_single_constant() {
-        // The follow-up health-check DSL ticket replaces BOOT_HEALTH_EXEC in
-        // one place; assert the emitted unit spells that constant exactly so
-        // the change is test-visible here.
+        // The default command is a single constant; assert the emitted unit
+        // spells it exactly so an override cannot silently drift it.
         assert_eq!(BOOT_HEALTH_EXEC, "shuttle runtime activate");
         assert!(
-            boot_health_service_content().contains(&format!("ExecStart={BOOT_HEALTH_EXEC}\n")),
-            "health unit runs the single constant command: {}",
-            boot_health_service_content()
+            boot_health_service_content(BOOT_HEALTH_EXEC)
+                .contains(&format!("ExecStart={BOOT_HEALTH_EXEC}\n")),
+            "health unit runs the single constant command by default: {}",
+            boot_health_service_content(BOOT_HEALTH_EXEC)
+        );
+    }
+
+    #[test]
+    fn boot_health_service_override_replaces_only_the_exec_start() {
+        // Issue #78: an explicit override replaces ONLY the ExecStart line;
+        // the default unit (above) stays byte-identical when unset.
+        let overridden = boot_health_service_content("/bin/true");
+        assert!(
+            overridden.contains("ExecStart=/bin/true\n"),
+            "override reaches the unit: {overridden}"
+        );
+        assert!(
+            !overridden.contains(BOOT_HEALTH_EXEC),
+            "default command is fully replaced: {overridden}"
+        );
+        assert_eq!(
+            overridden.replace("ExecStart=/bin/true", "ExecStart=shuttle runtime activate"),
+            boot_health_service_content(BOOT_HEALTH_EXEC),
+            "override changes only the ExecStart command"
         );
     }
 
     #[test]
     fn emit_boot_assessment_writes_units_and_gates_the_target() {
         let root = tempfile::tempdir().unwrap();
-        emit_boot_assessment(root.path()).unwrap();
+        emit_boot_assessment(root.path(), BOOT_HEALTH_EXEC).unwrap();
 
         for path in [
             BLESS_BOOT_UNIT_PATH,
@@ -3843,6 +3898,25 @@ RequiredBy=boot-complete.target
     }
 
     #[test]
+    fn emit_boot_assessment_writes_the_health_override() {
+        // Issue #78: the threaded override lands in the unit on disk, and the
+        // rest of the health unit is unchanged.
+        let root = tempfile::tempdir().unwrap();
+        emit_boot_assessment(root.path(), "/bin/true").unwrap();
+
+        let health = std::fs::read_to_string(root.path().join(BOOT_HEALTH_UNIT_PATH)).unwrap();
+        assert!(
+            health.contains("ExecStart=/bin/true\n"),
+            "override reaches the emitted unit: {health}"
+        );
+        assert!(
+            health.contains("Before=boot-complete.target")
+                && health.contains("RequiredBy=boot-complete.target"),
+            "gating shape is untouched by the override: {health}"
+        );
+    }
+
+    #[test]
     fn boot_assessment_units_live_in_the_override_dir_not_the_vendor_path() {
         // Same class of bug as #62: the systemd package ships
         // systemd-bless-boot.service and boot-complete.target at
@@ -3874,7 +3948,7 @@ RequiredBy=boot-complete.target
         let image = mini_decl("os", "1.2.3");
         let disk = ab_layout();
         if emits_sysupdate(&image, &disk) {
-            emit_boot_assessment(root.path()).unwrap();
+            emit_boot_assessment(root.path(), BOOT_HEALTH_EXEC).unwrap();
         }
         for path in [
             BLESS_BOOT_UNIT_PATH,
@@ -3896,7 +3970,7 @@ RequiredBy=boot-complete.target
         let mut disk = ab_layout();
         disk.ab = false;
         if emits_sysupdate(&image, &disk) {
-            emit_boot_assessment(root.path()).unwrap();
+            emit_boot_assessment(root.path(), BOOT_HEALTH_EXEC).unwrap();
         }
         for path in [
             BLESS_BOOT_UNIT_PATH,
@@ -4045,6 +4119,7 @@ RequiredBy=boot-complete.target
             disk: None,
             sysctl: vec![],
             update_source: None,
+            boot_health_exec: None,
         }
     }
 
@@ -4532,6 +4607,7 @@ RequiredBy=boot-complete.target
             disk: None,
             sysctl: vec![],
             update_source: None,
+            boot_health_exec: None,
         };
         let resolved = vec![ResolvedSnap {
             name: "pc-kernel".into(),
@@ -4935,6 +5011,7 @@ RequiredBy=boot-complete.target
                 disk: None,
                 sysctl: vec![],
                 update_source: None,
+                boot_health_exec: None,
             };
 
             let output = tempfile::tempdir().unwrap();
@@ -5064,6 +5141,7 @@ RequiredBy=boot-complete.target
                 disk: None,
                 sysctl: vec![],
                 update_source: None,
+                boot_health_exec: None,
             };
             let root = tempfile::tempdir().unwrap();
             let esp = root.path().join("EFI").join("BOOT");
@@ -5208,6 +5286,7 @@ RequiredBy=boot-complete.target
                 }),
                 sysctl: vec![],
                 update_source: None,
+                boot_health_exec: None,
             };
 
             let output = tempfile::tempdir().unwrap();
@@ -5312,6 +5391,7 @@ RequiredBy=boot-complete.target
                 }),
                 sysctl: vec![],
                 update_source: Some("https://updates.example.invalid/os/".into()),
+                boot_health_exec: None,
             };
 
             let output = tempfile::tempdir().unwrap();
@@ -5403,6 +5483,7 @@ RequiredBy=boot-complete.target
                 }),
                 sysctl: vec![],
                 update_source: None,
+                boot_health_exec: None,
             };
 
             let output = tempfile::tempdir().unwrap();
