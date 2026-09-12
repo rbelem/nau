@@ -198,6 +198,401 @@ pub struct BootTest {
     pub kvm_available: bool,
     /// Extra substrings that MUST appear in the serial log to pass.
     pub required: Vec<String>,
+    /// How many boots to run in sequence (default 1). Values > 1 boot a single
+    /// sparse copy repeatedly so guest mutations persist across boots.
+    pub runs: u32,
+    /// Expected try-boot counter sequence, one element per boot, observed
+    /// BEFORE each boot. Empty disables counter assertions.
+    pub expect_counters: Vec<ExpectedCounters>,
+}
+
+/// One expected try-boot observation, parsed from `--expect-counter-seq`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpectedCounters {
+    /// Expected `tries_left` before the boot.
+    pub tries_left: u32,
+    /// Expected `tries_done`, or `None` when the spec did not pin it.
+    pub tries_done: Option<u32>,
+}
+
+/// Parse a `--expect-counter-seq` spec: `"3-0,2-1"` pins both halves of each
+/// observation, while a bare `"3,2,1,0"` leaves `tries_done` unchecked.
+pub fn parse_expect_counters(spec: &str) -> miette::Result<Vec<ExpectedCounters>> {
+    spec.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (left, done) = match part.split_once('-') {
+                Some((left, done)) => (left, Some(done)),
+                None => (part, None),
+            };
+            let tries_left = left.trim().parse::<u32>().map_err(|_| {
+                miette::miette!(
+                    "invalid --expect-counter-seq entry '{part}': '{left}' is not a number"
+                )
+            })?;
+            let tries_done = match done {
+                Some(d) => Some(d.trim().parse::<u32>().map_err(|_| {
+                    miette::miette!(
+                        "invalid --expect-counter-seq entry '{part}': '{d}' is not a number"
+                    )
+                })?),
+                None => None,
+            };
+            Ok(ExpectedCounters {
+                tries_left,
+                tries_done,
+            })
+        })
+        .collect()
+}
+
+// ── Boot sequence (issue #77) ───────────────────────────────────────────
+
+/// One boot's auditable record: what the ESP held *before* it, and what the
+/// serial log proved *after*.
+#[derive(Clone, Debug)]
+pub struct BootRecord {
+    /// 1-based boot index within the sequence.
+    pub index: u32,
+    /// The serial log path for this boot.
+    pub log: PathBuf,
+    /// The ESP listing captured before this boot.
+    pub esp_listing: PathBuf,
+    /// The raw ESP directory entries.
+    pub esp_entries: Vec<String>,
+    /// The first counter-bearing UKI in the sorted listing, if any.
+    pub uki: Option<String>,
+    /// The counters observed BEFORE this boot.
+    pub counters: Option<crate::esp::TryCounters>,
+    /// The serial-log verdict for this boot.
+    pub outcome: Outcome,
+}
+
+/// Why a boot sequence did not pass (distinct from an individual boot's
+/// [`Failure`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SequenceFailure {
+    /// `--expect-counter-seq` was set but no ESP entry carried counters.
+    NoCountedUki,
+    /// The observed counters before boot `index` did not match the expected
+    /// element.
+    CountersMismatch {
+        index: u32,
+        expected: ExpectedCounters,
+        observed: crate::esp::TryCounters,
+    },
+    /// Counting never engaged: two consecutive observations were equal.
+    Stuck { index: u32 },
+    /// The ESP could not be inspected (missing tools or no `esp` partition).
+    EspUnavailable(String),
+}
+
+impl SequenceFailure {
+    /// Stable machine-readable label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SequenceFailure::NoCountedUki => "no-counted-uki",
+            SequenceFailure::CountersMismatch { .. } => "counters-mismatch",
+            SequenceFailure::Stuck { .. } => "counters-stuck",
+            SequenceFailure::EspUnavailable(_) => "esp-unavailable",
+        }
+    }
+
+    /// A precise, one-line explanation.
+    pub fn message(&self) -> String {
+        match self {
+            SequenceFailure::NoCountedUki => {
+                "expected a try-boot counter sequence but no UKI on the ESP carries a \
+                 '+N-M' counter"
+                    .to_string()
+            }
+            SequenceFailure::CountersMismatch {
+                index,
+                expected,
+                observed,
+            } => {
+                let want = match expected.tries_done {
+                    Some(done) => format!("+{}-{}", expected.tries_left, done),
+                    None => format!("+{}", expected.tries_left),
+                };
+                format!(
+                    "boot {index}: ESP held +{}-{} before the boot, expected {want}",
+                    observed.tries_left, observed.tries_done
+                )
+            }
+            SequenceFailure::Stuck { index } => format!(
+                "boot {index}: try-boot counters did not change from the previous boot — \
+                 counting never engaged"
+            ),
+            SequenceFailure::EspUnavailable(message) => {
+                format!("cannot inspect the ESP for try-boot counters: {message}")
+            }
+        }
+    }
+}
+
+/// The full result of a boot sequence: every boot's record, the first
+/// sequence-level failure (if any), the resolved paths, and the image booted.
+#[derive(Clone, Debug)]
+pub struct SequenceOutcome {
+    pub records: Vec<BootRecord>,
+    pub failure: Option<SequenceFailure>,
+    pub run_root: Option<PathBuf>,
+    pub image: PathBuf,
+}
+
+impl SequenceOutcome {
+    /// True when every boot passed and no sequence assertion failed.
+    pub fn passed(&self) -> bool {
+        self.failure.is_none() && self.records.iter().all(|r| r.outcome.passed())
+    }
+
+    /// One-line summary covering both axes.
+    pub fn message(&self) -> String {
+        if let Some(failure) = &self.failure {
+            return failure.message();
+        }
+        let boots = self.records.len();
+        for record in &self.records {
+            if !record.outcome.passed() {
+                return format!("boot {}: {}", record.index, record.outcome.message());
+            }
+        }
+        format!("{boots} boot(s) passed")
+    }
+}
+
+fn first_counted_uki(entries: &[String]) -> Option<(String, crate::esp::TryCounters)> {
+    entries.iter().find_map(|name| {
+        let parsed = crate::esp::parse_uki_name(name);
+        parsed.counters.map(|counters| (name.clone(), counters))
+    })
+}
+
+/// Write the per-boot ESP listing, ignoring write failure (the listing is
+/// advisory evidence; a missing tool or a read-only run root must not mask a
+/// boot verdict).
+fn write_listing(path: &Path, entries: &[String]) {
+    let body = if entries.is_empty() {
+        String::new()
+    } else {
+        let mut body = entries.join("\n");
+        body.push('\n');
+        body
+    };
+    let _ = std::fs::write(path, body);
+}
+
+/// Run a whole boot sequence through the injected [`CommandRunner`].
+///
+/// `runs == 1` boots the image **in place** (today's behaviour, no
+/// regression) and records the ESP into `<log>.esp.txt`. `runs > 1` makes ONE
+/// sparse copy at `<log>.d/img` and boots that same copy every time, so guest
+/// mutations persist; per-boot logs and listings land under `<log>.d/`, and a
+/// `sequence.json` summarises every boot. `-snapshot` is never used — it would
+/// discard the decrements and make the test self-deceiving.
+///
+/// The ESP is inspected BEFORE each boot, so a `+3-0` start over four boots
+/// observes `3-0, 2-1, 1-2, 0-3`.
+pub fn run_sequence(
+    runner: &dyn CommandRunner,
+    test: &BootTest,
+) -> miette::Result<SequenceOutcome> {
+    let runs = test.runs.max(1);
+    let expect = &test.expect_counters;
+
+    let run_root = (runs > 1).then(|| {
+        let mut name = test.log.as_os_str().to_owned();
+        name.push(".d");
+        PathBuf::from(name)
+    });
+    if let Some(root) = &run_root {
+        std::fs::create_dir_all(root)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create run root {}", root.display()))?;
+    }
+
+    let boot_image = match &run_root {
+        Some(root) => {
+            let copy = root.join("img");
+            sparse_copy(&test.image, &copy).wrap_err_with(|| {
+                format!(
+                    "failed to make the per-run image copy {} -> {}",
+                    test.image.display(),
+                    copy.display()
+                )
+            })?;
+            copy
+        }
+        None => test.image.clone(),
+    };
+
+    // ESP offset is a property of the image; recover it once, before the
+    // first boot. A failure is hard when counting is asserted or the sequence
+    // boots a copy (mutations under test), and a soft warning otherwise so a
+    // plain single boot on a host without mtools still works.
+    let hard = !expect.is_empty() || runs > 1;
+    let esp_offset = match crate::esp::esp_partition_offset(runner, &boot_image) {
+        Ok(offset) => Some(offset),
+        Err(err) => {
+            if hard {
+                return Ok(SequenceOutcome {
+                    records: Vec::new(),
+                    failure: Some(SequenceFailure::EspUnavailable(format!("{err}"))),
+                    run_root,
+                    image: boot_image,
+                });
+            }
+            crate::output::warn(format!(
+                "ESP inspection unavailable ({err}); boot counting was not observed"
+            ));
+            None
+        }
+    };
+
+    let mut records: Vec<BootRecord> = Vec::new();
+    let mut failure: Option<SequenceFailure> = None;
+
+    for i in 1..=runs {
+        let (log, listing) = match &run_root {
+            Some(root) => (
+                root.join(format!("boot-{i}.serial.log")),
+                root.join(format!("boot-{i}.esp.txt")),
+            ),
+            None => {
+                let mut listing = test.log.as_os_str().to_owned();
+                listing.push(".esp.txt");
+                (test.log.clone(), PathBuf::from(listing))
+            }
+        };
+
+        let mut esp_entries = Vec::new();
+        let mut uki = None;
+        let mut counters = None;
+        if let Some(offset) = esp_offset {
+            match crate::esp::list_ukis(runner, &boot_image, offset) {
+                Ok(entries) => {
+                    esp_entries = entries;
+                    if let Some((name, observed)) = first_counted_uki(&esp_entries) {
+                        uki = Some(name);
+                        counters = Some(observed);
+                    }
+                }
+                Err(err) => {
+                    if failure.is_none() {
+                        failure = Some(SequenceFailure::EspUnavailable(format!("{err}")));
+                    }
+                    write_listing(&listing, &[]);
+                    let boot_test = BootTest {
+                        image: boot_image.clone(),
+                        log: log.clone(),
+                        ..test.clone()
+                    };
+                    let outcome = run_boot(runner, &boot_test)?;
+                    records.push(BootRecord {
+                        index: i,
+                        log,
+                        esp_listing: listing,
+                        esp_entries,
+                        uki,
+                        counters,
+                        outcome,
+                    });
+                    break;
+                }
+            }
+        }
+        write_listing(&listing, &esp_entries);
+
+        // Assert against the observation BEFORE boot i.
+        if failure.is_none() && !expect.is_empty() {
+            let expected = expect.get((i - 1) as usize).copied();
+            match (counters, expected) {
+                (None, _) => failure = Some(SequenceFailure::NoCountedUki),
+                (Some(_), None) => {}
+                (Some(observed), Some(want)) => {
+                    let left_ok = observed.tries_left == want.tries_left;
+                    let done_ok = want.tries_done.is_none_or(|d| observed.tries_done == d);
+                    if !left_ok || !done_ok {
+                        failure = Some(SequenceFailure::CountersMismatch {
+                            index: i,
+                            expected: want,
+                            observed,
+                        });
+                    } else if let Some(previous) = records.last() {
+                        if previous.counters == Some(observed) {
+                            failure = Some(SequenceFailure::Stuck { index: i });
+                        }
+                    }
+                }
+            }
+        }
+
+        let boot_test = BootTest {
+            image: boot_image.clone(),
+            log: log.clone(),
+            ..test.clone()
+        };
+        let outcome = run_boot(runner, &boot_test)?;
+        records.push(BootRecord {
+            index: i,
+            log,
+            esp_listing: listing,
+            esp_entries,
+            uki,
+            counters,
+            outcome,
+        });
+    }
+
+    if let Some(root) = &run_root {
+        write_sequence_json(root, &records, failure.as_ref(), &boot_image);
+    }
+
+    Ok(SequenceOutcome {
+        records,
+        failure,
+        run_root,
+        image: boot_image,
+    })
+}
+
+fn write_sequence_json(
+    root: &Path,
+    records: &[BootRecord],
+    failure: Option<&SequenceFailure>,
+    image: &Path,
+) {
+    let boots: Vec<serde_json::Value> = records
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "index": record.index,
+                "log": record.log.display().to_string(),
+                "esp_listing": record.esp_listing.display().to_string(),
+                "esp_entries": record.esp_entries,
+                "uki": record.uki,
+                "counters": record.counters.map(|c| serde_json::json!({
+                    "tries_left": c.tries_left,
+                    "tries_done": c.tries_done,
+                })),
+                "passed": record.outcome.passed(),
+                "message": record.outcome.message(),
+            })
+        })
+        .collect();
+    let report = serde_json::json!({
+        "image": image.display().to_string(),
+        "boots": boots,
+        "failure": failure.map(|f| f.label()),
+        "message": failure.map(|f| f.message()),
+    });
+    let path = root.join("sequence.json");
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string()),
+    );
 }
 
 /// The exact QEMU argv the harness builds. Exposed so both the fake runner
@@ -528,6 +923,97 @@ fn run_command(runner: &dyn CommandRunner, argv: &[String]) -> miette::Result<Ru
     })
 }
 
+/// Copy `src` to `dst`, preserving sparseness.
+///
+/// Deliberately NOT `cp --sparse=always`: that flag is GNU coreutils-only, and
+/// the `cp` on this project's own devbox PATH is BusyBox, which rejects it
+/// ("unrecognized option: sparse=always"). Shelling out would therefore fail on
+/// the very host the harness runs on — and the failure would be silent, because
+/// a failed `cp` surfaces much later as a confusing "cannot open .../img".
+///
+/// Doing it in-process also avoids depending on any particular `cp`
+/// implementation. A 12 GiB virtual / ~1.2 GiB real image would otherwise
+/// expand to its full apparent size; `SEEK_DATA`/`SEEK_HOLE` copies only the
+/// data extents, leaving holes as holes.
+pub fn sparse_copy(src: &Path, dst: &Path) -> miette::Result<()> {
+    use std::io::Write as _;
+
+    let input = std::fs::File::open(src)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to open {}", src.display()))?;
+    let mut output = std::fs::File::create(dst)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create {}", dst.display()))?;
+
+    let len = input
+        .metadata()
+        .into_diagnostic()
+        .wrap_err("failed to stat the source image")?
+        .len();
+    output
+        .set_len(len)
+        .into_diagnostic()
+        .wrap_err("failed to size the destination image")?;
+
+    let mut pos: u64 = 0;
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    while pos < len {
+        let Some(data) = seek_extent(&input, pos, libc::SEEK_DATA) else {
+            break; // no more data: the remainder is a hole
+        };
+        if data >= len {
+            break;
+        }
+        let hole = seek_extent(&input, data, libc::SEEK_HOLE).unwrap_or(len);
+        copy_extent(&input, &output, data, hole, &mut buf)?;
+        pos = hole;
+    }
+    output
+        .flush()
+        .into_diagnostic()
+        .wrap_err("failed to flush the image copy")?;
+    Ok(())
+}
+
+/// `lseek(fd, offset, whence)` for `SEEK_DATA`/`SEEK_HOLE`, returning `None`
+/// when there is nothing further in that direction (or the filesystem does not
+/// support the hint, in which case `ENXIO` is the documented answer).
+fn seek_extent(file: &std::fs::File, offset: u64, whence: i32) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `lseek` on a valid owned fd with a plain integer offset.
+    let rc = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, whence) };
+    (rc >= 0).then_some(rc as u64)
+}
+
+/// Copy bytes `[start, end)` from `input` into `output` at the same offsets.
+fn copy_extent(
+    input: &std::fs::File,
+    output: &std::fs::File,
+    start: u64,
+    end: u64,
+    buf: &mut [u8],
+) -> miette::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    let mut cursor = start;
+    while cursor < end {
+        let want = std::cmp::min(buf.len() as u64, end - cursor) as usize;
+        let read = input
+            .read_at(&mut buf[..want], cursor)
+            .into_diagnostic()
+            .wrap_err("failed to read the source image")?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all_at(&buf[..read], cursor)
+            .into_diagnostic()
+            .wrap_err("failed to write the image copy")?;
+        cursor += read as u64;
+    }
+    Ok(())
+}
+
 // ── Host environment resolution ─────────────────────────────────────────
 
 /// Resolve `name` against a PATH-style string, returning the first existing
@@ -792,8 +1278,12 @@ SHUTTLE-INIT: switch-root\n\
     const TRUNCATED_LOG: &str = "[    0.000000] Linux version 6.8.0\n";
 
     fn sample_test(tmp: &Path, accel: Accel, kvm_available: bool) -> BootTest {
+        // The multi-boot path makes a real in-process copy of `image`, so the
+        // fixture must exist on disk rather than being a bare path.
+        let image = tmp.join("image_1.0.0_amd64.img");
+        std::fs::write(&image, b"fixture").unwrap();
         BootTest {
-            image: tmp.join("image_1.0.0_amd64.img"),
+            image,
             log: tmp.join("serial.log"),
             accel,
             timeout: Duration::from_secs(5),
@@ -805,6 +1295,8 @@ SHUTTLE-INIT: switch-root\n\
             timeout_bin: PathBuf::from("/usr/bin/timeout"),
             kvm_available,
             required: Vec::new(),
+            runs: 1,
+            expect_counters: Vec::new(),
         }
     }
 
@@ -1265,5 +1757,376 @@ SHUTTLE-INIT: switch-root\n\
         assert_eq!(arg_after(&calls[0], "-accel"), Some("kvm"));
         assert_eq!(arg_after(&calls[1], "-accel"), Some("tcg"));
         assert_eq!(out.argv, wrapper_argv(&test, Accel::Tcg));
+    }
+
+    // ── run_sequence (issue #77) ──
+
+    use crate::esp::{parse_dir_listing, TryCounters};
+
+    /// The `sfdisk -J` output the fake runner answers with in sequence tests.
+    const SFDISK_STDOUT: &str = r#"{"partitiontable":{"partitions":[
+        {"start":2048,"name":"esp"},{"start":6144,"name":"root"}]}}"#;
+
+    /// A fake runner whose `mdir` answers are popped in order and whose QEMU
+    /// serial writes the pass log. `sfdisk`/`cp` calls are answered trivially.
+    struct SeqRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+        listings: Mutex<VecDeque<Vec<String>>>,
+        esp_ok: bool,
+    }
+
+    impl SeqRunner {
+        fn new(listings: Vec<Vec<String>>, esp_ok: bool) -> SeqRunner {
+            SeqRunner {
+                calls: Mutex::new(Vec::new()),
+                listings: Mutex::new(listings.into()),
+                esp_ok,
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandRunner for SeqRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            let program = argv.first().map(String::as_str).unwrap_or("");
+            match program {
+                "sfdisk" if self.esp_ok => Ok(RunnerOutput {
+                    code: 0,
+                    stdout: SFDISK_STDOUT.as_bytes().to_vec(),
+                    stderr: String::new(),
+                }),
+                "sfdisk" => Ok(RunnerOutput {
+                    code: 1,
+                    stdout: Vec::new(),
+                    stderr: "sfdisk: not found".to_string(),
+                }),
+                "mdir" => {
+                    let names = self
+                        .listings
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_default();
+                    Ok(RunnerOutput {
+                        code: 0,
+                        stdout: names.join("\n").into_bytes(),
+                        stderr: String::new(),
+                    })
+                }
+                _ => {
+                    if let Some(serial) = arg_after(argv, "-serial") {
+                        if let Some(path) = serial.strip_prefix("file:") {
+                            std::fs::write(path, PASS_LOG).unwrap();
+                        }
+                    }
+                    Ok(RunnerOutput {
+                        code: 124,
+                        stdout: Vec::new(),
+                        stderr: String::new(),
+                    })
+                }
+            }
+        }
+    }
+
+    fn counted(name: &str) -> String {
+        name.to_string()
+    }
+
+    #[test]
+    fn sequence_multi_boot_argv_uses_copy_with_per_boot_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut test = sample_test(tmp.path(), Accel::Kvm, true);
+        test.runs = 2;
+        let runner = SeqRunner::new(
+            vec![
+                vec![counted("foo_1.0+3-0.efi")],
+                vec![counted("foo_1.0+2-1.efi")],
+            ],
+            true,
+        );
+        let out = run_sequence(&runner, &test).unwrap();
+        assert!(out.passed(), "{}", out.message());
+        assert_eq!(out.records.len(), 2);
+        assert_eq!(
+            out.run_root,
+            Some(PathBuf::from(format!("{}.d", test.log.display())))
+        );
+
+        let calls = runner.calls();
+        // The copy is done in-process (never `cp --sparse=always`, which is
+        // GNU-only and broken under the BusyBox `cp` on this project's devbox
+        // PATH), so there is no copy argv to assert. Assert the effect instead:
+        // the copy exists on disk before the first boot.
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("cp")),
+            "the copy must not shell out to cp: {calls:?}"
+        );
+        let first_qemu = calls
+            .iter()
+            .position(|c| c.iter().any(|a| a == "-serial"))
+            .expect("a QEMU boot must be issued");
+        let root = out.run_root.as_ref().unwrap();
+        assert!(
+            root.join("img").is_file(),
+            "the per-run copy must exist before the first boot"
+        );
+
+        // Both boots target the copy, never the source image, and each has
+        // its own serial log.
+        let serials: Vec<&str> = calls
+            .iter()
+            .filter_map(|c| arg_after(c, "-serial"))
+            .collect();
+        assert_eq!(serials.len(), 2);
+        assert!(serials[0].contains(&root.join("boot-1.serial.log").display().to_string()));
+        assert!(serials[1].contains(&root.join("boot-2.serial.log").display().to_string()));
+        let _ = first_qemu;
+        for call in calls.iter().filter(|c| c.iter().any(|a| a == "-serial")) {
+            let drive = call
+                .iter()
+                .find(|a| a.starts_with("file=") && a.ends_with(",format=raw,if=virtio"))
+                .unwrap();
+            // The booted disk is the copy (the source image path is a prefix
+            // of the copy path, so require the copy path exactly).
+            assert!(
+                drive.contains(&root.join("img").display().to_string()),
+                "boot must use the copy: {drive}"
+            );
+        }
+        assert!(root.join("sequence.json").is_file());
+    }
+
+    #[test]
+    fn sequence_no_snapshot_in_boot_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut test = sample_test(tmp.path(), Accel::Kvm, true);
+        test.runs = 2;
+        let runner = SeqRunner::new(
+            vec![vec!["x+2-0.efi".into()], vec!["x+1-1.efi".into()]],
+            true,
+        );
+        run_sequence(&runner, &test).unwrap();
+        for call in runner.calls() {
+            assert!(
+                !call.iter().any(|a| a.contains("snapshot")),
+                "boot argv must never use -snapshot: {call:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequence_matching_counters_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut test = sample_test(tmp.path(), Accel::Kvm, true);
+        test.runs = 4;
+        test.expect_counters = parse_expect_counters("3-0,2-1,1-2,0-3").unwrap();
+        let runner = SeqRunner::new(
+            vec![
+                vec!["foo_1.0+3-0.efi".into()],
+                vec!["foo_1.0+2-1.efi".into()],
+                vec!["foo_1.0+1-2.efi".into()],
+                vec!["foo_1.0+0-3.efi".into()],
+            ],
+            true,
+        );
+        let out = run_sequence(&runner, &test).unwrap();
+        assert!(out.passed(), "{}", out.message());
+        assert!(out.failure.is_none());
+        assert_eq!(
+            out.records[0].counters,
+            Some(TryCounters {
+                tries_left: 3,
+                tries_done: 0
+            })
+        );
+        assert_eq!(
+            out.records[3].counters,
+            Some(TryCounters {
+                tries_left: 0,
+                tries_done: 3
+            })
+        );
+    }
+
+    #[test]
+    fn sequence_mismatch_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut test = sample_test(tmp.path(), Accel::Kvm, true);
+        test.runs = 2;
+        test.expect_counters = parse_expect_counters("3-0,2-1").unwrap();
+        let runner = SeqRunner::new(
+            vec![vec!["foo+3-0.efi".into()], vec!["foo+3-0.efi".into()]],
+            true,
+        );
+        let out = run_sequence(&runner, &test).unwrap();
+        assert!(!out.passed());
+        match out.failure {
+            Some(SequenceFailure::CountersMismatch { index, .. }) => assert_eq!(index, 2),
+            other => panic!("expected mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sparse_copy_preserves_holes_and_content() {
+        // Regression guard for a defect the fake runner could not catch: the
+        // per-run copy used to shell out to `cp --sparse=always`, which is
+        // GNU-only. The `cp` on this project's devbox PATH is BusyBox, which
+        // rejects that flag, so the copy silently failed and the run died much
+        // later with a confusing "cannot open .../img" from sfdisk. This must
+        // hold with NO external `cp` involved.
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.img");
+        let dst = tmp.path().join("dst.img");
+
+        // A sparse file: data, a large hole, then more data.
+        const HOLE: u64 = 64 * 1024 * 1024;
+        {
+            let mut f = std::fs::File::create(&src).unwrap();
+            f.write_all(b"head").unwrap();
+            f.seek(SeekFrom::Start(HOLE)).unwrap();
+            f.write_all(b"tail").unwrap();
+            f.flush().unwrap();
+        }
+
+        sparse_copy(&src, &dst).unwrap();
+
+        // Content matches, including the zeros inside the hole.
+        let mut a = std::fs::File::open(&src).unwrap();
+        let mut b = std::fs::File::open(&dst).unwrap();
+        let mut av = Vec::new();
+        let mut bv = Vec::new();
+        a.read_to_end(&mut av).unwrap();
+        b.read_to_end(&mut bv).unwrap();
+        assert_eq!(av, bv, "copy must be byte-identical, holes included");
+        assert_eq!(av.len() as u64, HOLE + 4);
+
+        // And the destination is actually sparse: its allocated size is a
+        // fraction of its apparent length. Without this the copy would expand a
+        // 12 GiB virtual image to its full size on disk.
+        let st = std::os::unix::fs::MetadataExt::blocks(&std::fs::metadata(&dst).unwrap());
+        let allocated = st * 512;
+        assert!(
+            allocated < HOLE / 2,
+            "destination should stay sparse: {allocated} bytes allocated for {} apparent",
+            av.len()
+        );
+    }
+
+    #[test]
+    fn sequence_stuck_counters_fail_even_when_expected() {
+        // Both boots observe +3-0 (counting never engaged). If the operator
+        // (wrongly) expects 3-0,3-0, the equality must still fail: a healthy
+        // boot count strictly decrements.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut test = sample_test(tmp.path(), Accel::Kvm, true);
+        test.runs = 2;
+        test.expect_counters = parse_expect_counters("3-0,3-0").unwrap();
+        let runner = SeqRunner::new(
+            vec![vec!["foo+3-0.efi".into()], vec!["foo+3-0.efi".into()]],
+            true,
+        );
+        let out = run_sequence(&runner, &test).unwrap();
+        assert!(!out.passed());
+        assert_eq!(out.failure, Some(SequenceFailure::Stuck { index: 2 }));
+    }
+
+    #[test]
+    fn sequence_missing_counted_uki_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut test = sample_test(tmp.path(), Accel::Kvm, true);
+        test.runs = 2;
+        test.expect_counters = parse_expect_counters("3-0,2-1").unwrap();
+        let runner = SeqRunner::new(vec![vec!["foo.efi".into()], vec!["foo.efi".into()]], true);
+        let out = run_sequence(&runner, &test).unwrap();
+        assert!(!out.passed());
+        assert_eq!(out.failure, Some(SequenceFailure::NoCountedUki));
+    }
+
+    #[test]
+    fn sequence_esp_unavailable_hard_when_counting_expected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut test = sample_test(tmp.path(), Accel::Kvm, true);
+        test.runs = 2;
+        test.expect_counters = parse_expect_counters("3-0").unwrap();
+        // The CLI rejects this combination, but the library must still
+        // hard-fail when the ESP cannot be inspected and counting is asserted.
+        let runner = SeqRunner::new(vec![], false);
+        let out = run_sequence(&runner, &test).unwrap();
+        assert!(!out.passed());
+        assert!(matches!(
+            out.failure,
+            Some(SequenceFailure::EspUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn sequence_esp_unavailable_soft_for_plain_single_boot() {
+        // runs == 1, no expectations: a host without mtools still boots.
+        let tmp = tempfile::tempdir().unwrap();
+        let test = sample_test(tmp.path(), Accel::Kvm, true);
+        let runner = SeqRunner::new(vec![], false);
+        let out = run_sequence(&runner, &test).unwrap();
+        assert!(out.passed(), "{}", out.message());
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.run_root, None);
+    }
+
+    #[test]
+    fn parse_expect_counters_accepts_dash_and_bare() {
+        assert_eq!(
+            parse_expect_counters("3-0,2-1").unwrap(),
+            vec![
+                ExpectedCounters {
+                    tries_left: 3,
+                    tries_done: Some(0)
+                },
+                ExpectedCounters {
+                    tries_left: 2,
+                    tries_done: Some(1)
+                },
+            ]
+        );
+        assert_eq!(
+            parse_expect_counters("3,2,1,0").unwrap(),
+            vec![
+                ExpectedCounters {
+                    tries_left: 3,
+                    tries_done: None
+                },
+                ExpectedCounters {
+                    tries_left: 2,
+                    tries_done: None
+                },
+                ExpectedCounters {
+                    tries_left: 1,
+                    tries_done: None
+                },
+                ExpectedCounters {
+                    tries_left: 0,
+                    tries_done: None
+                },
+            ]
+        );
+        assert!(parse_expect_counters("x").is_err());
+    }
+
+    #[test]
+    fn dir_listing_parses_mdir_output() {
+        assert_eq!(
+            parse_dir_listing("ubuntu-core-pc_22.04.efi\nfoo+3-0.efi\n"),
+            vec![
+                "ubuntu-core-pc_22.04.efi".to_string(),
+                "foo+3-0.efi".to_string()
+            ]
+        );
     }
 }

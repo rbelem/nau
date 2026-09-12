@@ -422,6 +422,10 @@ pub enum Command {
     /// it further — for an A/B image that emits `boot-complete.target`, the
     /// strongest assertion is `--require "Reached target Boot Completion
     /// Check"`.
+    ///
+    /// `--runs N` boots the image N times in sequence, and
+    /// `--expect-counter-seq` asserts the systemd-boot try-boot counters
+    /// observed on the ESP before each boot (issue #77).
     Test {
         /// Path to the built disk image (`.img`) to boot.
         image: String,
@@ -452,6 +456,27 @@ pub enum Command {
         /// or the edk2 equivalents). Default: auto-discovered.
         #[arg(long)]
         firmware_dir: Option<String>,
+
+        /// Boot the image N times in sequence (default 1). With N > 1 a single
+        /// sparse copy is booted repeatedly so guest mutations persist; each
+        /// boot's serial log and ESP listing are archived.
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+
+        /// Expected try-boot counter sequence, one element per boot, observed
+        /// BEFORE each boot. `3-0,2-1` pins tries-left and tries-done; a bare
+        /// `3,2,1,0` leaves tries-done unchecked.
+        ///
+        /// Boot counting lives in the ESP filename: systemd-boot renames the
+        /// selected UKI (`foo+3-0.efi` -> `foo+2-1.efi`) before the kernel
+        /// loads, so the serial console cannot see it. A fixture MUST use a
+        /// DISTINCT version for a counted entry: systemd-boot strips the
+        /// `+N-M` counter when deriving an entry id, so a counted UKI
+        /// differing from its sibling only by the counter shares its id; with
+        /// one entry counterless the comparator returns 0 and selection
+        /// becomes arbitrary.
+        #[arg(long = "expect-counter-seq")]
+        expect_counter_seq: Option<String>,
 
         /// Output structured JSON instead of human-friendly output.
         #[arg(long)]
@@ -1748,6 +1773,8 @@ mod tests {
                 log,
                 require,
                 firmware_dir,
+                runs,
+                expect_counter_seq,
                 json,
             } => {
                 assert_eq!(image, "disk.img");
@@ -1756,6 +1783,8 @@ mod tests {
                 assert!(log.is_none());
                 assert!(require.is_empty());
                 assert!(firmware_dir.is_none());
+                assert_eq!(runs, 1);
+                assert!(expect_counter_seq.is_none());
                 assert!(!json);
             }
             _ => panic!("expected Test"),
@@ -1778,6 +1807,10 @@ mod tests {
             "first",
             "--require",
             "Reached target Multi-User System.",
+            "--runs",
+            "4",
+            "--expect-counter-seq",
+            "3-0,2-1,1-2,0-3",
             "--json",
         ])
         .unwrap()
@@ -1788,6 +1821,8 @@ mod tests {
                 accel,
                 log,
                 require,
+                runs,
+                expect_counter_seq,
                 json,
                 ..
             } => {
@@ -1795,6 +1830,8 @@ mod tests {
                 assert_eq!(accel, Accel::Tcg);
                 assert_eq!(log.as_deref(), Some("evidence.log"));
                 assert_eq!(require, ["first", "Reached target Multi-User System."]);
+                assert_eq!(runs, 4);
+                assert_eq!(expect_counter_seq.as_deref(), Some("3-0,2-1,1-2,0-3"));
                 assert!(json);
             }
             _ => panic!("expected Test"),

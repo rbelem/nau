@@ -202,10 +202,22 @@ fn main() -> miette::Result<()> {
             log,
             require,
             firmware_dir,
+            runs,
+            expect_counter_seq,
             json,
         } => {
             shuttle::output::set_mode(json);
-            cmd_test(image, timeout, accel, log, require, firmware_dir, json)
+            cmd_test(
+                image,
+                timeout,
+                accel,
+                log,
+                require,
+                firmware_dir,
+                runs,
+                expect_counter_seq,
+                json,
+            )
         }
 
         Command::Push {
@@ -2362,12 +2374,36 @@ struct TestHost {
     _scratch: tempfile::TempDir,
 }
 
+/// Validate `--runs`/`--expect-counter-seq` together and parse the expected
+/// sequence. A single boot cannot observe a decrement, so a sequence spec
+/// with `--runs 1` is rejected rather than silently ignored.
+fn validate_sequence_args(
+    runs: u32,
+    expect_counter_seq: Option<&str>,
+) -> miette::Result<Vec<shuttle::boot_test::ExpectedCounters>> {
+    if runs == 0 {
+        return Err(miette::miette!("--runs must be at least 1"));
+    }
+    let expect_counters = match expect_counter_seq {
+        Some(spec) => shuttle::boot_test::parse_expect_counters(spec)?,
+        None => Vec::new(),
+    };
+    if !expect_counters.is_empty() && runs == 1 {
+        return Err(miette::miette!(
+            "--expect-counter-seq needs at least 2 boots to observe a decrement; pass --runs N"
+        ));
+    }
+    Ok(expect_counters)
+}
+
 /// `shuttle test`: boot a built image in QEMU and assert it reached
-/// userspace. The host-side wrapper around [`shuttle::boot_test::run_boot`]
-/// — it resolves the QEMU/firmware/timeout environment, runs the boot
-/// through the real [`RealRunner`][shuttle::command::RealRunner], prints
-/// the verdict, and exits non-zero when the assertion fails (so this can
-/// gate CI and, later, #63's revert test).
+/// userspace. The host-side wrapper around
+/// [`shuttle::boot_test::run_sequence`] — it resolves the
+/// QEMU/firmware/timeout environment, runs the boot(s) through the real
+/// [`RealRunner`][shuttle::command::RealRunner], prints each verdict, and
+/// exits non-zero when any boot or sequence assertion fails (so this can gate
+/// CI and, later, #63's revert test).
+#[allow(clippy::too_many_arguments)]
 fn cmd_test(
     image: String,
     timeout: u64,
@@ -2375,6 +2411,8 @@ fn cmd_test(
     log: Option<String>,
     require: Vec<String>,
     firmware_dir: Option<String>,
+    runs: u32,
+    expect_counter_seq: Option<String>,
     json: bool,
 ) -> miette::Result<()> {
     let image_path = PathBuf::from(&image);
@@ -2384,6 +2422,7 @@ fn cmd_test(
              resulting *.img"
         ));
     }
+    let expect_counters = validate_sequence_args(runs, expect_counter_seq.as_deref())?;
     let log_path = log
         .map(PathBuf::from)
         .unwrap_or_else(|| shuttle::boot_test::default_log_path(&image_path));
@@ -2399,13 +2438,22 @@ fn cmd_test(
         timeout_bin: host.timeout_bin,
         kvm_available: host.kvm_available,
         required: require,
+        runs,
+        expect_counters,
     };
 
     if !json {
-        shuttle::output::status(format!("booting {image} (accel {})...", accel.qemu_arg()));
+        if runs > 1 {
+            shuttle::output::status(format!(
+                "booting {image} {runs} times (accel {})...",
+                accel.qemu_arg()
+            ));
+        } else {
+            shuttle::output::status(format!("booting {image} (accel {})...", accel.qemu_arg()));
+        }
     }
-    let outcome = shuttle::boot_test::run_boot(&shuttle::command::RealRunner, &test)?;
-    report_test_result(&image, &log_path, &outcome, json);
+    let outcome = shuttle::boot_test::run_sequence(&shuttle::command::RealRunner, &test)?;
+    report_sequence_result(&image, &log_path, &outcome, json);
 
     if !outcome.passed() {
         std::process::exit(1);
@@ -2432,45 +2480,120 @@ fn resolve_test_host(firmware_dir: Option<&str>) -> miette::Result<TestHost> {
 }
 
 /// Print the boot verdict (human or JSON) plus the evidence path.
-fn report_test_result(image: &str, log: &Path, outcome: &shuttle::boot_test::Outcome, json: bool) {
+fn report_sequence_result(
+    image: &str,
+    log: &Path,
+    outcome: &shuttle::boot_test::SequenceOutcome,
+    json: bool,
+) {
     if json {
-        report_test_json(image, log, outcome);
+        report_sequence_json(image, outcome);
         return;
     }
-    if outcome.passed() {
-        shuttle::output::ok(outcome.message());
-    } else {
+    if outcome.records.is_empty() {
         shuttle::output::err(outcome.message());
+    } else {
+        for record in &outcome.records {
+            let label = format!("boot {}", record.index);
+            let counters = record
+                .counters
+                .map(|c| {
+                    let name = record.uki.as_deref().unwrap_or("");
+                    let base = shuttle::esp::parse_uki_name(name).base;
+                    format!(" (ESP {base} +{}-{})", c.tries_left, c.tries_done)
+                })
+                .unwrap_or_default();
+            if record.outcome.passed() {
+                shuttle::output::ok(format!("{label}: {}{counters}", record.outcome.message()));
+            } else {
+                shuttle::output::err(format!("{label}: {}{counters}", record.outcome.message()));
+            }
+        }
+        if let Some(failure) = &outcome.failure {
+            shuttle::output::err(format!("sequence: {}", failure.message()));
+        }
     }
-    shuttle::output::status(format!("serial evidence: {}", log.display()));
-    if !log.is_file() {
-        shuttle::output::warn(format!("no serial log was written at {}", log.display()));
+    if let Some(root) = &outcome.run_root {
+        shuttle::output::status(format!("sequence evidence: {}", root.display()));
+    } else {
+        shuttle::output::status(format!("serial evidence: {}", log.display()));
+        if !log.is_file() {
+            shuttle::output::warn(format!("no serial log was written at {}", log.display()));
+        }
     }
 }
 
-/// `--json` boot report: the verdict, the accelerator used, the exact argv,
-/// the parsed serial evidence, and the archived log path.
-fn report_test_json(image: &str, log: &Path, outcome: &shuttle::boot_test::Outcome) {
+/// `--json` boot report: the sequence summary (one entry per boot) plus the
+/// overall verdict, run root, and image.
+fn report_sequence_json(image: &str, outcome: &shuttle::boot_test::SequenceOutcome) {
+    let boots: Vec<serde_json::Value> = outcome
+        .records
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "index": record.index,
+                "log": record.log.display().to_string(),
+                "esp_listing": record.esp_listing.display().to_string(),
+                "esp_entries": record.esp_entries,
+                "uki": record.uki,
+                "counters": record.counters.map(|c| serde_json::json!({
+                    "tries_left": c.tries_left,
+                    "tries_done": c.tries_done,
+                })),
+                "passed": record.outcome.passed(),
+                "accel": record.outcome.accel.qemu_arg(),
+                "timeout_secs": record.outcome.timeout.as_secs(),
+                "argv": record.outcome.argv,
+                "failure": record.outcome.failure.as_ref().map(|f| f.label()),
+                "message": record.outcome.message(),
+                "evidence": {
+                    "userspace": record.outcome.evidence.userspace,
+                    "markers": record.outcome.evidence.markers,
+                    "target": record.outcome.evidence.target,
+                    "service": record.outcome.evidence.service,
+                    "handoff": record.outcome.evidence.handoff,
+                    "boot_complete": record.outcome.evidence.boot_complete,
+                    "panic": record.outcome.evidence.panic,
+                    "activate": record.outcome.evidence.activate,
+                },
+            })
+        })
+        .collect();
+    // Preserve the single-boot top-level shape for existing consumers: the
+    // first boot's verdict is mirrored at the top level, with `boots`
+    // carrying the sequence.
+    let first = outcome.records.first();
     let report = serde_json::json!({
         "command": "test",
         "image": image,
-        "log": log.display().to_string(),
+        "image_booted": outcome.image.display().to_string(),
+        "runs": outcome.records.len(),
+        "run_root": outcome.run_root.as_ref().map(|r| r.display().to_string()),
+        "log": first.map(|r| r.log.display().to_string()),
         "passed": outcome.passed(),
-        "accel": outcome.accel.qemu_arg(),
-        "timeout_secs": outcome.timeout.as_secs(),
-        "argv": outcome.argv,
-        "failure": outcome.failure.as_ref().map(|f| f.label()),
+        "failure": outcome.failure.as_ref().map(|f| f.label()).or_else(|| {
+            first.and_then(|r| r.outcome.failure.as_ref().map(|f| f.label()))
+        }),
         "message": outcome.message(),
-        "evidence": {
-            "userspace": outcome.evidence.userspace,
-            "markers": outcome.evidence.markers,
-            "target": outcome.evidence.target,
-            "service": outcome.evidence.service,
-            "handoff": outcome.evidence.handoff,
-            "boot_complete": outcome.evidence.boot_complete,
-            "panic": outcome.evidence.panic,
-            "activate": outcome.evidence.activate,
-        },
+        "accel": first.map(|r| r.outcome.accel.qemu_arg()),
+        "timeout_secs": first.map(|r| r.outcome.timeout.as_secs()),
+        "argv": first.map(|r| r.outcome.argv.clone()),
+        "esp_entries": first.map(|r| r.esp_entries.clone()),
+        "counters": first.and_then(|r| r.counters).map(|c| serde_json::json!({
+            "tries_left": c.tries_left,
+            "tries_done": c.tries_done,
+        })),
+        "evidence": first.map(|r| serde_json::json!({
+            "userspace": r.outcome.evidence.userspace,
+            "markers": r.outcome.evidence.markers,
+            "target": r.outcome.evidence.target,
+            "service": r.outcome.evidence.service,
+            "handoff": r.outcome.evidence.handoff,
+            "boot_complete": r.outcome.evidence.boot_complete,
+            "panic": r.outcome.evidence.panic,
+            "activate": r.outcome.evidence.activate,
+        })),
+        "boots": boots,
     });
     println!(
         "{}",

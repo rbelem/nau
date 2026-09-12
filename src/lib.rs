@@ -12,6 +12,7 @@ pub mod desktop;
 pub mod doctor;
 pub mod dsl;
 pub mod emit;
+pub mod esp;
 pub mod farm;
 pub mod image;
 pub mod index;
