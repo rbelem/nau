@@ -61,3 +61,7 @@ tar = "0.4"
 # Go module zip construction for the go resolver fixtures (issue #40):
 # the loopback proxy serves a real module zip in the proxy archive shape.
 zip = "2"
+# Worker stderr-forwarding tests (issue #76): dup2 the test process's
+# stderr onto a never-read pipe to prove a wedged sink cannot outlive the
+# containment deadline.
+libc = "0.2"

@@ -23,7 +23,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -48,6 +48,16 @@ const MAX_JSON_DEPTH: usize = 128;
 /// parent CPU/memory per request. (The wall-clock deadline bounds the child,
 /// not the parent's per-request resolve work.)
 const MAX_MODULE_NAME_LEN: usize = 4096;
+/// Max bytes of worker stderr the parent forwards to its own stderr.
+///
+/// Worker `print()` output is untrusted: without a cap, a definition looping
+/// on print() makes the parent forward an unbounded stream (syscall
+/// amplification, and a forwarder thread that lives as long as the sink
+/// keeps draining). Past the cap the forwarder keeps DRAINING the pipe to
+/// EOF and discards — it must never stop reading, because a full stderr
+/// pipe would stall the child mid-record, which is exactly what piping
+/// stderr exists to prevent (see [`forward_worker_stderr`]).
+const MAX_FORWARDED_STDERR_BYTES: u64 = 1024 * 1024;
 
 // ── Protocol types (newline-delimited JSON on the child's stdio) ──
 
@@ -342,7 +352,9 @@ pub fn run_eval(req: &EvalRequest) -> miette::Result<WorkerOk> {
 }
 
 /// Drain a worker's stderr on a background thread, forwarding it to the
-/// parent's own stderr.
+/// parent's own stderr. Returns a one-shot completion receiver — NOT a join
+/// handle; the parent must never wait unconditionally on this thread (see
+/// [`wait_stderr_forwarder`]).
 ///
 /// The worker runs with `RLIMIT_FSIZE = 0` ([`set_rlimits`]) because it must
 /// never write to a regular file, and `print()` is routed to stderr so it
@@ -355,15 +367,77 @@ pub fn run_eval(req: &EvalRequest) -> miette::Result<WorkerOk> {
 /// decouples the child's fd kind from the caller's environment; this forwarder
 /// preserves the output for the user.
 ///
+/// Two bounds keep the forwarder from becoming a containment leak of its own
+/// (issue #76):
+///
+/// * At most [`MAX_FORWARDED_STDERR_BYTES`] are forwarded ([`forward_capped`]);
+///   past the cap the pipe is still drained to EOF, only discarded.
+/// * The parent waits for completion only until the containment deadline. A
+///   stderr sink that stops draining (`shuttle build 2>&1 | stalled-reader`)
+///   would otherwise wedge `write_all` forever and hold the parent past the
+///   wall-clock deadline that exists to bound the run.
+///
 /// Call after `spawn` and before the parent blocks reading stdout: a full
 /// stderr pipe buffer would otherwise stall the child mid-record.
-fn forward_worker_stderr(child: &mut std::process::Child) -> std::thread::JoinHandle<()> {
+fn forward_worker_stderr(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<()> {
     let mut src = child.stderr.take().expect("child stderr is piped");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut dst = std::io::stderr();
-        // A closed parent stderr is the caller's problem, not the worker's.
-        let _ = std::io::copy(&mut src, &mut dst);
-    })
+        forward_capped(&mut src, &mut dst, MAX_FORWARDED_STDERR_BYTES);
+        // The parent waits on this with a timeout; if it has already given
+        // up on the wedged forwarder, a dropped receiver is fine.
+        let _ = done_tx.send(());
+    });
+    done_rx
+}
+
+/// Copy at most `cap` bytes from `src` to `dst`, then keep reading to EOF
+/// and discard. Never stops reading early: the child's stderr pipe must
+/// keep emptying, or the child stalls mid-record with a full pipe.
+///
+/// A sink that stops draining blocks in `write_all` HERE — but in aggregate
+/// at most `cap` bytes are ever written, and the parent bounds the wait with
+/// [`wait_stderr_forwarder`]. A write error (closed parent stderr, say)
+/// switches the rest of the stream to discard: the child's output handling
+/// must never be the thing that blocks the child.
+fn forward_capped(src: &mut dyn Read, dst: &mut dyn Write, cap: u64) {
+    let mut buf = [0u8; 8192];
+    let mut forwarded = 0u64;
+    let mut sink_ok = true;
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                if sink_ok && forwarded < cap {
+                    let take = n.min((cap - forwarded) as usize);
+                    if dst.write_all(&buf[..take]).is_err() {
+                        sink_ok = false;
+                    }
+                    forwarded += take as u64;
+                }
+                // Past the cap, or the sink died: drain and discard.
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Wait for the stderr forwarder to finish, but never past `deadline`.
+///
+/// Normally the forwarder reaches EOF the instant the child is reaped (its
+/// stderr write end closes with the process). The one wedge that survives
+/// child reaping is a parent stderr sink that stopped draining: the
+/// forwarder then sits in `write_all` forever, and joining it
+/// unconditionally would let a stuck reader hold the parent past the
+/// wall-clock deadline that exists to bound the whole run. On timeout the
+/// thread is left detached — it cannot block the parent, and the capped
+/// forward loop keeps its footprint to one bounded pipe buffer.
+fn wait_stderr_forwarder(done: &std::sync::mpsc::Receiver<()>, deadline: Instant) {
+    let now = Instant::now();
+    if now < deadline {
+        let _ = done.recv_timeout(deadline - now);
+    }
 }
 
 /// Like [`run_eval`] but returns the full run (status, wall time, peak RSS)
@@ -397,7 +471,7 @@ pub fn run_eval_raw(req: &EvalRequest) -> miette::Result<EvalRun> {
         // Reap the child so a failed ship can't leave a zombie behind.
         let _ = child.kill();
         let _ = child.wait();
-        let _ = stderr_forwarder.join();
+        wait_stderr_forwarder(&stderr_forwarder, start + WALL_DEADLINE);
         return Err(miette::miette!(
             "failed to ship eval request to worker: {e}"
         ));
@@ -543,8 +617,10 @@ pub fn run_eval_raw(req: &EvalRequest) -> miette::Result<EvalRun> {
     let max_rss_kb = rss_child.join().unwrap_or(0);
     killer.join().unwrap_or(());
     // The child is reaped, so its stderr write end is closed and the
-    // forwarder has reached EOF.
-    stderr_forwarder.join().unwrap_or(());
+    // forwarder has normally reached EOF. A stderr sink that stopped
+    // draining can still hold it in write_all forever — bound the wait by
+    // the containment deadline and detach past it (issue #76).
+    wait_stderr_forwarder(&stderr_forwarder, start + WALL_DEADLINE);
 
     // A child death at/after the deadline IS the timeout, whatever the pipe
     // reported first: the wall-clock SIGKILL closes the pipe, so the reader can
@@ -1044,7 +1120,7 @@ pub fn run_check_raw(req: &CheckRequest) -> miette::Result<CheckRun> {
         // Reap the child so a failed ship can't leave a zombie behind.
         let _ = child.kill();
         let _ = child.wait();
-        let _ = stderr_forwarder.join();
+        wait_stderr_forwarder(&stderr_forwarder, start + CHECK_WALL_DEADLINE);
         return Err(miette::miette!(
             "failed to ship check request to worker: {e}"
         ));
@@ -1129,8 +1205,9 @@ pub fn run_check_raw(req: &CheckRequest) -> miette::Result<CheckRun> {
     }
     killer.join().unwrap_or(());
     // Child reaped ⇒ the stderr write end is closed and the forwarder has
-    // reached EOF.
-    stderr_forwarder.join().unwrap_or(());
+    // normally reached EOF. A wedged sink holds it in write_all — same
+    // deadline-bounded detach as the eval worker (issue #76).
+    wait_stderr_forwarder(&stderr_forwarder, start + CHECK_WALL_DEADLINE);
 
     // A child death at/after the deadline IS the timeout, whatever the pipe
     // reported first (same 200ms margin as the eval worker).
@@ -1373,5 +1450,91 @@ mod tests {
             .eval()
             .unwrap();
         assert!(lua_to_json(&v).is_err());
+    }
+
+    // ── stderr forwarder: cap + deadline (issue #76) ──
+
+    #[test]
+    fn forward_capped_below_cap_forwards_everything() {
+        let src = b"hello stderr".to_vec();
+        let mut reader = std::io::Cursor::new(src.clone());
+        let mut dst = Vec::new();
+        forward_capped(&mut reader, &mut dst, 1024);
+        assert_eq!(dst, src, "below the cap forwarding must be unchanged");
+        assert_eq!(
+            reader.position(),
+            src.len() as u64,
+            "source must be drained to EOF"
+        );
+    }
+
+    #[test]
+    fn forward_capped_truncates_at_cap_and_drains_rest() {
+        let mut reader = std::io::Cursor::new(vec![b'x'; 3000]);
+        let mut dst = Vec::new();
+        forward_capped(&mut reader, &mut dst, 1000);
+        assert_eq!(dst.len(), 1000, "forwarding must stop at the cap");
+        assert!(dst.iter().all(|&b| b == b'x'));
+        assert_eq!(
+            reader.position(),
+            3000,
+            "past the cap the stream must still drain to EOF (a stopped \
+             drain would fill the child's stderr pipe and stall it)"
+        );
+    }
+
+    /// A sink that always fails, like a closed parent stderr.
+    struct DeadSink;
+    impl Write for DeadSink {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(libc::EPIPE))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn forward_capped_dead_sink_switches_to_discard_not_early_exit() {
+        let mut reader = std::io::Cursor::new(vec![b'y'; 4096]);
+        let mut dst = DeadSink;
+        forward_capped(&mut reader, &mut dst, 1024);
+        assert_eq!(
+            reader.position(),
+            4096,
+            "a dead sink must not stop the drain; the child's stderr pipe \
+             has to keep emptying"
+        );
+    }
+
+    /// A sink that never accepts a byte: the wedged-sink scenario.
+    struct WedgedSink;
+    impl Write for WedgedSink {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            std::thread::park(); // never woken
+            unreachable!("park without a token never returns")
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn wait_stderr_forwarder_detaches_a_wedged_sink_at_deadline() {
+        let mut reader = std::io::Cursor::new(vec![0u8; 8192]);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = WedgedSink;
+            forward_capped(&mut reader, &mut sink, 1024);
+            let _ = done_tx.send(());
+        });
+        let start = Instant::now();
+        wait_stderr_forwarder(&done_rx, start + Duration::from_millis(150));
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(140) && waited < Duration::from_secs(2),
+            "the wait must be bounded by the deadline, not by the wedged \
+             sink: {waited:?}"
+        );
     }
 }
