@@ -2890,6 +2890,68 @@ pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListE
     Ok(entries)
 }
 
+// ── Interactive shellenv (issue #47) ──
+
+/// The environment a pod exposes to an interactive shell (issue #47):
+/// the pod's bin farm behind its `current` link. `shuttle pod shellenv`
+/// renders it as POSIX shell statements the user `eval`s — the
+/// interactive half of farm activation (ADR-0015 §7: "a single PATH
+/// prepend"), never an RC-file write, daemon, or watcher.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct PodShellenv {
+    /// The pod this environment belongs to.
+    pub pod: String,
+    /// Absolute farm path for the PATH prepend:
+    /// `<root>/<pod>/current`. Kept as the `current` LINK itself —
+    /// never canonicalized through to the generation — so an already
+    /// eval'd shell picks up rollback/update flips transparently (the
+    /// activation seam, CONTEXT.md: Pod generation).
+    pub farm: String,
+    /// The generation the farm currently serves, when the `current`
+    /// link's target parses.
+    pub generation: Option<u64>,
+}
+
+/// Resolve the environment the selected pod exposes to an interactive
+/// shell (issue #47). Read verb: fails on an unknown pod or one with no
+/// active generation — pointing a shell's PATH at a missing farm would
+/// fail silently at every command lookup, so there is no degraded mode.
+/// The returned farm path is absolute (the root is canonicalized first;
+/// the `current` segment stays a symlink), so the export is eval-safe
+/// from any cwd.
+pub fn shellenv(root: &Path, pod_name: &str) -> miette::Result<PodShellenv> {
+    validate_pod_name(pod_name)?;
+    let pod = pod_dir(root, pod_name);
+    if !pod.is_dir() {
+        miette::bail!(
+            "pod '{pod_name}' has no state at {} (read verbs do not \
+             initialize pods; `shuttle pod --name {pod_name} add <package>` does)",
+            pod.display()
+        );
+    }
+    let farm = pod.join(crate::farm::CURRENT_LINK);
+    // Follows the link: a missing OR dangling `current` fails here, and
+    // the error is the user-facing "sync first" one either way.
+    std::fs::metadata(&farm).map_err(|_| {
+        miette::miette!(
+            "pod '{pod_name}' has no active generation at {} — sync the \
+             pod first (`shuttle pod --name {pod_name} sync`)",
+            farm.display()
+        )
+    })?;
+    let root_abs = std::fs::canonicalize(root)
+        .map_err(|e| miette::miette!("pod root {}: {e}", root.display()))?;
+    Ok(PodShellenv {
+        pod: pod_name.to_string(),
+        farm: root_abs
+            .join(pod_name)
+            .join(crate::farm::CURRENT_LINK)
+            .display()
+            .to_string(),
+        generation: crate::farm::current_generation(&pod)?,
+    })
+}
+
 // ── Dependency fetch (ADR-0017, issue #13) ──
 
 /// One fetched (or verified) dependency closure in a
@@ -3205,5 +3267,87 @@ pod {
         // Non-numeric components compare as exact strings.
         assert!(version_matches_constraint("14a", "14a"));
         assert!(!version_matches_constraint("14b", "14a"));
+    }
+
+    // ── shellenv (issue #47) ──
+
+    /// Seed one pod with an active generation farm: the `current` link
+    /// is created by the production flip mechanism (`crate::farm`), not
+    /// by hand.
+    fn seed_active_pod(root: &Path, pod: &str, generation: u64) {
+        let dir = pod_dir(root, pod);
+        let farm = dir
+            .join("generations")
+            .join(generation.to_string())
+            .join("farm");
+        std::fs::create_dir_all(&farm).unwrap();
+        std::fs::write(farm.join("tool"), "#!/bin/sh\n").unwrap();
+        crate::farm::flip_current(&dir, generation).unwrap();
+    }
+
+    #[test]
+    fn test_shellenv_farm_path_is_the_current_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_active_pod(tmp.path(), "default", 3);
+
+        let env = shellenv(tmp.path(), "default").unwrap();
+        assert_eq!(env.pod, "default");
+        assert_eq!(env.generation, Some(3));
+        // Absolute (eval-safe from any cwd) and pointing at the
+        // `current` LINK — never canonicalized through to the
+        // generation, so rollback flips stay visible to the shell.
+        let farm = PathBuf::from(&env.farm);
+        assert!(farm.is_absolute(), "farm must be absolute: {env:?}");
+        assert_eq!(
+            farm,
+            tmp.path().canonicalize().unwrap().join("default/current")
+        );
+    }
+
+    #[test]
+    fn test_shellenv_works_for_named_pods() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_active_pod(tmp.path(), "work", 1);
+
+        let env = shellenv(tmp.path(), "work").unwrap();
+        assert!(
+            env.farm.ends_with("work/current"),
+            "farm must be the work pod's: {env:?}"
+        );
+        assert_eq!(env.generation, Some(1));
+    }
+
+    #[test]
+    fn test_shellenv_fails_on_unknown_pod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = shellenv(tmp.path(), "ghost").unwrap_err().to_string();
+        assert!(
+            err.contains("ghost") && err.contains("add"),
+            "error must name the pod and the initializing verb: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shellenv_fails_without_active_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A declared but never-synced pod: state exists, no `current`.
+        std::fs::create_dir_all(pod_dir(tmp.path(), "default")).unwrap();
+        std::fs::write(pod_lua_path(tmp.path(), "default"), "pod { packages = {} }").unwrap();
+
+        let err = shellenv(tmp.path(), "default").unwrap_err().to_string();
+        assert!(
+            err.contains("no active generation") && err.contains("sync"),
+            "error must point at syncing: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shellenv_fails_on_dangling_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = pod_dir(tmp.path(), "default");
+        std::fs::create_dir_all(&dir).unwrap();
+        // current → a generation that does not exist (torn state).
+        std::os::unix::fs::symlink("generations/9/farm", dir.join("current")).unwrap();
+        assert!(shellenv(tmp.path(), "default").is_err());
     }
 }

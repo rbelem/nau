@@ -2248,6 +2248,28 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
 
 // ── Pods (issues #2 + #4) ──
 
+/// `shuttle pod shellenv` (issue #47): print the selected pod's
+/// environment as shell statements — `export PATH="<farm>:$PATH"` — or
+/// as structured JSON with `--json`. The caller `eval`s the output; this
+/// process only prints, never touching an RC file.
+fn cmd_pod_shellenv(pod_name: &str, json: bool, root: Option<String>) -> miette::Result<()> {
+    shuttle::output::set_mode(json);
+    let root = shuttle::pod::pod_root(root.as_deref());
+    let env = shuttle::pod::shellenv(&root, pod_name)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&env).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        // Eval-safe prepend: the farm goes in front, the caller's PATH
+        // survives inside the quotes (expanded at eval time, not by
+        // this process).
+        println!("export PATH=\"{}:$PATH\"", env.farm);
+    }
+    Ok(())
+}
+
 fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
     let pod_name = name.unwrap_or(shuttle::pod::DEFAULT_POD);
     match sub {
@@ -2297,6 +2319,7 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             }
             Ok(())
         }
+        PodCommand::Shellenv { json, root } => cmd_pod_shellenv(pod_name, json, root),
         PodCommand::Update { packages, root } => {
             let root = shuttle::pod::pod_root(root.as_deref());
             let report = shuttle::pod::update_pod(&root, pod_name, &packages)?;

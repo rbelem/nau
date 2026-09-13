@@ -646,3 +646,144 @@ fn explicit_default_name_matches_bare_verb() {
         "--name default targets the default pod"
     );
 }
+
+// ── shellenv (issue #47) ──
+
+/// Seed an ACTIVE pod farm by hand (no builds): one generation with a
+/// farm and the pod's `current` link pointing at it, exactly the layout
+/// the real emitter + flip produces.
+fn seed_active_farm(root: &Path, pod: &str, generation: u64) {
+    let pod_d = root.join(pod);
+    let farm = pod_d
+        .join("generations")
+        .join(generation.to_string())
+        .join("farm");
+    std::fs::create_dir_all(&farm).unwrap();
+    std::fs::write(farm.join("tool"), "#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(
+        format!("generations/{generation}/farm"),
+        pod_d.join("current"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn shellenv_prints_an_export_line_for_the_farm() {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    seed_active_farm(root.path(), "default", 1);
+
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["shellenv"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    // Exactly one eval-able line: the farm prepended to the caller's
+    // PATH, `current` kept as the link so rollback flips stay visible.
+    let expected_farm = root.path().canonicalize().unwrap().join("default/current");
+    assert_eq!(
+        stdout,
+        format!("export PATH=\"{}:$PATH\"\n", expected_farm.display()),
+        "shellenv must print exactly one export line"
+    );
+    assert!(
+        stdout.contains(&expected_farm.display().to_string()),
+        "farm path must be absolute and point at current: {stdout}"
+    );
+    assert!(
+        !stdout.contains("generations"),
+        "the PATH entry must be the current link, never the generation: {stdout}"
+    );
+}
+
+#[test]
+fn shellenv_eval_puts_the_farm_on_path() {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    seed_active_farm(root.path(), "default", 1);
+
+    let (_, stdout, _) = run(project.path(), root.path(), &["shellenv"]);
+    // The acceptance run: eval the output in a real POSIX shell and
+    // resolve a farm tool through the resulting PATH.
+    let script = format!("{}\ncommand -v tool\n", stdout.trim_end());
+    let sh = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("failed to run sh");
+    assert!(
+        sh.status.success(),
+        "eval'd shellenv must put the farm on PATH: {}",
+        String::from_utf8_lossy(&sh.stderr)
+    );
+    let resolved = String::from_utf8_lossy(&sh.stdout);
+    assert!(
+        resolved.contains("default/current/tool"),
+        "tool must resolve through the farm: {resolved}"
+    );
+}
+
+#[test]
+fn shellenv_json_reports_pod_farm_and_generation() {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    seed_active_farm(root.path(), "default", 7);
+
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["shellenv", "--json"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON on stdout");
+    assert_eq!(v["pod"], "default");
+    let farm = v["farm"].as_str().expect("farm is a string");
+    assert!(
+        farm.ends_with("default/current"),
+        "farm must be the current link: {farm}"
+    );
+    assert_eq!(v["generation"], 7);
+}
+
+#[test]
+fn shellenv_targets_the_named_pod() {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    seed_active_farm(root.path(), "default", 1);
+    seed_active_farm(root.path(), "work", 4);
+
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["--name", "work", "shellenv"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("work/current"),
+        "named pod's farm must be on PATH: {stdout}"
+    );
+    assert!(
+        !stdout.contains("default/current"),
+        "the default pod must not leak into a named shellenv: {stdout}"
+    );
+}
+
+#[test]
+fn shellenv_fails_on_unknown_pod() {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["shellenv"]);
+    assert_eq!(code, Some(1));
+    assert!(stdout.is_empty(), "a failed shellenv must print nothing");
+    assert!(
+        stderr.contains("pod 'default' has no state") && stderr.contains("add"),
+        "error must name the pod and the verb that initializes it: {stderr}"
+    );
+}
+
+#[test]
+fn shellenv_fails_without_active_generation() {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    // Declared but never synced: pod.lua exists, no `current`.
+    seed_pod_lua(root.path(), "pod { packages = { \"jq\" } }");
+
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["shellenv"]);
+    assert_eq!(code, Some(1));
+    assert!(stdout.is_empty(), "a failed shellenv must print nothing");
+    assert!(
+        stderr.contains("no active generation") && stderr.contains("sync"),
+        "error must point at syncing the pod: {stderr}"
+    );
+}

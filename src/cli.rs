@@ -838,6 +838,21 @@ pub enum PodCommand {
         root: Option<String>,
     },
 
+    /// Print shell statements that put the selected pod's bin farm on
+    /// PATH in the current shell (issue #47): `eval "$(shuttle pod
+    /// shellenv)"`. Pure stdout — never writes an RC file, never starts
+    /// a daemon (ADR-0015 §7, ADR-0016 §7). Fails on an unknown pod or
+    /// one with no active generation.
+    Shellenv {
+        /// Output structured JSON instead of shell statements.
+        #[arg(long)]
+        json: bool,
+
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
+    },
+
     /// Update the selected pod's packages to the newest versions
     /// matching their constraints (`pkg@14` = newest 14.x, bare `pkg` =
     /// newest available): repins the lockfile, rebuilds only what
