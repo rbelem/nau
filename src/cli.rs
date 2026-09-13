@@ -964,6 +964,13 @@ pub enum IndexCommand {
         /// Channel to resolve from (default: latest/stable)
         #[arg(long, default_value = "latest/stable")]
         channel: String,
+
+        /// Image base(s) to add base-track passes for (repeatable). A base
+        /// like `core22` makes resolve also pin every entry on `22/stable` —
+        /// the channel the image build derives for kernel/gadget snaps
+        /// (ADR-0019, issue #69).
+        #[arg(long)]
+        base: Vec<String>,
     },
 
     /// Update package source inputs (re-fetch GitHub repositories).

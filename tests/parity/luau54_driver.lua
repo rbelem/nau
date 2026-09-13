@@ -148,8 +148,8 @@ end
 -- ── Worker environment ports ──
 
 -- Port of build_worker_lua's index() callback: find-by-name-or-alias over
--- the shipped index data, then entry_to_lua_table ({name, revision?,
--- sha3_384?}) with the request's arch.
+-- the shipped index data, then entry_to_lua_table (name-only — pins are
+-- never baked into declarations, issue #69) with the request's arch.
 local function make_index(index_data, arch)
   return function(name)
     if type(name) ~= "string" then
@@ -179,13 +179,10 @@ local function make_index(index_data, arch)
     if not found then
       error("snap '" .. name .. "' not found in package index")
     end
-    local t = { name = found.name }
-    local pin = found.pins and found.pins[arch]
-    if pin then
-      t.revision = pin.revision
-      t.sha3_384 = pin["sha3-384"]
-    end
-    return t
+    -- Name-only by contract (issue #69): a store pin baked into a
+    -- declaration would be re-verified against the build's DERIVED channel
+    -- and fail there, so entry_to_lua_table never returns one.
+    return { name = found.name }
   end
 end
 

@@ -5,37 +5,213 @@
       "name": "core22",
       "store": {
         "channel": "latest/stable"
+      },
+      "pins": {
+        "amd64@latest/stable": {
+          "revision": 2955,
+          "sha3-384": "f9ef8626ccda54c0d973d0fcd5759c9c1e32ad59f33baf864eed49bc196dd337f94860607db96052617aad934b7beba6",
+          "channel": "latest/stable"
+        },
+        "armhf@latest/stable": {
+          "revision": 2957,
+          "sha3-384": "45bf9db63f0f6813f4754fc49763756d6872009674be05732b7ab2fd662df9478c2a42997cc4d11bfeb65ea55bb77e38",
+          "channel": "latest/stable"
+        },
+        "arm64@latest/stable": {
+          "revision": 2956,
+          "sha3-384": "1bf971e632c723b663be8c4a34b24c376f78fff3ed27e89ccf576f3fd0963326c9fab3e0860bda8146e82297a6de937b",
+          "channel": "latest/stable"
+        }
+      }
+    },
+    {
+      "name": "core26",
+      "summary": "Runtime environment based on Ubuntu Core 26",
+      "store": {
+        "channel": "latest/stable"
+      },
+      "pins": {
+        "arm64@latest/stable": {
+          "revision": 463,
+          "sha3-384": "7b385505856d4738d73694b27bb4a737b8e992bf41a1791cf92109babf0d5b76c2dc3c50849738b494f5194fe15d292a",
+          "channel": "latest/stable"
+        },
+        "amd64@latest/stable": {
+          "revision": 462,
+          "sha3-384": "7d1230c3236bd884d74a39defbb8feb0890bc035344614221cea1fe569c1aa6f3d960cc3d6d84c970a25633d7e3b0b4a",
+          "channel": "latest/stable"
+        },
+        "armhf@latest/stable": {
+          "revision": 464,
+          "sha3-384": "d9277d9ddcb415735073b4b13e2cfa017da83643df496c77d9da83d283e8f2e42813dc5276f571fb44e19c0f36366e89",
+          "channel": "latest/stable"
+        }
       }
     },
     {
       "name": "pc-gadget",
       "store": {
-        "channel": "latest/stable",
-        "name": "pc"
+        "name": "pc",
+        "channel": "latest/stable"
+      },
+      "pins": {
+        "amd64@latest/stable": {
+          "revision": 103,
+          "sha3-384": "026a58055ba18778ad44bee0946c37efcb8363a15aad8561237c713532a5fd38206827e17298ba21e7ab9cde68ce08cb",
+          "channel": "latest/stable"
+        },
+        "amd64@26/stable": {
+          "revision": 227,
+          "sha3-384": "84e48d72bec4d01c39cf85b10dba1759a6156b0d68ea24eb7a817cddaa78ab3d238da1401cdd68d311ab632a45a47baa",
+          "channel": "26/stable"
+        },
+        "amd64@22/stable": {
+          "revision": 194,
+          "sha3-384": "6f8d511038f88430349a0fa8c05d404b0b8f4e66cd2369ad81523986796122091612b3ff3583d418a0281948721324d1",
+          "channel": "22/stable"
+        },
+        "arm64@22/stable": {
+          "revision": 193,
+          "sha3-384": "ee9b4f7ab9bbf37a5ea04156ffb21d351d2b55b0513df159f708c5cfd2a5ee3fa2c454b493aeafad7cc5b6699cbe4e2c",
+          "channel": "22/stable"
+        },
+        "arm64@26/stable": {
+          "revision": 228,
+          "sha3-384": "d885eebe615542713ccede9a0978b3d17fe892fb0eba542af0ff125c94a5da329782d7a9ffd8551b654ecebd78cd0887",
+          "channel": "26/stable"
+        }
       }
     },
     {
       "name": "snapd",
       "store": {
         "channel": "latest/stable"
+      },
+      "pins": {
+        "amd64@latest/stable": {
+          "revision": 27738,
+          "sha3-384": "dc3bf15d908c01fd2577731b7f6ff2e2d78222101ff23521cadff43e77cb4a5a75294dc9a5d4489a14bb10224d86db44",
+          "channel": "latest/stable"
+        },
+        "arm64@latest/stable": {
+          "revision": 27740,
+          "sha3-384": "2fa3e58431bb7a4fab7dc4aacb93d4bad242ab0d74f0944ff814fd74f3f13ec21ee64f773e07898d031e24621f9f4ca0",
+          "channel": "latest/stable"
+        },
+        "armhf@latest/stable": {
+          "revision": 27739,
+          "sha3-384": "7daeabc3d12347e1f6a5914242fcb25f0a502d86290a27369beacb03b6ff74d4ead2609a247c84d3715a38667927e762",
+          "channel": "latest/stable"
+        }
       }
     },
     {
       "name": "network-manager",
       "store": {
         "channel": "latest/stable"
+      },
+      "pins": {
+        "arm64@26/stable": {
+          "revision": 1075,
+          "sha3-384": "42078202b03ba10cb723c08042f12cbf2e542de16fe42ee751a6e6086bffe1617b78b5fee5729326cb6f46f6ec3ba0f8",
+          "channel": "26/stable"
+        },
+        "armhf@26/stable": {
+          "revision": 1076,
+          "sha3-384": "32d7cffe4991ef44bc6702b60abbb9b93ba3dcc05ce1557eb8b2122b070220bd6ea2aa4696c2771cf54d9ca3fde7a3c5",
+          "channel": "26/stable"
+        },
+        "amd64@latest/stable": {
+          "revision": 952,
+          "sha3-384": "a470f756976132cdfa9c033fa79f262b472dc59b1c5704e6efa4cdfc9c15c329cc95b306f57e1983271854569517ab93",
+          "channel": "latest/stable"
+        },
+        "amd64@26/stable": {
+          "revision": 1074,
+          "sha3-384": "45a541c275339f8579cbff86d403c5e8348daf6eea98a689a49992363f03e4330b7bcfe3a3ade41db53680d689e20f2e",
+          "channel": "26/stable"
+        },
+        "arm64@latest/stable": {
+          "revision": 953,
+          "sha3-384": "6510de953bdffffce31bdeb46c8b36cb62e3dcbd02d0c70e27844a6c3aa1c78fa2f6d3af5ec6791d858f043e6b9a59ac",
+          "channel": "latest/stable"
+        },
+        "amd64@22/stable": {
+          "revision": 1020,
+          "sha3-384": "d4dbb54f7498f6826a46b7bd3e2fb4509c91e0f348736acd63e214eab6b1ad873df51641e89e24d8b3d1ea78508e593c",
+          "channel": "22/stable"
+        },
+        "arm64@22/stable": {
+          "revision": 1021,
+          "sha3-384": "f40b0b684597c114291d913e617a92f9fccc1e1731f3a45852816b1dfa6e4274bdda468f61bb5050234aa54f5e2fb95c",
+          "channel": "22/stable"
+        },
+        "armhf@latest/stable": {
+          "revision": 954,
+          "sha3-384": "5c1e4cc94c6962c2ecc13d63b4417dd6c82c8ca6c07e641ab59af8295fa4582c8d83cfcaab1fe4bbb011353207a03b1f",
+          "channel": "latest/stable"
+        },
+        "armhf@22/stable": {
+          "revision": 1022,
+          "sha3-384": "2a14982eeee6791e04db2afb3fe6b2d449e8743ca4afb6f2d6b9583a2ac14369b46a2388bf45598bfb560088be6310b6",
+          "channel": "22/stable"
+        }
       }
     },
     {
       "name": "lxd",
       "store": {
         "channel": "latest/stable"
+      },
+      "pins": {
+        "amd64@latest/stable": {
+          "revision": 40424,
+          "sha3-384": "f82e214a0977f46c62a908a2c5b54b69caac5b4ca20c7ecf69670f2d3b0f4144eec3887b1c9626cc42ba2f1fe5ca16b3",
+          "channel": "latest/stable"
+        },
+        "arm64@latest/stable": {
+          "revision": 40423,
+          "sha3-384": "60ca74b13a72c41b0bcbd41a4bf2d9b63d9d2406cf6f55bc2840c9414d5e7794067121e11d9d12914b2c451032be38f8",
+          "channel": "latest/stable"
+        },
+        "armhf@latest/stable": {
+          "revision": 40420,
+          "sha3-384": "7cac76af083ac3319e51316ccb7fe428eb521ed61106c4c7d20bcd452d27980fdbfadef3c3e33e9c7dac12de1b598500",
+          "channel": "latest/stable"
+        }
       }
     },
     {
       "name": "pc-kernel",
       "store": {
         "channel": "latest/stable"
+      },
+      "pins": {
+        "amd64@26/stable": {
+          "revision": 3699,
+          "sha3-384": "13820c73bbec921b9d868b6b7f6446afdb0be461c43c53e69a592a00800dc8cc6230f9614c2bcb90bbd4c6306a7bdeeb",
+          "channel": "26/stable"
+        },
+        "amd64@latest/stable": {
+          "revision": 3720,
+          "sha3-384": "ddee6447d0941735802d79e9aa916c252df8dde8f497eda333002fa64ffc628a4a0323d9c155f586cfbb7915952b337b",
+          "channel": "latest/stable"
+        },
+        "arm64@22/stable": {
+          "revision": 3655,
+          "sha3-384": "d172f376a9994b269e2697065bbf19f4707f507d6b945d8a3ad3edbea936f6af893b04f357d14166103c00b635a7f400",
+          "channel": "22/stable"
+        },
+        "arm64@26/stable": {
+          "revision": 3700,
+          "sha3-384": "5234d87d1241003c9563e5c6999c81374649a96b00c367f8e4052ea5000797a678d20395ea0f4cc6c0b30edbe8cff4fe",
+          "channel": "26/stable"
+        },
+        "amd64@22/stable": {
+          "revision": 3654,
+          "sha3-384": "f2dfa2c70b0745e4941a7acd6b60a28c61a91e96fecbbe0be55bd3330618d0520d9422687d96a79b7113f5b11f6ce05d",
+          "channel": "22/stable"
+        }
       }
     }
   ]

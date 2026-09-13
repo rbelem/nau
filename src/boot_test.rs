@@ -56,9 +56,15 @@
 //! `boot-complete.target` and a health gate (ADR-0024 §3); it is the first
 //! entry in [`COMPLETION_MARKERS`] and the strongest assertion. On an image
 //! without the boot-assessment machinery, `multi-user.target` (or
-//! `graphical.target`) is the completed `default.target` systemd renders as
-//! `Reached target Multi-User System.` / `Reached target Graphical
-//! Interface.`, so any image that finishes its boot transaction passes.
+//! `graphical.target`) is the completed `default.target`: systemd renders it
+//! pre-v250 as `Reached target Multi-User System.` / `Reached target Graphical
+//! Interface.` and v250+ as `Reached target multi-user.target - Multi-User
+//! System.` / `Reached target graphical.target - Graphical Interface.` — the
+//! marker set carries both phrasings so any image that finishes its boot
+//! transaction passes. (A factory counterless UKI never reaches
+//! `boot-complete.target` at all: the bless-boot generator only pulls it in
+//! when the selected entry carries counters, so the factory boot completes
+//! through `default.target`, not through the boot-assessment target.)
 //!
 //! **The boot-complete line is not proof that the try-boot machinery ran.**
 //! It is reached whenever the health unit does not hard-fail, whether or not
@@ -137,17 +143,35 @@ pub const BOOT_COMPLETE_MARKER: &str = "Reached target Boot Completion Check";
 /// for an image without the boot-assessment machinery.
 pub const MULTI_USER_MARKER: &str = "Reached target Multi-User System";
 
+/// The systemd ≥ v250 console rendering of `multi-user.target`: the prefix
+/// names the UNIT, the `Description=` follows after `" - "`. Matching the
+/// unit prefix keeps the completion gate honest across both phrasings (the
+/// core26 chain's systemd prints this shape — the migration proof booted a
+/// fully-completed transaction the pre-#84 marker set could not see).
+pub const MULTI_USER_MARKER_UNIT: &str = "Reached target multi-user.target";
+
 /// The systemd line for `graphical.target` — the other `default.target` an
 /// image can link. Kept alongside [`MULTI_USER_MARKER`] so a graphical image
 /// is not failed for completing.
 pub const GRAPHICAL_MARKER: &str = "Reached target Graphical Interface";
 
+/// The systemd ≥ v250 console rendering of `graphical.target`
+/// ([`GRAPHICAL_MARKER`], unit-prefixed shape).
+pub const GRAPHICAL_MARKER_UNIT: &str = "Reached target graphical.target";
+
 /// The default gate's completion signals (issue #84): the boot must have
 /// reached one of these targets, not merely handed off to systemd. A failed
 /// oneshot, an `emergency.target` reboot, or a stall at a console prompt all
-/// leave the log without any of them.
-pub const COMPLETION_MARKERS: &[&str] =
-    &[BOOT_COMPLETE_MARKER, MULTI_USER_MARKER, GRAPHICAL_MARKER];
+/// leave the log without any of them. Each target carries both renderings —
+/// the pre-v250 description-only line and the systemd ≥ v250 unit-prefixed
+/// line — so the gate is chain-independent (core22 and core26 alike).
+pub const COMPLETION_MARKERS: &[&str] = &[
+    BOOT_COMPLETE_MARKER,
+    MULTI_USER_MARKER,
+    MULTI_USER_MARKER_UNIT,
+    GRAPHICAL_MARKER,
+    GRAPHICAL_MARKER_UNIT,
+];
 
 /// Kernel-panic markers; any one fails the run regardless of exit code or
 /// other evidence.
@@ -723,8 +747,10 @@ fn is_handoff_line(line: &str) -> bool {
 }
 
 /// Parse a captured serial console into [`Evidence`]. Pure and hermetic —
-/// the unit tests drive it with synthetic logs.
+/// the unit tests drive it with synthetic logs. Console escape sequences are
+/// display artifacts and are stripped before matching.
 pub fn analyze_log(text: &str) -> Evidence {
+    let text = &strip_ansi_escapes(text);
     let panic = PANIC_MARKERS
         .iter()
         .find_map(|marker| first_line_containing(text, marker));
@@ -930,7 +956,58 @@ fn classify(
 fn read_log(path: &Path) -> String {
     std::fs::read(path)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .map(|text| strip_ansi_escapes(&text))
         .unwrap_or_default()
+}
+
+/// Remove console escape sequences (ANSI CSI, OSC, and bare two-byte ESC
+/// sequences) from captured serial output. The guest colorizes its console
+/// (systemd ≥ v250 queries the console's color capability and paints its
+/// `Reached target …` lines), and the paint lands BETWEEN the words a
+/// marker needs — `Reached target \x1b[0;1;39mmulti-user.target\x1b[0m` —
+/// so matching must happen on the cleaned text. Escape codes are display
+/// artifacts, not boot evidence.
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                // CSI: parameter/intermediate bytes, then a final @-~.
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC: terminated by BEL or ST (ESC \).
+                chars.next();
+                loop {
+                    match chars.next() {
+                        Some('\x07') | None => break,
+                        Some('\x1b') => {
+                            chars.next();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(_) => {
+                // Two-byte escape (e.g. ESC \, ESC ().
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 fn is_kvm_failure(code: i32, stderr: &str, log: &str) -> bool {
@@ -1608,6 +1685,33 @@ SHUTTLE-INIT: switch-root\n\
 Press enter to configure.\n";
 
     #[test]
+    /// The core26 migration proof (issue #28 chain): the pc-kernel 26/stable
+    /// (7.0) boot reaches multi-user/graphical, but systemd ≥ v250 paints the
+    /// console line — the escape codes sit BETWEEN the words a marker needs.
+    /// The cleaned line must complete the gate; the raw line must not.
+    #[test]
+    fn colored_systemd_v250_completion_line_passes() {
+        let painted = "\x1b[0;32m  OK  \x1b[0m Reached target \x1b[0;1;39mmulti-user.target\x1b[0m - Multi-User System.\r\n";
+        assert!(
+            !is_completion_line(painted),
+            "raw colored text must not be the matching path"
+        );
+        let ev = analyze_log(&format!("SHUTTLE-INIT: switch-root\n{painted}"));
+        assert!(
+            ev.completion
+                .as_deref()
+                .is_some_and(|l| l.contains("multi-user.target")),
+            "cleaned text completes: {:?}",
+            ev.completion
+        );
+    }
+
+    #[test]
+    fn ansi_stripper_removes_csi_osc_and_bare_escapes() {
+        let raw = "a\x1b[0;1;39mb\x1b]0;title\x07c\x1b\\d\x1bEe";
+        assert_eq!(strip_ansi_escapes(raw), "abcde");
+    }
+
     fn console_conf_stall_fails_by_default() {
         // The regression from issue #84: userspace is up and shuttle's own
         // /init handed off, but the boot parks on console-conf and never

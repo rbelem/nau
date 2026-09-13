@@ -3233,7 +3233,11 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
             alias,
             index,
         } => index_add(name, summary, store_name, channel, alias, index),
-        IndexCommand::Resolve { index, channel } => index_resolve(&index, &channel),
+        IndexCommand::Resolve {
+            index,
+            channel,
+            base,
+        } => index_resolve(&index, &channel, &base),
     }
 }
 
@@ -3343,8 +3347,9 @@ fn index_add(
 }
 
 /// `shuttle index resolve`: query the Snap Store for every entry's pins and
-/// save the updated index.
-fn index_resolve(index: &str, channel: &str) -> miette::Result<()> {
+/// save the updated index. Base-track passes (`--base core22 …`) pin the
+/// channels the image build derives for kernel/gadget snaps (issue #69).
+fn index_resolve(index: &str, channel: &str, bases: &[String]) -> miette::Result<()> {
     let path = Path::new(index);
     let mut idx = if path.exists() {
         PackageIndex::load(path)?
@@ -3354,7 +3359,7 @@ fn index_resolve(index: &str, channel: &str) -> miette::Result<()> {
     };
 
     eprintln!("Resolving snap pins from store (channel: {channel})...");
-    idx.resolve_all(channel)?;
+    idx.resolve_all(channel, bases)?;
     idx.save(path)?;
     shuttle::output::ok(format!("index updated: {}", index));
     Ok(())

@@ -4,7 +4,12 @@
 -- hardware-specific configuration for x86_64 Ubuntu Core devices.
 --
 -- Register in package index:
---   shuttle index add pc-gadget --summary "PC gadget snap"
+--   shuttle index add pc-gadget --store-name pc --summary "PC gadget snap"
+--
+-- The --store-name is required (issue #68): the store has no snap named
+-- 'pc-gadget' — the generic-PC gadget snap is named 'pc'. Without the
+-- alias, resolution queries the store for a snap that does not exist and
+-- every image build with gadget = index("pc-gadget") fails.
 --
 -- Usage:
 --   image {

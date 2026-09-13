@@ -1427,7 +1427,7 @@ mod boot;
 mod initramfs;
 mod mounts;
 mod partition;
-mod staging;
+pub(crate) mod staging;
 mod state;
 mod verity;
 

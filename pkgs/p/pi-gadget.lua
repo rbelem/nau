@@ -4,7 +4,11 @@
 -- and hardware configuration for Raspberry Pi Ubuntu Core devices.
 --
 -- Register in package index:
---   shuttle index add pi-gadget --summary "Raspberry Pi gadget snap"
+--   shuttle index add pi-gadget --store-name pi --summary "Raspberry Pi gadget snap"
+--
+-- The --store-name is required (issue #68, same class as pc-gadget): the
+-- store has no snap named 'pi-gadget' — the Raspberry Pi gadget snap is
+-- named 'pi'.
 --
 -- Usage:
 --   image {

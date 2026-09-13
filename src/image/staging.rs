@@ -196,6 +196,7 @@ fn resolve_image_snaps(
     lockfile: &LockFile,
     channel: &str,
     arch: &str,
+    cache_dir: &Path,
 ) -> miette::Result<Vec<ResolvedSnap>> {
     let mut resolved = Vec::new();
 
@@ -258,19 +259,22 @@ fn resolve_image_snaps(
                 let index_path = std::path::PathBuf::from(crate::index::DEFAULT_INDEX);
                 if let Ok(idx) = crate::index::PackageIndex::load_or_default(&index_path) {
                     if let Some(entry) = idx.find_by_name_or_alias(&snap_ref.name) {
-                        // Check if the index already has pre-resolved pins for this arch
+                        // Issue #69: a pre-resolved index pin is only
+                        // trusted on the channel it was resolved FROM —
+                        // never on a channel the build derived some other
+                        // way. A pin also carries no download URL, so it is
+                        // only usable when its payload is already in the
+                        // content-addressed cache (the offline path).
                         if let Some(ref pins) = entry.pins {
-                            if let Some(pin_entry) = pins.get(arch) {
-                                eprintln!(
-                                    "  ℹ {}: using pre-resolved pin from index (rev {})",
-                                    snap_ref.name, pin_entry.revision
-                                );
-                                resolved.push(ResolvedSnap {
-                                    name: snap_ref.name.clone(),
-                                    revision: pin_entry.revision,
-                                    sha3_384: pin_entry.sha3_384.clone(),
-                                    download_url: String::new(),
-                                });
+                            if let Some(s) = try_index_pin(
+                                entry,
+                                pins,
+                                &snap_ref.name,
+                                arch,
+                                &effective_channel,
+                                cache_dir,
+                            ) {
+                                resolved.push(s);
                                 continue;
                             }
                         }
@@ -340,6 +344,84 @@ fn resolve_image_snaps(
     Ok(resolved)
 }
 
+/// Use a pre-resolved index pin for `arch` on `effective_channel`, but only
+/// when the pin is trustworthy AND usable (issue #69):
+///
+/// - the pin must be recorded FOR the channel (keyed `"<arch>@<channel>"`,
+///   or a bare pin that itself records a matching channel) — the build
+///   never silently uses a pin resolved on some other channel;
+/// - the pin carries no download URL, so its payload must already sit in
+///   the content-addressed cache, under the local entry name or the store
+///   name (a store-named blob is hard-linked to the local name the
+///   downstream download/verify step expects). A cache miss falls back to
+///   store resolution — it must not fail the build while the store is
+///   still reachable.
+///
+/// Returns `Some(resolved)` when the pin was used; the caller then skips
+/// store resolution for this snap.
+fn try_index_pin(
+    entry: &crate::index::IndexEntry,
+    pins: &HashMap<String, crate::index::PinEntry>,
+    local_name: &str,
+    arch: &str,
+    effective_channel: &str,
+    cache_dir: &Path,
+) -> Option<ResolvedSnap> {
+    let Some(pin_entry) = crate::index::PackageIndex::channel_pin(pins, arch, effective_channel)
+    else {
+        if crate::index::PackageIndex::has_arch_pins(pins, arch) {
+            eprintln!(
+                "  ⚠ {local_name}: index pins exist but none for channel \
+                 '{effective_channel}' — not trusting them (issue #69)"
+            );
+        }
+        return None;
+    };
+
+    let local_path = cache_dir.join(format!(
+        "{local_name}_{}_{}.snap",
+        pin_entry.revision, pin_entry.sha3_384
+    ));
+    if !local_path.exists() {
+        let store_name = entry
+            .store
+            .as_ref()
+            .and_then(|s| s.name.as_deref())
+            .unwrap_or(local_name);
+        let store_path = cache_dir.join(format!(
+            "{store_name}_{}_{}.snap",
+            pin_entry.revision, pin_entry.sha3_384
+        ));
+        if store_path.exists() {
+            if let Err(e) = std::fs::hard_link(&store_path, &local_path) {
+                eprintln!("  ⚠ could not hard-link {store_path:?} → {local_path:?}: {e}");
+                if std::fs::copy(&store_path, &local_path).is_err() {
+                    return None;
+                }
+            }
+        } else {
+            eprintln!(
+                "  ⚠ {local_name}: index pin (rev {}, channel {effective_channel}) is \
+                 not in the snap cache — resolving from the store",
+                pin_entry.revision
+            );
+            return None;
+        }
+    }
+
+    eprintln!(
+        "  ℹ {local_name}: using pre-resolved pin from index (rev {}, channel \
+         {effective_channel}, cached payload)",
+        pin_entry.revision
+    );
+    Some(ResolvedSnap {
+        name: local_name.to_string(),
+        revision: pin_entry.revision,
+        sha3_384: pin_entry.sha3_384.clone(),
+        download_url: String::new(),
+    })
+}
+
 /// Kernel-payload policy for [`stage_rootfs`] — the ONE behavioral seam
 /// between the squashfs-only path (`build_image`) and the disk path
 /// (`build_disk_image`), both of which share the staging sequence.
@@ -391,7 +473,7 @@ pub(crate) fn stage_rootfs(
     lockfile: &mut LockFile,
     policy: KernelPayloadPolicy,
 ) -> miette::Result<StagedRootfs> {
-    let resolved = resolve_image_snaps(runner, image, lockfile, channel, arch)?;
+    let resolved = resolve_image_snaps(runner, image, lockfile, channel, arch, cache_dir)?;
     let snap_paths = download_and_verify(runner, &resolved, cache_dir)?;
 
     let has_unsquashfs = runner

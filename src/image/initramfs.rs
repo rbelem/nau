@@ -19,10 +19,14 @@
 //! that module's dependency paths, all relative to the `modules/<ver>/`
 //! directory. Shuttle's boot-chain requirement is expressed as module
 //! *names* (`dm-verity`, from [`crate::doctor::required_initrd_modules`]),
-//! so [`module_closure`] resolves each name to its one `.ko` path, walks the
-//! dependency graph, and returns the full path set dependency-first (`insmod`
-//! order). Every ambiguous, missing, cyclic, or compressed case fails closed
-//! — an initramfs that cannot load its boot chain is a brick.
+//! so [`module_closure`] resolves each name to its one `.ko` path (a
+//! `.ko.xz`/`.ko.zst`/`.ko.gz` on-disk spelling resolves to the same
+//! module — Ubuntu kernels ≥ 6.x ship compressed modules), walks the
+//! dependency graph, and returns the full path set dependency-first
+//! (`insmod` order). Packing then decompresses such modules so the archive
+//! carries plain `.ko` files the busybox `insmod` can load. Every
+//! ambiguous, missing, cyclic, or undecompressable case fails closed — an
+//! initramfs that cannot load its boot chain is a brick.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -48,40 +52,98 @@ pub(crate) fn parse_modules_dep(text: &str) -> BTreeMap<String, Vec<String>> {
     map
 }
 
-/// A module path that is compressed on disk. The kernel's initramfs loader
-/// and busybox `insmod` do not decompress modules, so shipping one would
-/// produce an initramfs that cannot load its boot chain.
-const COMPRESSED_SUFFIXES: [&str; 3] = [".ko.xz", ".ko.zst", ".ko.gz"];
+/// Compression suffixes Ubuntu kernels put on module files. The kernel's
+/// initramfs loader and busybox `insmod` cannot decompress modules, so a
+/// compressed module is unpacked at pack time ([`decompress_module`]) and
+/// stored under its plain `.ko` name.
+const COMPRESSION_SUFFIXES: [&str; 3] = [".zst", ".xz", ".gz"];
 
-/// The compression suffix `path` carries, if any.
-fn compressed_suffix(path: &str) -> Option<&'static str> {
-    COMPRESSED_SUFFIXES
+/// The compression suffix `path` ends with, if any (`dm-verity.ko.zst` →
+/// `".zst"`).
+fn compression_suffix(path: &str) -> Option<&'static str> {
+    COMPRESSION_SUFFIXES
         .into_iter()
         .find(|suffix| path.ends_with(suffix))
 }
 
-/// Fail closed on a compressed module anywhere in the resolved closure.
-fn reject_compressed(path: &str) -> miette::Result<()> {
-    let Some(suffix) = compressed_suffix(path) else {
-        return Ok(());
+/// `path` with its compression suffix stripped (`a.ko.zst` → `a.ko`); a
+/// plain path passes through unchanged. The `.ko` itself is kept — the
+/// unpacked module is a normal `.ko` file.
+fn unpacked_rel(path: &str) -> &str {
+    match compression_suffix(path) {
+        Some(suffix) => &path[..path.len() - suffix.len()],
+        None => path,
+    }
+}
+
+/// Decompress a compressed module's bytes with the matching host tool
+/// (`zstd`/`xz`/`gzip -dc`). The kernel's initramfs loader and busybox
+/// `insmod` cannot decompress modules, so the archive must carry the plain
+/// `.ko`; a missing tool or a failed decompression fails closed.
+fn decompress_module(data: Vec<u8>, rel: &str) -> miette::Result<Vec<u8>> {
+    let Some(suffix) = compression_suffix(rel) else {
+        return Ok(data);
     };
-    Err(miette::miette!(
-        "module '{path}' is compressed ({suffix}) — the kernel initramfs loader and \
-         busybox insmod cannot decompress modules, so shipping it would produce an \
-         initramfs that cannot load its boot chain; unpack the module tree before \
-         building the initramfs"
-    ))
+    let tool = match suffix {
+        ".zst" => "zstd",
+        ".xz" => "xz",
+        ".gz" => "gzip",
+        other => unreachable!("unhandled compression suffix {other}"),
+    };
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(tool)
+        .arg("-dc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            miette::miette!(
+                "module '{rel}' is compressed ({suffix}) but {tool} is unavailable: {e} — \
+                 the initramfs must carry the decompressed module, and busybox insmod \
+                 cannot load the compressed form; install {tool}"
+            )
+        })?;
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(&data)
+        .map_err(|e| miette::miette!("writing '{rel}' to {tool}: {e}"))?;
+    // Drop stdin so the tool sees EOF.
+    drop(child.stdin.take());
+    let mut out = Vec::new();
+    child
+        .stdout
+        .as_mut()
+        .expect("stdout piped")
+        .read_to_end(&mut out)
+        .map_err(|e| miette::miette!("reading {tool} output for '{rel}': {e}"))?;
+    let result = child
+        .wait()
+        .map_err(|e| miette::miette!("waiting for {tool}: {e}"))?;
+    if !result.success() {
+        return Err(miette::miette!(
+            "{tool} failed to decompress module '{rel}' (exit {}): the initramfs must \
+             carry the decompressed module and busybox insmod cannot load the \
+             compressed form",
+            result.code().unwrap_or(-1)
+        ));
+    }
+    Ok(out)
 }
 
 /// Resolve a module *name* (`dm-verity`) to its single `.ko` path in the dep
-/// map by matching the basename `"<name>.ko"` across the keys. Zero or more
-/// than one match is a fail-closed error naming the module and the
-/// candidates — a silent pick would ship the wrong module.
+/// map by matching the basename `"<name>.ko"` (optionally carrying a
+/// compression suffix — `dm-verity.ko.zst` is the same module) across the
+/// keys. Zero or more than one match is a fail-closed error naming the
+/// module and the candidates — a silent pick would ship the wrong module.
 fn resolve_module_path(name: &str, deps: &BTreeMap<String, Vec<String>>) -> miette::Result<String> {
     let wanted = format!("{name}.ko");
     let candidates: Vec<&String> = deps
         .keys()
-        .filter(|path| path.rsplit('/').next() == Some(wanted.as_str()))
+        .filter(|path| unpacked_rel(path.rsplit('/').next().unwrap_or(path)) == wanted.as_str())
         .collect();
     match candidates.as_slice() {
         [only] => Ok((*only).clone()),
@@ -108,8 +170,9 @@ fn resolve_module_path(name: &str, deps: &BTreeMap<String, Vec<String>>) -> miet
 /// deduplicated. Sibling order is sorted, so the result does not depend on
 /// input ordering or on map iteration.
 ///
-/// Fails closed on an unresolved required name, a missing dependency, a
-/// dependency cycle, or a compressed module.
+/// Fails closed on an unresolved required name, a missing dependency, or a
+/// dependency cycle. A compressed on-disk spelling resolves normally; the
+/// pack step decompresses it ([`decompress_module`]).
 pub(crate) fn module_closure(
     required: &[String],
     deps: &BTreeMap<String, Vec<String>>,
@@ -125,9 +188,6 @@ pub(crate) fn module_closure(
     let mut state: BTreeMap<String, Visit> = BTreeMap::new();
     for root in &roots {
         visit(root, deps, &mut order, &mut state, &mut Vec::new())?;
-    }
-    for path in &order {
-        reject_compressed(path)?;
     }
     Ok(order)
 }
@@ -527,7 +587,9 @@ fn closure_modules(modules_root: &Path, required: &[String]) -> miette::Result<V
 }
 
 /// Read every payload the archive needs, so assembly can build borrowed
-/// entries over stable buffers.
+/// entries over stable buffers. A compressed module is decompressed here
+/// and staged under its plain `.ko` name — the `/modules.load` contract
+/// and the archive member names are the unpacked spellings.
 fn stage_files(
     tools: &InitramfsTools,
     modules_root: &Path,
@@ -538,11 +600,16 @@ fn stage_files(
     for rel in modules {
         let absolute = modules_root.join(rel);
         let data = read_input(&absolute, &format!("module '{rel}'"))?;
-        staged_modules.push((rel.clone(), data));
+        let data = decompress_module(data, rel)?;
+        staged_modules.push((unpacked_rel(rel).to_string(), data));
     }
+    let staged_names: Vec<String> = staged_modules
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
     Ok(StagedFiles {
         init: include_str!("initramfs/init").as_bytes().to_vec(),
-        modules_load: modules_load_text(version, modules),
+        modules_load: modules_load_text(version, &staged_names),
         busybox: read_input(&tools.busybox, "busybox")?,
         findfs: read_input(&tools.findfs, "findfs")?,
         veritysetup: read_input(&tools.veritysetup, "veritysetup")?,
@@ -689,7 +756,13 @@ pub(crate) fn build_native_initramfs(
     let required = required_modules(config_path)?;
     let modules = closure_modules(modules_root, &required)?;
     let staged = stage_files(tools, modules_root, &modules, version)?;
-    let entries = archive_entries(version, &modules, &staged);
+    // Archive paths (and `/modules.load`) use the staged (unpacked) names.
+    let unpacked: Vec<String> = staged
+        .modules
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let entries = archive_entries(version, &unpacked, &staged);
     let archive = newc_archive(&entries);
     let gz = gzip_bytes(&archive);
     std::fs::create_dir_all(out_dir).map_err(|e| {
@@ -832,12 +905,28 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
     }
 
     #[test]
-    fn closure_rejects_compressed_module() {
-        let deps = parse_modules_dep("a.ko: a.ko.xz\na.ko.xz:\n");
-        let err = module_closure(&["a".to_string()], &deps).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("a.ko.xz"), "{msg}");
-        assert!(msg.contains("compressed"), "{msg}");
+    fn closure_resolves_a_compressed_module_spelling() {
+        // Ubuntu kernels ≥ 6.x ship modules compressed; the dep-map path
+        // still names the module, so resolution succeeds (a tree carrying
+        // BOTH spellings would be ambiguous — real maps carry one).
+        let deps = parse_modules_dep("kernel/drivers/a.ko.xz:\n");
+        let order = module_closure(&["a".to_string()], &deps).unwrap();
+        assert_eq!(order, vec!["kernel/drivers/a.ko.xz".to_string()]);
+    }
+
+    #[test]
+    fn resolve_module_path_matches_compressed_basenames() {
+        let deps = parse_modules_dep(
+            "kernel/drivers/md/dm-verity.ko.zst:\nkernel/drivers/block/virtio_blk.ko:\n",
+        );
+        assert_eq!(
+            resolve_module_path("dm-verity", &deps).unwrap(),
+            "kernel/drivers/md/dm-verity.ko.zst"
+        );
+        assert_eq!(
+            resolve_module_path("virtio_blk", &deps).unwrap(),
+            "kernel/drivers/block/virtio_blk.ko"
+        );
     }
 
     fn fixture_entries() -> Vec<CpioEntry<'static>> {
@@ -1106,10 +1195,18 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
     }
 
     #[test]
-    fn build_fails_closed_on_a_compressed_required_module() {
+    fn build_decompresses_a_compressed_dependency() {
         let root = tempfile::tempdir().unwrap();
         let (modules_root, config) = write_fixture_tree(root.path());
-        // Rewrite the dep so dm-bufio resolves to a compressed path.
+        // Compress the dm-bufio fixture on disk the way a modern kernel
+        // snap ships it, and point modules.dep at the compressed spelling.
+        let bufio = std::fs::read(modules_root.join(DM_BUFIO)).unwrap();
+        std::fs::write(
+            modules_root.join("kernel/drivers/md/dm-bufio.ko.xz"),
+            &bufio,
+        )
+        .unwrap();
+        std::fs::remove_file(modules_root.join(DM_BUFIO)).unwrap();
         std::fs::write(
             modules_root.join("modules.dep"),
             "kernel/drivers/block/virtio_blk.ko:\n\
@@ -1118,13 +1215,22 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
         )
         .unwrap();
         let tools = write_fixture_tools(root.path());
-        let err =
-            build_native_initramfs(&tools, &modules_root, &config, FIXTURE_VERSION, root.path())
-                .unwrap_err();
-        let msg = format!("{err:#}");
+        let out_dir = root.path().join("out");
+        let initramfs =
+            build_native_initramfs(&tools, &modules_root, &config, FIXTURE_VERSION, &out_dir)
+                .unwrap();
+        // The archive carries the DECOMPRESSED module: the plain `.ko`
+        // member is present, the `.ko.xz` spelling is not.
+        let gz = std::fs::read(&initramfs).unwrap();
+        let members = crate::doctor::cpio_newc_members(&gunzip(&gz)).unwrap();
+        let bufio_member = format!("lib/modules/{FIXTURE_VERSION}/kernel/drivers/md/dm-bufio.ko");
         assert!(
-            msg.contains("compressed") && msg.contains(".ko.xz"),
-            "{msg}"
+            members.iter().any(|m| m == &bufio_member),
+            "archive carries the unpacked module: {members:?}"
+        );
+        assert!(
+            !members.iter().any(|m| m.ends_with(".ko.xz")),
+            "no compressed module ships: {members:?}"
         );
     }
 
