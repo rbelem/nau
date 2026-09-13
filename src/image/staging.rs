@@ -437,6 +437,217 @@ pub(crate) enum KernelPayloadPolicy {
     Required,
 }
 
+// ── The host binary ships inside the image (#81) ──
+
+/// Staged-rootfs-relative path the running shuttle binary is embedded at.
+///
+/// `/usr/bin` is deliberate (#81): the default boot units exec the binary,
+/// so it must live inside the hashed (dm-verity) base tree at a pinned,
+/// deterministic location — not on a writable partition an A/B flip or a
+/// corrupted state disk could take away, and not resolved through PATH.
+/// `usr/bin` already hosts the app-command binaries the build materializes
+/// ([`crate::units::emit_app_runtime`]), and systemd's own search-path
+/// convention puts package binaries there.
+///
+/// The emitted units exec the ABSOLUTE spelling `/{SHUTTLE_BIN_PATH}`
+/// (systemd requires an absolute `ExecStart=`); [`SHUTTLE_BIN_PATH`] is the
+/// single source of truth and the `unit_exec_targets_match_the_staged_binary_path`
+/// test asserts the two cannot drift.
+pub(crate) const SHUTTLE_BIN_PATH: &str = "usr/bin/shuttle";
+
+/// Copy the running shuttle binary into the staged rootfs at
+/// [`SHUTTLE_BIN_PATH`] (#81).
+///
+/// The image build runs inside the shuttle process, so
+/// [`std::env::current_exe`] is the exact binary this build was made with —
+/// the local build ships itself, no network fetch, no host-path leakage into
+/// the image content (the staged file is a copy; the host source path is
+/// never written into any image file). Any failure fails the build closed:
+/// the emitted boot units exec `/usr/bin/shuttle` by absolute path, so an
+/// image whose health path cannot work must never be packed.
+///
+/// Reproducibility: the staged file carries only the copied bytes and
+/// `0755` permissions — the same treatment as every other build-emitted
+/// file; `mksquashfs`/`mkfs.ext4` timestamp clamping (SOURCE_DATE_EPOCH)
+/// applies to it like to the rest of the tree.
+///
+/// The source is [`embed_source`]: under `cfg(test)` that is a tiny fixture
+/// (the test executable is a 200 MB+ artifact, and copying it into every
+/// staged rootfs slows the suite and starves the load-sensitive autotools
+/// e2e tests of I/O headroom); in production it is always the running
+/// binary — the KVM boot proof pins the real end-to-end behavior.
+pub(crate) fn embed_shuttle_binary(
+    runner: &dyn CommandRunner,
+    root: &Path,
+    arch: &str,
+) -> miette::Result<()> {
+    embed_binary_at(root, &embed_source()?)?;
+    anchor_binary_to_guest(runner, &root.join(SHUTTLE_BIN_PATH), arch)
+}
+
+/// The dynamic-loader path the guest provides for `arch`.
+///
+/// The embedded binary must exec inside the IMAGE, whose loader lives at
+/// the FHS path — never at a build-host path (the devbox/nix toolchain
+/// bakes its own store interpreter into the ELF it produces).
+fn guest_interpreter(arch: &str) -> miette::Result<&'static str> {
+    match arch {
+        "amd64" | "x86_64" => Ok("/lib64/ld-linux-x86-64.so.2"),
+        "arm64" | "aarch64" => Ok("/lib/ld-linux-aarch64.so.1"),
+        other => Err(miette::miette!(
+            "no guest interpreter mapping for arch '{other}' — cannot stage the \
+             shuttle binary for the image (issue #81)"
+        )),
+    }
+}
+
+/// Re-anchor the staged binary to the guest (#81).
+///
+/// A devbox/nix-built ELF requests its interpreter from the build host's
+/// store (`/nix/store/…/ld-linux-…`) and carries that store in RUNPATH —
+/// paths that do not exist inside the image, where the exec would fail with
+/// the exact "No such file or directory" #81 closes. When the staged file's
+/// interpreter is not already the guest's standard path, `patchelf`
+/// (already part of this repo's toolchain, `snap.rs` ELF repair) rewrites it
+/// to [`guest_interpreter`] and drops the host RUNPATH — unprivileged,
+/// deterministic, and strictly REMOVING host paths from the image. A file
+/// patchelf cannot parse (static binary, test fixture) needs no anchoring
+/// and is skipped with a note.
+fn anchor_binary_to_guest(
+    runner: &dyn CommandRunner,
+    staged: &Path,
+    arch: &str,
+) -> miette::Result<()> {
+    let guest = guest_interpreter(arch)?;
+    let staged_str = staged.to_string_lossy().into_owned();
+    let has_patchelf = runner
+        .run(&["which".to_string(), "patchelf".to_string()])
+        .ok()
+        .is_some_and(|o| o.code == 0);
+
+    let out = match runner.run(&[
+        "patchelf".to_string(),
+        "--print-interpreter".to_string(),
+        staged_str.clone(),
+    ]) {
+        Ok(out) => out,
+        Err(e) if !has_patchelf => {
+            return Err(miette::miette!(
+                "patchelf is required to stage the shuttle binary into the image \
+                 (#81): the build-host ELF must be re-anchored to the guest loader \
+                 before it can exec on-device. Install patchelf (devbox ships it) \
+                 and rebuild: {e}"
+            ));
+        }
+        Err(e) => {
+            return Err(miette::miette!(
+                "cannot inspect /{SHUTTLE_BIN_PATH} with patchelf: {e}"
+            ));
+        }
+    };
+    if crate::command::exit_code(&out) != 0 {
+        eprintln!(
+            "  ℹ /{SHUTTLE_BIN_PATH}: not a dynamically linked ELF — no guest \
+             anchoring needed"
+        );
+        return Ok(());
+    }
+    let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if current == guest {
+        return Ok(());
+    }
+    if !has_patchelf {
+        return Err(miette::miette!(
+            "/{SHUTTLE_BIN_PATH} requests interpreter '{current}', which does not \
+             exist in the image, and patchelf is unavailable to re-anchor it to \
+             '{guest}' — the embedded binary would be inert on-device (#81). \
+             Install patchelf (devbox ships it) and rebuild."
+        ));
+    }
+    let out = runner
+        .run(&[
+            "patchelf".to_string(),
+            "--set-interpreter".to_string(),
+            guest.to_string(),
+            "--remove-rpath".to_string(),
+            staged_str.clone(),
+        ])
+        .map_err(|e| miette::miette!("patchelf failed: {e}"))?;
+    if crate::command::exit_code(&out) != 0 {
+        return Err(miette::miette!(
+            "patchelf could not re-anchor /{SHUTTLE_BIN_PATH} to '{guest}' — \
+             refusing to ship a binary the guest cannot exec (#81)"
+        ));
+    }
+    eprintln!(
+        "  ✓ /{SHUTTLE_BIN_PATH} anchored to the guest loader '{guest}' \
+         (was '{current}')"
+    );
+    Ok(())
+}
+
+/// The bytes staged at [`SHUTTLE_BIN_PATH`]: the running shuttle binary
+/// (production), a small fixture under test.
+#[cfg(test)]
+fn embed_source() -> miette::Result<PathBuf> {
+    static FIXTURE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let path = FIXTURE.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("shuttle-embed-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create embed fixture dir");
+        let file = dir.join("shuttle");
+        std::fs::write(&file, b"\x7fELF-shuttle-embed-fixture").expect("write embed fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+                .expect("set embed fixture mode");
+        }
+        file
+    });
+    Ok(path.clone())
+}
+
+/// The production [`embed_source`]: the running shuttle binary itself.
+#[cfg(not(test))]
+fn embed_source() -> miette::Result<PathBuf> {
+    std::env::current_exe().map_err(|e| {
+        miette::miette!(
+            "cannot locate the running shuttle binary to embed at /{SHUTTLE_BIN_PATH} \
+             (issue #81): {e}"
+        )
+    })
+}
+
+/// [`embed_shuttle_binary`] with an explicit source file — the seam the
+/// unit tests drive. Copies `source` to `root/usr/bin/shuttle`, mode `0755`.
+pub(crate) fn embed_binary_at(root: &Path, source: &Path) -> miette::Result<()> {
+    let dest = root.join(SHUTTLE_BIN_PATH);
+    std::fs::create_dir_all(dest.parent().expect("usr/bin has a parent"))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("creating /{}", SHUTTLE_BIN_PATH))?;
+    std::fs::copy(source, &dest)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "embedding the shuttle binary {} → /{SHUTTLE_BIN_PATH}",
+                source.display()
+            )
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .into_diagnostic()
+            .wrap_err_with(|| format!("setting exec mode on /{SHUTTLE_BIN_PATH}"))?;
+    }
+    let kib = std::fs::metadata(&dest)
+        .map(|m| m.len() / 1024)
+        .unwrap_or(0);
+    eprintln!("  ✓ embedded shuttle binary ({kib} KiB) → /{SHUTTLE_BIN_PATH} (#81)");
+    Ok(())
+}
+
 /// A fully staged rootfs — the shared result of [`stage_rootfs`]. Owns the
 /// build directory (dropping it removes the staged tree) alongside the
 /// resolved snaps, the `(name, snap)` pairs the manifest and snap-copy
@@ -498,6 +709,11 @@ pub(crate) fn stage_rootfs(
         has_unsquashfs,
         policy,
     )?;
+
+    // #81: the image ships the shuttle binary the boot units exec. Shared
+    // by both build paths so every staged rootfs carries /usr/bin/shuttle;
+    // a failure here fails the build closed (the units name it absolutely).
+    embed_shuttle_binary(runner, &root, arch)?;
 
     Ok(StagedRootfs {
         build_dir,
@@ -811,4 +1027,157 @@ fn copy_kernel_tree(kernel_dir: &Path, root: &Path) -> miette::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embed_binary_stages_the_executable_at_the_pinned_path() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let src_file = source.path().join("shuttle-under-test");
+        std::fs::write(&src_file, b"\x7fELF-fake-binary").unwrap();
+
+        embed_binary_at(root.path(), &src_file).unwrap();
+
+        let staged = root.path().join(SHUTTLE_BIN_PATH);
+        assert!(staged.is_file(), "binary staged at /{SHUTTLE_BIN_PATH}");
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"\x7fELF-fake-binary",
+            "staged bytes are the copied binary"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&staged).unwrap().permissions().mode();
+            assert_eq!(mode & 0o755, 0o755, "staged binary is executable: {mode:o}");
+        }
+    }
+
+    #[test]
+    fn embed_binary_fails_closed_on_an_unreadable_source() {
+        let root = tempfile::tempdir().unwrap();
+        let err = embed_binary_at(root.path(), Path::new("/nonexistent/shuttle")).unwrap_err();
+        assert!(
+            format!("{err:?}").contains(SHUTTLE_BIN_PATH),
+            "failure names the pinned install path: {err:?}"
+        );
+        assert!(
+            !root.path().join(SHUTTLE_BIN_PATH).exists(),
+            "nothing staged on failure"
+        );
+    }
+
+    #[test]
+    fn unit_exec_targets_match_the_staged_binary_path() {
+        // Issue #81: the units exec the binary the build embeds. The
+        // absolute spelling and the staged-rootfs-relative path must agree,
+        // or the emitted units are inert (203/EXEC) by construction.
+        let absolute = format!("/{SHUTTLE_BIN_PATH}");
+        assert_eq!(BOOT_HEALTH_EXEC, format!("{absolute} runtime activate"));
+        assert_eq!(ACTIVATE_EXEC, format!("{absolute} runtime activate"));
+    }
+
+    #[test]
+    fn guest_interpreter_maps_the_supported_arches() {
+        assert_eq!(
+            guest_interpreter("amd64").unwrap(),
+            "/lib64/ld-linux-x86-64.so.2"
+        );
+        assert_eq!(
+            guest_interpreter("x86_64").unwrap(),
+            "/lib64/ld-linux-x86-64.so.2"
+        );
+        assert_eq!(
+            guest_interpreter("arm64").unwrap(),
+            "/lib/ld-linux-aarch64.so.1"
+        );
+        assert!(
+            guest_interpreter("riscv64").is_err(),
+            "unknown arch fails closed"
+        );
+    }
+
+    #[test]
+    fn anchor_repoints_a_foreign_interpreter_to_the_guest() {
+        // Real patchelf against a REAL dynamic ELF (a copy of this test
+        // binary, whose nix toolchain interpreter is a host-store path) —
+        // proving the anchoring the guest needs, not just the seam shape.
+        if !crate::command::RealRunner
+            .run(&["which".to_string(), "patchelf".to_string()])
+            .ok()
+            .is_some_and(|o| o.code == 0)
+        {
+            eprintln!("skipping: patchelf not on PATH");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let source = std::env::current_exe().unwrap();
+        let staged = root.path().join("shuttle");
+        std::fs::copy(&source, &staged).unwrap();
+
+        anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
+
+        let out = crate::command::RealRunner
+            .run(&[
+                "patchelf".to_string(),
+                "--print-interpreter".to_string(),
+                staged.to_string_lossy().into_owned(),
+            ])
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "/lib64/ld-linux-x86-64.so.2",
+            "interpreter re-anchored to the guest loader"
+        );
+        let out = crate::command::RealRunner
+            .run(&[
+                "patchelf".to_string(),
+                "--print-rpath".to_string(),
+                staged.to_string_lossy().into_owned(),
+            ])
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "host store RUNPATH removed: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[test]
+    fn anchor_skips_a_non_elf_fixture_instead_of_failing() {
+        // The test embed fixture is not a real ELF; anchoring must skip it
+        // (a static/foreign binary needs no loader) rather than fail.
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("shuttle");
+        std::fs::write(&staged, b"not-an-elf").unwrap();
+        anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
+        assert!(staged.is_file(), "file untouched");
+    }
+
+    #[test]
+    fn anchor_is_a_noop_when_the_interpreter_already_matches_the_guest() {
+        if !crate::command::RealRunner
+            .run(&["which".to_string(), "patchelf".to_string()])
+            .ok()
+            .is_some_and(|o| o.code == 0)
+        {
+            eprintln!("skipping: patchelf not on PATH");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let source = std::env::current_exe().unwrap();
+        let staged = root.path().join("shuttle");
+        std::fs::copy(&source, &staged).unwrap();
+        // First anchor, then anchor again: the second pass must observe the
+        // guest interpreter and change nothing (no second set call).
+        anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
+        let before = std::fs::read(&staged).unwrap();
+        anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
+        let after = std::fs::read(&staged).unwrap();
+        assert_eq!(before, after, "second anchor is a byte-identical no-op");
+    }
 }

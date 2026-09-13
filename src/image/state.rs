@@ -239,18 +239,13 @@ pub(crate) const ACTIVATE_UNIT_PATH: &str =
 
 /// ExecStart program for the activation oneshot.
 ///
-/// The repo's on-device convention is a bare `shuttle` resolved from
-/// PATH — the confined-app launcher emits `exec shuttle run` (see
-/// [`crate::snap`] `emit_confined_launcher`), and no in-tree code ships
-/// the binary at a fixed image path. systemd resolves a bare ExecStart
-/// name through the fixed search path
-/// (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`), so
-/// the assumption is: **the image ships the shuttle binary in one of
-/// those directories** (e.g. `/usr/bin/shuttle`). If the binary lands
-/// elsewhere the unit is inert — the exact trap ADR-0024 warns about —
-/// so this constant is the single place to change when the image build
-/// gains a definitive install path.
-pub(crate) const ACTIVATE_EXEC: &str = "shuttle runtime activate";
+/// Pinned absolutely to `/{SHUTTLE_BIN_PATH}` (i.e. `/usr/bin/shuttle`,
+/// issue #81): the image build embeds the shuttle binary at that exact
+/// path (see [`super::staging::embed_shuttle_binary`]), so the exec target
+/// exists in every image the build produces — inside the dm-verity-hashed
+/// tree, no PATH lookup. A test asserts the absolute prefix and the staged
+/// path cannot drift apart.
+pub(crate) const ACTIVATE_EXEC: &str = "/usr/bin/shuttle runtime activate";
 
 /// Render the boot-time activation oneshot (ADR-0023 §4). It is
 /// `Type=oneshot` with `RemainAfterExit=yes`, so the activation is a

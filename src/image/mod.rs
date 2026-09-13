@@ -2347,7 +2347,7 @@ Type=oneshot
 RemainAfterExit=yes
 # Idempotent and boot-safe: a cold store is a no-op and a
 # half-written journal is discarded (see activate_current).
-ExecStart=shuttle runtime activate
+ExecStart=/usr/bin/shuttle runtime activate
 
 [Install]
 WantedBy=multi-user.target
@@ -2365,7 +2365,7 @@ WantedBy=multi-user.target
         let text = std::fs::read_to_string(&unit).unwrap();
         assert!(text.contains("Type=oneshot"), "oneshot: {text}");
         assert!(text.contains("RemainAfterExit=yes"));
-        assert!(text.contains("ExecStart=shuttle runtime activate"));
+        assert!(text.contains("ExecStart=/usr/bin/shuttle runtime activate"));
         assert!(text.contains("WantedBy=multi-user.target"));
         assert!(
             text.contains("RequiresMountsFor=/var/lib"),
@@ -4125,7 +4125,7 @@ Before=boot-complete.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=shuttle runtime activate
+ExecStart=/usr/bin/shuttle runtime activate
 
 [Install]
 RequiredBy=boot-complete.target
@@ -4137,7 +4137,9 @@ RequiredBy=boot-complete.target
     fn boot_health_command_is_the_single_constant() {
         // The default command is a single constant; assert the emitted unit
         // spells it exactly so an override cannot silently drift it.
-        assert_eq!(BOOT_HEALTH_EXEC, "shuttle runtime activate");
+        // Issue #81: the constant is the absolute pinned install path the
+        // build stages — a bare `shuttle` PATH lookup shipped no binary.
+        assert_eq!(BOOT_HEALTH_EXEC, "/usr/bin/shuttle runtime activate");
         assert!(
             boot_health_service_content(BOOT_HEALTH_EXEC)
                 .contains(&format!("ExecStart={BOOT_HEALTH_EXEC}\n")),
@@ -4160,7 +4162,10 @@ RequiredBy=boot-complete.target
             "default command is fully replaced: {overridden}"
         );
         assert_eq!(
-            overridden.replace("ExecStart=/bin/true", "ExecStart=shuttle runtime activate"),
+            overridden.replace(
+                "ExecStart=/bin/true",
+                "ExecStart=/usr/bin/shuttle runtime activate",
+            ),
             boot_health_service_content(BOOT_HEALTH_EXEC),
             "override changes only the ExecStart command"
         );
@@ -4292,6 +4297,18 @@ RequiredBy=boot-complete.target
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("libsystemd-shared-240.so"), b"ELF").unwrap();
         assert_eq!(base_systemd_major(root.path()), Some(240));
+    }
+
+    #[test]
+    fn base_systemd_major_reads_the_multiarch_triplet_dir() {
+        // Debian/Ubuntu systemd >= v257 moved the shared lib into the
+        // multi-arch triplet dir — measured on core26:
+        // usr/lib/x86_64-linux-gnu/systemd/libsystemd-shared-259.so.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("usr/lib/x86_64-linux-gnu/systemd");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libsystemd-shared-259.so"), b"ELF").unwrap();
+        assert_eq!(base_systemd_major(root.path()), Some(259));
     }
 
     #[test]
@@ -5336,7 +5353,18 @@ RequiredBy=boot-complete.target
                 self.calls.lock().unwrap().push(argv.to_vec());
                 let program = argv.first().map(String::as_str).unwrap_or("");
                 match program {
-                    "which" => Ok(out(0, Vec::new())), // unsquashfs + sfdisk present
+                    "which" => Ok(out(0, Vec::new())), // unsquashfs + sfdisk + patchelf present
+                    "patchelf" => {
+                        // #81 embed seam: the fake binary reads as requesting
+                        // a foreign (host-store) interpreter, and the
+                        // re-anchor answers success — the tests assert the
+                        // calls went through this seam.
+                        if argv.iter().any(|a| a == "--print-interpreter") {
+                            Ok(out(0, b"/nix/store/fake/ld-linux-x86-64.so.2\n".to_vec()))
+                        } else {
+                            Ok(out(0, Vec::new()))
+                        }
+                    }
                     "curl" => {
                         let url = argv.last().map(String::as_str).unwrap_or("");
                         if url.contains("/assertions/") {
@@ -5538,10 +5566,33 @@ RequiredBy=boot-complete.target
                 packed.iter().any(|p| p == "bin"),
                 "packed rootfs carries the extracted base tree: {packed:?}"
             );
+            // Issue #81: the staged rootfs ships the shuttle binary the
+            // boot units exec — staged here from the test embed fixture.
+            assert!(
+                packed.iter().any(|p| p == staging::SHUTTLE_BIN_PATH),
+                "packed rootfs carries the embedded shuttle binary: {packed:?}"
+            );
 
             // Seam proof: the expected tools were invoked through the
             // runner — never as real subprocesses.
             let calls = runner.calls();
+            // #81: the embedded binary was re-anchored to the guest loader
+            // through the seam.
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.first().is_some_and(|p| p == "patchelf")
+                        && c.iter().any(|a| a == "--print-interpreter")),
+                "embedded binary inspected through the seam: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.first().is_some_and(|p| p == "patchelf")
+                        && c.iter().any(|a| a == "--set-interpreter")
+                        && c.iter().any(|a| a == "--remove-rpath")),
+                "embedded binary re-anchored through the seam: {calls:?}"
+            );
             assert!(
                 calls.iter().any(|c| c == &["which", "unsquashfs"]),
                 "unsquashfs availability checked through the runner: {calls:?}"

@@ -9,7 +9,8 @@
 --   - GPT disk: ESP (vfat) + A/B roots (ext4, dm-verity) + state + swap
 --   - systemd-boot bootloader
 --   - disk.ab + update_source → sysupdate transfer files, the try-boot
---     counters, and boot-complete.target gated by the #78 health override
+--     counters, and boot-complete.target gated by the shipped shuttle
+--     binary (issue #81 — the default health path works, no override)
 --   - role = "state" partition → the persistent state surface (ADR-0023)
 --
 -- Build:
@@ -128,13 +129,11 @@ return {
         -- build time (the build never mints one).
         update_source = "https://updates.example.com/shuttle/ubuntu-core-pc-26/",
 
-        -- #78 health override: the generated boot-health gate defaults to
-        -- `shuttle runtime activate`, which needs the shuttle binary inside
-        -- the guest. An example image ships no such binary, so the gate is
-        -- satisfied with a trivially-successful exec; a real deployment
-        -- replaces this with its own health check (or ships shuttle and
-        -- drops the override).
-        boot_health_exec = "/bin/true",
+        -- Issue #81: no boot_health_exec override — the image ships the
+        -- shuttle binary at /usr/bin/shuttle (staged from the local build),
+        -- so the default gate `/usr/bin/shuttle runtime activate` works.
+        -- A real deployment can still override it with its own health
+        -- check (issue #78).
 
         sysctl = {
             "vm.swappiness=100",

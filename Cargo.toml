@@ -51,6 +51,13 @@ cc = { version = "1.2", features = ["parallel"] }
 flate2 = "1"
 tar = "0.4"
 
+[profile.release]
+# The image build embeds this binary into every image it builds at
+# /usr/bin/shuttle (issue #81): strip the symbol table so the shipped
+# artifact — and every A/B slot and update payload carrying it — stays
+# small. The guest never needs symbols: the boot units exec it headlessly.
+strip = true
+
 [dev-dependencies]
 # Dependency-fetch integration tests (issue #13): compute npm SRI
 # integrity and wheel hashes for the loopback registry fixtures.

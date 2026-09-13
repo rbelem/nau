@@ -227,7 +227,14 @@ pub(crate) const BLESS_BOOT_EXEC: &str = "/usr/lib/systemd/systemd-bless-boot go
 /// the default health check is a meaningful liveness/consistency gate, not
 /// an invented probe. This constant is the seam the follow-up health-check
 /// DSL ticket replaces; a test asserts the emitted unit spells it exactly.
-pub(crate) const BOOT_HEALTH_EXEC: &str = "shuttle runtime activate";
+///
+/// The program is pinned absolutely to `/{SHUTTLE_BIN_PATH}` (i.e.
+/// `/usr/bin/shuttle`): issue #81 — every image build embeds the shuttle
+/// binary there (see [`super::staging::embed_shuttle_binary`]), so the
+/// default gate runs the real binary instead of assuming a PATH hit that
+/// never existed. A test asserts the absolute prefix and the staged path
+/// cannot drift apart.
+pub(crate) const BOOT_HEALTH_EXEC: &str = "/usr/bin/shuttle runtime activate";
 
 /// Render `systemd-bless-boot.service` (ADR-0024 §3, #63).
 ///
@@ -425,18 +432,43 @@ pub(crate) const SYSTEMD_SHARED_LIB_PREFIX: &str = "libsystemd-shared-";
 /// The staged rootfs directories the systemd shared lib lives under.
 ///
 /// `usr/lib/systemd` is the merged-/usr spelling (every Ubuntu Core base);
-/// `lib/systemd` is kept for a non-merged layout.
+/// `lib/systemd` is kept for a non-merged layout. The multi-arch triplet
+/// dirs (`usr/lib/<triplet>/systemd`) are discovered per rootfs in
+/// [`systemd_lib_dirs`]: Debian/Ubuntu systemd ≥ v257 moved the shared libs
+/// there (measured on core26: `usr/lib/x86_64-linux-gnu/systemd/
+/// libsystemd-shared-259.so`), and the triplet is arch-specific.
 const SYSTEMD_LIB_DIRS: [&str; 2] = ["usr/lib/systemd", "lib/systemd"];
+
+/// Every staged-rootfs dir the systemd shared lib may live under: the fixed
+/// [`SYSTEMD_LIB_DIRS`] spellings plus any `usr/lib/<triplet>/systemd`
+/// multi-arch dir the base carries.
+fn systemd_lib_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = SYSTEMD_LIB_DIRS.iter().map(|d| root.join(d)).collect();
+    if let Ok(read) = std::fs::read_dir(root.join("usr/lib")) {
+        let mut multiarch: Vec<PathBuf> = read
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("-linux-"))
+            })
+            .map(|p| p.join("systemd"))
+            .collect();
+        dirs.append(&mut multiarch);
+    }
+    dirs
+}
 
 /// The base rootfs's systemd major version, read statically from the staged
 /// tree — [`SYSTEMD_SHARED_LIB_PREFIX`] explains the mechanism. `None` means
 /// "cannot be determined" and the build gate fails closed on it.
 pub(crate) fn base_systemd_major(root: &Path) -> Option<u32> {
     let mut best: Option<u32> = None;
-    for dir in SYSTEMD_LIB_DIRS {
-        let entries = match std::fs::read_dir(root.join(dir)) {
+    for dir in systemd_lib_dirs(root) {
+        let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(_) => continue, // dir absent — try the other spelling
+            Err(_) => continue, // dir absent — try the next spelling
         };
         for entry in entries.flatten() {
             let file_name = entry.file_name();
@@ -499,9 +531,10 @@ pub(crate) fn assert_base_systemd_supports_boot_assessment(root: &Path) -> miett
     let Some(major) = base_systemd_major(root) else {
         return Err(miette::miette!(
             "could not determine the base's systemd version: no \
-             {SYSTEMD_SHARED_LIB_PREFIX}<major>.so under {} in the staged \
-             rootfs, so the boot-assessment gate (#79) cannot assert systemd \
-             >= {BOOT_ASSESSMENT_MIN_MAJOR}. Failing closed — check that the \
+             {SYSTEMD_SHARED_LIB_PREFIX}<major>.so under {} (or any \
+             usr/lib/<triplet>/systemd multi-arch dir) in the staged rootfs, \
+             so the boot-assessment gate (#79) cannot assert systemd >= \
+             {BOOT_ASSESSMENT_MIN_MAJOR}. Failing closed — check that the \
              base snap was extracted (unsquashfs) and is a systemd rootfs",
             SYSTEMD_LIB_DIRS.join(" / ")
         ));
