@@ -204,6 +204,7 @@ fn main() -> miette::Result<()> {
             firmware_dir,
             runs,
             expect_counter_seq,
+            allow_no_completion,
             json,
         } => {
             shuttle::output::set_mode(json);
@@ -216,6 +217,7 @@ fn main() -> miette::Result<()> {
                 firmware_dir,
                 runs,
                 expect_counter_seq,
+                allow_no_completion,
                 json,
             )
         }
@@ -2413,6 +2415,7 @@ fn cmd_test(
     firmware_dir: Option<String>,
     runs: u32,
     expect_counter_seq: Option<String>,
+    allow_no_completion: bool,
     json: bool,
 ) -> miette::Result<()> {
     let image_path = PathBuf::from(&image);
@@ -2440,6 +2443,7 @@ fn cmd_test(
         required: require,
         runs,
         expect_counters,
+        allow_no_completion,
     };
 
     if !json {

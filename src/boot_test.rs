@@ -13,49 +13,56 @@
 //! therefore driven with UEFI firmware (OVMF/edk2) through two pflash
 //! drives: a read-only code image and a writable NVRAM copy.
 //!
-//! # What counts as "booted"
+//! # What counts as "booted" (and *completed*)
 //!
 //! Deliberately **not** "QEMU started" and **not** "the kernel printed its
-//! banner" — both are rejected by the ticket. Success requires, in the
-//! captured serial console:
+//! banner" — both are rejected by the ticket. Since issue #84, success
+//! requires, in the captured serial console:
 //!
 //! 1. no kernel panic, **and**
 //! 2. a userspace marker (`systemd[1]:`, a `Reached target …` line, `Started …`,
 //!    or the `Welcome to …` banner), **and**
 //! 3. the shuttle init handoff that this project's own initramfs prints after
-//!    the verified root is mounted and `switch_root` is issued.
+//!    the verified root is mounted and `switch_root` is issued (required
+//!    minimum, never sufficient alone), **and**
+//! 4. a *completion* signal: a `Reached target …` line for a target that
+//!    systemd only reaches when the boot transaction finished —
+//!    `boot-complete.target` (`Boot Completion Check`, the synchronization
+//!    point ADR-0024 §3 uses for try-boot assessment) on A/B images, or
+//!    otherwise `multi-user.target` / `graphical.target`, i.e. a completed
+//!    `default.target`.
 //!
-//! The exact markers live in [`USERSPACE_MARKERS`]/[`PANIC_MARKERS`] and can
-//! be tightened per run with `--require <substring>`.
+//! The exact markers live in [`COMPLETION_MARKERS`]/[`PANIC_MARKERS`] and can
+//! be tightened per run with `--require <substring>`. Images that legitimately
+//! never reach a completed target opt out with `--allow-no-completion`, which
+//! restores the pre-#84 handoff-only gate.
 //!
-//! # Why "init handoff", and not any service line
+//! # Why "completion", and not the init handoff alone
 //!
-//! Requiring an arbitrary service line was both too strict and too weak. Too
-//! strict: a `quiet` image that parks on an interactive console prompt — Ubuntu
-//! Core's console-conf, for instance — never prints the generic systemd target
-//! lines, so a perfectly successful boot could not be asserted. Too weak: the
-//! first `Started …` line can come from a unit that failed or was cancelled,
-//! which proves a job was *attempted*, not that the system reached a usable
-//! state.
+//! Through the 2026-09 QEMU session the default gate was the handoff marker
+//! alone. That is a *liveness* assertion — "the initramfs handed off to
+//! systemd" — and it blessed four boots that were actually broken: two that
+//! rebooted into `emergency.target` seconds into userspace, one that stalled
+//! at console-conf before `default.target`, and one whose
+//! `systemd-bless-boot.service` unit failed after the handoff (issue #84, see
+//! also #63). A `Type=oneshot` failure or a stall after the handoff leaves no
+//! trace the handoff-only gate can see, and a timeout kill after the markers
+//! were written passed for the same reason. Completion is the difference
+//! try-boot assessment exists to detect, so the default must require it.
 //!
-//! The default gate is instead the [`BOOT_HANDOFF_MARKER`] line emitted by
-//! shuttle's own `/init` ([`crate::image`]), immediately before it hands PID 1
-//! to `systemd`. That marker is present in every image shuttle builds, and it
-//! cannot appear unless the whole boot chain this project is responsible for
-//! actually worked: PARTUUID resolved without udev, dm-verity opened, the
-//! verified root mounted read-only, and the handoff issued. It is the closest
-//! thing to "the image booted" that is observable in a `quiet` boot without
-//! relying on a target a given image may not emit.
-//!
-//! # Strict mode: boot-complete.target
+//! # boot-complete.target vs multi-user.target
 //!
 //! An image built with an A/B disk and an `update_source` additionally emits
-//! `boot-complete.target` and a health gate (ADR-0024 §3), and the target line
-//! is available as `--require "Reached target Boot Completion Check"`.
+//! `boot-complete.target` and a health gate (ADR-0024 §3); it is the first
+//! entry in [`COMPLETION_MARKERS`] and the strongest assertion. On an image
+//! without the boot-assessment machinery, `multi-user.target` (or
+//! `graphical.target`) is the completed `default.target` systemd renders as
+//! `Reached target Multi-User System.` / `Reached target Graphical
+//! Interface.`, so any image that finishes its boot transaction passes.
 //!
-//! **That line is not proof that the try-boot machinery ran.** It is reached
-//! whenever the health unit does not hard-fail, whether or not boot counting
-//! was ever in effect: the factory UKI is installed counterless
+//! **The boot-complete line is not proof that the try-boot machinery ran.**
+//! It is reached whenever the health unit does not hard-fail, whether or not
+//! boot counting was ever in effect: the factory UKI is installed counterless
 //! (`{name}_{version}.efi`, no `+N-M` suffix — `src/image/boot.rs`), and
 //! `systemd-bless-boot-generator` only pulls `systemd-bless-boot.service` into
 //! the initial transaction when the *selected* entry carries counters. The
@@ -68,9 +75,6 @@
 //! suffix. The serial line conflates "the target was reached" with "the
 //! counter cleared", and those are different claims (see #63).
 //!
-//! It is not the default because a single-slot image emits no such target, and
-//! a default must hold for every image, not only the A/B ones.
-//!
 //! # Timeout seam
 //!
 //! QEMU is a long-lived process: a booted system that never powers off runs
@@ -79,7 +83,9 @@
 //! [`wrapper_argv`]) so the seam stays a single blocking call and the bound
 //! is visible in the exact argv the fake runner asserts. `timeout` exits
 //! `124` when it had to kill the guest; that code alone is **not** a failure
-//! — a boot that produced the userspace markers before the kill passes.
+//! — but a kill only passes once a completion signal was seen (or the run
+//! opted out with `--allow-no-completion`). A boot killed before any
+//! completion target fails regardless of how many earlier markers it wrote.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -124,6 +130,24 @@ pub const BOOT_HANDOFF_MARKER: &str = "SHUTTLE-INIT: switch-root";
 /// why this string is the description. A unit test pins it to the emitted
 /// unit so the two cannot drift.
 pub const BOOT_COMPLETE_MARKER: &str = "Reached target Boot Completion Check";
+
+/// The systemd line for `multi-user.target` — the rendered `Description=` of
+/// the classic `default.target`. systemd prints it only when the boot
+/// transaction reached the default target, which is what "completed" means
+/// for an image without the boot-assessment machinery.
+pub const MULTI_USER_MARKER: &str = "Reached target Multi-User System";
+
+/// The systemd line for `graphical.target` — the other `default.target` an
+/// image can link. Kept alongside [`MULTI_USER_MARKER`] so a graphical image
+/// is not failed for completing.
+pub const GRAPHICAL_MARKER: &str = "Reached target Graphical Interface";
+
+/// The default gate's completion signals (issue #84): the boot must have
+/// reached one of these targets, not merely handed off to systemd. A failed
+/// oneshot, an `emergency.target` reboot, or a stall at a console prompt all
+/// leave the log without any of them.
+pub const COMPLETION_MARKERS: &[&str] =
+    &[BOOT_COMPLETE_MARKER, MULTI_USER_MARKER, GRAPHICAL_MARKER];
 
 /// Kernel-panic markers; any one fails the run regardless of exit code or
 /// other evidence.
@@ -204,6 +228,10 @@ pub struct BootTest {
     /// Expected try-boot counter sequence, one element per boot, observed
     /// BEFORE each boot. Empty disables counter assertions.
     pub expect_counters: Vec<ExpectedCounters>,
+    /// Opt-out of the completion gate (issue #84): a boot that reached the
+    /// init handoff passes without a completed target. For images that
+    /// legitimately never reach one.
+    pub allow_no_completion: bool,
 }
 
 /// One expected try-boot observation, parsed from `--expect-counter-seq`.
@@ -655,6 +683,9 @@ pub struct Evidence {
     pub handoff: Option<String>,
     /// First boot-complete line, if any (only an A/B image emits it).
     pub boot_complete: Option<String>,
+    /// First line matching a [`COMPLETION_MARKERS`] entry, if any — the
+    /// default gate's "the boot completed" signal.
+    pub completion: Option<String>,
     /// First panic marker line, if any.
     pub panic: Option<String>,
     /// The shuttle activation unit was mentioned.
@@ -679,6 +710,12 @@ fn is_service_line(line: &str) -> bool {
 
 fn is_boot_complete_line(line: &str) -> bool {
     line.contains(BOOT_COMPLETE_MARKER)
+}
+
+fn is_completion_line(line: &str) -> bool {
+    COMPLETION_MARKERS
+        .iter()
+        .any(|marker| line.contains(marker))
 }
 
 fn is_handoff_line(line: &str) -> bool {
@@ -708,6 +745,10 @@ pub fn analyze_log(text: &str) -> Evidence {
         .lines()
         .find(|line| is_boot_complete_line(line))
         .map(|line| line.trim().to_string());
+    let completion = text
+        .lines()
+        .find(|line| is_completion_line(line))
+        .map(|line| line.trim().to_string());
     let handoff = text
         .lines()
         .find(|line| is_handoff_line(line))
@@ -718,6 +759,7 @@ pub fn analyze_log(text: &str) -> Evidence {
         service,
         handoff,
         boot_complete,
+        completion,
         panic,
         activate: text.contains(ACTIVATE_UNIT),
         markers,
@@ -737,6 +779,10 @@ pub enum Failure {
     NoUserspace,
     /// Userspace was reached but the shuttle init handoff never appeared.
     NoHandoff,
+    /// The handoff happened but no completion target was reached (and the
+    /// run did not pass `--allow-no-completion`): a stall, a failed oneshot,
+    /// or an `emergency.target` reboot after the handoff (issue #84).
+    NoCompletion,
     /// A `--require` substring was absent from the log.
     MissingRequirement(String),
     /// QEMU itself failed to run (non-zero exit, non-empty stderr).
@@ -751,6 +797,7 @@ impl Failure {
             Failure::Timeout => "timeout",
             Failure::NoUserspace => "no-userspace",
             Failure::NoHandoff => "no-handoff",
+            Failure::NoCompletion => "no-completion",
             Failure::MissingRequirement(_) => "missing-requirement",
             Failure::Qemu { .. } => "qemu-error",
         }
@@ -783,7 +830,7 @@ impl Outcome {
         let Some(failure) = &self.failure else {
             let what = self
                 .evidence
-                .boot_complete
+                .completion
                 .as_deref()
                 .or(self.evidence.handoff.as_deref())
                 .or(self.evidence.target.as_deref())
@@ -816,6 +863,14 @@ impl Outcome {
                  boot never got as far as the verify+switch_root handoff; raise --timeout or \
                  inspect the serial evidence"
             ),
+            Failure::NoCompletion => format!(
+                "boot handed off to systemd but never completed: no completion target line \
+                 ('{BOOT_COMPLETE_MARKER}', '{MULTI_USER_MARKER}', or '{GRAPHICAL_MARKER}') in \
+                 the serial log — the boot stalled, a unit failed, or it rebooted into \
+                 emergency/rescue after the handoff (possibly killed by the --timeout bound \
+                 first). Pass --allow-no-completion only for images that legitimately never \
+                 reach a completed target"
+            ),
             Failure::MissingRequirement(needle) => {
                 format!("required marker not found in the serial log: {needle}")
             }
@@ -827,14 +882,17 @@ impl Outcome {
 }
 
 /// Classify a completed run. Panic wins over everything; a timeout is only
-/// reported when no userspace marker appeared (a boot killed after reaching
-/// userspace passes).
+/// reported when no userspace marker appeared (otherwise the run is judged by
+/// the completion gate below). Since issue #84 the boot must have reached a
+/// completion target ([`COMPLETION_MARKERS`]) after the handoff; the
+/// `allow_no_completion` opt-out restores the handoff-only gate.
 fn classify(
     text: &str,
     evidence: &Evidence,
     code: i32,
     stderr: &str,
     required: &[String],
+    allow_no_completion: bool,
 ) -> Option<Failure> {
     if evidence.panic.is_some() {
         return Some(Failure::Panic);
@@ -853,6 +911,13 @@ fn classify(
     }
     if evidence.handoff.is_none() {
         return Some(Failure::NoHandoff);
+    }
+    // Completion gate (issue #84). The handoff proves the initramfs worked;
+    // only a completed target proves the boot did. A timeout kill (124) after
+    // the markers were written fails here too — the markers are liveness, not
+    // completion.
+    if evidence.completion.is_none() && !allow_no_completion {
+        return Some(Failure::NoCompletion);
     }
     for needle in required {
         if !text.contains(needle) {
@@ -904,7 +969,14 @@ pub fn run_boot(runner: &dyn CommandRunner, test: &BootTest) -> miette::Result<O
     }
 
     let evidence = analyze_log(&text);
-    let failure = classify(&text, &evidence, out.code, &out.stderr, &test.required);
+    let failure = classify(
+        &text,
+        &evidence,
+        out.code,
+        &out.stderr,
+        &test.required,
+        test.allow_no_completion,
+    );
     Ok(Outcome {
         accel,
         argv,
@@ -1297,6 +1369,7 @@ SHUTTLE-INIT: switch-root\n\
             required: Vec::new(),
             runs: 1,
             expect_counters: Vec::new(),
+            allow_no_completion: false,
         }
     }
 
@@ -1535,17 +1608,44 @@ SHUTTLE-INIT: switch-root\n\
 Press enter to configure.\n";
 
     #[test]
-    fn console_conf_boot_passes_on_the_init_handoff() {
-        // The regression case: userspace is up and shuttle's own /init handed
-        // off — this must PASS even though the boot parks on console-conf and
-        // never prints a generic service line.
+    fn console_conf_stall_fails_by_default() {
+        // The regression from issue #84: userspace is up and shuttle's own
+        // /init handed off, but the boot parks on console-conf and never
+        // reaches default.target. The handoff-only gate passed it; the
+        // default completion gate must fail it.
         let ev = analyze_log(CONSOLE_CONF_LOG);
         assert!(ev.userspace, "console-conf proves userspace");
         assert!(ev.panic.is_none());
         assert_eq!(ev.handoff.as_deref(), Some("SHUTTLE-INIT: switch-root"));
+        assert!(
+            ev.completion.is_none(),
+            "a console-conf stall never reaches a completed target"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let test = sample_test(tmp.path(), Accel::Kvm, true);
+        let runner = FakeRunner::new(vec![Script {
+            code: 124,
+            stderr: String::new(),
+            log: CONSOLE_CONF_LOG.to_string(),
+        }]);
+        let out = run_boot(&runner, &test).unwrap();
+        assert!(!out.passed());
+        assert_eq!(out.failure, Some(Failure::NoCompletion));
+        assert!(
+            out.message().contains("never completed"),
+            "{}",
+            out.message()
+        );
+    }
+
+    #[test]
+    fn allow_no_completion_restores_the_handoff_gate() {
+        // The explicit opt-out: an image that legitimately parks before any
+        // completed target passes again, handoff required as the minimum.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut test = sample_test(tmp.path(), Accel::Kvm, true);
+        test.allow_no_completion = true;
         let runner = FakeRunner::new(vec![Script {
             code: 124,
             stderr: String::new(),
@@ -1556,19 +1656,131 @@ Press enter to configure.\n";
         assert!(out.message().contains("switch-root"), "{}", out.message());
     }
 
+    /// A *real* failure shape from issue #84: a zeroed state partition sent
+    /// userspace into `local-fs.target` -> `emergency.target` ->
+    /// `OnFailure=reboot.target` about 2s after the handoff. QEMU `-no-reboot`
+    /// exits 0 on the guest reboot. Userspace and handoff markers are all
+    /// present — which is exactly why the old gate passed it.
+    const EMERGENCY_REBOOT_LOG: &str = "\
+SHUTTLE-INIT: switch-root\n\
+[    1.512003] systemd[1]: systemd 255 running in system mode.\n\
+[    2.113744] systemd[1]: Reached target Local File Systems.\n\
+[    2.204112] systemd[1]: Reached target Emergency Mode.\n\
+[    2.310884] systemd[1]: Starting Reboot...\n\
+[    2.402551] systemd[1]: Reached target Reboot.\n\
+[    2.512290] reboot: Restarting system\n";
+
+    #[test]
+    fn emergency_reboot_after_handoff_fails_by_default() {
+        // Issue #84 acceptance: the handoff is liveness, not completion. The
+        // machine rebooted into emergency ~2s into userspace; the log has
+        // userspace + handoff markers and a clean exit, but no completed
+        // target, so the default gate must fail it.
+        let tmp = tempfile::tempdir().unwrap();
+        let test = sample_test(tmp.path(), Accel::Kvm, true);
+        let runner = FakeRunner::new(vec![Script {
+            code: 0,
+            stderr: String::new(),
+            log: EMERGENCY_REBOOT_LOG.to_string(),
+        }]);
+        let out = run_boot(&runner, &test).unwrap();
+        assert!(!out.passed());
+        assert_eq!(out.failure, Some(Failure::NoCompletion));
+    }
+
+    #[test]
+    fn timeout_after_markers_fails_without_completion() {
+        // Issue #84 acceptance: a timeout kill (exit 124) after the userspace
+        // markers were written used to pass; without a completion signal it
+        // must fail — the markers say systemd ran, not that boot finished.
+        let log = "\
+SHUTTLE-INIT: switch-root\n\
+[    2.100000] systemd[1]: systemd 255 running in system mode.\n\
+[    3.200000] systemd[1]: Reached target Basic System.\n\
+[    4.900000] systemd[1]: Started some-long-running-unit.service.\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let test = sample_test(tmp.path(), Accel::Kvm, true);
+        let runner = FakeRunner::new(vec![Script {
+            code: 124,
+            stderr: String::new(),
+            log: log.to_string(),
+        }]);
+        let out = run_boot(&runner, &test).unwrap();
+        assert!(!out.passed());
+        assert_eq!(out.failure, Some(Failure::NoCompletion));
+    }
+
+    #[test]
+    fn boot_complete_target_passes_by_default() {
+        // Issue #84 acceptance: an A/B boot that reaches
+        // boot-complete.target passes with no flags at all — the completion
+        // gate is the default, not an opt-in.
+        let log = format!(
+            "\
+SHUTTLE-INIT: switch-root\n\
+[    2.100000] systemd[1]: systemd 255 running in system mode.\n\
+[    3.200000] systemd[1]: Reached target Basic System.\n\
+[    4.400000] systemd[1]: {BOOT_COMPLETE_MARKER}.\n"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let test = sample_test(tmp.path(), Accel::Kvm, true);
+        let runner = FakeRunner::new(vec![Script {
+            code: 124,
+            stderr: String::new(),
+            log,
+        }]);
+        let out = run_boot(&runner, &test).unwrap();
+        assert!(out.passed(), "{}", out.message());
+        assert_eq!(
+            out.evidence.completion.as_deref(),
+            Some("[    4.400000] systemd[1]: Reached target Boot Completion Check.")
+        );
+    }
+
+    #[test]
+    fn multi_user_target_passes_without_boot_assessment() {
+        // Issue #84 acceptance: an image without the boot-assessment
+        // machinery (no boot-complete.target) still passes when the boot
+        // transaction completes — multi-user.target is a completed
+        // default.target. [`PASS_LOG`] reaches Multi-User System and carries
+        // no Boot Completion Check line.
+        let ev = analyze_log(PASS_LOG);
+        assert_eq!(
+            ev.boot_complete, None,
+            "fixture must exercise the no-boot-assessment path"
+        );
+        assert!(ev.completion.is_some());
+        let tmp = tempfile::tempdir().unwrap();
+        let test = sample_test(tmp.path(), Accel::Kvm, true);
+        let runner = FakeRunner::new(vec![Script {
+            code: 124,
+            stderr: String::new(),
+            log: PASS_LOG.to_string(),
+        }]);
+        let out = run_boot(&runner, &test).unwrap();
+        assert!(out.passed(), "{}", out.message());
+        assert!(
+            out.message().contains("Multi-User System"),
+            "{}",
+            out.message()
+        );
+    }
+
     #[test]
     fn strict_require_boot_complete_is_opt_in() {
         // An A/B image that emits the completion target: --require tightens
-        // the gate to the line the try-boot machinery waits on.
+        // the gate beyond the default to the line the try-boot machinery
+        // waits on.
         let tmp = tempfile::tempdir().unwrap();
         let mut test = sample_test(tmp.path(), Accel::Kvm, true);
         test.required = vec![BOOT_COMPLETE_MARKER.to_string()];
 
-        // Without the target line, the handoff alone is not enough.
+        // A multi-user completion alone does not satisfy the stricter
+        // --require assertion.
         let runner = FakeRunner::new(vec![Script {
             code: 124,
             stderr: String::new(),
-            log: CONSOLE_CONF_LOG.to_string(),
+            log: PASS_LOG.to_string(),
         }]);
         let out = run_boot(&runner, &test).unwrap();
         assert_eq!(

@@ -411,17 +411,26 @@ pub enum Command {
         app_args: Vec<String>,
     },
 
-    /// Boot a built disk image in QEMU and assert it reached userspace and
-    /// completed shuttle's init handoff (issue #50). The programmatic "did the
-    /// image boot?" proof behind try-boot/revert: exits non-zero and archives
-    /// the serial console as evidence when the assertion fails.
+    /// Boot a built disk image in QEMU and assert the boot actually
+    /// COMPLETED (issue #84), not merely reached userspace: the programmatic
+    /// "did the image boot?" proof behind try-boot/revert — exits non-zero
+    /// and archives the serial console as evidence when the assertion fails.
     ///
-    /// Success requires no kernel panic, a userspace marker, and the
+    /// Success requires no kernel panic, a userspace marker, the
     /// `SHUTTLE-INIT: switch-root` line shuttle's own `/init` prints after it
-    /// opens dm-verity and hands PID 1 to systemd. Pass `--require` to tighten
-    /// it further — for an A/B image that emits `boot-complete.target`, the
-    /// strongest assertion is `--require "Reached target Boot Completion
-    /// Check"`.
+    /// opens dm-verity and hands PID 1 to systemd, and a COMPLETION signal:
+    /// a `Reached target Boot Completion Check` line (A/B images with the
+    /// try-boot machinery) or a completed `default.target` (`Reached target
+    /// Multi-User System` / `Reached target Graphical Interface`). The
+    /// handoff alone is a liveness assertion and passes broken boots —
+    /// emergency.target reboots, console-conf stalls, failed oneshots — so a
+    /// boot that never reaches a completed target FAILS, including a boot
+    /// killed by `--timeout` after the markers were written. Pass
+    /// `--allow-no-completion` only for images that legitimately never reach
+    /// a completed target.
+    ///
+    /// `--require` tightens further; for an A/B image the strongest
+    /// assertion is `--require "Reached target Boot Completion Check"`.
     ///
     /// `--runs N` boots the image N times in sequence, and
     /// `--expect-counter-seq` asserts the systemd-boot try-boot counters
@@ -430,8 +439,8 @@ pub enum Command {
         /// Path to the built disk image (`.img`) to boot.
         image: String,
 
-        /// Boot timeout in seconds. QEMU is killed when it elapses; a boot
-        /// that reached the init handoff before the kill still passes.
+        /// Boot timeout in seconds. QEMU is killed when it elapses; the kill
+        /// still passes when a completion target was reached before it.
         #[arg(long, default_value_t = 120)]
         timeout: u64,
 
@@ -451,6 +460,13 @@ pub enum Command {
         /// that emits the try-boot completion target.
         #[arg(long = "require")]
         require: Vec<String>,
+
+        /// Accept a boot that reached the init handoff without ever reaching
+        /// a completed target (issue #84 opt-out). Restores the pre-#84
+        /// handoff-only gate; use only for images that legitimately never
+        /// reach `boot-complete.target` or `default.target`.
+        #[arg(long = "allow-no-completion")]
+        allow_no_completion: bool,
 
         /// Directory holding the UEFI firmware (`OVMF_CODE.fd`/`OVMF_VARS.fd`
         /// or the edk2 equivalents). Default: auto-discovered.
@@ -1775,6 +1791,7 @@ mod tests {
                 firmware_dir,
                 runs,
                 expect_counter_seq,
+                allow_no_completion,
                 json,
             } => {
                 assert_eq!(image, "disk.img");
@@ -1785,6 +1802,7 @@ mod tests {
                 assert!(firmware_dir.is_none());
                 assert_eq!(runs, 1);
                 assert!(expect_counter_seq.is_none());
+                assert!(!allow_no_completion);
                 assert!(!json);
             }
             _ => panic!("expected Test"),
@@ -1823,6 +1841,7 @@ mod tests {
                 require,
                 runs,
                 expect_counter_seq,
+                allow_no_completion,
                 json,
                 ..
             } => {
@@ -1832,6 +1851,7 @@ mod tests {
                 assert_eq!(require, ["first", "Reached target Multi-User System."]);
                 assert_eq!(runs, 4);
                 assert_eq!(expect_counter_seq.as_deref(), Some("3-0,2-1,1-2,0-3"));
+                assert!(!allow_no_completion);
                 assert!(json);
             }
             _ => panic!("expected Test"),
