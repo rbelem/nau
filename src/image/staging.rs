@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use miette::IntoDiagnostic;
+use miette::{IntoDiagnostic, WrapErr};
 use serde::Deserialize;
 
 use super::*;
@@ -621,6 +621,85 @@ fn embed_source() -> miette::Result<PathBuf> {
 
 /// [`embed_shuttle_binary`] with an explicit source file — the seam the
 /// unit tests drive. Copies `source` to `root/usr/bin/shuttle`, mode `0755`.
+/// Stage the image declaration's `files =` entries verbatim into the
+/// staged rootfs (#80). Runs before the rootfs is hashed, so dm-verity
+/// covers every declared file. Fails closed: a missing source, an
+/// unreadable file, or a dest that escapes the staged root aborts the
+/// build — an image that silently dropped a declared file would boot
+/// without the tooling it declared.
+pub(crate) fn stage_extra_files(root: &Path, files: &[StagedFile]) -> miette::Result<()> {
+    for file in files {
+        stage_one_file(root, file)?;
+    }
+    Ok(())
+}
+
+/// Stage one `files =` entry: copy `source` into the staged root at the
+/// absolute guest path `dest`, mirroring the source's permission mode
+/// (the exec bit must survive for staged executables).
+fn stage_one_file(root: &Path, file: &StagedFile) -> miette::Result<()> {
+    let rel = file
+        .dest
+        .strip_prefix('/')
+        .expect("dest validated absolute at parse time");
+    let dest = root.join(rel);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("creating {}", parent.display()))?;
+    }
+    ensure_inside_root(root, &dest, &file.dest)?;
+    let bytes = std::fs::read(&file.source)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading files[].source {}", file.source.display()))?;
+    std::fs::write(&dest, &bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("staging {} → /{rel}", file.source.display()))?;
+    mirror_source_mode(&file.source, &dest, rel)?;
+    eprintln!("  ✓ staged file: /{rel} ← {}", file.source.display());
+    Ok(())
+}
+
+/// Defense in depth beyond the parse-time `..` check: resolve the
+/// destination through any existing symlinks and refuse anything that
+/// lands outside the staged root (e.g. a base-shipped `/lib → usr/lib`
+/// symlink under a declared `/lib/...` dest).
+fn ensure_inside_root(root: &Path, dest: &Path, declared: &str) -> miette::Result<()> {
+    let canonical_root = root
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("canonicalizing staged root {}", root.display()))?;
+    let canonical_parent = dest
+        .parent()
+        .expect("dest has a parent after create_dir_all")
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("resolving {}", dest.display()))?;
+    let resolved = canonical_parent.join(dest.file_name().expect("dest has a file name"));
+    if !resolved.starts_with(&canonical_root) {
+        return Err(miette::miette!(
+            "files[].dest {declared:?} escapes the staged root — refusing to stage"
+        ));
+    }
+    Ok(())
+}
+
+/// Copy the source file's permission bits onto the staged copy.
+fn mirror_source_mode(source: &Path, dest: &Path, rel: &str) -> miette::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(source)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o644);
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode))
+            .into_diagnostic()
+            .wrap_err_with(|| format!("setting mode on /{rel}"))?;
+    }
+    let _ = (source, dest, rel);
+    Ok(())
+}
+
 pub(crate) fn embed_binary_at(root: &Path, source: &Path) -> miette::Result<()> {
     let dest = root.join(SHUTTLE_BIN_PATH);
     std::fs::create_dir_all(dest.parent().expect("usr/bin has a parent"))

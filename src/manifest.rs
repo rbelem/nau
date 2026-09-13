@@ -759,6 +759,7 @@ mod tests {
             disk: None,
             sysctl: vec![],
             update_source: None,
+            files: vec![],
             boot_health_exec: None,
         }
     }
@@ -800,6 +801,7 @@ mod tests {
             disk: None,
             sysctl: vec![],
             update_source: None,
+            files: vec![],
             boot_health_exec: None,
         }
     }

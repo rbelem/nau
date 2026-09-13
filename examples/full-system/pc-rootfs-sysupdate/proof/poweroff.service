@@ -1,0 +1,14 @@
+[Unit]
+Description=shuttle-80 proof: poweroff once the evidence is on the console
+# Ordered only after sibling service units — NEVER after a target: these
+# units are pulled into the default.target transaction via the
+# systemd.wants= kernel parameter, and an After= against a target that
+# (transitively) wants them is an ordering cycle; systemd would delete the
+# job and the clean poweroff would never run (measured, #80 proof).
+After=shuttle-80-proof.service systemd-sysupdate.service
+
+[Service]
+Type=oneshot
+# Let the console flush the completion-target lines before QEMU exits.
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/systemctl poweroff

@@ -1,0 +1,11 @@
+[Unit]
+# Diagnostic companion for the #80 proof: run the same transfer set with
+# the `list` verb at debug log level, straight to the console.
+After=systemd-sysupdate.service
+
+[Service]
+Type=oneshot
+Environment=SYSTEMD_LOG_LEVEL=debug
+StandardOutput=journal+console
+StandardError=journal+console
+ExecStart=/usr/bin/sh /usr/libexec/shuttle-80/diag.sh

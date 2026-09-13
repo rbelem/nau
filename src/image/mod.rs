@@ -67,6 +67,7 @@ pub mod test_support {
             bootloader: None,
             disk: None,
             sysctl: vec![],
+            files: vec![],
             update_source: None,
             boot_health_exec: None,
         }
@@ -99,6 +100,19 @@ pub struct BootloaderConfig {
     /// silently ignored.
     pub type_: String,
     pub timeout: u32,
+}
+
+/// One host file staged verbatim into the image rootfs (`files =` in the
+/// image declaration, #80).
+///
+/// `dest` must be an absolute path inside the guest tree
+/// (`/usr/bin/systemd-sysupdate`); `source` is resolved against the
+/// directory of the declaring `--file` lua (absolute paths pass through).
+/// Staged BEFORE the rootfs is hashed, so dm-verity covers them.
+#[derive(Debug, Clone)]
+pub struct StagedFile {
+    pub source: PathBuf,
+    pub dest: String,
 }
 
 /// Full disk layout definition.
@@ -171,6 +185,11 @@ pub struct ImageDeclaration {
     pub bootloader: Option<BootloaderConfig>,
     pub disk: Option<DiskLayout>,
     pub sysctl: Vec<String>,
+    /// Extra host files staged verbatim into the rootfs (#80). The
+    /// update flow needs system tooling the base rootfs does not ship
+    /// (systemd-sysupdate), so an image can declare `files =` entries;
+    /// they land in the hashed tree before dm-verity formats it.
+    pub files: Vec<StagedFile>,
     /// Base URL of the systemd-sysupdate payload source (ADR-0011 step
     /// (d)); transfer files are emitted only when set — a local-source
     /// transfer would carry no verification, and unverifiable update
@@ -214,6 +233,46 @@ impl ImageDeclaration {
         let disk = get_opt_disk_layout(table)?;
         // NEW: sysctl
         let sysctl: Vec<String> = table.get("sysctl").unwrap_or_default();
+        // #80: optional extra files staged into the rootfs. Fail closed on
+        // a relative `dest`, a `..` component (staging would escape the
+        // staged root), or a non-table entry — an image that silently
+        // dropped a declared file would boot without the tooling it
+        // declared.
+        let files: Vec<StagedFile> = match table.get::<Vec<mlua::Table>>("files") {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|entry| -> miette::Result<StagedFile> {
+                    let source: String = entry.get("source").map_err(|_| {
+                        miette::miette!("image(): files[] entry needs a 'source' string")
+                    })?;
+                    let dest: String = entry.get("dest").map_err(|_| {
+                        miette::miette!("image(): files[] entry needs a 'dest' string")
+                    })?;
+                    if !dest.starts_with('/') {
+                        return Err(miette::miette!(
+                            "image(): files[].dest must be an absolute guest path, got {dest:?}"
+                        ));
+                    }
+                    if Path::new(&dest)
+                        .components()
+                        .any(|c| c == std::path::Component::ParentDir)
+                    {
+                        return Err(miette::miette!(
+                            "image(): files[].dest must not contain '..' (staging would \
+                             escape the staged root): {dest:?}"
+                        ));
+                    }
+                    if source.is_empty() {
+                        return Err(miette::miette!("image(): files[].source must not be empty"));
+                    }
+                    Ok(StagedFile {
+                        source: PathBuf::from(source),
+                        dest,
+                    })
+                })
+                .collect::<miette::Result<Vec<_>>>()?,
+            Err(_) => Vec::new(),
+        };
         // ADR-0011 step (d): optional sysupdate payload source URL
         let update_source = match table
             .get::<Value>("update_source")
@@ -258,9 +317,22 @@ impl ImageDeclaration {
             bootloader,
             disk,
             sysctl,
+            files,
             update_source,
             boot_health_exec,
         })
+    }
+
+    /// Resolve every [`Self::files`] entry's `source` against the directory
+    /// of the declaring lua file (called from [`crate::lua::`
+    /// `evaluate_images_file`], the one place that knows the `--file`
+    /// path). Absolute sources pass through untouched.
+    pub fn resolve_files_against(&mut self, base_dir: &Path) {
+        for file in &mut self.files {
+            if file.source.is_relative() {
+                file.source = base_dir.join(&file.source);
+            }
+        }
     }
 
     /// Collect all snap references (base + kernel + gadget + extras).
@@ -604,11 +676,14 @@ pub(crate) fn build_image_with(
             .into_diagnostic()
             .wrap_err("creating /etc/sysctl.d")?;
         let sysctl_content = image.sysctl.join("\n") + "\n";
-        std::fs::write(sysctl_dir.join("99-shuttle.conf"), &sysctl_content)
+        std::fs::write(root.join("etc/sysctl.d/99-shuttle.conf"), &sysctl_content)
             .into_diagnostic()
             .wrap_err("writing sysctl")?;
         eprintln!("  ✓ sysctl written ({} entries)", image.sysctl.len());
     }
+
+    // 6c-bis. #80: declared extra files, staged before anything is hashed.
+    staging::stage_extra_files(&root, &image.files)?;
 
     // 7. Create snap directory and copy all snap files
     let snap_dir = root.join("snap");
@@ -773,6 +848,10 @@ pub(crate) fn build_disk_image_with(
         eprintln!("  ✓ sysctl written ({} entries)", image.sysctl.len());
     }
 
+    // 5-bis. #80: declared extra files, staged before anything is hashed
+    // (dm-verity formats the root partition file later in this flow).
+    staging::stage_extra_files(&root, &image.files)?;
+
     let disk_layout = image
         .disk
         .as_ref()
@@ -811,7 +890,7 @@ pub(crate) fn build_disk_image_with(
         // UKI transfer (PathRelativeTo=boot) and bless-boot's rename would
         // otherwise race the mount.
         let esp_mount = esp_mount_point(disk_layout);
-        write_sysupdate_transfers(&root, image, disk_layout)?;
+        write_sysupdate_transfers(&root, image)?;
         emit_sysupdate_units(&root, esp_mount)?;
         // The transfers carry ProtectVersion=%A, which resolves to the
         // running system's os-release IMAGE_VERSION= (not VERSION_ID=).
@@ -1143,14 +1222,52 @@ pub(crate) fn build_disk_image_with(
                 slot_suffix(s)
             );
         }
-        // The UKI boots slot A: its hash PARTUUID is slot A's hash extent.
-        let hash_partuuid = extents[hash_idx].partuuid.clone();
-        if hash_partuuid.is_none() {
-            eprintln!(
-                "  ⚠ hash PARTUUID unresolvable — cmdline carries the documented \
-                 nil-GUID placeholder"
-            );
+        // #80: the generation identity. Slot A's data + hash partition
+        // GUIDs are DERIVED FROM THE ROOTHASH (deterministic; DPS-style
+        // hash-GUID convention) and pinned via sfdisk before the UKI is
+        // assembled — the cmdline references them by PARTUUID, so one UKI
+        // boots both this image's slot A and the slot systemd-sysupdate
+        // writes at update time (whose PARTUUID the emitted transfers pin
+        // to the same derived values via the @u source wildcard). The
+        // extents are re-read so every downstream consumer (cmdline,
+        // manifest, splice offsets) sees the FINAL identity; a mismatch
+        // fails closed.
+        let (data_guid, hash_guid) = generation_guids_from_roothash(&roothash)?;
+        set_partition_uuid(runner, &img_path, root_idx + 1, &data_guid)?;
+        set_partition_uuid(runner, &img_path, hash_idx + 1, &hash_guid)?;
+        let extents = read_partition_extents(runner, &img_path, expected_partitions)?;
+        // sfdisk -J reports GUIDs upper-case; compare case-insensitively.
+        if !extents[root_idx]
+            .partuuid
+            .as_deref()
+            .is_some_and(|got| got.eq_ignore_ascii_case(&data_guid))
+        {
+            return Err(miette::miette!(
+                "root slot PARTUUID did not land: expected {data_guid}, got {:?} — \
+                 refusing to build an image whose cmdline references a partition \
+                 identity that is not on disk",
+                extents[root_idx].partuuid
+            ));
         }
+        if !extents[hash_idx]
+            .partuuid
+            .as_deref()
+            .is_some_and(|got| got.eq_ignore_ascii_case(&hash_guid))
+        {
+            return Err(miette::miette!(
+                "verity hash slot PARTUUID did not land: expected {hash_guid}, got {:?} — \
+                 refusing to build an image whose cmdline references a partition \
+                 identity that is not on disk",
+                extents[hash_idx].partuuid
+            ));
+        }
+        eprintln!(
+            "  ✓ generation identity pinned: data PARTUUID {data_guid}, hash PARTUUID \
+             {hash_guid} (derived from the roothash, #80)"
+        );
+        // The UKI boots slot A: its hash PARTUUID is the roothash-derived
+        // GUID pinned above.
+        let hash_partuuid = Some(hash_guid);
         let verity_args = VerityBootArgs {
             roothash,
             hash_partuuid,
@@ -1627,6 +1744,7 @@ mod tests {
             disk: None,
             sysctl: vec![],
             update_source: None,
+            files: vec![],
             boot_health_exec: None,
         };
 
@@ -2809,6 +2927,7 @@ WantedBy=multi-user.target
             disk: None,
             sysctl: vec![],
             update_source: None,
+            files: vec![],
             boot_health_exec: None,
         };
         let snaps: Vec<(String, ResolvedSnap)> = vec![(
@@ -3643,6 +3762,7 @@ CONFIG_EXT4_FS=m
             disk: None,
             sysctl: vec![],
             update_source: None,
+            files: vec![],
             boot_health_exec: None,
         };
         assert_eq!(uki_filename(&image), "my-system_1.2.3.efi");
@@ -3673,6 +3793,7 @@ CONFIG_EXT4_FS=m
             disk: None,
             sysctl: vec![],
             update_source: None,
+            files: vec![],
             boot_health_exec: None,
         };
         assert!(
@@ -3865,10 +3986,46 @@ CONFIG_EXT4_FS=m
     fn slot_label_scheme_is_versioned_and_slot_suffixed() {
         assert_eq!(slot_suffix(0), "a");
         assert_eq!(slot_suffix(1), "b");
+        // Slot A is version-labeled; every slot BEYOND A ships labeled
+        // `_empty` — the literal DPS marker sysupdate treats as a writable
+        // slot. A version-labeled clone there would deadlock the first
+        // update: the running version (%A) is protected and could never be
+        // recycled (#80).
         assert_eq!(slot_partlabel("os", "1.2.3", 0), "os_1.2.3_a");
-        assert_eq!(slot_partlabel("os", "1.2.3", 1), "os_1.2.3_b");
         assert_eq!(hash_partlabel("os", "1.2.3", 0), "os_1.2.3_hash_a");
-        assert_eq!(hash_partlabel("os", "1.2.3", 1), "os_1.2.3_hash_b");
+    }
+
+    #[test]
+    fn generation_guids_derive_deterministically_from_the_roothash() {
+        // Non-periodic halves: front "0123456789abcdef0123456789abcdef",
+        // back "fedcba9876543210fedcba9876543210".
+        let rh = "0123456789abcdef0123456789abcdeffedcba9876543210fedcba9876543210";
+        let (data, hash) = generation_guids_from_roothash(rh).unwrap();
+        // Dashed 8-4-4-4-12 UUID shapes, each half of the roothash.
+        assert_eq!(data, "fedcba98-7654-3210-fedc-ba9876543210");
+        assert_eq!(hash, "01234567-89ab-cdef-0123-456789abcdef");
+        assert_ne!(data, hash, "the two partitions must not share an identity");
+        // Deterministic: the payload build and its @u-named artifacts agree
+        // with the update-installed slot by construction.
+        let (data2, hash2) = generation_guids_from_roothash(rh).unwrap();
+        assert_eq!((&data, &hash), (&data2, &hash2));
+        // A different roothash yields a different identity — the exact
+        // property that makes two generations distinguishable.
+        let other = generation_guids_from_roothash(
+            "ffffffffffffffffffffffffffffffff0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        assert_ne!(other, (data.clone(), hash.clone()));
+    }
+
+    #[test]
+    fn generation_guids_reject_malformed_roothashes() {
+        for bad in ["", "abc", "0123", &"g".repeat(64)] {
+            assert!(
+                generation_guids_from_roothash(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -3885,29 +4042,140 @@ CONFIG_EXT4_FS=m
     }
 
     #[test]
+    fn sysupdate_transfer_source_is_the_base_url_with_at_v_and_at_u_artifacts() {
+        // #80: url-file sources enumerate versions from a SHA256SUMS
+        // manifest at the base URL; each pattern carries @v (version) and —
+        // for the partition transfers — @u (the GPT PARTUUID the written
+        // slot is pinned to, sysupdate.d(5) PartitionUUID=).
+        for url in ["http://10.0.2.2:8123/", "https://updates.example.com/os/"] {
+            let t = root_transfer("os", url);
+            let source = transfer_section(&t, "[Source]");
+            assert!(source.contains(&format!("Path={url}")), "{source}");
+            assert!(
+                source
+                    .lines()
+                    .any(|l| l.trim() == "MatchPattern=root_@v_@u.img"),
+                "source artifact pattern with @v + @u: {source}"
+            );
+            let h = hash_transfer("os", url);
+            let hsource = transfer_section(&h, "[Source]");
+            assert!(
+                hsource
+                    .lines()
+                    .any(|l| l.trim() == "MatchPattern=verity-hash_@v_@u.img"),
+                "{hsource}"
+            );
+            let u = uki_transfer("os", url);
+            let usource = transfer_section(&u, "[Source]");
+            assert!(
+                usource
+                    .lines()
+                    .any(|l| l.trim() == "MatchPattern=os_@v.efi"),
+                "{usource}"
+            );
+        }
+    }
+
+    #[test]
+    fn sysupdate_transfers_carry_no_kernel_release_specifier_or_in_places_path() {
+        // Regression pins for the pre-#80 emission: %v is the KERNEL
+        // RELEASE specifier (sysupdate.d(5) specifiers table), not the
+        // update version, and `Path=in-places` is not a documented
+        // partition target path (the block device or the literal `auto`
+        // is). Neither can produce a working url-file transfer.
+        let t = root_transfer("os", "http://u.example/");
+        assert!(!t.contains("%v"), "no %v specifier: {t}");
+        assert!(!t.contains("in-places"), "no undocumented path: {t}");
+        assert!(t.contains("Path=auto"), "root device auto-discovery: {t}");
+    }
+
+    #[test]
+    fn sysupdate_partition_transfers_encode_the_target_uuid_in_the_source() {
+        // sysupdate.d(5) Example 1: "@u" in the SOURCE pattern encodes the
+        // partition UUID for the target partition in the source file name;
+        // a PartitionUUID= setting would only take a literal UUID (and
+        // parsing the bare wildcard fails, measured 261).
+        for (t, type_guid) in [
+            (
+                root_transfer("os", "http://u.example/"),
+                ROOT_TYPE_GUID_X86_64,
+            ),
+            (
+                hash_transfer("os", "http://u.example/"),
+                VERITY_TYPE_GUID_X86_64,
+            ),
+        ] {
+            assert!(
+                t.contains(&format!("MatchPartitionType={type_guid}")),
+                "{t}"
+            );
+            assert!(
+                t.lines().any(|l| l.trim().contains("@u.img")),
+                "source artifact pattern carries @u: {t}"
+            );
+            assert!(
+                !t.contains("PartitionUUID="),
+                "PartitionUUID= must not be emitted (only literal UUIDs parse): {t}"
+            );
+            assert!(
+                !t.contains("MinSize="),
+                "MinSize is not a valid key on 261: {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn sysupdate_transfers_skip_gpg_but_keep_manifest_hash_checks() {
+        // Verify=no is the documented test-environment posture: the GPG
+        // signature layer is skipped (no gpg/import-pubring in the base
+        // rootfs); the SHA256SUMS manifest itself is still fetched and
+        // every payload hash-checked unconditionally (sysupdate.d(5)).
+        for t in [
+            root_transfer("os", "http://u.example/"),
+            hash_transfer("os", "http://u.example/"),
+            uki_transfer("os", "http://u.example/"),
+        ] {
+            assert!(t.lines().any(|l| l.trim() == "Verify=no"), "{t}");
+            assert!(t.lines().any(|l| l.trim() == "ProtectVersion=%A"), "{t}");
+        }
+    }
+
+    /// Extract one section's lines from a transfer file body.
+    fn transfer_section(t: &str, section: &str) -> String {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in t.lines() {
+            if line.starts_with('[') {
+                inside = line.trim() == section;
+            }
+            if inside {
+                out.push(line);
+            }
+        }
+        out.join("\n")
+    }
+
+    #[test]
     fn root_transfer_carries_ab_slot_contract() {
-        let t = root_transfer("os", 4096);
+        let t = root_transfer("os", "http://u.example/");
         assert!(t.contains("[Transfer]"), "sections: {t}");
         assert!(t.contains("[Source]"), "sections: {t}");
         assert!(t.contains("[Target]"), "sections: {t}");
-        assert!(
-            t.lines().any(|l| l.trim() == "ProtectVersion=%A"),
-            "every transfer protects %A: {t}"
-        );
         assert!(t.contains("Type=url-file"), "remote source: {t}");
-        assert!(t.contains("Path=%v/root.img"), "versioned artifact: {t}");
         assert!(t.contains("Type=partition"), "partition target: {t}");
-        assert!(t.contains("Path=in-places"), "in-place slots: {t}");
         assert!(
             t.contains(&format!("MatchPartitionType={ROOT_TYPE_GUID_X86_64}")),
             "matched by x86-64 root TYPE UUID: {t}"
         );
-        let pattern = t.lines().find(|l| l.starts_with("MatchPattern=")).unwrap();
+        let pattern = transfer_section(&t, "[Target]")
+            .lines()
+            .find(|l| l.starts_with("MatchPattern="))
+            .unwrap()
+            .to_string();
         assert_eq!(
-            pattern, "MatchPattern=os_@v_a os_@v_b os_empty",
-            "both slot labels + the _empty factory fallback: {t}"
+            pattern, "MatchPattern=os_@v_a",
+            "the slot-a naming label; `_empty` is a label sysupdate honors              implicitly and must NOT appear as a pattern arm (every arm              needs @v or the transfer refuses to parse, measured 261): {t}"
         );
-        assert!(t.contains("MinSize=4096M"), "slot size floor: {t}");
         assert!(t.contains("InstancesMax=2"), "A/B = two instances: {t}");
         assert!(
             !t.contains("Instances="),
@@ -3917,39 +4185,45 @@ CONFIG_EXT4_FS=m
 
     #[test]
     fn hash_transfer_matches_verity_type_and_shares_version() {
-        let t = hash_transfer("os", 33);
+        let t = hash_transfer("os", "http://u.example/");
         assert!(
             t.contains(&format!("MatchPartitionType={VERITY_TYPE_GUID_X86_64}")),
             "matched by the verity TYPE UUID: {t}"
         );
-        assert!(
-            t.contains("Path=%v/verity-hash.img"),
-            "versioned artifact: {t}"
-        );
         assert_eq!(
-            t.lines().find(|l| l.starts_with("MatchPattern=")).unwrap(),
-            "MatchPattern=os_@v_hash_a os_@v_hash_b os_hash_empty",
-            "hash slot labels mirror the root scheme: {t}"
+            transfer_section(&t, "[Target]")
+                .lines()
+                .find(|l| l.starts_with("MatchPattern="))
+                .unwrap(),
+            "MatchPattern=os_@v_hash_a",
+            "hash slot label mirrors the root scheme: {t}"
         );
         assert!(t.contains("ProtectVersion=%A"));
         assert!(t.contains("InstancesMax=2"));
-        assert!(t.contains("MinSize=33M"));
     }
 
     #[test]
     fn uki_transfer_installs_with_tries_and_boot_relative_path() {
-        let t = uki_transfer("os");
+        let t = uki_transfer("os", "http://u.example/");
         assert!(
             t.lines().any(|l| l.trim() == "ProtectVersion=%A"),
             "ProtectVersion everywhere: {t}"
         );
         assert!(t.contains("Type=regular-file"), "UKI is a file target: {t}");
-        assert!(t.contains("Path=EFI/Linux"), "UKI install dir: {t}");
+        // Root-relative on purpose: PathRelativeTo=boot makes sysupdate run
+        // its $BOOT/ESP discovery, which fails on the UC22-era guest
+        // ("Failed to resolve $BOOT: Operation not supported"). The ESP's
+        // declared /boot mount expresses the same location without it.
         assert!(
-            t.contains("PathRelativeTo=boot"),
-            "regular-file target resolves against $BOOT: {t}"
+            t.contains("Path=/boot/EFI/Linux"),
+            "UKI install dir through the /boot mount: {t}"
         );
-        let pattern = t
+        assert!(
+            !t.lines()
+                .any(|l| !l.trim_start().starts_with('#') && l.contains("PathRelativeTo")),
+            "no $BOOT/ESP discovery on the guest: {t}"
+        );
+        let pattern = transfer_section(&t, "[Target]")
             .lines()
             .find(|l| l.starts_with("MatchPattern="))
             .unwrap()
@@ -3975,7 +4249,10 @@ CONFIG_EXT4_FS=m
             "TriesDone in [Target]: {t}"
         );
         assert!(t.contains("InstancesMax=2"));
-        assert!(t.contains("Path=%v/os_@v.efi"), "versioned artifact: {t}");
+        assert!(
+            t.contains("MatchPattern=os_@v.efi"),
+            "source artifact pattern: {t}"
+        );
     }
 
     #[test]
@@ -4636,7 +4913,7 @@ RequiredBy=boot-complete.target
         let image = mini_decl("os", "1.2.3");
         let disk = ab_layout();
         if emits_sysupdate(&image, &disk) {
-            write_sysupdate_transfers(root.path(), &image, &disk).unwrap();
+            write_sysupdate_transfers(root.path(), &image).unwrap();
             emit_sysupdate_units(root.path(), None).unwrap();
         }
         assert!(!root.path().join(SYSUPDATE_SERVICE_PATH).exists());
@@ -4655,7 +4932,7 @@ RequiredBy=boot-complete.target
         let mut disk = ab_layout();
         disk.ab = false;
         if emits_sysupdate(&image, &disk) {
-            write_sysupdate_transfers(root.path(), &image, &disk).unwrap();
+            write_sysupdate_transfers(root.path(), &image).unwrap();
             emit_sysupdate_units(root.path(), None).unwrap();
         }
         assert!(!root.path().join(SYSUPDATE_SERVICE_PATH).exists());
@@ -4680,6 +4957,7 @@ RequiredBy=boot-complete.target
             disk: None,
             sysctl: vec![],
             update_source: None,
+            files: vec![],
             boot_health_exec: None,
         }
     }
@@ -5168,6 +5446,7 @@ RequiredBy=boot-complete.target
             disk: None,
             sysctl: vec![],
             update_source: None,
+            files: vec![],
             boot_health_exec: None,
         };
         let resolved = vec![ResolvedSnap {
@@ -5612,6 +5891,7 @@ RequiredBy=boot-complete.target
                 disk: None,
                 sysctl: vec![],
                 update_source: None,
+                files: vec![],
                 boot_health_exec: None,
             };
 
@@ -5765,6 +6045,7 @@ RequiredBy=boot-complete.target
                 disk: None,
                 sysctl: vec![],
                 update_source: None,
+                files: vec![],
                 boot_health_exec: None,
             };
             let root = tempfile::tempdir().unwrap();
@@ -5922,6 +6203,7 @@ RequiredBy=boot-complete.target
                 }),
                 sysctl: vec![],
                 update_source: None,
+                files: vec![],
                 boot_health_exec: None,
             };
 
@@ -6039,6 +6321,7 @@ RequiredBy=boot-complete.target
                 }),
                 sysctl: vec![],
                 update_source: Some("https://updates.example.invalid/os/".into()),
+                files: vec![],
                 boot_health_exec: None,
             };
 
@@ -6137,6 +6420,7 @@ RequiredBy=boot-complete.target
                 }),
                 sysctl: vec![],
                 update_source: Some("https://updates.example.invalid/os/".into()),
+                files: vec![],
                 boot_health_exec: None,
             }
         }
@@ -6251,6 +6535,7 @@ RequiredBy=boot-complete.target
                 }),
                 sysctl: vec![],
                 update_source: None,
+                files: vec![],
                 boot_health_exec: None,
             };
 

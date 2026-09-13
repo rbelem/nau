@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "http-fetch"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "http-fetch"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+panic = "abort"

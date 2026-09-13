@@ -444,16 +444,77 @@ pub(crate) fn hash_partlabel(image_name: &str, image_version: &str, slot: usize)
     format!("{image_name}_{image_version}_hash_{}", slot_suffix(slot))
 }
 
-/// MatchPattern for root slot partitions: the two slot labels (version
-/// wildcarded) plus the documented `_empty` fallback for factory partitions
-/// not yet labeled. First pattern wins for newly created partitions.
-pub(crate) fn root_match_pattern(image_name: &str) -> String {
-    format!("{image_name}_@v_a {image_name}_@v_b {image_name}_empty")
+/// Derive the two GPT PARTUUIDs a generation is identified by, from its
+/// dm-verity roothash (#80).
+///
+/// The hash partition GUID is the roothash's first half and the data
+/// partition GUID its second half, both dashed into the canonical
+/// 8-4-4-4-12 UUID form. Derivation is deterministic — the same roothash
+/// always yields the same GUID pair — so the payload artifacts (named with
+/// the `@u` source wildcard in the emitted transfers) and the payload
+/// UKI's by-partuuid cmdline agree by construction, and systemd-sysupdate
+/// pins the written slots to exactly those GUIDs at install time
+/// ([Target] PartitionUUID=@u). The build writes the same GUIDs onto its
+/// own slot A, so one UKI boots both the built image and the
+/// update-installed slot.
+///
+/// A GUID is 16 bytes and a sha256 roothash 32, so each half is a
+/// truncation, not the hash itself; the full roothash rides the cmdline
+/// (`roothash=`) and dm-verity verifies against it — the GUIDs are only
+/// lookup handles.
+pub(crate) fn generation_guids_from_roothash(roothash: &str) -> miette::Result<(String, String)> {
+    fn dashed(hex: &str) -> String {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32],
+        )
+    }
+    let rh = roothash.trim().to_ascii_lowercase();
+    if rh.len() != 64 || !rh.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(miette::miette!(
+            "roothash must be 64 hex characters to derive the generation GUIDs, \
+             got {roothash:?}"
+        ));
+    }
+    // Data GUID from the back half, hash GUID from the front half — the
+    // two partitions must not share an identity.
+    Ok((dashed(&rh[32..64]), dashed(&rh[0..32])))
 }
 
-/// MatchPattern for verity-hash slot partitions.
-pub(crate) fn hash_match_pattern(image_name: &str) -> String {
-    format!("{image_name}_@v_hash_a {image_name}_@v_hash_b {image_name}_hash_empty")
+/// Pin one partition's GPT PARTUUID via `sfdisk --part-uuid`, the same
+/// raw-file mechanism [`apply_gpt_slot_metadata`] uses. Unlike the
+/// type/label metadata this is FAIL-CLOSED: the UKI cmdline references the
+/// root and hash partitions by PARTUUID, so a GUID that did not land makes
+/// the image unbootable by construction and must abort the build.
+pub(crate) fn set_partition_uuid(
+    runner: &dyn CommandRunner,
+    img_path: &Path,
+    partno: usize,
+    partuuid: &str,
+) -> miette::Result<()> {
+    let argv = vec![
+        "sfdisk".to_string(),
+        "--part-uuid".to_string(),
+        img_path.to_string_lossy().into_owned(),
+        partno.to_string(),
+        partuuid.to_string(),
+    ];
+    let out = runner
+        .run(&argv)
+        .map_err(|e| miette::miette!("sfdisk not runnable: {e}"))?;
+    if out.code != 0 {
+        return Err(miette::miette!(
+            "sfdisk --part-uuid failed for partition {partno} ({partuuid}): {} — \
+             the UKI cmdline references partitions by PARTUUID, so refusing to \
+             build an image whose identity did not land",
+            out.stderr.trim()
+        ));
+    }
+    Ok(())
 }
 
 /// 64-hex random salt from /dev/urandom — shared across A/B slot formats so
@@ -504,6 +565,14 @@ pub(crate) fn apply_gpt_slot_metadata(
         }
     };
     // (partition number 1-based, type GUID, PARTLABEL)
+    //
+    // Slot B (and every slot beyond A) is labeled `_empty` — the literal
+    // DPS marker systemd-sysupdate treats as an unused, writable slot
+    // (sysupdate.d(5)). The running version is protected (%A) and can
+    // never be recycled, so the first update needs an explicitly empty
+    // slot; a version-labeled clone there would deadlock the update
+    // (#80). The spliced rollback-twin CONTENT stays — only the label
+    // says "unused" — and sysupdate overwrites it at install time.
     let mut ops: Vec<(usize, &str, Option<String>)> = Vec::new();
     if layout.partitions[0].fs == "vfat" {
         ops.push((1, ESP_TYPE_GUID, None));
@@ -512,7 +581,11 @@ pub(crate) fn apply_gpt_slot_metadata(
         ops.push((
             idx + 1,
             ROOT_TYPE_GUID_X86_64,
-            Some(slot_partlabel(&image.name, &image.version, s)),
+            Some(if s == 0 {
+                slot_partlabel(&image.name, &image.version, s)
+            } else {
+                "_empty".to_string()
+            }),
         ));
     }
     for (s, hash) in slots.hashes.iter().enumerate() {
@@ -520,7 +593,11 @@ pub(crate) fn apply_gpt_slot_metadata(
             ops.push((
                 idx + 1,
                 VERITY_TYPE_GUID_X86_64,
-                Some(hash_partlabel(&image.name, &image.version, s)),
+                Some(if s == 0 {
+                    hash_partlabel(&image.name, &image.version, s)
+                } else {
+                    "_empty".to_string()
+                }),
             ));
         }
     }

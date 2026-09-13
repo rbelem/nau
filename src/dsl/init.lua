@@ -629,7 +629,9 @@ end
 --   gadget, snaps (optional arrays of pins)
 --   bootloader (table with type, timeout),
 --   disk (table with label, partitions, swap),
---   sysctl (array of "key=value" strings)
+--   sysctl (array of "key=value" strings),
+--   files (array of { source = "host path", dest = "/absolute/guest/path" },
+--          staged verbatim into the rootfs before it is hashed)
 -- @return the validated opts table
 -- @usage image {
 --     name = "my-system",
@@ -766,6 +768,26 @@ function image(opts)
     -- Optional sysctl entries (array of "key=value" strings)
     if opts.sysctl ~= nil then
         check_string_array(opts.sysctl, "image", "sysctl")
+    end
+
+    -- Optional extra files staged into the rootfs (#80): an array of
+    -- { source = "host path", dest = "/absolute/guest/path" } tables.
+    if opts.files ~= nil then
+        if type(opts.files) ~= "table" then
+            error("image(): 'files' must be an array of { source, dest } tables", 2)
+        end
+        for i, f in ipairs(opts.files) do
+            if type(f) ~= "table" then
+                error(string.format("image(): files[%d] must be a table, got %s", i, type(f)), 2)
+            end
+            if type(f.source) ~= "string" or f.source == "" then
+                error(string.format("image(): files[%d].source must be a non-empty string", i), 2)
+            end
+            if type(f.dest) ~= "string" or f.dest:sub(1, 1) ~= "/" then
+                error(string.format(
+                    "image(): files[%d].dest must be an absolute guest path starting with '/'", i), 2)
+            end
+        end
     end
 
     -- Optional sysupdate payload source (ADR-0011 step d)

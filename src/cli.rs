@@ -494,6 +494,15 @@ pub enum Command {
         #[arg(long = "expect-counter-seq")]
         expect_counter_seq: Option<String>,
 
+        /// Extra argv token passed through to QEMU verbatim (repeatable;
+        /// each value is ONE argv token, so an option and its value are two
+        /// `--qemu-arg` occurrences; values starting with `-` need clap's
+        /// `=` form: `--qemu-arg=-nic`). Appended after the built-in
+        /// drives — this is how the update proof (#80) attaches guest
+        /// networking: `--qemu-arg=-nic --qemu-arg user,model=virtio-net-pci`.
+        #[arg(long = "qemu-arg")]
+        qemu_args: Vec<String>,
+
         /// Output structured JSON instead of human-friendly output.
         #[arg(long)]
         json: bool,
@@ -1814,6 +1823,7 @@ mod tests {
                 runs,
                 expect_counter_seq,
                 allow_no_completion,
+                qemu_args,
                 json,
             } => {
                 assert_eq!(image, "disk.img");
@@ -1825,6 +1835,7 @@ mod tests {
                 assert_eq!(runs, 1);
                 assert!(expect_counter_seq.is_none());
                 assert!(!allow_no_completion);
+                assert!(qemu_args.is_empty(), "no QEMU args by default");
                 assert!(!json);
             }
             _ => panic!("expected Test"),
@@ -1875,6 +1886,29 @@ mod tests {
                 assert_eq!(expect_counter_seq.as_deref(), Some("3-0,2-1,1-2,0-3"));
                 assert!(!allow_no_completion);
                 assert!(json);
+            }
+            _ => panic!("expected Test"),
+        }
+    }
+
+    #[test]
+    fn test_test_qemu_args_pass_through_verbatim() {
+        // #80: guest networking for the in-guest sysupdate fetch. Each
+        // value is one argv token; values starting with '-' use clap's
+        // `=` form so they are not parsed as flags.
+        match Cli::try_parse_from([
+            "shuttle",
+            "test",
+            "disk.img",
+            "--qemu-arg=-nic",
+            "--qemu-arg",
+            "user,model=virtio-net-pci",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Test { qemu_args, .. } => {
+                assert_eq!(qemu_args, ["-nic", "user,model=virtio-net-pci"]);
             }
             _ => panic!("expected Test"),
         }

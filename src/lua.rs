@@ -345,7 +345,13 @@ pub fn evaluate_images_file(path: &str) -> miette::Result<HashMap<String, ImageD
             .map_err(|e| miette::miette!("{path}: image '{key}' conversion failed: {e}"))?;
         if let mlua::Value::Table(t) = value {
             match ImageDeclaration::from_lua_table(&t) {
-                Ok(decl) => {
+                Ok(mut decl) => {
+                    // #80: `files[].source` resolves against the declaring
+                    // lua's directory — the one path context available
+                    // here — so examples stay runnable from any cwd.
+                    if let Some(base_dir) = definition_dir_from_label(path) {
+                        decl.resolve_files_against(&base_dir);
+                    }
                     images.insert(key.clone(), decl);
                 }
                 Err(e) => crate::output::warn(format!("skipping image '{key}' from {path}: {e}")),

@@ -205,6 +205,7 @@ fn main() -> miette::Result<()> {
             runs,
             expect_counter_seq,
             allow_no_completion,
+            qemu_args,
             json,
         } => {
             shuttle::output::set_mode(json);
@@ -218,6 +219,7 @@ fn main() -> miette::Result<()> {
                 runs,
                 expect_counter_seq,
                 allow_no_completion,
+                qemu_args,
                 json,
             )
         }
@@ -2439,6 +2441,7 @@ fn cmd_test(
     runs: u32,
     expect_counter_seq: Option<String>,
     allow_no_completion: bool,
+    qemu_args: Vec<String>,
     json: bool,
 ) -> miette::Result<()> {
     let image_path = PathBuf::from(&image);
@@ -2467,6 +2470,7 @@ fn cmd_test(
         runs,
         expect_counters,
         allow_no_completion,
+        extra_qemu_args: qemu_args,
     };
 
     if !json {

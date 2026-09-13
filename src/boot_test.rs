@@ -256,6 +256,11 @@ pub struct BootTest {
     /// init handoff passes without a completed target. For images that
     /// legitimately never reach one.
     pub allow_no_completion: bool,
+    /// Extra argv tokens appended to the QEMU command verbatim (#80). Each
+    /// entry is one argv token, so an option and its value are two entries;
+    /// this is the seam the update proof uses for guest networking
+    /// (`-nic`, `user,model=virtio-net-pci`).
+    pub extra_qemu_args: Vec<String>,
 }
 
 /// One expected try-boot observation, parsed from `--expect-counter-seq`.
@@ -675,6 +680,9 @@ pub fn qemu_argv(test: &BootTest, accel: Accel) -> Vec<String> {
         format!("file:{}", test.log.display()),
         "-no-reboot".into(),
     ]
+    .into_iter()
+    .chain(test.extra_qemu_args.iter().cloned())
+    .collect::<Vec<String>>()
 }
 
 /// The argv actually handed to the [`CommandRunner`]: [`qemu_argv`] wrapped
@@ -1447,6 +1455,7 @@ SHUTTLE-INIT: switch-root\n\
             runs: 1,
             expect_counters: Vec::new(),
             allow_no_completion: false,
+            extra_qemu_args: Vec::new(),
         }
     }
 
@@ -1513,6 +1522,24 @@ SHUTTLE-INIT: switch-root\n\
         // No `-nographic`; serial is a file, display is disabled.
         assert!(argv.iter().any(|a| a == "-display"));
         assert!(!argv.iter().any(|a| a == "-nographic"));
+    }
+
+    #[test]
+    fn qemu_argv_appends_extra_args_verbatim_last() {
+        // #80: guest networking rides the passthrough seam. Each entry is
+        // ONE argv token — `-nic` and its value land as two elements after
+        // every built-in argument, never spliced or reordered.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut test = sample_test(tmp.path(), Accel::Kvm, true);
+        test.extra_qemu_args = vec!["-nic".into(), "user,model=virtio-net-pci".into()];
+        let argv = qemu_argv(&test, Accel::Kvm);
+        let suffix: Vec<String> = argv[argv.len() - 2..].to_vec();
+        assert_eq!(suffix, ["-nic", "user,model=virtio-net-pci"]);
+        assert_eq!(
+            argv.iter().position(|a| a == "-nic"),
+            Some(argv.len() - 2),
+            "the passthrough appends after the built-ins, including -no-reboot"
+        );
     }
 
     // ── environment resolution ──
