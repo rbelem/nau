@@ -26,6 +26,20 @@
 -- into the same merged prefix, giving the gcc sysroot its libc headers and
 -- libs. Not circular — pool glibc builds with the host toolchain (the
 -- sandbox PATH's nix gcc), not with pool gcc.
+--
+-- CPPFLAGS must NOT reach this build at all: the sandbox exports
+-- CPPFLAGS=-I/shuttle-build-prefix/usr/include (the merged-prefix contract),
+-- and GCC's Makefiles record it AHEAD of the tree's own -I dirs — so
+-- libiberty's bundled obstack.c picks up glibc's obstack.h from the prefix
+-- and dies on the layout mismatch (`chunkfun.extra`, _OBSTACK_SIZE_T) —
+-- and the stage1 re-configures replay whatever the top-level configure
+-- captured, so the value must never be recorded in the first place.
+-- The prefix is instead consumed through explicit --with-* paths: the
+-- release tarball bundles no gmp/mpfr/mpc/isl sources, so configure's
+-- prerequisite probes read their headers from the pool payloads via
+-- --with-gmp/--with-mpfr/--with-mpc/--with-isl, whose -I flags travel
+-- in their own recorded variables (gmpinc & co), not in CPPFLAGS.
+-- Target headers flow exclusively through --with-sysroot.
 return {
     default = snap {
         name = "gcc",
@@ -41,6 +55,20 @@ arithmetic. GCC is the standard system compiler for most Linux distributions.]],
         type = "source",
         requires = { "binutils", "gmp", "mpfr", "mpc", "isl", "linux-headers", "glibc" },
         source = { url = "https://ftp.gnu.org/gnu/gcc/gcc-16.1.0/gcc-16.1.0.tar.xz" },
-        build = "mkdir -p build && cd build && ../configure --prefix=/usr --target=x86_64-linux-gnu --enable-languages=c,c++ --disable-multilib --with-sysroot=/shuttle-build-prefix && make -j$(nproc) && make install DESTDIR=$STAGE",
+        build = "mkdir -p build && cd build && unset CPPFLAGS && ../configure --prefix=/usr --target=x86_64-linux-gnu --enable-languages=c,c++ --disable-multilib --with-sysroot=/shuttle-build-prefix --with-gmp=/shuttle-build-prefix/usr --with-mpfr=/shuttle-build-prefix/usr --with-mpc=/shuttle-build-prefix/usr --with-isl=/shuttle-build-prefix/usr && make -j$(nproc) CPPFLAGS= && make CPPFLAGS= install DESTDIR=$STAGE",
+
+        -- ADR-0018 leak scan: the drivers and their runtime libs record
+        -- the sysroot prefix (/shuttle-build-prefix/usr/lib{,64}) in
+        -- RUNPATH. Inside any build sandbox the merged prefix is bound
+        -- at exactly that path, so the RUNPATH is LOAD-BEARING for
+        -- build_deps consumers (cc1plus finds libstdc++ there). At pod
+        -- runtime it is dead — the toolchain meta's launchers replace
+        -- it with LD_LIBRARY_PATH into the assembled tree. Silenced
+        -- here by reference, not by file, so the exception stays two
+        -- greppable lines (leak_scan matches Leak::reference exactly).
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
+        },
     },
 }

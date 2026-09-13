@@ -46,12 +46,23 @@ pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<Dep
     let mut visited: HashSet<String> = HashSet::new();
     let mut pending: Vec<String> = seeds.to_vec();
 
-    while let Some(name) = pending.pop() {
+    while let Some(seed) = pending.pop() {
+        let meta = load_meta(&seed)?;
+        // Canonical identity: a seed may name a package through an alias
+        // (e.g. "toolchain" → toolchain-gcc-gnu-x86_64). Every downstream
+        // consumer — payload naming, cache keys, build order — keys on the
+        // meta's own name, so the node carries the canonical form and the
+        // visited set dedupes on it (a seed and its canonical name meeting
+        // in one closure resolve to one node).
+        let name = if meta.name.is_empty() {
+            seed.clone()
+        } else {
+            meta.name.clone()
+        };
         if !visited.insert(name.clone()) {
             continue;
         }
 
-        let meta = load_meta(&name)?;
         let requires: Vec<String> = meta
             .requires
             .iter()
