@@ -300,6 +300,14 @@ fn derive_track_channel(track: Option<&str>) -> String {
 /// that carries this image's model + seed. `kernel_name`/`gadget_name` are
 /// snap names (`pc-kernel`, `pc`) formatted to the `_<rev>` seed filename
 /// convention; `base_name` likewise.
+///
+/// No `bootloader` key is emitted, deliberately (issue #72): snapd's modeenv
+/// parser (`boot.Modeenv`, verified against snapd 2.76.3) defines no such
+/// key — unknown keys are carried in `extrakeys` and never read — and the
+/// bootloader names snap-bootstrap does implement are `grub`, `u-boot`,
+/// `android-boot`, `piboot` and `lk` (gadget.yaml validation), not
+/// `systemd-boot`. The bootloader identity is recorded in the image
+/// manifest instead.
 pub fn modeenv(
     recovery_label: &str,
     kernel_name: Option<&str>,
@@ -320,7 +328,8 @@ pub fn modeenv(
         let _ = writeln!(s, "snap_gadget={g}_1.snap");
     }
     let _ = writeln!(s, "snap_recovery_system={recovery_label}");
-    let _ = writeln!(s, "bootloader=systemd-boot");
+    // No `bootloader=` line: snapd's modeenv defines no such key; anything
+    // written here is dead data to snap-bootstrap (see doc comment, #72).
     s
 }
 
@@ -497,7 +506,10 @@ mod tests {
         assert!(text.contains("snap_kernel=pc-kernel_1.snap"));
         assert!(text.contains("snap_gadget=pc_1.snap"));
         assert!(text.contains("snap_recovery_system=20260909_1_0_0"));
-        assert!(text.contains("bootloader=systemd-boot"));
+        // Deliberate spec change (#72): modeenv carries no `bootloader` key —
+        // snapd's parser (snapd 2.76.3, boot.Modeenv) has no such key, and
+        // `systemd-boot` is not a name snap-bootstrap implements.
+        assert!(!text.contains("bootloader="));
     }
 
     #[test]
