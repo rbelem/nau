@@ -383,6 +383,142 @@ pub(crate) fn emit_boot_assessment(
     Ok(())
 }
 
+// ── Base systemd version gate (#79) ──
+
+/// Minimum systemd major the emitted boot-assessment machinery runs on.
+///
+/// Both halves of what step 5c emits land in systemd 240:
+/// `boot-complete.target` and `systemd-bless-boot` (their man pages state
+/// "Added in version 240") and the `LoaderBootCountPath` boot-count protocol
+/// that `bless-boot` consumes (the loader writes the counted entry name to
+/// `dir/next_name`; v240 reads it back and requires the `+` tries suffix).
+/// Measured on a real UC22 guest (systemd 249.11 + systemd-boot 261.2): the
+/// emitted machinery works at 249, so 240 is the floor, not the sweet spot.
+pub(crate) const BOOT_ASSESSMENT_MIN_MAJOR: u32 = 240;
+
+/// First systemd major whose `bless-boot` returns 0 cleanly on success.
+///
+/// Upstream commit 8f30a066ff (v255) adds the missing `return 0` to
+/// `bless-boot`'s `verb_set`. Below 255, a *successful* blessing still logs a
+/// spurious `EBUSY` ("Can't find boot counter source file…") and only exits 0
+/// because `DEFINE_MAIN_FUNCTION` maps non-negative to success — the blessing
+/// WORKS, it just lies to the serial log. That is cosmetic noise, not broken
+/// boot assessment, so this threshold produces a WARNING; the 240 floor is
+/// the only hard failure.
+pub(crate) const BLESS_BOOT_SUCCESS_EXIT_FIXED_MAJOR: u32 = 255;
+
+/// The static source the build reads the base's systemd version from.
+///
+/// Since v236 systemd installs its private shared library as
+/// `libsystemd-shared-<major>.so` under `/usr/lib/systemd/` (the SONAME
+/// carries the major only — 255.x installs `libsystemd-shared-255.so`), so
+/// the file NAME is the version, readable with plain filesystem access. This
+/// matters because the build cannot learn the version any other way
+/// unprivileged and offline: the staged rootfs is a foreign tree that must
+/// never be executed (`systemd --version` is off the table), and the base
+/// snap's `meta/snap.yaml` / `os-release` carry the *base* version, not the
+/// systemd package version. Major granularity is sufficient: every threshold
+/// this gate checks is major-granular ([`BOOT_ASSESSMENT_MIN_MAJOR`],
+/// [`BLESS_BOOT_SUCCESS_EXIT_FIXED_MAJOR`]).
+pub(crate) const SYSTEMD_SHARED_LIB_PREFIX: &str = "libsystemd-shared-";
+
+/// The staged rootfs directories the systemd shared lib lives under.
+///
+/// `usr/lib/systemd` is the merged-/usr spelling (every Ubuntu Core base);
+/// `lib/systemd` is kept for a non-merged layout.
+const SYSTEMD_LIB_DIRS: [&str; 2] = ["usr/lib/systemd", "lib/systemd"];
+
+/// The base rootfs's systemd major version, read statically from the staged
+/// tree — [`SYSTEMD_SHARED_LIB_PREFIX`] explains the mechanism. `None` means
+/// "cannot be determined" and the build gate fails closed on it.
+pub(crate) fn base_systemd_major(root: &Path) -> Option<u32> {
+    let mut best: Option<u32> = None;
+    for dir in SYSTEMD_LIB_DIRS {
+        let entries = match std::fs::read_dir(root.join(dir)) {
+            Ok(entries) => entries,
+            Err(_) => continue, // dir absent — try the other spelling
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix(SYSTEMD_SHARED_LIB_PREFIX) else {
+                continue;
+            };
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(major) = digits.parse::<u32>() {
+                best = best.max(Some(major));
+            }
+        }
+    }
+    best
+}
+
+/// The fail-closed message for a base systemd older than
+/// [`BOOT_ASSESSMENT_MIN_MAJOR`] — factored out so tests can assert the
+/// named, actionable wording without capturing stderr.
+pub(crate) fn boot_assessment_floor_error(major: u32) -> String {
+    format!(
+        "the base's systemd (major {major}) predates the boot-assessment \
+         machinery shuttle emits (ADR-0024 §3, #79): boot-complete.target, \
+         systemd-bless-boot, and the LoaderBootCountPath boot counting need \
+         systemd >= {BOOT_ASSESSMENT_MIN_MAJOR}. Refusing to emit try-boot \
+         configuration the base cannot run — pin a newer base snap, or drop \
+         disk.ab / update_source."
+    )
+}
+
+/// The spurious-EBUSY warning for a base systemd below
+/// [`BLESS_BOOT_SUCCESS_EXIT_FIXED_MAJOR`] (`None` at/above the fix).
+/// Factored out for the same reason as [`boot_assessment_floor_error`].
+pub(crate) fn bless_boot_busy_warning(major: u32) -> Option<String> {
+    (major < BLESS_BOOT_SUCCESS_EXIT_FIXED_MAJOR).then(|| {
+        format!(
+            "the base's systemd (major {major}) predates the v255 bless-boot \
+             fix (upstream 8f30a066ff): a successful blessing still logs a \
+             spurious EBUSY (\"Can't find boot counter source file\") and \
+             only exits 0 because DEFINE_MAIN_FUNCTION maps non-negative to \
+             success. Boot assessment itself works; the log line is noise. \
+             Warning, not a failure (#79)."
+        )
+    })
+}
+
+/// Build-time, fail-closed gate for the base's systemd version (#79).
+///
+/// Everything [`emit_boot_assessment`] writes is version-sensitive, so
+/// before any of it lands in the staged rootfs, the base's systemd must be
+/// *provable* (statically, offline, unprivileged —
+/// [`SYSTEMD_SHARED_LIB_PREFIX`]) and at least [`BOOT_ASSESSMENT_MIN_MAJOR`].
+/// An undeterminable version fails closed too: emitting try-boot machinery
+/// against an unverifiable base is exactly the silent-mismatch class #79
+/// closes. 240 ≤ major < 255 proceeds with a warning (see
+/// [`BLESS_BOOT_SUCCESS_EXIT_FIXED_MAJOR`] for why warning suffices there).
+pub(crate) fn assert_base_systemd_supports_boot_assessment(root: &Path) -> miette::Result<()> {
+    let Some(major) = base_systemd_major(root) else {
+        return Err(miette::miette!(
+            "could not determine the base's systemd version: no \
+             {SYSTEMD_SHARED_LIB_PREFIX}<major>.so under {} in the staged \
+             rootfs, so the boot-assessment gate (#79) cannot assert systemd \
+             >= {BOOT_ASSESSMENT_MIN_MAJOR}. Failing closed — check that the \
+             base snap was extracted (unsquashfs) and is a systemd rootfs",
+            SYSTEMD_LIB_DIRS.join(" / ")
+        ));
+    };
+    if major < BOOT_ASSESSMENT_MIN_MAJOR {
+        return Err(miette::miette!("{}", boot_assessment_floor_error(major)));
+    }
+    match bless_boot_busy_warning(major) {
+        Some(warning) => eprintln!("  ⚠ {warning}"),
+        None => eprintln!(
+            "  ✓ base systemd {major} supports the emitted boot-assessment \
+             machinery (floor {BOOT_ASSESSMENT_MIN_MAJOR}, #79)"
+        ),
+    }
+    Ok(())
+}
+
 /// Ensure the staged rootfs's `/etc/os-release` carries `IMAGE_VERSION`.
 ///
 /// The generated transfers carry `ProtectVersion=%A`; `%A` resolves to the

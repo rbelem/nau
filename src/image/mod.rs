@@ -780,6 +780,16 @@ pub(crate) fn build_disk_image_with(
     // actually run systemd-sysupdate, so the definitions and their trigger
     // cannot drift apart. One predicate drives the pair.
     if emits_sysupdate(image, disk_layout) {
+        // #79: fail-closed build gate on the base's systemd version. The
+        // try-boot machinery emitted below (systemd-bless-boot.service,
+        // boot-complete.target, LoaderBootCountPath counting) needs
+        // systemd >= 240; the version is read statically from the staged
+        // rootfs (libsystemd-shared-<major>.so) — no foreign-binary
+        // execution, works offline and unprivileged. 240 <= major < 255
+        // proceeds with a WARNING only: since v255 (upstream 8f30a066ff)
+        // successful blessing exits 0 cleanly, and below that the spurious
+        // EBUSY log line is cosmetic — the blessing itself works.
+        assert_base_systemd_supports_boot_assessment(&root)?;
         // ADR-0024 §3: the ESP-writing consumers carry
         // `RequiresMountsFor=<esp>` — a `nofail` ESP mount is only a
         // `wants` in local-fs.target with no ordering relationship, so the
@@ -3998,6 +4008,132 @@ RequiredBy=boot-complete.target
     }
 
     #[test]
+    fn base_systemd_major_reads_the_shared_lib_soname() {
+        // The SONAME carries the major only: 249.11-0ubuntu3.22 (the real
+        // UC22 guest) installs `libsystemd-shared-249.so` (#79).
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("usr/lib/systemd");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libsystemd-shared-249.so"), b"ELF").unwrap();
+        assert_eq!(base_systemd_major(root.path()), Some(249));
+    }
+
+    #[test]
+    fn base_systemd_major_reads_the_non_merged_lib_dir() {
+        // A non-merged-/usr layout keeps the lib under /lib/systemd.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("lib/systemd");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libsystemd-shared-240.so"), b"ELF").unwrap();
+        assert_eq!(base_systemd_major(root.path()), Some(240));
+    }
+
+    #[test]
+    fn base_systemd_major_takes_the_max_and_ignores_noise() {
+        // Both spellings present (plus a non-matching file): the version is
+        // the highest major found, junk never yields a bogus number.
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["usr/lib/systemd", "lib/systemd"] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        std::fs::write(
+            root.path().join("usr/lib/systemd/libsystemd-shared-249.so"),
+            b"ELF",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("lib/systemd/libsystemd-shared-255.so"),
+            b"ELF",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("usr/lib/systemd/libsystemd-core.so"),
+            b"ELF",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("usr/lib/systemd/udevd"), b"ELF").unwrap();
+        assert_eq!(base_systemd_major(root.path()), Some(255));
+    }
+
+    #[test]
+    fn base_systemd_major_is_none_for_a_systemd_free_rootfs() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(base_systemd_major(root.path()), None);
+    }
+
+    #[test]
+    fn boot_assessment_floor_error_names_the_failing_features() {
+        let message = boot_assessment_floor_error(239);
+        assert!(
+            message.contains("systemd >= 240"),
+            "names the floor: {message}"
+        );
+        assert!(
+            message.contains("boot-complete.target") && message.contains("LoaderBootCountPath"),
+            "names the version-sensitive features: {message}"
+        );
+        assert!(
+            message.contains("drop disk.ab / update_source"),
+            "names the opt-outs: {message}"
+        );
+    }
+
+    #[test]
+    fn bless_boot_busy_warning_applies_only_below_the_v255_fix() {
+        // 249 (the measured UC22 guest): warns, and the warning explains the
+        // upstream fix and why it is only a warning.
+        let warning = bless_boot_busy_warning(249).expect("249 predates the fix");
+        assert!(warning.contains("8f30a066ff"), "cites the fix: {warning}");
+        assert!(
+            warning.contains("Warning, not a failure"),
+            "states the posture: {warning}"
+        );
+        assert!(bless_boot_busy_warning(255).is_none(), "fixed at 255");
+        assert!(bless_boot_busy_warning(256).is_none(), "fixed above 255");
+    }
+
+    #[test]
+    fn assert_base_systemd_supports_boot_assessment_passes_at_the_measured_guest() {
+        // 249.11 is the real UC22 guest major from this week's boot tests:
+        // the gate admits it (with the v255 warning path), so the machinery
+        // that verifiably boots stays buildable.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("usr/lib/systemd");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libsystemd-shared-249.so"), b"ELF").unwrap();
+        assert!(assert_base_systemd_supports_boot_assessment(root.path()).is_ok());
+    }
+
+    #[test]
+    fn assert_base_systemd_supports_boot_assessment_fails_below_the_floor() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("usr/lib/systemd");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libsystemd-shared-239.so"), b"ELF").unwrap();
+        let err = assert_base_systemd_supports_boot_assessment(root.path())
+            .expect_err("239 predates boot-complete.target");
+        assert!(err.to_string().contains("systemd >= 240"), "{err}");
+    }
+
+    #[test]
+    fn assert_base_systemd_supports_boot_assessment_fails_closed_when_undeterminable() {
+        // No systemd lib ⇒ no assertion possible ⇒ the build stops before
+        // emitting any try-boot machinery (#79: fail closed).
+        let root = tempfile::tempdir().unwrap();
+        let err = assert_base_systemd_supports_boot_assessment(root.path())
+            .expect_err("an undeterminable version must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("could not determine the base's systemd version"),
+            "{message}"
+        );
+        assert!(
+            message.contains("usr/lib/systemd") && message.contains("lib/systemd"),
+            "names where it looked: {message}"
+        );
+    }
+
+    #[test]
     fn update_source_unset_emits_no_boot_assessment() {
         // Regression guard: the try-boot machinery shares the sysupdate gate,
         // so an image without `update_source` emits none of it.
@@ -4793,6 +4929,13 @@ RequiredBy=boot-complete.target
             calls: Mutex<Vec<Vec<String>>>,
             arch: String,
             digest: String,
+            /// The systemd major the fake base rootfs carries (written as
+            /// `usr/lib/systemd/libsystemd-shared-<major>.so` — the static
+            /// version source the #79 build gate reads). `None` stages a
+            /// systemd-free rootfs for the fail-closed tests. The default
+            /// 249 is the real UC22 guest's major measured against this
+            /// week's boot tests.
+            systemd_major: Option<u32>,
             /// `etc/fstab` contents observed in a populate source tree — the
             /// staged rootfs the fake `mkfs.ext4 -d` reads is removed when
             /// the build returns, so the fake captures the emitted split
@@ -4810,9 +4953,20 @@ RequiredBy=boot-complete.target
                     calls: Mutex::new(Vec::new()),
                     arch: arch.to_string(),
                     digest: digest.to_string(),
+                    systemd_major: Some(249),
                     fstabs: Mutex::new(Vec::new()),
                     split_paths: Mutex::new(Vec::new()),
                 }
+            }
+
+            fn with_systemd_major(mut self, major: u32) -> E2eRunner {
+                self.systemd_major = Some(major);
+                self
+            }
+
+            fn without_systemd(mut self) -> E2eRunner {
+                self.systemd_major = None;
+                self
             }
 
             fn calls(&self) -> Vec<Vec<String>> {
@@ -4885,9 +5039,11 @@ RequiredBy=boot-complete.target
         }
 
         /// Stage a rootfs tree the way a real `unsquashfs -d <dir>` would:
-        /// a `bin/` dir (so the pipeline reports a real rootfs) and a single
-        /// `lib/modules/<ver>/` tree (so kernel-version discovery works).
-        fn stage_rootfs_tree(dir: &str) {
+        /// a `bin/` dir (so the pipeline reports a real rootfs), a single
+        /// `lib/modules/<ver>/` tree (so kernel-version discovery works),
+        /// and the base's systemd shared lib (the #79 gate's version source)
+        /// when the runner carries a systemd major.
+        fn stage_rootfs_tree(dir: &str, systemd_major: Option<u32>) {
             std::fs::create_dir_all(Path::new(dir).join("bin")).unwrap();
             std::fs::create_dir_all(
                 Path::new(dir)
@@ -4898,6 +5054,15 @@ RequiredBy=boot-complete.target
             )
             .unwrap();
             std::fs::write(Path::new(dir).join("bin").join("busybox"), b"ELF").unwrap();
+            if let Some(major) = systemd_major {
+                let systemd_dir = Path::new(dir).join("usr").join("lib").join("systemd");
+                std::fs::create_dir_all(&systemd_dir).unwrap();
+                std::fs::write(
+                    systemd_dir.join(format!("{SYSTEMD_SHARED_LIB_PREFIX}{major}.so")),
+                    b"ELF",
+                )
+                .unwrap();
+            }
         }
 
         impl CommandRunner for E2eRunner {
@@ -4929,7 +5094,7 @@ RequiredBy=boot-complete.target
                             return Ok(out(1, Vec::new()));
                         }
                         if let Some(dir) = arg_after(argv, "-d") {
-                            stage_rootfs_tree(dir);
+                            stage_rootfs_tree(dir, self.systemd_major);
                         }
                         Ok(out(0, Vec::new()))
                     }
@@ -5514,6 +5679,126 @@ RequiredBy=boot-complete.target
                     "A/B + update_source emits {rel}: {paths:?}"
                 );
             }
+        }
+
+        /// The A/B + update_source image declaration shared by the #79
+        /// fail-closed e2e tests: same shape as the proven sysupdate e2e
+        /// layout above (UEFI + root + state + data, `ab`, `update_source`).
+        fn ab_update_source_image(name: &str, digest: &str) -> ImageDeclaration {
+            ImageDeclaration {
+                name: name.into(),
+                version: "1.0.0".into(),
+                base: pinned_base(digest),
+                kernel: None,
+                gadget: None,
+                gadget_channel: None,
+                extra_snaps: vec![],
+                bootloader: None,
+                disk: Some(DiskLayout {
+                    label: "gpt".into(),
+                    partitions: vec![
+                        Partition {
+                            name: "UEFI".into(),
+                            size: "64M".into(),
+                            fs: "vfat".into(),
+                            mount: "/boot/efi".into(),
+                            options: vec![],
+                            role: String::new(),
+                        },
+                        Partition {
+                            name: "root".into(),
+                            size: "256M".into(),
+                            fs: "ext4".into(),
+                            mount: "/".into(),
+                            options: vec![],
+                            role: String::new(),
+                        },
+                        Partition {
+                            name: "state".into(),
+                            size: "256M".into(),
+                            fs: "ext4".into(),
+                            mount: "/var/lib".into(),
+                            options: vec![],
+                            role: ROLE_STATE.into(),
+                        },
+                        Partition {
+                            name: "data".into(),
+                            size: "128M".into(),
+                            fs: "ext4".into(),
+                            mount: "/data".into(),
+                            options: vec![],
+                            role: String::new(),
+                        },
+                    ],
+                    swap: None,
+                    ab: true,
+                }),
+                sysctl: vec![],
+                update_source: Some("https://updates.example.invalid/os/".into()),
+                boot_health_exec: None,
+            }
+        }
+
+        #[test]
+        fn build_disk_image_fails_closed_when_base_systemd_is_too_old() {
+            // #79: a base predating boot-complete.target (240) must stop the
+            // A/B build before ANY try-boot machinery is emitted.
+            let stub_dir = tempfile::tempdir().unwrap();
+            let _path_guard = stub_disk_tool_path(stub_dir.path());
+            let (_cache_dir, cache, digest) = cache_fixture();
+            let image = ab_update_source_image("e2eoldsystemd", &digest);
+
+            let runner = E2eRunner::new("amd64", &digest).with_systemd_major(239);
+            let mut lockfile = LockFile::empty();
+            let output = tempfile::tempdir().unwrap();
+            let err = build_disk_image_with(
+                &runner,
+                &image,
+                output.path(),
+                &cache,
+                "latest/stable",
+                "amd64",
+                &mut lockfile,
+            )
+            .expect_err("systemd 239 predates the emitted machinery");
+            let message = err.to_string();
+            assert!(
+                message.contains("systemd >= 240"),
+                "names the floor: {message}"
+            );
+            assert!(
+                message.contains("Refusing to emit try-boot"),
+                "names the refusal: {message}"
+            );
+        }
+
+        #[test]
+        fn build_disk_image_fails_closed_when_base_systemd_is_undeterminable() {
+            // #79: no libsystemd-shared-<major>.so in the staged rootfs ⇒ no
+            // assertable version ⇒ the A/B build stops with a named message.
+            let stub_dir = tempfile::tempdir().unwrap();
+            let _path_guard = stub_disk_tool_path(stub_dir.path());
+            let (_cache_dir, cache, digest) = cache_fixture();
+            let image = ab_update_source_image("e2enodetect", &digest);
+
+            let runner = E2eRunner::new("amd64", &digest).without_systemd();
+            let mut lockfile = LockFile::empty();
+            let output = tempfile::tempdir().unwrap();
+            let err = build_disk_image_with(
+                &runner,
+                &image,
+                output.path(),
+                &cache,
+                "latest/stable",
+                "amd64",
+                &mut lockfile,
+            )
+            .expect_err("an undeterminable systemd version must fail closed");
+            let message = err.to_string();
+            assert!(
+                message.contains("could not determine the base's systemd version"),
+                "{message}"
+            );
         }
 
         #[test]
