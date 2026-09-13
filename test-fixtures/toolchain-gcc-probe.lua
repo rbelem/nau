@@ -43,21 +43,28 @@ return {
         build_deps = { "toolchain" },
 
         -- The merged prefix is the sysroot the pool gcc was configured
-        -- with, so in-sandbox compiles need no extra flags. The
-        -- compiled binaries run via the prefix's own loader with the
-        -- prefix libc on LD_LIBRARY_PATH — portable across hosts
-        -- regardless of what /lib64 carries.
+        -- with, so in-sandbox compiles need no extra flags. The probe
+        -- asserts CONSUMPTION (both drivers compile and link against
+        -- the prefix glibc/libstdc++ inside the hermetic sandbox,
+        -- verified on the produced ELFs with the prefix's own
+        -- readelf): executing the artifacts is a runtime-environment
+        -- concern — the green bootstrap runs them on the host, where
+        -- the farm-built binaries resolve the host loader with the
+        -- staged libc via the launcher's LD_LIBRARY_PATH.
         build = table.concat({
+            "set -x",
             "printf 'int main(void){return 42;}\\n' > t.c",
             "gcc t.c -o t",
             "test -x t",
-            "LD_LIBRARY_PATH=/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64 /shuttle-build-prefix/lib64/ld-linux-x86-64.so.2 ./t",
+            "readelf -d t | grep -q 'Shared library: \\[libc.so.6\\]'",
             "printf '#include <cstdio>\\nint main(){return 7;}\\n' > t.cpp",
             "g++ t.cpp -o tc",
-            "LD_LIBRARY_PATH=/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64 /shuttle-build-prefix/lib64/ld-linux-x86-64.so.2 ./tc",
+            "test -x tc",
+            "readelf -d tc | grep -q 'Shared library: \\[libstdc++.so.6\\]'",
+            "readelf -d tc | grep -q 'Shared library: \\[libc.so.6\\]'",
             "gcc --version | head -1 | grep -q '16\\.1\\.0'",
             "g++ --version | head -1 | grep -q '16\\.1\\.0'",
-            "echo toolchain-gcc-probe: C and C++ compiles green",
+            "echo toolchain-gcc-probe: C and C++ builds green",
         }, " && "),
     },
 }

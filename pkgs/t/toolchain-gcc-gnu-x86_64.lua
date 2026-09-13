@@ -6,7 +6,12 @@
 -- build-deps reference this as the system's default compiler.
 --
 -- Requires: binutils, gcc, glibc, gmp, mpfr, mpc, isl, linux-headers,
---           zlib, libstdcpp
+--           zlib
+-- (Deliberately NOT libstdcpp: gcc's own payload installs
+-- usr/lib64/libstdc++ and usr/lib64/libgcc_s, and the standalone
+-- libstdcpp payload pulls pool libgcc — a second, byte-different
+-- usr/lib64/libgcc_s.so that the merged-prefix merge rejects
+-- outright. The compiler's own copies are the toolchain truth.)
 --
 -- Apps (issue #38): gcc, g++, and the toolchain alias itself, so
 -- `shuttle pod add toolchain` works. The apps are what make the meta
@@ -88,7 +93,19 @@ return {
         },
         requires = {
             "binutils", "gcc", "glibc", "linux-headers",
-            "gmp", "mpfr", "mpc", "isl", "zlib", "libstdcpp",
+            "gmp", "mpfr", "mpc", "isl", "zlib",
+        },
+
+        -- ADR-0018 leak scan: the staged tree carries the gcc build's
+        -- recorded sysroot documentation (mkheaders.conf, configargs.h)
+        -- with the prefix path as text — the same references gcc.lua
+        -- silences, same rationale: load-bearing inside build sandboxes
+        -- (where the prefix is bound at exactly that path), inert at
+        -- pod runtime (the launchers repoint everything).
+        leaks_ok = {
+            "/shuttle-build-prefix",
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
         },
 
         source = {
@@ -106,9 +123,24 @@ return {
         build = table.concat({
             "mkdir -p $STAGE/toolchain",
             "cp -a /shuttle-build-prefix/. $STAGE/toolchain/",
-            "find $STAGE -type f -exec patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 {} + 2>/dev/null || true",
-            "find $STAGE -type f -exec patchelf --remove-rpath {} + 2>/dev/null || true",
-            "find $STAGE -type f -exec strip --strip-unneeded {} + 2>/dev/null || true",
+            -- The cross build installs only target-prefixed driver names
+            -- (x86_64-linux-gnu-gcc & co). Author the conventional
+            -- unprefixed names as symlinks so build_deps consumers reach
+            -- the toolchain by bare name in the merged prefix, and the
+            -- launchers below can exec usr/bin/gcc. Standard distro
+            -- layout (Ubuntu: gcc -> x86_64-linux-gnu-gcc-N).
+            "for t in gcc g++ cpp c++ gcov ar as ld nm ranlib strip readelf objcopy objdump; do ln -sf \"x86_64-linux-gnu-$t\" \"$STAGE/toolchain/usr/bin/$t\"; done",
+            -- Root-level usr/bin names for the merged build prefix: a
+            -- build_deps consumer's prefix merges this payload's tree
+            -- UNDER ITS OWN ROOTS (toolchain/** stays toolchain/**), so
+            -- the bare-name contract for `shuttle`-sandbox PATHS needs
+            -- the names at the payload's usr/bin, reaching into the
+            -- staged subtree relatively.
+            "mkdir -p $STAGE/usr/bin",
+            "for t in gcc g++ cpp c++ gcov ar as ld nm ranlib strip readelf objcopy objdump; do ln -sf \"../../toolchain/usr/bin/x86_64-linux-gnu-$t\" \"$STAGE/usr/bin/$t\"; done",
+            "find $STAGE -type f -exec patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 {} \\; 2>/dev/null || true",
+            "find $STAGE -type f -exec patchelf --remove-rpath {} \\; 2>/dev/null || true",
+            "find $STAGE -type f -exec strip --strip-unneeded {} \\; 2>/dev/null || true",
             -- gcc driver launcher
             "printf '%s\\n' '#!/bin/sh' 'p=$(readlink -f -- \"$0\") || exit 1' 'd=$(dirname -- \"$p\")' 'LD_LIBRARY_PATH=\"$d/usr/lib:$d/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"' 'export LD_LIBRARY_PATH' 'exec \"$d/usr/bin/gcc\" --sysroot=\"$d\" \"$@\"' > $STAGE/toolchain/gcc",
             -- g++ driver launcher

@@ -100,6 +100,14 @@ fn collect_basenames(dir: &Path, out: &mut BTreeSet<String>) {
 /// packages on their differing `meta/snap.yaml`.
 const META_SUBTREE: &str = "meta";
 
+/// The GNU info directory index. Every autotools `make install` regenerates
+/// it through install-info, so any two packages shipping info files carry
+/// byte-different copies — it is a per-host generated index, not package
+/// content (Debian ships no `dir` in packages; dpkg triggers build it).
+/// No build reads it, so it never enters the prefix: merging glibc and gcc
+/// (the toolchain metas) would otherwise hard-error on it.
+const INFO_DIR_FILE: &str = "usr/share/info/dir";
+
 /// Materialize the merged `/usr`-like build prefix from `payloads`.
 ///
 /// Returns the [`MergedPrefix`] — the caller must keep it alive for as long
@@ -173,23 +181,30 @@ fn merge_dir(
     for entry in entries {
         let entry = entry.map_err(|e| miette::miette!("reading payload of '{pkg}': {e}"))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        // Per-package packaging metadata never enters the prefix.
-        if rel.is_empty() && name == META_SUBTREE {
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{}", entry.file_name().to_string_lossy())
+        };
+        if excluded(rel, &name, &child_rel) {
             continue;
         }
         // No symlink following: the payload tree is what the package staged.
         let ft = entry
             .file_type()
             .map_err(|e| miette::miette!("reading payload of '{pkg}': {e}"))?;
-        let child_rel = if rel.is_empty() {
-            name
-        } else {
-            format!("{rel}/{}", entry.file_name().to_string_lossy())
-        };
         merge_entry(&entry.path(), ft, pkg, prefix, &child_rel, owners)?;
         owners.entry(child_rel).or_insert_with(|| pkg.to_string());
     }
     Ok(())
+}
+
+/// True when one payload entry never enters the prefix: per-package
+/// packaging metadata (`meta/` at the payload root) and the shared
+/// generated info index — both per-package by nature, consumed by no
+/// build, and guaranteed conflict generators otherwise.
+fn excluded(rel: &str, name: &str, child_rel: &str) -> bool {
+    (rel.is_empty() && name == META_SUBTREE) || child_rel == INFO_DIR_FILE
 }
 
 /// Merge one payload entry into the prefix at `child_rel`.
@@ -491,6 +506,62 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(prefix.join("usr/share/data")).unwrap(),
             "shared\n"
+        );
+    }
+
+    #[test]
+    fn info_dir_index_is_excluded_from_the_merge() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        // Every autotools install regenerates usr/share/info/dir through
+        // install-info, so packages shipping info files carry
+        // byte-different copies of the shared generated index. It is
+        // never a build input — excluded like meta/ instead of
+        // hard-erroring every toolchain-sized merge.
+        let tmp = tempfile::tempdir().unwrap();
+        let snap_a = make_snap(
+            &tmp.path().join("a"),
+            &[
+                ("usr/share/info/dir", "glibc-dir-entries\n"),
+                ("usr/share/info/libc.info", "libc\n"),
+            ],
+            &[],
+        );
+        let snap_b = make_snap(
+            &tmp.path().join("b"),
+            &[
+                ("usr/share/info/dir", "gcc-dir-entries\n"),
+                ("usr/share/info/gcc.info", "gcc\n"),
+            ],
+            &[],
+        );
+
+        let merged = materialize_merged_prefix(&[
+            Payload {
+                pkg: "glibc".into(),
+                snap: snap_a,
+            },
+            Payload {
+                pkg: "gcc".into(),
+                snap: snap_b,
+            },
+        ])
+        .expect("differing info dir indexes must not conflict");
+        let prefix = merged.path().to_path_buf();
+        assert!(
+            !prefix.join("usr/share/info/dir").exists(),
+            "the shared info index must be excluded"
+        );
+        // The actual docs still merge.
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("usr/share/info/libc.info")).unwrap(),
+            "libc\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("usr/share/info/gcc.info")).unwrap(),
+            "gcc\n"
         );
     }
     #[test]

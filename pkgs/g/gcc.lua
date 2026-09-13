@@ -59,14 +59,18 @@ arithmetic. GCC is the standard system compiler for most Linux distributions.]],
 
         -- ADR-0018 leak scan: the drivers and their runtime libs record
         -- the sysroot prefix (/shuttle-build-prefix/usr/lib{,64}) in
-        -- RUNPATH. Inside any build sandbox the merged prefix is bound
-        -- at exactly that path, so the RUNPATH is LOAD-BEARING for
-        -- build_deps consumers (cc1plus finds libstdc++ there). At pod
-        -- runtime it is dead — the toolchain meta's launchers replace
-        -- it with LD_LIBRARY_PATH into the assembled tree. Silenced
-        -- here by reference, not by file, so the exception stays two
-        -- greppable lines (leak_scan matches Leak::reference exactly).
+        -- RUNPATH, and the installed fixincludes config + recorded
+        -- configure args (mkheaders.conf, configargs.h) embed the
+        -- prefix as text. Inside any build sandbox the merged prefix
+        -- is bound at exactly that path, so the RUNPATH is
+        -- LOAD-BEARING for build_deps consumers (cc1plus finds
+        -- libstdc++ there); at pod runtime it is dead — the toolchain
+        -- meta's launchers replace it with LD_LIBRARY_PATH into the
+        -- assembled tree. Silenced by reference, not by file, so the
+        -- exception stays three greppable lines (leak_scan matches
+        -- Leak::reference exactly).
         leaks_ok = {
+            "/shuttle-build-prefix",
             "/shuttle-build-prefix/usr/lib",
             "/shuttle-build-prefix/usr/lib64",
         },
