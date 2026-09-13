@@ -94,7 +94,10 @@ pub struct KernelEntry {
 /// Bootloader configuration for disk images.
 #[derive(Debug, Clone)]
 pub struct BootloaderConfig {
-    pub type_: String, // "systemd-boot" or "grub"
+    /// Only "systemd-boot" is implemented (issue #71): any other declared
+    /// value fails declaration validation instead of being accepted and
+    /// silently ignored.
+    pub type_: String,
     pub timeout: u32,
 }
 
@@ -397,6 +400,18 @@ fn get_opt_bootloader(table: &mlua::Table) -> miette::Result<Option<BootloaderCo
     {
         Value::Table(t) => {
             let type_: String = t.get("type").unwrap_or_else(|_| "systemd-boot".into());
+            // Issue #71: `populate_esp`/`install_uki` install systemd-boot
+            // regardless of the declared type, so accepting any other value
+            // here would silently lie. Fail closed at declaration validation
+            // until a real GRUB backend exists (ADR-0011 §2's deferred
+            // uc-seed profile).
+            if type_ != "systemd-boot" {
+                return Err(miette::miette!(
+                    "image(): bootloader.type = \"{type_}\" is not implemented — only \
+                     \"systemd-boot\" is supported (issue #71: the GRUB backend does not \
+                     exist yet, so the declaration would silently install systemd-boot)"
+                ));
+            }
             let timeout: u32 = t.get("timeout").unwrap_or(3);
             Ok(Some(BootloaderConfig { type_, timeout }))
         }
@@ -1708,7 +1723,7 @@ mod tests {
                     name = "boot",
                     version = "1.0",
                     base = pin("core22"),
-                    bootloader = { type = "grub", timeout = 5 },
+                    bootloader = { type = "systemd-boot", timeout = 5 },
                 }
                 "#,
             )
@@ -1722,7 +1737,77 @@ mod tests {
 
         let decl = ImageDeclaration::from_lua_table(&table).unwrap();
         let bl = decl.bootloader.as_ref().unwrap();
-        assert_eq!(bl.type_, "grub");
+        assert_eq!(bl.type_, "systemd-boot");
+        assert_eq!(bl.timeout, 5);
+    }
+
+    /// Issue #71: `bootloader.type = "grub"` used to parse (and be silently
+    /// ignored — every image installs systemd-boot). It must fail closed at
+    /// declaration validation, naming the declared type, the supported
+    /// value, and the issue.
+    #[test]
+    fn test_image_rejects_unimplemented_grub_bootloader() {
+        let lua = lua_env();
+        let value: Value = lua
+            .load(
+                r#"
+                return image {
+                    name = "grub",
+                    version = "1.0",
+                    base = pin("core22"),
+                    bootloader = { type = "grub", timeout = 5 },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        let table = match value {
+            Value::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+
+        let err = ImageDeclaration::from_lua_table(&table)
+            .expect_err("grub must fail declaration validation (issue #71)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bootloader.type = \"grub\""),
+            "error must name the declared type: {msg}"
+        );
+        assert!(
+            msg.contains("systemd-boot"),
+            "error must name the supported value: {msg}"
+        );
+        assert!(msg.contains("#71"), "error must reference the issue: {msg}");
+    }
+
+    /// The implicit default shape (`bootloader` present without `type`) must
+    /// keep working — it resolves to the implemented systemd-boot.
+    #[test]
+    fn test_image_bootloader_without_type_defaults_to_systemd_boot() {
+        let lua = lua_env();
+        let value: Value = lua
+            .load(
+                r#"
+                return image {
+                    name = "default-bl",
+                    version = "1.0",
+                    base = pin("core22"),
+                    bootloader = { timeout = 5 },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        let table = match value {
+            Value::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+
+        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let bl = decl.bootloader.as_ref().unwrap();
+        assert_eq!(bl.type_, "systemd-boot");
         assert_eq!(bl.timeout, 5);
     }
 
