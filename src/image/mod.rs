@@ -2798,10 +2798,24 @@ WantedBy=multi-user.target
     /// The real Ubuntu Core `pc-kernel` layout (#70): root-level
     /// `kernel.efi` + `modules/<ver>/` + an empty `modules/<ver>/initrd`
     /// DIRECTORY. A fake objcopy writes the section payloads; the extracted
-    /// bzImage carries the matching banner, so discovery succeeds.
+    /// bzImage carries the matching banner, so discovery succeeds. `sbat`
+    /// is the body written for the `.sbat` section (#73) — empty simulates
+    /// an upstream UKI without the section (objcopy exits 0 with a
+    /// zero-byte output, as measured on binutils 2.46).
     struct ObjcopyRunner {
         calls: std::sync::Mutex<Vec<Vec<String>>>,
         banner: String,
+        sbat: String,
+    }
+
+    impl ObjcopyRunner {
+        fn with_banner(banner: String) -> ObjcopyRunner {
+            ObjcopyRunner {
+                calls: std::sync::Mutex::new(Vec::new()),
+                banner,
+                sbat: "sbat,1,UEFI Shim,sbat,1\nubuntu,1,Canonical,ubuntu,1\n".to_string(),
+            }
+        }
     }
 
     impl crate::command::CommandRunner for ObjcopyRunner {
@@ -2809,13 +2823,13 @@ WantedBy=multi-user.target
             self.calls.lock().unwrap().push(argv.to_vec());
             let section = argv[3].clone();
             let out = &argv[5];
-            let body = if section == "--only-section=.linux" {
-                format!(
+            let body = match section.as_str() {
+                "--only-section=.linux" => format!(
                     "....Linux version {} (buildd@lcy02) #1 SMP....",
                     self.banner
-                )
-            } else {
-                "newc-initrd".to_string()
+                ),
+                "--only-section=.sbat" => self.sbat.clone(),
+                _ => "newc-initrd".to_string(),
             };
             std::fs::write(out, body).unwrap();
             Ok(crate::command::RunnerOutput {
@@ -2850,10 +2864,7 @@ WantedBy=multi-user.target
         // The empty modules/<ver>/initrd DIRECTORY must never be selected.
         std::fs::create_dir_all(kdir.path().join(format!("modules/{version}/initrd"))).unwrap();
 
-        let runner = ObjcopyRunner {
-            calls: std::sync::Mutex::new(Vec::new()),
-            banner: version.to_string(),
-        };
+        let runner = ObjcopyRunner::with_banner(version.to_string());
         let scratch = tempfile::tempdir().unwrap();
         let payload = locate_kernel_payload(
             &runner,
@@ -2869,7 +2880,7 @@ WantedBy=multi-user.target
         assert!(payload.kernel.starts_with(scratch.path()));
 
         let calls = runner.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 2, "one objcopy per section: {calls:?}");
+        assert_eq!(calls.len(), 3, "one objcopy per section: {calls:?}");
         assert_eq!(
             calls[0][..4],
             ["/usr/bin/objcopy", "-O", "binary", "--only-section=.linux"]
@@ -2881,6 +2892,15 @@ WantedBy=multi-user.target
         assert_eq!(calls[0][5], payload.kernel.to_string_lossy());
         assert_eq!(calls[1][..4][3], "--only-section=.initrd", "second section");
         assert_eq!(calls[1][5], payload.initrd.to_string_lossy());
+        // #73: the .sbat section is extracted alongside, for `ukify --sbat`.
+        assert_eq!(calls[2][..4][3], "--only-section=.sbat", "third section");
+        let sbat = payload.sbat.expect("prebuilt UKI payload carries .sbat");
+        assert!(sbat.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&sbat).unwrap(),
+            "sbat,1,UEFI Shim,sbat,1\nubuntu,1,Canonical,ubuntu,1\n",
+            ".sbat is carried verbatim, never rewritten"
+        );
     }
 
     #[test]
@@ -2909,10 +2929,7 @@ WantedBy=multi-user.target
         let version = "5.15.0-186-generic";
         std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
         uc_kernel_snap_fixture(kdir.path(), version);
-        let runner = ObjcopyRunner {
-            calls: std::sync::Mutex::new(Vec::new()),
-            banner: "5.15.0-90-generic".to_string(),
-        };
+        let runner = ObjcopyRunner::with_banner("5.15.0-90-generic".to_string());
         let scratch = tempfile::tempdir().unwrap();
 
         let err = locate_kernel_payload(
@@ -2965,6 +2982,253 @@ WantedBy=multi-user.target
                 stderr: "no such section".into(),
             })
         }
+    }
+
+    #[test]
+    fn kernel_payload_uki_without_sbat_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        let version = "5.15.0-186-generic";
+        std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
+        uc_kernel_snap_fixture(kdir.path(), version);
+        // An ABSENT .sbat reports success but writes a zero-byte file
+        // (measured binutils 2.46 behavior) — absence is detected by the
+        // empty payload, and must refuse the build (#73).
+        let mut runner = ObjcopyRunner::with_banner(version.to_string());
+        runner.sbat = String::new();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let err = locate_kernel_payload(
+            &runner,
+            Some(Path::new("/usr/bin/objcopy")),
+            scratch.path(),
+            kdir.path(),
+            root.path(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(".sbat") && msg.contains("revocation"),
+            "a kernel.efi without .sbat must refuse the build naming the revocation \
+             lineage: {msg}"
+        );
+    }
+
+    #[test]
+    fn kernel_payload_uki_malformed_sbat_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        let version = "5.15.0-186-generic";
+        std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
+        uc_kernel_snap_fixture(kdir.path(), version);
+        // ukify SKIPS a --sbat input whose first line is not `sbat,`
+        // (warning only, exit 0) — a malformed upstream section would be
+        // dropped from the rebuilt UKI with a green build, so the payload
+        // must fail closed first (#73).
+        let mut runner = ObjcopyRunner::with_banner(version.to_string());
+        runner.sbat = "garbage,2,this-is-not-sbat\n".to_string();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let err = locate_kernel_payload(
+            &runner,
+            Some(Path::new("/usr/bin/objcopy")),
+            scratch.path(),
+            kdir.path(),
+            root.path(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(".sbat") && msg.contains("silently DROP"),
+            "malformed .sbat must name the ukify silent-drop hazard: {msg}"
+        );
+    }
+
+    /// A minimal but structurally valid PE32+ image, hand-rolled with no
+    /// toolchain: DOS header, COFF header, PE32+ optional header (240
+    /// bytes, 16 no-op data directories), and ONE named section whose raw
+    /// bytes are `body`. The real objcopy parses this, so section
+    /// extraction is proven against a real PE — a fake runner cannot prove
+    /// byte fidelity.
+    fn pe_fixture(section: &str, body: &[u8]) -> Vec<u8> {
+        let mut name = [0u8; 8];
+        name[..section.len()].copy_from_slice(section.as_bytes());
+        let mut pe = vec![0u8; 0x40];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        pe.extend_from_slice(b"PE\0\0");
+        pe.extend_from_slice(&0x8664u16.to_le_bytes()); // machine x86-64
+        pe.extend_from_slice(&1u16.to_le_bytes()); // one section
+        pe.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        pe.extend_from_slice(&0u32.to_le_bytes()); // symbol table
+        pe.extend_from_slice(&0u32.to_le_bytes()); // symbol count
+        pe.extend_from_slice(&240u16.to_le_bytes()); // optional header size
+        pe.extend_from_slice(&0x0102u16.to_le_bytes()); // executable image
+        pe.extend_from_slice(&0x20bu16.to_le_bytes()); // PE32+ magic
+        pe.push(1); // linker major
+        pe.push(0); // linker minor
+        pe.extend_from_slice(&0x200u32.to_le_bytes()); // size of code
+        pe.extend_from_slice(&(body.len() as u32).to_le_bytes()); // initialized
+        pe.extend_from_slice(&0u32.to_le_bytes()); // uninitialized
+        pe.extend_from_slice(&0x10u32.to_le_bytes()); // entry point
+        pe.extend_from_slice(&0u32.to_le_bytes()); // base of code
+        pe.extend_from_slice(&0u64.to_le_bytes()); // image base (VA=0!)
+        pe.extend_from_slice(&0x200u32.to_le_bytes()); // section alignment
+        pe.extend_from_slice(&0x200u32.to_le_bytes()); // file alignment
+        pe.extend_from_slice(&4u16.to_le_bytes()); // OS version
+        pe.extend_from_slice(&0u16.to_le_bytes());
+        pe.extend_from_slice(&0u16.to_le_bytes()); // image version
+        pe.extend_from_slice(&0u16.to_le_bytes());
+        pe.extend_from_slice(&4u16.to_le_bytes()); // subsystem version
+        pe.extend_from_slice(&0u16.to_le_bytes());
+        pe.extend_from_slice(&0u32.to_le_bytes()); // win32 version
+        pe.extend_from_slice(&0x2000u32.to_le_bytes()); // size of image
+        pe.extend_from_slice(&0x200u32.to_le_bytes()); // size of headers
+        pe.extend_from_slice(&0u32.to_le_bytes()); // checksum
+        pe.extend_from_slice(&10u16.to_le_bytes()); // EFI application
+        pe.extend_from_slice(&0u16.to_le_bytes()); // dll characteristics
+        pe.extend_from_slice(&0x100000u64.to_le_bytes()); // stack reserve
+        pe.extend_from_slice(&0x1000u64.to_le_bytes()); // stack commit
+        pe.extend_from_slice(&0x100000u64.to_le_bytes()); // heap reserve
+        pe.extend_from_slice(&0u64.to_le_bytes()); // heap commit
+        pe.extend_from_slice(&0u32.to_le_bytes()); // loader flags
+        pe.extend_from_slice(&16u32.to_le_bytes()); // data directories
+        pe.extend_from_slice(&[0u8; 128]); // 16 no-op data directories
+        assert_eq!(pe.len(), 0x40 + 4 + 20 + 240, "PE32+ header layout");
+        pe.extend_from_slice(&name);
+        pe.extend_from_slice(&(body.len() as u32).to_le_bytes()); // virtual size
+        pe.extend_from_slice(&0u32.to_le_bytes()); // virtual address (VA=0!)
+        pe.extend_from_slice(&(body.len() as u32).to_le_bytes()); // raw size
+        pe.extend_from_slice(&0x200u32.to_le_bytes()); // raw pointer
+        pe.extend_from_slice(&[0u8; 8]); // relocation + line-number pointers
+        pe.extend_from_slice(&[0u8; 4]); // relocation + line-number counts
+        pe.extend_from_slice(&0x42000040u32.to_le_bytes()); // data, readonly
+        assert_eq!(pe.len(), 0x170, "headers + one section table entry");
+        pe.resize(0x200, 0); // pad headers to file alignment
+        pe.extend_from_slice(body);
+        pe
+    }
+
+    #[test]
+    fn kernel_payload_sbat_is_extracted_from_a_real_pe_verbatim() {
+        // End-to-end against the REAL objcopy: a hand-rolled PE carrying a
+        // realistic Canonical-shaped .sbat must round-trip byte-identical.
+        // Skipped (honestly, with a note) only when binutils is not on PATH;
+        // the devbox gate always has it.
+        let Some(objcopy) = find_objcopy() else {
+            eprintln!("  ⊘ skip: objcopy not on PATH (run tests via devbox)");
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        let version = "5.15.0-186-generic";
+        std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
+        uc_kernel_snap_fixture(kdir.path(), version);
+        let sbat_body = b"sbat,1,UEFI Shim,sbat,1\n\
+                          ubuntu,1,Canonical,ubuntu,1\n\
+                          ubuntu.pc-kernel,1,Canonical,ubuntu,1\n";
+        std::fs::write(
+            kdir.path().join(KERNEL_EFI_NAME),
+            pe_fixture(".sbat", sbat_body),
+        )
+        .unwrap();
+
+        let payload = locate_kernel_payload(
+            &ImageTools,
+            Some(objcopy.as_path()),
+            kdir.path(), // scratch: the real objcopy only reads kernel.efi
+            kdir.path(),
+            root.path(),
+        )
+        .unwrap_or_else(|e| panic!("real-PE payload discovery must succeed: {e:#}"));
+        let sbat = payload.sbat.expect("prebuilt UKI payload carries .sbat");
+        assert_eq!(
+            std::fs::read(&sbat).unwrap(),
+            sbat_body,
+            ".sbat must survive extraction byte-identical (no truncation, no padding)"
+        );
+    }
+
+    /// A runner that records the argv it was handed and fakes success,
+    /// creating the `--output=` file — proving `build_uki_with`'s argv
+    /// without executing a real ukify.
+    struct RecordingUkifyRunner {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl crate::command::CommandRunner for RecordingUkifyRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            if let Some(output) = argv.iter().find(|a| a.starts_with("--output=")) {
+                std::fs::write(&output["--output=".len()..], b"MZ-fake-uki").unwrap();
+            }
+            Ok(crate::command::RunnerOutput {
+                code: 0,
+                stdout: Vec::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn uki_argv_carries_sbat_only_when_a_payload_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let sbat = dir.path().join("sbat");
+        std::fs::write(
+            &sbat,
+            "sbat,1,UEFI Shim,sbat,1\nubuntu,1,Canonical,ubuntu,1\n",
+        )
+        .unwrap();
+
+        let with_sbat = RecordingUkifyRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        build_uki_with(
+            &with_sbat,
+            Some(Path::new("/usr/bin/ukify")),
+            Some(Path::new("/usr/lib/systemd/boot/efi/linuxx64.efi.stub")),
+            Path::new("/nonexistent/vmlinuz"),
+            Path::new("/nonexistent/initrd"),
+            "quiet",
+            Path::new("/nonexistent/os-release"),
+            Some(&sbat),
+            &dir.path().join("out.efi"),
+        )
+        .expect("ukify succeeds");
+        let calls = with_sbat.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let flag = calls[0]
+            .iter()
+            .find(|a| a.starts_with("--sbat="))
+            .expect("--sbat must be passed when a payload exists");
+        assert_eq!(
+            flag,
+            &format!("--sbat=@{}", sbat.display()),
+            "the @PATH form hands the bytes to ukify verbatim"
+        );
+
+        let without_sbat = RecordingUkifyRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        build_uki_with(
+            &without_sbat,
+            Some(Path::new("/usr/bin/ukify")),
+            Some(Path::new("/usr/lib/systemd/boot/efi/linuxx64.efi.stub")),
+            Path::new("/nonexistent/vmlinuz"),
+            Path::new("/nonexistent/initrd"),
+            "quiet",
+            Path::new("/nonexistent/os-release"),
+            None,
+            &dir.path().join("out.efi"),
+        )
+        .expect("ukify succeeds");
+        let calls = without_sbat.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            !calls[0].iter().any(|a| a.starts_with("--sbat=")),
+            "no --sbat without an upstream payload: the stub's own policy stays, \
+             never an invented one"
+        );
     }
 
     #[test]
@@ -3236,6 +3500,7 @@ CONFIG_EXT4_FS=m
             Path::new("/nonexistent/initrd"),
             "quiet",
             Path::new("/nonexistent/os-release"),
+            None,
             Path::new("/nonexistent/out.efi"),
         )
         .unwrap_err();
@@ -3264,6 +3529,7 @@ CONFIG_EXT4_FS=m
             Path::new("/nonexistent/initrd"),
             "quiet",
             Path::new("/nonexistent/os-release"),
+            None,
             Path::new("/nonexistent/out.efi"),
         )
         .unwrap_err();

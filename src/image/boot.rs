@@ -772,6 +772,15 @@ pub(crate) struct KernelPayload {
     /// never honors shuttle's verity cmdline — the build replaces its initrd
     /// with shuttle's native one (issue #75). `false` for the raw path.
     pub(crate) prebuilt_uki: bool,
+    /// `.sbat` (SBAT — Secure Boot Advanced Targeting) revocation policy
+    /// carried VERBATIM from the prebuilt `kernel.efi` into the rebuilt UKI
+    /// via `ukify --sbat` (issue #73). Under an SBAT-enforcing shim, a UKI
+    /// whose policy lines are dropped is measured against a revocation
+    /// lineage that no longer describes it, so the upstream section is
+    /// carried as-is or the build fails closed — it is never invented.
+    /// `None` for the raw path: there is no upstream UKI, and the rebuilt
+    /// UKI keeps whatever `.sbat` the sd-stub itself carries.
+    pub(crate) sbat: Option<PathBuf>,
     /// Keeps UKI-extracted boot assets alive when the payload came from a
     /// prebuilt `kernel.efi` rather than raw files (issue #70). `None` for
     /// the raw path, where the files live in the extracted snap tree.
@@ -786,6 +795,7 @@ impl KernelPayload {
             initrd,
             version,
             prebuilt_uki: false,
+            sbat: None,
             _scratch: None,
         }
     }
@@ -833,11 +843,12 @@ pub(crate) const EFI_STUB_CANDIDATES: [&str; 3] = [
 /// Raw kernel binaries are first choice. When no raw pair is present, the
 /// real Ubuntu Core `pc-kernel` layout (#70) is used instead: a prebuilt
 /// [`KERNEL_EFI_NAME`] UKI at the snap root is split with `objcopy` into its
-/// `.linux`/`.initrd` PE sections and shuttle re-assembles its OWN UKI from
-/// them — the per-image cmdline (root=PARTUUID, dm-verity roothash) must live
-/// INSIDE the signed UKI, and systemd-stub ignores LoadOptions under Secure
-/// Boot when a UKI carries an embedded cmdline. A snapd-style `kernel.img`
-/// squashfs payload is not unpacked (that is gadget-stage behavior).
+/// `.linux`/`.initrd` PE sections (and its `.sbat` revocation policy, #73)
+/// and shuttle re-assembles its OWN UKI from them — the per-image cmdline
+/// (root=PARTUUID, dm-verity roothash) must live INSIDE the signed UKI, and
+/// systemd-stub ignores LoadOptions under Secure Boot when a UKI carries an
+/// embedded cmdline. A snapd-style `kernel.img` squashfs payload is not
+/// unpacked (that is gadget-stage behavior).
 pub(crate) fn locate_kernel_payload(
     runner: &dyn CommandRunner,
     objcopy: Option<&Path>,
@@ -885,10 +896,13 @@ fn locate_raw_payload(kernel_dir: &Path, version: String) -> miette::Result<Opti
 }
 
 /// The prebuilt-UKI fallback for the real Ubuntu Core `pc-kernel` layout
-/// (#70): `kernel.efi` at the snap root, split into `.linux`/`.initrd` PE
-/// sections via `objcopy`. Both halves must be found and extracted, and the
-/// extracted bzImage banner must agree with the discovered module version —
-/// anything less fails closed with the exact cause.
+/// (#70): `kernel.efi` at the snap root, split into `.linux`/`.initrd`
+/// PE sections via `objcopy` — plus its `.sbat` revocation policy, carried
+/// verbatim into the rebuilt UKI (#73). Both payload halves must be found
+/// and extracted, the `.sbat` must be present and well-formed (it is the
+/// revocation lineage under an SBAT-enforcing shim), and the extracted
+/// bzImage banner must agree with the discovered module version — anything
+/// less fails closed with the exact cause.
 fn locate_uki_payload(
     runner: &dyn CommandRunner,
     objcopy: Option<&Path>,
@@ -916,14 +930,73 @@ fn locate_uki_payload(
     for (section, out) in [(".linux", &kernel), (".initrd", &initrd)] {
         extract_pe_section(runner, objcopy, &uki, section, out)?;
     }
+    // #73: carry the upstream `.sbat` verbatim. Revocation metadata the
+    // rebuilt UKI drops would let a kernel boot past revocations issued
+    // against the original, so a missing or malformed section is a hard
+    // failure, never a warning.
+    let sbat = dir.join("sbat");
+    extract_pe_section(runner, objcopy, &uki, ".sbat", &sbat)?;
+    let sbat = validate_sbat_payload(&sbat, &uki)?;
     verify_bzimage_version(&kernel, &version)?;
     Ok(KernelPayload {
         kernel,
         initrd,
         version,
         prebuilt_uki: true,
+        sbat: Some(sbat),
         _scratch: None,
     })
+}
+
+/// Validate the extracted `.sbat` payload (#73) and normalize it in place
+/// for the `ukify --sbat=@path` hand-off.
+///
+/// `objcopy -O binary --only-section` reports an ABSENT section as exit 0
+/// with a ZERO-BYTE output file (measured: binutils 2.46), so absence is
+/// detected here, not by the exit code. Empty output means the source UKI
+/// carries no `.sbat` at all: its revocation lineage cannot be carried, and
+/// a rebuilt UKI without it would boot past revocations targeting the
+/// original — refused.
+///
+/// Non-empty payloads are trimmed of trailing NUL section padding, must
+/// decode as UTF-8, and must start with the `sbat,` version line. That last
+/// check mirrors `ukify`'s own merge step, which SKIPS a `--sbat` input that
+/// does not start with `sbat,` — printing a warning while exiting 0 (read
+/// from ukify's merge_sbat). Without the pre-check, a malformed upstream
+/// section would be dropped from the rebuilt UKI with a green build. The
+/// trimmed bytes are written back so the file handed to ukify is exactly
+/// the validated policy; the policy itself is never rewritten.
+fn validate_sbat_payload(sbat: &Path, uki: &Path) -> miette::Result<PathBuf> {
+    let bytes = std::fs::read(sbat)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading extracted .sbat from {}", uki.display()))?;
+    if bytes.is_empty() {
+        return Err(miette::miette!(
+            "{KERNEL_EFI_NAME} carries no .sbat section — its SBAT Secure Boot revocation \
+             lineage cannot be carried into the rebuilt UKI (#73), so refusing to build a \
+             disk image whose boot chain cannot be revoked by shim's SBAT policy"
+        ));
+    }
+    let trimmed = match bytes.iter().rposition(|&b| b != 0) {
+        Some(last) => &bytes[..=last],
+        None => &bytes[..],
+    };
+    let text = std::str::from_utf8(trimmed).map_err(|e| {
+        miette::miette!(
+            "{KERNEL_EFI_NAME}'s .sbat section is not valid UTF-8 ({e}) — a policy that \
+             cannot be read cannot be carried (#73); refusing to build"
+        )
+    })?;
+    if !text.lines().next().is_some_and(|l| l.starts_with("sbat,")) {
+        return Err(miette::miette!(
+            "{KERNEL_EFI_NAME}'s .sbat section does not start with an 'sbat,' version line — \
+             ukify would silently DROP it from the rebuilt UKI (#73); refusing to build with \
+             a revocation policy that would not be carried. First line: {:?}",
+            text.lines().next().unwrap_or("")
+        ));
+    }
+    std::fs::write(sbat, trimmed).into_diagnostic()?;
+    Ok(sbat.to_path_buf())
 }
 
 /// `objcopy -O binary --only-section=<section> <uki> <out>` through the
@@ -1217,7 +1290,9 @@ pub(crate) fn write_uki_os_release(
 
 /// Build one UKI with the real `ukify` CLI. `ukify` and `stub` are
 /// injected so the fail-closed behavior is testable on hosts without
-/// systemd's tools; [`build_uki`] resolves them from the host.
+/// systemd's tools; [`build_uki`] resolves them from the host. `sbat` is
+/// the upstream `.sbat` payload to carry verbatim (#73) — `None` leaves the
+/// sd-stub's own policy in place, never an invented one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_uki_with(
     runner: &dyn CommandRunner,
@@ -1227,6 +1302,7 @@ pub(crate) fn build_uki_with(
     initrd: &Path,
     cmdline: &str,
     os_release: &Path,
+    sbat: Option<&Path>,
     output: &Path,
 ) -> miette::Result<()> {
     let Some(ukify) = ukify else {
@@ -1244,7 +1320,7 @@ pub(crate) fn build_uki_with(
             EFI_STUB_CANDIDATES.join(", ")
         ));
     };
-    let argv = vec![
+    let mut argv = vec![
         ukify.to_string_lossy().into_owned(),
         "build".to_string(),
         format!("--linux={}", kernel.display()),
@@ -1252,8 +1328,16 @@ pub(crate) fn build_uki_with(
         format!("--cmdline={cmdline}"),
         format!("--os-release=@{}", os_release.display()),
         format!("--stub={}", stub.display()),
-        format!("--output={}", output.display()),
     ];
+    // `@PATH`, not inline text: the extracted bytes pass through byte-identical
+    // (ukify reads the file as text and merges its lines with the stub's own
+    // policy — nothing is truncated or replaced). Section carry itself never
+    // touches `objcopy --update-section`, which silently truncates the input
+    // to the existing section size; the UKI is assembled fresh on the stub.
+    if let Some(sbat) = sbat {
+        argv.push(format!("--sbat=@{}", sbat.display()));
+    }
+    argv.push(format!("--output={}", output.display()));
     let out = runner
         .run(&argv)
         .map_err(|e| miette::miette!("failed to run ukify: {e}"))?;
@@ -1274,6 +1358,7 @@ pub(crate) fn build_uki(
     initrd: &Path,
     cmdline: &str,
     os_release: &Path,
+    sbat: Option<&Path>,
     output: &Path,
 ) -> miette::Result<()> {
     build_uki_with(
@@ -1284,6 +1369,7 @@ pub(crate) fn build_uki(
         initrd,
         cmdline,
         os_release,
+        sbat,
         output,
     )
 }
@@ -1346,9 +1432,19 @@ pub(crate) fn assemble_uki(
         &payload.initrd,
         &cmdline,
         &os_release,
+        payload.sbat.as_deref(),
         &uki_stage,
     )?;
     eprintln!("  ✓ UKI built: {filename}");
+    if let Some(sbat) = payload.sbat.as_deref() {
+        let lines = std::fs::read_to_string(sbat)
+            .map(|t| t.lines().count().saturating_sub(1))
+            .unwrap_or(0);
+        eprintln!(
+            "  ✓ SBAT carried from {} ({lines} revocation component line(s), #73)",
+            KERNEL_EFI_NAME
+        );
+    }
 
     Ok((
         Some(UkiFacts {

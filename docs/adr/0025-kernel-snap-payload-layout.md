@@ -82,9 +82,13 @@ the layout mismatch moves from an unbootable artifact at first boot to a
 build-time failure with a precise message.
 
 **Negative**: shuttle rebuilds a UKI Canonical already assembled, discarding
-upstream's tested embedded command line, its `.sbat` revocation metadata, and
-any future Canonical signature chain (the dropped `.sbat` is tracked
-separately). The extraction path adds a hard runtime dependency on `objcopy`.
+upstream's tested embedded command line and any future Canonical signature
+chain. The `.sbat` revocation metadata initially dropped here is now carried
+verbatim into the rebuilt UKI instead (`objcopy` extraction alongside
+`.linux`/`.initrd` and `ukify --sbat=@path`, issue #73; absent or malformed
+upstream sections fail the build — a rebuilt UKI without its upstream's
+revocation lineage could boot past revocations issued against the
+original). The extraction path adds a hard runtime dependency on `objcopy`.
 If the deferred UC-compatible (`uc-seed` / GRUB) profile (ADR-0011 §2) is ever
 activated, adopt-as-is becomes the correct path for that target and this
 extraction machinery is not used there — recorded here as an explicit decision
