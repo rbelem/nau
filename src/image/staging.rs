@@ -1,6 +1,6 @@
 //! Rootfs staging + ADR-0019 base-aware resolution (issue #57).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
 use serde::Deserialize;
@@ -501,7 +501,20 @@ fn guest_interpreter(arch: &str) -> miette::Result<&'static str> {
     }
 }
 
-/// Re-anchor the staged binary to the guest (#81).
+/// Re-anchor the staged shuttle binary to the guest (#81): the generic
+/// [`anchor_elf_to_guest`] with the shuttle path as the error label and the
+/// host RUNPATH dropped (the guest resolves libc through its own default
+/// search path).
+fn anchor_binary_to_guest(
+    runner: &dyn CommandRunner,
+    staged: &Path,
+    arch: &str,
+) -> miette::Result<()> {
+    anchor_elf_to_guest(runner, staged, arch, &format!("/{SHUTTLE_BIN_PATH}"), None)
+}
+
+/// Re-anchor a staged ELF to the guest (#81; generalized for the #85
+/// bless-boot tooling by the `label` and `rpath` parameters).
 ///
 /// A devbox/nix-built ELF requests its interpreter from the build host's
 /// store (`/nix/store/…/ld-linux-…`) and carries that store in RUNPATH —
@@ -509,14 +522,18 @@ fn guest_interpreter(arch: &str) -> miette::Result<&'static str> {
 /// the exact "No such file or directory" #81 closes. When the staged file's
 /// interpreter is not already the guest's standard path, `patchelf`
 /// (already part of this repo's toolchain, `snap.rs` ELF repair) rewrites it
-/// to [`guest_interpreter`] and drops the host RUNPATH — unprivileged,
-/// deterministic, and strictly REMOVING host paths from the image. A file
-/// patchelf cannot parse (static binary, test fixture) needs no anchoring
-/// and is skipped with a note.
-fn anchor_binary_to_guest(
+/// to [`guest_interpreter`] — unprivileged, deterministic, and strictly
+/// REMOVING host paths from the image. `rpath` decides the RUNPATH rewrite:
+/// `None` drops it (the guest's own libraries resolve through the default
+/// search path), `Some(dir)` points it at a guest directory the file's
+/// dependencies were staged into. A file patchelf cannot parse (static
+/// binary, test fixture) needs no anchoring and is skipped with a note.
+fn anchor_elf_to_guest(
     runner: &dyn CommandRunner,
     staged: &Path,
     arch: &str,
+    label: &str,
+    rpath: Option<&str>,
 ) -> miette::Result<()> {
     let guest = guest_interpreter(arch)?;
     let staged_str = staged.to_string_lossy().into_owned();
@@ -533,56 +550,121 @@ fn anchor_binary_to_guest(
         Ok(out) => out,
         Err(e) if !has_patchelf => {
             return Err(miette::miette!(
-                "patchelf is required to stage the shuttle binary into the image \
-                 (#81): the build-host ELF must be re-anchored to the guest loader \
-                 before it can exec on-device. Install patchelf (devbox ships it) \
-                 and rebuild: {e}"
+                "patchelf is required to stage {label} into the image (#81): \
+                 the build-host ELF must be re-anchored to the guest loader \
+                 before it can exec on-device. Install patchelf (devbox ships \
+                 it) and rebuild: {e}"
             ));
         }
         Err(e) => {
-            return Err(miette::miette!(
-                "cannot inspect /{SHUTTLE_BIN_PATH} with patchelf: {e}"
-            ));
+            return Err(miette::miette!("cannot inspect {label} with patchelf: {e}"));
         }
     };
     if crate::command::exit_code(&out) != 0 {
-        eprintln!(
-            "  ℹ /{SHUTTLE_BIN_PATH}: not a dynamically linked ELF — no guest \
-             anchoring needed"
-        );
+        eprintln!("  ℹ {label}: not a dynamically linked ELF — no guest anchoring needed");
         return Ok(());
     }
     let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if current == guest {
+        // The loader is already the guest's, but the RUNPATH rewrite is the
+        // caller's contract too (rpath: #85). Reaching here with a requested
+        // rpath still applies it.
+        apply_rpath_only(runner, &staged_str, label, rpath, has_patchelf)?;
         return Ok(());
     }
+    rewrite_interpreter(
+        runner,
+        &staged_str,
+        label,
+        arch,
+        &current,
+        rpath,
+        has_patchelf,
+    )?;
+    eprintln!("  ✓ {label} anchored to the guest loader '{guest}' (was '{current}')");
+    Ok(())
+}
+
+/// Apply only the RUNPATH contract: `Some(dir)` is set, `None` is a no-op.
+fn apply_rpath_only(
+    runner: &dyn CommandRunner,
+    staged_str: &str,
+    label: &str,
+    rpath: Option<&str>,
+    has_patchelf: bool,
+) -> miette::Result<()> {
+    let Some(dir) = rpath else {
+        return Ok(());
+    };
     if !has_patchelf {
         return Err(miette::miette!(
-            "/{SHUTTLE_BIN_PATH} requests interpreter '{current}', which does not \
-             exist in the image, and patchelf is unavailable to re-anchor it to \
-             '{guest}' — the embedded binary would be inert on-device (#81). \
-             Install patchelf (devbox ships it) and rebuild."
+            "{label} needs its RUNPATH set to '{dir}' for the guest to resolve \
+             its dependencies, and patchelf is unavailable — refusing to ship \
+             an image whose boot tooling cannot load (#85). Install patchelf \
+             (devbox ships it) and rebuild."
         ));
     }
     let out = runner
         .run(&[
             "patchelf".to_string(),
-            "--set-interpreter".to_string(),
-            guest.to_string(),
-            "--remove-rpath".to_string(),
-            staged_str.clone(),
+            "--set-rpath".to_string(),
+            dir.to_string(),
+            staged_str.to_string(),
         ])
         .map_err(|e| miette::miette!("patchelf failed: {e}"))?;
     if crate::command::exit_code(&out) != 0 {
         return Err(miette::miette!(
-            "patchelf could not re-anchor /{SHUTTLE_BIN_PATH} to '{guest}' — \
-             refusing to ship a binary the guest cannot exec (#81)"
+            "patchelf could not set the RUNPATH of {label} to '{dir}' — \
+             refusing to ship a binary whose dependencies cannot resolve in \
+             the guest (#85)"
         ));
     }
-    eprintln!(
-        "  ✓ /{SHUTTLE_BIN_PATH} anchored to the guest loader '{guest}' \
-         (was '{current}')"
-    );
+    eprintln!("  ✓ {label} RUNPATH set to '{dir}' (#85)");
+    Ok(())
+}
+
+/// The interpreter differs from the guest's: rewrite it, applying the
+/// caller's RUNPATH decision in the same patchelf pass.
+fn rewrite_interpreter(
+    runner: &dyn CommandRunner,
+    staged_str: &str,
+    label: &str,
+    arch: &str,
+    current: &str,
+    rpath: Option<&str>,
+    has_patchelf: bool,
+) -> miette::Result<()> {
+    let guest = guest_interpreter(arch)?;
+    if !has_patchelf {
+        return Err(miette::miette!(
+            "{label} requests interpreter '{current}', which does not exist in \
+             the image, and patchelf is unavailable to re-anchor it to \
+             '{guest}' — the staged binary would be inert on-device (#81). \
+             Install patchelf (devbox ships it) and rebuild."
+        ));
+    }
+    let mut argv = vec![
+        "patchelf".to_string(),
+        "--set-interpreter".to_string(),
+        guest.to_string(),
+    ];
+    match rpath {
+        Some(dir) => {
+            argv.push("--set-rpath".to_string());
+            argv.push(dir.to_string());
+        }
+        None => argv.push("--remove-rpath".to_string()),
+    }
+    argv.push(staged_str.to_string());
+    let out = runner
+        .run(&argv)
+        .map_err(|e| miette::miette!("patchelf failed: {e}"))?;
+    if crate::command::exit_code(&out) != 0 {
+        return Err(miette::miette!(
+            "patchelf could not re-anchor {label} to '{guest}' — refusing to \
+             ship a binary the guest cannot exec (#81)"
+        ));
+    }
     Ok(())
 }
 
@@ -617,6 +699,589 @@ fn embed_source() -> miette::Result<PathBuf> {
              (issue #81): {e}"
         )
     })
+}
+
+// ── The bless-boot tooling the base may lack (#85) ──
+
+/// Guest-relative install path of the `systemd-bless-boot` helper (#85).
+///
+/// This is the path [`super::boot::BLESS_BOOT_EXEC`] execs (a drift-pin test
+/// asserts the two cannot diverge). `usr/lib/systemd/` is the FHS install
+/// directory upstream's own unit uses.
+pub(crate) const BLESS_BOOT_TOOLING_BIN_PATH: &str = "usr/lib/systemd/systemd-bless-boot";
+
+/// Guest-relative install path of the `systemd-bless-boot-generator` (#85).
+///
+/// `usr/lib/systemd/system-generators/` is where systemd runs boot
+/// generators from; this is the generator that pulls
+/// `systemd-bless-boot.service` into the transaction of a COUNTED boot (the
+/// stock mechanism, `systemd-bless-boot-generator(8)`).
+pub(crate) const BLESS_BOOT_TOOLING_GENERATOR_PATH: &str =
+    "usr/lib/systemd/system-generators/systemd-bless-boot-generator";
+
+/// The guest directory the staged tooling's RUNPATH points at when its
+/// `libsystemd-shared-<major>.so` had to be shipped from the build host (#85).
+pub(crate) const BLESS_BOOT_TOOLING_LIB_DIR: &str = "/usr/lib/systemd";
+
+/// The multiarch triplet an image arch's libraries live under (#85 glibc
+/// gate: the tooling must be checked against the libc of its OWN arch).
+fn multiarch_triplet(arch: &str) -> Option<&'static str> {
+    match arch {
+        "amd64" | "x86_64" => Some("x86_64-linux-gnu"),
+        "arm64" | "aarch64" => Some("aarch64-linux-gnu"),
+        _ => None,
+    }
+}
+
+/// Build-host override naming a directory that carries the host's own
+/// `systemd-bless-boot` (and, alongside it, `system-generators/
+/// systemd-bless-boot-generator` and `libsystemd-shared-<major>.so`). For
+/// hosts whose tooling is installed outside the probed defaults.
+pub(crate) const BLESS_BOOT_TOOLING_DIR_ENV: &str = "SHUTTLE_BLESS_BOOT_DIR";
+
+/// Ship the `systemd-bless-boot` helper and its boot generator into the
+/// staged rootfs when the base does not provide them (#85).
+///
+/// The core26 base (measured: `core26_462`, systemd 259) ships
+/// `boot-complete.target` and the counted-boot protocol but **neither**
+/// binary — so on UC26 a counted boot (the normal state after the first
+/// sysupdate install) could never be blessed: the generator that pulls the
+/// bless service is absent, and even a hand-pulled service would exec a
+/// missing `/usr/lib/systemd/systemd-bless-boot`. Every UC22-era base
+/// (measured: core22 2437/2955) ships both, so the fast path is
+/// "already there — touch nothing".
+///
+/// When staging is needed, the source is the BUILD HOST's own systemd
+/// tooling, and every step fails closed:
+///
+/// 1. **arch-aware**: the ELF `e_machine` of each host binary must match
+///    the image's target arch — a cross-arch build cannot ship host-arch
+///    tooling and fails with a named error.
+/// 2. **version-gated** against the #79 floor: the host binary reports its
+///    own version (`--version`; a host binary may be executed by the host)
+///    and must be ≥ [`super::boot::BOOT_ASSESSMENT_MIN_MAJOR`].
+/// 3. **runnable in the guest**: the `libsystemd-shared-<major>.so` the
+///    binaries link is resolved IN THE GUEST when the base carries the same
+///    major (RUNPATH → that directory); otherwise the host's copy is staged
+///    into [`BLESS_BOOT_TOOLING_LIB_DIR`] — a self-consistent pair, since
+///    `libsystemd-shared` is not a stable ABI across majors. The guest's
+///    glibc must define every `GLIBC_*` symbol version the staged host ELFs
+///    request (the #80 lesson: a nix toolchain needs glibc ≥ 2.36's
+///    `GLIBC_ABI_GNU2_TLS`, which the core22 guest's 2.35 lacks — an
+///    inert-at-boot binary must fail the BUILD, not the first bless).
+///
+/// Runs BEFORE the rootfs is hashed (same write-before-verity contract as
+/// every other staged file). Called from the same step-5c gate that emits
+/// the boot assessment.
+pub(crate) fn stage_bless_boot_binaries(
+    runner: &dyn CommandRunner,
+    root: &Path,
+    arch: &str,
+) -> miette::Result<()> {
+    // Fast path: the base ships its own tooling — touch nothing.
+    if root.join(BLESS_BOOT_TOOLING_BIN_PATH).is_file()
+        && root.join(BLESS_BOOT_TOOLING_GENERATOR_PATH).is_file()
+    {
+        eprintln!("  ✓ base ships its own systemd-bless-boot tooling — nothing staged (#85)");
+        return Ok(());
+    }
+
+    let (bless, generator) = locate_host_bless_tooling(runner).wrap_err_with(|| {
+        "boot assessment is emitted but the bless-boot tooling cannot be \
+         provided (#85, gate #79): the base rootfs ships neither \
+         systemd-bless-boot nor its generator, and the build host has no \
+         usable systemd tooling to ship — install the host's systemd tooling \
+         or point SHUTTLE_BLESS_BOOT_DIR at it"
+    })?;
+    bless_tooling_arch_gate(&bless, &generator, arch)?;
+    let major = bless_tooling_version(runner, &bless)?;
+
+    let (rpath, host_lib) = resolve_tooling_lib(runner, root, &bless, major)?;
+    let gated_elfs = gated_tooling_elfs(&bless, &generator, host_lib.as_ref());
+    assert_guest_libc_covers(root, arch, &gated_elfs)?;
+    stage_bless_binaries(runner, root, arch, &bless, &generator, &rpath)?;
+    eprintln!(
+        "  ✓ shipped systemd-bless-boot + its generator from the build host's \
+         systemd tooling (major {major}) (#85)"
+    );
+    Ok(())
+}
+
+/// The #85 arch gate: both host binaries must be ELFs for the image's
+/// target arch — cross-arch tooling cannot be staged.
+fn bless_tooling_arch_gate(bless: &Path, generator: &Path, arch: &str) -> miette::Result<()> {
+    let want = machine_for_arch(arch)?;
+    for path in [bless, generator] {
+        let got = elf_machine(path).wrap_err_with(|| {
+            format!("inspecting the host bless-boot tooling {}", path.display())
+        })?;
+        if got != want {
+            return Err(miette::miette!(
+                "the host's bless-boot tooling ({}, {}) is ELF machine {got} \
+                 but the image targets arch '{arch}' (machine {want}) — \
+                 cross-arch tooling cannot be staged (#85). Point \
+                 {BLESS_BOOT_TOOLING_DIR_ENV} at tooling built for '{arch}'.",
+                bless.display(),
+                generator.display(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The #85 version gate: read the host tooling's own version
+/// (`--version`; a host binary may be executed by the host) and require
+/// the #79 floor.
+fn bless_tooling_version(runner: &dyn CommandRunner, bless: &Path) -> miette::Result<u32> {
+    let out = runner
+        .run(&[
+            bless.to_string_lossy().into_owned(),
+            "--version".to_string(),
+        ])
+        .map_err(|e| {
+            miette::miette!(
+                "cannot run the host's systemd-bless-boot ({}) to read its \
+                 version — the tooling must be executable on the build host \
+                 to be gated (#85): {e}",
+                bless.display()
+            )
+        })?;
+    if crate::command::exit_code(&out) != 0 {
+        return Err(miette::miette!(
+            "the host's systemd-bless-boot ({}) exited {} on --version — \
+             refusing to stage tooling whose version cannot be proven (#85, \
+             gate #79)",
+            bless.display(),
+            crate::command::exit_code(&out),
+        ));
+    }
+    let major = systemd_major_from_version_output(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| {
+            miette::miette!(
+                "cannot parse a systemd major from the host's bless-boot \
+                 --version output ({:?}) — refusing to stage ungated tooling \
+                 (#85, gate #79)",
+                String::from_utf8_lossy(&out.stdout).trim()
+            )
+        })?;
+    if major < super::boot::BOOT_ASSESSMENT_MIN_MAJOR {
+        return Err(miette::miette!(
+            "the host's bless-boot tooling is systemd major {major}, below the \
+             boot-assessment floor {} — refusing to stage tooling the #79 gate \
+             cannot vouch for (#85)",
+            super::boot::BOOT_ASSESSMENT_MIN_MAJOR,
+        ));
+    }
+    if let Some(warning) = super::boot::bless_boot_busy_warning(major) {
+        eprintln!("  ⚠ {warning}");
+    }
+    Ok(major)
+}
+
+/// Resolve the libsystemd-shared the staged binaries link, returning the
+/// guest directory their RUNPATH must point at plus the staged host lib
+/// (when one was copied — it joins the glibc coverage gate) (#85).
+///
+/// When the guest's own shared lib carries the SAME major, the tooling is
+/// pointed at it (no duplication). Otherwise the host's copy is staged into
+/// [`BLESS_BOOT_TOOLING_LIB_DIR`] — a self-consistent pair, since
+/// `libsystemd-shared` is not a stable ABI across majors.
+fn resolve_tooling_lib(
+    runner: &dyn CommandRunner,
+    root: &Path,
+    bless: &Path,
+    major: u32,
+) -> miette::Result<(String, Option<PathBuf>)> {
+    if let Some((_, path)) = super::boot::base_systemd_shared_lib(root).filter(|(m, _)| *m == major)
+    {
+        let dir = match path.strip_prefix(root) {
+            Ok(rel) => match rel.parent() {
+                Some(parent_dir) => format!("/{}", parent_dir.to_string_lossy()),
+                None => BLESS_BOOT_TOOLING_LIB_DIR.to_string(),
+            },
+            Err(_) => BLESS_BOOT_TOOLING_LIB_DIR.to_string(),
+        };
+        eprintln!(
+            "  ✓ guest's own libsystemd-shared-{major}.so resolves the staged \
+             tooling (RUNPATH → {dir}) (#85)"
+        );
+        return Ok((dir, None));
+    }
+    let host_lib = find_host_shared_lib(bless, major).ok_or_else(|| {
+        miette::miette!(
+            "no libsystemd-shared-{major}.so found next to the host's bless-boot \
+             tooling ({}) — the staged binaries would be inert on-device (#85)",
+            bless.display()
+        )
+    })?;
+    copy_into_root(root, &host_lib, "usr/lib/systemd", 0o644)?;
+    let lib_name = host_lib.file_name().expect("shared lib has a file name");
+    let staged_lib = root
+        .join(BLESS_BOOT_TOOLING_LIB_DIR.trim_start_matches('/'))
+        .join(lib_name);
+    // Drop the host RUNPATH (nix store paths): the staged lib's own NEEDED
+    // (libc/libm) resolve through the guest's default search path. A shared
+    // library carries no PT_INTERP, so this is a direct RUNPATH rewrite —
+    // not the interpreter anchoring the executables get.
+    let out = runner
+        .run(&[
+            "patchelf".to_string(),
+            "--remove-rpath".to_string(),
+            staged_lib.to_string_lossy().into_owned(),
+        ])
+        .map_err(|e| miette::miette!("patchelf failed: {e}"))?;
+    if crate::command::exit_code(&out) != 0 {
+        return Err(miette::miette!(
+            "patchelf could not strip the host RUNPATH from the staged \
+             libsystemd-shared-{major}.so — refusing to ship host store paths \
+             inside the image (#85)"
+        ));
+    }
+    eprintln!(
+        "  ✓ staged host libsystemd-shared-{major}.so next to the tooling, host \
+         RUNPATH stripped (self-consistent pair, #85)"
+    );
+    Ok((BLESS_BOOT_TOOLING_LIB_DIR.to_string(), Some(staged_lib)))
+}
+
+/// The host-sourced ELFs the glibc coverage gate must vouch for: the two
+/// binaries plus, when staged, the host shared lib (#85).
+fn gated_tooling_elfs(bless: &Path, generator: &Path, host_lib: Option<&PathBuf>) -> Vec<PathBuf> {
+    let mut elfs = vec![bless.to_path_buf(), generator.to_path_buf()];
+    if let Some(lib) = host_lib {
+        elfs.push(lib.clone());
+    }
+    elfs
+}
+
+/// Stage the two binaries at their pinned paths (0755) and anchor them to
+/// the guest loader with the resolved RUNPATH.
+fn stage_bless_binaries(
+    runner: &dyn CommandRunner,
+    root: &Path,
+    arch: &str,
+    bless: &Path,
+    generator: &Path,
+    rpath: &str,
+) -> miette::Result<()> {
+    for (source, rel) in [
+        (bless, BLESS_BOOT_TOOLING_BIN_PATH),
+        (generator, BLESS_BOOT_TOOLING_GENERATOR_PATH),
+    ] {
+        copy_into_root(root, source, rel, 0o755)?;
+        anchor_elf_to_guest(
+            runner,
+            &root.join(rel),
+            arch,
+            &format!("/{rel}"),
+            Some(rpath),
+        )?;
+    }
+    Ok(())
+}
+
+/// Locate the build host's `systemd-bless-boot` and its generator.
+///
+/// Priority: the [`BLESS_BOOT_TOOLING_DIR_ENV`] override, `which` (through
+/// the command seam), then the FHS install paths (`/usr/lib/systemd`,
+/// `/lib/systemd` and their `system-generators/` subdirs). Not finding both
+/// is the #85/#79 fail-closed case — the error names every probed location.
+fn locate_host_bless_tooling(runner: &dyn CommandRunner) -> miette::Result<(PathBuf, PathBuf)> {
+    let env_dir = std::env::var_os(BLESS_BOOT_TOOLING_DIR_ENV).map(PathBuf::from);
+
+    let mut bin_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = &env_dir {
+        bin_dirs.push(dir.clone());
+    }
+    if let Some(hit) = which(runner, "systemd-bless-boot") {
+        bin_dirs.push(
+            hit.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/usr/lib/systemd")),
+        );
+    }
+    bin_dirs.push(PathBuf::from("/usr/lib/systemd"));
+    bin_dirs.push(PathBuf::from("/lib/systemd"));
+
+    let bless = bin_dirs
+        .iter()
+        .map(|dir| dir.join("systemd-bless-boot"))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            miette::miette!(
+                "no systemd-bless-boot on the build host: probed {} (from \
+                 {BLESS_BOOT_TOOLING_DIR_ENV}), `which systemd-bless-boot`, and \
+                 the FHS paths /usr/lib/systemd/ and /lib/systemd/. A base that \
+                 lacks the tooling cannot emit boot assessment without it — \
+                 install the host's systemd tooling or set \
+                 {BLESS_BOOT_TOOLING_DIR_ENV} (#85).",
+                env_dir
+                    .as_ref()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "no override dir".to_string()),
+            )
+        })?;
+    let generator = locate_generator(runner, env_dir.as_ref(), &bless)?;
+    Ok((bless, generator))
+}
+
+/// Locate the generator sibling of a found `systemd-bless-boot` binary:
+/// the env dir, the binary dir (and its `system-generators/` subdir),
+/// `which`, then the FHS generator paths.
+fn locate_generator(
+    runner: &dyn CommandRunner,
+    env_dir: Option<&PathBuf>,
+    bless: &Path,
+) -> miette::Result<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = env_dir {
+        dirs.push(dir.clone());
+        dirs.push(dir.join("system-generators"));
+    }
+    if let Some(bin_dir) = bless.parent() {
+        dirs.push(bin_dir.to_path_buf());
+        dirs.push(bin_dir.join("system-generators"));
+    }
+    dirs.push(PathBuf::from("/usr/lib/systemd/system-generators"));
+    dirs.push(PathBuf::from("/lib/systemd/system-generators"));
+    dirs.iter()
+        .map(|dir| dir.join("systemd-bless-boot-generator"))
+        .find(|candidate| candidate.is_file())
+        .or_else(|| which(runner, "systemd-bless-boot-generator"))
+        .ok_or_else(|| {
+            miette::miette!(
+                "no systemd-bless-boot-generator on the build host: probed the \
+                 tooling dir and its system-generators/, `which`, \
+                 /usr/lib/systemd/system-generators/ and \
+                 /lib/systemd/system-generators/ — a counted boot has nothing \
+                 to pull the bless service into the transaction (#85)."
+            )
+        })
+}
+
+/// `which <name>` through the command seam; `None` when not found (the
+/// resolved path is read from stdout — an empty one is not a hit).
+fn which(runner: &dyn CommandRunner, name: &str) -> Option<PathBuf> {
+    let out = runner.run(&["which".to_string(), name.to_string()]).ok()?;
+    if crate::command::exit_code(&out) != 0 {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// The ELF `e_machine` of a host binary (u16 at offset 0x12, file
+/// endianness), for the #85 arch gate.
+fn elf_machine(path: &Path) -> miette::Result<u16> {
+    let bytes = std::fs::read(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading {}", path.display()))?;
+    if bytes.len() < 0x14 || &bytes[0..4] != b"\x7fELF" {
+        return Err(miette::miette!(
+            "{} is not an ELF binary — it cannot be staged as guest tooling (#85)",
+            path.display()
+        ));
+    }
+    let (lo, hi) = (bytes[0x12], bytes[0x13]);
+    Ok(match bytes[5] {
+        1 => u16::from_le_bytes([lo, hi]),
+        2 => u16::from_be_bytes([lo, hi]),
+        other => {
+            return Err(miette::miette!(
+                "{} carries an unknown ELF data encoding ({other}) (#85)",
+                path.display()
+            ))
+        }
+    })
+}
+
+/// The ELF `e_machine` value an image arch must match (#85 arch gate).
+fn machine_for_arch(arch: &str) -> miette::Result<u16> {
+    match arch {
+        "amd64" | "x86_64" => Ok(62),   // EM_X86_64
+        "arm64" | "aarch64" => Ok(183), // EM_AARCH64
+        other => Err(miette::miette!(
+            "no ELF machine mapping for arch '{other}' — cannot gate the \
+             bless-boot tooling for it (#85)"
+        )),
+    }
+}
+
+/// Parse the systemd major from a `systemd-bless-boot --version` first line
+/// ("systemd 261 (261.2)").
+fn systemd_major_from_version_output(output: &str) -> Option<u32> {
+    let mut tokens = output.lines().next()?.split_whitespace();
+    if tokens.next()? != "systemd" {
+        return None;
+    }
+    tokens.next()?.parse::<u32>().ok()
+}
+
+/// The host `libsystemd-shared-<major>.so` for `major`, searched next to the
+/// bless binary and in the sibling multiarch/systemd dirs a distro layout
+/// may use. `None` fails the build at the caller.
+fn find_host_shared_lib(bless: &Path, major: u32) -> Option<PathBuf> {
+    let name = format!("{}{major}.so", super::boot::SYSTEMD_SHARED_LIB_PREFIX);
+    let bin_dir = bless.parent()?;
+    let mut dirs: Vec<PathBuf> = vec![bin_dir.to_path_buf()];
+    if let Some(parent) = bin_dir.parent() {
+        dirs.push(parent.join("systemd"));
+        if let Ok(read) = std::fs::read_dir(parent) {
+            let mut multiarch: Vec<PathBuf> = read
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains("-linux-"))
+                })
+                .map(|p| p.join("systemd"))
+                .collect();
+            dirs.append(&mut multiarch);
+        }
+    }
+    dirs.iter()
+        .map(|dir| dir.join(&name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Copy `source` into `root/<rel>` (when `rel` is a directory, under its
+/// file name) with an explicit mode — the fixed-permission shape
+/// [`embed_binary_at`] uses, for the #85 tooling staging.
+fn copy_into_root(root: &Path, source: &Path, rel: &str, mode: u32) -> miette::Result<()> {
+    let target = root.join(rel);
+    let dest = if target.is_dir() {
+        target.join(source.file_name().expect("source has a file name"))
+    } else {
+        target
+    };
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::copy(source, &dest)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("staging {} → {}", source.display(), dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode))
+            .into_diagnostic()
+            .wrap_err_with(|| format!("setting mode {mode:o} on {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+/// Every `GLIBC_2.x` / `GLIBC_ABI_*` symbol-version name the ELF requests
+/// (byte scan of `.gnu.version_r` content — static, no foreign exec).
+fn needed_glibc_versions(bytes: &[u8]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"GLIBC_2.") {
+            if bytes.len() > i + 8 && bytes[i + 8].is_ascii_digit() {
+                let start = i;
+                i += 8;
+                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                    i += 1;
+                }
+                found.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+            } else {
+                i += 1;
+            }
+        } else if bytes[i..].starts_with(b"GLIBC_ABI_") {
+            let start = i;
+            i += 10;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_uppercase() || bytes[i].is_ascii_digit() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            found.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+        } else {
+            i += 1;
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// The staged rootfs's own `libc.so.6` for the image's arch (the multiarch
+/// dir spelled by [`multiarch_triplet`] first — a core26 base also ships an
+/// i386 libc, which must NOT answer for an amd64 tooling check — then the
+/// legacy spellings).
+fn guest_libc_path(root: &Path, arch: &str) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(triplet) = multiarch_triplet(arch) {
+        candidates.push(root.join("usr/lib").join(triplet));
+        candidates.push(root.join("lib").join(triplet));
+    }
+    for base in ["usr/lib", "lib"] {
+        let dir = root.join(base);
+        if let Ok(read) = std::fs::read_dir(&dir) {
+            let mut multiarch: Vec<PathBuf> = read
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains("-linux-"))
+                })
+                .collect();
+            candidates.append(&mut multiarch);
+        }
+        candidates.push(dir);
+    }
+    candidates.push(root.join("lib64"));
+    candidates.push(root.join("usr/lib64"));
+    candidates
+        .iter()
+        .map(|dir| dir.join("libc.so.6"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Fail closed when any staged host ELF requests a `GLIBC_*` version the
+/// guest's own libc does not define — the static, build-time form of the
+/// #80 lesson (a tooling binary the guest cannot load must never be
+/// shipped). An undeterminable guest libc fails closed too (#79 posture).
+fn assert_guest_libc_covers(root: &Path, arch: &str, host_elfs: &[PathBuf]) -> miette::Result<()> {
+    let libc = guest_libc_path(root, arch).ok_or_else(|| {
+        miette::miette!(
+            "no libc.so.6 for arch '{arch}' found in the staged rootfs — the \
+             guest's glibc version cannot be proven statically, so the staged \
+             bless-boot tooling cannot be gated (#85). Failing closed."
+        )
+    })?;
+    let libc_bytes = std::fs::read(&libc)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading {}", libc.display()))?;
+    for elf in host_elfs {
+        let bytes = std::fs::read(elf)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("reading {}", elf.display()))?;
+        for version in needed_glibc_versions(&bytes) {
+            if !libc_bytes
+                .windows(version.len())
+                .any(|window| window == version.as_bytes())
+            {
+                return Err(miette::miette!(
+                    "the staged bless-boot tooling ({}) requests GLIBC symbol \
+                     version {version}, which the guest's libc ({}) does not \
+                     define — the tooling would be inert on-device (#85, the \
+                     #80 GLIBC_ABI_GNU2_TLS lesson). Ship tooling built for a \
+                     glibc the guest provides.",
+                    elf.display(),
+                    libc.display(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`embed_shuttle_binary`] with an explicit source file — the seam the
@@ -1258,5 +1923,520 @@ mod tests {
         anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
         let after = std::fs::read(&staged).unwrap();
         assert_eq!(before, after, "second anchor is a byte-identical no-op");
+    }
+
+    // ── #85: the bless-boot tooling the base may lack ──
+
+    /// A 64-byte 64-bit little-endian ELF header fixture with the given
+    /// `e_machine`, plus `extra` appended (GLIBC version markers).
+    fn elf_fixture(machine: u16, extra: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // little-endian
+        bytes[0x12..0x14].copy_from_slice(&machine.to_le_bytes());
+        bytes.extend_from_slice(extra);
+        bytes
+    }
+
+    const EM_X86_64: u16 = 62;
+    const MARKER_GLIBC: &[u8] = b"GLIBC_2.34";
+
+    /// A scripted runner for the staging seams: `which` answers from
+    /// `which_hits`, `patchelf --print-interpreter` reports the fake nix
+    /// loader, everything else succeeds; `<bless> --version` answers
+    /// `version`.
+    struct BlessRunner {
+        which_bless: Option<String>,
+        version: &'static str,
+    }
+
+    const FAKE_HOST_LOADER: &str = "/nix/store/fake/ld-linux-x86-64.so.2\n";
+    const SELF_VERSION_OUTPUT: &str = "systemd 249 (249.11-0ubuntu3.22)\n";
+
+    impl BlessRunner {
+        fn locating(bless: &Path) -> BlessRunner {
+            BlessRunner {
+                which_bless: Some(bless.to_string_lossy().into_owned()),
+                version: SELF_VERSION_OUTPUT,
+            }
+        }
+
+        fn locating_with_version(bless: &Path, version: &'static str) -> BlessRunner {
+            BlessRunner {
+                which_bless: Some(bless.to_string_lossy().into_owned()),
+                version,
+            }
+        }
+    }
+
+    impl crate::command::CommandRunner for BlessRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            let program = argv.first().map(String::as_str).unwrap_or("");
+            let (code, stdout) = match program {
+                "which" => match argv.get(1).map(String::as_str) {
+                    Some("systemd-bless-boot") => match &self.which_bless {
+                        Some(path) => (0, path.clone() + "\n"),
+                        None => (1, String::new()),
+                    },
+                    Some("patchelf") => (0, "/usr/bin/patchelf\n".to_string()),
+                    _ => (1, String::new()),
+                },
+                "patchelf" => match argv.iter().any(|a| a == "--print-interpreter") {
+                    true => (0, FAKE_HOST_LOADER.to_string()),
+                    false => (0, String::new()),
+                },
+                _ if argv.iter().any(|a| a == "--version") => (0, self.version.to_string()),
+                _ => (0, String::new()),
+            };
+            Ok(crate::command::RunnerOutput {
+                code,
+                stdout: stdout.into_bytes(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// A never-answer runner: any call panics, proving a path needs no host
+    /// tooling at all.
+    struct NoRunner;
+
+    impl crate::command::CommandRunner for NoRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            panic!("no host command expected, saw {argv:?}");
+        }
+    }
+
+    /// The tooling fast path: a base that ships both binaries (every
+    /// UC22-era base — measured core22 2437/2955) stages nothing and runs
+    /// no host tooling.
+    #[test]
+    fn bless_tooling_fast_path_when_the_base_ships_both() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("usr/lib/systemd/system-generators")).unwrap();
+        std::fs::write(root.path().join("usr/lib/systemd/systemd-bless-boot"), b"x").unwrap();
+        std::fs::write(
+            root.path()
+                .join("usr/lib/systemd/system-generators/systemd-bless-boot-generator"),
+            b"x",
+        )
+        .unwrap();
+
+        stage_bless_boot_binaries(&NoRunner, root.path(), "amd64")
+            .expect("a tooling-bearing base must pass through untouched");
+    }
+
+    /// The shipped-from-host happy path with the guest's own shared lib
+    /// resolving the tooling: both binaries staged, no lib duplicated, the
+    /// RUNPATH pointed at the guest systemd dir.
+    #[test]
+    fn bless_tooling_stages_from_the_host_and_reuses_the_guest_shared_lib() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(
+            host.path().join("systemd-bless-boot"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+        std::fs::create_dir_all(host.path().join("system-generators")).unwrap();
+        std::fs::write(
+            host.path()
+                .join("system-generators/systemd-bless-boot-generator"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        // Guest: same-major shared lib + a libc that defines the marker.
+        let guest_systemd = root.path().join("usr/lib/x86_64-linux-gnu/systemd");
+        std::fs::create_dir_all(&guest_systemd).unwrap();
+        std::fs::write(
+            guest_systemd.join("libsystemd-shared-249.so"),
+            elf_fixture(EM_X86_64, b""),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6"),
+            b"GLIBC C Library fixture GLIBC_2.34",
+        )
+        .unwrap();
+
+        let runner = BlessRunner::locating(&host.path().join("systemd-bless-boot"));
+        stage_bless_boot_binaries(&runner, root.path(), "amd64")
+            .expect("a well-formed host tooling must stage");
+
+        let bin = root.path().join(BLESS_BOOT_TOOLING_BIN_PATH);
+        let gen = root.path().join(BLESS_BOOT_TOOLING_GENERATOR_PATH);
+        assert!(bin.is_file(), "bless binary staged at /usr/lib/systemd/");
+        assert!(gen.is_file(), "generator staged under system-generators/");
+        assert!(
+            !root
+                .path()
+                .join("usr/lib/systemd/libsystemd-shared-249.so")
+                .exists(),
+            "the guest's own shared lib must not be duplicated"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&bin).unwrap().permissions().mode();
+            assert_eq!(mode & 0o755, 0o755, "bless binary is executable: {mode:o}");
+        }
+    }
+
+    /// When the guest's shared lib carries a different major, the host's
+    /// copy is staged next to the tooling (self-consistent pair) and the
+    /// RUNPATH points at the staging dir.
+    #[test]
+    fn bless_tooling_stages_the_host_shared_lib_when_the_guest_lacks_it() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(
+            host.path().join("systemd-bless-boot"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+        std::fs::create_dir_all(host.path().join("system-generators")).unwrap();
+        std::fs::write(
+            host.path()
+                .join("system-generators/systemd-bless-boot-generator"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+        std::fs::write(
+            host.path().join("libsystemd-shared-249.so"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        // Guest: a DIFFERENT major (269 vs 249) — the reuse path must not
+        // fire — plus a libc that defines the marker.
+        let guest_systemd = root.path().join("usr/lib/systemd");
+        std::fs::create_dir_all(&guest_systemd).unwrap();
+        std::fs::write(
+            guest_systemd.join("libsystemd-shared-269.so"),
+            elf_fixture(EM_X86_64, b""),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("usr/lib/x86_64-linux-gnu")).unwrap();
+        std::fs::write(
+            root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6"),
+            b"fixture GLIBC_2.34",
+        )
+        .unwrap();
+
+        let runner = BlessRunner::locating(&host.path().join("systemd-bless-boot"));
+        stage_bless_boot_binaries(&runner, root.path(), "amd64")
+            .expect("the host shared lib completes the pair");
+
+        let staged_lib = root.path().join("usr/lib/systemd/libsystemd-shared-249.so");
+        assert!(
+            staged_lib.is_file(),
+            "the host shared lib is staged next to the tooling"
+        );
+    }
+
+    /// Cross-arch tooling fails closed: an x86-64 host binary cannot be
+    /// shipped into an arm64 image (#85 arch gate).
+    #[test]
+    fn bless_tooling_fails_closed_on_an_arch_mismatch() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(
+            host.path().join("systemd-bless-boot"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+        std::fs::write(
+            host.path().join("systemd-bless-boot-generator"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let runner = BlessRunner::locating(&host.path().join("systemd-bless-boot"));
+        let err = stage_bless_boot_binaries(&runner, root.path(), "arm64")
+            .expect_err("cross-arch tooling must not stage");
+        let message = err.to_string();
+        assert!(
+            message.contains("arm64") && message.contains("62"),
+            "names both the target arch and the tooling machine: {message}"
+        );
+        assert!(
+            !root.path().join(BLESS_BOOT_TOOLING_BIN_PATH).exists(),
+            "nothing staged on failure"
+        );
+    }
+
+    /// Tooling below the #79 floor fails closed: the gate vouches for the
+    /// same floor the emitted machinery needs.
+    #[test]
+    fn bless_tooling_fails_closed_below_the_boot_assessment_floor() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(
+            host.path().join("systemd-bless-boot"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+        std::fs::write(
+            host.path().join("systemd-bless-boot-generator"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let runner = BlessRunner::locating_with_version(
+            &host.path().join("systemd-bless-boot"),
+            "systemd 239 (239)\n",
+        );
+        let err = stage_bless_boot_binaries(&runner, root.path(), "amd64")
+            .expect_err("tooling below the floor must not stage");
+        assert!(
+            err.to_string().contains("240"),
+            "names the #79 floor: {err}"
+        );
+    }
+
+    /// The missing-tooling case is the #85/#79 fail-closed gate: every probe
+    /// misses ⇒ the build refuses to emit unbacked assessment.
+    #[test]
+    fn bless_tooling_fails_closed_when_the_host_has_none() {
+        if host_ships_fhs_bless_tooling() {
+            eprintln!("skipping: the test host ships FHS bless tooling");
+            return;
+        }
+        struct NothingRunner;
+        impl crate::command::CommandRunner for NothingRunner {
+            fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+                let program = argv.first().map(String::as_str).unwrap_or("");
+                if program == "which" {
+                    return Ok(crate::command::RunnerOutput {
+                        code: 1,
+                        stdout: Vec::new(),
+                        stderr: String::new(),
+                    });
+                }
+                panic!("no further host command expected, saw {argv:?}");
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let err = stage_bless_boot_binaries(&NothingRunner, root.path(), "amd64")
+            .expect_err("missing tooling must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot be provided"),
+            "names the #85/#79 gate: {message}"
+        );
+        assert!(
+            message.contains("SHUTTLE_BLESS_BOOT_DIR"),
+            "names the override: {message}"
+        );
+    }
+
+    /// The #80 lesson, enforced: a staged host ELF whose GLIBC version
+    /// requirements the guest libc does not define fails the BUILD.
+    #[test]
+    fn bless_tooling_fails_closed_when_the_guest_libc_cannot_satisfy_it() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(
+            host.path().join("systemd-bless-boot"),
+            elf_fixture(EM_X86_64, b"GLIBC_2.99"),
+        )
+        .unwrap();
+        std::fs::write(
+            host.path().join("systemd-bless-boot-generator"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+        std::fs::write(
+            host.path().join("libsystemd-shared-249.so"),
+            elf_fixture(EM_X86_64, MARKER_GLIBC),
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("usr/lib/x86_64-linux-gnu")).unwrap();
+        std::fs::write(
+            root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6"),
+            b"fixture GLIBC_2.34 only",
+        )
+        .unwrap();
+
+        let runner = BlessRunner::locating(&host.path().join("systemd-bless-boot"));
+        let err = stage_bless_boot_binaries(&runner, root.path(), "amd64")
+            .expect_err("an unsatisfiable GLIBC requirement must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("GLIBC_2.99"),
+            "names the missing symbol version: {message}"
+        );
+        assert!(
+            message.contains("libc.so.6"),
+            "names the guest libc it was checked against: {message}"
+        );
+    }
+
+    /// The GLIBC gate must check the libc of the IMAGE's arch: a core26
+    /// base also ships an i386 libc, and its directory sort order must not
+    /// answer for an amd64 tooling check (found by the first real build).
+    #[test]
+    fn guest_libc_path_matches_the_image_arch_triplet() {
+        let root = tempfile::tempdir().unwrap();
+        // The i386 libc lacks the marker; the amd64 one carries it.
+        std::fs::create_dir_all(root.path().join("usr/lib/i386-linux-gnu")).unwrap();
+        std::fs::create_dir_all(root.path().join("usr/lib/x86_64-linux-gnu")).unwrap();
+        std::fs::write(
+            root.path().join("usr/lib/i386-linux-gnu/libc.so.6"),
+            b"32-bit fixture, no marker",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6"),
+            b"fixture GLIBC_2.34",
+        )
+        .unwrap();
+
+        let libc = guest_libc_path(root.path(), "amd64").expect("amd64 libc found");
+        assert!(
+            libc.to_string_lossy().contains("x86_64-linux-gnu"),
+            "the image arch's own libc must be checked: {}",
+            libc.display()
+        );
+        // The staged tooling passes against it.
+        let host = tempfile::tempdir().unwrap();
+        let bless = host.path().join("systemd-bless-boot");
+        std::fs::write(&bless, elf_fixture(EM_X86_64, MARKER_GLIBC)).unwrap();
+        assert_guest_libc_covers(root.path(), "amd64", &[bless])
+            .expect("the arch-matched libc defines the requested version");
+    }
+
+    fn host_ships_fhs_bless_tooling() -> bool {
+        Path::new("/usr/lib/systemd/systemd-bless-boot").is_file()
+            || Path::new("/lib/systemd/systemd-bless-boot").is_file()
+    }
+
+    /// The version parser: the standardized `--version` first line, and the
+    /// junk shapes it must reject.
+    #[test]
+    fn systemd_major_parses_from_the_version_output() {
+        assert_eq!(
+            systemd_major_from_version_output("systemd 261 (261.2)\n"),
+            Some(261)
+        );
+        assert_eq!(
+            systemd_major_from_version_output("systemd 249\n"),
+            Some(249)
+        );
+        assert_eq!(
+            systemd_major_from_version_output("v249 junk"),
+            None,
+            "not the systemd spelling"
+        );
+        assert_eq!(systemd_major_from_version_output(""), None);
+        assert_eq!(
+            systemd_major_from_version_output("systemd nan"),
+            None,
+            "a non-numeric major is undeterminable"
+        );
+    }
+
+    /// Drift pin (#85): the shipped tooling path and the unit's ExecStart
+    /// must spell the same location, or the shipped helper is inert.
+    #[test]
+    fn bless_exec_targets_the_staged_tooling_path() {
+        assert_eq!(
+            super::boot::BLESS_BOOT_EXEC,
+            format!("/{} good", BLESS_BOOT_TOOLING_BIN_PATH)
+        );
+    }
+
+    /// The GLIBC scanner sees version markers the way the runtime's
+    /// `.gnu.version_r` spells them.
+    #[test]
+    fn needed_glibc_versions_scans_both_spellings() {
+        let bytes = b"\0GLIBC_2.34\0xGLIBC_ABI_GNU2_TLS\0GLIBC_2.2.5\0GLIBC_2.";
+        assert_eq!(
+            needed_glibc_versions(bytes),
+            vec!["GLIBC_2.2.5", "GLIBC_2.34", "GLIBC_ABI_GNU2_TLS"]
+        );
+        assert!(needed_glibc_versions(b"nothing here").is_empty());
+    }
+
+    /// Real patchelf against the real host tooling (when present): the
+    /// interpreter lands on the guest loader and the RUNPATH on the staging
+    /// dir — the exact anchoring the shipped binaries need on-device.
+    #[test]
+    fn anchor_repoints_real_bless_tooling_with_an_rpath() {
+        if !crate::command::RealRunner
+            .run(&["which".to_string(), "patchelf".to_string()])
+            .ok()
+            .is_some_and(|o| o.code == 0)
+        {
+            eprintln!("skipping: patchelf not on PATH");
+            return;
+        }
+        let real = find_host_shared_lib_probe();
+        let Some(source) = real else {
+            eprintln!("skipping: no host systemd-bless-boot to probe");
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("systemd-bless-boot");
+        std::fs::copy(&source, &staged).unwrap();
+
+        anchor_elf_to_guest(
+            &crate::command::RealRunner,
+            &staged,
+            "amd64",
+            "/usr/lib/systemd/systemd-bless-boot",
+            Some("/usr/lib/systemd"),
+        )
+        .unwrap();
+
+        let print = |flag: &str| {
+            let out = crate::command::RealRunner
+                .run(&[
+                    "patchelf".to_string(),
+                    flag.to_string(),
+                    staged.to_string_lossy().into_owned(),
+                ])
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            print("--print-interpreter"),
+            "/lib64/ld-linux-x86-64.so.2",
+            "interpreter re-anchored to the guest loader"
+        );
+        assert_eq!(
+            print("--print-rpath"),
+            "/usr/lib/systemd",
+            "RUNPATH set to the tooling lib dir"
+        );
+    }
+
+    /// Best-effort probe of a real host `systemd-bless-boot` for the
+    /// anchoring test: FHS paths, then a nix-store glob.
+    fn find_host_shared_lib_probe() -> Option<PathBuf> {
+        for candidate in [
+            PathBuf::from("/usr/lib/systemd/systemd-bless-boot"),
+            PathBuf::from("/lib/systemd/systemd-bless-boot"),
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let mut hits = std::fs::read_dir("/nix/store")
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("systemd-") && !n.contains("minimal"))
+            })
+            .map(|p| p.join("lib/systemd/systemd-bless-boot"))
+            .filter(|p| p.is_file())
+            .collect::<Vec<_>>();
+        hits.sort();
+        hits.into_iter().next()
     }
 }

@@ -137,6 +137,14 @@ pub const BOOT_HANDOFF_MARKER: &str = "SHUTTLE-INIT: switch-root";
 /// unit so the two cannot drift.
 pub const BOOT_COMPLETE_MARKER: &str = "Reached target Boot Completion Check";
 
+/// The systemd ≥ v250 console rendering of `boot-complete.target` — the
+/// unit-prefixed shape (unit name, then `Description=` after `" - "`), which
+/// is what the core26 chain's systemd 259 actually prints
+/// (`Reached target boot-complete.target - Boot Completion Check.`). Kept
+/// alongside [`BOOT_COMPLETE_MARKER`] so the strongest assertion holds on
+/// both chains (the UC22-era 249 prints the description-only form).
+pub const BOOT_COMPLETE_MARKER_UNIT: &str = "Reached target boot-complete.target";
+
 /// The systemd line for `multi-user.target` — the rendered `Description=` of
 /// the classic `default.target`. systemd prints it only when the boot
 /// transaction reached the default target, which is what "completed" means
@@ -167,6 +175,7 @@ pub const GRAPHICAL_MARKER_UNIT: &str = "Reached target graphical.target";
 /// line — so the gate is chain-independent (core22 and core26 alike).
 pub const COMPLETION_MARKERS: &[&str] = &[
     BOOT_COMPLETE_MARKER,
+    BOOT_COMPLETE_MARKER_UNIT,
     MULTI_USER_MARKER,
     MULTI_USER_MARKER_UNIT,
     GRAPHICAL_MARKER,

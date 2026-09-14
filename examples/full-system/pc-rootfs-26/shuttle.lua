@@ -21,9 +21,9 @@
 --   shuttle test ~/.cache/shuttle-core26/ubuntu-core-pc-26_26.04_amd64.img \
 --       --runs 1 --require "Reached target multi-user.target"
 --
--- (The factory UKI is installed counterless, so boot-complete.target is not
--- pulled into the first transaction — the factory boot completes through
--- default.target; see the #84 completion-gate notes in src/boot_test.rs.)
+-- (Since #85 the emitted basic.target.wants/ link pulls boot-complete.target
+-- into EVERY boot transaction — factory boots included — so the factory boot
+-- is assessed too: the health unit runs and the completion target is reached.)
 --
 -- Requires:
 --   package-index.json with resolved pins (shuttle index resolve \
