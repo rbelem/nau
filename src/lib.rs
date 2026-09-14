@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod assert;
+pub mod audit;
 pub mod boot_test;
 pub mod build_prefix;
 pub mod build_sched;

@@ -156,6 +156,13 @@ fn main() -> miette::Result<()> {
             json,
         } => cmd_lint(file, pod, channel, json),
 
+        Command::Audit {
+            file,
+            lockfile,
+            update,
+            json,
+        } => cmd_audit(file, lockfile, update, json),
+
         Command::Lock {
             file,
             lockfile,
@@ -2206,6 +2213,119 @@ fn cmd_lint(file: String, pod: Option<String>, channel: String, json: bool) -> m
     }
 
     if shuttle::checks::has_errors(&findings) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+// ── Audit command (issue #52) ──
+
+/// Human report: every finding on its channel, then summary lines
+/// carrying the audit counters and the database state.
+fn report_audit_human(report: &shuttle::audit::AuditReport, label: &str, cache_dir: &Path) {
+    for f in &report.findings {
+        let lines = lint_finding_lines(f, label);
+        match f.severity {
+            shuttle::checks::Severity::Error => shuttle::output::err(lines),
+            shuttle::checks::Severity::Warn => shuttle::output::warn(lines),
+        }
+    }
+    if report.findings.is_empty() {
+        shuttle::output::ok("audit clean: 0 findings");
+    } else {
+        let errors = report
+            .findings
+            .iter()
+            .filter(|f| f.severity == shuttle::checks::Severity::Error)
+            .count();
+        shuttle::output::status(format!(
+            "audit: {} lockfile pin(s), {errors} error(s), {} warning(s)",
+            report.targets,
+            report.findings.len() - errors
+        ));
+    }
+    if report.degraded {
+        shuttle::output::warn(format!(
+            "OSV database unreachable (offline?) — {} pin(s) left unaudited; run \
+             `shuttle audit --update` when online (cache: {})",
+            report.unaudited,
+            cache_dir.display()
+        ));
+    }
+}
+
+/// JSON report: the `shuttle lint --json` shape (file/ok/errors/warnings/
+/// findings) plus an additive `database` object for the audit counters.
+fn report_audit_json(report: &shuttle::audit::AuditReport, label: &str) {
+    let findings_json: Vec<serde_json::Value> = report
+        .findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "check": f.check,
+                "package": f.package,
+                "severity": f.severity.as_str(),
+                "message": f.message,
+                "hint": f.hint,
+            })
+        })
+        .collect();
+    let errors = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == shuttle::checks::Severity::Error)
+        .count();
+    let out = serde_json::json!({
+        "file": label,
+        "ok": errors == 0,
+        "errors": errors,
+        "warnings": report.findings.len() - errors,
+        "findings": findings_json,
+        "database": {
+            "degraded": report.degraded,
+            "unaudited": report.unaudited,
+        },
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+/// `shuttle audit`: check lockfile pins against the OSV vulnerability
+/// database (issue #52). Exit code 1 only on confirmed (version-matched)
+/// findings; offline/stale databases warn, never fail.
+fn cmd_audit(
+    file: Option<String>,
+    lockfile: String,
+    update: bool,
+    json: bool,
+) -> miette::Result<()> {
+    shuttle::output::set_mode(json);
+    let lock_path = Path::new(&lockfile);
+    let Some(lock) = LockFile::load(lock_path)? else {
+        miette::bail!(
+            "no lockfile at '{lockfile}' — nothing to audit (build once to create it, \
+             or pass --lockfile)"
+        );
+    };
+    // An explicitly-given definition enriches the audit (declared
+    // versions, output-key labels); a failing eval is a hard error.
+    let raw = match &file {
+        Some(f) => Some(shuttle::lua::lint_eval_file(f)?.raw),
+        None => None,
+    };
+
+    let cfg = shuttle::audit::AuditConfig::from_env(update);
+    let report = shuttle::audit::run_audit(&lock, raw.as_ref(), &cfg)?;
+
+    if json {
+        report_audit_json(&report, &lockfile);
+    } else {
+        report_audit_human(&report, &lockfile, &cfg.cache_dir);
+    }
+
+    if shuttle::checks::has_errors(&report.findings) {
         std::process::exit(1);
     }
     Ok(())

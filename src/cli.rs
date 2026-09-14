@@ -200,6 +200,34 @@ pub enum Command {
         json: bool,
     },
 
+    /// Audit lockfile pins against the OSV vulnerability database (issue
+    /// #52). Source and dependency pins are version-matched (confirmed
+    /// hits are errors); store snaps are name-only (hits are warnings —
+    /// the lockfile pins store revisions, not upstream versions).
+    /// Online-first with a local response cache; offline it degrades to a
+    /// named stale-database warning, never a hard failure. Exits nonzero
+    /// only on confirmed findings.
+    Audit {
+        /// Path to the Lua definition file. Optional: when given, its
+        /// evaluated outputs enrich the audit with declared versions and
+        /// declaration labels for source pins.
+        #[arg(short, long)]
+        file: Option<String>,
+
+        /// Path to lockfile (project shuttle.lock or a pod's lockfile).
+        #[arg(short, long, default_value = "shuttle.lock")]
+        lockfile: String,
+
+        /// Force a refresh: bypass the local OSV response cache and
+        /// rewrite it from the live database.
+        #[arg(long)]
+        update: bool,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Resolve and refresh all input pins in the lockfile (no build).
     /// Pins each github input to its current branch head and records a
     /// content hash; `path:` inputs are marked local (unlocked).
