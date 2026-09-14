@@ -800,10 +800,18 @@ pub enum RuntimeCommand {
 /// key-ceremony operator surface. `--home` redirects the whole ceremony
 /// away from `$HOME` (tests, alternate operators); it defaults to `HOME`.
 ///
-/// - `keygen`  — mint `secret-key` and trust it (install `keys/<id>.pub`).
-/// - `rotate`  — mint the successor `secret-key.new` (NOT trusted yet).
+/// - `keygen`  — mint `secret-key` and trust it (install `keys/<id>.pub`),
+///   recording the creation in the ceremony ledger.
+/// - `rotate`  — mint the successor `secret-key.new` (NOT trusted yet),
+///   record the generation chain (id → replaced-by → date → window), and
+///   dual-sign `--manifest` under the successor when given (re-attaching
+///   provenance; issue #51).
 /// - `promote` — move `secret-key.new` → `secret-key`, install its anchor.
-/// - `revoke`  — drop a trust anchor and list it in `keys/revoked-keys`.
+/// - `revoke`  — drop a trust anchor, list it in `keys/revoked-keys`, and
+///   date the revocation in the ledger.
+/// - `list`    — print the ledger: the auditable ceremony trail.
+/// - `verify`  — verify a manifest under the ceremony policy (either key
+///   during a rotation window; revoked-only is a named error).
 #[derive(clap::Subcommand)]
 pub enum KeyCommand {
     /// Generate the update signing key under `--home`. Refuses to
@@ -824,10 +832,29 @@ pub enum KeyCommand {
     /// The successor is NOT trusted until `key promote`: it has no anchor,
     /// so the keychain cannot accept its signature. Requires an existing
     /// `secret-key`; refuses to overwrite a pending `secret-key.new`.
+    ///
+    /// The generation chain (this key → successor → date → overlap
+    /// window) is recorded in `keys/ceremony.json` (issue #51). With
+    /// `--manifest`, that manifest is additionally dual-signed under the
+    /// successor — the old signature entry is kept, and an attested
+    /// entry's provenance is re-attached under the new signature (same
+    /// claims, new key).
     Rotate {
         /// Key-ceremony home (default: $HOME).
         #[arg(long)]
         home: Option<String>,
+
+        /// Manifest JSON to dual-sign under the successor (old signature
+        /// kept; provenance re-attached when present).
+        #[arg(long)]
+        manifest: Option<String>,
+
+        /// Overlap window, in days, recorded with the rotation: how long
+        /// the rotated-out key's signatures stay first-class while the
+        /// successor rolls out. Expired windows downgrade to a verify
+        /// warning.
+        #[arg(long, default_value_t = crate::sign::DEFAULT_WINDOW_DAYS)]
+        window_days: u32,
 
         /// Output structured JSON instead of human-friendly output.
         #[arg(long)]
@@ -855,6 +882,36 @@ pub enum KeyCommand {
     Revoke {
         /// Key id (first 16 hex chars of the public key).
         key_id: String,
+
+        /// Key-ceremony home (default: $HOME).
+        #[arg(long)]
+        home: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print the ceremony ledger (`keys/ceremony.json`): every key the
+    /// ceremony touched with its created/rotated/revoked dates and the
+    /// generation chain — the auditable trail (issue #51).
+    List {
+        /// Key-ceremony home (default: $HOME).
+        #[arg(long)]
+        home: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify a manifest JSON under the ceremony policy: any signature
+    /// from a live trusted key verifies; a rotated-out key past its
+    /// overlap window verifies with a warning; a manifest signed only by
+    /// revoked keys fails with a named error.
+    Verify {
+        /// Path to the manifest JSON to verify.
+        manifest: String,
 
         /// Key-ceremony home (default: $HOME).
         #[arg(long)]
@@ -1704,11 +1761,50 @@ mod tests {
             .unwrap()
             .command
         {
-            Command::Key(KeyCommand::Rotate { home, json }) => {
+            Command::Key(KeyCommand::Rotate {
+                home,
+                json,
+                manifest,
+                window_days,
+            }) => {
                 assert!(home.is_none());
                 assert!(!json);
+                assert!(manifest.is_none(), "no manifest to dual-sign by default");
+                assert_eq!(
+                    window_days,
+                    crate::sign::DEFAULT_WINDOW_DAYS,
+                    "default overlap window"
+                );
             }
             _ => panic!("expected Key Rotate"),
+        }
+        match Cli::try_parse_from([
+            "shuttle",
+            "key",
+            "rotate",
+            "--manifest",
+            "m.json",
+            "--window-days",
+            "7",
+            "--home",
+            "/tmp/k",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Key(KeyCommand::Rotate {
+                home,
+                json,
+                manifest,
+                window_days,
+            }) => {
+                assert_eq!(home.as_deref(), Some("/tmp/k"));
+                assert!(json);
+                assert_eq!(manifest.as_deref(), Some("m.json"));
+                assert_eq!(window_days, 7);
+            }
+            _ => panic!("expected Key Rotate with manifest and window"),
         }
         match Cli::try_parse_from(["shuttle", "key", "promote", "--json"])
             .unwrap()
@@ -1737,6 +1833,37 @@ mod tests {
         }
         // `revoke` requires its key-id positional.
         assert!(Cli::try_parse_from(["shuttle", "key", "revoke"]).is_err());
+    }
+
+    #[test]
+    fn test_key_list_and_verify_parse() {
+        match Cli::try_parse_from(["shuttle", "key", "list", "--json"])
+            .unwrap()
+            .command
+        {
+            Command::Key(KeyCommand::List { home, json }) => {
+                assert!(home.is_none());
+                assert!(json);
+            }
+            _ => panic!("expected Key List"),
+        }
+        match Cli::try_parse_from(["shuttle", "key", "verify", "m.json"])
+            .unwrap()
+            .command
+        {
+            Command::Key(KeyCommand::Verify {
+                manifest,
+                home,
+                json,
+            }) => {
+                assert_eq!(manifest, "m.json");
+                assert!(home.is_none());
+                assert!(!json);
+            }
+            _ => panic!("expected Key Verify"),
+        }
+        // `verify` requires its manifest positional.
+        assert!(Cli::try_parse_from(["shuttle", "key", "verify"]).is_err());
     }
 
     // ── OCI push/pull (Phase 25) ──

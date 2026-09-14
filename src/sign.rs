@@ -60,6 +60,21 @@
 //! under the operator's key. The claim is only as strong as the signing
 //! key; that is the issue's stated bar.
 //!
+//! # The ceremony ledger (issue #51, ADR-0011 §4e)
+//!
+//! `keys/ceremony.json` records the ceremony as a first-class thing: one
+//! entry per key with its created/rotated/revoked dates and the
+//! generation chain (key id → `replaced_by` → date → overlap window).
+//! [`verify_with_ledger`] layers transition-window policy on top of the
+//! keychain's ANY-signature rule: either key verifies during the window;
+//! after it expires a manifest signed only by the rotated-out key still
+//! verifies but carries a warning; a manifest signed only by revoked
+//! keys is a named error, while one re-signed under a live key keeps
+//! verifying (no retroactive breakage). The device-side trust set
+//! ([`verify_trust_set`]) keeps ADR-0024's stricter rule — any revoked
+//! signature is refused — because a device's job is enforcement, not
+//! rollout.
+//!
 //! # Distinction from sysupdate's own verification
 //!
 //! systemd-sysupdate verifies the update payload's SHA256SUMS with its GPG
@@ -455,14 +470,19 @@ pub fn public_key_file(kp: &KeyPair) -> String {
 
 // ── Key ceremony (ADR-0011 step (e)): keychain, rotation, revocation ──
 //
-// Paths (documented contract, no CLI surface yet — the updater of
-// Phase 24b consumes these):
+// Paths (documented contract — `shuttle key keygen|rotate|promote|revoke|
+// list|verify` is the operator surface, the device half consumes the
+// embedded copies from the image build):
 //
 // - Secret key:            `~/.config/shuttle/secret-key`   (0600)
 // - Rotation secret:       `~/.config/shuttle/secret-key.new` (0600)
 // - Trusted public keys:   `~/.config/shuttle/keys/<key-id>.pub`
 //   (every `*.pub` file is a trust anchor; same two-line format as the
 //   embedded `/etc/shuttle/update-key.pub`).
+// - Ceremony ledger:       `~/.config/shuttle/keys/ceremony.json` — the
+//   audit trail (issue #51): created/rotated/revoked dates and the
+//   generation chain (key id → replaced-by → date → window). The
+//   ceremony as a first-class thing, not just the crypto.
 
 /// Trusted public-key directory under the user's home:
 /// `~/.config/shuttle/keys/`.
@@ -843,6 +863,588 @@ pub fn verify_trust_set(
 ) -> miette::Result<String> {
     reject_revoked(signatures, revoked)?;
     verify_keychain(manifest_bytes, signatures, chain)
+}
+
+// ── Ceremony ledger (issue #51, ADR-0011 §4e): the auditable key chain ──
+
+/// Ceremony ledger schema version.
+pub const CEREMONY_LEDGER_VERSION: u32 = 1;
+
+/// Default overlap window, in days, recorded at rotation: how long a
+/// rotated-out key's signatures stay first-class during the rollout of
+/// its successor. Expired windows downgrade to a verify warning — the
+/// artifact still verifies, the operator is told to re-sign.
+pub const DEFAULT_WINDOW_DAYS: u32 = 30;
+
+/// The ceremony ledger: `keys/ceremony.json` beside the trust anchors.
+/// One entry per key the ceremony ever touched, carrying its dates and
+/// its chain link (`replaced_by`), so a rotation/revocation is auditable
+/// after the fact and [`verify_with_ledger`] can apply transition-window
+/// policy. Every field is `#[serde(default)]`: ledgers written before a
+/// field existed (and hand-minimal ones) keep parsing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CeremonyLedger {
+    #[serde(default)]
+    pub version: u32,
+    /// Key id → ceremony record, sorted for byte-stable rewrites.
+    #[serde(default)]
+    pub keys: std::collections::BTreeMap<String, LedgerEntry>,
+}
+
+/// One key's ceremony record (issue #51): when it was created, which key
+/// replaced it and when (the generation chain), the overlap window that
+/// rotation granted it, and when it was revoked. Absent fields are
+/// genuinely unknown (e.g. revoking a key minted on another machine).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LedgerEntry {
+    /// Lowercase hex of the public key (64 chars), when known. Load-time
+    /// validation pins its 16-char prefix to the map key — a tampered
+    /// entry whose material disagrees with its id is a named error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+
+    /// RFC3339 UTC creation date (keygen).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+
+    /// The successor key id this key was rotated out for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
+
+    /// RFC3339 UTC date the rotation was minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_at: Option<String>,
+
+    /// Overlap window in days from `rotated_at`
+    /// (default [`DEFAULT_WINDOW_DAYS`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_days: Option<u32>,
+
+    /// RFC3339 UTC date the key was revoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+}
+
+/// The ledger file beside the trust anchors: `<keys-dir>/ceremony.json`.
+pub fn ceremony_ledger_path(keys_dir: &Path) -> PathBuf {
+    keys_dir.join("ceremony.json")
+}
+
+impl CeremonyLedger {
+    /// Load `<keys-dir>/ceremony.json`. A missing file is an empty ledger
+    /// (keychains predating the ceremony are valid state); anything
+    /// present is validated — corrupt JSON, a bad date, a key-id
+    /// prefix/material mismatch, a dangling chain link, or an unknown
+    /// future version is a named error. Trust-adjacent bookkeeping fails
+    /// closed, never silently skips.
+    pub fn load(keys_dir: &Path) -> miette::Result<CeremonyLedger> {
+        let path = ceremony_ledger_path(keys_dir);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(CeremonyLedger::default());
+        };
+        let ledger: CeremonyLedger = serde_json::from_str(&text).map_err(|e| {
+            miette::miette!(
+                "key ceremony ledger {} is corrupt: {e} — refusing to interpret it",
+                path.display()
+            )
+        })?;
+        ledger
+            .validate()
+            .wrap_err_with(|| format!("key ceremony ledger {}", path.display()))?;
+        Ok(ledger)
+    }
+
+    /// Write the ledger back (sorted ids, deterministic bytes).
+    pub fn save(&self, keys_dir: &Path) -> miette::Result<()> {
+        std::fs::create_dir_all(keys_dir)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("creating {}", keys_dir.display()))?;
+        let path = ceremony_ledger_path(keys_dir);
+        let body = serde_json::to_string_pretty(self)
+            .map_err(|e| miette::miette!("ledger serialization: {e}"))?;
+        std::fs::write(&path, body + "\n")
+            .into_diagnostic()
+            .wrap_err_with(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Record a freshly created key (keygen). An existing entry for the
+    /// id is never overwritten — the first record of a key wins.
+    pub fn record_created(&mut self, kp: &KeyPair, created: &str) {
+        self.keys.entry(kp.key_id()).or_insert_with(|| LedgerEntry {
+            public_key: Some(kp.public_hex()),
+            created: Some(created.to_string()),
+            ..LedgerEntry::default()
+        });
+        self.version = CEREMONY_LEDGER_VERSION;
+    }
+
+    /// Record the generation chain of a rotation: `old` was replaced by
+    /// `successor` at `rotated_at`, with an overlap window of
+    /// `window_days` days. `old`'s entry is created on the spot when the
+    /// ledger never saw its keygen (pre-ceremony keychain).
+    pub fn record_rotation(
+        &mut self,
+        old: &KeyPair,
+        successor: &KeyPair,
+        rotated_at: &str,
+        window_days: u32,
+    ) {
+        let old_entry = self.keys.entry(old.key_id()).or_default();
+        if old_entry.public_key.is_none() {
+            old_entry.public_key = Some(old.public_hex());
+        }
+        if old_entry.created.is_none() {
+            old_entry.created = Some(rotated_at.to_string());
+        }
+        old_entry.replaced_by = Some(successor.key_id());
+        old_entry.rotated_at = Some(rotated_at.to_string());
+        old_entry.window_days = Some(window_days);
+        self.keys
+            .entry(successor.key_id())
+            .or_insert_with(|| LedgerEntry {
+                public_key: Some(successor.public_hex()),
+                created: Some(rotated_at.to_string()),
+                ..LedgerEntry::default()
+            });
+        self.version = CEREMONY_LEDGER_VERSION;
+    }
+
+    /// Record a revocation (the date is the audit trail; the enforcement
+    /// half — anchor removal + `revoked-keys` — is [`revoke_local`]'s).
+    pub fn record_revocation(&mut self, key_id: &str, revoked_at: &str) {
+        let entry = self.keys.entry(key_id.to_string()).or_default();
+        entry.revoked_at = Some(revoked_at.to_string());
+        self.version = CEREMONY_LEDGER_VERSION;
+    }
+
+    /// Key ids carrying a revocation date.
+    pub fn revoked_ids(&self) -> Vec<String> {
+        self.keys
+            .iter()
+            .filter(|(_, e)| e.revoked_at.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// True when `key_id` was rotated out and its overlap window has
+    /// passed by `now` (unix seconds). Keys without a recorded rotation
+    /// are never stale; a recorded date that cannot parse is a named
+    /// error — but [`CeremonyLedger::load`] validates dates up front, so
+    /// this only fires for in-memory tampering.
+    pub fn rotation_window_expired(&self, key_id: &str, now: i64) -> miette::Result<bool> {
+        let Some(entry) = self.keys.get(key_id) else {
+            return Ok(false);
+        };
+        let Some(rotated_at) = entry.rotated_at.as_deref() else {
+            return Ok(false);
+        };
+        if entry.replaced_by.is_none() {
+            return Ok(false);
+        }
+        let days = i64::from(entry.window_days.unwrap_or(DEFAULT_WINDOW_DAYS));
+        let end = rfc3339_to_unix(rotated_at)? + days * 86_400;
+        Ok(now > end)
+    }
+
+    /// Structural validation (see [`CeremonyLedger::load`]).
+    fn validate(&self) -> miette::Result<()> {
+        if self.version > CEREMONY_LEDGER_VERSION {
+            return Err(miette::miette!(
+                "ledger version {} is newer than this shuttle understands ({})",
+                self.version,
+                CEREMONY_LEDGER_VERSION
+            ));
+        }
+        for (id, entry) in &self.keys {
+            validate_entry(self, id, entry)?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate one ledger entry: key-id shape, material↔id agreement, date
+/// parseability, and a chain link that resolves inside the ledger.
+fn validate_entry(ledger: &CeremonyLedger, id: &str, entry: &LedgerEntry) -> miette::Result<()> {
+    if !is_key_id(id) {
+        return Err(miette::miette!(
+            "entry key id {id:?} is not a 16-hex key id"
+        ));
+    }
+    validate_entry_material(id, entry)?;
+    validate_entry_dates(id, entry)?;
+    validate_entry_chain(ledger, id, entry)
+}
+
+/// The recorded public key material must be 64-hex whose own id prefix is
+/// the entry's map key — a tampered entry cannot move the material
+/// without tripping this.
+fn validate_entry_material(id: &str, entry: &LedgerEntry) -> miette::Result<()> {
+    let Some(pk) = &entry.public_key else {
+        return Ok(());
+    };
+    let agrees = match from_hex32(pk) {
+        Ok(bytes) => to_hex(&bytes)[..16] == *id,
+        Err(_) => false,
+    };
+    if agrees {
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "entry {id} carries public key material that does not hash to its own id"
+    ))
+}
+
+/// Every recorded date must parse as RFC3339 UTC.
+fn validate_entry_dates(id: &str, entry: &LedgerEntry) -> miette::Result<()> {
+    for (label, date) in [
+        ("created", &entry.created),
+        ("rotated_at", &entry.rotated_at),
+        ("revoked_at", &entry.revoked_at),
+    ] {
+        if let Some(date) = date {
+            rfc3339_to_unix(date)
+                .map_err(|e| miette::miette!("entry {id} has a malformed {label} date: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// A chain link must be a real key id with its own entry.
+fn validate_entry_chain(
+    ledger: &CeremonyLedger,
+    id: &str,
+    entry: &LedgerEntry,
+) -> miette::Result<()> {
+    let Some(succ) = &entry.replaced_by else {
+        return Ok(());
+    };
+    if !is_key_id(succ) {
+        return Err(miette::miette!(
+            "entry {id} chains to {succ:?}, which is not a 16-hex key id"
+        ));
+    }
+    if !ledger.keys.contains_key(succ) {
+        return Err(miette::miette!(
+            "entry {id} chains to successor {succ}, which has no ledger entry"
+        ));
+    }
+    Ok(())
+}
+
+/// True when `s` is a well-formed 16-hex key id.
+fn is_key_id(s: &str) -> bool {
+    s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The current time as unix seconds.
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The current time, RFC3339 UTC.
+pub fn now_rfc3339() -> String {
+    unix_to_rfc3339(now_unix())
+}
+
+/// Render unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (RFC3339 UTC). Civil
+/// date from days via the standard era algorithm — no timestamp
+/// dependency; the format is exactly what [`rfc3339_to_unix`] parses.
+pub fn unix_to_rfc3339(t: i64) -> String {
+    let days = t.div_euclid(86_400);
+    let secs = t.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// Parse our own `YYYY-MM-DDTHH:MM:SSZ` rendering back to unix seconds.
+/// Strict shape first, then a round-trip re-render must reproduce the
+/// input — which rejects impossible dates (Feb 30, month 13, hour 27)
+/// without a calendar table.
+pub fn rfc3339_to_unix(s: &str) -> miette::Result<i64> {
+    let b = s.as_bytes();
+    let shape_ok = b.len() == 20
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'Z'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| (0x30..=0x39).contains(c) || [4usize, 7, 10, 13, 16, 19].contains(&i));
+    if !shape_ok {
+        return Err(miette::miette!("expected YYYY-MM-DDTHH:MM:SSZ, got {s:?}"));
+    }
+    let num = |a: usize, z: usize| -> i64 {
+        s[a..z].parse().expect("shape check made this ascii digits")
+    };
+    let (y, mo, d) = (num(0, 4), num(5, 7), num(8, 10));
+    let (h, mi, sec) = (num(11, 13), num(14, 16), num(17, 19));
+    let t = days_from_civil(y, mo as u32, d as u32) * 86_400 + h * 3600 + mi * 60 + sec;
+    if unix_to_rfc3339(t) != s {
+        return Err(miette::miette!("not a real UTC datetime: {s:?}"));
+    }
+    Ok(t)
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + u64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// Inverse of [`days_from_civil`].
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Rotation re-sign (issue #51): add `kp`'s signature to the manifest
+/// BESIDE the existing ones, re-attaching provenance when the manifest
+/// already carries an attested entry — the claims (builder, invocation,
+/// materials, subject digest over the unchanged canonical body) are
+/// reused verbatim, so the successor's envelope attests exactly what the
+/// old one did, under the new key. A manifest with no attestation gets a
+/// bare cosign. An existing attestation that does not bind the current
+/// body is a named error: re-attaching stale claims would lie.
+pub fn cosign_reattaching_provenance(
+    manifest: &mut ImageManifest,
+    kp: &KeyPair,
+) -> miette::Result<()> {
+    let body = canonical_bytes(manifest)?;
+    let existing = manifest.signatures.values().find_map(|v| {
+        serde_json::from_value::<SignatureEntry>(v.clone())
+            .ok()
+            .and_then(|e| e.provenance().cloned())
+    });
+    match existing {
+        Some(prov) => {
+            if prov.subject.manifest_sha3_384 != subject_digest(&body) {
+                return Err(miette::miette!(
+                    "the existing provenance does not bind the current manifest bytes — \
+                     refusing to re-attach stale claims under key {} (re-run `shuttle eval` \
+                     to re-attest, then rotate)",
+                    kp.key_id()
+                ));
+            }
+            sign_attested(manifest, kp, &prov)
+        }
+        None => cosign(manifest, kp),
+    }
+}
+
+/// The outcome of [`verify_with_ledger`]: the key id that verified plus
+/// any transition-window warnings the operator should see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerVerification {
+    pub key_id: String,
+    pub warnings: Vec<String>,
+}
+
+/// Ceremony-policy verify (issue #51): the keychain's ANY-signature rule
+/// with the ledger's lifecycle layered on top.
+///
+/// - A revoked key is never a candidate. Dual-signed artifacts keep
+///   verifying through their live key — revocation must not retroactively
+///   break manifests that were re-signed during the window (unlike the
+///   device-side [`verify_trust_set`], which refuses any revoked-signed
+///   artifact outright).
+/// - A rotated-out key whose overlap window has expired still verifies,
+///   but the outcome carries a warning: the manifest is signed only by a
+///   key the ceremony already replaced. A live-key signature on the same
+///   manifest wins, so no warning is surfaced.
+/// - Manifests signed ONLY by revoked keys fail with a named error.
+pub fn verify_with_ledger(
+    manifest_bytes: &[u8],
+    signatures: &std::collections::BTreeMap<String, serde_json::Value>,
+    chain: &Keychain,
+    ledger: &CeremonyLedger,
+    extra_revoked: &[String],
+    now: i64,
+) -> miette::Result<LedgerVerification> {
+    if chain.is_empty() {
+        return Err(miette::miette!(
+            "empty trust chain — no public keys loaded, refusing to verify (fail closed)"
+        ));
+    }
+    let revoked = revoked_set(ledger, extra_revoked);
+    let mut missing = Vec::new();
+    let mut failed = Vec::new();
+    let mut live: Vec<String> = Vec::new();
+    let mut stale: Vec<(String, String)> = Vec::new();
+    for (key_id, public) in &chain.entries {
+        match classify_against_ledger(
+            manifest_bytes,
+            signatures,
+            key_id,
+            public,
+            &revoked,
+            ledger,
+            now,
+        )? {
+            Classification::Revoked => {}
+            Classification::Missing => missing.push(key_id.clone()),
+            Classification::Failed => failed.push(key_id.clone()),
+            Classification::Live => live.push(key_id.clone()),
+            Classification::Stale(warning) => stale.push((key_id.clone(), warning)),
+        }
+    }
+    pick_verification_outcome(signatures, &revoked, missing, failed, live, stale)
+}
+
+/// The ledger's revoked ids unioned with an externally supplied list
+/// (`keys/revoked-keys` — the device-carried spelling of the same fact).
+fn revoked_set(
+    ledger: &CeremonyLedger,
+    extra_revoked: &[String],
+) -> std::collections::BTreeSet<String> {
+    let mut revoked: std::collections::BTreeSet<String> =
+        ledger.revoked_ids().into_iter().collect();
+    revoked.extend(extra_revoked.iter().cloned());
+    revoked
+}
+
+/// How one keychain entry relates to a signature map under ledger policy.
+enum Classification {
+    /// Key is revoked — never a candidate.
+    Revoked,
+    /// No signature entry for this key.
+    Missing,
+    /// Signature present but does not verify.
+    Failed,
+    /// Verifies under a live (non-rotated or in-window) key.
+    Live,
+    /// Verifies under a rotated-out key past its window.
+    Stale(String),
+}
+
+/// Walk one chain entry through the revocation → presence → signature →
+/// window policy.
+fn classify_against_ledger(
+    manifest_bytes: &[u8],
+    signatures: &std::collections::BTreeMap<String, serde_json::Value>,
+    key_id: &str,
+    public: &[u8; 32],
+    revoked: &std::collections::BTreeSet<String>,
+    ledger: &CeremonyLedger,
+    now: i64,
+) -> miette::Result<Classification> {
+    if revoked.contains(key_id) {
+        return Ok(Classification::Revoked);
+    }
+    let Some(entry) = signatures.get(key_id) else {
+        return Ok(Classification::Missing);
+    };
+    let payload_ok = entry_signed_payload(manifest_bytes, key_id, entry)
+        .and_then(|(payload, raw)| verify_one(&payload, key_id, &raw, public));
+    if payload_ok.is_err() {
+        return Ok(Classification::Failed);
+    }
+    match stale_rotation_warning(ledger, key_id, now)? {
+        Some(warning) => Ok(Classification::Stale(warning)),
+        None => Ok(Classification::Live),
+    }
+}
+
+/// Choose the outcome: a live signature always wins; a window-expired one
+/// verifies with a warning; only-revoked signatures are a named error.
+fn pick_verification_outcome(
+    signatures: &std::collections::BTreeMap<String, serde_json::Value>,
+    revoked: &std::collections::BTreeSet<String>,
+    missing: Vec<String>,
+    failed: Vec<String>,
+    live: Vec<String>,
+    stale: Vec<(String, String)>,
+) -> miette::Result<LedgerVerification> {
+    if let Some(key_id) = live.first().cloned() {
+        return Ok(LedgerVerification {
+            key_id,
+            warnings: Vec::new(),
+        });
+    }
+    if let Some((key_id, warning)) = stale.first().cloned() {
+        return Ok(LedgerVerification {
+            key_id,
+            warnings: vec![warning],
+        });
+    }
+    let signed_revoked: Vec<String> = signatures
+        .keys()
+        .filter(|id| revoked.contains(*id))
+        .cloned()
+        .collect();
+    if !signed_revoked.is_empty() {
+        return Err(miette::miette!(
+            "manifest is signed only by REVOKED key(s) {} and carries no valid signature \
+             under a live key — refusing to verify",
+            signed_revoked.join(", ")
+        ));
+    }
+    Err(miette::miette!(
+        "no trusted signature verifies: missing entries for {missing:?}, failed for {failed:?} \
+         — refusing to verify"
+    ))
+}
+
+/// [`verify_with_ledger`] at the current time.
+pub fn verify_with_ledger_now(
+    manifest_bytes: &[u8],
+    signatures: &std::collections::BTreeMap<String, serde_json::Value>,
+    chain: &Keychain,
+    ledger: &CeremonyLedger,
+    extra_revoked: &[String],
+) -> miette::Result<LedgerVerification> {
+    verify_with_ledger(
+        manifest_bytes,
+        signatures,
+        chain,
+        ledger,
+        extra_revoked,
+        now_unix(),
+    )
+}
+
+/// The window warning for a verified rotated-out key, `None` while the
+/// overlap window is still open (or for keys never rotated).
+fn stale_rotation_warning(
+    ledger: &CeremonyLedger,
+    key_id: &str,
+    now: i64,
+) -> miette::Result<Option<String>> {
+    if !ledger.rotation_window_expired(key_id, now)? {
+        return Ok(None);
+    }
+    let entry = &ledger.keys[key_id];
+    Ok(Some(format!(
+        "transition window expired: key {key_id} was rotated out on {} (window {} days) and \
+         this manifest still carries only its signature — re-sign under its successor {} \
+         and revoke {key_id} when no old artifacts remain",
+        entry.rotated_at.as_deref().unwrap_or("?"),
+        entry.window_days.unwrap_or(DEFAULT_WINDOW_DAYS),
+        entry.replaced_by.as_deref().unwrap_or("?"),
+    )))
 }
 
 /// Verify one base64 signature string under one public key (the single
@@ -1548,6 +2150,339 @@ mod tests {
             format!("{err:#}").contains("revoked-keys"),
             "corrupt revocation list named: {err:#}"
         );
+    }
+
+    // ── Ceremony ledger + transition window (issue #51, ADR-0011 §4e) ──
+
+    /// A fixed epoch to build deterministic RFC3339 dates from.
+    const T0: i64 = 1_700_000_000;
+    const DAY: i64 = 86_400;
+
+    #[test]
+    fn full_lifecycle_gen_sign_rotate_dual_verify_revoke() {
+        // gen: the key is minted AND recorded in the ledger.
+        let (home, old) = temp_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        install_public_key(&old, dir.path()).unwrap();
+        let mut ledger = CeremonyLedger::load(dir.path()).unwrap();
+        ledger.record_created(&old, &unix_to_rfc3339(T0));
+        ledger.save(dir.path()).unwrap();
+
+        // sign: the old key attests the manifest (issue #56 envelope).
+        let mut manifest = manifest_with_github_input();
+        attest_eval(
+            &mut manifest,
+            &old,
+            "9.9.9",
+            "amd64",
+            "latest/stable",
+            false,
+        )
+        .unwrap();
+        let body = canonical_bytes(&manifest).unwrap();
+
+        // Either-key rule pre-rotation: the only signer verifies.
+        let chain = Keychain::load_dir(dir.path()).unwrap();
+        let out = verify_with_ledger(&body, &manifest.signatures, &chain, &ledger, &[], T0 + DAY)
+            .unwrap();
+        assert_eq!(out.key_id, old.key_id());
+        assert!(out.warnings.is_empty());
+
+        // rotate: successor minted, generation chain recorded, manifest
+        // dual-signed with provenance re-attachment.
+        let successor = mint_rotation_key(home.path()).unwrap();
+        ledger.record_rotation(&old, &successor, &unix_to_rfc3339(T0), 30);
+        ledger.save(dir.path()).unwrap();
+        cosign_reattaching_provenance(&mut manifest, &successor).unwrap();
+        assert!(manifest.signatures.contains_key(&old.key_id()));
+        assert!(manifest.signatures.contains_key(&successor.key_id()));
+        let body = canonical_bytes(&manifest).unwrap();
+
+        // The window accepts either key: old-only, new-only, both.
+        for anchored in [vec![&old], vec![&successor], vec![&old, &successor]] {
+            let d = tempfile::tempdir().unwrap();
+            let chain = chain_with(d.path(), &anchored);
+            let out =
+                verify_with_ledger(&body, &manifest.signatures, &chain, &ledger, &[], T0 + DAY)
+                    .unwrap();
+            assert!(out.warnings.is_empty(), "inside the window: no warning");
+        }
+
+        // revoke the old key: anchor removed, listed, dated in the ledger.
+        install_public_key(&successor, dir.path()).unwrap();
+        revoke_local(dir.path(), &old.key_id()).unwrap();
+        ledger.record_revocation(&old.key_id(), &unix_to_rfc3339(T0 + DAY));
+        ledger.save(dir.path()).unwrap();
+        let revoked = read_revoked_keys(dir.path()).unwrap();
+        assert_eq!(revoked, vec![old.key_id()]);
+
+        // The dual-signed manifest keeps verifying through the live key —
+        // revocation is not retroactive breakage.
+        let chain = Keychain::load_dir(dir.path()).unwrap();
+        let out = verify_with_ledger(
+            &body,
+            &manifest.signatures,
+            &chain,
+            &ledger,
+            &revoked,
+            T0 + 2 * DAY,
+        )
+        .unwrap();
+        assert_eq!(out.key_id, successor.key_id());
+
+        // A manifest signed ONLY by the revoked key fails with the named
+        // error, which names the key.
+        let mut old_only = manifest.clone();
+        old_only.signatures.remove(&successor.key_id());
+        let old_only_body = canonical_bytes(&old_only).unwrap();
+        let err = verify_with_ledger(
+            &old_only_body,
+            &old_only.signatures,
+            &chain,
+            &ledger,
+            &revoked,
+            T0 + 2 * DAY,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("REVOKED"), "named revocation error: {msg}");
+        assert!(msg.contains(&old.key_id()), "names the revoked key: {msg}");
+    }
+
+    #[test]
+    fn transition_window_warns_after_expiry_when_old_key_only() {
+        let (home, old) = temp_keypair();
+        let successor = mint_rotation_key(home.path()).unwrap();
+        let mut ledger = CeremonyLedger::default();
+        ledger.record_created(&old, &unix_to_rfc3339(T0));
+        ledger.record_rotation(&old, &successor, &unix_to_rfc3339(T0), 30);
+
+        let mut manifest = minimal_manifest();
+        cosign(&mut manifest, &old).unwrap();
+        let body = canonical_bytes(&manifest).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let chain = chain_with(dir.path(), &[&old, &successor]);
+
+        // Inside the window: clean verify, no warning.
+        let out = verify_with_ledger(
+            &body,
+            &manifest.signatures,
+            &chain,
+            &ledger,
+            &[],
+            T0 + 10 * DAY,
+        )
+        .unwrap();
+        assert_eq!(out.key_id, old.key_id());
+        assert!(out.warnings.is_empty());
+
+        // Past the window: still verifies (warn, never fail) — but the
+        // operator is told the artifact carries only the rotated-out key.
+        let out = verify_with_ledger(
+            &body,
+            &manifest.signatures,
+            &chain,
+            &ledger,
+            &[],
+            T0 + 31 * DAY,
+        )
+        .unwrap();
+        assert_eq!(out.key_id, old.key_id());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(out.warnings[0].contains("transition window expired"));
+        assert!(out.warnings[0].contains(&successor.key_id()));
+
+        // A dual-signed manifest past the window verifies through the
+        // live key with no warning — the fresh signature wins.
+        cosign(&mut manifest, &successor).unwrap();
+        let body = canonical_bytes(&manifest).unwrap();
+        let out = verify_with_ledger(
+            &body,
+            &manifest.signatures,
+            &chain,
+            &ledger,
+            &[],
+            T0 + 31 * DAY,
+        )
+        .unwrap();
+        assert_eq!(out.key_id, successor.key_id());
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn tampered_ceremony_ledger_is_a_named_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not JSON at all.
+        std::fs::write(ceremony_ledger_path(dir.path()), "not json {").unwrap();
+        let err = CeremonyLedger::load(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("corrupt"), "{err:#}");
+
+        // Public-key material that does not hash to its own id — the
+        // tamper an attacker (or a fat-fingered edit) produces.
+        let mut ledger = CeremonyLedger {
+            version: CEREMONY_LEDGER_VERSION,
+            keys: std::collections::BTreeMap::new(),
+        };
+        ledger.keys.insert(
+            "aaaaaaaaaaaaaaaa".into(),
+            LedgerEntry {
+                public_key: Some("ff".repeat(32)),
+                ..LedgerEntry::default()
+            },
+        );
+        std::fs::write(
+            ceremony_ledger_path(dir.path()),
+            serde_json::to_string(&ledger).unwrap(),
+        )
+        .unwrap();
+        let err = CeremonyLedger::load(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not hash to its own id"),
+            "{err:#}"
+        );
+
+        // A malformed date.
+        ledger.keys.get_mut("aaaaaaaaaaaaaaaa").unwrap().public_key = None;
+        ledger.keys.get_mut("aaaaaaaaaaaaaaaa").unwrap().created = Some("yesterday".into());
+        std::fs::write(
+            ceremony_ledger_path(dir.path()),
+            serde_json::to_string(&ledger).unwrap(),
+        )
+        .unwrap();
+        let err = CeremonyLedger::load(dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("malformed created date"),
+            "{err:#}"
+        );
+
+        // A dangling chain link.
+        ledger.keys.get_mut("aaaaaaaaaaaaaaaa").unwrap().created = None;
+        ledger.keys.get_mut("aaaaaaaaaaaaaaaa").unwrap().replaced_by =
+            Some("bbbbbbbbbbbbbbbb".into());
+        std::fs::write(
+            ceremony_ledger_path(dir.path()),
+            serde_json::to_string(&ledger).unwrap(),
+        )
+        .unwrap();
+        let err = CeremonyLedger::load(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("no ledger entry"), "{err:#}");
+
+        // An unknown future version.
+        ledger.keys.get_mut("aaaaaaaaaaaaaaaa").unwrap().replaced_by = None;
+        ledger.version = 99;
+        std::fs::write(
+            ceremony_ledger_path(dir.path()),
+            serde_json::to_string(&ledger).unwrap(),
+        )
+        .unwrap();
+        let err = CeremonyLedger::load(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("newer"), "{err:#}");
+    }
+
+    #[test]
+    fn ceremony_ledger_is_compat_with_missing_and_minimal_files() {
+        // No ledger file at all: pre-ceremony keychains are valid state.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = CeremonyLedger::load(dir.path()).unwrap();
+        assert!(ledger.keys.is_empty());
+        assert!(ledger.revoked_ids().is_empty());
+
+        // A minimal, partial entry (serde-default on every field) parses.
+        std::fs::write(
+            ceremony_ledger_path(dir.path()),
+            r#"{"version":1,"keys":{"aaaaaaaaaaaaaaaa":{}}}"#,
+        )
+        .unwrap();
+        let ledger = CeremonyLedger::load(dir.path()).unwrap();
+        let entry = ledger.keys.get("aaaaaaaaaaaaaaaa").expect("entry loaded");
+        assert_eq!(entry, &LedgerEntry::default());
+        assert!(ledger.revoked_ids().is_empty());
+    }
+
+    #[test]
+    fn rotation_resign_reattaches_provenance_verbatim() {
+        let (_, old) = temp_keypair();
+        let (_, successor) = temp_keypair();
+        let mut manifest = manifest_with_github_input();
+        attest_eval(&mut manifest, &old, "9.9.9", "amd64", "latest/stable", true).unwrap();
+        let old_entry = manifest.signatures[&old.key_id()].clone();
+        let old_prov = check_provenance(&old_entry, &manifest.inputs)
+            .unwrap()
+            .expect("attested");
+
+        cosign_reattaching_provenance(&mut manifest, &successor).unwrap();
+
+        // The old entry is untouched; the successor's carries the SAME
+        // claims under a NEW signature (materials unchanged → same
+        // attestation, new signature).
+        assert_eq!(manifest.signatures[&old.key_id()], old_entry);
+        let succ_entry = &manifest.signatures[&successor.key_id()];
+        let succ_prov = check_provenance(succ_entry, &manifest.inputs)
+            .unwrap()
+            .expect("re-attached attestation");
+        assert_eq!(succ_prov, old_prov);
+        assert_ne!(
+            succ_entry, &old_entry,
+            "the envelope itself differs (new signer)"
+        );
+
+        // Both verify over the unchanged canonical body.
+        let body = canonical_bytes(&manifest).unwrap();
+        verify(&body, &manifest.signatures, &old.public_hex()).unwrap();
+        verify(&body, &manifest.signatures, &successor.public_hex()).unwrap();
+    }
+
+    #[test]
+    fn resign_refuses_stale_provenance_subject() {
+        let (_, kp) = temp_keypair();
+        let (_, successor) = temp_keypair();
+        // An attestation minted over a DIFFERENT body than the manifest
+        // it is attached to: re-attaching it would lie about the bytes.
+        let mut other = manifest_with_github_input();
+        attest_eval(&mut other, &kp, "9.9.9", "amd64", "latest/stable", false).unwrap();
+        let prov: Provenance = {
+            let parsed: SignatureEntry =
+                serde_json::from_value(other.signatures[&kp.key_id()].clone()).unwrap();
+            parsed.provenance().unwrap().clone()
+        };
+
+        let mut target = minimal_manifest();
+        sign_attested(&mut target, &kp, &prov).unwrap();
+        let err = cosign_reattaching_provenance(&mut target, &successor).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not bind the current manifest bytes"),
+            "stale claims refused: {msg}"
+        );
+        assert!(
+            !target.signatures.contains_key(&successor.key_id()),
+            "no signature was added on refusal"
+        );
+    }
+
+    #[test]
+    fn rfc3339_roundtrip_and_rejects_impossible_dates() {
+        assert_eq!(unix_to_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_to_unix("1970-01-02T00:00:00Z").unwrap(), DAY);
+        // Leap day exists in 2024 (19782 days after the epoch, +12:34:56).
+        assert_eq!(
+            rfc3339_to_unix("2024-02-29T12:34:56Z").unwrap(),
+            1_709_210_096
+        );
+        assert_eq!(
+            unix_to_rfc3339(rfc3339_to_unix("2024-02-29T12:34:56Z").unwrap()),
+            "2024-02-29T12:34:56Z"
+        );
+        for bad in [
+            "2023-02-29T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-09-14T25:00:00Z",
+            "not-a-date",
+            "2026-09-14 12:00:00Z",
+            "",
+        ] {
+            assert!(rfc3339_to_unix(bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 
     // ── SLSA-lite provenance under the signature (issue #56) ──

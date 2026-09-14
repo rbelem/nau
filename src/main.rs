@@ -2645,9 +2645,14 @@ fn cmd_key(sub: KeyCommand) -> miette::Result<()> {
             shuttle::output::set_mode(json);
             key_keygen(key_home(home))
         }
-        KeyCommand::Rotate { home, json } => {
+        KeyCommand::Rotate {
+            home,
+            manifest,
+            window_days,
+            json,
+        } => {
             shuttle::output::set_mode(json);
-            key_rotate(key_home(home))
+            key_rotate(key_home(home), manifest, window_days)
         }
         KeyCommand::Promote { home, json } => {
             shuttle::output::set_mode(json);
@@ -2657,14 +2662,30 @@ fn cmd_key(sub: KeyCommand) -> miette::Result<()> {
             shuttle::output::set_mode(json);
             key_revoke(key_home(home), &key_id)
         }
+        KeyCommand::List { home, json } => {
+            shuttle::output::set_mode(json);
+            key_list(key_home(home))
+        }
+        KeyCommand::Verify {
+            manifest,
+            home,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            key_verify(key_home(home), &manifest)
+        }
     }
 }
 
 /// `shuttle key keygen`: mint the secret key and trust it immediately.
-/// Never prints the seed.
+/// Never prints the seed. The creation date is recorded in the ceremony
+/// ledger (issue #51) — the audit trail starts here.
 fn key_keygen(home: PathBuf) -> miette::Result<()> {
     let kp = shuttle::sign::create_secret_key(&home)?;
     let anchor = shuttle::sign::install_public_key(&kp, &shuttle::sign::keys_dir(&home))?;
+    let mut ledger = shuttle::sign::CeremonyLedger::load(&shuttle::sign::keys_dir(&home))?;
+    ledger.record_created(&kp, &shuttle::sign::now_rfc3339());
+    ledger.save(&shuttle::sign::keys_dir(&home))?;
     shuttle::output::ok(format!(
         "signing key created: {} (key id {})",
         shuttle::sign::secret_key_path(&home).display(),
@@ -2679,22 +2700,72 @@ fn key_keygen(home: PathBuf) -> miette::Result<()> {
     Ok(())
 }
 
-/// `shuttle key rotate`: mint `secret-key.new` only. No manifest is in
-/// hand for a bare CLI invocation, so this is the minting half of
-/// `sign::rotate` — the dual-sign half stays on the build path.
-fn key_rotate(home: PathBuf) -> miette::Result<()> {
-    let kp = shuttle::sign::mint_rotation_key(&home)?;
+/// `shuttle key rotate`: mint `secret-key.new`, record the generation
+/// chain in the ledger (old id → successor → date → overlap window), and
+/// dual-sign `--manifest` under the successor when given — the old
+/// signature entry is kept, and an attested entry's provenance is
+/// re-attached under the new signature (same claims, new key; issue #51).
+fn key_rotate(home: PathBuf, manifest: Option<String>, window_days: u32) -> miette::Result<()> {
+    let successor = shuttle::sign::mint_rotation_key(&home)?;
+    let old = shuttle::sign::load_secret_key(&home)?.expect("rotation key requires an active key");
+    let keys_dir = shuttle::sign::keys_dir(&home);
+    let mut ledger = shuttle::sign::CeremonyLedger::load(&keys_dir)?;
+    ledger.record_rotation(&old, &successor, &shuttle::sign::now_rfc3339(), window_days);
+    ledger.save(&keys_dir)?;
+
+    if let Some(path) = &manifest {
+        rotate_dual_sign_manifest(path, &successor)?;
+    }
+
     shuttle::output::ok(format!(
         "rotation key minted: {} (key id {}) — not trusted until promoted",
         shuttle::sign::rotation_key_path(&home).display(),
-        kp.key_id()
+        successor.key_id()
     ));
-    print_report(&serde_json::json!({
-        "key_id": kp.key_id(),
-        "rotation_key": shuttle::sign::rotation_key_path(&home).display().to_string(),
-        "trusted": false,
-    }));
+    shuttle::output::info(format!(
+        "generation chain recorded: {} replaced by {} (window {} days)",
+        old.key_id(),
+        successor.key_id(),
+        window_days
+    ));
+    print_rotate_report(&home, &old, &successor, window_days, manifest.as_deref());
     Ok(())
+}
+
+/// The `--manifest` half of `shuttle key rotate`: dual-sign the manifest
+/// file under the successor (old entries kept, provenance re-attached)
+/// and write it back atomically.
+fn rotate_dual_sign_manifest(path: &str, successor: &shuttle::sign::KeyPair) -> miette::Result<()> {
+    let mut parsed = read_manifest(path)?;
+    shuttle::sign::cosign_reattaching_provenance(&mut parsed, successor)?;
+    parsed.write_atomic(std::path::Path::new(path))?;
+    shuttle::output::ok(format!(
+        "manifest dual-signed: {path} (key id {} beside the existing entries)",
+        successor.key_id()
+    ));
+    Ok(())
+}
+
+/// The JSON report of a rotation, manifest field included when one was
+/// dual-signed.
+fn print_rotate_report(
+    home: &Path,
+    old: &shuttle::sign::KeyPair,
+    successor: &shuttle::sign::KeyPair,
+    window_days: u32,
+    manifest: Option<&str>,
+) {
+    let mut report = serde_json::json!({
+        "key_id": successor.key_id(),
+        "rotation_key": shuttle::sign::rotation_key_path(home).display().to_string(),
+        "trusted": false,
+        "replaces": old.key_id(),
+        "window_days": window_days,
+    });
+    if let Some(path) = manifest {
+        report["manifest"] = serde_json::json!(path);
+    }
+    print_report(&report);
 }
 
 /// `shuttle key promote`: move the successor into place and trust it.
@@ -2712,12 +2783,108 @@ fn key_promote(home: PathBuf) -> miette::Result<()> {
     Ok(())
 }
 
-/// `shuttle key revoke`: drop the local anchor and record the revocation.
+/// `shuttle key revoke`: drop the local anchor, record the revocation in
+/// `keys/revoked-keys`, and date it in the ceremony ledger.
 fn key_revoke(home: PathBuf, key_id: &str) -> miette::Result<()> {
     shuttle::sign::revoke_local(&shuttle::sign::keys_dir(&home), key_id)?;
-    shuttle::output::ok(format!("key {key_id} revoked"));
-    print_report(&serde_json::json!({ "key_id": key_id, "revoked": true }));
+    let keys_dir = shuttle::sign::keys_dir(&home);
+    let mut ledger = shuttle::sign::CeremonyLedger::load(&keys_dir)?;
+    let revoked_at = shuttle::sign::now_rfc3339();
+    ledger.record_revocation(key_id, &revoked_at);
+    ledger.save(&keys_dir)?;
+    shuttle::output::ok(format!("key {key_id} revoked (recorded {revoked_at})"));
+    print_report(&serde_json::json!({
+        "key_id": key_id,
+        "revoked": true,
+        "revoked_at": revoked_at,
+    }));
     Ok(())
+}
+
+/// `shuttle key list`: print the ceremony ledger — the auditable trail of
+/// every key the ceremony touched (issue #51).
+fn key_list(home: PathBuf) -> miette::Result<()> {
+    let ledger = shuttle::sign::CeremonyLedger::load(&shuttle::sign::keys_dir(&home))?;
+    if ledger.keys.is_empty() {
+        shuttle::output::info(format!(
+            "no ceremony ledger yet at {} (run `shuttle key keygen`)",
+            shuttle::sign::ceremony_ledger_path(&shuttle::sign::keys_dir(&home)).display()
+        ));
+        return Ok(());
+    }
+    for (key_id, entry) in &ledger.keys {
+        let created = entry.created.as_deref().unwrap_or("?");
+        let mut line = format!("{key_id}  created {created}");
+        if let (Some(succ), Some(at)) = (&entry.replaced_by, &entry.rotated_at) {
+            line.push_str(&format!(
+                "  rotated→{succ} {at} (window {}d)",
+                entry
+                    .window_days
+                    .unwrap_or(shuttle::sign::DEFAULT_WINDOW_DAYS)
+            ));
+        }
+        if let Some(at) = &entry.revoked_at {
+            line.push_str(&format!("  REVOKED {at}"));
+        }
+        if !shuttle::output::is_json() {
+            println!("{line}");
+        }
+    }
+    print_report(&ledger);
+    Ok(())
+}
+
+/// `shuttle key verify`: verify a manifest JSON under the ceremony policy
+/// (issue #51) — either key during a rotation window, a warning once an
+/// expired window's key is the only signer, a named error for
+/// revoked-only signatures. Provenance binding (issue #56) is enforced
+/// for the entry that verified.
+fn key_verify(home: PathBuf, manifest: &str) -> miette::Result<()> {
+    let parsed = read_manifest(manifest)?;
+    let outcome = verify_manifest_with_ceremony(&home, &parsed)?;
+    for warning in &outcome.warnings {
+        shuttle::output::warn(warning);
+    }
+    shuttle::output::ok(format!("manifest verified under key id {}", outcome.key_id));
+    print_report(&serde_json::json!({
+        "manifest": manifest,
+        "key_id": outcome.key_id,
+        "verified": true,
+        "warnings": outcome.warnings,
+    }));
+    Ok(())
+}
+
+/// Read and parse a manifest JSON file (shared by `key rotate --manifest`
+/// and `key verify`).
+fn read_manifest(path: &str) -> miette::Result<shuttle::manifest::ImageManifest> {
+    let text = std::fs::read_to_string(path).map_err(|e| miette::miette!("reading {path}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| miette::miette!("parsing manifest {path}: {e}"))
+}
+
+/// The ceremony-policy verify half of `shuttle key verify`: canonical
+/// bytes, operator keychain + ledger + `revoked-keys`, then the ledger
+/// verify with provenance binding enforced on the winning entry.
+fn verify_manifest_with_ceremony(
+    home: &Path,
+    parsed: &shuttle::manifest::ImageManifest,
+) -> miette::Result<shuttle::sign::LedgerVerification> {
+    let keys_dir = shuttle::sign::keys_dir(home);
+    let body = shuttle::sign::canonical_bytes(parsed)?;
+    let chain = shuttle::sign::Keychain::load_dir(&keys_dir)?;
+    let ledger = shuttle::sign::CeremonyLedger::load(&keys_dir)?;
+    let revoked = shuttle::sign::read_revoked_keys(&keys_dir)?;
+    let outcome = shuttle::sign::verify_with_ledger_now(
+        &body,
+        &parsed.signatures,
+        &chain,
+        &ledger,
+        &revoked,
+    )?;
+    if let Some(entry) = parsed.signatures.get(&outcome.key_id) {
+        shuttle::sign::check_provenance(entry, &parsed.inputs)?;
+    }
+    Ok(outcome)
 }
 
 // ── Runtime command (ADR-0012 step 5, Phase 24b) ──
