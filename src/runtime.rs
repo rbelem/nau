@@ -178,6 +178,13 @@ pub struct InstalledPackage {
     /// for packages without GUI apps.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub desktops: BTreeMap<String, DesktopLauncher>,
+    /// Payload font files (issue #29 cutover): path under the payload's
+    /// `usr/share/fonts` → sha256, recorded at install time so the font
+    /// emitter rebuilds the user-level surface from the manifest alone —
+    /// rollback re-emits without re-unpacking. Empty for packages that
+    /// ship no fonts (the common case; the hashes also appear in `files`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fonts: BTreeMap<String, String>,
 }
 
 /// One GUI app's desktop-launcher metadata (issue #7).
@@ -468,6 +475,29 @@ fn is_executable(path: &Path) -> bool {
 enum TreeEntry {
     Blob { rel: String, sha256: String },
     Symlink { rel: String, target: String },
+}
+
+/// The payload path prefix font files live under: every payload blob
+/// below it is a font the font emitter surfaces ([`record_fonts`]).
+const FONTS_PAYLOAD_PREFIX: &str = "usr/share/fonts/";
+
+/// Collect the font files of one ingested payload (issue #29 cutover):
+/// every content-addressed blob under [`FONTS_PAYLOAD_PREFIX`] becomes a
+/// (path-under-the-prefix → sha256) entry. Symlinks are skipped — a
+/// payload link out of the font tree must not pull outside trees into
+/// the user's font surface. The hashes are already in the package's
+/// `files` set, so GC marking is unchanged; this list is purely the
+/// emitter's activation record.
+fn record_fonts(entries: &[TreeEntry]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for entry in entries {
+        if let TreeEntry::Blob { rel, sha256 } = entry {
+            if let Some(rest) = rel.strip_prefix(FONTS_PAYLOAD_PREFIX) {
+                out.insert(rest.to_string(), sha256.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Everything extracted from one pending payload, ready to stage.
@@ -1080,6 +1110,7 @@ impl RuntimeStore {
                         None,
                         BTreeMap::new(),
                         BTreeMap::new(),
+                        BTreeMap::new(),
                     ),
                     planner_notes: Vec::new(),
                     entries: Vec::new(),
@@ -1094,6 +1125,7 @@ impl RuntimeStore {
                 let entries = self.ingest_tree(&extract, "meta")?;
                 let runtime = plan_payload_runtime(&meta, &entries, snap)?;
                 let desktops = self.record_desktops(&meta, &extract)?;
+                let fonts = record_fonts(&entries);
                 let pkg_units = runtime.units.iter().map(|u| u.unit_name.clone()).collect();
                 Ok(PreparedSnap {
                     pkg: self.recorded_package(
@@ -1107,6 +1139,7 @@ impl RuntimeStore {
                         runtime.confined,
                         runtime.app_confined,
                         desktops,
+                        fonts,
                     ),
                     planner_notes: runtime.notes,
                     entries,
@@ -1165,6 +1198,7 @@ impl RuntimeStore {
         confined: Option<crate::snap::Confinement>,
         app_confined: BTreeMap<String, crate::snap::Confinement>,
         desktops: BTreeMap<String, DesktopLauncher>,
+        fonts: BTreeMap<String, String>,
     ) -> InstalledPackage {
         InstalledPackage {
             name: snap.name.clone(),
@@ -1180,6 +1214,7 @@ impl RuntimeStore {
             confined,
             app_confined,
             desktops,
+            fonts,
         }
     }
 
@@ -2386,6 +2421,36 @@ mod tests {
 
     // ── Fixtures ──
 
+    #[test]
+    fn record_fonts_collects_payload_font_blobs_only() {
+        let entries = vec![
+            TreeEntry::Blob {
+                rel: "usr/share/fonts/truetype/nerd-fonts-hack/HackNerdFont-Regular.ttf".into(),
+                sha256: "aa11".into(),
+            },
+            TreeEntry::Symlink {
+                rel: "usr/share/fonts/truetype/escape.ttf".into(),
+                target: "/etc/passwd".into(),
+            },
+            TreeEntry::Blob {
+                rel: "usr/bin/jq".into(),
+                sha256: "bb22".into(),
+            },
+        ];
+        let fonts = record_fonts(&entries);
+        assert_eq!(
+            fonts,
+            [(
+                "truetype/nerd-fonts-hack/HackNerdFont-Regular.ttf".to_string(),
+                "aa11".to_string()
+            )]
+            .into_iter()
+            .collect(),
+            "only font-tree blobs are recorded; payload symlinks never surface"
+        );
+        assert!(record_fonts(&[]).is_empty());
+    }
+
     /// A state root with a temp extensions-link dir (never /var/lib).
     struct Fixture {
         _dir: tempfile::TempDir,
@@ -2420,6 +2485,7 @@ mod tests {
             confined: None,
             app_confined: BTreeMap::new(),
             desktops: BTreeMap::new(),
+            fonts: BTreeMap::new(),
         }
     }
 
@@ -3364,6 +3430,7 @@ plugs:
                 confined: None,
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
+                fonts: BTreeMap::new(),
             },
         );
         installed.insert(
@@ -3382,6 +3449,7 @@ plugs:
                 confined: None,
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
+                fonts: BTreeMap::new(),
             },
         );
         let resolved = vec![

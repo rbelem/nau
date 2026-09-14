@@ -494,6 +494,7 @@ mod tests {
             confined: None,
             app_confined: BTreeMap::new(),
             desktops: BTreeMap::new(),
+            fonts: BTreeMap::new(),
         };
         // Multi-file app: exec the assembled leaf, not the lone blob —
         // the leaf's directory carries the recorded sibling.

@@ -99,7 +99,7 @@ fn documented_layout_data_home(root: &std::path::Path) -> Option<&std::path::Pat
 }
 
 /// The pod name behind a store: the last component of its root path.
-fn pod_name(store: &RuntimeStore) -> miette::Result<String> {
+pub(crate) fn pod_name(store: &RuntimeStore) -> miette::Result<String> {
     store
         .root()
         .file_name()
@@ -325,7 +325,7 @@ pub fn clear_in(store: &RuntimeStore, data_home: &std::path::Path) -> miette::Re
 /// Symlink `dest` to `src`, replacing any existing file/link at `dest`.
 /// Creating the same link again (a re-emit) is idempotent; a link to a
 /// different target is replaced.
-fn link_or_replace(src: &std::path::Path, dest: &std::path::Path) -> miette::Result<()> {
+pub(crate) fn link_or_replace(src: &std::path::Path, dest: &std::path::Path) -> miette::Result<()> {
     let _ = std::fs::remove_file(dest);
     std::os::unix::fs::symlink(src, dest)
         .map_err(|e| miette::miette!("linking {} -> {}: {e}", dest.display(), src.display()))?;

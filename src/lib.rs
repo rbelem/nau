@@ -14,6 +14,7 @@ pub mod dsl;
 pub mod emit;
 pub mod esp;
 pub mod farm;
+pub mod fonts;
 pub mod image;
 pub mod index;
 pub mod isolate;

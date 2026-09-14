@@ -232,6 +232,10 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
     // emit it beside the bin farm so removal and rollback surface the
     // target generation's entries by re-emitting.
     crate::desktop::emit(store, gen)?;
+    // The font surface too (issue #29): font payload packages declare
+    // no apps, so without this their payloads would sit inert in the
+    // store — the user-level fonts dir is their activation seam.
+    crate::fonts::emit(store, gen)?;
     Ok(farm)
 }
 
@@ -460,6 +464,7 @@ mod tests {
                     .collect(),
                 assembly: BTreeMap::new(),
                 desktops: BTreeMap::new(),
+                fonts: BTreeMap::new(),
                 launchers: BTreeMap::new(),
                 confined: None,
                 app_confined: BTreeMap::new(),
@@ -512,6 +517,7 @@ mod tests {
                 }),
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
+                fonts: BTreeMap::new(),
             },
         );
         Generation {
@@ -647,6 +653,7 @@ mod tests {
                     .iter()
                     .map(|(a, l)| (a.to_string(), l.clone()))
                     .collect(),
+                fonts: BTreeMap::new(),
             },
         );
         Generation {
@@ -800,6 +807,7 @@ mod tests {
                 confined: None,
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
+                fonts: BTreeMap::new(),
             },
         );
         Generation {

@@ -2195,6 +2195,7 @@ fn seed_pod_generation(pod_dir: &Path, n: u64, pkg: &str, unit: &str) {
             confined: None,
             app_confined: std::collections::BTreeMap::new(),
             desktops: std::collections::BTreeMap::new(),
+            fonts: std::collections::BTreeMap::new(),
         },
     );
     let gen = Generation {
