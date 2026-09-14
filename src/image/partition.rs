@@ -342,6 +342,11 @@ pub(crate) struct PopulateCtx<'a> {
     /// non-UC/unsimplified path — content routing falls back to the
     /// historical behavior.
     pub(crate) uc: Option<&'a UcCtx>,
+    /// The staged Pi firmware-visible boot tree (#87) — `Some` for piboot
+    /// images, where the single vfat partition is populated from it
+    /// (gadget boot-assets + Pi-spelled kernel payload + generated
+    /// cmdline.txt/config.txt) instead of the systemd-boot ESP.
+    pub(crate) pi_boot_stage: Option<&'a Path>,
 }
 
 /// Ubuntu Core seed/role-model context threaded into the populate stage.
@@ -590,16 +595,48 @@ pub(crate) fn populate_side_partition(
     // populated from its dedicated staged tree (seed / modeenv), never the
     // rootfs — the UC role model replaces the simplified "everything is the
     // rootfs" routing for those partitions.
-    if let Some(stage) = ctx.uc_route_stage(part) {
-        build_staged_partition(runner, &part_file, part, stage, extent)?;
-    } else if super::is_state_partition(part) {
-        build_state_partition(runner, ctx, &part_file, part, extent)?;
-    } else if index == 0 && part.fs == "vfat" {
-        build_esp_partition(runner, ctx, &part_file, part)?;
-    } else {
-        build_data_partition(runner, ctx, &part_file, part, extent)?;
+    match route_side_partition(ctx, index, part) {
+        SideRoute::Uc(stage) => build_staged_partition(runner, &part_file, part, stage, extent)?,
+        SideRoute::State => build_state_partition(runner, ctx, &part_file, part, extent)?,
+        // #87: on a piboot image the single vfat partition is the Pi
+        // firmware partition — populated from the staged boot tree, and
+        // FATAL on failure (it IS the boot chain).
+        SideRoute::Piboot(stage) => build_piboot_partition(runner, &part_file, part, stage)?,
+        SideRoute::Esp => build_esp_partition(runner, ctx, &part_file, part)?,
+        SideRoute::Data => build_data_partition(runner, ctx, &part_file, part, extent)?,
     }
     splice_into(&ctx.scratch_dir.join("disk.img"), &part_file, extent)
+}
+
+/// The routing decision for one non-root partition: UC role trees, the
+/// state partition, the piboot firmware partition (#87), the systemd-boot
+/// ESP, or a plain data partition.
+enum SideRoute<'a> {
+    Uc(&'a Path),
+    State,
+    Piboot(&'a Path),
+    Esp,
+    Data,
+}
+
+fn route_side_partition<'a>(
+    ctx: &'a PopulateCtx<'a>,
+    index: usize,
+    part: &Partition,
+) -> SideRoute<'a> {
+    if let Some(stage) = ctx.uc_route_stage(part) {
+        return SideRoute::Uc(stage);
+    }
+    if super::is_state_partition(part) {
+        return SideRoute::State;
+    }
+    if let Some(stage) = ctx.pi_boot_stage.filter(|_| part.fs == "vfat") {
+        return SideRoute::Piboot(stage);
+    }
+    if index == 0 && part.fs == "vfat" {
+        return SideRoute::Esp;
+    }
+    SideRoute::Data
 }
 
 /// mkfs an EMPTY ext4 filesystem for a `role = "state"` partition
@@ -631,6 +668,56 @@ pub(crate) fn build_state_partition(
     Ok(())
 }
 
+/// mkfs.vfat a standalone partition file (`-F 32`, labelled with the
+/// partition name). Shared by the systemd-boot ESP and the piboot firmware
+/// partition (#87); the caller decides whether a failure warns or fails.
+fn mkfs_vfat_partition(
+    runner: &dyn CommandRunner,
+    part_file: &Path,
+    part: &Partition,
+) -> miette::Result<()> {
+    let (tool, mut flags) = mkfs_flags_for("vfat", false)?;
+    flags.push(part.name.clone()); // -n label
+    flags.push(part_file.to_string_lossy().into_owned());
+    let argv: Vec<String> = std::iter::once(tool.to_string()).chain(flags).collect();
+    let out = runner
+        .run(&argv)
+        .map_err(|e| miette::miette!("{tool} not found: {e}"))?;
+    if out.code != 0 {
+        return Err(miette::miette!(
+            "{tool} failed for the {} partition '{}' (exit {}): {}",
+            part.fs,
+            part.name,
+            crate::command::exit_code(&out),
+            out.stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// mkfs.vfat the Pi firmware partition and copy the staged boot tree on
+/// with mtools (#87) — gadget boot-assets, the Pi-spelled kernel payload,
+/// board DTBs, and the generated cmdline.txt/config.txt. FATAL on failure,
+/// unlike the warn-not-fatal ESP path: this partition IS the Pi boot chain
+/// (start.elf, DTBs, kernel.img), and one the firmware cannot even
+/// describe — a blank one is a silent brick.
+pub(crate) fn build_piboot_partition(
+    runner: &dyn CommandRunner,
+    part_file: &Path,
+    part: &Partition,
+    stage: &Path,
+) -> miette::Result<()> {
+    mkfs_vfat_partition(runner, part_file, part)
+        .wrap_err_with(|| format!("Pi firmware partition '{}' mkfs failed", part.name))?;
+    mtools_populate_vfat(runner, part_file, stage)
+        .wrap_err_with(|| format!("Pi firmware partition '{}' populate failed", part.name))?;
+    eprintln!(
+        "  ✓ {}: {} populated (Pi firmware partition — boot-assets + kernel payload, #87)",
+        part.name, part.fs
+    );
+    Ok(())
+}
+
 /// mkfs.vfat the standalone ESP file and copy the staged boot tree on with
 /// mtools (no offset syntax needed — the file IS the partition).
 /// Warn-not-fatal: a failure leaves the ESP unpopulated (historical
@@ -644,16 +731,8 @@ pub(crate) fn build_esp_partition(
     let esp_stage = ctx.scratch_dir.join("esp-staging");
     populate_esp(runner, &esp_stage.join("EFI").join("BOOT"))?;
     install_uki(ctx.image, &esp_stage, ctx.uki, ctx.uki_stage)?;
-    let (tool, flags) = mkfs_flags_for("vfat", false)?;
-    let mut args: Vec<String> = flags;
-    args.push(part.name.clone()); // -n label
-    args.push(part_file.to_string_lossy().into_owned());
-    let argv: Vec<String> = std::iter::once(tool.to_string()).chain(args).collect();
-    let out = runner
-        .run(&argv)
-        .map_err(|e| miette::miette!("{tool} not found: {e}"))?;
-    if out.code != 0 {
-        eprintln!("  ⚠ {tool} failed for {} — ESP left unpopulated", part.name);
+    if let Err(e) = mkfs_vfat_partition(runner, part_file, part) {
+        eprintln!("  ⚠ {e:#} — ESP left unpopulated");
         return Ok(());
     }
     if let Err(e) = mtools_populate_vfat(runner, part_file, &esp_stage) {
@@ -1034,6 +1113,7 @@ mod tests {
             uki: None,
             uki_stage: Path::new(""),
             uc: None,
+            pi_boot_stage: None,
         };
 
         populate_side_partition(&runner, &ctx, 0, &state).unwrap();
@@ -1072,6 +1152,7 @@ mod tests {
             uki: None,
             uki_stage: Path::new(""),
             uc: None,
+            pi_boot_stage: None,
         };
 
         let err = populate_side_partition(&runner, &ctx, 0, &state).unwrap_err();
@@ -1099,6 +1180,7 @@ mod tests {
             uki: None,
             uki_stage: Path::new(""),
             uc: None,
+            pi_boot_stage: None,
         };
 
         populate_side_partition(&runner, &ctx, 0, &data)

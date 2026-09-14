@@ -987,6 +987,15 @@ pub(crate) struct KernelPayload {
     /// never honors shuttle's verity cmdline — the build replaces its initrd
     /// with shuttle's native one (issue #75). `false` for the raw path.
     pub(crate) prebuilt_uki: bool,
+    /// `true` when the payload is the Raspberry Pi raw shape — `kernel.img`
+    /// (gzip ARM64 Image) + `initrd.img` at the snap root (issue #74/#87).
+    /// Consumed ONLY by the piboot backend: the Pi firmware boots
+    /// `kernel.img` directly (decompressing the gzip itself) off the
+    /// gadget's boot-assets; no UKI is ever assembled from it. The
+    /// payload↔bootloader pairing is enforced at staging
+    /// ([`piboot::assert_payload_bootloader_pairing`] — via
+    /// [`super::staging`]'s payload location).
+    pub(crate) pi_raw: bool,
     /// `.sbat` (SBAT — Secure Boot Advanced Targeting) revocation policy
     /// carried VERBATIM from the prebuilt `kernel.efi` into the rebuilt UKI
     /// via `ukify --sbat` (issue #73). Under an SBAT-enforcing shim, a UKI
@@ -1010,6 +1019,23 @@ impl KernelPayload {
             initrd,
             version,
             prebuilt_uki: false,
+            pi_raw: false,
+            sbat: None,
+            _scratch: None,
+        }
+    }
+
+    /// The Raspberry Pi payload ([`is_pi_raw_payload`]): the files stay at
+    /// their snap-root spellings — the piboot backend stages them verbatim
+    /// onto the firmware partition, and no UKI machinery ever touches them
+    /// (issue #87).
+    pub(crate) fn pi_raw(kernel: PathBuf, initrd: PathBuf, version: String) -> KernelPayload {
+        KernelPayload {
+            kernel,
+            initrd,
+            version,
+            prebuilt_uki: false,
+            pi_raw: true,
             sbat: None,
             _scratch: None,
         }
@@ -1067,8 +1093,9 @@ pub(crate) const EFI_STUB_CANDIDATES: [&str; 3] = [
 ///
 /// The Raspberry Pi kernel snap carries a THIRD shape — raw components
 /// under Pi spellings (`kernel.img` gzip Image + `initrd.img`), issue #74 —
-/// which is recognized and refused with a named error: no implemented boot
-/// chain can consume it ([`is_pi_raw_payload`]).
+/// located as a [`KernelPayload::pi_raw`] payload. It is consumable ONLY by
+/// the piboot backend (#87, ADR-0025 amendment): the payload↔bootloader
+/// pairing is enforced downstream, in [`super::staging`].
 pub(crate) fn locate_kernel_payload(
     runner: &dyn CommandRunner,
     objcopy: Option<&Path>,
@@ -1081,10 +1108,15 @@ pub(crate) fn locate_kernel_payload(
     // vmlinuz-centric searches see its half-matches — `initrd.img` alone
     // resolves in the raw initrd search, which would fail with a misleading
     // "payload has no kernel image" while `kernel.img` sits at the snap
-    // root. Recognition precedes every search so the refusal names the
-    // actual shape.
+    // root. Recognition precedes every search so the shape is located under
+    // its own name, and a build whose declared boot chain cannot consume it
+    // is refused there with THIS name (piboot pairing gate, #87).
     if is_pi_raw_payload(kernel_dir) {
-        return Err(pi_payload_error(&version));
+        return Ok(KernelPayload::pi_raw(
+            kernel_dir.join("kernel.img"),
+            kernel_dir.join("initrd.img"),
+            version,
+        ));
     }
     if let Some(payload) = locate_raw_payload(kernel_dir, version.clone())? {
         return Ok(payload);
@@ -1172,6 +1204,7 @@ fn locate_uki_payload(
         initrd,
         version,
         prebuilt_uki: true,
+        pi_raw: false,
         sbat: Some(sbat),
         _scratch: None,
     })
@@ -1184,15 +1217,10 @@ fn locate_uki_payload(
 /// `config-<kver>`, `dtbs/`, and `firmware/`. Measured on the real
 /// `pi-kernel` 22/stable rev 1137 (arm64, kver 5.15.0-1103-raspi).
 ///
-/// Recognized, never adopted: `kernel.img` is gzip-wrapped — not a PE
-/// object `ukify` can assemble into a UKI, and shuttle does not unwrap
-/// kernel payloads — and Raspberry Pi hardware does not run systemd-boot
-/// at all: the Pi firmware loads the gadget's boot-assets (config.txt,
-/// cmdline.txt, start4.elf, DTBs) from the boot partition, a boot-chain
-/// backend shuttle does not implement. Building this payload into a
-/// shuttle image would produce an artifact nothing can boot, so the shape
-/// is a named, fail-closed refusal; implementing the Pi chain is the
-/// ADR-0025 follow-up this error points at.
+/// Located as [`KernelPayload::pi_raw`] and consumable only by the piboot
+/// backend (issue #87, ADR-0025 amendment): the Pi firmware decompresses
+/// and boots `kernel.img` directly off the gadget's boot-assets. The
+/// payload↔bootloader pairing is enforced in [`super::piboot`].
 fn is_pi_raw_payload(kernel_dir: &Path) -> bool {
     PI_KERNEL_FILES.iter().all(|f| kernel_dir.join(f).is_file())
 }
@@ -1200,23 +1228,6 @@ fn is_pi_raw_payload(kernel_dir: &Path) -> bool {
 /// The two files whose presence identifies the Pi payload shape
 /// ([`is_pi_raw_payload`]).
 const PI_KERNEL_FILES: [&str; 2] = ["kernel.img", "initrd.img"];
-
-/// The fail-closed error for a recognized Pi payload ([`is_pi_raw_payload`]).
-/// The caller (`locate_payload_for_snap`) appends the snap name and the
-/// "refusing to build a disk image that cannot boot" close, so this names
-/// only the shape and the reason it cannot boot.
-fn pi_payload_error(version: &str) -> miette::Report {
-    miette::miette!(
-        "this payload is the Raspberry Pi kernel shape ({}, at the snap root; kernel \
-         version {version}) — `kernel.img` is a gzip-compressed ARM64 Image, not a PE \
-         object `ukify` can assemble into a UKI, and Raspberry Pi hardware does not run \
-         systemd-boot: the Pi firmware loads the gadget's boot-assets (config.txt, \
-         cmdline.txt, DTBs) from the boot partition, a boot-chain backend shuttle does \
-         not implement (issue #74, measured on pi-kernel 22/stable rev 1137). \
-         Implementing the Pi chain is #87, the ADR-0025 follow-up",
-        PI_KERNEL_FILES.join(" + "),
-    )
-}
 
 /// Validate the extracted `.sbat` payload (#73) and normalize it in place
 /// for the `ukify --sbat=@path` hand-off.
@@ -1669,6 +1680,18 @@ pub(crate) fn assemble_uki(
             entry.snap.name
         ));
     };
+    if payload.pi_raw {
+        // #87: the Pi payload never becomes a UKI — `kernel.img` is
+        // gzip-wrapped (not a PE object ukify can assemble) and the piboot
+        // backend boots it directly off the firmware partition. Reaching
+        // this branch with a Pi payload means the pipeline routing broke,
+        // so the refusal names the invariant.
+        return Err(miette::miette!(
+            "the Raspberry Pi payload (kernel.img + initrd.img) boots through the piboot \
+             chain — the Pi firmware loads kernel.img directly and no UKI is ever \
+             assembled from a gzip-wrapped Image; refusing to build (issue #87)"
+        ));
+    }
     let root_idx = root_partition_index(layout)?;
 
     // GPT PARTUUIDs exist from parted mkpart time and are read back from

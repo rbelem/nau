@@ -1650,16 +1650,23 @@ fn merge_kernel(
     // Fail closed on a payload that cannot boot the image. The raw
     // vmlinuz/initrd convention is first choice; the real Ubuntu Core
     // `pc-kernel` snap's prebuilt `kernel.efi` is the #70 fallback, split
-    // with objcopy into a scratch dir kept alive by the returned payload.
-    let payload = locate_payload_for_snap(runner, &kernel_dir, root, &kernel_entry.snap.name)?;
+    // with objcopy into a scratch dir kept alive by the returned payload;
+    // the Raspberry Pi shape (#74) is located as a `pi_raw` payload and
+    // paired against the declared bootloader (#87).
+    let payload =
+        locate_payload_for_snap(runner, image, &kernel_dir, root, &kernel_entry.snap.name)?;
     Ok((Some(payload), Some(kernel_work)))
 }
 
 /// Locate the kernel snap's boot payload and, for a prebuilt-UKI payload,
 /// replace its Canonical snap-bootstrap initramfs with shuttle's native one
-/// (issue #75). Fails closed with the snap name in every message.
+/// (issue #75). Fails closed with the snap name in every message, including
+/// the payload↔bootloader pairing gate (#87): the Pi payload is only
+/// consumable by the piboot backend, and the piboot backend only consumes
+/// the Pi payload.
 fn locate_payload_for_snap(
     runner: &dyn CommandRunner,
+    image: &ImageDeclaration,
     kernel_dir: &Path,
     root: &Path,
     snap_name: &str,
@@ -1676,6 +1683,7 @@ fn locate_payload_for_snap(
             "kernel snap '{snap_name}': {e}; refusing to build a disk image that cannot boot"
         )
     })?;
+    piboot::assert_payload_bootloader_pairing(image, payload.pi_raw, snap_name)?;
     // Issue #75: a prebuilt `kernel.efi` carries Canonical's snap-bootstrap
     // initramfs, which cannot honor shuttle's cmdline. Replace it with
     // shuttle's native initramfs (busybox + veritysetup + the snap's own

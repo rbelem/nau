@@ -655,19 +655,20 @@ fn check_partition_mounts(input: &LintInput) -> Vec<Finding> {
 
 // ── Check 4: bootloader-type (#71) ──
 
-/// `bootloader.type` values declaration validation rejects (issue #71).
+/// `bootloader.type` values declaration validation rejects (issues #71/#87).
 ///
-/// Only `systemd-boot` is implemented; `ImageDeclaration::from_lua_table`
-/// fails the image on anything else — the eval path then skips the image
-/// with a warning and the build dies later with a lost cause. Reading the
-/// RAW eval JSON, lint reports the rejected value directly, before any
-/// build: an **error**, because the build would fail.
+/// Two backends are implemented — `systemd-boot` (UEFI targets) and
+/// `piboot` (Raspberry Pi firmware chain, #87); `ImageDeclaration::
+/// from_lua_table` fails the image on anything else — the eval path then
+/// skips the image with a warning and the build dies later with a lost
+/// cause. Reading the RAW eval JSON, lint reports the rejected value
+/// directly, before any build: an **error**, because the build would fail.
 fn check_bootloader_type(input: &LintInput) -> Vec<Finding> {
     const CHECK: &str = "bootloader-type";
     let mut findings = Vec::new();
     for (key, img) in raw_images(input) {
         if let Some(t) = &img.bootloader_type {
-            if t != "systemd-boot" {
+            if t != "systemd-boot" && t != crate::image::BOOTLOADER_PIBOOT {
                 findings.push(Finding::new(
                     CHECK,
                     key,
@@ -678,7 +679,8 @@ fn check_bootloader_type(input: &LintInput) -> Vec<Finding> {
                          GRUB backend does not exist, the declaration would silently \
                          install systemd-boot)"
                     ),
-                    "set bootloader.type = \"systemd-boot\" or drop the bootloader field",
+                    "set bootloader.type = \"systemd-boot\" or \"piboot\" (issue #87), or \
+                     drop the bootloader field",
                 ));
             }
         }
@@ -1395,6 +1397,17 @@ mod tests {
         assert!(for_check(&input, "bootloader-type").is_empty());
         let mut raw = pc_image_raw();
         raw.as_object_mut().unwrap().remove("bootloader");
+        let b = Builder::new().image("rootfs", raw);
+        let input = b.build();
+        assert!(for_check(&input, "bootloader-type").is_empty());
+    }
+
+    /// Issue #87: `piboot` is the second implemented backend — the lint
+    /// must accept it (the pi-rootfs example declares it).
+    #[test]
+    fn piboot_bootloader_is_clean() {
+        let mut raw = pc_image_raw();
+        raw["bootloader"]["type"] = json!("piboot");
         let b = Builder::new().image("rootfs", raw);
         let input = b.build();
         assert!(for_check(&input, "bootloader-type").is_empty());

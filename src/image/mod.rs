@@ -95,9 +95,11 @@ pub struct KernelEntry {
 /// Bootloader configuration for disk images.
 #[derive(Debug, Clone)]
 pub struct BootloaderConfig {
-    /// Only "systemd-boot" is implemented (issue #71): any other declared
-    /// value fails declaration validation instead of being accepted and
-    /// silently ignored.
+    /// Two implemented backends: `"systemd-boot"` (UEFI targets — UKI on
+    /// the ESP, issue #71) and `"piboot"` (Raspberry Pi firmware chain —
+    /// boot-assets + Pi-spelled kernel payload, issue #87, ADR-0025
+    /// amendment). Any other declared value fails declaration validation
+    /// instead of being accepted and silently ignored.
     pub type_: String,
     pub timeout: u32,
 }
@@ -472,15 +474,17 @@ fn get_opt_bootloader(table: &mlua::Table) -> miette::Result<Option<BootloaderCo
     {
         Value::Table(t) => {
             let type_: String = t.get("type").unwrap_or_else(|_| "systemd-boot".into());
-            // Issue #71: `populate_esp`/`install_uki` install systemd-boot
-            // regardless of the declared type, so accepting any other value
-            // here would silently lie. Fail closed at declaration validation
-            // until a real GRUB backend exists (ADR-0011 §2's deferred
-            // uc-seed profile).
-            if type_ != "systemd-boot" {
+            // Issues #71/#87: `populate_esp`/`install_uki` install
+            // systemd-boot, and the piboot backend stages the Pi firmware
+            // chain — two implemented backends total. Accepting any other
+            // value here would silently lie. Fail closed at declaration
+            // validation until a real GRUB backend exists (ADR-0011 §2's
+            // deferred uc-seed profile).
+            if type_ != "systemd-boot" && type_ != BOOTLOADER_PIBOOT {
                 return Err(miette::miette!(
                     "image(): bootloader.type = \"{type_}\" is not implemented — only \
-                     \"systemd-boot\" is supported (issue #71: the GRUB backend does not \
+                     \"systemd-boot\" and \"piboot\" (Raspberry Pi firmware chain, \
+                     issue #87) are supported (issue #71: the GRUB backend does not \
                      exist yet, so the declaration would silently install systemd-boot)"
                 ));
             }
@@ -857,6 +861,14 @@ pub(crate) fn build_disk_image_with(
         .as_ref()
         .ok_or_else(|| miette::miette!("disk() must declare partitions for disk image"))?;
 
+    // #87: the Pi (piboot) backend. Fail-closed preconditions run BEFORE any
+    // destructive step, and the flag steers the whole pipeline away from the
+    // UKI/verity machinery the Pi firmware cannot consume.
+    let is_pi = is_piboot_boot(image);
+    if is_pi {
+        assert_piboot_preconditions(image, disk_layout)?;
+    }
+
     let output_filename = if arch == "all" {
         format!("{}_{}.img", image.name, image.version)
     } else {
@@ -1037,7 +1049,11 @@ pub(crate) fn build_disk_image_with(
     // half-written. The kernel config audit is warn-only: dm-verity needs
     // CONFIG_DM_VERITY=y, but a config-less payload is common and the
     // kernel decides at boot, so the audit never fails the build.
-    let verity = image.kernel.is_some();
+    //
+    // #87: piboot images run NEITHER — the Pi backend boots without a UKI
+    // and without verity (named scope, ADR-0025 amendment); its own
+    // fail-closed contract is the built-in boot-chain audit below.
+    let verity = image.kernel.is_some() && !is_pi;
     if verity {
         preflight_disk_tools_with(
             find_ukify().as_deref(),
@@ -1071,6 +1087,17 @@ pub(crate) fn build_disk_image_with(
                 &payload.initrd,
             );
             audit_initrd_modules(runner, config_dir, payload)?;
+        }
+    } else if is_pi && image.kernel.is_some() {
+        // #87: the piboot boot contract — the kernel must carry its boot
+        // chain BUILT IN (no initramfs runs before the root mount). Same
+        // fail-closed placement as the ADR-0024 §1 gate above: before any
+        // destructive step.
+        if let Some(payload) = kernel_payload.as_ref() {
+            let config_dir = kernel_snap_dir
+                .as_ref()
+                .map(|d| d.path().join("kernel-snap"));
+            audit_piboot_kernel(config_dir.as_deref(), &payload.version)?;
         }
     }
 
@@ -1157,7 +1184,7 @@ pub(crate) fn build_disk_image_with(
     // dm-verity formats the file (the data device must be final before
     // hashing; a cmdline is immutable once the UKI is later signed), then
     // the UKI embeds the captured roothash in its cmdline.
-    let (uki, uki_stage, populated_roots) = if verity {
+    let (uki, uki_stage, populated_roots, pi_boot_stage) = if verity {
         // 9a. Rootfs-level manifest only: boot facts (cmdline, roothash) are
         // unknowable until after verity format, and a post-format write
         // would break the Merkle tree. The root partition therefore carries
@@ -1179,27 +1206,7 @@ pub(crate) fn build_disk_image_with(
         let root_idx = slots.roots[0];
         refuse_non_ext4_vfat(&effective_layout.partitions[root_idx])?;
         let part_label = format!("{}_{}_{}", image.name, image.version, slot_suffix(0));
-        // Unprivileged populate prerequisite: snap packaging ships sentinel
-        // dirs with no-owner-read modes (snapd's `var/lib/snapd/void` is
-        // 111 --x--x--x), which `mkfs.ext4 -d` cannot scan without root.
-        // Normalize to owner-accessible (u+rwX) before any `-d` populate;
-        // the adjusted modes are what the filesystem — and the verity hash
-        // over it — will carry.
-        let root_arg = root.to_string_lossy().into_owned();
-        let status = runner
-            .run(&[
-                "chmod".to_string(),
-                "-R".to_string(),
-                "u+rwX".to_string(),
-                root_arg,
-            ])
-            .map_err(|e| miette::miette!("chmod not found: {e}"))?;
-        if status.code != 0 {
-            return Err(miette::miette!(
-                "chmod -R u+rwX failed on the staged rootfs — refusing to populate \
-                 from a tree mkfs cannot scan"
-            ));
-        }
+        normalize_populate_modes(runner, &root)?;
         let root_file = extent_file(scratch.path(), "root.img", &extents[root_idx])?;
         // Root populate failure fails closed (exit status carries it): an
         // empty verity data device would brick the boot — unlike the
@@ -1300,7 +1307,50 @@ pub(crate) fn build_disk_image_with(
             scratch.path(),
             Some(&verity_args),
         )?;
-        (uki, stage, slots.skip_indices())
+        (uki, stage, slots.skip_indices(), None)
+    } else if is_pi {
+        // #87: the piboot pipeline — plain ext4 root populated fail-closed
+        // (no verity hash device behind it), NO UKI (the Pi firmware boots
+        // kernel.img directly), and the firmware-visible boot tree staged
+        // onto the vfat partition in step 11.
+        let root_idx = slots.roots[0];
+        normalize_populate_modes(runner, &root)?;
+        let root_file = extent_file(scratch.path(), "root.img", &extents[root_idx])?;
+        // Root populate failure fails closed: an empty root partition is a
+        // brick the firmware cannot report usefully.
+        build_ext4_partition(
+            runner,
+            &root_file,
+            &root,
+            &effective_layout.partitions[root_idx],
+            &extents[root_idx],
+            false,
+        )?;
+        eprintln!(
+            "  ✓ {}: {} populated (piboot root — plain ext4, no verity)",
+            effective_layout.partitions[root_idx].name, effective_layout.partitions[root_idx].fs
+        );
+        splice_into(&img_path, &root_file, &extents[root_idx])?;
+        let root_partuuid = extents[root_idx].partuuid.clone().ok_or_else(|| {
+            miette::miette!(
+                "root slot PARTUUID unresolvable — cmdline.txt would carry the nil-GUID \
+                 placeholder and boot nothing; refusing to build (issue #87)"
+            )
+        })?;
+        let gadget_snap = gadget_snap_path(cache_dir, &snap_paths, image)?;
+        let payload = kernel_payload
+            .as_ref()
+            .expect("kernel declared ⇒ payload located");
+        let stage = stage_pi_boot_assets(PiBootStage {
+            runner,
+            scratch: scratch.path(),
+            gadget_snap: &gadget_snap,
+            payload,
+            params: &image.kernel.as_ref().expect("checked above").params,
+            root_partuuid: &root_partuuid,
+        })?;
+        eprintln!("  ✓ piboot: no UKI — the firmware loads kernel.img (issue #87)");
+        (None, PathBuf::new(), slots.skip_indices(), Some(stage))
     } else {
         // Kernel-free images boot without a UKI — no verity, no trailer.
         let (uki, stage) = assemble_uki(
@@ -1312,7 +1362,7 @@ pub(crate) fn build_disk_image_with(
             scratch.path(),
             None,
         )?;
-        (uki, stage, slots.skip_indices())
+        (uki, stage, slots.skip_indices(), None)
     };
 
     // 10. Write the authoritative manifest — threaded with the boot facts
@@ -1334,6 +1384,7 @@ pub(crate) fn build_disk_image_with(
         uki: uki.as_ref(),
         uki_stage: &uki_stage,
         uc: uc.as_ref(),
+        pi_boot_stage: pi_boot_stage.as_deref(),
     };
     populate_remaining_partitions(runner, &populate, &effective_layout, &populated_roots)?;
 
@@ -1350,6 +1401,57 @@ pub(crate) fn build_disk_image_with(
     }
 
     Ok(output_path)
+}
+
+/// Unprivileged populate prerequisite: snap packaging ships sentinel dirs
+/// with no-owner-read modes (snapd's `var/lib/snapd/void` is 111 --x--x--x),
+/// which `mkfs.ext4 -d` cannot scan without root. Normalize to
+/// owner-accessible (u+rwX) before any `-d` populate; the adjusted modes are
+/// what the filesystem — and the verity hash over it — will carry.
+fn normalize_populate_modes(runner: &dyn CommandRunner, root: &Path) -> miette::Result<()> {
+    let status = runner
+        .run(&[
+            "chmod".to_string(),
+            "-R".to_string(),
+            "u+rwX".to_string(),
+            root.to_string_lossy().into_owned(),
+        ])
+        .map_err(|e| miette::miette!("chmod not found: {e}"))?;
+    if status.code != 0 {
+        return Err(miette::miette!(
+            "chmod -R u+rwX failed on the staged rootfs — refusing to populate \
+             from a tree mkfs cannot scan"
+        ));
+    }
+    Ok(())
+}
+
+/// The verified gadget snap in the content-addressed cache — the source the
+/// piboot boot-assets are staged from.
+fn gadget_snap_path(
+    cache_dir: &Path,
+    snap_paths: &[(String, ResolvedSnap)],
+    image: &ImageDeclaration,
+) -> miette::Result<PathBuf> {
+    let declared = image.gadget.as_ref().ok_or_else(|| {
+        miette::miette!(
+            "the piboot backend needs a gadget snap — no gadget is declared (issue #87)"
+        )
+    })?;
+    let (_, snap) = snap_paths
+        .iter()
+        .find(|(name, _)| name == &declared.name)
+        .ok_or_else(|| {
+            miette::miette!(
+                "gadget snap '{}' declared but not staged — cannot stage the Pi \
+                 boot-assets from it (issue #87)",
+                declared.name
+            )
+        })?;
+    Ok(cache_dir.join(format!(
+        "{}_{}_{}.snap",
+        snap.name, snap.revision, snap.sha3_384
+    )))
 }
 
 /// Parse a size string like "512M" or "4G" or "0" to MB.
@@ -1576,6 +1678,7 @@ mod boot;
 mod initramfs;
 mod mounts;
 mod partition;
+mod piboot;
 pub(crate) mod staging;
 mod state;
 mod verity;
@@ -1584,6 +1687,7 @@ pub(crate) use boot::*;
 pub(crate) use initramfs::*;
 pub(crate) use mounts::*;
 pub(crate) use partition::*;
+pub(crate) use piboot::*;
 pub(crate) use staging::*;
 pub(crate) use state::*;
 pub(crate) use verity::*;
@@ -1874,6 +1978,37 @@ mod tests {
         let bl = decl.bootloader.as_ref().unwrap();
         assert_eq!(bl.type_, "systemd-boot");
         assert_eq!(bl.timeout, 5);
+    }
+
+    /// Issue #87: `bootloader.type = "piboot"` is the second implemented
+    /// backend — the Raspberry Pi firmware chain. It must parse through the
+    /// DSL into [`BootloaderConfig`].
+    #[test]
+    fn test_image_accepts_piboot_bootloader() {
+        let lua = lua_env();
+        let value: Value = lua
+            .load(
+                r#"
+                return image {
+                    name = "pi",
+                    version = "1.0",
+                    base = pin("core22"),
+                    bootloader = { type = "piboot", timeout = 1 },
+                }
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        let table = match value {
+            Value::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+
+        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let bl = decl.bootloader.as_ref().unwrap();
+        assert_eq!(bl.type_, "piboot");
+        assert_eq!(bl.timeout, 1);
     }
 
     /// Issue #71: `bootloader.type = "grub"` used to parse (and be silently
@@ -2202,6 +2337,7 @@ mod tests {
             uki: None,
             uki_stage: Path::new("/stage"),
             uc: Some(&uc),
+            pi_boot_stage: None,
         };
         assert_eq!(
             ctx.uc_route_stage(&part_named("seedpool")),
@@ -2223,6 +2359,7 @@ mod tests {
             uki: None,
             uki_stage: Path::new("/stage"),
             uc: None,
+            pi_boot_stage: None,
         };
         assert_eq!(empty.uc_route_stage(&seed), None);
     }
@@ -3042,7 +3179,7 @@ WantedBy=multi-user.target
     }
 
     #[test]
-    fn kernel_payload_pi_shape_is_named_not_searched() {
+    fn kernel_payload_pi_shape_locates_the_pi_payload() {
         let root = tempfile::tempdir().unwrap();
         let kdir = tempfile::tempdir().unwrap();
         let version = "5.15.0-1103-raspi";
@@ -3051,22 +3188,34 @@ WantedBy=multi-user.target
         std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
         pi_kernel_snap_fixture(kdir.path(), version);
 
-        let err = locate_kernel_payload(&ImageTools, None, kdir.path(), kdir.path(), root.path())
-            .unwrap_err();
+        let payload =
+            locate_kernel_payload(&ImageTools, None, kdir.path(), kdir.path(), root.path())
+                .expect("the Pi shape is located as a first-class payload (#87)");
+        assert!(payload.pi_raw, "the Pi shape carries the pi_raw flag");
+        assert_eq!(payload.kernel, kdir.path().join("kernel.img"));
+        assert_eq!(payload.initrd, kdir.path().join("initrd.img"));
+        assert_eq!(payload.version, version);
+        assert!(
+            !payload.prebuilt_uki,
+            "no UKI machinery ever touches this payload"
+        );
+    }
+
+    #[test]
+    fn pi_payload_and_systemd_boot_are_a_named_refusal() {
+        // The pairing gate (#87): the Pi payload is only consumable by the
+        // piboot backend — a systemd-boot build must refuse it by NAME,
+        // never stage a boot chain the firmware cannot run.
+        let image = crate::image::test_support::sample_image();
+        let err = piboot::assert_payload_bootloader_pairing(&image, true, "pi-kernel").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Raspberry Pi kernel shape")
-                && msg.contains("kernel.img")
-                && msg.contains("initrd.img"),
-            "the recognized Pi shape must be named, not reported as absent: {msg}"
+            msg.contains("Raspberry Pi kernel shape") && msg.contains("piboot"),
+            "the refusal must name the shape and the piboot fix: {msg}"
         );
         assert!(
-            msg.contains("gzip") && msg.contains("ukify"),
-            "the refusal must say why the boot chain cannot consume it: {msg}"
-        );
-        assert!(
-            !msg.contains("payload has no kernel image"),
-            "the generic not-found message would be a lie here: {msg}"
+            msg.contains("#87"),
+            "the refusal must point at the implementing issue: {msg}"
         );
     }
 
@@ -6313,6 +6462,7 @@ RequiredBy=boot-complete.target
                 uki: None,
                 uki_stage: Path::new(""),
                 uc: None,
+                pi_boot_stage: None,
             };
             // Empty skip list: the root partition (index 1) is populated too.
             // A `roots: vec![1]` skip list would silently bypass the
