@@ -2350,21 +2350,7 @@ fn pin_update_line(u: &shuttle::pkg_source::InputPinUpdate) -> String {
 
 /// `shuttle lock`: resolve/refresh all input pins without building.
 fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
-    let inputs = if Path::new(&file).exists() {
-        match shuttle::lua::evaluate_file_with_inputs(&file) {
-            Ok(eval) if !eval.global_inputs.is_empty() => eval.global_inputs,
-            Ok(_) => {
-                shuttle::output::info(format!("no inputs declared in '{file}', using default"));
-                default_input_map()
-            }
-            Err(e) => {
-                return Err(miette::miette!("failed to read inputs from '{file}': {e}"));
-            }
-        }
-    } else {
-        shuttle::output::info(format!("no config at '{file}', using default input"));
-        default_input_map()
-    };
+    let inputs = resolve_lock_inputs(&file)?;
 
     let lock_path = Path::new(&lockfile_path);
     let mut lockfile = LockFile::load(lock_path)?.unwrap_or_else(|| LockFile {
@@ -2380,7 +2366,40 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
     // before any is applied: a failed refresh never half-updates the lock.
     let updates = shuttle::pkg_source::update_input_pins(&inputs, &[], &mut lockfile)?;
 
-    for u in &updates {
+    report_lock_status(&updates, &lockfile);
+
+    lockfile.save(lock_path)?;
+
+    report_lock_output(&lockfile, &lockfile_path, updates.len())?;
+    Ok(())
+}
+
+/// The inputs a `shuttle lock` run refreshes: the definition's global
+/// inputs when the config exists and declares any, the default input
+/// otherwise.
+fn resolve_lock_inputs(file: &str) -> miette::Result<HashMap<String, PackageInput>> {
+    let inputs = if Path::new(file).exists() {
+        match shuttle::lua::evaluate_file_with_inputs(file) {
+            Ok(eval) if !eval.global_inputs.is_empty() => eval.global_inputs,
+            Ok(_) => {
+                shuttle::output::info(format!("no inputs declared in '{file}', using default"));
+                default_input_map()
+            }
+            Err(e) => {
+                return Err(miette::miette!("failed to read inputs from '{file}': {e}"));
+            }
+        }
+    } else {
+        shuttle::output::info(format!("no config at '{file}', using default input"));
+        default_input_map()
+    };
+    Ok(inputs)
+}
+
+/// Status lines for a lock run: each refreshed pin (old→new), then every
+/// pin currently recorded in the lockfile.
+fn report_lock_status(updates: &[shuttle::pkg_source::InputPinUpdate], lockfile: &LockFile) {
+    for u in updates {
         shuttle::output::status(pin_update_line(u));
     }
     for (name, entry) in &lockfile.inputs {
@@ -2390,9 +2409,15 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
             shuttle::output::status(format!("{name}: pinned to {}", rev.get(..7).unwrap_or(rev)));
         }
     }
+}
 
-    lockfile.save(lock_path)?;
-
+/// JSON/human output tail for `shuttle lock` (the lockfile is already
+/// saved by the time this runs).
+fn report_lock_output(
+    lockfile: &LockFile,
+    lockfile_path: &str,
+    updated: usize,
+) -> miette::Result<()> {
     if shuttle::output::is_json() {
         let mut pins: Vec<shuttle::output::LockPinJson> = lockfile
             .inputs
@@ -2407,18 +2432,15 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
         pins.sort_by(|a, b| a.name.cmp(&b.name));
         let out = shuttle::output::LockOutputJson {
             command: "lock".to_string(),
-            lockfile: lockfile_path.clone(),
-            updated: updates.len(),
+            lockfile: lockfile_path.to_string(),
+            updated,
             pins,
         };
         let json = serde_json::to_string_pretty(&out)
             .map_err(|e| miette::miette!("failed to serialize lock output: {e}"))?;
         println!("{json}");
     } else {
-        shuttle::output::ok(format!(
-            "{} input(s) locked -> {lockfile_path}",
-            updates.len()
-        ));
+        shuttle::output::ok(format!("{} input(s) locked -> {lockfile_path}", updated));
     }
     Ok(())
 }
@@ -2456,32 +2478,13 @@ fn cmd_eval(
     // subprocess worker.
     let eval = shuttle::lua::evaluate_file_with_inputs(&file)?;
 
-    // Materialize declared package inputs through their Phase 16 pins.
-    // Online: record missing pins first (record-once, like build). Offline:
-    // uncached/pinned inputs fail with the named "--offline prevents
-    // fetching" error. The lockfile is only saved after materialization
-    // succeeds, so a failed eval records nothing.
-    let mut pins_recorded = false;
-    if !eval.global_inputs.is_empty() {
-        if !offline {
-            let n = shuttle::pkg_source::ensure_input_pins(&eval.global_inputs, &mut lockfile)?;
-            pins_recorded |= n > 0;
-        }
-        shuttle::pkg_source::init_global_inputs_with(
-            &eval.global_inputs,
-            &lockfile.inputs,
-            offline,
-        )?;
-        if pins_recorded {
-            lockfile.save(lock_path)?;
-        }
-    }
+    materialize_eval_input_pins(&eval.global_inputs, &mut lockfile, lock_path, offline)?;
 
     // Image declarations (a second bounded eval of the same file, sharing
     // the worker output table with the snap outputs).
     let images = resolve_images(&file)?;
 
-    let manifest = shuttle::manifest::build_manifest(
+    let mut manifest = shuttle::manifest::build_manifest(
         &eval.outputs,
         &images,
         &eval.global_inputs,
@@ -2491,20 +2494,56 @@ fn cmd_eval(
         output_name.as_deref(),
     )?;
 
-    // ADR-0011 step (d) + issue #56: opt-in manifest signing. A key at
-    // ~/.config/shuttle/secret-key attests the canonical bytes (signatures
-    // map excluded) and carries the SLSA-lite provenance under the
-    // signature — builder, invocation, materials, subject digest. An
-    // absent key keeps `signatures` {} with a note — eval never fails on
-    // signing and never generates keys (that is the image build's
-    // deliberate engagement; mandated signing is step (e)).
-    let mut manifest = manifest;
+    sign_eval_manifest(&mut manifest, &arch, &channel, offline);
+
+    emit_eval_output(&manifest, output.as_deref())?;
+    Ok(())
+}
+
+/// Materialize declared package inputs through their Phase 16 pins.
+/// Online: record missing pins first (record-once, like build). Offline:
+/// uncached/pinned inputs fail with the named "--offline prevents
+/// fetching" error. The lockfile is only saved after materialization
+/// succeeds, so a failed eval records nothing.
+fn materialize_eval_input_pins(
+    global_inputs: &HashMap<String, PackageInput>,
+    lockfile: &mut LockFile,
+    lock_path: &Path,
+    offline: bool,
+) -> miette::Result<()> {
+    if global_inputs.is_empty() {
+        return Ok(());
+    }
+    let mut pins_recorded = false;
+    if !offline {
+        let n = shuttle::pkg_source::ensure_input_pins(global_inputs, lockfile)?;
+        pins_recorded |= n > 0;
+    }
+    shuttle::pkg_source::init_global_inputs_with(global_inputs, &lockfile.inputs, offline)?;
+    if pins_recorded {
+        lockfile.save(lock_path)?;
+    }
+    Ok(())
+}
+
+/// ADR-0011 step (d) + issue #56: opt-in manifest signing. A key at
+/// ~/.config/shuttle/secret-key attests the canonical bytes (signatures
+/// map excluded) and carries the SLSA-lite provenance under the
+/// signature — builder, invocation, materials, subject digest. An
+/// absent key keeps `signatures` {} with a note — eval never fails on
+/// signing and never generates keys (that is the image build's
+/// deliberate engagement; mandated signing is step (e)).
+fn sign_eval_manifest(
+    manifest: &mut shuttle::manifest::ImageManifest,
+    arch: &str,
+    channel: &str,
+    offline: bool,
+) {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     match shuttle::sign::load_secret_key(&home) {
         Ok(Some(kp)) => {
             let version = env!("CARGO_PKG_VERSION");
-            match shuttle::sign::attest_eval(&mut manifest, &kp, version, &arch, &channel, offline)
-            {
+            match shuttle::sign::attest_eval(manifest, &kp, version, arch, channel, offline) {
                 Ok(()) => eprintln!(
                     "  ✓ manifest signed with provenance (key id {}, builder {})",
                     kp.key_id(),
@@ -2522,9 +2561,16 @@ fn cmd_eval(
         }
         Err(e) => eprintln!("  ⚠ signing skipped: {e:#}"),
     }
+}
 
+/// Write the eval result: the manifest file plus a human confirmation
+/// line, or the JSON bytes on stdout when no `--output` was given.
+fn emit_eval_output(
+    manifest: &shuttle::manifest::ImageManifest,
+    output: Option<&str>,
+) -> miette::Result<()> {
     match output {
-        Some(ref out_path) => {
+        Some(out_path) => {
             manifest.write_atomic(Path::new(out_path))?;
             if !shuttle::output::is_json() {
                 shuttle::output::ok(format!(
