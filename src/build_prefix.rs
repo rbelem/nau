@@ -114,6 +114,13 @@ const INFO_DIR_FILE: &str = "usr/share/info/dir";
 /// as the build runs and bind [`MergedPrefix::path`] into the sandbox;
 /// dropping it removes the tree. An empty `payloads` list yields an empty
 /// prefix (callers usually skip materializing instead).
+///
+/// Wrapper-aware (issue #90): a payload built by the pod path carries the
+/// build-time launcher wrappers (issues #9/#10/#13) authored for the POD
+/// runtime layout. Those wrappers cannot resolve inside the prefix — see
+/// [`rewrite_prefix_wrappers`], which re-points them at the prefix layout
+/// after the merge and fails closed on one whose interpreter resolves to
+/// neither the payloads nor a declared `requires`.
 pub fn materialize_merged_prefix(payloads: &[Payload]) -> miette::Result<MergedPrefix> {
     let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
     let path = work.path().join("prefix");
@@ -130,6 +137,7 @@ pub fn materialize_merged_prefix(payloads: &[Payload]) -> miette::Result<MergedP
         unpack_snap(&payload.snap, &unpack_dir)?;
         merge_tree(&unpack_dir, &payload.pkg, &path, &mut owners)?;
     }
+    rewrite_prefix_wrappers(&path, payloads, &owners)?;
     Ok(MergedPrefix { work, path })
 }
 
@@ -158,8 +166,435 @@ fn unpack_snap(snap: &Path, dest: &Path) -> miette::Result<()> {
     Ok(())
 }
 
-/// Merge `src` (the unpacked payload of `pkg`) into `prefix`, tracking who
-/// contributed each relative path in `owners`.
+/// The pod-runtime extension-tree segment our build-time wrappers embed
+/// (`$PODROOT/active/extensions/<pkg>/usr/<payload-rel-path>`). Inside the
+/// merged prefix the payload root IS the prefix root, so the whole segment
+/// is dropped: the reference becomes `$PODROOT/<payload-rel-path>` — the
+/// `usr/usr` doubling untangled (issue #90).
+const EXTENSION_SEGMENT: &str = "active/extensions/";
+
+/// The `#!/bin/sh` launcher wrappers [`crate::snap::emit_build_wrappers`]
+/// authors derive their pod root from their own store-blob path with two
+/// dirname shapes; both fingerprints identify a wrapper of ours.
+const TREE_PODROOT_LINE: &str = "PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"";
+const LIB_PODROOT_LINE: &str = "PODROOT=\"$(dirname \"$(dirname \"$BLODIR\")\")\"";
+
+/// Rewrite pod-runtime launcher wrappers staged into the merged prefix so
+/// they resolve inside the prefix (issue #90).
+///
+/// The pod build path wraps toolchain payloads for the FARM: a wrapper execs
+/// `$PODROOT/active/extensions/<pkg>/usr/<rel>` (the extension tree nests the
+/// payload under a further `usr/`, hence the observed `usr/usr/bin/python3.real`
+/// doubling) or a pod content-store blob (`<podroot>/store/<aa>/<hash>`). The
+/// merged prefix has neither layout — the payload root merges at the prefix
+/// root and the `.real` sibling the wrapper preserved sits right beside it.
+/// Three deterministic rewrites, applied to files matching our wrapper
+/// fingerprints only (never to an upstream script):
+///
+/// 1. every `active/extensions/<pkg>/usr` segment is dropped, re-pointing
+///    the reference at the prefix root;
+/// 2. an `exec` argument that is an absolute pod-store blob path is replaced
+///    by an exec of the wrapper's `.real` sibling, resolved from the
+///    wrapper's own directory;
+/// 3. (verification, fail closed) every rewritten reference must resolve:
+///    the exec target and `LD_LIBRARY_PATH` dirs must exist in the prefix,
+///    and a bare-name interpreter must be provided by one of the merged
+///    payloads — i.e. the payload itself or a declared `requires`. A wrapper
+///    whose interpreter resolves to neither is a hard error naming the
+///    wrapper, not a silently broken artifact.
+fn rewrite_prefix_wrappers(
+    prefix: &Path,
+    payloads: &[Payload],
+    owners: &HashMap<String, String>,
+) -> miette::Result<()> {
+    rewrite_dir(prefix, prefix, "", payloads, owners)
+}
+
+fn rewrite_dir(
+    prefix: &Path,
+    dir: &Path,
+    rel: &str,
+    payloads: &[Payload],
+    owners: &HashMap<String, String>,
+) -> miette::Result<()> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| miette::miette!("reading prefix dir '{rel}': {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| miette::miette!("reading prefix dir '{rel}': {e}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        let ft = entry
+            .file_type()
+            .map_err(|e| miette::miette!("reading prefix entry '{child_rel}': {e}"))?;
+        if ft.is_dir() {
+            rewrite_dir(prefix, &entry.path(), &child_rel, payloads, owners)?;
+        } else if ft.is_file() {
+            rewrite_file(prefix, &child_rel, payloads, owners)?;
+        }
+    }
+    Ok(())
+}
+
+/// Which of our build-time wrapper shapes a staged file matches.
+#[derive(Debug, PartialEq)]
+enum WrapperShape {
+    /// Interpreter-script or native-ELF tree wrapper (issues #13/#10 B):
+    /// execs `$PODROOT/active/extensions/<pkg>/usr/<rel>`.
+    Tree,
+    /// Native-ELF runtime-lib wrapper (issue #10 B): execs a pod-store blob.
+    Lib,
+    /// Flat interpreter wrapper (issue #9): execs a bare interpreter name
+    /// plus a pod-store blob path.
+    Flat,
+}
+
+fn rewrite_file(
+    prefix: &Path,
+    rel: &str,
+    payloads: &[Payload],
+    owners: &HashMap<String, String>,
+) -> miette::Result<()> {
+    let path = prefix.join(rel);
+    let Some(text) = read_if_our_wrapper(&path) else {
+        return Ok(());
+    };
+    let Some(shape) = classify_wrapper(&text) else {
+        return Ok(());
+    };
+    // The PODROOT preamble derives the pod root from the wrapper's own path
+    // three dirnames up — exact for the farm's store/<aa>/<hash> blob and,
+    // in the prefix, exact for the usr/bin (or usr/sbin) command depth every
+    // app uses. Any other placement derives a wrong root: fail closed
+    // instead of rewriting into a silent lie.
+    if rel.split('/').count() != 3 || !rel.starts_with("usr/") {
+        return Err(unresolvable(
+            rel,
+            owners
+                .get(rel)
+                .map(String::as_str)
+                .unwrap_or("an earlier payload"),
+            "wrapper placement is not usr/<dir>/<name>; the prefix-root \
+             derivation does not hold there",
+        ));
+    }
+    let pkg = owners.get(rel).cloned().unwrap_or_default();
+
+    // 1. Drop the extension-tree segment wherever it appears (exec targets,
+    //    LD_LIBRARY_PATH entries, PKGROOT site-packages derivation).
+    let rewritten = strip_extension_segments(&text);
+
+    // 2. Replace absolute pod-store blob exec arguments with an exec of the
+    //    wrapper's preserved `.real` sibling.
+    let file_name = rel.rsplit('/').next().unwrap_or(rel);
+    let real = crate::snap::real_sibling_name(file_name);
+    let rewritten = rewrite_blob_execs(&rewritten, &real);
+
+    if rewritten != text {
+        std::fs::write(&path, &rewritten)
+            .map_err(|e| miette::miette!("rewriting wrapper '{rel}': {e}"))?;
+    }
+
+    // 3. Fail-closed resolution: every reference the wrapper makes must
+    //    resolve into the merged prefix (the payload set) here.
+    verify_resolution(prefix, rel, &pkg, shape, &rewritten, &real, payloads)
+}
+
+/// Read `path` as text if it starts with the `#!/bin/sh` magic our wrappers
+/// carry; `None` leaves ELFs, data, and upstream scripts untouched.
+fn read_if_our_wrapper(path: &Path) -> Option<String> {
+    let mut head = [0u8; 10];
+    let mut f = std::fs::File::open(path).ok()?;
+    use std::io::Read;
+    let n = f.read(&mut head).unwrap_or(0);
+    if &head[..n] != b"#!/bin/sh\n" {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// Match one of our wrapper fingerprints, else `None` (an upstream
+/// `#!/bin/sh` script — meson's launcher, say — is never ours to rewrite).
+fn classify_wrapper(text: &str) -> Option<WrapperShape> {
+    if text.contains(TREE_PODROOT_LINE) {
+        return Some(WrapperShape::Tree);
+    }
+    if text.contains(LIB_PODROOT_LINE) {
+        return Some(WrapperShape::Lib);
+    }
+    if is_flat_script_wrapper(text) {
+        return Some(WrapperShape::Flat);
+    }
+    None
+}
+
+/// Drop every `/active/extensions/<pkg>/usr` occurrence, re-joining the cut
+/// edges so `$PODROOT/active/extensions/<pkg>/usr/<rest>` becomes
+/// `$PODROOT/<rest>`. Malformed occurrences (no `/usr` right after the
+/// package segment) are left as-is — they are not our wrappers' shape.
+fn strip_extension_segments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find(EXTENSION_SEGMENT) {
+        let after = &rest[idx + EXTENSION_SEGMENT.len()..];
+        match extension_pkg_usr_len(after) {
+            Some(skip) => {
+                // Cut the segment together with its leading '/' (the one
+                // after `$PODROOT`); the `<pkg>/usr` cut leaves `<rest>`
+                // starting with its own '/', so the join carries exactly one
+                // separator: `$PODROOT` + `/usr/bin/...`.
+                let seg_start = if idx > 0 && rest.as_bytes()[idx - 1] == b'/' {
+                    idx - 1
+                } else {
+                    idx
+                };
+                out.push_str(&rest[..seg_start]);
+                rest = &after[skip..];
+            }
+            // Not our shape: copy the segment through and keep scanning.
+            None => {
+                out.push_str(&rest[..idx + EXTENSION_SEGMENT.len()]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Given the text right after `active/extensions/`, the number of bytes of
+/// the well-formed `<pkg>/usr` that follows, else `None`.
+fn extension_pkg_usr_len(after: &str) -> Option<usize> {
+    let slash = after.find('/')?;
+    if !after[slash..].starts_with("/usr") {
+        return None;
+    }
+    Some(slash + "/usr".len())
+}
+
+/// True for the two-line flat interpreter wrapper (`emit_script_wrapper`,
+/// issue #9): `#!/bin/sh` then `exec "<interpreter>" "<blob>" "$@"`.
+fn is_flat_script_wrapper(text: &str) -> bool {
+    let mut lines = text.lines();
+    if lines.next() != Some("#!/bin/sh") {
+        return false;
+    }
+    let Some(second) = lines.next() else {
+        return false;
+    };
+    let args = second.strip_prefix("exec ").unwrap_or(second);
+    matches!(quoted_tokens(args)[..], [_, blob, "$@"]
+        if blob.starts_with('/') && blob.contains("/store/"))
+}
+
+/// Split a leading sequence of quoted tokens (`"a" "b" ...`) into their
+/// contents; stops at the first gap that is not a single space.
+fn quoted_tokens(args: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut rest = args;
+    while let Some(after_open) = rest.strip_prefix('"') {
+        let Some(close) = after_open.find('"') else {
+            break;
+        };
+        tokens.push(&after_open[..close]);
+        match after_open[close + 1..].strip_prefix(' ') {
+            Some(tail) => rest = tail,
+            None => break,
+        }
+    }
+    tokens
+}
+
+/// Replace quoted exec arguments that are absolute pod-store blob paths with
+/// an exec of `real_sibling`, resolved from the wrapper's own directory
+/// (readlink resolves the farm symlink chain; dirname keeps the wrapper
+/// depth-agnostic inside the prefix).
+fn rewrite_blob_execs(text: &str, real_sibling: &str) -> String {
+    if !text.contains("/store/") {
+        return text.to_string();
+    }
+    let selfdir = "$(dirname \"$(readlink -f \"$0\")\")";
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        match line.strip_suffix('\n') {
+            Some(body) => {
+                out.push_str(&rewrite_exec_body(body, selfdir, real_sibling));
+                out.push('\n');
+            }
+            None => out.push_str(&rewrite_exec_body(line, selfdir, real_sibling)),
+        }
+    }
+    out
+}
+
+/// Rewrite one `exec` line (no terminator): quoted arguments that are
+/// store-blob paths become `<selfdir>/<real_sibling>`; everything else is
+/// copied verbatim.
+fn rewrite_exec_body(body: &str, selfdir: &str, real_sibling: &str) -> String {
+    let Some(args) = body.strip_prefix("exec ") else {
+        return body.to_string();
+    };
+    let mut out = String::from("exec ");
+    let mut rest = args;
+    while let Some(after_open) = rest.strip_prefix('"') {
+        let Some(close) = after_open.find('"') else {
+            break;
+        };
+        let token = &after_open[..close];
+        out.push('"');
+        if token.starts_with('/') && token.contains("/store/") {
+            out.push_str(selfdir);
+            out.push('/');
+            out.push_str(real_sibling);
+        } else {
+            out.push_str(token);
+        }
+        out.push('"');
+        match after_open[close + 1..].strip_prefix(' ') {
+            Some(tail) => {
+                out.push(' ');
+                rest = tail;
+            }
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+/// Fail-closed resolution check over the rewritten wrapper text (issue #90):
+/// every reference the wrapper makes must resolve into the merged prefix —
+/// `$PODROOT/...` exec targets and `LD_LIBRARY_PATH` dirs as prefix paths,
+/// the preserved `.real` sibling beside the wrapper, and a bare-name
+/// interpreter as a file one of the merged payloads (the payload itself or a
+/// declared `requires`) provides. A wrapper that cannot resolve here would
+/// be a silently broken artifact; it is a hard build error instead.
+fn verify_resolution(
+    prefix: &Path,
+    rel: &str,
+    pkg: &str,
+    shape: WrapperShape,
+    text: &str,
+    real_sibling: &str,
+    payloads: &[Payload],
+) -> miette::Result<()> {
+    let mut failures: BTreeSet<String> = BTreeSet::new();
+
+    // The `.real` sibling the wrapper family preserves must have survived
+    // the merge (Lib/Flat exec it directly; Tree execs it by extension path).
+    if matches!(shape, WrapperShape::Lib | WrapperShape::Flat) {
+        let sibling = prefix
+            .join(rel)
+            .parent()
+            .map(|d| d.join(real_sibling))
+            .unwrap_or_else(|| prefix.join(real_sibling));
+        if !sibling.exists() {
+            failures.insert(format!(
+                "preserved sibling '{real_sibling}' is missing from the prefix"
+            ));
+        }
+    }
+
+    for line in text.lines() {
+        check_exec_line(prefix, line, payloads, &mut failures);
+        check_podroot_refs(prefix, line, &mut failures);
+    }
+
+    let Some(first) = failures.iter().next() else {
+        return Ok(());
+    };
+    Err(unresolvable(rel, pkg, first))
+}
+
+/// One rewritten line's checks: on an `exec` line, the bare-name interpreter
+/// must be provided by the payload set (a `usr/bin/<name>` in the prefix).
+fn check_exec_line(
+    prefix: &Path,
+    line: &str,
+    payloads: &[Payload],
+    failures: &mut BTreeSet<String>,
+) {
+    let Some(args) = line.strip_prefix("exec ") else {
+        return;
+    };
+    let Some(first) = quoted_tokens(args).first().copied() else {
+        return;
+    };
+    if first.starts_with('$') || first.starts_with('/') || first == "$@" {
+        return; // $PODROOT target, selfdir sibling, or the args passthrough
+    }
+    let interp_rel = format!("usr/bin/{first}");
+    if !prefix.join(&interp_rel).exists() {
+        failures.insert(format!(
+            "interpreter '{first}' resolves to neither the merged payloads ({}) \
+             nor a declared requires — no '{interp_rel}' in the prefix",
+            payload_names(payloads),
+        ));
+    }
+}
+
+/// One rewritten line's checks: every `$PODROOT/<rest>` reference (exec
+/// targets, colon-separated LD_LIBRARY_PATH dirs) must exist in the prefix.
+/// Shell globs are skipped — they are expansion patterns, not paths.
+fn check_podroot_refs(prefix: &Path, line: &str, failures: &mut BTreeSet<String>) {
+    for part in quoted_tokens_after_prefix(line) {
+        for piece in part.split(':') {
+            let Some(rest) = piece.strip_prefix("$PODROOT/") else {
+                continue;
+            };
+            if rest.is_empty() || rest.contains('*') {
+                continue;
+            }
+            if !prefix.join(rest).exists() {
+                failures.insert(format!(
+                    "exec/library target '{rest}' is missing from the prefix"
+                ));
+            }
+        }
+    }
+}
+
+/// Payload names for the fail-closed message.
+fn payload_names(payloads: &[Payload]) -> String {
+    let mut names: Vec<&str> = payloads.iter().map(|p| p.pkg.as_str()).collect();
+    names.sort_unstable();
+    names.join(", ")
+}
+
+/// Collect every quoted token in `line` that references `$PODROOT/...`
+/// (exec targets, LD_LIBRARY_PATH entries), including colon-separated
+/// multi-dir values.
+fn quoted_tokens_after_prefix(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut rest = line;
+    while let Some((_, tail)) = rest.split_once('"') {
+        let Some(close) = tail.find('"') else {
+            break;
+        };
+        let token = &tail[..close];
+        if token.contains("$PODROOT/") {
+            tokens.push(token.to_string());
+        }
+        rest = &tail[close + 1..];
+    }
+    tokens
+}
+
+/// The issue #90 fail-closed error: a staged wrapper cannot be made to
+/// resolve inside the prefix, so shipping it would be silent breakage.
+fn unresolvable(rel: &str, pkg: &str, reason: &str) -> miette::Error {
+    miette::miette!(
+        "build prefix: refusing launcher wrapper '{rel}' (from payload '{pkg}'): \
+         {reason} — the wrapper must resolve to the payload set or a declared \
+         requires; shipping it broken is not an option (issue #90)"
+    )
+}
+
 fn merge_tree(
     src: &Path,
     pkg: &str,
@@ -595,5 +1030,344 @@ mod tests {
         assert!(libfoo.contains("libfoo.so.1"), "soname basename listed");
         assert!(libfoo.contains("libfoo.so"), "symlink basename listed");
         assert!(libfoo.contains("libfoo.h"), "header basename listed");
+    }
+
+    // ---- Wrapper-aware staging (issue #90) ----
+
+    /// The native-ELF tree wrapper `emit_elf_tree_wrapper` authors for the
+    /// python app: the exec target carries the pod extension layout —
+    /// `active/extensions/<pkg>/usr/` + the payload's own `usr/bin/...`
+    /// rel path, i.e. the `usr/usr/bin/python3.real` doubling that broke
+    /// every cold meson-family build. Staging must re-point it at the
+    /// prefix root, where the payload root merges.
+    fn elf_tree_wrapper_text(pkg: &str, real_rel: &str) -> String {
+        format!(
+            "#!/bin/sh\n\
+             SCRIPT=\"$(readlink -f \"$0\")\"\n\
+             PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+             PYTHONPATH=\"${{SHUTTLE_PYTHONPATH:-}}\"\n\
+             export PYTHONPATH\n\
+             exec \"$PODROOT/active/extensions/{pkg}/usr/{real_rel}\" \"$@\"\n"
+        )
+    }
+
+    #[test]
+    fn elf_tree_wrapper_usr_usr_doubling_is_repointed_at_the_prefix() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = elf_tree_wrapper_text("python", "usr/bin/python3.real");
+        let snap = make_snap(
+            &tmp.path().join("python"),
+            &[
+                ("usr/bin/python3", wrapper.as_str()),
+                ("usr/bin/python3.real", "ELF-bytes"),
+            ],
+            &[],
+        );
+        let merged = materialize_merged_prefix(&[Payload {
+            pkg: "python".into(),
+            snap,
+        }])
+        .expect("the doubled wrapper must stage");
+        let rewritten = std::fs::read_to_string(merged.path().join("usr/bin/python3")).unwrap();
+        assert!(
+            !rewritten.contains("active/extensions"),
+            "the extension-tree segment must be gone: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("exec \"$PODROOT/usr/bin/python3.real\" \"$@\"\n"),
+            "the exec target must resolve at the prefix root: {rewritten}"
+        );
+        assert!(
+            merged.path().join("usr/bin/python3.real").is_file(),
+            "the .real sibling must survive staging"
+        );
+    }
+
+    /// The script tree wrapper (`emit_script_tree_wrapper`, issue #13) also
+    /// derives site-packages dirs from the doubled layout — the PKGROOT
+    /// assignment must collapse to the prefix root as well.
+    #[test]
+    fn script_tree_wrapper_pkgroot_pythonpath_block_is_repointed() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = format!(
+            "#!/bin/sh\n\
+             SCRIPT=\"$(readlink -f \"$0\")\"\n\
+             PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+             \x20        PKGROOT=\"$PODROOT/active/extensions/cli/usr\"\n\
+             \x20        PYTHONPATH=\"\"\n\
+             \x20        for sp in \"$PKGROOT\"/usr/lib/python3.*/site-packages; do\n\
+             \x20         [ -d \"$sp\" ] && PYTHONPATH=\"${{PYTHONPATH:+$PYTHONPATH:$sp}}\"\n\
+             \x20        done\n\
+             \x20        export PYTHONPATH\n\
+             exec \"python3\" \"$PODROOT/active/extensions/cli/usr/usr/bin/cli.real\" \"$@\"\n"
+        );
+        let snap = make_snap(
+            &tmp.path().join("cli"),
+            &[
+                ("usr/bin/cli", wrapper.as_str()),
+                ("usr/bin/cli.real", "#!/usr/bin/env node\n"),
+            ],
+            &[],
+        );
+        let python = make_snap(
+            &tmp.path().join("python"),
+            &[("usr/bin/python3", "ELF")],
+            &[],
+        );
+        let merged = materialize_merged_prefix(&[
+            Payload {
+                pkg: "cli".into(),
+                snap,
+            },
+            Payload {
+                pkg: "python".into(),
+                snap: python,
+            },
+        ])
+        .expect("the wrapper must stage against a requires-provided interpreter");
+        let rewritten = std::fs::read_to_string(merged.path().join("usr/bin/cli")).unwrap();
+        assert!(
+            rewritten.contains("PKGROOT=\"$PODROOT\""),
+            "PKGROOT must collapse to the prefix root: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("exec \"python3\" \"$PODROOT/usr/bin/cli.real\" \"$@\"\n"),
+            "exec must point at the prefix-rooted sibling with the bare \
+             interpreter: {rewritten}"
+        );
+    }
+
+    /// The native-ELF lib wrapper (`emit_elf_lib_wrapper`, issue #10 B)
+    /// execs an absolute pod-store blob path — meaningless in the prefix.
+    /// The rewrite execs the preserved `.real` sibling from the wrapper's
+    /// own directory; the LD_LIBRARY_PATH entries re-point at the prefix.
+    #[test]
+    fn elf_lib_wrapper_store_blob_exec_rewrites_to_the_real_sibling() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = "#!/bin/sh\n\
+             SCRIPT=\"$(readlink -f \"$0\")\"\n\
+             BLODIR=\"$(dirname \"$SCRIPT\")\"\n\
+             PODROOT=\"$(dirname \"$(dirname \"$BLODIR\")\")\"\n\
+             export LD_LIBRARY_PATH=\"$PODROOT/active/extensions/jq/usr/usr/lib\"\n\
+             exec \"/home/u/pods/daily/store/aa/deadbeef\" \"$@\"\n";
+        let snap = make_snap(
+            &tmp.path().join("jq"),
+            &[
+                ("usr/bin/jq", wrapper),
+                ("usr/bin/jq.real", "ELF-bytes"),
+                ("usr/lib/libjq.so.1", "ELF-lib"),
+            ],
+            &[],
+        );
+        let merged = materialize_merged_prefix(&[Payload {
+            pkg: "jq".into(),
+            snap,
+        }])
+        .expect("the lib wrapper must stage");
+        let rewritten = std::fs::read_to_string(merged.path().join("usr/bin/jq")).unwrap();
+        assert!(
+            rewritten.contains("exec \"$(dirname \"$(readlink -f \"$0\")\")/jq.real\" \"$@\"\n"),
+            "the store-blob exec must become a sibling exec: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("LD_LIBRARY_PATH=\"$PODROOT/usr/lib\""),
+            "LD entries must re-point at the prefix root: {rewritten}"
+        );
+    }
+
+    /// The perl module-tree wrapper (the issue #90 PERL5LIB shape) sweeps
+    /// every payload's extension tree with a `*` package glob; staging must
+    /// re-point the whole sweep at the prefix root.
+    #[test]
+    fn perl_module_tree_wrapper_sweep_is_repointed_at_the_prefix() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = "#!/bin/sh\n\
+             SCRIPT=\"$(readlink -f \"$0\")\"\n\
+             PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+             \x20        PERL5LIB=\"\"\n\
+             \x20        for d in \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/ \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/*/ \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/*/*/; do\n\
+             \x20         [ -d \"$d\" ] && PERL5LIB=\"${{PERL5LIB:+$PERL5LIB:}}$d\"\n\
+             \x20        done\n\
+             \x20        export PERL5LIB\n\
+             exec \"perl\" \"$PODROOT/active/extensions/perltidy/usr/usr/bin/perltidy.real\" \"$@\"\n";
+        let app = make_snap(
+            &tmp.path().join("perltidy"),
+            &[
+                ("usr/bin/perltidy", wrapper),
+                ("usr/bin/perltidy.real", "#!/usr/bin/perl\n"),
+            ],
+            &[],
+        );
+        let perl = make_snap(&tmp.path().join("perl"), &[("usr/bin/perl", "ELF")], &[]);
+        let merged = materialize_merged_prefix(&[
+            Payload {
+                pkg: "perltidy".into(),
+                snap: app,
+            },
+            Payload {
+                pkg: "perl".into(),
+                snap: perl,
+            },
+        ])
+        .expect("the perl tree wrapper must stage");
+        let rewritten = std::fs::read_to_string(merged.path().join("usr/bin/perltidy")).unwrap();
+        assert!(
+            rewritten.contains("\"$PODROOT\"/usr/lib/perl5/*/"),
+            "the closure-wide sweep must re-point at the prefix root: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("active/extensions"),
+            "no extension segment may survive: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("exec \"perl\" \"$PODROOT/usr/bin/perltidy.real\" \"$@\"\n"),
+            "exec must point at the prefix-rooted sibling: {rewritten}"
+        );
+    }
+
+    /// The flat interpreter wrapper (`emit_script_wrapper`, issue #9): the
+    /// bare interpreter resolves through the prefix PATH (a declared
+    /// requires provides it), the blob path becomes the `.real` sibling.
+    #[test]
+    fn flat_script_wrapper_rewrites_and_resolves_the_interpreter() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = "#!/bin/sh\nexec \"perl\" \"/home/u/pods/daily/store/aa/cafe\" \"$@\"\n";
+        let app = make_snap(
+            &tmp.path().join("tool"),
+            &[("usr/bin/tool", wrapper), ("usr/bin/tool.real", "script")],
+            &[],
+        );
+        let perl = make_snap(&tmp.path().join("perl"), &[("usr/bin/perl", "ELF")], &[]);
+        let merged = materialize_merged_prefix(&[
+            Payload {
+                pkg: "tool".into(),
+                snap: app,
+            },
+            Payload {
+                pkg: "perl".into(),
+                snap: perl,
+            },
+        ])
+        .expect("a requires-provided interpreter resolves");
+        let rewritten = std::fs::read_to_string(merged.path().join("usr/bin/tool")).unwrap();
+        assert!(
+            rewritten.contains(
+                "exec \"perl\" \"$(dirname \"$(readlink -f \"$0\")\")/tool.real\" \"$@\"\n"
+            ),
+            "blob path must become the sibling, interpreter kept: {rewritten}"
+        );
+    }
+
+    /// Fail closed: a flat wrapper whose bare interpreter resolves to
+    /// neither the payload set nor a declared requires is a hard error.
+    #[test]
+    fn flat_wrapper_with_unresolvable_interpreter_fails_closed() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = "#!/bin/sh\nexec \"nosuchlang\" \"/p/store/aa/cafe\" \"$@\"\n";
+        let app = make_snap(
+            &tmp.path().join("tool"),
+            &[("usr/bin/tool", wrapper), ("usr/bin/tool.real", "script")],
+            &[],
+        );
+        let err = materialize_merged_prefix(&[Payload {
+            pkg: "tool".into(),
+            snap: app,
+        }])
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nosuchlang"), "names the interpreter: {msg}");
+        assert!(
+            msg.contains("neither the merged payloads"),
+            "states the fail-closed condition: {msg}"
+        );
+        assert!(msg.contains("usr/bin/tool"), "names the wrapper: {msg}");
+    }
+
+    /// Fail closed: a tree wrapper whose doubled exec target has no
+    /// counterpart in the merged prefix (the `.real` never staged).
+    #[test]
+    fn tree_wrapper_with_missing_exec_target_fails_closed() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = elf_tree_wrapper_text("python", "usr/bin/python3.real");
+        let snap = make_snap(
+            &tmp.path().join("python"),
+            // No python3.real: the wrapper's target cannot resolve.
+            &[("usr/bin/python3", wrapper.as_str())],
+            &[],
+        );
+        let err = materialize_merged_prefix(&[Payload {
+            pkg: "python".into(),
+            snap,
+        }])
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("usr/bin/python3.real"),
+            "names the unresolvable target: {msg}"
+        );
+        assert!(msg.contains("python"), "names the owning payload: {msg}");
+    }
+
+    /// Upstream scripts staged by a payload (meson's launcher, a shebang
+    /// script like perltidy's) are never ours to rewrite: they stage
+    /// byte-identical.
+    #[test]
+    fn upstream_scripts_stage_byte_identical() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let meson_launcher = "#!/bin/sh\nexec python3 -m mesonbuild.mesonmain \"$@\"\n";
+        let perltidy_like = "#!/usr/bin/perl\nprint \"perltidy\\n\";\n";
+        let snap = make_snap(
+            &tmp.path().join("meson"),
+            &[
+                ("usr/bin/meson", meson_launcher),
+                ("usr/bin/perltidy", perltidy_like),
+            ],
+            &[],
+        );
+        let merged = materialize_merged_prefix(&[Payload {
+            pkg: "meson".into(),
+            snap,
+        }])
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(merged.path().join("usr/bin/meson")).unwrap(),
+            meson_launcher
+        );
+        assert_eq!(
+            std::fs::read_to_string(merged.path().join("usr/bin/perltidy")).unwrap(),
+            perltidy_like
+        );
     }
 }

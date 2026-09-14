@@ -1973,9 +1973,10 @@ fn emit_build_wrappers(
     meta: &SnapMeta,
     stage_dir: &Path,
     pod_store: &crate::runtime::RuntimeStore,
+    listings: Option<&crate::leak_scan::PayloadListings>,
 ) -> miette::Result<()> {
     for (app_name, app) in &meta.apps {
-        wrap_app(app_name, app, meta, stage_dir, pod_store)?;
+        wrap_app(app_name, app, meta, stage_dir, pod_store, listings)?;
     }
     Ok(())
 }
@@ -1987,6 +1988,7 @@ fn wrap_app(
     meta: &SnapMeta,
     stage_dir: &Path,
     pod_store: &crate::runtime::RuntimeStore,
+    listings: Option<&crate::leak_scan::PayloadListings>,
 ) -> miette::Result<()> {
     if app.interpreter.as_deref() == Some("") {
         return Err(miette::miette!(
@@ -2039,7 +2041,18 @@ fn wrap_app(
     } else {
         // Issue #9: interpreter-script wrapper.
         let Some(interpreter) = &app.interpreter else {
-            return Ok(());
+            // Issue #90: no declared interpreter — the shebang is the
+            // interpreter. Resolve it against the payload set; unresolvable
+            // shebangs fail closed there.
+            return wrap_shebang_script(
+                app_name,
+                &entry,
+                meta,
+                stage_dir,
+                pod_store,
+                Path::new(&cmd_path),
+                listings,
+            );
         };
         if meta.deps.is_some() {
             // ADR-0017 (issue #13): with a dependency closure the app
@@ -2053,6 +2066,134 @@ fn wrap_app(
             emit_script_wrapper(app_name, &entry, interpreter, pod_store)
         }
     }
+}
+
+/// The interpreter a script's shebang names, when it is one our wrapper
+/// family must handle: an absolute path (the pod's closure root, e.g.
+/// `/usr/bin/perl`) that is neither a host-guaranteed interpreter (`/bin/sh`,
+/// `/usr/bin/env`) nor a PATH-resolved form (`env <name>`, bare name) —
+/// those resolve from the farm today and are left untouched.
+fn rewriteable_shebang(entry: &Path) -> miette::Result<Option<String>> {
+    let Ok(mut f) = std::fs::File::open(entry) else {
+        return Ok(None);
+    };
+    use std::io::Read;
+    let mut head = [0u8; 128];
+    let n = f.read(&mut head).unwrap_or(0);
+    let Ok(text) = std::str::from_utf8(&head[..n]) else {
+        return Ok(None);
+    };
+    let Some(first) = text.lines().next() else {
+        return Ok(None);
+    };
+    let Some(rest) = first.strip_prefix("#!") else {
+        return Ok(None);
+    };
+    let interp = rest.split_whitespace().next().unwrap_or("");
+    match interp {
+        "" | "/bin/sh" | "/usr/bin/env" => return Ok(None),
+        other if !other.starts_with('/') => return Ok(None),
+        other if other.ends_with("/env") => return Ok(None),
+        _ => {}
+    }
+    Ok(Some(interp.to_string()))
+}
+
+/// Issue #90: a script command with no declared `interpreter` still names an
+/// interpreter — its shebang. Perltidy's `#!/usr/bin/perl` is the shape:
+/// authored against the pod's root-mounted closure (`/usr/bin/perl` inside
+/// the sandbox), it cannot resolve when the farm symlinks straight at the
+/// store blob on a host without that path. When the shebang's interpreter
+/// resolves into the payload set — the payload itself or a declared
+/// `requires` — author the #9 wrapper so the farm execs the pod interpreter
+/// by bare name. An interpreter resolving only into build-only payloads, or
+/// nowhere, fails closed: a silently broken wrapper is what ships otherwise.
+#[allow(clippy::too_many_arguments)]
+fn wrap_shebang_script(
+    app_name: &str,
+    entry: &Path,
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    pod_store: &crate::runtime::RuntimeStore,
+    cmd_rel: &Path,
+    listings: Option<&crate::leak_scan::PayloadListings>,
+) -> miette::Result<()> {
+    let Some(interp) = rewriteable_shebang(entry)? else {
+        return Ok(());
+    };
+    let Some(listings) = listings else {
+        // No resolution data (direct calls in tests, non-scanned paths):
+        // keep the historical behavior — no wrapper, no error.
+        return Ok(());
+    };
+    let name = interp.rsplit('/').next().unwrap_or(&interp);
+    // The payload itself provides the interpreter at the mirrored prefix
+    // path (`/usr/bin/<name>` staged in this payload).
+    if stage_dir.join("usr/bin").join(name).is_file() {
+        return emit_wrapped_script(app_name, entry, meta, stage_dir, pod_store, name, cmd_rel);
+    }
+    // A declared `requires` (runtime-closure payload) provides it.
+    let runtime_provides = listings
+        .runtime
+        .iter()
+        .any(|pkg| listings.payloads.get(pkg).is_some_and(|f| f.contains(name)));
+    if runtime_provides {
+        return emit_wrapped_script(app_name, entry, meta, stage_dir, pod_store, name, cmd_rel);
+    }
+    let build_only_provides = listings
+        .payloads
+        .iter()
+        .filter(|(pkg, _)| !listings.runtime.contains(*pkg))
+        .find(|(_, files)| files.contains(name))
+        .map(|(pkg, _)| pkg.clone());
+    if let Some(pkg) = build_only_provides {
+        return Err(miette::miette!(
+            "app '{app_name}': command script's interpreter '{interp}' resolves \
+             only into build-only payload '{pkg}' — at runtime neither the \
+             payload nor a declared requires provides it, so the wrapper \
+             would be broken the moment it shipped (issue #90)"
+        ));
+    }
+    Err(miette::miette!(
+        "app '{app_name}': command script's interpreter '{interp}' resolves to \
+         neither the payload nor a declared requires — no merged payload \
+         provides '{name}'; refusing to ship a silently broken wrapper \
+         (issue #90)"
+    ))
+}
+
+/// Author the wrapper for a shebang-resolved interpreter: same routing as a
+/// declared `interpreter` (issue #13 tree shape when a dependency closure or
+/// an own-payload module tree needs adjacency, flat #9 blob otherwise).
+fn emit_wrapped_script(
+    app_name: &str,
+    entry: &Path,
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    pod_store: &crate::runtime::RuntimeStore,
+    name: &str,
+    cmd_rel: &Path,
+) -> miette::Result<()> {
+    if meta.deps.is_some() || stage_has_perl_lib(stage_dir) {
+        emit_script_tree_wrapper(
+            app_name,
+            entry,
+            name,
+            &meta.name,
+            &cmd_rel.to_string_lossy(),
+        )
+    } else {
+        emit_script_wrapper(app_name, entry, name, pod_store)
+    }
+}
+
+/// True when the payload stages a perl module tree (`usr/lib/perl5/`):
+/// a script riding such a payload resolves its modules through perl's @INC
+/// against the pod's root-mounted closure, so the farm wrapper must run it
+/// from the extension tree with PERL5LIB re-rooted (the perl analog of the
+/// #13 PYTHONPATH handoff).
+fn stage_has_perl_lib(stage_dir: &Path) -> bool {
+    stage_dir.join("usr/lib/perl5").is_dir()
 }
 
 /// The preserved-script sibling name. Inserts `.real` before the final
@@ -2183,6 +2324,25 @@ fn emit_script_tree_wrapper(
              done\n\
              export PYTHONPATH\n\
              export SHUTTLE_PYTHONPATH=\"$PYTHONPATH\"\n"
+        )
+    } else if interpreter.starts_with("perl") {
+        // Issue #90 (perltidy): a perl script resolves modules through
+        // @INC, which perl roots at /usr — the pod's root-mounted closure.
+        // From the farm there is no root mount, so PERL5LIB re-points @INC
+        // at the extension trees: every perl5 module dir one to three
+        // levels deep, across the whole pod closure (the core modules ship
+        // in the interpreter's own payload — 5.40.5/warnings.pm — while a
+        // script's modules ship in its own — site_perl/<ver>/...). The
+        // merged-prefix staging rewrite re-points the same segment at the
+        // prefix root for build time.
+        String::from(
+            "\n         PERL5LIB=\"\"\n\
+             for d in \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/ \
+             \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/*/ \
+             \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/*/*/; do\n\
+             \x20 [ -d \"$d\" ] && PERL5LIB=\"${PERL5LIB:+$PERL5LIB:}$d\"\n\
+             done\n\
+             export PERL5LIB\n",
         )
     } else {
         String::new()
@@ -2995,7 +3155,7 @@ pub fn build_snap(
     // path replaced by a single-`exec` wrapper referencing the script's
     // content-addressed store path. Only pod builds provide a store.
     if let Some(store) = pod_store {
-        emit_build_wrappers(meta, stage_dir, store)?;
+        emit_build_wrappers(meta, stage_dir, store, leak_scan)?;
     }
 
     // 1b'. Post-build leak scan (ADR-0018 Decision 3, issue #22): after the
@@ -9836,7 +9996,7 @@ mod wrapper_tests {
         );
         let meta = meta_with_app("zg", "bin/zg", Some("node"));
 
-        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
         // The command path is now the wrapper: a single exec of the
         // interpreter with the script's content-addressed store path.
@@ -9872,7 +10032,7 @@ mod wrapper_tests {
         );
         let meta = meta_with_app("zg", "lib/cli/index.js", Some("node"));
 
-        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
         // The preserved sibling keeps the extension (node's ESM loader
         // dispatches on it) — `index.real.js`, not `index.js.real`.
@@ -9908,7 +10068,7 @@ mod wrapper_tests {
         std::fs::write(stage.path().join("usr/lib/python3.12/os.py"), b"# stdlib\n").unwrap();
         let meta = meta_with_app("python3", "usr/bin/python3.12", None);
 
-        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
         // The command path became a wrapper that execs the ELF from the
         // generation's extension tree (stdlib discovery needs its tree,
@@ -9947,7 +10107,7 @@ mod wrapper_tests {
             go: None,
         });
 
-        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
         let wrapper = std::fs::read_to_string(script).unwrap();
         assert!(
@@ -9996,7 +10156,7 @@ mod wrapper_tests {
             go: None,
         });
 
-        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
         let wrapper = std::fs::read_to_string(script).unwrap();
         assert!(
@@ -10022,7 +10182,7 @@ mod wrapper_tests {
         let elf = stage_file(stage.path(), "bin/ztool", b"\x7fELF\x02\x01\x01rest");
         let meta = meta_with_app("ztool", "bin/ztool", Some("node"));
 
-        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
         // The command binary is untouched (still the ELF magic), and no
         // sibling `.real` script was created.
@@ -10037,13 +10197,218 @@ mod wrapper_tests {
         let script = stage_file(stage.path(), "bin/plain", b"#!/bin/sh\necho hi\n");
         let meta = meta_with_app("plain", "bin/plain", None);
 
-        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&script).unwrap(),
             "#!/bin/sh\necho hi\n"
         );
         assert!(!stage.path().join("bin/plain.real").exists());
+    }
+
+    // ── Issue #90: shebang-resolved interpreter wrappers ──
+
+    /// A listings fixture: `payloads` maps package → basenames, `runtime`
+    /// names the runtime-closure members among them.
+    fn listings_fixture(
+        payloads: &[(&str, &[&str])],
+        runtime: &[&str],
+    ) -> crate::leak_scan::PayloadListings {
+        crate::leak_scan::PayloadListings {
+            payloads: payloads
+                .iter()
+                .map(|(pkg, files)| {
+                    (
+                        pkg.to_string(),
+                        files.iter().map(|f| f.to_string()).collect(),
+                    )
+                })
+                .collect(),
+            runtime: runtime.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    /// Perltidy's shape (issue #90): the command is a perl script with
+    /// shebang `#!/usr/bin/perl`, authored against the pod's root-mounted
+    /// closure. `perl` is a declared requires, so the wrapper family must
+    /// fire: the script is preserved at the `.real` sibling and the command
+    /// path becomes a wrapper execing the pod interpreter by bare name —
+    /// exactly what the farm's PATH provides.
+    #[test]
+    fn shebang_interpreter_from_requires_lands_a_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "usr/bin/perltidy",
+            b"#!/usr/bin/perl\nuse Perl::Tidy;\n",
+        );
+        let meta = meta_with_app("perltidy", "usr/bin/perltidy", None);
+        let listings = listings_fixture(
+            &[("perl", &["perl", "perldoc"]), ("glibc", &["ld.so"])],
+            &["glibc", "perl"],
+        );
+
+        emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap();
+
+        let wrapper = std::fs::read_to_string(&script).unwrap();
+        assert!(
+            wrapper.starts_with("#!/bin/sh\nexec \"perl\" \""),
+            "the command path must become a #9 wrapper execing the requires \
+             interpreter by bare name: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("/store/") && wrapper.trim_end().ends_with("\"$@\""),
+            "wrapper must exec the script store blob and forward args: {wrapper}"
+        );
+        let real = stage.path().join("usr/bin/perltidy.real");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "#!/usr/bin/perl\nuse Perl::Tidy;\n",
+            "the original script must be preserved at the .real sibling"
+        );
+    }
+
+    /// Fail closed: the shebang interpreter resolves ONLY into a build-only
+    /// payload — nothing in the runtime closure provides it, so the wrapper
+    /// would be broken the moment it shipped.
+    #[test]
+    fn shebang_interpreter_from_build_only_payload_fails_closed() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        stage_file(
+            stage.path(),
+            "usr/bin/tool",
+            b"#!/usr/bin/python3\nimport buildtool\n",
+        );
+        let meta = meta_with_app("tool", "usr/bin/tool", None);
+        let listings = listings_fixture(
+            &[("python", &["python3"])],
+            // python is build-only here: not in the runtime set.
+            &[],
+        );
+
+        let err = emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("python3"), "names the interpreter: {msg}");
+        assert!(
+            msg.contains("build-only payload 'python'"),
+            "names the build-only provider: {msg}"
+        );
+    }
+
+    /// Fail closed: the shebang interpreter resolves to neither the payload
+    /// nor a declared requires — no merged payload provides it.
+    #[test]
+    fn shebang_interpreter_unresolvable_fails_closed() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        stage_file(stage.path(), "usr/bin/tool", b"#!/usr/bin/gone-lang\nx\n");
+        let meta = meta_with_app("tool", "usr/bin/tool", None);
+        let listings = listings_fixture(&[("perl", &["perl"])], &["perl"]);
+
+        let err = emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("gone-lang"), "names the interpreter: {msg}");
+        assert!(
+            msg.contains("neither the payload nor a declared requires"),
+            "states the fail-closed condition: {msg}"
+        );
+    }
+
+    /// A PATH-resolved shebang (`/usr/bin/env`) resolves from the farm
+    /// today — untouched, no wrapper, no error.
+    #[test]
+    fn shebang_env_script_stays_untouched() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "usr/bin/tool",
+            b"#!/usr/bin/env bash\necho hi\n",
+        );
+        let meta = meta_with_app("tool", "usr/bin/tool", None);
+        let listings = listings_fixture(&[], &[]);
+
+        emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            "#!/usr/bin/env bash\necho hi\n"
+        );
+        assert!(!stage.path().join("usr/bin/tool.real").exists());
+    }
+
+    /// An interpreter provided by the package's OWN payload resolves too:
+    /// the payload itself is one of the two accepted sources.
+    #[test]
+    fn shebang_interpreter_from_own_payload_lands_a_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        stage_file(stage.path(), "usr/bin/perl", b"\x7fELF-perl");
+        let script = stage_file(stage.path(), "usr/bin/tool", b"#!/usr/bin/perl\nx\n");
+        let meta = meta_with_app("tool", "usr/bin/tool", None);
+        let listings = listings_fixture(&[("glibc", &["ld.so"])], &["glibc"]);
+
+        emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap();
+
+        let wrapper = std::fs::read_to_string(&script).unwrap();
+        assert!(
+            wrapper.starts_with("#!/bin/sh\nexec \"perl\" \""),
+            "own-payload interpreter wraps the same way: {wrapper}"
+        );
+    }
+
+    /// Perltidy's real payload shape (issue #90): the script AND its perl
+    /// module tree (`usr/lib/perl5/...`) ship together. The wrapper must be
+    /// the tree shape — PERL5LIB re-pointing @INC at the extension tree's
+    /// module dirs, script exec'd from the tree — or Perl::Tidy.pm strands
+    /// on the farm even with a resolvable perl.
+    #[test]
+    fn shebang_perl_with_module_tree_gets_the_perl5lib_tree_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "usr/bin/perltidy",
+            b"#!/usr/bin/perl\nuse Perl::Tidy;\n",
+        );
+        stage_file(
+            stage.path(),
+            "usr/lib/perl5/site_perl/5.40.5/Perl/Tidy.pm",
+            b"package Perl::Tidy; 1;\n",
+        );
+        stage_file(
+            stage.path(),
+            "usr/lib/perl5/site_perl/5.40.5/x86_64-linux-thread-multi/auto/.keep",
+            b"",
+        );
+        let meta = meta_with_app("perltidy", "usr/bin/perltidy", None);
+        let listings = listings_fixture(&[("perl", &["perl"])], &["perl"]);
+
+        emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap();
+
+        let wrapper = std::fs::read_to_string(&script).unwrap();
+        assert!(
+            wrapper.contains("PERL5LIB"),
+            "module-tree payloads must hand @INC to the farm wrapper: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("usr/lib/perl5/*/*/"),
+            "PERL5LIB must sweep the version and arch dirs under the \
+             extension tree's usr level: {wrapper}"
+        );
+        assert!(
+            wrapper.contains(
+                "exec \"perl\" \"$PODROOT/active/extensions/pkg/usr/usr/bin/perltidy.real\""
+            ),
+            "the script must exec from the extension tree: {wrapper}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stage.path().join("usr/bin/perltidy.real")).unwrap(),
+            "#!/usr/bin/perl\nuse Perl::Tidy;\n",
+            "the original script must be preserved at the .real sibling"
+        );
     }
 
     // ── Issue #10 part B: native-ELF runtime-lib wrappers ──
@@ -10159,7 +10524,7 @@ mod wrapper_tests {
         };
         let meta = meta_with_app("jtool", "usr/bin/jtool", None);
 
-        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
         let wrapper = std::fs::read_to_string(&app).unwrap();
         assert!(
@@ -10197,7 +10562,7 @@ mod wrapper_tests {
         std::fs::remove_file(stage.path().join("usr/lib/libktool.so")).unwrap();
         let meta = meta_with_app("ktool", "usr/bin/ktool", None);
 
-        emit_build_wrappers(&meta, stage.path(), &store).unwrap();
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
         // Still the real ELF (magic), no `.real` sibling, no wrapper.
         assert!(is_elf(&app), "app must remain a native ELF");
