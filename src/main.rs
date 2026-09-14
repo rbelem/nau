@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -146,6 +146,13 @@ fn main() -> miette::Result<()> {
             shuttle::output::set_mode(json);
             cmd_check(&file, json)
         }
+
+        Command::Lint {
+            file,
+            pod,
+            channel,
+            json,
+        } => cmd_lint(file, pod, channel, json),
 
         Command::Lock {
             file,
@@ -1807,6 +1814,188 @@ fn report_check_diagnostic(d: &shuttle::lua::CheckDiagnostic) {
         )),
         (None, None) => shuttle::output::err(&d.message),
     }
+}
+
+// ── Lint command (issue #53) ──
+
+/// Load the package index the same way the eval worker does
+/// (`SHUTTLE_INDEX_PATH`, else `package-index.json` in the CWD).
+fn lint_index() -> miette::Result<shuttle::index::PackageIndex> {
+    let path = std::env::var("SHUTTLE_INDEX_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(shuttle::index::DEFAULT_INDEX));
+    shuttle::index::PackageIndex::load_or_default(&path)
+}
+
+/// The declared stage directory of a definition file, when it exists:
+/// `<definition dir>/stage` — the same default the build uses.
+fn lint_stage_dir(file: &str) -> Option<std::path::PathBuf> {
+    let dir = std::path::Path::new(file)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let stage = dir.join("stage");
+    stage.is_dir().then_some(stage)
+}
+
+/// One pod package's lint entry: resolved meta when the package resolves
+/// from local inputs, `None` (warned later) when it does not.
+fn lint_pod_package(spec_str: &str) -> shuttle::checks::PodPackageMeta {
+    let Ok(spec) = shuttle::pod::parse_pod_package(spec_str) else {
+        return shuttle::checks::PodPackageMeta {
+            spec: spec_str.to_string(),
+            name: spec_str.to_string(),
+            meta: None,
+        };
+    };
+    // Resolution is data-only over local inputs — never the network.
+    let meta = shuttle::deps::load_meta(&spec.name).ok();
+    shuttle::checks::PodPackageMeta {
+        spec: spec_str.to_string(),
+        name: spec.name,
+        meta,
+    }
+}
+
+/// Resolve a pod's declared packages to metas for the lint, offline: the
+/// declaration comes from the pod state directory, each package
+/// declaration from local inputs.
+fn lint_pod(pod_name: &str) -> miette::Result<shuttle::checks::PodLintData> {
+    let root = shuttle::pod::pod_root(None);
+    let decl_path = shuttle::pod::pod_lua_path(&root, pod_name);
+    if !decl_path.exists() {
+        miette::bail!(
+            "pod '{pod_name}' has no declaration at {} (read verbs do not initialize pods)",
+            decl_path.display()
+        );
+    }
+    let decl = shuttle::pod::evaluate_pod_file(&decl_path)?;
+    let packages = decl
+        .packages
+        .iter()
+        .map(|spec| lint_pod_package(spec))
+        .collect();
+    Ok(shuttle::checks::PodLintData {
+        name: pod_name.to_string(),
+        packages,
+    })
+}
+
+/// One finding's human-readable line pair (message + fix hint).
+fn lint_finding_lines(f: &shuttle::checks::Finding, label: &str) -> String {
+    format!(
+        "[{}] {label}: {} {}: {}\n           fix: {}",
+        f.severity.as_str(),
+        f.check,
+        f.package,
+        f.message,
+        f.hint
+    )
+}
+
+/// Human report: every finding on its channel, then a one-line summary.
+fn report_lint_human(findings: &[shuttle::checks::Finding], label: &str) {
+    for f in findings {
+        let lines = lint_finding_lines(f, label);
+        match f.severity {
+            shuttle::checks::Severity::Error => shuttle::output::err(lines),
+            shuttle::checks::Severity::Warn => shuttle::output::warn(lines),
+        }
+    }
+    if findings.is_empty() {
+        shuttle::output::ok("lint clean: 0 findings");
+    } else {
+        let errors = findings
+            .iter()
+            .filter(|f| f.severity == shuttle::checks::Severity::Error)
+            .count();
+        shuttle::output::status(format!(
+            "lint: {errors} error(s), {} warning(s)",
+            findings.len() - errors
+        ));
+    }
+}
+
+/// JSON report shape for `shuttle lint --json`.
+fn report_lint_json(findings: &[shuttle::checks::Finding], label: &str) {
+    let findings_json: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "check": f.check,
+                "package": f.package,
+                "severity": f.severity.as_str(),
+                "message": f.message,
+                "hint": f.hint,
+            })
+        })
+        .collect();
+    let errors = findings
+        .iter()
+        .filter(|f| f.severity == shuttle::checks::Severity::Error)
+        .count();
+    let report = serde_json::json!({
+        "file": label,
+        "ok": errors == 0,
+        "errors": errors,
+        "warnings": findings.len() - errors,
+        "findings": findings_json,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+/// `shuttle lint`: run the check battery over a definition file (or a
+/// pod's packages) and report findings. Exit code 1 only on error findings.
+fn cmd_lint(file: String, pod: Option<String>, channel: String, json: bool) -> miette::Result<()> {
+    shuttle::output::set_mode(json);
+    let index = lint_index()?;
+
+    let (label, eval, pod_data) = if let Some(pod_name) = pod.as_deref() {
+        let data = lint_pod(pod_name)?;
+        let path = shuttle::pod::pod_lua_path(&shuttle::pod::pod_root(None), pod_name);
+        (path.display().to_string(), None, Some(data))
+    } else {
+        let eval = shuttle::lua::lint_eval_file(&file)?;
+        for d in &eval.diagnostics {
+            shuttle::output::warn(d);
+        }
+        (file.clone(), Some(eval), None)
+    };
+
+    let empty_raw = BTreeMap::new();
+    let empty_outputs = shuttle::lua::Outputs::new();
+    let empty_images: std::collections::HashMap<String, shuttle::image::ImageDeclaration> =
+        Default::default();
+    let no_unparsed: Vec<String> = Vec::new();
+    let stage_dir = eval.is_some().then(|| lint_stage_dir(&file)).flatten();
+    let arch = std::env::var("SHUTTLE_ARCH").unwrap_or_else(|_| "amd64".into());
+
+    let input = shuttle::checks::LintInput {
+        file: std::path::Path::new(&label),
+        arch: &arch,
+        channel: &channel,
+        outputs: eval.as_ref().map_or(&empty_outputs, |e| &e.outputs),
+        images: eval.as_ref().map_or(&empty_images, |e| &e.images),
+        raw: eval.as_ref().map_or(&empty_raw, |e| &e.raw),
+        unparsed: eval.as_ref().map_or(&no_unparsed, |e| &e.unparsed),
+        index: &index,
+        pod: pod_data.as_ref(),
+        stage_dir: stage_dir.as_deref(),
+    };
+
+    let findings = shuttle::checks::run_battery(&input);
+    if json {
+        report_lint_json(&findings, &label);
+    } else {
+        report_lint_human(&findings, &label);
+    }
+
+    if shuttle::checks::has_errors(&findings) {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 // ── Lock command ──

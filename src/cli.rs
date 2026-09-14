@@ -175,6 +175,31 @@ pub enum Command {
         json: bool,
     },
 
+    /// Lint declarations: a battery of package/image/pod checks beyond the
+    /// leak scan (issue #53). Every finding carries the check name, the
+    /// package, a severity, and a one-line fix hint. Exits nonzero only on
+    /// errors, never warnings. Fully offline: index/lockfile data only.
+    Lint {
+        /// Path to the Lua definition file (default: shuttle.lua)
+        #[arg(short, long, default_value = "shuttle.lua")]
+        file: String,
+
+        /// Lint a pod's declared packages (app collisions) instead of a
+        /// definition file.
+        #[arg(long)]
+        pod: Option<String>,
+
+        /// Snap channel for resolution context (default: latest/stable).
+        /// Kernel/gadget snaps derive their channel from the image base
+        /// track on top of this (ADR-0019).
+        #[arg(long, default_value = "latest/stable")]
+        channel: String,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Resolve and refresh all input pins in the lockfile (no build).
     /// Pins each github input to its current branch head and records a
     /// content hash; `path:` inputs are marked local (unlocked).

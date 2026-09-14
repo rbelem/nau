@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use miette::{IntoDiagnostic, WrapErr};
 
@@ -324,6 +324,62 @@ fn extract_inputs_from_lua(lua: &mlua::Lua) -> miette::Result<HashMap<String, Pa
             other.type_name()
         )),
     }
+}
+
+// ── Lint eval (issue #53) ──
+
+/// Everything `shuttle lint` needs from one definition eval: the raw
+/// per-key JSON (pre-Rust-validation — the linter must see values that
+/// schema validation rejects; turning them into findings is its job), the
+/// keys that validated as snap outputs, the keys that validated as image
+/// declarations, keys that validated as neither, and the worker's
+/// warn-and-continue diagnostics.
+pub struct LintEval {
+    pub raw: BTreeMap<String, serde_json::Value>,
+    pub outputs: Outputs,
+    pub images: HashMap<String, ImageDeclaration>,
+    pub unparsed: Vec<String>,
+    pub diagnostics: Vec<String>,
+}
+
+/// Evaluate a definition file for the linter: one bounded worker run, then
+/// per-key classification. Image parse runs BEFORE the snap parse (an
+/// image table also satisfies the snap schema's `name`/`version`, but the
+/// reverse never holds — packages carry no `base`).
+pub fn lint_eval_file(path: &str) -> miette::Result<LintEval> {
+    let source = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("could not read {}", path))?;
+    let ok = run_worker_for(path, &source)?;
+    let definition_dir = definition_dir_from_label(path);
+
+    let lua = mlua::Lua::new();
+    let mut out = LintEval {
+        raw: BTreeMap::new(),
+        outputs: Outputs::new(),
+        images: HashMap::new(),
+        unparsed: Vec::new(),
+        diagnostics: ok.diagnostics,
+    };
+    for (key, json) in ok.outputs {
+        out.raw.insert(key.clone(), json.clone());
+        let value = json_to_lua(&lua, &json)
+            .map_err(|e| miette::miette!("{path}: output '{key}' conversion failed: {e}"))?;
+        if let mlua::Value::Table(table) = &value {
+            if let Ok(decl) = ImageDeclaration::from_lua_table(table) {
+                out.images.insert(key, decl);
+                continue;
+            }
+        }
+        match SnapMeta::from_lua_value(&value) {
+            Ok(mut meta) => {
+                meta.definition_dir = definition_dir.clone();
+                out.outputs.insert(key, meta);
+            }
+            Err(_) => out.unparsed.push(key),
+        }
+    }
+    Ok(out)
 }
 
 /// Evaluate a Lua file and extract image declarations.
