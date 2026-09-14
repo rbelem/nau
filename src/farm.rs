@@ -37,6 +37,22 @@
 //! the generation. Single-binary packages record no assembly and keep
 //! the unchanged direct store link.
 
+//! Issue #89: the loader-path seam. Packages whose binaries link
+//! against libraries from their requires closure (git → libpcre2/libz,
+//! tmux → libncursesw/libevent) install those libs per generation under
+//! `extensions/<pkg>/usr/usr/lib` (or `usr/usr/lib64` for the
+//! glibc/toolchain layout) — and nothing on the host puts that tree on
+//! the dynamic loader path. The emit records the generation's loader
+//! lib dirs into `generations/<n>/loader-libs` (higher composition
+//! layer first, so an overlay's library shadows a loaded pod's on the
+//! first-match loader search); `pod::shellenv` (issue #47) turns that
+//! list into `LD_LIBRARY_PATH` exports whose entries thread through the
+//! pod's `current` link (`<pod>/current/../extensions/...`), so the
+//! link flip re-scopes every entry atomically on rollback — a dead
+//! generation's lib dirs become unreachable through the seam without
+//! re-eval, nothing leaks across pods, and nothing is written outside
+//! the pod's own state.
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -57,6 +73,63 @@ pub const CURRENT_LINK: &str = "current";
 /// farm itself stays a flat directory of direct tool links) and inside
 /// the generation dir, so `current` swaps it atomically on rollback.
 pub const ASSEMBLY_DIR: &str = "apps";
+
+/// The generation's recorded loader-lib dirs (issue #89):
+/// `generations/<n>/loader-libs` — one generation-relative directory per
+/// line (`extensions/<pkg>/usr/usr/lib`), higher composition layer
+/// first. The pod shellenv reads this list to build `LD_LIBRARY_PATH`
+/// entries threaded through the pod's `current` link. Written on every
+/// emit (empty when the generation ships no lib dirs), so it follows
+/// generations exactly like the farm itself.
+pub const LOADER_LIBS_FILE: &str = "loader-libs";
+
+/// The payload-relative lib directories the loader seam records.
+/// `usr/usr/lib` is the pool's libdir convention (`--prefix=/usr`);
+/// `usr/usr/lib64` is the glibc/toolchain layout. `usr/usr/libexec`
+/// holds non-linkable helpers and is never a search dir. A subdirectory
+/// of a recorded dir is NOT itself recorded — the loader searches only
+/// the listed dirs, and the pool ships shared objects flat.
+const LOADER_LIB_SUBDIRS: [&str; 2] = ["usr/usr/lib", "usr/usr/lib64"];
+
+/// Path of generation `n`'s loader-lib list.
+pub fn loader_libs_path(store: &RuntimeStore, n: u64) -> PathBuf {
+    store.generation_dir(n).join(LOADER_LIBS_FILE)
+}
+
+/// Collect the generation's loader-lib dirs, higher composition layer
+/// first ([`layered_packages`] reversed — the loader's first-match
+/// search must resolve a shared soname to the highest layer, the same
+/// precedence the farm's shared-name overwrite encodes), package name
+/// ascending within a layer. Only dirs that exist in the freshly
+/// staged tree are recorded — the emit runs right after materialization,
+/// so the stat is authoritative and no manifest schema changes.
+pub fn loader_lib_dirs(store: &RuntimeStore, gen: &Generation) -> Vec<String> {
+    let extensions = store.generation_dir(gen.n).join("extensions");
+    let mut dirs: Vec<(ClaimLayer, String, String)> = Vec::new();
+    for pkg in layered_packages(gen) {
+        for sub in LOADER_LIB_SUBDIRS {
+            let rel = format!("extensions/{}/{}", pkg.name, sub);
+            if extensions.join(&pkg.name).join(sub).is_dir() {
+                dirs.push((pkg.layer, pkg.name.clone(), rel));
+            }
+        }
+    }
+    dirs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    dirs.into_iter().map(|(_, _, rel)| rel).collect()
+}
+
+/// Record the generation's loader-lib dirs (issue #89). Written on
+/// every emit — including the empty case, so a re-emit of a generation
+/// that lost its lib payloads withdraws the stale list.
+fn record_loader_libs(store: &RuntimeStore, gen: &Generation) -> miette::Result<()> {
+    let path = loader_libs_path(store, gen.n);
+    let mut body = String::new();
+    for rel in loader_lib_dirs(store, gen) {
+        body.push_str(&rel);
+        body.push('\n');
+    }
+    std::fs::write(&path, body).map_err(|e| miette::miette!("writing {}: {e}", path.display()))
+}
 
 /// One app's multi-file payload assembly (issue #37): the app binary's
 /// in-payload path plus the content that ships beside it (same payload
@@ -236,6 +309,11 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
     // no apps, so without this their payloads would sit inert in the
     // store — the user-level fonts dir is their activation seam.
     crate::fonts::emit(store, gen)?;
+    // And the loader-lib list (issue #89): the generation's payload lib
+    // dirs, recorded for the shellenv's LD_LIBRARY_PATH seam. The file
+    // lives inside the generation, so rollback and GC scope it exactly
+    // like the farm and launchers.
+    record_loader_libs(store, gen)?;
     Ok(farm)
 }
 
@@ -1002,5 +1080,131 @@ mod tests {
         );
         let target = std::fs::read_link(farm.join("new")).unwrap();
         assert!(target.ends_with("store/aa/aa11"));
+    }
+
+    // ── Issue #89: the generation's loader-lib list ──
+
+    /// A generation fixture with packages at explicit layers; the test
+    /// materializes the extension lib dirs the emit stats.
+    fn gen_with_layered_pkgs(n: u64, pkgs: &[(&str, ClaimLayer)]) -> Generation {
+        let mut packages = BTreeMap::new();
+        for (name, layer) in pkgs {
+            packages.insert(
+                name.to_string(),
+                crate::runtime::InstalledPackage {
+                    name: name.to_string(),
+                    version: "1.0".into(),
+                    revision: 1,
+                    sha3_384: "abc".into(),
+                    files: vec![],
+                    units: vec![],
+                    layer: *layer,
+                    apps: BTreeMap::new(),
+                    launchers: BTreeMap::new(),
+                    assembly: BTreeMap::new(),
+                    confined: None,
+                    app_confined: BTreeMap::new(),
+                    desktops: BTreeMap::new(),
+                    fonts: BTreeMap::new(),
+                },
+            );
+        }
+        Generation {
+            n,
+            base_version: "24.04".into(),
+            packages,
+            created_epoch: 0,
+            boot_entry: None,
+        }
+    }
+
+    fn materialize_ext_dir(store: &RuntimeStore, n: u64, pkg: &str, sub: &str) {
+        let dir = store
+            .generation_dir(n)
+            .join("extensions")
+            .join(pkg)
+            .join(sub);
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn emit_records_loader_lib_dirs_higher_layer_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        materialize_ext_dir(&store, 1, "loaded-libs", "usr/usr/lib");
+        materialize_ext_dir(&store, 1, "own-libs", "usr/usr/lib");
+        materialize_ext_dir(&store, 1, "toolchain", "usr/usr/lib64");
+        // Not a loader dir: libexec holds non-linkable helpers.
+        materialize_ext_dir(&store, 1, "own-libs", "usr/usr/libexec");
+        // A package with no lib dirs at all.
+        let gen = gen_with_layered_pkgs(
+            1,
+            &[
+                ("app-only", ClaimLayer::Own),
+                ("own-libs", ClaimLayer::Own),
+                ("toolchain", ClaimLayer::Own),
+                ("loaded-libs", ClaimLayer::Loaded),
+            ],
+        );
+        emit(&store, &gen).unwrap();
+
+        let list = std::fs::read_to_string(loader_libs_path(&store, 1)).unwrap();
+        let lines: Vec<&str> = list.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                // Higher layer first (Own before Loaded — the loader's
+                // first-match search follows the farm's precedence),
+                // name ascending within the layer.
+                "extensions/own-libs/usr/usr/lib",
+                "extensions/toolchain/usr/usr/lib64",
+                "extensions/loaded-libs/usr/usr/lib",
+            ],
+            "loader-lib list: {list:?}"
+        );
+    }
+
+    #[test]
+    fn reemit_withdraws_a_stale_loader_lib_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        materialize_ext_dir(&store, 1, "tmux-deps", "usr/usr/lib");
+        let with = gen_with_layered_pkgs(1, &[("tmux-deps", ClaimLayer::Loaded)]);
+        emit(&store, &with).unwrap();
+        assert!(std::fs::read_to_string(loader_libs_path(&store, 1))
+            .unwrap()
+            .contains("tmux-deps"));
+
+        // The target generation of a rollback re-emits without the lib
+        // package: the list must go empty, never keep the stale dir.
+        let without = gen_with_layered_pkgs(1, &[]);
+        emit(&store, &without).unwrap();
+        let list = std::fs::read_to_string(loader_libs_path(&store, 1)).unwrap();
+        assert!(
+            list.trim().is_empty(),
+            "re-emit must withdraw the stale list, got {list:?}"
+        );
+    }
+
+    #[test]
+    fn loader_lib_lists_never_bleed_across_generations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        materialize_ext_dir(&store, 1, "gen-one-libs", "usr/usr/lib");
+        materialize_ext_dir(&store, 2, "gen-two-libs", "usr/usr/lib");
+        emit(
+            &store,
+            &gen_with_layered_pkgs(1, &[("gen-one-libs", ClaimLayer::Own)]),
+        )
+        .unwrap();
+        emit(
+            &store,
+            &gen_with_layered_pkgs(2, &[("gen-two-libs", ClaimLayer::Own)]),
+        )
+        .unwrap();
+        let one = std::fs::read_to_string(loader_libs_path(&store, 1)).unwrap();
+        let two = std::fs::read_to_string(loader_libs_path(&store, 2)).unwrap();
+        assert!(one.contains("gen-one-libs") && !one.contains("gen-two-libs"));
+        assert!(two.contains("gen-two-libs") && !two.contains("gen-one-libs"));
     }
 }

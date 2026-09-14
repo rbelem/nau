@@ -2897,6 +2897,16 @@ pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListE
 /// renders it as POSIX shell statements the user `eval`s — the
 /// interactive half of farm activation (ADR-0015 §7: "a single PATH
 /// prepend"), never an RC-file write, daemon, or watcher.
+///
+/// Issue #89 adds the loader half: the generation's payload lib dirs
+/// (`extensions/<pkg>/usr/usr/lib`, recorded by the farm emit) as
+/// `LD_LIBRARY_PATH` entries, so requires-closure binaries (git, tmux,
+/// htop, tig, …) find their generation's libraries with no manual
+/// environment. Every entry threads through the pod's `current` LINK —
+/// `<pod>/current/../extensions/...` — never a canonicalized
+/// generation path, so the rollback flip re-scopes all of them
+/// atomically (a dead generation's dirs become unreachable without
+/// re-eval) and nothing leaks beyond this pod's activation surface.
 #[derive(Debug, PartialEq, Serialize)]
 pub struct PodShellenv {
     /// The pod this environment belongs to.
@@ -2910,6 +2920,13 @@ pub struct PodShellenv {
     /// The generation the farm currently serves, when the `current`
     /// link's target parses.
     pub generation: Option<u64>,
+    /// Absolute loader-lib dirs for the LD_LIBRARY_PATH prepend (issue
+    /// #89), threaded through the `current` link like `farm`. Empty for
+    /// pods whose packages ship no shared libraries (the common case —
+    /// statically linked tools) and for generations emitted before the
+    /// seam existed; the renderer exports nothing in that case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub libs: Vec<String>,
 }
 
 /// Resolve the environment the selected pod exposes to an interactive
@@ -2941,15 +2958,84 @@ pub fn shellenv(root: &Path, pod_name: &str) -> miette::Result<PodShellenv> {
     })?;
     let root_abs = std::fs::canonicalize(root)
         .map_err(|e| miette::miette!("pod root {}: {e}", root.display()))?;
+    let farm = root_abs.join(pod_name).join(crate::farm::CURRENT_LINK);
+    let generation = crate::farm::current_generation(&pod)?;
+    // Issue #89: the generation's recorded loader-lib dirs, as seam
+    // paths through the `current` link. Missing file = a generation
+    // emitted before the seam existed (or a lib-less generation read
+    // through an old binary) — an empty export is the correct answer.
+    let libs = match generation {
+        Some(n) => read_loader_libs(
+            &pod.join("generations")
+                .join(n.to_string())
+                .join(crate::farm::LOADER_LIBS_FILE),
+        )?
+        .into_iter()
+        .map(|rel| {
+            // `current` is a symlink into `generations/<n>/farm`, so
+            // `current/../<rel>` resolves (kernel path resolution, and
+            // glibc's loader resolves LD_LIBRARY_PATH entries at exec
+            // time) into `generations/<n>/<rel>` — the flip redirects
+            // the whole list on rollback.
+            format!("{}/../{rel}", farm.display())
+        })
+        .collect(),
+        None => Vec::new(),
+    };
     Ok(PodShellenv {
         pod: pod_name.to_string(),
-        farm: root_abs
-            .join(pod_name)
-            .join(crate::farm::CURRENT_LINK)
-            .display()
-            .to_string(),
-        generation: crate::farm::current_generation(&pod)?,
+        farm: farm.display().to_string(),
+        generation,
+        libs,
     })
+}
+
+/// Parse a generation's `loader-libs` list: one generation-relative
+/// directory per line, authored by the farm emit. A corrupted list
+/// fails the read verb loudly (the fonts emitter's rule for trusted
+/// data) — never a silently wrong loader path.
+fn read_loader_libs(path: &Path) -> miette::Result<Vec<String>> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(miette::miette!("reading {}: {e}", path.display()));
+        }
+    };
+    let mut dirs = Vec::new();
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('/') || line.split('/').any(|c| c == "..") || line.contains('\0') {
+            miette::bail!(
+                "corrupt loader-lib list {}: {line:?} is not a generation-relative directory",
+                path.display()
+            );
+        }
+        dirs.push(line.to_string());
+    }
+    Ok(dirs)
+}
+
+/// Render a shellenv as eval-safe POSIX shell statements (issue #47,
+/// extended by #89): the PATH prepend, plus the loader-lib
+/// `LD_LIBRARY_PATH` prepend when the pod's generation ships lib dirs.
+/// Pure — the JSON branch prints the struct instead.
+///
+/// The `LD_LIBRARY_PATH` line uses the `${VAR:+:$VAR}` idiom (the same
+/// one the pool's build scripts use) so the export is safe under
+/// `set -u` and never leaves a trailing empty element (which the
+/// loader would read as the current directory).
+pub fn render_shellenv(env: &PodShellenv) -> String {
+    let mut script = format!("export PATH=\"{}:$PATH\"\n", env.farm);
+    if !env.libs.is_empty() {
+        script.push_str(&format!(
+            "export LD_LIBRARY_PATH=\"{}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"\n",
+            env.libs.join(":")
+        ));
+    }
+    script
 }
 
 // ── Dependency fetch (ADR-0017, issue #13) ──
@@ -3349,5 +3435,164 @@ pod {
         // current → a generation that does not exist (torn state).
         std::os::unix::fs::symlink("generations/9/farm", dir.join("current")).unwrap();
         assert!(shellenv(tmp.path(), "default").is_err());
+    }
+
+    // ── shellenv loader-lib seam (issue #89) ──
+
+    /// A minimal public-fields generation with one package, so the
+    /// pod-level tests can drive `farm::emit` directly.
+    fn gen_with_one_pkg(n: u64, pkg: &str) -> crate::runtime::Generation {
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            pkg.to_string(),
+            crate::runtime::InstalledPackage {
+                name: pkg.to_string(),
+                version: "1.0".into(),
+                revision: 1,
+                sha3_384: "abc".into(),
+                files: vec![],
+                units: vec![],
+                layer: crate::farm::ClaimLayer::Own,
+                apps: BTreeMap::new(),
+                launchers: BTreeMap::new(),
+                assembly: BTreeMap::new(),
+                confined: None,
+                app_confined: BTreeMap::new(),
+                desktops: BTreeMap::new(),
+                fonts: BTreeMap::new(),
+            },
+        );
+        crate::runtime::Generation {
+            n,
+            base_version: "24.04".into(),
+            packages,
+            created_epoch: 0,
+            boot_entry: None,
+        }
+    }
+
+    #[test]
+    fn test_shellenv_lib_dirs_thread_through_the_current_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The documented layout `<data-home>/shuttle/pods/<pod>`: the
+        // emit's desktop/font surfaces derive their user-level dirs
+        // from this shape, so every write stays inside the tempdir.
+        let root = tmp.path().join("data/shuttle/pods");
+        let dir = pod_dir(&root, "default");
+        let store = pod_store(&dir);
+        // Generation 1 carries a lib payload (the emit records its lib
+        // dirs); generation 2 does not (the rollback target).
+        let ext1 = store
+            .generation_dir(1)
+            .join("extensions/tmux-deps/usr/usr/lib");
+        std::fs::create_dir_all(&ext1).unwrap();
+        crate::farm::emit(&store, &gen_with_one_pkg(1, "tmux-deps")).unwrap();
+        crate::farm::emit(&store, &gen_with_one_pkg(2, "tmux")).unwrap();
+        crate::farm::flip_current(&dir, 1).unwrap();
+
+        let env = shellenv(&root, "default").unwrap();
+        let expected = format!("{}/../extensions/tmux-deps/usr/usr/lib", env.farm);
+        assert_eq!(env.libs, vec![expected.clone()], "seam paths: {env:?}");
+        // The entry resolves THROUGH the link into generation 1.
+        assert!(
+            Path::new(&expected).is_dir(),
+            "seam must resolve into the active generation"
+        );
+
+        // Rollback semantics: the flip alone re-scopes the SAME text
+        // path — generation 2 has no tmux-deps, so the dead
+        // generation's dir is unreachable through the seam.
+        crate::farm::flip_current(&dir, 2).unwrap();
+        assert!(
+            !Path::new(&expected).exists(),
+            "flipped-away generation must be unreachable through the seam"
+        );
+        // And the shellenv of the rolled-back pod exports nothing.
+        let env2 = shellenv(&root, "default").unwrap();
+        assert!(
+            env2.libs.is_empty(),
+            "rollback target has no libs: {env2:?}"
+        );
+    }
+
+    #[test]
+    fn test_shellenv_without_a_loader_lib_list_exports_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A generation emitted before the seam existed: no loader-libs
+        // file. The shellenv must degrade to the #47 PATH-only export.
+        seed_active_pod(tmp.path(), "default", 4);
+        let env = shellenv(tmp.path(), "default").unwrap();
+        assert!(env.libs.is_empty());
+        assert_eq!(
+            render_shellenv(&env),
+            format!("export PATH=\"{}:$PATH\"\n", env.farm)
+        );
+    }
+
+    #[test]
+    fn test_render_shellenv_is_eval_safe_under_nounset() {
+        let env = PodShellenv {
+            pod: "default".into(),
+            farm: "/root/default/current".into(),
+            generation: Some(1),
+            libs: vec!["/root/default/current/../extensions/a/usr/usr/lib".into()],
+        };
+        let script = render_shellenv(&env);
+        assert_eq!(
+            script,
+            "export PATH=\"/root/default/current:$PATH\"\n\
+             export LD_LIBRARY_PATH=\"/root/default/current/../extensions/a/usr/usr/lib\
+             ${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n"
+        );
+
+        // The real proof: eval the script under `set -u` with
+        // LD_LIBRARY_PATH unset, set, and empty. The `:+` idiom must
+        // survive nounset and never leave a trailing empty element
+        // (which the loader reads as the current directory).
+        let eval = |pre: Option<&str>| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(format!(
+                "set -u\n{script}\nprintf '%s' \"${{LD_LIBRARY_PATH-__UNSET__}}\""
+            ));
+            match pre {
+                Some(v) => cmd.env("LD_LIBRARY_PATH", v),
+                None => cmd.env_remove("LD_LIBRARY_PATH"),
+            };
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "stderr: {:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(
+            eval(None),
+            "/root/default/current/../extensions/a/usr/usr/lib"
+        );
+        assert_eq!(
+            eval(Some("keep")),
+            "/root/default/current/../extensions/a/usr/usr/lib:keep"
+        );
+        assert_eq!(
+            eval(Some("")),
+            "/root/default/current/../extensions/a/usr/usr/lib"
+        );
+
+        // A lib-less pod emits no LD_LIBRARY_PATH line at all.
+        let bare = PodShellenv {
+            libs: Vec::new(),
+            ..env
+        };
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "set -u\n{}\nprintf '%s' \"${{LD_LIBRARY_PATH-__UNSET__}}\"",
+                render_shellenv(&bare)
+            ))
+            .env_remove("LD_LIBRARY_PATH")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "__UNSET__");
     }
 }
