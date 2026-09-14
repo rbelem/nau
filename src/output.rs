@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 static JSON_MODE: AtomicBool = AtomicBool::new(false);
+static QUIET_BUILD: AtomicBool = AtomicBool::new(false);
 static BUILD_RESULTS: Mutex<Option<Vec<BuildResultJson>>> = Mutex::new(None);
 static DEP_RESULTS: Mutex<Option<Vec<DepResultJson>>> = Mutex::new(None);
 static ORDER_RESULTS: Mutex<Option<Vec<OrderResultJson>>> = Mutex::new(None);
@@ -35,6 +36,21 @@ pub fn set_mode(json: bool) {
 /// True if JSON output mode is active.
 pub fn is_json() -> bool {
     JSON_MODE.load(Ordering::SeqCst)
+}
+
+/// Quiet-build switch for the parallel dep-build phase (issue #55): while
+/// set, progress-style output (spinners, download bars) is suppressed.
+/// Concurrent packages are attributed by their scheduler-prefixed lines —
+/// one spinner per worker thread would interleave into garbage. Scoped:
+/// set once around the whole parallel phase while the orchestrator thread
+/// blocks, never mutated per-build, so it cannot race (ADR-0022 addendum).
+pub fn set_quiet_build(on: bool) {
+    QUIET_BUILD.store(on, Ordering::SeqCst);
+}
+
+/// True while the parallel dep-build phase runs.
+pub fn is_quiet_build() -> bool {
+    QUIET_BUILD.load(Ordering::SeqCst)
 }
 
 // ── Colored status helpers (Normal mode only) ──
@@ -78,6 +94,9 @@ pub fn status(msg: impl std::fmt::Display) {
 
 /// Create a spinner with the given message.
 pub fn spinner(msg: &str) -> ProgressBar {
+    if is_quiet_build() {
+        return ProgressBar::hidden();
+    }
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
@@ -91,6 +110,9 @@ pub fn spinner(msg: &str) -> ProgressBar {
 
 /// Create a determinate progress bar for downloads.
 pub fn progress_bar(len: u64, msg: &str) -> ProgressBar {
+    if is_quiet_build() {
+        return ProgressBar::hidden();
+    }
     let pb = ProgressBar::new(len);
     pb.set_style(
         ProgressStyle::default_bar()

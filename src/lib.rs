@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod assert;
 pub mod boot_test;
 pub mod build_prefix;
+pub mod build_sched;
 pub mod cache;
 pub mod checks;
 pub mod cli;

@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Parser;
@@ -622,7 +624,7 @@ fn run_build(
 
     // If --all, resolve and build transitive dependencies first
     if all {
-        let all_deps = collect_dep_names(&iter);
+        let all_deps = collect_dep_graph(&iter);
         build_all_deps(
             &all_deps,
             target.as_ref(),
@@ -749,23 +751,23 @@ fn select_outputs<'a>(
 /// Collect the unique dependency names of every selected output, in
 /// first-seen order. Seeds are the build-time dependency union
 /// (`requires` ∪ `build_deps`) — both kinds get built (ADR-0018).
-fn collect_dep_names(iter: &[(&String, shuttle::snap::SnapMeta)]) -> Vec<String> {
-    let mut all_deps: Vec<String> = Vec::new();
+fn collect_dep_graph(iter: &[(&String, shuttle::snap::SnapMeta)]) -> Vec<shuttle::deps::DepNode> {
+    let mut nodes: Vec<shuttle::deps::DepNode> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (_name, meta) in iter {
         let seeds = shuttle::deps::build_dep_seeds(meta);
         if !seeds.is_empty() {
-            if let Ok(deps) = shuttle::deps::resolve_dep_names(&seeds, true) {
-                for dep in &deps {
-                    if seen.insert(dep.clone()) {
-                        all_deps.push(dep.clone());
+            if let Ok(deps) = shuttle::deps::resolve_deps(&seeds, true) {
+                for node in deps {
+                    if seen.insert(node.name.clone()) {
+                        nodes.push(node);
                     }
                 }
             }
         }
     }
-    all_deps
+    nodes
 }
 
 /// Resolve `meta`'s build-time dependency closure (`requires` ∪
@@ -776,6 +778,9 @@ fn collect_dep_names(iter: &[(&String, shuttle::snap::SnapMeta)]) -> Vec<String>
 ///
 /// Unknown dependency names reject exactly like unknown `requires` names:
 /// the resolver's "package 'x' not found" error propagates.
+///
+/// `quiet` suppresses the progress line (parallel dep builds, issue #55 —
+/// the scheduler prints attributable lines instead).
 #[allow(clippy::too_many_arguments)]
 fn ensure_build_prefix(
     meta: &shuttle::snap::SnapMeta,
@@ -784,6 +789,7 @@ fn ensure_build_prefix(
     pkg_cache: Option<&PackageCache>,
     lockfile: &LockFile,
     json: bool,
+    quiet: bool,
     building: &mut Vec<String>,
 ) -> miette::Result<Option<shuttle::build_prefix::MergedPrefix>> {
     // Only source builds consume a build prefix — meta/store snaps and
@@ -800,12 +806,12 @@ fn ensure_build_prefix(
     for name in closure_names {
         let dep_meta = shuttle::deps::load_meta(&name)?;
         let snap = ensure_dep_payload(
-            &name, &dep_meta, arch, output_dir, pkg_cache, lockfile, json, building,
+            &name, &dep_meta, arch, output_dir, pkg_cache, lockfile, json, quiet, building,
         )?;
         payloads.push(shuttle::build_prefix::Payload { pkg: name, snap });
     }
     let merged = shuttle::build_prefix::materialize_merged_prefix(&payloads)?;
-    if !json && !payloads.is_empty() {
+    if !json && !quiet && !payloads.is_empty() {
         let names: Vec<&str> = payloads.iter().map(|p| p.pkg.as_str()).collect();
         shuttle::output::status(format!(
             "build prefix: merged {} payload(s) — {}",
@@ -834,6 +840,7 @@ fn ensure_dep_payload(
     pkg_cache: Option<&PackageCache>,
     lockfile: &LockFile,
     json: bool,
+    quiet: bool,
     building: &mut Vec<String>,
 ) -> miette::Result<PathBuf> {
     let filename = format!("{}_{}_{}.snap", name, dep_meta.version, arch);
@@ -860,11 +867,11 @@ fn ensure_dep_payload(
     building.push(name.to_string());
 
     let dep_prefix = ensure_build_prefix(
-        dep_meta, arch, output_dir, pkg_cache, lockfile, json, building,
+        dep_meta, arch, output_dir, pkg_cache, lockfile, json, quiet, building,
     )?;
 
     shuttle::snap::check_cross_build(arch, dep_meta.target.as_deref())?;
-    if !json {
+    if !json && !quiet {
         shuttle::output::status(format!("building dependency {name} ({arch})..."));
     }
     let stage = tempfile::tempdir()
@@ -886,10 +893,11 @@ fn ensure_dep_payload(
         dep_prefix.as_ref().map(|t| t.path()),
         Some(&scan_listings),
     )?;
-    if !json {
+    if !json && !quiet {
         shuttle::output::ok(&result.snap_filename);
     }
     if let (Some(cache), Some(closure)) = (pkg_cache, closure.as_ref()) {
+        let _store_lock = CACHE_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = cache.store(dep_meta, &result, output_dir, closure) {
             shuttle::output::warn(format!("cache store failed: {e}"));
         }
@@ -899,11 +907,145 @@ fn ensure_dep_payload(
     Ok(output_dir.join(&result.snap_filename))
 }
 
+/// Per-package parallel build job context (issue #55): everything one
+/// ready-node build borrows from the orchestrator. Fields are read-only
+/// for the whole phase; the scheduler runs one `run` per node.
+struct DepJobCtx<'a> {
+    metas: &'a BTreeMap<String, shuttle::snap::SnapMeta>,
+    closures: &'a HashMap<String, Option<shuttle::cache::BuildClosure>>,
+    cli_archs: &'a [String],
+    output_dir: &'a Path,
+    pkg_cache: Option<&'a shuttle::cache::PackageCache>,
+    lockfile: &'a LockFile,
+    json: bool,
+    total: usize,
+    dispatch: &'a AtomicUsize,
+}
+
+impl DepJobCtx<'_> {
+    /// Build one scheduled package: attributable start/finish lines here,
+    /// quiet build inside, error prefixed per line for the final report.
+    fn run(&self, name: &str) -> Result<(), String> {
+        let meta = self.metas.get(name).expect("scheduled node was loaded");
+        let archs = shuttle::snap::resolve_archs(meta, self.cli_archs);
+        let dep_closure = self.closures[name].as_ref();
+        let slot = self.dispatch.fetch_add(1, Ordering::SeqCst) + 1;
+        if !self.json {
+            eprintln!("▶ [{slot}/{}] {name} ({})", self.total, archs.join(", "));
+        }
+        match build_dep_archs(
+            name,
+            meta,
+            &archs,
+            self.output_dir,
+            self.pkg_cache,
+            dep_closure,
+            self.lockfile,
+            self.json,
+            true,
+        ) {
+            Ok(()) => {
+                if !self.json {
+                    eprintln!("✓ [{slot}/{}] {name}", self.total);
+                }
+                Ok(())
+            }
+            Err(e) => Err(prefix_error_lines(&format!("{e:#}"), name)),
+        }
+    }
+}
+
+/// Load every node's meta up front, in topological order, applying
+/// `--target`. A node whose meta cannot load is skipped with a warning,
+/// as the sequential loop did.
+fn load_dep_metas(
+    dep_nodes: &[shuttle::deps::DepNode],
+    effective_target: Option<&String>,
+) -> BTreeMap<String, shuttle::snap::SnapMeta> {
+    let mut metas = BTreeMap::new();
+    for node in dep_nodes {
+        match shuttle::deps::load_meta(&node.name) {
+            Ok(mut m) => {
+                // Apply --target to deps as well
+                if let Some(t) = effective_target {
+                    m.target = Some(t.clone());
+                }
+                metas.insert(node.name.clone(), m);
+            }
+            Err(e) => {
+                shuttle::output::warn(format!("skipping dependency '{}': {}", node.name, e));
+            }
+        }
+    }
+    metas
+}
+
+/// Closure key per node (source + parts + target + requires closure):
+/// computed up front on the orchestrator thread — `build_closure`
+/// re-resolves the dep closure through the isolate worker, and evals stay
+/// sequential. Both the cache checks and the per-dep cache store use it.
+fn precompute_dep_closures(
+    metas: &BTreeMap<String, shuttle::snap::SnapMeta>,
+    pkg_cache: Option<&shuttle::cache::PackageCache>,
+    lockfile: &LockFile,
+) -> HashMap<String, Option<shuttle::cache::BuildClosure>> {
+    metas
+        .iter()
+        .map(|(name, meta)| {
+            (
+                name.clone(),
+                pkg_cache.map(|_| build_closure(meta, lockfile)),
+            )
+        })
+        .collect()
+}
+
+/// Names whose every resolved arch is already cached under their closure
+/// key: complete before scheduling starts, releasing dependents at once.
+/// (The check reads only the dep's own closure key, so checking here
+/// equals checking just before its build — nothing else writes its
+/// entries.)
+fn cached_dep_names(
+    metas: &BTreeMap<String, shuttle::snap::SnapMeta>,
+    closures: &HashMap<String, Option<shuttle::cache::BuildClosure>>,
+    pkg_cache: Option<&shuttle::cache::PackageCache>,
+    cli_archs: &[String],
+    json: bool,
+) -> HashSet<String> {
+    let mut cached = HashSet::new();
+    for (name, meta) in metas {
+        if let (Some(cache), Some(closure)) = (pkg_cache, closures[name].as_ref()) {
+            if dep_fully_cached(cache, closure, meta, cli_archs) {
+                cached.insert(name.clone());
+                if !json {
+                    shuttle::output::ok(format!("{} (cached)", name));
+                }
+            }
+        }
+    }
+    cached
+}
+
 /// Resolve and build every transitive dependency of the selected outputs
 /// (--all mode), consulting the binary cache per dep when one is active.
+///
+/// Parallel across packages (issue #55, ADR-0022 Decision 3): the graph
+/// from `deps.rs` is scheduled by [`shuttle::build_sched`] — every READY
+/// node builds concurrently up to
+/// [`shuttle::build_sched::MAX_PARALLEL_BUILD_WORKERS`], and dependents
+/// wake as their last dependency completes. Build isolation is unchanged:
+/// each package still builds in its own tempdir stage inside its own bwrap
+/// sandbox (`env_clear` + explicit PATH, ADR-0004) with its own leak scan.
+/// The Lua-eval isolate worker (issue #76 stderr cap + wall deadline) is
+/// never run concurrently — metas and closures are resolved below, on the
+/// orchestrator thread, before scheduling.
+///
+/// Failure semantics change on purpose (issue #55): a failed package fails
+/// the run (nonzero) and its dependents never start — the sequential loop
+/// used to warn and keep building garbage.
 #[allow(clippy::too_many_arguments)]
 fn build_all_deps(
-    dep_names: &[String],
+    dep_nodes: &[shuttle::deps::DepNode],
     effective_target: Option<&String>,
     pkg_cache: Option<&shuttle::cache::PackageCache>,
     cli_archs: &[String],
@@ -911,61 +1053,127 @@ fn build_all_deps(
     lockfile: &LockFile,
     json: bool,
 ) -> miette::Result<()> {
-    if dep_names.is_empty() {
+    if dep_nodes.is_empty() {
+        return Ok(());
+    }
+    let metas = load_dep_metas(dep_nodes, effective_target);
+    if metas.is_empty() {
+        return Ok(());
+    }
+    let closures = precompute_dep_closures(&metas, pkg_cache, lockfile);
+    let pre_done = cached_dep_names(&metas, &closures, pkg_cache, cli_archs, json);
+
+    // Scheduling graph: declared deps of each loaded node. The scheduler
+    // drops self-edges (issue #33 self-host marker) and edges to names
+    // outside the closure, exactly like `topological_sort`.
+    let graph: BTreeMap<String, Vec<String>> = metas
+        .iter()
+        .map(|(name, meta)| {
+            (
+                name.clone(),
+                meta.requires
+                    .iter()
+                    .chain(&meta.build_deps)
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .collect();
+
+    let to_build = metas.len() - pre_done.len();
+    if to_build == 0 {
         return Ok(());
     }
     if !json {
-        eprintln!("── Building {} dependencies ──", dep_names.len());
+        eprintln!(
+            "── Building {to_build} dependencies (up to {} in parallel) ──",
+            shuttle::build_sched::MAX_PARALLEL_BUILD_WORKERS.min(to_build),
+        );
     }
-    for dep_name in dep_names {
-        let mut dep_meta = match shuttle::deps::load_meta(dep_name) {
-            Ok(m) => m,
-            Err(e) => {
-                shuttle::output::warn(format!("skipping dependency '{}': {}", dep_name, e));
-                continue;
-            }
-        };
 
-        // Apply --target to deps as well
-        if let Some(t) = effective_target {
-            dep_meta.target = Some(t.clone());
-        }
+    // Scoped output discipline for the parallel phase (issue #55): worker
+    // builds hold their progress output; `DepJobCtx::run` prints the
+    // attributable per-package lines, and build-child stderr is buffered
+    // per package instead of streaming into other packages' output. Both
+    // flags are set once around the whole phase — the orchestrator thread
+    // blocks inside `run_ready_set` — and restored before returning.
+    shuttle::output::set_quiet_build(true);
+    shuttle::snap::set_buffer_child_stderr(true);
+    let dispatch = AtomicUsize::new(0);
+    let ctx = DepJobCtx {
+        metas: &metas,
+        closures: &closures,
+        cli_archs,
+        output_dir,
+        pkg_cache,
+        lockfile,
+        json,
+        total: to_build,
+        dispatch: &dispatch,
+    };
+    let scheduled = shuttle::build_sched::run_ready_set(
+        &graph,
+        &pre_done,
+        shuttle::build_sched::MAX_PARALLEL_BUILD_WORKERS,
+        |name| ctx.run(name),
+    );
+    shuttle::snap::set_buffer_child_stderr(false);
+    shuttle::output::set_quiet_build(false);
 
-        // Closure key for this dep: source + parts + target + requires
-        // closure, built once per dep; both the lookup and the store below
-        // use it.
-        let dep_closure = pkg_cache.map(|_| build_closure(&dep_meta, lockfile));
-
-        // Check cache first: skip the dep only when every resolved arch is
-        // cached under its closure key.
-        if let (Some(cache), Some(closure)) = (pkg_cache, dep_closure.as_ref()) {
-            if dep_fully_cached(cache, closure, &dep_meta, cli_archs) {
-                if !json {
-                    shuttle::output::ok(format!("{} (cached)", dep_name));
-                }
-                continue;
-            }
-        }
-
-        let dep_archs = shuttle::snap::resolve_archs(&dep_meta, cli_archs);
-        build_dep_archs(
-            dep_name,
-            &dep_meta,
-            &dep_archs,
-            output_dir,
-            pkg_cache,
-            dep_closure.as_ref(),
-            lockfile,
-            json,
-        )?;
+    match scheduled {
+        Ok(()) => Ok(()),
+        Err(failed) => Err(report_failed_builds(&failed)),
     }
-    Ok(())
 }
+
+/// Prefix every line of a failed package's error with the package name, so
+/// the buffered build output stays attributable in the final report.
+fn prefix_error_lines(err: &str, name: &str) -> String {
+    let prefix = format!("[{name}] ");
+    err.lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render the scheduler's failed/skipped sets as the run's error: the run
+/// exits nonzero, naming what failed and what was never started because of
+/// it.
+fn report_failed_builds(failed: &shuttle::build_sched::FailedBuilds) -> miette::Error {
+    let names: Vec<String> = failed.failed.iter().map(|(n, _)| n.clone()).collect();
+    let mut msg = format!(
+        "{} package build(s) failed: {}",
+        failed.failed.len(),
+        names.join(", ")
+    );
+    if !failed.skipped.is_empty() {
+        msg.push_str(&format!(
+            "\nskipped (failed or unschedulable dependency): {}",
+            failed.skipped.join(", ")
+        ));
+    }
+    for (name, err) in &failed.failed {
+        msg.push_str(&format!("\n--- {name} ---\n{err}"));
+    }
+    miette::miette!("{}", msg)
+}
+
+/// Serializes pool-cache stores during the parallel dep-build phase (issue
+/// #55): `store` prunes the shared cache directory when a max size is set,
+/// and concurrent prunes would race directory mutations. Lookups stay
+/// lock-free (read-only).
+static CACHE_STORE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Build one dependency across its resolved archs, storing each artifact in
 /// the binary cache when one is active. Each arch's build gets the merged
 /// build prefix of its own build-time deps (ADR-0018 applies to every
 /// source build, dependencies included).
+///
+/// `quiet` suppresses the per-package progress lines (the parallel
+/// scheduler prints attributable ones, issue #55). A failed arch fails the
+/// package: under the parallel scheduler a failed package's dependents
+/// never start, so warning-and-continuing would build them against a
+/// missing payload.
 #[allow(clippy::too_many_arguments)]
 fn build_dep_archs(
     dep_name: &str,
@@ -976,10 +1184,11 @@ fn build_dep_archs(
     dep_closure: Option<&shuttle::cache::BuildClosure>,
     lockfile: &LockFile,
     json: bool,
+    quiet: bool,
 ) -> miette::Result<()> {
     for a in dep_archs {
         shuttle::snap::check_cross_build(a, dep_meta.target.as_deref())?;
-        if !json {
+        if !json && !quiet {
             shuttle::output::status(format!("building {} ({})...", dep_name, a));
         }
         let dep_stage = tempfile::tempdir()
@@ -993,6 +1202,7 @@ fn build_dep_archs(
             pkg_cache,
             lockfile,
             json,
+            quiet,
             &mut building,
         )?;
 
@@ -1014,17 +1224,18 @@ fn build_dep_archs(
             Some(&scan_listings),
         ) {
             Ok(result) => {
-                if !json {
+                if !json && !quiet {
                     shuttle::output::ok(&result.snap_filename);
                 }
                 if let (Some(cache), Some(closure)) = (pkg_cache, dep_closure) {
+                    let _store_lock = CACHE_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                     if let Err(e) = cache.store(dep_meta, &result, output_dir, closure) {
                         shuttle::output::warn(format!("cache store failed: {}", e));
                     }
                 }
             }
             Err(e) => {
-                shuttle::output::warn(format!("build failed for '{}': {}", dep_name, e));
+                return Err(miette::miette!("arch {a}: {e}"));
             }
         }
     }
@@ -1111,6 +1322,8 @@ fn build_one_arch(
         pkg_cache,
         lockfile,
         json,
+        // Top-level output builds are sequential — full output.
+        false,
         &mut building,
     )?;
 

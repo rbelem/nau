@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mlua::Value;
 use serde::Deserialize;
@@ -3233,6 +3234,11 @@ pub fn build_snap(
         .arg("-comp")
         .arg(compression)
         .arg("-all-root");
+    // Parallel dep builds (issue #55): mksquashfs's progress meter would
+    // interleave across packages — disable it when output is buffered.
+    if buffer_child_stderr() {
+        mksquashfs.arg("-no-progress");
+    }
 
     // Reproducible timestamps via SOURCE_DATE_EPOCH.
     // mksquashfs 4.4+ reads this env var natively — we just need to
@@ -4838,9 +4844,43 @@ fn warn_no_network_hint(stderr: &str) {
     }
 }
 
+/// When set, build-child stderr is buffered per call instead of streamed
+/// to our stderr (issue #55). Set around the parallel dep-build phase:
+/// several concurrent make logs sharing one stderr interleave into
+/// garbage, so the output is instead attached to the build's failure
+/// error and printed as one prefixed block by the scheduler. Scoped: set
+/// once around the whole phase while the orchestrator thread blocks,
+/// never mutated per-build — it does not race (ADR-0022 addendum).
+static BUFFER_CHILD_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// Buffer build-child stderr instead of streaming it (issue #55).
+pub fn set_buffer_child_stderr(on: bool) {
+    BUFFER_CHILD_STDERR.store(on, Ordering::SeqCst);
+}
+
+/// True while build-child stderr should be buffered, not streamed.
+fn buffer_child_stderr() -> bool {
+    BUFFER_CHILD_STDERR.load(Ordering::SeqCst)
+}
+
+/// Cap on the buffered build-output tail attached to a failure error.
+const FAILURE_TAIL_LINES: usize = 80;
+
+/// The last `max` lines of `text`, for the buffered failure dump. The
+/// sequential path streams everything live; the buffered dump keeps the
+/// tail (where the actual failure lives) so a wild build cannot blow up
+/// the final error message.
+fn tail_lines(text: &str, max: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max);
+    lines[start..].join("\n")
+}
+
 /// Spawn a build command, forwarding its stderr to our stderr line-by-line
 /// (output still streams live) while also collecting it, so a failure can
 /// be inspected. Reading to EOF before reaping avoids pipe deadlock.
+/// Under [`buffer_child_stderr`] the lines are only collected — the
+/// parallel scheduler owns attribution and dumps them prefixed on failure.
 fn run_build_child(
     mut cmd_proc: std::process::Command,
 ) -> std::io::Result<(std::process::ExitStatus, String)> {
@@ -4848,12 +4888,15 @@ fn run_build_child(
     use std::process::Stdio;
     cmd_proc.stderr(Stdio::piped());
     let mut child = cmd_proc.spawn()?;
+    let forward = !buffer_child_stderr();
     let collected = match child.stderr.take() {
         Some(stderr) => std::thread::spawn(move || {
             let reader = std::io::BufReader::new(stderr);
             let mut collected = String::new();
             for line in reader.lines().map_while(Result::ok) {
-                eprintln!("{line}");
+                if forward {
+                    eprintln!("{line}");
+                }
                 collected.push_str(&line);
                 collected.push('\n');
             }
@@ -5015,11 +5058,13 @@ fn run_bwrapped(
 
     if !status.success() {
         warn_no_network_hint(&stderr_text);
-        return Err(miette::miette!(
-            "build command exited with error (in sandbox)"
-        ));
+        Err(build_child_error(
+            &stderr_text,
+            "build command exited with error (in sandbox)",
+        ))
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 /// Fallback: run the build command directly on host (no sandbox).
@@ -5071,9 +5116,26 @@ fn run_direct(
 
     if !status.success() {
         warn_no_network_hint(&stderr_text);
-        return Err(miette::miette!("build command exited with error"));
+        Err(build_child_error(
+            &stderr_text,
+            "build command exited with error",
+        ))
+    } else {
+        Ok(())
     }
-    Ok(())
+}
+
+/// The failure error for an exited build child. Sequential builds already
+/// streamed the child's output live; under [`buffer_child_stderr`] the
+/// captured tail rides along in the error so the parallel scheduler can
+/// print it as one attributable block.
+fn build_child_error(stderr_text: &str, base: &str) -> miette::Error {
+    if buffer_child_stderr() && !stderr_text.trim().is_empty() {
+        let tail = tail_lines(stderr_text, FAILURE_TAIL_LINES);
+        let shown = tail.lines().count();
+        return miette::miette!("{base}\n--- build output (last {shown} lines) ---\n{tail}");
+    }
+    miette::miette!("{base}")
 }
 
 /// Export plugin BuildPlan env vars to a command (ADR-0014 Decision 4).

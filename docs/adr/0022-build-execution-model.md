@@ -74,3 +74,35 @@ milestone.
 
 **Neutral**: craft-parts is also sequential across parts, so inter-part
 parallelism remains a differentiation opportunity rather than parity debt.
+
+## Addendum (2026-09-14): inter-package parallelism landed (issue #55)
+
+Decision 3 is implemented: `build --all` dep builds are scheduled by the
+ready-set scheduler (`src/build_sched.rs`) over the existing `deps.rs`
+graph — every READY node builds concurrently, dependents wake as their
+last dependency completes, capped at `MAX_PARALLEL_BUILD_WORKERS = 3`
+(fixed constant, not nproc: build RAM and I/O multiply with concurrency).
+
+The Decision 2 `BuildContext` refactor did not need to land whole. The
+named globals turned out to be stable for the whole parallel phase on the
+`build --all` path: `SOURCE_DATE_EPOCH` is CLI-set before any build;
+`SHUTTLE_ARCH` is never set on the build path (only `image`/`eval`);
+`output` statics are set-once or Mutex-protected; `pkg_source` globals are
+Mutex-protected. Two phase-scoped flags were added instead, set once while
+the orchestrator thread blocks in the scheduler and never mutated
+per-build: `output::set_quiet_build` (spinners/bars suppressed — workers
+are attributed by scheduler-prefixed lines) and
+`snap::set_buffer_child_stderr` (per-package build output buffered, dumped
+prefixed on failure, plus mksquashfs `-no-progress`). The Lua-eval isolate
+worker (issue #76 stderr cap, wall-clock deadline) is never run
+concurrently: metas and cache closure keys are resolved on the
+orchestrator thread before scheduling.
+
+Failure semantics tightened deliberately: the sequential loop warned and
+kept building on a failed dep (producing dependents against missing
+payloads); now a failed package fails the run nonzero, names the failed
+set, and its dependents never start (`build_sched::run_ready_set` is
+stop-the-world; running builds finish inside their own containment).
+Per-build isolation is unchanged: own tempdir stage, own bwrap sandbox
+(`env_clear` + explicit PATH), own leak scan; pool-cache stores are
+serialized behind a mutex (pruning mutates the shared cache directory).
