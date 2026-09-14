@@ -4331,6 +4331,9 @@ fn run_build_command(
 ) -> miette::Result<()> {
     let bwrap_bin = detect_bwrap();
     let cross_env = cross_compile_env(target);
+    // Fail closed (issue #44): a CGO-declaring build without a declared C
+    // toolchain stops here, naming the fix, before any command runs.
+    ensure_cgo_toolchain(cmd, extra_env, build_prefix, target)?;
 
     if let Some(bwrap_bin) = bwrap_bin {
         run_bwrapped(
@@ -4476,6 +4479,94 @@ pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
         ),
         ("PKG_CONFIG_SYSROOT_DIR", prefix.to_string()),
     ]
+}
+
+/// The C-toolchain env the merged build prefix contributes (issue #44):
+/// `CC`/`CXX` pointed at the pool toolchain drivers (bare names — the
+/// prefix's `usr/bin` leads the sandbox PATH in both the bwrap and
+/// degraded-direct modes, so the name resolves to the pool compiler, not
+/// a coincidental host one).
+///
+/// Probed from the prefix, not hardcoded: a prefix without a compiler
+/// (a docs tool, a pure-Go consumer's `go`-only closure) contributes
+/// nothing, and a clang toolchain (ADR-0007 naming scheme) contributes
+/// its own driver names. Cross builds are unaffected — `cross_compile_env`
+/// applies after this and overrides both vars with the triplet-prefixed
+/// drivers.
+///
+/// Nothing here sets `CGO_ENABLED` — that stays the recipe's declaration,
+/// and [`ensure_cgo_toolchain`] holds the fail-closed line under it. The
+/// staged compiler needs no extra library wiring inside the sandbox: the
+/// gcc payload's `cc1`/`cc1plus` carry `RUNPATH=/shuttle-build-prefix/
+/// usr/lib{,64}` (the gcc.lua leak-scan contract), which is exactly where
+/// the prefix binds.
+pub fn build_prefix_toolchain_env(prefix: &Path) -> Vec<(&'static str, String)> {
+    let bin = prefix.join("usr/bin");
+    [
+        ("CC", ["gcc", "clang"].as_slice()),
+        ("CXX", ["g++", "clang++"].as_slice()),
+    ]
+    .into_iter()
+    .filter_map(|(var, names)| {
+        names
+            .iter()
+            .find(|n| bin.join(n).exists())
+            .map(|n| (var, (*n).to_string()))
+    })
+    .collect()
+}
+
+/// True when a build command (or a plugin env pair) declares
+/// `CGO_ENABLED=1` — the recipe's explicit opt-in to C compilation. The
+/// plain-substring contract is fail-closed by construction: it can only
+/// over-trigger (a literal echo of the string), never miss an opt-in that
+/// spells the variable the standard way.
+fn declares_cgo(cmd: &str, extra_env: &[(String, String)]) -> bool {
+    cmd.contains("CGO_ENABLED=1")
+        || extra_env
+            .iter()
+            .any(|(k, v)| k == "CGO_ENABLED" && v == "1")
+}
+
+/// Whether `prefix` (the merged build prefix, at its host path in both
+/// sandboxed and degraded-direct modes) provides a C compiler at its
+/// `usr/bin`.
+fn prefix_has_c_compiler(prefix: &Path) -> bool {
+    ["gcc", "cc", "clang"]
+        .iter()
+        .any(|n| prefix.join("usr/bin").join(n).exists())
+}
+
+/// Fail closed (issue #44): a build that declares `CGO_ENABLED=1` without a
+/// C toolchain in its `build_deps` cannot compile C — and rather than dying
+/// mid-Go with `cgo: C compiler "gcc" not found in $PATH`, or silently
+/// building against a coincidental host compiler that leaked through the
+/// sandbox's system binds, the build refuses up front and names the fix.
+///
+/// Cross builds are exempt: `target` routes the C compiler through the
+/// sysroot machinery (`cross_compile_env`), not the merged prefix.
+pub fn ensure_cgo_toolchain(
+    cmd: &str,
+    extra_env: &[(String, String)],
+    build_prefix: Option<&Path>,
+    target: Option<&str>,
+) -> miette::Result<()> {
+    if target.is_some() || !declares_cgo(cmd, extra_env) {
+        return Ok(());
+    }
+    let has_compiler = build_prefix.map(prefix_has_c_compiler).unwrap_or(false);
+    if !has_compiler {
+        miette::bail!(
+            "build command enables CGO (CGO_ENABLED=1) but no C toolchain is \
+             declared for the build sandbox\n\n\
+             fix: add the pool toolchain (plus pkg-config and every C library \
+             you link) to build_deps:\n\n    \
+             build_deps = {{ \"toolchain\", \"pkg-config\", ... }}\n\n\
+             A library you link must also appear in requires — the build/link \
+             split is ADR-0018's explicit-duplication norm."
+        );
+    }
+    Ok(())
 }
 
 /// The process PATH split into absolute directory entries. Relative and
@@ -5104,8 +5195,13 @@ fn run_bwrapped(
     if deps_dir.is_some() {
         cmd_proc.env("SHUTTLE_DEPS_DIR", SANDBOX_DEPS_DIR);
     }
-    if build_prefix.is_some() {
+    if let Some(prefix) = build_prefix {
         for (key, val) in build_prefix_env(SANDBOX_BUILD_PREFIX) {
+            cmd_proc.env(key, val);
+        }
+        // C-toolchain wiring (issue #44): CC/CXX at the pool drivers when
+        // the prefix provides them — the CGO host contract.
+        for (key, val) in build_prefix_toolchain_env(prefix) {
             cmd_proc.env(key, val);
         }
     }
@@ -5158,6 +5254,10 @@ fn run_direct(
     if let Some(prefix) = build_prefix {
         let host = prefix.to_string_lossy().into_owned();
         for (key, val) in build_prefix_env(&host) {
+            cmd_proc.env(key, val);
+        }
+        // Same C-toolchain wiring as the sandboxed path (issue #44).
+        for (key, val) in build_prefix_toolchain_env(prefix) {
             cmd_proc.env(key, val);
         }
         // Degraded mode keeps the sandbox's tool order (issue #33): the
@@ -9838,6 +9938,135 @@ fi
             "/shuttle-build-prefix/usr/lib/pkgconfig:/shuttle-build-prefix/usr/share/pkgconfig"
         );
         assert_eq!(get("PKG_CONFIG_SYSROOT_DIR"), "/shuttle-build-prefix");
+    }
+
+    // ── C-toolchain prefix wiring (issue #44) ──
+
+    /// Touch `usr/bin/<name>` inside a tempdir standing in for the merged
+    /// build prefix.
+    fn stage_driver(dir: &Path, name: &str) {
+        let bin = dir.join("usr/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(name), "#!/bin/sh\n").unwrap();
+    }
+
+    #[test]
+    fn build_prefix_toolchain_env_sets_cc_cxx_from_gcc() {
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "gcc");
+        stage_driver(prefix.path(), "g++");
+        let env = build_prefix_toolchain_env(prefix.path());
+        assert_eq!(
+            env,
+            vec![("CC", "gcc".to_string()), ("CXX", "g++".to_string())]
+        );
+    }
+
+    #[test]
+    fn build_prefix_toolchain_env_falls_back_to_clang_names() {
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "clang");
+        stage_driver(prefix.path(), "clang++");
+        let env = build_prefix_toolchain_env(prefix.path());
+        assert_eq!(
+            env,
+            vec![("CC", "clang".to_string()), ("CXX", "clang++".to_string())]
+        );
+    }
+
+    #[test]
+    fn build_prefix_toolchain_env_empty_prefix_sets_nothing() {
+        let prefix = tempfile::tempdir().unwrap();
+        assert!(build_prefix_toolchain_env(prefix.path()).is_empty());
+    }
+
+    #[test]
+    fn build_prefix_toolchain_env_partial_prefix_sets_cc_only() {
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "gcc");
+        let env = build_prefix_toolchain_env(prefix.path());
+        assert_eq!(env, vec![("CC", "gcc".to_string())]);
+    }
+
+    #[test]
+    fn declares_cgo_matches_command_and_plugin_env() {
+        assert!(declares_cgo("export CGO_ENABLED=1 && go build ./...", &[]));
+        assert!(declares_cgo(
+            "go build",
+            &[("CGO_ENABLED".into(), "1".into())]
+        ));
+        // Not opt-ins: explicit disable, unrelated env, plain go builds.
+        assert!(!declares_cgo("export CGO_ENABLED=0 && go build ./...", &[]));
+        assert!(!declares_cgo(
+            "go build",
+            &[("GOFLAGS".into(), "-mod=mod".into())]
+        ));
+        assert!(!declares_cgo("go build", &[]));
+    }
+
+    #[test]
+    fn ensure_cgo_toolchain_fails_closed_without_prefix_naming_the_fix() {
+        let err = ensure_cgo_toolchain("export CGO_ENABLED=1 && go build ./...", &[], None, None)
+            .expect_err("CGO without a prefix must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("CGO_ENABLED=1"), "names the trigger: {msg}");
+        assert!(msg.contains("toolchain"), "names the toolchain dep: {msg}");
+        assert!(msg.contains("build_deps"), "names the field: {msg}");
+    }
+
+    #[test]
+    fn ensure_cgo_toolchain_fails_closed_with_compilerless_prefix() {
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "go"); // a build_dep toolchain, not a C one
+        let err = ensure_cgo_toolchain(
+            "CGO_ENABLED=1 go build ./...",
+            &[],
+            Some(prefix.path()),
+            None,
+        )
+        .expect_err("prefix without a C compiler must fail");
+        assert!(format!("{err}").contains("build_deps"));
+    }
+
+    #[test]
+    fn ensure_cgo_toolchain_passes_with_declared_toolchain() {
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "gcc");
+        ensure_cgo_toolchain(
+            "export CGO_ENABLED=1 && go build ./...",
+            &[],
+            Some(prefix.path()),
+            None,
+        )
+        .expect("a prefix with a C compiler satisfies the CGO gate");
+    }
+
+    #[test]
+    fn ensure_cgo_toolchain_passes_on_cgo_free_builds_and_cross_targets() {
+        // No CGO declaration → gate inert even with no prefix at all.
+        ensure_cgo_toolchain("go build ./...", &[], None, None)
+            .expect("plain builds are not gated");
+        // Explicit disable → inert.
+        ensure_cgo_toolchain("CGO_ENABLED=0 go build ./...", &[], None, None)
+            .expect("CGO_ENABLED=0 is not a CGO opt-in");
+        // Cross targets route the compiler through the sysroot machinery.
+        ensure_cgo_toolchain(
+            "export CGO_ENABLED=1 && make",
+            &[],
+            None,
+            Some("aarch64-linux-gnu"),
+        )
+        .expect("cross builds are exempt");
+        // Plugin env pair counts as the declaration.
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "gcc");
+        ensure_cgo_toolchain(
+            "go build ./...",
+            &[("CGO_ENABLED".into(), "1".into())],
+            Some(prefix.path()),
+            None,
+        )
+        .expect("plugin env CGO_ENABLED=1 with a toolchain passes");
     }
 
     #[test]
