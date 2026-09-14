@@ -35,6 +35,31 @@
 //! id (first 16 hex chars of the public key) without bumping the manifest
 //! schema.
 //!
+//! # Provenance under the signature (SLSA-lite, issue #56)
+//!
+//! A signature entry may carry a SLSA-lite provenance attestation: what
+//! was built (the sha3-384 subject digest over the canonical body bytes),
+//! from which inputs (the declared materials at their lockfile pins), and
+//! by which builder (`shuttle:<version>` + the eval invocation flags).
+//! The provenance lives INSIDE the signatures-map entry —
+//! `{"signature": …, "provenance": …}` — never in the canonical body, so
+//! it is covered by the signature (tamper breaks verify) while
+//! byte-identical eval is preserved (the body the eval property asserts
+//! on never changes).
+//!
+//! Verification assembles the signed payload as body bytes ++ provenance
+//! bytes and refuses, before the Ed25519 check, a provenance whose
+//! subject digest does not bind the body it travels with. The materials
+//! half of the binding ([`check_provenance`]) needs the parsed manifest
+//! and is enforced by callers that hold one (the device verify path) and
+//! offered to every other consumer.
+//!
+//! Deliberately omitted (the "lite"): no full SLSA levels, no transparency
+//! log, no external rekor/keyling infrastructure, no independent builder
+//! identity — the builder id is shuttle's own version, self-asserted
+//! under the operator's key. The claim is only as strong as the signing
+//! key; that is the issue's stated bar.
+//!
 //! # Distinction from sysupdate's own verification
 //!
 //! systemd-sysupdate verifies the update payload's SHA256SUMS with its GPG
@@ -47,7 +72,7 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use miette::{IntoDiagnostic, WrapErr};
 
-use crate::manifest::ImageManifest;
+use crate::manifest::{ImageManifest, ManifestInput};
 
 /// Untrusted-comment header on the secret key file.
 const SECRET_COMMENT: &str = "untrusted comment: shuttle signing secret key (ed25519)";
@@ -115,8 +140,10 @@ pub fn sign_bytes(bytes: &[u8], kp: &KeyPair) -> String {
 
 /// Verify `manifest_bytes` against the `signatures` map using the public
 /// key `public_hex`. The entry is looked up by the key id derived from that
-/// public key; a missing entry, undecodable signature, or failed Ed25519
-/// check is a named error (fail closed).
+/// public key; a missing entry, undecodable signature, provenance that
+/// does not bind the bytes, or failed Ed25519 check is a named error
+/// (fail closed). Attested entries verify over body ++ provenance bytes
+/// (issue #56); legacy bare entries over the body alone.
 pub fn verify(
     manifest_bytes: &[u8],
     signatures: &std::collections::BTreeMap<String, serde_json::Value>,
@@ -124,15 +151,11 @@ pub fn verify(
 ) -> miette::Result<()> {
     let public = from_hex32(public_hex).wrap_err("update public key is not 64 hex chars")?;
     let key_id = to_hex(&public)[..16].to_string();
-    let raw = signatures
-        .get(&key_id)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            miette::miette!(
-                "manifest carries no signature for key id {key_id} — refusing to verify"
-            )
-        })?;
-    verify_one(manifest_bytes, &key_id, raw, &public)
+    let entry = signatures.get(&key_id).ok_or_else(|| {
+        miette::miette!("manifest carries no signature for key id {key_id} — refusing to verify")
+    })?;
+    let (payload, raw) = entry_signed_payload(manifest_bytes, &key_id, entry)?;
+    verify_one(&payload, &key_id, &raw, &public)
 }
 
 /// Canonical signature input: the manifest serialized with `signatures`
@@ -142,6 +165,252 @@ pub fn canonical_bytes(manifest: &ImageManifest) -> miette::Result<Vec<u8>> {
     let mut clean = manifest.clone();
     clean.signatures.clear();
     serde_json::to_vec(&clean).map_err(|e| miette::miette!("canonical serialization: {e}"))
+}
+
+// ── SLSA-lite provenance (issue #56) ──
+
+/// Provenance payload schema version — independent of the manifest schema,
+/// bumped when the attestation claims change meaning.
+pub const PROVENANCE_VERSION: u32 = 1;
+
+/// The subject name recorded in every provenance: the attested output IS
+/// the canonical manifest body (not a blob — the pins inside it address
+/// those).
+const SUBJECT_NAME: &str = "manifest";
+
+/// One signatures-map entry. Two shapes, both verify:
+///
+/// - `Bare` — the legacy plain base64 signature over the canonical body
+///   bytes only (every manifest signed before issue #56).
+/// - `Attested` — the signature over body bytes ++ provenance bytes,
+///   with the SLSA-lite claims riding inside the entry (under the
+///   signature, never in the canonical body). `provenance` is optional so
+///   an envelope object without claims still verifies over the body.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum SignatureEntry {
+    Bare(String),
+    Attested {
+        signature: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<Provenance>,
+    },
+}
+
+impl SignatureEntry {
+    /// The attested claims, when the entry carries them.
+    pub fn provenance(&self) -> Option<&Provenance> {
+        match self {
+            SignatureEntry::Bare(_) => None,
+            SignatureEntry::Attested { provenance, .. } => provenance.as_ref(),
+        }
+    }
+}
+
+/// The eval invocation a provenance attests: the flags that shaped pin
+/// resolution (and that are deliberately kept OUT of the canonical body —
+/// they are builder facts, not definition facts).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Invocation {
+    pub arch: String,
+    pub channel: String,
+    /// True when eval ran with `--offline` (resolution was forbidden to
+    /// touch the network).
+    pub offline: bool,
+}
+
+/// The attested output: the sha3-384 of the canonical body bytes. The
+/// same content-address family the image snap pins use.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Subject {
+    pub name: String,
+    pub manifest_sha3_384: String,
+}
+
+/// SLSA-lite provenance, attached under a signature entry (issue #56).
+/// What was built (subject), from which verified inputs (materials), by
+/// which builder (builder id + invocation).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Provenance {
+    pub version: u32,
+
+    /// Builder identity — `shuttle:<CARGO_PKG_VERSION>`. Self-asserted
+    /// under the signing key; there is no independent builder registry
+    /// (the "lite").
+    pub builder_id: String,
+
+    /// The invocation flags of the eval that produced the manifest.
+    pub invocation: Invocation,
+
+    /// The definition's declared inputs at their lockfile pins — a mirror
+    /// of `ImageManifest.inputs`. The full input inventory (including
+    /// every image snap pin) is already inside the signed body; the
+    /// materials claim re-asserts the source-input half so a verifier
+    /// holding only the attestation can read it, and
+    /// [`check_provenance`] refuses a mirror that diverges from the
+    /// manifest it rides.
+    pub materials: std::collections::BTreeMap<String, ManifestInput>,
+
+    /// The output digest binding: sha3-384 over the canonical body bytes
+    /// the signature covers. Enforced at verify time before the Ed25519
+    /// check — an attestation that does not bind its bytes is refused.
+    pub subject: Subject,
+}
+
+/// The builder id for a shuttle version.
+pub fn builder_id(shuttle_version: &str) -> String {
+    format!("shuttle:{shuttle_version}")
+}
+
+/// SHA3-384 hex over the canonical body bytes — the provenance subject
+/// digest.
+pub fn subject_digest(body: &[u8]) -> String {
+    use sha3::Digest;
+    to_hex(&sha3::Sha3_384::digest(body))
+}
+
+/// The deterministic bytes a provenance contributes to the signed
+/// payload (appended after the canonical body bytes).
+pub fn provenance_bytes(provenance: &Provenance) -> miette::Result<Vec<u8>> {
+    serde_json::to_vec(provenance).map_err(|e| miette::miette!("provenance serialization: {e}"))
+}
+
+impl Provenance {
+    /// Build the SLSA-lite attestation for an eval-produced manifest:
+    /// builder `shuttle:<version>`, the invocation flags, the declared
+    /// inputs as materials, and the sha3-384 subject over `body` (the
+    /// canonical bytes [`canonical_bytes`] produced).
+    pub fn for_manifest(
+        shuttle_version: &str,
+        arch: &str,
+        channel: &str,
+        offline: bool,
+        manifest: &ImageManifest,
+        body: &[u8],
+    ) -> miette::Result<Provenance> {
+        Ok(Provenance {
+            version: PROVENANCE_VERSION,
+            builder_id: builder_id(shuttle_version),
+            invocation: Invocation {
+                arch: arch.to_string(),
+                channel: channel.to_string(),
+                offline,
+            },
+            materials: manifest.inputs.clone(),
+            subject: Subject {
+                name: SUBJECT_NAME.to_string(),
+                manifest_sha3_384: subject_digest(body),
+            },
+        })
+    }
+}
+
+/// Attach `provenance` under a fresh signature by `kp`: the Ed25519
+/// signature covers canonical body bytes ++ provenance bytes, and the
+/// envelope lands in the signatures map keyed by key id. Prior
+/// signatures keep verifying (they cover different bytes by design).
+pub fn sign_attested(
+    manifest: &mut ImageManifest,
+    kp: &KeyPair,
+    provenance: &Provenance,
+) -> miette::Result<()> {
+    let mut payload = canonical_bytes(manifest)?;
+    payload.extend_from_slice(&provenance_bytes(provenance)?);
+    let signature = sign_bytes(&payload, kp);
+    manifest.signatures.insert(
+        kp.key_id(),
+        serde_json::to_value(SignatureEntry::Attested {
+            signature,
+            provenance: Some(provenance.clone()),
+        })
+        .map_err(|e| miette::miette!("signature envelope serialization: {e}"))?,
+    );
+    Ok(())
+}
+
+/// Eval-time attestation (issue #56): sign the manifest and attach the
+/// SLSA-lite provenance under the signature — builder `shuttle:<version>`,
+/// invocation = the eval flags, materials = the declared inputs, subject =
+/// the body's sha3-384. The provenance lives inside the signatures-map
+/// entry, never in the canonical body, so byte-identical eval is
+/// preserved.
+pub fn attest_eval(
+    manifest: &mut ImageManifest,
+    kp: &KeyPair,
+    shuttle_version: &str,
+    arch: &str,
+    channel: &str,
+    offline: bool,
+) -> miette::Result<()> {
+    let body = canonical_bytes(manifest)?;
+    let provenance =
+        Provenance::for_manifest(shuttle_version, arch, channel, offline, manifest, &body)?;
+    sign_attested(manifest, kp, &provenance)
+}
+
+/// The materials half of the provenance binding: an attested entry's
+/// materials must EQUAL the manifest's declared inputs — the attestation
+/// claims "built from these inputs", so a mirror that diverges from the
+/// manifest it rides is a refused lie. Entries without provenance are
+/// `Ok(None)` (legacy bare signatures carry no claims). The signature and
+/// subject halves of the binding are enforced inside [`verify`] and
+/// [`verify_keychain`] unconditionally; call this wherever the parsed
+/// manifest is in hand (the device verify path does).
+pub fn check_provenance(
+    entry: &serde_json::Value,
+    inputs: &std::collections::BTreeMap<String, ManifestInput>,
+) -> miette::Result<Option<Provenance>> {
+    let parsed: SignatureEntry = serde_json::from_value(entry.clone())
+        .map_err(|e| miette::miette!("signature entry is not a valid signature envelope: {e}"))?;
+    let Some(provenance) = parsed.provenance() else {
+        return Ok(None);
+    };
+    if &provenance.materials != inputs {
+        return Err(miette::miette!(
+            "provenance materials do not match the manifest inputs — the attestation \
+             claims a different input inventory than the manifest carries; refusing"
+        ));
+    }
+    Ok(Some(provenance.clone()))
+}
+
+/// Decode one signatures-map entry and assemble the exact bytes its
+/// Ed25519 signature covers (issue #56): the canonical body bytes, plus
+/// the entry's provenance bytes when the entry carries them. A provenance
+/// whose subject digest does not bind `body` is a named error BEFORE the
+/// Ed25519 check — an attestation detached from its bytes must not pass
+/// even with a valid signature over the pair.
+fn entry_signed_payload(
+    body: &[u8],
+    key_id: &str,
+    entry: &serde_json::Value,
+) -> miette::Result<(Vec<u8>, String)> {
+    let parsed: SignatureEntry = serde_json::from_value(entry.clone()).map_err(|e| {
+        miette::miette!("signature entry for {key_id} is not a valid signature envelope: {e}")
+    })?;
+    match parsed {
+        SignatureEntry::Bare(raw) => Ok((body.to_vec(), raw)),
+        SignatureEntry::Attested {
+            signature,
+            provenance,
+        } => {
+            let Some(provenance) = provenance else {
+                return Ok((body.to_vec(), signature));
+            };
+            let actual = subject_digest(body);
+            if actual != provenance.subject.manifest_sha3_384 {
+                return Err(miette::miette!(
+                    "provenance subject digest does not bind these manifest bytes \
+                     (attested {}, actual {}) — refusing to verify",
+                    provenance.subject.manifest_sha3_384,
+                    actual
+                ));
+            }
+            let mut payload = body.to_vec();
+            payload.extend_from_slice(&provenance_bytes(&provenance)?);
+            Ok((payload, signature))
+        }
+    }
 }
 
 /// Create (never overwrite) the secret key under `home`. The 32 seed bytes
@@ -518,9 +787,11 @@ pub fn reject_revoked(
 }
 
 /// Multi-key verify: accept when ANY signature whose key id is in the
-/// trusted set verifies over `manifest_bytes`. An empty chain fails
-/// closed; so does a chain where no trusted key has a verifiable
-/// signature. Returns the key id that verified.
+/// trusted set verifies over `manifest_bytes`. Attested entries verify
+/// over body ++ provenance bytes with the subject binding enforced
+/// (issue #56); a malformed envelope counts as failed, not missing. An
+/// empty chain fails closed; so does a chain where no trusted key has a
+/// verifiable signature. Returns the key id that verified.
 pub fn verify_keychain(
     manifest_bytes: &[u8],
     signatures: &std::collections::BTreeMap<String, serde_json::Value>,
@@ -534,11 +805,13 @@ pub fn verify_keychain(
     let mut missing = Vec::new();
     let mut failed = Vec::new();
     for (key_id, public) in &chain.entries {
-        let Some(raw) = signatures.get(key_id).and_then(|v| v.as_str()) else {
+        let Some(entry) = signatures.get(key_id) else {
             missing.push(key_id.clone());
             continue;
         };
-        match verify_one(manifest_bytes, key_id, raw, public) {
+        let checked = entry_signed_payload(manifest_bytes, key_id, entry)
+            .and_then(|(payload, raw)| verify_one(&payload, key_id, &raw, public));
+        match checked {
             Ok(()) => return Ok(key_id.clone()),
             Err(_) => failed.push(key_id.clone()),
         }
@@ -1274,6 +1547,265 @@ mod tests {
         assert!(
             format!("{err:#}").contains("revoked-keys"),
             "corrupt revocation list named: {err:#}"
+        );
+    }
+
+    // ── SLSA-lite provenance under the signature (issue #56) ──
+
+    /// A manifest with one lockfile-pinned github input — the materials
+    /// mirror has real content to assert against.
+    fn manifest_with_github_input() -> ImageManifest {
+        let declared = std::collections::HashMap::from([(
+            "pkgs".to_string(),
+            crate::snap::PackageInput {
+                url: "github:owner/repo/main".into(),
+            },
+        )]);
+        let mut lockfile = crate::lock::LockFile {
+            version: 1,
+            sources: std::collections::HashMap::new(),
+            snaps: std::collections::HashMap::new(),
+            inputs: std::collections::HashMap::new(),
+            packages: std::collections::HashMap::new(),
+            build_deps: std::collections::HashMap::new(),
+        };
+        lockfile.inputs.insert(
+            "pkgs".into(),
+            crate::lock::InputLockEntry {
+                revision: Some("c0ffee".into()),
+                sha256: Some("beef".into()),
+                local: false,
+            },
+        );
+        crate::manifest::build_manifest(
+            &crate::lua::Outputs::new(),
+            &std::collections::HashMap::new(),
+            &declared,
+            &lockfile,
+            "amd64",
+            "latest/stable",
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Deterministic keypair so the golden envelope test is stable.
+    fn fixed_kp() -> KeyPair {
+        let seed = [0x42u8; 32];
+        let signing = SigningKey::from_bytes(&seed);
+        KeyPair {
+            seed,
+            public: signing.verifying_key().to_bytes(),
+        }
+    }
+
+    /// Flip one provenance field inside the stored entry and write it
+    /// back — the tamper an attacker (or a lying signer) produces.
+    fn tamper_provenance(manifest: &mut ImageManifest, key_id: &str) {
+        let mut entry: SignatureEntry =
+            serde_json::from_value(manifest.signatures[key_id].clone()).unwrap();
+        match &mut entry {
+            SignatureEntry::Attested { provenance, .. } => {
+                provenance.as_mut().unwrap().builder_id = "shuttle:0.0.0-lies".into();
+            }
+            SignatureEntry::Bare(_) => panic!("expected an attested entry"),
+        }
+        manifest
+            .signatures
+            .insert(key_id.to_string(), serde_json::to_value(&entry).unwrap());
+    }
+
+    #[test]
+    fn attested_signature_verifies_and_binds_the_body() {
+        let (_, kp) = temp_keypair();
+        let mut manifest = manifest_with_github_input();
+        attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", false).unwrap();
+
+        let body = canonical_bytes(&manifest).unwrap();
+        verify(&body, &manifest.signatures, &kp.public_hex()).unwrap();
+
+        // The entry is an attested envelope whose subject digests the body.
+        let parsed: SignatureEntry =
+            serde_json::from_value(manifest.signatures[&kp.key_id()].clone()).unwrap();
+        let prov = parsed.provenance().expect("attested entry carries claims");
+        assert_eq!(prov.version, PROVENANCE_VERSION);
+        assert_eq!(prov.builder_id, "shuttle:9.9.9");
+        assert_eq!(prov.invocation.arch, "amd64");
+        assert_eq!(prov.invocation.channel, "latest/stable");
+        assert!(!prov.invocation.offline);
+        assert_eq!(prov.subject.manifest_sha3_384, subject_digest(&body));
+        assert_eq!(
+            prov.subject.name, "manifest",
+            "the attested output is the canonical manifest body"
+        );
+    }
+
+    #[test]
+    fn tampered_provenance_fails_verification() {
+        let (_, kp) = temp_keypair();
+        let mut manifest = manifest_with_github_input();
+        attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", false).unwrap();
+        let key_id = kp.key_id();
+        tamper_provenance(&mut manifest, &key_id);
+
+        let body = canonical_bytes(&manifest).unwrap();
+        let err = verify(&body, &manifest.signatures, &kp.public_hex()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("FAILED"),
+            "any provenance flip must break the signature: {err:#}"
+        );
+    }
+
+    #[test]
+    fn legacy_bare_signatures_still_verify_beside_attested() {
+        let (home_a, a) = temp_keypair();
+        let (_, b) = temp_keypair();
+        let _ = home_a;
+        let mut manifest = manifest_with_github_input();
+        // `a` signs the old way (bare string entry, body-only coverage) —
+        // an old manifest or an old signer must keep verifying.
+        cosign(&mut manifest, &a).unwrap();
+        // `b` signs the new way (attested envelope) beside it.
+        attest_eval(&mut manifest, &b, "9.9.9", "amd64", "latest/stable", false).unwrap();
+
+        let body = canonical_bytes(&manifest).unwrap();
+        verify(&body, &manifest.signatures, &a.public_hex()).unwrap();
+        verify(&body, &manifest.signatures, &b.public_hex()).unwrap();
+
+        // The bare entry carries no claims; check_provenance says so.
+        let bare = check_provenance(&manifest.signatures[&a.key_id()], &manifest.inputs).unwrap();
+        assert!(bare.is_none(), "legacy entries are claim-free");
+        let attested =
+            check_provenance(&manifest.signatures[&b.key_id()], &manifest.inputs).unwrap();
+        assert!(attested.is_some(), "attested entries surface their claims");
+    }
+
+    #[test]
+    fn provenance_subject_mismatch_is_a_named_error() {
+        let (_, kp) = temp_keypair();
+        let mut a = manifest_with_github_input();
+        attest_eval(&mut a, &kp, "9.9.9", "amd64", "latest/stable", false).unwrap();
+        let prov: Provenance = {
+            let parsed: SignatureEntry =
+                serde_json::from_value(a.signatures[&kp.key_id()].clone()).unwrap();
+            parsed.provenance().unwrap().clone()
+        };
+
+        // Attach a's attestation to a DIFFERENT body: the signature still
+        // covers the pair, but the claims do not bind these bytes —
+        // refused by name before the Ed25519 check.
+        let mut b = minimal_manifest();
+        sign_attested(&mut b, &kp, &prov).unwrap();
+        let body_b = canonical_bytes(&b).unwrap();
+        let err = verify(&body_b, &b.signatures, &kp.public_hex()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not bind these manifest bytes"),
+            "subject mismatch must be named: {msg}"
+        );
+        assert!(
+            msg.contains(&prov.subject.manifest_sha3_384),
+            "attested digest named: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_provenance_requires_materials_to_match_manifest_inputs() {
+        let (_, kp) = temp_keypair();
+        let mut signed = manifest_with_github_input();
+        attest_eval(&mut signed, &kp, "9.9.9", "amd64", "latest/stable", false).unwrap();
+        let entry = signed.signatures[&kp.key_id()].clone();
+
+        // The attestation mirrors the manifest it rode in on: equal inputs pass.
+        check_provenance(&entry, &signed.inputs).unwrap();
+
+        // A manifest with a DIFFERENT input inventory: the attestation is
+        // a lie about its materials — refused.
+        let bare_manifest = minimal_manifest();
+        let err = check_provenance(&entry, &bare_manifest.inputs).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("materials do not match the manifest inputs"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn attested_envelope_json_is_a_deliberate_golden() {
+        let mut manifest = manifest_with_github_input();
+        let kp = fixed_kp();
+        attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", false).unwrap();
+        let body = canonical_bytes(&manifest).unwrap();
+        let entry = &manifest.signatures[&kp.key_id()];
+        let sig = entry["signature"].as_str().expect("signature field");
+        let json = serde_json::to_string(entry).unwrap();
+        // The stored entry is a serde_json::Value (BTreeMap keys), so the
+        // envelope's key order is sorted-deterministic — this literal is
+        // the deliberate golden; update it only with the schema.
+        let want = format!(
+            concat!(
+                r#"{{"provenance":{{"builder_id":"shuttle:9.9.9","#,
+                r#""invocation":{{"arch":"amd64","channel":"latest/stable","offline":false}},"#,
+                r#""materials":{{"pkgs":{{"revision":"c0ffee","sha256":"beef","#,
+                r#""url":"github:owner/repo/main"}}}},"#,
+                r#""subject":{{"manifest_sha3_384":"{digest}","name":"manifest"}},"version":1}},"#,
+                r#""signature":"{sig}"}}"#
+            ),
+            sig = sig,
+            digest = subject_digest(&body),
+        );
+        assert_eq!(
+            json, want,
+            "envelope shape is a deliberate golden — update it only with the schema"
+        );
+    }
+
+    #[test]
+    fn attested_signatures_stay_out_of_canonical_bytes() {
+        let (_, kp) = temp_keypair();
+        let mut manifest = manifest_with_github_input();
+        attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", true).unwrap();
+        // Byte-identical eval is the hard constraint (issue #56): a fully
+        // attested manifest's canonical bytes are exactly the unsigned
+        // golden — builder/host facts never enter the body.
+        assert_eq!(
+            canonical_bytes(&manifest).unwrap(),
+            canonical_bytes(&manifest_with_github_input()).unwrap()
+        );
+    }
+
+    #[test]
+    fn keychain_verifies_attested_entries_and_fails_on_tamper() {
+        let (_, kp) = temp_keypair();
+        let (_, other) = temp_keypair();
+        let mut manifest = manifest_with_github_input();
+        attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", true).unwrap();
+        let body = canonical_bytes(&manifest).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let chain = chain_with(dir.path(), &[&kp, &other]);
+
+        let verified = verify_keychain(&body, &manifest.signatures, &chain).unwrap();
+        assert_eq!(verified, kp.key_id());
+
+        let key_id = kp.key_id();
+        tamper_provenance(&mut manifest, &key_id);
+        let err = verify_keychain(&body, &manifest.signatures, &chain).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no trusted signature verifies"),
+            "tampered provenance fails the whole chain: {err:#}"
+        );
+    }
+
+    #[test]
+    fn malformed_envelope_is_a_named_error() {
+        let (_, kp) = temp_keypair();
+        let manifest = minimal_manifest();
+        let body = canonical_bytes(&manifest).unwrap();
+        let mut sigs = BTreeMap::new();
+        sigs.insert(kp.key_id(), serde_json::json!({ "signature": 123 }));
+        let err = verify(&body, &sigs, &kp.public_hex()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a valid signature envelope"),
+            "{err:#}"
         );
     }
 }

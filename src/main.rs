@@ -1968,24 +1968,28 @@ fn cmd_eval(
         output_name.as_deref(),
     )?;
 
-    // ADR-0011 step (d): opt-in manifest signing. A key at
+    // ADR-0011 step (d) + issue #56: opt-in manifest signing. A key at
     // ~/.config/shuttle/secret-key attests the canonical bytes (signatures
-    // map excluded); an absent key keeps `signatures` {} with a note —
-    // eval never fails on signing and never generates keys (that is the
-    // image build's deliberate engagement; mandated signing is step (e)).
+    // map excluded) and carries the SLSA-lite provenance under the
+    // signature — builder, invocation, materials, subject digest. An
+    // absent key keeps `signatures` {} with a note — eval never fails on
+    // signing and never generates keys (that is the image build's
+    // deliberate engagement; mandated signing is step (e)).
     let mut manifest = manifest;
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     match shuttle::sign::load_secret_key(&home) {
-        Ok(Some(kp)) => match shuttle::sign::canonical_bytes(&manifest) {
-            Ok(bytes) => {
-                let sig = shuttle::sign::sign_bytes(&bytes, &kp);
-                manifest
-                    .signatures
-                    .insert(kp.key_id(), serde_json::Value::String(sig));
-                eprintln!("  ✓ manifest signed (key id {})", kp.key_id());
+        Ok(Some(kp)) => {
+            let version = env!("CARGO_PKG_VERSION");
+            match shuttle::sign::attest_eval(&mut manifest, &kp, version, &arch, &channel, offline)
+            {
+                Ok(()) => eprintln!(
+                    "  ✓ manifest signed with provenance (key id {}, builder {})",
+                    kp.key_id(),
+                    shuttle::sign::builder_id(version)
+                ),
+                Err(e) => eprintln!("  ⚠ signing skipped: {e:#}"),
             }
-            Err(e) => eprintln!("  ⚠ signing skipped: {e:#}"),
-        },
+        }
         Ok(None) => {
             eprintln!(
                 "  ℹ no signing key at {} — signatures left empty (opt-in until \

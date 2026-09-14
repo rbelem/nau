@@ -2083,6 +2083,34 @@ pub fn verify_signatures_at(
     let revoked = embedded_revoked_keys(anchor, keys)?;
     crate::sign::reject_revoked(signatures, &revoked)?;
 
+    let verified = verify_against_anchors(canonical, signatures, anchor, keys)?;
+
+    // Issue #56: the entry that verified may carry SLSA-lite provenance.
+    // The signature and subject halves of the binding are enforced inside
+    // sign::verify / verify_keychain; here, with the manifest in hand, the
+    // attested materials must equal the manifest's declared inputs. A
+    // body that does not parse as a manifest has no inventory to bind, so
+    // the check is skipped for it.
+    if let Some(key_id) = &verified {
+        if let Some(entry) = signatures.get(key_id) {
+            if let Ok(manifest) =
+                serde_json::from_slice::<crate::manifest::ImageManifest>(canonical)
+            {
+                crate::sign::check_provenance(entry, &manifest.inputs)?;
+            }
+        }
+    }
+    Ok(verified)
+}
+
+/// The anchor walk behind [`verify_signatures_at`]: embedded trust set,
+/// single-anchor fallback, then the operator keychain.
+fn verify_against_anchors(
+    canonical: &[u8],
+    signatures: &BTreeMap<String, serde_json::Value>,
+    anchor: &Path,
+    keys: &Path,
+) -> miette::Result<Option<String>> {
     // 1. The embedded device trust set (/etc/shuttle/trusted-keys/*.pub),
     //    plus the single-anchor fallback (/etc/shuttle/update-key.pub) for
     //    images built before the set shape existed.
@@ -3620,6 +3648,98 @@ plugs:
         )
         .unwrap();
         assert_eq!(verified.as_deref(), Some(kp.key_id().as_str()));
+    }
+
+    #[test]
+    fn attested_manifest_verifies_and_divergent_materials_fail() {
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join("keys");
+        let kp = crate::sign::create_secret_key(home.path()).unwrap();
+        crate::sign::install_public_key(&kp, &keys).unwrap();
+
+        // A manifest with one pinned github input.
+        let declared = std::collections::HashMap::from([(
+            "pkgs".to_string(),
+            crate::snap::PackageInput {
+                url: "github:owner/repo/main".into(),
+            },
+        )]);
+        let mut lockfile = crate::lock::LockFile {
+            version: 1,
+            sources: std::collections::HashMap::new(),
+            snaps: std::collections::HashMap::new(),
+            inputs: std::collections::HashMap::new(),
+            packages: std::collections::HashMap::new(),
+            build_deps: std::collections::HashMap::new(),
+        };
+        lockfile.inputs.insert(
+            "pkgs".into(),
+            crate::lock::InputLockEntry {
+                revision: Some("c0ffee".into()),
+                sha256: Some("beef".into()),
+                local: false,
+            },
+        );
+        let mut manifest = crate::manifest::build_manifest(
+            &crate::lua::Outputs::new(),
+            &std::collections::HashMap::new(),
+            &declared,
+            &lockfile,
+            "amd64",
+            "latest/stable",
+            None,
+        )
+        .unwrap();
+
+        // The honest attestation verifies on the device path.
+        crate::sign::attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", false)
+            .unwrap();
+        let canonical = crate::sign::canonical_bytes(&manifest).unwrap();
+        let verified = verify_signatures_at(
+            &canonical,
+            &manifest.signatures,
+            Path::new("/definitely/not/here"),
+            &keys,
+        )
+        .unwrap();
+        assert_eq!(verified.as_deref(), Some(kp.key_id().as_str()));
+
+        // A materials claim that diverges from the manifest's own inputs:
+        // the signature is valid (it covers body ++ provenance) and the
+        // subject digest binds the body — only the materials lie. The
+        // device path must refuse the attestation by name.
+        let mut lying = crate::sign::Provenance::for_manifest(
+            "9.9.9",
+            "amd64",
+            "latest/stable",
+            false,
+            &manifest,
+            &canonical,
+        )
+        .unwrap();
+        lying.materials.insert(
+            "extra".into(),
+            crate::manifest::ManifestInput {
+                url: "github:evil/injected/main".into(),
+                revision: Some("deadbeef".into()),
+                sha256: None,
+                local: false,
+            },
+        );
+        let mut forged = manifest.clone();
+        crate::sign::sign_attested(&mut forged, &kp, &lying).unwrap();
+        let canonical_forged = crate::sign::canonical_bytes(&forged).unwrap();
+        let err = verify_signatures_at(
+            &canonical_forged,
+            &forged.signatures,
+            Path::new("/definitely/not/here"),
+            &keys,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("materials do not match the manifest inputs"),
+            "divergent materials must be named: {err:#}"
+        );
     }
 
     /// A minimal manifest signed by `kp`.

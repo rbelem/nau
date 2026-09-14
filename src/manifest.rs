@@ -93,15 +93,21 @@ pub struct ImageManifest {
     /// The definition's `image()` declarations, keyed by images-table name.
     pub images: BTreeMap<String, ImageEntry>,
 
-    /// Reserved for detached signatures over this manifest (synthesis §6.4 —
-    /// signing later protects exactly this artifact). Always an empty object
-    /// in v1; never populated by eval. Future signers attach entries keyed
-    /// by key id without bumping the surrounding schema.
+    /// Detached signatures over this manifest (synthesis §6.4 — signing
+    /// protects exactly this artifact; ADR-0011 step (d)). Entries are
+    /// keyed by key id (first 16 hex chars of the public key) and come in
+    /// two shapes: the legacy plain base64 signature over the canonical
+    /// bytes, or the issue-#56 attested envelope
+    /// `{"signature": …, "provenance": …}` whose signature covers the
+    /// canonical bytes PLUS the provenance bytes — the SLSA-lite claims
+    /// ride under the signature, never in the canonical body, so
+    /// byte-identical eval is preserved. The map is excluded from the
+    /// canonical bytes, so entries never cover themselves.
     pub signatures: BTreeMap<String, serde_json::Value>,
 }
 
 /// One declared package input with its lockfile pin state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestInput {
     /// Declared URL (e.g. "github:owner/repo/branch", "path:vendor").
     pub url: String,
