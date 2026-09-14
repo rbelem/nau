@@ -1757,6 +1757,13 @@ fn unsquashfs_kernel(
 /// single-source on `lib/modules/`, so this mapping is what makes the UC
 /// layout discoverable.
 fn copy_kernel_tree(kernel_dir: &Path, root: &Path) -> miette::Result<()> {
+    // Issue #74: the real pi-kernel carries BOTH spellings at once —
+    // conventional `lib/modules` + `lib/firmware` as SYMLINKS to the real
+    // snap-root `modules/` + `firmware/`. `cp_r` follows the symlink for
+    // the first spelling and copies the real tree for the second; the
+    // merge-overwrite walk lands the same content either way, so the
+    // double spelling is idempotent, not corrupting (proven by
+    // `copy_kernel_tree_maps_the_pi_kernel_double_spelling`).
     for (src_rel, dst_rel) in [
         ("lib/modules", "lib/modules"),
         ("lib/firmware", "lib/firmware"),
@@ -1776,6 +1783,75 @@ fn copy_kernel_tree(kernel_dir: &Path, root: &Path) -> miette::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real pi-kernel snap layout (#74): BOTH spellings at once —
+    /// `lib/modules` and `lib/firmware` as SYMLINKS to the snap-root
+    /// `modules/`/`firmware/` trees. The merge must land exactly one
+    /// correct `lib/modules/<ver>` tree in the rootfs: the symlink walk
+    /// and the real-tree walk overlap, and a corrupting interaction
+    /// (dangling link, truncated dir, duplicated version dir) would break
+    /// `discover_kernel_version` and the booted runtime alike.
+    #[test]
+    fn copy_kernel_tree_maps_the_pi_kernel_double_spelling() {
+        let kdir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let version = "5.15.0-1103-raspi";
+
+        // The real tree: modules/<ver>/kernel/... with a module file.
+        let ko = kdir
+            .path()
+            .join(format!("modules/{version}/kernel/dm-verity.ko"));
+        std::fs::create_dir_all(ko.parent().unwrap()).unwrap();
+        std::fs::write(&ko, b"ko-bytes").unwrap();
+        std::fs::create_dir_all(kdir.path().join("firmware")).unwrap();
+        std::fs::write(kdir.path().join("firmware/fw.bin"), b"fw").unwrap();
+        // The Pi spellings: lib/modules -> ../modules, lib/firmware -> ../firmware.
+        std::fs::create_dir_all(kdir.path().join("lib")).unwrap();
+        std::os::unix::fs::symlink(kdir.path().join("modules"), kdir.path().join("lib/modules"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            kdir.path().join("firmware"),
+            kdir.path().join("lib/firmware"),
+        )
+        .unwrap();
+
+        copy_kernel_tree(kdir.path(), root.path()).unwrap();
+
+        let staged_modules = root.path().join("lib/modules");
+        let staged_ver = staged_modules.join(&version);
+        // A REAL directory — never the symlink spelling copied verbatim.
+        let meta = std::fs::symlink_metadata(&staged_modules).unwrap();
+        assert!(
+            meta.is_dir(),
+            "staged lib/modules must be a real directory, got {:?}",
+            meta.file_type()
+        );
+        assert!(
+            staged_ver.join("kernel/dm-verity.ko").is_file(),
+            "module tree staged under lib/modules/{version}"
+        );
+        assert_eq!(
+            std::fs::read(staged_ver.join("kernel/dm-verity.ko")).unwrap(),
+            b"ko-bytes",
+            "staged module bytes are the snap's bytes"
+        );
+        assert!(
+            root.path().join("lib/firmware/fw.bin").is_file(),
+            "firmware staged under lib/firmware"
+        );
+        // Exactly one version dir — the overlapping walks must not fork.
+        let versions: Vec<String> = std::fs::read_dir(&staged_modules)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            versions,
+            vec![version.to_string()],
+            "the double spelling must merge into one module tree, got {versions:?}"
+        );
+    }
 
     #[test]
     fn embed_binary_stages_the_executable_at_the_pinned_path() {

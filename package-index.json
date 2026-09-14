@@ -213,6 +213,63 @@
           "channel": "22/stable"
         }
       }
+    },
+    {
+      "name": "pi-kernel",
+      "store": {
+        "channel": "latest/stable"
+      },
+      "pins": {
+        "arm64@22/stable": {
+          "revision": 1137,
+          "sha3-384": "ca24a611315cbd2bdf349eff5a92db53b4a7d5b754f2bbb4d9f85529ad29636ff9c40d6a3215530d77934bcbb72ce714",
+          "channel": "22/stable"
+        },
+        "arm64@26/stable": {
+          "revision": 1163,
+          "sha3-384": "45ceee8d9064f4e85161b589794e1ef0343e62c377760a9df3654a2ca0a34a59dbfc528cdd5eae3904414076baaaafc5",
+          "channel": "26/stable"
+        },
+        "arm64@latest/stable": {
+          "revision": 853,
+          "sha3-384": "68d650c06d61a12ea8f7c232b49419bd5dc14a5fead175693729cc4abc8b17230564f5d808dafa675b080692e7497c1c",
+          "channel": "latest/stable"
+        },
+        "armhf@22/stable": {
+          "revision": 1136,
+          "sha3-384": "8475b1d04e752ff1b50fb3fe415157760d69b5beabd1ad4365624cc41bc0485a27c8168d1a7d253bdd8c0eaf754d9ab5",
+          "channel": "22/stable"
+        }
+      }
+    },
+    {
+      "name": "pi-gadget",
+      "store": {
+        "name": "pi",
+        "channel": "latest/stable"
+      },
+      "pins": {
+        "arm64@22/stable": {
+          "revision": 132,
+          "sha3-384": "191160a445e13ab222b390750b829617e6b8a9ff6e1116f9bf6e435c32731ae1fc6421b6fbacd87fccf42af2e082a558",
+          "channel": "22/stable"
+        },
+        "arm64@26/stable": {
+          "revision": 159,
+          "sha3-384": "b41259c624aab02ab27327b9c9b1daf83a856732ecf63072fcf51576e0b637c1fe29ddd0d3ded9bd0822d9069c8762e2",
+          "channel": "26/stable"
+        },
+        "arm64@latest/stable": {
+          "revision": 11,
+          "sha3-384": "f8f72d046679182e60ca15e2ebd1c6fd88314cf608ef9b0aec583220c1247c99b0600b1654414ecf89153fe749271f7f",
+          "channel": "latest/stable"
+        },
+        "armhf@22/stable": {
+          "revision": 133,
+          "sha3-384": "990087397ee7415fe047ed8aa92bdaa349a0204deba64c515b284ea093a3e55791be2dbb98df9903c907df5c8b06544e",
+          "channel": "22/stable"
+        }
+      }
     }
   ]
 }

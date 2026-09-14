@@ -1045,16 +1045,22 @@ pub(crate) fn build_disk_image_with(
             find_veritysetup().as_deref(),
         )?;
         if let Some(payload) = kernel_payload.as_ref() {
-            doctor::audit_kernel_verity_config(&root, &payload.version);
+            // The real UC kernel payload ships config-<ver> at the SNAP
+            // ROOT (#70), which copy_kernel_tree does not copy into the
+            // rootfs — auditing `root` would warn "no kernel config" on
+            // every pc-kernel build while the config sits one directory
+            // away. Audit the extracted kernel-snap tree, the same source
+            // the initrd audits below read.
+            let config_dir = kernel_snap_dir
+                .as_ref()
+                .map(|d| d.path().join("kernel-snap"))
+                .unwrap_or_else(|| root.clone());
+            doctor::audit_kernel_verity_config(&config_dir, &payload.version);
             // ADR-0024 §1 hard gate: the initrd must carry the boot-chain
             // modules the kernel config builds as modules. Fail closed
             // BEFORE any destructive step — a kernel that cannot see its
             // own disk is a brick, not a warning. The config is re-read
             // from the extracted kernel-snap tree (staging keeps it alive).
-            let config_dir = kernel_snap_dir
-                .as_ref()
-                .map(|d| d.path().join("kernel-snap"))
-                .unwrap_or_else(|| root.clone());
             let config_dir = config_dir.as_path();
             // Doctor's initrd inventory report line (issue #65) —
             // warn-never-fail; the gate below is the hard one.
@@ -3007,6 +3013,82 @@ WantedBy=multi-user.target
         assert!(
             msg.contains("vmlinuz") && msg.contains("kernel.efi"),
             "error must name the missing kernel assets: {msg}"
+        );
+    }
+
+    /// The real Raspberry Pi kernel-snap layout (issue #74, measured on
+    /// pi-kernel 22/stable rev 1137, arm64, kver 5.15.0-1103-raspi):
+    /// `kernel.img` (gzip Image) + `initrd.img` (zstd) at the snap root,
+    /// `modules/<kver>/kernel/`, an empty `modules/<kver>/initrd` directory,
+    /// `config-<kver>`/`System.map-<kver>` at the root, and `dtbs/`. No
+    /// `vmlinuz*`, no `kernel.efi`. The recognition keys on file PRESENCE —
+    /// the written bytes mirror the real magic numbers but are never parsed.
+    fn pi_kernel_snap_fixture(kdir: &Path, version: &str) {
+        std::fs::create_dir_all(kdir.join(format!("modules/{version}/kernel"))).unwrap();
+        std::fs::create_dir_all(kdir.join(format!("modules/{version}/initrd"))).unwrap();
+        std::fs::create_dir_all(kdir.join("dtbs")).unwrap();
+        std::fs::create_dir_all(kdir.join("firmware")).unwrap();
+        // gzip magic (0x1f 0x8b) — the real kernel.img is a gzip-compressed
+        // Image; the refusal fires on the shape, before any content is read.
+        std::fs::write(kdir.join("kernel.img"), [0x1f, 0x8b, 0x08, 0x00]).unwrap();
+        // zstd magic (0x28 0xb5 0x2f 0xfd) — the real initrd.img spelling.
+        std::fs::write(kdir.join("initrd.img"), [0x28, 0xb5, 0x2f, 0xfd, 0x00]).unwrap();
+        std::fs::write(
+            kdir.join(format!("config-{version}")),
+            b"CONFIG_DM_VERITY=y\n",
+        )
+        .unwrap();
+        std::fs::write(kdir.join(format!("System.map-{version}")), b"").unwrap();
+    }
+
+    #[test]
+    fn kernel_payload_pi_shape_is_named_not_searched() {
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        let version = "5.15.0-1103-raspi";
+        // copy_kernel_tree mirrors modules/<ver> into lib/modules/<ver> —
+        // discover_kernel_version reads the staged tree, as in the real build.
+        std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
+        pi_kernel_snap_fixture(kdir.path(), version);
+
+        let err = locate_kernel_payload(&ImageTools, None, kdir.path(), kdir.path(), root.path())
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Raspberry Pi kernel shape")
+                && msg.contains("kernel.img")
+                && msg.contains("initrd.img"),
+            "the recognized Pi shape must be named, not reported as absent: {msg}"
+        );
+        assert!(
+            msg.contains("gzip") && msg.contains("ukify"),
+            "the refusal must say why the boot chain cannot consume it: {msg}"
+        );
+        assert!(
+            !msg.contains("payload has no kernel image"),
+            "the generic not-found message would be a lie here: {msg}"
+        );
+    }
+
+    #[test]
+    fn kernel_payload_without_pi_shape_keeps_the_generic_error() {
+        // A tree with NEITHER the raw pair nor kernel.efi nor the Pi files
+        // keeps the "searched … nothing found" message — recognition never
+        // masks a genuinely absent payload.
+        let root = tempfile::tempdir().unwrap();
+        let kdir = tempfile::tempdir().unwrap();
+        let version = "6.8.0-45-generic";
+        std::fs::create_dir_all(root.path().join("lib/modules").join(version)).unwrap();
+        std::fs::create_dir_all(kdir.path().join(format!("modules/{version}/kernel"))).unwrap();
+        // initrd.img alone is not the Pi shape (kernel.img is missing).
+        std::fs::write(kdir.path().join("initrd.img"), b"zstd-bytes").unwrap();
+
+        let err = locate_kernel_payload(&ImageTools, None, kdir.path(), kdir.path(), root.path())
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("payload has no kernel image") && !msg.contains("Raspberry Pi"),
+            "an unrecognized tree keeps the generic searched-nothing error: {msg}"
         );
     }
 

@@ -998,6 +998,11 @@ pub(crate) const EFI_STUB_CANDIDATES: [&str; 3] = [
 /// systemd-stub ignores LoadOptions under Secure Boot when a UKI carries an
 /// embedded cmdline. A snapd-style `kernel.img` squashfs payload is not
 /// unpacked (that is gadget-stage behavior).
+///
+/// The Raspberry Pi kernel snap carries a THIRD shape — raw components
+/// under Pi spellings (`kernel.img` gzip Image + `initrd.img`), issue #74 —
+/// which is recognized and refused with a named error: no implemented boot
+/// chain can consume it ([`is_pi_raw_payload`]).
 pub(crate) fn locate_kernel_payload(
     runner: &dyn CommandRunner,
     objcopy: Option<&Path>,
@@ -1006,6 +1011,15 @@ pub(crate) fn locate_kernel_payload(
     root: &Path,
 ) -> miette::Result<KernelPayload> {
     let version = discover_kernel_version(root)?;
+    // Issue #74: recognize the Raspberry Pi payload shape BEFORE the
+    // vmlinuz-centric searches see its half-matches — `initrd.img` alone
+    // resolves in the raw initrd search, which would fail with a misleading
+    // "payload has no kernel image" while `kernel.img` sits at the snap
+    // root. Recognition precedes every search so the refusal names the
+    // actual shape.
+    if is_pi_raw_payload(kernel_dir) {
+        return Err(pi_payload_error(&version));
+    }
     if let Some(payload) = locate_raw_payload(kernel_dir, version.clone())? {
         return Ok(payload);
     }
@@ -1095,6 +1109,47 @@ fn locate_uki_payload(
         sbat: Some(sbat),
         _scratch: None,
     })
+}
+
+/// The Raspberry Pi kernel-snap payload shape (issue #74): raw components
+/// at the snap root under their Pi spellings — `kernel.img` (a
+/// gzip-compressed ARM64 Image with the EFI stub compiled in) and
+/// `initrd.img` (a compressed initramfs), alongside `modules/<kver>/`,
+/// `config-<kver>`, `dtbs/`, and `firmware/`. Measured on the real
+/// `pi-kernel` 22/stable rev 1137 (arm64, kver 5.15.0-1103-raspi).
+///
+/// Recognized, never adopted: `kernel.img` is gzip-wrapped — not a PE
+/// object `ukify` can assemble into a UKI, and shuttle does not unwrap
+/// kernel payloads — and Raspberry Pi hardware does not run systemd-boot
+/// at all: the Pi firmware loads the gadget's boot-assets (config.txt,
+/// cmdline.txt, start4.elf, DTBs) from the boot partition, a boot-chain
+/// backend shuttle does not implement. Building this payload into a
+/// shuttle image would produce an artifact nothing can boot, so the shape
+/// is a named, fail-closed refusal; implementing the Pi chain is the
+/// ADR-0025 follow-up this error points at.
+fn is_pi_raw_payload(kernel_dir: &Path) -> bool {
+    PI_KERNEL_FILES.iter().all(|f| kernel_dir.join(f).is_file())
+}
+
+/// The two files whose presence identifies the Pi payload shape
+/// ([`is_pi_raw_payload`]).
+const PI_KERNEL_FILES: [&str; 2] = ["kernel.img", "initrd.img"];
+
+/// The fail-closed error for a recognized Pi payload ([`is_pi_raw_payload`]).
+/// The caller (`locate_payload_for_snap`) appends the snap name and the
+/// "refusing to build a disk image that cannot boot" close, so this names
+/// only the shape and the reason it cannot boot.
+fn pi_payload_error(version: &str) -> miette::Report {
+    miette::miette!(
+        "this payload is the Raspberry Pi kernel shape ({}, at the snap root; kernel \
+         version {version}) — `kernel.img` is a gzip-compressed ARM64 Image, not a PE \
+         object `ukify` can assemble into a UKI, and Raspberry Pi hardware does not run \
+         systemd-boot: the Pi firmware loads the gadget's boot-assets (config.txt, \
+         cmdline.txt, DTBs) from the boot partition, a boot-chain backend shuttle does \
+         not implement (issue #74, measured on pi-kernel 22/stable rev 1137). \
+         Implementing the Pi chain is #87, the ADR-0025 follow-up",
+        PI_KERNEL_FILES.join(" + "),
+    )
 }
 
 /// Validate the extracted `.sbat` payload (#73) and normalize it in place

@@ -1,5 +1,14 @@
 -- Ubuntu Core 22.04 rootfs image for Raspberry Pi (arm64)
 --
+-- SANITY STATUS (issue #74, measured against the real store snaps): the
+-- pi-kernel payload is a shape no shuttle boot chain can consume —
+-- `kernel.img` is a gzip-compressed ARM64 Image and the Pi firmware boots
+-- the gadget's boot-assets (config.txt, cmdline.txt, DTBs), not
+-- systemd-boot. A build fails closed at payload location with the named
+-- reason; the rootfs side (core22 base + pi-kernel module tree staging)
+-- is proven by the squashfs-only evidence run in the issue. Implementing
+-- the Pi boot chain is #87, the ADR-0025 follow-up.
+--
 -- Compose a bootable disk image with:
 --   - core22 base rootfs
 --   - pi-kernel with boot params
