@@ -221,3 +221,92 @@ fn update_reports_local_pin_refresh() {
     );
     assert!(stdout.is_empty(), "human mode: {stdout}");
 }
+
+// ── `submodules` declaration (issue #43) through the real DSL ──
+
+#[test]
+fn lock_rejects_submodules_on_path_input_named() {
+    // The full DSL path: `submodules = true` on a `path:` input survives
+    // the eval subprocess round-trip and fails closed at lock time — a
+    // path input has nothing to fetch, so the declaration is a definition
+    // error, never silently ignored.
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+    std::fs::write(
+        dir.path().join("shuttle.lua"),
+        r#"
+inputs = { vendored = { url = "path:vendor", submodules = true } }
+return {}
+"#,
+    )
+    .unwrap();
+
+    let (code, _, stderr) = run_in(
+        dir.path(),
+        home.path(),
+        &["lock", "--file", "shuttle.lua", "--lockfile", "proj.lock"],
+    );
+    assert_ne!(code, Some(0), "submodules on a path input must fail");
+    assert!(
+        stderr.contains("applies to git inputs only"),
+        "named path-input error required, got: {stderr}"
+    );
+}
+
+#[test]
+fn lock_rejects_malformed_submodules_declaration_named() {
+    // `submodules` must be `true` or a list of names — anything else is a
+    // named parse error from the DSL boundary.
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("shuttle.lua"),
+        r#"
+inputs = { pkgs = { url = "github:o/r", submodules = "yes" } }
+return {}
+"#,
+    )
+    .unwrap();
+
+    let (code, _, stderr) = run_in(
+        dir.path(),
+        home.path(),
+        &["lock", "--file", "shuttle.lua", "--lockfile", "proj.lock"],
+    );
+    assert_ne!(code, Some(0), "malformed declaration must fail");
+    // miette wraps long messages; match a substring that survives wrapping.
+    assert!(
+        stderr.contains("must be true or a list of submodule names"),
+        "named shape error required, got: {stderr}"
+    );
+}
+
+#[test]
+fn lock_rejects_empty_submodules_list_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("shuttle.lua"),
+        r#"
+inputs = { pkgs = { url = "github:o/r", submodules = {} } }
+return {}
+"#,
+    )
+    .unwrap();
+
+    let (code, _, stderr) = run_in(
+        dir.path(),
+        home.path(),
+        &["lock", "--file", "shuttle.lua", "--lockfile", "proj.lock"],
+    );
+    assert_ne!(
+        code,
+        Some(0),
+        "empty list must fail — omit the field instead"
+    );
+    assert!(
+        stderr.contains("must not be empty"),
+        "named empty-list error required, got: {stderr}"
+    );
+}

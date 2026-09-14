@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::lock::{InputLockEntry, LockFile};
-use crate::snap::PackageInput;
+use crate::lock::{InputLockEntry, LockFile, SubmoduleLockEntry};
+use crate::snap::{PackageInput, SubmoduleSpec};
 
 // ── Cache paths ──
 
@@ -86,7 +86,8 @@ pub fn resolve_input(input: &PackageInput) -> miette::Result<PathBuf> {
 /// - `path:` inputs always resolve to the local directory (pins are markers).
 /// - Pinned `github:` inputs resolve to the pinned revision's cache directory,
 ///   fetching it on first use (never when `offline`) and verifying the
-///   recorded content hash.
+///   recorded content hash. Submodule pins (issue #43) are verified by
+///   name before the tree hash.
 /// - Unpinned `github:` inputs use the branch-head cache; offline fails
 ///   instead of fetching.
 pub fn resolve_input_with(
@@ -123,7 +124,9 @@ fn resolve_input_in(
         ));
     };
 
-    if let Some(sha) = pin.and_then(|p| p.revision.as_deref()) {
+    let pinned = pin.filter(|p| p.revision.is_some());
+    if let Some(entry) = pinned {
+        let sha = entry.revision.as_deref().unwrap_or_default();
         let dir = pinned_cache_dir_in(root, owner, repo, sha);
         if !dir.exists() {
             if offline {
@@ -131,11 +134,25 @@ fn resolve_input_in(
                     "input '{url}' is pinned to {sha} but not cached; --offline prevents fetching"
                 ));
             }
-            fetch_github_rev(owner, repo, sha, &dir)?;
+            fetch_github_rev_in(root, owner, repo, sha, &dir)?;
+            // Fresh fetch: materialize the declared submodules at the
+            // gitlink commits recorded by this revision (issue #43). A
+            // cache hit skips this — the tree is already complete and the
+            // pins below verify it.
+            ensure_submodules(&dir, input)?;
         }
-        if let Some(expected) = pin.and_then(|p| p.sha256.as_ref()) {
+        // Named submodule verification before the parent tree hash, so a
+        // drifted/tampered submodule names the submodule instead of
+        // surfacing as a generic content-changed error.
+        verify_submodule_pins(
+            &dir,
+            input.submodules.as_ref(),
+            entry.submodules.as_ref(),
+            url,
+        )?;
+        if let Some(expected) = entry.sha256.as_ref() {
             let actual = content_hash(&dir)?;
-            if &actual != expected {
+            if actual != *expected {
                 return Err(miette::miette!(
                     "input '{url}' content changed since lock (lockfile: {expected}, cache: {actual}); \
                      run 'shuttle lock' or 'shuttle build --update' to refresh the pin"
@@ -213,17 +230,29 @@ pub fn refresh_input(input: &PackageInput) -> miette::Result<()> {
 
 // ── Input locking (Phase 16) ──
 
-/// Cache directory for a github input pinned to a specific commit SHA.
-/// Separate from the branch-head cache so pins never move.
-fn pinned_cache_dir(owner: &str, repo: &str, sha: &str) -> PathBuf {
-    pinned_cache_dir_in(&cache_root(), owner, repo, sha)
-}
-
-/// [`pinned_cache_dir`] under an explicit cache root (test injection).
+/// Cache directory for a github input pinned to a specific commit SHA,
+/// under an explicit cache root. Separate from the branch-head cache so
+/// pins never move. (Test injection: pass `&cache_root()` in production.)
 fn pinned_cache_dir_in(root: &Path, owner: &str, repo: &str, sha: &str) -> PathBuf {
     let key = format!("github:{owner}/{repo}@{sha}");
     let hash = sha256_hex(&key);
     root.join(&hash[..16])
+}
+
+/// Clone / ls-remote URL for an `owner/repo` pair.
+///
+/// Test seam: when a fixture repo exists under
+/// `<cache-root>/__repos__/<owner>/<repo>` (a layout only tests create —
+/// see the submodule fixtures in the test module), fetch from it over
+/// `file://` instead of github.com. Production cache roots never contain
+/// `__repos__/`, so the GitHub URL is always used there.
+fn repo_clone_url_in(root: &Path, owner: &str, repo: &str) -> String {
+    let fixture = root.join("__repos__").join(owner).join(repo);
+    if fixture.is_dir() {
+        format!("file://{}", fixture.display())
+    } else {
+        format!("https://github.com/{owner}/{repo}.git")
+    }
 }
 
 /// Run a git command, failing with its stderr on error.
@@ -267,8 +296,10 @@ fn git_out(args: &[&str]) -> miette::Result<String> {
 }
 
 /// Resolve the current head commit SHA of a GitHub branch (network).
-fn head_sha(owner: &str, repo: &str, branch: &str) -> miette::Result<String> {
-    let url = format!("https://github.com/{owner}/{repo}.git");
+/// Test fixture repos under the cache root's `__repos__/` seam are
+/// ls-remote'd over `file://` (see [`repo_clone_url_in`]).
+fn head_sha_in(root: &Path, owner: &str, repo: &str, branch: &str) -> miette::Result<String> {
+    let url = repo_clone_url_in(root, owner, repo);
     let out = git_out(&["ls-remote", &url, branch])?;
     let sha = out
         .lines()
@@ -287,8 +318,16 @@ fn head_sha(owner: &str, repo: &str, branch: &str) -> miette::Result<String> {
 ///
 /// Tries a shallow fetch of the bare SHA first (works on GitHub); falls back
 /// to a full clone + checkout for hosts that don't allow SHA fetches.
-fn fetch_github_rev(owner: &str, repo: &str, sha: &str, dest: &Path) -> miette::Result<()> {
-    let url = format!("https://github.com/{owner}/{repo}.git");
+/// Submodules are NOT initialized here — callers run [`ensure_submodules`]
+/// when the input declares them (issue #43).
+fn fetch_github_rev_in(
+    root: &Path,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+    dest: &Path,
+) -> miette::Result<()> {
+    let url = repo_clone_url_in(root, owner, repo);
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -318,6 +357,292 @@ fn fetch_github_rev(owner: &str, repo: &str, sha: &str, dest: &Path) -> miette::
     {
         let _ = std::fs::remove_dir_all(dest);
         return Err(e);
+    }
+    Ok(())
+}
+
+// ── Git submodules (issue #43) ──
+
+/// One parsed `.gitmodules` entry: its section name, the path it
+/// materializes at inside the parent tree, and its fetch URL.
+struct GitmodulesEntry {
+    name: String,
+    path: String,
+    url: String,
+}
+
+/// Parse `submodule.<name>.*` entries out of a tree's `.gitmodules`
+/// (git-config format — parsed through `git config` so quoting rules stay
+/// git's). A missing file or no entries yields an empty vec; callers that
+/// require the file check existence first for a named error.
+fn gitmodules_entries(repo: &Path) -> miette::Result<Vec<GitmodulesEntry>> {
+    let file = repo.join(".gitmodules");
+    let output = std::process::Command::new("git")
+        .args(["config", "--file"])
+        .arg(&file)
+        .args(["--get-regexp", r"^submodule\."])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| miette::miette!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        // `git config --get-regexp` exits 1 when nothing matched — an
+        // empty declaration, not an error.
+        if output.status.code() == Some(1) && output.stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(miette::miette!(
+            "failed to read {}: {}",
+            file.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Lines look like `submodule.<name>.<field> <value...>`; the name may
+    // itself contain dots, so the field splits at the LAST dot.
+    let mut paths: HashMap<String, String> = HashMap::new();
+    let mut urls: HashMap<String, String> = HashMap::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(rest) = key.strip_prefix("submodule.") else {
+            continue;
+        };
+        let Some((name, field)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        match field {
+            "path" => {
+                paths.insert(name.to_string(), value.to_string());
+            }
+            "url" => {
+                urls.insert(name.to_string(), value.to_string());
+            }
+            _ => {}
+        }
+    }
+    let mut names: Vec<String> = paths.keys().cloned().collect();
+    names.sort();
+    Ok(names
+        .into_iter()
+        .map(|name| GitmodulesEntry {
+            path: paths.remove(&name).unwrap_or_default(),
+            url: urls.remove(&name).unwrap_or_default(),
+            name,
+        })
+        .collect())
+}
+
+/// The `.gitmodules` entries a declaration selects, in `.gitmodules` order
+/// (All) or declaration order (Named). Named entries match by section name
+/// or path; an unmatched name fails closed, naming it and what exists.
+fn select_submodules<'a>(
+    entries: &'a [GitmodulesEntry],
+    spec: &SubmoduleSpec,
+    input_url: &str,
+) -> miette::Result<Vec<&'a GitmodulesEntry>> {
+    match spec {
+        SubmoduleSpec::All(_) => Ok(entries.iter().collect()),
+        SubmoduleSpec::Named(names) => {
+            let mut selected = Vec::with_capacity(names.len());
+            for name in names {
+                match entries.iter().find(|e| e.name == *name || e.path == *name) {
+                    Some(entry) => selected.push(entry),
+                    None => {
+                        let declared: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                        return Err(miette::miette!(
+                            "submodule '{name}' is not declared in .gitmodules of input \
+                             '{input_url}' (declared: {})",
+                            declared.join(", ")
+                        ));
+                    }
+                }
+            }
+            Ok(selected)
+        }
+    }
+}
+
+/// Initialize the declared submodules of a fetched parent tree at `repo`,
+/// each at the gitlink commit recorded by the parent's checked-out
+/// revision. Returns `(name, entry)` pairs for the lockfile.
+///
+/// Fails closed, naming the submodule, when:
+/// - the parent has no `.gitmodules` at this revision,
+/// - a declared name matches no `.gitmodules` entry (by name or path),
+/// - a submodule URL is unreachable or refuses the recorded commit.
+fn init_submodules(
+    repo: &Path,
+    spec: &SubmoduleSpec,
+    input_url: &str,
+) -> miette::Result<Vec<(String, SubmoduleLockEntry)>> {
+    if !spec.active() {
+        return Ok(Vec::new());
+    }
+    if !repo.join(".gitmodules").exists() {
+        return Err(miette::miette!(
+            "input '{input_url}' declares submodules but has no .gitmodules at this revision"
+        ));
+    }
+    let entries = gitmodules_entries(repo)?;
+    let selected = select_submodules(&entries, spec, input_url)?;
+
+    let mut pins = Vec::with_capacity(selected.len());
+    for entry in selected {
+        // `protocol.file.allow` — git blocks the file transport for
+        // submodule fetches by default (CVE-2022-39253). A declared
+        // submodule URL on file:// is legitimate here (mirrored or
+        // vendored trees), and this boundary already trusts the cloned
+        // repo — its build script runs next.
+        let shallow = git(
+            Some(repo),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--depth",
+                "1",
+                "--",
+                &entry.path,
+            ],
+        );
+        if shallow.is_err() {
+            // Hosts that refuse fetch-by-SHA need a full checkout.
+            git(
+                Some(repo),
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--",
+                    &entry.path,
+                ],
+            )
+            .map_err(|e| {
+                miette::miette!(
+                    "failed to fetch submodule '{}' ({}) of input '{input_url}': {}",
+                    entry.name,
+                    entry.url,
+                    e
+                )
+            })?;
+        }
+        let sub_dir = repo.join(&entry.path);
+        let revision = git_out(&["-C", &sub_dir.to_string_lossy(), "rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
+        let sha256 = content_hash(&sub_dir)?;
+        pins.push((
+            entry.name.clone(),
+            SubmoduleLockEntry {
+                path: entry.path.clone(),
+                revision,
+                sha256,
+            },
+        ));
+    }
+    Ok(pins)
+}
+
+/// Initialize an input's declared submodules in its fetched tree — a no-op
+/// for inputs without an active `submodules` declaration.
+fn ensure_submodules(
+    dir: &Path,
+    input: &PackageInput,
+) -> miette::Result<Vec<(String, SubmoduleLockEntry)>> {
+    match &input.submodules {
+        Some(spec) => init_submodules(dir, spec, &input.url),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Verify a materialized input tree against its lockfile submodule pins.
+///
+/// Fail-closed, named:
+/// - the declaration names a submodule the lockfile has no pin for
+///   (declared after locking) — error points at `shuttle lock`;
+/// - a pinned submodule is missing from the tree, or its content hash
+///   moved (re-resolution moved it, or it was tampered with) — named
+///   mismatch error.
+///
+/// Runs BEFORE the parent tree-hash check so a submodule problem names the
+/// submodule instead of surfacing as a generic content-changed error.
+fn verify_submodule_pins(
+    dir: &Path,
+    declared: Option<&SubmoduleSpec>,
+    pins: Option<&HashMap<String, SubmoduleLockEntry>>,
+    input_url: &str,
+) -> miette::Result<()> {
+    let empty = HashMap::new();
+    let pins = pins.unwrap_or(&empty);
+    check_declaration_pins(declared, pins, input_url)?;
+    for (name, sub) in pins {
+        verify_one_submodule(dir, name, sub, input_url)?;
+    }
+    Ok(())
+}
+
+/// A submodules-declaring input whose lockfile entry has no submodule pins
+/// at all is unresolved drift (declared after locking); a Named
+/// declaration naming a pin that does not exist is likewise drift. Both
+/// fail closed, pointing at `shuttle lock`.
+fn check_declaration_pins(
+    declared: Option<&SubmoduleSpec>,
+    pins: &HashMap<String, SubmoduleLockEntry>,
+    input_url: &str,
+) -> miette::Result<()> {
+    if let Some(spec) = declared {
+        if spec.active() && pins.is_empty() {
+            return Err(miette::miette!(
+                "input '{input_url}' declares submodules but the lockfile has no submodule \
+                 pins; run 'shuttle lock' to record submodule pins"
+            ));
+        }
+    }
+    if let Some(SubmoduleSpec::Named(names)) = declared {
+        for name in names {
+            // Declarations match pins by .gitmodules name or by path.
+            let pinned = pins.contains_key(name) || pins.values().any(|p| p.path == *name);
+            if !pinned {
+                return Err(miette::miette!(
+                    "input '{input_url}' declares submodule '{name}' but the lockfile has no \
+                     pin for it; run 'shuttle lock' to record submodule pins"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One pinned submodule must exist in the tree with exactly the locked
+/// content. Missing → named missing error; content moved → named
+/// changed-since-lock error.
+fn verify_one_submodule(
+    dir: &Path,
+    name: &str,
+    sub: &SubmoduleLockEntry,
+    input_url: &str,
+) -> miette::Result<()> {
+    let hash = content_hash(&dir.join(&sub.path)).map_err(|e| {
+        miette::miette!(
+            "submodule '{name}' of input '{input_url}' is missing from the materialized \
+             tree (expected at '{}'): {}",
+            sub.path,
+            e
+        )
+    })?;
+    if hash != sub.sha256 {
+        return Err(miette::miette!(
+            "submodule '{name}' of input '{input_url}' changed since lock \
+             (lockfile: {}, tree: {}); run 'shuttle lock' to refresh",
+            sub.sha256,
+            hash
+        ));
     }
     Ok(())
 }
@@ -368,9 +693,26 @@ pub fn content_hash(dir: &Path) -> miette::Result<String> {
 /// Resolve an input to its current lock entry: branch-head SHA + content
 /// hash for github inputs; a local marker for `path:` inputs.
 pub fn lock_input_entry(input: &PackageInput) -> miette::Result<InputLockEntry> {
+    lock_input_entry_in(&cache_root(), input)
+}
+
+/// [`lock_input_entry`] under an explicit cache root (test injection).
+///
+/// For a github input declaring `submodules` (issue #43), the parent tree
+/// is fetched at the resolved head and the declared submodules are
+/// materialized at this revision's gitlinks BEFORE hashing — so the entry's
+/// tree hash covers them and `submodules` records each submodule's own
+/// commit, path, and content hash. Idempotent on a pre-existing cache tree.
+fn lock_input_entry_in(root: &Path, input: &PackageInput) -> miette::Result<InputLockEntry> {
     let url = &input.url;
 
     if let Some(local) = url.strip_prefix("path:") {
+        if input.submodules.as_ref().is_some_and(SubmoduleSpec::active) {
+            return Err(miette::miette!(
+                "input '{url}': 'submodules' applies to git inputs only — \
+                 'path:{local}' is used as-is, nothing to fetch"
+            ));
+        }
         if !Path::new(local).exists() {
             return Err(miette::miette!("local input path '{local}' does not exist"));
         }
@@ -378,6 +720,7 @@ pub fn lock_input_entry(input: &PackageInput) -> miette::Result<InputLockEntry> 
             revision: None,
             sha256: None,
             local: true,
+            submodules: None,
         });
     }
 
@@ -387,16 +730,18 @@ pub fn lock_input_entry(input: &PackageInput) -> miette::Result<InputLockEntry> 
         ));
     };
 
-    let sha = head_sha(owner, repo, branch)?;
-    let dir = pinned_cache_dir(owner, repo, &sha);
+    let sha = head_sha_in(root, owner, repo, branch)?;
+    let dir = pinned_cache_dir_in(root, owner, repo, &sha);
     if !dir.exists() {
-        fetch_github_rev(owner, repo, &sha, &dir)?;
+        fetch_github_rev_in(root, owner, repo, &sha, &dir)?;
     }
+    let submodule_pins = ensure_submodules(&dir, input)?;
     let hash = content_hash(&dir)?;
     Ok(InputLockEntry {
         revision: Some(sha),
         sha256: Some(hash),
         local: false,
+        submodules: (!submodule_pins.is_empty()).then(|| submodule_pins.into_iter().collect()),
     })
 }
 
@@ -500,6 +845,7 @@ pub fn init_global_inputs_with(
     let paths = if inputs.is_empty() {
         let default = PackageInput {
             url: DEFAULT_INPUT_URL.to_string(),
+            submodules: None,
         };
         let mut m = HashMap::new();
         m.insert(
@@ -811,6 +1157,7 @@ mod tests {
     fn test_resolve_input_invalid_url() {
         let input = PackageInput {
             url: "ftp://bad".into(),
+            submodules: None,
         };
         let result = resolve_input(&input);
         assert!(result.is_err());
@@ -856,19 +1203,21 @@ mod tests {
 
     #[test]
     fn test_pinned_cache_dir_differs_from_branch_dir() {
+        let root = cache_root();
         let branch = github_cache_dir("o", "r", "main");
-        let pinned = pinned_cache_dir("o", "r", "abc123");
-        let pinned2 = pinned_cache_dir("o", "r", "def456");
+        let pinned = pinned_cache_dir_in(&root, "o", "r", "abc123");
+        let pinned2 = pinned_cache_dir_in(&root, "o", "r", "def456");
         assert_ne!(branch, pinned);
         assert_ne!(pinned, pinned2);
         // Same key → same dir
-        assert_eq!(pinned, pinned_cache_dir("o", "r", "abc123"));
+        assert_eq!(pinned, pinned_cache_dir_in(&root, "o", "r", "abc123"));
     }
 
     #[test]
     fn test_offline_uncached_input_errors() {
         let input = PackageInput {
             url: "github:shuttle-test-nonexistent-xyz/nope".into(),
+            submodules: None,
         };
         let err = resolve_input_with(&input, None, true)
             .unwrap_err()
@@ -881,11 +1230,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = PackageInput {
             url: format!("path:{}", dir.path().display()),
+            submodules: None,
         };
         let pin = InputLockEntry {
             revision: None,
             sha256: None,
             local: true,
+            submodules: None,
         };
         // Even offline, local inputs resolve; pins are markers only.
         let p = resolve_input_with(&input, Some(&pin), true).unwrap();
@@ -899,6 +1250,7 @@ mod tests {
             "packages".to_string(),
             PackageInput {
                 url: "path:/tmp".into(),
+                submodules: None,
             },
         );
         let mut lock = LockFile {
@@ -923,6 +1275,7 @@ mod tests {
             "local".to_string(),
             PackageInput {
                 url: format!("path:{}", dir.path().display()),
+                submodules: None,
             },
         );
         let mut lock = LockFile {
@@ -966,10 +1319,12 @@ mod tests {
             revision: Some(sha.to_string()),
             sha256: Some(content_hash(&dir).unwrap()),
             local: false,
+            submodules: None,
         };
         (
             PackageInput {
                 url: format!("github:{owner}/{repo}/main"),
+                submodules: None,
             },
             entry,
         )
@@ -1039,11 +1394,13 @@ mod tests {
         // exactly the "inputs absent from cache" offline scenario.
         let input = PackageInput {
             url: "github:shuttle-test-fixture/absent/main".into(),
+            submodules: None,
         };
         let pin = InputLockEntry {
             revision: Some("3333333333333333333333333333333333333333".to_string()),
             sha256: Some("deadbeef".to_string()),
             local: false,
+            submodules: None,
         };
 
         let err = resolve_input_in(root.path(), &input, Some(&pin), true)
@@ -1074,12 +1431,14 @@ mod tests {
             "good".to_string(),
             PackageInput {
                 url: format!("path:{}", dir.path().display()),
+                submodules: None,
             },
         );
         inputs.insert(
             "bad".to_string(),
             PackageInput {
                 url: "ftp://not-supported".into(),
+                submodules: None,
             },
         );
 
@@ -1099,6 +1458,7 @@ mod tests {
                 revision: Some("oldrev".to_string()),
                 sha256: None,
                 local: false,
+                submodules: None,
             },
         );
 
@@ -1118,6 +1478,7 @@ mod tests {
             "pkg".to_string(),
             PackageInput {
                 url: format!("path:{}", dir.path().display()),
+                submodules: None,
             },
         );
         let mut lock = LockFile {
@@ -1134,5 +1495,294 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].name, "pkg");
         assert!(updates[0].old.is_none(), "fresh pin has no old revision");
+    }
+
+    // ── Git submodule fixtures (issue #43) ──
+
+    /// Create a git repo with one committed file; returns (path, HEAD).
+    /// `allowAnySHA1InWant` so shuttle's shallow fetch-by-sha path works
+    /// against file:// fixtures the way it does against GitHub.
+    fn fixture_repo(base: &Path, name: &str, body: &str) -> (PathBuf, String) {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(
+            None,
+            &[
+                "init",
+                "--quiet",
+                "--initial-branch=main",
+                &dir.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        std::fs::write(dir.join("file.txt"), body).unwrap();
+        git(Some(&dir), &["config", "user.email", "test@shuttle"]).unwrap();
+        git(Some(&dir), &["config", "user.name", "shuttle-test"]).unwrap();
+        git(
+            Some(&dir),
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        )
+        .unwrap();
+        git(Some(&dir), &["add", "-A"]).unwrap();
+        git(Some(&dir), &["commit", "--quiet", "-m", "init"]).unwrap();
+        let rev = git_out(&["-C", &dir.to_string_lossy(), "rev-parse", "HEAD"]).unwrap();
+        (dir, rev.trim().to_string())
+    }
+
+    /// Parent repo carrying one committed submodule at `sub_path`
+    /// (`.gitmodules` name `sub_name`). Returns (path, parent HEAD,
+    /// submodule HEAD).
+    fn fixture_parent_with_submodule(
+        base: &Path,
+        parent: &str,
+        sub_name: &str,
+        sub_path: &str,
+    ) -> (PathBuf, String, String) {
+        let (sub_dir, sub_rev) = fixture_repo(base, sub_name, "sub-content\n");
+        let (dir, _) = fixture_repo(base, parent, "parent-content\n");
+        git(
+            Some(&dir),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                "--name",
+                sub_name,
+                &format!("file://{}", sub_dir.display()),
+                sub_path,
+            ],
+        )
+        .unwrap();
+        git(Some(&dir), &["commit", "--quiet", "-m", "add submodule"]).unwrap();
+        let rev = git_out(&["-C", &dir.to_string_lossy(), "rev-parse", "HEAD"]).unwrap();
+        (dir, rev.trim().to_string(), sub_rev)
+    }
+
+    /// Install a parent+submodule fixture pair under the test cache root's
+    /// `__repos__/` seam (`github:shuttle-test-fixture/parent`) and return
+    /// the input plus both revisions.
+    fn seed_submodule_input(
+        root: &Path,
+        submodules: SubmoduleSpec,
+    ) -> (PackageInput, String, String) {
+        let repos = root.join("__repos__/shuttle-test-fixture");
+        std::fs::create_dir_all(&repos).unwrap();
+        let (_, parent_rev, sub_rev) =
+            fixture_parent_with_submodule(&repos, "parent", "mylib", "vendor/mylib");
+        (
+            PackageInput {
+                url: "github:shuttle-test-fixture/parent/main".into(),
+                submodules: Some(submodules),
+            },
+            parent_rev,
+            sub_rev,
+        )
+    }
+
+    #[test]
+    fn test_submodule_fetch_pins_parent_and_submodule_revs() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, parent_rev, sub_rev) =
+            seed_submodule_input(root.path(), SubmoduleSpec::All(true));
+
+        let entry = lock_input_entry_in(root.path(), &input).unwrap();
+        assert_eq!(
+            entry.revision.as_deref(),
+            Some(parent_rev.as_str()),
+            "parent pin records the fetched parent rev"
+        );
+
+        let subs = entry.submodules.as_ref().expect("submodule pins recorded");
+        let sub = subs.get("mylib").expect("pin keyed by .gitmodules name");
+        assert_eq!(sub.revision, sub_rev, "submodule pin records its own rev");
+        assert_eq!(sub.path, "vendor/mylib");
+        assert!(!sub.sha256.is_empty(), "submodule content hash recorded");
+
+        // The tree materialized with the submodule present, and the parent
+        // tree hash covers it (hash recorded after initialization).
+        let dir = pinned_cache_dir_in(root.path(), "shuttle-test-fixture", "parent", &parent_rev);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("vendor/mylib/file.txt")).unwrap(),
+            "sub-content\n"
+        );
+        assert_eq!(
+            entry.sha256.as_deref(),
+            Some(content_hash(&dir).unwrap().as_str())
+        );
+    }
+
+    #[test]
+    fn test_submodule_rebuild_from_lock_offline() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, parent_rev, _) = seed_submodule_input(root.path(), SubmoduleSpec::All(true));
+
+        let entry = lock_input_entry_in(root.path(), &input).unwrap();
+
+        // Offline rebuild from the pin: cache hit, no fetch, tree complete.
+        let resolved = resolve_input_in(root.path(), &input, Some(&entry), true).unwrap();
+        assert_eq!(
+            resolved,
+            pinned_cache_dir_in(root.path(), "shuttle-test-fixture", "parent", &parent_rev)
+        );
+        assert_eq!(
+            std::fs::read_to_string(resolved.join("vendor/mylib/file.txt")).unwrap(),
+            "sub-content\n",
+            "submodule tree present without re-resolving"
+        );
+    }
+
+    #[test]
+    fn test_submodule_named_declaration_fetches_only_named() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, _parent_rev, _) =
+            seed_submodule_input(root.path(), SubmoduleSpec::Named(vec!["mylib".into()]));
+
+        let entry = lock_input_entry_in(root.path(), &input).unwrap();
+        let subs = entry.submodules.as_ref().unwrap();
+        assert_eq!(subs.len(), 1, "only the named submodule is pinned");
+        assert!(subs.contains_key("mylib"));
+    }
+
+    #[test]
+    fn test_submodule_declaration_matches_by_path_too() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, _, sub_rev) = seed_submodule_input(
+            root.path(),
+            SubmoduleSpec::Named(vec!["vendor/mylib".into()]),
+        );
+
+        // Declared by .gitmodules PATH; pinned under the section NAME.
+        let entry = lock_input_entry_in(root.path(), &input).unwrap();
+        let subs = entry.submodules.as_ref().unwrap();
+        assert_eq!(
+            subs.get("mylib").map(|s| s.revision.as_str()),
+            Some(sub_rev.as_str())
+        );
+
+        // Resolution verifies the path-form declaration against that pin.
+        resolve_input_in(root.path(), &input, Some(&entry), true).unwrap();
+    }
+
+    #[test]
+    fn test_submodule_missing_from_gitmodules_fails_named() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, _, _) =
+            seed_submodule_input(root.path(), SubmoduleSpec::Named(vec!["ghost".into()]));
+
+        let err = lock_input_entry_in(root.path(), &input)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("submodule 'ghost'") && err.contains(".gitmodules"),
+            "named missing-submodule error required, got: {err}"
+        );
+        assert!(
+            err.contains("mylib"),
+            "error lists what IS declared, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_submodules_true_without_gitmodules_fails_named() {
+        let root = tempfile::tempdir().unwrap();
+        // A plain parent repo: no .gitmodules at the pinned rev.
+        let repos = root.path().join("__repos__/shuttle-test-fixture");
+        std::fs::create_dir_all(&repos).unwrap();
+        fixture_repo(&repos, "parent", "plain\n");
+        let input = PackageInput {
+            url: "github:shuttle-test-fixture/parent/main".into(),
+            submodules: Some(SubmoduleSpec::All(true)),
+        };
+
+        let err = lock_input_entry_in(root.path(), &input)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no .gitmodules"),
+            "named missing-.gitmodules error required, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_submodule_tamper_fails_named() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, parent_rev, _) = seed_submodule_input(root.path(), SubmoduleSpec::All(true));
+        let entry = lock_input_entry_in(root.path(), &input).unwrap();
+
+        // Tamper INSIDE the materialized submodule tree after locking.
+        let dir = pinned_cache_dir_in(root.path(), "shuttle-test-fixture", "parent", &parent_rev);
+        std::fs::write(dir.join("vendor/mylib/file.txt"), b"tampered").unwrap();
+
+        let err = resolve_input_in(root.path(), &input, Some(&entry), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("submodule 'mylib'") && err.contains("changed since lock"),
+            "named per-submodule mismatch error required, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_submodule_declaration_without_pin_fails_named() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, parent_rev, _) = seed_submodule_input(root.path(), SubmoduleSpec::All(true));
+        lock_input_entry_in(root.path(), &input).unwrap();
+
+        // The same parent tree, but the lockfile entry predates the
+        // submodule declaration (no pins recorded): drift must fail named.
+        let stale = InputLockEntry {
+            revision: Some(parent_rev),
+            sha256: None,
+            local: false,
+            submodules: None,
+        };
+        let err = resolve_input_in(root.path(), &input, Some(&stale), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("declares submodules") && err.contains("no submodule pins"),
+            "named missing-pin error required, got: {err}"
+        );
+        assert!(
+            err.contains("shuttle lock"),
+            "error must point at the re-lock path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_submodule_tampered_parent_tree_still_caught() {
+        let root = tempfile::tempdir().unwrap();
+        let (input, parent_rev, _) = seed_submodule_input(root.path(), SubmoduleSpec::All(true));
+        let entry = lock_input_entry_in(root.path(), &input).unwrap();
+
+        // Tamper with a PARENT file (outside every submodule): the parent
+        // tree-hash check catches what submodule verification passed over.
+        let dir = pinned_cache_dir_in(root.path(), "shuttle-test-fixture", "parent", &parent_rev);
+        std::fs::write(dir.join("file.txt"), b"tampered").unwrap();
+        let err = resolve_input_in(root.path(), &input, Some(&entry), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("content changed since lock"),
+            "parent hash still verified, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_path_input_with_submodules_fails_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = PackageInput {
+            url: format!("path:{}", dir.path().display()),
+            submodules: Some(SubmoduleSpec::All(true)),
+        };
+        let err = lock_input_entry_in(&cache_root(), &input)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("applies to git inputs only"),
+            "named path-input error required, got: {err}"
+        );
     }
 }

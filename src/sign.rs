@@ -2494,6 +2494,7 @@ mod tests {
             "pkgs".to_string(),
             crate::snap::PackageInput {
                 url: "github:owner/repo/main".into(),
+                submodules: None,
             },
         )]);
         let mut lockfile = crate::lock::LockFile {
@@ -2510,6 +2511,7 @@ mod tests {
                 revision: Some("c0ffee".into()),
                 sha256: Some("beef".into()),
                 local: false,
+                submodules: None,
             },
         );
         crate::manifest::build_manifest(

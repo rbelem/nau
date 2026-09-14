@@ -882,7 +882,19 @@ fn extract_inputs_json(lua: &mlua::Lua) -> Result<Value, String> {
                         let url: String = input_table
                             .get("url")
                             .map_err(|_| format!("inputs['{name}']: missing 'url'"))?;
-                        map.insert(name, serde_json::json!({ "url": url }));
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("url".into(), Value::String(url));
+                        // `submodules` (issue #43) rides through verbatim —
+                        // shape validation happens in the parent's
+                        // re-extraction, so both paths share one parser.
+                        if let Ok(sub) = input_table.get::<mlua::Value>("submodules") {
+                            if !matches!(sub, mlua::Value::Nil) {
+                                let json = lua_to_json(&sub)
+                                    .map_err(|e| format!("inputs['{name}'].submodules: {e}"))?;
+                                obj.insert("submodules".into(), json);
+                            }
+                        }
+                        map.insert(name, Value::Object(obj));
                     }
                     other => {
                         return Err(format!(

@@ -1116,6 +1116,7 @@ mod tests {
             "pkgs".to_string(),
             PackageInput {
                 url: "github:owner/repo/main".into(),
+                submodules: None,
             },
         )]);
         let images = HashMap::new();
@@ -1145,6 +1146,7 @@ mod tests {
             "vendored".to_string(),
             PackageInput {
                 url: "path:vendor".into(),
+                submodules: None,
             },
         )]);
         let lockfile = empty_lockfile();
@@ -1175,12 +1177,14 @@ mod tests {
                 revision: Some("c0ffee".into()),
                 sha256: Some("beef".into()),
                 local: false,
+                submodules: None,
             },
         );
         let declared = HashMap::from([(
             "pkgs".to_string(),
             PackageInput {
                 url: "github:owner/repo/main".into(),
+                submodules: None,
             },
         )]);
         let m = build_manifest(

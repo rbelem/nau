@@ -18,7 +18,7 @@ _Avoid_: recipe, formula, formula file
 
 **Package type**: `source` (build from upstream tarball), `meta` (dependency group, no build), `store` (pulled from Snap Store, no local source).
 
-**Input**: A package source declaration, inspired by Nix flake inputs. URL schemes: `github:user/repo[/branch]` (shallow-cloned to `~/.cache/shuttle/inputs/`) or `path:/local/dir` (local filesystem). Declared as a Lua global before the return statement in `shuttle.lua`, or per-snap via `inputs` on a `snap()` declaration. If no inputs are declared, a default `github:rbelem/shuttle/main` is used at runtime.
+**Input**: A package source declaration, inspired by Nix flake inputs. URL schemes: `github:user/repo[/branch]` (shallow-cloned to `~/.cache/shuttle/inputs/`) or `path:/local/dir` (local filesystem). Declared as a Lua global before the return statement in `shuttle.lua`, or per-snap via `inputs` on a `snap()` declaration. If no inputs are declared, a default `github:rbelem/shuttle/main` is used at runtime. A github input may declare `submodules` — `true` (every `.gitmodules` entry) or a list of entry names/paths — materializing each declared submodule at the parent pin's gitlink and recording its commit in the lockfile (see ADR-0029).
 _Avoid_: registry, flake, source declaration
 
 **Toolchain**: A meta-package (`type = "meta"`) that aggregates compiler, linker, and runtime libraries needed to build source packages. Named by GNU triplet: `toolchain-<compiler>-<libc>-<arch>`.

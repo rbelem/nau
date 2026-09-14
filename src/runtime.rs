@@ -3662,6 +3662,7 @@ plugs:
             "pkgs".to_string(),
             crate::snap::PackageInput {
                 url: "github:owner/repo/main".into(),
+                submodules: None,
             },
         )]);
         let mut lockfile = crate::lock::LockFile {
@@ -3678,6 +3679,7 @@ plugs:
                 revision: Some("c0ffee".into()),
                 sha256: Some("beef".into()),
                 local: false,
+                submodules: None,
             },
         );
         let mut manifest = crate::manifest::build_manifest(

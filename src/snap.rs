@@ -107,6 +107,28 @@ pub struct BuildResult {
 
 // ── Package inputs (inspired by Nix flake inputs) ──
 
+/// Submodule policy for a git input (issue #43): `submodules = true`
+/// fetches every `.gitmodules` entry at the parent's pinned revision; a
+/// list fetches only the named entries (matched against `.gitmodules`
+/// section names or paths). Absent — the default — never touches
+/// submodules: gitlinks stay unmaterialized, exactly like before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum SubmoduleSpec {
+    /// `submodules = { "libfoo", "libbar" }` — the named entries only.
+    Named(Vec<String>),
+    /// `submodules = true` (or an explicit `false`, which means none).
+    All(bool),
+}
+
+impl SubmoduleSpec {
+    /// False for a hand-built `All(false)`; the DSL parse normalizes
+    /// `false` away, but non-DSL constructors can produce this value.
+    pub fn active(&self) -> bool {
+        !matches!(self, SubmoduleSpec::All(false))
+    }
+}
+
 /// A package input source — declares where to fetch package definitions from.
 ///
 /// URL schemes:
@@ -117,6 +139,43 @@ pub struct PackageInput {
     /// URL in Nix-inspired format (e.g. "github:rbelem/shuttle/main",
     /// "path:/home/user/pkgs").
     pub url: String,
+
+    /// Submodule policy (issue #43). `None` = parent tree only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submodules: Option<SubmoduleSpec>,
+}
+
+/// Parse a `submodules` declaration from an input table value.
+/// `true` → all entries; a non-empty table of strings → named entries;
+/// `false`/absent → `None`. Anything else fails, naming `ctx`.
+pub(crate) fn parse_submodule_spec(
+    v: mlua::Value,
+    ctx: &str,
+) -> miette::Result<Option<SubmoduleSpec>> {
+    match v {
+        mlua::Value::Nil | mlua::Value::Boolean(false) => Ok(None),
+        mlua::Value::Boolean(true) => Ok(Some(SubmoduleSpec::All(true))),
+        mlua::Value::Table(t) => {
+            let mut names = Vec::new();
+            for item in t.sequence_values::<String>() {
+                let name = item.map_err(|e| miette::miette!("{ctx}: {e}"))?;
+                if name.is_empty() {
+                    return Err(miette::miette!("{ctx}: submodule names must not be empty"));
+                }
+                names.push(name);
+            }
+            if names.is_empty() {
+                return Err(miette::miette!(
+                    "{ctx}: 'submodules' list must not be empty — omit the field to fetch none"
+                ));
+            }
+            Ok(Some(SubmoduleSpec::Named(names)))
+        }
+        other => Err(miette::miette!(
+            "{ctx}: 'submodules' must be true or a list of submodule names, got {}",
+            other.type_name()
+        )),
+    }
 }
 
 /// Dependency-closure declaration (ADR-0017, issue #13): which ecosystem
@@ -1770,7 +1829,7 @@ fn get_opt_plug_map(
     Ok(Some(map))
 }
 
-/// Extract `inputs` table: maps name → PackageInput { url }.
+/// Extract `inputs` table: maps name → PackageInput { url, submodules? }.
 fn get_package_inputs(
     table: &mlua::Table,
 ) -> miette::Result<Option<HashMap<String, PackageInput>>> {
@@ -1785,7 +1844,11 @@ fn get_package_inputs(
                         let url: String = input_table
                             .get("url")
                             .map_err(|_| miette::miette!("inputs['{name}']: missing 'url'"))?;
-                        inputs.insert(name, PackageInput { url });
+                        let submodules = parse_submodule_spec(
+                            input_table.get::<Value>("submodules").unwrap_or(Value::Nil),
+                            &format!("inputs['{name}']"),
+                        )?;
+                        inputs.insert(name, PackageInput { url, submodules });
                     }
                     other => {
                         return Err(miette::miette!(
@@ -5427,6 +5490,110 @@ mod tests {
             }
             other => panic!("expected Pinned, got {:?}", other),
         }
+    }
+
+    // ── Issue #43: `submodules` on input declarations ──
+
+    #[test]
+    fn test_submodule_spec_parse_forms() {
+        let all = parse_submodule_spec(mlua::Value::Boolean(true), "inputs['x']").unwrap();
+        assert_eq!(all, Some(SubmoduleSpec::All(true)));
+        assert!(all.as_ref().unwrap().active());
+
+        // `false` normalizes to absent.
+        let off = parse_submodule_spec(mlua::Value::Boolean(false), "inputs['x']").unwrap();
+        assert_eq!(off, None);
+
+        // Absent field → None.
+        let absent = parse_submodule_spec(mlua::Value::Nil, "inputs['x']").unwrap();
+        assert_eq!(absent, None);
+    }
+
+    #[test]
+    fn test_submodule_spec_dsl_table_and_list() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                all = snap {
+                    name = "sub-all",
+                    version = "1.0",
+                    inputs = { src = { url = "github:o/r", submodules = true } },
+                },
+                named = snap {
+                    name = "sub-named",
+                    version = "1.0",
+                    inputs = { src = { url = "github:o/r", submodules = { "libfoo", "libbar" } } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let all: mlua::Table = table.get("all").unwrap();
+        let meta = SnapMeta::from_lua_table(&all).unwrap();
+        let inputs = meta.inputs.unwrap();
+        assert_eq!(
+            inputs["src"].submodules,
+            Some(SubmoduleSpec::All(true)),
+            "submodules = true parses through per-snap inputs"
+        );
+
+        let named: mlua::Table = table.get("named").unwrap();
+        let meta = SnapMeta::from_lua_table(&named).unwrap();
+        let inputs = meta.inputs.unwrap();
+        assert_eq!(
+            inputs["src"].submodules,
+            Some(SubmoduleSpec::Named(vec!["libfoo".into(), "libbar".into()])),
+            "named list parses and preserves order"
+        );
+    }
+
+    #[test]
+    fn test_submodule_spec_dsl_rejects_bad_shapes() {
+        let env = LuaEnv::new();
+        for (body, expected) in [
+            ("submodules = 1", "'submodules' must be true or a list"),
+            ("submodules = { }", "'submodules' list must not be empty"),
+        ] {
+            let src = format!(
+                r#"
+            return {{
+                bad = snap {{
+                    name = "bad",
+                    version = "1.0",
+                    inputs = {{ src = {{ url = "github:o/r", {body} }} }},
+                }},
+            }}
+            "#
+            );
+            let table = env.eval(&src).unwrap();
+            let bad: mlua::Table = table.get("bad").unwrap();
+            let err = SnapMeta::from_lua_table(&bad)
+                .expect_err("malformed submodules declaration must fail");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?} in: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_submodule_spec_serializes_for_lua_roundtrip() {
+        // The eval subprocess serializes inputs to JSON and rehydrates them
+        // as a Lua table — the untagged shapes must be JSON-native.
+        let all = serde_json::to_value(&SubmoduleSpec::All(true)).unwrap();
+        assert_eq!(all, serde_json::Value::Bool(true));
+        let named =
+            serde_json::to_value(&SubmoduleSpec::Named(vec!["a".into(), "b".into()])).unwrap();
+        assert_eq!(
+            named,
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("a".into()),
+                serde_json::Value::String("b".into()),
+            ])
+        );
     }
 
     #[test]

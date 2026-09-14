@@ -456,6 +456,7 @@ fn default_input_map() -> HashMap<String, PackageInput> {
         shuttle::pkg_source::DEFAULT_INPUT_NAME.to_string(),
         PackageInput {
             url: shuttle::pkg_source::DEFAULT_INPUT_URL.to_string(),
+            submodules: None,
         },
     );
     m
@@ -3967,6 +3968,7 @@ fn index_update(file: &str) {
     if inputs.is_empty() {
         let default = PackageInput {
             url: "github:rbelem/shuttle/main".into(),
+            submodules: None,
         };
         eprintln!("  Updating default package index...");
         if let Err(e) = shuttle::pkg_source::refresh_input(&default) {

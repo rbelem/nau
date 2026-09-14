@@ -306,7 +306,13 @@ fn extract_inputs_from_lua(lua: &mlua::Lua) -> miette::Result<HashMap<String, Pa
                         let url: String = input_table
                             .get("url")
                             .map_err(|_| miette::miette!("inputs['{name}']: missing 'url'"))?;
-                        inputs.insert(name, PackageInput { url });
+                        let submodules = crate::snap::parse_submodule_spec(
+                            input_table
+                                .get::<mlua::Value>("submodules")
+                                .unwrap_or(mlua::Value::Nil),
+                            &format!("inputs['{name}']"),
+                        )?;
+                        inputs.insert(name, PackageInput { url, submodules });
                     }
                     other => {
                         return Err(miette::miette!(

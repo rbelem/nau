@@ -71,6 +71,31 @@ pub struct InputLockEntry {
     /// True for `path:` inputs — always resolved from the local filesystem.
     #[serde(default, skip_serializing_if = "is_false")]
     pub local: bool,
+
+    /// Submodule pins (issue #43): `.gitmodules` name → resolved commit,
+    /// materialization path, and content hash, all observed at lock time
+    /// under the parent's pinned revision. Present only for inputs
+    /// declared with `submodules`; absent (default) for every other entry,
+    /// so pre-#43 lockfiles load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submodules: Option<HashMap<String, SubmoduleLockEntry>>,
+}
+
+/// One pinned submodule of a git input (issue #43): the commit the
+/// parent's pinned revision records for it (its gitlink), where it
+/// materializes inside the parent tree, and the content hash of its tree
+/// at lock time — verified on every resolution, named on mismatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmoduleLockEntry {
+    /// Path within the parent tree (from `.gitmodules`) where the
+    /// submodule materializes (e.g. "vendor/mylib").
+    pub path: String,
+
+    /// Resolved git commit SHA of the submodule at the parent's pin.
+    pub revision: String,
+
+    /// SHA-256 over the submodule's content tree (excluding `.git`).
+    pub sha256: String,
 }
 
 /// `skip_serializing_if` helper: omit `local = false` from the lockfile.
@@ -492,6 +517,7 @@ mod tests {
                     "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef".to_string(),
                 ),
                 local: false,
+                submodules: None,
             },
         );
         inputs.insert(
@@ -500,6 +526,7 @@ mod tests {
                 revision: None,
                 sha256: None,
                 local: true,
+                submodules: None,
             },
         );
 
@@ -541,6 +568,99 @@ mod tests {
         let lock: LockFile = serde_json::from_str(json).unwrap();
         assert_eq!(lock.version, 1);
         assert!(lock.inputs.is_empty());
+    }
+
+    #[test]
+    fn test_input_entry_without_submodule_fields_backcompat() {
+        // Pre-#43 input entries have no `submodules` key — must still load,
+        // reading as "no submodule pins" (parent tree only).
+        let json = r#"{
+            "version": 1,
+            "inputs": {
+                "packages": {
+                    "revision": "c0ffee1234567890c0ffee1234567890c0ffee123",
+                    "sha256": "beef",
+                    "local": false
+                }
+            }
+        }"#;
+        let lock: LockFile = serde_json::from_str(json).unwrap();
+        let entry = &lock.inputs["packages"];
+        assert_eq!(
+            entry.revision.as_deref(),
+            Some("c0ffee1234567890c0ffee1234567890c0ffee123")
+        );
+        assert!(entry.submodules.is_none(), "absent field loads as None");
+    }
+
+    #[test]
+    fn test_input_entry_submodule_pins_roundtrip() {
+        // Issue #43: parent rev + submodule name → submodule rev. The pin
+        // map lives inside the input entry and round-trips through JSON.
+        let mut subs = HashMap::new();
+        subs.insert(
+            "mylib".to_string(),
+            SubmoduleLockEntry {
+                path: "vendor/mylib".to_string(),
+                revision: "fedcba9876543210fedcba9876543210fedcba98".to_string(),
+                sha256: "cafe".to_string(),
+            },
+        );
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "valkey".to_string(),
+            InputLockEntry {
+                revision: Some("c0ffee1234567890c0ffee1234567890c0ffee123".to_string()),
+                sha256: Some("beef".to_string()),
+                local: false,
+                submodules: Some(subs),
+            },
+        );
+        let lock = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs,
+            packages: HashMap::new(),
+            build_deps: HashMap::new(),
+        };
+
+        let json = serde_json::to_string_pretty(&lock).unwrap();
+        assert!(json.contains("submodules"), "pins serialize");
+        assert!(json.contains("vendor/mylib"), "path recorded");
+        assert!(json.contains("fedcba9876543210fedcba9876543210fedcba98"));
+
+        let back: LockFile = serde_json::from_str(&json).unwrap();
+        let entry = &back.inputs["valkey"];
+        let sub = &entry.submodules.as_ref().unwrap()["mylib"];
+        assert_eq!(sub.path, "vendor/mylib");
+        assert_eq!(sub.revision, "fedcba9876543210fedcba9876543210fedcba98");
+        assert_eq!(sub.sha256, "cafe");
+
+        // An entry without pins serializes no `submodules` key at all.
+        let mut plain = HashMap::new();
+        plain.insert(
+            "local".to_string(),
+            InputLockEntry {
+                revision: None,
+                sha256: None,
+                local: true,
+                submodules: None,
+            },
+        );
+        let bare = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs: plain,
+            packages: HashMap::new(),
+            build_deps: HashMap::new(),
+        };
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(
+            !json.contains("submodules"),
+            "no submodule pins → no submodule key, got: {json}"
+        );
     }
 
     #[test]
