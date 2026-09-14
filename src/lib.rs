@@ -30,6 +30,7 @@ pub mod plugins;
 pub mod pod;
 pub mod runtime;
 pub mod sign;
+pub mod slot_recovery;
 pub mod snap;
 pub mod store;
 pub mod uc;

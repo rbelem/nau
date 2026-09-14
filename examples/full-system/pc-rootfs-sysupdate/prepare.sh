@@ -180,6 +180,11 @@ extract_payload "$OUT"/gen2b/shuttle-80_2.0_amd64.img 2.0 "$WORK/payload-gen2b"
 # extractions above only need the gen2 images.
 build_one gen1.lua        gen1  shuttle-80_1.0_amd64.img
 
+# #86 strand CONTROL device (recovery masked via systemd.mask=): built
+# from the same tree, so it only differs from gen1 by the kernel cmdline.
+build_one gen1-strand.lua gen1-strand  shuttle-80_1.0_amd64.img
+
 log "preparation complete"
 echo "images:   $OUT"
 echo "payload:  $WORK/payload-gen2  (serve, then boot the gen-1 device)"
+echo "#86:      serve with tools/strand-server.py to strand; see README"

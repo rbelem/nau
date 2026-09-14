@@ -433,7 +433,7 @@ fn systemd_present() -> bool {
     Path::new("/run/systemd/system").exists()
 }
 
-fn find_on_path(tool: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(tool: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
         let candidate = dir.join(tool);

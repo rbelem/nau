@@ -2245,6 +2245,7 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
             shuttle::output::set_mode(json);
             runtime_activate(state_dir)
         }
+        RuntimeCommand::RecoverSlots { esp_mount } => runtime_recover_slots(&esp_mount),
     }
 }
 
@@ -3104,6 +3105,17 @@ fn runtime_activate(state_dir: Option<String>) -> miette::Result<()> {
     }
     print_report(&report);
     Ok(())
+}
+
+/// `shuttle runtime recover-slots` (issue #86): assess and reclaim
+/// sysupdate slots stranded mid-install. Runs in-guest at boot (the
+/// emitted `shuttle-slot-recovery.service` oneshot); see
+/// [`shuttle::slot_recovery`] for the invariant and the conservative
+/// recovery policy.
+fn runtime_recover_slots(esp_mount: &str) -> miette::Result<()> {
+    let runner = shuttle::command::RealRunner;
+    let tools = shuttle::slot_recovery::SlotRecoveryTools::resolve();
+    shuttle::slot_recovery::recover_slots(Path::new(esp_mount), &runner, &tools)
 }
 
 // ── Search command ──

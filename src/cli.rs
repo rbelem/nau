@@ -725,6 +725,22 @@ pub enum RuntimeCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Reclaim sysupdate A/B slots stranded mid-install (issue #86). A
+    /// killed install can leave a slot carrying the new version label
+    /// with no matching UKI on the ESP — the next update then finds no
+    /// writable target (systemd 249 has no vacuum verb). This command
+    /// relabels such slots `_empty` when the evidence proves the loader
+    /// never selected them, surfaces a named anomaly otherwise, and never
+    /// touches the running version. Boot-safe: every refusal is a named
+    /// no-op. The emitted `shuttle-slot-recovery.service` oneshot runs
+    /// this at boot, ordered before `systemd-sysupdate.service`.
+    RecoverSlots {
+        /// Where the image mounts the ESP — the emitted unit bakes the
+        /// image's own declaration in (default: /boot).
+        #[arg(long, default_value = "/boot")]
+        esp_mount: String,
+    },
 }
 
 /// Subcommands for `shuttle key` (ADR-0011 step (e), ADR-0024 §4): the
@@ -1570,6 +1586,36 @@ mod tests {
                 assert!(!all);
             }
             _ => panic!("expected Runtime Upgrade named"),
+        }
+    }
+
+    // ── Stranded-slot recovery (issue #86) ──
+
+    #[test]
+    fn test_runtime_recover_slots_defaults_and_flag() {
+        match Cli::try_parse_from(["shuttle", "runtime", "recover-slots"])
+            .unwrap()
+            .command
+        {
+            Command::Runtime(RuntimeCommand::RecoverSlots { esp_mount }) => {
+                assert_eq!(esp_mount, "/boot", "the emitted units' default mount");
+            }
+            _ => panic!("expected Runtime RecoverSlots"),
+        }
+        match Cli::try_parse_from([
+            "shuttle",
+            "runtime",
+            "recover-slots",
+            "--esp-mount",
+            "/boot/efi",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Runtime(RuntimeCommand::RecoverSlots { esp_mount }) => {
+                assert_eq!(esp_mount, "/boot/efi");
+            }
+            _ => panic!("expected Runtime RecoverSlots with --esp-mount"),
         }
     }
 

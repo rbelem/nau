@@ -146,6 +146,21 @@ return {
             { source = "local/nix/libmount.so.1",            dest = "/nix/store/17xmg38m60inc59az3frp540ccrwn2r8-util-linux-minimal-2.42.2-lib/lib/libmount.so.1" },
             { source = "local/nix/libsmartcols.so.1",        dest = "/nix/store/17xmg38m60inc59az3frp540ccrwn2r8-util-linux-minimal-2.42.2-lib/lib/libsmartcols.so.1" },
             { source = "local/nix/libuuid.so.1",             dest = "/nix/store/17xmg38m60inc59az3frp540ccrwn2r8-util-linux-minimal-2.42.2-lib/lib/libuuid.so.1" },
+            -- #86 proof-only: a GUEST-RUNNABLE /usr/bin/shuttle. The
+            -- build-host embed (#81) needs glibc >= 2.38; the core22
+            -- guest ships 2.35, so `runtime activate` and `runtime
+            -- recover-slots` could not exec at all (measured: "GLIBC_2.39
+            -- not found", in both #80's and #86's serial logs). This copy
+            -- is the same build with RUNPATH into the nix glibc/gcc dirs
+            -- — of which this file list already stages the loader and
+            -- libc for the sysupdate tooling — plus libstdc++, libgcc_s
+            -- and libm staged at their absolute store paths. Product
+            -- images keep the #81 embed; this is harness plumbing,
+            -- exactly like the sysupdate tooling above.
+            { source = "local/nix/shuttle-guest",            dest = "/usr/bin/shuttle" },
+            { source = "local/nix/libstdcpp.so.6",           dest = "/nix/store/chqq8mpmpyfi9kgsngya71akv5xicn03-gcc-15.2.0-lib/lib/libstdc++.so.6" },
+            { source = "local/nix/libgcc_s.so.1",            dest = "/nix/store/chqq8mpmpyfi9kgsngya71akv5xicn03-gcc-15.2.0-lib/lib/libgcc_s.so.1" },
+            { source = "local/nix/libm.so.6",                dest = "/nix/store/n51dhmdbik1kfrsm62j5knavmigwrl1a-glibc-2.42-84/lib/libm.so.6" },
             -- Per-generation payload proof + clean end of boot.
             { source = "proof/gen1/shuttle-80-proof.service", dest = "/etc/systemd/system/shuttle-80-proof.service" },
             { source = "proof/poweroff.service",              dest = "/etc/systemd/system/shuttle-80-poweroff.service" },

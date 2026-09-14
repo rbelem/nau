@@ -4415,8 +4415,14 @@ WantedBy=timers.target
 
         let service = root.path().join(SYSUPDATE_SERVICE_PATH);
         let timer = root.path().join(SYSUPDATE_TIMER_PATH);
+        let recovery = root.path().join(SLOT_RECOVERY_UNIT_PATH);
         assert!(service.is_file(), "service at {}", service.display());
         assert!(timer.is_file(), "timer at {}", timer.display());
+        assert!(
+            recovery.is_file(),
+            "recovery unit at {}",
+            recovery.display()
+        );
 
         // The timer is enabled into timers.target with the relative
         // symlink emit::enable_unit produces; the service is pulled by the
@@ -4441,6 +4447,41 @@ WantedBy=timers.target
             !service_link.exists(),
             "the service must not be separately enabled — the timer pulls it"
         );
+    }
+
+    #[test]
+    fn slot_recovery_unit_is_enabled_and_ordered_before_the_update() {
+        // Issue #86: the recovery oneshot ships on the same gate as the
+        // transfers, enabled into every boot, ordered before the update
+        // service it preconditions, and pinned to the embedded binary.
+        let root = tempfile::tempdir().unwrap();
+        emit_sysupdate_units(root.path(), Some("/boot")).unwrap();
+
+        let link = root
+            .path()
+            .join("etc/systemd/system/multi-user.target.wants")
+            .join(SLOT_RECOVERY_UNIT_NAME);
+        let meta = std::fs::symlink_metadata(&link)
+            .unwrap_or_else(|e| panic!("enablement link missing at {}: {e}", link.display()));
+        assert!(meta.file_type().is_symlink());
+
+        let text = std::fs::read_to_string(root.path().join(SLOT_RECOVERY_UNIT_PATH)).unwrap();
+        assert!(text.contains("Before=systemd-sysupdate.service"), "{text}");
+        assert!(text.contains("After=local-fs.target"), "{text}");
+        assert!(text.contains("RequiresMountsFor=/boot"), "{text}");
+        assert!(
+            text.contains("ExecStart=/usr/bin/shuttle runtime recover-slots --esp-mount /boot"),
+            "pinned binary + the image's own ESP mount: {text}"
+        );
+        assert!(text.contains("WantedBy=multi-user.target"), "{text}");
+    }
+
+    #[test]
+    fn slot_recovery_exec_is_the_pinned_staged_binary() {
+        // Same drift guard as BOOT_HEALTH_EXEC: the constant and the
+        // staged path cannot diverge (issue #81).
+        assert!(RECOVER_SLOTS_EXEC.starts_with("/usr/bin/shuttle "));
+        assert!(RECOVER_SLOTS_EXEC.ends_with(" runtime recover-slots"));
     }
 
     #[test]
