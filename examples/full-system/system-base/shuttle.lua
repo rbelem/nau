@@ -41,7 +41,12 @@ return {
         -- ship as modules and are the ones the initramfs would need.
         kernel = merge(pin("pc-kernel"), {
             params = {
-                "quiet",
+                -- No `quiet`: the #84 boot-completion gate reads systemd's
+                -- target lines ("Reached target Multi-User System.") off the
+                -- serial log, and `quiet` suppresses those status lines
+                -- (systemd show_status=auto), making a COMPLETING boot look
+                -- like a stall to the harness. Un-quiet is what the #63
+                -- proof boots used for the same reason.
                 "console=ttyS0,115200",
                 "panic=-1",
                 "net.ifnames=0",

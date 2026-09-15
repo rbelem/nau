@@ -21,6 +21,27 @@
 -- assessment (try-boot/revert is a systemd-boot protocol; disk.ab and
 -- update_source are REFUSED for piboot rather than shipped inert).
 --
+-- Boot proof status (#88): the FULL chain (VideoCore firmware -> kernel)
+-- needs real Pi hardware — QEMU does not emulate start.elf/config.txt.
+-- The deepest emulator reach is a `-M virt` TCG probe of the STAGED
+-- payload kernel against THIS image (kernel-only, not the product boot
+-- path): the raspi kernel carries the -M virt platform built-in
+-- (PCI_HOST_GENERIC + NVME + EXT4_FS + PL011 console are '=y'), so it
+-- mounts this image's real root from a QEMU NVMe with no initramfs and
+-- reaches userspace. Probe (adjusts only what the emulated hardware
+-- lacks — no VideoCore, so no firmware handoff and no SD/MMC root):
+--   zcat <pi-kernel snap>/kernel.img > /tmp/Image   # the gzip unwrap the
+--                                                   # firmware performs
+--   qemu-system-aarch64 -M virt -cpu cortex-a53 -smp 2 -m 2G \
+--     -kernel /tmp/Image \
+--     -append "net.ifnames=0 systemd.unified_cgroup_hierarchy=1 rootwait \
+--       rw root=PARTUUID=<p2-uuid> console=ttyAMA0,115200" \
+--     -drive file=ubuntu-core-pi_22.04_arm64.img,if=none,id=d,format=raw \
+--     -device nvme,drive=d,serial=probe -display none -monitor none \
+--     -serial file:pi-tcg-probe.serial.log
+-- The product boot path itself (cmdline.txt root=PARTUUID= on the SD's
+-- MMC partition) is verified only on hardware — recipe in ADR-0025.
+--
 -- Build:
 --   shuttle image --file examples/full-system/pi-rootfs/shuttle.lua --arch arm64
 --
