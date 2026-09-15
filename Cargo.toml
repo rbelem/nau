@@ -19,6 +19,14 @@ base64 = "0.22"
 # Snap Store assertion verification (ADR-0011 step b): OpenPGP v4
 # RSA-SHA512 over assertion wire bytes (see src/assert.rs).
 pgp = "0.20"
+# snapd assertion SIGNING (#28/#32): snapd's assertion crypto implements
+# ONLY OpenPGP v4 RSA-SHA512 (asserts/crypto.go — no ed25519 anywhere), so
+# the UC seed's model/account/account-key assertions are signed with an
+# RSA-4096 key through the same pgp crate; rsa is the direct handle for
+# keygen + PKCS#8 persistence. Both were already vendored (via pgp) — no
+# new vendored code.
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
 # Self-managed update-manifest signing (ADR-0011 step d, see src/sign.rs):
 # Ed25519 over canonical manifest bytes. Already locked transitively (via
 # pgp) at 2.2 — no new vendored code; keygen reads /dev/urandom directly.

@@ -151,7 +151,15 @@ pub(crate) fn mkpart_name(label: &str, part: &Partition) -> String {
         if part.name.is_empty() {
             "primary".to_string()
         } else {
-            part.name.clone()
+            // parted tokenizes its command string by whitespace, so a GPT
+            // PARTLABEL with a space (the pc gadget's "BIOS Boot") must be
+            // double-quoted for parted's own parser to keep it as one
+            // token.
+            if part.name.contains(' ') {
+                format!("\"{}\"", part.name)
+            } else {
+                part.name.clone()
+            }
         }
     } else {
         "primary".to_string()
@@ -245,8 +253,9 @@ pub(crate) fn create_partitions(
             .map_err(|e| miette::miette!("parted: {e}"))?;
         if out.code != 0 {
             return Err(miette::miette!(
-                "parted failed to create partition '{}'",
-                part.name
+                "parted failed to create partition '{}': {}",
+                part.name,
+                out.stderr.trim()
             ));
         }
 
@@ -1232,6 +1241,7 @@ pub(crate) fn uc_role_for_partlabel(label: &str) -> Option<&'static str> {
         crate::uc::UC_SEED_PART => Some(crate::uc::ROLE_SEED),
         crate::uc::UC_BOOT_PART => Some(crate::uc::ROLE_BOOT),
         crate::uc::UC_DATA_PART => Some(crate::uc::ROLE_DATA),
+        crate::uc::UC_SAVE_PART => Some(crate::uc::ROLE_SAVE),
         _ => None,
     }
 }
@@ -1403,16 +1413,16 @@ pub(crate) fn setup_uc_context(
     let gadget_tree = scratch.join("uc-gadget-tree");
     unpack_snap(runner, &gadget_file, &gadget_tree)?;
 
-    // The kernel snap's kernel.efi (the UKI grub chainloads).
-    let kernel_efi = kernel_dir.join("kernel.efi");
+    // The kernel snap's kernel.efi (the UKI grub chainloads) — the
+    // extracted tree is <dir>/kernel-snap/.
+    let kernel_efi = kernel_dir.join("kernel-snap").join("kernel.efi");
 
     // Build the signed model assertion and stage the seed + modeenv trees.
     let model = crate::uc::ModelAssertion::from_image(image, arch, &snap_ids)?;
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-    let kp = match crate::sign::load_secret_key(&home)? {
-        Some(kp) => kp,
-        None => crate::sign::create_secret_key(&home)?,
-    };
+    // snapd verifies assertions with OpenPGP v4 RSA — a DIFFERENT key (and
+    // crypto) from the ADR-0011 manifest key, persisted separately.
+    let key = crate::uc::SnapdAssertionKey::load_or_create(&home)?;
     let seed_stage = scratch.join("uc-seed-staging");
     let label = crate::uc::recovery_label(image);
     let extra_cmdline = kernel_entry.params.join(" ");
@@ -1426,7 +1436,7 @@ pub(crate) fn setup_uc_context(
             extra_cmdline: &extra_cmdline,
             model: &model,
             snaps: &seeds,
-            kp: &kp,
+            key: &key,
         },
     )?;
     let boot_stage = scratch.join("uc-boot-staging");
@@ -1439,10 +1449,18 @@ pub(crate) fn setup_uc_context(
         &image.base.name,
         gadget_name,
     )?;
+    // The recovery "kernel.efi" snapd's grub config chainloads is a VFAT
+    // IMAGE wrapping the kernel snap's UKI: the config does
+    // `loopback loop <kernel.efi>` + `chainloader (loop)/kernel.efi`, so the
+    // file must carry a filesystem with kernel.efi at its root — the raw
+    // UKI fails with "unknown filesystem" at the first auto-boot (snapd
+    // builds the same wrap via osutil/mkfs.MakeWithContent).
+    let sys_kernel_efi = seed_stage.join("systems").join(&label).join("kernel.efi");
+    wrap_kernel_efi_image(runner, &kernel_efi, &sys_kernel_efi, scratch)?;
     eprintln!(
         "  ✓ UC seed staged (recovery system {label}, {} snaps, key id {})",
         seeds.len(),
-        kp.key_id()
+        key.key_id()
     );
     Ok(Some(UcCtx {
         seed_stage,
@@ -1477,9 +1495,73 @@ fn assert_uc_partition_shapes(layout: &DiskLayout) -> miette::Result<()> {
     Ok(())
 }
 
+/// Wrap the kernel snap's UKI into a VFAT image at `dest`: a small FAT32
+/// filesystem whose root carries the UKI as `kernel.efi`. This is the
+/// recovery-kernel image snapd's grub config loopback-mounts. `mkfs.fat
+/// --invariant` + a fixed size keep the image byte-stable (#48); failure is
+/// fatal (the first boot cannot start without it).
+fn wrap_kernel_efi_image(
+    runner: &dyn CommandRunner,
+    uki: &Path,
+    dest: &Path,
+    scratch: &Path,
+) -> miette::Result<()> {
+    let uki_len = std::fs::metadata(uki)
+        .map(|m| m.len())
+        .into_diagnostic()
+        .wrap_err_with(|| format!("sizing {}", uki.display()))?;
+    // UKI + FAT32 overhead; the count is passed in 512-byte-sector units
+    // (dosfstools' smallest denominator) with generous slack so a marginal
+    // mcopy never fails on "Disk full".
+    let sectors = (uki_len / 512) + 131_072; // +64 MiB of slack
+    let work = scratch.join("kernel-efi-wrap.img");
+    let argv = vec![
+        "mkfs.fat".to_string(),
+        "-C".to_string(),
+        "-F".to_string(),
+        "32".to_string(),
+        "--invariant".to_string(),
+        "-n".to_string(),
+        "KERNEL".to_string(),
+        work.to_string_lossy().into_owned(),
+        sectors.to_string(),
+    ];
+    let out = runner
+        .run(&argv)
+        .map_err(|e| miette::miette!("mkfs.fat not found: {e}"))?;
+    if out.code != 0 {
+        return Err(miette::miette!(
+            "mkfs.fat failed building the recovery kernel image: {}",
+            out.stderr.trim()
+        ));
+    }
+    let argv = vec![
+        "mcopy".to_string(),
+        "-i".to_string(),
+        work.to_string_lossy().into_owned(),
+        "-o".to_string(),
+        uki.to_string_lossy().into_owned(),
+        "::/kernel.efi".to_string(),
+    ];
+    let out = runner
+        .run(&argv)
+        .map_err(|e| miette::miette!("mcopy not found: {e}"))?;
+    if out.code != 0 {
+        return Err(miette::miette!(
+            "mcopy failed staging the UKI into the recovery kernel image: {}",
+            out.stderr.trim()
+        ));
+    }
+    std::fs::rename(&work, dest)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("placing the recovery kernel image at {}", dest.display()))
+}
+
 /// Resolve the store snap-id for every snap the seed carries: base, kernel,
-/// gadget, snapd and the declared extras. Fails closed naming the first
-/// snap that cannot be identified.
+/// gadget, snapd and the declared extras. Declared names are mapped through
+/// the package index to their STORE names first (the pc gadget's index name
+/// is `pc-gadget`; the store knows it as `pc`). Fails closed naming the
+/// first snap that cannot be identified.
 fn resolve_snap_ids(
     runner: &dyn CommandRunner,
     image: &ImageDeclaration,
@@ -1506,11 +1588,26 @@ fn resolve_snap_ids(
                  it to the image declaration"
             ));
         }
-        let id = crate::store::StoreClient::snap_id_with(runner, name)?;
+        let id = crate::store::StoreClient::snap_id_with(runner, &store_name_for(name))?;
         eprintln!("  ✓ snap-id {name} = {id}");
         ids.insert(name.to_string(), id);
     }
     Ok(ids)
+}
+
+/// The STORE name for a declared snap name: the package index maps aliases
+/// (`pc-gadget` → store `pc`); names the index doesn't know pass through.
+fn store_name_for(name: &str) -> String {
+    let path = std::env::var("SHUTTLE_INDEX_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
+    let Ok(index) = crate::index::PackageIndex::load_or_default(&path) else {
+        return name.to_string();
+    };
+    index
+        .find_by_name_or_alias(name)
+        .and_then(|e| e.store.as_ref().and_then(|s| s.name.clone()))
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// Unpack a snap file into a directory with unsquashfs (the runner resolves

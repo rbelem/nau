@@ -2217,6 +2217,8 @@ dependencies = [
  "mlua",
  "owo-colors",
  "pgp",
+ "rand",
+ "rsa",
  "serde",
  "serde_json",
  "serde_yaml",

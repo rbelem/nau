@@ -25,14 +25,36 @@
 //!    model assertion, `seed.yaml`, the seed snap payloads, the kernel
 //!    snap's `kernel.efi` UKI, and a grubenv pointing grub's first-boot
 //!    config at it.
-//! 3. **The model assertion** — a UC `type: model` assertion in the snapd
-//!    wire format (headers only, `series: 16`, base64url sha3-384 key id,
-//!    ed25519 signature), self-signed through a bootstrapped account chain
-//!    (`account-key` + `account` staged under `assertions/database/`, the
-//!    same trust-anchor mechanism snapd's assertion DB uses for brand
-//!    accounts). The model carries `grade: dangerous` — a QEMU boot has no
-//!    TPM and no secure boot, and the dangerous grade is the documented
-//!    non-secboot path.
+//! 3. **The model assertion** — a UC `type: model` assertion in snapd's
+//!    real wire format (headers only, `series: 16`, `body-length` when a
+//!    body exists, base64url sha3-384 key id, OpenPGP v4 RSA-SHA512
+//!    signature), self-signed through a bootstrapped account chain
+//!    (`account-key` carrying the public key as its BODY + `account`,
+//!    staged under the recovery system's `assertions/` dir — the same
+//!    trust-anchor mechanism snapd's seed loader ReadDirs). The model
+//!    carries `grade: dangerous` — a QEMU boot has no TPM and no secure
+//!    boot, and the dangerous grade is the documented non-secboot path.
+//!
+//!    The signature machinery is snapd's own, not an approximation:
+//!    snapd's assertion crypto implements ONLY OpenPGP v4 RSA
+//!    (`asserts/crypto.go` — `golang.org/x/crypto/openpgp`; there is no
+//!    ed25519 anywhere in the codebase), so this module:
+//!    - signs assertions with an RSA-4096 key (PKCS#8-persisted at
+//!      `~/.config/shuttle/assertion-key.pem`),
+//!    - wraps signature bytes as `base64(0x01 ‖ OpenPGP signature packet)`
+//!      in 76-column lines (x/crypto's `encodeV1`),
+//!    - carries the account-key's public key as its assertion BODY in the
+//!      same envelope (`0x01 ‖ public-key packet`), with a `body-length`
+//!      header — the stream decoder reads bodies ONLY on that header,
+//!    - derives the key id exactly as snapd does:
+//!      `base64url(SHA3-384(0x01 ‖ x/crypto-serialized public-key
+//!      packet))`.
+//!
+//!    Every byte of this contract is boot-verified against snap-bootstrap
+//!    (2.77, amd64) — the wrong variants fail the seed load with named
+//!    errors (`assertion account: "validation" header is mandatory`,
+//!    `assertion account: "timestamp" header is not a RFC3339 date`,
+//!    `assertion account-key: cannot decode public key: no data`).
 //! 4. **The first-boot grub config** — snapd's own `Snapd-Boot-Config-
 //!    Edition: 2` recovery config, byte-for-byte the template snapd
 //!    installs, staged at `EFI/ubuntu/grub.cfg` (+ `.conf`) on
@@ -48,13 +70,20 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Cursor;
 use std::path::Path;
 
 use base64::Engine as _;
 use miette::{IntoDiagnostic, WrapErr};
 
+use pgp::crypto::hash::HashAlgorithm;
+use pgp::crypto::public_key::PublicKeyAlgorithm;
+use pgp::packet::{PublicKey, SecretKey, SignatureConfig, SignatureType, Subpacket, SubpacketData};
+use pgp::types::{Password, Timestamp};
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+use rsa::traits::PublicKeyParts;
+
 use crate::image::{base_track, ImageDeclaration};
-use crate::sign::KeyPair;
 
 // ── UC partition role names ──
 //
@@ -82,6 +111,13 @@ pub const ROLE_SEED: &str = "system-seed";
 pub const ROLE_BOOT: &str = "system-boot";
 pub const ROLE_DATA: &str = "system-data";
 pub const ROLE_SAVE: &str = "system-save";
+
+/// Shuttle DSL-only role for a UC gap partition: a structure the gadget
+/// declares (the pc gadget's `BIOS Boot`, say) that must EXIST on disk for
+/// snapd's gadget validation but is deliberately left unformatted — the
+/// build neither mounts nor populates it. Not a gadget.yaml role; the UC
+/// PARTLABEL mapping does not apply.
+pub const ROLE_GAP: &str = "gap";
 
 /// The UC PARTLABEL a gadget role maps to (gadget.yaml role → partition
 /// name). Returns `None` for a non-UC role (or an unimplemented one).
@@ -146,25 +182,243 @@ pub const MODEL_SERIES: &str = "16";
 // - Ed25519 signatures encode as base64 of `[SignatureTypeEd25519=1] ++
 //   64-byte signature`.
 
-/// The `sign-key-sha3-384` key id for the shuttle keypair: base64url
-/// (unpadded) of the sha3-384 digest over the raw Ed25519 public key.
-pub fn snapd_key_id(kp: &KeyPair) -> String {
-    use sha3::Digest;
-    let digest = sha3::Sha3_384::digest(kp.public);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+// <blank>
+// <base64 signature>
+// ```
+//
+// - The key id is the **base64url (unpadded) encoding of the sha3-384
+//   digest of `0x01 ‖ x/crypto-serialized public-key packet`** — 64
+//   chars, not hex (asserts/crypto.go `newOpenPGPPubKey`).
+// - Assertions without a body sign their header block ONLY (the content
+//   ends at the last header's newline — snapd's writer emits no blank
+//   line before the signature); assertions WITH a body (account-key)
+//   sign headers + blank separator + body, and carry a `body-length`
+//   header, without which the stream decoder never reads the body.
+// - Signature and key envelopes are x/crypto `encodeV1`:
+//   `base64(0x01 ‖ OpenPGP packet)`, wrapped at 76 columns.
+
+/// The snapd assertion signing key: RSA-4096 (the only algorithm snapd's
+/// assertion crypto implements), with the x/crypto serialization of its
+/// v4 public-key packet and the sha3-384 key id snapd derives from it.
+#[derive(Clone)]
+pub struct SnapdAssertionKey {
+    /// RSA private key (signing).
+    secret: rsa::RsaPrivateKey,
+    /// The v4 public-key packet in x/crypto `PublicKey.Serialize` form:
+    /// new-format header (0x99 + RFC4880 length) + version/created/algo +
+    /// MPI n + MPI e. The ID is derived over exactly these bytes.
+    public_packet: Vec<u8>,
+    /// RFC3339 creation timestamp (the seed epoch pin) for assertion
+    /// headers and the packet's creation-time field.
+    pub created_rfc3339: String,
 }
 
-/// Sign assertion header text (the complete headers, ending at the final
-/// header's newline) the way snapd's assertion parser verifies: base64 of
-/// `[1u8] ++ ed25519_sig`.
-fn snapd_sign(headers_including_key_id: &str, kp: &KeyPair) -> String {
-    use ed25519_dalek::Signer;
-    let signing = ed25519_dalek::SigningKey::from_bytes(&kp.seed);
-    let sig = signing.sign(headers_including_key_id.as_bytes());
-    let mut raw = Vec::with_capacity(65);
-    raw.push(1u8); // asserts.SignatureTypeEd25519
-    raw.extend_from_slice(&sig.to_bytes());
-    base64::engine::general_purpose::STANDARD.encode(raw)
+impl SnapdAssertionKey {
+    /// Load the persisted assertion key, or generate one (RSA-4096) on
+    /// first use. Stored as PKCS#8 PEM at `~/.config/shuttle/
+    /// assertion-key.pem` (mode 0600), like [`crate::sign`]'s manifest
+    /// key but a SEPARATE key — the manifest chain keeps its Ed25519
+    /// substrate (ADR-0011).
+    pub fn load_or_create(home: &Path) -> miette::Result<Self> {
+        let dir = home.join(".config").join("shuttle");
+        let path = dir.join("assertion-key.pem");
+        if path.is_file() {
+            let pem = std::fs::read_to_string(&path)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("reading {}", path.display()))?;
+            let secret = rsa::RsaPrivateKey::from_pkcs8_pem(&pem)
+                .map_err(|e| miette::miette!("parsing {}: {e}", path.display()))?;
+            return Self::from_secret(secret);
+        }
+        eprintln!("  generating snapd assertion key (RSA-4096, one-time)…");
+        let mut rng = rand::thread_rng();
+        let secret = rsa::RsaPrivateKey::new(&mut rng, 4096)
+            .map_err(|e| miette::miette!("generating the RSA assertion key: {e}"))?;
+        let key = Self::from_secret(secret)?;
+        std::fs::create_dir_all(&dir)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("creating {}", dir.display()))?;
+        let pem = key
+            .secret
+            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .map_err(|e| miette::miette!("encoding the assertion key: {e}"))?;
+        std::fs::write(&path, pem.as_bytes())
+            .into_diagnostic()
+            .wrap_err_with(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .into_diagnostic()
+                .wrap_err_with(|| format!("restricting {}", path.display()))?;
+        }
+        Ok(key)
+    }
+
+    fn from_secret(secret: rsa::RsaPrivateKey) -> miette::Result<Self> {
+        // The public-key packet's creation time is snapd's OWN
+        // v1FixedTimestamp (2016-01-01): `RSAPublicKey()` rebuilds every
+        // decoded key with that constant before computing the sha3-384
+        // id, discarding whatever creation time the body carried. Using
+        // anything else makes the id header mismatch snapd's
+        // recomputation (`public key does not match provided key id`,
+        // boot-observed). It is also a constant, so two builds serialize
+        // byte-identical packets (#48 discipline).
+        const SNAPD_V1_FIXED_TIMESTAMP_SECS: u32 = 1_451_606_400; // 2016-01-01Z
+        let created_rfc3339 = seed_timestamp();
+        let public_packet = xcrypto_public_key_packet(&secret, SNAPD_V1_FIXED_TIMESTAMP_SECS);
+        Ok(Self {
+            secret,
+            public_packet,
+            created_rfc3339,
+        })
+    }
+
+    /// The `sign-key-sha3-384` / `public-key-sha3-384` key id: base64url
+    /// (unpadded) of the sha3-384 digest over `0x01 ‖ public-key packet`
+    /// — byte-for-byte snapd's `newOpenPGPPubKey` derivation.
+    pub fn key_id(&self) -> String {
+        use sha3::Digest;
+        let mut hashed = Vec::with_capacity(self.public_packet.len() + 1);
+        hashed.push(1u8);
+        hashed.extend_from_slice(&self.public_packet);
+        let digest = sha3::Sha3_384::digest(&hashed);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+    }
+
+    /// The raw x/crypto-serialized public-key packet (test + verification
+    /// handle).
+    #[cfg(test)]
+    pub fn public_packet_bytes(&self) -> &[u8] {
+        &self.public_packet
+    }
+
+    /// The public-key packet parsed back (verification handle — the same
+    /// object snapd's decoder would hold).
+    pub(crate) fn public_key(&self) -> miette::Result<PublicKey> {
+        let mut reader = Cursor::new(&self.public_packet);
+        let header = pgp::packet::PacketHeader::try_from_reader(&mut reader)
+            .map_err(|e| miette::miette!("public-key packet header: {e}"))?;
+        PublicKey::try_from_reader(header, &mut reader)
+            .map_err(|e| miette::miette!("public-key packet: {e}"))
+    }
+}
+
+/// Serialize the RSA public key as x/crypto's `PublicKey.Serialize` does:
+/// new-format packet header (0x80|0x40|tag=0x99) with the RFC4880 length
+/// encoding, then a v4 body — version 4, creation time, algorithm 1
+/// (RSA), MPI n, MPI e. snapd re-serializes the DECODED key through this
+/// exact code to derive the key id, so byte-exactness here is what makes
+/// our id header match snapd's recomputation.
+fn xcrypto_public_key_packet(secret: &rsa::RsaPrivateKey, created: u32) -> Vec<u8> {
+    let pubkey = rsa::RsaPublicKey::from(secret);
+    let mut body = Vec::with_capacity(6 + 2 + 512 + 2 + 3);
+    body.push(4); // version
+    body.extend_from_slice(&created.to_be_bytes());
+    body.push(1); // PubKeyAlgoRSA
+    body.extend_from_slice(&mpi(pubkey.n()));
+    body.extend_from_slice(&mpi(pubkey.e()));
+    let mut out = vec![0x80 | 0x40 | 6]; // new-format packet header, tag 6
+    out.extend_from_slice(&rfc4880_length(body.len()));
+    out.extend_from_slice(&body);
+    out
+}
+
+/// An MPI: 2-byte big-endian bit count + minimal big-endian bytes
+/// (x/crypto `writeMPI` over a big.Int with leading zeros stripped).
+fn mpi(n: &rsa::BigUint) -> Vec<u8> {
+    let bytes = n.to_bytes_be();
+    let mut out = Vec::with_capacity(bytes.len() + 2);
+    out.extend_from_slice(&(n.bits() as u16).to_be_bytes());
+    out.extend_from_slice(&bytes);
+    out
+}
+
+/// RFC4880 §4.2.2 new-format length encoding, exactly x/crypto's
+/// `serializeHeader` length branches.
+fn rfc4880_length(length: usize) -> Vec<u8> {
+    let length = length as u32;
+    if length < 192 {
+        vec![length as u8]
+    } else if length < 8384 {
+        let l = length - 192;
+        vec![192 + (l >> 8) as u8, l as u8]
+    } else {
+        vec![
+            255,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]
+    }
+}
+
+/// x/crypto `encodeV1`: base64 of `[0x01] ++ data`, wrapped at 76 columns
+/// with newlines BETWEEN chunks (none after the last).
+fn encode_v1_wrapped(data: &[u8]) -> String {
+    let mut raw = Vec::with_capacity(data.len() + 1);
+    raw.push(1u8);
+    raw.extend_from_slice(data);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+    let mut out = String::with_capacity(b64.len() + b64.len() / 76 + 1);
+    for (i, chunk) in b64.as_bytes().chunks(76).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(std::str::from_utf8(chunk).expect("base64 is utf8"));
+    }
+    out
+}
+
+/// Sign assertion content the way snapd verifies: an OpenPGP v4
+/// RSA-SHA512 signature packet over the content bytes, wrapped as
+/// `encodeV1` (base64 of `0x01 ‖ packet`, 76-column lines). The
+/// creation-time subpacket is pinned to the seed epoch — the RSA
+/// computation itself is deterministic (PKCS#1 v1.5), so two builds sign
+/// identical bytes (#48).
+fn snapd_sign(content: &[u8], key: &SnapdAssertionKey) -> miette::Result<String> {
+    let packet_key = packet_secret_key(key)?;
+    let created =
+        Timestamp::try_from(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seed_epoch().0))
+            .map_err(|e| miette::miette!("seed epoch out of range: {e}"))?;
+    let mut config = SignatureConfig::v4(
+        SignatureType::Binary,
+        PublicKeyAlgorithm::RSA,
+        HashAlgorithm::Sha512,
+    );
+    config.hashed_subpackets =
+        vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(created))
+                .map_err(|e| miette::miette!("creation-time subpacket: {e}"))?,
+        ];
+    config.unhashed_subpackets = vec![];
+    let sig = config
+        .sign(&packet_key, &Password::empty(), Cursor::new(content))
+        .map_err(|e| miette::miette!("signing the assertion: {e}"))?;
+    // rpgp's `Serialize::to_bytes` writes the packet BODY only; the
+    // envelope needs the full packet: new-format header (0x80|0x40|tag 2)
+    // + RFC4880 length — byte-for-byte what x/crypto's Serialize emits
+    // and what the store's own assertion signatures carry.
+    let sig_body = pgp::ser::Serialize::to_bytes(&sig)
+        .map_err(|e| miette::miette!("serializing the signature packet: {e}"))?;
+    let mut packet_bytes = Vec::with_capacity(sig_body.len() + 6);
+    packet_bytes.push(0x80 | 0x40 | 2); // new-format packet header, tag 2
+    packet_bytes.extend_from_slice(&rfc4880_length(sig_body.len()));
+    packet_bytes.extend_from_slice(&sig_body);
+    Ok(encode_v1_wrapped(&packet_bytes))
+}
+
+/// The rpgp secret-key packet handle the signer needs, parsed back from
+/// our own x/crypto-exact public-key packet bytes (the same bytes
+/// snapd's decoder sees).
+fn packet_secret_key(key: &SnapdAssertionKey) -> miette::Result<SecretKey> {
+    let details = key.public_key()?;
+    let secret_params = pgp::types::SecretParams::Plain(pgp::types::PlainSecretParams::RSA(
+        pgp::crypto::rsa::SecretKey::from(key.secret.clone()),
+    ));
+    SecretKey::new(details, secret_params)
+        .map_err(|e| miette::miette!("assembling the secret key packet: {e}"))
 }
 
 /// One snap entry in the model assertion `snaps:` header list.
@@ -284,6 +538,13 @@ impl ModelAssertion {
             ));
         }
         for s in &image.extra_snaps {
+            // The essentials (base, snapd, kernel, gadget) are already
+            // listed — a declaration that names one again (an explicit
+            // snapd, say) must not duplicate it: snapd's model check
+            // rejects `cannot list the same snap … multiple times`.
+            if snaps.iter().any(|m| m.name == s.name) {
+                continue;
+            }
             snaps.push(ModelSnap {
                 name: s.name.clone(),
                 snap_id: need(&s.name)?,
@@ -322,9 +583,15 @@ impl ModelAssertion {
         let _ = writeln!(s, "grade: {}", self.grade);
         let _ = writeln!(s, "storage-safety: {}", self.storage_safety);
         let _ = writeln!(s, "timestamp: {}", self.timestamp);
+        // List-of-maps items use a BARE `-` line with the map nested at
+        // four spaces: snapd's assertion header parser treats
+        // `- name: x` as a scalar item and then rejects the nested keys
+        // as top-level headers (`invalid header name: "    id"`,
+        // boot-observed). Matches snapd's own model fixtures.
         let _ = writeln!(s, "snaps:");
         for snap in &self.snaps {
-            let _ = writeln!(s, "  - name: {}", snap.name);
+            let _ = writeln!(s, "  -");
+            let _ = writeln!(s, "    name: {}", snap.name);
             let _ = writeln!(s, "    id: {}", snap.snap_id);
             let _ = writeln!(s, "    type: {}", snap.snap_type);
             let _ = writeln!(s, "    default-channel: {}", snap.default_channel);
@@ -333,18 +600,33 @@ impl ModelAssertion {
         s
     }
 
-    /// The full assertion wire text: headers + blank separator + base64
-    /// signature. The key id is stamped into the headers before signing.
-    pub fn to_assert(&self, kp: &KeyPair) -> String {
+    /// The full assertion wire text (no body): headers, blank separator,
+    /// base64 signature. The signed CONTENT ends at the last header's
+    /// VALUE — snapd's writer emits headers each terminated by a newline,
+    /// and the content/signature separator supplies the final one, so the
+    /// content carries no trailing newline (asserts snap_declaration_test
+    /// wire sample). The key id is stamped into the headers first.
+    pub fn to_assert(&self, key: &SnapdAssertionKey) -> miette::Result<String> {
         let mut stamped = self.clone();
-        stamped.sign_key_sha3_384 = snapd_key_id(kp);
+        stamped.sign_key_sha3_384 = key.key_id();
         let headers = stamped.headers();
-        let mut out = headers;
-        out.push('\n'); // the blank separator line
-        out.push_str(&snapd_sign(out.as_str(), kp));
+        let content = strip_last_newline(headers);
+        let mut out = content.clone();
+        out.push_str("\n\n");
+        out.push_str(&snapd_sign(content.as_bytes(), key)?);
         out.push('\n');
-        out
+        Ok(out)
     }
+}
+
+/// Drop the final newline of a headers block — the content/signature
+/// separator (`\n\n` before the signature) supplies it on the wire.
+fn strip_last_newline(headers: String) -> String {
+    let mut s = headers;
+    if s.ends_with('\n') {
+        s.pop();
+    }
+    s
 }
 
 /// Recover the effective default channel for a model snap entry: an
@@ -374,8 +656,31 @@ fn derive_track_channel(track: Option<&str>) -> String {
 
 /// The `type: account-key` assertion binding the shuttle Ed25519 public
 /// key to the image's brand account. Self-signed by the declared key.
-pub fn account_key_assertion(kp: &KeyPair, brand_id: &str, timestamp: &str) -> String {
-    let key_id = snapd_key_id(kp);
+/// The account-key assertion BODY: the public key in snapd's wire encoding
+/// — base64 over `format-id byte ++ key bytes` (ed25519 format id is 1),
+/// exactly mirroring the `[1u8] ++ sig` signature encoding snapd already
+/// accepts from us. Boot-verified: an EMPTY body fails the seed load with
+/// `assertion account-key: cannot decode public key: no data`.
+/// The account-key assertion BODY: the public key in snapd's wire encoding
+/// — x/crypto `encodeV1`: base64 (76-column lines) over
+/// `0x01 ‖ public-key packet`. Boot-verified: an EMPTY body fails the
+/// seed load with `assertion account-key: cannot decode public key: no
+/// data`.
+fn snapd_public_key_body(key: &SnapdAssertionKey) -> String {
+    encode_v1_wrapped(&key.public_packet)
+}
+
+pub fn account_key_assertion(
+    key: &SnapdAssertionKey,
+    brand_id: &str,
+    timestamp: &str,
+) -> miette::Result<String> {
+    let key_id = key.key_id();
+    let body = snapd_public_key_body(key);
+    // `body-length` is MANDATORY for a body: the assertion stream decoder
+    // reads the body ONLY on that header (`readExact(length)`); without it
+    // the body text is consumed as the signature and the parsed body is
+    // empty. It counts the RAW body bytes including the line wraps.
     let mut headers = String::new();
     let _ = writeln!(headers, "type: account-key");
     let _ = writeln!(headers, "authority-id: {brand_id}");
@@ -384,30 +689,48 @@ pub fn account_key_assertion(kp: &KeyPair, brand_id: &str, timestamp: &str) -> S
     let _ = writeln!(headers, "name: shuttle-image-signing");
     let _ = writeln!(headers, "since: {timestamp}");
     let _ = writeln!(headers, "timestamp: {timestamp}");
+    let _ = writeln!(headers, "body-length: {}", body.len());
     let _ = writeln!(headers, "sign-key-sha3-384: {key_id}");
-    let mut out = headers;
+    // The signed content ends at the LAST HEADER'S VALUE (no trailing
+    // newline — the content/signature separator supplies it), then the
+    // body follows after the separator: content = headers ‖ "\n\n" ‖ body,
+    // byte-for-byte snapd's assembleAndSign construction.
+    let headers = headers.strip_suffix('\n').unwrap_or(&headers);
+    let content = format!("{headers}\n\n{body}");
+    let mut out = content.clone();
+    out.push_str("\n\n");
+    out.push_str(&snapd_sign(content.as_bytes(), key)?);
     out.push('\n');
-    out.push_str(&snapd_sign(out.as_str(), kp));
-    out.push('\n');
-    out
+    Ok(out)
 }
 
 /// The `type: account` assertion naming the brand account, signed by the
 /// account's key (the chain the model signature verifies through).
-pub fn account_assertion(kp: &KeyPair, brand_id: &str, timestamp: &str) -> String {
-    let key_id = snapd_key_id(kp);
+pub fn account_assertion(
+    key: &SnapdAssertionKey,
+    brand_id: &str,
+    timestamp: &str,
+) -> miette::Result<String> {
+    let key_id = key.key_id();
     let mut headers = String::new();
     let _ = writeln!(headers, "type: account");
     let _ = writeln!(headers, "authority-id: {brand_id}");
     let _ = writeln!(headers, "account-id: {brand_id}");
     let _ = writeln!(headers, "display-name: Shuttle image signing account");
+    // Mandatory per snapd's account assertion checks (boot-verified: seed
+    // load fails with `assertion account: "validation" header is mandatory`
+    // without it) — `certified` is what the store's own account carries.
+    let _ = writeln!(headers, "validation: certified");
     let _ = writeln!(headers, "timestamp: {timestamp}");
     let _ = writeln!(headers, "sign-key-sha3-384: {key_id}");
-    let mut out = headers;
+    // No body: the signed content ends at the last header's VALUE (no
+    // trailing newline — see `strip_last_newline`).
+    let headers = headers.strip_suffix('\n').unwrap_or(&headers);
+    let mut out = headers.to_string();
+    out.push_str("\n\n");
+    out.push_str(&snapd_sign(headers.as_bytes(), key)?);
     out.push('\n');
-    out.push_str(&snapd_sign(out.as_str(), kp));
-    out.push('\n');
-    out
+    Ok(out)
 }
 
 // ── Seed epoch + recovery-system label ──
@@ -441,12 +764,14 @@ pub fn recovery_label(image: &ImageDeclaration) -> String {
 }
 
 /// RFC3339 timestamp (`.0` fractional form, as store assertions use) for
-/// the seed epoch.
+/// the seed epoch. The DATE PART is RFC3339 (`YYYY-MM-DD`) — snapd parses
+/// assertion timestamps with a strict RFC3339 layout and rejects the
+/// compact `YYYYMMDD` form the recovery-system LABEL uses (boot-observed:
+/// `assertion account: "timestamp" header is not a RFC3339 date`).
 pub fn seed_timestamp() -> String {
-    let (secs, date) = seed_epoch();
-    let hhmmss = secs % 86_400;
-    let _ = hhmmss; // the default epoch is midnight; SOURCE_DATE_EPOCH keeps its time
-    format!("{date}T00:00:00.0Z")
+    let (secs, _) = seed_epoch();
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}-{m:02}-{d:02}T00:00:00.0Z")
 }
 
 fn ts_to_date(secs: u64) -> String {
@@ -511,11 +836,27 @@ pub fn seed_yaml(label: &str, snaps: &[SeedSnapFile]) -> String {
     s
 }
 
+/// A VALID EMPTY GRUB environment block: the signature line, `#` padding,
+/// trailing newline — byte-for-byte what `grub-editenv create` emits. The
+/// seed's `/EFI/ubuntu/grubenv` must be well-formed because BOTH consumers
+/// parse it strictly: grub's `load_env` (an invalid block is the boot-time
+/// `error: invalid environment block.`) and snapd's own grubenv reader,
+/// which the install completion drives to set `snapd_recovery_mode=run`.
+pub fn empty_grubenv() -> [u8; 1024] {
+    let mut out = [b'#'; 1024];
+    out[..GRUBENV_SIG.len()].copy_from_slice(GRUBENV_SIG);
+    out[1023] = b'\n';
+    out
+}
+
+const GRUBENV_SIG: &[u8] = b"# GRUB Environment Block\n";
+
 /// The `grubenv` content snapd's first-boot grub config consumes
 /// (`load_env --file /systems/$label/grubenv snapd_recovery_kernel
 /// snapd_extra_cmdline_args snapd_full_cmdline_args`). A grubenv file is
-/// EXACTLY 1024 bytes (snapd's writer enforces the same bound); padding is
-/// the `#` filler grub's environment block format uses.
+/// EXACTLY 1024 bytes (snapd's writer enforces the same bound); the layout
+/// is the environment block format: the signature line, key=value entries,
+/// `#` padding, and a trailing newline as the final byte.
 pub fn grubenv(recovery_kernel: &str, extra_cmdline: &str) -> [u8; 1024] {
     let mut buf = String::new();
     let _ = writeln!(buf, "# GRUB Environment Block");
@@ -524,8 +865,9 @@ pub fn grubenv(recovery_kernel: &str, extra_cmdline: &str) -> [u8; 1024] {
         let _ = writeln!(buf, "snapd_extra_cmdline_args={extra_cmdline}");
     }
     let mut out = [b'#'; 1024];
-    let n = buf.len().min(1024);
+    let n = buf.len().min(1023); // the last byte is the format's newline
     out[..n].copy_from_slice(&buf.as_bytes()[..n]);
+    out[1023] = b'\n';
     out
 }
 
@@ -664,7 +1006,9 @@ pub struct SeedStageInputs<'a> {
     pub extra_cmdline: &'a str,
     pub model: &'a ModelAssertion,
     pub snaps: &'a [SeedSnapFile],
-    pub kp: &'a KeyPair,
+    /// The snapd assertion signing key (RSA/OpenPGP — what snap-bootstrap
+    /// verifies).
+    pub key: &'a SnapdAssertionKey,
 }
 
 /// Write the full `ubuntu-seed` tree into a staging directory:
@@ -717,37 +1061,46 @@ pub fn stage_seed_tree(seed_stage: &Path, inputs: &SeedStageInputs<'_>) -> miett
             .into_diagnostic()
             .wrap_err_with(|| format!("writing {}", dst.display()))?;
     }
-    // The seed-level grubenv stays EMPTY: the Edition-2 config then defaults
-    // the mode to `install` (the first-boot behavior we need).
-    std::fs::write(seed_stage.join("EFI/ubuntu/grubenv"), [b'#'; 1024])
+    // The seed-level grubenv stays a VALID EMPTY environment block: grub's
+    // `load_env` parses it silently and the Edition-2 config defaults the
+    // mode to `install` (the first-boot behavior we need); snapd's install
+    // completion later writes `snapd_recovery_mode=run` into this exact
+    // file through its own signature-checking grubenv reader.
+    std::fs::write(seed_stage.join("EFI/ubuntu/grubenv"), empty_grubenv())
         .into_diagnostic()
         .wrap_err("writing the seed grubenv")?;
 
-    // 3. The trust anchor — account-key + account under assertions/database.
+    // 3. The trust anchor — account-key + account as FLAT assertion files
+    //    under the RECOVERY SYSTEM's assertions/ dir. The seed loader
+    //    (seed/helpers loadAssertions) ReadDir's that dir and parses every
+    //    entry as an assertion stream — no zips, no database subdir.
     let ts = seed_timestamp();
-    let db = seed_stage.join("assertions").join("database");
-    std::fs::create_dir_all(&db)
+    let adb = seed_stage
+        .join("systems")
+        .join(inputs.label)
+        .join("assertions");
+    std::fs::create_dir_all(&adb)
         .into_diagnostic()
-        .wrap_err_with(|| format!("creating {}", db.display()))?;
+        .wrap_err_with(|| format!("creating {}", adb.display()))?;
     std::fs::write(
-        db.join("account-key"),
-        account_key_assertion(inputs.kp, &inputs.model.brand_id, &ts),
+        adb.join("account-key"),
+        account_key_assertion(inputs.key, &inputs.model.brand_id, &ts)?,
     )
     .into_diagnostic()
-    .wrap_err("writing assertions/database/account-key")?;
+    .wrap_err("writing assertions/account-key")?;
     std::fs::write(
-        db.join("account"),
-        account_assertion(inputs.kp, &inputs.model.brand_id, &ts),
+        adb.join("account"),
+        account_assertion(inputs.key, &inputs.model.brand_id, &ts)?,
     )
     .into_diagnostic()
-    .wrap_err("writing assertions/database/account")?;
+    .wrap_err("writing assertions/account")?;
 
     // 4. The recovery system.
     let sys_dir = seed_stage.join("systems").join(inputs.label);
     std::fs::create_dir_all(sys_dir.join("snaps"))
         .into_diagnostic()
         .wrap_err_with(|| format!("creating {}", sys_dir.display()))?;
-    std::fs::write(sys_dir.join("model"), inputs.model.to_assert(inputs.kp))
+    std::fs::write(sys_dir.join("model"), inputs.model.to_assert(inputs.key)?)
         .into_diagnostic()
         .wrap_err("writing systems/<label>/model")?;
     std::fs::write(
@@ -926,6 +1279,15 @@ mod tests {
         assert_eq!(model.base, "core24");
         assert_eq!(model.brand_id, "test-uc");
         assert!(model.timestamp.ends_with("00:00:00.0Z"));
+        // RFC3339 date part WITH dashes — snapd's assertion parser rejects
+        // the compact YYYYMMDD label form (boot-observed first-boot
+        // failure).
+        assert!(
+            model.timestamp.contains("-"),
+            "timestamp {:?} is not RFC3339 (missing date dashes)",
+            model.timestamp
+        );
+        assert_eq!(model.timestamp.len(), "YYYY-MM-DDTHH:MM:SS.0Z".len());
         // kernel + gadget + base + snapd all identified.
         let names: Vec<&str> = model.snaps.iter().map(|s| s.name.as_str()).collect();
         for n in ["core24", "snapd", "pc-kernel", "pc"] {
@@ -938,10 +1300,10 @@ mod tests {
         assert!(headers.contains("authority-id: test-uc\n"));
         // Every snap entry carries its store id + type.
         assert!(headers.contains(
-            "  - name: core24\n    id: CQaUVdoKPUs8ekLmXsVwYGbTqUuDnyt2\n    type: base\n"
+            "  -\n    name: core24\n    id: CQaUVdoKPUs8ekLmXsVwYGbTqUuDnyt2\n    type: base\n"
         ));
         assert!(headers.contains(
-            "  - name: pc-kernel\n    id: DjYcoStxHLAaZ86Rln_XYVbYwLr0S2mZ\n    type: kernel\n"
+            "  -\n    name: pc-kernel\n    id: DjYcoStxHLAaZ86Rln_XYVbYwLr0S2mZ\n    type: kernel\n"
         ));
         assert!(headers.contains("    type: gadget\n"));
         assert!(headers.contains("    type: snapd\n"));
@@ -957,52 +1319,73 @@ mod tests {
         }
     }
 
+    /// A fast RSA fixture key for assertion-emission tests (2048 bits —
+    /// snapd's decoder imposes no minimum, and the production loader
+    /// generates 4096).
+    fn test_key() -> SnapdAssertionKey {
+        let mut rng = rand::thread_rng();
+        let secret = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        SnapdAssertionKey::from_secret(secret).unwrap()
+    }
+
     #[test]
     fn signed_assertion_matches_the_snapd_wire_format() {
-        let home = tempfile::tempdir().unwrap();
-        let kp = crate::sign::create_secret_key(home.path()).unwrap();
+        let key = test_key();
         let image = sample_image();
         let model = ModelAssertion::from_image(&image, "amd64", &snap_ids()).unwrap();
-        let assert_text = model.to_assert(&kp);
+        let assert_text = model.to_assert(&key).unwrap();
 
         // Split at the LAST header's newline + the blank separator.
-        let key_id = snapd_key_id(&kp);
+        let key_id = key.key_id();
         let header_tail = format!("sign-key-sha3-384: {key_id}\n");
         let pos = assert_text
             .find(&header_tail)
             .expect("stamped key id header present");
         let headers_end = pos + header_tail.len();
-        // The signature covers the headers INCLUDING the key-id header and
-        // the blank separator line — exactly the bytes snapd's signer signs
-        // (headers + separator, empty body).
-        let signed = &assert_text[..headers_end + 1];
-        assert!(signed.ends_with(&format!("{header_tail}\n")));
-        // Wire: signed bytes + base64 sig + "\n".
-        let rest = &assert_text[headers_end + 1..];
-        let mut lines = rest.lines();
-        let sig_line = lines.next().unwrap();
-        assert_eq!(lines.next(), None, "nothing after the signature");
+        // No body: the signed content ends at the LAST HEADER'S VALUE —
+        // the separator after it supplies the final newline (snapd's
+        // writer convention, matches the store's own wire samples).
+        let content = &assert_text[..headers_end - 1];
+        let rest = &assert_text[headers_end - 1..];
+        assert!(
+            rest.starts_with("\n\n"),
+            "the blank separator completes the content/signature split"
+        );
 
-        // Ed25519: base64( [1] ++ 64-byte sig ), verifiable with the pubkey.
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        // Envelope: base64( [0x01] ++ OpenPGP v4 RSA-SHA512 signature
+        // packet ), verified with the public key — snapd's exact verify
+        // path (content hash + signature trailer + RSA). assert.rs's
+        // parser can't handle the model's multi-line `snaps:` list header
+        // (store assertions have none), so assemble the verifier input
+        // directly: content bytes + 0x01-stripped OpenPGP packets.
+        let sig_text = rest[1..].trim_end();
+        let joined: String = sig_text.split_whitespace().collect();
         let raw = base64::engine::general_purpose::STANDARD
-            .decode(sig_line)
+            .decode(joined.as_bytes())
             .unwrap();
-        assert_eq!(raw[0], 1, "SignatureTypeEd25519");
-        assert_eq!(raw.len(), 65);
-        let sig = Signature::from_slice(&raw[1..]).unwrap();
-        let vk = VerifyingKey::from_bytes(&kp.public).unwrap();
-        vk.verify(signed.as_bytes(), &sig)
-            .expect("ed25519 signature over the exact header bytes");
+        assert_eq!(raw[0], 1, "x/crypto v1 envelope prefix");
+        let assertion = crate::assert::Assertion {
+            assertion_type: "model".into(),
+            authority_id: model.brand_id.clone(),
+            sign_key_id: key_id,
+            headers: BTreeMap::new(),
+            content: content.as_bytes().to_vec(),
+            body: Vec::new(),
+            signature_packets: raw[1..].to_vec(),
+        };
+        crate::assert::verify_signature("model", "model", &assertion, &key.public_key().unwrap())
+            .unwrap();
     }
 
     #[test]
     fn snapd_key_id_is_base64url_sha3_384_of_the_public_key() {
-        let home = tempfile::tempdir().unwrap();
-        let kp = crate::sign::create_secret_key(home.path()).unwrap();
-        let id = snapd_key_id(&kp);
+        let key = test_key();
+        let id = key.key_id();
         use sha3::Digest;
-        let digest = sha3::Sha3_384::digest(kp.public);
+        let mut hashed = Vec::new();
+        hashed.push(1u8);
+        hashed.extend_from_slice(&key.public_packet_bytes());
+        let digest = sha3::Sha3_384::digest(&hashed);
         let expect = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
         assert_eq!(id, expect);
         // 48 bytes → 64 unpadded base64url chars, like the generic model's id.
@@ -1015,36 +1398,29 @@ mod tests {
 
     #[test]
     fn account_chain_bootstraps_the_brand_trust() {
-        let home = tempfile::tempdir().unwrap();
-        let kp = crate::sign::create_secret_key(home.path()).unwrap();
+        let key = test_key();
         let brand = "test-brand";
-        let ak = account_key_assertion(&kp, brand, "2026-01-01T00:00:00.0Z");
-        let acc = account_assertion(&kp, brand, "2026-01-01T00:00:00.0Z");
-        for (text, t) in [(ak, "account-key"), (acc, "account")] {
-            assert!(text.starts_with(&format!("type: {t}\n")));
-            assert!(text.contains(&format!("authority-id: {brand}\n")));
-            assert!(text.contains(&format!("account-id: {brand}\n")));
-            assert!(text.contains(&format!("sign-key-sha3-384: {}\n", snapd_key_id(&kp))));
-            // Self-consistent: re-signing the embedded headers verifies
-            // (headers + blank separator are the signed bytes).
-            let tail = format!("sign-key-sha3-384: {}\n", snapd_key_id(&kp));
-            let end = text.find(&tail).unwrap() + tail.len();
-            let signed = &text[..end + 1];
-            let sig_line = text[end + 1..].lines().next().unwrap();
-            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-            let raw = base64::engine::general_purpose::STANDARD
-                .decode(sig_line)
-                .unwrap();
-            let vk = VerifyingKey::from_bytes(&kp.public).unwrap();
-            vk.verify(
-                signed.as_bytes(),
-                &Signature::from_slice(&raw[1..]).unwrap(),
-            )
-            .unwrap();
-        }
-        // The account-key declares THE key that signed it.
-        let ak = account_key_assertion(&kp, brand, "2026-01-01T00:00:00.0Z");
-        assert!(ak.contains(&format!("public-key-sha3-384: {}\n", snapd_key_id(&kp))));
+        let ts = "2026-01-01T00:00:00.0Z";
+        let ak = account_key_assertion(&key, brand, ts).unwrap();
+        let acc = account_assertion(&key, brand, ts).unwrap();
+        // Drive OUR OWN snapd-grammar verifier over the emitted bytes —
+        // the same parse + envelope + OpenPGP verification assert.rs runs
+        // against Store assertions.
+        let ak_parsed = crate::assert::parse_assertion("account-key", &ak).unwrap();
+        assert_eq!(ak_parsed.assertion_type, "account-key");
+        // The body carries the public key packet (0x01 ‖ packet).
+        assert!(!ak_parsed.body.is_empty(), "account-key body present");
+        let pk =
+            crate::assert::public_key_from_body("account-key", "body", &ak_parsed.body).unwrap();
+        crate::assert::verify_signature("account-key", "self", &ak_parsed, &pk).unwrap();
+        // The account-key id header matches snapd's derivation over the body key.
+        assert!(ak.contains(&format!("public-key-sha3-384: {}\n", key.key_id())));
+        assert!(ak.contains("body-length: "));
+
+        // The account is signed by the SAME key and verifies against it.
+        let acc_parsed = crate::assert::parse_assertion("account", &acc).unwrap();
+        assert!(acc.contains("validation: certified\n"));
+        crate::assert::verify_signature("account", "account", &acc_parsed, &pk).unwrap();
     }
 
     #[test]
@@ -1097,8 +1473,24 @@ mod tests {
         assert!(text.contains("# GRUB Environment Block\n"));
         assert!(text.contains("snapd_recovery_kernel=/systems/20260101_26_04/kernel.efi\n"));
         assert!(text.contains("snapd_extra_cmdline_args=console=ttyS0\n"));
-        // The tail is '#' filler (grub's environment block padding).
-        assert!(env.iter().rev().take(10).all(|&b| b == b'#'));
+        // The tail is '#' filler (grub's environment block padding) with
+        // the format's trailing newline as the FINAL byte — snapd's writer
+        // ends every env block exactly this way.
+        assert!(env.iter().rev().take(10).skip(1).all(|&b| b == b'#'));
+        assert_eq!(env[1023], b'\n');
+    }
+
+    #[test]
+    fn empty_grubenv_is_a_valid_environment_block() {
+        let env = empty_grubenv();
+        assert_eq!(env.len(), 1024);
+        // Signature line first — grub's load_env and snapd's grubenv reader
+        // both hard-fail without it (`invalid environment block`).
+        assert!(env.starts_with(b"# GRUB Environment Block\n"));
+        // No entries between the signature and the padding: no mode var is
+        // preselected, so the Edition-2 grub config defaults to install.
+        assert_eq!(&env[25..1023], &[b'#'; 998]);
+        assert_eq!(env[1023], b'\n');
     }
 
     #[test]
@@ -1140,7 +1532,6 @@ mod tests {
     /// Leaks the fixture dirs so the inputs can borrow 'static (test-only).
     fn fixture_inputs() -> SeedStageInputs<'static> {
         let fixture = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        let key_home = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let gadget = fixture.path().join("gadget");
         std::fs::create_dir_all(&gadget).unwrap();
         for f in ["grubx64.efi", "shim.efi.signed", "boot.csv", "fb.efi"] {
@@ -1178,9 +1569,7 @@ mod tests {
             extra_cmdline: "console=ttyS0",
             model: Box::leak(Box::new(model)),
             snaps: Box::leak(Box::new(snaps)),
-            kp: Box::leak(Box::new(
-                crate::sign::create_secret_key(key_home.path()).unwrap(),
-            )),
+            key: Box::leak(Box::new(test_key())),
         }
     }
 
@@ -1213,9 +1602,38 @@ mod tests {
                 .len(),
             1024
         );
-        // Trust anchor.
-        assert!(stage.join("assertions/database/account").is_file());
-        assert!(stage.join("assertions/database/account-key").is_file());
+        // Trust anchor: the recovery system's assertions dir carries flat
+        // assertion files (seed loadAssertions ReadDir + AddStream).
+        let adb = stage.join("systems/20260101_26_04/assertions");
+        let ak = std::fs::read_to_string(adb.join("account-key")).unwrap();
+        let acc = std::fs::read_to_string(adb.join("account")).unwrap();
+        assert!(ak.starts_with("type: account-key\n"));
+        assert!(ak.contains("\nsign-key-sha3-384: "));
+        // The public key rides the assertion BODY (x/crypto encodeV1:
+        // base64 of 0x01 ‖ public-key packet) with a mandatory
+        // `body-length` header — an empty/undeclared body fails the seed
+        // load (`cannot decode public key: no data`).
+        assert!(ak.contains("\nbody-length: "));
+        let body = ak.split("\n\n").nth(1).unwrap_or("");
+        let body_main = body.split_once("\n\n").map(|(b, _)| b).unwrap_or(body);
+        assert!(
+            !body_main.trim().is_empty(),
+            "account-key body must carry the public key"
+        );
+        let joined: String = body_main.split_whitespace().collect();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&joined)
+                .unwrap()
+                .first(),
+            Some(&1u8),
+            "account-key body must start with the v1 envelope prefix"
+        );
+        assert!(acc.starts_with("type: account\n"));
+        // The validation header is mandatory per snapd's account checks —
+        // its absence fails the seed load on the first boot (observed:
+        // `assertion account: "validation" header is mandatory`).
+        assert!(acc.contains("\nvalidation: certified\n"));
         // The recovery system.
         let sys = stage.join("systems/20260101_26_04");
         assert!(sys.join("model").is_file());

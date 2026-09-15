@@ -112,22 +112,22 @@ fn untrusted(name: &str, detail: String) -> AssertError {
 // ── Assertion model ──
 
 /// One parsed snap-store assertion.
-struct Assertion {
-    assertion_type: String,
-    authority_id: String,
-    sign_key_id: String,
+pub(crate) struct Assertion {
+    pub(crate) assertion_type: String,
+    pub(crate) authority_id: String,
+    pub(crate) sign_key_id: String,
     /// All headers as string key/value pairs (store assertion headers are
     /// all scalar strings).
-    headers: BTreeMap<String, String>,
+    pub(crate) headers: BTreeMap<String, String>,
     /// Signed content: exact wire bytes from the start through the last
     /// `\n\n` separator (headers + base64 body text if any).
-    content: Vec<u8>,
+    pub(crate) content: Vec<u8>,
     /// Decoded body, including the v1-envelope `0x01` prefix byte. Empty
     /// when the assertion has no body (e.g. snap-revision).
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
     /// Decoded signature section with the `0x01` envelope byte stripped:
     /// OpenPGP packet(s) led by the signature packet.
-    signature_packets: Vec<u8>,
+    pub(crate) signature_packets: Vec<u8>,
 }
 
 impl Assertion {
@@ -279,7 +279,7 @@ fn parse_epoch(s: &str) -> Option<u64> {
 }
 
 /// Parse one assertion in wire format.
-fn parse_assertion(name: &str, raw: &str) -> Result<Assertion, AssertError> {
+pub(crate) fn parse_assertion(name: &str, raw: &str) -> Result<Assertion, AssertError> {
     let raw = raw.trim_end_matches('\n');
     let (content, sig_text) = raw
         .rsplit_once("\n\n")
@@ -335,7 +335,11 @@ fn parse_assertion(name: &str, raw: &str) -> Result<Assertion, AssertError> {
 
 /// Extract the OpenPGP public key from an account-key assertion body
 /// (`0x01 || public-key packet`).
-fn public_key_from_body(name: &str, what: &str, body: &[u8]) -> Result<PublicKey, AssertError> {
+pub(crate) fn public_key_from_body(
+    name: &str,
+    what: &str,
+    body: &[u8],
+) -> Result<PublicKey, AssertError> {
     let packets = split_packets(name, body, what)?;
     let (tag, range) = packets
         .first()
@@ -358,7 +362,7 @@ fn public_key_from_body(name: &str, what: &str, body: &[u8]) -> Result<PublicKey
 /// Deliberately bypasses rpgp's `Signature::verify` identity guard — see
 /// the module docs (stale legacy issuer keyids; snapd selects keys by the
 /// assertion-level `sign-key-sha3-384`).
-fn verify_signature(
+pub(crate) fn verify_signature(
     name: &str,
     what: &str,
     assertion: &Assertion,

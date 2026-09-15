@@ -544,13 +544,26 @@ fn get_partitions(table: &mlua::Table) -> miette::Result<Vec<Partition>> {
                         let fs: String = pt
                             .get("fs")
                             .map_err(|_| miette::miette!("partition '{}': missing 'fs'", name))?;
-                        let mount: String = pt.get("mount").map_err(|_| {
-                            miette::miette!("partition '{}': missing 'mount'", name)
-                        })?;
+                        // The mount is optional for UC gap partitions: a
+                        // role-marked partition (system-seed/boot/data/save)
+                        // is placed by the UC role model, not mounted from
+                        // the painted rootfs — the gadget defines what the
+                        // seed/boot partitions carry (#32).
+                        let role_opt: Option<String> = pt.get("role").ok();
+                        let mount: String = match pt.get("mount") {
+                            Ok(m) => m,
+                            Err(_) if role_opt.is_some() => String::new(),
+                            Err(_) => {
+                                return Err(miette::miette!(
+                                    "partition '{}': missing 'mount'",
+                                    name
+                                ))
+                            }
+                        };
                         let options: Vec<String> = pt.get("options").unwrap_or_default();
                         // UC gadget role (issue #32) — optional; only honored
                         // under a UC base.
-                        let role: String = pt.get("role").unwrap_or_default();
+                        let role: String = role_opt.unwrap_or_default();
                         partitions.push(Partition {
                             name,
                             size,
@@ -2280,13 +2293,19 @@ mod tests {
             partition_uc_role(&part_named("ubuntu-seed")),
             Some("system-seed")
         );
+        assert_eq!(
+            partition_uc_role(&part_named("ubuntu-save")),
+            Some("system-save")
+        );
         // Ordinary partitions carry no UC role.
         assert_eq!(partition_uc_role(&part_named("root")), None);
         assert_eq!(partition_uc_role(&part_named("esp")), None);
-        // An unimplemented role (system-save) is not routed.
+        // The pc gadget's system-save is a recognized role (its ubuntu-save
+        // partition rides the UC role model like seed/boot/data — routed as
+        // a boot-populated empty, nothing from the painted rootfs).
         let mut p = part_named("p1");
         p.role = "system-save".into();
-        assert_eq!(partition_uc_role(&p), None);
+        assert_eq!(partition_uc_role(&p), Some("system-save"));
     }
 
     fn uc_layout() -> DiskLayout {
