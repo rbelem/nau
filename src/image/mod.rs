@@ -1104,13 +1104,16 @@ pub(crate) fn build_disk_image_with(
     // 6a. Unprivileged populate pre-flight — the standalone-partition-file
     // build formats and fills partitions with these host tools and leaves
     // no loop device behind that could hide a missing one; fail closed
-    // BEFORE dd, mirroring the verity pre-flight above.
+    // BEFORE dd, mirroring the verity pre-flight above. The vfat formatter
+    // resolves as dosfstools' `mkfs.fat` (with `mkfs.vfat` alias fallback) —
+    // only that toolchain supports `--invariant`, which the reproducible
+    // ESP needs (#48).
     let populate_tools = [
         ("sfdisk", find_host_tool("sfdisk")),
         ("mmd", find_host_tool("mmd")),
         ("mcopy", find_host_tool("mcopy")),
         ("mkfs.ext4", find_host_tool("mkfs.ext4")),
-        ("mkfs.vfat", find_host_tool("mkfs.vfat")),
+        ("mkfs.vfat", find_mkfs_vfat()),
     ];
     preflight_populate_tools_with(&populate_tools)?;
 
@@ -1160,6 +1163,12 @@ pub(crate) fn build_disk_image_with(
     // ADR-0011 step (d): A/B layouts additionally get GPT partition type
     // GUIDs + PARTLABELs so systemd-sysupdate can match the slots.
     apply_gpt_slot_metadata(runner, &img_path, image, &effective_layout, &slots)?;
+    // #48: parted minted fresh random disk/partition GUIDs above; pin every
+    // GPT identity to its deterministic derivation BEFORE anything reads it
+    // back. The verity slots are re-pinned to roothash-derived generation
+    // GUIDs after the format (below).
+    let image_identity = format!("{}|{}", image.name, image.version);
+    pin_gpt_identities(runner, &img_path, &image_identity, &effective_layout)?;
 
     // 8. Read back the authoritative partition extents with one `sfdisk -J`
     // call — parted's "MB" units are decimal (10^6) and sector-aligned
@@ -1198,11 +1207,6 @@ pub(crate) fn build_disk_image_with(
         // one format, one roothash, identical bytes behind every slot —
         // the historical per-slot roothash-match assert is subsumed, and
         // slot B stays a usable day-one rollback twin.
-        let shared_salt = if effective_layout.ab {
-            Some(random_salt_hex()?)
-        } else {
-            None
-        };
         let root_idx = slots.roots[0];
         refuse_non_ext4_vfat(&effective_layout.partitions[root_idx])?;
         let part_label = format!("{}_{}_{}", image.name, image.version, slot_suffix(0));
@@ -1218,11 +1222,17 @@ pub(crate) fn build_disk_image_with(
             &effective_layout.partitions[root_idx],
             &extents[root_idx],
             true,
+            Some(&image_identity),
         )?;
         eprintln!(
             "  ✓ {}: {} populated (slot a / {part_label}, standalone file)",
             effective_layout.partitions[root_idx].name, effective_layout.partitions[root_idx].fs
         );
+        // #48: the salt is DERIVED from the populated root bytes — a random
+        // salt is published in the UKI cmdline anyway, so it bought nothing
+        // but irreproducibility of the roothash and every identity derived
+        // from it.
+        let shared_salt = Some(data_salt_hex(&root_file)?);
         let hash_idx = slots.hashes[0].expect("verity ⇒ hash partition was appended");
         let hash_file = extent_file(scratch.path(), "verity-hash.img", &extents[hash_idx])?;
         let roothash = verity_format(
@@ -1259,6 +1269,15 @@ pub(crate) fn build_disk_image_with(
         let (data_guid, hash_guid) = generation_guids_from_roothash(&roothash)?;
         set_partition_uuid(runner, &img_path, root_idx + 1, &data_guid)?;
         set_partition_uuid(runner, &img_path, hash_idx + 1, &hash_guid)?;
+        // #48: slot B carries the SAME generation identity as slot A — it is
+        // the byte-identical rollback twin, so its root + hash PARTUUIDs are
+        // re-pinned to the same roothash-derived GUIDs (they were left
+        // random-from-parted before, which the rebuild compare flags).
+        for (s, &r) in slots.roots.iter().enumerate().skip(1) {
+            let h = slots.hashes[s].expect("verity ⇒ hash partition was appended");
+            set_partition_uuid(runner, &img_path, r + 1, &data_guid)?;
+            set_partition_uuid(runner, &img_path, h + 1, &hash_guid)?;
+        }
         let extents = read_partition_extents(runner, &img_path, expected_partitions)?;
         // sfdisk -J reports GUIDs upper-case; compare case-insensitively.
         if !extents[root_idx]
@@ -1325,6 +1344,7 @@ pub(crate) fn build_disk_image_with(
             &effective_layout.partitions[root_idx],
             &extents[root_idx],
             false,
+            Some(&image_identity),
         )?;
         eprintln!(
             "  ✓ {}: {} populated (piboot root — plain ext4, no verity)",
@@ -1383,6 +1403,7 @@ pub(crate) fn build_disk_image_with(
         root: &root,
         uki: uki.as_ref(),
         uki_stage: &uki_stage,
+        identity: &image_identity,
         uc: uc.as_ref(),
         pi_boot_stage: pi_boot_stage.as_deref(),
     };
@@ -2336,6 +2357,7 @@ mod tests {
             root: Path::new("/root"),
             uki: None,
             uki_stage: Path::new("/stage"),
+            identity: "test-uc|1.0.0",
             uc: Some(&uc),
             pi_boot_stage: None,
         };
@@ -2358,6 +2380,7 @@ mod tests {
             root: Path::new("/root"),
             uki: None,
             uki_stage: Path::new("/stage"),
+            identity: "test-uc|1.0.0",
             uc: None,
             pi_boot_stage: None,
         };
@@ -5338,13 +5361,16 @@ RequiredBy=boot-complete.target
     fn verity_salt_flag_is_threaded_into_the_invocation_shape() {
         // The AB twin contract: same data + same salt ⇒ same roothash. The
         // salt is passed as an explicit --salt argument (before the
-        // devices), so both slot formats can share one value.
+        // devices), and the superblock UUID rides it — veritysetup's random
+        // per-format UUID would make rebuilds differ (#48).
         let salt = "a".repeat(64);
         let with = verity_format_args(Some(&salt), "DATA", "HASH");
         assert_eq!(&with[9], "--salt");
         assert_eq!(&with[10], &salt);
-        assert_eq!(&with[11], "DATA", "devices come last");
-        assert_eq!(&with[12], "HASH");
+        assert_eq!(&with[11], "--uuid");
+        assert_eq!(&with[12], &verity_sb_uuid(&salt));
+        assert_eq!(&with[13], "DATA", "devices come last");
+        assert_eq!(&with[14], "HASH");
         let without = verity_format_args(None, "DATA", "HASH");
         assert_eq!(without.len(), 11, "no salt flag by default");
         assert!(
@@ -5409,10 +5435,11 @@ RequiredBy=boot-complete.target
             msg.to_lowercase().contains("verity"),
             "error names the conflict: {msg}"
         );
-        // Non-verity vfat (the ESP) keeps the historical flags.
+        // Non-verity vfat (the ESP) carries the --invariant flag the
+        // reproducible ESP needs (#48), under the dosfstools spelling.
         let (tool, flags) = mkfs_flags_for("vfat", false).unwrap();
-        assert_eq!(tool, "mkfs.vfat");
-        assert_eq!(flags, vec!["-F", "32", "-n"]);
+        assert_eq!(tool, "mkfs.fat");
+        assert_eq!(flags, vec!["-F", "32", "--invariant", "-n"]);
     }
 
     #[test]
@@ -5437,11 +5464,46 @@ RequiredBy=boot-complete.target
     }
 
     #[test]
-    fn random_salt_is_64_hex_chars() {
-        let salt = random_salt_hex().unwrap();
-        assert_eq!(salt.len(), 64, "32 bytes hex: {salt}");
+    fn verity_salt_is_content_derived_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.img");
+        let b = dir.path().join("b.img");
+        std::fs::write(&a, b"same root bytes").unwrap();
+        std::fs::write(&b, b"same root bytes").unwrap();
+        let salt = data_salt_hex(&a).unwrap();
+        assert_eq!(salt.len(), 64, "sha256 hex: {salt}");
         assert!(salt.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(random_salt_hex().unwrap(), salt, "fresh entropy per call");
+        assert_eq!(
+            data_salt_hex(&b).unwrap(),
+            salt,
+            "same data → same salt: rebuilds share a roothash (#48)"
+        );
+        std::fs::write(&b, b"other root bytes").unwrap();
+        assert_ne!(
+            data_salt_hex(&b).unwrap(),
+            salt,
+            "different data → different salt: generations stay distinct"
+        );
+    }
+
+    /// A pinned salt also pins the hash-partition superblock UUID — the
+    /// deterministic replacement for veritysetup's per-format random UUID
+    /// (#48, found by the rebuild compare).
+    #[test]
+    fn verity_sb_uuid_is_derived_from_the_salt() {
+        let salt = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let args = verity_format_args(Some(salt), "DATA", "HASH");
+        let uuid_at = args.iter().position(|a| a == "--uuid").unwrap();
+        assert_eq!(args[uuid_at + 1], verity_sb_uuid(salt));
+        assert_eq!(verity_sb_uuid(salt), "00112233-4455-6677-8899-aabbccddeeff");
+        assert_eq!(
+            verity_sb_uuid(salt),
+            verity_sb_uuid(salt),
+            "stable derivation"
+        );
+        // No salt (never the disk-build path anymore) stays flag-free.
+        let bare = verity_format_args(None, "DATA", "HASH");
+        assert!(!bare.iter().any(|a| a == "--uuid"));
     }
 
     // ── Unprivileged partition assembly (file-based extents) ──
@@ -6172,7 +6234,14 @@ RequiredBy=boot-complete.target
                         f.set_len(mb * 1024 * 1024).unwrap();
                         Ok(out(0, Vec::new()))
                     }
-                    "parted" | "mkfs.vfat" | "mkfs.ext4" | "mmd" | "mcopy" | "find" => {
+                    "parted" | "mkfs.vfat" | "mkfs.fat" | "mkfs.ext4" | "mmd" | "mcopy"
+                    | "find" => {
+                        // `mklabel` stamps a minimal GPT header pair — parted
+                        // lays the real table on a real host, and the #48
+                        // disk-GUID patch reads it back.
+                        if argv.iter().any(|a| a == "mklabel") {
+                            stamp_fake_gpt(parted_image_path(argv));
+                        }
                         // For the ADR-0023 split, capture the emitted fstab
                         // from the populate source tree (removed when the
                         // build returns) before answering.
@@ -6253,6 +6322,37 @@ RequiredBy=boot-complete.target
         }
 
         // ── fixtures ──
+
+        /// The image path a `parted -s <img> ...` invocation carries (argv[2]).
+        fn parted_image_path(argv: &[String]) -> Option<&str> {
+            argv.get(2).map(String::as_str)
+        }
+
+        /// Stamp a minimal GPT header pair into the image file: primary at
+        /// LBA1, backup at the last sector, both with the `EFI PART`
+        /// signature, header size 92, and the backup LBA wired into the
+        /// primary — just enough for the #48 disk-GUID patch to find and
+        /// rewrite them (parted lays the real table on a real host).
+        fn stamp_fake_gpt(path: Option<&str>) {
+            let Some(path) = path else { return };
+            let Ok(md) = std::fs::metadata(path) else {
+                return;
+            };
+            let sector: u64 = 512;
+            let backup_lba = md.len() / sector - 1;
+            let stamp = |offset: u64, backup: u64| -> std::io::Result<()> {
+                use std::io::{Seek, SeekFrom, Write};
+                let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+                let mut header = [0u8; 92];
+                header[0..8].copy_from_slice(b"EFI PART");
+                header[20..24].copy_from_slice(&92u32.to_le_bytes());
+                header[32..40].copy_from_slice(&backup.to_le_bytes());
+                f.seek(SeekFrom::Start(offset))?;
+                f.write_all(&header)
+            };
+            let _ = stamp(sector, backup_lba);
+            let _ = stamp(backup_lba * sector, backup_lba);
+        }
 
         /// A cache dir with a dummy `<name>_<rev>_<digest>.snap` whose real
         /// sha3-384 the fake store query reports back.
@@ -6461,6 +6561,7 @@ RequiredBy=boot-complete.target
                 root: root.path(),
                 uki: None,
                 uki_stage: Path::new(""),
+                identity: "e2edisk|2.0.0",
                 uc: None,
                 pi_boot_stage: None,
             };
@@ -6486,7 +6587,7 @@ RequiredBy=boot-complete.target
             assert!(runner.saw("dd"), "dd through the runner: {calls:?}");
             assert!(runner.saw("parted"), "parted through the runner");
             assert!(runner.saw("sfdisk"), "sfdisk read-back through the runner");
-            assert!(runner.saw("mkfs.vfat"), "ESP mkfs through the runner");
+            assert!(runner.saw("mkfs.fat"), "ESP mkfs through the runner");
             assert!(runner.saw("mmd"), "mtools mmd through the runner");
             // Exactly two mkfs.ext4: the data partition AND the populated
             // root. One would mean the root populate was skipped.

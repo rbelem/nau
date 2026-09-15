@@ -270,7 +270,7 @@ pub(crate) fn populate_tool_package(name: &str) -> &'static str {
         "sfdisk" => "util-linux",
         "mmd" | "mcopy" => "mtools",
         "mkfs.ext4" => "e2fsprogs",
-        "mkfs.vfat" => "dosfstools",
+        "mkfs.vfat" | "mkfs.fat" => "dosfstools",
         _ => "the matching OS package",
     }
 }
@@ -283,7 +283,8 @@ pub(crate) fn find_host_tool(name: &str) -> Option<PathBuf> {
 }
 
 /// veritysetup argv for a sha256/4K format-1 invocation, optional pinned
-/// salt, devices last.
+/// salt, devices last. A pinned salt also pins the hash-partition
+/// superblock UUID (see [`verity_sb_uuid`]).
 pub(crate) fn verity_format_args(
     salt: Option<&str>,
     data_dev: &str,
@@ -304,10 +305,31 @@ pub(crate) fn verity_format_args(
     if let Some(salt) = salt {
         args.push("--salt".to_string());
         args.push(salt.to_string());
+        // #48: the superblock UUID rides the salt (= H(data)) — veritysetup
+        // mints a random one per format, which would make two rebuilds with
+        // an identical roothash produce different hash devices.
+        args.push("--uuid".to_string());
+        args.push(verity_sb_uuid(salt));
     }
     args.push(data_dev.to_string());
     args.push(hash_dev.to_string());
     args
+}
+
+/// The dm-verity hash-partition superblock UUID, derived from the format
+/// salt (= H(data)) — dashed-GUID shape, mirroring
+/// [`generation_guids_from_roothash`]'s roothash derivation. A rebuild of
+/// the same rootfs yields the same salt, hence the same superblock UUID.
+pub(crate) fn verity_sb_uuid(salt_hex: &str) -> String {
+    let hex: String = salt_hex.chars().filter(|c| *c != '-').take(32).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32],
+    )
 }
 
 /// `veritysetup format` invocation (ADR-0011 step (c)): sha256 over 4K data
@@ -517,16 +539,38 @@ pub(crate) fn set_partition_uuid(
     Ok(())
 }
 
-/// 64-hex random salt from /dev/urandom — shared across A/B slot formats so
-/// byte-identical twins produce the same roothash.
-pub(crate) fn random_salt_hex() -> miette::Result<String> {
+/// Content-derived verity salt (#48): SHA-256 over the populated root
+/// partition file, hex. The salt is PUBLISHED — it rides the UKI cmdline
+/// and the manifest — so the historical per-build `/dev/urandom` salt bought
+/// nothing while making the roothash, and everything derived from it (the
+/// generation GUIDs, the UKI cmdline, the hash partition, the manifest boot
+/// facts) irreproducible. Salt = H(data) is deterministic across rebuilds
+/// and still varies with the rootfs bytes, so distinct generations keep
+/// distinct roothashes. Shared across A/B slots by construction: one format
+/// of the quiescent slot-A file, byte-identical splices behind every slot.
+pub(crate) fn data_salt_hex(root_file: &Path) -> miette::Result<String> {
+    use sha2::Digest;
     use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom")
-        .map_err(|e| miette::miette!("cannot open /dev/urandom: {e}"))?;
-    let mut bytes = [0u8; 32];
-    f.read_exact(&mut bytes)
-        .map_err(|e| miette::miette!("cannot read salt from /dev/urandom: {e}"))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    let mut file = std::fs::File::open(root_file)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading {} for the verity salt", root_file.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("hashing {}", root_file.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// Apply GPT slot metadata (type GUIDs + PARTLABELs) for A/B layouts via

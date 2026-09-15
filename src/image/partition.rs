@@ -1,11 +1,142 @@
 //! Partition lifecycle — extents, mkfs, populate, splice,
 //! geometry, and Ubuntu Core routing (issue #57).
+//!
+//! Reproducible identity (#48): every random-per-build byte the unprivileged
+//! pipeline would otherwise mint — parted's GPT disk GUID and partition
+//! GUIDs, mke2fs's filesystem UUID and directory-hash seed, verity's salt —
+//! is replaced by a derivation over the image identity (`name|version` +
+//! partition name/index). Same declaration + same inputs ⇒ same bytes, so a
+//! rebuild diff (`examples/rebuild-compare.sh`) can prove it.
 
 use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
 
 use super::*;
+
+/// Derivation namespaces for the deterministic identity GUIDs (#48).
+/// Distinct constants keep a partition's PARTUUID, its filesystem UUID, and
+/// its directory-hash seed from ever colliding by accident.
+pub(crate) const GUID_NS_DISK: &str = "shuttle.gpt.disk.v1";
+pub(crate) const GUID_NS_PARTITION: &str = "shuttle.gpt.part.v1";
+pub(crate) const GUID_NS_FSUUID: &str = "shuttle.ext4.uuid.v1";
+pub(crate) const GUID_NS_HASH_SEED: &str = "shuttle.ext4.hashseed.v1";
+
+/// A deterministic GUID derived from `namespace` + `parts` (SHA-256, first
+/// 16 bytes, dashed) — the reproducible replacement for the random GUIDs
+/// parted/mke2fs would mint per run (#48). Mirrors the roothash-derived
+/// generation GUID convention (`generation_guids_from_roothash`): raw
+/// dashed hex, no RFC-4122 version bits.
+pub(crate) fn identity_guid(namespace: &str, parts: &[&str]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(namespace.as_bytes());
+    for part in parts {
+        hasher.update([0]);
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32],
+    )
+}
+
+/// CRC-32 (IEEE 802.3, the polynomial GPT headers use), table-free.
+fn gpt_crc32(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Parse a dashed GUID string into the 16-byte little-endian-mixed form the
+/// GPT on-disk format uses (first three fields little-endian, last two
+/// big-endian). The same encoding `sfdisk --part-uuid` writes for the same
+/// string, so derived PARTUUIDs and the patched disk GUID share one
+/// representation.
+fn guid_bytes(guid: &str) -> miette::Result<[u8; 16]> {
+    let hex: String = guid.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(miette::miette!(
+            "GUID {guid:?} is not a dashed 32-hex string — cannot encode it into the GPT"
+        ));
+    }
+    fn field(hex: &str, le: bool) -> Vec<u8> {
+        let mut bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hexdigit checked above"))
+            .collect();
+        if le {
+            bytes.reverse();
+        }
+        bytes
+    }
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&field(&hex[0..8], true));
+    out[4..6].copy_from_slice(&field(&hex[8..12], true));
+    out[6..8].copy_from_slice(&field(&hex[12..16], true));
+    out[8..10].copy_from_slice(&field(&hex[16..20], false));
+    out[10..16].copy_from_slice(&field(&hex[20..32], false));
+    Ok(out)
+}
+
+/// Overwrite the GPT disk GUID (primary + backup header) with `guid` and
+/// refresh both header CRC32s, in place — parted mints a fresh random disk
+/// GUID at `mklabel` time, which would make every image irreproducible (#48).
+/// Pure file surgery on the raw image (the same unprivileged style as
+/// [`splice_into`]); fails closed when either header does not carry the
+/// `EFI PART` signature — a table that did not land is not silently shipped.
+pub(crate) fn set_disk_guid(img_path: &Path, guid: &str) -> miette::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    const SIG: &[u8; 8] = b"EFI PART";
+    let bytes = guid_bytes(guid)?;
+    let sector: u64 = 512;
+    let mut img = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(img_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("opening {} for the disk GUID patch", img_path.display()))?;
+    // Primary header at LBA1; the backup's LBA is read out of the primary
+    // (header offset 32, little-endian u64).
+    let mut raw = [0u8; 8];
+    img.seek(SeekFrom::Start(sector + 32)).into_diagnostic()?;
+    img.read_exact(&mut raw).into_diagnostic()?;
+    let backup_offset = u64::from_le_bytes(raw) * sector;
+    for (label, offset) in [("GPT header", sector), ("backup GPT header", backup_offset)] {
+        let mut header = [0u8; 92];
+        img.seek(SeekFrom::Start(offset)).into_diagnostic()?;
+        img.read_exact(&mut header).into_diagnostic()?;
+        if &header[0..8] != SIG {
+            return Err(miette::miette!(
+                "no {label} at offset {offset} of {} — parted did not lay the table it \
+                 reported; refusing to patch a disk GUID onto a non-GPT image",
+                img_path.display()
+            ));
+        }
+        header[56..72].copy_from_slice(&bytes); // disk GUID (header offset 56)
+        header[16..20].copy_from_slice(&0u32.to_le_bytes()); // the header CRC covers itself as zero
+        let crc = gpt_crc32(&header);
+        header[16..20].copy_from_slice(&crc.to_le_bytes());
+        img.seek(SeekFrom::Start(offset)).into_diagnostic()?;
+        img.write_all(&header).into_diagnostic()?;
+    }
+    Ok(())
+}
 
 /// GPT partition name passed to `parted mkpart` — the partition's declared
 /// `name` becomes BOTH the GPT PARTLABEL (matched by the UC initrd's
@@ -192,6 +323,41 @@ pub(crate) fn set_esp_flag(runner: &dyn CommandRunner, img_path: &Path) {
     }
 }
 
+/// Pin the GPT's random-per-build identities to deterministic derivations
+/// (#48): the disk GUID and every partition's PARTUUID (including the
+/// auto-appended verity-hash partitions and swap). The verity slots are
+/// re-pinned to the roothash-derived generation GUIDs after the format
+/// (`build_disk_image_with`); everything else keeps this derivation. Runs
+/// right after the parted layout + slot metadata, BEFORE the first extents
+/// read-back, so every downstream consumer (cmdline, manifest, fstab) sees
+/// final identities. Fail-closed through [`set_disk_guid`] /
+/// [`set_partition_uuid`]: an identity that did not land aborts the build.
+pub(crate) fn pin_gpt_identities(
+    runner: &dyn CommandRunner,
+    img_path: &Path,
+    image_identity: &str,
+    layout: &DiskLayout,
+) -> miette::Result<()> {
+    set_disk_guid(img_path, &identity_guid(GUID_NS_DISK, &[image_identity]))?;
+    for (i, part) in layout.partitions.iter().enumerate() {
+        let guid = identity_guid(
+            GUID_NS_PARTITION,
+            &[image_identity, &part.name, &i.to_string()],
+        );
+        set_partition_uuid(runner, img_path, i + 1, &guid)?;
+    }
+    let swap_size = layout
+        .swap
+        .as_ref()
+        .map_or(0, |s| parse_size_mb(&s.size, 0));
+    if swap_size > 0 {
+        let i = layout.partitions.len();
+        let guid = identity_guid(GUID_NS_PARTITION, &[image_identity, "swap", &i.to_string()]);
+        set_partition_uuid(runner, img_path, i + 1, &guid)?;
+    }
+    Ok(())
+}
+
 /// Add the declared swap partition (if any) after the data partitions.
 pub(crate) fn create_swap_partition(
     runner: &dyn CommandRunner,
@@ -338,6 +504,10 @@ pub(crate) struct PopulateCtx<'a> {
     pub(crate) root: &'a Path,
     pub(crate) uki: Option<&'a UkiFacts>,
     pub(crate) uki_stage: &'a Path,
+    /// `"<name>|<version>"` — the derivation seed the deterministic ext4
+    /// fs UUID / hash seed pin from (#48); same derivation the GPT
+    /// identity pinning uses.
+    pub(crate) identity: &'a str,
     /// Ubuntu Core seed/role-model staging (issue #32). `None` for the
     /// non-UC/unsimplified path — content routing falls back to the
     /// historical behavior.
@@ -445,6 +615,13 @@ pub(crate) fn refuse_non_ext4_vfat(part: &Partition) -> miette::Result<()> {
 /// the filesystem inside it (mkfs may leave an unused tail — fine, it can
 /// never overrun). The verity variant pins [`VERITY_BLOCK_SIZE`] fs blocks
 /// via [`mkfs_flags_for`] so the root mounts over its dm-verity mapping.
+///
+/// `image_identity` (Some for every disk-build call, #48) pins the two
+/// random-per-format ext4 properties — the filesystem UUID and the
+/// directory-index hash seed — to derivations over the image identity +
+/// partition name + extent offset. Without them two formats of the SAME
+/// tree differ byte-for-byte, and a rebuild compare would flag every ext4
+/// partition as a nondeterminism.
 pub(crate) fn build_ext4_partition(
     runner: &dyn CommandRunner,
     part_file: &Path,
@@ -452,11 +629,27 @@ pub(crate) fn build_ext4_partition(
     part: &Partition,
     extent: &PartitionExtent,
     verity: bool,
+    image_identity: Option<&str>,
 ) -> miette::Result<()> {
     let (tool, flags) = mkfs_flags_for(&part.fs, verity)?;
     let block_count = (extent.size_bytes / u64::from(VERITY_BLOCK_SIZE)).to_string();
     let mut args: Vec<String> = flags;
     args.push(part.name.clone()); // label — mkfs_flags_for ends its flags with the label option
+    if tool == "mkfs.ext4" {
+        if let Some(identity) = image_identity {
+            let offset = extent.start_bytes.to_string();
+            args.push("-U".into());
+            args.push(identity_guid(
+                GUID_NS_FSUUID,
+                &[identity, &part.name, &offset],
+            ));
+            args.push("-E".into());
+            args.push(format!(
+                "hash_seed={}",
+                identity_guid(GUID_NS_HASH_SEED, &[identity, &part.name, &offset])
+            ));
+        }
+    }
     args.push("-d".into());
     args.push(staged_root.to_string_lossy().into_owned());
     args.push(part_file.to_string_lossy().into_owned());
@@ -502,18 +695,80 @@ pub(crate) fn collect_staged_entries(
     Ok(())
 }
 
+/// Normalize ONE staged-tree entry: permissions to 0644 (0755 for dirs —
+/// mcopy maps a missing owner-write onto the FAT read-only attribute) and
+/// mtime to `time`. Returns whether `path` is a directory to descend into.
+fn normalize_tree_entry(path: &Path, time: std::time::SystemTime) -> miette::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let is_dir = path.is_dir();
+    let mode = if is_dir { 0o755 } else { 0o644 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("normalizing mode of {}", path.display()))?;
+    let file = if is_dir {
+        std::fs::File::open(path)
+    } else {
+        std::fs::OpenOptions::new().write(true).open(path)
+    }
+    .into_diagnostic()
+    .wrap_err_with(|| format!("opening {} for mtime normalization", path.display()))?;
+    file.set_times(std::fs::FileTimes::new().set_modified(time))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("normalizing mtime of {}", path.display()))?;
+    Ok(is_dir)
+}
+
+/// Set the mtime of every file and directory under `dir` to `epoch` — the
+/// staged-tree normalization an mtools populate needs (#48). Upstream
+/// mtools copies the SOURCE file's mtime into the FAT directory entry, so
+/// whatever clock the build wrote the UKI/loader.conf with would ride
+/// onto the ESP and break byte-reproducibility; a fixed pre-1980-or-pinned
+/// epoch collapses every entry to one stable FAT date. Files are also
+/// pinned to 0644 (dirs 0755): mcopy maps a missing owner-write bit onto
+/// the FAT read-only attribute, so host store permissions (0555 nix
+/// binaries, e.g. the copied systemd-boot fallback) would otherwise leak
+/// into the image — and a read-only file cannot have its mtime set.
+pub(crate) fn normalize_tree_times(dir: &Path, epoch: u64) -> miette::Result<()> {
+    let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(epoch);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let read = std::fs::read_dir(&current)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("reading {}", current.display()))?;
+        for entry in read.flatten() {
+            if normalize_tree_entry(&entry.path(), time)? {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The build epoch the image-side timestamp normalization pins to
+/// (#48): SOURCE_DATE_EPOCH when the environment carries one, else 0.
+pub(crate) fn image_epoch_secs() -> u64 {
+    std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// Populate a standalone vfat file (the ESP) with mtools — no mount, no
 /// root. The staged tree is walked in sorted order (directories before
 /// their contents fall out of a lexicographic sort: a parent path is a
 /// strict prefix of its children) so the FAT layout is deterministic;
 /// each directory is created with `mmd`, each file copied with `mcopy`.
-/// Only the exit status decides — mkfs/mtools may print benign warnings
-/// (e.g. "less than suggested minimum clusters" on small extents).
+/// The staged tree's mtimes are normalized to the build epoch first (#48):
+/// upstream mtools copies source mtimes into the FAT entries, and the UKI +
+/// loader.conf were written by THIS build's clock. Only the exit status
+/// decides — mkfs/mtools may print benign warnings (e.g. "less than
+/// suggested minimum clusters" on small extents).
 pub(crate) fn mtools_populate_vfat(
     runner: &dyn CommandRunner,
     vfat_file: &Path,
     staged: &Path,
 ) -> miette::Result<()> {
+    normalize_tree_times(staged, image_epoch_secs())?;
     let mut entries: Vec<(String, bool)> = Vec::new();
     collect_staged_entries(staged, Path::new(""), &mut entries)?;
     entries.sort();
@@ -596,7 +851,9 @@ pub(crate) fn populate_side_partition(
     // rootfs — the UC role model replaces the simplified "everything is the
     // rootfs" routing for those partitions.
     match route_side_partition(ctx, index, part) {
-        SideRoute::Uc(stage) => build_staged_partition(runner, &part_file, part, stage, extent)?,
+        SideRoute::Uc(stage) => {
+            build_staged_partition(runner, &part_file, part, stage, extent, ctx.identity)?
+        }
         SideRoute::State => build_state_partition(runner, ctx, &part_file, part, extent)?,
         // #87: on a piboot image the single vfat partition is the Pi
         // firmware partition — populated from the staged boot tree, and
@@ -659,8 +916,16 @@ pub(crate) fn build_state_partition(
     std::fs::create_dir_all(&empty)
         .into_diagnostic()
         .wrap_err_with(|| format!("creating the empty state staging dir {}", empty.display()))?;
-    build_ext4_partition(runner, part_file, &empty, part, extent, false)
-        .wrap_err_with(|| format!("state partition '{}' populate failed", part.name))?;
+    build_ext4_partition(
+        runner,
+        part_file,
+        &empty,
+        part,
+        extent,
+        false,
+        Some(ctx.identity),
+    )
+    .wrap_err_with(|| format!("state partition '{}' populate failed", part.name))?;
     eprintln!(
         "  ✓ {}: {} formatted empty (state, boot-populated)",
         part.name, part.fs
@@ -668,24 +933,67 @@ pub(crate) fn build_state_partition(
     Ok(())
 }
 
+/// Resolve the ESP/vfat formatter: dosfstools' `mkfs.fat` when present, its
+/// `mkfs.vfat` alias as fallback. A resolved `mkfs.vfat` may still be the
+/// BusyBox applet (first on some devbox PATHs) — that one lacks
+/// `--invariant` and time-seeds the volume id, so the `mkfs.fat
+/// --invariant` invocation fails with the named error in
+/// [`mkfs_vfat_partition`] instead of silently emitting an irreproducible
+/// ESP (#48). `None` = neither binary on PATH.
+pub(crate) fn find_mkfs_vfat() -> Option<PathBuf> {
+    find_host_tool("mkfs.fat").or_else(|| find_host_tool("mkfs.vfat"))
+}
+
 /// mkfs.vfat a standalone partition file (`-F 32`, labelled with the
 /// partition name). Shared by the systemd-boot ESP and the piboot firmware
 /// partition (#87); the caller decides whether a failure warns or fails.
+///
+/// The tool is resolved through [`find_mkfs_vfat`] and carries
+/// `--invariant` (mkfs_flags_for): dosfstools ≥ 4.2 formats the SAME bytes
+/// every run — the volume id and creation timestamps are what BusyBox's
+/// mkfs.vfat (and dosfstools without the flag) reseed per run, which a
+/// rebuild compare would flag on every ESP (#48).
 fn mkfs_vfat_partition(
     runner: &dyn CommandRunner,
     part_file: &Path,
     part: &Partition,
 ) -> miette::Result<()> {
-    let (tool, mut flags) = mkfs_flags_for("vfat", false)?;
+    let (_, mut flags) = mkfs_flags_for("vfat", false)?;
     flags.push(part.name.clone()); // -n label
     flags.push(part_file.to_string_lossy().into_owned());
-    let argv: Vec<String> = std::iter::once(tool.to_string()).chain(flags).collect();
+    // Resolve the NAME through the runner's own PATH (the `which` probe is
+    // the seam apply_gpt_slot_metadata already uses) — a fake runner can
+    // then script the resolution, and the real build resolves the same PATH
+    // `Command` will search.
+    let which = |name: &str| {
+        runner
+            .run(&["which".to_string(), name.to_string()])
+            .ok()
+            .filter(|o| o.code == 0)
+            .is_some()
+    };
+    let tool = if which("mkfs.fat") {
+        "mkfs.fat".to_string()
+    } else if which("mkfs.vfat") {
+        "mkfs.vfat".to_string()
+    } else {
+        return Err(miette::miette!(
+            "mkfs.fat not found on PATH — the disk build formats the ESP (and any \
+             vfat partition) with dosfstools ≥ 4.2 ('mkfs.fat --invariant') so the \
+             volume identity is reproducible; refusing to emit an irreproducible \
+             ESP. Run 'shuttle doctor' and install it (e.g. apt install dosfstools \
+             or add dosfstools to devbox.json packages)"
+        ));
+    };
+    let argv: Vec<String> = std::iter::once(tool.clone()).chain(flags).collect();
     let out = runner
         .run(&argv)
         .map_err(|e| miette::miette!("{tool} not found: {e}"))?;
     if out.code != 0 {
         return Err(miette::miette!(
-            "{tool} failed for the {} partition '{}' (exit {}): {}",
+            "{tool} failed for the {} partition '{}' (exit {}): {} — a reproducible \
+             ESP needs dosfstools >= 4.2 with --invariant support; BusyBox's \
+             mkfs.vfat cannot produce one",
             part.fs,
             part.name,
             crate::command::exit_code(&out),
@@ -758,9 +1066,18 @@ pub(crate) fn build_staged_partition(
     part: &Partition,
     stage: &Path,
     extent: &PartitionExtent,
+    identity: &str,
 ) -> miette::Result<()> {
-    build_ext4_partition(runner, part_file, stage, part, extent, false)
-        .wrap_err_with(|| format!("UC {} partition '{}' populate failed", part.fs, part.name))?;
+    build_ext4_partition(
+        runner,
+        part_file,
+        stage,
+        part,
+        extent,
+        false,
+        Some(identity),
+    )
+    .wrap_err_with(|| format!("UC {} partition '{}' populate failed", part.fs, part.name))?;
     eprintln!("  ✓ {}: {} populated (UC staged tree)", part.name, part.fs);
     Ok(())
 }
@@ -776,7 +1093,15 @@ pub(crate) fn build_data_partition(
     part: &Partition,
     extent: &PartitionExtent,
 ) -> miette::Result<()> {
-    if let Err(e) = build_ext4_partition(runner, part_file, ctx.root, part, extent, false) {
+    if let Err(e) = build_ext4_partition(
+        runner,
+        part_file,
+        ctx.root,
+        part,
+        extent,
+        false,
+        Some(ctx.identity),
+    ) {
         eprintln!(
             "  ⚠ {}: {} populate failed ({e:#}) — partition left unpopulated",
             part.name, part.fs
@@ -794,6 +1119,14 @@ pub(crate) fn build_data_partition(
 /// over the verity mapping — ext4 via `-b`, btrfs via nodesize +
 /// sectorsize. vfat + verity fails closed: FAT has no block-size knob and
 /// cannot serve as a verity data device.
+///
+/// The vfat tool is spelled `mkfs.fat` (dosfstools) because the ESP is
+/// formatted with `--invariant` — dosfstools ≥ 4.2 pins the volume id and
+/// creation timestamps so two formats of the same tree are byte-identical
+/// (#48). `mkfs_vfat_partition` resolves that name (falling back to a
+/// dosfstools-provided `mkfs.vfat`); BusyBox's applet of the same name has
+/// no `--invariant` and time-seeds the volume id, and is rejected at run
+/// time with a named error.
 pub(crate) fn mkfs_flags_for(
     fs: &str,
     verity: bool,
@@ -807,7 +1140,10 @@ pub(crate) fn mkfs_flags_for(
                  device; declare an ext4 (or btrfs) root"
             ));
         }
-        ("vfat", false) => ("mkfs.vfat", vec!["-F".into(), "32".into(), "-n".into()]),
+        ("vfat", false) => (
+            "mkfs.fat",
+            vec!["-F".into(), "32".into(), "--invariant".into(), "-n".into()],
+        ),
         ("btrfs", true) => (
             "mkfs.btrfs",
             vec![
@@ -1112,6 +1448,7 @@ mod tests {
             root: rootfs.path(),
             uki: None,
             uki_stage: Path::new(""),
+            identity: "test-uc|1.0.0",
             uc: None,
             pi_boot_stage: None,
         };
@@ -1151,6 +1488,7 @@ mod tests {
             root: rootfs.path(),
             uki: None,
             uki_stage: Path::new(""),
+            identity: "test-uc|1.0.0",
             uc: None,
             pi_boot_stage: None,
         };
@@ -1179,6 +1517,7 @@ mod tests {
             root: rootfs.path(),
             uki: None,
             uki_stage: Path::new(""),
+            identity: "test-uc|1.0.0",
             uc: None,
             pi_boot_stage: None,
         };
@@ -1189,6 +1528,229 @@ mod tests {
             mkfs_d_source(&runner.calls()),
             rootfs.path().to_string_lossy(),
             "an ordinary data partition still populates from the rootfs"
+        );
+    }
+
+    // ── Deterministic identity (#48) ──
+
+    /// CRC-32 must match the IEEE vector or every GPT header CRC the disk
+    /// GUID patch recomputes would be wrong (and parted/sfdisk would reject
+    /// the table at read-back).
+    #[test]
+    fn gpt_crc32_matches_the_ieee_check_vector() {
+        assert_eq!(gpt_crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(gpt_crc32(b""), 0x0000_0000);
+    }
+
+    /// The identity GUID derivation is stable, well-formed, and sensitive
+    /// to every input — two partitions that differ only in name or index
+    /// must never share an identity.
+    #[test]
+    fn identity_guid_is_deterministic_shape_and_input_sensitive() {
+        let a = identity_guid("ns", &["img|1.0", "esp", "0"]);
+        assert_eq!(a, identity_guid("ns", &["img|1.0", "esp", "0"]));
+        assert_eq!(a.len(), 36, "dashed 32-hex: {a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        assert_ne!(identity_guid("ns", &["img|1.0", "root", "1"]), a);
+        assert_ne!(identity_guid("ns", &["img|1.0", "esp", "1"]), a);
+        assert_ne!(identity_guid("other", &["img|1.0", "esp", "0"]), a);
+    }
+
+    /// A minimal 4-sector fixture with a primary header (LBA1) pointing at
+    /// a backup header (LBA3), the same shape `stamp_fake_gpt` gives the
+    /// e2e fake and parted gives a real image.
+    fn gpt_fixture(dir: &Path) -> PathBuf {
+        let path = dir.join("disk.img");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len(4 * 512).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        let mut header = [0u8; 92];
+        header[0..8].copy_from_slice(b"EFI PART");
+        header[20..24].copy_from_slice(&92u32.to_le_bytes());
+        header[32..40].copy_from_slice(&3u64.to_le_bytes());
+        header[72..80].copy_from_slice(&2u64.to_le_bytes()); // entries LBA
+        f.seek(SeekFrom::Start(512)).unwrap();
+        f.write_all(&header).unwrap();
+        f.seek(SeekFrom::Start(3 * 512)).unwrap();
+        f.write_all(&header).unwrap();
+        path
+    }
+
+    /// The disk GUID lands on BOTH headers, encoded little-endian-mixed,
+    /// and both header CRCs verify afterwards.
+    #[test]
+    fn set_disk_guid_patches_both_headers_and_fixes_the_crcs() {
+        use std::io::{Read, Seek, SeekFrom};
+        let dir = tempfile::tempdir().unwrap();
+        let path = gpt_fixture(dir.path());
+        let guid = "11223344-5566-7788-9900-aabbccddeeff";
+        set_disk_guid(&path, guid).unwrap();
+
+        let mut f = std::fs::File::open(&path).unwrap();
+        for (label, offset) in [("primary", 512u64), ("backup", 3 * 512)] {
+            let mut header = [0u8; 92];
+            f.seek(SeekFrom::Start(offset)).unwrap();
+            f.read_exact(&mut header).unwrap();
+            assert_eq!(&header[0..8], b"EFI PART", "{label} signature intact");
+            let expected = guid_bytes(guid).unwrap();
+            assert_eq!(&header[56..72], &expected[..], "{label} disk GUID bytes");
+            // The entries LBA must survive the patch — writing the GUID over
+            // it would leave sfdisk reading a bogus entry array.
+            let entries_lba = u64::from_le_bytes([
+                header[72], header[73], header[74], header[75], header[76], header[77], header[78],
+                header[79],
+            ]);
+            assert_eq!(entries_lba, 2, "{label} entries LBA untouched");
+            let mut for_crc = header;
+            for_crc[16..20].copy_from_slice(&[0; 4]);
+            let stored = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+            assert_eq!(
+                gpt_crc32(&for_crc),
+                stored,
+                "{label} header CRC verifies after the patch"
+            );
+        }
+    }
+
+    /// A non-GPT image (parted never ran, or the table did not land) fails
+    /// the patch closed — never a silently-unpatched random GUID.
+    #[test]
+    fn set_disk_guid_fails_closed_on_a_non_gpt_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blank.img");
+        std::fs::File::create(&path).unwrap().set_len(4096).unwrap();
+        let err = set_disk_guid(&path, "11223344-5566-7788-9900-aabbccddeeff").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("EFI PART") || format!("{err:#}").contains("GPT header"),
+            "the failure names the missing table: {err:#}"
+        );
+    }
+
+    /// Every partition the effective layout declares — plus the swap
+    /// partition when sized — gets a deterministic PARTUUID pinned through
+    /// the sfdisk seam, and the disk GUID is patched.
+    #[test]
+    fn pin_gpt_identities_pins_every_partition_and_the_disk_guid() {
+        use std::io::{Read, Seek, SeekFrom};
+        let dir = tempfile::tempdir().unwrap();
+        let path = gpt_fixture(dir.path());
+        let layout = DiskLayout {
+            label: "gpt".into(),
+            partitions: vec![part("esp", "64M"), part("root", "256M")],
+            swap: Some(SwapConfig { size: "64M".into() }),
+            ab: false,
+        };
+        let runner = RecordingRunner::new(0);
+        pin_gpt_identities(&runner, &path, "img|1.0", &layout).unwrap();
+
+        let calls = runner.calls();
+        let pinned: Vec<(String, String)> = calls
+            .iter()
+            .filter(|c| c.iter().any(|a| a == "--part-uuid"))
+            .filter_map(|c| {
+                let i = c.iter().position(|a| a == "--part-uuid")?;
+                Some((c[i + 2].clone(), c[i + 3].clone()))
+            })
+            .collect();
+        assert_eq!(pinned.len(), 3, "esp + root + swap pinned: {pinned:?}");
+        assert_eq!(pinned[0].0, "1");
+        assert_eq!(
+            pinned[0].1,
+            identity_guid(GUID_NS_PARTITION, &["img|1.0", "esp", "0"])
+        );
+        assert_eq!(
+            pinned[1].1,
+            identity_guid(GUID_NS_PARTITION, &["img|1.0", "root", "1"])
+        );
+        assert_eq!(pinned[2].0, "3", "swap is partition 3 (after 2 declared)");
+        assert_eq!(
+            pinned[2].1,
+            identity_guid(GUID_NS_PARTITION, &["img|1.0", "swap", "2"])
+        );
+
+        let mut header = [0u8; 92];
+        let mut f = std::fs::File::open(&path).unwrap();
+        f.seek(SeekFrom::Start(512)).unwrap();
+        f.read_exact(&mut header).unwrap();
+        let expected = guid_bytes(&identity_guid(GUID_NS_DISK, &["img|1.0"])).unwrap();
+        assert_eq!(&header[56..72], &expected[..], "disk GUID patched");
+    }
+
+    /// The staged-tree mtime normalization pins every file AND directory to
+    /// the epoch — what upstream mtools would copy into the FAT entries.
+    #[test]
+    fn normalize_tree_times_pins_files_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("EFI");
+        std::fs::create_dir_all(sub.join("Linux")).unwrap();
+        std::fs::write(sub.join("Linux").join("a.efi"), b"uki").unwrap();
+        let loader = dir.path().join("loader.conf");
+        std::fs::write(&loader, b"timeout 3").unwrap();
+
+        normalize_tree_times(dir.path(), 1_700_000_000).unwrap();
+
+        for path in [
+            loader,
+            sub.join("Linux").join("a.efi"),
+            sub.join("Linux"),
+            sub,
+        ] {
+            let md = std::fs::metadata(&path).unwrap();
+            let got = md.modified().unwrap();
+            assert_eq!(
+                got,
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+                "{} normalized: {got:?}",
+                path.display()
+            );
+        }
+    }
+
+    /// The ext4 determinism flags: with an image identity, every ext4 mkfs
+    /// carries -U and -E hash_seed derivations (offset-keyed, so two
+    /// same-named partitions never share one).
+    #[test]
+    fn ext4_populate_pins_fs_uuid_and_hash_seed_from_the_identity() {
+        let scratch = tempfile::tempdir().unwrap();
+        scratch_disk(scratch.path(), 16 * 1024 * 1024);
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::write(rootfs.path().join("f"), b"x").unwrap();
+        let runner = RecordingRunner::new(0);
+        let e = extent(16 * 1024 * 1024);
+        let p = part("state", "16M");
+        build_ext4_partition(
+            &runner,
+            &scratch.path().join("p.img"),
+            rootfs.path(),
+            &p,
+            &e,
+            false,
+            Some("img|1.0"),
+        )
+        .unwrap();
+        let call = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.first().is_some_and(|t| t == "mkfs.ext4"))
+            .unwrap();
+        let uuid_at = call.iter().position(|a| a == "-U").unwrap();
+        assert_eq!(
+            call[uuid_at + 1],
+            identity_guid(
+                GUID_NS_FSUUID,
+                &["img|1.0", "state", &e.start_bytes.to_string()]
+            )
+        );
+        let seed_at = call.iter().position(|a| a == "-E").unwrap();
+        assert_eq!(
+            call[seed_at + 1],
+            format!(
+                "hash_seed={}",
+                identity_guid(
+                    GUID_NS_HASH_SEED,
+                    &["img|1.0", "state", &e.start_bytes.to_string()]
+                )
+            )
         );
     }
 }

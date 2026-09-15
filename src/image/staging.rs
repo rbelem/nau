@@ -200,6 +200,14 @@ fn resolve_image_snaps(
 ) -> miette::Result<Vec<ResolvedSnap>> {
     let mut resolved = Vec::new();
 
+    // #48/#69: the image path resolves through the index the declaration
+    // baked its pins from — SHUTTLE_INDEX_PATH, else package-index.json in
+    // the CWD (the same seam the eval worker uses). Loaded once per build.
+    let index_path = std::env::var("SHUTTLE_INDEX_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
+    let image_index = crate::index::PackageIndex::load_or_default(&index_path).ok();
+
     let mut entries: Vec<(&SnapRef, SnapRole)> = vec![(&image.base, SnapRole::Base)];
     if let Some(ref k) = image.kernel {
         entries.push((&k.snap, SnapRole::Kernel));
@@ -251,13 +259,37 @@ fn resolve_image_snaps(
             );
         }
 
+        // #48/#69: a baked, cache-backed index pin wins over a live store
+        // query — the build must not silently re-resolve what the
+        // declaration pinned (a store-first order races the store's
+        // CURRENT revision between builds, so identical pins could produce
+        // different images). The store remains the path for anything
+        // unpinned or uncached ([`try_index_pin`] returns None on a cache
+        // miss while the store is still an option).
+        if let Some(idx) = image_index.as_ref() {
+            if let Some(entry) = idx.find_by_name_or_alias(&snap_ref.name) {
+                if let Some(ref pins) = entry.pins {
+                    if let Some(s) = try_index_pin(
+                        entry,
+                        pins,
+                        &snap_ref.name,
+                        arch,
+                        &effective_channel,
+                        cache_dir,
+                    ) {
+                        resolved.push(s);
+                        continue;
+                    }
+                }
+            }
+        }
+
         // Try Snap Store first, then fall back to package index
         let snap = match StoreClient::resolve_with(runner, &pin, &effective_channel, arch) {
             Ok(s) => s,
             Err(_) => {
                 // Try resolving through the package index
-                let index_path = std::path::PathBuf::from(crate::index::DEFAULT_INDEX);
-                if let Ok(idx) = crate::index::PackageIndex::load_or_default(&index_path) {
+                if let Some(idx) = image_index.as_ref() {
                     if let Some(entry) = idx.find_by_name_or_alias(&snap_ref.name) {
                         // Issue #69: a pre-resolved index pin is only
                         // trusted on the channel it was resolved FROM —
@@ -2522,5 +2554,152 @@ mod tests {
             .collect::<Vec<_>>();
         hits.sort();
         hits.into_iter().next()
+    }
+
+    // ── Pin-first resolution (#48/#69) ──
+
+    /// A runner that answers NOTHING: any store query (curl) is a test
+    /// failure by construction — the pin-first path must never reach it.
+    struct NoStoreRunner {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl NoStoreRunner {
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::command::CommandRunner for NoStoreRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            Err(std::io::Error::other("store must not be queried"))
+        }
+    }
+
+    /// An index with one channel-keyed core26 pin, plus its cached payload
+    /// under the exact content-addressed name the pin carries. Returns the
+    /// index FILE path (the seam takes a file, not a directory).
+    fn pin_fixture(dir: &Path) -> (PathBuf, String) {
+        let sha3 = "7d1230c3236bd8840000000000000000000000000000000000000000000000000000000000000000000000000000000000aa";
+        let index = serde_json::json!({
+            "version": 1,
+            "snaps": [{
+                "name": "core26",
+                "pins": {
+                    "amd64@26/stable": {
+                        "revision": 462,
+                        "sha3-384": sha3,
+                        "channel": "26/stable"
+                    }
+                }
+            }]
+        });
+        let index_path = dir.join("package-index.json");
+        std::fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+        std::fs::write(dir.join(format!("core26_462_{sha3}.snap")), b"payload").unwrap();
+        (index_path, sha3.to_string())
+    }
+
+    /// Lock the SHUTTLE_INDEX_PATH seam for the duration of one test — the
+    /// resolve loop reads it, and parallel tests must not race it.
+    struct IndexPathGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn set_index_path(path: &Path) -> IndexPathGuard {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SHUTTLE_INDEX_PATH", path);
+        IndexPathGuard { _lock: lock }
+    }
+
+    impl Drop for IndexPathGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("SHUTTLE_INDEX_PATH");
+        }
+    }
+
+    fn unpinned_core26_image() -> ImageDeclaration {
+        ImageDeclaration {
+            name: "pinfirst".into(),
+            version: "1.0.0".into(),
+            base: SnapRef {
+                name: "core26".into(),
+                revision: None,
+                sha3_384: None,
+            },
+            kernel: None,
+            gadget: None,
+            gadget_channel: None,
+            extra_snaps: vec![],
+            bootloader: None,
+            disk: None,
+            sysctl: vec![],
+            update_source: None,
+            files: vec![],
+            boot_health_exec: None,
+        }
+    }
+
+    /// A baked index pin with a cached payload resolves WITHOUT any store
+    /// query — two builds hours apart cannot race the store's current
+    /// revision (#48). This is the pin-honoring contract the rebuild
+    /// compare asserts on the log line.
+    #[test]
+    fn cached_index_pin_resolves_without_touching_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index_home, sha3) = pin_fixture(dir.path());
+        let _guard = set_index_path(&index_home);
+
+        let runner = NoStoreRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let resolved = resolve_image_snaps(
+            &runner,
+            &unpinned_core26_image(),
+            &LockFile::empty(),
+            "26/stable",
+            "amd64",
+            dir.path(),
+        )
+        .expect("the cached pin resolves offline");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "core26");
+        assert_eq!(resolved[0].revision, 462);
+        assert_eq!(resolved[0].sha3_384, sha3);
+        assert!(
+            runner.calls().is_empty(),
+            "the store was never queried: {:?}",
+            runner.calls()
+        );
+    }
+
+    /// A cache miss falls through to the store — the pin path must not
+    /// brick a build while the store is reachable (#69 contract).
+    #[test]
+    fn index_pin_cache_miss_falls_through_to_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index_home, _sha3) = pin_fixture(dir.path());
+        let _guard = set_index_path(&index_home);
+
+        let cache = tempfile::tempdir().unwrap();
+        let resolved = resolve_image_snaps(
+            &NoStoreRunner {
+                calls: std::sync::Mutex::new(Vec::new()),
+            },
+            &unpinned_core26_image(),
+            &LockFile::empty(),
+            "26/stable",
+            "amd64",
+            cache.path(),
+        )
+        .expect_err("no store reachable and no cached payload is a hard failure");
+        let msg = format!("{resolved:#}");
+        assert!(
+            msg.contains("cannot resolve"),
+            "names the unresolvable snap: {msg}"
+        );
     }
 }
