@@ -75,11 +75,17 @@ pub(crate) fn is_state_role(role: &str) -> bool {
 }
 
 /// True when a partition is the one the state role selects: the native
-/// `role = "state"`, or the UC `system-data` role (which describes the
-/// same persistent partition). Everything else — including the
-/// root/ESP/swap — is not state.
+/// `role = "state"`, or the UC `system-data` / `system-save` roles (which
+/// describe the same class of boot-populated writable — snapd seeds
+/// `ubuntu-data` and maintains `ubuntu-save` itself; the build formats
+/// both empty). Everything else — including the root/ESP/swap — is not
+/// state.
 pub(crate) fn is_state_partition(part: &Partition) -> bool {
-    is_state_role(&part.role) || partition_uc_role(part) == Some(crate::uc::ROLE_DATA)
+    is_state_role(&part.role)
+        || matches!(
+            partition_uc_role(part),
+            Some(crate::uc::ROLE_DATA) | Some(crate::uc::ROLE_SAVE)
+        )
 }
 
 /// Does the image ask for the state partition + `/var` split?

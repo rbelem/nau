@@ -1054,7 +1054,12 @@ pub(crate) fn build_disk_image_with(
     // #87: piboot images run NEITHER — the Pi backend boots without a UKI
     // and without verity (named scope, ADR-0025 amendment); its own
     // fail-closed contract is the built-in boot-chain audit below.
-    let verity = image.kernel.is_some() && !is_pi;
+    // #32: UC gadget-proper images run neither either — the boot chain is
+    // the GADGET's grub + the kernel snap's kernel.efi (staged onto
+    // ubuntu-seed by setup_uc_context below), not a shuttle UKI, and the
+    // root comes from the seed unpack, not a verity-hashed shuttle rootfs.
+    let uc_active = crate::uc::uc_requested(image, Some(disk_layout));
+    let verity = image.kernel.is_some() && !is_pi && !uc_active;
     if verity {
         preflight_disk_tools_with(
             find_ukify().as_deref(),
@@ -1139,19 +1144,35 @@ pub(crate) fn build_disk_image_with(
 
     // 6c. Ubuntu Core seed/role-model wiring (issue #32): when the image
     // base is a UC coreN base AND the layout marks a partition with a UC
-    // gadget role (system-seed/boot/data), remap those partitions to their
-    // UC PARTLABELs and stage the seed + modeenv trees. The role remap
-    // happens BEFORE partitioning so the parted-created GPT PARTLABELs come
-    // out as `ubuntu-seed`/`ubuntu-boot`/`ubuntu-data`. Non-UC bases (and
-    // coreN bases without a role-marked partition) are untouched, keeping
-    // the simplified path bit-identical.
+    // gadget role, remap those partitions to their UC PARTLABELs and stage
+    // the full seed (model assertion, seed.yaml, snap payloads, kernel.efi,
+    // grubenv, the gadget's EFI assets, snapd's first-boot grub config, the
+    // account trust anchor) + the modeenv tree. The role remap happens
+    // BEFORE partitioning so the parted-created GPT PARTLABELs come out as
+    // `ubuntu-seed`/`ubuntu-boot`/`ubuntu-data`/`ubuntu-save`. Non-UC bases
+    // (and coreN bases without a role-marked partition) are untouched,
+    // keeping the simplified path bit-identical.
     let uc = setup_uc_context(
+        runner,
         image,
         &mut effective_layout,
         scratch.path(),
         arch,
         &resolved,
+        cache_dir,
+        kernel_snap_dir.as_ref().map(|d| d.path()),
+        has_unsquashfs,
     )?;
+    if uc_active != uc.is_some() {
+        // The staged predicate and the requested predicate disagree — a
+        // role remap that turned a layout UC while the early gate (which
+        // reads the same predicate) saw none, or vice versa. Fail loudly
+        // rather than boot a hybrid.
+        return Err(miette::miette!(
+            "internal: UC activation mismatch (requested={uc_active}, staged={})",
+            uc.is_some()
+        ));
+    }
 
     // Calculate total image size: sum partitions + swap + 4M for GPT headers
     let total_mb = calculate_disk_size_mb(&effective_layout);
@@ -1160,7 +1181,33 @@ pub(crate) fn build_disk_image_with(
     // 7. Create and partition the raw image — GPT PARTUUIDs exist from
     // parted mkpart time, before anything is formatted or copied.
     let img_path = scratch.path().join("disk.img");
-    create_partitions(runner, &img_path, &effective_layout, total_mb)?;
+    // The GPT esp flag goes to the partition the firmware must find: the
+    // UC `ubuntu-seed` (the pc gadget's ESP) when active, else partition 1
+    // (the simplified path's ESP).
+    let esp_partition = if uc_active {
+        Some(
+            effective_layout
+                .partitions
+                .iter()
+                .position(|p| p.name == crate::uc::UC_SEED_PART)
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "UC layout has no '{}' partition — the seed carries the ESP \
+                         boot assets and cannot be built without it",
+                        crate::uc::UC_SEED_PART
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    create_partitions(
+        runner,
+        &img_path,
+        &effective_layout,
+        total_mb,
+        esp_partition,
+    )?;
     // ADR-0011 step (d): A/B layouts additionally get GPT partition type
     // GUIDs + PARTLABELs so systemd-sysupdate can match the slots.
     apply_gpt_slot_metadata(runner, &img_path, image, &effective_layout, &slots)?;
@@ -1373,6 +1420,16 @@ pub(crate) fn build_disk_image_with(
         })?;
         eprintln!("  ✓ piboot: no UKI — the firmware loads kernel.img (issue #87)");
         (None, PathBuf::new(), slots.skip_indices(), Some(stage))
+    } else if uc_active {
+        // #32/#28: the gadget-proper chain. No shuttle UKI — grub chainloads
+        // the kernel snap's own kernel.efi out of the recovery system
+        // (staged in step 6c), and snap-bootstrap manages the boot
+        // variables on ubuntu-boot after the first-boot seed.
+        eprintln!(
+            "  ✓ UC gadget-proper chain: no UKI — the gadget's grub + the kernel \
+             snap's kernel.efi drive the boot (#32)"
+        );
+        (None, PathBuf::new(), slots.skip_indices(), None)
     } else {
         // Kernel-free images boot without a UKI — no verity, no trailer.
         let (uki, stage) = assemble_uki(
@@ -2255,7 +2312,9 @@ mod tests {
                 Partition {
                     name: "seedpool".into(),
                     size: "1G".into(),
-                    fs: "ext4".into(),
+                    // The pc gadget's ubuntu-seed IS the ESP: vfat, per the
+                    // UC partition shape contract.
+                    fs: "vfat".into(),
                     mount: "/seed".into(),
                     options: vec![],
                     role: "system-seed".into(),
@@ -2275,38 +2334,61 @@ mod tests {
     }
 
     #[test]
-    fn setup_uc_context_remaps_role_partitions_and_stages() {
+    fn setup_uc_context_remaps_role_partitions_and_enforces_shapes() {
         let image = test_support::sample_image();
         assert!(crate::uc::is_uc_base(&image.base.name));
         let mut layout = uc_layout();
         let scratch = tempfile::tempdir().unwrap();
-        let uc = setup_uc_context(&image, &mut layout, scratch.path(), "amd64", &[])
-            .unwrap()
-            .expect("UC base + role partitions ⇒ UC active");
+        // The UC staging needs resolved snaps + the extracted kernel tree;
+        // this test stops at that named precondition — but only AFTER the
+        // layout remap and shape contract ran, which is what it asserts.
+        let err = setup_uc_context(
+            &ImageTools,
+            &image,
+            &mut layout,
+            scratch.path(),
+            "amd64",
+            &[],
+            scratch.path(),
+            None,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("extracted kernel snap"),
+            "fails at the kernel-tree precondition: {err}"
+        );
         // Role partitions remapped to their UC PARTLABEL; unmarked ones keep
         // their names (the simplified path is untouched).
         assert_eq!(layout.partitions[2].name, "ubuntu-seed");
         assert_eq!(layout.partitions[3].name, "ubuntu-boot");
         assert_eq!(layout.partitions[0].name, "esp");
         assert_eq!(layout.partitions[1].name, "esp-data");
-        // Seed + boot trees staged.
-        assert!(uc.seed_stage.join("seed.yaml").exists());
-        assert!(uc.boot_stage.join("device").join("modeenv").exists());
-        // The staged boot tree's modeenv declares a run mode (snap-bootstrap
-        // stops at "cannot detect mode" without it).
-        let modeenv =
-            std::fs::read_to_string(uc.boot_stage.join("device").join("modeenv")).unwrap();
-        assert!(modeenv.starts_with("mode=run\n"));
-        // The staged recovery-system model assertion is a signed assertion
-        // that roundtrips with the project's keychain.
-        let sys = std::fs::read_dir(uc.seed_stage.join("systems"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p.is_dir())
-            .expect("a recovery-system label dir");
-        let model_text = std::fs::read_to_string(sys.join("model")).unwrap();
-        assert!(model_text.contains("type: model"));
-        assert!(model_text.contains("base: core24"));
+    }
+
+    #[test]
+    fn setup_uc_context_refuses_a_non_vfat_seed_partition() {
+        let image = test_support::sample_image();
+        let mut layout = uc_layout();
+        // The pc gadget's ubuntu-seed IS the ESP (vfat); an ext4 seed would
+        // fail snapd's gadget-vs-disk filesystem cross-check at install.
+        layout.partitions[2].fs = "ext4".into();
+        let scratch = tempfile::tempdir().unwrap();
+        let err = setup_uc_context(
+            &ImageTools,
+            &image,
+            &mut layout,
+            scratch.path(),
+            "amd64",
+            &[],
+            scratch.path(),
+            None,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be vfat"), "{err}");
     }
 
     #[test]
@@ -2316,7 +2398,18 @@ mod tests {
         assert!(!crate::uc::is_uc_base(&image.base.name));
         let mut layout = uc_layout();
         let scratch = tempfile::tempdir().unwrap();
-        let uc = setup_uc_context(&image, &mut layout, scratch.path(), "amd64", &[]).unwrap();
+        let uc = setup_uc_context(
+            &ImageTools,
+            &image,
+            &mut layout,
+            scratch.path(),
+            "amd64",
+            &[],
+            scratch.path(),
+            None,
+            true,
+        )
+        .unwrap();
         assert!(uc.is_none(), "non-UC base keeps the simplified path");
         // Names unchanged — no remap.
         assert_eq!(layout.partitions[2].name, "seedpool");
@@ -2337,11 +2430,43 @@ mod tests {
             }
         }
         let scratch = tempfile::tempdir().unwrap();
-        let uc = setup_uc_context(&image, &mut layout, scratch.path(), "amd64", &[]).unwrap();
+        let uc = setup_uc_context(
+            &ImageTools,
+            &image,
+            &mut layout,
+            scratch.path(),
+            "amd64",
+            &[],
+            scratch.path(),
+            None,
+            true,
+        )
+        .unwrap();
         assert!(
             uc.is_none(),
             "no UC role-marked partition ⇒ simplified path kept"
         );
+    }
+
+    #[test]
+    fn uc_requested_gates_on_base_and_roles() {
+        let image = test_support::sample_image();
+        // UC base + role layout ⇒ requested (the verity/UKI gate reads this
+        // BEFORE staging runs, so a UC build never assembles a systemd-boot
+        // UKI the gadget chain would not boot).
+        assert!(crate::uc::uc_requested(&image, Some(&uc_layout())));
+        // Same image without a disk layout ⇒ not requested.
+        assert!(!crate::uc::uc_requested(&image, None));
+        // Non-UC base with roles ⇒ not requested.
+        let mut native = test_support::sample_image();
+        native.base.name = "my-base".into();
+        assert!(!crate::uc::uc_requested(&native, Some(&uc_layout())));
+        // UC base, no role-marked partition ⇒ not requested.
+        let mut plain = uc_layout();
+        for p in &mut plain.partitions {
+            p.role.clear();
+        }
+        assert!(!crate::uc::uc_requested(&image, Some(&plain)));
     }
 
     #[test]
@@ -6612,7 +6737,7 @@ RequiredBy=boot-complete.target
                 ab: false,
             };
             let img_path = work.path().join("disk.img");
-            create_partitions(&runner, &img_path, &layout, 580).unwrap();
+            create_partitions(&runner, &img_path, &layout, 580, None).unwrap();
             assert!(img_path.is_file(), "dd formed the raw image");
 
             let extents = read_partition_extents(&runner, &img_path, 3).unwrap();

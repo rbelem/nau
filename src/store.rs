@@ -85,6 +85,21 @@ impl ResolvedSnap {
 
 // ── Store client ──
 
+/// `SHUTTLE_SNAP_IDS` override: `name=id` pairs (comma/whitespace
+/// separated), consulted before any store query.
+fn env_snap_id(name: &str) -> Option<String> {
+    let spec = std::env::var("SHUTTLE_SNAP_IDS").ok()?;
+    for pair in spec.split([',', ' ', '\t']) {
+        let pair = pair.trim();
+        if let Some((n, id)) = pair.split_once('=') {
+            if n.trim() == name && !id.trim().is_empty() {
+                return Some(id.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Client for querying and downloading from the Snap Store.
 pub struct StoreClient;
 
@@ -124,6 +139,24 @@ impl StoreClient {
     /// (no store query needed). Otherwise it queries the store.
     pub fn resolve(pin: &SnapRef, channel: &str, arch: &str) -> miette::Result<ResolvedSnap> {
         Self::resolve_with(&crate::command::RealRunner, pin, channel, arch)
+    }
+
+    /// The store snap-id for one snap name (the top-level `snap-id` of the
+    /// `/v2/snaps/info` response) — the identity UC model assertions and
+    /// seed.yaml carry for every system snap. `SHUTTLE_SNAP_IDS` entries
+    /// (`name=id`, comma- or whitespace-separated) override per-name, so an
+    /// offline build can pin the identities it already knows.
+    pub fn snap_id_with(runner: &dyn CommandRunner, name: &str) -> miette::Result<String> {
+        if let Some(id) = env_snap_id(name) {
+            return Ok(id);
+        }
+        let info = Self::query_info_with(runner, name)?;
+        info.snap_id.ok_or_else(|| {
+            miette::miette!(
+                "store returned no snap-id for '{name}' — the UC seed identifies every \
+                 system snap by snap-id (or set SHUTTLE_SNAP_IDS='{name}=<snap-id>')"
+            )
+        })
     }
 
     /// [`Self::resolve`] with the host tool runner injected.

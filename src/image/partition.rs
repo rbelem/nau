@@ -184,13 +184,18 @@ pub(crate) fn parted_mkpart_args(
     ]
 }
 
-/// Create the raw disk image with dd, lay out partitions with parted, and
-/// set the ESP flag on the first partition.
+/// Create the raw disk image with dd and lay out partitions with parted.
+/// The GPT esp flag (the EFI System PARTITION TYPE GUID — what firmware
+/// scans for when it looks for `\EFI\boot\bootx64.efi`) lands on
+/// `esp_partition` when given (the UC path marks `ubuntu-seed`, which is
+/// the pc gadget's ESP), else on the first partition (the historical
+/// simplified-path ESP).
 pub(crate) fn create_partitions(
     runner: &dyn CommandRunner,
     img_path: &Path,
     layout: &DiskLayout,
     total_mb: u64,
+    esp_partition: Option<usize>,
 ) -> miette::Result<()> {
     let argv: Vec<String> = vec![
         "dd".to_string(),
@@ -245,8 +250,8 @@ pub(crate) fn create_partitions(
             ));
         }
 
-        if part_num == 0 {
-            set_esp_flag(runner, img_path);
+        if part_num == esp_partition.unwrap_or(0) {
+            set_esp_flag(runner, img_path, part_num + 1);
         }
 
         part_start_mb = end_mb;
@@ -306,20 +311,21 @@ fn reserved_after_mb(layout: &DiskLayout, index: usize) -> u64 {
     later + swap
 }
 
-/// Set the GPT esp flag on partition 1; a failure is reported but not
-/// fatal (matching the historical behavior — the vfat fs still works).
-pub(crate) fn set_esp_flag(runner: &dyn CommandRunner, img_path: &Path) {
+/// Set the GPT esp flag on `partition` (1-based); a failure is reported
+/// but not fatal (matching the historical behavior — the vfat fs still
+/// works).
+pub(crate) fn set_esp_flag(runner: &dyn CommandRunner, img_path: &Path, partition: usize) {
     let argv = vec![
         "parted".to_string(),
         "-s".to_string(),
         img_path.to_string_lossy().into_owned(),
         "set".to_string(),
-        "1".to_string(),
+        partition.to_string(),
         "esp".to_string(),
         "on".to_string(),
     ];
     if !runner.run(&argv).is_ok_and(|o| o.code == 0) {
-        eprintln!("  ⚠ failed to set ESP flag");
+        eprintln!("  ⚠ failed to set ESP flag on partition {partition}");
     }
 }
 
@@ -529,6 +535,7 @@ pub(crate) struct PopulateCtx<'a> {
 /// Ubuntu Core seed/role-model context threaded into the populate stage.
 /// Carries the staged seed tree (`ubuntu-seed`) and boot tree
 /// (`ubuntu-boot` with `device/modeenv`) built by [`setup_uc_context`].
+#[derive(Debug)]
 pub(crate) struct UcCtx {
     pub(crate) seed_stage: PathBuf,
     pub(crate) boot_stage: PathBuf,
@@ -868,19 +875,30 @@ pub(crate) fn populate_side_partition(
         SideRoute::Piboot(stage) => build_piboot_partition(runner, &part_file, part, stage)?,
         SideRoute::Esp => build_esp_partition(runner, ctx, &part_file, part)?,
         SideRoute::Data => build_data_partition(runner, ctx, &part_file, part, extent)?,
+        SideRoute::Skip => {
+            eprintln!(
+                "  ✓ {}: left unformatted (UC gap partition — snapd's gadget \
+                 validation wants it present, not populated)",
+                part.name
+            );
+            return Ok(());
+        }
     }
     splice_into(&ctx.scratch_dir.join("disk.img"), &part_file, extent)
 }
 
 /// The routing decision for one non-root partition: UC role trees, the
 /// state partition, the piboot firmware partition (#87), the systemd-boot
-/// ESP, or a plain data partition.
+/// ESP, a plain data partition, or untouched (UC partitions outside the
+/// role model — e.g. a BIOS Boot gap — get no filesystem from the build,
+/// exactly like ubuntu-image leaves them).
 enum SideRoute<'a> {
     Uc(&'a Path),
     State,
     Piboot(&'a Path),
     Esp,
     Data,
+    Skip,
 }
 
 fn route_side_partition<'a>(
@@ -897,8 +915,16 @@ fn route_side_partition<'a>(
     if let Some(stage) = ctx.pi_boot_stage.filter(|_| part.fs == "vfat") {
         return SideRoute::Piboot(stage);
     }
-    if index == 0 && part.fs == "vfat" {
+    // On a UC image the first vfat partition is NOT a systemd-boot ESP —
+    // the gadget chain owns every boot asset. Only the simplified path
+    // installs one. (The remaining UC gap partitions — a BIOS Boot, say —
+    // are skipped: snapd's gadget validation wants them PRESENT, not
+    // formatted.)
+    if index == 0 && part.fs == "vfat" && ctx.uc.is_none() {
         return SideRoute::Esp;
+    }
+    if ctx.uc.is_some() {
+        return SideRoute::Skip;
     }
     SideRoute::Data
 }
@@ -1062,7 +1088,9 @@ pub(crate) fn build_esp_partition(
 }
 
 /// mkfs + populate one partition from a dedicated staged tree (the UC seed
-/// or boot tree) through `mkfs.ext4 -d`. Unlike the historical
+/// or boot tree). The seed partition is VFAT (for the pc gadget
+/// `ubuntu-seed` IS the ESP) and formats + populates through mtools; the
+/// ext4 `ubuntu-boot` goes through `mkfs.ext4 -d`. Unlike the historical
 /// warn-not-fatal side-partition behavior, a UC seed/boot populate failure
 /// is FATAL: an `ubuntu-seed`/`ubuntu-boot` that cannot be read would leave
 /// snap-bootstrap without a model/seed/modeenv and stop at `cannot detect
@@ -1075,16 +1103,30 @@ pub(crate) fn build_staged_partition(
     extent: &PartitionExtent,
     identity: &str,
 ) -> miette::Result<()> {
-    build_ext4_partition(
-        runner,
-        part_file,
-        stage,
-        part,
-        extent,
-        false,
-        Some(identity),
-    )
-    .wrap_err_with(|| format!("UC {} partition '{}' populate failed", part.fs, part.name))?;
+    match part.fs.as_str() {
+        "vfat" => {
+            mkfs_vfat_partition(runner, part_file, part).wrap_err_with(|| {
+                format!("UC {} partition '{}' mkfs failed", part.fs, part.name)
+            })?;
+            mtools_populate_vfat(runner, part_file, stage).wrap_err_with(|| {
+                format!("UC {} partition '{}' populate failed", part.fs, part.name)
+            })?;
+        }
+        _ => {
+            build_ext4_partition(
+                runner,
+                part_file,
+                stage,
+                part,
+                extent,
+                false,
+                Some(identity),
+            )
+            .wrap_err_with(|| {
+                format!("UC {} partition '{}' populate failed", part.fs, part.name)
+            })?;
+        }
+    }
     eprintln!("  ✓ {}: {} populated (UC staged tree)", part.name, part.fs);
     Ok(())
 }
@@ -1202,19 +1244,31 @@ pub(crate) fn uc_role_for_partlabel(label: &str) -> Option<&'static str> {
 ///   (`role = "system-seed"` … or a `ubuntu-*` name).
 ///
 /// When active, role-marked partitions are remapped to their UC PARTLABEL
-/// (`ubuntu-seed`/`ubuntu-boot`/`ubuntu-data`) — the remap runs BEFORE
-/// partitioning so the parted-created GPT PARTLABELs come out correct — and
-/// the seed tree (`seed.yaml` + signed model assertion) and boot tree
+/// (`ubuntu-seed`/`ubuntu-boot`/`ubuntu-data`/`ubuntu-save`) — the remap
+/// runs BEFORE partitioning so the parted-created GPT PARTLABELs come out
+/// correct — and the full seed tree (model assertion + seed.yaml + snap
+/// payloads + kernel.efi + grubenv + the gadget's EFI boot assets + snapd's
+/// first-boot grub config + the account trust anchor) and the boot tree
 /// (`device/modeenv`) are staged into scratch dirs for the populate stage.
+///
+/// Every snap in the seed must carry its store snap-id (resolved here, or
+/// overridden through `SHUTTLE_SNAP_IDS`); a kernel snap without a
+/// `kernel.efi`, a gadget snap missing its boot assets, or a seed
+/// partition with the wrong filesystem are all named, fail-closed errors.
 ///
 /// Non-UC bases, and coreN bases that mark no partition for a UC role, are
 /// returned as `Ok(None)` unchanged — the simplified path is bit-identical.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn setup_uc_context(
+    runner: &dyn CommandRunner,
     image: &ImageDeclaration,
     layout: &mut DiskLayout,
     scratch: &Path,
     arch: &str,
     resolved: &[ResolvedSnap],
+    cache_dir: &Path,
+    kernel_snap_dir: Option<&Path>,
+    has_unsquashfs: bool,
 ) -> miette::Result<Option<UcCtx>> {
     if !crate::uc::is_uc_base(&image.base.name) {
         return Ok(None);
@@ -1248,20 +1302,136 @@ pub(crate) fn setup_uc_context(
             }
         }
     }
+    assert_uc_partition_shapes(layout)?;
+
+    // UC fail-closed preconditions: the gadget-proper seed needs the full
+    // snap chain, an extracted kernel snap (for kernel.efi) and the gadget
+    // snap (for the boot assets) — every absence a named error.
+    let kernel_entry = image.kernel.as_ref().ok_or_else(|| {
+        miette::miette!(
+            "the UC seed requires a kernel snap — snapd's first boot cannot seed a \
+             model without one"
+        )
+    })?;
+    let gadget_entry = image.gadget.as_ref().ok_or_else(|| {
+        miette::miette!(
+            "the UC seed requires a gadget snap — the gadget defines the boot chain \
+             snap-bootstrap drives (model requires system-seed structure)"
+        )
+    })?;
+    let kernel_dir = kernel_snap_dir.ok_or_else(|| {
+        miette::miette!(
+            "the UC seed needs the extracted kernel snap (its kernel.efi is the \
+             first-boot chainloader) — but the kernel snap tree was not staged"
+        )
+    })?;
+    if !has_unsquashfs {
+        return Err(miette::miette!(
+            "the UC seed stages the gadget's own boot assets, which needs unsquashfs \
+             on PATH to unpack the gadget snap — install squashfs-tools and rebuild"
+        ));
+    }
+
+    // Store identities: every seed snap is identified by snap-id.
+    let snap_ids = resolve_snap_ids(runner, image, resolved)?;
+    let cache_path = |name: &str| -> miette::Result<std::path::PathBuf> {
+        let snap = resolved.iter().find(|s| s.name == name).ok_or_else(|| {
+            miette::miette!(
+                "snap '{name}' is required by the UC seed but was not resolved — add \
+                 it to the image declaration (snapd is required on UC20+)"
+            )
+        })?;
+        Ok(cache_dir.join(format!(
+            "{}_{}_{}.snap",
+            snap.name, snap.revision, snap.sha3_384
+        )))
+    };
+
+    // Seed snap list, in model order: base, snapd, kernel, gadget, extras.
+    let mut seeds = Vec::new();
+    let track = crate::image::base_track(&image.base.name);
+    let derived = |channel: &Option<String>| {
+        channel.clone().unwrap_or_else(|| match track {
+            Some(t) => format!("{t}/stable"),
+            None => "latest/stable".into(),
+        })
+    };
+    let push = |seeds: &mut Vec<crate::uc::SeedSnapFile>,
+                name: &str,
+                snap_type: &str,
+                channel: String|
+     -> miette::Result<()> {
+        let snap = resolved.iter().find(|s| s.name == name).ok_or_else(|| {
+            miette::miette!(
+                "snap '{name}' is required by the UC seed but was not resolved — add \
+                 it to the image declaration"
+            )
+        })?;
+        seeds.push(crate::uc::SeedSnapFile {
+            name: name.to_string(),
+            snap_id: snap_ids.get(name).cloned().ok_or_else(|| {
+                miette::miette!("snap '{name}' has no store snap-id for the UC seed")
+            })?,
+            revision: snap.revision,
+            channel,
+            snap_type: snap_type.to_string(),
+            path: cache_path(name)?,
+        });
+        Ok(())
+    };
+    let base_name = image.base.name.clone();
+    push(&mut seeds, &base_name, "base", derived(&None))?;
+    push(&mut seeds, "snapd", "snapd", derived(&None))?;
+    push(
+        &mut seeds,
+        &kernel_entry.snap.name,
+        "kernel",
+        derived(&kernel_entry.channel),
+    )?;
+    push(
+        &mut seeds,
+        &gadget_entry.name,
+        "gadget",
+        derived(&image.gadget_channel),
+    )?;
+    for extra in &image.extra_snaps {
+        push(&mut seeds, &extra.name, "app", derived(&None))?;
+    }
+
+    // The gadget's EFI boot assets — unpack the gadget snap and map them.
+    let gadget_file = cache_path(&gadget_entry.name)?;
+    let gadget_tree = scratch.join("uc-gadget-tree");
+    unpack_snap(runner, &gadget_file, &gadget_tree)?;
+
+    // The kernel snap's kernel.efi (the UKI grub chainloads).
+    let kernel_efi = kernel_dir.join("kernel.efi");
 
     // Build the signed model assertion and stage the seed + modeenv trees.
-    let model = crate::uc::ModelAssertion::from_image(image, arch)?;
+    let model = crate::uc::ModelAssertion::from_image(image, arch, &snap_ids)?;
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     let kp = match crate::sign::load_secret_key(&home)? {
         Some(kp) => kp,
         None => crate::sign::create_secret_key(&home)?,
     };
     let seed_stage = scratch.join("uc-seed-staging");
-    crate::uc::emit_seed(&seed_stage, image, resolved, &model, &kp)?;
     let label = crate::uc::recovery_label(image);
+    let extra_cmdline = kernel_entry.params.join(" ");
+    crate::uc::stage_seed_tree(
+        &seed_stage,
+        &crate::uc::SeedStageInputs {
+            label: &label,
+            gadget_tree: &gadget_tree,
+            gadget_assets: &crate::uc::pc_gadget_efi_assets(),
+            kernel_efi: &kernel_efi,
+            extra_cmdline: &extra_cmdline,
+            model: &model,
+            snaps: &seeds,
+            kp: &kp,
+        },
+    )?;
     let boot_stage = scratch.join("uc-boot-staging");
-    let kernel_name = image.kernel.as_ref().map(|k| k.snap.name.as_str());
-    let gadget_name = image.gadget.as_ref().map(|g| g.name.as_str());
+    let kernel_name = Some(kernel_entry.snap.name.as_str());
+    let gadget_name = Some(gadget_entry.name.as_str());
     crate::uc::emit_modeenv(
         &boot_stage,
         &label,
@@ -1270,13 +1440,103 @@ pub(crate) fn setup_uc_context(
         gadget_name,
     )?;
     eprintln!(
-        "  ✓ UC seed + modeenv staged (recovery system label {label}, key id {})",
+        "  ✓ UC seed staged (recovery system {label}, {} snaps, key id {})",
+        seeds.len(),
         kp.key_id()
     );
     Ok(Some(UcCtx {
         seed_stage,
         boot_stage,
     }))
+}
+
+/// UC partition shape contract (fail-closed): the seed partition is vfat
+/// (the pc gadget's `ubuntu-seed` IS the ESP) and every other UC partition
+/// is ext4 — snapd's install-time gadget validation compares filesystems
+/// against the gadget (`filesystems do not match: declared as X, got Y`).
+fn assert_uc_partition_shapes(layout: &DiskLayout) -> miette::Result<()> {
+    for part in &layout.partitions {
+        let Some(role) = partition_uc_role(part) else {
+            continue;
+        };
+        let want = if role == crate::uc::ROLE_SEED {
+            "vfat"
+        } else {
+            "ext4"
+        };
+        if part.fs != want {
+            return Err(miette::miette!(
+                "UC partition '{}' (role {role}) must be {want}, declared as '{}' — \
+                 snapd's gadget validation compares partition filesystems against the \
+                 gadget and a mismatch is a first-boot install failure",
+                part.name,
+                part.fs
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the store snap-id for every snap the seed carries: base, kernel,
+/// gadget, snapd and the declared extras. Fails closed naming the first
+/// snap that cannot be identified.
+fn resolve_snap_ids(
+    runner: &dyn CommandRunner,
+    image: &ImageDeclaration,
+    resolved: &[ResolvedSnap],
+) -> miette::Result<std::collections::BTreeMap<String, String>> {
+    let mut ids = std::collections::BTreeMap::new();
+    let mut names: Vec<&str> = vec![&image.base.name, "snapd"];
+    if let Some(ref k) = image.kernel {
+        names.push(&k.snap.name);
+    }
+    if let Some(ref g) = image.gadget {
+        names.push(&g.name);
+    }
+    for extra in &image.extra_snaps {
+        names.push(&extra.name);
+    }
+    for name in names {
+        if ids.contains_key(name) {
+            continue;
+        }
+        if !resolved.iter().any(|s| s.name == *name) {
+            return Err(miette::miette!(
+                "snap '{name}' is required by the UC seed but was not resolved — add \
+                 it to the image declaration"
+            ));
+        }
+        let id = crate::store::StoreClient::snap_id_with(runner, name)?;
+        eprintln!("  ✓ snap-id {name} = {id}");
+        ids.insert(name.to_string(), id);
+    }
+    Ok(ids)
+}
+
+/// Unpack a snap file into a directory with unsquashfs (the runner resolves
+/// it from PATH; presence was checked by the caller).
+fn unpack_snap(runner: &dyn CommandRunner, snap: &Path, dest: &Path) -> miette::Result<()> {
+    std::fs::create_dir_all(dest)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("creating {}", dest.display()))?;
+    let argv = vec![
+        "unsquashfs".to_string(),
+        "-f".to_string(),
+        "-d".to_string(),
+        dest.to_string_lossy().into_owned(),
+        snap.to_string_lossy().into_owned(),
+    ];
+    let out = runner
+        .run(&argv)
+        .map_err(|e| miette::miette!("unsquashfs not found: {e}"))?;
+    if out.code != 0 {
+        return Err(miette::miette!(
+            "unsquashfs failed unpacking {}: {}",
+            snap.display(),
+            out.stderr.trim()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
