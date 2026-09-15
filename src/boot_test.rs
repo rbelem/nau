@@ -1720,7 +1720,6 @@ SHUTTLE-INIT: switch-root\n\
 /usr/share/subiquity/console-conf-wrapper: line 40: snap: command not found\n\
 Press enter to configure.\n";
 
-    #[test]
     /// The core26 migration proof (issue #28 chain): the pc-kernel 26/stable
     /// (7.0) boot reaches multi-user/graphical, but systemd ≥ v250 paints the
     /// console line — the escape codes sit BETWEEN the words a marker needs.
