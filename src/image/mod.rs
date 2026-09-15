@@ -769,8 +769,9 @@ pub(crate) fn build_image_with(
 /// the root partition file is populated first, then dm-verity is formatted
 /// over the quiescent file (`veritysetup`) into an auto-appended hash
 /// partition, and the captured roothash is embedded in the UKI cmdline
-/// (explicit `systemd.verity_root_data`/`systemd.verity_root_hash`
-/// by-partuuid devices — boot needs no dm-verity type GUIDs). Every
+/// (shuttle-private `shuttle.roothash` / `shuttle.verity_data` /
+/// `shuttle.verity_hash` by-partuuid devices, issue #92 — invisible to
+/// systemd-veritysetup-generator; boot needs no dm-verity type GUIDs). Every
 /// condition that would yield an unbootable or unverifiable image —
 /// missing ukify, missing sd-stub, missing veritysetup, missing mtools or
 /// mkfs tools, no kernel payload, no root partition — fails closed, before
@@ -1279,7 +1280,8 @@ pub(crate) fn build_disk_image_with(
             set_partition_uuid(runner, &img_path, h + 1, &hash_guid)?;
         }
         let extents = read_partition_extents(runner, &img_path, expected_partitions)?;
-        // sfdisk -J reports GUIDs upper-case; compare case-insensitively.
+        // The read-back normalizes GUIDs to lowercase (#92), matching the
+        // derived values byte-exactly; compare case-insensitively anyway.
         if !extents[root_idx]
             .partuuid
             .as_deref()
@@ -2834,23 +2836,23 @@ WantedBy=multi-user.target
 
     #[test]
     fn cmdline_leaves_room_for_verity_trailer() {
-        // Future dm-verity boot appends roothash= — composition is
+        // The dm-verity boot appends shuttle.roothash= — composition is
         // programmatic from parts so the trailer lands after root=.
         let base = compose_cmdline(&["ro".to_string()], Some("abcd"), &[]);
         let full = compose_cmdline(
             &["ro".to_string()],
             Some("abcd"),
-            &["roothash=9f86d081".to_string()],
+            &["shuttle.roothash=9f86d081".to_string()],
         );
-        assert_eq!(full, format!("{base} roothash=9f86d081"));
-        assert!(full.ends_with("root=PARTUUID=abcd roothash=9f86d081"));
+        assert_eq!(full, format!("{base} shuttle.roothash=9f86d081"));
+        assert!(full.ends_with("root=PARTUUID=abcd shuttle.roothash=9f86d081"));
     }
 
     // ── dm-verity over the root partition (ADR-0011 step (c)) ──
 
     #[test]
     fn verity_cmdline_composes_root_then_roothash_then_devices() {
-        // Exact trailer shape: roothash= first, then the explicit
+        // Exact trailer shape: shuttle.roothash= first, then the explicit
         // by-partuuid data/hash devices — boot needs no dm-verity type
         // GUIDs, and every verity argument lands AFTER root=.
         let trailing = verity_trailing(
@@ -2866,14 +2868,93 @@ WantedBy=multi-user.target
         assert_eq!(
             cmdline,
             "quiet root=PARTUUID=1234abcd-00aa-bbcc-ddee-ff0011223344 \
-             roothash=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 \
-             systemd.verity_root_data=/dev/disk/by-partuuid/1234abcd-00aa-bbcc-ddee-ff0011223344 \
-             systemd.verity_root_hash=/dev/disk/by-partuuid/abcdef01-00aa-bbcc-ddee-ff0011223344"
+             shuttle.roothash=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 \
+             shuttle.verity_data=/dev/disk/by-partuuid/1234abcd-00aa-bbcc-ddee-ff0011223344 \
+             shuttle.verity_hash=/dev/disk/by-partuuid/abcdef01-00aa-bbcc-ddee-ff0011223344"
         );
         let root = cmdline.find("root=PARTUUID=").unwrap();
-        assert!(cmdline.find("roothash=").unwrap() > root, "{cmdline}");
         assert!(
-            cmdline.find("systemd.verity_root_hash=").unwrap() > root,
+            cmdline.find("shuttle.roothash=").unwrap() > root,
+            "{cmdline}"
+        );
+        assert!(
+            cmdline.find("shuttle.verity_hash=").unwrap() > root,
+            "{cmdline}"
+        );
+    }
+
+    #[test]
+    fn verity_cmdline_feeds_no_systemd_veritysetup_generator_key() {
+        // Issue #92 regression guard, redundancy half: the initramfs opens
+        // the mapping before switch-root, so the real root's
+        // systemd-veritysetup-generator must NEVER be fed — its input keys
+        // (`roothash=`, `systemd.verity_root_data=`, `systemd.verity_root_hash=`,
+        // `systemd.verity=`) would instantiate redundant root-side units
+        // that stalled verity boots 90 s and busy-failed the re-attach.
+        // Every trailer token carries the shuttle. prefix instead.
+        let trailing = verity_trailing(
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            Some("1234abcd-00aa-bbcc-ddee-ff0011223344"),
+            Some("abcdef01-00aa-bbcc-ddee-ff0011223344"),
+        );
+        let cmdline = compose_cmdline(
+            &["quiet".to_string()],
+            Some("1234abcd-00aa-bbcc-ddee-ff0011223344"),
+            &trailing,
+        );
+        for tok in &trailing {
+            assert!(
+                tok.starts_with("shuttle."),
+                "verity trailer token {tok:?} lost its shuttle. prefix — it would \
+                 feed systemd-veritysetup-generator in the real root (issue #92)"
+            );
+        }
+        for tok in cmdline.split_whitespace() {
+            assert!(
+                !tok.starts_with("roothash=")
+                    && !tok.starts_with("systemd.verity")
+                    && !tok.starts_with("rd.systemd.verity"),
+                "cmdline token {tok:?} is a systemd-veritysetup-generator key — \
+                 the /init contract must stay shuttle-private (issue #92): {cmdline}"
+            );
+        }
+    }
+
+    #[test]
+    fn verity_cmdline_by_partuuid_paths_are_lowercase() {
+        // Issue #92 regression guard, case half: udev creates
+        // /dev/disk/by-partuuid/ symlinks LOWERCASE, and systemd matches
+        // device units by verbatim path. The full pipeline — uppercase
+        // sfdisk -J read-back through extent parsing into the composed
+        // cmdline — must emit lowercase hex so nothing can regress to the
+        // 90 s uppercase device-unit stall.
+        let extents = parse_partition_extents(
+            r#"{"partitiontable":{"partitions":[
+                {"start":8192,"size":61440,
+                 "uuid":"B7046865-C340-18CD-817D-E4009F80214C"},
+                {"start":69632,"size":204800,
+                 "uuid":"97F8E4CE-855F-7CAB-AB3A-AA643A1FA0B7"}]}}"#,
+        )
+        .unwrap();
+        let trailing = verity_trailing(
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            extents[0].partuuid.as_deref(),
+            extents[1].partuuid.as_deref(),
+        );
+        let cmdline = compose_cmdline(&[], extents[0].partuuid.as_deref(), &trailing);
+        for tok in cmdline.split_whitespace() {
+            if let Some((_, uuid)) = tok.split_once("by-partuuid/") {
+                assert!(
+                    !uuid.is_empty() && uuid.chars().all(|c| !c.is_ascii_uppercase()),
+                    "by-partuuid hex must be lowercase (udev symlink case): {tok:?}"
+                );
+            }
+        }
+        // Positive: both partitions are referenced, by the lowercase form.
+        assert!(
+            cmdline.contains("root=PARTUUID=b7046865-c340-18cd-817d-e4009f80214c")
+                && cmdline.contains("shuttle.verity_data=/dev/disk/by-partuuid/b7046865-c340-18cd-817d-e4009f80214c")
+                && cmdline.contains("shuttle.verity_hash=/dev/disk/by-partuuid/97f8e4ce-855f-7cab-ab3a-aa643a1fa0b7"),
             "{cmdline}"
         );
     }
@@ -2887,9 +2968,9 @@ WantedBy=multi-user.target
         assert_eq!(
             trailing,
             vec![
-                format!("roothash={hash}"),
-                format!("systemd.verity_root_data=/dev/disk/by-partuuid/{NIL_PARTUUID}"),
-                format!("systemd.verity_root_hash=/dev/disk/by-partuuid/{NIL_PARTUUID}"),
+                format!("shuttle.roothash={hash}"),
+                format!("shuttle.verity_data=/dev/disk/by-partuuid/{NIL_PARTUUID}"),
+                format!("shuttle.verity_hash=/dev/disk/by-partuuid/{NIL_PARTUUID}"),
             ]
         );
     }
@@ -5549,9 +5630,12 @@ RequiredBy=boot-complete.target
         assert_eq!(extents.len(), 3);
         assert_eq!(extents[0].start_bytes, 8192 * 512);
         assert_eq!(extents[0].size_bytes, 61440 * 512);
+        // sfdisk -J reports GUIDs upper-case; the read-back normalizes to
+        // lowercase — every string consumer (UKI cmdline by-partuuid paths,
+        // manifest) must match udev's lowercase symlinks byte-for-byte (#92).
         assert_eq!(
             extents[0].partuuid.as_deref(),
-            Some("ECEBC506-9E2D-4A62-9B0D-3B17F8A41C10")
+            Some("ecebc506-9e2d-4a62-9b0d-3b17f8a41c10")
         );
         // Index = parted partition number - 1, in table order.
         assert_eq!(extents[1].start_bytes, 69632 * 512);

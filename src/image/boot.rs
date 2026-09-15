@@ -1525,8 +1525,8 @@ pub(crate) fn uki_filename(image: &ImageDeclaration) -> String {
 
 /// Compose the UKI kernel command line from parts — never one opaque
 /// string. A UKI's `.cmdline` section is immutable once built, and dm-verity
-/// boot (ADR-0011 step (c)) appends `roothash=` plus the explicit verity
-/// device arguments ([`verity_trailing`]) and Secure Boot will later sign
+/// boot (ADR-0011 step (c)) appends `shuttle.roothash=` plus the explicit
+/// verity device arguments ([`verity_trailing`]) and Secure Boot will later sign
 /// the result, so composition stays programmatic: declared kernel params
 /// first (user intent), then the `root=` argument derived from the target
 /// root partition, then the trailing verity args (appended last).

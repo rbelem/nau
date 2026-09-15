@@ -16,11 +16,12 @@ treated as an opaque component and handed through.
 The first real build with `pc-kernel` rev 3654 proved the remaining blocker. The
 snap's `.initrd` is Canonical's **snap-bootstrap** userspace — it mounts a
 writable `ubuntu-data` and never verifies a root device. It therefore cannot
-honor shuttle's kernel command line (`root=PARTUUID=<u> roothash=<h>
-systemd.verity_root_data=/dev/disk/by-partuuid/<u>
-systemd.verity_root_hash=/dev/disk/by-partuuid/<u>`; see `verity_trailing` in
-`src/image/verity.rs`), which is the integrity binding ADR-0025 exists to
-protect. The ADR-0024 §1 initrd-module gate correctly failed the build for the
+honor shuttle's kernel command line (`root=PARTUUID=<u> shuttle.roothash=<h>
+shuttle.verity_data=/dev/disk/by-partuuid/<u>
+shuttle.verity_hash=/dev/disk/by-partuuid/<u>`; see `verity_trailing` in
+`src/image/verity.rs` — shuttle-private keys, issue #92, so the real root's
+systemd-veritysetup-generator is never fed), which is the integrity binding
+ADR-0025 exists to protect. The ADR-0024 §1 initrd-module gate correctly failed the build for the
 same reason: `CONFIG_DM_VERITY=m` on the audited kernel, but Canonical's initrd
 carries no `dm-verity.ko` (it carries `dm-crypt.ko` instead).
 

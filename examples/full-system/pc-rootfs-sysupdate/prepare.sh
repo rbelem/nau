@@ -122,12 +122,12 @@ extract_payload() { # $1 = image path, $2 = version, $3 = payload dest dir
     rm -f "$dest/.cmdline"
     data_guid=$(CMDLINE="$cmdline" python3 - <<'PY' | tr 'A-F' 'a-f'
 import os, re
-print(re.search(r"systemd\.verity_root_data=/dev/disk/by-partuuid/([0-9a-fA-F-]+)", os.environ["CMDLINE"]).group(1))
+print(re.search(r"shuttle\.verity_data=/dev/disk/by-partuuid/([0-9a-fA-F-]+)", os.environ["CMDLINE"]).group(1))
 PY
     )
     roothash=$(CMDLINE="$cmdline" python3 - <<'PY'
 import os, re
-print(re.search(r"roothash=([0-9a-f]{64})", os.environ["CMDLINE"]).group(1))
+print(re.search(r"shuttle\.roothash=([0-9a-f]{64})", os.environ["CMDLINE"]).group(1))
 PY
     )
     echo "  cmdline: $cmdline"

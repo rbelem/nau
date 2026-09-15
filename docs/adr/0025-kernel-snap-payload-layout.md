@@ -57,7 +57,7 @@ already the boot asset, not a set of components.
    internal shape.
 
 **Rationale (the decisive reason).** shuttle's per-image kernel command line —
-`root=PARTUUID=<uuid>` and the dm-verity `roothash=<hash>` — is the integrity
+`root=PARTUUID=<uuid>` and the dm-verity `shuttle.roothash=<hash>` — is the integrity
 binding (ADR-0011 step (c); `VERIFY_ROOTHASH_SIG` is absent from the audited
 kernels). It must live inside the signed UKI. Adopting `kernel.efi` as-is would
 force that command line into bootloader-supplied `LoadOptions` on the mutable,

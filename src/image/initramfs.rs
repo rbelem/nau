@@ -1,9 +1,10 @@
 //! Native initramfs construction (issue #75).
 //!
 //! A kernel that follows the native verity contract (`root=PARTUUID=…` plus
-//! `roothash=` and the explicit `systemd.verity_root_data` / `_hash`
-//! devices) needs an initramfs that mounts that root read-only and
-//! `switch_root`s into it. A stock Ubuntu Core `pc-kernel` snap ships
+//! the shuttle-private `shuttle.roothash` and `shuttle.verity_data` /
+//! `_hash` devices, issue #92) needs an initramfs that mounts that root
+//! read-only and `switch_root`s into it. A stock Ubuntu Core `pc-kernel`
+//! snap ships
 //! Canonical's snap-bootstrap initramfs instead, which mounts a writable
 //! `ubuntu-data` and never verifies a shuttle root, so shuttle builds its
 //! own.
@@ -939,7 +940,7 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
                 name: "etc/shuttle.conf",
                 kind: CpioKind::File {
                     mode: 0o644,
-                    data: b"root=PARTUUID=x roothash=deadbeef\n",
+                    data: b"root=PARTUUID=x shuttle.roothash=deadbeef\n",
                 },
             },
             CpioEntry {

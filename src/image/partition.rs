@@ -448,10 +448,17 @@ pub(crate) fn parse_partition_extents(json: &str) -> miette::Result<Vec<Partitio
             Ok(PartitionExtent {
                 start_bytes: sector("start")? * sector_size,
                 size_bytes: sector("size")? * sector_size,
+                // sfdisk -J reports GUIDs upper-case; normalize to lowercase
+                // at the read-back source (#92). GPT GUIDs are
+                // case-insensitive, but every string consumer downstream —
+                // the UKI cmdline's root=PARTUUID= and the verity
+                // by-partuuid device paths, the signed manifest — must be
+                // byte-identical to udev's LOWERCASE /dev/disk/by-partuuid/
+                // symlinks, or userspace device-unit matching misses.
                 partuuid: part
                     .get("uuid")
                     .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
+                    .map(|u| u.to_ascii_lowercase()),
             })
         })
         .collect()

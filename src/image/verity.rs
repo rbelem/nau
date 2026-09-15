@@ -419,19 +419,33 @@ pub(crate) fn parse_roothash(stdout: &str) -> miette::Result<String> {
 /// type GUIDs and the parted flow is untouched. Unresolvable PARTUUIDs fall
 /// back to the documented nil-GUID placeholder — loud failure at boot, no
 /// silent boot from the wrong volume.
+///
+/// All three keys are SHUTTLE-PRIVATE (`shuttle.*`), not the systemd
+/// spelling (`roothash=`, `systemd.verity_root_data=`, `systemd.verity_root_hash=`,
+/// issue #92). The kernel-embedded initramfs `/init` is the only contract
+/// consumer: it opens the dm-verity mapping BEFORE switch-root, so any
+/// root-side `systemd-veritysetup-generator` unit would be redundant —
+/// a guaranteed busy-fail re-attaching the live mapping — and when the
+/// contract rode the systemd keys, that generator ALSO instantiated device
+/// units from these paths; a case mismatch against udev's lowercase
+/// by-partuuid symlinks stalled every verity boot 90 s. Shuttle-private
+/// keys are invisible to the generator: no units, no stall, no busy-fail,
+/// and `veritysetup.target` is reached empty (the no-verity pi-image boot
+/// already proved the clean path). Device paths stay lowercase
+/// (see `parse_partition_extents`) to match udev byte-for-byte.
 pub(crate) fn verity_trailing(
     roothash: &str,
     root_partuuid: Option<&str>,
     hash_partuuid: Option<&str>,
 ) -> Vec<String> {
     vec![
-        format!("roothash={roothash}"),
+        format!("shuttle.roothash={roothash}"),
         format!(
-            "systemd.verity_root_data=/dev/disk/by-partuuid/{}",
+            "shuttle.verity_data=/dev/disk/by-partuuid/{}",
             root_partuuid.unwrap_or(NIL_PARTUUID)
         ),
         format!(
-            "systemd.verity_root_hash=/dev/disk/by-partuuid/{}",
+            "shuttle.verity_hash=/dev/disk/by-partuuid/{}",
             hash_partuuid.unwrap_or(NIL_PARTUUID)
         ),
     ]
