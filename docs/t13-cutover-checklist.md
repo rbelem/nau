@@ -189,40 +189,22 @@ env | grep -i devbox    # must be empty
 
 ### 4.3 Secrets (move, don't lose)
 
-The secrets loader lives inside the devbox init-hook today. Keep it
-working with a standalone snippet — `~/.bashrc.d/20-secrets.sh`:
-
-```bash
-# Secrets: source the SM cache, regenerating from ~/.config/bws/sm.ini
-# (bws comes from the pod farm). Mirrors the old devbox init-hook block.
-_sm_cache="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/devbox-secrets.sh}"
-if [ -n "$XDG_RUNTIME_DIR" ] && [ ! -f "$_sm_cache" ] && command -v bws >/dev/null 2>&1 \
-   && [ -f "$HOME/.config/bws/sm.ini" ] && [ -n "${BWS_ACCESS_TOKEN:-}" ]; then
-  while IFS= read -r _k || [ -n "$_k" ]; do
-    _k="${_k%%#*}"; _k="$(printf '%s' "$_k" | tr -d '[:space:]')"
-    [ -z "$_k" ] || { _sm_secrets=1; break; }
-  done < "$HOME/.config/bws/sm.ini"
-fi
-[ -f "$_sm_cache" ] && . "$_sm_cache"
-unset _sm_cache _k
-```
-
-(Or the equivalent one-liner the owner prefers; `BWS_ACCESS_TOKEN` already
-comes from `~/.bashrc.d/10-bit.sh`, which stays.)
+**The snippet originally drafted here was wrong** (it parsed the manifest
+but never called `bws`, and would leave the cache empty on a fresh boot).
+The real port of the devbox init-hook logic — bws `--output env`
+regeneration, libsecret `BWS_ACCESS_TOKEN` fallback, `[aliases]`
+re-exporting — lives in `examples/cutover/90-shuttle.sh` together with the
+§4.4 init lines, the pod-python venv setup, and the nix-ld cache. Deploy it
+as `~/.bashrc.d/90-shuttle.sh` (one file, proven ordering: farm first so
+`bws`/`blesh-share`/prompt binaries resolve from the pod).
 
 ### 4.4 Shell init lines (starship/zoxide/fzf/atuin/vi)
 
-Append to `~/.bashrc.d/30-prompt.sh` (binaries resolve from the pod farm
-once §4.2 is in place):
-
-```bash
-command -v starship >/dev/null 2>&1 && eval "$(starship init bash --print-full-init)"
-command -v zoxide   >/dev/null 2>&1 && eval "$(zoxide init bash)" && alias cd='z'
-command -v fzf      >/dev/null 2>&1 && source <(fzf --bash)
-command -v atuin    >/dev/null 2>&1 && eval "$(atuin init --disable-up-arrow bash)"
-set -o vi
-export SUDO_EDITOR=vi
-```
+Carried by the same `examples/cutover/90-shuttle.sh` (§4.3). Two deltas
+from the devbox init-hook: `SUDO_EDITOR=vi` (devbox's nvim path dies with
+the global profile; neovim is an unported pool gap, §5.1), and the
+`XDG_DATA_DIRS` completions prepend is dropped (pods don't surface a
+`share/` tree, §5.6).
 
 ### 4.5 Uninstall devbox-global (only after §4.2 is proven)
 
