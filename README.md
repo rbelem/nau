@@ -6,6 +6,18 @@ Inspired by Nix's declarative reproducibility and Neovim's Lua-based
 configurability. Define any Snap package with a simple Lua file — no Snapcraft
 YAML needed. Pins all inputs by content hash for reproducible builds.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rbelem/shuttle/main/install.sh | bash
+```
+
+Installs to `~/.local/bin/shuttle` and `~/.local/share/shuttle/repo` (managed
+source clone, used for updates — re-run the installer to update). Bootstraps
+rustup if cargo is missing and installs distro packages (`squashfs-tools`,
+`bubblewrap`) with sudo when absent; `--skip-deps` to manage those yourself.
+Linux first (any distro, NixOS, WSL2); macOS is not supported yet.
+
 ## Quickstart
 
 ```bash
