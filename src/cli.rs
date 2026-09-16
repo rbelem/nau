@@ -160,8 +160,14 @@ pub enum Command {
         json: bool,
     },
 
-    /// Check system readiness (required tools)
-    Doctor,
+    /// Check system readiness (required tools). The default gates the full
+    /// surface; --pod gates only what the pod verbs need (issue #97).
+    Doctor {
+        /// Gate only the pod surface (pod tools + build toolchain) —
+        /// image tools like ukify are not required on pod-only machines.
+        #[arg(long)]
+        pod: bool,
+    },
 
     /// Validate a Lua definition without building: bounded subprocess eval
     /// plus Rust-side schema checks, printing every diagnostic (ADR-0010

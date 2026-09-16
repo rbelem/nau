@@ -142,7 +142,7 @@ fn main() -> miette::Result<()> {
 
         Command::Index(sub) => cmd_index(sub),
 
-        Command::Doctor => cmd_doctor(),
+        Command::Doctor { pod } => cmd_doctor(pod),
 
         Command::Check { file, json } => {
             shuttle::output::set_mode(json);
@@ -1850,8 +1850,12 @@ fn build_one_image(
 
 // ── Doctor command ──
 
-fn cmd_doctor() -> miette::Result<()> {
-    let checks = shuttle::doctor::run_all();
+fn cmd_doctor(pod: bool) -> miette::Result<()> {
+    let checks = if pod {
+        shuttle::doctor::run_pod()
+    } else {
+        shuttle::doctor::run_all()
+    };
     shuttle::doctor::print_report(&checks);
     if !shuttle::doctor::all_ok(&checks) {
         std::process::exit(1);

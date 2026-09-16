@@ -1,7 +1,8 @@
 //! System readiness checks — `shuttle doctor`.
 //!
 //! Verifies that all required tools are installed and working before
-//! attempting a build. Run via `shuttle doctor`.
+//! attempting a build. Run via `shuttle doctor` (full surface) or
+//! `shuttle doctor --pod` (pod-verb surface only, issue #97).
 
 use std::path::{Path, PathBuf};
 
@@ -86,7 +87,61 @@ const SANDBOX_TOOLS: [(&str, &str); 3] = [
     ("cc", "add gcc to devbox.json packages (or apt install gcc)"),
 ];
 
-/// Run all system checks. Returns a list of results.
+/// The pod-surface tools gated in every scope, with the distro-package
+/// fix each missing tool names (#97) — mirroring install.sh's `pkg_for`
+/// map. `bwrap` is checked separately ([`check_bwrap`], it also probes
+/// user namespaces).
+const POD_TOOLS: [(&str, &str); 4] = [
+    (
+        "mksquashfs",
+        "install squashfs-tools (e.g. apt install squashfs-tools)",
+    ),
+    (
+        "unsquashfs",
+        "install squashfs-tools (e.g. apt install squashfs-tools)",
+    ),
+    ("curl", "install curl (e.g. apt install curl)"),
+    ("tar", "install tar (e.g. apt install tar)"),
+];
+
+/// Pod-scope build toolchain (#97): the sandbox tools plus the C++
+/// driver the vendored Luau analyzer needs. The cc/c++ fixes name the
+/// distro package per install.sh's map (g++, gcc-c++ on dnf/zypper);
+/// `sh`/`make` have no install.sh entry, so they keep the sandbox
+/// phrasing.
+const POD_SANDBOX_TOOLS: [(&str, &str); 4] = [
+    (
+        "sh",
+        "the sandbox runs every build via sh — /bin or /usr/bin must provide it",
+    ),
+    (
+        "make",
+        "add gnumake to devbox.json packages (or install make system-wide)",
+    ),
+    (
+        "cc",
+        "install g++ (e.g. apt install g++, dnf install gcc-c++)",
+    ),
+    (
+        "c++",
+        "install g++ (e.g. apt install g++, dnf install gcc-c++)",
+    ),
+];
+
+/// Which tool surface `doctor` gates (issue #97).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Default: the pod surface plus the image-verb surface (ukify,
+    /// the sd-stub, veritysetup, systemd-sysupdate, the mksquashfs
+    /// SOURCE_DATE_EPOCH gate).
+    Full,
+    /// `--pod`: only what the pod verbs need — the pod tools plus the
+    /// build toolchain. A healthy pod-only machine passes even with no
+    /// image tools installed.
+    Pod,
+}
+
+/// Run the full system checks (the default scope). Returns a list of results.
 ///
 /// Host-only checks live here. Checks that need an [`ImageDeclaration`] (the
 /// state-partition readiness and the initrd module inventory) cannot run in
@@ -95,25 +150,39 @@ const SANDBOX_TOOLS: [(&str, &str); 3] = [
 /// the image in hand, mirroring [`audit_kernel_verity_config`]
 /// (`src/image/mod.rs`). Both never fail the build; they add a report line.
 pub fn run_all() -> Vec<Check> {
-    let mut checks = vec![
-        check_cmd(
-            "mksquashfs",
-            "install squashfs-tools (e.g. apt install squashfs-tools)",
-        ),
-        check_cmd(
-            "unsquashfs",
-            "install squashfs-tools (e.g. apt install squashfs-tools)",
-        ),
-        check_cmd("curl", "install curl (e.g. apt install curl)"),
-        check_cmd("tar", "install tar (e.g. apt install tar)"),
-        check_bwrap(),
-        check_squashfs_version(),
-        check_ukify(),
-        check_efi_stub(),
-        check_veritysetup(),
-        check_sysupdate_prereqs(),
-    ];
-    checks.extend(check_sandbox_tools_with(&snap::path_entries()));
+    run_scoped(Scope::Full)
+}
+
+/// Run the pod-verb checks (`shuttle doctor --pod`, issue #97): the pod
+/// tools (mksquashfs/unsquashfs, bwrap, curl, tar) plus the sandbox
+/// build toolchain (sh, make, cc, c++). Image-verb checks are skipped —
+/// the installer's verify step gates on this scope, so a machine with
+/// the pod set but no image tools reads as ready.
+pub fn run_pod() -> Vec<Check> {
+    run_scoped(Scope::Pod)
+}
+
+/// Run the checks for one [`Scope`].
+fn run_scoped(scope: Scope) -> Vec<Check> {
+    let mut checks: Vec<Check> = POD_TOOLS
+        .iter()
+        .map(|(tool, fix)| check_cmd(tool, fix))
+        .collect();
+    checks.push(check_bwrap());
+    if scope == Scope::Full {
+        checks.extend([
+            check_squashfs_version(),
+            check_ukify(),
+            check_efi_stub(),
+            check_veritysetup(),
+            check_sysupdate_prereqs(),
+        ]);
+    }
+    let toolchain: &[(&str, &str)] = match scope {
+        Scope::Full => &SANDBOX_TOOLS,
+        Scope::Pod => &POD_SANDBOX_TOOLS,
+    };
+    checks.extend(check_sandbox_tools_with(toolchain, &snap::path_entries()));
     checks
 }
 
@@ -1032,9 +1101,10 @@ fn check_sandbox_tool(tool: &str, fix: &str, entries: &[PathBuf]) -> Check {
     }
 }
 
-/// Check the sandbox build toolchain against sandbox-visible PATH entries.
-fn check_sandbox_tools_with(entries: &[PathBuf]) -> Vec<Check> {
-    SANDBOX_TOOLS
+/// Check one set of sandbox build tools against sandbox-visible PATH
+/// entries.
+fn check_sandbox_tools_with(tools: &[(&str, &str)], entries: &[PathBuf]) -> Vec<Check> {
+    tools
         .iter()
         .map(|(tool, fix)| check_sandbox_tool(tool, fix, entries))
         .collect()
@@ -1310,7 +1380,7 @@ mod tests {
             PathBuf::from("/nix/store/0000-garbage-collected/bin"),
         ];
 
-        let checks = check_sandbox_tools_with(&entries);
+        let checks = check_sandbox_tools_with(&SANDBOX_TOOLS, &entries);
         let make = checks
             .iter()
             .find(|c| c.name == "sandbox: make")
@@ -1331,7 +1401,7 @@ mod tests {
     #[test]
     fn doctor_reports_absent_sandbox_tool_as_missing() {
         let entries = vec![PathBuf::from("/nix/store/0000-garbage-collected/bin")];
-        let checks = check_sandbox_tools_with(&entries);
+        let checks = check_sandbox_tools_with(&SANDBOX_TOOLS, &entries);
         let make = checks
             .iter()
             .find(|c| c.name == "sandbox: make")
@@ -1975,5 +2045,185 @@ CONFIG_EXT4_FS=y
         // keep reporting a non-Ok result through all_ok.
         print_report(&with_builder);
         assert!(!all_ok(&with_builder));
+    }
+
+    // ── Pod scope (#97) ──
+
+    /// Every check name the pod scope may produce: the pod surface tools
+    /// plus the sandbox build toolchain (`sandbox:`-prefixed).
+    const POD_SCOPE_NAMES: [&str; 9] = [
+        "mksquashfs",
+        "unsquashfs",
+        "bwrap",
+        "curl",
+        "tar",
+        "sandbox: sh",
+        "sandbox: make",
+        "sandbox: cc",
+        "sandbox: c++",
+    ];
+
+    /// The image-verb check names that must never appear in pod scope.
+    const IMAGE_SCOPE_NAMES: [&str; 4] = [
+        "ukify",
+        "linuxx64.efi.stub",
+        "veritysetup",
+        "systemd-sysupdate",
+    ];
+
+    #[test]
+    fn pod_scope_gates_exactly_the_pod_surface() {
+        let pod = run_pod();
+        for name in POD_SCOPE_NAMES {
+            assert!(
+                pod.iter().any(|c| c.name == name),
+                "pod scope must gate {name}"
+            );
+        }
+        for name in IMAGE_SCOPE_NAMES {
+            assert!(
+                !pod.iter().any(|c| c.name == name),
+                "image check {name} must not run in pod scope"
+            );
+        }
+        assert!(
+            !pod.iter().any(|c| c.name.contains("SOURCE_DATE_EPOCH")),
+            "the mksquashfs SOURCE_DATE_EPOCH gate is image-verb — not in pod scope"
+        );
+    }
+
+    #[test]
+    fn full_scope_keeps_pod_surface_plus_image_checks() {
+        // The default scope must still gate everything the pod scope does
+        // PLUS exactly the five image-verb checks — no behavior change.
+        // (Only the pod-surface checks must appear in full; the toolchain
+        // lists differ by design — pod adds the c++ driver, full keeps
+        // sh/make/cc.)
+        let full = run_all();
+        let pod = run_pod();
+        for check in pod.iter().filter(|c| !c.name.starts_with("sandbox: ")) {
+            assert!(
+                full.iter().any(|c| c.name == check.name),
+                "full scope lost the pod check {}",
+                check.name
+            );
+        }
+        let full_toolchain: Vec<&str> = full
+            .iter()
+            .filter(|c| c.name.starts_with("sandbox: "))
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            full_toolchain,
+            ["sandbox: sh", "sandbox: make", "sandbox: cc"],
+            "full scope toolchain must stay sh/make/cc"
+        );
+        // The non-toolchain part of the full scope is exactly the pod
+        // surface (5 checks) plus the five image-verb checks; the
+        // toolchain lists differ by design (pod adds the c++ driver).
+        let full_base = full
+            .iter()
+            .filter(|c| !c.name.starts_with("sandbox: "))
+            .count();
+        let pod_base = pod
+            .iter()
+            .filter(|c| !c.name.starts_with("sandbox: "))
+            .count();
+        assert_eq!(
+            full_base,
+            pod_base + 5,
+            "full scope = pod surface + 5 image checks (SOURCE_DATE_EPOCH, ukify, \
+             sd-stub, veritysetup, sysupdate); got full={} pod={}",
+            full_base,
+            pod_base
+        );
+        for name in IMAGE_SCOPE_NAMES {
+            assert!(
+                full.iter().any(|c| c.name == name),
+                "full scope must keep the image check {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn pod_scope_failures_name_only_pod_surface_tools() {
+        // Whatever the host is missing, a pod-scope failure can only name
+        // a pod tool or a toolchain entry — never an image tool.
+        let pod = run_pod();
+        let failing: Vec<&str> = pod
+            .iter()
+            .filter(|c| !matches!(c.status, CheckStatus::Ok))
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            failing.iter().all(|name| POD_SCOPE_NAMES.contains(name)),
+            "pod scope must only fail on pod-surface tools, got: {failing:?}"
+        );
+    }
+
+    #[test]
+    fn pod_scope_passes_with_pod_tools_present_and_image_tools_absent() {
+        // On a host provisioned with the pod surface (the container-distro
+        // evidence case), every pod-tool check must pass — image tools are
+        // structurally absent from the scope (the surface test above), so
+        // their absence cannot fail it.
+        let have = |tool: &str| {
+            std::process::Command::new("which")
+                .arg(tool)
+                .output()
+                .ok()
+                .is_some_and(|o| o.status.success())
+        };
+        if !POD_TOOLS.iter().all(|(tool, _)| have(tool)) || !have("bwrap") {
+            // Host without the pod set: the pass branch is exercised on a
+            // provisioned machine instead.
+            return;
+        }
+        let pod = run_pod();
+        let surface: Vec<&Check> = pod
+            .iter()
+            .filter(|c| !c.name.starts_with("sandbox: "))
+            .collect();
+        assert!(
+            surface.iter().all(|c| matches!(c.status, CheckStatus::Ok)),
+            "a machine with the pod tool set must pass the pod-surface checks: {surface:?}"
+        );
+        assert!(
+            !pod.iter()
+                .any(|c| IMAGE_SCOPE_NAMES.contains(&c.name.as_str())),
+            "image checks leaked into pod scope"
+        );
+    }
+
+    #[test]
+    fn pod_scope_hints_name_the_distro_packages() {
+        // install.sh's pkg_for map: squashfs-tools, bubblewrap, curl, tar,
+        // and g++ (gcc-c++ on dnf/zypper) for cc/c++.
+        for (tool, fix) in POD_TOOLS {
+            assert!(!fix.is_empty(), "{tool} must carry a fix hint");
+            assert!(
+                fix.contains("install"),
+                "hint must phrase the install fix: {fix}"
+            );
+        }
+        let bwrap = check_bwrap();
+        if let CheckStatus::Missing = bwrap.status {
+            let hint = bwrap.hint.as_deref().unwrap_or_default();
+            assert!(
+                hint.contains("bubblewrap"),
+                "bwrap hint must name the distro package: {hint}"
+            );
+        }
+        for (tool, fix) in POD_SANDBOX_TOOLS {
+            match tool {
+                "cc" | "c++" => {
+                    assert!(
+                        fix.contains("g++") && fix.contains("gcc-c++"),
+                        "{tool} hint must name the distro packages per install.sh: {fix}"
+                    );
+                }
+                _ => assert!(!fix.is_empty(), "{tool} must carry a fix hint"),
+            }
+        }
     }
 }
