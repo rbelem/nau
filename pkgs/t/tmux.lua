@@ -17,7 +17,7 @@
 return {
     default = snap {
         name = "tmux",
-        version = "3.5a",
+        version = "3.7",
         summary = "Terminal multiplexer",
         description = [[
             tmux is a terminal multiplexer. It lets you switch easily
@@ -31,8 +31,8 @@ return {
         architectures = { "amd64" },
 
         source = {
-            url = "https://github.com/tmux/tmux/releases/download/3.5a/tmux-3.5a.tar.gz",
-            sha256 = "16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951",
+            url = "https://github.com/tmux/tmux/releases/download/3.7/tmux-3.7.tar.gz",
+            sha256 = "2344f191501b8a73eb71dd6c5fd5dcf8c765f5066f34ab46f04b3013dc7bc1a5",
         },
 
         build = table.concat({

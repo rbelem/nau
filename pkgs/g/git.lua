@@ -27,7 +27,7 @@
 return {
     default = snap {
         name = "git",
-        version = "2.47.2",
+        version = "2.55.0",
         summary = "Distributed version control system (full)",
         description = [[
             Git is a free and open source distributed version control
@@ -42,8 +42,8 @@ return {
         architectures = { "amd64" },
 
         source = {
-            url = "https://github.com/git/git/archive/refs/tags/v2.47.2.tar.gz",
-            sha256 = "9d9e5d9b762188550b1dffaacea7f9709a43979b030c17f9424b2b27333ad52b",
+            url = "https://github.com/git/git/archive/refs/tags/v2.55.0.tar.gz",
+            sha256 = "72923418db7b26dfddc21e2268660c5118e560bdfaa09b4489b67b38e9b69c49",
         },
 
         build = table.concat({

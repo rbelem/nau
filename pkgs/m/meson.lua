@@ -43,8 +43,8 @@ return {
         -- mesonmain as a module (-m; its __main__ guard calls main) so
         -- no inline python is needed.
         build = table.concat({
-            "mkdir -p $STAGE/usr/lib/python3.12/site-packages $STAGE/usr/bin",
-            "cp -r $SRC/mesonbuild $STAGE/usr/lib/python3.12/site-packages/",
+            "mkdir -p $STAGE/usr/lib/python3.14/site-packages $STAGE/usr/bin",
+            "cp -r $SRC/mesonbuild $STAGE/usr/lib/python3.14/site-packages/",
             "printf '%s\\n' '#!/bin/sh' 'exec python3 -m mesonbuild.mesonmain \"$@\"' > $STAGE/usr/bin/meson",
             "chmod +x $STAGE/usr/bin/meson",
         }, " && "),
