@@ -196,7 +196,14 @@ const LIB_PODROOT_LINE: &str = "PODROOT=\"$(dirname \"$(dirname \"$BLODIR\")\")\
 /// 2. an `exec` argument that is an absolute pod-store blob path is replaced
 ///    by an exec of the wrapper's `.real` sibling, resolved from the
 ///    wrapper's own directory;
-/// 3. (verification, fail closed) every rewritten reference must resolve:
+/// 3. the python tree wrapper's `PYTHONPATH` scrub (farm isolation, snap.rs
+///    `emit_tree_elf_wrapper`) is re-pointed to preserve the caller's
+///    value: build tools hand python inputs through `PYTHONPATH` — meson
+///    passes build-time generators the source root exactly that way
+///    (xkeyboard-config 2.48 `rules.generator`, observed as a silent
+///    status-1) — and inside the hermetic sandbox the host-PYTHONPATH
+///    threat the scrub exists for does not apply;
+/// 4. (verification, fail closed) every rewritten reference must resolve:
 ///    the exec target and `LD_LIBRARY_PATH` dirs must exist in the prefix,
 ///    and a bare-name interpreter must be provided by one of the merged
 ///    payloads — i.e. the payload itself or a declared `requires`. A wrapper
@@ -293,12 +300,16 @@ fn rewrite_file(
     let real = crate::snap::real_sibling_name(file_name);
     let rewritten = rewrite_blob_execs(&rewritten, &real);
 
+    // 3. Preserve the caller's PYTHONPATH behind the SHUTTLE_PYTHONPATH
+    //    channel (farm scrub → prefix append; see the fn doc).
+    let rewritten = preserve_caller_pythonpath(&rewritten);
+
     if rewritten != text {
         std::fs::write(&path, &rewritten)
             .map_err(|e| miette::miette!("rewriting wrapper '{rel}': {e}"))?;
     }
 
-    // 3. Fail-closed resolution: every reference the wrapper makes must
+    // 4. Fail-closed resolution: every reference the wrapper makes must
     //    resolve into the merged prefix (the payload set) here.
     verify_resolution(prefix, rel, &pkg, shape, &rewritten, &real, payloads)
 }
@@ -363,6 +374,21 @@ fn strip_extension_segments(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Re-point the python tree wrapper's `PYTHONPATH` scrub for the prefix.
+/// The farm wrapper replaces `PYTHONPATH` with the `SHUTTLE_PYTHONPATH`
+/// channel (a host PYTHONPATH would shadow the pod's site-packages). In
+/// the merged build prefix the caller IS the build system: meson hands
+/// build-time generators the source root through `PYTHONPATH`, and the
+/// scrub turned that into a silent ModuleNotFoundError. Append the
+/// caller's value behind the channel instead of replacing it; an empty
+/// caller value expands to today's behavior exactly.
+fn preserve_caller_pythonpath(text: &str) -> String {
+    text.replace(
+        "PYTHONPATH=\"${SHUTTLE_PYTHONPATH:-}\"\n",
+        "PYTHONPATH=\"${SHUTTLE_PYTHONPATH:-}${PYTHONPATH:+:$PYTHONPATH}\"\n",
+    )
 }
 
 /// Given the text right after `active/extensions/`, the number of bytes of
@@ -547,7 +573,10 @@ fn check_podroot_refs(prefix: &Path, line: &str, failures: &mut BTreeSet<String>
             let Some(rest) = piece.strip_prefix("$PODROOT/") else {
                 continue;
             };
-            if rest.is_empty() || rest.contains('*') {
+            // Shell-expansion fragments (the `${LD_LIBRARY_PATH:+…}`
+            // prepend idiom) and globs are expansion patterns, not
+            // literal paths.
+            if rest.is_empty() || rest.contains('*') || rest.contains("${") {
                 continue;
             }
             if !prefix.join(rest).exists() {
@@ -1145,6 +1174,44 @@ mod tests {
         );
     }
 
+    /// The python tree wrapper scrubs inherited `PYTHONPATH` for the farm;
+    /// in the prefix the caller's value must survive behind the
+    /// `SHUTTLE_PYTHONPATH` channel (xkeyboard-config `rules.generator`
+    /// died on this: meson hands build-time generators the source root
+    /// through `PYTHONPATH`, the wrapper dropped it, `-m` import failed).
+    #[test]
+    fn python_tree_wrapper_pythonpath_scrub_preserves_the_caller_value() {
+        if !squashfs_tools_available() {
+            eprintln!("skipping: mksquashfs/unsquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = elf_tree_wrapper_text("python", "usr/bin/python3.real");
+        let snap = make_snap(
+            &tmp.path().join("python"),
+            &[
+                ("usr/bin/python3", wrapper.as_str()),
+                ("usr/bin/python3.real", "ELF-bytes"),
+            ],
+            &[],
+        );
+        let merged = materialize_merged_prefix(&[Payload {
+            pkg: "python".into(),
+            snap,
+        }])
+        .expect("the python wrapper must stage");
+        let rewritten = std::fs::read_to_string(merged.path().join("usr/bin/python3")).unwrap();
+        assert!(
+            rewritten
+                .contains("PYTHONPATH=\"${SHUTTLE_PYTHONPATH:-}${PYTHONPATH:+:$PYTHONPATH}\"\n"),
+            "the scrub must append the caller's PYTHONPATH: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("PYTHONPATH=\"${SHUTTLE_PYTHONPATH:-}\"\n"),
+            "the bare scrub must not survive prefix staging: {rewritten}"
+        );
+    }
+
     /// The native-ELF lib wrapper (`emit_elf_lib_wrapper`, issue #10 B)
     /// execs an absolute pod-store blob path — meaningless in the prefix.
     /// The rewrite execs the preserved `.real` sibling from the wrapper's
@@ -1160,7 +1227,7 @@ mod tests {
              SCRIPT=\"$(readlink -f \"$0\")\"\n\
              BLODIR=\"$(dirname \"$SCRIPT\")\"\n\
              PODROOT=\"$(dirname \"$(dirname \"$BLODIR\")\")\"\n\
-             export LD_LIBRARY_PATH=\"$PODROOT/active/extensions/jq/usr/usr/lib\"\n\
+             export LD_LIBRARY_PATH=\"$PODROOT/active/extensions/jq/usr/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n\
              exec \"/home/u/pods/daily/store/aa/deadbeef\" \"$@\"\n";
         let snap = make_snap(
             &tmp.path().join("jq"),
@@ -1182,8 +1249,11 @@ mod tests {
             "the store-blob exec must become a sibling exec: {rewritten}"
         );
         assert!(
-            rewritten.contains("LD_LIBRARY_PATH=\"$PODROOT/usr/lib\""),
-            "LD entries must re-point at the prefix root: {rewritten}"
+            rewritten.contains(
+                "LD_LIBRARY_PATH=\"$PODROOT/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\""
+            ),
+            "LD entries must re-point at the prefix root and keep the caller-prepend \
+             idiom (the shellenv compose, #94): {rewritten}"
         );
     }
 

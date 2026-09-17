@@ -316,8 +316,9 @@ gated_test!(interpreter_package_builds_wrapper_and_farm_execs_it, {
         "wrapper must single-exec the interpreter: {wrapper_text:?}"
     );
     assert!(
-        wrapper_text.contains("/store/"),
-        "wrapper must reference the script's content-addressed store path: {wrapper_text:?}"
+        wrapper_text.contains("$PODROOT/active/extensions/pytool/usr/bin/pytool.real"),
+        "wrapper must exec the script's extension-tree path (#94 tree \
+         routing): {wrapper_text:?}"
     );
 
     // Exactly ONE exec line — no lingering fork wrapper.
@@ -330,12 +331,17 @@ gated_test!(interpreter_package_builds_wrapper_and_farm_execs_it, {
         "wrapper must contain exactly one exec: {wrapper_text:?}"
     );
 
-    // The wrapper's baked script path must be a REAL store blob (the
-    // original script, preserved in the payload and content-addressed).
-    let script_store_path = extract_script_path(&wrapper_text, "python3");
+    // The wrapper's baked script path must exist in the generation's
+    // extension tree — the payload layout is mirrored there with the
+    // preserved `.real` sibling beside the wrapper (#94 tree routing).
+    // `$PODROOT` resolves to the pod state dir; `active` flips with
+    // rollback, so assert through the same link the wrapper uses.
+    let pod_root = pod_dir(root.path(), "default");
+    let tree_script = extract_script_path(&wrapper_text, "python3")
+        .replace("$PODROOT", &pod_root.display().to_string());
     assert!(
-        std::path::Path::new(&script_store_path).is_file(),
-        "wrapper must reference an existing store script blob: {script_store_path:?}"
+        std::path::Path::new(&tree_script).is_file(),
+        "wrapper must reference an existing extension-tree script: {tree_script:?}"
     );
 
     // The manifest records the app → store content mapping; the farm blob

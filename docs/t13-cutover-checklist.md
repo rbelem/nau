@@ -201,8 +201,8 @@ as `~/.bashrc.d/90-shuttle.sh` (one file, proven ordering: farm first so
 ### 4.4 Shell init lines (starship/zoxide/fzf/atuin/vi)
 
 Carried by the same `examples/cutover/90-shuttle.sh` (§4.3). Two deltas
-from the devbox init-hook: `SUDO_EDITOR=vi` (devbox's nvim path dies with
-the global profile; neovim is an unported pool gap, §5.1), and the
+from the devbox init-hook: `SUDO_EDITOR=vi` (the pod's neovim package
+provides `vi`; devbox's nvim path died with the global profile), and the
 `XDG_DATA_DIRS` completions prepend is dropped (pods don't surface a
 `share/` tree, §5.6).
 
@@ -253,23 +253,27 @@ GC in §4.5 — run `nix store gc` only after a full day of cutover).
 ## 5. Explicitly NOT covered by pods yet (open work, per #29
 "filed as follow-up tickets, not silently absorbed")
 
-### 5.1 Pool ports missing (biggest bucket — ~25 personal tools)
+### 5.1 Pool ports missing (personal tools not yet in the pool)
 
-`zenity`, `podman`, `jdk21`, `chromium`, `valkey` (+ `valkey-search`
-module), `neovim`, `blesh` (see §5.2), `opencode-v2`, `graphify`,
-`skills`, `playwright-cli`, `codeburn`, `codegraph`, `llm-verifier`,
-`agentmemory`, `impeccable`, `skillspector`, `bifrost`, `deepsec`,
-`deepseek-harness`, `pdf-inspector`, `wigolo`, `valkey-search`, `anydoc`,
-`tree-sitter-perl`. Most are dep-fetch ecosystem tools (npm/pip) that
-ADR-0017 supports — they need packages authored, not new machinery.
+Ported since this section was first written: `neovim`, `blesh` (§5.2),
+`graphify`, `skillspector`, `anydoc`, `tree-sitter-perl` — plus earlier
+`whichllm`, `rtk`, `strix`, `hunk`, `dcg`, `agent-browser`. Held with
+documented gaps (uncommitted `pkgs/` drafts, not ported): `llm-verifier`
+(no upstream lockfile), `agentmemory` (npm dist unbundled, no
+package-lock.json), `pdf-inspector` (no root Cargo.lock), `zenity`
+(gtk4/libadwaita/itstool not buildable from the pool). Still missing:
+`podman`, `jdk21`, `chromium`, `valkey` (+ `valkey-search` module),
+`opencode-v2`, `skills`, `playwright-cli`, `codeburn`, `codegraph`,
+`impeccable`, `bifrost`, `deepsec`, `deepseek-harness`, `wigolo`. Most
+are dep-fetch ecosystem tools (npm/pip) that ADR-0017 supports — they
+need packages authored, not new machinery.
 **Until ported, these stay devbox-only — cutover is gated on the owner
 dispositioning each (port now vs. live without).**
 
-### 5.2 ble.sh has no pool package
+### 5.2 ble.sh — ported (was a gap)
 
-The interactive line editor loads from the devbox profile
-(`$(blesh-share)/ble.sh`). Either port `blesh` to the pool or accept
-plain readline after cutover. Not shadowable by another tool.
+`pkgs/b/blesh.lua` builds the interactive line editor; the rc port loads
+it via the pod's `blesh-share` (§4.3).
 
 ### 5.3 Pod env vars (ADR-0016 §7 follow-up)
 
@@ -279,6 +283,16 @@ plain readline after cutover. Not shadowable by another tool.
 earmarked but unbuilt). Interim: keep the exports in a bashrc.d snippet.
 Locale support specifically (LOCALE_ARCHIVE) needs a pod decision:
 system locales vs. a pod locale payload.
+
+Semantic target for that surface: `shuttle run` becomes the single
+entry point the way `flatpak run` is — the confined-app half exists
+(#11: sandbox from declared grants); the missing half is flatpak's
+`--command` form, an arbitrary command executed with the pod env
+overlaid (farm PATH per the ADR-0028 shellenv contract) and no sandbox
+unless the target declares one. `devbox run` is the reference for the
+env-overlay half: isolated env, transparent exec, nothing else. Filed
+as #102 — not needed for this
+cutover; the bashrc.d interim covers it.
 
 ### 5.4 Pod services
 

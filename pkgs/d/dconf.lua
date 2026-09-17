@@ -68,6 +68,14 @@ return {
         requires = { "glibc", "glib" },
         build_deps = { "dbus", "meson", "ninja", "pkg-config" },
 
+        apps = {
+            -- The CLI reads/writes the user's dconf database (the
+            -- service is D-Bus-activated, not a farm app). Surfaced in
+            -- the #94 pilot gates: the meson family must cold-build AND
+            -- run (#94).
+            dconf = app { command = "usr/bin/dconf" },
+        },
+
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22/#19)
         -- until the nix gcc wrapper stops baking the merged build prefix
         -- into produced binaries: produced ELFs carry

@@ -68,6 +68,13 @@ return {
         requires = { "glibc", "glib" },
         build_deps = { "meson", "ninja", "pkg-config" },
 
+        apps = {
+            -- secret-tool is the libsecret CLI (schema-attribute lookup
+            -- against the Secret Service). Surfaced in the #94 pilot
+            -- gates with the rest of the meson family.
+            ["secret-tool"] = app { command = "usr/bin/secret-tool" },
+        },
+
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22/#19)
         -- until the nix gcc wrapper stops baking the merged build prefix
         -- into produced binaries: produced ELFs carry

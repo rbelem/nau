@@ -19,7 +19,11 @@
 -- the smoke contract is the CLI itself.
 --
 -- Requires: glibc, lua, unzip
--- build_deps: none (ships a configure script)
+-- build_deps: lua (configure runs the interpreter for version detection;
+--             without it the prefix has no lua at all and the wrapper
+--             probe fails — the config-.lua naming bug below), which
+--             pulls readline/ncurses into the prefix for lua.real's
+--             dynamic libs
 
 return {
     default = snap {
@@ -49,7 +53,11 @@ return {
         -- meson.lua caveat). The lua source is double-quote-only so every
         -- line survives as a single-quoted printf argument.
         build = table.concat({
-            "./configure --prefix=/usr --with-lua=$SHUTTLE_BUILD_PREFIX/usr",
+            -- --lua-version is explicit: configure's own detection shells
+            -- out to the prefix lua wrapper and returned empty in the
+            -- sandbox, producing config-.lua and a fatal sed on
+            -- config-5.4.lua (observed in the #94 cold pilot).
+            "./configure --prefix=/usr --with-lua=$SHUTTLE_BUILD_PREFIX/usr --lua-version=5.4",
             "make",
             "make install DESTDIR=$STAGE",
             "printf '%s\\n' " ..
@@ -120,6 +128,7 @@ return {
 
         type = "source",
         requires = { "glibc", "lua", "unzip" },
+        build_deps = { "lua" },
 
         apps = {
             luarocks = app {

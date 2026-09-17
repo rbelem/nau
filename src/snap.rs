@@ -2014,8 +2014,10 @@ pub fn check_cross_build(arch: &str, target: Option<&str>) -> miette::Result<()>
 ///    (no native ELF magic) gets a wrapper: the original script is preserved
 ///    at a sibling `<command>.real` path (still shipped in the payload) and
 ///    the command path is replaced by a wrapper that single-`exec`s the
-///    interpreter with the script's content-addressed store path, e.g.
-///    `exec "node" "$POD/store/aa/<sha256>" "$@"`.
+///    interpreter with the script's extension-tree path (the only
+///    runtime-correct shape — a flat blob path strands scripts that derive
+///    from their own path; #94), e.g.
+///    `exec "node" "$POD/active/extensions/<pkg>/usr/bin/<cmd>.real" "$@"`.
 ///
 /// 2. **Native-ELF with bundled runtime libs (issue #10 part B).** A native
 ///    ELF command binary that needs shared libraries the payload itself
@@ -2113,22 +2115,19 @@ fn wrap_app(
                 &entry,
                 meta,
                 stage_dir,
-                pod_store,
                 Path::new(&cmd_path),
                 listings,
             );
         };
-        if meta.deps.is_some() {
-            // ADR-0017 (issue #13): with a dependency closure the app
-            // must run from the generation's extension tree, where the
-            // staged `node_modules`/site-packages sit next to the
-            // script (require()/sys.path resolve relative to the
-            // script). A file-blob store path (the #9 default) would
-            // strand the interpreter with no modules beside it.
-            emit_script_tree_wrapper(app_name, &entry, interpreter, &meta.name, &cmd_path)
-        } else {
-            emit_script_wrapper(app_name, &entry, interpreter, pod_store)
-        }
+        // The tree shape is the only runtime-correct one for a script
+        // that resolves resources relative to its own path (arg[0]
+        // package.path, require() adjacency): a flat content-addressed
+        // blob path strands the derivation (luarocks, blesh-share —
+        // #94 gates). The extension tree mirrors the payload layout
+        // for every installed package, so every interpreter script
+        // execs from there (#13 shaped the wrapper; #94 extended the
+        // routing beyond deps closures).
+        emit_script_tree_wrapper(app_name, &entry, interpreter, &meta.name, &cmd_path)
     }
 }
 
@@ -2178,7 +2177,6 @@ fn wrap_shebang_script(
     entry: &Path,
     meta: &SnapMeta,
     stage_dir: &Path,
-    pod_store: &crate::runtime::RuntimeStore,
     cmd_rel: &Path,
     listings: Option<&crate::leak_scan::PayloadListings>,
 ) -> miette::Result<()> {
@@ -2194,7 +2192,7 @@ fn wrap_shebang_script(
     // The payload itself provides the interpreter at the mirrored prefix
     // path (`/usr/bin/<name>` staged in this payload).
     if stage_dir.join("usr/bin").join(name).is_file() {
-        return emit_wrapped_script(app_name, entry, meta, stage_dir, pod_store, name, cmd_rel);
+        return emit_wrapped_script(app_name, entry, meta, name, cmd_rel);
     }
     // A declared `requires` (runtime-closure payload) provides it.
     let runtime_provides = listings
@@ -2202,7 +2200,7 @@ fn wrap_shebang_script(
         .iter()
         .any(|pkg| listings.payloads.get(pkg).is_some_and(|f| f.contains(name)));
     if runtime_provides {
-        return emit_wrapped_script(app_name, entry, meta, stage_dir, pod_store, name, cmd_rel);
+        return emit_wrapped_script(app_name, entry, meta, name, cmd_rel);
     }
     let build_only_provides = listings
         .payloads
@@ -2227,37 +2225,24 @@ fn wrap_shebang_script(
 }
 
 /// Author the wrapper for a shebang-resolved interpreter: same routing as a
-/// declared `interpreter` (issue #13 tree shape when a dependency closure or
-/// an own-payload module tree needs adjacency, flat #9 blob otherwise).
+/// declared `interpreter` (issue #13 tree shape — the only runtime-correct
+/// shape for scripts that derive from their own path).
 fn emit_wrapped_script(
     app_name: &str,
     entry: &Path,
     meta: &SnapMeta,
-    stage_dir: &Path,
-    pod_store: &crate::runtime::RuntimeStore,
     name: &str,
     cmd_rel: &Path,
 ) -> miette::Result<()> {
-    if meta.deps.is_some() || stage_has_perl_lib(stage_dir) {
-        emit_script_tree_wrapper(
-            app_name,
-            entry,
-            name,
-            &meta.name,
-            &cmd_rel.to_string_lossy(),
-        )
-    } else {
-        emit_script_wrapper(app_name, entry, name, pod_store)
-    }
-}
-
-/// True when the payload stages a perl module tree (`usr/lib/perl5/`):
-/// a script riding such a payload resolves its modules through perl's @INC
-/// against the pod's root-mounted closure, so the farm wrapper must run it
-/// from the extension tree with PERL5LIB re-rooted (the perl analog of the
-/// #13 PYTHONPATH handoff).
-fn stage_has_perl_lib(stage_dir: &Path) -> bool {
-    stage_dir.join("usr/lib/perl5").is_dir()
+    // Same #94 routing as declared interpreters: the tree shape is the
+    // only one that keeps payload-relative derivation alive.
+    emit_script_tree_wrapper(
+        app_name,
+        entry,
+        name,
+        &meta.name,
+        &cmd_rel.to_string_lossy(),
+    )
 }
 
 /// The preserved-script sibling name. Inserts `.real` before the final
@@ -2298,49 +2283,9 @@ fn stage_bundles_python_stdlib(stage_dir: &Path, cmd_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Author the interpreter-script wrapper (issue #9) for a command path
-/// that is a shebang/script (not native ELF).
-fn emit_script_wrapper(
-    app_name: &str,
-    entry: &Path,
-    interpreter: &str,
-    pod_store: &crate::runtime::RuntimeStore,
-) -> miette::Result<()> {
-    // Preserve the original script in the payload at a sibling path, then
-    // replace the command path with the wrapper. The wrapper references
-    // the script by its content-addressed store blob path (computed here
-    // at build time from the script's sha256 — deterministic, so ingest
-    // later stores it at the same path).
-    let file_name = entry
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let script_path = entry.with_file_name(real_sibling_name(&file_name));
-    std::fs::rename(entry, &script_path).map_err(|e| {
-        miette::miette!(
-            "app '{app_name}': preserving interpreter script {}: {e}",
-            script_path.display()
-        )
-    })?;
-    let script_sha256 = sha256_file(&script_path).map_err(|e| {
-        miette::miette!(
-            "app '{app_name}': hashing interpreter script {}: {e}",
-            script_path.display()
-        )
-    })?;
-    let script_store_path = pod_store.blob_path(&script_sha256);
-
-    let wrapper = format!(
-        "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
-        interpreter,
-        script_store_path.display()
-    );
-    write_wrapper(app_name, entry, &wrapper)
-}
-
 /// Author the interpreter-script wrapper for a package WITH a dependency
-/// closure (ADR-0017, issue #13): same preserve-and-replace shape as
-/// [`emit_script_wrapper`], but the wrapper execs the `.real` script from
+/// closure (ADR-0017, issue #13): the same preserve-and-replace shape the
+/// flat #9 wrapper used, but the wrapper execs the `.real` script from
 /// the active generation's extension tree —
 /// `$PODROOT/active/extensions/<pkg>/usr/<command>.real` — where modules
 /// staged next to it (`node_modules`, site-packages) resolve. PODROOT is
@@ -2474,10 +2419,13 @@ fn emit_elf_tree_wrapper(
     // The only ELF that takes this wrapper is a prefix-relative runtime
     // (CPython, detected by stage_bundles_python_stdlib). Its sys.path
     // inherits the host's PYTHONPATH, which would shadow the pod's
-    // stdlib/site-packages with foreign installations — scrub it, but
-    // honor SHUTTLE_PYTHONPATH: the reserved channel a pod app wrapper
-    // uses to hand the interpreter its own site-packages (an app wrapper
-    // execs this wrapper as its interpreter).
+    // stdlib/site-packages with foreign installations — scrub it, then
+    // thread every extension's site-packages (the PERL5LIB shape from
+    // the #90 perltidy wrapper): the pod interpreter must import
+    // cross-package modules (mesonbuild from the meson extension — #94
+    // gates). SHUTTLE_PYTHONPATH stays first: the reserved channel a
+    // pod app wrapper uses to hand the interpreter its own
+    // site-packages, ahead of the pod-wide sweep.
     // The farm symlink resolves to the wrapper blob at
     // `<podroot>/store/<aa>/<hash>` — three dirnames to the pod root
     // (same derivation as the #10 ELF lib wrapper).
@@ -2487,6 +2435,9 @@ fn emit_elf_tree_wrapper(
          PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
          {ld_line}\
          PYTHONPATH=\"${{SHUTTLE_PYTHONPATH:-}}\"\n\
+         for sp in \"$PODROOT\"/active/extensions/*/usr/usr/lib/python3.*/site-packages; do\n\
+         \x20 [ -d \"$sp\" ] && PYTHONPATH=\"${{PYTHONPATH:+$PYTHONPATH:}}$sp\"\n\
+         done\n\
          export PYTHONPATH\n\
          exec \"{tree_elf}\" \"$@\"\n"
     );
@@ -2495,9 +2446,11 @@ fn emit_elf_tree_wrapper(
 
 /// Author the native-ELF runtime-lib wrapper (issue #10 part B): preserves
 /// the real ELF at `<command>.real`, then replaces the command path with a
-/// wrapper that sets `LD_LIBRARY_PATH` to the active generation's
-/// name-preserving lib dirs (where the payload's bundled runtime blobs are
-/// hardlinked) and single-`exec`s the real binary's store blob.
+/// wrapper that PREPENDS the active generation's name-preserving lib dirs
+/// (where the payload's bundled runtime blobs are hardlinked) to
+/// `LD_LIBRARY_PATH` — prepend, never replace: the caller's list (the #89
+/// shellenv seam) must survive, or cross-package libs (glib under dconf,
+/// #94) vanish — and single-`exec`s the real binary's store blob.
 fn emit_elf_lib_wrapper(
     app_name: &str,
     entry: &Path,
@@ -2544,7 +2497,7 @@ fn emit_elf_lib_wrapper(
          SCRIPT=\"$(readlink -f \"$0\")\"\n\
          BLODIR=\"$(dirname \"$SCRIPT\")\"\n\
          PODROOT=\"$(dirname \"$(dirname \"$BLODIR\")\")\"\n\
-         export LD_LIBRARY_PATH=\"{}\"\n\
+         export LD_LIBRARY_PATH=\"{}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"\n\
          exec \"{}\" \"$@\"\n",
         ld_paths.join(":"),
         real_store_path.display()
@@ -4470,6 +4423,18 @@ pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
         ("SHUTTLE_BUILD_PREFIX", prefix.to_string()),
         ("CPPFLAGS", format!("-I{}/usr/include", prefix)),
         ("LDFLAGS", format!("-L{}/usr/lib", prefix)),
+        // Build-time execution of prefix binaries needs the prefix's own
+        // libs on the loader path: the portable-ELF machinery (#12) strips
+        // RUNPATHs from pod-built payloads, so e.g. the lua interpreter in
+        // the prefix cannot find its merged readline/ncurses without this
+        // (observed as luarocks' configure failing its version probe with
+        // a silent exit 127). Replaces any inherited value — the sandbox
+        // is hermetic and the project already drops inherited LD pollution
+        // (hermetic_sandbox_drops_inherited_ldflags_pollution).
+        (
+            "LD_LIBRARY_PATH",
+            format!("{}/usr/lib:{}/usr/lib64", prefix, prefix),
+        ),
         (
             "PKG_CONFIG_PATH",
             format!(
@@ -9934,6 +9899,12 @@ fi
         assert_eq!(get("CPPFLAGS"), "-I/shuttle-build-prefix/usr/include");
         assert_eq!(get("LDFLAGS"), "-L/shuttle-build-prefix/usr/lib");
         assert_eq!(
+            get("LD_LIBRARY_PATH"),
+            "/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64",
+            "prefix-built ELFs carry no RUNPATH (#12) — build-time execs \
+             resolve merged libs through this var"
+        );
+        assert_eq!(
             get("PKG_CONFIG_PATH"),
             "/shuttle-build-prefix/usr/lib/pkgconfig:/shuttle-build-prefix/usr/share/pkgconfig"
         );
@@ -10457,17 +10428,24 @@ mod wrapper_tests {
         emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
         // The command path is now the wrapper: a single exec of the
-        // interpreter with the script's content-addressed store path.
+        // interpreter with the script's extension-tree path (the #94
+        // routing — a flat store-blob path strands arg[0]-derived
+        // module lookups).
         let wrapper = std::fs::read_to_string(&script).unwrap();
         assert!(wrapper.starts_with("#!/bin/sh\n"));
         assert!(
             wrapper.contains("exec \"node\""),
             "wrapper must exec the interpreter: {wrapper}"
         );
-        let store_blob = store.blob_path(&sha256_file(&stage.path().join("bin/zg.real")).unwrap());
         assert!(
-            wrapper.contains(&store_blob.display().to_string()),
-            "wrapper must bake the script's store path: {wrapper}"
+            wrapper.contains(
+                "exec \"node\" \"$PODROOT/active/extensions/pkg/usr/bin/zg.real\" \"$@\""
+            ),
+            "wrapper must exec the tree script: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("PODROOT="),
+            "wrapper must derive the pod root from its own blob: {wrapper}"
         );
 
         // The original script is preserved at the sibling `.real` path.
@@ -10541,6 +10519,15 @@ mod wrapper_tests {
             wrapper.contains("readlink -f"),
             "PODROOT derivation: {wrapper}"
         );
+        // #94: the wrapper threads every extension's site-packages so
+        // the pod interpreter imports cross-package modules
+        // (mesonbuild from the meson extension).
+        assert!(
+            wrapper.contains(
+                "for sp in \"$PODROOT\"/active/extensions/*/usr/usr/lib/python3.*/site-packages"
+            ),
+            "wrapper must sweep extension site-packages onto PYTHONPATH: {wrapper}"
+        );
         // The preserved sibling keeps the ELF and the extension segment.
         let real = stage.path().join("usr/bin/python3.real.12");
         assert_eq!(std::fs::read(&real).unwrap(), b"\x7fELF\x02\x01\x01rest");
@@ -10555,15 +10542,10 @@ mod wrapper_tests {
             "usr/bin/tool",
             b"#!/usr/bin/env python3\nimport tool\n",
         );
-        // meta_with_app names the package "pkg"; give it a deps closure so
-        // the app runs from the extension tree.
-        let mut meta = meta_with_app("tool", "usr/bin/tool", Some("python3"));
-        meta.deps = Some(crate::snap::PackageDeps {
-            npm: None,
-            pip: None,
-            cargo: None,
-            go: None,
-        });
+        // meta_with_app names the package "pkg"; the tree wrapper is
+        // now the routing for every interpreter script (#94), deps or
+        // not.
+        let meta = meta_with_app("tool", "usr/bin/tool", Some("python3"));
 
         emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
 
@@ -10711,13 +10693,13 @@ mod wrapper_tests {
 
         let wrapper = std::fs::read_to_string(&script).unwrap();
         assert!(
-            wrapper.starts_with("#!/bin/sh\nexec \"perl\" \""),
-            "the command path must become a #9 wrapper execing the requires \
-             interpreter by bare name: {wrapper}"
+            wrapper.starts_with("#!/bin/sh\n") && wrapper.contains("exec \"perl\" \"$PODROOT/active/extensions/pkg/usr/usr/bin/perltidy.real\" \"$@\""),
+            "the command path must become a tree wrapper execing the requires \
+             interpreter by bare name from the extension tree (#94): {wrapper}"
         );
         assert!(
-            wrapper.contains("/store/") && wrapper.trim_end().ends_with("\"$@\""),
-            "wrapper must exec the script store blob and forward args: {wrapper}"
+            wrapper.contains("PODROOT=") && wrapper.trim_end().ends_with("\"$@\""),
+            "wrapper must derive the pod root and forward args: {wrapper}"
         );
         let real = stage.path().join("usr/bin/perltidy.real");
         assert_eq!(
@@ -10812,8 +10794,11 @@ mod wrapper_tests {
 
         let wrapper = std::fs::read_to_string(&script).unwrap();
         assert!(
-            wrapper.starts_with("#!/bin/sh\nexec \"perl\" \""),
-            "own-payload interpreter wraps the same way: {wrapper}"
+            wrapper.starts_with("#!/bin/sh\n")
+                && wrapper.contains(
+                    "exec \"perl\" \"$PODROOT/active/extensions/pkg/usr/usr/bin/tool.real\" \"$@\""
+                ),
+            "own-payload interpreter wraps with the tree shape: {wrapper}"
         );
     }
 
