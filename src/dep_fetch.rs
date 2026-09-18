@@ -609,10 +609,10 @@ fn parse_pip_requirements(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
 /// content: a `uv.lock` is TOML with `[[package]]` tables; a
 /// `requirements.lock` is the pip-compile line format. Both resolve to
 /// the same pin list.
-fn parse_pip_pins(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
+fn parse_pip_pins(bytes: &[u8], target_minor: Option<u8>) -> miette::Result<Vec<PipPin>> {
     let text = String::from_utf8_lossy(bytes);
     if text.contains("[[package]]") {
-        parse_uv_lock(bytes)
+        parse_uv_lock(bytes, target_minor)
     } else {
         parse_pip_requirements(bytes)
     }
@@ -700,7 +700,7 @@ struct UvWheel {
 /// before any wheel check, with ONE aggregated warning naming what was
 /// dropped — the dev-dependency split keeps devtool-class closures
 /// (pytest, ruff, pyarrow) out of the fetch.
-fn parse_uv_lock(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
+fn parse_uv_lock(bytes: &[u8], target_minor: Option<u8>) -> miette::Result<Vec<PipPin>> {
     let text = String::from_utf8_lossy(bytes);
     let lock: UvLock =
         toml::from_str(&text).map_err(|e| miette::miette!("uv.lock is not valid TOML: {e}"))?;
@@ -712,7 +712,7 @@ fn parse_uv_lock(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
             dev_skipped.push(pkg.name.clone());
             continue;
         }
-        if let Some(pin) = pin_for_package(pkg) {
+        if let Some(pin) = pin_for_package(pkg, target_minor) {
             out.push(pin);
         }
     }
@@ -729,8 +729,12 @@ fn parse_uv_lock(bytes: &[u8]) -> miette::Result<Vec<PipPin>> {
 /// One non-dev package's pip pin: its best platform wheel (see
 /// [`wheel_tags_match`]). Skips with a warning and returns `None` for
 /// packages with no wheels (sdist-only), non-registry sources, and no
-/// wheel for this platform.
-fn pin_for_package(pkg: &UvPackage) -> Option<PipPin> {
+/// wheel for this platform. `target_minor` (the declared pod python)
+/// reorders the pick: an exact `cp<target>` wheel wins over `abi3`,
+/// which wins over interpreter-agnostic tags — uv.lock records the
+/// locking machine's choice, and first-match otherwise ships a wheel
+/// the pod interpreter cannot import.
+fn pin_for_package(pkg: &UvPackage, target_minor: Option<u8>) -> Option<PipPin> {
     let Some(wheels) = &pkg.wheels else {
         crate::output::warn(format!(
             "uv.lock: {} {} has no wheels (sdist-only or non-registry source) — skipped",
@@ -751,18 +755,22 @@ fn pin_for_package(pkg: &UvPackage) -> Option<PipPin> {
         return None;
     }
     let norm = normalize_name(&pkg.name);
-    let Some(wheel) = wheels.iter().find(|w| {
-        let filename = w.url.rsplit('/').next().unwrap_or("");
-        // Wheel filenames keep the distribution's original spelling
-        // (pydantic_core-…, typing_extensions-…) — normalize the
-        // filename's name segment before the prefix match, which
-        // compares PEP 503-normalized names.
-        let normed = match filename.split_once('-') {
-            Some((name_seg, rest)) => format!("{}-{}", normalize_name(name_seg), rest),
-            None => filename.to_string(),
-        };
-        is_matching_wheel(&normed, &norm, &pkg.version) && wheel_tags_match(filename)
-    }) else {
+    let Some(wheel) = wheels
+        .iter()
+        .filter(|w| {
+            let filename = w.url.rsplit('/').next().unwrap_or("");
+            // Wheel filenames keep the distribution's original spelling
+            // (pydantic_core-…, typing_extensions-…) — normalize the
+            // filename's name segment before the prefix match, which
+            // compares PEP 503-normalized names.
+            let normed = match filename.split_once('-') {
+                Some((name_seg, rest)) => format!("{}-{}", normalize_name(name_seg), rest),
+                None => filename.to_string(),
+            };
+            is_matching_wheel(&normed, &norm, &pkg.version) && wheel_tags_match(filename)
+        })
+        .min_by_key(|w| wheel_python_rank(w, target_minor))
+    else {
         crate::output::warn(format!(
             "uv.lock: {} {} has no wheel for this platform — skipped",
             pkg.name, pkg.version
@@ -780,6 +788,46 @@ fn pin_for_package(pkg: &UvPackage) -> Option<PipPin> {
             .unwrap_or_default(),
         url: Some(wheel.url.clone()),
     })
+}
+
+/// Preference rank for a lock-recorded wheel given the declared pod
+/// python: exact CPython minor match first, then `abi3`, then
+/// interpreter-agnostic, then anything else (lock order).
+fn wheel_python_rank(w: &UvWheel, target_minor: Option<u8>) -> u8 {
+    let filename = w.url.rsplit('/').next().unwrap_or("");
+    let Some(without_ext) = filename.strip_suffix(".whl") else {
+        return 3;
+    };
+    let Some((rest, _platform)) = without_ext.rsplit_once('-') else {
+        return 3;
+    };
+    let Some((rest, abi)) = rest.rsplit_once('-') else {
+        return 3;
+    };
+    let Some((_, python)) = rest.rsplit_once('-') else {
+        return 3;
+    };
+    match (python, abi, target_minor) {
+        ("py3", _, _) | ("py2.py3", _, _) => 2,
+        (p, "abi3", Some(target)) => {
+            if p.strip_prefix("cp3")
+                .and_then(|m| m.parse::<u8>().ok())
+                .is_some_and(|m| m <= target)
+            {
+                1
+            } else {
+                3
+            }
+        }
+        (p, _, Some(target)) => {
+            if p == format!("cp3{target}") {
+                0
+            } else {
+                3
+            }
+        }
+        (_, _, None) => 3,
+    }
 }
 
 /// The PEP 503-normalized names of packages that exist ONLY for
@@ -936,16 +984,72 @@ fn fetch_pip_closure(
 ) -> miette::Result<()> {
     let index = spec.index.as_deref().unwrap_or(DEFAULT_PIP_INDEX);
     let lock_bytes = read_source_file(src_root, &spec.lock)?;
-    let pins = parse_pip_pins(&lock_bytes)?;
+    let target_python = spec.python.as_deref().map(parse_python_minor).transpose()?;
+    let pins = parse_pip_pins(&lock_bytes, target_python)?;
     crate::output::info(format!(
         "pip closure: {} package(s) from {} via {index}",
         pins.len(),
         spec.lock
     ));
+    let excludes: Vec<String> = spec.exclude.iter().map(|n| normalize_name(n)).collect();
     for pin in &pins {
-        fetch_pip_wheel(pin, index, tree, work)?;
+        if excludes.contains(&normalize_name(&pin.name)) {
+            crate::output::info(format!(
+                "pip closure: skipping {} (deps.pip exclude)",
+                pin.name
+            ));
+            continue;
+        }
+        fetch_pip_wheel(pin, index, tree, work, target_python)?;
     }
     Ok(())
+}
+
+/// Parse a declared pod-interpreter version ("3.14") into its minor
+/// number. The wheel tag check compares CPython minor tags against it.
+fn parse_python_minor(v: &str) -> miette::Result<u8> {
+    let rest = v
+        .strip_prefix("3.")
+        .ok_or_else(|| miette::miette!("deps.pip: 'python' must be \"3.<minor>\", got '{v}'"))?;
+    rest.parse::<u8>()
+        .ok()
+        .filter(|_| !rest.is_empty())
+        .ok_or_else(|| miette::miette!("deps.pip: 'python' must be \"3.<minor>\", got '{v}'"))
+}
+
+/// Validate one fetched wheel against the declared pod interpreter.
+/// A plain `cp3x` wheel only runs on CPython x — anything else than the
+/// exact minor is a silent runtime breakage (imports of the compiled
+/// module fail), so the mismatch fails the fetch closed. `abi3` wheels
+/// run on any CPython newer than their python tag; pure-python tags run
+/// anywhere.
+fn validate_wheel_python(filename: &str, target_minor: u8) -> miette::Result<()> {
+    let Some(without_ext) = filename.strip_suffix(".whl") else {
+        return Ok(()); // sdists and non-wheel artifacts carry no tags
+    };
+    let Some((rest, _platform)) = without_ext.rsplit_once('-') else {
+        return Ok(());
+    };
+    let Some((rest, abi)) = rest.rsplit_once('-') else {
+        return Ok(());
+    };
+    let Some((_, python)) = rest.rsplit_once('-') else {
+        return Ok(());
+    };
+    let tag_minor = |tag: &str| tag.strip_prefix("cp3").and_then(|m| m.parse::<u8>().ok());
+    let ok = match (python, abi) {
+        ("py3", _) | ("py2.py3", _) => true,
+        (p, "abi3") => tag_minor(p).is_some_and(|m| m <= target_minor),
+        (p, _) => tag_minor(p).is_some_and(|m| m == target_minor),
+    };
+    if ok {
+        return Ok(());
+    }
+    miette::bail!(
+        "pip: wheel {filename} does not serve the declared pod python \
+         3.{target_minor} (relock against the pod interpreter, or exclude \
+         the package via deps.pip exclude if the app tolerates its absence)"
+    )
 }
 
 /// Resolve one pin to a wheel and download it, verifying integrity.
@@ -953,31 +1057,63 @@ fn fetch_pip_closure(
 /// otherwise the pin resolves on the index's project page. Either way
 /// the wheel is verified against the pin's hash (authoritative) or the
 /// page's anchor hash (TOFU when the lock carries no hash).
-fn fetch_pip_wheel(pin: &PipPin, index: &str, tree: &Path, work: &Path) -> miette::Result<()> {
-    if let Some(url) = &pin.url {
-        let filename = url.rsplit('/').next().unwrap_or("wheel.whl");
-        let dest = tree.join(filename);
-        http_get_to_file(url, &dest)?;
-        return match pin.hashes.first() {
-            Some(hash) => {
-                let actual = sha256_file(&dest)?;
-                if !constant_eq(actual.as_bytes(), hash.as_bytes()) {
-                    let _ = std::fs::remove_file(&dest);
-                    miette::bail!(
-                        "pip: wheel {filename} hash mismatch: expected {hash}, got {actual}"
-                    );
-                }
-                Ok(())
-            }
-            None => {
-                let actual = sha256_file(&dest)?;
-                crate::output::warn(format!(
-                    "pip: wheel {filename} fetched unpinned (hash {actual:.16}… — pin it in the lock)"
-                ));
-                Ok(())
-            }
-        };
+fn fetch_pip_wheel(
+    pin: &PipPin,
+    index: &str,
+    tree: &Path,
+    work: &Path,
+    target_minor: Option<u8>,
+) -> miette::Result<()> {
+    match &pin.url {
+        Some(url) => fetch_pip_wheel_direct(pin, url, tree, target_minor),
+        None => fetch_pip_wheel_index(pin, index, tree, work, target_minor),
     }
+}
+
+/// Fetch a uv.lock direct-URL wheel: validate its tags against the
+/// declared pod interpreter, download, verify the lock's hash.
+fn fetch_pip_wheel_direct(
+    pin: &PipPin,
+    url: &str,
+    tree: &Path,
+    target_minor: Option<u8>,
+) -> miette::Result<()> {
+    let filename = url.rsplit('/').next().unwrap_or("wheel.whl");
+    if let Some(minor) = target_minor {
+        validate_wheel_python(filename, minor)?;
+    }
+    let dest = tree.join(filename);
+    http_get_to_file(url, &dest)?;
+    match pin.hashes.first() {
+        Some(hash) => {
+            let actual = sha256_file(&dest)?;
+            if !constant_eq(actual.as_bytes(), hash.as_bytes()) {
+                let _ = std::fs::remove_file(&dest);
+                miette::bail!("pip: wheel {filename} hash mismatch: expected {hash}, got {actual}");
+            }
+            Ok(())
+        }
+        None => {
+            let actual = sha256_file(&dest)?;
+            crate::output::warn(format!(
+                "pip: wheel {filename} fetched unpinned (hash {actual:.16}… — pin it in the lock)"
+            ));
+            Ok(())
+        }
+    }
+}
+
+/// Resolve one pin on the index's PEP 503 project page: pick the first
+/// anchor matching name+version+tags, validate it against the declared
+/// pod interpreter, download, verify against the lock's hash or the
+/// anchor hash (TOFU when the lock carries none).
+fn fetch_pip_wheel_index(
+    pin: &PipPin,
+    index: &str,
+    tree: &Path,
+    work: &Path,
+    target_minor: Option<u8>,
+) -> miette::Result<()> {
     let page_url = format!(
         "{}/{}/",
         index.trim_end_matches('/'),
@@ -1000,6 +1136,9 @@ fn fetch_pip_wheel(pin: &PipPin, index: &str, tree: &Path, work: &Path) -> miett
             v = pin.version
         );
     };
+    if let Some(minor) = target_minor {
+        validate_wheel_python(&filename, minor)?;
+    }
     let url = resolve_url(&page_url, href.split('#').next().unwrap_or(&href));
     let dest = tree.join(&filename);
     http_get_to_file(&url, &dest)?;
@@ -1236,25 +1375,31 @@ fn fetch_cargo_closure(
     let dl = work.join("cargo-dl");
     std::fs::create_dir_all(&dl).map_err(|e| miette::miette!("creating {}: {e}", dl.display()))?;
     for c in &crates {
-        let url = format!("{api}/{}/{}/download", c.name, c.version);
-        let crate_file = dl.join(format!("{}-{}.crate", c.name, c.version));
-        http_get_to_file(&url, &crate_file)?;
-        let actual = sha256_file(&crate_file)?;
-        if !constant_eq(actual.as_bytes(), c.checksum.as_bytes()) {
-            let _ = std::fs::remove_file(&crate_file);
-            miette::bail!(
-                "cargo: crate {}-{} hash mismatch: expected {}, got {actual}",
-                c.name,
-                c.version,
-                c.checksum
-            );
-        }
-        let dest = vendor.join(format!("{}-{}", c.name, c.version));
-        extract_npm_tarball(&crate_file, &dest)
-            .map_err(|e| miette::miette!("cargo '{}-{}': {e}", c.name, c.version))?;
-        write_cargo_checksums(&dest, &c.checksum)?;
+        fetch_cargo_crate(c, api, &dl, &vendor)?;
     }
     Ok(())
+}
+
+/// Download one crate, verify its lockfile checksum, extract it into the
+/// vendor tree, and write its `.cargo-checksum.json`.
+fn fetch_cargo_crate(c: &CargoCrate, api: &str, dl: &Path, vendor: &Path) -> miette::Result<()> {
+    let url = format!("{api}/{}/{}/download", c.name, c.version);
+    let crate_file = dl.join(format!("{}-{}.crate", c.name, c.version));
+    http_get_to_file(&url, &crate_file)?;
+    let actual = sha256_file(&crate_file)?;
+    if !constant_eq(actual.as_bytes(), c.checksum.as_bytes()) {
+        let _ = std::fs::remove_file(&crate_file);
+        miette::bail!(
+            "cargo: crate {}-{} hash mismatch: expected {}, got {actual}",
+            c.name,
+            c.version,
+            c.checksum
+        );
+    }
+    let dest = vendor.join(format!("{}-{}", c.name, c.version));
+    extract_npm_tarball(&crate_file, &dest)
+        .map_err(|e| miette::miette!("cargo '{}-{}': {e}", c.name, c.version))?;
+    write_cargo_checksums(&dest, &c.checksum)
 }
 
 /// Write a vendored crate's `.cargo-checksum.json`: every regular file's
@@ -2000,6 +2145,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wheel_python_validation_matches_declared_interpreter() {
+        // Plain cp3x wheels: exact minor match required.
+        assert!(
+            validate_wheel_python("pydantic_core-2.46.5-cp314-cp314-manylinux.whl", 14).is_ok()
+        );
+        assert!(
+            validate_wheel_python("pydantic_core-2.46.5-cp312-cp312-manylinux.whl", 14).is_err()
+        );
+        // abi3 wheels run on any newer CPython.
+        assert!(validate_wheel_python("cffi-2.1.1-cp39-abi3-manylinux.whl", 14).is_ok());
+        assert!(validate_wheel_python("cffi-2.1.1-cp314-abi3-manylinux.whl", 12).is_err());
+        // Pure-python tags run anywhere.
+        assert!(validate_wheel_python("requests-2.34.2-py3-none-any.whl", 14).is_ok());
+        assert!(validate_wheel_python("requests-2.34.2-py2.py3-none-any.whl", 14).is_ok());
+        // Non-wheel artifacts are not tag-checked.
+        assert!(validate_wheel_python("skillspector-2.11.2.tar.gz", 14).is_ok());
+    }
+
+    #[test]
+    fn parse_python_minor_requires_three_dot_minor() {
+        assert_eq!(parse_python_minor("3.14").unwrap(), 14);
+        assert!(parse_python_minor("3").is_err());
+        assert!(parse_python_minor("3.x").is_err());
+        assert!(parse_python_minor("4.0").is_err());
+    }
+
+    #[test]
     fn parse_npm_lock_v3() {
         let lock = r#"{
             "name": "app", "version": "1.0.0", "lockfileVersion": 3,
@@ -2157,7 +2329,7 @@ name = "local-tool"
 version = "1.0.0"
 source = { editable = "." }
 "#;
-        let pins = parse_pip_pins(lock.as_bytes()).unwrap();
+        let pins = parse_pip_pins(lock.as_bytes(), None).unwrap();
         // dbgpu (sdist-only) and local-tool (editable) are skipped with a
         // warning; the whichllm, psutil, and pydantic-core closures
         // survive.
@@ -2182,6 +2354,29 @@ source = { editable = "." }
             .unwrap()
             .contains("manylinux_2_17_x86_64"));
         assert_eq!(pins[2].hashes, vec!["ffff"]);
+    }
+
+    #[test]
+    fn parse_uv_lock_prefers_the_declared_python_minor() {
+        let lock = r#"
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "pydantic-core"
+version = "2.46.5"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.example/pydantic_core-2.46.5-cp312-cp312-manylinux_2_17_x86_64.whl", hash = "sha256:3123" },
+    { url = "https://files.example/pydantic_core-2.46.5-cp314-cp314-manylinux_2_17_x86_64.whl", hash = "sha256:3144" },
+]
+"#;
+        // Without a declared interpreter, first match wins (lock order).
+        let pins = parse_pip_pins(lock.as_bytes(), None).unwrap();
+        assert!(pins[0].url.as_deref().unwrap().contains("cp312"));
+        // With python = "3.14", the cp314 wheel outranks the cp312 one.
+        let pins = parse_pip_pins(lock.as_bytes(), Some(14)).unwrap();
+        assert!(pins[0].url.as_deref().unwrap().contains("cp314"));
     }
 
     #[test]
@@ -2233,7 +2428,7 @@ wheels = [
 
         // parse_uv_lock skips the dev-only set BEFORE the wheel checks:
         // both dev wheels exist and match this platform, yet only prod pins.
-        let pins = parse_uv_lock(text.as_bytes()).unwrap();
+        let pins = parse_uv_lock(text.as_bytes(), None).unwrap();
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].name, "prod");
         assert_eq!(pins[0].hashes, vec!["pppp"]);
@@ -2312,7 +2507,7 @@ wheels = [
 "#;
         let lock: UvLock = toml::from_str(text).unwrap();
         assert!(dev_only_names(&lock.package).is_empty());
-        let pins = parse_uv_lock(text.as_bytes()).unwrap();
+        let pins = parse_uv_lock(text.as_bytes(), None).unwrap();
         assert_eq!(pins.len(), 2);
     }
 
@@ -2320,12 +2515,12 @@ wheels = [
     fn uv_lock_sniffed_over_requirements_format() {
         // A uv.lock routes to the TOML parser even via the shared entry.
         let lock = "[[package]]\nname = \"x\"\nversion = \"1.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://f/x-1.0-py3-none-any.whl\" }]\n";
-        let pins = parse_pip_pins(lock.as_bytes()).unwrap();
+        let pins = parse_pip_pins(lock.as_bytes(), None).unwrap();
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].name, "x");
         // A requirements file never sniffs as uv.lock (no [[package]]).
         let req = "certifi==2024.2.2\n";
-        let pins = parse_pip_pins(req.as_bytes()).unwrap();
+        let pins = parse_pip_pins(req.as_bytes(), None).unwrap();
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].name, "certifi");
         assert!(pins[0].url.is_none());

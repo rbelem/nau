@@ -1098,31 +1098,38 @@ gated_test!(uv_dev_split_never_fetches_dev_wheels, &["python3"], {
     );
 });
 
-// ── deps.pip `exclude` is a parse-time hard error (npm only) ──
+// ── deps.pip `exclude` filters the closure fetch (exact names) ──
 
-gated_test!(pip_exclude_rejected_at_parse, &[], {
+gated_test!(pip_exclude_filters_fetch, &[], {
     let project = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let server = tempfile::tempdir().unwrap();
     let (port, log) = serve_dir(server.path());
     write_pip_pkg(project.path(), server.path(), "pyxapp", "x", port);
 
-    // Amend the declaration to carry the unsupported option.
+    // Amend the declaration to exclude the locked package and drop the
+    // build's extraction of its (now unfetched) wheel.
     let lua_path = project.path().join("pkgs/p/pyxapp.lua");
-    let lua = std::fs::read_to_string(&lua_path).unwrap().replace(
+    let lua = std::fs::read_to_string(&lua_path).unwrap();
+    let lua = lua.replace(
         "lock = \"requirements.lock\"",
         "lock = \"requirements.lock\", exclude = { \"pcalc\" }",
+    );
+    // Replace the whole build line: the extraction step references the
+    // excluded (now unfetched) wheel.
+    let start = lua.find("build = \"").unwrap();
+    let end = lua[start..].find("\",\n").unwrap() + start + 1;
+    let lua = format!(
+        "{}build = \"mkdir -p $STAGE/lib/pymods/site-packages && cp $SRC/main.py $STAGE/lib/pymods/main.py\"{}",
+        &lua[..start],
+        &lua[end..]
     );
     std::fs::write(&lua_path, lua).unwrap();
 
     let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "add", "pyxapp"]);
-    assert_ne!(code, Some(0), "pip exclude must be rejected: {stdout}");
-    assert!(
-        stderr.contains("'exclude' is not supported (npm only)"),
-        "failure must name the unsupported option: {stderr}"
-    );
-    // The rejection is a parse-time hard error: nothing was fetched.
-    assert_eq!(requests_for(&log, "/wheels/"), 0);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+    // The excluded package's wheel was never requested.
+    assert_eq!(requests_for(&log, "/wheels/pcalc"), 0);
 });
 
 // ── cargo fixture (issue #36): crates served on the loopback, lock-pinned ──

@@ -19,12 +19,14 @@
 -- path, same as bun.lua's zlib note). The JS payload is self-contained
 -- (the flake installs NO node_modules at all), but it must run from its
 -- package dir — cli.js resolves its sibling index.js/anydoc.js and the
--- .node relative to __dirname — so the launcher is a self-locating sh
--- script (three-dirname through the farm's symlink chain, blesh-share
--- pattern) execing pool node on the real in-payload cli.js, the direct
--- translation of the flake's makeWrapper. `node` in requires covers the
--- interpreter (zg.lua's interpreter = "node" leans on the same runtime
--- resolution); glibc covers node itself.
+-- .node relative to __dirname — so the app is declared the zg.lua way:
+-- command = the in-payload cli.js, interpreter = "node" (issue #9/#13).
+-- The tree wrapper execs node on the cli.js's extension-tree path — the
+-- only runtime-correct shape; a farm blob path strands the __dirname
+-- derivation and a hand-rolled sh launcher is never tree-routed (sh
+-- shebangs are host-guaranteed, so the emitter copies them verbatim —
+-- found live on the daily pod 2026-09-18). `node` in requires covers
+-- the interpreter; glibc covers node itself.
 --
 -- build_deps: (none).
 
@@ -62,11 +64,9 @@ return {
         -- the makeWrapper translated to a self-locating sh launcher.
         build = table.concat({
             "pkg=$STAGE/usr/lib/node_modules/@firecrawl/anydoc",
-            "mkdir -p \"$pkg\" $STAGE/usr/bin",
+            "mkdir -p \"$pkg\"",
             "cp -r $SRC/main/. \"$pkg/\"",
             "cp $SRC/addon/anydoc.linux-x64-gnu.node $SRC/addon/package.json \"$pkg/\"",
-            "printf '%s\\n' '#!/bin/sh' 'root=$(dirname \"$(dirname \"$(dirname \"$0\")\")\")' 'exec node \"$root/usr/lib/node_modules/@firecrawl/anydoc/cli.js\" \"$@\"' > $STAGE/usr/bin/anydoc",
-            "chmod +x $STAGE/usr/bin/anydoc",
         }, " && "),
 
         type = "source",
@@ -74,7 +74,8 @@ return {
 
         apps = {
             anydoc = app {
-                command = "usr/bin/anydoc",
+                command = "usr/lib/node_modules/@firecrawl/anydoc/cli.js",
+                interpreter = "node",
             },
         },
     },

@@ -10,8 +10,11 @@ DAILY="$HOME/.local/share/shuttle/pods/daily"
 
 inner() {
   local rc=0
-  # daily tools: first PATH hit must be the pod farm, no devbox hits
-  local tools="atuin bw bws bun chezmoi dconf delta difft doggo dos2unix evtest fd file fzf gmc gh ghq git git-credential-manager git-credential-oauth htop jq luarocks node perltidy python3 rg sesh sqlite3 starship statix tig tmux tree tree-sitter unzip uv wl-copy wtype xxd zoxide 7z blesh-share"
+  # daily tools: first PATH hit must be the pod farm, no devbox hits.
+  # Two documented overrides: python3 may resolve to the pod-derived
+  # venv (pyvenv.cfg home = the pod python), and starship may resolve
+  # to the deliberate ~/.local/bin local build (checklist §4.6).
+  local tools="atuin bw bws bun chezmoi dconf delta difft doggo dos2unix evtest fd file fzf gmc gh ghq git git-credential-manager git-credential-oauth htop jq luarocks node perltidy python3 rg sesh sqlite3 starship statix tig tmux tree tree-sitter unzip uv wl-copy wtype xxd zoxide 7zz blesh-share"
   local t hits first
   for t in $tools; do
     hits=$(type -aP "$t" 2>/dev/null)
@@ -21,6 +24,10 @@ inner() {
     fi
     if printf '%s\n' "$hits" | grep -q '/devbox/'; then
       printf 'FAIL %-24s devbox hit: %s\n' "$t" "$(printf '%s\n' "$hits" | grep /devbox/ | head -1)"; rc=1
+    elif [ "$t" = python3 ] && [ -n "${VIRTUAL_ENV:-}" ] && [ "${first#"$VIRTUAL_ENV"}" != "$first" ]; then
+      printf 'ok   %-24s %s (pod python venv)\n' "$t" "$first"
+    elif [ "$t" = starship ] && [ "$first" = "$HOME/.local/bin/starship" ]; then
+      printf 'ok   %-24s %s (local override, §4.6)\n' "$t" "$first"
     elif [ "${first#"$DAILY"}" != "$first" ]; then
       printf 'ok   %-24s %s\n' "$t" "$first"
     else
@@ -80,15 +87,23 @@ if [ -n "${SHUTTLE_SWEEP_INNER:-}" ]; then
   inner
   rc=$?
   [ "$rc" -eq 0 ] && echo 'INNER: all gates green' || echo 'INNER: gates red'
+  # ble.sh intercepts the interactive exit and can swallow the status,
+  # so the verdict travels through a file, not the pty's exit code.
+  printf '%s\n' "$rc" > "${SHUTTLE_SWEEP_RCFILE:?SHUTTLE_SWEEP_RCFILE required}"
   set +u
   exit "$rc"
 fi
 
 SELF="$(readlink -f "$0")"
-if printf 'source %q\n' "$SELF" | script -qec "env SHUTTLE_SWEEP_INNER=1 bash -li" /dev/null; then
-  echo 'SWEEP: all gates green'
-  exit 0
-else
-  echo 'SWEEP: failures above' >&2
-  exit 1
-fi
+RCFILE="$(mktemp)"
+trap 'rm -f "$RCFILE"' EXIT
+# Keep stdin open for a grace window: script may otherwise close the
+# pty before the login shell has read the source line (racy). The
+# inner's `exit` ends the session long before the window expires.
+{ printf 'source %q\n' "$SELF"; sleep 60; } \
+  | script -qec "env SHUTTLE_SWEEP_INNER=1 SHUTTLE_SWEEP_RCFILE='$RCFILE' bash -li" /dev/null \
+  && [ -f "$RCFILE" ] && [ "$(cat "$RCFILE")" = 0 ]
+rc=$?
+[ "$rc" -eq 0 ] && { echo 'SWEEP: all gates green'; exit 0; }
+echo 'SWEEP: failures above' >&2
+exit 1

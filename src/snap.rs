@@ -217,8 +217,16 @@ pub struct DepsLockSpec {
     pub index: Option<String>,
     /// Glob patterns (`*` / `?`) matched against lock keys
     /// (`node_modules/...`, full-key match); any key matching one is
-    /// never fetched (npm only, issue #14).
+    /// never fetched (npm only, issue #14). pip reuses the field with
+    /// exact-name semantics: a listed package is never fetched.
     pub exclude: Vec<String>,
+    /// pip only: the CPython minor version the consuming pod interpreter
+    /// runs (e.g. "3.14"). Declared, every fetched wheel's tags are
+    /// validated against it and a mismatch fails the fetch closed —
+    /// uv.lock entries carry the locking machine's wheel choice, which
+    /// is silently wrong for a different interpreter (cp312 wheels on a
+    /// 3.14 pod import nothing). Undeclared: no tag validation (legacy).
+    pub python: Option<String>,
 }
 
 // ── Phase 3: Snap metadata structs ──
@@ -995,13 +1003,25 @@ fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLoc
     };
     let exclude = match key {
         "npm" => npm_exclude_from_lua(t)?,
+        "pip" => pip_exclude_from_lua(t)?,
         _ => {
             if pip_exclude_present(t) {
                 return Err(miette::miette!(
-                    "deps.{key}: 'exclude' is not supported (npm only)"
+                    "deps.{key}: 'exclude' is not supported (npm, pip only)"
                 ));
             }
             Vec::new()
+        }
+    };
+    let python = match key {
+        "pip" => get_opt_string(t, "python")?,
+        _ => {
+            if get_opt_string(t, "python")?.is_some() {
+                return Err(miette::miette!(
+                    "deps.{key}: 'python' is not supported (pip only)"
+                ));
+            }
+            None
         }
     };
     Ok(DepsLockSpec {
@@ -1009,6 +1029,7 @@ fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLoc
         sum,
         index,
         exclude,
+        python,
     })
 }
 
@@ -1063,6 +1084,38 @@ fn npm_exclude_from_lua(t: &mlua::Table) -> miette::Result<Vec<String>> {
 /// True when a pip spec table carries an `exclude` key (any value).
 fn pip_exclude_present(t: &mlua::Table) -> bool {
     !matches!(t.get::<Value>("exclude").unwrap_or(Value::Nil), Value::Nil)
+}
+
+/// pip `exclude`: a plain array of exact package names (not globs) that
+/// the closure fetch must skip — the declarative form of a documented
+/// runtime degradation (e.g. a wheel that cannot serve the pod's
+/// interpreter and whose absence the app itself tolerates).
+fn pip_exclude_from_lua(t: &mlua::Table) -> miette::Result<Vec<String>> {
+    let value = t.get::<Value>("exclude").unwrap_or(Value::Nil);
+    let Value::Table(arr) = value else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for pair in arr.sequence_values::<Value>() {
+        let Value::String(s) = pair.map_err(|e| miette::miette!("deps.pip: 'exclude': {e}"))?
+        else {
+            return Err(miette::miette!(
+                "deps.pip: 'exclude' entries must be strings"
+            ));
+        };
+        let name = s
+            .to_str()
+            .map_err(|e| miette::miette!("deps.pip: 'exclude': {e}"))?
+            .to_string();
+        if name.contains('*') || name.contains('?') {
+            return Err(miette::miette!(
+                "deps.pip: 'exclude' entries are exact package names — \
+                 globs are an npm-only shape, got '{name}'"
+            ));
+        }
+        out.push(name);
+    }
+    Ok(out)
 }
 
 /// Map an icon source path to its in-snap target (`meta/gui/icon.<ext>`),
@@ -5440,6 +5493,36 @@ fn cp_r(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pip_deps_spec_parses_python_and_exclude() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return { lock = "uv.lock", python = "3.14", exclude = { "yara-python" } }
+            "#,
+            )
+            .unwrap();
+        let spec = deps_lock_spec_from_lua("pip", &table).unwrap();
+        assert_eq!(spec.lock, "uv.lock");
+        assert_eq!(spec.python.as_deref(), Some("3.14"));
+        assert_eq!(spec.exclude, vec!["yara-python".to_string()]);
+    }
+
+    #[test]
+    fn pip_deps_spec_rejects_python_globs_in_exclude_and_non_pip_python() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(r#"return { lock = "l", exclude = { "*" } }"#)
+            .unwrap();
+        assert!(deps_lock_spec_from_lua("pip", &table).is_err());
+
+        let npm_table = env
+            .eval(r#"return { lock = "l", python = "3.14" }"#)
+            .unwrap();
+        assert!(deps_lock_spec_from_lua("npm", &npm_table).is_err());
+    }
 
     /// Evaluate with DSL and get top-level table (keeps Lua alive for the duration).
     struct LuaEnv {

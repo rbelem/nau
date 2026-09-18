@@ -16,16 +16,19 @@
 -- Dependency closure: deps.pip against the uv.lock shipped in the
 -- tarball (581 KB, requires-python >=3.12,<3.15 — the pod's python 3.14
 -- fits). The resolver fetches every registry, non-dev-only,
--- platform-matching wheel from the lock. The flake's one custom build —
--- pywhatwgurl 0.1.1 via hatch-vcs with a pretend version — is
--- unnecessary here: 0.1.1 publishes a pure py3-none-any wheel that the
--- lock carries directly. Known degradation: yara-python 4.5.4 ships
--- only cp312/cp313 wheels (no cp314, no abi3), so its wheel cannot
--- serve the pod's python 3.14 — the static_yara analyzer module fails
--- its `import yara` and skillspector's analyzer loader skips it with a
--- logged error (per-module ImportError handling); every other analyzer
--- runs. The flake had no such gap because nixpkgs compiles yara-python
--- from the sdist against its own interpreter.
+-- platform-matching wheel from the lock; `python = "3.14"` makes the
+-- fetch validate every wheel's tags against the pod interpreter —
+-- uv.lock records the LOCKING machine's wheel choice, and without the
+-- check it silently ships cp312 wheels a 3.14 runtime cannot import
+-- (found live: pydantic_core's compiled module, 2026-09-18). The flake's
+-- one custom build — pywhatwgurl 0.1.1 via hatch-vcs with a pretend
+-- version — is unnecessary here: 0.1.1 publishes a pure py3-none-any
+-- wheel that the lock carries directly. yara-python is excluded
+-- outright: its published wheels stop at cp313 (no cp314, no abi3), so
+-- none can serve the pod's python; skillspector's analyzer loader
+-- skips the missing static_yara module with a logged error and every
+-- other analyzer runs. The flake had no such gap because nixpkgs
+-- compiles yara-python from the sdist against its own interpreter.
 --
 -- Requires: glibc plus libstdcpp/libgcc — the closure carries C++ and
 --           Rust wheels (uvloop, pydantic-core, orjson, cryptography)
@@ -60,7 +63,8 @@ return {
         },
 
         deps = {
-            pip = { lock = "uv.lock" },
+            pip = { lock = "uv.lock", python = "3.14",
+                    exclude = { "yara-python", "backports-zstd" } },
         },
 
         build = table.concat({
@@ -77,6 +81,13 @@ return {
             -- pod and PYTHONPATH from the staged site-packages.
             "printf '#!/usr/bin/env python3\\nfrom skillspector.cli import app\\napp()\\n' > $STAGE/usr/bin/skillspector",
             "chmod +x $STAGE/usr/bin/skillspector",
+            -- The source copy above carries no dist-info, so
+            -- importlib.metadata.version("skillspector") (the CLI's
+            -- --version path) raises PackageNotFoundError — found live
+            -- on the daily pod 2026-09-18. Synthesize the minimal
+            -- metadata the source copy lacks.
+            "mkdir -p $STAGE/usr/lib/python3.14/site-packages/skillspector-2.11.2.dist-info",
+            "printf '%s\\n' 'Metadata-Version: 2.1' 'Name: skillspector' 'Version: 2.11.2' > $STAGE/usr/lib/python3.14/site-packages/skillspector-2.11.2.dist-info/METADATA",
         }, " && "),
 
         type = "source",
