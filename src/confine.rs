@@ -8,6 +8,10 @@
 //! unconfined), and execs the app's real command binary inside the
 //! sandbox.
 //!
+//! Issue #102 adds the arbitrary-command form: `shuttle run -- <cmd…>`
+//! execs any command with the pod's env overlaid (farm-first PATH +
+//! loader-lib LD_LIBRARY_PATH) and no sandbox — fail-open by design.
+//!
 //! Both backends honor the SAME shared grants vocabulary, so they are
 //! interchangeable for anything expressible in it. `backend_options` is
 //! the non-portable finetune escape hatch (documented as lost when
@@ -24,6 +28,8 @@ use crate::snap::{BackendKind, Confinement, SANDBOX_RO_ROOTS};
 /// the package providing `app`, reads its effective (per-app or
 /// package-level) confinement, verifies the backend is available (fail
 /// closed), then `exec`s the app's real command binary inside the sandbox.
+/// A name no package provides falls through to the arbitrary-command
+/// form (issue #102): `[app] ++ args` runs with the pod env, unconfined.
 ///
 /// An unconfined app reached here (explicit `shuttle run` misuse, or a
 /// pod overridden to unconfined) is exec'd directly — transparent, no
@@ -33,12 +39,14 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
     let gen = store.active_generation()?.ok_or_else(|| {
         miette::miette!("pod '{pod_name}' has no active generation — nothing to run for '{app}'")
     })?;
-    let (pkg_name, pkg, real_hash) = resolve_app(&gen, app).ok_or_else(|| {
-        miette::miette!(
-            "app '{app}' is not provided by any package in pod '{pod_name}' \
-             (checked its active generation)"
-        )
-    })?;
+    let Some((pkg_name, pkg, real_hash)) = resolve_app(&gen, app) else {
+        // Not a declared app: the arbitrary-command form (#102) takes
+        // over — everything after the app name is the command vector.
+        let mut cmd: Vec<String> = Vec::with_capacity(1 + args.len());
+        cmd.push(app.to_string());
+        cmd.extend_from_slice(args);
+        return run_command(pod_dir, pod_name, &cmd);
+    };
 
     // Issue #37: a multi-file app execs its ASSEMBLED binary — the
     // hardlinked leaf in the generation's assembly subtree, whose
@@ -109,6 +117,121 @@ fn exec_direct(bin: &Path, args: &[String]) -> miette::Result<()> {
         cmd.arg(a);
     }
     exec_cmd(cmd)
+}
+
+// ── Arbitrary-command form (issue #102) ──
+
+/// Run an arbitrary command with the pod's environment overlaid (issue
+/// #102): the farm-first PATH and loader-lib LD_LIBRARY_PATH of
+/// [`crate::pod::shellenv`] — the SAME env contract the shell export
+/// uses, never a second one. No confinement, no sandbox (fail-open by
+/// design). Transparent exec: the command replaces this process, so its
+/// exit status is `shuttle run`'s.
+///
+/// Trust: the command runs with the caller's full privileges, and a
+/// farm name resolves BEFORE the caller's PATH — the pod's active
+/// generation is trusted like the caller's own bin directory.
+pub fn run_command(pod_dir: &Path, pod_name: &str, command: &[String]) -> miette::Result<()> {
+    // `pod_dir` is `<root>/<pod>` (the store lives under the pod), while
+    // the shellenv contract is rooted at the pod state root one level up.
+    let root = pod_dir.parent().unwrap_or(pod_dir);
+    let env = crate::pod::shellenv(root, pod_name)?;
+    let farm = PathBuf::from(&env.farm);
+    let Some(prog) = command.first() else {
+        miette::bail!("shuttle run: empty command — nothing to exec");
+    };
+    let program = resolve_command(prog, &farm)?;
+    let mut cmd = std::process::Command::new(program);
+    for a in &command[1..] {
+        cmd.arg(a);
+    }
+    overlay_pod_env(&mut cmd, &env);
+    exec_cmd(cmd)
+}
+
+/// Resolve the command's program: a name containing `/` is an explicit
+/// path taken verbatim (like sh, no resolution); otherwise the pod's
+/// farm is searched before the caller's PATH, because the pod's active
+/// generation is the provider seam this command form is about.
+fn resolve_command(name: &str, farm: &Path) -> miette::Result<PathBuf> {
+    let mut entries = vec![farm.to_path_buf()];
+    if let Some(path) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&path));
+    }
+    resolve_command_in(name, &entries)
+}
+
+/// The resolution proper, over explicit entries — split out so tests can
+/// pin lookup order without mutating the process PATH (the suite runs
+/// tests in parallel).
+fn resolve_command_in(name: &str, entries: &[PathBuf]) -> miette::Result<PathBuf> {
+    if name.contains('/') {
+        return Ok(PathBuf::from(name));
+    }
+    crate::snap::resolve_in_path(name, entries).ok_or_else(|| {
+        miette::miette!(
+            "command '{name}' not found in the pod's farm ({}), or PATH — \
+             add the package that provides it to the pod \
+             (`shuttle pod add <package>`) or install it on the host PATH",
+            entries
+                .first()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        )
+    })
+}
+
+/// Overlay the pod env onto `cmd`, mirroring
+/// [`crate::pod::render_shellenv`]'s semantics: PATH is the farm
+/// prepended to the caller's existing PATH (the farm alone when the
+/// caller has none), and `LD_LIBRARY_PATH` gets the loader libs prepended
+/// ahead of any existing value — the `${VAR:+:$VAR}` idiom, so an
+/// unset/empty variable never produces a trailing empty element (which
+/// the dynamic loader would read as the current directory). Empty `libs`
+/// leaves `LD_LIBRARY_PATH` untouched.
+fn overlay_pod_env(cmd: &mut std::process::Command, env: &crate::pod::PodShellenv) {
+    overlay_pod_env_with(
+        cmd,
+        env,
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("LD_LIBRARY_PATH").as_deref(),
+    )
+}
+
+/// The overlay proper, over explicit existing values — split out so
+/// tests can pin the semantics (including unset/empty) without mutating
+/// the process environment.
+fn overlay_pod_env_with(
+    cmd: &mut std::process::Command,
+    env: &crate::pod::PodShellenv,
+    existing_path: Option<&std::ffi::OsStr>,
+    existing_ld: Option<&std::ffi::OsStr>,
+) {
+    // split_paths of an unset PATH yields nothing, and an EMPTY string
+    // would yield one empty entry (a trailing empty element the loader
+    // reads as the current directory) — so empty is filtered explicitly:
+    // the farm alone is exported either way.
+    let mut entries = vec![PathBuf::from(&env.farm)];
+    if let Some(existing) = existing_path {
+        if !existing.is_empty() {
+            entries.extend(std::env::split_paths(existing));
+        }
+    }
+    // join_paths only fails when an entry contains the separator; fall
+    // back to the bare farm rather than silently dropping the seam.
+    let path = std::env::join_paths(&entries).unwrap_or_else(|_| env.farm.as_str().into());
+    cmd.env("PATH", path);
+
+    if !env.libs.is_empty() {
+        let mut ld = std::ffi::OsString::from(env.libs.join(":"));
+        if let Some(existing) = existing_ld {
+            if !existing.is_empty() {
+                ld.push(":");
+                ld.push(existing);
+            }
+        }
+        cmd.env("LD_LIBRARY_PATH", ld);
+    }
 }
 
 /// Exec `bin` under a bwrap sandbox built from the grants (ticket #11).
@@ -511,5 +634,207 @@ mod tests {
         pkg.assembly.clear();
         let target = exec_target(&store, 3, &pkg.name, &pkg, "gcm", "aa11");
         assert_eq!(target, store.blob_path("aa11"));
+    }
+
+    // ── Issue #102: the arbitrary-command form ──
+
+    /// Seed a pod with an active generation the way the production
+    /// mechanisms do: a manifest-bearing generation dir (the store's
+    /// `active` source of truth) plus a farm and the `current` link
+    /// (the pod flip), as pod.rs's `seed_active_pod` does. Returns the
+    /// pod dir. Executables are added by each test.
+    fn seed_command_pod(root: &Path, pod: &str, generation: u64) -> PathBuf {
+        let dir = root.join(pod);
+        let gen_dir = dir.join("generations").join(generation.to_string());
+        let farm = gen_dir.join("farm");
+        std::fs::create_dir_all(&farm).unwrap();
+        let gen = crate::runtime::Generation {
+            n: generation,
+            base_version: "24.04".into(),
+            packages: BTreeMap::new(),
+            created_epoch: 0,
+            boot_entry: None,
+        };
+        std::fs::write(
+            gen_dir.join("manifest.json"),
+            serde_json::to_vec(&gen).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(format!("generations/{generation}"), dir.join("active"))
+            .unwrap();
+        crate::farm::flip_current(&dir, generation).unwrap();
+        dir
+    }
+
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn sample_command_env(farm: &Path, libs: Vec<String>) -> crate::pod::PodShellenv {
+        crate::pod::PodShellenv {
+            pod: "work".into(),
+            farm: farm.display().to_string(),
+            generation: Some(1),
+            libs,
+        }
+    }
+
+    /// The env overlay result as seen through the built command.
+    fn env_of(cmd: &std::process::Command, key: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn resolve_command_prefers_the_farm_over_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("farm");
+        std::fs::create_dir_all(&farm).unwrap();
+        make_executable(&farm.join("tool"));
+        let pathdir = tmp.path().join("onpath");
+        std::fs::create_dir_all(&pathdir).unwrap();
+        make_executable(&pathdir.join("tool"));
+        let entries = vec![farm.clone(), pathdir.clone()];
+        assert_eq!(
+            resolve_command_in("tool", &entries).unwrap(),
+            farm.join("tool")
+        );
+    }
+
+    #[test]
+    fn resolve_command_falls_through_to_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("farm"); // exists, lacks the name
+        std::fs::create_dir_all(&farm).unwrap();
+        let pathdir = tmp.path().join("onpath");
+        std::fs::create_dir_all(&pathdir).unwrap();
+        make_executable(&pathdir.join("tool"));
+        let entries = vec![farm, pathdir.clone()];
+        assert_eq!(
+            resolve_command_in("tool", &entries).unwrap(),
+            pathdir.join("tool")
+        );
+    }
+
+    #[test]
+    fn resolve_command_passes_explicit_paths_through_verbatim() {
+        // A name containing '/' is a path, not a lookup — no entries
+        // consulted (even bogus ones, proving no resolution ran).
+        let entries = vec![PathBuf::from("/nonexistent-farm")];
+        assert_eq!(
+            resolve_command_in("./scripts/deploy.sh", &entries).unwrap(),
+            PathBuf::from("./scripts/deploy.sh")
+        );
+        assert_eq!(
+            resolve_command_in("/usr/bin/env", &entries).unwrap(),
+            PathBuf::from("/usr/bin/env")
+        );
+    }
+
+    #[test]
+    fn resolve_command_miss_names_the_command_and_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("farm");
+        std::fs::create_dir_all(&farm).unwrap();
+        let pathdir = tmp.path().join("onpath");
+        std::fs::create_dir_all(&pathdir).unwrap();
+        let entries = vec![farm.clone(), pathdir];
+        let err = resolve_command_in("nosuchcmd", &entries)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("nosuchcmd") && err.contains("PATH"),
+            "error must name the command and the fix surface: {err}"
+        );
+        assert!(
+            err.contains(&farm.display().to_string()),
+            "error must name the farm searched: {err}"
+        );
+    }
+
+    #[test]
+    fn overlay_pod_env_is_farm_first_and_prepends_loader_libs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("current");
+        let env = sample_command_env(&farm, vec![format!("{}/../usr/lib", farm.display())]);
+        let mut cmd = std::process::Command::new("true");
+        overlay_pod_env_with(
+            &mut cmd,
+            &env,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+            Some(std::ffi::OsStr::new("/opt/legacy")),
+        );
+        assert_eq!(
+            env_of(&cmd, "PATH").unwrap(),
+            format!("{}:/usr/bin:/bin", farm.display()),
+            "farm must precede the caller's PATH"
+        );
+        assert_eq!(
+            env_of(&cmd, "LD_LIBRARY_PATH").unwrap(),
+            format!("{}/../usr/lib:/opt/legacy", farm.display()),
+            "loader libs must precede the existing value, never a trailing empty element"
+        );
+    }
+
+    #[test]
+    fn overlay_pod_env_exports_the_farm_alone_for_unset_or_empty_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("current");
+        let env = sample_command_env(&farm, Vec::new());
+        for existing in [None, Some(std::ffi::OsStr::new(""))] {
+            let mut cmd = std::process::Command::new("true");
+            overlay_pod_env_with(&mut cmd, &env, existing, None);
+            assert_eq!(
+                env_of(&cmd, "PATH").unwrap(),
+                farm.display().to_string(),
+                "unset/empty caller PATH must export just the farm (input: {existing:?})"
+            );
+            // Empty libs: LD_LIBRARY_PATH is left untouched — never set,
+            // so the command inherits the caller's (unset here).
+            assert!(env_of(&cmd, "LD_LIBRARY_PATH").is_none());
+        }
+    }
+
+    #[test]
+    fn overlay_pod_env_empty_libs_leaves_ld_library_path_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("current");
+        let env = sample_command_env(&farm, Vec::new());
+        let mut cmd = std::process::Command::new("true");
+        overlay_pod_env_with(
+            &mut cmd,
+            &env,
+            Some(std::ffi::OsStr::new("/bin")),
+            Some(std::ffi::OsStr::new("/opt/legacy")),
+        );
+        assert!(
+            env_of(&cmd, "LD_LIBRARY_PATH").is_none(),
+            "empty libs must not touch LD_LIBRARY_PATH"
+        );
+    }
+
+    #[test]
+    fn run_falls_through_to_the_command_form_for_undeclared_apps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = seed_command_pod(tmp.path(), "default", 1);
+        // The farm lacks the name and no package provides it: the
+        // failure must be the command-form resolution miss (against the
+        // caller's real PATH too — the name is unique enough to miss
+        // everywhere), proving the command form was entered, not the old
+        // "not provided by any package" error.
+        let missing = "shuttle-102-definitely-missing-zz7f3a9b";
+        let err = run(&dir, "default", missing, &[]).unwrap_err().to_string();
+        assert!(
+            err.contains(missing) && err.contains("PATH"),
+            "expected the command-form resolution miss: {err}"
+        );
+        assert!(
+            !err.contains("not provided by any package"),
+            "the old declared-app error must be gone: {err}"
+        );
     }
 }

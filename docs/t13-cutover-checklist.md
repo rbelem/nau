@@ -44,7 +44,7 @@ Inventory basis: `devbox global list` (91 entries), `devbox.json`
 | nixpkgs packages (48 named) | pool packages + `shuttle pod add` | covered — matrix §2 |
 | ~30 local path flakes (`devbox.d/*`) | pool packages (port per tool) | partial — follow-ups §5.1 |
 | PATH activation (`devbox global shellenv`) | `eval "$(shuttle pod shellenv)"` (#47) | covered |
-| `env:` block (EDITOR, LOCALE_ARCHIVE, PYTHONPATH, VENV_DIR, …) | none — pods have no env surface (ADR-0016 §7 defers env hooks to `shuttle run`) | **open** §5.3 |
+| `env:` block (EDITOR, LOCALE_ARCHIVE, PYTHONPATH, VENV_DIR, …) | `shuttle run -- <cmd…>` env overlay (farm-first PATH + loader seam, #102); per-var `env:` surface still deferred (ADR-0016 §7) | partial — §5.3 |
 | Secrets: init-hook sources `$XDG_RUNTIME_DIR/devbox-secrets.sh`, regenerated from `~/.config/bws/sm.ini` via `bws` + `BWS_ACCESS_TOKEN` (libsecret fallback) | none needed in shuttle — user-level init snippet | checklist step §4.3 |
 | Shell init: ble.sh, starship, zoxide (`cd` alias), fzf bindings, atuin, `set -o vi`, `SUDO_EDITOR`, XDG_DATA_DIRS completions | same init lines in the user's `~/.bashrc.d`, binaries now resolve from the pod farm | checklist step §4.4; ble.sh gap §5.2 |
 | Services: process-compose (`valkey`+search module, `bifrost`, `wigolo`) | none — pods have no service verb (ADR-0015 verb set) | **open** §5.4 |
@@ -307,20 +307,25 @@ it via the pod's `blesh-share` (§4.3).
 
 `EDITOR`/`VISUAL`, `LOCALE_ARCHIVE`, `PYTHONPATH`+`VENV_DIR`,
 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` come from devbox.json's
-`env:`. Pods have no env surface (the `shuttle run` env-hook home is
-earmarked but unbuilt). Interim: keep the exports in a bashrc.d snippet.
-Locale support specifically (LOCALE_ARCHIVE) needs a pod decision:
-system locales vs. a pod locale payload.
+`env:`. Pods have no per-pod env-var surface yet (ADR-0016 §7), but
+the `shuttle run` command half LANDED (2026-09-18, #102):
+`shuttle run -- <cmd…>` execs any command with the pod env overlaid
+(farm-first PATH + loader-lib LD_LIBRARY_PATH per the ADR-0028
+shellenv contract), no sandbox, transparent exec — the `devbox run`
+equivalent. Declared-app-first: a name that is a declared app still
+runs that app (confined). Interim for login env: keep the exports in a
+bashrc.d snippet. Remaining: declared per-pod/package env vars
+(EDITOR/VISUAL, LOCALE_ARCHIVE, PYTHONPATH+VENV_DIR, …) still need the
+env surface (§5.3 list); LOCALE_ARCHIVE needs a pod decision: system
+locales vs. a pod locale payload.
 
 Semantic target for that surface: `shuttle run` becomes the single
 entry point the way `flatpak run` is — the confined-app half exists
-(#11: sandbox from declared grants); the missing half is flatpak's
-`--command` form, an arbitrary command executed with the pod env
-overlaid (farm PATH per the ADR-0028 shellenv contract) and no sandbox
+(#11: sandbox from declared grants); the command half is LANDED
+(#102): an arbitrary command executed with the pod env overlaid
+(farm PATH per the ADR-0028 shellenv contract) and no sandbox
 unless the target declares one. `devbox run` is the reference for the
-env-overlay half: isolated env, transparent exec, nothing else. Filed
-as #102 — not needed for this
-cutover; the bashrc.d interim covers it.
+env-overlay half: isolated env, transparent exec, nothing else.
 
 ### 5.4 Pod services
 

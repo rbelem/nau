@@ -444,17 +444,37 @@ pub enum Command {
         command: PodCommand,
     },
 
-    /// Run a confined app from a pod (ADR-0016, ticket #11): resolve the
+    /// Run an app from a pod (ADR-0016, ticket #11). Two forms,
+    /// dispatched declared-app-first:
+    ///
+    /// Declared app — `shuttle run [--pod N] <app> [args…]`: resolve the
     /// app's declared grants, set up the sandbox with the chosen backend,
     /// then exec the app — transparent to the user (the pod's `current`/
-    /// bin farm symlink points at a wrapper that invokes this). Also the
-    /// future home for env hooks. `--pod` selects the pod (default:
-    /// `default`); a `confined` app on a host where the backend is
-    /// unavailable FAILS CLOSED (never silently runs unconfined).
+    /// bin farm symlink points at a wrapper that invokes this). A
+    /// `confined` app on a host where the backend is unavailable FAILS
+    /// CLOSED (never silently runs unconfined).
+    ///
+    /// Arbitrary command — `shuttle run [--pod N] -- <cmd…>` (issue
+    /// #102): exec any command with the pod's env overlaid (farm-first
+    /// PATH + loader-lib LD_LIBRARY_PATH), no sandbox. Declared-first
+    /// order: a name that IS a declared app always wins, so
+    /// `shuttle run -- <declared-app>` runs the declared app (confined),
+    /// not the command.
+    ///
+    /// TRUST BOUNDARY: the command form runs unsandboxed with the
+    /// caller's full privileges, and farm names shadow host PATH — it
+    /// trusts the pod's content the way the caller trusts their own
+    /// `~/.local/bin`. Confinement stays the declared-app path.
+    ///
+    /// `--pod` selects the pod (default: `default`). Also the future
+    /// home for env hooks.
     #[command(trailing_var_arg = true)]
     Run {
-        /// App (binary name) to run from the selected pod.
-        app: String,
+        /// App name: a declared app from the pod, or — as everything
+        /// after `--` — the start of an arbitrary command whose remaining
+        /// words are the rest of the args. Declared-first: a name that
+        /// matches a declared app always runs that app, confined.
+        app: Option<String>,
 
         /// Pod to operate on (default: `default`).
         #[arg(long, value_name = "POD")]
@@ -2149,5 +2169,65 @@ mod tests {
     #[test]
     fn test_test_requires_image() {
         assert!(Cli::try_parse_from(["shuttle", "test"]).is_err());
+    }
+
+    // ── `shuttle run` command form (issue #102) ──
+
+    #[test]
+    fn test_run_double_dash_starts_the_command_form() {
+        // `--` is sugar for the command form: the first word after it is
+        // the program, the rest its args — forwarded verbatim, hyphens
+        // included.
+        match parse_build(&["shuttle", "run", "--", "git", "-c", "x", "status"]) {
+            Command::Run { app, app_args, .. } => {
+                assert_eq!(app.as_deref(), Some("git"));
+                assert_eq!(app_args, ["-c", "x", "status"]);
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn test_run_pod_flag_before_the_double_dash() {
+        match parse_build(&["shuttle", "run", "--pod", "daily", "--", "true"]) {
+            Command::Run { app, pod, .. } => {
+                assert_eq!(app.as_deref(), Some("true"));
+                assert_eq!(pod.as_deref(), Some("daily"));
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn test_run_bare_parses_without_an_app() {
+        // Bare `shuttle run` parses (the dispatch turns it into a usage
+        // error naming both forms). It must NOT be a clap error: the
+        // confined launcher forwards `<app> "$@"` without a `--`, so the
+        // positional has to stay optional.
+        match parse_build(&["shuttle", "run"]) {
+            Command::Run { app, app_args, .. } => {
+                assert_eq!(app, None);
+                assert!(app_args.is_empty());
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn test_run_declared_app_form_unchanged() {
+        // The confined launcher's shape: bare positional + trailing args,
+        // no `--` anywhere. (Hyphen-leading values here never parsed
+        // without a `--`, before or after #102 — clap rejects them as
+        // unknown flags.)
+        match parse_build(&["shuttle", "run", "--pod", "work", "gcm", "cred"]) {
+            Command::Run {
+                app, pod, app_args, ..
+            } => {
+                assert_eq!(app.as_deref(), Some("gcm"));
+                assert_eq!(pod.as_deref(), Some("work"));
+                assert_eq!(app_args, ["cred"]);
+            }
+            _ => panic!("expected Run"),
+        }
     }
 }

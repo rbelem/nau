@@ -209,7 +209,7 @@ fn main() -> miette::Result<()> {
             pod,
             root,
             app_args,
-        } => cmd_run(pod.as_deref(), root.as_deref(), &app, &app_args),
+        } => cmd_run(pod.as_deref(), root.as_deref(), app.as_deref(), &app_args),
 
         Command::Test {
             image,
@@ -3105,18 +3105,26 @@ fn cmd_pod_rebuild(
     Ok(())
 }
 
-/// `shuttle run <app>`: run a confined app from a pod (ADR-0016, ticket
-/// #11). Resolves the pod's active generation to find the package
-/// providing `app`, reads its declared grants, and execs the app inside
-/// the selected backend's sandbox. Confined apps fail closed when the
-/// backend is unavailable — never silently unconfined. `--pod` selects
-/// the pod (default `default`); `--root` overrides the pod state root.
+/// `shuttle run`: run a declared confined app from a pod (ADR-0016,
+/// ticket #11) or, with `--`, an arbitrary command with the pod's env
+/// overlaid (issue #102). For a declared app this resolves the pod's
+/// active generation to find the package providing `app`, reads its
+/// declared grants, and execs the app inside the selected backend's
+/// sandbox; confined apps fail closed when the backend is unavailable —
+/// never silently unconfined. `--pod` selects the pod (default
+/// `default`); `--root` overrides the pod state root.
 fn cmd_run(
     pod: Option<&str>,
     root: Option<&str>,
-    app: &str,
+    app: Option<&str>,
     app_args: &[String],
 ) -> miette::Result<()> {
+    let Some(app) = app else {
+        return Err(miette::miette!(
+            "shuttle run: nothing to run — name a declared app \
+             (`shuttle run <app>`) or a command (`shuttle run -- <cmd...>`)"
+        ));
+    };
     let pod_name = pod.unwrap_or(shuttle::pod::DEFAULT_POD);
     shuttle::pod::validate_pod_name(pod_name).map_err(|e| miette::miette!("shuttle run: {e}"))?;
     let root = shuttle::pod::pod_root(root);
