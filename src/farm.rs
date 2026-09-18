@@ -83,6 +83,12 @@ pub const ASSEMBLY_DIR: &str = "apps";
 /// generations exactly like the farm itself.
 pub const LOADER_LIBS_FILE: &str = "loader-libs";
 
+/// The generation's recorded declared env: `generations/<n>/env.json` —
+/// the resolved pod env (own declaration composed over loaded pods) as a
+/// JSON object, written by the staging tail when a generation is
+/// presented. The shellenv reads it back and `shuttle run` overlays it.
+pub const ENV_FILE: &str = "env.json";
+
 /// The payload-relative lib directories the loader seam records.
 /// `usr/usr/lib` is the pool's libdir convention (`--prefix=/usr`);
 /// `usr/usr/lib64` is the glibc/toolchain layout. `usr/usr/libexec`
@@ -94,6 +100,11 @@ const LOADER_LIB_SUBDIRS: [&str; 2] = ["usr/usr/lib", "usr/usr/lib64"];
 /// Path of generation `n`'s loader-lib list.
 pub fn loader_libs_path(store: &RuntimeStore, n: u64) -> PathBuf {
     store.generation_dir(n).join(LOADER_LIBS_FILE)
+}
+
+/// Path of generation `n`'s recorded env object.
+pub fn env_path(store: &RuntimeStore, n: u64) -> PathBuf {
+    store.generation_dir(n).join(ENV_FILE)
 }
 
 /// Collect the generation's loader-lib dirs, higher composition layer
@@ -128,6 +139,25 @@ fn record_loader_libs(store: &RuntimeStore, gen: &Generation) -> miette::Result<
         body.push_str(&rel);
         body.push('\n');
     }
+    std::fs::write(&path, body).map_err(|e| miette::miette!("writing {}: {e}", path.display()))
+}
+
+/// Record the generation's resolved env (ADR-0016 §7 env hooks) as a
+/// JSON object — `BTreeMap` serialization, so keys land sorted and the
+/// file is byte-deterministic. Written by the reconcile's staging tail
+/// (`present_active`), NOT by [`emit`]: a rollback re-emits the target
+/// generation and must serve its RECORDED env, never a re-resolution
+/// against the current declaration. An empty map writes the empty
+/// object, withdrawing stale vars on re-emit — the same rule as the
+/// loader-lib list.
+pub fn write_generation_env(
+    store: &RuntimeStore,
+    n: u64,
+    vars: &BTreeMap<String, String>,
+) -> miette::Result<()> {
+    let path = env_path(store, n);
+    let body =
+        serde_json::to_vec(vars).map_err(|e| miette::miette!("serializing generation env: {e}"))?;
     std::fs::write(&path, body).map_err(|e| miette::miette!("writing {}: {e}", path.display()))
 }
 

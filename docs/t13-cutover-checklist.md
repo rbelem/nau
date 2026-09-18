@@ -307,17 +307,23 @@ it via the pod's `blesh-share` (§4.3).
 
 `EDITOR`/`VISUAL`, `LOCALE_ARCHIVE`, `PYTHONPATH`+`VENV_DIR`,
 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` come from devbox.json's
-`env:`. Pods have no per-pod env-var surface yet (ADR-0016 §7), but
-the `shuttle run` command half LANDED (2026-09-18, #102):
-`shuttle run -- <cmd…>` execs any command with the pod env overlaid
-(farm-first PATH + loader-lib LD_LIBRARY_PATH per the ADR-0028
-shellenv contract), no sandbox, transparent exec — the `devbox run`
-equivalent. Declared-app-first: a name that is a declared app still
-runs that app (confined). Interim for login env: keep the exports in a
-bashrc.d snippet. Remaining: declared per-pod/package env vars
-(EDITOR/VISUAL, LOCALE_ARCHIVE, PYTHONPATH+VENV_DIR, …) still need the
-env surface (§5.3 list); LOCALE_ARCHIVE needs a pod decision: system
-locales vs. a pod locale payload.
+`env:`. The command half of the surface LANDED first (2026-09-18,
+#102): `shuttle run -- <cmd…>` execs any command with the pod env
+overlaid (farm-first PATH + loader-lib LD_LIBRARY_PATH per the
+ADR-0028 shellenv contract), no sandbox, transparent exec — the
+`devbox run` equivalent. Declared-app-first: a name that is a declared
+app still runs that app (confined).
+
+The declared-env half LANDED (2026-09-18, ADR-0030): pod.lua accepts
+`env = { KEY = "value", … }`; staging resolves it (own beats loaded per
+key, loads fold transitively, first-declared load wins collisions) into
+`generations/<n>/env.json`; `shuttle pod shellenv` renders one
+`export KEY='value'` per var and `shuttle run` overlays the same map.
+The devbox init-hook's env exports can move into the pod declaration;
+`90-shuttle.sh` keeps only genuine shell-init lines. Open: package-level
+declared env (manifest surface, follow-up) and the LOCALE_ARCHIVE pod
+decision (system locales vs. a pod locale payload — declarable, never
+auto-generated).
 
 Semantic target for that surface: `shuttle run` becomes the single
 entry point the way `flatpak run` is — the confined-app half exists

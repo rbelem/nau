@@ -34,6 +34,9 @@ use crate::snap::{BackendKind, Confinement, SANDBOX_RO_ROOTS};
 /// An unconfined app reached here (explicit `shuttle run` misuse, or a
 /// pod overridden to unconfined) is exec'd directly — transparent, no
 /// sandbox. This is never invoked by the farm for an unconfined app.
+/// Every exec form (direct, bwrap, apparmor, arbitrary command) carries
+/// the generation's declared env (ADR-0030): declared replaces
+/// inherited, undeclared passes through.
 pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette::Result<()> {
     let store = crate::runtime::RuntimeStore::new(pod_dir.to_path_buf());
     let gen = store.active_generation()?.ok_or_else(|| {
@@ -57,12 +60,19 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
     // apps keep the lone content blob.
     let bin = exec_target(&store, gen.n, pkg_name, pkg, app, real_hash);
 
+    // ADR-0030: the generation's declared env rides EVERY exec form —
+    // declared replaces inherited, undeclared passes through. The
+    // shellenv read verb fails loudly on a torn state (no `current`
+    // despite an active generation), never silently drops the env.
+    let root = pod_dir.parent().unwrap_or(pod_dir);
+    let vars = crate::pod::shellenv(root, pod_name)?.vars;
+
     // Effective confinement: the per-app override, else the package default.
     let Some(confined) = pkg.app_confined.get(app).or(pkg.confined.as_ref()) else {
         // Unconfined app reached `shuttle run` directly — exec the real
         // binary with no sandbox (the farm never routes an unconfined app
         // here).
-        return exec_direct(&bin, args);
+        return exec_direct(&bin, args, &vars);
     };
 
     if !bin.is_file() {
@@ -74,8 +84,8 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
     }
 
     match confined.backend {
-        BackendKind::Bwrap => run_bwrap(pod_dir, app, confined, &bin, args),
-        BackendKind::Apparmor => run_apparmor(pod_name, app, confined, &bin, args),
+        BackendKind::Bwrap => run_bwrap(pod_dir, app, confined, &bin, args, &vars),
+        BackendKind::Apparmor => run_apparmor(pod_name, app, confined, &bin, args, &vars),
     }
 }
 
@@ -111,12 +121,29 @@ fn resolve_app<'a>(
 }
 
 /// Exec a binary directly (no sandbox), replacing the current process.
-fn exec_direct(bin: &Path, args: &[String]) -> miette::Result<()> {
+fn exec_direct(
+    bin: &Path,
+    args: &[String],
+    vars: &std::collections::BTreeMap<String, String>,
+) -> miette::Result<()> {
     let mut cmd = std::process::Command::new(bin);
     for a in args {
         cmd.arg(a);
     }
+    overlay_declared_vars(&mut cmd, vars);
     exec_cmd(cmd)
+}
+
+/// The declared vars ride every exec form (ADR-0030): declared replaces
+/// inherited, undeclared passes through — the same semantics as the
+/// arbitrary-command overlay.
+fn overlay_declared_vars(
+    cmd: &mut std::process::Command,
+    vars: &std::collections::BTreeMap<String, String>,
+) {
+    for (key, value) in vars {
+        cmd.env(key, value);
+    }
 }
 
 // ── Arbitrary-command form (issue #102) ──
@@ -232,6 +259,12 @@ fn overlay_pod_env_with(
         }
         cmd.env("LD_LIBRARY_PATH", ld);
     }
+
+    // ADR-0030: the generation's declared env replaces inherited values
+    // (the devbox `env:` semantics) — declared beats ambient by design.
+    for (key, value) in &env.vars {
+        cmd.env(key, value);
+    }
 }
 
 /// Exec `bin` under a bwrap sandbox built from the grants (ticket #11).
@@ -243,6 +276,7 @@ fn run_bwrap(
     confined: &Confinement,
     bin: &Path,
     args: &[String],
+    vars: &std::collections::BTreeMap<String, String>,
 ) -> miette::Result<()> {
     let bwrap = resolve_tool("bwrap").ok_or_else(|| {
         miette::miette!(
@@ -286,6 +320,9 @@ fn run_bwrap(
     for a in args {
         cmd.arg(a);
     }
+    // ADR-0030: declared env, threaded through bwrap into the sandbox
+    // (bwrap passes its own environment in; no --clearenv is applied).
+    overlay_declared_vars(&mut cmd, vars);
     // Replace the process (exec) so the sandboxed app is the child of our
     // caller, not a grandchild — transparent to the user.
     exec_cmd(cmd)
@@ -373,6 +410,7 @@ fn run_apparmor(
     _confined: &Confinement,
     bin: &Path,
     args: &[String],
+    vars: &std::collections::BTreeMap<String, String>,
 ) -> miette::Result<()> {
     let aa_exec = resolve_tool("aa-exec").ok_or_else(|| {
         miette::miette!(
@@ -391,6 +429,7 @@ fn run_apparmor(
     for a in args {
         cmd.arg(a);
     }
+    overlay_declared_vars(&mut cmd, vars);
     exec_cmd(cmd)
 }
 
@@ -678,6 +717,7 @@ mod tests {
             farm: farm.display().to_string(),
             generation: Some(1),
             libs,
+            vars: Default::default(),
         }
     }
 
@@ -815,6 +855,46 @@ mod tests {
             env_of(&cmd, "LD_LIBRARY_PATH").is_none(),
             "empty libs must not touch LD_LIBRARY_PATH"
         );
+    }
+
+    #[test]
+    fn overlay_pod_env_declared_vars_replace_inherited_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let farm = tmp.path().join("current");
+        let mut env = sample_command_env(&farm, Vec::new());
+        env.vars.insert("EDITOR".to_string(), "vi".to_string());
+        env.vars.insert("MODE".to_string(), "pod".to_string());
+        let mut cmd = std::process::Command::new("true");
+        cmd.env("MODE", "inherited");
+        cmd.env("HOME", "/home/user");
+        overlay_pod_env_with(&mut cmd, &env, Some(std::ffi::OsStr::new("/bin")), None);
+        assert_eq!(
+            env_of(&cmd, "EDITOR").unwrap(),
+            "vi",
+            "a declared var is set even when the caller has none"
+        );
+        assert_eq!(
+            env_of(&cmd, "MODE").unwrap(),
+            "pod",
+            "a declared var replaces the inherited value (devbox env: semantics)"
+        );
+        assert_eq!(
+            env_of(&cmd, "HOME").unwrap(),
+            "/home/user",
+            "undeclared vars pass through untouched"
+        );
+    }
+
+    #[test]
+    fn overlay_declared_vars_replaces_inherited_and_passes_the_rest() {
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("EDITOR".to_string(), "vi".to_string());
+        let mut cmd = std::process::Command::new("true");
+        cmd.env("EDITOR", "inherited");
+        cmd.env("HOME", "/home/user");
+        overlay_declared_vars(&mut cmd, &vars);
+        assert_eq!(env_of(&cmd, "EDITOR").unwrap(), "vi");
+        assert_eq!(env_of(&cmd, "HOME").unwrap(), "/home/user");
     }
 
     #[test]

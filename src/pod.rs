@@ -195,6 +195,10 @@ pub struct PodDeclaration {
     pub packages: Vec<String>,
     /// Inline overlays keyed by package name (CONTEXT.md: Overlay).
     pub overlay: BTreeMap<String, serde_json::Value>,
+    /// Declared environment (`env = { KEY = "value" }`), stored sorted —
+    /// the resolved map is written to the generation and exported in
+    /// this deterministic order (ADR-0016 §7 env hooks).
+    pub env: BTreeMap<String, String>,
 }
 
 /// Evaluate and validate a pod declaration file.
@@ -260,6 +264,7 @@ fn validate_pod_table(table: &mlua::Table) -> miette::Result<PodDeclaration> {
     let mut saw_loads = false;
     let mut saw_packages = false;
     let mut saw_overlay = false;
+    let mut saw_env = false;
 
     for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
         let (key, value) = pair.map_err(|e| miette::miette!("pod(): {e}"))?;
@@ -292,8 +297,16 @@ fn validate_pod_table(table: &mlua::Table) -> miette::Result<PodDeclaration> {
                 saw_overlay = true;
                 decl.overlay = expect_overlay(&value)?;
             }
+            "env" => {
+                if saw_env {
+                    miette::bail!("duplicate field 'env' in pod() declaration");
+                }
+                saw_env = true;
+                decl.env = expect_env(&value)?;
+            }
             other => miette::bail!(
-                "unknown field '{other}' in pod() declaration (allowed: loads, packages, overlay)"
+                "unknown field '{other}' in pod() declaration \
+                 (allowed: loads, packages, overlay, env)"
             ),
         }
     }
@@ -388,6 +401,72 @@ fn expect_overlay(value: &mlua::Value) -> miette::Result<BTreeMap<String, serde_
         }
     }
     Ok(out)
+}
+
+/// Validate the `env` field: a table of name → string value. Keys must
+/// be valid environment names (see [`validate_env_key`]); values must be
+/// UTF-8 strings without newlines (the shellenv export is line-based
+/// POSIX shell — a newline would smuggle in a second command). An empty
+/// value is allowed (exporting `KEY=''` is meaningful: it SHADOWS an
+/// inherited value with empty).
+fn expect_env(value: &mlua::Value) -> miette::Result<BTreeMap<String, String>> {
+    let table = match value {
+        mlua::Value::Table(t) => t,
+        other => miette::bail!(
+            "'env' must be a table of strings, got {}",
+            lua_type_name(other)
+        ),
+    };
+    let mut out = BTreeMap::new();
+    for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
+        let (key, item) = pair.map_err(|e| miette::miette!("'env': {e}"))?;
+        let key = match &key {
+            mlua::Value::String(s) => s
+                .to_str()
+                .map_err(|e| miette::miette!("'env': non-utf8 key: {e}"))?
+                .to_string(),
+            other => miette::bail!("'env' keys must be strings, got {}", lua_type_name(other)),
+        };
+        validate_env_key(&key)?;
+        let value = match &item {
+            mlua::Value::String(s) => s
+                .to_str()
+                .map_err(|e| miette::miette!("'env.{key}': non-utf8 value: {e}"))?
+                .to_string(),
+            other => miette::bail!("'env.{key}' must be a string, got {}", lua_type_name(other)),
+        };
+        if value.contains('\n') || value.contains('\r') {
+            miette::bail!("'env.{key}' must not contain newlines");
+        }
+        out.insert(key, value);
+    }
+    Ok(out)
+}
+
+/// An env name must be non-empty `[A-Za-z_][A-Za-z0-9_]*`. `PATH` and
+/// `LD_LIBRARY_PATH` are RESERVED: they are pod-computed seams (the
+/// farm-first PATH per ADR-0028; the loader-lib `LD_LIBRARY_PATH`), and
+/// a declared value would be silently overwritten at export — or,
+/// worse, silently break activation. Declare payloads' dirs instead.
+fn validate_env_key(key: &str) -> miette::Result<()> {
+    let mut chars = key.chars();
+    let well_formed = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    };
+    if !well_formed {
+        miette::bail!("invalid env key '{key}': must match [A-Za-z_][A-Za-z0-9_]*");
+    }
+    if key == "PATH" || key == "LD_LIBRARY_PATH" {
+        miette::bail!(
+            "env key '{key}' is reserved: PATH and LD_LIBRARY_PATH are pod-computed \
+             seams (farm-first PATH per ADR-0028, loader-lib LD_LIBRARY_PATH) — \
+             a declared value would never survive the export"
+        );
+    }
+    Ok(())
 }
 
 fn lua_type_name(value: &mlua::Value) -> &'static str {
@@ -854,6 +933,68 @@ fn detect_load_cycle(root: &Path, start: &str, start_decl: &PodDeclaration) -> m
     let mut stack = Vec::new();
     let mut done = HashSet::new();
     visit(root, start, start_decl, &mut stack, &mut done)
+}
+
+/// Resolve the pod's declared env (ADR-0030): own keys win per key over
+/// loaded pods (silent — the issue #8 own-over-loaded rule); loaded
+/// pods fold transitively, and a same-key collision between two loaded
+/// pods resolves to the FIRST-DECLARED load with a warning (determinism
+/// over surprise: adding a later load never silently steals an
+/// existing key). Pure reads — safe before any mutation.
+pub(crate) fn resolve_pod_env(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+) -> miette::Result<BTreeMap<String, String>> {
+    let folded = fold_pod_env(root, pod_name, decl, &mut Vec::new(), &mut HashSet::new())?;
+    Ok(folded.into_iter().map(|(k, (v, _))| (k, v)).collect())
+}
+
+/// The fold proper: key → (value, declaring pod). The provenance rides
+/// along so a cross-load collision can name both pods in its warning;
+/// `resolve_pod_env` strips it. Memoized + cycle-checked so it is safe
+/// standalone, not only behind [`validate_loads`].
+fn fold_pod_env(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+    stack: &mut Vec<String>,
+    done: &mut HashSet<String>,
+) -> miette::Result<BTreeMap<String, (String, String)>> {
+    if let Some(pos) = stack.iter().position(|p| p == pod_name) {
+        let mut cycle: Vec<String> = stack[pos..].to_vec();
+        cycle.push(pod_name.to_string());
+        miette::bail!("pod load cycle detected: {}", cycle.join(" -> "));
+    }
+    if !done.insert(pod_name.to_string()) {
+        return Ok(BTreeMap::new());
+    }
+    stack.push(pod_name.to_string());
+    let folded = (|| {
+        let mut env: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for loaded in &decl.loads {
+            let loaded_decl = load_declaration(root, loaded)?;
+            for (key, contributed) in fold_pod_env(root, loaded, &loaded_decl, stack, done)? {
+                match env.entry(key.clone()) {
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(contributed);
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        crate::output::warn(format!(
+                            "env '{key}' is declared by more than one loaded pod under \
+                             '{pod_name}' — keeping the first-declared load's value"
+                        ));
+                    }
+                }
+            }
+        }
+        for (key, value) in &decl.env {
+            env.insert(key.clone(), (value.clone(), pod_name.to_string()));
+        }
+        Ok(env)
+    })();
+    stack.pop();
+    folded
 }
 
 /// What one loaded pod contributes to the loading pod's composition:
@@ -1743,6 +1884,10 @@ fn reconcile_pod_scoped(
     tools: &crate::runtime::RuntimeTools,
 ) -> miette::Result<(PodSyncReport, bool)> {
     let mut state = prepare_reconcile(root, pod_name, allow_degraded, tools)?;
+    // Resolve the declared env (ADR-0030) before any build phase: the
+    // fold is pure read, and a bad declaration must fail with zero
+    // writes. Key/value validation already ran at declaration parse.
+    let env_vars = resolve_pod_env(&state.root, &state.pod_name, &state.decl)?;
     let mut build = ReconcileBuild::default();
     collect_pending(&mut state, only, float_deps, &mut build)?;
     let installed = install_pending(&mut state, &mut build)?;
@@ -1759,7 +1904,7 @@ fn reconcile_pod_scoped(
     // Remove store packages the declaration dropped.
     let removed = remove_undeclared(&state.store, &state.tools, &build.declared_names)?;
     // Present whatever is now active. Nothing active → nothing exposed.
-    let (generation, farm) = present_active(&state.store, &state.dir)?;
+    let (generation, farm) = present_active(&state.store, &state.dir, &env_vars)?;
 
     Ok((
         PodSyncReport {
@@ -2329,14 +2474,22 @@ fn remove_undeclared(
 /// generation and flip the pod's `current` link. Nothing active →
 /// nothing exposed: the farm and the user-level launcher surface are
 /// withdrawn along with it (issue #7).
+///
+/// The resolved declared env (ADR-0030) is recorded here — the staging
+/// tail where a generation is PRESENTED — never inside `farm::emit`:
+/// a rollback re-emits through its own path and must serve the target
+/// generation's RECORDED env, not a re-resolution against the current
+/// declaration.
 fn present_active(
     store: &crate::runtime::RuntimeStore,
     dir: &Path,
+    env_vars: &BTreeMap<String, String>,
 ) -> miette::Result<(Option<u64>, Option<PathBuf>)> {
     let active = store.active_generation()?;
     Ok(match &active {
         Some(gen) => {
             let farm = crate::farm::emit(store, gen)?;
+            crate::farm::write_generation_env(store, gen.n, env_vars)?;
             crate::farm::flip_current(dir, gen.n)?;
             (Some(gen.n), Some(farm))
         }
@@ -2927,6 +3080,12 @@ pub struct PodShellenv {
     /// seam existed; the renderer exports nothing in that case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub libs: Vec<String>,
+    /// The generation's recorded declared env (ADR-0030): sorted key →
+    /// literal value, read from `generations/<n>/env.json`. Empty for
+    /// env-less generations; the renderer exports nothing and `shuttle
+    /// run` overlays nothing in that case.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vars: BTreeMap<String, String>,
 }
 
 /// Resolve the environment the selected pod exposes to an interactive
@@ -2982,11 +3141,23 @@ pub fn shellenv(root: &Path, pod_name: &str) -> miette::Result<PodShellenv> {
         .collect(),
         None => Vec::new(),
     };
+    // ADR-0030: the generation's recorded declared env. A missing file
+    // is a pre-env surface generation (or an env-less one) — an empty
+    // map is the correct answer, exactly like `libs` above.
+    let vars = match generation {
+        Some(n) => read_generation_env(
+            &pod.join("generations")
+                .join(n.to_string())
+                .join(crate::farm::ENV_FILE),
+        )?,
+        None => BTreeMap::new(),
+    };
     Ok(PodShellenv {
         pod: pod_name.to_string(),
         farm: farm.display().to_string(),
         generation,
         libs,
+        vars,
     })
 }
 
@@ -3018,6 +3189,31 @@ fn read_loader_libs(path: &Path) -> miette::Result<Vec<String>> {
     Ok(dirs)
 }
 
+/// Parse a generation's recorded env object (ADR-0030): a JSON map of
+/// sorted key → literal value. A missing file is a generation emitted
+/// before the surface existed — an empty map is the correct answer. A
+/// corrupt object fails the read verb loudly (the loader-lib reader's
+/// rule for trusted data) — never a silently wrong export set.
+fn read_generation_env(path: &Path) -> miette::Result<BTreeMap<String, String>> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(miette::miette!("reading {}: {e}", path.display()));
+        }
+    };
+    serde_json::from_str(&body)
+        .map_err(|e| miette::miette!("corrupt generation env {}: {e}", path.display()))
+}
+
+/// POSIX single-quote a declared env value: every `'` becomes `'\''`
+/// (close the quoting, an escaped quote, reopen), so the wrapped
+/// literal survives any bytes the parser lets through (UTF-8, no
+/// newlines).
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
 /// Render a shellenv as eval-safe POSIX shell statements (issue #47,
 /// extended by #89): the PATH prepend, plus the loader-lib
 /// `LD_LIBRARY_PATH` prepend when the pod's generation ships lib dirs.
@@ -3034,6 +3230,11 @@ pub fn render_shellenv(env: &PodShellenv) -> String {
             "export LD_LIBRARY_PATH=\"{}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"\n",
             env.libs.join(":")
         ));
+    }
+    // ADR-0030: one export per declared var, BTreeMap order (sorted —
+    // byte-deterministic across syncs and rebuilds).
+    for (key, value) in &env.vars {
+        script.push_str(&format!("export {key}={}\n", sh_single_quote(value)));
     }
     script
 }
@@ -3536,6 +3737,7 @@ pod {
             farm: "/root/default/current".into(),
             generation: Some(1),
             libs: vec!["/root/default/current/../extensions/a/usr/usr/lib".into()],
+            vars: BTreeMap::new(),
         };
         let script = render_shellenv(&env);
         assert_eq!(
@@ -3594,5 +3796,258 @@ pod {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8(out.stdout).unwrap(), "__UNSET__");
+    }
+
+    // ── declared pod env (ADR-0030) ──
+
+    /// Drop a `pod.lua` for `pod` under `root` (the fold tests drive
+    /// real declarations on disk, exactly like production reads).
+    fn seed_pod_lua(root: &Path, pod: &str, body: &str) {
+        let dir = pod_dir(root, pod);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(pod_lua_path(root, pod), body).unwrap();
+    }
+
+    #[test]
+    fn env_declaration_parses_and_reserved_seams_are_rejected() {
+        let ok = evaluate_pod_source(
+            "t",
+            r#"pod { packages = { "jq" }, env = { EDITOR = "vi", EMPTY = "" } }"#,
+        )
+        .unwrap();
+        assert_eq!(ok.env.get("EDITOR").map(String::as_str), Some("vi"));
+        assert_eq!(ok.env.get("EMPTY").map(String::as_str), Some(""));
+
+        for (src, needle) in [
+            (r#"pod { env = { EDITOR = 5 } }"#, "'env.EDITOR'"),
+            (r#"pod { env = { ["BAD-KEY"] = "v" } }"#, "invalid env key"),
+            (r#"pod { env = { PATH = "/usr/bin" } }"#, "reserved"),
+            (r#"pod { env = { LD_LIBRARY_PATH = "/x" } }"#, "reserved"),
+            (r#"pod { env = { K = "a\nb" } }"#, "newlines"),
+        ] {
+            let err = format!("{}", evaluate_pod_source("t", src).unwrap_err());
+            assert!(err.contains(needle), "{src}: {err}");
+        }
+
+        // The unknown-field message keeps naming the allowed set.
+        let err = format!(
+            "{}",
+            evaluate_pod_source("t", "pod { nope = 1 }").unwrap_err()
+        );
+        assert!(err.contains("env"), "{err}");
+    }
+
+    #[test]
+    fn resolve_pod_env_own_beats_loaded_and_loads_fold_transitively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_pod_lua(root, "base", r#"pod { env = { A = "base", B = "base" } }"#);
+        seed_pod_lua(
+            root,
+            "mid",
+            r#"pod { loads = { "base" }, env = { B = "mid", C = "mid" } }"#,
+        );
+        seed_pod_lua(
+            root,
+            "work",
+            r#"pod { loads = { "mid" }, env = { C = "work" } }"#,
+        );
+        let decl = load_declaration(root, "work").unwrap();
+        let env = resolve_pod_env(root, "work", &decl).unwrap();
+        assert_eq!(env.get("A").map(String::as_str), Some("base"));
+        assert_eq!(env.get("B").map(String::as_str), Some("mid"));
+        assert_eq!(env.get("C").map(String::as_str), Some("work"));
+    }
+
+    #[test]
+    fn resolve_pod_env_first_declared_load_wins_cross_load_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_pod_lua(root, "one", r#"pod { env = { K = "one" } }"#);
+        seed_pod_lua(root, "two", r#"pod { env = { K = "two" } }"#);
+        seed_pod_lua(root, "work", r#"pod { loads = { "one", "two" } }"#);
+        let decl = load_declaration(root, "work").unwrap();
+        let env = resolve_pod_env(root, "work", &decl).unwrap();
+        assert_eq!(
+            env.get("K").map(String::as_str),
+            Some("one"),
+            "adding a later load must not silently steal an existing key"
+        );
+    }
+
+    #[test]
+    fn resolve_pod_env_detects_cycles_standalone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_pod_lua(root, "a", r#"pod { loads = { "b" } }"#);
+        seed_pod_lua(root, "b", r#"pod { loads = { "a" } }"#);
+        let decl = load_declaration(root, "a").unwrap();
+        let err = format!("{}", resolve_pod_env(root, "a", &decl).unwrap_err());
+        assert!(err.contains("cycle"), "{err}");
+    }
+
+    #[test]
+    fn test_shellenv_serves_the_generation_env_and_the_flip_restores_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data/shuttle/pods");
+        let dir = pod_dir(&root, "default");
+        let store = pod_store(&dir);
+        crate::farm::emit(&store, &gen_with_one_pkg(1, "jq")).unwrap();
+        crate::farm::emit(&store, &gen_with_one_pkg(2, "fzf")).unwrap();
+        let gen1_vars: BTreeMap<String, String> = [("EDITOR".to_string(), "vi".to_string())]
+            .into_iter()
+            .collect();
+        let gen2_vars: BTreeMap<String, String> = [("MODE".to_string(), "pod".to_string())]
+            .into_iter()
+            .collect();
+        crate::farm::write_generation_env(&store, 1, &gen1_vars).unwrap();
+        crate::farm::write_generation_env(&store, 2, &gen2_vars).unwrap();
+
+        crate::farm::flip_current(&dir, 1).unwrap();
+        let env = shellenv(&root, "default").unwrap();
+        assert_eq!(env.vars.get("EDITOR").map(String::as_str), Some("vi"));
+
+        // Rollback semantics: the flip alone re-scopes the vars to the
+        // target generation's RECORDED env — no rewrite, no
+        // re-resolution against the current declaration.
+        crate::farm::flip_current(&dir, 2).unwrap();
+        let env2 = shellenv(&root, "default").unwrap();
+        assert_eq!(env2.vars.get("MODE").map(String::as_str), Some("pod"));
+        assert!(!env2.vars.contains_key("EDITOR"));
+        crate::farm::flip_current(&dir, 1).unwrap();
+        let env3 = shellenv(&root, "default").unwrap();
+        assert_eq!(env3.vars.get("EDITOR").map(String::as_str), Some("vi"));
+    }
+
+    #[test]
+    fn test_shellenv_without_an_env_object_exports_no_vars() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_active_pod(tmp.path(), "default", 4);
+        let env = shellenv(tmp.path(), "default").unwrap();
+        assert!(env.vars.is_empty());
+        assert!(
+            !serde_json::to_value(&env)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("vars"),
+            "empty vars are omitted from the JSON output"
+        );
+        assert_eq!(
+            render_shellenv(&env),
+            format!("export PATH=\"{}:$PATH\"\n", env.farm)
+        );
+    }
+
+    #[test]
+    fn test_shellenv_fails_loudly_on_a_corrupt_generation_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_active_pod(tmp.path(), "default", 4);
+        let env_file = pod_dir(tmp.path(), "default")
+            .join("generations")
+            .join("4")
+            .join(crate::farm::ENV_FILE);
+        std::fs::write(&env_file, "{not json").unwrap();
+        let err = format!("{}", shellenv(tmp.path(), "default").unwrap_err());
+        assert!(err.contains("corrupt generation env"), "{err}");
+    }
+
+    #[test]
+    fn test_render_shellenv_exports_declared_vars_eval_safe() {
+        let mut vars = BTreeMap::new();
+        vars.insert("EDITOR".to_string(), "vi".to_string());
+        vars.insert(
+            "GREETING".to_string(),
+            "it's $fine, 'quoted' with spaces".to_string(),
+        );
+        vars.insert("EMPTY".to_string(), String::new());
+        vars.insert("A_FIRST".to_string(), "sorted".to_string());
+        let env = PodShellenv {
+            pod: "default".into(),
+            farm: "/root/default/current".into(),
+            generation: Some(1),
+            libs: Vec::new(),
+            vars,
+        };
+        let script = render_shellenv(&env);
+        // Sorted keys, POSIX single-quote escaping (`'` → `'\''`).
+        assert_eq!(
+            script,
+            "export PATH=\"/root/default/current:$PATH\"\n\
+             export A_FIRST='sorted'\n\
+             export EDITOR='vi'\n\
+             export EMPTY=''\n\
+             export GREETING='it'\\''s $fine, '\\''quoted'\\'' with spaces'\n"
+        );
+
+        // The real proof: eval under `set -u` and read the values back —
+        // including the empty one, which must still count as SET.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "set -u\n{script}\nprintf '%s|%s|%s|%s' \
+                 \"$A_FIRST\" \"$EDITOR\" \"$EMPTY\" \"$GREETING\""
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "sorted|vi||it's $fine, 'quoted' with spaces"
+        );
+
+        // JSON carries the map when present, omits it when empty.
+        let with = serde_json::to_value(&env).unwrap();
+        assert_eq!(with["vars"]["EDITOR"], "vi");
+        let bare = PodShellenv {
+            vars: BTreeMap::new(),
+            ..env
+        };
+        assert!(!serde_json::to_value(&bare)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("vars"));
+    }
+
+    #[test]
+    fn present_active_records_the_declared_env_on_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data/shuttle/pods");
+        let dir = pod_dir(&root, "default");
+        let store = pod_store(&dir);
+        crate::farm::emit(&store, &gen_with_one_pkg(1, "jq")).unwrap();
+        // The store's active pointer, the way the production mechanisms
+        // leave it: a manifest-bearing generation dir plus the `active`
+        // link (as confine.rs's seed_command_pod does).
+        let gen_dir = store.generation_dir(1);
+        std::fs::write(
+            gen_dir.join("manifest.json"),
+            serde_json::to_vec(&gen_with_one_pkg(1, "jq")).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("generations/1", dir.join("active")).unwrap();
+
+        let vars: BTreeMap<String, String> = [("EDITOR".to_string(), "vi".to_string())]
+            .into_iter()
+            .collect();
+        let (generation, _) = present_active(&store, &dir, &vars).unwrap();
+        assert_eq!(generation, Some(1));
+        let recorded: BTreeMap<String, String> =
+            serde_json::from_slice(&std::fs::read(crate::farm::env_path(&store, 1)).unwrap())
+                .unwrap();
+        assert_eq!(recorded, vars, "the staging tail records the resolved env");
+
+        // Re-presenting with no declared env writes the empty object —
+        // stale vars are withdrawn, the loader-libs re-emit rule.
+        present_active(&store, &dir, &BTreeMap::new()).unwrap();
+        let recorded: BTreeMap<String, String> =
+            serde_json::from_slice(&std::fs::read(crate::farm::env_path(&store, 1)).unwrap())
+                .unwrap();
+        assert!(recorded.is_empty());
     }
 }

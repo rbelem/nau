@@ -136,7 +136,12 @@ in NIX_LD
   unset _nix_ld_cache
 fi
 
-# ── Editor + agent env (interim for the pod env gap, checklist §5.3) ──
+# ── Editor + agent env ──
+# Declarative home since ADR-0030 — pod.lua accepts:
+#   env = { EDITOR = "vi", VISUAL = "vi", SUDO_EDITOR = "vi",
+#           OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = "1" }
+# Kept shell-side so a shell reached before the pod's first sync still
+# gets an editor (env vars ship per generation, checklist §5.3).
 export EDITOR=vi VISUAL=vi
 export SUDO_EDITOR=vi
 export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=1
