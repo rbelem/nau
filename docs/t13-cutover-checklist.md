@@ -219,22 +219,50 @@ nix store gc
 
 ### 4.6 Post-cutover checks (acceptance criteria of #29)
 
-- [ ] Fresh shell resolves daily tools from the pod farm only:
-      `type -a <tool>` for every tool in the §2 matrix — no
-      `/home/rodrigo/.local/share/devbox/...` hits.
-- [ ] devbox-global removed from PATH/rc: `env | grep -i devbox` empty;
-      `~/.bashrc.d/90-devbox.sh` gone.
-- [ ] nix-specific tools dropped: `attic-client`, `nix-search-cli`,
-      `nix-prefetch-git` all `command -v` → nothing.
-- [ ] Fonts still resolve (`fc-match 'Hack Nerd Font'` → pod surface).
-- [ ] Secrets present in a fresh shell (`env | grep GITHUB_TOKEN`).
+**LIVE RESULT 2026-09-18: `examples/cutover/verify-sweep.sh` exits 0 —
+all gates green** in a pty'd fresh login shell. Run it with a clean
+environment (an interactive terminal inherits the old session's devbox
+env; a fresh login matches this shape):
+
+    env -i HOME=$HOME USER=$USER LOGNAME=$USER TERM=xterm-256color \
+      XDG_RUNTIME_DIR=/run/user/1000 \
+      PATH=/home/rodrigo/.local/share/flatpak/exports/bin:/var/lib/flatpak/exports/bin:/home/rodrigo/.nix-profile/bin:/nix/profile/bin:/home/rodrigo/.local/state/nix/profile/bin:/etc/profiles/per-user/rodrigo/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin \
+      bash examples/cutover/verify-sweep.sh
+
+- [x] Fresh shell resolves daily tools from the pod farm only: sweep
+      checks ~50 tools (`type -aP`), first hit
+      `~/.local/share/shuttle/pods/daily/current/…`, zero
+      `/devbox/` hits.
+- [x] devbox-global removed from PATH/rc: sweep reports `env is
+      devbox-free`; `~/.bashrc.d/` holds only `10-android-sdk.sh`,
+      `10-bit.sh`, `90-shuttle.sh` (note: `~/.bashrc` sources
+      `~/.bashrc.d/*` — ALL files, so deactivated rc fragments must be
+      moved out of the directory, not renamed in place; the
+      `90-devbox.sh` backup lives in `/tmp/opencode/`).
+- [x] nix-specific tools dropped: `attic-client`, `nix-search-cli`,
+      `nix-prefetch-git` all `command -v` → nothing (sweep ok).
+- [x] Fonts still resolve (`fc-match 'Hack Nerd Font'` →
+      `HackNerdFont-Regular.ttf` from the pod surface).
+- [x] Secrets present in a fresh shell (`GITHUB_TOKEN` from the bws SM
+      cache).
+- [x] venv live: `$VIRTUAL_ENV/bin/python3 -c 'import whichllm'` ok
+      (pod python 3.14 venv at `~/.local/share/shuttle/python-venv`,
+      12 top-level pins — sources per
+      `examples/cutover/python-freeze.txt` header).
+- [x] ble.sh attached in the pty login shell (`BLE_VERSION` set;
+      attaches only in real interactive shells — the sweep feeds the
+      gates through stdin for exactly this reason).
 - [ ] Known shadowing note: `~/.local/bin` still holds real binaries
       (`starship`, `starship-patched`, `yq`, `iii`, `himalaya`,
       `bitw-new`, symlinks `bitw`/`jcode`). The farm is PREPENDED, so
       pod tools now win over these — if `~/.local/bin/starship` was a
       deliberate local build, either remove it or drop `starship` from
       the pod.
-- [ ] Gaps filed (§5) — none absorbed silently.
+- [x] Gaps filed (§5) — none absorbed silently (sounddevice/portaudio
+      runtime gap recorded in the freeze header).
+- [x] shellenv hardening: NixOS `/etc/profile` rebuilds PATH without
+      `~/.local/bin`, so the rc falls back to
+      `$HOME/.local/bin/shuttle` for the shellenv eval.
 
 ### 4.7 Rollback (any point before §4.5)
 
@@ -330,7 +358,14 @@ required for cutover (options: emit-time wrapper setting LD_LIBRARY_PATH
 in the #12 wrapper family, an ld.so.conf.d drop-in per pod, or binding
 the extensions tree via the `shuttle run` assembly). Until landed:
 cutover keeps git/tmux/htop/tig working only via the devbox profile —
-i.e. **this is the one code-level blocker for those four tools**.
+i.e. **this was the one code-level blocker for those four tools.**
+
+**LANDED 2026-09-18** (shellenv seam): `shuttle pod --name daily
+shellenv` emits `LD_LIBRARY_PATH` over the generation's extension lib
+dirs, compose-prepending (`${LD_LIBRARY_PATH:+…}`) so it never wipes a
+host list. The sweep proves git/tmux/htop/tig resolve and run from the
+pod farm with zero devbox hits; nothing here blocks the cutover
+anymore.
 
 ### 5.8 Build-time wrappers vs the extension layout (NEW, demonstrated)
 

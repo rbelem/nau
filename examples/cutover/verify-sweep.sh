@@ -80,11 +80,12 @@ if [ -n "${SHUTTLE_SWEEP_INNER:-}" ]; then
   inner
   rc=$?
   [ "$rc" -eq 0 ] && echo 'INNER: all gates green' || echo 'INNER: gates red'
+  set +u
   exit "$rc"
 fi
 
 SELF="$(readlink -f "$0")"
-if script -qec "env SHUTTLE_SWEEP_INNER=1 bash -li -c 'source \"$SELF\"'" /dev/null; then
+if printf 'source %q\n' "$SELF" | script -qec "env SHUTTLE_SWEEP_INNER=1 bash -li" /dev/null; then
   echo 'SWEEP: all gates green'
   exit 0
 else

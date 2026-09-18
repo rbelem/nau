@@ -9,6 +9,18 @@
 #   skillspector==2.11.2 sounddevice==0.5.5 tree-sitter-perl==2.0.0
 #   websockets==16.0 whichllm==0.5.16 requests==2.34.2
 #
+# Install sources (verified 2026-09-18 seeding the cutover venv): the
+# four personal packages are NOT on PyPI —
+#   skillspector  git+https://github.com/NVIDIA/SkillSpector@v2.11.2
+#   whichllm      git+https://github.com/Andyyyy64/whichllm@v0.5.16
+#   graphifyy     git+https://github.com/rbelem/graphify@v9-perl
+#                 (install --no-deps: its metadata wants
+#                 tree-sitter-perl<0.26, a nix-only versioning)
+#   llm-verifier  https://files.pythonhosted.org/packages/27/b7/6f91acc8898dc8e00e5a0826feb9437c6ac80ea335f7b6558ba76e2b59b6/llm_verifier-0.2.0.tar.gz
+# sounddevice imports but needs libportaudio at runtime; nothing in the
+# daily pod ships portaudio yet (open gap, devbox's nix profile was the
+# old provider).
+#
 # Full freeze:
 aiodns==4.0.4
 aiohappyeyeballs==2.7.0

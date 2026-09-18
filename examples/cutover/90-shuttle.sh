@@ -7,8 +7,14 @@
 [ "${-#*i}" == "$-" ] || [ ! -t 0 ] || [ -z "$PS1" ] || [ -n "$TOOLBOX_PATH" ] && return
 
 # Pod farm on PATH. shellenv fails closed on unknown pod / no active
-# generation; a broken eval must never take the shell down.
-command -v shuttle >/dev/null 2>&1 && eval "$(shuttle pod shellenv --name daily)"
+# generation; a broken eval must never take the shell down. NixOS
+# /etc/profile rebuilds PATH without ~/.local/bin, so fall back to the
+# release binary's install location before giving up.
+if command -v shuttle >/dev/null 2>&1; then
+  eval "$(shuttle pod --name daily shellenv)"
+elif [ -x "$HOME/.local/bin/shuttle" ]; then
+  eval "$("$HOME/.local/bin/shuttle" pod --name daily shellenv)"
+fi
 
 # ── Secrets: Bitwarden SM cache, regenerated from ~/.config/bws/sm.ini ──
 # Verbatim port of the devbox init-hook block. The manifest maps secret
