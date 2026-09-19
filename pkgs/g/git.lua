@@ -92,9 +92,12 @@ return {
             -- bundle path is empty and https verification fails
             -- ("unable to get local issuer certificate"). Trust anchors
             -- are host policy — system trust wins, the ADR-0030 locale
-            -- precedent — so the wrapper points at the host CA bundle.
+            -- precedent — so the wrapper points git at the host CA
+            -- bundle via GIT_SSL_CAINFO (git sets CURLOPT_CAINFO from
+            -- it explicitly; SSL_CERT_FILE alone is masked by
+            -- libcurl's baked-empty default).
             "mv $STAGE/usr/bin/git $STAGE/usr/bin/git.bin",
-            "printf '%s\\n' '#!/bin/sh' 'd=$(dirname \"$(readlink -f \"$0\")\")' 'e=$d/../libexec/git-core' 'if test ! -d \"$e\"' 'then e=$d/../../../../extensions/git/usr/usr/libexec/git-core' 'fi' 't=$d/../share/git-core/templates' 'if test ! -d \"$t\"' 'then t=$d/../../../../extensions/git/usr/usr/share/git-core/templates' 'fi' 'c=/etc/ssl/certs/ca-certificates.crt' 'if test ! -f \"$c\"' 'then c=/etc/pki/tls/certs/ca-bundle.crt' 'fi' 'GIT_EXEC_PATH=$e GIT_TEMPLATE_DIR=$t SSL_CERT_FILE=$c exec \"$d/git.bin\" \"$@\"' > $STAGE/usr/bin/git",
+            "printf '%s\\n' '#!/bin/sh' 'd=$(dirname \"$(readlink -f \"$0\")\")' 'e=$d/../libexec/git-core' 'if test ! -d \"$e\"' 'then e=$d/../../../../extensions/git/usr/usr/libexec/git-core' 'fi' 't=$d/../share/git-core/templates' 'if test ! -d \"$t\"' 'then t=$d/../../../../extensions/git/usr/usr/share/git-core/templates' 'fi' 'c=/etc/ssl/certs/ca-certificates.crt' 'if test ! -f \"$c\"' 'then c=/etc/pki/tls/certs/ca-bundle.crt' 'fi' 'GIT_EXEC_PATH=$e GIT_TEMPLATE_DIR=$t GIT_SSL_CAINFO=$c exec \"$d/git.bin\" \"$@\"' > $STAGE/usr/bin/git",
             "chmod +x $STAGE/usr/bin/git",
         }, " && "),
 
