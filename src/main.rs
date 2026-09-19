@@ -37,6 +37,11 @@ fn main() -> miette::Result<()> {
             json,
         } => {
             shuttle::output::set_mode(json);
+            // The eval worker reads this to refuse fetch() (ADR: eval-time
+            // network is opt-in and never survives --offline).
+            if offline {
+                std::env::set_var("SHUTTLE_OFFLINE", "1");
+            }
             // If --file is default and doesn't exist, try output_name as package name
             let file = if file == "shuttle.lua" && !Path::new("shuttle.lua").exists() {
                 if let Some(ref name) = output_name {
@@ -183,6 +188,9 @@ fn main() -> miette::Result<()> {
             json,
         } => {
             shuttle::output::set_mode(json);
+            if offline {
+                std::env::set_var("SHUTTLE_OFFLINE", "1");
+            }
             cmd_eval(
                 file,
                 output,

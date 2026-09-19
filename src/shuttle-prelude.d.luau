@@ -27,3 +27,6 @@ declare pin: (name: any, opts: any?) -> any
 declare index: (name: any) -> any
 declare app: (opts: any) -> any
 declare image: (opts: any) -> any
+-- Eval-time HTTP GET (Rust-injected when the request allows network;
+-- the runtime stub refuses otherwise).
+declare fetch: (url: string) -> string

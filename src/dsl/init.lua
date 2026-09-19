@@ -829,6 +829,18 @@ function index(name)
     return { name = name, _index = true }
 end
 
+--- One eval-time HTTP GET for floating upstream version resolution.
+-- The Rust worker replaces this stub with the real implementation
+-- (curl-backed, 30s timeout, 8 MiB body cap) when the request allows
+-- network; this stub remains where it does not (analyzer stage,
+-- hermetic contexts), refusing with a named error.
+-- @param url  An http(s) URL
+-- @return the response body as a string
+-- @usage local ver = string.match(fetch(channel), '"version":"([%w%.]+)"')
+function fetch(url)
+    error("fetch() is disabled for this eval (--offline or hermetic context)", 2)
+end
+
 function pin(name, opts)
     if type(name) ~= "string" then
         error("pin(): expected a string name, got " .. type(name), 2)

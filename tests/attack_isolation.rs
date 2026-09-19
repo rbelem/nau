@@ -15,6 +15,7 @@ fn request(label: &str, source: &str) -> EvalRequest {
         sources: BTreeMap::new(),
         entry: source.to_string(),
         entry_label: label.to_string(),
+        allow_fetch: false,
     }
 }
 

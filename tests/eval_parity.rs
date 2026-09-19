@@ -166,6 +166,7 @@ fn production_request(prelude: &str, index_data: Value, label: &str, source: &st
         sources: Default::default(),
         entry: source.to_string(),
         entry_label: label.to_string(),
+        allow_fetch: false,
     }
 }
 

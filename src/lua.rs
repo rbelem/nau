@@ -442,6 +442,9 @@ fn eval_request(label: &str, source: &str) -> miette::Result<crate::isolate::Eva
         sources: Default::default(),
         entry: source.to_string(),
         entry_label: label.to_string(),
+        // The CLI sets SHUTTLE_OFFLINE when --offline is parsed; the
+        // eval worker then refuses fetch() with a named error.
+        allow_fetch: std::env::var("SHUTTLE_OFFLINE").is_err(),
     })
 }
 

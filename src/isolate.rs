@@ -76,6 +76,14 @@ pub struct EvalRequest {
     pub entry: String,
     /// Display name of the definition (chunk name / diagnostic context).
     pub entry_label: String,
+    /// Whether the `fetch()` global may reach the network. Opt-in: the
+    /// normal eval path enables it (definitions may resolve floating
+    /// upstream versions, e.g. opencode-bin); hermetic contexts
+    /// (attack-isolation tests, `--offline`) leave it off and `fetch()`
+    /// refuses with a named error. Deliberately non-deterministic — that
+    /// is its purpose; reproducibility stays the source pin's job.
+    #[serde(default)]
+    pub allow_fetch: bool,
 }
 
 /// Child → parent: request for one require-able source.
@@ -863,6 +871,51 @@ fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
     }
 
     install_require(&lua, &req.sources)?;
+
+    // fetch(): one eval-time HTTP GET, for definitions that resolve a
+    // floating upstream version (opencode-bin reads the v2 update API).
+    // Always installed so disabled contexts fail with a named error
+    // instead of "attempt to call a nil value". curl is already a hard
+    // dependency (source downloads); the body crosses a pipe, so the
+    // worker's RLIMIT_FSIZE=0 never applies to it, and the worker's
+    // wall-clock deadline plus curl's --max-time bound the wait.
+    let allow_fetch = req.allow_fetch;
+    let fetch_fn = lua
+        .create_function(move |_, url: String| -> mlua::Result<String> {
+            if !allow_fetch {
+                return Err(mlua::Error::runtime(
+                    "fetch() is disabled for this eval (--offline or hermetic context)",
+                ));
+            }
+            if !url.starts_with("https://") && !url.starts_with("http://") {
+                return Err(mlua::Error::runtime(
+                    "fetch(): only http(s) URLs are supported",
+                ));
+            }
+            let out = std::process::Command::new("curl")
+                .args(["-fsSL", "--max-time", "30", "--", &url])
+                .output()
+                .map_err(|e| mlua::Error::runtime(format!("fetch(): curl spawn failed: {e}")))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let tail = stderr.lines().last().unwrap_or("").trim().to_string();
+                return Err(mlua::Error::runtime(format!(
+                    "fetch(): curl failed for {url}: {tail}"
+                )));
+            }
+            const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+            if out.stdout.len() > MAX_BODY_BYTES {
+                return Err(mlua::Error::runtime(format!(
+                    "fetch(): response from {url} exceeds the {MAX_BODY_BYTES}-byte cap"
+                )));
+            }
+            String::from_utf8(out.stdout)
+                .map_err(|_| mlua::Error::runtime("fetch(): response is not valid UTF-8"))
+        })
+        .map_err(|e| miette::miette!("failed to create fetch(): {e}"))?;
+    lua.globals()
+        .set("fetch", fetch_fn)
+        .map_err(|e| miette::miette!("failed to set fetch global: {e}"))?;
 
     Ok(lua)
 }
