@@ -377,6 +377,12 @@ pub struct PayloadSnap {
     /// emitter records it in the generation manifest. Absent = unconfined.
     #[serde(default)]
     pub confined: Option<crate::snap::Confinement>,
+    /// Services declared by this package (ADR-0032, issue #105), carried
+    /// through meta/snap.yaml (written by SnapMeta's Serialize) so the
+    /// runtime planner records them in the generation manifest at
+    /// install time (issue #106).
+    #[serde(default)]
+    pub services: BTreeMap<String, crate::snap::ServiceDecl>,
 }
 
 /// One app entry in a payload `meta/snap.yaml`.

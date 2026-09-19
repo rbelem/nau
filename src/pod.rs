@@ -1950,6 +1950,23 @@ fn record_pin_movement(
     }
 }
 
+/// The pure pre-build resolutions of one reconcile: the declared env
+/// (ADR-0030) and the folded pod-level service overrides (ADR-0032
+/// Decision 3), validated against the declaration BEFORE any build
+/// phase — a bad declaration must fail with zero writes. The overrides
+/// are resolved ONCE here and threaded through validation into the
+/// staging tail's service record.
+fn resolve_pure_inputs(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+) -> miette::Result<(BTreeMap<String, String>, PodServiceOverrides)> {
+    let env_vars = resolve_pod_env(root, pod_name, decl)?;
+    let svc_overrides = resolve_pod_service_overrides(root, pod_name, decl)?;
+    validate_service_overrides(root, pod_name, &svc_overrides, decl)?;
+    Ok((env_vars, svc_overrides))
+}
+
 /// The reconcile proper (see [`sync_pod`]). `only` scopes it to ONE
 /// declared package — the `pod rebuild` core (issue #15): the selected
 /// package rebuilds at its pins, every other installed package keeps
@@ -1973,13 +1990,7 @@ fn reconcile_pod_scoped(
     tools: &crate::runtime::RuntimeTools,
 ) -> miette::Result<(PodSyncReport, bool)> {
     let mut state = prepare_reconcile(root, pod_name, allow_degraded, tools)?;
-    // Resolve the declared env (ADR-0030) before any build phase: the
-    // fold is pure read, and a bad declaration must fail with zero
-    // writes. Key/value validation already ran at declaration parse.
-    let env_vars = resolve_pod_env(&state.root, &state.pod_name, &state.decl)?;
-    // Pod-level service overrides (ADR-0032 Decision 3): same zero-write
-    // gate — a typo'd service name or a bad layering fails here.
-    validate_service_overrides(&state.root, &state.pod_name, &state.decl)?;
+    let (env_vars, svc_overrides) = resolve_pure_inputs(&state.root, &state.pod_name, &state.decl)?;
     let mut build = ReconcileBuild::default();
     collect_pending(&mut state, only, float_deps, &mut build)?;
     let installed = install_pending(&mut state, &mut build)?;
@@ -1996,7 +2007,7 @@ fn reconcile_pod_scoped(
     // Remove store packages the declaration dropped.
     let removed = remove_undeclared(&state.store, &state.tools, &build.declared_names)?;
     // Present whatever is now active. Nothing active → nothing exposed.
-    let (generation, farm) = present_active(&state.store, &state.dir, &env_vars)?;
+    let (generation, farm) = present_active(&state.store, &state.dir, &env_vars, &svc_overrides)?;
 
     Ok((
         PodSyncReport {
@@ -2572,32 +2583,39 @@ fn remove_undeclared(
     Ok(removed)
 }
 
-/// Present whatever is now active: re-emit the bin farm for the active
-/// generation and flip the pod's `current` link. Nothing active →
-/// nothing exposed: the farm and the user-level launcher surface are
-/// withdrawn along with it (issue #7).
+/// Present whatever is now active: record the staging-tail artifacts and
+/// re-emit the bin farm for the active generation, then flip the pod's
+/// `current` link. Nothing active → nothing exposed: the farm and the
+/// user-level launcher and service surfaces are withdrawn along with it
+/// (issue #7, ADR-0032).
 ///
-/// The resolved declared env (ADR-0030) is recorded here — the staging
-/// tail where a generation is PRESENTED — never inside `farm::emit`:
-/// a rollback re-emits through its own path and must serve the target
-/// generation's RECORDED env, not a re-resolution against the current
-/// declaration.
+/// The staging order matters: the declared env (ADR-0030) is recorded
+/// FIRST, then the service record — it composes the recorded env into
+/// the rendered units — and only then the emit, which renders services
+/// from the just-recorded `units.json`, and the flip. All of this is the
+/// staging tail where a generation is PRESENTED, never inside
+/// `farm::emit`: a rollback re-emits through its own path and must serve
+/// the target generation's RECORDED env + units, not a re-resolution
+/// against the current declaration.
 fn present_active(
     store: &crate::runtime::RuntimeStore,
     dir: &Path,
     env_vars: &BTreeMap<String, String>,
+    svc_overrides: &PodServiceOverrides,
 ) -> miette::Result<(Option<u64>, Option<PathBuf>)> {
     let active = store.active_generation()?;
     Ok(match &active {
         Some(gen) => {
-            let farm = crate::farm::emit(store, gen)?;
             crate::farm::write_generation_env(store, gen.n, env_vars)?;
+            crate::services::record(store, gen, svc_overrides)?;
+            let farm = crate::farm::emit(store, gen)?;
             crate::farm::flip_current(dir, gen.n)?;
             (Some(gen.n), Some(farm))
         }
         None => {
             crate::farm::clear_current(dir)?;
             crate::desktop::clear(store)?;
+            crate::services::clear(store)?;
             (None, None)
         }
     })
@@ -3044,6 +3062,11 @@ pub(crate) fn resolve_service_options(
 /// name both pods, like [`fold_pod_env`].
 type FoldedServiceOverrides = BTreeMap<String, BTreeMap<String, (serde_json::Value, String)>>;
 
+/// The resolved pod-level service overrides, provenance stripped:
+/// service name → option key → value (ADR-0032 Decision 3). The form
+/// threaded through validation into the staging tail's service record.
+pub(crate) type PodServiceOverrides = BTreeMap<String, BTreeMap<String, serde_json::Value>>;
+
 /// The fold proper for pod{} service overrides (ADR-0032 Decision 3),
 /// mirroring [`fold_pod_env`]: loaded pods fold transitively, a
 /// same-key override between two loaded pods keeps the FIRST-declared
@@ -3113,7 +3136,7 @@ fn resolve_pod_service_overrides(
     root: &Path,
     pod_name: &str,
     decl: &PodDeclaration,
-) -> miette::Result<BTreeMap<String, BTreeMap<String, serde_json::Value>>> {
+) -> miette::Result<PodServiceOverrides> {
     let folded = fold_pod_services(root, pod_name, decl, &mut Vec::new(), &mut HashSet::new())?;
     Ok(folded
         .into_iter()
@@ -3124,20 +3147,20 @@ fn resolve_pod_service_overrides(
 /// Validate the pod-level `services` overrides (ADR-0032 Decision 3)
 /// BEFORE any write, on every reconcile: every override must reference a
 /// service the post-state package set actually declares (a typo is a hard
-/// error, not a silent no-op), and the layering resolves here — package
-/// defaults < loaded pods < own declaration — with a warning per
-/// overridden key. Pure reads. The resolved sets are the emitter's
-/// (ticket #106) input; validation only proves them well-formed.
+/// error, not a silent no-op). The layering itself resolved when the
+/// overrides were folded ([`resolve_pod_service_overrides`], warning per
+/// overridden key); this pass only proves them well-formed against the
+/// declared services.
 fn validate_service_overrides(
     root: &Path,
     pod_name: &str,
+    overrides: &PodServiceOverrides,
     decl: &PodDeclaration,
 ) -> miette::Result<()> {
-    let overrides = resolve_pod_service_overrides(root, pod_name, decl)?;
     if overrides.is_empty() {
-        return Ok(()); // nothing to reference-check or resolve
+        return Ok(()); // nothing to reference-check
     }
-    let declared = walk_post_state_services(root, decl, &overrides, pod_name)?;
+    let declared = walk_post_state_services(root, decl, overrides, pod_name)?;
     for service in overrides.keys() {
         if !declared.contains_key(service) {
             miette::bail!(
@@ -4257,6 +4280,8 @@ pod {
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
                 fonts: BTreeMap::new(),
+                services: BTreeMap::new(),
+                service_bins: BTreeMap::new(),
             },
         );
         crate::runtime::Generation {
@@ -4631,7 +4656,7 @@ pod {
         let vars: BTreeMap<String, String> = [("EDITOR".to_string(), "vi".to_string())]
             .into_iter()
             .collect();
-        let (generation, _) = present_active(&store, &dir, &vars).unwrap();
+        let (generation, _) = present_active(&store, &dir, &vars, &BTreeMap::new()).unwrap();
         assert_eq!(generation, Some(1));
         let recorded: BTreeMap<String, String> =
             serde_json::from_slice(&std::fs::read(crate::farm::env_path(&store, 1)).unwrap())
@@ -4640,7 +4665,7 @@ pod {
 
         // Re-presenting with no declared env writes the empty object —
         // stale vars are withdrawn, the loader-libs re-emit rule.
-        present_active(&store, &dir, &BTreeMap::new()).unwrap();
+        present_active(&store, &dir, &BTreeMap::new(), &BTreeMap::new()).unwrap();
         let recorded: BTreeMap<String, String> =
             serde_json::from_slice(&std::fs::read(crate::farm::env_path(&store, 1)).unwrap())
                 .unwrap();

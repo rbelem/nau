@@ -330,6 +330,26 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
             std::os::unix::fs::symlink(&target, &link)
                 .map_err(|e| miette::miette!("linking {} -> {}: {e}", link.display(), target))?;
         }
+        // Service command binaries ride the same flat farm (ADR-0032,
+        // issue #106): a `current/<svc>` link exactly like an app
+        // binary — the service emitter's ExecStart bakes that path.
+        for (svc, hash) in &pkg.service_bins {
+            if let Some((incumbent_pkg, incumbent_layer)) = seen.get(svc.as_str()) {
+                warn_emit_collision(
+                    "binary",
+                    svc,
+                    &pkg.name,
+                    incumbent_pkg,
+                    *incumbent_layer == pkg.layer,
+                );
+            }
+            seen.insert(svc, (&pkg.name, pkg.layer));
+            let link = farm.join(svc);
+            let _ = std::fs::remove_file(&link);
+            let target = entry_target_rel(store, gen.n, pkg, svc, hash)?;
+            std::os::unix::fs::symlink(&target, &link)
+                .map_err(|e| miette::miette!("linking {} -> {}: {e}", link.display(), target))?;
+        }
     }
     // The Freedesktop launcher set is part of the generation (issue #7):
     // emit it beside the bin farm so removal and rollback surface the
@@ -339,6 +359,11 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
     // no apps, so without this their payloads would sit inert in the
     // store — the user-level fonts dir is their activation seam.
     crate::fonts::emit(store, gen)?;
+    // And the service surface (ADR-0032, issue #106): rendered from the
+    // generation's recorded `units.json` alone, so a rollback's re-emit
+    // (this same call path) restores the target generation's link set
+    // without any declaration context.
+    crate::services::emit(store, gen)?;
     // And the loader-lib list (issue #89): the generation's payload lib
     // dirs, recorded for the shellenv's LD_LIBRARY_PATH seam. The file
     // lives inside the generation, so rollback and GC scope it exactly
@@ -573,6 +598,8 @@ mod tests {
                 assembly: BTreeMap::new(),
                 desktops: BTreeMap::new(),
                 fonts: BTreeMap::new(),
+                services: BTreeMap::new(),
+                service_bins: BTreeMap::new(),
                 launchers: BTreeMap::new(),
                 confined: None,
                 app_confined: BTreeMap::new(),
@@ -626,6 +653,8 @@ mod tests {
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
                 fonts: BTreeMap::new(),
+                services: BTreeMap::new(),
+                service_bins: BTreeMap::new(),
             },
         );
         Generation {
@@ -678,6 +707,55 @@ mod tests {
         );
         // Resolves to executable store content, not a wrapper.
         assert_eq!(std::fs::read(link).unwrap(), b"content");
+    }
+
+    #[test]
+    fn service_bins_get_flat_farm_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        let hash = "abcdef4321";
+        let blob = store.blob_path(hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"daemon").unwrap();
+
+        let mut packages = BTreeMap::new();
+        let mut pkg = crate::runtime::InstalledPackage {
+            name: "valkey".to_string(),
+            version: "1.0".into(),
+            revision: 1,
+            sha3_384: "abc".into(),
+            files: vec![],
+            units: vec![],
+            layer: ClaimLayer::Own,
+            apps: BTreeMap::new(),
+            launchers: BTreeMap::new(),
+            assembly: BTreeMap::new(),
+            confined: None,
+            app_confined: BTreeMap::new(),
+            desktops: BTreeMap::new(),
+            fonts: BTreeMap::new(),
+            services: BTreeMap::new(),
+            service_bins: BTreeMap::new(),
+        };
+        pkg.service_bins
+            .insert("valkey".to_string(), hash.to_string());
+        packages.insert(pkg.name.clone(), pkg);
+        let gen = crate::runtime::Generation {
+            n: 1,
+            base_version: "24.04".into(),
+            packages,
+            created_epoch: 0,
+            boot_entry: None,
+        };
+
+        let farm = emit(&store, &gen).unwrap();
+        let link = farm.join("valkey");
+        let target = std::fs::read_link(&link).unwrap();
+        assert!(
+            target.ends_with("store/ab/abcdef4321"),
+            "the service command binary gets a flat current/<svc> farm link, got {target:?}"
+        );
+        assert_eq!(std::fs::read(link).unwrap(), b"daemon");
     }
 
     #[test]
@@ -762,6 +840,8 @@ mod tests {
                     .map(|(a, l)| (a.to_string(), l.clone()))
                     .collect(),
                 fonts: BTreeMap::new(),
+                services: BTreeMap::new(),
+                service_bins: BTreeMap::new(),
             },
         );
         Generation {
@@ -916,6 +996,8 @@ mod tests {
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
                 fonts: BTreeMap::new(),
+                services: BTreeMap::new(),
+                service_bins: BTreeMap::new(),
             },
         );
         Generation {
@@ -1136,6 +1218,8 @@ mod tests {
                     app_confined: BTreeMap::new(),
                     desktops: BTreeMap::new(),
                     fonts: BTreeMap::new(),
+                    services: BTreeMap::new(),
+                    service_bins: BTreeMap::new(),
                 },
             );
         }

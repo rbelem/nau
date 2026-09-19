@@ -32,6 +32,7 @@ pub mod pkg_source;
 pub mod plugins;
 pub mod pod;
 pub mod runtime;
+pub mod services;
 pub mod sign;
 pub mod slot_recovery;
 pub mod snap;

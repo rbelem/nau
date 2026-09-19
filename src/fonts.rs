@@ -177,6 +177,8 @@ mod tests {
                         .iter()
                         .map(|(p, h)| (p.to_string(), h.to_string()))
                         .collect(),
+                    services: std::collections::BTreeMap::new(),
+                    service_bins: std::collections::BTreeMap::new(),
                 },
             );
         }

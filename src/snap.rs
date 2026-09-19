@@ -503,7 +503,7 @@ pub enum ServiceDaemon {
 /// `options` are NixOS-style declarations with defaults (`enabled` among
 /// them, materialized to `false` at pod resolution), `backend_options` the
 /// per-backend raw passthrough.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServiceDecl {
     pub command: String,
     pub daemon: ServiceDaemon,

@@ -114,7 +114,7 @@ pub const DEVICE_ANCHOR: &str = "/etc/shuttle/update-key.pub";
 // ── Generation model ──
 
 /// One installed package as pinned in a generation manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstalledPackage {
     pub name: String,
     pub version: String,
@@ -185,6 +185,19 @@ pub struct InstalledPackage {
     /// ship no fonts (the common case; the hashes also appear in `files`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fonts: BTreeMap<String, String>,
+    /// Service declarations (ADR-0032, issue #106), recorded verbatim from
+    /// the payload's snap.yaml at install time: service name → decl. This
+    /// is the declaration record the service emitter re-renders into the
+    /// generation's `units.json` (pod-level overrides are applied at
+    /// record time, not stored here). Empty for packages without services.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, crate::snap::ServiceDecl>,
+    /// Service name → sha256 of the service's command binary blob in the
+    /// store — the farm-link source, the `apps` precedent: each entry
+    /// becomes a flat farm link `current/<svc>` exactly like an app
+    /// binary. Empty for packages without services.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service_bins: BTreeMap<String, String>,
 }
 
 /// One GUI app's desktop-launcher metadata (issue #7).
@@ -222,7 +235,7 @@ pub struct DesktopIcon {
 }
 
 /// One bootable selection: base version + package set + content hashes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Generation {
     pub n: u64,
     /// Base OS version this generation was created on (from the host
@@ -1111,6 +1124,8 @@ impl RuntimeStore {
                         BTreeMap::new(),
                         BTreeMap::new(),
                         BTreeMap::new(),
+                        BTreeMap::new(),
+                        BTreeMap::new(),
                     ),
                     planner_notes: Vec::new(),
                     entries: Vec::new(),
@@ -1140,6 +1155,8 @@ impl RuntimeStore {
                         runtime.app_confined,
                         desktops,
                         fonts,
+                        runtime.services,
+                        runtime.service_bins,
                     ),
                     planner_notes: runtime.notes,
                     entries,
@@ -1199,6 +1216,8 @@ impl RuntimeStore {
         app_confined: BTreeMap<String, crate::snap::Confinement>,
         desktops: BTreeMap<String, DesktopLauncher>,
         fonts: BTreeMap<String, String>,
+        services: BTreeMap<String, crate::snap::ServiceDecl>,
+        service_bins: BTreeMap<String, String>,
     ) -> InstalledPackage {
         InstalledPackage {
             name: snap.name.clone(),
@@ -1215,6 +1234,8 @@ impl RuntimeStore {
             app_confined,
             desktops,
             fonts,
+            services,
+            service_bins,
         }
     }
 
@@ -1885,6 +1906,12 @@ struct PayloadRuntime {
     /// Per-app confinement overrides (ticket #11): only apps that differ
     /// from the package default.
     app_confined: BTreeMap<String, crate::snap::Confinement>,
+    /// Service declarations (ADR-0032, issue #106), recorded verbatim in
+    /// the package manifest.
+    services: BTreeMap<String, crate::snap::ServiceDecl>,
+    /// Service name → command binary blob hash (the `apps` precedent;
+    /// the farm links `current/<svc>` from these).
+    service_bins: BTreeMap<String, String>,
     notes: Vec<String>,
 }
 
@@ -1911,6 +1938,8 @@ fn plan_payload_runtime(
         assembly: BTreeMap::new(),
         confined: meta.confined.clone(),
         app_confined: BTreeMap::new(),
+        services: BTreeMap::new(),
+        service_bins: BTreeMap::new(),
         notes: Vec::new(),
     };
     for (app_name, app) in &meta.apps {
@@ -1947,7 +1976,50 @@ fn plan_payload_runtime(
             }
         }
     }
+    plan_payload_services(meta, entries, &snap.name, &mut out)?;
     Ok(out)
+}
+
+/// Record one payload service declaration (ADR-0032, issue #106): the
+/// command's blob is hashed into `service_bins` (the farm-link source,
+/// the `apps` precedent) and the declaration is copied verbatim into the
+/// manifest's `services` record — the emitter's re-render source.
+///
+/// Two fail-closed gates: a confined package cannot declare services in
+/// v1 (the wrapper machinery is app-scoped — a confined service would
+/// silently run unconfined), and the command must be a pure path
+/// (arguments belong in `args`, or they would leak into the blob lookup).
+fn plan_payload_services(
+    meta: &PayloadSnap,
+    entries: &[TreeEntry],
+    snap_name: &str,
+    out: &mut PayloadRuntime,
+) -> miette::Result<()> {
+    for (svc_name, decl) in &meta.services {
+        if meta.confined.is_some() {
+            miette::bail!(
+                "service '{svc_name}' of package '{snap_name}': confined packages cannot \
+                 declare services in v1 — the wrapper machinery is app-scoped; track an \
+                 unconfined variant or split the package"
+            );
+        }
+        if decl.command.trim().is_empty() || decl.command.split_whitespace().count() != 1 {
+            miette::bail!(
+                "service '{svc_name}' of package '{snap_name}': command must be a single \
+                 path with no arguments — put arguments in 'args' (ADR-0032 Decision 2)"
+            );
+        }
+        let rel = crate::units::resolve_command_path(&decl.command).ok_or_else(|| {
+            miette::miette!(
+                "service '{svc_name}' of package '{snap_name}': command does not name a \
+                 payload path"
+            )
+        })?;
+        let hash = blob_hash_for(entries, &rel, snap_name)?;
+        out.service_bins.insert(svc_name.clone(), hash);
+        out.services.insert(svc_name.clone(), decl.clone());
+    }
+    Ok(())
 }
 
 fn blob_hash_for(entries: &[TreeEntry], rel: &str, snap_name: &str) -> miette::Result<String> {
@@ -2514,6 +2586,8 @@ mod tests {
             app_confined: BTreeMap::new(),
             desktops: BTreeMap::new(),
             fonts: BTreeMap::new(),
+            services: BTreeMap::new(),
+            service_bins: BTreeMap::new(),
         }
     }
 
@@ -3459,6 +3533,8 @@ plugs:
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
                 fonts: BTreeMap::new(),
+                services: BTreeMap::new(),
+                service_bins: BTreeMap::new(),
             },
         );
         installed.insert(
@@ -3478,6 +3554,8 @@ plugs:
                 app_confined: BTreeMap::new(),
                 desktops: BTreeMap::new(),
                 fonts: BTreeMap::new(),
+                services: BTreeMap::new(),
+                service_bins: BTreeMap::new(),
             },
         );
         let resolved = vec![
