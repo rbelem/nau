@@ -16,7 +16,7 @@
 return {
     default = snap {
         name = "herdr",
-        version = "0.9.0",
+        version = "0.9.1",
         summary = "Terminal workspace manager for AI coding agents",
         description = [[
             herdr is a terminal workspace manager (tmux replacement)
@@ -30,8 +30,8 @@ return {
         architectures = { "amd64" },
 
         source = {
-            url = "https://github.com/ogulcancelik/herdr/releases/download/v0.9.0/herdr-linux-x86_64",
-            sha256 = "4fa1a01158dd8043da92d31b270780b0dcc10603038d9b61cac4d81ab63fb71f",
+            url = "https://github.com/ogulcancelik/herdr/releases/download/v0.9.1/herdr-linux-x86_64",
+            sha256 = "2a02fed16beb651ef006e1d43f048f652ca4dc58ad053cd2d44450563d5c54b7",
         },
 
         build = table.concat({
