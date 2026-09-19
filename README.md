@@ -78,3 +78,9 @@ See `pkgs/b/bzip2.lua` for a real three-part example — every command uses
 - **CI/CD**: GitHub Actions with devbox — ✓
 
 See `CONTEXT.md` (domain glossary) and `docs/adr/` (architecture decisions) for docs.
+
+## Sponsors
+
+shuttle is free, open source software (GPL-3.0), maintained nights and weekends
+on hardware that's due for an upgrade. If you'd like to keep development moving,
+please consider [sponsoring the project](https://github.com/sponsors/rbelem).
