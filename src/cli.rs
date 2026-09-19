@@ -429,14 +429,15 @@ pub enum Command {
     /// Manage user-level pods (CONTEXT.md: Pod). `shuttle pod [--name <n>]
     /// <verb>`: imperative edits to one pod's declaration + lockfile pins,
     /// reconciled into that pod's store, generation chain, and bin farm.
-    /// `--name` selects the pod (default: `default`) and must appear before
-    /// the verb; `add` initializes an unknown pod, read verbs fail on
-    /// unknown pods. Rollback and GC are pod-scoped — system generations
+    /// `--name` selects the pod (default: `default`) and is accepted before
+    /// or after the verb; `add` initializes an unknown pod, read verbs fail
+    /// on unknown pods. Rollback and GC are pod-scoped — system generations
     /// are never touched.
     Pod {
         /// Pod to operate on (default: `default`). Belongs to the `pod`
         /// command itself, so it goes before the verb:
-        /// `shuttle pod --name work add jq`.
+        /// `shuttle pod --name work add jq`. Every verb also accepts it
+        /// after the verb (see `PodTarget`); the two positions must agree.
         #[arg(long, value_name = "POD")]
         name: Option<String>,
 
@@ -953,13 +954,18 @@ pub enum KeyCommand {
 /// pod's declaration + lockfile, mirroring the runtime command group's
 /// lifecycle shape. The `--root` state override travels with each verb
 /// (test-scoped redirection); `--name` travels on the `pod` command
-/// itself, before the verb (issue #4).
+/// itself before the verb and, via the flattened [`PodTarget`], on
+/// every verb after it (issue #4) — `cmd_pod` merges the two positions
+/// fail-closed.
 #[derive(clap::Subcommand)]
 pub enum PodCommand {
     /// Add a package to the selected pod: records it in the pod
     /// declaration and pins the resolved version in the lockfile.
     /// (Re)initializes an unknown pod.
     Add {
+        #[command(flatten)]
+        target: PodTarget,
+
         /// Package name, optionally with a version constraint
         /// (`name@constraint`, e.g. `ripgrep@14`).
         package: String,
@@ -974,6 +980,9 @@ pub enum PodCommand {
     /// Remove a package from the selected pod: drops the declaration
     /// entry and the lockfile pin.
     Remove {
+        #[command(flatten)]
+        target: PodTarget,
+
         /// Package name (a trailing `@constraint` is ignored).
         package: String,
 
@@ -987,6 +996,9 @@ pub enum PodCommand {
     /// generation, remove dropped ones, and refresh the bin farm behind
     /// the pod's `current` link. A no-op when nothing changed.
     Sync {
+        #[command(flatten)]
+        target: PodTarget,
+
         /// Pod state root (see `pod add --root`).
         #[arg(long)]
         root: Option<String>,
@@ -994,6 +1006,9 @@ pub enum PodCommand {
 
     /// List the selected pod's packages with their resolved versions.
     List {
+        #[command(flatten)]
+        target: PodTarget,
+
         /// Pod state root (see `pod add --root`).
         #[arg(long)]
         root: Option<String>,
@@ -1005,6 +1020,9 @@ pub enum PodCommand {
     /// a daemon (ADR-0015 §7, ADR-0016 §7). Fails on an unknown pod or
     /// one with no active generation.
     Shellenv {
+        #[command(flatten)]
+        target: PodTarget,
+
         /// Output structured JSON instead of shell statements.
         #[arg(long)]
         json: bool,
@@ -1021,6 +1039,9 @@ pub enum PodCommand {
     /// already at its newest matching version; constrained packages
     /// whose newest candidate no longer matches are held at their pin.
     Update {
+        #[command(flatten)]
+        target: PodTarget,
+
         /// Package names to update (default: all declared packages).
         packages: Vec<String>,
 
@@ -1036,6 +1057,9 @@ pub enum PodCommand {
     /// one package. `--latest` additionally re-resolves the dependency
     /// closure, moving the deps pin deliberately (ADR-0017 Decision 5).
     Rebuild {
+        #[command(flatten)]
+        target: PodTarget,
+
         /// Package name to rebuild (must be declared in the pod).
         package: String,
 
@@ -1055,6 +1079,9 @@ pub enum PodCommand {
     /// only — never reboots, never touches system generations. Binaries
     /// the newer generation added disappear from the farm.
     Rollback {
+        #[command(flatten)]
+        target: PodTarget,
+
         /// Generation number to roll back to (default: previous).
         generation: Option<u64>,
 
@@ -1069,6 +1096,9 @@ pub enum PodCommand {
     /// sweeping, freeing their exclusive blobs (live generations keep
     /// theirs). System generations are never eligible.
     Gc {
+        #[command(flatten)]
+        target: PodTarget,
+
         /// Also drop all pod generations except current + previous
         /// before sweeping unreferenced blobs.
         #[arg(long)]
@@ -1078,6 +1108,36 @@ pub enum PodCommand {
         #[arg(long)]
         root: Option<String>,
     },
+}
+
+/// Pod selector shared by every `shuttle pod` verb: the `--name` flag
+/// accepted AFTER the verb (`shuttle pod add jq --name work`). Merged
+/// fail-closed in `cmd_pod` against the before-verb value on the `pod`
+/// command itself — conflicting values are a hard error, never a silent
+/// precedence.
+#[derive(clap::Args)]
+pub struct PodTarget {
+    /// Pod to operate on (default: `default`).
+    #[arg(long, value_name = "POD")]
+    pub name: Option<String>,
+}
+
+impl PodCommand {
+    /// The verb-position `--name` (from the flattened [`PodTarget`]),
+    /// for merging with the before-verb value in `cmd_pod`.
+    pub fn pod_name(&self) -> Option<&str> {
+        match self {
+            PodCommand::Add { target, .. }
+            | PodCommand::Remove { target, .. }
+            | PodCommand::Sync { target, .. }
+            | PodCommand::List { target, .. }
+            | PodCommand::Shellenv { target, .. }
+            | PodCommand::Update { target, .. }
+            | PodCommand::Rebuild { target, .. }
+            | PodCommand::Rollback { target, .. }
+            | PodCommand::Gc { target, .. } => target.name.as_deref(),
+        }
+    }
 }
 
 /// Subcommands for `shuttle index`.
@@ -2228,6 +2288,36 @@ mod tests {
                 assert_eq!(app_args, ["cred"]);
             }
             _ => panic!("expected Run"),
+        }
+    }
+
+    // `--name` before the verb lands on the `pod` command's own field.
+    #[test]
+    fn pod_name_before_verb_parses_into_parent_field() {
+        match Cli::try_parse_from(["shuttle", "pod", "--name", "daily", "add", "jq"])
+            .unwrap()
+            .command
+        {
+            Command::Pod { name, command } => {
+                assert_eq!(name.as_deref(), Some("daily"));
+                assert_eq!(command.pod_name(), None, "verb position unset");
+            }
+            _ => panic!("expected Pod"),
+        }
+    }
+
+    // `--name` after the verb lands on the verb's flattened PodTarget.
+    #[test]
+    fn pod_name_after_verb_parses_into_verb_field() {
+        match Cli::try_parse_from(["shuttle", "pod", "shellenv", "--name", "daily"])
+            .unwrap()
+            .command
+        {
+            Command::Pod { name, command } => {
+                assert_eq!(name, None, "parent position unset");
+                assert_eq!(command.pod_name(), Some("daily"));
+            }
+            _ => panic!("expected Pod"),
         }
     }
 }

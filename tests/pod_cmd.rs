@@ -5,8 +5,8 @@
 //! both live in tempdirs, so nothing is ever written to the real home.
 //! Scope under test: add/remove/list round-tripping through a pod's
 //! `pod.lua` declaration + lockfile pins — the default pod via bare verbs
-//! and named pods via `--name` before the verb (issue #4). No binaries,
-//! generations, or activation — those are later tickets.
+//! and named pods via `--name` before or after the verb (issue #4). No
+//! binaries, generations, or activation — those are later tickets.
 
 use std::path::Path;
 use std::process::Command;
@@ -584,27 +584,75 @@ fn remove_on_unknown_named_pod_fails_with_clear_error() {
     );
 }
 
-// ── UX shape: `--name` belongs before the verb ──
+// ── UX shape: `--name` is accepted before or after the verb ──
 
 #[test]
-fn name_after_verb_is_rejected() {
+fn name_after_verb_is_accepted() {
     let project = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     write_pkg(project.path(), "jq", "1.7.1");
 
-    // The agreed UX is `shuttle pod [--name X] <verb>`; `--name` is an
-    // argument of the `pod` command itself, not of any verb.
+    // `--name` is accepted after the verb as well as before it: the
+    // named pod is targeted either way (issue #4).
     let (code, _, stderr) = run(
         project.path(),
         root.path(),
         &["add", "jq", "--name", "work"],
     );
-    assert_ne!(code, Some(0), "--name after the verb must not be accepted");
+    assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(
-        !root.path().join("work").exists() && !pod_lua(root.path()).exists(),
-        "a rejected invocation must not write any state"
+        named_pod_lua(root.path(), "work").exists() && named_pod_lock(root.path(), "work").exists(),
+        "the named pod's declaration and lockfile must be written"
     );
-    let _ = stderr;
+    assert!(
+        !pod_lua(root.path()).exists(),
+        "the default pod must be untouched"
+    );
+}
+
+#[test]
+fn conflicting_name_positions_fail_closed() {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_pkg(project.path(), "jq", "1.7.1");
+
+    // Both positions given with DIFFERENT pods: hard error naming both
+    // values — never a silent last-one-wins.
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["--name", "alpha", "add", "jq", "--name", "beta"],
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("alpha") && stderr.contains("beta"),
+        "error must name both conflicting values: {stderr}"
+    );
+    assert!(
+        !root.path().join("alpha").exists()
+            && !root.path().join("beta").exists()
+            && !pod_lua(root.path()).exists(),
+        "a rejected invocation must not write any pod state"
+    );
+}
+
+#[test]
+fn same_name_in_both_positions_succeeds() {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_pkg(project.path(), "jq", "1.7.1");
+
+    // Both positions given with the SAME pod: fine.
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["--name", "work", "add", "jq", "--name", "work"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        named_pod_lua(root.path(), "work").exists() && named_pod_lock(root.path(), "work").exists(),
+        "the named pod's declaration and lockfile must be written"
+    );
 }
 
 #[test]
