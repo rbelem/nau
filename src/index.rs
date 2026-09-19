@@ -39,7 +39,7 @@
 //! bare `"<arch>"` key is legacy ("channel unknown") and is never trusted
 //! on a derived channel.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -463,6 +463,7 @@ impl PackageIndex {
             inputs: None,
             confined: None,
             apps,
+            services: BTreeMap::new(),
             deps: None,
             floating: false,
             definition_dir: None,

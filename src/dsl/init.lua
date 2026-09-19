@@ -514,6 +514,21 @@ function snap(opts)
         end
     end
 
+    -- services: table mapping string -> service definition (ADR-0032).
+    -- Type-check only here; the field-level schema is the Rust
+    -- conversion boundary in snap.rs.
+    check_table(opts.services, "snap", "services")
+    if opts.services ~= nil then
+        for name, svc_def in pairs(opts.services) do
+            if type(svc_def) ~= "table" then
+                error(string.format(
+                    "snap(): services['%s'] must be a service table, got %s",
+                    name, type(svc_def)
+                ), 2)
+            end
+        end
+    end
+
     -- Set defaults
     if opts.grade == nil then opts.grade = "stable" end
     if opts.confinement == nil then opts.confinement = "strict" end

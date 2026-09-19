@@ -199,6 +199,10 @@ pub struct PodDeclaration {
     /// the resolved map is written to the generation and exported in
     /// this deterministic order (ADR-0016 §7 env hooks).
     pub env: BTreeMap<String, String>,
+    /// Per-service option overrides (ADR-0032 Decision 3): service name →
+    /// option overrides merged over each package-declared service's
+    /// options (package defaults < loaded pods < this declaration).
+    pub services: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
 }
 
 /// Evaluate and validate a pod declaration file.
@@ -261,10 +265,7 @@ pub fn evaluate_pod_source(label: &str, source: &str) -> miette::Result<PodDecla
 /// failure names the offending field.
 fn validate_pod_table(table: &mlua::Table) -> miette::Result<PodDeclaration> {
     let mut decl = PodDeclaration::default();
-    let mut saw_loads = false;
-    let mut saw_packages = false;
-    let mut saw_overlay = false;
-    let mut saw_env = false;
+    let mut seen: HashSet<String> = HashSet::new();
 
     for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
         let (key, value) = pair.map_err(|e| miette::miette!("pod(): {e}"))?;
@@ -276,41 +277,37 @@ fn validate_pod_table(table: &mlua::Table) -> miette::Result<PodDeclaration> {
             other => miette::bail!("pod(): keys must be strings, got {}", lua_type_name(other)),
         };
         match key.as_str() {
-            "loads" => {
-                if saw_loads {
-                    miette::bail!("duplicate field 'loads' in pod() declaration");
+            "loads" | "packages" | "overlay" | "env" | "services" => {
+                if !seen.insert(key.clone()) {
+                    miette::bail!("duplicate field '{key}' in pod() declaration");
                 }
-                saw_loads = true;
-                decl.loads = expect_string_list(&value, "loads")?;
-            }
-            "packages" => {
-                if saw_packages {
-                    miette::bail!("duplicate field 'packages' in pod() declaration");
-                }
-                saw_packages = true;
-                decl.packages = expect_package_list(&value)?;
-            }
-            "overlay" => {
-                if saw_overlay {
-                    miette::bail!("duplicate field 'overlay' in pod() declaration");
-                }
-                saw_overlay = true;
-                decl.overlay = expect_overlay(&value)?;
-            }
-            "env" => {
-                if saw_env {
-                    miette::bail!("duplicate field 'env' in pod() declaration");
-                }
-                saw_env = true;
-                decl.env = expect_env(&value)?;
+                assign_pod_field(&mut decl, &key, &value)?;
             }
             other => miette::bail!(
                 "unknown field '{other}' in pod() declaration \
-                 (allowed: loads, packages, overlay, env)"
+                 (allowed: loads, packages, overlay, env, services)"
             ),
         }
     }
     Ok(decl)
+}
+
+/// Parse one known `pod()` field into the declaration. Only called with
+/// keys the match in [`validate_pod_table`] already accepted.
+fn assign_pod_field(
+    decl: &mut PodDeclaration,
+    key: &str,
+    value: &mlua::Value,
+) -> miette::Result<()> {
+    match key {
+        "loads" => decl.loads = expect_string_list(value, "loads")?,
+        "packages" => decl.packages = expect_package_list(value)?,
+        "overlay" => decl.overlay = expect_overlay(value)?,
+        "env" => decl.env = expect_env(value)?,
+        "services" => decl.services = expect_service_overrides(value)?,
+        _ => unreachable!("validate_pod_table filtered unknown keys"),
+    }
+    Ok(())
 }
 
 /// Validate a `table of strings` field, erroring with the field name.
@@ -439,6 +436,69 @@ fn expect_env(value: &mlua::Value) -> miette::Result<BTreeMap<String, String>> {
             miette::bail!("'env.{key}' must not contain newlines");
         }
         out.insert(key, value);
+    }
+    Ok(out)
+}
+
+/// Validate the `services` field (ADR-0032 Decision 3): service name →
+/// option-override table (string keys, scalar values). Names obey the
+/// shared plain-name constraint (`^[a-z0-9-]+$`, shared with the package
+/// declarations in snap.rs) so every backend identifier mapping stays
+/// total; the overrides configure an existing service — referencing one
+/// is validated at reconcile time, where the package set is known.
+fn expect_service_overrides(
+    value: &mlua::Value,
+) -> miette::Result<BTreeMap<String, BTreeMap<String, serde_json::Value>>> {
+    let table = match value {
+        mlua::Value::Table(t) => t,
+        other => miette::bail!(
+            "'services' must be a table of tables, got {}",
+            lua_type_name(other)
+        ),
+    };
+    let mut out = BTreeMap::new();
+    for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
+        let (key, item) = pair.map_err(|e| miette::miette!("'services': {e}"))?;
+        let name = match &key {
+            mlua::Value::String(s) => s
+                .to_str()
+                .map_err(|e| miette::miette!("'services': non-utf8 key: {e}"))?
+                .to_string(),
+            other => miette::bail!(
+                "'services' keys must be strings, got {}",
+                lua_type_name(other)
+            ),
+        };
+        crate::snap::validate_service_name(&name)
+            .map_err(|e| miette::miette!("'services': {e}"))?;
+        let options = match &item {
+            mlua::Value::Table(_) => crate::isolate::lua_to_json(&item).map_err(|e| {
+                miette::miette!("'services.{name}' must be a plain data table: {e}")
+            })?,
+            other => miette::bail!(
+                "'services.{name}' must be a table of option overrides, got {}",
+                lua_type_name(other)
+            ),
+        };
+        let Some(obj) = options.as_object() else {
+            miette::bail!("'services.{name}' must be a table of option overrides");
+        };
+        let mut overrides = BTreeMap::new();
+        for (key, value) in obj {
+            if !matches!(
+                value,
+                serde_json::Value::Bool(_)
+                    | serde_json::Value::Number(_)
+                    | serde_json::Value::String(_)
+            ) {
+                miette::bail!(
+                    "'services.{name}.{key}' must be a scalar option override \
+                     (string, number, or boolean)"
+                );
+            }
+            overrides.insert(key.clone(), value.clone());
+        }
+        out.insert(name, overrides);
     }
     Ok(out)
 }
@@ -719,6 +779,21 @@ pub fn render_pod_source(decl: &PodDeclaration) -> String {
                 render_lua_key(key),
                 render_json_lua(value, 2)
             ));
+        }
+        out.push_str("    },\n");
+    }
+    if !decl.services.is_empty() {
+        out.push_str("    services = {\n");
+        for (name, overrides) in &decl.services {
+            out.push_str(&format!("        {} = {{\n", render_lua_key(name)));
+            for (key, value) in overrides {
+                out.push_str(&format!(
+                    "            {} = {},\n",
+                    render_lua_key(key),
+                    render_json_lua(value, 3)
+                ));
+            }
+            out.push_str("        },\n");
         }
         out.push_str("    },\n");
     }
@@ -1133,6 +1208,9 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
         crate::farm::ClaimLayer::Own
     };
     precheck_binary_collision(root, &decl, &spec.name, &meta, new_layer)?;
+    // Service-name precheck (ADR-0032 Decision 3): same rules, same
+    // zero-writes guarantee.
+    precheck_service_collision(root, &decl, &spec.name, &meta, new_layer)?;
 
     let dir = pod_dir(root, pod_name);
     std::fs::create_dir_all(&dir)
@@ -1726,10 +1804,17 @@ enum OwnScope {
 fn hold_style_skip_claims(
     desktop_claims: &mut Vec<DesktopClaim>,
     binary_claims: &mut Vec<BinaryClaim>,
+    service_claims: &mut Vec<ServiceClaim>,
     installed_pkg: &crate::runtime::InstalledPackage,
+    meta: &crate::snap::SnapMeta,
 ) {
     push_desktop_claims(desktop_claims, installed_pkg, crate::farm::ClaimLayer::Own);
     push_installed_binary_claims(binary_claims, installed_pkg, crate::farm::ClaimLayer::Own);
+    // Services have no installed-record entry yet (the manifest record is
+    // ticket #106), so a held pin claims them from the freshly resolved
+    // meta — the pin's content only differs when the pin MOVES, and a
+    // move rebuilds.
+    push_meta_service_claims(service_claims, meta, crate::farm::ClaimLayer::Own);
 }
 
 /// True when a freshly resolved own package would be HELD at its
@@ -1776,7 +1861,9 @@ fn scope_own_package(
             hold_style_skip_claims(
                 &mut build.desktop_claims,
                 &mut build.binary_claims,
+                &mut build.service_claims,
                 installed_pkg,
+                meta,
             );
             return OwnScope::SkipInstalled;
         }
@@ -1793,7 +1880,9 @@ fn scope_own_package(
             hold_style_skip_claims(
                 &mut build.desktop_claims,
                 &mut build.binary_claims,
+                &mut build.service_claims,
                 installed_pkg,
+                meta,
             );
         }
         return OwnScope::Held;
@@ -1888,6 +1977,9 @@ fn reconcile_pod_scoped(
     // fold is pure read, and a bad declaration must fail with zero
     // writes. Key/value validation already ran at declaration parse.
     let env_vars = resolve_pod_env(&state.root, &state.pod_name, &state.decl)?;
+    // Pod-level service overrides (ADR-0032 Decision 3): same zero-write
+    // gate — a typo'd service name or a bad layering fails here.
+    validate_service_overrides(&state.root, &state.pod_name, &state.decl)?;
     let mut build = ReconcileBuild::default();
     collect_pending(&mut state, only, float_deps, &mut build)?;
     let installed = install_pending(&mut state, &mut build)?;
@@ -2094,6 +2186,7 @@ fn install_pending(
 ) -> miette::Result<Vec<String>> {
     resolve_desktop_claims(&build.desktop_claims)?;
     resolve_binary_claims(&build.binary_claims)?;
+    resolve_service_claims(&build.service_claims)?;
     let mut installed = Vec::new();
     if !build.pending.is_empty() {
         let report =
@@ -2138,6 +2231,9 @@ struct ReconcileBuild {
     /// BEFORE any store write so a same-precedence clash is a hard error
     /// with zero writes.
     binary_claims: Vec<BinaryClaim>,
+    /// Service-name claims of the post-state package set (ADR-0032,
+    /// issue #105): same classifier, same pre-write gate.
+    service_claims: Vec<ServiceClaim>,
     /// Version pins the reconcile moved (overlay wins over the pin):
     /// recorded only after the build succeeded, applied only after the
     /// install succeeded — a failed reconcile leaves the pin in place.
@@ -2257,6 +2353,7 @@ fn build_own_package(
 ) -> miette::Result<()> {
     push_meta_desktop_claims(&mut build.desktop_claims, meta, layer);
     push_meta_binary_claims(&mut build.binary_claims, meta, layer);
+    push_meta_service_claims(&mut build.service_claims, meta, layer);
     // Dependency closure first (ADR-0017 Decision 7): fetch or verify
     // BEFORE the sandboxed offline build consumes it. `force_float`
     // floats the closure regardless of the meta's own float mode
@@ -2347,6 +2444,11 @@ fn collect_loaded_packages(
         );
         push_meta_binary_claims(
             &mut build.binary_claims,
+            &meta,
+            crate::farm::ClaimLayer::Loaded,
+        );
+        push_meta_service_claims(
+            &mut build.service_claims,
             &meta,
             crate::farm::ClaimLayer::Loaded,
         );
@@ -2747,6 +2849,384 @@ fn resolve_binary_claims(claims: &[BinaryClaim]) -> miette::Result<()> {
         }
     }
     Ok(())
+}
+
+// ── Service-name claims (ADR-0032 Decision 3, issue #105) ──
+
+/// One claim on a service name (ADR-0032): which package declares the
+/// service, at which composition precedence layer. Mirrors the binary
+/// claim so the shared classifier runs unchanged. Package-level pod{}
+/// `services` entries are NOT claims — they configure an existing
+/// service; only a package's declared `services` claims the name.
+#[derive(Debug, Clone)]
+struct ServiceClaim {
+    service: String,
+    pkg: String,
+    layer: crate::farm::ClaimLayer,
+}
+
+/// Pre-write service-collision check for `add_package` (ADR-0032
+/// Decision 3): a same-precedence service-name clash with the pod's
+/// post-state package set must fail BEFORE any write. Mirrors
+/// [`precheck_binary_collision`].
+fn precheck_service_collision(
+    root: &Path,
+    decl: &PodDeclaration,
+    new_name: &str,
+    new_meta: &crate::snap::SnapMeta,
+    new_layer: crate::farm::ClaimLayer,
+) -> miette::Result<()> {
+    let mut claims: Vec<ServiceClaim> = Vec::new();
+    push_meta_service_claims(&mut claims, new_meta, new_layer);
+    push_declared_service_claims(&mut claims, decl, new_name)?;
+    push_loaded_service_claims(&mut claims, root, decl, new_name)?;
+    resolve_service_claims(&claims)
+}
+
+/// Collect the service claims of every declared package except the one
+/// being added, at its layer (own, or overlay when the pod patches it).
+fn push_declared_service_claims(
+    claims: &mut Vec<ServiceClaim>,
+    decl: &PodDeclaration,
+    new_name: &str,
+) -> miette::Result<()> {
+    for spec_str in &decl.packages {
+        let spec = parse_pod_package(spec_str)?;
+        if spec.name == new_name {
+            continue; // the incoming package's claims are already added
+        }
+        let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+            miette::miette!("cannot check '{}' for a service collision: {e}", spec.name)
+        })?;
+        if let Some(patch) = decl.overlay.get(&spec.name) {
+            apply_overlay(&mut meta, patch)
+                .map_err(|e| miette::miette!("overlay of '{}' is invalid: {e}", spec.name))?;
+        }
+        let layer = if decl.overlay.contains_key(&spec.name) {
+            crate::farm::ClaimLayer::Overlay
+        } else {
+            crate::farm::ClaimLayer::Own
+        };
+        push_meta_service_claims(claims, &meta, layer);
+    }
+    Ok(())
+}
+
+/// Collect the service claims of loaded-pod-provided packages, folded in
+/// at `Loaded` (the composition floor). A package the pod itself declares
+/// is already claimed at a higher layer, so it is skipped here.
+fn push_loaded_service_claims(
+    claims: &mut Vec<ServiceClaim>,
+    root: &Path,
+    decl: &PodDeclaration,
+    new_name: &str,
+) -> miette::Result<()> {
+    for name in loaded_package_names(root, decl)? {
+        let declared = decl.packages.iter().any(|s| {
+            parse_pod_package(s)
+                .map(|p| p.name == name)
+                .unwrap_or(false)
+        });
+        if declared || name == new_name {
+            continue;
+        }
+        let meta = crate::deps::load_meta(&name).map_err(|e| {
+            miette::miette!(
+                "cannot check loaded '{}' for a service collision: {e}",
+                name
+            )
+        })?;
+        push_meta_service_claims(claims, &meta, crate::farm::ClaimLayer::Loaded);
+    }
+    Ok(())
+}
+
+/// Collect the service claims of a freshly resolved meta: the name of
+/// every service the package declares.
+fn push_meta_service_claims(
+    claims: &mut Vec<ServiceClaim>,
+    meta: &crate::snap::SnapMeta,
+    layer: crate::farm::ClaimLayer,
+) {
+    for service in meta.services.keys() {
+        claims.push(ServiceClaim {
+            service: service.clone(),
+            pkg: meta.name.clone(),
+            layer,
+        });
+    }
+}
+
+/// Resolve service-name collisions across the post-state package set
+/// (ADR-0032 Decision 3): same-precedence duplicate service names are a
+/// hard error (zero writes); a higher layer overrides with a warning
+/// naming winner and loser; a lower layer is shadowed with a warning.
+/// Declaration order breaks ties: the later claim is the incoming one.
+fn resolve_service_claims(claims: &[ServiceClaim]) -> miette::Result<()> {
+    let mut incumbent: BTreeMap<String, ServiceClaim> = BTreeMap::new();
+    for claim in claims {
+        let Some(existing) = incumbent.get(&claim.service) else {
+            incumbent.insert(claim.service.clone(), claim.clone());
+            continue;
+        };
+        match crate::farm::classify_collision(existing.layer, claim.layer) {
+            crate::farm::CollisionVerdict::Error => {
+                miette::bail!(
+                    "service '{}' is declared by both '{}' and '{}' at the same \
+                     precedence — same-precedence service-name collision; rename one of \
+                     the services or drop one of the packages (ADR-0032 Decision 3)",
+                    claim.service,
+                    existing.pkg,
+                    claim.pkg
+                );
+            }
+            crate::farm::CollisionVerdict::Override => {
+                crate::output::warn(format!(
+                    "service '{}' from '{}' overrides '{}' (higher layer wins)",
+                    claim.service, claim.pkg, existing.pkg
+                ));
+                incumbent.insert(claim.service.clone(), claim.clone());
+            }
+            crate::farm::CollisionVerdict::Shadowed => {
+                crate::output::warn(format!(
+                    "service '{}' from '{}' is shadowed by '{}' (lower layer loses)",
+                    claim.service, claim.pkg, existing.pkg
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Pod-level service overrides (ADR-0032 Decision 3) ──
+
+/// One resolved service option set: the merged pass-through options plus
+/// `enabled` materialized as a bool (ADR-0032 Decision 7 — default
+/// `false`, declaring never starts anything). The service emitter
+/// consumes this; the resolution helpers here only validate.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedServiceOptions {
+    pub enabled: bool,
+    pub options: BTreeMap<String, serde_json::Value>,
+}
+
+/// Resolve one service's options (ADR-0032 Decision 3): the package's
+/// defaults merged per-key with the pod-level overrides, override wins.
+/// Every overridden key warns naming winner and loser — a cross-layer
+/// override is never silent. `enabled` is materialized separately:
+/// the pod override wins, else the package default, else `false`.
+pub(crate) fn resolve_service_options(
+    service: &str,
+    defaults: &BTreeMap<String, serde_json::Value>,
+    overrides: &BTreeMap<String, serde_json::Value>,
+    winner_label: &str,
+    loser_label: &str,
+) -> ResolvedServiceOptions {
+    let mut options = defaults.clone();
+    for (key, value) in overrides {
+        if defaults.get(key) != Some(value) {
+            crate::output::warn(format!(
+                "service '{service}': option '{key}' from {winner_label} overrides \
+                 {loser_label} (override wins)"
+            ));
+        }
+        options.insert(key.clone(), value.clone());
+    }
+    let enabled = options
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    ResolvedServiceOptions { enabled, options }
+}
+
+/// The folded pod-level service overrides: service name → option key →
+/// (value, declaring pod). Provenance rides along so a collision can
+/// name both pods, like [`fold_pod_env`].
+type FoldedServiceOverrides = BTreeMap<String, BTreeMap<String, (serde_json::Value, String)>>;
+
+/// The fold proper for pod{} service overrides (ADR-0032 Decision 3),
+/// mirroring [`fold_pod_env`]: loaded pods fold transitively, a
+/// same-key override between two loaded pods keeps the FIRST-declared
+/// load's value with a warning, and the pod's own declaration wins a
+/// cross-layer clash with a warning naming winner and loser. Memoized +
+/// cycle-checked; pure reads.
+fn fold_pod_services(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+    stack: &mut Vec<String>,
+    done: &mut HashSet<String>,
+) -> miette::Result<FoldedServiceOverrides> {
+    if let Some(pos) = stack.iter().position(|p| p == pod_name) {
+        let mut cycle: Vec<String> = stack[pos..].to_vec();
+        cycle.push(pod_name.to_string());
+        miette::bail!("pod load cycle detected: {}", cycle.join(" -> "));
+    }
+    if !done.insert(pod_name.to_string()) {
+        return Ok(BTreeMap::new());
+    }
+    stack.push(pod_name.to_string());
+    let folded = (|| {
+        let mut folded: FoldedServiceOverrides = BTreeMap::new();
+        for loaded in &decl.loads {
+            let loaded_decl = load_declaration(root, loaded)?;
+            for (service, options) in fold_pod_services(root, loaded, &loaded_decl, stack, done)? {
+                let entry = folded.entry(service.clone()).or_default();
+                for (key, contributed) in options {
+                    match entry.get(&key) {
+                        None => {
+                            entry.insert(key, contributed);
+                        }
+                        Some(_) => {
+                            crate::output::warn(format!(
+                                "service override for '{service}' option '{key}' comes from \
+                                 more than one loaded pod under '{pod_name}' — keeping the \
+                                 first-declared load's value"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for (service, options) in &decl.services {
+            let entry = folded.entry(service.clone()).or_default();
+            for (key, value) in options {
+                if let Some((_, loser)) =
+                    entry.insert(key.clone(), (value.clone(), pod_name.to_string()))
+                {
+                    crate::output::warn(format!(
+                        "service '{service}': option '{key}' from pod '{pod_name}' \
+                         overrides pod '{loser}' (higher layer wins)"
+                    ));
+                }
+            }
+        }
+        Ok(folded)
+    })();
+    stack.pop();
+    folded
+}
+
+/// Fold the loaded + own service overrides into one map (provenance
+/// stripped), like [`resolve_pod_env`] strips [`fold_pod_env`]'s.
+fn resolve_pod_service_overrides(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+) -> miette::Result<BTreeMap<String, BTreeMap<String, serde_json::Value>>> {
+    let folded = fold_pod_services(root, pod_name, decl, &mut Vec::new(), &mut HashSet::new())?;
+    Ok(folded
+        .into_iter()
+        .map(|(svc, options)| (svc, options.into_iter().map(|(k, (v, _))| (k, v)).collect()))
+        .collect())
+}
+
+/// Validate the pod-level `services` overrides (ADR-0032 Decision 3)
+/// BEFORE any write, on every reconcile: every override must reference a
+/// service the post-state package set actually declares (a typo is a hard
+/// error, not a silent no-op), and the layering resolves here — package
+/// defaults < loaded pods < own declaration — with a warning per
+/// overridden key. Pure reads. The resolved sets are the emitter's
+/// (ticket #106) input; validation only proves them well-formed.
+fn validate_service_overrides(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+) -> miette::Result<()> {
+    let overrides = resolve_pod_service_overrides(root, pod_name, decl)?;
+    if overrides.is_empty() {
+        return Ok(()); // nothing to reference-check or resolve
+    }
+    let declared = walk_post_state_services(root, decl, &overrides, pod_name)?;
+    for service in overrides.keys() {
+        if !declared.contains_key(service) {
+            miette::bail!(
+                "pod '{pod_name}' services: no package declares service '{service}' — \
+                 the override must name a service declared by one of the pod's packages \
+                 (ADR-0032 Decision 3)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Walk the post-state package set — own declared packages (overlay
+/// applied, the payload this pod would execute) plus loaded-pod packages
+/// at their claim layers, like the collision prechecks — resolving each
+/// package's services against the folded overrides. Returns the service
+/// name → declaring-packages map the reference check needs.
+fn walk_post_state_services(
+    root: &Path,
+    decl: &PodDeclaration,
+    overrides: &BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    pod_name: &str,
+) -> miette::Result<BTreeMap<String, Vec<String>>> {
+    let mut declared: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for spec_str in &decl.packages {
+        let spec = parse_pod_package(spec_str)?;
+        let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+            miette::miette!(
+                "cannot validate service overrides against '{}': {e}",
+                spec.name
+            )
+        })?;
+        if let Some(patch) = decl.overlay.get(&spec.name) {
+            apply_overlay(&mut meta, patch)
+                .map_err(|e| miette::miette!("overlay of '{}' is invalid: {e}", spec.name))?;
+        }
+        resolve_service_overrides_against_meta(overrides, &meta, pod_name);
+        record_declared_services(&mut declared, &meta);
+    }
+    for name in loaded_package_names(root, decl)? {
+        let own = decl
+            .packages
+            .iter()
+            .filter_map(|s| parse_pod_package(s).ok())
+            .any(|p| p.name == name);
+        if own {
+            continue;
+        }
+        let meta = crate::deps::load_meta(&name).map_err(|e| {
+            miette::miette!("cannot validate service overrides against loaded '{name}': {e}")
+        })?;
+        resolve_service_overrides_against_meta(overrides, &meta, pod_name);
+        record_declared_services(&mut declared, &meta);
+    }
+    Ok(declared)
+}
+
+/// Record one package's service claims in the declared-service map.
+fn record_declared_services(
+    declared: &mut BTreeMap<String, Vec<String>>,
+    meta: &crate::snap::SnapMeta,
+) {
+    for service in meta.services.keys() {
+        declared
+            .entry(service.clone())
+            .or_default()
+            .push(meta.name.clone());
+    }
+}
+
+/// Resolve one package's declared services against the folded pod-level
+/// overrides (warnings fire here, `enabled` materializes) — the
+/// validation-path consumption of [`resolve_service_options`]. Results
+/// are dropped until the emitter lands (ticket #106).
+fn resolve_service_overrides_against_meta(
+    overrides: &BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    meta: &crate::snap::SnapMeta,
+    pod_name: &str,
+) {
+    for (service, decl) in &meta.services {
+        let pod_overrides = overrides.get(service).cloned().unwrap_or_default();
+        let _resolved = resolve_service_options(
+            service,
+            &decl.options,
+            &pod_overrides,
+            &format!("pod '{pod_name}'"),
+            "the package default",
+        );
+    }
 }
 
 /// Degraded-mode banner for `pod add` when the squashfs pair is absent:
@@ -3423,6 +3903,121 @@ pod {
         assert!(validate_pod_name("a/b").is_err());
     }
 
+    // ── Pod-level service overrides (ADR-0032, issue #105) ──
+
+    #[test]
+    fn services_field_parses() {
+        let decl = evaluate_pod_source(
+            "test",
+            r#"
+            pod {
+                packages = { "valkey" },
+                services = {
+                    valkey = { port = 6380, enabled = true },
+                    wigolo = {},
+                },
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(decl.services["valkey"]["port"], serde_json::json!(6380));
+        assert_eq!(decl.services["valkey"]["enabled"], serde_json::json!(true));
+        assert!(decl.services["wigolo"].is_empty());
+    }
+
+    #[test]
+    fn unknown_field_message_lists_services_as_allowed() {
+        let err = evaluate_pod_source("test", r#"pod { pkgs = { "jq" } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("allowed: loads, packages, overlay, env, services"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn services_override_names_obey_the_name_constraint() {
+        for bad in ["Valkey", "valkey_2", ""] {
+            let entry = if bad.is_empty() {
+                r#"[""] = {}"#.to_string()
+            } else {
+                format!("{bad} = {{}}")
+            };
+            let err = evaluate_pod_source("test", &format!("pod {{ services = {{ {entry} }} }}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("invalid service name"),
+                "override name {bad:?} must be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn services_override_values_are_scalars_only() {
+        let err = evaluate_pod_source(
+            "test",
+            r#"pod { services = { valkey = { nested = { deep = 1 } } } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("services.valkey.nested") && err.contains("scalar"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn service_declaration_renders_and_round_trips() {
+        let decl = evaluate_pod_source(
+            "test",
+            r#"
+            pod {
+                services = { valkey = { port = 6380, enabled = true } },
+            }
+        "#,
+        )
+        .unwrap();
+        let redecl = evaluate_pod_source("test", &render_pod_source(&decl)).unwrap();
+        assert_eq!(redecl, decl, "render → evaluate must round-trip services");
+    }
+
+    #[test]
+    fn resolve_service_options_merges_and_materializes_enabled() {
+        let defaults = [
+            ("port".to_string(), serde_json::json!(6379)),
+            ("enabled".to_string(), serde_json::json!(false)),
+        ]
+        .into_iter()
+        .collect();
+        let overrides = [
+            ("port".to_string(), serde_json::json!(6380)),
+            ("enabled".to_string(), serde_json::json!(true)),
+        ]
+        .into_iter()
+        .collect();
+        let resolved = resolve_service_options(
+            "valkey",
+            &defaults,
+            &overrides,
+            "pod 'work'",
+            "the package default",
+        );
+        assert_eq!(resolved.options["port"], serde_json::json!(6380));
+        assert!(resolved.enabled, "pod override must win enablement");
+
+        // Neither layer declares `enabled` → false (Decision 7).
+        let resolved = resolve_service_options(
+            "valkey",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            "pod 'work'",
+            "the package default",
+        );
+        assert!(!resolved.enabled);
+    }
+
     /// Bare SnapMeta with every optional field empty (mirrors the test
     /// helper in manifest.rs).
     fn bare_meta(name: &str, version: &str) -> crate::snap::SnapMeta {
@@ -3460,6 +4055,7 @@ pod {
             inputs: None,
             confined: None,
             apps: HashMap::new(),
+            services: BTreeMap::new(),
             deps: None,
             floating: false,
             definition_dir: None,

@@ -401,6 +401,7 @@ mod tests {
             inputs: None,
             confined: None,
             apps: std::collections::HashMap::new(),
+            services: std::collections::BTreeMap::new(),
             deps: None,
             floating: false,
             definition_dir: None,

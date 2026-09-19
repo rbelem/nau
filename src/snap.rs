@@ -400,6 +400,13 @@ pub struct SnapMeta {
     #[serde(default)]
     pub apps: HashMap<String, SnapApp>,
 
+    /// Services declared by this package (ADR-0032, issue #105), keyed by
+    /// service name. Emitted into snap.yaml so it survives the pod build →
+    /// install pipeline exactly like `apps` (the service emitter later
+    /// records it in the generation manifest).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, ServiceDecl>,
+
     /// Dependency-closure declaration (ADR-0017, issue #13): ecosystem
     /// resolvers with their lockfiles, e.g.
     /// `deps = { npm = { lock = "package-lock.json" } }`. Build-time only —
@@ -476,6 +483,445 @@ pub struct SnapApp {
     /// snap.yaml so it survives the pod build → install pipeline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confined: Option<Confinement>,
+}
+
+// ── Service declarations (ADR-0032, Decisions 1–3) ──
+
+/// How the service daemon signals readiness (ADR-0032 Decision 2). The
+/// spelling deliberately matches the Snap app `daemon` key. `oneshot` is
+/// out of scope for v1 (ADR-0032 revisit trigger keeps the door open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceDaemon {
+    Simple,
+    Notify,
+    Forking,
+}
+
+/// One service declared by a package (`services = { name = service { … } }`,
+/// ADR-0032 Decision 2). The shared vocabulary every backend must accept;
+/// `options` are NixOS-style declarations with defaults (`enabled` among
+/// them, materialized to `false` at pod resolution), `backend_options` the
+/// per-backend raw passthrough.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ServiceDecl {
+    pub command: String,
+    pub daemon: ServiceDaemon,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub backend_options: BTreeMap<String, serde_json::Value>,
+}
+
+/// Service names become backend identifier components (unit names, labels,
+/// supervisor process names — ADR-0032 Decisions 3 and 9); keep them plain
+/// so every per-backend mapping stays total. Shared with the pod-level
+/// `services` override keys (pod.rs).
+pub(crate) fn validate_service_name(name: &str) -> miette::Result<()> {
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !plain {
+        miette::bail!(
+            "invalid service name '{name}': must be non-empty and match ^[a-z0-9-]+$ \
+             (ADR-0032 Decision 3)"
+        );
+    }
+    Ok(())
+}
+
+/// The one built-in interpolation reference (ADR-0032 Decision 2): the
+/// active generation's extensions dir resolved through `current`.
+const SERVICE_BUILTIN_REF: &str = "extensions";
+
+/// Fail-closed interpolation scan (ADR-0032 Decision 2) for `command`,
+/// `args` entries, and `options` string values: every `${ref}` must name a
+/// declared option of THIS service or exactly the `extensions` built-in;
+/// `%` may introduce only `%h`, `%p`, or the `%%` escape — no `%`-token
+/// ever reaches a backend artifact unexpanded. `%` followed by a non-letter
+/// (e.g. `50%`) is a literal.
+fn validate_service_interpolation(
+    service: &str,
+    field: &str,
+    value: &str,
+    option_keys: &std::collections::BTreeSet<String>,
+) -> miette::Result<()> {
+    let chars: Vec<char> = value.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '$' if i + 1 < chars.len() && chars[i + 1] == '{' => {
+                let start = i + 2;
+                let end = chars[start..]
+                    .iter()
+                    .position(|&c| c == '}')
+                    .map(|p| start + p);
+                let Some(end) = end else {
+                    miette::bail!(
+                        "service '{service}': field '{field}': unterminated '${{' in {value:?}"
+                    );
+                };
+                let reference: String = chars[start..end].iter().collect();
+                if reference.is_empty() {
+                    miette::bail!(
+                        "service '{service}': field '{field}': empty '${{}}' reference — \
+                         name a declared option or '{SERVICE_BUILTIN_REF}'"
+                    );
+                }
+                if reference != SERVICE_BUILTIN_REF && !option_keys.contains(&reference) {
+                    miette::bail!(
+                        "service '{service}': field '{field}': unknown '${{{reference}}}' \
+                         reference — must be a declared option of this service or \
+                         '{SERVICE_BUILTIN_REF}' (ADR-0032 Decision 2)"
+                    );
+                }
+                i = end + 1;
+            }
+            '%' => match chars.get(i + 1) {
+                Some('h') | Some('p') | Some('%') => i += 2,
+                Some(c) if c.is_ascii_alphabetic() => {
+                    miette::bail!(
+                        "service '{service}': field '{field}': '%{c}' is not a shuttle \
+                         specifier (only %h, %p, and the escape %%) (ADR-0032 Decision 2)"
+                    );
+                }
+                _ => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+/// `environment` values are literals (the ADR-0030 spirit, extended by
+/// ADR-0032 Decision 2): no `${` interpolation and no `%<letter>` specifier
+/// is ever expanded there, so both fail at parse instead of leaking raw.
+fn validate_service_env_literal(service: &str, key: &str, value: &str) -> miette::Result<()> {
+    if value.contains("${") {
+        miette::bail!(
+            "service '{service}': field 'environment.{key}': environment values are \
+             literals — '${{' interpolation is not allowed (ADR-0032 Decision 2)"
+        );
+    }
+    let chars: Vec<char> = value.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '%' && chars.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic()) {
+            miette::bail!(
+                "service '{service}': field 'environment.{key}': environment values are \
+                 literals — '%{}' specifiers are not allowed (ADR-0032 Decision 2)",
+                chars[i + 1]
+            );
+        }
+    }
+    Ok(())
+}
+
+impl ServiceDecl {
+    /// Convert a Lua service table (from `service()` or a plain table)
+    /// into a [`ServiceDecl`]. `name` is the service's key in `services`,
+    /// used to name errors.
+    ///
+    /// Unknown fields are rejected here FIRST (not silently dropped):
+    /// anything the schema doesn't know would otherwise vanish between
+    /// the DSL and the emitted backend artifact — the same rule as
+    /// [`SnapApp::from_lua_table`].
+    pub fn from_lua_table(name: &str, table: &mlua::Table) -> miette::Result<Self> {
+        const VALID_FIELDS: &str =
+            "command, daemon, args, options, after, environment, backend_options";
+        let mut unknown: Vec<String> = Vec::new();
+        for pair in table.pairs::<String, Value>() {
+            let (k, _) = pair.map_err(|e| miette::miette!("service '{name}': {e}"))?;
+            if !matches!(
+                k.as_str(),
+                "command"
+                    | "daemon"
+                    | "args"
+                    | "options"
+                    | "after"
+                    | "environment"
+                    | "backend_options"
+            ) {
+                unknown.push(k);
+            }
+        }
+        if !unknown.is_empty() {
+            unknown.sort();
+            let list = unknown
+                .iter()
+                .map(|k| format!("'{k}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(miette::miette!(
+                "service '{name}': unknown field(s) {list} (valid fields: {VALID_FIELDS})",
+            ));
+        }
+
+        let command = match table.get::<Value>("command").unwrap_or(Value::Nil) {
+            Value::String(s) => s
+                .to_str()
+                .map_err(|e| miette::miette!("service '{name}': field 'command': {e}"))?
+                .to_string(),
+            Value::Nil => {
+                miette::bail!("service '{name}': field 'command' is required");
+            }
+            other => {
+                return Err(miette::miette!(
+                    "service '{name}': field 'command' must be a string, got {}",
+                    other.type_name()
+                ));
+            }
+        };
+        let daemon = match table.get::<Value>("daemon").unwrap_or(Value::Nil) {
+            Value::Nil => ServiceDaemon::Simple,
+            Value::String(s) => {
+                let kind: String = s
+                    .to_str()
+                    .map_err(|e| miette::miette!("service '{name}': field 'daemon': {e}"))?
+                    .to_string();
+                match kind.as_str() {
+                    "simple" => ServiceDaemon::Simple,
+                    "notify" => ServiceDaemon::Notify,
+                    "forking" => ServiceDaemon::Forking,
+                    "oneshot" => {
+                        miette::bail!(
+                            "service '{name}': field 'daemon' kind 'oneshot' is out of scope \
+                             for v1 (ADR-0032 Decision 2)"
+                        );
+                    }
+                    other => {
+                        miette::bail!(
+                            "service '{name}': field 'daemon' must be one of simple, notify, \
+                             forking, got '{other}'"
+                        );
+                    }
+                }
+            }
+            other => {
+                return Err(miette::miette!(
+                    "service '{name}': field 'daemon' must be a string, got {}",
+                    other.type_name()
+                ));
+            }
+        };
+        let args = get_service_string_array(name, table, "args")?;
+        let options = get_service_options(name, table)?;
+        let after = get_service_string_array(name, table, "after")?;
+        let environment = get_service_environment(name, table)?;
+        let backend_options = get_service_backend_options(name, table)?;
+
+        // Interpolation is validated fail-closed at parse: the option
+        // set is fully known only after the fields above are read.
+        let option_keys: std::collections::BTreeSet<String> = options.keys().cloned().collect();
+        validate_service_interpolation(name, "command", &command, &option_keys)?;
+        for (i, arg) in args.iter().enumerate() {
+            validate_service_interpolation(name, &format!("args[{}]", i + 1), arg, &option_keys)?;
+        }
+        for (key, value) in &options {
+            if let Some(s) = value.as_str() {
+                validate_service_interpolation(name, &format!("options.{key}"), s, &option_keys)?;
+            }
+        }
+        for (key, value) in &environment {
+            validate_service_env_literal(name, key, value)?;
+        }
+
+        Ok(ServiceDecl {
+            command,
+            daemon,
+            args,
+            options,
+            after,
+            environment,
+            backend_options,
+        })
+    }
+}
+
+/// Read a required-array-of-strings service field; every non-string entry
+/// is an error naming the position (unlike [`get_opt_string_array`], which
+/// silently skips — service parsing must fail closed).
+fn get_service_string_array(
+    service: &str,
+    table: &mlua::Table,
+    key: &str,
+) -> miette::Result<Vec<String>> {
+    let mut out = Vec::new();
+    match table.get::<Value>(key).unwrap_or(Value::Nil) {
+        Value::Nil => Ok(out),
+        Value::Table(t) => {
+            for pair in t.pairs::<usize, Value>() {
+                let (idx, value) =
+                    pair.map_err(|e| miette::miette!("service '{service}': field '{key}': {e}"))?;
+                match value {
+                    Value::String(s) => out.push(
+                        s.to_str()
+                            .map_err(|e| {
+                                miette::miette!("service '{service}': field '{key}': {e}")
+                            })?
+                            .to_string(),
+                    ),
+                    other => {
+                        return Err(miette::miette!(
+                            "service '{service}': field '{key}' must be an array of \
+                             strings — entry {idx} is {}",
+                            other.type_name()
+                        ));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        other => Err(miette::miette!(
+            "service '{service}': field '{key}' must be an array of strings, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// Read the `options` map: NixOS-style options with defaults. Keys are
+/// strings, values must be scalars (string | number | boolean) — tables
+/// and functions have no meaning in an option value. `enabled` is a named
+/// option with boolean semantics (ADR-0032 Decisions 2 and 7), so a
+/// non-boolean value fails here rather than materializing a lie.
+fn get_service_options(
+    service: &str,
+    table: &mlua::Table,
+) -> miette::Result<BTreeMap<String, serde_json::Value>> {
+    let mut out = BTreeMap::new();
+    let Some(t) = get_service_table(service, table, "options")? else {
+        return Ok(out);
+    };
+    for pair in t.pairs::<String, Value>() {
+        let (key, value) =
+            pair.map_err(|e| miette::miette!("service '{service}': field 'options': {e}"))?;
+        let json = match value {
+            Value::String(s) => serde_json::Value::String(
+                s.to_str()
+                    .map_err(|e| miette::miette!("service '{service}': field 'options': {e}"))?
+                    .to_string(),
+            ),
+            Value::Integer(i) => serde_json::Value::from(i),
+            Value::Number(n) => serde_json::Number::from_f64(n)
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| {
+                    miette::miette!("service '{service}': field 'options.{key}': non-finite number")
+                })?,
+            Value::Boolean(b) => serde_json::Value::Bool(b),
+            other => {
+                return Err(miette::miette!(
+                    "service '{service}': field 'options.{key}' must be a scalar \
+                     (string, number, or boolean), got {}",
+                    other.type_name()
+                ));
+            }
+        };
+        if key == "enabled" && !json.is_boolean() {
+            miette::bail!(
+                "service '{service}': field 'options.enabled' must be a boolean, got {json}"
+            );
+        }
+        out.insert(key, json);
+    }
+    Ok(out)
+}
+
+/// Read the `environment` map: literal string → string (the strict
+/// get_opt_string_map shape, failing closed per entry).
+fn get_service_environment(
+    service: &str,
+    table: &mlua::Table,
+) -> miette::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    let Some(t) = get_service_table(service, table, "environment")? else {
+        return Ok(out);
+    };
+    for pair in t.pairs::<String, Value>() {
+        let (key, value) =
+            pair.map_err(|e| miette::miette!("service '{service}': field 'environment': {e}"))?;
+        match value {
+            Value::String(s) => out.insert(
+                key,
+                s.to_str()
+                    .map_err(|e| miette::miette!("service '{service}': field 'environment': {e}"))?
+                    .to_string(),
+            ),
+            other => {
+                return Err(miette::miette!(
+                    "service '{service}': field 'environment.{key}' must be a string, got {}",
+                    other.type_name()
+                ));
+            }
+        };
+    }
+    Ok(out)
+}
+
+/// Read the `backend_options` passthrough (ADR-0032 Decision 5, the
+/// ADR-0016 grants pattern): keys must be exactly the known backends,
+/// values are tables carried verbatim as JSON.
+fn get_service_backend_options(
+    service: &str,
+    table: &mlua::Table,
+) -> miette::Result<BTreeMap<String, serde_json::Value>> {
+    const BACKENDS: &[&str] = &["systemd", "launchd", "portable"];
+    let mut out = BTreeMap::new();
+    let Some(t) = get_service_table(service, table, "backend_options")? else {
+        return Ok(out);
+    };
+    for pair in t.pairs::<String, Value>() {
+        let (key, value) =
+            pair.map_err(|e| miette::miette!("service '{service}': field 'backend_options': {e}"))?;
+        if !BACKENDS.contains(&key.as_str()) {
+            miette::bail!(
+                "service '{service}': field 'backend_options.{key}' names an unknown \
+                 backend (allowed: {})",
+                BACKENDS.join(", ")
+            );
+        }
+        match value {
+            Value::Table(_) => {
+                let json = crate::isolate::lua_to_json(&value).map_err(|e| {
+                    miette::miette!(
+                        "service '{service}': field 'backend_options.{key}' must be a \
+                         plain data table: {e}"
+                    )
+                })?;
+                out.insert(key, json);
+            }
+            other => {
+                return Err(miette::miette!(
+                    "service '{service}': field 'backend_options.{key}' must be a table, \
+                     got {}",
+                    other.type_name()
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch an optional service sub-table, failing closed on wrong types
+/// (unlike [`get_opt_table`], which silently maps them to `None`).
+fn get_service_table(
+    service: &str,
+    table: &mlua::Table,
+    key: &str,
+) -> miette::Result<Option<mlua::Table>> {
+    match table.get::<Value>(key).unwrap_or(Value::Nil) {
+        Value::Table(t) => Ok(Some(t)),
+        Value::Nil => Ok(None),
+        other => Err(miette::miette!(
+            "service '{service}': field '{key}' must be a table, got {}",
+            other.type_name()
+        )),
+    }
 }
 
 // ── Runtime confinement (ADR-0016, ticket #11) ──
@@ -874,6 +1320,34 @@ impl SnapMeta {
             .transpose()?
             .unwrap_or_default();
 
+        // Services (ADR-0032, issue #105): the name is the map key here
+        // because it becomes every backend identifier component, so the
+        // plain-name constraint checks where the name is first known.
+        let services = get_opt_table(table, "services")?
+            .map(|services_table| {
+                let mut services = BTreeMap::new();
+                for pair in services_table.pairs::<String, Value>() {
+                    let (name, value) =
+                        pair.map_err(|e| miette::miette!("services entry: {}", e))?;
+                    validate_service_name(&name)?;
+                    match value {
+                        Value::Table(t) => {
+                            services.insert(name.clone(), ServiceDecl::from_lua_table(&name, &t)?);
+                        }
+                        other => {
+                            return Err(miette::miette!(
+                                "services['{}'] must be a table, got {}",
+                                name,
+                                other.type_name()
+                            ));
+                        }
+                    }
+                }
+                Ok(services)
+            })
+            .transpose()?
+            .unwrap_or_default();
+
         Ok(SnapMeta {
             name,
             version,
@@ -907,6 +1381,7 @@ impl SnapMeta {
             inputs,
             confined,
             apps,
+            services,
             deps,
             floating,
             definition_dir: None,
@@ -6072,6 +6547,278 @@ mod tests {
         );
     }
 
+    // ── Service declarations (ADR-0032, issue #105) ──
+
+    /// Parse a service table (the Rust conversion boundary).
+    fn svc(env: &LuaEnv, body: &str) -> miette::Result<ServiceDecl> {
+        let table = env.eval(&format!("return {{ {body} }}"))?;
+        ServiceDecl::from_lua_table("svc", &table)
+    }
+
+    #[test]
+    fn service_minimal_valid_parses_with_defaults() {
+        let env = LuaEnv::new();
+        let decl = svc(&env, r#"command = "bin/svc""#).unwrap();
+        assert_eq!(decl.command, "bin/svc");
+        assert_eq!(decl.daemon, ServiceDaemon::Simple);
+        assert!(decl.args.is_empty());
+        assert!(decl.options.is_empty());
+        assert!(decl.after.is_empty());
+        assert!(decl.environment.is_empty());
+        assert!(decl.backend_options.is_empty());
+    }
+
+    #[test]
+    fn service_full_vocabulary_parses() {
+        let env = LuaEnv::new();
+        let decl = svc(
+            &env,
+            r#"
+            command = "bin/valkey-server",
+            daemon = "notify",
+            args = { "--port", "${port}" },
+            options = { port = 6379, data_dir = "%h/.local/share/x", enabled = false },
+            after = { "other" },
+            environment = { VALKEY_QUIET = "yes" },
+            backend_options = { systemd = { RestartSec = 5 } },
+        "#,
+        )
+        .unwrap();
+        assert_eq!(decl.daemon, ServiceDaemon::Notify);
+        assert_eq!(decl.args, vec!["--port".to_string(), "${port}".to_string()]);
+        assert_eq!(decl.options["port"], serde_json::json!(6379));
+        assert_eq!(decl.options["enabled"], serde_json::json!(false));
+        assert_eq!(decl.after, vec!["other".to_string()]);
+        assert_eq!(decl.environment["VALKEY_QUIET"], "yes");
+        assert_eq!(
+            decl.backend_options["systemd"]["RestartSec"],
+            serde_json::json!(5)
+        );
+    }
+
+    #[test]
+    fn service_unknown_field_error_names_valid_fields() {
+        let env = LuaEnv::new();
+        let err = svc(&env, r#"command = "bin/x", restart = true"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("service 'svc': unknown field(s) 'restart'")
+                && err.contains(
+                    "valid fields: command, daemon, args, options, after, environment, \
+                     backend_options"
+                ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn service_bad_daemon_kind_errors() {
+        let env = LuaEnv::new();
+        let err = svc(&env, r#"command = "bin/x", daemon = "supervisord""#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("field 'daemon'") && err.contains("supervisord"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn service_oneshot_named_out_of_scope() {
+        let env = LuaEnv::new();
+        let err = svc(&env, r#"command = "bin/x", daemon = "oneshot""#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'oneshot'") && err.contains("out of scope"),
+            "got: {err}"
+        );
+    }
+
+    /// Service names are the map key; validate through the `services`
+    /// parse loop where the name is first known.
+    fn services_meta(env: &LuaEnv, entries: &str) -> miette::Result<SnapMeta> {
+        let table = env.eval(&format!(
+            "return snap {{ name = \"p\", version = \"1.0\", services = {{ {entries} }} }}"
+        ))?;
+        SnapMeta::from_lua_table(&table)
+    }
+
+    #[test]
+    fn service_name_constraint_rejections() {
+        let env = LuaEnv::new();
+        for bad in ["Web", "my_svc", ""] {
+            let entries = if bad.is_empty() {
+                r#"[""] = { command = "bin/x" }"#.to_string()
+            } else {
+                format!(r#"{bad} = {{ command = "bin/x" }}"#)
+            };
+            let err = services_meta(&env, &entries).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid service name"),
+                "name {bad:?} must be rejected, got: {err}"
+            );
+        }
+        services_meta(&env, r#"["a-b-c9"] = { command = "bin/x" }"#)
+            .expect("kebab-case names are valid");
+    }
+
+    #[test]
+    fn service_interpolation_vocabulary() {
+        let env = LuaEnv::new();
+        let options = r#"options = { port = 6379 }"#;
+        // Declared option resolves; the one built-in resolves; %h/%p/%%
+        // and a trailing non-letter % are legal.
+        svc(
+            &env,
+            &format!(r#"command = "bin/x ${{port}} ${{extensions}} %h %p 50%% 50%", {options}"#),
+        )
+        .expect("declared refs + legal %-tokens must parse");
+        // Unknown ref, in command, in an args entry, and in an option value.
+        for (needle, body) in [
+            ("command", r#"command = "bin/x ${db_host}""#),
+            (
+                "args[2]",
+                r#"command = "bin/x", args = { "--host", "${db_host}" }"#,
+            ),
+            (
+                "options.port",
+                r#"command = "bin/x ${port}", options = { port = "${db_host}" }"#,
+            ),
+        ] {
+            let err = svc(&env, body).unwrap_err().to_string();
+            assert!(
+                err.contains("${db_host}") && err.contains(needle),
+                "{needle} must name the unknown ref, got: {err}"
+            );
+        }
+        // %-tokens: only %h, %p, %% pass; %z is rejected.
+        svc(&env, r#"command = "run %h %p a%%b""#).expect("%h/%p/%% must parse");
+        let err = svc(&env, r#"command = "systemd-escape %z""#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("%z") && err.contains("not a shuttle specifier"),
+            "got: {err}"
+        );
+        // Unterminated ${ fails closed.
+        assert!(svc(&env, r#"command = "bin/x ${open""#).is_err());
+    }
+
+    #[test]
+    fn service_options_scalars_only() {
+        let env = LuaEnv::new();
+        let err = svc(
+            &env,
+            r#"command = "bin/x", options = { nested = { deeper = 1 } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("options.nested") && err.contains("scalar"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn service_options_enabled_must_be_boolean() {
+        let env = LuaEnv::new();
+        let err = svc(&env, r#"command = "bin/x", options = { enabled = "yes" }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("options.enabled"), "got: {err}");
+    }
+
+    #[test]
+    fn service_environment_literals_enforced() {
+        let env = LuaEnv::new();
+        for value in [r#""${port}""#, r#""home %h""#] {
+            let err = svc(
+                &env,
+                &format!(r#"command = "bin/x", options = {{ port = 1 }}, environment = {{ FOO = {value} }}"#),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("environment.FOO") && err.contains("literals"),
+                "env value {value} must be rejected, got: {err}"
+            );
+        }
+        // A % followed by a non-letter is a literal.
+        svc(
+            &env,
+            r#"command = "bin/x", environment = { FOO = "100% sure" }"#,
+        )
+        .expect("non-letter % in an env literal must parse");
+    }
+
+    #[test]
+    fn service_backend_options_key_validation() {
+        let env = LuaEnv::new();
+        let err = svc(
+            &env,
+            r#"command = "bin/x", backend_options = { upstart = { job = "x" } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("backend_options.upstart") && err.contains("unknown backend"),
+            "got: {err}"
+        );
+        let err = svc(
+            &env,
+            r#"command = "bin/x", backend_options = { systemd = "raw string" }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("backend_options.systemd"), "got: {err}");
+        let decl = svc(
+            &env,
+            r#"command = "bin/x", backend_options = { launchd = { KeepAlive = true } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decl.backend_options["launchd"]["KeepAlive"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// The daemon.lua `service()` constructor rides the full DSL → Rust
+    /// path (drift guard): defaults deep-merge so `enabled = false`
+    /// survives an override that replaces sibling options.
+    #[test]
+    fn test_daemon_service_template_validates() {
+        let env = LuaEnv::new();
+        let src = format!(
+            "return (function()\nlocal M = (function()\n{}end)()\n\
+             return snap {{\nname = \"tmpl\", version = \"1.0\",\n\
+             services = {{ svc = M.service {{ command = \"bin/svc\", \
+             options = {{ port = 6379 }} }} }},\n}}\nend)()",
+            include_str!("../pkgs/lib/daemon.lua")
+        );
+        let value: Value = env.lua.load(&src).eval().unwrap();
+        let table = match value {
+            Value::Table(t) => t,
+            other => panic!("expected table, got {}", other.type_name()),
+        };
+        let meta = SnapMeta::from_lua_table(&table)
+            .unwrap_or_else(|e| panic!("daemon template service must validate: {e}"));
+        let svc_decl = &meta.services["svc"];
+        assert_eq!(svc_decl.command, "bin/svc");
+        assert_eq!(svc_decl.daemon, ServiceDaemon::Simple);
+        assert_eq!(svc_decl.options["port"], serde_json::json!(6379));
+        assert_eq!(
+            svc_decl.options["enabled"],
+            serde_json::json!(false),
+            "the enabled=false default must deep-merge beside overrides"
+        );
+        // Services ride snap.yaml (the build → install pipeline).
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("services:"), "got: {yaml}");
+        assert!(yaml.contains("bin/svc"), "got: {yaml}");
+    }
+
     // ── Phase 4 tests: YAML output ──
 
     #[test]
@@ -10474,6 +11221,7 @@ mod wrapper_tests {
             toolchain: None,
             confined: None,
             apps,
+            services: BTreeMap::new(),
             deps: None,
             floating: false,
             definition_dir: None,
