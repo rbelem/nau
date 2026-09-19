@@ -1,22 +1,31 @@
 -- neovim: Vim-fork text editor (neovim/neovim).
 --
--- Ported from devbox-global's devbox.d/neovim flake — with one deliberate
--- substitution, per the porting dossier: the flake builds FROM SOURCE
--- through neovim-nightly-overlay (a nightly-channel Nix build of the C
--- tree plus wrapNeovim scaffolding); a from-source build here would
+-- Ported from devbox-global's devbox.d/neovim flake — with the flake's
+-- nightly CHANNEL parity: the flake builds FROM SOURCE through
+-- neovim-nightly-overlay (a nightly-channel Nix build of the C tree
+-- plus wrapNeovim scaffolding); a from-source build here would
 -- re-bootstrap that whole toolchain for no payoff. Pool strategy is
--- upstream's official PREBUILT release tarball instead, pinned to the
--- newest STABLE tag v0.12.5 (the repo's `stable` alias points here;
--- `nightly` is excluded by construction). Version delta vs the flake
--- (nightly channel) is accepted: pool packages pin releases, never
--- moving tags.
+-- upstream's official PREBUILT release tarball from the `nightly`
+-- tag, declared floating (`floating = true`): the tarball moves with
+-- every upstream push, and sync re-resolves it the same way
+-- hermes-agent re-resolves its release.
 --
--- Asset naming changed at v0.11+: `nvim-linux-x86_64.tar.gz` (the
--- pre-0.11 `nvim-linux-x64.tar.gz` pattern 404s on this tag). Release
--- asset = byte-stable upload, sha256 computed locally; the flake has no
--- tarball hash to cross-check (its SRI covers the source build), so
--- TOFU via shuttle.lock is the pin story, same as every prebuilt port
--- whose flake builds from source.
+-- Why nightly, not the newest stable (v0.12.5): the 0.12 line dropped
+-- the `vim.uri` Lua module; current plugin pins still reach it from
+-- init and crash before the first frame (nvim-lspconfig 2026-08 pin,
+-- E5113 at vim/_init_packages). The 0.13-dev tree restored it; the
+-- user config that ran on the flake's nightly boots clean on it. The
+-- earlier "pool packages pin releases, never moving tags" reading is
+-- superseded here by the hermes-agent precedent: floating pins ARE a
+-- pool mechanism, and TOFU moves from release-time to sync-time.
+--
+-- Asset naming: `nvim-linux-x86_64.tar.gz` (the pre-0.11
+-- `nvim-linux-x64.tar.gz` pattern 404s on 0.11+). Release asset =
+-- upstream's byte-stable upload per push; sha256 pinned at port time,
+-- re-hashed by sync under the float. The flake has no tarball hash to
+-- cross-check (its SRI covers the source build), so TOFU via
+-- shuttle.lock is the pin story, same as every prebuilt port whose
+-- flake builds from source.
 --
 -- Runtime deps (ldd on bin/nvim): glibc family + libgcc_s.so.1 only —
 -- libluv/luajit/treesitter parsers ship inside the tarball (lib/),
@@ -37,24 +46,26 @@
 return {
     default = snap {
         name = "neovim",
-        version = "0.12.5",
-        summary = "Ambitious Vim-fork text editor, official stable prebuilt",
+        version = "0.13.0-nightly",
+        summary = "Ambitious Vim-fork text editor, official nightly prebuilt",
         description = [[
             Neovim is a hyperextensible Vim-based text editor with
             built-in LSP client, treesitter highlighting, and Lua
-            scripting. Ships the official linux-x86_64 release build of
-            the stable v0.12.5 tag (self-contained: bundled luajit,
-            treesitter parsers, and runtime), with vi/vim/vimdiff
-            compatibility wrappers as the flake's aliases provided.
+            scripting. Ships the official linux-x86_64 nightly build
+            (self-contained: bundled luajit, treesitter parsers, and
+            runtime), with vi/vim/vimdiff compatibility wrappers as the
+            flake's aliases provided. Floating pin: sync re-resolves the
+            nightly tag.
         ]],
         license = "Apache-2.0",
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64" },
+        floating = true,
 
         source = {
-            url = "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-linux-x86_64.tar.gz",
-            sha256 = "bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875",
+            url = "https://github.com/neovim/neovim/releases/download/nightly/nvim-linux-x86_64.tar.gz",
+            sha256 = "531c8270e0c408561c7dbaf3f1be942631afc46fd75a65037a42a6eb75f8768f",
         },
 
         -- Single-source flatten lands the tarball root's contents
