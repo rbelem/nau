@@ -87,8 +87,14 @@ return {
             -- generation's extension tree (usr/usr doubling is
             -- load-bearing, §5.7). The LD_LIBRARY_PATH half of the shim
             -- story is the farm emit's per-app LD wrapper (ADR-0034).
+            -- SSL_CERT_FILE: libcurl's ./configure CA probe runs in the
+            -- sandbox, where /etc is not bind-mounted, so the baked
+            -- bundle path is empty and https verification fails
+            -- ("unable to get local issuer certificate"). Trust anchors
+            -- are host policy — system trust wins, the ADR-0030 locale
+            -- precedent — so the wrapper points at the host CA bundle.
             "mv $STAGE/usr/bin/git $STAGE/usr/bin/git.bin",
-            "printf '%s\\n' '#!/bin/sh' 'd=$(dirname \"$(readlink -f \"$0\")\")' 'e=$d/../libexec/git-core' 'if test ! -d \"$e\"' 'then e=$d/../../../../extensions/git/usr/usr/libexec/git-core' 'fi' 't=$d/../share/git-core/templates' 'if test ! -d \"$t\"' 'then t=$d/../../../../extensions/git/usr/usr/share/git-core/templates' 'fi' 'GIT_EXEC_PATH=$e GIT_TEMPLATE_DIR=$t exec \"$d/git.bin\" \"$@\"' > $STAGE/usr/bin/git",
+            "printf '%s\\n' '#!/bin/sh' 'd=$(dirname \"$(readlink -f \"$0\")\")' 'e=$d/../libexec/git-core' 'if test ! -d \"$e\"' 'then e=$d/../../../../extensions/git/usr/usr/libexec/git-core' 'fi' 't=$d/../share/git-core/templates' 'if test ! -d \"$t\"' 'then t=$d/../../../../extensions/git/usr/usr/share/git-core/templates' 'fi' 'c=/etc/ssl/certs/ca-certificates.crt' 'if test ! -f \"$c\"' 'then c=/etc/pki/tls/certs/ca-bundle.crt' 'fi' 'GIT_EXEC_PATH=$e GIT_TEMPLATE_DIR=$t SSL_CERT_FILE=$c exec \"$d/git.bin\" \"$@\"' > $STAGE/usr/bin/git",
             "chmod +x $STAGE/usr/bin/git",
         }, " && "),
 
