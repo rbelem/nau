@@ -492,7 +492,7 @@ gated_test!(pod_override_enablement_places_the_user_link, {
     let text = std::fs::read_to_string(&link).unwrap();
     let current = pod_dir(root.path(), "default").join("current");
     assert!(
-        text.contains(&format!("ExecStart={}/dup-svc", current.display())),
+        text.contains(&format!("ExecStart='{}/dup-svc'", current.display())),
         "ExecStart must bake the absolute farm path through current: {text}"
     );
 });

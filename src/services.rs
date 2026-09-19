@@ -253,7 +253,7 @@ pub fn record_in(
             overrides,
             "the pod declaration",
             "the package default",
-        );
+        )?;
         let unit = build_unit(&ctx, svc, pkg, decl, &resolved, &shuttle_services)?;
         units.push(unit);
     }
@@ -404,7 +404,9 @@ fn render_unit(
         .iter()
         .map(|a| format!(" {}", shell_quote(a)))
         .collect();
-    out.push_str(&format!("ExecStart={exec}{quoted_args}\n"));
+    // The exec path is quoted like every arg: a farm root with spaces
+    // must not split into binary + phantom args.
+    out.push_str(&format!("ExecStart={}{quoted_args}\n", shell_quote(&exec)));
     for (key, value) in environment {
         out.push_str(&format!(
             "Environment=\"{}={}\"",
@@ -841,6 +843,16 @@ const STATE_FILE: &str = "services-state.json";
 pub struct AppliedUnit {
     pub hash: String,
     pub enabled: bool,
+    /// Whether this entry's bus steps actually RAN. `false` = the last
+    /// reconcile planned the unit but systemctl was unavailable — the
+    /// manager was never told, so the classifier re-plans it instead of
+    /// diffing clean against a converged-looking state.
+    #[serde(default = "default_applied")]
+    pub applied: bool,
+}
+
+fn default_applied() -> bool {
+    true
 }
 
 /// The applied-state envelope (see [`STATE_FILE`]).
@@ -946,6 +958,14 @@ fn classify_unit(
     state_ok: bool,
     unit: &ServiceUnit,
 ) -> Option<UnitAction> {
+    // An entry whose bus steps were skipped (systemctl was missing) is
+    // NOT a converged registration: re-plan it from the live-link state
+    // so the next run with tools converges instead of diffing clean
+    // against a state that lies. `enable --now` is idempotent for an
+    // already-enabled unit, and the artifact on disk already matches
+    // units.json (the emit ran), so Activate converges without a bounce.
+    let unapplied = matches!(applied, Some(a) if !a.applied);
+    let applied = if unapplied { None } else { applied };
     match applied {
         Some(a) => match (unit.enabled, a.enabled) {
             (true, false) => Some(UnitAction::Activate),
@@ -953,7 +973,7 @@ fn classify_unit(
             (true, true) if a.hash != unit.hash => Some(UnitAction::Restart),
             _ => None,
         },
-        None if state_ok => {
+        None if state_ok && !unapplied => {
             if unit.enabled {
                 Some(UnitAction::Activate)
             } else {
@@ -962,6 +982,7 @@ fn classify_unit(
         }
         None => match (unit.enabled, live_link) {
             (true, false) => Some(UnitAction::Activate),
+            (true, true) if unapplied => Some(UnitAction::Activate),
             (true, true) => Some(UnitAction::Restart),
             (false, true) => Some(UnitAction::Deactivate),
             (false, false) => None,
@@ -1378,28 +1399,58 @@ fn reconcile_presented(
     // withdraws the deactivation re-links).
     emit(store, gen)?;
 
-    // Applied state = the all-units map of what this reconcile served.
-    let state = AppliedState {
-        units: input
-            .units
-            .iter()
-            .map(|u| {
-                (
-                    u.name.clone(),
-                    AppliedUnit {
-                        hash: u.hash.clone(),
-                        enabled: u.enabled,
-                    },
-                )
-            })
-            .collect(),
-    };
-    write_applied_state(input.dir, &state)?;
+    // Applied state = what the manager was last TOLD (see the helper).
+    write_reconciled_state(input, &plan, report)?;
 
     if !report.activated.is_empty() || !report.restarted.is_empty() {
         check_linger(pod_name, report);
     }
     Ok(())
+}
+
+/// Record the per-pod applied state after a presented reconcile: what
+/// the manager was last TOLD. A unit whose bus steps ran (or that
+/// needed no step) records `applied: true`; one whose steps were
+/// skipped records `applied: false`, so the next run with tools
+/// re-plans it instead of trusting a converged-looking state — the
+/// state must never lie converged.
+fn write_reconciled_state(
+    input: &ReconcileInput,
+    plan: &ReconcilePlan,
+    report: &ServiceReconcileReport,
+) -> miette::Result<()> {
+    let planned: std::collections::BTreeSet<&str> = plan
+        .activate
+        .iter()
+        .chain(plan.restart.iter())
+        .chain(plan.deactivate.iter())
+        .map(String::as_str)
+        .collect();
+    let ran: std::collections::BTreeSet<String> = report
+        .activated
+        .iter()
+        .chain(report.restarted.iter())
+        .chain(report.deactivated.iter())
+        .cloned()
+        .collect();
+    let state = AppliedState {
+        units: input
+            .units
+            .iter()
+            .map(|u| {
+                let applied = !planned.contains(u.name.as_str()) || ran.contains(&u.name);
+                (
+                    u.name.clone(),
+                    AppliedUnit {
+                        hash: u.hash.clone(),
+                        enabled: u.enabled,
+                        applied,
+                    },
+                )
+            })
+            .collect(),
+    };
+    write_applied_state(input.dir, &state)
 }
 
 // ── Cross-pod endpoint collisions (ADR-0032 Decision 9) ──
@@ -1418,11 +1469,17 @@ fn extract_endpoints(args: &[String]) -> Vec<(String, String)> {
     for (i, arg) in args.iter().enumerate() {
         for flag in ENDPOINT_FLAGS {
             if arg == flag {
+                // `--flag value`: a following flag token (or empty) is a
+                // missing value, not an endpoint — skip, never misread.
                 if let Some(value) = args.get(i + 1) {
-                    out.push((flag.to_string(), value.clone()));
+                    if !value.is_empty() && !value.starts_with("--") {
+                        out.push((flag.to_string(), value.clone()));
+                    }
                 }
             } else if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
-                out.push((flag.to_string(), value.to_string()));
+                if !value.is_empty() {
+                    out.push((flag.to_string(), value.to_string()));
+                }
             }
         }
     }
@@ -1664,7 +1721,7 @@ mod tests {
         assert!(text.contains("Description=shuttle pod 'pilot' service 'valkey'\n"));
         assert!(text.contains("Type=simple\n"));
         assert!(text.contains(&format!(
-            "ExecStart={current}/valkey '--port' '7002' '--dir' '{}/data/pilot' '--loadmodule' '{current}/extensions/valkey-search.so'\n",
+            "ExecStart='{current}/valkey' '--port' '7002' '--dir' '{}/data/pilot' '--loadmodule' '{current}/extensions/valkey-search.so'\n",
             home()
         )));
         assert!(text.contains("Environment=\"QUIET=yes\"\n"));
@@ -1919,7 +1976,56 @@ mod tests {
         AppliedUnit {
             hash: hash.into(),
             enabled,
+            applied: true,
         }
+    }
+
+    #[test]
+    fn unapplied_entries_replan_instead_of_diffing_clean() {
+        use UnitAction::*;
+        // An entry whose bus steps were skipped (systemctl missing) is
+        // not a registration: re-plan from the live-link state, and
+        // converge with the idempotent enable --now rather than a
+        // bounce (the artifact already matches units.json).
+        assert_eq!(
+            classify_unit(
+                Some(&AppliedUnit {
+                    applied: false,
+                    ..applied(true, "h")
+                }),
+                true,
+                true,
+                &unit(true, "h")
+            ),
+            Some(Activate),
+            "skipped-run entry with a live link re-activates (enable --now), never diffs clean"
+        );
+        assert_eq!(
+            classify_unit(
+                Some(&AppliedUnit {
+                    applied: false,
+                    ..applied(true, "h")
+                }),
+                false,
+                true,
+                &unit(true, "h")
+            ),
+            Some(Activate),
+            "skipped-run entry without a link activates"
+        );
+        assert_eq!(
+            classify_unit(
+                Some(&AppliedUnit {
+                    applied: false,
+                    ..applied(true, "h")
+                }),
+                true,
+                true,
+                &unit(false, "h")
+            ),
+            Some(Deactivate),
+            "skipped-run disabled unit with a live link still withdraws"
+        );
     }
 
     #[test]

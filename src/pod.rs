@@ -1263,6 +1263,45 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
 /// pair (issue #16): the degraded reconcile records the remaining
 /// declared set without building, so only the dropped package (plus
 /// genuinely undeclared strays) leaves the store.
+/// Drop `pod {}` service overrides no remaining declared package
+/// provides: a dangling override hard-errors the next reconcile
+/// ("no package declares service") with the removal already half-done —
+/// the declaration must stay self-consistent. A package that fails to
+/// load skips the whole prune (never destroy user config on a transient
+/// read error); validation still runs at reconcile.
+fn prune_dangling_service_overrides(decl: &mut PodDeclaration) {
+    if decl.services.is_empty() {
+        return;
+    }
+    let mut remaining: std::collections::BTreeSet<String> = Default::default();
+    for spec_str in &decl.packages {
+        let Ok(spec) = parse_pod_package(spec_str) else {
+            continue;
+        };
+        match crate::deps::load_meta(&spec.name) {
+            Ok(meta) => remaining.extend(meta.services.into_keys()),
+            Err(_) => {
+                crate::output::warn(
+                    "could not verify remaining packages; service overrides left untouched",
+                );
+                return;
+            }
+        }
+    }
+    let dangling: Vec<String> = decl
+        .services
+        .keys()
+        .filter(|k| !remaining.contains(*k))
+        .cloned()
+        .collect();
+    for key in &dangling {
+        decl.services.remove(key);
+        crate::output::warn(format!(
+            "service override '{key}' dropped — no remaining declared package provides it"
+        ));
+    }
+}
+
 pub fn remove_package(
     root: &Path,
     pod_name: &str,
@@ -1282,6 +1321,7 @@ pub fn remove_package(
     if decl.packages.len() == before {
         miette::bail!("package '{}' is not in pod '{}'", spec.name, pod_name);
     }
+    prune_dangling_service_overrides(&mut decl);
 
     let decl_path = pod_lua_path(root, pod_name);
     std::fs::write(&decl_path, render_pod_source(&decl))
@@ -3079,7 +3119,7 @@ pub(crate) fn resolve_service_options(
     overrides: &BTreeMap<String, serde_json::Value>,
     winner_label: &str,
     loser_label: &str,
-) -> ResolvedServiceOptions {
+) -> miette::Result<ResolvedServiceOptions> {
     let mut options = defaults.clone();
     for (key, value) in overrides {
         if defaults.get(key) != Some(value) {
@@ -3090,11 +3130,19 @@ pub(crate) fn resolve_service_options(
         }
         options.insert(key.clone(), value.clone());
     }
+    // `enabled` drives activation (ADR-0032 Decision 7) — a quoted
+    // "true" is a string, not an enable, and silently disabling a
+    // service the user asked to enable is the worst failure mode.
+    if let Some(v) = options.get("enabled") {
+        if !v.is_boolean() {
+            miette::bail!("service '{service}': option 'enabled' must be a boolean, got {v}");
+        }
+    }
     let enabled = options
         .get("enabled")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    ResolvedServiceOptions { enabled, options }
+    Ok(ResolvedServiceOptions { enabled, options })
 }
 
 /// The folded pod-level service overrides: service name → option key →
@@ -3237,7 +3285,7 @@ fn walk_post_state_services(
             apply_overlay(&mut meta, patch)
                 .map_err(|e| miette::miette!("overlay of '{}' is invalid: {e}", spec.name))?;
         }
-        resolve_service_overrides_against_meta(overrides, &meta, pod_name);
+        resolve_service_overrides_against_meta(overrides, &meta, pod_name)?;
         record_declared_services(&mut declared, &meta);
     }
     for name in loaded_package_names(root, decl)? {
@@ -3252,7 +3300,7 @@ fn walk_post_state_services(
         let meta = crate::deps::load_meta(&name).map_err(|e| {
             miette::miette!("cannot validate service overrides against loaded '{name}': {e}")
         })?;
-        resolve_service_overrides_against_meta(overrides, &meta, pod_name);
+        resolve_service_overrides_against_meta(overrides, &meta, pod_name)?;
         record_declared_services(&mut declared, &meta);
     }
     Ok(declared)
@@ -3279,7 +3327,7 @@ fn resolve_service_overrides_against_meta(
     overrides: &BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     meta: &crate::snap::SnapMeta,
     pod_name: &str,
-) {
+) -> miette::Result<()> {
     for (service, decl) in &meta.services {
         let pod_overrides = overrides.get(service).cloned().unwrap_or_default();
         let _resolved = resolve_service_options(
@@ -3288,8 +3336,9 @@ fn resolve_service_overrides_against_meta(
             &pod_overrides,
             &format!("pod '{pod_name}'"),
             "the package default",
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// Degraded-mode banner for `pod add` when the squashfs pair is absent:
@@ -4066,7 +4115,8 @@ pod {
             &overrides,
             "pod 'work'",
             "the package default",
-        );
+        )
+        .unwrap();
         assert_eq!(resolved.options["port"], serde_json::json!(6380));
         assert!(resolved.enabled, "pod override must win enablement");
 
@@ -4077,8 +4127,28 @@ pod {
             &BTreeMap::new(),
             "pod 'work'",
             "the package default",
-        );
+        )
+        .unwrap();
         assert!(!resolved.enabled);
+    }
+
+    #[test]
+    fn resolve_service_options_rejects_non_boolean_enabled() {
+        let overrides = [("enabled".to_string(), serde_json::json!("true"))]
+            .into_iter()
+            .collect();
+        let err = resolve_service_options(
+            "valkey",
+            &BTreeMap::new(),
+            &overrides,
+            "pod 'work'",
+            "the package default",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("must be a boolean"),
+            "a quoted \"true\" must fail loudly, never silently disable: {err}"
+        );
     }
 
     /// Bare SnapMeta with every optional field empty (mirrors the test

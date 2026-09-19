@@ -576,8 +576,55 @@ fn absent_tools_skip_bus_steps_but_files_still_reconcile() {
     );
     let state = state_of(&pod);
     assert_eq!(state["units"]["valkey"]["hash"], "hash-a", "{state}");
+    assert_eq!(
+        state["units"]["valkey"]["applied"], false,
+        "a skipped bus step must NOT record itself as applied: {state}"
+    );
     let link_target = std::fs::read_link(link_of(&rig, "alpha", "valkey")).unwrap();
     assert!(link_target.to_string_lossy().contains("generations/1"));
+}
+
+// Two-phase convergence: a reconcile that SKIPPED its bus steps (no
+// systemctl) must not poison the state — the next run with tools
+// re-plans the unapplied entry and converges with enable --now.
+#[test]
+fn tools_arriving_later_converge_the_skipped_registration() {
+    let rig = RollbackRig::new();
+    let pod = rig.pod("alpha");
+    let gen1 = service_unit("valkey", true, "hash-a", &["--port", "6379"]);
+    let gen2 = service_unit("valkey", true, "hash-b", &["--port", "6380"]);
+    seed_generation(&pod, 1, &[gen1]);
+    seed_generation(&pod, 2, &[gen2]);
+    set_active(&pod, 2);
+    // State left by a run whose enable was skipped: applied=false.
+    let units = serde_json::json!({
+        "valkey": { "hash": "hash-b", "enabled": true, "applied": false }
+    });
+    std::fs::write(
+        pod.join("services-state.json"),
+        serde_json::to_vec(&serde_json::json!({ "units": units })).unwrap(),
+    )
+    .unwrap();
+    seed_link(
+        &rig.config_home(),
+        "alpha",
+        "valkey",
+        &pod.join("generations/1/services/shuttle-pod-alpha-valkey.service"),
+    );
+
+    let (code, _, stderr, argv) = rig.run("alpha", "1");
+    assert_eq!(code, Some(0), "{stderr}");
+    let calls = std::fs::read_to_string(&argv).unwrap_or_default();
+    assert!(
+        calls.contains("enable --now"),
+        "the unapplied entry must converge with enable --now: {calls}"
+    );
+    assert!(
+        !calls.contains(" restart "),
+        "the artifact already matches — no bounce: {calls}"
+    );
+    let state = state_of(&pod);
+    assert_eq!(state["units"]["valkey"]["applied"], true, "{state}");
 }
 
 #[test]
@@ -1057,4 +1104,8 @@ gated_test!(sync_without_systemctl_skips_but_reconciles_links, {
     );
     let state = state_of(&rig.pod());
     assert_eq!(state["units"]["valkey"]["enabled"], true, "{state}");
+    assert_eq!(
+        state["units"]["valkey"]["applied"], false,
+        "enable skipped with no tools — the state must say so: {state}"
+    );
 });
