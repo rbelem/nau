@@ -1,0 +1,21 @@
+# shuttle pod 'daily': wigolo — bootstrap unit.
+# Hand-written per t13 §5.4 (issue #104); superseded by the ADR-0032
+# services emitter (the port's `services` declaration in
+# pkgs/w/wigolo/init.lua now owns this surface once the emitter is
+# active on the host). Ordered after bifrost per checklist §5.1.
+# PATH carries the generation root so the usr/bin/wigolo launcher's
+# bare `node` resolves against the pod farm (systemd's default PATH
+# does not have it).
+[Unit]
+Description=shuttle pod 'daily': wigolo (bootstrap unit — superseded by the ADR-0032 services emitter)
+After=shuttle-bifrost.service
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/share/shuttle/pods/daily/current:/usr/bin:/bin
+ExecStart=%h/.local/share/shuttle/pods/daily/current/usr/bin/wigolo serve --port 3333
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

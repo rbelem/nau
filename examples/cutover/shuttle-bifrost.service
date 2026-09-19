@@ -1,0 +1,17 @@
+# shuttle pod 'daily': bifrost — bootstrap unit.
+# Hand-written per t13 §5.4 (issue #104); superseded by the ADR-0032
+# services emitter (the port's `services` declaration in
+# pkgs/b/bifrost/init.lua now owns this surface once the emitter is
+# active on the host). Ordered after valkey per checklist §5.1.
+[Unit]
+Description=shuttle pod 'daily': bifrost (bootstrap unit — superseded by the ADR-0032 services emitter)
+After=shuttle-valkey.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/shuttle/pods/daily/current/usr/bin/bifrost --port 8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,19 @@
+# shuttle pod 'daily': valkey — bootstrap unit.
+# Hand-written per t13 §5.4 (issue #104); superseded by the ADR-0032
+# services emitter (the port's `services` declaration in
+# pkgs/v/valkey/init.lua now owns this surface once the emitter is
+# active on the host).
+# The valkey-search module line lands with that port (held; see
+# pkgs/README.md "Held ports"):
+#   --loadmodule %h/.local/share/shuttle/pods/daily/current/extensions/valkey-search/<module>.so
+[Unit]
+Description=shuttle pod 'daily': valkey (bootstrap unit — superseded by the ADR-0032 services emitter)
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/shuttle/pods/daily/current/usr/bin/valkey-server --port 6379 --dir %h/.local/share/shuttle/valkey/daily
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
