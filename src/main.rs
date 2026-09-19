@@ -3455,6 +3455,9 @@ fn cmd_pod_rollback(
     if let Some(farm) = &report.farm {
         shuttle::output::info(format!("farm: {}", farm.display()));
     }
+    if let Some(services) = &report.services {
+        print_pod_services(services);
+    }
     print_report(&report);
     Ok(())
 }
@@ -3509,7 +3512,43 @@ fn print_pod_sync_report(report: &shuttle::pod::PodSyncReport) {
     if let Some(farm) = &report.farm {
         shuttle::output::info(format!("farm: {}", farm.display()));
     }
+    if let Some(services) = &report.services {
+        print_pod_services(services);
+    }
     print_report(report);
+}
+
+/// The compact services section of a pod report (ADR-0032 Decision 8):
+/// printed only when the reconcile did anything — a no-op stays as
+/// quiet about services as the sync report is about packages.
+fn print_pod_services(report: &shuttle::services::ServiceReconcileReport) {
+    if report.is_trivial() {
+        return;
+    }
+    if report.reloaded {
+        shuttle::output::info("systemd user manager reloaded");
+    }
+    if !report.activated.is_empty() {
+        shuttle::output::ok(format!(
+            "services activated: {}",
+            report.activated.join(", ")
+        ));
+    }
+    if !report.restarted.is_empty() {
+        shuttle::output::ok(format!(
+            "services restarted: {}",
+            report.restarted.join(", ")
+        ));
+    }
+    if !report.deactivated.is_empty() {
+        shuttle::output::ok(format!(
+            "services deactivated: {}",
+            report.deactivated.join(", ")
+        ));
+    }
+    for skip in &report.skipped {
+        shuttle::output::warn(format!("service skip: {skip}"));
+    }
 }
 
 // ── OCI registry push/pull (Phase 25) ──

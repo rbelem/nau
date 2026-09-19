@@ -1635,6 +1635,10 @@ pub struct PodRollbackReport {
     /// The farm directory now behind `current`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub farm: Option<PathBuf>,
+    /// The service reconcile tail (ADR-0032 Decision 8): the flip
+    /// itself restarted changed services — no follow-up sync.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub services: Option<crate::services::ServiceReconcileReport>,
 }
 
 /// Roll a pod back to a previous generation (default: the one before
@@ -1674,12 +1678,18 @@ pub fn rollback_pod_with(
     })?;
     let farm = crate::farm::emit(&store, &gen)?;
     crate::farm::flip_current(&dir, gen.n)?;
+    // The reconcile tail rides the flip itself (ADR-0032 Decision 8,
+    // ticket #107): the hash covers the owning package's digest, so a
+    // binary-only upgrade across the flip restarts the service HERE —
+    // no follow-up sync (§5.4's restart caveat, resolved).
+    let services = crate::services::reconcile(&store, &dir, pod_name, tools)?;
 
     Ok(PodRollbackReport {
         pod: pod_name.to_string(),
         from: report.from,
         to: report.to,
         farm: Some(farm),
+        services: Some(services),
     })
 }
 
@@ -1728,6 +1738,10 @@ pub struct PodSyncReport {
     /// The farm directory now behind the pod's `current` link.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub farm: Option<PathBuf>,
+    /// The service reconcile tail (ADR-0032 Decision 8): what the
+    /// systemd user registrations switched to on this reconcile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub services: Option<crate::services::ServiceReconcileReport>,
 }
 
 /// The runtime store of one pod: the shared runtime store module
@@ -2006,21 +2020,47 @@ fn reconcile_pod_scoped(
     )?;
     // Remove store packages the declaration dropped.
     let removed = remove_undeclared(&state.store, &state.tools, &build.declared_names)?;
-    // Present whatever is now active. Nothing active → nothing exposed.
-    let (generation, farm) = present_active(&state.store, &state.dir, &env_vars, &svc_overrides)?;
-
-    Ok((
-        PodSyncReport {
-            pod: pod_name.to_string(),
-            noop: installed.is_empty() && removed.is_empty(),
-            installed,
-            removed,
-            held: build.held,
-            generation,
-            farm,
+    present_and_reconcile(&state, pod_name, &env_vars, &svc_overrides, tools).map(
+        |(generation, farm, services)| {
+            (
+                PodSyncReport {
+                    pod: pod_name.to_string(),
+                    noop: installed.is_empty() && removed.is_empty(),
+                    installed,
+                    removed,
+                    held: build.held,
+                    generation,
+                    farm,
+                    services: Some(services),
+                },
+                build.deps_moved,
+            )
         },
-        build.deps_moved,
-    ))
+    )
+}
+
+/// Present whatever is now active and run the service reconcile tail
+/// (ADR-0032 Decision 8, ticket #107): diff + switch the systemd user
+/// registrations to the generation just presented, AFTER the flip on
+/// every path. A cold pod (nothing active) withdraws whatever its
+/// applied state remembers, with the same stop-then-withdraw rule.
+fn present_and_reconcile(
+    state: &ReconcileState,
+    pod_name: &str,
+    env_vars: &BTreeMap<String, String>,
+    svc_overrides: &PodServiceOverrides,
+    tools: &crate::runtime::RuntimeTools,
+) -> miette::Result<(
+    Option<u64>,
+    Option<PathBuf>,
+    crate::services::ServiceReconcileReport,
+)> {
+    let (generation, farm) = present_active(&state.store, &state.dir, env_vars, svc_overrides)?;
+    let services = match generation {
+        Some(_) => crate::services::reconcile(&state.store, &state.dir, pod_name, tools)?,
+        None => crate::services::reconcile_empty(&state.dir, pod_name, tools)?,
+    };
+    Ok((generation, farm, services))
 }
 
 /// Validated inputs + pod state for one scoped reconcile: everything
