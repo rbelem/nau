@@ -77,6 +77,19 @@ return {
             -- libgettextsrc).
             "PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\" LD_LIBRARY_PATH=\"$SHUTTLE_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\" make -j$(nproc) prefix=/usr NO_EXPAT=1 NO_TCLTK=1 USE_LIBPCRE2=1 CFLAGS=\"-g -O2 -std=gnu17\" CPPFLAGS=\"-I. $CPPFLAGS\" LDFLAGS=\"$LDFLAGS\"",
             "PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\" LD_LIBRARY_PATH=\"$SHUTTLE_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\" make install prefix=/usr NO_EXPAT=1 NO_TCLTK=1 USE_LIBPCRE2=1 CFLAGS=\"-g -O2 -std=gnu17\" CPPFLAGS=\"-I. $CPPFLAGS\" LDFLAGS=\"$LDFLAGS\" DESTDIR=$STAGE",
+            -- Farm app assemblies carry only the command's usr/bin
+            -- subtree (issue #37 siblings), so git cannot find its
+            -- libexec helpers there — `git fetch/push` dies with
+            -- "'remote-https' is not a git command" (issue #110), and
+            -- `git init` warns about missing templates. bin/git becomes
+            -- a wrapper pinning GIT_EXEC_PATH and GIT_TEMPLATE_DIR:
+            -- first the payload layout (sandbox/store), then the
+            -- generation's extension tree (usr/usr doubling is
+            -- load-bearing, §5.7). The LD_LIBRARY_PATH half of the shim
+            -- story is the farm emit's per-app LD wrapper (ADR-0034).
+            "mv $STAGE/usr/bin/git $STAGE/usr/bin/git.bin",
+            "printf '%s\\n' '#!/bin/sh' 'd=$(dirname \"$(readlink -f \"$0\")\")' 'e=$d/../libexec/git-core' 'if test ! -d \"$e\"' 'then e=$d/../../../../extensions/git/usr/usr/libexec/git-core' 'fi' 't=$d/../share/git-core/templates' 'if test ! -d \"$t\"' 'then t=$d/../../../../extensions/git/usr/usr/share/git-core/templates' 'fi' 'GIT_EXEC_PATH=$e GIT_TEMPLATE_DIR=$t exec \"$d/git.bin\" \"$@\"' > $STAGE/usr/bin/git",
+            "chmod +x $STAGE/usr/bin/git",
         }, " && "),
 
         type = "source",
