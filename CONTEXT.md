@@ -77,6 +77,9 @@ _Avoid_: global, profile, environment
 **Pod generation**: A pinned selection of one pod's packages + overlays + loaded pods at one point in time. Rollback switches that pod's `current` link only; it never reboots or touches system generations.
 _Avoid_: system generation, snapshot
 
+**Pod service**: A long-running process declared by a package (`services = { … }`, options + defaults) and overridden per pod (`pod {}` options, `enabled` explicit), emitted into the generation by the services emitter through a backend — systemd user unit, launchd agent, or packaged-supervisor config (portable hosts) — pod-namespaced in each; `shuttle pod sync` activates by diff-and-restart. Declared, never verb-managed; the host manager's own CLI is the ad-hoc control surface. (ADR-0032)
+_Avoid_: service verb, daemon verb (for the declared surface; "supervisor" and "process manager" name the portable backend's runtime, not the service)
+
 **Overlay**: An inline, code-only patch to an existing package declaration inside `pod.lua`, layered over `pkgs/` and loaded pods. Later layers win; upstream files are never modified.
 _Avoid_: fork, shadow file, patch file
 

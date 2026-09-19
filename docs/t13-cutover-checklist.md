@@ -47,7 +47,7 @@ Inventory basis: `devbox global list` (91 entries), `devbox.json`
 | `env:` block (EDITOR, LOCALE_ARCHIVE, PYTHONPATH, VENV_DIR, …) | `shuttle run -- <cmd…>` env overlay (farm-first PATH + loader seam, #102); per-var `env:` surface still deferred (ADR-0016 §7) | partial — §5.3 |
 | Secrets: init-hook sources `$XDG_RUNTIME_DIR/devbox-secrets.sh`, regenerated from `~/.config/bws/sm.ini` via `bws` + `BWS_ACCESS_TOKEN` (libsecret fallback) | none needed in shuttle — user-level init snippet | checklist step §4.3 |
 | Shell init: ble.sh, starship, zoxide (`cd` alias), fzf bindings, atuin, `set -o vi`, `SUDO_EDITOR`, XDG_DATA_DIRS completions | same init lines in the user's `~/.bashrc.d`, binaries now resolve from the pod farm | checklist step §4.4; ble.sh gap §5.2 |
-| Services: process-compose (`valkey`+search module, `bifrost`, `wigolo`) | none — pods have no service verb (ADR-0015 verb set) | **open** §5.4 |
+| Services: process-compose (`valkey`+search module, `bifrost`, `wigolo`) | declared services, emitted per backend (ADR-0032) | resolved 2026-09-19, §5.4 |
 | Scripts: `update-flake`, `upload-flakes`, `config-sync/pull/push`, `setup-*`, `first-install`, `nix-store-gc` | nix/flake-specific → die with devbox-global (per #29) | dropped, §5.5 |
 | `~/.local/bin` shims (`bitw`, `jcode`, `iii`, `starship`, `yq`, …) | untouched — not devbox-managed | persists; shadowing note §4.6 |
 | Nerd fonts (hack, noto, fira-code) | `nerd-fonts-*` pool packages + **new font surface** | covered by this branch |
@@ -167,7 +167,7 @@ shuttle pod --name daily sync
 
 # Parity smoke BEFORE any rc change:
 shuttle pod --name daily list
-eval "$(shuttle pod shellenv --name daily)"
+eval "$(shuttle pod --name daily shellenv)"
 which jq rg fd fzf gh git tmux bws starship zoxide atuin   # → ~/.local/share/shuttle/pods/daily/current/bin/…
 fc-match 'Hack Nerd Font'                                   # resolves from the pod surface
 ```
@@ -177,7 +177,7 @@ fc-match 'Hack Nerd Font'                                   # resolves from the 
 ```bash
 # Replace the devbox lines in ~/.bashrc.d/90-devbox.sh with:
 #   [ ! -t 0 ] || [ -z "$PS1" ] && return
-#   eval "$(shuttle pod shellenv --name daily)"
+#   eval "$(shuttle pod --name daily shellenv)"
 # (no `devbox completion bash`; no `devbox global shellenv --init-hook`)
 $EDITOR ~/.bashrc.d/90-devbox.sh
 
@@ -258,6 +258,13 @@ env; a fresh login matches this shape):
       pod tools now win over these — if `~/.local/bin/starship` was a
       deliberate local build, either remove it or drop `starship` from
       the pod.
+      Council disposition (2026-09-18): sweep, don't guess — every
+      `~/.local/bin` entry that also exists under
+      `~/.local/share/shuttle/pods/daily/current/` gets its local copy
+      moved to an attic dir (NEVER rm; `starship-patched` proves
+      deliberate local builds exist), or the deliberate build folds
+      into the pool as an overlay package so one source of truth wins
+      instead of PATH-order luck.
 - [x] Gaps filed (§5) — none absorbed silently (sounddevice/portaudio
       runtime gap recorded in the freeze header).
 - [x] shellenv hardening: NixOS `/etc/profile` rebuilds PATH without
@@ -298,6 +305,17 @@ need packages authored, not new machinery.
 **Until ported, these stay devbox-only — cutover is gated on the owner
 dispositioning each (port now vs. live without).**
 
+Council disposition (2026-09-18): may-never-port — `podman` (system
+service + socket activation, wrong layer for a user pod), `chromium`
+(flatpak already serves it), `jdk21` (port on demonstrated need).
+DROP: `zenity` (gtk4/libadwaita/itstool unbuildable from the pool; the
+re-open trigger is the gtk4 family entering the queue — zenity is the
+canary for all of it). Everything else files as tickets, sequenced:
+valkey(+search)/bifrost/wigolo AFTER the §5.4 units land (a port before
+a service story exists gives binaries you hand-start); the independent
+dep-fetch tools (opencode-v2, codegraph, codeburn, skills,
+playwright-cli, deepsec, deepseek-harness) as one ticket per tool.
+
 ### 5.2 ble.sh — ported (was a gap)
 
 `pkgs/b/blesh.lua` builds the interactive line editor; the rc port loads
@@ -320,10 +338,15 @@ key, loads fold transitively, first-declared load wins collisions) into
 `generations/<n>/env.json`; `shuttle pod shellenv` renders one
 `export KEY='value'` per var and `shuttle run` overlays the same map.
 The devbox init-hook's env exports can move into the pod declaration;
-`90-shuttle.sh` keeps only genuine shell-init lines. Open: package-level
-declared env (manifest surface, follow-up) and the LOCALE_ARCHIVE pod
-decision (system locales vs. a pod locale payload — declarable, never
-auto-generated).
+`90-shuttle.sh` keeps only genuine shell-init lines. Council disposition
+(2026-09-18): LOCALE_ARCHIVE decided — system locales win; pods never
+auto-generate or ship locale payloads; a pod that needs its own declares
+a `glibc-locales` package and sets `LOCALE_ARCHIVE` through this
+`env = {}` surface (the host-specific literal is accepted until the
+interpolation trigger in ADR-0030 fires). Package-level declared env
+stays deferred per the Alternatives section; if it lands, the sketch is
+`env = {...}` folded into `generations/<n>/env.json` with package
+provenance and same-precedence collisions as a hard error.
 
 Semantic target for that surface: `shuttle run` becomes the single
 entry point the way `flatpak run` is — the confined-app half exists
@@ -340,6 +363,35 @@ devbox's process-compose. Pods have no service verb (ADR-0015). Options:
 a `shuttle pod service` verb backed by systemd user units, or keep a
 standalone process-compose launched from a user unit. None exists today.
 
+Council disposition (2026-09-18): no verb, no process-compose. Services
+run as out-of-band systemd USER units shipping in
+`examples/cutover/shuttle-{valkey,bifrost,wigolo}.service`, with
+`ExecStart` through
+`%h/.local/share/shuttle/pods/daily/current/<bin>` — the `current`
+symlink makes the units generation-proof with zero templating, and
+valkey's `--loadmodule` reaches `current/extensions/valkey-search/…`
+the same way. ADR-0015 Decision 10's "no systemd user units" was scoped
+to activation (services are not activation). `systemctl --user` stays
+the control surface, and units must be restarted after a pod rollback
+(a flip does not restart running daemons). Re-open trigger: a service
+must become pod-declared or machine-portable — then the design is
+packages declaring `services = { … }` emitted through the launcher/font
+emitter family, never a verb.
+
+RESOLVED (2026-09-19, ADR-0032): the re-open trigger above has been
+exercised — ADR-0032 records the carve-out (services are not
+activation) and resolves it declaratively: services are declared
+(`services = { … }` in packages, option overrides in `pod {}`) and
+emitted into the generation by a third emitter (`src/services.rs`,
+beside launchers/fonts) with swappable backends: systemd user units
+(the cutover hosts, first), packaged-supervisor config for hosts
+without a user manager — WSL2 with systemd disabled, SysV (second) —
+and launchd agents with the macOS port, sync doing
+switch-to-configuration-style diff-and-restart in each. The
+hand-written `examples/cutover/` units, committed alongside the pool
+ports, remain the bootstrap until the emitter lands (it lands with the
+first service-carrying port).
+
 ### 5.5 Dropped with devbox-global (by design, #29)
 
 `update-flake` / `upload-flakes` / `config-sync` / `config-pull` /
@@ -354,6 +406,12 @@ general `share/` tree, so bash completions and man pages shipped inside
 pod payloads stay unreachable. Today the pool packages barely ship any
 (only `tree` carries a man page), so nothing daily breaks; revisit if the
 pool grows share-heavy packages.
+
+Council disposition (2026-09-18): accepted permanently for now. Re-open
+when a pool package ships completions or man pages users actually
+consume; the implementation is the font-surface pattern again
+(`$XDG_DATA_HOME/shuttle-pod-<pod>/share` plus optional `MANPATH` /
+`XDG_DATA_DIRS` shellenv lines).
 
 ### 5.7 Loader path for requires-closure libraries (NEW, demonstrated)
 
@@ -377,6 +435,19 @@ dirs, compose-prepending (`${LD_LIBRARY_PATH:+…}`) so it never wipes a
 host list. The sweep proves git/tmux/htop/tig resolve and run from the
 pod farm with zero devbox hits; nothing here blocks the cutover
 anymore.
+
+Council gate (2026-09-18): the checklist and #90 may disagree. #90's
+wrapper-aware merged prefix (`classify_wrapper` /
+`rewrite_prefix_wrappers`, `src/build_prefix.rs`) and
+`wrap_shebang_script` (`src/snap.rs`) claim this family is closed, but
+`snap.rs` still shows a wrapper asserting `usr/usr/bin/python3.real.12`
+against a file staged at `usr/bin/python3.real.12`. Settled by a
+cold-store repro only: clear the store, `pod add dconf libsecret
+wl-clipboard wtype luarocks perltidy` + sync, then `perltidy --version`
+from the farm and build wl-clipboard (the smallest meson-class).
+Green → strike §3.1 and this section. Red → the repro output is the
+ticket. Either way, do NOT re-lay-out the extension tree: `usr/usr` is
+load-bearing (the §5.7 seam emits `extensions/*/usr/usr/lib`).
 
 ### 5.8 Build-time wrappers vs the extension layout (NEW, demonstrated)
 
@@ -409,6 +480,16 @@ The pilot exposed environment traps the cutover session must respect:
   to the pool toolchain meta.
 - Transient download flakes (ftp.gnu.org, github) abort a sync; re-run
   is incremental and resumes.
+
+### 5.10 Global-config sync (`devbox global push/pull` parity) — NEW
+
+Council disposition (2026-09-18): NOT-do. A pod is two portable files —
+`pod.lua` + `shuttle.lock` — at a stable path; version them with a plain
+git attic (chezmoi-managing `pod.lua` fights the imperative verbs that
+rewrite it). The store and generations rebuild via `pod sync` on any
+machine. Re-open trigger: a second machine — then the design is
+`pod export/import` (declaration + lock only, never the store), an
+ADR-level change.
 
 ## 6. Pilot reproduction transcript
 
