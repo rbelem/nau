@@ -11,7 +11,7 @@
 return {
     default = snap {
         name = "hunk",
-        version = "0.21.1",
+        version = "0.22.0",
         summary = "Review-first terminal diff viewer",
         description = [[
             hunk is a review-first terminal diff viewer built for
@@ -25,8 +25,8 @@ return {
         architectures = { "amd64" },
 
         source = {
-            url = "https://github.com/modem-dev/hunk/releases/download/v0.21.1/hunkdiff-linux-x64.tar.gz",
-            sha256 = "c7d1e23ba4ffb6ca3330797e9f0c82dbada50e3cfe1b719f4194747f2cbca122",
+            url = "https://github.com/modem-dev/hunk/releases/download/v0.22.0/hunkdiff-linux-x64.tar.gz",
+            sha256 = "5f280374f2ab0fc4c48266a9909ee1b0e0c59d77dd99a340f1c26f2125d2229b",
         },
 
         -- Single top-level dir (hunkdiff-linux-x64/): the source-root
