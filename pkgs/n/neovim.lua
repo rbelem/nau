@@ -71,9 +71,24 @@ return {
         -- Single-source flatten lands the tarball root's contents
         -- (bin/ lib/ share/) at $SRC; relayout into the /usr prefix.
         -- bin/ carries only the nvim ELF (no symlinks to dereference).
+        --
+        -- Farm app assemblies carry only the command's usr/bin subtree
+        -- (issue #37 siblings), so nvim's own runtime discovery
+        -- (bin/../share/nvim) finds nothing there and $VIMRUNTIME
+        -- collapses to the nonexistent compile-time default — every
+        -- `require('vim.*')` beyond the embedded bootstrap dies
+        -- (vim.uri E5113). The treesitter parsers ride along by
+        -- relocation into the runtime (rtp-relative parser search), and
+        -- bin/nvim becomes a wrapper pinning VIMRUNTIME: first the
+        -- payload layout (sandbox/store), then the generation's
+        -- extension tree (usr/usr doubling is load-bearing, §5.7).
         build = table.concat({
             "mkdir -p $STAGE/usr",
             "cp -r bin lib share $STAGE/usr/",
+            "cp -r lib/nvim/parser share/nvim/runtime/parser",
+            "mv $STAGE/usr/bin/nvim $STAGE/usr/bin/nvim.bin",
+            "printf '%s\\n' '#!/bin/sh' 'd=$(dirname \"$(readlink -f \"$0\")\")' 'r=$d/../../share/nvim/runtime' 'if test ! -d \"$r\"' 'then r=$d/../../../../extensions/neovim/usr/usr/share/nvim/runtime' 'fi' 'r=$(readlink -f \"$r\")' 'VIMRUNTIME=$r exec \"$d/nvim.bin\" \"$@\"' > $STAGE/usr/bin/nvim",
+            "chmod +x $STAGE/usr/bin/nvim",
             -- viAlias/vimAlias/vimdiff from the flake: sibling-relative
             -- sh wrappers, not symlinks (they would dereference).
             "printf '%s\\n' '#!/bin/sh' 'exec \"$(dirname \"$0\")/nvim\" \"$@\"' > $STAGE/usr/bin/vi",
