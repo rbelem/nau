@@ -7,7 +7,7 @@ replacement for Snapcraft's YAML. GPL-3.0-only, Linux-only. Formerly named
 ## Build, test, lint
 
 Use the pinned devbox toolchain — do not assume the system `cargo` matches:
-the pod ships a newer rust, and the 1.95 pin is the contract. The pod env
+the pod ships a newer rust, and the 1.97.1 pin is the contract. The pod env
 leaks `LD_LIBRARY_PATH` into the shell (breaks devbox's node), so unset it:
 
 ```bash

@@ -2,7 +2,7 @@
 
 ## Environment
 
-The toolchain is pinned in `devbox.json` — rustc, clippy, and rustfmt 1.95,
+The toolchain is pinned in `devbox.json` — rustc, clippy, and rustfmt 1.97.1,
 cargo, plus the Linux tools the build and test suite exercise (`squashfs-tools`,
 `bubblewrap`, `patchelf`, `gnumake`, `flex`/`bison`, `lua54`, …).
 
@@ -30,15 +30,18 @@ The gate is meant to move off devbox onto `shuttle run -- <cmd…>` (issue
 PATH plus the pod's declared vars, no sandbox, transparent exec. The command
 form is real, but it cannot carry this repo's gate yet:
 
-- The daily pod ships a rust toolchain, but 1.98.1 — not the pinned 1.95.0.
-  rustfmt/clippy output drifts between versions, so the pin is the contract.
+- The daily pod ships a rust toolchain, but 1.98.1 — not the pinned 1.97.1
+  (devbox's nixpkgs pin cannot resolve 1.98.x; 1.97.1 is the newest
+  resolvable). rustfmt/clippy output drifts between versions, so the pin is
+  the contract.
 - `check` is a devbox script name, not a farm binary — `shuttle run -- check`
   has nothing to resolve until the pod ships the pinned toolchain and a gate
   wrapper (or the gate is spelled as explicit `shuttle run -- cargo …`
   commands).
 
 Prerequisite for the switch: the pod/pool must carry the pinned toolchain
-(cargo/rustc/clippy/rustfmt 1.95.0). Until then, the devbox command above
+(cargo/rustc/clippy/rustfmt 1.97.1) — pod 1.98.1 still drifts from the pin,
+and devbox cannot resolve 1.98.x yet. Until then, the devbox command above
 remains the verified gate.
 
 ### `devbox run` semantics
