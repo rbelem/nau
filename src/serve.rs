@@ -20,6 +20,13 @@
 //! never served) and the pull-staging inbox
 //! ([`crate::pkg_manifest::manifest_path`]) per its documented
 //! invariant.
+//!
+//! Announce (ADR-0033 Decision 3): when the announce switch is set —
+//! `node { serve = { announce = true } }` or `serve --announce` — the
+//! lane registers `_shuttle._tcp.local.` via [`crate::discovery`] for
+//! the lifetime of the accept loop. Announce failure is a warning, not
+//! an error: on multicast-filtered networks explicit peer addresses
+//! degrade gracefully, and discovery sugar must not take serving down.
 
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -176,10 +183,18 @@ enum Handled {
 
 /// Run `shuttle serve` with the CLI's bind overrides. `address`/`port`
 /// are `None` when the operator gave no flag — the defaults come from
-/// `node {}` conventions ([`DEFAULT_SERVE_ADDRESS`], loopback). Serves
-/// the invoking user's default pod store (ADR-0033 Decision 5: v1
-/// scope is the pod store, foreground, no daemonization).
-pub fn run(address: Option<&str>, port: Option<u16>) -> miette::Result<()> {
+/// `node {}` conventions ([`DEFAULT_SERVE_ADDRESS`], loopback).
+/// `announce` + `node_name` come from `node {}` (source of truth) with
+/// the `--announce` flag as an override; `node_name: None` falls back
+/// to the kernel hostname. Serves the invoking user's default pod store
+/// (ADR-0033 Decision 5: v1 scope is the pod store, foreground, no
+/// daemonization).
+pub fn run(
+    address: Option<&str>,
+    port: Option<u16>,
+    announce: bool,
+    node_name: Option<&str>,
+) -> miette::Result<()> {
     let pod_root = crate::pod::pod_root(None);
     let pod_dir = crate::pod::pod_dir(&pod_root, crate::pod::DEFAULT_POD);
     if !pod_dir.is_dir() {
@@ -201,6 +216,35 @@ pub fn run(address: Option<&str>, port: Option<u16>) -> miette::Result<()> {
         "serving pod '{}' store on http://{host}:{port} — Ctrl-C to stop",
         crate::pod::DEFAULT_POD
     ));
+    // The guard binds the registration to the serve loop's lifetime —
+    // it is dropped only when the loop exits (i.e. never in practice:
+    // Ctrl-C terminates the process, and the OS reaps the multicast
+    // membership; the mDNS records expire by TTL).
+    let _announce = if announce {
+        let is_loopback = matches!(host.as_str(), "127.0.0.1" | "::1");
+        let name = node_name.map(str::to_string).unwrap_or_else(hostname);
+        match crate::discovery::announce(&name, port) {
+            Ok(guard) => {
+                crate::output::info(format!(
+                    "announcing as '{name}' on _shuttle._tcp (mDNS) — `shuttle peers` finds it"
+                ));
+                if is_loopback {
+                    crate::output::warn(
+                        "announcing a loopback-only bind — LAN peers will discover this node but cannot connect; bind a real address (e.g. 0.0.0.0) to serve the LAN",
+                    );
+                }
+                Some(guard)
+            }
+            Err(e) => {
+                crate::output::warn(format!(
+                    "mDNS announce failed ({e:#}) — peers can still pull by explicit address"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
     accept_loop(listener, ctx, Arc::new(AtomicUsize::new(0)))
 }
 

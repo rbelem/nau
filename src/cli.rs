@@ -433,9 +433,9 @@ pub enum Command {
     /// Serve the pod store to LAN peers over a minimal HTTP/1.1 subset
     /// (ADR-0033 Decisions 4+5): `GET /info`, `GET /manifests/<pkg>`,
     /// `GET /blobs/<sha256>`. Runs in the foreground until interrupted;
-    /// unsigned store entries are never served. Binding/publishing
-    /// policy comes from `node {}` in shuttle.lua — absent `node {}`,
-    /// there is nothing to serve.
+    /// unsigned store entries are never served. Binding and announce
+    /// policy come from `node {}` in shuttle.lua — absent `node {}`,
+    /// the loopback default applies and nothing is announced.
     Serve {
         /// Bind address override. Default: `node {}`'s
         /// `serve.address`, else 127.0.0.1 (loopback — `/info`
@@ -447,6 +447,27 @@ pub enum Command {
         /// Bind port override (default: 7780, unprivileged).
         #[arg(long)]
         port: Option<u16>,
+
+        /// Announce the node on the LAN via mDNS (`_shuttle._tcp`,
+        /// ADR-0033 Decision 3), overriding `node {}`'s
+        /// `serve.announce`. The declaration is the source of truth;
+        /// absent both, serve does not announce.
+        #[arg(long)]
+        announce: bool,
+    },
+
+    /// Browse the LAN for announcing shuttle peers (ADR-0033 Decision
+    /// 3): mDNS `_shuttle._tcp.local.` for a bounded window, printing
+    /// every node found. Discovery only, never trust — pulls still
+    /// verify every manifest fail-closed (ADR-0033 Decision 7).
+    Peers {
+        /// Browse window in seconds (default: 2).
+        #[arg(long, default_value_t = 2)]
+        secs: u64,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Export the pod store's shareable content as a static directory

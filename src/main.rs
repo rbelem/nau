@@ -304,7 +304,16 @@ fn main() -> miette::Result<()> {
             )
         }
 
-        Command::Serve { address, port } => cmd_serve(address.as_deref(), port),
+        Command::Serve {
+            address,
+            port,
+            announce,
+        } => cmd_serve(address.as_deref(), port, announce),
+
+        Command::Peers { secs, json } => {
+            shuttle::output::set_mode(json);
+            cmd_peers(secs)
+        }
 
         Command::Export { out, pod } => cmd_export(&out, pod.as_deref()),
 
@@ -3699,11 +3708,56 @@ fn cmd_pull(
     Ok(())
 }
 
-/// `shuttle serve`: hand the bind overrides to the serve lane (ADR-0033
-/// Decision 5 — serve is foreground, pod-store-scoped, configured by
-/// `node {}`).
-fn cmd_serve(address: Option<&str>, port: Option<u16>) -> miette::Result<()> {
-    shuttle::serve::run(address, port)
+/// `shuttle serve`: evaluate `node {}` from shuttle.lua for the
+/// binding + announce policy (ADR-0033 Decisions 3+5+6), then hand the
+/// overrides to the serve lane. `--announce` forces announcing over the
+/// declaration; the declaration is the source of truth — absent both,
+/// serve does not announce. Absent `--address`, the declared
+/// `serve.address` (or the loopback default) binds.
+fn cmd_serve(address: Option<&str>, port: Option<u16>, announce_flag: bool) -> miette::Result<()> {
+    let node = load_node_decl()?;
+    let announce = announce_flag || node.as_ref().is_some_and(|n| n.serve.announce);
+    let node_name = node.as_ref().map(|n| n.name.as_str());
+    let address = address
+        .map(str::to_string)
+        .or_else(|| node.as_ref().map(|n| n.serve_address().to_string()));
+    shuttle::serve::run(address.as_deref(), port, announce, node_name)
+}
+
+/// The `node {}` declaration from `./shuttle.lua`, if the file exists
+/// (ADR-0033 Decision 6 — same eval path as every other verb). A
+/// missing file yields `None`: zero behavior change. A file that fails
+/// to evaluate fails the verb — a config shuttle cannot evaluate must
+/// not be silently ignored by a serving verb.
+fn load_node_decl() -> miette::Result<Option<shuttle::lua::NodeConfig>> {
+    if !Path::new("shuttle.lua").exists() {
+        return Ok(None);
+    }
+    let evaluated = shuttle::lua::evaluate_file_with_inputs("shuttle.lua")?;
+    Ok(evaluated.node)
+}
+
+/// `shuttle peers`: browse the LAN for announcing nodes (ADR-0033
+/// Decision 3) and print name + host:port. Discovery only, never trust:
+/// every manifest stays fail-closed on pull (ADR-0033 Decision 7).
+fn cmd_peers(secs: u64) -> miette::Result<()> {
+    shuttle::output::status(format!(
+        "browsing the LAN for _shuttle._tcp peers ({secs}s)…"
+    ));
+    let mut peers = shuttle::discovery::browse(Duration::from_secs(secs))?;
+    peers.sort_by(|a, b| a.name.cmp(&b.name));
+    if peers.is_empty() {
+        shuttle::output::warn(
+            "no shuttle peers found — is `shuttle serve` running there with announce on?",
+        );
+    } else {
+        for peer in &peers {
+            shuttle::output::status(format!("{:<24} {}:{}", peer.name, peer.host, peer.port));
+        }
+        shuttle::output::ok(format!("{} peer(s) found", peers.len()));
+    }
+    print_report(&serde_json::json!({ "command": "peers", "peers": peers }));
+    Ok(())
 }
 
 /// `shuttle export`: hand the destination and pod to the export lane

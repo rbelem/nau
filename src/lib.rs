@@ -12,6 +12,7 @@ pub mod confine;
 pub mod dep_fetch;
 pub mod deps;
 pub mod desktop;
+pub mod discovery;
 pub mod doctor;
 pub mod dsl;
 pub mod emit;
