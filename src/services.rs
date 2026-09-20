@@ -81,10 +81,12 @@ pub struct ServiceUnit {
     /// already expanded to literals).
     pub args: Vec<String>,
     /// The resolved options (package defaults folded with the pod-level
-    /// overrides, specifiers NOT expanded) — recorded so the cross-pod
-    /// endpoint scan can read endpoint-ish option values (ADR-0032
-    /// Decision 9 also names data dirs, which need not appear in any
-    /// arg).
+    /// overrides, specifiers NOT expanded — the record contract) —
+    /// recorded so the cross-pod endpoint scan can read endpoint-ish
+    /// option values (ADR-0032 Decision 9 also names data dirs, which
+    /// need not appear in any arg). The scan expands `%h`/`%p`/`${ref}`
+    /// at COMPARISON time — recorded values are never compared raw
+    /// (issue #107: identical raw templates resolve to per-pod paths).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, serde_json::Value>,
     /// The service-declared environment literals (the generation's
@@ -1567,6 +1569,23 @@ fn pod_endpoint_claims(pod_dir: &std::path::Path) -> miette::Result<Vec<Endpoint
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Comparison-time expansion (issue #107): the record keeps option
+    // specifiers unexpanded, so two pods legally sharing the canonical
+    // `data_dir = "%h/.local/share/<pkg>/%p"` template must not compare
+    // as identical. The scan expands with the same semantics `record`
+    // used — home = $HOME, pod = the directory name, `${ref}` against
+    // the unit's own recorded options — and fails closed on an
+    // unresolvable value: recorded values are never compared raw.
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let current = store.root().join(crate::farm::CURRENT_LINK);
+    let ctx = ResolveCtx {
+        pod: &pod,
+        home: &home,
+        extensions: current.join("extensions").to_string_lossy().into_owned(),
+        gen_env: BTreeMap::new(), // expansion-only: env/loader-libs are render-time inputs
+        loader_libs: Vec::new(),
+        current: current.to_string_lossy().into_owned(),
+    };
     let mut claims = Vec::new();
     for unit in file.units {
         if !unit.enabled {
@@ -1581,17 +1600,28 @@ fn pod_endpoint_claims(pod_dir: &std::path::Path) -> miette::Result<Vec<Endpoint
             });
         }
         // Decision 9 also names data dirs, which need not appear in any
-        // arg: endpoint-ish recorded option values join the claim set.
+        // arg: endpoint-ish recorded option values join the claim set,
+        // expanded (see above — issue #107).
         for (key, value) in &unit.options {
             if let (Some(family), Some(text)) = (endpoint_option_family(key), option_text(value)) {
-                if !text.is_empty() {
-                    claims.push(EndpointClaim {
-                        pod: pod.clone(),
-                        svc: unit.name.clone(),
-                        key: family.to_string(),
-                        value: text,
-                    });
+                if text.is_empty() {
+                    continue;
                 }
+                let mut resolving = Vec::new();
+                let expanded = expand_specifiers(
+                    &unit.name,
+                    &format!("options.{key}"),
+                    &text,
+                    &unit.options,
+                    &ctx,
+                    &mut resolving,
+                )?;
+                claims.push(EndpointClaim {
+                    pod: pod.clone(),
+                    svc: unit.name.clone(),
+                    key: family.to_string(),
+                    value: expanded,
+                });
             }
         }
     }
@@ -2349,6 +2379,68 @@ mod tests {
         seed_scan_pod(&root3, "alpha", &[a]);
         seed_scan_pod(&root3, "beta", &[b, c]);
         check_endpoint_collisions(&root3).unwrap();
+    }
+
+    #[test]
+    fn endpoint_scan_compares_resolved_option_values() {
+        // Issue #107: recorded options keep specifiers unexpanded, so
+        // the scan must expand at comparison time — raw text never
+        // compares.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // (1) The canonical per-pod template: identical raws carrying
+        // %h/%p resolve to per-pod paths — NO collision, sync succeeds.
+        let mut a = unit(true, "h");
+        a.name = "valkey".into();
+        a.options.insert(
+            "data_dir".into(),
+            serde_json::json!("%h/.local/share/shuttle/valkey/%p"),
+        );
+        seed_scan_pod(root, "alpha", &[a.clone()]);
+        seed_scan_pod(root, "beta", &[a]);
+        check_endpoint_collisions(root)
+            .expect("identical raw templates with %h/%p must resolve to distinct per-pod dirs");
+
+        // (2) Different raws resolving to the same path DO collide —
+        // expansion must create detection, not only remove the false
+        // positive. `${ref}` resolves in the scan scope too: alpha's
+        // value references the `base` option.
+        let root2 = root.join("resolved");
+        std::fs::create_dir_all(&root2).unwrap();
+        let mut refd = unit(true, "h");
+        refd.name = "valkey".into();
+        refd.options
+            .insert("base".into(), serde_json::json!("%h/data"));
+        refd.options
+            .insert("data_dir".into(), serde_json::json!("${base}/db"));
+        let mut literal = unit(true, "h");
+        literal.name = "valkey".into();
+        literal.options.insert(
+            "data_dir".into(),
+            serde_json::json!(format!("{}/data/db", home())),
+        );
+        seed_scan_pod(&root2, "alpha", &[refd]);
+        seed_scan_pod(&root2, "beta", &[literal]);
+        let err = check_endpoint_collisions(&root2).unwrap_err().to_string();
+        assert!(
+            err.contains("alpha") && err.contains("beta") && err.contains("data_dir"),
+            "same resolved data_dir must collide, got: {err}"
+        );
+
+        // (3) Arg-form claims are unchanged: args are recorded already
+        // resolved, and identical literal args still collide.
+        let root3 = root.join("args");
+        std::fs::create_dir_all(&root3).unwrap();
+        let mut x = unit(true, "h");
+        x.name = "svc".into();
+        x.args = vec!["--socket-path".into(), "/run/svc.sock".into()];
+        seed_scan_pod(&root3, "alpha", &[x.clone()]);
+        seed_scan_pod(&root3, "beta", &[x]);
+        assert!(
+            check_endpoint_collisions(&root3).is_err(),
+            "arg-form collisions must keep hard-erroring"
+        );
     }
 
     #[test]

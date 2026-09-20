@@ -3171,6 +3171,16 @@ pub(crate) fn resolve_service_options(
         }
         options.insert(key.clone(), value.clone());
     }
+    // Pod-side override strings reach the same render path as declared
+    // values (ExecStart args, interpolation), so the parse-side exec
+    // boundary applies at the merge too (issue #109 S5): a control
+    // character (a raw newline) in a string value is rejected here,
+    // naming the key.
+    for (key, value) in &options {
+        if let Some(s) = value.as_str() {
+            crate::snap::validate_exec_text(service, &format!("options.{key}"), s)?;
+        }
+    }
     // `enabled` drives activation (ADR-0032 Decision 7) — a quoted
     // "true" is a string, not an enable, and silently disabling a
     // service the user asked to enable is the worst failure mode.
@@ -4139,6 +4149,47 @@ pod {
             format!("{err}").contains("must be a boolean"),
             "a quoted \"true\" must fail loudly, never silently disable: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_service_options_rejects_control_chars_in_override_strings() {
+        // Issue #109 S5: pod-side override strings reach the same
+        // render path as declared values (ExecStart args, interpola-
+        // tion) — a control character is rejected at the merge
+        // boundary, naming the key.
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "data_dir".to_string(),
+            serde_json::json!("x\nKillMode=never"),
+        );
+        let err = resolve_service_options(
+            "valkey",
+            &BTreeMap::new(),
+            &overrides,
+            "pod 'work'",
+            "the package default",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("options.data_dir") && err.contains("control characters"),
+            "got: {err}"
+        );
+        // A quoted override stays legal — the emitter quotes/escapes
+        // at render; only control characters are the boundary.
+        let mut quoted = BTreeMap::new();
+        quoted.insert(
+            "msg".to_string(),
+            serde_json::json!("it's a \"quoted\" value"),
+        );
+        resolve_service_options(
+            "valkey",
+            &BTreeMap::new(),
+            &quoted,
+            "pod 'work'",
+            "the package default",
+        )
+        .expect("quoted override values must stay legal");
     }
 
     /// Bare SnapMeta with every optional field empty (mirrors the test

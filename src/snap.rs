@@ -660,6 +660,25 @@ fn validate_env_value_text(service: &str, key: &str, value: &str) -> miette::Res
     Ok(())
 }
 
+/// Exec-surface text (issue #109 S5): `command`, `args` entries, and
+/// option string values are baked into the `ExecStart=` line — quotes
+/// are safe there (the emitter single-quotes every arg), but a control
+/// character is not: a raw newline terminates the directive and every
+/// following line parses as a fresh unit directive. Rejected at the
+/// parse boundary, fail-closed, naming the character. Also applied to
+/// pod-side override strings at the merge boundary (`pod.rs`), which
+/// reach the same render path.
+pub(crate) fn validate_exec_text(service: &str, field: &str, value: &str) -> miette::Result<()> {
+    if let Some(c) = value.chars().find(|c| c.is_control()) {
+        miette::bail!(
+            "service '{service}': field '{field}': control characters are not allowed — \
+             found {c:?}; the value reaches the ExecStart line, where a newline would \
+             terminate the directive and the remainder would parse as unit directives"
+        );
+    }
+    Ok(())
+}
+
 impl ServiceDecl {
     /// Convert a Lua service table (from `service()` or a plain table)
     /// into a [`ServiceDecl`]. `name` is the service's key in `services`,
@@ -754,15 +773,22 @@ impl ServiceDecl {
         let backend_options = get_service_backend_options(name, table)?;
 
         // Interpolation is validated fail-closed at parse: the option
-        // set is fully known only after the fields above are read.
+        // set is fully known only after the fields above are read. The
+        // exec-surface boundary rides the same loops (issue #109 S5):
+        // command / args / option values reach the ExecStart line, so
+        // control characters are rejected here — quotes stay legal
+        // (the emitter single-quotes every arg).
         let option_keys: std::collections::BTreeSet<String> = options.keys().cloned().collect();
         validate_service_interpolation(name, "command", &command, &option_keys)?;
+        validate_exec_text(name, "command", &command)?;
         for (i, arg) in args.iter().enumerate() {
             validate_service_interpolation(name, &format!("args[{}]", i + 1), arg, &option_keys)?;
+            validate_exec_text(name, &format!("args[{}]", i + 1), arg)?;
         }
         for (key, value) in &options {
             if let Some(s) = value.as_str() {
                 validate_service_interpolation(name, &format!("options.{key}"), s, &option_keys)?;
+                validate_exec_text(name, &format!("options.{key}"), s)?;
             }
         }
         for (key, value) in &environment {
@@ -6775,6 +6801,40 @@ mod tests {
         // characters there).
         svc(&env, r#"command = "bin/x", environment = { A = "v\"q" }"#)
             .expect("quoted env values are render-escaped, not rejected");
+    }
+
+    #[test]
+    fn service_exec_text_rejects_control_chars_but_not_quotes() {
+        // Issue #109 S5: command / args / option string values reach
+        // the ExecStart line — a raw newline terminates the directive
+        // and the remainder would parse as fresh unit directives, so
+        // control characters are rejected at parse, naming the field.
+        let env = LuaEnv::new();
+        let cases: [(&str, &str); 3] = [
+            ("command", r#"command = "bin/x\nKillMode=never""#),
+            (
+                "args[2]",
+                r#"command = "bin/x", args = { "--msg", "hi\nKillMode=never" }"#,
+            ),
+            (
+                "options.msg",
+                r#"command = "bin/x", options = { msg = "hi\nKillMode=never" }"#,
+            ),
+        ];
+        for (field, body) in cases {
+            let err = svc(&env, body).unwrap_err().to_string();
+            assert!(
+                err.contains("control characters") && err.contains(field),
+                "{field} must reject the newline by name, got: {err}"
+            );
+        }
+        // Quotes are legitimate on this surface: the emitter
+        // single-quotes every arg, so a quoted arg stays legal.
+        svc(
+            &env,
+            r#"command = "bin/x", args = { "--msg", "it's a \"quoted\" value" }"#,
+        )
+        .expect("quoted args must stay legal");
     }
 
     #[test]
