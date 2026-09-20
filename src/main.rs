@@ -3709,7 +3709,9 @@ fn cmd_serve(address: Option<&str>, port: Option<u16>) -> miette::Result<()> {
 /// `shuttle export`: hand the destination and pod to the export lane
 /// (ADR-0033 Decision 10 — a static tree any web server can serve).
 fn cmd_export(out: &str, pod: Option<&str>) -> miette::Result<()> {
-    shuttle::export::run(out, pod)
+    shuttle::export::run(out, pod)?;
+    shuttle::output::ok(format!("exported static tree to {out}"));
+    Ok(())
 }
 
 /// Peer/static pull: the verified manifest + blobs stage into the named
