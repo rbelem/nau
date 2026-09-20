@@ -4,19 +4,42 @@
 
 The toolchain is pinned in `devbox.json` — rustc, clippy, and rustfmt 1.95,
 cargo, plus the Linux tools the build and test suite exercise (`squashfs-tools`,
-`bubblewrap`, `patchelf`, `gnumake`, `flex`/`bison`, `lua54`, …). Run everything
-through devbox so the pinned versions are used.
+`bubblewrap`, `patchelf`, `gnumake`, `flex`/`bison`, `lua54`, …).
+
+The login shell is already devbox-free: it sources the pod shellenv
+(`~/.bashrc.d/90-shuttle.sh`), and the pod env exports the farm's loader-lib
+`LD_LIBRARY_PATH`. That leak breaks devbox's own node (`node: symbol lookup
+error`), so every devbox runner is invoked with `env -u LD_LIBRARY_PATH`.
 
 | Task | Command | Expands to |
 | --- | --- | --- |
-| Debug build | `devbox run -- build` | `cargo build` |
-| All tests | `devbox run -- test` | `cargo test` |
-| Lint | `devbox run -- clippy` | `cargo clippy -- -D warnings` |
-| Format | `devbox run -- fmt` | `cargo fmt` |
-| Format check | `devbox run -- fmt-check` | `cargo fmt --check` |
-| Full gate | `devbox run -- check` | test + clippy + fmt-check |
+| Debug build | `env -u LD_LIBRARY_PATH devbox run -- build` | `cargo build` |
+| All tests | `env -u LD_LIBRARY_PATH devbox run -- test` | `cargo test` |
+| Lint | `env -u LD_LIBRARY_PATH devbox run -- clippy` | `cargo clippy -- -D warnings` |
+| Format | `env -u LD_LIBRARY_PATH devbox run -- fmt` | `cargo fmt` |
+| Format check | `env -u LD_LIBRARY_PATH devbox run -- fmt-check` | `cargo fmt --check` |
+| Full gate | `env -u LD_LIBRARY_PATH devbox run -- check` | test + clippy + fmt-check |
 
-`devbox run -- check` is the definition of green; `clippy` treats warnings as errors.
+`env -u LD_LIBRARY_PATH devbox run -- check` is the definition of green;
+`clippy` treats warnings as errors.
+
+### Devbox-free endgame (target state)
+
+The gate is meant to move off devbox onto `shuttle run -- <cmd…>` (issue
+#102): exec any command with a reconciled pod's env overlaid — farm-first
+PATH plus the pod's declared vars, no sandbox, transparent exec. The command
+form is real, but it cannot carry this repo's gate yet:
+
+- The daily pod ships a rust toolchain, but 1.98.1 — not the pinned 1.95.0.
+  rustfmt/clippy output drifts between versions, so the pin is the contract.
+- `check` is a devbox script name, not a farm binary — `shuttle run -- check`
+  has nothing to resolve until the pod ships the pinned toolchain and a gate
+  wrapper (or the gate is spelled as explicit `shuttle run -- cargo …`
+  commands).
+
+Prerequisite for the switch: the pod/pool must carry the pinned toolchain
+(cargo/rustc/clippy/rustfmt 1.95.0). Until then, the devbox command above
+remains the verified gate.
 
 ### `devbox run` semantics
 

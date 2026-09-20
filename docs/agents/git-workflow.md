@@ -4,8 +4,8 @@
 
 - Use [Conventional Commits](https://www.conventionalcommits.org/)
   (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`).
-- Format before committing: `devbox run -- fmt`.
-- Pass the full gate before pushing: `devbox run -- check`.
+- Format before committing: `env -u LD_LIBRARY_PATH devbox run -- fmt`.
+- Pass the full gate before pushing: `env -u LD_LIBRARY_PATH devbox run -- check`.
 
 ## Generated files — do not commit
 

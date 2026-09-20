@@ -7,16 +7,21 @@ replacement for Snapcraft's YAML. GPL-3.0-only, Linux-only. Formerly named
 ## Build, test, lint
 
 Use the pinned devbox toolchain — do not assume the system `cargo` matches:
+the pod ships a newer rust, and the 1.95 pin is the contract. The pod env
+leaks `LD_LIBRARY_PATH` into the shell (breaks devbox's node), so unset it:
 
 ```bash
-devbox run -- build       # cargo build
-devbox run -- test        # cargo test (unit + integration)
-devbox run -- clippy      # cargo clippy -- -D warnings
-devbox run -- fmt-check   # cargo fmt --check
-devbox run -- check       # test + clippy + fmt-check
+env -u LD_LIBRARY_PATH devbox run -- build       # cargo build
+env -u LD_LIBRARY_PATH devbox run -- test        # cargo test (unit + integration)
+env -u LD_LIBRARY_PATH devbox run -- clippy      # cargo clippy -- -D warnings
+env -u LD_LIBRARY_PATH devbox run -- fmt-check   # cargo fmt --check
+env -u LD_LIBRARY_PATH devbox run -- check       # test + clippy + fmt-check
 ```
 
-Run `devbox run -- check` before committing or pushing. Clippy warnings are errors.
+Run `env -u LD_LIBRARY_PATH devbox run -- check` before committing or pushing.
+Clippy warnings are errors. Target state is devbox-free (`shuttle run --`)
+once the pod carries the pinned toolchain — see
+[Build & test](docs/agents/build-and-test.md).
 
 ## Detail docs
 

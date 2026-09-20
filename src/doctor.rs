@@ -82,9 +82,14 @@ const SANDBOX_TOOLS: [(&str, &str); 3] = [
     ),
     (
         "make",
-        "add gnumake to devbox.json packages (or install make system-wide)",
+        "install make system-wide so it is on the login PATH (e.g. NixOS \
+         systemPackages, apt install make)",
     ),
-    ("cc", "add gcc to devbox.json packages (or apt install gcc)"),
+    (
+        "cc",
+        "install gcc system-wide so it is on the login PATH (e.g. NixOS \
+         systemPackages, apt install gcc)",
+    ),
 ];
 
 /// The pod-surface tools gated in every scope, with the distro-package
@@ -116,7 +121,8 @@ const POD_SANDBOX_TOOLS: [(&str, &str); 4] = [
     ),
     (
         "make",
-        "add gnumake to devbox.json packages (or install make system-wide)",
+        "install make system-wide so it is on the login PATH (e.g. NixOS \
+         systemPackages, apt install make)",
     ),
     (
         "cc",
@@ -218,7 +224,8 @@ fn check_ukify() -> Check {
         None => Check::missing(
             "ukify",
             "kernel disk images need ukify to build the UKI (systemd >= 254) — \
-             e.g. apt install systemd-ukify, or add systemd to devbox.json packages",
+             e.g. apt install systemd-ukify, or install systemd system-wide \
+             (NixOS systemPackages)",
         ),
     }
 }
@@ -252,7 +259,8 @@ fn check_veritysetup() -> Check {
         None => Check::missing(
             "veritysetup",
             "kernel disk images need veritysetup for dm-verity (cryptsetup >= 2.4) — \
-             e.g. apt install cryptsetup, or add cryptsetup to devbox.json packages",
+             e.g. apt install cryptsetup, or install cryptsetup system-wide \
+             (NixOS systemPackages)",
         ),
     }
 }
@@ -1409,7 +1417,7 @@ mod tests {
         assert!(matches!(make.status, CheckStatus::Missing));
         let hint = make.hint.as_deref().unwrap_or_default();
         assert!(
-            hint.contains("devbox.json"),
+            hint.contains("login PATH"),
             "hint must carry the fix: {hint}"
         );
     }
