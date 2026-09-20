@@ -51,6 +51,17 @@ clap_complete = "4"
 # literal-require enforcement, and schema-diagnostic spans). The `luau`
 # feature is load-bearing: definitions are Luau, incl. type annotations.
 full_moon = { version = "2", features = ["luau"] }
+# LAN peer discovery (ADR-0033 Decisions 3+4, src/discovery.rs): the ONE
+# new runtime crate of the peer-sharing feature. mdns-sd is synchronous
+# pure Rust with no async-runtime dependency. Its transitive tree (from
+# `cargo tree -e normal -p mdns-sd` at 0.21.3): fastrand, flume
+# (+ futures-core, futures-sink, spin → lock_api → scopeguard), if-addrs,
+# log, mio, socket-pktinfo, socket2. Genuinely NEW units in the lock
+# (git diff Cargo.lock, `+name` lines): mdns-sd, flume, futures-sink,
+# if-addrs, mio, socket-pktinfo, socket2 — fastrand/futures-core/spin/
+# lock_api/scopeguard/log were already vendored via pgp/tempfile, and
+# libc only bumps. No tokio, no hyper.
+mdns-sd = "0.21"
 
 [build-dependencies]
 # Luau analyzer build (see build.rs + shim/): upstream C++ compiled with cc.
