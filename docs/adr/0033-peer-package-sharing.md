@@ -9,7 +9,12 @@ grammar to the serving surface (Decision 4), and tightens the verification,
 freshness, and store-scope statements per the council findings. Revised
 again the same day after snapd-distribution research: the sharing surface is
 restated as named distribution lanes (Decision 9) and gains a static-HTTP
-export lane servable by any web server (Decision 10). Extends ADR-0012
+export lane servable by any web server (Decision 10). Revised once more
+after the post-implementation grill: minting points restated (Decision 2 —
+serve-request, export, and peer-ingest; build-time minting with real
+payload paths is a named follow-up), `serve` gains `--pod`, export pruning
+is gated by an ownership marker (Decision 10), and pull sweeps
+same-package older-revision inbox entries (Decision 5). Extends ADR-0012
 (file-level content store), ADR-0010 (Luau language), ADR-0024 (key
 ceremony, trusted-key distribution), and ADR-0032 (declared pod services).
 Adjacent to ADR-0012 Decision 7 (distribution rides OCI registries):
@@ -95,15 +100,20 @@ suffices, plain HTTP allowed.
      (council finding: metadata must travel, not be re-derived),
    - `signer` key id + ed25519 signature over the canonical bytes.
 
-   **Minting**: shuttle mints and signs a PackageManifest whenever it writes
-   a package into a pod store it manages — at build time and at peer-ingest
-   time. Unsigned store entries are never served. Consequence: re-serving
-   content originally pulled from the Snap Store re-signs it under the
-   serving operator's key, moving provenance from snapd assertions to that
-   key (accepted; the SLSA-lite provenance machinery in `sign.rs` may later
-   bind original materials). This manifest is new code — schema, canonical
-   bytes, minting hooks — and is the price of admission for the whole
-   feature; "acceptance is free" was the council-rejected framing.
+   **Minting**: shuttle mints and signs a PackageManifest at serve-request
+   time and export time (from the generation records, under the operator
+   key) and at peer-ingest time (the verified manifest staged into the
+   inbox). Unsigned store entries are never served. Build-time minting —
+   which knows real payload paths — is a named follow-up; until it lands,
+   minted manifests carry the sha256 store identity as `files[].path`,
+   and the install metadata plus blob hashes remain the reconstructable
+   truth. Consequence: re-serving content originally pulled from the Snap
+   Store re-signs it under the serving operator's key, moving provenance
+   from snapd assertions to that key (accepted; the SLSA-lite provenance
+   machinery in `sign.rs` may later bind original materials). This
+   manifest is new code — schema, canonical bytes, minting hooks — and is
+   the price of admission for the whole feature; "acceptance is free" was
+   the council-rejected framing.
 
 3. **LAN-first discovery; explicit addresses for WAN.** Serving nodes
    announce via mDNS (`_shuttle._tcp.local.`); `shuttle pull` can browse
@@ -141,13 +151,18 @@ suffices, plain HTTP allowed.
 
 5. **Verbs and scope: `shuttle serve` foreground; `pull` gains peer
    references; v1 scope is the pod store.** `shuttle serve` evaluates
-   `node {}` from `shuttle.lua` and serves the invoking user's **pod store**
-   — the store it can write unprivileged — until interrupted. `shuttle pull
+   `node {}` from `shuttle.lua` and serves the invoking user's **pod
+   store** — the store it can write unprivileged — until interrupted;
+   `--pod` selects the pod (default: `default`), matching the `--pod`
+   flags on `export` and `pull`. `shuttle pull
    shuttle://host[:port]/<pkg>` verifies and stages the PackageManifest +
-   missing blobs into the local pod store; installation is the existing pod
-   workflow, not a pull side effect (a deliberate contrast with
-   `pull --install`). Persistence is not a shuttle verb: keeping `serve`
-   running is a declared pod service (`services = { … }` running
+   missing blobs into the local pod store, sweeping older-revision inbox
+   entries of the pulled package as it stages (same-package hygiene;
+   cross-package orphans remain until the GC-extension revisit trigger
+   fires — GC stays generation-rooted per ADR-0012); installation is the
+   existing pod workflow, not a pull side effect (a deliberate contrast
+   with `pull --install`). Persistence is not a shuttle verb: keeping
+   `serve` running is a declared pod service (`services = { … }` running
    `shuttle serve`), riding the ADR-0032 emitter machinery — declarative,
    never verb-managed, no built-in daemonization. Serving the **system**
    runtime store (`/var/lib/shuttle`, root-owned) on ShuttleOS devices is
@@ -261,7 +276,11 @@ suffices, plain HTTP allowed.
     the client strictly requesting only well-formed names — the traversal
     hazard is a serve-side concern, and the export tree contains no
     secrets by construction (it is manifests and blobs the operator chose
-    to publish).
+    to publish). Re-export over an existing tree **prunes stale entries**
+    — manifests and blobs for packages no longer exportable — but only
+    where export owns the directory, proven by a `.shuttle-export` marker
+    written on first export; a foreign directory accumulates exactly as
+    before, deleting nothing it did not write.
 
 ## Alternatives considered
 
