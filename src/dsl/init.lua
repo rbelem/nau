@@ -813,6 +813,74 @@ function image(opts)
     return opts
 end
 
+--- Declare a sharing node (ADR-0033 Decision 6): how this machine
+-- serves its store to peers and which peers it pulls from. Absent
+-- node() means zero behavior change — no sockets, no discovery.
+-- @param opts table with fields:
+--   name  (required string) the node's name on the network
+--   serve (optional table { address = "host:port", announce = boolean })
+--   peers (optional array of strings; the first entry is the origin
+--          peer — the default pull source, never a privilege)
+-- @return the validated opts table, stamped `_node = true` so the Rust
+--   eval boundary routes it to the NodeConfig conversion instead of the
+--   snap schema
+-- @usage node {
+--     name = "devbox",
+--     serve = { address = "127.0.0.1:7780", announce = true },
+--     peers = { "shuttle://nuci.local:7780" },
+-- }
+function node(opts)
+    if type(opts) ~= "table" then
+        error("node(): expected a table, got " .. type(opts), 2)
+    end
+
+    if opts.name == nil then
+        error("node(): missing required field 'name'", 2)
+    end
+    check_string(opts.name, "node", "name")
+
+    -- serve: { address = "host:port" (optional string),
+    --          announce = mDNS on/off (optional boolean) }
+    if opts.serve ~= nil then
+        check_table(opts.serve, "node", "serve")
+        check_string(opts.serve.address, "node", "serve.address")
+        if opts.serve.announce ~= nil and type(opts.serve.announce) ~= "boolean" then
+            error(string.format(
+                "node(): field 'serve.announce' must be a boolean, got %s",
+                type(opts.serve.announce)), 2)
+        end
+    end
+
+    -- peers: array of peer references (shuttle://host[:port])
+    check_string_array(opts.peers, "node", "peers")
+
+    -- Unknown fields are rejected, not silently dropped (the app()
+    -- precedent): anything this schema doesn't know would otherwise
+    -- vanish between the DSL and the Rust eval boundary.
+    local known_fields = { name = true, serve = true, peers = true }
+    local unknown = {}
+    for k in pairs(opts) do
+        if not known_fields[k] then
+            table.insert(unknown, k)
+        end
+    end
+    table.sort(unknown)
+    if #unknown > 0 then
+        local list = {}
+        for _, k in ipairs(unknown) do
+            table.insert(list, string.format("'%s'", k))
+        end
+        error(string.format(
+            "node(): unknown field%s %s (valid fields: name, serve, peers)",
+            #unknown == 1 and "" or "s",
+            table.concat(list, ", ")
+        ), 2)
+    end
+
+    opts._node = true
+    return opts
+end
+
 --- Look up a snap in the package index and return a pin table.
 -- The index file (package-index.json) contains pre-resolved snap pins
 -- and source definitions for common snaps.

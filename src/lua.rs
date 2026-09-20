@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use miette::{IntoDiagnostic, WrapErr};
+use serde::{Deserialize, Serialize};
 
 use crate::analysis::Span;
 use crate::image::ImageDeclaration;
@@ -8,6 +9,109 @@ use crate::snap::{PackageInput, SnapMeta};
 
 /// Named outputs from a `shuttle.lua`, fully converted to owned Rust types.
 pub type Outputs = HashMap<String, SnapMeta>;
+
+// ── node {} declaration (ADR-0033 Decision 6) ──
+
+/// The serve address every default falls back to: loopback, because
+/// `/info` publishes the pod inventory to everyone who can reach the
+/// socket — binding wider is an explicit choice the operator types.
+pub const DEFAULT_SERVE_ADDRESS: &str = "127.0.0.1:7780";
+
+/// The `node {}` serving/pulling declaration, carried to Rust in the
+/// eval payload beside the snap outputs (`node` is a first-class field
+/// of the eval result, never a snap output). Absent `node {}` means
+/// zero behavior change: no sockets, no discovery, no new processes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeConfig {
+    /// The node's name on the network.
+    pub name: String,
+    /// Serving surface — what to bind and whether to announce.
+    pub serve: NodeServe,
+    /// Peer references (`shuttle://host[:port]`); the FIRST entry is
+    /// the origin peer — the default pull source, a hint, never a
+    /// privilege (ADR-0033 Decision 1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<String>,
+}
+
+/// The serving half of [`NodeConfig`]: an optional bind address
+/// (defaulting to [`DEFAULT_SERVE_ADDRESS`] — see
+/// [`NodeConfig::serve_address`]) and the mDNS announce switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeServe {
+    /// Bind address override; `None` = the loopback default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// Announce via mDNS (`_shuttle._tcp.local.`). Default off.
+    #[serde(default)]
+    pub announce: bool,
+}
+
+impl NodeConfig {
+    /// The effective serve address: the declared one, or the loopback
+    /// default when `node {}` declared no `serve.address`.
+    pub fn serve_address(&self) -> &str {
+        self.serve
+            .address
+            .as_deref()
+            .unwrap_or(DEFAULT_SERVE_ADDRESS)
+    }
+
+    /// Convert from an `mlua::Value` — the table `node()` returned
+    /// (marker-stamped). Follows the [`SnapMeta::from_lua_value`]
+    /// pattern: Lua validated at eval time, so errors here indicate
+    /// internal bugs or version mismatches, not user config errors.
+    pub fn from_lua_value(value: &mlua::Value) -> miette::Result<Self> {
+        let mlua::Value::Table(table) = value else {
+            return Err(miette::miette!(
+                "expected a table from node(), got {}",
+                value.type_name()
+            ));
+        };
+        let marked: mlua::Value = table.get(NODE_MARKER).unwrap_or(mlua::Value::Nil);
+        if marked != mlua::Value::Boolean(true) {
+            return Err(miette::miette!(
+                "table is not a node() declaration (missing marker)"
+            ));
+        }
+        let name: String = table
+            .get("name")
+            .map_err(|e| miette::miette!("node: field 'name': {e}"))?;
+        let serve = match table
+            .get::<mlua::Value>("serve")
+            .unwrap_or(mlua::Value::Nil)
+        {
+            mlua::Value::Nil => NodeServe {
+                address: None,
+                announce: false,
+            },
+            mlua::Value::Table(t) => NodeServe {
+                address: t.get("address").ok(),
+                announce: t.get("announce").unwrap_or(false),
+            },
+            other => {
+                return Err(miette::miette!(
+                    "node: field 'serve' must be a table, got {}",
+                    other.type_name()
+                ))
+            }
+        };
+        let peers: Vec<String> = table.get("peers").unwrap_or_default();
+        Ok(NodeConfig { name, serve, peers })
+    }
+}
+
+/// The field `node()` stamps on its validated table so the eval
+/// boundary can route the output to [`NodeConfig`] instead of the snap
+/// schema.
+const NODE_MARKER: &str = "_node";
+
+/// True when a worker-serialized output table carries the `node()`
+/// marker — checked on the raw JSON so non-node outputs (the common
+/// case) never pay for a Lua round-trip.
+fn is_node_output(json: &serde_json::Value) -> bool {
+    json.get(NODE_MARKER) == Some(&serde_json::Value::Bool(true))
+}
 
 /// Directory of the definition file a label points at, threaded into each
 /// output so build-time file references (hooks, icons) resolve relative to
@@ -43,6 +147,12 @@ pub fn evaluate_string(label: &str, source: &str) -> miette::Result<Outputs> {
     let lua = mlua::Lua::new();
     let mut outputs = Outputs::new();
     for (key, json) in &ok.outputs {
+        // A node{} declaration is node-serving config, not a snap
+        // output — the build path consumes neither it nor wants a skip
+        // warning for it (it rides the EvalOutput/CheckedEval path).
+        if is_node_output(json) {
+            continue;
+        }
         let value = json_to_lua(&lua, json)
             .map_err(|e| miette::miette!("{label}: output '{key}' conversion failed: {e}"))?;
         match SnapMeta::from_lua_value(&value) {
@@ -74,6 +184,10 @@ pub fn evaluate_file(path: &str) -> miette::Result<Outputs> {
 pub struct EvalOutput {
     pub outputs: Outputs,
     pub global_inputs: HashMap<String, PackageInput>,
+    /// The `node {}` declaration when the definition carried one
+    /// (ADR-0033 Decision 6) — `None` means the definition declares no
+    /// node and every sharing verb stays inert.
+    pub node: Option<NodeConfig>,
 }
 
 /// One validation/eval diagnostic with structured fields (ADR-0010 Decisions
@@ -127,6 +241,9 @@ impl CheckDiagnostic {
 pub struct CheckedEval {
     pub outputs: Outputs,
     pub global_inputs: HashMap<String, PackageInput>,
+    /// The `node {}` declaration when the definition carried one (the
+    /// first wins; later duplicates are diagnostics).
+    pub node: Option<NodeConfig>,
     pub diagnostics: Vec<CheckDiagnostic>,
     /// Set when the eval failed hard; `outputs`/`global_inputs` are then empty.
     pub error: Option<String>,
@@ -169,6 +286,7 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
         CheckedEval {
             outputs: Outputs::new(),
             global_inputs: HashMap::new(),
+            node: None,
             diagnostics,
             error: Some(error),
         }
@@ -195,7 +313,38 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
 
     let lua = mlua::Lua::new();
     let mut outputs = Outputs::new();
+    let mut node: Option<NodeConfig> = None;
     for (key, json) in &ok.outputs {
+        if is_node_output(json) {
+            let value = match json_to_lua(&lua, json) {
+                Ok(v) => v,
+                Err(e) => {
+                    return failed(
+                        diagnostics,
+                        format!("{label}: output '{key}' conversion failed: {e}"),
+                    )
+                }
+            };
+            match NodeConfig::from_lua_value(&value) {
+                Ok(cfg) => {
+                    if node.replace(cfg).is_some() {
+                        crate::output::warn(format!(
+                            "ignoring extra node declaration '{key}' from {label} — \
+                             a definition declares one node",
+                        ));
+                    }
+                }
+                Err(e) => diagnostics.push(CheckDiagnostic {
+                    label: label.to_string(),
+                    key: Some(key.clone()),
+                    expected: None,
+                    actual: None,
+                    message: format!("skipping node declaration '{key}' from {label}: {e}"),
+                    span: crate::analysis::locate_output_key(source, key),
+                }),
+            }
+            continue;
+        }
         let value = match json_to_lua(&lua, json) {
             Ok(v) => v,
             Err(e) => {
@@ -246,6 +395,7 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
     CheckedEval {
         outputs,
         global_inputs,
+        node,
         diagnostics,
         error: None,
     }
@@ -260,6 +410,7 @@ pub fn check_file_with_inputs(path: &str) -> CheckedEval {
         Err(e) => CheckedEval {
             outputs: Outputs::new(),
             global_inputs: HashMap::new(),
+            node: None,
             diagnostics: Vec::new(),
             error: Some(format!("could not read {path}: {e}")),
         },
@@ -280,6 +431,7 @@ pub fn evaluate_string_with_inputs(label: &str, source: &str) -> miette::Result<
     Ok(EvalOutput {
         outputs: checked.outputs,
         global_inputs: checked.global_inputs,
+        node: checked.node,
     })
 }
 
@@ -1083,5 +1235,137 @@ mod tests {
         // Bare labels (embedded definitions) carry no directory.
         assert_eq!(super::definition_dir_from_label("shuttle.lua"), None);
         assert_eq!(super::definition_dir_from_label("embedded:test"), None);
+    }
+
+    // ── node {} DSL validator (ADR-0033 Decision 6) ──
+
+    #[test]
+    fn test_node_valid_minimal() {
+        let result = eval_with_dsl(r#"return node { name = "devbox" }"#);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_node_valid_full_config() {
+        let result = eval_with_dsl(
+            r#"
+            return node {
+                name = "devbox",
+                serve = { address = "127.0.0.1:7780", announce = true },
+                peers = { "shuttle://nuci.local:7780" },
+            }
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_node_stamps_marker_for_rust_routing() {
+        let lua = with_dsl();
+        let value: Value = lua
+            .load(r#"return node { name = "devbox" }"#)
+            .eval()
+            .unwrap();
+        let cfg = super::NodeConfig::from_lua_value(&value).expect("marked table converts");
+        assert_eq!(cfg.name, "devbox");
+        assert!(!cfg.serve.announce);
+        assert!(cfg.peers.is_empty());
+        // Absent serve.address falls back to the loopback default.
+        assert_eq!(cfg.serve_address(), super::DEFAULT_SERVE_ADDRESS);
+    }
+
+    #[test]
+    fn test_node_absent_is_nothing() {
+        // A snap output is not a node declaration: the marker is what
+        // routes, and unmarked tables refuse.
+        let lua = with_dsl();
+        let value: Value = lua
+            .load(r#"return { name = "just-a-snap", version = "1.0" }"#)
+            .eval()
+            .unwrap();
+        assert!(super::NodeConfig::from_lua_value(&value).is_err());
+        assert!(!super::is_node_output(
+            &serde_json::json!({ "name": "x", "version": "1.0" })
+        ));
+    }
+
+    #[test]
+    fn test_node_missing_name() {
+        let result = eval_with_dsl(r#"return node { serve = { announce = true } }"#);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing required field 'name'"),
+            "error should mention missing name: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_node_name_must_be_string() {
+        let result = eval_with_dsl(r#"return node { name = 42 }"#);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("'name' must be a string"),
+            "error should name the field: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_node_serve_must_be_table() {
+        let result = eval_with_dsl(r#"return node { name = "x", serve = "0.0.0.0:1" }"#);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("'serve' must be a table"),
+            "error should name the field: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_node_serve_announce_must_be_boolean() {
+        let result = eval_with_dsl(
+            r#"return node { name = "x", serve = { address = "127.0.0.1:7780", announce = "yes" } }"#,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("'serve.announce' must be a boolean"),
+            "error should name the field: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_node_peers_must_be_string_array() {
+        let result =
+            eval_with_dsl(r#"return node { name = "x", peers = { "shuttle://a:1", 42 } }"#);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("peers[2] must be a string"),
+            "error should name the field and index: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_node_rejects_unknown_field() {
+        let result = eval_with_dsl(r#"return node { name = "x", role = "hub" }"#);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field 'role'"),
+            "error should name the unknown field: {}",
+            err
+        );
+        assert!(
+            err.contains("valid fields: name, serve, peers"),
+            "error should list the valid fields: {}",
+            err
+        );
     }
 }

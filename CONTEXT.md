@@ -53,6 +53,15 @@ _Avoid_: shoot distro, shuttle distro
 **Store**: The content-addressed, file-level repository of package content — local build cache (`~/.cache/shuttle/`) and on-device under the state partition. Packages are signed manifests of store file hashes, not monolithic blobs (ADR-0012).
 _Avoid_: cache, registry, spool
 
+**Node**: A shuttle instance configured for sharing via the `node {}` declaration in `shuttle.lua` (ADR-0033). A node serves its store (signed manifests + blobs) and pulls from peers. Absent `node {}`, a shuttle install is not a node and opens no sockets.
+_Avoid_: master, server, hub, seed
+
+**Peer**: Another shuttle node on the network — discovered via mDNS (`_shuttle._tcp`) on the LAN or addressed explicitly (`shuttle://host:port/<pkg>`). Discovery confers no trust; a peer's content is accepted only when its signed manifest verifies against the local trusted-key set (ADR-0024, ADR-0033). The first entry of `node {}.peers` is the *origin peer*: the default pull source, a hint like a git remote named `origin`, never a privilege.
+_Avoid_: master, remote, replica
+
+**Export tree**: The static, servable-by-any-web-server image of a shareable store — `index.json`, `manifests/<pkg>.json`, `blobs/<sha256>` — written by `shuttle export` and pulled via plain `http(s)://` references (ADR-0033 Decision 10). A frozen export tree is a cold peer: same manifests, same signatures, no announce.
+_Avoid_: mirror site, repo, download page
+
 **Generation**: A pinned selection of base-image version + package set + configuration that boots as one unit. Rollback means booting a previous generation; GC is rooted at generations (ADR-0012).
 _Avoid_: profile, snapshot, deployment
 
@@ -132,3 +141,7 @@ Per-snap inputs work the same way, declared inside a `snap()` table.
 **Dev**: What if I don't have a `shuttle.lua` at all?
 
 **Domain expert**: `shuttle build hello` auto-fetches the default input (`github:rbelem/shuttle/main`) on first run. It's cached in `~/.cache/shuttle/inputs/`. Run `shuttle index update` to refresh.
+
+**Dev**: My team builds the same packages on five machines. Do I need a registry to share them?
+
+**Domain expert**: No. Declare a `node {}` in each `shuttle.lua` and run `shuttle serve`. Peers find each other over mDNS on the LAN and pull verified store content directly. There is no master; a package is accepted only if its signed manifest verifies against your trusted keys.
