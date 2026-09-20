@@ -90,6 +90,39 @@ pub fn status(msg: impl std::fmt::Display) {
     }
 }
 
+// ── Untrusted-text sanitization ──
+
+/// Strip control characters from untrusted text before it reaches a
+/// log/status line. Terminal escapes (ANSI CSI via ESC, U+0000–U+001F
+/// and DEL) must not ride attacker-controlled fields — serve request
+/// paths, mDNS instance names — into the operator's terminal. Removing
+/// control characters defuses the escape sequences while leaving the
+/// rest of the text visible for debugging.
+pub fn strip_control_chars(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_characters_are_stripped_from_untrusted_text() {
+        // ANSI color escape: the ESC byte goes, the printable payload
+        // stays (visible for debugging, harmless to the terminal).
+        assert_eq!(
+            strip_control_chars("/\u{1b}[31mred\u{1b}[0m"),
+            "/[31mred[0m"
+        );
+        // DEL is stripped too.
+        assert_eq!(strip_control_chars("x\u{7f}y"), "xy");
+        // CR/LF injection in a request path is defused.
+        assert_eq!(strip_control_chars("/a\r\nGET /b"), "/aGET /b");
+        // Clean text passes through untouched.
+        assert_eq!(strip_control_chars("hello-world_2"), "hello-world_2");
+    }
+}
+
 // ── Progress bar helpers ──
 
 /// Create a spinner with the given message.

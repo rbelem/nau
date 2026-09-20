@@ -2233,7 +2233,7 @@ fn verify_against_anchors(
 
 /// The embedded-key-set directory beside a device anchor: for
 /// `/etc/shuttle/update-key.pub` that is `/etc/shuttle/trusted-keys/`.
-fn trusted_keys_dir(anchor: &Path) -> PathBuf {
+pub(crate) fn trusted_keys_dir(anchor: &Path) -> PathBuf {
     anchor
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -2243,7 +2243,9 @@ fn trusted_keys_dir(anchor: &Path) -> PathBuf {
 /// Read the device revocation list beside the anchor, unioned with the
 /// operator list under the keychain dir. A missing file is an empty list;
 /// the operator side is the local `revoked-keys` the key ceremony writes.
-fn embedded_revoked_keys(anchor: &Path, keys: &Path) -> miette::Result<Vec<String>> {
+/// Shared with the peer verify path (ADR-0033 Decision 7) so both lanes
+/// police the same unioned revocation set.
+pub(crate) fn embedded_revoked_keys(anchor: &Path, keys: &Path) -> miette::Result<Vec<String>> {
     let mut revoked = Vec::new();
     let device = anchor
         .parent()

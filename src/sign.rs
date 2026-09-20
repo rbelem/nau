@@ -520,23 +520,29 @@ impl Keychain {
         }
         paths.sort();
         for path in paths {
-            let text = std::fs::read_to_string(&path)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("reading {}", path.display()))?;
-            let public_hex = text
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
-                .ok_or_else(|| {
-                    miette::miette!("public key file {} carries no key material", path.display())
-                })?;
-            let public =
-                from_hex32(public_hex).wrap_err_with(|| format!("parsing {}", path.display()))?;
-            chain
-                .entries
-                .push((to_hex(&public)[..16].to_string(), public));
+            let (key_id, public) = parse_pub_file(&path)?;
+            chain.entries.push((key_id, public));
         }
         Ok(chain)
+    }
+
+    /// Load ONE public-key file as a trust anchor — the legacy
+    /// single-anchor shape (`/etc/shuttle/update-key.pub`) that predates
+    /// the trusted-keys directory. Anchor walkers treat `Err` as "no
+    /// legacy anchor here" (the runtime's best-effort fallback), so the
+    /// error is a miss, never a silent trust grant.
+    pub fn load_pub_file(path: &Path) -> miette::Result<Keychain> {
+        let (key_id, public) = parse_pub_file(path)?;
+        Ok(Keychain {
+            entries: vec![(key_id, public)],
+        })
+    }
+
+    /// Merge `other`'s anchors into `self`: the anchor walk verifies
+    /// over the UNION of the device image-baked set and the operator
+    /// keychain, so one merged chain feeds one strict verifier.
+    pub fn merge(&mut self, other: Keychain) {
+        self.entries.extend(other.entries);
     }
 
     /// True when no trust anchors are loaded — verification under an
@@ -557,6 +563,24 @@ impl Keychain {
     pub fn entries_for_verify(&self) -> Vec<(String, [u8; 32])> {
         self.entries.clone()
     }
+}
+
+/// Parse one public-key file (the two-line anchor format: an optional
+/// `untrusted comment:` line, then the 64-hex public key). The single
+/// parser behind [`Keychain::load_dir`] and [`Keychain::load_pub_file`].
+fn parse_pub_file(path: &Path) -> miette::Result<(String, [u8; 32])> {
+    let text = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading {}", path.display()))?;
+    let public_hex = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
+        .ok_or_else(|| {
+            miette::miette!("public key file {} carries no key material", path.display())
+        })?;
+    let public = from_hex32(public_hex).wrap_err_with(|| format!("parsing {}", path.display()))?;
+    Ok((to_hex(&public)[..16].to_string(), public))
 }
 
 /// Install a public key into `dir` as `<key-id>.pub` (the trust-anchor

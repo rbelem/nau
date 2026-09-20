@@ -14,7 +14,13 @@ after the post-implementation grill: minting points restated (Decision 2 —
 serve-request, export, and peer-ingest; build-time minting with real
 payload paths is a named follow-up), `serve` gains `--pod`, export pruning
 is gated by an ownership marker (Decision 10), and pull sweeps
-same-package older-revision inbox entries (Decision 5). Extends ADR-0012
+same-package older-revision inbox entries (Decision 5). Amended after the
+council review of the implementation: the peer verify path walks both
+anchor sources as one union (Decision 7), minting is consolidated to one
+implementation so serve and export emit byte-identical manifests
+(Decision 2), `/info` walks the same union as export (Decision 5), the
+staged-inbox "no consumer yet" deferral is named (Decision 5), and
+pin-binding on the peer lane is deferred (Decision 7). Extends ADR-0012
 (file-level content store), ADR-0010 (Luau language), ADR-0024 (key
 ceremony, trusted-key distribution), and ADR-0032 (declared pod services).
 Adjacent to ADR-0012 Decision 7 (distribution rides OCI registries):
@@ -81,7 +87,9 @@ suffices, plain HTTP allowed.
    (Decision 7), regardless of which node served it. "Master" survives only
    as the *origin peer* — the first entry in `node {}.peers`, a default pull
    source exactly like a git remote named `origin`: a hint, never a
-   privilege. The word *master* is avoided in code, docs, and CLI
+   privilege. The consumer of that hint — default pull-source resolution
+   reading `node {}.peers` — is a follow-up; the field is inert
+   configuration today. The word *master* is avoided in code, docs, and CLI
    (CONTEXT.md: Node, Peer).
 
 2. **The signed PackageManifest is the one new artifact, defined here.**
@@ -161,7 +169,14 @@ suffices, plain HTTP allowed.
    cross-package orphans remain until the GC-extension revisit trigger
    fires — GC stays generation-rooted per ADR-0012); installation is the
    existing pod workflow, not a pull side effect (a deliberate contrast
-   with `pull --install`). Persistence is not a shuttle verb: keeping
+   with `pull --install`). **Staging has no consumer yet, stated
+   plainly**: install-from-inbox does not exist — pod verbs cannot
+   install peer-staged third-party content, so a staged manifest sits in
+   the inbox (visible to `/info`, `serve`, and `export`) and nowhere
+   else. That is a named deferral, not a completed story: the
+   install-from-inbox surface — e.g. `pod add --from-inbox` — must be
+   designed before the fleet story is complete (Revisit triggers).
+   Persistence is not a shuttle verb: keeping
    `serve` running is a declared pod service (`services = { … }` running
    `shuttle serve`), riding the ADR-0032 emitter machinery — declarative,
    never verb-managed, no built-in daemonization. Serving the **system**
@@ -197,19 +212,25 @@ suffices, plain HTTP allowed.
 7. **Verification: fail-closed, strict-set, downgrade-refusing — a
    tightening of today's path.** Peer pull uses `verify_trust_set`
    semantics (revoked-first; the ANY-anchor `verify_keychain` is never
-   acceptable on the peer path), consulting the anchor sources the runtime
-   already consults: the device image-baked set (`/etc/shuttle/trusted-keys`
-   + `revoked-keys`, ADR-0024) and the operator keychain
-   (`~/.config/shuttle/keys/`). An unverified manifest is refused and named,
+   acceptable on the peer path alone), walking the SAME anchor sources
+   the runtime already walks, as one union: the device image-baked set
+   (`/etc/shuttle/trusted-keys` + `revoked-keys`, ADR-0024) AND the
+   operator keychain (`~/.config/shuttle/keys/`) — both key sets are
+   consulted and both revocation lists are checked, so a key revoked on
+   the device image is refused even while the operator keychain still
+   carries it. An unverified manifest is refused and named,
    never provisionally accepted, never TOFU. **This is stricter than both
    existing precedents** — the OCI path verifies self-consistency (opt-in
    `--expect`), and the runtime install path is fail-open on unsigned
    manifests today. The tightening is peer-lane-only in v1; extending
    fail-closed verification to the runtime install path is a recorded
-   revisit trigger, not a silent scope grab. **Freshness**: a manifest whose
-   revision is older than the installed one for that name is refused unless
-   `--allow-downgrade` is explicit; where `shuttle.lock` pins exist, they
-   bind, per the `pull --install` precedent.
+   revisit trigger, not a silent scope grab. **Freshness**: a manifest
+   whose revision is older than the newest the pod holds for that name is
+   refused unless `--allow-downgrade` is explicit; the gate reads the max
+   of the installed revision and any staged inbox revision, so a newer
+   staged entry blocks an older incoming one. `shuttle.lock` pins do NOT
+   bind on the peer lane — pin-binding is deferred until PackageManifest
+   carries a store pin; revisit with build-time minting.
 
    Anchor distribution is out-of-band, full stop: the key ceremony has no
    distribute verb today (`shuttle key` = keygen/rotate/promote/revoke/
@@ -380,6 +401,10 @@ set means one compromised builder key can sign any package name.
 - `serve` exposed beyond the LAN → rate limiting and abuse posture.
 - A fleet genuinely wants push semantics (C2-style distribution) → re-open
   the hub-role alternative with the push-target obligations spelled out.
+- Staged inbox content has no consumer: install-from-inbox does not exist
+  and pod verbs cannot install peer-staged third-party content → design
+  the install-from-inbox surface (e.g. `pod add --from-inbox`) before the
+  fleet story is complete (Decision 5).
 
 ## Evidence
 

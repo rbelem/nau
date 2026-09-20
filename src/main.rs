@@ -3758,7 +3758,11 @@ fn cmd_peers(secs: u64) -> miette::Result<()> {
         );
     } else {
         for peer in &peers {
-            shuttle::output::status(format!("{:<24} {}:{}", peer.name, peer.host, peer.port));
+            // Instance names arrive off the LAN unauthenticated: strip
+            // control characters (terminal escapes) before the name
+            // reaches the operator's terminal.
+            let name = shuttle::output::strip_control_chars(&peer.name);
+            shuttle::output::status(format!("{:<24} {}:{}", name, peer.host, peer.port));
         }
         shuttle::output::ok(format!("{} peer(s) found", peers.len()));
     }
