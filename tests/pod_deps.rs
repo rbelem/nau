@@ -38,6 +38,21 @@ fn chain_available(extra: &[&str]) -> bool {
         .all(|t| has_tool(t))
 }
 
+/// The go closure tests build through the bwrap sandbox, so host `go`
+/// must also be sandbox-visible: a `go` resolving only from an unbound
+/// PATH entry (e.g. a shuttle pod bin dir) fails the build pre-flight
+/// by design. Skip instead of run-to-fail, using the same resolution
+/// rules as the pre-flight itself.
+fn go_sandbox_visible() -> bool {
+    let path = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    let visible = shuttle::snap::sandbox_visible_entries(&entries);
+    shuttle::snap::resolve_in_path("go", &visible).is_some()
+}
+
 macro_rules! gated_test {
     ($fn_name:ident, $extra:expr, $($body:tt)*) => {
         #[test]
@@ -1523,6 +1538,10 @@ fn write_go_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16)
 // ── Acceptance: go closure fetch → offline build → farm executes ──
 
 gated_test!(go_deps_fetch_build_and_farm_executes, &["go"], {
+    if !go_sandbox_visible() {
+        eprintln!("skipping: host go is not sandbox-visible (unbound PATH entry)");
+        return;
+    }
     let project = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let server = tempfile::tempdir().unwrap();
@@ -1566,6 +1585,10 @@ gated_test!(go_deps_fetch_build_and_farm_executes, &["go"], {
 // ── A tampered go closure fails the build (hash mismatch) ──
 
 gated_test!(tampered_go_closure_fails_build, &["go"], {
+    if !go_sandbox_visible() {
+        eprintln!("skipping: host go is not sandbox-visible (unbound PATH entry)");
+        return;
+    }
     let project = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let server = tempfile::tempdir().unwrap();
@@ -1604,6 +1627,10 @@ gated_test!(tampered_go_closure_fails_build, &["go"], {
 // ── A changed go.sum moves the deps_hash (cache invalidation) ──
 
 gated_test!(go_sum_change_moves_the_deps_hash, &["go"], {
+    if !go_sandbox_visible() {
+        eprintln!("skipping: host go is not sandbox-visible (unbound PATH entry)");
+        return;
+    }
     let project = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let server = tempfile::tempdir().unwrap();
