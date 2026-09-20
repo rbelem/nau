@@ -311,7 +311,12 @@ only warn about; service secrets have no declared surface yet — until
 one lands, credentials reach daemons the way they did under
 process-compose (host-managed env), not through the declaration; "stop a
 service temporarily" is overruled by the next reconcile unless the
-declaration says `enabled = false` — the Nix trade, accepted; duplicate
+declaration says `enabled = false` — the Nix trade, accepted; the
+classifier compares APPLIED state, not live manager state, so ad-hoc
+`systemctl --user stop`/`disable` drift is detected only when a hash
+next moves — an accepted trade (issue #109 N14), since the converge on
+the next sync is cheap while a live manager-state probe would tax every
+sync; duplicate
 services across pods remain the user's option discipline until a dedup
 requirement re-opens the registry question.
 
