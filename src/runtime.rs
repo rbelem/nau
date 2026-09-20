@@ -378,6 +378,10 @@ pub struct RuntimeTools {
     pub systemd_sysext: Option<PathBuf>,
     pub systemctl: Option<PathBuf>,
     pub bootctl: Option<PathBuf>,
+    /// `loginctl` — the user-session probe behind the Decision 8 linger
+    /// warning. Resolved from the host PATH like the rest, so the probe
+    /// rides the same seam (`SHUTTLE_POD_TOOLS=absent` silences it).
+    pub loginctl: Option<PathBuf>,
 }
 
 impl RuntimeTools {
@@ -388,6 +392,7 @@ impl RuntimeTools {
             systemd_sysext: find_on_path("systemd-sysext"),
             systemctl: find_on_path("systemctl"),
             bootctl: find_on_path("bootctl"),
+            loginctl: find_on_path("loginctl"),
         }
     }
 
@@ -2721,6 +2726,7 @@ plugs:
             systemd_sysext: Some(fake_tool(work, "fake-sysext", &sysext_marker)),
             systemctl: Some(fake_tool(work, "fake-systemctl", &systemctl_marker)),
             bootctl: None,
+            loginctl: None,
         })
     }
 
@@ -3431,6 +3437,7 @@ plugs:
             systemd_sysext: Some(PathBuf::from("/fake/systemd-sysext")),
             systemctl: Some(PathBuf::from("/fake/systemctl")),
             bootctl: Some(PathBuf::from("/fake/bootctl")),
+            loginctl: None,
         }
         .without_systemd();
         assert_eq!(tools.unsquashfs, Some(PathBuf::from("/fake/unsquashfs")));

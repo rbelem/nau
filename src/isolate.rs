@@ -219,6 +219,27 @@ impl SourceResolver {
     /// Resolve a module name to source content, enforcing the allowlist.
     /// Errors are strings because they cross the pipe as JSON.
     pub fn resolve(&self, name: &str) -> Result<String, String> {
+        match self.lookup(name) {
+            Ok(src) => Ok(src),
+            // ADR-0032 spelling: `require("pkgs.lib.daemon")` names the
+            // module an allowlisted `pkgs/` root serves as `lib.daemon`
+            // (the root IS the pkgs dir; the unaliased dotted spelling
+            // would double it to pkgs/pkgs/lib/…). Aliased as a FALLBACK
+            // only, so entry-relative roots that really do contain a
+            // `pkgs/` subtree keep resolving first (issue #109).
+            Err(e) if name.starts_with("pkgs.") => {
+                let alias = name.strip_prefix("pkgs.").unwrap_or(name);
+                self.lookup(alias).map_err(|_| e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The allowlist-enforcing lookup proper: every check on `name`
+    /// (size, absolute, traversal, dot-to-slash synthesis) applies to
+    /// the aliased spelling too, because [`Self::resolve`] delegates
+    /// here.
+    fn lookup(&self, name: &str) -> Result<String, String> {
         if name.is_empty() {
             return Err("resolver: rejected empty module name".into());
         }
@@ -1411,6 +1432,34 @@ mod tests {
         let err = resolver.resolve("../escape").unwrap_err();
         assert!(err.contains("rejected"), "got: {err}");
         assert!(resolver.resolve("a/../../b").is_err());
+    }
+
+    #[test]
+    fn test_resolver_aliases_the_adr_pkgs_prefix() {
+        // Issue #109: the ADR-0032 spelling `require("pkgs.lib.daemon")`
+        // must resolve against an allowlisted pkgs root (which IS the
+        // pkgs dir) instead of doubling to pkgs/pkgs/lib/…, as a
+        // FALLBACK behind the unaliased spelling.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+        std::fs::write(dir.path().join("lib/daemon.lua"), "return 'aliased'").unwrap();
+        let resolver = resolver_with_root(dir.path());
+        assert!(resolver.resolve("lib.daemon").is_ok());
+        assert_eq!(
+            resolver.resolve("pkgs.lib.daemon").unwrap(),
+            "return 'aliased'"
+        );
+        // A real pkgs/pkgs/… subtree under the root wins over the alias.
+        std::fs::create_dir_all(dir.path().join("pkgs/lib")).unwrap();
+        std::fs::write(dir.path().join("pkgs/lib/daemon.lua"), "return 'direct'").unwrap();
+        assert_eq!(
+            resolver.resolve("pkgs.lib.daemon").unwrap(),
+            "return 'direct'"
+        );
+        // The alias cannot conjure files that do not exist, and the
+        // safety checks apply to the aliased spelling too.
+        assert!(resolver.resolve("pkgs.lib.nope").is_err());
+        assert!(resolver.resolve("pkgs...").is_err());
     }
 
     #[test]

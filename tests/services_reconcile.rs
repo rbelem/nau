@@ -100,6 +100,7 @@ fn service_unit(name: &str, enabled: bool, hash: &str, args: &[&str]) -> Service
         enabled,
         exec: "current/valkey".into(),
         args: args.iter().map(|s| s.to_string()).collect(),
+        options: Default::default(),
         environment: Default::default(),
         after: vec![],
         text: format!(
@@ -585,6 +586,75 @@ fn absent_tools_skip_bus_steps_but_files_still_reconcile() {
     assert!(link_target.to_string_lossy().contains("generations/1"));
 }
 
+// N8: an explicit SHUTTLE_SERVICE_BACKEND=launchd|portable must no-op
+// the service emit like the reconcile tail does (named skip, verb
+// succeeds) — while an unknown value still fails the verb.
+#[test]
+fn known_non_systemd_backend_noops_the_services_tail() {
+    let rig = RollbackRig::new();
+    let pod = rig.pod("alpha");
+    let gen1 = service_unit("valkey", true, "hash-a", &["--port", "6379"]);
+    seed_generation(&pod, 1, &[gen1]);
+    seed_generation(&pod, 2, &[]);
+    set_active(&pod, 2);
+    seed_state(&pod, &[("valkey", "hash-a", false)]);
+
+    let run_with_backend = |backend: &str| {
+        // Reset the flip state: the previous run may have rolled back to
+        // gen 1 already. Point active back at gen 2 with a matching
+        // applied record so each run performs a real flip.
+        set_active(&pod, 2);
+        seed_state(&pod, &[("valkey", "hash-a", false)]);
+        // The shim dir as the ONLY PATH entry (the rig pattern): the
+        // rollback path must never reach the host's real bus tools.
+        let tools_bin = tools_bin_with(rig.markers.path());
+        let _ = std::fs::remove_file(argv_path(rig.markers.path()));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+        cmd.args(["pod", "--name", "alpha", "rollback", "1", "--root"])
+            .arg(rig.root.path())
+            .current_dir(rig.root.path());
+        cmd.env("SHUTTLE_SYSTEMD", "on");
+        cmd.env("SHUTTLE_POD_TOOLS", "");
+        cmd.env("SHUTTLE_SERVICE_BACKEND", backend);
+        cmd.env("XDG_CONFIG_HOME", rig.config_home());
+        cmd.env("PATH", &tools_bin);
+        let out = cmd.output().unwrap();
+        (
+            out.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+
+    // launchd: the known non-systemd backend is a NAMED no-op — the
+    // verb (rollback) succeeds, the link set still flips (files are
+    // pod truth), and the skip is named, never silent.
+    let (code, combined) = run_with_backend("launchd");
+    assert_eq!(
+        code,
+        Some(0),
+        "a known non-systemd backend must not fail the verb: {combined}"
+    );
+    assert!(
+        combined.contains("services: skipped") && combined.contains("launchd"),
+        "the no-op must be named: {combined}"
+    );
+    let (code, combined) = run_with_backend("portable");
+    assert_eq!(code, Some(0), "portable must no-op too: {combined}");
+    assert!(combined.contains("portable"), "{combined}");
+
+    // An unknown override value still fails the verb (fail-closed).
+    let (code, combined) = run_with_backend("openrc");
+    assert_ne!(code, Some(0), "unknown backend must fail: {combined}");
+    assert!(
+        combined.contains("SHUTTLE_SERVICE_BACKEND"),
+        "the failure names the override: {combined}"
+    );
+}
+
 // Two-phase convergence: a reconcile that SKIPPED its bus steps (no
 // systemctl) must not poison the state — the next run with tools
 // re-plans the unapplied entry and converges with enable --now.
@@ -656,6 +726,12 @@ fn cross_pod_same_endpoint_collides_without_bus_calls() {
     assert!(
         stderr.contains("Decision 9") && stderr.contains("enabled = false"),
         "the error carries the resolution: {stderr}"
+    );
+    // N10: the flip already happened when the scan runs — the error
+    // must say so and promise the converging re-sync.
+    assert!(
+        stderr.contains("flip already happened") && stderr.contains("re-sync"),
+        "the error names the post-flip state and the convergence: {stderr}"
     );
     // The collision is a compare-first hard error: no SERVICE
     // registration call happens (the store's own activation reload is
