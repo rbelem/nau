@@ -34,10 +34,11 @@
 -- entries exec the pool node runtime. build_deps: (none) — relayout
 -- only.
 --
--- sha256 note: the flake's npmDistHash SRI does NOT match the bytes
--- registry.npmjs.org serves today (both decode to a
--- d184ba26…d8d5071… prefix; the tails diverge). The hex below pins the
--- tarball as currently served, cross-checked by curl + sha256sum.
+-- sha256 note: the hex below was verified against the devbox-global
+-- flake's npmDistHash — the flake's SRI
+-- (sha256-0YS6Jl/wLdq1PyEkA1zVcqCLetjVBxjO/2IMRmNOcDI=) decodes to
+-- d184ba26…7032, byte-identical to the tarball served by
+-- registry.npmjs.org: both pins carry the same bytes.
 --
 -- require note: `lib/daemon` is the analyzer-resolvable spelling of
 -- the shared service() constructor (see valkey's header).
