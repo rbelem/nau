@@ -4,6 +4,9 @@
 
 Accepted (2026-09-14). Resolves the one code-level cutover blocker left by the
 #29 T13 audit (§5.7 of `docs/t13-cutover-checklist.md`). Grounded in issue #89.
+Amended 2026-09-19 by ADR-0034 (issue #110): the shellenv
+`LD_LIBRARY_PATH` transport is superseded by emit-time per-app LD
+wrappers; the three hard requirements below carry over.
 
 ## Context
 

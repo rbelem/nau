@@ -45,13 +45,24 @@
 //! the dynamic loader path. The emit records the generation's loader
 //! lib dirs into `generations/<n>/loader-libs` (higher composition
 //! layer first, so an overlay's library shadows a loaded pod's on the
-//! first-match loader search); `pod::shellenv` (issue #47) turns that
-//! list into `LD_LIBRARY_PATH` exports whose entries thread through the
-//! pod's `current` link (`<pod>/current/../extensions/...`), so the
-//! link flip re-scopes every entry atomically on rollback — a dead
-//! generation's lib dirs become unreachable through the seam without
-//! re-eval, nothing leaks across pods, and nothing is written outside
-//! the pod's own state.
+//! first-match loader search).
+//!
+//! Issue #110: the transport for that seam moved from the shell env
+//! into the emit (ADR-0034, amending ADR-0028). Exporting
+//! `LD_LIBRARY_PATH` from `pod shellenv` injected the pod's extension
+//! libraries into EVERY child of the hosting shell — host curl lost TLS
+//! verification to the pod's libcurl, a nix git-remote-https failed cert
+//! checks the same way, node hit sqlite symbol mismatches. The emit now
+//! writes a per-app LD wrapper into `generations/<n>/ld-wrappers/<app>`
+//! for every app of a package that ships loader-lib dirs: a two-line sh
+//! script that sets `LD_LIBRARY_PATH` to the generation's recorded dirs
+//! (resolved generation-relative through the wrapper's own location, so
+//! the rollback flip re-scopes it atomically exactly like the old env
+//! entries) and execs the real binary at its normal target — the
+//! assembly leaf, the confined launcher, or the store blob. SET, never
+//! compose-prepend: pod processes see pod libraries, and the ambient
+//! environment stays clean. `shuttle run` keeps its own pod-scoped
+//! overlay for the arbitrary-command form.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -73,6 +84,16 @@ pub const CURRENT_LINK: &str = "current";
 /// farm itself stays a flat directory of direct tool links) and inside
 /// the generation dir, so `current` swaps it atomically on rollback.
 pub const ASSEMBLY_DIR: &str = "apps";
+
+/// The per-generation LD-wrapper area (issue #110, ADR-0034):
+/// `generations/<n>/ld-wrappers/<app>`. For every app of a package that
+/// ships loader-lib dirs, the emit writes a two-line sh script that
+/// sets `LD_LIBRARY_PATH` to the generation's recorded dirs (resolved
+/// generation-relative through the wrapper's own location) and execs
+/// the app's normal entry target. The farm entry for such an app points
+/// here instead of at the binary, so the pod's libraries ride only the
+/// processes the pod launches — never the ambient shell (#110).
+pub const LD_WRAPPERS_DIR: &str = "ld-wrappers";
 
 /// The generation's recorded loader-lib dirs (issue #89):
 /// `generations/<n>/loader-libs` — one generation-relative directory per
@@ -309,6 +330,25 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
     std::fs::create_dir_all(&farm)
         .map_err(|e| miette::miette!("creating farm {}: {e}", farm.display()))?;
     reset_assembly(store, gen.n)?;
+    reset_ld_wrappers(store, gen.n)?;
+    // Issue #110 (ADR-0034): the generation's loader-lib dirs, rendered
+    // as wrapper-relative `$d/../…` paths once — every LD wrapper for
+    // this generation embeds the same list, in the record's layer-first
+    // order. The shellenv export this replaces carried exactly the same
+    // list and leaked it into every child of the hosting shell.
+    let libs = loader_lib_dirs(store, gen);
+    let lib_list = libs
+        .iter()
+        .map(|rel| format!("$d/../{rel}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    // ADR-0028 semantics, verbatim: when the generation ships ANY
+    // loader-lib dirs, every farm app gets the full layer-first list —
+    // a binary's libs live in its requires closure's extension dirs
+    // (git's libcurl under extensions/curl/...), not its own, and the
+    // old shellenv export made no per-package distinction either. A
+    // lib-less generation wraps nothing.
+    let ships_libs = !libs.is_empty();
     let mut seen: std::collections::BTreeMap<&str, (&str, ClaimLayer)> = Default::default();
     for pkg in layered_packages(gen) {
         for (app, hash) in &pkg.apps {
@@ -326,7 +366,12 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
             // Same-content collisions leave identical links; differing
             // content must not accumulate — replace, never merge.
             let _ = std::fs::remove_file(&link);
-            let target = entry_target_rel(store, gen.n, pkg, app, hash)?;
+            let target = if ships_libs {
+                let real = entry_target_rel(store, gen.n, pkg, app, hash)?;
+                write_ld_wrapper(store, gen.n, app, &real, &lib_list)?
+            } else {
+                entry_target_rel(store, gen.n, pkg, app, hash)?
+            };
             std::os::unix::fs::symlink(&target, &link)
                 .map_err(|e| miette::miette!("linking {} -> {}: {e}", link.display(), target))?;
         }
@@ -346,7 +391,12 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
             seen.insert(svc, (&pkg.name, pkg.layer));
             let link = farm.join(svc);
             let _ = std::fs::remove_file(&link);
-            let target = entry_target_rel(store, gen.n, pkg, svc, hash)?;
+            let target = if ships_libs {
+                let real = entry_target_rel(store, gen.n, pkg, svc, hash)?;
+                write_ld_wrapper(store, gen.n, svc, &real, &lib_list)?
+            } else {
+                entry_target_rel(store, gen.n, pkg, svc, hash)?
+            };
             std::os::unix::fs::symlink(&target, &link)
                 .map_err(|e| miette::miette!("linking {} -> {}: {e}", link.display(), target))?;
         }
@@ -365,7 +415,8 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
     // without any declaration context.
     crate::services::emit(store, gen)?;
     // And the loader-lib list (issue #89): the generation's payload lib
-    // dirs, recorded for the shellenv's LD_LIBRARY_PATH seam. The file
+    // dirs, consumed by the LD wrappers written above (issue #110,
+    // ADR-0034) and by `shuttle run`'s pod-scoped env overlay. The file
     // lives inside the generation, so rollback and GC scope it exactly
     // like the farm and launchers.
     record_loader_libs(store, gen)?;
@@ -381,6 +432,58 @@ fn reset_assembly(store: &RuntimeStore, n: u64) -> miette::Result<()> {
             .map_err(|e| miette::miette!("clearing stale assembly {}: {e}", dir.display()))?;
     }
     Ok(())
+}
+
+/// Path of generation `n`'s LD-wrapper area (issue #110):
+/// `generations/<n>/ld-wrappers`.
+fn ld_wrappers_dir(store: &RuntimeStore, n: u64) -> PathBuf {
+    store.generation_dir(n).join(LD_WRAPPERS_DIR)
+}
+
+/// Clear and recreate the LD-wrapper area. Runs on every emit — the
+/// same full-rebuild rule as [`reset_assembly`], so a generation that
+/// lost its lib payloads (or an older emit's wrappers for renamed
+/// apps) never leaves stale wrappers behind.
+fn reset_ld_wrappers(store: &RuntimeStore, n: u64) -> miette::Result<()> {
+    let dir = ld_wrappers_dir(store, n);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| miette::miette!("clearing stale ld-wrappers {}: {e}", dir.display()))?;
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| miette::miette!("creating ld-wrappers {}: {e}", dir.display()))
+}
+
+/// Write one app's LD wrapper (issue #110, ADR-0034) and return the
+/// farm-relative symlink target for it. The script resolves its own
+/// location (the wrapper file under `generations/<n>/ld-wrappers/`),
+/// sets `LD_LIBRARY_PATH` to the generation's recorded loader-lib dirs
+/// resolved generation-relative (`$d/../extensions/...` — the same
+/// through-the-generation trick the shellenv entries used, so the
+/// `current` flip re-scopes it atomically on rollback), and execs the
+/// app's normal entry target. Every path in the script is prefixed with
+/// the resolved `$d` — relative targets would resolve against the
+/// caller's CWD, not the script's, and break from any other directory.
+/// SET, never compose-prepend: the pod's libraries ride only this
+/// process, and whatever ambient `LD_LIBRARY_PATH` the caller carried
+/// stops at the wrapper (#110).
+fn write_ld_wrapper(
+    store: &RuntimeStore,
+    n: u64,
+    app: &str,
+    real_target: &str,
+    lib_list: &str,
+) -> miette::Result<String> {
+    let path = ld_wrappers_dir(store, n).join(app);
+    let body = format!(
+        "#!/bin/sh\nd=$(dirname \"$(readlink -f \"$0\")\")\nLD_LIBRARY_PATH=\"{lib_list}\" exec \"$d/../farm/{real_target}\" \"$@\"\n"
+    );
+    std::fs::write(&path, &body)
+        .map_err(|e| miette::miette!("writing ld-wrapper {}: {e}", path.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| miette::miette!("chmod {}: {e}", path.display()))?;
+    Ok(format!("../{LD_WRAPPERS_DIR}/{app}"))
 }
 
 /// The relative symlink target for one farm entry, building the
@@ -595,6 +698,7 @@ mod tests {
                     .iter()
                     .map(|(a, h)| (a.to_string(), h.to_string()))
                     .collect(),
+                requires: Vec::new(),
                 assembly: BTreeMap::new(),
                 desktops: BTreeMap::new(),
                 fonts: BTreeMap::new(),
@@ -637,6 +741,7 @@ mod tests {
                     .iter()
                     .map(|(a, h)| (a.to_string(), h.to_string()))
                     .collect(),
+                requires: Vec::new(),
                 launchers: launchers
                     .iter()
                     .map(|(a, h)| (a.to_string(), h.to_string()))
@@ -728,6 +833,7 @@ mod tests {
             units: vec![],
             layer: ClaimLayer::Own,
             apps: BTreeMap::new(),
+            requires: Vec::new(),
             launchers: BTreeMap::new(),
             assembly: BTreeMap::new(),
             confined: None,
@@ -831,6 +937,7 @@ mod tests {
                     .iter()
                     .map(|(a, h)| (a.to_string(), h.to_string()))
                     .collect(),
+                requires: Vec::new(),
                 launchers: BTreeMap::new(),
                 confined: None,
                 app_confined: BTreeMap::new(),
@@ -990,6 +1097,7 @@ mod tests {
                 apps: [(app.to_string(), bin_hash.to_string())]
                     .into_iter()
                     .collect(),
+                requires: Vec::new(),
                 launchers: BTreeMap::new(),
                 assembly: [(app.to_string(), asm)].into_iter().collect(),
                 confined: None,
@@ -1196,6 +1304,95 @@ mod tests {
 
     // ── Issue #89: the generation's loader-lib list ──
 
+    #[test]
+    fn emit_wraps_every_app_when_the_generation_ships_loader_libs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        materialize_ext_dir(&store, 1, "gitlike", "usr/usr/lib");
+        // The list is generation-wide (ADR-0028's export scope): a
+        // binary's libs sit in its requires closure's dirs — git's
+        // libcurl under extensions/curl/... — so even a package with no
+        // dirs of its own wraps when the generation carries libs.
+        let mut gitlike_apps = BTreeMap::new();
+        gitlike_apps.insert("git".to_string(), "hash-git".to_string());
+        let mut gitlike_svcs = BTreeMap::new();
+        gitlike_svcs.insert("gitd".to_string(), "hash-gitd".to_string());
+        let mut bare_apps = BTreeMap::new();
+        bare_apps.insert("fzf".to_string(), "hash-fzf".to_string());
+        let mut packages = BTreeMap::new();
+        for (name, apps, svcs) in [
+            ("gitlike", gitlike_apps, gitlike_svcs),
+            ("bare", bare_apps, BTreeMap::new()),
+        ] {
+            let mut pkg = gen_with_layered_pkgs(1, &[(name, ClaimLayer::Own)])
+                .packages
+                .remove(name)
+                .unwrap();
+            pkg.apps = apps;
+            pkg.service_bins = svcs;
+            packages.insert(name.to_string(), pkg);
+        }
+        let gen = Generation {
+            packages,
+            ..gen_with_layered_pkgs(1, &[])
+        };
+        emit(&store, &gen).unwrap();
+
+        // App + service bin entries point at LD wrappers.
+        let git_link = std::fs::read_link(store.generation_dir(1).join("farm/git")).unwrap();
+        assert_eq!(
+            git_link.to_string_lossy(),
+            "../ld-wrappers/git",
+            "a libs-carrying generation wraps its apps"
+        );
+        let gitd_link = std::fs::read_link(store.generation_dir(1).join("farm/gitd")).unwrap();
+        assert_eq!(gitd_link.to_string_lossy(), "../ld-wrappers/gitd");
+
+        // The wrapper sets the loader libs generation-relative (the full
+        // layer-first list) and execs the app's normal store target.
+        let wrapper = std::fs::read_to_string(ld_wrappers_dir(&store, 1).join("git")).unwrap();
+        assert!(
+            wrapper.contains("$d/../extensions/gitlike/usr/usr/lib"),
+            "wrapper must carry the recorded dirs: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("$d/../farm/../../../store/ha/hash-git"),
+            "wrapper must exec the real store blob, anchored at its own dir: {wrapper}"
+        );
+        assert!(wrapper.starts_with("#!/bin/sh"));
+
+        // The statically-linked app is wrapped too — same rule, same
+        // list, exactly like the old shellenv export.
+        let fzf_link = std::fs::read_link(store.generation_dir(1).join("farm/fzf")).unwrap();
+        assert_eq!(fzf_link.to_string_lossy(), "../ld-wrappers/fzf");
+        assert!(ld_wrappers_dir(&store, 1).join("fzf").exists());
+    }
+
+    #[test]
+    fn reemit_withdraws_stale_ld_wrappers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        materialize_ext_dir(&store, 1, "tmux-deps", "usr/usr/lib");
+        let mut with = gen_with_layered_pkgs(1, &[("tmux-deps", ClaimLayer::Loaded)]);
+        with.packages
+            .get_mut("tmux-deps")
+            .unwrap()
+            .apps
+            .insert("tmux".to_string(), "hash-tmux".to_string());
+        emit(&store, &with).unwrap();
+        assert!(ld_wrappers_dir(&store, 1).join("tmux").exists());
+
+        // The rollback target re-emits without the lib package: the
+        // wrapper area is emptied and the farm entry goes direct.
+        let without = gen_with_layered_pkgs(1, &[]);
+        emit(&store, &without).unwrap();
+        let wrappers = ld_wrappers_dir(&store, 1);
+        assert!(
+            wrappers.read_dir().unwrap().next().is_none(),
+            "re-emit must withdraw stale wrappers"
+        );
+    }
+
     /// A generation fixture with packages at explicit layers; the test
     /// materializes the extension lib dirs the emit stats.
     fn gen_with_layered_pkgs(n: u64, pkgs: &[(&str, ClaimLayer)]) -> Generation {
@@ -1212,6 +1409,7 @@ mod tests {
                     units: vec![],
                     layer: *layer,
                     apps: BTreeMap::new(),
+                    requires: Vec::new(),
                     launchers: BTreeMap::new(),
                     assembly: BTreeMap::new(),
                     confined: None,

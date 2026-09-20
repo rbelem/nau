@@ -362,6 +362,8 @@ pub struct PayloadSnap {
     #[serde(rename = "type", default)]
     pub snap_type: Option<String>,
     #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
     pub confinement: Option<String>,
     /// The snap-level icon target inside the payload (e.g.
     /// `meta/gui/icon.png`) — the icon the desktop launcher links

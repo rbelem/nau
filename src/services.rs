@@ -1606,6 +1606,7 @@ mod tests {
             units: vec![],
             layer: ClaimLayer::Own,
             apps: BTreeMap::new(),
+            requires: Vec::new(),
             launchers: BTreeMap::new(),
             assembly: BTreeMap::new(),
             confined: None,

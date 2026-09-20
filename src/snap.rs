@@ -353,8 +353,12 @@ pub struct SnapMeta {
     #[serde(skip)]
     pub aliases: Vec<String>,
 
-    /// Build/runtime dependencies. Skipped in YAML — build metadata only.
-    #[serde(skip)]
+    /// Build/runtime dependencies. Serialized into `meta/snap.yaml`
+    /// (issue #110/ADR-0034): the runtime emitter records it on the
+    /// installed package so the farm emit can tell libs-carrying
+    /// packages (requires beyond the glibc family) from self-contained
+    /// ones without re-reading the pool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
 
     /// Build-time-only dependencies (ADR-0018, issue #17): payloads are
@@ -9640,9 +9644,12 @@ mod tests {
             !yaml.contains("build_deps"),
             "yaml must not carry build_deps: {yaml}"
         );
+        // Issue #110 (ADR-0034): requires IS emitted now — the runtime
+        // emitter records it so the farm emit can tell libs-carrying
+        // packages from self-contained ones.
         assert!(
-            !yaml.contains("requires"),
-            "yaml must not carry requires: {yaml}"
+            yaml.contains("requires"),
+            "yaml must carry requires: {yaml}"
         );
 
         // Absent → empty.

@@ -126,6 +126,7 @@ fn seed_generation(pod: &Path, n: u64, units: &[ServiceUnit]) {
             units: Vec::new(),
             layer: ClaimLayer::Own,
             apps: Default::default(),
+            requires: Vec::new(),
             launchers: Default::default(),
             assembly: Default::default(),
             confined: None,

@@ -211,18 +211,12 @@ fn resolve_command_in(name: &str, entries: &[PathBuf]) -> miette::Result<PathBuf
 /// Overlay the pod env onto `cmd`, mirroring
 /// [`crate::pod::render_shellenv`]'s semantics: PATH is the farm
 /// prepended to the caller's existing PATH (the farm alone when the
-/// caller has none), and `LD_LIBRARY_PATH` gets the loader libs prepended
-/// ahead of any existing value — the `${VAR:+:$VAR}` idiom, so an
-/// unset/empty variable never produces a trailing empty element (which
-/// the dynamic loader would read as the current directory). Empty `libs`
-/// leaves `LD_LIBRARY_PATH` untouched.
+/// caller has none), plus the declared env vars (ADR-0030). No
+/// `LD_LIBRARY_PATH` is ever set here (issue #110, ADR-0034): farm
+/// apps carry their own emit-time LD wrappers, and an arbitrary
+/// command is not a pod process.
 fn overlay_pod_env(cmd: &mut std::process::Command, env: &crate::pod::PodShellenv) {
-    overlay_pod_env_with(
-        cmd,
-        env,
-        std::env::var_os("PATH").as_deref(),
-        std::env::var_os("LD_LIBRARY_PATH").as_deref(),
-    )
+    overlay_pod_env_with(cmd, env, std::env::var_os("PATH").as_deref())
 }
 
 /// The overlay proper, over explicit existing values — split out so
@@ -232,7 +226,6 @@ fn overlay_pod_env_with(
     cmd: &mut std::process::Command,
     env: &crate::pod::PodShellenv,
     existing_path: Option<&std::ffi::OsStr>,
-    existing_ld: Option<&std::ffi::OsStr>,
 ) {
     // split_paths of an unset PATH yields nothing, and an EMPTY string
     // would yield one empty entry (a trailing empty element the loader
@@ -249,16 +242,11 @@ fn overlay_pod_env_with(
     let path = std::env::join_paths(&entries).unwrap_or_else(|_| env.farm.as_str().into());
     cmd.env("PATH", path);
 
-    if !env.libs.is_empty() {
-        let mut ld = std::ffi::OsString::from(env.libs.join(":"));
-        if let Some(existing) = existing_ld {
-            if !existing.is_empty() {
-                ld.push(":");
-                ld.push(existing);
-            }
-        }
-        cmd.env("LD_LIBRARY_PATH", ld);
-    }
+    // No LD_LIBRARY_PATH here (issue #110, ADR-0034): farm apps carry
+    // their own emit-time LD wrappers, and an arbitrary command is not a
+    // pod process — it runs with the caller's environment, minus this
+    // overlay's PATH prepend. Exporting the pod's lib dirs here was the
+    // leak this issue closed.
 
     // ADR-0030: the generation's declared env replaces inherited values
     // (the devbox `env:` semantics) — declared beats ambient by design.
@@ -651,6 +639,7 @@ mod tests {
             apps: [("gcm".to_string(), "aa11".to_string())]
                 .into_iter()
                 .collect(),
+            requires: Vec::new(),
             launchers: BTreeMap::new(),
             assembly: [("gcm".to_string(), asm)].into_iter().collect(),
             confined: None,
@@ -713,12 +702,11 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    fn sample_command_env(farm: &Path, libs: Vec<String>) -> crate::pod::PodShellenv {
+    fn sample_command_env(farm: &Path) -> crate::pod::PodShellenv {
         crate::pod::PodShellenv {
             pod: "work".into(),
             farm: farm.display().to_string(),
             generation: Some(1),
-            libs,
             vars: Default::default(),
         }
     }
@@ -799,26 +787,20 @@ mod tests {
     }
 
     #[test]
-    fn overlay_pod_env_is_farm_first_and_prepends_loader_libs() {
+    fn overlay_pod_env_is_farm_first_and_never_touches_the_loader_path() {
         let tmp = tempfile::tempdir().unwrap();
         let farm = tmp.path().join("current");
-        let env = sample_command_env(&farm, vec![format!("{}/../usr/lib", farm.display())]);
+        let env = sample_command_env(&farm);
         let mut cmd = std::process::Command::new("true");
-        overlay_pod_env_with(
-            &mut cmd,
-            &env,
-            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
-            Some(std::ffi::OsStr::new("/opt/legacy")),
-        );
+        overlay_pod_env_with(&mut cmd, &env, Some(std::ffi::OsStr::new("/usr/bin:/bin")));
         assert_eq!(
             env_of(&cmd, "PATH").unwrap(),
             format!("{}:/usr/bin:/bin", farm.display()),
             "farm must precede the caller's PATH"
         );
-        assert_eq!(
-            env_of(&cmd, "LD_LIBRARY_PATH").unwrap(),
-            format!("{}/../usr/lib:/opt/legacy", farm.display()),
-            "loader libs must precede the existing value, never a trailing empty element"
+        assert!(
+            env_of(&cmd, "LD_LIBRARY_PATH").is_none(),
+            "the pod must never export loader libs into a child (issue #110)"
         );
     }
 
@@ -826,36 +808,33 @@ mod tests {
     fn overlay_pod_env_exports_the_farm_alone_for_unset_or_empty_path() {
         let tmp = tempfile::tempdir().unwrap();
         let farm = tmp.path().join("current");
-        let env = sample_command_env(&farm, Vec::new());
+        let env = sample_command_env(&farm);
         for existing in [None, Some(std::ffi::OsStr::new(""))] {
             let mut cmd = std::process::Command::new("true");
-            overlay_pod_env_with(&mut cmd, &env, existing, None);
+            overlay_pod_env_with(&mut cmd, &env, existing);
             assert_eq!(
                 env_of(&cmd, "PATH").unwrap(),
                 farm.display().to_string(),
                 "unset/empty caller PATH must export just the farm (input: {existing:?})"
             );
-            // Empty libs: LD_LIBRARY_PATH is left untouched — never set,
-            // so the command inherits the caller's (unset here).
-            assert!(env_of(&cmd, "LD_LIBRARY_PATH").is_none());
         }
     }
 
     #[test]
-    fn overlay_pod_env_empty_libs_leaves_ld_library_path_untouched() {
+    fn overlay_pod_env_does_not_wipe_an_inherited_loader_path() {
+        // The overlay never SETS LD_LIBRARY_PATH — but it also never
+        // wipes the caller's own value: the wrapper (not this overlay)
+        // owns the loader path inside pod processes (#110).
         let tmp = tempfile::tempdir().unwrap();
         let farm = tmp.path().join("current");
-        let env = sample_command_env(&farm, Vec::new());
+        let env = sample_command_env(&farm);
         let mut cmd = std::process::Command::new("true");
-        overlay_pod_env_with(
-            &mut cmd,
-            &env,
-            Some(std::ffi::OsStr::new("/bin")),
-            Some(std::ffi::OsStr::new("/opt/legacy")),
-        );
-        assert!(
-            env_of(&cmd, "LD_LIBRARY_PATH").is_none(),
-            "empty libs must not touch LD_LIBRARY_PATH"
+        cmd.env("LD_LIBRARY_PATH", "/opt/legacy");
+        overlay_pod_env_with(&mut cmd, &env, Some(std::ffi::OsStr::new("/bin")));
+        assert_eq!(
+            env_of(&cmd, "LD_LIBRARY_PATH").unwrap(),
+            "/opt/legacy",
+            "an inherited LD_LIBRARY_PATH passes through untouched"
         );
     }
 
@@ -863,13 +842,13 @@ mod tests {
     fn overlay_pod_env_declared_vars_replace_inherited_values() {
         let tmp = tempfile::tempdir().unwrap();
         let farm = tmp.path().join("current");
-        let mut env = sample_command_env(&farm, Vec::new());
+        let mut env = sample_command_env(&farm);
         env.vars.insert("EDITOR".to_string(), "vi".to_string());
         env.vars.insert("MODE".to_string(), "pod".to_string());
         let mut cmd = std::process::Command::new("true");
         cmd.env("MODE", "inherited");
         cmd.env("HOME", "/home/user");
-        overlay_pod_env_with(&mut cmd, &env, Some(std::ffi::OsStr::new("/bin")), None);
+        overlay_pod_env_with(&mut cmd, &env, Some(std::ffi::OsStr::new("/bin")));
         assert_eq!(
             env_of(&cmd, "EDITOR").unwrap(),
             "vi",

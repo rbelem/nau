@@ -2197,6 +2197,7 @@ fn seed_pod_generation(pod_dir: &Path, n: u64, pkg: &str, unit: &str) {
             },
             layer: ClaimLayer::Own,
             apps: std::collections::BTreeMap::new(),
+            requires: Vec::new(),
             launchers: std::collections::BTreeMap::new(),
             assembly: std::collections::BTreeMap::new(),
             confined: None,

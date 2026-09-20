@@ -234,12 +234,15 @@ gated_test!(meta_staged_app_runs_from_farm, {
     assert_eq!(out, "staged-marker\n", "{out}");
 
     // The assembly subtree, not a bare store blob: the farm link must
-    // point into the package's assembly area (multi-file app).
+    // point into the package's assembly area (multi-file app). Issue
+    // #110 (ADR-0034): metatool requires a dep beyond the glibc family,
+    // so the entry is the emit-time LD wrapper, which execs the same
+    // assembly leaf one hop later — either target is assembly-shaped.
     let link = std::fs::read_link(farm(&root, "t38").join("hello")).unwrap();
     let link = link.to_string_lossy().into_owned();
     assert!(
-        link.starts_with("../apps/metatool/"),
-        "farm link should target the assembly subtree, got: {link}"
+        link.starts_with("../apps/metatool/") || link.starts_with("../ld-wrappers/"),
+        "farm link should target the assembly subtree (or its LD wrapper), got: {link}"
     );
 });
 

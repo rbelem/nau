@@ -235,16 +235,38 @@ gated_test!(native_elf_with_bundled_lib_builds_wrapper_and_farm_execs, {
     let farm = current_farm(root.path(), "default");
     assert!(farm.join("app").exists(), "farm must expose the app");
     let target = farm_entry_target(&farm, "app");
-    let store_dir = std::fs::canonicalize(pod_dir(root.path(), "default").join("store")).unwrap();
+    // Issue #110 (ADR-0034): the generation ships loader-lib dirs, so
+    // the farm entry is the emit-time LD wrapper — one hop before the
+    // build-time wrapper blob in the store. The wrapper's exec anchors
+    // at its own dir (`$d/../farm/…`), so resolve through it.
+    let gen_dir = std::fs::canonicalize(&farm)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     assert!(
-        target.starts_with(&store_dir),
-        "farm entry must resolve into the store, not a shim: {target:?}"
+        target.starts_with(&gen_dir.join("ld-wrappers")),
+        "farm entry must target the emit-time LD wrapper: {target:?}"
+    );
+    let store_dir = std::fs::canonicalize(pod_dir(root.path(), "default").join("store")).unwrap();
+    let emit_wrapper =
+        String::from_utf8_lossy(&read_bytes(&gen_dir.join("ld-wrappers/app"))).into_owned();
+    let real_target = emit_wrapper
+        .lines()
+        .find(|l| l.contains("exec \"$d/../farm/"))
+        .and_then(|l| l.split("\"$d/../farm/").nth(1))
+        .and_then(|l| l.split('"').next())
+        .expect("emit wrapper must exec the farm-relative real target");
+    let store_target = std::fs::canonicalize(farm.join(real_target)).unwrap();
+    assert!(
+        store_target.starts_with(&store_dir),
+        "wrapper must exec into the store, not a shim: {store_target:?}"
     );
 
-    // The farm blob is the BUILD-TIME WRAPPER (a shell launcher setting
+    // The store blob is the BUILD-TIME WRAPPER (a shell launcher setting
     // LD_LIBRARY_PATH) — the real ELF is preserved as a `.real` sibling
     // store blob referenced by the wrapper's exec.
-    let wrapper = read_bytes(&target);
+    let wrapper = read_bytes(&store_target);
     let wrapper_text = String::from_utf8_lossy(&wrapper);
     assert!(
         wrapper_text.starts_with("#!/bin/sh"),
@@ -371,20 +393,25 @@ gated_test!(hermetic_sandbox_drops_inherited_ldflags_pollution, {
     // present (env_clear dropped it).
     let farm = current_farm(root.path(), "default");
     let target = farm_entry_target(&farm, "app");
-    let wrapper = String::from_utf8_lossy(&read_bytes(&target)).into_owned();
-    let exec_line = wrapper
-        .lines()
-        .find(|l| l.trim_start().starts_with("exec \"") && l.contains("/store/"))
-        .unwrap_or_else(|| panic!("no store exec line in wrapper: {wrapper}"));
-    let real_blob = exec_line
-        .split('"')
-        .nth(1)
-        .expect("wrapper exec line has a quoted real path");
+    // Hop 1: the farm entry is the emit-time LD wrapper (issue #110,
+    // ADR-0034) — assert that, then check hermeticity on the payload's
+    // real ELF, surfaced in the generation's extension tree.
+    let gen_dir = std::fs::canonicalize(&farm)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     assert!(
-        std::path::Path::new(real_blob).is_file(),
-        "wrapper must exec an existing store blob: {real_blob:?}"
+        target.starts_with(&gen_dir.join("ld-wrappers")),
+        "farm entry must target the emit-time LD wrapper: {target:?}"
     );
-
+    let real_elf = gen_dir.join("extensions/nelf/usr/usr/bin").join("app.real");
+    assert!(
+        real_elf.is_file(),
+        "the payload's real ELF must surface in the extension tree: {}",
+        real_elf.display()
+    );
+    let real_blob = real_elf.to_str().unwrap();
     // Read the real ELF's dynamic section; the inherited deadbeef path must
     // not appear in RUNPATH, and the interpreter must not be the shell's
     // polluted nix-shell path.

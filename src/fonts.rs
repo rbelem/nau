@@ -168,6 +168,7 @@ mod tests {
                     units: vec![],
                     layer: ClaimLayer::Own,
                     apps: std::collections::BTreeMap::new(),
+                    requires: Vec::new(),
                     launchers: std::collections::BTreeMap::new(),
                     assembly: std::collections::BTreeMap::new(),
                     confined: None,

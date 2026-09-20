@@ -504,10 +504,12 @@ fn expect_service_overrides(
 }
 
 /// An env name must be non-empty `[A-Za-z_][A-Za-z0-9_]*`. `PATH` and
-/// `LD_LIBRARY_PATH` are RESERVED: they are pod-computed seams (the
-/// farm-first PATH per ADR-0028; the loader-lib `LD_LIBRARY_PATH`), and
-/// a declared value would be silently overwritten at export — or,
-/// worse, silently break activation. Declare payloads' dirs instead.
+/// `LD_LIBRARY_PATH` are RESERVED: PATH is the pod-computed activation
+/// seam (farm-first prepend per ADR-0028), and `LD_LIBRARY_PATH` stays
+/// pod-managed even though the shell export is gone (ADR-0034) — the
+/// emit-time LD wrappers own it inside pod processes, and a declared
+/// value would be silently overwritten or, worse, re-open the #110
+/// leak. Declare payloads' dirs instead.
 fn validate_env_key(key: &str) -> miette::Result<()> {
     let mut chars = key.chars();
     let well_formed = match chars.next() {
@@ -521,9 +523,9 @@ fn validate_env_key(key: &str) -> miette::Result<()> {
     }
     if key == "PATH" || key == "LD_LIBRARY_PATH" {
         miette::bail!(
-            "env key '{key}' is reserved: PATH and LD_LIBRARY_PATH are pod-computed \
-             seams (farm-first PATH per ADR-0028, loader-lib LD_LIBRARY_PATH) — \
-             a declared value would never survive the export"
+            "env key '{key}' is reserved: PATH and LD_LIBRARY_PATH are pod-managed \
+             seams (farm-first PATH per ADR-0028; loader libs per ADR-0034's \
+             emit-time wrappers) — a declared value would never survive"
         );
     }
     Ok(())
@@ -3643,15 +3645,15 @@ pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListE
 /// interactive half of farm activation (ADR-0015 §7: "a single PATH
 /// prepend"), never an RC-file write, daemon, or watcher.
 ///
-/// Issue #89 adds the loader half: the generation's payload lib dirs
-/// (`extensions/<pkg>/usr/usr/lib`, recorded by the farm emit) as
-/// `LD_LIBRARY_PATH` entries, so requires-closure binaries (git, tmux,
-/// htop, tig, …) find their generation's libraries with no manual
-/// environment. Every entry threads through the pod's `current` LINK —
-/// `<pod>/current/../extensions/...` — never a canonicalized
-/// generation path, so the rollback flip re-scopes all of them
-/// atomically (a dead generation's dirs become unreachable without
-/// re-eval) and nothing leaks beyond this pod's activation surface.
+/// The loader half moved OUT of the shell env (issue #110, ADR-0034,
+/// amending ADR-0028): exporting `LD_LIBRARY_PATH` here injected the
+/// pod's extension libraries into every child of the hosting shell
+/// (host curl lost TLS, nix git-remote-https failed cert checks, node
+/// hit sqlite symbol mismatches). The emit now wraps each
+/// libs-carrying app in a generation-scoped LD wrapper
+/// (`farm::ld_wrappers`), so the pod's libraries ride only the
+/// processes the pod launches and this export exports nothing but PATH
+/// plus the declared env (ADR-0030).
 #[derive(Debug, PartialEq, Serialize)]
 pub struct PodShellenv {
     /// The pod this environment belongs to.
@@ -3665,13 +3667,6 @@ pub struct PodShellenv {
     /// The generation the farm currently serves, when the `current`
     /// link's target parses.
     pub generation: Option<u64>,
-    /// Absolute loader-lib dirs for the LD_LIBRARY_PATH prepend (issue
-    /// #89), threaded through the `current` link like `farm`. Empty for
-    /// pods whose packages ship no shared libraries (the common case —
-    /// statically linked tools) and for generations emitted before the
-    /// seam existed; the renderer exports nothing in that case.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub libs: Vec<String>,
     /// The generation's recorded declared env (ADR-0030): sorted key →
     /// literal value, read from `generations/<n>/env.json`. Empty for
     /// env-less generations; the renderer exports nothing and `shuttle
@@ -3711,31 +3706,15 @@ pub fn shellenv(root: &Path, pod_name: &str) -> miette::Result<PodShellenv> {
         .map_err(|e| miette::miette!("pod root {}: {e}", root.display()))?;
     let farm = root_abs.join(pod_name).join(crate::farm::CURRENT_LINK);
     let generation = crate::farm::current_generation(&pod)?;
-    // Issue #89: the generation's recorded loader-lib dirs, as seam
-    // paths through the `current` link. Missing file = a generation
-    // emitted before the seam existed (or a lib-less generation read
-    // through an old binary) — an empty export is the correct answer.
-    let libs = match generation {
-        Some(n) => read_loader_libs(
-            &pod.join("generations")
-                .join(n.to_string())
-                .join(crate::farm::LOADER_LIBS_FILE),
-        )?
-        .into_iter()
-        .map(|rel| {
-            // `current` is a symlink into `generations/<n>/farm`, so
-            // `current/../<rel>` resolves (kernel path resolution, and
-            // glibc's loader resolves LD_LIBRARY_PATH entries at exec
-            // time) into `generations/<n>/<rel>` — the flip redirects
-            // the whole list on rollback.
-            format!("{}/../{rel}", farm.display())
-        })
-        .collect(),
-        None => Vec::new(),
-    };
+    // The loader-lib list (issue #89) is no longer part of the shell
+    // surface: issue #110 (ADR-0034) moved the seam into per-app LD
+    // wrappers written by the farm emit, so no `LD_LIBRARY_PATH` is
+    // exported here. The recorded list still feeds the wrappers and
+    // `shuttle run`'s pod-scoped overlay.
     // ADR-0030: the generation's recorded declared env. A missing file
     // is a pre-env surface generation (or an env-less one) — an empty
-    // map is the correct answer, exactly like `libs` above.
+    // map is the correct answer, exactly like the loader-lib list
+    // handling in the farm emit above.
     let vars = match generation {
         Some(n) => read_generation_env(
             &pod.join("generations")
@@ -3748,37 +3727,8 @@ pub fn shellenv(root: &Path, pod_name: &str) -> miette::Result<PodShellenv> {
         pod: pod_name.to_string(),
         farm: farm.display().to_string(),
         generation,
-        libs,
         vars,
     })
-}
-
-/// Parse a generation's `loader-libs` list: one generation-relative
-/// directory per line, authored by the farm emit. A corrupted list
-/// fails the read verb loudly (the fonts emitter's rule for trusted
-/// data) — never a silently wrong loader path.
-fn read_loader_libs(path: &Path) -> miette::Result<Vec<String>> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(miette::miette!("reading {}: {e}", path.display()));
-        }
-    };
-    let mut dirs = Vec::new();
-    for line in body.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('/') || line.split('/').any(|c| c == "..") || line.contains('\0') {
-            miette::bail!(
-                "corrupt loader-lib list {}: {line:?} is not a generation-relative directory",
-                path.display()
-            );
-        }
-        dirs.push(line.to_string());
-    }
-    Ok(dirs)
 }
 
 /// Parse a generation's recorded env object (ADR-0030): a JSON map of
@@ -3806,23 +3756,17 @@ fn sh_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Render a shellenv as eval-safe POSIX shell statements (issue #47,
-/// extended by #89): the PATH prepend, plus the loader-lib
-/// `LD_LIBRARY_PATH` prepend when the pod's generation ships lib dirs.
-/// Pure — the JSON branch prints the struct instead.
+/// Render a shellenv as eval-safe POSIX shell statements (issue #47):
+/// the PATH prepend plus the declared env exports (ADR-0030). Pure —
+/// the JSON branch prints the struct instead.
 ///
-/// The `LD_LIBRARY_PATH` line uses the `${VAR:+:$VAR}` idiom (the same
-/// one the pool's build scripts use) so the export is safe under
-/// `set -u` and never leaves a trailing empty element (which the
-/// loader would read as the current directory).
+/// The loader-lib `LD_LIBRARY_PATH` export lived here until issue #110
+/// (ADR-0034) moved the seam into the emit-time LD wrappers: an env
+/// export reached every child of the hosting shell and broke host curl,
+/// nix git, and node. Nothing in the rendered script touches the
+/// loader path anymore.
 pub fn render_shellenv(env: &PodShellenv) -> String {
     let mut script = format!("export PATH=\"{}:$PATH\"\n", env.farm);
-    if !env.libs.is_empty() {
-        script.push_str(&format!(
-            "export LD_LIBRARY_PATH=\"{}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"\n",
-            env.libs.join(":")
-        ));
-    }
     // ADR-0030: one export per declared var, BTreeMap order (sorted —
     // byte-deterministic across syncs and rebuilds).
     for (key, value) in &env.vars {
@@ -4384,6 +4328,7 @@ pod {
                 units: vec![],
                 layer: crate::farm::ClaimLayer::Own,
                 apps: BTreeMap::new(),
+                requires: Vec::new(),
                 launchers: BTreeMap::new(),
                 assembly: BTreeMap::new(),
                 confined: None,
@@ -4404,7 +4349,7 @@ pod {
     }
 
     #[test]
-    fn test_shellenv_lib_dirs_thread_through_the_current_link() {
+    fn test_shellenv_exports_no_loader_libs_even_for_lib_payloads() {
         let tmp = tempfile::tempdir().unwrap();
         // The documented layout `<data-home>/shuttle/pods/<pod>`: the
         // emit's desktop/font surfaces derive their user-level dirs
@@ -4413,7 +4358,8 @@ pod {
         let dir = pod_dir(&root, "default");
         let store = pod_store(&dir);
         // Generation 1 carries a lib payload (the emit records its lib
-        // dirs); generation 2 does not (the rollback target).
+        // dirs and writes the per-app LD wrappers); generation 2 does
+        // not (the rollback target).
         let ext1 = store
             .generation_dir(1)
             .join("extensions/tmux-deps/usr/usr/lib");
@@ -4422,28 +4368,24 @@ pod {
         crate::farm::emit(&store, &gen_with_one_pkg(2, "tmux")).unwrap();
         crate::farm::flip_current(&dir, 1).unwrap();
 
+        // Issue #110 (ADR-0034): the shell export carries NO loader
+        // libs — the seam moved into the emit's per-app LD wrappers.
+        // The wrappers themselves are the farm emit's contract (tested
+        // there); here the absence from the shell surface is the point.
         let env = shellenv(&root, "default").unwrap();
-        let expected = format!("{}/../extensions/tmux-deps/usr/usr/lib", env.farm);
-        assert_eq!(env.libs, vec![expected.clone()], "seam paths: {env:?}");
-        // The entry resolves THROUGH the link into generation 1.
+        let script = render_shellenv(&env);
         assert!(
-            Path::new(&expected).is_dir(),
-            "seam must resolve into the active generation"
+            !script.contains("LD_LIBRARY_PATH"),
+            "shellenv must not export loader libs: {script}"
         );
 
-        // Rollback semantics: the flip alone re-scopes the SAME text
-        // path — generation 2 has no tmux-deps, so the dead
-        // generation's dir is unreachable through the seam.
+        // Rollback semantics: the flipped-to generation re-emits and
+        // the shell surface stays clean either way.
         crate::farm::flip_current(&dir, 2).unwrap();
-        assert!(
-            !Path::new(&expected).exists(),
-            "flipped-away generation must be unreachable through the seam"
-        );
-        // And the shellenv of the rolled-back pod exports nothing.
         let env2 = shellenv(&root, "default").unwrap();
         assert!(
-            env2.libs.is_empty(),
-            "rollback target has no libs: {env2:?}"
+            !render_shellenv(&env2).contains("LD_LIBRARY_PATH"),
+            "rollback target: {env2:?}"
         );
     }
 
@@ -4454,7 +4396,6 @@ pod {
         // file. The shellenv must degrade to the #47 PATH-only export.
         seed_active_pod(tmp.path(), "default", 4);
         let env = shellenv(tmp.path(), "default").unwrap();
-        assert!(env.libs.is_empty());
         assert_eq!(
             render_shellenv(&env),
             format!("export PATH=\"{}:$PATH\"\n", env.farm)
@@ -4467,21 +4408,16 @@ pod {
             pod: "default".into(),
             farm: "/root/default/current".into(),
             generation: Some(1),
-            libs: vec!["/root/default/current/../extensions/a/usr/usr/lib".into()],
             vars: BTreeMap::new(),
         };
         let script = render_shellenv(&env);
-        assert_eq!(
-            script,
-            "export PATH=\"/root/default/current:$PATH\"\n\
-             export LD_LIBRARY_PATH=\"/root/default/current/../extensions/a/usr/usr/lib\
-             ${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n"
-        );
+        assert_eq!(script, "export PATH=\"/root/default/current:$PATH\"\n");
 
         // The real proof: eval the script under `set -u` with
-        // LD_LIBRARY_PATH unset, set, and empty. The `:+` idiom must
-        // survive nounset and never leave a trailing empty element
-        // (which the loader reads as the current directory).
+        // LD_LIBRARY_PATH unset, set, and empty. The rendered script
+        // never mentions the variable (issue #110: the loader seam
+        // moved into the emit's per-app wrappers), so the caller's
+        // value passes through untouched in every case.
         let eval = |pre: Option<&str>| {
             let mut cmd = std::process::Command::new("sh");
             cmd.arg("-c").arg(format!(
@@ -4499,34 +4435,9 @@ pod {
             );
             String::from_utf8(out.stdout).unwrap()
         };
-        assert_eq!(
-            eval(None),
-            "/root/default/current/../extensions/a/usr/usr/lib"
-        );
-        assert_eq!(
-            eval(Some("keep")),
-            "/root/default/current/../extensions/a/usr/usr/lib:keep"
-        );
-        assert_eq!(
-            eval(Some("")),
-            "/root/default/current/../extensions/a/usr/usr/lib"
-        );
-
-        // A lib-less pod emits no LD_LIBRARY_PATH line at all.
-        let bare = PodShellenv {
-            libs: Vec::new(),
-            ..env
-        };
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "set -u\n{}\nprintf '%s' \"${{LD_LIBRARY_PATH-__UNSET__}}\"",
-                render_shellenv(&bare)
-            ))
-            .env_remove("LD_LIBRARY_PATH")
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8(out.stdout).unwrap(), "__UNSET__");
+        assert_eq!(eval(None), "__UNSET__");
+        assert_eq!(eval(Some("keep")), "keep");
+        assert_eq!(eval(Some("")), "");
     }
 
     // ── declared pod env (ADR-0030) ──
@@ -4697,7 +4608,6 @@ pod {
             pod: "default".into(),
             farm: "/root/default/current".into(),
             generation: Some(1),
-            libs: Vec::new(),
             vars,
         };
         let script = render_shellenv(&env);

@@ -142,6 +142,14 @@ pub struct InstalledPackage {
     /// store. Empty for packages without apps and store-recorded snaps.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub apps: BTreeMap<String, String>,
+    /// The package's declared runtime requires (ADR-0018), recorded so
+    /// the farm emitter can tell libs-carrying packages (requires
+    /// beyond the glibc family → their apps get the emit-time LD
+    /// wrapper, issue #110/ADR-0034) from self-contained ones without
+    /// re-reading the pool. Manifests from before the field default to
+    /// empty (unwrapped — the conservative old behavior).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
     /// App name → sha256 of the app's confined-launcher wrapper blob in
     /// the store (ticket #11). Only present for confined apps. The farm
     /// emitter prefers this over `apps` for a confined app so the farm's
@@ -1126,6 +1134,7 @@ impl RuntimeStore {
                         BTreeMap::new(),
                         BTreeMap::new(),
                         BTreeMap::new(),
+                        Vec::new(),
                     ),
                     planner_notes: Vec::new(),
                     entries: Vec::new(),
@@ -1157,6 +1166,7 @@ impl RuntimeStore {
                         fonts,
                         runtime.services,
                         runtime.service_bins,
+                        meta.requires.clone(),
                     ),
                     planner_notes: runtime.notes,
                     entries,
@@ -1218,6 +1228,7 @@ impl RuntimeStore {
         fonts: BTreeMap<String, String>,
         services: BTreeMap<String, crate::snap::ServiceDecl>,
         service_bins: BTreeMap<String, String>,
+        requires: Vec<String>,
     ) -> InstalledPackage {
         InstalledPackage {
             name: snap.name.clone(),
@@ -1227,6 +1238,7 @@ impl RuntimeStore {
             files,
             units,
             layer: snap.layer,
+            requires,
             apps,
             launchers,
             assembly,
@@ -2580,6 +2592,7 @@ mod tests {
             units: units.iter().map(|s| s.to_string()).collect(),
             layer: crate::farm::ClaimLayer::Own,
             apps: BTreeMap::new(),
+            requires: Vec::new(),
             launchers: BTreeMap::new(),
             assembly: BTreeMap::new(),
             confined: None,
@@ -3527,6 +3540,7 @@ plugs:
                 units: vec![],
                 layer: crate::farm::ClaimLayer::Own,
                 apps: BTreeMap::new(),
+                requires: Vec::new(),
                 launchers: BTreeMap::new(),
                 assembly: BTreeMap::new(),
                 confined: None,
@@ -3548,6 +3562,7 @@ plugs:
                 units: vec![],
                 layer: crate::farm::ClaimLayer::Own,
                 apps: BTreeMap::new(),
+                requires: Vec::new(),
                 launchers: BTreeMap::new(),
                 assembly: BTreeMap::new(),
                 confined: None,
