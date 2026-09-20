@@ -627,6 +627,39 @@ fn validate_service_env_literal(service: &str, key: &str, value: &str) -> miette
     Ok(())
 }
 
+/// Unit-text safety (issue #109 S5): these strings land verbatim in a
+/// file the service manager parses — a control character (a newline!)
+/// injects arbitrary directives, and a quote escapes the emitter's
+/// quoting. Rejected at the parse boundary, fail-closed, naming the
+/// character.
+fn validate_unit_text(service: &str, field: &str, value: &str) -> miette::Result<()> {
+    if let Some(c) = value
+        .chars()
+        .find(|c| c.is_control() || matches!(c, '\'' | '"'))
+    {
+        miette::bail!(
+            "service '{service}': field '{field}': control characters and quotes are not \
+             allowed — found {c:?}; the value reaches a manager-parsed unit file verbatim"
+        );
+    }
+    Ok(())
+}
+
+/// Environment VALUES keep their literal quoting contract: quotes and
+/// backslashes are render-escaped, but a control character (a raw
+/// newline) would still break the `Environment="…"` line, so it is
+/// rejected here (issue #109 S5).
+fn validate_env_value_text(service: &str, key: &str, value: &str) -> miette::Result<()> {
+    if let Some(c) = value.chars().find(|c| c.is_control()) {
+        miette::bail!(
+            "service '{service}': field 'environment.{key}': control characters are not \
+             allowed in environment values — found {c:?} (quotes are escaped at render; \
+             a control character would break the Environment line)"
+        );
+    }
+    Ok(())
+}
+
 impl ServiceDecl {
     /// Convert a Lua service table (from `service()` or a plain table)
     /// into a [`ServiceDecl`]. `name` is the service's key in `services`,
@@ -733,7 +766,14 @@ impl ServiceDecl {
             }
         }
         for (key, value) in &environment {
+            validate_unit_text(name, &format!("environment.{key} (key)"), key)?;
             validate_service_env_literal(name, key, value)?;
+            validate_env_value_text(name, key, value)?;
+        }
+        for (i, target) in after.iter().enumerate() {
+            // An `after` target renders raw into an After= line: the
+            // unit-text boundary applies (issue #109 S5).
+            validate_unit_text(name, &format!("after[{}]", i + 1), target)?;
         }
 
         Ok(ServiceDecl {
@@ -897,6 +937,7 @@ fn get_service_backend_options(
                          plain data table: {e}"
                     )
                 })?;
+                validate_backend_passthrough(service, &key, &json)?;
                 out.insert(key, json);
             }
             other => {
@@ -909,6 +950,31 @@ fn get_service_backend_options(
         }
     }
     Ok(out)
+}
+
+/// The passthrough's inner keys and string values render verbatim into
+/// the backend artifact (`Key=value` lines on systemd) — the unit-text
+/// boundary applies to them too (issue #109 S5). Only the render surface
+/// is checked: the passthrough's top-level scalar entries.
+fn validate_backend_passthrough(
+    service: &str,
+    backend: &str,
+    json: &serde_json::Value,
+) -> miette::Result<()> {
+    let Some(map) = json.as_object() else {
+        return Ok(());
+    };
+    for (key, value) in map {
+        validate_unit_text(
+            service,
+            &format!("backend_options.{backend}.{key} (key)"),
+            key,
+        )?;
+        if let Some(text) = value.as_str() {
+            validate_unit_text(service, &format!("backend_options.{backend}.{key}"), text)?;
+        }
+    }
+    Ok(())
 }
 
 /// Fetch an optional service sub-table, failing closed on wrong types
@@ -6666,6 +6732,49 @@ mod tests {
         }
         services_meta(&env, r#"["a-b-c9"] = { command = "bin/x" }"#)
             .expect("kebab-case names are valid");
+    }
+
+    #[test]
+    fn service_unit_text_rejects_injection_at_parse() {
+        // Issue #109 S5: strings that land verbatim in a manager-parsed
+        // file reject control characters and quotes at the parse
+        // boundary, each error naming the field.
+        let env = LuaEnv::new();
+        let cases: [(&str, &str); 6] = [
+            (
+                "after[1]",
+                r#"command = "bin/x", after = { "db\nKillMode=never" }"#,
+            ),
+            ("after[1]", r#"command = "bin/x", after = { "db\"x" }"#),
+            (
+                "backend_options.systemd",
+                r#"command = "bin/x", backend_options = { systemd = { ["Nice\nKillMode=never"] = 1 } }"#,
+            ),
+            (
+                "backend_options.systemd.Nice",
+                r#"command = "bin/x", backend_options = { systemd = { Nice = "5\nKillMode=never" } }"#,
+            ),
+            (
+                "environment",
+                r#"command = "bin/x", environment = { ["A\"B"] = "v" }"#,
+            ),
+            (
+                "environment.A",
+                r#"command = "bin/x", environment = { A = "v\nB=c" }"#,
+            ),
+        ];
+        for (field, body) in cases {
+            let err = svc(&env, body).unwrap_err().to_string();
+            assert!(
+                err.contains("not allowed") && err.contains(field),
+                "{field} must reject the injection, got: {err}"
+            );
+        }
+        // Quotes in environment VALUES stay legal — they are
+        // render-escaped, not injected (the parse only rejects control
+        // characters there).
+        svc(&env, r#"command = "bin/x", environment = { A = "v\"q" }"#)
+            .expect("quoted env values are render-escaped, not rejected");
     }
 
     #[test]

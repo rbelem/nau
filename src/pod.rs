@@ -119,9 +119,12 @@ pub fn pod_dir(root: &Path, pod_name: &str) -> PathBuf {
     root.join(pod_name)
 }
 
-/// Validate a pod name: the name becomes a directory under the pod root,
-/// so it must be a single path-safe component (no empty names, no path
-/// separators, not `.` or `..`).
+/// Validate a pod name: the name becomes a directory under the pod root
+/// AND reaches generated unit file names and `Description=` lines
+/// (ADR-0032 Decision 4), so besides being a single path-safe component
+/// it must not carry control characters or quotes (a newline would
+/// inject into the unit text; a quote breaks its quoting — issue #109
+/// S5).
 pub fn validate_pod_name(name: &str) -> miette::Result<()> {
     if name.is_empty() {
         miette::bail!("pod name must not be empty");
@@ -131,6 +134,15 @@ pub fn validate_pod_name(name: &str) -> miette::Result<()> {
     }
     if name.chars().any(|c| c == '/' || c == '\\') {
         miette::bail!("pod name '{name}' must not contain path separators");
+    }
+    if name
+        .chars()
+        .any(|c| c.is_control() || c == '\'' || c == '"')
+    {
+        miette::bail!(
+            "pod name '{name}' must not contain control characters or quotes — the \
+             name reaches unit file names and unit descriptions verbatim"
+        );
     }
     Ok(())
 }
@@ -3984,6 +3996,13 @@ pod {
         assert!(validate_pod_name("..").is_err());
         assert!(validate_pod_name("../escape").is_err());
         assert!(validate_pod_name("a/b").is_err());
+        // Issue #109 S5: the name reaches unit file names and
+        // Description= lines — control characters and quotes are
+        // rejected; spaces stay legal (no injection vector).
+        assert!(validate_pod_name("pod\n.service]").is_err());
+        assert!(validate_pod_name("po\"d").is_err());
+        assert!(validate_pod_name("po'd").is_err());
+        assert!(validate_pod_name("my pod").is_ok());
     }
 
     // ── Pod-level service overrides (ADR-0032, issue #105) ──

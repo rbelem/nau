@@ -80,6 +80,13 @@ pub struct ServiceUnit {
     /// The resolved arguments (`${}` refs and `%h`/`%p` specifiers
     /// already expanded to literals).
     pub args: Vec<String>,
+    /// The resolved options (package defaults folded with the pod-level
+    /// overrides, specifiers NOT expanded) — recorded so the cross-pod
+    /// endpoint scan can read endpoint-ish option values (ADR-0032
+    /// Decision 9 also names data dirs, which need not appear in any
+    /// arg).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, serde_json::Value>,
     /// The service-declared environment literals (the generation's
     /// recorded env and the loader-lib `LD_LIBRARY_PATH` are composed
     /// into the rendered `text`, not duplicated here).
@@ -169,8 +176,11 @@ pub fn select_backend() -> miette::Result<ServiceBackend> {
     Ok(ServiceBackend::Systemd)
 }
 
-/// Fail closed when the selected backend has no emitter yet (Decision 11
-/// sequencing: systemd first; portable and launchd come later).
+/// Fail closed when the selected backend has no reconcile implementation
+/// (Decision 11 sequencing: systemd first; portable and launchd come
+/// later). The reconcile tails use this as their named-no-op gate; the
+/// emit path carries its own (a skipped emit must still fail on unknown
+/// override values while no-oping on the known non-systemd backends).
 fn ensure_systemd_backend() -> miette::Result<()> {
     match select_backend()? {
         ServiceBackend::Systemd => Ok(()),
@@ -357,6 +367,7 @@ fn build_unit(
         enabled: resolved.enabled,
         exec: format!("{}/{}", ctx.current, svc),
         args,
+        options: resolved.options.clone(),
         environment: decl.environment.clone(),
         after: decl.after.clone(),
         hash: unit_hash(&text, &pkg.sha3_384),
@@ -682,9 +693,25 @@ fn read_generation_env(path: &std::path::Path) -> miette::Result<BTreeMap<String
 /// write the unit artifacts INSIDE the generation and link the enabled
 /// ones into the systemd user unit dir. A missing or empty units file is
 /// still a withdrawal pass — stale links a previous generation left are
-/// removed. Fails closed on any non-systemd backend (Decision 11).
+/// removed.
+///
+/// An explicit `SHUTTLE_SERVICE_BACKEND=launchd|portable` is a named
+/// no-op, matching the reconcile tail's skip contract for non-systemd
+/// hosts (Decision 11): those hosts must keep syncing pods, and emitting
+/// systemd-shaped artifacts for them would be wrong. Unknown override
+/// values still fail the verb, through [`select_backend`].
 pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<()> {
-    ensure_systemd_backend()?;
+    match select_backend()? {
+        ServiceBackend::Systemd => {}
+        other => {
+            crate::output::warn(format!(
+                "services: skipped — service backend '{}' has no emitter yet \
+                 (ADR-0032 Decision 11)",
+                other.label()
+            ));
+            return Ok(());
+        }
+    }
     let pod = crate::desktop::pod_name(store)?;
     emit_in(store, gen, &user_systemd_unit_dir(), &pod)
 }
@@ -736,10 +763,13 @@ fn present_units_file(store: &RuntimeStore, n: u64) -> miette::Result<Option<Uni
     }
 }
 
-/// Wipe + recreate the generation's `services/` dir and write every
-/// recorded unit's text. The recorded units file is rewritten verbatim
-/// afterwards: it IS the re-render source, and a rollback's emit must
-/// always find it (the wipe must never consume it).
+/// Rewrite the generation's `services/` dir: write every recorded unit's
+/// artifact, replace the recorded units file by atomic rename, then prune
+/// what the previous record left behind. Crash-safety (issue #109 N12):
+/// the recorded units file is NEVER removed — it is the rollback
+/// re-render source — so a crash at any point leaves either the old or
+/// the new `units.json` intact. A stale artifact or a leftover temp file
+/// from an interrupted pass is pruned by the next emit.
 fn write_service_artifacts(
     store: &RuntimeStore,
     n: u64,
@@ -747,10 +777,6 @@ fn write_service_artifacts(
     file: &UnitsFile,
 ) -> miette::Result<()> {
     let dir = store.generation_dir(n).join(SERVICES_DIR);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .map_err(|e| miette::miette!("clearing stale services {}: {e}", dir.display()))?;
-    }
     std::fs::create_dir_all(&dir)
         .map_err(|e| miette::miette!("creating services {}: {e}", dir.display()))?;
     for unit in &file.units {
@@ -760,7 +786,32 @@ fn write_service_artifacts(
     }
     let path = units_path(store, n);
     let body = serde_json::to_vec(file).map_err(|e| miette::miette!("serializing units: {e}"))?;
-    std::fs::write(&path, &body).map_err(|e| miette::miette!("writing {}: {e}", path.display()))
+    let tmp = dir.join(format!(".{UNITS_FILE}.tmp"));
+    std::fs::write(&tmp, &body).map_err(|e| miette::miette!("writing {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| miette::miette!("installing {}: {e}", path.display()))?;
+    // The prune runs LAST: everything the recorded file names is already
+    // on disk, so an interruption here leaves prunable orphans — never a
+    // lost record.
+    prune_stale_artifacts(&dir, pod, file)
+}
+
+/// Remove everything in the generation's `services/` dir the recorded
+/// units file does not name (stale artifacts, a leftover atomic-rename
+/// temp file). A missing dir or unreadable entry is left to the next emit.
+fn prune_stale_artifacts(dir: &std::path::Path, pod: &str, file: &UnitsFile) -> miette::Result<()> {
+    let current: BTreeSet<String> = file.units.iter().map(|u| unit_name(pod, &u.name)).collect();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == UNITS_FILE || current.contains(&name) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+    Ok(())
 }
 
 /// Remove the user-level unit links this pod owns but `keep` does not
@@ -1195,13 +1246,19 @@ fn apply_unit_steps(
 /// into the running set, a `Linger=no` user means they stop at the last
 /// logout. Best-effort and read-only — shuttle NEVER enables linger
 /// (a documented one-time manual host step). A missing loginctl (or any
-/// probe failure) stays silent.
-fn check_linger(pod: &str, report: &mut ServiceReconcileReport) {
-    let Some(loginctl) = crate::runtime::find_on_path("loginctl") else {
+/// probe failure) stays silent. `loginctl` rides the [`RuntimeTools`]
+/// seam like every other tool, so `SHUTTLE_POD_TOOLS=absent` silences
+/// the probe instead of tests having to scrub PATH.
+fn check_linger(
+    tools: &crate::runtime::RuntimeTools,
+    pod: &str,
+    report: &mut ServiceReconcileReport,
+) {
+    let Some(loginctl) = &tools.loginctl else {
         return;
     };
     let uid = unsafe { libc::getuid() }.to_string();
-    let Ok(output) = std::process::Command::new(&loginctl)
+    let Ok(output) = std::process::Command::new(loginctl)
         .args(["show-user", &uid, "--property=Linger"])
         .output()
     else {
@@ -1403,7 +1460,7 @@ fn reconcile_presented(
     write_reconciled_state(input, &plan, report)?;
 
     if !report.activated.is_empty() || !report.restarted.is_empty() {
-        check_linger(pod_name, report);
+        check_linger(tools, pod_name, report);
     }
     Ok(())
 }
@@ -1456,10 +1513,9 @@ fn write_reconciled_state(
 // ── Cross-pod endpoint collisions (ADR-0032 Decision 9) ──
 
 /// The endpoint flags a unit's resolved args are scanned for, in both
-/// `--flag value` and `--flag=value` shapes. Declared `port`/`socket`/
-/// `socket_path` options resolve INTO args at record time (the
-/// interpolation happened in [`record`]), so args are the resolved
-/// truth; nothing else is scanned.
+/// `--flag value` and `--flag=value` shapes. Endpoint-ish recorded
+/// option values (port / socket / data dir keys, ADR-0032 Decision 9)
+/// join the claim set separately — see [`endpoint_option_family`].
 const ENDPOINT_FLAGS: [&str; 3] = ["--port", "--socket", "--socket-path"];
 
 /// Extract the (flag, value) endpoint pairs from resolved args (pure).
@@ -1495,9 +1551,10 @@ struct EndpointClaim {
 }
 
 /// The enabled endpoint claims of ONE pod: its active generation's
-/// recorded units, args scanned for endpoint flags. A pod with no
-/// store, no active generation, or no recorded services contributes
-/// nothing — missing means no claims, never an error.
+/// recorded units, args scanned for endpoint flags and recorded options
+/// for endpoint-ish keys. A pod with no store, no active generation, or
+/// no recorded services contributes nothing — missing means no claims,
+/// never an error.
 fn pod_endpoint_claims(pod_dir: &std::path::Path) -> miette::Result<Vec<EndpointClaim>> {
     let store = RuntimeStore::new(pod_dir.to_path_buf());
     let Some(gen) = store.active_generation()? else {
@@ -1523,6 +1580,20 @@ fn pod_endpoint_claims(pod_dir: &std::path::Path) -> miette::Result<Vec<Endpoint
                 value,
             });
         }
+        // Decision 9 also names data dirs, which need not appear in any
+        // arg: endpoint-ish recorded option values join the claim set.
+        for (key, value) in &unit.options {
+            if let (Some(family), Some(text)) = (endpoint_option_family(key), option_text(value)) {
+                if !text.is_empty() {
+                    claims.push(EndpointClaim {
+                        pod: pod.clone(),
+                        svc: unit.name.clone(),
+                        key: family.to_string(),
+                        value: text,
+                    });
+                }
+            }
+        }
     }
     Ok(claims)
 }
@@ -1546,13 +1617,20 @@ fn check_endpoint_collisions(root: &std::path::Path) -> miette::Result<()> {
     }
     for (i, a) in claims.iter().enumerate() {
         for b in &claims[i + 1..] {
-            if a.pod != b.pod && a.key == b.key && a.value == b.value {
+            // The arg form (`--socket-path`) and the option form
+            // (`socket_path`) are the same endpoint vocabulary —
+            // normalize both before comparing.
+            if a.pod != b.pod
+                && endpoint_compare_key(&a.key) == endpoint_compare_key(&b.key)
+                && a.value == b.value
+            {
                 miette::bail!(
                     "endpoint collision: pod '{}' service '{}' and pod '{}' service '{}' \
                      both run enabled with {} {} — two pods cannot share one endpoint; \
-                     give the services different ports/sockets or keep one disabled \
-                     (one provider pod, consumers with enabled = false — ADR-0032 \
-                     Decision 9)",
+                     the generation flip already happened, so fix the collision \
+                     (different ports/sockets, or keep one disabled — one provider \
+                     pod, consumers with enabled = false — ADR-0032 Decision 9) and \
+                     re-sync: the re-run converges",
                     a.pod,
                     a.svc,
                     b.pod,
@@ -1564,6 +1642,41 @@ fn check_endpoint_collisions(root: &std::path::Path) -> miette::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Normalize an endpoint key for cross-shape comparison: the arg form
+/// (`--socket-path`) and the recorded option family (`socket`) must
+/// compare equal — strip flag dashes, fold to snake case, drop a
+/// `_path` suffix.
+fn endpoint_compare_key(key: &str) -> String {
+    let norm = key
+        .trim_start_matches('-')
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    match norm.strip_suffix("_path") {
+        Some(stem) => stem.to_string(),
+        None => norm,
+    }
+}
+
+/// The endpoint-ish option families the recorded options are scanned
+/// for (ADR-0032 Decision 9's vocabulary: port, socket path, data dir).
+/// Token match on the normalized key, so `http_port` / `unix_socket` /
+/// `data_dir` qualify while `transport` (which merely CONTAINS "port")
+/// does not.
+fn endpoint_option_family(key: &str) -> Option<&'static str> {
+    let normalized = key.to_ascii_lowercase().replace('-', "_");
+    let tokens: Vec<&str> = normalized.split('_').collect();
+    let has = |t: &str| tokens.contains(&t);
+    if has("port") {
+        Some("port")
+    } else if has("socket") {
+        Some("socket")
+    } else if has("datadir") || (has("data") && (has("dir") || has("directory") || has("path"))) {
+        Some("data_dir")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1966,6 +2079,7 @@ mod tests {
             enabled,
             exec: "/x/current/svc".into(),
             args: vec![],
+            options: BTreeMap::new(),
             environment: BTreeMap::new(),
             after: vec![],
             text: String::new(),
@@ -2130,6 +2244,177 @@ mod tests {
         assert_eq!(
             extract_endpoints(&tricky),
             vec![("--socket-path".to_string(), "/x".to_string())]
+        );
+    }
+
+    #[test]
+    fn endpoint_option_families_match_decision_9_vocabulary() {
+        // Token match: port/socket/data-dir keys qualify; a key that
+        // merely CONTAINS "port" ("transport") does not.
+        assert_eq!(endpoint_option_family("port"), Some("port"));
+        assert_eq!(endpoint_option_family("http_port"), Some("port"));
+        assert_eq!(endpoint_option_family("listen-port"), Some("port"));
+        assert_eq!(endpoint_option_family("transport"), None);
+        assert_eq!(endpoint_option_family("socket"), Some("socket"));
+        assert_eq!(endpoint_option_family("unix_socket"), Some("socket"));
+        assert_eq!(endpoint_option_family("socket_path"), Some("socket"));
+        assert_eq!(endpoint_option_family("data_dir"), Some("data_dir"));
+        assert_eq!(endpoint_option_family("datadir"), Some("data_dir"));
+        assert_eq!(endpoint_option_family("data-path"), Some("data_dir"));
+        assert_eq!(endpoint_option_family("workspace"), None);
+        assert_eq!(endpoint_option_family("log_dir"), None);
+        // Cross-shape comparison: arg flag and option family collide.
+        assert_eq!(endpoint_compare_key("--port"), endpoint_compare_key("port"));
+        assert_eq!(
+            endpoint_compare_key("--socket-path"),
+            endpoint_compare_key("socket_path")
+        );
+        assert_ne!(
+            endpoint_compare_key("--port"),
+            endpoint_compare_key("socket")
+        );
+    }
+
+    /// Seed a minimal pod dir whose active generation records `units`
+    /// (manifest + units.json only — the scan reads nothing else).
+    fn seed_scan_pod(root: &std::path::Path, name: &str, units: &[ServiceUnit]) {
+        let pod = root.join(name);
+        let gen_dir = pod.join("generations/1");
+        std::fs::create_dir_all(gen_dir.join(SERVICES_DIR)).unwrap();
+        std::fs::write(
+            gen_dir.join("manifest.json"),
+            serde_json::json!({
+                "n": 1, "base_version": "24.04", "packages": {}, "created_epoch": 0
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("generations/1", pod.join("active")).unwrap();
+        std::fs::write(
+            gen_dir.join(SERVICES_DIR).join(UNITS_FILE),
+            serde_json::to_vec(&UnitsFile {
+                units: units.to_vec(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn endpoint_scan_reads_option_values_across_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Decision 9 names data dirs: two pods sharing a data_dir
+        // option value (invisible to the arg scan) collide.
+        let mut dir_unit = unit(true, "h");
+        dir_unit.name = "valkey".into();
+        dir_unit
+            .options
+            .insert("data_dir".into(), serde_json::json!("%h/.local/share/x"));
+        seed_scan_pod(root, "alpha", &[dir_unit.clone()]);
+        seed_scan_pod(root, "beta", &[dir_unit]);
+        let err = check_endpoint_collisions(root).unwrap_err().to_string();
+        assert!(
+            err.contains("alpha") && err.contains("beta") && err.contains("data_dir"),
+            "{err}"
+        );
+
+        // Cross-shape: an arg `--port 6379` and an option port = 6379
+        // are the same endpoint.
+        let root2 = root.join("shapes");
+        std::fs::create_dir_all(&root2).unwrap();
+        let mut arg_unit = unit(true, "h");
+        arg_unit.name = "svc".into();
+        arg_unit.args = vec!["--port".into(), "6379".into()];
+        let mut opt_unit = unit(true, "h");
+        opt_unit.name = "svc".into();
+        opt_unit
+            .options
+            .insert("port".into(), serde_json::json!(6379));
+        seed_scan_pod(&root2, "alpha", &[arg_unit]);
+        seed_scan_pod(&root2, "beta", &[opt_unit]);
+        assert!(check_endpoint_collisions(&root2).is_err());
+
+        // Different values never collide, and disabled units are
+        // invisible to the scan (Decision 9 + Decision 7).
+        let root3 = root.join("clean");
+        std::fs::create_dir_all(&root3).unwrap();
+        let mut a = unit(true, "h");
+        a.options.insert("port".into(), serde_json::json!(6379));
+        let mut b = unit(true, "h");
+        b.options.insert("port".into(), serde_json::json!(6380));
+        let mut c = unit(false, "h");
+        c.options.insert("port".into(), serde_json::json!(6379));
+        seed_scan_pod(&root3, "alpha", &[a]);
+        seed_scan_pod(&root3, "beta", &[b, c]);
+        check_endpoint_collisions(&root3).unwrap();
+    }
+
+    #[test]
+    fn linger_probe_rides_the_runtime_tools_seam() {
+        // No loginctl on the seam → silent (SHUTTLE_POD_TOOLS=absent).
+        let mut report = ServiceReconcileReport::default();
+        check_linger(
+            &crate::runtime::RuntimeTools::default(),
+            "pilot",
+            &mut report,
+        );
+        assert!(!report.linger_warned, "absent loginctl must stay silent");
+
+        // A loginctl handed to the seam directly (no PATH involvement)
+        // answering Linger=no → the warning.
+        let tmp = tempfile::tempdir().unwrap();
+        let loginctl = tmp.path().join("loginctl");
+        std::fs::write(&loginctl, "#!/bin/sh\necho Linger=no\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&loginctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let tools = crate::runtime::RuntimeTools {
+            loginctl: Some(loginctl),
+            ..Default::default()
+        };
+        let mut report = ServiceReconcileReport::default();
+        check_linger(&tools, "pilot", &mut report);
+        assert!(report.linger_warned, "Linger=no must warn through the seam");
+    }
+
+    #[test]
+    fn artifact_rewrite_is_crash_safe_and_prunes_stale_files() {
+        // N12: the rewrite must never remove the recorded units file —
+        // write-then-rename keeps it present at every instant, and the
+        // final prune clears what the previous record left behind.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        let mut d = decl("bin/x");
+        d.options.insert("enabled".into(), serde_json::json!(true));
+        let gen = gen_with(
+            1,
+            vec![pkg_with_services("p", &"2".repeat(96), vec![("x", d)])],
+        );
+        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        let dir = unit_dir(&tmp);
+        emit_in(&store, &gen, &dir, "pilot").unwrap();
+
+        // Leftovers an interrupted pass could leave: a stale artifact
+        // for a withdrawn service and an orphaned temp file.
+        let svc_dir = store.generation_dir(1).join(SERVICES_DIR);
+        std::fs::write(svc_dir.join("shuttle-pod-pilot-gone.service"), "stale").unwrap();
+        std::fs::write(svc_dir.join(format!(".{UNITS_FILE}.tmp")), "junk").unwrap();
+
+        emit_in(&store, &gen, &dir, "pilot").unwrap();
+        assert!(
+            units_path(&store, 1).exists(),
+            "units.json survives its own rewrite"
+        );
+        assert_eq!(units_of(&store, 1).len(), 1);
+        assert!(svc_dir.join("shuttle-pod-pilot-x.service").exists());
+        assert!(!svc_dir.join("shuttle-pod-pilot-gone.service").exists());
+        assert!(
+            !svc_dir.join(format!(".{UNITS_FILE}.tmp")).exists(),
+            "the temp file must not outlive a successful emit"
         );
     }
 }
