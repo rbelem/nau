@@ -308,7 +308,8 @@ fn main() -> miette::Result<()> {
             address,
             port,
             announce,
-        } => cmd_serve(address.as_deref(), port, announce),
+            pod,
+        } => cmd_serve(address.as_deref(), port, announce, pod.as_deref()),
 
         Command::Peers { secs, json } => {
             shuttle::output::set_mode(json);
@@ -3714,14 +3715,19 @@ fn cmd_pull(
 /// declaration; the declaration is the source of truth — absent both,
 /// serve does not announce. Absent `--address`, the declared
 /// `serve.address` (or the loopback default) binds.
-fn cmd_serve(address: Option<&str>, port: Option<u16>, announce_flag: bool) -> miette::Result<()> {
+fn cmd_serve(
+    address: Option<&str>,
+    port: Option<u16>,
+    announce_flag: bool,
+    pod: Option<&str>,
+) -> miette::Result<()> {
     let node = load_node_decl()?;
     let announce = announce_flag || node.as_ref().is_some_and(|n| n.serve.announce);
     let node_name = node.as_ref().map(|n| n.name.as_str());
     let address = address
         .map(str::to_string)
         .or_else(|| node.as_ref().map(|n| n.serve_address().to_string()));
-    shuttle::serve::run(address.as_deref(), port, announce, node_name)
+    shuttle::serve::run(address.as_deref(), port, announce, node_name, pod)
 }
 
 /// The `node {}` declaration from `./shuttle.lua`, if the file exists

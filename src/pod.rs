@@ -135,6 +135,24 @@ pub fn validate_pod_name(name: &str) -> miette::Result<()> {
     Ok(())
 }
 
+/// Resolve a `--pod` param to `(name, pod dir)` under an explicit pod
+/// root — `default` when None, name validated per [`validate_pod_name`].
+/// Split from [`resolve_pod_dir`] so tests can point the root at a
+/// tempdir.
+pub fn resolve_pod_dir_under(root: &Path, pod: Option<&str>) -> miette::Result<(String, PathBuf)> {
+    let name = pod.unwrap_or(DEFAULT_POD);
+    validate_pod_name(name)?;
+    Ok((name.to_string(), pod_dir(root, name)))
+}
+
+/// [`resolve_pod_dir_under`] against the resolved [`pod_root`]: the one
+/// pod-scope rule of the sharing verbs (ADR-0033 Decision 5) — peer and
+/// static pulls stage into the named pod's store, `serve --pod` serves
+/// it.
+pub fn resolve_pod_dir(pod: Option<&str>) -> miette::Result<(String, PathBuf)> {
+    resolve_pod_dir_under(&pod_root(None), pod)
+}
+
 /// Path to a pod's `pod.lua`.
 pub fn pod_lua_path(root: &Path, pod_name: &str) -> PathBuf {
     pod_dir(root, pod_name).join(POD_FILE)
@@ -1793,6 +1811,15 @@ pub struct PodSyncReport {
 pub fn pod_store(pod_dir: &Path) -> crate::runtime::RuntimeStore {
     crate::runtime::RuntimeStore::new(pod_dir.to_path_buf())
         .with_extensions_link_dir(pod_dir.join("extensions"))
+}
+
+/// The runtime store of the pod a `--pod` param selects against the
+/// resolved [`pod_root`] (the peer/static pull's staging target,
+/// ADR-0033 Decision 5; shared with `serve --pod` via
+/// [`resolve_pod_dir`]).
+pub fn resolve_pod_store(pod: Option<&str>) -> miette::Result<crate::runtime::RuntimeStore> {
+    let (_, dir) = resolve_pod_dir(pod)?;
+    Ok(pod_store(&dir))
 }
 
 /// Runtime tools for the pod paths. Default: the host binaries with the

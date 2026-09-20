@@ -454,6 +454,12 @@ pub enum Command {
         /// absent both, serve does not announce.
         #[arg(long)]
         announce: bool,
+
+        /// Pod whose store to serve (default: `default`) — the named
+        /// pod's store is the served surface, matching `--pod` on
+        /// `pull` and `export` (ADR-0033 Decision 5).
+        #[arg(long, value_name = "POD")]
+        pod: Option<String>,
     },
 
     /// Browse the LAN for announcing shuttle peers (ADR-0033 Decision

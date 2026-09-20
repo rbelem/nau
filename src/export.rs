@@ -23,6 +23,17 @@
 //! — never a skip: a mirror publishing a partial tree would hand peers
 //! unverifiable content. An empty store (no generation packages, no
 //! inbox) is a clear error, not an empty tree.
+//!
+//! # Ownership and pruning (ADR-0033 Decision 10)
+//!
+//! Every export writes a `.shuttle-export` marker at the out root
+//! (content: the tree format version). On a re-export of a directory
+//! that HAS the marker, stale entries are pruned: manifests and blobs
+//! no longer part of the exportable set are removed, so a mirror never
+//! advertises packages the pod dropped. A directory WITHOUT the marker
+//! was not written by shuttle — it accumulates exactly as before,
+//! deleting nothing it did not write (and gets claimed by the marker
+//! from that export on).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -51,6 +62,14 @@ struct IndexJson {
     packages: Vec<IndexPackage>,
 }
 
+/// The ownership marker written at the out root on every export
+/// (ADR-0033 Decision 10): its presence proves shuttle wrote the tree,
+/// licensing re-export pruning.
+const MARKER_FILE: &str = ".shuttle-export";
+
+/// The marker's content: the export-tree format version, one line.
+const MARKER_VERSION: &str = "v1";
+
 /// Run `shuttle export` into `out` for the named pod (`None` = the
 /// default pod).
 pub fn run(out: &str, pod: Option<&str>) -> miette::Result<()> {
@@ -71,35 +90,35 @@ fn run_at(out: &Path, store: &RuntimeStore, home: &Path) -> miette::Result<()> {
     let inbox_only = union_inbox(&generation, &inbox);
     ensure_exportable(store.root(), &generation, &inbox_only)?;
     let (manifests_dir, blobs_dir) = prepare_dirs(out)?;
+    // Ownership is decided from the directory AS FOUND: a tree shuttle
+    // wrote before (marker present) gets stale-entry pruning this
+    // export; a foreign directory accumulates, deleting nothing.
+    let owned = out.join(MARKER_FILE).exists();
 
-    // Dedup across packages: a shared blob is copied once (content
-    // addressing makes re-copies byte-identical, so this is purely
-    // fewer syscalls — never a divergence risk).
-    let mut copied: BTreeSet<String> = BTreeSet::new();
-    let mut packages: Vec<IndexPackage> = Vec::new();
-
-    if let Some(gen) = &generation {
-        export_generation(
-            store,
-            &manifests_dir,
-            &blobs_dir,
-            home,
-            gen,
-            &mut copied,
-            &mut packages,
-        )?;
-    }
-    export_inbox(
+    let (copied, mut packages) = write_tree(
         store,
         &manifests_dir,
         &blobs_dir,
+        home,
+        &generation,
         &inbox_only,
-        &mut copied,
-        &mut packages,
     )?;
 
     // Canonical index order regardless of generation-vs-inbox split.
     packages.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Prune BEFORE the index lands: an owned tree briefly carrying a
+    // fresh index beside stale entries is the one state that lets a
+    // mirror advertise content the pod dropped.
+    if owned {
+        prune_stale(
+            &manifests_dir,
+            &blobs_dir,
+            &manifest_names(&packages),
+            &copied,
+        )?;
+    }
+    write_marker(out)?;
 
     // index.json is written LAST: a half-updated mirror never advertises
     // packages whose manifests/blobs have not landed yet.
@@ -108,6 +127,101 @@ fn run_at(out: &Path, store: &RuntimeStore, home: &Path) -> miette::Result<()> {
         packages,
     };
     write_json(&out.join("index.json"), &index)
+}
+
+/// Export every manifest + blob of the current exportable set into the
+/// tree. Returns the copied blob hashes (the `blobs/` keep set) and
+/// the index rows (from which the `manifests/` keep set derives).
+fn write_tree(
+    store: &RuntimeStore,
+    manifests_dir: &Path,
+    blobs_dir: &Path,
+    home: &Path,
+    generation: &Option<Generation>,
+    inbox_only: &[&(String, PathBuf)],
+) -> miette::Result<(BTreeSet<String>, Vec<IndexPackage>)> {
+    // Dedup across packages: a shared blob is copied once (content
+    // addressing makes re-copies byte-identical, so this is purely
+    // fewer syscalls — never a divergence risk).
+    let mut copied: BTreeSet<String> = BTreeSet::new();
+    let mut packages: Vec<IndexPackage> = Vec::new();
+
+    if let Some(gen) = generation {
+        export_generation(
+            store,
+            manifests_dir,
+            blobs_dir,
+            home,
+            gen,
+            &mut copied,
+            &mut packages,
+        )?;
+    }
+    export_inbox(
+        store,
+        manifests_dir,
+        blobs_dir,
+        inbox_only,
+        &mut copied,
+        &mut packages,
+    )?;
+    Ok((copied, packages))
+}
+
+/// Claim (or re-assert) ownership of `out`: the marker is written on
+/// EVERY export, so the next export may prune (ADR-0033 Decision 10).
+/// A first export into a foreign directory claims it from then on.
+fn write_marker(out: &Path) -> miette::Result<()> {
+    let path = out.join(MARKER_FILE);
+    std::fs::write(&path, format!("{MARKER_VERSION}\n"))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("writing {}", path.display()))
+}
+
+/// The manifest file names the current exportable set owns — the keep
+/// set for `manifests/` pruning.
+fn manifest_names(packages: &[IndexPackage]) -> BTreeSet<String> {
+    packages
+        .iter()
+        .map(|p| format!("{}.json", p.name))
+        .collect()
+}
+
+/// Remove manifests and blobs left over from earlier exports that the
+/// current exportable set no longer covers. Only ever called on an
+/// owned tree (the [`MARKER_FILE`] gate): entries the current export
+/// wrote are exactly the keep sets, everything else is a straggler.
+fn prune_stale(
+    manifests_dir: &Path,
+    blobs_dir: &Path,
+    keep_manifests: &BTreeSet<String>,
+    keep_blobs: &BTreeSet<String>,
+) -> miette::Result<()> {
+    prune_dir(manifests_dir, keep_manifests)?;
+    prune_dir(blobs_dir, keep_blobs)
+}
+
+/// Remove the plain files of `dir` whose names are not in `keep`.
+/// Anything not a plain file (a foreign subdirectory, say) is left
+/// alone — pruning reclaims shuttle's own stale entries, nothing else.
+fn prune_dir(dir: &Path, keep: &BTreeSet<String>) -> miette::Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading {}", dir.display()))?
+    {
+        let entry = entry
+            .into_diagnostic()
+            .wrap_err_with(|| format!("reading {}", dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+        if keep.contains(&name) || !is_file {
+            continue;
+        }
+        std::fs::remove_file(entry.path())
+            .into_diagnostic()
+            .wrap_err_with(|| format!("pruning stale export entry {}", entry.path().display()))?;
+    }
+    Ok(())
 }
 
 /// The union's inbox half (ADR-0033 Decision 5 invariant): staged
@@ -602,6 +716,93 @@ mod tests {
         assert_eq!(
             std::fs::read(fx.out.join("blobs").join(h(SHARED))).unwrap(),
             b"shared-blob-bytes"
+        );
+    }
+
+    /// An owned tree (marker present) prunes on re-export: a package
+    /// removed from the store loses its manifest and its no-longer-
+    /// shared blobs; survivors stay byte-intact (ADR-0033 Decision 10).
+    #[test]
+    fn owned_reexport_prunes_removed_packages() {
+        let fx = fabricate();
+        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fx.out.join(MARKER_FILE))
+                .unwrap()
+                .trim(),
+            MARKER_VERSION,
+            "every export writes the ownership marker"
+        );
+
+        // beta leaves the store: generation 1 is rewritten with alpha.
+        let gen_dir = fx.store.generation_dir(1);
+        let mut gen: Generation =
+            serde_json::from_str(&std::fs::read_to_string(gen_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        gen.packages.remove("beta");
+        std::fs::write(
+            gen_dir.join("manifest.json"),
+            serde_json::to_vec(&gen).unwrap(),
+        )
+        .unwrap();
+
+        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
+
+        assert!(
+            !fx.out.join("manifests").join("beta.json").exists(),
+            "stale manifest pruned"
+        );
+        assert!(
+            !fx.out.join("blobs").join(h(BETA_ONLY)).exists(),
+            "stale blob pruned"
+        );
+        assert!(
+            fx.out.join("manifests").join("alpha.json").exists()
+                && fx.out.join("manifests").join("gamma.json").exists(),
+            "surviving manifests intact"
+        );
+        for keep in [h(SHARED), h(ALPHA_ONLY), h(GAMMA_BLOB)] {
+            assert!(
+                fx.out.join("blobs").join(&keep).exists(),
+                "surviving blob {keep} intact"
+            );
+        }
+        let index: IndexJson =
+            serde_json::from_str(&std::fs::read_to_string(fx.out.join("index.json")).unwrap())
+                .unwrap();
+        assert!(index.packages.iter().all(|p| p.name != "beta"));
+    }
+
+    /// A directory without the marker is foreign: re-export accumulates
+    /// and deletes nothing (a stray manifest and blob pre-seeded beside
+    /// the operator's file survive) — and it is claimed by the marker,
+    /// so the NEXT export prunes those stragglers.
+    #[test]
+    fn foreign_directory_accumulates_then_gets_claimed() {
+        let fx = fabricate();
+        std::fs::create_dir_all(fx.out.join("manifests")).unwrap();
+        std::fs::create_dir_all(fx.out.join("blobs")).unwrap();
+        let foreign = fx.out.join("operator-file.txt");
+        std::fs::write(&foreign, b"mine").unwrap();
+        let stray_manifest = fx.out.join("manifests").join("ghost.json");
+        let stray_blob = fx.out.join("blobs").join("0".repeat(64));
+        std::fs::write(&stray_manifest, b"{}").unwrap();
+        std::fs::write(&stray_blob, b"stray").unwrap();
+
+        // First export: no marker found → zero deletions.
+        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"mine");
+        assert!(stray_manifest.exists(), "marker-less dir: no deletions");
+        assert!(stray_blob.exists(), "marker-less dir: no deletions");
+
+        // Claimed by the first export: the next one prunes the strays.
+        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
+        assert!(!stray_manifest.exists(), "owned now: stale manifest pruned");
+        assert!(!stray_blob.exists(), "owned now: stale blob pruned");
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            b"mine",
+            "out-root files are never touched"
         );
     }
 
