@@ -31,7 +31,7 @@
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -181,40 +181,39 @@ enum Handled {
     File(u16, &'static str, PathBuf, u64),
 }
 
+impl Handled {
+    /// The status code the response will carry (the request log's
+    /// input — known before the bytes are written).
+    fn status(&self) -> u16 {
+        match self {
+            Handled::Body(status, ..) | Handled::File(status, ..) => *status,
+        }
+    }
+}
+
 /// Run `shuttle serve` with the CLI's bind overrides. `address`/`port`
 /// are `None` when the operator gave no flag — the defaults come from
 /// `node {}` conventions ([`DEFAULT_SERVE_ADDRESS`], loopback).
 /// `announce` + `node_name` come from `node {}` (source of truth) with
 /// the `--announce` flag as an override; `node_name: None` falls back
-/// to the kernel hostname. Serves the invoking user's default pod store
-/// (ADR-0033 Decision 5: v1 scope is the pod store, foreground, no
-/// daemonization).
+/// to the kernel hostname. `pod` is the `--pod` flag: the named pod's
+/// store is the served surface (default `default`, matching the
+/// `--pod` flags on `pull` and `export`). Foreground until
+/// interrupted; no daemonization (ADR-0033 Decision 5).
 pub fn run(
     address: Option<&str>,
     port: Option<u16>,
     announce: bool,
     node_name: Option<&str>,
+    pod: Option<&str>,
 ) -> miette::Result<()> {
-    let pod_root = crate::pod::pod_root(None);
-    let pod_dir = crate::pod::pod_dir(&pod_root, crate::pod::DEFAULT_POD);
-    if !pod_dir.is_dir() {
-        miette::bail!(
-            "no pod store at {} — nothing to serve; sync a pod first \
-             (`shuttle pod sync`)",
-            pod_dir.display()
-        );
-    }
-    let ctx = ServerCtx {
-        store: Arc::new(crate::pod::pod_store(&pod_dir)),
-        home: PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())),
-    };
+    let (pod_name, ctx) = serve_ctx(&crate::pod::pod_root(None), pod)?;
     let (host, port) = resolve_bind(address, port)?;
     let listener = TcpListener::bind((host.as_str(), port))
         .into_diagnostic()
         .wrap_err_with(|| format!("binding serve address {host}:{port}"))?;
     crate::output::info(format!(
-        "serving pod '{}' store on http://{host}:{port} — Ctrl-C to stop",
-        crate::pod::DEFAULT_POD
+        "serving pod '{pod_name}' store on http://{host}:{port} — Ctrl-C to stop"
     ));
     // The guard binds the registration to the serve loop's lifetime —
     // it is dropped only when the loop exits (i.e. never in practice:
@@ -246,6 +245,29 @@ pub fn run(
         None
     };
     accept_loop(listener, ctx, Arc::new(AtomicUsize::new(0)))
+}
+
+/// Resolve the pod to serve under an explicit pod root: the `--pod`
+/// name ([`crate::pod::resolve_pod_dir_under`]) plus the
+/// store-existence gate. Split from [`run`] so tests can point the
+/// pod root at a tempdir and observe which store a pod flag selects.
+/// A missing store is a named error — the pod that was asked for and
+/// where it was looked for.
+fn serve_ctx(pod_root: &Path, pod: Option<&str>) -> miette::Result<(String, ServerCtx)> {
+    let (pod_name, pod_dir) = crate::pod::resolve_pod_dir_under(pod_root, pod)?;
+    if !pod_dir.is_dir() {
+        miette::bail!(
+            "no store for pod '{pod_name}' at {} — nothing to serve; \
+             sync a pod first (`shuttle pod sync`)",
+            pod_dir.display()
+        );
+    }
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let ctx = ServerCtx {
+        store: Arc::new(crate::pod::pod_store(&pod_dir)),
+        home,
+    };
+    Ok((pod_name, ctx))
 }
 
 /// Merge the CLI overrides onto the default address: `--address`
@@ -283,6 +305,10 @@ fn accept_loop(listener: TcpListener, ctx: ServerCtx, active: Arc<AtomicUsize>) 
             continue;
         };
         if active.load(Ordering::Relaxed) >= MAX_CONCURRENT_CONNECTIONS {
+            crate::output::warn(format!(
+                "connection limit reached ({MAX_CONCURRENT_CONNECTIONS}) — \
+                 refusing a peer with 503"
+            ));
             let mut stream = stream;
             drain_available(&mut stream);
             let _ = write_response(
@@ -338,15 +364,47 @@ fn serve_connection(mut stream: TcpStream, ctx: &ServerCtx) -> std::io::Result<(
         }
         Head::Closed => return Ok(()),
     };
+    let (method, path) = request_target(&line);
     match parse_request(&line) {
         Ok(route) => match dispatch(ctx, &route) {
-            Ok(handled) => write_handled(&mut stream, handled),
-            Err(e) => write_json_error(&mut stream, 500, &format!("{e}")),
+            Ok(handled) => {
+                log_request(method, path, handled.status());
+                write_handled(&mut stream, handled)
+            }
+            Err(e) => {
+                log_request(method, path, 500);
+                write_json_error(&mut stream, 500, &format!("{e}"))
+            }
         },
-        Err(405) => write_json_error(&mut stream, 405, "GET only"),
-        Err(404) => write_json_error(&mut stream, 404, "not found"),
-        Err(_) => write_json_error(&mut stream, 400, "malformed request"),
+        Err(405) => {
+            log_request(method, path, 405);
+            write_json_error(&mut stream, 405, "GET only")
+        }
+        Err(404) => {
+            log_request(method, path, 404);
+            write_json_error(&mut stream, 404, "not found")
+        }
+        Err(_) => {
+            log_request(method, path, 400);
+            write_json_error(&mut stream, 400, "malformed request")
+        }
     }
+}
+
+/// The (method, path) pair of a request line, verbatim from the wire —
+/// display text for the request log, never a path.
+fn request_target(line: &str) -> (&str, &str) {
+    let mut tokens = line.split_whitespace();
+    match (tokens.next(), tokens.next()) {
+        (Some(method), Some(path)) => (method, path),
+        _ => ("-", "-"),
+    }
+}
+
+/// One line per handled request: method, path, status — the serving
+/// surface's whole observability story.
+fn log_request(method: &str, path: &str, status: u16) {
+    crate::output::info(format!("{method} {path} → {status}"));
 }
 
 /// Route a validated request to its handler.
@@ -997,5 +1055,89 @@ mod tests {
         drop(holders);
         wait_for_active(&fx, 0);
         assert_eq!(get(addr, "/info").0, 200);
+    }
+
+    /// A pod directory whose generation-1 store holds exactly one
+    /// package (`pkg`) with a single blob — enough for `/info` to
+    /// identify whose store is being served.
+    fn fabricate_pod(root: &Path, pod: &str, pkg: &str) {
+        let store = RuntimeStore::new(root.join(pod));
+        let body = format!("payload-of-{pkg}").into_bytes();
+        let sha = crate::oci::sha256_hex(&body);
+        let blob_path = store.blob_path(&sha);
+        fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        fs::write(&blob_path, &body).unwrap();
+
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            pkg.to_string(),
+            InstalledPackage {
+                name: pkg.to_string(),
+                version: "1.0".into(),
+                revision: 1,
+                sha3_384: "abc".into(),
+                files: vec![sha],
+                units: Vec::new(),
+                layer: crate::farm::ClaimLayer::Own,
+                apps: BTreeMap::new(),
+                requires: Vec::new(),
+                launchers: BTreeMap::new(),
+                assembly: BTreeMap::new(),
+                confined: None,
+                app_confined: BTreeMap::new(),
+                desktops: BTreeMap::new(),
+                fonts: BTreeMap::new(),
+                services: BTreeMap::new(),
+                service_bins: BTreeMap::new(),
+            },
+        );
+        let gen = Generation {
+            n: 1,
+            base_version: "24.04".into(),
+            packages,
+            created_epoch: 0,
+            boot_entry: None,
+        };
+        let gen_dir = store.generation_dir(1);
+        fs::create_dir_all(gen_dir.join("extensions")).unwrap();
+        fs::write(
+            gen_dir.join("manifest.json"),
+            serde_json::to_vec(&gen).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("generations/1", store.root().join("active")).unwrap();
+    }
+
+    /// `--pod` selects the named pod's store as the served surface
+    /// (ADR-0033 Decision 5): two pods in a tempdir root, the
+    /// non-default one served, `/info` reflects ITS inventory.
+    #[test]
+    fn serve_pod_flag_serves_the_named_pod() {
+        let root = tempfile::tempdir().unwrap();
+        fabricate_pod(root.path(), "default", "default-pod-pkg");
+        fabricate_pod(root.path(), "lab", "lab-pod-pkg");
+
+        // No flag: the default pod, as before.
+        let (name, _) = serve_ctx(root.path(), None).unwrap();
+        assert_eq!(name, "default");
+
+        let (name, ctx) = serve_ctx(root.path(), Some("lab")).unwrap();
+        assert_eq!(name, "lab");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || accept_loop(listener, ctx, Arc::new(AtomicUsize::new(0))));
+
+        let (status, _, body) = get(addr, "/info");
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let pkgs = info["packages"].as_array().unwrap();
+        assert_eq!(pkgs.len(), 1, "the served store is lab's, not default's");
+        assert_eq!(pkgs[0]["name"], "lab-pod-pkg");
+
+        // A missing store is a named refusal.
+        let err = serve_ctx(root.path(), Some("ghost"))
+            .err()
+            .expect("no such pod");
+        assert!(err.to_string().contains("ghost"), "{err}");
     }
 }

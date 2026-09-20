@@ -366,16 +366,6 @@ pub struct PullPeerReport {
 
 // ── The pipeline ──
 
-/// Resolve the target pod store from the `pod` param the way the pod
-/// commands do: named pod under the resolved pod root, `default` when
-/// None.
-fn resolve_pod_store(pod: Option<&str>) -> miette::Result<RuntimeStore> {
-    let name = pod.unwrap_or(crate::pod::DEFAULT_POD);
-    crate::pod::validate_pod_name(name)?;
-    let dir = crate::pod::pod_dir(&crate::pod::pod_root(None), name);
-    Ok(crate::pod::pod_store(&dir))
-}
-
 /// The operator keychain directory (`~/.config/shuttle/keys/`).
 fn operator_keys_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -387,7 +377,7 @@ fn operator_keys_dir() -> PathBuf {
 /// older-revision refusal (ADR-0033 Decision 7). Verifies and stages;
 /// installation stays the pod workflow.
 pub fn run(source: &PullRef, pod: Option<&str>, allow_downgrade: bool) -> miette::Result<()> {
-    let store = resolve_pod_store(pod)?;
+    let store = crate::pod::resolve_pod_store(pod)?;
     let keys = operator_keys_dir();
     let report = pull_into_store(&store, source, &keys, allow_downgrade, &CurlFetch)?;
     print_report(&report);
@@ -715,6 +705,43 @@ mod tests {
             .expect("re-pull dedups");
         assert_eq!(again.fetched.len(), 0);
         assert_eq!(again.already_present.len(), 1);
+    }
+
+    /// The staging inbox is single-file-per-package
+    /// ([`crate::pkg_manifest::manifest_path`]): staging revision N
+    /// OVERWRITES the same package's older entry — that overwrite IS
+    /// the same-package sweep the ADR approved (ADR-0033 Decision 5).
+    #[test]
+    fn restaging_a_newer_revision_overwrites_the_inbox_entry() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+
+        let older = signed_manifest(&kp); // revision 7
+        let fetch_old = FakeFetch::peer(&manifest_source(&older), &[(&blob_sha(), blob_bytes())]);
+        pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch_old)
+            .expect("revision 7 stages");
+
+        let mut newer = signed_manifest(&kp);
+        newer.revision = 9;
+        crate::pkg_manifest::sign(&mut newer, &kp).unwrap();
+        let fetch_new = FakeFetch::peer(&manifest_source(&newer), &[(&blob_sha(), blob_bytes())]);
+        pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch_new)
+            .expect("revision 9 stages");
+
+        let inbox = crate::pkg_manifest::manifest_path(fx.store.root(), "hello");
+        let staged: PackageManifest =
+            serde_json::from_slice(&std::fs::read(&inbox).unwrap()).unwrap();
+        assert_eq!(staged.revision, 9, "the newer revision owns the file");
+
+        let siblings: Vec<String> = std::fs::read_dir(inbox.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            siblings,
+            vec!["hello.json".to_string()],
+            "no sibling inbox entries may appear"
+        );
     }
 
     #[test]
