@@ -41,8 +41,8 @@ use std::path::{Path, PathBuf};
 use miette::{IntoDiagnostic, WrapErr};
 use serde::{Deserialize, Serialize};
 
-use crate::pkg_manifest::{self, InstallMeta, ManifestFile, PackageManifest};
-use crate::runtime::{Generation, InstalledPackage, RuntimeStore};
+use crate::pkg_manifest::{self, PackageManifest};
+use crate::runtime::{Generation, RuntimeStore};
 use crate::sign::KeyPair;
 
 /// One package row of `index.json`.
@@ -86,8 +86,8 @@ pub fn run(out: &str, pod: Option<&str>) -> miette::Result<()> {
 /// tests can inject the store root and signing-key home.
 fn run_at(out: &Path, store: &RuntimeStore, home: &Path) -> miette::Result<()> {
     let generation = store.active_generation()?;
-    let inbox = inbox_manifests(store.root())?;
-    let inbox_only = union_inbox(&generation, &inbox);
+    let inbox = pkg_manifest::inbox_manifests(store.root())?;
+    let inbox_only = pkg_manifest::union_inbox(&generation, &inbox);
     ensure_exportable(store.root(), &generation, &inbox_only)?;
     let (manifests_dir, blobs_dir) = prepare_dirs(out)?;
     // Ownership is decided from the directory AS FOUND: a tree shuttle
@@ -123,7 +123,7 @@ fn run_at(out: &Path, store: &RuntimeStore, home: &Path) -> miette::Result<()> {
     // index.json is written LAST: a half-updated mirror never advertises
     // packages whose manifests/blobs have not landed yet.
     let index = IndexJson {
-        name: hostname(),
+        name: pkg_manifest::hostname(),
         packages,
     };
     write_json(&out.join("index.json"), &index)
@@ -224,23 +224,6 @@ fn prune_dir(dir: &Path, keep: &BTreeSet<String>) -> miette::Result<()> {
     Ok(())
 }
 
-/// The union's inbox half (ADR-0033 Decision 5 invariant): staged
-/// manifests whose package is NOT in the current generation — those are
-/// exported verbatim instead of minted fresh.
-fn union_inbox<'a>(
-    generation: &Option<Generation>,
-    inbox: &'a [(String, PathBuf)],
-) -> Vec<&'a (String, PathBuf)> {
-    let gen_names: BTreeSet<&str> = generation
-        .as_ref()
-        .map(|g| g.packages.keys().map(String::as_str).collect())
-        .unwrap_or_default();
-    inbox
-        .iter()
-        .filter(|(name, _)| !gen_names.contains(name.as_str()))
-        .collect()
-}
-
 /// An empty store is a clear error, not an empty tree: nothing is
 /// exportable when the generation carries no packages AND the inbox is
 /// empty.
@@ -294,7 +277,7 @@ fn export_generation(
         if signing.is_none() {
             signing = Some(pkg_manifest::load_signing_key(home)?);
         }
-        let mut manifest = mint_manifest(record);
+        let mut manifest = pkg_manifest::mint_manifest(record);
         pkg_manifest::sign(&mut manifest, signing.as_ref().expect("key loaded above"))?;
         write_json(
             &manifests_dir.join(format!("{}.json", record.name)),
@@ -314,7 +297,10 @@ fn export_generation(
 
 /// Copy the inbox-only manifests VERBATIM plus their blobs. The stored
 /// manifest is read only to learn the blob set and index row — it is
-/// never altered or re-signed (it arrived signed from a peer).
+/// never altered or re-signed (it arrived signed from a peer). Its
+/// declared blob addresses are still trust-boundary-validated before
+/// anything touches `store.blob_path` — a malformed sha256 in a staged
+/// manifest never becomes a path.
 fn export_inbox(
     store: &RuntimeStore,
     manifests_dir: &Path,
@@ -324,26 +310,59 @@ fn export_inbox(
     packages: &mut Vec<IndexPackage>,
 ) -> miette::Result<()> {
     for (name, path) in inbox_only {
-        let raw = std::fs::read(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("reading staged manifest {}", path.display()))?;
-        let manifest: PackageManifest = serde_json::from_slice(&raw).map_err(|e| {
-            miette::miette!(
-                "staged manifest {} for package '{name}' does not parse: {e}",
-                path.display()
-            )
-        })?;
-        std::fs::copy(path, manifests_dir.join(format!("{name}.json")))
-            .into_diagnostic()
-            .wrap_err_with(|| format!("copying staged manifest for '{name}'"))?;
-        for file in &manifest.files {
-            copy_blob(store, blobs_dir, &file.sha256, name, copied)?;
-        }
-        packages.push(IndexPackage {
-            name: name.clone(),
-            version: manifest.version,
-            revision: manifest.revision,
-        });
+        export_one_staged(
+            store,
+            manifests_dir,
+            blobs_dir,
+            name,
+            path,
+            copied,
+            packages,
+        )?;
+    }
+    Ok(())
+}
+
+/// One staged manifest, verbatim + its blob set, into the tree.
+fn export_one_staged(
+    store: &RuntimeStore,
+    manifests_dir: &Path,
+    blobs_dir: &Path,
+    name: &str,
+    path: &PathBuf,
+    copied: &mut BTreeSet<String>,
+    packages: &mut Vec<IndexPackage>,
+) -> miette::Result<()> {
+    let raw = std::fs::read(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading staged manifest {}", path.display()))?;
+    let manifest: PackageManifest = serde_json::from_slice(&raw).map_err(|e| {
+        miette::miette!(
+            "staged manifest {} for package '{name}' does not parse: {e}",
+            path.display()
+        )
+    })?;
+    validate_staged_hashes(name, &manifest)?;
+    std::fs::copy(path, manifests_dir.join(format!("{name}.json")))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("copying staged manifest for '{name}'"))?;
+    for file in &manifest.files {
+        copy_blob(store, blobs_dir, &file.sha256, name, copied)?;
+    }
+    packages.push(IndexPackage {
+        name: name.to_string(),
+        version: manifest.version,
+        revision: manifest.revision,
+    });
+    Ok(())
+}
+
+/// Trust-boundary validation of a staged manifest's declared blob
+/// addresses BEFORE any of them becomes a path: 64 lowercase hex, each.
+fn validate_staged_hashes(name: &str, manifest: &PackageManifest) -> miette::Result<()> {
+    for file in &manifest.files {
+        pkg_manifest::validate_sha256(file)
+            .wrap_err_with(|| format!("staged manifest for package '{name}'"))?;
     }
     Ok(())
 }
@@ -377,100 +396,12 @@ fn copy_blob(
     Ok(())
 }
 
-/// Mint a [`PackageManifest`] from a generation record (ADR-0033
-/// Decision 2). The record keeps per-file CONTENT ADDRESSES only — no
-/// payload paths and no executable bits — so `files[].path` carries the
-/// store identity (the sha256 itself) and `executable` is true for the
-/// recorded command binaries (apps, confined launchers, service
-/// binaries — the farm links those for direct execution). `install`
-/// mirrors the snap.yaml-derived records verbatim: metadata travels,
-/// never re-derived. `signer`/`signature` are stamped by
-/// [`pkg_manifest::sign`].
-fn mint_manifest(record: &InstalledPackage) -> PackageManifest {
-    let binaries: BTreeSet<&str> = record
-        .apps
-        .values()
-        .chain(record.launchers.values())
-        .chain(record.service_bins.values())
-        .map(String::as_str)
-        .collect();
-    let files: Vec<ManifestFile> = record
-        .files
-        .iter()
-        .map(|sha256| ManifestFile {
-            path: sha256.clone(),
-            sha256: sha256.clone(),
-            executable: binaries.contains(sha256.as_str()),
-        })
-        .collect();
-    PackageManifest {
-        name: record.name.clone(),
-        version: record.version.clone(),
-        revision: record.revision,
-        target: host_triplet(),
-        files,
-        install: InstallMeta {
-            units: record.units.clone(),
-            apps: record.apps.clone(),
-            launchers: record.launchers.clone(),
-            assembly: record.assembly.clone(),
-            confined: record.confined.clone(),
-            app_confined: record.app_confined.clone(),
-            desktops: record.desktops.clone(),
-            fonts: record.fonts.clone(),
-            services: record.services.clone(),
-            service_bins: record.service_bins.clone(),
-            requires: record.requires.clone(),
-        },
-        signer: String::new(),
-        signature: String::new(),
-    }
-}
-
-/// GNU triplet for the running architecture — the best target record
-/// available at export time (the pod store keeps no per-package build
-/// triplet; payloads are host-arch glibc binaries).
-fn host_triplet() -> String {
-    format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
-}
-
-/// The pull-staging inbox: staged peer manifests under
-/// `<root>/store/manifests/` (see [`pkg_manifest::manifest_path`] for
-/// the layout invariant), sorted by package name. A missing directory
-/// is an empty inbox — an installed-only store is exportable.
-fn inbox_manifests(store_root: &Path) -> miette::Result<Vec<(String, PathBuf)>> {
-    let dir = store_root.join("store").join("manifests");
-    let Ok(read) = std::fs::read_dir(&dir) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for entry in read {
-        let entry = entry
-            .into_diagnostic()
-            .wrap_err_with(|| format!("reading {}", dir.display()))?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        out.push((stem.to_string(), path));
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
-}
-
-/// The publishing host name (the `/info` identity): the kernel's view
-/// at `/proc/sys/kernel/hostname`. `unknown` when unreadable — a label,
-/// never trust state.
-fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".into())
-}
+// Minting lives in [`pkg_manifest::mint_manifest`] — the one mint both
+// serve and export call, so a mirror's `manifests/<pkg>.json` is byte-
+// identical to what `/manifests/<pkg>` serves (ADR-0033 Decision 2).
+// The inbox listing is [`pkg_manifest::inbox_manifests`] and the
+// publishing host name [`pkg_manifest::hostname`] — both shared with
+// `serve /info`.
 
 /// Stable serde JSON to disk (struct field order + BTreeMap key order =
 /// deterministic bytes; pretty-printed for mirror inspection).
@@ -485,6 +416,8 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> miette::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pkg_manifest::{InstallMeta, ManifestFile};
+    use crate::runtime::InstalledPackage;
     use sha2::Digest as _;
     use std::collections::BTreeMap;
 
@@ -674,6 +607,28 @@ mod tests {
         }
     }
 
+    /// A staged inbox manifest carrying a malformed blob address is
+    /// refused BEFORE the address becomes a store path — trust-
+    /// boundary validation on export's verbatim-inbox lane.
+    #[test]
+    fn export_refuses_a_staged_manifest_with_malformed_blob_hashes() {
+        let fx = fabricate();
+        let inbox_path = pkg_manifest::manifest_path(fx.store.root(), "gamma");
+        let mut gamma: PackageManifest =
+            serde_json::from_str(&std::fs::read_to_string(&inbox_path).unwrap()).unwrap();
+        gamma.files[0].sha256 = "../../etc/passwd".to_string();
+        std::fs::write(&inbox_path, serde_json::to_vec(&gamma).unwrap()).unwrap();
+
+        let err = run_at(&fx.out, &fx.store, fx._home.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("64 lowercase hex"), "names the rule: {msg}");
+        assert!(msg.contains("gamma"), "names the package: {msg}");
+        assert!(
+            !fx.out.join("manifests").join("gamma.json").exists(),
+            "nothing copied for a malformed staged manifest"
+        );
+    }
+
     #[test]
     fn missing_blob_names_package_and_hash() {
         let fx = fabricate();
@@ -819,7 +774,7 @@ mod tests {
         rec.apps = apps.clone();
         rec.requires = vec!["libc6".into()];
 
-        let manifest = mint_manifest(&rec);
+        let manifest = pkg_manifest::mint_manifest(&rec);
         assert_eq!(manifest.install.apps, apps);
         assert_eq!(manifest.install.requires, vec!["libc6".to_string()]);
         // The command binary is the one file marked executable.

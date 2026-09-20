@@ -9,19 +9,25 @@
 //! # Verification order (ADR-0033 Decision 7, fail-closed)
 //!
 //! 1. JSON parse of the fetched manifest.
-//! 2. Signature: revocation check FIRST
+//! 2. Signature: revocation check FIRST over the UNION of the device
+//!    image's revocation list and the operator keychain's
 //!    ([`crate::sign::reject_revoked`]), then the strict trust set —
-//!    [`crate::pkg_manifest::verify`] is tried for every key loaded from
-//!    the operator keychain ([`crate::sign::keys_dir`]). The ANY-anchor
-//!    shortcut [`crate::sign::verify_keychain`] is NEVER used on this
-//!    path: an unverified manifest is refused and named, never
+//!    [`crate::sign::verify_trust_set`] over the merged anchor set
+//!    (device image-baked trusted-keys + legacy single anchor +
+//!    operator keychain, the same walk
+//!    [`crate::runtime`] does for channel manifests). The ANY-anchor
+//!    shortcut [`crate::sign::verify_keychain`] alone is NEVER enough
+//!    here: an unverified manifest is refused and named, never
 //!    provisionally accepted, never TOFU.
-//! 3. Freshness gate: an installed revision newer than the incoming
-//!    one is refused unless `--allow-downgrade`.
-//! 4. Every manifest blob: present in the store → its sha256 is
+//! 3. Target gate: a manifest built for another GNU triplet is
+//!    refused before anything downloads.
+//! 4. Freshness gate: a revision older than the newest the pod holds
+//!    (installed or staged-inbox) is refused unless
+//!    `--allow-downgrade`.
+//! 5. Every manifest blob: present in the store → its sha256 is
 //!    re-verified and the download skipped; absent → fetched, hashed,
 //!    hard-refused on mismatch, written atomically.
-//! 5. The verified manifest lands in the staging inbox.
+//! 6. The verified manifest lands in the staging inbox.
 //!
 //! Transport is the repo's one network convention: curl behind
 //! [`crate::command::CommandRunner`] (`src/oci.rs` precedent), with a
@@ -95,11 +101,24 @@ fn curl_failure_hint(code: i32) -> &'static str {
 
 // ── URL mapping (Decision 4 peer grammar / Decision 10 export tree) ──
 
+/// The host as it belongs in an http URL: IPv6 literals re-bracketed —
+/// the parsed `host` is the bare literal (`::1`), URLs require `[..]`.
+fn host_for_url(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
 /// The manifest endpoint for `pkg`: `http://host:port/manifests/<pkg>`
 /// from a peer; `<dir>/manifests/<pkg>.json` from a static tree.
 fn manifest_url(source: &PullRef, pkg: &str) -> miette::Result<String> {
     match source {
-        PullRef::Peer { host, port, .. } => Ok(format!("http://{host}:{port}/manifests/{pkg}")),
+        PullRef::Peer { host, port, .. } => Ok(format!(
+            "http://{}:{port}/manifests/{pkg}",
+            host_for_url(host)
+        )),
         PullRef::Url { url, .. } => {
             let dir = url_dir(url.as_str(), pkg)?;
             Ok(format!("{dir}/manifests/{pkg}.json"))
@@ -114,7 +133,9 @@ fn manifest_url(source: &PullRef, pkg: &str) -> miette::Result<String> {
 /// from a peer; `<dir>/blobs/<hash>` from a static tree.
 fn blob_url(source: &PullRef, pkg: &str, hash: &str) -> miette::Result<String> {
     match source {
-        PullRef::Peer { host, port, .. } => Ok(format!("http://{host}:{port}/blobs/{hash}")),
+        PullRef::Peer { host, port, .. } => {
+            Ok(format!("http://{}:{port}/blobs/{hash}", host_for_url(host)))
+        }
         PullRef::Url { url, .. } => {
             let dir = url_dir(url.as_str(), pkg)?;
             Ok(format!("{dir}/blobs/{hash}"))
@@ -136,7 +157,9 @@ fn url_dir<'a>(raw: &'a str, pkg: &str) -> miette::Result<&'a str> {
 /// The reference as originally spelled (report label).
 fn reference_string(source: &PullRef) -> String {
     match source {
-        PullRef::Peer { host, port, pkg } => format!("shuttle://{host}:{port}/{pkg}"),
+        PullRef::Peer { host, port, pkg } => {
+            format!("shuttle://{}:{port}/{pkg}", host_for_url(host))
+        }
         PullRef::Url { url, .. } => url.as_str().to_string(),
         PullRef::Oci(_) => "oci".to_string(),
     }
@@ -162,101 +185,99 @@ fn pkg_name(source: &PullRef) -> miette::Result<&str> {
 // ── Freshness gate (Decision 7) ──
 
 /// The freshness rule: a manifest whose revision is OLDER than the
-/// installed one for that name is refused unless `--allow-downgrade`
-/// is explicit. Equal or newer revisions always pass; nothing
-/// installed passes.
-fn check_downgrade(
-    installed: Option<u32>,
-    incoming: u32,
-    allow_downgrade: bool,
-) -> miette::Result<()> {
-    let Some(installed) = installed else {
+/// newest revision the pod already holds for that name is refused
+/// unless `--allow-downgrade` is explicit. Equal or newer revisions
+/// always pass; nothing held passes.
+fn check_downgrade(known: Option<u32>, incoming: u32, allow_downgrade: bool) -> miette::Result<()> {
+    let Some(known) = known else {
         return Ok(());
     };
-    if installed <= incoming || allow_downgrade {
+    if known <= incoming || allow_downgrade {
         return Ok(());
     }
     miette::bail!(
-        "package is installed at revision {installed}; the incoming manifest is revision \
-         {incoming} — refusing downgrade (pass --allow-downgrade to accept it)"
+        "package is already at revision {known} (installed or staged in the inbox); \
+         the incoming manifest is revision {incoming} — refusing downgrade \
+         (pass --allow-downgrade to accept it)"
     );
 }
 
-/// The installed revision of `pkg` from the pod's current generation
-/// manifest — None when nothing is installed yet.
-fn installed_revision(store: &RuntimeStore, pkg: &str) -> miette::Result<Option<u32>> {
-    Ok(store
+/// The newest revision the pod already holds for `pkg`: the max of the
+/// active generation's installed revision and any staged inbox
+/// manifest's revision. A newer staged entry gates an older incoming
+/// one exactly like an installed one — otherwise a peer could silently
+/// walk a staged revision back without `--allow-downgrade`.
+fn known_revision(store: &RuntimeStore, pkg: &str) -> miette::Result<Option<u32>> {
+    let installed = store
         .active_generation()?
-        .and_then(|g| g.packages.get(pkg).map(|p| p.revision)))
+        .and_then(|g| g.packages.get(pkg).map(|p| p.revision));
+    let inbox = crate::pkg_manifest::manifest_path(store.root(), pkg);
+    let staged = match std::fs::read(&inbox) {
+        Ok(raw) => Some(
+            serde_json::from_slice::<PackageManifest>(&raw)
+                .map_err(|e| {
+                    miette::miette!(
+                        "staged inbox manifest {} does not parse — refusing to gate against \
+                     an unknown revision: {e}",
+                        inbox.display()
+                    )
+                })?
+                .revision,
+        ),
+        Err(_) => None,
+    };
+    Ok(installed.max(staged))
 }
 
 // ── Trust (Decision 7: fail-closed, revoked-first, never TOFU) ──
 
-/// Verify the manifest against the operator keychain at `keys_dir`.
-/// Revoked-first (a signature under a revoked id is a hard refusal
-/// even before trust is consulted), then the strict trust set: the
-/// manifest must carry a signature from a key that is BOTH listed in
-/// the keychain AND cryptographically valid over the canonical bytes.
-/// Returns the key id that verified.
-fn verify_trust(pkg_manifest: &PackageManifest, keys_dir: &Path) -> miette::Result<String> {
+/// The peer-lane trust decision, walking the SAME anchors the runtime
+/// install path walks (`runtime::verify_against_anchors`): the device
+/// image-baked set (`<anchor-dir>/trusted-keys` + legacy single anchor)
+/// AND the operator keychain. Revocation runs first over the UNION of
+/// the device image's list and the operator's, so a key revoked on the
+/// device image is refused even while the operator keychain still
+/// carries it. Verification is the ONE strict verifier,
+/// [`crate::sign::verify_trust_set`] (revoked-first + ANY-anchor over
+/// the merged chain): the manifest must carry a signature from a key
+/// that is BOTH anchored locally AND cryptographically valid over the
+/// canonical bytes. Empty everywhere fails closed with a named refusal.
+fn verify_trust(
+    pkg_manifest: &PackageManifest,
+    anchor: &Path,
+    keys_dir: &Path,
+) -> miette::Result<String> {
     let signatures = BTreeMap::from([(
         pkg_manifest.signer.clone(),
         serde_json::Value::String(pkg_manifest.signature.clone()),
     )]);
-    let revoked = crate::sign::read_revoked_keys(keys_dir)?;
-    crate::sign::reject_revoked(&signatures, &revoked)?;
+    let canonical = crate::pkg_manifest::canonical_bytes(pkg_manifest)?;
 
-    let chain = crate::sign::Keychain::load_dir(keys_dir)?;
-    if chain.is_empty() {
-        return Err(miette::miette!(
-            "no trusted keys loaded from {} — refusing to verify the manifest for '{}' \
-             (fail closed; anchors come from the key ceremony, never the wire)",
-            keys_dir.display(),
-            pkg_manifest.name
-        ));
+    let revoked = crate::runtime::embedded_revoked_keys(anchor, keys_dir)?;
+
+    let mut chain = crate::sign::Keychain::load_dir(&crate::runtime::trusted_keys_dir(anchor))?;
+    // The legacy single-anchor fallback (images built before the set
+    // shape existed) is best-effort, exactly as on the runtime path:
+    // an unreadable legacy anchor is "no legacy anchor", not an error.
+    if let Ok(legacy) = crate::sign::Keychain::load_pub_file(anchor) {
+        chain.merge(legacy);
     }
-    if !chain.key_ids().contains(&pkg_manifest.signer) {
-        return Err(miette::miette!(
-            "manifest for '{}' is signed by key id '{}' which is not in the trusted set \
-             at {} — refusing (unverified manifests are never provisionally accepted, \
-             never TOFU)",
+    chain.merge(crate::sign::Keychain::load_dir(keys_dir)?);
+
+    crate::sign::verify_trust_set(&canonical, &signatures, &chain, &revoked).map_err(|e| {
+        miette::miette!(
+            "manifest for '{}' signed by key id '{}' verifies under no trusted anchor \
+             (device image anchors: {}, operator keychain: {}) — refusing \
+             (unverified manifests are never provisionally accepted, never TOFU): {e}",
             pkg_manifest.name,
             pkg_manifest.signer,
+            crate::runtime::trusted_keys_dir(anchor).display(),
             keys_dir.display()
-        ));
-    }
-    for (key_id, public) in chain.entries_for_verify() {
-        let public_hex: String = public.iter().map(|b| format!("{b:02x}")).collect();
-        if crate::pkg_manifest::verify(pkg_manifest, &public_hex).is_ok() {
-            return Ok(key_id);
-        }
-    }
-    Err(miette::miette!(
-        "signature of the manifest for '{}' does not verify under trusted key '{}' — \
-         refusing (the manifest may be tampered or the signature malformed)",
-        pkg_manifest.name,
-        pkg_manifest.signer
-    ))
+        )
+    })
 }
 
 // ── Blob staging ──
-
-/// A manifest's declared blob hash must be exactly 64 lowercase hex —
-/// the same content-address discipline the store and the wire grammar
-/// use; anything else is refused before it can reach a path.
-fn validate_sha256(file: &ManifestFile) -> miette::Result<()> {
-    let malformed = file.sha256.len() != 64
-        || !file.sha256.bytes().all(|b| b.is_ascii_hexdigit())
-        || file.sha256.bytes().any(|b| b.is_ascii_uppercase());
-    if malformed {
-        miette::bail!(
-            "manifest file '{}' carries malformed sha256 {:?} — expected 64 lowercase hex chars",
-            file.path,
-            file.sha256
-        );
-    }
-    Ok(())
-}
 
 /// Write `bytes` to `dest` atomically: temp file beside the
 /// destination, then rename — a crash never leaves a half-written
@@ -374,21 +395,28 @@ fn operator_keys_dir() -> PathBuf {
 
 /// Run a peer or static pull for `source` into the named pod (`None` =
 /// the default pod). `allow_downgrade` lifts the freshness rule's
-/// older-revision refusal (ADR-0033 Decision 7). Verifies and stages;
+/// older-revision refusal (ADR-0033 Decision 7). Trust anchors come
+/// from the device image (`/etc/shuttle/update-key.pub` — the runtime
+/// anchor) AND the operator keychain. Verifies and stages;
 /// installation stays the pod workflow.
 pub fn run(source: &PullRef, pod: Option<&str>, allow_downgrade: bool) -> miette::Result<()> {
     let store = crate::pod::resolve_pod_store(pod)?;
     let keys = operator_keys_dir();
-    let report = pull_into_store(&store, source, &keys, allow_downgrade, &CurlFetch)?;
+    let anchor = PathBuf::from(crate::runtime::DEVICE_ANCHOR);
+    let report = pull_into_store(&store, source, &anchor, &keys, allow_downgrade, &CurlFetch)?;
     print_report(&report);
     Ok(())
 }
 
-/// The lane body over an injected store root, keychain directory and
-/// transport — the testable core of [`run`].
+/// The lane body over an injected store root, trust-anchor paths and
+/// transport — the testable core of [`run`]. `anchor` is the device
+/// image anchor path (its siblings `trusted-keys/` and `revoked-keys`
+/// are consulted beside it, mirroring [`crate::runtime`]'s walk);
+/// `keys_dir` is the operator keychain.
 pub fn pull_into_store<F: Fetch>(
     store: &RuntimeStore,
     source: &PullRef,
+    anchor: &Path,
     keys_dir: &Path,
     allow_downgrade: bool,
     fetch: &F,
@@ -396,7 +424,8 @@ pub fn pull_into_store<F: Fetch>(
     let pkg = pkg_name(source)?.to_string();
 
     // 1. Fetch the manifest, 2. parse it, 3. verify fail-closed, 4.
-    // gate freshness — all BEFORE any blob moves.
+    // gate target + freshness + boundary-validate the declared files —
+    // all BEFORE any blob moves.
     let manifest_url = manifest_url(source, &pkg)?;
     let manifest_bytes = fetch
         .get(&manifest_url)
@@ -412,12 +441,22 @@ pub fn pull_into_store<F: Fetch>(
             manifest.name
         );
     }
-    let signer = verify_trust(&manifest, keys_dir)?;
-    let installed = installed_revision(store, &pkg)?;
-    check_downgrade(installed, manifest.revision, allow_downgrade)?;
+    let host = crate::pkg_manifest::host_target();
+    if manifest.target != host {
+        miette::bail!(
+            "manifest for '{}' targets '{}' but this host is '{host}' — refusing to pull \
+             foreign-target content",
+            manifest.name,
+            manifest.target
+        );
+    }
+    let signer = verify_trust(&manifest, anchor, keys_dir)?;
+    let known = known_revision(store, &pkg)?;
+    check_downgrade(known, manifest.revision, allow_downgrade)?;
 
     for file in &manifest.files {
-        validate_sha256(file)?;
+        crate::pkg_manifest::validate_payload_path(file)?;
+        crate::pkg_manifest::validate_sha256(file)?;
     }
 
     // 5. Stage the blobs, 6. stage the verified manifest (the inbox —
@@ -510,7 +549,7 @@ mod tests {
             name: "hello".to_string(),
             version: "2.10".to_string(),
             revision: 7,
-            target: "x86_64-linux-gnu".to_string(),
+            target: crate::pkg_manifest::host_target(),
             files: vec![ManifestFile {
                 path: "usr/bin/hello".to_string(),
                 sha256: blob_sha(),
@@ -557,32 +596,74 @@ mod tests {
         }
     }
 
-    /// A store in a tempdir with its operator keychain in a second
-    /// tempdir. The trusted key set is [kp].
+    /// A store in a tempdir, its operator keychain in a second tempdir,
+    /// and the device-image anchor tree in a third (the anchor path is
+    /// `<anchor_dir>/update-key.pub`; its `trusted-keys/` and
+    /// `revoked-keys` siblings are what the verify walk consults). The
+    /// trusted operator key set is [kp]; the device set starts empty.
     struct Fixture {
         _store_dir: tempfile::TempDir,
         _keys_dir: tempfile::TempDir,
+        _anchor_dir: tempfile::TempDir,
         store: RuntimeStore,
         keys: PathBuf,
+        anchor: PathBuf,
+        anchor_dir: PathBuf,
     }
 
     impl Fixture {
         fn with_trust(kp: &crate::sign::KeyPair) -> Fixture {
             let store_dir = tempfile::tempdir().unwrap();
             let keys_dir = tempfile::tempdir().unwrap();
+            let anchor_dir = tempfile::tempdir().unwrap();
             crate::sign::install_public_key(kp, keys_dir.path()).unwrap();
             let store = RuntimeStore::new(store_dir.path().to_path_buf());
             let keys = keys_dir.path().to_path_buf();
+            let anchor = anchor_dir.path().join("update-key.pub");
             Fixture {
                 _store_dir: store_dir,
                 _keys_dir: keys_dir,
+                anchor_dir: anchor_dir.path().to_path_buf(),
+                _anchor_dir: anchor_dir,
                 store,
                 keys,
+                anchor,
             }
         }
 
-        fn list_revoked(&self, key_id: &str) {
+        /// Bake `kp` into the DEVICE image trust set (the trusted-keys
+        /// directory beside the anchor).
+        fn install_device_anchor(&self, kp: &crate::sign::KeyPair) {
+            crate::sign::install_public_key(kp, &self.anchor_dir.join("trusted-keys")).unwrap();
+        }
+
+        /// List a key id in the DEVICE image revocation list.
+        fn list_device_revoked(&self, key_id: &str) {
+            std::fs::write(self.anchor_dir.join("revoked-keys"), format!("{key_id}\n")).unwrap();
+        }
+
+        /// List a key id in the OPERATOR revocation list.
+        fn list_operator_revoked(&self, key_id: &str) {
             std::fs::write(self.keys.join("revoked-keys"), format!("{key_id}\n")).unwrap();
+        }
+
+        /// Empty the operator keychain (a device with no operator keys
+        /// — trust must come from the image anchors alone).
+        fn clear_operator_keychain(&self) {
+            for entry in std::fs::read_dir(&self.keys).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) == Some("pub") {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+
+        /// Write `manifest` directly into the pull-staging inbox (as a
+        /// prior peer pull would have).
+        fn stage_inbox(&self, manifest: &PackageManifest) {
+            let inbox = crate::pkg_manifest::manifest_path(self.store.root(), &manifest.name);
+            std::fs::create_dir_all(inbox.parent().unwrap()).unwrap();
+            std::fs::write(&inbox, serde_json::to_vec_pretty(manifest).unwrap()).unwrap();
         }
 
         /// Seed an active generation 1 with `pkg` installed at
@@ -659,6 +740,35 @@ mod tests {
         );
     }
 
+    /// Bracketed IPv6 literals: the parsed host is the bare literal and
+    /// the built URLs re-bracket it (an unbracketed `::1` in an http
+    /// URL is not parseable by curl).
+    #[test]
+    fn bracketed_ipv6_references_map_to_bracketed_urls() {
+        let r = PullRef::parse("shuttle://[::1]:7780/hello").unwrap();
+        match &r {
+            PullRef::Peer { host, port, pkg } => {
+                assert_eq!(host, "::1");
+                assert_eq!(*port, 7780);
+                assert_eq!(pkg, "hello");
+            }
+            other => panic!("expected Peer, got {other:?}"),
+        }
+        let default = PullRef::parse("shuttle://[::1]/hello").unwrap();
+        match &default {
+            PullRef::Peer { host, port, .. } => {
+                assert_eq!(host, "::1");
+                assert_eq!(*port, crate::pull_ref::DEFAULT_PEER_PORT);
+            }
+            other => panic!("expected Peer, got {other:?}"),
+        }
+        assert_eq!(
+            manifest_url(&default, "hello").unwrap(),
+            "http://[::1]:7780/manifests/hello"
+        );
+        assert_eq!(reference_string(&r), "shuttle://[::1]:7780/hello");
+    }
+
     #[test]
     fn static_urls_derive_the_export_tree_dir() {
         let r = PullRef::parse("http://mirror.test:9000/mirror/vim").unwrap();
@@ -686,7 +796,7 @@ mod tests {
         let pkg = signed_manifest(&kp);
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
 
-        let report = pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch)
+        let report = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
             .expect("a signed, fresh manifest stages");
         assert_eq!(report.fetched.len(), 1);
         assert_eq!(report.already_present.len(), 0);
@@ -701,7 +811,7 @@ mod tests {
         assert_eq!(round, pkg);
 
         // Re-pull: the blob is already present (re-verified, skipped).
-        let again = pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch)
+        let again = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
             .expect("re-pull dedups");
         assert_eq!(again.fetched.len(), 0);
         assert_eq!(again.already_present.len(), 1);
@@ -718,15 +828,29 @@ mod tests {
 
         let older = signed_manifest(&kp); // revision 7
         let fetch_old = FakeFetch::peer(&manifest_source(&older), &[(&blob_sha(), blob_bytes())]);
-        pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch_old)
-            .expect("revision 7 stages");
+        pull_into_store(
+            &fx.store,
+            &peer_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch_old,
+        )
+        .expect("revision 7 stages");
 
         let mut newer = signed_manifest(&kp);
         newer.revision = 9;
         crate::pkg_manifest::sign(&mut newer, &kp).unwrap();
         let fetch_new = FakeFetch::peer(&manifest_source(&newer), &[(&blob_sha(), blob_bytes())]);
-        pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch_new)
-            .expect("revision 9 stages");
+        pull_into_store(
+            &fx.store,
+            &peer_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch_new,
+        )
+        .expect("revision 9 stages");
 
         let inbox = crate::pkg_manifest::manifest_path(fx.store.root(), "hello");
         let staged: PackageManifest =
@@ -752,7 +876,7 @@ mod tests {
         let evil = b"tampered-payload!!".to_vec();
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), evil)]);
 
-        let err = pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch)
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
             .expect_err("a flipped blob must be refused");
         let msg = err.to_string();
         assert!(msg.contains(&blob_sha()), "names expected: {msg}");
@@ -773,7 +897,7 @@ mod tests {
         std::fs::write(&dest, b"bitrot").unwrap();
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[]);
 
-        let err = pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch)
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
             .expect_err("corrupt store content must refuse");
         assert!(err.to_string().contains("corrupt"), "{err}");
     }
@@ -786,7 +910,7 @@ mod tests {
         let pkg = signed_manifest(&impostor);
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
 
-        let err = pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch)
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
             .expect_err("an untrusted signer must be refused");
         let msg = err.to_string();
         assert!(msg.contains(&impostor.key_id()), "names the key: {msg}");
@@ -797,15 +921,79 @@ mod tests {
     fn revoked_key_manifest_is_refused_via_the_revocation_list() {
         let kp = test_kp(1);
         let fx = Fixture::with_trust(&kp);
-        fx.list_revoked(&kp.key_id());
+        fx.list_operator_revoked(&kp.key_id());
         let pkg = signed_manifest(&kp);
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
 
-        let err = pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch)
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
             .expect_err("a revoked signer must be refused");
         let msg = err.to_string();
         assert!(msg.contains("REVOKED"), "{msg}");
         assert!(msg.contains(&kp.key_id()), "names the key: {msg}");
+    }
+
+    /// The union rule: a key the DEVICE image revokes is refused even
+    /// though the operator keychain still trusts it — either list is
+    /// sufficient, neither can mask the other.
+    #[test]
+    fn device_revocation_refuses_even_when_the_operator_keychain_trusts() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp); // operator keychain HAS kp
+        fx.list_device_revoked(&kp.key_id()); // device list revokes it
+        let pkg = signed_manifest(&kp);
+        let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
+
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
+            .expect_err("a device-revoked signer must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("REVOKED"), "{msg}");
+        assert!(msg.contains(&kp.key_id()), "names the key: {msg}");
+    }
+
+    /// The device image-baked anchor set verifies a manifest on its
+    /// own: an empty operator keychain is not a refusal when the image
+    /// anchors carry the key (Decision 7 consults BOTH sources).
+    #[test]
+    fn device_image_anchor_verifies_with_an_empty_operator_keychain() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        fx.clear_operator_keychain();
+        fx.install_device_anchor(&kp);
+        let pkg = signed_manifest(&kp);
+        let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
+
+        let report = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
+            .expect("the image-baked anchor verifies without operator keys");
+        assert_eq!(report.signer, kp.key_id());
+    }
+
+    /// Nothing anchored anywhere — empty device set, empty keychain —
+    /// is a named fail-closed refusal.
+    #[test]
+    fn no_anchors_anywhere_fails_closed_naming_both_sources() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        fx.clear_operator_keychain();
+        let pkg = signed_manifest(&kp);
+        let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
+
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
+            .expect_err("an empty trust chain must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("fail closed"), "{msg}");
+        assert!(
+            msg.contains(
+                &fx.anchor_dir
+                    .join("trusted-keys")
+                    .to_string_lossy()
+                    .to_string()
+            ),
+            "names the device anchors: {msg}"
+        );
+        assert!(
+            msg.contains(&fx.keys.to_string_lossy().to_string()),
+            "names the keychain: {msg}"
+        );
     }
 
     #[test]
@@ -817,7 +1005,7 @@ mod tests {
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
 
         assert!(
-            pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch).is_err(),
+            pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch).is_err(),
             "an unsigned manifest never stages"
         );
     }
@@ -827,12 +1015,21 @@ mod tests {
         let kp = test_kp(1);
         let store_dir = tempfile::tempdir().unwrap();
         let keys_dir = tempfile::tempdir().unwrap(); // exists, but no anchors
+        let anchor_dir = tempfile::tempdir().unwrap();
+        let anchor = anchor_dir.path().join("update-key.pub");
         let fx_store = RuntimeStore::new(store_dir.path().to_path_buf());
         let pkg = signed_manifest(&kp);
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
 
-        let err = pull_into_store(&fx_store, &peer_ref(), keys_dir.path(), false, &fetch)
-            .expect_err("an empty trust chain must fail closed");
+        let err = pull_into_store(
+            &fx_store,
+            &peer_ref(),
+            &anchor,
+            keys_dir.path(),
+            false,
+            &fetch,
+        )
+        .expect_err("an empty trust chain must fail closed");
         assert!(err.to_string().contains("fail closed"), "{err}");
     }
 
@@ -846,12 +1043,12 @@ mod tests {
         crate::pkg_manifest::sign(&mut pkg, &kp).unwrap();
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
 
-        let err = pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch)
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
             .expect_err("revision 5 over installed 9 is a downgrade");
         let msg = err.to_string();
         assert!(msg.contains('9') && msg.contains('5'), "{msg}");
 
-        pull_into_store(&fx.store, &peer_ref(), &fx.keys, true, &fetch)
+        pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, true, &fetch)
             .expect("--allow-downgrade lifts the gate");
     }
 
@@ -862,8 +1059,89 @@ mod tests {
         fx.seed_installed("hello", 7);
         let pkg = signed_manifest(&kp); // revision 7 == installed
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[(&blob_sha(), blob_bytes())]);
-        pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch)
+        pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
             .expect("equal revision is not a downgrade");
+    }
+
+    /// The gate reads the max of installed and STAGED revisions: a
+    /// newer manifest sitting in the pull inbox blocks an older,
+    /// validly-signed incoming one unless `--allow-downgrade` says
+    /// otherwise — without this, a peer could silently walk a staged
+    /// revision back.
+    #[test]
+    fn staged_inbox_revision_gates_the_downgrade_too() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+
+        let mut staged = signed_manifest(&kp); // revision 7
+        staged.revision = 9;
+        crate::pkg_manifest::sign(&mut staged, &kp).unwrap();
+        fx.stage_inbox(&staged);
+
+        let older = signed_manifest(&kp); // revision 7, validly signed
+        let fetch = FakeFetch::peer(&manifest_source(&older), &[(&blob_sha(), blob_bytes())]);
+
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
+            .expect_err("revision 7 over staged 9 is a downgrade");
+        let msg = err.to_string();
+        assert!(msg.contains('9') && msg.contains('7'), "{msg}");
+
+        pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, true, &fetch)
+            .expect("--allow-downgrade lifts the staged gate too");
+    }
+
+    /// A manifest built for another GNU triplet is refused before any
+    /// blob downloads — the fetch carries no blob routes, so reaching
+    /// the target error proves the download never started.
+    #[test]
+    fn foreign_target_manifest_is_refused_before_any_download() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        let mut pkg = signed_manifest(&kp);
+        pkg.target = "mips64-unknown-linux-gnu".to_string();
+        crate::pkg_manifest::sign(&mut pkg, &kp).unwrap();
+        let fetch = FakeFetch::peer(&manifest_source(&pkg), &[]);
+
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
+            .expect_err("a foreign-target manifest must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mips64-unknown-linux-gnu"),
+            "names the manifest target: {msg}"
+        );
+        assert!(
+            msg.contains(&crate::pkg_manifest::host_target()),
+            "names the host target: {msg}"
+        );
+        assert!(
+            !fx.store.blob_path(&blob_sha()).exists(),
+            "nothing staged for a foreign target"
+        );
+    }
+
+    /// Boundary validation of the declared payload paths (defense for
+    /// the future install-from-inbox consumer): absolute paths and
+    /// `..` segments are refused, naming the file.
+    #[test]
+    fn unsafe_payload_paths_are_refused_before_any_download() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        for bad in ["/etc/passwd", "../../etc/passwd", "usr/../../etc/passwd"] {
+            let mut pkg = signed_manifest(&kp);
+            pkg.files[0].path = bad.to_string();
+            crate::pkg_manifest::sign(&mut pkg, &kp).unwrap();
+            let fetch = FakeFetch::peer(&manifest_source(&pkg), &[]);
+
+            let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
+                .expect_err("an unsafe payload path must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains("unsafe path"), "names the rule: {msg}");
+            assert!(msg.contains(bad), "names the file: {msg}");
+            assert!(
+                !fx.store.blob_path(&blob_sha()).exists(),
+                "nothing staged for an unsafe path"
+            );
+        }
     }
 
     #[test]
@@ -883,7 +1161,7 @@ mod tests {
         let fetch = FakeFetch { routes };
         let r = PullRef::parse("http://mirror.test:9000/mirror/hello").unwrap();
 
-        let report = pull_into_store(&fx.store, &r, &fx.keys, false, &fetch)
+        let report = pull_into_store(&fx.store, &r, &fx.anchor, &fx.keys, false, &fetch)
             .expect("the static lane shares the peer verification path");
         assert_eq!(report.lane, "static");
         assert!(fx.store.blob_path(&blob_sha()).exists());
@@ -898,7 +1176,7 @@ mod tests {
         crate::pkg_manifest::sign(&mut pkg, &kp).unwrap();
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[]);
 
-        let err = pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch)
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
             .expect_err("a non-hex blob address must be refused");
         assert!(err.to_string().contains("64 lowercase hex"), "{err}");
         // The manifest route existed but NO blob route did — reaching
@@ -915,7 +1193,7 @@ mod tests {
         crate::pkg_manifest::sign(&mut pkg, &kp).unwrap();
         let fetch = FakeFetch::peer(&manifest_source(&pkg), &[]);
 
-        let err = pull_into_store(&fx.store, &peer_ref(), &fx.keys, false, &fetch)
+        let err = pull_into_store(&fx.store, &peer_ref(), &fx.anchor, &fx.keys, false, &fetch)
             .expect_err("a manifest naming another package must refuse");
         assert!(err.to_string().contains("'other'"), "{err}");
     }

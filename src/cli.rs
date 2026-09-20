@@ -419,9 +419,10 @@ pub enum Command {
         pod: Option<String>,
 
         /// Accept a manifest whose revision is OLDER than the installed
-        /// one for that name (ADR-0033 Decision 7 freshness rule).
-        /// Peer/URL pulls only; where `shuttle.lock` pins exist, they
-        /// bind regardless.
+        /// or staged one for that name (ADR-0033 Decision 7 freshness
+        /// rule). Peer/URL pulls only. Note: `shuttle.lock` pins do NOT
+        /// bind on the peer lane yet — PackageManifest carries no store
+        /// pin; pin-binding is deferred (ADR-0033 Decision 7).
         #[arg(long = "allow-downgrade")]
         allow_downgrade: bool,
 

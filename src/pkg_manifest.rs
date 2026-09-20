@@ -24,11 +24,13 @@
 //! module owns the schema, the canonical bytes, and the sign/verify
 //! wrapping over `crate::sign`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use miette::{IntoDiagnostic, WrapErr};
 use serde::{Deserialize, Serialize};
 
+use crate::runtime::{Generation, InstalledPackage};
 use crate::sign::KeyPair;
 
 /// One store file of a shared package: the payload path it occupied at
@@ -207,6 +209,167 @@ pub fn manifest_path(store_root: &Path, pkg: &str) -> PathBuf {
         .join(format!("{pkg}.json"))
 }
 
+// ── One mint, one truth (ADR-0033 Decision 2) ──
+//
+// Every minting lane (serve, export — build/ingest when they land)
+// calls [`mint_manifest`]; there is exactly one implementation so the
+// body a peer fetches over `/manifests/<pkg>` and the file a mirror
+// freezes are the same bytes by construction, not by discipline.
+
+/// Mint a [`PackageManifest`] from a generation record (ADR-0033
+/// Decision 2). The record keeps per-file CONTENT ADDRESSES only — no
+/// payload paths and no executable bits — so `files[].path` carries the
+/// store identity (the sha256 itself) and `executable` is true for the
+/// recorded command binaries (apps, confined launchers, service
+/// binaries — the farm links those for direct execution). `install`
+/// mirrors the snap.yaml-derived records verbatim: metadata travels,
+/// never re-derived. `signer`/`signature` are stamped by [`sign`].
+pub fn mint_manifest(record: &InstalledPackage) -> PackageManifest {
+    let binaries: BTreeSet<&str> = record
+        .apps
+        .values()
+        .chain(record.launchers.values())
+        .chain(record.service_bins.values())
+        .map(String::as_str)
+        .collect();
+    let files: Vec<ManifestFile> = record
+        .files
+        .iter()
+        .map(|sha256| ManifestFile {
+            path: sha256.clone(),
+            sha256: sha256.clone(),
+            executable: binaries.contains(sha256.as_str()),
+        })
+        .collect();
+    PackageManifest {
+        name: record.name.clone(),
+        version: record.version.clone(),
+        revision: record.revision,
+        target: host_target(),
+        files,
+        install: InstallMeta {
+            units: record.units.clone(),
+            apps: record.apps.clone(),
+            launchers: record.launchers.clone(),
+            assembly: record.assembly.clone(),
+            confined: record.confined.clone(),
+            app_confined: record.app_confined.clone(),
+            desktops: record.desktops.clone(),
+            fonts: record.fonts.clone(),
+            services: record.services.clone(),
+            service_bins: record.service_bins.clone(),
+            requires: record.requires.clone(),
+        },
+        signer: String::new(),
+        signature: String::new(),
+    }
+}
+
+/// Host GNU triplet for minted `target` fields — the best target record
+/// available at mint time (the pod store keeps no per-package build
+/// triplet; payloads are host-arch glibc binaries).
+pub fn host_target() -> String {
+    format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
+}
+
+/// The publishing-host identity `/info` and `index.json` carry: the
+/// kernel hostname, read at `/proc/sys/kernel/hostname` (std fs, no new
+/// deps). `unknown` when unreadable or empty — a label, never trust
+/// state. `serve` prefers the configured `node.name` over this.
+pub fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+// ── The union rule (ADR-0033 Decision 5 invariant) ──
+
+/// The pull-staging inbox: staged peer manifests under
+/// `<root>/store/manifests/` (see [`manifest_path`] for the layout
+/// invariant), sorted by package name. A missing directory is an empty
+/// inbox — an installed-only store is still publishable.
+pub fn inbox_manifests(store_root: &Path) -> miette::Result<Vec<(String, PathBuf)>> {
+    let dir = store_root.join("store").join("manifests");
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for entry in read {
+        let entry = entry
+            .into_diagnostic()
+            .wrap_err_with(|| format!("reading {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        out.push((stem.to_string(), path));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// The union's inbox half: staged manifests whose package is NOT in the
+/// current generation — the ones published verbatim instead of minted
+/// fresh. Both `serve /info` and `export index.json` walk this, so the
+/// dynamic view and the frozen tree never disagree on visibility.
+pub fn union_inbox<'a>(
+    generation: &Option<Generation>,
+    inbox: &'a [(String, PathBuf)],
+) -> Vec<&'a (String, PathBuf)> {
+    let gen_names: BTreeSet<&str> = generation
+        .as_ref()
+        .map(|g| g.packages.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    inbox
+        .iter()
+        .filter(|(name, _)| !gen_names.contains(name.as_str()))
+        .collect()
+}
+
+// ── Trust-boundary validation of manifest contents ──
+
+/// The sha256 discipline: exactly 64 lowercase hex chars — the same
+/// content-address rule the store and the wire grammar use; anything
+/// else is refused before it can reach a path.
+pub fn validate_sha256(file: &ManifestFile) -> miette::Result<()> {
+    let malformed = file.sha256.len() != 64
+        || !file.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        || file.sha256.bytes().any(|b| b.is_ascii_uppercase());
+    if malformed {
+        miette::bail!(
+            "manifest file '{}' carries malformed sha256 {:?} — expected 64 lowercase hex chars",
+            file.path,
+            file.sha256
+        );
+    }
+    Ok(())
+}
+
+/// Boundary validation of a manifest's declared payload path: no
+/// absolute paths, no `..` segments — a manifest is untrusted wire
+/// input and its paths are only ever joined under the payload root by
+/// the (future) install-from-inbox consumer.
+pub fn validate_payload_path(file: &ManifestFile) -> miette::Result<()> {
+    use std::path::Component;
+    let unsafe_path = file.path.starts_with('/')
+        || Path::new(&file.path)
+            .components()
+            .any(|c| c == Component::ParentDir);
+    if unsafe_path {
+        miette::bail!(
+            "manifest file carries an unsafe path {:?} — absolute paths and '..' \
+             segments are refused",
+            file.path
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +477,173 @@ mod tests {
             manifest_path(root, "hello"),
             PathBuf::from("/srv/shuttle-state/store/manifests/hello.json")
         );
+    }
+
+    // ── One mint, one truth ──
+
+    /// A generation record with one app, one launcher and one service
+    /// binary (the executable bits' sources) plus two plain blobs.
+    fn record() -> InstalledPackage {
+        let mut apps = BTreeMap::new();
+        apps.insert("hello".to_string(), "aa".repeat(32));
+        let mut launchers = BTreeMap::new();
+        launchers.insert("hello".to_string(), "bb".repeat(32));
+        let mut service_bins = BTreeMap::new();
+        service_bins.insert("srv".to_string(), "cc".repeat(32));
+        InstalledPackage {
+            name: "hello".into(),
+            version: "2.10".into(),
+            revision: 7,
+            sha3_384: "a3".repeat(48),
+            files: vec![
+                "aa".repeat(32),
+                "bb".repeat(32),
+                "cc".repeat(32),
+                "dd".repeat(32),
+            ],
+            units: vec![],
+            layer: crate::farm::ClaimLayer::Own,
+            apps,
+            requires: vec!["libc6".into()],
+            launchers,
+            assembly: BTreeMap::new(),
+            confined: None,
+            app_confined: BTreeMap::new(),
+            desktops: BTreeMap::new(),
+            fonts: BTreeMap::new(),
+            services: BTreeMap::new(),
+            service_bins,
+        }
+    }
+
+    /// The regression guard the council demanded: serve and export mint
+    /// through this one function, so the same record serializes to the
+    /// SAME bytes (ed25519 signatures are deterministic) — the `/info`-
+    /// adjacent `manifests/<pkg>.json` a mirror freezes can never drift
+    /// from the body `/manifests/<pkg>` serves.
+    #[test]
+    fn one_mint_serve_and_export_serialize_byte_identically() {
+        let kp = test_kp(1);
+        let mut served = mint_manifest(&record());
+        sign(&mut served, &kp).unwrap();
+        let mut exported = mint_manifest(&record());
+        sign(&mut exported, &kp).unwrap();
+
+        // The exact serializations the two lanes emit.
+        let serve_body = serde_json::to_vec_pretty(&served).unwrap();
+        let export_file = serde_json::to_vec_pretty(&exported).unwrap();
+        assert_eq!(serve_body, export_file);
+    }
+
+    /// The minted manifest's documented semantics (export semantics won
+    /// when the mints were consolidated): `files[].path` is the sha256
+    /// store identity and `executable` is the recorded-command union.
+    #[test]
+    fn minted_files_carry_store_identity_and_command_executable_bits() {
+        let manifest = mint_manifest(&record());
+        assert_eq!(manifest.target, host_target());
+        assert_eq!(manifest.files.len(), 4);
+        for file in &manifest.files {
+            assert_eq!(file.path, file.sha256, "path = store identity");
+        }
+        let exe: Vec<&str> = manifest
+            .files
+            .iter()
+            .filter(|f| f.executable)
+            .map(|f| f.sha256.as_str())
+            .collect();
+        // The app binary, the launcher wrapper and the service binary —
+        // in `files` order; the plain blob stays non-executable.
+        let (aa, bb, cc) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
+        assert_eq!(exe, vec![aa.as_str(), bb.as_str(), cc.as_str()]);
+        assert_eq!(manifest.install.apps.len(), 1);
+        assert_eq!(manifest.install.requires, vec!["libc6".to_string()]);
+    }
+
+    // ── Union helpers ──
+
+    #[test]
+    fn union_inbox_keeps_only_packages_outside_the_generation() {
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            "alpha".to_string(),
+            InstalledPackage {
+                name: "alpha".into(),
+                version: "1.0".into(),
+                revision: 1,
+                sha3_384: String::new(),
+                files: vec![],
+                units: vec![],
+                layer: crate::farm::ClaimLayer::Own,
+                apps: BTreeMap::new(),
+                requires: vec![],
+                launchers: BTreeMap::new(),
+                assembly: BTreeMap::new(),
+                confined: None,
+                app_confined: BTreeMap::new(),
+                desktops: BTreeMap::new(),
+                fonts: BTreeMap::new(),
+                services: BTreeMap::new(),
+                service_bins: BTreeMap::new(),
+            },
+        );
+        let gen = Generation {
+            n: 1,
+            base_version: "test".into(),
+            packages,
+            created_epoch: 0,
+            boot_entry: None,
+        };
+        let inbox = vec![
+            ("alpha".to_string(), PathBuf::from("/x/alpha.json")),
+            ("gamma".to_string(), PathBuf::from("/x/gamma.json")),
+        ];
+        let inbox_only: Vec<&(String, PathBuf)> = union_inbox(&Some(gen), &inbox);
+        assert_eq!(inbox_only.len(), 1);
+        assert_eq!(inbox_only[0].0, "gamma");
+        assert!(
+            union_inbox(&None, &inbox).len() == 2,
+            "no generation → all inbox"
+        );
+    }
+
+    // ── Trust-boundary validators ──
+
+    #[test]
+    fn sha_validation_demands_64_lowercase_hex() {
+        let ok = ManifestFile {
+            path: "ab".repeat(32),
+            sha256: "ab".repeat(32),
+            executable: false,
+        };
+        validate_sha256(&ok).unwrap();
+        for bad in ["AB".repeat(32), "ab".repeat(31), "zz".repeat(32)] {
+            let file = ManifestFile {
+                path: bad.clone(),
+                sha256: bad,
+                executable: false,
+            };
+            assert!(validate_sha256(&file).is_err(), "{:?}", file.sha256);
+        }
+    }
+
+    #[test]
+    fn payload_path_validation_refuses_absolute_and_parent_segments() {
+        let file = |path: &str| ManifestFile {
+            path: path.to_string(),
+            sha256: "ab".repeat(32),
+            executable: false,
+        };
+        validate_payload_path(&file("usr/bin/hello")).unwrap();
+        validate_payload_path(&file("ab".repeat(32).as_str())).unwrap();
+        for bad in [
+            "/etc/passwd",
+            "../../etc/passwd",
+            "usr/../../etc/passwd",
+            "..",
+        ] {
+            let err = validate_payload_path(&file(bad)).expect_err(bad);
+            assert!(err.to_string().contains(bad), "{err}");
+        }
     }
 }

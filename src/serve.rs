@@ -15,11 +15,12 @@
 //! connection-concurrency bound (the `oci.rs` bounded-timeout
 //! precedent) — a bare `TcpListener` has no slowloris defenses.
 //!
-//! `/manifests/<pkg>` publishes the UNION of the current generation's
-//! records (minted + signed on the fly — unsigned store entries are
-//! never served) and the pull-staging inbox
+//! `/manifests/<pkg>` and `/info` publish the UNION of the current
+//! generation's records (minted + signed on the fly — unsigned store
+//! entries are never served) and the pull-staging inbox
 //! ([`crate::pkg_manifest::manifest_path`]) per its documented
-//! invariant.
+//! invariant — the exact union `export` freezes into the static tree,
+//! through the same shared helpers.
 //!
 //! Announce (ADR-0033 Decision 3): when the announce switch is set —
 //! `node { serve = { announce = true } }` or `serve --announce` — the
@@ -41,7 +42,7 @@ use miette::{IntoDiagnostic, WrapErr};
 use serde::Serialize;
 
 use crate::lua::DEFAULT_SERVE_ADDRESS;
-use crate::runtime::{Generation, InstalledPackage, RuntimeStore};
+use crate::runtime::{Generation, RuntimeStore};
 
 /// Hard connection-concurrency bound (ADR-0033 Decision 4). The accept
 /// loop refuses with 503 beyond this — one thread per connection with
@@ -172,6 +173,9 @@ struct ServerCtx {
     /// Home used for the signing key (`~/.config/shuttle/secret-key`)
     /// when minting manifests. A seam: tests point it at a tempdir.
     home: PathBuf,
+    /// The configured `node.name` (ADR-0033 Decision 6) — the identity
+    /// `/info` publishes; the kernel hostname is only the fallback.
+    node_name: Option<String>,
 }
 
 /// A computed response: either an inline body or a file to stream
@@ -207,7 +211,7 @@ pub fn run(
     node_name: Option<&str>,
     pod: Option<&str>,
 ) -> miette::Result<()> {
-    let (pod_name, ctx) = serve_ctx(&crate::pod::pod_root(None), pod)?;
+    let (pod_name, ctx) = serve_ctx(&crate::pod::pod_root(None), pod, node_name)?;
     let (host, port) = resolve_bind(address, port)?;
     let listener = TcpListener::bind((host.as_str(), port))
         .into_diagnostic()
@@ -221,7 +225,9 @@ pub fn run(
     // membership; the mDNS records expire by TTL).
     let _announce = if announce {
         let is_loopback = matches!(host.as_str(), "127.0.0.1" | "::1");
-        let name = node_name.map(str::to_string).unwrap_or_else(hostname);
+        let name = node_name
+            .map(str::to_string)
+            .unwrap_or_else(crate::pkg_manifest::hostname);
         match crate::discovery::announce(&name, port) {
             Ok(guard) => {
                 crate::output::info(format!(
@@ -249,11 +255,15 @@ pub fn run(
 
 /// Resolve the pod to serve under an explicit pod root: the `--pod`
 /// name ([`crate::pod::resolve_pod_dir_under`]) plus the
-/// store-existence gate. Split from [`run`] so tests can point the
-/// pod root at a tempdir and observe which store a pod flag selects.
-/// A missing store is a named error — the pod that was asked for and
-/// where it was looked for.
-fn serve_ctx(pod_root: &Path, pod: Option<&str>) -> miette::Result<(String, ServerCtx)> {
+/// store-existence gate, and carry the node name through to `/info`.
+/// Split from [`run`] so tests can point the pod root at a tempdir and
+/// observe which store a pod flag selects. A missing store is a named
+/// error — the pod that was asked for and where it was looked for.
+fn serve_ctx(
+    pod_root: &Path,
+    pod: Option<&str>,
+    node_name: Option<&str>,
+) -> miette::Result<(String, ServerCtx)> {
     let (pod_name, pod_dir) = crate::pod::resolve_pod_dir_under(pod_root, pod)?;
     if !pod_dir.is_dir() {
         miette::bail!(
@@ -266,6 +276,7 @@ fn serve_ctx(pod_root: &Path, pod: Option<&str>) -> miette::Result<(String, Serv
     let ctx = ServerCtx {
         store: Arc::new(crate::pod::pod_store(&pod_dir)),
         home,
+        node_name: node_name.map(str::to_string),
     };
     Ok((pod_name, ctx))
 }
@@ -372,8 +383,13 @@ fn serve_connection(mut stream: TcpStream, ctx: &ServerCtx) -> std::io::Result<(
                 write_handled(&mut stream, handled)
             }
             Err(e) => {
+                // The full error chain goes to the LOCAL log only; the
+                // wire gets a generic body — dispatch errors can name
+                // signing keys, store paths, internal layout, and none
+                // of that belongs on the peer-facing wire.
+                crate::output::warn(format!("serve: {method} {path} → 500: {e:#}"));
                 log_request(method, path, 500);
-                write_json_error(&mut stream, 500, &format!("{e}"))
+                write_json_error(&mut stream, 500, "internal error")
             }
         },
         Err(405) => {
@@ -402,8 +418,11 @@ fn request_target(line: &str) -> (&str, &str) {
 }
 
 /// One line per handled request: method, path, status — the serving
-/// surface's whole observability story.
+/// surface's whole observability story. The request path is attacker-
+/// controlled bytes: control characters (terminal escapes, CR/LF) are
+/// stripped before the line reaches the log.
 fn log_request(method: &str, path: &str, status: u16) {
+    let path = crate::output::strip_control_chars(path);
     crate::output::info(format!("{method} {path} → {status}"));
 }
 
@@ -434,25 +453,50 @@ struct Info {
     packages: Vec<InfoPackage>,
 }
 
-/// `GET /info`: the pod inventory from the current generation's
-/// manifest records. No generation yet → an empty inventory (still
-/// 200 — the node exists, it just has nothing installed).
+/// `GET /info`: the pod inventory — the UNION of the current
+/// generation's records and the inbox-only staged manifests (the same
+/// rule `export` freezes into `index.json`, through the same
+/// [`crate::pkg_manifest`] helpers). Identity is the configured
+/// `node.name`; the kernel hostname is only the fallback. No
+/// generation and no inbox → an empty inventory (still 200 — the node
+/// exists, it just has nothing to show).
 fn handle_info(ctx: &ServerCtx) -> miette::Result<Handled> {
     let generation = ctx.store.active_generation()?;
+    let inbox = crate::pkg_manifest::inbox_manifests(ctx.store.root())?;
+    let inbox_only = crate::pkg_manifest::union_inbox(&generation, &inbox);
+    let mut packages: Vec<InfoPackage> = match &generation {
+        Some(gen) => gen
+            .packages
+            .values()
+            .map(|p| InfoPackage {
+                name: p.name.clone(),
+                version: p.version.clone(),
+                revision: p.revision,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    for (name, path) in inbox_only {
+        let raw = fs::read(path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("reading staged manifest {}", path.display()))?;
+        let manifest: crate::pkg_manifest::PackageManifest = serde_json::from_slice(&raw)
+            .map_err(|e| miette::miette!("staged manifest for '{name}' does not parse: {e}"))?;
+        packages.push(InfoPackage {
+            name: manifest.name,
+            version: manifest.version,
+            revision: manifest.revision,
+        });
+    }
+    // Canonical order regardless of generation-vs-inbox split (the
+    // rule export's index follows).
+    packages.sort_by(|a, b| a.name.cmp(&b.name));
     let info = Info {
-        name: hostname(),
-        packages: match &generation {
-            Some(gen) => gen
-                .packages
-                .values()
-                .map(|p| InfoPackage {
-                    name: p.name.clone(),
-                    version: p.version.clone(),
-                    revision: p.revision,
-                })
-                .collect(),
-            None => Vec::new(),
-        },
+        name: ctx
+            .node_name
+            .clone()
+            .unwrap_or_else(crate::pkg_manifest::hostname),
+        packages,
     };
     let body =
         serde_json::to_vec(&info).map_err(|e| miette::miette!("serialize /info payload: {e}"))?;
@@ -463,14 +507,15 @@ fn handle_info(ctx: &ServerCtx) -> miette::Result<Handled> {
 /// invariant): a package in the current generation is minted from its
 /// records and signed on the spot (unsigned store entries are never
 /// served); otherwise a pull-staged inbox manifest is served verbatim;
-/// otherwise 404.
+/// otherwise 404. The minted body is byte-identical to the file export
+/// freezes into `manifests/<pkg>.json` — one mint, one truth.
 fn handle_manifest(ctx: &ServerCtx, pkg: &str) -> miette::Result<Handled> {
     let generation: Option<Generation> = ctx.store.active_generation()?;
     if let Some(rec) = generation.as_ref().and_then(|g| g.packages.get(pkg)) {
         let kp = crate::pkg_manifest::load_signing_key(&ctx.home)?;
-        let mut manifest = mint_manifest(rec);
+        let mut manifest = crate::pkg_manifest::mint_manifest(rec);
         crate::pkg_manifest::sign(&mut manifest, &kp)?;
-        let body = serde_json::to_vec(&manifest)
+        let body = serde_json::to_vec_pretty(&manifest)
             .map_err(|e| miette::miette!("serialize package manifest: {e}"))?;
         return Ok(Handled::Body(200, "application/json", body));
     }
@@ -505,82 +550,6 @@ fn not_found() -> Handled {
         "application/json",
         b"{\"error\":\"not found\"}".to_vec(),
     )
-}
-
-// ── Minting (ADR-0033 Decision 2) ──
-
-/// Host GNU triplet for the minted `target` field.
-fn host_target() -> String {
-    format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
-}
-
-/// Mint a [`crate::pkg_manifest::PackageManifest`] from a generation's
-/// [`InstalledPackage`] records. Identity, the store blob set, and the
-/// snap.yaml-derived install metadata all travel (ADR-0033 Decision 2:
-/// a receiving peer must reconstruct an installable entry from the
-/// manifest alone).
-///
-/// One honest limitation: generation manifests record per-file HASHES,
-/// not payload paths — the path-bearing mint belongs to the build/ingest
-/// hooks. Until those land, minted `files[].path` carries the
-/// ADR-0012 store address (`store/<aa>/<sha256>`) as a stable
-/// placeholder, and `executable` conservatively reads false.
-fn mint_manifest(rec: &InstalledPackage) -> crate::pkg_manifest::PackageManifest {
-    let InstalledPackage {
-        name,
-        version,
-        revision,
-        files,
-        units,
-        apps,
-        launchers,
-        assembly,
-        confined,
-        app_confined,
-        desktops,
-        fonts,
-        services,
-        service_bins,
-        requires,
-        ..
-    } = rec.clone();
-    crate::pkg_manifest::PackageManifest {
-        name,
-        version,
-        revision,
-        target: host_target(),
-        files: files
-            .iter()
-            .map(|h| crate::pkg_manifest::ManifestFile {
-                path: format!("store/{}/{}", h.get(..2).unwrap_or(h), h),
-                sha256: h.clone(),
-                executable: false,
-            })
-            .collect(),
-        install: crate::pkg_manifest::InstallMeta {
-            units,
-            apps,
-            launchers,
-            assembly,
-            confined,
-            app_confined,
-            desktops,
-            fonts,
-            services,
-            service_bins,
-            requires,
-        },
-        signer: String::new(),
-        signature: String::new(),
-    }
-}
-
-/// The node name `/info` publishes: the kernel hostname (std fs, no new
-/// deps).
-fn hostname() -> String {
-    fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 // ── Response writing ──
@@ -650,6 +619,7 @@ fn write_json_error(stream: &mut TcpStream, status: u16, message: &str) -> std::
 mod tests {
     use super::*;
     use crate::pkg_manifest;
+    use crate::runtime::InstalledPackage;
     use crate::sign;
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -833,8 +803,13 @@ mod tests {
 
     /// Fabricate the store and start the accept loop on 127.0.0.1:0.
     /// The tempdir moves into the server thread, so the tree outlives
-    /// the test body.
+    /// the test body. `with_key = false` leaves the signing home
+    /// keyless — the /manifests mint then fails (the generic-500 case).
     fn start() -> ServeFixture {
+        start_with_signing_key(true)
+    }
+
+    fn start_with_signing_key(with_key: bool) -> ServeFixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let store = RuntimeStore::new(root.to_path_buf());
@@ -885,19 +860,36 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink("generations/1", root.join("active")).unwrap();
 
-        // Pull-staged inbox manifest for a staged-but-uninstalled pkg.
-        let inbox_body = br#"{"name":"inbox-only","staged":true}"#.to_vec();
+        // Pull-staged inbox manifest for a staged-but-uninstalled pkg
+        // (a real PackageManifest — /info walks the union and parses it).
+        let inbox_manifest = pkg_manifest::PackageManifest {
+            name: "inbox-only".into(),
+            version: "0.4".into(),
+            revision: 3,
+            target: pkg_manifest::host_target(),
+            files: vec![],
+            install: Default::default(),
+            signer: String::new(),
+            signature: String::new(),
+        };
+        let inbox_body = serde_json::to_vec(&inbox_manifest).unwrap();
         let inbox = pkg_manifest::manifest_path(root, "inbox-only");
         fs::create_dir_all(inbox.parent().unwrap()).unwrap();
         fs::write(&inbox, &inbox_body).unwrap();
 
         // A secret the traversal attempt must NOT be able to reach.
         let home = root.join("home");
-        let kp = sign::create_secret_key(&home).unwrap();
+        let public_hex = if with_key {
+            let kp = sign::create_secret_key(&home).unwrap();
+            kp.public_hex()
+        } else {
+            String::new()
+        };
 
         let ctx = ServerCtx {
             store: Arc::new(store),
             home,
+            node_name: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -911,7 +903,7 @@ mod tests {
         ServeFixture {
             addr,
             active,
-            public_hex: kp.public_hex(),
+            public_hex,
             blob_sha,
             blob_body,
             inbox_body,
@@ -966,7 +958,8 @@ mod tests {
         let fx = start();
         let addr = fx.addr;
 
-        // /info: 200, valid JSON, the generation package listed.
+        // /info: 200, valid JSON, the union inventory — the generation
+        // package AND the inbox-only staged package.
         let (status, head, body) = get(addr, "/info");
         assert_eq!(status, 200);
         assert!(head.contains("content-type: application/json"));
@@ -975,10 +968,13 @@ mod tests {
         let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(!info["name"].as_str().unwrap().is_empty());
         let pkgs = info["packages"].as_array().unwrap();
-        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs.len(), 2, "generation ∪ inbox-only");
         assert_eq!(pkgs[0]["name"], "hello-world");
         assert_eq!(pkgs[0]["version"], "2.10");
         assert_eq!(pkgs[0]["revision"], 7);
+        assert_eq!(pkgs[1]["name"], "inbox-only");
+        assert_eq!(pkgs[1]["version"], "0.4");
+        assert_eq!(pkgs[1]["revision"], 3);
 
         // /manifests/hello-world: minted + signed, self-consistent.
         let (status, _, body) = get(addr, "/manifests/hello-world");
@@ -1118,10 +1114,10 @@ mod tests {
         fabricate_pod(root.path(), "lab", "lab-pod-pkg");
 
         // No flag: the default pod, as before.
-        let (name, _) = serve_ctx(root.path(), None).unwrap();
+        let (name, _) = serve_ctx(root.path(), None, None).unwrap();
         assert_eq!(name, "default");
 
-        let (name, ctx) = serve_ctx(root.path(), Some("lab")).unwrap();
+        let (name, ctx) = serve_ctx(root.path(), Some("lab"), None).unwrap();
         assert_eq!(name, "lab");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1135,9 +1131,77 @@ mod tests {
         assert_eq!(pkgs[0]["name"], "lab-pod-pkg");
 
         // A missing store is a named refusal.
-        let err = serve_ctx(root.path(), Some("ghost"))
+        let err = serve_ctx(root.path(), Some("ghost"), None)
             .err()
             .expect("no such pod");
         assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    /// `/info` identity (Decision 6): the configured node name is
+    /// published when known; the kernel hostname is only the fallback.
+    #[test]
+    fn info_publishes_the_node_name_over_the_hostname_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        fabricate_pod(root.path(), "default", "pkg");
+        let (pod_name, ctx) = serve_ctx(root.path(), None, Some("devbox")).unwrap();
+        assert_eq!(pod_name, "default");
+        let info = handle_info(&ctx).expect("info builds");
+        let Handled::Body(200, _, body) = info else {
+            panic!("expected a body response");
+        };
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["name"], "devbox");
+
+        // No node name → kernel hostname fallback (never empty).
+        let (_, ctx) = serve_ctx(root.path(), None, None).unwrap();
+        let info = handle_info(&ctx).expect("info builds");
+        let Handled::Body(_, _, body) = info else {
+            panic!("expected a body response");
+        };
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            !parsed["name"].as_str().unwrap().is_empty(),
+            "the hostname fallback must not be empty"
+        );
+    }
+
+    /// A request line carrying ANSI escapes is logged sanitized: the
+    /// control characters (ESC) are stripped before the line reaches
+    /// output::info, defusing terminal escapes from attacker bytes.
+    #[test]
+    fn logged_paths_are_sanitized_of_control_characters() {
+        let line = "GET /manifests/\u{1b}[31mhello-world\u{1b}[0m HTTP/1.1";
+        let (method, path) = request_target(line);
+        let sanitized = crate::output::strip_control_chars(path);
+        assert!(
+            !sanitized.contains('\u{1b}'),
+            "no ESC may survive: {sanitized:?}"
+        );
+        assert_eq!(sanitized, "/manifests/[31mhello-world[0m");
+        // The method is echoed verbatim from the same wire line — the
+        // log line is built from the sanitized path.
+        assert_eq!(method, "GET");
+    }
+
+    /// A dispatch error (here: no signing key for the /manifests mint)
+    /// logs the chain locally but returns a GENERIC body — the error
+    /// text (key paths, `shuttle key keygen` hints, store layout) must
+    /// never reach the wire.
+    #[test]
+    fn internal_errors_return_a_generic_body_not_the_error_chain() {
+        let fx = start_with_signing_key(false);
+        let (status, _, body) = get(fx.addr, "/manifests/hello-world");
+        assert_eq!(status, 500);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "error": "internal error" }));
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("keygen"),
+            "no ceremony hints on the wire: {text}"
+        );
+        assert!(
+            !text.contains("secret-key"),
+            "no key paths on the wire: {text}"
+        );
     }
 }

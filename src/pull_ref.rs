@@ -75,21 +75,7 @@ impl PullRef {
             );
         };
         Self::validate_pkg(pkg, original)?;
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) => {
-                if h.is_empty() {
-                    miette::bail!("peer reference '{original}' has an empty host");
-                }
-                let port = p.parse::<u16>().map_err(|_| {
-                    miette::miette!(
-                        "peer reference '{original}' has an out-of-range port '{p}' — \
-                         ports are 1-65535"
-                    )
-                })?;
-                (h.to_string(), port)
-            }
-            None => (authority.to_string(), DEFAULT_PEER_PORT),
-        };
+        let (host, port) = Self::parse_authority(authority, original)?;
         if host.is_empty() {
             miette::bail!("peer reference '{original}' has an empty host");
         }
@@ -97,6 +83,52 @@ impl PullRef {
             host,
             port,
             pkg: pkg.to_string(),
+        })
+    }
+
+    /// The authority: `host[:port]`. Bracketed IPv6 literals
+    /// (`shuttle://[::1]/pkg`, `shuttle://[::1]:7780/pkg`) parse whole —
+    /// a bare `rsplit_once(':')` would split inside the brackets. The
+    /// stored `host` is the bare literal; URL builders re-bracket it.
+    fn parse_authority(authority: &str, original: &str) -> miette::Result<(String, u16)> {
+        if let Some(inner) = authority.strip_prefix('[') {
+            let Some((host, tail)) = inner.split_once(']') else {
+                miette::bail!(
+                    "peer reference '{original}' has an unterminated '[' — \
+                     expected shuttle://[host][:port]/<pkg>"
+                );
+            };
+            let port = match tail.strip_prefix(':') {
+                Some(p) => Self::parse_port(p, original)?,
+                None => {
+                    if !tail.is_empty() {
+                        miette::bail!(
+                            "peer reference '{original}' has trailing junk '{tail}' after ']' — \
+                             expected [host][:port]"
+                        );
+                    }
+                    DEFAULT_PEER_PORT
+                }
+            };
+            return Ok((host.to_string(), port));
+        }
+        match authority.rsplit_once(':') {
+            Some((h, p)) => {
+                if h.is_empty() {
+                    miette::bail!("peer reference '{original}' has an empty host");
+                }
+                Ok((h.to_string(), Self::parse_port(p, original)?))
+            }
+            None => Ok((authority.to_string(), DEFAULT_PEER_PORT)),
+        }
+    }
+
+    fn parse_port(p: &str, original: &str) -> miette::Result<u16> {
+        p.parse::<u16>().map_err(|_| {
+            miette::miette!(
+                "peer reference '{original}' has an out-of-range port '{p}' — \
+                 ports are 1-65535"
+            )
         })
     }
 
@@ -172,6 +204,38 @@ mod tests {
             }
             other => panic!("expected Peer, got {other:?}"),
         }
+    }
+
+    /// Bracketed IPv6 literals parse whole (default and explicit
+    /// port); the stored host is the bare literal `::1` — URL builders
+    /// re-bracket it. A bare rsplit_once(':') would split inside the
+    /// brackets and mis-parse both shapes.
+    #[test]
+    fn bracketed_ipv6_peer_references_parse_whole() {
+        let explicit = PullRef::parse("shuttle://[::1]:7780/hello").unwrap();
+        match explicit {
+            PullRef::Peer { host, port, pkg } => {
+                assert_eq!(host, "::1");
+                assert_eq!(port, 7780);
+                assert_eq!(pkg, "hello");
+            }
+            other => panic!("expected Peer, got {other:?}"),
+        }
+        let defaulted = PullRef::parse("shuttle://[::1]/hello").unwrap();
+        match defaulted {
+            PullRef::Peer { host, port, pkg } => {
+                assert_eq!(host, "::1");
+                assert_eq!(port, DEFAULT_PEER_PORT);
+                assert_eq!(pkg, "hello");
+            }
+            other => panic!("expected Peer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unterminated_bracket_is_refused() {
+        assert!(PullRef::parse("shuttle://[::1/hello").is_err());
+        assert!(PullRef::parse("shuttle://[]/hello").is_err());
     }
 
     #[test]
