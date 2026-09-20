@@ -2,7 +2,8 @@
 --
 -- Loaded via Frontend::loadDefinitionFile by the check stage so that the
 -- globals the eval prelude injects at runtime (src/dsl/init.lua: snap,
--- merge, pin, index, app, image) are *bound globals* for the analyzer.
+-- merge, pin, index, app, image, node) are *bound globals* for the
+-- analyzer.
 -- Without this, every corpus definition would fail the gate with
 -- "Unknown global 'snap'" — the unbound-prelude surface the spike measured
 -- (analyzer-spike/REPORT.md §3, case c1).
@@ -18,8 +19,8 @@
 -- that flow across require() module boundaries.
 --
 -- Trailing optional parameters (`any?`) mirror the runtime DSL: pin() and
--- merge() are legal with fewer arguments, snap()/app()/index()/image() are
--- not.
+-- merge() are legal with fewer arguments, snap()/app()/index()/image()/
+-- node() are not.
 
 declare snap: (meta: any) -> any
 declare merge: (base: any?, overrides: any?) -> any
@@ -27,6 +28,7 @@ declare pin: (name: any, opts: any?) -> any
 declare index: (name: any) -> any
 declare app: (opts: any) -> any
 declare image: (opts: any) -> any
+declare node: (opts: any) -> any
 -- Eval-time HTTP GET (Rust-injected when the request allows network;
 -- the runtime stub refuses otherwise).
 declare fetch: (url: string) -> string

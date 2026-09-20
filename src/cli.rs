@@ -363,6 +363,12 @@ pub enum Command {
     /// Pull an artifact bundle from an OCI registry: fetch the manifest,
     /// download every blob with sha256 verification (fail-closed on any
     /// mismatch), and write the files under their original names.
+    ///
+    /// Sharing lanes (ADR-0033): a `shuttle://host[:port]/<pkg>`
+    /// reference pulls from a peer and an `http(s)://…/<pkg>` reference
+    /// from a static export tree — both verify the signed
+    /// PackageManifest fail-closed and stage into the pod named by
+    /// `--pod` instead of writing files.
     Pull {
         /// Source reference: [registry[:port]/]repo[:tag|@digest]. An
         /// explicit registry host is required. A tag or @digest is
@@ -403,9 +409,58 @@ pub enum Command {
         #[arg(long)]
         state_dir: Option<String>,
 
+        /// Pod store that peer (`shuttle://`) and static-URL
+        /// (`http(s)://`) pulls stage into (default: `default`) — the
+        /// verified manifest + blobs land in the named pod's store and
+        /// installation stays the pod workflow, never a pull side
+        /// effect (ADR-0033 Decision 5). Ignored for plain registry
+        /// references.
+        #[arg(long, value_name = "POD")]
+        pod: Option<String>,
+
+        /// Accept a manifest whose revision is OLDER than the installed
+        /// one for that name (ADR-0033 Decision 7 freshness rule).
+        /// Peer/URL pulls only; where `shuttle.lock` pins exist, they
+        /// bind regardless.
+        #[arg(long = "allow-downgrade")]
+        allow_downgrade: bool,
+
         /// Output structured JSON instead of human-friendly output.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Serve the pod store to LAN peers over a minimal HTTP/1.1 subset
+    /// (ADR-0033 Decisions 4+5): `GET /info`, `GET /manifests/<pkg>`,
+    /// `GET /blobs/<sha256>`. Runs in the foreground until interrupted;
+    /// unsigned store entries are never served. Binding/publishing
+    /// policy comes from `node {}` in shuttle.lua — absent `node {}`,
+    /// there is nothing to serve.
+    Serve {
+        /// Bind address override. Default: `node {}`'s
+        /// `serve.address`, else 127.0.0.1 (loopback — `/info`
+        /// publishes the pod inventory to everyone who can reach the
+        /// socket; `0.0.0.0` is an explicit choice).
+        #[arg(long)]
+        address: Option<String>,
+
+        /// Bind port override (default: 7780, unprivileged).
+        #[arg(long)]
+        port: Option<u16>,
+    },
+
+    /// Export the pod store's shareable content as a static directory
+    /// tree any web server can serve (ADR-0033 Decision 10):
+    /// `index.json` (the `/info` payload), `manifests/<pkg>.json`
+    /// (signed PackageManifests), `blobs/<sha256>`. Upload the directory
+    /// to publish — no shuttle code runs server-side.
+    Export {
+        /// Directory to write the export tree into
+        out: String,
+
+        /// Pod whose store to export (default: `default`).
+        #[arg(long, value_name = "POD")]
+        pod: Option<String>,
     },
 
     /// Manage the binary package cache
@@ -2055,6 +2110,8 @@ mod tests {
                 expect,
                 install,
                 state_dir,
+                pod,
+                allow_downgrade,
                 json,
             } => {
                 assert_eq!(reference, "ghcr.io/owner/repo:v1");
@@ -2065,6 +2122,10 @@ mod tests {
                 assert!(expect.is_none());
                 assert!(!install);
                 assert!(state_dir.is_none());
+                // Peer/static staging flags default off: registry
+                // pulls keep writing files, pod-less.
+                assert!(pod.is_none());
+                assert!(!allow_downgrade);
                 assert!(!json);
             }
             _ => panic!("expected Pull"),

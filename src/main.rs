@@ -285,10 +285,12 @@ fn main() -> miette::Result<()> {
             expect,
             install,
             state_dir,
+            pod,
+            allow_downgrade,
             json,
         } => {
             shuttle::output::set_mode(json);
-            cmd_pull(
+            run_pull(
                 &reference,
                 out_dir,
                 username.as_deref(),
@@ -297,8 +299,14 @@ fn main() -> miette::Result<()> {
                 expect.as_deref(),
                 install,
                 state_dir,
+                pod.as_deref(),
+                allow_downgrade,
             )
         }
+
+        Command::Serve { address, port } => cmd_serve(address.as_deref(), port),
+
+        Command::Export { out, pod } => cmd_export(&out, pod.as_deref()),
 
         Command::EvalWorker => shuttle::isolate::worker_main(),
 
@@ -3626,6 +3634,38 @@ fn cmd_push(
     Ok(())
 }
 
+/// `shuttle pull` dispatch across the reference lanes (ADR-0033): the
+/// OCI lane keeps the original body unchanged — same parse, same flags —
+/// while `shuttle://` peer references and `http(s)://` static-tree
+/// references hand off to the pull lane.
+#[allow(clippy::too_many_arguments)]
+fn run_pull(
+    reference: &str,
+    out_dir: String,
+    username: Option<&str>,
+    password_stdin: bool,
+    insecure_http: bool,
+    expect: Option<&str>,
+    install: bool,
+    state_dir: Option<String>,
+    pod: Option<&str>,
+    allow_downgrade: bool,
+) -> miette::Result<()> {
+    match shuttle::pull_ref::PullRef::parse(reference)? {
+        shuttle::pull_ref::PullRef::Oci(_) => cmd_pull(
+            reference,
+            out_dir,
+            username,
+            password_stdin,
+            insecure_http,
+            expect,
+            install,
+            state_dir,
+        ),
+        peer_or_url => cmd_pull_peer(&peer_or_url, pod, allow_downgrade),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_pull(
     reference: &str,
@@ -3657,6 +3697,30 @@ fn cmd_pull(
     }
     print_report(&report);
     Ok(())
+}
+
+/// `shuttle serve`: hand the bind overrides to the serve lane (ADR-0033
+/// Decision 5 — serve is foreground, pod-store-scoped, configured by
+/// `node {}`).
+fn cmd_serve(address: Option<&str>, port: Option<u16>) -> miette::Result<()> {
+    shuttle::serve::run(address, port)
+}
+
+/// `shuttle export`: hand the destination and pod to the export lane
+/// (ADR-0033 Decision 10 — a static tree any web server can serve).
+fn cmd_export(out: &str, pod: Option<&str>) -> miette::Result<()> {
+    shuttle::export::run(out, pod)
+}
+
+/// Peer/static pull: the verified manifest + blobs stage into the named
+/// pod's store; installation stays the pod workflow (ADR-0033
+/// Decision 5).
+fn cmd_pull_peer(
+    pull_ref: &shuttle::pull_ref::PullRef,
+    pod: Option<&str>,
+    allow_downgrade: bool,
+) -> miette::Result<()> {
+    shuttle::pull_peer::run(pull_ref, pod, allow_downgrade)
 }
 
 /// `pull --install`: resolve revisions for the pulled `.snap` payloads
