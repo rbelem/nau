@@ -128,8 +128,8 @@ fn unit_name(pod: &str, svc: &str) -> String {
 
 /// The service backend that owns the emitted artifacts. Selection is
 /// fail-closed per Decision 11; reachability probing of the systemd user
-/// manager (and the portable/launchd emitters themselves) is ticket
-/// #107 — until then every non-systemd selection is a named error at
+/// manager (and the portable/launchd emitters themselves) is deferred —
+/// until it lands every non-systemd selection is a named error at
 /// emit time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceBackend {
