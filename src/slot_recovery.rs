@@ -190,10 +190,9 @@ fn parse_slot_label(label: &str) -> Option<SlotLabel> {
         (s, true)
     } else if let Some(s) = label.strip_suffix("_a") {
         (s, false)
-    } else if let Some(s) = label.strip_suffix("_b") {
-        (s, false)
     } else {
-        return None;
+        let s = label.strip_suffix("_b")?;
+        (s, false)
     };
     let idx = stem.rfind('_')?;
     let image = &stem[..idx];
