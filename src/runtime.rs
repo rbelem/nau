@@ -206,6 +206,12 @@ pub struct InstalledPackage {
     /// binary. Empty for packages without services.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub service_bins: BTreeMap<String, String>,
+    /// Canonical build-input digest (sha3-384) of the resolved recipe
+    /// meta recorded at install time (issue #113). `None` for manifests
+    /// recorded before the field existed — those never hold, so the
+    /// first sync after upgrade rebuilds once and records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_digest: Option<String>,
 }
 
 /// One GUI app's desktop-launcher metadata (issue #7).
@@ -294,6 +300,12 @@ pub struct PendingSnap {
     /// The composition precedence layer to record the package at
     /// (issue #8). Store/pull installs land at `Own` (the default).
     pub layer: crate::farm::ClaimLayer,
+    /// Canonical build-input digest of the resolved recipe meta (issue
+    /// #113), carried into the installed record at install time so a
+    /// plain sync can hold recipe-identical packages. `None` for
+    /// store/pull installs — the digest hold is a pod-own-package
+    /// concept.
+    pub meta_digest: Option<String>,
 }
 
 /// A channel-side manifest signature envelope (ADR-0011 step (d)): the
@@ -1253,6 +1265,7 @@ impl RuntimeStore {
             fonts,
             services,
             service_bins,
+            meta_digest: snap.meta_digest.clone(),
         }
     }
 
@@ -2608,6 +2621,7 @@ mod tests {
             fonts: BTreeMap::new(),
             services: BTreeMap::new(),
             service_bins: BTreeMap::new(),
+            meta_digest: None,
         }
     }
 
@@ -3558,6 +3572,7 @@ plugs:
                 fonts: BTreeMap::new(),
                 services: BTreeMap::new(),
                 service_bins: BTreeMap::new(),
+                meta_digest: None,
             },
         );
         installed.insert(
@@ -3580,6 +3595,7 @@ plugs:
                 fonts: BTreeMap::new(),
                 services: BTreeMap::new(),
                 service_bins: BTreeMap::new(),
+                meta_digest: None,
             },
         );
         let resolved = vec![

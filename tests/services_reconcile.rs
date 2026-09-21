@@ -136,6 +136,7 @@ fn seed_generation(pod: &Path, n: u64, units: &[ServiceUnit]) {
             fonts: Default::default(),
             services: Default::default(),
             service_bins: Default::default(),
+            meta_digest: None,
         },
     );
     let gen = Generation {

@@ -600,7 +600,10 @@ gated_test!(tampered_closure_fails_build, &["node"], {
     assert_eq!(code, Some(0), "stderr: {stderr}");
 
     // Flip a byte inside the stored closure blob (same path, different
-    // content) — the build-time verification must fail closed.
+    // content) — the build-time verification must fail closed. The
+    // trigger is a REBUILD (issue #113): a plain sync holds a
+    // recipe-identical package without touching its closure, so the
+    // deliberate build path is what consumes — and verifies — the blob.
     let (hash, _) = lock_deps_pin(root.path(), "default", "zndapp");
     let blob = pod_dir(root.path(), "default")
         .join("store")
@@ -611,7 +614,7 @@ gated_test!(tampered_closure_fails_build, &["node"], {
     bytes[last] ^= 0xff;
     std::fs::write(&blob, &bytes).unwrap();
 
-    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "rebuild", "zndapp"]);
     assert_ne!(code, Some(0), "tampered closure must fail the build");
     assert!(
         stderr.contains("hash mismatch") || stderr.contains("corrupted"),
@@ -1334,7 +1337,10 @@ gated_test!(
         assert_eq!(code, Some(0), "stderr: {stderr}");
 
         // Flip a byte inside the stored closure blob (same path, different
-        // content) — the build-time verification must fail closed.
+        // content) — the build-time verification must fail closed. The
+        // trigger is a REBUILD (issue #113): a plain sync holds a
+        // recipe-identical package without touching its closure, so the
+        // deliberate build path is what consumes — and verifies — the blob.
         let (hash, _) = lock_deps_pin(root.path(), "default", "ztampp");
         let blob = pod_dir(root.path(), "default")
             .join("store")
@@ -1345,7 +1351,7 @@ gated_test!(
         bytes[last] ^= 0xff;
         std::fs::write(&blob, &bytes).unwrap();
 
-        let (code, _, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+        let (code, _, stderr) = run(project.path(), root.path(), &["pod", "rebuild", "ztampp"]);
         assert_ne!(code, Some(0), "tampered closure must fail the build");
         assert!(
             stderr.contains("hash mismatch") || stderr.contains("corrupted"),
@@ -2529,6 +2535,7 @@ fn seed_pod_generation(pod_dir: &Path, n: u64, pkg: &str, unit: &str) {
             fonts: std::collections::BTreeMap::new(),
             services: std::collections::BTreeMap::new(),
             service_bins: std::collections::BTreeMap::new(),
+            meta_digest: None,
         },
     );
     let gen = Generation {

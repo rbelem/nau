@@ -707,6 +707,7 @@ mod tests {
                 launchers: BTreeMap::new(),
                 confined: None,
                 app_confined: BTreeMap::new(),
+                meta_digest: None,
             },
         );
         Generation {
@@ -760,6 +761,7 @@ mod tests {
                 fonts: BTreeMap::new(),
                 services: BTreeMap::new(),
                 service_bins: BTreeMap::new(),
+                meta_digest: None,
             },
         );
         Generation {
@@ -842,6 +844,7 @@ mod tests {
             fonts: BTreeMap::new(),
             services: BTreeMap::new(),
             service_bins: BTreeMap::new(),
+            meta_digest: None,
         };
         pkg.service_bins
             .insert("valkey".to_string(), hash.to_string());
@@ -949,6 +952,7 @@ mod tests {
                 fonts: BTreeMap::new(),
                 services: BTreeMap::new(),
                 service_bins: BTreeMap::new(),
+                meta_digest: None,
             },
         );
         Generation {
@@ -1106,6 +1110,7 @@ mod tests {
                 fonts: BTreeMap::new(),
                 services: BTreeMap::new(),
                 service_bins: BTreeMap::new(),
+                meta_digest: None,
             },
         );
         Generation {
@@ -1418,6 +1423,7 @@ mod tests {
                     fonts: BTreeMap::new(),
                     services: BTreeMap::new(),
                     service_bins: BTreeMap::new(),
+                    meta_digest: None,
                 },
             );
         }

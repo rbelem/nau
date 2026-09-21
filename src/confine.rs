@@ -648,6 +648,7 @@ mod tests {
             fonts: BTreeMap::new(),
             services: BTreeMap::new(),
             service_bins: BTreeMap::new(),
+            meta_digest: None,
         };
         // Multi-file app: exec the assembled leaf, not the lone blob —
         // the leaf's directory carries the recorded sibling.
