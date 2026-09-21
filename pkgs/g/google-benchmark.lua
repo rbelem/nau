@@ -27,7 +27,10 @@
 -- BENCHMARK_ENABLE_TESTING=OFF (plus BENCHMARK_ENABLE_GTEST_TESTS=OFF
 -- for explicitness) drops the googletest dependency entirely, so
 -- this port needs no gtest at build time and stays a leaf beside
--- the googletest port rather than depending on it. Version sources:
+-- the googletest port rather than depending on it.
+-- CMAKE_POSITION_INDEPENDENT_CODE=ON because the archive is linked
+-- into shared objects (libsearch.so) — non-PIC static code cannot
+-- relocate there. Version sources:
 -- none (BENCHMARK_ENABLE_LIBPFM/Downloads all off). C++17 floor;
 -- sandbox GCC 15.2 clears it.
 --
@@ -69,6 +72,7 @@ return {
                 "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr " ..
                 "-DCMAKE_INSTALL_PREFIX=/usr " ..
                 "-DCMAKE_INSTALL_LIBDIR=lib " ..
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON " ..
                 "-DBENCHMARK_ENABLE_TESTING=OFF " ..
                 "-DBENCHMARK_ENABLE_GTEST_TESTS=OFF " ..
                 "-DBENCHMARK_DOWNLOAD_DEPENDENCIES=OFF " ..

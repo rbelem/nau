@@ -23,7 +23,10 @@
 -- Port strategy: upstream defaults — static libraries
 -- (BUILD_SHARED_LIBS=OFF default), gmock built beside gtest
 -- (BUILD_GMOCK=ON default) because INSTALL_GTEST installs both
--- config packages from one configure. C++17 floor; the sandbox GCC
+-- config packages from one configure.
+-- CMAKE_POSITION_INDEPENDENT_CODE=ON because the archives link into
+-- shared objects (libsearch.so) — non-PIC static code cannot
+-- relocate there. C++17 floor; the sandbox GCC
 -- 15.2 clears it. Installs usr/lib/libgtest*.a/libgmock*.a plus
 -- usr/lib/cmake/GTest — the exact find_package(GTest CONFIG)
 -- contract valkey-search consumes.
@@ -65,7 +68,8 @@ return {
                 "-DCMAKE_BUILD_TYPE=Release " ..
                 "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr " ..
                 "-DCMAKE_INSTALL_PREFIX=/usr " ..
-                "-DCMAKE_INSTALL_LIBDIR=lib",
+                "-DCMAKE_INSTALL_LIBDIR=lib " ..
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
             "cmake --build $SRC/build -j$(nproc)",
             "DESTDIR=$STAGE cmake --install $SRC/build",
         }, " && "),
