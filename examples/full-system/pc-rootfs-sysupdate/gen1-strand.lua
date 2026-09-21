@@ -1,8 +1,8 @@
 -- #86 strand CONTROL device: gen1 with the #86 recovery oneshot masked
 -- out (systemd.mask=), reproducing the pre-#86 behavior. The strand is
--- created here (throttled payload server + a QEMU kill mid-transfer) and
--- the re-run update is observed WITHOUT recovery; gen1.lua (recovery
--- active) is the paired treatment device.
+-- created here (throttled payload server + a mid-transfer death) and the
+-- re-run update is observed WITHOUT recovery; gen1.lua (recovery active)
+-- is the paired treatment device.
 --
 -- The factory device: an A/B disk whose slot B ships DPS-`_empty`-labeled,
 -- the sysupdate transfer files pointed at a payload server on the QEMU
@@ -24,10 +24,9 @@
 -- Build (from this directory, after prepare.sh):
 --   shuttle image --file gen1-strand.lua --arch amd64 --output "$OUT/gen1-strand"
 --
--- Boot proof (see README "#86" for the full sequence): strand boot =
--- throttled payload server + `--timeout` QEMU kill mid-transfer; re-run
--- boot = unthrottled server, no recovery — the native post-strand
--- behavior this ticket fixes.
+-- Boot proof (README "#86"): strand boot = throttled payload server +
+-- a mid-transfer death; re-run boot = unthrottled server, recovery
+-- masked — the native post-strand behavior this ticket fixes.
 
 return {
     rootfs = image {
@@ -152,8 +151,17 @@ return {
             { source = "local/nix/libmount.so.1",            dest = "/nix/store/17xmg38m60inc59az3frp540ccrwn2r8-util-linux-minimal-2.42.2-lib/lib/libmount.so.1" },
             { source = "local/nix/libsmartcols.so.1",        dest = "/nix/store/17xmg38m60inc59az3frp540ccrwn2r8-util-linux-minimal-2.42.2-lib/lib/libsmartcols.so.1" },
             { source = "local/nix/libuuid.so.1",             dest = "/nix/store/17xmg38m60inc59az3frp540ccrwn2r8-util-linux-minimal-2.42.2-lib/lib/libuuid.so.1" },
-            -- #86 proof-only guest-runnable shuttle closure — see the
-            -- long comment in gen1.lua (same rationale and paths).
+            -- #86 proof-only: a GUEST-RUNNABLE /usr/bin/shuttle. The
+            -- build-host embed (#81) needs glibc >= 2.38; the core22
+            -- guest ships 2.35, so `runtime activate` and `runtime
+            -- recover-slots` could not exec at all (measured: "GLIBC_2.39
+            -- not found", in both #80's and #86's serial logs). This copy
+            -- is the same build with RUNPATH into the nix glibc/gcc dirs
+            -- — of which this file list already stages the loader and
+            -- libc for the sysupdate tooling — plus libstdc++, libgcc_s
+            -- and libm staged at their absolute store paths. Product
+            -- images keep the #81 embed; this is harness plumbing,
+            -- exactly like the sysupdate tooling above.
             { source = "local/nix/shuttle-guest",            dest = "/usr/bin/shuttle" },
             { source = "local/nix/libstdcpp.so.6",           dest = "/nix/store/chqq8mpmpyfi9kgsngya71akv5xicn03-gcc-15.2.0-lib/lib/libstdc++.so.6" },
             { source = "local/nix/libgcc_s.so.1",            dest = "/nix/store/chqq8mpmpyfi9kgsngya71akv5xicn03-gcc-15.2.0-lib/lib/libgcc_s.so.1" },

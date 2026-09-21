@@ -11,12 +11,11 @@ observed on the ESP through a real update — not a hand-planted UKI.
 | file | purpose |
 | --- | --- |
 | `gen1.lua` | the factory device: A/B disk (slot B ships `_empty`-labeled), `update_source` pointed at `http://10.0.2.2:8123/` (QEMU SLIRP's alias for the host loopback), the sysupdate service pulled into the first boot via `systemd.wants=` |
-| `gen1-strand.lua` | (#86) the same device with `systemd.mask=shuttle-slot-recovery.service` on the kernel cmdline — a CONTROL that behaves exactly like a pre-#86 image (no stranded-slot recovery) |
 | `gen2.lua` | the update payload build: version 2.0, health gate `/bin/false` so the counted UKI is never blessed — the `+3-0` → `+2-1` decrement stays observable |
 | `gen2-bless.lua` | same payload with health gate `/bin/true`: the boot-complete.target ceremony runs and the counter suffix is shed (bless path) |
 | `proof/` | per-generation proof oneshots (`shuttle-80-proof.service` echoes the generation into the boot), the clean-poweroff oneshot, the `/etc/generation` marker, the journald console drop-in |
 | `prepare.sh` | stages the guest sysupdate tooling, builds all three images, extracts the payload artifacts (`root_@v_@u.img`, `verity-hash_@v_@u.img`, `<name>_@v.efi`) plus `SHA256SUMS` from the payload build's slot A |
-| `tools/` | `http-fetch`: a ~200-line Rust stand-in for `systemd-pull` (see "Why a fetcher stand-in" below); `strand-server.py`: throttling payload server for the #86 strand proof |
+| `tools/` | `http-fetch`: a ~200-line Rust stand-in for `systemd-pull` (see "Why a fetcher stand-in" below) |
 | `local/` | (gitignored) populated by `prepare.sh`: the anchored fetcher binary and payload-tooling copies |
 
 ## Why the base rootfs needs staged tooling
@@ -112,119 +111,71 @@ under `~/.cache/shuttle-80/evidence/` (paths printed by the commands
 above), plus a post-mortem (`sfdisk -J` + `debugfs`) proving slot A holds
 generation 1 and slot B generation 2 with the payload-derived PARTUUIDs.
 
-## #86 — a killed install strands the target slot; boot-time reclaim
+## #86 — a killed install strands the target slot (reproduce + recover)
 
-`systemd-sysupdate` writes the target slot through the parent's
-whole-disk fd. Kill the install mid-transfer (power loss, OOM, deadline)
-and the slot is left half-installed with no graceful marker — and systemd
-249 (the UC22 base) has no `sysupdate vacuum` verb to clear it. Left
-alone, the stranded slot poisons every later install: the #63 fallback
-story ("a broken update counts down and the loader falls back") decays
-into a permanently stuck single-generation device.
+A sysupdate install killed mid-transaction leaves the target slot
+unusable, and systemd 249 has no `vacuum` verb to clear it: the NEXT
+update refuses (`Selected update '2.0' is already acquired and partially
+installed. Vacuum it to try installing again.`) — a clean #63 fallback
+device becomes permanently stuck on one generation.
 
-### The measured strand signature
+**Measured strand signature** (kill during the 50-verity transfer, after
+50-root finalized): slot B root carries the FINAL `2.0` label + `@u`
+PARTUUID but a masked placeholder TYPE GUID; the hash slot carries the
+final label, a masked type and a random PARTUUID (`@u` never ran); the
+ESP has no 2.0 UKI. Masked types make both partitions invisible to
+`MatchPartitionType` AND they do not read `_empty` — no writable target.
 
-sysupdate masks a slot it is about to rewrite: early in the transfer it
-sets the partition type to a fresh random v4 GUID so nothing recognizes
-the partition while data streams into it; the final type, PARTUUID and
-label are restored only at the end. A transaction killed mid-flight
-therefore leaves a mix (captured in `~/.cache/shuttle-86/evidence86/`):
+**The invariant** (`shuttle runtime recover-slots`,
+`src/slot_recovery.rs`): a slot label is valid only while its UKI was
+fully written (structurally: a PE whose section table fits the file) and
+the update was declared installed. Label-without-bootable-UKI ⇒ stranded
+⇒ restore the flavor type (where masked) + relabel `_empty`. The running
+version (`%A`) is never touched; nothing is reclaimed unless the running
+version's own UKI is present (the sentinel proving the ESP listing is
+real); every other odd state surfaces as a named anomaly, never an
+action. The emitted `shuttle-slot-recovery.service` oneshot runs this at
+boot, `Before=systemd-sysupdate.service`, on the same gate as the
+transfers.
 
-- root slot: FINAL version label (`shuttle-80_2.0_a`) + FINAL `@u`
-  PARTUUID, but a masked random type GUID — invisible to
-  `MatchPartitionType`;
-- hash slot: final-version label + masked random type + a random v4
-  PARTUUID (the `@u` pin never ran);
-- ESP: no UKI for the new version (the 60-uki transfer never started).
-
-The next `systemd-sysupdate update` then fails — measured, verbatim:
-`Selected update '2.0' is already acquired and partially installed.
-Vacuum it to try installing again.` — systemd naming the very verb this
-base does not have.
-
-### The invariant and the recovery policy
-
-A slot partition carries a version label only while its UKI was fully
-written and the update was declared installed. The transfer ordering
-makes the pairing checkable: the 50-* partitions finalize before the
-60-uki transfer, so **label-without-a-bootable-UKI ⇒ the transaction
-never completed ⇒ the slot is stranded**. `shuttle runtime
-recover-slots` (src/slot_recovery.rs) enforces this conservatively:
-
-- relabel `_empty` ONLY versions whose label is present and whose UKI is
-  absent or structurally incomplete (a truncated PE could never have
-  booted) — restoring the flavor type GUID where sysupdate left it
-  masked;
-- never touch the running version (`%A`, from os-release
-  `IMAGE_VERSION=`);
-- refuse to reclaim anything unless the running version's own UKI is
-  present and parses (the sentinel proving the ESP listing is real);
-- surface anything that fits neither box as a named anomaly, untouched.
-
-The emitted `shuttle-slot-recovery.service` oneshot runs it at boot,
-ordered `Before=systemd-sysupdate.service` — reclaim completes before
-the next install looks for a writable slot. Every refusal is a named
-no-op: a boot never wedges on this unit.
-
-### Reproduce the strand, the failure, and the recovery
-
-The kill is deterministic: the throttling server holds the
-`verity-hash_*` body for 900s while the staged `http-fetch` enforces a
-600s socket read timeout — the read times out well before the body
-arrives, the transfer dies mid-install ("read failed: Resource
-temporarily unavailable"), the update unit fails, and the slot pair is
-left labeled-but-unbootable. (At 600s the delay ties the timeout and the
-race can go either way — 900s removes the ambiguity.)
+**Reproduce** (S = control `gen1-strand.lua`, recovery masked via
+`systemd.mask=`; R = treatment `gen1.lua`; both images carry the #86
+unit; the payload is unchanged, served from `~/.cache/shuttle-80`):
 
 ```sh
-# 0. build the device images (gen1 + the gen1-strand CONTROL)
-devbox run -- bash prepare.sh          # also builds gen2/gen2b payloads
+# 0. build + stage (prepare.sh builds gen1-strand too; the payload from
+#    the #80 wave is reused as-is)
+export SHUTTLE_80_WORK="$HOME/.cache/shuttle-86"
+devbox run -- bash prepare.sh
 
-# 1. STRAND — serve the gen2b payload with the throttling server and boot
-#    gen1 (recovery active; a fresh device has nothing to reclaim). The
-#    root slot finalizes, the verity-hash fetch dies at the 600s read
-#    timeout, the update unit fails, poweroff is clean.
-STRAND_DELAY_SECS=900 python3 tools/strand-server.py "$WORK/payload-gen2b" 8123 &
-devbox run -- target/release/shuttle test "$WORK/images/gen1/shuttle-80_1.0_amd64.img" \
-    --runs 1 --timeout 1500 --log "$WORK/evidence86/R1-strand.serial.log" \
-    --require "slot-recovery: no stranded slots" \
-    --require "read failed: Resource temporarily unavailable" \
-    --require "Failed to start shuttle: apply systemd-sysupdate" \
+# 1. S1/R1 — strand creation: serve the payload with the throttling
+#    server; the guest's verity-hash fetch dies (EAGAIN on the delayed
+#    body) AFTER the root transfer finalized
+python3 tools/strand-server.py ~/.cache/shuttle-80/payload-gen2 8123 &
+devbox run -- target/debug/shuttle test "$WORK/images/<S-or-R>/shuttle-80_1.0_amd64.img" \
+    --runs 1 --timeout 900 --log "$WORK/evidence86/<phase>.serial.log" \
+    --require "payload proof: generation 1" \
     --qemu-arg=-nic --qemu-arg user,model=virtio-net-pci
-sfdisk -J "$WORK/images/gen1/shuttle-80_1.0_amd64.img"   # the strand
+#    → sfdisk -J: partitions 5/6 masked types + 2.0 labels; ESP: no 2.0 UKI
 
-# 2. CONTROL — the same strand on gen1-strand (recovery masked), then a
-#    re-run boot with an UNTHROTTLED server: the update refuses.
-cp -a "$WORK/images/gen1-strand" "$WORK/images/gen1-strand-run"
-STRAND_DELAY_SECS=900 python3 tools/strand-server.py "$WORK/payload-gen2b" 8123 &
-#   ... boot gen1-strand-run as in step 1 ...
-#   ... then re-boot it serving `python3 -m http.server` instead; the log
-#   shows "already acquired and partially installed. Vacuum it" + exit 1.
-
-# 3. RECOVERY — boot the stranded gen1 again (unthrottled server): the
-#    oneshot relabels both halves `_empty` (and restores their types),
-#    and the SAME boot's sysupdate installs 2.0 for real.
-python3 -m http.server 8123 --bind 127.0.0.1 --directory "$WORK/payload-gen2b" &
-devbox run -- target/release/shuttle test "$WORK/images/gen1/shuttle-80_1.0_amd64.img" \
-    --runs 1 --timeout 1500 --log "$WORK/evidence86/R2-recovery.serial.log" \
-    --require "slot-recovery: relabeled 'shuttle-80_2.0_a' -> '_empty'" \
-    --require "Finished shuttle: apply systemd-sysupdate A/B updates" \
-    --require "Reached target Multi-User System" \
-    --qemu-arg=-nic --qemu-arg user,model=virtio-net-pci
+# 2. S2 — the native re-run (unthrottled `python3 -m http.server`): the
+#    update refuses; `systemd-sysupdate list` assesses 2.0 as
+#    `current+partial` and 1.0 as `protected`. Stuck forever.
+# 3. R2 — the recovery boot (unthrottled server): the oneshot relabels
+#    both halves `_empty` (serial lines `slot-recovery: relabeled ...`),
+#    the SAME update transaction then finishes
+#    ("Finished shuttle: apply systemd-sysupdate A/B updates") and the
+#    ESP gains shuttle-80_2.0+3-0.efi.
 ```
 
-`~/.cache/shuttle-86/evidence86/` archives this wave's runs: `R1-*`
-(strand creation on the recovery-enabled device), `S1-*`/`S2-*` (the
-CONTROL: strand, then the refused re-run), `R2-*` (recovery relabel +
-the update succeeding), each with the serial log, `sfdisk -J` partition
-dump and the ESP listing.
+Evidence: `~/.cache/shuttle-86/evidence86/` — per-phase serial logs,
+`*-partitions.json` GPT dumps and `*-esp-listing.txt` (S1 strand state,
+S2 refusal, R2 relabel+retype+success).
 
-### The guest-runnable `shuttle` (proof-only staging)
-
-`runtime recover-slots` must exec in the guest, but the build-host
-binary needs glibc ≥ 2.38 while core22 ships 2.35. `gen1.lua` and
-`gen1-strand.lua` therefore stage a guest-runnable build of the same
-source (interpreter/RUNPATH patched into the nix glibc/gcc dirs whose
-loader and libc the file list already stages for the sysupdate tooling)
-at `/usr/bin/shuttle`, replacing the #81 build-host embed for this
-harness only. Product images keep the #81 embed.
+**Proof-harness plumbing note**: the build-host embed of `/usr/bin/shuttle`
+(#81) needs glibc ≥ 2.38 and could never exec on the core22 guest
+(measured: `GLIBC_2.39 not found` — the #80 logs show the same for the
+activate oneshot). Both gen1 lulas therefore stage a guest-runnable copy
+(`local/nix/shuttle-guest`: the same build with RUNPATH into the nix
+glibc/gcc dirs already staged for the sysupdate tooling). Product images
+keep the #81 embed untouched.

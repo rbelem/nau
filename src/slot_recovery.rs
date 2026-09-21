@@ -36,33 +36,35 @@
 //! # The measured strand signature (#86 reproduction, systemd 261 tooling)
 //!
 //! sysupdate masks a slot it is about to rewrite: early in the transfer it
-//! sets the partition type to a fresh random (v4) GUID, so nothing on the
-//! system recognizes the partition while data is being streamed into it.
-//! The final type, PARTUUID and label are only restored at the end of the
-//! transfer (and the re-set only lands for partitions fully acquired
-//! before the kill). A transaction killed mid-flight therefore leaves a
-//! mix the next `sysupdate update` cannot address at all — measured on the
-//! #80 harness after a mid-verity-transfer death:
+//! sets the partition type to a placeholder GUID (observed constant in
+//! this build, distinct per slot flavor) and a fresh random PARTUUID, so
+//! nothing on the system recognizes the partition while data is being
+//! streamed into it. The final type, PARTUUID and label are only restored
+//! at the end of the transfer (and the re-set only lands for partitions
+//! fully acquired before the kill). A transaction killed mid-flight
+//! therefore leaves a mix the next `sysupdate update` cannot address at
+//! all — measured on the #80 harness after a mid-verity-transfer death:
 //!
 //! - root slot: FINAL version label + FINAL @u PARTUUID, but a masked
-//!   random type GUID — invisible to `MatchPartitionType`;
-//! - hash slot: final-version label + a masked random type + a random v4
-//!   PARTUUID (the `@u` pin never ran);
+//!   placeholder type GUID — invisible to `MatchPartitionType`;
+//! - hash slot: final-version label + a masked placeholder type + a
+//!   random PARTUUID (the `@u` pin never ran);
 //! - ESP: no UKI for the new version (the 60-uki transfer never started).
 //!
 //! Neither partition matches its slot type NOR carries `_empty`, so the
-//! next install finds no writable target — the strand. Hence a partition
-//! whose LABEL parses as a slot of this image but whose TYPE is not that
-//! slot's flavor type is, by itself, evidence of a transaction that never
-//! completed — reclaiming it means restoring the flavor type AND
-//! relabeling `_empty`.
+//! next install refuses with `Selected update '2.0' is already acquired
+//! and partially installed. Vacuum it to try installing again.` — the
+//! strand. Hence a partition whose LABEL parses as a slot of this image
+//! but whose TYPE is not that slot's flavor type is, by itself, evidence
+//! of a transaction that never completed — reclaiming it means restoring
+//! the flavor type AND relabeling `_empty`.
 //!
 //! # The recovery policy (conservative by construction)
 //!
-//! - Reclaim (relabel `_empty`) ONLY versions whose label is present and
-//!   whose UKI is absent or structurally incomplete: such a slot could
-//!   never have been booted, so reclaiming cannot destroy state anyone
-//!   depended on.
+//! - Reclaim (retype + relabel `_empty`) ONLY versions whose label is
+//!   present and whose UKI is absent or structurally incomplete: such a
+//!   slot could never have been booted, so reclaiming cannot destroy
+//!   state anyone depended on.
 //! - Never touch the running version: it is `%A`, the same
 //!   `ProtectVersion=` anchor the transfers use, read from
 //!   `/etc/os-release` `IMAGE_VERSION=`.
@@ -70,11 +72,12 @@
 //!   present and parses: that UKI is the sentinel proving the ESP
 //!   listing is real (an unmounted/empty ESP would otherwise make every
 //!   installed slot look stranded).
-//! - Refuse entirely when os-release lacks `IMAGE_VERSION`/`NAME`: the
-//!   `%A` anchor is what separates running from stranded.
+//! - Refuse entirely when the image name cannot be attributed from the
+//!   transfer definitions: the `%A` anchor and the label grammar are
+//!   what separate running from stranded.
 //! - Anything that fits neither the "stranded" nor the "installed" box
-//!   (UKI present but partition pair incomplete, label/flavor mismatches)
-//!   surfaces as a named anomaly and is left untouched.
+//!   (UKI present but partition pair incomplete/masked) surfaces as a
+//!   named anomaly and is left untouched.
 //!
 //! # Where it runs
 //!
@@ -289,7 +292,7 @@ fn version_has_bootable_uki(ukis: &[UkiFile], image_name: &str, version: &str) -
 }
 
 /// Partition buckets for one version. The `masked` flag marks partitions
-/// whose type GUID was replaced mid-install (random masking GUID) —
+/// whose type GUID was replaced mid-install (placeholder masking GUID) —
 /// reclaiming them restores the type.
 #[derive(Default)]
 struct VersionSlots<'a> {
@@ -335,7 +338,7 @@ pub fn assess(facts: &SlotFacts) -> Assessment {
     // Bucket this image's version-labeled partitions. `_empty`, foreign
     // images' labels, and non-slot labels (esp, state, swap) never bucket.
     // A label of ours whose type GUID is NOT the flavor's type is the
-    // measured masking signature (random v4 GUID set early in the
+    // measured masking signature (placeholder GUID set early in the
     // transfer): it buckets as a masked partition instead of being
     // rejected.
     let mut slots: BTreeMap<String, VersionSlots> = BTreeMap::new();
@@ -803,6 +806,10 @@ mod tests {
         assert_eq!(r.partitions.len(), 1);
         assert_eq!(r.partitions[0].partno, 5);
         assert_eq!(r.partitions[0].label, "shuttle-80_2.0_a");
+        assert!(
+            r.partitions[0].retype_to.is_none(),
+            "healthy type: label-only reclaim"
+        );
         assert!(a.anomalies.is_empty(), "{:?}", a.anomalies);
     }
 
@@ -929,11 +936,11 @@ mod tests {
     }
 
     #[test]
-    fn type_masked_partitions_are_the_strand_and_get_retored() {
+    fn type_masked_partitions_are_the_strand_and_get_restored() {
         // The MEASURED #86 strand (systemd 261 tooling, mid-transaction
         // kill): both halves wear final-version labels but sysupdate left
-        // their type GUIDs masked (fresh random v4 GUIDs), so the next
-        // update matches neither by MatchPartitionType nor `_empty`.
+        // their type GUIDs masked (placeholder GUIDs), so the next update
+        // matches neither by MatchPartitionType nor `_empty`.
         // Recovery restores the flavor type AND relabels.
         let mut parts = factory_partitions();
         parts[4].partlabel = "shuttle-80_2.0_a".to_string();
@@ -968,8 +975,8 @@ mod tests {
     #[test]
     fn one_masked_half_of_a_pair_is_reclaimed_too() {
         // Kill between the two 50-* transfers: root finalized (healthy
-        // type), hash still masked/unlabeled. The labeled half is
-        // reclaimable regardless.
+        // type), hash still `_empty`. The labeled half is reclaimable
+        // regardless.
         let mut parts = factory_partitions();
         parts[4].partlabel = "shuttle-80_2.0_a".to_string();
         let ukis = vec![uki("shuttle-80_1.0.efi", true)];
