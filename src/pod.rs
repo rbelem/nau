@@ -3608,7 +3608,8 @@ fn ensure_own_deps(
     }
     let prev = lock.packages.get(pkg_name).and_then(|e| e.deps.clone());
     let floating = force_float || meta.floating;
-    crate::dep_fetch::ensure_pod_deps(store, meta, prev.as_ref(), floating)
+    let recipe_dir = crate::deps::recipe_dir(pkg_name);
+    crate::dep_fetch::ensure_pod_deps(store, meta, prev.as_ref(), floating, recipe_dir.as_deref())
         .map(Some)
         .map_err(|e| miette::miette!("package '{pkg_name}': {e}"))
 }
@@ -3895,8 +3896,15 @@ pub fn fetch_pod_deps(
             }
         }
         let old_hash = prev.as_ref().map(|p| p.deps_hash.clone());
-        let pin = crate::dep_fetch::ensure_pod_deps(&store, &meta, prev.as_ref(), floating)
-            .map_err(|e| miette::miette!("package '{}': {e}", spec.name))?;
+        let recipe_dir = crate::deps::recipe_dir(&spec.name);
+        let pin = crate::dep_fetch::ensure_pod_deps(
+            &store,
+            &meta,
+            prev.as_ref(),
+            floating,
+            recipe_dir.as_deref(),
+        )
+        .map_err(|e| miette::miette!("package '{}': {e}", spec.name))?;
         let changed = old_hash.as_deref() != Some(pin.deps_hash.as_str());
         lock.packages
             .entry(spec.name.clone())

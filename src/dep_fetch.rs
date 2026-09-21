@@ -77,6 +77,7 @@ pub fn ensure_pod_deps(
     meta: &SnapMeta,
     prev: Option<&PackageDepsLock>,
     floating: bool,
+    recipe_dir: Option<&Path>,
 ) -> miette::Result<PackageDepsLock> {
     let Some(deps) = &meta.deps else {
         miette::bail!(
@@ -96,7 +97,7 @@ pub fn ensure_pod_deps(
         }
     }
 
-    let hash = fetch_deps_closure(store, meta, deps)?;
+    let (hash, lock_sha256) = fetch_deps_closure(store, meta, deps, recipe_dir)?;
 
     match pinned {
         // The re-fetch reproduced the pin (locked entry rebuilt after GC,
@@ -121,6 +122,7 @@ pub fn ensure_pod_deps(
             Ok(PackageDepsLock {
                 deps_hash: hash,
                 fetched_at: Some(today()),
+                lock_sha256,
             })
         }
         None => {
@@ -133,36 +135,65 @@ pub fn ensure_pod_deps(
             Ok(PackageDepsLock {
                 deps_hash: hash,
                 fetched_at: Some(today()),
+                lock_sha256,
             })
         }
     }
 }
 
 /// Fetch + materialize the closure and store it as one content-addressed
-/// blob. Returns the blob's sha256 (the `deps_hash`).
+/// blob. Returns the blob's sha256 (the `deps_hash`) plus the sha256 of
+/// the lockfile bytes when the lock resolved from the package recipe
+/// directory (`recipe/` lock path — the audit field beside the pin);
+/// `None` for source-tree locks.
 fn fetch_deps_closure(
     store: &RuntimeStore,
     meta: &SnapMeta,
     deps: &crate::snap::PackageDeps,
-) -> miette::Result<String> {
+    recipe_dir: Option<&Path>,
+) -> miette::Result<(String, Option<String>)> {
     let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
     let src_root = fetch_source_tree(meta, work.path())?;
-    let tree = work.path().join("tree");
+    // Resolve the declared locks once up front: fails fast on a missing
+    // recipe lock (before any download), and records the recipe-shipped
+    // lockfile's sha for the pin. The per-resolver fetches re-read the
+    // same tiny files.
+    let lock_sha256 = recipe_lock_sha256(deps, &src_root, recipe_dir)?;
+    let tree = fetch_tree_dir(work.path())?;
+    fetch_all_resolvers(deps, &src_root, recipe_dir, &tree, work.path())?;
+    let bytes = pack_canonical(&tree)?;
+    let hash = write_store_blob(store, &bytes)?;
+    Ok((hash, lock_sha256))
+}
+
+/// The scratch dir the materialized closure tree is packed from.
+fn fetch_tree_dir(work: &Path) -> miette::Result<PathBuf> {
+    let tree = work.join("tree");
     std::fs::create_dir_all(&tree).map_err(|e| miette::miette!("creating tree dir: {e}"))?;
+    Ok(tree)
+}
+
+/// Run every declared ecosystem resolver against the fetched source tree.
+fn fetch_all_resolvers(
+    deps: &crate::snap::PackageDeps,
+    src_root: &Path,
+    recipe_dir: Option<&Path>,
+    tree: &Path,
+    work: &Path,
+) -> miette::Result<()> {
     if let Some(npm) = &deps.npm {
-        fetch_npm_closure(npm, &src_root, &tree, work.path())?;
+        fetch_npm_closure(npm, src_root, recipe_dir, tree, work)?;
     }
     if let Some(pip) = &deps.pip {
-        fetch_pip_closure(pip, &src_root, &tree, work.path())?;
+        fetch_pip_closure(pip, src_root, recipe_dir, tree, work)?;
     }
     if let Some(cargo) = &deps.cargo {
-        fetch_cargo_closure(cargo, &src_root, &tree, work.path())?;
+        fetch_cargo_closure(cargo, src_root, recipe_dir, tree, work)?;
     }
     if let Some(go) = &deps.go {
-        fetch_go_closure(go, &src_root, &tree)?;
+        fetch_go_closure(go, src_root, recipe_dir, tree)?;
     }
-    let bytes = pack_canonical(&tree)?;
-    write_store_blob(store, &bytes)
+    Ok(())
 }
 
 /// Verify the store's closure blob against its pin and unpack it into a
@@ -193,10 +224,12 @@ pub fn materialize_deps_entry(
     Ok(dir)
 }
 
-// ── Source tree (the lockfile ships in the package source) ──
+// ── Source tree ──
 
 /// Download + extract the package's source tarball and return its source
-/// root — the same download/TOFU semantics `run_build` applies.
+/// root — the same download/TOFU semantics `run_build` applies. Lockfiles
+/// resolve from this tree first (plain `lock` values), or from the
+/// package recipe directory (`recipe/` values — see [`lock_candidates`]).
 fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<PathBuf> {
     let spec = meta.source.as_ref().ok_or_else(|| {
         miette::miette!(
@@ -401,10 +434,11 @@ fn apply_npm_exclude(mut artifacts: Vec<NpmArtifact>, exclude: &[String]) -> Vec
 fn fetch_npm_closure(
     spec: &DepsLockSpec,
     src_root: &Path,
+    recipe_dir: Option<&Path>,
     tree: &Path,
     work: &Path,
 ) -> miette::Result<()> {
-    let lock_bytes = read_source_file(src_root, &spec.lock)?;
+    let lock_bytes = read_lock_file(src_root, recipe_dir, &spec.lock)?;
     let mut artifacts = parse_npm_lock(&lock_bytes)?;
     if !spec.exclude.is_empty() {
         artifacts = apply_npm_exclude(artifacts, &spec.exclude);
@@ -979,11 +1013,12 @@ fn parse_requirement_line(line: &str) -> miette::Result<Option<PipPin>> {
 fn fetch_pip_closure(
     spec: &DepsLockSpec,
     src_root: &Path,
+    recipe_dir: Option<&Path>,
     tree: &Path,
     work: &Path,
 ) -> miette::Result<()> {
     let index = spec.index.as_deref().unwrap_or(DEFAULT_PIP_INDEX);
-    let lock_bytes = read_source_file(src_root, &spec.lock)?;
+    let lock_bytes = read_lock_file(src_root, recipe_dir, &spec.lock)?;
     let target_python = spec.python.as_deref().map(parse_python_minor).transpose()?;
     let pins = parse_pip_pins(&lock_bytes, target_python)?;
     crate::output::info(format!(
@@ -1358,11 +1393,12 @@ fn parse_cargo_lock(bytes: &[u8]) -> miette::Result<Vec<CargoCrate>> {
 fn fetch_cargo_closure(
     spec: &DepsLockSpec,
     src_root: &Path,
+    recipe_dir: Option<&Path>,
     tree: &Path,
     work: &Path,
 ) -> miette::Result<()> {
     let api = spec.index.as_deref().unwrap_or(DEFAULT_CRATES_API);
-    let lock_bytes = read_source_file(src_root, &spec.lock)?;
+    let lock_bytes = read_lock_file(src_root, recipe_dir, &spec.lock)?;
     let crates = parse_cargo_lock(&lock_bytes)?;
     crate::output::info(format!(
         "cargo closure: {} crate(s) from {}",
@@ -1554,11 +1590,16 @@ fn split_require_spec(spec: &str) -> Option<(&str, &str)> {
 /// so a build wired with `GOMODCACHE`/`GOPATH` onto the extracted closure
 /// (or a `file://` GOPROXY onto the download dir) resolves every module
 /// OFFLINE — the proxy zip layout IS the cache layout.
-fn fetch_go_closure(spec: &DepsLockSpec, src_root: &Path, tree: &Path) -> miette::Result<()> {
+fn fetch_go_closure(
+    spec: &DepsLockSpec,
+    src_root: &Path,
+    recipe_dir: Option<&Path>,
+    tree: &Path,
+) -> miette::Result<()> {
     let proxy = spec.index.as_deref().unwrap_or(DEFAULT_GO_PROXY);
-    let mod_bytes = read_source_file(src_root, &spec.lock)?;
+    let mod_bytes = read_lock_file(src_root, recipe_dir, &spec.lock)?;
     let sum_path = spec.sum.as_deref().unwrap_or("go.sum");
-    let sum_bytes = read_source_file(src_root, sum_path)?;
+    let sum_bytes = read_lock_file(src_root, recipe_dir, sum_path)?;
     let modules = parse_go_requires(&mod_bytes)?;
     let sums = parse_go_sum(&sum_bytes)?;
     crate::output::info(format!(
@@ -2065,16 +2106,116 @@ fn http_get_to_string(url: &str, work: &Path) -> miette::Result<String> {
     Ok(text)
 }
 
-/// Read a lockfile out of the fetched source tree with a clear error when
-/// the declared path is missing.
-fn read_source_file(src_root: &Path, rel: &str) -> miette::Result<Vec<u8>> {
-    let path = src_root.join(rel);
-    std::fs::read(&path).map_err(|_| {
-        miette::miette!(
-            "declared lockfile '{rel}' not found in the package source tree (looked at {})",
-            path.display()
-        )
-    })
+// ── Lockfile resolution (source tree + recipe dir) ──
+
+/// One lockfile read to its bytes, plus where the bytes came from.
+struct ResolvedLock {
+    bytes: Vec<u8>,
+    /// True when the winning candidate was the recipe-directory copy.
+    from_recipe: bool,
+}
+
+/// The candidate locations of a declared lock path, in priority order,
+/// paired with whether each is the recipe-directory copy.
+///
+/// Contract: a plain path resolves from the fetched source tree first —
+/// exactly the legacy behavior — with the recipe directory as a fallback
+/// for upstreams that ship no lockfile. A `recipe/`-prefixed path is
+/// fail-closed: it resolves against the package recipe directory ONLY
+/// (the directory beside the package's `init.lua` or single `<name>.lua`)
+/// and never falls back to the source tree — the prefix declares "my
+/// recipe ships the authoritative lock", so silently consuming an
+/// upstream copy would defeat it.
+fn lock_candidates(
+    src_root: &Path,
+    recipe_dir: Option<&Path>,
+    declared: &str,
+) -> miette::Result<Vec<(PathBuf, bool)>> {
+    if let Some(rest) = declared.strip_prefix("recipe/") {
+        check_recipe_rel_path(rest)?;
+        let Some(dir) = recipe_dir else {
+            miette::bail!(
+                "declared lockfile '{declared}' resolves from the package recipe directory, \
+                 but no recipe directory is known for this package"
+            );
+        };
+        return Ok(vec![(dir.join(rest), true)]);
+    }
+    let mut out = vec![(src_root.join(declared), false)];
+    if let Some(dir) = recipe_dir {
+        out.push((dir.join(declared), true));
+    }
+    Ok(out)
+}
+
+/// The path under `recipe/` must stay inside the recipe directory: no
+/// `..` components, no absolute remnant, never empty.
+fn check_recipe_rel_path(rest: &str) -> miette::Result<()> {
+    use std::path::Component;
+    let rel = Path::new(rest);
+    let escapes =
+        rel.is_absolute() || rest.is_empty() || rel.components().any(|c| c == Component::ParentDir);
+    if escapes {
+        miette::bail!(
+            "'recipe/' lock path must name a file inside the recipe directory, got '{rest}'"
+        );
+    }
+    Ok(())
+}
+
+/// Read a declared lockfile (or go.sum sibling) from its candidate
+/// locations (see [`lock_candidates`]). Found in NONE of them → the
+/// named-diagnostic failure listing every path tried.
+fn read_lock_file(
+    src_root: &Path,
+    recipe_dir: Option<&Path>,
+    declared: &str,
+) -> miette::Result<Vec<u8>> {
+    resolve_lock(src_root, recipe_dir, declared).map(|r| r.bytes)
+}
+
+fn resolve_lock(
+    src_root: &Path,
+    recipe_dir: Option<&Path>,
+    declared: &str,
+) -> miette::Result<ResolvedLock> {
+    let mut tried = Vec::new();
+    for (path, from_recipe) in lock_candidates(src_root, recipe_dir, declared)? {
+        match std::fs::read(&path) {
+            Ok(bytes) => return Ok(ResolvedLock { bytes, from_recipe }),
+            Err(_) => tried.push(path.display().to_string()),
+        }
+    }
+    miette::bail!(
+        "declared lockfile '{declared}' not found (looked at {})",
+        tried.join(" and ")
+    )
+}
+
+/// The sha256 of the first declared lock that resolves from the recipe
+/// directory (resolver order npm → pip → cargo → go; single-resolver
+/// packages are the norm) — the audit value recorded beside `deps_hash`
+/// in shuttle.lock. Every declared lock is resolved here first, so a
+/// missing recipe lock fails BEFORE any source download; the per-resolver
+/// fetches re-read the same files.
+fn recipe_lock_sha256(
+    deps: &crate::snap::PackageDeps,
+    src_root: &Path,
+    recipe_dir: Option<&Path>,
+) -> miette::Result<Option<String>> {
+    let declared = [
+        deps.npm.as_ref().map(|s| s.lock.as_str()),
+        deps.pip.as_ref().map(|s| s.lock.as_str()),
+        deps.cargo.as_ref().map(|s| s.lock.as_str()),
+        deps.go.as_ref().map(|s| s.lock.as_str()),
+    ];
+    for lock in declared.into_iter().flatten() {
+        let resolved = resolve_lock(src_root, recipe_dir, lock)?;
+        if resolved.from_recipe {
+            return Ok(Some(hex_sha256(&resolved.bytes)));
+        }
+    }
+    Ok(None)
 }
 
 /// Streaming SHA-256 of a file, hex-encoded.

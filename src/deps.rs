@@ -11,7 +11,7 @@
 //! display and closure reporting.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::snap::SnapMeta;
 
@@ -275,6 +275,21 @@ pub fn load_meta(name_or_path: &str) -> miette::Result<SnapMeta> {
 /// Resolve a package name to a path: checks local file system and input sources.
 pub fn resolve_path(name_or_path: &str) -> PathBuf {
     crate::pkg_source::resolve_path(name_or_path)
+}
+
+/// The directory that ships beside a package's recipe: the parent of the
+/// `<name>.lua` file for single-file packages, of the `init.lua` for
+/// directory-form packages — the same resolution [`load_meta`] applies,
+/// local `pkgs/` and input-source trees alike. `recipe/`-prefixed
+/// `deps.*.lock` paths (ADR-0017) resolve against it. `None` when the
+/// package does not resolve to a recipe file on disk.
+pub fn recipe_dir(name_or_path: &str) -> Option<PathBuf> {
+    let path = match crate::pkg_source::resolve_pkg(name_or_path) {
+        crate::pkg_source::PkgResult::File(path) => path,
+        crate::pkg_source::PkgResult::Found { path, .. } => path,
+        crate::pkg_source::PkgResult::NotFound => return None,
+    };
+    Path::new(&path).parent().map(Path::to_path_buf)
 }
 
 #[cfg(test)]

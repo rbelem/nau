@@ -1156,6 +1156,7 @@ mod tests {
                     deps: deps_hash.map(|h| PackageDepsLock {
                         deps_hash: h.to_string(),
                         fetched_at: Some("2026-01-01".into()),
+                        lock_sha256: None,
                     }),
                 },
             );
