@@ -179,6 +179,9 @@ fc-match 'Hack Nerd Font'                                   # resolves from the 
 #   [ ! -t 0 ] || [ -z "$PS1" ] && return
 #   eval "$(shuttle pod --name daily shellenv)"
 # (no `devbox completion bash`; no `devbox global shellenv --init-hook`)
+# First take the rollback anchor §4.7 restores — OUTSIDE ~/.bashrc.d,
+# because ~/.bashrc sources EVERY file in that directory (§4.6):
+cp ~/.bashrc.d/90-devbox.sh /tmp/opencode/90-devbox.sh.bak
 $EDITOR ~/.bashrc.d/90-devbox.sh
 
 # Start a FRESH shell and confirm the pod farm is the only source:
@@ -206,15 +209,39 @@ provides `vi`; devbox's nvim path died with the global profile), and the
 `XDG_DATA_DIRS` completions prepend is dropped (pods don't surface a
 `share/` tree, §5.6).
 
-### 4.5 Uninstall devbox-global (only after §4.2 is proven)
+### 4.5 Uninstall devbox-global (only after §4.2 is proven AND the #101 systemPackages gate is green)
+
+**ORDERING GATE (issue #96 → #101): nothing below runs until the host
+toolchain is on the system PATH.** After devbox-global dies,
+`mksquashfs`/`unsquashfs`/`bwrap`/`make`/`cc` must already come from the
+system — the pool cannot provide them (store payloads are themselves
+squashfs images; provisioning would be chicken-and-egg, #101 disposition
+(b), rejected). Owner prerequisite, one line in
+`/etc/nixos/configuration.nix` plus a rebuild:
+
+```bash
+# environment.systemPackages = with pkgs; [ squashfs-tools bubblewrap gnumake gcc ];
+sudo nixos-rebuild switch   # lands the pod-surface tools on the login PATH (#101)
+shuttle doctor --pod        # must exit 0 BEFORE the destructive steps below (§5.9)
+```
+
+Then, and only then:
 
 ```bash
 devbox global list > ~/devbox-global-inventory-backup.txt   # final record
 rm -f ~/.bashrc.d/90-devbox.sh                               # the hook (already emptied in §4.2)
-# Then remove the install itself (devbox's own uninstall; ~GBs freed):
-devbox global rm --all          # or: rm -rf ~/.local/share/devbox  (owner's call)
-# nix store GC to reclaim the closure:
-nix store gc
+# Remove the install itself (~GBs freed). NOTE: `devbox global rm` only
+# removes PACKAGES (`devbox global rm <pkg>...` — no `--all` flag,
+# verified against devbox 0.17.5); there is no devbox self-uninstall
+# verb. The profile directory IS the install:
+rm -rf ~/.local/share/devbox
+rm -rf ~/.cache/devbox                                       # download/build cache
+# The devbox BINARY itself (system profile:
+# /etc/profiles/per-user/<user>/bin/devbox) STAYS until the shuttle repo
+# drops its own devbox.json ("target state is devbox-free", AGENTS.md) —
+# the project build still pins cargo through it.
+nix store gc             # reclaim the freed closures — DEFER per §4.7:
+                         # run only after a full day of cutover
 ```
 
 ### 4.6 Post-cutover checks (acceptance criteria of #29)
@@ -270,12 +297,18 @@ env; a fresh login matches this shape):
 - [x] shellenv hardening: NixOS `/etc/profile` rebuilds PATH without
       `~/.local/bin`, so the rc falls back to
       `$HOME/.local/bin/shuttle` for the shellenv eval.
+- [ ] Pod-surface host tools on the post-cutover login PATH (#101):
+      from the same fresh login shell the sweep uses, `shuttle doctor
+      --pod` exits 0 (mksquashfs/unsquashfs/bwrap/curl/tar + sh/make/
+      cc/c++ all resolve from `/run/current-system/sw/bin`, zero
+      `/devbox/` hits) and the pod mutation no-op proof passes — full
+      command block in §5.9.
 
 ### 4.7 Rollback (any point before §4.5)
 
 ```bash
 # Revert the rc edit:
-cp ~/.bashrc.d/90-devbox.sh.bak ~/.bashrc.d/90-devbox.sh   # take the backup in §4.2
+cp /tmp/opencode/90-devbox.sh.bak ~/.bashrc.d/90-devbox.sh   # the §4.2 backup
 exec bash -l
 type -a jq    # back on the devbox profile
 ```
@@ -468,6 +501,47 @@ the extension-tree layout (`usr/usr` doubling) together.
 
 ### 5.9 Host toolchain environment prerequisites (NEW, operational)
 
+**The #101 gate — run before every destructive cutover step (§4.5):**
+the pod-surface host tools must be installed SYSTEM-WIDE first.
+Disposition (a) of #101 — NixOS `systemPackages`, owner sudo, one line
+(disposition (b), pool-provided tools, is REJECTED: store payloads are
+themselves squashfs images, so provisioning would be chicken-and-egg):
+
+```bash
+# /etc/nixos/configuration.nix:
+#   environment.systemPackages = with pkgs; [ squashfs-tools bubblewrap gnumake gcc ];
+sudo nixos-rebuild switch
+```
+
+This closes the compiler trap below by SYSTEM install, not by devbox:
+`cc`/`c++`/`make` resolve from `/run/current-system/sw/bin` on the plain
+login PATH, and `shuttle doctor --pod` gates exactly this surface
+(mksquashfs, unsquashfs, bwrap, curl, tar + sh, make, cc, c++ — verified
+red on this host pre-install, with fix hints naming the same distro
+packages). Declaring the toolchain in `build_deps` stays the
+explicit-beats-implicit rule (ADR-0018) for packages needing a specific
+one; the implicit fallback just no longer depends on devbox-global.
+
+**Post-install verification (the #101 acceptance)** — from a fresh
+`bash -l` with no devbox env on PATH (true immediately after §4.2/§4.5;
+before the cutover, drive the same commands through §4.6's `env -i …
+bash -l` shape):
+
+```bash
+bash -l
+env | grep -i devbox                                    # must be empty
+command -v mksquashfs unsquashfs bwrap make gcc cc c++  # all /run/current-system/sw/bin
+shuttle doctor --pod                                    # must exit 0
+
+# Pod mutation no-op proof, same shell: the `add` records + pins and the
+# `remove` drops both — the store and generation are untouched because no
+# sync runs (declaration round-trip):
+shuttle pod --name daily add jq && shuttle pod --name daily remove jq
+# equivalent no-op alternative: shuttle pod --name daily update
+# (`update` is a no-op while every lockfile pin is at its newest
+# matching version — new generation only on real changes)
+```
+
 The pilot exposed environment traps the cutover session must respect:
 
 - The project devbox env puts **busybox `tar`/`xz`** first on PATH;
@@ -475,9 +549,10 @@ The pilot exposed environment traps the cutover session must respect:
   read") — every `.tar.xz` pool package fails. GNU tar+xz must precede
   it (or fix the project devbox.json ordering).
 - Recipes without `build_deps` rely on a compiler reaching the sandbox
-  through the mirrored host PATH (today: devbox-global's gcc, via the
-  `/nix` bind root). Post-retirement, that source disappears — recipes
-  needing a compiler must declare the toolchain in `build_deps`
+  through the mirrored host PATH (pre-cutover: devbox-global's gcc, via
+  the `/nix` bind root). Post-retirement that source is gone — CLOSED by
+  the #101 gate above (system gcc on the login PATH), not by devbox;
+  recipes needing a specific toolchain still declare it in `build_deps`
   explicitly (ADR-0018's explicit-beats-implicit rule) or builds move
   to the pool toolchain meta.
 - Transient download flakes (ftp.gnu.org, github) abort a sync; re-run
