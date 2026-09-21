@@ -20,10 +20,15 @@
 -- ever lands. BUILD_TLS=no keeps openssl out of the closure (no pool
 -- consumer speaks TLS to a loopback pod service).
 --
--- The valkey-search module port is HELD (see pkgs/README.md "Held
--- ports"): its build needs git submodules the offline sandbox cannot
--- materialize. The service's arg list reserves the --loadmodule
--- position so enabling the module later is a one-line edit.
+-- The valkey-search module is ported (pkgs/v/valkey-search.lua,
+-- issue #109): libsearch.so builds offline through upstream's
+-- system-modules path over the pool grpc chain, and the service
+-- below wires it via the ${extensions} reference. The module loads
+-- only when the pod actually includes the valkey-search package
+-- (adding it pulls libsearch.so plus its grpc/protobuf closure);
+-- until then the loadmodule path simply does not exist — the
+-- service stays `enabled = false` by default, and flipping it on
+-- without the package fails visibly at start, not silently.
 --
 -- The shared templates come in via slash-form requires (the analyzer's
 -- dot→slash module mapping has no root where `pkgs.lib.X` resolves;
@@ -88,9 +93,12 @@ return {
                 args    = {
                     "--port", "${port}",
                     "--dir",  "${data_dir}",
-                    -- The valkey-search module plugs in here once its
-                    -- port lands (held; see pkgs/README.md):
-                    -- "--loadmodule", "${extensions}/valkey-search/<module>.so",
+                    -- The valkey-search module (pkgs/v/valkey-search.lua
+                    -- stages usr/lib/libsearch.so; extensions merge
+                    -- payloads under a second usr level — blesh/
+                    -- hermes-desktop precedent). Loads when the pod
+                    -- includes the valkey-search package.
+                    "--loadmodule", "${extensions}/valkey-search/usr/usr/lib/libsearch.so",
                 },
                 options = {
                     port     = 6379,

@@ -54,10 +54,12 @@ vim pkgs/<first-letter>/<name>/lib.lua
 
 ## Held ports
 
-- `valkey-search` 1.2.1 — held: its build initializes git submodules
-  (gRPC, Protobuf, Abseil) a GitHub tarball does not contain and the
-  offline sandbox cannot fetch; needs a vendor-input story before it
-  can build. valkey's service already reserves the
-  `${extensions}/valkey-search/…` `--loadmodule` position for when it
-  lands (pkgs/v/valkey/init.lua).
+(none — the last hold, `valkey-search` 1.2.1, un-held: it builds
+offline through upstream's system-modules path
+(`-DWITH_SUBMODULES_SYSTEM=ON`) over the pool grpc chain
+(abseil-cpp, c-ares, googletest, google-benchmark, highwayhash,
+protobuf, re2, grpc, libgomp — each pinned to grpc 1.70.1's own
+dependency manifest, the version valkey-search pins); see
+pkgs/v/valkey-search.lua and pkgs/v/valkey/init.lua for the wired
+`--loadmodule`.)
 
