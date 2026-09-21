@@ -1399,6 +1399,302 @@ gated_test!(
     }
 );
 
+// ── Recipe-shipped lockfiles (`recipe/` lock paths) ──
+//
+// The lockfile itself can ship beside the recipe instead of inside the
+// fetched source tarball: `deps.<ecosystem>.lock = "recipe/<path>"`
+// resolves against the package recipe directory (fail-closed), plain
+// values keep source-tree-first resolution with the recipe dir as
+// fallback. Exercised through the fetch-only `shuttle deps fetch` path
+// (hand-seeded pod.lua): the closure fetch is proven without a sandbox
+// build, so these tests need no language toolchain.
+
+/// Seed a minimal pod declaration directly (no `pod add`, no build):
+/// `deps fetch` resolves packages from the declaration alone.
+fn seed_pod_declaration(root: &Path, packages: &[&str]) {
+    let list = packages
+        .iter()
+        .map(|p| format!("\"{p}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let dir = pod_dir(root, "default");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("pod.lua"),
+        format!(
+            "-- Pod declaration, maintained by `shuttle pod add/remove`.\npod {{\n    packages = {{ {list} }},\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// The recipe-lock sha256 recorded beside the deps pin, if any.
+fn lock_deps_lock_sha256(root: &Path, pod: &str, pkg: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Lock {
+        packages: std::collections::BTreeMap<String, Entry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        deps: Option<Pin>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pin {
+        #[serde(default)]
+        lock_sha256: Option<String>,
+    }
+    let text = std::fs::read_to_string(pod_dir(root, pod).join("shuttle.lock")).unwrap();
+    let lock: Lock = serde_json::from_str(&text).unwrap();
+    lock.packages
+        .get(pkg)
+        .and_then(|e| e.deps.as_ref())
+        .expect("lock must record a deps pin")
+        .lock_sha256
+        .clone()
+}
+
+/// Cargo fixture with the lockfile shipped in the recipe directory: the
+/// source tarball carries Cargo.toml + src only (upstream ships no
+/// Cargo.lock), and `deps.cargo.lock = "recipe/Cargo.lock"` resolves the
+/// hand-written lock beside the package's .lua.
+fn write_cargo_recipe_lock_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let dir = project.join("pkgs").join(letter.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let checksum = write_cargo_dep_crate(server, say);
+
+    let approot = server.join("cargorecipeapproot");
+    let _ = std::fs::remove_dir_all(&approot);
+    std::fs::create_dir_all(approot.join("src")).unwrap();
+    std::fs::write(
+        approot.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[dependencies]\npcrate = \"0.1\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        approot.join("src/main.rs"),
+        "fn main() {\n    println!(\"{}\", pcrate::say());\n}\n",
+    )
+    .unwrap();
+    // NO Cargo.lock in the tarball — it ships in the recipe dir below.
+    tar_czf(server, "cargorecipe-src.tar.gz", "cargorecipeapproot");
+
+    std::fs::write(
+        dir.join("Cargo.lock"),
+        format!(
+            "version = 3\n\n[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\ndependencies = [\"pcrate\"]\n\n[[package]]\nname = \"pcrate\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "{name}",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/cargorecipe-src.tar.gz",
+    deps = {{ cargo = {{ lock = "recipe/Cargo.lock", index = "http://127.0.0.1:{port}/api/v1/crates" }} }},
+    build = "true",
+}} }}
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
+gated_test!(recipe_prefixed_cargo_lock_resolves_from_recipe_dir, &[], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_cargo_recipe_lock_pkg(
+        project.path(),
+        server.path(),
+        "zcrlapp",
+        "recipe-cargo-ran",
+        port,
+    );
+    seed_pod_declaration(root.path(), &["zcrlapp"]);
+
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["deps", "fetch"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+
+    // The closure pin is recorded, and the recipe lockfile's sha256 rides
+    // beside it — bound to the exact bytes that were resolved.
+    let (hash, fetched_at) = lock_deps_pin(root.path(), "default", "zcrlapp");
+    assert_eq!(hash.len(), 64, "deps_hash is a sha256 hex digest");
+    assert!(fetched_at.is_some(), "first fetch records fetched_at");
+    let recipe_lock_bytes = std::fs::read(project.path().join("pkgs/z/Cargo.lock")).unwrap();
+    assert_eq!(
+        lock_deps_lock_sha256(root.path(), "default", "zcrlapp").as_deref(),
+        Some(sha256_hex(&recipe_lock_bytes)).as_deref(),
+        "shuttle.lock must record the recipe-shipped Cargo.lock's sha256"
+    );
+
+    // The closure came from the recipe-shipped lock: the pinned crate was
+    // fetched from the lock's resolved crates.io path (the source tree
+    // carries no Cargo.lock at all).
+    assert!(
+        requests_for(&log, "/api/v1/crates/pcrate/0.1.0/download") >= 1,
+        "the resolver must fetch the recipe-lock-pinned crate: {:#?}",
+        log.lock().unwrap()
+    );
+
+    // SAFETY: nothing executed a dependency build script on the host.
+    assert_no_canary(&[project.path(), root.path(), server.path()]);
+});
+
+/// npm fixture with the lockfile shipped beside the recipe: the source
+/// tarball carries only the CLI script. `lock_decl` is the literal
+/// `deps.npm.lock` value; `write_recipe_lock` controls whether the
+/// lockfile exists in the recipe directory (false = missing everywhere,
+/// for the both-candidates diagnostic test).
+fn write_npm_recipe_lock_pkg(
+    project: &Path,
+    server: &Path,
+    name: &str,
+    say: &str,
+    port: u16,
+    lock_decl: &str,
+    write_recipe_lock: bool,
+) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let dir = project.join("pkgs").join(letter.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let dep_tgz = write_npm_dep(server, "ndep", "1.0.0", say, None);
+    let integrity = sri_sha512(&dep_tgz);
+
+    let approot = server.join("npmrecipeapproot");
+    let _ = std::fs::remove_dir_all(&approot);
+    std::fs::create_dir_all(&approot).unwrap();
+    std::fs::write(
+        approot.join("cli.js"),
+        "const d = require(\"ndep\");\nconsole.log(d.say());\n",
+    )
+    .unwrap();
+    tar_czf(server, "npmrecipe-src.tar.gz", "npmrecipeapproot");
+
+    let lock = format!(
+        r#"{{
+  "name": "{name}",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {{
+    "": {{ "name": "{name}", "version": "1.0.0", "dependencies": {{ "ndep": "1.0.0" }} }},
+    "node_modules/ndep": {{
+      "version": "1.0.0",
+      "resolved": "http://127.0.0.1:{port}/registry/ndep/-/ndep-1.0.0.tgz",
+      "integrity": "{integrity}"
+    }}
+  }}
+}}
+"#
+    );
+    if write_recipe_lock {
+        std::fs::write(dir.join("package-lock.json"), lock).unwrap();
+    }
+
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "{name}",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/npmrecipe-src.tar.gz",
+    deps = {{ npm = {{ lock = "{lock_decl}" }} }},
+    build = "true",
+}} }}
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
+gated_test!(recipe_prefixed_npm_lock_resolves_from_recipe_dir, &[], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, log) = serve_dir(server.path());
+    write_npm_recipe_lock_pkg(
+        project.path(),
+        server.path(),
+        "znrlapp",
+        "recipe-npm-ran",
+        port,
+        "recipe/package-lock.json",
+        true,
+    );
+    seed_pod_declaration(root.path(), &["znrlapp"]);
+
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["deps", "fetch"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+
+    let (hash, fetched_at) = lock_deps_pin(root.path(), "default", "znrlapp");
+    assert_eq!(hash.len(), 64, "deps_hash is a sha256 hex digest");
+    assert!(fetched_at.is_some(), "first fetch records fetched_at");
+    let recipe_lock_bytes = std::fs::read(project.path().join("pkgs/z/package-lock.json")).unwrap();
+    assert_eq!(
+        lock_deps_lock_sha256(root.path(), "default", "znrlapp").as_deref(),
+        Some(sha256_hex(&recipe_lock_bytes)).as_deref(),
+        "shuttle.lock must record the recipe-shipped package-lock.json's sha256"
+    );
+
+    // The registry tarball was resolved FROM the recipe-shipped lock.
+    assert!(
+        requests_for(&log, "/registry/ndep/-/ndep-1.0.0.tgz") >= 1,
+        "the resolver must fetch the recipe-lock-pinned dep: {:#?}",
+        log.lock().unwrap()
+    );
+
+    // SAFETY: nothing executed a dependency lifecycle script on the host.
+    assert_no_canary(&[project.path(), root.path(), server.path()]);
+});
+
+gated_test!(missing_lock_failure_names_both_candidate_paths, &[], {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, _log) = serve_dir(server.path());
+    // Plain lock value, present in NEITHER the source tree nor the
+    // recipe directory: the failure must name both candidate paths.
+    write_npm_recipe_lock_pkg(
+        project.path(),
+        server.path(),
+        "zmbapp",
+        "never-runs",
+        port,
+        "package-lock.json",
+        false,
+    );
+    seed_pod_declaration(root.path(), &["zmbapp"]);
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["deps", "fetch"]);
+    assert_ne!(code, Some(0), "a missing lock must fail the fetch");
+    // The error renderer wraps lines mid-path with box-drawing prefixes,
+    // so match against output reduced to path-safe characters: the
+    // named-diagnostic style with BOTH candidate paths — source tree
+    // first, recipe dir second.
+    let flat: String = stderr
+        .chars()
+        .filter(|c| c.is_alphanumeric() || "/._-'".contains(*c))
+        .collect();
+    assert!(
+        flat.contains("notfoundlookedat"),
+        "failure must use the named-diagnostic style: {stderr}"
+    );
+    assert!(
+        flat.contains("pkgs/z/package-lock.json"),
+        "failure must name the recipe-directory candidate: {stderr}"
+    );
+    assert!(
+        flat.contains("npmrecipeapproot/package-lock.json"),
+        "failure must name the source-tree candidate: {stderr}"
+    );
+    assert_eq!(
+        flat.matches("package-lock.json").count(),
+        3,
+        "exactly the declared name plus the two candidate paths: {stderr}"
+    );
+});
+
 // ── go fixture (issue #40): modules served on the loopback, go.sum-pinned ──
 
 /// Build a real Go module zip (the proxy archive shape, rooted at

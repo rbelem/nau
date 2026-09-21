@@ -167,6 +167,14 @@ pub struct PackageDepsLock {
     /// content, updated when a floating re-fetch moves the closure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetched_at: Option<String>,
+
+    /// SHA-256 (hex) of the lockfile bytes when the closure's lock resolved
+    /// from the package recipe directory (`recipe/` lock path): the audit
+    /// trail binding the pin to the exact recipe-shipped lockfile. `None`
+    /// when every lock resolved from the fetched source tree (the default
+    /// contract), so existing pod lockfiles keep their shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_sha256: Option<String>,
 }
 
 /// A single snap entry in the lockfile.

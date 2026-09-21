@@ -198,12 +198,21 @@ pub struct PackageDeps {
 }
 
 /// One ecosystem resolver's spec: its lockfile (relative to the source
-/// root), the index to resolve against (index-driven ecosystems), and —
-/// npm only — fetch-side exclusion globs over lock keys.
+/// root, or `recipe/`-prefixed to resolve against the package recipe
+/// directory — the lockfile ships beside the recipe; fail-closed, no
+/// source-tree fallback), the index to resolve against (index-driven
+/// ecosystems), and — npm only — fetch-side exclusion globs over lock
+/// keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepsLockSpec {
     /// Lockfile path relative to the source root (e.g.
-    /// "package-lock.json", "requirements.lock", "go.mod").
+    /// "package-lock.json", "requirements.lock", "go.mod"), or
+    /// `recipe/<path>` to resolve against the package recipe directory
+    /// (the dir holding the package's `init.lua` or single `<name>.lua`).
+    /// Plain values fall back to the recipe dir when the source tree has
+    /// no lockfile; `recipe/` values never fall back to the source tree.
+    /// go's `sum` (go.sum) follows the same rules, its `recipe/` sibling
+    /// defaulting beside a `recipe/` go.mod.
     pub lock: String,
     /// Hash/checksum source path relative to the source root (go only:
     /// the go.sum sibling, required). Cargo/npm/pip read their checksums
@@ -1547,7 +1556,9 @@ fn package_deps_from_lua(t: &mlua::Table) -> miette::Result<PackageDeps> {
 /// `deps = { go = { mods = "go.mod" } }`), plus an optional `sum` — the
 /// go.sum path; when omitted it defaults to the sibling of `mods` with the
 /// `.mod` extension replaced by `.sum` (go.mod → go.sum is the Go
-/// toolchain's own invariant). Both files must exist in the source tree.
+/// toolchain's own invariant, preserving any `recipe/` prefix). Both
+/// files resolve from the source tree, or from the package recipe
+/// directory when `recipe/`-prefixed (see [`DepsLockSpec::lock`]).
 fn deps_lock_spec_from_lua(key: &str, t: &mlua::Table) -> miette::Result<DepsLockSpec> {
     // go uses `mods` (the go.mod path); every other resolver uses `lock`.
     let lock = go_mods_alias(key, t)?
