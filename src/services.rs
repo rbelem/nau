@@ -428,6 +428,14 @@ fn render_unit(
         ));
         out.push('\n');
     }
+    // Farm-first PATH seam: interpreter-based launchers (wigolo's
+    // usr/bin/wigolo execs bare `node`) resolve against the generation
+    // root, which carries the farm; systemd's default PATH does not.
+    // Baked shape of the hand-written bootstrap unit (t13 §5.4, #104).
+    out.push_str(&format!(
+        "Environment=\"PATH={}:/usr/bin:/bin\"\n",
+        ctx.current
+    ));
     if let Some(libs) = ld_library_path {
         out.push_str(&format!("Environment=\"LD_LIBRARY_PATH={libs}\"\n"));
     }
@@ -1882,6 +1890,40 @@ mod tests {
             std::fs::read_link(&link).unwrap(),
             artifact,
             "the user link must target the generation's artifact"
+        );
+    }
+
+    #[test]
+    fn units_carry_farm_first_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        let gen = gen_with(
+            1,
+            vec![pkg_with_services(
+                "stack",
+                &"d".repeat(96),
+                vec![("wigolo", decl("usr/bin/wigolo"))],
+            )],
+        );
+        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        let unit = &units_of(&store, 1)[0];
+        let exec_line = unit
+            .text
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .unwrap();
+        let full = exec_line
+            .trim_start_matches("ExecStart=")
+            .trim_matches('\'');
+        let current = full.strip_suffix("/wigolo").unwrap();
+        // Farm-first PATH seam: bare-interpreter launchers (wigolo execs
+        // `node`) resolve against the generation root; systemd's default
+        // PATH does not carry it. Baked shape of the bootstrap unit (t13 §5.4).
+        assert!(
+            unit.text
+                .contains(&format!("Environment=\"PATH={current}:/usr/bin:/bin\"\n")),
+            "{}",
+            unit.text
         );
     }
 
