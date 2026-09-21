@@ -13,21 +13,19 @@
 -- iii release tarball at $SRC/iii. Both sha256s cross-check against the
 -- flake's fetchurl SRIs (base64→hex match, verified).
 --
--- KNOWN GAP (reported in the porting dossier): the npm tarball ships NO
--- package-lock.json and an UNBUNDLED dist/ (78 files, requires
--- @anthropic-ai/sdk, zod, dotenv, iii-sdk, ... at runtime), so the
--- production node_modules closure the flake installs cannot be
--- reproduced here: deps.npm needs a lockfile in the source tree (absent)
--- and the sandbox is net-unshared (no `npm install`). This package
--- stages everything else verbatim — dist, package.json, the iii config
--- surfaces (iii-config.yaml, docker-compose.yml, .env.example), plugin/,
--- and the iii binary — but `agentmemory` will fail on its first module
--- import
--- until either (a) upstream ships a package-lock.json (then add
--- deps = { npm = { lock = "package-lock.json" } } following zg.lua), or
--- (b) the DSL grows a fetch-time lockfile-generation hook mirroring the
--- flake's postPatch `npm install --package-lock-only`. Flagged rather
--- than silently shipping a half payload.
+-- The npm closure resolves from a RECIPE-LOCAL package-lock.json. Both
+-- halves of the porting dossier's gap VERIFIED 2026-09-21 against the
+-- pristine 0.9.29 registry tarball: it ships NO package-lock.json, and
+-- its dist/ is UNBUNDLED — bare-specifier imports with no vendored
+-- node_modules anywhere in the payload (78 files, 5.8 MB):
+-- dist/cli.mjs imports "@clack/prompts" and "picocolors";
+-- dist/index.mjs imports "iii-sdk", "@anthropic-ai/sdk" and "zod";
+-- index.mjs also dynamically imports "@anthropic-ai/claude-agent-sdk".
+-- deps.npm.lock = "recipe/package-lock.json" resolves the file next to
+-- this init.lua (generated with `npm install --package-lock-only
+-- --omit=dev --ignore-scripts`; regenerate on bump), the deps fetch
+-- vendors the production closure offline, and the build stages it next
+-- to dist/ (zg.lua tar-copy pattern) so the bare imports resolve.
 --
 -- requires: glibc for both ELFs; libgcc for the iii Rust binary (ldd);
 -- node because the launcher execs the pool node runtime (same runtime
@@ -44,10 +42,10 @@ return {
             agentmemory silently captures what your AI coding agent
             does, compresses it into searchable memory, and injects the
             right context when the next session starts. Built on
-            iii-engine primitives; ships the prebuilt dist payload plus
-            the pinned iii v0.11.2 engine binary. NOTE: the production
-            node_modules closure is not yet provisioned — see the port
-            header in the package definition.
+            iii-engine primitives; ships the prebuilt dist payload, the
+            production node_modules closure (recipe-local
+            package-lock.json), and the pinned iii v0.11.2 engine
+            binary.
         ]],
         license = "Apache-2.0",
         grade = "stable",
@@ -65,6 +63,10 @@ return {
             },
         },
 
+        deps = {
+            npm = { lock = "recipe/package-lock.json" },
+        },
+
         -- Mirror the flake's installPhase: dist + package.json + the
         -- config surfaces into lib/node_modules/@agentmemory/agentmemory
         -- (the tarball ships plugin/ too — cursor/hooks/opencode payloads
@@ -80,6 +82,10 @@ return {
             "mkdir -p \"$pkg\" $STAGE/usr/bin",
             "cp -r $SRC/npm/dist $SRC/npm/package.json $SRC/npm/plugin \"$pkg/\"",
             "cp $SRC/npm/iii-config.yaml $SRC/npm/docker-compose.yml $SRC/npm/.env.example \"$pkg/\"",
+            -- Stage the production node_modules closure next to dist/
+            -- (zg.lua tar-copy pattern): dist's bare-specifier imports
+            -- (see header) resolve via node's upward node_modules walk.
+            "tar -C \"$SHUTTLE_DEPS_DIR\" -cf - node_modules | tar -C \"$pkg\" -xf -",
             "install -m755 $SRC/iii/iii $STAGE/usr/bin/iii",
             "printf '%s\\n' '#!/bin/sh' 'root=$(dirname \"$(dirname \"$(dirname \"$0\")\")\")' 'PATH=\"$root/usr/bin:$PATH\"' 'exec node \"$root/usr/lib/node_modules/@agentmemory/agentmemory/dist/cli.mjs\" \"$@\"' > $STAGE/usr/bin/agentmemory",
             "chmod +x $STAGE/usr/bin/agentmemory",

@@ -292,11 +292,13 @@ GC in §4.5 — run `nix store gc` only after a full day of cutover).
 
 Ported since this section was first written: `neovim`, `blesh` (§5.2),
 `graphify`, `skillspector`, `anydoc`, `tree-sitter-perl` — plus earlier
-`whichllm`, `rtk`, `strix`, `hunk`, `dcg`, `agent-browser`. Held with
-documented gaps (uncommitted `pkgs/` drafts, not ported): `llm-verifier`
-(no upstream lockfile), `agentmemory` (npm dist unbundled, no
-package-lock.json), `pdf-inspector` (no root Cargo.lock), `zenity`
-(gtk4/libadwaita/itstool not buildable from the pool). Still missing:
+`whichllm`, `rtk`, `strix`, `hunk`, `dcg`, `agent-browser`. Completed
+2026-09-21 via recipe-local lockfiles (`deps.<eco>.lock =
+"recipe/<file>"` resolving against the recipe directory, closing the
+no-lockfile-in-source-tree gaps): `agentmemory` and `pdf-inspector`.
+`zenity` is replaced by the pure-Rust `zenity-rs` (pkgs/z/zenity-rs.lua
+— the GUI dialog lane with no gtk at all); `llm-verifier` dropped by
+owner decision 2026-09-21. Still missing:
 `podman`, `jdk21`, `chromium`, `valkey` (+ `valkey-search` module),
 `opencode-v2`, `skills`, `playwright-cli`, `codeburn`, `codegraph`,
 `impeccable`, `bifrost`, `deepsec`, `deepseek-harness`, `wigolo`. Most
