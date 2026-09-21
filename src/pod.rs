@@ -1106,10 +1106,13 @@ fn fold_pod_env(
 
 /// What one loaded pod contributes to the loading pod's composition:
 /// the package versions it currently executes (its active generation —
-/// read-only) or, when it has no generation yet, the versions its own
-/// first sync would build (declaration + its overlays, live). Sub-loads
-/// are folded in beneath its own packages (same precedence rules one
-/// level down), so a chain resolves through this one call.
+/// read-only) UNIONed with its declaration (issue #103), so a name the
+/// pod declares that its generation does not carry (failed/partial
+/// sync, degraded removal, a generation predating the declaration)
+/// still reaches the loading pod. Generation content wins a name
+/// clash with the declaration. Sub-loads fold in beneath (same
+/// precedence rules one level down), so a chain resolves through this
+/// one call.
 struct LoadedContribution {
     /// The loaded pod's own overlay entries — applied when re-resolving
     /// its packages so the rebuilt payload carries the same build
@@ -1119,23 +1122,16 @@ struct LoadedContribution {
     packages: BTreeMap<String, Option<String>>,
 }
 
-fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedContribution> {
-    let decl = load_declaration(root, pod_name)?;
-    let store = pod_store(&pod_dir(root, pod_name));
-    if let Some(active) = store.active_generation()? {
-        return Ok(LoadedContribution {
-            overlay: decl.overlay,
-            packages: active
-                .packages
-                .iter()
-                .map(|(name, pkg)| (name.clone(), Some(pkg.version.clone())))
-                .collect(),
-        });
-    }
-    // No generation yet: mirror the loaded pod's own first sync — its
-    // declared packages resolve fresh (overlay applied), its sub-loads
-    // fold in beneath (own packages win the name clash, issue #8).
-    // Acyclicity is guaranteed: `validate_loads` ran before this read.
+/// Fold a pod's DECLARATION alone: its own packages resolved live (the
+/// pod's own overlay applied — the same inputs its first sync would
+/// use) plus its sub-loads folded recursively beneath (own packages
+/// win the name clash, issue #8). Acyclicity is guaranteed:
+/// `validate_loads` ran before this read.
+fn declared_contribution(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+) -> miette::Result<BTreeMap<String, Option<String>>> {
     let mut packages = BTreeMap::new();
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
@@ -1158,6 +1154,33 @@ fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedCont
             packages.entry(name).or_insert(version);
         }
     }
+    Ok(packages)
+}
+
+fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedContribution> {
+    let decl = load_declaration(root, pod_name)?;
+    let store = pod_store(&pod_dir(root, pod_name));
+    // Union (issue #103): what the pod EXECUTES (its active generation)
+    // is the base and wins every name clash; its declaration folds in
+    // beneath with `or_insert` so declaration-only names — resolved
+    // live with the pod's own overlay, sub-loads recursive — are added
+    // without ever displacing an executing version. Without the
+    // generation the declaration alone is the whole story (it mirrors
+    // the pod's own first sync).
+    let packages = match store.active_generation()? {
+        Some(active) => {
+            let mut packages: BTreeMap<String, Option<String>> = active
+                .packages
+                .iter()
+                .map(|(name, pkg)| (name.clone(), Some(pkg.version.clone())))
+                .collect();
+            for (name, version) in declared_contribution(root, pod_name, &decl)? {
+                packages.entry(name).or_insert(version);
+            }
+            packages
+        }
+        None => declared_contribution(root, pod_name, &decl)?,
+    };
     Ok(LoadedContribution {
         overlay: decl.overlay,
         packages,
@@ -2429,9 +2452,10 @@ struct ReconcileBuild {
 }
 
 /// Fold the `loads` graph one level deep (issue #8): each loaded pod
-/// contributes its active generation's package versions (or, with none
-/// yet, its declaration as its own first sync would resolve) and its
-/// overlay map.
+/// contributes its active generation's package versions UNIONed with
+/// its declaration (generation wins the clash, issue #103; with no
+/// generation the declaration alone mirrors its own first sync) and
+/// its overlay map.
 fn loaded_contributions(
     root: &Path,
     decl: &PodDeclaration,
