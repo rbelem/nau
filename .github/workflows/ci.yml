@@ -63,6 +63,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor
+      # (kernel.apparmor_restrict_unprivileged_userns=1), which strips
+      # bubblewrap's netns of CAP_NET_ADMIN — every sandboxed e2e test
+      # dies with "bwrap: loopback: Failed RTM_NEWADDR: Operation not
+      # permitted". Runners have passwordless sudo; lift the restriction
+      # for the job.
+      - name: Allow unprivileged userns (bubblewrap sandbox)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Install devbox
         uses: jetify-com/devbox-install-action@v0.12.0
         with:
@@ -74,14 +83,18 @@ jobs:
           workspaces: |
             .
 
+      # The devbox script forms ARE the gate (docs/agents/build-and-test.md):
+      # `test` carries SHUTTLE_SYSTEMD=off; calling cargo directly skips it
+      # and the systemd-touching tests fail on a runner with no systemd
+      # tooling.
       - name: Build
-        run: devbox run -- cargo build --locked
+        run: devbox run -- build
 
       - name: Test
-        run: devbox run -- cargo test --locked
+        run: devbox run -- test
 
       - name: Lint (clippy)
-        run: devbox run -- cargo clippy --locked -- -D warnings
+        run: devbox run -- clippy
 
       - name: Format check
-        run: devbox run -- cargo fmt --check
+        run: devbox run -- fmt-check
