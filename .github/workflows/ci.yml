@@ -16,6 +16,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -32,14 +36,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download actionlint
-        run: |
-          curl -fsSL --retry 3 \
-            https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash |
-          bash -s -- 1.7.7
+      - name: Install actionlint
+        uses: taiki-e/install-action@v2
+        with:
+          tool: actionlint@1.7.7
 
       - name: Lint workflow
-        run: ./actionlint -color
+        run: actionlint -color
 
   deps:
     runs-on: ubuntu-24.04
@@ -51,7 +54,7 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.19.6
 
       - name: Check licenses, advisories, sources
         run: cargo deny check
@@ -76,19 +79,30 @@ jobs:
         uses: jetify-com/devbox-install-action@v0.12.0
         with:
           project-path: .
+          devbox-version: 0.18.3
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            .
+          prefix-key: rust-1.97.1
+          cache-on-failure: true
+          workspaces: .
 
-      # The devbox script forms ARE the gate (docs/agents/build-and-test.md):
-      # `test` carries SHUTTLE_SYSTEMD=off; calling cargo directly skips it
-      # and the systemd-touching tests fail on a runner with no systemd
-      # tooling.
+      # Cheap format gate before the expensive build: a whitespace-only
+      # PR learns about it in seconds, not after build+test+clippy.
+      - name: Format check
+        run: devbox run -- fmt-check
+
       - name: Build
         run: devbox run -- build
+
+      # The devbox scripts are the gate (docs/agents/build-and-test.md)
+      # and intentionally spell no --locked: instead of policing the
+      # command form, fail closed when a dependency bump landed without
+      # its Cargo.lock commit — cargo would otherwise resolve fresh in
+      # CI and test something no fresh clone or release can reproduce.
+      - name: Lockfile must be committed
+        run: git diff --exit-code Cargo.lock
 
       # The image command-seam tests drive a real A/B+update_source disk
       # build, which fails closed without an existing image-signing key
@@ -102,6 +116,3 @@ jobs:
 
       - name: Lint (clippy)
         run: devbox run -- clippy
-
-      - name: Format check
-        run: devbox run -- fmt-check

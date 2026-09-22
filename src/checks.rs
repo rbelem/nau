@@ -725,10 +725,14 @@ fn tree_provides(stage: &Path, path: &str) -> bool {
 
 /// Base-guaranteed interpreters: every snap base runtime ships these
 /// before the merged prefix assembles, so a payload script pointing at
-/// one is not a broken wrapper. (Before the host-fs probe fix, this
-/// case resolved by ACCIDENT — stage.join("/bin/sh") probed the host.)
+/// one is not a broken wrapper. core22/core24 also carry
+/// `/usr/bin/sh -> /bin/sh`. (Before the host-fs probe fix, this case
+/// resolved by ACCIDENT — stage.join("/bin/sh") probed the host.)
 fn base_guaranteed(interp: &str) -> bool {
-    matches!(interp, "/bin/sh" | "/bin/bash" | "/usr/bin/bash")
+    matches!(
+        interp,
+        "/bin/sh" | "/usr/bin/sh" | "/bin/bash" | "/usr/bin/bash"
+    )
 }
 
 /// Findings for one package's staged scripts.

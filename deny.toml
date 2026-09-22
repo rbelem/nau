@@ -22,11 +22,6 @@ allow = [
 # The repo is GPL-3.0-only: strong copyleft is compatible here, permissive
 # is always fine. Everything else (AGPL, SSPL, proprietary) needs a look.
 
-[[licenses.clarify]]
-name = "ring"
-expression = "OpenSSL OR ISC OR MIT"
-license-files = []
-
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
@@ -36,12 +31,14 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 version = 2
 yanked = "deny"
 ignore = [
-  # rsa 0.9 (via pgp -> Snap Store assertion verification, src/assert.rs):
-  # RUSTSEC-2023-0071, Marvin timing sidechannel in rsa's *private-key*
-  # padding. shuttle only verifies signatures with public keys, so the
-  # vulnerable path is not exercised; no fixed release exists upstream
+  # rsa 0.9 (via pgp, src/assert.rs + src/uc.rs): RUSTSEC-2023-0071, the
+  # Marvin timing sidechannel is a PKCS#1 v1.5 DECRYPTION oracle. shuttle
+  # never decrypts attacker-chosen ciphertexts with the rsa crate — it
+  # generates keys (src/uc.rs) and signs snapd model/account assertions
+  # locally with no oracle on the unpadding path — so the vulnerable
+  # behavior is unreachable. No fixed release exists upstream
   # (RustCrypto/RSA#626, still affected 2026-09). Re-evaluate if shuttle
-  # ever signs with rsa.
+  # ever decrypts with rsa.
   "RUSTSEC-2023-0071",
   # paste is unmaintained (RUSTSEC-2024-0436); pulled by full_moon (the
   # Lua parser's derive macros). No advisory of impact, no replacement

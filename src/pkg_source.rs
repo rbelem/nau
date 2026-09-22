@@ -220,14 +220,23 @@ fn fetch_github(owner: &str, repo: &str, branch: &str, dest: &Path) -> miette::R
 
     match std::fs::rename(&tmp_path, dest) {
         Ok(()) => Ok(()),
-        // Lost the race to a concurrent winner: same URL + branch, same
-        // content — reuse it.
+        // Lost the race to a concurrent winner: same URL + branch, so an
+        // equivalent cache slot — reuse it.
         Err(_) if dest.join(".git").exists() => Ok(()),
-        // Stale or partial directory from an older state: replace it.
+        // Stale or partial directory from an older state: replace it and
+        // re-check, because a concurrent resolver may claim `dest`
+        // between our remove and our rename — losing that retry race is
+        // still a win (they cloned the same input).
         Err(_) => {
             let _ = std::fs::remove_dir_all(dest);
-            std::fs::rename(&tmp_path, dest)
-                .map_err(|e| miette::miette!("failed to claim cache dir {}: {e}", dest.display()))
+            match std::fs::rename(&tmp_path, dest) {
+                Ok(()) => Ok(()),
+                Err(_) if dest.join(".git").exists() => Ok(()),
+                Err(e) => Err(miette::miette!(
+                    "failed to claim cache dir {}: {e}",
+                    dest.display()
+                )),
+            }
         }
     }
 }
