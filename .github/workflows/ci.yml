@@ -1,7 +1,13 @@
 # CI for shuttle — Rust CLI tool that builds Snap packages from Lua declarations.
 #
-# Uses devbox for reproducible toolchain (Rust, squashfs-tools, bubblewrap).
-# Verifies: build, test, lint, format.
+# Jobs, cheapest first:
+#   lint-workflow — actionlint over this file; no toolchain, runs in seconds.
+#   deps          — cargo-deny: license/advisory/source policy (deny.toml).
+#   check         — the devbox gate: build, test, clippy -D warnings, fmt --check.
+#
+# The Rust linter (clippy) and style checker (rustfmt) are the Lint/Format
+# steps of `check`; the pinned 1.97.1 toolchain is the contract (see
+# docs/agents/build-and-test.md).
 
 name: CI
 
@@ -11,12 +17,48 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint-workflow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download actionlint
+        run: |
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash |
+          bash -s -- v1.7.7
+
+      - name: Lint workflow
+        run: ./actionlint -color
+
+  deps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Check licenses, advisories, sources
+        run: cargo deny check
+
   check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,6 +67,12 @@ jobs:
         uses: jetify-com/devbox-install-action@v0.12.0
         with:
           project-path: .
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
 
       - name: Build
         run: devbox run -- cargo build --locked
