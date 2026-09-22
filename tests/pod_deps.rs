@@ -1972,8 +1972,13 @@ gated_test!(missing_go_closure_fails_sync, &["go"], {
 
     let (code, _, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
     assert_ne!(code, Some(0), "missing closure must fail the held sync");
+    // miette wraps its pretty render at 80 columns, so assert on short
+    // fragments that always fit one rendered line (the wrapped-message
+    // trap this test first fell into on CI).
     assert!(
-        stderr.contains("missing from the pod store") && stderr.contains("held package 'zgomiss'"),
+        stderr.contains("held package 'zgomiss'")
+            && stderr.contains("dependency closure")
+            && stderr.contains("deps fetch"),
         "failure must name the missing blob and the held package: {stderr}"
     );
 });
