@@ -18,7 +18,7 @@ return {
         confinement = "strict",
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
-        requires = { "glibc", "zlib", "openssl" },
+        requires = { "glibc", "zlib", "openssl", "ca-certificates" },
         source = {
             url = "https://curl.se/download/curl-8.20.0.tar.xz",
         },
@@ -33,6 +33,29 @@ return {
             -- libtool .la metadata embeds the configure-time prefix and is
             -- obsolete at runtime (same strip as libevent/pcre2).
             "find $STAGE/usr/lib -name '*.la' -delete",
+            -- CURL_CA_BUNDLE: openssl's --openssldir=/etc/ssl bakes the
+            -- absolute HOST CA dir into libcurl, and the installed tree
+            -- carries no CA bundle — https dies with "certificate problem"
+            -- exit 60 (issue #130). The bundle ships in the ca-certificates
+            -- payload, so bin/curl becomes a wrapper pinning CURL_CA_BUNDLE:
+            -- the staged bundle first (merged build prefix / root-mounted
+            -- payload layout), then the pod store layout (farm links a
+            -- wrapper-managed command straight at its store blob; two
+            -- dirnames reach the pod root, the #10/#13 PODROOT derivation,
+            -- and the bundle rides the active generation's ca-certificates
+            -- extension tree), then the extension-tree sibling package, and
+            -- finally the host pair (git wrapper precedent — trust anchors
+            -- are host policy, ADR-0030). The env var only supplies
+            -- defaults — an explicit --cacert/-k still wins, and an
+            -- ambient CURL_CA_BUNDLE (caller's own trust choice) is
+            -- never clobbered. Exec resolves
+            -- the real binary beside the shim, falling back through the
+            -- pod tree (#13 shape): the farm links a wrapper-managed
+            -- command straight at its bare store blob, where no sibling
+            -- exists.
+            "mv $STAGE/usr/bin/curl $STAGE/usr/bin/curl.real",
+            "printf '%s\\n' '#!/bin/sh' 'd=$(dirname \"$(readlink -f \"$0\")\")' 'p=$(dirname \"$(dirname \"$d\")\")' 'c=$d/../../etc/ssl/certs/ca-certificates.crt' 'if test ! -f \"$c\"' 'then c=$p/active/extensions/ca-certificates/usr/etc/ssl/certs/ca-certificates.crt' 'fi' 'if test ! -f \"$c\"' 'then c=$d/../../../../ca-certificates/usr/etc/ssl/certs/ca-certificates.crt' 'fi' 'if test ! -f \"$c\"' 'then c=/etc/ssl/certs/ca-certificates.crt' 'fi' 'if test ! -f \"$c\"' 'then c=/etc/pki/tls/certs/ca-bundle.crt' 'fi' 'if test -f \"$c\" && test -z \"$CURL_CA_BUNDLE\"' 'then CURL_CA_BUNDLE=$c' 'export CURL_CA_BUNDLE' 'fi' 'r=$d/curl.real' 'if test ! -f \"$r\"' 'then r=$p/active/extensions/curl/usr/usr/bin/curl.real' 'fi' 'exec \"$r\" \"$@\"' > $STAGE/usr/bin/curl",
+            "chmod +x $STAGE/usr/bin/curl",
         }, " && "),
 
         -- Interim leak-scan escapes (ADR-0018 Decision 3, issue #22):
