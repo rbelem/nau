@@ -21,7 +21,7 @@
 -- Not included: tcl/tk (gitk/git-gui) is NOT in the pool — built with
 -- NO_TCLTK.
 --
--- Requires: glibc, zlib, openssl, curl, pcre2, perl
+-- Requires: glibc, zlib, openssl, curl, pcre2, perl, libsecret, glib
 -- build_deps: pkg-config, gettext
 
 return {
@@ -77,6 +77,24 @@ return {
             -- libgettextsrc).
             "PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\" LD_LIBRARY_PATH=\"$SHUTTLE_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\" make -j$(nproc) prefix=/usr NO_EXPAT=1 NO_TCLTK=1 USE_LIBPCRE2=1 CFLAGS=\"-g -O2 -std=gnu17\" CPPFLAGS=\"-I. $CPPFLAGS\" LDFLAGS=\"$LDFLAGS\"",
             "PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\" LD_LIBRARY_PATH=\"$SHUTTLE_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\" make install prefix=/usr NO_EXPAT=1 NO_TCLTK=1 USE_LIBPCRE2=1 CFLAGS=\"-g -O2 -std=gnu17\" CPPFLAGS=\"-I. $CPPFLAGS\" LDFLAGS=\"$LDFLAGS\" DESTDIR=$STAGE",
+            -- git-credential-libsecret: the libsecret credential helper
+            -- is NOT built by git's main Makefile — it lives in
+            -- contrib/credential/libsecret with its own plain Makefile
+            -- whose only probes are `pkg-config --cflags/--libs
+            -- libsecret-1 glib-2.0` (gio/gobject come along via .pc
+            -- Requires). Same env convention as the main build lines:
+            -- PATH prepend exposes the pool pkg-config, LD_LIBRARY_PATH
+            -- keeps the probe/build tools loadable, CFLAGS pins gnu17,
+            -- and the sandbox CPPFLAGS/LDFLAGS are re-passed explicitly
+            -- because the contrib Makefile only picks them up through
+            -- `?=` defaults; it never assigns LDFLAGS internally, so -L
+            -- would be missing for -lsecret-1/-lglib-2.0 if dropped.
+            -- Installed flat at usr/bin mirroring the git-credential-oauth
+            -- pool recipe — the helper resolves at runtime through the
+            -- farm PATH entry (app below), the same PATH fallback that
+            -- makes `helper = oauth` work, not through git's exec-path.
+            "PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\" LD_LIBRARY_PATH=\"$SHUTTLE_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\" make -C contrib/credential/libsecret CFLAGS=\"-g -O2 -std=gnu17\" CPPFLAGS=\"$CPPFLAGS\" LDFLAGS=\"$LDFLAGS\"",
+            "install -Dm755 contrib/credential/libsecret/git-credential-libsecret $STAGE/usr/bin/git-credential-libsecret",
             -- Farm app assemblies carry only the command's usr/bin
             -- subtree (issue #37 siblings), so git cannot find its
             -- libexec helpers there — `git fetch/push` dies with
@@ -102,14 +120,27 @@ return {
         }, " && "),
 
         type = "source",
-        requires = { "glibc", "zlib", "openssl", "curl", "pcre2", "perl" },
+        -- git-credential-libsecret (contrib/credential/libsecret) links
+        -- libsecret-1 and glib-2.0 — DT_NEEDED libsecret-1.so.1 plus
+        -- libgio/libgobject/libglib-2.0 (pkg-config pulls gio/gobject in
+        -- through libsecret-1.pc Requires). Both are link-time AND
+        -- runtime libraries, so they ride `requires` per ADR-0018 —
+        -- which also materializes them into the merged build prefix,
+        -- where the sandbox's PKG_CONFIG_PATH lets the contrib
+        -- Makefile's pkg-config probes find libsecret-1.pc /
+        -- glib-2.0.pc.
+        requires = { "glibc", "zlib", "openssl", "curl", "pcre2", "perl", "libsecret", "glib" },
         -- pkg-config: git's own Makefile probes libcurl/libpcre2 via
         -- pkg-config-provided metadata (curl-config/pcre2-config are the
         -- primary probes; pkg-config backs the USE_LIBPCRE2 detection).
         -- gettext: msgfmt compiles git's po/ translation catalogs at build
         -- time (runtime libintl comes from glibc itself).
-        -- Both are build-time-only tools; the sandbox provides the compiler.
-        build_deps = { "pkg-config", "gettext" },
+        -- rust: git's Makefile drives CARGO for target/release/libgitcore.a
+        -- (the Rust components); the pool rust payload stages cargo in the
+        -- merged prefix bin, which the build's PATH prepend exposes.
+        -- Both pkg-config/gettext are build-time-only tools; the sandbox
+        -- provides the compiler.
+        build_deps = { "pkg-config", "gettext", "rust" },
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as htop/tig/tmux: the nix gcc wrapper bakes
@@ -123,6 +154,15 @@ return {
         apps = {
             git = app {
                 command = "usr/bin/git",
+            },
+            -- Farm entry so the helper is on the pod PATH: git resolves
+            -- `helper = libsecret` as the external `git-credential-libsecret`
+            -- (exec-path first, then PATH), and the farm app assembly
+            -- carries only the command's usr/bin subtree, so the flat
+            -- usr/bin binary needs its own farm entry to be reachable —
+            -- the git-credential-oauth pool package's exact shape.
+            ["git-credential-libsecret"] = app {
+                command = "usr/bin/git-credential-libsecret",
             },
         },
     },
