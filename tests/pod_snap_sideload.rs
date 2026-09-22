@@ -1072,3 +1072,461 @@ gated_test!(rebuild_sideloaded_reports_held, {
     );
     assert_eq!(generation_count(root.path(), "default"), 1);
 });
+
+// ── Issue #133 / #135: sideload hardening ──
+
+/// The snap-arch vocabulary of the build host (the `crate::snap::host_arch`
+/// mapping, mirrored here so fixtures name the arch the gate accepts).
+fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+// Issue #133: a payload whose filename claims a foreign architecture
+// refuses BEFORE any write — a foreign blob installs clean and fails
+// only at exec, which is the failure the gate exists for. The control
+// side proves the gate does not over-refuse: the same content under
+// the host's arch installs.
+gated_test!(foreign_arch_payload_refused, {
+    let stage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+
+    // Neither amd64 nor arm64: the refusal is host-arch-independent.
+    let foreign = stage.path().join("hello_1.0_riscv64.snap");
+    fake_snap(&foreign, "name: hello\nversion: \"1.0\"\n");
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", foreign.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_ne!(code, Some(0), "a foreign-arch payload must refuse");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("arch riscv64") && stderr.contains("foreign-architecture"),
+        "must name the arch mismatch: {stderr}"
+    );
+    assert!(
+        !pod_dir(root.path(), "default")
+            .join("shuttle.lock")
+            .exists(),
+        "the refusal must leave zero writes"
+    );
+
+    // Control: the same content under the HOST arch installs.
+    let local = stage.path().join(format!("hello_1.0_{}.snap", host_arch()));
+    std::fs::copy(&foreign, &local).unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", local.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "the host-arch payload must install: {stderr}"
+    );
+});
+
+// Issue #135 (blob-pin polish): a sideloaded version that violates the
+// declared `@constraint` refuses before any write — both the fresh
+// conversion and the deliberate version move — instead of recording a
+// packages pin that contradicts its own constraint.
+gated_test!(constraint_violating_sideload_refused, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let builder_root2 = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "hello");
+    let stage = tempfile::tempdir().unwrap();
+    let v1 = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "sideload-one",
+        port,
+        "hello.tar.gz",
+    );
+    let v2 = build_payload(
+        builder_project.path(),
+        builder_root2.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "2.0",
+        "sideload-two",
+        port,
+        "hello.tar.gz",
+    );
+
+    // (a) Fresh conversion: the target DECLARES hello@2; sideloading
+    // hello 1.0 would record version 1.0 under constraint 2. (The
+    // constraint grammar is dotted-numeric prefix: `@1`, not `@1.x`.)
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = pod_dir(root.path(), "default");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("pod.lua"), "pod { packages = { \"hello@2\" } }\n").unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", v1.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_ne!(code, Some(0));
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("violates the declared constraint '@2'") && stderr.contains("version 1.0"),
+        "must name the violated constraint: {stderr}"
+    );
+    assert!(
+        !dir.join("shuttle.lock").exists(),
+        "the refusal must leave zero writes"
+    );
+
+    // (b) Version move: hello@1 + sideloaded 1.0 installs; re-adding
+    // 2.0 must refuse with the pins and generation untouched.
+    let root2 = tempfile::tempdir().unwrap();
+    let dir = pod_dir(root2.path(), "default");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("pod.lua"), "pod { packages = { \"hello@1\" } }\n").unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root2.path(),
+        &["add", "--snap", v1.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "1.0 matches '@1': {stderr}");
+    assert_eq!(generation_count(root2.path(), "default"), 1);
+
+    let (code, _, stderr) = run(
+        project.path(),
+        root2.path(),
+        &["add", "--snap", v2.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_ne!(code, Some(0), "the constraint-violating move must refuse");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("violates the declared constraint '@1'") && stderr.contains("version 2.0"),
+        "must name the violated constraint: {stderr}"
+    );
+    assert_eq!(
+        generation_count(root2.path(), "default"),
+        1,
+        "no generation may move"
+    );
+    assert_eq!(
+        lockfile(root2.path(), "default")["packages"]["hello"]["version"],
+        "1.0",
+        "the pin must stay at the constraint-honoring version"
+    );
+});
+
+// Issue #135 (blob-pin polish, rollback trap): rolling back to a
+// generation that predates a blob pin SUCCEEDS — and the report names
+// the stranded pin and its recovery path, instead of leaving the next
+// mutating verb to fail named without warning.
+gated_test!(rollback_predating_blob_pin_names_recovery, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "apples");
+    make_tarball(server.path(), "hello");
+    let stage = tempfile::tempdir().unwrap();
+    let apples = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "apples",
+        "apples",
+        "apples",
+        "1.0",
+        "marker-apples",
+        port,
+        "apples.tar.gz",
+    );
+    let hello = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "marker-hello",
+        port,
+        "hello.tar.gz",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    // The target's project carries resolvable RECIPES for both packages
+    // (never built — the payloads are the input): the second sideload's
+    // collision precheck resolves the first package's declared claims
+    // from the collection, which a collection-less pod cannot do
+    // (pre-existing limitation, see PR notes).
+    write_pkg_version(
+        project.path(),
+        "apples",
+        "apples",
+        "apples",
+        "1.0",
+        "marker-apples",
+        port,
+        "apples.tar.gz",
+    );
+    write_pkg_version(
+        project.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "marker-hello",
+        port,
+        "hello.tar.gz",
+    );
+
+    // Two sideloads: apples is generation 1, hello is generation 2.
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", apples.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", hello.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(generation_count(root.path(), "default"), 2);
+
+    // Roll back to the pre-hello generation: succeeds, warns.
+    let (code, _, stderr) = run(project.path(), root.path(), &["rollback", "1"]);
+    assert_eq!(code, Some(0), "the rollback itself must succeed: {stderr}");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("blob pin") && stderr.contains("hello"),
+        "must name the stranded pin: {stderr}"
+    );
+    assert!(
+        stderr.contains("add --snap"),
+        "must name the recovery path: {stderr}"
+    );
+
+    // The trap: the next mutating verb fails named...
+    let (code, _, stderr) = run(project.path(), root.path(), &["sync"]);
+    assert_ne!(code, Some(0), "the stranded pin must fail sync");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("blob-pinned") && stderr.contains("does not carry its pinned content"),
+        "must be the named bail: {stderr}"
+    );
+
+    // ...and the recovery the rollback named repairs it.
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", hello.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "the re-add must repair: {stderr}");
+    let (code, _, stderr) = run(project.path(), root.path(), &["sync"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("held 'hello'"), "stderr: {stderr}");
+});
+
+// Issue #135 (blob-pin polish, repair test): hold_blob_pinned's named
+// bail for the half-done state a failed `add --snap` install leaves —
+// declaration + pins written, content never installed — and the named
+// repair (re-add) that recovers from it.
+gated_test!(pins_without_content_refuses_then_readd_repairs, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "hello");
+    let stage = tempfile::tempdir().unwrap();
+    let payload = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "sideload-ran",
+        port,
+        "hello.tar.gz",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let pinned_sha = lockfile(root.path(), "default")["snaps"]["hello"]["sha3-384"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Remove drops the declaration entry and both pins.
+    let (code, _, stderr) = run(project.path(), root.path(), &["remove", "hello"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    // Hand-write the half-done state back: declaration + pins WITHOUT
+    // installed content — exactly what `add --snap` leaves when its
+    // install fails after the writes.
+    let dir = pod_dir(root.path(), "default");
+    std::fs::write(dir.join("pod.lua"), "pod { packages = { \"hello\" } }\n").unwrap();
+    let lock_path = dir.join("shuttle.lock");
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+    lock["packages"]["hello"] = serde_json::json!({ "version": "1.0" });
+    lock["snaps"]["hello"] = serde_json::json!({ "revision": 0, "sha3-384": pinned_sha });
+    std::fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+
+    // The next sync refuses, named.
+    let (code, _, stderr) = run(project.path(), root.path(), &["sync"]);
+    assert_ne!(code, Some(0), "pins without content must fail sync");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("blob-pinned") && stderr.contains("does not carry its pinned content"),
+        "must be hold_blob_pinned's named bail: {stderr}"
+    );
+
+    // The named repair — re-run `pod add --snap` — reinstalls it.
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "the re-add must repair: {stderr}");
+    let (code, _, stderr) = run(project.path(), root.path(), &["sync"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("held 'hello'"), "stderr: {stderr}");
+});
+
+// Issue #135 (blob-pin polish, loader-side brick): sideloading into a
+// pod that ANOTHER pod loads succeeds — the sideload itself is
+// legitimate — but warns, naming the loading pod whose mutating verbs
+// will now refuse (and demonstrating exactly that).
+gated_test!(sideload_into_loaded_pod_warns, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "hello");
+    let stage = tempfile::tempdir().unwrap();
+    let payload = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "sideload-ran",
+        port,
+        "hello.tar.gz",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    // Pod `other` loads `base` BEFORE the sideload lands.
+    let other = pod_dir(root.path(), "other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("pod.lua"),
+        "pod { loads = { \"base\" }, packages = {} }\n",
+    )
+    .unwrap();
+
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &[
+            "--name",
+            "base",
+            "add",
+            "--snap",
+            payload.to_str().unwrap(),
+            "--ack-unsigned",
+        ],
+    );
+    assert_eq!(code, Some(0), "the sideload must succeed: {stderr}");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("loaded by pod 'other'"),
+        "must name the loading pod: {stderr}"
+    );
+
+    // The brick is real: the loading pod's mutating verbs refuse.
+    let (code, _, stderr) = run(project.path(), root.path(), &["--name", "other", "sync"]);
+    assert_ne!(code, Some(0));
+    assert!(
+        flat(&stderr).contains("sideloaded package(s)"),
+        "the loading pod must refuse named: {stderr}"
+    );
+});
+
+// Issue #135 (blob-pin polish, farm seam): a payload whose app name is
+// not a bare name must not produce a farm symlink outside the farm
+// dir — the emit refuses named at the seam.
+gated_test!(farm_link_refuses_non_bare_app_name, {
+    let stage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+
+    // A payload with a real bin/evil file and the app keyed "../evil".
+    let evil = stage.path().join(format!("evil_1.0_{}.snap", host_arch()));
+    let pkg_stage = stage.path().join("evil-stage");
+    let meta = pkg_stage.join("meta");
+    let bin = pkg_stage.join("bin");
+    std::fs::create_dir_all(&meta).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        meta.join("snap.yaml"),
+        "name: evil\nversion: \"1.0\"\napps:\n  \"../evil\":\n    command: bin/evil\n",
+    )
+    .unwrap();
+    std::fs::write(bin.join("evil"), "#!/bin/sh\necho pwned\n").unwrap();
+    let status = Command::new("mksquashfs")
+        .args([
+            pkg_stage.to_str().unwrap(),
+            evil.to_str().unwrap(),
+            "-noappend",
+            "-no-xattrs",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "mksquashfs failed");
+
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", evil.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_ne!(code, Some(0), "the non-bare app name must refuse");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("outside the bin farm") && stderr.contains("../evil"),
+        "must name the app and the refusal: {stderr}"
+    );
+    // Nothing escaped the farm: `farm.join("../evil")` would land beside
+    // the farm dir inside the generation.
+    let gen1 = pod_dir(root.path(), "default")
+        .join("generations")
+        .join("1");
+    assert!(
+        !gen1.join("evil").exists(),
+        "no symlink may exist outside the farm dir"
+    );
+});

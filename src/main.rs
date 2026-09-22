@@ -3540,6 +3540,17 @@ fn cmd_pod_rollback(
     if let Some(farm) = &report.farm {
         shuttle::output::info(format!("farm: {}", farm.display()));
     }
+    if !report.blob_pins_without_content.is_empty() {
+        // Issue #135: the flipped generation predates a blob pin — every
+        // mutating verb fails named until the pin is repaired.
+        shuttle::output::warn(format!(
+            "generation {} does not carry blob pin(s) ({}) — mutating verbs fail \
+             until each is re-added (`shuttle pod --name {} add --snap`) or removed",
+            report.to,
+            report.blob_pins_without_content.join(", "),
+            report.pod
+        ));
+    }
     if let Some(services) = &report.services {
         print_pod_services(services);
     }
