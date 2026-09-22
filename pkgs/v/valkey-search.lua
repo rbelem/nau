@@ -150,6 +150,13 @@ return {
             "make install PKGDATA_MODE=static",
             -- Stage 2: the module itself, system-modules path.
             "cd $SRC",
+            -- Sandbox gap: the pool GCC dropped the transitive
+            -- <mutex> include; upstream 1.2.1 text_index.h uses
+            -- std::mutex/std::lock_guard without including it, so the
+            -- cold build dies at ninja ("'mutex' in namespace 'std'
+            -- does not name a type"). Inject the include as line 1 —
+            -- pragma-once headers tolerate an include above the guard.
+            "sed -i \"1i#include <mutex>\" $SRC/src/indexes/text/text_index.h",
             -- Sandbox gap: the sandbox has no /etc/os-release, and
             -- submodules/CMakeLists.txt:7 unconditionally reads it to
             -- derive DISTRO_NAME — used ONLY for an alpine-specific
