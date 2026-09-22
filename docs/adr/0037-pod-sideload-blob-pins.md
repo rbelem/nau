@@ -118,11 +118,15 @@ ingestion path that bypasses the collection must therefore also say what
 ## Consequences
 
 **Positive**: the pod axis gains the same blob-source seam the system
-axis already has; a collection-less machine can reproduce a pod from
-payloads that carry no `requires` closures (a requires closure still
-resolves through the collection, so those pods need it present at sync
-time); pins stay content-addressed and fail-closed; `sync` stays a
-no-op holder instead of dying in `load_meta`.
+axis already has; a collection-less machine can reproduce a pod only
+from payloads whose `requires` closures are empty or already carried by
+the pod: a requires-carrying sideload refuses zero-write before install
+when its closure cannot be resolved, and a closure that fails only
+after install leaves a declared partial generation — payload active,
+libraries missing — completed by providing the collection and
+re-running `pod sync`, or abandoned via `pod remove`; pins stay
+content-addressed and fail-closed; `sync` stays a no-op holder instead
+of dying in `load_meta`.
 
 **Negative**: every sideload is unsigned in v1 (`--ack-unsigned` is the
 honest spelling of that); loading a sideload-carrying pod refuses until
