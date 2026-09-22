@@ -1729,6 +1729,97 @@ mod tests {
 
     // ── State partition populate routing + fail-closed (ADR-0023) ──
 
+    /// A runner that answers `sfdisk -J` with a canned body (or exit
+    /// code), leaving other tools to the shared fakes.
+    struct SfdiskReader {
+        code: i32,
+        stdout: String,
+    }
+
+    impl crate::command::CommandRunner for SfdiskReader {
+        fn run(&self, _argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            Ok(crate::command::RunnerOutput {
+                code: self.code,
+                stdout: self.stdout.clone().into_bytes(),
+                stderr: if self.code == 0 {
+                    String::new()
+                } else {
+                    "probed failure".into()
+                },
+            })
+        }
+    }
+
+    fn sfdisk_json(partitions: &[(&str, u64, u64)]) -> String {
+        let parts: Vec<String> = partitions
+            .iter()
+            .map(|(uuid, start, size)| {
+                format!(r#"{{"uuid": "{uuid}", "start": {start}, "size": {size}}}"#)
+            })
+            .collect();
+        format!(
+            r#"{{"partitiontable": {{"label": "gpt", "sector-size": 512, "partitions": [{}]}}}}"#,
+            parts.join(",")
+        )
+    }
+
+    #[test]
+    fn read_partition_extents_maps_sectors_to_bytes_and_normalizes_uuids() {
+        let runner = SfdiskReader {
+            code: 0,
+            stdout: sfdisk_json(&[("AABBCCDD-0011-2233-4455-667788990011", 2048, 4096)]),
+        };
+        let extents = read_partition_extents(&runner, Path::new("disk.img"), 1).unwrap();
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].start_bytes, 2048 * 512);
+        assert_eq!(extents[0].size_bytes, 4096 * 512);
+        assert_eq!(
+            extents[0].partuuid.as_deref(),
+            Some("aabbccdd-0011-2233-4455-667788990011"),
+            "read-back PARTUUIDs normalize to udev's lowercase"
+        );
+    }
+
+    #[test]
+    fn read_partition_extents_fails_closed_on_tool_and_count_mismatches() {
+        let failing = SfdiskReader {
+            code: 1,
+            stdout: String::new(),
+        };
+        let err = read_partition_extents(&failing, Path::new("disk.img"), 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sfdisk -J failed") && err.contains("probed failure"),
+            "{err}"
+        );
+
+        let one = SfdiskReader {
+            code: 0,
+            stdout: sfdisk_json(&[("a", 1, 1), ("b", 2, 2)]),
+        };
+        let mismatch = SfdiskReader {
+            code: 0,
+            stdout: one.stdout,
+        };
+        let err = read_partition_extents(&mismatch, Path::new("disk.img"), 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("found 2 partitions but the layout created 1"),
+            "{err}"
+        );
+
+        let junk = SfdiskReader {
+            code: 0,
+            stdout: "<html>".into(),
+        };
+        let err = read_partition_extents(&junk, Path::new("disk.img"), 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unparseable JSON"), "{err}");
+    }
+
     /// A runner that records every argv and answers each tool with a
     /// scripted exit code — enough to drive the ext4 `mkfs -d` seam with
     /// no real filesystem tooling.

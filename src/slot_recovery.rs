@@ -1139,4 +1139,293 @@ vda7  0657fd6d-a4ab-43c4-84e5-0933c84b4f4f vda\n"
             .iter()
             .all(|p| p.parttype.chars().all(|c| c.is_ascii())));
     }
+
+    #[test]
+    fn gather_partitions_reports_an_lsblk_failure() {
+        struct Failing;
+        impl CommandRunner for Failing {
+            fn run(&self, _argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+                Ok(crate::command::RunnerOutput {
+                    code: 1,
+                    stdout: Vec::new(),
+                    stderr: "not a block device".into(),
+                })
+            }
+        }
+        struct Broken;
+        impl CommandRunner for Broken {
+            fn run(&self, _argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+            }
+        }
+        let err = gather_partitions(&Failing, Path::new("lsblk"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("lsblk exited 1") && err.contains("not a block device"),
+            "{err}"
+        );
+        let err = gather_partitions(&Broken, Path::new("lsblk"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to run"), "{err}");
+    }
+
+    // ── pure parsers ──
+
+    #[test]
+    fn os_release_field_reads_unquoted_values_and_skips_noise() {
+        let content = "\
+# IMAGE_VERSION=9.9 is a comment
+NAME=\"Ubuntu Core 22\"
+VERSION=22
+ID_LIKE=debian
+IMAGE_VERSION=1.2.3
+";
+        assert_eq!(
+            os_release_field(content, "IMAGE_VERSION"),
+            Some("1.2.3".into())
+        );
+        assert_eq!(
+            os_release_field(content, "NAME"),
+            Some("Ubuntu Core 22".into())
+        );
+        assert_eq!(os_release_field(content, "VERSION"), Some("22".into()));
+        // A key that only prefixes the requested one never matches.
+        assert_eq!(os_release_field(content, "ID"), None);
+        assert_eq!(os_release_field(content, "MISSING"), None);
+    }
+
+    #[test]
+    fn image_name_reads_the_target_slot_grammar_only() {
+        let transfer = "\
+[Transfer]
+[Source]
+MatchPattern=shuttle-80_1.0_+1;shuttle-80_1.0_+1
+[Target]
+MatchPattern=shuttle-80_@v_a
+";
+        assert_eq!(
+            image_name_from_root_transfer(transfer),
+            Some("shuttle-80".into())
+        );
+
+        let b_arm = "[Target]\nMatchPattern=img_2.0_@v_b\n";
+        assert_eq!(image_name_from_root_transfer(b_arm), Some("img_2.0".into()));
+
+        let multi_arm = "[Target]\nMatchPattern=shuttle-80_@v_a shuttle-80_@v_b\n";
+        assert_eq!(
+            image_name_from_root_transfer(multi_arm),
+            Some("shuttle-80".into())
+        );
+
+        // [Target] without a slot-grammar MatchPattern names nothing.
+        assert_eq!(
+            image_name_from_root_transfer("[Target]\nMatchPatterns=x\n"),
+            None
+        );
+        assert_eq!(image_name_from_root_transfer(""), None);
+    }
+
+    #[test]
+    fn parse_partno_reads_parent_plus_optional_p_plus_digits() {
+        assert_eq!(parse_partno("vda5", "vda"), Some(5));
+        assert_eq!(parse_partno("nvme0n1p5", "nvme0n1"), Some(5));
+        assert_eq!(parse_partno("sdb15", "sdb"), Some(15));
+        assert_eq!(
+            parse_partno("vda", "vda"),
+            None,
+            "the whole disk has no partno"
+        );
+        assert_eq!(
+            parse_partno("vdb1", "vda"),
+            None,
+            "a different parent is not a slot"
+        );
+    }
+
+    // ── UKI directory listing ──
+
+    /// A minimal PE the completeness check vouches for: DOS header, one
+    /// section whose on-disk extent lies inside the file.
+    fn minimal_complete_pe() -> Vec<u8> {
+        let mut pe = vec![0u8; 512];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        let coff = 0x44;
+        let sections: u16 = 1;
+        let opt_size: u16 = 0x30;
+        pe[coff + 2..coff + 4].copy_from_slice(&sections.to_le_bytes());
+        pe[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
+        let opt_off = coff + 20;
+        pe[opt_off..opt_off + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        let table = opt_off + opt_size as usize;
+        // Section: SizeOfRawData @+16 = 0x20, PointerToRawData @+20 = 0x10.
+        pe[table + 16..table + 20].copy_from_slice(&0x20u32.to_le_bytes());
+        pe[table + 20..table + 24].copy_from_slice(&0x10u32.to_le_bytes());
+        pe
+    }
+
+    #[test]
+    fn gather_ukis_lists_efi_files_with_completeness_and_skips_the_rest() {
+        let esp = tempfile::tempdir().unwrap();
+        let dir = esp.path().join("EFI").join("Linux");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shuttle-80_1.0_a.efi"), minimal_complete_pe()).unwrap();
+        std::fs::write(
+            dir.join("shuttle-80_0.9_a.efi"),
+            &minimal_complete_pe()[..0x60],
+        )
+        .unwrap();
+        std::fs::write(dir.join("README.txt"), "not a ukI").unwrap();
+
+        let ukis = gather_ukis(esp.path());
+        assert_eq!(ukis.len(), 2, "non-.efi files are not UKIs");
+        let complete = ukis
+            .iter()
+            .find(|u| u.name == "shuttle-80_1.0_a.efi")
+            .unwrap();
+        assert!(complete.pe_complete);
+        let truncated = ukis
+            .iter()
+            .find(|u| u.name == "shuttle-80_0.9_a.efi")
+            .unwrap();
+        assert!(!truncated.pe_complete, "a cut-off PE is incomplete");
+    }
+
+    #[test]
+    fn gather_ukis_yields_nothing_without_the_uki_directory() {
+        let esp = tempfile::tempdir().unwrap();
+        assert!(gather_ukis(esp.path()).is_empty());
+    }
+
+    // ── reclaim application ──
+
+    struct RecordingRunner {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        fail_on_call: Option<usize>,
+    }
+
+    impl RecordingRunner {
+        fn new(fail_on_call: Option<usize>) -> RecordingRunner {
+            RecordingRunner {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail_on_call,
+            }
+        }
+
+        fn recorded(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            let mut calls = self.calls.lock().unwrap();
+            let n = calls.len();
+            calls.push(argv.to_vec());
+            let failed = self.fail_on_call == Some(n);
+            Ok(crate::command::RunnerOutput {
+                code: if failed { 1 } else { 0 },
+                stdout: Vec::new(),
+                stderr: if failed {
+                    "simulated failure".into()
+                } else {
+                    String::new()
+                },
+            })
+        }
+    }
+
+    fn stranded(retype_to: Option<String>) -> ReclaimPartition {
+        ReclaimPartition {
+            name: "vda5".into(),
+            pkname: "vda".into(),
+            partno: 5,
+            label: "shuttle-80_0.9_a".into(),
+            retype_to,
+        }
+    }
+
+    #[test]
+    fn reclaim_partition_restores_type_before_label() {
+        let runner = RecordingRunner::new(None);
+        reclaim_partition(&runner, Path::new("sfdisk"), &stranded(Some(ROOT.into()))).unwrap();
+        let calls = runner.recorded();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][1], "--part-type");
+        assert_eq!(calls[0][3], "5");
+        assert_eq!(calls[0][4], ROOT);
+        assert_eq!(calls[1][1], "--part-label");
+        assert_eq!(calls[1][4], EMPTY_SLOT_LABEL);
+    }
+
+    #[test]
+    fn reclaim_partition_skips_the_type_when_not_masked() {
+        let runner = RecordingRunner::new(None);
+        reclaim_partition(&runner, Path::new("sfdisk"), &stranded(None)).unwrap();
+        let calls = runner.recorded();
+        assert_eq!(calls.len(), 1, "relabel only");
+        assert_eq!(calls[0][1], "--part-label");
+    }
+
+    #[test]
+    fn reclaim_partition_fails_closed_naming_the_partition() {
+        let runner = RecordingRunner::new(Some(1));
+        let err = reclaim_partition(&runner, Path::new("sfdisk"), &stranded(Some(ROOT.into())))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--part-label"), "{err}");
+        assert!(err.contains("partition 5"), "{err}");
+        assert!(err.contains("shuttle-80_0.9_a"), "{err}");
+        assert!(err.contains("simulated failure"), "{err}");
+    }
+
+    #[test]
+    fn apply_reclaims_counts_every_restored_partition() {
+        let runner = RecordingRunner::new(None);
+        let reclaims = vec![
+            Reclaim {
+                version: "0.9".into(),
+                partitions: vec![stranded(None)],
+            },
+            Reclaim {
+                version: "1.0".into(),
+                partitions: vec![stranded(None), stranded(None)],
+            },
+        ];
+        let reclaimed = apply_reclaims(&runner, Path::new("sfdisk"), &reclaims).unwrap();
+        assert_eq!(reclaimed, 3);
+        assert_eq!(runner.recorded().len(), 3);
+    }
+
+    #[test]
+    fn apply_reclaims_aborts_on_the_first_failed_op() {
+        let runner = RecordingRunner::new(Some(0));
+        let reclaims = vec![Reclaim {
+            version: "0.9".into(),
+            partitions: vec![stranded(Some(ROOT.into())), stranded(None)],
+        }];
+        let err = apply_reclaims(&runner, Path::new("sfdisk"), &reclaims)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("while reclaiming stranded version 0.9"),
+            "{err}"
+        );
+        assert_eq!(runner.recorded().len(), 1, "no op runs after the failure");
+    }
+
+    #[test]
+    fn recover_slots_no_ops_without_the_host_tools() {
+        let esp = tempfile::tempdir().unwrap();
+        let tools = SlotRecoveryTools {
+            lsblk: None,
+            sfdisk: None,
+        };
+        let runner = RecordingRunner::new(None);
+        recover_slots(esp.path(), &runner, &tools).unwrap();
+        assert!(runner.recorded().is_empty(), "no sfdisk/lsblk call may run");
+    }
 }
