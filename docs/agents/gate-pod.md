@@ -1,9 +1,9 @@
 # Gate pod — P1 dogfood log (devbox-free gate)
 
-Status: **blocked at provisioning.** The `gate` pod cannot be materialized
-on this machine yet, so the four `shuttle run --pod gate -- cargo …`
-commands do not replace devbox here. All claims come from commands run on
-NixOS 26.11, shuttle 0.1.0 (`~/.local/bin/shuttle`).
+Status: **blocked at the sandbox C compiler.** TLS and the kernel.org
+download now pass; the rust chain still dies building linux-headers
+without gcc in the sandbox. All claims come from commands run on
+NixOS 26.11, shuttle 0.1.0.
 
 ## What worked
 
@@ -38,16 +38,40 @@ NixOS 26.11, shuttle 0.1.0 (`~/.local/bin/shuttle`).
 'gate' has not been reconciled yet`). The 1.98.1-vs-1.97.1 clippy/fmt
 drift is **not yet observable** — it needs a live pod.
 
+## Round 2 (2026-09-22, shuttle @ a3cc98b, debug build)
+
+1. `pod --name gate sync` with the daily farm first on PATH — still the
+   exit-60 CA failure: the farm curl is the daily pod's generation 67,
+   built before #138, so it carries neither the wrapper nor a bundle.
+   The #138 fix lives in recipes; no installed pod has rebuilt curl yet
+   (refresh-path gap → issue filed).
+2. Same with `CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt` in the
+   caller env — the kernel.org headers tarball downloads and hashes
+   (`source hash: bb7f6d80b387c757…`), then the linux-headers build dies
+   in the sandbox, unchanged:
+
+        sh: gcc: not found
+        Error:   × build command exited with error (in sandbox)
+
+What moved since round 1: #116 shipped `pod add --snap` (prebuilt
+payload sideloading — provisioning has a verb now), and #130/#138 fixed
+the curl recipes (wrapper + ca-certificates require). Neither has been
+exercised on the gate pod yet.
+
 ## Gap list to make this the default gate
 
-1. **Prebuilt payload provisioning (blocking).** A fresh pod's store is
-   per-pod and empty; `pod sync` builds the full requires chain from
-   recipes, and rust drags in glibc (source build, hours). Shuttle 0.1.0
-   has no verb carrying prebuilt payloads into a pod: no `export`/`serve`;
-   `pull` is OCI-only (no `--pod`); `pod add` takes names only.
-2. **CA bundle (blocking).** Pod env should declare `CURL_CA_BUNDLE`/`SSL_CERT_FILE`, or the farm curl should ship one.
-3. **Sandbox C compiler (blocking for any C-building recipe).** The
-   linux-headers step of the rust chain needs gcc on the sandbox PATH.
+1. **Sandbox C compiler (blocking).** The linux-headers step of the rust
+   chain needs gcc on the sandbox PATH; `doctor --pod` cc/c++ misses
+   unchanged. This is now the only blocker for the from-recipe route.
+2. **Prebuilt payload provisioning (alternate route, untested).**
+   `pod add --snap` (#116) can carry prebuilt payloads into a pod
+   without a recipe build. Untested on gate; a requires-carrying payload
+   on a collection-less target lands exactly in #132's failure path.
+3. **Curl refresh path (filed).** A recipe-only fix (#138) does not
+   reach installed pods: curl is not declared in daily, `rebuild`
+   reuses the cached closure, `update` no-ops at an unchanged version
+   pin. Ambient `CURL_CA_BUNDLE` works meanwhile (never clobbered by
+   the wrapper, per #138).
 4. **`pod declare --file` (plan §6).** `pod.lua` is write-only today
    (`add`/`remove` maintain it); no checked-in `gate/pod.lua` until a verb
    can load one.
