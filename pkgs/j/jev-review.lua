@@ -61,10 +61,10 @@ return {
         -- dist/server.js flat (found live 2026-09-20).
         build = table.concat({
             "pkg=$STAGE/usr/lib/node_modules/jev-review",
-            "mkdir -p \"$pkg/dist\"",
-            "cp package.json \"$pkg/\"",
-            "cp dist/server.js \"$pkg/dist/\"",
-            "chmod +x \"$pkg/dist/server.js\"",
+            'mkdir -p "$pkg/dist"',
+            'cp package.json "$pkg/"',
+            'cp dist/server.js "$pkg/dist/"',
+            'chmod +x "$pkg/dist/server.js"',
         }, " && "),
 
         type = "source",

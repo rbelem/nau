@@ -32,12 +32,12 @@ return {
         stage = "./stage/",
         apps = {
             -- Compose from the shared CLI template, override with jq-specific values
-            jq = lib.cli_app({ command = "bin/jq" }),
+            jq = lib.cli_app { command = "bin/jq" },
         },
     }, {
         -- Extra overrides can be stacked here (e.g. plugs specific to jq)
         apps = {
-            jq = { plugs = { "home" } },  -- jq only needs file read access, not network
+            jq = { plugs = { "home" } }, -- jq only needs file read access, not network
         },
-    }))
+    })),
 }

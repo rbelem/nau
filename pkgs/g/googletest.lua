@@ -64,12 +64,12 @@ return {
         },
 
         build = table.concat({
-            "cmake -S $SRC -B $SRC/build -G Ninja " ..
-                "-DCMAKE_BUILD_TYPE=Release " ..
-                "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr " ..
-                "-DCMAKE_INSTALL_PREFIX=/usr " ..
-                "-DCMAKE_INSTALL_LIBDIR=lib " ..
-                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+            "cmake -S $SRC -B $SRC/build -G Ninja "
+                .. "-DCMAKE_BUILD_TYPE=Release "
+                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_INSTALL_PREFIX=/usr "
+                .. "-DCMAKE_INSTALL_LIBDIR=lib "
+                .. "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
             "cmake --build $SRC/build -j$(nproc)",
             "DESTDIR=$STAGE cmake --install $SRC/build",
         }, " && "),

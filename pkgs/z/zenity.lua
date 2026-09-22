@@ -59,7 +59,7 @@ return {
             -- meson-internal find_program calls, e.g. msgfmt). HOME
             -- keeps cmake-method dependency lookups alive (no /etc in
             -- the sandbox, so no passwd entry).
-            "export PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\"",
+            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
             "export HOME=/tmp",
             -- glib's .pc advertises its tools at /usr/bin/... (the
             -- install prefix path), which does not exist in the sandbox
@@ -69,11 +69,11 @@ return {
             -- glib tool variable zenity uses at once
             -- (glib-compile-resources, glib-mkenums).
             "printf '[binaries]\\nglib-compile-resources = '\\''%s'\\''\\nglib-mkenums = '\\''%s'\\''\\n' \"$SHUTTLE_BUILD_PREFIX/usr/bin/glib-compile-resources\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/glib-mkenums\" > zenity-tools-native.ini",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/meson\" setup build --prefix=/usr " ..
-                "--native-file zenity-tools-native.ini " ..
-                "-Dmanpage=false -Dwebkitgtk=false",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build",
-            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build install",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
+                .. "--native-file zenity-tools-native.ini "
+                .. "-Dmanpage=false -Dwebkitgtk=false",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
 
         type = "source",

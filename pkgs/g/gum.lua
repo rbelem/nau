@@ -97,8 +97,8 @@ return {
         build = table.concat({
             "mkdir -p $STAGE/usr/bin",
             "export HOME=/tmp GOCACHE=/tmp/shuttle-go-gocache GOPATH=/tmp/shuttle-go-gopath GOMODCACHE=/tmp/shuttle-go-gopath/pkg/mod",
-            "export GOFLAGS=\"-trimpath -mod=mod\" GOPROXY=\"file://$SHUTTLE_DEPS_DIR/cache/download\" GOSUMDB=off GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=0",
-            "cd $SRC && go build -ldflags \"-s -w -X main.Version=2.0.1\" -o $STAGE/usr/bin/gum .",
+            'export GOFLAGS="-trimpath -mod=mod" GOPROXY="file://$SHUTTLE_DEPS_DIR/cache/download" GOSUMDB=off GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=0',
+            'cd $SRC && go build -ldflags "-s -w -X main.Version=2.0.1" -o $STAGE/usr/bin/gum .',
         }, " && "),
 
         type = "source",

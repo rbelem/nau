@@ -45,12 +45,12 @@ return {
             -- python3 on it for wayland's embed.py codegen helper and
             -- keeps HOME alive for meson's method lookups (no /etc in
             -- the sandbox, so no passwd entry).
-            "export PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\"",
+            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
             "export HOME=/tmp",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/meson\" setup build --prefix=/usr " ..
-                "-Dtests=false -Ddocumentation=false -Ddtd_validation=false",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build",
-            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build install",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
+                .. "-Dtests=false -Ddocumentation=false -Ddtd_validation=false",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
 
         type = "source",

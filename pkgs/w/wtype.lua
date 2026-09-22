@@ -49,12 +49,12 @@ return {
             -- runs git describe only when git is found; in the tarball
             -- (no repo) the command fails soft (meson run_command
             -- check:false) and the tag version is baked instead.
-            "export PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\"",
-            "export LD_LIBRARY_PATH=\"$SHUTTLE_BUILD_PREFIX/usr/lib:$SHUTTLE_BUILD_PREFIX/usr/lib64\"",
+            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
+            'export LD_LIBRARY_PATH="$SHUTTLE_BUILD_PREFIX/usr/lib:$SHUTTLE_BUILD_PREFIX/usr/lib64"',
             "export HOME=/tmp",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/meson\" setup build --prefix=/usr",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build",
-            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build install",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr',
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
 
         type = "source",

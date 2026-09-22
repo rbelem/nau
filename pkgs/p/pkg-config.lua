@@ -21,6 +21,6 @@ This build uses the internal glib to avoid external dependencies.]],
         -- so `gboolean bool;` fails ("two or more data types", "expected
         -- identifier before 'bool'"). Compile with the C89 GNU dialect where
         -- `bool` is a plain identifier, restoring the source's assumption.
-        build = "./configure --prefix=/usr --with-internal-glib && make CFLAGS=\"-std=gnu89\" && make install DESTDIR=$STAGE",
+        build = './configure --prefix=/usr --with-internal-glib && make CFLAGS="-std=gnu89" && make install DESTDIR=$STAGE',
     },
 }

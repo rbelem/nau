@@ -26,7 +26,7 @@ Autoconf and other GNU build tools depend on M4 for macro expansion.]],
             -- C23 default ignores the attribute there and hard-errors
             -- ('expected identifier or ( before int'). Pin the gnu17 dialect
             -- (with -O2 restated, since this replaces the default CFLAGS).
-            "./configure --prefix=/usr CFLAGS=\"-O2 -std=gnu17\"",
+            './configure --prefix=/usr CFLAGS="-O2 -std=gnu17"',
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
             -- The info index is regenerated per-package; in a merged build

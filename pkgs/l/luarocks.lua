@@ -60,70 +60,70 @@ return {
             "./configure --prefix=/usr --with-lua=$SHUTTLE_BUILD_PREFIX/usr --lua-version=5.4",
             "make",
             "make install DESTDIR=$STAGE",
-            "printf '%s\\n' " ..
-                "'#!/usr/bin/env lua' " ..
-                "'-- Self-locating luarocks launcher (pool port): resolves the' " ..
-                "'-- staged module tree relative to the running script, which the' " ..
-                "'-- pod interpreter wrapper passes as the extension-tree path.' " ..
-                "'local dir = arg[0]:match(\"^(.*)[/]\") or \".\"' " ..
-                "'local root = dir .. \"/../share/lua/5.4\"' " ..
-                "'package.path = root .. \"/?.lua;\" .. root .. \"/?/init.lua;\" .. package.path' " ..
-                "'package.cpath = root .. \"/?.so;\" .. package.cpath' " ..
-                "'local cfg = require(\"luarocks.core.cfg\")' " ..
-                "'local loader = require(\"luarocks.loader\")' " ..
-                "'local cmd = require(\"luarocks.cmd\")' " ..
-                "'local description = \"LuaRocks main command-line interface\"' " ..
-                "'local commands = {' " ..
-                "'   init = \"luarocks.cmd.init\",' " ..
-                "'   pack = \"luarocks.cmd.pack\",' " ..
-                "'   unpack = \"luarocks.cmd.unpack\",' " ..
-                "'   build = \"luarocks.cmd.build\",' " ..
-                "'   install = \"luarocks.cmd.install\",' " ..
-                "'   search = \"luarocks.cmd.search\",' " ..
-                "'   list = \"luarocks.cmd.list\",' " ..
-                "'   remove = \"luarocks.cmd.remove\",' " ..
-                "'   make = \"luarocks.cmd.make\",' " ..
-                "'   download = \"luarocks.cmd.download\",' " ..
-                "'   path = \"luarocks.cmd.path\",' " ..
-                "'   show = \"luarocks.cmd.show\",' " ..
-                "'   new_version = \"luarocks.cmd.new_version\",' " ..
-                "'   lint = \"luarocks.cmd.lint\",' " ..
-                "'   write_rockspec = \"luarocks.cmd.write_rockspec\",' " ..
-                "'   purge = \"luarocks.cmd.purge\",' " ..
-                "'   doc = \"luarocks.cmd.doc\",' " ..
-                "'   upload = \"luarocks.cmd.upload\",' " ..
-                "'   config = \"luarocks.cmd.config\",' " ..
-                "'   which = \"luarocks.cmd.which\",' " ..
-                "'   test = \"luarocks.cmd.test\",' " ..
-                "'}' " ..
-                "'cmd.run_command(description, commands, \"luarocks.cmd.external\", table.unpack(arg))' " ..
-                "> $STAGE/usr/bin/luarocks",
+            "printf '%s\\n' "
+                .. "'#!/usr/bin/env lua' "
+                .. "'-- Self-locating luarocks launcher (pool port): resolves the' "
+                .. "'-- staged module tree relative to the running script, which the' "
+                .. "'-- pod interpreter wrapper passes as the extension-tree path.' "
+                .. '\'local dir = arg[0]:match("^(.*)[/]") or "."\' '
+                .. "'local root = dir .. \"/../share/lua/5.4\"' "
+                .. '\'package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path\' '
+                .. "'package.cpath = root .. \"/?.so;\" .. package.cpath' "
+                .. "'local cfg = require(\"luarocks.core.cfg\")' "
+                .. "'local loader = require(\"luarocks.loader\")' "
+                .. "'local cmd = require(\"luarocks.cmd\")' "
+                .. "'local description = \"LuaRocks main command-line interface\"' "
+                .. "'local commands = {' "
+                .. "'   init = \"luarocks.cmd.init\",' "
+                .. "'   pack = \"luarocks.cmd.pack\",' "
+                .. "'   unpack = \"luarocks.cmd.unpack\",' "
+                .. "'   build = \"luarocks.cmd.build\",' "
+                .. "'   install = \"luarocks.cmd.install\",' "
+                .. "'   search = \"luarocks.cmd.search\",' "
+                .. "'   list = \"luarocks.cmd.list\",' "
+                .. "'   remove = \"luarocks.cmd.remove\",' "
+                .. "'   make = \"luarocks.cmd.make\",' "
+                .. "'   download = \"luarocks.cmd.download\",' "
+                .. "'   path = \"luarocks.cmd.path\",' "
+                .. "'   show = \"luarocks.cmd.show\",' "
+                .. "'   new_version = \"luarocks.cmd.new_version\",' "
+                .. "'   lint = \"luarocks.cmd.lint\",' "
+                .. "'   write_rockspec = \"luarocks.cmd.write_rockspec\",' "
+                .. "'   purge = \"luarocks.cmd.purge\",' "
+                .. "'   doc = \"luarocks.cmd.doc\",' "
+                .. "'   upload = \"luarocks.cmd.upload\",' "
+                .. "'   config = \"luarocks.cmd.config\",' "
+                .. "'   which = \"luarocks.cmd.which\",' "
+                .. "'   test = \"luarocks.cmd.test\",' "
+                .. "'}' "
+                .. "'cmd.run_command(description, commands, \"luarocks.cmd.external\", table.unpack(arg))' "
+                .. "> $STAGE/usr/bin/luarocks",
             -- luarocks-admin gets the same self-locating launcher: the
             -- generated one bakes the build prefix into absolute paths.
-            "printf '%s\\n' " ..
-                "'#!/usr/bin/env lua' " ..
-                "'-- Self-locating luarocks-admin launcher (pool port): see usr/bin/luarocks.' " ..
-                "'local dir = arg[0]:match(\"^(.*)[/]\") or \".\"' " ..
-                "'local root = dir .. \"/../share/lua/5.4\"' " ..
-                "'package.path = root .. \"/?.lua;\" .. root .. \"/?/init.lua;\" .. package.path' " ..
-                "'package.cpath = root .. \"/?.so;\" .. package.cpath' " ..
-                "'local cfg = require(\"luarocks.core.cfg\")' " ..
-                "'local loader = require(\"luarocks.loader\")' " ..
-                "'local cmd = require(\"luarocks.cmd\")' " ..
-                "'local description = \"LuaRocks repository administration interface\"' " ..
-                "'local commands = {' " ..
-                "'   make_manifest = \"luarocks.admin.cmd.make_manifest\",' " ..
-                "'   add = \"luarocks.admin.cmd.add\",' " ..
-                "'   remove = \"luarocks.admin.cmd.remove\",' " ..
-                "'   refresh_cache = \"luarocks.admin.cmd.refresh_cache\",' " ..
-                "'}' " ..
-                "'cmd.run_command(description, commands, \"luarocks.admin.cmd.external\", table.unpack(arg))' " ..
-                "> $STAGE/usr/bin/luarocks-admin",
+            "printf '%s\\n' "
+                .. "'#!/usr/bin/env lua' "
+                .. "'-- Self-locating luarocks-admin launcher (pool port): see usr/bin/luarocks.' "
+                .. '\'local dir = arg[0]:match("^(.*)[/]") or "."\' '
+                .. "'local root = dir .. \"/../share/lua/5.4\"' "
+                .. '\'package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path\' '
+                .. "'package.cpath = root .. \"/?.so;\" .. package.cpath' "
+                .. "'local cfg = require(\"luarocks.core.cfg\")' "
+                .. "'local loader = require(\"luarocks.loader\")' "
+                .. "'local cmd = require(\"luarocks.cmd\")' "
+                .. "'local description = \"LuaRocks repository administration interface\"' "
+                .. "'local commands = {' "
+                .. "'   make_manifest = \"luarocks.admin.cmd.make_manifest\",' "
+                .. "'   add = \"luarocks.admin.cmd.add\",' "
+                .. "'   remove = \"luarocks.admin.cmd.remove\",' "
+                .. "'   refresh_cache = \"luarocks.admin.cmd.refresh_cache\",' "
+                .. "'}' "
+                .. "'cmd.run_command(description, commands, \"luarocks.admin.cmd.external\", table.unpack(arg))' "
+                .. "> $STAGE/usr/bin/luarocks-admin",
             "chmod +x $STAGE/usr/bin/luarocks $STAGE/usr/bin/luarocks-admin",
             -- The staged default config embeds the configure-time
             -- --with-lua prefix; point it at the install prefix instead
             -- (same build-prefix scrub as the launchers above).
-            "sed -i \"s|$SHUTTLE_BUILD_PREFIX|/usr|g\" $STAGE/etc/luarocks/config-5.4.lua",
+            'sed -i "s|$SHUTTLE_BUILD_PREFIX|/usr|g" $STAGE/etc/luarocks/config-5.4.lua',
         }, " && "),
 
         type = "source",

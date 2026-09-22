@@ -42,12 +42,12 @@ return {
             -- LD_LIBRARY_PATH: the prefix scanner strips its build-tree
             -- RUNPATH at install (meson rpath cleanup), so its libexpat
             -- dependency needs the prefix lib dirs at exec time.
-            "export PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\"",
-            "export LD_LIBRARY_PATH=\"$SHUTTLE_BUILD_PREFIX/usr/lib:$SHUTTLE_BUILD_PREFIX/usr/lib64\"",
+            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
+            'export LD_LIBRARY_PATH="$SHUTTLE_BUILD_PREFIX/usr/lib:$SHUTTLE_BUILD_PREFIX/usr/lib64"',
             "export HOME=/tmp",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/meson\" setup build --prefix=/usr",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build",
-            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build install",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr',
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
 
         type = "source",

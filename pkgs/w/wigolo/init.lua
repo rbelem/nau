@@ -79,9 +79,9 @@ return {
         -- the farm command, the merged prefix, and a store tree.
         build = table.concat({
             "pkg=$STAGE/usr/lib/wigolo",
-            "mkdir -p \"$pkg\" $STAGE/usr/bin",
-            "cp -r $SRC/dist $SRC/package.json \"$pkg/\"",
-            "printf '%s\\n' '#!/bin/sh' 'root=$(dirname \"$(dirname \"$(dirname \"$0\")\")\")' 'exec node \"$root/usr/lib/wigolo/dist/index.js\" \"$@\"' > $STAGE/usr/bin/wigolo",
+            'mkdir -p "$pkg" $STAGE/usr/bin',
+            'cp -r $SRC/dist $SRC/package.json "$pkg/"',
+            'printf \'%s\\n\' \'#!/bin/sh\' \'root=$(dirname "$(dirname "$(dirname "$0")")")\' \'exec node "$root/usr/lib/wigolo/dist/index.js" "$@"\' > $STAGE/usr/bin/wigolo',
             "chmod +x $STAGE/usr/bin/wigolo",
         }, " && "),
 
@@ -108,12 +108,12 @@ return {
                 -- The bootstrap unit (examples/cutover/shuttle-wigolo.service)
                 -- sets Environment=PATH over the generation root.
                 command = "usr/bin/wigolo",
-                daemon  = "simple",
-                args    = { "serve", "--port", "${port}" },
+                daemon = "simple",
+                args = { "serve", "--port", "${port}" },
                 options = {
-                    port     = 3333,
+                    port = 3333,
                     data_dir = "%h/.local/share/wigolo",
-                    enabled  = false,
+                    enabled = false,
                 },
                 environment = {},
             },

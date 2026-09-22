@@ -35,11 +35,11 @@ return {
         },
 
         build = table.concat({
-            "export PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\"",
+            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
             "export HOME=/tmp",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/meson\" setup build --prefix=/usr -Dnls=false",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build",
-            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build install",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr -Dnls=false',
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
             -- The meson install adds a usr/share/X11/xkb -> absolute
             -- /usr/share/xkeyboard-config-2 compatibility symlink; the snap
             -- packer's recursive copy follows stage symlinks, and this one

@@ -92,8 +92,15 @@ return {
             "toolchain",
         },
         requires = {
-            "binutils", "gcc", "glibc", "linux-headers",
-            "gmp", "mpfr", "mpc", "isl", "zlib",
+            "binutils",
+            "gcc",
+            "glibc",
+            "linux-headers",
+            "gmp",
+            "mpfr",
+            "mpc",
+            "isl",
+            "zlib",
         },
 
         -- ADR-0018 leak scan: the staged tree carries the gcc build's
@@ -129,7 +136,7 @@ return {
             -- the toolchain by bare name in the merged prefix, and the
             -- launchers below can exec usr/bin/gcc. Standard distro
             -- layout (Ubuntu: gcc -> x86_64-linux-gnu-gcc-N).
-            "for t in gcc g++ cpp c++ gcov ar as ld nm ranlib strip readelf objcopy objdump; do ln -sf \"x86_64-linux-gnu-$t\" \"$STAGE/toolchain/usr/bin/$t\"; done",
+            'for t in gcc g++ cpp c++ gcov ar as ld nm ranlib strip readelf objcopy objdump; do ln -sf "x86_64-linux-gnu-$t" "$STAGE/toolchain/usr/bin/$t"; done',
             -- Root-level usr/bin names for the merged build prefix: a
             -- build_deps consumer's prefix merges this payload's tree
             -- UNDER ITS OWN ROOTS (toolchain/** stays toolchain/**), so
@@ -137,7 +144,7 @@ return {
             -- the names at the payload's usr/bin, reaching into the
             -- staged subtree relatively.
             "mkdir -p $STAGE/usr/bin",
-            "for t in gcc g++ cpp c++ gcov ar as ld nm ranlib strip readelf objcopy objdump; do ln -sf \"../../toolchain/usr/bin/x86_64-linux-gnu-$t\" \"$STAGE/usr/bin/$t\"; done",
+            'for t in gcc g++ cpp c++ gcov ar as ld nm ranlib strip readelf objcopy objdump; do ln -sf "../../toolchain/usr/bin/x86_64-linux-gnu-$t" "$STAGE/usr/bin/$t"; done',
             "find $STAGE -type f -exec patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 {} \\; 2>/dev/null || true",
             "find $STAGE -type f -exec patchelf --remove-rpath {} \\; 2>/dev/null || true",
             "find $STAGE -type f -exec strip --strip-unneeded {} \\; 2>/dev/null || true",

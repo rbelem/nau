@@ -89,21 +89,24 @@ return {
         services = {
             valkey = svc {
                 command = "usr/bin/valkey-server",
-                daemon  = "simple",
-                args    = {
-                    "--port", "${port}",
-                    "--dir",  "${data_dir}",
+                daemon = "simple",
+                args = {
+                    "--port",
+                    "${port}",
+                    "--dir",
+                    "${data_dir}",
                     -- The valkey-search module (pkgs/v/valkey-search.lua
                     -- stages usr/lib/libsearch.so; extensions merge
                     -- payloads under a second usr level — blesh/
                     -- hermes-desktop precedent). Loads when the pod
                     -- includes the valkey-search package.
-                    "--loadmodule", "${extensions}/valkey-search/usr/usr/lib/libsearch.so",
+                    "--loadmodule",
+                    "${extensions}/valkey-search/usr/usr/lib/libsearch.so",
                 },
                 options = {
-                    port     = 6379,
+                    port = 6379,
                     data_dir = "%h/.local/share/shuttle/valkey/%p",
-                    enabled  = false,
+                    enabled = false,
                 },
                 environment = {},
             },

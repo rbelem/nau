@@ -44,7 +44,7 @@ return {
         -- pool readline.so leaves the terminfo symbols undefined for the
         -- final link.
         build = table.concat({
-            "make -C src all SYSCFLAGS=\"-DLUA_USE_LINUX -DLUA_USE_READLINE -I$SHUTTLE_BUILD_PREFIX/usr/include\" SYSLIBS=\"-Wl,-E -ldl -L$SHUTTLE_BUILD_PREFIX/usr/lib -lreadline -ltinfow\"",
+            'make -C src all SYSCFLAGS="-DLUA_USE_LINUX -DLUA_USE_READLINE -I$SHUTTLE_BUILD_PREFIX/usr/include" SYSLIBS="-Wl,-E -ldl -L$SHUTTLE_BUILD_PREFIX/usr/lib -lreadline -ltinfow"',
             "make install INSTALL_TOP=$STAGE/usr",
         }, " && "),
 

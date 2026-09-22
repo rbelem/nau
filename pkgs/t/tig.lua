@@ -40,7 +40,7 @@ return {
             -- separately by tig's Makefile via TIG_CPPFLAGS, so overriding
             -- CFLAGS on the make line does not drop the build-prefix headers.
             "./configure --prefix=/usr --without-readline",
-            "make -j$(nproc) CFLAGS=\"-Wall -O2 -Wno-error=int-conversion\"",
+            'make -j$(nproc) CFLAGS="-Wall -O2 -Wno-error=int-conversion"',
             "make install DESTDIR=$STAGE",
         }, " && "),
 

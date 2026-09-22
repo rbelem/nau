@@ -49,8 +49,8 @@ return {
             -- the sandbox's /tmp tmpfs plus a source replacement pointing
             -- at the mounted, hash-verified vendor closure.
             "export CARGO_HOME=/tmp/shuttle-cargo-home CARGO_NET_OFFLINE=true",
-            "mkdir -p \"$CARGO_HOME\"",
-            "printf '[source.crates-io]\\nreplace-with = \"shuttle-vendored\"\\n\\n[source.shuttle-vendored]\\ndirectory = \"%s\"\\n' \"$SHUTTLE_DEPS_DIR/vendor\" > \"$CARGO_HOME/config.toml\"",
+            'mkdir -p "$CARGO_HOME"',
+            'printf \'[source.crates-io]\\nreplace-with = "shuttle-vendored"\\n\\n[source.shuttle-vendored]\\ndirectory = "%s"\\n\' "$SHUTTLE_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
             -- statix is a virtual workspace (root Cargo.toml carries only
             -- [workspace]); the installable package is the bin/ member.
             "cargo install --path $SRC/bin --root $STAGE",

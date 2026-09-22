@@ -44,13 +44,13 @@ return {
         build = table.concat({
             -- tsc resolves imports by walking node_modules up from the
             -- source root; link the mounted closure there for the build.
-            "ln -s \"$SHUTTLE_DEPS_DIR/node_modules\" node_modules",
+            'ln -s "$SHUTTLE_DEPS_DIR/node_modules" node_modules',
             "node node_modules/typescript/bin/tsc -p tsconfig.json",
             "mkdir -p $STAGE/usr/lib/node_modules/@zvec/zvec-grep",
             "cp -r dist package.json $STAGE/usr/lib/node_modules/@zvec/zvec-grep/",
             -- Stage the whole closure (the llama backends never reached
             -- it — excluded at fetch time, see header).
-            "tar -C \"$SHUTTLE_DEPS_DIR\" -cf - node_modules | tar -C $STAGE/usr/lib/node_modules/@zvec/zvec-grep -xf -",
+            'tar -C "$SHUTTLE_DEPS_DIR" -cf - node_modules | tar -C $STAGE/usr/lib/node_modules/@zvec/zvec-grep -xf -',
         }, " && "),
 
         type = "source",

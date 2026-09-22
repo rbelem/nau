@@ -11,7 +11,7 @@ return {
     default = snap {
         name = "hello",
         version = "2.10",
-        summary = "GNU Hello, the \"hello world\" snap",
+        summary = 'GNU Hello, the "hello world" snap',
         description = [[
             GNU hello prints a friendly greeting.
             This is part of the snapcraft tour at https://snapcraft.io/
@@ -20,7 +20,7 @@ return {
         grade = "stable",
         confinement = "strict",
 
-            -- Source URL (like Nix's `src` or Snapcraft's `parts.*.source`).
+        -- Source URL (like Nix's `src` or Snapcraft's `parts.*.source`).
         -- In v1 this is informational — binaries come from ./stage/.
         -- Future phases will add fetching and building from source.
         source = "http://ftp.gnu.org/gnu/hello/hello-2.10.tar.gz",

@@ -64,9 +64,9 @@ return {
         -- the makeWrapper translated to a self-locating sh launcher.
         build = table.concat({
             "pkg=$STAGE/usr/lib/node_modules/@firecrawl/anydoc",
-            "mkdir -p \"$pkg\"",
-            "cp -r $SRC/main/. \"$pkg/\"",
-            "cp $SRC/addon/anydoc.linux-x64-gnu.node $SRC/addon/package.json \"$pkg/\"",
+            'mkdir -p "$pkg"',
+            'cp -r $SRC/main/. "$pkg/"',
+            'cp $SRC/addon/anydoc.linux-x64-gnu.node $SRC/addon/package.json "$pkg/"',
         }, " && "),
 
         type = "source",
