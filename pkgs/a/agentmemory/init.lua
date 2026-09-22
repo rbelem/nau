@@ -71,12 +71,16 @@ return {
         -- config surfaces into lib/node_modules/@agentmemory/agentmemory
         -- (the tarball ships plugin/ too — cursor/hooks/opencode payloads
         -- behind the flake's `[ -d plugin ]` conditional — copied the
-        -- same way), iii into usr/bin (its PATH-wrap, realized by the
-        -- launcher below), and a self-locating sh launcher instead of
-        -- makeWrapper: three-dirname resolves the payload root through
-        -- the farm's symlink chain, PATH gets the payload's usr/bin (so
-        -- the CLI's `iii` spawn resolves), then node runs the real
-        -- in-payload cli.mjs (a store-blob copy would lose its siblings).
+        -- same way), iii into usr/bin, and the production node_modules
+        -- closure staged next to dist/ (zg.lua tar-copy pattern) so the
+        -- bare imports resolve via node's upward node_modules walk.
+        -- NOTE: the CLI is exposed zg-style — app command pointing at
+        -- the payload-relative cli.mjs with interpreter = "node" — NOT
+        -- through a hand-rolled self-locating launcher: the pod install
+        -- materializes only claimed binaries into the generation's
+        -- apps/<pkg>/ tree (full payloads live in the store blob), so a
+        -- launcher assuming usr/lib beside usr/bin breaks. The farm
+        -- emitter resolves the store path at emit time.
         build = table.concat({
             "pkg=$STAGE/usr/lib/node_modules/@agentmemory/agentmemory",
             "mkdir -p \"$pkg\" $STAGE/usr/bin",
@@ -87,8 +91,6 @@ return {
             -- (see header) resolve via node's upward node_modules walk.
             "tar -C \"$SHUTTLE_DEPS_DIR\" -cf - node_modules | tar -C \"$pkg\" -xf -",
             "install -m755 $SRC/iii/iii $STAGE/usr/bin/iii",
-            "printf '%s\\n' '#!/bin/sh' 'root=$(dirname \"$(dirname \"$(dirname \"$0\")\")\")' 'PATH=\"$root/usr/bin:$PATH\"' 'exec node \"$root/usr/lib/node_modules/@agentmemory/agentmemory/dist/cli.mjs\" \"$@\"' > $STAGE/usr/bin/agentmemory",
-            "chmod +x $STAGE/usr/bin/agentmemory",
         }, " && "),
 
         type = "source",
@@ -96,7 +98,14 @@ return {
 
         apps = {
             agentmemory = app {
-                command = "usr/bin/agentmemory",
+                command = "usr/lib/node_modules/@agentmemory/agentmemory/dist/cli.mjs",
+                interpreter = "node",
+            },
+            -- The CLI spawns the bundled engine by bare name; exposing
+            -- it as an app puts the farm wrapper on the pod PATH so the
+            -- spawn resolves.
+            iii = app {
+                command = "usr/bin/iii",
             },
         },
     },
