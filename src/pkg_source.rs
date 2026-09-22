@@ -45,12 +45,8 @@ fn cache_root() -> PathBuf {
     PathBuf::from(home).join(".cache/shuttle/inputs")
 }
 
-/// Cache directory for a given github: URL.
-fn github_cache_dir(owner: &str, repo: &str, branch: &str) -> PathBuf {
-    github_cache_dir_in(&cache_root(), owner, repo, branch)
-}
-
-/// [`github_cache_dir`] under an explicit cache root (test injection).
+/// Cache directory for a github: URL, under an explicit cache root
+/// (test injection: pass `&cache_root()` in production).
 fn github_cache_dir_in(root: &Path, owner: &str, repo: &str, branch: &str) -> PathBuf {
     let key = format!("github:{owner}/{repo}/{branch}");
     let hash = sha256_hex(&key);
@@ -174,20 +170,15 @@ fn resolve_input_in(
     Ok(cache_dir)
 }
 
-/// Shallow-clone a GitHub repo into a cache directory.
-///
-/// Race-safe and idempotent: concurrent callers (parallel cargo test
-/// threads, two `shuttle build`s on a cold cache) clone into private
-/// temp dirs and the winner atomically claims `dest` via rename; losers
-/// reuse the winner's copy, which carries the same content for the same
-/// URL + branch. A stale non-repo directory from an older partial state
-/// is replaced.
-fn fetch_github(owner: &str, repo: &str, branch: &str, dest: &Path) -> miette::Result<()> {
-    let url = format!("https://github.com/{owner}/{repo}.git");
-
-    let parent = dest
-        .parent()
-        .ok_or_else(|| miette::miette!("cache dir {} has no parent", dest.display()))?;
+/// Shallow-clone `url` at `branch` into a fresh private temp dir under
+/// `parent` (the inputs cache root); the tree lands at `<tmp>/clone`.
+/// Callers claim their final cache slot by renaming that tree into place
+/// (see [`fetch_github`], [`claim_branch_slot`]).
+fn clone_github_branch(
+    url: &str,
+    branch: &str,
+    parent: &Path,
+) -> miette::Result<tempfile::TempDir> {
     std::fs::create_dir_all(parent)
         .map_err(|e| miette::miette!("failed to create cache dir {}: {e}", parent.display()))?;
 
@@ -203,7 +194,7 @@ fn fetch_github(owner: &str, repo: &str, branch: &str, dest: &Path) -> miette::R
             "--branch",
             branch,
             "--single-branch",
-            &url,
+            url,
             &tmp_path.to_string_lossy(),
         ])
         .stdout(std::process::Stdio::null())
@@ -217,6 +208,27 @@ fn fetch_github(owner: &str, repo: &str, branch: &str, dest: &Path) -> miette::R
             "failed to clone {url} (branch: {branch}): {stderr}"
         ));
     }
+    Ok(tmp)
+}
+
+/// Shallow-clone a GitHub repo into a cache directory.
+///
+/// Race-safe and idempotent: concurrent callers (parallel cargo test
+/// threads, two `shuttle build`s on a cold cache) clone into private
+/// temp dirs and the winner atomically claims `dest` via rename; losers
+/// reuse the winner's copy, which carries the same content for the same
+/// URL + branch. A stale non-repo directory from an older partial state
+/// is replaced. The clone URL goes through [`repo_clone_url_in`], so
+/// fixture cache roots serve local repos in tests and production roots
+/// always hit github.com.
+fn fetch_github(owner: &str, repo: &str, branch: &str, dest: &Path) -> miette::Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| miette::miette!("cache dir {} has no parent", dest.display()))?;
+    let url = repo_clone_url_in(parent, owner, repo);
+
+    let tmp = clone_github_branch(&url, branch, parent)?;
+    let tmp_path = tmp.path().join("clone");
 
     match std::fs::rename(&tmp_path, dest) {
         Ok(()) => Ok(()),
@@ -241,21 +253,104 @@ fn fetch_github(owner: &str, repo: &str, branch: &str, dest: &Path) -> miette::R
     }
 }
 
+/// HEAD commit SHA of a clone tree; `None` when git cannot answer
+/// (partial tree, not a repository).
+fn dir_head(dir: &Path) -> Option<String> {
+    git_out(&["-C", &dir.to_string_lossy(), "rev-parse", "HEAD"])
+        .ok()
+        .map(|out| out.trim().to_string())
+}
+
+/// Bounded retries for the refresh claim loop (see [`refresh_input_in`]).
+const REFRESH_CLAIM_ATTEMPTS: usize = 3;
+
+/// Move `dest` aside and install the fresh `clone` tree in its place.
+///
+/// Returns `true` when `clone` is now at `dest` — the previous tree, if
+/// any, is deleted only after the install succeeds. Returns `false` when
+/// a concurrent winner re-claimed `dest` between our move-aside and our
+/// rename; its tree is left in place for the caller to judge.
+///
+/// Reader safety (issue #122): a reader holding the `dest` path observes
+/// either the old tree or the new tree, never a torn one; only for the
+/// instant between the two renames may the path be absent. Fully atomic
+/// reader isolation would need generation directories — deliberately not
+/// built; rename-swap makes the common cases (resolve-then-read,
+/// `shuttle index update` alongside a build) safe.
+fn claim_branch_slot(clone: &Path, dest: &Path) -> miette::Result<bool> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| miette::miette!("cache dir {} has no parent", dest.display()))?;
+    let aside = tempfile::TempDir::new_in(parent)
+        .map_err(|e| miette::miette!("failed to create temp dir: {e}"))?;
+    if dest.exists() {
+        std::fs::rename(dest, aside.path().join("old"))
+            .map_err(|e| miette::miette!("failed to move aside {}: {e}", dest.display()))?;
+    }
+    match std::fs::rename(clone, dest) {
+        Ok(()) => {
+            drop(aside); // removes the replaced generation
+            Ok(true)
+        }
+        // Lost the install to a concurrent winner: keep its tree.
+        Err(_) if dest.join(".git").exists() => {
+            drop(aside);
+            Ok(false)
+        }
+        Err(e) => Err(miette::miette!(
+            "failed to claim cache dir {}: {e}",
+            dest.display()
+        )),
+    }
+}
+
 /// Re-fetch a cached GitHub input (for `shuttle index update`).
 pub fn refresh_input(input: &PackageInput) -> miette::Result<()> {
-    let url = &input.url;
-    if let Some((owner, repo, branch)) = parse_github_url(url) {
-        let cache_dir = github_cache_dir(owner, repo, branch);
+    refresh_input_in(&cache_root(), input)
+}
 
-        if cache_dir.exists() {
-            std::fs::remove_dir_all(&cache_dir)
-                .map_err(|e| miette::miette!("failed to remove old cache: {e}"))?;
-        }
-        fetch_github(owner, repo, branch, &cache_dir)
-    } else {
+/// [`refresh_input`] under an explicit cache root (test injection).
+///
+/// Refresh semantics (issue #122): clone the current head into a private
+/// temp dir first, then claim the branch-head cache slot with that fresh
+/// clone. Refresh never reuses whatever already sits in the slot, so a
+/// concurrent resolver can no longer make it return Ok having refreshed
+/// nothing; and the previous tree is only dropped after the new one is
+/// installed, so a failed clone leaves the old cache intact. A resolver
+/// that wins the install race instead is accepted only when its tree
+/// serves the same head (checked by SHA); otherwise the swap retries.
+/// Non-github URLs (local paths) need no refresh.
+fn refresh_input_in(root: &Path, input: &PackageInput) -> miette::Result<()> {
+    let url = &input.url;
+    let Some((owner, repo, branch)) = parse_github_url(url) else {
         // Local paths don't need refreshing
-        Ok(())
+        return Ok(());
+    };
+    let cache_dir = github_cache_dir_in(root, owner, repo, branch);
+    let parent = cache_dir
+        .parent()
+        .ok_or_else(|| miette::miette!("cache dir {} has no parent", cache_dir.display()))?;
+
+    let clone_url = repo_clone_url_in(root, owner, repo);
+    let tmp = clone_github_branch(&clone_url, branch, parent)?;
+    let clone = tmp.path().join("clone");
+    let my_head = dir_head(&clone)
+        .ok_or_else(|| miette::miette!("refreshed clone of {url} has no HEAD commit"))?;
+
+    for _ in 0..REFRESH_CLAIM_ATTEMPTS {
+        if claim_branch_slot(&clone, &cache_dir)? {
+            return Ok(());
+        }
+        // A concurrent resolver claimed the slot first. Its tree counts as
+        // refreshed iff it serves the head we cloned; an older tree (its
+        // clone started before ours) is swapped out on the next attempt.
+        if dir_head(&cache_dir).as_deref() == Some(my_head.as_str()) {
+            return Ok(());
+        }
     }
+    Err(miette::miette!(
+        "failed to refresh {url}: another process keeps claiming the cache slot"
+    ))
 }
 
 // ── Input locking (Phase 16) ──
@@ -1234,7 +1329,7 @@ mod tests {
     #[test]
     fn test_pinned_cache_dir_differs_from_branch_dir() {
         let root = cache_root();
-        let branch = github_cache_dir("o", "r", "main");
+        let branch = github_cache_dir_in(&cache_root(), "o", "r", "main");
         let pinned = pinned_cache_dir_in(&root, "o", "r", "abc123");
         let pinned2 = pinned_cache_dir_in(&root, "o", "r", "def456");
         assert_ne!(branch, pinned);
@@ -1813,6 +1908,130 @@ mod tests {
         assert!(
             err.contains("applies to git inputs only"),
             "named path-input error required, got: {err}"
+        );
+    }
+
+    // ── Branch-head refresh races (issue #122) ──
+
+    /// Seed a branch fixture repo under the cache root's `__repos__/`
+    /// seam; returns (repo dir, HEAD sha).
+    fn seed_branch_fixture(root: &Path, name: &str, body: &str) -> (PathBuf, String) {
+        let repos = root.join("__repos__/shuttle-test-fixture");
+        std::fs::create_dir_all(&repos).unwrap();
+        fixture_repo(&repos, name, body)
+    }
+
+    fn branch_input(name: &str) -> PackageInput {
+        PackageInput {
+            url: format!("github:shuttle-test-fixture/{name}/main"),
+            submodules: None,
+        }
+    }
+
+    #[test]
+    fn test_refresh_input_fetches_into_empty_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, rev) = seed_branch_fixture(root.path(), "refresh-empty", "v1\n");
+
+        refresh_input_in(root.path(), &branch_input("refresh-empty")).unwrap();
+
+        let dest =
+            github_cache_dir_in(root.path(), "shuttle-test-fixture", "refresh-empty", "main");
+        assert_eq!(dir_head(&dest).as_deref(), Some(rev.as_str()));
+        assert_eq!(
+            std::fs::read_to_string(dest.join("file.txt")).unwrap(),
+            "v1\n"
+        );
+    }
+
+    #[test]
+    fn test_refresh_input_updates_stale_cache() {
+        // The core #122 contract: a slot already holding a VALID tree of
+        // the same input must be replaced by the refreshed clone, never
+        // silently reused (the old remove-then-fetch could return Ok with
+        // a concurrent resolver's stale tree still in place).
+        let root = tempfile::tempdir().unwrap();
+        let (repo, _rev1) = seed_branch_fixture(root.path(), "refresh-stale", "v1\n");
+        refresh_input_in(root.path(), &branch_input("refresh-stale")).unwrap();
+
+        // Move the fixture forward after the first refresh.
+        std::fs::write(repo.join("file.txt"), "v2\n").unwrap();
+        git(Some(&repo), &["add", "-A"]).unwrap();
+        git(Some(&repo), &["commit", "--quiet", "-m", "v2"]).unwrap();
+        let rev2 = git_out(&["-C", &repo.to_string_lossy(), "rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        refresh_input_in(root.path(), &branch_input("refresh-stale")).unwrap();
+
+        let dest =
+            github_cache_dir_in(root.path(), "shuttle-test-fixture", "refresh-stale", "main");
+        assert_eq!(
+            dir_head(&dest).as_deref(),
+            Some(rev2.as_str()),
+            "refresh must replace a valid-but-stale cache tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("file.txt")).unwrap(),
+            "v2\n"
+        );
+    }
+
+    #[test]
+    fn test_refresh_input_path_is_noop() {
+        let input_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let input = PackageInput {
+            url: format!("path:{}", input_dir.path().display()),
+            submodules: None,
+        };
+        refresh_input_in(root.path(), &input).unwrap();
+        let created: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            created.is_empty(),
+            "path refresh must touch nothing, got {created:?}"
+        );
+    }
+
+    #[test]
+    fn test_claim_branch_slot_replaces_occupied_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let dest = root.join("slot");
+        std::fs::create_dir_all(dest.join(".git")).unwrap();
+        std::fs::write(dest.join("old.txt"), b"old").unwrap();
+
+        // A fresh clone staged in a private temp dir, as
+        // clone_github_branch stages it.
+        let staging = tempfile::TempDir::new_in(root).unwrap();
+        let clone = staging.path().join("clone");
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+        std::fs::write(clone.join("new.txt"), b"new").unwrap();
+
+        let installed = claim_branch_slot(&clone, &dest).unwrap();
+        drop(staging); // clone was renamed out; release the empty container
+
+        assert!(installed, "an unclaimed slot installs on the first attempt");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("new.txt")).unwrap(),
+            "new"
+        );
+        assert!(
+            !dest.join("old.txt").exists(),
+            "the replaced generation must be gone after install"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec!["slot".to_string()],
+            "swap must leave no litter behind, found: {leftovers:?}"
         );
     }
 }
