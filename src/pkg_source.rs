@@ -53,6 +53,49 @@ fn github_cache_dir_in(root: &Path, owner: &str, repo: &str, branch: &str) -> Pa
     root.join(&hash[..16])
 }
 
+// ── Clone-litter sweep (issue #123) ──
+
+/// Filename prefix `tempfile` uses for its private temp dirs
+/// (`TempDir::new_in`), which double as the aside containers of
+/// [`claim_branch_slot`].
+const TMP_LITTER_PREFIX: &str = ".tmp";
+
+/// Clone litter older than this is unreachable scratch from a killed
+/// process: a live shallow clone claims its slot within minutes, so a
+/// day-old `.tmp*` directory under the inputs cache root can only be a
+/// leak (SIGKILL between clone and rename).
+const TMP_CLONE_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Best-effort removal of stale clone-litter dirs (`.tmp*`, older than
+/// `cutoff`) under `root`. Runs before each clone so the `.tmpXXXXXX/`
+/// dirs a SIGKILLed process leaks are reclaimed on the next fetch
+/// without a dedicated cache verb. Only directories count; per-entry
+/// errors are ignored — litter removal must never fail a live fetch.
+fn sweep_tmp_litter(root: &Path, cutoff: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_litter = entry.file_type().is_ok_and(|t| t.is_dir())
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TMP_LITTER_PREFIX);
+        if !is_litter {
+            continue;
+        }
+        let stale = entry
+            .path()
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|mtime| mtime <= cutoff)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 // ── Input resolution ──
 
 /// Split a `github:owner/repo[/branch]` URL into `(owner, repo, branch)`.
@@ -181,6 +224,7 @@ fn clone_github_branch(
 ) -> miette::Result<tempfile::TempDir> {
     std::fs::create_dir_all(parent)
         .map_err(|e| miette::miette!("failed to create cache dir {}: {e}", parent.display()))?;
+    sweep_tmp_litter(parent, std::time::SystemTime::now() - TMP_CLONE_STALE_AFTER);
 
     let tmp = tempfile::TempDir::new_in(parent)
         .map_err(|e| miette::miette!("failed to create temp dir: {e}"))?;
@@ -2033,5 +2077,45 @@ mod tests {
             vec!["slot".to_string()],
             "swap must leave no litter behind, found: {leftovers:?}"
         );
+    }
+
+    // ── Clone-litter sweep (issue #123) ──
+
+    #[test]
+    fn test_sweep_tmp_litter_removes_only_stale_tmp_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [".tmpold", ".tmpnew", "keepme"] {
+            std::fs::create_dir_all(root.path().join(name)).unwrap();
+        }
+        // A .tmp-prefixed FILE is not clone litter (only dirs are swept).
+        std::fs::write(root.path().join(".tmpfile"), b"x").unwrap();
+
+        // Cutoff in the future: every directory counts as stale, but only
+        // .tmp-prefixed directories qualify as litter.
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        sweep_tmp_litter(root.path(), future);
+
+        let mut left: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![".tmpfile", "keepme"],
+            "only .tmp dirs are litter"
+        );
+    }
+
+    #[test]
+    fn test_sweep_tmp_litter_keeps_recent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".tmpfresh")).unwrap();
+
+        // Epoch cutoff: nothing is older than the epoch, so a live clone's
+        // young temp dir is never swept.
+        sweep_tmp_litter(root.path(), std::time::SystemTime::UNIX_EPOCH);
+
+        assert!(root.path().join(".tmpfresh").exists());
     }
 }
