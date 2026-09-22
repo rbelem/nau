@@ -11,6 +11,14 @@ The login shell is already devbox-free: it sources the pod shellenv
 `LD_LIBRARY_PATH`. That leak breaks devbox's own node (`node: symbol lookup
 error`), so every devbox runner is invoked with `env -u LD_LIBRARY_PATH`.
 
+Related leak: the farm's ld-wrapper can resolve even the *system* `curl` to a
+pod's libcurl (`…/generations/<n>/ld-wrappers/.../libcurl.so.4`), which may
+ship no CA bundle — a host-side HTTPS fetch then fails TLS despite a clean
+PATH (the #130 bug, live on the host until the pod syncs a fixed generation).
+Before trusting a fetch's TLS result here, export the host bundle:
+`export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt`. Transient `x509`
+failures from `gh`/watchers get an immediate retry/re-arm, not dismissal.
+
 | Task | Command | Expands to |
 | --- | --- | --- |
 | Debug build | `env -u LD_LIBRARY_PATH devbox run -- build` | `cargo build` |
@@ -69,3 +77,14 @@ one-off variables with `--env`/`--env-file`.
 - Tests run offline. Where a registry or proxy is required (dependency-fetch
   tests), the suite uses loopback fixtures under `tests/fixtures/` — no
   external service or network access.
+- **Asserting on rendered stderr:** errors render through `miette`, which
+  wraps captured stderr at 80 columns with `│` gutters. Integration tests must
+  assert short per-line fragments (`"held package 'zgotmp'"`,
+  `"dependency closure"`), never a phrase long enough to straddle a wrap
+  boundary — a `contains()` on a split phrase fails even though the exact
+  sentence was printed.
+- **Gated tests skip silently.** `gated_test!` early-returns with an eprintln
+  when its tool is absent (issue #134 tracks a fail-loud canary). A green
+  local run proves nothing for gated tests: when a PR's proof rests on them,
+  grep the CI run log for their `... ok` lines and do not merge on a run
+  where they were skipped.
