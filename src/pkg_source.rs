@@ -175,13 +175,25 @@ fn resolve_input_in(
 }
 
 /// Shallow-clone a GitHub repo into a cache directory.
+///
+/// Race-safe and idempotent: concurrent callers (parallel cargo test
+/// threads, two `shuttle build`s on a cold cache) clone into private
+/// temp dirs and the winner atomically claims `dest` via rename; losers
+/// reuse the winner's copy, which carries the same content for the same
+/// URL + branch. A stale non-repo directory from an older partial state
+/// is replaced.
 fn fetch_github(owner: &str, repo: &str, branch: &str, dest: &Path) -> miette::Result<()> {
     let url = format!("https://github.com/{owner}/{repo}.git");
 
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| miette::miette!("failed to create cache dir {}: {e}", parent.display()))?;
-    }
+    let parent = dest
+        .parent()
+        .ok_or_else(|| miette::miette!("cache dir {} has no parent", dest.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| miette::miette!("failed to create cache dir {}: {e}", parent.display()))?;
+
+    let tmp = tempfile::TempDir::new_in(parent)
+        .map_err(|e| miette::miette!("failed to create temp dir: {e}"))?;
+    let tmp_path = tmp.path().join("clone");
 
     let output = std::process::Command::new("git")
         .args([
@@ -192,7 +204,7 @@ fn fetch_github(owner: &str, repo: &str, branch: &str, dest: &Path) -> miette::R
             branch,
             "--single-branch",
             &url,
-            &dest.to_string_lossy(),
+            &tmp_path.to_string_lossy(),
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -201,14 +213,23 @@ fn fetch_github(owner: &str, repo: &str, branch: &str, dest: &Path) -> miette::R
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Clean up partial clone
-        let _ = std::fs::remove_dir_all(dest);
         return Err(miette::miette!(
             "failed to clone {url} (branch: {branch}): {stderr}"
         ));
     }
 
-    Ok(())
+    match std::fs::rename(&tmp_path, dest) {
+        Ok(()) => Ok(()),
+        // Lost the race to a concurrent winner: same URL + branch, same
+        // content — reuse it.
+        Err(_) if dest.join(".git").exists() => Ok(()),
+        // Stale or partial directory from an older state: replace it.
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(dest);
+            std::fs::rename(&tmp_path, dest)
+                .map_err(|e| miette::miette!("failed to claim cache dir {}: {e}", dest.display()))
+        }
+    }
 }
 
 /// Re-fetch a cached GitHub input (for `shuttle index update`).
