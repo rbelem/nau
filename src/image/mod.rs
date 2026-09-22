@@ -6993,10 +6993,38 @@ RequiredBy=boot-complete.target
             }
         }
 
+        /// Restore HOME on drop (even on panic): the tempdir a HOME-mutating
+        /// test installs is deleted when its body ends, and a concurrently
+        /// started test must never resolve HOME into it.
+        struct HomeGuard {
+            old: Option<String>,
+        }
+
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                match self.old.take() {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+
         #[test]
         fn build_disk_image_with_ab_and_update_source_emits_sysupdate_units() {
             let stub_dir = tempfile::tempdir().unwrap();
             let _path_guard = stub_disk_tool_path(stub_dir.path());
+
+            // #121: the update_source build fails closed without a signing
+            // key under $HOME — right for production, host-state-dependent
+            // for a test. Point HOME at a tempdir and mint a throwaway key
+            // through the same calls `shuttle key keygen` makes, so the test
+            // is hermetic and CI needs no key step.
+            let old_home = std::env::var("HOME").ok();
+            let home_dir = tempfile::tempdir().unwrap();
+            std::env::set_var("HOME", home_dir.path());
+            let _home_guard = HomeGuard { old: old_home };
+            let kp = crate::sign::create_secret_key(home_dir.path()).unwrap();
+            crate::sign::install_public_key(&kp, &crate::sign::keys_dir(home_dir.path())).unwrap();
 
             let (_cache_dir, cache, digest) = cache_fixture();
             let image = ImageDeclaration {
