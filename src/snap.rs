@@ -197,6 +197,25 @@ pub struct PackageDeps {
     pub go: Option<DepsLockSpec>,
 }
 
+impl PackageDeps {
+    /// True when every declared lockfile is recipe-local
+    /// (`recipe/`-prefixed): those resolve against the recipe directory
+    /// (the ADR-0017 addendum — the lockfile ships beside the recipe),
+    /// not a source tree, so the closure can fetch without a `source`.
+    /// The `deps`+`source` parse check relaxes on this predicate; the
+    /// motivating shape is a multi-source build (issue #41 `sources`)
+    /// that vendors an ecosystem closure from a recipe-local lock while
+    /// `sources` delivers the artifacts the no-network sandbox cannot
+    /// fetch (agentmemory: npm closure + pinned iii binary).
+    pub fn all_locks_recipe_local(&self) -> bool {
+        let specs = [&self.npm, &self.pip, &self.cargo, &self.go];
+        specs.iter().all(|s| {
+            s.as_ref()
+                .is_none_or(|spec| spec.lock.starts_with("recipe/"))
+        })
+    }
+}
+
 /// One ecosystem resolver's spec: its lockfile (relative to the source
 /// root, or `recipe/`-prefixed to resolve against the package recipe
 /// directory — the lockfile ships beside the recipe; fail-closed, no
@@ -207,8 +226,7 @@ pub struct PackageDeps {
 pub struct DepsLockSpec {
     /// Lockfile path relative to the source root (e.g.
     /// "package-lock.json", "requirements.lock", "go.mod"), or
-    /// `recipe/<path>` to resolve against the package recipe directory
-    /// (the dir holding the package's `init.lua` or single `<name>.lua`).
+    /// `recipe/<path>` to resolve against the package recipe directory    /// (the dir holding the package's `init.lua` or single `<name>.lua`).
     /// Plain values fall back to the recipe dir when the source tree has
     /// no lockfile; `recipe/` values never fall back to the source tree.
     /// go's `sum` (go.sum) follows the same rules, its `recipe/` sibling
@@ -1711,15 +1729,21 @@ impl SnapMeta {
         let deps = get_opt_table(table, "deps")?
             .map(|t| package_deps_from_lua(&t))
             .transpose()?;
-        // A dependency closure resolves from the source tree (the lockfile
-        // ships in the source tarball), so `deps` without `source` can
-        // never fetch. Fail at the parse boundary, not mid-fetch.
-        // Multi-source (`sources`) has no single tree for a lockfile to
-        // ship in — the single-source requirement covers it too.
+        // A dependency closure resolves from ONE of two roots: the
+        // source tree (the lockfile ships in the source tarball) or the
+        // recipe directory (the ADR-0017-addendum `recipe/` prefix — the
+        // lockfile ships beside the recipe). `deps` therefore fails the
+        // parse boundary only when it can resolve from NEITHER: a
+        // source-relative lockfile without `source`. Recipe-local locks
+        // need no source at all — which is what lets a multi-source
+        // build (issue #41 `sources`) carry an ecosystem closure.
         if deps.is_some() && source.is_none() {
-            return Err(miette::miette!(
-                "snap meta: 'deps' requires 'source' — the lockfile resolves from the package source tree"
-            ));
+            let all_recipe_local = deps.as_ref().is_some_and(|d| d.all_locks_recipe_local());
+            if !all_recipe_local {
+                return Err(miette::miette!(
+                    "snap meta: 'deps' requires 'source' — the lockfile resolves from the package source tree"
+                ));
+            }
         }
         // The adopt-info ladder reads ONE pinned source tree (its
         // extractors resolve relative to `$SRC`). With named sources there
@@ -6616,6 +6640,57 @@ mod tests {
             .eval(r#"return { lock = "l", python = "3.14" }"#)
             .unwrap();
         assert!(deps_lock_spec_from_lua("npm", &npm_table).is_err());
+    }
+
+    /// A deps block whose lockfiles are ALL recipe-local resolves from
+    /// the recipe directory (ADR-0017 addendum) — it needs no `source`,
+    /// which is what lets a multi-source build (`sources`) carry an
+    /// ecosystem closure (agentmemory: recipe-local npm lock + a
+    /// `sources` map for the artifacts the sandbox cannot fetch).
+    #[test]
+    fn deps_recipe_local_locks_parse_without_source() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "agentmemory", version = "0.9.29",
+                sources = {
+                    npm = {
+                        url = "https://example.com/pkg.tgz",
+                        sha256 = "e9b1d4d5f3c0b2a1d9c8f7e6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b",
+                    },
+                },
+                deps = { npm = { lock = "recipe/package-lock.json" } },
+            }
+            "#,
+            )
+            .unwrap();
+        let meta = SnapMeta::from_lua_table(&table).unwrap();
+        assert!(meta.deps.as_ref().unwrap().all_locks_recipe_local());
+    }
+
+    /// A source-relative lockfile has no recipe-dir fallback: without
+    /// `source` the closure could never fetch — still fail at the
+    /// parse boundary (the Lua prelude rejects first; the Rust
+    /// boundary mirrors it).
+    #[test]
+    fn deps_source_relative_lock_still_requires_source() {
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return snap {
+                name = "hybrid", version = "1.0",
+                deps = { cargo = { lock = "Cargo.lock" } },
+            }
+            "#,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("'deps' requires 'source'"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Evaluate with DSL and get top-level table (keeps Lua alive for the duration).

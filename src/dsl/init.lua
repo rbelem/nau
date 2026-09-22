@@ -107,6 +107,25 @@ end
 -- @param opts table with snap metadata fields
 -- @return the validated opts table
 -- @usage snap { name = "my-snap", version = "1.0", apps = { ... } }
+-- True when every resolver in a deps table declares a recipe-local
+-- lockfile (`recipe/` prefix): those resolve against the recipe
+-- directory (ADR-0017 addendum — the file ships beside init.lua), not
+-- the package source tree, so the deps block can fetch without
+-- `source`. Mirrors PackageDeps::all_locks_recipe_local at the Rust
+-- parse boundary.
+local function deps_all_recipe_local(deps)
+    for eco, resolver in pairs(deps) do
+        local lock_field = resolver.lock
+        if eco == "go" and (resolver.mods ~= nil or lock_field == nil) then
+            lock_field = resolver.mods
+        end
+        if type(lock_field) ~= "string" or string.sub(lock_field, 1, 7) ~= "recipe/" then
+            return false
+        end
+    end
+    return true
+end
+
 function snap(opts)
     if type(opts) ~= "table" then
         error("snap(): expected a table, got " .. type(opts), 2)
@@ -489,7 +508,16 @@ function snap(opts)
         if #resolvers == 0 then
             error("snap(): deps must name at least one resolver: npm, pip, cargo, or go", 2)
         end
-        if opts.source == nil then
+        -- `source` is required only when a lockfile must resolve from
+        -- the package source tree. A `recipe/`-prefixed lockfile
+        -- resolves against the recipe directory (ADR-0017 addendum —
+        -- the file ships beside this init.lua), so a deps block whose
+        -- lockfiles are ALL recipe-local needs no source at all: that
+        -- is what lets a multi-source build (`sources`, issue #41)
+        -- carry an ecosystem closure alongside build artifacts the
+        -- no-network sandbox cannot fetch. Mirrors PackageDeps::
+        -- all_locks_recipe_local at the Rust parse boundary.
+        if opts.source == nil and not deps_all_recipe_local(opts.deps) then
             error("snap(): 'deps' requires 'source' — the lockfile resolves from the package source tree", 2)
         end
     end
