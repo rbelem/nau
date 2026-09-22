@@ -12,7 +12,8 @@ YAML needed. Pins all inputs by content hash for reproducible builds.
 curl -fsSL https://raw.githubusercontent.com/rbelem/shuttle/main/install.sh | bash
 ```
 
-Installs to `~/.local/bin/shuttle` and `~/.local/share/shuttle/repo` (managed
+Installs to `~/.local/bin/shuttle` (plus an `stl` symlink for 3-key
+invocation) and `~/.local/share/shuttle/repo` (managed
 source clone, used for updates — re-run the installer to update). Bootstraps
 rustup if cargo is missing and installs distro packages (`squashfs-tools`,
 `bubblewrap`) with sudo when absent; `--skip-deps` to manage those yourself.

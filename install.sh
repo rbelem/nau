@@ -3,6 +3,7 @@
 #
 # Installs into the user's home, no root-owned files:
 #   ~/.local/bin/shuttle          the binary
+#   ~/.local/bin/stl              symlink to shuttle (3-key alias)
 #   ~/.local/share/shuttle/repo   managed source clone (builds + updates)
 #   ~/.cargo, ~/.rustup           rust toolchain, bootstrapped only if cargo is missing
 #
@@ -169,6 +170,7 @@ BIN_DIR="$PREFIX/bin"
 log "installing to $BIN_DIR/shuttle"
 run mkdir -p "$BIN_DIR"
 run install -m 755 "$SRC_DIR/target/release/shuttle" "$BIN_DIR/shuttle"
+run ln -sfn shuttle "$BIN_DIR/stl"
 
 # ── Verify ───────────────────────────────────────────────────────────────
 if [ "$DRY_RUN" != 1 ]; then

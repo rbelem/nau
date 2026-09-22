@@ -10,7 +10,9 @@
 -- tree_sitter_perl/__init__.py, a binding.c exposing tree_sitter_perl()
 -- as a PyCapsule, and a setup.py building the limited-API extension
 -- (Py_LIMITED_API=0x030A0000 → abi3) from binding.c + src/parser.c +
--- src/scanner.c. Pure C (the external scanner is scanner.c, not C++),
+-- src/scanner.c, compiled directly with cc — the pool python
+-- (python-build-standalone) ships no setuptools, so distutils is not an
+-- option. Pure C (the external scanner is scanner.c, not C++),
 -- so the .so needs neither libstdcpp nor libgcc. Library-only — no
 -- console scripts, no apps; consumers import it from a pod python3.
 --
@@ -82,26 +84,8 @@ return {
             "    return PyModule_Create(&_module);",
             "}",
             "EOF",
-            "cat > setup.py <<'EOF'",
-            "from setuptools import Extension, setup",
-            "",
-            "setup(",
-            "    name=\"tree-sitter-perl\",",
-            "    version=\"2.0.0\",",
-            "    packages=[\"tree_sitter_perl\"],",
-            "    ext_package=\"tree_sitter_perl\",",
-            "    ext_modules=[",
-            "        Extension(",
-            "            name=\"_binding\",",
-            "            sources=[\"binding.c\", \"src/parser.c\", \"src/scanner.c\"],",
-            "            include_dirs=[\"src\"],",
-            "            define_macros=[(\"Py_LIMITED_API\", \"0x030A0000\")],",
-            "            py_limited_api=True,",
-            "        )",
-            "    ],",
-            ")",
-            "EOF",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/python3\" setup.py build_ext --inplace",
+            "PYINC=$($SHUTTLE_BUILD_PREFIX/usr/bin/python3 -c 'import sysconfig; print(sysconfig.get_paths()[\"include\"])')",
+            "cc -shared -fPIC -O2 -I\"$PYINC\" -Isrc -DPy_LIMITED_API=0x030A0000 binding.c src/parser.c src/scanner.c -o tree_sitter_perl/_binding.so",
             -- The flake's pythonImportsCheck, against the built tree.
             "PYTHONPATH=$PWD \"$SHUTTLE_BUILD_PREFIX/usr/bin/python3\" -c \"import tree_sitter_perl\"",
             -- Stage as the whichllm pattern, minus console scripts.
