@@ -312,6 +312,19 @@ pub fn farm_dir(store: &RuntimeStore, n: u64) -> PathBuf {
     store.generation_dir(n).join(FARM_DIR)
 }
 
+/// Cheap link-name validation at the farm seam (issue #135): the name
+/// is `join`ed under the farm dir, so an absolute path or a `..`
+/// component would write the symlink outside the farm. Refuse named.
+fn check_farm_link_name(kind: &str, name: &str, pkg: &str) -> miette::Result<()> {
+    if name.starts_with('/') || name.split('/').any(|c| c == "..") {
+        miette::bail!(
+            "package '{pkg}': {kind} name '{name}' is not a bare name — refusing \
+             to link it outside the bin farm"
+        );
+    }
+    Ok(())
+}
+
 /// Emit (rebuild) the farm for generation `n` from its manifest and
 /// return the farm path.
 ///
@@ -362,6 +375,7 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
                 );
             }
             seen.insert(app, (&pkg.name, pkg.layer));
+            check_farm_link_name("app", app, &pkg.name)?;
             let link = farm.join(app);
             // Same-content collisions leave identical links; differing
             // content must not accumulate — replace, never merge.
@@ -389,6 +403,7 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
                 );
             }
             seen.insert(svc, (&pkg.name, pkg.layer));
+            check_farm_link_name("service binary", svc, &pkg.name)?;
             let link = farm.join(svc);
             let _ = std::fs::remove_file(&link);
             let target = if ships_libs {

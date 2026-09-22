@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Allow unprivileged userns (bubblewrap sandbox)
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -36,28 +36,28 @@ jobs:
       - name: Install golang (go-deps tests build inside the sandbox)
         run: sudo apt-get install -y --no-install-recommends golang-go
 
+      # Same enable-cache rationale as CI's check job: snapshot the
+      # /nix/store closure keyed on devbox.lock instead of re-pulling
+      # ~1.5 GiB per run; ~10 GB actions/cache repo cap and the qemu
+      # closure are the caveats, first runs only populate the cache.
       - name: Install devbox
-        uses: jetify-com/devbox-install-action@v0.12.0
+        uses: jetify-com/devbox-install-action@734088efddca47cf44ff8a09289c6d0e51b73218 # v0.12.0
         with:
           project-path: .
           devbox-version: 0.18.3
+          enable-cache: true
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           prefix-key: rust-1.97.1
           cache-on-failure: true
           workspaces: .
 
-      # Same unprivileged-build sequence as CI's check job: the binary
-      # must exist before the guarded key mint, and the mint must happen
-      # before the instrumented test run (the image command-seam tests
-      # build a real A/B disk, which fails closed without a signing key).
+      # Same unprivileged-build sequence as CI's check job: build before
+      # the instrumented test run.
       - name: Build
         run: devbox run -- build
-
-      - name: Mint the image-signing key
-        run: test -f ~/.config/shuttle/secret-key || devbox run -- ./target/debug/shuttle key keygen
 
       # The devbox rustc has no rustup llvm-tools; cargo-llvm-cov takes
       # the LLVM pair through env vars (its documented seam — see

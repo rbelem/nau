@@ -1059,6 +1059,44 @@ fn refuse_loaded_blob_pins(
     visit(root, pod_name, decl, &mut visited)
 }
 
+/// Sibling pods whose load graph (transitively) reaches `pod_name`
+/// (issue #135 loader-side brick): once this pod carries a blob pin,
+/// [`refuse_loaded_blob_pins`] refuses every mutating verb of each of
+/// them. Best-effort read-only scan — a pod without a declaration or
+/// with an unreadable one is skipped; the warning must never fail the
+/// add.
+fn pods_loading(root: &Path, pod_name: &str) -> Vec<String> {
+    fn reaches(root: &Path, from: &str, target: &str, seen: &mut HashSet<String>) -> bool {
+        let Ok(decl) = load_declaration(root, from) else {
+            return false;
+        };
+        for loaded in &decl.loads {
+            if loaded == target
+                || (seen.insert(loaded.clone()) && reaches(root, loaded, target, seen))
+            {
+                return true;
+            }
+        }
+        false
+    }
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == pod_name || !pod_lua_path(root, &name).is_file() {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        if reaches(root, &name, pod_name, &mut seen) {
+            out.push(name);
+        }
+    }
+    out.sort();
+    out
+}
+
 /// DFS over the load graph reachable from `start`: a pod revisited on
 /// the current path is a cycle, named in full (`work -> base -> work`).
 /// Fully-explored pods are memoized — a DAG branch is walked once.
@@ -1283,9 +1321,27 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
         .map_err(|e| miette::miette!("cannot add '{}': {e}", spec.name))?;
 
     let mut decl = load_declaration_or_default(root, pod_name)?;
+    let lock = LockFile::load(&pod_lock_path(root, pod_name))?;
     for existing in &decl.packages {
         let parsed = parse_pod_package(existing)?;
         if parsed.name == spec.name {
+            if lock
+                .as_ref()
+                .is_some_and(|l| l.snaps.contains_key(&spec.name))
+            {
+                // Blob pin (issue #135): the generic escape below is
+                // false here — sync HOLDS a blob pin (no collection
+                // recipe to rebuild); name the real escapes.
+                miette::bail!(
+                    "package '{}' is already in pod '{}' as a sideloaded blob \
+                     pin — `shuttle pod sync` holds it at its pin (no collection \
+                     recipe to rebuild); re-run `shuttle pod add --snap` to move \
+                     the pin, or `shuttle pod remove '{}'` first",
+                    spec.name,
+                    pod_name,
+                    spec.name
+                );
+            }
             miette::bail!(
                 "package '{}' is already in pod '{}' (remove it first to change its \
                  constraint; `shuttle pod sync` rebuilds it at its pins)",
@@ -1501,7 +1557,7 @@ pub fn add_snap_pod(
     // Filename↔meta identity (the `pending_from_blob` rule, copied):
     // the artifact filename is a claim about the payload; a mismatch
     // refuses fail-closed.
-    if let Ok((fname, fversion, _arch)) = crate::oci::parse_artifact_filename(payload) {
+    if let Ok((fname, fversion, arch)) = crate::oci::parse_artifact_filename(payload) {
         if fname != name {
             miette::bail!(
                 "{}: filename says '{fname}' but meta/snap.yaml says '{name}' — \
@@ -1515,6 +1571,22 @@ pub fn add_snap_pod(
                  {version} — refusing to sideload (fail-closed)",
                 payload.display()
             );
+        }
+        // Architecture gate (issue #133): the filename arch is a claim
+        // about the payload; a mismatch with the host refuses before any
+        // write — a foreign blob would install clean and fail only at
+        // exec. A filename without an arch component makes no claim.
+        if let Some(arch) = arch {
+            let host = crate::snap::host_arch();
+            if arch != host {
+                miette::bail!(
+                    "{}: filename says arch {arch} but this host is {host} — \
+                     refusing to sideload a foreign-architecture payload (it \
+                     would install and fail only at exec); sideload a {host} \
+                     payload",
+                    payload.display()
+                );
+            }
         }
     }
 
@@ -1556,6 +1628,25 @@ pub fn add_snap_pod(
                 // Deliberate version move: fall through, the pins move below.
             }
         }
+        // Constraint consistency (issue #135): a declared spec with an
+        // `@constraint` must not gain a pin whose version violates it —
+        // the lockfile would contradict itself (the blob branch never
+        // evaluates constraints downstream). Refuse before any write.
+        if let Some(constraint) = decl
+            .packages
+            .iter()
+            .find_map(|s| parse_pod_package(s).ok().filter(|p| p.name == name))
+            .and_then(|p| p.constraint)
+        {
+            if !version_matches_constraint(&version, &constraint) {
+                miette::bail!(
+                    "'{name}': sideloaded version {version} violates the declared \
+                     constraint '@{constraint}' — refusing to record a pin that \
+                     contradicts its own constraint; widen the constraint in the \
+                     pod declaration, or `shuttle pod remove {name}` first"
+                );
+            }
+        }
     }
     // The same zero-writes validation chain as `add_package` (issue
     // #8), with claims read from the payload — on EVERY identity path:
@@ -1583,6 +1674,21 @@ pub fn add_snap_pod(
     // fail the follow-up sync's closure resolution on this machine —
     // a partial generation with no rollback. Refuse before any write.
     preflight_requires_closure(root, &dir, &decl, &meta, &name, &version)?;
+
+    // Loader-side brick warning (issue #135): a sideload into a pod
+    // that OTHER pods load bricks those pods' mutating verbs —
+    // `refuse_loaded_blob_pins` walks only the loading pod's own graph
+    // and refuses once the loaded pod carries a pin. The sideload
+    // itself is legitimate, so this warns (naming the loaders and the
+    // escape) instead of refusing.
+    for loader in pods_loading(root, pod_name) {
+        crate::output::warn(format!(
+            "pod '{pod_name}' is loaded by pod '{loader}' — this sideload makes \
+             '{loader}' refuse its mutating verbs (loading pods that carry blob \
+             pins is unsupported, issue #116); `shuttle pod remove` the pin from \
+             '{pod_name}' to restore it"
+        ));
+    }
 
     // Writes: declaration (new packages only) + both lockfile pins.
     let mut decl = decl;
@@ -2292,6 +2398,12 @@ pub struct PodRollbackReport {
     /// itself restarted changed services — no follow-up sync.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<crate::services::ServiceReconcileReport>,
+    /// Blob pins the generation rolled back TO does not carry (issue
+    /// #135): every mutating verb fails named (hold_blob_pinned) until
+    /// each is re-added — the report names them so the recovery path
+    /// is known at rollback time, not discovered at the next verb.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blob_pins_without_content: Vec<String>,
 }
 
 /// Roll a pod back to a previous generation (default: the one before
@@ -2337,12 +2449,31 @@ pub fn rollback_pod_with(
     // no follow-up sync (§5.4's restart caveat, resolved).
     let services = crate::services::reconcile(&store, &dir, pod_name, tools)?;
 
+    // The rollback trap (issue #135): the target generation may predate
+    // a blob pin — the pin's content is gone from the active generation,
+    // so every mutating verb now fails named. Name the stranded pins in
+    // the report instead of letting the next verb surprise.
+    let mut blob_pins_without_content = Vec::new();
+    if let Some(lock) = LockFile::load(&pod_lock_path(root, pod_name))? {
+        for (name, pin) in &lock.snaps {
+            let carried = gen
+                .packages
+                .get(name)
+                .is_some_and(|p| p.sha3_384 == pin.sha3_384);
+            if !carried {
+                blob_pins_without_content.push(name.clone());
+            }
+        }
+    }
+    blob_pins_without_content.sort();
+
     Ok(PodRollbackReport {
         pod: pod_name.to_string(),
         from: report.from,
         to: report.to,
         farm: Some(farm),
         services: Some(services),
+        blob_pins_without_content,
     })
 }
 

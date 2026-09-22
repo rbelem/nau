@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download actionlint
         run: |
@@ -50,12 +50,25 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2
         with:
           tool: cargo-deny@0.19.6
+
+      # The advisory DB re-clones from GitHub every run; cache it under a
+      # week-bucketed key so it refreshes weekly, with restore-keys seeding
+      # a new week from the previous one (only the delta gets fetched).
+      - name: Week bucket for advisory DB cache
+        run: echo "WEEK=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
+
+      - name: Cache RustSec advisory DB
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cargo/advisory-dbs
+          key: cargo-deny-advisory-db-${{ env.WEEK }}
+          restore-keys: cargo-deny-advisory-db-
 
       - name: Check licenses, advisories, sources
         run: cargo deny check
@@ -65,7 +78,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor
       # (kernel.apparmor_restrict_unprivileged_userns=1), which strips
@@ -85,14 +98,21 @@ jobs:
       - name: Install golang (go-deps tests build inside the sandbox)
         run: sudo apt-get install -y --no-install-recommends golang-go
 
+      # enable-cache snapshots the whole /nix/store closure (keyed on
+      # devbox.lock + nix version) instead of re-pulling ~1.5 GiB from
+      # cache.nixos.org every run. Caveats: actions/cache caps ~10 GB per
+      # repo and this closure carries qemu, so watch the cache size after
+      # enabling; the first runs only populate the cache — the savings
+      # show up on subsequent runs. The PR's own CI run is the measurement.
       - name: Install devbox
-        uses: jetify-com/devbox-install-action@v0.12.0
+        uses: jetify-com/devbox-install-action@734088efddca47cf44ff8a09289c6d0e51b73218 # v0.12.0
         with:
           project-path: .
           devbox-version: 0.18.3
+          enable-cache: true
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           prefix-key: rust-1.97.1
           cache-on-failure: true
@@ -113,13 +133,6 @@ jobs:
       # CI and test something no fresh clone or release can reproduce.
       - name: Lockfile must be committed
         run: git diff --exit-code Cargo.lock
-
-      # The image command-seam tests drive a real A/B+update_source disk
-      # build, which fails closed without an existing image-signing key
-      # (a build never mints one). Mint it for the runner user, guarded so
-      # an existing key is never touched.
-      - name: Mint the image-signing key
-        run: test -f ~/.config/shuttle/secret-key || devbox run -- ./target/debug/shuttle key keygen
 
       - name: Test
         run: devbox run -- test
