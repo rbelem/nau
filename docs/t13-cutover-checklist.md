@@ -165,6 +165,16 @@ re-sync, issue #113, 4.5 s no-op). -->
 
 ## 4. The cutover (exact commands, ordered)
 
+> **EXECUTED 2026-09-21/22 — live.** Legacy process-compose stopped; pod
+> units serve valkey/bifrost/wigolo on 6379/8081/3333 (gen 66, enabled).
+> Step-4 verification: valkey PONG + set/get, keyed mimo-v2.5 completion
+> through bifrost, wigolo /health 200. Deviations carried as systemd
+> drop-in overrides — the emitter/recipe bugs they paper over are
+> ticketed as #115 (PATH seam, arg anchors, bifrost app-dir+env, wigolo
+> closure). wigolo runs the devbox binary as a documented stopgap; that
+> devbox dependency blocks the wigolo slice of §4.5/#96 until #115's
+> closure fix lands.
+
 **Run everything from a shell that does NOT have devbox on PATH when
 possible; the cutover is one session, ordered so a failure at any step
 leaves the old stack intact (rollback = §4.7).**
