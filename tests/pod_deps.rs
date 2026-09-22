@@ -1907,15 +1907,10 @@ gated_test!(tampered_go_closure_fails_build, &["go"], {
     assert_eq!(code, Some(0), "stderr: {stderr}");
 
     // Flip a byte inside the stored closure blob (same path, different
-    // content) — build-time verification must fail closed. Since #113 a
-    // plain sync HOLDS recipe-identical packages on the meta digest and
-    // never reads the blob, so the rebuild must be forced. Bumping the
-    // VERSION is the wrong lever: the #5 pin hold fires on version drift
-    // (lock pins 1.0, meta says 1.1) and sync holds without building.
-    // Diverge the meta digest through the build command instead — same
-    // version, a changed build input — so sync rebuilds and the build
-    // must consume the corrupted blob through materialize_deps_entry's
-    // fail-closed hash check.
+    // content). Since #125 the content hold re-verifies the recorded
+    // deps pin on every plain sync (the hold itself never reads the
+    // blob), so the tampered store fails the sync loud — no recipe edit
+    // or forced rebuild is needed to reach a fail-closed check.
     let (hash, _) = lock_deps_pin(root.path(), "default", "zgotmp");
     let blob = pod_dir(root.path(), "default")
         .join("store")
@@ -1926,24 +1921,121 @@ gated_test!(tampered_go_closure_fails_build, &["go"], {
     bytes[last] ^= 0xff;
     std::fs::write(&blob, &bytes).unwrap();
 
-    let recipe = project.path().join("pkgs/z/zgotmp.lua");
-    let lua = std::fs::read_to_string(&recipe).unwrap();
-    std::fs::write(
-        &recipe,
-        lua.replace(
-            "go build -o $STAGE/zgotmp .",
-            "go build -o $STAGE/zgotmp . && :",
-        ),
-    )
-    .unwrap();
-
     let (code, _, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
-    assert_ne!(code, Some(0), "tampered closure must fail the build");
+    assert_ne!(code, Some(0), "tampered closure must fail the held sync");
     assert!(
-        stderr.contains("hash mismatch") || stderr.contains("corrupted"),
-        "failure must name the hash mismatch: {stderr}"
+        stderr.contains("hash mismatch") && stderr.contains("held package 'zgotmp'"),
+        "failure must name the hash mismatch and the held package: {stderr}"
     );
 });
+
+// ── A missing go closure fails the held sync (issue #125) ──
+
+gated_test!(missing_go_closure_fails_sync, &["go"], {
+    if !go_sandbox_visible() {
+        eprintln!("skipping: host go is not sandbox-visible (unbound PATH entry)");
+        return;
+    }
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let (port, _log) = serve_dir(server.path());
+    write_go_pkg(
+        project.path(),
+        server.path(),
+        "zgomiss",
+        "missing-target",
+        port,
+    );
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zgomiss"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    // While the blob is intact the package content-holds cleanly: the
+    // held sync is a no-op (this proves the hold is what runs next).
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+    assert!(
+        format!("{stdout}{stderr}").contains("already matches its declaration"),
+        "the package must content-hold while the blob is intact: {stdout}{stderr}"
+    );
+
+    // Deleting the store blob turns the NEXT held sync into a loud
+    // failure naming the package and the missing blob (issue #125).
+    // No re-fetch, no auto-heal: the held sync refuses.
+    let (hash, _) = lock_deps_pin(root.path(), "default", "zgomiss");
+    let blob = pod_dir(root.path(), "default")
+        .join("store")
+        .join(&hash[..2])
+        .join(&hash);
+    std::fs::remove_file(&blob).unwrap();
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+    assert_ne!(code, Some(0), "missing closure must fail the held sync");
+    assert!(
+        stderr.contains("missing from the pod store") && stderr.contains("held package 'zgomiss'"),
+        "failure must name the missing blob and the held package: {stderr}"
+    );
+});
+
+// ── A held package without a recorded deps pin skips verification ──
+
+/// A deps-less fixture: a tarball snap whose build stages an echo
+/// script — no `deps` declaration, so the lock records no deps pin
+/// (same shape as pod_overlay.rs's `write_pkg_version`).
+fn write_plain_pkg(project: &Path, server: &Path, name: &str, marker: &str, port: u16) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let dir = project.join("pkgs").join(letter.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let approot = server.join("plainroot");
+    let _ = std::fs::remove_dir_all(&approot);
+    std::fs::create_dir_all(&approot).unwrap();
+    std::fs::write(approot.join("README"), "fixture source\n").unwrap();
+    tar_czf(server, "plain-src.tar.gz", "plainroot");
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "{name}",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/plain-src.tar.gz",
+    build = "mkdir -p $STAGE/bin && echo '#!/bin/sh' > $STAGE/bin/{name} && echo 'echo {marker}' >> $STAGE/bin/{name} && chmod +x $STAGE/bin/{name}",
+    apps = {{ {name} = {{ command = "bin/{name}" }} }},
+}} }}
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
+gated_test!(
+    held_sync_without_a_deps_pin_skips_verification_and_succeeds,
+    &[],
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let (port, _log) = serve_dir(server.path());
+        write_plain_pkg(
+            project.path(),
+            server.path(),
+            "zplain",
+            "plain-marker",
+            port,
+        );
+
+        let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zplain"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+
+        // No `deps` declaration → no recorded deps_hash: the content
+        // hold has nothing to verify and must hold cleanly (issue #125
+        // guarantees the loud failure only fires on recorded pins).
+        let (code, stdout, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
+        let out = format!("{stdout}{stderr}");
+        assert!(
+            out.contains("held 'zplain' at its pin"),
+            "the deps-less package must content-hold cleanly: {out}"
+        );
+    }
+);
 
 // ── A changed go.sum moves the deps_hash (cache invalidation) ──
 

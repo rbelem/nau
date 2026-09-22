@@ -2394,6 +2394,7 @@ pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
 
 /// What the scoped reconcile does with one own package before the
 /// build (issue #15).
+#[derive(Debug)]
 enum OwnScope {
     /// Plain-sync hold: recorded + claims contributed, stores nothing.
     Held,
@@ -2489,6 +2490,42 @@ fn hold_plain_sync(
     OwnScope::Held
 }
 
+/// Verify the recorded deps-closure blob of a content-held package
+/// (issue #125): the hold skips the build that would otherwise hash the
+/// blob (issue #113), so a corrupted or missing store entry would ride
+/// along silently — the held sync instead fails loud, fail-closed like
+/// [`crate::dep_fetch::materialize_deps_entry`]. One stat + one
+/// streaming hash of the already-local blob; no fetch, no unpack, no
+/// auto-heal. Packages without a recorded deps pin (no `deps`
+/// declaration, store/pull installs) skip cleanly: nothing to verify.
+fn verify_held_deps_blob(ctx: &ReconcileCtx<'_>, name: &str) -> miette::Result<()> {
+    let Some(hash) = ctx
+        .lock
+        .packages
+        .get(name)
+        .and_then(|e| e.deps.as_ref())
+        .map(|d| d.deps_hash.as_str())
+    else {
+        return Ok(());
+    };
+    let blob = ctx.store.blob_path(hash);
+    if !blob.exists() {
+        miette::bail!(
+            "held package '{name}': dependency closure {hash:.12}… is missing from the pod \
+             store — the held sync refuses to proceed; run `shuttle deps fetch` to fetch it"
+        );
+    }
+    let actual = crate::dep_fetch::sha256_file(&blob)?;
+    if actual != hash {
+        miette::bail!(
+            "held package '{name}': dependency closure hash mismatch: expected {hash}, \
+             found {actual} — the store entry is corrupted or tampered with; the held \
+             sync refuses to proceed"
+        );
+    }
+    Ok(())
+}
+
 /// The blob-pin hold body (issue #116): a sideloaded package keeps its
 /// installed store content on every reconcile — there is no collection
 /// recipe to rebuild from, the sha3-384 pin is the content. Claims come
@@ -2554,7 +2591,7 @@ fn scope_own_package(
     overlay: bool,
     meta: &mut crate::snap::SnapMeta,
     build: &mut ReconcileBuild,
-) -> OwnScope {
+) -> miette::Result<OwnScope> {
     if !selected {
         if let Some(installed_pkg) = ctx.active.and_then(|g| g.packages.get(&meta.name)) {
             hold_style_skip_claims(
@@ -2564,22 +2601,26 @@ fn scope_own_package(
                 installed_pkg,
                 meta,
             );
-            return OwnScope::SkipInstalled;
+            return Ok(OwnScope::SkipInstalled);
         }
-        return OwnScope::Build;
+        return Ok(OwnScope::Build);
     }
     if !scoped && !overlay && held_at_content(ctx.active, meta) {
         // Content hold (issue #113): the installed record was built
         // from this exact recipe — plain sync keeps its store content.
-        return hold_plain_sync(ctx, meta, build);
+        // The hold never reads the deps blob, so re-verify the recorded
+        // closure pin first (issue #125): corrupted or missing store
+        // content fails the sync loud instead of riding along.
+        verify_held_deps_blob(ctx, &meta.name)?;
+        return Ok(hold_plain_sync(ctx, meta, build));
     }
     if overlay || !held_at_pin(ctx.lock, &meta.name, &meta.version, ctx.active) {
-        return OwnScope::Build;
+        return Ok(OwnScope::Build);
     }
     if !scoped {
         // Plain sync holds (issue #5): the pin plus the active
         // generation's content win over collection drift.
-        return hold_plain_sync(ctx, meta, build);
+        return Ok(hold_plain_sync(ctx, meta, build));
     }
     // Rebuild bypasses the hold (issue #15) but KEEPS THE PIN: build
     // at the pinned version, not the collection candidate — never
@@ -2587,7 +2628,7 @@ fn scope_own_package(
     // job). Pinning the meta to the executing version mirrors the
     // loaded-packages path.
     meta.version = ctx.lock.packages[&meta.name].version.clone();
-    OwnScope::Build
+    Ok(OwnScope::Build)
 }
 
 /// True when a scoped reconcile deliberately moved a package's
@@ -3079,7 +3120,7 @@ fn collect_own_packages(
         };
         let selected = only.is_none_or(|n| n == spec.name.as_str());
         if let OwnScope::Build =
-            scope_own_package(ctx, selected, only.is_some(), overlay, &mut meta, build)
+            scope_own_package(ctx, selected, only.is_some(), overlay, &mut meta, build)?
         {
             build_own_package(ctx, &spec, &meta, layer, float_deps && selected, build)?;
         }
@@ -4992,7 +5033,8 @@ pod {
         let mut meta = bare_meta("tool", "1.0");
         let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
         let mut build = ReconcileBuild::default();
-        let scope = scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build);
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
         assert!(matches!(scope, OwnScope::Held));
         assert_eq!(build.held, vec!["tool".to_string()]);
         assert!(
@@ -5014,7 +5056,8 @@ pod {
         let mut meta = bare_meta("tool", "1.0");
         meta.build = Some("echo new".into());
         let mut build = ReconcileBuild::default();
-        let scope = scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build);
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
         assert!(matches!(scope, OwnScope::Build));
         assert!(build.held.is_empty(), "a changed recipe must not hold");
     }
@@ -5026,7 +5069,8 @@ pod {
         let mut meta = bare_meta("tool", "1.0");
         let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
         let mut build = ReconcileBuild::default();
-        let scope = scope_own_package(&fixture.ctx(), true, true, false, &mut meta, &mut build);
+        let scope =
+            scope_own_package(&fixture.ctx(), true, true, false, &mut meta, &mut build).unwrap();
         assert!(matches!(scope, OwnScope::Build));
         assert!(build.held.is_empty(), "scoped rebuild is never held");
     }
@@ -5038,7 +5082,8 @@ pod {
         let mut meta = bare_meta("tool", "1.0");
         let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
         let mut build = ReconcileBuild::default();
-        let scope = scope_own_package(&fixture.ctx(), true, false, true, &mut meta, &mut build);
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, true, &mut meta, &mut build).unwrap();
         assert!(matches!(scope, OwnScope::Build));
         assert!(build.held.is_empty(), "overlay packages never hold");
     }
@@ -5051,16 +5096,134 @@ pod {
         let mut meta = bare_meta("tool", "1.0");
         let fixture = hold_fixture(installed_tool(None));
         let mut build = ReconcileBuild::default();
-        let scope = scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build);
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
         assert!(matches!(scope, OwnScope::Build));
 
         // The rebuild records its digest on the installed record —
         // simulated here by reinstalling the fixture with the digest.
         let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
         let mut build = ReconcileBuild::default();
-        let scope = scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build);
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
         assert!(matches!(scope, OwnScope::Held));
         assert_eq!(build.held, vec!["tool".to_string()]);
+    }
+
+    // ── Held-sync deps verification (issue #125) ──
+
+    /// Record a deps pin for `tool` in the fixture's lockfile.
+    fn pin_tool_deps(fixture: &mut HoldFixture, hash: &str) {
+        fixture.lock.packages.get_mut("tool").unwrap().deps = Some(crate::lock::PackageDepsLock {
+            deps_hash: hash.to_string(),
+            fetched_at: None,
+            lock_sha256: None,
+        });
+    }
+
+    /// A content-held package with NO recorded deps pin skips
+    /// verification: the loud failure must only fire on recorded pins
+    /// (store/pull installs, deps-less declarations).
+    #[test]
+    fn test_held_sync_skips_verification_without_a_recorded_deps_pin() {
+        let fixture = hold_fixture(installed_tool(Some(
+            bare_meta("tool", "1.0").build_input_digest(),
+        )));
+        verify_held_deps_blob(&fixture.ctx(), "tool").unwrap();
+    }
+
+    /// An intact deps blob verifies cleanly on the held sync — the
+    /// happy path keeps the #113 no-fetch hold (issue #125).
+    #[test]
+    fn test_held_sync_verifies_an_intact_deps_blob() {
+        use sha2::{Digest, Sha256};
+        let mut fixture = hold_fixture(installed_tool(Some(
+            bare_meta("tool", "1.0").build_input_digest(),
+        )));
+        let content = b"closure bytes";
+        let hash: String = Sha256::digest(content)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let blob = fixture.store.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, content).unwrap();
+        pin_tool_deps(&mut fixture, &hash);
+        verify_held_deps_blob(&fixture.ctx(), "tool").unwrap();
+    }
+
+    /// A MISSING deps blob fails the held sync loud: the hold never
+    /// reads the blob, so the sync itself must (issue #125).
+    #[test]
+    fn test_held_sync_fails_loud_when_the_recorded_deps_blob_is_missing() {
+        let mut fixture = hold_fixture(installed_tool(Some(
+            bare_meta("tool", "1.0").build_input_digest(),
+        )));
+        let hash = "a1".repeat(32);
+        pin_tool_deps(&mut fixture, &hash);
+        let err = verify_held_deps_blob(&fixture.ctx(), "tool").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("missing from the pod store"),
+            "must name the missing blob: {msg}"
+        );
+        assert!(
+            msg.contains("held package 'tool'"),
+            "must name the package: {msg}"
+        );
+    }
+
+    /// A TAMPERED deps blob fails the held sync loud, fail-closed like
+    /// materialize_deps_entry, naming recorded vs actual (issue #125).
+    #[test]
+    fn test_held_sync_fails_loud_when_the_recorded_deps_blob_is_tampered() {
+        let mut fixture = hold_fixture(installed_tool(Some(
+            bare_meta("tool", "1.0").build_input_digest(),
+        )));
+        let hash = "a1".repeat(32);
+        let blob = fixture.store.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"not the closure").unwrap();
+        pin_tool_deps(&mut fixture, &hash);
+        let err = verify_held_deps_blob(&fixture.ctx(), "tool").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("hash mismatch"),
+            "must name the mismatch: {msg}"
+        );
+        assert!(msg.contains(&hash), "must name the recorded hash: {msg}");
+        assert!(
+            msg.contains("held package 'tool'"),
+            "must name the package: {msg}"
+        );
+    }
+
+    /// The wiring: a plain sync whose content hold hits a tampered deps
+    /// blob fails the SCOPING loud — the hold is never recorded
+    /// (issue #125).
+    #[test]
+    fn test_content_hold_fails_loud_when_the_deps_blob_is_tampered() {
+        let mut meta = bare_meta("tool", "1.0");
+        let mut fixture = hold_fixture(installed_tool(Some(
+            bare_meta("tool", "1.0").build_input_digest(),
+        )));
+        let hash = "a1".repeat(32);
+        let blob = fixture.store.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"not the closure").unwrap();
+        pin_tool_deps(&mut fixture, &hash);
+        let mut build = ReconcileBuild::default();
+        let err = scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("hash mismatch"),
+            "the content hold must refuse loud: {err}"
+        );
+        assert!(
+            build.held.is_empty(),
+            "a refused hold must not be recorded: {:?}",
+            build.held
+        );
     }
 
     #[test]
