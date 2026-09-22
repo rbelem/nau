@@ -65,7 +65,7 @@ return {
 
         source = {
             url = "https://github.com/neovim/neovim/releases/download/nightly/nvim-linux-x86_64.tar.gz",
-            sha256 = "531c8270e0c408561c7dbaf3f1be942631afc46fd75a65037a42a6eb75f8768f",
+            sha256 = "971e0541910bfde3d9d22d44bfa3651ae4b9dc005b9484208994c43a775275eb",
         },
 
         -- Single-source flatten lands the tarball root's contents

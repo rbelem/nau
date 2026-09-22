@@ -153,7 +153,16 @@ fn fetch_deps_closure(
     recipe_dir: Option<&Path>,
 ) -> miette::Result<(String, Option<String>)> {
     let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
-    let src_root = fetch_source_tree(meta, work.path())?;
+    // All-recipe-local closures never read a source tree: every lock
+    // resolves against the recipe directory, so there is nothing to
+    // download — skip the fetch entirely (and with it the `source`
+    // requirement, mirroring the parse-boundary relaxation in
+    // `snap`). Any other lock shape still needs the tree.
+    let src_root = if deps.all_locks_recipe_local() {
+        work.path().to_path_buf()
+    } else {
+        fetch_source_tree(meta, work.path())?
+    };
     // Resolve the declared locks once up front: fails fast on a missing
     // recipe lock (before any download), and records the recipe-shipped
     // lockfile's sha for the pin. The per-resolver fetches re-read the

@@ -22,11 +22,14 @@
     "parted@latest",
     "mtools@latest",
     "dosfstools@latest",
-    "github:NixOS/nixpkgs#pkgsStatic.busybox",
-    "github:NixOS/nixpkgs#pkgsStatic.cryptsetup.bin",
-    "github:NixOS/nixpkgs#pkgsStatic.util-linux.bin",
+    "github:NixOS/nixpkgs/nixos-26.05#pkgsStatic.busybox",
+    "github:NixOS/nixpkgs/nixos-26.05#pkgsStatic.cryptsetup.bin",
+    "github:NixOS/nixpkgs/nixos-26.05#pkgsStatic.util-linux.bin",
     "systemdUkify@latest",
-    "cryptsetup@latest"
+    "cryptsetup@latest",
+    "github:NixOS/nixpkgs/nixos-26.05#lua54Packages.luacheck",
+    "github:NixOS/nixpkgs/nixos-26.05#stylua",
+    "github:NixOS/nixpkgs/nixos-26.05#cargo-llvm-cov"
   ],
   "shell": {
     "init_hook": [

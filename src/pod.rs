@@ -1106,10 +1106,13 @@ fn fold_pod_env(
 
 /// What one loaded pod contributes to the loading pod's composition:
 /// the package versions it currently executes (its active generation —
-/// read-only) or, when it has no generation yet, the versions its own
-/// first sync would build (declaration + its overlays, live). Sub-loads
-/// are folded in beneath its own packages (same precedence rules one
-/// level down), so a chain resolves through this one call.
+/// read-only) UNIONed with its declaration (issue #103), so a name the
+/// pod declares that its generation does not carry (failed/partial
+/// sync, degraded removal, a generation predating the declaration)
+/// still reaches the loading pod. Generation content wins a name
+/// clash with the declaration. Sub-loads fold in beneath (same
+/// precedence rules one level down), so a chain resolves through this
+/// one call.
 struct LoadedContribution {
     /// The loaded pod's own overlay entries — applied when re-resolving
     /// its packages so the rebuilt payload carries the same build
@@ -1119,23 +1122,16 @@ struct LoadedContribution {
     packages: BTreeMap<String, Option<String>>,
 }
 
-fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedContribution> {
-    let decl = load_declaration(root, pod_name)?;
-    let store = pod_store(&pod_dir(root, pod_name));
-    if let Some(active) = store.active_generation()? {
-        return Ok(LoadedContribution {
-            overlay: decl.overlay,
-            packages: active
-                .packages
-                .iter()
-                .map(|(name, pkg)| (name.clone(), Some(pkg.version.clone())))
-                .collect(),
-        });
-    }
-    // No generation yet: mirror the loaded pod's own first sync — its
-    // declared packages resolve fresh (overlay applied), its sub-loads
-    // fold in beneath (own packages win the name clash, issue #8).
-    // Acyclicity is guaranteed: `validate_loads` ran before this read.
+/// Fold a pod's DECLARATION alone: its own packages resolved live (the
+/// pod's own overlay applied — the same inputs its first sync would
+/// use) plus its sub-loads folded recursively beneath (own packages
+/// win the name clash, issue #8). Acyclicity is guaranteed:
+/// `validate_loads` ran before this read.
+fn declared_contribution(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+) -> miette::Result<BTreeMap<String, Option<String>>> {
     let mut packages = BTreeMap::new();
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
@@ -1158,6 +1154,33 @@ fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedCont
             packages.entry(name).or_insert(version);
         }
     }
+    Ok(packages)
+}
+
+fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedContribution> {
+    let decl = load_declaration(root, pod_name)?;
+    let store = pod_store(&pod_dir(root, pod_name));
+    // Union (issue #103): what the pod EXECUTES (its active generation)
+    // is the base and wins every name clash; its declaration folds in
+    // beneath with `or_insert` so declaration-only names — resolved
+    // live with the pod's own overlay, sub-loads recursive — are added
+    // without ever displacing an executing version. Without the
+    // generation the declaration alone is the whole story (it mirrors
+    // the pod's own first sync).
+    let packages = match store.active_generation()? {
+        Some(active) => {
+            let mut packages: BTreeMap<String, Option<String>> = active
+                .packages
+                .iter()
+                .map(|(name, pkg)| (name.clone(), Some(pkg.version.clone())))
+                .collect();
+            for (name, version) in declared_contribution(root, pod_name, &decl)? {
+                packages.entry(name).or_insert(version);
+            }
+            packages
+        }
+        None => declared_contribution(root, pod_name, &decl)?,
+    };
     Ok(LoadedContribution {
         overlay: decl.overlay,
         packages,
@@ -1934,6 +1957,49 @@ fn held_at_pin(
         })
 }
 
+/// True when a freshly resolved own package's recipe digests identically
+/// to the installed record's build inputs (issue #113): the installed
+/// store content was built from THIS recipe, so a plain sync can hold.
+/// `None` on the installed side never matches — pre-#113 manifests
+/// rebuild once, record their digest, and hold from then on. Floating
+/// packages never hold: float mode follows upstream content drift at a
+/// constant recipe (ADR-0017) — its sync re-resolves the closure and
+/// repins, which a hold would silently skip.
+fn held_at_content(
+    active: Option<&crate::runtime::Generation>,
+    meta: &crate::snap::SnapMeta,
+) -> bool {
+    if meta.floating {
+        return false;
+    }
+    let digest = meta.build_input_digest();
+    active
+        .and_then(|g| g.packages.get(&meta.name))
+        .and_then(|p| p.meta_digest.as_deref())
+        .is_some_and(|d| d == digest)
+}
+
+/// The plain-sync hold body: record the hold (issue #5, issue #113) and
+/// contribute the installed record's claims so the generation still
+/// presents the package's desktop IDs and binaries.
+fn hold_plain_sync(
+    ctx: &ReconcileCtx<'_>,
+    meta: &crate::snap::SnapMeta,
+    build: &mut ReconcileBuild,
+) -> OwnScope {
+    build.held.push(meta.name.clone());
+    if let Some(installed_pkg) = ctx.active.and_then(|g| g.packages.get(&meta.name)) {
+        hold_style_skip_claims(
+            &mut build.desktop_claims,
+            &mut build.binary_claims,
+            &mut build.service_claims,
+            installed_pkg,
+            meta,
+        );
+    }
+    OwnScope::Held
+}
+
 /// Decide what one own package does in a scoped reconcile BEFORE any
 /// build (issue #15): an off-scope package keeps its installed store
 /// content (claims from the installed record, no build — or a normal
@@ -1943,6 +2009,12 @@ fn held_at_pin(
 /// `scoped` is true when the reconcile targets one package
 /// (`only.is_some()`); `overlay` is true when the package has an
 /// overlay (overlay packages never hold).
+///
+/// Two holds, two drift senses (both plain-sync only): the pin hold
+/// (issue #5) keeps the installed content when the lockfile pin and the
+/// collection candidate disagree on VERSION; the content hold (issue
+/// #113) keeps it when the freshly resolved recipe digests identically
+/// to the installed record — same version, no rebuild.
 fn scope_own_package(
     ctx: &ReconcileCtx<'_>,
     selected: bool,
@@ -1964,23 +2036,18 @@ fn scope_own_package(
         }
         return OwnScope::Build;
     }
+    if !scoped && !overlay && held_at_content(ctx.active, meta) {
+        // Content hold (issue #113): the installed record was built
+        // from this exact recipe — plain sync keeps its store content.
+        return hold_plain_sync(ctx, meta, build);
+    }
     if overlay || !held_at_pin(ctx.lock, &meta.name, &meta.version, ctx.active) {
         return OwnScope::Build;
     }
     if !scoped {
         // Plain sync holds (issue #5): the pin plus the active
         // generation's content win over collection drift.
-        build.held.push(meta.name.clone());
-        if let Some(installed_pkg) = ctx.active.and_then(|g| g.packages.get(&meta.name)) {
-            hold_style_skip_claims(
-                &mut build.desktop_claims,
-                &mut build.binary_claims,
-                &mut build.service_claims,
-                installed_pkg,
-                meta,
-            );
-        }
-        return OwnScope::Held;
+        return hold_plain_sync(ctx, meta, build);
     }
     // Rebuild bypasses the hold (issue #15) but KEEPS THE PIN: build
     // at the pinned version, not the collection candidate — never
@@ -2385,9 +2452,10 @@ struct ReconcileBuild {
 }
 
 /// Fold the `loads` graph one level deep (issue #8): each loaded pod
-/// contributes its active generation's package versions (or, with none
-/// yet, its declaration as its own first sync would resolve) and its
-/// overlay map.
+/// contributes its active generation's package versions UNIONed with
+/// its declaration (generation wins the clash, issue #103; with no
+/// generation the declaration alone mirrors its own first sync) and
+/// its overlay map.
 fn loaded_contributions(
     root: &Path,
     decl: &PodDeclaration,
@@ -3616,7 +3684,9 @@ fn ensure_own_deps(
 
 /// Shape a built, content-hashed payload as a [`PendingSnap`] at the
 /// package's composition layer (issue #8). Store/pull installs use the
-/// `Own` default.
+/// `Own` default. The resolved recipe's build-input digest rides along
+/// (issue #113) — the install records it so a plain sync can hold
+/// recipe-identical packages instead of rebuilding them.
 fn build_pending_snap_at(
     meta: &crate::snap::SnapMeta,
     payload_path: &Path,
@@ -3629,6 +3699,7 @@ fn build_pending_snap_at(
         sha3_384,
         payload_path: payload_path.to_path_buf(),
         layer,
+        meta_digest: Some(meta.build_input_digest()),
     }
 }
 
@@ -4244,6 +4315,174 @@ pod {
         }
     }
 
+    // ── Content hold (issue #113) ──
+
+    /// An installed record for `tool` with an optional build-input
+    /// digest (the field a pre-#113 manifest carries `None` of).
+    fn installed_tool(meta_digest: Option<String>) -> crate::runtime::InstalledPackage {
+        crate::runtime::InstalledPackage {
+            name: "tool".into(),
+            version: "1.0".into(),
+            revision: 1,
+            sha3_384: "abc".into(),
+            files: vec![],
+            units: vec![],
+            layer: crate::farm::ClaimLayer::Own,
+            apps: BTreeMap::new(),
+            requires: Vec::new(),
+            launchers: BTreeMap::new(),
+            assembly: BTreeMap::new(),
+            confined: None,
+            app_confined: BTreeMap::new(),
+            desktops: BTreeMap::new(),
+            fonts: BTreeMap::new(),
+            services: BTreeMap::new(),
+            service_bins: BTreeMap::new(),
+            meta_digest,
+        }
+    }
+
+    /// A generation carrying exactly one installed record.
+    fn gen_with_record(record: crate::runtime::InstalledPackage) -> crate::runtime::Generation {
+        let mut packages = BTreeMap::new();
+        packages.insert(record.name.clone(), record);
+        crate::runtime::Generation {
+            n: 1,
+            base_version: "24.04".into(),
+            packages,
+            created_epoch: 0,
+            boot_entry: None,
+        }
+    }
+
+    /// A reconcile context over a tempdir whose lock pins `tool` at
+    /// 1.0 and whose active generation carries `record`.
+    struct HoldFixture {
+        _dir: tempfile::TempDir,
+        store: crate::runtime::RuntimeStore,
+        lock: LockFile,
+        gen: crate::runtime::Generation,
+    }
+
+    fn hold_fixture(record: crate::runtime::InstalledPackage) -> HoldFixture {
+        use std::collections::HashMap;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runtime::RuntimeStore::new(dir.path().join("store"));
+        let mut lock = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs: HashMap::new(),
+            packages: HashMap::new(),
+            build_deps: HashMap::new(),
+        };
+        lock.packages.insert(
+            "tool".to_string(),
+            PodPackageLockEntry {
+                version: "1.0".into(),
+                constraint: None,
+                deps: None,
+            },
+        );
+        let gen = gen_with_record(record);
+        HoldFixture {
+            _dir: dir,
+            store,
+            lock,
+            gen,
+        }
+    }
+
+    impl HoldFixture {
+        fn ctx(&self) -> ReconcileCtx<'_> {
+            ReconcileCtx {
+                store: &self.store,
+                lock: &self.lock,
+                active: Some(&self.gen),
+                root: self._dir.path(),
+                pod_name: "default",
+            }
+        }
+    }
+
+    /// Plain sync + digest match + the generation carries the package
+    /// → HELD at the installed store content, no build queued.
+    #[test]
+    fn test_plain_sync_holds_when_the_recipe_matches_the_installed_record() {
+        let mut meta = bare_meta("tool", "1.0");
+        let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        let mut build = ReconcileBuild::default();
+        let scope = scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build);
+        assert!(matches!(scope, OwnScope::Held));
+        assert_eq!(build.held, vec!["tool".to_string()]);
+        assert!(
+            build.pending.is_empty(),
+            "a held package must not queue a build: {:?}",
+            build.pending
+        );
+    }
+
+    /// The recipe's build command changed → digest mismatch → the
+    /// plain sync rebuilds (the whole point of the hold's sense: it
+    /// skips only when the build inputs are identical).
+    #[test]
+    fn test_plain_sync_rebuilds_when_the_build_command_changed() {
+        let mut installed_meta = bare_meta("tool", "1.0");
+        installed_meta.build = Some("echo old".into());
+        let fixture = hold_fixture(installed_tool(Some(installed_meta.build_input_digest())));
+
+        let mut meta = bare_meta("tool", "1.0");
+        meta.build = Some("echo new".into());
+        let mut build = ReconcileBuild::default();
+        let scope = scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build);
+        assert!(matches!(scope, OwnScope::Build));
+        assert!(build.held.is_empty(), "a changed recipe must not hold");
+    }
+
+    /// `pod rebuild <pkg>` (scoped) bypasses the content hold even
+    /// when the digest matches — a scoped rebuild is deliberate.
+    #[test]
+    fn test_scoped_rebuild_bypasses_the_content_hold() {
+        let mut meta = bare_meta("tool", "1.0");
+        let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        let mut build = ReconcileBuild::default();
+        let scope = scope_own_package(&fixture.ctx(), true, true, false, &mut meta, &mut build);
+        assert!(matches!(scope, OwnScope::Build));
+        assert!(build.held.is_empty(), "scoped rebuild is never held");
+    }
+
+    /// Overlay packages never hold — the overlay may have changed the
+    /// recipe in ways the installed record predates.
+    #[test]
+    fn test_overlay_package_never_content_holds() {
+        let mut meta = bare_meta("tool", "1.0");
+        let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        let mut build = ReconcileBuild::default();
+        let scope = scope_own_package(&fixture.ctx(), true, false, true, &mut meta, &mut build);
+        assert!(matches!(scope, OwnScope::Build));
+        assert!(build.held.is_empty(), "overlay packages never hold");
+    }
+
+    /// A pre-#113 manifest carries no digest: it never holds — the
+    /// first sync rebuilds once and records the digest, and the NEXT
+    /// plain sync holds on the identical recipe.
+    #[test]
+    fn test_manifest_without_a_digest_rebuilds_once_then_holds() {
+        let mut meta = bare_meta("tool", "1.0");
+        let fixture = hold_fixture(installed_tool(None));
+        let mut build = ReconcileBuild::default();
+        let scope = scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build);
+        assert!(matches!(scope, OwnScope::Build));
+
+        // The rebuild records its digest on the installed record —
+        // simulated here by reinstalling the fixture with the digest.
+        let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        let mut build = ReconcileBuild::default();
+        let scope = scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build);
+        assert!(matches!(scope, OwnScope::Held));
+        assert_eq!(build.held, vec!["tool".to_string()]);
+    }
+
     #[test]
     fn test_apply_overlay_patches_whitelisted_fields() {
         let mut meta = bare_meta("tool", "14.4");
@@ -4442,6 +4681,7 @@ pod {
                 fonts: BTreeMap::new(),
                 services: BTreeMap::new(),
                 service_bins: BTreeMap::new(),
+                meta_digest: None,
             },
         );
         crate::runtime::Generation {

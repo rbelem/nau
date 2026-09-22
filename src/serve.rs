@@ -842,6 +842,7 @@ mod tests {
                 fonts: BTreeMap::new(),
                 services: BTreeMap::new(),
                 service_bins: BTreeMap::new(),
+                meta_digest: None,
             },
         );
         let gen = Generation {
@@ -1085,6 +1086,7 @@ mod tests {
                 fonts: BTreeMap::new(),
                 services: BTreeMap::new(),
                 service_bins: BTreeMap::new(),
+                meta_digest: None,
             },
         );
         let gen = Generation {

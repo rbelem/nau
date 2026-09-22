@@ -1769,6 +1769,7 @@ mod tests {
                 .map(|(n, d)| (n.to_string(), d))
                 .collect(),
             service_bins: BTreeMap::new(),
+            meta_digest: None,
         }
     }
 

@@ -130,28 +130,50 @@ name `pilot`, against this worktree's pool. Re-runnable: §6.
 - Multi-file apps work through the per-package assembly (`python3`
   runs its own payload via `apps/python/usr/bin/…`).
 
-### 3.1 What blocked the meson class (dispositioned, not absorbed)
+### 3.1 What blocked the meson class — RESOLVED (issue #114, closed 2026-09-21)
 
-`dconf`, `libsecret`, `wl-clipboard`, `wtype` (→ `wayland`, → meson →
-needs `python3` from the merged build prefix) fail to BUILD from a cold
-store with:
+Struck by the cold scratch-pod repro (`~/.cache/shuttle-meson-repro`,
+generation 1 green): the blocker was missing runtime-lib declarations on
+the C++ prefix tools — `cmake` and `ninja` linked
+`libstdc++.so.6`/`libgcc_s.so.1` while declaring `requires = {}`, and
+the hermetic sandbox resolves shared libs only from the merged prefix.
+Both recipes now carry `requires = { "glibc", "libstdcpp", "libgcc" }`
+(commit `c2ec58c`); the meson class (dconf, libsecret, wl-clipboard,
+wtype, luarocks, perltidy) builds cold and installs, farm binaries
+execute. The earlier wrapper-servicing error below is kept for the
+record — the wrapper-aware prefix build (#90) plus the lib closure
+together closed the class.
+
+<details><summary>Original blocker record (superseded)</summary>
 
 ```
 /shuttle-build-prefix/usr/bin/python3: line 6:
   /shuttle-build-prefix/active/extensions/python/usr/usr/bin/python3.real: No such file or directory
 ```
 
-This is the **already-recorded ADR-0017-addendum gap**: pod-built
+This was the **already-recorded ADR-0017-addendum gap**: pod-built
 toolchain/payload wrappers cannot serve as merged-prefix `build_deps` —
 "a wrapper-aware prefix build is the follow-up." Plus `luarocks`, whose
-build script misses its generated `etc/luarocks/config-5.4.lua` under
-the same prefix (same family). These five stay devbox-only until that
-follow-up lands; they are the only daily-set members not proven in the
-pilot.
+build script missed its generated `etc/luarocks/config-5.4.lua` under
+the same prefix (same family).
 
-<!-- EVIDENCE -->
+</details>
+
+<!-- EVIDENCE: /tmp/opencode/shuttle-night/meson-repro-3.log (cold build,
+zero "Could not detect Ninja"), meson-repro-4.log (skip-if-installed
+re-sync, issue #113, 4.5 s no-op). -->
 
 ## 4. The cutover (exact commands, ordered)
+
+> **EXECUTED 2026-09-21/22 — live.** Legacy process-compose stopped; pod
+> units serve valkey/bifrost/wigolo on 6379/8081/3333 (gen 66, enabled).
+> Step-4 verification: valkey PONG + set/get, keyed mimo-v2.5 completion
+> through bifrost, wigolo /health 200. Deviations carried as systemd
+> drop-in overrides — the emitter/recipe bugs they paper over are
+> ticketed as #115 (PATH seam, arg anchors, bifrost app-dir+env, wigolo
+> closure). wigolo runs the devbox binary as a documented stopgap; that
+> devbox dependency blocks the wigolo slice of §4.5/#96 until #115's
+> closure fix lands.
 
 **Run everything from a shell that does NOT have devbox on PATH when
 possible; the cutover is one session, ordered so a failure at any step

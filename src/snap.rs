@@ -197,6 +197,25 @@ pub struct PackageDeps {
     pub go: Option<DepsLockSpec>,
 }
 
+impl PackageDeps {
+    /// True when every declared lockfile is recipe-local
+    /// (`recipe/`-prefixed): those resolve against the recipe directory
+    /// (the ADR-0017 addendum — the lockfile ships beside the recipe),
+    /// not a source tree, so the closure can fetch without a `source`.
+    /// The `deps`+`source` parse check relaxes on this predicate; the
+    /// motivating shape is a multi-source build (issue #41 `sources`)
+    /// that vendors an ecosystem closure from a recipe-local lock while
+    /// `sources` delivers the artifacts the no-network sandbox cannot
+    /// fetch (agentmemory: npm closure + pinned iii binary).
+    pub fn all_locks_recipe_local(&self) -> bool {
+        let specs = [&self.npm, &self.pip, &self.cargo, &self.go];
+        specs.iter().all(|s| {
+            s.as_ref()
+                .is_none_or(|spec| spec.lock.starts_with("recipe/"))
+        })
+    }
+}
+
 /// One ecosystem resolver's spec: its lockfile (relative to the source
 /// root, or `recipe/`-prefixed to resolve against the package recipe
 /// directory — the lockfile ships beside the recipe; fail-closed, no
@@ -207,8 +226,7 @@ pub struct PackageDeps {
 pub struct DepsLockSpec {
     /// Lockfile path relative to the source root (e.g.
     /// "package-lock.json", "requirements.lock", "go.mod"), or
-    /// `recipe/<path>` to resolve against the package recipe directory
-    /// (the dir holding the package's `init.lua` or single `<name>.lua`).
+    /// `recipe/<path>` to resolve against the package recipe directory    /// (the dir holding the package's `init.lua` or single `<name>.lua`).
     /// Plain values fall back to the recipe dir when the source tree has
     /// no lockfile; `recipe/` values never fall back to the source tree.
     /// go's `sum` (go.sum) follows the same rules, its `recipe/` sibling
@@ -456,6 +474,345 @@ fn default_grade() -> String {
 
 fn default_confinement() -> String {
     "strict".to_string()
+}
+
+// ── Build-input digest (issue #113) ──
+//
+// Canonical content digest over the BUILD-RELEVANT fields of a resolved
+// recipe meta. Recorded on the installed package at install time; a
+// plain sync holds a package whose freshly resolved recipe digests
+// identically to the installed record instead of rebuilding it (the
+// content hold in `pod.rs`). Deliberately NOT serde serialization of
+// the whole struct: many build fields are `#[serde(skip)]` and several
+// carried fields (summary, compression, aliases) are not build inputs.
+//
+// The contract is DETERMINISM, not secrecy: the same recipe must digest
+// identically across processes. The stream is length-prefixed fields in
+// a fixed order; `HashMap`-backed fields (`apps`, `inputs`) are fed in
+// sorted key order — Rust HashMap iteration order is randomized per
+// process and would otherwise flip the digest run to run.
+
+/// Feed a length-prefixed byte string into the canonical stream.
+fn feed_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Feed a length-prefixed UTF-8 string.
+fn feed_str(buf: &mut Vec<u8>, s: &str) {
+    feed_bytes(buf, s.as_bytes());
+}
+
+/// Feed an optional string: a 0/1 presence tag, then the value.
+fn feed_opt_str(buf: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(v) => {
+            buf.push(1);
+            feed_str(buf, v);
+        }
+        None => buf.push(0),
+    }
+}
+
+/// Feed an optional structured value: a 0/1 presence tag, then the
+/// value as encoded by `feed`.
+fn feed_opt<T, F>(buf: &mut Vec<u8>, value: Option<&T>, feed: F)
+where
+    F: Fn(&mut Vec<u8>, &T),
+{
+    match value {
+        Some(v) => {
+            buf.push(1);
+            feed(buf, v);
+        }
+        None => buf.push(0),
+    }
+}
+
+/// Feed a boolean as one byte.
+fn feed_bool(buf: &mut Vec<u8>, b: bool) {
+    buf.push(u8::from(b));
+}
+
+/// Feed a canonical JSON encoding. serde_json's object map is a
+/// BTreeMap (no `preserve_order` feature), so key order is sorted and
+/// the encoding is deterministic.
+fn feed_json(buf: &mut Vec<u8>, value: &serde_json::Value) {
+    let bytes = serde_json::to_vec(value).expect("serde_json::Value is always serializable");
+    feed_bytes(buf, &bytes);
+}
+
+/// Feed a string list in declared order — order carries meaning for
+/// declared lists (build sequencing, dependency ordering).
+fn feed_str_list(buf: &mut Vec<u8>, items: &[String]) {
+    buf.extend_from_slice(&(items.len() as u64).to_le_bytes());
+    for item in items {
+        feed_str(buf, item);
+    }
+}
+
+/// Feed a `HashMap`-backed map in SORTED key order: count, then
+/// key-sorted entries. Never iterate a HashMap directly — its order is
+/// per-process noise.
+fn feed_sorted_map<V, F>(buf: &mut Vec<u8>, map: &HashMap<String, V>, feed_value: F)
+where
+    F: Fn(&mut Vec<u8>, &V),
+{
+    let mut names: Vec<&String> = map.keys().collect();
+    names.sort();
+    buf.extend_from_slice(&(names.len() as u64).to_le_bytes());
+    for name in names {
+        feed_str(buf, name);
+        feed_value(buf, &map[name]);
+    }
+}
+
+/// The BTreeMap twin: already ordered, feed as-is.
+fn feed_ordered_map<V, F>(buf: &mut Vec<u8>, map: &BTreeMap<String, V>, feed_value: F)
+where
+    F: Fn(&mut Vec<u8>, &V),
+{
+    buf.extend_from_slice(&(map.len() as u64).to_le_bytes());
+    for (name, value) in map {
+        feed_str(buf, name);
+        feed_value(buf, value);
+    }
+}
+
+/// Feed one pinned source: variant tag + url + optional pin hash (the
+/// hash IS the source identity when pinned).
+fn feed_source(buf: &mut Vec<u8>, source: &SourceSpec) {
+    match source {
+        SourceSpec::Unverified(url) => {
+            buf.push(0);
+            feed_str(buf, url);
+        }
+        SourceSpec::Pinned { url, sha256 } => {
+            buf.push(1);
+            feed_str(buf, url);
+            feed_str(buf, sha256);
+        }
+    }
+}
+
+fn feed_source_map(buf: &mut Vec<u8>, sources: &BTreeMap<String, SourceSpec>) {
+    feed_ordered_map(buf, sources, feed_source);
+}
+
+/// Feed one build part: command, ordering edges, plugin shape.
+fn feed_part(buf: &mut Vec<u8>, part: &SnapPart) {
+    feed_str(buf, &part.build);
+    feed_str_list(buf, &part.after);
+    feed_opt_str(buf, part.plugin.as_deref());
+    feed_opt(buf, part.plugin_options.as_ref(), |buf, opts| {
+        feed_ordered_map(buf, opts, |buf, value| feed_json(buf, &value.to_json()));
+    });
+}
+
+fn feed_part_map(buf: &mut Vec<u8>, parts: &BTreeMap<String, SnapPart>) {
+    feed_ordered_map(buf, parts, feed_part);
+}
+
+fn feed_env_map(buf: &mut Vec<u8>, env: &BTreeMap<String, String>) {
+    feed_ordered_map(buf, env, |buf, value| feed_str(buf, value));
+}
+
+/// Feed one layout entry: variant tag + payload.
+fn feed_layout(buf: &mut Vec<u8>, layout: &LayoutEntry) {
+    match layout {
+        LayoutEntry::Bind(v) => {
+            buf.push(0);
+            feed_str(buf, v);
+        }
+        LayoutEntry::BindFile(v) => {
+            buf.push(1);
+            feed_str(buf, v);
+        }
+        LayoutEntry::Symlink(v) => {
+            buf.push(2);
+            feed_str(buf, v);
+        }
+        LayoutEntry::Tmpfs(TmpfsSpec::Bare(b)) => {
+            buf.push(3);
+            feed_bool(buf, *b);
+        }
+        LayoutEntry::Tmpfs(TmpfsSpec::Sized { size }) => {
+            buf.push(4);
+            feed_str(buf, size);
+        }
+    }
+}
+
+fn feed_layout_map(buf: &mut Vec<u8>, layout: &BTreeMap<String, LayoutEntry>) {
+    feed_ordered_map(buf, layout, feed_layout);
+}
+
+/// Feed one hook: the executed command plus the declared source path.
+fn feed_hook(buf: &mut Vec<u8>, hook: &SnapHook) {
+    feed_str(buf, &hook.command);
+    feed_str(buf, &hook.source);
+}
+
+fn feed_hook_map(buf: &mut Vec<u8>, hooks: &BTreeMap<String, SnapHook>) {
+    feed_ordered_map(buf, hooks, feed_hook);
+}
+
+/// Feed one plug/slot: bare interface name or typed attributes.
+fn feed_plug(buf: &mut Vec<u8>, plug: &SnapPlug) {
+    match plug {
+        SnapPlug::Name(name) => {
+            buf.push(0);
+            feed_str(buf, name);
+        }
+        SnapPlug::Typed(typed) => {
+            buf.push(1);
+            feed_str(buf, &typed.interface);
+            feed_ordered_map(buf, &typed.attributes, |buf, value| feed_str(buf, value));
+        }
+    }
+}
+
+fn feed_plug_map(buf: &mut Vec<u8>, plugs: &BTreeMap<String, SnapPlug>) {
+    feed_ordered_map(buf, plugs, feed_plug);
+}
+
+/// Feed confinement grants: backend + the shared grants vocabulary.
+fn feed_confinement(buf: &mut Vec<u8>, conf: &Confinement) {
+    feed_str(buf, conf.backend.as_str());
+    feed_str_list(buf, &conf.filesystem);
+    feed_bool(buf, conf.network);
+    feed_str_list(buf, &conf.sockets);
+    feed_str_list(buf, &conf.devices);
+    feed_ordered_map(buf, &conf.backend_options, feed_json);
+}
+
+/// Feed one app: every app field shapes the payload — command, daemon
+/// mode, plug/slot wiring, env, desktop entry, interpreter wrapper,
+/// per-app confinement.
+fn feed_app(buf: &mut Vec<u8>, app: &SnapApp) {
+    feed_str(buf, &app.command);
+    feed_opt_str(buf, app.daemon.as_deref());
+    feed_opt(buf, app.plugs.as_ref(), |buf, plugs: &Vec<String>| {
+        feed_str_list(buf, plugs)
+    });
+    feed_opt(buf, app.slots.as_ref(), |buf, slots: &Vec<String>| {
+        feed_str_list(buf, slots)
+    });
+    feed_opt(buf, app.environment.as_ref(), feed_env_map);
+    feed_opt_str(buf, app.desktop.as_deref());
+    feed_opt_str(buf, app.interpreter.as_deref());
+    feed_opt(buf, app.confined.as_ref(), feed_confinement);
+}
+
+fn feed_app_map(buf: &mut Vec<u8>, apps: &HashMap<String, SnapApp>) {
+    feed_sorted_map(buf, apps, feed_app);
+}
+
+/// Feed one service: everything the backend artifact renders from.
+fn feed_service(buf: &mut Vec<u8>, svc: &ServiceDecl) {
+    feed_str(buf, &svc.command);
+    let daemon = match svc.daemon {
+        ServiceDaemon::Simple => "simple",
+        ServiceDaemon::Notify => "notify",
+        ServiceDaemon::Forking => "forking",
+    };
+    feed_str(buf, daemon);
+    feed_str_list(buf, &svc.args);
+    feed_ordered_map(buf, &svc.options, feed_json);
+    feed_str_list(buf, &svc.after);
+    feed_env_map(buf, &svc.environment);
+    feed_ordered_map(buf, &svc.backend_options, feed_json);
+}
+
+fn feed_service_map(buf: &mut Vec<u8>, services: &BTreeMap<String, ServiceDecl>) {
+    feed_ordered_map(buf, services, feed_service);
+}
+
+/// Feed one package input: URL + submodule policy.
+fn feed_input(buf: &mut Vec<u8>, input: &PackageInput) {
+    feed_str(buf, &input.url);
+    match &input.submodules {
+        Some(SubmoduleSpec::All(b)) => {
+            buf.push(1);
+            feed_bool(buf, *b);
+        }
+        Some(SubmoduleSpec::Named(names)) => {
+            buf.push(2);
+            feed_str_list(buf, names);
+        }
+        None => buf.push(0),
+    }
+}
+
+fn feed_input_map(buf: &mut Vec<u8>, inputs: &HashMap<String, PackageInput>) {
+    feed_sorted_map(buf, inputs, feed_input);
+}
+
+/// Feed one ecosystem resolver spec of a deps closure declaration.
+fn feed_deps_lock_spec(buf: &mut Vec<u8>, spec: &DepsLockSpec) {
+    feed_str(buf, &spec.lock);
+    feed_opt_str(buf, spec.sum.as_deref());
+    feed_opt_str(buf, spec.index.as_deref());
+    feed_str_list(buf, &spec.exclude);
+    feed_opt_str(buf, spec.python.as_deref());
+}
+
+fn feed_deps(buf: &mut Vec<u8>, deps: &PackageDeps) {
+    for slot in [&deps.npm, &deps.pip, &deps.cargo, &deps.go] {
+        feed_opt(buf, slot.as_ref(), feed_deps_lock_spec);
+    }
+}
+
+impl SnapMeta {
+    /// Canonical build-input digest (sha3-384, hex) of this resolved
+    /// recipe meta (issue #113). Deterministic: the same recipe digests
+    /// identically across processes. Recorded on the installed package
+    /// at install time; a plain sync whose freshly resolved meta digests
+    /// the same as the installed record holds instead of rebuilding.
+    ///
+    /// Hashed: identity (name, version, type, grade, confinement,
+    /// adopt-info), source inputs (single + named, url + pin hash), the
+    /// build tree (command, parts with plugin shape), dependency
+    /// declarations (build_deps, requires, deps closures), the runtime
+    /// surface that rides the payload (environment, layout, hooks,
+    /// plugs, slots, confinement, apps, services, inputs), and the
+    /// build-sandbox selectors (target, toolchain). Deliberately
+    /// excluded: docs-only fields (summary, description, license),
+    /// distribution metadata (compression, aliases, architectures), and
+    /// machine-local paths (definition_dir).
+    pub fn build_input_digest(&self) -> String {
+        let mut buf = Vec::new();
+        feed_str(&mut buf, &self.name);
+        feed_str(&mut buf, &self.version);
+        feed_opt_str(&mut buf, self.type_.as_deref());
+        feed_str(&mut buf, &self.grade);
+        feed_str(&mut buf, &self.confinement);
+        feed_opt_str(&mut buf, self.adopt_info.as_deref());
+        feed_bool(&mut buf, self.version_adopted);
+        feed_opt(&mut buf, self.source.as_ref(), feed_source);
+        feed_opt(&mut buf, self.sources.as_ref(), feed_source_map);
+        feed_opt_str(&mut buf, self.build.as_deref());
+        feed_opt(&mut buf, self.parts.as_ref(), feed_part_map);
+        feed_str_list(&mut buf, &self.build_deps);
+        feed_str_list(&mut buf, &self.requires);
+        feed_opt(&mut buf, self.environment.as_ref(), feed_env_map);
+        feed_opt(&mut buf, self.layout.as_ref(), feed_layout_map);
+        feed_opt(&mut buf, self.hooks.as_ref(), feed_hook_map);
+        feed_opt(&mut buf, self.plugs.as_ref(), feed_plug_map);
+        feed_opt(&mut buf, self.slots.as_ref(), feed_plug_map);
+        feed_opt(&mut buf, self.confined.as_ref(), feed_confinement);
+        // HashMap-backed fields: sorted — see the determinism note above.
+        feed_app_map(&mut buf, &self.apps);
+        feed_service_map(&mut buf, &self.services);
+        feed_opt(&mut buf, self.inputs.as_ref(), feed_input_map);
+        feed_opt_str(&mut buf, self.target.as_deref());
+        feed_opt_str(&mut buf, self.toolchain.as_deref());
+        feed_opt_str(&mut buf, self.icon_source.as_deref());
+        feed_opt_str(&mut buf, self.icon.as_deref());
+        feed_opt(&mut buf, self.deps.as_ref(), feed_deps);
+        let hash = <sha3::Sha3_384 as sha3::Digest>::digest(&buf);
+        hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 /// An app declared inside a snap.
@@ -1372,15 +1729,21 @@ impl SnapMeta {
         let deps = get_opt_table(table, "deps")?
             .map(|t| package_deps_from_lua(&t))
             .transpose()?;
-        // A dependency closure resolves from the source tree (the lockfile
-        // ships in the source tarball), so `deps` without `source` can
-        // never fetch. Fail at the parse boundary, not mid-fetch.
-        // Multi-source (`sources`) has no single tree for a lockfile to
-        // ship in — the single-source requirement covers it too.
+        // A dependency closure resolves from ONE of two roots: the
+        // source tree (the lockfile ships in the source tarball) or the
+        // recipe directory (the ADR-0017-addendum `recipe/` prefix — the
+        // lockfile ships beside the recipe). `deps` therefore fails the
+        // parse boundary only when it can resolve from NEITHER: a
+        // source-relative lockfile without `source`. Recipe-local locks
+        // need no source at all — which is what lets a multi-source
+        // build (issue #41 `sources`) carry an ecosystem closure.
         if deps.is_some() && source.is_none() {
-            return Err(miette::miette!(
-                "snap meta: 'deps' requires 'source' — the lockfile resolves from the package source tree"
-            ));
+            let all_recipe_local = deps.as_ref().is_some_and(|d| d.all_locks_recipe_local());
+            if !all_recipe_local {
+                return Err(miette::miette!(
+                    "snap meta: 'deps' requires 'source' — the lockfile resolves from the package source tree"
+                ));
+            }
         }
         // The adopt-info ladder reads ONE pinned source tree (its
         // extractors resolve relative to `$SRC`). With named sources there
@@ -6076,6 +6439,179 @@ fn cp_r(src: &Path, dst: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    // ── Build-input digest (issue #113) ──
+
+    /// Bare SnapMeta with every optional field empty (mirrors the test
+    /// helpers in manifest.rs / pod.rs).
+    fn bare_meta(name: &str, version: &str) -> SnapMeta {
+        SnapMeta {
+            name: name.into(),
+            version: version.into(),
+            summary: None,
+            description: None,
+            license: None,
+            source: None,
+            sources: None,
+            build: None,
+            parts: None,
+            architectures: None,
+            grade: "stable".into(),
+            confinement: "strict".into(),
+            type_: None,
+            adopt_info: None,
+            version_adopted: false,
+            icon_source: None,
+            icon: None,
+            compression: None,
+            environment: None,
+            layout: None,
+            hooks: None,
+            plugs: None,
+            slots: None,
+            aliases: vec![],
+            requires: vec![],
+            build_deps: vec![],
+            leaks_ok: vec![],
+            target: None,
+            toolchain: None,
+            inputs: None,
+            confined: None,
+            apps: HashMap::new(),
+            services: BTreeMap::new(),
+            deps: None,
+            floating: false,
+            definition_dir: None,
+        }
+    }
+
+    /// The digest contract is determinism across processes: Rust
+    /// randomizes HashMap iteration order per process, so two metas
+    /// whose HashMap-backed fields (`apps`, `inputs`) were populated in
+    /// different orders MUST digest identically.
+    #[test]
+    fn build_input_digest_is_stable_over_hashmap_insertion_order() {
+        let mut first = bare_meta("tool", "1.0");
+        first.apps.insert(
+            "zapp".to_string(),
+            SnapApp {
+                command: "bin/z".into(),
+                daemon: None,
+                plugs: None,
+                slots: None,
+                environment: None,
+                desktop: None,
+                interpreter: None,
+                confined: None,
+            },
+        );
+        first.apps.insert(
+            "app".to_string(),
+            SnapApp {
+                command: "bin/a".into(),
+                daemon: None,
+                plugs: None,
+                slots: None,
+                environment: None,
+                desktop: None,
+                interpreter: None,
+                confined: None,
+            },
+        );
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "pkgs".to_string(),
+            PackageInput {
+                url: "github:rbelem/shuttle/main".into(),
+                submodules: None,
+            },
+        );
+        inputs.insert(
+            "defs".to_string(),
+            PackageInput {
+                url: "path:/home/user/pkgs".into(),
+                submodules: None,
+            },
+        );
+        first.inputs = Some(inputs);
+
+        let mut second = bare_meta("tool", "1.0");
+        // Reverse insertion order for both maps.
+        second.apps.insert(
+            "app".to_string(),
+            SnapApp {
+                command: "bin/a".into(),
+                daemon: None,
+                plugs: None,
+                slots: None,
+                environment: None,
+                desktop: None,
+                interpreter: None,
+                confined: None,
+            },
+        );
+        second.apps.insert(
+            "zapp".to_string(),
+            SnapApp {
+                command: "bin/z".into(),
+                daemon: None,
+                plugs: None,
+                slots: None,
+                environment: None,
+                desktop: None,
+                interpreter: None,
+                confined: None,
+            },
+        );
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "defs".to_string(),
+            PackageInput {
+                url: "path:/home/user/pkgs".into(),
+                submodules: None,
+            },
+        );
+        inputs.insert(
+            "pkgs".to_string(),
+            PackageInput {
+                url: "github:rbelem/shuttle/main".into(),
+                submodules: None,
+            },
+        );
+        second.inputs = Some(inputs);
+
+        assert_eq!(
+            first.build_input_digest(),
+            second.build_input_digest(),
+            "HashMap iteration order must not reach the digest"
+        );
+    }
+
+    /// The build command is a build input: changing it must flip the
+    /// digest so a plain sync rebuilds the package.
+    #[test]
+    fn build_input_digest_changes_when_the_build_command_changes() {
+        let mut old = bare_meta("tool", "1.0");
+        old.build = Some("make && make install".into());
+        let mut new = old.clone();
+        new.build = Some("make && make PREFIX=/usr install".into());
+        assert_ne!(old.build_input_digest(), new.build_input_digest());
+        // Control: an identical meta still digests identically.
+        let same = old.clone();
+        assert_eq!(old.build_input_digest(), same.build_input_digest());
+    }
+
+    /// The build_deps declaration is a build input: adding one must
+    /// flip the digest (the merged prefix changes with it).
+    #[test]
+    fn build_input_digest_changes_when_build_deps_change() {
+        let mut old = bare_meta("tool", "1.0");
+        old.build = Some("./configure && make".into());
+        old.build_deps = vec!["toolchain-gcc-gnu-x86_64".to_string()];
+        let mut new = old.clone();
+        new.build_deps.push("libfoo".to_string());
+        assert_ne!(old.build_input_digest(), new.build_input_digest());
+    }
+
     #[test]
     fn pip_deps_spec_parses_python_and_exclude() {
         let env = LuaEnv::new();
@@ -6104,6 +6640,57 @@ mod tests {
             .eval(r#"return { lock = "l", python = "3.14" }"#)
             .unwrap();
         assert!(deps_lock_spec_from_lua("npm", &npm_table).is_err());
+    }
+
+    /// A deps block whose lockfiles are ALL recipe-local resolves from
+    /// the recipe directory (ADR-0017 addendum) — it needs no `source`,
+    /// which is what lets a multi-source build (`sources`) carry an
+    /// ecosystem closure (agentmemory: recipe-local npm lock + a
+    /// `sources` map for the artifacts the sandbox cannot fetch).
+    #[test]
+    fn deps_recipe_local_locks_parse_without_source() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "agentmemory", version = "0.9.29",
+                sources = {
+                    npm = {
+                        url = "https://example.com/pkg.tgz",
+                        sha256 = "e9b1d4d5f3c0b2a1d9c8f7e6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b",
+                    },
+                },
+                deps = { npm = { lock = "recipe/package-lock.json" } },
+            }
+            "#,
+            )
+            .unwrap();
+        let meta = SnapMeta::from_lua_table(&table).unwrap();
+        assert!(meta.deps.as_ref().unwrap().all_locks_recipe_local());
+    }
+
+    /// A source-relative lockfile has no recipe-dir fallback: without
+    /// `source` the closure could never fetch — still fail at the
+    /// parse boundary (the Lua prelude rejects first; the Rust
+    /// boundary mirrors it).
+    #[test]
+    fn deps_source_relative_lock_still_requires_source() {
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return snap {
+                name = "hybrid", version = "1.0",
+                deps = { cargo = { lock = "Cargo.lock" } },
+            }
+            "#,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("'deps' requires 'source'"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Evaluate with DSL and get top-level table (keeps Lua alive for the duration).

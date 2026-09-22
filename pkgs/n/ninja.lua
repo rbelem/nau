@@ -14,7 +14,14 @@ to run builds as fast as possible.]],
         confinement = "strict",
         architectures = { "amd64" },
         type = "source",
-        requires = {},
+        -- Cold-build closure (issue #114): the ninja binary links
+        -- libstdc++/libgcc_s and the hermetic build sandbox resolves
+        -- shared libraries only from the merged build prefix — with
+        -- requires = {} the prefix carried neither, so meson found ninja
+        -- but could not exec it ("Could not detect Ninja v1.8.2 or
+        -- newer", dconf cold repro). Installed-pod operation only ever
+        -- worked through the unrelated libstdcpp/libgcc pod extensions.
+        requires = { "glibc", "libstdcpp", "libgcc" },
         -- ninja's build drives cmake; cmake is a build-time-only tool, so
         -- it is a build_dep (never a runtime requires). It materializes
         -- into the merged build prefix.

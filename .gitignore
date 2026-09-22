@@ -28,3 +28,7 @@ stage/
 # CodeGraph index
 .codegraph/
 .venv/
+
+# Local tooling artifacts (generated)
+.audit/
+graphify-out/

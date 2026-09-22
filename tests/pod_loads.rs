@@ -623,3 +623,226 @@ gated_test!(load_nonexistent_pod_fails_before_any_mutation, {
         "lockfile must be untouched"
     );
 });
+
+// ── Acceptance: loaded generation UNION declaration (issue #103) ──
+//
+// A loaded pod's active generation is what it EXECUTES, but its
+// declaration is what its next sync will build. When the two drift
+// apart (a declaration addition predating the sync, a failed/partial
+// sync, a degraded removal), the loading pod's composition must see
+// the UNION — generation content winning the name clash — or the
+// loaded pod's next sync yanks the loading pod into a
+// remove-then-rebuild loop.
+
+// The loading pod's contribution must include a name the loaded pod
+// DECLARES but whose active generation does not carry it, resolved
+// live (built and linked into the loading pod's farm).
+gated_test!(
+    loaded_declaration_missing_from_generation_still_contributes,
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let port = serve_dir(server.path());
+
+        write_app_pkg(
+            project.path(),
+            "base-pkg",
+            "1.0",
+            "base-ran",
+            "basetool",
+            port,
+        );
+        make_tarball(server.path(), "base-pkg");
+        write_app_pkg(
+            project.path(),
+            "extra-pkg",
+            "1.0",
+            "extra-ran",
+            "extratool",
+            port,
+        );
+        make_tarball(server.path(), "extra-pkg");
+
+        // base syncs with base-pkg only: its generation carries base-pkg.
+        let (code, _, stderr) =
+            run_named(project.path(), root.path(), "base", &["add", "base-pkg"]);
+        assert_eq!(code, Some(0), "base add failed: {stderr}");
+        assert_eq!(current_generation(root.path(), "base"), 1);
+
+        // base's declaration drifts ahead of its generation: extra-pkg is
+        // declared but NOT in the active generation (never synced).
+        let base_decl = pod_dir(root.path(), "base").join("pod.lua");
+        let decl = std::fs::read_to_string(&base_decl).unwrap();
+        let edited = decl.replace(
+            r#"packages = { "base-pkg" },"#,
+            r#"packages = { "base-pkg", "extra-pkg" },"#,
+        );
+        assert_ne!(edited, decl, "fixture must match");
+        std::fs::write(&base_decl, &edited).unwrap();
+
+        // work loads base; base's generation alone would contribute only
+        // base-pkg — the declaration's extra-pkg must still arrive.
+        let (code, _, stderr) =
+            run_named(project.path(), root.path(), "work", &["add", "base-pkg"]);
+        assert_eq!(code, Some(0), "work add failed: {stderr}");
+        let work_decl = pod_dir(root.path(), "work").join("pod.lua");
+        let decl = std::fs::read_to_string(&work_decl).unwrap();
+        let edited = decl.replace(r#"packages = { "base-pkg" },"#, r#"loads = { "base" },"#);
+        assert_ne!(edited, decl, "fixture must match");
+        std::fs::write(&work_decl, &edited).unwrap();
+
+        let (code, _, stderr) = run_named(project.path(), root.path(), "work", &["sync"]);
+        assert_eq!(code, Some(0), "work sync failed: {stderr}");
+        let g = current_generation(root.path(), "work");
+        assert_eq!(manifest_version(root.path(), "work", g, "base-pkg"), "1.0");
+        assert_eq!(
+            manifest_version(root.path(), "work", g, "extra-pkg"),
+            "1.0",
+            "the loaded pod's declaration-only package must reach the loading pod"
+        );
+        assert_eq!(
+            farm_output(&current_farm(root.path(), "work"), "extratool"),
+            "extra-ran",
+            "the declaration-only package must be built and linked, not just recorded"
+        );
+    }
+);
+
+// A name present in BOTH the loaded pod's generation and its
+// declaration keeps the generation's executing version — the live
+// declaration resolution must not displace it.
+gated_test!(
+    loaded_generation_version_wins_over_declaration_resolution,
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let port = serve_dir(server.path());
+
+        write_app_pkg(
+            project.path(),
+            "base-pkg",
+            "1.0",
+            "base-ran",
+            "basetool",
+            port,
+        );
+        make_tarball(server.path(), "base-pkg");
+        let (code, _, stderr) =
+            run_named(project.path(), root.path(), "base", &["add", "base-pkg"]);
+        assert_eq!(code, Some(0), "base add failed: {stderr}");
+        assert_eq!(manifest_version(root.path(), "base", 1, "base-pkg"), "1.0");
+
+        // Bump the collection fixture to 2.0 WITHOUT re-syncing base: the
+        // live declaration resolution now yields 2.0 while the active
+        // generation still executes 1.0. Executing content must win.
+        write_app_pkg(
+            project.path(),
+            "base-pkg",
+            "2.0",
+            "base-ran",
+            "basetool",
+            port,
+        );
+
+        let (code, _, stderr) =
+            run_named(project.path(), root.path(), "work", &["add", "base-pkg"]);
+        assert_eq!(code, Some(0), "work add failed: {stderr}");
+        let work_decl = pod_dir(root.path(), "work").join("pod.lua");
+        let decl = std::fs::read_to_string(&work_decl).unwrap();
+        let edited = decl.replace(r#"packages = { "base-pkg" },"#, r#"loads = { "base" },"#);
+        assert_ne!(edited, decl, "fixture must match");
+        std::fs::write(&work_decl, &edited).unwrap();
+
+        let (code, _, stderr) = run_named(project.path(), root.path(), "work", &["sync"]);
+        assert_eq!(code, Some(0), "work sync failed: {stderr}");
+        let g = current_generation(root.path(), "work");
+        assert_eq!(
+            manifest_version(root.path(), "work", g, "base-pkg"),
+            "1.0",
+            "the loaded pod's executing version must win the generation/declaration clash"
+        );
+        assert_eq!(
+            farm_output(&current_farm(root.path(), "work"), "basetool"),
+            "base-ran",
+            "the executing build must be what the loaded pod executes"
+        );
+    }
+);
+
+// The union recursion must go through the loaded graph: a sub-load's
+// declaration-only name reaches the loading pod through its immediate
+// load (work loads base loads sub).
+gated_test!(
+    sub_load_declaration_only_name_folds_through_loaded_generation,
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let port = serve_dir(server.path());
+
+        write_app_pkg(project.path(), "sub-pkg", "0.1", "sub-ran", "subtool", port);
+        make_tarball(server.path(), "sub-pkg");
+        write_app_pkg(
+            project.path(),
+            "sub-extra",
+            "0.1",
+            "subextra-ran",
+            "subxtool",
+            port,
+        );
+        make_tarball(server.path(), "sub-extra");
+
+        // sub syncs with sub-pkg only; its generation carries sub-pkg.
+        let (code, _, stderr) = run_named(project.path(), root.path(), "sub", &["add", "sub-pkg"]);
+        assert_eq!(code, Some(0), "sub add failed: {stderr}");
+
+        // base becomes a pure load node over sub BEFORE sub drifts, so
+        // base's own generation stays clean (sub-pkg only).
+        let (code, _, stderr) = run_named(project.path(), root.path(), "base", &["add", "sub-pkg"]);
+        assert_eq!(code, Some(0), "base add failed: {stderr}");
+        let base_decl = pod_dir(root.path(), "base").join("pod.lua");
+        let decl = std::fs::read_to_string(&base_decl).unwrap();
+        let edited = decl.replace(r#"packages = { "sub-pkg" },"#, r#"loads = { "sub" },"#);
+        assert_ne!(edited, decl, "fixture must match");
+        std::fs::write(&base_decl, &edited).unwrap();
+        let (code, _, stderr) = run_named(project.path(), root.path(), "base", &["sync"]);
+        assert_eq!(code, Some(0), "base sync failed: {stderr}");
+
+        // NOW sub's declaration drifts ahead of its generation.
+        let sub_decl = pod_dir(root.path(), "sub").join("pod.lua");
+        let decl = std::fs::read_to_string(&sub_decl).unwrap();
+        let edited = decl.replace(
+            r#"packages = { "sub-pkg" },"#,
+            r#"packages = { "sub-pkg", "sub-extra" },"#,
+        );
+        assert_ne!(edited, decl, "fixture must match");
+        std::fs::write(&sub_decl, &edited).unwrap();
+
+        // work loads base. sub-extra must fold through base's contribution
+        // (base's generation ∪ base's declaration → sub's contribution).
+        let (code, _, stderr) = run_named(project.path(), root.path(), "work", &["add", "sub-pkg"]);
+        assert_eq!(code, Some(0), "work add failed: {stderr}");
+        let work_decl = pod_dir(root.path(), "work").join("pod.lua");
+        let decl = std::fs::read_to_string(&work_decl).unwrap();
+        let edited = decl.replace(r#"packages = { "sub-pkg" },"#, r#"loads = { "base" },"#);
+        assert_ne!(edited, decl, "fixture must match");
+        std::fs::write(&work_decl, &edited).unwrap();
+
+        let (code, _, stderr) = run_named(project.path(), root.path(), "work", &["sync"]);
+        assert_eq!(code, Some(0), "work sync failed: {stderr}");
+        let g = current_generation(root.path(), "work");
+        assert_eq!(manifest_version(root.path(), "work", g, "sub-pkg"), "0.1");
+        assert_eq!(
+            manifest_version(root.path(), "work", g, "sub-extra"),
+            "0.1",
+            "the sub-load's declaration-only package must fold through one level"
+        );
+        assert_eq!(
+            farm_output(&current_farm(root.path(), "work"), "subxtool"),
+            "subextra-ran",
+            "the sub-load's declaration-only package must be built and linked"
+        );
+    }
+);

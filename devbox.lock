@@ -615,17 +615,29 @@
         }
       }
     },
-    "github:NixOS/nixpkgs#pkgsStatic.busybox": {
-      "last_modified": "2026-09-11T16:26:48Z",
-      "resolved": "github:NixOS/nixpkgs/573136fe94c5b39768d0b261c4cad5fa483c9c01?lastModified=1789144008&narHash=sha256-mig%2FTf3cKxZBFuRKA8D6zq7h5ZHyXXjQjjs2%2FcZ6WrM%3D#pkgsStatic.busybox"
+    "github:NixOS/nixpkgs/nixos-26.05#cargo-llvm-cov": {
+      "last_modified": "2026-09-21T13:54:21Z",
+      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#cargo-llvm-cov"
     },
-    "github:NixOS/nixpkgs#pkgsStatic.cryptsetup.bin": {
-      "last_modified": "2026-09-11T16:26:48Z",
-      "resolved": "github:NixOS/nixpkgs/573136fe94c5b39768d0b261c4cad5fa483c9c01?lastModified=1789144008&narHash=sha256-mig%2FTf3cKxZBFuRKA8D6zq7h5ZHyXXjQjjs2%2FcZ6WrM%3D#pkgsStatic.cryptsetup.bin"
+    "github:NixOS/nixpkgs/nixos-26.05#lua54Packages.luacheck": {
+      "last_modified": "2026-09-21T13:54:21Z",
+      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#lua54Packages.luacheck"
     },
-    "github:NixOS/nixpkgs#pkgsStatic.util-linux.bin": {
-      "last_modified": "2026-09-11T16:26:48Z",
-      "resolved": "github:NixOS/nixpkgs/573136fe94c5b39768d0b261c4cad5fa483c9c01?lastModified=1789144008&narHash=sha256-mig%2FTf3cKxZBFuRKA8D6zq7h5ZHyXXjQjjs2%2FcZ6WrM%3D#pkgsStatic.util-linux.bin"
+    "github:NixOS/nixpkgs/nixos-26.05#pkgsStatic.busybox": {
+      "last_modified": "2026-09-21T13:54:21Z",
+      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#pkgsStatic.busybox"
+    },
+    "github:NixOS/nixpkgs/nixos-26.05#pkgsStatic.cryptsetup.bin": {
+      "last_modified": "2026-09-21T13:54:21Z",
+      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#pkgsStatic.cryptsetup.bin"
+    },
+    "github:NixOS/nixpkgs/nixos-26.05#pkgsStatic.util-linux.bin": {
+      "last_modified": "2026-09-21T13:54:21Z",
+      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#pkgsStatic.util-linux.bin"
+    },
+    "github:NixOS/nixpkgs/nixos-26.05#stylua": {
+      "last_modified": "2026-09-21T13:54:21Z",
+      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#stylua"
     },
     "github:NixOS/nixpkgs/nixpkgs-unstable": {
       "last_modified": "2026-05-27T10:28:13Z",

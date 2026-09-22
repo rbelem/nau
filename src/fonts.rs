@@ -180,6 +180,7 @@ mod tests {
                         .collect(),
                     services: std::collections::BTreeMap::new(),
                     service_bins: std::collections::BTreeMap::new(),
+                    meta_digest: None,
                 },
             );
         }
