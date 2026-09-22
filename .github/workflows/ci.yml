@@ -39,7 +39,7 @@ jobs:
       - name: Install actionlint
         uses: taiki-e/install-action@v2
         with:
-          tool: actionlint@1.7.7
+          tool: actionlint
 
       - name: Lint workflow
         run: actionlint -color
@@ -74,6 +74,15 @@ jobs:
       # for the job.
       - name: Allow unprivileged userns (bubblewrap sandbox)
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # The go-deps tests (tests/pod_deps.rs) gate on host go being
+      # sandbox-visible, but on GH runners go lives in /usr/local/go —
+      # a SEPARATE mount that bwrap's /usr bind does not cross — so the
+      # gate passes host-side while the sandbox itself reports
+      # "go: not found". The distro go lands at /usr/bin/go, inside the
+      # bound /usr, where the sandbox can actually use it.
+      - name: Install golang (go-deps tests build inside the sandbox)
+        run: sudo apt-get install -y --no-install-recommends golang-go
 
       - name: Install devbox
         uses: jetify-com/devbox-install-action@v0.12.0
