@@ -36,13 +36,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install actionlint
-        uses: taiki-e/install-action@v2
-        with:
-          tool: actionlint
+      - name: Download actionlint
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+            https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash |
+          bash -s -- 1.7.7
 
       - name: Lint workflow
-        run: actionlint -color
+        run: ./actionlint -color
 
   deps:
     runs-on: ubuntu-24.04

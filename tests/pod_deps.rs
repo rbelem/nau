@@ -1907,7 +1907,11 @@ gated_test!(tampered_go_closure_fails_build, &["go"], {
     assert_eq!(code, Some(0), "stderr: {stderr}");
 
     // Flip a byte inside the stored closure blob (same path, different
-    // content) — the build-time verification must fail closed.
+    // content) — build-time verification must fail closed. Since #113 a
+    // plain sync HOLDS recipe-identical packages on the meta digest and
+    // never reads the blob, so bump the recipe first: the divergent meta
+    // digest forces the rebuild path, which must consume the corrupted
+    // blob and fail on its hash.
     let (hash, _) = lock_deps_pin(root.path(), "default", "zgotmp");
     let blob = pod_dir(root.path(), "default")
         .join("store")
@@ -1917,6 +1921,14 @@ gated_test!(tampered_go_closure_fails_build, &["go"], {
     let last = bytes.len() - 1;
     bytes[last] ^= 0xff;
     std::fs::write(&blob, &bytes).unwrap();
+
+    let recipe = project.path().join("pkgs/z/zgotmp.lua");
+    let lua = std::fs::read_to_string(&recipe).unwrap();
+    std::fs::write(
+        &recipe,
+        lua.replace("version = \"1.0\"", "version = \"1.1\""),
+    )
+    .unwrap();
 
     let (code, _, stderr) = run(project.path(), root.path(), &["pod", "sync"]);
     assert_ne!(code, Some(0), "tampered closure must fail the build");
