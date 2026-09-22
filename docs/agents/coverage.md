@@ -137,6 +137,83 @@ Wave 1 attacks the biggest first.
 
 ## Wave log
 
+Line coverage measured after wave 1 and after wave 4 (the final state);
+waves 2–3 were gated with `check` and measured only in the final run.
+
+| Wave | Clusters | Commit(s) | Line coverage | Δ |
+| --- | --- | --- | --- | --- |
+| baseline | — | — | 85.98% | — |
+| 1 | A: store, index, deps | `test(store)`, `test(deps)`, `test(index)` | 86.28% (measured) | +0.30 |
+| 2 | B: confine, command | `test(confine)`, `test(command)` | — | — |
+| 3 | C: output, emit | `test(output)`, `test(emit)` | — | — |
+| 4 | D: slot_recovery, image/partition | `test(recovery)` | **86.72%** (measured) | +0.74 total |
+
+\* The final measured total is 86.72% lines / 78.99% functions, 1657 tests
+green (baseline: 1597).
+
+Per-file movement (line coverage, baseline → final):
+
+| File | Baseline | Final | Note |
+| --- | --- | --- | --- |
+| src/command.rs | 72.22% | **100%** | |
+| src/output.rs | 43.84% | **98.65%** | |
+| src/store.rs | 61.48% | **95.89%** | full fake-store offline round-trip incl. the real assertion chain |
+| src/slot_recovery.rs | 78.67% | **93.11%** | parsers, UKI listing, reclaim ordering |
+| src/assert.rs | 74.07% | 76.55% | lifted transitively by the store round-trip |
+| src/confine.rs | 82.54% | 88.92% | |
+| src/index.rs | 83.00% | 88.36% | |
+| src/deps.rs | 83.79% | 87.53% | |
+| src/emit.rs | 92.78% | 94.34% | |
+| src/image/partition.rs | 72.98% | 74.70% | extent read-back covered; exec glue remains |
+
+## Structural ceilings (honest gaps)
+
+Where coverage is bounded by reality, not by missing effort:
+
+- **src/main.rs (43.47%)** — the bin entrypoint: every line is
+  arg-parse → subcommand dispatch into real-exec work. The logic behind
+  the dispatch lives in the library and is tested; the entrypoint itself
+  only runs for real.
+- **src/isolate.rs (54.12%)** — bwrap/unshare/namespace process glue and
+  the eval-worker protocol; untestable without real sandboxes (the
+  integration suites drive it through the built binary).
+- **exec-replacement paths** — `confine::run_bwrap`/`run_apparmor`
+  bodies, `run_command`'s exec tail, `exec_direct`'s success path:
+  `CommandExt::exec` *replaces the process*, so a test cannot observe
+  past it. Error paths are covered; success paths end the process.
+- **The DSL eval seam** — `deps::load_meta`/`format_tree`,
+  `resolve_deps` on real recipes spawn the eval worker, which re-executes
+  `argv[0]`; under the test harness that is the test binary and the
+  worker protocol breaks (`running 0 tests` on the pipe). Covered by the
+  `eval_*` integration suites instead.
+- **Live endpoints** — `store::fetch`/`StoreClient::resolve` (RealRunner
+  delegation), `index::PackageIndex::resolve_all` (calls the
+  non-injectable `StoreClient::resolve`; making it injectable is a
+  production-seam change, deliberately not done here), and
+  `discovery::announce`/`browse` (real multicast; the loopback round-trip
+  is `#[ignore]`d for sandboxed CI by design).
+- **Host probes** — `confine::userns_available` (kernel knob probe),
+  `resolve_tool` misses (PATH-dependent).
+- **pre-existing flake** — `snap::tests::test_e2e_plugin_and_command_
+  parts_share_stage_and_ordering` and `test_e2e_make_plugin_variables_
+  reach_command_line` fail under some `cargo test <filter>` schedulings
+  (sandboxed `make` contention) but pass alone and in the full suite.
+  Pre-existing, untouched.
+
+## Proposed CI gate floor
+
+```
+cargo llvm-cov --workspace --all-targets --locked --fail-under-lines 86
+```
+
+86% sits just above the pre-wave baseline (85.98%), under the current
+86.72% — it locks in today's floor while leaving room to land more waves
+without churn. Ratchet upward as clusters B/D deepen (isolate and image
+glue aside, the remaining testable mass — snap.rs's long tail, cache.rs,
+dep_fetch parsing — supports a 90% medium-term ceiling).
+
+## Wave log
+
 | Wave | Clusters | Commit(s) | Line coverage | Δ |
 | --- | --- | --- | --- | --- |
 | baseline | — | — | 85.98% | — |
