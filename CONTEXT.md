@@ -47,8 +47,8 @@ _Avoid_: makedepends, nativeBuildInputs, build requires
 
 **Image**: A bootable disk image (`.img`) assembled from multiple snaps — base, kernel, gadget, and application snaps. Declared via the `image()` DSL function.
 
-**ShuttleOS**: The Linux distribution assembled by shuttle — an immutable verity-protected base updated via A/B, plus a content-addressed package store on the state partition (ADR-0011/0012).
-_Avoid_: shoot distro, shuttle distro
+**Nau**: The Linux distribution assembled by shuttle — an immutable verity-protected base updated via A/B, plus a content-addressed package store on the state partition (ADR-0011/0012). The ship the missions launch from: releases carry mission names, 1.0 is "Cassini".
+_Avoid_: shoot distro, shuttle distro, ShuttleOS, Cassini (as the distro name — it is release 1.0)
 
 **Store**: The content-addressed, file-level repository of package content — local build cache (`~/.cache/shuttle/`) and on-device under the state partition. Packages are signed manifests of store file hashes, not monolithic blobs (ADR-0012).
 _Avoid_: cache, registry, spool
