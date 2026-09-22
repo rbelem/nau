@@ -1578,6 +1578,12 @@ pub fn add_snap_pod(
         ));
     }
 
+    // Zero-write requires pre-flight (issue #132): a payload whose
+    // meta/snap.yaml carries `requires` would go ACTIVE first and only
+    // fail the follow-up sync's closure resolution on this machine —
+    // a partial generation with no rollback. Refuse before any write.
+    preflight_requires_closure(root, &dir, &decl, &meta, &name, &version)?;
+
     // Writes: declaration (new packages only) + both lockfile pins.
     let mut decl = decl;
     if !declared {
@@ -1636,7 +1642,26 @@ pub fn add_snap_pod(
     // Reconcile the rest of the pod around the installed content: the
     // blob pin holds it in place (no rebuild), the farm, services, and
     // the requires closure follow.
-    let sync = sync_pod(root, pod_name)?;
+    //
+    // A sync failure here cannot roll back (issue #132): the payload
+    // is already ACTIVE on the generation the install flipped to. The
+    // accepted residual (ADR-0037) is a declared partial generation —
+    // no restore is attempted; the error names the cause and both
+    // recovery verbs.
+    let generation = install
+        .generation
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let sync = match sync_pod(root, pod_name) {
+        Ok(sync) => sync,
+        Err(cause) => miette::bail!(
+            "sideloaded '{name}' ('{version}') is ACTIVE on generation \
+             {generation} with its `requires` closure incomplete ({cause}): \
+             libraries missing, farm/services not re-presented — provide the \
+             collection and run `shuttle pod sync` to complete, or `shuttle \
+             pod remove {name}` to abandon"
+        ),
+    };
 
     Ok(PodSnapAddReport {
         pod: pod_name.to_string(),
@@ -1646,6 +1671,50 @@ pub fn add_snap_pod(
         noop: false,
         generation: sync.generation.or(install.generation),
     })
+}
+
+/// Zero-write requires pre-flight for a sideload (issue #132): resolve
+/// the payload's `requires` closure BEFORE any declaration, pin, or
+/// generation write. The seeds mirror the follow-up sync exactly — the
+/// installed record re-seeds from `requires` ([`hold_blob_pinned`]) —
+/// minus members the post-state already provides (the payload itself,
+/// the declaration, loaded pods, the active generation: mirroring
+/// [`install_requires_closure`]'s skips), then the same resolution call
+/// sync's closure pass uses. An unresolvable member bails naming the
+/// fix; a refusal here leaves zero state to roll back.
+fn preflight_requires_closure(
+    root: &Path,
+    dir: &Path,
+    decl: &PodDeclaration,
+    meta: &crate::units::PayloadSnap,
+    name: &str,
+    version: &str,
+) -> miette::Result<()> {
+    let mut provided: std::collections::BTreeSet<String> = decl
+        .packages
+        .iter()
+        .filter_map(|spec| parse_pod_package(spec).ok().map(|p| p.name))
+        .collect();
+    provided.insert(name.to_string());
+    let (loaded_versions, _) = loaded_contributions(root, decl)?;
+    provided.extend(loaded_versions.into_keys());
+    if let Some(active) = pod_store(dir).active_generation()? {
+        provided.extend(active.packages.into_keys());
+    }
+    let seeds: Vec<String> = meta
+        .requires
+        .iter()
+        .filter(|r| !r.is_empty() && !provided.contains(*r))
+        .cloned()
+        .collect();
+    if let Err(e) = crate::deps::resolve_dep_names(&seeds, true) {
+        miette::bail!(
+            "refusing to sideload '{name}' ({version}): its `requires` closure \
+             does not resolve here ({e}) — provide the collection, or sideload \
+             from a collection-bearing machine; nothing was written"
+        );
+    }
+    Ok(())
 }
 
 /// The identical-readd check that needs no unpack: `Some(report)` when
