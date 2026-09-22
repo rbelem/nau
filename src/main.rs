@@ -3081,20 +3081,58 @@ fn merge_pod_name<'a>(parent: Option<&'a str>, verb: Option<&'a str>) -> miette:
     }
 }
 
+/// `shuttle pod add`: a collection package by name, or — with `--snap`
+/// — a sideloaded `.snap` payload (issue #116).
+fn cmd_pod_add(
+    pod_name: &str,
+    package: Option<String>,
+    snap: Option<String>,
+    ack_unsigned: bool,
+    root: Option<String>,
+) -> miette::Result<()> {
+    let root = shuttle::pod::pod_root(root.as_deref());
+    if let Some(snap) = snap {
+        let report = shuttle::pod::add_snap_pod(&root, pod_name, Path::new(&snap), ack_unsigned)?;
+        if report.noop {
+            shuttle::output::ok(format!(
+                "'{}' is already sideloaded into pod '{pod_name}' at this content \
+                 ({:.12}…) — nothing to do",
+                report.name, report.sha3_384
+            ));
+        } else {
+            let mut line = format!(
+                "sideloaded '{}' ({}) into pod '{pod_name}'",
+                report.name, report.version
+            );
+            if let Some(n) = report.generation {
+                line.push_str(&format!(" (generation {n})"));
+            }
+            shuttle::output::ok(line);
+        }
+        return Ok(());
+    }
+    // clap enforces: required unless --snap.
+    let package = package.expect("clap: package required unless --snap");
+    let report = shuttle::pod::add_package(&root, pod_name, &package)?;
+    shuttle::output::ok(format!(
+        "added '{}' ({}) to pod '{}'",
+        report.name, report.version, report.pod
+    ));
+    Ok(())
+}
+
 fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
     // Owned so `pod_name` doesn't borrow `sub` across the match's move.
     let verb_name = sub.pod_name().map(str::to_owned);
     let pod_name = merge_pod_name(name, verb_name.as_deref())?;
     match sub {
-        PodCommand::Add { package, root, .. } => {
-            let root = shuttle::pod::pod_root(root.as_deref());
-            let report = shuttle::pod::add_package(&root, pod_name, &package)?;
-            shuttle::output::ok(format!(
-                "added '{}' ({}) to pod '{}'",
-                report.name, report.version, report.pod
-            ));
-            Ok(())
-        }
+        PodCommand::Add {
+            package,
+            snap,
+            ack_unsigned,
+            root,
+            ..
+        } => cmd_pod_add(pod_name, package, snap, ack_unsigned, root),
         PodCommand::Remove { package, root, .. } => {
             let root = shuttle::pod::pod_root(root.as_deref());
             let report = shuttle::pod::remove_package(&root, pod_name, &package)?;
@@ -3442,10 +3480,16 @@ fn report_sequence_json(image: &str, outcome: &shuttle::boot_test::SequenceOutco
 /// updates name the version moves, held packages explain their
 /// constraint, and the current generation closes the story.
 fn print_pod_update_report(report: &shuttle::pod::PodUpdateReport) {
-    if report.updated.is_empty() && report.held.is_empty() {
+    if report.updated.is_empty() && report.held.is_empty() && report.skipped.is_empty() {
         shuttle::output::ok(format!(
             "pod '{}' is already at its newest matching versions — no new generation",
             report.pod
+        ));
+    }
+    for name in &report.skipped {
+        shuttle::output::warn(format!(
+            "skipped '{name}' (sideloaded — blob pins never float; re-add with a \
+             new --snap to move it)"
         ));
     }
     for entry in &report.updated {
@@ -3531,6 +3575,9 @@ fn print_pod_sync_report(report: &shuttle::pod::PodSyncReport) {
         for name in &report.removed {
             shuttle::output::ok(format!("removed {name}"));
         }
+    }
+    for name in &report.held {
+        shuttle::output::warn(format!("held '{name}' at its pin"));
     }
     if let Some(n) = report.generation {
         shuttle::output::info(format!("generation {n} current"));
