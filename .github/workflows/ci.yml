@@ -126,3 +126,9 @@ jobs:
 
       - name: Lint (clippy)
         run: devbox run -- clippy
+
+      - name: Lua lint (luacheck)
+        run: devbox run -- luacheck pkgs/
+
+      - name: Lua style (stylua)
+        run: devbox run -- stylua --check pkgs/
