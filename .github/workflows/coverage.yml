@@ -1,0 +1,84 @@
+# Nightly coverage measurement for shuttle.
+#
+# Instrumented build roughly doubles the gate's cost, so this runs on a
+# schedule instead of every PR. The floor ratchets as tails get covered —
+# see docs/agents/coverage.md for the baseline, the per-file table, and
+# the structurally-unreachable ceilings.
+
+name: coverage
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Allow unprivileged userns (bubblewrap sandbox)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install golang (go-deps tests build inside the sandbox)
+        run: sudo apt-get install -y --no-install-recommends golang-go
+
+      - name: Install devbox
+        uses: jetify-com/devbox-install-action@v0.12.0
+        with:
+          project-path: .
+          devbox-version: 0.18.3
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rust-1.97.1
+          cache-on-failure: true
+          workspaces: .
+
+      # Same unprivileged-build sequence as CI's check job: the binary
+      # must exist before the guarded key mint, and the mint must happen
+      # before the instrumented test run (the image command-seam tests
+      # build a real A/B disk, which fails closed without a signing key).
+      - name: Build
+        run: devbox run -- build
+
+      - name: Mint the image-signing key
+        run: test -f ~/.config/shuttle/secret-key || devbox run -- ./target/debug/shuttle key keygen
+
+      # The devbox rustc has no rustup llvm-tools; cargo-llvm-cov takes
+      # the LLVM pair through env vars (its documented seam — see
+      # docs/agents/coverage.md for why not --llvm-path).
+      - name: LLVM tools for cargo-llvm-cov
+        run: nix build github:NixOS/nixpkgs/nixos-26.05#llvm --out-link /tmp/llvm-link
+
+      - name: Measure coverage (fail under 86% lines)
+        run: |
+          env -u LD_LIBRARY_PATH \
+            LLVM_COV=/tmp/llvm-link/bin/llvm-cov \
+            LLVM_PROFDATA=/tmp/llvm-link/bin/llvm-profdata \
+            devbox run -- bash -c 'SHUTTLE_SYSTEMD=off cargo llvm-cov \
+              --workspace --all-targets --locked \
+              --fail-under-lines 86 \
+              --lcov --output-path lcov.info \
+              --summary'
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+          retention-days: 14
