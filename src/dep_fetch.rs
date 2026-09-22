@@ -87,8 +87,9 @@ pub fn ensure_pod_deps(
     };
     let pinned = prev.map(|p| p.deps_hash.as_str());
 
-    // Locked + cached: verify nothing, fetch nothing — the entry is
-    // content-addressed and re-verified against the pin at build time.
+    // Locked + cached: fetch nothing — the pin is verified where the
+    // closure is consumed: on the held sync (pod.rs verify_held_deps_blob,
+    // issue #125) and at build time (materialize_deps_entry).
     if !floating {
         if let Some(hash) = pinned {
             if store.blob_path(hash).exists() {
