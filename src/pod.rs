@@ -79,6 +79,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use miette::{IntoDiagnostic, WrapErr};
 use serde::Serialize;
 
 use crate::lock::{LockFile, PodPackageLockEntry};
@@ -926,6 +927,12 @@ pub struct PodRebuildReport {
     pub pod: String,
     pub name: String,
     pub version: String,
+    /// True when the target was HELD, not rebuilt: a blob-pinned
+    /// (sideloaded) package keeps its installed store content on every
+    /// reconcile — the payload, not a recipe, is its content (issue
+    /// #116).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
     /// True when the rebuild deliberately moved the dependency-closure
     /// pin (`--latest`): the fresh closure hash differed from the
     /// previous pin's, or the package had no deps pin yet (ADR-0017
@@ -1003,7 +1010,53 @@ pub fn validate_loads(root: &Path, pod_name: &str, decl: &PodDeclaration) -> mie
             );
         }
     }
-    detect_load_cycle(root, pod_name, decl)
+    detect_load_cycle(root, pod_name, decl)?;
+    refuse_loaded_blob_pins(root, pod_name, decl)
+}
+
+/// Refuse a load graph that carries sideloaded packages (issue #116,
+/// Decision 5): a loaded pod's packages are REBUILT into the loading
+/// pod's store from collection source, and a blob-pinned package has no
+/// collection entry — composition would die in `load_meta` halfway
+/// through, or worse after writes. The refusal runs in
+/// [`validate_loads`], so every mutating verb (add/sync/update/rebuild/
+/// remove) fails BEFORE any write, naming the loaded pod, the pinned
+/// packages, and this issue. Blob-copy across pods is deferred.
+fn refuse_loaded_blob_pins(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+) -> miette::Result<()> {
+    fn visit(
+        root: &Path,
+        pod_name: &str,
+        decl: &PodDeclaration,
+        visited: &mut HashSet<String>,
+    ) -> miette::Result<()> {
+        for loaded in &decl.loads {
+            if !visited.insert(loaded.clone()) {
+                continue;
+            }
+            let loaded_decl = load_declaration(root, loaded)?;
+            if let Some(lock) = LockFile::load(&pod_lock_path(root, loaded))? {
+                let mut pins: Vec<String> = lock.snaps.keys().cloned().collect();
+                pins.sort();
+                if !pins.is_empty() {
+                    miette::bail!(
+                        "pod '{pod_name}' cannot load '{loaded}': it carries sideloaded \
+                         package(s) ({}) — loading pods that carry blob-pinned packages \
+                         is not supported yet (blob-copy across pods is deferred, \
+                         issue #116)",
+                        pins.join(", ")
+                    );
+                }
+            }
+            visit(root, pod_name, &loaded_decl, visited)?;
+        }
+        Ok(())
+    }
+    let mut visited = HashSet::new();
+    visit(root, pod_name, decl, &mut visited)
 }
 
 /// DFS over the load graph reachable from `start`: a pod revisited on
@@ -1311,6 +1364,419 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
     })
 }
 
+/// Report for `shuttle pod add --snap` (issue #116).
+#[derive(Debug, Serialize)]
+pub struct PodSnapAddReport {
+    pub pod: String,
+    /// Package name, taken from the payload's `meta/snap.yaml` — the
+    /// sideloaded content is its own identity.
+    pub name: String,
+    /// Version from the payload's `meta/snap.yaml`.
+    pub version: String,
+    /// sha3-384 of the payload — the blob pin recorded in the pod
+    /// lockfile's `snaps` section (revision 0 = sideload sentinel).
+    pub sha3_384: String,
+    /// True when the identical payload was already sideloaded and
+    /// installed — nothing was written.
+    pub noop: bool,
+    /// The generation now current (absent for a no-op).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
+/// The `meta/snap.yaml` version field of an unpacked payload (the
+/// runtime's `MetaVersion` twin, kept local so the runtime's private
+/// parse stays private).
+#[derive(serde::Deserialize)]
+struct PayloadIdentity {
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// Sideload a built `.snap` payload into a pod (issue #116): the
+/// payload's `meta/snap.yaml` is its identity (name + version), its
+/// sha3-384 is its pin. Records BOTH lockfile entries — `packages`
+/// (version pin, existing tooling keeps working) and `snaps` (revision
+/// 0, sha3-384) — then installs the payload through the store's normal
+/// batch path (`install_batch`: sha3-384 re-verified fail-closed,
+/// infrastructure types refused, `type: store` recorded inert) and
+/// reconciles the rest of the pod around it.
+///
+/// Fail-closed gates, all BEFORE any write: `--ack-unsigned` (v1
+/// sideloads carry no signature — snapd's `--dangerous` precedent),
+/// filename↔meta identity, the trust gate, collision prechecks. A
+/// re-add of the identical payload is a no-op; a re-add whose payload
+/// carries the SAME name+version but different bytes is refused (the
+/// content under one version is the pin's trust anchor — a move bumps
+/// the version); a DIFFERENT version moves the pins deliberately.
+pub fn add_snap_pod(
+    root: &Path,
+    pod_name: &str,
+    payload: &Path,
+    ack_unsigned: bool,
+) -> miette::Result<PodSnapAddReport> {
+    validate_pod_name(pod_name)?;
+    // Trust gate first (zero writes): v1 sideloads are unsigned by
+    // construction, so the acknowledgment is the only proof of intent.
+    if !ack_unsigned {
+        miette::bail!(
+            "refusing to sideload '{}': the payload carries no shuttle \
+             signature — pass --ack-unsigned to accept an unsigned payload",
+            payload.display()
+        );
+    }
+    if !payload.is_file() {
+        miette::bail!("no such payload: {}", payload.display());
+    }
+    let sha3_384 = crate::store::sha3_384_file(payload)?;
+
+    // Identity prechecks on the declared names avoid unpacking a
+    // payload just to learn it is a re-add.
+    let dir = pod_dir(root, pod_name);
+    let decl = load_declaration_or_default(root, pod_name)?;
+    let lock_path = pod_lock_path(root, pod_name);
+    let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    // (filename, pinned sha3-384) when the filename names a package the
+    // pod already blob-pins — the cheap re-add/divergence probe.
+    let pinned_name = crate::oci::parse_artifact_filename(payload)
+        .ok()
+        .map(|(name, _, _)| name)
+        .filter(|n| parse_pod_package_spec_names(&decl, n))
+        .and_then(|n| lock.snaps.get(&n).map(|pin| (n, pin.sha3_384.clone())));
+    if let Some((fname, pin_sha3_384)) = &pinned_name {
+        if *pin_sha3_384 == sha3_384 {
+            if let Some(mut report) = sideload_readd_report(root, pod_name, fname, &sha3_384)? {
+                // Even a no-op re-add re-presents the pod: a previous
+                // install whose follow-up sync FAILED (e.g. the
+                // requires closure unresolved on a collection-less
+                // machine) leaves farm/current/services stale while the
+                // generation already carries the sha. sync is
+                // idempotent here (present_active re-emits the farm and
+                // services), so running it repairs the presentation and
+                // keeps the "nothing to do" report true.
+                let sync = sync_pod(root, pod_name)?;
+                report.generation = sync.generation.or(report.generation);
+                return Ok(report);
+            }
+            // Content missing from the generation: fall through to a
+            // repair-install.
+        }
+        // Divergent bytes under a pinned name: the unpack below decides
+        // tamper (same version → refuse) vs move.
+    }
+
+    // Unpack once for identity + the trust gate (install re-unpacks and
+    // re-verifies sha3-384 fail-closed on its own).
+    let tools = pod_runtime_tools();
+    let unsquashfs = tools.unsquashfs.as_ref().ok_or_else(|| {
+        miette::miette!(
+            "unsquashfs not found on PATH — sideloading cannot unpack \
+             payloads; install squashfs-tools"
+        )
+    })?;
+    let (meta, version) = match unpack_payload_identity(payload, unsquashfs) {
+        Ok(found) => found,
+        Err(e) => {
+            if let Some((fname, pin_sha3_384)) = &pinned_name {
+                if *pin_sha3_384 != sha3_384 {
+                    miette::bail!(
+                        "'{fname}': sideloaded payload sha3-384 {sha3_384} does not \
+                         match the pod's blob pin ({pin_sha3_384}) — refusing \
+                         (fail-closed); the payload also failed to unpack: {e}"
+                    );
+                }
+            }
+            return Err(e);
+        }
+    };
+    let name = meta.name.clone().ok_or_else(|| {
+        miette::miette!(
+            "{}: meta/snap.yaml carries no name — refusing to sideload an \
+             unidentified payload",
+            payload.display()
+        )
+    })?;
+    let version = version.unwrap_or_else(|| "0".into());
+
+    // Filename↔meta identity (the `pending_from_blob` rule, copied):
+    // the artifact filename is a claim about the payload; a mismatch
+    // refuses fail-closed.
+    if let Ok((fname, fversion, _arch)) = crate::oci::parse_artifact_filename(payload) {
+        if fname != name {
+            miette::bail!(
+                "{}: filename says '{fname}' but meta/snap.yaml says '{name}' — \
+                 refusing to sideload (fail-closed)",
+                payload.display()
+            );
+        }
+        if fversion != version {
+            miette::bail!(
+                "{}: filename says version {fversion} but meta/snap.yaml says \
+                 {version} — refusing to sideload (fail-closed)",
+                payload.display()
+            );
+        }
+    }
+
+    // Trust gate (the `prepare_snap` classification, evaluated before
+    // any write so a refusal leaves zero state).
+    match crate::units::classify(meta.snap_type.as_deref()) {
+        crate::units::RuntimeClass::Infrastructure => miette::bail!(
+            "snap '{name}' is snapd infrastructure (type={:?}) — refusing to \
+             sideload via the package axis",
+            meta.snap_type
+        ),
+        crate::units::RuntimeClass::Store => crate::output::warn(format!(
+            "{name}: type=store — records only, nothing executable (store snaps \
+             keep their own runtime)"
+        )),
+        crate::units::RuntimeClass::ShootBuilt => {}
+    }
+
+    // Re-add bookkeeping: identical content is a no-op (checked above
+    // when the filename allowed the cheap path); the same version with
+    // divergent bytes is refused; a new version moves deliberately.
+    let declared = parse_pod_package_spec_names(&decl, &name);
+    if declared {
+        if let Some(pin) = lock.snaps.get(&name) {
+            if pin.sha3_384 != sha3_384 {
+                let version_same = lock
+                    .packages
+                    .get(&name)
+                    .is_some_and(|e| e.version == version);
+                if version_same {
+                    miette::bail!(
+                        "'{name}': sideloaded payload sha3-384 {sha3_384} does not \
+                         match the pod's blob pin ({}) for the same version {version} \
+                         — refusing to swap content under an identical version; bump \
+                         the version and re-add, or `shuttle pod remove` first",
+                        pin.sha3_384
+                    );
+                }
+                // Deliberate version move: fall through, the pins move below.
+            }
+        }
+    }
+    // The same zero-writes validation chain as `add_package` (issue
+    // #8), with claims read from the payload — on EVERY identity path:
+    // a payload naming a declared COLLECTION package converts it to a
+    // blob pin (trust-model flip collection → unsigned content), so
+    // its composition prechecks must refuse before any write too, not
+    // just a new package's.
+    validate_loads(root, pod_name, &decl)?;
+    validate_overlays(root, &decl, pod_name)?;
+    let layer = payload_layer(&decl, &name);
+    precheck_payload_collisions(root, &decl, &name, &meta, layer)?;
+    if declared && !lock.snaps.contains_key(&name) {
+        // The conversion is allowed but loud: the collection recipe
+        // stops governing this package's content — the payload (an
+        // acknowledged-unsigned blob) does.
+        crate::output::warn(format!(
+            "{name}: declared collection package converted to a sideloaded blob \
+             pin — its content is now the payload (unsigned, --ack-unsigned), \
+             no longer the collection recipe"
+        ));
+    }
+
+    // Writes: declaration (new packages only) + both lockfile pins.
+    let mut decl = decl;
+    if !declared {
+        decl.packages.push(name.clone());
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
+    let decl_path = pod_lua_path(root, pod_name);
+    std::fs::write(&decl_path, render_pod_source(&decl))
+        .map_err(|e| miette::miette!("failed to write {}: {e}", decl_path.display()))?;
+
+    let constraint = decl
+        .packages
+        .iter()
+        .find_map(|spec| {
+            parse_pod_package(spec)
+                .ok()
+                .filter(|p| p.name == name)
+                .map(|p| p.constraint)
+        })
+        .unwrap_or(None);
+    lock.packages.insert(
+        name.clone(),
+        PodPackageLockEntry {
+            version: version.clone(),
+            constraint,
+            deps: lock.packages.get(&name).and_then(|e| e.deps.clone()),
+        },
+    );
+    lock.snaps.insert(
+        name.clone(),
+        crate::lock::SnapLockEntry {
+            revision: 0,
+            sha3_384: sha3_384.clone(),
+        },
+    );
+    lock.save(&lock_path)?;
+
+    // Install the payload through the store's normal batch path: it
+    // re-verifies sha3-384 fail-closed, refuses infrastructure types,
+    // records `type: store` inert, and emits the loud unsigned note.
+    let store = pod_store(&dir);
+    let pending = crate::runtime::PendingSnap {
+        name: name.clone(),
+        revision: 0,
+        sha3_384: sha3_384.clone(),
+        payload_path: payload.to_path_buf(),
+        layer: payload_layer(&decl, &name),
+        meta_digest: None,
+    };
+    let install = store.install_batch(&[pending], &Default::default(), &tools)?;
+    for note in &install.notes {
+        crate::output::info(note.clone());
+    }
+
+    // Reconcile the rest of the pod around the installed content: the
+    // blob pin holds it in place (no rebuild), the farm, services, and
+    // the requires closure follow.
+    let sync = sync_pod(root, pod_name)?;
+
+    Ok(PodSnapAddReport {
+        pod: pod_name.to_string(),
+        name,
+        version,
+        sha3_384,
+        noop: false,
+        generation: sync.generation.or(install.generation),
+    })
+}
+
+/// The identical-readd check that needs no unpack: `Some(report)` when
+/// the active generation carries the pinned content (nothing to do),
+/// `None` when the pin's content is missing from the generation — the
+/// caller falls through to a repair-install.
+fn sideload_readd_report(
+    root: &Path,
+    pod_name: &str,
+    name: &str,
+    sha3_384: &str,
+) -> miette::Result<Option<PodSnapAddReport>> {
+    let dir = pod_dir(root, pod_name);
+    let store = pod_store(&dir);
+    let active = store.active_generation()?;
+    let installed = active.as_ref().and_then(|g| g.packages.get(name));
+    if installed.is_some_and(|p| p.sha3_384 == sha3_384) {
+        return Ok(Some(PodSnapAddReport {
+            pod: pod_name.to_string(),
+            name: name.to_string(),
+            version: installed.map(|p| p.version.clone()).unwrap_or_default(),
+            sha3_384: sha3_384.to_string(),
+            noop: true,
+            generation: active.map(|g| g.n),
+        }));
+    }
+    Ok(None)
+}
+
+/// True when any declared package spec names `name` (no constraint
+/// comparison — a sideload's identity is the payload, not a spec).
+fn parse_pod_package_spec_names(decl: &PodDeclaration, name: &str) -> bool {
+    decl.packages
+        .iter()
+        .any(|spec| parse_pod_package(spec).is_ok_and(|p| p.name == name))
+}
+
+/// The composition layer a sideloaded payload records at: `Overlay`
+/// when the pod already patches the package, `Own` otherwise (issue #8
+/// layering, same rule as `add_package`).
+fn payload_layer(decl: &PodDeclaration, name: &str) -> crate::farm::ClaimLayer {
+    if decl.overlay.contains_key(name) {
+        crate::farm::ClaimLayer::Overlay
+    } else {
+        crate::farm::ClaimLayer::Own
+    }
+}
+
+/// Unpack a payload with unsquashfs and read its `meta/snap.yaml`
+/// identity: the runtime-planner shape plus the version field. The
+/// [`crate::runtime::RuntimeStore`] twin (`unpack_payload`) stays
+/// private to the install path; the sideload gate needs the same read
+/// BEFORE any write.
+fn unpack_payload_identity(
+    payload: &Path,
+    unsquashfs: &Path,
+) -> miette::Result<(crate::units::PayloadSnap, Option<String>)> {
+    let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
+    let extract = work.path().join("extract");
+    let status = std::process::Command::new(unsquashfs)
+        .args([
+            "-d",
+            &extract.to_string_lossy(),
+            "-no-xattrs",
+            &payload.to_string_lossy(),
+        ])
+        .status()
+        .map_err(|e| miette::miette!("unsquashfs: {e}"))?;
+    if !status.success() {
+        miette::bail!(
+            "unsquashfs failed to extract payload {} — not a readable \
+             squashfs payload",
+            payload.display()
+        );
+    }
+    let yaml_path = extract.join("meta").join("snap.yaml");
+    let yaml_text = std::fs::read_to_string(&yaml_path)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "reading {} (no meta/snap.yaml — not a shuttle-built payload)",
+                yaml_path.display()
+            )
+        })?;
+    let meta: crate::units::PayloadSnap = serde_yaml::from_str(&yaml_text)
+        .map_err(|e| miette::miette!("meta/snap.yaml parse for '{}': {e}", payload.display()))?;
+    let identity: PayloadIdentity = serde_yaml::from_str(&yaml_text)
+        .map_err(|e| miette::miette!("meta/snap.yaml version parse: {e}"))?;
+    Ok((meta, identity.version))
+}
+
+/// Pre-write collision checks for a sideloaded payload (issue #8 +
+/// ADR-0032 Decision 3): binary and service claims read from the
+/// payload's `meta/snap.yaml` against the pod's post-state package set,
+/// resolved by the shared classifiers. Same guarantees as
+/// `add_package`'s prechecks — a same-precedence clash fails with zero
+/// writes.
+fn precheck_payload_collisions(
+    root: &Path,
+    decl: &PodDeclaration,
+    name: &str,
+    payload: &crate::units::PayloadSnap,
+    layer: crate::farm::ClaimLayer,
+) -> miette::Result<()> {
+    let mut binary_claims: Vec<BinaryClaim> = payload
+        .apps
+        .keys()
+        .map(|app| BinaryClaim {
+            binary: app.clone(),
+            pkg: name.to_string(),
+            layer,
+        })
+        .collect();
+    push_declared_binary_claims(&mut binary_claims, decl, name)?;
+    push_loaded_binary_claims(&mut binary_claims, root, decl, name)?;
+    resolve_binary_claims(&binary_claims)?;
+
+    let mut service_claims: Vec<ServiceClaim> = payload
+        .services
+        .keys()
+        .map(|service| ServiceClaim {
+            service: service.clone(),
+            pkg: name.to_string(),
+            layer,
+        })
+        .collect();
+    push_declared_service_claims(&mut service_claims, decl, name)?;
+    push_loaded_service_claims(&mut service_claims, root, decl, name)?;
+    resolve_service_claims(&service_claims)
+}
+
 /// Remove a package from a pod: drop it from the declaration and delete
 /// its lockfile pin, then reconcile — the store generation without it
 /// and a farm that no longer exposes its binaries (issue #3). Loads are
@@ -1385,6 +1851,10 @@ pub fn remove_package(
     let lock_path = pod_lock_path(root, pod_name);
     if let Some(mut lock) = LockFile::load(&lock_path)? {
         lock.packages.remove(&spec.name);
+        // A sideloaded package's blob pin goes with it (issue #116): a
+        // stale `snaps` entry would hold a future re-add of the same
+        // name from the collection at phantom content.
+        lock.snaps.remove(&spec.name);
         lock.save(&lock_path)?;
     }
 
@@ -1469,11 +1939,16 @@ pub fn rebuild_package(
             ));
         }
     }
+    // A blob-pinned package cannot rebuild (the payload is its
+    // content): the reconcile HELD it — surface that instead of letting
+    // the "rebuilt" line claim a build happened (council round 2).
+    let held = sync.held.contains(&spec.name);
 
     Ok(PodRebuildReport {
         pod: pod_name.to_string(),
         name: spec.name,
         version,
+        held,
         deps_pin_moved,
         generation: sync.generation,
     })
@@ -1517,6 +1992,11 @@ pub struct PodUpdateReport {
     pub held: Vec<PodUpdateHeld>,
     /// Packages already at their newest matching version.
     pub unchanged: Vec<String>,
+    /// Sideloaded (blob-pinned) packages: never float and never
+    /// re-resolve from the collection (issue #116) — a version move is
+    /// a re-add with a new `--snap`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
     /// The generation now current (absent under the degraded
     /// no-squashfs mode or when nothing moved).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1606,12 +2086,20 @@ pub fn update_pod(
     let lock_path = pod_lock_path(root, pod_name);
     let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
     let mut moves = Vec::new();
+    let mut skipped = Vec::new();
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
         if let Some(wanted) = &wanted {
             if !wanted.contains(&spec.name) {
                 continue;
             }
+        }
+        // Blob pins never float and never re-resolve from the
+        // collection (issue #116, Decision 6): the payload IS the
+        // version — `update` reports the skip; a move is a re-add.
+        if lock.snaps.contains_key(&spec.name) {
+            skipped.push(spec.name);
+            continue;
         }
         // The candidate resolves through the pod's overlay layer (issue
         // #6): an overlay version pin IS the candidate — the overlay
@@ -1713,6 +2201,7 @@ pub fn update_pod(
         updated,
         held,
         unchanged,
+        skipped,
         generation: sync.generation,
     })
 }
@@ -1998,6 +2487,49 @@ fn hold_plain_sync(
         );
     }
     OwnScope::Held
+}
+
+/// The blob-pin hold body (issue #116): a sideloaded package keeps its
+/// installed store content on every reconcile — there is no collection
+/// recipe to rebuild from, the sha3-384 pin is the content. Claims come
+/// from the installed record so the generation still presents the
+/// package's desktop IDs, binaries, and services; its runtime `requires`
+/// seeds the closure so the libraries it needs stay carried. A pin whose
+/// content the active generation does NOT carry fails named (the
+/// repair path is a re-add: `shuttle pod add --snap`).
+fn hold_blob_pinned(
+    ctx: &ReconcileCtx<'_>,
+    name: &str,
+    pin_sha3_384: &str,
+    layer: crate::farm::ClaimLayer,
+    build: &mut ReconcileBuild,
+) -> miette::Result<()> {
+    let Some(installed_pkg) = ctx.active.and_then(|g| g.packages.get(name)) else {
+        miette::bail!(
+            "package '{name}' is blob-pinned (sideloaded) but the pod's active \
+             generation does not carry its pinned content — re-run \
+             `shuttle pod --name {} add --snap` to reinstall it",
+            ctx.pod_name
+        );
+    };
+    if installed_pkg.sha3_384 != pin_sha3_384 {
+        miette::bail!(
+            "package '{name}' is blob-pinned (sha3-384 {pin_sha3_384}) but the \
+             active generation carries different content ({}) — re-run \
+             `shuttle pod --name {} add --snap` to realign it",
+            installed_pkg.sha3_384,
+            ctx.pod_name
+        );
+    }
+    build.declared_names.insert(name.to_string());
+    build.held.push(name.to_string());
+    build
+        .requires_seeds
+        .extend(installed_pkg.requires.iter().cloned());
+    push_desktop_claims(&mut build.desktop_claims, installed_pkg, layer);
+    push_installed_binary_claims(&mut build.binary_claims, installed_pkg, layer);
+    push_installed_service_claims(&mut build.service_claims, installed_pkg, layer);
+    Ok(())
 }
 
 /// Decide what one own package does in a scoped reconcile BEFORE any
@@ -2519,6 +3051,21 @@ fn collect_own_packages(
 ) -> miette::Result<()> {
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
+        // Blob pins (issue #116) have no collection entry to resolve:
+        // the installed content IS the pin. When the generation carries
+        // it, the package holds (claims from the installed record, no
+        // build — the sideloaded payload is not rebuildable from source);
+        // when it does not, the reconcile fails named instead of dying
+        // in `load_meta` with a confusing collection error.
+        if let Some(pin) = ctx.lock.snaps.get(&spec.name) {
+            let layer = if decl.overlay.contains_key(&spec.name) {
+                crate::farm::ClaimLayer::Overlay
+            } else {
+                crate::farm::ClaimLayer::Own
+            };
+            hold_blob_pinned(ctx, &spec.name, &pin.sha3_384, layer, build)?;
+            continue;
+        }
         let mut meta = resolve_own_meta(ctx.root, ctx.pod_name, &spec, &decl.overlay)?;
         build.declared_names.insert(meta.name.clone());
         // Runtime-closure seeds (issue #35): the declared package's own
@@ -3010,6 +3557,24 @@ fn push_installed_binary_claims(
     for app in pkg.apps.keys() {
         claims.push(BinaryClaim {
             binary: app.clone(),
+            pkg: pkg.name.clone(),
+            layer,
+        });
+    }
+}
+
+/// Collect the service-name claims of an already-installed package: the
+/// service declarations recorded in its manifest entry at install time
+/// (issue #106) — the blob-pin hold (issue #116) has no freshly resolved
+/// meta to read them from.
+fn push_installed_service_claims(
+    claims: &mut Vec<ServiceClaim>,
+    pkg: &crate::runtime::InstalledPackage,
+    layer: crate::farm::ClaimLayer,
+) {
+    for service in pkg.services.keys() {
+        claims.push(ServiceClaim {
+            service: service.clone(),
             pkg: pkg.name.clone(),
             layer,
         });
@@ -3917,6 +4482,11 @@ pub struct DepsFetchReport {
     pub fetched: Vec<DepsFetchedEntry>,
     /// Locked packages whose pin is cached — untouched (no re-fetch).
     pub skipped: Vec<String>,
+    /// Sideloaded (blob-pinned) packages: never re-resolve from the
+    /// collection (issue #116) — the payload is their content, there
+    /// is no collection meta to load.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sideloaded: Vec<String>,
 }
 
 /// Explicit dependency-closure fetch for every declared package with a
@@ -3945,9 +4515,19 @@ pub fn fetch_pod_deps(
         pod: pod_name.to_string(),
         fetched: Vec::new(),
         skipped: Vec::new(),
+        sideloaded: Vec::new(),
     };
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
+        // Blob pins never re-resolve from the collection (issue #116,
+        // the same skip `update` applies): the payload IS their
+        // content, and `load_meta` here would die in collection
+        // resolution — fatally on a collection-less machine — for a
+        // package that was never a collection package at all.
+        if lock.snaps.contains_key(&spec.name) {
+            report.sideloaded.push(spec.name.clone());
+            continue;
+        }
         let mut meta = crate::deps::load_meta(&spec.name)?;
         if let Some(patch) = decl.overlay.get(&spec.name) {
             apply_overlay(&mut meta, patch)?;

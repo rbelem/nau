@@ -1044,14 +1044,32 @@ pub enum KeyCommand {
 pub enum PodCommand {
     /// Add a package to the selected pod: records it in the pod
     /// declaration and pins the resolved version in the lockfile.
-    /// (Re)initializes an unknown pod.
+    /// (Re)initializes an unknown pod. With `--snap`, sideloads a built
+    /// `.snap` payload instead of resolving from the collection
+    /// (issue #116).
     Add {
         #[command(flatten)]
         target: PodTarget,
 
         /// Package name, optionally with a version constraint
-        /// (`name@constraint`, e.g. `ripgrep@14`).
-        package: String,
+        /// (`name@constraint`, e.g. `ripgrep@14`). Required unless
+        /// `--snap` carries the identity (issue #116).
+        #[arg(required_unless_present = "snap")]
+        package: Option<String>,
+
+        /// Sideload a built `.snap` payload (issue #116): the payload's
+        /// `meta/snap.yaml` is the identity, its sha3-384 the pin. A
+        /// filename/name mismatch or a snapd infrastructure payload
+        /// refuses fail-closed.
+        #[arg(long, value_name = "SNAP", conflicts_with = "package")]
+        snap: Option<String>,
+
+        /// Acknowledge the sideloaded payload is unsigned (v1 carries
+        /// no pod-side signature; snapd's `--dangerous` precedent).
+        /// Without it the sideload refuses before any write. Only
+        /// meaningful with `--snap`.
+        #[arg(long, requires = "snap")]
+        ack_unsigned: bool,
 
         /// Pod state root (default: $XDG_DATA_HOME/shuttle/pods, i.e.
         /// ~/.local/share/shuttle/pods). Overridable via SHUTTLE_POD_ROOT.
