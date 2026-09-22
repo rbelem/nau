@@ -1,7 +1,13 @@
 # CI for shuttle — Rust CLI tool that builds Snap packages from Lua declarations.
 #
-# Uses devbox for reproducible toolchain (Rust, squashfs-tools, bubblewrap).
-# Verifies: build, test, lint, format.
+# Jobs, cheapest first:
+#   lint-workflow — actionlint over this file; no toolchain, runs in seconds.
+#   deps          — cargo-deny: license/advisory/source policy (deny.toml).
+#   check         — the devbox gate: build, test, clippy -D warnings, fmt --check.
+#
+# The Rust linter (clippy) and style checker (rustfmt) are the Lint/Format
+# steps of `check`; the pinned 1.97.1 toolchain is the contract (see
+# docs/agents/build-and-test.md).
 
 name: CI
 
@@ -10,30 +16,113 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  lint-workflow:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download actionlint
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+            https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash |
+          bash -s -- 1.7.7
+
+      - name: Lint workflow
+        run: ./actionlint -color
+
+  deps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.6
+
+      - name: Check licenses, advisories, sources
+        run: cargo deny check
+
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor
+      # (kernel.apparmor_restrict_unprivileged_userns=1), which strips
+      # bubblewrap's netns of CAP_NET_ADMIN — every sandboxed e2e test
+      # dies with "bwrap: loopback: Failed RTM_NEWADDR: Operation not
+      # permitted". Runners have passwordless sudo; lift the restriction
+      # for the job.
+      - name: Allow unprivileged userns (bubblewrap sandbox)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # The go-deps tests (tests/pod_deps.rs) gate on host go being
+      # sandbox-visible, but on GH runners go lives in /usr/local/go —
+      # a SEPARATE mount that bwrap's /usr bind does not cross — so the
+      # gate passes host-side while the sandbox itself reports
+      # "go: not found". The distro go lands at /usr/bin/go, inside the
+      # bound /usr, where the sandbox can actually use it.
+      - name: Install golang (go-deps tests build inside the sandbox)
+        run: sudo apt-get install -y --no-install-recommends golang-go
 
       - name: Install devbox
         uses: jetify-com/devbox-install-action@v0.12.0
         with:
           project-path: .
+          devbox-version: 0.18.3
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rust-1.97.1
+          cache-on-failure: true
+          workspaces: .
+
+      # Cheap format gate before the expensive build: a whitespace-only
+      # PR learns about it in seconds, not after build+test+clippy.
+      - name: Format check
+        run: devbox run -- fmt-check
 
       - name: Build
-        run: devbox run -- cargo build --locked
+        run: devbox run -- build
+
+      # The devbox scripts are the gate (docs/agents/build-and-test.md)
+      # and intentionally spell no --locked: instead of policing the
+      # command form, fail closed when a dependency bump landed without
+      # its Cargo.lock commit — cargo would otherwise resolve fresh in
+      # CI and test something no fresh clone or release can reproduce.
+      - name: Lockfile must be committed
+        run: git diff --exit-code Cargo.lock
+
+      # The image command-seam tests drive a real A/B+update_source disk
+      # build, which fails closed without an existing image-signing key
+      # (a build never mints one). Mint it for the runner user, guarded so
+      # an existing key is never touched.
+      - name: Mint the image-signing key
+        run: test -f ~/.config/shuttle/secret-key || devbox run -- ./target/debug/shuttle key keygen
 
       - name: Test
-        run: devbox run -- cargo test --locked
+        run: devbox run -- test
 
       - name: Lint (clippy)
-        run: devbox run -- cargo clippy --locked -- -D warnings
-
-      - name: Format check
-        run: devbox run -- cargo fmt --check
+        run: devbox run -- clippy

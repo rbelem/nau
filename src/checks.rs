@@ -709,12 +709,30 @@ fn shebang_interpreter(first_line: &str) -> Option<(String, bool)> {
 
 /// Whether the staged tree provides `path` (a `usr/...`-relative payload
 /// file) or `usr/bin/<basename>`.
+///
+/// Shebang interpreters arrive absolute (`/usr/bin/perl`); `Path::join`
+/// with an absolute argument would REPLACE the stage root and probe the
+/// host filesystem instead of the payload — on any machine shipping
+/// `/usr/bin/perl` the check silently no-ops (issue #90 follow-up).
 fn tree_provides(stage: &Path, path: &str) -> bool {
-    if stage.join(path).is_file() {
+    let rel = path.strip_prefix('/').unwrap_or(path);
+    if stage.join(rel).is_file() {
         return true;
     }
-    let base = path.rsplit('/').next().unwrap_or(path);
+    let base = rel.rsplit('/').next().unwrap_or(rel);
     stage.join("usr/bin").join(base).is_file()
+}
+
+/// Base-guaranteed interpreters: every snap base runtime ships these
+/// before the merged prefix assembles, so a payload script pointing at
+/// one is not a broken wrapper. core22/core24 also carry
+/// `/usr/bin/sh -> /bin/sh`. (Before the host-fs probe fix, this case
+/// resolved by ACCIDENT — stage.join("/bin/sh") probed the host.)
+fn base_guaranteed(interp: &str) -> bool {
+    matches!(
+        interp,
+        "/bin/sh" | "/usr/bin/sh" | "/bin/bash" | "/usr/bin/bash"
+    )
 }
 
 /// Findings for one package's staged scripts.
@@ -728,7 +746,7 @@ fn package_shebang_findings(key: &str, meta: &crate::snap::SnapMeta, stage: &Pat
         let Some((interp, via_env)) = text.lines().next().and_then(shebang_interpreter) else {
             continue;
         };
-        if tree_provides(stage, &interp) {
+        if tree_provides(stage, &interp) || base_guaranteed(&interp) {
             continue;
         }
         let basename = interp.rsplit('/').next().unwrap_or(&interp).to_string();
@@ -770,8 +788,9 @@ fn package_shebang_findings(key: &str, meta: &crate::snap::SnapMeta, stage: &Pat
 ///
 /// Scans the declared stage directory for scripts carrying shebangs and
 /// resolves each interpreter the way the merged-prefix build does
-/// ([`crate::build_prefix`] fail-closed rule): into the payload tree or a
-/// declared `requires`. An unresolvable interpreter is an **error** — the
+/// ([`crate::build_prefix`] fail-closed rule): into the payload tree, a
+/// declared `requires`, or the base-guaranteed set ([`base_guaranteed`]).
+/// An unresolvable interpreter is an **error** — the
 /// prefix build fails closed on exactly this shape (#90: "a silently
 /// broken wrapper is what ships today"), and a plain snap build ships the
 /// broken wrapper. `#!/usr/bin/env X` is a **warning** when nothing
