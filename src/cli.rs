@@ -2427,4 +2427,94 @@ mod tests {
             _ => panic!("expected Pod"),
         }
     }
+
+    // `pod add` needs a package OR `--snap` (issue #135): neither is a
+    // missing-required error.
+    fn parse_err(args: &[&str]) -> clap::error::Error {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("expected parse failure: {args:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn pod_add_requires_package_or_snap() {
+        use clap::error::ErrorKind;
+        assert_eq!(
+            parse_err(&["shuttle", "pod", "add"]).kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    // `--snap` and the package positional are mutually exclusive.
+    #[test]
+    fn pod_add_snap_conflicts_with_package() {
+        use clap::error::ErrorKind;
+        assert_eq!(
+            parse_err(&["shuttle", "pod", "add", "--snap", "p.snap", "hello"]).kind(),
+            ErrorKind::ArgumentConflict
+        );
+    }
+
+    // `--ack-unsigned` is only meaningful with `--snap`.
+    #[test]
+    fn pod_add_ack_unsigned_requires_snap() {
+        use clap::error::ErrorKind;
+        assert_eq!(
+            parse_err(&["shuttle", "pod", "add", "--ack-unsigned"]).kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    // The two happy shapes parse into their fields.
+    #[test]
+    fn pod_add_happy_shapes_parse() {
+        match Cli::try_parse_from(["shuttle", "pod", "add", "hello"])
+            .unwrap()
+            .command
+        {
+            Command::Pod {
+                command:
+                    PodCommand::Add {
+                        package,
+                        snap,
+                        ack_unsigned,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(package.as_deref(), Some("hello"));
+                assert!(snap.is_none());
+                assert!(!ack_unsigned);
+            }
+            _ => panic!("expected pod add"),
+        }
+        match Cli::try_parse_from([
+            "shuttle",
+            "pod",
+            "add",
+            "--snap",
+            "p.snap",
+            "--ack-unsigned",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Pod {
+                command:
+                    PodCommand::Add {
+                        package,
+                        snap,
+                        ack_unsigned,
+                        ..
+                    },
+                ..
+            } => {
+                assert!(package.is_none());
+                assert_eq!(snap.as_deref(), Some("p.snap"));
+                assert!(ack_unsigned);
+            }
+            _ => panic!("expected pod add"),
+        }
+    }
 }
