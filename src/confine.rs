@@ -899,4 +899,91 @@ mod tests {
             "the old declared-app error must be gone: {err}"
         );
     }
+
+    #[test]
+    fn run_refuses_a_pod_without_an_active_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("empty-pod");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = run(&dir, "empty-pod", "app", &[]).unwrap_err().to_string();
+        assert!(err.contains("no active generation"), "{err}");
+    }
+
+    #[test]
+    fn run_command_rejects_an_empty_command_vector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = seed_command_pod(tmp.path(), "default", 1);
+        let err = run_command(&dir, "default", &[]).unwrap_err().to_string();
+        assert!(err.contains("empty command"), "{err}");
+    }
+
+    #[test]
+    fn overlay_pod_env_prepends_the_farm_to_the_caller_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = sample_command_env(&tmp.path().join("farm"));
+        let mut cmd = std::process::Command::new("true");
+        overlay_pod_env(&mut cmd, &env);
+        let path = env_of(&cmd, "PATH").unwrap();
+        assert!(
+            path.starts_with(&format!("{}", tmp.path().join("farm").display())),
+            "farm must lead the exported PATH: {path}"
+        );
+    }
+
+    #[test]
+    fn exec_direct_reports_a_missing_binary_instead_of_panicking() {
+        let vars = std::collections::BTreeMap::new();
+        let err = exec_direct(Path::new("/nonexistent/shuttle-no-bin"), &[], &vars)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to exec"), "{err}");
+    }
+
+    #[test]
+    fn write_grant_binds_the_standard_roots_read_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grants = vec![
+            "write".to_string(),
+            tmp.path().join("plain").to_string_lossy().into_owned(),
+            format!("ro:{}", tmp.path().join("hidden").display()),
+        ];
+        std::fs::create_dir_all(tmp.path().join("plain")).unwrap();
+        let mut cmd = std::process::Command::new("bwrap");
+        bind_filesystem_grants(&mut cmd, &grants);
+        let joined = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("--bind /usr /usr"),
+            "write opens the standard roots rw: {joined}"
+        );
+        assert!(
+            joined.contains(&format!(
+                "--bind {} {}",
+                tmp.path().join("plain").display(),
+                tmp.path().join("plain").display()
+            )),
+            "a bare path defaults read-write: {joined}"
+        );
+        assert!(
+            !joined.contains("hidden"),
+            "a ro: grant at a missing host path binds nothing: {joined}"
+        );
+    }
+
+    #[test]
+    fn apparmor_profile_renders_a_bare_path_grant_read_write() {
+        let mut c = sample_confinement();
+        c.filesystem = vec!["/srv/data".into()];
+        let profile = render_apparmor_profile("work", "myapp", &c);
+        assert!(profile.contains("/srv/data rw,"), "{profile}");
+    }
+
+    #[test]
+    fn resolve_tool_finds_a_standard_binary_on_path() {
+        let tool = resolve_tool("sh").expect("sh exists on any Linux host");
+        assert!(tool.is_file());
+    }
 }

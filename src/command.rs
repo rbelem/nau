@@ -71,3 +71,69 @@ impl CommandRunner for RealRunner {
 /// the subprocess writes directly — [`RunnerOutput::stdout`] is unused
 /// there.
 pub use RealRunner as CurlRunner;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_maps_a_signal_termination_to_1() {
+        assert_eq!(
+            exit_code(&RunnerOutput {
+                code: -1,
+                stdout: vec![],
+                stderr: String::new()
+            }),
+            1
+        );
+        assert_eq!(
+            exit_code(&RunnerOutput {
+                code: -9,
+                stdout: vec![],
+                stderr: String::new()
+            }),
+            1
+        );
+        assert_eq!(
+            exit_code(&RunnerOutput {
+                code: 0,
+                stdout: vec![],
+                stderr: String::new()
+            }),
+            0
+        );
+        assert_eq!(
+            exit_code(&RunnerOutput {
+                code: 7,
+                stdout: vec![],
+                stderr: String::new()
+            }),
+            7
+        );
+    }
+
+    #[test]
+    fn real_runner_rejects_an_empty_argv() {
+        let err = RealRunner.run(&[]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn real_runner_captures_streams_and_the_exit_code() {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo out; echo err >&2; exit 3".to_string(),
+        ];
+        let out = RealRunner.run(&argv).unwrap();
+        assert_eq!(out.code, 3);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "out");
+        assert_eq!(out.stderr.trim(), "err");
+    }
+
+    #[test]
+    fn real_runner_reports_a_missing_program_as_io_error() {
+        let argv = vec!["shuttle-no-such-binary-zz9x".to_string()];
+        assert!(RealRunner.run(&argv).is_err());
+    }
+}
