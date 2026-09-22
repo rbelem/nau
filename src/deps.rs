@@ -295,6 +295,7 @@ pub fn recipe_dir(name_or_path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn test_topological_sort_simple() {
@@ -467,5 +468,81 @@ mod tests {
             build_deps: vec!["ncurses".into()],
         };
         assert_eq!(node.all_deps(), vec!["glibc", "ncurses"]);
+    }
+
+    // ── topological sort branches (pure) ──
+
+    #[test]
+    fn topological_sort_treats_outside_graph_deps_as_leaves() {
+        let nodes = vec![DepNode {
+            name: "app".into(),
+            requires: vec!["glibc".into()],
+            build_deps: vec![],
+        }];
+        let names: Vec<String> = topological_sort(&nodes)
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        assert_eq!(names, vec!["app"]);
+    }
+
+    #[test]
+    fn topological_sort_appends_nodes_trapped_in_cycles() {
+        let nodes = vec![
+            DepNode {
+                name: "a".into(),
+                requires: vec!["b".into()],
+                build_deps: vec![],
+            },
+            DepNode {
+                name: "b".into(),
+                requires: vec!["a".into()],
+                build_deps: vec![],
+            },
+            DepNode {
+                name: "c".into(),
+                requires: vec![],
+                build_deps: vec![],
+            },
+        ];
+        let names: Vec<String> = topological_sort(&nodes)
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        assert_eq!(names.len(), 3, "cycle members are not dropped: {names:?}");
+        assert_eq!(names[0], "c", "free node sorts first");
+    }
+
+    // ── input-source resolution (no eval; process-global state, serialized) ──
+    //
+    // load_meta/format_tree evaluate recipes through the eval worker
+    // subprocess, which re-executes argv[0] — under the test harness that
+    // is the test binary, so the worker protocol breaks ("running 0
+    // tests"). Those paths stay with the eval_* integration suites; only
+    // the resolution seam is exercised here.
+
+    static INPUTS_LOCK: Mutex<()> = Mutex::new(());
+
+    fn init_local_input_source(root: &Path) {
+        crate::pkg_source::init_global_inputs(&HashMap::from([(
+            "test".to_string(),
+            crate::snap::PackageInput {
+                url: format!("path:{}", root.display()),
+                submodules: None,
+            },
+        )]))
+        .unwrap();
+    }
+
+    #[test]
+    fn recipe_dir_is_the_recipe_file_parent_through_input_sources() {
+        let src = tempfile::tempdir().unwrap();
+        let pkg = src.path().join("pkgs/b");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("bpkg.lua"), "-- recipe body").unwrap();
+        let _guard = INPUTS_LOCK.lock().unwrap();
+        init_local_input_source(src.path());
+        assert_eq!(recipe_dir("bpkg"), Some(src.path().join("pkgs/b")));
+        assert_eq!(recipe_dir("missing-pkg"), None);
     }
 }

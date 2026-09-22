@@ -773,4 +773,97 @@ mod tests {
         assert!(!table.contains_key("revision").unwrap());
         assert!(!table.contains_key("sha3_384").unwrap());
     }
+
+    // ── the index() DSL seam ──
+
+    fn index_file_with(entry: IndexEntry) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(DEFAULT_INDEX);
+        PackageIndex {
+            version: 1,
+            snaps: vec![entry],
+        }
+        .save(&path)
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn lua_index_entry_serves_the_name_table_for_an_alias() {
+        let mut entry = sample_entry();
+        entry.aliases = vec!["core".into()];
+        let (_dir, path) = index_file_with(entry);
+        let lua = mlua::Lua::new();
+
+        let by_name = lua_index_entry(&lua, "core22".into(), "amd64".into(), path.clone()).unwrap();
+        assert_eq!(by_name.get::<String>("name").unwrap(), "core22");
+        let by_alias = lua_index_entry(&lua, "core".into(), "amd64".into(), path).unwrap();
+        assert_eq!(by_alias.get::<String>("name").unwrap(), "core22");
+    }
+
+    #[test]
+    fn lua_index_entry_names_the_missing_snap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(DEFAULT_INDEX);
+        PackageIndex {
+            version: 1,
+            snaps: vec![sample_entry()],
+        }
+        .save(&path)
+        .unwrap();
+        let lua = mlua::Lua::new();
+        let err = lua_index_entry(&lua, "nope".into(), "amd64".into(), path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'nope' not found in package index"), "{err}");
+    }
+
+    #[test]
+    fn lua_index_entry_falls_back_to_the_bundled_default_index() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let lua = mlua::Lua::new();
+        let table = lua_index_entry(&lua, "pc-kernel".into(), "amd64".into(), path).unwrap();
+        assert_eq!(table.get::<String>("name").unwrap(), "pc-kernel");
+    }
+
+    #[test]
+    fn store_ref_defaults_the_channel_when_absent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(DEFAULT_INDEX);
+        std::fs::write(
+            &path,
+            r#"{"version": 1, "snaps": [{"name": "x", "store": {}}]}"#,
+        )
+        .unwrap();
+        let index = PackageIndex::load(&path).unwrap();
+        assert_eq!(
+            index.snaps[0].store.as_ref().unwrap().channel,
+            "latest/stable"
+        );
+    }
+
+    #[test]
+    fn entry_to_snap_meta_marks_a_source_without_sha256_unverified() {
+        let entry = IndexEntry {
+            name: "hello".into(),
+            summary: None,
+            store: None,
+            pins: None,
+            source: Some(SourceDef {
+                url: "https://example.com/hello.tar.gz".into(),
+                sha256: None,
+            }),
+            build: None,
+            apps: None,
+            aliases: vec![],
+        };
+        let meta = PackageIndex::entry_to_snap_meta(&entry).unwrap();
+        match meta.source {
+            Some(crate::snap::SourceSpec::Unverified(url)) => {
+                assert_eq!(url, "https://example.com/hello.tar.gz");
+            }
+            other => panic!("expected an unverified source, got {other:?}"),
+        }
+    }
 }

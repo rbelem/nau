@@ -188,4 +188,16 @@ WantedBy=multi-user.target
             fstab
         );
     }
+
+    #[test]
+    fn write_file_names_the_kind_when_the_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = write_file(root.path(), Path::new("out.txt"), "body", "unit")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unit"), "{err}");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }

@@ -105,6 +105,9 @@ pub fn strip_control_chars(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static OUT_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn control_characters_are_stripped_from_untrusted_text() {
@@ -120,6 +123,97 @@ mod tests {
         assert_eq!(strip_control_chars("/a\r\nGET /b"), "/aGET /b");
         // Clean text passes through untouched.
         assert_eq!(strip_control_chars("hello-world_2"), "hello-world_2");
+    }
+
+    #[test]
+    fn status_helpers_print_only_in_normal_mode() {
+        let _guard = OUT_LOCK.lock().unwrap();
+        set_mode(true);
+        assert!(is_json());
+        ok("json-silent");
+        err("json-silent");
+        warn("json-silent");
+        info("json-silent");
+        status("json-silent");
+        set_mode(false);
+        assert!(!is_json());
+        ok("done");
+        err("failed");
+        warn("careful");
+        info("fyi");
+        status("plain");
+    }
+
+    #[test]
+    fn quiet_build_hides_the_progress_helpers() {
+        let _guard = OUT_LOCK.lock().unwrap();
+        set_quiet_build(true);
+        assert!(is_quiet_build());
+        // Both gate paths run: hidden bars absorb the finish calls
+        // silently (no terminal output under quiet).
+        let quiet_sp = spinner("quiet");
+        let quiet_bar = progress_bar(10, "quiet");
+        finish_ok(&quiet_sp, "done");
+        finish_err(&quiet_bar, "nope");
+        set_quiet_build(false);
+        assert!(!is_quiet_build());
+        let sp = spinner("working");
+        assert_eq!(sp.message(), "working");
+        let bar = progress_bar(100, "downloading");
+        assert_eq!(bar.length(), Some(100));
+        assert_eq!(bar.message(), "downloading");
+        finish_ok(&bar, "done");
+        finish_err(&bar, "nope");
+    }
+
+    fn sample_build_result() -> BuildResultJson {
+        BuildResultJson {
+            name: "tree".into(),
+            version: "2.3.2".into(),
+            arch: "amd64".into(),
+            filename: "tree_2.3.2_amd64.snap".into(),
+            sha256: Some("abc".into()),
+            sources: None,
+        }
+    }
+
+    #[test]
+    fn json_accumulators_drain_per_command_and_skip_normal_mode() {
+        let _guard = OUT_LOCK.lock().unwrap();
+        clear();
+        set_mode(false);
+        record_build_result(sample_build_result());
+        flush_json("build"); // normal mode is a no-op: nothing drains
+        assert!(BUILD_RESULTS.lock().unwrap().is_some());
+
+        set_mode(true);
+        flush_json("unknown-command"); // no command surface: nothing drains
+        assert!(BUILD_RESULTS.lock().unwrap().is_some());
+
+        flush_json("build");
+        assert!(BUILD_RESULTS.lock().unwrap().is_none());
+        assert!(DEP_RESULTS.lock().unwrap().is_none());
+
+        record_dep_result(DepResultJson {
+            name: "m4".into(),
+            requires: vec![],
+            build_deps: vec![],
+            kind: "transitive".into(),
+        });
+        record_order_result(OrderResultJson {
+            name: "m4".into(),
+            kind: "direct".into(),
+        });
+        flush_json("deps");
+        assert!(DEP_RESULTS.lock().unwrap().is_none());
+        assert!(
+            ORDER_RESULTS.lock().unwrap().is_some(),
+            "deps flush leaves orders"
+        );
+        flush_json("order");
+        assert!(ORDER_RESULTS.lock().unwrap().is_none());
+        clear();
+        set_mode(false);
     }
 }
 
