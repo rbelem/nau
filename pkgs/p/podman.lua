@@ -124,8 +124,8 @@ return {
         build = table.concat({
             "mkdir -p $STAGE/usr/bin",
             "export HOME=/tmp GOCACHE=/tmp/shuttle-go-gocache GOPATH=/tmp/shuttle-go-gopath",
-            "export GOFLAGS=\"-trimpath -mod=vendor\" GOPROXY=off GOWORK=off GOTOOLCHAIN=local",
-            "cd $SRC && CGO_ENABLED=1 go build -ldflags \"-X go.podman.io/podman/v6/libpod/config._installPrefix=/usr -X go.podman.io/podman/v6/libpod/config._etcDir=/etc -X go.podman.io/podman/v6/pkg/systemd/quadlet._binDir=/usr/bin\" -tags \"grpcnotrace exclude_graphdriver_btrfs\" -o $STAGE/usr/bin/podman ./cmd/podman",
+            'export GOFLAGS="-trimpath -mod=vendor" GOPROXY=off GOWORK=off GOTOOLCHAIN=local',
+            'cd $SRC && CGO_ENABLED=1 go build -ldflags "-X go.podman.io/podman/v6/libpod/config._installPrefix=/usr -X go.podman.io/podman/v6/libpod/config._etcDir=/etc -X go.podman.io/podman/v6/pkg/systemd/quadlet._binDir=/usr/bin" -tags "grpcnotrace exclude_graphdriver_btrfs" -o $STAGE/usr/bin/podman ./cmd/podman',
         }, " && "),
 
         type = "source",

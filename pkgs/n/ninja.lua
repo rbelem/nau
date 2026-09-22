@@ -34,12 +34,12 @@ to run builds as fast as possible.]],
         -- the sandbox PATH (issue #33), so bare `cmake` resolves to it —
         -- no explicit $SHUTTLE_BUILD_PREFIX path needed.
         build = table.concat({
-            "cmake -S $SRC -B build " ..
-                "-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr " ..
+            "cmake -S $SRC -B build "
+                .. "-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr "
                 -- The sandbox has no network; without this ninja's CMake
                 -- FetchContent tries to download googletest at build time.
                 -- Tests are not installed into the snap anyway.
-                "-DBUILD_TESTING=OFF",
+                .. "-DBUILD_TESTING=OFF",
             "cmake --build build",
             "DESTDIR=$STAGE cmake --install build",
         }, " && "),

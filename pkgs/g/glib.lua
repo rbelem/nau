@@ -51,12 +51,12 @@ return {
             -- the merged build prefix, whose bin dir leads the sandbox
             -- PATH (issue #33) — bare command words resolve to the pool
             -- tools, and the preflight probes them there too.
-            "meson setup build --prefix=/usr " ..
-                "-Dselinux=disabled -Dlibmount=disabled -Dsysprof=disabled " ..
-                "-Dnls=disabled -Dman-pages=disabled -Ddocumentation=false " ..
-                "-Dtests=false -Dinstalled_tests=false -Dlibelf=disabled " ..
-                "-Dintrospection=disabled -Ddtrace=disabled -Dsystemtap=disabled " ..
-                "-Dglib_debug=disabled",
+            "meson setup build --prefix=/usr "
+                .. "-Dselinux=disabled -Dlibmount=disabled -Dsysprof=disabled "
+                .. "-Dnls=disabled -Dman-pages=disabled -Ddocumentation=false "
+                .. "-Dtests=false -Dinstalled_tests=false -Dlibelf=disabled "
+                .. "-Dintrospection=disabled -Ddtrace=disabled -Dsystemtap=disabled "
+                .. "-Dglib_debug=disabled",
             "ninja -C build",
             "DESTDIR=$STAGE ninja -C build install",
         }, " && "),

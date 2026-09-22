@@ -38,20 +38,20 @@ return {
         },
 
         build = table.concat({
-            "export PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\"",
+            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
             "export HOME=/tmp",
             -- xkb-config-root pins the compiled-in default dataset path:
             -- xkeyboard-config ships its rules under share/xkeyboard-config-2
             -- (the X11/xkb compat alias is not shipped — the snap packer's
             -- recursive copy follows stage symlinks, and out-of-stage links
             -- break it).
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/meson\" setup build --prefix=/usr " ..
-                "-Denable-tools=false -Denable-x11=false -Denable-wayland=false " ..
-                "-Denable-xkbregistry=false -Denable-docs=false " ..
-                "-Denable-bash-completion=false " ..
-                "-Dxkb-config-root=/usr/share/xkeyboard-config-2",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build",
-            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build install",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
+                .. "-Denable-tools=false -Denable-x11=false -Denable-wayland=false "
+                .. "-Denable-xkbregistry=false -Denable-docs=false "
+                .. "-Denable-bash-completion=false "
+                .. "-Dxkb-config-root=/usr/share/xkeyboard-config-2",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
         type = "source",
         requires = { "glibc", "xkeyboard-config" },

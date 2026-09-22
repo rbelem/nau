@@ -47,16 +47,16 @@ return {
             -- $SHUTTLE_BUILD_PREFIX path. HOME keeps cmake-method
             -- dependency lookups alive (no /etc in the sandbox, so no
             -- passwd entry).
-            "export PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\"",
+            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
             "export HOME=/tmp",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/meson\" setup build --prefix=/usr " ..
-                "--sysconfdir=/etc --localstatedir=/var " ..
-                "-Dselinux=disabled -Dapparmor=disabled -Dsystemd=disabled " ..
-                "-Dmodular_tests=disabled " ..
-                "-Dxml_docs=disabled -Ddoxygen_docs=disabled " ..
-                "-Dducktype_docs=disabled -Dqt_help=disabled",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build",
-            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build install",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
+                .. "--sysconfdir=/etc --localstatedir=/var "
+                .. "-Dselinux=disabled -Dapparmor=disabled -Dsystemd=disabled "
+                .. "-Dmodular_tests=disabled "
+                .. "-Dxml_docs=disabled -Ddoxygen_docs=disabled "
+                .. "-Dducktype_docs=disabled -Dqt_help=disabled",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22/#19)

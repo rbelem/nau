@@ -134,37 +134,44 @@ return {
             "cp -r opencensus-proto/. grpc/third_party/opencensus-proto/",
             "cp -r xds/. grpc/third_party/xds/",
             "cp -r protoc-gen-validate/. grpc/third_party/protoc-gen-validate/",
-            "cmake -S grpc -B grpc/build -G Ninja " ..
-                "-DCMAKE_BUILD_TYPE=Release " ..
-                "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr " ..
-                "-DCMAKE_INSTALL_PREFIX=/usr " ..
-                "-DCMAKE_INSTALL_LIBDIR=lib " ..
-                "-DCMAKE_CXX_STANDARD=20 " ..
-                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON " ..
-                "-DBUILD_SHARED_LIBS=ON " ..
-                "-DgRPC_INSTALL=ON " ..
-                "-DgRPC_BUILD_TESTS=OFF " ..
-                "-DgRPC_BUILD_CSHARP_EXT=OFF " ..
-                "-DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF " ..
-                "-DgRPC_BUILD_GRPC_NODE_PLUGIN=OFF " ..
-                "-DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=OFF " ..
-                "-DgRPC_BUILD_GRPC_PHP_PLUGIN=OFF " ..
-                "-DgRPC_BUILD_GRPC_PYTHON_PLUGIN=OFF " ..
-                "-DgRPC_BUILD_GRPC_RUBY_PLUGIN=OFF " ..
-                "-DgRPC_SSL_PROVIDER=package " ..
-                "-DgRPC_ZLIB_PROVIDER=package " ..
-                "-DgRPC_CARES_PROVIDER=package " ..
-                "-DgRPC_PROTOBUF_PROVIDER=package " ..
-                "-DgRPC_RE2_PROVIDER=package " ..
-                "-DgRPC_ABSL_PROVIDER=package",
+            "cmake -S grpc -B grpc/build -G Ninja "
+                .. "-DCMAKE_BUILD_TYPE=Release "
+                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_INSTALL_PREFIX=/usr "
+                .. "-DCMAKE_INSTALL_LIBDIR=lib "
+                .. "-DCMAKE_CXX_STANDARD=20 "
+                .. "-DCMAKE_POSITION_INDEPENDENT_CODE=ON "
+                .. "-DBUILD_SHARED_LIBS=ON "
+                .. "-DgRPC_INSTALL=ON "
+                .. "-DgRPC_BUILD_TESTS=OFF "
+                .. "-DgRPC_BUILD_CSHARP_EXT=OFF "
+                .. "-DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF "
+                .. "-DgRPC_BUILD_GRPC_NODE_PLUGIN=OFF "
+                .. "-DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=OFF "
+                .. "-DgRPC_BUILD_GRPC_PHP_PLUGIN=OFF "
+                .. "-DgRPC_BUILD_GRPC_PYTHON_PLUGIN=OFF "
+                .. "-DgRPC_BUILD_GRPC_RUBY_PLUGIN=OFF "
+                .. "-DgRPC_SSL_PROVIDER=package "
+                .. "-DgRPC_ZLIB_PROVIDER=package "
+                .. "-DgRPC_CARES_PROVIDER=package "
+                .. "-DgRPC_PROTOBUF_PROVIDER=package "
+                .. "-DgRPC_RE2_PROVIDER=package "
+                .. "-DgRPC_ABSL_PROVIDER=package",
             "cmake --build grpc/build -j$(nproc)",
             "DESTDIR=$STAGE cmake --install grpc/build",
         }, " && "),
 
         type = "source",
         requires = {
-            "glibc", "libstdcpp", "libgcc", "openssl", "zlib",
-            "abseil-cpp", "protobuf", "re2", "c-ares",
+            "glibc",
+            "libstdcpp",
+            "libgcc",
+            "openssl",
+            "zlib",
+            "abseil-cpp",
+            "protobuf",
+            "re2",
+            "c-ares",
         },
         build_deps = { "cmake", "ninja" },
 

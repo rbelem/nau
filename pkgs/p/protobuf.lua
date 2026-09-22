@@ -78,16 +78,16 @@ return {
         },
 
         build = table.concat({
-            "cmake -S $SRC -B $SRC/build -G Ninja " ..
-                "-DCMAKE_BUILD_TYPE=Release " ..
-                "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr " ..
-                "-DCMAKE_INSTALL_PREFIX=/usr " ..
-                "-DCMAKE_INSTALL_LIBDIR=lib " ..
-                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON " ..
-                "-Dprotobuf_BUILD_TESTS=OFF " ..
-                "-Dprotobuf_BUILD_SHARED_LIBS=ON " ..
-                "-Dprotobuf_ABSL_PROVIDER=package " ..
-                "-Dprotobuf_BUILD_PROTOBUF_BINARIES=ON",
+            "cmake -S $SRC -B $SRC/build -G Ninja "
+                .. "-DCMAKE_BUILD_TYPE=Release "
+                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_INSTALL_PREFIX=/usr "
+                .. "-DCMAKE_INSTALL_LIBDIR=lib "
+                .. "-DCMAKE_POSITION_INDEPENDENT_CODE=ON "
+                .. "-Dprotobuf_BUILD_TESTS=OFF "
+                .. "-Dprotobuf_BUILD_SHARED_LIBS=ON "
+                .. "-Dprotobuf_ABSL_PROVIDER=package "
+                .. "-Dprotobuf_BUILD_PROTOBUF_BINARIES=ON",
             "cmake --build $SRC/build -j$(nproc)",
             "DESTDIR=$STAGE cmake --install $SRC/build",
         }, " && "),

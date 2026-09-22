@@ -51,9 +51,9 @@ return {
         -- keeps the sumdb unreachable (go.sum pins everything).
         build = table.concat({
             "export GOMODCACHE=/tmp/shuttle-go-cache",
-            "export GOPROXY=\"file://$SHUTTLE_DEPS_DIR/cache/download\"",
+            'export GOPROXY="file://$SHUTTLE_DEPS_DIR/cache/download"',
             "export GOFLAGS=-mod=mod GOSUMDB=off GOPATH=/tmp/shuttle-go-cache",
-            "mkdir -p \"$GOMODCACHE\"",
+            'mkdir -p "$GOMODCACHE"',
             "go build -o $STAGE/gojq ./cmd/gojq",
         }, " && "),
 

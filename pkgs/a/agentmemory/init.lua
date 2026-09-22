@@ -83,13 +83,13 @@ return {
         -- emitter resolves the store path at emit time.
         build = table.concat({
             "pkg=$STAGE/usr/lib/node_modules/@agentmemory/agentmemory",
-            "mkdir -p \"$pkg\" $STAGE/usr/bin",
-            "cp -r $SRC/npm/dist $SRC/npm/package.json $SRC/npm/plugin \"$pkg/\"",
-            "cp $SRC/npm/iii-config.yaml $SRC/npm/docker-compose.yml $SRC/npm/.env.example \"$pkg/\"",
+            'mkdir -p "$pkg" $STAGE/usr/bin',
+            'cp -r $SRC/npm/dist $SRC/npm/package.json $SRC/npm/plugin "$pkg/"',
+            'cp $SRC/npm/iii-config.yaml $SRC/npm/docker-compose.yml $SRC/npm/.env.example "$pkg/"',
             -- Stage the production node_modules closure next to dist/
             -- (zg.lua tar-copy pattern): dist's bare-specifier imports
             -- (see header) resolve via node's upward node_modules walk.
-            "tar -C \"$SHUTTLE_DEPS_DIR\" -cf - node_modules | tar -C \"$pkg\" -xf -",
+            'tar -C "$SHUTTLE_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
             "install -m755 $SRC/iii/iii $STAGE/usr/bin/iii",
         }, " && "),
 

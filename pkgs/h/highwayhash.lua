@@ -75,10 +75,10 @@ return {
         },
 
         build = table.concat({
-            "cmake -S $SRC -B $SRC/build -G Ninja " ..
-                "-DCMAKE_BUILD_TYPE=Release " ..
-                "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr " ..
-                "-DCMAKE_INSTALL_PREFIX=/usr",
+            "cmake -S $SRC -B $SRC/build -G Ninja "
+                .. "-DCMAKE_BUILD_TYPE=Release "
+                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_INSTALL_PREFIX=/usr",
             "cmake --build $SRC/build -j$(nproc) --target highwayhash",
             -- No upstream install() rule: hand-stage the two
             -- artifacts the WITH_SUBMODULES_SYSTEM find_path probes

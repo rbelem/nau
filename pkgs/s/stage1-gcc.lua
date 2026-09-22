@@ -44,8 +44,14 @@ return {
         target = "x86_64-linux-gnu",
         toolchain = "stage0-gcc",
         requires = {
-            "stage0-gcc", "binutils",
-            "gmp", "mpfr", "mpc", "isl", "linux-headers", "zlib",
+            "stage0-gcc",
+            "binutils",
+            "gmp",
+            "mpfr",
+            "mpc",
+            "isl",
+            "linux-headers",
+            "zlib",
         },
         source = { url = "https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz" },
         build = [[

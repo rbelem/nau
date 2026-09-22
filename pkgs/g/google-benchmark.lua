@@ -67,16 +67,16 @@ return {
         },
 
         build = table.concat({
-            "cmake -S $SRC -B $SRC/build -G Ninja " ..
-                "-DCMAKE_BUILD_TYPE=Release " ..
-                "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr " ..
-                "-DCMAKE_INSTALL_PREFIX=/usr " ..
-                "-DCMAKE_INSTALL_LIBDIR=lib " ..
-                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON " ..
-                "-DBENCHMARK_ENABLE_TESTING=OFF " ..
-                "-DBENCHMARK_ENABLE_GTEST_TESTS=OFF " ..
-                "-DBENCHMARK_DOWNLOAD_DEPENDENCIES=OFF " ..
-                "-DBENCHMARK_ENABLE_LIBPFM=OFF",
+            "cmake -S $SRC -B $SRC/build -G Ninja "
+                .. "-DCMAKE_BUILD_TYPE=Release "
+                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_INSTALL_PREFIX=/usr "
+                .. "-DCMAKE_INSTALL_LIBDIR=lib "
+                .. "-DCMAKE_POSITION_INDEPENDENT_CODE=ON "
+                .. "-DBENCHMARK_ENABLE_TESTING=OFF "
+                .. "-DBENCHMARK_ENABLE_GTEST_TESTS=OFF "
+                .. "-DBENCHMARK_DOWNLOAD_DEPENDENCIES=OFF "
+                .. "-DBENCHMARK_ENABLE_LIBPFM=OFF",
             "cmake --build $SRC/build -j$(nproc)",
             "DESTDIR=$STAGE cmake --install $SRC/build",
         }, " && "),

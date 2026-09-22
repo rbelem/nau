@@ -33,10 +33,7 @@
 local channel_url = "https://opencode.ai/update/api/latest/cli/npm"
 local channel_body = fetch(channel_url)
 local version = string.match(channel_body, '"version":"([%w%.]+)"')
-assert(
-    version and #version > 0,
-    "opencode-bin: could not resolve the latest v2 release from " .. channel_url
-)
+assert(version and #version > 0, "opencode-bin: could not resolve the latest v2 release from " .. channel_url)
 
 return {
     default = snap {
@@ -57,9 +54,7 @@ return {
         architectures = { "amd64" },
 
         source = {
-            url = "https://opencode.ai/files/bin/"
-                .. version
-                .. "/opencode-linux-x64-baseline.tar.gz",
+            url = "https://opencode.ai/files/bin/" .. version .. "/opencode-linux-x64-baseline.tar.gz",
         },
 
         build = table.concat({

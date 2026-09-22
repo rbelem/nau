@@ -46,7 +46,7 @@ return {
             -- $SHUTTLE_BUILD_PREFIX path. HOME keeps cmake-method
             -- dependency lookups alive (no /etc in the sandbox, so no
             -- passwd entry).
-            "export PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\"",
+            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
             "export HOME=/tmp",
             -- gio-2.0.pc / glib-2.0.pc advertise their tools at /usr/bin/...
             -- (the install prefix path), which does not exist in the
@@ -56,12 +56,12 @@ return {
             -- and glib-2.0 tool variables (libsecret reads gdbus_codegen
             -- and glib_mkenums via the gnome module).
             "printf '[binaries]\\ngdbus-codegen = '\\''%s'\\''\\ngio = '\\''%s'\\''\\ngio-querymodules = '\\''%s'\\''\\nglib-compile-schemas = '\\''%s'\\''\\nglib-compile-resources = '\\''%s'\\''\\ngdbus = '\\''%s'\\''\\ngresource = '\\''%s'\\''\\ngsettings = '\\''%s'\\''\\nglib-mkenums = '\\''%s'\\''\\nglib-genmarshal = '\\''%s'\\''\\ngobject-query = '\\''%s'\\''\\n' \"$SHUTTLE_BUILD_PREFIX/usr/bin/gdbus-codegen\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gio\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gio-querymodules\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/glib-compile-schemas\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/glib-compile-resources\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gdbus\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gresource\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gsettings\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/glib-mkenums\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/glib-genmarshal\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gobject-query\" > gio-tools-native.ini",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/meson\" setup build --prefix=/usr " ..
-                "--native-file gio-tools-native.ini " ..
-                "-Dcrypto=disabled -Dmanpage=false -Dgtk_doc=false " ..
-                "-Dintrospection=false -Dvapi=false -Dbash_completion=disabled",
-            "\"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build",
-            "DESTDIR=$STAGE \"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja\" -C build install",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
+                .. "--native-file gio-tools-native.ini "
+                .. "-Dcrypto=disabled -Dmanpage=false -Dgtk_doc=false "
+                .. "-Dintrospection=false -Dvapi=false -Dbash_completion=disabled",
+            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
 
         type = "source",

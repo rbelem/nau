@@ -52,8 +52,8 @@ return {
             "printf '%s\\n' "
                 .. "'#!/usr/bin/env bash' "
                 .. "'set -e' "
-                .. "'SCRIPT=\"$(readlink -f \"$0\")\"' "
-                .. "'PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"' "
+                .. '\'SCRIPT="$(readlink -f "$0")"\' '
+                .. '\'PODROOT="$(dirname "$(dirname "$(dirname "$SCRIPT")")")"\' '
                 .. "'export HERMES_DESKTOP_HERMES=\"${HERMES_DESKTOP_HERMES:-$PODROOT/current/hermes}\"' "
                 .. "'export ELECTRON_IS_DEV=0' "
                 .. "'if [ ! -x \"$HERMES_DESKTOP_HERMES\" ]; then' "
@@ -61,12 +61,12 @@ return {
                 .. "'    exit 1' "
                 .. "'fi' "
                 .. "'APP=\"$PODROOT/active/extensions/hermes-desktop/usr/usr/lib/hermes-desktop/Hermes\"' "
-                .. "'LIBS=\"$(dirname \"$APP\")/libs\"' "
+                .. '\'LIBS="$(dirname "$APP")/libs"\' '
                 .. "'export LD_LIBRARY_PATH=\"$LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"' "
-                .. "'if [ \"$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)\" = \"1\" ] && ! unshare --user --map-root-user true 2>/dev/null; then' "
-                .. "'    exec \"$APP\" --no-sandbox \"$@\"' "
+                .. '\'if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ] && ! unshare --user --map-root-user true 2>/dev/null; then\' '
+                .. '\'    exec "$APP" --no-sandbox "$@"\' '
                 .. "'fi' "
-                .. "'exec \"$APP\" \"$@\"' "
+                .. '\'exec "$APP" "$@"\' '
                 .. "> $STAGE/usr/bin/hermes-desktop",
             "mkdir -p $STAGE/usr/share/applications",
             "printf '%s\\n' \"[Desktop Entry]\" 'Type=Application' 'Name=Hermes Desktop' 'GenericName=Hermes Agent GUI' 'Comment=The Hermes Agent desktop app — memory, skills, agents, outside the terminal' 'Exec=/usr/bin/hermes-desktop' 'Terminal=false' 'Categories=Development;' > $STAGE/usr/share/applications/hermes-desktop.desktop",

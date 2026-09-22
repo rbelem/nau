@@ -33,13 +33,13 @@ return {
             -- does not extend PATH to it (git.lua documents the same
             -- convention). Makefile.PL and the install steps re-invoke
             -- perl from PATH.
-            "export PATH=\"$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH\"",
+            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
             -- The prefix perl's @INC is compiled in as /usr/lib/perl5/...
             -- which does not exist at build time (the prefix is mounted at
             -- /shuttle-build-prefix); PERL5LIB re-points it at the merged
             -- prefix tree. At runtime no override is needed: pods mount
             -- the closure at /, exactly where @INC looks.
-            "export PERL5LIB=\"$SHUTTLE_BUILD_PREFIX/usr/lib/perl5/5.40.5:$SHUTTLE_BUILD_PREFIX/usr/lib/perl5/5.40.5/x86_64-linux-thread-multi\"",
+            'export PERL5LIB="$SHUTTLE_BUILD_PREFIX/usr/lib/perl5/5.40.5:$SHUTTLE_BUILD_PREFIX/usr/lib/perl5/5.40.5/x86_64-linux-thread-multi"',
             "export HOME=/tmp",
             "perl Makefile.PL",
             "make -j$(nproc)",

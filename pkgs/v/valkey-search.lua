@@ -140,12 +140,12 @@ return {
             -- install prefix is the exact path third_party/icu/
             -- CMakeLists.txt probes relative to CMAKE_BINARY_DIR.
             "mkdir -p $SRC/build-release/icu && cd $SRC/build-release/icu",
-            "$SRC/third_party/icu/source/configure --enable-static " ..
-                "--disable-shared --with-data-packaging=static " ..
-                "--disable-extras --disable-icuio --disable-layout " ..
-                "--disable-tests --disable-samples --enable-tools " ..
-                "--prefix=$SRC/build-release/icu/install " ..
-                "CFLAGS=\"-O2 -fPIC\" CXXFLAGS=\"-O2 -fPIC\"",
+            "$SRC/third_party/icu/source/configure --enable-static "
+                .. "--disable-shared --with-data-packaging=static "
+                .. "--disable-extras --disable-icuio --disable-layout "
+                .. "--disable-tests --disable-samples --enable-tools "
+                .. "--prefix=$SRC/build-release/icu/install "
+                .. 'CFLAGS="-O2 -fPIC" CXXFLAGS="-O2 -fPIC"',
             "make PKGDATA_MODE=static -j$(nproc)",
             "make install PKGDATA_MODE=static",
             -- Stage 2: the module itself, system-modules path.
@@ -156,7 +156,7 @@ return {
             -- cold build dies at ninja ("'mutex' in namespace 'std'
             -- does not name a type"). Inject the include as line 1 —
             -- pragma-once headers tolerate an include above the guard.
-            "sed -i \"1i#include <mutex>\" $SRC/src/indexes/text/text_index.h",
+            'sed -i "1i#include <mutex>" $SRC/src/indexes/text/text_index.h',
             -- Sandbox gap: the sandbox has no /etc/os-release, and
             -- submodules/CMakeLists.txt:7 unconditionally reads it to
             -- derive DISTRO_NAME — used ONLY for an alpine-specific
@@ -166,31 +166,44 @@ return {
             -- errors. (Colon delimiters, not slashes/pipes: the
             -- sandbox tool preflight splits command segments on the
             -- sed-script pipes otherwise.)
-            "sed -i \"7s:.*:set(OS_RELEASE x):\" $SRC/submodules/CMakeLists.txt",
+            'sed -i "7s:.*:set(OS_RELEASE x):" $SRC/submodules/CMakeLists.txt',
             -- SAN_BUILD=no: build.sh exports exactly this before
             -- configure (lines 14/163); the CMake files gate the
             -- benchmark probe on lowercased $ENV{SAN_BUILD} — without
             -- it find_package(benchmark REQUIRED) silently never
             -- fires (see header).
-            "SAN_BUILD=no cmake -S $SRC -B $SRC/build-release -G Ninja " ..
-                "-DCMAKE_BUILD_TYPE=Release " ..
-                "-DCMAKE_POLICY_VERSION_MINIMUM=3.5 " ..
-                "-DBUILD_UNIT_TESTS=OFF " ..
-                "-DWITH_SUBMODULES_SYSTEM=ON " ..
-                "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr " ..
-                "-DCMAKE_INSTALL_PREFIX=/usr",
+            "SAN_BUILD=no cmake -S $SRC -B $SRC/build-release -G Ninja "
+                .. "-DCMAKE_BUILD_TYPE=Release "
+                .. "-DCMAKE_POLICY_VERSION_MINIMUM=3.5 "
+                .. "-DBUILD_UNIT_TESTS=OFF "
+                .. "-DWITH_SUBMODULES_SYSTEM=ON "
+                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_INSTALL_PREFIX=/usr",
             "cmake --build $SRC/build-release -j$(nproc)",
             "install -Dm755 $SRC/build-release/libsearch.so $STAGE/usr/lib/libsearch.so",
         }, " && "),
 
         type = "source",
         requires = {
-            "glibc", "libstdcpp", "libgcc", "libgomp",
-            "abseil-cpp", "protobuf", "grpc", "re2", "openssl", "zlib",
+            "glibc",
+            "libstdcpp",
+            "libgcc",
+            "libgomp",
+            "abseil-cpp",
+            "protobuf",
+            "grpc",
+            "re2",
+            "openssl",
+            "zlib",
         },
         build_deps = {
-            "cmake", "ninja", "make", "git",
-            "highwayhash", "googletest", "google-benchmark",
+            "cmake",
+            "ninja",
+            "make",
+            "git",
+            "highwayhash",
+            "googletest",
+            "google-benchmark",
         },
 
         -- ADR-0018 interim escape (libsecret precedent): the nix gcc

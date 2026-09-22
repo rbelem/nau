@@ -15,7 +15,9 @@ runtime including AddressSanitizer, ThreadSanitizer, and UBSan.]],
         architectures = { "amd64" },
         type = "source",
         requires = { "llvm", "cmake", "ninja" },
-        source = { url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/compiler-rt-19.1.7.src.tar.xz" },
+        source = {
+            url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/compiler-rt-19.1.7.src.tar.xz",
+        },
         build = "cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD=X86 && cmake --build build -j$(nproc) && DESTDIR=$STAGE cmake --install build",
     },
 }

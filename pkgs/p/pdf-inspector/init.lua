@@ -71,8 +71,8 @@ return {
             -- source replacement pointing at the mounted, hash-verified
             -- vendor closure.
             "export CARGO_HOME=/tmp/shuttle-cargo-home CARGO_NET_OFFLINE=true",
-            "mkdir -p \"$CARGO_HOME\"",
-            "printf '[source.crates-io]\\nreplace-with = \"shuttle-vendored\"\\n\\n[source.shuttle-vendored]\\ndirectory = \"%s\"\\n' \"$SHUTTLE_DEPS_DIR/vendor\" > \"$CARGO_HOME/config.toml\"",
+            'mkdir -p "$CARGO_HOME"',
+            'printf \'[source.crates-io]\\nreplace-with = "shuttle-vendored"\\n\\n[source.shuttle-vendored]\\ndirectory = "%s"\\n\' "$SHUTTLE_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
             -- Root crate carries the lib + all three bins; cargo
             -- install lays them out under $STAGE/bin.
             "cargo install --path $SRC --root $STAGE",

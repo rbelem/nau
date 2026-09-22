@@ -31,7 +31,7 @@ for building GCC, MPFR, and MPC.]],
             -- for real (not masked). User CFLAGS fully replace GMP's default
             -- flags, so -O2 must be restated; the x86_64 compiler default
             -- -m64 keeps the ABI=64 probe's codegen correct.
-            "./configure --prefix=/usr CFLAGS=\"-O2 -std=gnu17\" && make && make install DESTDIR=$STAGE",
+            './configure --prefix=/usr CFLAGS="-O2 -std=gnu17" && make && make install DESTDIR=$STAGE',
             -- libtool drops .la metadata next to the libraries carrying
             -- absolute build-time paths (dependency_libs embeds the sandbox
             -- LDFLAGS, -L/shuttle-build-prefix/usr/lib); nothing in the pool

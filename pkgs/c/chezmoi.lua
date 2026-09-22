@@ -32,7 +32,7 @@ return {
         -- root finder (find_source_root) picks as $SRC/cwd. Resolve the
         -- binary against $SRC/.. so the build works for either layout.
         build = table.concat({
-            "install -Dm755 \"$SRC/../chezmoi\" $STAGE/usr/bin/chezmoi",
+            'install -Dm755 "$SRC/../chezmoi" $STAGE/usr/bin/chezmoi',
         }, " && "),
 
         type = "source",

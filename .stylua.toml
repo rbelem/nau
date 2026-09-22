@@ -1,0 +1,25 @@
+# stylua configuration for the shuttle recipe corpus.
+#
+# House style (as found in pkgs/ — this config encodes it, does not
+# invent it): 4-space indent, double-quoted strings, table-literal
+# calls without parentheses (`snap { ... }`, `app { ... }`), other
+# calls parenthesized (`merge(t, overrides)`, `pin("name")`).
+#
+# syntax = "All" enables every parser variant including Luau scripts.
+# NOTE: the typed prelude (src/shuttle-prelude.d.luau) is a Luau
+# *definition* file (`declare` statements) which stylua's parser
+# rejects even in Luau mode — it is listed in .styluaignore and gated
+# by the check-stage Luau pass instead.
+#
+# column_width = 120 reflows code/table literals; string literals that
+# exceed it (shell commands, tarball URLs) are never split, so recipes
+# keep their byte-identical command content.
+
+column_width = 120
+line_endings = "Unix"
+indent_type = "Spaces"
+indent_width = 4
+quote_style = "AutoPreferDouble"
+call_parentheses = "NoSingleTable"
+space_after_function_names = "Never"
+syntax = "All"

@@ -83,10 +83,10 @@ return {
             "mkdir -p $STAGE/usr/bin $SRC/transports/bifrost-http/ui",
             "printf '%s\\n' '<!doctype html><title>bifrost</title><p>bifrost API is running; web UI is not bundled in this port.</p>' > $SRC/transports/bifrost-http/ui/index.html",
             "export GOMODCACHE=/tmp/shuttle-go-cache",
-            "export GOPROXY=\"file://$SHUTTLE_DEPS_DIR/cache/download\"",
+            'export GOPROXY="file://$SHUTTLE_DEPS_DIR/cache/download"',
             "export GOFLAGS=-mod=mod GOSUMDB=off GOPATH=/tmp/shuttle-go-cache",
-            "mkdir -p \"$GOMODCACHE\"",
-            "cd $SRC/transports && CGO_ENABLED=1 GOWORK=off go build -ldflags \"-w -s -X main.Version=v1.7.2\" -trimpath -tags sqlite_static -o $STAGE/usr/bin/bifrost ./bifrost-http",
+            'mkdir -p "$GOMODCACHE"',
+            'cd $SRC/transports && CGO_ENABLED=1 GOWORK=off go build -ldflags "-w -s -X main.Version=v1.7.2" -trimpath -tags sqlite_static -o $STAGE/usr/bin/bifrost ./bifrost-http',
         }, " && "),
 
         type = "source",
@@ -103,10 +103,10 @@ return {
         services = {
             bifrost = svc {
                 command = "usr/bin/bifrost",
-                daemon  = "simple",
-                args    = { "--port", "${port}" },
+                daemon = "simple",
+                args = { "--port", "${port}" },
                 options = {
-                    port    = 8080,
+                    port = 8080,
                     enabled = false,
                 },
                 environment = {},

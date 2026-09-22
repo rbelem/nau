@@ -25,10 +25,16 @@ return {
         type = "meta",
         aliases = { "build-essential" },
         requires = {
-            "make", "autoconf", "automake", "libtool", "m4",
-            "texinfo", "gettext", "pkg-config",
-            "perl",  -- pulled by autotools
-            "toolchain",  -- resolves via alias → gcc-gnu-x86_64
+            "make",
+            "autoconf",
+            "automake",
+            "libtool",
+            "m4",
+            "texinfo",
+            "gettext",
+            "pkg-config",
+            "perl", -- pulled by autotools
+            "toolchain", -- resolves via alias → gcc-gnu-x86_64
         },
     },
 }
