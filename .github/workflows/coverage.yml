@@ -54,15 +54,10 @@ jobs:
           cache-on-failure: true
           workspaces: .
 
-      # Same unprivileged-build sequence as CI's check job: the binary
-      # must exist before the guarded key mint, and the mint must happen
-      # before the instrumented test run (the image command-seam tests
-      # build a real A/B disk, which fails closed without a signing key).
+      # Same unprivileged-build sequence as CI's check job: build before
+      # the instrumented test run.
       - name: Build
         run: devbox run -- build
-
-      - name: Mint the image-signing key
-        run: test -f ~/.config/shuttle/secret-key || devbox run -- ./target/debug/shuttle key keygen
 
       # The devbox rustc has no rustup llvm-tools; cargo-llvm-cov takes
       # the LLVM pair through env vars (its documented seam — see
