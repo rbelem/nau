@@ -927,6 +927,12 @@ pub struct PodRebuildReport {
     pub pod: String,
     pub name: String,
     pub version: String,
+    /// True when the target was HELD, not rebuilt: a blob-pinned
+    /// (sideloaded) package keeps its installed store content on every
+    /// reconcile — the payload, not a recipe, is its content (issue
+    /// #116).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
     /// True when the rebuild deliberately moved the dependency-closure
     /// pin (`--latest`): the fresh closure hash differed from the
     /// previous pin's, or the package had no deps pin yet (ADR-0017
@@ -1439,7 +1445,17 @@ pub fn add_snap_pod(
         .and_then(|n| lock.snaps.get(&n).map(|pin| (n, pin.sha3_384.clone())));
     if let Some((fname, pin_sha3_384)) = &pinned_name {
         if *pin_sha3_384 == sha3_384 {
-            if let Some(report) = sideload_readd_report(root, pod_name, fname, &sha3_384)? {
+            if let Some(mut report) = sideload_readd_report(root, pod_name, fname, &sha3_384)? {
+                // Even a no-op re-add re-presents the pod: a previous
+                // install whose follow-up sync FAILED (e.g. the
+                // requires closure unresolved on a collection-less
+                // machine) leaves farm/current/services stale while the
+                // generation already carries the sha. sync is
+                // idempotent here (present_active re-emits the farm and
+                // services), so running it repairs the presentation and
+                // keeps the "nothing to do" report true.
+                let sync = sync_pod(root, pod_name)?;
+                report.generation = sync.generation.or(report.generation);
                 return Ok(report);
             }
             // Content missing from the generation: fall through to a
@@ -1540,13 +1556,26 @@ pub fn add_snap_pod(
                 // Deliberate version move: fall through, the pins move below.
             }
         }
-    } else {
-        // New package: the same zero-writes validation chain as
-        // `add_package` (issue #8), with claims read from the payload.
-        validate_loads(root, pod_name, &decl)?;
-        validate_overlays(root, &decl, pod_name)?;
-        let layer = payload_layer(&decl, &name);
-        precheck_payload_collisions(root, &decl, &name, &meta, layer)?;
+    }
+    // The same zero-writes validation chain as `add_package` (issue
+    // #8), with claims read from the payload — on EVERY identity path:
+    // a payload naming a declared COLLECTION package converts it to a
+    // blob pin (trust-model flip collection → unsigned content), so
+    // its composition prechecks must refuse before any write too, not
+    // just a new package's.
+    validate_loads(root, pod_name, &decl)?;
+    validate_overlays(root, &decl, pod_name)?;
+    let layer = payload_layer(&decl, &name);
+    precheck_payload_collisions(root, &decl, &name, &meta, layer)?;
+    if declared && !lock.snaps.contains_key(&name) {
+        // The conversion is allowed but loud: the collection recipe
+        // stops governing this package's content — the payload (an
+        // acknowledged-unsigned blob) does.
+        crate::output::warn(format!(
+            "{name}: declared collection package converted to a sideloaded blob \
+             pin — its content is now the payload (unsigned, --ack-unsigned), \
+             no longer the collection recipe"
+        ));
     }
 
     // Writes: declaration (new packages only) + both lockfile pins.
@@ -1910,11 +1939,16 @@ pub fn rebuild_package(
             ));
         }
     }
+    // A blob-pinned package cannot rebuild (the payload is its
+    // content): the reconcile HELD it — surface that instead of letting
+    // the "rebuilt" line claim a build happened (council round 2).
+    let held = sync.held.contains(&spec.name);
 
     Ok(PodRebuildReport {
         pod: pod_name.to_string(),
         name: spec.name,
         version,
+        held,
         deps_pin_moved,
         generation: sync.generation,
     })
@@ -4448,6 +4482,11 @@ pub struct DepsFetchReport {
     pub fetched: Vec<DepsFetchedEntry>,
     /// Locked packages whose pin is cached — untouched (no re-fetch).
     pub skipped: Vec<String>,
+    /// Sideloaded (blob-pinned) packages: never re-resolve from the
+    /// collection (issue #116) — the payload is their content, there
+    /// is no collection meta to load.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sideloaded: Vec<String>,
 }
 
 /// Explicit dependency-closure fetch for every declared package with a
@@ -4476,9 +4515,19 @@ pub fn fetch_pod_deps(
         pod: pod_name.to_string(),
         fetched: Vec::new(),
         skipped: Vec::new(),
+        sideloaded: Vec::new(),
     };
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
+        // Blob pins never re-resolve from the collection (issue #116,
+        // the same skip `update` applies): the payload IS their
+        // content, and `load_meta` here would die in collection
+        // resolution — fatally on a collection-less machine — for a
+        // package that was never a collection package at all.
+        if lock.snaps.contains_key(&spec.name) {
+            report.sideloaded.push(spec.name.clone());
+            continue;
+        }
         let mut meta = crate::deps::load_meta(&spec.name)?;
         if let Some(patch) = decl.overlay.get(&spec.name) {
             apply_overlay(&mut meta, patch)?;

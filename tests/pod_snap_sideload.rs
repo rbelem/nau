@@ -220,6 +220,22 @@ fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, Stri
     )
 }
 
+/// Run a non-`pod` subcommand (`shuttle deps ...`) against the same
+/// redirected state as [`run`].
+fn run_plain(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    cmd.args(args).arg("--root").arg(root);
+    cmd.current_dir(project);
+    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("SHUTTLE_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn shuttle");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 fn pod_dir(root: &Path, pod: &str) -> PathBuf {
     root.join(pod)
 }
@@ -782,4 +798,277 @@ gated_test!(loading_pod_with_blob_pin_refused, {
         !pod_dir(root.path(), "other").join("shuttle.lock").exists(),
         "the refusal must leave zero writes"
     );
+});
+
+// ── Council round 2 ──
+
+// `deps fetch` skips blob-pinned packages (council round 2): a
+// sideloaded package was never a collection package, so resolving its
+// meta would die — fatally on the collection-less pod a sideload
+// targets. The verb must succeed and name the skip.
+gated_test!(deps_fetch_skips_sideloaded, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "hello");
+    let stage = tempfile::tempdir().unwrap();
+    let payload = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "sideload-ran",
+        port,
+        "hello.tar.gz",
+    );
+    // Collection-less target pod: no pkgs/ at all.
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    let (code, _, stderr) = run_plain(
+        project.path(),
+        root.path(),
+        &["deps", "fetch", "--name", "default"],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "deps fetch must not die on a blob pin: {stderr}"
+    );
+    assert!(
+        stderr.contains("skipped 'hello'") && stderr.contains("sideloaded"),
+        "must name the sideload skip: {stderr}"
+    );
+});
+
+// A no-op re-add still re-presents the pod (council round 2): a
+// previous install whose follow-up sync failed leaves the farm stale
+// while the generation already carries the sha — the re-add runs sync
+// (idempotent), repairs the farm, and only then reports "nothing to
+// do".
+gated_test!(readd_repairs_stale_farm, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "hello");
+    let stage = tempfile::tempdir().unwrap();
+    let payload = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "sideload-ran",
+        port,
+        "hello.tar.gz",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let farm = current_farm(root.path(), "default");
+    assert!(farm.join("hello").exists());
+
+    // Simulate the stale presentation a failed follow-up sync leaves:
+    // the farm lost the binary.
+    std::fs::remove_file(farm.join("hello")).unwrap();
+
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("nothing to do"),
+        "the content is identical — a no-op: {stderr}"
+    );
+    let farm = current_farm(root.path(), "default");
+    assert!(
+        farm.join("hello").exists(),
+        "the no-op re-add must have re-presented the farm"
+    );
+    assert_eq!(generation_count(root.path(), "default"), 1);
+});
+
+// Sideloading over a DECLARED collection package converts it to a blob
+// pin — allowed, but loud: the same zero-writes prechecks as a new
+// package run first, and a warning names the conversion (council
+// round 2, ADR-0037 Decision 5 exception).
+gated_test!(sideload_over_declared_collection_converts_loud, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "hello");
+    let stage = tempfile::tempdir().unwrap();
+    let payload = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "sideload-ran",
+        port,
+        "hello.tar.gz",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    // The target pod DECLARES hello (a collection package it never
+    // managed to build — no collection here at all).
+    let dir = pod_dir(root.path(), "default");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("pod.lua"), "pod { packages = { \"hello\" } }\n").unwrap();
+
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "the conversion is allowed: {stderr}");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("converted to a sideloaded blob pin"),
+        "must warn about the trust-model flip: {stderr}"
+    );
+    let lock = lockfile(root.path(), "default");
+    assert_eq!(lock["packages"]["hello"]["version"], "1.0");
+    assert_eq!(lock["snaps"]["hello"]["revision"], 0);
+    assert_eq!(generation_count(root.path(), "default"), 1);
+});
+
+// The hoisted prechecks refuse BEFORE any write: a pod that DECLARES
+// the payload's name and LOADS a pod already carrying that blob pin
+// cannot sideload over it (its load graph is invalid for a mutating
+// verb — same refusal a plain `add` gets).
+gated_test!(sideload_over_declared_in_loaded_pod_refused, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "hello");
+    let stage = tempfile::tempdir().unwrap();
+    let payload = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "sideload-ran",
+        port,
+        "hello.tar.gz",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    // Pod base carries the blob pin.
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &[
+            "--name",
+            "base",
+            "add",
+            "--snap",
+            payload.to_str().unwrap(),
+            "--ack-unsigned",
+        ],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    // Pod other declares hello AND loads base: the sideload must hit
+    // the hoisted validate_loads and refuse with zero writes.
+    let dir = pod_dir(root.path(), "other");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("pod.lua"),
+        "pod { loads = { \"base\" }, packages = { \"hello\" } }\n",
+    )
+    .unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &[
+            "--name",
+            "other",
+            "add",
+            "--snap",
+            payload.to_str().unwrap(),
+            "--ack-unsigned",
+        ],
+    );
+    assert_ne!(code, Some(0), "the hoisted precheck must refuse");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("sideloaded package(s)") && stderr.contains("hello"),
+        "must name the loaded pod's blob pins: {stderr}"
+    );
+    assert!(
+        !pod_dir(root.path(), "other").join("shuttle.lock").exists(),
+        "the refusal must leave zero writes"
+    );
+});
+
+// `pod rebuild` of a blob-pinned package HOLDS it at its pin and says
+// so — never "rebuilt" (council round 2: the held-list is no longer
+// discarded).
+gated_test!(rebuild_sideloaded_reports_held, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "hello");
+    let stage = tempfile::tempdir().unwrap();
+    let payload = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "sideload-ran",
+        port,
+        "hello.tar.gz",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["rebuild", "hello"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("held 'hello' at its pin"),
+        "must surface the hold like sync does: {stderr}"
+    );
+    assert!(
+        !stderr.contains("rebuilt"),
+        "a held package must not be reported as rebuilt: {stderr}"
+    );
+    assert_eq!(generation_count(root.path(), "default"), 1);
 });

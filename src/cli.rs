@@ -1066,8 +1066,9 @@ pub enum PodCommand {
 
         /// Acknowledge the sideloaded payload is unsigned (v1 carries
         /// no pod-side signature; snapd's `--dangerous` precedent).
-        /// Without it the sideload refuses before any write.
-        #[arg(long)]
+        /// Without it the sideload refuses before any write. Only
+        /// meaningful with `--snap`.
+        #[arg(long, requires = "snap")]
         ack_unsigned: bool,
 
         /// Pod state root (default: $XDG_DATA_HOME/shuttle/pods, i.e.

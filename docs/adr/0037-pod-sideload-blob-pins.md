@@ -60,7 +60,15 @@ ingestion path that bypasses the collection must therefore also say what
    carries the new content. (This reads issue #116 Decision 2's "changed
    content produces a new generation" as the version-move path, and
    copies `pending_from_blob`'s divergent-hash refusal to the
-   same-version case.)
+   same-version case.) The tamper refusal guards EXISTING blob pins
+   only: a payload whose name matches a declared COLLECTION package
+   converts that package to a blob pin — including at the same version,
+   with bytes no collection build produced. That conversion is allowed
+   but loud: the same zero-writes composition prechecks a new package
+   goes through (`validate_loads` / `validate_overlays` /
+   `precheck_payload_collisions`) run first, and a warning names the
+   converted package — the collection recipe stops governing its
+   content.
 
 6. **Hold without the collection.** Blob-pinned packages never resolve
    through `load_meta`. `pod sync` holds them when the active generation
@@ -73,12 +81,23 @@ ingestion path that bypasses the collection must therefore also say what
    carries blob pins fails in `validate_loads` — before any write,
    naming the loaded pod, the pinned packages, and issue #116. A loading
    pod rebuilds its loads from collection source; a blob-pinned package
-   has none. Blob-copy across pods is deferred.
+   has none. Blob-copy across pods is deferred. The refusal walks the
+   loading pod's OWN load graph, which leaves a second edge open:
+   sideloading INTO pod B while pod A already loads B leaves A's
+   mutating verbs refused (naming B's new pin) until B's pin is
+   removed — B gained content A cannot rebuild, and A's verbs fail
+   closed rather than silently dropping B from the graph.
 
-8. **`pod update` skips blob pins** with a named note ("re-add with a
-   new `--snap` to move"): blob-pinned packages never float and are never
-   re-resolved from the collection. `remove` and `rollback` work
-   unchanged through the existing paths.
+8. **Blob pins never float.** `pod update` skips blob pins with a named
+   note ("re-add with a new `--snap` to move"), and `deps fetch` skips
+   them too — both would otherwise die in collection resolution for a
+   package that was never a collection package (fatally on a
+   collection-less pod). `pod rebuild` of a blob-pinned package holds it
+   at its pin and says so ("held '<name>' at its pin"), never reporting
+   a rebuild. `rollback` works unchanged through the existing generation
+   switch. `remove` is pin-aware: it drops BOTH pins (Decision 4), so a
+   plain sync after it does not fail named on a pin whose content is
+   gone.
 
 ## Alternatives considered
 
@@ -100,7 +119,9 @@ ingestion path that bypasses the collection must therefore also say what
 
 **Positive**: the pod axis gains the same blob-source seam the system
 axis already has; a collection-less machine can reproduce a pod from
-payloads; pins stay content-addressed and fail-closed; `sync` stays a
+payloads that carry no `requires` closures (a requires closure still
+resolves through the collection, so those pods need it present at sync
+time); pins stay content-addressed and fail-closed; `sync` stays a
 no-op holder instead of dying in `load_meta`.
 
 **Negative**: every sideload is unsigned in v1 (`--ack-unsigned` is the

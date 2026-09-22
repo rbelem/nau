@@ -1614,7 +1614,12 @@ fn cmd_deps_fetch(pod: Option<&str>, root: Option<&str>, latest: bool) -> miette
             "skipped '{name}': locked and its closure pin is cached (use --latest to re-resolve)"
         ));
     }
-    if report.fetched.is_empty() && report.skipped.is_empty() {
+    for name in &report.sideloaded {
+        shuttle::output::info(format!(
+            "skipped '{name}' (sideloaded — blob pins never re-resolve from the collection)"
+        ));
+    }
+    if report.fetched.is_empty() && report.skipped.is_empty() && report.sideloaded.is_empty() {
         shuttle::output::info(format!(
             "pod '{pod_name}' declares no dependency closures (deps = {{ npm = ... }} / pip)"
         ));
@@ -3185,14 +3190,24 @@ fn cmd_pod_rebuild(
 ) -> miette::Result<()> {
     let root = shuttle::pod::pod_root(root.as_deref());
     let report = shuttle::pod::rebuild_package(&root, pod_name, package, latest)?;
-    let mut line = format!(
-        "rebuilt '{}' ({}) in pod '{}'",
-        report.name, report.version, report.pod
-    );
-    if let Some(n) = report.generation {
-        line.push_str(&format!(" (generation {n})"));
+    if report.held {
+        // A blob-pinned (sideloaded) package cannot rebuild — the
+        // payload is its content. Report the hold the way sync does,
+        // never as "rebuilt" (issue #116).
+        shuttle::output::warn(format!("held '{}' at its pin", report.name));
+        if let Some(n) = report.generation {
+            shuttle::output::info(format!("generation {n} current"));
+        }
+    } else {
+        let mut line = format!(
+            "rebuilt '{}' ({}) in pod '{}'",
+            report.name, report.version, report.pod
+        );
+        if let Some(n) = report.generation {
+            line.push_str(&format!(" (generation {n})"));
+        }
+        shuttle::output::ok(line);
     }
-    shuttle::output::ok(line);
     print_report(&report);
     Ok(())
 }
