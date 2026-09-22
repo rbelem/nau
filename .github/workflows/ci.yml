@@ -90,6 +90,13 @@ jobs:
       - name: Build
         run: devbox run -- build
 
+      # The image command-seam tests drive a real A/B+update_source disk
+      # build, which fails closed without an existing image-signing key
+      # (a build never mints one). Mint it for the runner user, guarded so
+      # an existing key is never touched.
+      - name: Mint the image-signing key
+        run: test -f ~/.config/shuttle/secret-key || devbox run -- ./target/debug/shuttle key keygen
+
       - name: Test
         run: devbox run -- test
 

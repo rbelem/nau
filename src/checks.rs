@@ -709,11 +709,17 @@ fn shebang_interpreter(first_line: &str) -> Option<(String, bool)> {
 
 /// Whether the staged tree provides `path` (a `usr/...`-relative payload
 /// file) or `usr/bin/<basename>`.
+///
+/// Shebang interpreters arrive absolute (`/usr/bin/perl`); `Path::join`
+/// with an absolute argument would REPLACE the stage root and probe the
+/// host filesystem instead of the payload — on any machine shipping
+/// `/usr/bin/perl` the check silently no-ops (issue #90 follow-up).
 fn tree_provides(stage: &Path, path: &str) -> bool {
-    if stage.join(path).is_file() {
+    let rel = path.strip_prefix('/').unwrap_or(path);
+    if stage.join(rel).is_file() {
         return true;
     }
-    let base = path.rsplit('/').next().unwrap_or(path);
+    let base = rel.rsplit('/').next().unwrap_or(rel);
     stage.join("usr/bin").join(base).is_file()
 }
 
