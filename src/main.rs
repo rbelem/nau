@@ -3152,6 +3152,36 @@ fn cmd_pod_add(
     Ok(())
 }
 
+/// `shuttle pod declare --file <pod.lua>` (gate-pod gap 5): make a
+/// checked-in file the pod's declaration and reconcile. The summary is
+/// the declaration delta vs the previous state — one line, not a
+/// report.
+fn cmd_pod_declare(pod_name: &str, file: &str, root: Option<String>) -> miette::Result<()> {
+    let root = shuttle::pod::pod_root(root.as_deref());
+    let report = shuttle::pod::declare_pod(&root, pod_name, Path::new(file))?;
+    let mut line = format!("declared pod '{}' from {file}", report.pod);
+    let mut changes = Vec::new();
+    if !report.added.is_empty() {
+        changes.push(format!("added: {}", report.added.join(", ")));
+    }
+    if !report.removed.is_empty() {
+        changes.push(format!("removed: {}", report.removed.join(", ")));
+    }
+    if changes.is_empty() {
+        line.push_str(" — no package changes");
+    } else {
+        line.push_str(&format!(" ({})", changes.join("; ")));
+    }
+    shuttle::output::ok(line);
+    for name in &report.sync.held {
+        shuttle::output::warn(format!("held '{name}' at its pin"));
+    }
+    if let Some(n) = report.sync.generation {
+        shuttle::output::info(format!("generation {n} current"));
+    }
+    Ok(())
+}
+
 /// `shuttle pod refresh <member…>` (issue #142): rebuild the named
 /// members from their current recipes and report per-member outcomes —
 /// installed (generation named) or byte-identical (store content kept).
@@ -3193,6 +3223,7 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             root,
             ..
         } => cmd_pod_add(pod_name, package, snap, ack_unsigned, root),
+        PodCommand::Declare { file, root, .. } => cmd_pod_declare(pod_name, &file, root),
         PodCommand::Remove { package, root, .. } => {
             let root = shuttle::pod::pod_root(root.as_deref());
             let report = shuttle::pod::remove_package(&root, pod_name, &package)?;
