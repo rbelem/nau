@@ -1078,7 +1078,7 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
 
     let inputs = match extract_inputs_json(&lua) {
         Ok(v) => v,
-        Err(e) => return fatal(vec![format!("{e}")]),
+        Err(e) => return fatal(vec![e.to_string()]),
     };
 
     let mlua::Value::Table(table) = &result else {

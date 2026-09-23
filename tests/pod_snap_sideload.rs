@@ -2289,3 +2289,88 @@ gated_test!(precheck_refuses_non_bare_service_name, {
     );
     assert_eq!(generation_count(root.path(), "default"), 0);
 });
+
+/// A fake rust-toolchain payload: `usr/bin/cargo` is the only declared
+/// app, with `cargo-clippy`/`cargo-fmt`/`clippy-driver` as undeclared
+/// payload siblings — the shape that makes cargo's external-subcommand
+/// discovery (`cargo clippy` PATH-searches `cargo-clippy`) a farm
+/// question.
+fn write_toolchain_pkg(project: &Path, port: u16, tarball: &str) {
+    let dir = project.join("pkgs").join("f");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = |name: &str, marker: &str| {
+        format!(
+            "echo '#!/bin/sh' > $STAGE/usr/bin/{name} && \
+             echo 'echo {marker}' >> $STAGE/usr/bin/{name} && \
+             chmod +x $STAGE/usr/bin/{name}"
+        )
+    };
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "faketoolchain",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/{tarball}",
+    build = "mkdir -p $STAGE/usr/bin && {cargo} && {clippy} && {fmt} && {driver}",
+    apps = {{ cargo = {{ command = "usr/bin/cargo" }} }},
+}} }}
+"#,
+        cargo = bin("cargo", "cargo-main"),
+        clippy = bin("cargo-clippy", "clippy-ran"),
+        fmt = bin("cargo-fmt", "fmt-ran"),
+        driver = bin("clippy-driver", "driver-ran"),
+    );
+    std::fs::write(dir.join("faketoolchain.lua"), lua).unwrap();
+}
+
+// A cargo payload's external-subcommand entry points surface on the
+// farm even though only `cargo` is a declared app (gate-pod round 6,
+// blocker a): `cargo clippy`/`cargo fmt` resolve by PATH-searching
+// `cargo-clippy`/`cargo-fmt`, so the shims must be farm entries that
+// EXECUTE. The non-subcommand sibling (clippy-driver) stays unexposed
+// — the app table plus the cargo-* shim rule is the whole bin set.
+gated_test!(cargo_subcommand_shims_surface_on_the_farm, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "toolchain");
+    let stage = tempfile::tempdir().unwrap();
+    write_toolchain_pkg(builder_project.path(), port, "toolchain.tar.gz");
+    let (code, _, stderr) = run(
+        builder_project.path(),
+        builder_root.path(),
+        &["--name", "build", "add", "faketoolchain"],
+    );
+    assert_eq!(code, Some(0), "builder pod add failed: {stderr}");
+    let payload = harvest_payload(builder_root.path(), stage.path(), "faketoolchain", "1.0");
+
+    // The target pod's project has NO pkgs/ — the payload is the only
+    // input (the sideload contract of this file).
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    let farm = current_farm(root.path(), "default");
+    assert!(farm.join("cargo").exists(), "the declared app stays linked");
+    for (name, marker) in [("cargo-clippy", "clippy-ran"), ("cargo-fmt", "fmt-ran")] {
+        assert!(farm.join(name).exists(), "farm must expose {name}");
+        let out = Command::new(name)
+            .env("PATH", &farm)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(marker),
+            "{name} must execute through the farm: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    assert!(
+        !farm.join("clippy-driver").exists(),
+        "non-subcommand siblings must stay unexposed"
+    );
+});
