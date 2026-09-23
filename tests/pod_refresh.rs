@@ -13,6 +13,10 @@
 //! - A refresh BASELINES unrelated drifted members (stamp + content
 //!   kept) instead of rebuilding them; a NAMED member's build failure
 //!   stays loud.
+//! - No UNNAMED installed member rebuilds at all (issue #177): a
+//!   member whose holds don't apply (recipe edited at a constant
+//!   version) keeps its content — its source server may be down
+//!   without failing the refresh of an unrelated member.
 //! - Recipe stamps persist per package as each build succeeds — a
 //!   mid-sweep failure must not restart the whole sweep next sync.
 //! - The migration stamp is LOUD and names the escape hatch.
@@ -607,6 +611,102 @@ gated_test!(refresh_baselines_unrelated_drift_instead_of_rebuilding, {
     assert_ne!(
         xa_after, xa_before,
         "the unnamed member's stamp must be re-recorded (baselined)"
+    );
+});
+
+// Issue #177: `pod refresh <named>` must NEVER rebuild an UNNAMED
+// installed member — not even through the no-version-hold gap (a
+// recipe edited at a constant version misses the content hold: its
+// build-input digest moved; the pin hold needs a version
+// DISAGREEMENT). The unnamed member reaches the rebuild path and its
+// source download runs host-side — failing the whole refresh whenever
+// that source is unreachable (the #177 shape: a local payload tarball
+// served over loopback HTTP only while the operator keeps the server
+// up). Here the unnamed member's source is re-pointed at a loopback
+// port with NO listener before the refresh; the verb must succeed on
+// the named member alone and keep the unnamed member's content.
+gated_test!(refresh_keeps_unnamed_member_whose_source_server_is_down, {
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    // The dead source server: a loopback port bound, recorded, and
+    // dropped — connection refused at fetch time.
+    let dead_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    make_tarball(server.path(), "appsrc");
+    make_tarball(server.path(), "member");
+    let project = tempfile::tempdir().unwrap().keep();
+    let root = tempfile::tempdir().unwrap().keep();
+    write_pkg(
+        &project,
+        "libmember",
+        &[],
+        "memberbin",
+        "member-ran",
+        port,
+        "member.tar.gz",
+    );
+    write_pkg(
+        &project,
+        "app",
+        &["libmember"],
+        "appbin",
+        "app-ran",
+        port,
+        "appsrc.tar.gz",
+    );
+    let (code, _, stderr) = run(&project, &root, &["--name", "p", "add", "app"]);
+    assert_eq!(code, Some(0), "first sync failed: {stderr}");
+    // The jev-review shape: the payload member is DECLARED too — its
+    // recipe lives beside the pod, not just in app's requires closure.
+    let (code, _, stderr) = run(&project, &root, &["--name", "p", "add", "libmember"]);
+    assert_eq!(code, Some(0), "add libmember failed: {stderr}");
+    let gens = generation_count(&root, "p");
+
+    // The recipe moves AFTER the install: re-pointed at the dead
+    // loopback server (the source URL is a build input — the digest
+    // follows) at the SAME version, so neither hold applies. This is
+    // exactly the pre-refresh state of #177's jev-review member.
+    write_pkg(
+        &project,
+        "libmember",
+        &[],
+        "memberbin",
+        "member-ran",
+        dead_port,
+        "member.tar.gz",
+    );
+
+    let (code, stdout, stderr) = run(&project, &root, &["--name", "p", "refresh", "app"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "the refresh must not touch the unnamed member's dead source: \
+         stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to download"),
+        "no source fetch may run for the unnamed member: {stderr}"
+    );
+
+    // The named member rebuilt (byte-identical here — the churn guard
+    // keeps the store content); the unnamed member's installed content
+    // survived untouched.
+    assert_eq!(
+        generation_count(&root, "p"),
+        gens,
+        "nothing the verb touched may churn the store: {stderr}"
+    );
+    let farm = current_farm(&root, "p");
+    assert!(
+        farm_output(&farm, "appbin").contains("app-ran"),
+        "the named member must keep executing"
+    );
+    assert!(
+        farm_output(&farm, "memberbin").contains("member-ran"),
+        "the unnamed member's installed content must survive the refresh"
     );
 });
 

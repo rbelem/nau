@@ -20,9 +20,10 @@
 --      python3 -m http.server 8921 --bind 127.0.0.1)
 -- Bring the server up for `pod rebuild jev-review` AND before any full
 -- plain `pod sync` — a plain sync rebuilds every non-held package, not
--- just changed ones (observed live 2026-09-20); a SCOPED reconcile
--- (`pod rebuild <other>`) skips non-selected installed packages
--- entirely (OwnScope::SkipInstalled) and needs no server.
+-- just changed ones (observed live 2026-09-20). A SCOPED reconcile of
+-- anything else (`pod rebuild <other>`, `pod refresh <other>`) skips
+-- installed packages the verb did not name (OwnScope::SkipInstalled,
+-- #177) and needs no server.
 --
 -- The app is declared the anydoc.lua way: command = the in-payload
 -- server.js, interpreter = "node" (issue #9/#13) — the tree wrapper
