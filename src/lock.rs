@@ -149,6 +149,17 @@ pub struct PodPackageLockEntry {
     /// `deps` declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deps: Option<PackageDepsLock>,
+
+    /// Recipe-closure pin (issue #142): SHA-256 over the canonical,
+    /// sorted list of `(member_name, recipe_file_bytes)` covering the
+    /// package's recipe-resolved `requires` closure — the members
+    /// reconcile builds from collection recipes (blob-pinned sideloads
+    /// excluded). Sync compares it to detect recipe drift at an
+    /// unchanged version pin and rebuilds the affected package.
+    /// Absent from pre-#142 lockfiles, which load unchanged and are
+    /// stamped on the next sync without a rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe_sha256: Option<String>,
 }
 
 /// The dependency-closure pin for one pod package (ADR-0017, issue #13).

@@ -1158,6 +1158,7 @@ mod tests {
                         fetched_at: Some("2026-01-01".into()),
                         lock_sha256: None,
                     }),
+                    recipe_sha256: None,
                 },
             );
         }
