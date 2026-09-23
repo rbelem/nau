@@ -1439,6 +1439,13 @@ pub struct PodSnapAddReport {
     /// The generation now current (absent for a no-op).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    /// The sha3-384 this sideload REPLACED — a divergent payload under
+    /// an existing pin (issue #164 follow-up): same version or not, the
+    /// pins moved and the member was replaced as a new generation.
+    /// `None` on a first install, so the output can distinguish a
+    /// replacement from one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<String>,
 }
 
 /// The `meta/snap.yaml` version field of an unpacked payload (the
@@ -1720,6 +1727,17 @@ pub fn add_snap_pod(
     std::fs::write(&decl_path, render_pod_source(&decl))
         .map_err(|e| miette::miette!("failed to write {}: {e}", decl_path.display()))?;
 
+    // Swap detection (issue #164 follow-up output): a divergent payload
+    // under an existing pin REPLACES the member — capture the prior pin
+    // before the writes below so the report can name the move (a
+    // same-version content replacement must be distinguishable from a
+    // first install).
+    let replaced = lock
+        .snaps
+        .get(&name)
+        .map(|pin| pin.sha3_384.clone())
+        .filter(|old| *old != sha3_384);
+
     let constraint = decl
         .packages
         .iter()
@@ -1735,7 +1753,12 @@ pub fn add_snap_pod(
         PodPackageLockEntry {
             version: version.clone(),
             constraint,
-            deps: lock.packages.get(&name).and_then(|e| e.deps.clone()),
+            // A payload swap invalidates any recorded deps closure: the
+            // new content was not built from the closure the old pin
+            // recorded — carrying it forward would pin a lie. Dropping
+            // the pin fails safe: the next sync/refresh re-resolves the
+            // closure and records a fresh one.
+            deps: None,
             // A sideload is a blob pin (issue #116): no collection
             // recipe closure to hash — the payload is the identity.
             recipe_sha256: None,
@@ -1779,6 +1802,23 @@ pub fn add_snap_pod(
         Err(cause) => return Err(sync_failure_wrap(&name, &version, &generation, cause)),
     };
 
+    // Flip-time warning (issue #164/#142 follow-up): the swapped-out
+    // content still lives in the older generations — a rollback across
+    // this swap reactivates a sha3-384 the blob pin no longer names,
+    // and the NEXT sync refuses (the `hold_blob_pinned` mismatch bail)
+    // until `pod add --snap` realigns it. Warn NOW, at the flip, not
+    // at the next sync's failure.
+    if replaced.is_some() && sync.generation.is_some_and(|n| n > 1) {
+        let previous = sync.generation.unwrap() - 1;
+        crate::output::warn(format!(
+            "'{name}' content replaced: generation {previous} and older still \
+             carry sha3-384 {replaced:.12}… — `shuttle pod rollback` across \
+             this swap reactivates content the blob pin no longer names; the \
+             next sync refuses until `shuttle pod add --snap` realigns it",
+            replaced = replaced.clone().unwrap(),
+        ));
+    }
+
     Ok(PodSnapAddReport {
         pod: pod_name.to_string(),
         name,
@@ -1786,6 +1826,7 @@ pub fn add_snap_pod(
         sha3_384,
         noop: false,
         generation: sync.generation.or(install.generation),
+        replaced,
     })
 }
 
@@ -1861,6 +1902,7 @@ fn sideload_readd_report(
             sha3_384: sha3_384.to_string(),
             noop: true,
             generation: active.map(|g| g.n),
+            replaced: None,
         }));
     }
     Ok(None)
@@ -2112,7 +2154,15 @@ pub fn remove_package(
     // reconcile proceeds without the squashfs pair — and its declared
     // set is recorded WITHOUT building, so only the dropped package
     // (plus genuinely undeclared strays) is removed.
-    let (sync, _) = reconcile_pod_scoped(root, pod_name, None, false, true, &pod_runtime_tools())?;
+    let (sync, _) = reconcile_pod_scoped(
+        root,
+        pod_name,
+        &ReconcileOpts {
+            allow_degraded: true,
+            ..Default::default()
+        },
+        &pod_runtime_tools(),
+    )?;
     if let Some(n) = sync.generation {
         crate::output::ok(format!(
             "removed '{}' from pod '{pod_name}' (generation {n})",
@@ -2158,9 +2208,11 @@ pub fn rebuild_package(
     let (sync, deps_pin_moved) = reconcile_pod_scoped(
         root,
         pod_name,
-        Some(&spec.name),
-        latest,
-        false,
+        &ReconcileOpts {
+            only: Some(&spec.name),
+            float_deps: latest,
+            ..Default::default()
+        },
         &pod_runtime_tools(),
     )?;
 
@@ -2664,8 +2716,122 @@ fn pod_runtime_tools() -> crate::runtime::RuntimeTools {
 /// `Own`, overlay-patched at `Overlay`, recorded in the generation
 /// manifest so the farm resamples the same order at activation.
 pub fn sync_pod(root: &Path, pod_name: &str) -> miette::Result<PodSyncReport> {
-    reconcile_pod_scoped(root, pod_name, None, false, false, &pod_runtime_tools())
-        .map(|(report, _)| report)
+    sync_pod_with(root, pod_name, false)
+}
+
+/// [`sync_pod`] with the issue #142 opt-in: `rebuild_unstamped` treats
+/// entries migration-stamped THIS run as drifted — the one-time
+/// opt-in rebuild sweep (`sync --rebuild-unstamped`). The default
+/// sync stamps without rebuilding (existing pods must not
+/// mass-rebuild on their first post-#142 sync).
+pub fn sync_pod_with(
+    root: &Path,
+    pod_name: &str,
+    rebuild_unstamped: bool,
+) -> miette::Result<PodSyncReport> {
+    let opts = ReconcileOpts {
+        rebuild_unstamped,
+        ..Default::default()
+    };
+    reconcile_pod_scoped(root, pod_name, &opts, &pod_runtime_tools()).map(|(report, _)| report)
+}
+
+/// One refreshed member's outcome (issue #142 `pod refresh`).
+#[derive(Debug, Serialize)]
+pub struct PodRefreshedMember {
+    pub name: String,
+    /// The version the member now executes.
+    pub version: String,
+    /// False when the rebuild came back byte-identical: the churn
+    /// guard kept the store content — no generation churn.
+    pub installed: bool,
+}
+
+/// Report for `shuttle pod refresh` (issue #142).
+#[derive(Debug, Serialize)]
+pub struct PodRefreshReport {
+    pub pod: String,
+    /// One entry per requested member, request order preserved.
+    pub members: Vec<PodRefreshedMember>,
+    /// The reconcile the refresh rode (generation, farm, services).
+    pub sync: PodSyncReport,
+}
+
+/// Rebuild named members from their CURRENT recipes (issue #142),
+/// regardless of whether they are declared: the escape hatch for
+/// undeclarable `requires`-closure members (curl riding git's
+/// closure) and for fixes that predate a pod's recipe-closure
+/// baseline — sync can never reach either (round 5 finding).
+///
+/// Members the rebuild finds byte-identical keep their store content
+/// (the churn guard — no generation churn); a rebuilt member joins
+/// the composition with its binary/desktop/service claims COLLECTED,
+/// so its farm entries materialize (the closure-member gap). A
+/// blob-pinned member refuses fail-closed BEFORE any write: the
+/// payload is its content, there is no recipe to rebuild. Build-tool
+/// failures are loud errors here — this verb is the explicit opt-in,
+/// never a broken day-0 sync.
+pub fn refresh_pod(
+    root: &Path,
+    pod_name: &str,
+    members: &[String],
+) -> miette::Result<PodRefreshReport> {
+    validate_pod_name(pod_name)?;
+    if members.is_empty() {
+        miette::bail!("refresh needs at least one member to rebuild");
+    }
+    // Fail-closed, zero-write prechecks BEFORE any reconcile work.
+    let decl = load_declaration_or_default(root, pod_name)?;
+    let declared: std::collections::BTreeSet<String> = decl
+        .packages
+        .iter()
+        .filter_map(|spec| parse_pod_package(spec).ok().map(|p| p.name))
+        .collect();
+    let lock_path = pod_lock_path(root, pod_name);
+    let lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
+    for member in members {
+        if lock.snaps.contains_key(member) {
+            miette::bail!(
+                "cannot refresh '{member}': it is blob-pinned (sideloaded) — the \
+                 payload is its content, there is no recipe to rebuild; re-run \
+                 `shuttle pod add --snap` to replace it"
+            );
+        }
+        if !declared.contains(member) {
+            // An undeclared target must at least resolve in the
+            // collection — refuse a garbage name before any build.
+            crate::deps::load_meta(member)
+                .map_err(|e| miette::miette!("cannot refresh '{member}': {e}"))?;
+        }
+    }
+    let opts = ReconcileOpts {
+        refresh: members,
+        ..Default::default()
+    };
+    let (sync, _) = reconcile_pod_scoped(root, pod_name, &opts, &pod_runtime_tools())?;
+    // Per-member outcome from the post-state generation.
+    let store = pod_store(&pod_dir(root, pod_name));
+    let active = store.active_generation()?;
+    let out = members
+        .iter()
+        .map(|member| {
+            let version = active
+                .as_ref()
+                .and_then(|g| g.packages.get(member))
+                .map(|p| p.version.clone())
+                .unwrap_or_default();
+            PodRefreshedMember {
+                name: member.clone(),
+                version,
+                installed: sync.installed.iter().any(|n| n == member),
+            }
+        })
+        .collect();
+    Ok(PodRefreshReport {
+        pod: pod_name.to_string(),
+        members: out,
+        sync,
+    })
 }
 
 /// What the scoped reconcile does with one own package before the
@@ -2852,7 +3018,9 @@ fn hold_blob_pinned(
 ///
 /// - Entry with an equal hash → today's behavior.
 /// - Entry without a hash (pre-#142 lockfile) → the digest is stamped
-///   silently, NO rebuild — existing pods must not mass-rebuild.
+///   (LOUD: it names the baseline and its limit) with NO rebuild —
+///   existing pods must not mass-rebuild. `sync --rebuild-unstamped`
+///   opts into treating unstamped entries as drifted instead.
 /// - No entry (new pin) → today's behavior; the pin is stamped when
 ///   written.
 /// - Entry with a differing hash → drift: the package joins the
@@ -2896,8 +3064,34 @@ fn detect_recipe_drift(
     };
     match &entry.recipe_sha256 {
         None => {
-            // Migration (issue #142): stamp silently, no rebuild.
-            build.recipe_stamps.push((spec.name.clone(), digest));
+            // Migration (issue #142): stamp WITHOUT a rebuild — existing
+            // pods must not mass-rebuild. The stamp is LOUD (round 5:
+            // the silent baseline swallowed pre-baseline fixes forever)
+            // and names both the limit and the escape hatch. With
+            // `sync --rebuild-unstamped` the operator opts into the
+            // one-time rebuild sweep instead: the unstamped entry is
+            // treated as drifted, in the exact shape of the branch
+            // below.
+            build
+                .recipe_stamps_pending
+                .push((spec.name.clone(), digest));
+            if build.rebuild_unstamped {
+                build.recipe_drift.insert(spec.name.clone());
+                build
+                    .recipe_drift_members
+                    .extend(entries.iter().map(|(name, _)| name.clone()));
+                crate::output::status(format!(
+                    "recipe drift: {} (no recorded closure digest — rebuilding)",
+                    spec.name
+                ));
+            } else {
+                crate::output::status(format!(
+                    "baseline recorded for '{}': recipe drift predating this sync \
+                     is unrecoverable — run `shuttle pod refresh <member>` to \
+                     rebuild a member from its current recipe",
+                    spec.name
+                ));
+            }
         }
         Some(recorded) if *recorded == digest => {}
         Some(_) => {
@@ -2905,7 +3099,9 @@ fn detect_recipe_drift(
             build
                 .recipe_drift_members
                 .extend(entries.iter().map(|(name, _)| name.clone()));
-            build.recipe_stamps.push((spec.name.clone(), digest));
+            build
+                .recipe_stamps_pending
+                .push((spec.name.clone(), digest));
             crate::output::status(format!(
                 "recipe drift: {} (closure recipe changed)",
                 spec.name
@@ -3093,16 +3289,37 @@ fn resolve_pure_inputs(
     Ok((env_vars, svc_overrides))
 }
 
-/// The reconcile proper (see [`sync_pod`]). `only` scopes it to ONE
-/// declared package — the `pod rebuild` core (issue #15): the selected
-/// package rebuilds at its pins, every other installed package keeps
-/// its store content. `float_deps` makes the selected package's
-/// dependency ensure float regardless of its own float mode
-/// (`rebuild --latest`): the closure is re-resolved and its pin moved
-/// deliberately (ADR-0017 Decision 5). Returns the report plus whether
-/// the selected package's deps pin moved.
+/// Knobs of one scoped reconcile (see [`reconcile_pod_scoped`]).
+#[derive(Default)]
+struct ReconcileOpts<'a> {
+    /// Scope the reconcile to ONE declared package (`pod rebuild`,
+    /// issue #15).
+    only: Option<&'a str>,
+    /// Float the selected package's dependency closure
+    /// (`rebuild --latest`, ADR-0017 Decision 5).
+    float_deps: bool,
+    /// Removal-flow degraded mode (issue #16): without the squashfs
+    /// pair the reconcile records the declared set and removes only.
+    allow_degraded: bool,
+    /// `sync --rebuild-unstamped` (issue #142): entries migration-stamped
+    /// this run are treated as drifted — the one-time opt-in rebuild
+    /// sweep. The default sync stamps without rebuilding.
+    rebuild_unstamped: bool,
+    /// `pod refresh <member…>` (issue #142): rebuild exactly these
+    /// members from their CURRENT recipes, regardless of declared-ness.
+    refresh: &'a [String],
+}
+
+/// The reconcile proper (see [`sync_pod`]). `opts.only` scopes it to
+/// ONE declared package — the `pod rebuild` core (issue #15): the
+/// selected package rebuilds at its pins, every other installed
+/// package keeps its store content. `opts.float_deps` makes the
+/// selected package's dependency ensure float regardless of its own
+/// float mode (`rebuild --latest`): the closure is re-resolved and its
+/// pin moved deliberately (ADR-0017 Decision 5). Returns the report
+/// plus whether the selected package's deps pin moved.
 ///
-/// `allow_degraded` (issue #16): when the squashfs pair is absent,
+/// `opts.allow_degraded` (issue #16): when the squashfs pair is absent,
 /// build-capable verbs (`sync`, `rebuild`) fail closed BEFORE any
 /// store/lock/farm mutation, while the removal flow (`allow_degraded`)
 /// proceeds — nothing builds, but the declared set is still recorded
@@ -3110,25 +3327,28 @@ fn resolve_pure_inputs(
 fn reconcile_pod_scoped(
     root: &Path,
     pod_name: &str,
-    only: Option<&str>,
-    float_deps: bool,
-    allow_degraded: bool,
+    opts: &ReconcileOpts<'_>,
     tools: &crate::runtime::RuntimeTools,
 ) -> miette::Result<(PodSyncReport, bool)> {
-    let mut state = prepare_reconcile(root, pod_name, allow_degraded, tools)?;
+    let mut state = prepare_reconcile(root, pod_name, opts.allow_degraded, tools)?;
     let (env_vars, svc_overrides) = resolve_pure_inputs(&state.root, &state.pod_name, &state.decl)?;
-    let mut build = ReconcileBuild::default();
-    collect_pending(&mut state, only, float_deps, &mut build)?;
+    let mut build = ReconcileBuild {
+        rebuild_unstamped: opts.rebuild_unstamped,
+        refresh_members: opts.refresh.iter().cloned().collect(),
+        ..Default::default()
+    };
+    collect_pending(&mut state, opts, &mut build)?;
     let installed = install_pending(&mut state, &mut build)?;
 
     // Overlay-driven repins (issue #6) and moved dependency-closure pins
     // (ADR-0017): applied only after the installs succeeded, so a failed
-    // reconcile leaves the pin untouched.
+    // reconcile leaves the pin untouched. Recipe-closure stamps (issue
+    // #142) are NOT batched here — they persist incrementally, per
+    // package, as each package's contribution succeeds.
     apply_pin_updates(
         &mut state.lock,
         &build.repins,
         &build.deps_pins,
-        &build.recipe_stamps,
         &state.lock_path,
     )?;
     // Remove store packages the declaration dropped.
@@ -3266,19 +3486,19 @@ fn prepare_reconcile(
 /// warning is loud when declared packages remain uninstalled.
 fn collect_pending(
     state: &mut ReconcileState,
-    only: Option<&str>,
-    float_deps: bool,
+    opts: &ReconcileOpts<'_>,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
     if install_capable(&state.tools) {
-        let ctx = ReconcileCtx {
+        let mut ctx = ReconcileCtx {
             store: &state.store,
-            lock: &state.lock,
+            lock: &mut state.lock,
+            lock_path: &state.lock_path,
             active: state.active.as_ref(),
             root: &state.root,
             pod_name: &state.pod_name,
         };
-        collect_own_packages(&ctx, &state.decl, only, float_deps, build)?;
+        collect_own_packages(&mut ctx, &state.decl, opts, build)?;
         collect_loaded_packages(
             &ctx,
             &state.decl,
@@ -3365,11 +3585,13 @@ fn install_pending(
 }
 
 /// Shared inputs for the build phases of one scoped reconcile: the pod
-/// store, the pre-reconcile lockfile, and the active generation when
-/// one exists.
+/// store, the pre-reconcile lockfile (mutable — recipe-closure stamps
+/// commit into it per package, issue #142), and the active generation
+/// when one exists.
 struct ReconcileCtx<'a> {
     store: &'a crate::runtime::RuntimeStore,
-    lock: &'a LockFile,
+    lock: &'a mut LockFile,
+    lock_path: &'a Path,
     active: Option<&'a crate::runtime::Generation>,
     root: &'a Path,
     pod_name: &'a str,
@@ -3417,10 +3639,17 @@ struct ReconcileBuild {
     /// Recipe-closure digests computed this reconcile (issue #142), per
     /// declared package: recorded onto every pin the reconcile writes.
     recipe_digests: Vec<(String, String)>,
-    /// Silent migration stamps (issue #142): lock entries that predate
-    /// the closure hash get theirs recorded WITHOUT a rebuild — existing
-    /// pods must not mass-rebuild on the first post-#142 sync.
-    recipe_stamps: Vec<(String, String)>,
+    /// Recipe-closure stamps queued this reconcile (issue #142), per
+    /// declared package: committed INCREMENTALLY — as each package's
+    /// contribution (build or hold) succeeds — so a mid-sweep failure
+    /// doesn't restart the whole sweep on the next sync.
+    recipe_stamps_pending: Vec<(String, String)>,
+    /// `sync --rebuild-unstamped` (issue #142): migration-stamped entries
+    /// are treated as drifted this run.
+    rebuild_unstamped: bool,
+    /// `pod refresh <member…>` (issue #142): the members to rebuild from
+    /// current recipes regardless of declared-ness.
+    refresh_members: std::collections::BTreeSet<String>,
     /// Declared packages whose recipe closure drifted (issue #142):
     /// rebuilt at their pins EVEN at an unchanged version.
     recipe_drift: std::collections::BTreeSet<String>,
@@ -3490,10 +3719,9 @@ fn resolve_own_meta(
 /// Decision 7). The scoped-reconcile decisions (issue #15) come from
 /// [`scope_own_package`].
 fn collect_own_packages(
-    ctx: &ReconcileCtx<'_>,
+    ctx: &mut ReconcileCtx<'_>,
     decl: &PodDeclaration,
-    only: Option<&str>,
-    float_deps: bool,
+    opts: &ReconcileOpts<'_>,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
     for spec_str in &decl.packages {
@@ -3524,18 +3752,65 @@ fn collect_own_packages(
         } else {
             crate::farm::ClaimLayer::Own
         };
-        let selected = only.is_none_or(|n| n == spec.name.as_str());
+        let selected = opts.only.is_none_or(|n| n == spec.name.as_str());
         // Recipe-closure drift (issue #142): decided BEFORE scoping, so
         // a drifted package can bypass the sync holds. Off-scope
         // packages (a scoped rebuild of a sibling) are not probed —
         // their drift stays for a plain sync to sweep.
         if selected {
             detect_recipe_drift(ctx, &spec, &meta, build)?;
+            // `pod refresh` (issue #142): an explicitly named declared
+            // member rebuilds from its CURRENT recipes at its pin even
+            // when the closure digest matches — the churn guard keeps a
+            // byte-identical rebuild store-stable.
+            if build.refresh_members.contains(&spec.name)
+                && !build.recipe_drift.contains(&spec.name)
+            {
+                build.recipe_drift.insert(spec.name.clone());
+            }
         }
-        if let OwnScope::Build =
-            scope_own_package(ctx, selected, only.is_some(), overlay, &mut meta, build)?
-        {
-            build_own_package(ctx, &spec, &meta, layer, float_deps && selected, build)?;
+        let scope = scope_own_package(
+            ctx,
+            selected,
+            opts.only.is_some(),
+            overlay,
+            &mut meta,
+            build,
+        )?;
+        if let OwnScope::Build = scope {
+            build_own_package(ctx, &spec, &meta, layer, opts.float_deps && selected, build)?;
+        }
+        // Issue #142, incremental stamping: this package's contribution
+        // (a successful build, or a hold that keeps its content) is
+        // complete — persist its queued stamp NOW, so a later package's
+        // failure in the same sweep doesn't restart the whole sweep on
+        // the next sync. Repins/deps pins stay batched after success.
+        commit_pending_recipe_stamp(ctx, build, &spec.name)?;
+    }
+    Ok(())
+}
+
+/// Persist one queued recipe-closure stamp (issue #142): written onto
+/// the package's EXISTING lock entry (a stamp never creates a pin) and
+/// saved immediately. Incremental, per-package — the stamp records the
+/// digest the package's closure had when its contribution succeeded.
+fn commit_pending_recipe_stamp(
+    ctx: &mut ReconcileCtx<'_>,
+    build: &mut ReconcileBuild,
+    name: &str,
+) -> miette::Result<()> {
+    let Some(pos) = build
+        .recipe_stamps_pending
+        .iter()
+        .position(|(queued, _)| queued == name)
+    else {
+        return Ok(());
+    };
+    let (_, digest) = build.recipe_stamps_pending.remove(pos);
+    if let Some(entry) = ctx.lock.packages.get_mut(name) {
+        if entry.recipe_sha256.as_deref() != Some(digest.as_str()) {
+            entry.recipe_sha256 = Some(digest);
+            ctx.lock.save(ctx.lock_path)?;
         }
     }
     Ok(())
@@ -3687,10 +3962,17 @@ fn collect_loaded_packages(
 /// contributions. No desktop/binary claims are collected for them — a
 /// collision resolves at farm emission by layer precedence instead of
 /// failing the reconcile.
+///
+/// `pod refresh` targets (issue #142) are the exception twice over:
+/// a named member rebuilds from its CURRENT recipe even though the
+/// active generation carries content (sync skips it), and its claims
+/// ARE collected — the refreshed member's binaries reach the farm
+/// instead of vanishing behind layer precedence.
 fn install_requires_closure(
     ctx: &ReconcileCtx<'_>,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
+    ensure_refresh_targets_are_members(ctx, build)?;
     if build.requires_seeds.is_empty() {
         return Ok(());
     }
@@ -3704,22 +3986,53 @@ fn install_requires_closure(
         if build.declared_names.contains(&name) {
             continue;
         }
+        let refresh = build.refresh_members.contains(&name);
         // Recipe drift (issue #142): a member whose collection recipe
         // drifted rebuilds from its recipe even though the active
         // generation carries content — that carried content is what
         // recipe-only fixes never used to reach.
         let drifted = build.recipe_drift_members.contains(&name);
-        if active_names.contains(&name) && !drifted {
+        if active_names.contains(&name) && !drifted && !refresh {
             build.declared_names.insert(name);
             continue;
         }
         let dep_meta = crate::deps::load_meta(&name)?;
-        let payload = ensure_pod_dep_payload(ctx.store, &name, &dep_meta, &mut building, drifted)?;
+        let payload = ensure_pod_dep_payload(
+            ctx.store,
+            &name,
+            &dep_meta,
+            &mut building,
+            drifted || refresh,
+        )?;
         let sha3_384 = crate::store::sha3_384_file(&payload)?;
-        if drifted {
+        if refresh {
+            // The refreshed member joins the composition with its
+            // claims COLLECTED (the closure-member gap, issue #142):
+            // its binaries/desktop IDs/services are emitted onto the
+            // farm at the Loaded layer. Collected BEFORE the churn
+            // check — a byte-identical refresh still materializes the
+            // farm entry the member never had.
+            push_meta_desktop_claims(
+                &mut build.desktop_claims,
+                &dep_meta,
+                crate::farm::ClaimLayer::Loaded,
+            );
+            push_meta_binary_claims(
+                &mut build.binary_claims,
+                &dep_meta,
+                crate::farm::ClaimLayer::Loaded,
+            );
+            push_meta_service_claims(
+                &mut build.service_claims,
+                &dep_meta,
+                crate::farm::ClaimLayer::Loaded,
+            );
+        }
+        if drifted || refresh {
             // Churn guard: an UNDRIFTED member of a drifted closure
-            // rebuilds to identical bytes and keeps its store content —
-            // only a genuinely changed payload earns an install.
+            // (and any `pod refresh` target) rebuilds to identical
+            // bytes and keeps its store content — only a genuinely
+            // changed payload earns an install.
             if let Some(installed) = ctx.active.as_ref().and_then(|g| g.packages.get(&name)) {
                 if installed.sha3_384 == sha3_384 {
                     build.declared_names.insert(name);
@@ -3738,10 +4051,50 @@ fn install_requires_closure(
     Ok(())
 }
 
-/// Apply overlay-driven repins (issue #6), moved dependency-closure
-/// pins (ADR-0017), and recipe-closure stamps (issue #142) to the
-/// lockfile — called only after the installs succeeded, so a failed
-/// reconcile leaves the pins untouched. Loaded packages are NOT
+/// `pod refresh` targets must BE members of this pod's package set
+/// (issue #142): declared, loaded, or in some package's `requires`
+/// closure. Anything else has nothing to refresh — a name outside the
+/// closure would be built and then wiped by the undeclared-removal
+/// phase — so it fails loud BEFORE any build. Declared/loaded names
+/// are already recorded in `declared_names` by the collection phases.
+fn ensure_refresh_targets_are_members(
+    ctx: &ReconcileCtx<'_>,
+    build: &ReconcileBuild,
+) -> miette::Result<()> {
+    if build.refresh_members.is_empty() {
+        return Ok(());
+    }
+    let members: std::collections::BTreeSet<String> = if build.requires_seeds.is_empty() {
+        Default::default()
+    } else {
+        crate::deps::resolve_dep_names(&build.requires_seeds, true)?
+            .into_iter()
+            .collect()
+    };
+    let foreign: Vec<String> = build
+        .refresh_members
+        .iter()
+        .filter(|name| !members.contains(*name) && !build.declared_names.contains(*name))
+        .cloned()
+        .collect();
+    if !foreign.is_empty() {
+        miette::bail!(
+            "cannot refresh {}: not a member of pod '{}' — not declared, not \
+             loaded, and in no package's requires closure; declare it with \
+             `shuttle pod add` first",
+            foreign.join(", "),
+            ctx.pod_name
+        );
+    }
+    Ok(())
+}
+
+/// Apply overlay-driven repins (issue #6) and moved dependency-closure
+/// pins (ADR-0017) to the lockfile — called only after the installs
+/// succeeded, so a failed reconcile leaves the pins untouched.
+/// Recipe-closure stamps (issue #142) are NOT batched here: they
+/// commit incrementally, per package, as each package's contribution
+/// succeeds ([`commit_pending_recipe_stamp`]). Loaded packages are NOT
 /// repinned in this pod's lockfile: a loaded pod's versions live in the
 /// loaded pod, and this pod follows them live (issue #8 — read-only
 /// consumption, no cross-pod pins).
@@ -3749,10 +4102,9 @@ fn apply_pin_updates(
     lock: &mut LockFile,
     repins: &[(String, PodPackageLockEntry)],
     deps_pins: &[(String, crate::lock::PackageDepsLock)],
-    recipe_stamps: &[(String, String)],
     lock_path: &Path,
 ) -> miette::Result<()> {
-    if repins.is_empty() && deps_pins.is_empty() && recipe_stamps.is_empty() {
+    if repins.is_empty() && deps_pins.is_empty() {
         return Ok(());
     }
     for (name, entry) in repins {
@@ -3771,13 +4123,6 @@ fn apply_pin_updates(
                     recipe_sha256: None,
                 },
             );
-        }
-    }
-    // Recipe-closure stamps (issue #142): only entries that exist — a
-    // stamp never creates a pin, it records onto one.
-    for (name, digest) in recipe_stamps {
-        if let Some(entry) = lock.packages.get_mut(name) {
-            entry.recipe_sha256 = Some(digest.clone());
         }
     }
     lock.save(lock_path)
@@ -5483,10 +5828,11 @@ pod {
     }
 
     impl HoldFixture {
-        fn ctx(&self) -> ReconcileCtx<'_> {
+        fn ctx(&mut self) -> ReconcileCtx<'_> {
             ReconcileCtx {
                 store: &self.store,
-                lock: &self.lock,
+                lock: &mut self.lock,
+                lock_path: self._dir.path(),
                 active: Some(&self.gen),
                 root: self._dir.path(),
                 pod_name: "default",
@@ -5499,7 +5845,7 @@ pod {
     #[test]
     fn test_plain_sync_holds_when_the_recipe_matches_the_installed_record() {
         let mut meta = bare_meta("tool", "1.0");
-        let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
         let mut build = ReconcileBuild::default();
         let scope =
             scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
@@ -5519,7 +5865,7 @@ pod {
     fn test_plain_sync_rebuilds_when_the_build_command_changed() {
         let mut installed_meta = bare_meta("tool", "1.0");
         installed_meta.build = Some("echo old".into());
-        let fixture = hold_fixture(installed_tool(Some(installed_meta.build_input_digest())));
+        let mut fixture = hold_fixture(installed_tool(Some(installed_meta.build_input_digest())));
 
         let mut meta = bare_meta("tool", "1.0");
         meta.build = Some("echo new".into());
@@ -5535,7 +5881,7 @@ pod {
     #[test]
     fn test_scoped_rebuild_bypasses_the_content_hold() {
         let mut meta = bare_meta("tool", "1.0");
-        let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
         let mut build = ReconcileBuild::default();
         let scope =
             scope_own_package(&fixture.ctx(), true, true, false, &mut meta, &mut build).unwrap();
@@ -5548,7 +5894,7 @@ pod {
     #[test]
     fn test_overlay_package_never_content_holds() {
         let mut meta = bare_meta("tool", "1.0");
-        let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
         let mut build = ReconcileBuild::default();
         let scope =
             scope_own_package(&fixture.ctx(), true, false, true, &mut meta, &mut build).unwrap();
@@ -5562,7 +5908,7 @@ pod {
     #[test]
     fn test_manifest_without_a_digest_rebuilds_once_then_holds() {
         let mut meta = bare_meta("tool", "1.0");
-        let fixture = hold_fixture(installed_tool(None));
+        let mut fixture = hold_fixture(installed_tool(None));
         let mut build = ReconcileBuild::default();
         let scope =
             scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
@@ -5570,7 +5916,7 @@ pod {
 
         // The rebuild records its digest on the installed record —
         // simulated here by reinstalling the fixture with the digest.
-        let fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
+        let mut fixture = hold_fixture(installed_tool(Some(meta.build_input_digest())));
         let mut build = ReconcileBuild::default();
         let scope =
             scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
@@ -5594,7 +5940,7 @@ pod {
     /// (store/pull installs, deps-less declarations).
     #[test]
     fn test_held_sync_skips_verification_without_a_recorded_deps_pin() {
-        let fixture = hold_fixture(installed_tool(Some(
+        let mut fixture = hold_fixture(installed_tool(Some(
             bare_meta("tool", "1.0").build_input_digest(),
         )));
         verify_held_deps_blob(&fixture.ctx(), "tool").unwrap();

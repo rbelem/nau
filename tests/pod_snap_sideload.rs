@@ -743,8 +743,8 @@ gated_test!(new_version_blob_moves_pins, {
     );
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(
-        stderr.contains("sideloaded 'hello' (2.0)"),
-        "stderr: {stderr}"
+        stderr.contains("replaced 'hello' (2.0): sha3-384"),
+        "a pinned-name re-add must name the pin move; stderr: {stderr}"
     );
     assert_eq!(generation_count(root.path(), "default"), 2);
     assert_eq!(current_generation(root.path(), "default"), 2);
@@ -834,8 +834,9 @@ gated_test!(same_version_blob_swaps_in_place, {
         "same-version divergent bytes must replace, not refuse: {stderr}"
     );
     assert!(
-        stderr.contains("sideloaded 'hello' (1.0)"),
-        "stderr: {stderr}"
+        stderr.contains("replaced 'hello' (1.0): sha3-384"),
+        "a same-version replacement must be named as one, not as a first \
+         install; stderr: {stderr}"
     );
     assert_eq!(generation_count(root.path(), "default"), 2);
     assert_eq!(current_generation(root.path(), "default"), 2);

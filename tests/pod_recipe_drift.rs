@@ -339,8 +339,18 @@ fn pre142_lockfile_stamped_without_rebuild() {
     let gens = generation_count(&root, "p");
     let (code, _, stderr) = run(&_project, &root, &["--name", "p", "sync"]);
     assert_eq!(code, Some(0), "{stderr}");
+    // The stamp is LOUD now (round 5: the silent baseline swallowed
+    // pre-baseline fixes forever) — it names the limit and the escape.
     assert!(
-        !stderr.contains("recipe drift"),
+        stderr.contains("baseline recorded for 'app'"),
+        "the migration stamp must be loud; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("pod refresh"),
+        "the baseline notice must name the escape hatch; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("no recorded closure digest — rebuilding"),
         "migration must not rebuild; stderr={stderr}"
     );
     assert_eq!(
