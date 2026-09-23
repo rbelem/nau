@@ -486,9 +486,11 @@ gated_test!(sideload_installs_sync_holds_and_readd_is_noop, {
     assert!(!current_farm(root.path(), "default").join("hello").exists());
 });
 
-// A byte-flipped re-add under the pinned name+version refuses
+// A blob under the pinned name that cannot even unpack refuses
 // fail-closed, naming the divergence — the generation chain is
-// untouched.
+// untouched. (Since the #164 follow-up, an unpackable payload under
+// the same version would otherwise be a legitimate replacement; the
+// unpack gate is what still refuses corrupted bytes.)
 gated_test!(tampered_payload_refused, {
     let builder_project = tempfile::tempdir().unwrap();
     let builder_root = tempfile::tempdir().unwrap();
@@ -518,15 +520,16 @@ gated_test!(tampered_payload_refused, {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(generation_count(root.path(), "default"), 1);
 
-    // Tamper: flip one byte in the middle of a copy (a distinct file —
-    // copying onto the source would truncate it).
+    // Tamper: flip the squashfs magic byte in a copy (a distinct
+    // file — copying onto the source would truncate it). The magic is
+    // deterministic: unsquashfs cannot unpack it, so the fail-closed
+    // unpack gate refuses regardless of the replacement semantics.
     let tampered_dir = stage.path().join("tampered");
     std::fs::create_dir_all(&tampered_dir).unwrap();
     let tampered = tampered_dir.join(payload.file_name().unwrap());
     std::fs::copy(&payload, &tampered).unwrap();
     let mut bytes = std::fs::read(&tampered).unwrap();
-    let mid = bytes.len() / 2;
-    bytes[mid] ^= 0xFF;
+    bytes[0] ^= 0xFF;
     std::fs::write(&tampered, &bytes).unwrap();
 
     let (code, _, stderr) = run(
@@ -756,6 +759,104 @@ gated_test!(new_version_blob_moves_pins, {
         lock["snaps"]["hello"]["sha3-384"].as_str().unwrap(),
         v1_pin_sha,
         "the blob pin must move to the new content"
+    );
+});
+
+// A same-version blob swap (re-built content under an identical
+// name+version) is a replacement, not a refusal (issue #164 follow-up):
+// the blob hash — not the version string — is the identity, so the pins
+// move, the member is replaced as a new generation, and the farm
+// executes the new content. Every trust gate re-ran on the way in
+// (--ack-unsigned included); the generation history is preserved.
+gated_test!(same_version_blob_swaps_in_place, {
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let builder_root2 = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "hello");
+    let stage = tempfile::tempdir().unwrap();
+    let v1 = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "sideload-one",
+        port,
+        "hello.tar.gz",
+    );
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", v1.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(generation_count(root.path(), "default"), 1);
+    let v1_pin_sha = lockfile(root.path(), "default")["snaps"]["hello"]["sha3-384"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The rebuild: same name, SAME version, different bytes — a second
+    // builder root, and a separate harvest dir (the artifact filename
+    // collides with v1's).
+    let stage2 = tempfile::tempdir().unwrap();
+    let v1b = build_payload(
+        builder_project.path(),
+        builder_root2.path(),
+        stage2.path(),
+        "hello",
+        "hello",
+        "hello",
+        "1.0",
+        "sideload-two",
+        port,
+        "hello.tar.gz",
+    );
+    assert_ne!(
+        std::fs::read(&v1).unwrap(),
+        std::fs::read(&v1b).unwrap(),
+        "the two payloads must carry different bytes"
+    );
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", v1b.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "same-version divergent bytes must replace, not refuse: {stderr}"
+    );
+    assert!(
+        stderr.contains("sideloaded 'hello' (1.0)"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(generation_count(root.path(), "default"), 2);
+    assert_eq!(current_generation(root.path(), "default"), 2);
+
+    let farm = current_farm(root.path(), "default");
+    let out = Command::new("hello").env("PATH", &farm).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("sideload-two"),
+        "the farm must execute the replacement content"
+    );
+
+    let lock = lockfile(root.path(), "default");
+    assert_eq!(
+        lock["packages"]["hello"]["version"],
+        serde_json::json!("1.0"),
+        "the version string never moved"
+    );
+    assert_ne!(
+        lock["snaps"]["hello"]["sha3-384"].as_str().unwrap(),
+        v1_pin_sha,
+        "the blob pin must move to the replacement content"
     );
 });
 
