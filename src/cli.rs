@@ -1100,6 +1100,15 @@ pub enum PodCommand {
         #[command(flatten)]
         target: PodTarget,
 
+        /// Opt into the one-time migration rebuild sweep (issue #142):
+        /// lock entries being stamped for the FIRST time this sync are
+        /// treated as drifted — they rebuild at their pins from the
+        /// CURRENT recipes instead of baselining silently. The default
+        /// sync stamps without rebuilding: existing pods must not
+        /// mass-rebuild on their first post-#142 sync.
+        #[arg(long)]
+        rebuild_unstamped: bool,
+
         /// Pod state root (see `pod add --root`).
         #[arg(long)]
         root: Option<String>,
@@ -1177,6 +1186,31 @@ pub enum PodCommand {
         root: Option<String>,
     },
 
+    /// Rebuild named members from their CURRENT recipes (issue #142),
+    /// regardless of whether they are declared: the escape hatch for
+    /// undeclarable requires-closure members (curl riding git's
+    /// closure) and for fixes that predate a pod's recipe-closure
+    /// baseline — sync can never reach either. A member the rebuild
+    /// finds byte-identical keeps its store content (no generation
+    /// churn); a changed member installs with its binary claims
+    /// collected, so its farm entries materialize. Explicit opt-in:
+    /// build-tool failures are loud errors here, never a broken day-0
+    /// sync. Blob-pinned (sideloaded) members refuse — the payload is
+    /// their content, there is no recipe.
+    Refresh {
+        #[command(flatten)]
+        target: PodTarget,
+
+        /// Member names to rebuild: declared packages, loaded packages,
+        /// or requires-closure members of the pod's package set.
+        #[arg(required = true)]
+        members: Vec<String>,
+
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
+    },
+
     /// Roll the selected pod back to a previous generation (default:
     /// the one before the current): flips that pod's `current` link
     /// only — never reboots, never touches system generations. Binaries
@@ -1233,6 +1267,7 @@ impl PodCommand {
             PodCommand::Add { target, .. }
             | PodCommand::Remove { target, .. }
             | PodCommand::Sync { target, .. }
+            | PodCommand::Refresh { target, .. }
             | PodCommand::List { target, .. }
             | PodCommand::Shellenv { target, .. }
             | PodCommand::Update { target, .. }

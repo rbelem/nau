@@ -3104,6 +3104,18 @@ fn cmd_pod_add(
                  ({:.12}…) — nothing to do",
                 report.name, report.sha3_384
             ));
+        } else if let Some(old) = &report.replaced {
+            // A replacement under a pinned name (issue #164 follow-up
+            // output): name the pin move so a same-version content
+            // swap is distinguishable from a first install.
+            let mut line = format!(
+                "replaced '{}' ({}): sha3-384 {old:.12}… → {:.12}…",
+                report.name, report.version, report.sha3_384
+            );
+            if let Some(n) = report.generation {
+                line.push_str(&format!(", generation {n}"));
+            }
+            shuttle::output::ok(line);
         } else {
             let mut line = format!(
                 "sideloaded '{}' ({}) into pod '{pod_name}'",
@@ -3123,6 +3135,35 @@ fn cmd_pod_add(
         "added '{}' ({}) to pod '{}'",
         report.name, report.version, report.pod
     ));
+    Ok(())
+}
+
+/// `shuttle pod refresh <member…>` (issue #142): rebuild the named
+/// members from their current recipes and report per-member outcomes —
+/// installed (generation named) or byte-identical (store content kept).
+fn cmd_pod_refresh(root: &Path, pod_name: &str, members: &[String]) -> miette::Result<()> {
+    let report = shuttle::pod::refresh_pod(root, pod_name, members)?;
+    for member in &report.members {
+        if member.installed {
+            let generation = report
+                .sync
+                .generation
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            shuttle::output::ok(format!(
+                "refreshed '{}' ({}) — installed on generation {generation}",
+                member.name, member.version
+            ));
+        } else {
+            shuttle::output::ok(format!(
+                "refreshed '{}' ({}) — rebuild byte-identical, store content kept",
+                member.name, member.version
+            ));
+        }
+    }
+    if let Some(n) = report.sync.generation {
+        shuttle::output::info(format!("generation {n} current"));
+    }
     Ok(())
 }
 
@@ -3147,11 +3188,19 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             ));
             Ok(())
         }
-        PodCommand::Sync { root, .. } => {
+        PodCommand::Sync {
+            rebuild_unstamped,
+            root,
+            ..
+        } => {
             let root = shuttle::pod::pod_root(root.as_deref());
-            let report = shuttle::pod::sync_pod(&root, pod_name)?;
+            let report = shuttle::pod::sync_pod_with(&root, pod_name, rebuild_unstamped)?;
             print_pod_sync_report(&report);
             Ok(())
+        }
+        PodCommand::Refresh { members, root, .. } => {
+            let root = shuttle::pod::pod_root(root.as_deref());
+            cmd_pod_refresh(&root, pod_name, &members)
         }
         PodCommand::List { root, .. } => {
             let root = shuttle::pod::pod_root(root.as_deref());
