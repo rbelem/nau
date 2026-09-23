@@ -2945,6 +2945,14 @@ pub fn check_explicit_stage(stage_dir: &Path) -> miette::Result<()> {
 /// file is simply left behind (deleting it would reintroduce an
 /// unlink/unlock race); no stale-lock cleanup exists or is needed.
 ///
+/// Hardened against an external `stage.lock` unlink mid-acquire (issue
+/// #173): after the flock, the fd's `(dev, ino)` is checked against the
+/// path's, and a mismatch — something swept and recreated the file
+/// between our open and our check — drops the orphaned fd and retries,
+/// bounded. A followed pre-planted symlink is refused outright
+/// (O_NOFOLLOW): the fd must lock the file at the path, never a victim
+/// inode behind a link. Shuttle itself never unlinks the lock file.
+///
 /// Scope: `flock(2)` is SINGLE-HOST mutual exclusion (on NFS it is
 /// client-local, since Linux 2.6.12) — this lock never coordinates
 /// builds across machines. And it covers the default stage only:
@@ -2971,42 +2979,136 @@ fn stage_lock_path(stage_dir: &Path) -> Option<std::path::PathBuf> {
     )
 }
 
+/// Bounded re-open attempts when the lock file's identity flips between
+/// the open and the check (an external unlink+recreate racing the
+/// acquire): enough to absorb a one-shot sweeper, small enough that a
+/// pathological sweeper fails the build loudly instead of spinning.
+const STAGE_LOCK_IDENTITY_ATTEMPTS: usize = 5;
+
+/// Test-only seam (issue #173): runs between the flock and the inode
+/// check, so a unit test can race an external unlink+recreate into
+/// exactly that window deterministically. Registered per lock path:
+/// unit tests run in parallel, so a single global hook would either fire
+/// inside a concurrent test's acquire or be replaced by it.
+#[cfg(test)]
+static STAGE_LOCK_TEST_SWAP: std::sync::Mutex<
+    Vec<(std::path::PathBuf, Box<dyn Fn(&Path) + Send>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_stage_lock_test_swap(lock_path: &Path) {
+    let hooks = STAGE_LOCK_TEST_SWAP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (target, hook) in hooks.iter() {
+        if target == lock_path {
+            hook(lock_path);
+        }
+    }
+}
+
+/// Open the sibling lock file without following a symlink planted at the
+/// path (issue #173): O_NOFOLLOW turns a pre-planted `stage.lock →
+/// victim` link into a loud failure instead of silently flocking the
+/// victim inode. The file is never written, so the link is harmless
+/// today — but a followed link would still have us locking an inode
+/// shuttle does not own.
+fn open_stage_lock(lock_path: &Path) -> miette::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                miette::miette!(
+                    "stage lock {} is a symlink — refusing to follow it. Remove the \
+                     symlink so shuttle can create a real lock file.",
+                    lock_path.display()
+                )
+            } else {
+                miette::miette!("failed to open stage lock {}: {}", lock_path.display(), e)
+            }
+        })
+}
+
+/// Take the exclusive flock on an already-open lock file. Non-blocking:
+/// a held lock is the normal second-build outcome, not an inode race.
+fn flock_stage_lock(
+    file: &std::fs::File,
+    stage_dir: &Path,
+    lock_path: &Path,
+) -> miette::Result<()> {
+    use std::os::fd::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return Err(miette::miette!(
+            "default stage '{}' is held by another shuttle build — wait \
+             for it to finish, or pass --stage <dir> to build into a \
+             separate stage",
+            stage_dir.display()
+        ));
+    }
+    Err(miette::miette!(
+        "failed to lock stage {}: {}",
+        lock_path.display(),
+        err
+    ))
+}
+
+/// Unlink-and-recreate check (issue #173): true while the fd we flocked
+/// is still the inode now at `lock_path`. Without it, an external unlink
+/// between the open and the check lets the next build O_CREAT a fresh
+/// inode and take its own flock — reopening the mutual-exclusion gap.
+fn stage_lock_identity_holds(file: &std::fs::File, lock_path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(fd_meta), Ok(path_meta)) = (file.metadata(), std::fs::metadata(lock_path)) else {
+        return false;
+    };
+    fd_meta.ino() == path_meta.ino() && fd_meta.dev() == path_meta.dev()
+}
+
 impl StageLock {
     /// Take the default-stage lock, failing loudly when another build
     /// already holds it. Non-blocking: never waits.
     pub fn acquire(stage_dir: &Path) -> miette::Result<Self> {
-        use std::os::fd::AsRawFd;
         let lock_path = stage_lock_path(stage_dir).ok_or_else(|| {
             miette::miette!(
                 "cannot lock stage '{}': path has no file name to derive a sibling lock from",
                 stage_dir.display()
             )
         })?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| {
-                miette::miette!("failed to open stage lock {}: {}", lock_path.display(), e)
-            })?;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
+        let mut attempt = 0usize;
+        let file = loop {
+            attempt += 1;
+            let file = open_stage_lock(&lock_path)?;
+            flock_stage_lock(&file, stage_dir, &lock_path)?;
+            #[cfg(test)]
+            run_stage_lock_test_swap(&lock_path);
+            if stage_lock_identity_holds(&file, &lock_path) {
+                break file;
+            }
+            // The inode we just locked is gone from the path: an outside
+            // actor (git clean, a *.lock sweeper) unlinked and recreated
+            // it between the open and the check. Drop this fd —
+            // releasing its orphaned flock — and take the fresh one.
+            // Shuttle itself never unlinks the lock file.
+            if attempt >= STAGE_LOCK_IDENTITY_ATTEMPTS {
                 return Err(miette::miette!(
-                    "default stage '{}' is held by another shuttle build — wait \
-                     for it to finish, or pass --stage <dir> to build into a \
-                     separate stage",
-                    stage_dir.display()
+                    "stage lock {} was replaced {} times while acquiring it — something \
+                     is sweeping or recreating the file mid-acquire (git clean, a *.lock \
+                     watcher). Stop the sweeper and retry the build.",
+                    lock_path.display(),
+                    attempt
                 ));
             }
-            return Err(miette::miette!(
-                "failed to lock stage {}: {}",
-                lock_path.display(),
-                err
-            ));
-        }
+        };
         Ok(Self { _file: file })
     }
 }
@@ -11757,7 +11859,7 @@ fi
 
         // Release on drop: the next build proceeds.
         drop(_first);
-        let _again = StageLock::acquire(&stage).unwrap();
+        wait_stage_lock_released(&stage);
     }
 
     #[test]
@@ -11769,6 +11871,167 @@ fi
         std::fs::create_dir_all(&b).unwrap();
         let _lock_a = StageLock::acquire(&a).unwrap();
         let _lock_b = StageLock::acquire(&b).unwrap();
+    }
+
+    // ── stage.lock hardening (issue #173) ──
+
+    fn set_stage_lock_swap_hook(lock_path: &Path, hook: Option<Box<dyn Fn(&Path) + Send>>) {
+        let mut hooks = STAGE_LOCK_TEST_SWAP
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        hooks.retain(|(target, _)| target != lock_path);
+        if let Some(hook) = hook {
+            hooks.push((lock_path.to_path_buf(), hook));
+        }
+    }
+
+    /// Proves release-on-drop with a bounded re-acquire. `drop(lock)`
+    /// closes our fd, but flock lives as long as ANY reference to the
+    /// open file description — a `fork(2)`ed, not-yet-exec'd child of a
+    /// concurrent test (the build/image suites spawn tools) pins the
+    /// description for a few microseconds past our close, and
+    /// `/proc/locks` keeps naming the original owner pid. The build
+    /// contract stays fail-loud; only this release assertion tolerates
+    /// that scheduling window.
+    fn wait_stage_lock_released(stage: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match StageLock::acquire(stage) {
+                Ok(lock) => {
+                    drop(lock);
+                    return;
+                }
+                Err(err) if std::time::Instant::now() < deadline => {
+                    assert!(
+                        format!("{err:#}").contains("held by another shuttle build"),
+                        "unexpected lock error while waiting for release: {err:#}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("stage lock was not released on drop: {err:#}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_stage_lock_identity_check_detects_replaced_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stage.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            stage_lock_identity_holds(&file, &path),
+            "a freshly opened fd must match the path"
+        );
+
+        // External sweeper: unlink + recreate puts a fresh inode at the
+        // path — the orphaned fd must no longer match.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            !stage_lock_identity_holds(&file, &path),
+            "a replaced file must fail the identity check"
+        );
+
+        // A vanished path (unlink only, no recreate) is a mismatch too.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!stage_lock_identity_holds(&file, &path));
+    }
+
+    #[test]
+    fn test_stage_lock_recovers_when_lock_file_is_swapped_mid_acquire() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let lock_path = dir.path().join("stage.lock");
+        let hook_path = lock_path.clone();
+        let swaps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_swaps = swaps.clone();
+        set_stage_lock_swap_hook(
+            &lock_path,
+            Some(Box::new(move |_| {
+                // A one-shot external sweeper racing the acquire: unlink +
+                // recreate exactly once, then leave the fresh file alone.
+                if hook_swaps.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    std::fs::remove_file(&hook_path).unwrap();
+                    std::fs::write(&hook_path, b"").unwrap();
+                }
+            })),
+        );
+        let lock = StageLock::acquire(&stage);
+        set_stage_lock_swap_hook(&lock_path, None);
+
+        let lock = lock.unwrap();
+        assert!(
+            swaps.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the swap hook must have fired during the acquire"
+        );
+        // The held lock is the file NOW at the path: a second acquirer
+        // is excluded, proving the retry took the fresh inode.
+        let err = StageLock::acquire(&stage).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("held by another shuttle build"),
+            "retry must land on the current inode: {err:#}"
+        );
+        drop(lock);
+        wait_stage_lock_released(&stage);
+    }
+
+    #[test]
+    fn test_stage_lock_fails_loudly_when_lock_file_keeps_changing() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let lock_path = dir.path().join("stage.lock");
+        let hook_path = lock_path.clone();
+        set_stage_lock_swap_hook(
+            &lock_path,
+            Some(Box::new(move |_| {
+                std::fs::remove_file(&hook_path).unwrap();
+                std::fs::write(&hook_path, b"").unwrap();
+            })),
+        );
+        let result = StageLock::acquire(&stage);
+        set_stage_lock_swap_hook(&lock_path, None);
+
+        let err = result.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("was replaced"),
+            "exhausted retries must fail loudly: {msg}"
+        );
+        assert!(
+            msg.contains("stage.lock"),
+            "the loud failure must name the lock file: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_stage_lock_refuses_symlinked_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A victim inode with a symlink planted at another stage's lock
+        // path, pointing at it.
+        let victim = dir.path().join("victimstage.lock");
+        std::fs::write(&victim, b"").unwrap();
+        let stage = dir.path().join("otherstage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("otherstage.lock")).unwrap();
+
+        let err = StageLock::acquire(&stage).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("symlink"),
+            "a planted link must be refused, not followed: {msg}"
+        );
+
+        // The fd never flocked the victim: the stage owning that lock
+        // path still acquires cleanly.
+        let victim_stage = dir.path().join("victimstage");
+        std::fs::create_dir_all(&victim_stage).unwrap();
+        StageLock::acquire(&victim_stage).unwrap();
     }
 
     #[test]
