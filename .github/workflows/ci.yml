@@ -98,18 +98,56 @@ jobs:
       - name: Install golang (go-deps tests build inside the sandbox)
         run: sudo apt-get install -y --no-install-recommends golang-go
 
-      # enable-cache snapshots the whole /nix/store closure (keyed on
-      # devbox.lock + nix version) instead of re-pulling ~1.5 GiB from
-      # cache.nixos.org every run. Caveats: actions/cache caps ~10 GB per
-      # repo and this closure carries qemu, so watch the cache size after
-      # enabling; the first runs only populate the cache — the savings
-      # show up on subsequent runs. The PR's own CI run is the measurement.
+      # The nix-store closure (~1.5 GiB, qemu included) is cached by
+      # hand instead of via devbox-install-action's enable-cache for
+      # two upstream reasons: its cache key hashes devbox.lock, which
+      # `devbox run` rewrites mid-job, so restore and save hash
+      # differently and the cache can never hit
+      # (jetify-com/devbox-install-action#28); and the action's inner
+      # nix-installer v16 carries its own /nix/store cache against the
+      # decommissioned GH cache service — 400s every run, no knob to
+      # disable (jetify-com/devbox-install-action#79). Nix therefore
+      # installs directly (v17+ dropped that inner cache), and the
+      # closure restore/save below use a stable key keyed on
+      # devbox.json with a prefix fallback: after a devbox.json bump
+      # the exact key misses but restore-keys still seeds from the old
+      # closure, and nix fills the delta from cache.nixos.org.
+      - name: Install nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          extra-conf: experimental-features = ca-derivations fetch-closure
+
+      # Restoring /nix/store as non-root needs this sudo tar shim
+      # (actions/cache shells out to `tar`; copied from the devbox
+      # action's own Linux workaround).
+      - name: Tar shim for /nix store restore
+        run: |
+          mkdir -p ~/.local/bin
+          printf '#!/bin/sh\nexec sudo /usr/bin/tar "$@"\n' > ~/.local/bin/tar
+          chmod +x ~/.local/bin/tar
+
+      - name: Restore nix store closure
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cache/devbox
+            ~/.cache/nix
+            ~/.local/state/nix
+            ~/.nix-defexpr
+            ~/.nix-profile
+            /nix/store
+            /nix/var/nix
+          key: devbox-nix-store-v1-${{ runner.os }}-${{ hashFiles('devbox.json') }}
+          restore-keys: |
+            devbox-nix-store-v1-${{ runner.os }}-
+
       - name: Install devbox
         uses: jetify-com/devbox-install-action@734088efddca47cf44ff8a09289c6d0e51b73218 # v0.12.0
         with:
           project-path: .
           devbox-version: 0.18.3
-          enable-cache: true
+          enable-cache: false
+          skip-nix-installation: true
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -145,3 +183,23 @@ jobs:
 
       - name: Lua style (stylua)
         run: devbox run -- stylua --check pkgs/
+
+      # Seeds the closure for the next run. Main-only: PR runs restore
+      # from main's cache but never race it — concurrent reserves of the
+      # same key were the "another job may be creating this cache"
+      # failure on every overlapping run. always() so a red gate still
+      # warms the cache; the closure is complete right after the devbox
+      # install either way.
+      - name: Save nix store closure
+        if: always() && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cache/devbox
+            ~/.cache/nix
+            ~/.local/state/nix
+            ~/.nix-defexpr
+            ~/.nix-profile
+            /nix/store
+            /nix/var/nix
+          key: devbox-nix-store-v1-${{ runner.os }}-${{ hashFiles('devbox.json') }}

@@ -36,16 +36,44 @@ jobs:
       - name: Install golang (go-deps tests build inside the sandbox)
         run: sudo apt-get install -y --no-install-recommends golang-go
 
-      # Same enable-cache rationale as CI's check job: snapshot the
-      # /nix/store closure keyed on devbox.lock instead of re-pulling
-      # ~1.5 GiB per run; ~10 GB actions/cache repo cap and the qemu
-      # closure are the caveats, first runs only populate the cache.
+      # Same hand-rolled closure cache as CI's check job — see the
+      # rationale there (devbox-install-action#28 key drift, #79 inner
+      # v16 cache). The nightly save runs at job end, so the llvm
+      # tools that `nix build` adds to /nix/store are captured too and
+      # subsequent nights skip that fetch entirely.
+      - name: Install nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          extra-conf: experimental-features = ca-derivations fetch-closure
+
+      - name: Tar shim for /nix store restore
+        run: |
+          mkdir -p ~/.local/bin
+          printf '#!/bin/sh\nexec sudo /usr/bin/tar "$@"\n' > ~/.local/bin/tar
+          chmod +x ~/.local/bin/tar
+
+      - name: Restore nix store closure
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cache/devbox
+            ~/.cache/nix
+            ~/.local/state/nix
+            ~/.nix-defexpr
+            ~/.nix-profile
+            /nix/store
+            /nix/var/nix
+          key: devbox-nix-store-v1-${{ runner.os }}-${{ hashFiles('devbox.json') }}
+          restore-keys: |
+            devbox-nix-store-v1-${{ runner.os }}-
+
       - name: Install devbox
         uses: jetify-com/devbox-install-action@734088efddca47cf44ff8a09289c6d0e51b73218 # v0.12.0
         with:
           project-path: .
           devbox-version: 0.18.3
-          enable-cache: true
+          enable-cache: false
+          skip-nix-installation: true
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -82,3 +110,20 @@ jobs:
           name: lcov
           path: lcov.info
           retention-days: 14
+
+      # Same save discipline as CI's check job — main-only, always().
+      # Runs after the coverage steps, so the llvm closure added by
+      # `nix build` above is part of the saved snapshot.
+      - name: Save nix store closure
+        if: always() && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cache/devbox
+            ~/.cache/nix
+            ~/.local/state/nix
+            ~/.nix-defexpr
+            ~/.nix-profile
+            /nix/store
+            /nix/var/nix
+          key: devbox-nix-store-v1-${{ runner.os }}-${{ hashFiles('devbox.json') }}
