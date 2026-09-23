@@ -20,6 +20,18 @@ return {
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
         requires = { "glibc" },
+        -- build_deps flip (#179, the gap-3 route proven by curl #174): the
+        -- rehash step runs bare `c_rehash`, which previously resolved from
+        -- whatever host toolchain leaked into the sandbox PATH — on a host
+        -- with no such leak the build dies with "tool 'c_rehash' was not
+        -- found in any sandbox-visible PATH directory". The openssl payload
+        -- ships usr/bin/c_rehash, so declaring openssl puts the tool in the
+        -- merged build prefix whose usr/bin leads the sandbox PATH (issue
+        -- #33) — the rehash runs from the declared payload, not host luck.
+        -- (Its `#!/usr/bin/env perl` interpreter stays an ambient sandbox
+        -- root like sh: NixOS carries perl in /run/current-system.)
+        -- Build-time only: openssl is not a runtime require of the bundle.
+        build_deps = { "openssl" },
         -- Dated bundles rotate off curl.se (the 2025-01-01 pin 404'd —
         -- found while landing #130, which makes this package a hard curl
         -- require). Pin the current bundle AND its sha256: this payload
