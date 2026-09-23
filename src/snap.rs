@@ -2927,6 +2927,83 @@ pub fn check_explicit_stage(stage_dir: &Path) -> miette::Result<()> {
     Ok(())
 }
 
+/// Cross-process advisory lock over the shuttle-owned default stage
+/// (gate-pod gap 6: two concurrent builds silently shared `./stage/`, a
+/// watcher catching the stage inode flipping mid-build).
+///
+/// The lock lives in a SIBLING file (`stage.lock` next to `stage/`) —
+/// never inside the stage and never on the stage directory itself:
+/// `clear_stage_dir` removes and recreates the stage directory on every
+/// default-stage build phase, which would strand a lock held on (or in)
+/// the wiped directory and silently break mutual exclusion. The sibling
+/// file is untouched by the wipe, so its inode — and the flock on it —
+/// survives for the whole build.
+///
+/// Acquired with `flock(LOCK_EX | LOCK_NB)`: a second concurrent build
+/// fails loudly and immediately instead of hanging, and the kernel drops
+/// the lock when the fd closes — on drop or on crash. The empty lock
+/// file is simply left behind (deleting it would reintroduce an
+/// unlink/unlock race); no stale-lock cleanup exists or is needed.
+#[derive(Debug)]
+pub struct StageLock {
+    /// Held open for the lock's lifetime: closing this fd releases the
+    /// flock, so dropping the guard releases the stage.
+    _file: std::fs::File,
+}
+
+/// Sibling lock-file path for a stage directory: `./stage/` →
+/// `./stage.lock`. `None` when the stage path carries no file name (`/`,
+/// `..`) — such a path has no sibling to pin a lock to.
+fn stage_lock_path(stage_dir: &Path) -> Option<std::path::PathBuf> {
+    let name = stage_dir.file_name()?;
+    Some(
+        stage_dir
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(format!("{}.lock", name.to_string_lossy())),
+    )
+}
+
+impl StageLock {
+    /// Take the default-stage lock, failing loudly when another build
+    /// already holds it. Non-blocking: never waits.
+    pub fn acquire(stage_dir: &Path) -> miette::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let lock_path = stage_lock_path(stage_dir).ok_or_else(|| {
+            miette::miette!(
+                "cannot lock stage '{}': path has no file name to derive a sibling lock from",
+                stage_dir.display()
+            )
+        })?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                miette::miette!("failed to open stage lock {}: {}", lock_path.display(), e)
+            })?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(miette::miette!(
+                    "default stage '{}' is held by another shuttle build — wait \
+                     for it to finish, or pass --stage <dir> to build into a \
+                     separate stage",
+                    stage_dir.display()
+                ));
+            }
+            return Err(miette::miette!(
+                "failed to lock stage {}: {}",
+                lock_path.display(),
+                err
+            ));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 /// Wipe and recreate the shuttle-owned default stage. Only called right
 /// before a build phase populates it.
 fn clear_stage_dir(stage_dir: &Path) -> miette::Result<()> {
@@ -11349,6 +11426,62 @@ fi
 
         let missing = dir.path().join("missing");
         assert!(check_explicit_stage(&missing).is_ok());
+    }
+
+    #[test]
+    fn test_stage_lock_path_is_sibling_of_stage() {
+        assert_eq!(
+            stage_lock_path(Path::new("./stage/")).unwrap(),
+            Path::new("./stage.lock")
+        );
+        // A stage path with no file name cannot carry a sibling lock.
+        assert!(stage_lock_path(Path::new("/")).is_none());
+    }
+
+    #[test]
+    fn test_stage_lock_excludes_second_holder_then_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+
+        let _first = StageLock::acquire(&stage).unwrap();
+        // The lock lives next to the stage, never inside it: the wipe
+        // removes the stage dir, which must not strand the lock.
+        assert!(dir.path().join("stage.lock").is_file());
+        assert_eq!(
+            std::fs::read_dir(&stage).unwrap().count(),
+            0,
+            "lock file must not be created inside the stage"
+        );
+
+        // Non-blocking: the second concurrent holder fails loudly instead
+        // of waiting (flock conflicts across independent fds, so this is
+        // the same mutual exclusion a second process would hit).
+        let err = StageLock::acquire(&stage).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("held by another shuttle build"),
+            "conflict error must name the holder: {msg}"
+        );
+        assert!(
+            msg.contains("--stage"),
+            "conflict error must point at the --stage escape hatch: {msg}"
+        );
+
+        // Release on drop: the next build proceeds.
+        drop(_first);
+        let _again = StageLock::acquire(&stage).unwrap();
+    }
+
+    #[test]
+    fn test_stage_locks_are_per_stage_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let _lock_a = StageLock::acquire(&a).unwrap();
+        let _lock_b = StageLock::acquire(&b).unwrap();
     }
 
     #[test]
