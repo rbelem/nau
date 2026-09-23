@@ -17,6 +17,8 @@ target
 *.snap
 shuttle.lock
 stage/
+# Cross-process default-stage lock (flock sibling of stage/, never wiped)
+stage.lock
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

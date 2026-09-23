@@ -604,20 +604,31 @@ fn dep_fully_cached(
 
 /// Resolve the `--stage` CLI flag into (path, policy) and enforce the
 /// explicit-stage precondition: a user-chosen directory that already has
-/// contents is refused up front — never wiped.
+/// contents is refused up front — never wiped. The default `./stage/` is
+/// additionally pinned by a cross-process advisory lock
+/// ([`shuttle::snap::StageLock`], gate-pod gap 6): two concurrent builds
+/// must not silently share it, so the second build refuses loudly and is
+/// pointed at `--stage`. The lock is returned to the caller, which holds
+/// it for the whole build; an explicit `--stage` is user-owned and never
+/// locked.
 fn resolve_stage(
     stage: Option<String>,
-) -> miette::Result<(std::path::PathBuf, shuttle::snap::StagePolicy)> {
+) -> miette::Result<(
+    std::path::PathBuf,
+    shuttle::snap::StagePolicy,
+    Option<shuttle::snap::StageLock>,
+)> {
     match stage {
         Some(path) => {
             let policy = shuttle::snap::StagePolicy::Explicit;
             shuttle::snap::check_explicit_stage(Path::new(&path))?;
-            Ok((std::path::PathBuf::from(path), policy))
+            Ok((std::path::PathBuf::from(path), policy, None))
         }
-        None => Ok((
-            std::path::PathBuf::from("./stage/"),
-            shuttle::snap::StagePolicy::Default,
-        )),
+        None => {
+            let stage = std::path::PathBuf::from("./stage/");
+            let lock = shuttle::snap::StageLock::acquire(&stage)?;
+            Ok((stage, shuttle::snap::StagePolicy::Default, Some(lock)))
+        }
     }
 }
 
@@ -648,7 +659,10 @@ fn run_build(
     // Stage policy: an explicitly passed --stage belongs to the user — it
     // must be empty to start and is never wiped. The default ./stage/ is
     // shuttle-managed scratch, wiped before every build phase (snap.rs).
-    let (stage_path, stage_policy) = resolve_stage(stage)?;
+    // `_stage_lock` pins the default stage against concurrent builds for
+    // this whole invocation (gate-pod gap 6): it must stay bound for the
+    // rest of the function — dropping it releases the flock.
+    let (stage_path, stage_policy, _stage_lock) = resolve_stage(stage)?;
     let stage_dir = std::path::Path::new(&stage_path);
     let output_dir = std::path::Path::new(&output);
 
@@ -4475,5 +4489,49 @@ mod tests {
             "ok: 2 output(s): bzip2 1.0.8, hello 2.10"
         );
         assert_eq!(check_ok_message(&[]), "ok: 0 output(s)");
+    }
+
+    #[test]
+    fn test_resolve_stage_explicit_takes_no_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stg");
+        std::fs::create_dir_all(&stage).unwrap();
+
+        let (path, policy, lock) =
+            resolve_stage(Some(stage.to_string_lossy().into_owned())).unwrap();
+        assert_eq!(policy, shuttle::snap::StagePolicy::Explicit);
+        assert_eq!(path, stage);
+        // An explicit --stage is user-owned: no cross-process lock, and no
+        // lock file appears next to it.
+        assert!(lock.is_none());
+        assert!(!dir.path().join("stg.lock").exists());
+    }
+
+    #[test]
+    fn test_resolve_stage_default_pins_against_concurrent_build() {
+        // Runs against the repo's ./stage/ (the real default): the lock
+        // file it creates is gitignored. Only this test touches it.
+        let (path, policy, lock) = resolve_stage(None).unwrap();
+        assert_eq!(policy, shuttle::snap::StagePolicy::Default);
+        assert_eq!(path, std::path::Path::new("./stage/"));
+        assert!(lock.is_some(), "default stage must be pinned by a lock");
+
+        // A second concurrent default-stage build refuses loudly instead
+        // of silently sharing the stage (gate-pod gap 6).
+        let err = resolve_stage(None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("held by another shuttle build"),
+            "conflict must be loud: {msg}"
+        );
+        assert!(
+            msg.contains("--stage"),
+            "conflict must point at the escape hatch: {msg}"
+        );
+
+        // Release on drop: the next build proceeds.
+        drop(lock);
+        let (_p, _pol, again) = resolve_stage(None).unwrap();
+        assert!(again.is_some());
     }
 }
