@@ -19,6 +19,10 @@ return {
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
         requires = { "glibc", "zlib", "openssl", "ca-certificates" },
+        -- gcc as a declared build tool (gate-pod gap 3, #170): the payload's
+        -- drivers lead the sandbox PATH, so cc/c++ resolve from the build
+        -- prefix and provisioning never falls back to the rust toolchain.
+        build_deps = { "gcc" },
         source = {
             url = "https://curl.se/download/curl-8.20.0.tar.xz",
         },
