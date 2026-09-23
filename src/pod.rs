@@ -1510,7 +1510,21 @@ pub fn add_snap_pod(
                 // idempotent here (present_active re-emits the farm and
                 // services), so running it repairs the presentation and
                 // keeps the "nothing to do" report true.
-                let sync = sync_pod(root, pod_name)?;
+                let sync = match sync_pod(root, pod_name) {
+                    Ok(sync) => sync,
+                    Err(cause) => {
+                        let generation = report
+                            .generation
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "unknown".into());
+                        return Err(sync_failure_wrap(
+                            &report.name,
+                            &report.version,
+                            &generation,
+                            cause,
+                        ));
+                    }
+                };
                 report.generation = sync.generation.or(report.generation);
                 return Ok(report);
             }
@@ -1575,10 +1589,11 @@ pub fn add_snap_pod(
         // Architecture gate (issue #133): the filename arch is a claim
         // about the payload; a mismatch with the host refuses before any
         // write — a foreign blob would install clean and fail only at
-        // exec. A filename without an arch component makes no claim.
+        // exec. `all` is the build default (resolve_archs) and makes no
+        // host claim, like a filename without an arch component.
         if let Some(arch) = arch {
             let host = crate::snap::host_arch();
-            if arch != host {
+            if arch != host && arch != "all" {
                 miette::bail!(
                     "{}: filename says arch {arch} but this host is {host} — \
                      refusing to sideload a foreign-architecture payload (it \
@@ -1658,6 +1673,13 @@ pub fn add_snap_pod(
     validate_overlays(root, &decl, pod_name)?;
     let layer = payload_layer(&decl, &name);
     precheck_payload_collisions(root, &decl, &name, &meta, layer)?;
+    // Zero-write requires pre-flight (issue #132): a payload whose
+    // meta/snap.yaml carries `requires` would go ACTIVE first and only
+    // fail the follow-up sync's closure resolution on this machine —
+    // a partial generation with no rollback. Refuse before any write —
+    // and before the conversion warning below, so a refusal emits no
+    // "converted" claim.
+    preflight_requires_closure(root, &dir, &decl, &meta, &name, &version)?;
     if declared && !lock.snaps.contains_key(&name) {
         // The conversion is allowed but loud: the collection recipe
         // stops governing this package's content — the payload (an
@@ -1668,12 +1690,6 @@ pub fn add_snap_pod(
              no longer the collection recipe"
         ));
     }
-
-    // Zero-write requires pre-flight (issue #132): a payload whose
-    // meta/snap.yaml carries `requires` would go ACTIVE first and only
-    // fail the follow-up sync's closure resolution on this machine —
-    // a partial generation with no rollback. Refuse before any write.
-    preflight_requires_closure(root, &dir, &decl, &meta, &name, &version)?;
 
     // Loader-side brick warning (issue #135): a sideload into a pod
     // that OTHER pods load bricks those pods' mutating verbs —
@@ -1747,26 +1763,15 @@ pub fn add_snap_pod(
 
     // Reconcile the rest of the pod around the installed content: the
     // blob pin holds it in place (no rebuild), the farm, services, and
-    // the requires closure follow.
-    //
-    // A sync failure here cannot roll back (issue #132): the payload
-    // is already ACTIVE on the generation the install flipped to. The
-    // accepted residual (ADR-0037) is a declared partial generation —
-    // no restore is attempted; the error names the cause and both
-    // recovery verbs.
+    // the requires closure follow. A sync failure cannot roll back —
+    // `sync_failure_wrap` names the residual and the recovery verbs.
     let generation = install
         .generation
         .map(|n| n.to_string())
         .unwrap_or_else(|| "unknown".into());
     let sync = match sync_pod(root, pod_name) {
         Ok(sync) => sync,
-        Err(cause) => miette::bail!(
-            "sideloaded '{name}' ('{version}') is ACTIVE on generation \
-             {generation} with its `requires` closure incomplete ({cause}): \
-             libraries missing, farm/services not re-presented — provide the \
-             collection and run `shuttle pod sync` to complete, or `shuttle \
-             pod remove {name}` to abandon"
-        ),
+        Err(cause) => return Err(sync_failure_wrap(&name, &version, &generation, cause)),
     };
 
     Ok(PodSnapAddReport {
@@ -1781,13 +1786,14 @@ pub fn add_snap_pod(
 
 /// Zero-write requires pre-flight for a sideload (issue #132): resolve
 /// the payload's `requires` closure BEFORE any declaration, pin, or
-/// generation write. The seeds mirror the follow-up sync exactly — the
-/// installed record re-seeds from `requires` ([`hold_blob_pinned`]) —
-/// minus members the post-state already provides (the payload itself,
-/// the declaration, loaded pods, the active generation: mirroring
-/// [`install_requires_closure`]'s skips), then the same resolution call
-/// sync's closure pass uses. An unresolvable member bails naming the
-/// fix; a refusal here leaves zero state to roll back.
+/// generation write. The seeds mirror the follow-up sync exactly: sync
+/// resolves the FULL requires list ([`install_requires_closure`])
+/// before its per-member skips, so a member carried by the active
+/// generation still fails sync when it has no resolvable recipe — the
+/// pre-flight resolves the same full list through the same call. An
+/// unresolvable member bails naming the fix; a refusal here leaves
+/// zero state to roll back.
+#[allow(unused_variables)] // signature kept: root/dir/decl were pre-flight context only
 fn preflight_requires_closure(
     root: &Path,
     dir: &Path,
@@ -1796,21 +1802,10 @@ fn preflight_requires_closure(
     name: &str,
     version: &str,
 ) -> miette::Result<()> {
-    let mut provided: std::collections::BTreeSet<String> = decl
-        .packages
-        .iter()
-        .filter_map(|spec| parse_pod_package(spec).ok().map(|p| p.name))
-        .collect();
-    provided.insert(name.to_string());
-    let (loaded_versions, _) = loaded_contributions(root, decl)?;
-    provided.extend(loaded_versions.into_keys());
-    if let Some(active) = pod_store(dir).active_generation()? {
-        provided.extend(active.packages.into_keys());
-    }
     let seeds: Vec<String> = meta
         .requires
         .iter()
-        .filter(|r| !r.is_empty() && !provided.contains(*r))
+        .filter(|r| !r.is_empty())
         .cloned()
         .collect();
     if let Err(e) = crate::deps::resolve_dep_names(&seeds, true) {
@@ -1821,6 +1816,26 @@ fn preflight_requires_closure(
         );
     }
     Ok(())
+}
+
+/// The shared sync-failure wrap (issue #132, ADR-0037): the payload is
+/// already ACTIVE on the generation the install flipped to, so a failed
+/// reconcile cannot roll back. The accepted residual is a declared
+/// partial generation — no restore is attempted; the error names the
+/// cause and both recovery verbs.
+fn sync_failure_wrap(
+    name: &str,
+    version: &str,
+    generation: &str,
+    cause: miette::Report,
+) -> miette::Error {
+    miette::miette!(
+        "sideloaded '{name}' ('{version}') is ACTIVE on generation \
+         {generation} with its `requires` closure incomplete ({cause}): \
+         libraries missing, farm/services not re-presented — provide the \
+         collection and run `shuttle pod sync` to complete, or `shuttle \
+         pod remove {name}` to abandon"
+    )
 }
 
 /// The identical-readd check that needs no unpack: `Some(report)` when
