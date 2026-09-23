@@ -315,7 +315,9 @@ pub fn farm_dir(store: &RuntimeStore, n: u64) -> PathBuf {
 /// Cheap link-name validation at the farm seam (issue #135): the name
 /// is `join`ed under the farm dir, so an absolute path or a `..`
 /// component would write the symlink outside the farm. Refuse named.
-fn check_farm_link_name(kind: &str, name: &str, pkg: &str) -> miette::Result<()> {
+/// Also the shared validator for the sideload precheck (issue #150),
+/// which must refuse the same names zero-write before any install.
+pub(crate) fn check_farm_link_name(kind: &str, name: &str, pkg: &str) -> miette::Result<()> {
     if name.starts_with('/') || name.split('/').any(|c| c == "..") {
         miette::bail!(
             "package '{pkg}': {kind} name '{name}' is not a bare name — refusing \
@@ -880,6 +882,32 @@ mod tests {
             "the service command binary gets a flat current/<svc> farm link, got {target:?}"
         );
         assert_eq!(std::fs::read(link).unwrap(), b"daemon");
+    }
+
+    #[test]
+    fn emit_refuses_non_bare_service_bin_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        let mut gen = gen_with_apps(1, "evil", &[]);
+        gen.packages
+            .get_mut("evil")
+            .unwrap()
+            .service_bins
+            .insert("../evil".to_string(), "aa11".to_string());
+
+        // Issue #150: the service_bins escape site — the same seam check
+        // the apps loop gets, refused named before any blob access.
+        let err = emit(&store, &gen).unwrap_err().to_string();
+        assert!(
+            err.contains("not a bare name") && err.contains("../evil"),
+            "must refuse named at the seam: {err}"
+        );
+        // Nothing escaped the farm: `farm.join("../evil")` would land
+        // beside the farm dir inside the generation.
+        assert!(
+            !store.generation_dir(1).join("evil").exists(),
+            "no symlink may exist outside the farm dir"
+        );
     }
 
     #[test]

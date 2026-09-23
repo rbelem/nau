@@ -1356,10 +1356,15 @@ gated_test!(requires_closure_resolves_sideload_completes, {
         stderr.contains("sideloaded 'app' (1.0)"),
         "stderr: {stderr}"
     );
-    // Generation 1 carries the payload; the follow-up sync installs
-    // the closure member as generation 2.
-    assert_eq!(generation_count(root.path(), "default"), 2);
-    assert_eq!(current_generation(root.path(), "default"), 2);
+    // The add's tip carries the payload; whether the follow-up sync
+    // installs the closure member as another generation or batches it
+    // into this one is an implementation detail — pin the tip and that
+    // nothing after the add grows the pod (issue #150).
+    let gens_after_add = generation_count(root.path(), "default");
+    assert_eq!(
+        current_generation(root.path(), "default") as usize,
+        gens_after_add
+    );
 
     // The farm exposes payload AND closure; both execute.
     let farm = current_farm(root.path(), "default");
@@ -1386,7 +1391,7 @@ gated_test!(requires_closure_resolves_sideload_completes, {
     let (code, _, stderr) = run(project.path(), root.path(), &["sync"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(stderr.contains("held 'app'"), "stderr: {stderr}");
-    assert_eq!(generation_count(root.path(), "default"), 2);
+    assert_eq!(generation_count(root.path(), "default"), gens_after_add);
 
     // Identical re-add: a no-op.
     let (code, _, stderr) = run(
@@ -1396,7 +1401,7 @@ gated_test!(requires_closure_resolves_sideload_completes, {
     );
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(stderr.contains("nothing to do"), "stderr: {stderr}");
-    assert_eq!(generation_count(root.path(), "default"), 2);
+    assert_eq!(generation_count(root.path(), "default"), gens_after_add);
 });
 
 /// The shared partial-state fixture for the residual tests (issue
@@ -1480,8 +1485,11 @@ gated_test!(
             stderr.contains("closure incomplete"),
             "must flag the residual: {stderr}"
         );
+        // The message must name THE active generation, whatever the
+        // store produced — not a hardcoded number (issue #150).
+        let active = active_generation_link(root.path(), "default");
         assert!(
-            stderr.contains("ACTIVE on generation 1"),
+            stderr.contains(&format!("ACTIVE on generation {active}")),
             "must name the active generation: {stderr}"
         );
         assert!(
@@ -1494,11 +1502,13 @@ gated_test!(
         );
         assert!(stderr.contains("to abandon"), "stderr: {stderr}");
 
-        // Partial state: the payload is ACTIVE on the store's generation 1
-        // (the install flipped `active`), the farm was never re-presented
-        // (no `current` link), the declaration entry and both pins stand.
+        // Partial state: the payload is ACTIVE on the store's first
+        // generation (the install flipped `active` — a fresh pod's first
+        // reconcile is always generation 1), the farm was never
+        // re-presented (no `current` link), the declaration entry and
+        // both pins stand.
         assert_eq!(generation_count(root.path(), "default"), 1);
-        assert_eq!(active_generation_link(root.path(), "default"), 1);
+        assert_eq!(active, 1);
         assert!(
             !pod_dir(root.path(), "default").join("current").exists(),
             "the failed sync must not have presented the farm"
@@ -2083,4 +2093,41 @@ gated_test!(farm_link_refuses_non_bare_app_name, {
         !gen1.join("evil").exists(),
         "no symlink may exist outside the farm dir"
     );
+});
+
+// Issue #150: the service name rides the same farm seam as the app
+// name — the precheck must refuse a non-bare service name zero-write
+// (the farm emit check alone is post-install).
+gated_test!(precheck_refuses_non_bare_service_name, {
+    let stage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+
+    // A payload whose service is keyed "../evil" (the service_bins
+    // escape site); the precheck reads meta/snap.yaml only, so the
+    // command's bin need not exist in the payload.
+    let evil = stage.path().join(format!("evil_1.0_{}.snap", host_arch()));
+    fake_snap(
+        &evil,
+        "name: evil\nversion: \"1.0\"\nservices:\n  \"../evil\":\n    command: bin/daemon\n    daemon: simple\n",
+    );
+
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", evil.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_ne!(code, Some(0), "the non-bare service name must refuse");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("outside the bin farm") && stderr.contains("../evil"),
+        "must name the service and the refusal: {stderr}"
+    );
+    // Zero-write refusal: the precheck fires before any install, so no
+    // generation exists to hold an escaped symlink.
+    assert!(
+        !pod_dir(root.path(), "default").exists(),
+        "the refusal must leave zero writes"
+    );
+    assert_eq!(generation_count(root.path(), "default"), 0);
 });
