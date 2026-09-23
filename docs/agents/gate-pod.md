@@ -4,8 +4,11 @@ Status: **gate proven — the devbox-free cargo path works.** Round 4
 shipped the C toolchain payload (#164) and the loader-seam changes it
 needed; `shuttle run --pod gate -- cargo build` now compiles C build
 scripts through the pod's own gcc and runs the output. The clippy/fmt
-drift re-test ran in round 5: drift is real — the pod lint axis cannot
-replace the devbox gate yet (see Round 5 + gap 2). All claims come from commands
+drift re-test ran in round 6: drift is real. Round 7 landed the lint
+enablers — the farm exposes the cargo subcommand shims and the one
+clippy error is fixed — so both toolchains' lint axes now pass this
+repo pod-side with no caller shims (see Round 7 + gap 2; the
+toolchain-version contract decision stays open). All claims come from commands
 run on NixOS 26.11, shuttle 0.1.0.
 
 ## What worked
@@ -296,24 +299,102 @@ surfaces `cargo-clippy`/`cargo-fmt`, the devbox lint gate stays the
 contract. `build-and-test.md`'s devbox-free endgame is unchanged by
 this round — no claim upgraded.
 
+## Round 7 (2026-09-23, lint-enable @ 3f17f55, debug build) — lint enablers land
+
+Both round-6 blockers closed in code, and the drift experiment re-run
+for real: after the fixes, BOTH toolchains' lint axes pass this repo
+pod-side with no caller shims. Toolchains unchanged from round 6:
+devbox = rustc 1.97.1 / clippy 0.1.97 / rustfmt 1.9.0 / cargo 1.97.0;
+gate pod = rustc 1.98.1 (`48a229ceae 2026-09-01`) / clippy 0.1.98 /
+rustfmt 1.9.0.
+
+1. **Blocker (a) — farm exposure — closed in `farm.rs`.** The emit now
+   surfaces a package's cargo external-subcommand entry points: payload
+   siblings recorded DIRECTLY beside a declared `cargo` app whose bare
+   name is `cargo-*` (`cargo-clippy`, `cargo-fmt` for the rust payload)
+   get farm links — exactly what `cargo clippy`/`cargo fmt` PATH-search,
+   a mechanism the declared app table cannot express. Same seams as
+   every other entry: layer precedence through the shared collision
+   map, a name the package already declares as an app is not
+   duplicated, `clippy-driver` and other non-`cargo-*` siblings stay
+   unexposed, and the drivers run from the full materialized payload
+   copy (`extensions/rust/usr/usr/bin/…`) so their `/proc/self/exe`
+   sysroot resolution keeps the complete `usr/lib` tree. Landing it
+   needed no pod mutation beyond a re-emit: `pod --name gate sync`
+   (no-op — all five packages held at their pins, generation 38
+   current) re-presents and re-emits the farm of the EXISTING
+   sideloaded rust payload:
+
+        $ ls ~/.local/share/shuttle/pods/gate/current | grep cargo
+        cargo
+        cargo-clippy
+        cargo-fmt
+
+2. **Blocker (b) — source drift — dissolved for this repo.**
+   `src/isolate.rs:1081` now reads `e.to_string()` where round 6's pod
+   clippy errored on `format!("{e}")` (`clippy::useless_format`);
+   1.97.1 accepts both forms, so the devbox gate stays green (it did).
+
+3. **Clippy axis — parity, both green, no shims.** Pod-side, from this
+   tree, no caller PATH shims:
+
+        $ shuttle run --pod gate -- cargo clippy --version
+        clippy 0.1.98 (48a229ceae 2026-09-01)          # exit 0, 0.16 s
+        $ time shuttle run --pod gate -- cargo clippy -- -D warnings
+          Compiling libc v0.2.189
+          … every dep crate checked fresh under 1.98.1, then:
+          Checking shuttle v0.1.0 (…/lint-enable)
+          Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 07s
+        real    1m7.119s
+        # exit 0; zero diagnostics
+
+   Devbox (`devbox run -- clippy`): exit 0, 0 diagnostics (10.2 s cold
+   after the source edit; 0.2 s warm). Round 6's verdict flips:
+   identical source, identical `-D warnings`, both toolchains accept.
+
+4. **Fmt axis — still parity.** Pod `shuttle run --pod gate -- cargo
+   fmt --check`: exit 0, empty output, 0.77 s; `cargo fmt --version`
+   through the run → `rustfmt 1.9.0-stable (48a229ceae 2026-09-01)`,
+   `rustc 1.98.1`, `cargo 1.98.1`. Devbox `devbox run -- fmt-check`:
+   exit 0, empty, 0.96 s.
+
+5. **Offline proof for the exposure fix**: `tests/pod_snap_sideload.rs`
+   gains `cargo_subcommand_shims_surface_on_the_farm` — it sideloads a
+   fake multi-file toolchain payload (only `cargo` declared as an app)
+   into a collection-less pod and asserts the farm exposes
+   `cargo-clippy`/`cargo-fmt` AND that they execute through the farm
+   PATH (the resolution `cargo clippy` performs), while `clippy-driver`
+   stays unexposed. Full devbox gate (`devbox run -- check`): exit 0 —
+   lib tests 1436 passed / 0 failed, clippy clean, fmt clean.
+
+Honest limits: pod clippy 0.1.98 remains strictly stricter than 0.1.97
+in general — this repo now satisfies both, but a future source pattern
+could re-split the verdicts (round 6's mechanism is unchanged). The
+toolchain-version decision (keep the 1.97.1 pin vs adopt 1.98.1's
+stricter verdict as the contract) stays open for the repo owner. The
+devbox lint gate remains the default until that call is made — but the
+pod-side axis is now runnable and matching, not blocked.
+
 ## Gap list to make this the default gate
 
 1. ~~**C toolchain payload (blocking, cargo layer).**~~ **CLOSED in
    round 4** (#164): fetch-merge gcc 14.2 payload + loader-seam fixes;
    cargo build scripts compile in the pod.
-2. ~~**Clippy/fmt drift re-test (unblocked).**~~ **ANSWERED in round 6:
-   drift is real — the pod cannot replace the devbox lint gate yet.**
-   Two blockers remain: (a) the farm bin set does not expose
-   `cargo-clippy`/`cargo-fmt` (the rust payload *ships* them under
-   `apps/rust/usr/bin/`, they are just not on the farm PATH, so
-   `cargo clippy`/`cargo fmt` die with `no such command`); (b) pod
-   clippy 0.1.98 is stricter than devbox 0.1.97 — it errors on
-   `src/isolate.rs:1081` (`format!("{e}")` → `clippy::useless_format`)
-   where 1.97.1 accepts the file, so the two gates disagree on
-   identical source. Pod-side lint needs the pinned 1.97.1 clippy
-   (or a repo decision to adopt 1.98.1's verdict) plus the farm
-   exposure fix. The fmt axis (rustfmt 1.9.0 both sides) already
-   matches.
+2. ~~**Clippy/fmt drift re-test (unblocked).**~~ **ANSWERED in round 6;
+   enablers LANDED in round 7.** Round 6 measured the drift and named
+   two blockers; round 7 closed both: (a) the farm bin set now exposes
+   the cargo external-subcommand shims — `cargo-clippy`/`cargo-fmt`
+   are emitted from the cargo app's recorded payload siblings, a
+   no-op-reconcile re-emit surfaces them on the EXISTING pod, and
+   `cargo clippy`/`cargo fmt` run through `shuttle run` with no caller
+   PATH shims; (b) the one-line source fix (`src/isolate.rs:1081`,
+   `format!("{e}")` → `e.to_string()`) dissolves the divergence for
+   this repo — both toolchains' clippy and fmt axes pass, pod-side and
+   devbox-side (round 7 evidence). STILL OPEN, policy not code: the
+   toolchain-version decision — keep the 1.97.1 pin or adopt 1.98.1's
+   stricter verdict as the contract. Pod clippy 0.1.98 remains
+   strictly stricter than 0.1.97 in general, so the two gates can
+   re-split on future source until the owner picks the contract.
 3. **Sandbox C compiler at the recipe layer (narrowed).** From-recipe
    provisioning of rust still needs the glibc chain; with the gcc
    payload now a recipe, a pod can declare gcc as a build tool instead
