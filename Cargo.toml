@@ -84,6 +84,8 @@ sha2 = "0.10"
 base64 = "0.22"
 flate2 = "1"
 tar = "0.4"
+# Pod lockfile assertions in the recipe-drift tests (issue #142).
+serde_json = "1"
 # Go module zip construction for the go resolver fixtures (issue #40):
 # the loopback proxy serves a real module zip in the proxy archive shape.
 zip = "2"
