@@ -1520,6 +1520,14 @@ pub fn add_snap_pod(
                 refuse_foreign_arch(payload, arch.as_deref())?;
             }
             if let Some(mut report) = sideload_readd_report(root, pod_name, fname, &sha3_384)? {
+                // The no-op path still honors the #135 gate (issue
+                // #169): a declaration NARROWED after the install must
+                // not silently keep a pin it now contradicts. The
+                // identical blob carries the installed version, so the
+                // cheap constraint-only check runs on the report's
+                // version — a violation refuses before the sync repair
+                // and the report.
+                refuse_constraint_violation(&decl, fname, &report.version)?;
                 // Even a no-op re-add re-presents the pod: a previous
                 // install whose follow-up sync FAILED (e.g. the
                 // requires closure unresolved on a collection-less
@@ -1641,21 +1649,7 @@ pub fn add_snap_pod(
         // `@constraint` must not gain a pin whose version violates it —
         // the lockfile would contradict itself (the blob branch never
         // evaluates constraints downstream). Refuse before any write.
-        if let Some(constraint) = decl
-            .packages
-            .iter()
-            .find_map(|s| parse_pod_package(s).ok().filter(|p| p.name == name))
-            .and_then(|p| p.constraint)
-        {
-            if !version_matches_constraint(&version, &constraint) {
-                miette::bail!(
-                    "'{name}': sideloaded version {version} violates the declared \
-                     constraint '@{constraint}' — refusing to record a pin that \
-                     contradicts its own constraint; widen the constraint in the \
-                     pod declaration, or `shuttle pod remove {name}` first"
-                );
-            }
-        }
+        refuse_constraint_violation(&decl, &name, &version)?;
     }
     // The same zero-writes validation chain as `add_package` (issue
     // #8), with claims read from the payload — on EVERY identity path:
@@ -1884,6 +1878,35 @@ fn sync_failure_wrap(
 /// the active generation carries the pinned content (nothing to do),
 /// `None` when the pin's content is missing from the generation — the
 /// caller falls through to a repair-install.
+/// Constraint consistency (issue #135): a declared spec with an
+/// `@constraint` must not gain a pin whose version violates it — the
+/// lockfile would contradict itself. Shared by the declared install
+/// path AND the identical-blob no-op path (issue #169: the no-op must
+/// not skip a gate a narrowed constraint would fail). A no-op for an
+/// undeclared or constraint-less spec. Pure — zero writes.
+fn refuse_constraint_violation(
+    decl: &PodDeclaration,
+    name: &str,
+    version: &str,
+) -> miette::Result<()> {
+    if let Some(constraint) = decl
+        .packages
+        .iter()
+        .find_map(|s| parse_pod_package(s).ok().filter(|p| p.name == name))
+        .and_then(|p| p.constraint)
+    {
+        if !version_matches_constraint(version, &constraint) {
+            miette::bail!(
+                "'{name}': sideloaded version {version} violates the declared \
+                 constraint '@{constraint}' — refusing to record a pin that \
+                 contradicts its own constraint; widen the constraint in the \
+                 pod declaration, or `shuttle pod remove {name}` first"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn sideload_readd_report(
     root: &Path,
     pod_name: &str,

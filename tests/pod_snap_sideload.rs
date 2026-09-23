@@ -1895,6 +1895,106 @@ gated_test!(constraint_violating_sideload_refused, {
     );
 });
 
+// Issue #169: the identical-blob no-op path must re-run the #135 gate
+// — a declaration NARROWED after the install must not silently keep a
+// pin it now contradicts. The re-add of the identical payload must
+// refuse naming the conflict, with pin and generations untouched.
+gated_test!(narrowed_constraint_identical_readd_refused, {
+    let stage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = pod_dir(root.path(), "default");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("pod.lua"), "pod { packages = { \"hello@1\" } }\n").unwrap();
+    let payload = stage.path().join("hello_1.0_all.snap");
+    fake_snap(&payload, "name: hello\nversion: \"1.0\"\n");
+
+    // First install: 1.0 matches '@1'.
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "1.0 matches '@1': {stderr}");
+    let generations = generation_count(root.path(), "default");
+    let pinned_sha = lockfile(root.path(), "default")["snaps"]["hello"]["sha3-384"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Narrow the declaration to '@2' — 1.0 no longer satisfies it —
+    // then re-add the IDENTICAL payload: the no-op must refuse.
+    std::fs::write(dir.join("pod.lua"), "pod { packages = { \"hello@2\" } }\n").unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_ne!(code, Some(0), "the narrowed constraint must refuse");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("violates the declared constraint '@2'") && stderr.contains("version 1.0"),
+        "must name the violated constraint: {stderr}"
+    );
+    assert_eq!(
+        generation_count(root.path(), "default"),
+        generations,
+        "no generation may move"
+    );
+    assert_eq!(
+        lockfile(root.path(), "default")["packages"]["hello"]["version"],
+        "1.0",
+        "the version pin must stay as installed"
+    );
+    assert_eq!(
+        lockfile(root.path(), "default")["snaps"]["hello"]["sha3-384"],
+        pinned_sha,
+        "the blob pin must stay as installed"
+    );
+});
+
+// Issue #169, satisfied side: a narrowed-but-still-satisfied
+// constraint keeps the identical re-add a green no-op — no generation
+// churn (that is the point of the fast path).
+gated_test!(satisfied_narrowed_constraint_readd_still_noop, {
+    let stage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = pod_dir(root.path(), "default");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("pod.lua"), "pod { packages = { \"hello@1\" } }\n").unwrap();
+    let payload = stage.path().join("hello_1.0_all.snap");
+    fake_snap(&payload, "name: hello\nversion: \"1.0\"\n");
+
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "1.0 matches '@1': {stderr}");
+    let generations = generation_count(root.path(), "default");
+
+    // Narrow '@1' to '@1.0' — 1.0 still satisfies it — then re-add the
+    // IDENTICAL payload: still a no-op.
+    std::fs::write(
+        dir.join("pod.lua"),
+        "pod { packages = { \"hello@1.0\" } }\n",
+    )
+    .unwrap();
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "1.0 satisfies '@1.0': {stderr}");
+    assert!(stderr.contains("nothing to do"), "stderr: {stderr}");
+    assert_eq!(
+        generation_count(root.path(), "default"),
+        generations,
+        "the no-op must not churn generations"
+    );
+});
+
 // Issue #135 (blob-pin polish, rollback trap): rolling back to a
 // generation that predates a blob pin SUCCEEDS — and the report names
 // the stranded pin and its recovery path, instead of leaving the next
