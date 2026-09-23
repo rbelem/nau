@@ -2935,7 +2935,12 @@ pub struct PodRefreshReport {
 /// declared members the verb did NOT name is BASELINED, not rebuilt:
 /// the current closure digest is stamped and the installed content
 /// kept (zero churn) — a refresh must not be held hostage by
-/// unrelated drifted members, and the summary reports both groups. A
+/// unrelated drifted members, and the summary reports both groups.
+/// No UNNAMED installed member rebuilds at all (issue #177): drift
+/// baselines, everything else keeps its content — an unnamed member's
+/// source download must never run, or an unreachable source (a local
+/// loopback fixture that is not currently up) fails the whole verb
+/// for a member it never targeted. A
 /// blob-pinned member refuses fail-closed BEFORE any write: the
 /// payload is its content, there is no recipe to rebuild. Build-tool
 /// failures are loud errors here — this verb is the explicit opt-in,
@@ -3386,6 +3391,31 @@ fn scope_own_package(
     // rebuild branch below through the no-version-hold gap.
     if let Some(scope) = hold_baselined_drift(ctx, meta, build) {
         return Ok(scope);
+    }
+    // `pod refresh` rebuilds ONLY the members it names (issue #177):
+    // an installed member the verb did not name keeps its store
+    // content even when neither hold above applied — a recipe edited
+    // at a constant version misses the content hold (its build-input
+    // digest moved) AND the pin hold (equal versions never
+    // disagree), so the rebuild branch below would download its
+    // source host-side. An unreachable source (the #177 shape: a
+    // local payload tarball served over loopback HTTP only while the
+    // operator keeps the server up) then fails the WHOLE refresh for
+    // a member the verb never targeted. Drifted unnamed members
+    // already returned through the baseline hold; an uninstalled
+    // member still builds — the post-state must contain everything
+    // declared.
+    if !build.refresh_members.is_empty() && !build.refresh_members.contains(&meta.name) {
+        if let Some(installed_pkg) = ctx.active.and_then(|g| g.packages.get(&meta.name)) {
+            hold_style_skip_claims(
+                &mut build.desktop_claims,
+                &mut build.binary_claims,
+                &mut build.service_claims,
+                installed_pkg,
+                meta,
+            );
+            return Ok(OwnScope::SkipInstalled);
+        }
     }
     if overlay || !held_at_pin(ctx.lock, &meta.name, &meta.version, ctx.active) || drifted {
         if drifted {
@@ -6157,6 +6187,41 @@ pod {
             scope_own_package(&fixture.ctx(), true, false, true, &mut meta, &mut build).unwrap();
         assert!(matches!(scope, OwnScope::Build));
         assert!(build.held.is_empty(), "overlay packages never hold");
+    }
+
+    /// `pod refresh` scoping (issue #177): an installed member the
+    /// verb did NOT name keeps its content even when both holds miss —
+    /// the content hold (digest moved: the recipe was edited at a
+    /// constant version) and the pin hold (equal versions never
+    /// disagree). Without the skip the member would rebuild, and its
+    /// host-side source download fails the whole refresh whenever the
+    /// source is unreachable.
+    #[test]
+    fn test_refresh_skips_an_unnamed_installed_member_even_when_both_holds_miss() {
+        let mut installed_meta = bare_meta("tool", "1.0");
+        installed_meta.build = Some("echo old".into());
+        let mut fixture = hold_fixture(installed_tool(Some(installed_meta.build_input_digest())));
+
+        let mut meta = bare_meta("tool", "1.0");
+        meta.build = Some("echo new".into());
+        let mut build = ReconcileBuild::default();
+        build.refresh_members = std::collections::BTreeSet::from(["other".to_string()]);
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
+        assert!(matches!(scope, OwnScope::SkipInstalled));
+        assert!(build.held.is_empty(), "a refresh skip is not a hold");
+        assert!(
+            build.pending.is_empty(),
+            "the unnamed member must not queue a build: {:?}",
+            build.pending
+        );
+
+        // The NAMED member of the same refresh still rebuilds.
+        let mut build = ReconcileBuild::default();
+        build.refresh_members = std::collections::BTreeSet::from(["tool".to_string()]);
+        let scope =
+            scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
+        assert!(matches!(scope, OwnScope::Build));
     }
 
     /// A pre-#113 manifest carries no digest: it never holds — the
