@@ -1,12 +1,12 @@
 # Gate pod — P1 dogfood log (devbox-free gate)
 
-Status: **blocked at a C toolchain payload (cargo build-script layer).**
-Round 3 proved the sideload route end to end: the gate pod provisions
-from prebuilt `.snap` payloads with zero recipe builds, and pod cargo
-runs — it now dies only at the first `cc`-needing build script (see
-round 3 and gap 1). TLS and the kernel.org download pass; the from-recipe
-route stays blocked at the same compiler, one layer lower. All claims
-come from commands run on NixOS 26.11, shuttle 0.1.0.
+Status: **gate proven — the devbox-free cargo path works.** Round 4
+shipped the C toolchain payload (#164) and the loader-seam changes it
+needed; `shuttle run --pod gate -- cargo build` now compiles C build
+scripts through the pod's own gcc and runs the output. The remaining
+experiment is the clippy/fmt drift re-test (pod rust 1.98.1 vs devbox
+pin 1.97.1) — unblocked as of round 4. All claims come from commands
+run on NixOS 26.11, shuttle 0.1.0.
 
 ## What worked
 
@@ -61,6 +61,55 @@ payload sideloading — provisioning has a verb now), and #130/#138 fixed
 the curl recipes (wrapper + ca-certificates require). Neither has been
 exercised on the gate pod yet.
 
+## Round 4 (2026-09-23, gate pod @ main 370a3b0's #164 payloads) — C toolchain lands
+
+The last blocker fell, and it took one payload plus three loader-seam
+fixes — `cc` on PATH alone would not have been enough:
+
+1. **gcc 14.2.0 payload** (#164): pure fetch-merge from 20 Debian
+   trixie snapshot debs (`snapshot.debian.org` @ 20250815T000000Z,
+   sha256-pinned, NO libc6-dev — the pod's glibc owns libc; Bootlin
+   was ruled out because its bundled sysroot collides with the merged
+   prefix, zig-cc because its glibc cap 2.40 < pod 2.43). Sandbox
+   unpack tooling discovered by probe recipe (`pkgs/s/sandbox-tool-probe`).
+   53,436,416 B snap; all 20 fetches logged `source pinned: <hash>`.
+2. **glibc rebuild**: GNU ld scripts (`libc.so`, `libm.so`, …) carried
+   absolute rootfs paths — `GROUP ( /lib64/libc.so.6 … )` ENOENT'd for
+   a payload consumer. The glibc recipe now rewrites ld scripts to bare
+   sonames (text "GNU ld script" files only; ELF .so byte-identical).
+   Rebuilt snap sideloaded as generation 11; grep-verified zero
+   absolute refs.
+3. **Loader seam** (farm.rs): loader lib dirs gained Debian multiarch
+   (`usr/usr/lib/x86_64-linux-gnu` — cc1's libisl/libmpfr DT_NEEDED)
+   and slibdir (`usr/lib64` — bare-soname scripts resolve libc.so.6
+   through -L). `usr/lib` deliberately NOT a key (the extension-release
+   marker makes it exist in every pod — it would wrap every app; caught
+   by three failing tests and dropped). LD wrappers now export
+   COMPILER_PATH so gcc/collect2 find as/ld/ar with no host binutils.
+4. **confine.rs**: unconfined direct-exec prefers the generation LD
+   wrapper and overlays farm-first PATH — a toolchain app's children
+   (cc, rustc) must resolve from the pod, not the caller.
+5. **snap.rs**: `cp_r` recreates symlinks instead of dereferencing
+   (deb trees ship relative driver links like
+   `gcc-14 -> x86_64-linux-gnu-gcc-14`; `fs::copy` duplicated or
+   ENOENT'd them).
+
+Acceptance (real runs, verbatim): gcc snap sideloaded (generation 16);
+`cargo build --locked` with zstd 0.13.3 → `Compiling zstd-sys
+v2.1.0+zstd.1.5.7 … Finished dev profile in 3.96s`, binary runs
+(`roundtrip: hello zstd`); clean-target rerun identical. Hermeticity:
+`command -v cc gcc clang` on the caller PATH → empty — the pod's cc was
+the only compiler reachable. ld-wrapper gcc compiles and runs even with
+the farm off PATH (COMPILER_PATH independence). Full devbox gate: 1714
+passed / 0 failed.
+
+Operational notes: `pod add --snap` refuses same-version blob swaps —
+recipe revisions go through `pod remove` → re-add (generation churn on
+gate: 5→24). Concurrent snap builds in one checkout must pass explicit
+`--stage` (two lanes shared the default stage; a watcher caught the
+stage inode flipping mid-build). glibc builds must run inside devbox
+(linux-headers' HOSTCC needs the sandbox gcc).
+
 ## Round 3 (2026-09-23, shuttle @ 0ab0912, debug build) — sideload route proven
 
 The prebuilt-payload route (gap 2) works end to end. All four payloads
@@ -108,27 +157,29 @@ drift question (pod 1.98.1 vs devbox 1.97.1) stays unobservable until
 
 ## Gap list to make this the default gate
 
-1. **C toolchain payload (blocking, cargo layer).** `cargo build` needs
-   `cc` for build scripts (zstd-sys, lzma-sys, bzip2-sys at minimum);
-   `doctor --pod` cc/c++ misses unchanged. Two candidate routes: a
-   fetch-strategy gcc recipe (rust.lua precedent — a prebuilt toolchain
-   tarball instead of the multi-hour source bootstrap), or completing
-   the gcc source chain (binutils/gmp/mpfr/mpc/isl snaps exist from the
-   Sep-14 lanes; gcc itself never landed). Filed as an issue.
-2. **Sandbox C compiler at the recipe layer (unblocked by sideload,
-   still open for from-recipe pods).** Any pod provisioning rust from
-   the collection recipe still needs gcc to build the glibc chain.
-3. **Curl refresh path (filed).** A recipe-only fix (#138) does not
-   reach installed pods: curl is not declared in daily, `rebuild`
-   reuses the cached closure, `update` no-ops at an unchanged version
-   pin. Ambient `CURL_CA_BUNDLE` works meanwhile (never clobbered by
-   the wrapper, per #138). (The sideload round needed no curl at all —
-   payloads came from disk.)
-4. **`pod declare --file` (plan §6).** `pod.lua` is write-only today
+1. ~~**C toolchain payload (blocking, cargo layer).**~~ **CLOSED in
+   round 4** (#164): fetch-merge gcc 14.2 payload + loader-seam fixes;
+   cargo build scripts compile in the pod.
+2. **Clippy/fmt drift re-test (unblocked).** Pod rust 1.98.1 vs devbox
+   pin 1.97.1: run `devbox run -- clippy` and `fmt-check` outputs
+   through the pod toolchain against this repo and diff the verdicts.
+   This is the experiment that decides whether the pod gate can replace
+   the devbox gate for the lint axis.
+3. **Sandbox C compiler at the recipe layer (narrowed).** From-recipe
+   provisioning of rust still needs the glibc chain; with the gcc
+   payload now a recipe, a pod can declare gcc as a build tool instead
+   of needing a host compiler — untested.
+4. **Curl refresh path (filed).** A recipe-only fix (#138) does not
+   reach installed pods — #142's recipe-hash pin (merged) now sweeps
+   recipe drift on `pod sync`; end-to-end verify a wrapped curl reaches
+   a farm via a sync (the original #142 acceptance).
+5. **`pod declare --file` (plan §6).** `pod.lua` is write-only today
    (`add`/`remove` maintain it); no checked-in `gate/pod.lua` until a verb
    can load one.
-5. Minor: `doctor --pod`'s cc hint names apt/dnf only — NixOS needs a
-   nixpkgs gcc on PATH instead.
+6. Minor: `doctor --pod`'s cc hint names apt/dnf only — now it should
+   name the gcc payload. Minor: same-version blob-swap refusal forces
+   remove/re-add churn on recipe revisions. Minor: default-stage
+   sharing between concurrent builds (mitigate with explicit `--stage`).
 
-State left behind: gate pod provisioned for reuse (4 packages,
-generation 4, `~/.local/share/shuttle/pods/gate`).
+State left behind: gate pod provisioned with linux-headers, libgcc,
+glibc (soname ld scripts), rust 1.98.1, gcc 14.2.0 — generation 22+.
