@@ -18,6 +18,11 @@
 //!    binary FAILS `pod add`; declaring the hit in `leaks_ok` makes the
 //!    build pass (visibly logged). Pod-built payloads carry no
 //!    build-only references.
+//!
+//! 3. The declared build tool as the sandbox compiler (gate-pod gap 3):
+//!    a `build_deps`-declared compiler payload feeds the merged prefix,
+//!    and the sandbox resolves cc/c++/$CC/$CXX from it — the doctor
+//!    hint's flow, sideload included, with no host compiler anywhere.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -404,3 +409,220 @@ gated_test!(leak_scan_leaks_ok_passes_pod_build, {
         "the silenced leak must be visibly logged: {stderr}"
     );
 });
+
+// ── Gate-pod gap 3: the declared build tool IS the sandbox compiler ──
+//
+// The doctor's cc/c++ hints lead with the gcc payload sideload ("carries
+// cc and c++") — the recipe-layer claim that a pod declares its C
+// toolchain via build_deps instead of needing a host compiler. These
+// tests prove that claim end to end with a gcc payload in miniature:
+// pure-sh driver shims that print identity markers, so the consumer
+// build recording what `cc`/`c++`/`$CC`/`$CXX` resolved to proves WHICH
+// compiler served the sandbox. Gated WITHOUT gcc on purpose — gating on
+// a host compiler would test the opposite of the point.
+
+fn toolchain_free_chain_available() -> bool {
+    ["mksquashfs", "unsquashfs", "curl", "tar"]
+        .iter()
+        .all(|t| has_tool(t))
+}
+
+macro_rules! gated_toolchain_free_test {
+    ($fn_name:ident, $($body:tt)*) => {
+        #[test]
+        fn $fn_name() {
+            if !toolchain_free_chain_available() {
+                eprintln!("skipping: mksquashfs/unsquashfs/curl/tar unavailable");
+                return;
+            }
+            $($body)*
+        }
+    };
+}
+
+/// The gcc payload in miniature (the `gcc_14.2.0.snap` shape): four
+/// driver names under `usr/bin` — cc/c++/gcc/g++ — each a sh script
+/// printing its own identity marker. Pure sh, so building it needs no
+/// host compiler; that is the contract under test. `srcs` is the SERVED
+/// source tree (the loopback root), which need not live under `project`.
+fn write_fakegcc(project: &Path, srcs: &Path, port: u16) {
+    make_tarball(srcs, &[("README", "fakegcc fixture source\n")], "fakegcc");
+    let driver = |name: &str, marker: &str| {
+        format!(
+            "echo '#!/bin/sh' > $STAGE/usr/bin/{name} && \
+             echo 'echo {marker}' >> $STAGE/usr/bin/{name} && \
+             chmod +x $STAGE/usr/bin/{name}"
+        )
+    };
+    let dir = project.join("pkgs").join("f");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "fakegcc",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/fakegcc.tar.gz",
+    build = "mkdir -p $STAGE/usr/bin && {cc} && {cxx} && {gcc} && {gxx}",
+    architectures = {{ "amd64" }},
+}} }}
+
+"#,
+        cc = driver("cc", "fakegcc-cc"),
+        cxx = driver("c++", "fakegcc-cxx"),
+        gcc = driver("gcc", "fakegcc-gcc"),
+        gxx = driver("g++", "fakegcc-gxx"),
+    );
+    std::fs::write(dir.join("fakegcc.lua"), lua).unwrap();
+}
+
+/// The consumer: `build_deps = { "fakegcc" }` and a build that records
+/// what the four compiler entry points resolved to inside the sandbox —
+/// the bare `cc`/`c++` probes cc-rs makes, plus the `$CC`/`$CXX` env the
+/// prefix toolchain wiring exports. `srcs` is the SERVED source tree.
+fn write_prefix_consumer(project: &Path, srcs: &Path, port: u16) {
+    make_tarball(srcs, &[("README", "consumer fixture source\n")], "consumer");
+    let dir = project.join("pkgs").join("c");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "consumer",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/consumer.tar.gz",
+    build = "mkdir -p $STAGE/usr/share && cc > $STAGE/usr/share/cc-identity.txt && c++ > $STAGE/usr/share/cxx-identity.txt && \"$CC\" > $STAGE/usr/share/env-cc-identity.txt && \"$CXX\" > $STAGE/usr/share/env-cxx-identity.txt",
+    build_deps = {{ "fakegcc" }},
+    architectures = {{ "amd64" }},
+}} }}
+
+"#
+    );
+    std::fs::write(dir.join("consumer.lua"), lua).unwrap();
+}
+
+/// Locate the built `{name}_{version}_*.snap` in a pod's downloads dir.
+fn built_payload(downloads: &Path, name: &str, version: &str) -> PathBuf {
+    std::fs::read_dir(downloads)
+        .unwrap_or_else(|e| panic!("downloads dir {}: {e}", downloads.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&format!("{name}_{version}_")))
+        })
+        .unwrap_or_else(|| panic!("no {name}_{version}_*.snap in {}", downloads.display()))
+}
+
+/// Extract one file from a payload snap and return its trimmed text.
+fn payload_file_text(snap: &Path, rel: &str) -> String {
+    let extract = tempfile::tempdir().unwrap();
+    let status = Command::new("unsquashfs")
+        .args(["-f", "-d"])
+        .arg(extract.path())
+        .arg(snap)
+        .status()
+        .unwrap();
+    assert!(status.success(), "unsquashfs failed");
+    std::fs::read_to_string(extract.path().join(rel))
+        .unwrap_or_else(|e| panic!("payload file {rel}: {e}"))
+        .trim()
+        .to_string()
+}
+
+/// The identity markers each consumer build must record: the payload's
+/// drivers won every entry point (bare cc, bare c++, $CC, $CXX).
+const PAYLOAD_IDENTITY: [(&str, &str); 4] = [
+    ("usr/share/cc-identity.txt", "fakegcc-cc"),
+    ("usr/share/cxx-identity.txt", "fakegcc-cxx"),
+    ("usr/share/env-cc-identity.txt", "fakegcc-gcc"),
+    ("usr/share/env-cxx-identity.txt", "fakegcc-gxx"),
+];
+
+fn assert_payload_compiled_with_fakegcc(downloads: &Path) {
+    let payload = built_payload(downloads, "consumer", "1.0");
+    for (file, marker) in PAYLOAD_IDENTITY {
+        let got = payload_file_text(&payload, file);
+        assert_eq!(got, marker, "{file} must record the payload driver");
+    }
+}
+
+// A pod build whose C toolchain is a build_deps-DECLARED payload
+// resolves cc/c++ (and $CC/$CXX) from the merged build prefix — the
+// payload's identity markers come back, not a host compiler's. If the
+// prefix bin did not lead the sandbox PATH, a host `cc` would answer
+// instead (erroring on bare invocation) and the build would fail.
+gated_toolchain_free_test!(declared_gcc_payload_feeds_the_sandbox_toolchain, {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let port = serve_dir(&project.path().join("srcs"));
+    write_fakegcc(project.path(), &project.path().join("srcs"), port);
+    write_prefix_consumer(project.path(), &project.path().join("srcs"), port);
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["add", "consumer"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("build prefix") && stderr.contains("fakegcc"),
+        "the pod build must report the declared toolchain payload as the \
+         merged prefix: {stderr}"
+    );
+
+    assert_payload_compiled_with_fakegcc(&pod_dir(root.path(), "default").join("downloads"));
+
+    // build_deps are build-time-only: the tool payload is NOT a
+    // generation member (only `requires` closure members install).
+    let gen_tree = generation_dir(root.path(), "default", 1).join("extensions");
+    assert!(
+        !gen_tree.join("fakegcc").exists(),
+        "a build_deps-only payload must not install into the generation"
+    );
+});
+
+// The doctor hint's exact flow: the builder pod builds the compiler
+// payload; the target pod — empty project, no collection — sideloads it
+// (`shuttle pod add --ack-unsigned --snap …`); a recipe in the target
+// project then declares the tool by name via build_deps, and the pod's
+// build resolves the compilers from it. A pod-side compiler therefore
+// serves builds with no host compiler anywhere in the flow.
+gated_toolchain_free_test!(
+    sideloaded_gcc_payload_declared_as_build_tool_serves_the_sandbox,
+    {
+        let builder_project = tempfile::tempdir().unwrap();
+        let builder_root = tempfile::tempdir().unwrap();
+        let builder_srcs = builder_project.path().join("srcs");
+        let port = serve_dir(&builder_srcs);
+        write_fakegcc(builder_project.path(), &builder_srcs, port);
+        let (code, _, stderr) = run(
+            builder_project.path(),
+            builder_root.path(),
+            &["--name", "build", "add", "fakegcc"],
+        );
+        assert_eq!(code, Some(0), "builder pod add failed: {stderr}");
+        let payload = built_payload(
+            &pod_dir(builder_root.path(), "build").join("downloads"),
+            "fakegcc",
+            "1.0",
+        );
+
+        // Target pod: the hint's command, zero writes before it.
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (code, _, stderr) = run(
+            project.path(),
+            root.path(),
+            &["add", "--snap", payload.to_str().unwrap(), "--ack-unsigned"],
+        );
+        assert_eq!(code, Some(0), "sideload failed: {stderr}");
+
+        // The target project declares the tool by name (ADR-0018's
+        // explicit-duplication norm: build_deps resolve by recipe); the
+        // sources keep coming from the builder's loopback server, so the
+        // target recipes' tarballs are written into the SERVED tree.
+        write_fakegcc(project.path(), &builder_srcs, port);
+        write_prefix_consumer(project.path(), &builder_srcs, port);
+        let (code, _, stderr) = run(project.path(), root.path(), &["add", "consumer"]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(
+            stderr.contains("build prefix") && stderr.contains("fakegcc"),
+            "the declared toolchain payload must feed the merged prefix: {stderr}"
+        );
+        assert_payload_compiled_with_fakegcc(&pod_dir(root.path(), "default").join("downloads"));
+    }
+);
