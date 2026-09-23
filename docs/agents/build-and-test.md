@@ -49,11 +49,14 @@ pin is the contract on whichever side carries it.
 
 Two blockers, precisely:
 
-1. **Pin.** `pkgs/r/rust.lua` pins 1.98.1 and must pin 1.97.1. rust.lua
-   is a FETCH recipe (upstream static tarballs), so 1.97.1 is fetchable —
-   it is devbox's nixpkgs that cannot resolve 1.98.x (1.97.1 is the
-   newest resolvable there), which is why the two sides cannot converge
-   from the devbox side.
+1. ~~**Pin.**~~ **CLOSED in round 8.** rust.lua briefly pinned 1.98.1 and had to pin
+   1.97.1: rust.lua is a FETCH recipe (upstream static tarballs), so 1.97.1 was
+   always fetchable — it was devbox's nixpkgs that could not resolve 1.98.x
+   (1.97.1 was the newest resolvable there), which is why the two sides could
+   not converge from the devbox side. Caveat: the devbox flake inputs now
+   track nixos-unstable, so re-check 1.98.x resolvability there before
+   treating the pin as immovable; any move stays a forward-only ratchet
+   commit.
 2. ~~**Exposure.**~~ **CLOSED at the farm layer (round 7, commit
    45cabf9):** the farm bin set now emits a shim for every bare
    `cargo-*` sibling recorded beside a declared `cargo` app, so
@@ -77,8 +80,11 @@ clippy/fmt verdicts match the devbox pin exactly).
 **Ratified (post-round-8 rerun on the daily host):** the pod gate is the
 verified substitute for the lint axes — `shuttle run --pod gate -- cargo
 clippy -- -D warnings` (≈1m25s warm vs devbox's ≈15s; the accepted cost of
-the flip) and `… cargo fmt --check` both pass with verdicts identical to
-the devbox pin. The test axis is NOT ratified: a full pod-side
+the flip) and `… cargo fmt --check` both passed with verdicts matching the
+devbox pin, re-confirmed after the five-lane merge of 2026-09-23. The
+evidence is single-host and warm-cache: re-verify per host and cold cache
+before leaning on the substitution elsewhere. The test axis is NOT
+ratified: a full pod-side
 `cargo test` on the daily host fails where devbox passes, on build-host
 tools the gate pod does not ship — observed: `patchelf` (image staging
 path) and the mksquashfs-backed snap-build tests — plus one xz

@@ -20,7 +20,8 @@ shuttle run --pod gate -- cargo fmt --check             # fmt axis, pod gate
 
 Run `env -u LD_LIBRARY_PATH devbox run -- check` before committing or pushing.
 Clippy warnings are errors. Ratified: the pod gate is the verified substitute
-for the clippy/fmt axes (pod-side verdicts match the devbox pin exactly); the
+for the clippy/fmt axes (verdicts matched the devbox pin on the daily-host
+reruns — see Build & test); the
 test axis stays devbox until the gate pod also carries the build-host tools
 the suite spawns — see [Build & test](docs/agents/build-and-test.md).
 
