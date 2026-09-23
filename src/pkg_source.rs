@@ -1373,7 +1373,7 @@ mod tests {
     #[test]
     fn test_pinned_cache_dir_differs_from_branch_dir() {
         let root = cache_root();
-        let branch = github_cache_dir_in(&cache_root(), "o", "r", "main");
+        let branch = github_cache_dir_in(&root, "o", "r", "main");
         let pinned = pinned_cache_dir_in(&root, "o", "r", "abc123");
         let pinned2 = pinned_cache_dir_in(&root, "o", "r", "def456");
         assert_ne!(branch, pinned);

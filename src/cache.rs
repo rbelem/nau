@@ -648,11 +648,13 @@ mod tests {
 
     #[test]
     fn test_cache_default_dir() {
+        // One observation: read HOME first, construct from it immediately.
+        // The image command-seam test mutates HOME in this same process —
+        // reading it on both sides of `PackageCache::new` (which resolves
+        // HOME internally) could straddle that mutation (issue #149).
+        let home = std::env::var("HOME").unwrap();
         let cache = PackageCache::new(None);
-        let expected = Path::new(&std::env::var("HOME").unwrap())
-            .join(".cache")
-            .join("shuttle")
-            .join("pkgs");
+        let expected = Path::new(&home).join(".cache").join("shuttle").join("pkgs");
         assert_eq!(cache.root(), expected);
     }
 
