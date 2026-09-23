@@ -615,29 +615,33 @@
         }
       }
     },
-    "github:NixOS/nixpkgs/nixos-26.05#cargo-llvm-cov": {
-      "last_modified": "2026-09-21T13:54:21Z",
-      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#cargo-llvm-cov"
+    "github:NixOS/nixpkgs/nixos-unstable#cargo-llvm-cov": {
+      "last_modified": "2026-09-22T03:11:10Z",
+      "resolved": "github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc?lastModified=1790046670&narHash=sha256-MYiI%2BCzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso%3D#cargo-llvm-cov"
     },
-    "github:NixOS/nixpkgs/nixos-26.05#lua54Packages.luacheck": {
-      "last_modified": "2026-09-21T13:54:21Z",
-      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#lua54Packages.luacheck"
+    "github:NixOS/nixpkgs/nixos-unstable#lua54Packages.luacheck": {
+      "last_modified": "2026-09-22T03:11:10Z",
+      "resolved": "github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc?lastModified=1790046670&narHash=sha256-MYiI%2BCzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso%3D#lua54Packages.luacheck"
     },
-    "github:NixOS/nixpkgs/nixos-26.05#pkgsStatic.busybox": {
-      "last_modified": "2026-09-21T13:54:21Z",
-      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#pkgsStatic.busybox"
+    "github:NixOS/nixpkgs/nixos-unstable#pkgsStatic.busybox": {
+      "last_modified": "2026-09-22T03:11:10Z",
+      "resolved": "github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc?lastModified=1790046670&narHash=sha256-MYiI%2BCzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso%3D#pkgsStatic.busybox"
     },
-    "github:NixOS/nixpkgs/nixos-26.05#pkgsStatic.cryptsetup.bin": {
-      "last_modified": "2026-09-21T13:54:21Z",
-      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#pkgsStatic.cryptsetup.bin"
+    "github:NixOS/nixpkgs/nixos-unstable#pkgsStatic.cryptsetup.bin": {
+      "last_modified": "2026-09-22T03:11:10Z",
+      "resolved": "github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc?lastModified=1790046670&narHash=sha256-MYiI%2BCzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso%3D#pkgsStatic.cryptsetup.bin"
     },
-    "github:NixOS/nixpkgs/nixos-26.05#pkgsStatic.util-linux.bin": {
-      "last_modified": "2026-09-21T13:54:21Z",
-      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#pkgsStatic.util-linux.bin"
+    "github:NixOS/nixpkgs/nixos-unstable#pkgsStatic.util-linux.bin": {
+      "last_modified": "2026-09-22T03:11:10Z",
+      "resolved": "github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc?lastModified=1790046670&narHash=sha256-MYiI%2BCzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso%3D#pkgsStatic.util-linux.bin"
     },
-    "github:NixOS/nixpkgs/nixos-26.05#stylua": {
-      "last_modified": "2026-09-21T13:54:21Z",
-      "resolved": "github:NixOS/nixpkgs/1e8bc658fc985ef27ccd66d107d767b32bb7ef98?lastModified=1789998861&narHash=sha256-62XMQD4WLdMAfdT0%2F8gJmPH2dKeTw908ryNloAplTr8%3D#stylua"
+    "github:NixOS/nixpkgs/nixos-unstable#squashfsTools": {
+      "last_modified": "2026-09-22T03:11:10Z",
+      "resolved": "github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc?lastModified=1790046670&narHash=sha256-MYiI%2BCzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso%3D#squashfsTools"
+    },
+    "github:NixOS/nixpkgs/nixos-unstable#stylua": {
+      "last_modified": "2026-09-22T03:11:10Z",
+      "resolved": "github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc?lastModified=1790046670&narHash=sha256-MYiI%2BCzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso%3D#stylua"
     },
     "github:NixOS/nixpkgs/nixpkgs-unstable": {
       "last_modified": "2026-05-27T10:28:13Z",
@@ -1348,54 +1352,6 @@
             }
           ],
           "store_path": "/nix/store/47k26k98v32x56rxiqawdk5qk0r0b6w1-rustfmt-1.97.1"
-        }
-      }
-    },
-    "squashfsTools@4.7.5": {
-      "last_modified": "2026-05-21T08:15:18Z",
-      "resolved": "github:NixOS/nixpkgs/4a29d733e8a7d5b824c3d8c958a946a9867b3eb2#squashfsTools",
-      "source": "devbox-search",
-      "version": "4.7.5",
-      "systems": {
-        "aarch64-darwin": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/g3jf39z4ihnglzgysjx5qpp4f1hckh5i-squashfs-4.7.5",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/g3jf39z4ihnglzgysjx5qpp4f1hckh5i-squashfs-4.7.5"
-        },
-        "aarch64-linux": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/r4qhgjk089qscgdwmvnjw9hqhx0dagyl-squashfs-4.7.5",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/r4qhgjk089qscgdwmvnjw9hqhx0dagyl-squashfs-4.7.5"
-        },
-        "x86_64-darwin": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/bf7p63cnpii9fq0kxlhxaw4pmrv30i36-squashfs-4.7.5",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/bf7p63cnpii9fq0kxlhxaw4pmrv30i36-squashfs-4.7.5"
-        },
-        "x86_64-linux": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/p42q8hjiphnms28ym8pwq7mbs9snl0f2-squashfs-4.7.5",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/p42q8hjiphnms28ym8pwq7mbs9snl0f2-squashfs-4.7.5"
         }
       }
     },

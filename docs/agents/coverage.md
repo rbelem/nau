@@ -13,7 +13,7 @@ documents for exactly this case:
 
 ```bash
 # One-time (session-local): LLVM 21 tools matching rustc 1.97.1's LLVM
-nix build github:NixOS/nixpkgs/nixos-26.05#llvm --out-link /tmp/opencode/llvm-link
+nix build github:NixOS/nixpkgs/nixos-unstable#llvm --out-link /tmp/opencode/llvm-link
 
 # Baseline/after-wave measurement (~12 min cold, ~2 min warm)
 env -u LD_LIBRARY_PATH \
