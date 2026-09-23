@@ -3508,6 +3508,7 @@ fn reconcile_pod_scoped(
         &mut state.lock,
         &build.repins,
         &build.deps_pins,
+        &build.source_repins,
         &state.lock_path,
     )?;
     // Remove store packages the declaration dropped.
@@ -3816,6 +3817,12 @@ struct ReconcileBuild {
     /// rebuilt from their recipes even though the active generation
     /// carries content for them.
     recipe_drift_members: std::collections::BTreeSet<String>,
+    /// Floating-source re-resolves (issue #175): `(url, sha256)` pairs
+    /// to restamp into the lockfile's `sources` map — collected only
+    /// from floating own packages' builds, applied only after the
+    /// installs succeeded, so the TOFU record follows the float without
+    /// ever pinning a rebuild that did not land.
+    source_repins: Vec<(String, String)>,
 }
 
 /// Fold the `loads` graph one level deep (issue #8): each loaded pod
@@ -4012,12 +4019,17 @@ fn build_own_package(
             .find(|(name, _)| *name == spec.name)
             .map(|(_, digest)| digest.as_str()),
     );
-    build.pending.push(build_pending_snap(
-        ctx.store,
-        meta,
-        layer,
-        deps_pin.as_ref(),
-    )?);
+    let (pending, source_infos) = build_pending_snap(ctx.store, meta, layer, deps_pin.as_ref())?;
+    // Floating sources (issue #175): the build re-resolved the pin, so
+    // the observed hashes restamp the lockfile's `sources` record once
+    // the reconcile lands. Loaded packages don't restamp here — their
+    // pod owns the pins.
+    if meta.floating {
+        build
+            .source_repins
+            .extend(source_infos.into_iter().map(|info| (info.url, info.sha256)));
+    }
+    build.pending.push(pending);
     Ok(())
 }
 
@@ -4092,12 +4104,9 @@ fn collect_loaded_packages(
             &meta,
             crate::farm::ClaimLayer::Loaded,
         );
-        build.pending.push(build_pending_snap(
-            ctx.store,
-            &meta,
-            crate::farm::ClaimLayer::Loaded,
-            None,
-        )?);
+        let (pending, _) =
+            build_pending_snap(ctx.store, &meta, crate::farm::ClaimLayer::Loaded, None)?;
+        build.pending.push(pending);
     }
     Ok(())
 }
@@ -4248,12 +4257,13 @@ fn ensure_refresh_targets_are_members(
     Ok(())
 }
 
-/// Apply overlay-driven repins (issue #6) and moved dependency-closure
-/// pins (ADR-0017) to the lockfile — called only after the installs
-/// succeeded, so a failed reconcile leaves the pins untouched.
-/// Recipe-closure stamps (issue #142) are NOT batched here: they
-/// commit incrementally, per package, as each package's contribution
-/// succeeds ([`commit_pending_recipe_stamp`]). Loaded packages are NOT
+/// Apply overlay-driven repins (issue #6), moved dependency-closure
+/// pins (ADR-0017), and floating-source re-resolve restamps (issue
+/// #175) to the lockfile — called only after the installs succeeded, so
+/// a failed reconcile leaves the pins untouched. Recipe-closure stamps
+/// (issue #142) are NOT batched here: they commit incrementally, per
+/// package, as each package's contribution succeeds
+/// ([`commit_pending_recipe_stamp`]). Loaded packages are NOT
 /// repinned in this pod's lockfile: a loaded pod's versions live in the
 /// loaded pod, and this pod follows them live (issue #8 — read-only
 /// consumption, no cross-pod pins).
@@ -4261,9 +4271,10 @@ fn apply_pin_updates(
     lock: &mut LockFile,
     repins: &[(String, PodPackageLockEntry)],
     deps_pins: &[(String, crate::lock::PackageDepsLock)],
+    source_repins: &[(String, String)],
     lock_path: &Path,
 ) -> miette::Result<()> {
-    if repins.is_empty() && deps_pins.is_empty() {
+    if repins.is_empty() && deps_pins.is_empty() && source_repins.is_empty() {
         return Ok(());
     }
     for (name, entry) in repins {
@@ -4283,6 +4294,14 @@ fn apply_pin_updates(
                 },
             );
         }
+    }
+    for (url, sha256) in source_repins {
+        lock.sources.insert(
+            url.clone(),
+            crate::lock::SourceLockEntry {
+                sha256: sha256.clone(),
+            },
+        );
     }
     lock.save(lock_path)
 }
@@ -5078,7 +5097,7 @@ fn build_pending_snap(
     meta: &crate::snap::SnapMeta,
     layer: crate::farm::ClaimLayer,
     deps_pin: Option<&crate::lock::PackageDepsLock>,
-) -> miette::Result<crate::runtime::PendingSnap> {
+) -> miette::Result<(crate::runtime::PendingSnap, Vec<crate::snap::SourceInfo>)> {
     set_pod_build_epoch();
     let deps_dir = match (meta.deps.as_ref(), deps_pin) {
         (Some(_), Some(pin)) => Some(crate::dep_fetch::materialize_deps_entry(
@@ -5121,7 +5140,10 @@ fn build_pending_snap(
     )?;
     let payload = downloads.join(&result.snap_filename);
     let sha3_384 = crate::store::sha3_384_file(&payload)?;
-    Ok(build_pending_snap_at(meta, &payload, sha3_384, layer))
+    Ok((
+        build_pending_snap_at(meta, &payload, sha3_384, layer),
+        result.source_infos,
+    ))
 }
 
 /// Resolve `meta`'s build-time dependency closure (`requires` ∪

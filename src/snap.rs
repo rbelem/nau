@@ -4371,6 +4371,49 @@ pub fn build_snap(
 /// name is reserved as a part name.
 const SOURCE_DIR_NAME: &str = "source";
 
+/// Verify a downloaded single-source tarball against its pin (issue
+/// #175). A locked source enforces the pin exactly: changed bytes
+/// refuse. A FLOATING source re-resolves instead — its recorded pin is
+/// a moving target by design (sync re-resolves it the same way), so a
+/// mismatch warns and continues; the computed hash rides out as the
+/// build's `SourceInfo`, which the pod reconcile restamps into the
+/// lockfile after the rebuild lands (TOFU: the record follows the
+/// bytes actually built). An unpinned source keeps the legacy
+/// pin-suggestion notice.
+fn verify_source_download(
+    meta: &SnapMeta,
+    spec: &SourceSpec,
+    url: &str,
+    computed: &str,
+) -> miette::Result<()> {
+    let Some(expected) = spec.expected_sha256() else {
+        if !output::is_json() {
+            output::info(format!(
+                "source hash: {:.16}... (add to source.sha256 to pin)",
+                computed
+            ));
+        }
+        return Ok(());
+    };
+    if computed == expected {
+        output::ok(format!("SHA-256 verified: {:.16}...", computed));
+        return Ok(());
+    }
+    if meta.floating {
+        output::warn(format!(
+            "floating source of {} re-resolved: {:.12}… → {:.12}… (restamping the pin)",
+            meta.name, expected, computed
+        ));
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "SHA-256 mismatch for {}:\n  expected: {}\n  got:      {}",
+        url,
+        expected,
+        computed
+    ))
+}
+
 /// What a build phase produced: lockfile-relevant source info plus the
 /// adopt-info metadata extracted from the built part, if any.
 #[derive(Debug, Default)]
@@ -4511,23 +4554,12 @@ fn run_build(
     // 2. Compute SHA-256 of downloaded file
     let computed_sha256 = sha256_file(&tarball)?;
 
-    // 3. Verify against pinned hash
-    if let Some(expected) = source_spec.expected_sha256() {
-        if computed_sha256 != expected {
-            return Err(miette::miette!(
-                "SHA-256 mismatch for {}:\n  expected: {}\n  got:      {}",
-                source_url,
-                expected,
-                computed_sha256
-            ));
-        }
-        output::ok(format!("SHA-256 verified: {:.16}...", computed_sha256));
-    } else if !output::is_json() {
-        output::info(format!(
-            "source hash: {:.16}... (add to source.sha256 to pin)",
-            computed_sha256
-        ));
-    }
+    // 3. Verify against pinned hash (issue #175): a locked source
+    // refuses moved bytes; a FLOATING source re-resolves — its pin is a
+    // moving target by design, so the new hash is TOFU-recorded (it
+    // rides out as the build's SourceInfo) and the pod lockfile pin is
+    // restamped once the rebuild lands.
+    verify_source_download(meta, source_spec, source_url, &computed_sha256)?;
 
     // 4. Extract the tarball into the shared source dir (parts mode keeps
     // part work dirs separate) or the build tree root (single-part mode,

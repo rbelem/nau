@@ -312,6 +312,70 @@ fn harvest_payload(downloads: &Path, prefix: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("harvest {prefix} payload from {}", downloads.display()))
 }
 
+/// SHA-256 of a file, via the coreutils tool (present wherever the
+/// tar/curl gate passes).
+fn sha256_of(path: &Path) -> String {
+    let out = Command::new("sha256sum").arg(path).output().unwrap();
+    assert!(out.status.success(), "sha256sum failed");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// Pack a tarball whose source README is `echo {marker}` — the marker
+/// is executable content, so the rebuilt farm binary proves WHICH bytes
+/// the build consumed — and return the archive's SHA-256. Re-running it
+/// with a new marker IS the upstream move (issue #175).
+fn make_marker_tarball(server_dir: &Path, name: &str, marker: &str) -> String {
+    let pkg = server_dir.join(name);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(pkg.join("README"), format!("echo {marker}\n")).unwrap();
+    let tarball = server_dir.join(format!("{name}.tar.gz"));
+    let status = Command::new("tar")
+        .args(["czf", tarball.to_str().unwrap(), name])
+        .current_dir(server_dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "tar failed");
+    sha256_of(&tarball)
+}
+
+/// A package whose source is the PINNED table form
+/// (`source = { url, sha256 }`), optionally `floating` — the issue #175
+/// fixture. The build turns the source README into the farm binary, so
+/// the served bytes are directly observable through the farm.
+fn write_pinned_source_pkg(
+    project: &Path,
+    name: &str,
+    port: u16,
+    tarball: &str,
+    sha256: &str,
+    floating: bool,
+) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let dir = project.join("pkgs").join(letter.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let float_field = if floating {
+        "\n    floating = true,"
+    } else {
+        ""
+    };
+    let bin = format!("{name}bin");
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "{name}",
+    version = "1.0",{float_field}
+    source = {{ url = "http://127.0.0.1:{port}/{tarball}", sha256 = "{sha256}" }},
+    build = "mkdir -p $STAGE/bin && echo '#!/bin/sh' > $STAGE/bin/{bin} && cat README >> $STAGE/bin/{bin} && chmod +x $STAGE/bin/{bin}",
+    apps = {{ {bin} = {{ command = "bin/{bin}" }} }},
+}} }}
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
 // ── Tests ──
 
 // `pod refresh` reaches an UNDECLARABLE closure member (the round-5
@@ -757,6 +821,93 @@ gated_test!(refresh_refuses_blob_pinned_member, {
     );
     assert_eq!(
         generation_count(&root, "default"),
+        gens,
+        "the refusal must be zero-write"
+    );
+});
+
+// A FLOATING source re-resolves on refresh (issue #175): the upstream
+// bytes move at the same URL, the rebuild SUCCEEDS (the stale recorded
+// pin is not enforced), the rebuilt content lands on the farm, and the
+// pod lockfile's `sources` record restamps to the new hash — the TOFU
+// record follows the float.
+gated_test!(refresh_floating_source_reresolves_and_restamps, {
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    let hash_a = make_marker_tarball(server.path(), "floatsrc", "float-ran-a");
+    let project = tempfile::tempdir().unwrap().keep();
+    let root = tempfile::tempdir().unwrap().keep();
+    write_pinned_source_pkg(&project, "floatpkg", port, "floatsrc.tar.gz", &hash_a, true);
+    let (code, _, stderr) = run(&project, &root, &["--name", "p", "add", "floatpkg"]);
+    assert_eq!(code, Some(0), "first sync failed: {stderr}");
+    let url = format!("http://127.0.0.1:{port}/floatsrc.tar.gz");
+    let source_pin = |root: &Path, pod: &str| {
+        read_lock(root, pod)["sources"]
+            .get(&url)
+            .and_then(|v| v.get("sha256"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    assert_eq!(
+        source_pin(&root, "p").as_deref(),
+        Some(hash_a.as_str()),
+        "the first install records the observed hash (TOFU)"
+    );
+    let gens = generation_count(&root, "p");
+
+    // Upstream moves: same URL, new bytes.
+    let hash_b = make_marker_tarball(server.path(), "floatsrc", "float-ran-b");
+    assert_ne!(hash_a, hash_b, "the fixture must serve distinct bytes");
+
+    let (code, stdout, stderr) = run(&project, &root, &["--name", "p", "refresh", "floatpkg"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "a floating refresh must re-resolve, not refuse: {stderr}"
+    );
+    assert!(
+        stderr.contains("re-resolved"),
+        "the re-resolve must be loud; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        generation_count(&root, "p") > gens,
+        "moved bytes must land a new generation"
+    );
+    let farm = current_farm(&root, "p");
+    assert!(
+        farm_output(&farm, "floatpkgbin").contains("float-ran-b"),
+        "the farm must execute the re-resolved content"
+    );
+    assert_eq!(
+        source_pin(&root, "p").as_deref(),
+        Some(hash_b.as_str()),
+        "the floating source pin must restamp to the new hash"
+    );
+});
+
+// A LOCKED (non-floating) source keeps exact enforcement (issue #175's
+// counterfactual): the same moved bytes refuse the rebuild, the refusal
+// names the mismatch, and nothing is written.
+gated_test!(refresh_locked_source_still_refuses_moved_bytes, {
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    let hash_a = make_marker_tarball(server.path(), "locksrc", "lock-ran-a");
+    let project = tempfile::tempdir().unwrap().keep();
+    let root = tempfile::tempdir().unwrap().keep();
+    write_pinned_source_pkg(&project, "lockpkg", port, "locksrc.tar.gz", &hash_a, false);
+    let (code, _, stderr) = run(&project, &root, &["--name", "p", "add", "lockpkg"]);
+    assert_eq!(code, Some(0), "first sync failed: {stderr}");
+    let gens = generation_count(&root, "p");
+
+    let _hash_b = make_marker_tarball(server.path(), "locksrc", "lock-ran-b");
+    let (code, stdout, stderr) = run(&project, &root, &["--name", "p", "refresh", "lockpkg"]);
+    assert_ne!(code, Some(0), "moved bytes must refuse a locked source");
+    assert!(
+        stderr.contains("SHA-256 mismatch"),
+        "the refusal must name the mismatch; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        generation_count(&root, "p"),
         gens,
         "the refusal must be zero-write"
     );
