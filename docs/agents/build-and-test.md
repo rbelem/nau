@@ -27,20 +27,25 @@ failures from `gh`/watchers get an immediate retry/re-arm, not dismissal.
 | Format | `env -u LD_LIBRARY_PATH devbox run -- fmt` | `cargo fmt` |
 | Format check | `env -u LD_LIBRARY_PATH devbox run -- fmt-check` | `cargo fmt --check` |
 | Full gate | `env -u LD_LIBRARY_PATH devbox run -- check` | test + clippy + fmt-check |
+| Lint (pod gate) | `shuttle run --pod gate -- cargo clippy -- -D warnings` | pod-side clippy |
+| Format check (pod gate) | `shuttle run --pod gate -- cargo fmt --check` | pod-side rustfmt |
 
 `env -u LD_LIBRARY_PATH devbox run -- check` is the definition of green;
-`clippy` treats warnings as errors.
+`clippy` treats warnings as errors. The two pod-gate rows are the ratified
+substitute for the lint axes — same verdicts as the devbox pin (evidence in
+the endgame section below).
 
 ### Devbox-free endgame (target state)
 
 The gate is meant to move off devbox onto `shuttle run -- <cmd…>` (issue
 #102): exec any command with a reconciled pod's env overlaid — farm-first
 PATH plus the pod's declared vars, no sandbox, transparent exec. The command
-form is real, but it cannot carry this repo's gate yet. Directionality is
-fixed: the pod payload follows the devbox pin — the pod never leads it.
-When the switch happens, the pod becomes the single canonical gate, and
-rustfmt/clippy output drifts between versions, so the pin is the contract
-on whichever side carries it.
+form is real, and as of the ratification it carries the lint axes (clippy,
+fmt) as the verified substitute; the test axis is not yet pod-carried.
+Directionality is fixed: the pod payload follows the devbox pin — the pod
+never leads it. When the switch happens, the pod becomes the single
+canonical gate, and rustfmt/clippy output drifts between versions, so the
+pin is the contract on whichever side carries it.
 
 Two blockers, precisely:
 
@@ -67,9 +72,21 @@ Flip trigger — switch when any of: nixpkgs carries 1.98.x; clippy drift
 grows beyond a handful of diagnostics; or CI runs the pod gate. Both
 blockers are now closed: exposure at the farm layer (round 7) and the
 pin itself (round 8 — the gate pod carries rust 1.97.1, and pod-side
-clippy/fmt verdicts match the devbox pin exactly). The devbox command
-above remains the verified gate until the pod-side switch is ratified;
-when it flips, the pod becomes the single canonical gate.
+clippy/fmt verdicts match the devbox pin exactly).
+
+**Ratified (post-round-8 rerun on the daily host):** the pod gate is the
+verified substitute for the lint axes — `shuttle run --pod gate -- cargo
+clippy -- -D warnings` (≈1m25s warm vs devbox's ≈15s; the accepted cost of
+the flip) and `… cargo fmt --check` both pass with verdicts identical to
+the devbox pin. The test axis is NOT ratified: a full pod-side
+`cargo test` on the daily host fails where devbox passes, on build-host
+tools the gate pod does not ship — observed: `patchelf` (image staging
+path) and the mksquashfs-backed snap-build tests — plus one xz
+decompress failure under the pod env (suspected loader-lib leak, #130
+class; confirm before closing the axis). Until the gate pod declares
+those tools (recipe-layer provisioning, the general shape of gate-pod
+gap 3), the test axis stays devbox-side: `devbox run -- check` remains
+the full gate, and the pod gate substitutes for clippy/fmt only.
 
 ### `devbox run` semantics
 

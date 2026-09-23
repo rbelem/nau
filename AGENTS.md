@@ -6,22 +6,23 @@ replacement for Snapcraft's YAML. GPL-3.0-only, Linux-only. Formerly named
 
 ## Build, test, lint
 
-Use the pinned devbox toolchain — do not assume the system `cargo` matches:
-the pod ships a newer rust, and the 1.97.1 pin is the contract. The pod env
+Use the pinned 1.97.1 toolchain — devbox and the gate pod both carry it, and
+the pod payload follows the devbox pin (the pin is the contract). The pod env
 leaks `LD_LIBRARY_PATH` into the shell (breaks devbox's node), so unset it:
 
 ```bash
 env -u LD_LIBRARY_PATH devbox run -- build       # cargo build
 env -u LD_LIBRARY_PATH devbox run -- test        # cargo test (unit + integration)
-env -u LD_LIBRARY_PATH devbox run -- clippy      # cargo clippy -- -D warnings
-env -u LD_LIBRARY_PATH devbox run -- fmt-check   # cargo fmt --check
-env -u LD_LIBRARY_PATH devbox run -- check       # test + clippy + fmt-check
+env -u LD_LIBRARY_PATH devbox run -- check       # test + clippy + fmt-check (full gate)
+shuttle run --pod gate -- cargo clippy -- -D warnings   # lint axis, pod gate
+shuttle run --pod gate -- cargo fmt --check             # fmt axis, pod gate
 ```
 
 Run `env -u LD_LIBRARY_PATH devbox run -- check` before committing or pushing.
-Clippy warnings are errors. Target state is devbox-free (`shuttle run --`)
-once the pod carries the pinned toolchain — see
-[Build & test](docs/agents/build-and-test.md).
+Clippy warnings are errors. Ratified: the pod gate is the verified substitute
+for the clippy/fmt axes (pod-side verdicts match the devbox pin exactly); the
+test axis stays devbox until the gate pod also carries the build-host tools
+the suite spawns — see [Build & test](docs/agents/build-and-test.md).
 
 ## Detail docs
 
