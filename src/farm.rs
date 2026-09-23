@@ -432,6 +432,19 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
             std::os::unix::fs::symlink(&target, &link)
                 .map_err(|e| miette::miette!("linking {} -> {}: {e}", link.display(), target))?;
         }
+        // Cargo external subcommands (gate-pod round 6, blocker a):
+        // cargo discovers external subcommands by PATH-searching
+        // `cargo-<verb>` executables, and `cargo clippy`/`cargo fmt`
+        // die with `no such command` when the farm omits them. The
+        // rust payload ships the entry points (`cargo-clippy`,
+        // `cargo-fmt`) as payload siblings of the declared `cargo` app
+        // — the app table records only the canonical tool names — so
+        // the emit surfaces every recorded bare `cargo-*` sibling of
+        // that app. Same layer precedence as apps via `seen`; a name
+        // the package already declares as an app stays untouched.
+        if let Some(asm) = pkg.assembly.get("cargo") {
+            emit_cargo_subcommand_shims(store, gen.n, pkg, asm, ships_libs, &lib_list, &mut seen)?;
+        }
     }
     // The Freedesktop launcher set is part of the generation (issue #7):
     // emit it beside the bin farm so removal and rollback surface the
@@ -453,6 +466,91 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
     // like the farm and launchers.
     record_loader_libs(store, gen)?;
     Ok(farm)
+}
+
+/// Expose one package's cargo external-subcommand entry points. Only
+/// siblings recorded DIRECTLY beside the `cargo` binary qualify (a
+/// bare `cargo-*` file — cargo PATH-searches the bare name; a nested
+/// one is not a subcommand entry point), and a name the package
+/// already declares as an app is skipped — that app's own link wins
+/// its name through the normal path, without a duplicate warning.
+/// Farm-name collisions against OTHER packages resolve through the
+/// same `seen` map the apps and service binaries use, so a higher
+/// layer's shims shadow a loaded pod's and the warning is never
+/// silent. Like every farm entry in a lib-shipping generation, each
+/// shim is an LD wrapper over the payload copy.
+fn emit_cargo_subcommand_shims<'a>(
+    store: &RuntimeStore,
+    n: u64,
+    pkg: &'a InstalledPackage,
+    asm: &'a AppAssembly,
+    ships_libs: bool,
+    lib_list: &str,
+    seen: &mut std::collections::BTreeMap<&'a str, (&'a str, ClaimLayer)>,
+) -> miette::Result<()> {
+    let farm = farm_dir(store, n);
+    for rel in asm.files.keys() {
+        if rel.contains('/') {
+            continue;
+        }
+        let name = rel.as_str();
+        if !name.starts_with("cargo-") || pkg.apps.contains_key(name) {
+            continue;
+        }
+        if let Some((incumbent_pkg, incumbent_layer)) = seen.get(name) {
+            warn_emit_collision(
+                "binary",
+                name,
+                &pkg.name,
+                incumbent_pkg,
+                *incumbent_layer == pkg.layer,
+            );
+        }
+        seen.insert(name, (&pkg.name, pkg.layer));
+        check_farm_link_name("app", name, &pkg.name)?;
+        let link = farm.join(name);
+        // Same-content collisions leave identical links; differing
+        // content must not accumulate — replace, never merge.
+        let _ = std::fs::remove_file(&link);
+        let target = shim_target_rel(store, n, &pkg.name, asm, rel);
+        let target = if ships_libs {
+            write_ld_wrapper(store, n, name, &target, lib_list)?
+        } else {
+            target
+        };
+        std::os::unix::fs::symlink(&target, &link)
+            .map_err(|e| miette::miette!("linking {} -> {}: {e}", link.display(), target))?;
+    }
+    Ok(())
+}
+
+/// Farm-relative link target for one cargo subcommand sibling — the
+/// same preference [`entry_target_rel`]'s unconfined assembly branch
+/// encodes: the full materialized payload copy first (the clippy/fmt
+/// drivers resolve their sysroot through `/proc/self/exe` and need
+/// the complete `usr/lib` tree the bin-only assembly lacks), the
+/// assembly subtree's hardlinked leaf as fallback.
+fn shim_target_rel(
+    store: &RuntimeStore,
+    n: u64,
+    pkg_name: &str,
+    asm: &AppAssembly,
+    rel: &str,
+) -> String {
+    let payload_rel = match asm.binary.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{rel}"),
+        None => rel.to_string(),
+    };
+    let ext = store
+        .generation_dir(n)
+        .join("extensions")
+        .join(pkg_name)
+        .join("usr")
+        .join(&payload_rel);
+    if ext.is_file() {
+        return format!("../extensions/{}/usr/{}", pkg_name, payload_rel);
+    }
+    format!("../{ASSEMBLY_DIR}/{}/{}", pkg_name, payload_rel)
 }
 
 /// Reset the generation's assembly area wholesale (issue #37): the emit
