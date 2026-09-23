@@ -1679,7 +1679,7 @@ pub fn add_snap_pod(
     // a partial generation with no rollback. Refuse before any write —
     // and before the conversion warning below, so a refusal emits no
     // "converted" claim.
-    preflight_requires_closure(root, &dir, &decl, &meta, &name, &version)?;
+    preflight_requires_closure(&meta, &name, &version)?;
     if declared && !lock.snaps.contains_key(&name) {
         // The conversion is allowed but loud: the collection recipe
         // stops governing this package's content — the payload (an
@@ -1793,11 +1793,7 @@ pub fn add_snap_pod(
 /// pre-flight resolves the same full list through the same call. An
 /// unresolvable member bails naming the fix; a refusal here leaves
 /// zero state to roll back.
-#[allow(unused_variables)] // signature kept: root/dir/decl were pre-flight context only
 fn preflight_requires_closure(
-    root: &Path,
-    dir: &Path,
-    decl: &PodDeclaration,
     meta: &crate::units::PayloadSnap,
     name: &str,
     version: &str,
