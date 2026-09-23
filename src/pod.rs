@@ -1394,6 +1394,7 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
             version: meta.version.clone(),
             constraint: spec.constraint.clone(),
             deps: existing_deps,
+            recipe_sha256: None,
         },
     );
     lock.save(&lock_path)?;
@@ -1733,6 +1734,9 @@ pub fn add_snap_pod(
             version: version.clone(),
             constraint,
             deps: lock.packages.get(&name).and_then(|e| e.deps.clone()),
+            // A sideload is a blob pin (issue #116): no collection
+            // recipe closure to hash — the payload is the identity.
+            recipe_sha256: None,
         },
     );
     lock.snaps.insert(
@@ -2370,6 +2374,7 @@ pub fn update_pod(
                         version: to.clone(),
                         constraint,
                         deps,
+                        recipe_sha256: None,
                     },
                 );
                 dirty = true;
@@ -2780,6 +2785,99 @@ fn hold_blob_pinned(
     Ok(())
 }
 
+/// Detect recipe-closure drift for one declared package (issue #142):
+/// hash the canonical list of `(member_name, recipe_file_bytes)` over
+/// the package's recipe-resolved `requires` closure and compare it with
+/// the lockfile pin.
+///
+/// - Entry with an equal hash → today's behavior.
+/// - Entry without a hash (pre-#142 lockfile) → the digest is stamped
+///   silently, NO rebuild — existing pods must not mass-rebuild.
+/// - No entry (new pin) → today's behavior; the pin is stamped when
+///   written.
+/// - Entry with a differing hash → drift: the package joins the
+///   rebuilt set EVEN at an unchanged version, its recipe-resolved
+///   (non-blob-pinned) closure members join the member-rebuild set, and
+///   the drift is named on the output.
+///
+/// Members holding a blob pin (issue #116 sideloads) are excluded from
+/// the digest: their recipes live in the collection but the pod holds
+/// the blob — their drift must not force a rebuild.
+fn detect_recipe_drift(
+    ctx: &ReconcileCtx<'_>,
+    spec: &PodPackageSpec,
+    meta: &crate::snap::SnapMeta,
+    build: &mut ReconcileBuild,
+) -> miette::Result<()> {
+    let members = crate::deps::resolve_dep_names(&meta.requires, true)?;
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    for name in members {
+        // Blob-pinned member (sideloaded): the pod holds the blob, the
+        // collection recipe is not what executes — excluded.
+        if ctx.lock.snaps.contains_key(&name) {
+            continue;
+        }
+        let bytes = match crate::pkg_source::resolve_pkg(&name) {
+            crate::pkg_source::PkgResult::File(path) => std::fs::read(&path)
+                .map_err(|e| miette::miette!("failed to read recipe of '{name}': {e}"))?,
+            crate::pkg_source::PkgResult::Found { content, .. } => content.into_bytes(),
+            crate::pkg_source::PkgResult::NotFound => continue,
+        };
+        entries.push((name, bytes));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let digest = recipe_closure_hash(&entries);
+    build
+        .recipe_digests
+        .push((spec.name.clone(), digest.clone()));
+    let Some(entry) = ctx.lock.packages.get(&spec.name) else {
+        // New pin: stamped when the entry is written.
+        return Ok(());
+    };
+    match &entry.recipe_sha256 {
+        None => {
+            // Migration (issue #142): stamp silently, no rebuild.
+            build.recipe_stamps.push((spec.name.clone(), digest));
+        }
+        Some(recorded) if *recorded == digest => {}
+        Some(_) => {
+            build.recipe_drift.insert(spec.name.clone());
+            build
+                .recipe_drift_members
+                .extend(entries.iter().map(|(name, _)| name.clone()));
+            build.recipe_stamps.push((spec.name.clone(), digest));
+            crate::output::status(format!(
+                "recipe drift: {} (closure recipe changed)",
+                spec.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// SHA-256 over the canonical closure listing (issue #142): entries
+/// sorted by member name (sorted by the caller), each fed into one
+/// running hash as `name \0 <length> \0 bytes` — the NAR-style
+/// convention of [`crate::pkg_source::content_hash`] (sorted paths +
+/// contents), lifted one level: the members are the paths, the recipe
+/// bytes the contents. The length prefix keeps adjacent entries
+/// unambiguous.
+fn recipe_closure_hash(entries: &[(String, Vec<u8>)]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    for (name, bytes) in entries {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Decide what one own package does in a scoped reconcile BEFORE any
 /// build (issue #15): an off-scope package keeps its installed store
 /// content (claims from the installed record, no build — or a normal
@@ -2794,7 +2892,9 @@ fn hold_blob_pinned(
 /// (issue #5) keeps the installed content when the lockfile pin and the
 /// collection candidate disagree on VERSION; the content hold (issue
 /// #113) keeps it when the freshly resolved recipe digests identically
-/// to the installed record — same version, no rebuild.
+/// to the installed record — same version, no rebuild. Recipe-closure
+/// drift (issue #142) bypasses both: the closure's recipes changed, so
+/// the package rebuilds at its pin even at an unchanged version.
 fn scope_own_package(
     ctx: &ReconcileCtx<'_>,
     selected: bool,
@@ -2816,7 +2916,11 @@ fn scope_own_package(
         }
         return Ok(OwnScope::Build);
     }
-    if !scoped && !overlay && held_at_content(ctx.active, meta) {
+    // Recipe drift (issue #142) bypasses both holds: the package
+    // rebuilds at its pin EVEN at an unchanged version — drift moves
+    // content, not the version (`pod update` is the version verb).
+    let drifted = build.recipe_drift.contains(&meta.name);
+    if !drifted && !scoped && !overlay && held_at_content(ctx.active, meta) {
         // Content hold (issue #113): the installed record was built
         // from this exact recipe — plain sync keeps its store content.
         // The hold never reads the deps blob, so re-verify the recorded
@@ -2825,7 +2929,12 @@ fn scope_own_package(
         verify_held_deps_blob(ctx, &meta.name)?;
         return Ok(hold_plain_sync(ctx, meta, build));
     }
-    if overlay || !held_at_pin(ctx.lock, &meta.name, &meta.version, ctx.active) {
+    if overlay || !held_at_pin(ctx.lock, &meta.name, &meta.version, ctx.active) || drifted {
+        if drifted {
+            if let Some(entry) = ctx.lock.packages.get(&meta.name) {
+                meta.version = entry.version.clone();
+            }
+        }
         return Ok(OwnScope::Build);
     }
     if !scoped {
@@ -2864,7 +2973,8 @@ fn deps_pin_moved(
 /// Record one own package's pin movement after its build succeeded: a
 /// version change repins (carrying the deps pin forward, ADR-0017); a
 /// version kept with a fresh closure pin records the deps pin
-/// separately (float).
+/// separately (float). Every written entry carries the package's
+/// recipe-closure digest (issue #142) — a repin must not wipe it.
 fn record_pin_movement(
     repins: &mut Vec<(String, PodPackageLockEntry)>,
     deps_pins: &mut Vec<(String, crate::lock::PackageDepsLock)>,
@@ -2872,21 +2982,31 @@ fn record_pin_movement(
     spec: &PodPackageSpec,
     meta: &crate::snap::SnapMeta,
     deps_pin: Option<&crate::lock::PackageDepsLock>,
+    recipe_sha256: Option<&str>,
 ) {
     let version_changed =
         lock.packages.get(&spec.name).map(|e| e.version.as_str()) != Some(meta.version.as_str());
     if version_changed {
         // A repin carries the existing deps pin forward (ADR-0017):
-        // content-addressed, re-verified by sync.
+        // content-addressed, re-verified by sync. Same for the recipe
+        // closure hash (issue #142): the fresh digest when this
+        // reconcile computed one, else the recorded hash carried
+        // forward — a repin never wipes the pin.
         let deps = deps_pin
             .cloned()
             .or_else(|| lock.packages.get(&spec.name).and_then(|e| e.deps.clone()));
+        let recipe_sha256 = recipe_sha256.map(str::to_string).or_else(|| {
+            lock.packages
+                .get(&spec.name)
+                .and_then(|e| e.recipe_sha256.clone())
+        });
         repins.push((
             spec.name.clone(),
             PodPackageLockEntry {
                 version: meta.version.clone(),
                 constraint: spec.constraint.clone(),
                 deps,
+                recipe_sha256,
             },
         ));
     } else if let Some(pin) = deps_pin {
@@ -2948,6 +3068,7 @@ fn reconcile_pod_scoped(
         &mut state.lock,
         &build.repins,
         &build.deps_pins,
+        &build.recipe_stamps,
         &state.lock_path,
     )?;
     // Remove store packages the declaration dropped.
@@ -3233,6 +3354,20 @@ struct ReconcileBuild {
     /// (issue #35). Seeds, not members — the pass resolves them
     /// transitively once the full declared set is known.
     requires_seeds: Vec<String>,
+    /// Recipe-closure digests computed this reconcile (issue #142), per
+    /// declared package: recorded onto every pin the reconcile writes.
+    recipe_digests: Vec<(String, String)>,
+    /// Silent migration stamps (issue #142): lock entries that predate
+    /// the closure hash get theirs recorded WITHOUT a rebuild — existing
+    /// pods must not mass-rebuild on the first post-#142 sync.
+    recipe_stamps: Vec<(String, String)>,
+    /// Declared packages whose recipe closure drifted (issue #142):
+    /// rebuilt at their pins EVEN at an unchanged version.
+    recipe_drift: std::collections::BTreeSet<String>,
+    /// Requires members whose collection recipes drifted (issue #142):
+    /// rebuilt from their recipes even though the active generation
+    /// carries content for them.
+    recipe_drift_members: std::collections::BTreeSet<String>,
 }
 
 /// Fold the `loads` graph one level deep (issue #8): each loaded pod
@@ -3330,6 +3465,13 @@ fn collect_own_packages(
             crate::farm::ClaimLayer::Own
         };
         let selected = only.is_none_or(|n| n == spec.name.as_str());
+        // Recipe-closure drift (issue #142): decided BEFORE scoping, so
+        // a drifted package can bypass the sync holds. Off-scope
+        // packages (a scoped rebuild of a sibling) are not probed —
+        // their drift stays for a plain sync to sweep.
+        if selected {
+            detect_recipe_drift(ctx, &spec, &meta, build)?;
+        }
         if let OwnScope::Build =
             scope_own_package(ctx, selected, only.is_some(), overlay, &mut meta, build)?
         {
@@ -3370,6 +3512,11 @@ fn build_own_package(
         spec,
         meta,
         deps_pin.as_ref(),
+        build
+            .recipe_digests
+            .iter()
+            .find(|(name, _)| *name == spec.name)
+            .map(|(_, digest)| digest.as_str()),
     );
     build.pending.push(build_pending_snap(
         ctx.store,
@@ -3497,13 +3644,29 @@ fn install_requires_closure(
         if build.declared_names.contains(&name) {
             continue;
         }
-        if active_names.contains(&name) {
+        // Recipe drift (issue #142): a member whose collection recipe
+        // drifted rebuilds from its recipe even though the active
+        // generation carries content — that carried content is what
+        // recipe-only fixes never used to reach.
+        let drifted = build.recipe_drift_members.contains(&name);
+        if active_names.contains(&name) && !drifted {
             build.declared_names.insert(name);
             continue;
         }
         let dep_meta = crate::deps::load_meta(&name)?;
-        let payload = ensure_pod_dep_payload(ctx.store, &name, &dep_meta, &mut building)?;
+        let payload = ensure_pod_dep_payload(ctx.store, &name, &dep_meta, &mut building, drifted)?;
         let sha3_384 = crate::store::sha3_384_file(&payload)?;
+        if drifted {
+            // Churn guard: an UNDRIFTED member of a drifted closure
+            // rebuilds to identical bytes and keeps its store content —
+            // only a genuinely changed payload earns an install.
+            if let Some(installed) = ctx.active.as_ref().and_then(|g| g.packages.get(&name)) {
+                if installed.sha3_384 == sha3_384 {
+                    build.declared_names.insert(name);
+                    continue;
+                }
+            }
+        }
         build.pending.push(build_pending_snap_at(
             &dep_meta,
             &payload,
@@ -3515,19 +3678,21 @@ fn install_requires_closure(
     Ok(())
 }
 
-/// Apply overlay-driven repins (issue #6) and moved dependency-closure
-/// pins (ADR-0017) to the lockfile — called only after the installs
-/// succeeded, so a failed reconcile leaves the pins untouched. Loaded
-/// packages are NOT repinned in this pod's lockfile: a loaded pod's
-/// versions live in the loaded pod, and this pod follows them live
-/// (issue #8 — read-only consumption, no cross-pod pins).
+/// Apply overlay-driven repins (issue #6), moved dependency-closure
+/// pins (ADR-0017), and recipe-closure stamps (issue #142) to the
+/// lockfile — called only after the installs succeeded, so a failed
+/// reconcile leaves the pins untouched. Loaded packages are NOT
+/// repinned in this pod's lockfile: a loaded pod's versions live in the
+/// loaded pod, and this pod follows them live (issue #8 — read-only
+/// consumption, no cross-pod pins).
 fn apply_pin_updates(
     lock: &mut LockFile,
     repins: &[(String, PodPackageLockEntry)],
     deps_pins: &[(String, crate::lock::PackageDepsLock)],
+    recipe_stamps: &[(String, String)],
     lock_path: &Path,
 ) -> miette::Result<()> {
-    if repins.is_empty() && deps_pins.is_empty() {
+    if repins.is_empty() && deps_pins.is_empty() && recipe_stamps.is_empty() {
         return Ok(());
     }
     for (name, entry) in repins {
@@ -3543,8 +3708,16 @@ fn apply_pin_updates(
                     version: String::new(),
                     constraint: None,
                     deps: Some(deps.clone()),
+                    recipe_sha256: None,
                 },
             );
+        }
+    }
+    // Recipe-closure stamps (issue #142): only entries that exist — a
+    // stamp never creates a pin, it records onto one.
+    for (name, digest) in recipe_stamps {
+        if let Some(entry) = lock.packages.get_mut(name) {
+            entry.recipe_sha256 = Some(digest.clone());
         }
     }
     lock.save(lock_path)
@@ -4395,7 +4568,7 @@ fn pod_build_prefix(
     let mut payloads = Vec::new();
     for name in closure_names {
         let dep_meta = crate::deps::load_meta(&name)?;
-        let snap = ensure_pod_dep_payload(store, &name, &dep_meta, building)?;
+        let snap = ensure_pod_dep_payload(store, &name, &dep_meta, building, false)?;
         payloads.push(crate::build_prefix::Payload { pkg: name, snap });
     }
     let merged = crate::build_prefix::materialize_merged_prefix(&payloads)?;
@@ -4419,12 +4592,15 @@ fn pod_build_prefix(
 ///
 /// `building` is the in-progress stack for cycle detection: a circular
 /// requires/build_deps chain fails with a clear chain instead of
-/// recursing forever.
+/// recursing forever. `force_build` (issue #142) skips the cached
+/// downloads hit: a recipe-drifted member must rebuild from its recipe,
+/// and the fresh payload overwrites the stale cache entry.
 fn ensure_pod_dep_payload(
     store: &crate::runtime::RuntimeStore,
     name: &str,
     dep_meta: &crate::snap::SnapMeta,
     building: &mut Vec<String>,
+    force_build: bool,
 ) -> miette::Result<std::path::PathBuf> {
     set_pod_build_epoch();
     let downloads = store.downloads_dir();
@@ -4436,7 +4612,7 @@ fn ensure_pod_dep_payload(
         dep_meta.version,
         crate::snap::host_arch()
     ));
-    if existing.exists() {
+    if existing.exists() && !force_build {
         return Ok(existing);
     }
 
@@ -4815,6 +4991,7 @@ pub fn fetch_pod_deps(
                 version: meta.version.clone(),
                 constraint: spec.constraint.clone(),
                 deps: None,
+                recipe_sha256: None,
             })
             .deps = Some(pin.clone());
         report.fetched.push(DepsFetchedEntry {
@@ -5214,6 +5391,7 @@ pod {
                 version: "1.0".into(),
                 constraint: None,
                 deps: None,
+                recipe_sha256: None,
             },
         );
         let gen = gen_with_record(record);

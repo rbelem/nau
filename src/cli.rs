@@ -1139,6 +1139,8 @@ pub enum PodCommand {
     /// changed, and bumps the generation. A no-op when every package is
     /// already at its newest matching version; constrained packages
     /// whose newest candidate no longer matches are held at their pin.
+    /// Update is version-driven — recipe-only drift in a package's
+    /// requires closure is swept by `pod sync` (issue #142).
     Update {
         #[command(flatten)]
         target: PodTarget,
