@@ -71,8 +71,33 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
     let Some(confined) = pkg.app_confined.get(app).or(pkg.confined.as_ref()) else {
         // Unconfined app reached `shuttle run` directly — exec the real
         // binary with no sandbox (the farm never routes an unconfined app
-        // here).
-        return exec_direct(&bin, args, &vars);
+        // here). Two invariants keep this form equivalent to running the
+        // app THROUGH the farm:
+        //
+        // 1. Prefer the generation's LD wrapper for the app when one was
+        //    emitted: through the farm this binary runs wrapped
+        //    (loader-libs LD_LIBRARY_PATH + the emit-chosen payload copy,
+        //    issue #164); the raw assembly leaf would instead inherit the
+        //    CALLER'S loader env, and a toolchain app would then resolve
+        //    its toolchain from the caller's PATH, not the pod's. The
+        //    wrapper exists exactly when the farm entry is
+        //    wrapper-routed, so the two forms stay equivalent.
+        // 2. Farm-first PATH (the shellenv contract, issue #102's
+        //    arbitrary-command form): without it, the app's children
+        //    (a build driver's `cc`, `rustc`) resolve from the caller's
+        //    PATH, silently bypassing the pod.
+        let wrapper = store
+            .generation_dir(gen.n)
+            .join(crate::farm::LD_WRAPPERS_DIR)
+            .join(app);
+        let target = if wrapper.is_file() { wrapper } else { bin };
+        let mut cmd = std::process::Command::new(&target);
+        for a in args {
+            cmd.arg(a);
+        }
+        let shellenv = crate::pod::shellenv(root, pod_name)?;
+        overlay_pod_env_with(&mut cmd, &shellenv, std::env::var_os("PATH").as_deref());
+        return exec_cmd(cmd);
     };
 
     if !bin.is_file() {
@@ -118,20 +143,6 @@ fn resolve_app<'a>(
         }
     }
     None
-}
-
-/// Exec a binary directly (no sandbox), replacing the current process.
-fn exec_direct(
-    bin: &Path,
-    args: &[String],
-    vars: &std::collections::BTreeMap<String, String>,
-) -> miette::Result<()> {
-    let mut cmd = std::process::Command::new(bin);
-    for a in args {
-        cmd.arg(a);
-    }
-    overlay_declared_vars(&mut cmd, vars);
-    exec_cmd(cmd)
 }
 
 /// The declared vars ride every exec form (ADR-0030): declared replaces
@@ -928,15 +939,6 @@ mod tests {
             path.starts_with(&format!("{}", tmp.path().join("farm").display())),
             "farm must lead the exported PATH: {path}"
         );
-    }
-
-    #[test]
-    fn exec_direct_reports_a_missing_binary_instead_of_panicking() {
-        let vars = std::collections::BTreeMap::new();
-        let err = exec_direct(Path::new("/nonexistent/shuttle-no-bin"), &[], &vars)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("failed to exec"), "{err}");
     }
 
     #[test]

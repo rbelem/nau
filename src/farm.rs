@@ -113,10 +113,25 @@ pub const ENV_FILE: &str = "env.json";
 /// The payload-relative lib directories the loader seam records.
 /// `usr/usr/lib` is the pool's libdir convention (`--prefix=/usr`);
 /// `usr/usr/lib64` is the glibc/toolchain layout. `usr/usr/libexec`
-/// holds non-linkable helpers and is never a search dir. A subdirectory
-/// of a recorded dir is NOT itself recorded — the loader searches only
-/// the listed dirs, and the pool ships shared objects flat.
-const LOADER_LIB_SUBDIRS: [&str; 2] = ["usr/usr/lib", "usr/usr/lib64"];
+/// holds non-linkable helpers and is never a search dir. The Debian
+/// multiarch dir (`usr/usr/lib/x86_64-linux-gnu`) covers deb-payload
+/// recipes (issue #164): trixie splits shared libs into it, and cc1's
+/// DT_NEEDED (libisl, libmpfr, ...) only resolves when it is listed.
+/// `usr/lib64` covers rootfs-layout payloads staged with `install_root`
+/// semantics (issue #164: glibc's slibdir /lib64 lands at usr/lib64 and
+/// holds the runtime sonames — libc.so.6 — that a bare-soname ld script
+/// GROUP must resolve through -L). `usr/lib` is NOT a key: the emit
+/// writes `usr/lib/extension-release` into every extension
+/// (runtime.rs), so the dir always exists and would wrap every app in
+/// every pod. A subdirectory of a recorded dir is NOT itself recorded —
+/// the loader searches only the listed dirs. Every entry is stat-gated
+/// at emit, so layouts a payload does not ship are never recorded.
+const LOADER_LIB_SUBDIRS: [&str; 4] = [
+    "usr/usr/lib",
+    "usr/usr/lib64",
+    "usr/usr/lib/x86_64-linux-gnu",
+    "usr/lib64",
+];
 
 /// Path of generation `n`'s loader-lib list.
 pub fn loader_libs_path(store: &RuntimeStore, n: u64) -> PathBuf {
@@ -492,8 +507,37 @@ fn write_ld_wrapper(
     lib_list: &str,
 ) -> miette::Result<String> {
     let path = ld_wrappers_dir(store, n).join(app);
+    // The lib dirs ride THREE loader/search variables, not one (issue
+    // #164): LD_LIBRARY_PATH (runtime loader, the original contract),
+    // LIBRARY_PATH (gcc/clang drivers map it onto -L AND startfile
+    // search — a C driver in a toolchain payload must find the pod's
+    // Scrt1.o/-lc at link time; they live in the same recorded dirs) and
+    // CPATH (every extensions package's usr/usr/include, so the driver's
+    // preprocessor resolves the pod's libc/kernel headers instead of the
+    // host's — the wrapper is generation-relative, so the glob re-scopes
+    // atomically on rollback like every other $d path).
+    //
+    // COMPILER_PATH (issue #164): where the driver — and collect2, which
+    // inherits the same env — searches for its SUBPROGRAMS (as, ld, ar)
+    // before falling back to PATH. The deb payload ships them at
+    // usr/usr/bin; without this the driver dies at posix_spawnp on a
+    // caller whose PATH has no binutils. Inert for non-compiler apps.
     let body = format!(
-        "#!/bin/sh\nd=$(dirname \"$(readlink -f \"$0\")\")\nLD_LIBRARY_PATH=\"{lib_list}\" exec \"$d/../farm/{real_target}\" \"$@\"\n"
+        "#!/bin/sh\nd=$(dirname \"$(readlink -f \"$0\")\")\n\
+         LD_LIBRARY_PATH=\"{lib_list}\"\n\
+         LIBRARY_PATH=\"$LD_LIBRARY_PATH\"\n\
+         CPATH=\n\
+         COMPILER_PATH=\n\
+         for i in \"$d\"/../extensions/*/usr/usr/include; do\n\
+         \x20 [ -d \"$i\" ] && CPATH=\"$CPATH$i:\"\n\
+         done\n\
+         CPATH=\"${{CPATH%:}}\"\n\
+         for i in \"$d\"/../extensions/*/usr/usr/bin; do\n\
+         \x20 [ -d \"$i\" ] && COMPILER_PATH=\"$COMPILER_PATH$i:\"\n\
+         done\n\
+         COMPILER_PATH=\"${{COMPILER_PATH%:}}\"\n\
+         export LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n\
+         exec \"$d/../farm/{real_target}\" \"$@\"\n"
     );
     std::fs::write(&path, &body)
         .map_err(|e| miette::miette!("writing ld-wrapper {}: {e}", path.display()))?;
@@ -523,6 +567,21 @@ fn entry_target_rel(
     if let Some(asm) = pkg.assembly.get(app) {
         build_assembly(store, n, &pkg.name, hash, asm)?;
         if !effective_confined(pkg, app) {
+            // Prefer the full materialized payload copy when present:
+            // `<binary>` is payload-root-relative, so it sits at
+            // `extensions/<pkg>/usr/<binary>` (issue #164 — the gcc
+            // driver opens cc1/liblto_plugin.so beside itself, so it
+            // must run from the complete payload tree, not the bin-dir
+            // assembly). The assembly subtree stays the fallback.
+            let ext_path = store
+                .generation_dir(n)
+                .join("extensions")
+                .join(&pkg.name)
+                .join("usr")
+                .join(&asm.binary);
+            if ext_path.is_file() {
+                return Ok(format!("../extensions/{}/usr/{}", pkg.name, asm.binary));
+            }
             return Ok(format!("../{ASSEMBLY_DIR}/{}/{}", pkg.name, asm.binary));
         }
     }
@@ -590,6 +649,23 @@ fn build_assembly(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| miette::miette!("creating assembly dir {}: {e}", parent.display()))?;
+        }
+        // Idempotent, mirroring the hardlink branch: a payload may record
+        // the same relative path as both a file and a link sibling, and a
+        // prior emit of this generation can leave the link in place. An
+        // identical existing link is a no-op; anything else is replaced
+        // (remove + recreate, never fail on EEXIST).
+        if let Ok(meta) = std::fs::symlink_metadata(&dest) {
+            let same = meta.file_type().is_symlink()
+                && std::fs::read_link(&dest)
+                    .map(|existing| existing == *target)
+                    .unwrap_or(false);
+            if same {
+                continue;
+            }
+            std::fs::remove_file(&dest).map_err(|e| {
+                miette::miette!("replacing stale assembly entry {}: {e}", dest.display())
+            })?;
         }
         std::os::unix::fs::symlink(target, &dest)
             .map_err(|e| miette::miette!("linking {} -> {}: {e}", dest.display(), target))?;

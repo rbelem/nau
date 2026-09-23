@@ -6404,6 +6404,14 @@ pub fn resolve_archs(meta: &SnapMeta, cli_archs: &[String]) -> Vec<String> {
 }
 
 /// Recursive copy of directory contents into destination.
+///
+/// Symlinks are recreated as symlinks, not dereferenced: a payload stage
+/// legitimately carries relative symlinks (deb-relayout trees ship
+/// `gcc-14 -> x86_64-linux-gnu-gcc-14`-style links; `std::fs::copy`
+/// follows them, silently duplicating target content for resolvable
+/// links and failing with ENOENT for links that only resolve after the
+/// payload is merged into its final tree). Dangling links are preserved
+/// verbatim — squashfs packs them as-is.
 fn cp_r(src: &Path, dst: &Path) -> std::io::Result<()> {
     let mut dirs = vec![src.to_path_buf()];
     while let Some(current) = dirs.pop() {
@@ -6421,7 +6429,16 @@ fn cp_r(src: &Path, dst: &Path) -> std::io::Result<()> {
                 let rel = path.strip_prefix(src).unwrap();
                 let dest = dst.join(rel);
 
-                if path.is_dir() {
+                if path.is_symlink() {
+                    // Replace whatever a previous generation left at dest
+                    // (symlink_metadata, not exists() — a dangling dest
+                    // link still counts).
+                    if dest.symlink_metadata().is_ok() {
+                        std::fs::remove_file(&dest)?;
+                    }
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(std::fs::read_link(&path)?, &dest)?;
+                } else if path.is_dir() {
                     std::fs::create_dir_all(&dest)?;
                     dirs.push(path);
                 } else {
