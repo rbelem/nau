@@ -119,9 +119,10 @@ ingestion path that bypasses the collection must therefore also say what
 
 **Positive**: the pod axis gains the same blob-source seam the system
 axis already has; a collection-less machine can reproduce a pod only
-from payloads whose `requires` closures are empty or already carried by
-the pod: a requires-carrying sideload refuses zero-write before install
-when its closure cannot be resolved, and a closure that fails only
+from payloads whose `requires` closures resolve in the collection — a
+requires-carrying sideload refuses zero-write when the closure cannot
+be resolved (even when a member is already carried by the pod's active
+generation), and a closure that fails only
 after install leaves a declared partial generation — payload active,
 libraries missing — completed by providing the collection and
 re-running `pod sync`, or abandoned via `pod remove`; pins stay

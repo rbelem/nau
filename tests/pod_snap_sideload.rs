@@ -578,7 +578,7 @@ gated_test!(filename_meta_mismatch_refused, {
     let root = tempfile::tempdir().unwrap();
 
     // Name mismatch: hello content under a `world_` filename.
-    let wrong_name = stage.path().join("world_1.0_amd64.snap");
+    let wrong_name = stage.path().join(format!("world_1.0_{}.snap", host_arch()));
     std::fs::copy(&payload, &wrong_name).unwrap();
     let (code, _, stderr) = run(
         project.path(),
@@ -599,7 +599,7 @@ gated_test!(filename_meta_mismatch_refused, {
     assert!(!pod_dir(root.path(), "default").exists(), "zero writes");
 
     // Version mismatch: hello 1.0 content under a 9.9 filename.
-    let wrong_version = stage.path().join("hello_9.9_amd64.snap");
+    let wrong_version = stage.path().join(format!("hello_9.9_{}.snap", host_arch()));
     std::fs::copy(&payload, &wrong_version).unwrap();
     let (code, _, stderr) = run(
         project.path(),
@@ -628,7 +628,9 @@ gated_test!(infrastructure_refused_store_warns, {
     let root = tempfile::tempdir().unwrap();
 
     // Infrastructure: refused, zero writes.
-    let base_snap = stage.path().join("base-core_1.0_amd64.snap");
+    let base_snap = stage
+        .path()
+        .join(format!("base-core_1.0_{}.snap", host_arch()));
     fake_snap(
         &base_snap,
         "name: base-core\nversion: \"1.0\"\ntype: base\n",
@@ -653,7 +655,9 @@ gated_test!(infrastructure_refused_store_warns, {
     );
 
     // Store type: warns, installs as an inert record.
-    let store_snap = stage.path().join("store-thing_1.0_amd64.snap");
+    let store_snap = stage
+        .path()
+        .join(format!("store-thing_1.0_{}.snap", host_arch()));
     fake_snap(
         &store_snap,
         "name: store-thing\nversion: \"1.0\"\ntype: store\n",
@@ -1179,7 +1183,7 @@ fn active_generation_link(root: &Path, pod: &str) -> u64 {
 // meta/snap.yaml only.
 gated_test!(preflight_refuses_unresolvable_requires_zero_write, {
     let stage = tempfile::tempdir().unwrap();
-    let payload = stage.path().join("app_1.0_amd64.snap");
+    let payload = stage.path().join(format!("app_1.0_{}.snap", host_arch()));
     fake_snap(
         &payload,
         "name: app\nversion: \"1.0\"\nrequires:\n  - libmember\n",
@@ -1213,6 +1217,100 @@ gated_test!(preflight_refuses_unresolvable_requires_zero_write, {
         "the refusal must leave zero writes"
     );
     assert_eq!(generation_count(root.path(), "default"), 0);
+});
+
+// Regression (review round 1): the pre-flight mirrors sync's FULL-list
+// resolution — a requires member that the target pod's ACTIVE
+// generation already carries must still refuse zero-write when it has
+// no resolvable recipe in the collection, because the follow-up sync
+// would fail exactly the same way (resolve_dep_names runs on the full
+// seed list before any per-member skip).
+//
+// Fixture: `base` (sideloaded, requires member) drags `member` into
+// the generation via the follow-up sync's closure install — WITHOUT a
+// declaration entry (closure members never enter decl.packages). The
+// member recipe is then deleted, so `member` is carried but
+// unresolvable; `base` keeps its recipe so the binary-collision
+// precheck (which loads every declared package's meta) still passes
+// and the refusal comes from the requires pre-flight itself.
+gated_test!(preflight_refuses_member_carried_but_unresolvable, {
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    let stage = tempfile::tempdir().unwrap();
+    make_tarball(server.path(), "basesrc");
+    make_tarball(server.path(), "member");
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_pkg_version(
+        project.path(),
+        "base",
+        "baseapp",
+        "basebin",
+        "1.0",
+        "base-ran",
+        port,
+        "basesrc.tar.gz",
+    );
+    write_pkg_version(
+        project.path(),
+        "member",
+        "memberlib",
+        "memberlib",
+        "1.0",
+        "member-ran",
+        port,
+        "member.tar.gz",
+    );
+
+    // Sideload `base` (requires member): the pre-flight passes (member
+    // resolves), and the follow-up sync installs `member` into the
+    // generation as a closure member — no declaration entry.
+    let base = stage.path().join(format!("base_1.0_{}.snap", host_arch()));
+    fake_snap(
+        &base,
+        "name: base\nversion: \"1.0\"\nrequires:\n  - member\n",
+    );
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", base.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(generation_count(root.path(), "default"), 2);
+
+    // `member` stays carried by the active generation, but its recipe
+    // is gone from the collection.
+    std::fs::remove_file(project.path().join("pkgs/m/member.lua")).unwrap();
+
+    // `app` requires `member`: carried, yet unresolvable.
+    let app = stage.path().join(format!("app_1.0_{}.snap", host_arch()));
+    fake_snap(&app, "name: app\nversion: \"1.0\"\nrequires:\n  - member\n");
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", app.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_ne!(code, Some(0), "the unresolvable member must refuse");
+    let stderr = flat(&stderr);
+    assert!(
+        stderr.contains("refusing to sideload 'app'") && stderr.contains("requires"),
+        "must name the payload and the gate: {stderr}"
+    );
+    assert!(
+        stderr.contains("member"),
+        "must name the unresolvable member: {stderr}"
+    );
+    assert!(
+        stderr.contains("provide the collection"),
+        "must name the fix: {stderr}"
+    );
+    // Zero-write for THIS sideload: no new generation, no `app` pin.
+    assert_eq!(generation_count(root.path(), "default"), 2);
+    let lock = lockfile(root.path(), "default");
+    assert!(
+        lock["snaps"].get("app").is_none(),
+        "the refusal must not record an app pin: {lock}"
+    );
 });
 
 // Flagship: a requires-carrying payload whose closure RESOLVES
@@ -1562,6 +1660,28 @@ gated_test!(foreign_arch_payload_refused, {
         code,
         Some(0),
         "the host-arch payload must install: {stderr}"
+    );
+});
+
+// Review round 1: `all` is the build default (`resolve_archs`) and
+// makes no host claim — an `_all` filename sideloads on any host,
+// like the no-arch and host-arch shapes.
+gated_test!(all_arch_payload_sideloads, {
+    let stage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+
+    let all = stage.path().join("hello_1.0_all.snap");
+    fake_snap(&all, "name: hello\nversion: \"1.0\"\n");
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", all.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "an `_all` payload must install: {stderr}");
+    assert!(
+        !stderr.contains("foreign-architecture"),
+        "the arch gate must not fire for `all`: {stderr}"
     );
 });
 
