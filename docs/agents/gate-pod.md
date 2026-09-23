@@ -110,6 +110,79 @@ gate: 5→24). Concurrent snap builds in one checkout must pass explicit
 stage inode flipping mid-build). glibc builds must run inside devbox
 (linux-headers' HOSTCC needs the sandbox gcc).
 
+## Round 5 — curl refresh path end to end (#142) (2026-09-23, daily pod, shuttle @ 97bdfaa + #138/#142 in tree, debug build)
+
+**Verdict: negative — `pod sync` does not sweep the stranded #138 curl
+fix.** The recipe-closure hash pin never fires for it: the migration
+clause baselines past drift instead of detecting it, and undeclarable
+closure members skip sync outright. The original #142 acceptance (a
+wrapped curl reaches a farm via sync) is unreachable on the daily pod;
+issue #142 stays open.
+
+1. Recon (before): generations 62–67, active → 67 (built set 21
+   23:34). curl 8.20.0 rev 0 is a gen-67 member via git's `requires` —
+   undeclarable, absent from `pod.lua` and from `pod list`; the gen-67
+   farm exposes **no curl entry** (a caller's `command -v curl` falls
+   through to the NixOS system curl). The installed blob is pre-#138:
+   a 365 KB ELF at
+   `…/generations/67/extensions/curl/usr/usr/bin/curl` (mtime set 17),
+   and the generation carries **no ca-certificates member at all** —
+   the #138 recipe's new require has never been materialized here.
+   Lockfile: 63/63 entries, **zero `recipe_sha256`** (pre-#142 lock).
+
+2. `pod --name daily sync` (`CURL_CA_BUNDLE` exported per the pre-sync
+   contract; NixOS squashfs-tools/bwrap store paths prepended per the
+   round-1 precedent). Sync did NOT detect curl drift — it started a
+   mass content-hold rebuild of declared packages (gen 67 predates two
+   days of recipe/payload changes): atuin, bitwarden-cli, bws, bun,
+   chezmoi rebuilt green (fetch-merge), then dconf died in the sandbox:
+
+        meson.build:1:0: ERROR: Unknown compiler(s): [['cc'], ['gcc'], ['clang'], …]
+        Running `cc --version` gave "[Errno 2] No such file or directory: 'cc'"
+        Error:   × build command exited with error (in sandbox)
+
+   Downloads ran through a pod curl whose RUNPATH pins the gen-66-era
+   extension tree — `curl:
+   …/generations/66/ld-wrappers/../extensions/curl/usr/usr/lib/libcurl.so.4:
+   no version information available` — the same pre-#138 blob class;
+   TLS succeeded only because of the exported `CURL_CA_BUNDLE`. The
+   devbox-HOSTCC retry was deliberately NOT taken: the dconf miss is a
+   plain content-hold rebuild unrelated to the curl verdict, and
+   completing the 60+-package storm would not change it (the member
+   skip below is unconditional). The failed sync left no trace per the
+   pins-after-success contract: active still → 67, lock still 0
+   stamps, generations unchanged.
+
+3. Root cause (two independent grounds, pod.rs @ this tree):
+   - **Migration clause swallows past drift.** `detect_recipe_drift`
+     (src/pod.rs:2907-2911): a lock entry without `recipe_sha256`
+     stamps the digest **silently, no rebuild**. The stamped digest is
+     computed from the *currently resolved* recipes — which already
+     contain #138 (fe0f9cc). The first successful post-#142 sync
+     therefore writes a baseline that includes the stranded fix; every
+     later sync compares equal and drift can never fire. No disk state
+     anywhere carries a pre-fe0f9cc baseline (stamps land only on
+     successful sync, and none happened between f7cc5ac and fe0f9cc).
+   - **Undeclarable members skip sync.** `install_requires_closure`
+     (src/pod.rs:3713-3725): `if active_names.contains(&name) &&
+     !drifted { continue; }`. Even when git rebuilds (here via plain
+     content-hold, not drift), curl — the active generation carries it,
+     `recipe_drift_members` is empty — is skipped. No sync path reaches
+     the curl recipe without drift firing first.
+
+4. Acceptance (step 4) NOT RUN — moot: no new generation, no wrapped
+   curl exists to expose on a farm. TLS without `CURL_CA_BUNDLE` would
+   still fail today: the pod's curl is byte-identical pre-#138 content
+   with no bundle sibling.
+
+Narrowed gap: #142's mechanism remains valid for FUTURE recipe edits
+(post-baseline drift fires → the declared package plus drifted closure
+members rebuild, churn-guarded). What it cannot do is retro-sweep a fix
+that predates a pod's first post-#142 stamp — exactly the #138
+situation it was filed for. Follow-up candidates for the issue (none
+attempted here): a one-shot migration rebuild, a `pod refresh` verb, or
+the documented remove/re-add churn.
+
 ## Round 3 (2026-09-23, shuttle @ 0ab0912, debug build) — sideload route proven
 
 The prebuilt-payload route (gap 2) works end to end. All four payloads
@@ -169,10 +242,16 @@ drift question (pod 1.98.1 vs devbox 1.97.1) stays unobservable until
    provisioning of rust still needs the glibc chain; with the gcc
    payload now a recipe, a pod can declare gcc as a build tool instead
    of needing a host compiler — untested.
-4. **Curl refresh path (filed).** A recipe-only fix (#138) does not
-   reach installed pods — #142's recipe-hash pin (merged) now sweeps
-   recipe drift on `pod sync`; end-to-end verify a wrapped curl reaches
-   a farm via a sync (the original #142 acceptance).
+4. ~~**Curl refresh path (filed).**~~ **NEGATIVE in round 5.** #142's
+   recipe-hash pin cannot sweep the stranded #138 fix: the migration
+   clause (entry without `recipe_sha256` → stamp silently, no rebuild)
+   baselines the *current* recipes, so drift that predates the baseline
+   — i.e. fe0f9cc itself — is undetectable; and undeclarable closure
+   members skip sync unless a drifted declared package names them
+   (pod.rs:3722). A wrapped curl reaches no farm via sync on any pod
+   whose first post-#142 sync postdates the recipe fix. #142 stays
+   open; needs a follow-up (one-shot migration rebuild or refresh
+   verb). The pin remains valid for future recipe drift.
 5. **`pod declare --file` (plan §6).** `pod.lua` is write-only today
    (`add`/`remove` maintain it); no checked-in `gate/pod.lua` until a verb
    can load one.
