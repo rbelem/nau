@@ -74,3 +74,19 @@ are minimal and reproducible; leak detection matches the strictest industry prec
 the leak scan has known blind spots (dlopened plugins, data files consumed at build time)
 covered only by the escape hatch; merged-prefix materialization adds build-setup work per
 build; a future cross-compilation story will need the `host_deps` retrofit.
+
+## Addendum (2026-09-23): subtree ownership (issue #174)
+
+Each shared subtree in the merged prefix has exactly one owning payload. The
+kernel uapi headers (`usr/include/asm-generic` et al.) are owned by the pool's
+`linux-headers` payload; glibc already requires it, so any merged prefix
+containing a toolchain carries the uapi transitively. Toolchain bundles must
+not restage owned subtrees — the gcc deb set's existing "NO libc6-dev"
+exclusion extends to `linux-libc-dev` (#174): a Debian toolchain shipping its
+own kernel-uapi copy collides with `linux-headers` at identical shared paths,
+and the collision is a payload bug, not a merge problem. Overlaps are fixed in
+the payload by dropping the duplicate, never by merge priority: the
+identical-content rule (Decision 2) stays fail-closed and unchanged. The gcc
+build chain asserts the rule (`test ! -e "$STAGE/usr/include/asm-generic"`)
+so a future deb in the set cannot silently reintroduce the collision.
+Recipe-declared arch extensions of a toolchain deb set (#171) inherit the rule.
