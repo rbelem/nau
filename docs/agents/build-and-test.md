@@ -36,21 +36,34 @@ failures from `gh`/watchers get an immediate retry/re-arm, not dismissal.
 The gate is meant to move off devbox onto `shuttle run -- <cmd…>` (issue
 #102): exec any command with a reconciled pod's env overlaid — farm-first
 PATH plus the pod's declared vars, no sandbox, transparent exec. The command
-form is real, but it cannot carry this repo's gate yet:
+form is real, but it cannot carry this repo's gate yet. Directionality is
+fixed: the pod payload follows the devbox pin — the pod never leads it.
+When the switch happens, the pod becomes the single canonical gate, and
+rustfmt/clippy output drifts between versions, so the pin is the contract
+on whichever side carries it.
 
-- The daily pod ships a rust toolchain, but 1.98.1 — not the pinned 1.97.1
-  (devbox's nixpkgs pin cannot resolve 1.98.x; 1.97.1 is the newest
-  resolvable). rustfmt/clippy output drifts between versions, so the pin is
-  the contract.
-- `check` is a devbox script name, not a farm binary — `shuttle run -- check`
-  has nothing to resolve until the pod ships the pinned toolchain and a gate
-  wrapper (or the gate is spelled as explicit `shuttle run -- cargo …`
-  commands).
+Two blockers, precisely:
 
-Prerequisite for the switch: the pod/pool must carry the pinned toolchain
-(cargo/rustc/clippy/rustfmt 1.97.1) — pod 1.98.1 still drifts from the pin,
-and devbox cannot resolve 1.98.x yet. Until then, the devbox command above
-remains the verified gate.
+1. **Pin.** `pkgs/r/rust.lua` pins 1.98.1 and must pin 1.97.1. rust.lua
+   is a FETCH recipe (upstream static tarballs), so 1.97.1 is fetchable —
+   it is devbox's nixpkgs that cannot resolve 1.98.x (1.97.1 is the
+   newest resolvable there), which is why the two sides cannot converge
+   from the devbox side.
+2. **Exposure.** rust.lua's apps map must declare `cargo-clippy` and
+   `cargo-fmt`. The payload already ships both binaries; the existing
+   `clippy` app exposes the entry point under the wrong name for cargo's
+   `cargo-<sub>` PATH discovery, so `cargo clippy`/`cargo fmt` die with
+   `no such command` (round 6 of the gate-pod log).
+
+Ratchet rule: once the pod is the gate, the pin moves forward only, via
+a dedicated bump commit that lands the forward-fixes first (the code
+changes the newer clippy demands) — never port an older toolchain into a
+newer gate to un-block a lane.
+
+Flip trigger — switch when any of: nixpkgs carries 1.98.x; clippy drift
+grows beyond a handful of diagnostics; or CI runs the pod gate. Until
+then, round 6's negative verdict stands: the pod lint axis cannot replace
+the devbox gate, and the devbox command above remains the verified gate.
 
 ### `devbox run` semantics
 
