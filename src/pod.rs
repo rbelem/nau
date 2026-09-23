@@ -1669,7 +1669,17 @@ pub fn add_snap_pod(
     validate_loads(root, pod_name, &decl)?;
     validate_overlays(root, &decl, pod_name)?;
     let layer = payload_layer(&decl, &name);
-    precheck_payload_collisions(root, &decl, &name, &meta, layer)?;
+    // Sibling resolution sees the pod's OWN pins/blobs first (issue
+    // #147): a collection-less pod accumulates sideloaded payloads, so
+    // a declared sibling that is pinned and carried here must resolve
+    // from its installed record, not through the collection.
+    let store = pod_store(&dir);
+    let active = store.active_generation()?;
+    let pins = PodPins {
+        lock: &lock,
+        active: active.as_ref(),
+    };
+    precheck_payload_collisions(root, &decl, &name, &meta, layer, &pins)?;
     // Zero-write requires pre-flight (issue #132): a payload whose
     // meta/snap.yaml carries `requires` would go ACTIVE first and only
     // fail the follow-up sync's closure resolution on this machine —
@@ -1753,7 +1763,6 @@ pub fn add_snap_pod(
     // Install the payload through the store's normal batch path: it
     // re-verifies sha3-384 fail-closed, refuses infrastructure types,
     // records `type: store` inert, and emits the loud unsigned note.
-    let store = pod_store(&dir);
     let pending = crate::runtime::PendingSnap {
         name: name.clone(),
         revision: 0,
@@ -1929,6 +1938,29 @@ fn unpack_payload_identity(
     Ok((meta, identity.version))
 }
 
+/// The pod's own pins for sideload sibling resolution (issue #147):
+/// the lockfile `snaps` blob pins plus the active generation's
+/// installed records. A declared sibling both pinned and carried here
+/// resolves from its installed record — the pod store's carried
+/// payloads — BEFORE the collection is consulted, so a collection-less
+/// pod can accumulate sideloaded payloads.
+struct PodPins<'a> {
+    lock: &'a LockFile,
+    active: Option<&'a crate::runtime::Generation>,
+}
+
+impl PodPins<'_> {
+    /// The installed record of a declared sibling the pod pins AND
+    /// carries — the #135/#151 blob-pin lookup shape (`hold_blob_pinned`):
+    /// the lockfile pin's sha3-384 must match the generation's content.
+    /// `None` leaves the sibling to the collection fallback.
+    fn carried(&self, name: &str) -> Option<&crate::runtime::InstalledPackage> {
+        let pin = self.lock.snaps.get(name)?;
+        let pkg = self.active?.packages.get(name)?;
+        (pkg.sha3_384 == pin.sha3_384).then_some(pkg)
+    }
+}
+
 /// Architecture gate (issue #133): the filename arch is a claim about
 /// the payload; a mismatch with the host refuses before any write — a
 /// foreign blob would install clean and fail only at exec. `all` is the
@@ -1957,13 +1989,15 @@ fn refuse_foreign_arch(payload: &Path, arch: Option<&str>) -> miette::Result<()>
 /// payload's `meta/snap.yaml` against the pod's post-state package set,
 /// resolved by the shared classifiers. Same guarantees as
 /// `add_package`'s prechecks — a same-precedence clash fails with zero
-/// writes.
+/// writes. Declared siblings resolve through `pins` (the pod's own
+/// pins/blobs, issue #147) first, falling back to the collection.
 fn precheck_payload_collisions(
     root: &Path,
     decl: &PodDeclaration,
     name: &str,
     payload: &crate::units::PayloadSnap,
     layer: crate::farm::ClaimLayer,
+    pins: &PodPins<'_>,
 ) -> miette::Result<()> {
     // Farm-link bare names (issue #150): the payload's app and service
     // names are `join`ed under the farm dir at emit — validate them with
@@ -1985,7 +2019,7 @@ fn precheck_payload_collisions(
             layer,
         })
         .collect();
-    push_declared_binary_claims(&mut binary_claims, decl, name)?;
+    push_declared_binary_claims(&mut binary_claims, decl, name, Some(pins))?;
     push_loaded_binary_claims(&mut binary_claims, root, decl, name)?;
     resolve_binary_claims(&binary_claims)?;
 
@@ -1998,7 +2032,7 @@ fn precheck_payload_collisions(
             layer,
         })
         .collect();
-    push_declared_service_claims(&mut service_claims, decl, name)?;
+    push_declared_service_claims(&mut service_claims, decl, name, Some(pins))?;
     push_loaded_service_claims(&mut service_claims, root, decl, name)?;
     resolve_service_claims(&service_claims)
 }
@@ -3922,22 +3956,38 @@ fn precheck_binary_collision(
 ) -> miette::Result<()> {
     let mut claims: Vec<BinaryClaim> = Vec::new();
     push_meta_binary_claims(&mut claims, new_meta, new_layer);
-    push_declared_binary_claims(&mut claims, decl, new_name)?;
+    // No `pins`: `add_package` resolves the incoming package from the
+    // collection, so its declared siblings stay collection-resolved
+    // (the sideload path passes the pod's own pins first, issue #147).
+    push_declared_binary_claims(&mut claims, decl, new_name, None)?;
     push_loaded_binary_claims(&mut claims, root, decl, new_name)?;
     resolve_binary_claims(&claims)
 }
 
 /// Collect the binary claims of every declared package except the one
 /// being added, at its layer (own, or overlay when the pod patches it).
+/// With `pins` (the sideload path, issue #147) a sibling the pod pins
+/// and carries resolves from its installed record first — the pod's
+/// own pins/blobs — and only falls back to the collection otherwise.
 fn push_declared_binary_claims(
     claims: &mut Vec<BinaryClaim>,
     decl: &PodDeclaration,
     new_name: &str,
+    pins: Option<&PodPins<'_>>,
 ) -> miette::Result<()> {
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
         if spec.name == new_name {
             continue; // the incoming package's claims are already added
+        }
+        let layer = if decl.overlay.contains_key(&spec.name) {
+            crate::farm::ClaimLayer::Overlay
+        } else {
+            crate::farm::ClaimLayer::Own
+        };
+        if let Some(pkg) = pins.and_then(|p| p.carried(&spec.name)) {
+            push_installed_binary_claims(claims, pkg, layer);
+            continue;
         }
         let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
             miette::miette!("cannot check '{}' for a binary collision: {e}", spec.name)
@@ -3946,11 +3996,6 @@ fn push_declared_binary_claims(
             apply_overlay(&mut meta, patch)
                 .map_err(|e| miette::miette!("overlay of '{}' is invalid: {e}", spec.name))?;
         }
-        let layer = if decl.overlay.contains_key(&spec.name) {
-            crate::farm::ClaimLayer::Overlay
-        } else {
-            crate::farm::ClaimLayer::Own
-        };
         push_meta_binary_claims(claims, &meta, layer);
     }
     Ok(())
@@ -4111,22 +4156,35 @@ fn precheck_service_collision(
 ) -> miette::Result<()> {
     let mut claims: Vec<ServiceClaim> = Vec::new();
     push_meta_service_claims(&mut claims, new_meta, new_layer);
-    push_declared_service_claims(&mut claims, decl, new_name)?;
+    push_declared_service_claims(&mut claims, decl, new_name, None)?;
     push_loaded_service_claims(&mut claims, root, decl, new_name)?;
     resolve_service_claims(&claims)
 }
 
 /// Collect the service claims of every declared package except the one
 /// being added, at its layer (own, or overlay when the pod patches it).
+/// With `pins` (the sideload path, issue #147) a sibling the pod pins
+/// and carries resolves from its installed record first — the pod's
+/// own pins/blobs — and only falls back to the collection otherwise.
 fn push_declared_service_claims(
     claims: &mut Vec<ServiceClaim>,
     decl: &PodDeclaration,
     new_name: &str,
+    pins: Option<&PodPins<'_>>,
 ) -> miette::Result<()> {
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
         if spec.name == new_name {
             continue; // the incoming package's claims are already added
+        }
+        let layer = if decl.overlay.contains_key(&spec.name) {
+            crate::farm::ClaimLayer::Overlay
+        } else {
+            crate::farm::ClaimLayer::Own
+        };
+        if let Some(pkg) = pins.and_then(|p| p.carried(&spec.name)) {
+            push_installed_service_claims(claims, pkg, layer);
+            continue;
         }
         let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
             miette::miette!("cannot check '{}' for a service collision: {e}", spec.name)
@@ -4135,11 +4193,6 @@ fn push_declared_service_claims(
             apply_overlay(&mut meta, patch)
                 .map_err(|e| miette::miette!("overlay of '{}' is invalid: {e}", spec.name))?;
         }
-        let layer = if decl.overlay.contains_key(&spec.name) {
-            crate::farm::ClaimLayer::Overlay
-        } else {
-            crate::farm::ClaimLayer::Own
-        };
         push_meta_service_claims(claims, &meta, layer);
     }
     Ok(())

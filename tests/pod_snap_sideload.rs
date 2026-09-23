@@ -1796,7 +1796,8 @@ gated_test!(constraint_violating_sideload_refused, {
 // Issue #135 (blob-pin polish, rollback trap): rolling back to a
 // generation that predates a blob pin SUCCEEDS — and the report names
 // the stranded pin and its recovery path, instead of leaving the next
-// mutating verb to fail named without warning.
+// mutating verb to fail named without warning. The pod is
+// collection-less: sibling payloads resolve from its own pins (#147).
 gated_test!(rollback_predating_blob_pin_names_recovery, {
     let builder_project = tempfile::tempdir().unwrap();
     let builder_root = tempfile::tempdir().unwrap();
@@ -1831,31 +1832,6 @@ gated_test!(rollback_predating_blob_pin_names_recovery, {
     );
     let project = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
-    // The target's project carries resolvable RECIPES for both packages
-    // (never built — the payloads are the input): the second sideload's
-    // collision precheck resolves the first package's declared claims
-    // from the collection, which a collection-less pod cannot do
-    // (pre-existing limitation, see PR notes).
-    write_pkg_version(
-        project.path(),
-        "apples",
-        "apples",
-        "apples",
-        "1.0",
-        "marker-apples",
-        port,
-        "apples.tar.gz",
-    );
-    write_pkg_version(
-        project.path(),
-        "hello",
-        "hello",
-        "hello",
-        "1.0",
-        "marker-hello",
-        port,
-        "hello.tar.gz",
-    );
 
     // Two sideloads: apples is generation 1, hello is generation 2.
     let (code, _, stderr) = run(
@@ -2093,6 +2069,87 @@ gated_test!(farm_link_refuses_non_bare_app_name, {
         !gen1.join("evil").exists(),
         "no symlink may exist outside the farm dir"
     );
+});
+
+// Issue #147: a collection-less pod ACCUMULATES sideloaded payloads.
+// The second `pod add --snap` of a distinct payload must resolve the
+// already-sideloaded sibling from the pod's own pins/blobs (lockfile
+// `snaps` pin + the store's carried content) — not through the
+// collection, which this project does not have.
+gated_test!(second_sideload_resolves_sibling_from_pod_pins, {
+    // A builder pod produces two distinct payloads.
+    let builder_project = tempfile::tempdir().unwrap();
+    let builder_root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "alpha");
+    make_tarball(server.path(), "beta");
+    let stage = tempfile::tempdir().unwrap();
+    let alpha = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "alpha",
+        "alpha",
+        "alphabin",
+        "1.0",
+        "alpha-ran",
+        port,
+        "alpha.tar.gz",
+    );
+    let beta = build_payload(
+        builder_project.path(),
+        builder_root.path(),
+        stage.path(),
+        "beta",
+        "beta",
+        "betabin",
+        "1.0",
+        "beta-ran",
+        port,
+        "beta.tar.gz",
+    );
+
+    // The target pod's project has NO pkgs/ — collection-less.
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", alpha.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(code, Some(0), "first sideload must succeed: {stderr}");
+    assert_eq!(generation_count(root.path(), "default"), 1);
+
+    // The second, DISTINCT payload: the collision precheck resolves the
+    // declared sibling `alpha` — it must come from the pod's own
+    // pins/blobs, so this add succeeds.
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["add", "--snap", beta.to_str().unwrap(), "--ack-unsigned"],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "second sideload must resolve the sibling from the pod's own pins, \
+         not the collection: {stderr}"
+    );
+    assert_eq!(generation_count(root.path(), "default"), 2);
+    assert_eq!(current_generation(root.path(), "default"), 2);
+
+    // Both payloads pinned: packages (version) + snaps (revision 0).
+    let lock = lockfile(root.path(), "default");
+    assert_eq!(lock["packages"]["alpha"]["version"], "1.0");
+    assert_eq!(lock["packages"]["beta"]["version"], "1.0");
+    assert_eq!(lock["snaps"]["alpha"]["revision"], 0);
+    assert_eq!(lock["snaps"]["beta"]["revision"], 0);
+
+    // The farm exposes both apps.
+    let farm = current_farm(root.path(), "default");
+    assert!(farm.join("alpha").exists(), "farm must expose alpha");
+    assert!(farm.join("beta").exists(), "farm must expose beta");
 });
 
 // Issue #150: the service name rides the same farm seam as the app
