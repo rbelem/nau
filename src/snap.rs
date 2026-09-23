@@ -4538,21 +4538,12 @@ fn run_build(
         || filename.ends_with(".tgz");
     if is_tarball {
         let xtract_spinner = output::spinner(&format!("extracting {}...", meta.name));
-        let tarball_str = tarball.to_string_lossy().to_string();
-        let status = std::process::Command::new("tar")
-            .arg("xaf")
-            .arg(&tarball_str)
-            .arg("-C")
-            .arg(&extract_dir)
-            .current_dir(build_path)
-            .status()
-            .map_err(|e| miette::miette!("tar not found: {}", e))?;
-        if !status.success() {
+        if let Err(e) = extract_tarball(&tarball, &extract_dir) {
             output::finish_err(
                 &xtract_spinner,
                 &format!("extraction failed: {}", meta.name),
             );
-            return Err(miette::miette!("failed to extract {}", filename));
+            return Err(e.wrap_err(format!("failed to extract {filename}")));
         }
         output::finish_ok(&xtract_spinner, &format!("extracted {}", meta.name));
     }
@@ -4777,18 +4768,9 @@ fn fetch_and_extract_source(
         std::fs::create_dir_all(&scratch)
             .map_err(|e| miette::miette!("failed to create extract dir for '{name}': {}", e))?;
         let xtract_spinner = output::spinner(&format!("extracting source '{name}'..."));
-        let status = std::process::Command::new("tar")
-            .arg("xaf")
-            .arg(&tarball)
-            .arg("-C")
-            .arg(&scratch)
-            .status()
-            .map_err(|e| miette::miette!("tar not found: {}", e))?;
-        if !status.success() {
+        if let Err(e) = extract_tarball(&tarball, &scratch) {
             output::finish_err(&xtract_spinner, &format!("extraction failed: {name}"));
-            return Err(miette::miette!(
-                "failed to extract {filename} (source '{name}')"
-            ));
+            return Err(e.wrap_err(format!("failed to extract {filename} (source '{name}')")));
         }
         output::finish_ok(&xtract_spinner, &format!("extracted source '{name}'"));
         match find_source_root(&scratch) {
@@ -6351,6 +6333,65 @@ fn apply_extra_env(cmd: &mut std::process::Command, extra_env: &[(String, String
 /// Find the single top-level directory in a path (the source root
 /// after extracting a tarball). If there's more than one entry or
 /// no entry, returns None.
+/// Extract one source archive into `dest` (issue #170).
+///
+/// Tarballs are unpacked IN-PROCESS with the `tar` crate (the same seam
+/// `dep_fetch` uses for npm closures): gzip via `flate2`, xz via `xz2`,
+/// plain tar raw. Extraction must never depend on whatever `tar` binary
+/// the caller's PATH carries — pod builds run inside user environments
+/// (`shuttle run --pod …`) whose PATH may shadow GNU tar with an
+/// implementation that cannot read the archives real recipes pin
+/// (observed: busybox tar rejects the rust dist tarball's 128 MiB
+/// LZMA2 dictionary with an instant "corrupted data / short read",
+/// while the SHA-256 of the same bytes verified clean).
+///
+/// Permissions, symlinks, and hardlinks are preserved; `unpack` refuses
+/// path-escaping entries, so this is also the safer extractor. Archives
+/// in formats the crates do not cover (bz2, zst, …) fall back to the
+/// external `tar` spawn — the pre-#170 behavior for those extensions.
+pub(crate) fn extract_tarball(archive: &Path, dest: &Path) -> miette::Result<()> {
+    let filename = archive.to_string_lossy();
+    let result = if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
+        let file = std::fs::File::open(archive)
+            .map_err(|e| miette::miette!("opening {}: {e}", archive.display()))?;
+        unpack_tar(flate2::read::GzDecoder::new(file), dest)
+    } else if filename.ends_with(".tar.xz") {
+        let file = std::fs::File::open(archive)
+            .map_err(|e| miette::miette!("opening {}: {e}", archive.display()))?;
+        unpack_tar(xz2::read::XzDecoder::new(file), dest)
+    } else if filename.ends_with(".tar") {
+        let file = std::fs::File::open(archive)
+            .map_err(|e| miette::miette!("opening {}: {e}", archive.display()))?;
+        unpack_tar(file, dest)
+    } else {
+        extract_tarball_external(archive, dest)
+    };
+    result.map_err(|e| miette::miette!("extracting {}: {e}", archive.display()))
+}
+
+/// Decode `reader` as a tar archive and unpack it into `dest`.
+fn unpack_tar<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    archive.set_preserve_permissions(true);
+    archive.unpack(dest)
+}
+
+/// The external-`tar` fallback for formats the in-process crates do not
+/// cover. Same spawn the pre-#170 code used for every archive.
+fn extract_tarball_external(archive: &Path, dest: &Path) -> std::io::Result<()> {
+    let status = std::process::Command::new("tar")
+        .arg("xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("tar exited with {}", status)))
+    }
+}
+
 fn find_source_root(dir: &Path) -> Option<std::path::PathBuf> {
     let mut entries: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(read) = std::fs::read_dir(dir) {
@@ -9896,6 +9937,141 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("'parts' must not be empty"), "got: {err}");
+    }
+
+    // ── Source extraction (issue #170) ──
+
+    /// A 256-byte .tar.xz compressed with a 65 MiB LZMA2 dictionary
+    /// (CRC64 check). Busybox tar — the `tar` a devbox caller PATH
+    /// carries, via `pkgsStatic.busybox` — refuses xz dictionaries above
+    /// 64 MiB with an instant "corrupted data / short read"; the rust
+    /// dist tarball that surfaced #170 is the same class of stream at
+    /// 128 MiB. GNU tar and the in-process xz2 decoder both read it.
+    const HIGH_DICT_XZ_TAR: &str = "/Td6WFoAAATm1rRGBMC/AYBQIQEdAAAAAAAAAKKgclfgJ/8At10AOhvs2GRsWPuPK925ZjPx+H3MtnsiTz1OPmTRHm9K/83eT4zKuTCAA/ooz828VMufwT2klR9q4WqIpgx2likGbDG/5NH43mm9fyuQhcR7oqLir5NwgOIHJVh/ViLfz/ce/znyLiKwu6iDmkl0oj3IufkhW9V5P4w1A+gQ3Dyef54xUgYwdMHansYUPcYmaJY80y/OyW6WNj47tZolCihjb8rxOo2JPrlC4UGrHT5QHgIwlTo+6ptSAAB6/k+UDXORqAAB2wGAUAAACokpB7HEZ/sCAAAAAARZWg==";
+
+    /// Decode the embedded fixture. Its single top-level dir is
+    /// `toolchain-demo-1.0/` holding an executable `echo.txt` and a
+    /// symlink `echo-link` → `echo.txt`.
+    fn high_dict_xz_tarball() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(HIGH_DICT_XZ_TAR)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_extract_tarball_reads_high_dict_xz_in_process() {
+        // The extraction seam decodes toolchain-class xz streams itself,
+        // never through the caller PATH's `tar` binary (issue #170).
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("toolchain.tar.xz");
+        std::fs::write(&archive, high_dict_xz_tarball()).unwrap();
+        let dest = tmp.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        extract_tarball(&archive, &dest).unwrap();
+
+        let tree = dest.join("toolchain-demo-1.0");
+        assert_eq!(
+            std::fs::read_to_string(tree.join("echo.txt")).unwrap(),
+            "#!/bin/sh\n"
+        );
+        assert!(tree.join("echo-link").is_file(), "symlink survived");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tree.join("echo.txt"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "exec bit survived");
+        }
+    }
+
+    #[test]
+    fn test_extract_tarball_gz_and_plain_roundtrip() {
+        use std::io::Write;
+        // One tree, packed two ways: plain .tar and .tar.gz. Both must
+        // land identically through the in-process seam.
+        for name in ["demo.tar", "demo.tar.gz"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let payload = tmp.path().join("payload/demo-1.0");
+            std::fs::create_dir_all(&payload).unwrap();
+            std::fs::write(payload.join("f.txt"), "x").unwrap();
+
+            let mut builder = tar::Builder::new(Vec::new());
+            builder.append_dir_all("demo-1.0", &payload).unwrap();
+            let raw = builder.into_inner().unwrap();
+            let archive = tmp.path().join(name);
+            if name.ends_with(".gz") {
+                let mut enc = flate2::write::GzEncoder::new(
+                    std::fs::File::create(&archive).unwrap(),
+                    flate2::Compression::default(),
+                );
+                enc.write_all(&raw).unwrap();
+                enc.finish().unwrap();
+            } else {
+                std::fs::write(&archive, &raw).unwrap();
+            }
+
+            let dest = tmp.path().join("out");
+            std::fs::create_dir_all(&dest).unwrap();
+            extract_tarball(&archive, &dest).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dest.join("demo-1.0/f.txt")).unwrap(),
+                "x",
+                "{name} roundtrip"
+            );
+        }
+    }
+
+    /// RED/GREEN for #170: a full `run_build` whose source is a
+    /// toolchain-class .tar.xz (65 MiB dictionary — above the busybox
+    /// decode cap). Pre-fix, extraction spawned whatever `tar` the
+    /// process PATH carried: under the devbox gate that is busybox tar,
+    /// which failed exactly like the reported repro ("corrupted data" /
+    /// "short read" / "failed to extract"), so this test fails there.
+    /// Post-fix the in-process xz2 decoder extracts it everywhere. (A
+    /// GNU-tar PATH also passed pre-fix — the test distinguishes
+    /// implementations only where an impaired `tar` leads PATH, which is
+    /// the devbox gate where the bug was found.)
+    #[test]
+    fn test_run_build_extracts_toolchain_profile_xz() {
+        let server = tempfile::tempdir().unwrap();
+        let bytes = high_dict_xz_tarball();
+        std::fs::write(server.path().join("toolchain.tar.xz"), &bytes).unwrap();
+        let port = serve_dir(server.path());
+        let hash = sha256_hex(&bytes);
+
+        let env = LuaEnv::new();
+        let table = env
+            .eval(&format!(
+                r#"
+            return {{
+                default = snap {{
+                    name = "toolchain-demo",
+                    version = "1.0",
+                    type = "source",
+                    source = {{
+                        url = "http://127.0.0.1:{port}/toolchain.tar.xz",
+                        sha256 = "{hash}",
+                    }},
+                    build = 'test -f "$SRC/echo.txt" && touch "$STAGE/ok"',
+                }},
+            }}
+            "#
+            ))
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let stage = tempfile::tempdir().unwrap();
+        let outcome = run_build(&meta, stage.path(), StagePolicy::Default, None, None)
+            .unwrap_or_else(|e| panic!("extraction must survive the caller PATH's tar: {e:#}"));
+        assert_eq!(outcome.sources.len(), 1);
+        assert_eq!(outcome.sources[0].sha256, hash);
+        // The build command ran against the extracted tree.
+        assert!(stage.path().join("ok").exists());
     }
 
     // ── Issue #41: multi-source build inputs ──
