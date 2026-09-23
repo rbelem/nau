@@ -1222,3 +1222,95 @@ gated_test!(refresh_locked_source_still_refuses_moved_bytes, {
         "the refusal must be zero-write"
     );
 });
+
+// After a float's refresh re-resolves and restamps the lock pin (the
+// landed half of issue #175), a later PLAIN SYNC must not re-warn:
+// the recipe's baked-in `source.sha256` is a stale seed once the pin
+// moved — the lock record IS the TOFU baseline (ADR-0017 Decision 4).
+// The sync re-resolves byte-identically (the restamped hash), so: no
+// "re-resolved" warning, no recipe-drift naming, no new generation,
+// the recipe stamp's scheme stays current (migration clause not
+// tripped), and the source pin stays at the restamped hash.
+gated_test!(
+    refresh_restamped_floating_pin_survives_sync_without_drift,
+    {
+        let server = tempfile::tempdir().unwrap();
+        let port = serve_dir(server.path());
+        let hash_a = make_marker_tarball(server.path(), "syncfloat", "sync-float-a");
+        let project = tempfile::tempdir().unwrap().keep();
+        let root = tempfile::tempdir().unwrap().keep();
+        write_pinned_source_pkg(&project, "syncpkg", port, "syncfloat.tar.gz", &hash_a, true);
+        let (code, _, stderr) = run(&project, &root, &["--name", "p", "add", "syncpkg"]);
+        assert_eq!(code, Some(0), "first sync failed: {stderr}");
+        let url = format!("http://127.0.0.1:{port}/syncfloat.tar.gz");
+        let source_pin = |root: &Path, pod: &str| {
+            read_lock(root, pod)["sources"]
+                .get(&url)
+                .and_then(|v| v.get("sha256"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            source_pin(&root, "p").as_deref(),
+            Some(hash_a.as_str()),
+            "the first install records the observed hash (TOFU)"
+        );
+        let gens = generation_count(&root, "p");
+
+        // Upstream moves at the same URL; the refresh re-resolves, warns,
+        // restamps, and lands a new generation (the landed behavior).
+        let hash_b = make_marker_tarball(server.path(), "syncfloat", "sync-float-b");
+        assert_ne!(hash_a, hash_b, "the fixture must serve distinct bytes");
+        let (code, _, stderr) = run(&project, &root, &["--name", "p", "refresh", "syncpkg"]);
+        assert_eq!(
+            code,
+            Some(0),
+            "a floating refresh must re-resolve, not refuse: {stderr}"
+        );
+        assert!(
+            stderr.contains("re-resolved"),
+            "the refresh must warn; stderr={stderr}"
+        );
+        assert!(
+            generation_count(&root, "p") > gens,
+            "moved bytes must land a new generation"
+        );
+        assert_eq!(
+            source_pin(&root, "p").as_deref(),
+            Some(hash_b.as_str()),
+            "the floating source pin must restamp to the new hash"
+        );
+        let gens = generation_count(&root, "p");
+
+        // The residual defect under test: a plain sync re-resolves the
+        // SAME bytes — the restamped lock pin is the baseline now, not the
+        // recipe's stale baked-in seed.
+        let (code, stdout, stderr) = run(&project, &root, &["--name", "p", "sync"]);
+        assert_eq!(code, Some(0), "sync after the restamp failed: {stderr}");
+        assert!(
+            !stderr.contains("re-resolved"),
+            "the restamped pin must be the TOFU baseline — no spurious \
+         re-resolve warning; stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("recipe drift: syncpkg"),
+            "a restamped float is not recipe drift; stdout={stdout} stderr={stderr}"
+        );
+        assert_eq!(
+            generation_count(&root, "p"),
+            gens,
+            "a byte-identical re-resolve must not churn the store"
+        );
+        let lock = read_lock(&root, "p");
+        assert_eq!(
+            lock["packages"]["syncpkg"]["recipe_digest_scheme"].as_u64(),
+            Some(2),
+            "the recipe stamp's scheme must stay current (migration clause not tripped)"
+        );
+        assert_eq!(
+            source_pin(&root, "p").as_deref(),
+            Some(hash_b.as_str()),
+            "the source pin must stay at the restamped hash"
+        );
+    }
+);
