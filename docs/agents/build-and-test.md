@@ -56,7 +56,9 @@ Two blockers, precisely:
    not converge from the devbox side. Caveat: the devbox flake inputs now
    track nixos-unstable, so re-check 1.98.x resolvability there before
    treating the pin as immovable; any move stays a forward-only ratchet
-   commit.
+   commit. Re-probed 2026-09-23: still not resolvable — `rustfmt@1.98.1`
+   and the 1.98.0 quartet all fail with `package not found`, and
+   `devbox search --show-all` tops out at 1.97.1.
 2. ~~**Exposure.**~~ **CLOSED at the farm layer (round 7, commit
    45cabf9):** the farm bin set now emits a shim for every bare
    `cargo-*` sibling recorded beside a declared `cargo` app, so
