@@ -111,7 +111,12 @@ recipe revisions go through `pod remove` → re-add (generation churn on
 gate: 5→24). Concurrent snap builds in one checkout must pass explicit
 `--stage` (two lanes shared the default stage; a watcher caught the
 stage inode flipping mid-build). glibc builds must run inside devbox
-(linux-headers' HOSTCC needs the sandbox gcc).
+(linux-headers' HOSTCC needs the sandbox gcc). Pods carrying a gcc
+payload built before 77964ae still have the broken `c++`; the fix
+reaches them by re-sideload, which b8afa43 makes a same-version blob
+swap (no remove/re-add churn). The payload hash changes again with the
+review fixes (shim -L guard, gcc routed through the shim), so existing
+gate pods need one re-sideload to pick up all three fixes.
 
 ## Round 5 — curl refresh path end to end (#142) (2026-09-23, daily pod, shuttle @ 97bdfaa + #138/#142 in tree, debug build)
 

@@ -21,10 +21,14 @@
 --                 + cpp-14-x86-64-linux-gnu (cc1) + gcc-14 (usr/bin/gcc-14
 --                 symlink) + gcc-14-base (docs) + libgcc-14-dev (crt .o,
 --                 libgcc.a, gcc include/)
---   c++ compiler  g++-14-x86-64-linux-gnu (cc1plus, x86_64-linux-gnu-
---                 c++-14) + libstdc++-14-dev (headers, static lib) +
---                 libstdc++6 (runtime) — cc-rs probes literal `c++` for
---                 C++ build scripts just like `cc` for C
+--   c++ compiler  g++-14-x86-64-linux-gnu (cc1plus, driver
+--                 x86_64-linux-gnu-g++-14) + libstdc++-14-dev (headers,
+--                 static lib) + libstdc++6 (runtime) — cc-rs probes
+--                 literal `c++` for C++ build scripts just like `cc`
+--                 for C. None of these debs ships a `*-c++-14` binary:
+--                 the shim's C++ arm must exec g++-14 (77964ae — the
+--                 first cut pointed at x86_64-linux-gnu-c++-14, a file
+--                 Debian never ships, and every C++ probe died ENOENT).
 --   libc headers  linux-libc-dev (asm/, linux/ — the kernel uapi only;
 --                 NO libc6-dev: the pod's pool glibc payload owns libc
 --                 itself and overlaying Debian's would shadow it)
@@ -61,7 +65,10 @@
 -- apps: cc-rs probes the literal `cc` (C build scripts) and `c++` (C++
 -- build scripts); gcc-14's binaries are triplet-named drivers, so cc and
 -- c++ are declared as apps onto them and land as tree-routed launchers.
--- gcc/g++ stay exposed too. `cc` is the LIBRARY_PATH→-L shim (see build).
+-- gcc/g++ stay exposed too. All four (cc/c++/gcc/g++) route through
+-- `usr/bin/cc`, the LIBRARY_PATH→-L shim (see build) — a raw-driver app
+-- bypasses the translation and links against the host, the exact #164
+-- failure class the shim exists to prevent.
 
 return {
     default = snap {
@@ -216,12 +223,15 @@ return {
             -- into -L so every link searches the pod's payload dirs, and
             -- dispatch on the invoked name: c++/g++/cxx hit the C++
             -- driver (C++ link spec), everything else the C driver.
+            -- Empty segments (leading/trailing colon) are skipped: a
+            -- bare `-L` is an ld operator that consumes the NEXT token,
+            -- not a no-op.
             [[cat > "$STAGE/usr/bin/cc" <<'EOF'
 #!/bin/sh
 d=$(dirname "$(readlink -f "$0")")
 l=
 ifs=$IFS; IFS=:
-for p in $LIBRARY_PATH; do l="$l -L$p"; done
+for p in $LIBRARY_PATH; do [ -n "$p" ] && l="$l -L$p"; done
 IFS=$ifs
 case "${0##*/}" in
   c++|cxx|g++) exec "$d/x86_64-linux-gnu-g++-14" $l "$@" ;;
@@ -241,6 +251,11 @@ chmod +x "$STAGE/usr/bin/cc" && cp "$STAGE/usr/bin/cc" "$STAGE/usr/bin/c++"]],
             'test -x "$STAGE/usr/bin/x86_64-linux-gnu-gcc-14"',
             'test -x "$STAGE/usr/bin/cc"',
             'test -x "$STAGE/usr/bin/c++"',
+            -- Driver existence alone leaves the 77964ae bug class open:
+            -- the shim could still exec anything. Derive every exec
+            -- target from the shim text itself and assert each lands
+            -- executable — the shim↔payload contract, asserted.
+            [[for t in $(sed -n "s/.*exec \"\$d\/\([^\"]*\)\".*/\1/p" "$STAGE/usr/bin/cc"); do test -x "$STAGE/usr/bin/$t" || exit 1; done]],
             'test -x "$STAGE/usr/libexec/gcc/x86_64-linux-gnu/14/cc1"',
             -- The C++ half of the payload must land too (issue #164
             -- follow-up): cc1plus beside cc1, the g++ driver the c++
@@ -257,8 +272,11 @@ chmod +x "$STAGE/usr/bin/cc" && cp "$STAGE/usr/bin/cc" "$STAGE/usr/bin/c++"]],
             cc = app {
                 command = "usr/bin/cc",
             },
+            -- Symmetric with g++: the shim's default arm IS the C
+            -- driver, so gcc rides the same LIBRARY_PATH→-L translation
+            -- instead of bypassing it via the raw triplet driver.
             gcc = app {
-                command = "usr/bin/x86_64-linux-gnu-gcc-14",
+                command = "usr/bin/cc",
             },
             cxx = app {
                 command = "usr/bin/c++",
