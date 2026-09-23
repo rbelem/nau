@@ -49,11 +49,14 @@ Two blockers, precisely:
    it is devbox's nixpkgs that cannot resolve 1.98.x (1.97.1 is the
    newest resolvable there), which is why the two sides cannot converge
    from the devbox side.
-2. **Exposure.** rust.lua's apps map must declare `cargo-clippy` and
-   `cargo-fmt`. The payload already ships both binaries; the existing
-   `clippy` app exposes the entry point under the wrong name for cargo's
-   `cargo-<sub>` PATH discovery, so `cargo clippy`/`cargo fmt` die with
-   `no such command` (round 6 of the gate-pod log).
+2. ~~**Exposure.**~~ **CLOSED at the farm layer (round 7, commit
+   45cabf9):** the farm bin set now emits a shim for every bare
+   `cargo-*` sibling recorded beside a declared `cargo` app, so
+   `cargo clippy`/`cargo fmt` resolve inside `shuttle run` with no
+   payload rebuild; proven pod-side in round 7 (`cargo clippy
+   -- -D warnings` exit 0). The payload keeps shipping both binaries;
+   the apps-map route (declaring `cargo-clippy`/`cargo-fmt` apps)
+   remains an alternative, not a blocker.
 
 Ratchet rule: once the pod is the gate, the pin moves forward only, via
 a dedicated bump commit that lands the forward-fixes first (the code
@@ -61,9 +64,10 @@ changes the newer clippy demands) — never port an older toolchain into a
 newer gate to un-block a lane.
 
 Flip trigger — switch when any of: nixpkgs carries 1.98.x; clippy drift
-grows beyond a handful of diagnostics; or CI runs the pod gate. Until
-then, round 6's negative verdict stands: the pod lint axis cannot replace
-the devbox gate, and the devbox command above remains the verified gate.
+grows beyond a handful of diagnostics; or CI runs the pod gate. With
+exposure closed (round 7), the remaining blocker is the pin itself;
+until the pod carries 1.97.1, round 6's negative verdict stands and the
+devbox command above remains the verified gate.
 
 ### `devbox run` semantics
 
