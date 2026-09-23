@@ -2177,6 +2177,75 @@ pub fn remove_package(
     })
 }
 
+/// Report for `shuttle pod declare --file` (gate-pod gap 5).
+#[derive(Debug, Serialize)]
+pub struct PodDeclareReport {
+    pub pod: String,
+    /// Package names the incoming declaration ADDED vs the previous
+    /// state (an unknown pod reads as empty).
+    pub added: Vec<String>,
+    /// Package names the incoming declaration DROPPED vs the previous
+    /// state.
+    pub removed: Vec<String>,
+    /// The reconcile the declare rode (generation, farm, services).
+    pub sync: PodSyncReport,
+}
+
+/// Declared package names of a declaration (specs are `name` or
+/// `name@constraint`; only the name identifies a package).
+fn declaration_names(decl: &PodDeclaration) -> std::collections::BTreeSet<String> {
+    decl.packages
+        .iter()
+        .filter_map(|spec| parse_pod_package(spec).ok().map(|p| p.name))
+        .collect()
+}
+
+/// Declare a pod from a checked-in `pod.lua` file (gate-pod gap 5):
+/// load + validate the file, make its content the pod's declaration —
+/// REPLACING whatever was there, the file is the source of truth —
+/// then reconcile through the same path add/sync uses (store,
+/// generation chain, bin farm). An unknown pod is initialized.
+///
+/// Fail-closed BEFORE any write: the file must read and evaluate, and
+/// its loads (existence + cycles) and overlays must validate against
+/// the pod. A corrupt existing declaration does not block the replace
+/// — declaring a good file IS the repair; it just reads as
+/// "everything added" in the change summary. The file's bytes are
+/// copied verbatim: the checked-in file stays the pod's declaration,
+/// comments included (later adds/removed re-render it normalized).
+pub fn declare_pod(root: &Path, pod_name: &str, file: &Path) -> miette::Result<PodDeclareReport> {
+    validate_pod_name(pod_name)?;
+    if !file.is_file() {
+        miette::bail!("no such declaration file: {}", file.display());
+    }
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| miette::miette!("could not read {}: {}", file.display(), e))?;
+    let decl = evaluate_pod_source(&file.display().to_string(), &source)?;
+    let previous = load_declaration_or_default(root, pod_name)
+        .map(|old| declaration_names(&old))
+        .unwrap_or_default();
+
+    // Zero-write gates before the declaration swap (issue #8/#6).
+    validate_loads(root, pod_name, &decl)?;
+    validate_overlays(root, &decl, pod_name)?;
+
+    let dir = pod_dir(root, pod_name);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
+    let decl_path = pod_lua_path(root, pod_name);
+    std::fs::write(&decl_path, &source)
+        .map_err(|e| miette::miette!("failed to write {}: {e}", decl_path.display()))?;
+
+    let sync = sync_pod(root, pod_name)?;
+    let declared = declaration_names(&decl);
+    Ok(PodDeclareReport {
+        pod: pod_name.to_string(),
+        added: declared.difference(&previous).cloned().collect(),
+        removed: previous.difference(&declared).cloned().collect(),
+        sync,
+    })
+}
+
 /// Rebuild ONE declared package at its pins (issue #15): the version
 /// pin and the dependency-closure pin stay put — the cached closure is
 /// reused with zero fetches (unlike the remove+add workaround, which

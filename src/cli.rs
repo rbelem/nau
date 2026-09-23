@@ -1078,6 +1078,25 @@ pub enum PodCommand {
         root: Option<String>,
     },
 
+    /// Declare the selected pod from a checked-in `pod.lua` file
+    /// (gate-pod gap 5): the file is loaded, validated, and its content
+    /// becomes the pod's declaration — REPLACING whatever was there,
+    /// the file is the source of truth — then the pod reconciles
+    /// through the same path add/sync uses (store, generation chain,
+    /// bin farm). (Re)initializes an unknown pod.
+    Declare {
+        #[command(flatten)]
+        target: PodTarget,
+
+        /// Path to the `pod.lua` to load.
+        #[arg(long, value_name = "FILE")]
+        file: String,
+
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
+    },
+
     /// Remove a package from the selected pod: drops the declaration
     /// entry and the lockfile pin.
     Remove {
@@ -1265,6 +1284,7 @@ impl PodCommand {
     pub fn pod_name(&self) -> Option<&str> {
         match self {
             PodCommand::Add { target, .. }
+            | PodCommand::Declare { target, .. }
             | PodCommand::Remove { target, .. }
             | PodCommand::Sync { target, .. }
             | PodCommand::Refresh { target, .. }
