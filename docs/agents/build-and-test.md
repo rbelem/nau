@@ -64,10 +64,12 @@ changes the newer clippy demands) — never port an older toolchain into a
 newer gate to un-block a lane.
 
 Flip trigger — switch when any of: nixpkgs carries 1.98.x; clippy drift
-grows beyond a handful of diagnostics; or CI runs the pod gate. With
-exposure closed (round 7), the remaining blocker is the pin itself;
-until the pod carries 1.97.1, round 6's negative verdict stands and the
-devbox command above remains the verified gate.
+grows beyond a handful of diagnostics; or CI runs the pod gate. Both
+blockers are now closed: exposure at the farm layer (round 7) and the
+pin itself (round 8 — the gate pod carries rust 1.97.1, and pod-side
+clippy/fmt verdicts match the devbox pin exactly). The devbox command
+above remains the verified gate until the pod-side switch is ratified;
+when it flips, the pod becomes the single canonical gate.
 
 ### `devbox run` semantics
 
