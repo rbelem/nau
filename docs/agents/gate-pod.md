@@ -8,7 +8,11 @@ drift re-test ran in round 6: drift is real. Round 7 landed the lint
 enablers — the farm exposes the cargo subcommand shims and the one
 clippy error is fixed — so both toolchains' lint axes now pass this
 repo pod-side with no caller shims (see Round 7 + gap 2; the
-toolchain-version contract decision stays open). All claims come from commands
+toolchain-version contract decision stays open). Round 8 re-pinned the
+payload: the gate pod now carries 1.97.1 — the pinned toolchain — and
+pod/devbox lint verdicts are identical by construction (see Round 8 +
+gap 2; what remains of the lint axis is policy documentation in
+build-and-test.md, not code). All claims come from commands
 run on NixOS 26.11, shuttle 0.1.0.
 
 ## What worked
@@ -375,6 +379,142 @@ stricter verdict as the contract) stays open for the repo owner. The
 devbox lint gate remains the default until that call is made — but the
 pod-side axis is now runnable and matching, not blocked.
 
+## Round 8 (2026-09-23, pin-1971 @ f5aa68d, debug build) — the pod carries the pinned toolchain
+
+The council-resolved endgame step for the lint axis: the payload must
+FOLLOW the devbox pin, not outrun it. Pod clippy 0.1.98 was strictly
+stricter than the pinned 0.1.97 — a different verdict set, so the pod
+gate could re-split from devbox on future source (round 7's honest
+limit). `pkgs/r/rust.lua` is a FETCH recipe — the official
+static.rust-lang.org dist tarball — so the older point release is
+trivially fetchable (it is devbox's nixpkgs that cannot resolve
+1.98.x, never the dist archive). Re-pinned to 1.97.1, payload
+rebuilt, sideloaded as a version move (1.98.1 → 1.97.1), drift
+experiment re-run: the pod's lint verdicts now MATCH the devbox pin
+exactly.
+
+1. **Re-pin.** `version = "1.97.1"`; source URL
+   `https://static.rust-lang.org/dist/2026-07-16/rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz`;
+   sha256 `88f28fa9af20594179f85d6df67078dfd6fa93e2f6da5e1e9b0ac4997988ca4f`,
+   from the signed channel manifest (`channel-rust-1.97.1.toml`,
+   `date = "2026-07-16"`,
+   `[pkg.rust.target.x86_64-unknown-linux-gnu]` → `xz_hash`) and
+   triple-checked by hashing the downloaded 201,303,968-byte tarball
+   (`sha256sum` → identical, two independent grounds). The build's own
+   fetch gate verified it again:
+
+        ✓ SHA-256 verified: 88f28fa9af205941...
+
+   Component set unchanged — the tarball carries the same
+   dist-root layout (cargo/, rustc/ with lib/ + libexec/,
+   rust-std-x86_64-unknown-linux-gnu/, clippy-preview/,
+   rustfmt-preview/) the build script merges; recipe structure and
+   style untouched.
+
+2. **Payload build** (explicit `--stage`,
+   `CURL_CA_BUNDLE` exported for the farm-curl fetch):
+
+        ✓ rust_1.97.1_amd64.snap                    (174,718,976 B)
+        source pinned: 88f28fa9af20594179f85d6df67078dfd6fa93e2f6da5e1e9b0ac4997988ca4f https://static.rust-lang.org/dist/2026-07-16/rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz
+
+   Two traps hit on the way, both now operational notes: the first
+   uncached chain build needs devbox (linux-headers HOSTCC — round 4
+   note, unchanged), and the payload leg itself needs a GNU tar/xz
+   shim ahead of the documented PATH prepends (busybox tar/xz in the
+   bwrap profile dir die on the rust dist tarball's multi-stream xz —
+   see operational notes below). `-A amd64` is required: glibc
+   declares an arm64 leg the host refuses to cross-build.
+
+3. **Sideload — a version move, accepted by the add path by design**
+   (no remove/re-add, no generation churn beyond the one):
+
+        ✓ sideloaded 'rust' (1.97.1) into pod 'gate' (generation 39)
+
+   `--ack-unsigned` as expected (payload built by this recipe; the
+   signing ceremony is still pending, ADR-0011 step (e)). Then
+   `pod --name gate sync` — held all five packages at their pins
+   (`held 'rust' at its pin`), `generation 39 current`, farm
+   re-emitted at `generations/39/farm`. `pod list`:
+
+        linux-headers  7.0
+        libgcc         14.2.0
+        rust           1.97.1
+        glibc          2.43
+        gcc            14.2.0
+
+   and the farm exposes all six toolchain entries: `cargo`,
+   `cargo-clippy`, `cargo-fmt`, `clippy`, `rustc`, `rustfmt`.
+
+4. **The parity proof** — from this tree, raw caller shell, NO shims,
+   NO `CURL_CA_BUNDLE` in the run env. Versions through the pod run:
+
+        $ shuttle run --pod gate -- cargo clippy --version
+        clippy 0.1.97 (8bab26f4f6 2026-07-14)
+        $ shuttle run --pod gate -- rustc --version
+        rustc 1.97.1 (8bab26f4f 2026-07-14)
+        $ shuttle run --pod gate -- cargo --version
+        cargo 1.97.1 (c980f4866 2026-06-30)
+        $ shuttle run --pod gate -- cargo fmt --version
+        rustfmt 1.9.0-stable (8bab26f4f6 2026-07-14)
+
+   Clippy axis — every dep crate checked fresh under the pod's 1.97.1
+   (the official dist build, `8bab26f4f6` — a different rustc binary
+   from devbox's nixpkgs build, so cargo fingerprints differ and
+   nothing is shared through target/):
+
+        $ time shuttle run --pod gate -- cargo clippy -- -D warnings
+          Checking serde_yaml v0.9.34+deprecated
+          … (every dep crate, then)
+          Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 17s
+        real    1m17,744s
+        # exit 0; zero diagnostics
+
+   Devbox side (`devbox run -- clippy`): exit 0, zero diagnostics,
+   1m13.8s (it rechecked after the pod run — each side rebuilds the
+   other's artifacts, but the verdicts are what matter and they are
+   identical). Fmt axis: pod `shuttle run --pod gate -- cargo fmt
+   --check` exit 0, empty output, 1.3s; devbox `devbox run --
+   fmt-check` exit 0, empty, 0.9s.
+
+**Verdict:** the pod lint gate now carries the pinned toolchain; pod
+and devbox verdicts are identical — same toolchain (rustc 1.97.1 /
+clippy 0.1.97 / rustfmt 1.9.0 on both sides). Round 6's drift
+mechanism (a 1.98-only lint rejecting source 1.97 accepts) is
+structurally closed: there is no 1.98 in the gate anymore. Gap 2's
+code axis is done; what remains of the lint axis is policy —
+documenting in build-and-test.md when the pod-side axis may stand in
+for the devbox gate (another lane owns that file).
+
+Operational notes (round 8): the documented round-1 PATH prepends
+shadow GNU tar/xz with busybox — the bwrap profile dir
+(`91rl324p7yidwakn63rnxwl5ch540mg5-profile/bin`) carries its own
+`tar` and `xz`, and busybox's decompressor dies on the rust dist
+tarball's multi-stream xz stream AFTER the sha256 verify passes (the
+bytes on disk are correct; the decompressor, not the archive, is
+what fails — three builds were burned finding this):
+
+    xz: corrupted data
+    tar: Child returned status 1
+    Error:   × failed to extract rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz
+
+Repair is caller-side and one dir: prepend a shim directory holding
+GNU tar/xz symlinks (here `/run/current-system/sw/bin/{tar,xz}`)
+AHEAD of the two documented prepend dirs. Under devbox the same trap
+fires with no prepends at all — devbox's own profile tar IS busybox
+(`tar (busybox) 1.37.0`). Separately: `-A amd64` is mandatory for
+chain builds here — glibc declares an arm64 leg the host refuses
+("refusing to build for 'arm64' on this amd64 host: no cross
+toolchain is configured…"). On the gcc c++ shim: the feared stale
+payload is already gone — the gate pod's gcc payload as installed in
+generation 38 (pre-dating this lane, which touched only rust)
+carries the post-77964ae dispatch
+(`c++|cxx|g++) exec "$d/x86_64-linux-gnu-g++-14"`), and a C++
+compile through the pod succeeds (`shuttle run --pod gate -- c++ -o
+… exit 0`, 18,888-byte binary produced). Should a stale gcc payload
+ever reappear, the documented repair is a same-version re-sideload
+of a rebuilt payload — content hash is the identity since b8afa43;
+gcc.lua is another lane's file, untouched here.
+
 ## Gap list to make this the default gate
 
 1. ~~**C toolchain payload (blocking, cargo layer).**~~ **CLOSED in
@@ -390,11 +530,16 @@ pod-side axis is now runnable and matching, not blocked.
    PATH shims; (b) the one-line source fix (`src/isolate.rs:1081`,
    `format!("{e}")` → `e.to_string()`) dissolves the divergence for
    this repo — both toolchains' clippy and fmt axes pass, pod-side and
-   devbox-side (round 7 evidence). STILL OPEN, policy not code: the
-   toolchain-version decision — keep the 1.97.1 pin or adopt 1.98.1's
-   stricter verdict as the contract. Pod clippy 0.1.98 remains
-   strictly stricter than 0.1.97 in general, so the two gates can
-   re-split on future source until the owner picks the contract.
+   devbox-side (round 7 evidence). Round 8 removed the last code
+   dimension: the payload now follows the devbox pin (rust 1.97.1 in
+   the pod, sideloaded as a version move), so pod clippy IS 0.1.97 —
+   the "keep the 1.97.1 pin vs adopt 1.98.1's stricter verdict"
+   contract question is dissolved in code rather than picked: there is
+   no 1.98 verdict set in the gate anymore, and the round-6 re-split
+   mechanism is structurally gone (round 8 evidence). REMAINING,
+   policy not code: document in build-and-test.md when the pod-side
+   axis may substitute for the devbox gate (another lane owns that
+   file).
 3. **Sandbox C compiler at the recipe layer (narrowed).** From-recipe
    provisioning of rust still needs the glibc chain; with the gcc
    payload now a recipe, a pod can declare gcc as a build tool instead
@@ -419,4 +564,5 @@ pod-side axis is now runnable and matching, not blocked.
    identity, replacement runs the full gate chain (b8afa43).
 
 State left behind: gate pod provisioned with linux-headers, libgcc,
-glibc (soname ld scripts), rust 1.98.1, gcc 14.2.0 — generation 22+.
+glibc (soname ld scripts), rust 1.97.1 (round 8 re-pin), gcc 14.2.0
+(post-77964ae c++ shim) — generation 39.
