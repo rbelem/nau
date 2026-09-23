@@ -465,6 +465,31 @@ case "\${0##*/}" in
 esac
 EOF
 chmod +x "$STAGE/usr/bin/cc" && cp "$STAGE/usr/bin/cc" "$STAGE/usr/bin/c++"]],
+            -- binutils tool shims: the deb set's plain /usr/bin/ar, as,
+            -- ld, ... are relative symlinks to triplet binaries whose
+            -- DT_NEEDED (libbfd, libopcodes, ...) live in the payload's
+            -- multiarch lib dir. A pod run has the farm LD wrapper to
+            -- supply it; a MERGED BUILD PREFIX (build_deps consumer,
+            -- ADR-0018) has no such wrapper — libtool's first `ar` call
+            -- died loading libbfd (#171 gap-3 proof). Each shim self-
+            -- locates via readlink -f (works in stage, store blob and
+            -- extension layouts alike), prepends its own payload's
+            -- multiarch dir to LD_LIBRARY_PATH (never clobbering an
+            -- existing one), and execs the triplet binary named after
+            -- its own invoked name. Authored per arch ($t bakes the
+            -- triplet; everything \$-escaped stays a runtime variable).
+            [[for x in ar as ld nm ranlib strip objcopy objdump readelf strings size addr2line; do
+  rm -f "$STAGE/usr/bin/$x"
+  cat > "$STAGE/usr/bin/$x" <<EOF
+#!/bin/sh
+d=\$(dirname "\$(readlink -f "\$0")")
+n=\${0##*/}
+LD_LIBRARY_PATH="\$d/../lib/$t\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+exec "\$d/$t-\$n" "\$@"
+EOF
+  chmod +x "$STAGE/usr/bin/$x" || exit 1
+done]],
             -- The driver must find cc1 (usr/libexec) relative to itself
             -- and as/ld on PATH; assert the spine exists so a failed
             -- extraction cannot silently produce an empty toolchain.
@@ -509,11 +534,11 @@ chmod +x "$STAGE/usr/bin/cc" && cp "$STAGE/usr/bin/cc" "$STAGE/usr/bin/c++"]],
             },
             -- The binutils apps are arch-neutral on purpose: the recipe
             -- is evaluated once for all arches, so an app command cannot
-            -- vary per port — but Debian's binutils deb ships plain
-            -- /usr/bin/ar, as, ld, ... as relative symlinks to the
-            -- triplet binaries in EVERY port, so the same command lands
-            -- on the right driver per payload (#171; previously these
-            -- pointed at x86_64-linux-gnu-* directly).
+            -- vary per port — but the payload ships plain /usr/bin/ar,
+            -- as, ld, ... (authored as self-locating shims, see build)
+            -- in EVERY port, so the same command lands on the right
+            -- driver per payload (#171; previously these pointed at
+            -- x86_64-linux-gnu-* directly).
             ar = app {
                 command = "usr/bin/ar",
             },
