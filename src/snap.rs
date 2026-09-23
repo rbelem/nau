@@ -2944,6 +2944,13 @@ pub fn check_explicit_stage(stage_dir: &Path) -> miette::Result<()> {
 /// the lock when the fd closes — on drop or on crash. The empty lock
 /// file is simply left behind (deleting it would reintroduce an
 /// unlink/unlock race); no stale-lock cleanup exists or is needed.
+///
+/// Scope: `flock(2)` is SINGLE-HOST mutual exclusion (on NFS it is
+/// client-local, since Linux 2.6.12) — this lock never coordinates
+/// builds across machines. And it covers the default stage only:
+/// explicit `--stage` directories are never locked — they are
+/// user-owned, so sharing one across concurrent builds is the user's
+/// responsibility.
 #[derive(Debug)]
 pub struct StageLock {
     /// Held open for the lock's lifetime: closing this fd releases the
