@@ -110,10 +110,11 @@ const POD_TOOLS: [(&str, &str); 4] = [
 ];
 
 /// Pod-scope build toolchain (#97): the sandbox tools plus the C++
-/// driver the vendored Luau analyzer needs. The cc/c++ fixes name the
-/// distro package per install.sh's map (g++, gcc-c++ on dnf/zypper);
-/// `sh`/`make` have no install.sh entry, so they keep the sandbox
-/// phrasing.
+/// driver the vendored Luau analyzer needs. The cc/c++ fixes lead with
+/// the gcc payload sideload (issue #164 follow-up: one payload carries
+/// cc and c++), keeping the distro packages as the fallback per
+/// install.sh's map (g++, gcc-c++ on dnf/zypper); `sh`/`make` have no
+/// payload, so they keep the sandbox phrasing.
 const POD_SANDBOX_TOOLS: [(&str, &str); 4] = [
     (
         "sh",
@@ -126,11 +127,15 @@ const POD_SANDBOX_TOOLS: [(&str, &str); 4] = [
     ),
     (
         "cc",
-        "install g++ (e.g. apt install g++, dnf install gcc-c++)",
+        "sideload the gcc payload (`shuttle pod add --ack-unsigned --snap \
+         gcc_14.2.0.snap` — carries cc and c++), or install gcc system-wide \
+         (e.g. NixOS systemPackages, apt install gcc)",
     ),
     (
         "c++",
-        "install g++ (e.g. apt install g++, dnf install gcc-c++)",
+        "sideload the gcc payload (`shuttle pod add --ack-unsigned --snap \
+         gcc_14.2.0.snap` — carries cc and c++), or install g++ (e.g. apt \
+         install g++, dnf install gcc-c++)",
     ),
 ];
 
@@ -2204,9 +2209,10 @@ CONFIG_EXT4_FS=y
     }
 
     #[test]
-    fn pod_scope_hints_name_the_distro_packages() {
+    fn pod_scope_hints_lead_with_payload_and_keep_distro_fallback() {
         // install.sh's pkg_for map: squashfs-tools, bubblewrap, curl, tar,
-        // and g++ (gcc-c++ on dnf/zypper) for cc/c++.
+        // and g++ (gcc-c++ on dnf/zypper) for cc/c++ — the latter now the
+        // FALLBACK text behind the gcc payload sideload (#164 follow-up).
         for (tool, fix) in POD_TOOLS {
             assert!(!fix.is_empty(), "{tool} must carry a fix hint");
             assert!(
@@ -2225,10 +2231,25 @@ CONFIG_EXT4_FS=y
         for (tool, fix) in POD_SANDBOX_TOOLS {
             match tool {
                 "cc" | "c++" => {
+                    // The gcc payload sideload leads (#164 follow-up: one
+                    // payload carries cc and c++); the install.sh distro
+                    // packages stay as the fallback text.
                     assert!(
-                        fix.contains("g++") && fix.contains("gcc-c++"),
-                        "{tool} hint must name the distro packages per install.sh: {fix}"
+                        fix.contains("gcc payload")
+                            && fix.contains("pod add")
+                            && fix.contains("cc and c++"),
+                        "{tool} hint must lead with the gcc payload sideload: {fix}"
                     );
+                    match tool {
+                        "cc" => assert!(
+                            fix.contains("apt install gcc"),
+                            "cc hint must keep the distro fallback per install.sh: {fix}"
+                        ),
+                        _ => assert!(
+                            fix.contains("g++") && fix.contains("gcc-c++"),
+                            "c++ hint must keep the distro packages per install.sh: {fix}"
+                        ),
+                    }
                 }
                 _ => assert!(!fix.is_empty(), "{tool} must carry a fix hint"),
             }
