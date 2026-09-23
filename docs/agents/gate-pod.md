@@ -228,7 +228,7 @@ gate needs exactly one more payload — a C toolchain. The clippy/fmt
 drift question (pod 1.98.1 vs devbox 1.97.1) stays unobservable until
 `cargo build` goes green.
 
-## Round 5 (2026-09-23, lint-drift @ 97bdfaa, debug build) — clippy/fmt drift re-test
+## Round 6 (2026-09-23, lint-drift @ 97bdfaa, debug build) — clippy/fmt drift re-test
 
 The round-4-unblocked experiment, executed: both toolchains' lint axis
 against this repo, verdicts diffed. Toolchains: devbox = rustc 1.97.1 /
@@ -301,7 +301,7 @@ this round — no claim upgraded.
 1. ~~**C toolchain payload (blocking, cargo layer).**~~ **CLOSED in
    round 4** (#164): fetch-merge gcc 14.2 payload + loader-seam fixes;
    cargo build scripts compile in the pod.
-2. ~~**Clippy/fmt drift re-test (unblocked).**~~ **ANSWERED in round 5:
+2. ~~**Clippy/fmt drift re-test (unblocked).**~~ **ANSWERED in round 6:
    drift is real — the pod cannot replace the devbox lint gate yet.**
    Two blockers remain: (a) the farm bin set does not expose
    `cargo-clippy`/`cargo-fmt` (the rust payload *ships* them under
@@ -331,10 +331,11 @@ this round — no claim upgraded.
 5. **`pod declare --file` (plan §6).** `pod.lua` is write-only today
    (`add`/`remove` maintain it); no checked-in `gate/pod.lua` until a verb
    can load one.
-6. Minor: `doctor --pod`'s cc hint names apt/dnf only — now it should
-   name the gcc payload. Minor: same-version blob-swap refusal forces
-   remove/re-add churn on recipe revisions. Minor: default-stage
-   sharing between concurrent builds (mitigate with explicit `--stage`).
+6. Minor: default-stage sharing between concurrent builds (mitigate
+   with explicit `--stage`). Landed from this list: the doctor cc/c++
+   hints now lead with the gcc payload sideload (756fc92) and the
+   same-version blob-swap refusal is gone — content hash is the
+   identity, replacement runs the full gate chain (b8afa43).
 
 State left behind: gate pod provisioned with linux-headers, libgcc,
 glibc (soname ld scripts), rust 1.98.1, gcc 14.2.0 — generation 22+.
