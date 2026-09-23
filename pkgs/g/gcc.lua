@@ -29,9 +29,19 @@
 --                 the shim's C++ arm must exec g++-14 (77964ae — the
 --                 first cut pointed at x86_64-linux-gnu-c++-14, a file
 --                 Debian never ships, and every C++ probe died ENOENT).
---   libc headers  linux-libc-dev (asm/, linux/ — the kernel uapi only;
---                 NO libc6-dev: the pod's pool glibc payload owns libc
---                 itself and overlaying Debian's would shadow it)
+--   kernel uapi    NONE — the deb set must not restage owned subtrees:
+--                 kernel uapi headers (asm/, linux/, asm-generic/) are
+--                 owned by the pool `linux-headers` payload, which is in
+--                 every merged build prefix that contains gcc (gcc
+--                 requires glibc, glibc requires linux-headers — one
+--                 owning payload per shared subtree, the same rule as the
+--                 NO libc6-dev exclusion below; the linux-libc-dev deb
+--                 used to ship asm-generic/errno.h and collided with
+--                 linux-headers in the prefix merge, issue #174). A
+--                 build-time assertion fails loudly if any future deb in
+--                 the set reintroduces uapi paths.
+--                 NO libc6-dev either: the pod's pool glibc payload owns
+--                 libc itself and overlaying Debian's would shadow it
 --   binutils      binutils + binutils-common + binutils-x86-64-linux-gnu
 --                 + libbinutils + libsframe1 + libctf0 + libctf-nobfd0
 --                 + libjansson4 (as/ld/ar/nm/strip and the shared libs
@@ -127,10 +137,12 @@ return {
                 url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/g/gcc-14/libgcc-14-dev_14.2.0-19_amd64.deb",
                 sha256 = "ca6f2d36d96b19b3eb71405b0b80134d8c89380b02204a2512e5c58ceb090628",
             },
-            ["linux-libc-dev"] = {
-                url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/l/linux/linux-libc-dev_6.12.38-1_all.deb",
-                sha256 = "85b85662ef28e31364d6b00b041fade0ebcf649a368cc3e7899c2e2b87b77a46",
-            },
+            -- NO linux-libc-dev here (issue #174): it ships the kernel uapi
+            -- headers (usr/include/asm-generic/, linux/), which are owned
+            -- by the pool linux-headers payload — staging them here made
+            -- the merged build prefix fail closed on differing shared
+            -- content ("usr/include/asm-generic/errno.h differs between
+            -- 'linux-headers' and 'gcc'"). The build asserts the absence.
             binutils = {
                 url = "https://snapshot.debian.org/archive/debian/20250815T000000Z/pool/main/b/binutils/binutils_2.44-3_amd64.deb",
                 sha256 = "6bc08c02539ba53b5e748142397144c499f9b20b5fa9bb56431545db124addeb",
@@ -204,7 +216,11 @@ return {
             'dpkg-deb -x "$SRC/gcc-14" "$STAGE"',
             'dpkg-deb -x "$SRC/gcc-14-base" "$STAGE"',
             'dpkg-deb -x "$SRC/libgcc-14-dev" "$STAGE"',
-            'dpkg-deb -x "$SRC/linux-libc-dev" "$STAGE"',
+            -- Ownership lock (#174): kernel uapi headers belong to the
+            -- pool linux-headers payload (transitively in every prefix
+            -- carrying gcc, via glibc). No deb in this set may restage
+            -- them — fail loudly instead of colliding in the prefix merge.
+            'test ! -e "$STAGE/usr/include/asm-generic" || { echo "gcc payload: staged usr/include/asm-generic — kernel uapi is owned by the linux-headers payload; a deb in this set ships uapi headers (issue #174)" >&2; exit 1; }',
             'dpkg-deb -x "$SRC/binutils" "$STAGE"',
             'dpkg-deb -x "$SRC/binutils-common" "$STAGE"',
             'dpkg-deb -x "$SRC/binutils-x86-64-linux-gnu" "$STAGE"',
