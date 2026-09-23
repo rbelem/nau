@@ -2282,6 +2282,7 @@ dependencies = [
  "tar",
  "tempfile",
  "toml",
+ "xz2",
  "zip",
 ]
 

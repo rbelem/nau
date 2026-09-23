@@ -40,6 +40,12 @@ indicatif = "0.18"
 # vendors (kept at identical versions; no new vendored code).
 flate2 = "1"
 tar = "0.4"
+# Source tarball extraction (issue #170): .tar.xz sources decode in-process
+# with the same xz2 0.1.7 already in the lock (zip's dependency — the crate
+# set does not change). Extracting must not depend on whatever `tar` binary
+# the caller's PATH happens to carry: busybox tar rejects the high-dictionary
+# xz streams toolchain tarballs ship (rust dist = 128 MiB dict).
+xz2 = "0.1"
 # Go module zips (ADR-0017 extension, issue #40): the module proxy serves
 # each module as a ZIP archive (not a tar), read in-process at fetch time
 # with the standard library's DEFLATE stack — data-only, nothing executes.

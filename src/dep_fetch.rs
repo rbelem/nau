@@ -272,16 +272,10 @@ fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<PathBuf> {
     let src_dir = work.join("src");
     std::fs::create_dir_all(&src_dir)
         .map_err(|e| miette::miette!("creating {}: {e}", src_dir.display()))?;
-    let status = std::process::Command::new("tar")
-        .arg("xf")
-        .arg(&tarball)
-        .arg("-C")
-        .arg(&src_dir)
-        .status()
-        .map_err(|e| miette::miette!("tar not found: {e}"))?;
-    if !status.success() {
-        return Err(miette::miette!("failed to extract {filename}"));
-    }
+    // Issue #170: extraction is in-process (crate::snap::extract_tarball) —
+    // never at the mercy of the caller PATH's `tar` binary.
+    crate::snap::extract_tarball(&tarball, &src_dir)
+        .map_err(|e| e.wrap_err(format!("failed to extract {filename}")))?;
     crate::output::finish_ok(&spinner, &format!("fetched source of {}", meta.name));
     Ok(find_source_root(&src_dir))
 }
