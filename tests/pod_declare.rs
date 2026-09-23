@@ -142,6 +142,45 @@ fn write_pkg(project: &Path, name: &str, bin: &str, marker: &str, port: u16) {
     std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
 }
 
+/// Like `write_pkg`, but the exported app key is `app` — lets two
+/// different packages claim the SAME binary name for the collision
+/// precheck.
+fn write_pkg_exporting(project: &Path, name: &str, app: &str, marker: &str, port: u16) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let dir = project.join("pkgs").join(letter.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "{name}",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/{name}.tar.gz",
+    build = "mkdir -p $STAGE/bin && echo '#!/bin/sh' > $STAGE/bin/{app} && echo 'echo {marker}' >> $STAGE/bin/{app} && chmod +x $STAGE/bin/{app}",
+    apps = {{ {app} = {{ command = "bin/{app}" }} }},
+}} }}
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
+/// A resolvable package whose build always fails — the declare-time
+/// reconcile failure (declaration written, sync refuses).
+fn write_failing_pkg(project: &Path, name: &str, port: u16) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let dir = project.join("pkgs").join(letter.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "{name}",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/{name}.tar.gz",
+    build = "exit 1",
+    apps = {{ }},
+}} }}
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
 /// A checked-in pod.lua declaring the given packages verbatim.
 fn write_pod_file(project: &Path, file_name: &str, packages: &[&str]) -> PathBuf {
     let list = packages
@@ -409,5 +448,146 @@ gated_test!(declare_invalid_file_fails_loud_leaving_pod_untouched, {
         snapshot(&pod_lock(root.path(), "default")),
         lock_before,
         "lockfile must be untouched on failure"
+    );
+});
+
+gated_test!(
+    declare_unknown_package_refuses_leaving_pod_byte_identical,
+    {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let port = serve_dir(server.path());
+        make_tarball(server.path(), "hello");
+        write_pkg(project.path(), "hello", "hello", "pod-ghost-hello", port);
+        let good = write_pod_file(project.path(), "pod-a.lua", &["hello"]);
+
+        // Seed a healthy pod through the same verb.
+        let (code, _, stderr) = run(
+            project.path(),
+            root.path(),
+            &["declare", "--file", good.to_str().unwrap()],
+        );
+        assert_eq!(code, Some(0), "seed declare failed: {stderr}");
+
+        let decl_before = snapshot(&pod_lua(root.path(), "default"));
+        let lock_before = snapshot(&pod_lock(root.path(), "default"));
+
+        // The bad file names a package the collection cannot resolve. The
+        // whole-declaration precheck must refuse BEFORE the swap — the old
+        // declaration stays byte-identical instead of wedging the pod.
+        let bad = write_pod_file(project.path(), "pod-ghost.lua", &["ghost"]);
+        let (code, _, stderr) = run(
+            project.path(),
+            root.path(),
+            &["declare", "--file", bad.to_str().unwrap()],
+        );
+        assert_eq!(code, Some(1));
+        assert!(
+            stderr.contains("ghost"),
+            "error must name the unresolvable package: {stderr}"
+        );
+        assert!(
+            stderr.contains("cannot declare"),
+            "error must come from the declare precheck: {stderr}"
+        );
+        assert_eq!(
+            snapshot(&pod_lua(root.path(), "default")),
+            decl_before,
+            "pod.lua must be byte-identical on refusal"
+        );
+        assert_eq!(
+            snapshot(&pod_lock(root.path(), "default")),
+            lock_before,
+            "lockfile must be untouched on refusal"
+        );
+    }
+);
+
+gated_test!(declare_colliding_binaries_refuse_before_write, {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "hello");
+    make_tarball(server.path(), "ibex");
+    // Both packages export the SAME app key — a same-precedence
+    // (own-layer) binary collision when declared together.
+    write_pkg_exporting(project.path(), "hello", "clash", "pod-clash-hello", port);
+    write_pkg_exporting(project.path(), "ibex", "clash", "pod-clash-ibex", port);
+    let good = write_pod_file(project.path(), "pod-a.lua", &["hello"]);
+
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["declare", "--file", good.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(0), "seed declare failed: {stderr}");
+
+    let decl_before = snapshot(&pod_lua(root.path(), "default"));
+    let lock_before = snapshot(&pod_lock(root.path(), "default"));
+
+    let colliding = write_pod_file(project.path(), "pod-clash.lua", &["hello", "ibex"]);
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["declare", "--file", colliding.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("shipped by both"),
+        "error must name the same-precedence collision: {stderr}"
+    );
+    // Refusal is pre-write: the pod keeps its previous declaration and
+    // its pin instead of wedging until a re-declare.
+    assert_eq!(
+        snapshot(&pod_lua(root.path(), "default")),
+        decl_before,
+        "pod.lua must be byte-identical on refusal"
+    );
+    assert_eq!(
+        snapshot(&pod_lock(root.path(), "default")),
+        lock_before,
+        "lockfile must be untouched on refusal"
+    );
+});
+
+gated_test!(declare_sync_failure_names_written_declaration, {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    make_tarball(server.path(), "breaks");
+    // Resolves fine (the prechecks pass), but its build always fails —
+    // the post-write reconcile failure.
+    write_failing_pkg(project.path(), "breaks", port);
+    let file = write_pod_file(project.path(), "pod-broken.lua", &["breaks"]);
+
+    let (code, _, stderr) = run(
+        project.path(),
+        root.path(),
+        &["declare", "--file", file.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(1));
+    // The wrap names that the declaration WAS written and gives the
+    // convergence verb (short fragments — miette wraps at 80 columns).
+    assert!(
+        stderr.contains("declaration written"),
+        "error must say the declaration was written: {stderr}"
+    );
+    assert!(
+        stderr.contains("reconcile"),
+        "error must name the failed reconcile: {stderr}"
+    );
+    assert!(
+        stderr.contains("sync"),
+        "error must point at `shuttle pod sync`: {stderr}"
+    );
+    // The post-write contract (same residual as add_package): the new
+    // declaration stays in place for the converging re-run.
+    let declared = std::fs::read_to_string(pod_lua(root.path(), "default")).unwrap();
+    assert!(
+        declared.contains("breaks"),
+        "the failed reconcile must leave the declaration in place:\n{declared}"
     );
 });

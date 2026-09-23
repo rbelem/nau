@@ -1921,6 +1921,11 @@ fn sideload_readd_report(
         return Ok(Some(PodSnapAddReport {
             pod: pod_name.to_string(),
             name: name.to_string(),
+            // Invariant: the `installed.is_some_and(...)` guard above
+            // makes this map always `Some`, so the `unwrap_or_default`
+            // fallback is dead code — and deliberately fail-closed if
+            // the guard ever loosened ("" violates every constraint,
+            // it never silently matches one).
             version: installed.map(|p| p.version.clone()).unwrap_or_default(),
             sha3_384: sha3_384.to_string(),
             noop: true,
@@ -2223,19 +2228,66 @@ fn declaration_names(decl: &PodDeclaration) -> std::collections::BTreeSet<String
         .collect()
 }
 
+/// Whole-declaration prechecks for `declare_pod`: the file REPLACES the
+/// pod's package set, so — unlike [`add_package`], which prechecks one
+/// incoming package against the post-state — every declared name must
+/// resolve from the collection (with its overlay applied) and the FULL
+/// post-state set must pass the binary + service collision checks
+/// BEFORE the file is written. A declared file naming a nonexistent
+/// package, or a set that collides, must refuse fail-closed (zero
+/// writes), not wedge the pod until it is re-declared with the old
+/// file. Loaded-pod contributions fold in at `Loaded`, same rule as
+/// `add_package`.
+fn precheck_declare_collisions(root: &Path, decl: &PodDeclaration) -> miette::Result<()> {
+    let mut bin_claims: Vec<BinaryClaim> = Vec::new();
+    let mut svc_claims: Vec<ServiceClaim> = Vec::new();
+    for spec_str in &decl.packages {
+        let spec = parse_pod_package(spec_str)?;
+        let layer = if decl.overlay.contains_key(&spec.name) {
+            crate::farm::ClaimLayer::Overlay
+        } else {
+            crate::farm::ClaimLayer::Own
+        };
+        let mut meta = crate::deps::load_meta(&spec.name)
+            .map_err(|e| miette::miette!("cannot declare '{}': {e}", spec.name))?;
+        if let Some(patch) = decl.overlay.get(&spec.name) {
+            apply_overlay(&mut meta, patch)
+                .map_err(|e| miette::miette!("overlay of '{}' is invalid: {e}", spec.name))?;
+        }
+        push_meta_binary_claims(&mut bin_claims, &meta, layer);
+        push_meta_service_claims(&mut svc_claims, &meta, layer);
+    }
+    // No `pins`: the incoming file is collection-resolved whole (the
+    // sideload path is the one that passes pins). No `new_name` to
+    // exclude: every claim comes from the freshly resolved metas above,
+    // so the loaded sweep must only skip names the declaration itself
+    // carries — any non-name placeholder does that.
+    push_loaded_binary_claims(&mut bin_claims, root, decl, "")?;
+    push_loaded_service_claims(&mut svc_claims, root, decl, "")?;
+    resolve_binary_claims(&bin_claims)?;
+    resolve_service_claims(&svc_claims)
+}
+
 /// Declare a pod from a checked-in `pod.lua` file (gate-pod gap 5):
 /// load + validate the file, make its content the pod's declaration —
 /// REPLACING whatever was there, the file is the source of truth —
 /// then reconcile through the same path add/sync uses (store,
 /// generation chain, bin farm). An unknown pod is initialized.
 ///
-/// Fail-closed BEFORE any write: the file must read and evaluate, and
-/// its loads (existence + cycles) and overlays must validate against
-/// the pod. A corrupt existing declaration does not block the replace
-/// — declaring a good file IS the repair; it just reads as
+/// Fail-closed BEFORE any write: the file must read and evaluate, its
+/// loads (existence + cycles) and overlays must validate against the
+/// pod, and every declared package must resolve from the collection
+/// with the whole post-state set passing the binary + service
+/// collision prechecks. A corrupt existing declaration does not block
+/// the replace — declaring a good file IS the repair; it just reads as
 /// "everything added" in the change summary. The file's bytes are
 /// copied verbatim: the checked-in file stays the pod's declaration,
 /// comments included (later adds/removed re-render it normalized).
+///
+/// Post-write failures remain possible (the same residual as
+/// `add_package`): a failed reconcile leaves the new declaration (and
+/// any pins sync already recorded) in place — fix the cause and re-run
+/// `shuttle pod sync` (or re-declare the file) to converge.
 pub fn declare_pod(root: &Path, pod_name: &str, file: &Path) -> miette::Result<PodDeclareReport> {
     validate_pod_name(pod_name)?;
     if !file.is_file() {
@@ -2251,6 +2303,10 @@ pub fn declare_pod(root: &Path, pod_name: &str, file: &Path) -> miette::Result<P
     // Zero-write gates before the declaration swap (issue #8/#6).
     validate_loads(root, pod_name, &decl)?;
     validate_overlays(root, &decl, pod_name)?;
+    // Whole-declaration prechecks (council review): the file names every
+    // package the pod will carry, so each must resolve and the full
+    // post-state set must pass the collision checks before any write.
+    precheck_declare_collisions(root, &decl)?;
 
     let dir = pod_dir(root, pod_name);
     std::fs::create_dir_all(&dir)
@@ -2259,7 +2315,18 @@ pub fn declare_pod(root: &Path, pod_name: &str, file: &Path) -> miette::Result<P
     std::fs::write(&decl_path, &source)
         .map_err(|e| miette::miette!("failed to write {}: {e}", decl_path.display()))?;
 
-    let sync = sync_pod(root, pod_name)?;
+    // The declaration is the source of truth; the reconcile follows it.
+    // A failed reconcile (unbuildable package) leaves the new
+    // declaration — and any pins sync already recorded — in place:
+    // fix the cause and re-run `shuttle pod sync` (or re-declare).
+    let sync = sync_pod(root, pod_name).map_err(|cause| {
+        miette::miette!(
+            "declaration written to {} but its reconcile failed ({cause}): the \
+             new declaration and its pins stay in place — fix the cause and \
+             run `shuttle pod sync` (or re-declare the file) to converge",
+            decl_path.display()
+        )
+    })?;
     let declared = declaration_names(&decl);
     Ok(PodDeclareReport {
         pod: pod_name.to_string(),

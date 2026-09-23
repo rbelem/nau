@@ -602,6 +602,24 @@ fn dep_fully_cached(
         .all(|a| cache.lookup(dep_meta, a, closure).is_some())
 }
 
+/// True when `given` names the same stage directory as the
+/// shuttle-owned default (`./stage/`): by canonical path when both
+/// exist (the live lock-holder's wipe window), else by components with
+/// `.` separators dropped — so `./stage`, `stage`, and `./stage/` all
+/// match even before the directory exists.
+fn names_default_stage(given: &Path) -> bool {
+    fn norm(p: &Path) -> Vec<std::path::Component<'_>> {
+        p.components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect()
+    }
+    let default = Path::new("./stage/");
+    if let (Ok(a), Ok(b)) = (given.canonicalize(), default.canonicalize()) {
+        return a == b;
+    }
+    norm(given) == norm(default)
+}
+
 /// Resolve the `--stage` CLI flag into (path, policy) and enforce the
 /// explicit-stage precondition: a user-chosen directory that already has
 /// contents is refused up front — never wiped. The default `./stage/` is
@@ -620,6 +638,18 @@ fn resolve_stage(
 )> {
     match stage {
         Some(path) => {
+            // Council review: a spelling of the default stage must not
+            // pose as a user-owned explicit stage — it would bypass the
+            // StageLock the default carries and pass
+            // check_explicit_stage during the lock-holder's wipe
+            // window. Refuse loudly instead.
+            if names_default_stage(Path::new(&path)) {
+                miette::bail!(
+                    "'{path}' is the default stage ('./stage/') — omit --stage \
+                     to build there (pinned by the cross-process stage lock), or \
+                     pass a different directory as --stage"
+                );
+            }
             let policy = shuttle::snap::StagePolicy::Explicit;
             shuttle::snap::check_explicit_stage(Path::new(&path))?;
             Ok((std::path::PathBuf::from(path), policy, None))
@@ -4520,6 +4550,43 @@ mod tests {
             "ok: 2 output(s): bzip2 1.0.8, hello 2.10"
         );
         assert_eq!(check_ok_message(&[]), "ok: 0 output(s)");
+    }
+
+    #[test]
+    fn test_names_default_stage_matches_spellings() {
+        // Any spelling of the default — existing or not — must match:
+        // a lock-holder's wipe window is exactly the existing case.
+        assert!(names_default_stage(Path::new("./stage")));
+        assert!(names_default_stage(Path::new("./stage/")));
+        assert!(names_default_stage(Path::new("stage")));
+        assert!(names_default_stage(Path::new("stage/.")));
+        // Sibling names stay user-owned explicit stages.
+        assert!(!names_default_stage(Path::new("./stage2")));
+        assert!(!names_default_stage(Path::new("staging")));
+        assert!(!names_default_stage(Path::new("/tmp/stage")));
+    }
+
+    #[test]
+    fn test_resolve_stage_refuses_default_stage_spelling() {
+        let err = resolve_stage(Some("./stage".to_string())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("default stage"),
+            "conflict with the default must be loud: {msg}"
+        );
+        assert!(
+            msg.contains("--stage"),
+            "error must point at the explicit-stage escape: {msg}"
+        );
+
+        // A distinct directory is still a fine explicit stage.
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("stage2");
+        let (path, policy, lock) =
+            resolve_stage(Some(other.to_string_lossy().into_owned())).unwrap();
+        assert_eq!(path, other);
+        assert_eq!(policy, shuttle::snap::StagePolicy::Explicit);
+        assert!(lock.is_none(), "an explicit stage is never locked");
     }
 
     #[test]
