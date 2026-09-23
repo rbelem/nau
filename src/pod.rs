@@ -176,6 +176,43 @@ pub fn pod_lock_path(root: &Path, pod_name: &str) -> PathBuf {
     pod_dir(root, pod_name).join(LockFile::FILENAME)
 }
 
+/// Replace a pod's `pod.lua` atomically (the manifest.rs `write_atomic`
+/// pattern): write a same-directory temp file, then rename it over the
+/// declaration. A crash or failure mid-write leaves the previous
+/// declaration intact — no torn `pod.lua` to break every pod verb until
+/// re-declared — and the temp file is cleaned up when the write or the
+/// rename fails (issue #173). Like the other atomic writers, no fsync:
+/// rename(2) alone keeps every on-disk instant either the old or the new
+/// declaration.
+fn write_pod_declaration(path: &Path, body: &str) -> miette::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(POD_FILE),
+        std::process::id()
+    ));
+    let cleanup = |tmp: &Path| {
+        let _ = std::fs::remove_file(tmp);
+    };
+    if let Err(e) = std::fs::write(&tmp, body) {
+        cleanup(&tmp);
+        return Err(miette::miette!("failed to write {}: {e}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        cleanup(&tmp);
+        return Err(miette::miette!(
+            "failed to finalize {}: {e}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 // ── Package specs ──
 
 /// One declared package: a name plus an optional `@constraint`
@@ -1380,8 +1417,7 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
     std::fs::create_dir_all(&dir)
         .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
     let decl_path = pod_lua_path(root, pod_name);
-    std::fs::write(&decl_path, render_pod_source(&decl))
-        .map_err(|e| miette::miette!("failed to write {}: {e}", decl_path.display()))?;
+    write_pod_declaration(&decl_path, &render_pod_source(&decl))?;
 
     let lock_path = pod_lock_path(root, pod_name);
     let mut lock = LockFile::load(&lock_path)?.unwrap_or_else(LockFile::empty);
@@ -1718,8 +1754,7 @@ pub fn add_snap_pod(
     std::fs::create_dir_all(&dir)
         .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
     let decl_path = pod_lua_path(root, pod_name);
-    std::fs::write(&decl_path, render_pod_source(&decl))
-        .map_err(|e| miette::miette!("failed to write {}: {e}", decl_path.display()))?;
+    write_pod_declaration(&decl_path, &render_pod_source(&decl))?;
 
     // Swap detection (issue #164 follow-up output): a divergent payload
     // under an existing pin REPLACES the member — capture the prior pin
@@ -2165,8 +2200,7 @@ pub fn remove_package(
     prune_dangling_service_overrides(&mut decl);
 
     let decl_path = pod_lua_path(root, pod_name);
-    std::fs::write(&decl_path, render_pod_source(&decl))
-        .map_err(|e| miette::miette!("failed to write {}: {e}", decl_path.display()))?;
+    write_pod_declaration(&decl_path, &render_pod_source(&decl))?;
 
     let lock_path = pod_lock_path(root, pod_name);
     if let Some(mut lock) = LockFile::load(&lock_path)? {
@@ -2312,8 +2346,7 @@ pub fn declare_pod(root: &Path, pod_name: &str, file: &Path) -> miette::Result<P
     std::fs::create_dir_all(&dir)
         .map_err(|e| miette::miette!("failed to create {}: {e}", dir.display()))?;
     let decl_path = pod_lua_path(root, pod_name);
-    std::fs::write(&decl_path, &source)
-        .map_err(|e| miette::miette!("failed to write {}: {e}", decl_path.display()))?;
+    write_pod_declaration(&decl_path, &source)?;
 
     // The declaration is the source of truth; the reconcile follows it.
     // A failed reconcile (unbuildable package) leaves the new
@@ -5723,6 +5756,83 @@ pod {
 
         let redecl = evaluate_pod_source("test", &render_pod_source(&decl)).unwrap();
         assert_eq!(redecl, decl, "render → evaluate must round-trip");
+    }
+
+    // ── atomic pod.lua writes (issue #173) ──
+
+    fn dir_entry_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    #[test]
+    fn test_write_pod_declaration_replaces_content_and_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pod.lua");
+        std::fs::write(&path, "old declaration").unwrap();
+        write_pod_declaration(&path, "new declaration").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new declaration");
+        assert_eq!(
+            dir_entry_count(dir.path()),
+            1,
+            "a successful write must leave no temp file behind"
+        );
+    }
+
+    #[test]
+    fn test_write_pod_declaration_failure_cleans_tmp_and_keeps_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pod.lua");
+        // Crash-shaped rename failure: the target cannot be replaced
+        // (it is a directory, so rename(2) fails), modelling the
+        // finalize step blowing up after the temp was written.
+        std::fs::create_dir_all(&path).unwrap();
+        let err = write_pod_declaration(&path, "new declaration").unwrap_err();
+        assert!(
+            err.to_string().contains("finalize"),
+            "rename failure must be reported as a finalize error: {err}"
+        );
+        assert!(
+            path.is_dir(),
+            "the target must survive a failed write untouched"
+        );
+        assert_eq!(
+            dir_entry_count(dir.path()),
+            1,
+            "a failed write must clean up its temp file"
+        );
+    }
+
+    #[test]
+    fn test_write_pod_declaration_write_failure_keeps_old_content() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root ignores directory write permissions");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pod.lua");
+        std::fs::write(&path, "old declaration").unwrap();
+        // Crash-shaped write failure: the temp file cannot even be
+        // created (read-only pod dir), so the old declaration must stay
+        // byte-intact on disk.
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+        let result = write_pod_declaration(&path, "new declaration");
+        // Restore before asserting so the tempdir can be cleaned up.
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+        assert!(result.is_err(), "an unwritable dir must fail the write");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "old declaration",
+            "a failed write must leave the previous declaration intact"
+        );
+        assert_eq!(
+            dir_entry_count(dir.path()),
+            1,
+            "a failed write must leave no temp file behind"
+        );
     }
 
     #[test]
