@@ -4073,6 +4073,34 @@ fn resolve_own_meta(
     Ok(meta)
 }
 
+/// Re-base a floating source's TOFU baseline onto the lockfile's
+/// last-known pin (issue #175). After a float re-resolves, the rebuild
+/// restamps the lock record — but the recipe's baked-in `source.sha256`
+/// stays at the original seed forever, so every later sync compares
+/// fresh downloads against the STALE seed and re-warns "re-resolved"
+/// even when the bytes match the last-known hash (ADR-0017 Decision 4:
+/// float means re-resolve, not unverified; the lock pin IS the
+/// last-known hash, kept so rollback works). The rebase points the
+/// build-input seed at the recorded pin instead. A source the lock
+/// never saw keeps the recipe hash as its TOFU seed. LOCKED
+/// (non-floating) sources are untouched: their recipe pin is enforced
+/// exactly and must never be masked by a lock entry. Floating metas
+/// never take the content hold (`held_at_content` is false for
+/// floating), so the rebased build-input digest has no hold to skew.
+fn rebase_floating_source_pin(meta: &mut crate::snap::SnapMeta, lock: &LockFile) {
+    if !meta.floating {
+        return;
+    }
+    let Some(crate::snap::SourceSpec::Pinned { url, sha256 }) = meta.source.as_mut() else {
+        return;
+    };
+    if let Some(recorded) = lock.lookup_source(url) {
+        if recorded != sha256.as_str() {
+            *sha256 = recorded.to_string();
+        }
+    }
+}
+
 /// Resolve + build the pod's OWN packages (in declared order, issue
 /// #3): each resolves collection → pin (hold) → overlay, later wins,
 /// then builds after its dependency closure is ensured (ADR-0017
@@ -4102,6 +4130,9 @@ fn collect_own_packages(
             continue;
         }
         let mut meta = resolve_own_meta(ctx.root, ctx.pod_name, &spec, &decl.overlay)?;
+        // Issue #175: the TOFU baseline follows the restamped lock pin,
+        // not the recipe's stale baked-in seed.
+        rebase_floating_source_pin(&mut meta, ctx.lock);
         build.declared_names.insert(meta.name.clone());
         // Runtime-closure seeds (issue #35): the declared package's own
         // requires — the overlay-won meta is what the pod executes.
