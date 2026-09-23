@@ -5475,8 +5475,9 @@ fn ro_bind_if_exists(cmd: &mut std::process::Command, path: &str) {
 
 /// Host path roots bound read-only into the build sandbox (see
 /// [`bind_system_ro_paths`]). This is the sandbox's entire view of the host
-/// filesystem: a build tool resolves inside the sandbox only if its PATH
-/// entry lives under one of these roots. Entries elsewhere (e.g. a
+/// filesystem apart from the resolver/trust files of
+/// [`SANDBOX_ETC_RO_PATHS`]: a build tool resolves inside the sandbox only
+/// if its PATH entry lives under one of these roots. Entries elsewhere (e.g. a
 /// project's `.devbox` profile dir) are invisible to sandboxed builds, and
 /// a `nix store` garbage collection can delete `/nix/store` paths a stale
 /// shell still exports — both turn a working host setup into an obscure
@@ -5491,6 +5492,26 @@ pub const SANDBOX_RO_ROOTS: [&str; 6] = [
     "/bin",
     "/run/current-system",
 ];
+
+/// Name-resolution and CA-trust paths bound read-only into the build
+/// sandbox (issue #176), on top of [`SANDBOX_RO_ROOTS`]. The FHS roots
+/// carry no `/etc`, so a build command that fetches over the network had
+/// neither a resolver (`curl: (6) Could not resolve host`) nor TLS trust
+/// (the merged build prefix's curl is a bare pod payload — the #130 class;
+/// the #138 wrapper only lands in installed payloads, not build prefixes).
+/// Kept separate from [`SANDBOX_RO_ROOTS`] because that list is also the
+/// doctor's tool-visibility root set and the declared-app confinement's
+/// bind set — these files are neither tool roots nor app grants, and the
+/// declared-app sandboxes stay untouched. Each path binds only when it
+/// exists on the host (`ro_bind_if_exists`): distros without
+/// `/etc/ssl/certs` keep building, exactly as before.
+pub const SANDBOX_ETC_RO_PATHS: [&str; 3] = ["/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs"];
+
+/// The CA bundle the build env defaults `CURL_CA_BUNDLE` to (issue #176).
+/// The same file the ca-certificates payload installs; the sandbox binds
+/// its directory read-only ([`SANDBOX_ETC_RO_PATHS`]), so the default
+/// resolves inside the sandbox exactly when it exists on the host.
+pub const SANDBOX_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
 /// Where the fetched dependency closure (ADR-0017, issue #13) is mounted
 /// inside the build sandbox (read-only), and what `$SHUTTLE_DEPS_DIR`
@@ -5540,6 +5561,32 @@ pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
         ),
         ("PKG_CONFIG_SYSROOT_DIR", prefix.to_string()),
     ]
+}
+
+/// The `CURL_CA_BUNDLE` env pair the build env defaults to (issue #176), or
+/// `None` when no default may be set. Two gates:
+///
+/// * `ambient` is Some when the caller/recipe already defines
+///   `CURL_CA_BUNDLE` — the #138 ambient-trust/never-clobber rule: the
+///   caller's own trust choice is never overwritten. In the sandboxed
+///   build the ambient env is dropped by design (issue #10 hermetic), so
+///   the recipe's `extra_env` pair is the only trust declaration that can
+///   exist ahead of this default; in degraded-direct mode the caller's
+///   real env rides through and is honored here.
+/// * `bundle_exists` reports the host bundle file: pointing
+///   `CURL_CA_BUNDLE` at a missing file turns every TLS fetch into an
+///   "error setting certificate verify locations" failure, so the default
+///   is issued only when the file is actually there — which is exactly
+///   the condition under which the sandbox bound `/etc/ssl/certs`
+///   ([`SANDBOX_ETC_RO_PATHS`]).
+fn default_curl_ca_bundle(
+    ambient: Option<&str>,
+    bundle_exists: bool,
+) -> Option<(&'static str, String)> {
+    if ambient.is_some() || !bundle_exists {
+        return None;
+    }
+    Some(("CURL_CA_BUNDLE", SANDBOX_CA_BUNDLE.to_string()))
 }
 
 /// The C-toolchain env the merged build prefix contributes (issue #44):
@@ -6127,12 +6174,16 @@ fn run_build_child(
 
 /// Read-only system paths for toolchain, shebangs, and Nix/devbox builds.
 /// The bind set is [`SANDBOX_RO_ROOTS`] — doctor's sandbox-visibility
-/// check and the build pre-flight resolve tools against the same list.
+/// check and the build pre-flight resolve tools against the same list —
+/// plus the resolver/trust files of [`SANDBOX_ETC_RO_PATHS`] (issue #176).
 /// Each root is bound only when it exists (bwrap errors on missing bind
 /// sources; the FHS roots exist on every host where sandboxed builds run).
 fn bind_system_ro_paths(cmd: &mut std::process::Command) {
     for root in SANDBOX_RO_ROOTS {
         ro_bind_if_exists(cmd, root);
+    }
+    for path in SANDBOX_ETC_RO_PATHS {
+        ro_bind_if_exists(cmd, path);
     }
 }
 
@@ -6253,6 +6304,18 @@ fn run_bwrapped(
         // resort; build scripts may still export their own, and the cross /
         // extra env applied below overrides this default.
         .env("HOME", "/tmp");
+    // TLS trust default (issue #176): the sandbox has no ambient env, so
+    // the recipe's extra_env is the only pre-existing CURL_CA_BUNDLE; the
+    // default (the bound /etc/ssl/certs bundle) fills the gap otherwise.
+    let ambient_ca = extra_env
+        .iter()
+        .find(|(k, _)| k == "CURL_CA_BUNDLE")
+        .map(|(_, v)| v.as_str());
+    if let Some((key, val)) =
+        default_curl_ca_bundle(ambient_ca, Path::new(SANDBOX_CA_BUNDLE).exists())
+    {
+        cmd_proc.env(key, val);
+    }
     if deps_dir.is_some() {
         cmd_proc.env("SHUTTLE_DEPS_DIR", SANDBOX_DEPS_DIR);
     }
@@ -6330,6 +6393,15 @@ fn run_direct(
     }
     if let Some(name) = part_name {
         cmd_proc.env("PART_NAME", name);
+    }
+    // TLS trust default (issue #176), degraded mode: the caller's real env
+    // rides through here, so an ambient CURL_CA_BUNDLE is honored (the #138
+    // never-clobber rule) and the default fills only its absence.
+    if let Some((key, val)) = default_curl_ca_bundle(
+        std::env::var("CURL_CA_BUNDLE").ok().as_deref(),
+        Path::new(SANDBOX_CA_BUNDLE).exists(),
+    ) {
+        cmd_proc.env(key, val);
     }
     apply_cross_env(&mut cmd_proc, cross_env);
     apply_extra_env(&mut cmd_proc, extra_env);
@@ -12296,6 +12368,49 @@ fi
                 "expected --ro-bind {root} {root}, got {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn bind_system_ro_paths_binds_resolver_and_ca_paths() {
+        // Issue #176: the build sandbox's FHS bind roots carry no /etc, so
+        // build-step downloads had no resolver and no CA trust. The
+        // constructed spec must carry all three read-only binds.
+        let mut cmd = std::process::Command::new("true");
+        bind_system_ro_paths(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for path in SANDBOX_ETC_RO_PATHS {
+            if !Path::new(path).exists() {
+                continue;
+            }
+            assert!(
+                args.windows(3).any(|w| w == ["--ro-bind", path, path]),
+                "expected --ro-bind {path} {path}, got {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_curl_ca_bundle_sets_the_exact_pair_when_absent() {
+        let (key, val) = default_curl_ca_bundle(None, true).expect("default issued");
+        assert_eq!(key, "CURL_CA_BUNDLE");
+        assert_eq!(val, "/etc/ssl/certs/ca-certificates.crt");
+        assert_eq!(val, SANDBOX_CA_BUNDLE);
+    }
+
+    #[test]
+    fn default_curl_ca_bundle_never_clobbers_an_ambient_value() {
+        // The #138 ambient-trust rule: the caller's own trust choice wins.
+        assert!(default_curl_ca_bundle(Some("/my/own/bundle.pem"), true).is_none());
+    }
+
+    #[test]
+    fn default_curl_ca_bundle_skips_a_missing_bundle_file() {
+        // Pointing CURL_CA_BUNDLE at a missing file would turn TLS into a
+        // certificate-verify-locations error — worse than no default.
+        assert!(default_curl_ca_bundle(None, false).is_none());
     }
 }
 
