@@ -571,3 +571,31 @@ gcc.lua is another lane's file, untouched here.
 State left behind: gate pod provisioned with linux-headers, libgcc,
 glibc (soname ld scripts), rust 1.97.1 (round 8 re-pin), gcc 14.2.0
 (post-77964ae c++ shim) — generation 39.
+
+## Round 9 (2026-09-23, post-#174/#171 gcc re-sideload, debug build) — uapi ownership lands pod-side
+
+The gate pod's gcc blob was swapped twice the same day the recipes changed:
+`a25b9270…` (pre-#174, carried linux-libc-dev uapi) → `62cf65b8…` (#174 drop +
+#171 deb sets, 95cdccb) → `d9b2bffc…` (CPATH shim repair below). Generation 41.
+Same-version blob swaps ran the documented content-identity path; rollback
+across a swap reactivates content the blob pin no longer names (tool prints
+the caveat).
+
+Round-4 acceptance `shuttle run --pod gate -- cargo build --locked` FAILED on
+`62cf65b8…`: every C++ TU died with `c++/14/cstdlib:79: fatal error:
+stdlib.h: No such file or directory`. Root cause: `#include_next` only
+searches dirs AFTER the C++ headers; the #171 shim rewrite dropped the gen-39
+shim's CPATH→`-idirafter` translation, so the farm wrapper's CPATH (glibc's
+include root among them) entered at `-I` position — unreachable by
+include_next. Restored in the gcc.lua shim heredoc (with the empty-segment
+guard); rebuild + re-sideload; acceptance green (1m35s) and a C++
+cstdlib/string probe compiles, links, and runs pod-side.
+
+Verified on `d9b2bffc…`: gcc payload stages NO uapi (`asm-generic` absent —
+single farm-wide owner is linux-headers, so the CPATH-glob ambiguity recorded
+in the #174 council review is gone); `<linux/errno.h>` + `<asm/unistd.h>`
+compile and run through the pod cc (EAGAIN=11); cc/c++ resolve to the
+payload's Debian 14.2.0. The 62cf65b8 finding is a lesson for payload shim
+rewrites: any script that touches include-path translation must be exercised
+with a C++ TU against libstdc++ before landing — the deb builds in the lane
+were pure C and never reached the chain.

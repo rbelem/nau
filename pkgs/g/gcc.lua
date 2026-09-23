@@ -447,6 +447,14 @@ do dpkg-deb -x "$SRC/$p" "$STAGE" || exit 1; done]],
             -- into -L so every link searches the pod's payload dirs, and
             -- dispatch on the invoked name: c++/g++/cxx hit the C++
             -- driver (C++ link spec), everything else the C driver.
+            -- CPATH is translated to -idirafter, never left at -I
+            -- position: libstdc++'s cstdlib pulls the C stdlib.h via
+            -- #include_next, which only searches dirs AFTER the C++
+            -- headers — glibc's include root entering at -I position is
+            -- unreachable by include_next and every C++ TU dies on
+            -- `stdlib.h: No such file or directory` (the gen-39 shim
+            -- carried this loop; the #171 triplet parameterization
+            -- dropped it and the gate cargo build caught it).
             -- Empty segments (leading/trailing colon) are skipped: a
             -- bare `-L` is an ld operator that consumes the NEXT token,
             -- not a no-op. The heredoc is UNQUOTED: $t is the build's
@@ -456,12 +464,14 @@ do dpkg-deb -x "$SRC/$p" "$STAGE" || exit 1; done]],
 #!/bin/sh
 d=\$(dirname "\$(readlink -f "\$0")")
 l=
+c=
 ifs=\$IFS; IFS=:
 for p in \$LIBRARY_PATH; do [ -n "\$p" ] && l="\$l -L\$p"; done
+for p in \$CPATH; do [ -n "\$p" ] && c="\$c -idirafter \$p"; done
 IFS=\$ifs
 case "\${0##*/}" in
-  c++|cxx|g++) exec "\$d/$t-g++-14" \$l "\$@" ;;
-  *) exec "\$d/$t-gcc-14" \$l "\$@" ;;
+  c++|cxx|g++) exec "\$d/$t-g++-14" \$l \$c "\$@" ;;
+  *) exec "\$d/$t-gcc-14" \$l \$c "\$@" ;;
 esac
 EOF
 chmod +x "$STAGE/usr/bin/cc" && cp "$STAGE/usr/bin/cc" "$STAGE/usr/bin/c++"]],
