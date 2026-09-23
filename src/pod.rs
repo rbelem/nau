@@ -2802,6 +2802,12 @@ pub struct PodSyncReport {
     /// generation's content) say otherwise — `shuttle pod update` moves
     /// them deliberately (issue #5).
     pub held: Vec<String>,
+    /// Names whose recipe-closure drift this reconcile BASELINED
+    /// instead of rebuilding (`pod refresh` members the verb did not
+    /// name, issue #142): the current recipe hash was stamped and the
+    /// installed content kept — their drift pre-dates this refresh.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub baselined: Vec<String>,
     /// The generation now current (absent when the pod has nothing
     /// installed).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2925,7 +2931,11 @@ pub struct PodRefreshReport {
 /// Members the rebuild finds byte-identical keep their store content
 /// (the churn guard — no generation churn); a rebuilt member joins
 /// the composition with its binary/desktop/service claims COLLECTED,
-/// so its farm entries materialize (the closure-member gap). A
+/// so its farm entries materialize (the closure-member gap). Drift on
+/// declared members the verb did NOT name is BASELINED, not rebuilt:
+/// the current closure digest is stamped and the installed content
+/// kept (zero churn) — a refresh must not be held hostage by
+/// unrelated drifted members, and the summary reports both groups. A
 /// blob-pinned member refuses fail-closed BEFORE any write: the
 /// payload is its content, there is no recipe to rebuild. Build-tool
 /// failures are loud errors here — this verb is the explicit opt-in,
@@ -3253,21 +3263,47 @@ fn detect_recipe_drift(
             }
         }
         Some(recorded) if *recorded == digest => {}
-        Some(_) => {
-            build.recipe_drift.insert(spec.name.clone());
-            build
-                .recipe_drift_members
-                .extend(entries.iter().map(|(name, _)| name.clone()));
-            build
-                .recipe_stamps_pending
-                .push((spec.name.clone(), digest));
-            crate::output::status(format!(
-                "recipe drift: {} (closure recipe changed)",
-                spec.name
-            ));
-        }
+        Some(_) => record_recipe_drift(spec, digest, &entries, build),
     }
     Ok(())
+}
+
+/// The recorded-digest MISMATCH arm of [`detect_recipe_drift`] (issue
+/// #142): a plain sync rebuilds the drifted package at its pin and
+/// sweeps its closure members — but a `pod refresh` baselines every
+/// drifted member the verb did NOT name. The refresh rebuilds the
+/// named members and must not be held hostage by unrelated drift:
+/// baselining stamps the current closure digest (committed
+/// incrementally like every stamp) and keeps the installed content —
+/// zero generation churn, the same unrecoverable-drift semantics as
+/// the #142 migration. Baselined members are reported by name in the
+/// refresh summary.
+fn record_recipe_drift(
+    spec: &PodPackageSpec,
+    digest: String,
+    entries: &[(String, Vec<u8>)],
+    build: &mut ReconcileBuild,
+) {
+    build
+        .recipe_stamps_pending
+        .push((spec.name.clone(), digest));
+    if !build.refresh_members.is_empty() && !build.refresh_members.contains(&spec.name) {
+        build.recipe_baselined.push(spec.name.clone());
+        crate::output::status(format!(
+            "baselined '{}': drift pre-dating this refresh — recipe hash \
+             recorded, installed content kept",
+            spec.name
+        ));
+        return;
+    }
+    build.recipe_drift.insert(spec.name.clone());
+    build
+        .recipe_drift_members
+        .extend(entries.iter().map(|(name, _)| name.clone()));
+    crate::output::status(format!(
+        "recipe drift: {} (closure recipe changed)",
+        spec.name
+    ));
 }
 
 /// SHA-256 over the canonical closure listing (issue #142): entries
@@ -3344,6 +3380,13 @@ fn scope_own_package(
         verify_held_deps_blob(ctx, &meta.name)?;
         return Ok(hold_plain_sync(ctx, meta, build));
     }
+    // `pod refresh` baselining (issue #142): a drifted member the verb
+    // did not name keeps its installed content here — without this
+    // intercept a member whose OWN recipe changed would reach the
+    // rebuild branch below through the no-version-hold gap.
+    if let Some(scope) = hold_baselined_drift(ctx, meta, build) {
+        return Ok(scope);
+    }
     if overlay || !held_at_pin(ctx.lock, &meta.name, &meta.version, ctx.active) || drifted {
         if drifted {
             if let Some(entry) = ctx.lock.packages.get(&meta.name) {
@@ -3364,6 +3407,32 @@ fn scope_own_package(
     // loaded-packages path.
     meta.version = ctx.lock.packages[&meta.name].version.clone();
     Ok(OwnScope::Build)
+}
+
+/// The baselined-drift hold (issue #142 `pod refresh`): a drifted
+/// member the refresh did not name keeps its installed content —
+/// claims contributed from the installed record, no build — so the
+/// refresh lands only the named members. `None` when the member is not
+/// baselined, or when the generation does not carry it: a baselined
+/// member the pod lacks still builds, because the post-state must
+/// contain everything declared.
+fn hold_baselined_drift(
+    ctx: &ReconcileCtx<'_>,
+    meta: &crate::snap::SnapMeta,
+    build: &mut ReconcileBuild,
+) -> Option<OwnScope> {
+    if !build.recipe_baselined.contains(&meta.name) {
+        return None;
+    }
+    let installed = ctx.active.and_then(|g| g.packages.get(&meta.name))?;
+    hold_style_skip_claims(
+        &mut build.desktop_claims,
+        &mut build.binary_claims,
+        &mut build.service_claims,
+        installed,
+        meta,
+    );
+    Some(OwnScope::SkipInstalled)
 }
 
 /// True when a scoped reconcile deliberately moved a package's
@@ -3522,6 +3591,7 @@ fn reconcile_pod_scoped(
                     installed,
                     removed,
                     held: build.held,
+                    baselined: build.recipe_baselined,
                     generation,
                     farm,
                     services: Some(services),
@@ -3799,6 +3869,12 @@ struct ReconcileBuild {
     /// Recipe-closure digests computed this reconcile (issue #142), per
     /// declared package: recorded onto every pin the reconcile writes.
     recipe_digests: Vec<(String, String)>,
+    /// `pod refresh` (issue #142): declared packages whose recipe
+    /// closure drifted this reconcile but were NOT named — baselined
+    /// (current digest stamped, installed content kept) instead of
+    /// rebuilt, so the refresh is not held hostage by unrelated drift.
+    /// Reported by name in the refresh summary.
+    recipe_baselined: Vec<String>,
     /// Recipe-closure stamps queued this reconcile (issue #142), per
     /// declared package: committed INCREMENTALLY — as each package's
     /// contribution (build or hold) succeeds — so a mid-sweep failure

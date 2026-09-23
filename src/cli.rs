@@ -1212,7 +1212,9 @@ pub enum PodCommand {
     /// baseline — sync can never reach either. A member the rebuild
     /// finds byte-identical keeps its store content (no generation
     /// churn); a changed member installs with its binary claims
-    /// collected, so its farm entries materialize. Explicit opt-in:
+    /// collected, so its farm entries materialize. Unrelated drifted
+    /// members are baselined (current recipe hash stamped, installed
+    /// content kept), never rebuilt. Explicit opt-in:
     /// build-tool failures are loud errors here, never a broken day-0
     /// sync. Blob-pinned (sideloaded) members refuse — the payload is
     /// their content, there is no recipe.

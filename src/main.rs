@@ -3215,6 +3215,8 @@ fn cmd_pod_declare(pod_name: &str, file: &str, root: Option<String>) -> miette::
 /// `shuttle pod refresh <member…>` (issue #142): rebuild the named
 /// members from their current recipes and report per-member outcomes —
 /// installed (generation named) or byte-identical (store content kept).
+/// Unrelated drifted members are baselined, not rebuilt, and the
+/// summary names them.
 fn cmd_pod_refresh(root: &Path, pod_name: &str, members: &[String]) -> miette::Result<()> {
     let report = shuttle::pod::refresh_pod(root, pod_name, members)?;
     for member in &report.members {
@@ -3234,6 +3236,13 @@ fn cmd_pod_refresh(root: &Path, pod_name: &str, members: &[String]) -> miette::R
                 member.name, member.version
             ));
         }
+    }
+    for name in &report.sync.baselined {
+        shuttle::output::warn(format!(
+            "baselined '{name}' — drift pre-dating this refresh: recipe hash \
+             recorded, installed content kept (`shuttle pod refresh {name}` \
+             rebuilds it)"
+        ));
     }
     if let Some(n) = report.sync.generation {
         shuttle::output::info(format!("generation {n} current"));

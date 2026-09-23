@@ -10,6 +10,9 @@
 //!   (the stranded #138 curl story) from its current recipe and exposes
 //!   its farm entry (the closure-member claims gap).
 //! - Refresh is churn-free when the rebuild comes back byte-identical.
+//! - A refresh BASELINES unrelated drifted members (stamp + content
+//!   kept) instead of rebuilding them; a NAMED member's build failure
+//!   stays loud.
 //! - Recipe stamps persist per package as each build succeeds — a
 //!   mid-sweep failure must not restart the whole sweep next sync.
 //! - The migration stamp is LOUD and names the escape hatch.
@@ -376,6 +379,60 @@ fn write_pinned_source_pkg(
     std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
 }
 
+/// The refresh-isolation fixture: two INDEPENDENT declared members
+/// `xa` (requires `libx`) and `yb` (requires `liby`), synced in that
+/// order. Each add stamps its member's closure digest. Returns
+/// (project, root).
+fn sync_isolation_pod(server_dir: &Path, port: u16, name: &str) -> (PathBuf, PathBuf) {
+    make_tarball(server_dir, "xasrc");
+    make_tarball(server_dir, "ybsrc");
+    make_tarball(server_dir, "libxsrc");
+    make_tarball(server_dir, "libysrc");
+    let project = tempfile::tempdir().unwrap().keep();
+    let root = tempfile::tempdir().unwrap().keep();
+    write_pkg(
+        &project,
+        "libx",
+        &[],
+        "libxbin",
+        "libx-ran",
+        port,
+        "libxsrc.tar.gz",
+    );
+    write_pkg(
+        &project,
+        "liby",
+        &[],
+        "libybin",
+        "liby-ran",
+        port,
+        "libysrc.tar.gz",
+    );
+    write_pkg(
+        &project,
+        "xa",
+        &["libx"],
+        "xabin",
+        "xa-ran",
+        port,
+        "xasrc.tar.gz",
+    );
+    write_pkg(
+        &project,
+        "yb",
+        &["liby"],
+        "ybbin",
+        "yb-ran",
+        port,
+        "ybsrc.tar.gz",
+    );
+    let (code, _, stderr) = run(&project, &root, &["--name", name, "add", "xa"]);
+    assert_eq!(code, Some(0), "add xa failed: {stderr}");
+    let (code, _, stderr) = run(&project, &root, &["--name", name, "add", "yb"]);
+    assert_eq!(code, Some(0), "add yb failed: {stderr}");
+    (project, root)
+}
+
 // ── Tests ──
 
 // `pod refresh` reaches an UNDECLARABLE closure member (the round-5
@@ -424,8 +481,10 @@ gated_test!(refresh_rebuilds_undeclared_member_and_exposes_farm_entry, {
         "the farm binary must execute the refreshed content"
     );
 
-    // The refresh rode a full reconcile: the declared root's drift
-    // fired too and its stamp was restamped with the new digest.
+    // The refresh rode a full reconcile: the declared root's closure
+    // drifted too (the member's recipe is in it), and the UNNAMED root
+    // was baselined — its stamp restamped with the current digest
+    // while its installed content stayed untouched.
     let app_hash_after = recipe_hash_of(&read_lock(&root, "p"), "app").unwrap();
     assert_ne!(
         app_hash_after, app_hash_before,
@@ -460,6 +519,157 @@ gated_test!(refresh_byte_identical_keeps_store_content, {
     assert_eq!(code, Some(0), "{stderr}");
     assert!(stderr.contains("byte-identical"), "stderr={stderr}");
     assert_eq!(generation_count(&root, "p"), gens);
+});
+
+// A refresh must not be held hostage by unrelated drift (the #142
+// contract, kept honest): with BOTH members' closures drifted (libx
+// and liby recipes moved), `refresh yb` rebuilds only yb's side —
+// xa gets the baseline-record treatment (its current closure hash
+// stamped, its installed content kept, zero churn) and the summary
+// names it baselined.
+gated_test!(refresh_baselines_unrelated_drift_instead_of_rebuilding, {
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    let (project, root) = sync_isolation_pod(server.path(), port, "p");
+
+    // Drift BOTH closures: the requires members' recipes move.
+    write_pkg(
+        &project,
+        "libx",
+        &[],
+        "libxbin",
+        "libx-v2",
+        port,
+        "libxsrc.tar.gz",
+    );
+    write_pkg(
+        &project,
+        "liby",
+        &[],
+        "libybin",
+        "liby-v2",
+        port,
+        "libysrc.tar.gz",
+    );
+
+    let gens = generation_count(&root, "p");
+    let xa_before = recipe_hash_of(&read_lock(&root, "p"), "xa").unwrap();
+    let (code, stdout, stderr) = run(&project, &root, &["--name", "p", "refresh", "yb"]);
+    assert_eq!(code, Some(0), "refresh failed: {stderr}");
+
+    // The summary reports BOTH groups: the named rebuild and the
+    // unrelated baseline — and the unnamed member was never swept.
+    assert!(
+        stderr.contains("refreshed 'yb'"),
+        "the named member must be rebuilt; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("baselined 'xa'"),
+        "the unnamed drifted member must be reported as baselined; \
+         stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("recipe drift: xa"),
+        "the unnamed member must not enter the drift sweep; stderr={stderr}"
+    );
+
+    // Exactly one new generation: the named side's. xa churned
+    // nothing (its store content was kept).
+    assert_eq!(
+        generation_count(&root, "p"),
+        gens + 1,
+        "only the named side may land a generation; stderr={stderr}"
+    );
+
+    // The named side's drifted closure member executes the new
+    // content; the unnamed side (xa AND its closure member libx)
+    // keeps its OLD installed content.
+    let farm = current_farm(&root, "p");
+    assert!(
+        farm_output(&farm, "libybin").contains("liby-v2"),
+        "the named member's drifted closure member must be rebuilt"
+    );
+    assert!(
+        farm_output(&farm, "ybbin").contains("yb-ran"),
+        "the named member stays at its (unchanged) recipe"
+    );
+    assert!(
+        farm_output(&farm, "libxbin").contains("libx-ran"),
+        "the unnamed drifted side must keep its installed closure content"
+    );
+    assert!(
+        farm_output(&farm, "xabin").contains("xa-ran"),
+        "the unnamed drifted member must keep its installed content"
+    );
+
+    // xa's baseline: the stamp moved to the CURRENT closure digest.
+    let xa_after = recipe_hash_of(&read_lock(&root, "p"), "xa").unwrap();
+    assert_ne!(
+        xa_after, xa_before,
+        "the unnamed member's stamp must be re-recorded (baselined)"
+    );
+});
+
+// A NAMED member's build failure stays loud even when unrelated
+// members drift — the verb's build-tool-failures-are-loud contract.
+// The unnamed drifted member is baselined (stamp commits
+// incrementally, content kept): it is neither the failure nor a
+// blocker.
+gated_test!(refresh_named_member_failure_stays_loud, {
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    let (project, root) = sync_isolation_pod(server.path(), port, "p");
+
+    // Drift xa's closure (harmless); BREAK yb's build (the named
+    // target).
+    write_pkg(
+        &project,
+        "libx",
+        &[],
+        "libxbin",
+        "libx-v2",
+        port,
+        "libxsrc.tar.gz",
+    );
+    write_failing_pkg(&project, "yb", &["liby"], port, "ybsrc.tar.gz");
+
+    let gens = generation_count(&root, "p");
+    let xa_before = recipe_hash_of(&read_lock(&root, "p"), "xa").unwrap();
+    let (code, stdout, stderr) = run(&project, &root, &["--name", "p", "refresh", "yb"]);
+    assert_ne!(
+        code,
+        Some(0),
+        "the named member's broken build must fail the refresh: {stderr}"
+    );
+    assert!(
+        stderr.contains("build command exited with error"),
+        "the build failure must be loud; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("baselined 'xa'"),
+        "the unnamed drifted member is baselined, not the failure; \
+         stdout={stdout} stderr={stderr}"
+    );
+
+    // The failed reconcile landed nothing…
+    assert_eq!(
+        generation_count(&root, "p"),
+        gens,
+        "a failed refresh must not land a generation"
+    );
+    // …but xa's baseline stamp committed incrementally BEFORE the
+    // named member's build ran (its hold succeeded).
+    let xa_after = recipe_hash_of(&read_lock(&root, "p"), "xa").unwrap();
+    assert_ne!(
+        xa_after, xa_before,
+        "the unnamed member's baseline must commit despite the failure"
+    );
+    // And xa's content is still the OLD one.
+    let farm = current_farm(&root, "p");
+    assert!(
+        farm_output(&farm, "xabin").contains("xa-ran"),
+        "the unnamed drifted member must keep its installed content"
+    );
 });
 
 // Incremental stamping (issue #142): recipe stamps persist per
