@@ -19,11 +19,10 @@ return {
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
         requires = { "glibc", "zlib", "openssl", "ca-certificates" },
-        -- gcc as a declared build tool (gate-pod gap 3): works around
-        -- the provisioning FALLBACK observed in #170 (not a fix — that
-        -- bug stays open): the payload's drivers lead the sandbox PATH,
-        -- so cc/c++ resolve from the build prefix, not the rust toolchain.
-        build_deps = { "gcc" },
+        -- cc for this build comes from the caller's farm overlay (gate gcc
+        -- on PATH via `shuttle run --pod gate`). Declaring gcc here as a
+        -- build_dep is the gap-3 endgame but is deferred: the gcc payload
+        -- and linux-headers conflict in the merged prefix (#174).
         source = {
             url = "https://curl.se/download/curl-8.20.0.tar.xz",
         },
