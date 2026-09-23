@@ -1501,6 +1501,13 @@ pub fn add_snap_pod(
         .and_then(|n| lock.snaps.get(&n).map(|pin| (n, pin.sha3_384.clone())));
     if let Some((fname, pin_sha3_384)) = &pinned_name {
         if *pin_sha3_384 == sha3_384 {
+            // The fast path honors the arch gate too (issue #150): a
+            // re-add is still an add, and the filename's arch claim is
+            // knowable before the report — refuse foreign-arch content
+            // zero-write exactly like the post-unpack gate below.
+            if let Ok((_, _, arch)) = crate::oci::parse_artifact_filename(payload) {
+                refuse_foreign_arch(payload, arch.as_deref())?;
+            }
             if let Some(mut report) = sideload_readd_report(root, pod_name, fname, &sha3_384)? {
                 // Even a no-op re-add re-presents the pod: a previous
                 // install whose follow-up sync FAILED (e.g. the
@@ -1591,32 +1598,21 @@ pub fn add_snap_pod(
         // write — a foreign blob would install clean and fail only at
         // exec. `all` is the build default (resolve_archs) and makes no
         // host claim, like a filename without an arch component.
-        if let Some(arch) = arch {
-            let host = crate::snap::host_arch();
-            if arch != host && arch != "all" {
-                miette::bail!(
-                    "{}: filename says arch {arch} but this host is {host} — \
-                     refusing to sideload a foreign-architecture payload (it \
-                     would install and fail only at exec); sideload a {host} \
-                     payload",
-                    payload.display()
-                );
-            }
-        }
+        refuse_foreign_arch(payload, arch.as_deref())?;
     }
 
     // Trust gate (the `prepare_snap` classification, evaluated before
-    // any write so a refusal leaves zero state).
+    // any write so a refusal leaves zero state). The store-type notice
+    // is deferred below the pre-flights (issue #150 — same ordering
+    // rule as the conversion warning: a refusal emits no reassurance).
+    let mut store_records_only = false;
     match crate::units::classify(meta.snap_type.as_deref()) {
         crate::units::RuntimeClass::Infrastructure => miette::bail!(
             "snap '{name}' is snapd infrastructure (type={:?}) — refusing to \
              sideload via the package axis",
             meta.snap_type
         ),
-        crate::units::RuntimeClass::Store => crate::output::warn(format!(
-            "{name}: type=store — records only, nothing executable (store snaps \
-             keep their own runtime)"
-        )),
+        crate::units::RuntimeClass::Store => store_records_only = true,
         crate::units::RuntimeClass::ShootBuilt => {}
     }
 
@@ -1680,6 +1676,12 @@ pub fn add_snap_pod(
     // and before the conversion warning below, so a refusal emits no
     // "converted" claim.
     preflight_requires_closure(&meta, &name, &version)?;
+    if store_records_only {
+        crate::output::warn(format!(
+            "{name}: type=store — records only, nothing executable (store snaps \
+             keep their own runtime)"
+        ));
+    }
     if declared && !lock.snaps.contains_key(&name) {
         // The conversion is allowed but loud: the collection recipe
         // stops governing this package's content — the payload (an
@@ -1923,6 +1925,29 @@ fn unpack_payload_identity(
     Ok((meta, identity.version))
 }
 
+/// Architecture gate (issue #133): the filename arch is a claim about
+/// the payload; a mismatch with the host refuses before any write — a
+/// foreign blob would install clean and fail only at exec. `all` is the
+/// build default (resolve_archs) and makes no host claim, like a
+/// filename without an arch component. Shared by every identity path
+/// that carries a filename arch claim (issue #150), including the
+/// identical-content re-add fast path.
+fn refuse_foreign_arch(payload: &Path, arch: Option<&str>) -> miette::Result<()> {
+    if let Some(arch) = arch {
+        let host = crate::snap::host_arch();
+        if arch != host && arch != "all" {
+            miette::bail!(
+                "{}: filename says arch {arch} but this host is {host} — \
+                 refusing to sideload a foreign-architecture payload (it \
+                 would install and fail only at exec); sideload a {host} \
+                 payload",
+                payload.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Pre-write collision checks for a sideloaded payload (issue #8 +
 /// ADR-0032 Decision 3): binary and service claims read from the
 /// payload's `meta/snap.yaml` against the pod's post-state package set,
@@ -1936,6 +1961,17 @@ fn precheck_payload_collisions(
     payload: &crate::units::PayloadSnap,
     layer: crate::farm::ClaimLayer,
 ) -> miette::Result<()> {
+    // Farm-link bare names (issue #150): the payload's app and service
+    // names are `join`ed under the farm dir at emit — validate them with
+    // the farm's own seam check so a `..` component or absolute path
+    // refuses zero-write here, like every other precheck, instead of
+    // surfacing at farm emit (post-install).
+    for app in payload.apps.keys() {
+        crate::farm::check_farm_link_name("app", app, name)?;
+    }
+    for service in payload.services.keys() {
+        crate::farm::check_farm_link_name("service binary", service, name)?;
+    }
     let mut binary_claims: Vec<BinaryClaim> = payload
         .apps
         .keys()
