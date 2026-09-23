@@ -962,7 +962,7 @@ gated_test!(rebuild_unstamped_sweeps_only_with_the_flag, {
     );
     assert_eq!(code, Some(0), "rebuild-unstamped sync failed: {stderr}");
     assert!(
-        stderr.contains("no recorded closure digest — rebuilding"),
+        stderr.contains("no current-scheme recipe digest — rebuilding"),
         "the sweep must name what it rebuilds; stderr={stderr}"
     );
     assert!(

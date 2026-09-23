@@ -1431,6 +1431,7 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
             constraint: spec.constraint.clone(),
             deps: existing_deps,
             recipe_sha256: None,
+            recipe_digest_scheme: None,
         },
     );
     lock.save(&lock_path)?;
@@ -1791,6 +1792,7 @@ pub fn add_snap_pod(
             // A sideload is a blob pin (issue #116): no collection
             // recipe closure to hash — the payload is the identity.
             recipe_sha256: None,
+            recipe_digest_scheme: None,
         },
     );
     lock.snaps.insert(
@@ -2679,6 +2681,7 @@ pub fn update_pod(
                         constraint,
                         deps,
                         recipe_sha256: None,
+                        recipe_digest_scheme: None,
                     },
                 );
                 dirty = true;
@@ -3218,26 +3221,45 @@ fn hold_blob_pinned(
     Ok(())
 }
 
-/// Detect recipe-closure drift for one declared package (issue #142):
+/// The digest scheme a fresh stamp records (issue #172): v1 (#142)
+/// hashed the requires closure only; v2 adds the package's OWN recipe
+/// bytes. Bump when the digest inputs change — entries stamped under an
+/// older scheme re-baseline silently on the first sync under the newer
+/// one (the migration clause), so a scheme move never mass-rebuilds.
+const RECIPE_DIGEST_SCHEME: u32 = 2;
+
+/// Detect recipe drift for one declared package (issues #142 + #172):
 /// hash the canonical list of `(member_name, recipe_file_bytes)` over
-/// the package's recipe-resolved `requires` closure and compare it with
-/// the lockfile pin.
+/// the package's OWN recipe plus its recipe-resolved `requires`
+/// closure, and compare it with the lockfile pin.
 ///
-/// - Entry with an equal hash → today's behavior.
-/// - Entry without a hash (pre-#142 lockfile) → the digest is stamped
-///   (LOUD: it names the baseline and its limit) with NO rebuild —
-///   existing pods must not mass-rebuild. `sync --rebuild-unstamped`
+/// - Entry stamped under the CURRENT scheme with an equal hash →
+///   today's behavior.
+/// - Entry without a current-scheme stamp (no hash — pre-#142
+///   lockfile — or a v1 closure-only hash, issue #172) → the digest is
+///   stamped (LOUD: it names the baseline and its limit) with NO
+///   rebuild — existing pods must not mass-rebuild, and the scheme
+///   change itself must not read as drift. `sync --rebuild-unstamped`
 ///   opts into treating unstamped entries as drifted instead.
 /// - No entry (new pin) → today's behavior; the pin is stamped when
 ///   written.
 /// - Entry with a differing hash → drift: the package joins the
-///   rebuilt set EVEN at an unchanged version, its recipe-resolved
-///   (non-blob-pinned) closure members join the member-rebuild set, and
-///   the drift is named on the output.
+///   rebuilt set EVEN at an unchanged version, its own plus its
+///   recipe-resolved (non-blob-pinned) closure members join the
+///   member-rebuild set, and the drift is named on the output.
+///
+/// The OWN recipe bytes are the v2 addition (issue #172): a
+/// recipe-only change to the package itself at a constant version (a
+/// build_deps gain, a comment) is drift on sync, same as a member
+/// edit — the closure listing alone never saw it. The loud path for
+/// propagating a change stranded before a pod's first v2 stamp remains
+/// `pod refresh <pkg>`, which bypasses sync holds by design (#142).
 ///
 /// Members holding a blob pin (issue #116 sideloads) are excluded from
 /// the digest: their recipes live in the collection but the pod holds
-/// the blob — their drift must not force a rebuild.
+/// the blob — their drift must not force a rebuild. (The own package
+/// is never blob-pinned here: that shape took the `hold_blob_pinned`
+/// path before drift was probed.)
 fn detect_recipe_drift(
     ctx: &ReconcileCtx<'_>,
     spec: &PodPackageSpec,
@@ -3246,6 +3268,20 @@ fn detect_recipe_drift(
 ) -> miette::Result<()> {
     let members = crate::deps::resolve_dep_names(&meta.requires, true)?;
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    // The package's OWN recipe bytes (issue #172): same resolution
+    // [`crate::deps::load_meta`] just used for this package's meta.
+    let own_bytes = match crate::pkg_source::resolve_pkg(&spec.name) {
+        crate::pkg_source::PkgResult::File(path) => std::fs::read(&path)
+            .map_err(|e| miette::miette!("failed to read recipe of '{}': {e}", spec.name))?,
+        crate::pkg_source::PkgResult::Found { content, .. } => content.into_bytes(),
+        crate::pkg_source::PkgResult::NotFound => {
+            miette::bail!(
+                "recipe of declared package '{}' not found for the drift probe",
+                spec.name
+            )
+        }
+    };
+    entries.push((spec.name.clone(), own_bytes));
     for name in members {
         // Blob-pinned member (sideloaded): the pod holds the blob, the
         // collection recipe is not what executes — excluded.
@@ -3269,39 +3305,53 @@ fn detect_recipe_drift(
         // New pin: stamped when the entry is written.
         return Ok(());
     };
-    match &entry.recipe_sha256 {
-        None => {
-            // Migration (issue #142): stamp WITHOUT a rebuild — existing
-            // pods must not mass-rebuild. The stamp is LOUD (round 5:
-            // the silent baseline swallowed pre-baseline fixes forever)
-            // and names both the limit and the escape hatch. With
-            // `sync --rebuild-unstamped` the operator opts into the
-            // one-time rebuild sweep instead: the unstamped entry is
-            // treated as drifted, in the exact shape of the branch
-            // below.
+    if entry.version != meta.version {
+        // A VERSION move is not drift (issues #142 + #172): the
+        // candidate's own recipe legitimately differs from the pin's
+        // stamp — the version field alone moves it — so `pod update`
+        // and the pin hold own the decision. Firing drift here would
+        // rebuild the pinned version FROM the candidate's recipe, and
+        // stamping here would baseline recipe content the pod never
+        // installed. The entry stays untouched: its stamp keeps
+        // describing the installed version's recipe, and a drifted
+        // closure member sweeps on a version-equal sync.
+        return Ok(());
+    }
+    let stamped_current_scheme =
+        entry.recipe_sha256.is_some() && entry.recipe_digest_scheme == Some(RECIPE_DIGEST_SCHEME);
+    if !stamped_current_scheme {
+        // Migration (issues #142 + #172): stamp WITHOUT a rebuild —
+        // existing pods must not mass-rebuild, and the v1→v2 scheme
+        // move itself must not read as drift. The stamp is LOUD
+        // (round 5: the silent baseline swallowed pre-baseline fixes
+        // forever) and names both the limit and the escape hatch. With
+        // `sync --rebuild-unstamped` the operator opts into the
+        // one-time rebuild sweep instead: the unstamped entry is
+        // treated as drifted, in the exact shape of the branch below.
+        build
+            .recipe_stamps_pending
+            .push((spec.name.clone(), digest));
+        if build.rebuild_unstamped {
+            build.recipe_drift.insert(spec.name.clone());
             build
-                .recipe_stamps_pending
-                .push((spec.name.clone(), digest));
-            if build.rebuild_unstamped {
-                build.recipe_drift.insert(spec.name.clone());
-                build
-                    .recipe_drift_members
-                    .extend(entries.iter().map(|(name, _)| name.clone()));
-                crate::output::status(format!(
-                    "recipe drift: {} (no recorded closure digest — rebuilding)",
-                    spec.name
-                ));
-            } else {
-                crate::output::status(format!(
-                    "baseline recorded for '{}': recipe drift predating this sync \
-                     is unrecoverable — run `shuttle pod refresh <member>` to \
-                     rebuild a member from its current recipe",
-                    spec.name
-                ));
-            }
+                .recipe_drift_members
+                .extend(entries.iter().map(|(name, _)| name.clone()));
+            crate::output::status(format!(
+                "recipe drift: {} (no current-scheme recipe digest — rebuilding)",
+                spec.name
+            ));
+        } else {
+            crate::output::status(format!(
+                "baseline recorded for '{}': recipe drift predating this sync \
+                 is unrecoverable — run `shuttle pod refresh <member>` to \
+                 rebuild a member from its current recipe",
+                spec.name
+            ));
         }
-        Some(recorded) if *recorded == digest => {}
-        Some(_) => record_recipe_drift(spec, digest, &entries, build),
+    } else if entry.recipe_sha256.as_deref() == Some(digest.as_str()) {
+        // Equal: today's behavior — the sync proceeds normally.
+    } else {
+        record_recipe_drift(spec, digest, &entries, build);
     }
     Ok(())
 }
@@ -3338,19 +3388,18 @@ fn record_recipe_drift(
     build
         .recipe_drift_members
         .extend(entries.iter().map(|(name, _)| name.clone()));
-    crate::output::status(format!(
-        "recipe drift: {} (closure recipe changed)",
-        spec.name
-    ));
+    crate::output::status(format!("recipe drift: {} (recipe changed)", spec.name));
 }
 
-/// SHA-256 over the canonical closure listing (issue #142): entries
-/// sorted by member name (sorted by the caller), each fed into one
-/// running hash as `name \0 <length> \0 bytes` — the NAR-style
-/// convention of [`crate::pkg_source::content_hash`] (sorted paths +
-/// contents), lifted one level: the members are the paths, the recipe
-/// bytes the contents. The length prefix keeps adjacent entries
-/// unambiguous.
+/// SHA-256 over the canonical listing the caller feeds (issues #142 +
+/// #172): entries sorted by member name (sorted by the caller), each
+/// fed into one running hash as `name \0 <length> \0 bytes` — the
+/// NAR-style convention of [`crate::pkg_source::content_hash`] (sorted
+/// paths + contents), lifted one level: the members are the paths, the
+/// recipe bytes the contents. The length prefix keeps adjacent entries
+/// unambiguous. Under the v2 scheme the listing leads with the
+/// package's own `(name, recipe_bytes)` entry, so an own-recipe edit
+/// moves the digest exactly like a member edit.
 fn recipe_closure_hash(entries: &[(String, Vec<u8>)]) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
@@ -3521,7 +3570,9 @@ fn deps_pin_moved(
 /// version change repins (carrying the deps pin forward, ADR-0017); a
 /// version kept with a fresh closure pin records the deps pin
 /// separately (float). Every written entry carries the package's
-/// recipe-closure digest (issue #142) — a repin must not wipe it.
+/// recipe digest (issues #142 + #172) — a repin must not wipe it. A
+/// fresh digest stamps the current scheme; a carried-forward digest
+/// keeps the scheme it was recorded under.
 fn record_pin_movement(
     repins: &mut Vec<(String, PodPackageLockEntry)>,
     deps_pins: &mut Vec<(String, crate::lock::PackageDepsLock)>,
@@ -3536,17 +3587,20 @@ fn record_pin_movement(
     if version_changed {
         // A repin carries the existing deps pin forward (ADR-0017):
         // content-addressed, re-verified by sync. Same for the recipe
-        // closure hash (issue #142): the fresh digest when this
-        // reconcile computed one, else the recorded hash carried
-        // forward — a repin never wipes the pin.
+        // digest (issues #142 + #172): a fresh digest when this
+        // reconcile computed one (stamped under the current scheme),
+        // else the recorded digest + scheme carried forward — a repin
+        // never wipes the pin.
         let deps = deps_pin
             .cloned()
             .or_else(|| lock.packages.get(&spec.name).and_then(|e| e.deps.clone()));
-        let recipe_sha256 = recipe_sha256.map(str::to_string).or_else(|| {
-            lock.packages
-                .get(&spec.name)
-                .and_then(|e| e.recipe_sha256.clone())
-        });
+        let (recipe_sha256, recipe_digest_scheme) = match recipe_sha256 {
+            Some(fresh) => (Some(fresh.to_string()), Some(RECIPE_DIGEST_SCHEME)),
+            None => match lock.packages.get(&spec.name) {
+                Some(old) => (old.recipe_sha256.clone(), old.recipe_digest_scheme),
+                None => (None, None),
+            },
+        };
         repins.push((
             spec.name.clone(),
             PodPackageLockEntry {
@@ -3554,6 +3608,7 @@ fn record_pin_movement(
                 constraint: spec.constraint.clone(),
                 deps,
                 recipe_sha256,
+                recipe_digest_scheme,
             },
         ));
     } else if let Some(pin) = deps_pin {
@@ -4095,10 +4150,11 @@ fn collect_own_packages(
     Ok(())
 }
 
-/// Persist one queued recipe-closure stamp (issue #142): written onto
+/// Persist one queued recipe stamp (issues #142 + #172): written onto
 /// the package's EXISTING lock entry (a stamp never creates a pin) and
 /// saved immediately. Incremental, per-package — the stamp records the
-/// digest the package's closure had when its contribution succeeded.
+/// digest the package's own-plus-closure recipes had when its
+/// contribution succeeded, always under the current scheme.
 fn commit_pending_recipe_stamp(
     ctx: &mut ReconcileCtx<'_>,
     build: &mut ReconcileBuild,
@@ -4113,8 +4169,11 @@ fn commit_pending_recipe_stamp(
     };
     let (_, digest) = build.recipe_stamps_pending.remove(pos);
     if let Some(entry) = ctx.lock.packages.get_mut(name) {
-        if entry.recipe_sha256.as_deref() != Some(digest.as_str()) {
+        if entry.recipe_sha256.as_deref() != Some(digest.as_str())
+            || entry.recipe_digest_scheme != Some(RECIPE_DIGEST_SCHEME)
+        {
             entry.recipe_sha256 = Some(digest);
+            entry.recipe_digest_scheme = Some(RECIPE_DIGEST_SCHEME);
             ctx.lock.save(ctx.lock_path)?;
         }
     }
@@ -4430,6 +4489,7 @@ fn apply_pin_updates(
                     constraint: None,
                     deps: Some(deps.clone()),
                     recipe_sha256: None,
+                    recipe_digest_scheme: None,
                 },
             );
         }
@@ -5736,6 +5796,7 @@ pub fn fetch_pod_deps(
                 constraint: spec.constraint.clone(),
                 deps: None,
                 recipe_sha256: None,
+                recipe_digest_scheme: None,
             })
             .deps = Some(pin.clone());
         report.fetched.push(DepsFetchedEntry {
@@ -6213,6 +6274,7 @@ pod {
                 constraint: None,
                 deps: None,
                 recipe_sha256: None,
+                recipe_digest_scheme: None,
             },
         );
         let gen = gen_with_record(record);

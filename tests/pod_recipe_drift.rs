@@ -1,12 +1,14 @@
-//! Recipe-closure drift for pods (issue #142) — integration tests
+//! Recipe drift for pods (issues #142 + #172) — integration tests
 //! through the real binary.
 //!
 //! Mirrors tests/pod_snap_sideload.rs: a declared package in `pkgs/`
 //! with a `requires` edge is resolved, built, and installed into a pod
 //! over a loopback HTTP source. The pod lockfile pin carries a
-//! `recipe_sha256` over the package's recipe-resolved requires closure;
-//! editing a member's recipe (the #138 stranded-fix story: a recipe-only
-//! change to an UNDECLARED member) must reach the installed pod on the
+//! `recipe_sha256` over the package's OWN recipe plus its
+//! recipe-resolved requires closure (#172 added the own bytes, the v2
+//! scheme); editing a member's recipe (the #138 stranded-fix story: a
+//! recipe-only change to an UNDECLARED member) or the package's own
+//! recipe at a constant version must reach the installed pod on the
 //! next `sync` even though every version pin is unchanged.
 //!
 //! All state (project dirs, pod roots) lives in tempdirs — never the
@@ -148,6 +150,24 @@ fn write_pkg(
     std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
 }
 
+/// Prepend a comment line to a package's recipe (issue #172): a pure
+/// byte-level edit — the resolved meta (and every version) stays
+/// identical, so only the own recipe's bytes moving the digest can
+/// detect it.
+fn add_recipe_comment(project: &Path, name: &str) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let path = project
+        .join("pkgs")
+        .join(letter.to_string())
+        .join(format!("{name}.lua"));
+    let body = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!("-- own-recipe drift (#172): bytes only\n{body}"),
+    )
+    .unwrap();
+}
+
 // ── Runners ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
@@ -255,7 +275,7 @@ fn sync_rebuilds_recipe_drifted_root() {
     let (code, stdout, stderr) = run(&project, &root, &["--name", "p", "sync"]);
     assert_eq!(code, Some(0), "drift sync failed: {stderr}");
     assert!(
-        stderr.contains("recipe drift: app (closure recipe changed)"),
+        stderr.contains("recipe drift: app (recipe changed)"),
         "drift must be named on the output; stdout={stdout} stderr={stderr}"
     );
     assert!(
@@ -507,7 +527,7 @@ fn rebuild_of_drifted_pod_restamps() {
     let (code, _, stderr) = run(&project, &root, &["--name", "p", "rebuild", "app"]);
     assert_eq!(code, Some(0), "rebuild failed: {stderr}");
     assert!(
-        stderr.contains("recipe drift: app (closure recipe changed)"),
+        stderr.contains("recipe drift: app (recipe changed)"),
         "rebuild names the drift; stderr={stderr}"
     );
     assert!(
@@ -518,5 +538,181 @@ fn rebuild_of_drifted_pod_restamps() {
         recipe_hash_of(&read_lock(&root, "p"), "app").as_deref(),
         Some(first_hash.as_str()),
         "rebuild restamps the closure hash"
+    );
+}
+
+/// (f, #172) Recipe-only edit to the package's OWN recipe at a constant
+/// version, changing the built content → sync names the drift, rebuilds
+/// (new generation), restamps under the v2 scheme.
+#[test]
+fn sync_rebuilds_own_recipe_drift() {
+    require_chain();
+    if !chain_available() {
+        return;
+    }
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    let (project, root) = sync_fixture_pod(server.path(), port, "p");
+    let gens_before = generation_count(&root, "p");
+    let first_hash = recipe_hash_of(&read_lock(&root, "p"), "app").unwrap();
+
+    // Drift: the OWN recipe's bytes AND content change; version stays 1.0.
+    write_pkg(
+        &project,
+        "app",
+        &["libmember"],
+        "appbin",
+        "app-v2",
+        port,
+        "appsrc.tar.gz",
+    );
+
+    let (code, stdout, stderr) = run(&project, &root, &["--name", "p", "sync"]);
+    assert_eq!(code, Some(0), "own-drift sync failed: {stderr}");
+    assert!(
+        stderr.contains("recipe drift: app"),
+        "own-recipe drift must be named; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        generation_count(&root, "p") > gens_before,
+        "the own-recipe drift must land a new generation; stderr={stderr}"
+    );
+
+    // The pin was restamped with the own bytes folded in, under the
+    // v2 scheme marker.
+    let second_hash = recipe_hash_of(&read_lock(&root, "p"), "app").unwrap();
+    assert_ne!(second_hash, first_hash, "own bytes moved the digest");
+    let lock = read_lock(&root, "p");
+    assert_eq!(
+        lock["packages"]["app"]["recipe_digest_scheme"].as_u64(),
+        Some(2),
+        "the v2 scheme marker is recorded"
+    );
+
+    // Convergence: a third sync holds everything — the drift was swept.
+    let gens_after = generation_count(&root, "p");
+    let (code, _, stderr3) = run(&project, &root, &["--name", "p", "sync"]);
+    assert_eq!(code, Some(0));
+    assert!(
+        stderr3.contains("already matches its declaration"),
+        "post-drift sync must be a no-op; stderr={stderr3}"
+    );
+    assert_eq!(generation_count(&root, "p"), gens_after);
+}
+
+/// (f2, #172) The pure silent-no-op shape: a bytes-only edit that
+/// leaves the resolved meta identical (a comment) never moved the
+/// content hold (#113) — before #172 it was invisible FOREVER. Now the
+/// drift is named and the stamp moves, while the churn guard keeps the
+/// byte-identical rebuild from churning the generation.
+#[test]
+fn own_recipe_bytes_drift_named_without_churn() {
+    require_chain();
+    if !chain_available() {
+        return;
+    }
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    let (project, root) = sync_fixture_pod(server.path(), port, "p");
+    let gens = generation_count(&root, "p");
+    let first_hash = recipe_hash_of(&read_lock(&root, "p"), "app").unwrap();
+
+    add_recipe_comment(&project, "app");
+
+    let (code, stdout, stderr) = run(&project, &root, &["--name", "p", "sync"]);
+    assert_eq!(code, Some(0), "bytes-only drift sync failed: {stderr}");
+    assert!(
+        stderr.contains("recipe drift: app"),
+        "own-recipe drift must be named even when meta-identical; \
+         stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        generation_count(&root, "p"),
+        gens,
+        "a byte-identical rebuild is churn-guarded: no new generation"
+    );
+    assert_ne!(
+        recipe_hash_of(&read_lock(&root, "p"), "app").as_deref(),
+        Some(first_hash.as_str()),
+        "the stamp follows the recipe bytes"
+    );
+
+    // Convergence: the next sync holds — the drift was recorded.
+    let (code, _, stderr3) = run(&project, &root, &["--name", "p", "sync"]);
+    assert_eq!(code, Some(0));
+    assert!(
+        !stderr3.contains("recipe drift: app"),
+        "the drifted bytes are the new baseline; stderr={stderr3}"
+    );
+}
+
+/// (g, #172) Migration: an entry stamped under the v1 scheme
+/// (closure-only digest, no marker) baselines SILENTLY on the first
+/// sync under the v2 scheme — the scheme move itself is not drift, no
+/// rebuild — and an own-recipe edit AFTER that stamp is drift on the
+/// second sync.
+#[test]
+fn v1_stamp_baselines_silently_then_drifts() {
+    require_chain();
+    if !chain_available() {
+        return;
+    }
+    let server = tempfile::tempdir().unwrap();
+    let port = serve_dir(server.path());
+    let (project, root) = sync_fixture_pod(server.path(), port, "p");
+
+    // Simulate the v1 shape: a recorded digest with NO scheme marker.
+    let lock_path = root.join("p").join("shuttle.lock");
+    let mut lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    let app = lock["packages"]["app"].as_object_mut().unwrap();
+    app.insert(
+        "recipe_sha256".into(),
+        serde_json::Value::String("0".repeat(64)),
+    );
+    app.remove("recipe_digest_scheme");
+    std::fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+
+    // First sync under the v2 scheme: stamps silently, no rebuild.
+    let gens = generation_count(&root, "p");
+    let (code, _, stderr) = run(&project, &root, &["--name", "p", "sync"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("baseline recorded for 'app'"),
+        "the v1→v2 restamp must be loud; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("recipe drift: app"),
+        "a scheme move is not drift; stderr={stderr}"
+    );
+    assert_eq!(
+        generation_count(&root, "p"),
+        gens,
+        "migration must not bump the generation"
+    );
+    let lock = read_lock(&root, "p");
+    let stamped = recipe_hash_of(&lock, "app").expect("v2 stamp recorded");
+    assert_ne!(stamped, "0".repeat(64), "re-stamped under the v2 scheme");
+    assert_eq!(
+        lock["packages"]["app"]["recipe_digest_scheme"].as_u64(),
+        Some(2),
+        "the v2 marker is recorded"
+    );
+
+    // Second sync after an own-recipe edit: drift fires now — the
+    // #172 gap is closed for this pod. The comment edit builds
+    // byte-identical content, so the rebuild is churn-guarded (no
+    // generation) — but it is named and restamped.
+    add_recipe_comment(&project, "app");
+    let (code, _, stderr) = run(&project, &root, &["--name", "p", "sync"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("recipe drift: app"),
+        "post-migration own-recipe edit must drift; stderr={stderr}"
+    );
+    assert_ne!(
+        recipe_hash_of(&read_lock(&root, "p"), "app").as_deref(),
+        Some(stamped.as_str()),
+        "the stamp follows the edited bytes"
     );
 }

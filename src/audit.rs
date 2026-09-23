@@ -1159,6 +1159,7 @@ mod tests {
                         lock_sha256: None,
                     }),
                     recipe_sha256: None,
+                    recipe_digest_scheme: None,
                 },
             );
         }
