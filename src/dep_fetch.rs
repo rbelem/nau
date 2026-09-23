@@ -264,8 +264,18 @@ fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<PathBuf> {
     let sha = sha256_file(&tarball)?;
     if let Some(expected) = spec.expected_sha256() {
         if sha != expected {
-            return Err(miette::miette!(
-                "SHA-256 mismatch for {url}:\n  expected: {expected}\n  got:      {sha}"
+            // Issue #175: a floating source's recorded pin is a moving
+            // target by design — re-resolve (TOFU-record the new hash)
+            // exactly like the rebuild path does, never enforce the
+            // stale pin.
+            if !meta.floating {
+                return Err(miette::miette!(
+                    "SHA-256 mismatch for {url}:\n  expected: {expected}\n  got:      {sha}"
+                ));
+            }
+            crate::output::warn(format!(
+                "floating source of {} re-resolved: {:.12}… → {:.12}… (restamping the pin)",
+                meta.name, expected, sha
             ));
         }
     }
