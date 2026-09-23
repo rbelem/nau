@@ -114,7 +114,9 @@ const POD_TOOLS: [(&str, &str); 4] = [
 /// the gcc payload sideload (issue #164 follow-up: one payload carries
 /// cc and c++), keeping the distro packages as the fallback per
 /// install.sh's map (g++, gcc-c++ on dnf/zypper); `sh`/`make` have no
-/// payload, so they keep the sandbox phrasing.
+/// payload, so they keep the sandbox phrasing. cc/c++ additionally get
+/// the pod-env credit ([`POD_ENV_TOOLS`], issue #178) — the hint below
+/// is for the genuinely-absent case only.
 const POD_SANDBOX_TOOLS: [(&str, &str); 4] = [
     (
         "sh",
@@ -138,6 +140,15 @@ const POD_SANDBOX_TOOLS: [(&str, &str); 4] = [
          install g++, dnf install gcc-c++)",
     ),
 ];
+
+/// The pod-scope tools that additionally credit the pod farms (issue
+/// #178): both C toolchain names ride the gcc payload's farm shims
+/// (commit 77964ae), and `shuttle run --pod` composes a farm-first
+/// PATH ([`crate::confine`] `overlay_pod_env_with`) that resolves them
+/// with no host install — the check must read readiness the same way
+/// the run form does. `sh`/`make` have no payload-shim contract, so
+/// they keep the sandbox-visibility semantics only.
+const POD_ENV_TOOLS: [&str; 2] = ["cc", "c++"];
 
 /// Which tool surface `doctor` gates (issue #97).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +179,10 @@ pub fn run_all() -> Vec<Check> {
 /// tools (mksquashfs/unsquashfs, bwrap, curl, tar) plus the sandbox
 /// build toolchain (sh, make, cc, c++). Image-verb checks are skipped —
 /// the installer's verify step gates on this scope, so a machine with
-/// the pod set but no image tools reads as ready.
+/// the pod set but no image tools reads as ready. The cc/c++ checks
+/// also credit toolchains reachable through the farm-first pod env of
+/// any healthy pod (issue #178) — readiness as `shuttle run --pod`
+/// would see it.
 pub fn run_pod() -> Vec<Check> {
     run_scoped(Scope::Pod)
 }
@@ -193,7 +207,17 @@ fn run_scoped(scope: Scope) -> Vec<Check> {
         Scope::Full => &SANDBOX_TOOLS,
         Scope::Pod => &POD_SANDBOX_TOOLS,
     };
-    checks.extend(check_sandbox_tools_with(toolchain, &snap::path_entries()));
+    let entries = snap::path_entries();
+    match scope {
+        Scope::Full => checks.extend(check_sandbox_tools_with(toolchain, &entries)),
+        // Pod scope takes the #178 variant: cc/c++ also credit the pod
+        // farms (`shuttle run --pod`'s farm-first PATH surface).
+        Scope::Pod => checks.extend(
+            toolchain
+                .iter()
+                .map(|(tool, fix)| check_pod_toolchain_tool(tool, fix, &entries)),
+        ),
+    }
     checks
 }
 
@@ -1123,6 +1147,66 @@ fn check_sandbox_tools_with(tools: &[(&str, &str)], entries: &[PathBuf]) -> Vec<
         .collect()
 }
 
+/// Check one pod-scope toolchain tool (issue #178):
+/// [`check_sandbox_tool`] plus a pod-env credit — the pod farms under
+/// the pod root are the surface `shuttle run --pod` searches FIRST
+/// (farm-first PATH), so a cc/c++ that only resolves there is ready for
+/// pod-side work and must not read as missing. The pre-#178 check
+/// flagged exactly that setup on gate pods carrying the gcc payload
+/// (whose farm shims provide both names), advising the user to
+/// sideload what the pod already carries.
+fn check_pod_toolchain_tool(tool: &str, fix: &str, entries: &[PathBuf]) -> Check {
+    let farms = pod_farm_dirs();
+    check_pod_toolchain_tool_with(tool, fix, entries, &farms)
+}
+
+/// The resolution proper over explicit pod farms — split out so tests
+/// can point the farms at a tempdir without touching the real pod root.
+fn check_pod_toolchain_tool_with(
+    tool: &str,
+    fix: &str,
+    entries: &[PathBuf],
+    farms: &[PathBuf],
+) -> Check {
+    let check = check_sandbox_tool(tool, fix, entries);
+    if !POD_ENV_TOOLS.contains(&tool) || matches!(check.status, CheckStatus::Ok) {
+        return check;
+    }
+    if resolve_pod_tool_in(tool, farms).is_some() {
+        // The pod provides the tool — pass, no hint (issue #178).
+        Check::ok(format!("sandbox: {tool}"))
+    } else {
+        check
+    }
+}
+
+/// Resolve `tool` through the pod farms — the first PATH entries
+/// `shuttle run --pod` composes, one farm per healthy pod.
+fn resolve_pod_tool_in(tool: &str, farms: &[PathBuf]) -> Option<PathBuf> {
+    farms
+        .iter()
+        .find_map(|farm| snap::resolve_in_path(tool, std::slice::from_ref(farm)))
+}
+
+/// Farm bin dirs of every pod under the pod root whose `current` link
+/// resolves to an active generation — the farm-first PATH entries
+/// `shuttle run --pod` prepends. `doctor --pod` takes no pod name, so
+/// any healthy pod's farm counts as reachable. A missing or dangling
+/// `current` contributes nothing — doctor is a diagnostic, never a
+/// state initializer.
+fn pod_farm_dirs() -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(crate::pod::pod_root(None)) else {
+        return Vec::new();
+    };
+    let mut farms: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path().join(crate::farm::CURRENT_LINK))
+        .filter(|farm| std::fs::metadata(farm).is_ok_and(|m| m.is_dir()))
+        .collect();
+    farms.sort();
+    farms
+}
+
 /// Print a formatted doctor report to stdout.
 pub fn print_report(checks: &[Check]) {
     let mut all_ok = true;
@@ -1424,6 +1508,119 @@ mod tests {
         assert!(
             hint.contains("login PATH"),
             "hint must carry the fix: {hint}"
+        );
+    }
+
+    // ── Pod-env credit for the cc/c++ toolchain checks (issue #178) ──
+
+    /// A stand-in pod farm: `<pod>/current` with an executable tool shim
+    /// inside — the shape the gcc payload's farm emission leaves behind
+    /// (direct store links and the 77964ae dispatch shims).
+    fn write_pod_farm(dir: &std::path::Path, pod: &str, tool: &str) -> PathBuf {
+        let farm = dir.join(pod).join(crate::farm::CURRENT_LINK);
+        std::fs::create_dir_all(&farm).unwrap();
+        write_exec(&farm, tool);
+        farm
+    }
+
+    /// The tool entry named by `POD_SANDBOX_TOOLS`, so tests exercise the
+    /// real (tool, fix) pair run_scoped maps over.
+    fn pod_tool(name: &str) -> (&'static str, &'static str) {
+        POD_SANDBOX_TOOLS
+            .iter()
+            .find(|(tool, _)| *tool == name)
+            .copied()
+            .unwrap_or_else(|| panic!("{name} must be a POD_SANDBOX_TOOLS entry"))
+    }
+
+    #[test]
+    fn doctor_pod_scope_credits_cc_and_cxx_from_a_pod_farm() {
+        let dir = tempfile::tempdir().unwrap();
+        let farm = write_pod_farm(dir.path(), "gate", "cc");
+        write_exec(&farm, "c++");
+        // Host PATH offers nothing (a garbage-collected store entry), so
+        // the pod farm is the only provider — the live gate-pod shape.
+        let entries = vec![PathBuf::from("/nix/store/0000-garbage-collected/bin")];
+
+        for tool in ["cc", "c++"] {
+            let (name, fix) = pod_tool(tool);
+            let check = check_pod_toolchain_tool_with(name, fix, &entries, &[farm.clone()]);
+            assert!(
+                matches!(check.status, CheckStatus::Ok),
+                "pod-provided {tool} must pass: {check:?}"
+            );
+            assert!(
+                check.hint.is_none(),
+                "pod-provided {tool} passes with no hint: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_pod_scope_keeps_the_gcc_payload_hint_when_absent_everywhere() {
+        let entries = vec![PathBuf::from("/nix/store/0000-garbage-collected/bin")];
+        let (name, fix) = pod_tool("cc");
+        let check = check_pod_toolchain_tool_with(name, fix, &entries, &[]);
+        assert!(matches!(check.status, CheckStatus::Missing));
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("gcc payload") && hint.contains("not found on PATH"),
+            "genuinely-absent cc must keep the sideload hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn doctor_pod_scope_farm_credit_wins_over_the_out_of_roots_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Host-resolvable cc outside the bind roots reads as the error
+        // verdict on its own…
+        write_exec(dir.path(), "cc");
+        let farm = write_pod_farm(dir.path(), "gate", "cc");
+        let entries = vec![
+            dir.path().to_path_buf(),
+            PathBuf::from("/nix/store/0000-garbage-collected/bin"),
+        ];
+
+        let bare = check_pod_toolchain_tool_with("cc", pod_tool("cc").1, &entries, &[]);
+        assert!(
+            matches!(bare.status, CheckStatus::Error),
+            "host-only out-of-roots cc must stay the error verdict: {bare:?}"
+        );
+
+        // …but `shuttle run --pod` composes the farm FIRST, so with the
+        // farm present the tool resolves and the check must say so.
+        let check = check_pod_toolchain_tool_with("cc", pod_tool("cc").1, &entries, &[farm]);
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "farm-first PATH resolves cc — must pass: {check:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_pod_scope_farm_credit_requires_an_executable_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let farm = dir.path().join("gate").join(crate::farm::CURRENT_LINK);
+        std::fs::create_dir_all(&farm).unwrap();
+        std::fs::write(farm.join("cc"), "#!/bin/sh\n").unwrap(); // mode 644
+        let entries = vec![PathBuf::from("/nix/store/0000-garbage-collected/bin")];
+
+        let check = check_pod_toolchain_tool_with("cc", pod_tool("cc").1, &entries, &[farm]);
+        assert!(
+            matches!(check.status, CheckStatus::Missing),
+            "a non-executable farm entry is no shim: {check:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_pod_scope_credits_only_the_pod_env_tools_from_farms() {
+        let dir = tempfile::tempdir().unwrap();
+        let farm = write_pod_farm(dir.path(), "gate", "make");
+        let entries = vec![PathBuf::from("/nix/store/0000-garbage-collected/bin")];
+
+        let check = check_pod_toolchain_tool_with("make", pod_tool("make").1, &entries, &[farm]);
+        assert!(
+            matches!(check.status, CheckStatus::Missing),
+            "make has no pod-shim contract — no farm credit: {check:?}"
         );
     }
 
