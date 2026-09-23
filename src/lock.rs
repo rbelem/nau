@@ -150,9 +150,10 @@ pub struct PodPackageLockEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deps: Option<PackageDepsLock>,
 
-    /// Recipe-closure pin (issue #142): SHA-256 over the canonical,
+    /// Recipe pin (issues #142 + #172): SHA-256 over the canonical,
     /// sorted list of `(member_name, recipe_file_bytes)` covering the
-    /// package's recipe-resolved `requires` closure — the members
+    /// package's OWN recipe plus its recipe-resolved `requires` closure
+    /// (v2 scheme — see [`Self::recipe_digest_scheme`]) — the members
     /// reconcile builds from collection recipes (blob-pinned sideloads
     /// excluded). Sync compares it to detect recipe drift at an
     /// unchanged version pin and rebuilds the affected package.
@@ -160,6 +161,16 @@ pub struct PodPackageLockEntry {
     /// stamped on the next sync without a rebuild.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipe_sha256: Option<String>,
+
+    /// Digest-scheme marker for [`Self::recipe_sha256`] (issue #172):
+    /// `2` once the digest covers the package's OWN recipe bytes plus
+    /// its requires closure. Absent → the #142 v1 scheme (closure only)
+    /// or a pre-#142 lockfile: the first sync under the v2 scheme
+    /// re-stamps WITHOUT a rebuild (the migration clause) — own-recipe
+    /// drift predating that stamp is unrecoverable; `pod refresh
+    /// <member>` rebuilds a member from its current recipe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe_digest_scheme: Option<u32>,
 }
 
 /// The dependency-closure pin for one pod package (ADR-0017, issue #13).
