@@ -1,4 +1,4 @@
--- gcc: GNU Compiler Collection 14.2 (C) for x86_64 — FETCH strategy.
+-- gcc: GNU Compiler Collection 14.2 (C/C++) for x86_64 — FETCH strategy.
 --
 -- Issue #164: the gate pod's cargo builds die at build scripts
 -- (`failed to find tool "cc"` — zstd-sys et al.) because the pod carries
@@ -224,7 +224,7 @@ ifs=$IFS; IFS=:
 for p in $LIBRARY_PATH; do l="$l -L$p"; done
 IFS=$ifs
 case "${0##*/}" in
-  c++|cxx|g++) exec "$d/x86_64-linux-gnu-c++-14" $l "$@" ;;
+  c++|cxx|g++) exec "$d/x86_64-linux-gnu-g++-14" $l "$@" ;;
   *) exec "$d/x86_64-linux-gnu-gcc-14" $l "$@" ;;
 esac
 EOF
@@ -242,6 +242,13 @@ chmod +x "$STAGE/usr/bin/cc" && cp "$STAGE/usr/bin/cc" "$STAGE/usr/bin/c++"]],
             'test -x "$STAGE/usr/bin/cc"',
             'test -x "$STAGE/usr/bin/c++"',
             'test -x "$STAGE/usr/libexec/gcc/x86_64-linux-gnu/14/cc1"',
+            -- The C++ half of the payload must land too (issue #164
+            -- follow-up): cc1plus beside cc1, the g++ driver the c++
+            -- shim execs, and the runtime libstdc++.so.6 in the
+            -- multiarch dir the generation's loader-lib key exposes.
+            'test -x "$STAGE/usr/libexec/gcc/x86_64-linux-gnu/14/cc1plus"',
+            'test -x "$STAGE/usr/bin/x86_64-linux-gnu-g++-14"',
+            'test -e "$STAGE/usr/lib/x86_64-linux-gnu/libstdc++.so.6"',
             'test -e "$STAGE/usr/bin/as"',
             'test -e "$STAGE/usr/bin/ld"',
         }, " && "),

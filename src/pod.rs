@@ -1462,10 +1462,13 @@ struct PayloadIdentity {
 /// Fail-closed gates, all BEFORE any write: `--ack-unsigned` (v1
 /// sideloads carry no signature — snapd's `--dangerous` precedent),
 /// filename↔meta identity, the trust gate, collision prechecks. A
-/// re-add of the identical payload is a no-op; a re-add whose payload
-/// carries the SAME name+version but different bytes is refused (the
-/// content under one version is the pin's trust anchor — a move bumps
-/// the version); a DIFFERENT version moves the pins deliberately.
+/// re-add of the identical payload is a no-op (the blob hash is the
+/// identity); divergent bytes — same version re-built or a new version
+/// — move the pins and replace the member as a new generation (issue
+/// #164 follow-up: recipe revisions no longer force `pod remove` →
+/// re-add generation churn), all through the same gates; a payload
+/// that also fails to unpack still refuses fail-closed naming the pin
+/// mismatch.
 pub fn add_snap_pod(
     root: &Path,
     pod_name: &str,
@@ -1539,8 +1542,9 @@ pub fn add_snap_pod(
             // Content missing from the generation: fall through to a
             // repair-install.
         }
-        // Divergent bytes under a pinned name: the unpack below decides
-        // tamper (same version → refuse) vs move.
+        // Divergent bytes under a pinned name: fall through to the
+        // full gated install — a replacement, same version or not. A
+        // payload that ALSO fails to unpack refuses fail-closed below.
     }
 
     // Unpack once for identity + the trust gate (install re-unpacks and
@@ -1618,28 +1622,14 @@ pub fn add_snap_pod(
     }
 
     // Re-add bookkeeping: identical content is a no-op (checked above
-    // when the filename allowed the cheap path); the same version with
-    // divergent bytes is refused; a new version moves deliberately.
+    // when the filename allowed the cheap path); divergent bytes — the
+    // same version re-built or a version move — move the pins below,
+    // and install_batch replaces the member as a new generation
+    // (content-hash identity, issue #164 follow-up). Every gate above
+    // and inside the install re-ran first (--ack-unsigned, trust
+    // classification, identity, collisions, requires closure).
     let declared = parse_pod_package_spec_names(&decl, &name);
     if declared {
-        if let Some(pin) = lock.snaps.get(&name) {
-            if pin.sha3_384 != sha3_384 {
-                let version_same = lock
-                    .packages
-                    .get(&name)
-                    .is_some_and(|e| e.version == version);
-                if version_same {
-                    miette::bail!(
-                        "'{name}': sideloaded payload sha3-384 {sha3_384} does not \
-                         match the pod's blob pin ({}) for the same version {version} \
-                         — refusing to swap content under an identical version; bump \
-                         the version and re-add, or `shuttle pod remove` first",
-                        pin.sha3_384
-                    );
-                }
-                // Deliberate version move: fall through, the pins move below.
-            }
-        }
         // Constraint consistency (issue #135): a declared spec with an
         // `@constraint` must not gain a pin whose version violates it —
         // the lockfile would contradict itself (the blob branch never
