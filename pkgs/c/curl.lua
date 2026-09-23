@@ -19,10 +19,18 @@ return {
         architectures = { "amd64", "arm64", "armhf" },
         type = "source",
         requires = { "glibc", "zlib", "openssl", "ca-certificates" },
-        -- cc for this build comes from the caller's farm overlay (gate gcc
-        -- on PATH via `shuttle run --pod gate`). Declaring gcc here as a
-        -- build_dep is the gap-3 endgame but is deferred: the gcc payload
-        -- and linux-headers conflict in the merged prefix (#174).
+        -- build_deps flip (the gap-3 endgame, #174 + #171): curl builds
+        -- with the pool gcc payload as its declared build tool — cc for
+        -- the merged build prefix, not the caller's farm overlay. The
+        -- flip waited on #174: the gcc deb set used to stage linux-libc-dev
+        -- uapi headers, which collided with the linux-headers payload in
+        -- the merged build prefix (one owning payload per shared subtree:
+        -- glibc requires linux-headers, so every prefix carrying gcc
+        -- already owns uapi through it; gcc must not restage it). With the
+        -- deb set clean and gcc carrying amd64/arm64/armhf sets (#171),
+        -- the declared build_dep covers every arch curl advertises — no
+        -- host-compiler fallback needed on any port.
+        build_deps = { "gcc" },
         source = {
             url = "https://curl.se/download/curl-8.20.0.tar.xz",
         },
