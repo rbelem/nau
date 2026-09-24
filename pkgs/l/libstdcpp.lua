@@ -83,7 +83,10 @@ return {
         -- RUNPATH=/shuttle-build-prefix/usr/lib into the produced
         -- libstdc++.so. That path does not exist at runtime; silenced
         -- here, visibly logged by the leak scan, pending the RUNPATH
-        -- repair (issue #22's portability follow-up).
-        leaks_ok = { "/shuttle-build-prefix/usr/lib" },
+        -- repair (issue #22's portability follow-up). usr/lib64 joined
+        -- the baked set when the pool glibc payload's loader-lib list
+        -- gained the lib64 dir (the wrapper bakes the loader-lib dirs it
+        -- sees) — both spellings silenced.
+        leaks_ok = { "/shuttle-build-prefix/usr/lib", "/shuttle-build-prefix/usr/lib64" },
     },
 }
