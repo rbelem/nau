@@ -27,10 +27,15 @@
 -- requires = { glibc }: pure Rust CLI over the glibc family (no C
 -- deps; the flake declares no buildInputs).
 --
--- build_deps: none — cargo/rustc resolve from the host toolchain
--- through the /nix bind (pool-wide source-build posture, statix.lua).
--- The tarball's rust-toolchain.toml (1.98 pin) is a rustup directive;
--- the non-rustup pool cargo ignores it (crate MSRV is 1.88).
+-- build_deps = { "gcc" }: the cargo build links every build script and
+-- the final binaries through `cc`, which must resolve to the pool gcc
+-- payload's shim inside the merged build prefix (ADR-0018: declare the
+-- implicit build tool rather than leak the host nix gcc through the
+-- /nix bind). No `make` — cargo drives the build itself; this is the
+-- rust-flavored variant of the sqlite/tree/unzip autotools pattern
+-- (#180 payoff run). The tarball's rust-toolchain.toml (1.98 pin) is a
+-- rustup directive; the non-rustup pool cargo ignores it (crate MSRV
+-- is 1.88).
 
 return {
     default = snap {
@@ -80,6 +85,7 @@ return {
 
         type = "source",
         requires = { "glibc" },
+        build_deps = { "gcc" },
         build_deps = { "rust", "gcc" },
 
         apps = {

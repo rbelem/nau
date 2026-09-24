@@ -37,8 +37,12 @@ return {
         }, " && "),
 
         type = "source",
-        requires = { "glibc" },
-        build_deps = { "libstdcpp" },
+        -- libstdcpp rides REQUIRES, not build_deps: 7zz is a prebuilt
+        -- ELF (nothing compiles) whose DT_NEEDED libstdc++.so.6 must
+        -- resolve inside the runtime closure, not the build sandbox
+        -- (#180 payoff: it previously leaked from the undeclarable gcc
+        -- extension's multiarch dir).
+        requires = { "glibc", "libstdcpp" },
 
         apps = {
             ["7zz"] = app {
