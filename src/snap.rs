@@ -5670,6 +5670,13 @@ pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
         // (#180 item 2: git's build died at cc1 exec). Adding the common
         // multiarch dirs unconditionally is safe: nonexistent dirs on
         // LD_LIBRARY_PATH are ignored by the loader.
+        //
+        // {prefix}/lib64: the pool glibc payload's source build stages
+        // its runtime (slibdir: ld-linux, libc.so.6, libm.so.6, ...) at
+        // the ROOT lib64 while the dev half (ld scripts, crt, .a) lands
+        // at usr/lib64 — the linker resolves the clean `libc.so` script
+        // to bare `libc.so.6` and only searches -L/LIBRARY_PATH dirs for
+        // it, so the runtime slibdir has to be on this list too.
         ("LD_LIBRARY_PATH", build_prefix_ld_library_path(prefix)),
         // The gcc payload's cc/c++ shims compose -L/-idirafter flags from
         // these (gcc.lua shim contract: it mirrors the farm LD wrapper,
@@ -5687,11 +5694,14 @@ pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
 /// dirs as the LD list. The gcc payload's cc shims turn these into `-L`
 /// flags (gcc.lua shim contract), so link-time searches — libgcc_s.so.1,
 /// libc_nonshared.a, crt files — resolve against the prefix the same way
-/// loader-time searches do (#180 item 2b).
+/// loader-time searches do (#180 item 2b). Includes the prefix's root
+/// `lib64` — the glibc payload's slibdir (runtime) half, see
+/// `build_prefix_env` (#180 follow-up: the linker's `libc.so` script
+/// resolves to a bare `libc.so.6` only a listed dir can satisfy).
 fn build_prefix_ld_library_path(prefix: &str) -> String {
     format!(
-        "{}/usr/lib:{}/usr/lib64:{}/usr/lib/x86_64-linux-gnu:{}/usr/lib/aarch64-linux-gnu:{}/usr/lib/arm-linux-gnueabihf",
-        prefix, prefix, prefix, prefix, prefix
+        "{}/usr/lib:{}/usr/lib64:{}/lib64:{}/usr/lib/x86_64-linux-gnu:{}/usr/lib/aarch64-linux-gnu:{}/usr/lib/arm-linux-gnueabihf",
+        prefix, prefix, prefix, prefix, prefix, prefix
     )
 }
 

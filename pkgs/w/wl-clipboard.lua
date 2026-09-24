@@ -39,11 +39,15 @@ return {
             -- find_program, which only sees the sandbox PATH. The merged
             -- build prefix's wayland-scanner (from the wayland
             -- build_dep) becomes visible through the export.
-            -- LD_LIBRARY_PATH: the prefix scanner strips its build-tree
-            -- RUNPATH at install (meson rpath cleanup), so its libexpat
-            -- dependency needs the prefix lib dirs at exec time.
+            -- LD_LIBRARY_PATH: NOT exported here — the engine's
+            -- build_prefix_env owns it (1d81006): its 5-dir list already
+            -- covers the prefix lib dirs libexpat needs at scanner-exec
+            -- time PLUS the multiarch dir cc1's DT_NEEDED resolve
+            -- through (#180). This recipe used to clobber it with a
+            -- 2-dir usr/lib:usr/lib64 export, which wiped the multiarch
+            -- dir and re-created the cc1 libisl failure the engine fix
+            -- had removed.
             'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
-            'export LD_LIBRARY_PATH="$SHUTTLE_BUILD_PREFIX/usr/lib:$SHUTTLE_BUILD_PREFIX/usr/lib64"',
             "export HOME=/tmp",
             '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr',
             '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
