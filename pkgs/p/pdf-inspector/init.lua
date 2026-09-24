@@ -80,6 +80,7 @@ return {
 
         type = "source",
         requires = { "glibc" },
+        build_deps = { "rust", "gcc" },
 
         apps = {
             pdf2md = app {

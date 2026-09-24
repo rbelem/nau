@@ -53,11 +53,12 @@ return {
             'printf \'[source.crates-io]\\nreplace-with = "shuttle-vendored"\\n\\n[source.shuttle-vendored]\\ndirectory = "%s"\\n\' "$SHUTTLE_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
             -- statix is a virtual workspace (root Cargo.toml carries only
             -- [workspace]); the installable package is the bin/ member.
-            "cargo install --path $SRC/bin --root $STAGE",
+            "$SHUTTLE_BUILD_PREFIX/usr/bin/cargo install --path $SRC/bin --root $STAGE",
         }, " && "),
 
         type = "source",
-        requires = { "glibc" },
+        requires = { "glibc", "libgcc" },
+        build_deps = { "gcc", "rust", "zlib" },
 
         apps = {
             statix = app {

@@ -140,7 +140,7 @@ return {
         -- merged prefix bin, which the build's PATH prepend exposes.
         -- Both pkg-config/gettext are build-time-only tools; the sandbox
         -- provides the compiler.
-        build_deps = { "pkg-config", "gettext", "rust" },
+        build_deps = { "pkg-config", "gettext", "rust", "gcc", "make"},
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as htop/tig/tmux: the nix gcc wrapper bakes

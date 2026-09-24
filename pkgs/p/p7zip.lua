@@ -38,6 +38,7 @@ return {
 
         type = "source",
         requires = { "glibc" },
+        build_deps = { "libstdcpp" },
 
         apps = {
             ["7zz"] = app {

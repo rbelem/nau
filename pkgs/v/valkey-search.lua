@@ -204,7 +204,7 @@ return {
             "highwayhash",
             "googletest",
             "google-benchmark",
-        },
+            "gcc"},
 
         -- ADR-0018 interim escape (libsecret precedent): the nix gcc
         -- wrapper bakes RUNPATH=/shuttle-build-prefix/usr/lib into

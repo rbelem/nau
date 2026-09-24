@@ -35,6 +35,7 @@ return {
         }, " && "),
 
         type = "source",
+        build_deps = { "gcc", "make" },
         requires = { "glibc", "ncurses" },
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22) until the

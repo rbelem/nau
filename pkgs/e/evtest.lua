@@ -36,6 +36,7 @@ return {
         }, " && "),
 
         type = "source",
+        build_deps = { "gcc", "make", "autoconf", "automake" },
         requires = { "glibc" },
 
         apps = {

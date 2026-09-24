@@ -43,7 +43,7 @@ return {
 
         type = "source",
         requires = { "glibc", "libevent", "ncurses" },
-        build_deps = { "pkg-config" },
+        build_deps = { "pkg-config", "gcc", "make"},
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22) until the
         -- nix gcc wrapper stops baking the merged build prefix into produced

@@ -36,12 +36,14 @@ return {
         },
 
         build = table.concat({
+            "sed -i '350s/return false;/return NULL;/' src/stage.c",
             "./configure --prefix=/usr",
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
         }, " && "),
 
         type = "source",
+        build_deps = { "gcc", "make" },
         requires = { "glibc", "ncurses" },
 
         -- Same interim escape as htop: the nix gcc wrapper bakes a

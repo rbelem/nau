@@ -4788,7 +4788,16 @@ fn run_multi_source_build(
 ) -> miette::Result<BuildOutcome> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
-    let build_path = build_dir.path();
+    let build_path = build_dir.path().to_path_buf();
+    // SHUTTLE_KEEP_BUILD_DIR=1: leak the tempdir so a failed build's tree
+    // (meson-log.txt, config.log, ...) survives for post-mortem debugging.
+    if std::env::var("SHUTTLE_KEEP_BUILD_DIR").as_deref() == Ok("1") {
+        std::mem::forget(build_dir);
+        crate::output::status(format!(
+            "SHUTTLE_KEEP_BUILD_DIR=1 — build tree kept at {}",
+            build_path.display()
+        ));
+    }
 
     let mut infos = Vec::with_capacity(sources.len());
     for (name, spec) in sources {
@@ -4800,7 +4809,7 @@ fn run_multi_source_build(
                 "source '{name}' collides with a part of the same name — source trees and part work dirs share the build tree"
             ));
         }
-        infos.push(fetch_and_extract_source(name, spec, build_path)?);
+        infos.push(fetch_and_extract_source(name, spec, &build_path)?);
     }
 
     // Stage hygiene mirrors the single-source path: wipe shuttle-owned
@@ -4815,8 +4824,8 @@ fn run_multi_source_build(
     if let Some(parts) = &meta.parts {
         run_parts(
             parts,
-            build_path,
-            build_path,
+            &build_path,
+            &build_path,
             &abs_stage,
             meta.target.as_deref(),
             deps_dir,
@@ -4829,9 +4838,9 @@ fn run_multi_source_build(
         let build_spinner = output::spinner(&format!("building {}...", meta.name));
         run_build_command(
             build_cmd,
-            build_path,
-            build_path,
-            build_path,
+            &build_path,
+            &build_path,
+            &build_path,
             &abs_stage,
             meta.target.as_deref(),
             None,
@@ -5640,7 +5649,10 @@ pub const SANDBOX_BUILD_PREFIX: &str = "/shuttle-build-prefix";
 pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
     vec![
         ("SHUTTLE_BUILD_PREFIX", prefix.to_string()),
-        ("CPPFLAGS", format!("-I{}/usr/include", prefix)),
+        (
+            "CPPFLAGS",
+            format!("-I{}/usr/include -I{}/usr/usr/include", prefix, prefix),
+        ),
         ("LDFLAGS", format!("-L{}/usr/lib", prefix)),
         // Build-time execution of prefix binaries needs the prefix's own
         // libs on the loader path: the portable-ELF machinery (#12) strips
@@ -5650,19 +5662,53 @@ pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
         // a silent exit 127). Replaces any inherited value — the sandbox
         // is hermetic and the project already drops inherited LD pollution
         // (hermetic_sandbox_drops_inherited_ldflags_pollution).
-        (
-            "LD_LIBRARY_PATH",
-            format!("{}/usr/lib:{}/usr/lib64", prefix, prefix),
-        ),
-        (
-            "PKG_CONFIG_PATH",
-            format!(
-                "{}/usr/lib/pkgconfig:{}/usr/share/pkgconfig",
-                prefix, prefix
-            ),
-        ),
+        //
+        // The deb-gcc payload (#164) stages under the multiarch dir —
+        // cc1's own DT_NEEDED (libisl, libmpc, libmpfr, zstd) live at
+        // usr/lib/<triplet>/, not usr/lib — and the driver execs cc1 with
+        // this env, so a prefix carrying gcc misses them without it
+        // (#180 item 2: git's build died at cc1 exec). Adding the common
+        // multiarch dirs unconditionally is safe: nonexistent dirs on
+        // LD_LIBRARY_PATH are ignored by the loader.
+        ("LD_LIBRARY_PATH", build_prefix_ld_library_path(prefix)),
+        // The gcc payload's cc/c++ shims compose -L/-idirafter flags from
+        // these (gcc.lua shim contract: it mirrors the farm LD wrapper,
+        // which exports them for farm-side builds). Without them the shim
+        // execs the driver with an empty link/include search and every
+        // sanity link dies on unresolvable -lgcc_s/libc (#180 item 2b).
+        ("LIBRARY_PATH", build_prefix_ld_library_path(prefix)),
+        ("CPATH", build_prefix_usr_include_dirs(prefix)),
+        ("PKG_CONFIG_PATH", build_prefix_pkgconfig_dirs(prefix)),
         ("PKG_CONFIG_SYSROOT_DIR", prefix.to_string()),
     ]
+}
+
+/// The lib dirs `LIBRARY_PATH` exposes for the merged prefix: the same
+/// dirs as the LD list. The gcc payload's cc shims turn these into `-L`
+/// flags (gcc.lua shim contract), so link-time searches — libgcc_s.so.1,
+/// libc_nonshared.a, crt files — resolve against the prefix the same way
+/// loader-time searches do (#180 item 2b).
+fn build_prefix_ld_library_path(prefix: &str) -> String {
+    format!(
+        "{}/usr/lib:{}/usr/lib64:{}/usr/lib/x86_64-linux-gnu:{}/usr/lib/aarch64-linux-gnu:{}/usr/lib/arm-linux-gnueabihf",
+        prefix, prefix, prefix, prefix, prefix
+    )
+}
+
+/// The include/pc dirs the merged prefix serves: the deb payloads keep
+/// the dpkg `./usr` doubling inside their trees (usr/usr/...), and the
+/// raw recursive merge preserves it, so pkg-config and bare `-I` probes
+/// need both spellings (#180: git's libsecret helper missed
+/// libsecret-1.pc at {prefix}/usr/usr/lib/pkgconfig).
+fn build_prefix_usr_include_dirs(prefix: &str) -> String {
+    format!("{}/usr/include:{}/usr/usr/include", prefix, prefix)
+}
+
+fn build_prefix_pkgconfig_dirs(prefix: &str) -> String {
+    format!(
+        "{}/usr/lib/pkgconfig:{}/usr/lib64/pkgconfig:{}/usr/share/pkgconfig:{}/usr/usr/lib/pkgconfig:{}/usr/usr/share/pkgconfig",
+        prefix, prefix, prefix, prefix, prefix
+    )
 }
 
 /// The `CURL_CA_BUNDLE` env pair the build env defaults to (issue #176), or
@@ -12200,17 +12246,39 @@ fi
                 .unwrap_or_else(|| panic!("missing {k}"))
         };
         assert_eq!(get("SHUTTLE_BUILD_PREFIX"), "/shuttle-build-prefix");
-        assert_eq!(get("CPPFLAGS"), "-I/shuttle-build-prefix/usr/include");
+        assert_eq!(
+            get("CPPFLAGS"),
+            "-I/shuttle-build-prefix/usr/include -I/shuttle-build-prefix/usr/usr/include",
+            "the dpkg usr/usr doubling: deb payloads keep their ./usr tree, \
+             so include probes need both spellings (#180)"
+        );
+        assert_eq!(
+            get("LIBRARY_PATH"),
+            "/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64:\
+             /shuttle-build-prefix/usr/lib/x86_64-linux-gnu:\
+             /shuttle-build-prefix/usr/lib/aarch64-linux-gnu:\
+             /shuttle-build-prefix/usr/lib/arm-linux-gnueabihf",
+            "the gcc cc-shim composes -L from this (gcc.lua contract) (#180)"
+        );
         assert_eq!(get("LDFLAGS"), "-L/shuttle-build-prefix/usr/lib");
         assert_eq!(
             get("LD_LIBRARY_PATH"),
-            "/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64",
+            "/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64:\
+             /shuttle-build-prefix/usr/lib/x86_64-linux-gnu:\
+             /shuttle-build-prefix/usr/lib/aarch64-linux-gnu:\
+             /shuttle-build-prefix/usr/lib/arm-linux-gnueabihf",
             "prefix-built ELFs carry no RUNPATH (#12) — build-time execs \
-             resolve merged libs through this var"
+             resolve merged libs through this var; the deb-gcc multiarch \
+             dir rides along for cc1's own DT_NEEDED (#180)"
         );
         assert_eq!(
             get("PKG_CONFIG_PATH"),
-            "/shuttle-build-prefix/usr/lib/pkgconfig:/shuttle-build-prefix/usr/share/pkgconfig"
+            "/shuttle-build-prefix/usr/lib/pkgconfig:\
+             /shuttle-build-prefix/usr/lib64/pkgconfig:\
+             /shuttle-build-prefix/usr/share/pkgconfig:\
+             /shuttle-build-prefix/usr/usr/lib/pkgconfig:\
+             /shuttle-build-prefix/usr/usr/share/pkgconfig",
+            "deb payload pc files live under the usr/usr doubling (#180)"
         );
         assert_eq!(get("PKG_CONFIG_SYSROOT_DIR"), "/shuttle-build-prefix");
     }

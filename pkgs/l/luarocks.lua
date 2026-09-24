@@ -128,7 +128,7 @@ return {
 
         type = "source",
         requires = { "glibc", "lua", "unzip" },
-        build_deps = { "lua" },
+        build_deps = { "lua", "gcc", "make"},
 
         apps = {
             luarocks = app {

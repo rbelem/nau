@@ -66,7 +66,7 @@ return {
 
         type = "source",
         requires = { "glibc", "glib" },
-        build_deps = { "meson", "ninja", "pkg-config" },
+        build_deps = { "meson", "ninja", "pkg-config", "gcc"},
 
         apps = {
             -- secret-tool is the libsecret CLI (schema-attribute lookup

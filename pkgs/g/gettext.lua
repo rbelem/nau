@@ -14,6 +14,7 @@ translation files. It is a core dependency for many GNU packages.]],
         confinement = "strict",
         architectures = { "amd64" },
         type = "source",
+        build_deps = { "gcc", "make" },
         requires = {},
         source = { url = "https://ftp.gnu.org/gnu/gettext/gettext-0.22.5.tar.xz" },
         -- --without-libpsl n/a; gettext is a plain autotools build. The
