@@ -101,7 +101,7 @@ return {
 
         type = "source",
         requires = { "glibc", "libstdcpp", "libgcc" },
-        build_deps = { "tree-sitter-perl" },
+        build_deps = { "tree-sitter-perl", "python" },
 
         -- The copied tree_sitter_perl/_binding .so was linked by the
         -- nix gcc wrapper with RUNPATH=/shuttle-build-prefix/usr/lib

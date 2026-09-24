@@ -38,6 +38,7 @@ return {
 
         type = "source",
         requires = { "glibc" },
+        build_deps = { "python" },
 
         apps = {
             ["tree-sitter"] = app {

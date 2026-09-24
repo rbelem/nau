@@ -61,6 +61,7 @@ return {
         -- a full GCC source build is disproportionate for a runtime-only need
         -- and its fixinc/sysroot bootstrap is a separate concern.
         requires = { "glibc", "libstdcpp", "libgcc" },
+        build_deps = { "node" },
 
         apps = {
             zg = app {

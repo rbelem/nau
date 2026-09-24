@@ -51,6 +51,7 @@ return {
         -- interpreter's own dependency; listed so the closure is explicit
         -- about the container's floor).
         requires = { "glibc", "perl" },
+        build_deps = { "make" },
 
         apps = {
             perltidy = app {

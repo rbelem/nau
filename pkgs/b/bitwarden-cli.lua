@@ -36,6 +36,7 @@ return {
 
         type = "source",
         requires = { "glibc" },
+        build_deps = { "python" },
 
         apps = {
             bw = app {

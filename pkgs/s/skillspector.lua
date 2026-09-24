@@ -95,6 +95,7 @@ return {
 
         type = "source",
         requires = { "glibc", "libstdcpp", "libgcc" },
+        build_deps = { "python" },
 
         apps = {
             skillspector = app {
