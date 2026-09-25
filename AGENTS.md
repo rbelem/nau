@@ -8,17 +8,22 @@ replacement for Snapcraft's YAML. GPL-3.0-only, Linux-only. Formerly named
 
 Use the pinned 1.97.1 toolchain — devbox and the gate pod both carry it, and
 the pod payload follows the devbox pin (the pin is the contract). The pod env
-leaks `LD_LIBRARY_PATH` into the shell (breaks devbox's node), so unset it:
+leaks `LD_LIBRARY_PATH` into the shell (breaks devbox's node), and
+`COMPILER_PATH`/`LIBRARY_PATH` redirect every gcc driver's subprogram search
+into pod store blobs (libbfd load deaths), so strip all three and pin CC/CXX:
 
 ```bash
-env -u LD_LIBRARY_PATH devbox run -- build       # cargo build
-env -u LD_LIBRARY_PATH devbox run -- test        # cargo test (unit + integration)
-env -u LD_LIBRARY_PATH devbox run -- check       # test + clippy + fmt-check (full gate)
+nix shell nixpkgs#gcc -c env -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH CC=gcc CXX=g++ devbox run -- build
+nix shell nixpkgs#gcc -c env -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH CC=gcc CXX=g++ devbox run -- test
+nix shell nixpkgs#gcc -c env -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH CC=gcc CXX=g++ devbox run -- check  # full gate
 shuttle run --pod gate -- cargo clippy -- -D warnings   # lint axis, pod gate
 shuttle run --pod gate -- cargo fmt --check             # fmt axis, pod gate
 ```
 
-Run `env -u LD_LIBRARY_PATH devbox run -- check` before committing or pushing.
+Keep the pod shellenv on PATH (git and the curl shim ride it); the nix gcc
+prepend plus `CC=gcc` keeps every compiler invocation off the pod blobs.
+
+Run the corrected full-gate invocation above before committing or pushing.
 Clippy warnings are errors. Ratified: the pod gate is the verified substitute
 for the clippy/fmt axes (verdicts matched the devbox pin on the daily-host
 reruns — see Build & test); the
