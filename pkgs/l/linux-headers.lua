@@ -37,6 +37,13 @@ owner of the uapi subtrees per the #174 rule.]],
             -- busybox dpkg-deb is the sandbox's only deb unpacker (the
             -- sync env's busybox, same as gcc.lua's payload stage).
             "dpkg-deb -x \"$SRC/linux-libc-dev\" \"$STAGE\"",
+            -- Debian multiarch: the per-arch uapi asm/ lives under
+            -- usr/include/<triplet>/ (arch-all deb ships every triplet);
+            -- the classic flat include/asm path is what kernel uapi
+            -- consumers (glibc's bits/errno.h -> linux/errno.h ->
+            -- asm/errno.h) resolve. Same content, Debian's own x86_64
+            -- asm tree.
+            "ln -s x86_64-linux-gnu/asm \"$STAGE/usr/include/asm\"",
         }, " && "),
     },
 }
