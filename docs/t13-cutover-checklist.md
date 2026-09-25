@@ -352,15 +352,22 @@ Ported since this section was first written: `neovim`, `blesh` (§5.2),
 "recipe/<file>"` resolving against the recipe directory, closing the
 no-lockfile-in-source-tree gaps): `agentmemory` and `pdf-inspector`.
 Ported 2026-09-24/25 from the still-missing list below: `codegraph`
-(1.6.0-perl), `valkey` (+ `valkey-search`), `bifrost`, `wigolo`.
+(1.6.0-perl), `valkey` (+ `valkey-search`), `bifrost`, `wigolo`,
+`skills` (1.6.0, #199), `playwright-cli` (0.1.20, #200 — pairs with the
+system/flatpak browser, none ships), `impeccable` (4.1.0, #202),
+`deepsec` (2.3.9, #203), `skillranker` (0.1.0-main-3fe85c4, #206 —
+stable rust suffices, nightly claim did not reproduce), `bsk` (0.3.0,
+#205 — prebuilt musl release-fetch).
 `zenity` is replaced by the pure-Rust `zenity-rs` (pkgs/z/zenity-rs.lua
 — the GUI dialog lane with no gtk at all); `llm-verifier` dropped by
-owner decision 2026-09-21. Still missing:
-`podman`, `jdk21`, `chromium`, `opencode-v2`, `skills`, `playwright-cli`,
-`codeburn`, `impeccable`, `deepsec`, `deepseek-harness`, `bsk`
-(prebuilt musl release-fetch tier), `skillranker` (nightly-rust source
-build). bsk and skillranker postdate the original section — added
-2026-09-25 when ticketed (#205, #206). Most
+owner decision 2026-09-21. Owner dispositions 2026-09-25:
+`opencode-v2` (#207), `codeburn` (#201), `deepseek-harness` (#204) —
+not ported, closed; `chromium` — flatpak serves it, confirmed; `jdk21`
+— no live ticket (only closed triage #21), port on demonstrated need
+stands; `podman` — NEEDED, reverses the may-never call, hybrid design
+ticketed (#215); `nerd-fonts` — ships via #101 `fonts.packages` (#214).
+Still missing:
+`podman` (#215, owner-gated with #101). Most
 are dep-fetch ecosystem tools (npm/pip) that ADR-0017 supports — they
 need packages authored, not new machinery.
 **Until ported, these stay devbox-only — cutover is gated on the owner
