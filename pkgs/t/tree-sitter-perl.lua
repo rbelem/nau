@@ -95,7 +95,7 @@ return {
 
         type = "source",
         requires = { "glibc" },
-        build_deps = { "tree-sitter", "python" },
+        build_deps = { "tree-sitter", "python", "gcc" },
 
         -- Same interim leak-scan escape as dconf/htop/tmux: produced
         -- .so carries RUNPATH=/shuttle-build-prefix/usr/lib (dead at
