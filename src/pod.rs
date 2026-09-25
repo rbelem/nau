@@ -6449,6 +6449,89 @@ pod {
         assert_eq!(build.held, vec!["tool".to_string()]);
     }
 
+    // ── Incremental baseline-stamp flush (issue #180 item 4) ──
+
+    /// The #142 incremental-flush contract at the persistence seam
+    /// (issue #180 item 4): each baselined member's stamp reaches the
+    /// ON-DISK lockfile at its own [`commit_pending_recipe_stamp`] call
+    /// — the point `collect_own_packages` invokes once per declared
+    /// member, right after that member's build-or-hold contribution (a
+    /// `pod refresh` baseline hold included) — before the next member's
+    /// stamp is committed. A mid-sweep crash therefore preserves every
+    /// member whose contribution already completed; no completion-time
+    /// flush holds the batch hostage.
+    #[test]
+    fn baseline_stamps_persist_per_member_in_commit_order() {
+        use std::collections::HashMap;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runtime::RuntimeStore::new(dir.path().join("store"));
+        let lock_path = dir.path().join("pod.lock");
+        let mut lock = LockFile {
+            version: 1,
+            sources: HashMap::new(),
+            snaps: HashMap::new(),
+            inputs: HashMap::new(),
+            packages: HashMap::new(),
+            build_deps: HashMap::new(),
+        };
+        for name in ["alpha", "beta"] {
+            lock.packages.insert(
+                name.to_string(),
+                PodPackageLockEntry {
+                    version: "1.0".into(),
+                    constraint: None,
+                    deps: None,
+                    recipe_sha256: None,
+                    recipe_digest_scheme: None,
+                },
+            );
+        }
+
+        // Two baselines queued (the `record_recipe_drift` shape):
+        // alpha's contribution completed first, beta's second.
+        let mut build = ReconcileBuild::default();
+        build
+            .recipe_stamps_pending
+            .push(("alpha".to_string(), "digest-alpha".to_string()));
+        build
+            .recipe_stamps_pending
+            .push(("beta".to_string(), "digest-beta".to_string()));
+
+        let mut ctx = ReconcileCtx {
+            store: &store,
+            lock: &mut lock,
+            lock_path: &lock_path,
+            active: None,
+            root: dir.path(),
+            pod_name: "p",
+        };
+
+        // alpha's commit: its stamp is durable ON DISK now, and beta's
+        // is still queued — not batched for a completion-time flush.
+        commit_pending_recipe_stamp(&mut ctx, &mut build, "alpha").unwrap();
+        assert_eq!(
+            build.recipe_stamps_pending,
+            vec![("beta".to_string(), "digest-beta".to_string())],
+            "only the committed member leaves the queue"
+        );
+        let on_disk = LockFile::load(&lock_path).unwrap().unwrap();
+        let alpha = &on_disk.packages["alpha"];
+        assert_eq!(alpha.recipe_sha256.as_deref(), Some("digest-alpha"));
+        assert_eq!(alpha.recipe_digest_scheme, Some(RECIPE_DIGEST_SCHEME));
+        assert!(
+            on_disk.packages["beta"].recipe_sha256.is_none(),
+            "the uncommitted member's stamp must not leak to disk"
+        );
+
+        // beta's commit: persisted in turn, the queue drains.
+        commit_pending_recipe_stamp(&mut ctx, &mut build, "beta").unwrap();
+        assert!(build.recipe_stamps_pending.is_empty());
+        let on_disk = LockFile::load(&lock_path).unwrap().unwrap();
+        let beta = &on_disk.packages["beta"];
+        assert_eq!(beta.recipe_sha256.as_deref(), Some("digest-beta"));
+        assert_eq!(beta.recipe_digest_scheme, Some(RECIPE_DIGEST_SCHEME));
+    }
+
     // ── Held-sync deps verification (issue #125) ──
 
     /// Record a deps pin for `tool` in the fixture's lockfile.
