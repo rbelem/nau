@@ -28,6 +28,9 @@ loop optimization framework to perform advanced loop nest optimizations.]],
         -- RUNPATH=/shuttle-build-prefix/usr/lib into libisl.so (gmp on the
         -- merged prefix via requires). Silenced, visibly logged, pending
         -- issue #22.
-        leaks_ok = { "/shuttle-build-prefix/usr/lib" },
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
+        },
     },
 }

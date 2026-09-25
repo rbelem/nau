@@ -45,7 +45,10 @@ return {
         -- path does not exist at runtime. Silenced here, visibly logged by
         -- the build's leak scan, pending the RUNPATH repair (issue #22's
         -- portability follow-up).
-        leaks_ok = { "/shuttle-build-prefix/usr/lib" },
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
+        },
 
         apps = {
             htop = app {

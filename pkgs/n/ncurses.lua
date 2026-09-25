@@ -31,6 +31,12 @@ return {
         -- the exact prefix marker `/shuttle-build-prefix`, so leaks_ok must
         -- match that string. Silenced here, visibly logged by the leak scan,
         -- pending the RUNPATH/config repair (portability follow-up).
-        leaks_ok = { "/shuttle-build-prefix" },
+        -- The exact usr/lib64 entry: RUNPATH entries match exactly (the
+        -- bare string only covers text references) — the wrapper now
+        -- bakes the lib64 spelling into the ELFs too.
+        leaks_ok = {
+            "/shuttle-build-prefix",
+            "/shuttle-build-prefix/usr/lib64",
+        },
     },
 }

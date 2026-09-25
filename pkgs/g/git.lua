@@ -149,7 +149,10 @@ return {
         -- reference string). That path does not exist at runtime; silenced
         -- here, visibly logged by the leak scan, pending the RUNPATH repair
         -- (issue #22's portability follow-up).
-        leaks_ok = { "/shuttle-build-prefix/usr/lib" },
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
+        },
 
         apps = {
             git = app {

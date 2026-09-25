@@ -36,20 +36,31 @@ return {
         },
 
         build = table.concat({
-            "sed -i '350s/return false;/return NULL;/' src/stage.c",
+            -- The 704 release tarball is flat: no src/ staging and no
+            -- stage.c (that file first appears in the post-704 repo
+            -- restructure) — an earlier revision of this recipe carried
+            -- a src/stage.c sed for a GCC 14 false-return fix that has
+            -- no target here; 704 configures and builds plain.
             "./configure --prefix=/usr",
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
         }, " && "),
 
         type = "source",
-        build_deps = { "gcc", "make" },
+        -- pkg-config: less's configure locates ncurses through its .pc
+        -- file (the ncurses payload's pkg-config libdir points into the
+        -- merged prefix), so the pkg-config payload must ride the build
+        -- closure (ADR-0018: declare the implicit build tool).
+        build_deps = { "gcc", "make", "pkg-config" },
         requires = { "glibc", "ncurses" },
 
         -- Same interim escape as htop: the nix gcc wrapper bakes a
         -- /shuttle-build-prefix RUNPATH into produced binaries (issue
         -- #22 portability follow-up).
-        leaks_ok = { "/shuttle-build-prefix/usr/lib" },
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
+        },
 
         apps = {
             less = app {

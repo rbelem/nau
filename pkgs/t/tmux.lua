@@ -52,7 +52,10 @@ return {
         -- here, visibly logged by the build's leak scan, pending the RUNPATH
         -- repair (issue #22's portability follow-up). Same rationale as
         -- htop/tig.
-        leaks_ok = { "/shuttle-build-prefix/usr/lib" },
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
+        },
 
         apps = {
             tmux = app {

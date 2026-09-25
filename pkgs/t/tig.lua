@@ -45,7 +45,7 @@ return {
         }, " && "),
 
         type = "source",
-        build_deps = { "gcc", "make" },
+        build_deps = { "gcc", "make", "pkg-config" },
         requires = { "glibc", "ncurses" },
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22) until the
@@ -54,7 +54,10 @@ return {
         -- into the tig binary; that path does not exist at runtime. Silenced
         -- here, visibly logged by the build's leak scan, pending the RUNPATH
         -- repair (issue #22's portability follow-up). Same rationale as htop.
-        leaks_ok = { "/shuttle-build-prefix/usr/lib" },
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
+        },
 
         apps = {
             tig = app {

@@ -77,6 +77,10 @@ return {
         --    and the curl-config script — build-time metadata, same class as
         --    ncurses' ncursesw6-config. All silenced visibly, pending the
         --    RUNPATH/portability repair.
-        leaks_ok = { "/shuttle-build-prefix/usr/lib", "/shuttle-build-prefix" },
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
+            "/shuttle-build-prefix",
+        },
     },
 }

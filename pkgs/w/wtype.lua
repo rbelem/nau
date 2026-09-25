@@ -44,13 +44,16 @@ return {
             -- resolves wayland-scanner with a bare find_program against
             -- the sandbox PATH; the merged build prefix's scanner (from
             -- the wayland build_dep) becomes visible through the export.
-            -- LD_LIBRARY_PATH covers the scanner's libexpat (its build
-            -- RUNPATH is stripped at install). Upstream's VERSION probe
-            -- runs git describe only when git is found; in the tarball
-            -- (no repo) the command fails soft (meson run_command
-            -- check:false) and the tag version is baked instead.
+            -- resolves wayland-scanner with a bare find_program against
+            -- the sandbox PATH; the merged build prefix's scanner (from
+            -- the wayland build_dep) becomes visible through the export.
+            -- LD_LIBRARY_PATH: NOT exported here — the engine's
+            -- build_prefix_env owns it (1d81006): its list already
+            -- covers libexpat at scanner-exec time plus the multiarch
+            -- dir cc1 needs (#180). This recipe used to clobber it with
+            -- a two-dir export, re-creating the cc1 libisl failure the
+            -- engine fix had removed (same as wl-clipboard.lua).
             'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
-            'export LD_LIBRARY_PATH="$SHUTTLE_BUILD_PREFIX/usr/lib:$SHUTTLE_BUILD_PREFIX/usr/lib64"',
             "export HOME=/tmp",
             '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr',
             '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',

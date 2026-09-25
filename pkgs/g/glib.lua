@@ -69,10 +69,15 @@ return {
         -- until the nix gcc wrapper stops baking the merged build prefix
         -- into produced binaries: the ELFs that link libffi carry
         -- RUNPATH=/shuttle-build-prefix/usr/lib64 (libffi's
-        -- toolexeclibdir ${libdir}/../lib64 — that path does not exist at
-        -- runtime). Silenced here, visibly logged by the build's leak
-        -- scan, pending the RUNPATH repair (issue #22's portability
-        -- follow-up). Same rationale as htop/tmux/tig.
-        leaks_ok = { "/shuttle-build-prefix/usr/lib64" },
+        -- toolexeclibdir ${libdir}/../lib64) and the meson-built
+        -- libraries carry RUNPATH=/shuttle-build-prefix/usr/lib (the
+        -- shim's -L list) — neither path exists at runtime. Silenced
+        -- here, visibly logged by the build's leak scan, pending the
+        -- RUNPATH repair (issue #22's portability follow-up). Same
+        -- rationale as htop/tmux/tig.
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
+        },
     },
 }

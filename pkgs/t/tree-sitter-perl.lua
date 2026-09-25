@@ -101,6 +101,9 @@ return {
         -- .so carries RUNPATH=/shuttle-build-prefix/usr/lib (dead at
         -- runtime). Silenced here, visibly logged by the leak scan,
         -- pending the RUNPATH repair.
-        leaks_ok = { "/shuttle-build-prefix/usr/lib" },
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix/usr/lib64",
+        },
     },
 }
