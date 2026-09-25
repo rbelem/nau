@@ -13,17 +13,13 @@
 -- SOURCE STABILITY: shuttle build sources must be http(s) — the build
 -- fetch path rejects file:// and path: URLs outright — and local-path
 -- sources are not supported anywhere in the DSL. The payload tarball
--- therefore lives at ~/.local/share/shuttle/inputs/jev-review-0.1.1.tgz
--- (dist/ + package.json under a package/ top dir, sha256-pinned below)
--- and is served over loopback HTTP during builds:
---   (cd ~/.local/share/shuttle/inputs && \
---      python3 -m http.server 8921 --bind 127.0.0.1)
--- Bring the server up for `pod rebuild jev-review` AND before any full
--- plain `pod sync` — a plain sync rebuilds every non-held package, not
--- just changed ones (observed live 2026-09-20). A SCOPED reconcile of
--- anything else (`pod rebuild <other>`, `pod refresh <other>`) skips
--- installed packages the verb did not name (OwnScope::SkipInstalled,
--- #177) and needs no server.
+-- (dist/ + package.json under a package/ top dir) therefore lives as a
+-- durable release asset on this repo:
+--   https://github.com/rbelem/shuttle/releases/tag/jev-review-payload-0.1.1
+-- sha256-pinned below (byte-identical to the artifact the recipe
+-- originally served from a hand-run loopback http.server on 8921 —
+-- that pin broke every unattended reconcile that had to rebuild the
+-- member, fixed 2026-09-25, #212).
 --
 -- The app is declared the anydoc.lua way: command = the in-payload
 -- server.js, interpreter = "node" (issue #9/#13) — the tree wrapper
@@ -52,7 +48,7 @@ return {
         architectures = { "amd64" },
 
         source = {
-            url = "http://127.0.0.1:8921/jev-review-0.1.1.tgz",
+            url = "https://github.com/rbelem/shuttle/releases/download/jev-review-payload-0.1.1/jev-review-0.1.1.tgz",
             sha256 = "d87e2644be09b713bd95e5dacaa3cf83f0fa934a4b5e26f0a5dc2cc3a273db1a",
         },
 
