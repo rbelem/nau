@@ -1130,13 +1130,15 @@ mod tests {
             "#!/bin/sh\n\
              SCRIPT=\"$(readlink -f \"$0\")\"\n\
              PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+             TREE=\"$PODROOT/active/extensions/cli/usr/usr/bin/cli.real\"\n\
+             [ -f \"$TREE\" ] || TREE=\"$(dirname \"$(dirname \"$SCRIPT\")\")/usr/bin/cli.real\"\n\
              \x20        PKGROOT=\"$PODROOT/active/extensions/cli/usr\"\n\
              \x20        PYTHONPATH=\"\"\n\
              \x20        for sp in \"$PKGROOT\"/usr/lib/python3.*/site-packages; do\n\
              \x20         [ -d \"$sp\" ] && PYTHONPATH=\"${{PYTHONPATH:+$PYTHONPATH:$sp}}\"\n\
              \x20        done\n\
              \x20        export PYTHONPATH\n\
-             exec \"python3\" \"$PODROOT/active/extensions/cli/usr/usr/bin/cli.real\" \"$@\"\n"
+             exec \"python3\" \"$TREE\" \"$@\"\n"
         );
         let snap = make_snap(
             &tmp.path().join("cli"),
@@ -1168,8 +1170,12 @@ mod tests {
             "PKGROOT must collapse to the prefix root: {rewritten}"
         );
         assert!(
-            rewritten.contains("exec \"python3\" \"$PODROOT/usr/bin/cli.real\" \"$@\"\n"),
-            "exec must point at the prefix-rooted sibling with the bare \
+            rewritten.contains("TREE=\"$PODROOT/usr/bin/cli.real\""),
+            "the #210 tree target must resolve at the prefix root: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("exec \"python3\" \"$TREE\" \"$@\"\n"),
+            "exec must point at the resolved tree target with the bare \
              interpreter: {rewritten}"
         );
     }
@@ -1270,12 +1276,14 @@ mod tests {
         let wrapper = "#!/bin/sh\n\
              SCRIPT=\"$(readlink -f \"$0\")\"\n\
              PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+             TREE=\"$PODROOT/active/extensions/perltidy/usr/usr/bin/perltidy.real\"\n\
+             [ -f \"$TREE\" ] || TREE=\"$(dirname \"$(dirname \"$SCRIPT\")\")/usr/bin/perltidy.real\"\n\
              \x20        PERL5LIB=\"\"\n\
              \x20        for d in \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/ \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/*/ \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/*/*/; do\n\
              \x20         [ -d \"$d\" ] && PERL5LIB=\"${{PERL5LIB:+$PERL5LIB:}}$d\"\n\
              \x20        done\n\
              \x20        export PERL5LIB\n\
-             exec \"perl\" \"$PODROOT/active/extensions/perltidy/usr/usr/bin/perltidy.real\" \"$@\"\n";
+             exec \"perl\" \"$TREE\" \"$@\"\n";
         let app = make_snap(
             &tmp.path().join("perltidy"),
             &[
@@ -1306,8 +1314,12 @@ mod tests {
             "no extension segment may survive: {rewritten}"
         );
         assert!(
-            rewritten.contains("exec \"perl\" \"$PODROOT/usr/bin/perltidy.real\" \"$@\"\n"),
-            "exec must point at the prefix-rooted sibling: {rewritten}"
+            rewritten.contains("TREE=\"$PODROOT/usr/bin/perltidy.real\""),
+            "the #210 tree target must resolve at the prefix root: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("exec \"perl\" \"$TREE\" \"$@\"\n"),
+            "exec must point at the resolved tree target: {rewritten}"
         );
     }
 

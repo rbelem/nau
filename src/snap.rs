@@ -3475,6 +3475,16 @@ fn stage_bundles_python_stdlib(stage_dir: &Path, cmd_path: &Path) -> bool {
 /// staged next to it (`node_modules`, site-packages) resolve. PODROOT is
 /// derived from the wrapper's own store-blob path (`store/<aa>/<hash>`),
 /// the same derivation the #10 ELF lib wrapper uses.
+///
+/// The store blob is not the wrapper's only install site: the generation
+/// tree hardlinks the same blob at
+/// `generations/<n>/extensions/<pkg>/usr/bin/<pkg>-<app>` (issue #210),
+/// and the pod's top-level extensions tree carries it too. There the
+/// three-dirname derivation lands on the extension, not the pod root, so
+/// the primary tree target misses and the wrapper falls back to the
+/// payload root two dirnames up from its own resolved path — the SAME
+/// generation's copy, so a generation-pinned invocation execs its own
+/// payload rather than racing `active`.
 fn emit_script_tree_wrapper(
     app_name: &str,
     entry: &Path,
@@ -3543,14 +3553,22 @@ fn emit_script_tree_wrapper(
     // The farm symlink resolves to the wrapper blob at
     // `<podroot>/store/<aa>/<hash>` — three dirnames to the pod root
     // (same derivation as the #10 ELF lib wrapper). Args forward to the
-    // tool exactly like the flat #9 wrapper (`exec "$i" "$s" "$@"`) — a
-    // deps-closure CLI takes arguments just the same.
+    // tool exactly like the flat #9 wrapper (`exec "$i" "$s" "$@"`).
+    // The tree target is resolved adaptively (issue #210): primary hit
+    // through `$PODROOT/active` for the store-blob invocation (and the
+    // prefix, where the rewrite strips the extension segment), fallback
+    // to the payload root two dirnames up for direct generation-tree
+    // invocation — the wrapper commands at `<payload-root>/bin/<name>`,
+    // so appending the command's own rel path reproduces the `usr/usr`
+    // doubling the extension tree shows.
     let wrapper = format!(
         "#!/bin/sh\n\
          SCRIPT=\"$(readlink -f \"$0\")\"\n\
          PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+         TREE=\"{tree_script}\"\n\
+         [ -f \"$TREE\" ] || TREE=\"$(dirname \"$(dirname \"$SCRIPT\")\")/{cmd_rel_real}\"\n\
          {pythonpath_block}\
-         exec \"{interpreter}\" \"{tree_script}\" \"$@\"\n"
+         exec \"{interpreter}\" \"$TREE\" \"$@\"\n"
     );
     write_wrapper(app_name, entry, &wrapper)
 }
@@ -12868,9 +12886,12 @@ mod wrapper_tests {
         );
         assert!(
             wrapper.contains(
-                "exec \"node\" \"$PODROOT/active/extensions/pkg/usr/bin/zg.real\" \"$@\""
+                "TREE=\"$PODROOT/active/extensions/pkg/usr/bin/zg.real\"\n\
+                 [ -f \"$TREE\" ] || TREE=\"$(dirname \"$(dirname \"$SCRIPT\")\")/bin/zg.real\"\n\
+                 exec \"node\" \"$TREE\" \"$@\""
             ),
-            "wrapper must exec the tree script: {wrapper}"
+            "wrapper must exec the tree script with the #210 generation-tree \
+             fallback: {wrapper}"
         );
         assert!(
             wrapper.contains("PODROOT="),
@@ -12985,9 +13006,10 @@ mod wrapper_tests {
         );
         assert!(wrapper.contains("export PYTHONPATH"), "{wrapper}");
         // Issue #9 criterion: a single exec that forwards the tool's
-        // arguments (`exec "$interpreter" "$script" "$@"`).
+        // arguments (`exec "$interpreter" "$script" "$@"`), with the
+        // script resolved through the #210 tree-target variable.
         assert!(
-            wrapper.contains("exec \"python3\" \"$PODROOT/"),
+            wrapper.contains("exec \"python3\" \"$TREE\""),
             "wrapper must exec the tree script: {wrapper}"
         );
         assert_eq!(
@@ -13122,7 +13144,10 @@ mod wrapper_tests {
 
         let wrapper = std::fs::read_to_string(&script).unwrap();
         assert!(
-            wrapper.starts_with("#!/bin/sh\n") && wrapper.contains("exec \"perl\" \"$PODROOT/active/extensions/pkg/usr/usr/bin/perltidy.real\" \"$@\""),
+            wrapper.starts_with("#!/bin/sh\n")
+                && wrapper
+                    .contains("TREE=\"$PODROOT/active/extensions/pkg/usr/usr/bin/perltidy.real\"")
+                && wrapper.contains("exec \"perl\" \"$TREE\" \"$@\""),
             "the command path must become a tree wrapper execing the requires \
              interpreter by bare name from the extension tree (#94): {wrapper}"
         );
@@ -13224,9 +13249,9 @@ mod wrapper_tests {
         let wrapper = std::fs::read_to_string(&script).unwrap();
         assert!(
             wrapper.starts_with("#!/bin/sh\n")
-                && wrapper.contains(
-                    "exec \"perl\" \"$PODROOT/active/extensions/pkg/usr/usr/bin/tool.real\" \"$@\""
-                ),
+                && wrapper
+                    .contains("TREE=\"$PODROOT/active/extensions/pkg/usr/usr/bin/tool.real\"")
+                && wrapper.contains("exec \"perl\" \"$TREE\" \"$@\""),
             "own-payload interpreter wraps with the tree shape: {wrapper}"
         );
     }
@@ -13271,9 +13296,7 @@ mod wrapper_tests {
              extension tree's usr level: {wrapper}"
         );
         assert!(
-            wrapper.contains(
-                "exec \"perl\" \"$PODROOT/active/extensions/pkg/usr/usr/bin/perltidy.real\""
-            ),
+            wrapper.contains("TREE=\"$PODROOT/active/extensions/pkg/usr/usr/bin/perltidy.real\""),
             "the script must exec from the extension tree: {wrapper}"
         );
         assert_eq!(

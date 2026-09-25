@@ -233,23 +233,18 @@ fn read_bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).expect("read file")
 }
 
-/// Extract the script store path from a wrapper's `exec "<interpreter>"
-/// "<script>" "$@"` line (the second double-quoted argument).
-fn extract_script_path(wrapper: &str, interpreter: &str) -> String {
-    let exec_line = wrapper
+/// Extract the script tree path from a wrapper's `TREE="$PODROOT/..."`
+/// assignment — the primary target the #210 wrapper resolves (the exec
+/// line carries the `$TREE` variable, not the literal path).
+fn extract_script_path(wrapper: &str) -> String {
+    let tree_line = wrapper
         .lines()
-        .find(|l| l.trim_start().starts_with("exec ") && l.contains(interpreter))
-        .unwrap_or_else(|| panic!("no exec line for interpreter {interpreter} in: {wrapper}"));
-    // Split on the quoted arguments and take the second double-quoted token.
-    let quoted: Vec<&str> = exec_line
-        .split('"')
-        .enumerate()
-        .filter(|(i, _)| *i % 2 == 1)
-        .map(|(_, s)| s)
-        .collect();
+        .find(|l| l.trim_start().starts_with("TREE=\"$PODROOT"))
+        .unwrap_or_else(|| panic!("no TREE assignment in wrapper: {wrapper}"));
+    let quoted: Vec<&str> = tree_line.split('"').collect();
     assert!(
         quoted.len() >= 2,
-        "wrapper exec line has too few args: {exec_line}"
+        "TREE assignment has no quoted path: {tree_line}"
     );
     quoted[1].to_string()
 }
@@ -337,8 +332,8 @@ gated_test!(interpreter_package_builds_wrapper_and_farm_execs_it, {
     // `$PODROOT` resolves to the pod state dir; `active` flips with
     // rollback, so assert through the same link the wrapper uses.
     let pod_root = pod_dir(root.path(), "default");
-    let tree_script = extract_script_path(&wrapper_text, "python3")
-        .replace("$PODROOT", &pod_root.display().to_string());
+    let tree_script =
+        extract_script_path(&wrapper_text).replace("$PODROOT", &pod_root.display().to_string());
     assert!(
         std::path::Path::new(&tree_script).is_file(),
         "wrapper must reference an existing extension-tree script: {tree_script:?}"
