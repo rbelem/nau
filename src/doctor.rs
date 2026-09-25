@@ -218,6 +218,10 @@ fn run_scoped(scope: Scope) -> Vec<Check> {
                 .map(|(tool, fix)| check_pod_toolchain_tool(tool, fix, &entries)),
         ),
     }
+    // Issue #180 item 3: the sync env's cc must read as the farm/pool
+    // toolchain, or doctor names the collect2/ld skew before a sync
+    // dies mid-link on it. Hint-only — see [`check_cc_provenance`].
+    checks.push(check_cc_provenance());
     checks
 }
 
@@ -1188,6 +1192,60 @@ fn resolve_pod_tool_in(tool: &str, farms: &[PathBuf]) -> Option<PathBuf> {
         .find_map(|farm| snap::resolve_in_path(tool, std::slice::from_ref(farm)))
 }
 
+/// The sync environment's `cc` provenance (issue #180 item 3): warns
+/// when `cc` resolves to a FOREIGN toolchain while the pod farms carry
+/// the pool one — the collect2/ld version-skew class (nixpkgs gcc
+/// 15.3's collect2 execing the farm's deb ld 2.44 dies on
+/// `libbfd-…-system.so` in degraded-direct mode, where the build
+/// inherits the caller's PATH). Resolution follows the surfaces a sync
+/// build actually sees: the host PATH (what degraded-direct inherits;
+/// inside the bwrap sandbox the merged prefix's `usr/bin` leads
+/// instead, so a gcc `build_dep` build is unaffected by a foreign host
+/// cc), judged against the farms a healthy pod composes
+/// ([`resolve_pod_tool_in`], `shuttle run --pod`'s first entries).
+/// Status stays Ok in every verdict — this is the issue's "doctor
+/// hint": a wrong-tool warning, never a second missing-tool flag
+/// (absence already has the `sandbox: cc` check) and never a hard
+/// failure for the usually-working foreign cc.
+fn check_cc_provenance() -> Check {
+    let entries = snap::path_entries();
+    let farms = pod_farm_dirs();
+    check_cc_provenance_with(&entries, &farms)
+}
+
+/// The provenance resolution proper over an explicit host-PATH entry
+/// list and pod farm dirs — split out so tests can point both at
+/// tempdirs without touching the real PATH or pod root.
+fn check_cc_provenance_with(entries: &[PathBuf], farms: &[PathBuf]) -> Check {
+    let name = "sync cc provenance";
+    match snap::resolve_in_path("cc", entries) {
+        // Absence is the `sandbox: cc` check's verdict — this hint
+        // would only duplicate it.
+        None => Check::ok(name),
+        Some(path) if farms.iter().any(|f| path.starts_with(f)) => Check::ok_at(
+            name,
+            format!("resolves to the pod toolchain farm: {}", path.display()),
+        ),
+        Some(path) => {
+            let hint = if resolve_pod_tool_in("cc", farms).is_some() {
+                format!(
+                    "warning: cc resolves to {} — not the farm/pool toolchain, so a \
+                     degraded-direct build can pair a foreign collect2 with the farm's \
+                     ld and die on version skew (issue #180: nix gcc 15.3 collect2 + \
+                     deb ld 2.44). Sync from an environment without a foreign gcc \
+                     (e.g. `nix shell` without gcc) so cc resolves to the farm; \
+                     sandboxed builds with a gcc build_dep are unaffected — the merged \
+                     prefix leads their PATH.",
+                    path.display()
+                )
+            } else {
+                format!("resolves to {}", path.display())
+            };
+            Check::ok_at(name, hint)
+        }
+    }
+}
+
 /// Farm bin dirs of every pod under the pod root whose `current` link
 /// resolves to an active generation — the farm-first PATH entries
 /// `shuttle run --pod` prepends. `doctor --pod` takes no pod name, so
@@ -1622,6 +1680,94 @@ mod tests {
             matches!(check.status, CheckStatus::Missing),
             "make has no pod-shim contract — no farm credit: {check:?}"
         );
+    }
+
+    // ── Sync cc provenance (issue #180 item 3) ──
+
+    /// The #180 incident shape: the sync PATH leads `cc` to a foreign
+    /// compiler while a healthy pod's farm carries the pool toolchain —
+    /// the collect2/ld skew doctor must name. Hint-only: status stays
+    /// Ok, the warning lives in the hint.
+    #[test]
+    fn doctor_warns_when_the_path_cc_is_foreign_while_the_farm_carries_the_toolchain() {
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "cc");
+        // The farm cc lives under gate/current/ — a subdir the PATH
+        // entry does not recurse into, so the foreign dir/cc wins the
+        // PATH resolution exactly like the incident's nix gcc.
+        let farm = write_pod_farm(dir.path(), "gate", "cc");
+        let entries = vec![dir.path().to_path_buf()];
+
+        let check = check_cc_provenance_with(&entries, &[farm]);
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "the skew warning is a hint, never fatal: {check:?}"
+        );
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("warning") && hint.contains("collect2"),
+            "the hint must name the skew class: {hint}"
+        );
+        assert!(
+            hint.contains("nix shell"),
+            "the hint must carry the issue's workaround: {hint}"
+        );
+    }
+
+    /// A cc resolving from a farm dir (the `shuttle run --pod` PATH
+    /// shape) IS the pool toolchain — no warning.
+    #[test]
+    fn doctor_credits_a_cc_that_resolves_from_a_pod_farm() {
+        let dir = tempfile::tempdir().unwrap();
+        let farm = write_pod_farm(dir.path(), "gate", "cc");
+        let entries = vec![farm.clone()];
+
+        let check = check_cc_provenance_with(&entries, &[farm]);
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("pod toolchain farm") && !hint.contains("warning"),
+            "{hint}"
+        );
+    }
+
+    /// No cc anywhere: quiet Ok — absence already has the `sandbox: cc`
+    /// verdict, and this check never double-flags it.
+    #[test]
+    fn doctor_stays_quiet_when_no_cc_resolves_anywhere() {
+        let entries = vec![PathBuf::from("/nix/store/0000-garbage-collected/bin")];
+        let check = check_cc_provenance_with(&entries, &[]);
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert!(check.hint.is_none(), "{check:?}");
+    }
+
+    /// A foreign cc with NO farm toolchain to skew against is plain
+    /// host readiness — informational, not the #180 warning.
+    #[test]
+    fn doctor_hints_without_warning_when_only_a_foreign_cc_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "cc");
+        let entries = vec![dir.path().to_path_buf()];
+
+        let check = check_cc_provenance_with(&entries, &[]);
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("resolves to") && !hint.contains("warning"),
+            "{hint}"
+        );
+    }
+
+    /// Both doctor scopes gate the sync surface, so both carry the
+    /// provenance check.
+    #[test]
+    fn run_all_and_pod_scope_include_the_sync_cc_provenance_check() {
+        for checks in [run_all(), run_pod()] {
+            assert!(
+                checks.iter().any(|c| c.name == "sync cc provenance"),
+                "missing sync cc provenance check"
+            );
+        }
     }
 
     // ── Initrd boot-chain module audit (ADR-0024 §1) ──
