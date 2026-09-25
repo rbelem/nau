@@ -12265,15 +12265,18 @@ fi
         assert_eq!(
             get("LIBRARY_PATH"),
             "/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64:\
+             /shuttle-build-prefix/lib64:\
              /shuttle-build-prefix/usr/lib/x86_64-linux-gnu:\
              /shuttle-build-prefix/usr/lib/aarch64-linux-gnu:\
              /shuttle-build-prefix/usr/lib/arm-linux-gnueabihf",
-            "the gcc cc-shim composes -L from this (gcc.lua contract) (#180)"
+            "the gcc cc-shim composes -L from this (gcc.lua contract) (#180); \
+             /lib64 is the glibc source build's slibdir (08061c8)"
         );
         assert_eq!(get("LDFLAGS"), "-L/shuttle-build-prefix/usr/lib");
         assert_eq!(
             get("LD_LIBRARY_PATH"),
             "/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64:\
+             /shuttle-build-prefix/lib64:\
              /shuttle-build-prefix/usr/lib/x86_64-linux-gnu:\
              /shuttle-build-prefix/usr/lib/aarch64-linux-gnu:\
              /shuttle-build-prefix/usr/lib/arm-linux-gnueabihf",
