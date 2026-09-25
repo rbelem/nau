@@ -26,8 +26,12 @@
 //! hardlinks fail closed with a loud error — the state root is documented
 //! to live on ONE filesystem. A symlink fallback is deliberately absent:
 //! a symlinked generation tree would make blob deletion (gc) dangle every
-//! installed file, and a copy fallback would silently double storage while
-//! breaking the "generations are free" invariant.
+//! installed file. The ONE sanctioned copy is EMLINK (issue #213): when a
+//! blob sits at the filesystem's link-count cap (btrfs allows 65535 links
+//! per inode; the empty-content blob is linked by every staged empty file
+//! and reached it), that single file is copied instead of failing staging.
+//! Copies don't dangle under gc, and the cost is one file's bytes — not
+//! the generation-free invariant.
 //!
 //! # Presentation
 //!
@@ -1501,12 +1505,35 @@ impl RuntimeStore {
 
     /// Hardlink a content blob into a generation tree. Cross-device
     /// (EXDEV) is a loud fail-closed error: the state root is documented
-    /// to live on ONE filesystem.
+    /// to live on ONE filesystem. EMLINK (the blob is at the filesystem's
+    /// link-count cap) copies just that blob instead of failing staging
+    /// (issue #213).
     fn hardlink_blob(&self, sha256: &str, dest: &Path) -> miette::Result<()> {
+        self.hardlink_blob_with(&RealFs, sha256, dest)
+    }
+
+    /// [`Self::hardlink_blob`] with the filesystem seam injected (tests).
+    fn hardlink_blob_with(
+        &self,
+        fs: &dyn BlobLinker,
+        sha256: &str,
+        dest: &Path,
+    ) -> miette::Result<()> {
         let blob = self.blob_path(sha256);
-        std::fs::hard_link(&blob, dest).map_err(|e| {
-            if e.raw_os_error() == Some(libc::EXDEV) {
-                miette::miette!(
+        if let Err(e) = fs.hard_link(&blob, dest) {
+            return match classify_hardlink_failure(&e) {
+                HardlinkFailure::LinkCountCap => fs
+                    .copy(&blob, dest)
+                    .into_diagnostic()
+                    .map(|_| ())
+                    .wrap_err_with(|| {
+                        format!(
+                            "copying capped blob {} -> {}",
+                            blob.display(),
+                            dest.display()
+                        )
+                    }),
+                HardlinkFailure::CrossDevice => Err(miette::miette!(
                     "cannot hardlink blob into the generation tree: {} and {} \
                      are on different filesystems (EXDEV). The state root must \
                      live on ONE filesystem — generations share the store's \
@@ -1515,11 +1542,15 @@ impl RuntimeStore {
                      filesystem.",
                     blob.display(),
                     dest.display()
-                )
-            } else {
-                miette::miette!("hardlinking {} -> {}: {e}", blob.display(), dest.display())
-            }
-        })
+                )),
+                HardlinkFailure::Other => Err(miette::miette!(
+                    "hardlinking {} -> {}: {e}",
+                    blob.display(),
+                    dest.display()
+                )),
+            };
+        }
+        Ok(())
     }
 
     /// Stage generation `n` at generations/.staging-<N>: per-package
@@ -2342,6 +2373,77 @@ fn extension_release_text(id: &str, version_id: &str) -> String {
     format!("ID={id}\nVERSION_ID={version_id}\n")
 }
 
+/// What a failed hardlink(2) means, decided purely from the errno —
+/// the syscall boundary maps the raw error ONCE; callers stay
+/// filesystem-free and string-match nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardlinkFailure {
+    /// EMLINK — the source inode is at the filesystem's link-count cap
+    /// (btrfs caps one inode at 65535 links; issue #213: the
+    /// empty-content blob `e3b0c44…` is linked by every staged empty
+    /// file and reached it).
+    LinkCountCap,
+    /// EXDEV — source and destination live on different filesystems.
+    CrossDevice,
+    /// Anything else (or a non-errno error) — propagate.
+    Other,
+}
+
+fn classify_hardlink_failure(err: &std::io::Error) -> HardlinkFailure {
+    match err.raw_os_error() {
+        Some(libc::EMLINK) => HardlinkFailure::LinkCountCap,
+        Some(libc::EXDEV) => HardlinkFailure::CrossDevice,
+        _ => HardlinkFailure::Other,
+    }
+}
+
+/// The filesystem link/copy primitives used to materialize trees — the
+/// ONE seam (issue #213) that lets a test fail the link syscall with a
+/// chosen errno without a filesystem that actually caps at 65535 links.
+trait BlobLinker {
+    fn hard_link(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn copy(&self, from: &Path, to: &Path) -> std::io::Result<u64>;
+}
+
+/// Production impl: the real syscalls.
+struct RealFs;
+
+impl BlobLinker for RealFs {
+    fn hard_link(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::hard_link(from, to)
+    }
+    fn copy(&self, from: &Path, to: &Path) -> std::io::Result<u64> {
+        std::fs::copy(from, to)
+    }
+}
+
+/// Hardlink `from` at `to`, falling back to a content copy ONLY when the
+/// link failed with EMLINK (the source inode is at its link-count cap —
+/// a copy is the only cap-free option: symlinks would dangle under gc,
+/// and failing staging wedges every install past the cap). Any other
+/// link error propagates unchanged.
+fn hard_link_or_copy(fs: &dyn BlobLinker, from: &Path, to: &Path) -> miette::Result<()> {
+    if let Err(e) = fs.hard_link(from, to) {
+        if classify_hardlink_failure(&e) == HardlinkFailure::LinkCountCap {
+            return fs
+                .copy(from, to)
+                .into_diagnostic()
+                .map(|_| ())
+                .wrap_err_with(|| {
+                    format!(
+                        "copying {} -> {} after the link-count cap (EMLINK)",
+                        from.display(),
+                        to.display()
+                    )
+                });
+        }
+        return Err(e)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("hardlinking {} -> {}", from.display(), to.display()));
+    }
+    Ok(())
+}
+
 /// Copy a tree, hardlinking regular files (never copying contents) —
 /// the carried-over-tree path for packages untouched by an operation.
 fn copy_tree_hardlinks(src: &Path, dest: &Path) -> miette::Result<()> {
@@ -2372,9 +2474,7 @@ fn copy_tree_entry(from: &Path, to: &Path) -> miette::Result<()> {
     } else if meta.is_dir() {
         copy_tree_hardlinks(from, to)
     } else {
-        std::fs::hard_link(from, to)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("hardlinking {}", to.display()))
+        hard_link_or_copy(&RealFs, from, to)
     }
 }
 
@@ -2662,6 +2762,170 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert(p.name.clone(), p);
         m
+    }
+
+    // ── EMLINK copy fallback (issue #213) ──
+
+    use std::cell::Cell;
+
+    const BLOB_213: &[u8] = b"issue-213-empty-blob-content";
+
+    /// Link double: fails every hard_link with `errno` (io::Error isn't
+    /// Clone, so it is constructed per call) and counts attempts; copies
+    /// hit the real filesystem so content equality is provable.
+    struct CappedLinker {
+        errno: i32,
+        links: Cell<usize>,
+        copies: Cell<usize>,
+    }
+
+    impl CappedLinker {
+        fn capped() -> CappedLinker {
+            CappedLinker::with_errno(libc::EMLINK)
+        }
+
+        fn with_errno(errno: i32) -> CappedLinker {
+            CappedLinker {
+                errno,
+                links: Cell::new(0),
+                copies: Cell::new(0),
+            }
+        }
+    }
+
+    impl BlobLinker for CappedLinker {
+        fn hard_link(&self, _from: &Path, _to: &Path) -> std::io::Result<()> {
+            self.links.set(self.links.get() + 1);
+            Err(std::io::Error::from_raw_os_error(self.errno))
+        }
+
+        fn copy(&self, from: &Path, to: &Path) -> std::io::Result<u64> {
+            self.copies.set(self.copies.get() + 1);
+            std::fs::copy(from, to)
+        }
+    }
+
+    fn seed_content_blob(store: &RuntimeStore, hash: &str, content: &[u8]) {
+        let path = store.blob_path(hash);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+    }
+
+    fn tree_dest(store: &RuntimeStore, hash: &str) -> PathBuf {
+        let dest = store
+            .generation_dir(1)
+            .join("extensions/x/usr/bin")
+            .join(format!("tool-{hash}"));
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        dest
+    }
+
+    #[test]
+    fn emlink_blob_link_falls_back_to_a_copy_with_equal_content() {
+        let f = fixture();
+        let blob = f.store.blob_path(H1);
+        seed_content_blob(&f.store, H1, BLOB_213);
+        let dest = tree_dest(&f.store, H1);
+
+        let capped = CappedLinker::capped();
+        f.store
+            .hardlink_blob_with(&capped, H1, &dest)
+            .expect("EMLINK must copy the blob, not fail staging");
+
+        assert_eq!(
+            capped.links.get(),
+            1,
+            "the link fast path is still attempted first"
+        );
+        assert_eq!(capped.copies.get(), 1, "exactly one copy fallback");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            BLOB_213,
+            "the copy preserves content"
+        );
+        assert_ne!(
+            std::fs::metadata(&blob).unwrap().ino(),
+            std::fs::metadata(&dest).unwrap().ino(),
+            "the fallback must be a copy, not another link"
+        );
+    }
+
+    #[test]
+    fn non_emlink_blob_link_errors_propagate_without_a_fallback() {
+        let f = fixture();
+        seed_content_blob(&f.store, H2, BLOB_213);
+        let dest = tree_dest(&f.store, H2);
+
+        let denied = CappedLinker::with_errno(libc::EACCES);
+        let err = f.store.hardlink_blob_with(&denied, H2, &dest).unwrap_err();
+        assert!(err.to_string().contains("hardlinking"), "{err}");
+        assert_eq!(denied.copies.get(), 0, "no blanket copy fallback");
+        assert!(!dest.exists(), "a failed link leaves no destination");
+    }
+
+    #[test]
+    fn exdev_blob_link_still_fails_closed() {
+        let f = fixture();
+        seed_content_blob(&f.store, H3, BLOB_213);
+        let dest = tree_dest(&f.store, H3);
+
+        let exdev = CappedLinker::with_errno(libc::EXDEV);
+        let err = f.store.hardlink_blob_with(&exdev, H3, &dest).unwrap_err();
+        assert!(err.to_string().contains("EXDEV"), "{err}");
+        assert_eq!(exdev.copies.get(), 0, "EXDEV never copies");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn classify_hardlink_failure_maps_errata_only() {
+        use HardlinkFailure::{CrossDevice, LinkCountCap, Other};
+        assert_eq!(
+            classify_hardlink_failure(&std::io::Error::from_raw_os_error(libc::EMLINK)),
+            LinkCountCap
+        );
+        assert_eq!(
+            classify_hardlink_failure(&std::io::Error::from_raw_os_error(libc::EXDEV)),
+            CrossDevice
+        );
+        assert_eq!(
+            classify_hardlink_failure(&std::io::Error::from_raw_os_error(libc::EIO)),
+            Other
+        );
+        assert_eq!(
+            classify_hardlink_failure(&std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "no errno behind it"
+            )),
+            Other,
+            "non-errno errors propagate, never fall back"
+        );
+    }
+
+    #[test]
+    fn hard_link_or_copy_falls_back_only_on_emlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        std::fs::write(&from, BLOB_213).unwrap();
+
+        // EMLINK → copy, content equal, different inode.
+        let to = dir.path().join("to");
+        let capped = CappedLinker::capped();
+        hard_link_or_copy(&capped, &from, &to).expect("EMLINK copies");
+        assert_eq!(capped.links.get(), 1);
+        assert_eq!(capped.copies.get(), 1);
+        assert_eq!(std::fs::read(&to).unwrap(), BLOB_213);
+        assert_ne!(
+            std::fs::metadata(&from).unwrap().ino(),
+            std::fs::metadata(&to).unwrap().ino()
+        );
+
+        // Any other errno → propagates, no copy, no destination.
+        let to2 = dir.path().join("to2");
+        let denied = CappedLinker::with_errno(libc::EACCES);
+        let err = hard_link_or_copy(&denied, &from, &to2).unwrap_err();
+        assert!(err.to_string().contains("hardlinking"), "{err}");
+        assert_eq!(denied.copies.get(), 0);
+        assert!(!to2.exists());
     }
 
     /// A fake tool: exits 0 and touches a marker — proves injection.
