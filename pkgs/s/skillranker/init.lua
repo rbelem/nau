@@ -68,15 +68,15 @@ return {
 
         sources = {
             sr = {
-                url = "https://codeload.github.com/Dicklesworthstone/skillranker/tar.gz/3fe85c432ba5e2b4f980e842fc94d57fae6c4189",
+                url = "https://github.com/Dicklesworthstone/skillranker/archive/3fe85c432ba5e2b4f980e842fc94d57fae6c4189.tar.gz",
                 sha256 = "76627113e8de709562214bddf81ede1c4c0ffff290b0dd86adc454cf211266d6",
             },
             frankensearch = {
-                url = "https://codeload.github.com/Dicklesworthstone/frankensearch/tar.gz/39047c44c3a92ceb71d25c602913b8b2888e2fe7",
+                url = "https://github.com/Dicklesworthstone/frankensearch/archive/39047c44c3a92ceb71d25c602913b8b2888e2fe7.tar.gz",
                 sha256 = "87b3651c609a5407abfd10e9af5ea3d9b7caf03d484ac2786cdc92825110ea77",
             },
             asupersync = {
-                url = "https://codeload.github.com/Dicklesworthstone/asupersync/tar.gz/81fb7b579ce5f161622f1524391f5202a641cc2e",
+                url = "https://github.com/Dicklesworthstone/asupersync/archive/81fb7b579ce5f161622f1524391f5202a641cc2e.tar.gz",
                 sha256 = "f23a4fa3bbd1a84a0c8324990b80e53eb4aa4783a39fd116f11b35b5d1fff3e5",
             },
         },
