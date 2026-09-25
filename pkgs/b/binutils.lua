@@ -14,7 +14,7 @@ archives, and binaries. This build targets x86_64-linux-gnu.]],
         confinement = "strict",
         architectures = { "amd64" },
         type = "source",
-        requires = {},
+        requires = { "glibc" },
         -- ADR-0018: no implicit host toolchain — configure died "no
         -- acceptable C compiler found in $PATH" under the pod-first
         -- sync env.
