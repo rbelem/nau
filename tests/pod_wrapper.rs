@@ -191,6 +191,27 @@ fn write_pkg_elf(project: &Path, name: &str, app: &str, port: u16, tarball: &str
     std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
 }
 
+/// A CPython-shaped native-ELF package: like [`write_pkg_elf`] but the
+/// build ALSO stages `lib/python3.10/` beside `bin/<bin>` — the
+/// `stage_bundles_python_stdlib` trigger that routes the command into
+/// `emit_elf_tree_wrapper` (the #210 gen-tree fallback under test).
+fn write_pkg_elf_stdlib(project: &Path, name: &str, app: &str, port: u16, tarball: &str) {
+    let letter = name.chars().next().unwrap().to_ascii_lowercase();
+    let dir = project.join("pkgs").join(letter.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "{name}",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/{tarball}",
+    build = "mkdir -p $STAGE/bin $STAGE/lib/python3.10 && gcc -o $STAGE/bin/{app} $SRC/hello.c && chmod +x $STAGE/bin/{app} && : > $STAGE/lib/python3.10/os.py",
+    apps = {{ {app} = {{ command = "bin/{app}", interpreter = "python3" }} }},
+}} }}
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.lua")), lua).unwrap();
+}
+
 // ── Runners / helpers ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
@@ -252,20 +273,30 @@ fn extract_script_path(wrapper: &str) -> String {
 /// Run `farm/<name>` with the farm prepended to the current PATH (the
 /// interpreter resolves through that PATH), returning stdout.
 fn run_farm_binary(farm: &Path, name: &str, extra_args: &[&str]) -> String {
-    let mut cmd = Command::new(farm.join(name));
+    run_binary(&farm.join(name), extra_args)
+}
+
+/// Execute an arbitrary installed binary (farm entry or gen-tree wrapper)
+/// with its own directory prepended to PATH, stdout on success.
+fn run_binary(path: &Path, extra_args: &[&str]) -> String {
+    let mut cmd = Command::new(path);
     cmd.args(extra_args);
-    let path = format!(
-        "{}:{}",
-        farm.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    cmd.env("PATH", path);
-    let out = cmd.output().expect("spawn farm entry");
+    if let Some(dir) = path.parent() {
+        let path = format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        cmd.env("PATH", path);
+    }
+    let out = cmd.output().expect("spawn binary");
     assert!(
         out.status.success(),
-        "farm entry {name} must run successfully (exit {:?}): {}",
+        "binary {} must run successfully (exit {:?}): {} {}",
+        path.display(),
         out.status.code(),
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -364,6 +395,23 @@ gated_test!(interpreter_package_builds_wrapper_and_farm_execs_it, {
         out.contains("py-tool-ran alpha beta"),
         "farm binary must execute the interpreter tool with args forwarded: {out:?}"
     );
+
+    // #210 regression: the SAME wrapper blob is hardlinked into the
+    // generation tree at `generations/<n>/extensions/<pkg>/usr/bin/
+    // <pkg>-<app>`. Invoked from there, the three-dirname PODROOT
+    // derivation lands on the extension and the primary `$PODROOT/active`
+    // target misses — the fallback must exec the payload root's own copy.
+    let gen_wrapper = pod_dir(root.path(), "default")
+        .join("generations/1/extensions/pytool/usr/bin/pytool-pytool");
+    assert!(
+        gen_wrapper.is_file(),
+        "gen-tree wrapper must exist: {gen_wrapper:?}"
+    );
+    let out = run_binary(&gen_wrapper, &["alpha", "beta"]);
+    assert!(
+        out.contains("py-tool-ran alpha beta"),
+        "gen-tree wrapper must execute the tool with args forwarded (#210): {out:?}"
+    );
 });
 
 gated_test!(native_elf_package_gets_no_wrapper, {
@@ -396,5 +444,69 @@ gated_test!(native_elf_package_gets_no_wrapper, {
     assert!(
         out.contains("native-elf-ran"),
         "native ELF farm binary must execute directly: {out:?}"
+    );
+});
+
+// An ELF whose payload bundles a python stdlib tree takes the TREE
+// wrapper (`emit_elf_tree_wrapper`, CPython stdlib self-located). The
+// wrapper must run the real ELF from BOTH install sites: the farm's
+// store blob (primary `$PODROOT/active` target) and the generation-tree
+// hardlink (fallback to the payload root — #210, same gap the script
+// tree wrapper closed).
+gated_test!(elf_stdlib_tree_wrapper_resolves_gen_tree, {
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server = project.path().join("server");
+    make_tarball(&server, "pyelf");
+    let port = serve_dir(&server);
+    write_pkg_elf_stdlib(project.path(), "pyelf", "pyelf", port, "pyelf.tar.gz");
+
+    let (code, _, stderr) = run(project.path(), root.path(), &["add", "pyelf"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    let farm = current_farm(root.path(), "default");
+    let target = farm_entry_target(&farm, "pyelf");
+    let wrapper = read_bytes(&target);
+    let wrapper_text = String::from_utf8_lossy(&wrapper);
+    assert!(
+        wrapper_text.starts_with("#!/bin/sh"),
+        "stdlib-bundling ELF must take the tree wrapper: {wrapper_text:?}"
+    );
+    assert!(
+        wrapper_text.contains("TREE=\"$PODROOT/active/extensions/pyelf/usr/bin/pyelf.real\""),
+        "wrapper primary target must be the extension tree: {wrapper_text:?}"
+    );
+    assert!(
+        wrapper_text.contains("[ -f \"$TREE\" ] || TREE="),
+        "wrapper must carry the gen-tree fallback (#210): {wrapper_text:?}"
+    );
+    assert_eq!(
+        wrapper_text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("exec "))
+            .count(),
+        1,
+        "wrapper must contain exactly one exec: {wrapper_text:?}"
+    );
+
+    // Farm path: the primary `$PODROOT/active/...` target resolves.
+    let out = run_farm_binary(&farm, "pyelf", &[]);
+    assert!(
+        out.contains("native-elf-ran"),
+        "farm tree wrapper must execute the real ELF: {out:?}"
+    );
+
+    // Gen-tree path: the primary misses, the fallback execs the payload
+    // root's own `.real` copy (#210).
+    let gen_wrapper =
+        pod_dir(root.path(), "default").join("generations/1/extensions/pyelf/usr/bin/pyelf-pyelf");
+    assert!(
+        gen_wrapper.is_file(),
+        "gen-tree wrapper must exist: {gen_wrapper:?}"
+    );
+    let out = run_binary(&gen_wrapper, &[]);
+    assert!(
+        out.contains("native-elf-ran"),
+        "gen-tree wrapper must fall back to the payload root (#210): {out:?}"
     );
 });

@@ -3580,6 +3580,15 @@ fn emit_script_tree_wrapper(
 /// discovery, detected by [`stage_bundles_python_stdlib`]). Bundled
 /// runtime libs (the #10 LD_LIBRARY_PATH set) still resolve, now from the
 /// tree's name-preserving lib dirs.
+///
+/// Like the script tree wrapper (#210), the blob is hardlinked into every
+/// generation at `generations/<n>/extensions/<pkg>/usr/bin/<pkg>-<app>`,
+/// where the three-dirname PODROOT derivation lands on the extension. The
+/// exec target and the LD_LIBRARY_PATH root therefore resolve adaptively:
+/// primary hit through `$PODROOT/active/...` (store-blob invocation and
+/// the merged prefix, where the #90 rewrite strips the extension
+/// segment), fallback to the payload root two dirnames up — the SAME
+/// generation's copy.
 fn emit_elf_tree_wrapper(
     app_name: &str,
     entry: &Path,
@@ -3603,20 +3612,25 @@ fn emit_elf_tree_wrapper(
         None => real_sibling_name(&cmd_rel.to_string_lossy()),
     };
     let tree_elf = format!("$PODROOT/active/extensions/{pkg_name}/usr/{cmd_rel_real}");
-    let ld_paths: Vec<String> = lib_dirs
-        .iter()
-        .map(|rel| {
-            format!(
-                "$PODROOT/active/extensions/{}/usr/{}",
-                pkg_name,
-                rel.display()
-            )
-        })
-        .collect();
-    let ld_line = if ld_paths.is_empty() {
+    // Gen-tree fallback (#210): when the primary `$PODROOT/active/...`
+    // misses, both the exec target and the bundled-lib root re-point at
+    // the payload root two dirnames up from the wrapper — appending each
+    // reference's own rel path reproduces the extension tree's `usr/usr`
+    // doubling for usr/-staged payloads.
+    let libroot_line = if lib_dirs.is_empty() {
         String::new()
     } else {
-        format!("export LD_LIBRARY_PATH=\"{}\"\n", ld_paths.join(":"))
+        let libroot = format!("$PODROOT/active/extensions/{pkg_name}/usr");
+        let ld_list = lib_dirs
+            .iter()
+            .map(|rel| format!("$LIBROOT/{}", rel.display()))
+            .collect::<Vec<_>>()
+            .join(":");
+        format!(
+            "LIBROOT=\"{libroot}\"\n\
+             [ -d \"$LIBROOT\" ] || LIBROOT=\"$(dirname \"$(dirname \"$SCRIPT\")\")\"\n\
+             export LD_LIBRARY_PATH=\"{ld_list}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"\n"
+        )
     };
     // The only ELF that takes this wrapper is a prefix-relative runtime
     // (CPython, detected by stage_bundles_python_stdlib). Its sys.path
@@ -3635,13 +3649,15 @@ fn emit_elf_tree_wrapper(
         "#!/bin/sh\n\
          SCRIPT=\"$(readlink -f \"$0\")\"\n\
          PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
-         {ld_line}\
+         {libroot_line}\
          PYTHONPATH=\"${{SHUTTLE_PYTHONPATH:-}}\"\n\
          for sp in \"$PODROOT\"/active/extensions/*/usr/usr/lib/python3.*/site-packages; do\n\
          \x20 [ -d \"$sp\" ] && PYTHONPATH=\"${{PYTHONPATH:+$PYTHONPATH:}}$sp\"\n\
          done\n\
          export PYTHONPATH\n\
-         exec \"{tree_elf}\" \"$@\"\n"
+         TREE=\"{tree_elf}\"\n\
+         [ -f \"$TREE\" ] || TREE=\"$(dirname \"$(dirname \"$SCRIPT\")\")/{cmd_rel_real}\"\n\
+         exec \"$TREE\" \"$@\"\n"
     );
     write_wrapper(app_name, entry, &wrapper)
 }
@@ -13016,6 +13032,17 @@ mod wrapper_tests {
         assert!(
             wrapper.contains("extensions/pkg/usr/usr/bin/python3.real.12"),
             "wrapper must exec the tree ELF: {wrapper}"
+        );
+        // #210: the gen-tree hardlink invocation falls back to the
+        // payload root two dirnames up, appending the command's own
+        // (usr/-doubled) rel path.
+        assert!(
+            wrapper.contains(
+                "TREE=\"$PODROOT/active/extensions/pkg/usr/usr/bin/python3.real.12\"\n\
+                 [ -f \"$TREE\" ] || TREE=\"$(dirname \"$(dirname \"$SCRIPT\")\")/usr/bin/python3.real.12\"\n\
+                 exec \"$TREE\" \"$@\""
+            ),
+            "ELF tree wrapper must carry the gen-tree fallback: {wrapper}"
         );
         assert!(
             wrapper.contains("readlink -f"),
