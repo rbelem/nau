@@ -14,7 +14,7 @@ for building GCC, MPFR, and MPC.]],
         confinement = "strict",
         architectures = { "amd64" },
         type = "source",
-        requires = {},
+        requires = { "glibc" },
         -- build_deps m4: GMP's build assembles its mpn assembly by running
         -- .asm files through m4; the sandbox toolchain ships none, so the
         -- pool m4 must be on the build PATH (merged build prefix, ADR-0018).
