@@ -30,5 +30,16 @@ archives, and binaries. This build targets x86_64-linux-gnu.]],
             -- prefix merging stays content-identical.
             "find $STAGE -name 'dir' -path '*/share/info/*' -delete",
         }, " && "),
+
+        -- The five libtool archives (libsframe/libbfd/libopcodes/libctf/
+        -- libctf-nobfd .la) embed the merged build prefix in
+        -- dependency_libs — the zlib-class interim escape (ADR-0018
+        -- Decision 3, issue #22's portability follow-up). .la files
+        -- matter only at libtool link time; runtime consumers resolve
+        -- the SONAMEs through the name-preserving tree. The scan's
+        -- text-leak reference is the bare prefix marker, so one entry
+        -- covers all five files; ELF RUNPATH/DT_NEEDED still scan
+        -- strictly.
+        leaks_ok = { "/shuttle-build-prefix" },
     },
 }
