@@ -27,7 +27,17 @@
 --
 --   kept:    grpcnotrace (upstream default), exclude_graphdriver_btrfs
 --            (no btrfs headers in the pool; overlay is the storage
---            driver)
+--            driver), seccomp (issue #215: the #21-era build shipped
+--            WITHOUT it and every default `podman run` died at spec
+--            generation — common/pkg/seccomp/seccomp_unsupported.go
+--            errNotSupported; the pool libseccomp port supplies the
+--            cgo pkg-config: libseccomp probe)
+--   dropped: apparmor/btrfs/sqlite/systemd/libsubid probes (their
+--            hack/*.tag.sh autodetects have no pool counterpart and
+--            no-op cleanly; libsubid falls back to /etc/subuid file
+--            parsing, functionally identical for rootless userns)
+--   added:   none needed for gpgme — the !openpgp path
+--            (mechanism_gpgme_only.go) is pure Go, no cgo gpgme
 --   dropped: seccomp, systemd, libsubid, apparmor, libsqlite3 — each
 --            probe needs a system library the pool lacks. None blocks
 --            the build; each narrows behavior (see KNOWN GAPS).
@@ -57,35 +67,48 @@
 --
 -- KNOWN GAPS (declared, not resolved): podman is a runtime
 -- ORCHESTRATOR — it execs its helpers by name at container time, and
--- none of them is in the pool yet, so this package cannot RUN
--- containers until they land as ports:
+-- Runtime helper family, pool status after #215:
 --
---   crun (or runc)    OCI runtime; crun-first lookup
---                     (config.findRuntime)
---   conmon            container monitor; PATH lookup
---   pasta             rootless network default + rootless port
---                     forwarder (podman 5/6 default, replacing
---                     slirp4netns)
---   netavark          bridge network stack (rootful; rootless
---                     opt-in)
---   aardvark-dns      DNS on netavark bridges
---   catatonit         --init binary (config.FindInitBinary)
---   fuse-overlayfs    rootless overlay fallback (native-overlay
---                     kernels do not need it)
---   containers-common /etc/containers config; policy.json is
---                     ErrorIfNotFound in containers/image — image
---                     pulls fail without it
+--   crun 1.30.1          IN POOL (prebuilt release fetch)
+--   conmon 2.2.1         IN POOL (prebuilt release fetch)
+--   passt g21550f5       IN POOL (prebuilt release fetch; pasta is
+--                        podman 5/6's rootless network default)
+--   fuse-overlayfs 1.18  IN POOL (prebuilt release fetch; rootless
+--                        overlay fallback — native-overlay kernels,
+--                        5.13+, do not need it)
+--   libseccomp 2.6.1     IN POOL (source port; required by the
+--                        seccomp BUILDTAG, see the kept/dropped
+--                        block above)
 --
--- plus the dropped-tag libraries: a future libseccomp port re-enables
--- seccomp profile enforcement (BUILDTAGS += seccomp), libsystemd the
--- journald log driver, libsubid NSS subuid lookup (until then podman
--- falls back to /etc/subuid parsing), libapparmor apparmor profile
--- loading.
+-- Still NOT in the pool, and NOT in requires because the default
+-- rootless run path never execs them:
 --
--- Requires: glibc; crun, conmon, pasta, netavark, aardvark-dns,
--- catatonit, fuse-overlayfs, containers-common (all not yet in pool —
--- see KNOWN GAPS). build_deps: go (vendored build), toolchain (CGO
--- compiler for the sqlite amalgamation).
+--   netavark / aardvark-dns   bridge-network stack (rootless default
+--                             is pasta); needed only for custom
+--                             bridge networks and `podman build`
+--                             with --network=bridge
+--   catatonit                 only exec'd for --init containers
+--
+-- Config: the payload ships the upstream minimal default
+-- /usr/share/containers/policy.json (insecureAcceptAnything — the
+-- common distro default; image pulls ErrorIfNotFound without it,
+-- containers/image signature policy). The pod shell sees the HOST
+-- /usr (NixOS: no /usr/share/containers), so the pull path is wired
+-- via CONTAINERS_POLICY_JSON pointing at the pod tree's copy — a
+-- machine-specific literal in the daily pod declaration
+-- (<podroot>/active/extensions/podman/usr/share/containers/
+-- policy.json; `active` is generation-stable). Storage needs NO conf:
+-- the rootless defaults (graphroot ~/.local/share/containers/storage,
+-- runroot $XDG_RUNTIME_DIR/containers, containers/storage
+-- types/options.go setDefaultRootlessStoreOptions) are exactly the
+-- ticket's target.
+--
+-- Requires: glibc + the helper family above + libseccomp (podman's
+-- DT_NEEDED set: libc, libseccomp.so.2 — resolved by name through the
+-- #10 loader-lib machinery). build_deps: go (vendored build),
+-- toolchain (CGO compiler for the sqlite amalgamation + the seccomp
+-- binding), pkg-config (the `#cgo pkg-config: libseccomp` probe),
+-- libseccomp (headers + shared lib in the merged prefix).
 
 return {
     default = snap {
@@ -97,11 +120,13 @@ return {
             with a daemonless, rootless-first architecture and a
             Docker-compatible CLI. Built from the vendored v6.1.2
             release tree with the pool Go toolchain; CGO is required
-            for the SQLite state database. NOTE: the container-runtime
-            helper family (crun, conmon, pasta, netavark,
-            aardvark-dns, catatonit, fuse-overlayfs,
-            containers-common) is not yet in the pool — see the port
-            header before relying on container execution.
+            for the SQLite state database. The rootless
+            helper family (crun, conmon, pasta,
+            fuse-overlayfs, libseccomp) ships in the pool;
+            bridge networking (netavark, aardvark-dns) and
+            --init (catatonit) remain outside requires —
+            see the port header before relying on those
+            paths.
         ]],
         license = "Apache-2.0",
         grade = "stable",
@@ -122,10 +147,16 @@ return {
         -- command is the Makefile's bin/podman recipe with the
         -- pool-resolved BUILDTAGS documented in the header.
         build = table.concat({
-            "mkdir -p $STAGE/usr/bin",
+            "mkdir -p $STAGE/usr/bin $STAGE/usr/share/containers",
             "export HOME=/tmp GOCACHE=/tmp/shuttle-go-gocache GOPATH=/tmp/shuttle-go-gopath",
             'export GOFLAGS="-trimpath -mod=vendor" GOPROXY=off GOWORK=off GOTOOLCHAIN=local',
-            'cd $SRC && CGO_ENABLED=1 go build -ldflags "-X go.podman.io/podman/v6/libpod/config._installPrefix=/usr -X go.podman.io/podman/v6/libpod/config._etcDir=/etc -X go.podman.io/podman/v6/pkg/systemd/quadlet._binDir=/usr/bin" -tags "grpcnotrace exclude_graphdriver_btrfs" -o $STAGE/usr/bin/podman ./cmd/podman',
+            'cd $SRC && CGO_ENABLED=1 go build -ldflags "-X go.podman.io/podman/v6/libpod/config._installPrefix=/usr -X go.podman.io/podman/v6/libpod/config._etcDir=/etc -X go.podman.io/podman/v6/pkg/systemd/quadlet._binDir=/usr/bin" -tags "grpcnotrace exclude_graphdriver_btrfs seccomp" -o $STAGE/usr/bin/podman ./cmd/podman',
+            -- The upstream minimal default signature policy (the
+            -- common distro default): image pulls are
+            -- ErrorIfNotFound in containers/image, and the pod shell's
+            -- /usr is the host's — the pod wires CONTAINERS_POLICY_JSON
+            -- at this file (see header).
+            'printf \'%s\\n\' \'{"default":[{"type":"insecureAcceptAnything"}]}\' > $STAGE/usr/share/containers/policy.json',
         }, " && "),
 
         type = "source",
@@ -134,13 +165,10 @@ return {
             "crun",
             "conmon",
             "pasta",
-            "netavark",
-            "aardvark-dns",
-            "catatonit",
             "fuse-overlayfs",
-            "containers-common",
+            "libseccomp",
         },
-        build_deps = { "go", "toolchain" },
+        build_deps = { "go", "toolchain", "pkg-config", "libseccomp" },
 
         apps = {
             podman = app {
