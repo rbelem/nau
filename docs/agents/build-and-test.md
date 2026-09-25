@@ -107,6 +107,27 @@ gets re-parsed and loses its quoting. Put nontrivial scripts in a file
 (`devbox run -- bash script.sh`) or a `devbox.json` script, and set
 one-off variables with `--env`/`--env-file`.
 
+## Pre-migration sweep: `return false` in pointer returns (#208)
+
+Before each migration rebuild — every recipe port and every upstream
+version bump through the pool — re-run the gcc-14 `int-conversion`
+sweep over embedded C sources, patches, and snippets:
+
+```bash
+grep -rniE 'return *(false|FALSE)' pkgs/
+```
+
+Baseline 2026-09-25: zero live hits (the two known occurrences are fix
+artifacts — the `less` sed-patch at `pkgs/l/less.lua:39` and tig's
+`-Wno-error=int-conversion` downgrade at `pkgs/t/tig.lua`). Recipes
+fetch upstream sources at build time, so this in-repo grep cannot see
+everything: treat any `-Werror=int-conversion` build failure in a pod
+build log as a sighting of this class. The fix is the tig/less
+pattern — sed-patch to `return NULL` when the function returns a
+pointer, or a scoped `-Wno-error=int-conversion` downgrade when the
+return type is a boolean-ish integer (`NCURSES_BOOL`, `TRUE`/`FALSE`
+unions) — never a blanket `-w`.
+
 ## Test layout
 
 - **Unit tests** live in `src/` next to the code they cover, in `#[cfg(test)]`
