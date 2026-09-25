@@ -12,7 +12,7 @@
 -- pkg-config is build-time-only tooling, so it goes in `build_deps`.
 --
 -- Requires: glibc, libevent, ncurses
--- build_deps: pkg-config
+-- build_deps: pkg-config, gcc, make, bison (tmux 3.7's configure wants yacc)
 
 return {
     default = snap {
@@ -43,7 +43,7 @@ return {
 
         type = "source",
         requires = { "glibc", "libevent", "ncurses" },
-        build_deps = { "pkg-config", "gcc", "make"},
+        build_deps = { "pkg-config", "gcc", "make", "bison"},
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22) until the
         -- nix gcc wrapper stops baking the merged build prefix into produced
