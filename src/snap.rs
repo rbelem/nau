@@ -5671,7 +5671,11 @@ pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
             "CPPFLAGS",
             format!("-I{}/usr/include -I{}/usr/usr/include", prefix, prefix),
         ),
-        ("LDFLAGS", format!("-L{}/usr/lib", prefix)),
+        // Aligned with LIBRARY_PATH below (#209 watch item): one -L per
+        // dir, same order — configure/meson/libtool probes that read
+        // LDFLAGS get the multiarch dirs the cc shim's -L translation
+        // already covers.
+        ("LDFLAGS", build_prefix_ld_flags(prefix)),
         // Build-time execution of prefix binaries needs the prefix's own
         // libs on the loader path: the portable-ELF machinery (#12) strips
         // RUNPATHs from pod-built payloads, so e.g. the lua interpreter in
@@ -5716,11 +5720,39 @@ pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
 /// `lib64` — the glibc payload's slibdir (runtime) half, see
 /// `build_prefix_env` (#180 follow-up: the linker's `libc.so` script
 /// resolves to a bare `libc.so.6` only a listed dir can satisfy).
+///
+/// Foreign-arch caveat (#209 watch item): the triplet dirs are listed
+/// unconditionally, in a FIXED order (x86_64, aarch64, armhf), and the
+/// order is load-bearing the day a payload populates a dir it does not
+/// belong to. Today it is inert — a payload stages only its own arch's
+/// set (gcc.lua selects one deb set per build on
+/// `$CONFIGURE_TARGET`/`uname -m`), so at most one triplet dir exists.
+/// But the loader and the linker both take the FIRST dir carrying a
+/// soname: if a future payload ever stages a foreign arch's libs (or
+/// several arches at once), this amd64-first list would silently prefer
+/// x86_64 libraries for an aarch64/armhf link. Re-order or arch-filter
+/// this list before shipping such a payload — don't rely on the accident.
 fn build_prefix_ld_library_path(prefix: &str) -> String {
     format!(
         "{}/usr/lib:{}/usr/lib64:{}/lib64:{}/usr/lib/x86_64-linux-gnu:{}/usr/lib/aarch64-linux-gnu:{}/usr/lib/arm-linux-gnueabihf",
         prefix, prefix, prefix, prefix, prefix, prefix
     )
+}
+
+/// The `-L` list `LDFLAGS` exposes for the merged prefix: one flag per
+/// dir of [`build_prefix_ld_library_path`], same order. Configure,
+/// meson, and libtool link probes read `LDFLAGS` directly — without the
+/// multiarch entries a link line that bypasses the gcc cc shim's
+/// LIBRARY_PATH→-L translation searched `{prefix}/usr/lib` only and
+/// missed the deb payloads' multiarch-staged libs (#209 watch item).
+/// The first flag is unchanged (`usr/lib` keeps priority), so existing
+/// consumers' search order only widens.
+fn build_prefix_ld_flags(prefix: &str) -> String {
+    build_prefix_ld_library_path(prefix)
+        .split(':')
+        .map(|dir| format!("-L{dir}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The include/pc dirs the merged prefix serves: the deb payloads keep
@@ -5779,11 +5811,21 @@ fn default_curl_ca_bundle(
 /// drivers.
 ///
 /// Nothing here sets `CGO_ENABLED` — that stays the recipe's declaration,
-/// and [`ensure_cgo_toolchain`] holds the fail-closed line under it. The
-/// staged compiler needs no extra library wiring inside the sandbox: the
-/// gcc payload's `cc1`/`cc1plus` carry `RUNPATH=/shuttle-build-prefix/
-/// usr/lib{,64}` (the gcc.lua leak-scan contract), which is exactly where
-/// the prefix binds.
+/// and [`ensure_cgo_toolchain`] holds the fail-closed line under it.
+///
+/// The staged compiler needs no RUNPATH wiring inside the sandbox — and
+/// the payload carries none. gcc.lua is a pure file-copy of the Debian
+/// trixie debs (no rebuild step, nothing bakes a RUNPATH), and the leak
+/// scan FAILS produced binaries carrying prefix RUNPATHs — it never
+/// mints them. cc1/cc1plus resolve their own DT_NEEDED (libisl, libmpc,
+/// libmpfr, libgmp, libzstd, staged under the payload's multiarch dir)
+/// through [`build_prefix_env`]'s LD_LIBRARY_PATH alone — the #210-lane
+/// LD_DEBUG capture attributes every cc1 probe to LD_LIBRARY_PATH
+/// entries with no RUNPATH candidate — and link searches ride the cc
+/// shim's LIBRARY_PATH→-L translation (the gcc.lua shim contract). The
+/// earlier "cc1 carries RUNPATH=/shuttle-build-prefix/usr/lib{,64}"
+/// claim here described the pre-#164 source-built gcc recipe and died
+/// with it (#209 watch item).
 pub fn build_prefix_toolchain_env(prefix: &Path) -> Vec<(&'static str, String)> {
     let bin = prefix.join("usr/bin");
     [
@@ -12290,7 +12332,17 @@ fi
             "the gcc cc-shim composes -L from this (gcc.lua contract) (#180); \
              /lib64 is the glibc source build's slibdir (08061c8)"
         );
-        assert_eq!(get("LDFLAGS"), "-L/shuttle-build-prefix/usr/lib");
+        assert_eq!(
+            get("LDFLAGS"),
+            "-L/shuttle-build-prefix/usr/lib -L/shuttle-build-prefix/usr/lib64 \
+             -L/shuttle-build-prefix/lib64 \
+             -L/shuttle-build-prefix/usr/lib/x86_64-linux-gnu \
+             -L/shuttle-build-prefix/usr/lib/aarch64-linux-gnu \
+             -L/shuttle-build-prefix/usr/lib/arm-linux-gnueabihf",
+            "one -L per LIBRARY_PATH dir, same order — configure/meson probes \
+             get the multiarch dirs the cc shim covers (#209); usr/lib keeps \
+             priority so existing search order only widens"
+        );
         assert_eq!(
             get("LD_LIBRARY_PATH"),
             "/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64:\
