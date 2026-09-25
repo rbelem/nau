@@ -55,6 +55,9 @@ return {
 
         type = "source",
         requires = { "glibc" },
+        -- the build unpacks wheels with `python3 -m zipfile` — ADR-0018:
+        -- declare it, the pod-first sync env leaks no host python
+        build_deps = { "python" },
 
         apps = {
             whichllm = app {
