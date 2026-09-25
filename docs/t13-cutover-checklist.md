@@ -351,12 +351,16 @@ Ported since this section was first written: `neovim`, `blesh` (§5.2),
 2026-09-21 via recipe-local lockfiles (`deps.<eco>.lock =
 "recipe/<file>"` resolving against the recipe directory, closing the
 no-lockfile-in-source-tree gaps): `agentmemory` and `pdf-inspector`.
+Ported 2026-09-24/25 from the still-missing list below: `codegraph`
+(1.6.0-perl), `valkey` (+ `valkey-search`), `bifrost`, `wigolo`.
 `zenity` is replaced by the pure-Rust `zenity-rs` (pkgs/z/zenity-rs.lua
 — the GUI dialog lane with no gtk at all); `llm-verifier` dropped by
 owner decision 2026-09-21. Still missing:
-`podman`, `jdk21`, `chromium`, `valkey` (+ `valkey-search` module),
-`opencode-v2`, `skills`, `playwright-cli`, `codeburn`, `codegraph`,
-`impeccable`, `bifrost`, `deepsec`, `deepseek-harness`, `wigolo`. Most
+`podman`, `jdk21`, `chromium`, `opencode-v2`, `skills`, `playwright-cli`,
+`codeburn`, `impeccable`, `deepsec`, `deepseek-harness`, `bsk`
+(prebuilt musl release-fetch tier), `skillranker` (nightly-rust source
+build). bsk and skillranker postdate the original section — added
+2026-09-25 when ticketed (#205, #206). Most
 are dep-fetch ecosystem tools (npm/pip) that ADR-0017 supports — they
 need packages authored, not new machinery.
 **Until ported, these stay devbox-only — cutover is gated on the owner
@@ -372,6 +376,9 @@ valkey(+search)/bifrost/wigolo AFTER the §5.4 units land (a port before
 a service story exists gives binaries you hand-start); the independent
 dep-fetch tools (opencode-v2, codegraph, codeburn, skills,
 playwright-cli, deepsec, deepseek-harness) as one ticket per tool.
+Ticketed 2026-09-25 as #199–#207 (one per port, execution owner-gated;
+valkey/bifrost/wigolo/codegraph landed before their tickets were
+actioned).
 
 ### 5.2 ble.sh — ported (was a gap)
 
