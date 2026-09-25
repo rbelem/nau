@@ -30,7 +30,20 @@ used by configure scripts to generate platform-specific Makefiles.]],
             -- (@datadir@/@PACKAGE@-@VERSION@) as a real-root path; wrap
             -- them (pool interpreter-wrapper pattern, #9) so the merged
             -- prefix's automake lib dir leads PERL5LIB in every context
-            -- (build prefix, real root, extension tree).
+            -- (build prefix, real root, extension tree). The m4-side:
+            -- aclocal bakes both acdirs real-root — the automake-m4
+            -- acdir (@datadir@/aclocal-@APIVERSION@, fatal scan) and
+            -- the third-party acdir (@datadir@/aclocal, also fatal —
+            -- surfaced live on evtest after the first export landed) —
+            -- and the automake driver bakes its .am libdir
+            -- (Automake::Config $libdir) the same way. The aclocal
+            -- driver resets its lists under AUTOMAKE_UNINSTALLED (its
+            -- own "don't refer to installation directories from the
+            -- build environment" mode) and re-honors
+            -- ACLOCAL_AUTOMAKE_DIR afterwards; third-party dirs stay
+            -- reachable via ACLOCAL_PATH, which parses after the
+            -- reset. The libdir has the AUTOMAKE_LIBDIR override, so
+            -- the wrapper exports the triple (#211).
             table.concat({
                 "for f in aclocal automake aclocal-1.17 automake-1.17; do",
                 '  [ -e "$STAGE/usr/bin/$f" ] || continue',
@@ -40,6 +53,12 @@ used by configure scripts to generate platform-specific Makefiles.]],
                 'd=\\$(dirname "\\$(readlink -f "\\$0")")',
                 'PERL5LIB="\\$d/../share/automake-1.17\\${PERL5LIB:+:\\$PERL5LIB}"',
                 'export PERL5LIB',
+                'ACLOCAL_AUTOMAKE_DIR="\\$d/../share/aclocal-1.17"',
+                'export ACLOCAL_AUTOMAKE_DIR',
+                'AUTOMAKE_LIBDIR="\\$d/../share/automake-1.17"',
+                'export AUTOMAKE_LIBDIR',
+                "AUTOMAKE_UNINSTALLED=1",
+                "export AUTOMAKE_UNINSTALLED",
                 'exec "\\$d/$f.real" "\\$@"',
                 "EOF",
                 '  chmod +x "$STAGE/usr/bin/$f" || exit 1',

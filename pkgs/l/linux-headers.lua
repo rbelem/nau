@@ -21,6 +21,11 @@ other programs that need to interact with the kernel at a low level.]],
         architectures = { "amd64" },
         type = "source",
         requires = {},
+        -- HOSTCC (scripts/basic/fixdep) compiles host tools during
+        -- headers_install; ADR-0018 sandbox has no implicit host gcc
+        -- (surfaced by the #211 refresh cascade under the pod-first
+        -- sync env).
+        build_deps = { "gcc" },
         source = { url = "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.0.tar.xz" },
         parts = {
             headers = {

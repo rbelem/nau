@@ -14,8 +14,12 @@ Autoconf and other GNU build tools depend on M4 for macro expansion.]],
         confinement = "strict",
         architectures = { "amd64" },
         type = "source",
-        requires = {},
+        requires = { "glibc" },
         source = { url = "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz" },
+        -- ADR-0018: no implicit host toolchain — the sandbox is env_clear,
+        -- and this rebuild (recipe drift swept by `pod refresh automake`,
+        -- issue #211) proved configure finds no compiler without the decl.
+        build_deps = { "gcc", "make" },
         -- Hand-written build (not the autotools plugin) so the payload can
         -- strip the generated share/info/dir index: it differs per package
         -- (m4 vs gmp), and a merged build prefix requires identical content

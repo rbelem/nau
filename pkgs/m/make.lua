@@ -14,8 +14,12 @@ recompile them.]],
         confinement = "strict",
         architectures = { "amd64" },
         type = "source",
-        requires = {},
+        requires = { "glibc" },
         source = { url = "https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz" },
+        -- ADR-0018: no implicit host toolchain — the sandbox is env_clear,
+        -- and this rebuild (recipe drift swept by `pod refresh automake`,
+        -- issue #211) proved configure finds no compiler without the decl.
+        build_deps = { "gcc", "make" },
         build = "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
     },
 }
