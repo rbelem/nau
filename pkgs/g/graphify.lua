@@ -100,7 +100,7 @@ return {
         }, " && "),
 
         type = "source",
-        requires = { "glibc", "libstdcpp", "libgcc" },
+        requires = { "glibc", "libstdcpp", "libgcc", "zlib" },
         build_deps = { "tree-sitter-perl", "python" },
 
         -- The copied tree_sitter_perl/_binding .so was linked by the
