@@ -15,6 +15,10 @@ archives, and binaries. This build targets x86_64-linux-gnu.]],
         architectures = { "amd64" },
         type = "source",
         requires = {},
+        -- ADR-0018: no implicit host toolchain — configure died "no
+        -- acceptable C compiler found in $PATH" under the pod-first
+        -- sync env.
+        build_deps = { "gcc", "make" },
         source = { url = "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz" },
         build = table.concat({
             "./configure --prefix=/usr --target=x86_64-linux-gnu --disable-gprofng --disable-werror",
