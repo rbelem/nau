@@ -81,5 +81,5 @@ host-side resolver concern.
 
 ADR-0004 (bubblewrap sandbox, offline), ADR-0017 (dependency fetch, offline
 install, networked-build rejection), ADR-0038 (pod isolation, deny-by-default),
-#176. The tree carries two ADR-0038 files (`0038-pod-isolation.md`,
-`0038-squashfs-pack-performance.md`) — numbering collision noted for cleanup.
+#176. ADR-0038 is pod isolation; the squashfs ADR renumbered to ADR-0041
+(2026-09-26) after the tree briefly carried two 0038 files.
