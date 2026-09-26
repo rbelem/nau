@@ -231,20 +231,18 @@ provides `vi`; devbox's nvim path died with the global profile), and the
 `XDG_DATA_DIRS` completions prepend is dropped (pods don't surface a
 `share/` tree, §5.6).
 
-### 4.5 Uninstall devbox-global (only after §4.2 is proven AND the #101 systemPackages gate is green)
+### 4.5 Uninstall devbox-global (only after §4.2 is proven AND the #101 provisioned-floor gate is green)
 
-**ORDERING GATE (issue #96 → #101): nothing below runs until the host
-toolchain is on the system PATH.** After devbox-global dies,
-`mksquashfs`/`unsquashfs`/`bwrap`/`make`/`cc` must already come from the
-system — the pool cannot provide them (store payloads are themselves
-squashfs images; provisioning would be chicken-and-egg, #101 disposition
-(b), rejected). Owner prerequisite, one line in
-`/etc/nixos/configuration.nix` plus a rebuild:
+**ORDERING GATE (issue #96 → #101): nothing below runs until the floor
+tools are provisioned.** Disposition (c) superseded the systemPackages
+plan (see §5.9): shuttle provisions `mksquashfs`/`unsquashfs`/`bwrap`/
+`tar`/`curl` itself, checksum-pinned, resolved ahead of PATH. The pool
+still cannot provide them (store payloads are themselves squashfs images;
+chicken-and-egg, disposition (b), rejected) — but the provider is shuttle
+itself, not the host. One command, no sudo:
 
 ```bash
-# environment.systemPackages = with pkgs; [ squashfs-tools bubblewrap gnumake gcc ];
-sudo nixos-rebuild switch   # lands the pod-surface tools on the login PATH (#101)
-shuttle doctor --pod        # must exit 0 BEFORE the destructive steps below (§5.9)
+shuttle doctor --pod --fix   # provisions the floor, re-checks, must exit 0 (§5.9)
 ```
 
 Then, and only then:
@@ -319,12 +317,13 @@ env; a fresh login matches this shape):
 - [x] shellenv hardening: NixOS `/etc/profile` rebuilds PATH without
       `~/.local/bin`, so the rc falls back to
       `$HOME/.local/bin/shuttle` for the shellenv eval.
-- [ ] Pod-surface host tools on the post-cutover login PATH (#101):
+- [ ] Provisioned floor tools green in a fresh login shell (#101):
       from the same fresh login shell the sweep uses, `shuttle doctor
-      --pod` exits 0 (mksquashfs/unsquashfs/bwrap/curl/tar + sh/make/
-      cc/c++ all resolve from `/run/current-system/sw/bin`, zero
-      `/devbox/` hits) and the pod mutation no-op proof passes — full
-      command block in §5.9.
+      --pod --fix` provisions (first run) and exits 0 — mksquashfs/
+      unsquashfs/bwrap/tar resolve provisioned-first (curl PATH-first),
+      the functional probes pass, devbox is irrelevant to the result)
+      and the pod mutation no-op proof passes — full command block in
+      §5.9.
 
 ### 4.7 Rollback (any point before §4.5)
 
@@ -535,64 +534,48 @@ elsewhere:
 Both are the `#12` wrapper-aware family: fix the wrapper authoring and
 the extension-tree layout (`usr/usr` doubling) together.
 
-### 5.9 Host toolchain environment prerequisites (NEW, operational)
+### 5.9 Host toolchain environment prerequisites (SUPERSEDED 2026-09-25 — #101 disposition (c))
 
-**The #101 gate — run before every destructive cutover step (§4.5):**
-the pod-surface host tools must be installed SYSTEM-WIDE first.
-Disposition (a) of #101 — NixOS `systemPackages`, owner sudo, one line
-(disposition (b), pool-provided tools, is REJECTED: store payloads are
-themselves squashfs images, so provisioning would be chicken-and-egg):
+**The #101 gate is no longer a host change.** The original plan here —
+NixOS `systemPackages` one-liner (`squashfs-tools bubblewrap gnumake gcc`)
+plus `sudo nixos-rebuild switch` — is REJECTED: it re-imposes a
+per-distro, sudo-gated dependency and contradicts shuttle's
+host-independence thesis (the vendor-SDK postmortem: hosts pinned to one
+distro break onboarding everywhere else). Disposition (c) ships the floor
+with shuttle instead (rustup pattern): checksum-pinned musl-static
+artifacts provisioned by `shuttle doctor --fix` into
+`~/.local/share/shuttle/tools/`, resolved ahead of PATH — except `curl`,
+which resolves PATH-first (host network fidelity: NSS, CA bundles).
+`make`/`cc` are NOT provisioned: recipes needing a compiler declare
+`build_deps` (ADR-0018) and resolve them from the pool. Verification is
+functional, not `command -v`: doctor round-trips a squashfs with an xattr
+and execs a real bwrap sandbox.
 
-```bash
-# /etc/nixos/configuration.nix:
-#   environment.systemPackages = with pkgs; [ squashfs-tools bubblewrap gnumake gcc ];
-sudo nixos-rebuild switch
-```
-
-This closes the compiler trap below by SYSTEM install, not by devbox:
-`cc`/`c++`/`make` resolve from `/run/current-system/sw/bin` on the plain
-login PATH, and `shuttle doctor --pod` gates exactly this surface
-(mksquashfs, unsquashfs, bwrap, curl, tar + sh, make, cc, c++ — verified
-red on this host pre-install, with fix hints naming the same distro
-packages). Declaring the toolchain in `build_deps` stays the
-explicit-beats-implicit rule (ADR-0018) for packages needing a specific
-one; the implicit fallback just no longer depends on devbox-global.
-
-**Post-install verification (the #101 acceptance)** — from a fresh
-`bash -l` with no devbox env on PATH (true immediately after §4.2/§4.5;
-before the cutover, drive the same commands through §4.6's `env -i …
-bash -l` shape):
+Post-install verification (the #101 acceptance) — from a fresh `bash -l`
+with no devbox env on PATH, no sudo, no distro packages:
 
 ```bash
 bash -l
 env | grep -i devbox                                    # must be empty
-command -v mksquashfs unsquashfs bwrap make gcc cc c++  # all /run/current-system/sw/bin
-shuttle doctor --pod                                    # must exit 0
-
-# Pod mutation no-op proof, same shell: the `add` records + pins and the
-# `remove` drops both — the store and generation are untouched because no
-# sync runs (declaration round-trip):
+shuttle doctor --pod --fix                              # provisions the floor, re-checks, exits 0
 shuttle pod --name daily add jq && shuttle pod --name daily remove jq
-# equivalent no-op alternative: shuttle pod --name daily update
-# (`update` is a no-op while every lockfile pin is at its newest
-# matching version — new generation only on real changes)
 ```
 
-The pilot exposed environment traps the cutover session must respect:
+The pilot's environment traps, restated for the (c) world:
 
-- The project devbox env puts **busybox `tar`/`xz`** first on PATH;
-  busybox tar cannot drive `.tar.xz` sources ("corrupted data / short
-  read") — every `.tar.xz` pool package fails. GNU tar+xz must precede
-  it (or fix the project devbox.json ordering).
-- Recipes without `build_deps` rely on a compiler reaching the sandbox
-  through the mirrored host PATH (pre-cutover: devbox-global's gcc, via
-  the `/nix` bind root). Post-retirement that source is gone — CLOSED by
-  the #101 gate above (system gcc on the login PATH), not by devbox;
-  recipes needing a specific toolchain still declare it in `build_deps`
-  explicitly (ADR-0018's explicit-beats-implicit rule) or builds move
-  to the pool toolchain meta.
-- Transient download flakes (ftp.gnu.org, github) abort a sync; re-run
-  is incremental and resumes.
+- The project devbox env's busybox `tar`/`xz` PATH poisoning is bypassed
+  for the pod surface: once provisioned, pod operations resolve the
+  pinned GNU tar, not the ambient PATH. (The trap still applies to any
+  non-pod tooling in that shell.)
+- Recipes without `build_deps` relying on a host compiler via the
+  mirrored PATH: CLOSED BY DESIGN — the implicit host fallback is gone.
+  An undeclared toolchain need fails at the recipe step with a named
+  `pod add` fix (explicit-beats-implicit, ADR-0018), not a mysterious
+  `cc: not found` mid-sync.
+- Transient download flakes: re-run is incremental, and
+  `shuttle doctor --fix --from <dir>` provisions offline through the
+  identical checksum-verify path.
+
 
 ### 5.10 Global-config sync (`devbox global push/pull` parity) — NEW
 
