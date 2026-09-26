@@ -350,6 +350,79 @@ fn confined_app_executes_with_grants_via_shuttle_run() {
     assert!(marker2.exists(), "farm wrapper must exec the confined app");
 }
 
+/// Issue #157: socket + device grants must compile to flags real bwrap
+/// accepts (`--bind` of the resolved socket path, `--dev-bind` of the
+/// device path). The regression this guards: the old `--socket`/`--device`
+/// argv failed the bwrap exec outright, so a confined app with such grants
+/// never ran at all. The app proves the grants INSIDE the sandbox (socket
+/// is a socket, device node is visible) before writing its marker; a
+/// grant-check failure exits 3/4 instead.
+#[test]
+fn confined_app_executes_with_socket_and_device_grants_via_shuttle_run() {
+    if !bwrap_gate() {
+        return;
+    }
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let server_dir = tempfile::tempdir().unwrap();
+    let grant_dir = tempfile::tempdir().unwrap();
+    let sock_dir = tempfile::tempdir().unwrap();
+    let dev_dir = tempfile::tempdir().unwrap();
+    let port = serve_dir(server_dir.path());
+    make_tarball(server_dir.path(), "confsrc");
+
+    // A real unix socket (the socket grant) and a device-like node path
+    // (the device grant), both resolvable host paths.
+    let sock = sock_dir.path().join("app.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let dev = dev_dir.path().join("card0");
+    std::fs::write(&dev, "").unwrap();
+
+    let grant_shell = grant_dir.path().display();
+    let lua = format!(
+        r#"return {{ default = snap {{
+    name = "confsock",
+    version = "1.0",
+    source = "http://127.0.0.1:{port}/confsrc.tar.gz",
+    build = "mkdir -p $STAGE/bin && echo '#!/bin/sh' > $STAGE/bin/confsock && echo 'test -S {0} || exit 3' >> $STAGE/bin/confsock && echo 'test -e {1} || exit 4' >> $STAGE/bin/confsock && echo 'echo confined-marker > {2}/marker' >> $STAGE/bin/confsock && chmod +x $STAGE/bin/confsock",
+    confined = {{ backend = "bwrap", filesystem = {{ "rw:{2}" }}, network = false, sockets = {{ "{0}" }}, devices = {{ "{1}" }} }},
+    apps = {{ confsock = {{ command = "bin/confsock" }} }},
+}} }}
+"#,
+        sock.display(),
+        dev.display(),
+        grant_shell,
+    );
+    let dir = project.path().join("pkgs").join("c");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("confsock.lua"), lua).unwrap();
+
+    let (code, _out, err) = run(project.path(), root.path(), &["add", "confsock"], &[]);
+    assert_eq!(code, Some(0), "confined pod add failed: {err}");
+
+    // The bwrap sandbox accepts the socket/device grant argv and the app
+    // proves both grants resolved inside the boundary.
+    let marker = grant_dir.path().join("marker");
+    assert!(!marker.exists(), "no marker before run");
+    let (rcode, _stdout, rerr) =
+        run_shuttle_run(project.path(), root.path(), "default", "confsock", &[]);
+    assert_ne!(
+        rcode,
+        Some(3),
+        "socket grant did not resolve inside sandbox: {rerr}"
+    );
+    assert_ne!(
+        rcode,
+        Some(4),
+        "device grant did not resolve inside sandbox: {rerr}"
+    );
+    assert_eq!(rcode, Some(0), "shuttle run failed: {rerr}");
+    assert!(
+        marker.exists(),
+        "confined app must write its marker with socket+device grants"
+    );
+}
+
 #[test]
 fn confined_app_fails_closed_when_backend_unavailable() {
     if !bwrap_gate() {

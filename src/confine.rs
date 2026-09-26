@@ -413,17 +413,45 @@ fn bind_filesystem_grants(cmd: &mut std::process::Command, filesystem: &[String]
     }
 }
 
-/// Bind named socket grants (bwrap `--socket <name>`).
+/// Bind socket grants. bwrap has no `--socket` flag; a named grant must
+/// resolve to concrete socket paths bound read-write at their host
+/// location (`--bind SRC DEST` — ADR-0038 contract 2). Absent sockets
+/// are skipped, matching the filesystem-grant convention.
 fn bind_sockets(cmd: &mut std::process::Command, sockets: &[String]) {
     for socket in sockets {
-        cmd.arg("--socket").arg(socket);
+        for path in socket_grant_paths(socket) {
+            if path.exists() {
+                cmd.arg("--bind").arg(&path).arg(&path);
+            }
+        }
     }
 }
 
-/// Bind device grants (bwrap `--device <path>`).
+/// Resolve a socket grant to the concrete host paths it grants. An
+/// absolute path is taken verbatim; a bare name (e.g. "x11") resolves
+/// to the per-user runtime dir (`/run/user/<euid>/<name>`) and the X11
+/// socket dir (`/tmp/.X11-unix/<name>`) — the same shapes the AppArmor
+/// renderer grants, with the uid glob resolved to the effective uid.
+fn socket_grant_paths(grant: &str) -> Vec<PathBuf> {
+    if grant.starts_with('/') {
+        return vec![PathBuf::from(grant)];
+    }
+    let euid = unsafe { libc::geteuid() };
+    vec![
+        PathBuf::from(format!("/run/user/{euid}")).join(grant),
+        PathBuf::from("/tmp/.X11-unix").join(grant),
+    ]
+}
+
+/// Bind device grants. bwrap has no `--device` flag; device access is a
+/// filesystem-bind variant (`--dev-bind SRC DEST`, bound read-write at
+/// its host path — ADR-0038 contract 2). Absent devices are skipped,
+/// matching the filesystem-grant convention.
 fn bind_devices(cmd: &mut std::process::Command, devices: &[String]) {
     for device in devices {
-        cmd.arg("--device").arg(device);
+        if Path::new(device).exists() {
+            cmd.arg("--dev-bind").arg(device).arg(device);
+        }
     }
 }
 
@@ -477,8 +505,7 @@ pub fn profile_name(pod_name: &str, app: &str) -> String {
 ///
 /// This is the vocabulary-honoring implementation — the profile is the
 /// AppArmor backend's expression of the same `grants` declaration bwrap
-/// expresses with `--bind`/`--ro-bind`/`--unshare-net`/`--socket`/
-/// `--device`.
+/// expresses with `--bind`/`--ro-bind`/`--dev-bind`/`--unshare-net`.
 pub fn render_apparmor_profile(pod_name: &str, app: &str, confined: &Confinement) -> String {
     let mut out = String::new();
     out.push_str("#include <tunables/global>\n");
@@ -515,10 +542,16 @@ pub fn render_apparmor_profile(pod_name: &str, app: &str, confined: &Confinement
     if confined.network {
         out.push_str("  network,\n");
     }
-    // Socket grants (paths).
+    // Socket grants (paths). Absolute paths are emitted verbatim — the
+    // same grant the bwrap backend binds at its own path; bare names
+    // keep the per-user/X11 glob shapes.
     for socket in &confined.sockets {
-        out.push_str(&format!("  /run/user/*/{socket} rw,\n"));
-        out.push_str(&format!("  /tmp/.X11-unix/{socket} rw,\n"));
+        if socket.starts_with('/') {
+            out.push_str(&format!("  {socket} rw,\n"));
+        } else {
+            out.push_str(&format!("  /run/user/*/{socket} rw,\n"));
+            out.push_str(&format!("  /tmp/.X11-unix/{socket} rw,\n"));
+        }
     }
     // Device grants.
     for device in &confined.devices {
@@ -608,7 +641,22 @@ mod tests {
 
     #[test]
     fn bwrap_args_honor_the_shared_grants_vocabulary() {
-        let c = sample_confinement();
+        // Concrete grant paths (a real socket file + a device-like node
+        // path) so the emitted argv is deterministic: grants resolve to
+        // binds only when the path exists on the host.
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("wayland-0");
+        std::fs::write(&sock, "").unwrap();
+        let dev = tmp.path().join("dri-card");
+        std::fs::write(&dev, "").unwrap();
+        let c = Confinement {
+            backend: BackendKind::Bwrap,
+            filesystem: vec!["ro:/usr".into(), "rw:/lib".into(), "read".into()],
+            network: false,
+            sockets: vec![sock.to_string_lossy().into_owned()],
+            devices: vec![dev.to_string_lossy().into_owned()],
+            backend_options: BTreeMap::new(),
+        };
         let mut cmd = std::process::Command::new("bwrap");
         if !c.network {
             cmd.arg("--unshare-net");
@@ -627,11 +675,118 @@ mod tests {
         assert!(joined.contains("--bind /lib /lib"), "got: {joined}");
         // "read" keyword ro-binds the standard roots.
         assert!(joined.contains("--ro-bind /usr /usr"));
-        // Socket grants map to --socket.
-        assert!(joined.contains("--socket wayland"));
-        assert!(joined.contains("--socket x11"));
-        // Device grants map to --device.
-        assert!(joined.contains("--device /dev/dri"));
+        // Socket grants resolve to concrete rw binds at their host path.
+        assert!(
+            joined.contains(&format!("--bind {0} {0}", sock.display())),
+            "got: {joined}"
+        );
+        // Device grants map to --dev-bind at their host path.
+        assert!(
+            joined.contains(&format!("--dev-bind {0} {0}", dev.display())),
+            "got: {joined}"
+        );
+    }
+
+    #[test]
+    fn socket_grant_names_resolve_per_user_and_x11_dirs() {
+        // A bare name resolves to the shapes the AppArmor renderer
+        // grants, with the uid glob resolved to the effective uid.
+        let euid = unsafe { libc::geteuid() };
+        let paths = socket_grant_paths("wayland");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], PathBuf::from(format!("/run/user/{euid}/wayland")));
+        assert_eq!(paths[1], PathBuf::from("/tmp/.X11-unix/wayland"));
+        // An absolute path grant is taken verbatim.
+        assert_eq!(
+            socket_grant_paths("/run/user/7/dbus"),
+            vec![PathBuf::from("/run/user/7/dbus")]
+        );
+    }
+
+    /// The real bwrap option vocabulary (from bwrap.1 / `bwrap --help`):
+    /// every flag the backend emits for grants must be in this set —
+    /// a flag bwrap does not accept fails the exec outright (issue #157).
+    /// backend_options flags are excluded: that escape hatch is
+    /// documented as non-portable.
+    const BWRAP_ACCEPTED_FLAGS: &[&str] = &[
+        "--bind",
+        "--ro-bind",
+        "--dev-bind",
+        "--proc",
+        "--dev",
+        "--tmpfs",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-net",
+        "--die-with-parent",
+    ];
+
+    #[test]
+    fn emitted_grant_flags_are_real_bwrap_flags() {
+        // Socket + device grants over BOTH grant shapes (bare names and
+        // existing absolute paths). Runs without bwrap installed: the
+        // accepted set is hardcoded; when bwrap is present the set is
+        // additionally cross-checked against its --help output.
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("app.sock");
+        std::fs::write(&sock, "").unwrap();
+        // A device stand-in under the tmpdir: /dev/dri etc. are not
+        // guaranteed to exist on every build host, and absent devices
+        // are skipped — so grant a path that always exists.
+        let dev = tmp.path().join("dri-card");
+        std::fs::write(&dev, "").unwrap();
+        let mut cmd = std::process::Command::new("bwrap");
+        bind_sockets(
+            &mut cmd,
+            &["wayland".into(), sock.to_string_lossy().into_owned()],
+        );
+        bind_devices(&mut cmd, &[dev.to_string_lossy().into_owned()]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let flags: Vec<&str> = args
+            .iter()
+            .filter(|a| a.starts_with("--"))
+            .map(|a| a.as_str())
+            .collect();
+        assert!(!flags.is_empty(), "grants must emit flags");
+        for flag in &flags {
+            assert!(
+                BWRAP_ACCEPTED_FLAGS.contains(flag),
+                "flag '{flag}' is not in real bwrap's option vocabulary"
+            );
+        }
+        // And the mapping is the one ADR-0038 contract 2 names: sockets
+        // are explicit binds, devices are --dev-bind.
+        assert!(args.iter().any(|a| a == "--dev-bind"), "got: {args:?}");
+        assert!(args.iter().any(|a| a == "--bind"), "got: {args:?}");
+        assert!(!args.iter().any(|a| a == "--socket"), "got: {args:?}");
+        assert!(!args.iter().any(|a| a == "--device"), "got: {args:?}");
+
+        // When bwrap IS installed, cross-check the hardcoded set against
+        // the binary's own option list (best-effort: absent bwrap skips
+        // only this cross-check, never the assertions above).
+        if let Some(bwrap) = resolve_tool("bwrap") {
+            if let Ok(help) = std::process::Command::new(bwrap).arg("--help").output() {
+                let text = String::from_utf8_lossy(&help.stdout).into_owned()
+                    + &String::from_utf8_lossy(&help.stderr);
+                // Whole-token match: splitting on whitespace/punctuation
+                // boundaries so a dropped flag cannot false-pass inside a
+                // longer one (e.g. `--bind` inside `--bind-file`).
+                let tokens: Vec<&str> = text
+                    .split(|c: char| c.is_whitespace() || !c.is_alphanumeric() && c != '-')
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                for flag in BWRAP_ACCEPTED_FLAGS {
+                    assert!(
+                        tokens.contains(&flag),
+                        "hardcoded flag {flag} missing from real bwrap --help"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -650,6 +805,24 @@ mod tests {
         assert!(profile.contains("/run/user/*/wayland rw,"));
         // Device rules.
         assert!(profile.contains("/dev/dri rw,"));
+    }
+
+    #[test]
+    fn apparmor_socket_grants_honor_absolute_paths_verbatim() {
+        // An absolute socket grant renders its own path as the rule —
+        // the same grant the bwrap backend binds verbatim.
+        let mut c = sample_confinement();
+        c.sockets = vec!["/run/user/7/dbus".into()];
+        let profile = render_apparmor_profile("work", "myapp", &c);
+        assert!(profile.contains("/run/user/7/dbus rw,"), "got: {profile}");
+        // No mangled double-path shapes for absolute grants.
+        assert!(!profile.contains("//"), "got: {profile}");
+        // A bare name still renders both glob shapes.
+        let mut c = sample_confinement();
+        c.sockets = vec!["x11".into()];
+        let profile = render_apparmor_profile("work", "myapp", &c);
+        assert!(profile.contains("/run/user/*/x11 rw,"), "got: {profile}");
+        assert!(profile.contains("/tmp/.X11-unix/x11 rw,"), "got: {profile}");
     }
 
     #[test]
