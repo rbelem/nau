@@ -101,11 +101,21 @@ _Avoid_: interfaces, permissions, capabilities
 **Pod isolation**: The execution boundary every process of a pod runs inside — `run` forms, services, shells, and unconfined apps alike. Three levels: `host` (processes run directly on the host; the default), `sandbox` (one bubblewrap boundary around the whole pod, fail-closed, with pod-scoped grants), and `machine` (a microVM boundary with its own guest kernel, driven through smolvm, fail-closed without KVM). Distinct from per-app confinement and from the build sandbox. (ADR-0038)
 _Avoid_: pod sandbox, full sandbox, VM pod, sandboxed environment
 
+**Worker**: A machine shuttle drives over SSH to execute build jobs offloaded from a local build (ADR-0040). Operator-controlled, stateless beyond its own cache, reachable only coordinator-initiated. Absent a `workers = { … }` declaration, no Worker exists and nothing remote happens.
+_Avoid_: node, peer, farm, builder, agent, remote
+
+**Job manifest**: The content-addressed description of one package build dispatched to a Worker — recipe slice, lockfile pin slice, full closure list, toolchain identity, target arch, epoch, protocol version (ADR-0040). Its canonical-bytes SHA-256 is the job identity and the remote result's cache identity.
+_Avoid_: task, work item
+
+**Coordinator**: The `shuttle build` process scheduling a build across executors — local threads plus any declared Workers (ADR-0040). Not a role, verb, or daemon; it exists only while the build runs.
+_Avoid_: master, server, orchestrator
+
 ## Flagged ambiguities
 
 - **"Build"** can mean: (a) the `shuttle build` CLI command, (b) a source package's compile step (`snap { build = "..." }`), or (c) the build sandbox environment. Use "build command", "build script", and "build sandbox" respectively.
 - **"Sandbox"** can mean: (a) the build-time *build sandbox* (bubblewrap, ADR-0004), or (b) runtime *confinement* (level applied to the installed app). They are different axes; use "build sandbox" and "confinement" to disambiguate. The pod-level boundary is named *pod isolation*; prefer naming the level (`host`/`sandbox`/`machine`) over the bare word "sandboxed".
 - **"Package"** can refer to a Lua declaration in `pkgs/` or to the Snap Store concept of a snap. Use "package index entry" or "store snap" to disambiguate.
+- **"Worker"** can mean: (a) a build-farm machine shuttle drives over SSH (ADR-0040), (b) the eval/check child-process types in `isolate.rs`/`cli.rs`, or (c) a scheduler pool thread. The machine sense is the glossary term; qualify the others ("eval worker process", "local build slot") when prose must touch them.
 
 ## Example dialogue
 
