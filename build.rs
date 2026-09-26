@@ -22,12 +22,16 @@ use std::path::{Path, PathBuf};
 const LUAU_TAG: &str = "0.663";
 // Luau.Analysis needs Ast, EqSat and Config compiled, plus Compiler and VM
 // headers (TypeFunction.cpp uses BytecodeBuilder + compileOrThrow + lua_*
-// symbols). The Compiler+VM OBJECTS are deliberately not compiled here: the
-// `mlua` runtime dependency already links the identical luau0-src
-// 0.12.3+luau663 VM+Compiler (same sources, same LUAI_MAXCSTACK /
-// LUA_VECTOR_SIZE defines), and compiling them again duplicates every VM
-// symbol at link time. The analyzer's undefined refs resolve against mlua's.
-const LIBS: &[&str] = &["Ast", "Config", "EqSat", "Analysis"];
+// symbols). The Ast, Compiler and VM OBJECTS are deliberately not compiled
+// here: the `mlua` runtime dependency already links the identical luau0-src
+// 0.12.3+luau663 Ast+VM+Compiler (same sources, same LUAI_MAXCSTACK /
+// LUA_VECTOR_SIZE defines), and compiling any of them again duplicates
+// every symbol at link time (issue #230-land: the duplicate Parser.o
+// between libshuttle and libmlua_sys made 12 test targets fail to link
+// once a full rebuild reordered object pull). The analyzer's undefined
+// refs resolve against mlua's luauast/luau libs at final link, exactly as
+// the VM ones always have.
+const LIBS: &[&str] = &["Config", "EqSat", "Analysis"];
 // Only these tree prefixes are unpacked from the tarball (skip CLI/tests/bench).
 const WANTED_DIRS: &[&str] = &[
     "Analysis", "Ast", "Common", "Compiler", "Config", "EqSat", "VM",
