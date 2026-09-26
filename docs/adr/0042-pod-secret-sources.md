@@ -291,6 +291,13 @@ consumers through the existing env contract.
   `src/services.rs` (unit-hash restart key `unit_hash`/`:672-683`,
   action table `:1034`) and `src/pod.rs` (`render_shellenv` farm PATH
   prepend `:5718`), plus the ADR-0038 contract-3 re-injection analysis.
+- Vault implementation verdict (2026-09-26, issue #186): raw REST on
+  the existing ureq host fetch stack (the `src/tools.rs` fetch-agent
+  shape — rustls TLS with compiled-in webpki roots, http kept for the
+  loopback test host) beat the `vaultrs` crate, which would drag tokio
+  into a tree that bans it, because KV v2 needs exactly one GET plus
+  one header and the loopback KV v2 harness pins OpenBao
+  compatibility on the identical wire shape.
 
 ## References
 

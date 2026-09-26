@@ -21,7 +21,8 @@
 //! - **D4 (compiled-in provider registry, ADR-0014 shape).** A
 //!   match-based dispatch inside [`resolve_one`] plus a small
 //!   source-name table — no trait hierarchy for five sources; it grows
-//!   by arms (vault is the last arm standing with its ticket). `env`
+//!   by arms (all five D4 sources are live — vault landed with issue
+//!   #186). `env`
 //!   reads the caller's environment; `exec` and `bitwarden` run an
 //!   argv array with NO shell. argv[0] resolves against the HOST PATH
 //!   with every entry under the pod state root removed first (shells
@@ -39,7 +40,9 @@
 //! - **D5 (provider credentials from the caller env).** Nothing nested,
 //!   nothing stored: `exec` children and `bws` inherit the caller's
 //!   environment (`BWS_ACCESS_TOKEN` is presence-checked only — never
-//!   read, forwarded, or logged).
+//!   read, forwarded, or logged). `vault` reads `VAULT_ADDR` +
+//!   `VAULT_TOKEN` for its KV v2 request — the token rides the
+//!   `X-Vault-Token` header and never enters a log or an error (D8).
 //! - **D7 (fail loud, never partial).** Any resolution failure fails
 //!   the WHOLE resolve naming the var key and the source kind. Never a
 //!   partial map, never an empty value, no `optional` flag.
@@ -88,22 +91,6 @@ fn source_name(source: &SecretSource) -> &'static str {
         SecretSource::Libsecret { .. } => "libsecret",
         SecretSource::Exec { .. } => "exec",
         SecretSource::Env { .. } => "env",
-    }
-}
-
-/// Whether the source can resolve in this build. Only Vault still ships
-/// with its own ticket (#186) — every attempt fails loud naming it
-/// ([`source_issue`]); `pod secrets check` reports it as unavailable,
-/// `list` still lists the reference.
-fn source_available(source: &SecretSource) -> bool {
-    !matches!(source, SecretSource::Vault { .. })
-}
-
-/// Where an unavailable source ships.
-fn source_issue(source: &SecretSource) -> &'static str {
-    match source {
-        SecretSource::Vault { .. } => "issue #186",
-        _ => "a future ticket",
     }
 }
 
@@ -162,13 +149,7 @@ fn resolve_one(pod_dir: &Path, key: &str, source: &SecretSource) -> miette::Resu
         SecretSource::Exec { command } => resolve_exec(pod_dir, key, command),
         SecretSource::Bitwarden { id } => resolve_bitwarden(pod_dir, key, id),
         SecretSource::Libsecret { attributes } => resolve_libsecret(key, attributes),
-        other => miette::bail!(
-            "secret '{key}' (source '{}'): the '{}' provider is not available \
-             in this build — vault lands with {}",
-            source_name(other),
-            source_name(other),
-            source_issue(other)
-        ),
+        SecretSource::Vault { mount, path, field } => resolve_vault(key, mount, path, field),
     }
 }
 
@@ -501,6 +482,139 @@ fn libsecret_value(key: &str, bytes: Vec<u8>) -> miette::Result<String> {
     if value.is_empty() {
         // D7: never an empty value.
         miette::bail!("secret '{key}' (source 'libsecret'): entry content is empty")
+    }
+    Ok(value)
+}
+
+// ── vault (KV v2 REST, issue #186) ──
+
+/// `vault`: KV v2 REST read against `{VAULT_ADDR}` (D4; OpenBao shares
+/// the wire shape — it is a fork of Vault's KV engine). One request:
+/// `GET {VAULT_ADDR}/v1/{mount}/data/{path}` with the `X-Vault-Token`
+/// header; the value lives at `.data.data.<field>`.
+///
+/// Implementation verdict (ADR-0042 Evidence, issue #186): raw REST on
+/// the existing ureq host fetch stack — the `src/tools.rs` fetch-agent
+/// shape — not the `vaultrs` crate, which would drag tokio into a tree
+/// that bans it while the KV v2 wire shape is one GET + one header.
+///
+/// Auth (D5): `VAULT_ADDR` + `VAULT_TOKEN` from the caller env.
+/// Named failures (D7): either variable unset/empty (named
+/// separately), transport failure (short reason), non-2xx status
+/// named (403 wrong token, 404 missing path), non-JSON body,
+/// `.data`/`.data.data` missing or non-object, field missing,
+/// field non-string, field empty (never an empty value). A response
+/// BODY never enters an error string (D8: an error body can echo
+/// field data) and the token never enters one either; mount/path/
+/// field are declared surface and may appear.
+fn resolve_vault(key: &str, mount: &str, path: &str, field: &str) -> miette::Result<String> {
+    let (addr, token) = vault_env(key)?;
+    let url = format!("{}/v1/{mount}/data/{path}", addr.trim_end_matches('/'));
+    vault_read(key, field, &url, &token)
+}
+
+/// The D5 credential pair; each failure named separately (unset vs
+/// set-but-empty, addr vs token).
+fn vault_env(key: &str) -> miette::Result<(String, String)> {
+    let addr = match std::env::var("VAULT_ADDR") {
+        Err(_) => miette::bail!(
+            "secret '{key}' (source 'vault'): VAULT_ADDR is not set (it must \
+             ride the caller env per ADR-0042 D5)"
+        ),
+        Ok(a) if a.is_empty() => {
+            miette::bail!("secret '{key}' (source 'vault'): VAULT_ADDR is set but empty")
+        }
+        Ok(a) => a,
+    };
+    let token = match std::env::var("VAULT_TOKEN") {
+        Err(_) => miette::bail!(
+            "secret '{key}' (source 'vault'): VAULT_TOKEN is not set (it must \
+             ride the caller env per ADR-0042 D5)"
+        ),
+        Ok(t) if t.is_empty() => {
+            miette::bail!("secret '{key}' (source 'vault'): VAULT_TOKEN is set but empty")
+        }
+        Ok(t) => t,
+    };
+    Ok((addr, token))
+}
+
+/// The KV v2 GET. Status and short reason only in failures — a
+/// response BODY never enters an error string (D8), and `Error::Status`'s
+/// dropped `Response` is never read.
+fn vault_read(key: &str, field: &str, url: &str, token: &str) -> miette::Result<String> {
+    let agent = vault_agent();
+    let response = match agent.get(url).set("X-Vault-Token", token).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => miette::bail!(
+            "secret '{key}' (source 'vault'): KV v2 read returned HTTP {status} {} — \
+             response body suppressed (ADR-0042 D8 masking)",
+            response.status_text()
+        ),
+        Err(e) => miette::bail!(
+            "secret '{key}' (source 'vault'): transport failure reaching the \
+             KV v2 API: {e} (response body suppressed per ADR-0042 D8)"
+        ),
+    };
+    let body = response.into_string().map_err(|e| {
+        miette::miette!(
+            "secret '{key}' (source 'vault'): could not read the KV v2 \
+             response body: {e}"
+        )
+    })?;
+    let json: serde_json::Value = serde_json::from_str(body.trim()).map_err(|e| {
+        miette::miette!(
+            "secret '{key}' (source 'vault'): KV v2 response was not valid \
+             JSON (serde position {e})"
+        )
+    })?;
+    vault_field(key, field, &json)
+}
+
+/// The ureq host fetch agent — the `src/tools.rs` fetch-agent shape
+/// (same TLS/CA resolution: rustls with compiled-in webpki roots for
+/// https; http stays plain, the loopback test host) and the same
+/// connect/total timeouts.
+fn vault_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(crate::tools::FETCH_CONNECT_TIMEOUT)
+        .timeout(crate::tools::FETCH_TOTAL_TIMEOUT)
+        .build()
+}
+
+/// Navigate `.data.data.<field>` in the KV v2 document. Named failures
+/// only (D7); the body and the value never enter a failure string (D8).
+fn vault_field(key: &str, field: &str, json: &serde_json::Value) -> miette::Result<String> {
+    let data = json.get("data").ok_or_else(|| {
+        miette::miette!("secret '{key}' (source 'vault'): KV v2 response has no '.data' object")
+    })?;
+    if !data.is_object() {
+        miette::bail!(
+            "secret '{key}' (source 'vault'): KV v2 response field '.data' is not an object"
+        )
+    }
+    let inner = data.get("data").ok_or_else(|| {
+        miette::miette!(
+            "secret '{key}' (source 'vault'): KV v2 response has no '.data.data' object"
+        )
+    })?;
+    if !inner.is_object() {
+        miette::bail!(
+            "secret '{key}' (source 'vault'): KV v2 response field '.data.data' is not an object"
+        )
+    }
+    let value = match inner.get(field) {
+        Some(serde_json::Value::String(v)) => v.clone(),
+        Some(_) => {
+            miette::bail!("secret '{key}' (source 'vault'): KV v2 field '{field}' is not a string")
+        }
+        None => {
+            miette::bail!("secret '{key}' (source 'vault'): KV v2 secret has no '{field}' field")
+        }
+    };
+    if value.is_empty() {
+        // D7: never an empty value.
+        miette::bail!("secret '{key}' (source 'vault'): KV v2 field '{field}' is empty")
     }
     Ok(value)
 }
@@ -1114,11 +1228,10 @@ pub struct SecretsCheckRow {
     pub key: String,
     /// Registry source name.
     pub source: String,
-    /// `ok`, `unavailable` (provider ships with a later ticket), or
-    /// `failed` (the named failure, D7).
+    /// `ok` (the probe resolved) or `failed` (the named failure, D7) —
+    /// every D4 source is live since #186.
     pub status: &'static str,
-    /// The named failure, or where an unavailable provider ships. Never
-    /// a value (D8).
+    /// The named failure, empty on `ok`. Never a value (D8).
     pub note: String,
 }
 
@@ -1138,15 +1251,6 @@ pub fn check_pod(root: &Path, pod_name: &str) -> miette::Result<Vec<SecretsCheck
     let mut rows = Vec::new();
     for (key, source) in &inputs.refs {
         let name = source_name(source);
-        if !source_available(source) {
-            rows.push(SecretsCheckRow {
-                key: key.clone(),
-                source: name.to_string(),
-                status: "unavailable",
-                note: format!("provider lands with {}", source_issue(source)),
-            });
-            continue;
-        }
         match resolve_one(&inputs.pod_dir, key, source) {
             Ok(_) => rows.push(SecretsCheckRow {
                 key: key.clone(),
@@ -1245,9 +1349,11 @@ mod tests {
     use std::sync::Mutex;
 
     /// Every test that mutates process env (`XDG_RUNTIME_DIR`, probe
-    /// vars, `PATH`) takes this lock — env is process-global and cargo
-    /// runs tests in parallel threads.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// vars, `PATH`) takes the shared crate-wide lock (src/test_env.rs)
+    /// — env is process-global, cargo runs tests in parallel threads,
+    /// and the per-module statics of the pre-#186 era excluded nothing
+    /// across modules.
+    use crate::test_env::ENV_LOCK;
 
     const SENTINEL: &str = "TOPSECRET-b183-VALUE";
 
@@ -1778,6 +1884,21 @@ mod tests {
         assert_eq!(again.meta.get("A_KEY").unwrap().source, "env");
     }
 
+    /// The printf one-liner with every nasty byte: backslash, double
+    /// quote, interior newline. Extracted so the test body stays a
+    /// plain sequence (the complexity guard miscounts escape-heavy
+    /// literals).
+    fn nasty_provider_script() -> &'static str {
+        r#"printf '%s\n' 'back\slash quote" nl
+end'"#
+    }
+
+    /// The byte-exact envfile the escaper must produce for
+    /// [`nasty_provider_script`]'s output.
+    fn expected_envfile_body() -> &'static str {
+        "K=\"back\\\\slash quote\\\" nl\\nend\"\n"
+    }
+
     #[test]
     fn envfile_escapes_systemd_c_sequences_verbatim_backslashes_included() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1787,8 +1908,7 @@ mod tests {
                 command: vec![script(
                     tmp.path(),
                     "nasty-provider",
-                    r#"printf '%s\n' 'back\slash quote" nl
-end'"#,
+                    nasty_provider_script(),
                 )],
             },
         )]);
@@ -1803,7 +1923,8 @@ end'"#,
         .unwrap();
         let body = std::fs::read_to_string(served.envfile.unwrap()).unwrap();
         assert_eq!(
-            body, "K=\"back\\\\slash quote\\\" nl\\nend\"\n",
+            body,
+            expected_envfile_body(),
             "backslash doubled, quote escaped, newline folded to \\n"
         );
     }
@@ -2041,12 +2162,489 @@ end'"#,
         assert!(text.contains("hit") && text.contains("stale"));
     }
 
+    // ── vault (issue #186): loopback KV v2 harness ──
+
+    /// One canned KV v2 response served over 127.0.0.1 HTTP on an
+    /// OS-assigned port. Captures the request line and the
+    /// `X-Vault-Token` header of the first request so a test can
+    /// assert the exact wire shape. One request per connection, loop
+    /// for the listener's life (the pod_declare source-server
+    /// pattern); OpenBao compatibility rides the identical wire shape —
+    /// no second live server.
+    struct VaultServer {
+        addr: String,
+        captured: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>,
+    }
+
+    impl VaultServer {
+        /// Bind, spawn the listener thread, answer every request with
+        /// `status`/`body` (an HTTP status line reason + a JSON body).
+        fn start(status: &str, body: &str) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = format!("http://{}", listener.local_addr().unwrap());
+            let canned = (status.to_string(), body.to_string());
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let slot = std::sync::Arc::clone(&captured);
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    vault_serve_one(stream, &canned, &slot);
+                }
+            });
+            Self { addr, captured }
+        }
+
+        /// The first request's request line (`GET /v1/… HTTP/1.1`).
+        fn request_line(&self) -> String {
+            self.captured
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.0.clone())
+                .unwrap_or_default()
+        }
+
+        /// The first request's `X-Vault-Token` header value.
+        fn token_header(&self) -> String {
+            self.captured
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.1.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    /// Read one request head, capture request line + token header,
+    /// answer with the canned response. Errors on the wire are
+    /// swallowed — the test asserts through the capture.
+    fn vault_serve_one(
+        mut stream: std::net::TcpStream,
+        canned: &(String, String),
+        captured: &std::sync::Mutex<Option<(String, String)>>,
+    ) {
+        use std::io::{Read, Write};
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stream.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+            if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let req = String::from_utf8_lossy(&data);
+        let mut lines = req.split("\r\n");
+        let request_line = lines.next().unwrap_or("").to_string();
+        let token = lines
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.eq_ignore_ascii_case("X-Vault-Token")
+                    .then(|| value.trim().to_string())
+            })
+            .unwrap_or_default();
+        *captured.lock().unwrap() = Some((request_line, token));
+        let head = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            canned.0,
+            canned.1.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(canned.1.as_bytes());
+        let _ = stream.flush();
+    }
+
+    /// A KV v2 happy-path document with `field` under `.data.data`.
+    fn vault_body(field_value: &str) -> String {
+        format!(r#"{{"data":{{"data":{{"token":"{field_value}"}}}}}}"#)
+    }
+
+    fn vault_ref() -> SecretSource {
+        SecretSource::Vault {
+            mount: "secret".to_string(),
+            path: "app".to_string(),
+            field: "token".to_string(),
+        }
+    }
+
+    fn vault_refs() -> BTreeMap<String, SecretSource> {
+        BTreeMap::from([("V_TOKEN".to_string(), vault_ref())])
+    }
+
+    /// Scoped (VAULT_ADDR, VAULT_TOKEN) swap; restores on drop so a
+    /// failing assert cannot poison the process env for sibling tests
+    /// (every caller holds ENV_LOCK).
+    struct VaultEnv {
+        saved_addr: Option<String>,
+        saved_token: Option<String>,
+    }
+
+    impl VaultEnv {
+        /// `None` removes the variable; `Some` sets it.
+        fn new(addr: Option<&str>, token: Option<&str>) -> Self {
+            let saved_addr = std::env::var("VAULT_ADDR").ok();
+            match addr {
+                Some(a) => std::env::set_var("VAULT_ADDR", a),
+                None => std::env::remove_var("VAULT_ADDR"),
+            }
+            let saved_token = std::env::var("VAULT_TOKEN").ok();
+            match token {
+                Some(t) => std::env::set_var("VAULT_TOKEN", t),
+                None => std::env::remove_var("VAULT_TOKEN"),
+            }
+            Self {
+                saved_addr,
+                saved_token,
+            }
+        }
+    }
+
+    impl Drop for VaultEnv {
+        fn drop(&mut self) {
+            match self.saved_addr.take() {
+                Some(a) => std::env::set_var("VAULT_ADDR", a),
+                None => std::env::remove_var("VAULT_ADDR"),
+            }
+            match self.saved_token.take() {
+                Some(t) => std::env::set_var("VAULT_TOKEN", t),
+                None => std::env::remove_var("VAULT_TOKEN"),
+            }
+        }
+    }
+
+    #[test]
+    fn vault_happy_path_reads_field_through_the_kv_v2_route() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let server = VaultServer::start("200 OK", &vault_body(SENTINEL));
+        let _env = VaultEnv::new(Some(&server.addr), Some("caller-token"));
+        let refs = vault_refs();
+        let values = resolve_references(
+            &pod,
+            "p",
+            3,
+            &refs,
+            Some(tmp.path().join("cache").as_path()),
+        )
+        .unwrap();
+        assert_eq!(values.get("V_TOKEN").map(String::as_str), Some(SENTINEL));
+        // The wire shape: KV v2 route + the token header.
+        assert_eq!(server.request_line(), "GET /v1/secret/data/app HTTP/1.1");
+        assert_eq!(server.token_header(), "caller-token");
+    }
+
+    #[test]
+    fn vault_wrong_token_403_fails_named_and_the_body_never_leaks() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        // The canned body carries the sentinel AND the "wrong" token:
+        // neither may reach the error string (D8).
+        let server = VaultServer::start(
+            "403 Forbidden",
+            &format!("permission denied: {SENTINEL} token-t suspects"),
+        );
+        let _env = VaultEnv::new(Some(&server.addr), Some("wrong-token"));
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &vault_refs(),
+                Some(tmp.path().join("cache").as_path()),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("403"), "{err}");
+        assert!(err.contains("Forbidden"), "{err}");
+        assert!(err.contains("source 'vault'"), "{err}");
+        assert!(
+            !err.contains(SENTINEL),
+            "response body leaked into the error: {err}"
+        );
+        assert!(!err.contains("wrong-token"), "token leaked: {err}");
+    }
+
+    #[test]
+    fn vault_missing_path_404_fails_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let server = VaultServer::start("404 Not Found", &format!("no such path {SENTINEL}"));
+        let _env = VaultEnv::new(Some(&server.addr), Some("t"));
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &vault_refs(),
+                Some(tmp.path().join("cache").as_path()),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("404"), "{err}");
+        assert!(
+            !err.contains(SENTINEL),
+            "response body leaked into the error: {err}"
+        );
+    }
+
+    #[test]
+    fn vault_missing_field_fails_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        // The sentinel hides in a DIFFERENT field of the same secret.
+        let body = format!(r#"{{"data":{{"data":{{"other":"{SENTINEL}"}}}}}}"#);
+        let server = VaultServer::start("200 OK", &body);
+        let _env = VaultEnv::new(Some(&server.addr), Some("t"));
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &vault_refs(),
+                Some(tmp.path().join("cache").as_path()),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("no 'token' field"), "{err}");
+        assert!(
+            !err.contains(SENTINEL),
+            "other field's value leaked into the error: {err}"
+        );
+    }
+
+    #[test]
+    fn vault_non_string_field_fails_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let body = format!(r#"{{"data":{{"data":{{"token":42,"other":"{SENTINEL}"}}}}}}"#);
+        let server = VaultServer::start("200 OK", &body);
+        let _env = VaultEnv::new(Some(&server.addr), Some("t"));
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &vault_refs(),
+                Some(tmp.path().join("cache").as_path()),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("not a string"), "{err}");
+        assert!(!err.contains(SENTINEL), "value leaked: {err}");
+    }
+
+    #[test]
+    fn vault_empty_field_fails_named_never_an_empty_value() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let server = VaultServer::start("200 OK", &vault_body(""));
+        let _env = VaultEnv::new(Some(&server.addr), Some("t"));
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &vault_refs(),
+                Some(tmp.path().join("cache").as_path()),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn vault_malformed_json_body_fails_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let server = VaultServer::start("200 OK", &format!("totally not json {SENTINEL}"));
+        let _env = VaultEnv::new(Some(&server.addr), Some("t"));
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &vault_refs(),
+                Some(tmp.path().join("cache").as_path()),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("not valid JSON"), "{err}");
+        assert!(
+            !err.contains(SENTINEL),
+            "body content leaked into the error: {err}"
+        );
+    }
+
+    #[test]
+    fn vault_data_levels_missing_or_non_object_fail_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let cases: [(&str, String); 4] = [
+            ("no .data", "{}".to_string()),
+            (".data not an object", r#"{"data":42}"#.to_string()),
+            (
+                "no .data.data",
+                r#"{"data":{"metadata":{"version":2}}}"#.to_string(),
+            ),
+            (
+                ".data.data not an object",
+                r#"{"data":{"data":"flat"}}"#.to_string(),
+            ),
+        ];
+        for (what, body) in cases {
+            let server = VaultServer::start("200 OK", &body);
+            let _env = VaultEnv::new(Some(&server.addr), Some("t"));
+            let err = format!(
+                "{}",
+                resolve_references(
+                    &pod,
+                    "p",
+                    3,
+                    &vault_refs(),
+                    Some(tmp.path().join("cache").as_path()),
+                )
+                .unwrap_err()
+            );
+            assert!(
+                err.contains(".data"),
+                "{what}: failure must name the JSON shape: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vault_trailing_slash_addr_is_normalized_before_joining() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let server = VaultServer::start("200 OK", &vault_body(SENTINEL));
+        // A double slash would hit /v1//secret/... and 404 on real
+        // Vault — the normalization must prevent it.
+        let _env = VaultEnv::new(Some(&format!("{}/", server.addr)), Some("t"));
+        resolve_references(
+            &pod,
+            "p",
+            3,
+            &vault_refs(),
+            Some(tmp.path().join("cache").as_path()),
+        )
+        .unwrap();
+        assert_eq!(
+            server.request_line(),
+            "GET /v1/secret/data/app HTTP/1.1",
+            "no doubled slash in the request line"
+        );
+    }
+
+    #[test]
+    fn vault_addr_and_token_missing_or_empty_fail_named_separately() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let resolve_err = || -> String {
+            format!(
+                "{}",
+                resolve_references(
+                    &pod,
+                    "p",
+                    3,
+                    &vault_refs(),
+                    Some(tmp.path().join("cache").as_path()),
+                )
+                .unwrap_err()
+            )
+        };
+        // (a) both unset → the ADDR failure is named first.
+        let _env = VaultEnv::new(None, None);
+        let err = resolve_err();
+        assert!(err.contains("VAULT_ADDR is not set"), "{err}");
+        assert!(!err.contains("VAULT_TOKEN"), "{err}");
+        // (b) addr set, token unset → the TOKEN failure, distinctly.
+        let _env = VaultEnv::new(Some("http://127.0.0.1:1"), None);
+        let err = resolve_err();
+        assert!(err.contains("VAULT_TOKEN is not set"), "{err}");
+        assert!(
+            !err.contains("VAULT_ADDR"),
+            "the addr failure must not be named for a token failure: {err}"
+        );
+        // (c) addr set-but-empty.
+        let _env = VaultEnv::new(Some(""), Some("t"));
+        let err = resolve_err();
+        assert!(err.contains("VAULT_ADDR is set but empty"), "{err}");
+        // (d) token set-but-empty.
+        let _env = VaultEnv::new(Some("http://127.0.0.1:1"), Some(""));
+        let err = resolve_err();
+        assert!(err.contains("VAULT_TOKEN is set but empty"), "{err}");
+    }
+
+    #[test]
+    fn vault_transport_failure_fails_named_without_touching_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        // Port 1: nothing listens — a fast, deterministic refusal.
+        let _env = VaultEnv::new(Some("http://127.0.0.1:1"), Some("t"));
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &vault_refs(),
+                Some(tmp.path().join("cache").as_path()),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("transport failure"), "{err}");
+        assert!(err.contains("source 'vault'"), "{err}");
+    }
+
+    #[test]
+    fn vault_interior_newlines_in_the_value_survive() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let body = r#"{"data":{"data":{"token":"-----BEGIN\nLINE2\n-----END"}}}"#;
+        let server = VaultServer::start("200 OK", body);
+        let _env = VaultEnv::new(Some(&server.addr), Some("t"));
+        let values = resolve_references(
+            &pod,
+            "p",
+            3,
+            &vault_refs(),
+            Some(tmp.path().join("cache").as_path()),
+        )
+        .unwrap();
+        assert_eq!(
+            values.get("V_TOKEN").map(String::as_str),
+            Some("-----BEGIN\nLINE2\n-----END"),
+            "PEM shape rides verbatim (ADR-0042 D4)"
+        );
+    }
+
     // ── verbs: check ──
 
-    /// A pod whose references cover all three check statuses: an
-    /// unavailable stub (vault), a failing env var, and a working exec
-    /// provider.
-    fn check_fixture() -> tempfile::TempDir {
+    /// A pod whose references cover the check statuses: vault resolves
+    /// through the loopback KV v2 server (issue #186 — every D4 source
+    /// is live), a failing env var, and a working exec provider. The
+    /// server and the (VAULT_ADDR, VAULT_TOKEN) env swap live as long
+    /// as the returned tuple.
+    fn check_fixture() -> (tempfile::TempDir, VaultServer, VaultEnv) {
         let tmp = tempfile::tempdir().unwrap();
         let provider = script(
             tmp.path(),
@@ -2068,23 +2666,20 @@ end'"#,
             ),
         );
         activate(tmp.path(), "work");
-        tmp
+        let server = VaultServer::start("200 OK", &vault_body(SENTINEL));
+        let env = VaultEnv::new(Some(&server.addr), Some("caller-token"));
+        (tmp, server, env)
     }
 
     #[test]
     fn check_reports_per_source_health_and_fails_named() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let tmp = check_fixture();
+        let (tmp, server, _env) = check_fixture();
         std::env::remove_var("SHUTTLE_SECRETS_TEST_CHECK");
         let rows = check_pod(tmp.path(), "work").unwrap();
         assert_eq!(rows.len(), 3);
         let by_key = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
-        assert_eq!(by_key("VAULT_ITEM").status, "unavailable");
-        assert!(
-            by_key("VAULT_ITEM").note.contains("#186"),
-            "{}",
-            by_key("VAULT_ITEM").note
-        );
+        assert_eq!(by_key("VAULT_ITEM").status, "ok");
         assert_eq!(by_key("ENV_VAR").status, "failed");
         assert!(
             by_key("ENV_VAR")
@@ -2095,22 +2690,23 @@ end'"#,
         );
         assert_eq!(by_key("EXEC_VAR").status, "ok");
         assert!(!check_healthy(&rows), "a failing reference means exit 1");
+        // The vault probe really hit the KV v2 route with the token header.
+        assert_eq!(server.request_line(), "GET /v1/secret/data/app HTTP/1.1");
+        assert_eq!(server.token_header(), "caller-token");
         // No value reaches any report row (D8).
         let text = render_check_rows("work", &rows);
         assert!(!text.contains(SENTINEL), "value leaked into check output");
-        // Everything resolvable goes green once the env var exists.
+        // Everything goes green once the env var exists (exit-0 shape).
         std::env::set_var("SHUTTLE_SECRETS_TEST_CHECK", SENTINEL);
         let rows = check_pod(tmp.path(), "work").unwrap();
         std::env::remove_var("SHUTTLE_SECRETS_TEST_CHECK");
-        let failed: Vec<_> = rows
-            .iter()
-            .filter(|r| r.status == "failed")
-            .map(|r| r.key.as_str())
-            .collect();
-        assert_eq!(
-            failed,
-            Vec::<&str>::new(),
-            "only VAULT_ITEM stays unavailable"
+        assert!(
+            check_healthy(&rows),
+            "all three D4 sources are live → exit 0: {rows:?}"
+        );
+        assert!(
+            !render_check_rows("work", &rows).contains(SENTINEL),
+            "value leaked into check output"
         );
     }
 
@@ -2714,13 +3310,14 @@ end'"#,
         assert_eq!(found.as_deref(), Some(SENTINEL.as_bytes()));
     }
 
-    // ── pod secrets check end-to-end (issue #185 scope 5) ──
+    // ── pod secrets check end-to-end (issue #185 scope 5, #186) ──
 
     /// One pod, three sources: bitwarden resolves through the fake bws,
-    /// libsecret through the seam fake, vault stays unavailable (#186).
-    /// The CLI maps this row set to exit 1.
+    /// libsecret through the seam fake, vault through the loopback KV v2
+    /// server — every D4 source is live since #186, so the healthy row
+    /// set is the exit-0 shape.
     #[test]
-    fn check_pod_end_to_end_bitwarden_libsecret_ok_vault_unavailable_exit_1() {
+    fn check_pod_end_to_end_bitwarden_libsecret_vault_ok_exit_0() {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         seed_pod(
@@ -2739,6 +3336,8 @@ end'"#,
         let body = format!(r#"{{"value":"{SENTINEL}"}}"#);
         let _bws = bws_script(tmp.path(), &body, 0, None);
         let _env = BwsEnv::new(tmp.path(), Some("caller-token"));
+        let server = VaultServer::start("200 OK", &vault_body(SENTINEL));
+        let _venv = VaultEnv::new(Some(&server.addr), Some("vault-caller-token"));
         let previous = reseat_lookup(fake_lookup);
         seed_fake_store(&[("bitwarden", "sm-access-token")], b"ring-stored");
         let rows = check_pod(tmp.path(), "work").unwrap();
@@ -2747,16 +3346,60 @@ end'"#,
         let by_key = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
         assert_eq!(by_key("BW_ITEM").status, "ok");
         assert_eq!(by_key("LS_TOKEN").status, "ok");
-        assert_eq!(by_key("VAULT_ITEM").status, "unavailable");
-        assert!(
-            by_key("VAULT_ITEM").note.contains("#186"),
-            "{}",
-            by_key("VAULT_ITEM").note
-        );
-        assert!(!check_healthy(&rows), "this row set is the exit-1 shape");
-        // Neither resolved value reaches any check output (D8).
+        assert_eq!(by_key("VAULT_ITEM").status, "ok");
+        assert!(check_healthy(&rows), "every D4 source live → exit 0");
+        // The vault probe hit the KV v2 route with the token header.
+        assert_eq!(server.request_line(), "GET /v1/secret/data/app HTTP/1.1");
+        assert_eq!(server.token_header(), "vault-caller-token");
+        // No resolved value reaches any check output (D8).
         let text = render_check_rows("work", &rows);
         assert!(!text.contains(SENTINEL), "bitwarden value leaked: {text}");
+        assert!(
+            !text.contains("ring-stored"),
+            "keyring value leaked: {text}"
+        );
+    }
+
+    /// The exit-1 shape survives #186 — the stub row is gone, so its
+    /// story re-points at the transport-failure path: a dead
+    /// VAULT_ADDR fails its row named while the other two stay green.
+    #[test]
+    fn check_pod_end_to_end_vault_transport_failure_is_the_exit_1_shape() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_pod(
+            tmp.path(),
+            "work",
+            r#"pod {
+    secrets = {
+        BW_ITEM    = { source = "bitwarden", id = "8848da48" },
+        LS_TOKEN   = { source = "libsecret", attributes = { bitwarden = "sm-access-token" } },
+        VAULT_ITEM = { source = "vault", mount = "secret", path = "app", field = "token" },
+    },
+}
+"#,
+        );
+        activate(tmp.path(), "work");
+        let body = format!(r#"{{"value":"{SENTINEL}"}}"#);
+        let _bws = bws_script(tmp.path(), &body, 0, None);
+        let _env = BwsEnv::new(tmp.path(), Some("caller-token"));
+        // Port 1: nothing listens there — connection refused.
+        let _venv = VaultEnv::new(Some("http://127.0.0.1:1"), Some("t"));
+        let previous = reseat_lookup(fake_lookup);
+        seed_fake_store(&[("bitwarden", "sm-access-token")], b"ring-stored");
+        let rows = check_pod(tmp.path(), "work").unwrap();
+        reseat_lookup(previous);
+        FAKE_STORE.lock().unwrap().clear();
+        let by_key = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
+        assert_eq!(by_key("BW_ITEM").status, "ok");
+        assert_eq!(by_key("LS_TOKEN").status, "ok");
+        let vault = by_key("VAULT_ITEM");
+        assert_eq!(vault.status, "failed");
+        assert!(vault.note.contains("transport failure"), "{}", vault.note);
+        assert!(!check_healthy(&rows), "this row set is the exit-1 shape");
+        // The transport failure text carries no values (D8).
+        let text = render_check_rows("work", &rows);
+        assert!(!text.contains(SENTINEL), "value leaked: {text}");
         assert!(
             !text.contains("ring-stored"),
             "keyring value leaked: {text}"

@@ -456,7 +456,9 @@ mod tests {
     const STORE_ACCOUNT_KEY: &str =
         include_str!("../tests/fixtures/assertions/store.account-key.assert");
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // The shared crate-wide test-env lock (src/test_env.rs) — the
+    // per-module statics used to exclude nothing across modules.
+    use crate::test_env::ENV_LOCK;
 
     fn hello_channel_map(track: &str, risk: &str) -> String {
         format!(

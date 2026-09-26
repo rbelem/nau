@@ -3094,9 +3094,10 @@ CONFIG_EXT4_FS=y
     // ── Floor-tool origin report, probes, notices (issue #101) ──
 
     /// Env vars are process-global; cargo runs tests in parallel threads.
-    /// Tests that read or mutate tool-related env hold this lock (the
-    /// tools::tests pattern).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Tests that read or mutate tool-related env hold the shared
+    /// crate-wide lock (src/test_env.rs) — the per-module statics of the
+    /// pre-#186 era excluded nothing across modules.
+    use crate::test_env::ENV_LOCK;
 
     /// Points `SHUTTLE_TOOLS_DIR` at a tempdir for the test's lifetime and
     /// restores the previous value on drop.
@@ -3185,6 +3186,13 @@ done
 
     #[test]
     fn floor_tool_check_reports_path_origin_with_version() {
+        // Spawning the probe helper resolves through PATH, so the whole
+        // window rides the shared crate test-env lock — concurrent
+        // PATH-swapping tests otherwise flake the version discovery
+        // (the four-per-module-lock era raced exactly here).
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let fake = write_script(
             dir.path(),

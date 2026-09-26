@@ -44,6 +44,8 @@ pub mod sign;
 pub mod slot_recovery;
 pub mod snap;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_env;
 pub mod tools;
 pub mod uc;
 pub mod units;

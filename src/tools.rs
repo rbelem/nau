@@ -84,8 +84,10 @@ const DEFAULT_ROOT_SUFFIX: &str = ".local/share/shuttle/tools";
 const ENV_TOOLS_DIR: &str = "SHUTTLE_TOOLS_DIR";
 /// Provisioning moves a few MB total; generous body ceiling, short
 /// connect fail-fast.
-const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Crate-visible so the vault source (src/secrets.rs) rides the SAME
+/// timeout contract as the fetch stack instead of duplicating numbers.
+pub(crate) const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Exec-probe budget: three tries with a short gap covers the flaky
 /// ETXTBSY a heavily forking host can return for a just-closed file.
 const PROBE_ATTEMPTS: u32 = 3;
@@ -807,11 +809,12 @@ fn io_context(context: impl Into<String>, source: io::Error) -> ToolsError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     /// Env vars are process-global; cargo runs tests in parallel threads.
-    /// Every test that reads or mutates tool-related env holds this lock.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Every test that reads or mutates tool-related env holds this lock —
+    /// the shared crate-wide one (src/test_env.rs); the per-module
+    /// statics of the pre-#186 era excluded nothing across modules.
+    use crate::test_env::ENV_LOCK;
 
     /// Points `SHUTTLE_TOOLS_DIR` at a tempdir for the test's lifetime and
     /// restores the previous value on drop — provision tests must never
