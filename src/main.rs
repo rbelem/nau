@@ -3141,31 +3141,54 @@ fn cmd_pod_secrets(
             Ok(())
         }
         shuttle::cli::PodSecretsCommand::Refresh => {
-            let report = shuttle::secrets::refresh_pod(&root, pod_name, None)?;
+            let tools = shuttle::runtime::RuntimeTools::for_pod_runtime();
+            let report = shuttle::secrets::refresh_pod(&root, pod_name, None, &tools)?;
             if report.resolved == 0 {
                 shuttle::output::info(format!("pod '{pod_name}' has no secret references"));
                 return Ok(());
             }
-            let sources = report
-                .sources
-                .iter()
-                .map(|(k, n)| format!("{k}={n}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if report.purged > 0 {
-                let noun = if report.purged == 1 {
-                    "entry"
-                } else {
-                    "entries"
-                };
-                shuttle::output::info(format!("dropped {} cached {noun}", report.purged));
-            }
+            print_refresh_counts(&report);
             shuttle::output::ok(format!(
                 "resolved {} secret(s) from [{}] — values cached for this session",
-                report.resolved, sources
+                report.resolved,
+                report
+                    .sources
+                    .iter()
+                    .map(|(k, n)| format!("{k}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
+            print_refresh_restarts(&report);
             Ok(())
         }
+    }
+}
+
+/// The refresh report's cache counts: the dropped-entry line, only
+/// when something was actually dropped (a quiet no-op stays quiet).
+fn print_refresh_counts(report: &shuttle::secrets::SecretsRefreshReport) {
+    if report.purged == 0 {
+        return;
+    }
+    let noun = if report.purged == 1 {
+        "entry"
+    } else {
+        "entries"
+    };
+    shuttle::output::info(format!("dropped {} cached {noun}", report.purged));
+}
+
+/// The refresh report's rotate-restart half (ADR-0042 D3, issue #224):
+/// name every unit that moved and every named skip.
+fn print_refresh_restarts(report: &shuttle::secrets::SecretsRefreshReport) {
+    if !report.restarted.is_empty() {
+        shuttle::output::ok(format!("restarted {}", report.restarted.join(", ")));
+    }
+    if !report.skipped.is_empty() {
+        shuttle::output::info(format!(
+            "restart skipped for {} — systemctl unavailable",
+            report.skipped.join(", ")
+        ));
     }
 }
 
