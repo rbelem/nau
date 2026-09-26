@@ -68,6 +68,21 @@ full_moon = { version = "2", features = ["luau"] }
 # lock_api/scopeguard/log were already vendored via pgp/tempfile, and
 # libc only bumps. No tokio, no hyper.
 mdns-sd = "0.21"
+# libsecret source (ADR-0042 issue #185, src/secrets.rs): Secret Service
+# (gnome-keyring/kwalletd behind it) attribute lookups through
+# dbus-secret-service — the synchronous libdbus client, NO async runtime
+# in this tree (the ADR's "keyring crate" wording is superseded: keyring
+# 3.x cannot search by attributes — its schema is hardcoded
+# service/user/target — and its async Secret Service backend drags in
+# tokio). search_items() over the declared attributes map is the exact
+# `secret-tool lookup <pairs>` surface the survey names. Sync D-Bus only:
+# the session bus is the workstation-only caveat (survey §2) — headless
+# hosts fail named, never partially. Features: `crypto-rust` picks the
+# pure-Rust DH session crypto (no OpenSSL linkage); `vendored` builds
+# libdbus from source — no host needs libdbus-1.dev on its pkg-config
+# path, and the gate pod env stays untouched (tests never touch the
+# bus; the lookup sits behind the seam in src/secrets.rs).
+dbus-secret-service = { version = "4", features = ["crypto-rust", "vendored"] }
 # Floor-tool self-provisioning (issue #101 disposition (c), src/tools.rs):
 # native HTTPS for fetching pinned tool binaries — the provisioner must not
 # depend on the curl it provisions. rustls TLS (`tls` feature, webpki roots

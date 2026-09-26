@@ -20,18 +20,26 @@
 //!   interaction and no tmpfs requirement.
 //! - **D4 (compiled-in provider registry, ADR-0014 shape).** A
 //!   match-based dispatch inside [`resolve_one`] plus a small
-//!   source-name table — no trait hierarchy for five sources where
-//!   three are stubs; it grows by arms when the network sources land.
-//!   `env` reads the caller's environment; `exec` runs an argv array
-//!   with NO shell. argv[0] resolves against the HOST PATH with every
-//!   entry under the pod state root removed first (shells that eval the
-//!   shellenv carry the pod farm ahead; a pool package shipping a
-//!   binary named `op`/`bws` must not shadow the host tool and capture
-//!   tokens), and a win that lands under the pod state root anyway
-//!   (symlinks included) is refused. Stdout is trimmed at the edges
-//!   only — interior newlines (PEM keys) survive verbatim.
+//!   source-name table — no trait hierarchy for five sources; it grows
+//!   by arms (vault is the last arm standing with its ticket). `env`
+//!   reads the caller's environment; `exec` and `bitwarden` run an
+//!   argv array with NO shell. argv[0] resolves against the HOST PATH
+//!   with every entry under the pod state root removed first (shells
+//!   that eval the shellenv carry the pod farm ahead; a pool package
+//!   shipping a binary named `op`/`bws` must not shadow the host tool
+//!   and capture tokens), and a win that lands under the pod state root
+//!   anyway (symlinks included) is refused. Stdout is trimmed at the
+//!   edges only — interior newlines (PEM keys) survive verbatim.
+//!   `libsecret` maps its attribute pairs onto a Secret Service item
+//!   lookup through `dbus-secret-service` (sync D-Bus, no async
+//!   runtime — the ADR's "keyring crate" wording is superseded: keyring
+//!   3.x cannot search by attributes); the query sits behind the
+//!   [`SECRET_SERVICE_LOOKUP`] seam so tests run an in-memory fake and
+//!   live-bus tests stay env-gated.
 //! - **D5 (provider credentials from the caller env).** Nothing nested,
-//!   nothing stored: `exec` children inherit the caller's environment.
+//!   nothing stored: `exec` children and `bws` inherit the caller's
+//!   environment (`BWS_ACCESS_TOKEN` is presence-checked only — never
+//!   read, forwarded, or logged).
 //! - **D7 (fail loud, never partial).** Any resolution failure fails
 //!   the WHOLE resolve naming the var key and the source kind. Never a
 //!   partial map, never an empty value, no `optional` flag.
@@ -64,6 +72,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
@@ -82,18 +91,17 @@ fn source_name(source: &SecretSource) -> &'static str {
     }
 }
 
-/// Whether the source can resolve in this build. The network sources
-/// land with their own tickets; until then every attempt fails loud
-/// naming the ticket ([`source_issue`]) — `pod secrets check` reports
-/// them as unavailable, `list` still lists the references.
+/// Whether the source can resolve in this build. Only Vault still ships
+/// with its own ticket (#186) — every attempt fails loud naming it
+/// ([`source_issue`]); `pod secrets check` reports it as unavailable,
+/// `list` still lists the reference.
 fn source_available(source: &SecretSource) -> bool {
-    matches!(source, SecretSource::Env { .. } | SecretSource::Exec { .. })
+    !matches!(source, SecretSource::Vault { .. })
 }
 
 /// Where an unavailable source ships.
 fn source_issue(source: &SecretSource) -> &'static str {
     match source {
-        SecretSource::Bitwarden { .. } | SecretSource::Libsecret { .. } => "issue #185",
         SecretSource::Vault { .. } => "issue #186",
         _ => "a future ticket",
     }
@@ -152,9 +160,11 @@ fn resolve_one(pod_dir: &Path, key: &str, source: &SecretSource) -> miette::Resu
     match source {
         SecretSource::Env { var } => resolve_env(key, var),
         SecretSource::Exec { command } => resolve_exec(pod_dir, key, command),
+        SecretSource::Bitwarden { id } => resolve_bitwarden(pod_dir, key, id),
+        SecretSource::Libsecret { attributes } => resolve_libsecret(key, attributes),
         other => miette::bail!(
             "secret '{key}' (source '{}'): the '{}' provider is not available \
-             in this build — network sources land with {}",
+             in this build — vault lands with {}",
             source_name(other),
             source_name(other),
             source_issue(other)
@@ -195,8 +205,8 @@ fn resolve_exec(pod_dir: &Path, key: &str, command: &[String]) -> miette::Result
     let program = command
         .first()
         .ok_or_else(|| miette::miette!("secret '{key}' (source 'exec'): command array is empty"))?;
-    let resolved = resolve_exec_program(pod_dir, key, program)?;
-    let output = std::process::Command::new(&resolved)
+    let resolved = resolve_exec_program(pod_dir, key, "exec", program)?;
+    let output = std::process::Command::new(resolved)
         .args(&command[1..])
         .output()
         .map_err(|e| {
@@ -223,25 +233,30 @@ fn resolve_exec(pod_dir: &Path, key: &str, command: &[String]) -> miette::Result
     Ok(value.to_string())
 }
 
-/// Resolve one `exec` argv[0] against the HOST PATH (D4): every PATH
+/// Resolve one provider argv[0] against the HOST PATH (D4): every PATH
 /// entry under the pod state root is dropped BEFORE the search, and a
 /// win that lands under the pod state root anyway (symlinks included)
-/// is refused.
-fn resolve_exec_program(pod_dir: &Path, key: &str, program: &str) -> miette::Result<PathBuf> {
+/// is refused. `source` labels the failures (`exec`, `bitwarden`).
+fn resolve_exec_program(
+    pod_dir: &Path,
+    key: &str,
+    source: &str,
+    program: &str,
+) -> miette::Result<PathBuf> {
     let pod_root = std::fs::canonicalize(pod_dir).map_err(|e| {
         miette::miette!(
-            "secret '{key}' (source 'exec'): pod state root {}: {e}",
+            "secret '{key}' (source '{source}'): pod state root {}: {e}",
             pod_dir.display()
         )
     })?;
     if program.contains('/') {
         let resolved = std::fs::canonicalize(program).map_err(|e| {
             miette::miette!(
-                "secret '{key}' (source 'exec'): program '{program}' is not \
-                 reachable: {e}"
+                "secret '{key}' (source '{source}'): program '{program}' is \
+                 not reachable: {e}"
             )
         })?;
-        refuse_pod_rooted_program(&pod_root, key, program, &resolved)?;
+        refuse_pod_rooted_program(&pod_root, key, source, program, &resolved)?;
         return Ok(resolved);
     }
     let raw_path = std::env::var("PATH").unwrap_or_default();
@@ -255,16 +270,16 @@ fn resolve_exec_program(pod_dir: &Path, key: &str, program: &str) -> miette::Res
         }
         let resolved = std::fs::canonicalize(&candidate).map_err(|e| {
             miette::miette!(
-                "secret '{key}' (source 'exec'): resolving {}: {e}",
+                "secret '{key}' (source '{source}'): resolving {}: {e}",
                 candidate.display()
             )
         })?;
-        refuse_pod_rooted_program(&pod_root, key, program, &resolved)?;
+        refuse_pod_rooted_program(&pod_root, key, source, program, &resolved)?;
         return Ok(resolved);
     }
     miette::bail!(
-        "secret '{key}' (source 'exec'): program '{program}' not found on the \
-         host PATH (pod farm entries are excluded per ADR-0042 D4)"
+        "secret '{key}' (source '{source}'): program '{program}' not found \
+         on the host PATH (pod farm entries are excluded per ADR-0042 D4)"
     )
 }
 
@@ -273,14 +288,15 @@ fn resolve_exec_program(pod_dir: &Path, key: &str, program: &str) -> miette::Res
 fn refuse_pod_rooted_program(
     pod_root: &Path,
     key: &str,
+    source: &str,
     program: &str,
     resolved: &Path,
 ) -> miette::Result<()> {
     if resolved.starts_with(pod_root) {
         miette::bail!(
-            "secret '{key}' (source 'exec'): program '{program}' resolves to {} \
-             inside the pod state root — refusing (ADR-0042 D4: a pod package \
-             must not shadow a provider program)",
+            "secret '{key}' (source '{source}'): program '{program}' resolves \
+             to {} inside the pod state root — refusing (ADR-0042 D4: a pod \
+             package must not shadow a provider program)",
             resolved.display()
         );
     }
@@ -307,6 +323,186 @@ fn host_path_dirs(pod_dir: &Path, raw_path: &str) -> Vec<PathBuf> {
 fn is_executable(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     meta.permissions().mode() & 0o111 != 0
+}
+
+// ── bitwarden (bws, issue #185) ──
+
+/// `bitwarden`: `bws secret get <id>` as an ARGV ARRAY (no shell — D4),
+/// parse the JSON stdout, extract `.value` (bws prints the secret as a
+/// JSON document). `bws` resolves like every exec argv[0]: the HOST
+/// PATH with pod-farm entries scrubbed, pod-rooted wins refused —
+/// a pool package shipping a `bws` must not capture the token (D4).
+///
+/// Auth (D5): `BWS_ACCESS_TOKEN` is presence-checked here and rides the
+/// caller env into the child by INHERITANCE — it is never read, stored,
+/// forwarded, or logged. Named failures (D7): bws not on the host PATH,
+/// token unset/empty, nonzero exit (provider stderr suppressed, D8),
+/// malformed JSON, `.value` missing / non-string / empty. The secret
+/// never enters an error string (D8).
+fn resolve_bitwarden(pod_dir: &Path, key: &str, id: &str) -> miette::Result<String> {
+    let bws = resolve_exec_program(pod_dir, key, "bitwarden", "bws")?;
+    // D5 presence check — a boolean leaves this match; the token does not.
+    match std::env::var("BWS_ACCESS_TOKEN") {
+        Err(_) => miette::bail!(
+            "secret '{key}' (source 'bitwarden'): BWS_ACCESS_TOKEN is not set \
+             (it must ride the caller env per ADR-0042 D5)"
+        ),
+        Ok(token) if token.is_empty() => {
+            miette::bail!(
+                "secret '{key}' (source 'bitwarden'): BWS_ACCESS_TOKEN is set \
+                 but empty"
+            )
+        }
+        Ok(_) => {}
+    }
+    let output = std::process::Command::new(&bws)
+        .arg("secret")
+        .arg("get")
+        .arg(id)
+        .output()
+        .map_err(|e| {
+            miette::miette!("secret '{key}' (source 'bitwarden'): could not run 'bws': {e}")
+        })?;
+    if !output.status.success() {
+        miette::bail!(
+            "secret '{key}' (source 'bitwarden'): 'bws secret get' exited with \
+             {} — provider stderr suppressed (ADR-0042 D8 masking)",
+            output.status
+        );
+    }
+    let text = String::from_utf8(output.stdout).map_err(|_| {
+        miette::miette!("secret '{key}' (source 'bitwarden'): 'bws' wrote non-UTF-8 output")
+    })?;
+    bitwarden_value(key, text.trim())
+}
+
+/// Extract `.value` from the bws JSON body. Named failures only (D7);
+/// the body and the value never appear in a failure string (D8).
+fn bitwarden_value(key: &str, body: &str) -> miette::Result<String> {
+    let json: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        miette::miette!(
+            "secret '{key}' (source 'bitwarden'): 'bws' did not return valid \
+             JSON (serde position {e})"
+        )
+    })?;
+    let value = match json.get("value") {
+        Some(serde_json::Value::String(v)) => v.clone(),
+        Some(_) => miette::bail!(
+            "secret '{key}' (source 'bitwarden'): bws JSON field '.value' is \
+             not a string"
+        ),
+        None => miette::bail!(
+            "secret '{key}' (source 'bitwarden'): bws JSON has no '.value' \
+             field"
+        ),
+    };
+    if value.is_empty() {
+        // D7: never an empty value.
+        miette::bail!(
+            "secret '{key}' (source 'bitwarden'): bws returned an empty \
+             '.value'"
+        )
+    }
+    Ok(value)
+}
+
+// ── libsecret (Secret Service, issue #185) ──
+
+/// The Secret Service attribute-query seam. The ONE place the tree
+/// touches the D-Bus session; tests reseat it to an in-memory fake,
+/// production always runs [`secret_service_lookup`], live-bus tests
+/// stay env-gated (`SHUTTLE_SECRETS_LIVE_DBUS=1`).
+type AttributeLookup = fn(&BTreeMap<String, String>) -> miette::Result<Option<Vec<u8>>>;
+
+static SECRET_SERVICE_LOOKUP: Mutex<AttributeLookup> = Mutex::new(secret_service_lookup);
+
+/// The reseated lookup — the single call site in production paths.
+fn attribute_lookup(attributes: &BTreeMap<String, String>) -> miette::Result<Option<Vec<u8>>> {
+    let f = SECRET_SERVICE_LOOKUP.lock().unwrap();
+    f(attributes)
+}
+
+/// The real Secret Service lookup: `secret-tool lookup` semantics over
+/// the declared attribute pairs — search ALL collections for an item
+/// matching EVERY attribute, fail named when nothing matches (`None`)
+/// or when the match is ambiguous, unlock on demand, return the secret
+/// bytes. Devbox interop: `{ bitwarden = "sm-access-token" }` reads the
+/// token the setup-bws pipeline stores. The attribute map is the
+/// declared, reviewable surface; the secret CONTENT never enters an
+/// error string (D8).
+fn secret_service_lookup(attributes: &BTreeMap<String, String>) -> miette::Result<Option<Vec<u8>>> {
+    use dbus_secret_service::{EncryptionType, SecretService};
+    let named =
+        |what: &str, e: dbus_secret_service::Error| miette::miette!("secret service {what}: {e}");
+    let service =
+        SecretService::connect(EncryptionType::Dh).map_err(|e| named("connect failed", e))?;
+    let query: std::collections::HashMap<&str, &str> = attributes
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let found = service
+        .search_items(query)
+        .map_err(|e| named("search failed", e))?;
+    match found.unlocked.len() + found.locked.len() {
+        0 => return Ok(None),
+        1 => {}
+        n => miette::bail!(
+            "secret service: {n} entries match the attribute set — refine it \
+             to one (ambiguous lookup, refusing)"
+        ),
+    }
+    let item = found
+        .unlocked
+        .into_iter()
+        .chain(found.locked)
+        .next()
+        .expect("exactly one match");
+    Ok(Some(read_item_secret(&item)?))
+}
+
+/// Read one item's secret, unlocking on demand (the login-keyring
+/// prompt flow). Named failures; the bytes never surface in errors (D8).
+fn read_item_secret(item: &dbus_secret_service::Item<'_>) -> miette::Result<Vec<u8>> {
+    if item
+        .is_locked()
+        .map_err(|e| miette::miette!("secret service: item lock state: {e}"))?
+    {
+        item.unlock()
+            .map_err(|e| miette::miette!("secret service: unlock failed: {e}"))?;
+    }
+    item.get_secret()
+        .map_err(|e| miette::miette!("secret service: could not read the secret: {e}"))
+}
+
+/// `libsecret`: map the attribute pairs (≥1 — the declaration validator
+/// enforces shape) onto an exact Secret Service item match. Missing
+/// entry = named failure, distinguishable from a transport failure by
+/// construction (`Ok(None)` is "no such entry"; anything else names the
+/// D-Bus error). Workstation-only caveat (survey §2): a headless host
+/// has no session bus/keyring and fails named, never partially.
+fn resolve_libsecret(key: &str, attributes: &BTreeMap<String, String>) -> miette::Result<String> {
+    match attribute_lookup(attributes)? {
+        Some(bytes) => libsecret_value(key, bytes),
+        None => miette::bail!(
+            "secret '{key}' (source 'libsecret'): no Secret Service entry \
+             matches the attribute set (headless hosts carry no session \
+             bus/keyring — ADR-0042 survey §2)"
+        ),
+    }
+}
+
+/// Bytes → value: UTF-8 and empty checks. The CONTENT is never part of
+/// a failure string (D8); stored verbatim — no trimming (unlike CLI
+/// stdout, a keyring secret is the bytes the writer chose).
+fn libsecret_value(key: &str, bytes: Vec<u8>) -> miette::Result<String> {
+    let value = String::from_utf8(bytes).map_err(|_| {
+        miette::miette!("secret '{key}' (source 'libsecret'): entry content is not UTF-8")
+    })?;
+    if value.is_empty() {
+        // D7: never an empty value.
+        miette::bail!("secret '{key}' (source 'libsecret'): entry content is empty")
+    }
+    Ok(value)
 }
 
 // ── The declaration hash (D3 cache key) ──
@@ -1188,6 +1384,10 @@ mod tests {
 
     #[test]
     fn exec_cache_hit_makes_zero_provider_calls() {
+        // The counting provider shells out to `cat` (an EXTERNAL command
+        // resolved via PATH), so the spawn window must exclude every
+        // env-mutating test (PATH swaps) — same ENV_LOCK discipline.
+        let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
         let counter = tmp.path().join("calls");
@@ -1294,7 +1494,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let saved_path = std::env::var("PATH").ok();
         std::env::set_var("PATH", &raw_path);
-        let resolved = resolve_exec_program(&pod, "K", "shadow");
+        let resolved = resolve_exec_program(&pod, "K", "exec", "shadow");
         match saved_path {
             Some(p) => std::env::set_var("PATH", p),
             None => std::env::remove_var("PATH"),
@@ -1317,7 +1517,7 @@ mod tests {
         std::env::set_var("PATH", &farm);
         let err = format!(
             "{}",
-            resolve_exec_program(&pod, "BW_ITEM", "bws").unwrap_err()
+            resolve_exec_program(&pod, "BW_ITEM", "exec", "bws").unwrap_err()
         );
         // (b) The symlink-escape form: an OUTSIDE PATH entry whose
         // binary links back into the pod root. The scrub passes the
@@ -1328,12 +1528,12 @@ mod tests {
         std::env::set_var("PATH", &outside);
         let err2 = format!(
             "{}",
-            resolve_exec_program(&pod, "BW_ITEM", "bws").unwrap_err()
+            resolve_exec_program(&pod, "BW_ITEM", "exec", "bws").unwrap_err()
         );
         // (c) The absolute-path form hits the refusal directly.
         let err3 = format!(
             "{}",
-            resolve_exec_program(&pod, "BW_ITEM", &tool).unwrap_err()
+            resolve_exec_program(&pod, "BW_ITEM", "exec", &tool).unwrap_err()
         );
         match saved_path {
             Some(p) => std::env::set_var("PATH", p),
@@ -1353,7 +1553,8 @@ mod tests {
         std::env::set_var("PATH", tmp.path());
         let err = format!(
             "{}",
-            resolve_exec_program(tmp.path(), "K", "definitely-not-on-path-183").unwrap_err()
+            resolve_exec_program(tmp.path(), "K", "exec", "definitely-not-on-path-183")
+                .unwrap_err()
         );
         match saved_path {
             Some(p) => std::env::set_var("PATH", p),
@@ -1439,6 +1640,10 @@ mod tests {
 
     #[test]
     fn refresh_busts_the_cache_and_rewrites_the_entry() {
+        // The counting provider shells out to `cat` (external, found
+        // via PATH) — hold ENV_LOCK so concurrent PATH swaps cannot
+        // break the provider spawn.
+        let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
         let counter = tmp.path().join("calls");
@@ -1839,8 +2044,8 @@ end'"#,
     // ── verbs: check ──
 
     /// A pod whose references cover all three check statuses: an
-    /// unavailable stub (bitwarden), a failing env var, and a working
-    /// exec provider.
+    /// unavailable stub (vault), a failing env var, and a working exec
+    /// provider.
     fn check_fixture() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let provider = script(
@@ -1854,9 +2059,9 @@ end'"#,
             &format!(
                 r#"pod {{
     secrets = {{
-        BW_ITEM  = {{ source = "bitwarden", id = "8848da48" }},
-        ENV_VAR  = {{ source = "env", var = "SHUTTLE_SECRETS_TEST_CHECK" }},
-        EXEC_VAR = {{ source = "exec", command = {{ "{provider}" }} }},
+        VAULT_ITEM = {{ source = "vault", mount = "secret", path = "app", field = "token" }},
+        ENV_VAR    = {{ source = "env", var = "SHUTTLE_SECRETS_TEST_CHECK" }},
+        EXEC_VAR   = {{ source = "exec", command = {{ "{provider}" }} }},
     }},
 }}
 "#
@@ -1874,11 +2079,11 @@ end'"#,
         let rows = check_pod(tmp.path(), "work").unwrap();
         assert_eq!(rows.len(), 3);
         let by_key = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
-        assert_eq!(by_key("BW_ITEM").status, "unavailable");
+        assert_eq!(by_key("VAULT_ITEM").status, "unavailable");
         assert!(
-            by_key("BW_ITEM").note.contains("#185"),
+            by_key("VAULT_ITEM").note.contains("#186"),
             "{}",
-            by_key("BW_ITEM").note
+            by_key("VAULT_ITEM").note
         );
         assert_eq!(by_key("ENV_VAR").status, "failed");
         assert!(
@@ -1902,7 +2107,11 @@ end'"#,
             .filter(|r| r.status == "failed")
             .map(|r| r.key.as_str())
             .collect();
-        assert_eq!(failed, Vec::<&str>::new(), "only BW_ITEM stays unavailable");
+        assert_eq!(
+            failed,
+            Vec::<&str>::new(),
+            "only VAULT_ITEM stays unavailable"
+        );
     }
 
     #[test]
@@ -1939,5 +2148,618 @@ end'"#,
             std::env::set_var("XDG_RUNTIME_DIR", dir);
         }
         assert_eq!(report.unwrap(), SecretsRefreshReport::default());
+    }
+
+    // ── bitwarden (issue #185): fake bws on the host PATH ──
+
+    /// Scoped (PATH, BWS_ACCESS_TOKEN) swap; restores on drop so a
+    /// failing assert cannot poison the process env for sibling tests
+    /// (every caller holds ENV_LOCK).
+    struct BwsEnv {
+        saved_path: Option<String>,
+        saved_token: Option<String>,
+    }
+
+    impl BwsEnv {
+        /// Put the fake bws dir FIRST on PATH (ambient PATH entries stay
+        /// — concurrent spawn-heavy tests must keep finding git/cat).
+        fn new(bws_dir: &Path, token: Option<&str>) -> Self {
+            let saved_path = std::env::var("PATH").ok();
+            let path = match &saved_path {
+                Some(p) => format!("{}:{}", bws_dir.display(), p),
+                None => bws_dir.display().to_string(),
+            };
+            std::env::set_var("PATH", &path);
+            let saved_token = std::env::var("BWS_ACCESS_TOKEN").ok();
+            match token {
+                Some(t) => std::env::set_var("BWS_ACCESS_TOKEN", t),
+                None => std::env::remove_var("BWS_ACCESS_TOKEN"),
+            }
+            Self {
+                saved_path,
+                saved_token,
+            }
+        }
+
+        /// Full PATH replacement — only for the not-found case, where
+        /// `bws` must be ABSENT from every entry.
+        fn path_without_bws(dir: &Path, token: Option<&str>) -> Self {
+            let saved_path = std::env::var("PATH").ok();
+            std::env::set_var("PATH", dir);
+            let saved_token = std::env::var("BWS_ACCESS_TOKEN").ok();
+            match token {
+                Some(t) => std::env::set_var("BWS_ACCESS_TOKEN", t),
+                None => std::env::remove_var("BWS_ACCESS_TOKEN"),
+            }
+            Self {
+                saved_path,
+                saved_token,
+            }
+        }
+    }
+
+    impl Drop for BwsEnv {
+        fn drop(&mut self) {
+            match self.saved_path.take() {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+            match self.saved_token.take() {
+                Some(t) => std::env::set_var("BWS_ACCESS_TOKEN", t),
+                None => std::env::remove_var("BWS_ACCESS_TOKEN"),
+            }
+        }
+    }
+
+    /// The fake bws: counts its call (the counting-provider pattern),
+    /// prints the canned body plus a trailing newline (the trim case),
+    /// exits with the given status. The body must not carry single
+    /// quotes (it is spliced into a shell literal).
+    fn bws_script(dir: &Path, body: &str, exit: u32, counter: Option<&Path>) -> String {
+        let count = match counter {
+            Some(c) => format!(
+                "n=$(cat {} 2>/dev/null || echo 0); echo $((n+1)) > {}; ",
+                c.display(),
+                c.display()
+            ),
+            None => String::new(),
+        };
+        script(
+            dir,
+            "bws",
+            &format!("{count}printf '%s\\n' '{body}'\nexit {exit}\n"),
+        )
+    }
+
+    fn bitwarden_ref(id: &str) -> SecretSource {
+        SecretSource::Bitwarden { id: id.to_string() }
+    }
+
+    fn bitwarden_refs(id: &str) -> BTreeMap<String, SecretSource> {
+        BTreeMap::from([("BW_TOKEN".to_string(), bitwarden_ref(id))])
+    }
+
+    #[test]
+    fn bitwarden_happy_path_extracts_the_json_value_field() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let counter = tmp.path().join("calls");
+        let body = format!(r#"{{"id":"8848da48","value":"{SENTINEL}"}}"#);
+        let _bws = bws_script(tmp.path(), &body, 0, Some(&counter));
+        let _env = BwsEnv::new(tmp.path(), Some("caller-token"));
+        let refs = bitwarden_refs("8848da48");
+        let values = resolve_references(
+            &pod,
+            "p",
+            3,
+            &refs,
+            Some(tmp.path().join("cache").as_path()),
+        )
+        .unwrap();
+        assert_eq!(values.get("BW_TOKEN").map(String::as_str), Some(SENTINEL));
+        assert_eq!(calls(&counter), 1, "exactly one bws invocation");
+    }
+
+    #[test]
+    fn bitwarden_calls_bws_with_the_exact_argv_shape() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let argv = tmp.path().join("argv");
+        let body = r#"{"value":"v"}"#;
+        script(
+            tmp.path(),
+            "bws",
+            &format!(
+                "printf '%s ' \"$@\" > {}\nprintf '%s\\n' '{body}'\n",
+                argv.display()
+            ),
+        );
+        let _env = BwsEnv::new(tmp.path(), Some("t"));
+        let refs = bitwarden_refs("8848da48-aa");
+        resolve_references(
+            &pod,
+            "p",
+            3,
+            &refs,
+            Some(tmp.path().join("cache").as_path()),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&argv).unwrap(),
+            "secret get 8848da48-aa ",
+            "`bws secret get <id>` — argv array, no shell, no extra words"
+        );
+    }
+
+    #[test]
+    fn bitwarden_interior_newlines_in_the_value_survive() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        // The \n inside the literal is the JSON escape: the parsed
+        // value carries the real newline (PEM shape). Only the stdout
+        // EDGES are trimmed.
+        let _bws = bws_script(tmp.path(), r#"{"value":"line1\nline2"}"#, 0, None);
+        let _env = BwsEnv::new(tmp.path(), Some("t"));
+        let refs = bitwarden_refs("x");
+        let values = resolve_references(
+            &pod,
+            "p",
+            3,
+            &refs,
+            Some(tmp.path().join("cache").as_path()),
+        )
+        .unwrap();
+        assert_eq!(
+            values.get("BW_TOKEN").map(String::as_str),
+            Some("line1\nline2")
+        );
+    }
+
+    #[test]
+    fn bitwarden_nonzero_exit_fails_named_and_suppresses_stderr() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        // The failing fake leaks the sentinel on BOTH stderr and
+        // stdout — neither may reach our error (D8).
+        script(
+            tmp.path(),
+            "bws",
+            &format!("printf '{SENTINEL}' >&2\nprintf '{SENTINEL}'\nexit 3\n"),
+        );
+        let _env = BwsEnv::new(tmp.path(), Some("t"));
+        let refs = bitwarden_refs("8848da48");
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("secret 'BW_TOKEN'"), "{err}");
+        assert!(err.contains("source 'bitwarden'"), "{err}");
+        assert!(err.contains("exited with"), "{err}");
+        assert!(err.contains("3"), "exit status not named: {err}");
+        assert!(!err.contains(SENTINEL), "provider output leaked: {err}");
+    }
+
+    #[test]
+    fn bitwarden_malformed_json_fails_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let _bws = bws_script(tmp.path(), "not json at all", 0, None);
+        let _env = BwsEnv::new(tmp.path(), Some("t"));
+        let refs = bitwarden_refs("x");
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("valid JSON"), "{err}");
+        assert!(err.contains("source 'bitwarden'"), "{err}");
+    }
+
+    #[test]
+    fn bitwarden_missing_value_field_fails_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let _bws = bws_script(tmp.path(), r#"{"id":"8848"}"#, 0, None);
+        let _env = BwsEnv::new(tmp.path(), Some("t"));
+        let refs = bitwarden_refs("x");
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("no '.value'"), "{err}");
+    }
+
+    #[test]
+    fn bitwarden_non_string_value_fails_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let _bws = bws_script(tmp.path(), r#"{"value":42}"#, 0, None);
+        let _env = BwsEnv::new(tmp.path(), Some("t"));
+        let refs = bitwarden_refs("x");
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("not a string"), "{err}");
+    }
+
+    #[test]
+    fn bitwarden_empty_value_fails_named_never_an_empty_secret() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let _bws = bws_script(tmp.path(), r#"{"value":""}"#, 0, None);
+        let _env = BwsEnv::new(tmp.path(), Some("t"));
+        let refs = bitwarden_refs("x");
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn bitwarden_missing_token_fails_named_before_bws_runs() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let counter = tmp.path().join("calls");
+        let body = format!(r#"{{"value":"{SENTINEL}"}}"#);
+        let _bws = bws_script(tmp.path(), &body, 0, Some(&counter));
+        let _env = BwsEnv::new(tmp.path(), None);
+        let refs = bitwarden_refs("8848da48");
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("BWS_ACCESS_TOKEN"), "{err}");
+        assert!(err.contains("not set"), "{err}");
+        assert!(
+            !counter.is_file(),
+            "the counter stays unwritten — bws must not run without a token"
+        );
+        assert!(!err.contains(SENTINEL), "{err}");
+    }
+
+    #[test]
+    fn bitwarden_empty_token_fails_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let _bws = bws_script(tmp.path(), r#"{"value":"v"}"#, 0, None);
+        let _env = BwsEnv::new(tmp.path(), Some(""));
+        let refs = bitwarden_refs("x");
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("BWS_ACCESS_TOKEN"), "{err}");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn bitwarden_bws_missing_from_the_host_path_fails_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let empty = tempfile::tempdir().unwrap();
+        let _env = BwsEnv::path_without_bws(empty.path(), Some("t"));
+        let refs = bitwarden_refs("x");
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("not found on the host PATH"), "{err}");
+        assert!(err.contains("'bws'"), "{err}");
+        assert!(err.contains("source 'bitwarden'"), "{err}");
+    }
+
+    // ── libsecret (issue #185): the Secret Service seam fake ──
+
+    /// In-memory stand-in for the session-bus keyring, keyed by the
+    /// EXACT attribute map. ENV_LOCK serializes all users.
+    static FAKE_STORE: Mutex<BTreeMap<BTreeMap<String, String>, Vec<u8>>> =
+        Mutex::new(BTreeMap::new());
+
+    fn fake_lookup(attributes: &BTreeMap<String, String>) -> miette::Result<Option<Vec<u8>>> {
+        Ok(FAKE_STORE.lock().unwrap().get(attributes).cloned())
+    }
+
+    fn failing_lookup(_attributes: &BTreeMap<String, String>) -> miette::Result<Option<Vec<u8>>> {
+        miette::bail!("secret service: bus hole (injected transport failure)")
+    }
+
+    /// Swap the seam; returns the previous fn for restoration.
+    fn reseat_lookup(f: AttributeLookup) -> AttributeLookup {
+        let mut seam = SECRET_SERVICE_LOOKUP.lock().unwrap();
+        std::mem::replace(&mut *seam, f)
+    }
+
+    fn seed_fake_store(pairs: &[(&str, &str)], value: &[u8]) -> BTreeMap<String, String> {
+        let map: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        FAKE_STORE
+            .lock()
+            .unwrap()
+            .insert(map.clone(), value.to_vec());
+        map
+    }
+
+    fn libsecret_ref(pairs: &[(&str, &str)]) -> SecretSource {
+        SecretSource::Libsecret {
+            attributes: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn libsecret_set_then_resolve_round_trips_through_the_seam() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let attrs = seed_fake_store(&[("bitwarden", "sm-access-token")], SENTINEL.as_bytes());
+        let previous = reseat_lookup(fake_lookup);
+        let refs = BTreeMap::from([(
+            "LS_TOKEN".to_string(),
+            SecretSource::Libsecret { attributes: attrs },
+        )]);
+        let values = resolve_references(
+            &pod,
+            "p",
+            3,
+            &refs,
+            Some(tmp.path().join("cache").as_path()),
+        )
+        .unwrap();
+        reseat_lookup(previous);
+        FAKE_STORE.lock().unwrap().clear();
+        assert_eq!(
+            values.get("LS_TOKEN").map(String::as_str),
+            Some(SENTINEL),
+            "the setup-bws interop shape reads back through the seam"
+        );
+    }
+
+    #[test]
+    fn libsecret_missing_entry_fails_named_and_distinct_from_transport() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let previous = reseat_lookup(fake_lookup);
+        // (a) No such entry — the store is empty.
+        let refs = BTreeMap::from([(
+            "LS_TOKEN".to_string(),
+            libsecret_ref(&[("bitwarden", "no-such-token")]),
+        )]);
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("no Secret Service entry matches"), "{err}");
+        assert!(err.contains("LS_TOKEN"), "{err}");
+        assert!(err.contains("source 'libsecret'"), "{err}");
+        // (b) Transport failure — a DIFFERENT named failure.
+        reseat_lookup(failing_lookup);
+        let refs = BTreeMap::from([(
+            "LS_TOKEN".to_string(),
+            libsecret_ref(&[("bitwarden", "sm-access-token")]),
+        )]);
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        reseat_lookup(previous);
+        FAKE_STORE.lock().unwrap().clear();
+        assert!(err.contains("bus hole"), "{err}");
+        assert!(!err.contains("no Secret Service entry"), "{err}");
+    }
+
+    #[test]
+    fn libsecret_non_utf8_and_empty_content_fail_named_without_the_content() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pod = pod_state_root(tmp.path());
+        let previous = reseat_lookup(fake_lookup);
+        let non_utf8 = seed_fake_store(&[("k", "non-utf8")], &[0xff, 0xfe]);
+        let refs = BTreeMap::from([(
+            "LS_TOKEN".to_string(),
+            SecretSource::Libsecret {
+                attributes: non_utf8,
+            },
+        )]);
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("not UTF-8"), "{err}");
+        let empty = seed_fake_store(&[("k", "empty")], &[]);
+        let refs = BTreeMap::from([(
+            "LS_TOKEN".to_string(),
+            SecretSource::Libsecret { attributes: empty },
+        )]);
+        let err = format!(
+            "{}",
+            resolve_references(
+                &pod,
+                "p",
+                3,
+                &refs,
+                Some(tmp.path().join("cache").as_path())
+            )
+            .unwrap_err()
+        );
+        reseat_lookup(previous);
+        FAKE_STORE.lock().unwrap().clear();
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    /// Live-bus gate: SHUTTLE_SECRETS_LIVE_DBUS=1 opts into a REAL
+    /// session bus + unlocked keyring. Writes a uniquely-attributed
+    /// item, reads it back through the PRODUCTION seam fn, deletes it.
+    #[test]
+    fn live_dbus_secret_service_round_trip_when_gated_on() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        if std::env::var("SHUTTLE_SECRETS_LIVE_DBUS").as_deref() != Ok("1") {
+            return;
+        }
+        use dbus_secret_service::{EncryptionType, SecretService};
+        let attrs: BTreeMap<String, String> = BTreeMap::from([
+            ("shuttle-test".to_string(), "issue-185".to_string()),
+            ("nonce".to_string(), std::process::id().to_string()),
+        ]);
+        let pairs: std::collections::HashMap<&str, &str> = attrs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let service = SecretService::connect(EncryptionType::Dh).unwrap();
+        let collection = service.get_default_collection().unwrap();
+        let item = collection
+            .create_item(
+                "shuttle issue-185 live test",
+                pairs,
+                SENTINEL.as_bytes(),
+                true,
+                "text/plain",
+            )
+            .unwrap();
+        let found = secret_service_lookup(&attrs).unwrap();
+        item.delete().unwrap();
+        assert_eq!(found.as_deref(), Some(SENTINEL.as_bytes()));
+    }
+
+    // ── pod secrets check end-to-end (issue #185 scope 5) ──
+
+    /// One pod, three sources: bitwarden resolves through the fake bws,
+    /// libsecret through the seam fake, vault stays unavailable (#186).
+    /// The CLI maps this row set to exit 1.
+    #[test]
+    fn check_pod_end_to_end_bitwarden_libsecret_ok_vault_unavailable_exit_1() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_pod(
+            tmp.path(),
+            "work",
+            r#"pod {
+    secrets = {
+        BW_ITEM    = { source = "bitwarden", id = "8848da48" },
+        LS_TOKEN   = { source = "libsecret", attributes = { bitwarden = "sm-access-token" } },
+        VAULT_ITEM = { source = "vault", mount = "secret", path = "app", field = "token" },
+    },
+}
+"#,
+        );
+        activate(tmp.path(), "work");
+        let body = format!(r#"{{"value":"{SENTINEL}"}}"#);
+        let _bws = bws_script(tmp.path(), &body, 0, None);
+        let _env = BwsEnv::new(tmp.path(), Some("caller-token"));
+        let previous = reseat_lookup(fake_lookup);
+        seed_fake_store(&[("bitwarden", "sm-access-token")], b"ring-stored");
+        let rows = check_pod(tmp.path(), "work").unwrap();
+        reseat_lookup(previous);
+        FAKE_STORE.lock().unwrap().clear();
+        let by_key = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
+        assert_eq!(by_key("BW_ITEM").status, "ok");
+        assert_eq!(by_key("LS_TOKEN").status, "ok");
+        assert_eq!(by_key("VAULT_ITEM").status, "unavailable");
+        assert!(
+            by_key("VAULT_ITEM").note.contains("#186"),
+            "{}",
+            by_key("VAULT_ITEM").note
+        );
+        assert!(!check_healthy(&rows), "this row set is the exit-1 shape");
+        // Neither resolved value reaches any check output (D8).
+        let text = render_check_rows("work", &rows);
+        assert!(!text.contains(SENTINEL), "bitwarden value leaked: {text}");
+        assert!(
+            !text.contains("ring-stored"),
+            "keyring value leaked: {text}"
+        );
     }
 }
