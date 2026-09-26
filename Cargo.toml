@@ -68,6 +68,12 @@ full_moon = { version = "2", features = ["luau"] }
 # lock_api/scopeguard/log were already vendored via pgp/tempfile, and
 # libc only bumps. No tokio, no hyper.
 mdns-sd = "0.21"
+# Floor-tool self-provisioning (issue #101 disposition (c), src/tools.rs):
+# native HTTPS for fetching pinned tool binaries — the provisioner must not
+# depend on the curl it provisions. rustls TLS (`tls` feature, webpki roots
+# bundled — no reliance on the host trust store); the gzip/json/charset
+# defaults are dead weight for streaming raw binaries — off.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [build-dependencies]
 # Luau analyzer build (see build.rs + shim/): upstream C++ compiled with cc.

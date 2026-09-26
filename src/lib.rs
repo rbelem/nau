@@ -43,5 +43,6 @@ pub mod sign;
 pub mod slot_recovery;
 pub mod snap;
 pub mod store;
+pub mod tools;
 pub mod uc;
 pub mod units;

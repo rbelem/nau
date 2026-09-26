@@ -1,0 +1,27 @@
+# Floor-tool manifest (issue #101 disposition (c)): the tools shuttle
+# self-provisions so the pod surface works from a plain login shell.
+#
+# Threat model: root of trust is the git repo, same as the shuttle binary
+# itself. sha256 pins bytes, not provenance.
+#
+# tools_version is monotonic — bump on any tool-set change; installed sets
+# live under <tools_root>/<tools_version>/bin/ and the `current` pointer
+# names the active set. `signature` is reserved for future manifest
+# signing (out of scope for #101). `min_kernel` is advisory — doctor
+# warns, never hard-fails; the functional probe is the real gate.
+#
+# One entry per tool, e.g.:
+#
+# [[tools]]
+# name = "mksquashfs"                # mksquashfs | unsquashfs | bwrap | tar | curl
+# version = "4.7.2"
+# triple = "x86_64-linux-musl"
+# url = "https://example.invalid/shuttle-tools/1/mksquashfs-x86_64-linux-musl"
+# sha256_hex = "64 hex chars over the exact artifact bytes"
+# source_url = "https://example.invalid/source"   # license/source offer
+# license = "GPL-2.0+"
+# precedence = "provisioned-first"   # provisioned-first (default) | path-first (curl)
+tools_version = 1
+# min_kernel = "5.10"
+# signature = ""
+tools = []
