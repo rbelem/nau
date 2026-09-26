@@ -1,10 +1,15 @@
 # ADR-0042: Pod secret sources
 
 Status: Accepted (2026-09-26). Four-seat council review the same day:
-unanimous accept-with-changes; every required change is incorporated
-below, including the two that would have made D3 false as originally
-drafted (the services rotation mechanism and the reboot story). Input:
-the 2026-09-24 grill proposal
+unanimous accept-with-changes; every council-required change is
+incorporated below. One mechanism the council left split was resolved
+by the ratification run, not by council consensus: the services
+rotation mechanism is the refresh verb (Decision 3), not the
+envfile-digest-into-unit_hash option two seats had leaned toward — the
+rationale is recorded in Alternatives. The decisive council findings
+that would otherwise have made D3 false as originally drafted were the
+services rotation mechanism itself and the reboot story. Input: the
+2026-09-24 grill proposal
 (`.planning/grill-input-2026-09-24-pod-secrets.md`) and its landscape
 survey (`.planning/research/secret-manager-survey-2026-09-24.md`). The
 draft ADR number in those documents (0040) was taken by the distributed
