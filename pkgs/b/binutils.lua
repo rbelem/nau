@@ -29,6 +29,15 @@ archives, and binaries. This build targets x86_64-linux-gnu.]],
             -- across packages and conflicts (gmp/m4 precedent). Strip it so
             -- prefix merging stays content-identical.
             "find $STAGE -name 'dir' -path '*/share/info/*' -delete",
+            -- The triplet-prefixed tools belong to the gcc deb set in a
+            -- merged prefix (gcc.lua owns the x86_64-linux-gnu tool
+            -- namespace: binutils-x86-64-linux-gnu.deb IS the triplet
+            -- toolchain there) — staging this source build's own copies
+            -- content-conflicts with them (different builds, same
+            -- paths, #215 podman prefix merge). The plain names stay;
+            -- the meta's staged tree symlinks plain → prefixed, which
+            -- keeps resolving against the deb payload.
+            "rm -f $STAGE/usr/bin/x86_64-linux-gnu-*",
         }, " && "),
 
         -- The five libtool archives (libsframe/libbfd/libopcodes/libctf/
