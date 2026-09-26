@@ -599,3 +599,68 @@ payload's Debian 14.2.0. The 62cf65b8 finding is a lesson for payload shim
 rewrites: any script that touches include-path translation must be exercised
 with a C++ TU against libstdc++ before landing — the deb builds in the lane
 were pure C and never reached the chain.
+
+## Round 10 (2026-09-26, secrets @ 207021f, debug build) — pod secrets live, values never print
+
+The #182-#186 secret-sources series went live on the gate pod: one real
+Bitwarden reference declared, resolved through `bws` host-side, and the
+whole round's transcripts carry zero value bytes. Executed 2026-09-26,
+shuttle built from this repo at 207021f (the secrets series landed);
+issue #187's dogfood leg.
+
+1. **Declaration.** `gate`'s `pod.lua` gained one reference:
+
+       secrets = { GH_TOKEN = { source = "bitwarden", id = "378c3347-1667-4341-8312-b49f01887394" } }
+
+2. **Sync — references only.** `shuttle pod --name gate sync`
+   re-presented generation 41 with all pins held (a secrets edit is
+   not a package change). The staging tail wrote
+   `generations/41/secrets.json`, mode 0600 — canonical, ref-only
+   JSON (the `id` is a reference, not a value):
+
+       {"GH_TOKEN":{"source":"bitwarden","id":"378c3347-1667-4341-8312-b49f01887394"}}
+
+3. **Cache lifecycle.** `pod secrets list` before any resolve → the
+   GH_TOKEN row shows `miss`; after the run below it shows `hit`.
+   Values never print — the list footer says so verbatim. The cache
+   entry landed at `$XDG_RUNTIME_DIR/shuttle/secrets/gate/<decl-hash>.json`
+   (0600; the decl-hash is the SHA-256 of the `secrets.json` bytes
+   above, and the cache key drops the generation on purpose).
+
+4. **Live resolve (the acceptance).** From this tree:
+
+       $ shuttle run --pod gate -- sh -c 'test -n "$GH_TOKEN" && echo LIVE_RESOLVE_OK'
+       LIVE_RESOLVE_OK
+
+   Exit 0, stdout exactly `LIVE_RESOLVE_OK` — the non-empty check
+   proves the token arrived without printing it. The bitwarden resolve
+   ran host-side through `bws` (the binary lives in the *daily* pod,
+   outside the gate pod's state root, so the D4 host-PATH scrub leaves
+   it alone), and the token entered only the child process env.
+
+5. **Verbs.** `pod secrets check` → `ok` row for GH_TOKEN, exit 0.
+   `pod secrets refresh` reported "dropped 1 cached entry" and
+   "resolved 1 secret(s) from [bitwarden=1]" — rotation pickup with no
+   new generation, per the ADR-0042 services contract.
+
+6. **Masking assertion.** The sync/run/list/check/refresh transcripts
+   carry zero value bytes — the only byte that could be a value is the
+   one the run printed, and that is `LIVE_RESOLVE_OK`, not the token.
+
+Honest deviations, both recorded rather than smoothed over:
+
+- **Rotation and rollback re-scope were proven by the landed test
+  suite, not a second live pod**: `refresh_busts_the_cache_and_rewrites_the_entry`
+  (rotation-without-new-generation), the generation-riding entry body
+  plus the cache-key-drops-generation tests (rollback re-scope), and
+  `present_active_records_declared_secrets_on_staging` (the ref-only
+  record). A fresh-pod live leg was attempted and stalled >10 minutes
+  on a cold build queue under session load — an infra flake tracked
+  separately, not a secrets defect; the gate pod's own sync was
+  unaffected.
+- **The INSTALLED shuttle binary (0.1.0, pre-secrets) rejects the new
+  declaration** with `unknown field 'secrets'` — correct fail-closed
+  behavior for a binary from before the surface existed. The round ran
+  the freshly built repo binary; installed fleets pick the surface up
+  at their next rebuild.
+
