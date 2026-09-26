@@ -1,0 +1,134 @@
+# Tools artifacts — builds shuttle's self-provisioned floor tools
+# (issue #101, disposition (c)) as musl-static x86_64 binaries and attaches
+# them to releases with a generated sha256 manifest + source-offer bundle.
+#
+# Jobs:
+#   build   — one matrix leg per tool via recipes/tools/build-tool.sh
+#             (pinned-digest Alpine container; static + version gates live
+#             in the recipe). Uploads one artifact per tool.
+#   publish — downloads the built tools, generates tools-manifest.toml from
+#             pins.conf + artifact bytes, packages the source-offer bundle
+#             (upstream tarballs + recipes), uploads CI artifacts, and on a
+#             release publish attaches everything with `gh release upload`.
+#
+# No repo secrets: release attach uses the default GITHUB_TOKEN, which only
+# needs `contents: write` — granted to the publish job alone. Dispatch runs
+# produce identical outputs minus the release attach.
+
+name: tools-artifacts
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tools-artifacts-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [squashfs-tools, bubblewrap, tar, curl]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Build ${{ matrix.tool }} (musl-static, gated)
+        run: |
+          recipes/tools/build-tool.sh \
+            '${{ matrix.tool }}' \
+            '${{ runner.temp }}/downloads' \
+            '${{ runner.temp }}/out'
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tool-${{ matrix.tool }}
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # release attach only; GITHUB_TOKEN, no repo secrets
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download built tools
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: tool-*
+          merge-multiple: true
+          path: tools-out
+
+      - name: Read tools_version from pins.conf
+        id: ver
+        run: |
+          v=$(sed -n 's/^TOOLS_VERSION=//p' recipes/tools/pins.conf | tr -d '[:space:]')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          test -n "$v"
+
+      # Re-fetching (and re-verifying against pins.conf) here instead of
+      # passing tarballs between jobs: the source-offer bundle must ship
+      # bytes whose hashes were checked against the same pins the manifest
+      # records — one verify path, not two.
+      - name: Fetch pinned sources (sha256-verified)
+        run: recipes/tools/build-tool.sh fetch '${{ runner.temp }}/downloads'
+
+      - name: Generate tools-manifest.toml
+        run: |
+          prefix='https://github.com/${{ github.repository }}/releases/download'
+          # A dispatch run has no release yet: point the manifest's url field
+          # at the tools-v<N> convention; the release publish regenerates it
+          # with the real attachment base.
+          if [ '${{ github.event_name }}' = 'release' ]; then
+            prefix="$prefix/${{ github.event.release.tag_name }}"
+          else
+            prefix="$prefix/tools-v${{ steps.ver.outputs.version }}"
+          fi
+          recipes/tools/gen-manifest.sh \
+            '${{ steps.ver.outputs.version }}' \
+            tools-out tools-manifest.toml "$prefix"
+          cat tools-manifest.toml
+
+      - name: Package source-offer bundle
+        run: |
+          mkdir -p src-offer/recipes
+          cp -R recipes/tools/. src-offer/recipes/
+          cp '${{ runner.temp }}/downloads'/* src-offer/
+          # Hashes written outside src-offer, then moved in: the hashing
+          # pipeline must not write into the tree it reads.
+          (cd src-offer && find . -type f -print0 \
+            | sort -z | xargs -0 sha256sum) > checksums.txt
+          mv checksums.txt src-offer/SHA256SUMS
+          tar -czf "tools-source-offer-v${{ steps.ver.outputs.version }}.tar.gz" src-offer
+
+      - name: Upload manifest + source offer (workflow artifacts)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tools-release-bundle
+          path: |
+            tools-manifest.toml
+            tools-source-offer-v*.tar.gz
+          if-no-files-found: error
+
+      - name: Attach tools to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload '${{ github.event.release.tag_name }}' \
+            tools-out/* tools-manifest.toml \
+            "tools-source-offer-v${{ steps.ver.outputs.version }}.tar.gz" \
+            --clobber --repo '${{ github.repository }}'
