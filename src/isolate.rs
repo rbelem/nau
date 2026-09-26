@@ -133,6 +133,11 @@ pub struct WorkerOk {
     pub outputs: BTreeMap<String, Value>,
     /// The global `inputs` table, serialized to JSON.
     pub global_inputs: Value,
+    /// The global `workers` table, serialized to JSON. Shape validation
+    /// happens in the parent's re-extraction, so both eval paths share
+    /// one parser (the `inputs` precedent).
+    #[serde(default = "serde_json::Value::default")]
+    pub workers: Value,
     /// Warn-and-continue diagnostics (per-output extraction skips).
     pub diagnostics: Vec<String>,
 }
@@ -994,6 +999,24 @@ fn extract_inputs_json(lua: &mlua::Lua) -> Result<Value, String> {
     }
 }
 
+/// Extract the global `workers` table to JSON, mirroring the in-process
+/// `extract_workers_from_lua` semantics (including error messages). The
+/// mixed shape (array part = worker entries, `local_jobs` hash key = the
+/// coordinator's own slot count) rides through verbatim; shape
+/// validation happens in the parent's re-extraction, so both eval paths
+/// share one parser.
+fn extract_workers_json(lua: &mlua::Lua) -> Result<Value, String> {
+    let value: mlua::Value = lua.globals().get("workers").unwrap_or(mlua::Value::Nil);
+    match value {
+        mlua::Value::Nil => Ok(serde_json::json!([])),
+        mlua::Value::Table(t) => lua_to_json(&mlua::Value::Table(t)),
+        other => Err(format!(
+            "'workers' must be a table, got {}",
+            other.type_name()
+        )),
+    }
+}
+
 /// Serialize an mlua value to JSON. Tables must be array-shaped (1..=n
 /// integer keys) or string-keyed maps; functions/userdata and cycles are
 /// errors (they become per-output "skipping" diagnostics).
@@ -1088,6 +1111,11 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
         Err(e) => return fatal(vec![e.to_string()]),
     };
 
+    let workers = match extract_workers_json(&lua) {
+        Ok(v) => v,
+        Err(e) => return fatal(vec![e.to_string()]),
+    };
+
     let mlua::Value::Table(table) = &result else {
         return fatal(vec![format!(
             "must return a table of outputs, got {}",
@@ -1123,6 +1151,7 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
     WorkerOutcome::Ok(WorkerOk {
         outputs,
         global_inputs: inputs,
+        workers,
         diagnostics,
     })
 }

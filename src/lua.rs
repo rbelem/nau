@@ -106,6 +106,333 @@ impl NodeConfig {
 /// schema.
 const NODE_MARKER: &str = "_node";
 
+/// The `workers` config surface (ADR-0040 Decision 3): the coordinator's
+/// own slot count plus the Worker entries, declared as one global table
+/// in `shuttle.lua` — the array part holds the entries, the
+/// `local_jobs` hash key holds the slot count. Absent entirely means
+/// zero behavior change: no SSH, no sockets, no new code paths.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkersConfig {
+    /// The coordinator's own build slots (today's
+    /// `build_sched::MAX_PARALLEL_BUILD_WORKERS`, now config-driven).
+    #[serde(default = "default_local_jobs")]
+    pub local_jobs: u32,
+    /// The Worker entries, in declaration order.
+    #[serde(default)]
+    pub workers: Vec<WorkerConfig>,
+}
+
+/// One Worker entry: where to reach it, how many concurrent jobs it
+/// takes, and the arch override when the preflight probe must not be
+/// trusted to match (ADR-0040 Decision 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerConfig {
+    /// `ssh://[user@]host[:port]`.
+    pub address: String,
+    /// Max concurrent jobs on this machine (default 2).
+    #[serde(default = "default_worker_jobs")]
+    pub jobs: u32,
+    /// GNU triplet override; probed via `__worker-cap` at preflight
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+}
+
+fn default_local_jobs() -> u32 {
+    crate::build_sched::MAX_PARALLEL_BUILD_WORKERS as u32
+}
+
+fn default_worker_jobs() -> u32 {
+    2
+}
+
+impl Default for WorkersConfig {
+    fn default() -> Self {
+        WorkersConfig {
+            local_jobs: default_local_jobs(),
+            workers: Vec::new(),
+        }
+    }
+}
+
+/// Validate one `ssh://[user@]host[:port]` worker address (ADR-0040
+/// Decision 3's grammar: integer port 1-65535, non-empty host, the host
+/// must never begin with `-` so an address cannot inject ssh options
+/// into the CommandRunner-wrapped argv, no whitespace, IPv6 bracket
+/// form accepted).
+fn validate_worker_address(raw: &str) -> miette::Result<()> {
+    let rest = raw
+        .strip_prefix("ssh://")
+        .ok_or_else(|| miette::miette!("address must start with ssh://, got '{raw}'"))?;
+    if rest.is_empty() {
+        return Err(miette::miette!("address has an empty host: '{raw}'"));
+    }
+    if rest.contains(char::is_whitespace) {
+        return Err(miette::miette!(
+            "address must not contain whitespace: '{raw}'"
+        ));
+    }
+    let (host, port) = split_authority(rest, raw)?;
+    validate_host_port(host, port, raw)
+}
+
+/// Split `[user@]host[:port]`, honoring the IPv6 bracket form.
+fn split_authority<'a>(rest: &'a str, raw: &str) -> miette::Result<(&'a str, Option<&'a str>)> {
+    let host_port = match rest.rsplit_once('@') {
+        Some((user, hp)) => {
+            if user.is_empty() || user.starts_with('-') || user.contains('[') {
+                return Err(miette::miette!("address has an invalid user part: '{raw}'"));
+            }
+            hp
+        }
+        None => rest,
+    };
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        let (h, after) = bracketed
+            .split_once(']')
+            .ok_or_else(|| miette::miette!("address has an unterminated IPv6 bracket: '{raw}'"))?;
+        match after.strip_prefix(':') {
+            Some(p) => Ok((h, Some(p))),
+            None if after.is_empty() => Ok((h, None)),
+            None => Err(miette::miette!(
+                "unexpected characters after IPv6 bracket: '{raw}'"
+            )),
+        }
+    } else {
+        Ok(match host_port.rsplit_once(':') {
+            Some((h, p)) => {
+                if h.contains(':') {
+                    return Err(miette::miette!(
+                        "IPv6 addresses must use the bracket form [addr]:port: '{raw}'"
+                    ));
+                }
+                (h, Some(p))
+            }
+            None => {
+                if host_port.contains(':') {
+                    return Err(miette::miette!(
+                        "IPv6 addresses must use the bracket form [addr]:port: '{raw}'"
+                    ));
+                }
+                (host_port, None)
+            }
+        })
+    }
+}
+
+/// The host half and the 1-65535 port half of a validated address.
+fn validate_host_port(host: &str, port: Option<&str>, raw: &str) -> miette::Result<()> {
+    if host.is_empty() || host.starts_with('-') {
+        return Err(miette::miette!(
+            "address host must be non-empty and must not start with '-': '{raw}'"
+        ));
+    }
+    if let Some(p) = port {
+        let n: u16 = p
+            .parse()
+            .map_err(|_| miette::miette!("address port must be an integer 1-65535: '{raw}'"))?;
+        if n == 0 {
+            return Err(miette::miette!("address port must be 1-65535: '{raw}'"));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a required positive integer out of a Lua value (Lua numbers
+/// are floats; 2.0 is an integer, 2.5 and -1 are not).
+fn parse_positive_int(value: &mlua::Value, field: &str) -> miette::Result<u32> {
+    let n = match value {
+        mlua::Value::Integer(i) => i64::from(*i),
+        mlua::Value::Number(f) if f.fract() == 0.0 => *f as i64,
+        other => {
+            return Err(miette::miette!(
+                "field '{field}' must be an integer, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    if n < 1 {
+        return Err(miette::miette!(
+            "field '{field}' must be an integer >= 1, got {n}"
+        ));
+    }
+    u32::try_from(n).map_err(|_| miette::miette!("field '{field}' value {n} is out of range"))
+}
+
+impl WorkersConfig {
+    /// Convert from the raw `workers` global table. Unknown fields are
+    /// rejected fail-closed; one named miette diagnostic per malformed
+    /// shape, naming the field and the entry index.
+    pub fn from_lua_value(value: &mlua::Value) -> miette::Result<Self> {
+        const KNOWN_FIELDS: &str = "known keys: local_jobs; array entries take address, jobs, arch";
+        let mlua::Value::Table(table) = value else {
+            return Err(miette::miette!(
+                "'workers' must be a table, got {}",
+                value.type_name()
+            ));
+        };
+        let mut cfg = WorkersConfig::default();
+        // Entries arrive with their 1-based declaration index as the key
+        // (integer or string digit — Luau hash iteration order is
+        // otherwise not stable), so collect and sort to restore the
+        // declared order before the duplicate check.
+        let mut entries: Vec<(usize, WorkerConfig)> = Vec::new();
+        for pair in table.pairs::<mlua::Value, mlua::Value>() {
+            let (key, val) = pair.map_err(|e| miette::miette!("workers entry: {e}"))?;
+            match key {
+                mlua::Value::String(s) => {
+                    let field = s
+                        .to_str()
+                        .map_err(|e| miette::miette!("workers: key name: {e}"))?
+                        .to_string();
+                    // Luau's pairs() yields array entries with string
+                    // digit keys — a numeric key is a worker entry, no
+                    // matter how the VM surfaced it.
+                    if let Ok(idx) = field.parse::<usize>() {
+                        if idx == 0 {
+                            return Err(miette::miette!(
+                                "workers: array indices are 1-based, got key '{field}'"
+                            ));
+                        }
+                        entries.push((idx, parse_worker_entry(&val, idx)?));
+                    } else if field == "local_jobs" {
+                        cfg.local_jobs = parse_positive_int(&val, "local_jobs")
+                            .map_err(|e| miette::miette!("workers: {e}"))?;
+                    } else {
+                        return Err(miette::miette!(
+                            "workers: unknown key '{field}' ({KNOWN_FIELDS})"
+                        ));
+                    }
+                }
+                mlua::Value::Integer(i) => {
+                    let idx = usize::try_from(i)
+                        .map_err(|_| miette::miette!("workers: negative array index"))?;
+                    if idx == 0 {
+                        return Err(miette::miette!(
+                            "workers: array indices are 1-based, got key '{i}'"
+                        ));
+                    }
+                    entries.push((idx, parse_worker_entry(&val, idx)?));
+                }
+                other => {
+                    return Err(miette::miette!(
+                        "workers: keys must be strings or array indices, got {}",
+                        other.type_name()
+                    ));
+                }
+            }
+        }
+        entries.sort_by_key(|(idx, _)| *idx);
+        for (idx, worker) in entries {
+            if cfg.workers.iter().any(|w| w.address == worker.address) {
+                return Err(miette::miette!(
+                    "workers[{idx}]: duplicate address '{}'",
+                    worker.address
+                ));
+            }
+            cfg.workers.push(worker);
+        }
+        Ok(cfg)
+    }
+}
+
+/// Parse one array entry of the `workers` table.
+fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<WorkerConfig> {
+    const KNOWN: &str = "known fields: address, jobs, arch";
+    let mlua::Value::Table(table) = value else {
+        return Err(miette::miette!(
+            "workers[{index}] must be a table, got {}",
+            value.type_name()
+        ));
+    };
+    let mut address: Option<String> = None;
+    let mut jobs = default_worker_jobs();
+    let mut arch: Option<String> = None;
+    for pair in table.pairs::<mlua::Value, mlua::Value>() {
+        let (key, val) = pair.map_err(|e| miette::miette!("workers[{index}] entry: {e}"))?;
+        let field = match &key {
+            mlua::Value::String(s) => s
+                .to_str()
+                .map_err(|e| miette::miette!("workers[{index}]: field name: {e}"))?
+                .to_string(),
+            other => {
+                return Err(miette::miette!(
+                    "workers[{index}]: field names must be strings, got {}",
+                    other.type_name()
+                ))
+            }
+        };
+        match field.as_str() {
+            "address" => {
+                let a = match &val {
+                    mlua::Value::String(s) => s
+                        .to_str()
+                        .map_err(|e| miette::miette!("workers[{index}]: field 'address': {e}"))?
+                        .to_string(),
+                    other => {
+                        return Err(miette::miette!(
+                            "workers[{index}]: field 'address' must be a string, got {}",
+                            other.type_name()
+                        ))
+                    }
+                };
+                validate_worker_address(&a)
+                    .map_err(|e| miette::miette!("workers[{index}]: field 'address': {e}"))?;
+                address = Some(a);
+            }
+            "jobs" => {
+                jobs = parse_positive_int(&val, "jobs")
+                    .map_err(|e| miette::miette!("workers[{index}]: {e}"))?;
+            }
+            "arch" => {
+                let a = match &val {
+                    mlua::Value::String(s) => s
+                        .to_str()
+                        .map_err(|e| miette::miette!("workers[{index}]: field 'arch': {e}"))?
+                        .to_string(),
+                    other => {
+                        return Err(miette::miette!(
+                            "workers[{index}]: field 'arch' must be a string, got {}",
+                            other.type_name()
+                        ))
+                    }
+                };
+                if a.is_empty() || a.contains(char::is_whitespace) {
+                    return Err(miette::miette!(
+                        "workers[{index}]: field 'arch' must be a non-empty GNU triplet without whitespace"
+                    ));
+                }
+                arch = Some(a);
+            }
+            other => {
+                return Err(miette::miette!(
+                    "workers[{index}]: unknown field '{other}' ({KNOWN})"
+                ));
+            }
+        }
+    }
+    let address = address
+        .ok_or_else(|| miette::miette!("workers[{index}]: missing required field 'address'"))?;
+    Ok(WorkerConfig {
+        address,
+        jobs,
+        arch,
+    })
+}
+
+/// Extract the global `workers` table from an evaluated Lua state.
+/// Absent means the default: zero workers, the pool's local slot count.
+fn extract_workers_from_lua(lua: &mlua::Lua) -> miette::Result<WorkersConfig> {
+    let value: mlua::Value = lua
+        .globals()
+        .get("workers")
+        .map_err(|e| miette::miette!("failed to read 'workers' global: {e}"))?;
+    match value {
+        mlua::Value::Nil => Ok(WorkersConfig::default()),
+        other => WorkersConfig::from_lua_value(&other),
+    }
+}
+
 /// True when a worker-serialized output table carries the `node()`
 /// marker — checked on the raw JSON so non-node outputs (the common
 /// case) never pay for a Lua round-trip.
@@ -188,6 +515,9 @@ pub struct EvalOutput {
     /// (ADR-0033 Decision 6) — `None` means the definition declares no
     /// node and every sharing verb stays inert.
     pub node: Option<NodeConfig>,
+    /// The `workers` surface (ADR-0040 Decision 3) — empty by default;
+    /// absent means zero behavior change.
+    pub workers: WorkersConfig,
 }
 
 /// One validation/eval diagnostic with structured fields (ADR-0010 Decisions
@@ -244,6 +574,8 @@ pub struct CheckedEval {
     /// The `node {}` declaration when the definition carried one (the
     /// first wins; later duplicates are diagnostics).
     pub node: Option<NodeConfig>,
+    /// The `workers` surface (ADR-0040 Decision 3).
+    pub workers: WorkersConfig,
     pub diagnostics: Vec<CheckDiagnostic>,
     /// Set when the eval failed hard; `outputs`/`global_inputs` are then empty.
     pub error: Option<String>,
@@ -287,6 +619,7 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
             outputs: Outputs::new(),
             global_inputs: HashMap::new(),
             node: None,
+            workers: WorkersConfig::default(),
             diagnostics,
             error: Some(error),
         }
@@ -392,10 +725,30 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
         Err(e) => return failed(diagnostics, format!("{e:#}")),
     };
 
+    // Same rehydration for `workers`: the child carries the raw global,
+    // the parent validates shape so both eval paths share one parser.
+    let workers_value = match json_to_lua(&lua, &ok.workers) {
+        Ok(v) => v,
+        Err(e) => {
+            return failed(
+                diagnostics,
+                format!("{label}: workers conversion failed: {e}"),
+            )
+        }
+    };
+    if let Err(e) = lua.globals().set("workers", workers_value) {
+        return failed(diagnostics, format!("failed to set workers global: {e}"));
+    }
+    let workers = match extract_workers_from_lua(&lua) {
+        Ok(w) => w,
+        Err(e) => return failed(diagnostics, format!("{e:#}")),
+    };
+
     CheckedEval {
         outputs,
         global_inputs,
         node,
+        workers,
         diagnostics,
         error: None,
     }
@@ -411,6 +764,7 @@ pub fn check_file_with_inputs(path: &str) -> CheckedEval {
             outputs: Outputs::new(),
             global_inputs: HashMap::new(),
             node: None,
+            workers: WorkersConfig::default(),
             diagnostics: Vec::new(),
             error: Some(format!("could not read {path}: {e}")),
         },
@@ -432,6 +786,7 @@ pub fn evaluate_string_with_inputs(label: &str, source: &str) -> miette::Result<
         outputs: checked.outputs,
         global_inputs: checked.global_inputs,
         node: checked.node,
+        workers: checked.workers,
     })
 }
 
