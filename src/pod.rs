@@ -1163,6 +1163,17 @@ pub fn render_pod_source(decl: &PodDeclaration) -> String {
         }
         out.push_str("    },\n");
     }
+    if !decl.env.is_empty() {
+        out.push_str("    env = {\n");
+        for (key, value) in &decl.env {
+            out.push_str(&format!(
+                "        {} = {},\n",
+                render_lua_key(key),
+                render_lua_string(value)
+            ));
+        }
+        out.push_str("    },\n");
+    }
     if !decl.services.is_empty() {
         out.push_str("    services = {\n");
         for (name, overrides) in &decl.services {
@@ -6438,6 +6449,39 @@ pod {
 
         let redecl = evaluate_pod_source("test", &render_pod_source(&decl)).unwrap();
         assert_eq!(redecl, decl, "render → evaluate must round-trip");
+    }
+
+    // `pod add` re-renders the declaration, so every populated section must
+    // survive a render → evaluate round-trip — including env values that need
+    // Lua escaping (issue #222: the renderer silently dropped `env`).
+    // Excluded on purpose, per parse-side rules: non-identifier keys are
+    // rejected for env (`validate_env_key`) and newline values are rejected
+    // by `expect_env`, so those render paths are unreachable here.
+    #[test]
+    fn test_render_roundtrip_env_literals() {
+        let source = r#"
+pod {
+    packages = { "jq" },
+    env = {
+        PLAIN = "value",
+        QUOTED = "say \"hi\"",
+        BACKSLASH = "C:\\path",
+        TABBED = "col1\tcol2",
+    },
+}
+"#;
+        let decl = evaluate_pod_source("test", source).unwrap();
+        assert_eq!(decl.packages, vec!["jq"]);
+        assert_eq!(decl.env["QUOTED"], "say \"hi\"");
+
+        let rendered = render_pod_source(&decl);
+        assert!(
+            rendered.contains("env = {"),
+            "rendered source must contain the env section: {rendered}"
+        );
+
+        let redecl = evaluate_pod_source("test", &rendered).unwrap();
+        assert_eq!(redecl, decl, "render → evaluate must round-trip env");
     }
 
     // ── atomic pod.lua writes (issue #173) ──
