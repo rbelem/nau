@@ -4,12 +4,14 @@
 //! attempting a build. Run via `shuttle doctor` (full surface) or
 //! `shuttle doctor --pod` (pod-verb surface only, issue #97).
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
 
 use crate::command::CommandRunner;
 use crate::snap;
+use crate::tools::{self, ResolvedTool, ToolName};
 
 /// Result of one dependency check.
 #[derive(Debug)]
@@ -92,22 +94,35 @@ const SANDBOX_TOOLS: [(&str, &str); 3] = [
     ),
 ];
 
-/// The pod-surface tools gated in every scope, with the distro-package
-/// fix each missing tool names (#97) — mirroring install.sh's `pkg_for`
-/// map. `bwrap` is checked separately ([`check_bwrap`], it also probes
-/// user namespaces).
-const POD_TOOLS: [(&str, &str); 4] = [
+/// The pod-surface floor tools (#101): doctor resolves each through
+/// [`tools::resolve`] and reports origin (provisioned vs PATH) + version.
+/// The fix text is the distro-package FALLBACK — the primary fix for a
+/// missing floor tool is `shuttle doctor --fix`, which self-provisions.
+const POD_TOOL_FIXES: [(ToolName, &str); 5] = [
     (
-        "mksquashfs",
+        ToolName::Mksquashfs,
         "install squashfs-tools (e.g. apt install squashfs-tools)",
     ),
     (
-        "unsquashfs",
+        ToolName::Unsquashfs,
         "install squashfs-tools (e.g. apt install squashfs-tools)",
     ),
-    ("curl", "install curl (e.g. apt install curl)"),
-    ("tar", "install tar (e.g. apt install tar)"),
+    (
+        ToolName::Bwrap,
+        "install bubblewrap (e.g. apt install bubblewrap)",
+    ),
+    (ToolName::Tar, "install tar (e.g. apt install tar)"),
+    (ToolName::Curl, "install curl (e.g. apt install curl)"),
 ];
+
+/// The distro-package fallback fix for one floor tool.
+fn distro_fix_for(name: ToolName) -> &'static str {
+    POD_TOOL_FIXES
+        .iter()
+        .find(|(tool, _)| *tool == name)
+        .map(|(_, fix)| *fix)
+        .unwrap_or("install the tool")
+}
 
 /// Pod-scope build toolchain (#97): the sandbox tools plus the C++
 /// driver the vendored Luau analyzer needs. The cc/c++ fixes lead with
@@ -189,11 +204,12 @@ pub fn run_pod() -> Vec<Check> {
 
 /// Run the checks for one [`Scope`].
 fn run_scoped(scope: Scope) -> Vec<Check> {
-    let mut checks: Vec<Check> = POD_TOOLS
+    let mut checks: Vec<Check> = ToolName::ALL
         .iter()
-        .map(|(tool, fix)| check_cmd(tool, fix))
+        .copied()
+        .map(check_floor_tool)
         .collect();
-    checks.push(check_bwrap());
+    checks.extend(probe_checks());
     if scope == Scope::Full {
         checks.extend([
             check_squashfs_version(),
@@ -225,18 +241,56 @@ fn run_scoped(scope: Scope) -> Vec<Check> {
     checks
 }
 
-/// Check that a command exists on PATH.
-fn check_cmd(name: &'static str, hint: &'static str) -> Check {
-    let found = std::process::Command::new("which")
-        .arg(name)
-        .output()
-        .ok()
-        .is_some_and(|o| o.status.success());
+/// Check one floor tool through [`tools::resolve`]: the origin report
+/// (#101 AC-5) — `provisioned <upstream version> (tools v<set>)` vs
+/// `PATH <path> <version>` — so shadowing is visible, and a missing tool
+/// names `shuttle doctor --fix` plus the escape hatches (#101 AC-6).
+/// Resolution is stat-only (never executes), matching `tools`' policy.
+fn check_floor_tool(name: ToolName) -> Check {
+    let manifest = tools::manifest();
+    let spec_version = manifest.spec(name).map(|s| s.version.as_str());
+    floor_tool_check_with(
+        name,
+        tools::resolve(name),
+        spec_version,
+        distro_fix_for(name),
+    )
+}
 
-    if found {
-        Check::ok(name)
-    } else {
-        Check::missing(name, hint)
+/// [`check_floor_tool`] over explicit inputs — the test seam (no env or
+/// manifest dependency).
+fn floor_tool_check_with(
+    name: ToolName,
+    resolved: tools::ToolsResult<ResolvedTool>,
+    spec_version: Option<&str>,
+    distro_fix: &str,
+) -> Check {
+    match resolved {
+        Ok(ResolvedTool::Provisioned { version: set, .. }) => Check::ok_at(
+            name.as_str(),
+            format!(
+                "provisioned {} (tools v{set})",
+                spec_version.unwrap_or("unknown")
+            ),
+        ),
+        Ok(ResolvedTool::Path { path, version }) => {
+            let discovered = version.or_else(|| tools::discover_version(&path));
+            match discovered {
+                Some(v) => Check::ok_at(name.as_str(), format!("PATH {} {v}", path.display())),
+                None => Check::ok_at(
+                    name.as_str(),
+                    format!("PATH {} (version unknown)", path.display()),
+                ),
+            }
+        }
+        Err(_) => Check::missing(
+            name.as_str(),
+            format!(
+                "run: shuttle doctor --fix (distro fallback: {distro_fix}; overrides: \
+                 SHUTTLE_TOOLS_DIR, {})",
+                name.env_var()
+            ),
+        ),
     }
 }
 
@@ -1075,41 +1129,395 @@ pub fn initrd_modules_check(kernel_version: &str, outcome: &InitrdModuleAudit) -
 
 // ── Host tooling checks ──
 
-/// Check bubblewrap with a basic no-op invocation.
-fn check_bwrap() -> Check {
-    let output = std::process::Command::new("bwrap")
-        .args(["--version"])
-        .output()
-        .ok();
+/// Check that mksquashfs supports SOURCE_DATE_EPOCH (4.4+). The version
+/// gate is a tolerant parse of the leading `<major>.<minor>` (#101 AC-8:
+/// the closed 4.4/4.5/4.6 allowlist rejected the provisioner's 4.7.x
+/// builds and labelled shuttle's own provisioned tool "untested").
+fn check_squashfs_version() -> Check {
+    let manifest = tools::manifest();
+    let spec_version = manifest
+        .spec(ToolName::Mksquashfs)
+        .map(|s| s.version.as_str());
+    check_squashfs_version_with(tools::resolve(ToolName::Mksquashfs), spec_version)
+}
 
-    match output {
-        Some(o) if o.status.success() => Check::ok("bwrap"),
-        Some(_) => Check::error(
-            "bwrap",
-            "bwrap found but failed to run — check user namespaces are enabled",
-        ),
-        None => Check::missing("bwrap", "install bubblewrap (e.g. apt install bubblewrap)"),
+/// [`check_squashfs_version`] over explicit inputs — the test seam.
+fn check_squashfs_version_with(
+    resolved: tools::ToolsResult<ResolvedTool>,
+    spec_version: Option<&str>,
+) -> Check {
+    let name = "mksquashfs >= 4.4 (SOURCE_DATE_EPOCH)";
+    match resolved {
+        Ok(ResolvedTool::Provisioned { version: set, .. }) => {
+            // The provisioner installs a manifest-pinned, CI-verified
+            // version (#101 AC-8): never "untested" — the manifest pin is
+            // the source of truth and the round-trip probe is the gate.
+            match spec_version.and_then(parse_squashfs_version) {
+                Some(v) if v >= SQUASHFS_SDE_MIN => Check::ok_at(
+                    name,
+                    format!(
+                        "provisioned {} (tools v{set}) — pinned by the verified manifest",
+                        spec_version.unwrap_or_default(),
+                    ),
+                ),
+                Some(v) => Check::error(
+                    name,
+                    format!(
+                        "the manifest pins squashfs-tools {}, which predates \
+                         SOURCE_DATE_EPOCH support (needs >= 4.4)",
+                        version_string(v)
+                    ),
+                ),
+                None => Check::ok_at(
+                    name,
+                    format!(
+                        "provisioned tools v{set} — version pinned by the verified \
+                         manifest, exercised by the round-trip probe"
+                    ),
+                ),
+            }
+        }
+        Ok(ResolvedTool::Path { path, .. }) => match mksquashfs_version(&path) {
+            Some(v) if v >= SQUASHFS_SDE_MIN => Check::ok_at(
+                name,
+                format!("PATH {} {}", path.display(), version_string(v)),
+            ),
+            Some(v) => Check::error(
+                name,
+                format!(
+                    "PATH {} {} predates SOURCE_DATE_EPOCH support (needs >= 4.4)",
+                    path.display(),
+                    version_string(v)
+                ),
+            ),
+            None => Check::ok_at(
+                name,
+                format!(
+                    "PATH {} (version unparsable — SOURCE_DATE_EPOCH untested)",
+                    path.display()
+                ),
+            ),
+        },
+        Err(_) => Check::missing(name, "install squashfs-tools"),
     }
 }
 
-/// Check that mksquashfs supports SOURCE_DATE_EPOCH (4.4+).
-fn check_squashfs_version() -> Check {
-    let output = std::process::Command::new("mksquashfs")
-        .args(["-version"])
-        .output()
-        .ok();
+/// The minimum (major, minor) with SOURCE_DATE_EPOCH support.
+const SQUASHFS_SDE_MIN: (u32, u32) = (4, 4);
 
-    match output {
-        Some(o) if o.status.success() => {
-            let version = String::from_utf8_lossy(&o.stdout);
-            if version.contains("4.4") || version.contains("4.5") || version.contains("4.6") {
-                Check::ok("mksquashfs >= 4.4 (SOURCE_DATE_EPOCH)")
-            } else {
-                Check::ok("mksquashfs (SOURCE_DATE_EPOCH untested)")
-            }
-        }
-        _ => Check::missing("mksquashfs", "install squashfs-tools"),
+/// Render a parsed (major, minor) pair for report lines.
+fn version_string(v: (u32, u32)) -> String {
+    format!("{}.{}", v.0, v.1)
+}
+
+/// Run `-version` on a resolved mksquashfs and parse the leading
+/// `<major>.<minor>` pair.
+fn mksquashfs_version(path: &Path) -> Option<(u32, u32)> {
+    let out = std::process::Command::new(path)
+        .arg("-version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
+    parse_squashfs_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the first `<major>.<minor>` token of the version output's first
+/// line ("mksquashfs version 4.7.5 (…)" → (4, 7)).
+fn parse_squashfs_version(text: &str) -> Option<(u32, u32)> {
+    let first = text.lines().next()?;
+    first.split_whitespace().find_map(|token| {
+        let mut parts = token.split('.');
+        let major = parts.next()?.parse::<u32>().ok()?;
+        let minor = parts.next()?.parse::<u32>().ok()?;
+        Some((major, minor))
+    })
+}
+
+// ── Functional probes (issue #101 AC-2) ──
+//
+// Stat/version checks cannot tell a working tool from a shipped-bytes
+// one: the probes execute the resolved binaries. They run whenever the
+// tools they exercise resolve; their failures carry named diagnostics
+// (noexec mount, disabled user namespaces, kernel restriction) mirroring
+// tools::ToolsError::Noexec's wording.
+
+/// A probe file's content, asserted verbatim after the round-trip.
+const PROBE_CONTENT: &str = "shuttle doctor squashfs round-trip probe\n";
+/// The user xattr exercised when the host carries setfattr/getfattr.
+const XATTR_PROBE: &str = "user.probe";
+/// The marker value stored in [`XATTR_PROBE`].
+const XATTR_MARKER: &str = "shuttle-probe";
+
+/// The probe checks for one doctor run: the squashfs round-trip when the
+/// pair resolves, the bwrap sandbox exec when bwrap resolves.
+fn probe_checks() -> Vec<Check> {
+    let mut checks = Vec::new();
+    let mksquashfs = resolved_path(&tools::resolve(ToolName::Mksquashfs));
+    let unsquashfs = resolved_path(&tools::resolve(ToolName::Unsquashfs));
+    if let (Some(mk), Some(us)) = (mksquashfs, unsquashfs) {
+        checks.push(squashfs_probe_check(&mk, &us));
+    }
+    if let Some(bwrap) = resolved_path(&tools::resolve(ToolName::Bwrap)) {
+        checks.push(bwrap_probe_check(&bwrap));
+    }
+    checks
+}
+
+/// The path behind a resolution — both origins carry one.
+fn resolved_path(resolved: &tools::ToolsResult<ResolvedTool>) -> Option<PathBuf> {
+    match resolved {
+        Ok(ResolvedTool::Provisioned { path, .. }) | Ok(ResolvedTool::Path { path, .. }) => {
+            Some(path.clone())
+        }
+        Err(_) => None,
+    }
+}
+
+/// One probe execution with the spawn failure classified: EACCES/EPERM at
+/// spawn is the noexec-mount signature, distinct from other spawn errors.
+#[derive(Debug)]
+enum ProbeRun {
+    Ran {
+        code: i32,
+        stdout: String,
+        stderr: String,
+    },
+    Noexec(io::Error),
+    Spawn(io::Error),
+}
+
+fn run_probe(bin: &Path, args: &[&str]) -> ProbeRun {
+    match std::process::Command::new(bin).args(args).output() {
+        Ok(out) => ProbeRun::Ran {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        },
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => ProbeRun::Noexec(e),
+        Err(e) => ProbeRun::Spawn(e),
+    }
+}
+
+/// Run one probe step, mapping every failure class to a named diagnostic.
+fn probe_step(bin: &Path, args: &[&str], what: &str) -> Result<(), String> {
+    match run_probe(bin, args) {
+        ProbeRun::Ran { code: 0, .. } => Ok(()),
+        ProbeRun::Ran { code, stderr, .. } => {
+            let line = first_line(&stderr);
+            Err(format!("{what} exited {code}: {line}"))
+        }
+        ProbeRun::Noexec(e) => Err(noexec_hint(what, &e)),
+        ProbeRun::Spawn(e) => Err(format!("cannot spawn {what}: {e}")),
+    }
+}
+
+/// The noexec diagnostic, mirroring tools::ToolsError::Noexec's wording
+/// and workaround (#101 AC-3/AC-6).
+fn noexec_hint(what: &str, source: &io::Error) -> String {
+    format!(
+        "cannot execute {what}: {source} — the path is likely mounted noexec; \
+         relocate the tools root by setting SHUTTLE_TOOLS_DIR to an exec-mounted \
+         path (e.g. SHUTTLE_TOOLS_DIR=/var/tmp/shuttle-tools) and re-run \
+         `shuttle doctor --fix`"
+    )
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default().trim()
+}
+
+fn squashfs_probe_check(mksquashfs: &Path, unsquashfs: &Path) -> Check {
+    let name = "probe: squashfs round-trip";
+    match squashfs_roundtrip(mksquashfs, unsquashfs) {
+        Ok(note) => Check::ok_at(name, note),
+        Err(msg) => Check::error(name, msg),
+    }
+}
+
+/// Pack a probe tree with the resolved mksquashfs, unpack it with the
+/// resolved unsquashfs, and assert the content (and, when the host carries
+/// setfattr, the `user.probe` xattr) survives. Ok carries the one-line
+/// report, including the named note when xattr fidelity was NOT exercised.
+fn squashfs_roundtrip(mksquashfs: &Path, unsquashfs: &Path) -> Result<String, String> {
+    let work = tempfile::tempdir().map_err(|e| format!("create probe workdir: {e}"))?;
+    let file = work.path().join("probe.txt");
+    std::fs::write(&file, PROBE_CONTENT).map_err(|e| format!("write probe file: {e}"))?;
+
+    let entries = snap::path_entries();
+    let setfattr = snap::resolve_in_path("setfattr", &entries);
+    let getfattr = snap::resolve_in_path("getfattr", &entries);
+    // The xattr is set BEFORE packing: the probe asserts that the packed
+    // bytes carry it and the unpack restores it — setting it after the
+    // round-trip would prove nothing.
+    let xattr_note = match setfattr {
+        None => Some("xattr fidelity not exercised (setfattr not installed)".into()),
+        Some(tool) => set_probe_xattr(&tool, &file).err(),
+    };
+
+    let img = work.path().join("probe.squashfs");
+    let img_arg = img.to_string_lossy().into_owned();
+    let file_arg = file.to_string_lossy().into_owned();
+    // Packing the single probe file keeps the unpack layout deterministic
+    // (the archive root IS probe.txt); a directory source would carry the
+    // source basename as its archive root and move the probe file deeper.
+    probe_step(
+        mksquashfs,
+        &[&file_arg, &img_arg, "-noappend"],
+        "probe mksquashfs",
+    )?;
+
+    let out = work.path().join("probe-out");
+    let out_arg = out.to_string_lossy().into_owned();
+    probe_step(unsquashfs, &["-d", &out_arg, &img_arg], "probe unsquashfs")?;
+
+    finish_roundtrip(xattr_note, getfattr.as_deref(), &out.join("probe.txt"))
+}
+
+/// Assert the unpacked probe file and produce the one-line report.
+fn finish_roundtrip(
+    xattr_note: Option<String>,
+    getfattr: Option<&Path>,
+    unpacked: &Path,
+) -> Result<String, String> {
+    let round = std::fs::read_to_string(unpacked)
+        .map_err(|e| format!("read the unpacked probe file: {e}"))?;
+    if round != PROBE_CONTENT {
+        return Err("probe file content did not survive the squashfs round-trip".into());
+    }
+    match (xattr_note, getfattr) {
+        (Some(note), _) => Ok(format!("content survived the round-trip — {note}")),
+        (None, None) => Ok(
+            "content survived the round-trip — user.probe was set but could not be \
+             verified (getfattr not installed)"
+                .into(),
+        ),
+        (None, Some(getfattr)) => {
+            read_probe_xattr(getfattr, unpacked)?;
+            Ok("content and user.probe xattr survived the round-trip".into())
+        }
+    }
+}
+
+/// Set the probe xattr. `Err` carries a non-fatal named note: the probe
+/// filesystem may simply not support user xattrs (e.g. tmpfs), which is a
+/// fidelity gap in the TEST BED, not a failing tool.
+fn set_probe_xattr(setfattr: &Path, file: &Path) -> Result<(), String> {
+    let file_arg = file.to_string_lossy().into_owned();
+    match run_probe(
+        setfattr,
+        &["-n", XATTR_PROBE, "-v", XATTR_MARKER, &file_arg],
+    ) {
+        ProbeRun::Ran { code: 0, .. } => Ok(()),
+        ProbeRun::Ran { code, stderr, .. } => Err(format!(
+            "setfattr could not set {XATTR_PROBE} on the probe file (exit {code}: {}) — \
+             the filesystem may not support user xattrs",
+            first_line(&stderr)
+        )),
+        ProbeRun::Noexec(e) => Err(format!("cannot execute setfattr: {e}")),
+        ProbeRun::Spawn(e) => Err(format!("cannot spawn setfattr: {e}")),
+    }
+}
+
+/// Read the probe xattr back. `Err` is fatal: the xattr WAS set, so losing
+/// it in the round-trip is a real payload-fidelity failure.
+fn read_probe_xattr(getfattr: &Path, file: &Path) -> Result<(), String> {
+    let file_arg = file.to_string_lossy().into_owned();
+    match run_probe(getfattr, &["-n", XATTR_PROBE, &file_arg]) {
+        ProbeRun::Ran {
+            code: 0, stdout, ..
+        } => match parse_getfattr_value(&stdout) {
+            Some(v) if v == XATTR_MARKER => Ok(()),
+            Some(v) => Err(format!(
+                "{XATTR_PROBE} did not survive the round-trip: set '{XATTR_MARKER}', \
+                 read '{v}'"
+            )),
+            None => Err(format!(
+                "{XATTR_PROBE} did not survive the round-trip: set '{XATTR_MARKER}', \
+                 getfattr reported none"
+            )),
+        },
+        ProbeRun::Ran { code, stderr, .. } => Err(format!(
+            "reading {XATTR_PROBE} back failed (exit {code}: {})",
+            first_line(&stderr)
+        )),
+        ProbeRun::Noexec(e) => Err(format!("cannot execute getfattr: {e}")),
+        ProbeRun::Spawn(e) => Err(format!("cannot spawn getfattr: {e}")),
+    }
+}
+
+/// Extract the quoted value from `getfattr -n` output — GNU prints a
+/// `# file:` header plus `user.probe="value"`, busybox prints just the
+/// `name="value"` line; both quote a printable value.
+fn parse_getfattr_value(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        let rest = line.strip_prefix(XATTR_PROBE)?;
+        let value = rest.strip_prefix('=')?.strip_prefix('"')?;
+        let end = value.find('"')?;
+        Some(value[..end].to_string())
+    })
+}
+
+/// The sandbox exec target: the first existing of the classic minimal
+/// binaries. `/bin/true` is absent on NixOS, `/bin/sh` exists on every
+/// Linux (NixOS ships it as a system symlink); a static-true-less host
+/// still needs the probe to exercise a real exec.
+fn bwrap_probe_target_from(
+    candidates: &'static [&'static str],
+) -> Option<(&'static str, Vec<&'static str>)> {
+    candidates.iter().find_map(|c| {
+        let path = Path::new(c);
+        (path.exists()).then(|| match *c {
+            "/bin/sh" | "/usr/bin/sh" => (*c, vec!["-c", "exit 0"]),
+            _ => (*c, Vec::new()),
+        })
+    })
+}
+
+fn bwrap_probe_check(bwrap: &Path) -> Check {
+    let name = "probe: bwrap sandbox exec";
+    let Some((target, args)) = bwrap_probe_target_from(&["/bin/true", "/usr/bin/true", "/bin/sh"])
+    else {
+        return Check::error(
+            name,
+            "no sandbox exec target found (tried /bin/true, /usr/bin/true, /bin/sh) — \
+             the probe gates a real sandboxed exec, so it fails closed",
+        );
+    };
+    let mut probe_args = vec!["--ro-bind", "/", "/", target];
+    probe_args.extend(args);
+    let rendered = probe_args.join(" ");
+    match run_probe(bwrap, &probe_args) {
+        ProbeRun::Ran { code: 0, .. } => {
+            Check::ok_at(name, format!("real sandboxed exec succeeded ({rendered})"))
+        }
+        ProbeRun::Ran { code, stderr, .. } => Check::error(name, bwrap_failure_hint(code, &stderr)),
+        ProbeRun::Noexec(e) => Check::error(name, noexec_hint("the resolved bwrap", &e)),
+        ProbeRun::Spawn(e) => Check::error(name, format!("cannot spawn {}: {e}", bwrap.display())),
+    }
+}
+
+/// Name the bwrap failure cause: user namespaces, a kernel/seccomp-style
+/// restriction, a missing exec target, or an unnamed sandbox setup
+/// failure. Never bare "failed".
+fn bwrap_failure_hint(code: i32, stderr: &str) -> String {
+    let cause = if stderr.contains("user namespace")
+        || stderr.contains("uid map")
+        || stderr.contains("unshare")
+    {
+        "user namespaces appear disabled (kernel.unprivileged_userns_clone or a \
+         hardened sandbox) — enable unprivileged user namespaces"
+    } else if stderr.contains("Operation not permitted") || stderr.contains("EPERM") {
+        "the kernel or a seccomp/gVisor-style restriction denied the namespace setup"
+    } else if stderr.contains("execvp") || stderr.contains("No such file") {
+        "the sandbox exec target is missing on this host — \
+         the probe gates a real sandboxed exec, so it fails closed"
+    } else {
+        "bwrap could not set up the sandbox"
+    };
+    format!("bwrap exited {code}: {} — {cause}", first_line(stderr))
 }
 
 /// Check one tool the way the build sandbox would resolve it: through the
@@ -1305,6 +1713,88 @@ pub fn all_ok(checks: &[Check]) -> bool {
     checks.iter().all(|c| matches!(c.status, CheckStatus::Ok))
 }
 
+/// Print the warn-only post-table notices (#101): the stale provisioned
+/// set (AC-5) and the `min_kernel` advisory (AC-10). Neither affects the
+/// exit code — the functional probes are the real gate.
+pub fn print_notices() {
+    if let Some(msg) = stale_notice() {
+        println!("  ⚠ {msg}");
+    }
+    if let Some(msg) = min_kernel_notice() {
+        println!("  ⚠ {msg}");
+    }
+}
+
+/// The stale-shadow warning (#101 AC-5): the installed tools set is not
+/// the manifest's version. Warn-only; `shuttle doctor --fix` re-provisions.
+/// Carries the escape hatches (AC-6 — this reports a stale provisioned set).
+fn stale_notice() -> Option<String> {
+    let stale = tools::detect_stale()?;
+    Some(format!(
+        "provisioned tools stale (installed v{}, manifest v{}) — run: \
+         shuttle doctor --fix (overrides: SHUTTLE_TOOLS_DIR, SHUTTLE_TOOL_<NAME>)",
+        stale.installed, stale.manifest
+    ))
+}
+
+/// The `min_kernel` advisory (#101 AC-10): the running kernel is older
+/// than the manifest's floor. Warn-only, best-effort; an unparsable
+/// release string is named, never silently skipped.
+fn min_kernel_notice() -> Option<String> {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
+    min_kernel_notice_with(release.as_deref(), tools::manifest().min_kernel.as_deref())
+}
+
+/// [`min_kernel_notice`] over explicit inputs — the test seam.
+fn min_kernel_notice_with(release: Option<&str>, min_kernel: Option<&str>) -> Option<String> {
+    let min = min_kernel?;
+    let min_parsed = parse_kernel_version(min)?;
+    let Some(release) = release else {
+        return Some(format!(
+            "warning: kernel version unparsable (no release string) — cannot \
+             compare against the floor tools' min_kernel {min}"
+        ));
+    };
+    let release = release.trim();
+    match parse_kernel_version(release) {
+        Some(running) if kernel_below(&running, &min_parsed) => Some(format!(
+            "warning: kernel {release} is older than the floor tools' min_kernel \
+             {min} — provisioned tools may not run; the functional probes are \
+             the real gate"
+        )),
+        Some(_) => None,
+        None => Some(format!(
+            "warning: kernel version unparsable ('{release}') — cannot compare \
+             against the floor tools' min_kernel {min}"
+        )),
+    }
+}
+
+/// Parse a kernel release into its leading numeric components:
+/// "6.8.0-42-generic" → [6, 8] (the "0-42-generic" component is not a bare
+/// number); "5.10" → [5, 10]. None when no leading numeric component exists.
+fn parse_kernel_version(release: &str) -> Option<Vec<u32>> {
+    let components: Vec<u32> = release
+        .split('.')
+        .map_while(|c| c.parse::<u32>().ok())
+        .collect();
+    (!components.is_empty()).then_some(components)
+}
+
+/// Whether `running` sorts strictly below `min`, comparing numeric
+/// components and padding the shorter side with zeros (5.9 < 5.10,
+/// 6.1 ≥ 5.10, 5.10.1 ≥ 5.10).
+fn kernel_below(running: &[u32], min: &[u32]) -> bool {
+    for i in 0..running.len().max(min.len()) {
+        let a = running.get(i).copied().unwrap_or(0);
+        let b = min.get(i).copied().unwrap_or(0);
+        if a != b {
+            return a < b;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1319,19 +1809,6 @@ mod tests {
             "expected at least 8 checks, got {}",
             checks.len()
         );
-    }
-
-    #[test]
-    fn test_check_cmd_found() {
-        // 'which' itself should always be findable
-        let check = check_cmd("which", "should not happen");
-        assert!(matches!(check.status, CheckStatus::Ok));
-    }
-
-    #[test]
-    fn test_check_cmd_not_found() {
-        let check = check_cmd("this-command-definitely-does-not-exist-12345", "install it");
-        assert!(matches!(check.status, CheckStatus::Missing));
     }
 
     #[test]
@@ -2454,7 +2931,9 @@ CONFIG_EXT4_FS=y
         // PLUS exactly the five image-verb checks — no behavior change.
         // (Only the pod-surface checks must appear in full; the toolchain
         // lists differ by design — pod adds the c++ driver, full keeps
-        // sh/make/cc.)
+        // sh/make/cc.) The env lock keeps concurrent probe/env tests from
+        // skewing the probe-check counts mid-run.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let full = run_all();
         let pod = run_pod();
         for check in pod.iter().filter(|c| !c.name.starts_with("sandbox: ")) {
@@ -2504,7 +2983,8 @@ CONFIG_EXT4_FS=y
     #[test]
     fn pod_scope_failures_name_only_pod_surface_tools() {
         // Whatever the host is missing, a pod-scope failure can only name
-        // a pod tool or a toolchain entry — never an image tool.
+        // a pod tool, a toolchain entry, or a functional probe (#101) —
+        // never an image tool.
         let pod = run_pod();
         let failing: Vec<&str> = pod
             .iter()
@@ -2512,8 +2992,10 @@ CONFIG_EXT4_FS=y
             .map(|c| c.name.as_str())
             .collect();
         assert!(
-            failing.iter().all(|name| POD_SCOPE_NAMES.contains(name)),
-            "pod scope must only fail on pod-surface tools, got: {failing:?}"
+            failing
+                .iter()
+                .all(|name| POD_SCOPE_NAMES.contains(name) || name.starts_with("probe: ")),
+            "pod scope must only fail on pod-surface tools or probes, got: {failing:?}"
         );
     }
 
@@ -2530,9 +3012,13 @@ CONFIG_EXT4_FS=y
                 .ok()
                 .is_some_and(|o| o.status.success())
         };
-        if !POD_TOOLS.iter().all(|(tool, _)| have(tool)) || !have("bwrap") {
-            // Host without the pod set: the pass branch is exercised on a
-            // provisioned machine instead.
+        if !POD_TOOL_FIXES.iter().all(|(tool, _)| have(tool.as_str()))
+            || !have("bwrap")
+            || bwrap_probe_target_from(&["/bin/true", "/usr/bin/true", "/bin/sh"]).is_none()
+        {
+            // Host without the pod set — or without any sandbox exec
+            // target (/bin/true absent on NixOS; /bin/sh is the fallback):
+            // the pass branch is exercised on a provisioned machine instead.
             return;
         }
         let pod = run_pod();
@@ -2556,19 +3042,25 @@ CONFIG_EXT4_FS=y
         // install.sh's pkg_for map: squashfs-tools, bubblewrap, curl, tar,
         // and g++ (gcc-c++ on dnf/zypper) for cc/c++ — the latter now the
         // FALLBACK text behind the gcc payload sideload (#164 follow-up).
-        for (tool, fix) in POD_TOOLS {
+        // The floor tools' PRIMARY fix is `shuttle doctor --fix` (#101);
+        // the distro text stays as the named fallback.
+        for (tool, fix) in POD_TOOL_FIXES {
             assert!(!fix.is_empty(), "{tool} must carry a fix hint");
             assert!(
                 fix.contains("install"),
                 "hint must phrase the install fix: {fix}"
             );
         }
-        let bwrap = check_bwrap();
+        let bwrap = check_floor_tool(ToolName::Bwrap);
         if let CheckStatus::Missing = bwrap.status {
             let hint = bwrap.hint.as_deref().unwrap_or_default();
             assert!(
                 hint.contains("bubblewrap"),
                 "bwrap hint must name the distro package: {hint}"
+            );
+            assert!(
+                hint.contains("shuttle doctor --fix"),
+                "missing floor tool must lead with the provision fix: {hint}"
             );
         }
         for (tool, fix) in POD_SANDBOX_TOOLS {
@@ -2597,5 +3089,451 @@ CONFIG_EXT4_FS=y
                 _ => assert!(!fix.is_empty(), "{tool} must carry a fix hint"),
             }
         }
+    }
+
+    // ── Floor-tool origin report, probes, notices (issue #101) ──
+
+    /// Env vars are process-global; cargo runs tests in parallel threads.
+    /// Tests that read or mutate tool-related env hold this lock (the
+    /// tools::tests pattern).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `SHUTTLE_TOOLS_DIR` at a tempdir for the test's lifetime and
+    /// restores the previous value on drop.
+    struct ToolsDirGuard {
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl ToolsDirGuard {
+        fn at(path: &Path) -> Self {
+            const ENV_TOOLS_DIR: &str = "SHUTTLE_TOOLS_DIR";
+            let saved = std::env::var_os(ENV_TOOLS_DIR);
+            std::env::set_var(ENV_TOOLS_DIR, path);
+            ToolsDirGuard { saved }
+        }
+    }
+
+    impl Drop for ToolsDirGuard {
+        fn drop(&mut self) {
+            const ENV_TOOLS_DIR: &str = "SHUTTLE_TOOLS_DIR";
+            match self.saved.take() {
+                Some(v) => std::env::set_var(ENV_TOOLS_DIR, v),
+                None => std::env::remove_var(ENV_TOOLS_DIR),
+            }
+        }
+    }
+
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Fake squashfs pair that round-trips by copying, speaking the probe's
+    /// exact argv. A real squashfs pair stores and restores xattrs; busybox
+    /// `cp` (the devbox profile's cp) drops them, so the fakes carry
+    /// `user.probe` across explicitly via getfattr/setfattr.
+    const FAKE_MKSQUASHFS_BODY: &str = r#"#!/bin/sh
+set -e
+mkdir -p "$2"
+cp "$1" "$2/"
+v=$(getfattr -n user.probe "$1" 2>/dev/null | sed -n 's/^user.probe="\([^"]*\)"$/\1/p')
+[ -z "$v" ] || setfattr -n user.probe -v "$v" "$2/$(basename "$1")"
+"#;
+    const FAKE_UNSQUASHFS_BODY: &str = r#"#!/bin/sh
+set -e
+out="$2"
+img="$3"
+mkdir -p "$out"
+for f in "$img"/*; do
+  cp "$f" "$out/"
+  v=$(getfattr -n user.probe "$f" 2>/dev/null | sed -n 's/^user.probe="\([^"]*\)"$/\1/p')
+  [ -z "$v" ] || setfattr -n user.probe -v "$v" "$out/$(basename "$f")"
+done
+"#;
+
+    /// Hand-builds the on-disk provisioned-set shape for `tools` at
+    /// `<root>/<version>/bin` + the `current` pointer — the read side
+    /// (resolve) needs only an executable file behind the pointer.
+    fn provision_fake_set(root: &Path, version: u64, bodies: &[(&str, &str)]) {
+        let bin = root.join(version.to_string()).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for (name, body) in bodies {
+            write_script(&bin, name, body);
+        }
+        std::fs::write(root.join("current"), format!("{version}\n")).unwrap();
+    }
+
+    #[test]
+    fn floor_tool_check_reports_provisioned_origin_with_manifest_version() {
+        let resolved = Ok(ResolvedTool::Provisioned {
+            path: PathBuf::from("/tools/3/bin/mksquashfs"),
+            version: "3".into(),
+        });
+        let check = floor_tool_check_with(
+            ToolName::Mksquashfs,
+            resolved,
+            Some("4.7.5"),
+            "install squashfs-tools",
+        );
+        assert!(matches!(check.status, CheckStatus::Ok));
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert_eq!(hint, "provisioned 4.7.5 (tools v3)");
+    }
+
+    #[test]
+    fn floor_tool_check_reports_path_origin_with_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_script(
+            dir.path(),
+            "curl",
+            "#!/bin/sh\necho curl 8.20.0 libcurl/8.20.0\n",
+        );
+        let resolved = Ok(ResolvedTool::Path {
+            path: fake.clone(),
+            version: None,
+        });
+        let check = floor_tool_check_with(ToolName::Curl, resolved, None, "install curl");
+        assert!(matches!(check.status, CheckStatus::Ok));
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains(&fake.display().to_string()) && hint.contains("8.20.0"),
+            "PATH origin carries path + discovered version: {hint}"
+        );
+        assert!(hint.starts_with("PATH "), "{hint}");
+    }
+
+    #[test]
+    fn floor_tool_check_missing_names_fix_and_escape_hatches() {
+        let resolved = Err(tools::ToolsError::NotResolved {
+            tool: "bwrap".into(),
+            detail: "nothing anywhere".into(),
+        });
+        let check = floor_tool_check_with(
+            ToolName::Bwrap,
+            resolved,
+            None,
+            "install bubblewrap (e.g. apt install bubblewrap)",
+        );
+        assert!(matches!(check.status, CheckStatus::Missing));
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("shuttle doctor --fix"),
+            "the primary fix is the provisioner: {hint}"
+        );
+        assert!(
+            hint.contains("SHUTTLE_TOOLS_DIR") && hint.contains("SHUTTLE_TOOL_BWRAP"),
+            "missing floor tools must list the escape hatches (AC-6): {hint}"
+        );
+        assert!(
+            hint.contains("bubblewrap"),
+            "the distro fallback stays named: {hint}"
+        );
+    }
+
+    #[test]
+    fn squashfs_version_parse_is_tolerant_not_a_closed_list() {
+        // AC-8: the old closed allowlist (4.4/4.5/4.6 substring sniffing)
+        // is now a leading <major>.<minor> parse.
+        assert_eq!(
+            parse_squashfs_version("mksquashfs version 4.6.1 (2023-08-31)"),
+            Some((4, 6))
+        );
+        assert_eq!(
+            parse_squashfs_version("mksquashfs version 4.7.5"),
+            Some((4, 7))
+        );
+        assert_eq!(parse_squashfs_version("4.4"), Some((4, 4)));
+        assert_eq!(
+            parse_squashfs_version("mksquashfs version 3.1"),
+            Some((3, 1))
+        );
+        assert_eq!(parse_squashfs_version("no version here"), None);
+        assert_eq!(parse_squashfs_version(""), None);
+        assert!((4, 7) >= SQUASHFS_SDE_MIN);
+        assert!((5, 0) >= SQUASHFS_SDE_MIN);
+        assert!((4, 3) < SQUASHFS_SDE_MIN);
+    }
+
+    #[test]
+    fn provisioned_squashfs_is_never_labelled_untested() {
+        // AC-8: doctor's own provisioned tool, whatever its binary answers
+        // to -version, is accepted via the manifest pin.
+        let resolved = Ok(ResolvedTool::Provisioned {
+            path: PathBuf::from("/tools/3/bin/mksquashfs"),
+            version: "3".into(),
+        });
+        let check = check_squashfs_version_with(resolved, Some("4.7.5"));
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("4.7.5") && hint.contains("tools v3"),
+            "{hint}"
+        );
+        assert!(!hint.contains("untested"), "{hint}");
+    }
+
+    #[test]
+    fn provisioned_squashfs_with_unparsable_pin_stays_ok() {
+        let resolved = Ok(ResolvedTool::Provisioned {
+            path: PathBuf::from("/tools/3/bin/mksquashfs"),
+            version: "3".into(),
+        });
+        let check = check_squashfs_version_with(resolved, Some("opaque"));
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("verified manifest") && !hint.contains("untested"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn path_squashfs_gate_accepts_4_7_and_rejects_3_x() {
+        let dir = tempfile::tempdir().unwrap();
+        let modern = write_script(
+            dir.path(),
+            "mksquashfs-modern",
+            "#!/bin/sh\necho mksquashfs version 4.7.5 (2024)\n",
+        );
+        let ok = check_squashfs_version_with(
+            Ok(ResolvedTool::Path {
+                path: modern,
+                version: None,
+            }),
+            None,
+        );
+        assert!(matches!(ok.status, CheckStatus::Ok), "{ok:?}");
+
+        let ancient = write_script(
+            dir.path(),
+            "mksquashfs-ancient",
+            "#!/bin/sh\necho mksquashfs version 3.1\n",
+        );
+        let old = check_squashfs_version_with(
+            Ok(ResolvedTool::Path {
+                path: ancient,
+                version: None,
+            }),
+            None,
+        );
+        assert!(matches!(old.status, CheckStatus::Error), "{old:?}");
+        assert!(
+            old.hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("predates SOURCE_DATE_EPOCH"),
+            "{old:?}"
+        );
+    }
+
+    #[test]
+    fn kernel_version_parse_and_compare() {
+        assert_eq!(parse_kernel_version("6.8.0-42-generic"), Some(vec![6, 8]));
+        assert_eq!(parse_kernel_version("5.10"), Some(vec![5, 10]));
+        assert_eq!(parse_kernel_version(""), None);
+        assert_eq!(parse_kernel_version("generic"), None);
+
+        assert!(kernel_below(&[5, 9], &[5, 10]));
+        assert!(!kernel_below(&[5, 10], &[5, 10]));
+        assert!(!kernel_below(&[6, 0], &[5, 10]));
+        assert!(!kernel_below(&[5, 10, 1], &[5, 10]));
+        assert!(kernel_below(&[5, 9, 9], &[5, 10]));
+    }
+
+    #[test]
+    fn min_kernel_notice_warns_only_below_the_floor() {
+        // Below the floor: warn-only line naming both versions.
+        let below = min_kernel_notice_with(Some("5.4.0-42-generic\n"), Some("5.10")).unwrap();
+        assert!(below.contains("5.4.0") && below.contains("5.10"), "{below}");
+        assert!(below.contains("warning"), "{below}");
+
+        // At or above: quiet.
+        assert_eq!(
+            min_kernel_notice_with(Some("6.8.0-42-generic"), Some("5.10")),
+            None
+        );
+        assert_eq!(min_kernel_notice_with(Some("5.10.0"), Some("5.10")), None);
+
+        // No floor in the manifest: nothing at all.
+        assert_eq!(min_kernel_notice_with(Some("4.1.0"), None), None);
+
+        // An unparsable release is named, never silently skipped.
+        let unparsable = min_kernel_notice_with(Some("generic-build"), Some("5.10")).unwrap();
+        assert!(
+            unparsable.contains("kernel version unparsable"),
+            "{unparsable}"
+        );
+        let missing = min_kernel_notice_with(None, Some("5.10")).unwrap();
+        assert!(missing.contains("kernel version unparsable"), "{missing}");
+    }
+
+    #[test]
+    fn stale_notice_fires_only_on_a_version_mismatch() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _guard = ToolsDirGuard::at(root.path());
+
+        // Nothing installed: not stale.
+        assert_eq!(stale_notice(), None);
+
+        // A pointer off the manifest's tools_version is stale.
+        std::fs::write(root.path().join("current"), "7\n").unwrap();
+        let notice = stale_notice().unwrap();
+        let manifest_v = format!("manifest v{}", tools::manifest().tools_version);
+        assert!(
+            notice.contains("installed v7") && notice.contains(&manifest_v),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("shuttle doctor --fix")
+                && notice.contains("SHUTTLE_TOOLS_DIR")
+                && notice.contains("SHUTTLE_TOOL_<NAME>"),
+            "stale reports must carry the fix and the escape hatches: {notice}"
+        );
+    }
+
+    #[test]
+    fn run_probe_classifies_a_nonexecutable_file_as_noexec() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("data.bin");
+        std::fs::write(&plain, b"not executable").unwrap();
+        match run_probe(&plain, &[]) {
+            ProbeRun::Noexec(e) => {
+                let hint = noexec_hint("the resolved tool", &e);
+                assert!(
+                    hint.contains("noexec") && hint.contains("SHUTTLE_TOOLS_DIR"),
+                    "the noexec diagnostic names the cause and workaround: {hint}"
+                );
+            }
+            other => panic!("expected Noexec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn squashfs_probe_round_trips_content_with_a_fake_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = write_script(dir.path(), "mksquashfs", FAKE_MKSQUASHFS_BODY);
+        let us = write_script(dir.path(), "unsquashfs", FAKE_UNSQUASHFS_BODY);
+        let note = squashfs_roundtrip(&mk, &us).unwrap_or_else(|e| panic!("probe failed: {e}"));
+        assert!(note.contains("content"), "{note}");
+    }
+
+    #[test]
+    fn squashfs_probe_fails_named_when_unpacking_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = write_script(dir.path(), "mksquashfs", FAKE_MKSQUASHFS_BODY);
+        let us = write_script(
+            dir.path(),
+            "unsquashfs",
+            "#!/bin/sh\necho boom >&2\nexit 7\n",
+        );
+        let err = squashfs_roundtrip(&mk, &us).unwrap_err();
+        assert!(
+            err.contains("unsquashfs exited 7"),
+            "the failing step is named: {err}"
+        );
+    }
+
+    #[test]
+    fn squashfs_probe_fails_named_when_content_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = write_script(dir.path(), "mksquashfs", FAKE_MKSQUASHFS_BODY);
+        // "Packs" but writes an empty probe file: content lost in transit.
+        let us = write_script(
+            dir.path(),
+            "unsquashfs",
+            "#!/bin/sh\nmkdir -p \"$2\"\n: > \"$2/probe.txt\"\n",
+        );
+        let err = squashfs_roundtrip(&mk, &us).unwrap_err();
+        assert!(
+            err.contains("did not survive"),
+            "a silent fidelity loss is an error, not a pass: {err}"
+        );
+    }
+
+    #[test]
+    fn bwrap_probe_target_falls_through_to_sh_and_fails_named_when_none() {
+        let sh = bwrap_probe_target_from(&["/nonexistent-probe-true", "/bin/sh"])
+            .expect("/bin/sh exists on every Linux");
+        assert_eq!(sh.0, "/bin/sh");
+        assert_eq!(sh.1, vec!["-c", "exit 0"]);
+        assert_eq!(
+            bwrap_probe_target_from(&["/nonexistent-probe-true"]),
+            None,
+            "no candidate exists -> the probe fails closed with a named cause"
+        );
+    }
+
+    #[test]
+    fn bwrap_probe_passes_a_real_sandbox_exec_and_names_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = write_script(dir.path(), "bwrap", "#!/bin/sh\nexit 0\n");
+        let ok = bwrap_probe_check(&good);
+        assert!(matches!(ok.status, CheckStatus::Ok), "{ok:?}");
+        assert!(
+            ok.hint.as_deref().unwrap_or_default().contains("--ro-bind"),
+            "the pass line names the real sandbox exec: {ok:?}"
+        );
+
+        let userns = write_script(
+            dir.path(),
+            "bwrap-userns",
+            "#!/bin/sh\necho 'bwrap: setting up uid map: Permission denied' >&2\nexit 1\n",
+        );
+        let failed = bwrap_probe_check(&userns);
+        assert!(matches!(failed.status, CheckStatus::Error), "{failed:?}");
+        let hint = failed.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("user namespaces appear disabled"),
+            "a uid-map failure names the userns cause: {hint}"
+        );
+    }
+
+    #[test]
+    fn getfattr_output_parser_reads_both_shapes() {
+        // GNU getfattr prints a header plus the quoted attribute.
+        let gnu = "# file: probe.txt\nuser.probe=\"shuttle-probe\"\n";
+        assert_eq!(parse_getfattr_value(gnu).as_deref(), Some("shuttle-probe"));
+        // busybox getfattr prints just the name="value" line.
+        assert_eq!(
+            parse_getfattr_value("user.probe=\"shuttle-probe\"\n").as_deref(),
+            Some("shuttle-probe")
+        );
+        assert_eq!(parse_getfattr_value(""), None);
+        assert_eq!(parse_getfattr_value("# file: x\n"), None);
+    }
+
+    #[test]
+    fn probe_checks_resolve_through_the_provisioned_set() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _guard = ToolsDirGuard::at(root.path());
+        provision_fake_set(
+            root.path(),
+            3,
+            &[
+                ("mksquashfs", FAKE_MKSQUASHFS_BODY),
+                ("unsquashfs", FAKE_UNSQUASHFS_BODY),
+                ("bwrap", "#!/bin/sh\nexit 0\n"),
+            ],
+        );
+
+        let checks = probe_checks();
+        assert_eq!(checks.len(), 2, "pair + bwrap resolve: {checks:?}");
+        for name in ["probe: squashfs round-trip", "probe: bwrap sandbox exec"] {
+            let check = checks.iter().find(|c| c.name == name).unwrap();
+            assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        }
+        // The floor-tool origin report reads the same set.
+        let origin = check_floor_tool(ToolName::Mksquashfs);
+        assert!(matches!(origin.status, CheckStatus::Ok), "{origin:?}");
+        let hint = origin.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.starts_with("provisioned") && hint.contains("tools v3"),
+            "{hint}"
+        );
     }
 }

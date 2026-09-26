@@ -167,6 +167,18 @@ pub enum Command {
         /// image tools like ukify are not required on pod-only machines.
         #[arg(long)]
         pod: bool,
+
+        /// Provision the floor tools first (issue #101 disposition (c)),
+        /// then re-run the pod check section as the post-fix table.
+        /// Explicit consent — doctor never auto-provisions without it.
+        #[arg(long)]
+        fix: bool,
+
+        /// With --fix: provision from a local directory of pre-fetched
+        /// artifacts (offline; identical sha256 verify path) instead of
+        /// the pinned release URLs.
+        #[arg(long)]
+        from: Option<String>,
     },
 
     /// Validate a Lua definition without building: bounded subprocess eval

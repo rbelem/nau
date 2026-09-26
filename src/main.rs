@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Parser;
+use miette::{IntoDiagnostic, WrapErr};
 use shuttle::cache::PackageCache;
 use shuttle::cli::{
     CacheCommand, Cli, Command, DepsCommand, IndexCommand, KeyCommand, PodCommand, RuntimeCommand,
@@ -147,7 +148,7 @@ fn main() -> miette::Result<()> {
 
         Command::Index(sub) => cmd_index(sub),
 
-        Command::Doctor { pod } => cmd_doctor(pod),
+        Command::Doctor { pod, fix, from } => cmd_doctor(pod, fix, from.as_deref()),
 
         Command::Check { file, json } => {
             shuttle::output::set_mode(json);
@@ -1925,13 +1926,32 @@ fn build_one_image(
 
 // ── Doctor command ──
 
-fn cmd_doctor(pod: bool) -> miette::Result<()> {
-    let checks = if pod {
+fn cmd_doctor(pod: bool, fix: bool, from: Option<&str>) -> miette::Result<()> {
+    if from.is_some() && !fix {
+        miette::bail!("--from requires --fix: doctor only provisions with explicit consent");
+    }
+    if fix {
+        let source = match from {
+            Some(dir) => shuttle::tools::ProvisionSource::FromDir(PathBuf::from(dir)),
+            None => shuttle::tools::ProvisionSource::Fetch,
+        };
+        println!("provisioning floor tools (issue #101)...");
+        let installed = shuttle::tools::provision(source)
+            .into_diagnostic()
+            .wrap_err("floor-tool provisioning failed")?;
+        println!(
+            "  ✓ floor tools provisioned — tools v{} active in {}",
+            installed.tools_version,
+            installed.bin_dir.display()
+        );
+    }
+    let checks = if pod || fix {
         shuttle::doctor::run_pod()
     } else {
         shuttle::doctor::run_all()
     };
     shuttle::doctor::print_report(&checks);
+    shuttle::doctor::print_notices();
     if !shuttle::doctor::all_ok(&checks) {
         std::process::exit(1);
     }
