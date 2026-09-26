@@ -103,6 +103,18 @@ fn env_snap_id(name: &str) -> Option<String> {
 /// Client for querying and downloading from the Snap Store.
 pub struct StoreClient;
 
+/// The curl binary path through the tools module (issue #101): curl
+/// resolves PATH-first with the provisioned fallback, and `ensure` is its
+/// mid-build entry (for curl it is the resolve path).
+fn curl_tool() -> miette::Result<PathBuf> {
+    let resolved = crate::tools::ensure(crate::tools::ToolName::Curl)
+        .map_err(|e| miette::miette!("resolve curl: {e}"))?;
+    Ok(match resolved {
+        crate::tools::ResolvedTool::Provisioned { path, .. }
+        | crate::tools::ResolvedTool::Path { path, .. } => path,
+    })
+}
+
 impl StoreClient {
     /// Query the store for a snap's metadata.
     ///
@@ -111,7 +123,7 @@ impl StoreClient {
         let url = format!("https://api.snapcraft.io/v2/snaps/info/{name}");
 
         let argv = vec![
-            "curl".to_string(),
+            curl_tool()?.to_string_lossy().into_owned(),
             "-s".to_string(),
             "-H".to_string(),
             "Snap-Device-Series: 16".to_string(),
@@ -275,7 +287,7 @@ impl StoreClient {
             .map_err(|e| miette::miette!("failed to create {:?}: {e}", output_dir))?;
 
         let argv = vec![
-            "curl".to_string(),
+            curl_tool()?.to_string_lossy().into_owned(),
             "-fsSL".to_string(),
             "-o".to_string(),
             output_path.to_string_lossy().into_owned(),

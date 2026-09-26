@@ -330,12 +330,23 @@ pub(crate) struct PiBootStage<'a> {
     pub(crate) root_partuuid: &'a str,
 }
 
+/// The unsquashfs argv[0] (issue #101 seam): resolved through the tools
+/// module (provisioned-first, PATH fallback).
+fn unsquashfs_argv0() -> miette::Result<String> {
+    let resolved = crate::tools::resolve(crate::tools::ToolName::Unsquashfs)
+        .map_err(|e| miette::miette!("resolve unsquashfs: {e}"))?;
+    Ok(match resolved {
+        crate::tools::ResolvedTool::Provisioned { path, .. }
+        | crate::tools::ResolvedTool::Path { path, .. } => path.to_string_lossy().into_owned(),
+    })
+}
+
 /// Run the gadget-snap unsquashfs, failing closed — the boot partition has
 /// no content without it (Required policy, mirroring
 /// [`crate::image::staging`]'s kernel extraction).
 fn unsquashfs_gadget(runner: &dyn CommandRunner, snap: &Path, dir: &Path) -> miette::Result<()> {
     let argv = vec![
-        "unsquashfs".to_string(),
+        unsquashfs_argv0()?,
         "-d".to_string(),
         dir.to_string_lossy().into_owned(),
         "-no-xattrs".to_string(),
@@ -796,8 +807,19 @@ mod tests {
 
     impl CommandRunner for GadgetRunner {
         fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput> {
-            let program = argv.first().map(String::as_str).unwrap_or("");
-            match program {
+            // argv[0] is a bare tool name or an absolute path resolved
+            // through the tools module (issue #101) — dispatch on the
+            // basename either way.
+            let program = argv
+                .first()
+                .map(|p| {
+                    Path::new(p)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.clone())
+                })
+                .unwrap_or_default();
+            match program.as_str() {
                 "unsquashfs" => {
                     let dir = argv
                         .iter()

@@ -666,6 +666,18 @@ fn cache_write(cache_dir: &Path, query: &serde_json::Value, fetched: &Fetched) {
     let _ = std::fs::write(cache_path(cache_dir, query), entry.to_string());
 }
 
+/// The curl binary path through the tools module (issue #101): curl
+/// resolves PATH-first with the provisioned fallback, and `ensure` is its
+/// mid-build entry (for curl it is the resolve path).
+fn curl_tool() -> miette::Result<PathBuf> {
+    let resolved = crate::tools::ensure(crate::tools::ToolName::Curl)
+        .map_err(|e| miette::miette!("resolve curl: {e}"))?;
+    Ok(match resolved {
+        crate::tools::ResolvedTool::Provisioned { path, .. }
+        | crate::tools::ResolvedTool::Path { path, .. } => path,
+    })
+}
+
 /// POST one querybatch chunk to the OSV endpoint via curl (the repo's
 /// HTTP client — no new dependencies). Bounded: 5s connect, 60s total.
 fn curl_querybatch(
@@ -678,7 +690,8 @@ fn curl_querybatch(
     let body = json!({ "queries": queries });
     std::fs::write(&inp, body.to_string())
         .map_err(|e| miette::miette!("writing OSV request: {e}"))?;
-    let out = std::process::Command::new("curl")
+    let curl = curl_tool()?;
+    let out = std::process::Command::new(&curl)
         .args([
             "-fsSL",
             "--connect-timeout",

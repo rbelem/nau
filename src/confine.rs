@@ -277,14 +277,21 @@ fn run_bwrap(
     args: &[String],
     vars: &std::collections::BTreeMap<String, String>,
 ) -> miette::Result<()> {
-    let bwrap = resolve_tool("bwrap").ok_or_else(|| {
+    // Floor-tool seam (issue #101): bwrap resolves provisioned-first with
+    // PATH fallback; a tool error still fails closed.
+    let bwrap = crate::tools::resolve(crate::tools::ToolName::Bwrap).map_err(|_| {
         miette::miette!(
             "confined app '{app}' uses the bwrap backend, but bubblewrap is not \
-             installed on this host — refusing to run unconfined. Install bubblewrap \
-             (e.g. `apt install bubblewrap`) or override the package to unconfined \
-             via the pod declaration."
+             available on this host (no provisioned set and none on PATH) — refusing \
+             to run unconfined. Run `shuttle doctor --fix` to provision it, install \
+             bubblewrap (e.g. `apt install bubblewrap`), or override the package to \
+             unconfined via the pod declaration."
         )
     })?;
+    let bwrap = match bwrap {
+        crate::tools::ResolvedTool::Provisioned { path, .. }
+        | crate::tools::ResolvedTool::Path { path, .. } => path,
+    };
     if !userns_available() {
         return Err(miette::miette!(
             "confined app '{app}' uses the bwrap backend, but unprivileged user \

@@ -4337,6 +4337,18 @@ fn is_shared_lib_name(name: &str) -> bool {
 /// [`StagePolicy::Explicit`] it is never wiped (an existing non-empty
 /// explicit stage is rejected up front by [`check_explicit_stage`]).
 ///
+/// Resolve a floor tool (issue #101) through the tools module — its
+/// per-tool precedence (provisioned-first, curl PATH-first) with PATH
+/// fallback — to the executable path every floor-tool spawn uses.
+fn floor_tool(name: crate::tools::ToolName) -> miette::Result<PathBuf> {
+    let resolved =
+        crate::tools::resolve(name).map_err(|e| miette::miette!("resolve {name}: {e}"))?;
+    Ok(match resolved {
+        crate::tools::ResolvedTool::Provisioned { path, .. }
+        | crate::tools::ResolvedTool::Path { path, .. } => path,
+    })
+}
+
 /// `pod_store` is `Some` only when building into a pod's store (issue #9):
 /// it is what a build-time interpreter wrapper bakes the script's
 /// content-addressed store path from (see [`emit_build_wrappers`]). The
@@ -4460,7 +4472,8 @@ pub fn build_snap(
     // 5. Run mksquashfs with optional SOURCE_DATE_EPOCH
     let pack_spinner = output::spinner(&format!("packaging {} as .snap...", meta.name));
     let compression = meta.compression.as_deref().unwrap_or("xz");
-    let mut mksquashfs = std::process::Command::new("mksquashfs");
+    let mut mksquashfs =
+        std::process::Command::new(floor_tool(crate::tools::ToolName::Mksquashfs)?);
     mksquashfs
         .arg(build_dir.path())
         .arg(&output_path)
@@ -4676,7 +4689,8 @@ fn run_build(
     let tarball = build_path.join(filename);
 
     let dl_spinner = output::spinner(&format!("downloading {}...", pkg_label));
-    let status = std::process::Command::new("curl")
+    let curl = floor_tool(crate::tools::ToolName::Curl)?;
+    let status = std::process::Command::new(&curl)
         .args(["-fsSL", "-o", &tarball.to_string_lossy(), source_url])
         .status()
         .map_err(|e| miette::miette!("curl not found: {}", e))?;
@@ -4916,7 +4930,8 @@ fn fetch_and_extract_source(
     // source tree directory.
     let tarball = build_path.join(format!(".dl-{name}.download"));
     let dl_spinner = output::spinner(&format!("downloading source '{name}'..."));
-    let status = std::process::Command::new("curl")
+    let curl = floor_tool(crate::tools::ToolName::Curl)?;
+    let status = std::process::Command::new(&curl)
         .args(["-fsSL", "-o", &tarball.to_string_lossy(), url])
         .status()
         .map_err(|e| miette::miette!("curl not found: {}", e))?;
@@ -6724,7 +6739,9 @@ fn unpack_tar<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Result<()> {
 /// The external-`tar` fallback for formats the in-process crates do not
 /// cover. Same spawn the pre-#170 code used for every archive.
 fn extract_tarball_external(archive: &Path, dest: &Path) -> std::io::Result<()> {
-    let status = std::process::Command::new("tar")
+    let tar = floor_tool(crate::tools::ToolName::Tar)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let status = std::process::Command::new(&tar)
         .arg("xf")
         .arg(archive)
         .arg("-C")
@@ -8188,7 +8205,9 @@ mod tests {
         );
 
         // Verify it's a valid SquashFS via unsquashfs
-        let check = std::process::Command::new("unsquashfs")
+        let unsquashfs =
+            floor_tool(crate::tools::ToolName::Unsquashfs).expect("unsquashfs should be available");
+        let check = std::process::Command::new(&unsquashfs)
             .args(["-l", &snap_path.to_string_lossy()])
             .output()
             .expect("unsquashfs should be available");
@@ -8260,7 +8279,9 @@ mod tests {
 
         // Verify both have correct arch in YAML
         for snap_result in [&snap_amd64, &snap_arm64] {
-            let check = std::process::Command::new("unsquashfs")
+            let unsquashfs = floor_tool(crate::tools::ToolName::Unsquashfs)
+                .expect("unsquashfs should be available");
+            let check = std::process::Command::new(&unsquashfs)
                 .args([
                     "-l",
                     &output_dir
@@ -9754,7 +9775,9 @@ mod tests {
         assert!(snap_path.exists());
 
         // Hook script and icon must be inside the snap.
-        let listing = std::process::Command::new("unsquashfs")
+        let unsquashfs =
+            floor_tool(crate::tools::ToolName::Unsquashfs).expect("unsquashfs should be available");
+        let listing = std::process::Command::new(&unsquashfs)
             .args(["-l", &snap_path.to_string_lossy()])
             .output()
             .expect("unsquashfs should be available");
@@ -9764,7 +9787,7 @@ mod tests {
 
         // Extract snap.yaml and check the emitted hook command + icon path.
         let extract_dir = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("unsquashfs")
+        let status = std::process::Command::new(&unsquashfs)
             .args([
                 "-f",
                 "-d",
@@ -10473,7 +10496,8 @@ mod tests {
         let payload = dir.join("payload");
         std::fs::create_dir_all(payload.join(top)).unwrap();
         std::fs::write(payload.join(top).join("echo.txt"), top).unwrap();
-        let tar = std::process::Command::new("tar")
+        let tar_bin = floor_tool(crate::tools::ToolName::Tar).expect("tar should be available");
+        let tar = std::process::Command::new(&tar_bin)
             .args(["czf", "-", "-C"])
             .arg(&payload)
             .arg(top)

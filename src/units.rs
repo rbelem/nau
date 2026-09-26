@@ -519,6 +519,18 @@ pub fn emit_app_runtime(
     Ok(all_warnings)
 }
 
+/// The unsquashfs argv[0] (issue #101 seam): resolved through the tools
+/// module (provisioned-first, PATH fallback). A resolution failure means
+/// the emit cannot extract — the per-payload skip path reports it.
+fn unsquashfs_argv0() -> miette::Result<String> {
+    let resolved = crate::tools::resolve(crate::tools::ToolName::Unsquashfs)
+        .map_err(|e| miette::miette!("resolve unsquashfs: {e}"))?;
+    Ok(match resolved {
+        crate::tools::ResolvedTool::Provisioned { path, .. }
+        | crate::tools::ResolvedTool::Path { path, .. } => path.to_string_lossy().into_owned(),
+    })
+}
+
 /// Emit runtime for one payload: classify, extract binaries, write
 /// units. Warnings are returned; hard failures mean the rootfs cannot
 /// be written and abort the build.
@@ -534,7 +546,7 @@ fn emit_one_snap(
     // 1. Read meta/snap.yaml out of the payload (single-file
     //    extraction, same tool + flags as the base-rootfs flow).
     let argv = vec![
-        "unsquashfs".to_string(),
+        unsquashfs_argv0()?,
         "-no-xattrs".to_string(),
         "-d".to_string(),
         extract_dir.to_string_lossy().into_owned(),
@@ -592,7 +604,7 @@ fn emit_one_snap(
         file_args.push(plan.in_snap_binary.clone());
     }
     let mut argv = vec![
-        "unsquashfs".to_string(),
+        unsquashfs_argv0()?,
         "-no-xattrs".to_string(),
         "-d".to_string(),
         extract_dir.join("files").to_string_lossy().into_owned(),
@@ -652,6 +664,20 @@ fn emit_one_snap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A floor-tool spawn (issue #101 seam) for gated fixtures: resolves
+    /// through the tools module (provisioned-first, PATH fallback);
+    /// callers gate availability first.
+    fn floor_tool(tool: crate::tools::ToolName) -> std::process::Command {
+        let path = match crate::tools::resolve(tool) {
+            Ok(
+                crate::tools::ResolvedTool::Provisioned { path, .. }
+                | crate::tools::ResolvedTool::Path { path, .. },
+            ) => path,
+            Err(_) => panic!("{tool} unavailable"),
+        };
+        std::process::Command::new(path)
+    }
 
     fn daemon_spec() -> AppUnitSpec {
         let mut env = BTreeMap::new();
@@ -1027,7 +1053,7 @@ plugs:
             .unwrap();
         }
         let payload = dir.join("my-snap_1_abc.snap");
-        let status = std::process::Command::new("mksquashfs")
+        let status = floor_tool(crate::tools::ToolName::Mksquashfs)
             .arg(&tree)
             .arg(&payload)
             .arg("-noappend")
@@ -1122,7 +1148,7 @@ plugs:
             .replace("name: my-snap", "name: store-snap\ntype: store");
         std::fs::write(tree.join("meta/snap.yaml"), yaml).unwrap();
         let payload = work.path().join("store_1_def.snap");
-        let status = std::process::Command::new("mksquashfs")
+        let status = floor_tool(crate::tools::ToolName::Mksquashfs)
             .arg(tree)
             .arg(&payload)
             .arg("-noappend")

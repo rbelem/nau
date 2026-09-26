@@ -2086,10 +2086,23 @@ fn write_store_blob(store: &RuntimeStore, bytes: &[u8]) -> miette::Result<String
 
 // ── Small shared helpers ──
 
+/// The curl binary path through the tools module (issue #101): curl
+/// resolves PATH-first with the provisioned fallback, and `ensure` is its
+/// mid-build entry (for curl it is the resolve path).
+fn curl_tool() -> miette::Result<PathBuf> {
+    let resolved = crate::tools::ensure(crate::tools::ToolName::Curl)
+        .map_err(|e| miette::miette!("resolve curl: {e}"))?;
+    Ok(match resolved {
+        crate::tools::ResolvedTool::Provisioned { path, .. }
+        | crate::tools::ResolvedTool::Path { path, .. } => path,
+    })
+}
+
 /// curl download (the codebase's one network mechanism). A User-Agent is
 /// mandatory registry etiquette — crates.io 403s requests without one.
 fn http_get_to_file(url: &str, dest: &Path) -> miette::Result<()> {
-    let status = std::process::Command::new("curl")
+    let curl = curl_tool()?;
+    let status = std::process::Command::new(&curl)
         .args([
             "-fsSL",
             "-A",

@@ -913,7 +913,14 @@ fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
                     "fetch(): only http(s) URLs are supported",
                 ));
             }
-            let out = std::process::Command::new("curl")
+            let curl = match crate::tools::ensure(crate::tools::ToolName::Curl) {
+                Ok(resolved) => match resolved {
+                    crate::tools::ResolvedTool::Provisioned { path, .. }
+                    | crate::tools::ResolvedTool::Path { path, .. } => path,
+                },
+                Err(e) => return Err(mlua::Error::runtime(format!("fetch(): {e}"))),
+            };
+            let out = std::process::Command::new(&curl)
                 .args(["-fsSL", "--max-time", "30", "--", &url])
                 .output()
                 .map_err(|e| mlua::Error::runtime(format!("fetch(): curl spawn failed: {e}")))?;

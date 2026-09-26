@@ -6406,8 +6406,19 @@ RequiredBy=boot-complete.target
         impl CommandRunner for E2eRunner {
             fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput> {
                 self.calls.lock().unwrap().push(argv.to_vec());
-                let program = argv.first().map(String::as_str).unwrap_or("");
-                match program {
+                // argv[0] is a bare tool name or an absolute path resolved
+                // through the tools module (issue #101) — dispatch on the
+                // basename either way.
+                let program = argv
+                    .first()
+                    .map(|p| {
+                        std::path::Path::new(p)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.clone())
+                    })
+                    .unwrap_or_default();
+                match program.as_str() {
                     "which" => Ok(out(0, Vec::new())), // unsquashfs + sfdisk + patchelf present
                     "patchelf" => {
                         // #81 embed seam: the fake binary reads as requesting
@@ -6693,10 +6704,10 @@ RequiredBy=boot-complete.target
                 "unsquashfs availability checked through the runner: {calls:?}"
             );
             assert!(
-                calls
-                    .iter()
-                    .any(|c| c.first().is_some_and(|p| p == "unsquashfs")
-                        && c.iter().any(|a| a == "-no-xattrs")),
+                calls.iter().any(|c| c.first().is_some_and(|p| {
+                    std::path::Path::new(p).file_name().and_then(|n| n.to_str())
+                        == Some("unsquashfs")
+                }) && c.iter().any(|a| a == "-no-xattrs")),
                 "base snap extracted through the runner: {calls:?}"
             );
             let mk = calls

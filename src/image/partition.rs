@@ -1610,14 +1610,25 @@ fn store_name_for(name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
-/// Unpack a snap file into a directory with unsquashfs (the runner resolves
-/// it from PATH; presence was checked by the caller).
+/// The unsquashfs argv[0] (issue #101 seam): resolved through the tools
+/// module (provisioned-first, PATH fallback).
+fn unsquashfs_argv0() -> miette::Result<String> {
+    let resolved = crate::tools::resolve(crate::tools::ToolName::Unsquashfs)
+        .map_err(|e| miette::miette!("resolve unsquashfs: {e}"))?;
+    Ok(match resolved {
+        crate::tools::ResolvedTool::Provisioned { path, .. }
+        | crate::tools::ResolvedTool::Path { path, .. } => path.to_string_lossy().into_owned(),
+    })
+}
+
+/// Unpack a snap file into a directory with unsquashfs (resolved through
+/// the tools module; presence was checked by the caller).
 fn unpack_snap(runner: &dyn CommandRunner, snap: &Path, dest: &Path) -> miette::Result<()> {
     std::fs::create_dir_all(dest)
         .into_diagnostic()
         .wrap_err_with(|| format!("creating {}", dest.display()))?;
     let argv = vec![
-        "unsquashfs".to_string(),
+        unsquashfs_argv0()?,
         "-f".to_string(),
         "-d".to_string(),
         dest.to_string_lossy().into_owned(),

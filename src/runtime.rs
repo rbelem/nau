@@ -404,7 +404,9 @@ impl RuntimeTools {
     /// Resolve every tool from the host PATH.
     pub fn from_host() -> RuntimeTools {
         RuntimeTools {
-            unsquashfs: find_on_path("unsquashfs"),
+            // unsquashfs rides the floor-tool seam (issue #101):
+            // provisioned-first, PATH fallback.
+            unsquashfs: tools_unsquashfs(),
             systemd_sysext: find_on_path("systemd-sysext"),
             systemctl: find_on_path("systemctl"),
             bootctl: find_on_path("bootctl"),
@@ -484,6 +486,19 @@ pub(crate) fn find_on_path(tool: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The unsquashfs for on-device installs (issue #101): resolved through
+/// the tools module (provisioned-first, PATH fallback). `None` keeps the
+/// install path fail-closed.
+fn tools_unsquashfs() -> Option<PathBuf> {
+    match crate::tools::resolve(crate::tools::ToolName::Unsquashfs) {
+        Ok(
+            crate::tools::ResolvedTool::Provisioned { path, .. }
+            | crate::tools::ResolvedTool::Path { path, .. },
+        ) => Some(path),
+        Err(_) => None,
+    }
 }
 
 #[cfg(unix)]
@@ -1113,8 +1128,9 @@ impl RuntimeStore {
     ) -> miette::Result<PreparedSnap> {
         let unsquashfs = tools.unsquashfs.as_ref().ok_or_else(|| {
             miette::miette!(
-                "unsquashfs not found on PATH — on-device install cannot unpack \
-                 payloads; install squashfs-tools"
+                "no provisioned unsquashfs and none on PATH — on-device install \
+                 cannot unpack payloads; run `shuttle doctor --fix` or install \
+                 squashfs-tools"
             )
         })?;
 
@@ -2941,6 +2957,20 @@ mod tests {
         find_on_path(tool).is_some()
     }
 
+    /// A floor-tool spawn (issue #101 seam) for gated fixtures: the tool
+    /// resolves through the tools module (provisioned-first, PATH
+    /// fallback); callers gate availability first.
+    fn floor_tool(tool: crate::tools::ToolName) -> std::process::Command {
+        let path = match crate::tools::resolve(tool) {
+            Ok(
+                crate::tools::ResolvedTool::Provisioned { path, .. }
+                | crate::tools::ResolvedTool::Path { path, .. },
+            ) => path,
+            Err(_) => panic!("{tool} unavailable"),
+        };
+        std::process::Command::new(path)
+    }
+
     /// Pack a minimal shoot-built payload with mksquashfs (units.rs
     /// test pattern); None when the squashfs tools are unavailable.
     fn pack_payload(dir: &Path) -> Option<PathBuf> {
@@ -2986,7 +3016,7 @@ plugs:
         )
         .unwrap();
         let payload = dir.join("my-snap_1_abc.snap");
-        let status = std::process::Command::new("mksquashfs")
+        let status = floor_tool(crate::tools::ToolName::Mksquashfs)
             .arg(&tree)
             .arg(&payload)
             .arg("-noappend")
@@ -3480,7 +3510,7 @@ plugs:
         )
         .unwrap();
         let payload = work.path().join("core22_1_abc.snap");
-        let status = std::process::Command::new("mksquashfs")
+        let status = floor_tool(crate::tools::ToolName::Mksquashfs)
             .arg(&tree)
             .arg(&payload)
             .arg("-noappend")

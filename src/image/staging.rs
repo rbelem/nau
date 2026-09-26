@@ -108,6 +108,17 @@ pub(crate) fn check_declared_base(
     }
 }
 
+/// The unsquashfs argv[0] (issue #101 seam): resolved through the tools
+/// module (provisioned-first, PATH fallback).
+fn unsquashfs_argv0() -> miette::Result<String> {
+    let resolved = crate::tools::resolve(crate::tools::ToolName::Unsquashfs)
+        .map_err(|e| miette::miette!("resolve unsquashfs: {e}"))?;
+    Ok(match resolved {
+        crate::tools::ResolvedTool::Provisioned { path, .. }
+        | crate::tools::ResolvedTool::Path { path, .. } => path.to_string_lossy().into_owned(),
+    })
+}
+
 /// Read the declared `base:` out of a downloaded snap payload by
 /// single-file extracting `meta/snap.yaml` (same tool + flags as the
 /// runtime emitter). `Ok(None)` means the metadata could not be read or
@@ -116,7 +127,7 @@ pub(crate) fn payload_declared_base(runner: &dyn CommandRunner, payload: &Path) 
     let work = tempfile::tempdir().ok()?;
     let extract_dir = work.path().join("extract");
     let argv = vec![
-        "unsquashfs".to_string(),
+        unsquashfs_argv0().ok()?,
         "-no-xattrs".to_string(),
         "-d".to_string(),
         extract_dir.to_string_lossy().into_owned(),
@@ -1603,7 +1614,7 @@ fn run_base_unsquashfs(
 ) -> miette::Result<()> {
     eprintln!("  extracting base snap into {:?}", root);
     let argv = vec![
-        "unsquashfs".to_string(),
+        unsquashfs_argv0()?,
         "-d".to_string(),
         root.to_string_lossy().into_owned(),
         "-no-xattrs".to_string(),
@@ -1765,7 +1776,7 @@ fn unsquashfs_kernel(
     policy: KernelPayloadPolicy,
 ) -> miette::Result<bool> {
     let argv = vec![
-        "unsquashfs".to_string(),
+        unsquashfs_argv0()?,
         "-d".to_string(),
         kernel_dir.to_string_lossy().into_owned(),
         "-no-xattrs".to_string(),

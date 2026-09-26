@@ -141,10 +141,22 @@ pub fn materialize_merged_prefix(payloads: &[Payload]) -> miette::Result<MergedP
     Ok(MergedPrefix { work, path })
 }
 
+/// Resolve a floor tool (issue #101) through the tools module — per-tool
+/// precedence (provisioned-first, curl PATH-first) with PATH fallback.
+fn floor_tool(name: crate::tools::ToolName) -> miette::Result<PathBuf> {
+    let resolved =
+        crate::tools::resolve(name).map_err(|e| miette::miette!("resolve {name}: {e}"))?;
+    Ok(match resolved {
+        crate::tools::ResolvedTool::Provisioned { path, .. }
+        | crate::tools::ResolvedTool::Path { path, .. } => path,
+    })
+}
+
 /// Data-only unpack of a `.snap` (squashfs) into `dest` with `unsquashfs`.
 /// The payload is never executed — files are just extracted.
 fn unpack_snap(snap: &Path, dest: &Path) -> miette::Result<()> {
-    let output = std::process::Command::new("unsquashfs")
+    let unsquashfs = floor_tool(crate::tools::ToolName::Unsquashfs)?;
+    let output = std::process::Command::new(&unsquashfs)
         .arg("-no-progress")
         .arg("-d")
         .arg(dest)
@@ -803,14 +815,8 @@ mod tests {
     /// Skip gate for tests that shell out to squashfs tools (repo convention:
     /// integration-ish tests skip when the tools are unavailable).
     fn squashfs_tools_available() -> bool {
-        std::process::Command::new("mksquashfs")
-            .arg("-version")
-            .output()
-            .is_ok()
-            && std::process::Command::new("unsquashfs")
-                .arg("-version")
-                .output()
-                .is_ok()
+        crate::tools::resolve(crate::tools::ToolName::Mksquashfs).is_ok()
+            && crate::tools::resolve(crate::tools::ToolName::Unsquashfs).is_ok()
     }
 
     /// Build a `.snap` whose payload contains the given rel-path → content
@@ -829,7 +835,9 @@ mod tests {
         }
         let snap = dir.join("test.snap");
         let _ = std::fs::remove_file(&snap);
-        let status = std::process::Command::new("mksquashfs")
+        let mksquashfs =
+            floor_tool(crate::tools::ToolName::Mksquashfs).expect("mksquashfs should be available");
+        let status = std::process::Command::new(&mksquashfs)
             .arg(&payload)
             .arg(&snap)
             .arg("-no-progress")
