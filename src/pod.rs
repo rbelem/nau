@@ -80,7 +80,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::lock::{LockFile, PodPackageLockEntry};
 
@@ -255,6 +255,35 @@ pub fn parse_pod_package(spec: &str) -> miette::Result<PodPackageSpec> {
 
 /// The validated `pod()` declaration. Only fields present in the file are
 /// populated; rendering emits exactly what was declared.
+/// A declared secret reference (ADR-0042 D1/D4): which built-in
+/// provider serves the value and what identifies it. Declarations carry
+/// references only — a value never exists at parse, fold, or
+/// generation-record time (D2); it resolves at serve time (D3). The
+/// serialized shape is the `secrets.json` record shape: tagged by
+/// `source`, keys canonical from the map's sorted iteration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "lowercase")]
+pub enum SecretSource {
+    /// Bitwarden Secrets Manager: `bws secret get <id>`, read `.value`.
+    Bitwarden { id: String },
+    /// Vault/OpenBao KV v2: `GET /v1/{mount}/data/{path}`, field `field`.
+    Vault {
+        mount: String,
+        path: String,
+        field: String,
+    },
+    /// Secret Service (libsecret): at least one attribute pair selects
+    /// the item.
+    Libsecret {
+        attributes: BTreeMap<String, String>,
+    },
+    /// Arbitrary provider via argv — an array of non-empty strings,
+    /// never a shell string. Run, trim stdout.
+    Exec { command: Vec<String> },
+    /// The caller's environment: read `var` at serve time.
+    Env { var: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PodDeclaration {
     /// Pods loaded under this one (`loads = { "base" }`).
@@ -267,6 +296,11 @@ pub struct PodDeclaration {
     /// the resolved map is written to the generation and exported in
     /// this deterministic order (ADR-0016 §7 env hooks).
     pub env: BTreeMap<String, String>,
+    /// Declared secret references (`secrets = { KEY = { source =
+    /// "bitwarden", id = "…" } }`, ADR-0042 D1) — references only, never
+    /// values; values resolve at serve time (D3). Stored sorted like
+    /// `env`, so the generation record is byte-canonical.
+    pub secrets: BTreeMap<String, SecretSource>,
     /// Per-service option overrides (ADR-0032 Decision 3): service name →
     /// option overrides merged over each package-declared service's
     /// options (package defaults < loaded pods < this declaration).
@@ -345,7 +379,7 @@ fn validate_pod_table(table: &mlua::Table) -> miette::Result<PodDeclaration> {
             other => miette::bail!("pod(): keys must be strings, got {}", lua_type_name(other)),
         };
         match key.as_str() {
-            "loads" | "packages" | "overlay" | "env" | "services" => {
+            "loads" | "packages" | "overlay" | "env" | "secrets" | "services" => {
                 if !seen.insert(key.clone()) {
                     miette::bail!("duplicate field '{key}' in pod() declaration");
                 }
@@ -353,8 +387,20 @@ fn validate_pod_table(table: &mlua::Table) -> miette::Result<PodDeclaration> {
             }
             other => miette::bail!(
                 "unknown field '{other}' in pod() declaration \
-                 (allowed: loads, packages, overlay, env, services)"
+                 (allowed: loads, packages, overlay, env, secrets, services)"
             ),
+        }
+    }
+    // A key carries exactly ONE value kind (ADR-0042 D1): env is a
+    // literal, secrets is a reference — both would leave every consumer
+    // guessing which to serve. Declared keys only; a clash ACROSS pods
+    // is the fold's jurisdiction (fold_pod_secrets, D2's hard error).
+    for key in decl.env.keys() {
+        if decl.secrets.contains_key(key) {
+            miette::bail!(
+                "env and secrets both declare '{key}' in pod() declaration — \
+                 a key must have exactly one source (env literal or secret reference)"
+            );
         }
     }
     Ok(decl)
@@ -372,6 +418,7 @@ fn assign_pod_field(
         "packages" => decl.packages = expect_package_list(value)?,
         "overlay" => decl.overlay = expect_overlay(value)?,
         "env" => decl.env = expect_env(value)?,
+        "secrets" => decl.secrets = expect_secrets(value)?,
         "services" => decl.services = expect_service_overrides(value)?,
         _ => unreachable!("validate_pod_table filtered unknown keys"),
     }
@@ -571,14 +618,23 @@ fn expect_service_overrides(
     Ok(out)
 }
 
-/// An env name must be non-empty `[A-Za-z_][A-Za-z0-9_]*`. `PATH` and
-/// `LD_LIBRARY_PATH` are RESERVED: PATH is the pod-computed activation
-/// seam (farm-first prepend per ADR-0028), and `LD_LIBRARY_PATH` stays
-/// pod-managed even though the shell export is gone (ADR-0034) — the
-/// emit-time LD wrappers own it inside pod processes, and a declared
-/// value would be silently overwritten or, worse, re-open the #110
-/// leak. Declare payloads' dirs instead.
+/// An env key must be non-empty `[A-Za-z_][A-Za-z0-9_]*` with the
+/// reserved seams rejected — the shared rule [`validate_declared_key`]
+/// applies with `env` as the surface.
 fn validate_env_key(key: &str) -> miette::Result<()> {
+    validate_declared_key(key, "env")
+}
+
+/// The shared key rule for the pod's declared string-keyed tables —
+/// `env` (ADR-0030) and `secrets` (ADR-0042): a name must be non-empty
+/// `[A-Za-z_][A-Za-z0-9_]*`, and `PATH` / `LD_LIBRARY_PATH` are
+/// RESERVED: PATH is the pod-computed activation seam (farm-first
+/// prepend per ADR-0028), and `LD_LIBRARY_PATH` stays pod-managed even
+/// though the shell export is gone (ADR-0034) — the emit-time LD
+/// wrappers own it inside pod processes, and a declared value would be
+/// silently overwritten or, worse, re-open the #110 leak. Declare
+/// payloads' dirs instead.
+fn validate_declared_key(key: &str, surface: &str) -> miette::Result<()> {
     let mut chars = key.chars();
     let well_formed = match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {
@@ -587,16 +643,271 @@ fn validate_env_key(key: &str) -> miette::Result<()> {
         _ => false,
     };
     if !well_formed {
-        miette::bail!("invalid env key '{key}': must match [A-Za-z_][A-Za-z0-9_]*");
+        miette::bail!("invalid {surface} key '{key}': must match [A-Za-z_][A-Za-z0-9_]*");
     }
     if key == "PATH" || key == "LD_LIBRARY_PATH" {
         miette::bail!(
-            "env key '{key}' is reserved: PATH and LD_LIBRARY_PATH are pod-managed \
+            "{surface} key '{key}' is reserved: PATH and LD_LIBRARY_PATH are pod-managed \
              seams (farm-first PATH per ADR-0028; loader libs per ADR-0034's \
              emit-time wrappers) — a declared value would never survive"
         );
     }
     Ok(())
+}
+
+/// Validate the `secrets` field (ADR-0042 D1): secret name → per-source
+/// reference table. Keys follow [`validate_declared_key`] (reserved
+/// seams included); every entry must declare a string `source` naming a
+/// built-in provider, its per-source fields are checked deep here in
+/// Rust (ADR-0014's boundary rule), unknown fields fail closed (the
+/// snap.rs unknown-field precedent), and `exec` takes an argv array —
+/// never a shell string.
+fn expect_secrets(value: &mlua::Value) -> miette::Result<BTreeMap<String, SecretSource>> {
+    let table = match value {
+        mlua::Value::Table(t) => t,
+        other => miette::bail!(
+            "'secrets' must be a table of secret references, got {}",
+            lua_type_name(other)
+        ),
+    };
+    let mut out = BTreeMap::new();
+    for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
+        let (key, item) = pair.map_err(|e| miette::miette!("'secrets': {e}"))?;
+        let key = match &key {
+            mlua::Value::String(s) => s
+                .to_str()
+                .map_err(|e| miette::miette!("'secrets': non-utf8 key: {e}"))?
+                .to_string(),
+            other => miette::bail!(
+                "'secrets' keys must be strings, got {}",
+                lua_type_name(other)
+            ),
+        };
+        validate_declared_key(&key, "secrets")?;
+        let entry = match &item {
+            mlua::Value::Table(t) => t,
+            other => miette::bail!(
+                "'secrets.{key}' must be a table, got {}",
+                lua_type_name(other)
+            ),
+        };
+        out.insert(key.clone(), expect_secret_source(&key, entry)?);
+    }
+    Ok(out)
+}
+
+/// Every provider name accepted in a `secrets` entry's `source` field
+/// (ADR-0042 D4's built-in registry, v1).
+const SECRET_SOURCES: &str = "bitwarden, vault, libsecret, exec, env";
+
+/// Validate one `secrets` entry: the string `source` tag dispatches to
+/// the per-source parser, which consumes exactly its known fields — any
+/// leftover field is unknown and fails closed.
+fn expect_secret_source(key: &str, table: &mlua::Table) -> miette::Result<SecretSource> {
+    let mut fields: BTreeMap<String, mlua::Value> = BTreeMap::new();
+    let mut source: Option<String> = None;
+    for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
+        let (field, value) = pair.map_err(|e| miette::miette!("'secrets.{key}': {e}"))?;
+        let field = match &field {
+            mlua::Value::String(s) => s
+                .to_str()
+                .map_err(|e| miette::miette!("'secrets.{key}': non-utf8 field name: {e}"))?
+                .to_string(),
+            other => miette::bail!(
+                "'secrets.{key}' field names must be strings, got {}",
+                lua_type_name(other)
+            ),
+        };
+        if field == "source" {
+            source = Some(secret_string(&format!("'secrets.{key}.source'"), &value)?);
+        } else {
+            fields.insert(field, value);
+        }
+    }
+    let source = source.ok_or_else(|| {
+        miette::miette!(
+            "'secrets.{key}' must declare a string 'source' naming one of: {SECRET_SOURCES}"
+        )
+    })?;
+    match source.as_str() {
+        "bitwarden" => secret_bitwarden(key, fields),
+        "vault" => secret_vault(key, fields),
+        "libsecret" => secret_libsecret(key, fields),
+        "exec" => secret_exec(key, fields),
+        "env" => secret_env_source(key, fields),
+        other => miette::bail!(
+            "'secrets.{key}': unknown secret source '{other}' (known sources: {SECRET_SOURCES})"
+        ),
+    }
+}
+
+/// A newline-free non-empty string field of a secret entry (`where`
+/// names the spot for the error, e.g. `'secrets.GITHUB_TOKEN.id'`).
+/// Newlines are rejected because a reference is one JSON record value
+/// and one provider argument — a newline is never a legitimate part of
+/// a reference (ADR-0042 D1; resolved VALUES may contain them, the
+/// declared references may not).
+fn secret_string(where_: &str, value: &mlua::Value) -> miette::Result<String> {
+    let s = match value {
+        mlua::Value::String(s) => s
+            .to_str()
+            .map_err(|e| miette::miette!("{where_}: non-utf8 string: {e}"))?
+            .to_string(),
+        other => miette::bail!("{where_} must be a string, got {}", lua_type_name(other)),
+    };
+    if s.contains('\n') || s.contains('\r') {
+        miette::bail!("{where_} must not contain newlines");
+    }
+    if s.is_empty() {
+        miette::bail!("{where_} must not be empty");
+    }
+    Ok(s)
+}
+
+/// Take one required string field out of a secret entry's remaining
+/// fields (consuming it, so the post-parse leftover check sees only
+/// unknown fields).
+fn secret_string_field(
+    fields: &mut BTreeMap<String, mlua::Value>,
+    key: &str,
+    source: &str,
+    field: &str,
+) -> miette::Result<String> {
+    let value = fields.remove(field).ok_or_else(|| {
+        miette::miette!("'secrets.{key}': source '{source}' requires field '{field}'")
+    })?;
+    secret_string(&format!("'secrets.{key}.{field}'"), &value)
+}
+
+/// Fail closed on fields the chosen source does not declare (the
+/// snap.rs unknown-field precedent): a typo'd field name must not be
+/// silently dropped — it would silently weaken the reference's meaning.
+fn secret_unknown_fields(
+    fields: &BTreeMap<String, mlua::Value>,
+    key: &str,
+    source: &str,
+    allowed: &[&str],
+) -> miette::Result<()> {
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = fields.keys().map(|f| format!("'{f}'")).collect();
+    miette::bail!(
+        "'secrets.{key}': unknown field{} {} for source '{source}' (valid fields: {})",
+        if fields.len() == 1 { "" } else { "s" },
+        names.join(", "),
+        allowed.join(", ")
+    );
+}
+
+fn secret_bitwarden(
+    key: &str,
+    mut fields: BTreeMap<String, mlua::Value>,
+) -> miette::Result<SecretSource> {
+    let id = secret_string_field(&mut fields, key, "bitwarden", "id")?;
+    secret_unknown_fields(&fields, key, "bitwarden", &["id"])?;
+    Ok(SecretSource::Bitwarden { id })
+}
+
+fn secret_vault(
+    key: &str,
+    mut fields: BTreeMap<String, mlua::Value>,
+) -> miette::Result<SecretSource> {
+    let mount = secret_string_field(&mut fields, key, "vault", "mount")?;
+    let path = secret_string_field(&mut fields, key, "vault", "path")?;
+    let field = secret_string_field(&mut fields, key, "vault", "field")?;
+    secret_unknown_fields(&fields, key, "vault", &["mount", "path", "field"])?;
+    Ok(SecretSource::Vault { mount, path, field })
+}
+
+fn secret_libsecret(
+    key: &str,
+    mut fields: BTreeMap<String, mlua::Value>,
+) -> miette::Result<SecretSource> {
+    let value = fields.remove("attributes").ok_or_else(|| {
+        miette::miette!("'secrets.{key}': source 'libsecret' requires field 'attributes'")
+    })?;
+    let table = match &value {
+        mlua::Value::Table(t) => t,
+        other => miette::bail!(
+            "'secrets.{key}.attributes' must be a table of string pairs, got {}",
+            lua_type_name(other)
+        ),
+    };
+    let mut attributes = BTreeMap::new();
+    for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
+        let (name, item) = pair.map_err(|e| miette::miette!("'secrets.{key}.attributes': {e}"))?;
+        let name = match &name {
+            mlua::Value::String(s) => s
+                .to_str()
+                .map_err(|e| miette::miette!("'secrets.{key}.attributes': non-utf8 key: {e}"))?
+                .to_string(),
+            other => miette::bail!(
+                "'secrets.{key}.attributes' keys must be strings, got {}",
+                lua_type_name(other)
+            ),
+        };
+        if name.is_empty() || name.contains('\n') || name.contains('\r') {
+            miette::bail!(
+                "'secrets.{key}.attributes' keys must be non-empty strings without newlines"
+            );
+        }
+        let item = secret_string(&format!("'secrets.{key}.attributes.{name}'"), &item)?;
+        attributes.insert(name, item);
+    }
+    if attributes.is_empty() {
+        miette::bail!("'secrets.{key}': source 'libsecret' requires at least one attribute pair");
+    }
+    secret_unknown_fields(&fields, key, "libsecret", &["attributes"])?;
+    Ok(SecretSource::Libsecret { attributes })
+}
+
+fn secret_exec(
+    key: &str,
+    mut fields: BTreeMap<String, mlua::Value>,
+) -> miette::Result<SecretSource> {
+    let value = fields.remove("command").ok_or_else(|| {
+        miette::miette!("'secrets.{key}': source 'exec' requires field 'command'")
+    })?;
+    let table = match &value {
+        mlua::Value::Table(t) => t,
+        other => miette::bail!(
+            "'secrets.{key}.command' must be an argv array of strings, got {} \
+             (a shell string is not accepted — argv only, ADR-0042 D4)",
+            lua_type_name(other)
+        ),
+    };
+    let mut command = Vec::new();
+    for (position, pair) in table
+        .clone()
+        .pairs::<mlua::Value, mlua::Value>()
+        .enumerate()
+    {
+        let (index, item) = pair.map_err(|e| miette::miette!("'secrets.{key}.command': {e}"))?;
+        let position = position + 1;
+        match index {
+            mlua::Value::Integer(n) if n == position as mlua::Integer => {}
+            _ => miette::bail!(
+                "'secrets.{key}.command' must be a sequential array (expected index {position})"
+            ),
+        }
+        let item = secret_string(&format!("'secrets.{key}.command[{position}]'"), &item)?;
+        command.push(item);
+    }
+    if command.is_empty() {
+        miette::bail!("'secrets.{key}.command' must not be empty");
+    }
+    secret_unknown_fields(&fields, key, "exec", &["command"])?;
+    Ok(SecretSource::Exec { command })
+}
+
+fn secret_env_source(
+    key: &str,
+    mut fields: BTreeMap<String, mlua::Value>,
+) -> miette::Result<SecretSource> {
+    let var = secret_string_field(&mut fields, key, "env", "var")?;
+    secret_unknown_fields(&fields, key, "env", &["var"])?;
+    Ok(SecretSource::Env { var })
 }
 
 fn lua_type_name(value: &mlua::Value) -> &'static str {
@@ -867,6 +1178,17 @@ pub fn render_pod_source(decl: &PodDeclaration) -> String {
         }
         out.push_str("    },\n");
     }
+    if !decl.secrets.is_empty() {
+        out.push_str("    secrets = {\n");
+        for (key, source) in &decl.secrets {
+            out.push_str(&format!(
+                "        {} = {},\n",
+                render_lua_key(key),
+                render_secret_source(source)
+            ));
+        }
+        out.push_str("    },\n");
+    }
     out.push_str("}\n");
     out
 }
@@ -874,6 +1196,43 @@ pub fn render_pod_source(decl: &PodDeclaration) -> String {
 fn render_string_array(items: &[String]) -> String {
     let rendered: Vec<String> = items.iter().map(|s| render_lua_string(s)).collect();
     format!("{{ {} }}", rendered.join(", "))
+}
+
+/// Render one secret reference as inline Lua (`{ source = "bitwarden",
+/// id = "..." }`), strings escaped per [`render_lua_string`], so
+/// `pod add`/`declare` round-trips through [`evaluate_pod_source`].
+fn render_secret_source(source: &SecretSource) -> String {
+    match source {
+        SecretSource::Bitwarden { id } => {
+            format!(
+                "{{ source = \"bitwarden\", id = {} }}",
+                render_lua_string(id)
+            )
+        }
+        SecretSource::Vault { mount, path, field } => format!(
+            "{{ source = \"vault\", mount = {}, path = {}, field = {} }}",
+            render_lua_string(mount),
+            render_lua_string(path),
+            render_lua_string(field)
+        ),
+        SecretSource::Libsecret { attributes } => {
+            let pairs: Vec<String> = attributes
+                .iter()
+                .map(|(k, v)| format!("{} = {}", render_lua_key(k), render_lua_string(v)))
+                .collect();
+            format!(
+                "{{ source = \"libsecret\", attributes = {{ {} }} }}",
+                pairs.join(", ")
+            )
+        }
+        SecretSource::Exec { command } => format!(
+            "{{ source = \"exec\", command = {} }}",
+            render_string_array(command)
+        ),
+        SecretSource::Env { var } => {
+            format!("{{ source = \"env\", var = {} }}", render_lua_string(var))
+        }
+    }
 }
 
 fn render_lua_key(key: &str) -> String {
@@ -1183,6 +1542,76 @@ pub(crate) fn resolve_pod_env(
 ) -> miette::Result<BTreeMap<String, String>> {
     let folded = fold_pod_env(root, pod_name, decl, &mut Vec::new(), &mut HashSet::new())?;
     Ok(folded.into_iter().map(|(k, (v, _))| (k, v)).collect())
+}
+
+/// Resolve the pod's declared secret references (ADR-0042 D2): own keys
+/// win per key over loaded pods (silent — the same own-over-loaded rule
+/// as [`resolve_pod_env`]); loaded pods fold transitively. The one
+/// deliberate tightening vs env: a same-key collision between two
+/// loaded pods is a HARD ERROR naming the key and both pods, not a
+/// warning — env literals are inert, but a losing credential reference
+/// silently changes live credentials under masking. Pure reads — safe
+/// before any mutation.
+pub(crate) fn resolve_pod_secrets(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+) -> miette::Result<BTreeMap<String, SecretSource>> {
+    let folded = fold_pod_secrets(root, pod_name, decl, &mut Vec::new(), &mut HashSet::new())?;
+    Ok(folded.into_iter().map(|(k, (v, _))| (k, v)).collect())
+}
+
+/// The secrets fold proper: key → (reference, declaring pod). The
+/// provenance rides along so a cross-load collision can name both pods
+/// in its hard error; [`resolve_pod_secrets`] strips it. Memoized +
+/// cycle-checked so it is safe standalone, not only behind
+/// [`validate_loads`].
+fn fold_pod_secrets(
+    root: &Path,
+    pod_name: &str,
+    decl: &PodDeclaration,
+    stack: &mut Vec<String>,
+    done: &mut HashSet<String>,
+) -> miette::Result<BTreeMap<String, (SecretSource, String)>> {
+    if let Some(pos) = stack.iter().position(|p| p == pod_name) {
+        let mut cycle: Vec<String> = stack[pos..].to_vec();
+        cycle.push(pod_name.to_string());
+        miette::bail!("pod load cycle detected: {}", cycle.join(" -> "));
+    }
+    if !done.insert(pod_name.to_string()) {
+        return Ok(BTreeMap::new());
+    }
+    stack.push(pod_name.to_string());
+    let folded = (|| {
+        let mut secrets: BTreeMap<String, (SecretSource, String)> = BTreeMap::new();
+        for loaded in &decl.loads {
+            let loaded_decl = load_declaration(root, loaded)?;
+            for (key, contributed) in fold_pod_secrets(root, loaded, &loaded_decl, stack, done)? {
+                match secrets.entry(key.clone()) {
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(contributed);
+                    }
+                    std::collections::btree_map::Entry::Occupied(e) => {
+                        let (_, holder) = e.get();
+                        let (_, claimant) = &contributed;
+                        miette::bail!(
+                            "secret '{key}' is declared by more than one loaded pod under \
+                             '{pod_name}' (pod '{holder}' and pod '{claimant}') — \
+                             secret-key collisions across loads are a hard error, not a \
+                             warning (ADR-0042 D2: a losing credential reference silently \
+                             changes live credentials under masking)"
+                        );
+                    }
+                }
+            }
+        }
+        for (key, source) in &decl.secrets {
+            secrets.insert(key.clone(), (source.clone(), pod_name.to_string()));
+        }
+        Ok(secrets)
+    })();
+    stack.pop();
+    folded
 }
 
 /// The fold proper: key → (value, declaring pod). The provenance rides
@@ -3619,20 +4048,27 @@ fn record_pin_movement(
 }
 
 /// The pure pre-build resolutions of one reconcile: the declared env
-/// (ADR-0030) and the folded pod-level service overrides (ADR-0032
-/// Decision 3), validated against the declaration BEFORE any build
-/// phase — a bad declaration must fail with zero writes. The overrides
-/// are resolved ONCE here and threaded through validation into the
-/// staging tail's service record.
+/// (ADR-0030), the folded secret references (ADR-0042 D2), and the
+/// folded pod-level service overrides (ADR-0032 Decision 3), validated
+/// against the declaration BEFORE any build phase — a bad declaration
+/// must fail with zero writes. Each is resolved ONCE here and threaded
+/// through validation into the staging tail's records.
+type PureInputs = (
+    BTreeMap<String, String>,
+    BTreeMap<String, SecretSource>,
+    PodServiceOverrides,
+);
+
 fn resolve_pure_inputs(
     root: &Path,
     pod_name: &str,
     decl: &PodDeclaration,
-) -> miette::Result<(BTreeMap<String, String>, PodServiceOverrides)> {
+) -> miette::Result<PureInputs> {
     let env_vars = resolve_pod_env(root, pod_name, decl)?;
+    let secrets = resolve_pod_secrets(root, pod_name, decl)?;
     let svc_overrides = resolve_pod_service_overrides(root, pod_name, decl)?;
     validate_service_overrides(root, pod_name, &svc_overrides, decl)?;
-    Ok((env_vars, svc_overrides))
+    Ok((env_vars, secrets, svc_overrides))
 }
 
 /// Knobs of one scoped reconcile (see [`reconcile_pod_scoped`]).
@@ -3677,7 +4113,8 @@ fn reconcile_pod_scoped(
     tools: &crate::runtime::RuntimeTools,
 ) -> miette::Result<(PodSyncReport, bool)> {
     let mut state = prepare_reconcile(root, pod_name, opts.allow_degraded, tools)?;
-    let (env_vars, svc_overrides) = resolve_pure_inputs(&state.root, &state.pod_name, &state.decl)?;
+    let (env_vars, secrets, svc_overrides) =
+        resolve_pure_inputs(&state.root, &state.pod_name, &state.decl)?;
     let mut build = ReconcileBuild {
         rebuild_unstamped: opts.rebuild_unstamped,
         refresh_members: opts.refresh.iter().cloned().collect(),
@@ -3700,7 +4137,7 @@ fn reconcile_pod_scoped(
     )?;
     // Remove store packages the declaration dropped.
     let removed = remove_undeclared(&state.store, &state.tools, &build.declared_names)?;
-    present_and_reconcile(&state, pod_name, &env_vars, &svc_overrides, tools).map(
+    present_and_reconcile(&state, pod_name, &env_vars, &secrets, &svc_overrides, tools).map(
         |(generation, farm, services)| {
             (
                 PodSyncReport {
@@ -3729,6 +4166,7 @@ fn present_and_reconcile(
     state: &ReconcileState,
     pod_name: &str,
     env_vars: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, SecretSource>,
     svc_overrides: &PodServiceOverrides,
     tools: &crate::runtime::RuntimeTools,
 ) -> miette::Result<(
@@ -3736,7 +4174,8 @@ fn present_and_reconcile(
     Option<PathBuf>,
     crate::services::ServiceReconcileReport,
 )> {
-    let (generation, farm) = present_active(&state.store, &state.dir, env_vars, svc_overrides)?;
+    let (generation, farm) =
+        present_active(&state.store, &state.dir, env_vars, secrets, svc_overrides)?;
     let services = match generation {
         Some(_) => crate::services::reconcile(&state.store, &state.dir, pod_name, tools)?,
         None => crate::services::reconcile_empty(&state.dir, pod_name, tools)?,
@@ -4575,12 +5014,14 @@ fn present_active(
     store: &crate::runtime::RuntimeStore,
     dir: &Path,
     env_vars: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, SecretSource>,
     svc_overrides: &PodServiceOverrides,
 ) -> miette::Result<(Option<u64>, Option<PathBuf>)> {
     let active = store.active_generation()?;
     Ok(match &active {
         Some(gen) => {
             crate::farm::write_generation_env(store, gen.n, env_vars)?;
+            crate::farm::write_generation_secrets(store, gen.n, secrets)?;
             crate::services::record(store, gen, svc_overrides)?;
             let farm = crate::farm::emit(store, gen)?;
             crate::farm::flip_current(dir, gen.n)?;
@@ -6039,12 +6480,12 @@ pod {
     }
 
     #[test]
-    fn unknown_field_message_lists_services_as_allowed() {
+    fn unknown_field_message_lists_secrets_as_allowed() {
         let err = evaluate_pod_source("test", r#"pod { pkgs = { "jq" } }"#)
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("allowed: loads, packages, overlay, env, services"),
+            err.contains("allowed: loads, packages, overlay, env, secrets, services"),
             "got: {err}"
         );
     }
@@ -6961,6 +7402,198 @@ pod {
     }
 
     #[test]
+    fn secrets_declaration_parses_all_five_sources() {
+        let ok = evaluate_pod_source(
+            "t",
+            r#"
+pod {
+    secrets = {
+        GITHUB_TOKEN = { source = "bitwarden", id = "8848da48" },
+        DB_PASS      = { source = "vault", mount = "secret", path = "prod/db", field = "pass" },
+        LOGIN_KEY    = { source = "libsecret", attributes = { schema = "io.devbox.Secret", key = "login" } },
+        ONEPASS      = { source = "exec", command = { "op", "read", "op://vault/item/field" } },
+        GH_PAT       = { source = "env", var = "GITHUB_TOKEN" },
+    },
+}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ok.secrets.get("GITHUB_TOKEN"),
+            Some(&SecretSource::Bitwarden {
+                id: "8848da48".to_string(),
+            })
+        );
+        assert_eq!(
+            ok.secrets.get("DB_PASS"),
+            Some(&SecretSource::Vault {
+                mount: "secret".to_string(),
+                path: "prod/db".to_string(),
+                field: "pass".to_string(),
+            })
+        );
+        assert_eq!(
+            ok.secrets.get("LOGIN_KEY"),
+            Some(&SecretSource::Libsecret {
+                attributes: BTreeMap::from([
+                    ("schema".to_string(), "io.devbox.Secret".to_string()),
+                    ("key".to_string(), "login".to_string()),
+                ]),
+            })
+        );
+        assert_eq!(
+            ok.secrets.get("ONEPASS"),
+            Some(&SecretSource::Exec {
+                command: vec![
+                    "op".to_string(),
+                    "read".to_string(),
+                    "op://vault/item/field".to_string(),
+                ],
+            })
+        );
+        assert_eq!(
+            ok.secrets.get("GH_PAT"),
+            Some(&SecretSource::Env {
+                var: "GITHUB_TOKEN".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn secrets_reject_unknown_sources_bad_keys_and_reserved_seams() {
+        for (src, needle) in [
+            (
+                r#"pod { secrets = { K = { source = "sops" } } }"#,
+                "unknown secret source",
+            ),
+            (
+                r#"pod { secrets = { K = { id = "x" } } }"#,
+                "must declare a string 'source'",
+            ),
+            (
+                r#"pod { secrets = { ["BAD-KEY"] = { source = "env", var = "V" } } }"#,
+                "invalid secrets key",
+            ),
+            (
+                r#"pod { secrets = { PATH = { source = "env", var = "V" } } }"#,
+                "is reserved",
+            ),
+            (
+                r#"pod { secrets = { LD_LIBRARY_PATH = { source = "env", var = "V" } } }"#,
+                "is reserved",
+            ),
+        ] {
+            let err = format!("{}", evaluate_pod_source("t", src).unwrap_err());
+            assert!(err.contains(needle), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn secrets_reject_malformed_per_source_fields() {
+        for (src, needle) in [
+            // Unknown per-source fields fail closed (snap.rs precedent).
+            (
+                r#"pod { secrets = { K = { source = "bitwarden", id = "i", secret = true } } }"#,
+                "unknown field",
+            ),
+            (
+                r#"pod { secrets = { K = { source = "vault", mount = "m", path = "p", field = "f", nope = 1 } } }"#,
+                "unknown field",
+            ),
+            // Missing required fields.
+            (
+                r#"pod { secrets = { K = { source = "bitwarden" } } }"#,
+                "requires field 'id'",
+            ),
+            (
+                r#"pod { secrets = { K = { source = "env" } } }"#,
+                "requires field 'var'",
+            ),
+            (
+                r#"pod { secrets = { K = { source = "libsecret", attributes = { } } } }"#,
+                "at least one attribute pair",
+            ),
+            // Wrong shapes.
+            (
+                r#"pod { secrets = { K = "op read x" } }"#,
+                "must be a table",
+            ),
+            (
+                r#"pod { secrets = { K = { source = "bitwarden", id = 5 } } }"#,
+                "must be a string",
+            ),
+            (
+                r#"pod { secrets = { K = { source = "exec", command = "op read x" } } }"#,
+                "argv array",
+            ),
+            (
+                r#"pod { secrets = { K = { source = "exec", command = { "op", 2 } } } }"#,
+                "must be a string",
+            ),
+            (
+                r#"pod { secrets = { K = { source = "exec", command = { } } } }"#,
+                "must not be empty",
+            ),
+            (
+                r#"pod { secrets = { K = { source = "exec", command = { "op", [3] = "x" } } } }"#,
+                "sequential array",
+            ),
+            // Newlines in string fields.
+            (
+                r#"pod { secrets = { K = { source = "env", var = "A\nB" } } }"#,
+                "must not contain newlines",
+            ),
+            (
+                r#"pod { secrets = { K = { source = "bitwarden", id = "a\nb" } } }"#,
+                "must not contain newlines",
+            ),
+        ] {
+            let err = format!("{}", evaluate_pod_source("t", src).unwrap_err());
+            assert!(err.contains(needle), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn env_and_secrets_collision_refuses_at_parse() {
+        let err = evaluate_pod_source(
+            "t",
+            r#"
+pod {
+    env = { TOKEN = "literal" },
+    secrets = { TOKEN = { source = "env", var = "TOKEN" } },
+}
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("env and secrets both declare 'TOKEN'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn secrets_render_round_trips_through_evaluate() {
+        let decl = evaluate_pod_source(
+            "t",
+            r#"
+pod {
+    secrets = {
+        GITHUB_TOKEN = { source = "bitwarden", id = "8848da48" },
+        DB_PASS      = { source = "vault", mount = "secret", path = "prod/db", field = "pass" },
+        LOGIN_KEY    = { source = "libsecret", attributes = { schema = "io.devbox.Secret" } },
+        ONEPASS      = { source = "exec", command = { "op", "read", "op://x" } },
+        GH_PAT       = { source = "env", var = "GITHUB_TOKEN" },
+    },
+}
+"#,
+        )
+        .unwrap();
+        let redecl = evaluate_pod_source("t", &render_pod_source(&decl)).unwrap();
+        assert_eq!(redecl, decl, "render → evaluate must round-trip secrets");
+    }
+
+    #[test]
     fn env_declaration_parses_and_reserved_seams_are_rejected() {
         let ok = evaluate_pod_source(
             "t",
@@ -7036,6 +7669,100 @@ pod {
         let decl = load_declaration(root, "a").unwrap();
         let err = format!("{}", resolve_pod_env(root, "a", &decl).unwrap_err());
         assert!(err.contains("cycle"), "{err}");
+    }
+
+    #[test]
+    fn resolve_pod_secrets_own_beats_loaded_and_loads_fold_transitively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_pod_lua(
+            root,
+            "base",
+            r#"pod { secrets = { A = { source = "env", var = "A" }, B = { source = "env", var = "B" } } }"#,
+        );
+        seed_pod_lua(
+            root,
+            "mid",
+            r#"pod { loads = { "base" }, secrets = { B = { source = "env", var = "B_MID" } } }"#,
+        );
+        seed_pod_lua(
+            root,
+            "work",
+            r#"pod { loads = { "mid" }, secrets = { C = { source = "exec", command = { "op", "read", "x" } } } }"#,
+        );
+        let decl = load_declaration(root, "work").unwrap();
+        let secrets = resolve_pod_secrets(root, "work", &decl).unwrap();
+        assert_eq!(
+            secrets.get("A"),
+            Some(&SecretSource::Env {
+                var: "A".to_string(),
+            }),
+            "a loaded pod's reference folds through transitively"
+        );
+        assert_eq!(
+            secrets.get("B"),
+            Some(&SecretSource::Env {
+                var: "B_MID".to_string(),
+            }),
+            "own beats loaded per key, silently (the issue #8 own-over-loaded rule)"
+        );
+        assert_eq!(
+            secrets.get("C"),
+            Some(&SecretSource::Exec {
+                command: vec!["op".to_string(), "read".to_string(), "x".to_string()],
+            }),
+        );
+    }
+
+    #[test]
+    fn resolve_pod_secrets_cross_load_collision_is_a_hard_error_naming_both_pods() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_pod_lua(
+            root,
+            "one",
+            r#"pod { secrets = { K = { source = "env", var = "ONE" } } }"#,
+        );
+        seed_pod_lua(
+            root,
+            "two",
+            r#"pod { secrets = { K = { source = "env", var = "TWO" } } }"#,
+        );
+        seed_pod_lua(root, "work", r#"pod { loads = { "one", "two" } }"#);
+        let decl = load_declaration(root, "work").unwrap();
+        let err = format!("{}", resolve_pod_secrets(root, "work", &decl).unwrap_err());
+        assert!(err.contains("secret 'K'"), "{err}");
+        assert!(err.contains("pod 'one'"), "{err}");
+        assert!(err.contains("pod 'two'"), "{err}");
+        assert!(err.contains("hard error"), "{err}");
+    }
+
+    #[test]
+    fn secrets_fold_collision_fails_pure_inputs_before_any_write() {
+        // Zero writes on validation failure (ADR-0042 D7, house norm):
+        // resolve_pure_inputs runs BEFORE any build or staging phase, so
+        // a secrets fold collision must leave the pod untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_pod_lua(
+            root,
+            "one",
+            r#"pod { secrets = { K = { source = "env", var = "ONE" } } }"#,
+        );
+        seed_pod_lua(
+            root,
+            "two",
+            r#"pod { secrets = { K = { source = "env", var = "TWO" } } }"#,
+        );
+        seed_pod_lua(root, "work", r#"pod { loads = { "one", "two" } }"#);
+        let decl = load_declaration(root, "work").unwrap();
+        assert!(resolve_pure_inputs(root, "work", &decl).is_err());
+        let dir = pod_dir(root, "work");
+        assert!(
+            !dir.join("generations").exists(),
+            "a validation failure must produce no generation writes"
+        );
+        assert!(!crate::farm::secrets_path(&pod_store(&dir), 1).exists());
     }
 
     #[test]
@@ -7186,7 +7913,8 @@ pod {
         let vars: BTreeMap<String, String> = [("EDITOR".to_string(), "vi".to_string())]
             .into_iter()
             .collect();
-        let (generation, _) = present_active(&store, &dir, &vars, &BTreeMap::new()).unwrap();
+        let (generation, _) =
+            present_active(&store, &dir, &vars, &BTreeMap::new(), &BTreeMap::new()).unwrap();
         assert_eq!(generation, Some(1));
         let recorded: BTreeMap<String, String> =
             serde_json::from_slice(&std::fs::read(crate::farm::env_path(&store, 1)).unwrap())
@@ -7195,10 +7923,84 @@ pod {
 
         // Re-presenting with no declared env writes the empty object —
         // stale vars are withdrawn, the loader-libs re-emit rule.
-        present_active(&store, &dir, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        present_active(
+            &store,
+            &dir,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let recorded: BTreeMap<String, String> =
             serde_json::from_slice(&std::fs::read(crate::farm::env_path(&store, 1)).unwrap())
                 .unwrap();
         assert!(recorded.is_empty());
+    }
+
+    #[test]
+    fn present_active_records_declared_secrets_on_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data/shuttle/pods");
+        let dir = pod_dir(&root, "default");
+        let store = pod_store(&dir);
+        crate::farm::emit(&store, &gen_with_one_pkg(1, "jq")).unwrap();
+        // The store's active pointer, the way the production mechanisms
+        // leave it: a manifest-bearing generation dir plus the `active`
+        // link (as confine.rs's seed_command_pod does).
+        let gen_dir = store.generation_dir(1);
+        std::fs::write(
+            gen_dir.join("manifest.json"),
+            serde_json::to_vec(&gen_with_one_pkg(1, "jq")).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("generations/1", dir.join("active")).unwrap();
+
+        let secrets: BTreeMap<String, SecretSource> = [
+            (
+                "GITHUB_TOKEN".to_string(),
+                SecretSource::Bitwarden {
+                    id: "8848da48".to_string(),
+                },
+            ),
+            (
+                "API_KEY".to_string(),
+                SecretSource::Env {
+                    var: "TOKEN".to_string(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let (generation, _) =
+            present_active(&store, &dir, &BTreeMap::new(), &secrets, &BTreeMap::new()).unwrap();
+        assert_eq!(generation, Some(1));
+
+        // Mode 0600 — stricter than env.json (ADR-0042 D2).
+        let path = crate::farm::secrets_path(&store, 1);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "secrets.json must be mode 0600");
+
+        // Sorted canonical JSON, references only. The type cannot carry
+        // a value at all, but pin the byte shape anyway.
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body,
+            r#"{"API_KEY":{"source":"env","var":"TOKEN"},"GITHUB_TOKEN":{"source":"bitwarden","id":"8848da48"}}"#
+        );
+
+        // Re-presenting with no declared secrets writes the empty
+        // object — stale references are withdrawn (the loader-libs
+        // re-emit rule).
+        present_active(
+            &store,
+            &dir,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, "{}");
     }
 }

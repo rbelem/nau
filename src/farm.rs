@@ -110,6 +110,13 @@ pub const LOADER_LIBS_FILE: &str = "loader-libs";
 /// presented. The shellenv reads it back and `shuttle run` overlays it.
 pub const ENV_FILE: &str = "env.json";
 
+/// The generation's recorded secret references:
+/// `generations/<n>/secrets.json` (ADR-0042 D2) — the folded pod secret
+/// table as sorted canonical JSON, references only, written by the
+/// staging tail at mode 0600. Values are never recorded here: they
+/// resolve at serve time (ADR-0042 D3), and the lockfile gains nothing.
+pub const SECRETS_FILE: &str = "secrets.json";
+
 /// The payload-relative lib directories the loader seam records.
 /// `usr/usr/lib` is the pool's libdir convention (`--prefix=/usr`);
 /// `usr/usr/lib64` is the glibc/toolchain layout. `usr/usr/libexec`
@@ -141,6 +148,11 @@ pub fn loader_libs_path(store: &RuntimeStore, n: u64) -> PathBuf {
 /// Path of generation `n`'s recorded env object.
 pub fn env_path(store: &RuntimeStore, n: u64) -> PathBuf {
     store.generation_dir(n).join(ENV_FILE)
+}
+
+/// Path of generation `n`'s recorded secret references.
+pub fn secrets_path(store: &RuntimeStore, n: u64) -> PathBuf {
+    store.generation_dir(n).join(SECRETS_FILE)
 }
 
 /// Collect the generation's loader-lib dirs, higher composition layer
@@ -195,6 +207,45 @@ pub fn write_generation_env(
     let body =
         serde_json::to_vec(vars).map_err(|e| miette::miette!("serializing generation env: {e}"))?;
     std::fs::write(&path, body).map_err(|e| miette::miette!("writing {}: {e}", path.display()))
+}
+
+/// Record the generation's secret references (ADR-0042 D2) as sorted
+/// canonical JSON — key → reference table (`source` + per-source
+/// fields), NEVER resolved values. Written by the reconcile's staging
+/// tail (`present_active`), NOT by [`emit`], for the same reason as
+/// [`write_generation_env`]: a rollback re-emits the target generation
+/// and must serve its RECORDED references, never a re-resolution
+/// against the current declaration. An empty map writes the empty
+/// object — a re-stage of a pod whose declaration dropped its secrets
+/// withdraws the stale references (the loader-libs re-emit rule).
+///
+/// Mode 0600, stricter than `env.json`: these are live credential
+/// destinations. `mode(0o600)` applies at creation and this writer is
+/// the file's only creator — nothing else writes the generation tree.
+///
+/// The lockfile gains nothing (ADR-0042 D2): references come from the
+/// declaration, values are never pinned, rotation never touches
+/// `shuttle.lock`.
+pub fn write_generation_secrets(
+    store: &RuntimeStore,
+    n: u64,
+    refs: &BTreeMap<String, crate::pod::SecretSource>,
+) -> miette::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = secrets_path(store, n);
+    let body = serde_json::to_vec(refs)
+        .map_err(|e| miette::miette!("serializing generation secrets: {e}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| miette::miette!("opening {}: {e}", path.display()))?;
+    file.write_all(&body)
+        .map_err(|e| miette::miette!("writing {}: {e}", path.display()))
 }
 
 /// One app's multi-file payload assembly (issue #37): the app binary's
