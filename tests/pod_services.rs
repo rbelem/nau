@@ -562,3 +562,198 @@ gated_test!(rollback_re_emits_the_target_generation_link_set, {
     );
     assert!(unit_link(root.path(), "default", "other-svc").exists());
 });
+// ── secrets envfile (ADR-0042 D3/D7, issue #184) ──
+//
+// Full chain, gated on the toolchain like the tests above: a pod with a
+// service-declaring package AND a secret reference. Sync records the
+// unit with the mandatory `EnvironmentFile=` but never resolves (D3);
+// a warm session cache lets the staging tail re-materialize the 0600
+// envfile with zero provider calls; `pod secrets refresh` is the
+// rotation writer.
+
+/// The pod-level service fixture plus a secret reference: a provider
+/// counting script OUTSIDE the pod state root (the D4 refusal treats
+/// pod-rooted programs as shadowing) and a tmpfs runtime dir.
+struct SecretSvcFixture {
+    project: tempfile::TempDir,
+    root: tempfile::TempDir,
+    run_dir: std::path::PathBuf,
+    counter: std::path::PathBuf,
+}
+
+impl Drop for SecretSvcFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.run_dir);
+    }
+}
+
+fn secret_svc_fixture() -> Option<SecretSvcFixture> {
+    let shm = std::path::Path::new("/dev/shm");
+    if !shm.is_dir() {
+        return None;
+    }
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let run_dir = shm.join(format!("shuttle-svc-{}-sec", std::process::id()));
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let serve = root.path().join("serve");
+    std::fs::create_dir_all(&serve).unwrap();
+    let port = serve_dir(&serve);
+    write_service_pkg(project.path(), "svc-sec", "sec-svc", "sec-ran", port);
+    make_tarball(&serve, "svc-sec");
+
+    let counter = root.path().join("calls");
+    let counter_s = counter.display().to_string();
+    let provider = root.path().join("counting-provider");
+    std::fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nn=$(cat {counter_s} 2>/dev/null || echo 0); echo $((n+1)) > {counter_s}; \
+             printf -- '-----BEGIN SVC KEY-----\\nMIIsvc\\n-----END SVC KEY-----\\n'\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let provider_s = provider.display().to_string();
+    std::fs::create_dir_all(root.path().join("default")).unwrap();
+    std::fs::write(
+        root.path().join("default").join("pod.lua"),
+        format!(
+            "pod {{ packages = {{ \"svc-sec\" }}, secrets = {{ SVC_KEY = {{ source = \"exec\", \
+             command = {{ \"{provider_s}\" }} }} }} }}\n"
+        ),
+    )
+    .unwrap();
+    Some(SecretSvcFixture {
+        project,
+        root,
+        run_dir,
+        counter,
+    })
+}
+
+/// The decl-hash of the fixture's folded reference set — the envfile
+/// name and the cache entry share it.
+fn svc_envfile_hash(root: &Path) -> String {
+    let pod_lua = std::fs::read_to_string(root.join("default/pod.lua")).unwrap();
+    let command = pod_lua
+        .split("command = { \"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("fixture pod.lua carries one exec command")
+        .to_string();
+    let refs = std::collections::BTreeMap::from([(
+        "SVC_KEY".to_string(),
+        shuttle::pod::SecretSource::Exec {
+            command: vec![command],
+        },
+    )]);
+    shuttle::secrets::decl_hash(&refs).unwrap()
+}
+
+gated_test!(
+    secret_pod_sync_records_envfile_unit_and_warm_cache_writes_without_providers,
+    {
+        let Some(fx) = secret_svc_fixture() else {
+            eprintln!("skipping: no tmpfs runtime dir available");
+            return;
+        };
+        let run_named_in = |args: &[&str]| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+            cmd.arg("pod").arg("--name").arg("default");
+            // `secrets` is the one verb whose `--root` precedes its
+            // subcommand; every other verb takes it last.
+            if args.first() == Some(&"secrets") {
+                cmd.arg(args[0]).arg("--root").arg(fx.root.path());
+                cmd.args(&args[1..]);
+            } else {
+                cmd.args(args).arg("--root").arg(fx.root.path());
+            }
+            cmd.current_dir(fx.project.path());
+            cmd.env("SHUTTLE_DATA_HOME", fx.root.path().join("data-home"));
+            cmd.env("SHUTTLE_SERVICE_BACKEND", "systemd");
+            cmd.env("XDG_CONFIG_HOME", fx.root.path().join("config-home"));
+            cmd.env("SHUTTLE_SYSTEMD", "off");
+            cmd.env("XDG_RUNTIME_DIR", &fx.run_dir);
+            let out = cmd.output().unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+
+        // SYNC (cold cache): the unit is recorded with the mandatory
+        // EnvironmentFile path, but NOTHING resolves — no envfile, no
+        // provider call.
+        let (code, stdout, stderr) = run_named_in(&["sync"]);
+        assert_eq!(code, Some(0), "sync failed: {stderr}{stdout}");
+        assert_eq!(generation_count(fx.root.path(), "default"), 1);
+        let hash = svc_envfile_hash(fx.root.path());
+        let artifact = pod_dir(fx.root.path(), "default")
+            .join("generations/1/services")
+            .join("shuttle-pod-default-sec-svc.service");
+        let unit_text = std::fs::read_to_string(&artifact).unwrap();
+        let expected_line = format!(
+            "EnvironmentFile=\"{}/shuttle/secrets/default/{hash}.env\"\n",
+            fx.run_dir.display()
+        );
+        assert!(
+            unit_text.contains(&expected_line),
+            "unit must reference the canonical envfile:\n{unit_text}"
+        );
+        assert!(
+            !unit_text.contains("EnvironmentFile=\"-"),
+            "no `-` prefix — a missing envfile fails the start loud (D7)"
+        );
+        let envfile = fx
+            .run_dir
+            .join("shuttle")
+            .join("secrets")
+            .join("default")
+            .join(format!("{hash}.env"));
+        assert!(
+            !envfile.exists(),
+            "a cold sync must NOT write the envfile (sync never resolves)"
+        );
+        assert!(!fx.counter.exists(), "sync makes zero provider calls (D3)");
+
+        // REFRESH (the rotation writer): resolves and writes the 0600
+        // envfile.
+        let (code, stdout, stderr) = run_named_in(&["secrets", "refresh"]);
+        assert_eq!(code, Some(0), "refresh failed: {stderr}{stdout}");
+        assert_eq!(
+            std::fs::read_to_string(&fx.counter).unwrap().trim(),
+            "1",
+            "the refresh resolved once"
+        );
+        assert!(envfile.is_file(), "the refresh materializes the envfile");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&envfile).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the envfile is 0600"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&envfile).unwrap(),
+            "SVC_KEY=\"-----BEGIN SVC KEY-----\\nMIIsvc\\n-----END SVC KEY-----\"\n",
+            "systemd C-escaped, sorted KEY=value lines"
+        );
+
+        // WARM SYNC: drop the envfile, sync again — the staging tail
+        // re-materializes it FROM THE CACHE with zero provider calls.
+        std::fs::remove_file(&envfile).unwrap();
+        let (code, stdout, stderr) = run_named_in(&["sync"]);
+        assert_eq!(code, Some(0), "second sync failed: {stderr}{stdout}");
+        assert_eq!(
+            std::fs::read_to_string(&fx.counter).unwrap().trim(),
+            "1",
+            "the warm sync re-renders the envfile from the cache — no provider call"
+        );
+        assert!(
+            envfile.is_file(),
+            "the warm sync re-materializes the envfile (D3's sync-triggered render)"
+        );
+    }
+);

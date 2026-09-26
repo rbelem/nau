@@ -835,3 +835,272 @@ fn shellenv_fails_without_active_generation() {
         "error must point at syncing the pod: {stderr}"
     );
 }
+
+// ── shellenv secrets serve (ADR-0042 D3/D7/D8, issue #184) ──
+
+const SECRET_SENTINEL: &str = "TOPSECRET-b184-VALUE";
+
+/// An isolated tmpfs runtime dir for one test: the secrets session
+/// cache lives under `$XDG_RUNTIME_DIR` and the D3 gate refuses anything
+/// but tmpfs, so the tests use `/dev/shm` — never the real runtime dir.
+/// Returns None when no tmpfs dir exists (skip, not fail).
+fn secrets_runtime_dir(tag: &str) -> Option<std::path::PathBuf> {
+    let base = std::path::Path::new("/dev/shm");
+    if !base.is_dir() {
+        return None;
+    }
+    let dir = base.join(format!("shuttle-test-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Run `shuttle pod <verb…>` with an isolated data home AND an isolated
+/// tmpfs `$XDG_RUNTIME_DIR` (the secrets cache base).
+fn run_with_runtime_dir(
+    project: &Path,
+    root: &Path,
+    run_dir: &Path,
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    cmd.arg("pod").args(args).arg("--root").arg(root);
+    cmd.current_dir(project);
+    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("SHUTTLE_SYSTEMD", "off");
+    cmd.env("XDG_RUNTIME_DIR", run_dir);
+    let out = cmd.output().expect("failed to spawn shuttle pod");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A `+x` provider OUTSIDE the pod state root (the D4 refusal treats
+/// pod-rooted programs as shadowing); prints its body's output.
+fn write_provider(dir: &Path, name: &str, body: &str) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.display().to_string()
+}
+
+/// The counting provider: one line appended per invocation; the line
+/// count IS the invocation count. Prints a PEM-shaped secret.
+fn write_counting_provider(dir: &Path, counter: &Path) -> String {
+    let counter = counter.display();
+    write_provider(
+        dir,
+        "counting-provider",
+        &format!(
+            "n=$(cat {counter} 2>/dev/null || echo 0); echo $((n+1)) > {counter}; \
+             printf -- '-----BEGIN KEY-----\\nMIIb184\\n-----END KEY-----\\n'\n"
+        ),
+    )
+}
+
+fn provider_calls(counter: &Path) -> u32 {
+    std::fs::read_to_string(counter)
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Record the ACTIVE generation's secret references (the same
+/// canonical bytes sync writes) via the library's own writer.
+fn seed_generation_secrets(
+    root: &Path,
+    pod: &str,
+    refs: &std::collections::BTreeMap<String, shuttle::pod::SecretSource>,
+) {
+    let store = shuttle::runtime::RuntimeStore::new(root.join(pod));
+    shuttle::farm::write_generation_secrets(&store, 1, refs).unwrap();
+}
+
+fn exec_secret(command: &str) -> shuttle::pod::SecretSource {
+    shuttle::pod::SecretSource::Exec {
+        command: vec![command.to_string()],
+    }
+}
+
+#[test]
+fn shellenv_exports_resolved_secrets_after_env_lines_and_evals_safe() {
+    let Some(run_dir) = secrets_runtime_dir("shellev") else {
+        eprintln!("skipping: no tmpfs runtime dir available");
+        return;
+    };
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    seed_active_farm(root.path(), "default", 1);
+
+    // Declared env alongside, to pin the ordering rule; the counting
+    // provider yields a PEM (newline-bearing) value.
+    let counter = root.path().join("calls");
+    let counting = write_counting_provider(root.path(), &counter);
+    let static_p = write_provider(root.path(), "static-provider", "printf token123\\n");
+    std::fs::write(
+        pod_lua(root.path()),
+        format!(
+            "pod {{ env = {{ EDITOR = \"vi\" }}, secrets = {{ A_PEM = {{ source = \"exec\", \
+             command = {{ \"{counting}\" }} }}, Z_TOKEN = {{ source = \"exec\", command = {{ \
+             \"{static_p}\" }} }} }} }}\n"
+        ),
+    )
+    .unwrap();
+    let refs = std::collections::BTreeMap::from([
+        ("A_PEM".to_string(), exec_secret(&counting)),
+        ("Z_TOKEN".to_string(), exec_secret(&static_p)),
+    ]);
+    seed_generation_secrets(root.path(), "default", &refs);
+    // The declared env rides the generation record (env.json) — write it
+    // the way sync does, so SH_EDITOR is a real declared export, not an
+    // ambient accident.
+    let store = shuttle::runtime::RuntimeStore::new(root.path().join("default"));
+    shuttle::farm::write_generation_env(
+        &store,
+        1,
+        &[("SH_EDITOR".to_string(), "vi".to_string())]
+            .into_iter()
+            .collect(),
+    )
+    .unwrap();
+
+    let (code, script, stderr) =
+        run_with_runtime_dir(project.path(), root.path(), &run_dir, &["shellenv"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(provider_calls(&counter), 1, "cold serve resolves once");
+
+    // Eval under `set -u`: every export readable, PEM newline intact.
+    let eval = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "set -u\n{script}\nprintf '%s|%s' \"$EDITOR\" \"$A_PEM\""
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        eval.status.success(),
+        "shellenv must eval clean under set -u: {}",
+        String::from_utf8_lossy(&eval.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(eval.stdout).unwrap(),
+        "vi|-----BEGIN KEY-----\nMIIb184\n-----END KEY-----",
+        "env value then secret value verbatim (newline included)"
+    );
+
+    // Ordering: EVERY env export precedes EVERY secret export, secrets
+    // sorted, POSIX single-quoted.
+    let env_line = script.find("export SH_EDITOR='vi'").unwrap();
+    let a = script.find("export A_PEM='").unwrap();
+    let z = script.find("export Z_TOKEN='").unwrap();
+    assert!(
+        env_line < a && a < z,
+        "env first, secrets sorted:\n{script}"
+    );
+
+    // The resolve warmed the session cache: a second shellenv is a hit
+    // with zero provider calls.
+    let (code, _, stderr) =
+        run_with_runtime_dir(project.path(), root.path(), &run_dir, &["shellenv"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(
+        provider_calls(&counter),
+        1,
+        "warm serve must make zero provider calls"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[test]
+fn shellenv_json_reports_secret_metadata_and_never_values() {
+    let Some(run_dir) = secrets_runtime_dir("sheljson") else {
+        eprintln!("skipping: no tmpfs runtime dir available");
+        return;
+    };
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    seed_active_farm(root.path(), "default", 1);
+    let provider = write_provider(
+        root.path(),
+        "sentinel-provider",
+        &format!("echo {SECRET_SENTINEL}"),
+    );
+    std::fs::write(
+        pod_lua(root.path()),
+        format!(
+            "pod {{ secrets = {{ K = {{ source = \"exec\", command = {{ \"{provider}\" }} }} }} }}\n"
+        ),
+    )
+    .unwrap();
+    let refs = std::collections::BTreeMap::from([("K".to_string(), exec_secret(&provider))]);
+    seed_generation_secrets(root.path(), "default", &refs);
+
+    let (code, stdout, stderr) = run_with_runtime_dir(
+        project.path(),
+        root.path(),
+        &run_dir,
+        &["shellenv", "--json"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let secret = v["secrets"]["K"]
+        .as_object()
+        .expect("secrets map carries K");
+    assert_eq!(secret["source"], "exec");
+    assert_eq!(secret["cache"], "hit");
+    assert!(
+        !stdout.contains(SECRET_SENTINEL),
+        "--json must never carry a resolved value (D8): {stdout}"
+    );
+    assert!(
+        !stdout.contains("secret_vars"),
+        "the values map must not serialize at all: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[test]
+fn shellenv_fails_loud_on_a_dead_provider_without_partial_exports() {
+    let Some(run_dir) = secrets_runtime_dir("sheldead") else {
+        eprintln!("skipping: no tmpfs runtime dir available");
+        return;
+    };
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    seed_active_farm(root.path(), "default", 1);
+    let good = write_provider(root.path(), "good-provider", "echo partialvalue");
+    let dead = write_provider(root.path(), "dead-provider", "exit 9");
+    std::fs::write(
+        pod_lua(root.path()),
+        format!(
+            "pod {{ secrets = {{ BAD = {{ source = \"exec\", command = {{ \"{dead}\" }} }}, \
+             OK = {{ source = \"exec\", command = {{ \"{good}\" }} }} }} }}\n"
+        ),
+    )
+    .unwrap();
+    let refs = std::collections::BTreeMap::from([
+        ("BAD".to_string(), exec_secret(&dead)),
+        ("OK".to_string(), exec_secret(&good)),
+    ]);
+    seed_generation_secrets(root.path(), "default", &refs);
+
+    let (code, stdout, stderr) =
+        run_with_runtime_dir(project.path(), root.path(), &run_dir, &["shellenv"]);
+    assert_ne!(code, Some(0), "a dead provider must fail the verb");
+    assert!(
+        stderr.contains("BAD") && stderr.contains("dead-provider"),
+        "the failure names the var and provider: {stderr}"
+    );
+    assert!(
+        !stdout.contains("export"),
+        "no partial export set on stdout (D7): {stdout}"
+    );
+    assert!(
+        !stdout.contains("partialvalue"),
+        "even the healthy key's value must not leak: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}

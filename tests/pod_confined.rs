@@ -563,3 +563,141 @@ fn pod_confinement_unconfined_override_lifts_the_sandbox() {
         "unconfined-override app must write its marker without a sandbox"
     );
 }
+
+// ── `shuttle run` secrets overlay (ADR-0042 D3/D6/D7, issue #184) ──
+//
+// Hand-seeded pod (no builds): the arbitrary-command form resolves the
+// pod's secrets host-side (D6) and overlays them onto the exec'd
+// process with the declared-replaces-inherited rule.
+
+/// `/dev/shm`-backed isolated runtime dir (the D3 tmpfs gate); None =
+/// skip when no tmpfs is available.
+fn run_overlay_runtime_dir(tag: &str) -> Option<std::path::PathBuf> {
+    let base = std::path::Path::new("/dev/shm");
+    if !base.is_dir() {
+        return None;
+    }
+    let dir = base.join(format!("shuttle-run-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+#[test]
+fn shuttle_run_overlays_resolved_secrets_declared_replaces_inherited() {
+    let Some(run_dir) = run_overlay_runtime_dir("overlay") else {
+        eprintln!("skipping: no tmpfs runtime dir available");
+        return;
+    };
+    let project = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let pod = root.path().join("default");
+
+    // The active farm + an empty generation manifest: no package claims
+    // an app, so the arbitrary-command form runs the command.
+    let farm = pod.join("generations/1/farm");
+    std::fs::create_dir_all(&farm).unwrap();
+    std::os::unix::fs::symlink("generations/1/farm", pod.join("current")).unwrap();
+    // The store's own active pointer (`run` resolves the generation
+    // through it, distinct from the farm's `current`).
+    std::os::unix::fs::symlink("generations/1", pod.join("active")).unwrap();
+    std::fs::write(
+        pod.join("generations/1/manifest.json"),
+        serde_json::json!({
+            "n": 1, "base_version": "24.04", "packages": {},
+            "created_epoch": 0, "boot_entry": null
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // The counting provider lives OUTSIDE the pod state root (the D4
+    // refusal treats pod-rooted programs as provider shadowing).
+    let counter = root.path().join("calls");
+    let counter_s = counter.display().to_string();
+    let provider = root.path().join("counting-provider");
+    std::fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nn=$(cat {counter_s} 2>/dev/null || echo 0); echo $((n+1)) > {counter_s}; \
+             printf -- '-----BEGIN RUN KEY-----\\nMIIrun\\n-----END RUN KEY-----\\n'\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let provider_s = provider.display().to_string();
+
+    std::fs::write(
+        pod.join("pod.lua"),
+        format!(
+            "pod {{ secrets = {{ RUN_SECRET = {{ source = \"exec\", command = {{ \
+             \"{provider_s}\" }} }} }} }}\n"
+        ),
+    )
+    .unwrap();
+    let refs = std::collections::BTreeMap::from([(
+        "RUN_SECRET".to_string(),
+        shuttle::pod::SecretSource::Exec {
+            command: vec![provider_s.clone()],
+        },
+    )]);
+    let store = shuttle::runtime::RuntimeStore::new(pod.clone());
+    shuttle::farm::write_generation_secrets(&store, 1, &refs).unwrap();
+
+    let expected = "-----BEGIN RUN KEY-----\nMIIrun\n-----END RUN KEY-----";
+    let run_with = |ambient: Option<&str>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+        cmd.arg("run")
+            .arg("--pod")
+            .arg("default")
+            .arg("--root")
+            .arg(root.path())
+            .arg("--")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$RUN_SECRET\"");
+        match ambient {
+            Some(v) => {
+                cmd.env("RUN_SECRET", v);
+            }
+            None => {
+                cmd.env_remove("RUN_SECRET");
+            }
+        }
+        cmd.current_dir(project.path());
+        cmd.env("SHUTTLE_DATA_HOME", root.path().join("data-home"));
+        cmd.env("XDG_RUNTIME_DIR", &run_dir);
+        let out = cmd.output().expect("failed to spawn shuttle run");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // Cold: one resolve; the secret value replaces the inherited one,
+    // the PEM newline surviving the overlay untouched.
+    let (code, stdout, stderr) = run_with(Some("ambient-must-lose"));
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(
+        stdout, expected,
+        "the resolved value replaces the ambient one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().trim(),
+        "1",
+        "the cold run resolves exactly once"
+    );
+
+    // Warm: the second run rides the session cache — zero provider
+    // calls, same value served.
+    let (code, stdout, stderr) = run_with(None);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stdout, expected);
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().trim(),
+        "1",
+        "the warm run must be a session-cache hit (D3)"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}

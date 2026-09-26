@@ -65,7 +65,13 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
     // shellenv read verb fails loudly on a torn state (no `current`
     // despite an active generation), never silently drops the env.
     let root = pod_dir.parent().unwrap_or(pod_dir);
-    let vars = crate::pod::shellenv(root, pod_name)?.vars;
+    let shellenv = crate::pod::shellenv(root, pod_name)?;
+    let vars = &shellenv.vars;
+    // ADR-0042 D3 (issue #184): resolved secrets ride every exec form
+    // too — the serve resolve happened inside `shellenv` (all-or-
+    // nothing, D7: a provider outage fails the run named, never a
+    // partial env).
+    let secret_vars = &shellenv.secret_vars;
 
     // Effective confinement: the per-app override, else the package default.
     let Some(confined) = pkg.app_confined.get(app).or(pkg.confined.as_ref()) else {
@@ -109,8 +115,10 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
     }
 
     match confined.backend {
-        BackendKind::Bwrap => run_bwrap(pod_dir, app, confined, &bin, args, &vars),
-        BackendKind::Apparmor => run_apparmor(pod_name, app, confined, &bin, args, &vars),
+        BackendKind::Bwrap => run_bwrap(pod_dir, app, confined, &bin, args, vars, secret_vars),
+        BackendKind::Apparmor => {
+            run_apparmor(pod_name, app, confined, &bin, args, vars, secret_vars)
+        }
     }
 }
 
@@ -264,6 +272,13 @@ fn overlay_pod_env_with(
     for (key, value) in &env.vars {
         cmd.env(key, value);
     }
+    // ADR-0042 D3 (issue #184): the resolved secrets ride the SAME
+    // overlay with the SAME rule — declared replaces inherited. The
+    // values were resolved (all-or-nothing, D7) inside `shellenv`'
+    // serve step before this overlay ever ran.
+    for (key, value) in &env.secret_vars {
+        cmd.env(key, value);
+    }
 }
 
 /// Exec `bin` under a bwrap sandbox built from the grants (ticket #11).
@@ -276,6 +291,7 @@ fn run_bwrap(
     bin: &Path,
     args: &[String],
     vars: &std::collections::BTreeMap<String, String>,
+    secret_vars: &std::collections::BTreeMap<String, String>,
 ) -> miette::Result<()> {
     // Floor-tool seam (issue #101): bwrap resolves provisioned-first with
     // PATH fallback; a tool error still fails closed.
@@ -329,6 +345,11 @@ fn run_bwrap(
     // ADR-0030: declared env, threaded through bwrap into the sandbox
     // (bwrap passes its own environment in; no --clearenv is applied).
     overlay_declared_vars(&mut cmd, vars);
+    // ADR-0042 D3 (issue #184): resolved secrets ride the SAME declared
+    // re-injection — declared replaces inherited, never ambient env
+    // (the D3 isolation contract). Provider credentials stay
+    // caller-side; only the pod's secret values cross.
+    overlay_declared_vars(&mut cmd, secret_vars);
     // Replace the process (exec) so the sandboxed app is the child of our
     // caller, not a grandchild — transparent to the user.
     exec_cmd(cmd)
@@ -417,6 +438,7 @@ fn run_apparmor(
     bin: &Path,
     args: &[String],
     vars: &std::collections::BTreeMap<String, String>,
+    secret_vars: &std::collections::BTreeMap<String, String>,
 ) -> miette::Result<()> {
     let aa_exec = resolve_tool("aa-exec").ok_or_else(|| {
         miette::miette!(
@@ -436,6 +458,9 @@ fn run_apparmor(
         cmd.arg(a);
     }
     overlay_declared_vars(&mut cmd, vars);
+    // ADR-0042 D3 (issue #184): secrets ride the same declared
+    // re-injection as env — declared replaces inherited.
+    overlay_declared_vars(&mut cmd, secret_vars);
     exec_cmd(cmd)
 }
 
@@ -727,6 +752,8 @@ mod tests {
             farm: farm.display().to_string(),
             generation: Some(1),
             vars: Default::default(),
+            secret_vars: Default::default(),
+            secrets: Default::default(),
         }
     }
 
@@ -882,6 +909,33 @@ mod tests {
             env_of(&cmd, "HOME").unwrap(),
             "/home/user",
             "undeclared vars pass through untouched"
+        );
+    }
+
+    #[test]
+    fn overlay_pod_env_applies_secret_vars_with_the_declared_rule() {
+        // ADR-0042 D3 (issue #184): resolved secrets ride the SAME
+        // overlay as declared env — declared replaces inherited, the
+        // caller's ambient value never wins.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = sample_command_env(&tmp.path().join("current"));
+        env.secret_vars.insert(
+            "API_TOKEN".to_string(),
+            "s3cr3t with spaces and 'quotes'".to_string(),
+        );
+        let mut cmd = std::process::Command::new("true");
+        cmd.env("API_TOKEN", "ambient-must-lose");
+        cmd.env("UNRELATED", "keep");
+        overlay_pod_env_with(&mut cmd, &env, Some(std::ffi::OsStr::new("/bin")));
+        assert_eq!(
+            env_of(&cmd, "API_TOKEN").unwrap(),
+            "s3cr3t with spaces and 'quotes'",
+            "the secret value replaces the inherited one, verbatim"
+        );
+        assert_eq!(
+            env_of(&cmd, "UNRELATED").unwrap(),
+            "keep",
+            "undeclared vars still pass through"
         );
     }
 

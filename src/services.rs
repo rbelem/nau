@@ -227,9 +227,10 @@ pub fn record(
     store: &RuntimeStore,
     gen: &Generation,
     pod_overrides: &BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    secrets_envfile: Option<&str>,
 ) -> miette::Result<()> {
     let pod = crate::desktop::pod_name(store)?;
-    record_in(store, gen, pod_overrides, &pod)
+    record_in(store, gen, pod_overrides, &pod, secrets_envfile)
 }
 
 /// [`record`] with an explicit pod name (tests).
@@ -238,6 +239,7 @@ pub fn record_in(
     gen: &Generation,
     pod_overrides: &BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     pod: &str,
+    secrets_envfile: Option<&str>,
 ) -> miette::Result<()> {
     let current = store.root().join(crate::farm::CURRENT_LINK);
     let ctx = ResolveCtx {
@@ -247,6 +249,12 @@ pub fn record_in(
         gen_env: read_generation_env(&crate::farm::env_path(store, gen.n))?,
         loader_libs: crate::farm::loader_lib_dirs(store, gen),
         current: current.to_string_lossy().into_owned(),
+        // ADR-0042 D3 (issue #184): the pod's 0600 runtime envfile,
+        // derived from the references' decl-hash alone — record bakes
+        // the PATH into the unit text without resolving (sync never
+        // resolves). `None` for a secret-less pod: no line, nothing
+        // that could fail a start.
+        secrets_envfile: secrets_envfile.map(str::to_string),
     };
 
     // Shared service names resolve at emit time exactly like binaries:
@@ -328,6 +336,11 @@ struct ResolveCtx<'a> {
     loader_libs: Vec<String>,
     /// The absolute `current` path.
     current: String,
+    /// The pod's 0600 runtime secrets envfile (ADR-0042 D3, issue
+    /// #184) — recorded as a mandatory `EnvironmentFile=` line. `None`
+    /// for a secret-less pod (no line: an envfile nothing writes must
+    /// never fail a start).
+    secrets_envfile: Option<String>,
 }
 
 /// Resolve and render one service unit (a `record` inner step, split
@@ -420,6 +433,16 @@ fn render_unit(
     // The exec path is quoted like every arg: a farm root with spaces
     // must not split into binary + phantom args.
     out.push_str(&format!("ExecStart={}{quoted_args}\n", shell_quote(&exec)));
+    // ADR-0042 D3/D7 (issue #184): secret values ride the pod's 0600
+    // runtime envfile, NEVER the unit text — the mandatory path (no
+    // `-` prefix) makes a missing envfile FAIL the unit start naming
+    // the path. A silent start-without-secrets is exactly what D7
+    // forbids. Rotation never touches this text (values aren't hashed
+    // into unit_hash); a reference change moves the decl-hash in the
+    // path and the normal unit-diff restart takes it.
+    if let Some(envfile) = &ctx.secrets_envfile {
+        out.push_str(&format!("EnvironmentFile=\"{envfile}\"\n"));
+    }
     for (key, value) in environment {
         out.push_str(&format!(
             "Environment=\"{}={}\"",
@@ -1593,6 +1616,10 @@ fn pod_endpoint_claims(pod_dir: &std::path::Path) -> miette::Result<Vec<Endpoint
         gen_env: BTreeMap::new(), // expansion-only: env/loader-libs are render-time inputs
         loader_libs: Vec::new(),
         current: current.to_string_lossy().into_owned(),
+        // Expansion-only context (the endpoint scan): the envfile path
+        // is a render-time input and never participates in `${ref}`
+        // expansion.
+        secrets_envfile: None,
     };
     let mut claims = Vec::new();
     for unit in file.units {
@@ -1847,7 +1874,7 @@ mod tests {
         )
         .unwrap();
 
-        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
 
         let units = units_of(&store, 1);
         assert_eq!(units.len(), 1);
@@ -1895,6 +1922,60 @@ mod tests {
     }
 
     #[test]
+    fn record_bakes_the_secrets_envfile_line_only_when_the_pod_declares_secrets() {
+        // ADR-0042 D3/D7 (issue #184): secret-bearing units reference the
+        // pod's 0600 runtime envfile by its MANDATORY path (no `-`
+        // prefix — a missing file fails the start loud). A secret-less
+        // pod gains no line at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_fixture(tmp.path());
+        let gen = gen_with(
+            1,
+            vec![pkg_with_services(
+                "valkey",
+                &"a".repeat(96),
+                vec![("valkey", decl("bin/valkey-server"))],
+            )],
+        );
+        std::fs::create_dir_all(store.generation_dir(1)).unwrap();
+
+        let envfile = "/run/user/1000/shuttle/secrets/pilot/abc123.env";
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", Some(envfile)).unwrap();
+        let unit = &units_of(&store, 1)[0];
+        let expected = format!("EnvironmentFile=\"{envfile}\"\n");
+        assert!(
+            unit.text.contains(&expected),
+            "the mandatory EnvironmentFile line must render verbatim:\n{}",
+            unit.text
+        );
+        assert!(
+            !unit.text.contains("EnvironmentFile=-"),
+            "no `-` prefix: silent start-without-secrets is D7-forbidden\n{}",
+            unit.text
+        );
+        // The path rides the unit TEXT (so a reference change moves the
+        // unit hash through the normal diff), and the unit hash stays
+        // package-only — no envfile content digest is folded in.
+        // Rendering is deterministic in the path: a second record with
+        // the same envfile produces byte-identical text.
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", Some(envfile)).unwrap();
+        let again = &units_of(&store, 1)[0];
+        assert_eq!(
+            again.text, unit.text,
+            "render is deterministic in the envfile path"
+        );
+
+        // Secret-less pods: no line, nothing that could fail a start.
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
+        let unit = &units_of(&store, 1)[0];
+        assert!(
+            !unit.text.contains("EnvironmentFile"),
+            "secret-less units must not reference an envfile:\n{}",
+            unit.text
+        );
+    }
+
+    #[test]
     fn units_carry_farm_first_path() {
         let tmp = tempfile::tempdir().unwrap();
         let store = store_fixture(tmp.path());
@@ -1906,7 +1987,7 @@ mod tests {
                 vec![("wigolo", decl("usr/bin/wigolo"))],
             )],
         );
-        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
         let unit = &units_of(&store, 1)[0];
         let exec_line = unit
             .text
@@ -1944,7 +2025,7 @@ mod tests {
                 vec![("api", api), ("db", db)],
             )],
         );
-        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
         let units = units_of(&store, 1);
         let api = units.iter().find(|u| u.name == "api").unwrap();
         let db = units.iter().find(|u| u.name == "db").unwrap();
@@ -1967,7 +2048,7 @@ mod tests {
         );
         let err = format!(
             "{}",
-            record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap_err()
+            record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap_err()
         );
         assert!(err.contains("unknown '${nope}'"), "{err}");
     }
@@ -1985,7 +2066,7 @@ mod tests {
             1,
             vec![pkg_with_services("p", &"d".repeat(96), vec![("x", d)])],
         );
-        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
         let text = &units_of(&store, 1)[0].text;
         let passthrough_start = text.find("MemoryMax=1G\n").unwrap();
         assert!(
@@ -2007,7 +2088,7 @@ mod tests {
         );
         let err = format!(
             "{}",
-            record_in(&store, &gen_bad, &BTreeMap::new(), "pilot").unwrap_err()
+            record_in(&store, &gen_bad, &BTreeMap::new(), "pilot", None).unwrap_err()
         );
         assert!(
             err.contains("must be a string, number, or boolean"),
@@ -2029,7 +2110,7 @@ mod tests {
         );
         let err = format!(
             "{}",
-            record_in(&store, &gen_nt, &BTreeMap::new(), "pilot").unwrap_err()
+            record_in(&store, &gen_nt, &BTreeMap::new(), "pilot", None).unwrap_err()
         );
         assert!(err.contains("must be a table"), "{err}");
     }
@@ -2047,7 +2128,7 @@ mod tests {
                 vec![("x", decl("bin/x"))],
             )],
         );
-        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
         assert!(!units_of(&store, 1)[0].enabled);
         let dir = unit_dir(&tmp);
         emit_in(&store, &gen, &dir, "pilot").unwrap();
@@ -2072,7 +2153,7 @@ mod tests {
             1,
             vec![pkg_with_services("p", &"f".repeat(96), vec![("x", d)])],
         );
-        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
         let dir = unit_dir(&tmp);
         emit_in(&store, &gen, &dir, "pilot").unwrap();
         assert!(dir.join("shuttle-pod-pilot-x.service").exists());
@@ -2113,9 +2194,9 @@ mod tests {
             1,
             vec![pkg_with_services("p", &"1".repeat(96), vec![("x", d)])],
         );
-        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
         let first = std::fs::read(units_path(&store, 1)).unwrap();
-        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
         let second = std::fs::read(units_path(&store, 1)).unwrap();
         assert_eq!(first, second, "re-record must be byte-identical");
     }
@@ -2529,7 +2610,7 @@ mod tests {
             1,
             vec![pkg_with_services("p", &"2".repeat(96), vec![("x", d)])],
         );
-        record_in(&store, &gen, &BTreeMap::new(), "pilot").unwrap();
+        record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
         let dir = unit_dir(&tmp);
         emit_in(&store, &gen, &dir, "pilot").unwrap();
 

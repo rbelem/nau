@@ -263,6 +263,26 @@ pub fn write_generation_secrets(
         .map_err(|e| miette::miette!("writing {}: {e}", path.display()))
 }
 
+/// Read one generation's recorded secret references (ADR-0042 D2) —
+/// the serve-side half of [`write_generation_secrets`]. A missing file
+/// is a generation recorded before the surface existed (or a
+/// secret-less one): an empty map is the correct answer, exactly the
+/// `env.json` reader's rule. A corrupt object fails loud — trusted
+/// data, never a silently wrong reference set at serve time.
+pub fn read_generation_secrets(
+    store: &RuntimeStore,
+    n: u64,
+) -> miette::Result<BTreeMap<String, crate::pod::SecretSource>> {
+    let path = secrets_path(store, n);
+    let body = match std::fs::read(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(miette::miette!("reading {}: {e}", path.display())),
+    };
+    serde_json::from_slice(&body)
+        .map_err(|e| miette::miette!("corrupt generation secrets {}: {e}", path.display()))
+}
+
 /// One app's multi-file payload assembly (issue #37): the app binary's
 /// in-payload path plus the content that ships beside it (same payload
 /// directory, recursively), recorded at install time from the walked

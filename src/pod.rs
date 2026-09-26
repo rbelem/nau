@@ -5050,7 +5050,30 @@ fn present_active(
             // resolves — it only prunes cache entries whose recorded
             // generation is no longer active. Best-effort by contract.
             crate::secrets::reconcile_cache_prune(pod_name, Some(gen.n), secrets_cache_base);
-            crate::services::record(store, gen, svc_overrides)?;
+            // ADR-0042 D3's sync-triggered resolve, without resolving:
+            // a WARM cache entry (surviving the prune above, so
+            // generation-current) lets sync re-materialize the 0600
+            // runtime envfile from the cached values — zero provider
+            // calls, zero network. A cold cache writes nothing here;
+            // the units' mandatory `EnvironmentFile=` then fails the
+            // start loud (D7) until a serve-time resolve or
+            // `pod secrets refresh` writes the file — the designed
+            // boot story, never a silent start-without-secrets.
+            crate::secrets::render_pod_envfile_from_warm_cache(
+                pod_name,
+                secrets,
+                secrets_cache_base,
+            );
+            // The envfile PATH is derived from the references alone (the
+            // decl-hash), so the unit text can be recorded value-free
+            // without resolving. A secret-less pod records no line; a
+            // secret-bearing pod with no runtime dir fails here named
+            // (D7) — recording a unit without the line would silently
+            // start it without secrets.
+            let secrets_envfile =
+                crate::secrets::pod_envfile_path_passive(pod_name, secrets, secrets_cache_base)?;
+            let secrets_envfile = secrets_envfile.map(|p| p.to_string_lossy().into_owned());
+            crate::services::record(store, gen, svc_overrides, secrets_envfile.as_deref())?;
             let farm = crate::farm::emit(store, gen)?;
             crate::farm::flip_current(dir, gen.n)?;
             (Some(gen.n), Some(farm))
@@ -6093,6 +6116,19 @@ pub struct PodShellenv {
     /// run` overlays nothing in that case.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub vars: BTreeMap<String, String>,
+    /// Resolved secret values (ADR-0042 D3, issue #184): the recorded
+    /// references resolved at serve time, all-or-nothing (D7). The
+    /// renderer exports these AFTER the env lines; `shuttle run`
+    /// overlays them onto the exec'd process with the same
+    /// declared-replaces-inherited rule. NEVER serialized (D8): the
+    /// JSON branch of `pod shellenv` must not become a value
+    /// exfiltration path — [`Self::secrets`] is the only `--json` face.
+    #[serde(skip)]
+    pub secret_vars: BTreeMap<String, String>,
+    /// Per-secret serve metadata for `--json` (D8): the source kind and
+    /// session-cache state only, never a value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, crate::secrets::SecretMeta>,
 }
 
 /// Resolve the environment the selected pod exposes to an interactive
@@ -6103,6 +6139,17 @@ pub struct PodShellenv {
 /// the `current` segment stays a symlink), so the export is eval-safe
 /// from any cwd.
 pub fn shellenv(root: &Path, pod_name: &str) -> miette::Result<PodShellenv> {
+    shellenv_with(root, pod_name, None)
+}
+
+/// [`shellenv`] with an explicit secrets session-cache base (tests —
+/// the production path derives `$XDG_RUNTIME_DIR` inside the resolve).
+/// `None` keeps the default derivation, tmpfs gate included.
+pub fn shellenv_with(
+    root: &Path,
+    pod_name: &str,
+    secrets_cache_base: Option<&Path>,
+) -> miette::Result<PodShellenv> {
     validate_pod_name(pod_name)?;
     let pod = pod_dir(root, pod_name);
     if !pod.is_dir() {
@@ -6143,12 +6190,46 @@ pub fn shellenv(root: &Path, pod_name: &str) -> miette::Result<PodShellenv> {
         )?,
         None => BTreeMap::new(),
     };
+    // ADR-0042 D3 (issue #184): resolve the generation's RECORDED
+    // secret references — never the declaration, the same read rule as
+    // `env.json` (a rollback must serve the target generation's pinned
+    // refs, not a re-resolution against a moved declaration). The
+    // resolve is all-or-nothing (D7): an unreachable provider fails the
+    // verb named, never a partial export set — and it also materializes
+    // the 0600 runtime envfile the service units reference.
+    let (secret_vars, secrets) = shellenv_secrets(&pod, pod_name, generation, secrets_cache_base)?;
     Ok(PodShellenv {
         pod: pod_name.to_string(),
         farm: farm.display().to_string(),
         generation,
         vars,
+        secret_vars,
+        secrets,
     })
+}
+
+/// The shellenv's secrets half (split out to keep [`shellenv_with`]
+/// small): the active generation's recorded `secrets.json` through the
+/// ONE serve step. Empty refs (a secret-less generation) never touch
+/// `$XDG_RUNTIME_DIR` — the D3 empty rule.
+fn shellenv_secrets(
+    pod: &Path,
+    pod_name: &str,
+    generation: Option<u64>,
+    secrets_cache_base: Option<&Path>,
+) -> miette::Result<(
+    BTreeMap<String, String>,
+    BTreeMap<String, crate::secrets::SecretMeta>,
+)> {
+    let Some(n) = generation else {
+        return Ok((BTreeMap::new(), BTreeMap::new()));
+    };
+    let refs = crate::farm::read_generation_secrets(&pod_store(pod), n)?;
+    if refs.is_empty() {
+        return Ok((BTreeMap::new(), BTreeMap::new()));
+    }
+    let served = crate::secrets::serve_pod(pod, pod_name, n, &refs, secrets_cache_base)?;
+    Ok((served.values, served.meta))
 }
 
 /// Parse a generation's recorded env object (ADR-0030): a JSON map of
@@ -6190,6 +6271,14 @@ pub fn render_shellenv(env: &PodShellenv) -> String {
     // ADR-0030: one export per declared var, BTreeMap order (sorted —
     // byte-deterministic across syncs and rebuilds).
     for (key, value) in &env.vars {
+        script.push_str(&format!("export {key}={}\n", sh_single_quote(value)));
+    }
+    // ADR-0042 D3 (issue #184): secret exports come AFTER the env
+    // exports — one POSIX single-quoted export per resolved secret,
+    // sorted keys. Single quotes survive any bytes the providers yield,
+    // newline-bearing PEM values included; the same
+    // declared-replaces-inherited rule `shuttle run` overlays with.
+    for (key, value) in &env.secret_vars {
         script.push_str(&format!("export {key}={}\n", sh_single_quote(value)));
     }
     script
@@ -7390,6 +7479,8 @@ pod {
             farm: "/root/default/current".into(),
             generation: Some(1),
             vars: BTreeMap::new(),
+            secret_vars: BTreeMap::new(),
+            secrets: BTreeMap::new(),
         };
         let script = render_shellenv(&env);
         assert_eq!(script, "export PATH=\"/root/default/current:$PATH\"\n");
@@ -7876,6 +7967,8 @@ pod {
             farm: "/root/default/current".into(),
             generation: Some(1),
             vars,
+            secret_vars: BTreeMap::new(),
+            secrets: BTreeMap::new(),
         };
         let script = render_shellenv(&env);
         // Sorted keys, POSIX single-quote escaping (`'` → `'\''`).
@@ -7920,6 +8013,272 @@ pod {
             .as_object()
             .unwrap()
             .contains_key("vars"));
+    }
+
+    // ── shellenv secrets serve (ADR-0042 D3, issue #184) ──
+
+    /// A `+x` provider script printing one line; returns its absolute
+    /// path (the argv[0] form). Lives OUTSIDE the pod state root — the
+    /// D4 refusal treats pod-rooted programs as shadowing.
+    fn secret_provider(dir: &Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    /// The counting provider: appends one line to `counter`, prints the
+    /// sentinel. Zero calls = zero lines.
+    fn counting_secret_provider(dir: &Path, counter: &Path) -> String {
+        let counter = counter.display();
+        secret_provider(
+            dir,
+            "counting-provider",
+            &format!(
+                "n=$(cat {counter} 2>/dev/null || echo 0); \
+                 echo $((n+1)) > {counter}; \
+                 printf 'line1\\nline2 \"quoted\" $dollar '\\''tick\\n'\n"
+            ),
+        )
+    }
+
+    fn provider_calls(counter: &Path) -> u32 {
+        std::fs::read_to_string(counter)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    fn test_shellenv_secrets_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_active_pod(tmp.path(), "default", 3);
+        let dir = pod_dir(tmp.path(), "default");
+        let store = pod_store(&dir);
+        let counter = tmp.path().join("calls");
+        let provider = counting_secret_provider(tmp.path(), &counter);
+        let static_provider = secret_provider(tmp.path(), "static-provider", "printf plain\n");
+        let refs: BTreeMap<String, SecretSource> = BTreeMap::from([
+            (
+                "Z_TOKEN".to_string(),
+                SecretSource::Exec {
+                    command: vec![static_provider],
+                },
+            ),
+            (
+                "A_PEM".to_string(),
+                SecretSource::Exec {
+                    command: vec![provider],
+                },
+            ),
+        ]);
+        crate::farm::write_generation_secrets(&store, 3, &refs).unwrap();
+        let cache = tmp.path().join("secrets-cache");
+        let hash = crate::secrets::decl_hash(&refs).unwrap();
+        (tmp, counter, cache, hash)
+    }
+
+    #[test]
+    fn test_shellenv_exports_secret_values_after_env_sorted_and_eval_safe() {
+        let (tmp, counter, cache, hash) = test_shellenv_secrets_fixture();
+        // Declared env alongside, to pin the ordering rule.
+        let dir = pod_dir(tmp.path(), "default");
+        let store = pod_store(&dir);
+        let vars: BTreeMap<String, String> = [("EDITOR".to_string(), "vi".to_string())]
+            .into_iter()
+            .collect();
+        crate::farm::write_generation_env(&store, 3, &vars).unwrap();
+
+        let env = shellenv_with(tmp.path(), "default", Some(&cache)).unwrap();
+        assert_eq!(provider_calls(&counter), 1, "cold serve resolves once");
+        // Sorted keys; the newline/quote/$-laden value survives verbatim
+        // under POSIX single quotes.
+        let script = render_shellenv(&env);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "set -u\n{script}\nprintf '%s|%s' \"$EDITOR\" \"$A_PEM\""
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "shellenv must eval clean under set -u: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "vi|line1\nline2 \"quoted\" $dollar 'tick",
+            "env value then secret value, newline + quote + $ intact"
+        );
+
+        // Position contract: EVERY env export precedes EVERY secret
+        // export, secrets sorted, and the envfile materialized 0600.
+        let env_line = script.find("export EDITOR='vi'").unwrap();
+        let a = script.find("export A_PEM='").unwrap();
+        let z = script.find("export Z_TOKEN='").unwrap();
+        assert!(
+            env_line < a && a < z,
+            "env exports first, secrets sorted:\n{script}"
+        );
+        let envfile = cache.join("default").join(format!("{hash}.env"));
+        assert!(envfile.is_file());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&envfile).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // The warm serve is a cache hit — zero provider calls — and
+        // still refreshes the envfile.
+        std::fs::remove_file(&envfile).unwrap();
+        let env2 = shellenv_with(tmp.path(), "default", Some(&cache)).unwrap();
+        assert_eq!(provider_calls(&counter), 1, "cache hit, zero calls");
+        assert!(envfile.is_file(), "envfile re-materialized from the cache");
+        assert_eq!(env2.secret_vars, env.secret_vars);
+    }
+
+    #[test]
+    fn test_shellenv_json_carries_secret_metadata_never_values() {
+        let (tmp, _counter, cache, _hash) = test_shellenv_secrets_fixture();
+        let env = shellenv_with(tmp.path(), "default", Some(&cache)).unwrap();
+        let json = serde_json::to_value(&env).unwrap();
+        let secrets = json["secrets"].as_object().expect("secrets map present");
+        assert_eq!(secrets.len(), 2);
+        let meta = secrets["A_PEM"].as_object().unwrap();
+        assert_eq!(meta["source"], "exec");
+        assert_eq!(meta["cache"], "hit");
+        assert!(
+            !meta.contains_key("value") && !meta.contains_key("values"),
+            "no value field of any shape: {secrets:?}"
+        );
+        let rendered = serde_json::to_string(&env).unwrap();
+        assert!(
+            !rendered.contains("line1") && !rendered.contains("tick"),
+            "the JSON surface must carry no resolved value: {rendered}"
+        );
+        // The values map is skipped entirely from serialization.
+        assert!(
+            !rendered.contains("secret_vars"),
+            "values live only on the render/overlay faces: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_shellenv_fails_loud_on_a_failing_provider_without_partial_exports() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_active_pod(tmp.path(), "default", 3);
+        let dir = pod_dir(tmp.path(), "default");
+        let store = pod_store(&dir);
+        let provider = secret_provider(tmp.path(), "broken-provider", "echo partial; exit 7");
+        let refs: BTreeMap<String, SecretSource> = BTreeMap::from([
+            (
+                "OK_KEY".to_string(),
+                SecretSource::Exec {
+                    command: vec![provider.clone()],
+                },
+            ),
+            (
+                "BAD_KEY".to_string(),
+                SecretSource::Exec {
+                    command: vec![secret_provider(tmp.path(), "dead-provider", "exit 3")],
+                },
+            ),
+        ]);
+        crate::farm::write_generation_secrets(&store, 3, &refs).unwrap();
+        let cache = tmp.path().join("cache");
+        let err = format!(
+            "{}",
+            shellenv_with(tmp.path(), "default", Some(&cache)).unwrap_err()
+        );
+        assert!(err.contains("BAD_KEY"), "{err}");
+        assert!(err.contains("exit") || err.contains("3"), "{err}");
+        // D7: nothing lands — no cache entry, no envfile, nothing for a
+        // caller to mistake for a partial export set.
+        let secretless = format!(
+            "{}",
+            shellenv_with(tmp.path(), "default", Some(&cache)).unwrap_err()
+        );
+        assert!(
+            secretless.contains("BAD_KEY"),
+            "deterministic failure: {secretless}"
+        );
+        let hash = crate::secrets::decl_hash(&refs).unwrap();
+        assert!(
+            !cache.join("default").join(format!("{hash}.env")).exists(),
+            "no envfile on a failed serve"
+        );
+    }
+
+    #[test]
+    fn test_shellenv_serves_the_flipped_generation_secrets_not_the_declaration() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_active_pod(tmp.path(), "default", 1);
+        let dir = pod_dir(tmp.path(), "default");
+        let store = pod_store(&dir);
+        let p1 = secret_provider(tmp.path(), "provider-one", "echo one");
+        let p2 = secret_provider(tmp.path(), "provider-two", "echo two");
+        let gen1: BTreeMap<String, SecretSource> = BTreeMap::from([(
+            "GEN1_KEY".to_string(),
+            SecretSource::Exec { command: vec![p1] },
+        )]);
+        let gen2: BTreeMap<String, SecretSource> = BTreeMap::from([(
+            "GEN2_KEY".to_string(),
+            SecretSource::Exec { command: vec![p2] },
+        )]);
+        crate::farm::write_generation_secrets(&store, 1, &gen1).unwrap();
+        // The farm dir for generation 2 must exist before the record +
+        // the flip (the flip links generations/2).
+        std::fs::create_dir_all(store.generation_dir(2).join("farm")).unwrap();
+        crate::farm::write_generation_secrets(&store, 2, &gen2).unwrap();
+        // The DECLARATION points at yet another (nonexistent) provider —
+        // the serve must read the generation record, never re-fold the
+        // declaration (the same rule as env.json).
+        std::fs::write(
+            dir.join("pod.lua"),
+            "pod { secrets = { GHOST = { source = \"exec\", command = { \"/no/such/x\" } } } }",
+        )
+        .unwrap();
+        let cache = tmp.path().join("cache");
+        let env1 = shellenv_with(tmp.path(), "default", Some(&cache)).unwrap();
+        assert!(env1.secret_vars.contains_key("GEN1_KEY"));
+        crate::farm::flip_current(&dir, 2).unwrap();
+        let env2 = shellenv_with(tmp.path(), "default", Some(&cache)).unwrap();
+        assert!(
+            env2.secret_vars.contains_key("GEN2_KEY") && !env2.secret_vars.contains_key("GEN1_KEY"),
+            "the flip re-scopes the served reference set: {:?}",
+            env2.secret_vars.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_shellenv_fails_loudly_on_a_corrupt_generation_secrets_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_active_pod(tmp.path(), "default", 4);
+        let record = pod_dir(tmp.path(), "default")
+            .join("generations")
+            .join("4")
+            .join(crate::farm::SECRETS_FILE);
+        std::fs::write(&record, "{not json").unwrap();
+        let err = format!(
+            "{}",
+            shellenv_with(tmp.path(), "default", Some(tmp.path().join("c").as_path())).unwrap_err()
+        );
+        assert!(err.contains("corrupt generation secrets"), "{err}");
+    }
+
+    #[test]
+    fn test_shellenv_without_secrets_needs_no_runtime_dir_and_omits_the_json_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_active_pod(tmp.path(), "default", 2);
+        let env = shellenv_with(tmp.path(), "default", None).unwrap();
+        assert!(env.secret_vars.is_empty() && env.secrets.is_empty());
+        let json = serde_json::to_value(&env).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("secrets"),
+            "secret-less pods carry no secrets map"
+        );
     }
 
     #[test]

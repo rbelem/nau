@@ -45,8 +45,22 @@
 //! Sync NEVER resolves (D3): the sync side only prunes cache entries
 //! whose recorded generation is no longer active
 //! ([`reconcile_cache_prune`], wired into the reconcile staging tail
-//! beside `farm::write_generation_secrets`). `pod remove` prunes the
-//! pod's whole subtree via [`remove_pod_cache`].
+//! beside `farm::write_generation_secrets`) and, when a WARM entry
+//! already exists, renders the 0600 runtime envfile from the cached
+//! values ([`render_pod_envfile_from_warm_cache`]) — zero provider
+//! calls either way. `pod remove` prunes the pod's whole subtree via
+//! [`remove_pod_cache`].
+//!
+//! The consumers (issue #184): [`serve_pod`] is the ONE serve step
+//! every exec-form consumer shares — resolve (D3), publish the session
+//! cache, and materialize the envfile the service units reference.
+//! `pod shellenv` renders the values as POSIX exports after the env
+//! lines; `shuttle run` overlays them onto the exec'd process (declared
+//! replaces inherited — the same rule as env); services read the
+//! envfile through a mandatory `EnvironmentFile=` (no `-` prefix — a
+//! missing file fails the unit start loud, never a silent
+//! start-without-secrets, D7). Values never reach a log, an error, or
+//! any `--json` output (D8).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -469,6 +483,11 @@ fn is_tmpfs(path: &Path) -> miette::Result<bool> {
 /// the cache is disposable tmpfs, sync never fails on hygiene, and an
 /// unreadable entry has no recorded generation to classify it — it is
 /// skipped (a refresh purge or the reboot drops it).
+///
+/// The `.env` sibling rides its entry's lifecycle: a stale entry's
+/// envfile is pruned with it, and any file that is not a cache entry
+/// (including an orphaned envfile) is left to the next purge/reboot —
+/// hygiene never blocks sync.
 pub fn prune_stale_cache_entries(base: &Path, pod_name: &str, active_generation: u64) -> usize {
     let dir = pod_cache_dir(base, pod_name);
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -482,19 +501,26 @@ pub fn prune_stale_cache_entries(base: &Path, pod_name: &str, active_generation:
             .and_then(|body| serde_json::from_slice::<CacheEntry>(&body).ok())
             .map(|cache| cache.generation != active_generation);
         if stale == Some(true) && std::fs::remove_file(&path).is_ok() {
+            // The envfile shares the entry's decl-hash key — it goes
+            // when the entry goes (best-effort, same hygiene rule).
+            let _ = std::fs::remove_file(path.with_extension("env"));
             pruned += 1;
         }
     }
     pruned
 }
 
-/// Drop the pod's whole cache subtree, returning how many entries went.
-/// Errors fail loud — `refresh` is the explicit, operator-facing cache
-/// lifecycle verb.
+/// Drop the pod's whole cache subtree, returning how many ENTRIES went
+/// (`.json` cache entries — the `.env` siblings ride the subtree and
+/// are not counted). Errors fail loud — `refresh` is the explicit,
+/// operator-facing cache lifecycle verb.
 pub fn purge_pod_cache(base: &Path, pod_name: &str) -> miette::Result<usize> {
     let dir = pod_cache_dir(base, pod_name);
     let count = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries.flatten().filter(|e| e.path().is_file()).count(),
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .count(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(miette::miette!("reading {}: {e}", dir.display())),
     };
@@ -535,6 +561,223 @@ pub fn reconcile_cache_prune(
         }
         None => remove_pod_cache(&base, pod_name),
     }
+}
+
+// ── Serve + the envfile (ADR-0042 D3's consumers, issue #184) ──
+
+/// Per-key serve metadata: the registry source kind and the session
+/// cache state. The ONLY thing `pod shellenv --json` carries about a
+/// secret (D8: names + source kind + cache state, never a value — a CI
+/// script dumping shellenv JSON must not become an exfiltration path).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SecretMeta {
+    /// The registry source name (`bitwarden`, `exec`, `env`, …).
+    pub source: String,
+    /// `hit` / `stale` / `miss` — the session cache state after the
+    /// serve resolve.
+    pub cache: &'static str,
+}
+
+/// What one serve step hands a consumer: the resolved values (the ONLY
+/// value surface, never serialized — [`SecretMeta`] is the `--json`
+/// face), the per-key metadata, and the envfile path the resolve
+/// materialized.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServedSecrets {
+    /// Key → resolved value. Rendered as POSIX exports / overlaid onto
+    /// the exec'd process / written to the envfile — nothing else.
+    pub values: BTreeMap<String, String>,
+    /// Key → serve metadata (the `--json` map).
+    pub meta: BTreeMap<String, SecretMeta>,
+    /// The 0600 runtime envfile path, when the pod declares secrets.
+    /// `None` for a secret-less pod: no references, no envfile, no
+    /// tmpfs requirement (the D3 empty rule).
+    pub envfile: Option<PathBuf>,
+}
+
+/// The ONE serve step every exec-form consumer shares (ADR-0042 D3):
+/// resolve the folded reference set (session cache first, providers
+/// all-or-nothing — D7), then materialize the 0600 runtime envfile from
+/// the resolved values. A cache hit costs zero provider calls and still
+/// refreshes the envfile (idempotent same-content rewrite). Splitting
+/// out of [`resolve_references`] would change nothing: this calls it —
+/// one resolve entry point, three consumers.
+pub fn serve_pod(
+    pod_dir: &Path,
+    pod_name: &str,
+    generation: u64,
+    refs: &BTreeMap<String, SecretSource>,
+    cache_base_override: Option<&Path>,
+) -> miette::Result<ServedSecrets> {
+    if refs.is_empty() {
+        return Ok(ServedSecrets::default());
+    }
+    let base = cache_base(cache_base_override)?;
+    let hash = decl_hash(refs)?;
+    let entry_path = pod_cache_entry_path(&base, pod_name, &hash);
+    let values = resolve_references(pod_dir, pod_name, generation, refs, Some(&base))?;
+    let meta = refs
+        .keys()
+        .map(|key| -> miette::Result<(String, SecretMeta)> {
+            Ok((
+                key.clone(),
+                SecretMeta {
+                    source: source_name(&refs[key]).to_string(),
+                    cache: cache_state(&entry_path, generation)?,
+                },
+            ))
+        })
+        .collect::<miette::Result<BTreeMap<_, _>>>()?;
+    let envfile = pod_envfile_path(&base, pod_name, &hash);
+    write_pod_envfile(&envfile, &values)?;
+    Ok(ServedSecrets {
+        values,
+        meta,
+        envfile: Some(envfile),
+    })
+}
+
+/// The envfile for one cache entry: a SIBLING of the cache entry
+/// (`<base>/<pod>/<decl-hash>.env`, the `.json` swapped for `.env`).
+/// Same decl-hash key, same rotation semantics: any reference change is
+/// a fresh path AND a fresh fetch.
+fn pod_envfile_path(base: &Path, pod_name: &str, hash: &str) -> PathBuf {
+    let entry = pod_cache_entry_path(base, pod_name, hash);
+    entry.with_extension("env")
+}
+
+/// Derive the pod's canonical envfile path PASSIVELY (no creation, no
+/// tmpfs gate): the sync side bakes it into unit TEXT without resolving
+/// (D3), so it must be computable from the references alone. `None`
+/// when the pod declares no secrets — a secret-less unit never gains an
+/// `EnvironmentFile=` pointing at a file nothing will ever write. An
+/// unset `$XDG_RUNTIME_DIR` with secrets declared is a named failure
+/// (D7): sync must not record a secret-bearing pod it cannot point a
+/// unit at — the alternative (recording the unit without the line)
+/// silently starts without secrets, exactly what D7 forbids.
+pub fn pod_envfile_path_passive(
+    pod_name: &str,
+    refs: &BTreeMap<String, SecretSource>,
+    cache_base_override: Option<&Path>,
+) -> miette::Result<Option<PathBuf>> {
+    if refs.is_empty() {
+        return Ok(None);
+    }
+    let base = match cache_base_override {
+        Some(base) => base.to_path_buf(),
+        None => match xdg_cache_base_passive() {
+            Some(base) => base,
+            None => {
+                miette::bail!(
+                    "pod '{pod_name}' declares secrets, but XDG_RUNTIME_DIR is \
+                     not set — the service envfile lives under \
+                     $XDG_RUNTIME_DIR/shuttle/secrets (ADR-0042 D3/D7: no \
+                     disk fallback). Export XDG_RUNTIME_DIR and sync again."
+                )
+            }
+        },
+    };
+    let hash = decl_hash(refs)?;
+    Ok(Some(pod_envfile_path(&base, pod_name, &hash)))
+}
+
+/// Escape one secret value for the systemd `EnvironmentFile=` format
+/// (ADR-0042 D4: values may carry newlines — PEM keys are a day-one
+/// case). Double quotes with systemd's C-escape processing: backslash,
+/// double quote, newline, carriage return, and tab are escaped, every
+/// other byte lands verbatim. `$` needs no escape — systemd env files
+/// never expand.
+fn envfile_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Write the pod's 0600 runtime envfile (ADR-0042 D3): one `KEY=value`
+/// line per resolved secret, sorted keys, values C-escaped per
+/// [`envfile_value`]. ATOMIC like the cache entry — same-dir temp +
+/// rename, 0600 — so a unit start never observes a half-written file.
+/// Values only ever arrive from an in-process resolve (this map is the
+/// D8 value surface; the envfile and the POSIX shellenv exports are the
+/// only two value outputs in the whole surface). The file lives in the
+/// tmpfs secrets tree, NEVER under `generations/<n>/` — ADR-0032's
+/// emit-into-generation norm must not be read onto it (D3).
+fn write_pod_envfile(path: &Path, values: &BTreeMap<String, String>) -> miette::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| miette::miette!("secret envfile {} has no parent", path.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| miette::miette!("creating {}: {e}", dir.display()))?;
+    set_dir_mode(dir, 0o700)?;
+    let mut body = String::new();
+    for (key, value) in values {
+        body.push_str(&format!("{key}={}\n", envfile_value(value)));
+    }
+    let temp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| miette::miette!("staging {}: {e}", path.display()))?;
+    temp.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| miette::miette!("staging {}: {e}", path.display()))?;
+    temp.as_file()
+        .write_all(body.as_bytes())
+        .map_err(|e| miette::miette!("staging {}: {e}", path.display()))?;
+    temp.persist(path)
+        .map_err(|e| miette::miette!("publishing {}: {}", path.display(), e.error))?;
+    Ok(())
+}
+
+/// The sync-side warm-cache envfile render (ADR-0042 D3's
+/// sync-triggered resolve, with sync STILL NEVER resolving): when a
+/// warm cache entry already exists for the pod's decl-hash, render the
+/// envfile FROM THE CACHE — zero provider calls, zero network. On a
+/// cache miss, write NOTHING: the unit's mandatory `EnvironmentFile=`
+/// fails the start loud (D7), which is the designed cold-cache state
+/// until a serve-time resolve or `pod secrets refresh` materializes the
+/// file. Call AFTER [`reconcile_cache_prune`] — a surviving entry is
+/// generation-current by construction. Best-effort on cache read
+/// failures, by the same hygiene rule as the prune: sync never fails on
+/// cache state, and a corrupt entry serves nothing rather than
+/// something wrong. Returns 1 when the envfile was rendered, 0 when
+/// not (no references, no runtime dir, cache miss, or read failure).
+pub fn render_pod_envfile_from_warm_cache(
+    pod_name: &str,
+    refs: &BTreeMap<String, SecretSource>,
+    cache_base_override: Option<&Path>,
+) -> usize {
+    if refs.is_empty() {
+        return 0;
+    }
+    let base = match cache_base_override {
+        Some(base) => base.to_path_buf(),
+        None => match xdg_cache_base_passive() {
+            Some(base) => base,
+            None => return 0,
+        },
+    };
+    let Ok(hash) = decl_hash(refs) else {
+        return 0;
+    };
+    let rendered = read_cache_entry(&pod_cache_entry_path(&base, pod_name, &hash))
+        .ok()
+        .flatten()
+        .map(|cache| {
+            write_pod_envfile(&pod_envfile_path(&base, pod_name, &hash), &cache.values).is_ok()
+        })
+        .unwrap_or(false);
+    usize::from(rendered)
 }
 
 // ── Verbs (`shuttle pod secrets …`) ──
@@ -792,6 +1035,11 @@ pub fn refresh_pod(
         Some(&base),
     )?;
     report.resolved = values.len();
+    // Consumer duty (ADR-0042 D3, issue #184): refresh is the rotation
+    // verb, so it re-materializes the 0600 runtime envfile the service
+    // units reference — the rotate-restart contract's write half.
+    let hash = decl_hash(&inputs.refs)?;
+    write_pod_envfile(&pod_envfile_path(&base, pod_name, &hash), &values)?;
     Ok(report)
 }
 
@@ -1271,6 +1519,210 @@ mod tests {
         // Best-effort by construction: unknown pods and missing bases
         // are silent no-ops.
         reconcile_cache_prune("ghost", Some(1), Some(&cache));
+    }
+
+    // ── serve step + envfile (issue #184) ──
+
+    #[test]
+    fn serve_pod_resolves_and_materializes_the_envfile_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let pod = pod_state_root(tmp.path());
+        let counter = tmp.path().join("calls");
+        let path = counting_script(tmp.path(), &counter);
+        let refs = BTreeMap::from([
+            ("A_KEY".to_string(), env_ref("SHUTTLE_SECRETS_TEST_SERVE")),
+            (
+                "B_KEY".to_string(),
+                SecretSource::Exec {
+                    command: vec![path],
+                },
+            ),
+        ]);
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SHUTTLE_SECRETS_TEST_SERVE", "plain");
+        let served = serve_pod(&pod, "p", 5, &refs, Some(&cache)).unwrap();
+        std::env::remove_var("SHUTTLE_SECRETS_TEST_SERVE");
+        assert_eq!(calls(&counter), 1, "cold resolve calls the provider");
+        assert_eq!(
+            served.values.get("B_KEY").map(String::as_str),
+            Some(SENTINEL)
+        );
+        let envfile = served.envfile.clone().unwrap();
+        let hash = decl_hash(&refs).unwrap();
+        let cache_entry = pod_cache_entry_path(&cache, "p", &hash);
+        assert_eq!(
+            envfile,
+            cache_entry.with_extension("env"),
+            "the envfile is the cache entry's .env sibling"
+        );
+        assert_eq!(file_mode(&envfile), 0o600);
+        let body = std::fs::read_to_string(&envfile).unwrap();
+        assert_eq!(
+            body,
+            format!("A_KEY=\"plain\"\nB_KEY=\"{SENTINEL}\"\n"),
+            "sorted KEY=value lines, systemd double-quote wrapping"
+        );
+        // A warm serve: zero provider calls, envfile refreshed anyway.
+        std::fs::remove_file(&envfile).unwrap();
+        let again = serve_pod(&pod, "p", 5, &refs, Some(&cache)).unwrap();
+        assert_eq!(calls(&counter), 1, "cache hit = zero provider calls");
+        assert!(envfile.is_file(), "the serve re-materializes the envfile");
+        assert_eq!(again.meta.get("B_KEY").unwrap().cache, "hit");
+        assert_eq!(again.meta.get("B_KEY").unwrap().source, "exec");
+        assert_eq!(again.meta.get("A_KEY").unwrap().source, "env");
+    }
+
+    #[test]
+    fn envfile_escapes_systemd_c_sequences_verbatim_backslashes_included() {
+        let tmp = tempfile::tempdir().unwrap();
+        let refs = BTreeMap::from([(
+            "K".to_string(),
+            SecretSource::Exec {
+                command: vec![script(
+                    tmp.path(),
+                    "nasty-provider",
+                    r#"printf '%s\n' 'back\slash quote" nl
+end'"#,
+                )],
+            },
+        )]);
+        let pod = pod_state_root(tmp.path());
+        let served = serve_pod(
+            &pod,
+            "p",
+            1,
+            &refs,
+            Some(tmp.path().join("cache").as_path()),
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(served.envfile.unwrap()).unwrap();
+        assert_eq!(
+            body, "K=\"back\\\\slash quote\\\" nl\\nend\"\n",
+            "backslash doubled, quote escaped, newline folded to \\n"
+        );
+    }
+
+    #[test]
+    fn serve_pod_with_no_references_needs_no_runtime_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let refs: BTreeMap<String, SecretSource> = BTreeMap::new();
+        let served = serve_pod(Path::new("/nonexistent-pod"), "p", 1, &refs, None).unwrap();
+        if let Some(dir) = saved {
+            std::env::set_var("XDG_RUNTIME_DIR", dir);
+        }
+        assert_eq!(served, ServedSecrets::default());
+    }
+
+    #[test]
+    fn serve_pod_fails_loud_naming_the_var_before_any_envfile_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let pod = pod_state_root(tmp.path());
+        let refs = BTreeMap::from([
+            ("GOOD".to_string(), env_ref("SHUTTLE_SECRETS_TEST_GOOD")),
+            ("BAD".to_string(), env_ref("SHUTTLE_SECRETS_TEST_ABSENT")),
+        ]);
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SHUTTLE_SECRETS_TEST_GOOD", "v");
+        let err = format!(
+            "{}",
+            serve_pod(&pod, "p", 1, &refs, Some(&cache)).unwrap_err()
+        );
+        std::env::remove_var("SHUTTLE_SECRETS_TEST_GOOD");
+        assert!(err.contains("SHUTTLE_SECRETS_TEST_ABSENT"), "{err}");
+        assert!(err.contains("BAD"), "{err}");
+        // D7: an all-or-nothing resolve means NOTHING landed — no cache
+        // entry, no envfile, no partial export set downstream.
+        assert!(read_dir_count(&cache).is_none() || read_dir_count(&cache) == Some(0));
+        assert_eq!(
+            std::fs::read_dir(pod_cache_entry_path(&cache, "p", "x").parent().unwrap())
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0,
+            "no cache dir contents"
+        );
+    }
+
+    fn read_dir_count(path: &Path) -> Option<usize> {
+        std::fs::read_dir(path).ok().map(|d| d.count())
+    }
+
+    #[test]
+    fn warm_cache_render_writes_the_envfile_without_any_provider_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let refs = BTreeMap::from([(
+            "K".to_string(),
+            SecretSource::Exec {
+                command: vec!["/no/such/program-184".to_string()],
+            },
+        )]);
+        // A WARM entry already in the cache (nothing resolves here —
+        // the provider named above does not even exist).
+        let hash = decl_hash(&refs).unwrap();
+        write_cache_entry(
+            &pod_cache_entry_path(&cache, "p", &hash),
+            &CacheEntry {
+                generation: 4,
+                values: BTreeMap::from([("K".to_string(), "cached".to_string())]),
+            },
+        )
+        .unwrap();
+        let rendered = render_pod_envfile_from_warm_cache("p", &refs, Some(&cache));
+        assert_eq!(rendered, 1);
+        let envfile = pod_cache_entry_path(&cache, "p", &hash).with_extension("env");
+        assert_eq!(std::fs::read_to_string(&envfile).unwrap(), "K=\"cached\"\n");
+        assert_eq!(file_mode(&envfile), 0o600);
+        // Idempotent: a second warm sync rewrites the same content.
+        assert_eq!(
+            render_pod_envfile_from_warm_cache("p", &refs, Some(&cache)),
+            1
+        );
+        // A COLD cache writes nothing — the unit's start-time failure
+        // is the designed state (D7).
+        let cold = tmp.path().join("cold");
+        assert_eq!(
+            render_pod_envfile_from_warm_cache("p", &refs, Some(&cold)),
+            0,
+            "cache miss renders nothing"
+        );
+        assert!(!cold.join("p").join(format!("{hash}.env")).exists());
+        // No references → nothing, no runtime dir required.
+        let empty: BTreeMap<String, SecretSource> = BTreeMap::new();
+        assert_eq!(
+            render_pod_envfile_from_warm_cache("p", &empty, Some(&cache)),
+            0
+        );
+    }
+
+    #[test]
+    fn pod_envfile_path_passive_derives_from_the_refs_and_fails_named_without_runtime_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let refs = BTreeMap::from([("K".to_string(), env_ref("ANY"))]);
+        let err = format!(
+            "{}",
+            pod_envfile_path_passive("p", &refs, None).unwrap_err()
+        );
+        let empty: BTreeMap<String, SecretSource> = BTreeMap::new();
+        let none = pod_envfile_path_passive("p", &empty, None).unwrap();
+        if let Some(dir) = saved {
+            std::env::set_var("XDG_RUNTIME_DIR", dir);
+        }
+        assert!(err.contains("XDG_RUNTIME_DIR"), "{err}");
+        assert!(err.contains("p"), "{err}");
+        assert!(none.is_none(), "secret-less pods get no envfile line");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("run/shuttle/secrets");
+        let some = pod_envfile_path_passive("p", &refs, Some(&base))
+            .unwrap()
+            .unwrap();
+        let hash = decl_hash(&refs).unwrap();
+        assert_eq!(some, base.join("p").join(format!("{hash}.env")));
     }
 
     // ── empty reference set + runtime-dir gate ──
