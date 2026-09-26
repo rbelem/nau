@@ -898,6 +898,63 @@ fn read_units_file(store: &RuntimeStore, n: u64) -> miette::Result<Option<UnitsF
         .map_err(|e| miette::miette!("corrupt units file {}: {e}", path.display()))
 }
 
+/// The generation's units whose rendered text references `envfile`
+/// through the mandatory `EnvironmentFile=` line (ADR-0042 D3, issue
+/// #224): the pod's secret-consuming restart set for `pod secrets
+/// refresh`, as full systemd unit names. A generation with no recorded
+/// units file has no consumers.
+pub fn units_referencing_envfile(
+    store: &RuntimeStore,
+    n: u64,
+    pod: &str,
+    envfile: &std::path::Path,
+) -> miette::Result<Vec<String>> {
+    let needle = format!("EnvironmentFile=\"{}\"", envfile.display());
+    Ok(read_units_file(store, n)?
+        .map(|file| {
+            file.units
+                .iter()
+                .filter(|u| u.text.contains(&needle))
+                .map(|u| unit_name(pod, &u.name))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// `systemctl --user restart` the named units (ADR-0042 D3's
+/// rotate-restart contract, issue #224): the refresh-side consumer
+/// restart, with the reconcile tail's skip/fail semantics — a missing
+/// systemctl skips (named), a systemctl that exists and FAILS is a
+/// real error naming the unit (D7). Returns (restarted, skipped).
+pub fn restart_units(
+    units: &[String],
+    tools: &crate::runtime::RuntimeTools,
+) -> miette::Result<(Vec<String>, Vec<String>)> {
+    let mut restarted = Vec::new();
+    let mut skipped = Vec::new();
+    for unit in units {
+        let Some(systemctl) = &tools.systemctl else {
+            skipped.push(unit.clone());
+            continue;
+        };
+        let status = std::process::Command::new(systemctl)
+            .arg("--user")
+            .arg("restart")
+            .arg(unit)
+            .status()
+            .map_err(|e| miette::miette!("restart: spawning {}: {e}", systemctl.display()))?;
+        if !status.success() {
+            miette::bail!(
+                "restart: systemctl --user restart {unit} exited {:?} — \
+                 unit '{unit}' is not running the refreshed environment",
+                status.code()
+            );
+        }
+        restarted.push(unit.clone());
+    }
+    Ok((restarted, skipped))
+}
+
 // ── Reconcile tail (ADR-0032 Decision 8, ticket #107) ──
 //
 // Switch-to-configuration semantics on every generation-changing verb:
