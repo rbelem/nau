@@ -1278,6 +1278,35 @@ pub enum PodCommand {
         #[arg(long)]
         root: Option<String>,
     },
+    /// Inspect and refresh the selected pod's secret references
+    /// (ADR-0042, issue #183). Values never print (D8): references,
+    /// per-source health, and session-cache state only.
+    Secrets {
+        #[command(flatten)]
+        target: PodTarget,
+
+        #[command(subcommand)]
+        command: PodSecretsCommand,
+
+        /// Pod state root (see `pod add --root`).
+        #[arg(long)]
+        root: Option<String>,
+    },
+}
+
+/// Subcommands for `shuttle pod secrets` (ADR-0042 D3/D7/D8).
+#[derive(clap::Subcommand)]
+pub enum PodSecretsCommand {
+    /// List the pod's folded secret references with their session-cache
+    /// state (hit / stale / miss). Values never print (ADR-0042 D8).
+    List,
+    /// Resolve every reference through its provider and report
+    /// per-source health; exits 1 naming failures. Values never print.
+    Check,
+    /// Bust the pod's session-cache entries, re-resolve every reference
+    /// through its provider, and rewrite the active entry (rotation,
+    /// ADR-0042 D3). Prunes stale-generation entries.
+    Refresh,
 }
 
 /// Pod selector shared by every `shuttle pod` verb: the `--name` flag
@@ -1307,7 +1336,8 @@ impl PodCommand {
             | PodCommand::Update { target, .. }
             | PodCommand::Rebuild { target, .. }
             | PodCommand::Rollback { target, .. }
-            | PodCommand::Gc { target, .. } => target.name.as_deref(),
+            | PodCommand::Gc { target, .. }
+            | PodCommand::Secrets { target, .. } => target.name.as_deref(),
         }
     }
 }

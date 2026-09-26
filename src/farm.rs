@@ -209,7 +209,19 @@ pub fn write_generation_env(
     std::fs::write(&path, body).map_err(|e| miette::miette!("writing {}: {e}", path.display()))
 }
 
-/// Record the generation's secret references (ADR-0042 D2) as sorted
+/// The canonical `secrets.json` bytes for a folded reference set: the
+/// ONE serialization path for recorded references.
+/// `write_generation_secrets` writes these bytes and `secrets.rs`
+/// hashes them for the session-cache key (ADR-0042 D3), so the record
+/// and the cache key can never disagree. `BTreeMap` serialization —
+/// keys land sorted, the bytes are byte-deterministic.
+pub fn canonical_secrets_bytes(
+    refs: &BTreeMap<String, crate::pod::SecretSource>,
+) -> miette::Result<Vec<u8>> {
+    serde_json::to_vec(refs).map_err(|e| miette::miette!("serializing generation secrets: {e}"))
+}
+
+/// Record the generation's folded secret references (ADR-0042 D2) as
 /// canonical JSON — key → reference table (`source` + per-source
 /// fields), NEVER resolved values. Written by the reconcile's staging
 /// tail (`present_active`), NOT by [`emit`], for the same reason as
@@ -226,6 +238,10 @@ pub fn write_generation_env(
 /// The lockfile gains nothing (ADR-0042 D2): references come from the
 /// declaration, values are never pinned, rotation never touches
 /// `shuttle.lock`.
+///
+/// The canonical bytes come from [`canonical_secrets_bytes`] — the ONE
+/// serialization path, so `secrets.rs` hashes the very bytes this
+/// records (the session-cache key can never disagree with the record).
 pub fn write_generation_secrets(
     store: &RuntimeStore,
     n: u64,
@@ -235,8 +251,7 @@ pub fn write_generation_secrets(
     use std::os::unix::fs::OpenOptionsExt;
 
     let path = secrets_path(store, n);
-    let body = serde_json::to_vec(refs)
-        .map_err(|e| miette::miette!("serializing generation secrets: {e}"))?;
+    let body = canonical_secrets_bytes(refs)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)

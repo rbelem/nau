@@ -37,6 +37,7 @@ pub mod pod;
 pub mod pull_peer;
 pub mod pull_ref;
 pub mod runtime;
+pub mod secrets;
 pub mod serve;
 pub mod services;
 pub mod sign;

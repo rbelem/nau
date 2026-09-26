@@ -1552,7 +1552,9 @@ pub(crate) fn resolve_pod_env(
 /// warning — env literals are inert, but a losing credential reference
 /// silently changes live credentials under masking. Pure reads — safe
 /// before any mutation.
-pub(crate) fn resolve_pod_secrets(
+/// `pod secrets` reference resolution (ADR-0042, issue #183): the pod's
+/// own folded secret references and its active generation.
+pub fn resolve_pod_secrets(
     root: &Path,
     pod_name: &str,
     decl: &PodDeclaration,
@@ -4090,6 +4092,11 @@ struct ReconcileOpts<'a> {
     /// `pod refresh <member…>` (issue #142): rebuild exactly these
     /// members from their CURRENT recipes, regardless of declared-ness.
     refresh: &'a [String],
+    /// Secrets session-cache base override for the staging-tail prune
+    /// (ADR-0042 D3, issue #183): `None` derives it from
+    /// `$XDG_RUNTIME_DIR` (best-effort — unset means no cache
+    /// interaction). Tests redirect it at a tempdir.
+    secrets_cache_base: Option<&'a Path>,
 }
 
 /// The reconcile proper (see [`sync_pod`]). `opts.only` scopes it to
@@ -4137,24 +4144,31 @@ fn reconcile_pod_scoped(
     )?;
     // Remove store packages the declaration dropped.
     let removed = remove_undeclared(&state.store, &state.tools, &build.declared_names)?;
-    present_and_reconcile(&state, pod_name, &env_vars, &secrets, &svc_overrides, tools).map(
-        |(generation, farm, services)| {
-            (
-                PodSyncReport {
-                    pod: pod_name.to_string(),
-                    noop: installed.is_empty() && removed.is_empty(),
-                    installed,
-                    removed,
-                    held: build.held,
-                    baselined: build.recipe_baselined,
-                    generation,
-                    farm,
-                    services: Some(services),
-                },
-                build.deps_moved,
-            )
-        },
+    present_and_reconcile(
+        &state,
+        pod_name,
+        &env_vars,
+        &secrets,
+        &svc_overrides,
+        tools,
+        opts.secrets_cache_base,
     )
+    .map(|(generation, farm, services)| {
+        (
+            PodSyncReport {
+                pod: pod_name.to_string(),
+                noop: installed.is_empty() && removed.is_empty(),
+                installed,
+                removed,
+                held: build.held,
+                baselined: build.recipe_baselined,
+                generation,
+                farm,
+                services: Some(services),
+            },
+            build.deps_moved,
+        )
+    })
 }
 
 /// Present whatever is now active and run the service reconcile tail
@@ -4169,13 +4183,21 @@ fn present_and_reconcile(
     secrets: &BTreeMap<String, SecretSource>,
     svc_overrides: &PodServiceOverrides,
     tools: &crate::runtime::RuntimeTools,
+    secrets_cache_base: Option<&Path>,
 ) -> miette::Result<(
     Option<u64>,
     Option<PathBuf>,
     crate::services::ServiceReconcileReport,
 )> {
-    let (generation, farm) =
-        present_active(&state.store, &state.dir, env_vars, secrets, svc_overrides)?;
+    let (generation, farm) = present_active(
+        &state.store,
+        &state.dir,
+        pod_name,
+        env_vars,
+        secrets,
+        svc_overrides,
+        secrets_cache_base,
+    )?;
     let services = match generation {
         Some(_) => crate::services::reconcile(&state.store, &state.dir, pod_name, tools)?,
         None => crate::services::reconcile_empty(&state.dir, pod_name, tools)?,
@@ -5013,15 +5035,21 @@ fn remove_undeclared(
 fn present_active(
     store: &crate::runtime::RuntimeStore,
     dir: &Path,
+    pod_name: &str,
     env_vars: &BTreeMap<String, String>,
     secrets: &BTreeMap<String, SecretSource>,
     svc_overrides: &PodServiceOverrides,
+    secrets_cache_base: Option<&Path>,
 ) -> miette::Result<(Option<u64>, Option<PathBuf>)> {
     let active = store.active_generation()?;
     Ok(match &active {
         Some(gen) => {
             crate::farm::write_generation_env(store, gen.n, env_vars)?;
             crate::farm::write_generation_secrets(store, gen.n, secrets)?;
+            // Session-cache lifecycle (ADR-0042 D3): sync NEVER
+            // resolves — it only prunes cache entries whose recorded
+            // generation is no longer active. Best-effort by contract.
+            crate::secrets::reconcile_cache_prune(pod_name, Some(gen.n), secrets_cache_base);
             crate::services::record(store, gen, svc_overrides)?;
             let farm = crate::farm::emit(store, gen)?;
             crate::farm::flip_current(dir, gen.n)?;
@@ -5029,6 +5057,8 @@ fn present_active(
         }
         None => {
             crate::farm::clear_current(dir)?;
+            // Cold pod: nothing can serve values, so the subtree goes.
+            crate::secrets::reconcile_cache_prune(pod_name, None, secrets_cache_base);
             crate::desktop::clear(store)?;
             crate::services::clear(store)?;
             (None, None)
@@ -7913,8 +7943,16 @@ pod {
         let vars: BTreeMap<String, String> = [("EDITOR".to_string(), "vi".to_string())]
             .into_iter()
             .collect();
-        let (generation, _) =
-            present_active(&store, &dir, &vars, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        let (generation, _) = present_active(
+            &store,
+            &dir,
+            "default",
+            &vars,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some(&tmp.path().join("secrets-cache")),
+        )
+        .unwrap();
         assert_eq!(generation, Some(1));
         let recorded: BTreeMap<String, String> =
             serde_json::from_slice(&std::fs::read(crate::farm::env_path(&store, 1)).unwrap())
@@ -7926,9 +7964,11 @@ pod {
         present_active(
             &store,
             &dir,
+            "default",
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            Some(&tmp.path().join("secrets-cache")),
         )
         .unwrap();
         let recorded: BTreeMap<String, String> =
@@ -7971,8 +8011,16 @@ pod {
         ]
         .into_iter()
         .collect();
-        let (generation, _) =
-            present_active(&store, &dir, &BTreeMap::new(), &secrets, &BTreeMap::new()).unwrap();
+        let (generation, _) = present_active(
+            &store,
+            &dir,
+            "default",
+            &BTreeMap::new(),
+            &secrets,
+            &BTreeMap::new(),
+            Some(&tmp.path().join("secrets-cache")),
+        )
+        .unwrap();
         assert_eq!(generation, Some(1));
 
         // Mode 0600 — stricter than env.json (ADR-0042 D2).
@@ -7995,9 +8043,11 @@ pod {
         present_active(
             &store,
             &dir,
+            "default",
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            Some(&tmp.path().join("secrets-cache")),
         )
         .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();

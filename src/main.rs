@@ -3111,6 +3111,64 @@ fn cmd_pod_shellenv(pod_name: &str, json: bool, root: Option<String>) -> miette:
     Ok(())
 }
 
+/// `shuttle pod secrets` (ADR-0042, issue #183): references, health,
+/// and the session-cache lifecycle. Values never reach any output here
+/// (D8) — the reference table, the health report, and refresh counts
+/// are the entire surface.
+fn cmd_pod_secrets(
+    pod_name: &str,
+    command: shuttle::cli::PodSecretsCommand,
+    root: Option<String>,
+) -> miette::Result<()> {
+    let root = shuttle::pod::pod_root(root.as_deref());
+    match command {
+        shuttle::cli::PodSecretsCommand::List => {
+            let rows = shuttle::secrets::list_pod(&root, pod_name, None)?;
+            if rows.is_empty() {
+                shuttle::output::info(format!("pod '{pod_name}' has no secret references"));
+            } else {
+                print!("{}", shuttle::secrets::render_list_rows(pod_name, &rows));
+            }
+            Ok(())
+        }
+        shuttle::cli::PodSecretsCommand::Check => {
+            let rows = shuttle::secrets::check_pod(&root, pod_name)?;
+            print!("{}", shuttle::secrets::render_check_rows(pod_name, &rows));
+            if !shuttle::secrets::check_healthy(&rows) {
+                let bad = rows.iter().filter(|r| r.status != "ok").count();
+                miette::bail!("{bad} secret reference(s) unhealthy for pod '{pod_name}'");
+            }
+            Ok(())
+        }
+        shuttle::cli::PodSecretsCommand::Refresh => {
+            let report = shuttle::secrets::refresh_pod(&root, pod_name, None)?;
+            if report.resolved == 0 {
+                shuttle::output::info(format!("pod '{pod_name}' has no secret references"));
+                return Ok(());
+            }
+            let sources = report
+                .sources
+                .iter()
+                .map(|(k, n)| format!("{k}={n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if report.purged > 0 {
+                let noun = if report.purged == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                };
+                shuttle::output::info(format!("dropped {} cached {noun}", report.purged));
+            }
+            shuttle::output::ok(format!(
+                "resolved {} secret(s) from [{}] — values cached for this session",
+                report.resolved, sources
+            ));
+            Ok(())
+        }
+    }
+}
+
 /// Render `shuttle pod list` output: one spec + resolved version per
 /// line (float-marked per ADR-0017), or an empty-pod notice.
 fn print_pod_packages(pod_name: &str, entries: &[shuttle::pod::PodListEntry]) {
@@ -3329,6 +3387,7 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             generation, root, ..
         } => cmd_pod_rollback(pod_name, generation, root),
         PodCommand::Gc { prune, root, .. } => cmd_pod_gc(pod_name, prune, root),
+        PodCommand::Secrets { command, root, .. } => cmd_pod_secrets(pod_name, command, root),
     }
 }
 
