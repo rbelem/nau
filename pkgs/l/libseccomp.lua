@@ -13,9 +13,12 @@
 -- Runtime consumers resolve libseccomp.so.2 by name through the #10
 -- loader-lib machinery, exactly like zg's libstdcpp/libgcc pair.
 --
--- Fetch tier: pinned upstream release tarball. The release tarball
--- ships pre-generated configure (no autotools/gperf regeneration
--- needed) — build_deps stay at gcc + make.
+-- Fetch tier: pinned upstream release tarball. The tarball even ships
+-- the pre-generated syscalls.perf.c, but that is irrelevant: 2.6.x's
+-- configure runs an unconditional gperf check and hard-errors without
+-- it (as_fn_error "please install gperf"; src/Makefile.am regenerates
+-- syscalls.perf via arch-gperf-generate), so build_deps carry the pool
+-- gperf (pkgs/g/gperf, issue #216) on top of gcc + make.
 --
 -- Checksum cross-verified against the upstream
 -- libseccomp-2.6.1.tar.gz.SHA256SUM asset (exact line match).
@@ -56,7 +59,19 @@ return {
 
         type = "source",
         requires = { "glibc" },
-        build_deps = { "gcc", "make" },
+        build_deps = { "gcc", "make", "gperf" },
+
+        -- The gcc payload's link driver bakes the merged build prefix into
+        -- the RUNPATH of both ELFs (the .so and scmp_sys_resolver; exact
+        -- string, per the cmake/make class), and libseccomp.la embeds the
+        -- bare prefix in dependency_libs (the binutils 44550d7 class: .la
+        -- files matter only at libtool link time, so the bare-prefix entry
+        -- covers it while ELF scanning stays strict).
+        leaks_ok = {
+            "/shuttle-build-prefix/usr/lib64",
+            "/shuttle-build-prefix/usr/lib",
+            "/shuttle-build-prefix",
+        },
 
         apps = {},
     },

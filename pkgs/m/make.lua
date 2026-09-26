@@ -15,11 +15,19 @@ recompile them.]],
         architectures = { "amd64" },
         type = "source",
         requires = { "glibc" },
-        source = { url = "https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz" },
+        source = {
+            url = "https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz",
+            sha256 = "dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3",
+        },
         -- ADR-0018: no implicit host toolchain — the sandbox is env_clear,
         -- and this rebuild (recipe drift swept by `pod refresh automake`,
         -- issue #211) proved configure finds no compiler without the decl.
         build_deps = { "gcc", "make" },
+        -- The gcc payload's link driver bakes the merged build prefix into
+        -- the RUNPATH; make only ever executes inside build sandboxes where
+        -- that prefix is mounted (leaks_ok both-spellings treatment, the
+        -- autoconf/automake/binutils precedent, #180 residual notes).
+        leaks_ok = { "/shuttle-build-prefix/usr/lib64", "/shuttle-build-prefix/usr/lib" },
         build = "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
     },
 }
