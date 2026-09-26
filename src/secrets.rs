@@ -1303,16 +1303,32 @@ pub struct SecretsRefreshReport {
     pub sources: BTreeMap<String, usize>,
     /// Cached entries the purge dropped.
     pub purged: usize,
+    /// Secret-consuming units restarted: their envfile digest moved
+    /// (ADR-0042 D3's rotate-restart contract, issue #224).
+    pub restarted: Vec<String>,
+    /// Secret-consuming units left running: the envfile bytes are
+    /// unchanged, so a restart would be gratuitous.
+    pub unchanged: Vec<String>,
+    /// Consuming units whose restart was skipped — systemctl
+    /// unavailable (the reconcile skip semantics: named, never silent;
+    /// the next refresh with tools converges).
+    pub skipped: Vec<String>,
 }
 
 /// `pod secrets refresh` (ADR-0042 D3's rotation verb): bust the pod's
 /// cache subtree, re-resolve every reference through its provider, and
 /// rewrite the active entry. With no references this touches nothing —
 /// no purge, no tmpfs requirement (the D3 empty rule covers the verb).
+/// After the rewrite, the pod's secret-consuming units whose envfile
+/// digest changed get `systemctl --user restart` (issue #224): the
+/// rotate-restart contract's restart half. The unit hash stays
+/// package-only and sync never sees any of this — refresh is the ONLY
+/// rotation mechanism.
 pub fn refresh_pod(
     root: &Path,
     pod_name: &str,
     cache_base_override: Option<&Path>,
+    tools: &crate::runtime::RuntimeTools,
 ) -> miette::Result<SecretsRefreshReport> {
     let inputs = verb_inputs(root, pod_name)?;
     let mut report = SecretsRefreshReport::default();
@@ -1320,6 +1336,14 @@ pub fn refresh_pod(
         return Ok(report);
     }
     let base = cache_base(cache_base_override)?;
+    let hash = decl_hash(&inputs.refs)?;
+    let envfile = pod_envfile_path(&base, pod_name, &hash);
+    // The digest the consuming units last ran against, captured BEFORE
+    // the purge (which drops the whole subtree, envfile included).
+    // Missing file → no digest: every consumer is stale by
+    // construction (started failed against the gone file — the D3 boot
+    // story), so the rewrite below restarts them.
+    let before = envfile_digest(&envfile);
     report.purged = purge_pod_cache(&base, pod_name)?;
     for source in inputs.refs.values() {
         *report
@@ -1335,12 +1359,53 @@ pub fn refresh_pod(
         Some(&base),
     )?;
     report.resolved = values.len();
-    // Consumer duty (ADR-0042 D3, issue #184): refresh is the rotation
-    // verb, so it re-materializes the 0600 runtime envfile the service
-    // units reference — the rotate-restart contract's write half.
-    let hash = decl_hash(&inputs.refs)?;
-    write_pod_envfile(&pod_envfile_path(&base, pod_name, &hash), &values)?;
+    // Consumer duty (ADR-0042 D3, issues #184 and #224): refresh is the
+    // rotation verb, so it re-materializes the 0600 runtime envfile the
+    // service units reference, then restarts exactly the units whose
+    // digest moved — the rotate-restart contract, both halves.
+    write_pod_envfile(&envfile, &values)?;
+    let after = envfile_digest(&envfile);
+    let consumers = crate::services::units_referencing_envfile(
+        &crate::pod::pod_store(&inputs.pod_dir),
+        inputs.generation,
+        pod_name,
+        &envfile,
+    )?;
+    let restart = restart_on_digest_change(before.as_deref(), after.as_deref(), &consumers);
+    report.unchanged = consumers
+        .iter()
+        .filter(|u| !restart.contains(*u))
+        .cloned()
+        .collect();
+    let (restarted, skipped) = crate::services::restart_units(&restart, tools)?;
+    report.restarted = restarted;
+    report.skipped = skipped;
     Ok(report)
+}
+
+/// SHA-256 hex over a file's bytes; `None` when the file is missing
+/// (the post-reboot tmpfs state — no bytes, no digest).
+fn envfile_digest(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(sha256_hex(&bytes))
+}
+
+/// The digest-diff restart selection (issue #224): a consuming unit
+/// restarts IFF the envfile bytes actually changed. `before` is the
+/// digest the units last ran against (`None` = the file was gone — the
+/// D3 boot story), `after` the digest of the rewritten file. Equal
+/// digests select nothing (no gratuitous restarts); non-consumers
+/// never appear (new units enter only through `consumers`, removed
+/// ones only drop out of it).
+fn restart_on_digest_change(
+    before: Option<&str>,
+    after: Option<&str>,
+    consumers: &[String],
+) -> Vec<String> {
+    match (before, after) {
+        (Some(b), Some(a)) if b == a => Vec::new(),
+        _ => consumers.to_vec(),
+    }
 }
 
 #[cfg(test)]
@@ -1765,7 +1830,13 @@ mod tests {
             ),
         );
         activate(tmp.path(), "work");
-        let first = refresh_pod(tmp.path(), "work", Some(&cache)).unwrap();
+        let first = refresh_pod(
+            tmp.path(),
+            "work",
+            Some(&cache),
+            &crate::runtime::RuntimeTools::default(),
+        )
+        .unwrap();
         assert_eq!(first.resolved, 1);
         assert_eq!(first.sources.get("exec"), Some(&1));
         assert_eq!(calls(&counter), 1);
@@ -1776,7 +1847,13 @@ mod tests {
         resolve_references(&pod_dir, "work", 3, &refs, Some(&cache)).unwrap();
         assert_eq!(calls(&counter), 1);
         // Refresh busts it: the provider runs again.
-        let second = refresh_pod(tmp.path(), "work", Some(&cache)).unwrap();
+        let second = refresh_pod(
+            tmp.path(),
+            "work",
+            Some(&cache),
+            &crate::runtime::RuntimeTools::default(),
+        )
+        .unwrap();
         assert_eq!(second.purged, 1);
         assert_eq!(calls(&counter), 2);
         // The rewritten entry serves the ACTIVE generation.
@@ -1830,6 +1907,268 @@ mod tests {
         // Best-effort by construction: unknown pods and missing bases
         // are silent no-ops.
         reconcile_cache_prune("ghost", Some(1), Some(&cache));
+    }
+
+    // ── rotate-restart (ADR-0042 D3, issue #224) ──
+
+    /// A fake systemctl: appends its argv (one arg per line) to `log`,
+    /// then exits `code` — the runtime.rs fake-tool pattern, extended
+    /// to record WHAT it was asked to run.
+    fn fake_systemctl(dir: &Path, log: &Path, code: i32) -> crate::runtime::RuntimeTools {
+        let path = dir.join("fake-systemctl");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexit {code}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::runtime::RuntimeTools {
+            systemctl: Some(path),
+            ..Default::default()
+        }
+    }
+
+    /// An exec provider whose value rotates: it prints the current
+    /// contents of `valuefile` (trimmed by the resolve).
+    fn valuefile_provider(dir: &Path, valuefile: &Path) -> String {
+        script(
+            dir,
+            "valuefile-provider",
+            &format!("cat {}", valuefile.display()),
+        )
+    }
+
+    /// Record generation `gen`'s units.json with (service name, rendered
+    /// text) pairs — the fixture shape `units_referencing_envfile` reads.
+    fn seed_units(pod_dir: &Path, gen: u64, units: &[(&str, String)]) {
+        let dir = pod_dir
+            .join("generations")
+            .join(gen.to_string())
+            .join(crate::services::SERVICES_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let units: Vec<serde_json::Value> = units
+            .iter()
+            .map(|(name, text)| {
+                serde_json::json!({
+                    "name": name, "pkg": "pkg", "layer": "own",
+                    "daemon": "simple", "enabled": true, "exec": "/exec",
+                    "args": [], "environment": {}, "after": [],
+                    "text": text, "hash": "h",
+                })
+            })
+            .collect();
+        std::fs::write(
+            dir.join("units.json"),
+            serde_json::to_vec(&serde_json::json!({ "units": units })).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn digest_diff_selection_restarts_only_changed_consumers() {
+        let web = "shuttle-pod-work-web.service".to_string();
+        let side = "shuttle-pod-work-side.service".to_string();
+        let both = vec![web.clone(), side.clone()];
+        // Changed digest: every current consumer restarts…
+        assert_eq!(
+            restart_on_digest_change(Some("old"), Some("new"), &both),
+            both
+        );
+        // …including a NEWLY-added consumer, and NOT a removed one.
+        assert_eq!(
+            restart_on_digest_change(Some("old"), Some("new"), &[web.clone()]),
+            vec![web.clone()]
+        );
+        // Unchanged digest: nothing restarts, whatever the set.
+        assert!(restart_on_digest_change(Some("same"), Some("same"), &both).is_empty());
+        assert!(restart_on_digest_change(Some("same"), Some("same"), &[web.clone()]).is_empty());
+        // Missing before (the envfile was gone — the D3 boot story):
+        // every consumer is stale by construction.
+        assert_eq!(restart_on_digest_change(None, Some("new"), &both), both);
+    }
+
+    #[test]
+    fn envfile_digest_tracks_bytes_and_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f.env");
+        assert_eq!(envfile_digest(&file), None, "missing file, no digest");
+        std::fs::write(&file, b"K=\"v1\"\n").unwrap();
+        let first = envfile_digest(&file).unwrap();
+        std::fs::write(&file, b"K=\"v1\"\n").unwrap();
+        assert_eq!(envfile_digest(&file).unwrap(), first, "same bytes");
+        std::fs::write(&file, b"K=\"v2\"\n").unwrap();
+        assert_ne!(envfile_digest(&file).unwrap(), first, "moved bytes");
+    }
+
+    #[test]
+    fn refresh_restarts_exactly_the_changed_digest_consumers() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let valuefile = tmp.path().join("value.txt");
+        std::fs::write(&valuefile, "v1\n").unwrap();
+        let provider = valuefile_provider(tmp.path(), &valuefile);
+        seed_pod(
+            tmp.path(),
+            "work",
+            &format!(
+                r#"pod {{
+    secrets = {{ K = {{ source = "exec", command = {{ "{provider}" }} }} }},
+}}
+"#
+            ),
+        );
+        activate(tmp.path(), "work");
+        let decl = crate::pod::load_declaration(tmp.path(), "work").unwrap();
+        let refs = crate::pod::resolve_pod_secrets(tmp.path(), "work", &decl).unwrap();
+        let hash = decl_hash(&refs).unwrap();
+        let envfile = pod_envfile_path(&cache, "work", &hash);
+        // One consumer ("web") and one non-consumer ("side").
+        seed_units(
+            &tmp.path().join("work"),
+            3,
+            &[
+                (
+                    "web",
+                    format!(
+                        "ExecStart=/bin/true\nEnvironmentFile=\"{}\"\n",
+                        envfile.display()
+                    ),
+                ),
+                ("side", "ExecStart=/bin/true\n".to_string()),
+            ],
+        );
+        let log = tmp.path().join("systemctl.log");
+        let tools = fake_systemctl(tmp.path(), &log, 0);
+
+        // First refresh: no envfile existed, so the consumer is stale by
+        // construction (the D3 boot story) — exactly "web" restarts.
+        let first = refresh_pod(tmp.path(), "work", Some(&cache), &tools).unwrap();
+        assert_eq!(
+            first.restarted,
+            vec!["shuttle-pod-work-web.service".to_string()]
+        );
+        assert!(first.unchanged.is_empty());
+
+        // Second refresh, same value: the bytes are identical, so
+        // nothing restarts — the consumer is reported unchanged.
+        let second = refresh_pod(tmp.path(), "work", Some(&cache), &tools).unwrap();
+        assert!(second.restarted.is_empty());
+        assert_eq!(
+            second.unchanged,
+            vec!["shuttle-pod-work-web.service".to_string()]
+        );
+
+        // Rotate the value: the digest moves and "web" restarts again.
+        std::fs::write(&valuefile, "v2\n").unwrap();
+        let third = refresh_pod(tmp.path(), "work", Some(&cache), &tools).unwrap();
+        assert_eq!(
+            third.restarted,
+            vec!["shuttle-pod-work-web.service".to_string()]
+        );
+
+        // The fake ran `--user restart <consumer>` exactly twice and
+        // NEVER touched the non-consumer.
+        let ran = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(ran.matches("shuttle-pod-work-web.service").count(), 2);
+        assert!(!ran.contains("shuttle-pod-work-side.service"));
+        assert!(ran.contains("--user"));
+        assert!(ran.contains("restart"));
+    }
+
+    #[test]
+    fn refresh_without_systemctl_skips_the_restart_named() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let provider = valuefile_provider(tmp.path(), &tmp.path().join("value.txt"));
+        std::fs::write(tmp.path().join("value.txt"), "v1\n").unwrap();
+        seed_pod(
+            tmp.path(),
+            "work",
+            &format!(
+                r#"pod {{
+    secrets = {{ K = {{ source = "exec", command = {{ "{provider}" }} }} }},
+}}
+"#
+            ),
+        );
+        activate(tmp.path(), "work");
+        let decl = crate::pod::load_declaration(tmp.path(), "work").unwrap();
+        let refs = crate::pod::resolve_pod_secrets(tmp.path(), "work", &decl).unwrap();
+        let envfile = pod_envfile_path(&cache, "work", &decl_hash(&refs).unwrap());
+        seed_units(
+            &tmp.path().join("work"),
+            3,
+            &[(
+                "web",
+                format!("EnvironmentFile=\"{}\"\n", envfile.display()),
+            )],
+        );
+        // Tools absent (RuntimeTools::default()): the restart is a named
+        // skip — never a silent no-op, never a failure.
+        let report = refresh_pod(
+            tmp.path(),
+            "work",
+            Some(&cache),
+            &crate::runtime::RuntimeTools::default(),
+        )
+        .unwrap();
+        assert!(report.restarted.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec!["shuttle-pod-work-web.service".to_string()]
+        );
+    }
+
+    #[test]
+    fn refresh_fails_loud_naming_a_unit_the_restart_cannot_move() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let valuefile = tmp.path().join("value.txt");
+        std::fs::write(&valuefile, "v1\n").unwrap();
+        let provider = valuefile_provider(tmp.path(), &valuefile);
+        seed_pod(
+            tmp.path(),
+            "work",
+            &format!(
+                r#"pod {{
+    secrets = {{ K = {{ source = "exec", command = {{ "{provider}" }} }} }},
+}}
+"#
+            ),
+        );
+        activate(tmp.path(), "work");
+        let decl = crate::pod::load_declaration(tmp.path(), "work").unwrap();
+        let refs = crate::pod::resolve_pod_secrets(tmp.path(), "work", &decl).unwrap();
+        let envfile = pod_envfile_path(&cache, "work", &decl_hash(&refs).unwrap());
+        seed_units(
+            &tmp.path().join("work"),
+            3,
+            &[(
+                "web",
+                format!("EnvironmentFile=\"{}\"\n", envfile.display()),
+            )],
+        );
+        // The fake exists but FAILS: refresh exits naming the unit (D7),
+        // after the envfile write landed (the write half is done).
+        let log = tmp.path().join("systemctl.log");
+        let tools = fake_systemctl(tmp.path(), &log, 7);
+        let err = refresh_pod(tmp.path(), "work", Some(&cache), &tools).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("shuttle-pod-work-web.service"),
+            "the error must name the unit: {err}"
+        );
+        assert!(
+            envfile.is_file(),
+            "the envfile write half completed before the failed restart"
+        );
     }
 
     // ── serve step + envfile (issue #184) ──
@@ -2739,7 +3078,12 @@ end'"#
         let tmp = tempfile::tempdir().unwrap();
         seed_pod(tmp.path(), "cold", "pod {}");
         activate(tmp.path(), "cold");
-        let report = refresh_pod(tmp.path(), "cold", None);
+        let report = refresh_pod(
+            tmp.path(),
+            "cold",
+            None,
+            &crate::runtime::RuntimeTools::default(),
+        );
         if let Some(dir) = saved {
             std::env::set_var("XDG_RUNTIME_DIR", dir);
         }
