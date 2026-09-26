@@ -98,10 +98,13 @@ _Avoid_: strict, classic, full, sandboxed
 **Grants**: Declared resource access a `confined` app requests (filesystem paths, network, sockets, devices) — the shared vocabulary any confinement backend honors. A package may add a non-portable `backend_options` sub-table for backend-specific raw flags beyond the shared vocabulary.
 _Avoid_: interfaces, permissions, capabilities
 
+**Pod isolation**: The execution boundary every process of a pod runs inside — `run` forms, services, shells, and unconfined apps alike. Three levels: `host` (processes run directly on the host; the default), `sandbox` (one bubblewrap boundary around the whole pod, fail-closed, with pod-scoped grants), and `machine` (a microVM boundary with its own guest kernel, driven through smolvm, fail-closed without KVM). Distinct from per-app confinement and from the build sandbox. (ADR-0038)
+_Avoid_: pod sandbox, full sandbox, VM pod, sandboxed environment
+
 ## Flagged ambiguities
 
 - **"Build"** can mean: (a) the `shuttle build` CLI command, (b) a source package's compile step (`snap { build = "..." }`), or (c) the build sandbox environment. Use "build command", "build script", and "build sandbox" respectively.
-- **"Sandbox"** can mean: (a) the build-time *build sandbox* (bubblewrap, ADR-0004), or (b) runtime *confinement* (level applied to the installed app). They are different axes; use "build sandbox" and "confinement" to disambiguate.
+- **"Sandbox"** can mean: (a) the build-time *build sandbox* (bubblewrap, ADR-0004), or (b) runtime *confinement* (level applied to the installed app). They are different axes; use "build sandbox" and "confinement" to disambiguate. The pod-level boundary is named *pod isolation*; prefer naming the level (`host`/`sandbox`/`machine`) over the bare word "sandboxed".
 - **"Package"** can refer to a Lua declaration in `pkgs/` or to the Snap Store concept of a snap. Use "package index entry" or "store snap" to disambiguate.
 
 ## Example dialogue

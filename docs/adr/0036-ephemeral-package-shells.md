@@ -3,7 +3,8 @@
 Status: Draft (design doc; the implementation is not scheduled in this
 document). Council-reviewed 2026-09-21 (two-seat consensus; both seats
 picked Option A, both rejected Option B, both kept nix as the documented
-bridge for the cases A serves worst).
+bridge for the cases A serves worst). §5 amended 2026-09-22 by
+ADR-0038 contract 7.
 
 ## Context
 
@@ -67,7 +68,10 @@ no generation, no `shuttle.lock` record.
    precedes the pod farm on PATH for the invocation — that is the
    feature (`shuttle shell jq -- bash` gets the ephemeral jq). The
    declared-app confinement rule of `run` does not apply: `shell` never
-   sandboxes (fail-open, same as the #102 command half).
+   sandboxes (fail-open, same as the #102 command half). (Amended by
+   ADR-0038 contract 7: in a pod whose isolation level is not `host`,
+   `shell` inherits the pod boundary; the fail-open rule names `host`
+   pods only.)
 6. **The bare form is reserved**: `shuttle shell <pkg>…` without `--`
    will exec an interactive shell with the overlay once implemented;
    tonight's contract only fixes the name, not the semantics.
