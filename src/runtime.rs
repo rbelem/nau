@@ -3263,6 +3263,9 @@ plugs:
 
     #[test]
     fn install_creates_generation_blobs_and_extension_tree() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let work = match tempfile::tempdir() {
             Ok(d) => d,
             Err(_) => return,
@@ -3393,6 +3396,9 @@ plugs:
 
     #[test]
     fn install_same_revision_is_a_noop_without_new_generation() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let work = match tempfile::tempdir() {
             Ok(d) => d,
             Err(_) => return,
@@ -3429,6 +3435,9 @@ plugs:
 
     #[test]
     fn reinstall_changed_payload_replaces_tree_without_collision() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // A changed revision must REPLACE the carried tree, not
         // hardlink over it: carry-forward of the old tree onto the
         // freshly staged new one used to fail with "File exists"
@@ -3494,6 +3503,9 @@ plugs:
 
     #[test]
     fn install_infrastructure_payload_is_refused() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let work = match tempfile::tempdir() {
             Ok(d) => d,
             Err(_) => return,
@@ -3544,6 +3556,9 @@ plugs:
 
     #[test]
     fn install_remove_rollback_relinks_and_reconciles_units() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let work = match tempfile::tempdir() {
             Ok(d) => d,
             Err(_) => return,

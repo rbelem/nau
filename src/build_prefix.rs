@@ -853,6 +853,9 @@ mod tests {
 
     #[test]
     fn merge_disjoint_payloads_and_dedupes_identical() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -909,6 +912,9 @@ mod tests {
 
     #[test]
     fn merge_conflicting_content_is_a_hard_error_naming_both() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -938,6 +944,9 @@ mod tests {
 
     #[test]
     fn meta_packaging_subtree_is_excluded_from_the_merge() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -983,6 +992,9 @@ mod tests {
 
     #[test]
     fn info_dir_index_is_excluded_from_the_merge() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -1047,6 +1059,9 @@ mod tests {
     /// layer below the payload root.
     #[test]
     fn payload_files_lists_recursive_basenames() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -1090,6 +1105,9 @@ mod tests {
 
     #[test]
     fn elf_tree_wrapper_usr_usr_doubling_is_repointed_at_the_prefix() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -1129,6 +1147,9 @@ mod tests {
     /// assignment must collapse to the prefix root as well.
     #[test]
     fn script_tree_wrapper_pkgroot_pythonpath_block_is_repointed() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -1195,6 +1216,9 @@ mod tests {
     /// through `PYTHONPATH`, the wrapper dropped it, `-m` import failed).
     #[test]
     fn python_tree_wrapper_pythonpath_scrub_preserves_the_caller_value() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -1232,6 +1256,9 @@ mod tests {
     /// own directory; the LD_LIBRARY_PATH entries re-point at the prefix.
     #[test]
     fn elf_lib_wrapper_store_blob_exec_rewrites_to_the_real_sibling() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -1276,6 +1303,9 @@ mod tests {
     /// re-point the whole sweep at the prefix root.
     #[test]
     fn perl_module_tree_wrapper_sweep_is_repointed_at_the_prefix() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -1336,6 +1366,9 @@ mod tests {
     /// requires provides it), the blob path becomes the `.real` sibling.
     #[test]
     fn flat_script_wrapper_rewrites_and_resolves_the_interpreter() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -1372,6 +1405,9 @@ mod tests {
     /// neither the payload set nor a declared requires is a hard error.
     #[test]
     fn flat_wrapper_with_unresolvable_interpreter_fails_closed() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -1401,6 +1437,9 @@ mod tests {
     /// counterpart in the merged prefix (the `.real` never staged).
     #[test]
     fn tree_wrapper_with_missing_exec_target_fails_closed() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;
@@ -1431,6 +1470,9 @@ mod tests {
     /// byte-identical.
     #[test]
     fn upstream_scripts_stage_byte_identical() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !squashfs_tools_available() {
             eprintln!("skipping: mksquashfs/unsquashfs unavailable");
             return;

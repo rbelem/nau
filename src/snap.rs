@@ -8155,6 +8155,9 @@ mod tests {
 
     #[test]
     fn test_build_snap_creates_snap_file() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let env = LuaEnv::new();
         let table = env
             .eval(
@@ -8221,6 +8224,9 @@ mod tests {
 
     #[test]
     fn test_build_multi_arch() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let env = LuaEnv::new();
         let table = env
             .eval(
@@ -9725,6 +9731,9 @@ mod tests {
 
     #[test]
     fn test_phase15_build_copies_hooks_icon_and_compression() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Real files for hook scripts and the icon (absolute paths).
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join("scripts")).unwrap();
@@ -10405,6 +10414,9 @@ mod tests {
     /// the devbox gate where the bug was found.)
     #[test]
     fn test_run_build_extracts_toolchain_profile_xz() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let server = tempfile::tempdir().unwrap();
         let bytes = high_dict_xz_tarball();
         std::fs::write(server.path().join("toolchain.tar.xz"), &bytes).unwrap();
@@ -11237,8 +11249,13 @@ mod tests {
     /// (even if `f` panics). Serialized: PATH is process-global, so parallel
     /// E2E tests must not interleave set/restore.
     fn with_path_prepend<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-        static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The ONE crate-global test-env lock (src/test_env.rs): PATH is
+        // process-global, so parallel E2E tests must not interleave
+        // set/restore — a per-module static would exclude nothing across
+        // modules.
+        let guard = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let old = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{old}", dir.display()));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
@@ -13366,6 +13383,9 @@ mod wrapper_tests {
     /// on the farm even with a resolvable perl.
     #[test]
     fn shebang_perl_with_module_tree_gets_the_perl5lib_tree_wrapper() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stage = tempfile::tempdir().unwrap();
         let store = store_fixture(&stage.path().join("store"));
         let script = stage_file(
@@ -13514,6 +13534,9 @@ mod wrapper_tests {
 
     #[test]
     fn native_elf_with_bundled_lib_gets_wrapper() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stage = tempfile::tempdir().unwrap();
         let store = store_fixture(&stage.path().join("store"));
         let Some(app) = build_c_fixture(stage.path(), "jtool") else {
@@ -13549,6 +13572,9 @@ mod wrapper_tests {
 
     #[test]
     fn native_elf_without_bundled_lib_gets_no_wrapper() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stage = tempfile::tempdir().unwrap();
         let store = store_fixture(&stage.path().join("store"));
         let Some(app) = build_c_fixture(stage.path(), "ktool") else {

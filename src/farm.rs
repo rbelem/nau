@@ -1493,6 +1493,9 @@ mod tests {
 
     #[test]
     fn multifile_binary_executed_from_the_farm_reads_its_sibling() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let store = store_fixture(tmp.path());
         // The synthetic payload: a "binary" that reads the data file

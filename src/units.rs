@@ -1066,6 +1066,9 @@ plugs:
 
     #[test]
     fn emit_app_runtime_stages_binary_and_daemon_unit() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let work = match tempfile::tempdir() {
             Ok(d) => d,
             Err(_) => return,
@@ -1134,6 +1137,9 @@ plugs:
 
     #[test]
     fn emit_app_runtime_skips_store_payloads_with_note() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let work = match tempfile::tempdir() {
             Ok(d) => d,
             Err(_) => return,

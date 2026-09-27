@@ -3001,6 +3001,9 @@ CONFIG_EXT4_FS=y
 
     #[test]
     fn pod_scope_passes_with_pod_tools_present_and_image_tools_absent() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // On a host provisioned with the pod surface (the container-distro
         // evidence case), every pod-tool check must pass — image tools are
         // structurally absent from the scope (the surface test above), so

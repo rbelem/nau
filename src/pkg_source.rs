@@ -1641,6 +1641,9 @@ mod tests {
 
     #[test]
     fn test_update_input_pins_reports_old_to_new() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(
@@ -1752,6 +1755,9 @@ mod tests {
 
     #[test]
     fn test_submodule_fetch_pins_parent_and_submodule_revs() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         let (input, parent_rev, sub_rev) =
             seed_submodule_input(root.path(), SubmoduleSpec::All(true));
@@ -1784,6 +1790,9 @@ mod tests {
 
     #[test]
     fn test_submodule_rebuild_from_lock_offline() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         let (input, parent_rev, _) = seed_submodule_input(root.path(), SubmoduleSpec::All(true));
 
@@ -1804,6 +1813,9 @@ mod tests {
 
     #[test]
     fn test_submodule_named_declaration_fetches_only_named() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         let (input, _parent_rev, _) =
             seed_submodule_input(root.path(), SubmoduleSpec::Named(vec!["mylib".into()]));
@@ -1816,6 +1828,9 @@ mod tests {
 
     #[test]
     fn test_submodule_declaration_matches_by_path_too() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         let (input, _, sub_rev) = seed_submodule_input(
             root.path(),
@@ -1836,6 +1851,9 @@ mod tests {
 
     #[test]
     fn test_submodule_missing_from_gitmodules_fails_named() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         let (input, _, _) =
             seed_submodule_input(root.path(), SubmoduleSpec::Named(vec!["ghost".into()]));
@@ -1855,6 +1873,9 @@ mod tests {
 
     #[test]
     fn test_submodules_true_without_gitmodules_fails_named() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         // A plain parent repo: no .gitmodules at the pinned rev.
         let repos = root.path().join("__repos__/shuttle-test-fixture");
@@ -1876,6 +1897,9 @@ mod tests {
 
     #[test]
     fn test_submodule_tamper_fails_named() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         let (input, parent_rev, _) = seed_submodule_input(root.path(), SubmoduleSpec::All(true));
         let entry = lock_input_entry_in(root.path(), &input).unwrap();
@@ -1895,6 +1919,9 @@ mod tests {
 
     #[test]
     fn test_submodule_declaration_without_pin_fails_named() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         let (input, parent_rev, _) = seed_submodule_input(root.path(), SubmoduleSpec::All(true));
         lock_input_entry_in(root.path(), &input).unwrap();
@@ -1922,6 +1949,9 @@ mod tests {
 
     #[test]
     fn test_submodule_tampered_parent_tree_still_caught() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         let (input, parent_rev, _) = seed_submodule_input(root.path(), SubmoduleSpec::All(true));
         let entry = lock_input_entry_in(root.path(), &input).unwrap();
@@ -1941,6 +1971,9 @@ mod tests {
 
     #[test]
     fn test_path_input_with_submodules_fails_named() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let input = PackageInput {
             url: format!("path:{}", dir.path().display()),
@@ -1990,6 +2023,9 @@ mod tests {
 
     #[test]
     fn test_refresh_input_updates_stale_cache() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // The core #122 contract: a slot already holding a VALID tree of
         // the same input must be replaced by the refreshed clone, never
         // silently reused (the old remove-then-fetch could return Ok with

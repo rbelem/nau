@@ -6855,8 +6855,8 @@ RequiredBy=boot-complete.target
 
         /// Serialize PATH mutation across parallel tests (PATH is
         /// process-global) and restore it afterwards, even on panic.
-        static STUB_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+        /// The lock is the ONE crate-global test-env lock (src/test_env.rs);
+        /// a per-module static here would exclude nothing across modules.
         struct PathGuard {
             old: String,
             _lock: std::sync::MutexGuard<'static, ()>,
@@ -6875,7 +6875,9 @@ RequiredBy=boot-complete.target
         /// guard that restores PATH on drop.
         fn stub_disk_tool_path(stub_dir: &Path) -> PathGuard {
             use std::os::unix::fs::PermissionsExt;
-            let lock = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_env::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for tool in ["sfdisk", "mmd", "mcopy", "mkfs.ext4", "mkfs.vfat"] {
                 let path = stub_dir.join(tool);
                 std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();

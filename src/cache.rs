@@ -648,6 +648,9 @@ mod tests {
 
     #[test]
     fn test_cache_default_dir() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // One observation: read HOME first, construct from it immediately.
         // The image command-seam test mutates HOME in this same process —
         // reading it on both sides of `PackageCache::new` (which resolves
