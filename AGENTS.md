@@ -15,7 +15,7 @@ into pod store blobs (libbfd load deaths), so strip all three and pin CC/CXX:
 ```bash
 nix shell nixpkgs#gcc -c env -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH CC=gcc CXX=g++ devbox run -- build
 nix shell nixpkgs#gcc -c env -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH CC=gcc CXX=g++ devbox run -- test
-nix shell nixpkgs#gcc -c env -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH CC=gcc CXX=g++ devbox run -- check  # full gate
+bash scripts/gate.sh   # full gate (test + clippy -D + fmt-check, gcc14 pinned)
 shuttle run --pod gate -- cargo clippy -- -D warnings   # lint axis, pod gate
 shuttle run --pod gate -- cargo fmt --check             # fmt axis, pod gate
 ```
