@@ -47,18 +47,24 @@ hooks), and refuses to run if either does not name gcc-wrapper-14.
 
 Two Luau facts make the pin load-bearing rather than cosmetic:
 
-1. The Luau sources vendored by `luau0-src` 0.12.3 (`Compiler.cpp`) are
-   missing `#include <limits>`; whether that compiles depends on which
-   libstdc++ headers happen to be in the include path.
-2. The pod shellenv's `CPATH` leak (pod include dirs, libstdc++ among
-   them) is load-bearing for the Luau build and is re-injected by devbox
-   hooks regardless of the caller's `-u CPATH`; the script leaves it
-   alone.
+1. The Luau sources vendored by `luau0-src` — 0.12.3 before the #236
+   bump, and **still** 0.21.0+luau736 after it (the premise that 736
+   fixed `Compiler.cpp` proved wrong) — are missing
+   `#include <limits>`. `.cargo/config.toml` force-includes it via
+   `LUAU_CXXFLAGS`, so the build no longer depends on include-graph
+   luck.
+2. The pod shellenv's `CPATH` leak flipped from crutch to hazard with
+   the #236 bump: the pod's gcc-14.2-era libstdc++ headers shadow the
+   pinned compiler's own and break the vendored Luau build (isolated
+   repro during the #154 gate: gcc14 with `CPATH` → 9 errors; gcc14
+   without → green). `gate.sh` therefore strips `CPATH` alongside the
+   other pod leaks. (Before #236 the same leak was load-bearing —
+   luau663 needed it transitively — and devbox re-injected it no
+   matter what the caller stripped.)
 
-The durable fix is the dependency bump (mlua 0.12 / mlua-sys 0.12 /
-luau0-src 0.21, which vendors a Luau with the include fixed) — tracked
-on the luau/mlua bump issue; until it lands, treat `scripts/gate.sh` as
-the only green definition.
+The #236 bump landed; `scripts/gate.sh` remains the only green
+definition (the pin guards the compiler identity, the pod shim, and
+the Luau include sensitivity).
 
 ### Devbox-free endgame (target state)
 
