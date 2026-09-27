@@ -473,7 +473,9 @@ fn confined_app_fails_closed_when_backend_unavailable() {
         "confined app must not have written its marker when the backend was unavailable"
     );
     assert!(
-        rerr.contains("refusing to run unconfined") || rerr.contains("bwrap"),
+        // "refusing to run unconfined" straddles the 80-col miette wrap
+        // (line 2 ends exactly at "to"); single-word fragments survive.
+        rerr.contains("refusing") || rerr.contains("bwrap"),
         "fail-closed error must name the backend: {rerr}"
     );
 }
