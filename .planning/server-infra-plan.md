@@ -1,200 +1,246 @@
 # Server infra plan: worker spin-up + S3 cache storage
 
-Date: 2026-09-27. Researched against the zet cluster repo
-(`~/Workspace/github.com/rbelem/zet`, private) and
-`.planning/remote-cache-plan.md` v3. Oracle review folded same day
-(anonymous-read gate promoted to step 0, retention measurement, sweep
-hardening, omissions recorded). This plan moves no ADR clauses; it
-provisions the infrastructure the cache lane (ADR-0043, #253) publishes to
-and the workers lane (ADR-0045 gate, #194) will rent. The cache is untrusted
-storage under ADR-0033 D10: every artifact carries its signature and digest;
-the S3 layer can neither authenticate nor poison an entry that consumers
-accept.
+Date: 2026-09-27. v2 — four-seat council review folded (premise
+corrections: local-path has no quota, no publisher exists yet, age-prune
+kills hot blobs, the TTL sweep inverted the leak case, worker account
+isolation was missing). Oracle round-1 corrections retained. This plan
+moves no ADR clauses; it provisions the infrastructure the cache lane
+(ADR-0043, #253) publishes to and the workers lane (ADR-0045 gate, #194)
+will rent. The cache is untrusted storage under ADR-0033 D10: every
+artifact carries its signature and digest; the S3 layer can neither
+authenticate nor poison an entry that consumers accept.
 
 ## Current state
 
 | Concern | zet cluster today | Shuttle need |
 |---|---|---|
-| Compute | One Hetzner CX33 VPS `zet` (hel1, Ubuntu 24.04, k3s v1.36.3+k3s1, ~4Gi headroom) | Coordinator = the operator's build machine (ADR-0040 posture; no coordinator server). Workers = ephemeral Hetzner VMs, post-#262 |
-| S3 | rustfs 1.0.0-rc.1 in ns `cache`, 20Gi local-path PVC, NodePort 30081, public vhost `cache.zet.rclb.dev` (Caddy TLS, wildcard via Cloudflare DNS-01) | A place to hold + serve the cache export tree (`cache/<key>.json`, `blobs/<sha256>`) over HTTPS |
-| S3 consumer precedent | Attic binary cache reads/writes bucket `attic-cache`; bucket-scoped user via `scripts/rustfs-provision-attic.sh` (`mc`, creds written back to SM). All existing policies attach to authenticated users — nothing anonymous exists yet | Same shape: bucket + scoped user + public-read GETs |
+| Compute | One Hetzner CX33 VPS `zet` (hel1, Ubuntu 24.04, k3s v1.36.3+k3s1, ~4Gi headroom, one shared disk) | Coordinator = the operator's build machine (ADR-0040 posture; no coordinator server). Workers = ephemeral Hetzner VMs, post-#262 |
+| S3 | rustfs 1.0.0-rc.1 in ns `cache`, 20Gi local-path PVC (no quota enforced — local-path is a hostPath dir), NodePort 30081, public vhost `cache.zet.rclb.dev` (Caddy TLS, wildcard via Cloudflare DNS-01) | A place to hold + serve the cache export tree (`cache/<key>.json`, `blobs/<sha256>`) over HTTPS |
+| S3 consumer precedent | Attic binary cache reads/writes bucket `attic-cache` (authenticated, bucket-scoped user via `scripts/rustfs-provision-attic.sh`). Anonymous reads on this same rustfs+Caddy path have a recorded precedent: the legacy `devbox-nix-cache` bucket answered anonymous 200s before it was object-lock-frozen (`scripts/kuma/monitors.json:63-74`) | Same shape: bucket + scoped user + public-read GETs |
+| Monitoring | uptime-kuma in ns `monitoring`, provisioned from `scripts/kuma/monitors.json` — zero push-type monitors, no notification channels configured; kuma runs on zet itself | Prune heartbeat + disk-guard alert need a provisioned push monitor and channel |
 | Secrets | Bitwarden SM; rendered on the workstation, applied to the VPS; no SM token on the VPS (`secrets-render`/`secrets-apply`) | New SM keys for the cache push user; nothing enters `shuttle.lua` |
-| IaC | tofu: `hcloud_server.zet` + Cloudflare DNS (`tofu/dns.tf`); `hcloud_token` inside SM `TOFU_INPUTS` | Worker provisioning reuses the same token, via operator env only |
-| Timers | Workstation systemd user timer (`update-timer.yml`, 05:30 daily); VPS timer (`attic-backup.yml`) | Cache prune timer on the VPS; worker TTL sweep timer on the workstation |
+| IaC | tofu: `hcloud_server.zet` + Cloudflare DNS; `hcloud_token` in SM `TOFU_INPUTS` is the full-account token (owns zet, can touch DNS) | Worker provisioning must NOT reuse the full-account token — see decision 5 and #271 |
+| Timers | Workstation systemd user timer (`update-timer.yml`); VPS timer (`attic-backup.yml`, `Persistent=true`) | Cache prune timer on the VPS; worker TTL sweep timer on the workstation |
 | Backups | rustfs data: none (only Attic SQLite) | Cache needs none — content-addressed, deterministic, rebuildable; loss is time, not data |
 
 ## Decisions
 
-1. **Cache storage backend: rustfs on zet.** Over (a) Hetzner Object Storage
-   and (b) plain disk behind Caddy. It reuses the canonical service pattern,
-   the secrets flow, and a TLS front that already terminates in front of
-   rustfs; attic proves the bucket-user-script shape. The cache is
-   rebuildable, so the single-disk single-replica posture is acceptable in a
-   way it would not be for primary data. Migration trigger: at ~60% bucket
-   fill (measured, see decision 4) or repeated ENOSPC pressure on the shared
-   disk, evaluate Hetzner Object Storage — the mc-based publish/serve flow is
-   backend-agnostic and moves intact; the evaluation includes its monthly
-   cost against the CX33's included traffic.
+1. **Cache storage backend: rustfs on zet.** Over (a) Hetzner Object
+   Storage and (b) plain disk behind Caddy. It reuses the canonical service
+   pattern, the secrets flow, and a TLS front that already terminates in
+   front of rustfs; attic proves the bucket-user-script shape; the recorded
+   anonymous precedent de-risks the serving path. The cache is rebuildable,
+   so single-disk rc software is an acceptable tenant. **The migration
+   trigger measures the disk, not the bucket**: local-path enforces no PVC
+   quota, so the only real signal is `df` on the data path — below 10Gi
+   free, publishing stops and the guard alert fires. `mc du` on the bucket
+   is trend telemetry, not a trigger. The evacuation runbook
+   (`scripts/cache-evacuate.sh`, mc mirror to Hetzner Object Storage) is
+   written and tested while the bucket is empty, so the trigger is
+   mechanical when it fires; its cost line is part of the runbook.
 2. **Serving: the existing S3 path-style vhost, anonymous reads — gated on
-   step 0.** The `cache.zet.rclb.dev` vhost already reverse-proxies rustfs,
-   and path-style authenticated access is proven (attic). What is NOT proven
-   is anonymous access: rustfs rc.1's support for MinIO-style anonymous
-   bucket policy is the plan's load-bearing assumption. **Checklist step 0
-   verifies it empirically** (curl an anonymous GET and ListObjects against a
-   throwaway bucket) before the provision script is written. The policy must
-   allow `GetObject` and **deny `ListBucket`** — MinIO's anonymous-download
-   preset permits listing, which would re-open the inventory exposure
-   decision 3 rejects; verify the policy shape, do not assume it. Pull-side
-   semantics to record with it: a 403 on a missing key must be treated as
-   not-found by consumers. **Fallback if anonymous policy is unsupported:**
-   `mc mirror` the bucket to a directory and add a Caddy `file_server` block
-   on the same vhost — still zero new DNS/TLS, same lane URL shape.
-   The lane root for `shuttle.lua` is
-   `https://cache.zet.rclb.dev/shuttle-cache/` (bucket prefix absorbed by
-   the configurable base URL).
-3. **Inventory exposure: no index for the cache bucket.** The cache plan's
-   delta 4 offers "accepted exposure or omit the index". Decision: omit —
-   `index.json` never publishes to `shuttle-cache`, and the bucket policy
-   denies listing (decision 2). Keys are opaque closure hashes;
-   CacheManifest contents (recipe summaries) are fetchable only by someone
-   who already knows a key. Recorded as the accepted exposure. The
-   credential shape has exactly two rungs: anonymous (GetObject on
-   `shuttle-cache` only) and the push user (read/write/list/delete scoped to
-   `shuttle-cache` only — delete and list are required by the manifest-first
-   prune; no bucket-create, no admin, no other bucket). Nothing between
-   them, no shared admin credential.
-4. **Retention: weekly age-based prune on the VPS, with the trigger
-   measured.** systemd timer + `mc`-driven sweep of `shuttle-cache`: objects
-   older than 30 days are removed, manifest-first (`cache/<key>.json` deleted
-   before its blobs) per the cache plan's open call 3 sweep order; never
-   touches `attic-cache`. Age-only pruning on immutable blobs is
-   landfill-safe: an orphaned blob after manifest deletion ages out within
-   30 days, and concurrent publishes are never prune-eligible (Last-Modified
-   is upload time). Two recorded consequences: re-publishing refreshes an
-   entry's age, so an actively used entry whose publisher stops refreshing
-   dies at 30 days — that is the intended policy, not an accident; and exact
-   GC semantics (reference counting, LRU) stay an ADR-0043 call — the timer
-   is the floor. The same timer logs `mc du` on the bucket and `df` on the
-   data path every run: the 60% migration trigger in decision 1 is measured
-   by this, or it is dead text.
-5. **Workers: no new server.** The coordinator is the build machine; workers
-   are ephemeral Hetzner VMs created by the #194 provisioner once ADR-0045 is
-   ratified (#262). `hcloud_token` reaches the provisioner through the
-   operator's environment (SM `TOFU_INPUTS`), never `shuttle.lua` — same
-   rule as every other secret. Default burst shape cx22 (2 vCPU/4GB), x86_64,
-   Ubuntu 24.04, TTL marker, host key minted and injected per ADR-0045; the
-   cloud-init template spec belongs to #194. Worker TTLs must exceed the
-   maximum job wall clock (or workers must heartbeat-refresh their TTL), so
-   the sweep in decision 6 never kills a machine mid-job.
-   **Standing worker on the zet VPS: rejected.** ~4Gi headroom shared with
-   rustfs, attic, postgres, n8n, auth — farm builds would thrash the same
-   disk the cache sits on. Revisit on a node upgrade or a second VPS.
-6. **Worker safety net: TTL sweep timer on the workstation.** Daily systemd
-   user timer: list Hetzner servers labeled `shuttle-worker`, destroy only on
-   a three-condition match — the label AND a parseable TTL marker AND the
-   TTL past due. Alert on any hcloud API failure: a silently skipped sweep
-   is the exact failure this net exists to catch. Dry-run is the default
-   mode for the first two weeks (log what it would destroy), then flips to
-   enforce. Catches a crashed `workers destroy` or a lost SSH path before it
-   becomes a bill.
-
-## Recorded assumptions and positions
-
-- **Consistency**: single-node rustfs is effectively strongly consistent;
-  cache objects are immutable and the only overwrite is a re-publish of the
-  same closure key. Read-after-write mirroring is therefore safe. Written
-  down so a future clustered rustfs re-opens it deliberately.
-- **rustfs upgrade path**: rc.1 digest-pinned now (checklist item 2); bumps
-  follow the repo's dated-comment convention, and 1.0 final gets its own
-  dated bump with a bucket-listing sanity check against both caches.
-- **Abuse/rate limiting**: the cache bucket is public-read on a public vhost
-  with no rate limiter. Accepted for now (blobs are large, keys unguessable,
-  CX33 traffic is included); the explicit alternative is a Caddy
-  `rate_limit` block on the vhost if traffic logs show draining. Revisit
-  with the migration trigger.
-- **Licensing**: blobs are GPL-3.0-built binaries served anonymously.
-  Position recorded: the cache is a build-acceleration cache for the
-  operator's own machines and their direct correspondents. shuttle is
-  GPL-3.0-only with source in-repo, and the corresponding source for every
-  blob is obtainable from the public repo by commit pin. If Nau images ever
-  ship from this lane, re-run this analysis as part of the ADR-0044
-  publication decision.
+   step 0.** Anonymous is the only model that adds no client code, no
+   signing service (ADR-0011 D5 bars new daemons), and no secret in
+   `shuttle.lua`; credentials would protect nothing confidential
+   (signature+digest fail-closed verification is the security). Recorded
+   precedent says anonymous GET already worked on this stack; the true
+   step-0 unknowns are the policy dialect and persistence. Step 0 verifies,
+   through the Caddy vhost (not the NodePort): anonymous GET 200; anonymous
+   ListObjectsV2 denied; the MinIO preset trap (`download` = GetObject
+   only; it is `public` that adds ListBucket — round 1's wording
+   corrected); HEAD and Range; 403-vs-404 on a missing key; `attic-cache`
+   still 403s anonymously (policy scoping); policy survives a rustfs pod
+   restart; a large blob streamed to concurrent anonymous clients while
+   watching rustfs RSS against the 2Gi limit; the console on 30082 still
+   requires auth; and finally an end-to-end `shuttle pull` against a
+   hand-published manifest+blob. **Fallback if anonymous is unsupported:**
+   `mc mirror` to a directory + Caddy `file_server` on a new `handle`
+   block of the same vhost. The fallback is correctness-equivalent
+   (digest+sig make partial data a miss) but operationally worse: it
+   doubles cache bytes on the scarce disk, adds a mirror-interval
+   staleness window (a miss, never a wrong answer — cadence pinned at 5
+   minutes if invoked), and re-tools the prune (`find -mtime`,
+   `--remove`). The lane root for `shuttle.lua` is
+   `https://cache.zet.rclb.dev/shuttle-cache/`.
+3. **Inventory exposure: no index, two-rung credentials.** No `index.json`
+   publishes to `shuttle-cache`; the bucket policy denies listing. Keys are
+   opaque closure hashes. Exactly two rungs: anonymous (GetObject on
+   `shuttle-cache` only) and the push user (read/write/list/delete on
+   `shuttle-cache` only — delete and list exist for the prune; no
+   bucket-create, no admin, no other bucket). Consumers treat 403 and 404
+   identically as miss, and warn on consecutive 403s (a broken policy must
+   not silently degrade every build to cold — consumer semantics belong to
+   #253). If an inventory is ever wanted, it is a signed file the push user
+   writes, never an S3 listing surface. **Workers need no cache
+   credentials at all** (ADR-0040 D6: sources travel from the coordinator;
+   workers never fetch upstream) — written down so nobody wires
+   `SHUTTLE_CACHE_S3_*` onto a worker.
+4. **Retention: a publisher, then two-tier age pruning, measured and
+   heartbeated.** The plan v1 error: it provisioned a bucket nothing writes
+   to. **The publish transport is its own ticket (#270)** — workstation-side
+   uploader: blobs-then-manifest per entry, skip-if-exists blobs
+   (content-addressed), unconditional manifest re-PUT with a bytes-compare
+   before overwrite. Skipping existing blobs means re-publishing does NOT
+   refresh blob age, so v1's "re-publishing refreshes an entry's age" was
+   false for blobs. Prune is therefore two-tier and two-pass: manifests
+   pruned at 30d, blobs at 90d, both prefix-scoped invocations
+   (`cache/` then `blobs/` — a single bucket-wide `mc rm --older-than` is
+   not manifest-first), under `flock` against concurrent publishes, with
+   the run failing loudly before any heartbeat. Reference-scanned deletion
+   (delete blobs no live manifest references) stays the ADR-0043 upgrade;
+   two-tier age is the floor that keeps hot entries alive. The same timer
+   logs `mc du` + `df` every run and **pushes a kuma heartbeat only on
+   verified completion** — provisioned properly: a push monitor and a
+   notification channel added to `scripts/kuma/monitors.json` (today:
+   none exist), plus a workstation-side stale-heartbeat check, because
+   kuma runs on zet and a node-level death kills the pruner and its
+   witness together. The timer is `Persistent=true` (post-downtime
+   catch-up). An object-lock/versioning guard is asserted before every
+   prune (this rustfs already hosts one object-locked bucket; prune lives
+   on DeleteObject).
+5. **Workers: no new server, isolated account, colocated.** The coordinator
+   is the build machine; workers are ephemeral Hetzner VMs created by the
+   #194 provisioner once ADR-0045 is ratified (#262). **Workers get their
+   own Hetzner project and a project-scoped API token in SM (#271)** —
+   reusing `TOFU_INPUTS`' full-account token couples a worker-lane leak to
+   the cluster itself; structural isolation beats procedural care. An
+   hcloud firewall (ssh ingress from the operator's addresses only) is
+   attached at create time. Location hel1 (same region as the cache vhost);
+   IPv4 by default (included on cx servers), IPv6-only recorded as a
+   possible later cost cut. TTL expiry is stamped as an **hcloud label at
+   create time** (survives a cloud-init failure — the in-guest marker file
+   is a copy, not the source of truth); the label contract pins key names
+   AND value format — epoch seconds, because Hetzner label values reject
+   `:` and ISO-8601 will not fit — shared between #194 (writer) and #269
+   (reader). Golden image vs
+   per-boot cloud-init is decided in #194 — the trade is the 4-minute
+   token-to-cap budget against toolchain determinism (the v5 key's
+   premise); snapshot ownership and refresh cadence are infra-side and
+   land in #271's project setup. Workers hold no cache credentials
+   (decision 3). `shuttle.lua` registration is its own contract: a
+   machine-managed `workers` block that the provisioner/destroy verbs
+   append and evict (address + host_key pin per ADR-0045 D4) —
+   ephemeral IPs mean hand-editing Lua per burst is a non-starter
+   (**#272**). Placement groups: out of scope, recorded so nobody adds
+   them for ephemeral singletons.
+6. **Worker safety net: TTL sweep timer on the workstation (#269).** Daily
+   systemd user timer. Match rules, in order: labeled `shuttle-worker` AND
+   (parseable TTL label past due OR — missing/unparseable marker — server
+   age past a floor: alert at 48h, destroy at 72h). The v1 three-condition
+   match inverted the risk: the forgotten VM is precisely the one whose
+   marker never got written. Every destroy run also asserts
+   `hcloud volume list --server X` is empty (a detached volume outlives
+   its server and bills silently). Alerts go to the kuma push monitor +
+   notification channel provisioned in decision 4's checklist item.
+   Dry-run from landing until two weeks after the first real provision,
+   then enforce (there is nothing to sweep before the first provision, so
+   a calendar-based flip is untestable).
 
 ## zet-side execution checklist
 
 No GitHub tracker for zet (private repo); this checklist is the ticket
-queue. Order matters: step 0 gates the script's policy shape; the PVC bump
-precedes the bucket filling.
+queue. Step 0 gates the script; the guard alert precedes first publish;
+the PVC "bump" is documentation, not a control (local-path has no quota)
+and lands last.
 
-0. **Anonymous-read gate.** Throwaway bucket + `mc anonymous set` (or raw
-   policy JSON): curl an unauthenticated GET (expect 200) and an
-   unauthenticated LIST (expect 403). Records the rustfs policy dialect and
-   the 403-vs-404 behavior. If it fails, switch decision 2 to the documented
-   fallback and re-point the lane root.
+0. **Anonymous-read gate.** Throwaway bucket; run the full step-0 matrix
+   from decision 2 (GET, ListObjectsV2, HEAD, Range, 403-vs-404,
+   cross-bucket scoping on `attic-cache`, preset-vs-raw-policy shape,
+   persistence across pod restart, concurrent large-blob GET vs RSS,
+   console auth, end-to-end `shuttle pull`). Records the rustfs policy
+   dialect. If anonymous fails, switch decision 2 to the fallback and
+   re-point the lane root.
 1. **Provision script** `scripts/rustfs-provision-shuttle-cache.sh` —
-   model `rustfs-provision-attic.sh`: idempotent `mc` run against
-   `https://cache.zet.rclb.dev` — a re-run converges from any partial state
-   (bucket exists, user exists, policy half-applied are all sensed and
-   completed, and the script fails loudly before the SM writeback if any
-   step failed); bucket `shuttle-cache`; bucket-scoped user
-   `shuttle-cache` with read/write/list/delete on that bucket only (the
-   decision 3 credential shape; no bucket-create, no admin); anonymous
-   policy per step 0 (GetObject yes, ListBucket no); creds written back to
-   SM as `SHUTTLE_CACHE_S3_ACCESS_KEY` / `SHUTTLE_CACHE_S3_SECRET_KEY`.
-2. **Digest-pin the rustfs image.** `rustfs/rustfs:1.0.0-rc.1` is the only
-   non-digest-pinned image in the repo (repo convention). Pin to the rc.1
-   digest with a dated comment.
-3. **PVC headroom.** Bump `rustfs-data` 20Gi → 40Gi before the bucket starts
-   filling, if the cx33 disk allows (verify `df` first — local-path on the
-   single disk); record the measured 60% trigger in the PVC comment.
-4. **Prune + measurement timer** `ansible/playbooks/cache-prune.yml` + timer
-   — VPS-side, `attic-backup.yml` shape: weekly `mc rm --older-than 30d`
-   manifest-first against `shuttle-cache`, plus `mc du` + `df` logged every
-   run (the decision 1 trigger's data source), creds from the rendered
-   Secret via `mc alias`, log to journal. Outcome signal: the timer pushes a
-   heartbeat to the existing uptime-kuma on success, so a dead prune shows
-   up as a missing heartbeat instead of a journal line nobody reads; the
-   same run flags the log line when bucket fill crosses the 60% trigger.
-5. **Deploy** via `scripts/deploy.sh` phases (secrets-render → secrets-apply
-   → deploy); the checklist touches none of the tofu/DNS layers.
+   model `rustfs-provision-attic.sh` including its object-lock guard:
+   idempotent (a re-run converges from any partial state and fails loudly
+   before the SM writeback if any step failed); bucket `shuttle-cache`;
+   bucket-scoped push user per decision 3; anonymous policy per step 0;
+   creds written back to SM as `SHUTTLE_CACHE_S3_ACCESS_KEY` /
+   `SHUTTLE_CACHE_S3_SECRET_KEY`.
+2. **Digest-pin the rustfs image** (`rustfs/rustfs:1.0.0-rc.1` — the only
+   non-digest-pinned image in the repo) with a dated comment; 1.0 final
+   gets a dated bump plus a bucket sanity check on both caches.
+3. **Disk-guard alerting** — uptime-kuma push monitor on `df` of the data
+   path (below 10Gi free = alert + stop-publish signal), provisioned in
+   `scripts/kuma/monitors.json` with a real notification channel. This is
+   the control; the PVC size line below is not.
+4. **Prune + measurement timer** `ansible/playbooks/cache-prune.yml` +
+   timer — VPS-side, `attic-backup.yml` shape, `Persistent=true`: install
+   `mc` on the VPS (it exists on the workstation only today); creds via a
+   root-only rendered host file (not a k8s Secret read); two-pass
+   two-tier prune per decision 4 under `flock`; `mc du` + `df` logged;
+   object-lock guard asserted; kuma heartbeat pushed only on verified
+   completion.
+5. **Kuma provisioning** — add the push monitors (prune heartbeat,
+   disk-guard, later the #269 sweep alert) and a notification channel to
+   `scripts/kuma/monitors.json`; re-run `kuma-provision.sh`.
+6. **Evacuation runbook** `scripts/cache-evacuate.sh` — mc mirror
+   `shuttle-cache` to Hetzner Object Storage, written and tested empty
+   (decision 1's trigger must be mechanical); includes its cost line.
+7. **PVC comment, then deploy.** Record on `rustfs-data` that local-path
+   enforces no quota and `df` is the boundary (no size bump pretense);
+   deploy via `scripts/deploy.sh` phases.
 
 ## shuttle-side tickets
 
-- **New: worker TTL sweep timer (#269)** — workstation systemd user timer +
-  `hcloud` sweep script (decision 6; three-condition match, alert on API
-  failure, dry-run first). Money-bounded, shuttle-independent.
-- Existing lanes this infra serves: #253 (ADR-0043 cache lane), build-perf
-  item 1a (v5 key — the lane carries nothing real until it lands), #194
-  (Provisioner + Hetzner, post-#262), #192 (carries the host_key pin
-  mechanics).
+- **#270 (new): cache publish transport** — workstation uploader:
+  blobs-then-manifest, skip-existing blobs, unconditional manifest re-PUT
+  with bytes-compare. The real blocker: retention is meaningless without a
+  writer, and build-perf 1a's output has nowhere to land until this
+  exists.
+- **#271 (new): worker account isolation** — dedicated Hetzner project +
+  project-scoped token in SM + hcloud firewall + hel1/IPv4 placement +
+  snapshot ownership decision. Blocks #194's first real provision.
+- **#272 (new): worker registration into `shuttle.lua`** — machine-managed
+  `workers` block (append on provision, evict on destroy) carrying address
+  + host_key pin per ADR-0045 D4. #194 contract.
+- **#269** — amended: TTL expiry as an hcloud label at create time, the
+  age-floor rule for missing/unparseable markers, volume assertion, kuma
+  alert channel, enforce-flip keyed to first real provision.
+- **#253 (ADR-0043)** — amended: consumer miss semantics (403/404 identical,
+  consecutive-403 warning, HEAD/Range expectations) and the publish side
+  (or its explicit handoff to #270) must land in the ADR.
+- **#194** — amended: TTL label contract with #269, `shuttle.lua` write via
+  #272, firewall attach at create, ssh user pinning, known_hosts append
+  locking, teardown-on-failure, golden-image decision, toolchain
+  determinism, an explicit per-job RAM budget (cx22 is 2 vCPU/4GB
+  shared-vCPU), no cache credentials on workers.
+- **hcloud CLI pre-check** (rides #269): confirm `hcloud server create
+  --label` support and volume-delete defaults on the installed CLI before
+  the sweep script is written.
+- Existing: #262 (ratification gate), #192 (host_key pin mechanics),
+  build-perf 1a (v5 key — depends on #270 existing).
 
 ## Sequencing
 
-Step 0 and items 1-4 are content-agnostic — they serve a static tree
-regardless of what fills it — so they land before the v5 key and ADR-0043;
-step 0 gates item 1. The lane becomes useful when build-perf 1a + #253 land.
-The PVC bump (item 3) precedes first publish. Worker provisioning waits for
-#262 (your ratification), then #194; the TTL sweep timer should exist before
-the first real provision, not after the first forgotten VM.
+zet checklist: 0 → 1 → 2 → 3 → 5 → 4 → 6 → 7. Steps 0-6 are
+content-agnostic and land before the v5 key and ADR-0043; the guard alert
+(step 3) precedes first publish; the prune timer (4) is the retention
+floor the cache plan requires before publishing. Shuttle side: #270 gates
+any real publish; #271 gates #194's first provision; #272 rides #194;
+#269 lands before that first provision. #262 remains the operator gate on
+the whole worker lane.
 
 ## Risks
 
-- **Shared disk, single replica.** rustfs, attic, postgres, and the OS share
-  one cx33 disk. A runaway cache competes with the Attic SQLite and the k3s
-  PVCs. Mitigations: the prune + measurement timer, the PVC bump before
-  filling, the 60% trigger, and the rebuildable-by-design posture. Measured:
-  rustfs OOM-crashlooped at a 1Gi limit; the 2Gi limit and ~4Gi node
-  headroom are real constraints, and a growing object count (many small
-  manifests) is the thing to watch against that limit.
+- **Shared disk, single replica, no quota.** rustfs, attic, postgres, and
+  the OS share one cx33 disk. The df guard (step 3) is the boundary; the
+  PVC size is decoration. Measured: rustfs OOM-crashlooped at a 1Gi limit;
+  a growing object count is the thing to watch against the 2Gi limit.
+- **kuma watches from inside the burning house.** kuma runs on zet; a
+  node-level death silences prune heartbeat and disk guard together. The
+  workstation-side stale-heartbeat check (decision 4) is the outside
+  witness.
 - **NodePort exposure** binds 0.0.0.0; ufw is the only gate (existing
-  posture, unchanged here). The anonymous-read policy is scoped to
-  `shuttle-cache` only — `attic-cache` stays credential-gated.
-- **rustfs is an rc release** holding both caches. Acceptable while the
-  cache is rebuildable; the Hetzner Object Storage migration path is the
-  escape hatch and is preserved by the mc-based flow, with cost now part of
-  its trigger evaluation.
-- **TTL sweep deletes by three-condition match.** Label + parseable TTL
-  marker + past due, grace rule from decision 5, dry-run default — the
-  residual risk is a server that matches all three but is still wanted,
-  which means the TTL was set wrong at provision time; that is a #194
-  template bug, not a sweep bug.
+  posture). The anonymous policy is scoped to `shuttle-cache`;
+  `attic-cache` stays credential-gated, and step 0 tests it stays that
+  way.
+- **rustfs is an rc release** holding both caches; the evacuate runbook
+  (step 6) is the escape hatch, written before it is needed.
+- **TTL sweep deletes by rule.** The rules are label-at-create + age floor
+  + volume assertion, with dry-run until there is something real to
+  sweep. Residual: a server that matches every rule but is still wanted
+  means the TTL was set wrong at provision time — a #194 template bug,
+  not a sweep bug.
+- **Traffic**: CX33 included traffic is not unmetered; the rate-limit
+  revisit (recorded position) keys off the traffic logs and the df guard.
