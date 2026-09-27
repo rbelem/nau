@@ -13,21 +13,22 @@
 -- self-contained).
 --
 -- Versioning: passt does not tag every build, so the version field
--- is the upstream build stamp g21550f5 (the binary itself reports
--- "pasta 2026_07_28.f8df3f1-16-g21550f5"). URL note: the spec'd
--- https://passt.top/builds/g21550f5/x86_64/pasta 404s — builds/ has
+-- is the upstream build stamp gdf90211 (the binary itself reports
+-- "pasta 2026_07_28.f8df3f1-18-gdf90211"). URL note: the spec'd
+-- https://passt.top/builds/gdf90211/x86_64/pasta 404s — builds/ has
 -- no per-stamp directory for this stamp — so the pin targets
 -- https://passt.top/builds/latest/x86_64/pasta, which currently
--- serves exactly that g21550f5 build. latest/ is a moving symlink,
+-- serves exactly that gdf90211 build. latest/ is a moving symlink,
 -- so this pin is a point-in-time snapshot; a future upstream build
 -- WILL break the checksum and force a re-pin (re-verify the
--- --version stamp when that happens).
+-- --version stamp when that happened once already: g21550f5 ->
+-- gdf90211, 2026-09-27).
 --
 -- Checksum: download-verified only (sha256 of a fresh fetch of the
 -- exact URL, re-verified at authoring time; passt.top publishes no
 -- checksum asset — bsk.lua carries the same download-only
 -- precedent):
---   8b4a289328e2d37aa21a0dfb860197b5993724c6bb2595c3ab6977b2fc20e25c
+--   73320bcc96eaad082660d57d25228e1230f252d9d1fcc7a55c52bedbd0c64385
 -- License note: passt/pasta sources carry
 -- SPDX-License-Identifier: GPL-2.0-or-later (pasta.c, tcp.c, util.c
 -- spot-checked); a historical dual GPL-2.0-or-later AND BSD-2-Clause
@@ -38,7 +39,7 @@
 return {
     default = snap {
         name = "passt",
-        version = "g21550f5",
+        version = "gdf90211",
         summary = "User-mode networking for namespaces (passt/pasta)",
         description = [[
             passt provides network connectivity to virtual machines and
@@ -53,10 +54,13 @@ return {
         grade = "stable",
         confinement = "strict",
         architectures = { "amd64" },
+        -- podman's requires names this payload "pasta" (the name it
+        -- execs); without the alias the closure cannot resolve.
+        aliases = { "pasta" },
 
         source = {
             url = "https://passt.top/builds/latest/x86_64/pasta",
-            sha256 = "8b4a289328e2d37aa21a0dfb860197b5993724c6bb2595c3ab6977b2fc20e25c",
+            sha256 = "73320bcc96eaad082660d57d25228e1230f252d9d1fcc7a55c52bedbd0c64385",
         },
 
         -- Bare binary (no tarball): lands in $SRC as "pasta". One

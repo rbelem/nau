@@ -150,7 +150,12 @@ return {
             "mkdir -p $STAGE/usr/bin $STAGE/usr/share/containers",
             "export HOME=/tmp GOCACHE=/tmp/shuttle-go-gocache GOPATH=/tmp/shuttle-go-gopath",
             'export GOFLAGS="-trimpath -mod=vendor" GOPROXY=off GOWORK=off GOTOOLCHAIN=local',
-            'cd $SRC && CGO_ENABLED=1 go build -ldflags "-X go.podman.io/podman/v6/libpod/config._installPrefix=/usr -X go.podman.io/podman/v6/libpod/config._etcDir=/etc -X go.podman.io/podman/v6/pkg/systemd/quadlet._binDir=/usr/bin" -tags "grpcnotrace exclude_graphdriver_btrfs seccomp" -o $STAGE/usr/bin/podman ./cmd/podman',
+            -- containers_image_openpgp: WITHOUT it the signature
+            -- mechanism is the cgo gpgme wrapper (proglottis/gpgme),
+            -- which needs libgpgme.pc — no pool port carries gpgme.
+            -- The tag switches signatures to the pure-Go mechanism
+            -- (mechanism_gpgme.go is gated !containers_image_openpgp).
+            'cd $SRC && CGO_ENABLED=1 go build -ldflags "-X go.podman.io/podman/v6/libpod/config._installPrefix=/usr -X go.podman.io/podman/v6/libpod/config._etcDir=/etc -X go.podman.io/podman/v6/pkg/systemd/quadlet._binDir=/usr/bin" -tags "grpcnotrace exclude_graphdriver_btrfs seccomp containers_image_openpgp" -o $STAGE/usr/bin/podman ./cmd/podman',
             -- The upstream minimal default signature policy (the
             -- common distro default): image pulls are
             -- ErrorIfNotFound in containers/image, and the pod shell's

@@ -76,7 +76,15 @@ return {
                 .. "-DBENCHMARK_ENABLE_TESTING=OFF "
                 .. "-DBENCHMARK_ENABLE_GTEST_TESTS=OFF "
                 .. "-DBENCHMARK_DOWNLOAD_DEPENDENCIES=OFF "
-                .. "-DBENCHMARK_ENABLE_LIBPFM=OFF",
+                .. "-DBENCHMARK_ENABLE_LIBPFM=OFF "
+                -- benchmark hardcodes -pedantic -pedantic-errors in
+                -- its own flags; under a GCC 15 host compiler those
+                -- fire as ERRORS inside the linux UAPI headers
+                -- (zero-size arrays, __int128 typedefs) before any
+                -- benchmark source is reached. Release flags append
+                -- AFTER the project flags, so -Wno-pedantic here wins
+                -- the last-flag-wins ordering.
+                .. "-DCMAKE_CXX_FLAGS_RELEASE=\"-O3 -DNDEBUG -Wno-pedantic\"",
             "cmake --build $SRC/build -j$(nproc)",
             "DESTDIR=$STAGE cmake --install $SRC/build",
         }, " && "),

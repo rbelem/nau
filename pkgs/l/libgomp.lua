@@ -74,12 +74,21 @@ return {
             -- pthreads only (see header). CPPFLAGS unset guard: the
             -- sandbox exports the merged-prefix -I; harmless here,
             -- but the gcc-family convention is to keep recorded
-            -- flags clean of it.
-            "mkdir -p build && cd build && ../libgomp/configure --prefix=/usr --disable-multilib CPPFLAGS= && make -j$(nproc) CPPFLAGS= && make CPPFLAGS= install DESTDIR=$STAGE",
+            -- flags clean of it. -Wno-error=discarded-qualifiers:
+            -- libgomp's Makefile.am hardcodes -Wall -Werror, and
+            -- glibc 2.43's cdefs.h surfaces a benign const-discard
+            -- through macro expansion into this tree (gcc 14.2.0
+            -- predates that header) — the narrow -Wno-error keeps
+            -- every other warning fatal.
+            "mkdir -p build && cd build && ../libgomp/configure --prefix=/usr --disable-multilib CPPFLAGS= CFLAGS=\"-g -O2 -Wno-error=discarded-qualifiers\" && make -j$(nproc) CPPFLAGS= CFLAGS=\"-g -O2 -Wno-error=discarded-qualifiers\" && make CPPFLAGS= install DESTDIR=$STAGE",
             -- libtool's .la metadata records the build-prefix paths
             -- (leak-scan text class) and no consumer on any chain
             -- resolves libraries through libtool archives — drop it.
+            -- The linked .so carries the same class of record: libtool
+            -- embeds the build prefix as DT_RUNPATH during relink, and
+            -- nothing at runtime resolves through it — strip it.
             "find $STAGE -name '*.la' -delete",
+            "find $STAGE -type f -name '*.so*' -exec patchelf --remove-rpath {} \\;",
         }, " && "),
     },
 }

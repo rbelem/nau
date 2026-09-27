@@ -92,7 +92,13 @@ return {
             "toolchain",
         },
         requires = {
-            "binutils",
+            -- binutils is deliberately ABSENT: gcc's payload vendors the
+            -- Debian binutils tool binaries and shells the plain names
+            -- (ar, as, ld, ...) through LD-fixing shims (gcc.lua, #171).
+            -- The pool binutils payload's own usr/bin/ar is a different
+            -- binary, and ADR-0018 merge semantics make gcc + binutils
+            -- in one build prefix a hard conflict — podman's toolchain
+            -- build_dep could never materialize (#171 follow-up).
             "gcc",
             "glibc",
             "linux-headers",
@@ -137,14 +143,16 @@ return {
             -- launchers below can exec usr/bin/gcc. Standard distro
             -- layout (Ubuntu: gcc -> x86_64-linux-gnu-gcc-N).
             'for t in gcc g++ cpp c++ gcov ar as ld nm ranlib strip readelf objcopy objdump; do ln -sf "x86_64-linux-gnu-$t" "$STAGE/toolchain/usr/bin/$t"; done',
-            -- Root-level usr/bin names for the merged build prefix: a
-            -- build_deps consumer's prefix merges this payload's tree
-            -- UNDER ITS OWN ROOTS (toolchain/** stays toolchain/**), so
-            -- the bare-name contract for `shuttle`-sandbox PATHS needs
-            -- the names at the payload's usr/bin, reaching into the
-            -- staged subtree relatively.
-            "mkdir -p $STAGE/usr/bin",
-            'for t in gcc g++ cpp c++ gcov ar as ld nm ranlib strip readelf objcopy objdump; do ln -sf "../../toolchain/usr/bin/x86_64-linux-gnu-$t" "$STAGE/usr/bin/$t"; done',
+            -- NO root-level usr/bin names here: the gcc payload already
+            -- stages the plain compiler names (Debian gcc -> triplet
+            -- symlinks) and the binutils-tool bare names via its
+            -- LD-fixing shims (#171). Authoring ANY bare name at this
+            -- payload's usr/bin collides with those under ADR-0018
+            -- merge semantics (same path, different content or link
+            -- target) — the podman toolchain build_dep could never
+            -- materialize. The bare-name contract is satisfied by the
+            -- gcc payload itself; consumers reach the drivers through
+            -- their own prefix's usr/bin and the subtree via toolchain/*.
             "find $STAGE -type f -exec patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 {} \\; 2>/dev/null || true",
             "find $STAGE -type f -exec patchelf --remove-rpath {} \\; 2>/dev/null || true",
             "find $STAGE -type f -exec strip --strip-unneeded {} \\; 2>/dev/null || true",
