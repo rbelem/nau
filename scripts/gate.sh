@@ -11,8 +11,14 @@
 # 2. The pod puts a gcc shim on PATH, and `devbox run` re-resolves CC/CXX
 #    through its own env AFTER a parent-env pin is applied — so the pin
 #    must be exported inside the devbox shell, not before it.
-# 3. CPATH (the pod's include leak) is load-bearing for the Luau build
-#    and devbox re-injects it anyway; it is deliberately left alone.
+# 3. CPATH: BEFORE the mlua 0.12 bump (PR #241), the pod shellenv's
+#    CPATH leak was load-bearing — luau663's Compiler.cpp missed
+#    `#include <limits>` and the pod's libstdc++ headers papered over
+#    it. AFTER the bump, LUAU_CXXFLAGS=-include limits (.cargo/config.toml)
+#    handles that explicitly, and the pod CPATH actively BREAKS the
+#    vendored Luau under gcc14 (pod gcc-14.2-era headers shadow the
+#    compiler's own; isolated repro: gcc14+CPATH 9 errors, gcc14 alone
+#    green). So CPATH is stripped, same as the other pod leaks.
 #
 # Re-exec: the outer invocation enters `nix shell nixpkgs#gcc14`, where
 # `command -v gcc` still resolves to the gcc14 wrapper (devbox has not
@@ -34,7 +40,7 @@ if [[ "${SHUTTLE_GATE_OUTER:-1}" == "1" ]]; then
     esac
     SHUTTLE_GATE_OUTER=0 SHUTTLE_GATE_CC="$CC14" SHUTTLE_GATE_CXX="$CXX14" \
         exec nix shell nixpkgs#gcc14 -c env \
-        -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH \
+        -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH -u CPATH \
         devbox run -- bash "$0"
 fi
 
