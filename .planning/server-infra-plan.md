@@ -1,5 +1,16 @@
 # Server infra plan: worker spin-up + S3 cache storage
 
+> **SUPERSEDED IN PART, 2026-09-27 (operator, evening): the zet VPS was
+> deleted.** "I dropped zet, I was not using it. We will be deploying Nau
+> in place." The zet checklist below is therefore history: steps 0-2 were
+> executed and verified live (the rustfs policy dialect findings and the
+> provision script `scripts/rustfs-provision-shuttle-cache.sh` in the zet
+> repo remain valid and re-runnable against any MinIO-compatible target);
+> steps 3-7 and all VPS-side artifacts (timers, monitors, mc) died with
+> the server. The workers plan (classes, TTL, OS) is unaffected. The cache
+> lane and the Nau domains re-home onto the Nau deployment itself — see
+> `.planning/nau-infra-plan.md` and the ADR-0046 draft decision pending.
+
 Date: 2026-09-27. v2 — four-seat council review folded (premise
 corrections: local-path has no quota, no publisher exists yet, age-prune
 kills hot blobs, the TTL sweep inverted the leak case, worker account
