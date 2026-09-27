@@ -171,14 +171,29 @@ return {
             -- configure (lines 14/163); the CMake files gate the
             -- benchmark probe on lowercased $ENV{SAN_BUILD} — without
             -- it find_package(benchmark REQUIRED) silently never
-            -- fires (see header).
+            -- fires (see header). Sandbox gap: the deb driver's
+            -- baked-in gxx-include dir (/usr/include/c++/14) is
+            -- absolute and dead inside the sandbox, and the pod env
+            -- leaks CPATH (C-only finds) but never
+            -- CPLUS_INCLUDE_PATH. C++ headers resolve only via this
+            -- recipe's -isystem prefix dir, and #include_next from
+            -- cstdlib then skips that dir — stdlib.h vanishes
+            -- (#171's include_next class). include_next is
+            -- canonical-path-based, so the -isystem dir can never
+            -- satisfy it — no flag spelling or symlink escapes the
+            -- dedup. A REAL second dir is required: copy the C header
+            -- tree (minus the C++ subtree) under the build tree and
+            -- -idirafter that (distinct canonical path, after every
+            -- system dir).
+            "mkdir -p $SRC/build-release/c-include && cp -a $SHUTTLE_BUILD_PREFIX/usr/include/. $SRC/build-release/c-include/ && rm -rf $SRC/build-release/c-include/c++ $SRC/build-release/c-include/x86_64-linux-gnu/c++",
             "SAN_BUILD=no cmake -S $SRC -B $SRC/build-release -G Ninja "
                 .. "-DCMAKE_BUILD_TYPE=Release "
                 .. "-DCMAKE_POLICY_VERSION_MINIMUM=3.5 "
                 .. "-DBUILD_UNIT_TESTS=OFF "
                 .. "-DWITH_SUBMODULES_SYSTEM=ON "
                 .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
-                .. "-DCMAKE_INSTALL_PREFIX=/usr",
+                .. "-DCMAKE_INSTALL_PREFIX=/usr "
+                .. "-DCMAKE_CXX_FLAGS=\"-idirafter $SRC/build-release/c-include\"",
             "cmake --build $SRC/build-release -j$(nproc)",
             "install -Dm755 $SRC/build-release/libsearch.so $STAGE/usr/lib/libsearch.so",
         }, " && "),

@@ -70,6 +70,12 @@ return {
                 .. "-DCARES_STATIC=ON -DCARES_SHARED=OFF",
             "cmake --build $SRC/build -j$(nproc)",
             "DESTDIR=$STAGE cmake --install $SRC/build",
+            -- ahost/adig/acountry carry a build-tree RUNPATH (pointing
+            -- into the merged prefix) regardless of CMake's install
+            -- RPATH handling — the leak scan rejects that class of
+            -- record (ADR-0018) and nothing at runtime resolves
+            -- through it: strip it from the installed ELFs.
+            "find $STAGE -type f -perm /111 -exec patchelf --remove-rpath {} +",
         }, " && "),
 
         type = "source",
