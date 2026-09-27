@@ -40,3 +40,16 @@ Amendment (2026-09-20): the distro name went ShuttleOS → Cassini → **Nau** t
 **Positive**: one coherent brand family (shuttle builds Nau; Nau launches Cassini); rename landed before ADR-0011/0012 so they are born with the final name; naming invariant makes any future rename O(constants + docs).
 
 **Negative**: accepted, permanent distribution tax — `cargo install` conflicts with cargo-shuttle's binary and "shuttle rust" search favors shuttle.dev. Future crates.io publication will need a suffixed crate name (`shuttle-os` / `shuttleos` are free).
+
+## Amendment (2026-09-27): brand-domain registration deferred; rclb.dev is the operational home
+
+Operator decision (grill session): the feasibility-condition registrations
+(`nauos.dev`, `nau-os.dev`, the `github.com/nau-os` org) are **not** made.
+The canonical operational lanes are `rclb.dev` subdomains — `www` /
+`download` / `cache` under `nau.rclb.dev` (`.planning/nau-infra-plan.md`) —
+and released images bake those URLs. The trademark pre-release gate is
+unchanged and still blocking for any public release under the name Nau;
+the registration feasibility check re-runs at that gate (names verified
+free 2026-09-27). Squatting risk in the interim is accepted by this
+decision. This supersedes only the registration timing of Decision 1;
+the name matrix itself stands.

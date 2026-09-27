@@ -2,11 +2,12 @@
 
 ## Status
 
-Proposed, parked on operator ratification. Drafted 2026-09-27 by a planning
-session from a four-seat council review (unanimous: never learn a host key
-from the network; the split was injection vs a coordinator SSH CA, recorded
-below as one decision family). This ADR is the un-park gate for #194-#198;
-no provisioning code lands before ratification.
+Accepted (2026-09-27, operator ratification in a grill session). The
+ratified form is plain injection (Decision 1) for v1; the SSH host CA
+(Decision 3) is the recorded escalation — adopt it when more than two
+providers are live or a standing fleet wider than five machines exists,
+whichever comes first. #194-#198 are un-parked for implementation (#271
+gates the first real provision).
 
 ## Context
 

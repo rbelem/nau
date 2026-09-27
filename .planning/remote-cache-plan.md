@@ -173,20 +173,13 @@ settle:
    compromised-key blast radius from pulled packages to every build
    input, breaks the "absent `node {}` = zero behavior change" posture,
    and mirrors the implicit-seed-on-build pattern ADR-0033 rejected.
-2. **Key scoping: UNRESOLVED, decide in the ADR.** Beta and alpha: flat
-   set for v1 (scoping is an ADR-0024 ceremony redesign that does not
-   exist; gate the lane on it and the feature dies), with a hard revisit
-   trigger and `rebuild-compare.sh` determinism
-   spot-checks as the interim control (mirroring ADR-0040 D7). Delta and
-   gamma: a distinct key ROLE for cache artifacts from day one
-   (`cache-signer`, a label plus its own anchor file — no new
-   machinery), because cache compromise propagates into build outputs,
-   a strictly larger blast radius than package installs. The middle
-   option costs almost nothing and bounds the worst case; the flat
-   option ships sooner. Council synthesis leans flat-for-v1 with the
-   trigger condition spelled out: the scoping work fires on whichever
-   comes first, a second signer or the cache serving installable
-   payloads.
+2. **Key scoping: RESOLVED 2026-09-27 (operator, grill session): flat
+   trust set for v1.** The distinct `cache-signer` role fires on whichever
+   comes first, a second signer key or the cache serving installable
+   payloads; `examples/rebuild-compare.sh` determinism spot-checks are
+   the interim control (mirroring ADR-0040 D7). ADR-0043 records this as
+   settled, not open. (Seat positions from round 2 — alpha/beta for flat,
+   delta/gamma for the scoped role — are preserved in git history.)
 3. **Published-tree retention: RESOLVED in shape (4/4), details for the
    ADR.** Decision 10's `.shuttle-export` ownership-marker semantics
    verbatim, plus a cache-tree marker. Cache-specific asymmetry (delta):

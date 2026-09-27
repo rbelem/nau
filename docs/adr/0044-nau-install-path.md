@@ -2,10 +2,13 @@
 
 ## Status
 
-Proposed. Drafted 2026-09-27 by a planning session from a four-seat council
-review (all four seats: install = write the built image; installer never
-builds, never signs). Awaiting operator ratification. Implementation tickets
-are gated on ratification.
+Accepted (2026-09-27, operator ratification in a grill session; the
+four-seat council verdict of drafting day stands). Implementation tickets
+#274/#275/#276 and #266's publication wiring are unblocked.
+
+Operator rider: dd-flash is the v1 path. A full interactive installer is
+a deliberate follow-up that opens only after the first fully functional
+image build works in a VM (see Revisit triggers).
 
 ## Context
 
