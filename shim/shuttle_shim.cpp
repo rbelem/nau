@@ -26,6 +26,7 @@
 
 #include "Luau/BuiltinDefinitions.h"
 #include "Luau/Config.h"
+#include "Luau/ConfigResolver.h"
 #include "Luau/Error.h"
 #include "Luau/FileResolver.h"
 #include "Luau/Frontend.h"
@@ -60,7 +61,7 @@ struct InMemoryResolver final : Luau::FileResolver
         return Luau::SourceCode{it->second, Luau::SourceCode::Module};
     }
 
-    std::optional<Luau::ModuleInfo> resolveModule(const Luau::ModuleInfo* context, Luau::AstExpr* node) override
+    std::optional<Luau::ModuleInfo> resolveModule(const Luau::ModuleInfo* context, Luau::AstExpr* node, const Luau::TypeCheckLimits& limits) override
     {
         if (auto* expr = node->as<Luau::AstExprConstantString>())
         {
@@ -85,7 +86,7 @@ struct FixedConfigResolver final : Luau::ConfigResolver
         defaultConfig.mode = mode;
     }
 
-    const Luau::Config& getConfig(const Luau::ModuleName& name) const override
+    const Luau::Config& getConfig(const Luau::ModuleName& name, const Luau::TypeCheckLimits& limits) const override
     {
         return defaultConfig;
     }
