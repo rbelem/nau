@@ -695,6 +695,24 @@ pub enum Command {
     /// part of the public CLI.
     #[command(name = "__check-worker", hide = true)]
     CheckWorker,
+
+    /// Internal: build-farm worker capability probe (hidden). Prints one
+    /// JSON capability document (protocol, arch, nproc, RAM, free disk,
+    /// tool presence, functioning-sandbox and KVM probes) on stdout, then
+    /// exits (ADR-0040 Decision 2). Not part of the public CLI.
+    #[command(name = "__worker-cap", hide = true)]
+    WorkerCap,
+
+    /// Internal: build-farm worker job executor (hidden). Executes exactly
+    /// one job manifest — verifies every payload sha256, then runs the
+    /// ordinary offline sandbox build path — and prints one JSON result
+    /// document on stdout (ADR-0040 Decision 2). Any refusal exits nonzero
+    /// before anything runs. Not part of the public CLI.
+    #[command(name = "__worker-job", hide = true)]
+    WorkerJob {
+        /// Path to the job manifest file.
+        job_file: String,
+    },
 }
 
 /// Subcommands for `shuttle deps`.
