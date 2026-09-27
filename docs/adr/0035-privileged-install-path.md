@@ -197,8 +197,9 @@ Phase 24b.
    operator admits users to `shuttle` (or, where local convention prefers,
    aliases the group to `wheel` at packaging time — the helper checks
    group membership, not the group name). Root always passes. The
-   ShuttleOS image-builder case never touches the helper: image assembly
-   runs as root and writes the store directly, and the emitted boot
+   Nau image-builder case never touches the helper: image assembly is
+   unprivileged (file-based partition assembly, no mounts) and writes the
+   image file directly, and the emitted boot
    oneshot (#60) activates as root at first boot
    (`src/image/state.rs:237`, `src/image/boot.rs:287`) — the helper exists
    for post-boot interactive administration on a running system, which is

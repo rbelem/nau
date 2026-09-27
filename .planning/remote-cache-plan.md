@@ -134,7 +134,7 @@ ADR-0033).
    keying host identity would make heterogeneous-fleet hits near zero
    and kill the operator's own requirement. Host identity survives as a
    verification assert (rebuild-compare across machines). Verified by
-   `scripts/rebuild-compare.sh` + the #152 harness, not assumed.
+   `examples/rebuild-compare.sh` + the #152 harness, not assumed.
 3. Flat trust set sharpens: one compromised builder key poisons every
    peer's build inputs (transitively, per delta 1). Positions recorded
    for the ADR to settle — see open calls.
