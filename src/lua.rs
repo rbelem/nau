@@ -136,6 +136,14 @@ pub struct WorkerConfig {
     /// when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
+    /// The pinned SSH host key (ADR-0045 Decision 4): a full public-key
+    /// line (`ssh-ed25519 AAAA... [comment]`) or a `SHA256:` fingerprint.
+    /// Pins are never learned — the executor drives ssh with
+    /// `StrictHostKeyChecking=yes` against a shuttle-managed known_hosts
+    /// built from the pin, and preflight refuses a worker whose pin
+    /// cannot be enforced by name. No `ssh-keyscan` path exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key: Option<String>,
 }
 
 fn default_local_jobs() -> u32 {
@@ -264,7 +272,8 @@ impl WorkersConfig {
     /// rejected fail-closed; one named miette diagnostic per malformed
     /// shape, naming the field and the entry index.
     pub fn from_lua_value(value: &mlua::Value) -> miette::Result<Self> {
-        const KNOWN_FIELDS: &str = "known keys: local_jobs; array entries take address, jobs, arch";
+        const KNOWN_FIELDS: &str =
+            "known keys: local_jobs; array entries take address, jobs, arch, host_key";
         let mlua::Value::Table(table) = value else {
             return Err(miette::miette!(
                 "'workers' must be a table, got {}",
@@ -350,9 +359,48 @@ impl WorkersConfig {
     }
 }
 
+/// A string field of a worker entry: the value or a named refusal.
+fn entry_string_field(val: &mlua::Value, index: usize, field: &str) -> miette::Result<String> {
+    match val {
+        mlua::Value::String(s) => s
+            .to_str()
+            .map(|v| v.to_string())
+            .map_err(|e| miette::miette!("workers[{index}]: field '{field}': {e}")),
+        other => Err(miette::miette!(
+            "workers[{index}]: field '{field}' must be a string, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+/// The `arch` override: a non-empty GNU triplet without whitespace.
+fn parse_arch_field(val: &mlua::Value, index: usize) -> miette::Result<String> {
+    let a = entry_string_field(val, index, "arch")?;
+    if a.is_empty() || a.contains(char::is_whitespace) {
+        return Err(miette::miette!(
+            "workers[{index}]: field 'arch' must be a non-empty GNU triplet without whitespace"
+        ));
+    }
+    Ok(a)
+}
+
+/// The field name of a worker entry's key: the name or a named refusal.
+fn entry_field_name(key: &mlua::Value, index: usize) -> miette::Result<String> {
+    match key {
+        mlua::Value::String(s) => s
+            .to_str()
+            .map(|v| v.to_string())
+            .map_err(|e| miette::miette!("workers[{index}]: field name: {e}")),
+        other => Err(miette::miette!(
+            "workers[{index}]: field names must be strings, got {}",
+            other.type_name()
+        )),
+    }
+}
+
 /// Parse one array entry of the `workers` table.
 fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<WorkerConfig> {
-    const KNOWN: &str = "known fields: address, jobs, arch";
+    const KNOWN: &str = "known fields: address, jobs, arch, host_key";
     let mlua::Value::Table(table) = value else {
         return Err(miette::miette!(
             "workers[{index}] must be a table, got {}",
@@ -362,34 +410,13 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
     let mut address: Option<String> = None;
     let mut jobs = default_worker_jobs();
     let mut arch: Option<String> = None;
+    let mut host_key: Option<String> = None;
     for pair in table.pairs::<mlua::Value, mlua::Value>() {
         let (key, val) = pair.map_err(|e| miette::miette!("workers[{index}] entry: {e}"))?;
-        let field = match &key {
-            mlua::Value::String(s) => s
-                .to_str()
-                .map_err(|e| miette::miette!("workers[{index}]: field name: {e}"))?
-                .to_string(),
-            other => {
-                return Err(miette::miette!(
-                    "workers[{index}]: field names must be strings, got {}",
-                    other.type_name()
-                ))
-            }
-        };
+        let field = entry_field_name(&key, index)?;
         match field.as_str() {
             "address" => {
-                let a = match &val {
-                    mlua::Value::String(s) => s
-                        .to_str()
-                        .map_err(|e| miette::miette!("workers[{index}]: field 'address': {e}"))?
-                        .to_string(),
-                    other => {
-                        return Err(miette::miette!(
-                            "workers[{index}]: field 'address' must be a string, got {}",
-                            other.type_name()
-                        ))
-                    }
-                };
+                let a = entry_string_field(&val, index, "address")?;
                 validate_worker_address(&a)
                     .map_err(|e| miette::miette!("workers[{index}]: field 'address': {e}"))?;
                 address = Some(a);
@@ -399,24 +426,13 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
                     .map_err(|e| miette::miette!("workers[{index}]: {e}"))?;
             }
             "arch" => {
-                let a = match &val {
-                    mlua::Value::String(s) => s
-                        .to_str()
-                        .map_err(|e| miette::miette!("workers[{index}]: field 'arch': {e}"))?
-                        .to_string(),
-                    other => {
-                        return Err(miette::miette!(
-                            "workers[{index}]: field 'arch' must be a string, got {}",
-                            other.type_name()
-                        ))
-                    }
-                };
-                if a.is_empty() || a.contains(char::is_whitespace) {
-                    return Err(miette::miette!(
-                        "workers[{index}]: field 'arch' must be a non-empty GNU triplet without whitespace"
-                    ));
-                }
-                arch = Some(a);
+                arch = Some(parse_arch_field(&val, index)?);
+            }
+            "host_key" => {
+                let k = entry_string_field(&val, index, "host_key")?;
+                validate_host_key(&k)
+                    .map_err(|e| miette::miette!("workers[{index}]: field 'host_key': {e}"))?;
+                host_key = Some(k);
             }
             other => {
                 return Err(miette::miette!(
@@ -431,7 +447,66 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
         address,
         jobs,
         arch,
+        host_key,
     })
+}
+
+/// The `host_key` pin grammar (ADR-0045 Decision 4): either a full
+/// public-key line — `<keytype> <base64> [comment]`, usable verbatim as a
+/// known_hosts key — or an OpenSSH `SHA256:<43 base64 chars>` fingerprint.
+/// The fingerprint form is validated in shape only: it cannot build a
+/// known_hosts entry and shuttle learns no host keys, so the executor
+/// refuses a fingerprint-only pin at preflight.
+fn validate_host_key(raw: &str) -> miette::Result<()> {
+    const KEY_TYPES: &[&str] = &[
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "ssh-rsa",
+        "rsa-sha2-256",
+        "rsa-sha2-512",
+    ];
+    if let Some(fp) = raw.strip_prefix("SHA256:") {
+        if fp.len() == 43 && fp.bytes().all(is_base64_char) {
+            return Ok(());
+        }
+        return Err(miette::miette!(
+            "a fingerprint pin must be 'SHA256:' + 43 base64 characters (the OpenSSH form), got '{raw}'"
+        ));
+    }
+    let mut parts = raw.split_whitespace();
+    let key_type = parts.next();
+    let key = parts.next();
+    let comment = parts.next();
+    if parts.next().is_some() {
+        return Err(miette::miette!(
+            "expected '<keytype> <base64> [comment]' or 'SHA256:<fingerprint>', got '{raw}'"
+        ));
+    }
+    match (key_type, key, comment) {
+        (Some(k), Some(key), comment) if KEY_TYPES.contains(&k) => {
+            let comment_ok = comment.is_none_or(|c| !c.starts_with('-') && !c.contains(char::is_whitespace));
+            let key_ok = key.len() >= 16 && key.bytes().all(|b| is_base64_char(b) || b == b'=');
+            if key_ok && comment_ok {
+                return Ok(());
+            }
+            Err(miette::miette!(
+                "'{k}' is a known host-key type, but the entry is not a valid public-key line: '{raw}'"
+            ))
+        }
+        (Some(k), ..) if !KEY_TYPES.contains(&k) => Err(miette::miette!(
+            "unknown host-key type '{k}' (expected ssh-ed25519, ecdsa-sha2-nistp*, ssh-rsa, rsa-sha2-*, or a SHA256: fingerprint)"
+        )),
+        _ => Err(miette::miette!(
+            "expected '<keytype> <base64> [comment]' or 'SHA256:<fingerprint>', got '{raw}'"
+        )),
+    }
+}
+
+/// One base64 character (standard alphabet, no padding).
+fn is_base64_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'+' || b == b'/'
 }
 
 /// Extract the global `workers` table from an evaluated Lua state.

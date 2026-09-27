@@ -182,3 +182,81 @@ fn local_jobs_type_and_bound_are_checked() {
     let err = eval_err(r#"workers = { local_jobs = "many" }"#);
     assert!(err.contains("'local_jobs'"), "{err:#}");
 }
+
+// ── host_key pins (ADR-0045 Decision 4, T4) ──
+
+#[test]
+fn host_key_pin_line_round_trips() {
+    let out = eval_with(
+        r#"
+workers = {
+  { address = "ssh://op@nuci.local",
+    host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux op@nuci" },
+}
+"#,
+    )
+    .expect("pinned worker evals");
+    let pin = out.workers.workers[0]
+        .host_key
+        .as_deref()
+        .expect("pin present");
+    assert!(pin.starts_with("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"), "{pin}");
+    assert!(pin.ends_with("op@nuci"), "the comment survives: {pin}");
+}
+
+#[test]
+fn host_key_fingerprint_pin_round_trips() {
+    let out = eval_with(
+        r#"
+workers = {
+  { address = "ssh://nuci.local",
+    host_key = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG" },
+}
+"#,
+    )
+    .expect("fingerprint pin evals");
+    assert!(out.workers.workers[0]
+        .host_key
+        .as_deref()
+        .expect("pin present")
+        .starts_with("SHA256:"));
+}
+
+#[test]
+fn absent_host_key_still_evaluates_preflight_owns_the_refusal() {
+    // The config shape accepts an unpinned entry — the executor refuses
+    // it by name before any channel activity (ADR-0045 D4). This keeps
+    // every non-farm use of the eval payload inert.
+    let out = eval_with(r#"workers = { { address = "ssh://h" } }"#).expect("unpinned evals");
+    assert!(out.workers.workers[0].host_key.is_none());
+}
+
+#[test]
+fn malformed_host_key_pins_are_refused() {
+    let err = eval_err(r#"workers = { { address = "ssh://h", host_key = "ed25519 AAAA" } }"#);
+    assert!(err.contains("unknown host-key type"), "{err:#}");
+
+    let err = eval_err(r#"workers = { { address = "ssh://h", host_key = "SHA256:tooshort" } }"#);
+    assert!(err.contains("43 base64 characters"), "{err:#}");
+
+    let err =
+        eval_err(r#"workers = { { address = "ssh://h", host_key = "ssh-ed25519 not!valid" } }"#);
+    assert!(err.contains("not a valid public-key line"), "{err:#}");
+
+    let err = eval_err(r#"workers = { { address = "ssh://h", host_key = "ssh-ed25519" } }"#);
+    assert!(
+        err.contains("expected '<keytype> <base64> [comment]'"),
+        "{err:#}"
+    );
+
+    let err = eval_err(r#"workers = { { address = "ssh://h", host_key = 42 } }"#);
+    assert!(err.contains("field 'host_key' must be a string"), "{err:#}");
+
+    let err = eval_err(
+        r#"workers = { { address = "ssh://h", host_key = "ssh-ed25519 AAAA extra1 extra2" } }"#,
+    );
+    assert!(
+        err.contains("expected '<keytype> <base64> [comment]'"),
+        "{err:#}"
+    );
+}
