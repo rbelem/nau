@@ -2619,8 +2619,12 @@ mod tests {
     }
 
     fn set_index_path(path: &Path) -> IndexPathGuard {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The ONE crate-global test-env lock (src/test_env.rs): the resolve
+        // loop reads SHUTTLE_INDEX_PATH, and parallel tests must not race it
+        // — a per-module static would exclude nothing across modules.
+        let lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SHUTTLE_INDEX_PATH", path);
         IndexPathGuard { _lock: lock }
     }

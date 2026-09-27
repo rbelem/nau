@@ -1886,6 +1886,9 @@ mod tests {
 
     #[test]
     fn record_renders_full_unit_and_emits_the_link() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let store = store_fixture(tmp.path());
         let mut d = decl("bin/valkey-server");
@@ -2564,6 +2567,9 @@ mod tests {
 
     #[test]
     fn endpoint_scan_compares_resolved_option_values() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Issue #107: recorded options keep specifiers unexpanded, so
         // the scan must expand at comparison time — raw text never
         // compares.
