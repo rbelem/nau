@@ -155,8 +155,11 @@ gated_test!(two_concurrent_default_stage_builds_conflict_loudly, {
         "exactly one concurrent default-stage build may proceed: {stderr1} | {stderr2}"
     );
     let (_, loser_err, _) = attempts.iter().find(|(c, _, _)| *c != Some(0)).unwrap();
+    // miette wraps its 80-col render at the tempdir path's length, so the
+    // "held by another shuttle build" phrase can straddle a line break;
+    // assert wrap-safe fragments (rule: docs/agents/build-and-test.md).
     assert!(
-        loser_err.contains("held by another shuttle build"),
+        loser_err.contains("held by") && loser_err.contains("shuttle build"),
         "loser must refuse loudly naming the conflict: {loser_err}"
     );
     assert!(
