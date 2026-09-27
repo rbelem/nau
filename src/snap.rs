@@ -348,10 +348,18 @@ pub struct SnapMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 
-    /// SquashFS compression for mksquashfs ("xz" or "lzo"). Build-time only
-    /// — snap.yaml has no compression field; it's a property of the image.
+    /// SquashFS compression for mksquashfs ("zstd", "xz" or "lzo"; zstd when
+    /// absent — ticket #154). Build-time only — snap.yaml has no compression
+    /// field; it's a property of the image.
     #[serde(default, skip)]
     pub compression: Option<String>,
+
+    /// Optional mksquashfs `-Xcompression-level` (ticket #154): zstd accepts
+    /// 1-22 (the pack path pins 6 when absent), lzo 1-9; rejected for xz —
+    /// mksquashfs' xz wrapper has no `-Xcompression-level`. Build-time only,
+    /// like `compression`.
+    #[serde(default, skip)]
+    pub compression_level: Option<u32>,
 
     /// Global environment variables applied to every app in the snap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1695,6 +1703,9 @@ impl SnapMeta {
         let icon_source = get_opt_string(table, "icon")?;
         let icon = icon_target_from_source(icon_source.as_deref())?;
         let compression = get_opt_string(table, "compression")?;
+        validate_compression_choice(compression.as_deref())?;
+        let compression_level = get_opt_compression_level(table)?;
+        validate_compression_level(compression.as_deref(), compression_level)?;
         let environment = get_opt_string_map(table, "environment")?;
         let layout = get_opt_layout(table)?;
         let hooks = get_opt_hooks(table)?;
@@ -1835,6 +1846,7 @@ impl SnapMeta {
             icon_source,
             icon,
             compression,
+            compression_level,
             environment,
             layout,
             hooks,
@@ -2361,6 +2373,94 @@ fn get_opt_table(table: &mlua::Table, key: &str) -> miette::Result<Option<mlua::
         Value::Table(t) => Ok(Some(t)),
         Value::Nil => Ok(None),
         _ => Ok(None),
+    }
+}
+
+/// Compression choices mksquashfs accepts here (ticket #154). zstd is the
+/// absent default; gzip dropped — strictly dominated by zstd (ADR-0038
+/// evidence table).
+const VALID_COMPRESSIONS: [&str; 3] = ["zstd", "xz", "lzo"];
+
+/// The effective compressor: the declared value, else the zstd default
+/// (ticket #154). Single point where the default lives on the Rust side.
+fn effective_compression(compression: Option<&str>) -> &str {
+    compression.unwrap_or("zstd")
+}
+
+fn validate_compression_choice(compression: Option<&str>) -> miette::Result<()> {
+    if let Some(c) = compression {
+        if !VALID_COMPRESSIONS.contains(&c) {
+            return Err(miette::miette!(
+                "snap meta: 'compression' must be one of: zstd, xz, lzo, got {c:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `compression_level` bounds per compressor (ticket #154): zstd 1-22,
+/// lzo 1-9; rejected for xz — mksquashfs' xz wrapper does not implement
+/// `-Xcompression-level`, so a declared level would silently no-op.
+fn validate_compression_level(compression: Option<&str>, level: Option<u32>) -> miette::Result<()> {
+    let Some(level) = level else {
+        return Ok(());
+    };
+    match effective_compression(compression) {
+        "zstd" => {
+            if !(1..=22).contains(&level) {
+                return Err(miette::miette!(
+                    "snap meta: 'compression_level' must be between 1 and 22 for compression = \"zstd\", got {level}"
+                ));
+            }
+        }
+        "lzo" => {
+            if !(1..=9).contains(&level) {
+                return Err(miette::miette!(
+                    "snap meta: 'compression_level' must be between 1 and 9 for compression = \"lzo\", got {level}"
+                ));
+            }
+        }
+        "xz" => {
+            return Err(miette::miette!(
+                "snap meta: 'compression_level' is not supported with compression = \"xz\" — \
+                 mksquashfs' xz wrapper does not implement -Xcompression-level"
+            ));
+        }
+        other => unreachable!("validated by validate_compression_choice: {other}"),
+    }
+    Ok(())
+}
+
+/// Extract an optional integer `compression_level`, rejecting fractional
+/// values with a named error (mlua would accept `6.0` but the DSL contract
+/// says integer — 6.5 fails here, not at mksquashfs).
+fn get_opt_compression_level(table: &mlua::Table) -> miette::Result<Option<u32>> {
+    match table
+        .get::<Value>("compression_level")
+        .map_err(|e| miette::miette!("{}", e))?
+    {
+        Value::Integer(i) => u32::try_from(i).map(Some).map_err(|_| {
+            miette::miette!(
+                "snap meta: field 'compression_level' must be a positive integer, got {i}"
+            )
+        }),
+        Value::Number(f) => {
+            if f.fract() != 0.0 {
+                return Err(miette::miette!(
+                    "snap meta: field 'compression_level' must be an integer, got {f}"
+                ));
+            }
+            u32::try_from(f as i64).map(Some).map_err(|_| {
+                miette::miette!(
+                    "snap meta: field 'compression_level' must be a positive integer, got {f}"
+                )
+            })
+        }
+        Value::Nil => Ok(None),
+        other => Err(miette::miette!(
+            "snap meta: field 'compression_level' must be an integer, got {}",
+            other.type_name()
+        )),
     }
 }
 
@@ -4349,6 +4449,96 @@ fn floor_tool(name: crate::tools::ToolName) -> miette::Result<PathBuf> {
     })
 }
 
+/// The pinned zstd level for the default pack path (ticket #154, ADR-0038
+/// decision 2): mksquashfs' own zstd default is level 15 and slow, so the
+/// level is always explicit.
+const DEFAULT_ZSTD_LEVEL: u32 = 6;
+
+/// mksquashfs compression arguments (ticket #154, ADR-0038 decisions 1-3):
+/// the zstd path (the default) pins the level — 6 unless declared — and 1M
+/// blocks; lzo passes an explicit level only when declared; xz keeps the
+/// legacy argv byte-identical (no `-b`: published data shows xz at 1M
+/// blocks regresses pack time ~16%, and its wrapper takes no level).
+fn mksquashfs_compression_args(
+    compression: Option<&str>,
+    compression_level: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec![effective_compression(compression).to_string()];
+    match args[0].as_str() {
+        "zstd" => {
+            args.push("-Xcompression-level".to_string());
+            args.push(compression_level.unwrap_or(DEFAULT_ZSTD_LEVEL).to_string());
+            args.push("-b".to_string());
+            args.push("1M".to_string());
+        }
+        "lzo" => {
+            if let Some(level) = compression_level {
+                args.push("-Xcompression-level".to_string());
+                args.push(level.to_string());
+            }
+        }
+        _ => {} // xz: unchanged argv
+    }
+    args
+}
+
+/// Memoized zstd-support probe outcomes, keyed by the resolved mksquashfs
+/// path: one tiny pack per binary per process — support is a property of
+/// the binary, and multi-arch builds would otherwise re-probe per arch.
+type ZstdProbeCache = std::collections::HashMap<PathBuf, Result<(), String>>;
+
+fn zstd_probe_cache() -> &'static std::sync::Mutex<ZstdProbeCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ZstdProbeCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Fail-closed zstd support probe (ticket #154, ADR-0038 decision 5): run
+/// one tiny mksquashfs pack at the requested level through the same
+/// resolved binary the real pack will use. On failure the pack errors with
+/// an actionable message — never a silent fallback to another compressor.
+fn probe_zstd_support(mksquashfs: &Path, level: u32) -> miette::Result<()> {
+    let mut cache = zstd_probe_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = cache.get(mksquashfs) {
+        return cached.clone().map_err(|e| miette::miette!("{e}"));
+    }
+    let probe = tempfile::tempdir()
+        .map_err(|e| miette::miette!("zstd probe: failed to create probe directory: {e}"))?;
+    std::fs::write(probe.path().join("probe"), b"shuttle zstd probe\n")
+        .map_err(|e| miette::miette!("zstd probe: failed to write probe file: {e}"))?;
+    let image = probe.path().join("probe.snap");
+    let output = std::process::Command::new(mksquashfs)
+        .arg(probe.path())
+        .arg(&image)
+        .arg("-noappend")
+        .arg("-comp")
+        .arg("zstd")
+        .arg("-Xcompression-level")
+        .arg(level.to_string())
+        .arg("-no-progress")
+        .output()
+        .map_err(|e| {
+            miette::miette!(
+                "zstd probe: failed to execute {}: {e}",
+                mksquashfs.display()
+            )
+        });
+    let result = match output {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(format!(
+            "mksquashfs at {} cannot pack zstd at level {level} (exit {:?}, stderr: {}) — \
+             install a zstd-enabled squashfs-tools, or set compression = \"xz\" in the snap \
+             definition to keep building",
+            mksquashfs.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(e.to_string()),
+    };
+    cache.insert(mksquashfs.to_path_buf(), result.clone());
+    result.map_err(|e| miette::miette!("{e}"))
+}
+
 /// `pod_store` is `Some` only when building into a pod's store (issue #9):
 /// it is what a build-time interpreter wrapper bakes the script's
 /// content-addressed store path from (see [`emit_build_wrappers`]). The
@@ -4471,16 +4661,26 @@ pub fn build_snap(
 
     // 5. Run mksquashfs with optional SOURCE_DATE_EPOCH
     let pack_spinner = output::spinner(&format!("packaging {} as .snap...", meta.name));
-    let compression = meta.compression.as_deref().unwrap_or("xz");
-    let mut mksquashfs =
-        std::process::Command::new(floor_tool(crate::tools::ToolName::Mksquashfs)?);
+    // Issue #154: the zstd default path probes zstd support (with the
+    // requested level) through the same resolved binary before packing —
+    // fail closed, no silent fallback.
+    let mksquashfs_path = floor_tool(crate::tools::ToolName::Mksquashfs)?;
+    if effective_compression(meta.compression.as_deref()) == "zstd" {
+        probe_zstd_support(
+            &mksquashfs_path,
+            meta.compression_level.unwrap_or(DEFAULT_ZSTD_LEVEL),
+        )?;
+    }
+    let mut mksquashfs = std::process::Command::new(&mksquashfs_path);
     mksquashfs
         .arg(build_dir.path())
         .arg(&output_path)
         .arg("-noappend")
-        .arg("-comp")
-        .arg(compression)
-        .arg("-all-root");
+        .arg("-comp");
+    for arg in mksquashfs_compression_args(meta.compression.as_deref(), meta.compression_level) {
+        mksquashfs.arg(arg);
+    }
+    mksquashfs.arg("-all-root");
     // Parallel dep builds (issue #55): mksquashfs's progress meter would
     // interleave across packages — disable it when output is buffered.
     if buffer_child_stderr() {
@@ -6960,6 +7160,7 @@ mod tests {
             icon_source: None,
             icon: None,
             compression: None,
+            compression_level: None,
             environment: None,
             layout: None,
             hooks: None,
@@ -9073,7 +9274,7 @@ mod tests {
     #[test]
     fn test_compression_validation() {
         let env = LuaEnv::new();
-        for comp in ["xz", "lzo"] {
+        for comp in ["zstd", "xz", "lzo"] {
             let table = env
                 .eval(&format!(
                     r#"
@@ -9091,6 +9292,21 @@ mod tests {
             assert_eq!(meta.compression.as_deref(), Some(comp));
         }
 
+        // Absent compression is legal — the zstd default applies at pack
+        // time (argv), not at parse time.
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "c", version = "1" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.compression, None);
+
         let err = env
             .eval(
                 r#"
@@ -9105,9 +9321,124 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("'compression' must be one of: xz, lzo"),
+            err.contains("'compression' must be one of: zstd, xz, lzo"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_compression_level_validation() {
+        let env = LuaEnv::new();
+
+        // Accepted: zstd 1-22 (explicit and via the absent default), lzo 1-9.
+        for (comp, want) in [
+            (Some("zstd"), Some(1u32)),
+            (Some("zstd"), Some(22)),
+            (None, Some(6)), // absent compression defaults to zstd — level applies to it
+            (Some("lzo"), Some(1)),
+            (Some("lzo"), Some(9)),
+        ] {
+            let comp_arg = comp
+                .map(|c| format!("compression = \"{c}\","))
+                .unwrap_or_default();
+            let level_arg = want
+                .map(|l| format!("compression_level = {l},"))
+                .unwrap_or_default();
+            let table = env
+                .eval(&format!(
+                    r#"
+                    return {{
+                        default = snap {{
+                            name = "c", version = "1",
+                            {comp_arg}
+                            {level_arg}
+                        }},
+                    }}
+                    "#
+                ))
+                .unwrap_or_else(|e| panic!("lua should accept {comp_arg} {level_arg}: {e}"));
+            let default_table: mlua::Table = table.get("default").unwrap();
+            let meta = SnapMeta::from_lua_table(&default_table)
+                .unwrap_or_else(|e| panic!("rust should accept {comp_arg} {level_arg}: {e}"));
+            assert_eq!(meta.compression_level, want, "for {comp_arg}");
+        }
+
+        // Junk levels rejected at the DSL boundary.
+        for bad in ["0", "23", "-1", "6.5", "\"6\""] {
+            let err = env
+                .eval(&format!(
+                    r#"
+                    return {{
+                        default = snap {{
+                            name = "c", version = "1",
+                            compression = "zstd",
+                            compression_level = {bad},
+                        }},
+                    }}
+                    "#
+                ))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("'compression_level'"),
+                "level {bad} should be rejected, got: {err}"
+            );
+        }
+
+        // lzo bounds.
+        for bad in ["0", "10"] {
+            let err = env
+                .eval(&format!(
+                    r#"
+                    return {{
+                        default = snap {{
+                            name = "c", version = "1",
+                            compression = "lzo",
+                            compression_level = {bad},
+                        }},
+                    }}
+                    "#
+                ))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("must be between 1 and 9 for compression = \"lzo\""),
+                "lzo level {bad} should be rejected, got: {err}"
+            );
+        }
+
+        // xz takes no level — rejected at parse time (the wrapper does not
+        // implement -Xcompression-level).
+        let err = env
+            .eval(
+                r#"
+                return {
+                    default = snap {
+                        name = "c", version = "1",
+                        compression = "xz",
+                        compression_level = 6,
+                    },
+                }
+                "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'compression_level' is not supported with compression = \"xz\""),
+            "got: {err}"
+        );
+
+        // The Rust boundary re-checks even for non-DSL constructors.
+        let err = validate_compression_level(Some("xz"), Some(6))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not supported with compression = \"xz\""),
+            "got: {err}"
+        );
+        assert!(validate_compression_choice(Some("gzip")).is_err());
+        assert!(validate_compression_choice(Some("zstd")).is_ok());
+        assert!(validate_compression_choice(None).is_ok());
     }
 
     #[test]
@@ -9725,7 +10056,8 @@ mod tests {
         assert!(yaml.contains("environment:"));
         assert!(yaml.contains("APP_MODE: production"));
         assert!(yaml.contains("icon: meta/gui/icon.svg"));
-        assert!(!yaml.contains("compression")); // build-time only
+        assert!(!yaml.contains("compression")); // build-time only (incl. compression_level)
+        assert!(!yaml.contains("compression_level")); // build-time only
         assert!(!yaml.contains("type:")); // app is snapd's default
     }
 
@@ -9817,6 +10149,239 @@ mod tests {
         // compression = "lzo" was wired into mksquashfs — an invalid -comp
         // value would have failed the build above.
         assert_eq!(meta.compression.as_deref(), Some("lzo"));
+    }
+
+    // ── Ticket #154: zstd default compression ──
+
+    #[test]
+    fn test_mksquashfs_compression_args_default_is_zstd_6_1m() {
+        // The default path (no compression declared) carries level 6 and
+        // 1M blocks (ticket #154, ADR-0038 decisions 1-3).
+        assert_eq!(
+            mksquashfs_compression_args(None, None),
+            vec!["zstd", "-Xcompression-level", "6", "-b", "1M"]
+        );
+        // An explicit zstd level rides through; 1M blocks stay.
+        assert_eq!(
+            mksquashfs_compression_args(Some("zstd"), Some(9)),
+            vec!["zstd", "-Xcompression-level", "9", "-b", "1M"]
+        );
+    }
+
+    #[test]
+    fn test_mksquashfs_compression_args_xz_byte_identical_to_legacy() {
+        // Explicit xz keeps today's argv exactly: -comp xz, no -b (xz at
+        // 1M blocks regresses pack time ~16%), no level (the xz wrapper
+        // takes none).
+        assert_eq!(mksquashfs_compression_args(Some("xz"), None), vec!["xz"]);
+    }
+
+    #[test]
+    fn test_mksquashfs_compression_args_lzo_level_only_when_declared() {
+        assert_eq!(
+            mksquashfs_compression_args(Some("lzo"), Some(4)),
+            vec!["lzo", "-Xcompression-level", "4"]
+        );
+        assert_eq!(mksquashfs_compression_args(Some("lzo"), None), vec!["lzo"]);
+    }
+
+    #[test]
+    fn test_default_pack_is_zstd_1m_and_roundtrips() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A payload the pack must carry. Explicit stage: user-authored,
+        // never wiped (Default would wipe only if a build phase ran — this
+        // meta has none — but Explicit states the intent).
+        let stage_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            stage_dir.path().join("payload.txt"),
+            b"zstd roundtrip payload\n",
+        )
+        .unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "zstd-default", version = "1.0" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let result = build_snap(
+            &meta,
+            stage_dir.path(),
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Explicit,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let snap_path = output_dir.path().join(&result.snap_filename);
+        assert!(snap_path.exists());
+
+        let unsquashfs =
+            floor_tool(crate::tools::ToolName::Unsquashfs).expect("unsquashfs should be available");
+        let extract_dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(&unsquashfs)
+            .args([
+                "-f",
+                "-d",
+                &extract_dir.path().to_string_lossy(),
+                &snap_path.to_string_lossy(),
+            ])
+            .status()
+            .expect("unsquashfs should be available");
+        assert!(status.success());
+
+        // Roundtrip reads the payload.
+        let payload = std::fs::read_to_string(extract_dir.path().join("payload.txt")).unwrap();
+        assert_eq!(payload, "zstd roundtrip payload\n");
+
+        // compression / compression_level stay out of snap.yaml.
+        let yaml = std::fs::read_to_string(extract_dir.path().join("meta/snap.yaml")).unwrap();
+        assert!(!yaml.contains("compression"), "got: {yaml}");
+
+        // The image really is zstd at 1M blocks.
+        let superblock = std::process::Command::new(&unsquashfs)
+            .args(["-s", &snap_path.to_string_lossy()])
+            .output()
+            .expect("unsquashfs should be available");
+        let out = format!(
+            "{} {}",
+            String::from_utf8_lossy(&superblock.stdout),
+            String::from_utf8_lossy(&superblock.stderr)
+        )
+        .to_lowercase();
+        assert!(
+            out.contains("zstd"),
+            "superblock should name zstd, got: {out}"
+        );
+        assert!(
+            out.contains("1048576"),
+            "block size should be 1M, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_zstd_pack_is_reproducible() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOURCE_DATE_EPOCH", "946684800");
+        let stage_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            stage_dir.path().join("payload.txt"),
+            b"reproducible payload\n",
+        )
+        .unwrap();
+
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "zstd-repro", version = "1.0" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let out1 = tempfile::tempdir().unwrap();
+        let out2 = tempfile::tempdir().unwrap();
+        for out in [&out1, &out2] {
+            build_snap(
+                &meta,
+                stage_dir.path(),
+                out.path(),
+                "amd64",
+                StagePolicy::Explicit,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        std::env::remove_var("SOURCE_DATE_EPOCH");
+
+        let hash1 =
+            crate::store::sha3_384_file(&out1.path().join("zstd-repro_1.0_amd64.snap")).unwrap();
+        let hash2 =
+            crate::store::sha3_384_file(&out2.path().join("zstd-repro_1.0_amd64.snap")).unwrap();
+        assert_eq!(
+            hash1, hash2,
+            "two packs of the same tree must hash identically"
+        );
+    }
+
+    #[test]
+    fn test_zstd_less_mksquashfs_fails_closed_with_actionable_error() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A fake mksquashfs that behaves like a squashfs-tools build
+        // without zstd: the tiny probe pack fails.
+        let fake_dir = tempfile::tempdir().unwrap();
+        let fake = fake_dir.path().join("mksquashfs");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho \"mksquashfs: zstd support is not enabled\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The probe resolves through the same mechanism the pack uses —
+        // pin it via the tools module's override.
+        let override_var = crate::tools::ToolName::Mksquashfs.env_var();
+        std::env::set_var(&override_var, &fake);
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "zstd-less", version = "1" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let stage_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let outcome = build_snap(
+            &meta,
+            stage_dir.path(),
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Default,
+            None,
+            None,
+            None,
+            None,
+        );
+        std::env::remove_var(&override_var);
+
+        let err = outcome.unwrap_err().to_string();
+        assert!(err.contains("zstd-enabled squashfs-tools"), "got: {err}");
+        assert!(err.contains("compression = \"xz\""), "got: {err}");
+        assert!(
+            !output_dir.path().join("zstd-less_1_amd64.snap").exists(),
+            "no silent fallback — no image may be produced"
+        );
     }
 
     // ── Phase 18 tests: multi-part builds ──
@@ -12932,6 +13497,7 @@ mod wrapper_tests {
             icon_source: None,
             icon: None,
             compression: None,
+            compression_level: None,
             environment: None,
             layout: None,
             hooks: None,

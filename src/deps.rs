@@ -403,6 +403,7 @@ mod tests {
             icon_source: None,
             icon: None,
             compression: None,
+            compression_level: None,
             environment: None,
             layout: None,
             hooks: None,
