@@ -2715,7 +2715,7 @@ fn plugin_table_value(label: &str, t: &mlua::Table) -> miette::Result<crate::plu
 }
 
 /// Copy an mlua string into an owned Rust String.
-fn lua_str(s: &mlua::String) -> miette::Result<String> {
+fn lua_str(s: &mlua::LuaString) -> miette::Result<String> {
     s.to_str()
         .map_err(|e| miette::miette!("{}", e))
         .map(|s| s.to_string())

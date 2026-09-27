@@ -242,7 +242,7 @@ fn validate_host_port(host: &str, port: Option<&str>, raw: &str) -> miette::Resu
 /// are floats; 2.0 is an integer, 2.5 and -1 are not).
 fn parse_positive_int(value: &mlua::Value, field: &str) -> miette::Result<u32> {
     let n = match value {
-        mlua::Value::Integer(i) => i64::from(*i),
+        mlua::Value::Integer(i) => *i,
         mlua::Value::Number(f) if f.fract() == 0.0 => *f as i64,
         other => {
             return Err(miette::miette!(

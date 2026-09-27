@@ -1,40 +1,48 @@
-//! Builds Luau 0.663's analyzer (Luau.Analysis + deps) from the vendored
+//! Builds Luau 0.736's analyzer (Luau.Analysis + deps) from the vendored
 //! upstream tarball, plus the extern "C" shim in `shim/`.
 //!
 //! Ported from analyzer-spike/build.rs (the proven recipe — see
 //! analyzer-spike/REPORT.md). Source lists come from the tarball's own
 //! Sources.cmake (the build system Luau itself uses), so nothing is
 //! hand-maintained per library:
-//!   Luau.Analysis (64 .cpp) -> needs Ast (9), EqSat (2), Config (2) publicly,
-//!   Compiler (10) + VM (33) privately (TypeFunction.cpp uses BytecodeBuilder +
+//!   Luau.Analysis (77 .cpp) -> needs Ast (8) and Config (3) publicly,
+//!   Compiler + VM privately (TypeFunction.cpp uses BytecodeBuilder +
 //!   compileOrThrow + lua_* symbols).
-//! Total: 120 C++ translation units + 1 shim TU.
+//! Total: 80 C++ translation units + 1 shim TU. (EqSat was folded away
+//! upstream between 0.663 and 0.736; Analysis no longer needs it.)
 //!
-//! The vendored tarball (`vendor/luau-0.663.tar.gz`) duplicates the copy in
-//! `analyzer-spike/` on purpose: the spike directory is archival research and
-//! stays untouched.
+//! The vendored tarball (`vendor/luau-0.736.tar.gz`) must stay in lockstep
+//! with the luau0-src mlua-sys vendors — see the LIBS comment below.
 
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-const LUAU_TAG: &str = "0.663";
-// Luau.Analysis needs Ast, EqSat and Config compiled, plus Compiler and VM
-// headers (TypeFunction.cpp uses BytecodeBuilder + compileOrThrow + lua_*
-// symbols). The Ast, Compiler and VM OBJECTS are deliberately not compiled
-// here: the `mlua` runtime dependency already links the identical luau0-src
-// 0.12.3+luau663 Ast+VM+Compiler (same sources, same LUAI_MAXCSTACK /
+const LUAU_TAG: &str = "0.736";
+// Luau.Analysis needs Config compiled, plus Ast, Compiler and VM headers
+// (TypeFunction.cpp uses BytecodeBuilder + compileOrThrow + lua_* symbols).
+// The Ast, Compiler and VM OBJECTS are deliberately not compiled here: the
+// `mlua` runtime dependency already links the identical luau0-src
+// 0.21.0+luau736 Ast+VM+Compiler (same sources, same LUAI_MAXCSTACK /
 // LUA_VECTOR_SIZE defines), and compiling any of them again duplicates
 // every symbol at link time (issue #230-land: the duplicate Parser.o
 // between libshuttle and libmlua_sys made 12 test targets fail to link
 // once a full rebuild reordered object pull). The analyzer's undefined
 // refs resolve against mlua's luauast/luau libs at final link, exactly as
 // the VM ones always have.
-const LIBS: &[&str] = &["Config", "EqSat", "Analysis"];
+//
+// The vendored tarball version MUST match mlua-sys's luau0-src pin
+// (0.21.0+luau736 as of the mlua 0.12 bump): the analyzer's Ast/VM refs
+// resolve against luau0-src's objects at final link, so any drift between
+// the two trees is a link error (or worse, an ABI mismatch).
+const LIBS: &[&str] = &["Config", "Analysis"];
 // Only these tree prefixes are unpacked from the tarball (skip CLI/tests/bench).
+// Bytecode is headers-only here: BytecodeBuilder.h moved under Bytecode/include
+// in 0.736 and Analysis includes it, but the Bytecode objects themselves stay
+// luau0-src's (see LIBS above).
 const WANTED_DIRS: &[&str] = &[
-    "Analysis", "Ast", "Common", "Compiler", "Config", "EqSat", "VM",
+    "Analysis", "Ast", "Bytecode", "Common", "Compiler", "Config", "VM",
 ];
 
 fn main() {
@@ -68,13 +76,18 @@ fn main() {
         .define("LUAI_MAXCSTACK", "1000000")
         .define("LUA_VECTOR_SIZE", "3")
         .define("LUA_API", "extern \"C\"")
-        // Luau 0.663 relies on transitive <cstdint> includes (e.g.
+        // Luau 0.663 relied on transitive <cstdint> includes (e.g.
         // TypedAllocator.cpp uses uintptr_t); newer gcc no longer leaks it in.
+        // 0.736's Analysis has the same disease for <limits> (TypeIds.cpp
+        // uses std::numeric_limits; Compiler.cpp upstream-wide). Force-include
+        // both so the vendored build is gcc-version-independent.
         .flag("-include")
-        .flag("cstdint");
+        .flag("cstdint")
+        .flag("-include")
+        .flag("limits");
 
     for dir in [
-        "Common", "Ast", "Config", "EqSat", "Analysis", "Compiler", "VM",
+        "Common", "Ast", "Bytecode", "Config", "Analysis", "Compiler", "VM",
     ] {
         build.include(src_root.join(dir).join("include"));
     }

@@ -842,6 +842,15 @@ fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
     lua.set_memory_limit(VM_MEMORY_LIMIT)
         .map_err(|e| miette::miette!("failed to set VM memory limit: {e}"))?;
 
+    // mlua 0.12 unconditionally injects `loadstring` into every Luau VM
+    // (configure_luau; changelog "Added loadstring function to Luau") — an
+    // arbitrary-code/bytecode escape hatch the worker must never expose
+    // (ADR-0010: untrusted definitions get no loaders). Remove it before the
+    // prelude runs so even init code can't reach it.
+    lua.globals()
+        .set("loadstring", mlua::Value::Nil)
+        .map_err(|e| miette::miette!("failed to remove loadstring: {e}"))?;
+
     lua.load(req.prelude.as_str())
         .set_name("=init.lua".to_string())
         .exec()
@@ -1041,7 +1050,7 @@ pub fn lua_to_json(v: &mlua::Value) -> Result<Value, String> {
             && entries
                 .iter()
                 .enumerate()
-                .all(|(i, (k, _))| matches!(k, mlua::Value::Integer(n) if *n == i as i32 + 1))
+                .all(|(i, (k, _))| matches!(k, mlua::Value::Integer(n) if *n == i as i64 + 1))
     }
 
     fn go(v: &mlua::Value, depth: usize, seen: &[mlua::Value]) -> Result<Value, String> {

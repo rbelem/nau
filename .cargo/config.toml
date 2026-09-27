@@ -1,0 +1,6 @@
+# luau0-src 0.21.0+luau736's Compiler.cpp uses std::numeric_limits without
+# including <limits> (upstream Luau regression — 0.12.3+luau663 got it
+# transitively via Luau/VecDeque.h, the 736 include graph no longer does).
+# Force-include it until upstream Compiler.cpp carries the include itself.
+[env]
+LUAU_CXXFLAGS = "-include limits"
