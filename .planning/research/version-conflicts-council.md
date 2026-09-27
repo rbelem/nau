@@ -4,7 +4,7 @@ Council session 2026-09-27 (four seats + synthesis). Input evidence:
 `docs/research/package-version-conflicts.md` (external survey), the local
 conflict model (build prefix, farm, manifest), and three live WIP recipes in
 the working tree at session time (`node22.lua`, `toolchain-gcc-gnu-x86_64.lua`,
-`valkey-search.lua`). Companion policy deliverable: ADR-0043 (ticket T1
+`valkey-search.lua`). Companion policy deliverable: ADR-0044 (ticket T1
 below drafts it; nothing here ratifies policy — the ADR does).
 
 ## Question
@@ -76,7 +76,7 @@ T4 ∥ T5 ∥ T7.
 
 | # | Ticket | Scope | Files | Verification gate |
 |---|---|---|---|---|
-| T1 | ADR-0043 + ADR-0015 addendum + glossary | Full policy layer; three-axis story; reject list; vocabulary traps (never "global", never "slot"/"instance"/"variant"/"channel"/"alternative"; "priority" reserved); `@`-sigil note; rekey blast radius | `docs/adr/0043-*.md`, ADR-0015/0018 addenda, `CONTEXT.md` | Doc review; lands first |
+| T1 | ADR-0044 + ADR-0015 addendum + glossary | Full policy layer; three-axis story; reject list; vocabulary traps (never "global", never "slot"/"instance"/"variant"/"channel"/"alternative"; "priority" reserved); `@`-sigil note; rekey blast radius | `docs/adr/0044-*.md`, ADR-0015/0018 addenda, `CONTEXT.md` | Doc review; lands first |
 | T2 | `conflict()` path-class diagnostics | Complete conflicting-path set; per-class remedy; owning payload named | `src/build_prefix.rs` + tests | Unit tests per path class (incl. dir-vs-file, multi-conflict single report); `bash scripts/gate.sh` |
 | T3 | Plan-time preflight | Full conflict set from signed file-hash manifests at dependency resolution, before any build | plan/resolve site | Multi-conflict reported in one pass pre-build; gate |
 | T4 | gcc/binutils ownership de-hack + valkey repair | gcc drops plain-name staging (keeps triplet + drivers); toolchain restores `binutils`; LD-fix → #12 pass / launcher env; repair gcc's baked gxx-include path; retire valkey `-idirafter`; ADR-0018 addendum #2 | `pkgs/g/gcc.lua`, `pkgs/t/toolchain-gcc-gnu-x86_64.lua`, `pkgs/b/binutils.lua` (verify), #12 portability site | Pre-gates: pool binutils standalone-good re #171; triplet names not equally fragile; Debian 2.44-3 pairing check. Gate: toolchain probe build + valkey-search rebuild + `bash scripts/gate.sh` |
@@ -89,7 +89,7 @@ T4 ∥ T5 ∥ T7.
 | # | Risk | Mitigation |
 |---|---|---|
 | R1 | #171 libbfd shim necessity — plain-name LD-fixing shims may be load-bearing | T4 pre-gates; fallbacks: ownership flip (R2) or multi-output split (R7) |
-| R2 | Debian binutils 2.44-3 ↔ gcc pairing load-bearing | Pre-authorized contingency in ADR-0043: flip ownership to the Debian set; human sign-off (open item 1) |
+| R2 | Debian binutils 2.44-3 ↔ gcc pairing load-bearing | Pre-authorized contingency in ADR-0044: flip ownership to the Debian set; human sign-off (open item 1) |
 | R3 | Per-file digest availability — `InstalledPackage.files` is names only | Pick cheaper: staged-tree compare at sync vs manifest extension; pre-#8 manifests degrade to warn |
 | R4 | ADR-0028/0034 amendment review — narrowing a ratified generation-wide export scope | Land as addenda; delta's deferral trigger inverted into the review criterion |
 | R5 | Soname-gate false positives — ABI-compatible same-soname twins (`libgcc_s`) hard-error inside a toolchain closure | Pair T6 with payload ownership assignment for the known twins; exercise in T6 tests |
@@ -101,7 +101,7 @@ T4 ∥ T5 ∥ T7.
 ## Open items only the human can decide
 
 1. **R2 flip authorization** — pre-authorize the Debian-set ownership flip in
-   ADR-0043, or require a return to council if the pairing check fires.
+   ADR-0044, or require a return to council if the pairing check fires.
    (Blocks only T4's contingency branch; T4 can start.)
 2. **Delta's Q3 dissent** — accept the ADR-0034 amendment with the
    inverted-trigger review criterion, or adopt delta's defer-narrowing
