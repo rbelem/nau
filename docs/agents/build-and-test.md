@@ -26,14 +26,39 @@ failures from `gh`/watchers get an immediate retry/re-arm, not dismissal.
 | Lint | `env -u LD_LIBRARY_PATH devbox run -- clippy` | `cargo clippy -- -D warnings` |
 | Format | `env -u LD_LIBRARY_PATH devbox run -- fmt` | `cargo fmt` |
 | Format check | `env -u LD_LIBRARY_PATH devbox run -- fmt-check` | `cargo fmt --check` |
-| Full gate | `env -u LD_LIBRARY_PATH devbox run -- check` | test + clippy + fmt-check |
+| Full gate | `bash scripts/gate.sh` | gcc14-pinned test + clippy + fmt-check |
 | Lint (pod gate) | `shuttle run --pod gate -- cargo clippy -- -D warnings` | pod-side clippy |
 | Format check (pod gate) | `shuttle run --pod gate -- cargo fmt --check` | pod-side rustfmt |
 
-`env -u LD_LIBRARY_PATH devbox run -- check` is the definition of green;
-`clippy` treats warnings as errors. The two pod-gate rows are the ratified
-substitute for the lint axes — same verdicts as the devbox pin (evidence in
-the endgame section below).
+`bash scripts/gate.sh` is the definition of green; `clippy` treats warnings
+as errors. The two pod-gate rows are the ratified substitute for the lint
+axes — same verdicts as the devbox pin (evidence in the endgame section
+below).
+
+### Why the gate script pins gcc14 (2026-09-26 incident)
+
+The host toolchain floats: `nix shell nixpkgs#gcc` resolved gcc 14.x one
+day and gcc 15.x the next (channel eval moved mid-session), and the daily
+pod re-syncs its own gcc shim onto PATH, which `devbox run`'s env hooks
+can resurrect even after a parent-env `CC`/`CXX` pin. `scripts/gate.sh`
+therefore resolves the gcc14 wrapper inside `nix shell nixpkgs#gcc14`,
+exports absolute `CC`/`CXX` paths inside the devbox shell (after the
+hooks), and refuses to run if either does not name gcc-wrapper-14.
+
+Two Luau facts make the pin load-bearing rather than cosmetic:
+
+1. The Luau sources vendored by `luau0-src` 0.12.3 (`Compiler.cpp`) are
+   missing `#include <limits>`; whether that compiles depends on which
+   libstdc++ headers happen to be in the include path.
+2. The pod shellenv's `CPATH` leak (pod include dirs, libstdc++ among
+   them) is load-bearing for the Luau build and is re-injected by devbox
+   hooks regardless of the caller's `-u CPATH`; the script leaves it
+   alone.
+
+The durable fix is the dependency bump (mlua 0.12 / mlua-sys 0.12 /
+luau0-src 0.21, which vendors a Luau with the include fixed) — tracked
+on the luau/mlua bump issue; until it lands, treat `scripts/gate.sh` as
+the only green definition.
 
 ### Devbox-free endgame (target state)
 
