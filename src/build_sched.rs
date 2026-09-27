@@ -1,10 +1,14 @@
-//! Inter-package build scheduling (issue #55, ADR-0022 Decision 3).
+//! Inter-package build scheduling (issue #55, ADR-0022 Decision 3,
+//! executor seam per ADR-0040 Decision 4).
 //!
 //! Builds the READY set of the dependency graph concurrently: a node may
 //! start as soon as its last in-graph dependency completes, up to
-//! [`MAX_PARALLEL_BUILD_WORKERS`] concurrent builds. The graph layer
-//! (`deps.rs`) is untouched — this module consumes the same node/edge
-//! shape Kahn's algorithm orders and adds wake-on-completion scheduling.
+//! [`pool_budget`] concurrent builds — the coordinator's own slots plus
+//! every declared worker's job allowance (with no `workers` table, that
+//! is [`MAX_PARALLEL_BUILD_WORKERS`], today's fixed three). The graph
+//! layer (`deps.rs`) is untouched — this module consumes the same
+//! node/edge shape Kahn's algorithm orders and adds wake-on-completion
+//! scheduling.
 //!
 //! Concurrency model: a fixed pool of worker threads over a shared
 //! ready-queue guarded by one Mutex + Condvar. A worker pops a ready node,
@@ -27,12 +31,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Condvar, Mutex};
 
-/// Maximum number of concurrent inter-package builds (issue #55).
+/// The coordinator's default build-slot count (issue #55), also the
+/// default of the `workers.local_jobs` config key (ADR-0040 Decision 3):
+/// the pool is config-driven now, and this constant is only the value
+/// an absent `workers` table falls back to.
 ///
 /// Deliberately a fixed constant, not `nproc`: every worker runs a full
 /// toolchain invocation (compiler + mksquashfs), so RAM and I/O multiply
-/// with concurrency. 3 saturates the ready sets of the current package
-/// graph without exhausting a 15 GB build box.
+/// with concurrency (the ADR-0022 sizing caveat — this bound exists so a
+/// 15 GB build box is not exhausted). 3 saturates the ready sets of the
+/// current package graph; raising it via `local_jobs`/`jobs` multiplies
+/// RAM and I/O the same way, so size the pool to the box.
 pub const MAX_PARALLEL_BUILD_WORKERS: usize = 3;
 
 /// Why a scheduled run stopped short of building every node.
@@ -46,7 +55,88 @@ pub struct FailedBuilds {
     pub skipped: Vec<String>,
 }
 
-/// Run `job` over the dependency graph once its ready, in parallel.
+/// Where a scheduled job runs (ADR-0040 Decision 4). The scheduler owns
+/// ready-set ordering and stop-the-world; an executor only answers "run
+/// this node's build job" — T2 ships the local implementation, the SSH
+/// executor arrives with the transport work.
+pub trait BuildExecutor {
+    /// Run one build job for node `name`, blocking until it finishes.
+    /// `Err` fails the run and trips stop-the-world, exactly as the
+    /// pre-seam job closure did.
+    fn run(&self, name: &str) -> Result<(), String>;
+
+    /// Best-effort abandon of in-flight work, called once when the
+    /// scheduler trips stop-the-world. The local pool never kills jobs —
+    /// a mid-build kill would orphan bwrap children — running builds
+    /// finish inside their own containment, so [`LocalExecutor`] treats
+    /// this as a documented no-op.
+    fn cancel(&self);
+}
+
+/// The local executor: today's in-process path. Jobs run on the
+/// scheduler's scoped worker threads through the caller's job closure —
+/// a behavior-preserving wrap of the pre-seam scheduler, not a rewrite.
+pub struct LocalExecutor<F> {
+    job: F,
+}
+
+impl<F> LocalExecutor<F>
+where
+    F: Fn(&str) -> Result<(), String>,
+{
+    /// Wrap the per-package build job that runs on the worker threads.
+    pub fn new(job: F) -> Self {
+        LocalExecutor { job }
+    }
+}
+
+impl<F> BuildExecutor for LocalExecutor<F>
+where
+    F: Fn(&str) -> Result<(), String>,
+{
+    fn run(&self, name: &str) -> Result<(), String> {
+        (self.job)(name)
+    }
+
+    fn cancel(&self) {
+        // Deliberate no-op: no NEW job is dispatched after stop-the-world
+        // and in-flight local jobs must finish their containment (see the
+        // module docs) — killing them mid-build would orphan bwrap
+        // children.
+    }
+}
+
+/// The pool budget (ADR-0040 Decision 4): the coordinator's own slots
+/// plus the sum of every declared worker's job allowance. An absent or
+/// empty `workers` table yields today's fixed parallelism — the default
+/// `local_jobs` and no workers.
+pub fn pool_budget(workers: &crate::lua::WorkersConfig) -> usize {
+    workers.local_jobs as usize
+        + workers
+            .workers
+            .iter()
+            .map(|w| w.jobs as usize)
+            .sum::<usize>()
+}
+
+/// Run `job` over the dependency graph once its ready, in parallel,
+/// through the local executor — the pre-seam entry point, preserved for
+/// callers that just want today's behavior.
+///
+/// See [`run_ready_set_with_executor`] for the shape this delegates to.
+pub fn run_ready_set<F>(
+    graph: &BTreeMap<String, Vec<String>>,
+    pre_done: &HashSet<String>,
+    max_workers: usize,
+    job: F,
+) -> Result<(), FailedBuilds>
+where
+    F: Fn(&str) -> Result<(), String> + Sync,
+{
+    run_ready_set_with_executor(graph, pre_done, max_workers, &LocalExecutor::new(job))
+}
+
+/// Schedule the graph through `executor` (ADR-0040 Decision 4).
 ///
 /// `graph` maps node name → declared dependency names. Edges to names not
 /// in the graph (external/leaf deps, aliases that resolve outside the
@@ -57,16 +147,17 @@ pub struct FailedBuilds {
 /// immediately releasing their dependents.
 ///
 /// `max_workers` bounds concurrency (clamped to at least 1); jobs run on
-/// scoped worker threads, so `F` must be `Sync` and may borrow the caller's
-/// build context.
-pub fn run_ready_set<F>(
+/// scoped worker threads calling `executor.run`, so `E` must be `Sync`.
+/// Ready-set ordering, stop-the-world, and the `FailedBuilds` outcome are
+/// identical to the pre-seam scheduler: only where a job executes changed.
+pub fn run_ready_set_with_executor<E>(
     graph: &BTreeMap<String, Vec<String>>,
     pre_done: &HashSet<String>,
     max_workers: usize,
-    job: F,
+    executor: &E,
 ) -> Result<(), FailedBuilds>
 where
-    F: Fn(&str) -> Result<(), String> + Sync,
+    E: BuildExecutor + Sync,
 {
     let names: Vec<String> = graph.keys().cloned().collect();
     let index: HashMap<&str, usize> = names
@@ -149,7 +240,7 @@ where
                     }
                 };
                 let Some(i) = next else { break };
-                let outcome = job(&names[i]);
+                let outcome = executor.run(&names[i]);
                 let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                 s.running -= 1;
                 match outcome {
@@ -157,6 +248,10 @@ where
                     Err(err) => {
                         s.stop = true;
                         s.failures.push((i, err));
+                        // Stop-the-world: the executor may abandon what it
+                        // can (a no-op for the local pool). No NEW job is
+                        // dispatched either way.
+                        executor.cancel();
                     }
                 }
                 cv.notify_all();

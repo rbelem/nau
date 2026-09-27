@@ -437,6 +437,7 @@ fn cmd_build(
                     cache_max_size,
                     target,
                     json,
+                    eval.workers,
                 );
             }
             Err(e) => {
@@ -473,6 +474,10 @@ fn cmd_build(
         cache_max_size,
         target,
         json,
+        // The fallback path re-evaluated into plain Outputs — the workers
+        // surface was never part of it, so the inert default applies
+        // (zero behavior change, ADR-0040 Decision 3).
+        shuttle::lua::WorkersConfig::default(),
     )
 }
 
@@ -679,6 +684,7 @@ fn run_build(
     cache_max_size: Option<String>,
     target: Option<String>,
     json: bool,
+    workers: shuttle::lua::WorkersConfig,
 ) -> miette::Result<()> {
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
@@ -712,6 +718,7 @@ fn run_build(
             output_dir,
             &lockfile,
             json,
+            &workers,
         )?;
     }
 
@@ -999,6 +1006,9 @@ struct DepJobCtx<'a> {
     json: bool,
     total: usize,
     dispatch: &'a AtomicUsize,
+    /// Executor name stamped into the scheduler prefixes (ADR-0040
+    /// Decision 4): `local` until the SSH executor integrates.
+    executor: &'a str,
 }
 
 impl DepJobCtx<'_> {
@@ -1010,7 +1020,12 @@ impl DepJobCtx<'_> {
         let dep_closure = self.closures[name].as_ref();
         let slot = self.dispatch.fetch_add(1, Ordering::SeqCst) + 1;
         if !self.json {
-            eprintln!("▶ [{slot}/{}] {name} ({})", self.total, archs.join(", "));
+            eprintln!(
+                "▶ [{} {slot}/{}] {name} ({})",
+                self.executor,
+                self.total,
+                archs.join(", ")
+            );
         }
         match build_dep_archs(
             name,
@@ -1025,7 +1040,7 @@ impl DepJobCtx<'_> {
         ) {
             Ok(()) => {
                 if !self.json {
-                    eprintln!("✓ [{slot}/{}] {name}", self.total);
+                    eprintln!("✓ [{} {slot}/{}] {name}", self.executor, self.total);
                 }
                 Ok(())
             }
@@ -1110,10 +1125,12 @@ fn cached_dep_names(
 ///
 /// Parallel across packages (issue #55, ADR-0022 Decision 3): the graph
 /// from `deps.rs` is scheduled by [`shuttle::build_sched`] — every READY
-/// node builds concurrently up to
-/// [`shuttle::build_sched::MAX_PARALLEL_BUILD_WORKERS`], and dependents
-/// wake as their last dependency completes. Build isolation is unchanged:
-/// each package still builds in its own tempdir stage inside its own bwrap
+/// node builds concurrently up to the pool budget,
+/// [`shuttle::build_sched::pool_budget`] of the `workers` config
+/// (ADR-0040 Decision 4; no `workers` table = the fixed three), and
+/// dependents wake as their last dependency completes. Jobs dispatch
+/// through the local executor seam. Build isolation is unchanged: each
+/// package still builds in its own tempdir stage inside its own bwrap
 /// sandbox (`env_clear` + explicit PATH, ADR-0004) with its own leak scan.
 /// The Lua-eval isolate worker (issue #76 stderr cap + wall deadline) is
 /// never run concurrently — metas and closures are resolved below, on the
@@ -1131,6 +1148,7 @@ fn build_all_deps(
     output_dir: &Path,
     lockfile: &LockFile,
     json: bool,
+    workers: &shuttle::lua::WorkersConfig,
 ) -> miette::Result<()> {
     if dep_nodes.is_empty() {
         return Ok(());
@@ -1163,10 +1181,11 @@ fn build_all_deps(
     if to_build == 0 {
         return Ok(());
     }
+    let max_workers = shuttle::build_sched::pool_budget(workers);
     if !json {
         eprintln!(
             "── Building {to_build} dependencies (up to {} in parallel) ──",
-            shuttle::build_sched::MAX_PARALLEL_BUILD_WORKERS.min(to_build),
+            max_workers.min(to_build),
         );
     }
 
@@ -1189,12 +1208,14 @@ fn build_all_deps(
         json,
         total: to_build,
         dispatch: &dispatch,
+        executor: "local",
     };
-    let scheduled = shuttle::build_sched::run_ready_set(
+    let executor = shuttle::build_sched::LocalExecutor::new(|name| ctx.run(name));
+    let scheduled = shuttle::build_sched::run_ready_set_with_executor(
         &graph,
         &pre_done,
-        shuttle::build_sched::MAX_PARALLEL_BUILD_WORKERS,
-        |name| ctx.run(name),
+        max_workers,
+        &executor,
     );
     shuttle::snap::set_buffer_child_stderr(false);
     shuttle::output::set_quiet_build(false);

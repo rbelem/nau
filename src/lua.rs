@@ -275,7 +275,10 @@ impl WorkersConfig {
         // Entries arrive with their 1-based declaration index as the key
         // (integer or string digit — Luau hash iteration order is
         // otherwise not stable), so collect and sort to restore the
-        // declared order before the duplicate check.
+        // declared order. The density check below turns sparse or
+        // mixed numbering into a named refusal instead of the silent
+        // renumber a plain sort would imply (pre-wiring for #191, where
+        // workers are addressed by their declared index).
         let mut entries: Vec<(usize, WorkerConfig)> = Vec::new();
         for pair in table.pairs::<mlua::Value, mlua::Value>() {
             let (key, val) = pair.map_err(|e| miette::miette!("workers entry: {e}"))?;
@@ -323,6 +326,17 @@ impl WorkersConfig {
             }
         }
         entries.sort_by_key(|(idx, _)| *idx);
+        // Dense 1..n only: after sorting, position i must carry index
+        // i+1. A gap (sparse, `{ [1]=w, [3]=w }`) or any mismatch names
+        // the offending index instead of silently renumbering.
+        for (pos, (idx, _)) in entries.iter().enumerate() {
+            let expected = pos + 1;
+            if *idx != expected {
+                return Err(miette::miette!(
+                    "workers[{idx}]: array indices must be dense 1..n, expected index {expected} here"
+                ));
+            }
+        }
         for (idx, worker) in entries {
             if cfg.workers.iter().any(|w| w.address == worker.address) {
                 return Err(miette::miette!(
