@@ -7518,6 +7518,9 @@ pod {
 
     #[test]
     fn test_render_shellenv_is_eval_safe_under_nounset() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let env = PodShellenv {
             pod: "default".into(),
             farm: "/root/default/current".into(),
@@ -7998,6 +8001,9 @@ pod {
 
     #[test]
     fn test_render_shellenv_exports_declared_vars_eval_safe() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut vars = BTreeMap::new();
         vars.insert("EDITOR".to_string(), "vi".to_string());
         vars.insert(
@@ -8125,6 +8131,9 @@ pod {
 
     #[test]
     fn test_shellenv_exports_secret_values_after_env_sorted_and_eval_safe() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (tmp, counter, cache, hash) = test_shellenv_secrets_fixture();
         // Declared env alongside, to pin the ordering rule.
         let dir = pod_dir(tmp.path(), "default");
