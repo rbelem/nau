@@ -113,5 +113,5 @@ path); release media naming enters the mission checklist.
   mission naming), ADR-0023 (state partition), ADR-0024 (A/B updates and key
   ceremony), ADR-0032 D5 (documented destructive steps), ADR-0033 D10 (export
   tree), ADR-0040 D7 (worker fabrication hazard).
-- Issues: first-boot state growth, `shuttle verify-image`,
-  `shuttle image --release` (filed 2026-09-27), ratification ticket.
+- Issues: #264 (first-boot state growth), #265 (`shuttle verify-image`),
+  #266 (`shuttle image --release`), #261 (ratification ticket).
