@@ -322,6 +322,10 @@ fn main() -> miette::Result<()> {
         Command::EvalWorker => shuttle::isolate::worker_main(),
 
         Command::CheckWorker => shuttle::isolate::check_worker_main(),
+
+        Command::WorkerCap => shuttle::worker::cap_main(),
+
+        Command::WorkerJob { job_file } => shuttle::worker::job_main(&job_file),
     }
 }
 
