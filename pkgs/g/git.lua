@@ -105,17 +105,40 @@ return {
             -- generation's extension tree (usr/usr doubling is
             -- load-bearing, §5.7). The LD_LIBRARY_PATH half of the shim
             -- story is the farm emit's per-app LD wrapper (ADR-0034).
-            -- SSL_CERT_FILE: libcurl's ./configure CA probe runs in the
-            -- sandbox, where /etc is not bind-mounted, so the baked
-            -- bundle path is empty and https verification fails
-            -- ("unable to get local issuer certificate"). Trust anchors
-            -- are host policy — system trust wins, the ADR-0030 locale
-            -- precedent — so the wrapper points git at the host CA
-            -- bundle via GIT_SSL_CAINFO (git sets CURLOPT_CAINFO from
-            -- it explicitly; SSL_CERT_FILE alone is masked by
-            -- libcurl's baked-empty default).
+            -- GIT_SSL_CAINFO: the pod libcurl bakes the host CA dir
+            -- (--openssldir=/etc/ssl) and carries no bundle — the same
+            -- defect class as the curl wrapper's #130 fix — and this
+            -- wrapper resolved
+            -- only HOST paths, which do not exist in a pod (the FHS
+            -- roots carry no /etc; the #176 /etc/ssl/certs bind is
+            -- build-sandbox-only), so https died while the bundle sat
+            -- in the pod's ca-certificates extension (transitive via
+            -- curl's requires — curl.lua:21; load-bearing, do not
+            -- drop it from curl). Resolve it the same
+            -- staged-bundle-first chain #130 gave curl, adapted to
+            -- git's install sites: the staged bundle (merged build
+            -- prefix / root-mounted tree), then the pod store-blob
+            -- layout (the farm links wrapper-managed commands straight
+            -- at their store blob; two dirnames reach the pod root, the
+            -- #10/#13 PODROOT derivation, and the bundle rides the
+            -- active generation's ca-certificates extension tree), then
+            -- the farm assembly leaf where git's command actually runs
+            -- in a pod (usr/bin/git.bin makes it a plain sibling
+            -- assembly, not wrapper-managed, so four dirnames up is its
+            -- own generation — the same-generation ca-certificates
+            -- extension, the #210 no-active-race principle), and
+            -- finally the host pair (trust anchors are host policy —
+            -- system trust wins, the ADR-0030 locale precedent). The
+            -- wrapper points git at the bundle via GIT_SSL_CAINFO (git
+            -- sets CURLOPT_CAINFO from it explicitly; SSL_CERT_FILE
+            -- alone is masked by libcurl's baked default), and like the
+            -- curl wrapper the env var only supplies defaults — an
+            -- ambient GIT_SSL_CAINFO (caller's own trust choice) is
+            -- never clobbered, and when no candidate exists it stays
+            -- unset rather than pinning a nonexistent path (libcurl
+            -- then fails on its baked default, no worse than today).
             "mv $STAGE/usr/bin/git $STAGE/usr/bin/git.bin",
-            "printf '%s\\n' '#!/bin/sh' 'd=$(dirname \"$(readlink -f \"$0\")\")' 'e=$d/../libexec/git-core' 'if test ! -d \"$e\"' 'then e=$d/../../../../extensions/git/usr/usr/libexec/git-core' 'fi' 't=$d/../share/git-core/templates' 'if test ! -d \"$t\"' 'then t=$d/../../../../extensions/git/usr/usr/share/git-core/templates' 'fi' 'c=/etc/ssl/certs/ca-certificates.crt' 'if test ! -f \"$c\"' 'then c=/etc/pki/tls/certs/ca-bundle.crt' 'fi' 'GIT_EXEC_PATH=$e GIT_TEMPLATE_DIR=$t GIT_SSL_CAINFO=$c exec \"$d/git.bin\" \"$@\"' > $STAGE/usr/bin/git",
+            "printf '%s\\n' '#!/bin/sh' 'd=$(dirname \"$(readlink -f \"$0\")\")' 'p=$(dirname \"$(dirname \"$d\")\")' 'e=$d/../libexec/git-core' 'if test ! -d \"$e\"' 'then e=$d/../../../../extensions/git/usr/usr/libexec/git-core' 'fi' 't=$d/../share/git-core/templates' 'if test ! -d \"$t\"' 'then t=$d/../../../../extensions/git/usr/usr/share/git-core/templates' 'fi' 'c=$d/../../etc/ssl/certs/ca-certificates.crt' 'if test ! -f \"$c\"' 'then c=$p/active/extensions/ca-certificates/usr/etc/ssl/certs/ca-certificates.crt' 'fi' 'if test ! -f \"$c\"' 'then c=$d/../../../../extensions/ca-certificates/usr/etc/ssl/certs/ca-certificates.crt' 'fi' 'if test ! -f \"$c\"' 'then c=/etc/ssl/certs/ca-certificates.crt' 'fi' 'if test ! -f \"$c\"' 'then c=/etc/pki/tls/certs/ca-bundle.crt' 'fi' 'if test -f \"$c\" && test -z \"$GIT_SSL_CAINFO\"' 'then GIT_SSL_CAINFO=$c' 'export GIT_SSL_CAINFO' 'fi' 'GIT_EXEC_PATH=$e GIT_TEMPLATE_DIR=$t exec \"$d/git.bin\" \"$@\"' > $STAGE/usr/bin/git",
             "chmod +x $STAGE/usr/bin/git",
         }, " && "),
 
