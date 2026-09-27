@@ -110,5 +110,5 @@ becomes operator ceremony alongside ADR-0024's signing key ceremony.
   D7 fabrication hazard, Revisit triggers), ADR-0024 (key ceremony), ADR-0033
   D7 (out-of-band anchors, no TOFU), ADR-0044 (adjacent install-path trust
   posture).
-- Issues: ratification ticket (un-park gate), #194 re-scope, #195-#198 stay
-  parked behind #194.
+- Issues: #262 (ratification ticket, the un-park gate), #194 re-scope,
+  #195-#198 stay parked behind #194.

@@ -52,19 +52,19 @@ was verified against the repo and GitHub on 2026-09-27.
 
 ## Tickets filed this pass
 
-- Ratify ADR-0044 (install path) — ready-for-human.
-- Ratify ADR-0045 (host-key provenance; un-parks #194) — ready-for-human.
-- os-release violates the ADR-0013 identity matrix (ID=shuttle in
+- #261 Ratify ADR-0044 (install path) — ready-for-human.
+- #262 Ratify ADR-0045 (host-key provenance; un-parks #194) — ready-for-human.
+- #263 os-release violates the ADR-0013 identity matrix (ID=shuttle in
   boot.rs) — ready-for-agent, small, blocking for any release.
-- First-boot state-partition growth (systemd-repart) — ready-for-agent.
-- shuttle verify-image — ready-for-agent, gated on ADR-0044.
-- shuttle image --release (deterministic mission media + SHA256SUMS +
+- #264 First-boot state-partition growth (systemd-repart) — ready-for-agent.
+- #265 shuttle verify-image — ready-for-agent, gated on ADR-0044.
+- #266 shuttle image --release (deterministic mission media + SHA256SUMS +
   signed manifest + rebuild-compare ritual) — ready-for-agent, gated on
   ADR-0044.
-- Sysupdate Verify=no signature gap + ADR-0024 key-ceremony CLI —
+- #267 Sysupdate Verify=no signature gap + ADR-0024 key-ceremony CLI —
   needs-triage (the "headline security story" gap; blocking-for-1.0 is the
   operator's call; council recommends closing it).
-- ADR-0040 amendment: split D4 failure classes (worker loss re-dispatches;
+- #268 ADR-0040 amendment: split D4 failure classes (worker loss re-dispatches;
   stop-the-world only when no executor remains) — needs-triage; blocks T5
   design.
 
