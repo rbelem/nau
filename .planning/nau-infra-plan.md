@@ -1,5 +1,12 @@
 # Nau infra plan: the distro-facing domain structure (nau.rclb.dev)
 
+> **HOSTING UPDATE, 2026-09-27 (operator):** the zet VPS was deleted; Nau
+> itself will be deployed in its place, and the lanes below are expected
+> to be served BY that Nau deployment (dogfood: the distro hosts its own
+> distribution surface as pod services). Target hardware, install method,
+> and the lane service stack are the open decisions — see the grill
+> session round of 2026-09-27 evening.
+
 Date: 2026-09-27. Companion to `.planning/server-infra-plan.md` (the
 operator-facing build infra) and ADR-0044 (what mission images must carry).
 This plan defines the PARALLEL, distro-facing surface: the domains Nau users

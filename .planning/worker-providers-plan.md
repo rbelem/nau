@@ -21,7 +21,7 @@ monthly price, ideal for TTL-destroyed workers):
 |---|---|---|---|---|---|
 | build-light | CX23 | 2/4/40 | 0.0088 | 5.49 | single-package bursts |
 | build-default | CX33 | 4/8/80 | 0.0136 | 8.49 | daily loop, index runs |
-| build-aarch64 | CAX11 / CAX21 | 2/4/40, 4/8/80 | 0.0096 / 0.0168 | 5.99 / 10.49 | arm64 targets |
+| ~~build-aarch64~~ | CAX11 / CAX21 | 2/4/40, 4/8/80 | 0.0096 / 0.0168 | 5.99 / 10.49 | **deferred** — operator decision 2026-09-27: the pool builds x86_64 only; other architectures come later (the CAX rows stay as the priced reference for that day) |
 
 Notes: IPv4 is a separately billed resource now (unit price unverified —
 community ≈ €0.30/mo); 20TB traffic included; locations fsn1/nbg1/hel1 —
