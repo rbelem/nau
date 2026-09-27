@@ -171,15 +171,38 @@ function snap(opts)
             error("snap(): 'type' must be one of: source, meta, store, app, base, gadget, kernel, snapd", 2)
         end
     end
-    -- compression: only what both snapd-era tooling and mksquashfs accept
+    -- compression: only what both snapd-era tooling and mksquashfs accept.
+    -- zstd is the default when absent (ticket #154, ADR-0038); gzip dropped —
+    -- the evidence table shows it strictly dominated by zstd.
     if opts.compression ~= nil then
-        local valid_compressions = { "xz", "lzo" }
+        local valid_compressions = { "zstd", "xz", "lzo" }
         local found = false
         for _, c in ipairs(valid_compressions) do
             if opts.compression == c then found = true; break end
         end
         if not found then
-            error("snap(): 'compression' must be one of: xz, lzo", 2)
+            error("snap(): 'compression' must be one of: zstd, xz, lzo", 2)
+        end
+    end
+    -- compression_level (ticket #154): optional integer knob for zstd (1-22)
+    -- and lzo (1-9). Rejected for xz: mksquashfs' xz wrapper does not
+    -- implement -Xcompression-level, so a level there would silently no-op.
+    if opts.compression_level ~= nil then
+        if type(opts.compression_level) ~= "number" or opts.compression_level % 1 ~= 0 then
+            error("snap(): 'compression_level' must be an integer, got " ..
+                type(opts.compression_level), 2)
+        end
+        local comp = opts.compression or "zstd" -- zstd is the absent default
+        local level_limits = { zstd = { 1, 22 }, lzo = { 1, 9 } }
+        local limits = level_limits[comp]
+        if limits == nil then
+            error("snap(): 'compression_level' is not supported with compression = \"xz\" — " ..
+                "mksquashfs' xz wrapper does not implement -Xcompression-level", 2)
+        end
+        if opts.compression_level < limits[1] or opts.compression_level > limits[2] then
+            error(string.format(
+                "snap(): 'compression_level' must be between %d and %d for compression = \"%s\", got %d",
+                limits[1], limits[2], comp, opts.compression_level), 2)
         end
     end
     for _, field in ipairs(string_fields) do
