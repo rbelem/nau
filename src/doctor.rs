@@ -169,12 +169,14 @@ const POD_ENV_TOOLS: [&str; 2] = ["cc", "c++"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     /// Default: the pod surface plus the image-verb surface (ukify,
-    /// the sd-stub, veritysetup, systemd-sysupdate, the mksquashfs
-    /// SOURCE_DATE_EPOCH gate).
+    /// the sd-stub, veritysetup, systemd-sysupdate). The mksquashfs
+    /// version gate runs in both scopes (#155) — pod builds pay the
+    /// pack cost too.
     Full,
-    /// `--pod`: only what the pod verbs need — the pod tools plus the
-    /// build toolchain. A healthy pod-only machine passes even with no
-    /// image tools installed.
+    /// `--pod`: what the pod verbs need — the pod tools, the build
+    /// toolchain, and the mksquashfs version gate (#155: pod builds
+    /// pay the pack cost). A healthy pod-only machine passes even with
+    /// no image tools installed.
     Pod,
 }
 
@@ -191,13 +193,14 @@ pub fn run_all() -> Vec<Check> {
 }
 
 /// Run the pod-verb checks (`shuttle doctor --pod`, issue #97): the pod
-/// tools (mksquashfs/unsquashfs, bwrap, curl, tar) plus the sandbox
-/// build toolchain (sh, make, cc, c++). Image-verb checks are skipped —
-/// the installer's verify step gates on this scope, so a machine with
-/// the pod set but no image tools reads as ready. The cc/c++ checks
-/// also credit toolchains reachable through the farm-first pod env of
-/// any healthy pod (issue #178) — readiness as `shuttle run --pod`
-/// would see it.
+/// tools (mksquashfs/unsquashfs, bwrap, curl, tar), the sandbox build
+/// toolchain (sh, make, cc, c++), and — since #155 — the mksquashfs
+/// version gate, because pod builds pay the pack cost. The remaining
+/// image-verb checks are skipped — the installer's verify step gates on
+/// this scope, so a machine with the pod set but no image tools reads as
+/// ready. The cc/c++ checks also credit toolchains reachable through the
+/// farm-first pod env of any healthy pod (issue #178) — readiness as
+/// `shuttle run --pod` would see it.
 pub fn run_pod() -> Vec<Check> {
     run_scoped(Scope::Pod)
 }
@@ -210,9 +213,11 @@ fn run_scoped(scope: Scope) -> Vec<Check> {
         .map(check_floor_tool)
         .collect();
     checks.extend(probe_checks());
+    // The mksquashfs version gate runs in BOTH scopes (#155): pod builds
+    // pay the pack cost too (mksquashfs is a pod-surface floor tool).
+    checks.push(check_squashfs_version());
     if scope == Scope::Full {
         checks.extend([
-            check_squashfs_version(),
             check_ukify(),
             check_efi_stub(),
             check_veritysetup(),
@@ -1129,8 +1134,12 @@ pub fn initrd_modules_check(kernel_version: &str, outcome: &InitrdModuleAudit) -
 
 // ── Host tooling checks ──
 
-/// Check that mksquashfs supports SOURCE_DATE_EPOCH (4.4+). The version
-/// gate is a tolerant parse of the leading `<major>.<minor>` (#101 AC-8:
+/// Check mksquashfs: SOURCE_DATE_EPOCH support (4.4+, #101) and the
+/// #155 pack-performance advice. The detected `mksquashfs -version`
+/// triple is printed on every parsed report line; anything below
+/// [`SQUASHFS_PERF_MIN`] (4.7 parallelized reads) carries the upgrade
+/// hint on its existing status — the advice is advisory and never fails
+/// a command. The version gate is a tolerant triple parse (#101 AC-8:
 /// the closed 4.4/4.5/4.6 allowlist rejected the provisioner's 4.7.x
 /// builds and labelled shuttle's own provisioned tool "untested").
 fn check_squashfs_version() -> Check {
@@ -1155,17 +1164,23 @@ fn check_squashfs_version_with(
             match spec_version.and_then(parse_squashfs_version) {
                 Some(v) if v >= SQUASHFS_SDE_MIN => Check::ok_at(
                     name,
-                    format!(
-                        "provisioned {} (tools v{set}) — pinned by the verified manifest",
-                        spec_version.unwrap_or_default(),
+                    with_upgrade_advice(
+                        format!(
+                            "provisioned {} (tools v{set}) — pinned by the verified manifest",
+                            spec_version.unwrap_or_default(),
+                        ),
+                        v,
                     ),
                 ),
                 Some(v) => Check::error(
                     name,
-                    format!(
-                        "the manifest pins squashfs-tools {}, which predates \
-                         SOURCE_DATE_EPOCH support (needs >= 4.4)",
-                        version_string(v)
+                    with_upgrade_advice(
+                        format!(
+                            "the manifest pins squashfs-tools {}, which predates \
+                             SOURCE_DATE_EPOCH support (needs >= 4.4)",
+                            version_string(v)
+                        ),
+                        v,
                     ),
                 ),
                 None => Check::ok_at(
@@ -1180,14 +1195,17 @@ fn check_squashfs_version_with(
         Ok(ResolvedTool::Path { path, .. }) => match mksquashfs_version(&path) {
             Some(v) if v >= SQUASHFS_SDE_MIN => Check::ok_at(
                 name,
-                format!("PATH {} {}", path.display(), version_string(v)),
+                with_upgrade_advice(format!("PATH {} {}", path.display(), version_string(v)), v),
             ),
             Some(v) => Check::error(
                 name,
-                format!(
-                    "PATH {} {} predates SOURCE_DATE_EPOCH support (needs >= 4.4)",
-                    path.display(),
-                    version_string(v)
+                with_upgrade_advice(
+                    format!(
+                        "PATH {} {} predates SOURCE_DATE_EPOCH support (needs >= 4.4)",
+                        path.display(),
+                        version_string(v)
+                    ),
+                    v,
                 ),
             ),
             None => Check::ok_at(
@@ -1202,17 +1220,39 @@ fn check_squashfs_version_with(
     }
 }
 
-/// The minimum (major, minor) with SOURCE_DATE_EPOCH support.
-const SQUASHFS_SDE_MIN: (u32, u32) = (4, 4);
+/// The minimum (major, minor, patch) with SOURCE_DATE_EPOCH support.
+const SQUASHFS_SDE_MIN: (u32, u32, u32) = (4, 4, 0);
 
-/// Render a parsed (major, minor) pair for report lines.
-fn version_string(v: (u32, u32)) -> String {
-    format!("{}.{}", v.0, v.1)
+/// The (major, minor, patch) that parallelized reads landed in
+/// (squashfs-tools 4.7, June 2025) — packs on older tools leave real
+/// build time on the table (issue #155: 20% to >10x on I/O-bound packs).
+const SQUASHFS_PERF_MIN: (u32, u32, u32) = (4, 7, 0);
+
+/// The #155 upgrade advice appended to a report line whose detected
+/// version predates [`SQUASHFS_PERF_MIN`]. Advisory only: it changes
+/// hint text, never a status — the check must not fail a command on it.
+const SQUASHFS_UPGRADE_HINT: &str = "upgrade squashfs-tools to >= 4.7 for faster builds \
+     (4.7 parallelized reads — worth 20% to >10x on I/O-bound packs; \
+     `shuttle doctor --fix` provisions a pinned 4.7.x)";
+
+/// Append [`SQUASHFS_UPGRADE_HINT`] to a report line whose detected
+/// version is below [`SQUASHFS_PERF_MIN`].
+fn with_upgrade_advice(hint: String, v: (u32, u32, u32)) -> String {
+    if v < SQUASHFS_PERF_MIN {
+        format!("{hint}; {SQUASHFS_UPGRADE_HINT}")
+    } else {
+        hint
+    }
+}
+
+/// Render a parsed (major, minor, patch) triple for report lines.
+fn version_string(v: (u32, u32, u32)) -> String {
+    format!("{}.{}.{}", v.0, v.1, v.2)
 }
 
 /// Run `-version` on a resolved mksquashfs and parse the leading
-/// `<major>.<minor>` pair.
-fn mksquashfs_version(path: &Path) -> Option<(u32, u32)> {
+/// `<major>.<minor>[.<patch>]` triple.
+fn mksquashfs_version(path: &Path) -> Option<(u32, u32, u32)> {
     let out = std::process::Command::new(path)
         .arg("-version")
         .output()
@@ -1223,16 +1263,34 @@ fn mksquashfs_version(path: &Path) -> Option<(u32, u32)> {
     parse_squashfs_version(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Parse the first `<major>.<minor>` token of the version output's first
-/// line ("mksquashfs version 4.7.5 (…)" → (4, 7)).
-fn parse_squashfs_version(text: &str) -> Option<(u32, u32)> {
+/// Parse the first `<major>.<minor>[.<patch>]` token of the version
+/// output's first line ("mksquashfs version 4.7.5 (…)" → (4, 7, 5)).
+/// Defensive about pre/suffix forms: each component contributes only its
+/// leading digits ("4.7.5-pre" → 5), and a missing or non-numeric patch
+/// reads as 0 ("4.4" → (4, 4, 0), "4.9.x" → (4, 9, 0)). A token with
+/// fewer than two numeric components is skipped. Never panics: no
+/// numeric pair in the first line → `None` (reported as unknown).
+fn parse_squashfs_version(text: &str) -> Option<(u32, u32, u32)> {
     let first = text.lines().next()?;
     first.split_whitespace().find_map(|token| {
         let mut parts = token.split('.');
-        let major = parts.next()?.parse::<u32>().ok()?;
-        let minor = parts.next()?.parse::<u32>().ok()?;
-        Some((major, minor))
+        let major = leading_u32(parts.next()?)?;
+        let minor = leading_u32(parts.next()?)?;
+        let patch = parts.next().and_then(leading_u32).unwrap_or(0);
+        Some((major, minor, patch))
     })
+}
+
+/// The leading ASCII digits of `s` as a `u32` (the
+/// [`parse_systemd_major`] pattern) — an empty or non-digit leading run
+/// is `None`.
+fn leading_u32(s: &str) -> Option<u32> {
+    let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 // ── Functional probes (issue #101 AC-2) ──
@@ -2882,10 +2940,12 @@ CONFIG_EXT4_FS=y
 
     // ── Pod scope (#97) ──
 
-    /// Every check name the pod scope may produce: the pod surface tools
-    /// plus the sandbox build toolchain (`sandbox:`-prefixed).
-    const POD_SCOPE_NAMES: [&str; 9] = [
+    /// Every check name the pod scope may produce: the pod surface tools,
+    /// the mksquashfs version gate (#155 — pod builds pay the pack cost),
+    /// and the sandbox build toolchain (`sandbox:`-prefixed).
+    const POD_SCOPE_NAMES: [&str; 10] = [
         "mksquashfs",
+        "mksquashfs >= 4.4 (SOURCE_DATE_EPOCH)",
         "unsquashfs",
         "bwrap",
         "curl",
@@ -2919,16 +2979,18 @@ CONFIG_EXT4_FS=y
                 "image check {name} must not run in pod scope"
             );
         }
+        // #155 flipped the old exclusion: the mksquashfs version gate now
+        // gates pod scope too (pod builds pay the pack cost).
         assert!(
-            !pod.iter().any(|c| c.name.contains("SOURCE_DATE_EPOCH")),
-            "the mksquashfs SOURCE_DATE_EPOCH gate is image-verb — not in pod scope"
+            pod.iter().any(|c| c.name.contains("SOURCE_DATE_EPOCH")),
+            "the mksquashfs version gate must run in pod scope (#155)"
         );
     }
 
     #[test]
     fn full_scope_keeps_pod_surface_plus_image_checks() {
         // The default scope must still gate everything the pod scope does
-        // PLUS exactly the five image-verb checks — no behavior change.
+        // PLUS exactly the four image-verb checks — no behavior change.
         // (Only the pod-surface checks must appear in full; the toolchain
         // lists differ by design — pod adds the c++ driver, full keeps
         // sh/make/cc.) The env lock keeps concurrent probe/env tests from
@@ -2954,8 +3016,10 @@ CONFIG_EXT4_FS=y
             "full scope toolchain must stay sh/make/cc"
         );
         // The non-toolchain part of the full scope is exactly the pod
-        // surface (5 checks) plus the five image-verb checks; the
-        // toolchain lists differ by design (pod adds the c++ driver).
+        // surface (6 checks, including the mksquashfs version gate that
+        // runs in both scopes since #155) plus the four image-verb
+        // checks; the toolchain lists differ by design (pod adds the c++
+        // driver).
         let full_base = full
             .iter()
             .filter(|c| !c.name.starts_with("sandbox: "))
@@ -2966,9 +3030,9 @@ CONFIG_EXT4_FS=y
             .count();
         assert_eq!(
             full_base,
-            pod_base + 5,
-            "full scope = pod surface + 5 image checks (SOURCE_DATE_EPOCH, ukify, \
-             sd-stub, veritysetup, sysupdate); got full={} pod={}",
+            pod_base + 4,
+            "full scope = pod surface + 4 image checks (ukify, sd-stub, \
+             veritysetup, sysupdate); got full={} pod={}",
             full_base,
             pod_base
         );
@@ -3247,25 +3311,40 @@ done
     #[test]
     fn squashfs_version_parse_is_tolerant_not_a_closed_list() {
         // AC-8: the old closed allowlist (4.4/4.5/4.6 substring sniffing)
-        // is now a leading <major>.<minor> parse.
+        // is now a leading numeric triple parse (#155: major.minor.patch).
         assert_eq!(
             parse_squashfs_version("mksquashfs version 4.6.1 (2023-08-31)"),
-            Some((4, 6))
+            Some((4, 6, 1))
         );
         assert_eq!(
             parse_squashfs_version("mksquashfs version 4.7.5"),
-            Some((4, 7))
+            Some((4, 7, 5))
         );
-        assert_eq!(parse_squashfs_version("4.4"), Some((4, 4)));
+        assert_eq!(parse_squashfs_version("4.4"), Some((4, 4, 0)));
         assert_eq!(
             parse_squashfs_version("mksquashfs version 3.1"),
-            Some((3, 1))
+            Some((3, 1, 0))
+        );
+        // Defensive about pre/suffix forms: leading digits per component;
+        // a missing or non-numeric patch reads as 0. Never panics.
+        assert_eq!(
+            parse_squashfs_version("mksquashfs version 4.7.5-pre (2025-06-01)"),
+            Some((4, 7, 5))
+        );
+        assert_eq!(
+            parse_squashfs_version("mksquashfs version 4.9.x"),
+            Some((4, 9, 0))
         );
         assert_eq!(parse_squashfs_version("no version here"), None);
         assert_eq!(parse_squashfs_version(""), None);
-        assert!((4, 7) >= SQUASHFS_SDE_MIN);
-        assert!((5, 0) >= SQUASHFS_SDE_MIN);
-        assert!((4, 3) < SQUASHFS_SDE_MIN);
+        assert_eq!(parse_squashfs_version("version 4"), None);
+        assert!((4, 7, 5) >= SQUASHFS_SDE_MIN);
+        assert!((5, 0, 0) >= SQUASHFS_SDE_MIN);
+        assert!((4, 3, 9) < SQUASHFS_SDE_MIN);
+        // #155: the pack-performance floor sits above the
+        // SOURCE_DATE_EPOCH floor.
+        assert!((4, 6, 1) < SQUASHFS_PERF_MIN);
+        assert!((4, 7, 0) >= SQUASHFS_PERF_MIN);
     }
 
     #[test]
@@ -3284,6 +3363,10 @@ done
             "{hint}"
         );
         assert!(!hint.contains("untested"), "{hint}");
+        assert!(
+            !hint.contains("faster builds"),
+            "a 4.7+ pin carries no upgrade advice: {hint}"
+        );
     }
 
     #[test]
@@ -3307,7 +3390,7 @@ done
         let modern = write_script(
             dir.path(),
             "mksquashfs-modern",
-            "#!/bin/sh\necho mksquashfs version 4.7.5 (2024)\n",
+            "#!/bin/sh\necho 'mksquashfs version 4.7.5 (2024)'\n",
         );
         let ok = check_squashfs_version_with(
             Ok(ResolvedTool::Path {
@@ -3317,6 +3400,13 @@ done
             None,
         );
         assert!(matches!(ok.status, CheckStatus::Ok), "{ok:?}");
+        // #155: the detected version is printed, full triple.
+        let ok_hint = ok.hint.as_deref().unwrap_or_default();
+        assert!(ok_hint.contains("4.7.5"), "{ok_hint}");
+        assert!(
+            !ok_hint.contains("faster builds"),
+            "4.7+ carries no upgrade advice: {ok_hint}"
+        );
 
         let ancient = write_script(
             dir.path(),
@@ -3338,6 +3428,120 @@ done
                 .contains("predates SOURCE_DATE_EPOCH"),
             "{old:?}"
         );
+    }
+
+    #[test]
+    fn squashfs_upgrade_advice_fires_below_4_7_and_stays_advisory() {
+        // #155: a detected version below 4.7 carries the upgrade advice
+        // on an OK line — the advice never fails a command; 4.7+ gets no
+        // advice.
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |name: &str, body: &str| {
+            check_squashfs_version_with(
+                Ok(ResolvedTool::Path {
+                    path: write_script(dir.path(), name, body),
+                    version: None,
+                }),
+                None,
+            )
+        };
+
+        let older = mk(
+            "mksquashfs-461",
+            "#!/bin/sh\necho 'mksquashfs version 4.6.1 (2023-08-31)'\n",
+        );
+        assert!(
+            matches!(older.status, CheckStatus::Ok),
+            "the perf advice is advisory only: {older:?}"
+        );
+        let hint = older.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("4.6.1"), "detected version printed: {hint}");
+        assert!(
+            hint.contains("faster builds") && hint.contains("parallelized reads"),
+            "below 4.7 advises the upgrade: {hint}"
+        );
+
+        let modern = mk(
+            "mksquashfs-475",
+            "#!/bin/sh\necho mksquashfs version 4.7.5\n",
+        );
+        assert!(matches!(modern.status, CheckStatus::Ok), "{modern:?}");
+        let hint = modern.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("4.7.5"), "{hint}");
+        assert!(
+            !hint.contains("faster builds") && !hint.contains("parallelized reads"),
+            "4.7+ carries no upgrade advice: {hint}"
+        );
+
+        // The same advice on a provisioned tool whose manifest pin is
+        // below 4.7 — advisory there too.
+        let pinned = check_squashfs_version_with(
+            Ok(ResolvedTool::Provisioned {
+                path: PathBuf::from("/tools/3/bin/mksquashfs"),
+                version: "3".into(),
+            }),
+            Some("4.6.1"),
+        );
+        assert!(matches!(pinned.status, CheckStatus::Ok), "{pinned:?}");
+        assert!(
+            pinned
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("faster builds"),
+            "{pinned:?}"
+        );
+
+        // The advisory outcomes all read as ok: `shuttle doctor` exits 0.
+        assert!(
+            all_ok(&[older, modern, pinned]),
+            "the version advice must never fail a command"
+        );
+    }
+
+    #[test]
+    fn unparsable_path_squashfs_version_is_unknown_advisory() {
+        // #155: unparseable -version output reports the version as
+        // unknown on an OK line — never a failure, and no upgrade advice
+        // (with no version there is nothing to compare against 4.7).
+        let dir = tempfile::tempdir().unwrap();
+        let opaque = write_script(
+            dir.path(),
+            "mksquashfs-opaque",
+            "#!/bin/sh\necho 'mksquashfs: some future output shape'\n",
+        );
+        let check = check_squashfs_version_with(
+            Ok(ResolvedTool::Path {
+                path: opaque,
+                version: None,
+            }),
+            None,
+        );
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "unknown version stays advisory: {check:?}"
+        );
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("unparsable"), "{hint}");
+        assert!(
+            !hint.contains("faster builds"),
+            "no advice without a detected version: {hint}"
+        );
+        assert!(all_ok(&[check]));
+    }
+
+    /// #155: pod builds pay the pack cost, so both scopes gate the
+    /// mksquashfs version.
+    #[test]
+    fn run_all_and_pod_scope_include_the_mksquashfs_version_gate() {
+        for checks in [run_all(), run_pod()] {
+            assert!(
+                checks
+                    .iter()
+                    .any(|c| c.name == "mksquashfs >= 4.4 (SOURCE_DATE_EPOCH)"),
+                "missing the mksquashfs version gate"
+            );
+        }
     }
 
     #[test]
