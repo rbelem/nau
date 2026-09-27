@@ -44,9 +44,11 @@ roots and the verified-boot chain (ADR-0011/0024) is dead on arrival.
 2. **Whole-disk only for 1.0; fixed build-time geometry.** No dual-boot, no
    install-time resizing. The sized-once state partition (ADR-0023) grows to
    fill the disk on first boot via systemd-repart — its own ticket, QEMU-gated.
-3. **Cassini target matrix: x86_64 UEFI and Raspberry Pi.** Both boot backends
-   exist (systemd-boot and piboot, `src/image/mod.rs`); the Pi is the native
-   flash case.
+3. **Cassini target matrix: x86_64 UEFI first.** Both boot backends exist
+   (systemd-boot and piboot, `src/image/mod.rs`). Amended 2026-09-27
+   (operator, grill session): the pool builds x86_64 only for now — the
+   Raspberry Pi (aarch64) target is deferred until other architectures
+   are added to the build scope; the piboot backend ships regardless.
 4. **Trust is established at download, not on the device.** A flashed device
    cannot verify its own medium. Each mission publishes the `.img`, a
    `SHA256SUMS`, and the signed image manifest. `shuttle verify-image --device
