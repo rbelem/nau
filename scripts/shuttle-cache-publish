@@ -1,0 +1,342 @@
+#!/bin/sh
+# shuttle-cache-publish — push a cache export tree to the shuttle-cache
+# S3 bucket over plain HTTPS (path-style), AWS SigV4-signed.
+#
+# Ticket #270 (cache publish transport; server-infra-plan decision 4).
+# Content side: remote-cache-plan.md — the export/cache tree is
+#   cache/<closure-key>.json   manifests (CacheManifest)
+#   blobs/<sha256>             content-addressed blobs
+#
+# Order contract: every blob first, then every manifest — the manifest
+# is the commit point, so in-flight objects stay invisible to
+# consumers. Blobs skip-if-exists (content-addressed: HEAD 200 =>
+# skip; 404/403 => PUT — consumers treat 403 as a miss, so the
+# publisher does too). Manifests: GET + bytes-compare — identical =>
+# skip, different => FAIL LOUD (equivocation signal: two payloads for
+# one closure key; the key is named), absent (404/403) => PUT.
+#
+# Credentials come ONLY from the environment (SM-rendered on the
+# workstation per server-infra-plan checklist step 1); never from
+# shuttle.lua, never echoed to stdout/stderr/logs. The Authorization
+# header is handed to curl via `--header @file` (curl >= 7.55) so it
+# never appears in process args; the secret itself appears only inside
+# the openssl invocation args (same-user ps visibility — the accepted
+# workstation threat model).
+#   SHUTTLE_CACHE_S3_ACCESS_KEY   (required)
+#   SHUTTLE_CACHE_S3_SECRET_KEY   (required)
+#   SHUTTLE_CACHE_S3_ENDPOINT     scheme://host[:port] (no path/query)
+#   SHUTTLE_CACHE_S3_BUCKET       (required)
+#   SHUTTLE_CACHE_S3_REGION       (optional, default us-east-1)
+#
+# Transport: curl only, bounded (--connect-timeout 10; --max-time 30 s
+# metadata / 300 s blob — the oci.rs convention). Signing: SigV4 with
+# UNSIGNED-PAYLOAD for every method (the S3 relaxation; no body
+# pre-hash). No S3 SDK, no mc. External tools: curl, openssl, awk,
+# cmp, mktemp.
+#
+# Usage:
+#   shuttle-cache-publish [--dry-run] [--tree DIR]
+#     DIR  export/cache tree holding cache/*.json and blobs/*
+#          (default: the current directory)
+#
+# Exit 0 only when every object ended in skip/put with no conflict.
+
+set -eu
+LC_ALL=C
+export LC_ALL
+umask 077
+
+PROG=shuttle-cache-publish
+CONNECT_TIMEOUT=10
+META_TIMEOUT=30
+BLOB_TIMEOUT=300
+PAYLOAD_HASH=UNSIGNED-PAYLOAD
+SIGNED_HEADERS='host;x-amz-content-sha256;x-amz-date'
+
+die() {
+    printf '%s: FAIL: %s\n' "$PROG" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+usage: $PROG [--dry-run] [--tree DIR]
+
+Publish a cache export tree (cache/*.json manifests, blobs/*) to the
+shuttle-cache S3 bucket. Blobs first, manifests last; blobs
+skip-if-exists; manifests fail on a bytes difference (equivocation
+signal).
+
+Required environment (never shuttle.lua, never printed):
+  SHUTTLE_CACHE_S3_ACCESS_KEY
+  SHUTTLE_CACHE_S3_SECRET_KEY
+  SHUTTLE_CACHE_S3_ENDPOINT   scheme://host[:port] (no path/query)
+  SHUTTLE_CACHE_S3_BUCKET
+Optional:
+  SHUTTLE_CACHE_S3_REGION     default us-east-1
+
+Requires: curl (>= 7.55) and openssl on PATH.
+EOF
+}
+
+DRY_RUN=0
+TREE=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --dry-run) DRY_RUN=1 ;;
+        --tree)
+            [ $# -ge 2 ] || die '--tree needs a directory argument'
+            TREE=$2
+            shift
+            ;;
+        -h|--help) usage; exit 0 ;;
+        -*) die "unknown option: $1 (see --help)" ;;
+        *)
+            [ -z "$TREE" ] || die 'multiple input directories given'
+            TREE=$1
+            ;;
+    esac
+    shift
+done
+
+[ -n "${SHUTTLE_CACHE_S3_ACCESS_KEY:-}" ] || die 'SHUTTLE_CACHE_S3_ACCESS_KEY is not set'
+[ -n "${SHUTTLE_CACHE_S3_SECRET_KEY:-}" ] || die 'SHUTTLE_CACHE_S3_SECRET_KEY is not set'
+[ -n "${SHUTTLE_CACHE_S3_ENDPOINT:-}" ] || die 'SHUTTLE_CACHE_S3_ENDPOINT is not set'
+[ -n "${SHUTTLE_CACHE_S3_BUCKET:-}" ] || die 'SHUTTLE_CACHE_S3_BUCKET is not set'
+
+ACCESS_KEY=$SHUTTLE_CACHE_S3_ACCESS_KEY
+SECRET_KEY=$SHUTTLE_CACHE_S3_SECRET_KEY
+ENDPOINT=$SHUTTLE_CACHE_S3_ENDPOINT
+BUCKET=$SHUTTLE_CACHE_S3_BUCKET
+REGION=${SHUTTLE_CACHE_S3_REGION:-us-east-1}
+
+case $REGION in
+    ''|*[!A-Za-z0-9-]*) die "bad region: $REGION" ;;
+esac
+case $BUCKET in
+    ''|*[!a-z0-9.-]*) die "bad bucket name: $BUCKET" ;;
+esac
+case $ENDPOINT in
+    http://*|https://*) ;;
+    *) die 'SHUTTLE_CACHE_S3_ENDPOINT must start with http:// or https://' ;;
+esac
+HOST=${ENDPOINT#*://}
+case $HOST in
+    ''|*/*|*\?*|*#*) die 'SHUTTLE_CACHE_S3_ENDPOINT must be scheme://host[:port] with no path or query' ;;
+esac
+
+[ -n "$TREE" ] || TREE=.
+[ -d "$TREE/blobs" ] || die "no blobs/ directory under $TREE"
+[ -d "$TREE/cache" ] || die "no cache/ directory under $TREE"
+
+command -v curl >/dev/null 2>&1 || die 'curl not found on PATH'
+command -v openssl >/dev/null 2>&1 || die 'openssl not found on PATH'
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/$PROG.XXXXXX") || die 'mktemp failed'
+HDRS=$TMP/headers
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+# hmac_raw KEY — HMAC-SHA256 of stdin under a raw-text key, hex out.
+hmac_raw() {
+    openssl dgst -sha256 -mac HMAC -macopt "key:$1" | awk '{print $NF}'
+}
+
+# hmac_hex HEXKEY — HMAC-SHA256 of stdin under a hex-encoded key
+# (keeps the derived-key chain binary-exact: each round-trip goes
+# hexkey <-> hex output, never raw bytes through a shell variable).
+hmac_hex() {
+    openssl dgst -sha256 -mac HMAC -macopt "hexkey:$1" | awk '{print $NF}'
+}
+
+# sig4 METHOD CANONICAL_URI — sign the request and write the auth +
+# amz headers into "$HDRS" (side effect; avoids subshell scoping).
+sig4() {
+    _s4_method=$1
+    _s4_uri=$2
+    _s4_date=$(date -u +%Y%m%dT%H%M%SZ)
+    _s4_day=${_s4_date%T*}
+    _s4_scope="$_s4_day/$REGION/s3/aws4_request"
+    # Canonical request: method \n uri \n query(none) \n canonical
+    # headers (host, x-amz-content-sha256, x-amz-date — alphabetical)
+    # \n blank \n signed headers \n payload hash.
+    _s4_cr=$(printf '%s\n%s\n%s\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n\n%s\n%s' \
+        "$_s4_method" "$_s4_uri" '' "$HOST" "$PAYLOAD_HASH" "$_s4_date" \
+        "$SIGNED_HEADERS" "$PAYLOAD_HASH")
+    _s4_sts=$(printf 'AWS4-HMAC-SHA256\n%s\n%s\n%s' \
+        "$_s4_date" "$_s4_scope" "$_s4_cr")
+    _s4_kdate=$(printf '%s' "$_s4_day" | hmac_raw "AWS4$SECRET_KEY")
+    _s4_kregion=$(printf '%s' "$REGION" | hmac_hex "$_s4_kdate")
+    _s4_kservice=$(printf '%s' 's3' | hmac_hex "$_s4_kregion")
+    _s4_ksign=$(printf '%s' 'aws4_request' | hmac_hex "$_s4_kservice")
+    _s4_sig=$(printf '%s' "$_s4_sts" | hmac_hex "$_s4_ksign")
+    {
+        printf 'Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s\n' \
+            "$ACCESS_KEY" "$_s4_scope" "$SIGNED_HEADERS" "$_s4_sig"
+        printf 'x-amz-date: %s\n' "$_s4_date"
+        printf 'x-amz-content-sha256: %s\n' "$PAYLOAD_HASH"
+    } >"$HDRS"
+}
+
+# do_request METHOD KEY [SRCFILE] [CONTENT_TYPE] [MAX_TIME]
+# Sets RC to the HTTP status (or 000 on transport failure).
+# GET bodies land in "$TMP/body".
+do_request() {
+    _rq_method=$1
+    _rq_key=$2
+    _rq_file=${3:-}
+    _rq_ct=${4:-}
+    _rq_maxtime=${5:-$META_TIMEOUT}
+    _rq_url="$ENDPOINT/$BUCKET/$_rq_key"
+    sig4 "$_rq_method" "/$BUCKET/$_rq_key"
+    if [ -n "$_rq_ct" ]; then
+        printf 'Content-Type: %s\n' "$_rq_ct" >>"$HDRS"
+    fi
+    _rq_rc=0
+    _rq_code=000
+    case $_rq_method in
+        HEAD)
+            _rq_code=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT" \
+                --max-time "$_rq_maxtime" -I -o /dev/null \
+                --header @"$HDRS" -w '%{http_code}' "$_rq_url") || _rq_rc=$?
+            ;;
+        GET)
+            _rq_code=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT" \
+                --max-time "$_rq_maxtime" -o "$TMP/body" \
+                --header @"$HDRS" -w '%{http_code}' "$_rq_url") || _rq_rc=$?
+            ;;
+        PUT)
+            _rq_code=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT" \
+                --max-time "$_rq_maxtime" -o /dev/null \
+                --upload-file "$_rq_file" --header @"$HDRS" \
+                -w '%{http_code}' "$_rq_url") || _rq_rc=$?
+            ;;
+        *) die "internal: bad method $_rq_method" ;;
+    esac
+    if [ "$_rq_rc" -ne 0 ]; then
+        printf 'FAIL      %s %s (curl exit %s)\n' "$_rq_method" "$_rq_key" "$_rq_rc" >&2
+        RC=000
+        return 1
+    fi
+    RC=$_rq_code
+    return 0
+}
+
+# check_name NAME — object names must be plain ASCII segments; this is
+# also what keeps the canonical URI escape-free (every allowed char is
+# URI-unreserved) and blocks traversal.
+check_name() {
+    case $1 in
+        .|..) die "unsafe object name: $1" ;;
+        *[!A-Za-z0-9._-]*) die "unsafe object name (charset): $1" ;;
+    esac
+}
+
+n_up=0
+n_skip=0
+n_conf=0
+n_err=0
+
+handle_blob() {
+    _hb_name=${1##*/}
+    check_name "$_hb_name"
+    _hb_key="blobs/$_hb_name"
+    if ! do_request HEAD "$_hb_key" '' '' "$BLOB_TIMEOUT"; then
+        n_err=$((n_err + 1))
+        return
+    fi
+    case $RC in
+        200)
+            printf 'skip      %s\n' "$_hb_key"
+            n_skip=$((n_skip + 1))
+            ;;
+        404 | 403)
+            if [ "$DRY_RUN" -eq 1 ]; then
+                printf 'put(dry)  %s\n' "$_hb_key"
+            elif do_request PUT "$_hb_key" "$1" 'application/octet-stream' "$BLOB_TIMEOUT"; then
+                case $RC in
+                    2??)
+                        printf 'put       %s\n' "$_hb_key"
+                        n_up=$((n_up + 1))
+                        ;;
+                    *)
+                        printf 'FAIL      %s (PUT status %s)\n' "$_hb_key" "$RC" >&2
+                        n_err=$((n_err + 1))
+                        ;;
+                esac
+            else
+                n_err=$((n_err + 1))
+            fi
+            ;;
+        *)
+            printf 'FAIL      %s (HEAD status %s)\n' "$_hb_key" "$RC" >&2
+            n_err=$((n_err + 1))
+            ;;
+    esac
+}
+
+handle_manifest() {
+    _hm_name=${1##*/}
+    check_name "$_hm_name"
+    _hm_key="cache/$_hm_name"
+    if ! do_request GET "$_hm_key"; then
+        n_err=$((n_err + 1))
+        return
+    fi
+    case $RC in
+        200)
+            if cmp -s "$1" "$TMP/body"; then
+                printf 'skip      %s\n' "$_hm_key"
+                n_skip=$((n_skip + 1))
+            else
+                # Equivocation signal (remote-cache-plan: two payloads
+                # for one closure key can never be ordered) — name the
+                # key and refuse the overwrite.
+                printf 'CONFLICT  %s: remote bytes differ from local; refusing overwrite\n' \
+                    "$_hm_key" >&2
+                n_conf=$((n_conf + 1))
+            fi
+            ;;
+        404 | 403)
+            if [ "$DRY_RUN" -eq 1 ]; then
+                printf 'put(dry)  %s\n' "$_hm_key"
+            elif do_request PUT "$_hm_key" "$1" 'application/json'; then
+                case $RC in
+                    2??)
+                        printf 'put       %s\n' "$_hm_key"
+                        n_up=$((n_up + 1))
+                        ;;
+                    *)
+                        printf 'FAIL      %s (PUT status %s)\n' "$_hm_key" "$RC" >&2
+                        n_err=$((n_err + 1))
+                        ;;
+                esac
+            else
+                n_err=$((n_err + 1))
+            fi
+            ;;
+        *)
+            printf 'FAIL      %s (GET status %s)\n' "$_hm_key" "$RC" >&2
+            n_err=$((n_err + 1))
+            ;;
+    esac
+}
+
+# Walk order: all blobs, then all manifests (glob order is sorted
+# under LC_ALL=C).
+for _f in "$TREE"/blobs/*; do
+    [ -f "$_f" ] || continue
+    handle_blob "$_f"
+done
+for _f in "$TREE"/cache/*.json; do
+    [ -f "$_f" ] || continue
+    handle_manifest "$_f"
+done
+
+_mode=''
+[ "$DRY_RUN" -eq 0 ] || _mode=', dry-run — no writes performed'
+printf '%s: %s uploaded, %s skipped, %s conflicts, %s failed%s\n' \
+    "$PROG" "$n_up" "$n_skip" "$n_conf" "$n_err" "$_mode"
+
+[ "$n_err" -eq 0 ] || exit 1
+[ "$n_conf" -eq 0 ] || exit 1
+exit 0
