@@ -135,7 +135,7 @@ amended with field evidence. Each item names its acceptance check.
    quadratic to linear in the profile.
 5. **`-processors` for mksquashfs.** One line, argv at src/snap.rs:4678.
    Acceptance: pack wall-clock on the pinned harness improves or matches,
-   AND byte-neutrality is proven via `scripts/rebuild-compare.sh` before
+   AND byte-neutrality is proven via `examples/rebuild-compare.sh` before
    merge — if parallelism is not byte-neutral, this lands together with
    the v5 key, never before it.
 6. **Merged-prefix work, measure-first.** Cheap slice: reflink /
@@ -158,7 +158,7 @@ amended with field evidence. Each item names its acceptance check.
   1a and after each item; log per-phase wall clock. Timing anchor from
   the field: a warm single-package rebuild (opencode-bin, 80 MB fetch +
   81 MB mksquashfs) takes about 2-3 minutes today.
-- Reproducibility: `scripts/rebuild-compare.sh` byte-identity on a sample
+- Reproducibility: `examples/rebuild-compare.sh` byte-identity on a sample
   package after any key or packer change (explicitly includes the
   `-processors` change).
 

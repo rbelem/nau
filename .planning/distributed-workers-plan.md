@@ -12,6 +12,15 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 
 ## Program checklist
 
+> Resync 2026-09-27, from a four-seat council review. This plan predates the
+> amendments that ratified ADR-0040 on 2026-09-26, and four seats found the
+> same drift independently: T1/T4/T5 boxes implement superseded design. The
+> boxes now conform to the ratified ADR — `speed`, `requires`, and `provision`
+> are out of v1 (D8), remote ingest keys on job-manifest identity, never
+> `v4:` (D6), and T6 waits for T5 plus the host-key provenance ADR-0045.
+> Landed state: T0 (#188), T1 (#189), T2 (#190, PR #239), T3 (#191, PR #245)
+> merged.
+
 ### Arm the program
 
 - [ ] State the protocol and this plan to the operator, then stop. Start execution only on her explicit go.
@@ -34,7 +43,8 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
   - [ ] T0 is first and alone. It lands the ADR, the glossary terms, and this plan on trunk.
   - [ ] T1 after T0. T2 after T1. T3 after T1.
   - [ ] T4 after T2 and T3. T5 after T4.
-  - [ ] T6 after T3. T7, T8, T9, T10 after T6 and are independent of each other.
+  - [ ] T6 after T5, and only after ADR-0045 (worker host-key provenance) is
+        ratified. T7, T8, T9, T10 after T6 and are independent of each other.
 - [ ] Hold the file boundaries. T1 touches only `src/dsl/init.lua` and the eval payload struct. T2 touches only `src/build_sched.rs` and its call site in `src/main.rs`. T3 touches only `src/cli.rs` and the new `src/worker.rs`. T4 touches only `src/ssh_exec.rs` and `src/worker.rs`. T5 touches only `src/build_sched.rs`, `src/main.rs`, and `src/output.rs`. T6 touches only `src/provision.rs` and `src/cli.rs`. T7 through T10 touch only their provider module under `src/provision/`.
 - [ ] Hold the review gate. T5, T6, T7, T8, T9, T10 change what the operator sees. They wait for the operator's review in chat with the lane logs and a terminal video before merge.
 
@@ -127,7 +137,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 **Build.**
 
-- [ ] Top-level `workers = { ... }` array validated Lua-side. Fields address, required, `ssh://[user@]host[:port]`; jobs, default 2, minimum 1; speed, default 1.0, positive number; arch, optional GNU triplet; requires, optional string list; provision, optional table, deferred to T6.
+- [ ] Top-level `workers = { ... }` array validated Lua-side. Fields address, required, `ssh://[user@]host[:port]`; jobs, default 2, minimum 1; arch, optional GNU triplet. Resync: `speed`, `requires`, and `provision` were cut from v1 by ADR-0040 D8 after this plan was drafted; the landed T1 code parses exactly address, jobs, arch, and local_jobs, which is the contract.
 - [ ] Eval payload gains the workers field. Absent key evaluates to an empty vector, no behavior change anywhere.
 - [ ] Every malformed shape produces one named miette diagnostic that names the field.
 
@@ -137,7 +147,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 **Verify, unit.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked.
 
-- [ ] `tests/workers_config.rs` gains the valid table, absent key, missing address, bad scheme, zero jobs, negative speed, wrong types, unknown field, duplicate address cases. Run `env -u LD_LIBRARY_PATH devbox run -- test`.
+- [ ] `tests/workers_config.rs` gains the valid table, absent key, missing address, bad scheme, zero jobs, wrong types, unknown field, duplicate address cases. Run `env -u LD_LIBRARY_PATH devbox run -- test`.
 
 **Verify, live.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked. Ten lanes on `grok-4.6-fast-xhigh` at the PR head, per the boot recipe.
 
@@ -289,7 +299,8 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 - [ ] `SshExecutor` drives `ssh` through `CommandRunner` with bounded timeouts, probe, dispatch, stream, collect.
 - [ ] Preflight runs `__worker-cap` and asserts protocol, arch match with the job target, tool presence, and free disk. Any failure is a named refusal naming the probe.
-- [ ] Delta sync ships only objects the worker reports missing, as a tar stream over the SSH channel, and verifies every sha256 on arrival. Returned artifacts are hash-verified before cache ingest keyed `v4:<closure_sha256>`.
+- [ ] Delta sync ships only objects the worker reports missing, as a tar stream over the SSH channel, and verifies every sha256 on arrival. Returned artifacts are hash-verified before ingest under the job-manifest identity namespace (ADR-0040 D6) — never `v4:<closure_sha256>`, so a remote result can never silently substitute for a locally keyed entry.
+- [ ] Host keys are pinned, never learned. Each workers entry carries its `host_key` (an `ssh-ed25519 AAAA...` line or a `SHA256:` fingerprint); the executor drives ssh with `StrictHostKeyChecking=yes` against a shuttle-managed known_hosts built from the pins, and preflight refuses an unpinned worker by name. No `ssh-keyscan` path exists. (ADR-0045 D4; the pin mechanics land here, the provisioning form waits for ratification.)
 - [ ] Workers never fetch upstream. Pinned sources travel in the job payload.
 
 **You see.**
@@ -308,7 +319,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 - [ ] Lane 4. Preflight names the probe. Run with mksquashfs hidden on the worker PATH. Save `preflight-tools.log`. Pass when the refusal names the mksquashfs probe and no job runs.
 - [ ] Lane 5. Arch mismatch refused. Target an aarch64 job at an x86_64 worker. Save `arch-refusal.log`. Pass when the refusal names arch and nothing dispatches.
 - [ ] Lane 6. Corrupt in flight. Inject a flipped byte into the tar stream with an intercepting wrapper. Save `corrupt-stream.log`. Pass when the arrival hash check names the object and the job fails.
-- [ ] Lane 7. Cache ingest. Re-run the same job. Save `cache-hit.log`. Pass when the coordinator reports the `v4:` cache hit and transfers nothing.
+- [ ] Lane 7. Cache ingest. Re-run the same job. Save `cache-hit.log`. Pass when the coordinator reports the manifest-identity cache hit and transfers nothing.
 - [ ] Lane 8. Host key change. Point the worker at a moved host key. Save `hostkey.log`. Pass when ssh refuses and the diagnostic says so plainly.
 - [ ] Lane 9. Concurrency on one worker. Set jobs to 4 and dispatch six jobs. Save `concurrency.log`. Pass when at most four run at once and all six land.
 - [ ] Lane 10. A second real machine. Run lane 2 against a LAN box. When none exists, record that fact and run the loopback variant. Save `second-machine.log`. Pass when the named variant completes.
@@ -342,7 +353,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 **Build.**
 
-- [ ] `build --all` with workers dispatches ready nodes to the `SshExecutor` by capability match, then speed factor, then ready-set order.
+- [ ] `build --all` with workers dispatches ready nodes to the `SshExecutor` by capability match, then ready-set order.
 - [ ] Failure semantics are strict and global. A lost or failed worker fails the run, names the worker and the job, in-flight jobs on surviving executors finish, dependents never start.
 - [ ] JSON events gain executor and worker fields. Remote failures dump the buffered stderr prefixed by the worker name.
 
@@ -361,11 +372,10 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 - [ ] Lane 3. Worker loss. Kill the SSH process mid-build on one worker. Save `worker-loss.log`. Pass when the run fails nonzero, names the worker and job, survivors finish, dependents never start.
 - [ ] Lane 4. Remote stderr dump. Force a remote build failure with a broken recipe. Save `remote-stderr.log`. Pass when the full stderr appears prefixed by the worker name.
 - [ ] Lane 5. JSON fields. Run a farm build with `--json` through jq. Save `farm-json.log`. Pass when events carry executor and worker.
-- [ ] Lane 6. Speed factor placement. Give one worker speed 2.0 and count assigned jobs. Save `placement.log`. Pass when the fast worker receives roughly twice the share.
-- [ ] Lane 7. Capability filter. Target an aarch64 job at a pool with one arm worker. Save `cap-filter.log`. Pass when the job lands only on the arm worker.
-- [ ] Lane 8. Cache re-run. Rebuild the same closure. Save `rerun.log`. Pass when no dispatch happens and the run exits zero from cache.
-- [ ] Lane 9. Artifact equality. Compare the farm-built closure hashes to a local-only rebuild. Save `hash-equality.log`. Pass when every hash matches.
-- [ ] Lane 10. The end state the user waits for. Time the ten-package farm build against a local-only run of the same closure. Save `end-state.log`. Pass when the farm run is faster.
+- [ ] Lane 6. Capability filter. Target an aarch64 job at a pool with one arm worker. Save `cap-filter.log`. Pass when the job lands only on the arm worker.
+- [ ] Lane 7. Cache re-run. Rebuild the same closure. Save `rerun.log`. Pass when no dispatch happens and the run exits zero from cache.
+- [ ] Lane 8. Artifact equality. Compare the farm-built closure hashes to a local-only rebuild. Save `hash-equality.log`. Pass when every hash matches.
+- [ ] Lane 9. The end state the user waits for. Time the ten-package farm build against a local-only run of the same closure. Save `end-state.log`. Pass when the farm run is faster.
 
 **Verify, perf.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked.
 
@@ -389,7 +399,10 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 ## Add the Provisioner seam and the Hetzner provider (T6)
 
-**Depends on.** T3.
+**Depends on.** T5, and the operator's ratification of ADR-0045 (worker
+host-key provenance). Parked until both hold — do not dispatch this lane; the
+Build box below is pre-resynced to the mint-and-inject posture and gets its
+final rewrite at un-park time.
 
 **Files.**
 
@@ -400,14 +413,14 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 **Build.**
 
-- [ ] `shuttle workers provision --provider hetzner --type cx22 --location fsn1 --count 1` creates servers, waits for cloud-init, prints the host key for pinning, and appends the worker entry to the `workers` array in `shuttle.lua`.
+- [ ] `shuttle workers provision --provider hetzner --type cx22 --location fsn1 --count 1` creates servers, waits for cloud-init, mints the worker host keypair coordinator-side, injects the private half through cloud-init user-data (the provider's authenticated API channel), pins the public half into the appended `workers` entry, and never calls `ssh-keyscan` (ADR-0045 posture; final shape set at ratification).
 - [ ] Cloud-init installs the pinned shuttle binary, writes the operator authorized key, and stamps a TTL marker file.
 - [ ] `shuttle workers destroy --provider hetzner --name <name>` removes the server and the config entry.
 - [ ] No token, invalid token, and dry-run are all handled before any API call. Secrets never enter `shuttle.lua`.
 
 **You see.**
 
-- [ ] One command turns a Hetzner account into a listed worker in `shuttle.lua` that a farm build uses. The printed host key is pinned before first use.
+- [ ] One command turns a Hetzner account into a listed worker in `shuttle.lua` that a farm build uses. The minted host key is pinned before first use.
 
 **Verify, unit.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked.
 
