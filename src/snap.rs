@@ -3239,7 +3239,7 @@ pub fn host_arch() -> &'static str {
 /// "aarch64-linux-gnu" → Some("arm64"), "x86_64-linux-gnu" → Some("amd64"),
 /// "arm-linux-gnueabihf" → Some("armhf"). Unknown vendor/OS suffixes are not
 /// interpreted: the first component maps by the rules above, else identity.
-fn triplet_arch(triplet: &str) -> Option<&str> {
+pub(crate) fn triplet_arch(triplet: &str) -> Option<&str> {
     let first = triplet.split('-').next()?;
     match first {
         "x86_64" | "amd64" => Some("amd64"),

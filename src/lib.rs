@@ -43,6 +43,7 @@ pub mod services;
 pub mod sign;
 pub mod slot_recovery;
 pub mod snap;
+pub mod ssh_exec;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_env;

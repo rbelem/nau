@@ -132,6 +132,54 @@ pub struct JobResult {
     pub stderr: Option<String>,
 }
 
+// ── Transport side (ADR-0040 Decision 6, T4) ──
+
+/// The canonical manifest bytes the job identity digests (ADR-0040
+/// Decision 6): serde_json with sorted object keys plus the array members
+/// sorted — pins by URL, closure by sha256 — so two coordinators produce
+/// the same bytes for the same job. The transport-local `payload_dir` is
+/// stripped: it names coordinator-side disk, not job content.
+pub fn canonical_manifest_bytes(manifest: &JobManifest) -> miette::Result<Vec<u8>> {
+    let mut value = serde_json::to_value(manifest)
+        .map_err(|e| miette::miette!("worker-job: cannot canonicalize the job manifest: {e}"))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("payload_dir");
+        if let Some(pins) = obj.get_mut("pins").and_then(|v| v.as_array_mut()) {
+            pins.sort_by(|a, b| a["url"].as_str().cmp(&b["url"].as_str()));
+        }
+        if let Some(closure) = obj.get_mut("closure").and_then(|v| v.as_array_mut()) {
+            closure.sort_by(|a, b| a["sha256"].as_str().cmp(&b["sha256"].as_str()));
+        }
+    }
+    serde_json::to_vec(&value)
+        .map_err(|e| miette::miette!("worker-job: cannot serialize the canonical manifest: {e}"))
+}
+
+/// The job-manifest identity (ADR-0040 Decision 6): `jm1:` + the SHA-256
+/// of the canonical manifest bytes. Remote results ingest into the
+/// coordinator under this namespace — deliberately distinct from the
+/// local `v4:` closure cache, so a remote result can never silently
+/// substitute for a locally keyed entry.
+pub fn manifest_identity(manifest: &JobManifest) -> miette::Result<String> {
+    Ok(format!(
+        "jm1:{}",
+        crate::oci::sha256_hex(&canonical_manifest_bytes(manifest)?)
+    ))
+}
+
+/// Write the canonical job manifest as `job.json` into `dir` — the
+/// transport-side half of the job-file surface: the coordinator ships
+/// exactly these bytes, and their digest is the manifest identity.
+/// Returns the written path.
+pub fn write_job_file(dir: &Path, manifest: &JobManifest) -> miette::Result<PathBuf> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| miette::miette!("worker-job: cannot create {}: {e}", dir.display()))?;
+    let path = dir.join("job.json");
+    std::fs::write(&path, canonical_manifest_bytes(manifest)?)
+        .map_err(|e| miette::miette!("worker-job: cannot write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 // ── Capability document ──
 
 /// What a Worker advertises (ADR-0040 Decision 2): protocol version, arch,

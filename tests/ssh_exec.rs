@@ -1,0 +1,1026 @@
+//! The SSH transport (T4, ADR-0040 Decisions 4–7 / ADR-0045 Decision 4),
+//! driven through a loopback harness: the worker side is played in-process
+//! by a scripted `CommandRunner` fake that runs the REAL verbs — the real
+//! local tar, the real extraction, the real `__worker-job` execution for
+//! the build-less hello fixture — so every byte the coordinator hashes,
+//! ships, verifies, and ingests is real. `ssh://localhost` is the
+//! address under test throughout; no network, no sshd, no keyscan.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use sha2::{Digest, Sha256};
+use shuttle::command::{CommandRunner, RealRunner, RunnerOutput};
+use shuttle::lua::WorkerConfig;
+use shuttle::ssh_exec::{DispatchOutcome, PreflightChecks, SshExecutor};
+use shuttle::worker::{
+    canonical_manifest_bytes, manifest_identity, write_job_file, Artifact, CapabilityDoc,
+    ClosureObject, JobManifest, JobResult, WORKER_PROTOCOL_VERSION,
+};
+
+/// A shape-valid ed25519 public-key line (the pin grammar needs the key
+/// type plus base64; the fake never validates cryptography).
+const ED25519_PIN: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux loopback-pin";
+const FINGERPRINT_PIN: &str = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+fn host_arch() -> String {
+    shuttle::snap::host_arch().to_string()
+}
+
+fn flip_last(bytes: &mut [u8]) {
+    let n = bytes.len();
+    bytes[n - 1] ^= 0x01;
+}
+
+/// Flip one byte at `offset` (a data-area byte of a small tar).
+fn flip_at(bytes: &mut [u8], offset: usize) {
+    if bytes.len() > offset {
+        bytes[offset] ^= 0x01;
+    }
+}
+
+// ── The loopback worker ──
+
+/// The fake worker: owns the "remote machine" tree (`~` = root) and
+/// interprets the exact remote commands the executor emits. scp moves
+/// real bytes between the coordinator's filesystem and the tree; ssh
+/// routes to the real verbs where it matters.
+struct LoopbackWorker {
+    root: PathBuf,
+    cap: CapabilityDoc,
+    real_job: bool,
+    scripted_result: Option<JobResult>,
+    scripted_files: Vec<(String, Vec<u8>)>,
+    corrupt_payload_push: bool,
+    corrupt_artifact: Option<String>,
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl LoopbackWorker {
+    fn new(root: &Path) -> Self {
+        LoopbackWorker {
+            root: root.to_path_buf(),
+            cap: cap_happy(),
+            real_job: false,
+            scripted_result: None,
+            scripted_files: Vec::new(),
+            corrupt_payload_push: false,
+            corrupt_artifact: None,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn calls_handle(&self) -> Arc<Mutex<Vec<Vec<String>>>> {
+        self.calls.clone()
+    }
+
+    fn record(&self, argv: &[String]) {
+        self.calls.lock().unwrap().push(argv.to_vec());
+    }
+
+    /// Count recorded invocations whose argv[0] is `program`.
+    fn count_program(calls: &Arc<Mutex<Vec<Vec<String>>>>, program: &str) -> usize {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|argv| argv[0] == program)
+            .count()
+    }
+
+    fn any_call<F>(calls: &Arc<Mutex<Vec<Vec<String>>>>, pred: F) -> bool
+    where
+        F: Fn(&[String]) -> bool,
+    {
+        calls.lock().unwrap().iter().any(|argv| pred(argv))
+    }
+
+    fn set_cap(&mut self, mutate: impl FnOnce(&mut CapabilityDoc)) {
+        mutate(&mut self.cap);
+    }
+
+    /// `"~/a/b"` → the fake machine's absolute path.
+    fn remote_path(&self, token: &str) -> Option<PathBuf> {
+        let rest = token.strip_prefix('~')?.trim_start_matches('/');
+        Some(self.root.join(rest))
+    }
+
+    fn ok(stdout: String) -> RunnerOutput {
+        RunnerOutput {
+            code: 0,
+            stdout: stdout.into_bytes(),
+            stderr: String::new(),
+        }
+    }
+
+    fn ssh(&self, argv: &[String]) -> io::Result<RunnerOutput> {
+        let Some(cmd) = argv.last() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty ssh argv",
+            ));
+        };
+        if cmd.contains("__worker-cap") {
+            return Ok(Self::ok(serde_json::to_string(&self.cap).unwrap()));
+        }
+        if cmd.contains("__worker-job") {
+            return self.job(cmd);
+        }
+        if cmd.starts_with("rm -rf") {
+            for token in cmd.split_whitespace().skip(2) {
+                if let Some(p) = self.remote_path(token) {
+                    let _ = std::fs::remove_dir_all(&p);
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+            return Ok(Self::ok(String::new()));
+        }
+        if cmd.starts_with("ls ") {
+            let dir = cmd.split_whitespace().nth(1).unwrap();
+            let mut names: Vec<String> = self
+                .remote_path(dir)
+                .and_then(|p| std::fs::read_dir(p).ok())
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            return Ok(Self::ok(names.join("\n")));
+        }
+        if cmd.contains(" -xf ") {
+            return self.extract_and_hash(cmd);
+        }
+        if cmd.contains("sha256sum") {
+            return self.hash_command(cmd);
+        }
+        if cmd.contains("ln -f") {
+            return self.job_prep(cmd);
+        }
+        if cmd.contains(" mv ") {
+            return self.commit(cmd);
+        }
+        if cmd.starts_with("mkdir -p") {
+            for token in cmd.split_whitespace().skip(2) {
+                if token == "&&" {
+                    break;
+                }
+                std::fs::create_dir_all(self.remote_path(token).unwrap())?;
+            }
+            return Ok(Self::ok(String::new()));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("loopback: unsupported remote command: {cmd}"),
+        ))
+    }
+
+    /// `shuttle __worker-job <job.json>` — the real verb for the hello
+    /// fixture, or the scripted document for transport-only scenarios.
+    fn job(&self, cmd: &str) -> io::Result<RunnerOutput> {
+        let job_file = self
+            .remote_path(cmd.split_whitespace().last().unwrap())
+            .expect("job file under ~");
+        let manifest = shuttle::worker::load_manifest(&job_file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:#}")))?;
+        let dir = job_file.parent().unwrap();
+        if self.real_job {
+            return match shuttle::worker::execute_job(
+                &manifest,
+                Some(&dir.join("payload")),
+                &dir.join("out"),
+            ) {
+                Ok(result) => Ok(Self::ok(serde_json::to_string(&result).unwrap())),
+                Err(e) => Ok(RunnerOutput {
+                    code: 1,
+                    stdout: Vec::new(),
+                    stderr: format!("{e:#}"),
+                }),
+            };
+        }
+        std::fs::create_dir_all(dir.join("out"))?;
+        for (name, bytes) in &self.scripted_files {
+            std::fs::write(dir.join("out").join(name), bytes)?;
+        }
+        let doc = self.scripted_result.as_ref().expect("scripted result set");
+        Ok(Self::ok(serde_json::to_string(doc).unwrap()))
+    }
+
+    /// `mkdir -p <staging> && tar -C <staging> -xf <incoming> && cd
+    /// <staging> && sha256sum ...` — real extraction, real hashes.
+    fn extract_and_hash(&self, cmd: &str) -> io::Result<RunnerOutput> {
+        let toks: Vec<&str> = cmd.split_whitespace().collect();
+        let mp = toks.iter().position(|t| *t == "-p").unwrap();
+        let staging = self.remote_path(toks[mp + 1]).unwrap();
+        std::fs::create_dir_all(&staging)?;
+        let xf = toks.iter().position(|t| *t == "-xf").unwrap();
+        let incoming = self.remote_path(toks[xf + 1]).unwrap();
+        let st = RealRunner.run(&[
+            "tar".to_string(),
+            "-C".to_string(),
+            staging.to_string_lossy().into_owned(),
+            "-xf".to_string(),
+            incoming.to_string_lossy().into_owned(),
+        ])?;
+        if st.code != 0 {
+            return Ok(st);
+        }
+        let sum = toks.iter().position(|t| *t == "sha256sum").unwrap();
+        self.hash_files(&staging, &toks[sum + 1..])
+    }
+
+    /// `cd <dir> && sha256sum <names...>` — the claimed-object re-hash.
+    fn hash_command(&self, cmd: &str) -> io::Result<RunnerOutput> {
+        let toks: Vec<&str> = cmd.split_whitespace().collect();
+        let cd = toks.iter().position(|t| *t == "cd").unwrap();
+        let dir = self.remote_path(toks[cd + 1]).unwrap();
+        let sum = toks.iter().position(|t| *t == "sha256sum").unwrap();
+        self.hash_files(&dir, &toks[sum + 1..])
+    }
+
+    fn hash_files(&self, dir: &Path, names: &[&str]) -> io::Result<RunnerOutput> {
+        let mut out = String::new();
+        let mut errs: Vec<String> = Vec::new();
+        let mut code = 0;
+        for name in names {
+            let f = dir.join(name);
+            match std::fs::read(&f) {
+                Ok(bytes) => out.push_str(&format!("{}  {name}\n", sha256_hex(&bytes))),
+                Err(_) => {
+                    code = 1;
+                    errs.push(format!("sha256sum: {name}: No such file or directory"));
+                }
+            }
+        }
+        Ok(RunnerOutput {
+            code,
+            stdout: out.into_bytes(),
+            stderr: errs.join("\n"),
+        })
+    }
+
+    /// `mkdir -p <payload> <out> && ln -f <objects...> <payload>` — the
+    /// job-directory preparation with real hardlinks.
+    fn job_prep(&self, cmd: &str) -> io::Result<RunnerOutput> {
+        let toks: Vec<&str> = cmd.split_whitespace().collect();
+        let mp = toks.iter().position(|t| *t == "-p").unwrap();
+        let mut i = mp + 1;
+        while i < toks.len() && toks[i] != "&&" {
+            std::fs::create_dir_all(self.remote_path(toks[i]).unwrap())?;
+            i += 1;
+        }
+        let ln = toks.iter().position(|t| *t == "-f").unwrap();
+        let (dst, srcs) = toks[ln + 1..].split_last().unwrap();
+        let dst_dir = self.remote_path(dst).unwrap();
+        for src in srcs {
+            let from = self.remote_path(src).unwrap();
+            let name = Path::new(src).file_name().unwrap();
+            std::fs::hard_link(&from, dst_dir.join(name))?;
+        }
+        Ok(Self::ok(String::new()))
+    }
+
+    /// `mkdir -p <objects> && mv <staging>/* <objects>/ && rm -rf
+    /// <staging> <incoming>` — the verified-blob commit.
+    fn commit(&self, cmd: &str) -> io::Result<RunnerOutput> {
+        let toks: Vec<&str> = cmd.split_whitespace().collect();
+        let mp = toks.iter().position(|t| *t == "-p").unwrap();
+        std::fs::create_dir_all(self.remote_path(toks[mp + 1]).unwrap())?;
+        let mv = toks.iter().position(|t| *t == "mv").unwrap();
+        let staging = self
+            .remote_path(toks[mv + 1].strip_suffix("/*").unwrap())
+            .unwrap();
+        let objects = self
+            .remote_path(toks[mv + 2].trim_end_matches('/'))
+            .unwrap();
+        for entry in std::fs::read_dir(&staging)?.flatten() {
+            let name = entry.file_name();
+            std::fs::rename(entry.path(), objects.join(&name))?;
+        }
+        if let Some(rf) = toks.iter().position(|t| *t == "-rf") {
+            for token in &toks[rf + 1..] {
+                if let Some(p) = self.remote_path(token) {
+                    let _ = std::fs::remove_dir_all(&p);
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+        Ok(Self::ok(String::new()))
+    }
+
+    fn scp(&self, argv: &[String]) -> io::Result<RunnerOutput> {
+        let src = &argv[argv.len() - 2];
+        let dst = &argv[argv.len() - 1];
+        if src.contains(':') {
+            // Pull: remote file → local path (real scp splits host:path
+            // at the FIRST colon).
+            let remote = src.split_once(':').unwrap().1;
+            let from = self.remote_path(remote).expect("remote source under ~");
+            let mut bytes = std::fs::read(&from)?;
+            if self
+                .corrupt_artifact
+                .as_deref()
+                .is_some_and(|n| from.to_string_lossy().ends_with(n))
+            {
+                flip_last(&mut bytes);
+            }
+            std::fs::write(dst, bytes)?;
+        } else {
+            // Push: local file → remote path.
+            let Some(to) = dst
+                .split_once(':')
+                .and_then(|(_, remote)| self.remote_path(remote))
+            else {
+                panic!("scp push: unparsable destination {dst:?}");
+            };
+            std::fs::create_dir_all(to.parent().unwrap())?;
+            let mut bytes = std::fs::read(src)?;
+            // The intercepting wrapper corrupts the payload tar in
+            // flight — a byte inside the first member's data, so the
+            // extraction succeeds but the content is wrong.
+            if self.corrupt_payload_push && to.to_string_lossy().contains("/incoming/") {
+                flip_at(&mut bytes, 517);
+            }
+            std::fs::write(to, bytes)?;
+        }
+        Ok(Self::ok(String::new()))
+    }
+}
+
+impl CommandRunner for LoopbackWorker {
+    fn run(&self, argv: &[String]) -> io::Result<RunnerOutput> {
+        self.record(argv);
+        match argv[0].as_str() {
+            "ssh" => self.ssh(argv),
+            "scp" => self.scp(argv),
+            "tar" => RealRunner.run(argv),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("loopback: unexpected program {other}"),
+            )),
+        }
+    }
+}
+
+// ── Fixtures ──
+
+fn cap_happy() -> CapabilityDoc {
+    CapabilityDoc {
+        protocol: WORKER_PROTOCOL_VERSION,
+        arch: host_arch(),
+        nproc: 4,
+        ram_bytes: 8_000_000_000,
+        free_disk_bytes: 1024u64.pow(4),
+        bwrap: true,
+        mksquashfs: true,
+        kvm: false,
+        sandbox: true,
+    }
+}
+
+fn worker_cfg(address: &str, pin: Option<&str>) -> WorkerConfig {
+    WorkerConfig {
+        address: address.to_string(),
+        jobs: 2,
+        arch: None,
+        host_key: pin.map(str::to_string),
+    }
+}
+
+fn executor(fake: LoopbackWorker, cache: &Path) -> SshExecutor<LoopbackWorker> {
+    SshExecutor::with_cache_dir(
+        &worker_cfg("ssh://localhost", Some(ED25519_PIN)),
+        fake,
+        cache,
+    )
+    .expect("executor builds")
+}
+
+fn hello_recipe() -> String {
+    r#"
+return {
+    default = snap {
+        name = "worker-hello",
+        version = "1.0.0",
+        summary = "ssh transport loopback fixture",
+        description = "built by the transport loopback harness",
+    },
+}
+"#
+    .to_string()
+}
+
+fn hello_manifest() -> JobManifest {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("pkgs/w/worker-hello.lua".to_string(), hello_recipe());
+    JobManifest {
+        protocol_version: WORKER_PROTOCOL_VERSION,
+        target: host_arch(),
+        cross_target: None,
+        source_date_epoch: Some(1700000000),
+        package: "worker-hello".to_string(),
+        recipes: map,
+        pins: Vec::new(),
+        closure: Vec::new(),
+        payload_dir: None,
+    }
+}
+
+/// A manifest carrying two `dep:` payload blobs, for the delta-sync
+/// machinery, answered by the scripted result document.
+fn blob_manifest(blobs: &[(&str, &str)]) -> JobManifest {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("pkgs/w/worker-hello.lua".to_string(), hello_recipe());
+    JobManifest {
+        protocol_version: WORKER_PROTOCOL_VERSION,
+        target: host_arch(),
+        cross_target: None,
+        source_date_epoch: Some(1700000000),
+        package: "worker-hello".to_string(),
+        recipes: map,
+        pins: Vec::new(),
+        closure: blobs
+            .iter()
+            .map(|(sha, purpose)| ClosureObject {
+                sha256: sha.to_string(),
+                size: 16,
+                purpose: purpose.to_string(),
+            })
+            .collect(),
+        payload_dir: None,
+    }
+}
+
+fn scripted_dispatch(outcome_artifact: &str, bytes: &[u8]) -> (JobResult, Vec<(String, Vec<u8>)>) {
+    let result = JobResult {
+        protocol_version: WORKER_PROTOCOL_VERSION,
+        package: "worker-hello".to_string(),
+        target: host_arch(),
+        ok: true,
+        artifacts: vec![Artifact {
+            filename: outcome_artifact.to_string(),
+            path: "~/.cache/shuttle/worker/jobs/x/out/x".to_string(),
+            sha256: sha256_hex(bytes),
+            size: bytes.len() as u64,
+        }],
+        error: None,
+        stderr: None,
+    };
+    (result, vec![(outcome_artifact.to_string(), bytes.to_vec())])
+}
+
+fn blob_pair() -> (String, Vec<u8>, String, Vec<u8>) {
+    let a = b"payload-blob-01!".to_vec();
+    let b = b"payload-blob-02!".to_vec();
+    (sha256_hex(&a), a, sha256_hex(&b), b)
+}
+
+fn preseed_object(root: &Path, sha: &str, bytes: &[u8]) {
+    // The fake machine's `~` is `root`; the object store lives at the
+    // same remote path the real layout uses.
+    let dir = root.join(".cache/shuttle/worker/objects");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(sha), bytes).unwrap();
+}
+
+// ── Preflight ──
+
+#[test]
+fn preflight_happy_and_the_pinned_bounded_argv() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let fake = LoopbackWorker::new(machine.path());
+    let calls = fake.calls_handle();
+    let ex = executor(fake, cache.path());
+
+    let cap = ex
+        .preflight(PreflightChecks {
+            arch: Some("amd64"),
+            min_free_disk: 1,
+        })
+        .expect("happy preflight");
+    assert_eq!(cap.protocol, WORKER_PROTOCOL_VERSION);
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "exactly one channel hop");
+    let argv = &calls[0];
+    assert_eq!(argv[0], "ssh");
+    assert_eq!(argv[argv.len() - 1], "shuttle __worker-cap");
+    assert_eq!(argv[argv.len() - 2], "localhost");
+    for opt in [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=4",
+    ] {
+        assert!(
+            argv.contains(&opt.to_string()),
+            "argv missing {opt}: {argv:?}"
+        );
+    }
+    let known = argv
+        .iter()
+        .find(|a| a.starts_with("UserKnownHostsFile="))
+        .expect("managed known_hosts option");
+    let known_path = known.strip_prefix("UserKnownHostsFile=").unwrap();
+    let pinned = std::fs::read_to_string(known_path).expect("managed known_hosts written");
+    let key_half = ED25519_PIN
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(pinned, format!("localhost {key_half}"));
+}
+
+#[test]
+fn known_hosts_pattern_covers_the_non_default_port() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let fake = LoopbackWorker::new(machine.path());
+    let ex = SshExecutor::with_cache_dir(
+        &worker_cfg("ssh://localhost:2222", Some(ED25519_PIN)),
+        fake,
+        cache.path(),
+    )
+    .unwrap();
+    ex.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("preflight with port");
+    let pinned = std::fs::read_to_string(ex.known_hosts_path()).unwrap();
+    let key_half = ED25519_PIN
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(pinned, format!("[localhost]:2222 {key_half}"));
+}
+
+#[test]
+fn unpinned_and_fingerprint_only_workers_refuse_before_any_channel_activity() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+
+    let fake = LoopbackWorker::new(machine.path());
+    let calls = fake.calls_handle();
+    let ex = SshExecutor::with_cache_dir(&worker_cfg("ssh://localhost", None), fake, cache.path())
+        .unwrap();
+    let err = ex
+        .preflight(PreflightChecks {
+            arch: None,
+            min_free_disk: 0,
+        })
+        .expect_err("unpinned refuses");
+    assert!(err.to_string().contains("localhost"), "{err:#}");
+    assert!(err.to_string().contains("unpinned"), "{err:#}");
+    assert_eq!(calls.lock().unwrap().len(), 0, "no channel activity");
+
+    let fake = LoopbackWorker::new(machine.path());
+    let calls = fake.calls_handle();
+    let ex = SshExecutor::with_cache_dir(
+        &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
+        fake,
+        cache.path(),
+    )
+    .unwrap();
+    let err = ex
+        .preflight(PreflightChecks {
+            arch: None,
+            min_free_disk: 0,
+        })
+        .expect_err("fingerprint-only refuses");
+    assert!(err.to_string().contains("fingerprint"), "{err:#}");
+    assert!(err.to_string().contains("localhost"), "{err:#}");
+    assert_eq!(calls.lock().unwrap().len(), 0, "no channel activity");
+}
+
+#[test]
+fn preflight_refusals_name_the_probe() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+
+    let cases: &[(&str, &dyn Fn(&mut LoopbackWorker))] = &[
+        ("preflight protocol", &|f: &mut LoopbackWorker| {
+            f.set_cap(|c| c.protocol = 99)
+        }),
+        ("preflight arch", &|f: &mut LoopbackWorker| {
+            f.set_cap(|c| c.arch = "arm64".into())
+        }),
+        ("preflight bwrap", &|f: &mut LoopbackWorker| {
+            f.set_cap(|c| c.bwrap = false)
+        }),
+        ("preflight sandbox", &|f: &mut LoopbackWorker| {
+            f.set_cap(|c| c.sandbox = false)
+        }),
+        ("preflight mksquashfs", &|f: &mut LoopbackWorker| {
+            f.set_cap(|c| c.mksquashfs = false)
+        }),
+        ("preflight disk", &|f: &mut LoopbackWorker| {
+            f.set_cap(|c| c.free_disk_bytes = 1)
+        }),
+    ];
+    for (probe, mutate) in cases {
+        let mut fake = LoopbackWorker::new(machine.path());
+        (mutate)(&mut fake);
+        let ex = executor(fake, cache.path());
+        let err = ex
+            .preflight(PreflightChecks {
+                arch: Some("amd64"),
+                min_free_disk: 1024 * 1024 * 1024,
+            })
+            .expect_err("must refuse");
+        let text = format!("{err:#}");
+        assert!(text.starts_with(probe), "probe '{probe}' not named: {text}");
+    }
+}
+
+// ── Dispatch: the full loopback job (real build) ──
+
+#[test]
+fn dispatch_lands_the_artifact_in_the_coordinator_ingest() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.real_job = true;
+    let ex = executor(fake, cache.path());
+
+    let manifest = hello_manifest();
+    let payload = tempfile::tempdir().unwrap();
+    let outcome = ex
+        .dispatch(&manifest, payload.path())
+        .expect("loopback dispatch");
+    assert!(!outcome.cache_hit);
+    assert!(outcome.result.ok);
+
+    let dir = ex.ingest_dir(&manifest).unwrap();
+    let id_slug = manifest_identity(&manifest).unwrap().replace(':', "_");
+    assert!(dir.join("result.json").exists(), "ingest record present");
+    assert!(
+        dir.to_string_lossy().contains(&id_slug),
+        "ingest keyed under the manifest identity: {dir:?}"
+    );
+    assert!(!dir.to_string_lossy().contains("v4:"), "never v4-keyed");
+    for art in &outcome.result.artifacts {
+        let stored = dir.join(&art.filename);
+        assert!(stored.exists(), "artifact ingested: {stored:?}");
+        assert_eq!(
+            shuttle::oci::sha256_file(&stored).unwrap(),
+            art.sha256,
+            "stored bytes hash to the verified claim"
+        );
+    }
+}
+
+#[test]
+fn second_identical_dispatch_is_a_cache_hit_that_transfers_nothing() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.real_job = true;
+    let calls = fake.calls_handle();
+    let ex = executor(fake, cache.path());
+
+    let manifest = hello_manifest();
+    let payload = tempfile::tempdir().unwrap();
+    let first = ex.dispatch(&manifest, payload.path()).expect("first run");
+    assert!(!first.cache_hit);
+    let after_first = calls.lock().unwrap().len();
+
+    let second: DispatchOutcome = ex.dispatch(&manifest, payload.path()).expect("second run");
+    assert!(second.cache_hit, "served from the ingest record");
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        after_first,
+        "zero channel activity on the cache hit"
+    );
+    assert_eq!(second.result.artifacts.len(), first.result.artifacts.len());
+    let (second_hashes, first_hashes) = (
+        second
+            .result
+            .artifacts
+            .iter()
+            .map(|a| a.sha256.clone())
+            .collect::<Vec<_>>(),
+        first
+            .result
+            .artifacts
+            .iter()
+            .map(|a| a.sha256.clone())
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(second_hashes, first_hashes);
+}
+
+// ── Delta sync (scripted transport scenarios) ──
+
+#[test]
+fn delta_sync_ships_only_the_missing_objects() {
+    let (sha_a, blob_a, sha_b, blob_b) = blob_pair();
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let artifact_bytes = b"scripted snap artifact".to_vec();
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", &artifact_bytes);
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    let calls = fake.calls_handle();
+    // The worker already holds blob A — exactly.
+    preseed_object(machine.path(), &sha_a, &blob_a);
+    let ex = executor(fake, cache.path());
+
+    let payload = tempfile::tempdir().unwrap();
+    std::fs::write(payload.path().join(&sha_a), &blob_a).unwrap();
+    std::fs::write(payload.path().join(&sha_b), &blob_b).unwrap();
+    let manifest = blob_manifest(&[(&sha_a, "dep:dep-a"), (&sha_b, "dep:dep-b")]);
+
+    let outcome = ex
+        .dispatch(&manifest, payload.path())
+        .expect("delta dispatch");
+    assert!(!outcome.cache_hit);
+
+    // The tar bundle carried only the missing object.
+    let tarred = LoopbackWorker::any_call(&calls, |argv| {
+        argv[0] == "tar" && argv.iter().any(|a| a == &sha_b)
+    });
+    assert!(tarred, "the missing object shipped");
+    let tarred_held = LoopbackWorker::any_call(&calls, |argv| {
+        argv[0] == "tar" && argv.iter().any(|a| a == &sha_a)
+    });
+    assert!(!tarred_held, "the held object never shipped");
+
+    // The worker's object store now holds both.
+    let objects = machine.path().join(".cache/shuttle/worker/objects");
+    assert!(objects.join(&sha_a).exists());
+    assert!(objects.join(&sha_b).exists());
+
+    // The artifact landed, hash-verified, under the manifest identity.
+    let dir = ex.ingest_dir(&manifest).unwrap();
+    let stored = dir.join("worker-hello_1.0_amd64.snap");
+    assert_eq!(
+        shuttle::oci::sha256_file(&stored).unwrap(),
+        sha256_hex(&artifact_bytes)
+    );
+}
+
+#[test]
+fn all_objects_held_means_no_transfer_at_all() {
+    let (sha_a, blob_a, sha_b, blob_b) = blob_pair();
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let artifact_bytes = b"scripted snap artifact".to_vec();
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", &artifact_bytes);
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    let calls = fake.calls_handle();
+    preseed_object(machine.path(), &sha_a, &blob_a);
+    preseed_object(machine.path(), &sha_b, &blob_b);
+    let ex = executor(fake, cache.path());
+
+    let payload = tempfile::tempdir().unwrap();
+    let manifest = blob_manifest(&[(&sha_a, "dep:dep-a"), (&sha_b, "dep:dep-b")]);
+    let outcome = ex
+        .dispatch(&manifest, payload.path())
+        .expect("zero-transfer dispatch");
+    assert!(
+        !outcome.cache_hit,
+        "the JOB ran; only the transfer is skipped"
+    );
+    assert_eq!(LoopbackWorker::count_program(&calls, "tar"), 0, "no tar");
+    let scp_count = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|argv| argv[0] == "scp")
+        .count();
+    assert_eq!(scp_count, 2, "job.json out, artifact back — no blob scp");
+    let tar_landing = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|argv| argv.iter().any(|a| a.contains("/incoming/")));
+    assert!(!tar_landing, "no blob landing ever appears on the channel");
+    assert!(
+        LoopbackWorker::any_call(&calls, |argv| argv
+            .last()
+            .is_some_and(|c| c.contains("__worker-job"))),
+        "the job ran"
+    );
+}
+
+#[test]
+fn corrupt_claimed_object_refuses_before_anything_runs() {
+    let (sha_a, blob_a, sha_b, _blob_b) = blob_pair();
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", b"artifact");
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    let calls = fake.calls_handle();
+    // The worker CLAIMS to hold blob A but the bytes are truncated poison.
+    let mut corrupt = blob_a.clone();
+    flip_last(&mut corrupt);
+    preseed_object(machine.path(), &sha_a, &corrupt);
+    let ex = executor(fake, cache.path());
+
+    let payload = tempfile::tempdir().unwrap();
+    let manifest = blob_manifest(&[(&sha_a, "dep:dep-a"), (&sha_b, "dep:dep-b")]);
+    let err = ex
+        .dispatch(&manifest, payload.path())
+        .expect_err("poisoned claim refuses");
+    let text = format!("{err:#}");
+    assert!(text.contains("claims are content-verified"), "{text}");
+    assert!(
+        !LoopbackWorker::any_call(&calls, |argv| argv
+            .last()
+            .is_some_and(|c| c.contains("__worker-job"))),
+        "nothing dispatched after a failed claim check"
+    );
+    assert_eq!(LoopbackWorker::count_program(&calls, "tar"), 0);
+}
+
+#[test]
+fn corruption_in_flight_refuses_before_commit() {
+    let (sha_a, blob_a, sha_b, blob_b) = blob_pair();
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", b"artifact");
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    fake.corrupt_payload_push = true; // the intercepting wrapper flips a byte
+    let calls = fake.calls_handle();
+    preseed_object(machine.path(), &sha_a, &blob_a);
+    let ex = executor(fake, cache.path());
+
+    let payload = tempfile::tempdir().unwrap();
+    std::fs::write(payload.path().join(&sha_b), &blob_b).unwrap();
+    let manifest = blob_manifest(&[(&sha_a, "dep:dep-a"), (&sha_b, "dep:dep-b")]);
+    let err = ex
+        .dispatch(&manifest, payload.path())
+        .expect_err("flipped byte refuses");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("refusing") || text.contains("arrival verification failed"),
+        "{text}"
+    );
+    assert!(
+        !machine
+            .path()
+            .join(".cache/shuttle/worker/objects")
+            .join(&sha_b)
+            .exists(),
+        "a dead transfer commits nothing"
+    );
+    assert!(
+        !LoopbackWorker::any_call(&calls, |argv| argv
+            .last()
+            .is_some_and(|c| c.contains("__worker-job"))),
+        "the job never ran"
+    );
+}
+
+#[test]
+fn corrupt_returned_artifact_refuses_ingest() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let artifact_bytes = b"scripted snap artifact".to_vec();
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", &artifact_bytes);
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    fake.corrupt_artifact = Some("worker-hello_1.0_amd64.snap".to_string());
+    let ex = executor(fake, cache.path());
+
+    let payload = tempfile::tempdir().unwrap();
+    let manifest = hello_manifest();
+    let err = ex
+        .dispatch(&manifest, payload.path())
+        .expect_err("corrupted artifact refuses");
+    let text = format!("{err:#}");
+    assert!(text.contains("refusing ingest"), "{text}");
+    assert!(
+        !ex.ingest_dir(&manifest).unwrap().exists(),
+        "nothing ingested"
+    );
+}
+
+#[test]
+fn scp_rides_the_same_port_flag_shape() {
+    let (sha_a, blob_a, _sha_b, _blob_b) = blob_pair();
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", b"artifact");
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    let calls = fake.calls_handle();
+    preseed_object(machine.path(), &sha_a, &blob_a);
+    let ex = SshExecutor::with_cache_dir(
+        &worker_cfg("ssh://localhost:2222", Some(ED25519_PIN)),
+        fake,
+        cache.path(),
+    )
+    .unwrap();
+
+    let payload = tempfile::tempdir().unwrap();
+    std::fs::write(payload.path().join(&sha_a), &blob_a).unwrap();
+    let manifest = blob_manifest(&[(sha_a.as_str(), "dep:dep-a")]);
+    ex.dispatch(&manifest, payload.path())
+        .expect("port dispatch");
+    let scp = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|argv| argv[0] == "scp")
+        .expect("scp used")
+        .clone();
+    assert!(
+        scp.windows(2).any(|w| w[0] == "-P" && w[1] == "2222"),
+        "scp carries -P 2222: {scp:?}"
+    );
+    assert!(
+        scp.iter()
+            .any(|a| a.starts_with("StrictHostKeyChecking=yes") || a == "-o"),
+        "scp carries the pin options"
+    );
+}
+
+// ── Transport-side manifest identity (src/worker.rs) ──
+
+#[test]
+fn manifest_identity_is_canonical_namespaced_and_transport_local_free() {
+    let mut manifest = hello_manifest();
+    let id = manifest_identity(&manifest).expect("identity");
+    assert!(id.starts_with("jm1:"), "{id}");
+    assert_eq!(id.len(), "jm1:".len() + 64);
+
+    // Array order and the transport-local payload_dir cannot move it.
+    let mut shuffled = hello_manifest();
+    shuffled.payload_dir = Some("/somewhere/else".to_string());
+    assert_eq!(manifest_identity(&shuffled).unwrap(), id);
+
+    let mut with_pins = hello_manifest();
+    with_pins.pins = vec![
+        shuttle::worker::SourcePin {
+            url: "https://a".into(),
+            sha256: "a".repeat(64),
+        },
+        shuttle::worker::SourcePin {
+            url: "https://b".into(),
+            sha256: "b".repeat(64),
+        },
+    ];
+    let forward = manifest_identity(&with_pins).unwrap();
+    with_pins.pins.reverse();
+    assert_eq!(manifest_identity(&with_pins).unwrap(), forward);
+
+    let mut other = hello_manifest();
+    other.package = "worker-hello-2".to_string();
+    assert_ne!(manifest_identity(&other).unwrap(), id);
+
+    // Canonical bytes are JSON, sorted-key, and strip payload_dir.
+    let bytes = canonical_manifest_bytes(&manifest).expect("canonical bytes");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(value["package"], "worker-hello");
+    assert!(value.get("payload_dir").is_none());
+
+    manifest.payload_dir = Some("local/only".into());
+    let bytes2 = canonical_manifest_bytes(&manifest).unwrap();
+    assert_eq!(bytes, bytes2, "payload_dir never enters the identity");
+}
+
+#[test]
+fn write_job_file_writes_exactly_the_identity_bytes() {
+    let manifest = hello_manifest();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_job_file(dir.path(), &manifest).expect("job file");
+    assert_eq!(path.file_name().unwrap(), "job.json");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes, canonical_manifest_bytes(&manifest).unwrap());
+    let id = manifest_identity(&manifest).unwrap();
+    assert_eq!(
+        format!("jm1:{}", sha256_hex(&bytes)),
+        id,
+        "the shipped job file digests to the manifest identity"
+    );
+}

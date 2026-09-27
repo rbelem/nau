@@ -32,6 +32,7 @@ fn worker(address: &str, jobs: u32) -> shuttle::lua::WorkerConfig {
         address: address.to_string(),
         jobs,
         arch: None,
+        host_key: None,
     }
 }
 
