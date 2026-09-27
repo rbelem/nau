@@ -453,3 +453,23 @@ execution boundaries), ADR-0039 (offline sandbox; non-degradable on
 Workers), ADR-0042 (the numbering this ADR's original draft number
 yielded to pod secret sources). The 0038 numbering collision noted in
 ADR-0039 resolved on 2026-09-26: the squashfs ADR renumbered to ADR-0041.
+
+## Amendment 1 — D4 failure classes (2026-09-27)
+
+Operator-approved (grill session; ticket #268). D4's stop-the-world no
+longer treats worker loss and build failure identically:
+
+- **Build failure** keeps stop-the-world unchanged: the run fails, names
+  the worker and the job, in-flight jobs on surviving executors finish,
+  dependents never start.
+- **Worker loss** (connection dropped, host vanished, provider eviction)
+  re-dispatches the lost job to any eligible executor — local slots
+  included — and trips stop-the-world only when no eligible executor
+  remains.
+
+Rationale: one flaky LAN box or one eviction otherwise fails an
+hours-long index run while completed packages sit cache-protected.
+D7's fabrication hazard is unchanged — re-dispatched jobs carry the same
+manifest identity, and determinism cross-checks remain the control.
+T5 (#193) implements this split; spot-capable providers (#195) stay
+gated on it.

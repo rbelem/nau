@@ -77,8 +77,14 @@ _Avoid_: key management, PKI
 **Image manifest**: The flat, serializable, signed result of evaluating `image()` — partitions, UKI/roothash digests, package lists. The shuttle-side analog of a model assertion (ADR-0011).
 _Avoid_: model assertion, lockfile (the lockfile pins *inputs*; the manifest describes the *system*)
 
+**Mission image**: The published, whole-disk artifact of one release — `nau-<mission>-<version>-<arch>.img` plus `SHA256SUMS` and the signed image manifest. What users download and flash; what released machines update against. (ADR-0044)
+_Avoid_: installer, ISO, release build
+
 **Install**: An on-device operation that adds a package to the store and the current generation without mutating the base (`shuttle install`, ADR-0012).
 _Avoid_: snap install, layering
+
+**Flash**: Installing Nau on bare metal by writing a mission image to a whole disk. Install copies bytes; it never lays out partitions, re-derives a roothash, or signs. Trust is established at download (SHA256SUMS + signed manifest), not on the device. (ADR-0044)
+_Avoid_: install (that is the package operation), burn, image write
 
 **Pod**: A named user-level package selection owned by one user; the small shuttle served by the system mothership. Each pod has its own packages, overlays, lockfile, and generation chain; rollback switches that pod only.
 _Avoid_: global, profile, environment

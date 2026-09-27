@@ -94,12 +94,13 @@ heartbeat (already the documented alternative to oversized TTLs).
 
 ## 3. Worker OS until Nau can dogfood
 
-**Ubuntu 24.04 LTS, stock provider image, with two tool pins.** It is
-cloud-init-native on every provider (keeps #195-#198 mechanical), matches
-the zet standard, and — researched, not assumed — bubblewrap works
-unprivileged out of the box on 24.04: Ubuntu's AppArmor userns
-restriction (23.10+) denies arbitrary unprivileged `unshare`, but
-bubblewrap ships its own AppArmor profile. Keep the system hardening; do
+**The latest Ubuntu LTS (26.04 at decision time; the contract pins
+"latest LTS", never a codename), stock provider image, with two tool
+pins.** It is cloud-init-native on every provider (keeps #195-#198
+mechanical), matches the zet standard, and — researched, not assumed —
+bubblewrap works unprivileged out of the box on the AppArmor-restricted
+lineage (23.10+ through 25.x; the cap probe re-verifies on whatever
+boots). Keep the system hardening; do
 NOT set `apparmor_restrict_unprivileged_userns=0`. `__worker-cap`'s real
 sandbox probe is the admission gate: a worker whose userns is broken
 fails preflight by design.
@@ -107,8 +108,10 @@ fails preflight by design.
 The two pins, both research-confirmed:
 
 1. **squashfs-tools: build 4.7.x from source in the template.** 4.6.1 is
-   what Ubuntu 24.04, Ubuntu 25.10, Debian 13, and Fedora 43/44 all ship;
-   4.7.x is packaged only in Fedora 45+/Rawhide. The doctor advises 4.7+
+   what every stable distro ships (Ubuntu through 25.10, Debian 13,
+   Fedora through 44); 4.7.x is packaged only in Fedora 45+/Rawhide.
+   26.04's package version is unverified — the source-built pin makes
+   the question moot. The doctor advises 4.7+
    (#155), and ADR-0041's zstd defaults make mksquashfs behavior part of
    artifact identity — a fleet must run one pinned mksquashfs. The build
    is a trivial `make` against lz4/zstd/xz; install to `/usr/local/bin`
