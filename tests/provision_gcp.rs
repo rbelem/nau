@@ -1000,8 +1000,17 @@ fn user_data_carries_the_publish_callback_and_one_time_token() {
         .collect();
     assert_eq!(
         runcmds.last().copied(),
-        Some("  - /etc/shuttle/publish-host-key.sh"),
-        "publish is the final runcmd: {runcmds:?}"
+        Some("  - systemctl enable --now shuttle-pickup-host-cert.service"),
+        "the pickup unit enable is the final runcmd: {runcmds:?}"
+    );
+    let publish_at = runcmds
+        .iter()
+        .position(|l| *l == "  - /etc/shuttle/publish-host-key.sh")
+        .expect("publish is a runcmd");
+    assert_eq!(
+        publish_at + 1,
+        runcmds.len() - 1,
+        "publish directly precedes the pickup enable (the channel is proven up): {runcmds:?}"
     );
     assert!(user_data.contains("while [ \"$i\" -lt 10 ]"));
     assert!(user_data.contains("curl -fsS -m 30"));

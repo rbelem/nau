@@ -415,16 +415,27 @@ fn user_data_carries_the_publish_callback_and_one_time_token() {
     assert!(user_data.contains("/run/cloud-init/instance-data.json"));
     assert!(user_data.contains("instance_identity"));
     assert!(user_data.contains("Authorization: Bearer $PUBLISH_TOKEN"));
-    // The publish runs LAST (after curl is installed) and retries are
-    // bounded — a not-yet-up coordinator never bricks the boot.
+    // The publish runs after curl is installed and retries are bounded —
+    // a not-yet-up coordinator never bricks the boot. The pickup unit
+    // enable is the final runcmd (the certificate fetch must not hang
+    // the boot — it polls from a oneshot service, #295 sub-task 4).
     let runcmds: Vec<&str> = user_data
         .lines()
         .filter(|l| l.starts_with("  - "))
         .collect();
     assert_eq!(
         runcmds.last().copied(),
-        Some("  - /etc/shuttle/publish-host-key.sh"),
-        "publish is the final runcmd: {runcmds:?}"
+        Some("  - systemctl enable --now shuttle-pickup-host-cert.service"),
+        "the pickup unit enable is the final runcmd: {runcmds:?}"
+    );
+    let publish_at = runcmds
+        .iter()
+        .position(|l| *l == "  - /etc/shuttle/publish-host-key.sh")
+        .expect("publish is a runcmd");
+    assert_eq!(
+        publish_at + 1,
+        runcmds.len() - 1,
+        "publish directly precedes the pickup enable (the channel is proven up): {runcmds:?}"
     );
     assert!(user_data.contains("while [ \"$i\" -lt 10 ]"));
     assert!(user_data.contains("curl -fsS -m 30"));
@@ -1278,4 +1289,97 @@ fn sweep_accepts_exactly_what_render_user_data_emits_as_the_marker() {
         !err.contains("LABEL-INVALID"),
         "an epoch marker never reads as an invalid label:\n{err}"
     );
+}
+
+#[test]
+fn provision_records_the_machine_linkage_next_to_the_pin() {
+    // The executor's @cert-authority pin binds the certificate principal
+    // through the address→identity linkage (#295 sub-task 4): one record
+    // per pinned server, under the publish channel's ceremony home.
+    let (dir, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let (pubtmp, channel) = pubtmp();
+    let fake = FakeProvider::new(Script::default());
+    let mut req = request(&config, false);
+    req.count = 2;
+    let workers = provisioner_with(&fake, Some("tok-1"), Some(channel))
+        .provision(&req)
+        .unwrap();
+    assert_eq!(workers.len(), 2);
+
+    let machines = shuttle::provision::publish::machines_dir(pubtmp.path());
+    let mut links: Vec<(String, String)> = std::fs::read_dir(&machines)
+        .unwrap()
+        .flatten()
+        .map(|e| {
+            let link: shuttle::provision::publish::MachineLink =
+                serde_json::from_str(&std::fs::read_to_string(e.path()).unwrap()).unwrap();
+            (link.address.clone(), link.machine_identity.clone())
+        })
+        .collect();
+    links.sort();
+    assert_eq!(links.len(), 2, "one linkage per pinned server");
+    for w in &workers {
+        assert!(
+            links
+                .iter()
+                .any(|(a, id)| a == &w.address && id.starts_with("shuttle-worker-")),
+            "address {} is linked to its machine identity: {links:?}",
+            w.address
+        );
+    }
+}
+
+#[test]
+fn user_data_picks_the_issued_certificate_up_on_first_boot() {
+    // #295 sub-task 4: the guest fetches its issued certificate over the
+    // SAME one-time bearer channel the publish used, installs it beside
+    // the generated key, and restarts sshd. The retry budget is exactly
+    // the token TTL: 1440 × 60s = 86400s.
+    let user_data = render_user_data(&UserDataParams {
+        machine_identity: "shuttle-worker-abc-01",
+        publish_url: PUBLISH_URL,
+        publish_token: "a".repeat(64).leak(),
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: 1_800_000_000,
+    });
+
+    // The pickup rides a oneshot unit, not a runcmd — the retry loop may
+    // legitimately run for the whole token window.
+    assert!(user_data.contains("path: /etc/shuttle/pickup-host-cert.sh\n    permissions: \"0700\""));
+    assert!(user_data.contains(
+        "path: /etc/systemd/system/shuttle-pickup-host-cert.service\n    permissions: \"0644\""
+    ));
+    assert!(user_data.contains("Type=oneshot"));
+    assert!(
+        user_data.contains("TimeoutStartSec=infinity"),
+        "the retry loop must not die at systemd's 90s default start timeout"
+    );
+    assert!(user_data.contains("ExecStart=/etc/shuttle/pickup-host-cert.sh"));
+
+    // The GET half of the same callback: same URL env, same bearer.
+    assert!(user_data.contains("Authorization: Bearer $PUBLISH_TOKEN"));
+    assert!(user_data.contains("-o \"$TMP\" \"$PUBLISH_URL\""));
+    assert!(user_data.contains("CERT=/etc/ssh/ssh_host_ed25519_key-cert.pub"));
+    assert!(
+        user_data.contains("head -n 1 \"$TMP\" | grep -q 'ssh-ed25519-cert-v01@openssh.com'"),
+        "the fetch is shape-checked before it is installed"
+    );
+    assert!(
+        user_data.contains("chmod 0644 \"$TMP\"") && user_data.contains("mv \"$TMP\" \"$CERT\""),
+        "atomic install, cert mode 0644 (public material)"
+    );
+    assert!(user_data.contains("systemctl restart ssh || systemctl restart sshd"));
+
+    // Bounded retries sized to the publish-token window.
+    let ttl = shuttle::provision::publish::PUBLISH_TOKEN_TTL_SECS;
+    assert!(user_data.contains("while [ \"$i\" -lt 1440 ]"));
+    assert!(user_data.contains("sleep 60"));
+    assert_eq!(1440 * 60, ttl, "the retry budget IS the token TTL");
+
+    // Fail-closed, named: no certificate = the coordinator refuses the
+    // raw host key.
+    assert!(user_data.contains("no certificate within the publish-token window (1440 x 60s)"));
+    assert!(user_data.contains("the coordinator refuses this worker's raw host key"));
 }

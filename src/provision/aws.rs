@@ -376,6 +376,10 @@ impl<R: CommandRunner> AwsProvisioner<R> {
                 let ip = self.instance_public_ipv4(Some(&req.location), &id)?;
                 let address = address_for(&ip);
                 created.last_mut().expect("just pushed").1 = address.clone();
+                // The machine-identity linkage rides the pin — the
+                // executor's @cert-authority pin binds the certificate
+                // principal through it (#295 sub-task 4).
+                crate::provision::publish::record_machine_link(&pin.publish.home, &name, &address)?;
                 append_worker_entry(&req.config, &address, pin.ca_pin)?;
             }
         }

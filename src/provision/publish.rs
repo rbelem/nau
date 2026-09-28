@@ -109,6 +109,101 @@ fn registry_path(home: &Path) -> PathBuf {
     pending_dir(home).join("tokens.json")
 }
 
+/// The machine-linkage store root:
+/// `<home>/.config/shuttle/ca/machines/` — the provision-time record of
+/// which machine identity each pinned workers address belongs to (#295
+/// sub-task 4). The config entry carries only the address and the CA
+/// fingerprint (the amendment's "same config shape"), so this
+/// coordinator-side store is what lets the executor bind the pinned
+/// `@cert-authority` line to the certificate principal: the principal
+/// form is the machine identity, and the linkage is the only
+/// address→identity map that exists.
+pub fn machines_dir(home: &Path) -> PathBuf {
+    crate::ca::ca_dir(home).join("machines")
+}
+
+/// The filesystem slug for an address's linkage record: the same
+/// sha256-truncated form the executor's known_hosts files use, so both
+/// sides derive the same name from the same address string.
+fn machine_link_slug(address: &str) -> String {
+    crate::oci::sha256_hex(address.as_bytes())[..16].to_string()
+}
+
+/// One provision-time machine linkage: the pinned workers address and
+/// the machine identity (the provider-side server name) it was created
+/// for — the identity the certificate principal binds first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineLink {
+    pub address: String,
+    pub machine_identity: String,
+}
+
+fn machine_link_path(home: &Path, address: &str) -> PathBuf {
+    machines_dir(home).join(format!("machine-{}.json", machine_link_slug(address)))
+}
+
+/// Record one address→machine-identity linkage at provision time, next
+/// to the config pin transaction (the executor cannot build a
+/// `@cert-authority` connection without it). A malformed identity or
+/// address refuses — a provision whose executor could never connect is
+/// torn down, not pinned blind.
+pub fn record_machine_link(
+    home: &Path,
+    machine_identity: &str,
+    address: &str,
+) -> miette::Result<PathBuf> {
+    validate_machine_identity(machine_identity)?;
+    if address.is_empty() || address.chars().any(char::is_whitespace) {
+        return Err(miette::miette!(
+            "publish: refusing to link machine identity '{machine_identity}' to the malformed \
+             address '{address}'"
+        ));
+    }
+    std::fs::create_dir_all(machines_dir(home)).map_err(|e| {
+        miette::miette!(
+            "publish: cannot create the machine-linkage store {}: {e}",
+            machines_dir(home).display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            std::fs::set_permissions(machines_dir(home), std::fs::Permissions::from_mode(0o700));
+    }
+    let link = MachineLink {
+        address: address.to_string(),
+        machine_identity: machine_identity.to_string(),
+    };
+    let text = serde_json::to_string_pretty(&link)
+        .map_err(|e| miette::miette!("publish: cannot serialize the machine linkage: {e}"))?;
+    let path = machine_link_path(home, address);
+    atomic_write_0600(&path, &format!("{text}\n"))?;
+    Ok(path)
+}
+
+/// The linkage recorded for `address`, `Ok(None)` when absent. A corrupt
+/// record is a named refusal — the executor never guesses an identity.
+pub fn machine_link(home: &Path, address: &str) -> miette::Result<Option<MachineLink>> {
+    let path = machine_link_path(home, address);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        miette::miette!(
+            "publish: cannot read the machine linkage {}: {e}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&text).map(Some).map_err(|e| {
+        miette::miette!(
+            "publish: machine linkage {} is corrupt: {e} — fix or \
+             re-provision; refusing to guess the machine identity",
+            path.display()
+        )
+    })
+}
+
 /// One enrolled machine's pending entry, as the store persists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingIdentity {
@@ -1761,5 +1856,59 @@ mod tests {
             "shuttle-worker-abc123-01"
         );
         assert!(pending_identities(home).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn machine_link_round_trips_by_address_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let address = "ssh://root@203.0.113.9";
+        let path = record_machine_link(home, "shuttle-worker-x-01", address).unwrap();
+        assert_eq!(
+            path,
+            machines_dir(home).join(format!(
+                "machine-{}.json",
+                crate::oci::sha256_hex(address.as_bytes())[..16].to_string()
+            ))
+        );
+        let link = machine_link(home, address).unwrap().expect("linked");
+        assert_eq!(link.machine_identity, "shuttle-worker-x-01");
+        assert_eq!(link.address, address);
+        // A differently-formed address is a different worker: no link.
+        assert!(machine_link(home, "ssh://root@203.0.113.10")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn machine_link_refuses_malformed_identity_or_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = record_machine_link(dir.path(), "bad identity!", "ssh://root@203.0.113.9")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shuttle server name"), "{err}");
+        let err = record_machine_link(dir.path(), "shuttle-worker-x-01", "ssh://ro ot@h")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("malformed address"), "{err}");
+        // Nothing was written on refusal.
+        assert!(!machines_dir(dir.path()).exists());
+    }
+
+    #[test]
+    fn machine_link_corrupt_record_is_a_named_refusal_not_a_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        let address = "ssh://root@203.0.113.9";
+        record_machine_link(dir.path(), "shuttle-worker-x-01", address).unwrap();
+        let path = machine_link_path(dir.path(), address);
+        std::fs::write(&path, "{not json").unwrap();
+        let err = machine_link(dir.path(), address).unwrap_err().to_string();
+        assert!(err.contains("corrupt"), "{err}");
+        assert!(err.contains("refusing to guess"), "{err}");
     }
 }

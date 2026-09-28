@@ -26,13 +26,12 @@
 //! all — the one-time publish token is the only bearer it carries, and
 //! it dies at the first accepted publish.
 //!
-//! **Epic #295 interim state (by design)**: certificate issuance is
-//! sub-task 3 and the `@cert-authority` executor shape is sub-task 4 —
-//! until they land, the flow stops fail-closed at the pending store
-//! ([`publish::pending_dir`]) and [`crate::ssh_exec`] refuses the
-//! fingerprint-only pin at preflight. The fleet flow is intentionally
-//! incomplete in this window; every gap refuses by name rather than
-//! trusting anything unverified.
+//! **Epic #295 state (sub-tasks 1–4 landed)**: the CA flow works end to
+//! end — guest gen → publish → issue → pickup → cert served → the
+//! coordinator connects with a `@cert-authority` pin built from the CA
+//! fingerprint (the machine linkage under `ca/machines/` binds each
+//! pinned address to its certificate principal). Sub-task 5 retires the
+//! legacy mint-and-inject paths; until then nothing here emits them.
 
 pub mod aws;
 pub mod azure;
@@ -883,6 +882,71 @@ echo "publish-host-key: coordinator unreachable after 10 attempts — without th
 exit 0
 "#;
 
+/// The first-boot pickup script the template drops at
+/// `/etc/shuttle/pickup-host-cert.sh` (0700, #295 sub-task 4): GET the
+/// issued host certificate over the SAME one-time bearer channel the
+/// publish used (`/etc/shuttle/publish.env` carries every slot the
+/// pickup needs — URL, token). The certificate exists only after the
+/// coordinator signs (`shuttle workers issue`), so the guest polls with
+/// bounded retries until the token TTL closes the window
+/// ([`crate::provision::publish::PUBLISH_TOKEN_TTL_SECS`] = 1440 × 60s).
+/// On arrival the certificate is shape-checked (a cert line, not a
+/// proxy's 200 page), installed ATOMICALLY as
+/// `/etc/ssh/ssh_host_ed25519_key-cert.pub` beside the guest-generated
+/// key (sshd serves `<key>-cert.pub` automatically), and sshd is
+/// restarted to serve it. Fail-closed by construction: no certificate by
+/// window end means sshd serves only the raw host key, and the
+/// coordinator's `@cert-authority` pin refuses a raw key at host
+/// verification (`No ED25519 host key is known ... strict checking` →
+/// the preflight `ChannelLoss` names the worker) — the worker is
+/// unreachable to the fleet until it is re-provisioned or re-issued.
+const PICKUP_SCRIPT: &str = r#"#!/bin/sh
+# ADR-0045 amendment (#295): pick up the coordinator-issued host
+# certificate over the same one-time bearer the publish used. Public
+# material only; the window closes at the publish-token TTL.
+set -eu
+. /etc/shuttle/publish.env
+CERT=/etc/ssh/ssh_host_ed25519_key-cert.pub
+TMP=$CERT.tmp
+i=0
+while [ "$i" -lt 1440 ]; do
+  if curl -fsS -m 30 \
+      -H "Authorization: Bearer $PUBLISH_TOKEN" \
+      -o "$TMP" "$PUBLISH_URL" 2>/dev/null; then
+    if head -n 1 "$TMP" | grep -q 'ssh-ed25519-cert-v01@openssh.com'; then
+      chmod 0644 "$TMP"
+      mv "$TMP" "$CERT"
+      systemctl restart ssh || systemctl restart sshd
+      exit 0
+    fi
+    rm -f "$TMP"
+  fi
+  i=$((i + 1))
+  sleep 60
+done
+echo "pickup-host-cert: no certificate within the publish-token window (1440 x 60s) — the coordinator refuses this worker's raw host key (fail-closed); rebuild or re-provision to retry" >&2
+exit 0
+"#;
+
+/// The oneshot unit that runs [`PICKUP_SCRIPT`] outside cloud-init: the
+/// retry loop may legitimately run for the whole token window (the
+/// certificate appears only when the coordinator signs), and a
+/// cloud-init runcmd that long would hang the boot's final stage. The
+/// unit is enabled by the last runcmd, after the publish runcmd has
+/// already proven the channel up.
+const PICKUP_UNIT: &str = r#"[Unit]
+Description=shuttle: pick up the issued SSH host certificate (ADR-0045 amendment)
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=/etc/shuttle/pickup-host-cert.sh
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
 /// The shell-sourceable env file the publish script reads (0600): the
 /// three per-machine slots, single-quoted (the CLI boundary refuses
 /// values that would break out of the quotes).
@@ -903,11 +967,14 @@ fn publish_env(p: &UserDataParams<'_>) -> String {
 /// as the in-guest fallback COPY of the `shuttle-worker-ttl` label (the
 /// sweep's source of truth), the worker tool pins are installed (#273),
 /// the pinned shuttle binary is installed, sshd is hardened (key-only,
-/// root login by key) — and the first-boot publish script drops the
-/// PUBLIC half plus instance identity to the coordinator over the
-/// one-time token. The old post-sshd user-data scrub is GONE: it existed
-/// to scrub an injected private half; nothing sensitive ships anymore
-/// (ADR-0045 amendment: the scrub step is dead code and is removed).
+/// root login by key) — the first-boot publish script drops the PUBLIC
+/// half plus instance identity to the coordinator over the one-time
+/// token, and the pickup unit (a oneshot service, not a runcmd) fetches
+/// the issued certificate when the coordinator signs and serves it from
+/// sshd (#295 sub-task 4). The old post-sshd user-data scrub is GONE: it
+/// existed to scrub an injected private half; nothing sensitive ships
+/// anymore (ADR-0045 amendment: the scrub step is dead code and is
+/// removed).
 pub fn render_user_data(p: &UserDataParams<'_>) -> String {
     let mut s = String::from("#cloud-config\n");
     // Guest-local generation, explicit: cloud-init's ssh module generates
@@ -929,6 +996,18 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
         "/etc/shuttle/publish-host-key.sh",
         "0700",
         PUBLISH_SCRIPT,
+    );
+    write_file(
+        &mut s,
+        "/etc/shuttle/pickup-host-cert.sh",
+        "0700",
+        PICKUP_SCRIPT,
+    );
+    write_file(
+        &mut s,
+        "/etc/systemd/system/shuttle-pickup-host-cert.service",
+        "0644",
+        PICKUP_UNIT,
     );
     s.push_str("runcmd:\n");
     // Pin 2 first: the distro packages every later step needs — bwrap
@@ -959,6 +1038,11 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
     // The publish: last runcmd (final stage — after the ssh module has
     // generated the host keys and the network is up).
     s.push_str("  - /etc/shuttle/publish-host-key.sh\n");
+    // The pickup: a oneshot unit (NOT a runcmd — its bounded-retry loop
+    // may run for the whole token window) enabled after the publish has
+    // proven the channel up; the guest installs the issued certificate
+    // as /etc/ssh/ssh_host_ed25519_key-cert.pub and restarts sshd.
+    s.push_str("  - systemctl enable --now shuttle-pickup-host-cert.service\n");
     s
 }
 
