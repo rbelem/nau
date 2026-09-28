@@ -253,8 +253,12 @@ fn report_media_set(dir: &Path, img_name: &str, manifest_name: &str, kp: &crate:
     eprintln!(
         "  ℹ release checklist (ADR-0044 D8) — BLOCKING before distribution: run \
          examples/rebuild-compare.sh for two-machine byte-identity; the ADR-0013 \
-         trademark sweep remains blocking. Self-check: shuttle verify-image --device \
-         <img> --manifest {manifest_name} --key <anchor>"
+         trademark sweep remains blocking. Pre-ship check: shuttle verify-image \
+         --device <img> --manifest {manifest_name} verifies under the operator \
+         keychain (~/.config/shuttle/keys); any --key must be a copy from the \
+         ceremony keychain, NEVER a file served beside this media set — anchors \
+         travel OUT-OF-BAND (ADR-0033 D7); a --key fetched with the download is \
+         a self-bless. Procedure: docs/nau-ops-runbook.md §7."
     );
 }
 
