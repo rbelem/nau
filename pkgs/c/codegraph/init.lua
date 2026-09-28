@@ -18,7 +18,7 @@
 -- npmDepsHash closure carried. No exclude list: the runtime surface is
 -- WASM-only (web-tree-sitter + tree-sitter-wasms grammars, no native
 -- .node addons), so — unlike zg — there is nothing to prune, and
--- requires is glibc + node22 (the runtime interpreter, see below).
+-- requires is glibc + node@22 (the runtime interpreter, see below).
 --
 -- The flake also built a python tree-sitter-perl binding; the node CLI
 -- never imports it (grammars load as .wasm from tree-sitter-wasms) and
@@ -29,19 +29,23 @@
 -- (src/bin/codegraph.ts — the V8 turboshaft Zone OOM guard) with
 -- upstream's own override CODEGRAPH_ALLOW_UNSAFE_NODE=1; the actual
 -- mitigation (--liftoff-only relaunch) runs inside the CLI either way.
--- The pool node is 26.x, so the runtime is pinned to the LTS line:
--- `interpreter = "node22"` execs the bare name at runtime PATH, and
--- `requires` carries node22 (pkgs/n/node22, LTS 22 — the impeccable
--- interpreter-in-requires precedent) so any pod that declares
--- codegraph gets the matching interpreter closure-pulled, and pods
--- wanting the owned lifecycle compose it read-only via
--- `loads = { "codegraph" }` (issue #8). An earlier revision of this
--- comment claimed the daily pod declares the override env per
--- ADR-0030; no pod ever carried it (env.json stayed {}), and the
--- interpreter pin supersedes the approach.
+-- The pool node is 26.x, so the runtime is pinned to the LTS line —
+-- by CONSTRAINT, not by a renamed sibling (ADR-0047: there is exactly
+-- one `node` package; `requires` carries `node@22`, a requires-edge
+-- constraint, so any pod that declares codegraph closure-pulls the
+-- node 22 LINE — resolved into the same unsuffixed `node` payload a
+-- `node@22` pod spec would pin), and the app's
+-- `interpreter = "node"` execs the bare name at runtime PATH — the
+-- wrapper invariant: name-uniqueness-per-pod puts the same line's node
+-- on PATH as the staged script tree. Pods wanting the owned lifecycle
+-- compose it read-only via `loads = { "codegraph" }` (issue #8). An
+-- earlier revision of this comment carried a node22 sibling package
+-- (deleted per ticket #278) and claimed the daily pod declares the
+-- override env per ADR-0030; no pod ever carried it (env.json stayed
+-- {}), and the constraint pin supersedes both.
 --
 -- requires: glibc (the loader for the interpreter wrapper's node) and
--- node22 (the runtime interpreter itself).
+-- node@22 (the runtime interpreter itself, selected by constraint).
 -- build_deps: node — the tsc compile needs a runtime in-sandbox; the
 -- build prefix carries the pool node (ADR-0018 explicit-beats-implicit,
 -- not the mirrored host PATH).
@@ -92,13 +96,13 @@ return {
         }, " && "),
 
         type = "source",
-        requires = { "glibc", "node22" },
+        requires = { "glibc", "node@22" },
         build_deps = { "node" },
 
         apps = {
             codegraph = app {
                 command = "usr/lib/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
-                interpreter = "node22",
+                interpreter = "node",
             },
         },
     },
