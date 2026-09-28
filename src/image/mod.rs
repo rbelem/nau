@@ -1879,7 +1879,7 @@ pub(crate) use verity::*;
 pub use verity::{ESP_TYPE_GUID, ROOT_TYPE_GUID_X86_64, VERITY_TYPE_GUID_X86_64};
 
 // The `shuttle verify-image` surface (ADR-0044 D4, #265).
-pub use verify::{verify_device, VerifyImageArgs, VerifyOutcome};
+pub use verify::{verify_device, SlotSelector, VerifyImageArgs, VerifyOutcome};
 
 #[cfg(test)]
 mod tests {
