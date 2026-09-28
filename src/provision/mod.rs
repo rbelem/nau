@@ -22,6 +22,7 @@
 //! the guest and is scrubbed from the guest's user-data copy once `sshd`
 //! is up.
 
+pub mod aws;
 pub mod hetzner;
 
 use std::path::{Path, PathBuf};
@@ -55,6 +56,32 @@ fn token_from_env() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// Where the AWS CLI would resolve credentials from, without calling the
+/// API: `AWS_ACCESS_KEY_ID` (the dedicated worker-account key, the #271
+/// analog), else `AWS_PROFILE`, else `$HOME/.aws/credentials` on disk.
+/// Read at the CLI boundary so the provider core stays env-free under
+/// test; the aws CLI inherits the credential from the environment — it
+/// never enters argv.
+fn aws_credentials_source() -> Option<String> {
+    if std::env::var("AWS_ACCESS_KEY_ID")
+        .ok()
+        .is_some_and(|k| !k.trim().is_empty())
+    {
+        return Some("AWS_ACCESS_KEY_ID".into());
+    }
+    if std::env::var("AWS_PROFILE")
+        .ok()
+        .is_some_and(|p| !p.trim().is_empty())
+    {
+        return Some("AWS_PROFILE".into());
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    if Path::new(&home).join(".aws").join("credentials").exists() {
+        return Some("~/.aws/credentials".into());
+    }
+    None
+}
+
 /// CLI entry for `shuttle workers provision` / `shuttle workers destroy`.
 pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
     match command {
@@ -64,6 +91,8 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
             location,
             count,
             ttl,
+            spot,
+            max_price,
             dry_run,
             file,
         } => {
@@ -73,6 +102,8 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
                 location,
                 count,
                 ttl_secs: parse_ttl(&ttl)?,
+                spot,
+                max_price,
                 dry_run,
                 config: PathBuf::from(&file),
             };
@@ -121,8 +152,14 @@ fn provider_for(provider: &str) -> miette::Result<Box<dyn Provisioner>> {
             default_binary_url(),
             resolve_operator_key()?,
         ))),
+        "aws" => Ok(Box::new(aws::AwsProvisioner::new(
+            crate::command::RealRunner,
+            aws_credentials_source(),
+            default_binary_url(),
+            resolve_operator_key()?,
+        ))),
         other => Err(miette::miette!(
-            "workers: unknown provider '{other}' (supported: hetzner)"
+            "workers: unknown provider '{other}' (supported: hetzner, aws)"
         )),
     }
 }
@@ -179,11 +216,23 @@ pub struct ProvisionRequest {
     /// How many servers to create.
     pub count: u32,
     /// Worker lifetime in seconds — `--ttl`. Two stamps (the #269 v2
-    /// contract): the `shuttle-worker-ttl` hcloud label (epoch-seconds
-    /// expiry — the SOURCE OF TRUTH the sweep reads) and the in-guest
-    /// `/etc/shuttle/worker-ttl` marker (one decimal EPOCH-SECONDS line —
-    /// the sweep's `is_epoch` parses decimal only — a fallback COPY).
+    /// contract): the provider's `shuttle-worker-ttl` label/tag
+    /// (epoch-seconds expiry — the SOURCE OF TRUTH the sweep reads) and
+    /// the in-guest `/etc/shuttle/worker-ttl` marker (one decimal
+    /// EPOCH-SECONDS line — the sweep's `is_epoch` parses decimal only —
+    /// a fallback COPY).
     pub ttl_secs: u64,
+    /// `--spot`: request a provider spot/preemptible instance. Opt-in;
+    /// on-demand hourly is the default (providers plan §1: spot is for
+    /// eviction-tolerant lanes, per ADR-0040 Amendment 1 a spot eviction
+    /// is T5 worker loss — re-dispatched, never migrated). A provider
+    /// without a spot product refuses this flag rather than ignoring it.
+    pub spot: bool,
+    /// `--max-price`: the hourly USD cap a `--spot` instance may bid.
+    /// Required with `--spot` (an uncapped bid is not a cap); refused
+    /// without it (on-demand has no bid). Validated by the spot-capable
+    /// provider before any API call.
+    pub max_price: Option<String>,
     /// Dry run: resolve everything, render the user-data, print the plan —
     /// and exit before ANY provider API call (including the token check).
     pub dry_run: bool,
@@ -204,6 +253,9 @@ pub struct ProvisionPlan {
     pub ttl_secs: u64,
     pub ttl_expiry_iso: String,
     pub binary_url: String,
+    /// The `--max-price` cap when the plan is a spot plan, `None` for
+    /// on-demand — the plan must show the bid the real run would place.
+    pub spot_max_price: Option<String>,
     /// SHA-256 of the exact user-data blob a real run would send.
     pub user_data_sha256: String,
 }
@@ -277,6 +329,25 @@ pub fn mint_host_keypair(runner: &dyn CommandRunner, dir: &Path) -> miette::Resu
         private_pem: private_pem.trim_end().to_string(),
         public_line: public_line.trim_end().to_string(),
     })
+}
+
+/// Stage the user-data blob for the provider's create call INSIDE the mint
+/// tempdir (`dir`), mode 0600. The blob carries the minted private host
+/// half (server-auth, blast radius one machine per ADR-0045), so it must
+/// never sit at a fixed world-readable temp path: the per-run tempdir
+/// keeps concurrent provisions isolated, 0600 keeps it private while it
+/// exists, and it dies with the keypair when the tempdir drops.
+pub fn stage_user_data(dir: &Path, user_data: &str) -> miette::Result<PathBuf> {
+    let path = dir.join("user-data.yaml");
+    std::fs::write(&path, user_data)
+        .map_err(|e| miette::miette!("provision: cannot write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| miette::miette!("provision: cannot chmod 0600 {}: {e}", path.display()))?;
+    }
+    Ok(path)
 }
 
 // ── TTL (the #269 sweep contract) ──

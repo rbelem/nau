@@ -192,6 +192,8 @@ fn request(config: &Path, dry_run: bool) -> ProvisionRequest {
         location: "hel1".into(),
         count: 1,
         ttl_secs: parse_ttl("4h").unwrap(),
+        spot: false,
+        max_price: None,
         dry_run,
         config: config.to_path_buf(),
     }
@@ -249,6 +251,30 @@ fn no_token_refuses_before_any_api_call() {
     assert!(
         hcloud_calls(&fake).is_empty(),
         "no API call before the token refusal"
+    );
+}
+
+#[test]
+fn hetzner_has_no_spot_product_and_refuses_the_flag() {
+    // providers plan §1: spot is an aws capability. A hetzner provision
+    // carrying --spot is a REFUSAL, never a silent on-demand fallback —
+    // an on-demand instance pretending to be spot lies about its
+    // eviction class.
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let fake = FakeProvider::new(Script::default());
+    let mut req = request(&config, false);
+    req.spot = true;
+    req.max_price = Some("0.05".into());
+    let err = provisioner(&fake, Some("tok")).provision(&req).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("--spot is not supported on hetzner"),
+        "{text}"
+    );
+    assert!(
+        hcloud_calls(&fake).is_empty(),
+        "the refusal precedes every API call"
     );
 }
 
