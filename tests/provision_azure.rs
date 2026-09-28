@@ -17,7 +17,10 @@ use shuttle::provision::azure::{
     AzureProvisioner, ADMIN_USERNAME, IMAGE_URN, WORKER_SPOT_TAG, WORKER_TAG, WORKER_TTL_TAG,
 };
 use shuttle::provision::publish::PublishChannel;
-use shuttle::provision::{parse_ttl, ProvisionRequest, Provisioner, BLOCK_BEGIN, BLOCK_END};
+use shuttle::provision::{
+    parse_ttl, render_user_data, ProvisionRequest, Provisioner, UserDataParams, BLOCK_BEGIN,
+    BLOCK_END, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
+};
 
 const OPERATOR_KEY: &str = "ssh-ed25519 AAAAoperatorkey operator@example";
 const BINARY_URL: &str = "https://example.invalid/shuttle-amd64";
@@ -27,6 +30,15 @@ const SIZE: &str = "Standard_D4s_v5";
 /// `SHA256:` + 43 base64 chars — the pin grammar's fingerprint form).
 const CA_FPR: &str = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG";
 const PUBLISH_URL: &str = "https://coordinator.example/publish";
+
+/// A shape-valid ed25519 public line — throwaway fixture bytes, no
+/// crypto. Reused as the published-key fixture in payload-shape tests.
+const TEST_HOST_PUB: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ shuttle-worker-host-key";
+
+/// A fixed marker expiry for template-shape assertions (decimal epoch
+/// seconds — the #269 sweep's `is_epoch` shape).
+const MARKER_EPOCH: u64 = 1_788_000_000;
 
 // ── The scripted provider CLI ──
 
@@ -317,13 +329,32 @@ fn throwaway_publish_channel() -> PublishChannel {
     }
 }
 
+/// A publish channel over a bound throwaway home — for tests that read
+/// the token registry back.
+fn pubtmp() -> (tempfile::TempDir, PublishChannel) {
+    let d = tempfile::tempdir().unwrap();
+    let channel = PublishChannel {
+        url: PUBLISH_URL.into(),
+        home: d.path().to_path_buf(),
+    };
+    (d, channel)
+}
+
 fn provisioner(fake: &FakeAz, credentials: Option<&str>) -> AzureProvisioner<FakeAz> {
+    provisioner_with(fake, credentials, Some(throwaway_publish_channel()))
+}
+
+fn provisioner_with(
+    fake: &FakeAz,
+    credentials: Option<&str>,
+    publish: Option<PublishChannel>,
+) -> AzureProvisioner<FakeAz> {
     AzureProvisioner::new(
         fake.clone(),
         credentials.map(|c| c.to_string()),
         BINARY_URL.into(),
         OPERATOR_KEY.into(),
-        Some(throwaway_publish_channel()),
+        publish,
     )
 }
 
@@ -1058,5 +1089,200 @@ fn the_base_image_pins_the_latest_ubuntu_lts_never_a_codename() {
     assert!(
         IMAGE_URN.ends_with(":latest"),
         "the version leg rolls security updates: {IMAGE_URN}"
+    );
+}
+
+// ── Amendment convergence: guest-local keys, publish callback, one-time tokens ──
+// (the same block the Hetzner suite carries — one converted shape, five providers)
+
+#[test]
+fn dry_run_user_data_resolves_to_the_real_template() {
+    // The dry-run render path runs for real (local only); the rendered
+    // user-data must be byte-identical to the shared template's output
+    // for the same inputs — the plan is the REAL plan (shape-wise: the
+    // publish slots carry the documented placeholders, the real
+    // per-VM blob differs only there).
+    let user_data = render_user_data(&UserDataParams {
+        machine_identity: PLAN_MACHINE_IDENTITY,
+        publish_url: PLAN_PUBLISH_URL,
+        publish_token: PLAN_PUBLISH_TOKEN,
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: 1_700_000_000 + 14_400,
+    });
+    assert!(user_data.starts_with("#cloud-config\n"));
+    // Deterministic: same inputs, same blob, same hash — the plan lane
+    // diffs this hash against the sent user-data.
+    let again = render_user_data(&UserDataParams {
+        machine_identity: PLAN_MACHINE_IDENTITY,
+        publish_url: PLAN_PUBLISH_URL,
+        publish_token: PLAN_PUBLISH_TOKEN,
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: 1_700_000_000 + 14_400,
+    });
+    assert_eq!(user_data, again);
+}
+
+#[test]
+fn user_data_generates_keys_guest_side_and_never_carries_a_private_half() {
+    // THE amendment assertion (ADR-0045): the template turns host-key
+    // generation ON (explicit — never a default relied on) and contains
+    // NO private half anywhere. The absence is the security property.
+    let user_data = render_user_data(&UserDataParams {
+        machine_identity: "shuttle-worker-abc-01",
+        publish_url: PUBLISH_URL,
+        publish_token: "a".repeat(64).as_str(),
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: MARKER_EPOCH,
+    });
+    // Guest-local generation, explicit.
+    assert!(user_data.contains("ssh_deletekeys: true"));
+    assert!(user_data.contains("ssh_genkey: true"));
+    // Absence: no injected keypair write_files, no PEM, no mint.
+    assert!(!user_data.contains("path: /etc/ssh/ssh_host_ed25519_key\n"));
+    assert!(!user_data.contains("BEGIN OPENSSH PRIVATE KEY"));
+    assert!(!user_data.contains("ssh-keygen"));
+    assert!(
+        !user_data.contains(TEST_HOST_PUB),
+        "no coordinator-minted key material rides the blob"
+    );
+    // The old post-sshd scrub is dead code under the amendment — removed.
+    assert!(!user_data.contains("rm -f /var/lib/cloud/instances"));
+    // The operator login flow is untouched.
+    assert!(user_data.contains("path: /root/.ssh/authorized_keys"));
+    assert!(user_data.contains(OPERATOR_KEY));
+}
+
+#[test]
+fn user_data_carries_the_publish_callback_and_one_time_token() {
+    // The publish block: a 0600 env file with the three per-machine
+    // slots, a 0700 script that reads the GUEST-GENERATED public half +
+    // the cloud-init instance-data document, and the POST with the
+    // one-time bearer. The URL/token/identity ride the env file, never
+    // loose argv interpolation.
+    let token = "b".repeat(64);
+    let user_data = render_user_data(&UserDataParams {
+        machine_identity: "shuttle-worker-abc-01",
+        publish_url: PUBLISH_URL,
+        publish_token: &token,
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: MARKER_EPOCH,
+    });
+    assert!(user_data.contains("path: /etc/shuttle/publish.env\n    permissions: \"0600\""));
+    assert!(user_data.contains(&format!("MACHINE_IDENTITY='shuttle-worker-abc-01'")));
+    assert!(user_data.contains(&format!("PUBLISH_URL='{PUBLISH_URL}'")));
+    assert!(user_data.contains(&format!("PUBLISH_TOKEN='{token}'")));
+    assert!(user_data.contains("path: /etc/shuttle/publish-host-key.sh\n    permissions: \"0700\""));
+    // The script reads the locally generated ed25519 public half and the
+    // cloud-init normalized instance-data (the D3 principal content).
+    assert!(user_data.contains("/etc/ssh/ssh_host_ed25519_key.pub"));
+    assert!(user_data.contains("/run/cloud-init/instance-data.json"));
+    assert!(user_data.contains("instance_identity"));
+    assert!(user_data.contains("Authorization: Bearer $PUBLISH_TOKEN"));
+    // The publish runs LAST (after curl is installed) and retries are
+    // bounded — a not-yet-up coordinator never bricks the boot.
+    let runcmds: Vec<&str> = user_data
+        .lines()
+        .filter(|l| l.starts_with("  - "))
+        .collect();
+    assert_eq!(
+        runcmds.last().copied(),
+        Some("  - /etc/shuttle/publish-host-key.sh"),
+        "publish is the final runcmd: {runcmds:?}"
+    );
+    assert!(user_data.contains("while [ \"$i\" -lt 10 ]"));
+    assert!(user_data.contains("curl -fsS -m 30"));
+    // The TTL marker (the #269 sweep contract): one DECIMAL EPOCH-SECONDS
+    // line — the sweep's is_epoch parses decimal only.
+    assert!(user_data.contains("path: /etc/shuttle/worker-ttl"));
+    assert!(user_data.contains(&format!("content: |\n      {MARKER_EPOCH}\n")));
+    // Pinned shuttle binary install + sshd hardening.
+    assert!(user_data.contains(BINARY_URL));
+    assert!(user_data.contains("PasswordAuthentication no"));
+    assert!(user_data.contains("PermitRootLogin prohibit-password"));
+    // The provider credential never rides user-data.
+    assert!(!user_data.contains("AZURE_CLIENT_SECRET"));
+}
+
+#[test]
+fn each_server_gets_its_own_recorded_one_time_token() {
+    // The convergence property, read back from the coordinator registry:
+    // N VMs → N recorded tokens, each bound to its own machine identity,
+    // none consumed (issuance is sub-task 3).
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let (pubhome, publish) = pubtmp();
+    let fake = FakeAz::new(Script::default());
+    let mut req = request(&config, false);
+    req.count = 2;
+    provisioner_with(&fake, Some("env"), Some(publish))
+        .provision(&req)
+        .unwrap();
+
+    let registry = std::fs::read_to_string(
+        pubhome
+            .path()
+            .join(".config/shuttle/ca/pending/tokens.json"),
+    )
+    .expect("the registry exists after provision");
+    let v: serde_json::Value = serde_json::from_str(&registry).unwrap();
+    let tokens = v["tokens"].as_array().unwrap();
+    assert_eq!(tokens.len(), 2, "one recorded issuance per VM");
+    let mut identities: Vec<&str> = tokens
+        .iter()
+        .map(|t| t["machine_identity"].as_str().unwrap())
+        .collect();
+    identities.sort();
+    assert!(
+        identities.windows(2).all(|w| w[0] != w[1]),
+        "one identity per VM: {identities:?}"
+    );
+    for t in tokens {
+        assert!(
+            t["consumed_at_epoch"].is_null(),
+            "nothing consumed yet — issuance is sub-task 3"
+        );
+    }
+}
+
+#[test]
+fn no_publish_channel_refuses_before_any_api_call() {
+    // Fail-closed: a provision whose guest cannot publish can never be
+    // issued a certificate — refused before the create, nothing torn
+    // down, config untouched.
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let fake = FakeAz::new(Script::default());
+    let err = provisioner_with(&fake, Some("env"), None)
+        .provision(&request(&config, false))
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("no publish channel"), "{text}");
+    assert!(text.contains("SHUTTLE_PUBLISH_URL"), "{text}");
+    assert!(
+        az_calls(&fake).is_empty(),
+        "no API call before the publish-channel refusal"
+    );
+}
+
+#[test]
+fn no_ca_fingerprint_refuses_before_any_api_call() {
+    // Fail-closed interim: the pin IS the CA fingerprint; a request
+    // without one is a named refusal before any API call.
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let fake = FakeAz::new(Script::default());
+    let mut req = request(&config, false);
+    req.ca_fingerprint = None;
+    let err = provisioner(&fake, Some("env")).provision(&req).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("no host CA fingerprint"), "{text}");
+    assert!(text.contains("shuttle ca keygen"), "{text}");
+    assert!(
+        az_calls(&fake).is_empty(),
+        "no API call before the CA-pin refusal"
     );
 }
