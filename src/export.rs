@@ -34,6 +34,25 @@
 //! was not written by shuttle — it accumulates exactly as before,
 //! deleting nothing it did not write (and gets claimed by the marker
 //! from that export on).
+//!
+//! # Curation (the per-mission mirror, #275)
+//!
+//! `run_mission` exports a CURATED tree: only the packages one mission
+//! pins. The pin set is the mission's existing `image()` declaration —
+//! the names [`crate::image::ImageDeclaration::all_snaps`] collects
+//! (base, kernel, gadget, declared snaps) — no new schema. A pinned
+//! name the pool does not hold is a hard, named error BEFORE anything
+//! is written: a mirror missing a mission's pinned package would hand
+//! its users an unverifiable tree. The pull-staging inbox is out of
+//! scope for a curated export — a mission pins a closed set; staged
+//! peer content is not the released pool.
+//!
+//! # Determinism
+//!
+//! A re-export of the same pool + mission is byte-identical: packages
+//! iterate in `BTreeMap` order, JSON is written in struct field order,
+//! and the ed25519 signature is deterministic (RFC 8032) — same store,
+//! same key, same bytes.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -41,9 +60,61 @@ use std::path::{Path, PathBuf};
 use miette::{IntoDiagnostic, WrapErr};
 use serde::{Deserialize, Serialize};
 
+use crate::image::ImageDeclaration;
 use crate::pkg_manifest::{self, PackageManifest};
 use crate::runtime::{Generation, RuntimeStore};
 use crate::sign::KeyPair;
+
+/// The per-mission curation list (#275): the package names one mission
+/// pins, applied at export time. A set — the base/kernel/gadget refs
+/// may repeat a name, and set semantics keep the resolved pin set
+/// canonical.
+pub type Curation = BTreeSet<String>;
+
+/// The curation list of one mission: the names its `image()`
+/// declaration pins. This is the existing mission schema — the same
+/// declaration `shuttle image --output-name` builds from; export adds
+/// no new pin format.
+pub fn mission_curation(image: &ImageDeclaration) -> Curation {
+    image
+        .all_snaps()
+        .into_iter()
+        .map(|snap| snap.name.clone())
+        .collect()
+}
+
+/// Resolve a curation list against the pool's generation: every pinned
+/// name must be exportable, fail-closed (naming the missing pins —
+/// sorted, since `Curation` iteration is ordered). Returns the keep
+/// set the generation walk filters on.
+fn resolve_pins(
+    generation: &Option<Generation>,
+    pins: &Curation,
+) -> miette::Result<BTreeSet<String>> {
+    if pins.is_empty() {
+        miette::bail!("mission pins no packages — nothing to curate");
+    }
+    let mut resolved = BTreeSet::new();
+    let mut missing = Vec::new();
+    for name in pins {
+        if generation
+            .as_ref()
+            .is_some_and(|g| g.packages.contains_key(name))
+        {
+            resolved.insert(name.clone());
+        } else {
+            missing.push(name.clone());
+        }
+    }
+    if !missing.is_empty() {
+        miette::bail!(
+            "mission pool is missing pinned package(s): {} — refusing \
+             to export an incomplete curated tree",
+            missing.join(", ")
+        );
+    }
+    Ok(resolved)
+}
 
 /// One package row of `index.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,22 +144,47 @@ const MARKER_VERSION: &str = "v1";
 /// Run `shuttle export` into `out` for the named pod (`None` = the
 /// default pod).
 pub fn run(out: &str, pod: Option<&str>) -> miette::Result<()> {
+    export_at(out, pod, None)
+}
+
+/// Run a CURATED `shuttle export` (#275): only the packages `curation`
+/// pins, for the named pod. Every pinned name must be in the pool —
+/// anything else is a named, fail-closed error before the tree is
+/// touched.
+pub fn run_mission(out: &str, pod: Option<&str>, curation: &Curation) -> miette::Result<()> {
+    export_at(out, pod, Some(curation))
+}
+
+fn export_at(out: &str, pod: Option<&str>, curation: Option<&Curation>) -> miette::Result<()> {
     let pod_name = pod.unwrap_or(crate::pod::DEFAULT_POD);
     let root = crate::pod::pod_root(None);
     let dir = crate::pod::pod_dir(&root, pod_name);
     let store = crate::pod::pod_store(&dir);
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-    run_at(Path::new(out), &store, &home)
+    run_at(Path::new(out), &store, &home, curation)
 }
 
 /// Export `store`'s shareable content into `out`, signing minted
 /// manifests with the operator key under `home`. Split from [`run`] so
-/// tests can inject the store root and signing-key home.
-fn run_at(out: &Path, store: &RuntimeStore, home: &Path) -> miette::Result<()> {
+/// tests can inject the store root and signing-key home. `curation`
+/// narrows the export to a mission's pinned set (`None` = the whole
+/// exportable store, the historical behavior).
+fn run_at(
+    out: &Path,
+    store: &RuntimeStore,
+    home: &Path,
+    curation: Option<&Curation>,
+) -> miette::Result<()> {
     let generation = store.active_generation()?;
-    let inbox = pkg_manifest::inbox_manifests(store.root())?;
+    // Curation resolves BEFORE the tree is touched: a mission pinning a
+    // package the pool does not hold is a named error, never a partial
+    // mirror.
+    let keep = curation
+        .map(|pins| resolve_pins(&generation, pins))
+        .transpose()?;
+    let (inbox, generation_has_packages) = select_pool(store, &generation, &keep)?;
     let inbox_only = pkg_manifest::union_inbox(&generation, &inbox);
-    ensure_exportable(store.root(), &generation, &inbox_only)?;
+    ensure_exportable(store.root(), generation_has_packages, &inbox_only)?;
     let (manifests_dir, blobs_dir) = prepare_dirs(out)?;
     // Ownership is decided from the directory AS FOUND: a tree shuttle
     // wrote before (marker present) gets stale-entry pruning this
@@ -97,11 +193,14 @@ fn run_at(out: &Path, store: &RuntimeStore, home: &Path) -> miette::Result<()> {
 
     let (copied, mut packages) = write_tree(
         store,
-        &manifests_dir,
-        &blobs_dir,
-        home,
+        &Sinks {
+            manifests: &manifests_dir,
+            blobs: &blobs_dir,
+            home,
+        },
         &generation,
         &inbox_only,
+        keep.as_ref(),
     )?;
 
     // Canonical index order regardless of generation-vs-inbox split.
@@ -129,16 +228,44 @@ fn run_at(out: &Path, store: &RuntimeStore, home: &Path) -> miette::Result<()> {
     write_json(&out.join("index.json"), &index)
 }
 
+/// The exportable pool split for this run: the staged-inbox additions
+/// (empty under curation — a mission pins a closed set, staged peer
+/// content is not the released pool) and whether the generation itself
+/// carries anything to export.
+fn select_pool(
+    store: &RuntimeStore,
+    generation: &Option<Generation>,
+    keep: &Option<BTreeSet<String>>,
+) -> miette::Result<(Vec<(String, PathBuf)>, bool)> {
+    match keep {
+        Some(keep) => Ok((Vec::new(), !keep.is_empty())),
+        None => {
+            let inbox = pkg_manifest::inbox_manifests(store.root())?;
+            let generation_has_packages =
+                generation.as_ref().is_some_and(|g| !g.packages.is_empty());
+            Ok((inbox, generation_has_packages))
+        }
+    }
+}
+
+/// The write destinations of one export run: the tree's `manifests/`
+/// and `blobs/` directories plus the signing-key home. Bundled so the
+/// walk helpers take one destination argument, not three.
+struct Sinks<'a> {
+    manifests: &'a Path,
+    blobs: &'a Path,
+    home: &'a Path,
+}
+
 /// Export every manifest + blob of the current exportable set into the
 /// tree. Returns the copied blob hashes (the `blobs/` keep set) and
 /// the index rows (from which the `manifests/` keep set derives).
 fn write_tree(
     store: &RuntimeStore,
-    manifests_dir: &Path,
-    blobs_dir: &Path,
-    home: &Path,
+    sinks: &Sinks,
     generation: &Option<Generation>,
     inbox_only: &[&(String, PathBuf)],
+    keep: Option<&BTreeSet<String>>,
 ) -> miette::Result<(BTreeSet<String>, Vec<IndexPackage>)> {
     // Dedup across packages: a shared blob is copied once (content
     // addressing makes re-copies byte-identical, so this is purely
@@ -147,24 +274,9 @@ fn write_tree(
     let mut packages: Vec<IndexPackage> = Vec::new();
 
     if let Some(gen) = generation {
-        export_generation(
-            store,
-            manifests_dir,
-            blobs_dir,
-            home,
-            gen,
-            &mut copied,
-            &mut packages,
-        )?;
+        export_generation(store, sinks, gen, keep, &mut copied, &mut packages)?;
     }
-    export_inbox(
-        store,
-        manifests_dir,
-        blobs_dir,
-        inbox_only,
-        &mut copied,
-        &mut packages,
-    )?;
+    export_inbox(store, sinks, inbox_only, &mut copied, &mut packages)?;
     Ok((copied, packages))
 }
 
@@ -226,14 +338,14 @@ fn prune_dir(dir: &Path, keep: &BTreeSet<String>) -> miette::Result<()> {
 
 /// An empty store is a clear error, not an empty tree: nothing is
 /// exportable when the generation carries no packages AND the inbox is
-/// empty.
+/// empty. `generation_has_packages` arrives pre-computed (under
+/// curation it reflects the resolved keep set, not the raw generation).
 fn ensure_exportable(
     store_root: &Path,
-    generation: &Option<Generation>,
+    generation_has_packages: bool,
     inbox_only: &[&(String, PathBuf)],
 ) -> miette::Result<()> {
-    let has_packages = generation.as_ref().is_some_and(|g| !g.packages.is_empty());
-    if !has_packages && inbox_only.is_empty() {
+    if !generation_has_packages && inbox_only.is_empty() {
         miette::bail!(
             "pod store {} is empty — no installed packages and no staged \
              peer manifests; nothing to export",
@@ -260,13 +372,13 @@ fn prepare_dirs(out: &Path) -> miette::Result<(PathBuf, PathBuf)> {
 
 /// Mint + sign one manifest per generation package and copy its blobs
 /// (ADR-0033 Decision 2: unsigned store entries are never served — the
-/// signing key is required and its absence is a named error).
+/// signing key is required and its absence is a named error). `keep`
+/// narrows the walk to a mission's pinned names (`None` = all).
 fn export_generation(
     store: &RuntimeStore,
-    manifests_dir: &Path,
-    blobs_dir: &Path,
-    home: &Path,
+    sinks: &Sinks,
     gen: &Generation,
+    keep: Option<&BTreeSet<String>>,
     copied: &mut BTreeSet<String>,
     packages: &mut Vec<IndexPackage>,
 ) -> miette::Result<()> {
@@ -274,17 +386,22 @@ fn export_generation(
     // BTreeMap iteration: sorted by name — deterministic tree, and the
     // first missing-blob error is the alphabetically first package.
     for record in gen.packages.values() {
+        if let Some(keep) = keep {
+            if !keep.contains(&record.name) {
+                continue;
+            }
+        }
         if signing.is_none() {
-            signing = Some(pkg_manifest::load_signing_key(home)?);
+            signing = Some(pkg_manifest::load_signing_key(sinks.home)?);
         }
         let mut manifest = pkg_manifest::mint_manifest(record);
         pkg_manifest::sign(&mut manifest, signing.as_ref().expect("key loaded above"))?;
         write_json(
-            &manifests_dir.join(format!("{}.json", record.name)),
+            &sinks.manifests.join(format!("{}.json", record.name)),
             &manifest,
         )?;
         for hash in &record.files {
-            copy_blob(store, blobs_dir, hash, &record.name, copied)?;
+            copy_blob(store, sinks.blobs, hash, &record.name, copied)?;
         }
         packages.push(IndexPackage {
             name: record.name.clone(),
@@ -303,22 +420,13 @@ fn export_generation(
 /// manifest never becomes a path.
 fn export_inbox(
     store: &RuntimeStore,
-    manifests_dir: &Path,
-    blobs_dir: &Path,
+    sinks: &Sinks,
     inbox_only: &[&(String, PathBuf)],
     copied: &mut BTreeSet<String>,
     packages: &mut Vec<IndexPackage>,
 ) -> miette::Result<()> {
     for (name, path) in inbox_only {
-        export_one_staged(
-            store,
-            manifests_dir,
-            blobs_dir,
-            name,
-            path,
-            copied,
-            packages,
-        )?;
+        export_one_staged(store, sinks, name, path, copied, packages)?;
     }
     Ok(())
 }
@@ -326,8 +434,7 @@ fn export_inbox(
 /// One staged manifest, verbatim + its blob set, into the tree.
 fn export_one_staged(
     store: &RuntimeStore,
-    manifests_dir: &Path,
-    blobs_dir: &Path,
+    sinks: &Sinks,
     name: &str,
     path: &PathBuf,
     copied: &mut BTreeSet<String>,
@@ -343,11 +450,11 @@ fn export_one_staged(
         )
     })?;
     validate_staged_hashes(name, &manifest)?;
-    std::fs::copy(path, manifests_dir.join(format!("{name}.json")))
+    std::fs::copy(path, sinks.manifests.join(format!("{name}.json")))
         .into_diagnostic()
         .wrap_err_with(|| format!("copying staged manifest for '{name}'"))?;
     for file in &manifest.files {
-        copy_blob(store, blobs_dir, &file.sha256, name, copied)?;
+        copy_blob(store, sinks.blobs, &file.sha256, name, copied)?;
     }
     packages.push(IndexPackage {
         name: name.to_string(),
@@ -558,7 +665,7 @@ mod tests {
     #[test]
     fn tree_shape_index_manifests_and_deduped_blobs() {
         let fx = fabricate();
-        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
+        run_at(&fx.out, &fx.store, fx._home.path(), None).unwrap();
 
         // index.json parses and lists every exportable package.
         let index: IndexJson =
@@ -620,7 +727,7 @@ mod tests {
         gamma.files[0].sha256 = "../../etc/passwd".to_string();
         std::fs::write(&inbox_path, serde_json::to_vec(&gamma).unwrap()).unwrap();
 
-        let err = run_at(&fx.out, &fx.store, fx._home.path()).unwrap_err();
+        let err = run_at(&fx.out, &fx.store, fx._home.path(), None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("64 lowercase hex"), "names the rule: {msg}");
         assert!(msg.contains("gamma"), "names the package: {msg}");
@@ -636,7 +743,7 @@ mod tests {
         let alpha_hash = h(ALPHA_ONLY);
         std::fs::remove_file(fx.store.blob_path(&alpha_hash)).unwrap();
 
-        let err = run_at(&fx.out, &fx.store, fx._home.path()).unwrap_err();
+        let err = run_at(&fx.out, &fx.store, fx._home.path(), None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("alpha"), "error must name the package: {msg}");
         assert!(msg.contains(&alpha_hash), "error must name the hash: {msg}");
@@ -649,7 +756,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let out = state.path().join("tree");
 
-        let err = run_at(&out, &store, home.path()).unwrap_err();
+        let err = run_at(&out, &store, home.path(), None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("empty"), "error must say empty: {msg}");
         assert!(
@@ -665,8 +772,8 @@ mod tests {
         std::fs::create_dir_all(&fx.out).unwrap();
         std::fs::write(&keep, b"mine").unwrap();
 
-        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
-        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
+        run_at(&fx.out, &fx.store, fx._home.path(), None).unwrap();
+        run_at(&fx.out, &fx.store, fx._home.path(), None).unwrap();
 
         assert_eq!(std::fs::read(&keep).unwrap(), b"mine");
         assert_eq!(
@@ -681,7 +788,7 @@ mod tests {
     #[test]
     fn owned_reexport_prunes_removed_packages() {
         let fx = fabricate();
-        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
+        run_at(&fx.out, &fx.store, fx._home.path(), None).unwrap();
         assert_eq!(
             std::fs::read_to_string(fx.out.join(MARKER_FILE))
                 .unwrap()
@@ -702,7 +809,7 @@ mod tests {
         )
         .unwrap();
 
-        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
+        run_at(&fx.out, &fx.store, fx._home.path(), None).unwrap();
 
         assert!(
             !fx.out.join("manifests").join("beta.json").exists(),
@@ -746,13 +853,13 @@ mod tests {
         std::fs::write(&stray_blob, b"stray").unwrap();
 
         // First export: no marker found → zero deletions.
-        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
+        run_at(&fx.out, &fx.store, fx._home.path(), None).unwrap();
         assert_eq!(std::fs::read(&foreign).unwrap(), b"mine");
         assert!(stray_manifest.exists(), "marker-less dir: no deletions");
         assert!(stray_blob.exists(), "marker-less dir: no deletions");
 
         // Claimed by the first export: the next one prunes the strays.
-        run_at(&fx.out, &fx.store, fx._home.path()).unwrap();
+        run_at(&fx.out, &fx.store, fx._home.path(), None).unwrap();
         assert!(!stray_manifest.exists(), "owned now: stale manifest pruned");
         assert!(!stray_blob.exists(), "owned now: stale blob pruned");
         assert_eq!(
@@ -782,5 +889,179 @@ mod tests {
         let exe: Vec<&ManifestFile> = manifest.files.iter().filter(|f| f.executable).collect();
         assert_eq!(exe.len(), 1);
         assert_eq!(exe[0].sha256, bin_hash);
+    }
+
+    // ── #275: the per-mission mirror — curation + determinism ──
+
+    use crate::image::ImageDeclaration;
+    use crate::image::KernelEntry;
+    use crate::snap::SnapRef;
+
+    /// A mission declaration in the image-module test shape: base +
+    /// kernel + one extra snap. The pin set export curates from — the
+    /// same `image()` schema `shuttle image` consumes, no new format.
+    fn mission() -> ImageDeclaration {
+        ImageDeclaration {
+            name: "workstation".into(),
+            version: "1.0".into(),
+            base: SnapRef {
+                name: "alpha".into(),
+                revision: None,
+                sha3_384: None,
+            },
+            kernel: Some(KernelEntry {
+                snap: SnapRef {
+                    name: "beta".into(),
+                    revision: None,
+                    sha3_384: None,
+                },
+                params: vec![],
+                modules: vec![],
+                modprobe_config: None,
+                channel: None,
+            }),
+            gadget: None,
+            gadget_channel: None,
+            extra_snaps: vec![SnapRef {
+                name: "gamma".into(),
+                revision: None,
+                sha3_384: None,
+            }],
+            bootloader: None,
+            disk: None,
+            sysctl: vec![],
+            update_source: None,
+            files: vec![],
+            boot_health_exec: None,
+        }
+    }
+
+    fn set(names: &[&str]) -> Curation {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Recursive map of every file under `dir`: relative path → bytes.
+    /// The byte-for-byte comparison the determinism test asserts on.
+    fn tree_bytes(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, files);
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    files.insert(rel, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        walk(dir, dir, &mut files);
+        files
+    }
+
+    #[test]
+    fn mission_curation_collects_the_pinned_names() {
+        let curation = mission_curation(&mission());
+        assert_eq!(
+            curation,
+            set(&["alpha", "beta", "gamma"]),
+            "base + kernel + declared snaps, set-deduped"
+        );
+    }
+
+    /// A curated export writes ONLY the pinned packages: index rows,
+    /// manifests, and blobs exactly the pin set — the unpinned
+    /// generation packages and the staged inbox manifest never appear.
+    #[test]
+    fn curated_export_writes_only_the_pinned_pool() {
+        let fx = fabricate();
+        let curation = set(&["alpha"]);
+        run_at(&fx.out, &fx.store, fx._home.path(), Some(&curation)).unwrap();
+
+        let index: IndexJson =
+            serde_json::from_str(&std::fs::read_to_string(fx.out.join("index.json")).unwrap())
+                .unwrap();
+        let rows: Vec<&str> = index.packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(rows, vec!["alpha"], "index carries exactly the pins");
+
+        let manifests: Vec<String> = std::fs::read_dir(fx.out.join("manifests"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(manifests, vec!["alpha.json"], "unpinned + staged: absent");
+
+        let blobs: Vec<String> = std::fs::read_dir(fx.out.join("blobs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let mut expected = vec![h(SHARED), h(ALPHA_ONLY)];
+        expected.sort();
+        assert_eq!(blobs, expected, "exactly the pinned package's blobs");
+    }
+
+    /// A pin the pool does not hold fails the export BEFORE anything is
+    /// written — a mirror missing a mission's pinned package would hand
+    /// its users an unverifiable tree.
+    #[test]
+    fn curated_export_missing_pin_fails_closed_before_writing() {
+        let fx = fabricate();
+        let curation = set(&["alpha", "ghost"]);
+        let err = run_at(&fx.out, &fx.store, fx._home.path(), Some(&curation)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ghost"), "names the missing pin: {msg}");
+        assert!(
+            msg.contains("missing pinned package"),
+            "names the rule: {msg}"
+        );
+        assert!(
+            !fx.out.join("index.json").exists(),
+            "no tree may be written for unresolved pins"
+        );
+        assert!(
+            !fx.out.join("manifests").join("alpha.json").exists(),
+            "nothing copied for unresolved pins"
+        );
+    }
+
+    #[test]
+    fn empty_curation_is_an_error() {
+        let fx = fabricate();
+        let curation = Curation::new();
+        let err = run_at(&fx.out, &fx.store, fx._home.path(), Some(&curation)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pins no packages"), "names the rule: {msg}");
+    }
+
+    /// Re-export of the same pool + mission is byte-identical: two
+    /// fresh exports AND a re-export into an already-owned tree produce
+    /// the same bytes everywhere (BTreeMap order, struct-order JSON,
+    /// deterministic ed25519).
+    #[test]
+    fn curated_reexport_is_byte_identical() {
+        let fx = fabricate();
+        let curation = set(&["alpha"]);
+        let out_b = fx.out.parent().unwrap().join("tree-b");
+
+        run_at(&fx.out, &fx.store, fx._home.path(), Some(&curation)).unwrap();
+        run_at(&out_b, &fx.store, fx._home.path(), Some(&curation)).unwrap();
+        assert_eq!(
+            tree_bytes(&fx.out),
+            tree_bytes(&out_b),
+            "two fresh exports of one pool+mission: identical bytes"
+        );
+
+        // Re-export into the owned tree: still identical (pruning
+        // rewrites nothing that survives).
+        run_at(&fx.out, &fx.store, fx._home.path(), Some(&curation)).unwrap();
+        assert_eq!(
+            tree_bytes(&fx.out),
+            tree_bytes(&out_b),
+            "re-export into an owned tree: identical bytes"
+        );
     }
 }

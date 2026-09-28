@@ -318,7 +318,12 @@ fn main() -> miette::Result<()> {
             cmd_peers(secs)
         }
 
-        Command::Export { out, pod } => cmd_export(&out, pod.as_deref()),
+        Command::Export {
+            out,
+            pod,
+            mission,
+            file,
+        } => cmd_export(&out, pod.as_deref(), mission.as_deref(), file.as_deref()),
 
         Command::EvalWorker => shuttle::isolate::worker_main(),
 
@@ -4703,8 +4708,35 @@ fn cmd_peers(secs: u64) -> miette::Result<()> {
 
 /// `shuttle export`: hand the destination and pod to the export lane
 /// (ADR-0033 Decision 10 — a static tree any web server can serve).
-fn cmd_export(out: &str, pod: Option<&str>) -> miette::Result<()> {
-    shuttle::export::run(out, pod)?;
+/// With `--mission`, the export is CURATED (#275): only the packages
+/// the named `image()` declaration pins are exported — the curation
+/// list is read from the mission's existing declaration, never a new
+/// schema.
+fn cmd_export(
+    out: &str,
+    pod: Option<&str>,
+    mission: Option<&str>,
+    file: Option<&str>,
+) -> miette::Result<()> {
+    match mission {
+        None => shuttle::export::run(out, pod)?,
+        Some(name) => {
+            // The same eval path `shuttle image` builds from: missions
+            // ARE image declarations (this is the mission schema).
+            shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
+            let file = file.unwrap_or("shuttle.lua");
+            let file = resolve_file(file)?;
+            let images = shuttle::lua::evaluate_images_file(&file)?;
+            let decl = images.get(name).ok_or_else(|| {
+                miette::miette!(
+                    "mission '{name}' not found in {file} — curate from an \
+                     image() declaration (shuttle image --output-name {name})"
+                )
+            })?;
+            let curation = shuttle::export::mission_curation(decl);
+            shuttle::export::run_mission(out, pod, &curation)?;
+        }
+    }
     shuttle::output::ok(format!("exported static tree to {out}"));
     Ok(())
 }
