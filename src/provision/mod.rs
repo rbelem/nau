@@ -23,6 +23,7 @@
 //! is up.
 
 pub mod aws;
+pub mod azure;
 pub mod gcp;
 pub mod hetzner;
 
@@ -113,6 +114,39 @@ fn gcp_credentials_source() -> Option<String> {
     None
 }
 
+/// Where the az CLI would resolve credentials from, without calling
+/// the API: the service-principal environment triple
+/// (`AZURE_CLIENT_ID` + `AZURE_TENANT_ID` + `AZURE_CLIENT_SECRET` or
+/// `AZURE_CLIENT_CERTIFICATE_PATH`), else the `az login` token cache on
+/// disk (`AZURE_CONFIG_DIR`, default `~/.azure`). Read at the CLI
+/// boundary so the provider core stays env-free under test; the az CLI
+/// inherits the credential — it never enters argv.
+fn azure_credentials_source() -> Option<String> {
+    let env_nonempty = |k: &str| std::env::var(k).ok().is_some_and(|v| !v.trim().is_empty());
+    if env_nonempty("AZURE_CLIENT_ID")
+        && env_nonempty("AZURE_TENANT_ID")
+        && (env_nonempty("AZURE_CLIENT_SECRET") || env_nonempty("AZURE_CLIENT_CERTIFICATE_PATH"))
+    {
+        return Some("AZURE_CLIENT_ID + AZURE_TENANT_ID (service principal)".into());
+    }
+    let base = match std::env::var("AZURE_CONFIG_DIR")
+        .ok()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+    {
+        Some(c) => c,
+        None => format!(
+            "{}/.azure",
+            std::env::var("HOME").unwrap_or_else(|_| ".".into())
+        ),
+    };
+    let base = Path::new(&base);
+    if base.join("msal_token_cache.json").exists() || base.join("accessTokens.json").exists() {
+        return Some(base.display().to_string());
+    }
+    None
+}
+
 /// CLI entry for `shuttle workers provision` / `shuttle workers destroy`.
 pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
     match command {
@@ -199,8 +233,14 @@ fn provider_for(provider: &str) -> miette::Result<Box<dyn Provisioner>> {
             default_binary_url(),
             resolve_operator_key()?,
         ))),
+        "azure" => Ok(Box::new(azure::AzureProvisioner::new(
+            crate::command::RealRunner,
+            azure_credentials_source(),
+            default_binary_url(),
+            resolve_operator_key()?,
+        ))),
         other => Err(miette::miette!(
-            "workers: unknown provider '{other}' (supported: hetzner, aws, gcp)"
+            "workers: unknown provider '{other}' (supported: hetzner, aws, gcp, azure)"
         )),
     }
 }
