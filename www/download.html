@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Download Nau — mission Cassini · the payload bay</title>
-  <meta name="description" content="Mission Cassini 1.0 payloads: the x86_64 mission image, SHA256SUMS, and the current.json pointer, with the verification walkthrough from pointer to proven write.">
+  <meta name="description" content="Mission Cassini 1.0 payloads: the x86_64 (amd64) mission image, the signed image manifest, SHA256SUMS and its OpenPGP signature, with the verification walkthrough from download to proven write.">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'">
   <link rel="icon" type="image/svg+xml" href="/assets/patch.svg">
   <link rel="stylesheet" href="/css/fonts.css">
@@ -35,42 +35,58 @@
       <div class="wrap">
         <p class="sec-label"><span class="idx">01</span> Payload bay</p>
         <h1 id="images-title">Mission Cassini — payloads</h1>
-        <p class="sec-lede">Everything below lives on the download lane,
-          <code>download.nau.rclb.dev/missions/cassini/</code>. One whole-disk mission
-          image per target; the checksum manifest and the mission pointer beside it.</p>
+        <p class="sec-lede">Everything below lives flat in one directory on the download
+          lane, <code>download.nau.rclb.dev/missions/cassini/</code> — one whole-disk
+          mission image for x86_64 UEFI (the release names the arch
+          <code>amd64</code>), its signed manifest, and the checksum manifest with its
+          detached signature. Filenames follow
+          <code>nau-&lt;mission&gt;-&lt;version&gt;-&lt;arch&gt;</code> exactly as the
+          release flow emits them.</p>
 
         <div class="payload-grid">
           <article class="payload-card">
-            <h2 class="card-title">Mission image — x86_64</h2>
-            <p class="artifact">missions/cassini/images/nau-cassini-1.0-x86_64.img</p>
+            <h2 class="card-title">Mission image — x86_64 (amd64)</h2>
+            <p class="artifact">missions/cassini/nau-cassini-1.0.0-amd64.img</p>
             <p>Whole-disk GPT artifact: ESP with a UKI, two verity-protected root slots,
               hash partitions, and the state partition that grows on first boot.
               Install is a copy of these bytes — nothing re-lays-out partitions
               at flash time.</p>
-            <a class="btn" href="https://download.nau.rclb.dev/missions/cassini/images/nau-cassini-1.0-x86_64.img">Download image</a>
+            <a class="btn" href="https://download.nau.rclb.dev/missions/cassini/nau-cassini-1.0.0-amd64.img">Download image</a>
+          </article>
+
+          <article class="payload-card">
+            <h2 class="card-title">Signed image manifest</h2>
+            <p class="artifact">missions/cassini/nau-cassini-1.0.0-amd64.manifest.json</p>
+            <p>The build's authoritative boot facts — roothash, cmdline, UKI, ESP
+              identity — with the operator's Ed25519 signature attached.
+              <code>verify-image</code> proves the flashed device against this file,
+              signature included.</p>
+            <a class="btn" href="https://download.nau.rclb.dev/missions/cassini/nau-cassini-1.0.0-amd64.manifest.json">Download manifest</a>
           </article>
 
           <article class="payload-card">
             <h2 class="card-title">Checksum manifest</h2>
             <p class="artifact">missions/cassini/SHA256SUMS</p>
-            <p>One line per artifact in the tree. Feed it to
-              <code>sha256sum --check</code> after the pull — a checksum proves the
-              bytes arrived intact, nothing more.</p>
+            <p>Coreutils format, one line per published file — image, manifest, and
+              every sysupdate payload. Feed it to <code>sha256sum --check</code> after
+              the pull: a checksum proves the bytes arrived <em>intact</em>, nothing
+              more.</p>
             <a class="btn" href="https://download.nau.rclb.dev/missions/cassini/SHA256SUMS">Download SHA256SUMS</a>
           </article>
 
           <article class="payload-card">
-            <h2 class="card-title">Mission pointer</h2>
-            <p class="artifact">missions/cassini/current.json</p>
-            <p>The only moving part. The release flow rewrites it at publish so version
-              and directory reshuffles never require a re-image — installed machines
-              follow it for sysupdate A/B transfers. Read it first.</p>
-            <a class="btn" href="https://download.nau.rclb.dev/missions/cassini/current.json">Read current.json</a>
+            <h2 class="card-title">Checksum signature</h2>
+            <p class="artifact">missions/cassini/SHA256SUMS.gpg</p>
+            <p>Detached OpenPGP signature (Ed25519) over SHA256SUMS, made by the
+              ceremony key's sysupdate identity — the same public key baked into every
+              Nau rootfs, where <code>systemd-sysupdate Verify=yes</code> checks it on
+              every update. This is what proves the bytes were <em>released</em>.</p>
+            <a class="btn" href="https://download.nau.rclb.dev/missions/cassini/SHA256SUMS.gpg">Download SHA256SUMS.gpg</a>
           </article>
 
           <article class="payload-card disabled">
             <h2 class="card-title">Mission image — aarch64</h2>
-            <p class="artifact">nau-cassini-1.0-aarch64.img</p>
+            <p class="artifact">nau-cassini-1.0.0-arm64.img</p>
             <p>Deferred: the pool builds x86_64 only for now (ADR-0044, amended). The
               piboot backend ships regardless and lights up when the target matrix
               widens.</p>
@@ -79,10 +95,10 @@
         </div>
 
         <aside class="honesty">
-          <p>Flight rules say it plainly: these URLs answer <strong>404 until the release
-            flow lands</strong>. Cassini is preparing for publication. The layout is
-            fixed, so every link on this page is correct by construction — nothing here
-            rots the day the first mission publishes.</p>
+          <p>Flight rules say it plainly: these URLs answer <strong>404 until the first
+            release lands</strong>. Cassini is preparing for publication. The filenames
+            are the release flow's own output — pinned in its tests, not invented here —
+            so every link is correct by construction the day the tree goes live.</p>
         </aside>
       </div>
     </section>
@@ -91,44 +107,63 @@
     <section id="verify" aria-labelledby="verify-title">
       <div class="wrap">
         <p class="sec-label"><span class="idx">02</span> Verification walkthrough</p>
-        <h1 id="verify-title">From pointer to proven write</h1>
-        <p class="sec-lede">Six flight steps, in order. Trust is established at download,
-          not on the device — a flashed machine cannot verify its own medium.</p>
+        <h1 id="verify-title">From download to proven write</h1>
+        <p class="sec-lede">Six flight steps, in order, copy-pasteable. Trust is
+          established on the machine that flashes — a flashed device cannot verify its
+          own medium, and the release key never travels on the download lane it signs.</p>
 
         <ol class="steps">
           <li>
-            <h2>Read the mission pointer</h2>
+            <h2>Pull the media set</h2>
 
-            <p><code>current.json</code> is the ground truth for what Cassini is today.
-              Installed machines read the same file, so your install and their updates
-              always agree.</p>
-            <pre tabindex="0"><code>curl -fsS https://download.nau.rclb.dev/missions/cassini/current.json</code></pre>
+            <p>Four files: the image, the signed manifest, the checksum manifest, and
+              the signature over it. Caddy serves the tree with native Range support,
+              so a broken transfer resumes — re-run the same pull with
+              <code>-C -</code> and it continues where it stopped. The image is
+              multi-gigabyte; the other three are small.</p>
+            <pre tabindex="0"><code>base=https://download.nau.rclb.dev/missions/cassini
+curl -fLO $base/nau-cassini-1.0.0-amd64.img
+curl -fLO $base/nau-cassini-1.0.0-amd64.manifest.json
+curl -fLO $base/SHA256SUMS
+curl -fLO $base/SHA256SUMS.gpg</code></pre>
           </li>
 
           <li>
-            <h2>Pull the image and its checksums</h2>
+            <h2>Establish the release key — out of band</h2>
 
-            <p>Caddy serves the tree with native Range support, so a broken transfer
-              resumes — re-run the same pull with <code>-C -</code> and it continues
-              where it stopped.</p>
-            <pre tabindex="0"><code>curl -fLO https://download.nau.rclb.dev/missions/cassini/images/nau-cassini-1.0-x86_64.img
-curl -fLO https://download.nau.rclb.dev/missions/cassini/SHA256SUMS
-
-sha256sum --check --ignore-missing SHA256SUMS
-<span class="cmt"># nau-cassini-1.0-x86_64.img: OK</span></code></pre>
+            <p>The signature is made by the ceremony key's sysupdate identity — an
+              OpenPGP Ed25519 key whose public half is baked into every Nau rootfs at
+              <code>/usr/lib/systemd/import-pubring.pgp</code>, covered by the
+              dm-verity the device boots. Import that public key into your keyring
+              from a channel you already trust: the brand's key-distribution channel,
+              a keychain you received in person, a Nau machine you own. Never fetch
+              the key from the download lane itself — a lane that serves both the
+              bytes and the key that blesses them verifies nothing (ADR-0033 D7).</p>
+            <pre tabindex="0"><code>gpg --import nau-release-key.asc   <span class="cmt"># from a trusted channel, never from the lane</span>
+gpg --list-keys --with-subkeys       <span class="cmt"># confirm the fingerprint out of band</span></code></pre>
           </li>
 
           <li>
-            <h2>Verify the signed image manifest</h2>
+            <h2>Verify the checksum manifest signature</h2>
 
-            <p>Fetch the manifest entry the tree advertises for the image and verify its
-              signature against the release key. The checksum proves the bytes arrived
-              <em>intact</em>; the manifest signature proves they were <em>released</em>.
-              Confirm the key fingerprint out of band. Custody is one trusted machine
-              under the update-signing key ceremony (ADR-0024).</p>
-            <p class="rule-note"><b>Flight rule:</b> a failed signature means
-              <b>do not flash</b>. Stop the countdown and keep the payload on the
-              ground.</p>
+            <p>The checksum proves the bytes arrived <em>intact</em>; this signature
+              proves they were <em>released</em>. One command over the two small
+              files:</p>
+            <pre tabindex="0"><code>gpg --verify SHA256SUMS.gpg SHA256SUMS
+<span class="cmt"># gpg: Good signature from "…" [unknown]</span></code></pre>
+            <p class="rule-note"><b>Flight rule:</b> anything that is not a good
+              signature from the expected key means <b>do not flash</b>. Stop the
+              countdown and keep the payload on the ground.</p>
+          </li>
+
+          <li>
+            <h2>Check the bytes</h2>
+
+            <p>Now the hashes — <code>--ignore-missing</code> because you fetched the
+              media set, not the sysupdate payloads the same sums also cover:</p>
+            <pre tabindex="0"><code>sha256sum --check --ignore-missing SHA256SUMS
+<span class="cmt"># nau-cassini-1.0.0-amd64.img: OK</span>
+<span class="cmt"># nau-cassini-1.0.0-amd64.manifest.json: OK</span></code></pre>
           </li>
 
           <li>
@@ -139,28 +174,33 @@ sha256sum --check --ignore-missing SHA256SUMS
               touches the disk — a destructive step is documented, never silent.</p>
             <pre tabindex="0"><code>ls -l /dev/disk/by-id/   <span class="cmt"># confirm model + serial</span>
 
-sudo dd if=nau-cassini-1.0-x86_64.img \
+sudo dd if=nau-cassini-1.0.0-amd64.img \
         of=/dev/disk/by-id/&lt;model&gt;_&lt;serial&gt; \
-        bs=4M status=progress conv=fsync</code></pre>
+        bs=4M status=progress conv=fsync
+sync</code></pre>
           </li>
 
           <li>
-            <h2>Prove the write</h2>
+            <h2>Prove the write, then boot</h2>
 
             <p><code>verify-image</code> is read-only and unprivileged. It refuses a
               mounted, undersized, or foreign-signature target without an explicit
-              override — which is exactly the argument for running it.</p>
-            <pre tabindex="0"><code>shuttle verify-image --device /dev/disk/by-id/&lt;model&gt;_&lt;serial&gt;</code></pre>
-          </li>
-
-          <li>
-            <h2>Boot and ride the ground track</h2>
-
-            <p>Pull the medium, boot the ship. Slot A runs Cassini; the
-              <code>update_source</code> baked into the image points at this same tree,
-              so sysupdate A/B transfers arrive over the lane you flashed from. When a
-              mission update lands, you switch slots — and rollback is the other slot,
-              still there.</p>
+              override — which is exactly the argument for running it. It re-checks
+              the device's roothash and the manifest's Ed25519 signature against the
+              ceremony keychain (<code>~/.config/shuttle/keys/*.pub</code>), so no
+              <code>--key</code> is needed once that is installed; a
+              <code>--key</code> copy, like the key in step 2, comes out of band or
+              nowhere. Record the reported <code>verified_key_id</code> with the
+              release notes, then pull the medium and boot.</p>
+            <pre tabindex="0"><code>shuttle verify-image \
+    --device /dev/disk/by-id/&lt;model&gt;_&lt;serial&gt; \
+    --manifest nau-cassini-1.0.0-amd64.manifest.json</code></pre>
+            <p>Slot A runs Cassini; the <code>update_source</code> baked into the image
+              points at this same tree, so sysupdate A/B transfers arrive over the lane
+              you flashed from — and every update re-runs this whole verification on
+              the device: gpg against the embedded keyring, then the SHA256SUMS hash
+              checks. When a mission update lands you switch slots, and rollback is
+              the other slot, still there.</p>
           </li>
         </ol>
       </div>
@@ -172,31 +212,41 @@ sudo dd if=nau-cassini-1.0-x86_64.img \
         <p class="sec-label"><span class="idx">03</span> Layout contract</p>
         <h1 id="layout-title">The tree every link assumes</h1>
         <p class="sec-lede">The download lane is append-only for released missions: a
-          published image is an artifact, never a cache entry. This shape is the whole
-          contract — filenames included.</p>
+          published image is an artifact, never a cache entry. The media set is flat —
+          no subdirectories — because installed machines resolve every name relative
+          to the baked <code>update_source</code> URL. This shape is the whole
+          contract; filenames included.</p>
 
         <pre class="tree" tabindex="0"><code><span class="dir">missions/cassini/</span>
-├── <span class="dir">current.json</span>            <span class="note">mission pointer — the only moving part</span>
-├── <span class="dir">SHA256SUMS</span>              <span class="note">checksum manifest, one line per artifact</span>
-├── <span class="dir">images/</span>
-│   └── nau-cassini-1.0-x86_64.img   <span class="note">whole-disk mission image</span>
-├── <span class="dir">manifest/</span>               <span class="note">signed image manifest (ADR-0044 D5)</span>
-└── <span class="dir">updates/</span>                <span class="note">sysupdate transfer artifacts</span></code></pre>
+├── <span class="dir">current.json</span>                       <span class="note">update pointer — publish-maintained (plan decision 4)</span>
+├── <span class="dir">SHA256SUMS</span>                         <span class="note">checksum manifest — one line per file below</span>
+├── <span class="dir">SHA256SUMS.gpg</span>                     <span class="note">detached OpenPGP signature over SHA256SUMS</span>
+├── nau-cassini-1.0.0-amd64.img          <span class="note">whole-disk mission image</span>
+├── nau-cassini-1.0.0-amd64.manifest.json <span class="note">signed image manifest (Ed25519)</span>
+├── root_1.0.0_&lt;partuuid&gt;.img             <span class="note">sysupdate payload — rootfs extent</span>
+├── verity-hash_1.0.0_&lt;partuuid&gt;.img     <span class="note">sysupdate payload — verity hash extent</span>
+└── &lt;name&gt;_1.0.0.efi                     <span class="note">sysupdate payload — the staged UKI</span></code></pre>
 
         <ul class="contract-list">
-          <li><b>current.json</b> — updated by the publish wrapper at each release. The
-            <code>update_source</code> URL baked into every image points at the
-            directory, so the pointer can move without a re-image.</li>
-          <li><b>images/nau-cassini-1.0-x86_64.img</b> — the only image filename that
-            exists for Cassini 1.0. Names follow
-            <code>nau-&lt;mission&gt;-&lt;version&gt;-&lt;arch&gt;.img</code>; nothing
-            else appears in <code>images/</code>.</li>
-          <li><b>SHA256SUMS</b> — lives beside the pointer at the mission root, checked
-            with <code>--ignore-missing</code> so extra local files don't disturb the
-            pass.</li>
-          <li><b>manifest/ and updates/</b> — the signature proof of step 3 and the
-            transfer payloads installed machines pull. Both are part of the same
-            mission tree, same certificate, same lane.</li>
+          <li><b>nau-cassini-1.0.0-amd64</b> — the media stem, built from the signed
+            manifest's own version and arch fields
+            (<code>nau-&lt;mission&gt;-&lt;version&gt;-&lt;arch&gt;</code>). The image
+            and its manifest are siblings; verification needs both.</li>
+          <li><b>SHA256SUMS + SHA256SUMS.gpg</b> — siblings at the mission root, the
+            pair <code>systemd-sysupdate Verify=yes</code> fetches on the device. The
+            build's own contract test signs the sums, then refuses any sysupdate
+            drop-in whose source names miss the signed list — a rename on either side
+            fails the build, not your update night.</li>
+          <li><b>root_… / verity-hash_… / …_.efi</b> — the A/B transfer payloads
+            installed machines pull. <code>&lt;partuuid&gt;</code> is the
+            roothash-derived GUID the build pinned on its slots (the
+            <code>@u</code> a transfer pattern expands at update time); the version is
+            its <code>@v</code>. You don't need them to install — flashing the whole
+            disk is the install path.</li>
+          <li><b>current.json</b> — the one moving part, rewritten by publish at each
+            release so version and directory reshuffles never require a re-image.
+            Installed machines follow it; the flash walkthrough above doesn't need
+            it.</li>
         </ul>
       </div>
     </section>
