@@ -1819,6 +1819,141 @@ pub(crate) fn check_pod_version_lines_with(root: &Path) -> Check {
     }
 }
 
+/// The check name of the pod failed-unit scan ([`check_pod_failed_units`]).
+const POD_FAILED_UNITS_CHECK: &str = "pod failed units";
+
+/// Pod failed-unit scan (ADR-0042 D3 boot story, issue #231): after a
+/// reboot the tmpfs secrets tree is gone, so every unit recorded with a
+/// mandatory `EnvironmentFile=` starts failed until
+/// `pod secrets refresh` re-resolves and restarts the consumers (the
+/// rotate-restart contract landed in #224). This check names that fix —
+/// `shuttle doctor --pod <name>` selects the pod. Advisory by
+/// construction: the status stays `Ok` (hint-only, the
+/// [`check_pod_version_lines`] idiom); only tool absence turns into a
+/// NAMED skip, never a failed check.
+pub fn check_pod_failed_units(pod: &str) -> Check {
+    check_pod_failed_units_with(
+        &crate::pod::pod_root(None),
+        pod,
+        None,
+        &crate::runtime::RuntimeTools::for_pod_runtime(),
+    )
+}
+
+/// [`check_pod_failed_units`] over an explicit pod root, cache base, and
+/// tool set — the test seam (the `check_pod_version_lines_with`
+/// pattern; the cache override and the fake systemctl keep tests off the
+/// host's `$XDG_RUNTIME_DIR` and systemd).
+pub(crate) fn check_pod_failed_units_with(
+    root: &Path,
+    pod: &str,
+    cache_base: Option<&Path>,
+    tools: &crate::runtime::RuntimeTools,
+) -> Check {
+    let name = POD_FAILED_UNITS_CHECK;
+    let pod_dir = root.join(pod);
+    if !pod_dir.is_dir() {
+        // Unknown pod: nothing recorded to scan — not applicable.
+        return Check::ok(name);
+    }
+    // The generation the verbs address (`current` → `generations/<n>`,
+    // the same source `pod secrets refresh` reads). No link = never
+    // synced = no recorded units.
+    let Some(generation) = crate::farm::current_generation(&pod_dir).ok().flatten() else {
+        return Check::ok(name);
+    };
+    // The envfile path the sync would have baked into unit text —
+    // derived PASSIVELY from the folded references, no provider calls.
+    // A pod with no secrets (or an undervivable path — no runtime dir,
+    // under which D7 keeps sync from recording a secret-bearing unit at
+    // all) has no `EnvironmentFile=` to scan for: not applicable.
+    let refs = match crate::pod::load_declaration(root, pod)
+        .and_then(|decl| crate::pod::resolve_pod_secrets(root, pod, &decl))
+    {
+        Ok(refs) => refs,
+        Err(_) => return Check::ok(name),
+    };
+    let Some(envfile) = crate::secrets::pod_envfile_path_passive(pod, &refs, cache_base)
+        .ok()
+        .flatten()
+    else {
+        return Check::ok(name);
+    };
+    // The scan's direct input: the generation's recorded units
+    // (services::units_referencing_envfile — the same reader #224's
+    // restart half uses). A corrupt file fails loudly there — trusted
+    // data — so the scan surfaces it as a doctor error, not a silent
+    // skip.
+    let consumers = match crate::services::units_referencing_envfile(
+        &crate::pod::pod_store(&pod_dir),
+        generation,
+        pod,
+        &envfile,
+    ) {
+        Ok(consumers) => consumers,
+        Err(e) => return Check::error(name, e.to_string()),
+    };
+    if consumers.is_empty() {
+        // No unit references the envfile: the scan has no consumers.
+        return Check::ok(name);
+    }
+    let Some(systemctl) = tools.systemctl.as_ref() else {
+        // Reconcile semantics (issue #107): the tool's absence is a
+        // named skip, never a failed check.
+        return Check::ok_at(
+            name,
+            format!(
+                "skipped: systemctl unavailable — cannot probe the failed \
+                 state of {}",
+                consumers.join(", ")
+            ),
+        );
+    };
+    let mut notices: Vec<String> = Vec::new();
+    for unit in &consumers {
+        // The D3 boot story needs BOTH halves: the envfile is gone
+        // (tmpfs died at reboot) AND the unit actually starts failed.
+        if envfile.exists() {
+            continue;
+        }
+        let failed = std::process::Command::new(systemctl)
+            .arg("--user")
+            .arg("is-failed")
+            .arg(unit)
+            .status();
+        match failed {
+            Ok(status) if status.success() => notices.push(failed_unit_notice(unit, &envfile)),
+            // Active, inactive, or a probe exit the state mapping does
+            // not cover: nothing to name.
+            Ok(_) => {}
+            // systemctl exists but cannot run: the same named skip as
+            // absence — doctor never fails on the tool alone.
+            Err(e) => {
+                return Check::ok_at(
+                    name,
+                    format!("skipped: systemctl could not be run ({e}) — cannot probe the failed state of {}", consumers.join(", ")),
+                );
+            }
+        }
+    }
+    if notices.is_empty() {
+        Check::ok(name)
+    } else {
+        Check::ok_at(name, notices.join("; "))
+    }
+}
+
+/// The verbatim per-unit notice (drafted in the #224 review, issue
+/// #231): names the unit, the gone envfile, and the fix.
+fn failed_unit_notice(unit: &str, envfile: &Path) -> String {
+    format!(
+        "unit '{unit}' starts failed: envfile {} is gone (tmpfs secrets die \
+         at reboot) — run `pod secrets refresh` to re-resolve the pod's \
+         secrets and restart its consumers",
+        envfile.display()
+    )
+}
+
 /// Print a formatted doctor report to stdout.
 pub fn print_report(checks: &[Check]) {
     let mut all_ok = true;
@@ -3899,5 +4034,259 @@ done
             hint.starts_with("provisioned") && hint.contains("tools v3"),
             "{hint}"
         );
+    }
+
+    // ── pod failed-unit scan (ADR-0042 D3, issue #231) ──
+
+    /// A `+x` shell script; returns its absolute path (argv[0] form) —
+    /// the secrets.rs test-module fixture shape.
+    fn secret_provider_script(dir: &Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    /// A pod declaration with one exec-secret reference — the same
+    /// minimal `pod.lua` the secrets.rs fixtures use.
+    fn seed_secret_pod(root: &Path, name: &str, provider: &str) {
+        let pod = root.join(name);
+        std::fs::create_dir_all(&pod).unwrap();
+        std::fs::write(
+            pod.join("pod.lua"),
+            format!(
+                r#"pod {{
+    secrets = {{ K = {{ source = "exec", command = {{ "{provider}" }} }} }},
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Give the pod an active generation 3 (`current` →
+    /// `generations/3/farm`) — the verbs only parse the link.
+    fn activate_generation(root: &Path, name: &str) {
+        let pod = root.join(name);
+        std::fs::create_dir_all(pod.join("generations").join("3")).unwrap();
+        std::os::unix::fs::symlink("generations/3/farm", pod.join("current")).unwrap();
+    }
+
+    /// Record generation `gen`'s units.json with (service name, rendered
+    /// text) pairs — the fixture shape `units_referencing_envfile`
+    /// reads (the secrets.rs `seed_units` shape).
+    fn seed_generation_units(pod_dir: &Path, gen: u64, units: &[(&str, String)]) {
+        let dir = pod_dir
+            .join("generations")
+            .join(gen.to_string())
+            .join(crate::services::SERVICES_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let units: Vec<serde_json::Value> = units
+            .iter()
+            .map(|(name, text)| {
+                serde_json::json!({
+                    "name": name, "pkg": "pkg", "layer": "own",
+                    "daemon": "simple", "enabled": true, "exec": "/exec",
+                    "args": [], "environment": {}, "after": [],
+                    "text": text, "hash": "h",
+                })
+            })
+            .collect();
+        std::fs::write(
+            dir.join("units.json"),
+            serde_json::to_vec(&serde_json::json!({ "units": units })).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A fake systemctl for the `is-failed` probe: exits 0 (failed)
+    /// only when the unit argument is on the list, 1 otherwise.
+    fn fake_is_failed(dir: &Path, failed_units: &[&str]) -> crate::runtime::RuntimeTools {
+        let path = dir.join("fake-systemctl");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nunit=\"$3\"\ncase \" {} \" in *\" $unit \"*) exit 0;; *) exit 1;; esac\n",
+                failed_units.join(" ")
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::runtime::RuntimeTools {
+            systemctl: Some(path),
+            ..Default::default()
+        }
+    }
+
+    /// Stand up pod `work` with a consumer unit (`web`) and a
+    /// non-consumer (`side`); returns the derived envfile path (the
+    /// passive derivation the check itself uses) and the pod dir.
+    fn seed_consumer_pod(
+        tmp: &Path,
+        failed_envfile: bool,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let cache = tmp.join("cache");
+        let provider = secret_provider_script(tmp, "provider", "echo SECRET");
+        seed_secret_pod(tmp, "work", &provider);
+        activate_generation(tmp, "work");
+        let pod_dir = tmp.join("work");
+        let refs = {
+            let decl = crate::pod::load_declaration(tmp, "work").unwrap();
+            crate::pod::resolve_pod_secrets(tmp, "work", &decl).unwrap()
+        };
+        let envfile = crate::secrets::pod_envfile_path_passive("work", &refs, Some(&cache))
+            .unwrap()
+            .unwrap();
+        let consumer_text = format!(
+            "ExecStart=/bin/true\nEnvironmentFile=\"{}\"\n",
+            envfile.display()
+        );
+        seed_generation_units(
+            &pod_dir,
+            3,
+            &[
+                ("web", consumer_text),
+                ("side", "ExecStart=/bin/true\n".to_string()),
+            ],
+        );
+        if !failed_envfile {
+            // Refresh materializes the envfile tree; the fixture does
+            // the minimum: the parent dir, then the file.
+            std::fs::create_dir_all(envfile.parent().unwrap()).unwrap();
+            std::fs::write(&envfile, "K=\"SECRET\"\n").unwrap();
+        }
+        (cache, envfile)
+    }
+
+    #[test]
+    fn pod_failed_units_names_refresh_when_envfile_gone_and_unit_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cache, envfile) = seed_consumer_pod(tmp.path(), true);
+        let tools = fake_is_failed(tmp.path(), &["shuttle-pod-work-web.service"]);
+        let check = check_pod_failed_units_with(tmp.path(), "work", Some(&cache), &tools);
+        // Hint-only: the boot story is advisory, never a failing check.
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        let hint = check.hint.expect("the failed unit must be named");
+        assert_eq!(
+            hint,
+            format!(
+                "unit 'shuttle-pod-work-web.service' starts failed: envfile {} \
+                 is gone (tmpfs secrets die at reboot) — run `pod secrets \
+                 refresh` to re-resolve the pod's secrets and restart its \
+                 consumers",
+                envfile.display()
+            )
+        );
+    }
+
+    #[test]
+    fn pod_failed_units_quiet_when_envfile_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cache, _) = seed_consumer_pod(tmp.path(), false);
+        let tools = fake_is_failed(tmp.path(), &["shuttle-pod-work-web.service"]);
+        let check = check_pod_failed_units_with(tmp.path(), "work", Some(&cache), &tools);
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert!(check.hint.is_none(), "nothing to name: {check:?}");
+    }
+
+    #[test]
+    fn pod_failed_units_quiet_when_unit_not_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Envfile gone (the D3 state) but the probe says the unit is
+        // not failed (never started / already recovered): no notice.
+        let (cache, _) = seed_consumer_pod(tmp.path(), true);
+        let tools = fake_is_failed(tmp.path(), &[]);
+        let check = check_pod_failed_units_with(tmp.path(), "work", Some(&cache), &tools);
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert!(check.hint.is_none(), "nothing to name: {check:?}");
+    }
+
+    #[test]
+    fn pod_failed_units_ignores_units_not_referencing_the_envfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cache, _) = seed_consumer_pod(tmp.path(), true);
+        // `side` references no envfile: even reported failed, it is out
+        // of scope for the scan — only the consumer is named.
+        let tools = fake_is_failed(
+            tmp.path(),
+            &[
+                "shuttle-pod-work-web.service",
+                "shuttle-pod-work-side.service",
+            ],
+        );
+        let check = check_pod_failed_units_with(tmp.path(), "work", Some(&cache), &tools);
+        let hint = check.hint.expect("the consumer must be named");
+        assert!(hint.contains("shuttle-pod-work-web.service"), "{hint}");
+        assert!(
+            !hint.contains("shuttle-pod-work-side.service"),
+            "non-consumer is out of scope: {hint}"
+        );
+    }
+
+    #[test]
+    fn pod_failed_units_skips_named_when_systemctl_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cache, _) = seed_consumer_pod(tmp.path(), true);
+        let tools = crate::runtime::RuntimeTools::default();
+        let check = check_pod_failed_units_with(tmp.path(), "work", Some(&cache), &tools);
+        // Reconcile semantics: tool absence is a NAMED skip, never a
+        // failed check.
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        let hint = check.hint.expect("the skip must be named");
+        assert!(hint.starts_with("skipped: systemctl unavailable"), "{hint}");
+        assert!(hint.contains("shuttle-pod-work-web.service"), "{hint}");
+    }
+
+    #[test]
+    fn pod_failed_units_passes_silently_without_pod_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = fake_is_failed(tmp.path(), &["anything"]);
+        // Unknown pod.
+        let check =
+            check_pod_failed_units_with(tmp.path(), "ghost", Some(&tmp.path().join("c")), &tools);
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert!(check.hint.is_none(), "{check:?}");
+        // Known pod, never synced (no active generation).
+        let provider = secret_provider_script(tmp.path(), "provider", "echo SECRET");
+        seed_secret_pod(tmp.path(), "work", &provider);
+        let check =
+            check_pod_failed_units_with(tmp.path(), "work", Some(&tmp.path().join("c")), &tools);
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert!(check.hint.is_none(), "{check:?}");
+    }
+
+    #[test]
+    fn pod_failed_units_passes_silently_without_secret_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A synced pod whose declaration carries no secrets: no envfile
+        // to scan for, no units to select.
+        let pod = tmp.path().join("plain");
+        std::fs::create_dir_all(&pod).unwrap();
+        std::fs::write(pod.join("pod.lua"), "pod {}\n").unwrap();
+        activate_generation(tmp.path(), "plain");
+        seed_generation_units(&pod, 3, &[("web", "ExecStart=/bin/true\n".to_string())]);
+        let tools = fake_is_failed(tmp.path(), &["shuttle-pod-plain-web.service"]);
+        let check =
+            check_pod_failed_units_with(tmp.path(), "plain", Some(&tmp.path().join("c")), &tools);
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert!(check.hint.is_none(), "{check:?}");
+    }
+
+    #[test]
+    fn pod_failed_units_surfaces_a_corrupt_units_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cache, _) = seed_consumer_pod(tmp.path(), true);
+        // Corrupt the scan's direct input: trusted data fails loudly
+        // (services.rs read_units_file contract), surfaced as a doctor
+        // error — never a silent skip.
+        let units = tmp.path().join("work/generations/3/services/units.json");
+        std::fs::write(&units, b"{ not json").unwrap();
+        let tools = fake_is_failed(tmp.path(), &[]);
+        let check = check_pod_failed_units_with(tmp.path(), "work", Some(&cache), &tools);
+        assert!(matches!(check.status, CheckStatus::Error), "{check:?}");
+        let hint = check.hint.expect("the corruption must be named");
+        assert!(hint.contains("corrupt units file"), "{hint}");
     }
 }
