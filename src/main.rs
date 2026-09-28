@@ -326,6 +326,8 @@ fn main() -> miette::Result<()> {
         Command::WorkerCap => shuttle::worker::cap_main(),
 
         Command::WorkerJob { job_file } => shuttle::worker::job_main(&job_file),
+
+        Command::Workers { command } => shuttle::provision::workers_main(command),
     }
 }
 
