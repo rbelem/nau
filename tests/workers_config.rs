@@ -183,29 +183,33 @@ fn local_jobs_type_and_bound_are_checked() {
     assert!(err.contains("'local_jobs'"), "{err:#}");
 }
 
-// ── host_key pins (ADR-0045 Decision 4, T4) ──
+// ── host_key pins (ADR-0045 Decision 4, as amended by #295) ──
 
 #[test]
-fn host_key_pin_line_round_trips() {
-    let out = eval_with(
+fn legacy_public_key_line_pins_are_refused_with_the_re_pin_remedy() {
+    // The retired mint-and-inject pin form (a full public-key line)
+    // refuses at parse, by name, with the operator migration path.
+    // Breaking by design: re-pinning is one `shuttle ca list` away.
+    let err = eval_err(
         r#"
 workers = {
   { address = "ssh://op@nuci.local",
     host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux op@nuci" },
 }
 "#,
-    )
-    .expect("pinned worker evals");
-    let pin = out.workers.workers[0]
-        .host_key
-        .as_deref()
-        .expect("pin present");
-    assert!(pin.starts_with("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"), "{pin}");
-    assert!(pin.ends_with("op@nuci"), "the comment survives: {pin}");
+    );
+    assert!(err.contains("retired mint-and-inject pin form"), "{err:#}");
+    assert!(
+        err.contains("re-pin with the CA fingerprint from `shuttle ca list`"),
+        "the remedy rides: {err:#}"
+    );
 }
 
 #[test]
 fn host_key_fingerprint_pin_round_trips() {
+    // The fingerprint form is the ONLY round-tripping pin: it parses,
+    // survives the eval, and is what the executor enforces as the
+    // @cert-authority line.
     let out = eval_with(
         r#"
 workers = {
@@ -215,11 +219,13 @@ workers = {
 "#,
     )
     .expect("fingerprint pin evals");
-    assert!(out.workers.workers[0]
-        .host_key
-        .as_deref()
-        .expect("pin present")
-        .starts_with("SHA256:"));
+    assert_eq!(
+        out.workers.workers[0]
+            .host_key
+            .as_deref()
+            .expect("pin present"),
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG"
+    );
 }
 
 #[test]
@@ -233,30 +239,21 @@ fn absent_host_key_still_evaluates_preflight_owns_the_refusal() {
 
 #[test]
 fn malformed_host_key_pins_are_refused() {
-    let err = eval_err(r#"workers = { { address = "ssh://h", host_key = "ed25519 AAAA" } }"#);
-    assert!(err.contains("unknown host-key type"), "{err:#}");
+    // The legacy public-key line is the named refusal — the retired
+    // mint-and-inject pin form, refused with the re-pin remedy.
+    let err = eval_err(
+        r#"workers = { { address = "ssh://h", host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux" } }"#,
+    );
+    assert!(err.contains("retired mint-and-inject pin form"), "{err:#}");
+    assert!(err.contains("shuttle ca list"), "{err:#}");
 
     let err = eval_err(r#"workers = { { address = "ssh://h", host_key = "SHA256:tooshort" } }"#);
     assert!(err.contains("43 base64 characters"), "{err:#}");
 
-    let err =
-        eval_err(r#"workers = { { address = "ssh://h", host_key = "ssh-ed25519 not!valid" } }"#);
-    assert!(err.contains("not a valid public-key line"), "{err:#}");
-
-    let err = eval_err(r#"workers = { { address = "ssh://h", host_key = "ssh-ed25519" } }"#);
-    assert!(
-        err.contains("expected '<keytype> <base64> [comment]'"),
-        "{err:#}"
-    );
+    let err = eval_err(r#"workers = { { address = "ssh://h", host_key = "not-a-pin" } }"#);
+    assert!(err.contains("host CA's fingerprint"), "{err:#}");
+    assert!(err.contains("shuttle ca list"), "{err:#}");
 
     let err = eval_err(r#"workers = { { address = "ssh://h", host_key = 42 } }"#);
     assert!(err.contains("field 'host_key' must be a string"), "{err:#}");
-
-    let err = eval_err(
-        r#"workers = { { address = "ssh://h", host_key = "ssh-ed25519 AAAA extra1 extra2" } }"#,
-    );
-    assert!(
-        err.contains("expected '<keytype> <base64> [comment]'"),
-        "{err:#}"
-    );
 }

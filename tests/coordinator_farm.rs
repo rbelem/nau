@@ -424,9 +424,23 @@ fn a_lost_cross_job_falls_back_to_local() {
 
 // ── The loopback dispatch (T4 transport under the T5 pool) ──
 
-/// Shape-valid ed25519 pin line (the fake never validates crypto).
-const ED25519_PIN: &str =
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux loopback-pin";
+/// The workers-entry pin is the host CA's fingerprint (the only pin
+/// form, #295); the ceremony fixture below writes the CA public half
+/// the fake fingerprints to it.
+const FINGERPRINT_PIN: &str = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG";
+const CA_PUB_LINE: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux loopback-ca";
+const CA_IDENTITY: &str = "shuttle-worker-farm-test-01";
+
+/// The ceremony fixture the CA-form pin resolves against: the CA public
+/// half on disk plus the machine linkage for `address`, under `home`
+/// (the seam `with_ceremony_home` points the executor at).
+fn ca_ceremony(home: &Path, address: &str) {
+    let ca_dir = home.join(".config/shuttle/ca");
+    std::fs::create_dir_all(ca_dir.join("machines")).unwrap();
+    std::fs::write(ca_dir.join("ca.pub"), format!("{CA_PUB_LINE}\n")).unwrap();
+    shuttle::provision::publish::record_machine_link(home, CA_IDENTITY, address).unwrap();
+}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -446,6 +460,9 @@ struct LoopbackWorker {
     root: PathBuf,
     dies: bool,
     cap: CapabilityDoc,
+    /// What `ssh-keygen -lf` reports for any key file — the CA-form pin
+    /// resolution seam (must match the pinned fingerprint).
+    reported_fingerprint: String,
 }
 
 impl LoopbackWorker {
@@ -453,6 +470,7 @@ impl LoopbackWorker {
         LoopbackWorker {
             root: root.to_path_buf(),
             dies: false,
+            reported_fingerprint: FINGERPRINT_PIN.to_string(),
             cap: CapabilityDoc {
                 protocol: WORKER_PROTOCOL_VERSION,
                 arch: host_arch(),
@@ -593,6 +611,17 @@ impl CommandRunner for LoopbackWorker {
         match argv[0].as_str() {
             "ssh" => self.ssh(argv),
             "scp" => self.scp(argv),
+            "ssh-keygen" => {
+                // `-lf <path>`: report the configured fingerprint for
+                // whichever key file the executor inspects (the CA-form
+                // resolution seam).
+                Ok(RunnerOutput {
+                    code: 0,
+                    stdout: format!("256 {} loopback-ca (ED25519)\n", self.reported_fingerprint)
+                        .into_bytes(),
+                    stderr: String::new(),
+                })
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("loopback: unexpected program {other}"),
@@ -669,17 +698,21 @@ fn loopback_farm_dispatch_and_worker_loss() {
         out_dir: out_dir.clone(),
     });
 
+    let ceremony = tmp.path().join("ceremony");
     let make_worker = |port: u16, dies: bool, root: &Path| {
         let mut fake = LoopbackWorker::new(root);
         fake.dies = dies;
+        let address = format!("ssh://localhost:{port}");
+        ca_ceremony(&ceremony, &address);
         let cfg = WorkerConfig {
-            address: format!("ssh://localhost:{port}"),
+            address,
             jobs: 1,
             arch: None,
-            host_key: Some(ED25519_PIN.to_string()),
+            host_key: Some(FINGERPRINT_PIN.to_string()),
         };
         let cache = tmp.path().join(format!("cache-{port}"));
-        let exec = SshExecutor::with_cache_dir(&cfg, fake, &cache).expect("executor builds");
+        let exec = SshExecutor::with_ceremony_home(&cfg, fake, &cache, &ceremony)
+            .expect("executor builds");
         RemoteExecutor::new(exec, Arc::clone(&source), 1, 1)
     };
 
@@ -1152,12 +1185,15 @@ fn preflight_refuses_a_declared_arch_mismatch_before_any_dispatch() {
         address: "ssh://localhost:2226".into(),
         jobs: 1,
         arch: Some(declared.into()),
-        host_key: Some(ED25519_PIN.to_string()),
+        host_key: Some(FINGERPRINT_PIN.to_string()),
     };
-    let exec = SshExecutor::with_cache_dir(
+    let ceremony = tmp.path().join("ceremony");
+    ca_ceremony(&ceremony, "ssh://localhost:2226");
+    let exec = SshExecutor::with_ceremony_home(
         &cfg,
         LoopbackWorker::new(&machine),
         &tmp.path().join("cache"),
+        &ceremony,
     )
     .expect("executor builds");
     let err = preflight_farm_workers(&[exec])
@@ -1179,10 +1215,12 @@ fn preflight_refuses_a_declared_arch_mismatch_before_any_dispatch() {
         arch: None,
         ..cfg
     };
-    let exec = SshExecutor::with_cache_dir(
+    ca_ceremony(&ceremony, "ssh://localhost:2227");
+    let exec = SshExecutor::with_ceremony_home(
         &ok_cfg,
         LoopbackWorker::new(&machine),
         &tmp.path().join("cache2"),
+        &ceremony,
     )
     .expect("executor builds");
     preflight_farm_workers(&[exec]).expect("an undeclared arch takes the worker's report");
