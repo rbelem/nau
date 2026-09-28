@@ -98,6 +98,40 @@ required field.
 **Negative**: host-key lifecycle (rotation, TTL'd certs under the CA form)
 becomes operator ceremony alongside ADR-0024's signing key ceremony.
 
+## Addendum (2026-09-28): the Hetzner user-data residual is permanent
+
+Research into the metadata exposure behind Decision 1's scrub (librarian
+brief against docs.hetzner.cloud API reference + changelog, 2026-09-28):
+
+- **Lifetime**: the IMDS serves create-time user-data for the life of the
+  server. No documented bound exists anywhere; the inference is
+  behavior-based (the documented `/hetzner/v1/*` metadata table and the
+  removed-after-2026-08 EC2-style `/latest/user-data` route both answered at
+  any time, not only during first boot).
+- **Rebuild re-delivers**: `POST /servers/{id}/actions/rebuild` now accepts a
+  `user_data` override — and **without one, the original user-data is
+  re-served to the fresh image**. Rebuild is also the recovery path, i.e.
+  the moment you would most want the old key dead is the moment it is
+  re-injected.
+- **No removal, no hardening**: there is no API to read back, replace, or
+  delete user-data on a live server; no per-server disable flag, token
+  requirement, or hop-limit control (the Robot dedicated "disable metadata"
+  flag has no documented Cloud equivalent). The 2026 EC2-route cleanup
+  narrowed the URL surface only.
+- **Consequence for Decision 1**: the post-sshd guest scrub removes one local
+  copy; it does not touch the Hetzner-side record. The private host key must
+  be assumed recoverable by any in-guest process for the life of the server
+  and every rebuild. The blast-radius argument still bounds this: the key is
+  server-auth-only, pins bind the public half (Decision 4 unaffected), and
+  exposure is per-machine — but "scrubbed" would overstate it, and
+  render_user_data's docstring now says so.
+
+This addendum strengthens Decision 3's escalation case. The clean
+elimination is guest-local key generation with authenticated publication of
+the public half (no secret ever ships in user-data); filed as an operator
+decision (#283) rather than adopted unilaterally, since it amends the
+ratified mint-and-inject mechanism.
+
 ## Revisit triggers
 
 - Workers crossing trust domains (shared/multi-org pools) — replace the
