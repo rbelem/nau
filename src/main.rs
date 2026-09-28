@@ -114,6 +114,16 @@ fn main() -> miette::Result<()> {
             r
         }
 
+        Command::VerifyImage {
+            device,
+            manifest,
+            key,
+            json,
+        } => {
+            shuttle::output::set_mode(json);
+            cmd_verify_image(&device, &manifest, key.as_deref(), json)
+        }
+
         Command::Deps(sub) => match sub {
             DepsCommand::Show {
                 package,
@@ -1974,6 +1984,53 @@ fn cmd_image(
         shuttle::output::ok(format!("lockfile updated: {}", lockfile_path));
     }
 
+    Ok(())
+}
+
+/// `shuttle verify-image` (ADR-0044 D4, #265): read-only flash
+/// verification against the published signed image manifest. The
+/// machinery lives in [`shuttle::image::verify`]; this handler binds the
+/// real runner and reports the outcome.
+fn cmd_verify_image(
+    device: &str,
+    manifest: &str,
+    key: Option<&str>,
+    json: bool,
+) -> miette::Result<()> {
+    let args = shuttle::image::VerifyImageArgs {
+        device: PathBuf::from(device),
+        manifest: PathBuf::from(manifest),
+        key: key.map(PathBuf::from),
+    };
+    let outcome = shuttle::image::verify_device(&shuttle::command::RealRunner, &args)?;
+    if json {
+        let report = serde_json::json!({
+            "command": "verify-image",
+            "device": device,
+            "manifest": manifest,
+            "image": format!("{} {}", outcome.image_name, outcome.image_version),
+            "verified_key_id": outcome.verified_key_id,
+            "roothash": outcome.roothash,
+            "root_partuuid": outcome.root_partuuid,
+            "hash_partuuid": outcome.hash_partuuid,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|e| miette::miette!("verify-image JSON serialization: {e}"))?
+        );
+    } else {
+        shuttle::output::ok(format!(
+            "verified '{}' {} — slot A root ({}) over hash ({}) recomputes to the \
+             manifest roothash, under key {}",
+            outcome.image_name,
+            outcome.image_version,
+            outcome.root_partuuid,
+            outcome.hash_partuuid,
+            outcome.verified_key_id
+        ));
+        shuttle::output::info("the flashed medium matches the signed manifest (ADR-0044 D4)");
+    }
     Ok(())
 }
 

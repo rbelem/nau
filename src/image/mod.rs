@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
 use mlua::Value;
-use serde::Serialize;
 use serde::Serializer;
+use serde::{Deserialize, Serialize};
 
 use crate::command::CommandRunner;
 use crate::doctor;
@@ -1630,7 +1630,7 @@ fn local_anchor_files(dir: &Path) -> miette::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageManifest {
     pub name: String,
     pub version: String,
@@ -1659,9 +1659,19 @@ pub struct ImageManifest {
     /// — the hash lives on the dedicated trailing verity-hash partition.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roothash: Option<String>,
+
+    /// Ed25519 signatures over the canonical body (the manifest serialized
+    /// with this map emptied — [`crate::sign`]'s scheme), keyed by key id.
+    /// The build writes NO entries — `skip_serializing_if` keeps the
+    /// emitted `image-manifest.json` byte-identical to before this field
+    /// existed (byte-comparable doctrine) — and `shuttle image --release`
+    /// (#266) attaches the published signatures. Parsed back by
+    /// `shuttle verify-image` ([`crate::image::verify`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub signatures: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageSnapEntry {
     pub name: String,
     pub revision: u32,
@@ -1708,6 +1718,7 @@ impl ImageManifest {
             uki: boot.map(|b| b.uki_filename.clone()),
             esp_partuuid: boot.and_then(|b| b.esp_partuuid.clone()),
             roothash: boot.and_then(|b| b.roothash.clone()),
+            signatures: Default::default(),
         }
     }
 }
@@ -1789,6 +1800,7 @@ mod partition;
 mod piboot;
 pub(crate) mod staging;
 mod state;
+mod verify;
 mod verity;
 
 pub(crate) use boot::*;
@@ -1802,6 +1814,9 @@ pub(crate) use verity::*;
 
 // Genuinely public partition-type GUIDs keep their original `pub` surface.
 pub use verity::{ESP_TYPE_GUID, ROOT_TYPE_GUID_X86_64, VERITY_TYPE_GUID_X86_64};
+
+// The `shuttle verify-image` surface (ADR-0044 D4, #265).
+pub use verify::{verify_device, VerifyImageArgs, VerifyOutcome};
 
 #[cfg(test)]
 mod tests {
