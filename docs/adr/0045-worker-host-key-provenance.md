@@ -7,7 +7,8 @@ ratified form is plain injection (Decision 1) for v1; the SSH host CA
 (Decision 3) is the recorded escalation — adopt it when more than two
 providers are live or a standing fleet wider than five machines exists,
 whichever comes first. #194-#198 are un-parked for implementation (#271
-gates the first real provision).
+gates the first real provision). Amended 2026-09-29: Decision 3 adopted
+early (#283 — five providers are live in code) — see the amendment below.
 
 ## Context
 
@@ -131,6 +132,38 @@ elimination is guest-local key generation with authenticated publication of
 the public half (no secret ever ships in user-data); filed as an operator
 decision (#283) rather than adopted unilaterally, since it amends the
 ratified mint-and-inject mechanism.
+
+## Amendment (2026-09-29, #283 decided): Decision 3 adopted — certificate issuance replaces mint-and-inject
+
+The operator picked the scalable form on the addendum's evidence (user-data
+residual permanent, re-delivered on rebuild, no hardening knobs). Decision
+3's ratification clause was written for exactly this trigger, and its own
+invariant — no per-worker secrets in user-data — decides the mechanism:
+
+- The guest generates its host keypair locally on first boot (cloud-init
+  `ssh_genkey` or a first-boot unit); no private half is ever minted
+  coordinator-side or shipped through user-data. The mint-and-inject scrub
+  step becomes dead code and is removed.
+- The guest publishes the PUBLIC half to the coordinator over the
+  provisioning channel (the one-time create-time token — the same
+  authenticated channel, now carrying public material only). The coordinator
+  CA signs a short-lived host certificate whose principals bind the machine
+  identity plus the provider's instance-identity content (Decision 3's
+  principal rule).
+- The trust anchor moves from per-worker pins to ONE pinned
+  `@cert-authority` line per operator; Decision 4's refusal-by-name posture
+  is unchanged (the mandatory workers-entry field becomes the CA
+  fingerprint); `StrictHostKeyChecking=yes` and the shuttle-managed
+  `known_hosts` stay.
+- Rebuild is clean rotation: a rebuilt machine generates a NEW key and
+  re-publishes; the addendum's re-delivery trap is moot because nothing
+  sensitive is re-delivered. #283's generate-and-publish property is
+  delivered BY the CA form, not adopted separately.
+- The CA key ceremony joins ADR-0024's — the CA is the new high-value
+  trust root, with rotation/TTL policy recorded there. Implementation epic:
+  #295. #281's remaining mint-and-inject hardening items are superseded
+  where the CA form deletes their subject (the scrub), rescored where it
+  does not.
 
 ## Revisit triggers
 

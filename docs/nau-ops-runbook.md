@@ -52,20 +52,20 @@ structural isolation beats procedural care (#271; INFRA D5).
 3. Store it under a NEW key — `HETZNER_WORKER_TOKEN` is #271's example —
    never inside `TOFU_INPUTS`.
 
-> **DECISION SLOT A — token storage/secret path.** #271 mandates "a
-> project-scoped API token stored in SM (new key, e.g.
-> `HETZNER_WORKER_TOKEN`)" but leaves the concrete secret path and
-> distribution open. The operator picks: SM item name/path, and how
-> consumers receive it (env var in the shell that runs the provisioner
-> #194 and the sweep #269; zet's `scripts/bws-get` + secrets-cache flow
-> is the prior art). Both consumers read THIS token, never `TOFU_INPUTS`.
+> **DECISION SLOT A — RESOLVED (2026-09-29, operator): Bitwarden SM via the
+> secrets cache.** `HETZNER_WORKER_TOKEN` is a new SM item in the
+> devbox-global vault; consumers (provisioner #194, sweep #269) receive it
+> through the secrets cache (`/run/user/1000/devbox-secrets.sh` → env; zet's
+> `scripts/bws-get` is the retrieval prior art). It is never `TOFU_INPUTS`
+> and never a plaintext file.
 
 Export it for the CLI session (the `HCLOUD_TOKEN` env var is what the
 hcloud CLI reads; #269's sweep drives the same CLI):
 
 ```bash
-# source: #271 (new key, never TOFU_INPUTS); HCLOUD_TOKEN = hcloud CLI env
-export HCLOUD_TOKEN='<HETZNER_WORKER_TOKEN from DECISION SLOT A storage>'
+# HETZNER_WORKER_TOKEN: Bitwarden SM item delivered by the secrets cache
+# (DECISION SLOT A). HCLOUD_TOKEN is the hcloud CLI's env var:
+export HCLOUD_TOKEN="$HETZNER_WORKER_TOKEN"
 ```
 
 ### 1.2 Firewall: ssh from the operator only
@@ -337,13 +337,13 @@ Caveat from ADR-0046: the monitoring stack died with zet and must be
 rebuilt — the definitions above are placement-agnostic and land wherever
 the successor kuma runs.
 
-> **DECISION SLOT B — alert destination (and where the monitoring stack
-> runs).** ADR-0046's revisit trigger names it: "a monitoring destination
-> decision (where kuma-successor alerts go)". It gates meaningful alerts
-> from §4's monitors AND §5's sweep API-failure alarm (#269: "a silently
-> skipped sweep is the exact failure this net exists to catch"). No
-> source records a destination (zet's monitors.json shipped
-> `notificationIDList: {}`).
+> **DECISION SLOT B — RESOLVED (2026-09-29, operator): multi-notify
+> fan-out.** Alerts go to ALL configured mechanisms — first-class kuma push
+> and ntfy topics, extensible to further destinations — designed and landed
+> under #296 alongside #287's sweep axes. Until #296 lands, the interim
+> destination is the existing generic `SHUTTLE_SWEEP_ALERT_CMD` hook
+> (single command; chain notifiers there if needed). ADR-0046's monitoring
+> destination question is answered by the same design.
 
 ## 5. TTL sweep install (#269 — by reference)
 
