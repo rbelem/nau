@@ -198,6 +198,9 @@ pub struct ProvisionPlan {
     pub server_type: String,
     pub location: String,
     pub count: u32,
+    /// The base image the workers boot — the latest-Ubuntu-LTS pin
+    /// (ADR-0046, never a codename); the provider module's SKU mapping.
+    pub image: String,
     pub ttl_secs: u64,
     pub ttl_expiry_iso: String,
     pub binary_url: String,
@@ -345,6 +348,33 @@ pub fn now_epoch_secs() -> miette::Result<u64> {
 
 // ── The shared cloud-init template ──
 
+// The worker tool pins (providers plan §3, ticket #273). Both are
+// compile-time constants on purpose: the template, the dry-run plan, and
+// the coordinator-side admission checks all read the SAME values, so a
+// pin bump is one commit that moves template + admission together.
+
+/// The pinned mksquashfs, built from source in the template (pin 1).
+/// Every stable distro ships 4.6.1; ADR-0041's zstd defaults make
+/// mksquashfs behavior part of artifact identity, so the fleet runs one
+/// source-built 4.7.x. The preflight admission refuses any worker whose
+/// resolved mksquashfs reports anything else.
+pub const SQUASHFS_TOOLS_VERSION: &str = "4.7.4";
+
+/// The release date baked into the pinned build's version string. The
+/// codeload tarball otherwise builds as `4.7.4-<hash>`; the template
+/// forces the clean release form so `discover_version` reads exactly
+/// [`SQUASHFS_TOOLS_VERSION`] on every worker.
+pub const SQUASHFS_TOOLS_RELEASE_DATE: &str = "2025-11-09";
+
+/// The pinned source tarball (GitHub codeload, tag `4.7.4`). Verified by
+/// sha256 IN the template before a single byte is built.
+pub const SQUASHFS_TOOLS_TARBALL_URL: &str =
+    "https://codeload.github.com/plougher/squashfs-tools/tar.gz/refs/tags/4.7.4";
+
+/// sha256 of [`SQUASHFS_TOOLS_TARBALL_URL`]'s exact bytes.
+pub const SQUASHFS_TOOLS_SHA256: &str =
+    "91c49f9a1ed972ad00688a38222119e2baf49ba74cf5fda05729a79d7d59d335";
+
 /// Everything the template needs. Nothing here is optional: a provision
 /// without a pin, a login key, or a TTL is not a shuttle worker.
 pub struct UserDataParams<'a> {
@@ -371,11 +401,13 @@ pub struct UserDataParams<'a> {
 /// (`ssh_deletekeys: false` keeps cloud-init from regenerating it), the
 /// operator authorized key grants login, the TTL marker is stamped as the
 /// in-guest fallback COPY of the `shuttle-worker-ttl` label (the sweep's
-/// source of truth), the pinned shuttle binary is installed, sshd is
-/// hardened (key-only, root login by key), and the guest's copy of this
-/// very blob is scrubbed once sshd is up — the metadata service keeps
-/// serving user-data indefinitely, so the private half must not linger
-/// there.
+/// source of truth), the worker tool pins are installed (#273: distro
+/// bwrap + ca-certificates + curl, then the pinned squashfs-tools built
+/// from source to /usr/local/bin with its version asserted), the pinned
+/// shuttle binary is installed, sshd is hardened (key-only, root login by
+/// key), and the guest's copy of this very blob is scrubbed once sshd is
+/// up — the metadata service keeps serving user-data indefinitely, so the
+/// private half must not linger there.
 pub fn render_user_data(p: &UserDataParams<'_>) -> String {
     let mut s = String::from("#cloud-config\n");
     // cloud-init's ssh module must not delete/regenerate the injected key.
@@ -401,6 +433,20 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
         &p.ttl_expiry_epoch.to_string(),
     );
     s.push_str("runcmd:\n");
+    // Pin 2 first: the distro packages every later step needs — bwrap
+    // (it ships its own AppArmor profile, so the current Ubuntu LTS
+    // userns restriction does not break it; the hardening stays, and
+    // `apparmor_restrict_unprivileged_userns` is NEVER touched here),
+    // plus the toolchain pin 1 builds against.
+    s.push_str("  - apt-get update\n");
+    s.push_str(
+        "  - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+         bubblewrap ca-certificates curl build-essential liblz4-dev libzstd-dev liblzma-dev \
+         zlib1g-dev\n",
+    );
+    // Pin 1: the source-built mksquashfs, fetched+verified+installed as
+    // one fail-together step.
+    s.push_str(&format!("  - {}\n", squashfs_build_runcmd()));
     s.push_str(&format!(
         "  - curl -fsSL {url} -o /usr/local/bin/shuttle\n",
         url = p.binary_url
@@ -430,6 +476,34 @@ fn write_file(s: &mut String, path: &str, mode: &str, content: &str) {
     for line in content.lines() {
         s.push_str(&format!("      {line}\n"));
     }
+}
+
+/// The single `sh -c` runcmd that installs pin 1 (providers plan §3):
+/// fetch the pinned squashfs-tools tarball, verify its sha256 BEFORE
+/// anything runs, build against lz4/zstd/xz with the release VERSION
+/// forced (the codeload tarball otherwise bakes the commit hash into the
+/// version string — the fleet pin must read exactly
+/// [`SQUASHFS_TOOLS_VERSION`]), `make install` to /usr/local/bin
+/// (PATH-precedence over the distro's 4.6.1), and fail the step unless
+/// the built binary reports the pin. One step, because the tool pin
+/// succeeds or fails as a unit in the cloud-init log; a worker that
+/// missed it is refused at preflight by design (admission is
+/// fail-closed).
+fn squashfs_build_runcmd() -> String {
+    let tarball = format!("squashfs-tools-{SQUASHFS_TOOLS_VERSION}.tar.gz");
+    let srcdir = format!("squashfs-tools-{SQUASHFS_TOOLS_VERSION}");
+    format!(
+        "sh -c 'set -e; cd /tmp; \
+         curl -fsSL {SQUASHFS_TOOLS_TARBALL_URL} -o {tarball}; \
+         echo \"{SQUASHFS_TOOLS_SHA256}  {tarball}\" | sha256sum -c -; \
+         tar -xzf {tarball}; \
+         make -C {srcdir}/squashfs-tools XZ_SUPPORT=1 ZSTD_SUPPORT=1 LZ4_SUPPORT=1 LZO_SUPPORT=0 \
+         RELEASE_VERSION={SQUASHFS_TOOLS_VERSION} RELEASE_DATE={SQUASHFS_TOOLS_RELEASE_DATE} \
+         -j\"$(nproc)\"; \
+         make -C {srcdir}/squashfs-tools install; \
+         /usr/local/bin/mksquashfs -version | grep -q \"version {SQUASHFS_TOOLS_VERSION} \"; \
+         rm -rf /tmp/{srcdir} /tmp/{tarball}'"
+    )
 }
 
 // ── The managed `workers` block in shuttle.lua ──

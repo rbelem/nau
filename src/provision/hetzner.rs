@@ -35,9 +35,13 @@ use crate::provision::{
 pub const WORKER_LABEL: &str = "shuttle-worker";
 pub const WORKER_TTL_LABEL: &str = "shuttle-worker-ttl";
 
-/// The stock image the template assumes (providers plan: Ubuntu 24.04;
-/// template/toolchain determinism is #276's scope).
-const IMAGE: &str = "ubuntu-24.04";
+/// The worker base image (providers plan §3, ADR-0046): the LATEST
+/// Ubuntu LTS — the contract pins "latest LTS", never a codename — so
+/// this slug is bumped on every new LTS (26.04 at the 2026-09-27
+/// decision; #273 reconciled it from the stale 24.04 wording). The
+/// overlay is entirely in the shared cloud-init template: stock provider
+/// image, no custom images.
+pub const IMAGE: &str = "ubuntu-26.04";
 
 pub struct HetznerProvisioner<R: CommandRunner> {
     runner: R,
@@ -104,6 +108,7 @@ impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
                 server_type: req.server_type.clone(),
                 location: req.location.clone(),
                 count: req.count,
+                image: IMAGE.to_string(),
                 ttl_secs: req.ttl_secs,
                 ttl_expiry_iso: expiry_iso,
                 binary_url: self.binary_url.clone(),
@@ -336,6 +341,7 @@ fn print_plan(plan: &ProvisionPlan) {
     crate::output::info("  provider:         hetzner");
     crate::output::info(format!("  type:             {}", plan.server_type));
     crate::output::info(format!("  location:         {}", plan.location));
+    crate::output::info(format!("  base image:       {}", plan.image));
     crate::output::info(format!("  count:            {}", plan.count));
     crate::output::info(format!(
         "  ttl:              {}s (expiry {})",

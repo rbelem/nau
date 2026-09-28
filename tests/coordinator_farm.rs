@@ -463,6 +463,7 @@ impl LoopbackWorker {
                 mksquashfs: true,
                 kvm: false,
                 sandbox: true,
+                mksquashfs_version: Some(shuttle::provision::SQUASHFS_TOOLS_VERSION.into()),
             },
         }
     }

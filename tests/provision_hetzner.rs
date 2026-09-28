@@ -13,7 +13,8 @@ use shuttle::command::{CommandRunner, RunnerOutput};
 use shuttle::provision::hetzner::HetznerProvisioner;
 use shuttle::provision::{
     append_worker_entry, now_epoch_secs, parse_ttl, render_user_data, ProvisionRequest,
-    Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END,
+    Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END, SQUASHFS_TOOLS_RELEASE_DATE,
+    SQUASHFS_TOOLS_SHA256, SQUASHFS_TOOLS_TARBALL_URL, SQUASHFS_TOOLS_VERSION,
 };
 
 /// A shape-valid ed25519 keypair — throwaway fixture bytes, no crypto.
@@ -326,6 +327,81 @@ fn user_data_carries_pinned_binary_operator_key_ttl_and_scrub() {
 }
 
 #[test]
+fn user_data_builds_the_pinned_squashfs_tools_from_source() {
+    let user_data = render_user_data(&UserDataParams {
+        host_private_key: TEST_HOST_PRIV,
+        host_public_key: TEST_HOST_PUB,
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: MARKER_EPOCH,
+    });
+    // Pin 1 (providers plan §3): the exact 4.7.x pin rides the template —
+    // exact tarball URL, exact bytes (sha256 verified BEFORE the build),
+    // the lz4/zstd/xz build the plan names, the install to /usr/local/bin
+    // (PATH-precedence over the distro's 4.6.1), and a version assert so
+    // a drifted build fails provisioning instead of joining the fleet.
+    assert!(
+        SQUASHFS_TOOLS_VERSION.starts_with("4.7."),
+        "the fleet pin is a 4.7.x, got {SQUASHFS_TOOLS_VERSION}"
+    );
+    assert!(user_data.contains(SQUASHFS_TOOLS_TARBALL_URL));
+    assert!(user_data.contains(SQUASHFS_TOOLS_SHA256));
+    assert!(user_data.contains("sha256sum -c"));
+    // The compression set the plan names, explicit over the Makefile's
+    // defaults (lzo defaults ON in 4.7.x; the pin is xz/zstd/lz4).
+    assert!(user_data.contains("XZ_SUPPORT=1 ZSTD_SUPPORT=1 LZ4_SUPPORT=1 LZO_SUPPORT=0"));
+    // The release VERSION is forced: the codeload tarball otherwise bakes
+    // the commit hash into the version string, and admission pins the
+    // exact string the resolved binary reports.
+    assert!(user_data.contains(&format!(
+        "RELEASE_VERSION={SQUASHFS_TOOLS_VERSION} RELEASE_DATE={SQUASHFS_TOOLS_RELEASE_DATE}"
+    )));
+    assert!(user_data.contains(&format!(
+        "make -C squashfs-tools-{SQUASHFS_TOOLS_VERSION}/squashfs-tools install"
+    )));
+    assert!(user_data.contains("/usr/local/bin/mksquashfs -version"));
+    assert!(user_data.contains(&format!("grep -q \"version {SQUASHFS_TOOLS_VERSION} \"")));
+    // The build tree never rides into a snapshot (#271 bills per GB-month).
+    assert!(user_data.contains("rm -rf /tmp/squashfs-tools-"));
+}
+
+#[test]
+fn user_data_installs_the_distro_bwrap_pin_and_keeps_the_userns_hardening() {
+    let user_data = render_user_data(&UserDataParams {
+        host_private_key: TEST_HOST_PRIV,
+        host_public_key: TEST_HOST_PUB,
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: MARKER_EPOCH,
+    });
+    // Pin 2: bwrap + ca-certificates + curl from the DISTRO, no overlay.
+    assert!(user_data
+        .contains("apt-get install -y --no-install-recommends bubblewrap ca-certificates curl"));
+    // The current Ubuntu LTS AppArmor userns restriction is system
+    // hardening that does NOT break bubblewrap (it ships its own
+    // profile): the template never weakens it. Admission is fail-closed
+    // via the __worker-cap real sandbox probe instead.
+    assert!(!user_data.contains("apparmor_restrict_unprivileged_userns"));
+}
+
+#[test]
+fn the_base_image_is_the_latest_ubuntu_lts_slug_never_a_codename() {
+    // ADR-0046: the contract pins "latest LTS" — 26.04 at the 2026-09-27
+    // decision. The slug shape (ubuntu-NN.NN) is the never-a-codename
+    // rule made checkable; a codename like "resolute" must never land.
+    assert_eq!(shuttle::provision::hetzner::IMAGE, "ubuntu-26.04");
+    let slug = shuttle::provision::hetzner::IMAGE
+        .strip_prefix("ubuntu-")
+        .expect("an ubuntu image slug");
+    assert_eq!(
+        slug.len(),
+        "NN.NN".len(),
+        "ubuntu-NN.NN, never a codename: {}",
+        shuttle::provision::hetzner::IMAGE
+    );
+}
+
+#[test]
 fn provision_creates_describes_pins_and_labels() {
     let (dir, config) = workspace("shuttle.lua");
     std::fs::write(&config, operator_config()).unwrap();
@@ -386,7 +462,13 @@ fn provision_creates_describes_pins_and_labels() {
         assert!(!ttl_value.contains(':'), "epoch seconds, never ISO-8601");
         assert!(f.contains("--type\u{1f}CX33"));
         assert!(f.contains("--location\u{1f}hel1"));
-        assert!(f.contains("--image\u{1f}ubuntu-24.04"));
+        // The base-image pin (ADR-0046 latest-Ubuntu-LTS slug) rides the
+        // create argv — asserted against the const, so pin and test move
+        // together.
+        assert!(f.contains(&format!(
+            "--image\u{1f}{}",
+            shuttle::provision::hetzner::IMAGE
+        )));
         let udf = argv.iter().position(|a| a == "--user-datafile").unwrap();
         assert!(!argv[udf + 1].is_empty(), "a user-data file is passed");
         assert!(!f.contains("tok-1"), "token never enters argv: {f}");
