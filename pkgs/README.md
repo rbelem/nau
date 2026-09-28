@@ -65,10 +65,11 @@ below). Policy and rationale:
 [ADR-0047](../docs/adr/0047-version-coexistence.md); vocabulary: the
 *Package line* entry in [CONTEXT.md](../CONTEXT.md).
 
-> **Status:** the policy is ratified (ADR-0047) and the machinery
-> lands via #278 — constraint-threaded evaluation, the `lines` table,
-> the lint and doctor surfaces (#260). Until it lands, recipes remain
-> one-version-per-file and `name@constraint` only filters resolution.
+> **Status:** live. The policy is ratified (ADR-0047); the machinery
+> landed via #278 — the `constraint` eval global, the `lines` table,
+> refusal of a constraint naming no declared line — and #260 — the
+> eval lint on suffixed sibling names and the doctor cross-pod line
+> report.
 
 ### The rules
 
@@ -89,8 +90,7 @@ below). Policy and rationale:
 
 ### Worked example — `pkgs/n/node.lua`
 
-The target shape (landing with #278; today's file still carries a
-single version):
+The reference shape, as the shipped recipe declares it:
 
 ```lua
 local lines = {

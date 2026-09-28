@@ -389,13 +389,42 @@ pub fn layered_packages(gen: &Generation) -> Vec<&InstalledPackage> {
     pkgs
 }
 
+/// True when two colliding package names are a version-line pair: the
+/// same name, or one a `<base><digits>` sibling of the other (`node`
+/// next to `node22`). Only then does the collision warning speak the
+/// coexistence vocabulary — two packages genuinely owning one command
+/// get the plain warning, not a remedy that does not apply.
+fn is_version_line_pair(winner: &str, loser: &str) -> bool {
+    if winner == loser {
+        return true;
+    }
+    match crate::lint::split_version_suffix(winner) {
+        Some(base) => base == loser,
+        None => crate::lint::split_version_suffix(loser) == Some(winner),
+    }
+}
+
+/// The ADR-0047 remedy vocabulary for a version-line collision: the
+/// second line belongs in another pod, selected by `name@constraint` —
+/// never as a suffixed name in the same one (#260).
+fn coexistence_hint(winner: &str, loser: &str) -> Option<String> {
+    is_version_line_pair(winner, loser).then(|| {
+        "two lines of one package coexist across pods via `name@constraint`, \
+         never within one (ADR-0047)"
+            .to_string()
+    })
+}
+
 /// Warn about one name collision resolved at emit time (activation).
 /// Generations this code produces are collision-checked at mutation
 /// time (`pod.rs` claim resolution), so emit only ever sees cross-layer
 /// overrides (warn: higher layer wins) or same-precedence duplicates
 /// from pre-#8 manifests (warn: deterministic replacement). Never
 /// silent, never fatal — a rollback must always be able to re-emit.
+/// A version-line pair (`node` vs `node22`, or one name twice) carries
+/// the ADR-0047 remedy vocabulary (#260).
 pub fn warn_emit_collision(kind: &str, id: &str, winner: &str, loser: &str, same_layer: bool) {
+    let hint = coexistence_hint(winner, loser);
     if same_layer {
         crate::output::warn(format!(
             "{kind} '{id}' is shipped by both '{winner}' and '{loser}' at the same \
@@ -405,6 +434,9 @@ pub fn warn_emit_collision(kind: &str, id: &str, winner: &str, loser: &str, same
         crate::output::warn(format!(
             "{kind} '{id}' from '{winner}' overrides '{loser}' (higher layer wins)"
         ));
+    }
+    if let Some(hint) = hint {
+        crate::output::warn(hint);
     }
 }
 
@@ -1378,6 +1410,25 @@ mod tests {
         assert_eq!(classify_collision(Own, Overlay), Override);
         assert_eq!(classify_collision(Overlay, Own), Shadowed);
         assert_eq!(classify_collision(Own, Loaded), Shadowed);
+    }
+
+    // ── Version-line hint vocabulary (ADR-0047 D5, #260) ──
+
+    #[test]
+    fn version_line_collisions_carry_the_coexistence_hint() {
+        let hint = coexistence_hint("node22", "node").unwrap();
+        assert!(
+            hint.contains("`name@constraint`") && hint.contains("ADR-0047"),
+            "suffixed-sibling collision must point at the remedy: {hint}"
+        );
+        // Either side may carry the suffix, and the same name twice (a
+        // cross-pod line sharing a shell) is the canonical case.
+        assert!(coexistence_hint("node", "node22").is_some());
+        assert!(coexistence_hint("node", "node").is_some());
+        // Two genuinely different packages owning one command get no
+        // remedy that does not apply.
+        assert!(coexistence_hint("curl", "git").is_none());
+        assert!(coexistence_hint("foo", "foobar").is_none());
     }
 
     // ── Issue #37: multi-file packages — the assembly subtree ──

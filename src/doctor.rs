@@ -243,6 +243,10 @@ fn run_scoped(scope: Scope) -> Vec<Check> {
     // toolchain, or doctor names the collect2/ld skew before a sync
     // dies mid-link on it. Hint-only — see [`check_cc_provenance`].
     checks.push(check_cc_provenance());
+    // Cross-pod version-line report (ADR-0047 D3, #260): the same
+    // package on different lines across pods, named instead of folklore.
+    // Hint-only — see [`check_pod_version_lines`].
+    checks.push(check_pod_version_lines());
     checks
 }
 
@@ -1731,6 +1735,90 @@ fn pod_farm_dirs() -> Vec<PathBuf> {
     farms
 }
 
+/// The line a pod pin sits on (ADR-0047): the declared constraint when
+/// the pod pinned one (`node@22` → "22"), else the leading dotted
+/// component of the resolved version — an unconstrained pin takes the
+/// current line, so 26.7.0 sits on the 26 line. The lockfile already
+/// records `{version, constraint}` per pin ([`crate::lock`]).
+fn pin_line(entry: &crate::lock::PodPackageLockEntry) -> String {
+    entry.constraint.clone().unwrap_or_else(|| {
+        entry
+            .version
+            .split('.')
+            .next()
+            .unwrap_or(&entry.version)
+            .to_string()
+    })
+}
+
+/// Cross-pod version-line report (ADR-0047 D3, #260): the same package
+/// pinned to different lines across pods is coexistence working as
+/// designed — `node@26` here, `node@22` in another pod — but only
+/// discoverable when named, so doctor reports the divergence and the
+/// remedy vocabulary. Read-only over the lockfiles; never fails the
+/// report (a pod whose lockfile is absent or unreadable contributes
+/// nothing — doctor is a diagnostic, never a state initializer).
+pub fn check_pod_version_lines() -> Check {
+    check_pod_version_lines_with(&crate::pod::pod_root(None))
+}
+
+/// [`check_pod_version_lines`] over an explicit pod root — the test seam.
+pub(crate) fn check_pod_version_lines_with(root: &Path) -> Check {
+    let name = "pod version lines";
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Check::ok(name);
+    };
+    let mut pods: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    pods.sort();
+    // package → [(pod, line)], pods in sorted order.
+    let mut lines: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
+    for pod in pods {
+        let lock =
+            crate::lock::LockFile::load(&root.join(&pod).join(crate::lock::LockFile::FILENAME));
+        let Ok(Some(lock)) = lock else {
+            continue;
+        };
+        for (pkg, entry) in lock.packages {
+            lines
+                .entry(pkg)
+                .or_default()
+                .push((pod.clone(), pin_line(&entry)));
+        }
+    }
+    let mut divergent: Vec<String> = Vec::new();
+    for (pkg, pins) in &lines {
+        let mut distinct: Vec<&str> = pins.iter().map(|(_, l)| l.as_str()).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() < 2 {
+            continue;
+        }
+        let detail = pins
+            .iter()
+            .map(|(pod, line)| format!("'{pod}' has {pkg}@{line}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        divergent.push(format!("{pkg}: {detail}"));
+    }
+    if divergent.is_empty() {
+        Check::ok(name)
+    } else {
+        // Informational: divergence is sanctioned coexistence, never a
+        // failure — the hint names the pins and the ADR-0047 remedy.
+        Check::ok_at(
+            name,
+            format!(
+                "{} — cross-pod coexistence via `name@constraint`, one line per pod (ADR-0047)",
+                divergent.join("; ")
+            ),
+        )
+    }
+}
+
 /// Print a formatted doctor report to stdout.
 pub fn print_report(checks: &[Check]) {
     let mut all_ok = true;
@@ -1968,6 +2056,67 @@ mod tests {
             audit_kernel_verity_config(dir.path(), "6.8.0"),
             VerityConfigAudit::Unconfirmed(config)
         );
+    }
+
+    // ── Cross-pod version-line report (ADR-0047 D3, #260) ──
+
+    /// One pod directory with a lockfile pinning `node` on `line`
+    /// (`constraint: None` derives the line from the resolved version).
+    fn pod_with_node_pin(root: &Path, pod: &str, version: &str, constraint: Option<&str>) {
+        let dir = root.join(pod);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut lock = crate::lock::LockFile::empty();
+        lock.packages.insert(
+            "node".to_string(),
+            crate::lock::PodPackageLockEntry {
+                version: version.to_string(),
+                constraint: constraint.map(String::from),
+                deps: None,
+                recipe_sha256: None,
+                recipe_digest_scheme: None,
+            },
+        );
+        lock.save(&dir.join(crate::lock::LockFile::FILENAME))
+            .unwrap();
+    }
+
+    #[test]
+    fn cross_pod_line_divergence_is_named_with_the_adr_vocabulary() {
+        let dir = tempfile::tempdir().unwrap();
+        // 'default' takes the current 26 line unconstrained; 'legacy'
+        // pins the LTS line by constraint — the ADR-0047 example shape.
+        pod_with_node_pin(dir.path(), "default", "26.7.0", None);
+        pod_with_node_pin(dir.path(), "legacy", "22.23.3", Some("22"));
+        let check = check_pod_version_lines_with(dir.path());
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "hint-only: {check:?}"
+        );
+        let hint = check.hint.expect("divergence must be reported");
+        assert!(
+            hint.contains("'default' has node@26") && hint.contains("'legacy' has node@22"),
+            "snapshot: both pins named in pod order: {hint}"
+        );
+        assert!(
+            hint.contains("`name@constraint`") && hint.contains("ADR-0047"),
+            "the remedy vocabulary must point at name@constraint (ADR-0047): {hint}"
+        );
+    }
+
+    #[test]
+    fn same_line_across_pods_and_missing_pods_stay_silent() {
+        // Both pods on the 22 line: coexistence with no divergence — ok,
+        // no hint.
+        let dir = tempfile::tempdir().unwrap();
+        pod_with_node_pin(dir.path(), "a", "22.23.3", Some("22"));
+        pod_with_node_pin(dir.path(), "b", "22.23.3", Some("22"));
+        let check = check_pod_version_lines_with(dir.path());
+        assert!(matches!(check.status, CheckStatus::Ok));
+        assert!(check.hint.is_none(), "no divergence, no hint: {check:?}");
+        // No pod root at all: silent ok (doctor never initializes state).
+        let empty = tempfile::tempdir().unwrap();
+        let check = check_pod_version_lines_with(empty.path());
+        assert!(matches!(check.status, CheckStatus::Ok) && check.hint.is_none());
     }
 
     #[test]
