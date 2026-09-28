@@ -23,6 +23,7 @@
 //! is up.
 
 pub mod aws;
+pub mod gcp;
 pub mod hetzner;
 
 use std::path::{Path, PathBuf};
@@ -82,6 +83,36 @@ fn aws_credentials_source() -> Option<String> {
     None
 }
 
+/// Where the gcloud CLI would resolve credentials from, without calling
+/// the API: `GOOGLE_APPLICATION_CREDENTIALS` (the ADC key file), else the
+/// `CLOUDSDK_CONFIG` credential store (default `$HOME/.config/gcloud`, the
+/// `gcloud auth login` state) on disk. Read at the CLI boundary so the
+/// provider core stays env-free under test; the gcloud CLI inherits the
+/// credential from the environment — it never enters argv.
+fn gcp_credentials_source() -> Option<String> {
+    if std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+        .ok()
+        .is_some_and(|k| !k.trim().is_empty())
+    {
+        return Some("GOOGLE_APPLICATION_CREDENTIALS".into());
+    }
+    let base = match std::env::var("CLOUDSDK_CONFIG")
+        .ok()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+    {
+        Some(c) => c,
+        None => format!(
+            "{}/.config/gcloud",
+            std::env::var("HOME").unwrap_or_else(|_| ".".into())
+        ),
+    };
+    if Path::new(&base).exists() {
+        return Some(base);
+    }
+    None
+}
+
 /// CLI entry for `shuttle workers provision` / `shuttle workers destroy`.
 pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
     match command {
@@ -93,6 +124,7 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
             ttl,
             spot,
             max_price,
+            preemptible,
             dry_run,
             file,
         } => {
@@ -102,7 +134,10 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
                 location,
                 count,
                 ttl_secs: parse_ttl(&ttl)?,
-                spot,
+                // `--preemptible` is the gcp spelling of the
+                // provider-independent `--spot` bit: one request shape,
+                // two flag spellings.
+                spot: spot || preemptible,
                 max_price,
                 dry_run,
                 config: PathBuf::from(&file),
@@ -158,8 +193,14 @@ fn provider_for(provider: &str) -> miette::Result<Box<dyn Provisioner>> {
             default_binary_url(),
             resolve_operator_key()?,
         ))),
+        "gcp" => Ok(Box::new(gcp::GcpProvisioner::new(
+            crate::command::RealRunner,
+            gcp_credentials_source(),
+            default_binary_url(),
+            resolve_operator_key()?,
+        ))),
         other => Err(miette::miette!(
-            "workers: unknown provider '{other}' (supported: hetzner, aws)"
+            "workers: unknown provider '{other}' (supported: hetzner, aws, gcp)"
         )),
     }
 }
