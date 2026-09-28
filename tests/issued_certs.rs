@@ -1,0 +1,390 @@
+//! Host-certificate issuance + pickup (#295 sub-task 3) end to end
+//! through the real binary with the REAL `ssh-keygen`: a ceremony-minted
+//! CA signs a SHORT-LIVED host certificate for a pending identity —
+//! principals binding the machine identity plus the provider
+//! instance-identity content (ADR-0045 Decision 3) — the identity moves
+//! pending → issued (audit trail), and the guest picks the certificate
+//! up under its one-time publish token. Every signed certificate is
+//! verified with `ssh-keygen -L`: the principal list, the validity
+//! window, and the signing CA fingerprint must all be what the flow
+//! claimed. Every path runs under an isolated `--home`/HOME — the
+//! operator's real CA is never touched.
+
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const IDENTITY: &str = "shuttle-worker-itest-01";
+
+struct Run {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_in(dir: &Path, args: &[&str]) -> Run {
+    let out = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+        .args(args)
+        .env("HOME", dir)
+        .current_dir(dir)
+        .output()
+        .expect("failed to spawn shuttle");
+    Run {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// Run shuttle with stdin piped (the receive-publish payload) and the
+/// publish bearer in the environment (the transport front's contract).
+fn run_in_with_stdin(dir: &Path, args: &[&str], stdin: &[u8], token: &str) -> Run {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+        .args(args)
+        .env("HOME", dir)
+        .env("SHUTTLE_PUBLISH_TOKEN", token)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn shuttle");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(stdin)
+        .expect("payload written");
+    let out = child.wait_with_output().expect("shuttle waited");
+    Run {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+fn json_out(stdout: &str) -> serde_json::Value {
+    serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("--json report must parse ({e}): {stdout}"))
+}
+
+/// A REAL guest host key: minted by the real ssh-keygen, the .pub line
+/// the guest would publish. (The coordinator signs whatever public half
+/// was published; a fabricated line would prove nothing here.)
+fn real_guest_pub_line(dir: &Path) -> String {
+    let path = dir.join("guest_host_key");
+    let out = Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "itest-guest-host-key",
+            "-f",
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("real ssh-keygen must be available (openssh)");
+    assert!(
+        out.status.success(),
+        "ssh-keygen mint failed: {}",
+        out.status
+    );
+    std::fs::read_to_string(path.with_extension("pub"))
+        .expect("guest .pub")
+        .trim()
+        .to_string()
+}
+
+fn instance_identity() -> serde_json::Value {
+    serde_json::json!({
+        "v1": {
+            "instance_id": "i-0itest",
+            "cloud_name": "hetzner",
+            "region": "hel1",
+            "availability_zone": "hel1-dc2",
+            "hostname": "host-alias-77",
+            "local_hostname": "host-alias-77.internal",
+        }
+    })
+}
+
+/// The real intake flow: mint + record a token (library — provision
+/// does this mid-create), then push the payload through the REAL
+/// `workers receive-publish` verb (stdin + bearer env).
+fn enroll_and_publish_via_binary(dir: &Path, identity: &str, guest_pub: &str) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let token = shuttle::provision::publish::mint_publish_token().unwrap();
+    shuttle::provision::publish::record_issue(dir, &token, identity, now).unwrap();
+    let payload = serde_json::json!({
+        "machine_identity": identity,
+        "public_key": guest_pub,
+        "instance_identity": instance_identity(),
+    })
+    .to_string();
+    let run = run_in_with_stdin(
+        dir,
+        &["workers", "receive-publish"],
+        payload.as_bytes(),
+        &token,
+    );
+    assert_eq!(run.code, Some(0), "receive-publish: {}", run.stderr);
+    assert!(
+        run.stderr.contains("pending identity"),
+        "intake names the stored identity: {}",
+        run.stderr
+    );
+    token
+}
+
+#[test]
+fn issue_and_pickup_round_trip_through_the_real_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = format!("--home={}", dir.path().display());
+    let ca_dir = dir.path().join(".config/shuttle/ca");
+
+    // ── the ceremony: a real CA keypair ──
+    let run = run_in(dir.path(), &["ca", "keygen", &home, "--json"]);
+    assert_eq!(run.code, Some(0), "ca keygen: {}", run.stderr);
+    let ca_fingerprint = json_out(&run.stdout)["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let guest_pub = real_guest_pub_line(dir.path());
+    let token = enroll_and_publish_via_binary(dir.path(), IDENTITY, &guest_pub);
+
+    // ── issuance through the real binary, REAL ssh-keygen -s ──
+    let run = run_in(dir.path(), &["workers", "issue", &home, "--json"]);
+    assert_eq!(run.code, Some(0), "issue: {}", run.stderr);
+    let report = json_out(&run.stdout);
+    let issued = &report["issued"];
+    assert_eq!(
+        issued.as_array().map(Vec::len),
+        Some(1),
+        "one pending identity, one certificate: {report}"
+    );
+    assert_eq!(issued[0]["machine_identity"], serde_json::json!(IDENTITY));
+    let principals: Vec<&str> = issued[0]["principals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        principals,
+        vec![IDENTITY, "i-0itest", "hetzner", "hel1", "hel1-dc2"],
+        "machine identity first, then Decision 3 content — addresses excluded"
+    );
+    assert_eq!(issued[0]["validity"], serde_json::json!("+48h"));
+    assert_eq!(
+        issued[0]["ca_fingerprint"],
+        serde_json::json!(ca_fingerprint)
+    );
+
+    // The identity left the pending store into the issued record.
+    assert!(
+        !ca_dir
+            .join("pending")
+            .join(format!("pending-{IDENTITY}.json"))
+            .exists(),
+        "pending entry gone"
+    );
+    let record_path = ca_dir
+        .join("issued")
+        .join(format!("issued-{IDENTITY}.json"));
+    assert!(
+        record_path.exists(),
+        "issued record (audit trail) at {record_path:?}"
+    );
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+    assert_eq!(record["public_key"], serde_json::json!(guest_pub));
+    assert_eq!(
+        record["token_sha256"],
+        serde_json::json!(shuttle::oci::sha256_hex(token.as_bytes())),
+        "the record ties back to the publish token (hashed at rest)"
+    );
+    assert!(
+        record["cert"]
+            .as_str()
+            .unwrap()
+            .starts_with("ssh-ed25519-cert-v01"),
+        "the record carries the certificate: {}",
+        record["cert"]
+    );
+
+    // ── pickup through the real binary: same bearer, cert on stdout ──
+    let run = run_in_with_stdin(dir.path(), &["workers", "pickup", &home], b"", &token);
+    assert_eq!(run.code, Some(0), "pickup: {}", run.stderr);
+    let cert = run.stdout.trim().to_string();
+    assert!(
+        cert.starts_with("ssh-ed25519-cert-v01"),
+        "the certificate is the stdout artifact: {cert}"
+    );
+
+    // Idempotent: the guest polls; every GET serves the same cert.
+    let again = run_in_with_stdin(dir.path(), &["workers", "pickup", &home], b"", &token);
+    assert_eq!(again.code, Some(0));
+    assert_eq!(again.stdout.trim(), cert);
+
+    // A wrong bearer never serves anything.
+    let run = run_in_with_stdin(
+        dir.path(),
+        &["workers", "pickup", &home],
+        b"",
+        &"f".repeat(64),
+    );
+    assert_ne!(run.code, Some(0), "unknown token must refuse");
+    assert!(run.stderr.contains("unknown publish token"));
+
+    // ── THE PROOF: the real `ssh-keygen -L` reads the certificate back ──
+    let cert_path = dir.path().join("host-cert.pub");
+    std::fs::write(&cert_path, format!("{cert}\n")).unwrap();
+    let out = Command::new("ssh-keygen")
+        .args(["-L", "-f", cert_path.to_str().unwrap()])
+        .output()
+        .expect("real ssh-keygen -L");
+    assert!(out.status.success(), "ssh-keygen -L failed on our cert");
+    let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        listing.contains("ssh-ed25519-cert-v01") && listing.contains("host certificate"),
+        "it IS a host certificate: {listing}"
+    );
+    assert!(
+        listing.contains(&format!("Key ID: \"{IDENTITY}\"")),
+        "Key ID binds the machine identity: {listing}"
+    );
+    for principal in [IDENTITY, "i-0itest", "hetzner", "hel1", "hel1-dc2"] {
+        assert!(
+            listing.contains(principal),
+            "principal '{principal}' bound: {listing}"
+        );
+    }
+    assert!(
+        !listing.contains("host-alias-77"),
+        "addresses are not identity — hostname must not be a principal: {listing}"
+    );
+    assert!(
+        listing.contains("Valid: from") && !listing.contains("forever"),
+        "short-lived window, not forever: {listing}"
+    );
+    assert!(
+        listing.contains(&format!("Signing CA: ED25519 {ca_fingerprint}")),
+        "the ceremony CA signed it: {listing}"
+    );
+}
+
+#[test]
+fn pickup_before_issue_refuses_then_serves_after_issue() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = format!("--home={}", dir.path().display());
+    let run = run_in(dir.path(), &["ca", "keygen", &home, "--json"]);
+    assert_eq!(run.code, Some(0), "ca keygen: {}", run.stderr);
+
+    let guest_pub = real_guest_pub_line(dir.path());
+    let token = enroll_and_publish_via_binary(dir.path(), IDENTITY, &guest_pub);
+
+    // Not yet signed → the retryable refusal (nonzero; the guest retries).
+    let run = run_in_with_stdin(dir.path(), &["workers", "pickup", &home], b"", &token);
+    assert_ne!(run.code, Some(0), "pre-issuance pickup must refuse");
+    assert!(
+        run.stderr.contains("no issued certificate yet"),
+        "names the gap: {}",
+        run.stderr
+    );
+
+    let run = run_in(dir.path(), &["workers", "issue", &home, "--json"]);
+    assert_eq!(run.code, Some(0), "issue: {}", run.stderr);
+
+    let run = run_in_with_stdin(dir.path(), &["workers", "pickup", &home], b"", &token);
+    assert_eq!(run.code, Some(0), "post-issuance pickup: {}", run.stderr);
+    assert!(run.stdout.contains("ssh-ed25519-cert-v01"));
+}
+
+#[test]
+fn issue_refusals_name_the_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = format!("--home={}", dir.path().display());
+    let guest_pub = real_guest_pub_line(dir.path());
+    let token = enroll_and_publish_via_binary(dir.path(), IDENTITY, &guest_pub);
+    let _ = token;
+
+    // (a) No CA — the refusal names the ceremony verb.
+    let run = run_in(dir.path(), &["workers", "issue", &home]);
+    assert_ne!(run.code, Some(0), "issue without a CA must refuse");
+    assert!(run.stderr.contains("no host CA"), "{}", run.stderr);
+    assert!(run.stderr.contains("ca keygen"), "{}", run.stderr);
+
+    // (b) Unknown identity.
+    let run = run_in(dir.path(), &["ca", "keygen", &home]);
+    assert_eq!(run.code, Some(0), "ca keygen: {}", run.stderr);
+    let run = run_in(
+        dir.path(),
+        &[
+            "workers",
+            "issue",
+            &home,
+            "--identity",
+            "shuttle-worker-nope",
+        ],
+    );
+    assert_ne!(run.code, Some(0));
+    assert!(
+        run.stderr
+            .contains("no pending identity named 'shuttle-worker-nope'"),
+        "{}",
+        run.stderr
+    );
+
+    // (c) Already issued → named refusal unless --force.
+    let run = run_in(dir.path(), &["workers", "issue", &home, "--json"]);
+    assert_eq!(run.code, Some(0), "first issue: {}", run.stderr);
+    let run = run_in(
+        dir.path(),
+        &["workers", "issue", &home, "--identity", IDENTITY],
+    );
+    assert_ne!(run.code, Some(0));
+    assert!(run.stderr.contains("already issued"), "{}", run.stderr);
+    assert!(run.stderr.contains("--force"), "{}", run.stderr);
+    let run = run_in(
+        dir.path(),
+        &[
+            "workers",
+            "issue",
+            &home,
+            "--identity",
+            IDENTITY,
+            "--force",
+            "--json",
+        ],
+    );
+    assert_eq!(run.code, Some(0), "forced re-issue: {}", run.stderr);
+
+    // (d) A forever window is refused — certificates must age out
+    // (ADR-0045 amendment).
+    let run = run_in(
+        dir.path(),
+        &[
+            "workers",
+            "issue",
+            &home,
+            "--identity",
+            IDENTITY,
+            "--force",
+            "--validity",
+            "forever",
+        ],
+    );
+    assert_ne!(run.code, Some(0));
+    assert!(
+        run.stderr.contains("short-lived"),
+        "names the posture: {}",
+        run.stderr
+    );
+}

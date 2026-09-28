@@ -896,11 +896,58 @@ pub enum WorkersCommand {
     /// JSON payload on stdin with the bearer token in
     /// `SHUTTLE_PUBLISH_TOKEN`, validates one-time-ness + key shape, and
     /// stores the pending identity under
-    /// `~/.config/shuttle/ca/pending/` for issuance (#295 sub-task 3).
+    /// `~/.config/shuttle/ca/pending/` for `shuttle workers issue`.
     /// The transport binding for any TLS-terminating front: extract the
     /// Authorization header, hand the body here — fail-closed on every
     /// bad token, replay, or malformed key.
     ReceivePublish,
+
+    /// Issue short-lived host certificates (ADR-0045 amendment, #295
+    /// sub-task 3): the host CA signs one certificate per pending
+    /// identity — principals bind the machine identity plus the provider
+    /// instance-identity content (Decision 3) — and the identity moves to
+    /// the issued record (`~/.config/shuttle/ca/issued/`), the audit
+    /// trail. The guest picks its certificate up with
+    /// `shuttle workers pickup`.
+    Issue {
+        /// CA ceremony home (default: $HOME).
+        #[arg(long)]
+        home: Option<String>,
+
+        /// Issue only this machine identity (default: every pending
+        /// identity).
+        #[arg(long)]
+        identity: Option<String>,
+
+        /// Certificate validity — short-lived and relative to now,
+        /// ssh-keygen form (e.g. +48h, +2d12h). Absolute dates and
+        /// forever windows are refused: certificates must age out.
+        #[arg(long, default_value = crate::provision::publish::HOST_CERT_VALIDITY_DEFAULT)]
+        validity: String,
+
+        /// Re-issue an identity that already has an issued record (the
+        /// previous certificate stays valid until its own expiry).
+        #[arg(long)]
+        force: bool,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Serve one issued certificate back to its guest (the pickup half
+    /// of the publish channel): authenticates with the machine's
+    /// one-time publish token (`SHUTTLE_PUBLISH_TOKEN` — the same bearer
+    /// that carried the publish) and prints the certificate to stdout.
+    /// The GET of the callback URL, symmetric with receive-publish's
+    /// POST. Idempotent reads; refuses (nonzero exit) while the identity
+    /// is not yet issued or the token is expired/unknown — the guest
+    /// retries, and the TTL sweep reclaims a guest that never picks up.
+    Pickup {
+        /// CA ceremony home (default: $HOME).
+        #[arg(long)]
+        home: Option<String>,
+    },
 }
 
 /// Subcommands for `shuttle deps`.
@@ -2985,6 +3032,80 @@ mod tests {
                 err.contains("not in 1..=50"),
                 "refusal names the range: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn test_workers_issue_and_pickup_parse() {
+        // Defaults: all pending identities, the 48h default validity, no
+        // force.
+        match Cli::try_parse_from(["shuttle", "workers", "issue"])
+            .unwrap()
+            .command
+        {
+            Command::Workers {
+                command:
+                    WorkersCommand::Issue {
+                        home,
+                        identity,
+                        validity,
+                        force,
+                        json,
+                    },
+            } => {
+                assert!(home.is_none());
+                assert!(identity.is_none());
+                assert_eq!(
+                    validity,
+                    crate::provision::publish::HOST_CERT_VALIDITY_DEFAULT
+                );
+                assert!(!force);
+                assert!(!json);
+            }
+            _ => panic!("expected Workers Issue"),
+        }
+        match Cli::try_parse_from([
+            "shuttle",
+            "workers",
+            "issue",
+            "--home",
+            "/tmp/ca-home",
+            "--identity",
+            "shuttle-worker-abc123-01",
+            "--validity",
+            "+2d12h",
+            "--force",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Workers {
+                command:
+                    WorkersCommand::Issue {
+                        home,
+                        identity,
+                        validity,
+                        force,
+                        json,
+                    },
+            } => {
+                assert_eq!(home.as_deref(), Some("/tmp/ca-home"));
+                assert_eq!(identity.as_deref(), Some("shuttle-worker-abc123-01"));
+                assert_eq!(validity, "+2d12h");
+                assert!(force);
+                assert!(json);
+            }
+            _ => panic!("expected Workers Issue with flags"),
+        }
+        match Cli::try_parse_from(["shuttle", "workers", "pickup", "--home", "/tmp/ca-home"])
+            .unwrap()
+            .command
+        {
+            Command::Workers {
+                command: WorkersCommand::Pickup { home },
+            } => assert_eq!(home.as_deref(), Some("/tmp/ca-home")),
+            _ => panic!("expected Workers Pickup"),
         }
     }
 }

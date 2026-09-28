@@ -237,6 +237,14 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
             Ok(())
         }
         WorkersCommand::ReceivePublish => receive_publish_main(),
+        WorkersCommand::Issue {
+            home,
+            identity,
+            validity,
+            force,
+            json,
+        } => issue_main(home, identity.as_deref(), &validity, force, json),
+        WorkersCommand::Pickup { home } => pickup_main(home),
     }
 }
 
@@ -318,9 +326,104 @@ fn receive_publish_main() -> miette::Result<()> {
         .map_err(|e| miette::miette!("receive-publish: cannot read the payload on stdin: {e}"))?;
     let identity = publish::receive_publish(Path::new(&home), &token, &payload, now_epoch_secs()?)?;
     crate::output::ok(format!(
-        "stored pending identity '{identity}' — awaiting certificate issuance \
-         (#295 sub-task 3); the flow stops here fail-closed until it lands"
+        "stored pending identity '{identity}' — run 'shuttle workers issue' to sign its \
+         host certificate"
     ));
+    Ok(())
+}
+
+/// The `issue` verb body: sign short-lived host certificates for pending
+/// identities (all of them by default, one with `--identity`). Issued
+/// identities leave the pending store into the issued record — the audit
+/// trail — and their guests pick the certificates up through
+/// [`pickup_main`].
+fn issue_main(
+    home: Option<String>,
+    identity: Option<&str>,
+    validity: &str,
+    force: bool,
+    json: bool,
+) -> miette::Result<()> {
+    crate::output::set_mode(json);
+    let home = home
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())));
+    let report = publish::issue_identities(
+        &crate::command::RealRunner,
+        &home,
+        identity,
+        validity,
+        force,
+        now_epoch_secs()?,
+    )?;
+    for issued in &report.issued {
+        crate::output::ok(format!(
+            "issued host certificate for '{id}' — principals [{principals}], validity \
+             {validity}, CA {fingerprint}",
+            id = issued.machine_identity,
+            principals = issued.principals.join(","),
+            validity = issued.validity,
+            fingerprint = issued.ca_fingerprint
+        ));
+        crate::output::info(
+            "the guest picks it up: GET the publish URL with its one-time token \
+             (shuttle workers pickup)"
+                .to_string(),
+        );
+    }
+    for skipped in &report.skipped {
+        crate::output::warn(format!(
+            "skipped '{skipped}' — already issued (--force to re-issue; pickup serves the \
+             certificate)"
+        ));
+    }
+    if crate::output::is_json() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "issued": report.issued.iter().map(|i| serde_json::json!({
+                    "machine_identity": i.machine_identity,
+                    "principals": i.principals,
+                    "validity": i.validity,
+                    "cert": i.cert,
+                    "ca_fingerprint": i.ca_fingerprint,
+                    "issued_at_epoch": i.issued_at_epoch,
+                    "record": publish::issued_dir(&home).join(format!("issued-{}.json", i.machine_identity)).display().to_string(),
+                })).collect::<Vec<_>>(),
+                "skipped": report.skipped,
+            }))
+            .map_err(|e| miette::miette!("issue: cannot serialize the report: {e}"))?
+        );
+    }
+    Ok(())
+}
+
+/// The `pickup` verb body: the GET half of the publish callback URL.
+/// Bearer in `SHUTTLE_PUBLISH_TOKEN` (the same one-time token the guest
+/// published under); the certificate goes to STDOUT — pure certificate
+/// text, the artifact the guest installs — status lines to stderr. A
+/// refusal is a nonzero exit, which the guest's bounded-retry loop
+/// reads as "not yet / not ever".
+fn pickup_main(home: Option<String>) -> miette::Result<()> {
+    let token = std::env::var("SHUTTLE_PUBLISH_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            miette::miette!(
+                "pickup: no bearer token — set SHUTTLE_PUBLISH_TOKEN (the front that \
+                 terminates the guest's GET extracts it from the Authorization header)"
+            )
+        })?;
+    let home = home
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())));
+    let issued = publish::pickup_certificate(&home, &token, now_epoch_secs()?)?;
+    crate::output::ok(format!(
+        "serving the host certificate for '{}'",
+        issued.machine_identity
+    ));
+    println!("{}", issued.cert);
     Ok(())
 }
 
