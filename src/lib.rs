@@ -34,6 +34,7 @@ pub mod pkg_manifest;
 pub mod pkg_source;
 pub mod plugins;
 pub mod pod;
+pub mod provision;
 pub mod pull_peer;
 pub mod pull_ref;
 pub mod runtime;

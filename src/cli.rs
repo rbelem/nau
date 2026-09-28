@@ -713,6 +713,71 @@ pub enum Command {
         /// Path to the job manifest file.
         job_file: String,
     },
+
+    /// Manage build-farm workers (ADR-0040): provision cloud workers
+    /// (mint + inject + pin the host key per ADR-0045) or destroy them.
+    Workers {
+        #[command(subcommand)]
+        command: WorkersCommand,
+    },
+}
+
+/// Subcommands for `shuttle workers`.
+#[derive(clap::Subcommand)]
+pub enum WorkersCommand {
+    /// Provision cloud workers: mints the worker host keypair
+    /// coordinator-side, injects the private half through cloud-init
+    /// user-data (the provider's authenticated channel), and pins the
+    /// public half into a machine-managed `workers` entry in shuttle.lua
+    /// BEFORE first use — never ssh-keyscan (ADR-0045).
+    Provision {
+        /// Provider driver (currently: hetzner).
+        #[arg(long)]
+        provider: String,
+
+        /// Server SKU — operator-supplied, never hardcoded (Hetzner
+        /// repriced the lineup 2026-06-15; classes CX23/CX33/CAX11/CAX21).
+        #[arg(long = "type", value_name = "SKU")]
+        server_type: String,
+
+        /// Provider location (e.g. hel1, fsn1).
+        #[arg(long)]
+        location: String,
+
+        /// How many servers to create.
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+
+        /// Worker lifetime before the TTL sweep reclaims it (e.g. 4h,
+        /// 30m). Stamped into /etc/shuttle/worker-ttl and the
+        /// `shuttle-worker` hcloud label (epoch-seconds expiry).
+        #[arg(long, default_value = "4h")]
+        ttl: String,
+
+        /// Print the plan (type, location, count, TTL, user-data hash) and
+        /// exit — resolved fully, no API call, no token needed.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Config file the workers entries are pinned into.
+        #[arg(short, long, default_value = "shuttle.lua")]
+        file: String,
+    },
+
+    /// Destroy one provisioned worker: removes the server and evicts its
+    /// managed `workers` entry (operator-owned text is never rewritten).
+    Destroy {
+        /// Provider driver (currently: hetzner).
+        #[arg(long)]
+        provider: String,
+
+        /// Server name, as printed by provision.
+        name: String,
+
+        /// Config file the workers entry is evicted from.
+        #[arg(short, long, default_value = "shuttle.lua")]
+        file: String,
+    },
 }
 
 /// Subcommands for `shuttle deps`.
