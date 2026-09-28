@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nau — the ship you live on</title>
+  <meta name="description" content="Nau is the immutable, verity-protected A/B distribution shuttle assembles. First mission: Cassini, 1.0. Install is a flash of a mission image; updates ride the ground track.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'">
+  <link rel="icon" type="image/svg+xml" href="/assets/patch.svg">
+  <link rel="stylesheet" href="/css/fonts.css">
+  <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="masthead">
+    <a class="brand" href="/">
+      <img src="/assets/patch.svg" alt="" width="26" height="26">
+      NAU
+    </a>
+    <nav aria-label="Primary">
+      <ul>
+        <li><a href="#ship">Ship</a></li>
+        <li><a href="#missions">Missions</a></li>
+        <li><a href="#pronounce">Pronounce</a></li>
+        <li><a href="#docs">Docs</a></li>
+        <li><a href="/download.html">Download</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main id="main">
+
+    <!-- ======================= HERO ======================= -->
+    <section class="hero" id="ship" aria-labelledby="hero-title">
+      <div class="wrap">
+        <p class="telemetry">
+          <span>Callsign <b>Nau-1</b></span>
+          <span>Class <b>ship</b> · immutable A/B</span>
+          <span>First mission <b>Cassini</b></span>
+          <span>Status <b>preparing for publication</b></span>
+          <span class="ok">Target x86_64 UEFI</span>
+        </p>
+
+        <h1 class="wordmark" id="hero-title">N<span class="accent">A</span>U</h1>
+
+        <div class="hero-sub">
+          <div>
+            <p class="tag">The ship you <em>live on</em>.</p>
+            <p class="blurb">Nau is the immutable, verity-protected A/B distribution that
+              <a href="https://github.com/rbelem/shuttle">shuttle</a> assembles from declared
+              packages. Install is a flash of a mission image; updates ride the ground track
+              from the download lane; rollback is simply the other slot.</p>
+          </div>
+          <div class="hero-cta">
+            <a class="btn" href="/download.html">Open the payload bay</a>
+            <a class="btn ghost" href="https://github.com/rbelem/shuttle/blob/main/docs/adr/0044-nau-install-path.md">Flight rules — ADR-0044</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= MISSION ROSTER ======================= -->
+    <section id="missions" aria-labelledby="missions-title">
+      <div class="wrap">
+        <p class="sec-label"><span class="idx">01</span> Mission roster</p>
+        <h2 id="missions-title">The manifest</h2>
+        <p class="sec-lede">Releases are missions, and a mission is the whole ship: one
+          version, one target matrix, one signed manifest. Cassini is first on the pad.
+          The rest of the queue is plotted, not scheduled.</p>
+
+        <ul class="manifest">
+          <li class="active">
+            <span class="patch" aria-hidden="true">C1</span>
+            <span class="m-name">Cassini<small>Mission 1.0</small></span>
+            <span class="m-status">Preparing for publication</span>
+            <span class="m-arch">x86_64 UEFI</span>
+            <a class="m-link" href="/download.html">Payload bay →</a>
+          </li>
+          <li><span class="patch" aria-hidden="true">B2</span><span class="m-name">Buran<small>Mission 1.1</small></span><span class="m-status">Planned</span><span class="m-arch">—</span></li>
+          <li><span class="patch" aria-hidden="true">V3</span><span class="m-name">Venera<small>Mission 1.2</small></span><span class="m-status">Planned</span><span class="m-arch">—</span></li>
+          <li><span class="patch" aria-hidden="true">T4</span><span class="m-name">Telstar<small>Mission 1.3</small></span><span class="m-status">Planned</span><span class="m-arch">—</span></li>
+          <li><span class="patch" aria-hidden="true">L5</span><span class="m-name">Leonov<small>Mission 1.4</small></span><span class="m-status">Planned</span><span class="m-arch">—</span></li>
+          <li><span class="patch" aria-hidden="true">S6</span><span class="m-name">Skylab<small>Mission 1.5</small></span><span class="m-status">Planned</span><span class="m-arch">—</span></li>
+          <li class="deferred">
+            <span class="patch" aria-hidden="true">π</span>
+            <span class="m-name">aarch64 · Raspberry Pi<small>Deferred target, every mission</small></span>
+            <span class="m-status">Deferred</span>
+            <span class="m-arch">aarch64</span>
+          </li>
+        </ul>
+
+        <p class="roster-note">The pool builds <code>x86_64</code> only for now, so the
+          Raspberry Pi target is deferred across the whole roster — but the
+          <code>piboot</code> backend ships regardless and waits for the target matrix to
+          widen (ADR-0044).</p>
+      </div>
+    </section>
+
+    <!-- ======================= COMMS CHECK ======================= -->
+    <section id="pronounce" aria-labelledby="pronounce-title">
+      <div class="wrap">
+        <p class="sec-label"><span class="idx">02</span> Comms check</p>
+        <h2 id="pronounce-title">How to say Nau</h2>
+        <p class="sec-lede">One syllable, every major language. If the name crosses your
+          radio, this is the approved reading — the full matrix ships with the brand
+          (ADR-0013).</p>
+
+        <table class="comms">
+          <caption>Comms check — pronunciation matrix</caption>
+          <thead>
+            <tr><th scope="col">Language</th><th scope="col">Transcription</th><th scope="col">Reading</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">PT</th><td class="ipa">/naw/</td><td>“now”</td></tr>
+            <tr><th scope="row">EN</th><td class="ipa">/naw/</td><td>“now”</td></tr>
+            <tr><th scope="row">DE</th><td class="ipa">/naʊ̯/</td><td>“now”</td></tr>
+            <tr><th scope="row">ES</th><td class="ipa">/naw/</td><td>“now”</td></tr>
+            <tr><th scope="row">IT</th><td class="ipa">/naw/</td><td>“now”</td></tr>
+            <tr><th scope="row">FR</th><td class="ipa">/no/</td><td>like “no” — an accepted quirk of the brand, on the record</td></tr>
+            <tr><th scope="row">JP</th><td class="ipa">ナウ</td><td>“na-u”</td></tr>
+            <tr><th scope="row">CN</th><td class="ipa">nao</td><td>“now”</td></tr>
+          </tbody>
+        </table>
+
+        <aside class="etymology">
+          <p>The name is the ancestral ship word: Greek <span class="word">ναῦς</span>,
+            Latin <span class="word">navis</span> — the same root that lives inside
+            <em>astronaut</em>, a star-sailor. The distro is the ship; its releases are
+            missions.</p>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ======================= GROUND TRACK ======================= -->
+    <section id="docs" aria-labelledby="docs-title">
+      <div class="wrap">
+        <p class="sec-label"><span class="idx">03</span> Ground track</p>
+        <h2 id="docs-title">Docs &amp; lanes</h2>
+        <p class="sec-lede">Everything below is a static tree served read-only — no
+          accounts, no API, no state. Three lanes under
+          <code>nau.rclb.dev</code>, one assembler repo.</p>
+
+        <ul class="lanes">
+          <li>
+            <a href="https://github.com/rbelem/shuttle">
+              <span class="lane-id">Repo</span>
+              <span class="lane-name">rbelem/shuttle</span>
+              <span class="lane-desc">The assembler. shuttle builds Nau from Lua
+                declarations — a programmable replacement for Snapcraft's YAML.
+                GPL-3.0-only, Linux-only.</span>
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/rbelem/shuttle/blob/main/docs/adr/0013-project-rename-shuttle.md">
+              <span class="lane-id">ADR-0013</span>
+              <span class="lane-name">Brand rules</span>
+              <span class="lane-desc">The rename record: why Nau, how missions are
+                named, and the per-language pronunciation matrix this page mirrors.</span>
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/rbelem/shuttle/blob/main/docs/adr/0044-nau-install-path.md">
+              <span class="lane-id">ADR-0044</span>
+              <span class="lane-name">Flight rules</span>
+              <span class="lane-desc">The install path: mission images, the dd flash,
+                and verify-image. Install copies bytes; it never signs or
+                re-lays-out.</span>
+            </a>
+          </li>
+          <li>
+            <a href="https://download.nau.rclb.dev/missions/cassini/">
+              <span class="lane-id">Lane · download</span>
+              <span class="lane-name">download.nau.rclb.dev</span>
+              <span class="lane-desc">Mission images, SHA256SUMS, and the signed image
+                manifest. Install and update share one tree, one domain, one
+                certificate.</span>
+            </a>
+          </li>
+          <li>
+            <a href="https://cache.nau.rclb.dev/">
+              <span class="lane-id">Lane · cache</span>
+              <span class="lane-name">cache.nau.rclb.dev</span>
+              <span class="lane-desc">The public package mirror of the released pool —
+                what <code>shuttle pull</code> and Nau pods consume, with a freshness
+                stamp per publish.</span>
+            </a>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="colophon">
+    <div class="wrap">
+      <span>Nau — assembled by shuttle · content per ADR-0013</span>
+      <nav aria-label="Footer">
+        <ul>
+          <li><a href="/">Landing</a></li>
+          <li><a href="/download.html">Download</a></li>
+          <li><a href="https://github.com/rbelem/shuttle">rbelem/shuttle</a></li>
+          <li><a href="https://cache.nau.rclb.dev/">cache lane</a></li>
+        </ul>
+      </nav>
+    </div>
+  </footer>
+
+</body>
+</html>

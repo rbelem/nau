@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240">
+  <!-- Nau www — film-grain tile. Static fractal noise, tiled by CSS at low
+       opacity; an external file (not a data URI) so a strict CSP
+       (img-src 'self') covers the page without exceptions. -->
+  <filter id="grain">
+    <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="3" stitchTiles="stitch"/>
+    <feColorMatrix type="saturate" values="0"/>
+  </filter>
+  <rect width="240" height="240" filter="url(#grain)"/>
+</svg>

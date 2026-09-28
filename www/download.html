@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Download Nau — mission Cassini · the payload bay</title>
+  <meta name="description" content="Mission Cassini 1.0 payloads: the x86_64 mission image, SHA256SUMS, and the current.json pointer, with the verification walkthrough from pointer to proven write.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'">
+  <link rel="icon" type="image/svg+xml" href="/assets/patch.svg">
+  <link rel="stylesheet" href="/css/fonts.css">
+  <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="masthead">
+    <a class="brand" href="/">
+      <img src="/assets/patch.svg" alt="" width="26" height="26">
+      NAU
+    </a>
+    <nav aria-label="Primary">
+      <ul>
+        <li><a href="/">Landing</a></li>
+        <li><a href="#images">Payload</a></li>
+        <li><a href="#verify">Verify</a></li>
+        <li><a href="#layout">Layout contract</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main id="main">
+
+    <!-- ======================= PAYLOAD ======================= -->
+    <section id="images" aria-labelledby="images-title">
+      <div class="wrap">
+        <p class="sec-label"><span class="idx">01</span> Payload bay</p>
+        <h1 id="images-title">Mission Cassini — payloads</h1>
+        <p class="sec-lede">Everything below lives on the download lane,
+          <code>download.nau.rclb.dev/missions/cassini/</code>. One whole-disk mission
+          image per target; the checksum manifest and the mission pointer beside it.</p>
+
+        <div class="payload-grid">
+          <article class="payload-card">
+            <h2 class="card-title">Mission image — x86_64</h2>
+            <p class="artifact">missions/cassini/images/nau-cassini-1.0-x86_64.img</p>
+            <p>Whole-disk GPT artifact: ESP with a UKI, two verity-protected root slots,
+              hash partitions, and the state partition that grows on first boot.
+              Install is a copy of these bytes — nothing re-lays-out partitions
+              at flash time.</p>
+            <a class="btn" href="https://download.nau.rclb.dev/missions/cassini/images/nau-cassini-1.0-x86_64.img">Download image</a>
+          </article>
+
+          <article class="payload-card">
+            <h2 class="card-title">Checksum manifest</h2>
+            <p class="artifact">missions/cassini/SHA256SUMS</p>
+            <p>One line per artifact in the tree. Feed it to
+              <code>sha256sum --check</code> after the pull — a checksum proves the
+              bytes arrived intact, nothing more.</p>
+            <a class="btn" href="https://download.nau.rclb.dev/missions/cassini/SHA256SUMS">Download SHA256SUMS</a>
+          </article>
+
+          <article class="payload-card">
+            <h2 class="card-title">Mission pointer</h2>
+            <p class="artifact">missions/cassini/current.json</p>
+            <p>The only moving part. The release flow rewrites it at publish so version
+              and directory reshuffles never require a re-image — installed machines
+              follow it for sysupdate A/B transfers. Read it first.</p>
+            <a class="btn" href="https://download.nau.rclb.dev/missions/cassini/current.json">Read current.json</a>
+          </article>
+
+          <article class="payload-card disabled">
+            <h2 class="card-title">Mission image — aarch64</h2>
+            <p class="artifact">nau-cassini-1.0-aarch64.img</p>
+            <p>Deferred: the pool builds x86_64 only for now (ADR-0044, amended). The
+              piboot backend ships regardless and lights up when the target matrix
+              widens.</p>
+            <span class="soon">Deferred — no artifact yet</span>
+          </article>
+        </div>
+
+        <aside class="honesty">
+          <p>Flight rules say it plainly: these URLs answer <strong>404 until the release
+            flow lands</strong>. Cassini is preparing for publication. The layout is
+            fixed, so every link on this page is correct by construction — nothing here
+            rots the day the first mission publishes.</p>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ======================= VERIFY ======================= -->
+    <section id="verify" aria-labelledby="verify-title">
+      <div class="wrap">
+        <p class="sec-label"><span class="idx">02</span> Verification walkthrough</p>
+        <h1 id="verify-title">From pointer to proven write</h1>
+        <p class="sec-lede">Six flight steps, in order. Trust is established at download,
+          not on the device — a flashed machine cannot verify its own medium.</p>
+
+        <ol class="steps">
+          <li>
+            <h2>Read the mission pointer</h2>
+
+            <p><code>current.json</code> is the ground truth for what Cassini is today.
+              Installed machines read the same file, so your install and their updates
+              always agree.</p>
+            <pre tabindex="0"><code>curl -fsS https://download.nau.rclb.dev/missions/cassini/current.json</code></pre>
+          </li>
+
+          <li>
+            <h2>Pull the image and its checksums</h2>
+
+            <p>Caddy serves the tree with native Range support, so a broken transfer
+              resumes — re-run the same pull with <code>-C -</code> and it continues
+              where it stopped.</p>
+            <pre tabindex="0"><code>curl -fLO https://download.nau.rclb.dev/missions/cassini/images/nau-cassini-1.0-x86_64.img
+curl -fLO https://download.nau.rclb.dev/missions/cassini/SHA256SUMS
+
+sha256sum --check --ignore-missing SHA256SUMS
+<span class="cmt"># nau-cassini-1.0-x86_64.img: OK</span></code></pre>
+          </li>
+
+          <li>
+            <h2>Verify the signed image manifest</h2>
+
+            <p>Fetch the manifest entry the tree advertises for the image and verify its
+              signature against the release key. The checksum proves the bytes arrived
+              <em>intact</em>; the manifest signature proves they were <em>released</em>.
+              Confirm the key fingerprint out of band. Custody is one trusted machine
+              under the update-signing key ceremony (ADR-0024).</p>
+            <p class="rule-note"><b>Flight rule:</b> a failed signature means
+              <b>do not flash</b>. Stop the countdown and keep the payload on the
+              ground.</p>
+          </li>
+
+          <li>
+            <h2>Flash by-id, never by raw sdX</h2>
+
+            <p>The kernel letter can change between boots; the by-id name carries the
+              model and serial. Confirm what the name resolves to before anything
+              touches the disk — a destructive step is documented, never silent.</p>
+            <pre tabindex="0"><code>ls -l /dev/disk/by-id/   <span class="cmt"># confirm model + serial</span>
+
+sudo dd if=nau-cassini-1.0-x86_64.img \
+        of=/dev/disk/by-id/&lt;model&gt;_&lt;serial&gt; \
+        bs=4M status=progress conv=fsync</code></pre>
+          </li>
+
+          <li>
+            <h2>Prove the write</h2>
+
+            <p><code>verify-image</code> is read-only and unprivileged. It refuses a
+              mounted, undersized, or foreign-signature target without an explicit
+              override — which is exactly the argument for running it.</p>
+            <pre tabindex="0"><code>shuttle verify-image --device /dev/disk/by-id/&lt;model&gt;_&lt;serial&gt;</code></pre>
+          </li>
+
+          <li>
+            <h2>Boot and ride the ground track</h2>
+
+            <p>Pull the medium, boot the ship. Slot A runs Cassini; the
+              <code>update_source</code> baked into the image points at this same tree,
+              so sysupdate A/B transfers arrive over the lane you flashed from. When a
+              mission update lands, you switch slots — and rollback is the other slot,
+              still there.</p>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- ======================= LAYOUT CONTRACT ======================= -->
+    <section id="layout" aria-labelledby="layout-title">
+      <div class="wrap">
+        <p class="sec-label"><span class="idx">03</span> Layout contract</p>
+        <h1 id="layout-title">The tree every link assumes</h1>
+        <p class="sec-lede">The download lane is append-only for released missions: a
+          published image is an artifact, never a cache entry. This shape is the whole
+          contract — filenames included.</p>
+
+        <pre class="tree" tabindex="0"><code><span class="dir">missions/cassini/</span>
+├── <span class="dir">current.json</span>            <span class="note">mission pointer — the only moving part</span>
+├── <span class="dir">SHA256SUMS</span>              <span class="note">checksum manifest, one line per artifact</span>
+├── <span class="dir">images/</span>
+│   └── nau-cassini-1.0-x86_64.img   <span class="note">whole-disk mission image</span>
+├── <span class="dir">manifest/</span>               <span class="note">signed image manifest (ADR-0044 D5)</span>
+└── <span class="dir">updates/</span>                <span class="note">sysupdate transfer artifacts</span></code></pre>
+
+        <ul class="contract-list">
+          <li><b>current.json</b> — updated by the publish wrapper at each release. The
+            <code>update_source</code> URL baked into every image points at the
+            directory, so the pointer can move without a re-image.</li>
+          <li><b>images/nau-cassini-1.0-x86_64.img</b> — the only image filename that
+            exists for Cassini 1.0. Names follow
+            <code>nau-&lt;mission&gt;-&lt;version&gt;-&lt;arch&gt;.img</code>; nothing
+            else appears in <code>images/</code>.</li>
+          <li><b>SHA256SUMS</b> — lives beside the pointer at the mission root, checked
+            with <code>--ignore-missing</code> so extra local files don't disturb the
+            pass.</li>
+          <li><b>manifest/ and updates/</b> — the signature proof of step 3 and the
+            transfer payloads installed machines pull. Both are part of the same
+            mission tree, same certificate, same lane.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="colophon">
+    <div class="wrap">
+      <span>Nau — assembled by shuttle · content per ADR-0013</span>
+      <nav aria-label="Footer">
+        <ul>
+          <li><a href="/">Landing</a></li>
+          <li><a href="/download.html">Download</a></li>
+          <li><a href="https://github.com/rbelem/shuttle">rbelem/shuttle</a></li>
+          <li><a href="https://cache.nau.rclb.dev/">cache lane</a></li>
+        </ul>
+      </nav>
+    </div>
+  </footer>
+
+</body>
+</html>
