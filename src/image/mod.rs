@@ -1056,6 +1056,14 @@ pub(crate) fn build_disk_image_with(
         // split there is nothing to activate.
         emit_runtime_activate_unit(&root)?;
     }
+    // ADR-0044 D2, #264: first-boot growth of the state partition for
+    // flashed images. Emitted beside the split artifacts (same
+    // write-before-hash constraint): a repart definition marking the
+    // state partition growable plus the oneshot that grows the partition
+    // before the fstab mount. Resolves to a no-op + named note on images
+    // without a growable native state partition — plain and UC images
+    // stay byte-comparable.
+    emit_state_growth(&root, disk_layout)?;
 
     // 6. ADR-0011 step (c) pre-flight — kernel images need ukify, the
     // sd-stub, and veritysetup; fail closed BEFORE any destructive step
@@ -1224,6 +1232,13 @@ pub(crate) fn build_disk_image_with(
     // ADR-0011 step (d): A/B layouts additionally get GPT partition type
     // GUIDs + PARTLABELs so systemd-sysupdate can match the slots.
     apply_gpt_slot_metadata(runner, &img_path, image, &effective_layout, &slots)?;
+    // ADR-0044 D2, #264: the table-side half of the first-boot growth
+    // mark — the state partition carries the shuttle-private growable
+    // type GUID the emitted repart definition matches (the definition's
+    // `Type=` shares the constant, so the two cannot drift).
+    if let Some(growth) = repart_growth_target(&effective_layout) {
+        apply_state_growth_type(runner, &img_path, growth.partno);
+    }
     // #48: parted minted fresh random disk/partition GUIDs above; pin every
     // GPT identity to its deterministic derivation BEFORE anything reads it
     // back. The verity slots are re-pinned to roothash-derived generation
@@ -2681,6 +2696,7 @@ mod tests {
         let split = StateSplit {
             partlabel: "state".into(),
             var_submount_partlabel: String::new(),
+            growfs: false,
         };
         let fstab = fstab_content(&[], Some(&split));
         // Persistent state partition → /var/lib, by PARTLABEL.
@@ -2705,6 +2721,7 @@ mod tests {
         let split = StateSplit {
             partlabel: "writable".into(),
             var_submount_partlabel: "docker".into(),
+            growfs: false,
         };
         let fstab = fstab_content(&[], Some(&split));
         assert!(
@@ -2735,6 +2752,7 @@ mod tests {
         let split = StateSplit {
             partlabel: "state".into(),
             var_submount_partlabel: String::new(),
+            growfs: false,
         };
         emit_mounts(root.path(), &[], Some(&split)).unwrap();
         assert!(root.path().join(FSTAB_PATH).is_file());
@@ -6496,6 +6514,8 @@ RequiredBy=boot-complete.target
                                     STATE_TMPFILES_PATH,
                                     VAR_TMPFILES_PATH,
                                     ACTIVATE_UNIT_PATH,
+                                    REPART_DEFINITION_PATH,
+                                    STATE_GROW_UNIT_PATH,
                                     SYSUPDATE_DIR,
                                     SYSUPDATE_SERVICE_PATH,
                                     SYSUPDATE_TIMER_PATH,
@@ -6998,12 +7018,33 @@ RequiredBy=boot-complete.target
                 STATE_TMPFILES_PATH,
                 VAR_TMPFILES_PATH,
                 ACTIVATE_UNIT_PATH,
+                REPART_DEFINITION_PATH,
+                STATE_GROW_UNIT_PATH,
             ] {
                 assert!(
                     split_paths.iter().any(|p| p == rel),
                     "state image emits {rel}: {split_paths:?}"
                 );
             }
+            // #264: the state fstab line carries the mount-time fs growth
+            // option, and the table carries the growable type GUID the
+            // emitted repart definition matches (state is partition 3 in
+            // this layout).
+            assert!(
+                fstabs.iter().any(|f| f
+                    .contains("PARTLABEL=state /var/lib auto defaults,nofail,x-systemd.growfs")),
+                "state mount line grows at mount time: {fstabs:?}"
+            );
+            assert!(
+                calls.iter().any(|c| {
+                    c.first().is_some_and(|p| p == "sfdisk")
+                        && c.iter().any(|a| a == "--part-type")
+                        && c.last().is_some_and(|a| a == STATE_TYPE_GUID)
+                        && c.iter().any(|a| a == "3")
+                }),
+                "the state partition's table entry carries the growable type GUID: \
+                 {calls:?}"
+            );
         }
 
         /// Restore HOME on drop (even on panic): the tempdir a HOME-mutating
@@ -7371,6 +7412,22 @@ RequiredBy=boot-complete.target
                     "plain image must emit no state artifact {rel}: {split_paths:?}"
                 );
             }
+            // #264: no first-boot growth artifacts either — no repart
+            // definition, no growth unit, no growable type GUID stamped
+            // into the table, no growfs option.
+            for rel in [REPART_DEFINITION_PATH, STATE_GROW_UNIT_PATH] {
+                assert!(
+                    !split_paths.iter().any(|p| p == rel),
+                    "plain image must emit no growth artifact {rel}: {split_paths:?}"
+                );
+            }
+            assert!(
+                !runner
+                    .calls()
+                    .iter()
+                    .any(|c| c.last().is_some_and(|a| a == STATE_TYPE_GUID)),
+                "no growable type GUID stamped on a state-less image"
+            );
             let fstabs = runner.fstabs();
             assert_eq!(fstabs.len(), 1, "the declared-mount fstab is emitted");
             assert!(

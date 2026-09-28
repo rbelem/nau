@@ -289,6 +289,7 @@ mod tests {
         let split = StateSplit {
             partlabel: "state".into(),
             var_submount_partlabel: String::new(),
+            growfs: false,
         };
         let fstab = fstab_content(&mounts, Some(&split));
         let expected = "\
@@ -374,6 +375,7 @@ tmpfs /var tmpfs mode=0755,nosuid,nodev
         let split = StateSplit {
             partlabel: "state".into(),
             var_submount_partlabel: "docker".into(),
+            growfs: false,
         };
         emit_mounts(rootdir.path(), &mounts, Some(&split)).unwrap();
         // Shadowed by the tmpfs: not a build-time mkdir, but a tmpfiles line.
