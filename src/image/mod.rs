@@ -1294,6 +1294,11 @@ pub(crate) fn build_disk_image_with(
     // dm-verity formats the file (the data device must be final before
     // hashing; a cmdline is immutable once the UKI is later signed), then
     // the UKI embeds the captured roothash in its cmdline.
+    // #274: the sysupdate transfer payloads the release carves are named
+    // here, where the root/verity extents and the staged UKI exist, and
+    // persisted only by `--release` (below) — the build itself stays
+    // byte-stable.
+    let mut release_payloads: Option<Vec<release::ReleasePayload>> = None;
     let (uki, uki_stage, populated_roots, pi_boot_stage) = if verity {
         // 9a. Rootfs-level manifest only: boot facts (cmdline, roothash) are
         // unknowable until after verity format, and a post-format write
@@ -1411,8 +1416,9 @@ pub(crate) fn build_disk_image_with(
              {hash_guid} (derived from the roothash, #80)"
         );
         // The UKI boots slot A: its hash PARTUUID is the roothash-derived
-        // GUID pinned above.
-        let hash_partuuid = Some(hash_guid);
+        // GUID pinned above. (Cloned: #274's payload naming below borrows
+        // the same GUID after this.)
+        let hash_partuuid = Some(hash_guid.clone());
         let verity_args = VerityBootArgs {
             roothash,
             hash_partuuid,
@@ -1428,6 +1434,22 @@ pub(crate) fn build_disk_image_with(
             scratch.path(),
             Some(&verity_args),
         )?;
+        // #274: on the SAME one-predicate gate as the transfer emission
+        // (step 5c — no transfers, no payloads), name the update payloads
+        // the transfers fetch: the root/verity extents and the staged UKI
+        // under their @u-PARTUUID names. release::publish carves them;
+        // nothing is written during the build itself.
+        if emits_sysupdate(image, disk_layout) {
+            release_payloads = Some(release::update_payloads(
+                &image.name,
+                &image.version,
+                &root_file,
+                &hash_file,
+                &data_guid,
+                &hash_guid,
+                &stage,
+            ));
+        }
         (uki, stage, slots.skip_indices(), None)
     } else if is_pi {
         // #87: the piboot pipeline — plain ext4 root populated fail-closed
@@ -1531,9 +1553,16 @@ pub(crate) fn build_disk_image_with(
     );
 
     // 12-bis. #266: release mode publishes the media set beside the image —
-    // the SIGNED manifest (the #265 verify-image contract) + SHA256SUMS.
+    // the SIGNED manifest (the #265 verify-image contract) + SHA256SUMS —
+    // plus, for sysupdate images, the carved transfer payloads (#274).
     if let Some(rel) = release {
-        release::publish(&output_path, &manifest, arch, rel)?;
+        release::publish(
+            &output_path,
+            &manifest,
+            arch,
+            rel,
+            release_payloads.as_deref().unwrap_or_default(),
+        )?;
     }
 
     // 13. Update lockfile
