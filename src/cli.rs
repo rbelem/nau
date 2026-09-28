@@ -800,7 +800,7 @@ pub enum WorkersCommand {
     /// public half into a machine-managed `workers` entry in shuttle.lua
     /// BEFORE first use — never ssh-keyscan (ADR-0045).
     Provision {
-        /// Provider driver (currently: hetzner, aws, gcp, azure).
+        /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
         #[arg(long)]
         provider: String,
 
@@ -858,7 +858,7 @@ pub enum WorkersCommand {
     /// Destroy one provisioned worker: removes the server and evicts its
     /// managed `workers` entry (operator-owned text is never rewritten).
     Destroy {
-        /// Provider driver (currently: hetzner, aws, gcp, azure).
+        /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
         #[arg(long)]
         provider: String,
 

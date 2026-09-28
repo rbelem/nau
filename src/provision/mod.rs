@@ -26,6 +26,7 @@ pub mod aws;
 pub mod azure;
 pub mod gcp;
 pub mod hetzner;
+pub mod scaleway;
 
 use std::path::{Path, PathBuf};
 
@@ -147,6 +148,40 @@ fn azure_credentials_source() -> Option<String> {
     None
 }
 
+/// Where the scw CLI would resolve credentials from, without calling the
+/// API: the `SCW_ACCESS_KEY` + `SCW_SECRET_KEY` pair (the dedicated
+/// worker-project key, the #271 analog), else the `scw init` config file
+/// (`SCW_CONFIG_PATH` when set, else `~/.config/scw/config.yaml` — a
+/// `SCW_CONFIGURATION` profile is a section inside that file, so the file
+/// probe covers it). Read at the CLI boundary so the provider core stays
+/// env-free under test; the scw CLI inherits the credential from its
+/// environment/config store — it never enters argv.
+fn scaleway_credentials_source() -> Option<String> {
+    let env_nonempty = |k: &str| std::env::var(k).ok().is_some_and(|v| !v.trim().is_empty());
+    if env_nonempty("SCW_ACCESS_KEY") && env_nonempty("SCW_SECRET_KEY") {
+        return Some("SCW_ACCESS_KEY + SCW_SECRET_KEY".into());
+    }
+    if let Some(p) = std::env::var("SCW_CONFIG_PATH")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+    {
+        if Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    if Path::new(&home)
+        .join(".config")
+        .join("scw")
+        .join("config.yaml")
+        .exists()
+    {
+        return Some("~/.config/scw/config.yaml".into());
+    }
+    None
+}
+
 /// CLI entry for `shuttle workers provision` / `shuttle workers destroy`.
 pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
     match command {
@@ -239,8 +274,14 @@ fn provider_for(provider: &str) -> miette::Result<Box<dyn Provisioner>> {
             default_binary_url(),
             resolve_operator_key()?,
         ))),
+        "scaleway" => Ok(Box::new(scaleway::ScalewayProvisioner::new(
+            crate::command::RealRunner,
+            scaleway_credentials_source(),
+            default_binary_url(),
+            resolve_operator_key()?,
+        ))),
         other => Err(miette::miette!(
-            "workers: unknown provider '{other}' (supported: hetzner, aws, gcp, azure)"
+            "workers: unknown provider '{other}' (supported: hetzner, aws, gcp, azure, scaleway)"
         )),
     }
 }
