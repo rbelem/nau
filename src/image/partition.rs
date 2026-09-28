@@ -406,9 +406,8 @@ pub(crate) fn create_swap_partition(
 
 /// One partition's authoritative geometry + GPT PARTUUID, read back from
 /// the finished partition table. `start_bytes`/`size_bytes` are derived
-/// from sfdisk's 512-byte-sector `start`/`size` fields (scaled by the
-/// table's reported sector-size when present); the vec index equals the
-/// parted partition number - 1.
+/// from sfdisk's `start`/`size` fields (scaled by the table's reported
+/// `sectorsize`); the vec index equals the parted partition number - 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PartitionExtent {
     pub(crate) start_bytes: u64,
@@ -419,7 +418,10 @@ pub(crate) struct PartitionExtent {
 /// Parse `sfdisk -J` JSON into partition extents. Fail closed: a missing
 /// partitiontable, a missing/invalid start or size, or unparseable JSON is
 /// an error — a guessed offset would splice a filesystem over the wrong
-/// partition.
+/// partition. The sector size's JSON key is sfdisk's `sectorsize` (no
+/// hyphen); refusing when it is absent or non-numeric is what keeps a
+/// 4K-sector device's extents from being spliced at 512-byte offsets
+/// (#294, same discipline as [`super::verify`]'s `parse_gpt`).
 pub(crate) fn parse_partition_extents(json: &str) -> miette::Result<Vec<PartitionExtent>> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
         miette::miette!(
@@ -433,9 +435,15 @@ pub(crate) fn parse_partition_extents(json: &str) -> miette::Result<Vec<Partitio
         )
     })?;
     let sector_size = table
-        .get("sector-size")
+        .get("sectorsize")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(512);
+        .ok_or_else(|| {
+            miette::miette!(
+                "sfdisk -J output carries no valid 'sectorsize' — refusing to guess \
+                 the geometry (a guessed sector size would splice partitions at the \
+                 wrong byte offsets)"
+            )
+        })?;
     let partitions = table
         .get("partitions")
         .and_then(serde_json::Value::as_array)
@@ -1769,7 +1777,7 @@ mod tests {
             })
             .collect();
         format!(
-            r#"{{"partitiontable": {{"label": "gpt", "sector-size": 512, "partitions": [{}]}}}}"#,
+            r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [{}]}}}}"#,
             parts.join(",")
         )
     }
@@ -1788,6 +1796,49 @@ mod tests {
             extents[0].partuuid.as_deref(),
             Some("aabbccdd-0011-2233-4455-667788990011"),
             "read-back PARTUUIDs normalize to udev's lowercase"
+        );
+    }
+
+    /// Empirically captured 4K-native shape (util-linux 2.42.3: `sfdisk -J
+    /// --sector-size 4096` on a regular file): the JSON key is `sectorsize`,
+    /// no hyphen, and LBAs scale (firstlba 256 = 1 MiB / 4096). The old
+    /// `sector-size` lookup never matched a real table, so this path used
+    /// to silently compute 512-byte extents (#294).
+    #[test]
+    fn read_partition_extents_scales_by_real_4k_sectorsize_key() {
+        let runner = SfdiskReader {
+            code: 0,
+            stdout: concat!(
+                r#"{"partitiontable": {"label": "gpt", "sectorsize": 4096, "#,
+                r#""partitions": [{"uuid": "AABBCCDD-0011-2233-4455-667788990011", "#,
+                r#""start": 256, "size": 1792}]}}"#
+            )
+            .to_string(),
+        };
+        let extents = read_partition_extents(&runner, Path::new("disk.img"), 1).unwrap();
+        assert_eq!(extents[0].start_bytes, 256 * 4096, "1 MiB in 4K sectors");
+        assert_eq!(extents[0].size_bytes, 1792 * 4096);
+    }
+
+    /// A table missing `sectorsize` — including one carrying the fictional
+    /// hyphenated `sector-size` key sfdisk never emits — refuses instead of
+    /// defaulting to 512-byte geometry (#294).
+    #[test]
+    fn read_partition_extents_fails_closed_without_sectorsize() {
+        let runner = SfdiskReader {
+            code: 0,
+            stdout: concat!(
+                r#"{"partitiontable": {"label": "gpt", "sector-size": 512, "#,
+                r#""partitions": [{"start": 2048, "size": 4096}]}}"#
+            )
+            .to_string(),
+        };
+        let err = read_partition_extents(&runner, Path::new("disk.img"), 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no valid 'sectorsize'") && err.contains("refusing"),
+            "{err}"
         );
     }
 

@@ -3135,7 +3135,7 @@ WantedBy=multi-user.target
         // cmdline — must emit lowercase hex so nothing can regress to the
         // 90 s uppercase device-unit stall.
         let extents = parse_partition_extents(
-            r#"{"partitiontable":{"partitions":[
+            r#"{"partitiontable":{"sectorsize":512,"partitions":[
                 {"start":8192,"size":61440,
                  "uuid":"B7046865-C340-18CD-817D-E4009F80214C"},
                 {"start":69632,"size":204800,
@@ -5824,7 +5824,7 @@ RequiredBy=boot-complete.target
       "partitiontable": {
         "label": "gpt",
         "id": "9F86D081-0000-0000-0000-000000000000",
-        "sector-size": 512,
+        "sectorsize": 512,
         "grain": 512,
         "partitions": [
          {
@@ -5874,20 +5874,35 @@ RequiredBy=boot-complete.target
 
     #[test]
     fn partition_extents_scale_by_reported_sector_size() {
-        let json = r#"{"partitiontable":{"sector-size":4096,"partitions":[
-            {"start":8,"size":16,"uuid":null}]}}"#;
+        // Empirically captured 4K-native shape (util-linux 2.42.3, `sfdisk
+        // -J --sector-size 4096` on a regular file): the JSON key is
+        // `sectorsize`, no hyphen, and LBAs scale (firstlba 256 = 1 MiB).
+        // The pre-#294 fixture carried the fictional `sector-size` key, so
+        // this 4K path silently computed 512-byte extents.
+        let json = r#"{"partitiontable":{"label":"gpt","firstlba":256,"lastlba":2042,"sectorsize":4096,"partitions":[
+            {"start":256,"size":1792,"uuid":null}]}}"#;
         let extents = parse_partition_extents(json).unwrap();
-        assert_eq!(extents[0].start_bytes, 8 * 4096);
-        assert_eq!(extents[0].size_bytes, 16 * 4096);
+        assert_eq!(extents[0].start_bytes, 256 * 4096);
+        assert_eq!(extents[0].size_bytes, 1792 * 4096);
     }
 
     #[test]
-    fn partition_extents_default_to_512b_sectors() {
-        // The validated minimal host shape: no sector-size key at all.
-        let json = r#"{"partitiontable":{"partitions":[{"start":8192,"size":61440,"uuid":"X"}]}}"#;
-        let extents = parse_partition_extents(json).unwrap();
-        assert_eq!(extents[0].start_bytes, 8192 * 512);
-        assert_eq!(extents[0].size_bytes, 61440 * 512);
+    fn partition_extents_fail_closed_without_sectorsize() {
+        // The old lookup read `sector-size` — a key sfdisk never emits —
+        // and defaulted the miss to 512, hiding 4K geometry (#294).
+        // Missing, non-numeric, and fictional-key tables all refuse now.
+        for bad in [
+            r#"{"partitiontable":{"partitions":[{"start":8192,"size":61440,"uuid":"X"}]}}"#,
+            r#"{"partitiontable":{"sectorsize":"512","partitions":[{"start":8192,"size":61440,"uuid":"X"}]}}"#,
+            r#"{"partitiontable":{"sectorsize":null,"partitions":[{"start":8192,"size":61440,"uuid":"X"}]}}"#,
+            r#"{"partitiontable":{"sector-size":512,"partitions":[{"start":8192,"size":61440,"uuid":"X"}]}}"#,
+        ] {
+            let err = parse_partition_extents(bad).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("no valid 'sectorsize'"),
+                "must refuse to guess the geometry: {err:#}"
+            );
+        }
     }
 
     #[test]
@@ -6431,7 +6446,7 @@ RequiredBy=boot-complete.target
                 })
                 .collect();
             serde_json::json!({
-                "partitiontable": { "sector-size": 512, "partitions": parts }
+                "partitiontable": { "sectorsize": 512, "partitions": parts }
             })
             .to_string()
             .into_bytes()
