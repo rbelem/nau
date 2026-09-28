@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use shuttle::command::{CommandRunner, RunnerOutput};
 use shuttle::provision::hetzner::HetznerProvisioner;
 use shuttle::provision::{
-    append_worker_entry, iso8601_utc, parse_ttl, render_user_data, ProvisionRequest, Provisioner,
-    UserDataParams, BLOCK_BEGIN, BLOCK_END,
+    append_worker_entry, now_epoch_secs, parse_ttl, render_user_data, ProvisionRequest,
+    Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END,
 };
 
 /// A shape-valid ed25519 keypair — throwaway fixture bytes, no crypto.
@@ -23,6 +23,10 @@ const TEST_HOST_PRIV: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZ
 const OPERATOR_KEY: &str = "ssh-ed25519 AAAAoperatorkey operator@example";
 const BINARY_URL: &str = "https://example.invalid/shuttle-amd64";
 
+/// A fixed marker expiry for template-shape assertions (decimal epoch
+/// seconds — the #269 sweep's `is_epoch` shape).
+const MARKER_EPOCH: u64 = 1_788_000_000;
+
 // ── The scripted provider CLI ──
 
 #[derive(Clone, Default)]
@@ -30,6 +34,10 @@ struct Script {
     create_fails: bool,
     describe_fails: bool,
     delete_fails: bool,
+    /// Fail deletes once this many have already succeeded (default:
+    /// effectively never) — scripts a MIXED teardown: some servers
+    /// deleted, some stuck billing.
+    delete_fails_after: usize,
     /// Volumes the fake reports attached to any server (the #269 v2
     /// pre-delete check's input).
     attached_volumes: usize,
@@ -40,6 +48,13 @@ struct Script {
 #[derive(Clone)]
 struct FakeProvider {
     calls: Arc<Mutex<Vec<Vec<String>>>>,
+    /// (path, unix mode, content) of every `--user-datafile` the fake
+    /// served, captured at call time — the real blob dies with the mint
+    /// tempdir.
+    user_data_files: Arc<Mutex<Vec<(PathBuf, u32, String)>>>,
+    /// Successful `server delete` count, shared across clones (drives
+    /// `delete_fails_after`).
+    deletes_done: Arc<Mutex<usize>>,
     script: Script,
 }
 
@@ -47,6 +62,8 @@ impl FakeProvider {
     fn new(script: Script) -> Self {
         FakeProvider {
             calls: Arc::new(Mutex::new(Vec::new())),
+            user_data_files: Arc::new(Mutex::new(Vec::new())),
+            deletes_done: Arc::new(Mutex::new(0)),
             script,
         }
     }
@@ -85,6 +102,18 @@ impl FakeProvider {
                 if self.script.create_fails {
                     return Ok(fail_out("hcloud: invalid credentials (fake)"));
                 }
+                use std::os::unix::fs::PermissionsExt;
+                if let Some(i) = argv.iter().position(|a| a == "--user-datafile") {
+                    let path = PathBuf::from(&argv[i + 1]);
+                    let mode = std::fs::metadata(&path)
+                        .map(|m| m.permissions().mode() & 0o777)
+                        .unwrap_or(0);
+                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+                    self.user_data_files
+                        .lock()
+                        .unwrap()
+                        .push((path, mode, content));
+                }
                 Ok(ok_out(""))
             }
             ["server", "describe", name, "-o", "json"] => {
@@ -94,9 +123,14 @@ impl FakeProvider {
                 Ok(ok_out(&describe_json(name)))
             }
             ["server", "delete", _name] => {
-                if self.script.delete_fails {
+                let mut done = self.deletes_done.lock().unwrap();
+                if self.script.delete_fails
+                    || (self.script.delete_fails_after > 0
+                        && *done >= self.script.delete_fails_after)
+                {
                     return Ok(fail_out("hcloud: delete failed (fake)"));
                 }
+                *done += 1;
                 Ok(ok_out(""))
             }
             ["volume", "list", "--server", _name, "-o", "json"] => {
@@ -243,7 +277,7 @@ fn dry_run_user_data_resolves_to_the_real_template() {
         host_public_key: TEST_HOST_PUB,
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
-        ttl_expiry_iso: &iso8601_utc(1_700_000_000 + 14_400),
+        ttl_expiry_epoch: 1_700_000_000 + 14_400,
     });
     assert!(user_data.starts_with("#cloud-config\n"));
     // Deterministic: same inputs, same blob, same hash — the plan lane
@@ -253,7 +287,7 @@ fn dry_run_user_data_resolves_to_the_real_template() {
         host_public_key: TEST_HOST_PUB,
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
-        ttl_expiry_iso: &iso8601_utc(1_700_000_000 + 14_400),
+        ttl_expiry_epoch: 1_700_000_000 + 14_400,
     });
     assert_eq!(user_data, again);
 }
@@ -265,7 +299,7 @@ fn user_data_carries_pinned_binary_operator_key_ttl_and_scrub() {
         host_public_key: TEST_HOST_PUB,
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
-        ttl_expiry_iso: "2026-09-27T23:16:00Z",
+        ttl_expiry_epoch: MARKER_EPOCH,
     });
     // ADR-0045 D1: the minted host keypair, 0600 private half, public .pub.
     assert!(user_data.contains("path: /etc/ssh/ssh_host_ed25519_key\n    permissions: \"0600\""));
@@ -277,9 +311,11 @@ fn user_data_carries_pinned_binary_operator_key_ttl_and_scrub() {
     // Operator login key — separate from the host key.
     assert!(user_data.contains("path: /root/.ssh/authorized_keys"));
     assert!(user_data.contains(OPERATOR_KEY));
-    // The TTL marker (the #269 sweep contract), one ISO-8601 UTC line.
+    // The TTL marker (the #269 sweep contract): one DECIMAL EPOCH-SECONDS
+    // line — the sweep's is_epoch parses decimal only, so ISO-8601 here
+    // would leave its marker fallback dead code.
     assert!(user_data.contains("path: /etc/shuttle/worker-ttl"));
-    assert!(user_data.contains("2026-09-27T23:16:00Z"));
+    assert!(user_data.contains(&format!("content: |\n      {MARKER_EPOCH}\n")));
     // Pinned shuttle binary install + sshd hardening + user-data scrub.
     assert!(user_data.contains(BINARY_URL));
     assert!(user_data.contains("PasswordAuthentication no"));
@@ -352,14 +388,23 @@ fn provision_creates_describes_pins_and_labels() {
         assert!(f.contains("--location\u{1f}hel1"));
         assert!(f.contains("--image\u{1f}ubuntu-24.04"));
         let udf = argv.iter().position(|a| a == "--user-datafile").unwrap();
-        let user_data = std::fs::read_to_string(&argv[udf + 1]).unwrap();
+        assert!(!argv[udf + 1].is_empty(), "a user-data file is passed");
+        assert!(!f.contains("tok-1"), "token never enters argv: {f}");
+    }
+
+    // The staged blobs (captured at create time — they die with the mint
+    // tempdir after provision): the private half rides user-data, the
+    // operator key authorizes login.
+    let staged = fake.user_data_files.lock().unwrap();
+    assert_eq!(staged.len(), 2, "one staged blob per create");
+    for (_, _, user_data) in staged.iter() {
         assert!(
             user_data.contains("-----BEGIN OPENSSH PRIVATE KEY-----"),
             "private half rides user-data"
         );
         assert!(user_data.contains(OPERATOR_KEY));
-        assert!(!f.contains("tok-1"), "token never enters argv: {f}");
     }
+    drop(staged);
 
     // Config: the managed block holds exactly the two entries; the file
     // still evaluates.
@@ -541,9 +586,10 @@ fn destroy_removes_the_server_and_evicts_the_managed_entry() {
     let name = workers[0].name.clone();
     let address = workers[0].address.clone();
 
-    provisioner(&fake, Some("tok"))
+    let evicted = provisioner(&fake, Some("tok"))
         .destroy(&name, &config)
         .unwrap();
+    assert!(evicted, "a managed entry was evicted");
 
     let text = std::fs::read_to_string(&config).unwrap();
     assert!(
@@ -661,4 +707,270 @@ fn destroy_keeps_the_pin_when_the_server_delete_fails() {
         "a failed delete leaves the pin: the server is still live"
     );
     let _ = address;
+}
+
+#[test]
+fn destroy_of_a_server_without_a_managed_pin_reports_not_evicted() {
+    // Eviction honesty (#272 addendum): a deleted server whose address no
+    // managed entry pins must read as NOT evicted — `Ok(false)` — so the
+    // verb never claims an eviction that did not happen.
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let fake = FakeProvider::new(Script::default());
+    let evicted = provisioner(&fake, Some("tok"))
+        .destroy("shuttle-worker-fake-01", &config)
+        .unwrap();
+    assert!(!evicted, "no managed entry → nothing evicted");
+}
+
+// ── M1: user-data staging hygiene ──
+
+#[test]
+fn user_data_is_staged_inside_the_mint_tempdir_at_0600() {
+    // The blob carries the minted private host half: it must live in the
+    // mint tempdir (so it dies with the keypair) at mode 0600 — never at
+    // a fixed world-readable OS-temp path that outlives the run.
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let fake = FakeProvider::new(Script::default());
+    provisioner(&fake, Some("tok"))
+        .provision(&request(&config, false))
+        .unwrap();
+
+    let staged = fake.user_data_files.lock().unwrap();
+    assert_eq!(staged.len(), 1, "one create, one staged blob: {staged:?}");
+    let (path, mode, _) = staged[0].clone();
+    drop(staged);
+    assert_eq!(
+        path.file_name().unwrap(),
+        "user-data.yaml",
+        "staged inside the mint tempdir, not a content-addressed temp path"
+    );
+    assert_ne!(
+        path.parent().unwrap(),
+        std::env::temp_dir(),
+        "not directly in the OS temp dir"
+    );
+    assert_eq!(mode, 0o600, "the blob is 0600 while it exists");
+    assert!(
+        !path.exists(),
+        "the staged blob dies with the mint tempdir after provision"
+    );
+}
+
+// ── M2: teardown truthfulness ──
+
+#[test]
+fn teardown_delete_failure_names_the_residual_server() {
+    // A teardown delete that fails must NOT read as torn down: the error
+    // names the still-billing residual and both reclaim paths.
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let before = std::fs::read_to_string(&config).unwrap();
+    let fake = FakeProvider::new(Script {
+        describe_fails: true,
+        delete_fails: true,
+        ..Default::default()
+    });
+    let err = provisioner(&fake, Some("tok"))
+        .provision(&request(&config, false))
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("tore down 0 created server(s)"), "{text}");
+    assert!(text.contains("FAILED to delete shuttle-worker-"), "{text}");
+    assert!(text.contains("it is still billing"), "{text}");
+    assert!(text.contains("'shuttle workers destroy'"), "{text}");
+    assert!(text.contains("TTL sweep reclaim it"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        before,
+        "config untouched"
+    );
+}
+
+#[test]
+fn teardown_reports_mixed_delete_results() {
+    // Two servers created, the pin step fails, and the SECOND teardown
+    // delete fails: the first is honestly counted torn down AND the stuck
+    // one is named with its reclaim path — neither half can vanish into a
+    // blanket success line.
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("absent").join("shuttle.lua");
+    let fake = FakeProvider::new(Script {
+        delete_fails_after: 1,
+        ..Default::default()
+    });
+    let mut req = request(&config, false);
+    req.count = 2;
+    let err = provisioner(&fake, Some("tok")).provision(&req).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("tore down 1 created server(s)"), "{text}");
+    assert!(text.contains("FAILED to delete shuttle-worker-"), "{text}");
+    assert!(text.contains("it is still billing"), "{text}");
+    assert!(text.contains("TTL sweep reclaim it"), "{text}");
+}
+
+// ── m2: config mode preservation ──
+
+#[test]
+fn config_mode_survives_a_managed_block_rewrite() {
+    // The atomic rewrite persists a 0600 tempfile — the operator's
+    // shuttle.lua mode must survive every provision/destroy rewrite.
+    use std::os::unix::fs::PermissionsExt;
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    for mode in [0o644, 0o600, 0o640] {
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).unwrap();
+        append_worker_entry(&config, "ssh://root@203.0.113.99", "ssh-ed25519 AAAAm c").unwrap();
+        let got = std::fs::metadata(&config).unwrap().permissions().mode() & 0o777;
+        assert_eq!(got, mode, "mode {mode:o} preserved across the rewrite");
+    }
+}
+
+// ── M6: the marker interop (writer here, reader = the sweep script) ──
+
+/// The single marker line `render_user_data` emits for `expiry`: the
+/// content line under the `/etc/shuttle/worker-ttl` write_files block.
+fn emitted_marker_line(user_data: &str) -> String {
+    user_data
+        .lines()
+        .skip_while(|line| !line.contains("path: /etc/shuttle/worker-ttl"))
+        .nth(3)
+        .and_then(|line| line.strip_prefix("      "))
+        .expect("the marker content line")
+        .to_string()
+}
+
+#[test]
+fn sweep_accepts_exactly_what_render_user_data_emits_as_the_marker() {
+    // The interop test whose absence let the ISO-8601 marker land: the
+    // sweep script is the marker's only reader and its `is_epoch` parses
+    // DECIMAL EPOCH SECONDS only. Run the REAL sweep (fake hcloud + fake
+    // ssh) against marker files holding exactly the bytes the template
+    // emits, and require the marker-copy rule (Rule 2) to decide BOTH
+    // directions — past due → destroy track, future → ALIVE.
+    let now = now_epoch_secs().unwrap();
+    let past_blob = render_user_data(&UserDataParams {
+        host_private_key: TEST_HOST_PRIV,
+        host_public_key: TEST_HOST_PUB,
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: now - 2 * 3600,
+    });
+    let future_blob = render_user_data(&UserDataParams {
+        host_private_key: TEST_HOST_PRIV,
+        host_public_key: TEST_HOST_PUB,
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: now + 24 * 3600,
+    });
+
+    // The emitted marker block is the decimal-epoch shape, byte for byte.
+    for blob in [&past_blob, &future_blob] {
+        let marker = emitted_marker_line(blob);
+        assert!(
+            !marker.is_empty() && marker.chars().all(|c| c.is_ascii_digit()),
+            "the marker line is decimal epoch seconds: '{marker}'"
+        );
+        let block = format!(
+            "  - path: /etc/shuttle/worker-ttl\n    permissions: \"0644\"\n    content: |\n      {marker}\n"
+        );
+        assert!(blob.contains(&block), "the marker block shape: {block}");
+    }
+
+    // Fake provider CLI: two servers with ABSENT ttl labels, so the sweep
+    // falls through Rule 1 to the marker copy (Rule 2) — the fallback the
+    // marker exists for.
+    let fx = tempfile::tempdir().unwrap();
+    let fx_path = fx.path();
+    let bin = fx_path.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        fx_path.join("servers.list"),
+        "w-marker-past\nw-marker-future\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fx_path.join("w-marker-past"),
+        format!("{} 10.9.1.1 \n", now - 2 * 3600),
+    )
+    .unwrap();
+    std::fs::write(
+        fx_path.join("w-marker-future"),
+        format!("{} 10.9.1.2 \n", now - 2 * 3600),
+    )
+    .unwrap();
+    // The in-guest marker file: exactly the emitted content line + newline
+    // (what cloud-init writes for a one-line `content: |` block).
+    std::fs::write(
+        fx_path.join("10.9.1.1.ttl"),
+        format!("{}\n", emitted_marker_line(&past_blob)),
+    )
+    .unwrap();
+    std::fs::write(
+        fx_path.join("10.9.1.2.ttl"),
+        format!("{}\n", emitted_marker_line(&future_blob)),
+    )
+    .unwrap();
+    let hcloud_fake = bin.join("hcloud");
+    std::fs::write(
+        &hcloud_fake,
+        "#!/bin/sh\ncase \"$1 $2\" in\n\
+         \"server list\") cat \"$HCLOUD_LIST\" ;;\n\
+         \"server describe\") cat \"$HCLOUD_DESCRIBE_DIR/$3\" ;;\n\
+         \"volume list\") exit 0 ;;\n\
+         \"server delete\") printf '%s\\n' \"$3\" >>\"$HCLOUD_DELETE_LOG\" ;;\n\
+         *) echo \"fake hcloud: unexpected invocation: $*\" >&2; exit 64 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    let ssh_fake = bin.join("ssh");
+    std::fs::write(
+        &ssh_fake,
+        "#!/bin/sh\nhost=\"\"\nfor a in \"$@\"; do\n\
+         case \"$a\" in *@*) host=${a#*@} ;; esac\ndone\n\
+         [ -n \"$host\" ] || exit 255\n\
+         exec cat \"$SSH_FIXTURE_DIR/$host.ttl\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hcloud_fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&ssh_fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Dry-run is the sweep's default: prove classification, touch nothing.
+    let sweep = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/shuttle-worker-ttl-sweep");
+    let out = std::process::Command::new("sh")
+        .arg(&sweep)
+        .env("SHUTTLE_SWEEP_HCLOUD", &hcloud_fake)
+        .env("SHUTTLE_SWEEP_SSH", &ssh_fake)
+        .env("SHUTTLE_SWEEP_SSH_OPTS", "-o BatchMode=yes")
+        .env("SSH_FIXTURE_DIR", fx_path)
+        .env("HCLOUD_LIST", fx_path.join("servers.list"))
+        .env("HCLOUD_DESCRIBE_DIR", fx_path)
+        .env("HCLOUD_DELETE_LOG", fx_path.join("deletes.log"))
+        .env_remove("SHUTTLE_SWEEP_ENFORCE")
+        .env_remove("SHUTTLE_SWEEP_ALERT_CMD")
+        .output()
+        .expect("run the sweep script");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "sweep exits clean when every value parses: {}\n{err}",
+        out.status
+    );
+    assert!(
+        err.contains("WOULD-DESTROY: w-marker-past (no TTL label; marker copy past due)"),
+        "the emitted marker, past due, must drive the destroy track:\n{err}"
+    );
+    assert!(
+        err.contains("ALIVE: w-marker-future (no TTL label; marker copy in the future)"),
+        "the emitted marker, in the future, must read ALIVE:\n{err}"
+    );
+    assert!(
+        !err.contains("LABEL-INVALID"),
+        "an epoch marker never reads as an invalid label:\n{err}"
+    );
 }

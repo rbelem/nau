@@ -722,6 +722,26 @@ pub enum Command {
     },
 }
 
+/// `--count` bounds for `shuttle workers provision` (M5): at least ONE
+/// server — a zero count would run nothing and exit 0 — and at most
+/// [`WORKERS_MAX_COUNT`] per run, the API fan-out cap; larger fleets
+/// should be split into runs.
+const WORKERS_MIN_COUNT: u32 = 1;
+const WORKERS_MAX_COUNT: u32 = 50;
+
+/// The `--count` value parser: decimal u32 within the named bounds.
+fn workers_count(raw: &str) -> Result<u32, String> {
+    let n: u32 = raw
+        .parse()
+        .map_err(|_| format!("invalid unsigned integer: '{raw}'"))?;
+    if !(WORKERS_MIN_COUNT..=WORKERS_MAX_COUNT).contains(&n) {
+        return Err(format!(
+            "{n} is not in {WORKERS_MIN_COUNT}..={WORKERS_MAX_COUNT}"
+        ));
+    }
+    Ok(n)
+}
+
 /// Subcommands for `shuttle workers`.
 #[derive(clap::Subcommand)]
 pub enum WorkersCommand {
@@ -744,8 +764,8 @@ pub enum WorkersCommand {
         #[arg(long)]
         location: String,
 
-        /// How many servers to create.
-        #[arg(long, default_value_t = 1)]
+        /// How many servers to create (1-50).
+        #[arg(long, default_value_t = WORKERS_MIN_COUNT, value_parser = workers_count)]
         count: u32,
 
         /// Worker lifetime before the TTL sweep reclaims it (e.g. 4h,
@@ -2699,6 +2719,52 @@ mod tests {
                 assert!(ack_unsigned);
             }
             _ => panic!("expected pod add"),
+        }
+    }
+
+    #[test]
+    fn workers_count_is_bounded_one_to_fifty() {
+        // M5: count 0 would run nothing and exit 0; the range parser
+        // refuses it (and anything past the 50 fan-out cap) at the CLI
+        // boundary.
+        let base = [
+            "shuttle",
+            "workers",
+            "provision",
+            "--provider",
+            "hetzner",
+            "--type",
+            "CX33",
+            "--location",
+            "hel1",
+        ];
+        match Cli::try_parse_from(base).unwrap().command {
+            Command::Workers {
+                command: WorkersCommand::Provision { count, .. },
+            } => assert_eq!(count, 1, "default count is one"),
+            _ => panic!("expected Workers Provision"),
+        }
+        for good in ["1", "50"] {
+            let mut args: Vec<&str> = base.to_vec();
+            args.extend(["--count", good]);
+            match Cli::try_parse_from(args).unwrap().command {
+                Command::Workers {
+                    command: WorkersCommand::Provision { count, .. },
+                } => assert_eq!(count, good.parse::<u32>().unwrap()),
+                _ => panic!("expected Workers Provision"),
+            }
+        }
+        for bad in ["0", "51"] {
+            let mut args: Vec<&str> = base.to_vec();
+            args.extend(["--count", bad]);
+            let err = match Cli::try_parse_from(args) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("count {bad} must be refused"),
+            };
+            assert!(
+                err.contains("not in 1..=50"),
+                "refusal names the range: {err}"
+            );
         }
     }
 }

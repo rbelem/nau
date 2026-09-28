@@ -93,12 +93,20 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
             file,
         } => {
             let provisioner = provider_for(&provider)?;
-            provisioner.destroy(&name, Path::new(&file))?;
-            crate::output::ok(format!(
-                "destroyed worker '{name}' and evicted its config entry"
-            ));
+            let evicted = provisioner.destroy(&name, Path::new(&file))?;
+            crate::output::ok(destroy_summary(&name, evicted));
             Ok(())
         }
+    }
+}
+
+/// The destroy summary line. An absent managed entry is reported honestly:
+/// the server is gone, but nothing was evicted from the config.
+fn destroy_summary(name: &str, evicted: bool) -> String {
+    if evicted {
+        format!("destroyed worker '{name}' and evicted its config entry")
+    } else {
+        format!("destroyed worker '{name}' — not managed by shuttle — nothing evicted")
     }
 }
 
@@ -173,8 +181,8 @@ pub struct ProvisionRequest {
     /// Worker lifetime in seconds — `--ttl`. Two stamps (the #269 v2
     /// contract): the `shuttle-worker-ttl` hcloud label (epoch-seconds
     /// expiry — the SOURCE OF TRUTH the sweep reads) and the in-guest
-    /// `/etc/shuttle/worker-ttl` marker (one ISO-8601 UTC line, a
-    /// fallback COPY only).
+    /// `/etc/shuttle/worker-ttl` marker (one decimal EPOCH-SECONDS line —
+    /// the sweep's `is_epoch` parses decimal only — a fallback COPY).
     pub ttl_secs: u64,
     /// Dry run: resolve everything, render the user-data, print the plan —
     /// and exit before ANY provider API call (including the token check).
@@ -215,8 +223,11 @@ pub trait Provisioner {
     /// untouched.
     fn provision(&self, req: &ProvisionRequest) -> miette::Result<Vec<ProvisionedWorker>>;
 
-    /// Destroy one server by name and evict its config entry.
-    fn destroy(&self, name: &str, config: &Path) -> miette::Result<()>;
+    /// Destroy one server by name and evict its config entry. `Ok(true)`
+    /// when a managed entry was evicted; `Ok(false)` when no managed
+    /// entry carried the server's address (the caller decides the
+    /// wording).
+    fn destroy(&self, name: &str, config: &Path) -> miette::Result<bool>;
 }
 
 // ── Mint (ADR-0045 Decision 1) ──
@@ -289,8 +300,10 @@ pub fn parse_ttl(raw: &str) -> miette::Result<u64> {
     Ok(secs)
 }
 
-/// Format epoch seconds as one ISO-8601 UTC line — the exact shape the
-/// `/etc/shuttle/worker-ttl` marker carries and the #269 sweep parses.
+/// Format epoch seconds as one ISO-8601 UTC line — HUMAN DISPLAY ONLY
+/// (the dry-run plan). Every on-the-wire TTL stamp (the hcloud label AND
+/// the `/etc/shuttle/worker-ttl` marker) is decimal epoch seconds; the
+/// sweep's `is_epoch` parses decimal only.
 pub fn iso8601_utc(epoch_secs: u64) -> String {
     let days = (epoch_secs / 86400) as i64;
     let rem = epoch_secs % 86400;
@@ -346,8 +359,11 @@ pub struct UserDataParams<'a> {
     pub operator_key: &'a str,
     /// The pinned shuttle binary URL cloud-init installs.
     pub binary_url: &'a str,
-    /// TTL expiry, one ISO-8601 UTC line (`/etc/shuttle/worker-ttl`).
-    pub ttl_expiry_iso: &'a str,
+    /// TTL expiry as DECIMAL EPOCH SECONDS — the exact shape the #269
+    /// sweep's `is_epoch` accepts for the `/etc/shuttle/worker-ttl`
+    /// marker (one line). ISO-8601 here would leave the sweep's
+    /// marker fallback rule dead code.
+    pub ttl_expiry_epoch: u64,
 }
 
 /// Render the shared cloud-init user-data (ADR-0045 D1): the minted host
@@ -378,7 +394,12 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
         p.host_public_key,
     );
     write_file(&mut s, "/root/.ssh/authorized_keys", "0600", p.operator_key);
-    write_file(&mut s, "/etc/shuttle/worker-ttl", "0644", p.ttl_expiry_iso);
+    write_file(
+        &mut s,
+        "/etc/shuttle/worker-ttl",
+        "0644",
+        &p.ttl_expiry_epoch.to_string(),
+    );
     s.push_str("runcmd:\n");
     s.push_str(&format!(
         "  - curl -fsSL {url} -o /usr/local/bin/shuttle\n",
@@ -476,7 +497,9 @@ fn read_config(config: &Path) -> miette::Result<String> {
 }
 
 /// Atomically replace `config` (tempfile + rename, the known_hosts-pin
-/// pattern) so a crashed provision never leaves a torn config.
+/// pattern) so a crashed provision never leaves a torn config. The
+/// operator's file mode survives: a NamedTempFile is 0600, and persisting
+/// it as-is would silently tighten every rewritten shuttle.lua.
 fn write_config(config: &Path, content: &str) -> miette::Result<()> {
     let dir = config.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
@@ -485,6 +508,18 @@ fn write_config(config: &Path, content: &str) -> miette::Result<()> {
     tmp.write_all(content.as_bytes())
         .and_then(|_| tmp.flush())
         .map_err(|e| miette::miette!("provision: cannot write {}: {e}", config.display()))?;
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(config) {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(meta.permissions().mode()))
+            .map_err(|e| {
+                miette::miette!(
+                    "provision: cannot preserve the mode of {}: {e}",
+                    config.display()
+                )
+            })?;
+    }
     tmp.persist(config).map_err(|e| {
         miette::miette!(
             "provision: cannot install {}: {}",
@@ -849,12 +884,23 @@ mod tests {
     }
 
     #[test]
-    fn iso8601_utc_formats_the_sweep_contract_shape() {
+    fn iso8601_utc_formats_the_human_display_shape() {
         assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601_utc(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(iso8601_utc(86_400), "1970-01-02T00:00:00Z");
         // Leap-year day (2024-02-29).
         assert_eq!(iso8601_utc(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn destroy_summary_reports_an_absent_entry_honestly() {
+        assert_eq!(
+            destroy_summary("shuttle-worker-x-01", true),
+            "destroyed worker 'shuttle-worker-x-01' and evicted its config entry"
+        );
+        let absent = destroy_summary("shuttle-worker-x-01", false);
+        assert!(absent.contains("not managed by shuttle"), "{absent}");
+        assert!(absent.contains("nothing evicted"), "{absent}");
     }
 
     #[test]
