@@ -384,6 +384,7 @@ fn cap_happy() -> CapabilityDoc {
         mksquashfs: true,
         kvm: false,
         sandbox: true,
+        mksquashfs_version: Some(shuttle::provision::SQUASHFS_TOOLS_VERSION.into()),
     }
 }
 
@@ -649,6 +650,40 @@ fn preflight_refusals_name_the_probe() {
             .expect_err("must refuse");
         let text = format!("{err:#}");
         assert!(text.starts_with(probe), "probe '{probe}' not named: {text}");
+    }
+}
+
+#[test]
+fn preflight_refuses_an_mksquashfs_off_the_fleet_pin() {
+    // The #273 pinned-mksquashfs admission: an off-pin version AND an
+    // unreadable one both refuse, by name, with the pin in the message —
+    // fail-closed, never a silent pass.
+    for cap_version in [Some("4.6.1".to_string()), None] {
+        let cache = tempfile::tempdir().unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        let mut fake = LoopbackWorker::new(machine.path());
+        let reported = cap_version.clone().unwrap_or_else(|| "<unreadable>".into());
+        fake.set_cap(move |c| c.mksquashfs_version = cap_version.clone());
+        let ex = executor(fake, cache.path());
+        let err = ex
+            .preflight(PreflightChecks {
+                arch: None,
+                min_free_disk: 0,
+            })
+            .expect_err("off-pin or unreadable mksquashfs refuses");
+        let text = format!("{err:#}");
+        assert!(
+            text.starts_with("preflight mksquashfs version"),
+            "probe not named: {text}"
+        );
+        assert!(
+            text.contains(&reported),
+            "names what the worker reported: {text}"
+        );
+        assert!(
+            text.contains(shuttle::provision::SQUASHFS_TOOLS_VERSION),
+            "names the fleet pin: {text}"
+        );
     }
 }
 

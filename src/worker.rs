@@ -202,12 +202,32 @@ pub struct CapabilityDoc {
     pub kvm: bool,
     /// Functioning sandbox: the minimal unshared bwrap probe succeeded.
     pub sandbox: bool,
+    /// The upstream version the RESOLVED mksquashfs reports (a
+    /// `discover_version` exec), when readable — the pinned-mksquashfs
+    /// half of the admission contract (#273): the fleet runs ONE pinned
+    /// mksquashfs, and preflight refuses a worker whose version is
+    /// unreadable (`None`) or off the pin
+    /// ([`crate::provision::SQUASHFS_TOOLS_VERSION`]). `default` so an
+    /// older worker's document still parses — into an admission refusal,
+    /// never a silent pass.
+    #[serde(default)]
+    pub mksquashfs_version: Option<String>,
 }
 
 /// Build the capability document for THIS machine — the test seam; the
 /// verb serializes whatever this returns.
 pub fn capability_document() -> CapabilityDoc {
     let bwrap = tool_present(crate::tools::ToolName::Bwrap);
+    let mksquashfs = crate::tools::resolve(crate::tools::ToolName::Mksquashfs).ok();
+    // One extra exec on a one-shot verb, so admission can pin the exact
+    // mksquashfs (ADR-0041: mksquashfs behavior is artifact identity).
+    let mksquashfs_version = mksquashfs.as_ref().and_then(|resolved| {
+        let path = match resolved {
+            crate::tools::ResolvedTool::Provisioned { path, .. }
+            | crate::tools::ResolvedTool::Path { path, .. } => path,
+        };
+        crate::tools::discover_version(path)
+    });
     CapabilityDoc {
         protocol: WORKER_PROTOCOL_VERSION,
         arch: crate::snap::host_arch().to_string(),
@@ -217,9 +237,10 @@ pub fn capability_document() -> CapabilityDoc {
         ram_bytes: total_ram_bytes(),
         free_disk_bytes: free_disk_bytes(&std::env::temp_dir()),
         bwrap,
-        mksquashfs: tool_present(crate::tools::ToolName::Mksquashfs),
+        mksquashfs: mksquashfs.is_some(),
         kvm: crate::boot_test::kvm_available(),
         sandbox: bwrap && sandbox_probe_succeeds(),
+        mksquashfs_version,
     }
 }
 

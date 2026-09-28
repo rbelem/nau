@@ -40,6 +40,7 @@ use miette::WrapErr;
 
 use crate::command::{exit_code, CommandRunner};
 use crate::lua::WorkerConfig;
+use crate::provision::SQUASHFS_TOOLS_VERSION;
 use crate::worker::{CapabilityDoc, JobManifest, JobResult, WORKER_PROTOCOL_VERSION};
 
 /// The SSH channel itself died: ssh/scp could not be spawned, or exited
@@ -441,7 +442,8 @@ impl<R: CommandRunner> SshExecutor<R> {
     /// Probe → assert (ADR-0040 D8: every failure names its probe).
     /// Runs `__worker-cap` and refuses, by name, on reachability, an
     /// unparseable cap document, protocol version, arch, bwrap, the
-    /// functioning-sandbox probe, mksquashfs, or free disk.
+    /// functioning-sandbox probe, mksquashfs, the mksquashfs fleet pin,
+    /// or free disk.
     pub fn preflight(&self, checks: PreflightChecks<'_>) -> miette::Result<CapabilityDoc> {
         // The pin refusal lands before any channel activity.
         self.ensure_known_hosts()?;
@@ -489,6 +491,23 @@ impl<R: CommandRunner> SshExecutor<R> {
                 "preflight mksquashfs: worker '{}' reports mksquashfs absent",
                 self.worker.address
             ));
+        }
+        // The pinned-mksquashfs half of admission (#273): ADR-0041's zstd
+        // defaults make mksquashfs behavior part of artifact identity, so
+        // the fleet runs ONE pinned version — the same constant the
+        // worker template builds. Fail-closed: an unreadable or absent
+        // version report is a refusal, never a pass.
+        match cap.mksquashfs_version.as_deref() {
+            Some(v) if v == SQUASHFS_TOOLS_VERSION => {}
+            other => {
+                return Err(miette::miette!(
+                    "preflight mksquashfs version: worker '{}' reports '{}', the fleet pin is \
+                     {SQUASHFS_TOOLS_VERSION} — one pinned mksquashfs per fleet; reprovision \
+                     the worker from the current template",
+                    self.worker.address,
+                    other.unwrap_or("<unreadable>")
+                ));
+            }
         }
         if cap.free_disk_bytes < checks.min_free_disk {
             return Err(miette::miette!(
