@@ -86,6 +86,9 @@ _Avoid_: snap install, layering
 **Flash**: Installing Nau on bare metal by writing a mission image to a whole disk. Install copies bytes; it never lays out partitions, re-derives a roothash, or signs. Trust is established at download (SHA256SUMS + signed manifest), not on the device. (ADR-0044)
 _Avoid_: install (that is the package operation), burn, image write
 
+**Verify-image**: The read-only, unprivileged proof that a flashed target still matches its signed image manifest — `shuttle verify-image --device <by-id path>` reads the target's GPT and verity hash regions, recomputes them against the manifest, and refuses by name on any mismatch. The write itself stays documented `dd`; this verb has no write path. (ADR-0044)
+_Avoid_: installer, integrity check (that is the update-time half), disk doctor
+
 **Pod**: A named user-level package selection owned by one user; the small shuttle served by the system mothership. Each pod has its own packages, overlays, lockfile, and generation chain; rollback switches that pod only.
 _Avoid_: global, profile, environment
 

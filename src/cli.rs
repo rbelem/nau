@@ -694,6 +694,34 @@ pub enum Command {
         json: bool,
     },
 
+    /// Verify a flashed mission image against its signed manifest
+    /// (ADR-0044 D4). Read-only and unprivileged: reads the target's GPT
+    /// and dm-verity hash regions, recomputes them against the published
+    /// signed image manifest, and refuses by name on any mismatch. This
+    /// verb has no write path.
+    VerifyImage {
+        /// Flashed target to verify: a block device named by stable id
+        /// (/dev/disk/by-id/...) or a whole-disk image file. Only ever
+        /// opened for reading.
+        #[arg(long)]
+        device: String,
+
+        /// Signed image manifest (.manifest.json) published with the
+        /// mission image (ADR-0044 D5).
+        #[arg(long)]
+        manifest: String,
+
+        /// Extra trust anchor for the manifest signature: a public-key
+        /// file (same two-line format `shuttle key keygen` writes),
+        /// accepted beside the operator keychain (~/.config/shuttle/keys).
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Internal: evaluation worker process (hidden). Re-executed by the
     /// parent to evaluate untrusted definitions in a bounded subprocess
     /// (ADR-0010 Decisions 4+5). Not part of the public CLI.
