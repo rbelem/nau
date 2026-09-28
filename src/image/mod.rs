@@ -1719,6 +1719,17 @@ pub struct ImageManifest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uki: Option<String>,
 
+    /// SHA3-384 of the UKI `uki` names, as built and installed on the ESP
+    /// (issue #284). The ESP is the one flashed region dm-verity does NOT
+    /// cover, so the signed manifest pins its boot content directly —
+    /// `shuttle verify-image` recomputes this digest from the medium and
+    /// refuses a replaced or tampered UKI by name. A manifest signed by
+    /// a shuttle predating the field carries no digest: verify-image
+    /// refuses it (fail-closed — the repo's posture for trust inputs),
+    /// naming the coverage gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uki_sha3_384: Option<String>,
+
     /// GPT PARTUUID of the ESP, when resolvable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub esp_partuuid: Option<String>,
@@ -1784,6 +1795,7 @@ impl ImageManifest {
             kernel_version: boot.map(|b| b.kernel_version.clone()),
             cmdline: boot.map(|b| b.cmdline.clone()),
             uki: boot.map(|b| b.uki_filename.clone()),
+            uki_sha3_384: boot.map(|b| b.uki_sha3_384.clone()),
             esp_partuuid: boot.and_then(|b| b.esp_partuuid.clone()),
             roothash: boot.and_then(|b| b.roothash.clone()),
             signatures: Default::default(),
@@ -3448,6 +3460,7 @@ WantedBy=multi-user.target
             kernel_version: "6.8.0".into(),
             cmdline: format!("ro roothash={hash}"),
             uki_filename: "verity_1.0.efi".into(),
+            uki_sha3_384: "d".repeat(96),
             esp_partuuid: Some("esp".into()),
             roothash: Some(hash.clone()),
         };
