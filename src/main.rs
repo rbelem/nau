@@ -94,6 +94,7 @@ fn main() -> miette::Result<()> {
             cache_max_size,
             output_name,
             source_date_epoch,
+            release,
             lockfile: lockfile_path,
             json,
         } => {
@@ -107,6 +108,7 @@ fn main() -> miette::Result<()> {
                 cache_max_size,
                 output_name,
                 source_date_epoch,
+                release,
                 lockfile_path,
                 json,
             );
@@ -1939,6 +1941,77 @@ fn report_deps_human(
 // ── Image command ──
 
 #[allow(clippy::too_many_arguments)]
+/// Pin the build epoch when the flag carries one (the env form is
+/// already exported — the release gate requires one or the other).
+fn pin_epoch(source_date_epoch: Option<&str>) {
+    if let Some(epoch) = source_date_epoch {
+        std::env::set_var("SOURCE_DATE_EPOCH", epoch);
+    }
+}
+
+/// The #266 release gates (ADR-0044 D5/D8): the epoch must be pinned
+/// (release media must be byte-reproducible) and the media names carry an
+/// explicit architecture. `None` when this is a plain dev build.
+fn release_args(
+    release: &Option<String>,
+    arch: &str,
+    source_date_epoch: Option<&str>,
+) -> miette::Result<Option<shuttle::image::release::ReleaseArgs>> {
+    let Some(dir) = release else {
+        return Ok(None);
+    };
+    if source_date_epoch.is_none() && std::env::var_os("SOURCE_DATE_EPOCH").is_none() {
+        return Err(miette::miette!(
+            "--release requires a pinned SOURCE_DATE_EPOCH — pass \
+             --source-date-epoch <unix-seconds> or export SOURCE_DATE_EPOCH; \
+             release media must be byte-reproducible (ADR-0044 D8)"
+        ));
+    }
+    if arch == "all" {
+        return Err(miette::miette!(
+            "--release media name the architecture \
+             (nau-<mission>-<version>-<arch>) — pass an explicit --arch, \
+             e.g. --arch amd64"
+        ));
+    }
+    Ok(Some(shuttle::image::release::ReleaseArgs {
+        dir: PathBuf::from(dir),
+    }))
+}
+
+/// The build destination: the release export tree in release mode, else
+/// the `--output` directory.
+fn image_output_dir<'a>(
+    output: &'a str,
+    release_args: Option<&'a shuttle::image::release::ReleaseArgs>,
+) -> &'a Path {
+    release_args
+        .map(|r| r.dir.as_path())
+        .unwrap_or_else(|| Path::new(output))
+}
+
+/// The images to build; release mode demands exactly ONE named pick —
+/// the media set is a named artifact, not a batch output.
+fn select_build_images<'a>(
+    images: &'a HashMap<String, ImageDeclaration>,
+    output_name: &'a Option<String>,
+    file: &str,
+    release: bool,
+) -> miette::Result<Vec<(&'a String, &'a ImageDeclaration)>> {
+    let iter = select_images(images, output_name, file)?;
+    if release && iter.len() != 1 {
+        return Err(miette::miette!(
+            "--release publishes exactly ONE named mission image — pass \
+             --output-name <name> to pick it (found {} declared images in {file})",
+            iter.len()
+        ));
+    }
+    Ok(iter)
+}
+
+/// `shuttle image` (the #266 release gates live in [`release_args`] and
+/// [`select_build_images`]).
+#[allow(clippy::too_many_arguments)]
 fn cmd_image(
     file: String,
     output: String,
@@ -1948,24 +2021,31 @@ fn cmd_image(
     _cache_max_size: Option<String>,
     output_name: Option<String>,
     source_date_epoch: Option<String>,
+    release: Option<String>,
     lockfile_path: String,
     json: bool,
 ) -> miette::Result<()> {
     shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
     let file = resolve_file(&file)?;
 
-    if let Some(ref epoch) = source_date_epoch {
-        std::env::set_var("SOURCE_DATE_EPOCH", epoch);
-    }
+    // #266 gates (ADR-0044 D5/D8): a release pins the epoch, names the
+    // architecture, and publishes exactly ONE named disk image — Cassini
+    // ships named artifacts, not ad-hoc builds.
+    let release_args = release_args(&release, &arch, source_date_epoch.as_deref())?;
+
+    pin_epoch(source_date_epoch.as_deref());
     std::env::set_var("SHUTTLE_ARCH", &arch);
 
     let lock_path = Path::new(&lockfile_path);
     let mut lockfile = load_lockfile_or_default(lock_path)?;
 
     let images = resolve_images(&file)?;
-    let output_dir = Path::new(&output);
+    // In release mode the build lands directly in the export tree under
+    // the release media name — one set of image bytes, correctly named,
+    // no duplicate artifact inviting distribution of the wrong one.
+    let output_dir = image_output_dir(&output, release_args.as_ref());
     let cache_dir = image_cache_dir(cache.as_deref());
-    let iter = select_images(&images, &output_name, &file)?;
+    let iter = select_build_images(&images, &output_name, &file, release_args.is_some())?;
 
     // Every selected image records lockfile pins as it builds.
     let lock_changed = !iter.is_empty();
@@ -1976,6 +2056,7 @@ fn cmd_image(
         &channel,
         &arch,
         &mut lockfile,
+        release_args.as_ref(),
         json,
     )?;
 
@@ -2079,6 +2160,7 @@ fn select_images<'a>(
 }
 
 /// Build every selected image, mutating the lockfile as pins are recorded.
+#[allow(clippy::too_many_arguments)]
 fn build_images(
     iter: &[(&String, &ImageDeclaration)],
     output_dir: &Path,
@@ -2086,6 +2168,7 @@ fn build_images(
     channel: &str,
     arch: &str,
     lockfile: &mut LockFile,
+    release: Option<&shuttle::image::release::ReleaseArgs>,
     json: bool,
 ) -> miette::Result<()> {
     for (name, image_decl) in iter {
@@ -2094,7 +2177,7 @@ fn build_images(
         }
 
         build_one_image(
-            name, image_decl, output_dir, cache_dir, channel, arch, lockfile, json,
+            name, image_decl, output_dir, cache_dir, channel, arch, lockfile, release, json,
         )?;
     }
     Ok(())
@@ -2111,11 +2194,23 @@ fn build_one_image(
     channel: &str,
     arch: &str,
     lockfile: &mut LockFile,
+    release: Option<&shuttle::image::release::ReleaseArgs>,
     json: bool,
 ) -> miette::Result<()> {
+    // #266: the release media set is the verity-protected whole-disk
+    // mission image (ADR-0044 D1/D5) — the plain squashfs path has no
+    // roothash and would publish a manifest verify-image must refuse.
+    if release.is_some() && image_decl.disk.is_none() {
+        return Err(miette::miette!(
+            "--release requires a disk() mission image — '{}' declares no disk, so it \
+             has no whole-disk GPT artifact to publish and no roothash to verify \
+             against (ADR-0044 D1)",
+            name
+        ));
+    }
     let result = if image_decl.disk.is_some() {
         shuttle::image::build_disk_image(
-            image_decl, output_dir, cache_dir, channel, arch, lockfile,
+            image_decl, output_dir, cache_dir, channel, arch, lockfile, release,
         )?
     } else {
         shuttle::image::build_image(image_decl, output_dir, cache_dir, channel, arch, lockfile)?
@@ -3236,7 +3331,7 @@ fn verify_manifest_with_ceremony(
     parsed: &shuttle::manifest::ImageManifest,
 ) -> miette::Result<shuttle::sign::LedgerVerification> {
     let keys_dir = shuttle::sign::keys_dir(home);
-    let body = shuttle::sign::canonical_bytes(parsed)?;
+    let body = shuttle::sign::eval_manifest_canonical_bytes(parsed)?;
     let chain = shuttle::sign::Keychain::load_dir(&keys_dir)?;
     let ledger = shuttle::sign::CeremonyLedger::load(&keys_dir)?;
     let revoked = shuttle::sign::read_revoked_keys(&keys_dir)?;

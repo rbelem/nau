@@ -796,6 +796,7 @@ pub fn build_disk_image(
     channel: &str,
     arch: &str,
     lockfile: &mut LockFile,
+    release: Option<&release::ReleaseArgs>,
 ) -> miette::Result<PathBuf> {
     build_disk_image_with(
         &ImageTools,
@@ -805,6 +806,7 @@ pub fn build_disk_image(
         channel,
         arch,
         lockfile,
+        release,
     )
 }
 
@@ -818,6 +820,7 @@ pub(crate) fn build_disk_image_with(
     channel: &str,
     arch: &str,
     lockfile: &mut LockFile,
+    release: Option<&release::ReleaseArgs>,
 ) -> miette::Result<PathBuf> {
     // Scratch dir for build ARTIFACTS (disk.img, standalone partition files,
     // UKI stage) — deliberately separate from the staged rootfs, because the
@@ -883,7 +886,15 @@ pub(crate) fn build_disk_image_with(
         assert_piboot_preconditions(image, disk_layout)?;
     }
 
-    let output_filename = if arch == "all" {
+    // Release media carry the ADR-0013 vocabulary name (nau-<mission>-
+    // <version>-<arch>) instead of the dev build's `<name>_<version>_
+    // <arch>`; ADR-0044 D5. The caller validated arch is explicit.
+    let output_filename = if release.is_some() {
+        format!(
+            "{}.img",
+            release::release_stem(image.version.as_str(), arch)
+        )
+    } else if arch == "all" {
         format!("{}_{}.img", image.name, image.version)
     } else {
         format!("{}_{}_{}.img", image.name, image.version, arch)
@@ -1474,7 +1485,9 @@ pub(crate) fn build_disk_image_with(
 
     // 10. Write the authoritative manifest — threaded with the boot facts
     // the image boots with, including the dm-verity roothash (step (c)).
-    write_manifest(&root, image, &snap_paths, arch, uki.as_ref())?;
+    // The release path (#266) signs a copy of exactly this manifest beside
+    // the published image, so its boot facts must be captured here.
+    let manifest = write_manifest(&root, image, &snap_paths, arch, uki.as_ref())?;
 
     // 11. Format and populate the remaining partitions as standalone files
     // spliced at their read-back extents — the ESP gets the UKI +
@@ -1502,6 +1515,12 @@ pub(crate) fn build_disk_image_with(
         "  ✓ disk image built: {} ({} MB)",
         output_filename, total_mb
     );
+
+    // 12-bis. #266: release mode publishes the media set beside the image —
+    // the SIGNED manifest (the #265 verify-image contract) + SHA256SUMS.
+    if let Some(rel) = release {
+        release::publish(&output_path, &manifest, arch, rel)?;
+    }
 
     // 13. Update lockfile
     for snap in &resolved {
@@ -1798,6 +1817,7 @@ mod initramfs;
 mod mounts;
 mod partition;
 mod piboot;
+pub mod release;
 pub(crate) mod staging;
 mod state;
 mod verify;
@@ -6998,6 +7018,7 @@ RequiredBy=boot-complete.target
                 "latest/stable",
                 "amd64",
                 &mut lockfile,
+                None,
             )
             .expect("disk build with a state role must complete");
             assert!(img.is_file(), "disk artifact written: {}", img.display());
@@ -7165,6 +7186,7 @@ RequiredBy=boot-complete.target
                 "latest/stable",
                 "amd64",
                 &mut lockfile,
+                None,
             )
             .expect("A/B + update_source disk build must complete");
             assert!(img.is_file(), "disk artifact written: {}", img.display());
@@ -7277,6 +7299,7 @@ RequiredBy=boot-complete.target
                 "latest/stable",
                 "amd64",
                 &mut lockfile,
+                None,
             )
             .expect_err("systemd 239 predates the emitted machinery");
             let message = err.to_string();
@@ -7310,6 +7333,7 @@ RequiredBy=boot-complete.target
                 "latest/stable",
                 "amd64",
                 &mut lockfile,
+                None,
             )
             .expect_err("an undeterminable systemd version must fail closed");
             let message = err.to_string();
@@ -7341,6 +7365,7 @@ RequiredBy=boot-complete.target
                 "latest/stable",
                 "amd64",
                 &mut lockfile,
+                None,
             )
             .expect_err("assessment without bless tooling must fail closed");
             let message = err.to_string();
@@ -7413,6 +7438,7 @@ RequiredBy=boot-complete.target
                 "latest/stable",
                 "amd64",
                 &mut lockfile,
+                None,
             )
             .expect("plain disk build must complete");
             assert!(img.is_file());

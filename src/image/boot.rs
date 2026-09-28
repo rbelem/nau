@@ -896,21 +896,24 @@ pub(crate) fn uki_transfer(image_name: &str, base_url: &str) -> String {
     )
 }
 
-/// Serialize and write the image manifest into the staged rootfs.
+/// Serialize and write the image manifest into the staged rootfs,
+/// returning what was written — the release path (#266) signs a copy of
+/// this exact manifest beside the published image, so the published
+/// signatures must cover the boot facts the image actually boots with.
 pub(crate) fn write_manifest(
     root: &Path,
     image: &ImageDeclaration,
     snaps: &[(String, ResolvedSnap)],
     arch: &str,
     boot: Option<&UkiFacts>,
-) -> miette::Result<()> {
+) -> miette::Result<ImageManifest> {
     let manifest = ImageManifest::from_resolved(image, snaps, arch, boot);
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|e| miette::miette!("failed to serialize manifest: {e}"))?;
     std::fs::write(root.join("image-manifest.json"), manifest_json)
         .into_diagnostic()
         .wrap_err("writing manifest")?;
-    Ok(())
+    Ok(manifest)
 }
 
 /// Copy the systemd-boot fallback binary onto the ESP (EFI/BOOT). When no

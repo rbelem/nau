@@ -4066,7 +4066,7 @@ plugs:
             signatures: BTreeMap::new(),
         };
         crate::sign::cosign(&mut manifest, &kp).unwrap();
-        let canonical = crate::sign::canonical_bytes(&manifest).unwrap();
+        let canonical = crate::sign::eval_manifest_canonical_bytes(&manifest).unwrap();
         let verified = verify_signatures_at(
             &canonical,
             &manifest.signatures,
@@ -4123,7 +4123,7 @@ plugs:
         // The honest attestation verifies on the device path.
         crate::sign::attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", false)
             .unwrap();
-        let canonical = crate::sign::canonical_bytes(&manifest).unwrap();
+        let canonical = crate::sign::eval_manifest_canonical_bytes(&manifest).unwrap();
         let verified = verify_signatures_at(
             &canonical,
             &manifest.signatures,
@@ -4157,7 +4157,7 @@ plugs:
         );
         let mut forged = manifest.clone();
         crate::sign::sign_attested(&mut forged, &kp, &lying).unwrap();
-        let canonical_forged = crate::sign::canonical_bytes(&forged).unwrap();
+        let canonical_forged = crate::sign::eval_manifest_canonical_bytes(&forged).unwrap();
         let err = verify_signatures_at(
             &canonical_forged,
             &forged.signatures,
@@ -4183,7 +4183,7 @@ plugs:
             signatures: BTreeMap::new(),
         };
         crate::sign::cosign(&mut manifest, kp).unwrap();
-        let canonical = crate::sign::canonical_bytes(&manifest).unwrap();
+        let canonical = crate::sign::eval_manifest_canonical_bytes(&manifest).unwrap();
         (canonical, manifest.signatures)
     }
 
@@ -4261,7 +4261,7 @@ plugs:
         };
         crate::sign::cosign(&mut manifest, &revoked).unwrap();
         crate::sign::cosign(&mut manifest, &trusted).unwrap();
-        let canonical = crate::sign::canonical_bytes(&manifest).unwrap();
+        let canonical = crate::sign::eval_manifest_canonical_bytes(&manifest).unwrap();
         let err = verify_signatures_at(
             &canonical,
             &manifest.signatures,

@@ -132,8 +132,10 @@ fn load_signed_manifest(path: &Path) -> miette::Result<ImageManifest> {
 
 /// Canonical signature input for the image manifest: serialized with the
 /// signatures map emptied — byte-stable, and a signature never covers
-/// itself. The exact scheme [`crate::sign::canonical_bytes`] applies to
-/// the eval manifest, applied to the image one.
+/// itself. The exact scheme [`crate::sign::eval_manifest_canonical_bytes`]
+/// applies to the eval manifest, applied to the image one. This — NOT the
+/// eval scheme — is what `shuttle image --release` signs (#266) and what
+/// this module verifies.
 pub(crate) fn image_manifest_canonical_bytes(manifest: &ImageManifest) -> miette::Result<Vec<u8>> {
     let mut clean = manifest.clone();
     clean.signatures.clear();
@@ -155,8 +157,10 @@ pub fn verify_manifest_signature(
 }
 
 /// [`verify_manifest_signature`] against an explicit keychain directory —
-/// the test seam (mirrors [`crate::runtime::verify_signatures_at`]).
-fn verify_manifest_signature_at(
+/// the seam the release signer's tests drive too (the sign↔verify
+/// round-trip must exercise the EXACT device policy; mirrors
+/// [`crate::runtime::verify_signatures_at`]).
+pub(crate) fn verify_manifest_signature_at(
     manifest: &ImageManifest,
     extra_key: Option<&Path>,
     keys_dir: &Path,

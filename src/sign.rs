@@ -173,10 +173,16 @@ pub fn verify(
     verify_one(&payload, &key_id, &raw, &public)
 }
 
-/// Canonical signature input: the manifest serialized with `signatures`
+/// Canonical signature input for the EVAL manifest
+/// ([`crate::manifest::ImageManifest`]): serialized with `signatures`
 /// emptied (see the module docs — a signature never covers itself; the map
 /// is deterministic, so the bytes are byte-stable).
-pub fn canonical_bytes(manifest: &ImageManifest) -> miette::Result<Vec<u8>> {
+///
+/// Named `eval_manifest_…` deliberately (#266): the IMAGE manifest's
+/// canonical bytes are a separate scheme —
+/// [`crate::image::verify::image_manifest_canonical_bytes`] — and the
+/// two must never be confused when signing/verifying.
+pub fn eval_manifest_canonical_bytes(manifest: &ImageManifest) -> miette::Result<Vec<u8>> {
     let mut clean = manifest.clone();
     clean.signatures.clear();
     serde_json::to_vec(&clean).map_err(|e| miette::miette!("canonical serialization: {e}"))
@@ -294,7 +300,7 @@ impl Provenance {
     /// Build the SLSA-lite attestation for an eval-produced manifest:
     /// builder `shuttle:<version>`, the invocation flags, the declared
     /// inputs as materials, and the sha3-384 subject over `body` (the
-    /// canonical bytes [`canonical_bytes`] produced).
+    /// canonical bytes [`eval_manifest_canonical_bytes`] produced).
     pub fn for_manifest(
         shuttle_version: &str,
         arch: &str,
@@ -329,7 +335,7 @@ pub fn sign_attested(
     kp: &KeyPair,
     provenance: &Provenance,
 ) -> miette::Result<()> {
-    let mut payload = canonical_bytes(manifest)?;
+    let mut payload = eval_manifest_canonical_bytes(manifest)?;
     payload.extend_from_slice(&provenance_bytes(provenance)?);
     let signature = sign_bytes(&payload, kp);
     manifest.signatures.insert(
@@ -357,7 +363,7 @@ pub fn attest_eval(
     channel: &str,
     offline: bool,
 ) -> miette::Result<()> {
-    let body = canonical_bytes(manifest)?;
+    let body = eval_manifest_canonical_bytes(manifest)?;
     let provenance =
         Provenance::for_manifest(shuttle_version, arch, channel, offline, manifest, &body)?;
     sign_attested(manifest, kp, &provenance)
@@ -600,7 +606,7 @@ pub fn install_public_key(kp: &KeyPair, dir: &Path) -> miette::Result<PathBuf> {
 /// existing ones (DUAL/multi-signature). Canonical bytes never include
 /// the map, so prior signatures keep verifying untouched.
 pub fn cosign(manifest: &mut ImageManifest, kp: &KeyPair) -> miette::Result<()> {
-    let bytes = canonical_bytes(manifest)?;
+    let bytes = eval_manifest_canonical_bytes(manifest)?;
     manifest.signatures.insert(
         kp.key_id(),
         serde_json::Value::String(sign_bytes(&bytes, kp)),
@@ -1257,7 +1263,7 @@ pub fn cosign_reattaching_provenance(
     manifest: &mut ImageManifest,
     kp: &KeyPair,
 ) -> miette::Result<()> {
-    let body = canonical_bytes(manifest)?;
+    let body = eval_manifest_canonical_bytes(manifest)?;
     let existing = manifest.signatures.values().find_map(|v| {
         serde_json::from_value::<SignatureEntry>(v.clone())
             .ok()
@@ -1585,7 +1591,7 @@ mod tests {
     #[test]
     fn canonical_bytes_exclude_signatures_and_are_deterministic() {
         let mut m = minimal_manifest();
-        let before = canonical_bytes(&m).unwrap();
+        let before = eval_manifest_canonical_bytes(&m).unwrap();
         m.signatures.insert(
             "deadbeef00112233".into(),
             serde_json::Value::String("x".into()),
@@ -1596,10 +1602,10 @@ mod tests {
             serde_json::to_vec(&m).unwrap(),
             serde_json::to_vec(&minimal_manifest()).unwrap()
         );
-        assert_eq!(canonical_bytes(&m).unwrap(), before);
+        assert_eq!(eval_manifest_canonical_bytes(&m).unwrap(), before);
         // Empty map serializes as {} deterministically (BTreeMap order).
         assert_eq!(
-            canonical_bytes(&minimal_manifest()).unwrap(),
+            eval_manifest_canonical_bytes(&minimal_manifest()).unwrap(),
             br#"{"manifest_version":1,"inputs":{},"outputs":{},"images":{},"signatures":{}}"#
                 .to_vec()
         );
@@ -1665,7 +1671,7 @@ mod tests {
         let (home, kp) = temp_keypair();
         let _ = home;
         let manifest = minimal_manifest();
-        let bytes = canonical_bytes(&manifest).unwrap();
+        let bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
         let mut sigs = BTreeMap::new();
         sigs.insert(
             kp.key_id(),
@@ -1679,12 +1685,12 @@ mod tests {
         let (home, kp) = temp_keypair();
         let _ = home;
         let manifest = minimal_manifest();
-        let mut bytes = canonical_bytes(&manifest).unwrap();
+        let mut bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
         // Flip one payload byte — the signature must stop holding.
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
         let mut sigs = BTreeMap::new();
-        let intact = canonical_bytes(&manifest).unwrap();
+        let intact = eval_manifest_canonical_bytes(&manifest).unwrap();
         sigs.insert(
             kp.key_id(),
             serde_json::Value::String(sign_bytes(&intact, &kp)),
@@ -1702,7 +1708,7 @@ mod tests {
         let (home2, impostor) = temp_keypair();
         let _ = home2;
         let manifest = minimal_manifest();
-        let bytes = canonical_bytes(&manifest).unwrap();
+        let bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
         let mut sigs = BTreeMap::new();
         sigs.insert(
             kp.key_id(),
@@ -1732,7 +1738,7 @@ mod tests {
 
     fn signed_manifest(kp: &KeyPair) -> (Vec<u8>, BTreeMap<String, serde_json::Value>) {
         let manifest = minimal_manifest();
-        let bytes = canonical_bytes(&manifest).unwrap();
+        let bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
         let mut sigs = BTreeMap::new();
         sigs.insert(
             kp.key_id(),
@@ -1802,7 +1808,7 @@ mod tests {
         let mut manifest = minimal_manifest();
         cosign(&mut manifest, &a).unwrap();
         cosign(&mut manifest, &b).unwrap();
-        let mut bytes = canonical_bytes(&manifest).unwrap();
+        let mut bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
         let sigs = manifest.signatures.clone();
@@ -1857,8 +1863,11 @@ mod tests {
         assert!(manifest.signatures.contains_key(&successor.key_id()));
 
         // Canonical bytes exclude the map — the old signature still holds.
-        let bytes = canonical_bytes(&manifest).unwrap();
-        assert_eq!(bytes, canonical_bytes(&minimal_manifest()).unwrap());
+        let bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
+        assert_eq!(
+            bytes,
+            eval_manifest_canonical_bytes(&minimal_manifest()).unwrap()
+        );
 
         // Verify passes under old-only, new-only, and both-key chains.
         let old_dir = tempfile::tempdir().unwrap();
@@ -1915,7 +1924,7 @@ mod tests {
         let mut manifest = minimal_manifest();
         cosign(&mut manifest, &old).unwrap();
         let successor = rotate(home.path(), &mut manifest).unwrap();
-        let bytes = canonical_bytes(&manifest).unwrap();
+        let bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         install_public_key(&old, dir.path()).unwrap();
@@ -1938,7 +1947,7 @@ mod tests {
         assert_eq!(remaining.key_ids(), vec![successor.key_id()]);
 
         // Verification under the remaining set passes.
-        let bytes_after = canonical_bytes(&manifest).unwrap();
+        let bytes_after = eval_manifest_canonical_bytes(&manifest).unwrap();
         let verified = verify_keychain(&bytes_after, &manifest.signatures, &remaining).unwrap();
         assert_eq!(verified, successor.key_id());
 
@@ -1993,7 +2002,7 @@ mod tests {
         // signed cannot verify under the keychain.
         let mut manifest = minimal_manifest();
         cosign(&mut manifest, &successor).unwrap();
-        let bytes = canonical_bytes(&manifest).unwrap();
+        let bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
         let chain = Keychain::load_dir(dir.path()).unwrap();
         let err = verify_keychain(&bytes, &manifest.signatures, &chain).unwrap_err();
         assert!(
@@ -2089,7 +2098,7 @@ mod tests {
         let mut manifest = minimal_manifest();
         cosign(&mut manifest, &revoked).unwrap();
         cosign(&mut manifest, &trusted).unwrap();
-        let bytes = canonical_bytes(&manifest).unwrap();
+        let bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
         let chain = Keychain::load_dir(dir.path()).unwrap();
 
         // Without the revocation list the trusted signature verifies.
@@ -2116,7 +2125,7 @@ mod tests {
         cosign(&mut manifest, &old).unwrap();
         let successor = mint_rotation_key(home.path()).unwrap();
         cosign(&mut manifest, &successor).unwrap();
-        let bytes = canonical_bytes(&manifest).unwrap();
+        let bytes = eval_manifest_canonical_bytes(&manifest).unwrap();
 
         // Both anchors present: either signature verifies (the overlap
         // window a rotation needs to roll out without a flag day).
@@ -2203,7 +2212,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
 
         // Either-key rule pre-rotation: the only signer verifies.
         let chain = Keychain::load_dir(dir.path()).unwrap();
@@ -2220,7 +2229,7 @@ mod tests {
         cosign_reattaching_provenance(&mut manifest, &successor).unwrap();
         assert!(manifest.signatures.contains_key(&old.key_id()));
         assert!(manifest.signatures.contains_key(&successor.key_id()));
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
 
         // The window accepts either key: old-only, new-only, both.
         for anchored in [vec![&old], vec![&successor], vec![&old, &successor]] {
@@ -2258,7 +2267,7 @@ mod tests {
         // error, which names the key.
         let mut old_only = manifest.clone();
         old_only.signatures.remove(&successor.key_id());
-        let old_only_body = canonical_bytes(&old_only).unwrap();
+        let old_only_body = eval_manifest_canonical_bytes(&old_only).unwrap();
         let err = verify_with_ledger(
             &old_only_body,
             &old_only.signatures,
@@ -2283,7 +2292,7 @@ mod tests {
 
         let mut manifest = minimal_manifest();
         cosign(&mut manifest, &old).unwrap();
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let chain = chain_with(dir.path(), &[&old, &successor]);
 
@@ -2319,7 +2328,7 @@ mod tests {
         // A dual-signed manifest past the window verifies through the
         // live key with no warning — the fresh signature wins.
         cosign(&mut manifest, &successor).unwrap();
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
         let out = verify_with_ledger(
             &body,
             &manifest.signatures,
@@ -2451,7 +2460,7 @@ mod tests {
         );
 
         // Both verify over the unchanged canonical body.
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
         verify(&body, &manifest.signatures, &old.public_hex()).unwrap();
         verify(&body, &manifest.signatures, &successor.public_hex()).unwrap();
     }
@@ -2582,7 +2591,7 @@ mod tests {
         let mut manifest = manifest_with_github_input();
         attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", false).unwrap();
 
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
         verify(&body, &manifest.signatures, &kp.public_hex()).unwrap();
 
         // The entry is an attested envelope whose subject digests the body.
@@ -2609,7 +2618,7 @@ mod tests {
         let key_id = kp.key_id();
         tamper_provenance(&mut manifest, &key_id);
 
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
         let err = verify(&body, &manifest.signatures, &kp.public_hex()).unwrap_err();
         assert!(
             format!("{err:#}").contains("FAILED"),
@@ -2629,7 +2638,7 @@ mod tests {
         // `b` signs the new way (attested envelope) beside it.
         attest_eval(&mut manifest, &b, "9.9.9", "amd64", "latest/stable", false).unwrap();
 
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
         verify(&body, &manifest.signatures, &a.public_hex()).unwrap();
         verify(&body, &manifest.signatures, &b.public_hex()).unwrap();
 
@@ -2657,7 +2666,7 @@ mod tests {
         // refused by name before the Ed25519 check.
         let mut b = minimal_manifest();
         sign_attested(&mut b, &kp, &prov).unwrap();
-        let body_b = canonical_bytes(&b).unwrap();
+        let body_b = eval_manifest_canonical_bytes(&b).unwrap();
         let err = verify(&body_b, &b.signatures, &kp.public_hex()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
@@ -2695,7 +2704,7 @@ mod tests {
         let mut manifest = manifest_with_github_input();
         let kp = fixed_kp();
         attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", false).unwrap();
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
         let entry = &manifest.signatures[&kp.key_id()];
         let sig = entry["signature"].as_str().expect("signature field");
         let json = serde_json::to_string(entry).unwrap();
@@ -2721,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn attested_signatures_stay_out_of_canonical_bytes() {
+    fn attested_signatures_stay_out_of_eval_manifest_canonical_bytes() {
         let (_, kp) = temp_keypair();
         let mut manifest = manifest_with_github_input();
         attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", true).unwrap();
@@ -2729,8 +2738,8 @@ mod tests {
         // attested manifest's canonical bytes are exactly the unsigned
         // golden — builder/host facts never enter the body.
         assert_eq!(
-            canonical_bytes(&manifest).unwrap(),
-            canonical_bytes(&manifest_with_github_input()).unwrap()
+            eval_manifest_canonical_bytes(&manifest).unwrap(),
+            eval_manifest_canonical_bytes(&manifest_with_github_input()).unwrap()
         );
     }
 
@@ -2740,7 +2749,7 @@ mod tests {
         let (_, other) = temp_keypair();
         let mut manifest = manifest_with_github_input();
         attest_eval(&mut manifest, &kp, "9.9.9", "amd64", "latest/stable", true).unwrap();
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let chain = chain_with(dir.path(), &[&kp, &other]);
 
@@ -2760,7 +2769,7 @@ mod tests {
     fn malformed_envelope_is_a_named_error() {
         let (_, kp) = temp_keypair();
         let manifest = minimal_manifest();
-        let body = canonical_bytes(&manifest).unwrap();
+        let body = eval_manifest_canonical_bytes(&manifest).unwrap();
         let mut sigs = BTreeMap::new();
         sigs.insert(kp.key_id(), serde_json::json!({ "signature": 123 }));
         let err = verify(&body, &sigs, &kp.public_hex()).unwrap_err();
