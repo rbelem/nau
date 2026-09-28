@@ -2249,7 +2249,7 @@ fn build_one_image(
 
 // ── Doctor command ──
 
-fn cmd_doctor(pod: bool, fix: bool, from: Option<&str>) -> miette::Result<()> {
+fn cmd_doctor(pod: Option<Option<String>>, fix: bool, from: Option<&str>) -> miette::Result<()> {
     if from.is_some() && !fix {
         miette::bail!("--from requires --fix: doctor only provisions with explicit consent");
     }
@@ -2268,11 +2268,19 @@ fn cmd_doctor(pod: bool, fix: bool, from: Option<&str>) -> miette::Result<()> {
             installed.bin_dir.display()
         );
     }
-    let checks = if pod || fix {
+    let mut checks = if pod.is_some() || fix {
         shuttle::doctor::run_pod()
     } else {
         shuttle::doctor::run_all()
     };
+    // `--pod <name>` (issue #231): the failed-unit scan for the named
+    // pod. The name is validated fail-closed at the CLI boundary; the
+    // scan itself is advisory (hint-only, never fails the report).
+    if let Some(pod_name) = pod.clone().flatten().as_deref() {
+        let (name, _) =
+            shuttle::pod::resolve_pod_dir_under(&shuttle::pod::pod_root(None), Some(pod_name))?;
+        checks.push(shuttle::doctor::check_pod_failed_units(&name));
+    }
     shuttle::doctor::print_report(&checks);
     shuttle::doctor::print_notices();
     if !shuttle::doctor::all_ok(&checks) {

@@ -172,13 +172,18 @@ pub enum Command {
         json: bool,
     },
 
-    /// Check system readiness (required tools). The default gates the full
-    /// surface; --pod gates only what the pod verbs need (issue #97).
+    /// Check system readiness (required tools). The default gates the
+    /// full surface; --pod gates only what the pod verbs need (issue #97).
     Doctor {
         /// Gate only the pod surface (pod tools + build toolchain) —
         /// image tools like ukify are not required on pod-only machines.
-        #[arg(long)]
-        pod: bool,
+        /// Takes an optional pod NAME (`--pod work`): with a name, the
+        /// doctor additionally scans the pod's recorded units for the
+        /// D3 boot story — failed units whose secret envfile died with
+        /// the tmpfs — and names `pod secrets refresh` as the fix
+        /// (issue #231).
+        #[arg(long, value_name = "POD", num_args = 0..=1)]
+        pod: Option<Option<String>>,
 
         /// Provision the floor tools first (issue #101 disposition (c)),
         /// then re-run the pod check section as the post-fix table.
@@ -3106,6 +3111,73 @@ mod tests {
                 command: WorkersCommand::Pickup { home },
             } => assert_eq!(home.as_deref(), Some("/tmp/ca-home")),
             _ => panic!("expected Workers Pickup"),
+        }
+    }
+
+    // ── Doctor `--pod` flag shapes (issue #231) ──
+
+    #[test]
+    fn doctor_pod_bare_is_scope_only() {
+        match Cli::try_parse_from(["shuttle", "doctor", "--pod"])
+            .unwrap()
+            .command
+        {
+            Command::Doctor { pod, fix, from } => {
+                // Bare `--pod`: the scope flag with NO pod identity —
+                // the pre-#231 surface, byte-for-byte.
+                assert_eq!(pod, Some(None));
+                assert!(!fix);
+                assert_eq!(from, None);
+            }
+            _ => panic!("expected Doctor"),
+        }
+    }
+
+    #[test]
+    fn doctor_pod_with_name_carries_identity() {
+        match Cli::try_parse_from(["shuttle", "doctor", "--pod", "work"])
+            .unwrap()
+            .command
+        {
+            Command::Doctor { pod, .. } => assert_eq!(pod.flatten().as_deref(), Some("work")),
+            _ => panic!("expected Doctor"),
+        }
+        // The `=` form too.
+        match Cli::try_parse_from(["shuttle", "doctor", "--pod=work"])
+            .unwrap()
+            .command
+        {
+            Command::Doctor { pod, .. } => assert_eq!(pod.flatten().as_deref(), Some("work")),
+            _ => panic!("expected Doctor"),
+        }
+    }
+
+    #[test]
+    fn doctor_pod_does_not_swallow_a_following_flag() {
+        match Cli::try_parse_from(["shuttle", "doctor", "--pod", "--fix"])
+            .unwrap()
+            .command
+        {
+            Command::Doctor { pod, fix, .. } => {
+                assert_eq!(pod, Some(None), "`--fix` must not be eaten as the value");
+                assert!(fix);
+            }
+            _ => panic!("expected Doctor"),
+        }
+    }
+
+    #[test]
+    fn doctor_without_pod_behaves_as_today() {
+        match Cli::try_parse_from(["shuttle", "doctor", "--fix"])
+            .unwrap()
+            .command
+        {
+            Command::Doctor { pod, fix, from } => {
+                assert_eq!(pod, None);
+                assert!(fix);
+                assert_eq!(from, None);
+            }
+            _ => panic!("expected Doctor"),
         }
     }
 }
