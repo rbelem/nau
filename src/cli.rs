@@ -501,6 +501,17 @@ pub enum Command {
         /// Pod whose store to export (default: `default`).
         #[arg(long, value_name = "POD")]
         pod: Option<String>,
+
+        /// Curate the export to one mission's pinned pool (#275): only
+        /// the packages the named `image()` declaration pins (base,
+        /// kernel, gadget, snaps). Every pinned package must be in the
+        /// pod store — a missing pin fails the export.
+        #[arg(long, value_name = "MISSION")]
+        mission: Option<String>,
+
+        /// Project Lua declaring the mission (with --mission).
+        #[arg(long, value_name = "FILE", requires = "mission")]
+        file: Option<String>,
     },
 
     /// Manage the binary package cache
