@@ -15,6 +15,13 @@ It reuses the zet cluster unchanged — same VPS, same Caddy, same tofu phase �
 and adds one wildcard certificate plus static trees. No new daemons, no new
 databases, no new secrets.
 
+> [2026-09-27: the zet-cluster premise above is superseded by ADR-0046 —
+> the lanes pod on the Nau host carries static file service + TLS
+> termination (D3), and the zet VPS is gone. The "## zet-side execution
+> checklist" below is historical, never re-homed; operator execution lives
+> in docs/nau-ops-runbook.md (DNS via tofu, three Caddy vhost blocks,
+> kuma monitors).]
+
 ## Relationship to the brand domains (ADR-0013)
 
 ADR-0013 assigned the public brand home: org `github.com/nau-os`, domains

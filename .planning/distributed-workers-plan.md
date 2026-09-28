@@ -19,7 +19,13 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 > are out of v1 (D8), remote ingest keys on job-manifest identity, never
 > `v4:` (D6), and T6 waits for T5 plus the host-key provenance ADR-0045.
 > Landed state: T0 (#188), T1 (#189), T2 (#190, PR #239), T3 (#191, PR #245)
-> merged.
+> merged; T4 (#192) and T6 (#194) landed 2026-09-27 — T6 deliberately ahead of
+> T5 (ADR-0045 ratification un-parked it); T5 (#193) is the only open box.
+> Contract note: the TTL source of truth is the hcloud label pair
+> (`shuttle-worker`, `shuttle-worker-ttl` = epoch seconds) per the #269
+> amendment — the in-guest marker is a fallback copy; `--type cx22` examples
+> below are stale post-reprice (classes CX23/CX33/CAX11/21; cli.rs help is
+> authoritative).
 
 ### Arm the program
 
@@ -43,8 +49,10 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
   - [ ] T0 is first and alone. It lands the ADR, the glossary terms, and this plan on trunk.
   - [ ] T1 after T0. T2 after T1. T3 after T1.
   - [ ] T4 after T2 and T3. T5 after T4.
-  - [ ] T6 after T5, and only after ADR-0045 (worker host-key provenance) is
-        ratified. T7, T8, T9, T10 after T6 and are independent of each other.
+  - [x] T6 after T5, and only after ADR-0045 (worker host-key provenance) is
+        ratified — LANDED 2026-09-27 (#194), out of order: after ADR-0045
+        ratification but ahead of T5 (see Landed state). T7, T8, T9, T10 after
+        T6 and are independent of each other.
 - [ ] Hold the file boundaries. T1 touches only `src/dsl/init.lua` and the eval payload struct. T2 touches only `src/build_sched.rs` and its call site in `src/main.rs`. T3 touches only `src/cli.rs` and the new `src/worker.rs`. T4 touches only `src/ssh_exec.rs` and `src/worker.rs`. T5 touches only `src/build_sched.rs`, `src/main.rs`, and `src/output.rs`. T6 touches only `src/provision.rs` and `src/cli.rs`. T7 through T10 touch only their provider module under `src/provision/`.
 - [ ] Hold the review gate. T5, T6, T7, T8, T9, T10 change what the operator sees. They wait for the operator's review in chat with the lane logs and a terminal video before merge.
 
@@ -399,10 +407,10 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 ## Add the Provisioner seam and the Hetzner provider (T6)
 
-**Depends on.** T5, and the operator's ratification of ADR-0045 (worker
-host-key provenance). Parked until both hold — do not dispatch this lane; the
-Build box below is pre-resynced to the mint-and-inject posture and gets its
-final rewrite at un-park time.
+**Depends on.** T3, and the operator's ratification of ADR-0045 (worker
+host-key provenance). Both held; UN-PARKED and LANDED 2026-09-27 as #194 —
+the promised un-park rewrite is realized in the landed Build box
+(mint-and-inject posture).
 
 **Files.**
 
@@ -696,8 +704,8 @@ The full ledger lives in ADR-0040's Alternatives section. The short list. Worker
 ## Appendix C. Risks
 
 - One flaky worker fails the whole run. Lands in T5. The owner watches the stop-the-world lanes and the operator decides if strict is too strict after living with it. The escape hatch is removing the worker from config, not silent retries.
-- Provisioned cloud VMs leak when a run dies mid-provision. Lands in T6 and every provider ticket. The TTL marker file and the destroy verb are the leash. The owner watches lane 10 of each provider.
-- Host-key pinning friction on first use. Lands in T6. The printed-key flow is the operator's explicit-trust act. The owner watches lane 5.
+- Provisioned cloud VMs leak when a run dies mid-provision. Lands in T6 and every provider ticket. The leash: the `shuttle-worker`/`shuttle-worker-ttl` hcloud labels set at create (v2 contract, #269 amendment), the destroy verb's volume pre-check, and the #269 TTL sweep. The owner watches lane 10 of each provider.
+- Host-key pinning friction on first use. Lands in T6. ADR-0045 superseded the printed-key flow: mint-and-inject pins the host key into the workers entry atomically at provision — the operator's explicit-trust act is provisioning at all. The owner watches lane 5.
 - Protocol drift between coordinator and worker versions. Lands in T3 and T4. The constant plus preflight refusal is the guard. The owner watches lane 8 of T3.
 - Large source tarballs over slow links make coordinator-ships-sources painful. Surfaces at T4 lane 3 and the T4 perf block. The recorded answer is the fetch-at-worker revisit trigger, not a v1 mode.
 - hcloud, aws, gcloud, az, and scw CLI drift. Lands in T6 through T10. Each provider module wraps one CLI, so drift is one module's fix. The owners watch the dry-run lanes.

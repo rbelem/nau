@@ -133,11 +133,14 @@ pre-check stands).
 
 ## 4. Ticket actions
 
-- **#194 (amend):** SKU examples are stale post-reprice — classes
+- **#194 (amend):** [SUPERSEDED BY LANDING 2026-09-27 — #194 merged with the
+  post-reprice classes (CX23/CX33/CAX11/21) in code help and comments.]
+  SKU examples were stale post-reprice — classes
   build-light (CX23) / build-default (CX33) / build-aarch64 (CAX11/21);
   jobs and RAM budget derive from the class (4 jobs / 8GB on
   build-default, 2 jobs / 4GB on build-light); TTL defaults 4h burst /
-  24h index runs; template = stock Ubuntu 24.04 + source-built
+  24h index runs; template = stock latest Ubuntu LTS (ADR-0046, never a
+  codename — the "24.04" wording below predates it) + source-built
   squashfs-tools 4.7.x + distro bwrap + cap probes.
 - **#271 (amend):** placement hel1 stands; add snapshot ownership (per
   OS/tool-pin version, refreshed on bump) and the note that CPX dedicated
