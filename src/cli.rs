@@ -800,16 +800,18 @@ pub enum WorkersCommand {
     /// public half into a machine-managed `workers` entry in shuttle.lua
     /// BEFORE first use — never ssh-keyscan (ADR-0045).
     Provision {
-        /// Provider driver (currently: hetzner).
+        /// Provider driver (currently: hetzner, aws).
         #[arg(long)]
         provider: String,
 
         /// Server SKU — operator-supplied, never hardcoded (Hetzner
-        /// repriced the lineup 2026-06-15; classes CX23/CX33/CAX11/CAX21).
+        /// repriced the lineup 2026-06-15; classes CX23/CX33/CAX11/CAX21;
+        /// AWS: the EC2 instance type, e.g. c7i.large).
         #[arg(long = "type", value_name = "SKU")]
         server_type: String,
 
-        /// Provider location (e.g. hel1, fsn1).
+        /// Provider location (e.g. hel1, fsn1; AWS: the region, e.g.
+        /// eu-central-1).
         #[arg(long)]
         location: String,
 
@@ -822,6 +824,18 @@ pub enum WorkersCommand {
         /// `shuttle-worker` hcloud label (epoch-seconds expiry).
         #[arg(long, default_value = "4h")]
         ttl: String,
+
+        /// Request a spot/preemptible instance (aws only; hetzner has no
+        /// spot product). Eviction is T5 worker loss — re-dispatched,
+        /// never migrated (ADR-0040 Amendment 1). On-demand hourly is the
+        /// default; spot is for eviction-tolerant lanes only.
+        #[arg(long)]
+        spot: bool,
+
+        /// Hourly USD price cap for `--spot` (e.g. 0.05). Required with
+        /// `--spot` — an uncapped bid is not a cap; refused without it.
+        #[arg(long, value_name = "USD_H")]
+        max_price: Option<String>,
 
         /// Print the plan (type, location, count, TTL, user-data hash) and
         /// exit — resolved fully, no API call, no token needed.

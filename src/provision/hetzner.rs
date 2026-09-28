@@ -14,15 +14,15 @@
 //! failure: servers created before a later failure are deleted, config is
 //! appended only after every server is up.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::Value;
 
 use crate::command::{exit_code, CommandRunner};
 use crate::provision::{
     append_worker_entry, evict_worker_entry, iso8601_utc, mint_host_keypair, now_epoch_secs,
-    render_user_data, ProvisionPlan, ProvisionRequest, ProvisionedWorker, Provisioner,
-    UserDataParams,
+    render_user_data, stage_user_data, ProvisionPlan, ProvisionRequest, ProvisionedWorker,
+    Provisioner, UserDataParams,
 };
 
 /// The hcloud labels shuttle stamps at create time — the key names shared
@@ -85,6 +85,16 @@ impl<R: CommandRunner> HetznerProvisioner<R> {
 
 impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
     fn provision(&self, req: &ProvisionRequest) -> miette::Result<Vec<ProvisionedWorker>> {
+        // Hetzner has no spot product (providers plan §1): the flag is
+        // refused, never silently ignored — an on-demand instance pretending
+        // to be spot would lie about its eviction class.
+        if req.spot {
+            return Err(miette::miette!(
+                "provision: --spot is not supported on hetzner — it has no spot product; \
+                 on-demand hourly (capped at the monthly price) is the only class. Spot is an \
+                 aws capability (eviction-tolerant lanes only, ADR-0040 Amendment 1)"
+            ));
+        }
         // Local resolution first: mint, template, TTL. All of it is
         // API-free, so the dry-run plan is the REAL plan.
         let expiry_epoch = now_epoch_secs()? + req.ttl_secs;
@@ -112,6 +122,7 @@ impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
                 ttl_secs: req.ttl_secs,
                 ttl_expiry_iso: expiry_iso,
                 binary_url: self.binary_url.clone(),
+                spot_max_price: None,
                 user_data_sha256,
             });
             return Ok(Vec::new());
@@ -121,7 +132,7 @@ impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
         // enters argv. Presence is checked before any API call.
         self.require_token()?;
 
-        let user_data_file = write_user_data_file(dir.path(), &user_data)?;
+        let user_data_file = stage_user_data(dir.path(), &user_data)?;
 
         // Create + describe; every successfully created name rides
         // `created` so any later failure tears the whole set down.
@@ -317,25 +328,6 @@ fn server_name(i: u32) -> String {
     format!("shuttle-worker-{nanos:x}-{:02}", i + 1)
 }
 
-/// Stage the user-data blob for `hcloud --user-datafile` INSIDE the mint
-/// tempdir (`dir`), mode 0600. The blob carries the minted private host
-/// half (server-auth, blast radius one machine per ADR-0045), so it must
-/// never sit at a fixed world-readable temp path: the per-run tempdir
-/// keeps concurrent provisions isolated, 0600 keeps it private while it
-/// exists, and it dies with the keypair when the tempdir drops.
-fn write_user_data_file(dir: &Path, user_data: &str) -> miette::Result<PathBuf> {
-    let path = dir.join("user-data.yaml");
-    std::fs::write(&path, user_data)
-        .map_err(|e| miette::miette!("provision: cannot write {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| miette::miette!("provision: cannot chmod 0600 {}: {e}", path.display()))?;
-    }
-    Ok(path)
-}
-
 fn print_plan(plan: &ProvisionPlan) {
     crate::output::info("provision plan (dry run — no API call was made):");
     crate::output::info("  provider:         hetzner");
@@ -348,6 +340,9 @@ fn print_plan(plan: &ProvisionPlan) {
         plan.ttl_secs, plan.ttl_expiry_iso
     ));
     crate::output::info(format!("  binary url:       {}", plan.binary_url));
+    if let Some(cap) = &plan.spot_max_price {
+        crate::output::info(format!("  spot max price:   {cap} USD/h"));
+    }
     crate::output::info(format!("  user-data sha256: {}", plan.user_data_sha256));
     crate::output::info(format!(
         "  label:            {WORKER_LABEL} + {WORKER_TTL_LABEL}=<ttl epoch>"
