@@ -56,3 +56,32 @@ A design tension had to be resolved: ADR-0012's `Install` and `Generation` are *
 **Positive**: one stack replaces devbox + nix; host tools and system packages share one store and one lockfile philosophy; pod rollback/GC are cheap and never disturb the bootable system; GUI apps reach the desktop menu; devbox-parity activation without shim cost.
 
 **Negative**: two update chains must stay coherent (system generations vs pod generations) — they are deliberately separate contracts, so no cross-referencing manifests are required today; interpreter-based packages need build-time authors to emit a wrapper (#9); a pod's `PATH` prepend is manual (no shellenv hook in v1); cross-pod pins are deferred (live-following only). The hosting project keeps the naming invariant (no "global" in CLI/config).
+
+## Addendum (2026-09-27): one name per pod, version lines by constraint (ADR-0047)
+
+The pod manifest stays keyed by package name: **one version of a name per
+pod, permanently.** A second version line of the same package coexists in
+another pod, never in this one — the coexistence unit is `name@constraint`
+in another pod, and `pod add node@22` into a pod holding node 26 is a
+replace (pin moves, new generation), never a shadow (full rationale:
+ADR-0047, D2/D3). The loader's silent soname first-match is why: any
+same-soname pair in one pod would make incidental ordering load-bearing,
+against D6's never-silent rule.
+
+The declared constraint now selects as well as filters: `name@constraint`
+threads into recipe evaluation (an `EvalRequest` field exposed as a DSL
+global, ADR-0047 D4), so one recipe owns every version line of its name.
+D4's `packages = { "ripgrep@14" }` grammar is unchanged.
+
+D8's wrapper invariant is now stated as a consequence of the name rule:
+an interpreter app's wrapper execs the bare interpreter name from the
+farm PATH, sound because name-uniqueness-per-pod guarantees the
+interpreter on PATH is the same line as the staged script tree. The
+interpreter-wrapper pass follows relative symlinks when rewriting command
+files, so recipes stage real copies (`rm`, then `cp -L`) before declaring
+such apps with `interpreter = "..."` — the npm/npx handling in
+`pkgs/n/node.lua` is the canonical form.
+
+The suffixed-sibling pattern (a `node22` package renaming every app) is
+retired as the documented anti-pattern — escape hatch for genuinely
+different products only (ADR-0047 D5); #260's lint warns on the shape.

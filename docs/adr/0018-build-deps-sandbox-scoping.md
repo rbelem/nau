@@ -90,3 +90,23 @@ identical-content rule (Decision 2) stays fail-closed and unchanged. The gcc
 build chain asserts the rule (`test ! -e "$STAGE/usr/include/asm-generic"`)
 so a future deb in the set cannot silently reintroduce the collision.
 Recipe-declared arch extensions of a toolchain deb set (#171) inherit the rule.
+
+## Addendum 2 (2026-09-27): command ownership and one toolchain per prefix (ADR-0047)
+
+The one-owner rule extends from shared subtrees to **PATH-visible command
+names**: each command name in a merged prefix has exactly one owning
+payload; overlaps are fixed in the payload by dropping the duplicate,
+never by merge priority (Decision 2 unchanged, still fail-closed). This
+generalizes the existing negotiation in `pkgs/b/binutils.lua` (it drops
+the triplet names because the gcc deb set owns them). A merged build
+prefix also carries **one compiler toolchain** — never two of the same
+name.
+
+Why the prefix can never meet two lines of one package: the pod manifest
+is keyed by name and one version of a name per pod is permanent
+(ADR-0047 D2) — version lines coexist across pods, selected by declared
+`name@constraint` (ADR-0047 D3/D4). The `node22`-style unstaged-`include/`
+discipline `pkgs/n/node22.lua` once documented is therefore retired with
+the suffixed design: with one line per name, the shared-path conflict it
+guarded against (`usr/include/node` differing per line) is prevented
+upstream instead of dodged per payload.
