@@ -2,11 +2,12 @@
 
 Status: **draft for the operator — nothing here has been applied.** This
 document is the authored execution pack for the operator-side steps behind
-#271/#274/#275/#276: the worker account, the DNS lane, the serving config,
-the kuma monitors, and the worker TTL sweep install. Every command cites
+#271/#274/#275/#276/#292: the worker account, the DNS lane, the serving
+config, the kuma monitors, the worker TTL sweep install, and the
+release-to-flash trust chain. Every command cites
 its source; no lane executes any of it. Genuinely open operator decisions
 are labelled **DECISION SLOT** — there are exactly two (A and B, summarised
-in §7); everything else is decided in an existing source and referenced.
+in §8); everything else is decided in an existing source and referenced.
 
 Hosting context: the zet VPS was deleted and ADR-0046 re-homed the lanes
 onto the Nau deployment itself (`.planning/nau-infra-plan.md`'s hosting
@@ -292,8 +293,9 @@ curl -s -r 0-0 -o /dev/null -w '%{http_code}\n' https://download.nau.rclb.dev/mi
 
 ## 4. kuma monitors (PLAN decision 6 + CACHE-SPEC)
 
-Four monitors. The stamp monitor is the one that catches a silently
-stale tree; the others catch a dead origin.
+Four monitors + one presence check (#292). The stamp monitor is the one
+that catches a silently stale tree; the others catch a dead origin — or a
+half-served media set.
 
 1. **`nau cache mirror — stamp release`** — the keyword monitor on
    `https://cache.nau.rclb.dev/freshness.stamp`. Full field spec (type,
@@ -314,6 +316,19 @@ stale tree; the others catch a dead origin.
    https://download.nau.rclb.dev/missions/<mission>/SHA256SUMS`, accept
    200 (PLAN decision 6: "HEAD on the current SHA256SUMS"; one monitor
    per released mission, `<mission>` filled from the released set).
+5. **download signature presence** (#292) — `HEAD
+   https://download.nau.rclb.dev/missions/<mission>/SHA256SUMS.gpg`,
+   accept 200, one monitor per released mission beside monitor 4.
+   Monitor 4 going green proves nothing about the signature: a vanished
+   `SHA256SUMS.gpg` over a live `SHA256SUMS` is the
+   monitor-green-while-channel-dead trap — the sysupdate `Verify=yes`
+   path is dead while every plain-HTTP check stays green. This monitor
+   checks EXISTENCE only; signature validity stays the device's job (gpg
+   against the embedded `/usr/lib/systemd/import-pubring.pgp`). A
+   vanished signature must page, not stay green. The kuma config is
+   operator-applied (the zet `scripts/kuma/monitors.json` +
+   `kuma-provision.sh` pattern, rebuilt per ADR-0046) — this check lands
+   in the rebuilt monitor set; nothing in-repo to patch.
 
 Application vehicle: monitors-as-code in the zet repo's
 `scripts/kuma/monitors.json`, applied by `scripts/kuma-provision.sh`
@@ -381,12 +396,123 @@ side).
    empty trees harmlessly (PLAN sequencing).
 5. §4 monitors — once the monitoring stack exists (DECISION SLOT B) and
    the lanes serve; the stamp keyword update joins the per-release
-   publish loop from day one (CACHE-SPEC).
-6. Live verification of the cache lane (`shuttle pull` against the real
+   publish loop from day one (CACHE-SPEC), and monitor 5 rides monitor
+   4's per-mission set (#292).
+6. §7 release-to-flash — the trust-chain procedure, the operator gate
+   for "first real flash by anyone" (#292): needs §3 serving the media
+   set, the ceremony keychain (§7.1), and a pinned epoch (§7.2).
+7. Live verification of the cache lane (`shuttle pull` against the real
    host) waits for the Nau host to exist (CACHE-SPEC "Not proven yet") —
    do not attempt before that.
 
-## 7. DECISION SLOTS (complete list)
+## 7. Release-to-flash: the trust-chain procedure (#292)
+
+The operator execution pack from ceremony key to a verified, blessed
+boot — the gate before anyone's first real flash. Each step cites its
+contract; none of it runs automatically.
+
+> **THE OUT-OF-BAND RULE (ADR-0033 D7) — anchors and key material travel
+> OUT-OF-BAND, NEVER from the medium being verified.** `verify-image`'s
+> `--key` MERGES into the ANY-anchor set beside `~/.config/shuttle/keys/*.pub`
+> (src/image/verify.rs, the ADR-0024 §4 anchor policy), so a key fetched from
+> the same download lane as the manifest verifies the attacker's own manifest
+> — a self-bless. Anchors come from the ceremony keychain (§7.1) or nowhere;
+> the download lane serves bytes and never vouches for them.
+
+### 7.1 Key ceremony (operator-executed — pointer)
+
+The ceremony is ADR-0024's, executed by the operator; this runbook does
+not re-derive it. The CLI surface is `shuttle key
+keygen|rotate|promote|revoke|list|verify` (ADR-0024 §4, landed via
+#64/#51); operator anchors install under `~/.config/shuttle/keys/*.pub` —
+the keychain `verify-image` trusts by default, and the same ceremony key's
+sysupdate identity bakes into the base rootfs as
+`/usr/lib/systemd/import-pubring.pgp` (the device-side anchor). That
+keychain is the ONLY legitimate source of `--key` files anywhere below.
+
+### 7.2 Pin SOURCE_DATE_EPOCH — and what it does NOT move (#289)
+
+`shuttle image --release` refuses to run with the epoch unset (the CLI
+refuses a release without a pinned epoch, ADR-0044 D8). Export it for the
+whole release session:
+
+```bash
+# source: ADR-0044 D8; 1704067200 is examples/rebuild-compare.sh's default
+export SOURCE_DATE_EPOCH=1704067200
+```
+
+**Epoch-stable anchor contract (#289): the ceremony key's identity does
+NOT move with the release epoch.** The sysupdate OpenPGP identity is
+minted at a fixed anchor epoch (`SYSUPDATE_OPENPGP_EPOCH`, src/sign.rs)
+regardless of `SOURCE_DATE_EPOCH`, so `SHA256SUMS.gpg` is byte-identical
+across release epochs and every fielded device's embedded
+`import-pubring.pgp` keeps resolving the same key — a differently-epoch'd
+release re-keys nobody (pinned by
+`sysupdate_anchor_identity_is_epoch_stable_cross_epoch_roundtrip`). The
+epoch still pins every other deterministic byte (squashfs timestamps,
+UUIDs); only the anchor identity is exempted.
+
+### 7.3 Build and sign the media set
+
+```bash
+# source: ADR-0044 D5 — named artifacts in the ADR-0033 D10 export tree;
+# src/image/release.rs module doc
+shuttle image --release
+```
+
+Emits `nau-<mission>-<version>-<arch>.img`, the SIGNED
+`nau-<mission>-<version>-<arch>.manifest.json` (Ed25519 under the
+operator key id), `SHA256SUMS`, and `SHA256SUMS.gpg` (the sysupdate
+detached OpenPGP signature, #267). The command prints the media set plus
+its BLOCKING checklist (ADR-0044 D8) — the next step is one of them.
+
+### 7.4 Two-machine rebuild-compare (BLOCKING before distribution)
+
+```bash
+# source: ADR-0044 D8; examples/rebuild-compare.sh
+examples/rebuild-compare.sh   # byte-identity across two machines
+```
+
+A media set that has not passed this is not distributed, whatever the
+build said. The ADR-0013 trademark pre-release sweep is the other
+blocking checklist item.
+
+### 7.5 Flash: documented `dd`, then verify BEFORE first boot
+
+Write by `/dev/disk/by-id`, never raw `sdX` (ADR-0044 D6):
+
+```bash
+# source: ADR-0044 D1 (install = byte copy; the write stays documented dd)
+dd if=nau-<mission>-<version>-<arch>.img \
+   of=/dev/disk/by-id/<target> bs=4M conv=fsync status=progress
+sync
+```
+
+Then prove the written device matches the SIGNED manifest — read-only,
+unprivileged, works on real block devices (#288: refuses to guess sector
+size, HOME, or device sizing). Run it on the freshly written medium,
+before it boots anything:
+
+```bash
+# source: ADR-0044 D4 + #288. No --key needed with the ceremony keychain
+# installed (§7.1); --key, when used, is a ceremony-keychain copy — never
+# a file the download lane supplied (out-of-band rule above).
+shuttle verify-image --device /dev/disk/by-id/<target> \
+    --manifest nau-<mission>-<version>-<arch>.manifest.json
+```
+
+Record the reported `verified_key_id` and roothash with the release
+record.
+
+### 7.6 First boot and bless
+
+The flashed host's first boot runs the try-boot count (ADR-0024 §3); a
+good boot is marked good by `systemd-bless-boot` (tooling staged by the
+base per ADR-0027 — slots are never blessed by hand). The flash gate for
+"first real flash" is: §7.4 passed byte-identity, §7.5 named the expected
+key id, and the first boot blessed itself.
+
+## 8. DECISION SLOTS (complete list)
 
 | Slot | Question | Source of the openness |
 |---|---|---|
@@ -400,7 +526,7 @@ values), and the final serving-stack placement for the §3 blocks
 (ADR-0046 pod vs plan-era host Caddy — the open lane-service-stack
 decision).
 
-## 8. Traceability index
+## 9. Traceability index
 
 | Runbook item | Source |
 |---|---|
@@ -413,5 +539,7 @@ decision).
 | Three vhost blocks, roots, browse off, Range/sendfile, append-only note, 308 apex | PLAN decisions 1-2, 6, checklist 2 |
 | Stamp keyword monitor + per-release keyword update | CACHE-SPEC (spec + two-command loop); PLAN decision 3 |
 | Companion monitors (index.json, www 200, download HEAD) | PLAN decision 6; CACHE-SPEC |
+| `SHA256SUMS.gpg` existence monitor (one per released mission, pages on a vanished signature) | #292 (monitor-green-while-channel-dead trap); PLAN decision 6 |
+| Release-to-flash procedure; out-of-band anchor rule; epoch-stable anchor identity | #292; ADR-0033 D7; ADR-0024 §3-4; ADR-0044 D1, D4-D6, D8; ADR-0027; #267; #288; #289 (src/sign.rs `SYSUPDATE_OPENPGP_EPOCH`) |
 | Sweep install, three-condition match, epoch-second labels, dry-run window, alert-on-failure | #269; INFRA D5; PROVIDERS §2; ZET update-timer.yml (pattern) |
-| Sequencing and gates | PLAN sequencing; #271/#269 gates; CACHE-SPEC "Not proven yet" |
+| Sequencing and gates | PLAN sequencing; #271/#269 gates; #292 flash gate; CACHE-SPEC "Not proven yet" |
