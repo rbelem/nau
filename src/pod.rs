@@ -1688,8 +1688,19 @@ struct LoadedContribution {
     /// its packages so the rebuilt payload carries the same build
     /// inputs the loaded pod itself used.
     overlay: BTreeMap<String, serde_json::Value>,
-    /// Package name → executing version (None: resolve live).
-    packages: BTreeMap<String, Option<String>>,
+    /// Package name → executing version (None: resolve live) plus the
+    /// constraint the loaded pod selected the name with (ADR-0047) — a
+    /// loading pod must re-resolve the SAME line, or a `node@22` loaded
+    /// pod would silently contribute a default-line node.
+    packages: BTreeMap<String, ContributedPkg>,
+}
+
+/// One contributed name: the version the loaded pod executes (None:
+/// resolve live) and the constraint its line was selected with.
+#[derive(Debug, Clone)]
+struct ContributedPkg {
+    version: Option<String>,
+    constraint: Option<String>,
 }
 
 /// Fold a pod's DECLARATION alone: its own packages resolved live (the
@@ -1701,11 +1712,11 @@ fn declared_contribution(
     root: &Path,
     pod_name: &str,
     decl: &PodDeclaration,
-) -> miette::Result<BTreeMap<String, Option<String>>> {
+) -> miette::Result<BTreeMap<String, ContributedPkg>> {
     let mut packages = BTreeMap::new();
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
-        let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+        let mut meta = load_spec_meta(&spec).map_err(|e| {
             miette::miette!("cannot resolve loaded pod's package '{}': {e}", spec.name)
         })?;
         if let Some(patch) = decl.overlay.get(&spec.name) {
@@ -1716,12 +1727,18 @@ fn declared_contribution(
                 )
             })?;
         }
-        packages.insert(spec.name, Some(meta.version));
+        packages.insert(
+            spec.name,
+            ContributedPkg {
+                version: Some(meta.version),
+                constraint: spec.constraint,
+            },
+        );
     }
     for loaded in &decl.loads {
         let sub = loaded_contribution(root, loaded)?;
-        for (name, version) in sub.packages {
-            packages.entry(name).or_insert(version);
+        for (name, pkg) in sub.packages {
+            packages.entry(name).or_insert(pkg);
         }
     }
     Ok(packages)
@@ -1730,6 +1747,11 @@ fn declared_contribution(
 fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedContribution> {
     let decl = load_declaration(root, pod_name)?;
     let store = pod_store(&pod_dir(root, pod_name));
+    // The loaded pod's own constraint record, for names the generation
+    // carries but the declaration no longer mentions (a line/constraint
+    // move pending its next sync): the lockfile pin's constraint is what
+    // the executing content was selected with.
+    let lock = LockFile::load(&pod_lock_path(root, pod_name))?.unwrap_or_else(LockFile::empty);
     // Union (issue #103): what the pod EXECUTES (its active generation)
     // is the base and wins every name clash; its declaration folds in
     // beneath with `or_insert` so declaration-only names — resolved
@@ -1739,13 +1761,38 @@ fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedCont
     // the pod's own first sync).
     let packages = match store.active_generation()? {
         Some(active) => {
-            let mut packages: BTreeMap<String, Option<String>> = active
+            let mut packages: BTreeMap<String, ContributedPkg> = active
                 .packages
                 .iter()
-                .map(|(name, pkg)| (name.clone(), Some(pkg.version.clone())))
+                .map(|(name, pkg)| {
+                    (
+                        name.clone(),
+                        ContributedPkg {
+                            version: Some(pkg.version.clone()),
+                            constraint: None,
+                        },
+                    )
+                })
                 .collect();
-            for (name, version) in declared_contribution(root, pod_name, &decl)? {
-                packages.entry(name).or_insert(version);
+            for (name, declared) in declared_contribution(root, pod_name, &decl)? {
+                match packages.entry(name) {
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(declared);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut e) => {
+                        // The generation's version wins (issue #103);
+                        // the constraint still follows the declaration
+                        // so the re-resolution selects the same line.
+                        e.get_mut().constraint = declared.constraint;
+                    }
+                }
+            }
+            // Generation-only names: the lockfile pin's constraint is
+            // the line the executing content was built from.
+            for (name, pkg) in packages.iter_mut() {
+                if pkg.constraint.is_none() {
+                    pkg.constraint = lock.packages.get(name).and_then(|e| e.constraint.clone());
+                }
             }
             packages
         }
@@ -1759,17 +1806,22 @@ fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedCont
 
 /// The union of package names the pod's `loads` provide (own names
 /// shadow sub-load names, but the union is what the overlay-target
-/// check needs). Declaration-only, no resolution — read-only and cheap.
-fn loaded_package_names(root: &Path, decl: &PodDeclaration) -> miette::Result<HashSet<String>> {
+/// check needs), each with the constraint its loaded pod declared —
+/// the re-resolution input (ADR-0047). Declaration-only, no
+/// resolution — read-only and cheap.
+fn loaded_package_specs(
+    root: &Path,
+    decl: &PodDeclaration,
+) -> miette::Result<Vec<(String, Option<String>)>> {
     fn collect(
         root: &Path,
         decl: &PodDeclaration,
         visited: &mut HashSet<String>,
-        out: &mut HashSet<String>,
+        out: &mut Vec<(String, Option<String>)>,
     ) -> miette::Result<()> {
         for spec in &decl.packages {
             if let Ok(parsed) = parse_pod_package(spec) {
-                out.insert(parsed.name);
+                out.push((parsed.name, parsed.constraint));
             }
         }
         for loaded in &decl.loads {
@@ -1781,9 +1833,17 @@ fn loaded_package_names(root: &Path, decl: &PodDeclaration) -> miette::Result<Ha
         Ok(())
     }
     let mut visited = HashSet::new();
-    let mut out = HashSet::new();
+    let mut out = Vec::new();
     collect(root, decl, &mut visited, &mut out)?;
     Ok(out)
+}
+
+/// The constraint-free form for callers that only need the names.
+fn loaded_package_names(root: &Path, decl: &PodDeclaration) -> miette::Result<HashSet<String>> {
+    Ok(loaded_package_specs(root, decl)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
 }
 /// Add a package to a pod: resolve it from the package collection FIRST
 /// (an unknown package must not modify any state), then record it in
@@ -1796,8 +1856,8 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
     let spec = parse_pod_package(spec_str)?;
 
     // Resolve before touching any state.
-    let meta = crate::deps::load_meta(&spec.name)
-        .map_err(|e| miette::miette!("cannot add '{}': {e}", spec.name))?;
+    let meta =
+        load_spec_meta(&spec).map_err(|e| miette::miette!("cannot add '{}': {e}", spec.name))?;
 
     let mut decl = load_declaration_or_default(root, pod_name)?;
     let lock = LockFile::load(&pod_lock_path(root, pod_name))?;
@@ -1837,8 +1897,19 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
     decl.packages.push(spec_str.to_string());
     validate_overlays(root, &decl, pod_name)?;
     // The overlay entry for this package is the top layer: pin the
-    // EFFECTIVE version, not the collection's (issue #6).
+    // EFFECTIVE version, not the collection's (issue #6). The ADR-0047
+    // constraint guard runs on the COLLECTION's selection before the
+    // overlay applies — an overlay version pin is the author's explicit
+    // choice and beats the constraint, so an overlay written ahead of
+    // the add exempts the add; without one, a recipe that dropped the
+    // declared line refuses before any write.
     let mut meta = meta;
+    if let Some(constraint) = &spec.constraint {
+        if !decl.overlay.contains_key(&spec.name) {
+            refuse_spec_constraint_violation(&spec.name, &meta.version, constraint)
+                .map_err(|e| miette::miette!("cannot add '{}': {e}", spec.name))?;
+        }
+    }
     if let Some(patch) = decl.overlay.get(&spec.name) {
         apply_overlay(&mut meta, patch)
             .map_err(|e| miette::miette!("cannot add '{}' with its overlay: {e}", spec.name))?;
@@ -2374,14 +2445,30 @@ fn refuse_constraint_violation(
         .find_map(|s| parse_pod_package(s).ok().filter(|p| p.name == name))
         .and_then(|p| p.constraint)
     {
-        if !version_matches_constraint(version, &constraint) {
-            miette::bail!(
-                "'{name}': sideloaded version {version} violates the declared \
-                 constraint '@{constraint}' — refusing to record a pin that \
-                 contradicts its own constraint; widen the constraint in the \
-                 pod declaration, or `shuttle pod remove {name}` first"
-            );
-        }
+        refuse_spec_constraint_violation(name, version, &constraint)?;
+    }
+    Ok(())
+}
+
+/// The spec-level form of [`refuse_constraint_violation`], generalized
+/// to the collection add path (ADR-0047): the constraint is the caller's
+/// `PodPackageSpec` — `pod add node@22`, a pod declaration, a sync
+/// re-resolution — not just the sideload paths. A recipe whose
+/// constraint-selected version violates its own declared constraint (a
+/// recipe bug, or a line dropped upstream while a stale default leaked
+/// through) refuses before any write — never a silent re-pin. Pure.
+fn refuse_spec_constraint_violation(
+    name: &str,
+    version: &str,
+    constraint: &str,
+) -> miette::Result<()> {
+    if !version_matches_constraint(version, constraint) {
+        miette::bail!(
+            "'{name}': resolved version {version} violates the declared \
+             constraint '@{constraint}' — refusing to record a pin that \
+             contradicts its own constraint; the recipe must select the \
+             declared line (ADR-0047), or the constraint must widen"
+        );
     }
     Ok(())
 }
@@ -2598,7 +2685,7 @@ fn prune_dangling_service_overrides(decl: &mut PodDeclaration) {
         let Ok(spec) = parse_pod_package(spec_str) else {
             continue;
         };
-        match crate::deps::load_meta(&spec.name) {
+        match load_spec_meta(&spec) {
             Ok(meta) => remaining.extend(meta.services.into_keys()),
             Err(_) => {
                 crate::output::warn(
@@ -2726,7 +2813,7 @@ fn precheck_declare_collisions(root: &Path, decl: &PodDeclaration) -> miette::Re
         } else {
             crate::farm::ClaimLayer::Own
         };
-        let mut meta = crate::deps::load_meta(&spec.name)
+        let mut meta = load_spec_meta(&spec)
             .map_err(|e| miette::miette!("cannot declare '{}': {e}", spec.name))?;
         if let Some(patch) = decl.overlay.get(&spec.name) {
             apply_overlay(&mut meta, patch)
@@ -2862,11 +2949,7 @@ pub fn rebuild_package(
         .map(|e| e.version.as_str())
         .filter(|v| !v.is_empty())
         .map_or_else(
-            || {
-                crate::deps::load_meta(&spec.name)
-                    .map(|m| m.version)
-                    .unwrap_or_default()
-            },
+            || load_spec_meta(&spec).map(|m| m.version).unwrap_or_default(),
             str::to_string,
         );
     if deps_pin_moved {
@@ -3044,7 +3127,7 @@ pub fn update_pod(
         // beats both the collection and the package's constraint, so the
         // update lands the pod on the pinned version (or reports it
         // already current) instead of fighting the overlay.
-        let mut candidate_meta = crate::deps::load_meta(&spec.name)
+        let mut candidate_meta = load_spec_meta(&spec)
             .map_err(|e| miette::miette!("cannot update '{}': {e}", spec.name))?;
         let overlay = decl.overlay.get(&spec.name);
         if let Some(patch) = overlay {
@@ -4228,7 +4311,7 @@ struct ReconcileState {
     active: Option<crate::runtime::Generation>,
     lock: LockFile,
     lock_path: PathBuf,
-    loaded_versions: BTreeMap<String, String>,
+    loaded_versions: BTreeMap<String, ContributedPkg>,
     loaded_overlays: BTreeMap<String, serde_json::Value>,
 }
 
@@ -4369,7 +4452,7 @@ fn warn_degraded_missing(state: &ReconcileState, build: &ReconcileBuild) {
 /// genuinely undeclared packages and never wipes declared ones.
 fn collect_degraded_names(
     decl: &PodDeclaration,
-    loaded_versions: &BTreeMap<String, String>,
+    loaded_versions: &BTreeMap<String, ContributedPkg>,
     build: &mut ReconcileBuild,
 ) {
     for spec_str in &decl.packages {
@@ -4500,23 +4583,30 @@ fn loaded_contributions(
     root: &Path,
     decl: &PodDeclaration,
 ) -> miette::Result<(
-    BTreeMap<String, String>,
+    BTreeMap<String, ContributedPkg>,
     BTreeMap<String, serde_json::Value>,
 )> {
-    let mut loaded_versions: BTreeMap<String, String> = BTreeMap::new();
+    let mut loaded_versions: BTreeMap<String, ContributedPkg> = BTreeMap::new();
     let mut loaded_overlays: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for loaded in &decl.loads {
         let contribution = loaded_contribution(root, loaded)?;
-        for (name, version) in contribution.packages {
-            loaded_versions
-                .entry(name)
-                .or_insert(version.unwrap_or_default());
+        for (name, pkg) in contribution.packages {
+            loaded_versions.entry(name).or_insert(pkg);
         }
         for (name, patch) in contribution.overlay {
             loaded_overlays.entry(name).or_insert(patch);
         }
     }
     Ok((loaded_versions, loaded_overlays))
+}
+
+/// Load a declared spec's meta with its constraint threaded into the
+/// recipe eval (ADR-0047 Decision 4): `node@22` evaluates pkgs/n/node.lua
+/// with `constraint = "22"` so the recipe selects the declared line.
+/// `node` (no constraint) evaluates unconstrained — the recipe's own
+/// default line.
+fn load_spec_meta(spec: &PodPackageSpec) -> miette::Result<crate::snap::SnapMeta> {
+    crate::deps::load_meta_for(&spec.name, spec.constraint.as_deref())
 }
 
 /// Resolve one declared own package through the collection + the pod's
@@ -4526,14 +4616,34 @@ fn resolve_own_meta(
     pod_name: &str,
     spec: &PodPackageSpec,
     overlay: &BTreeMap<String, serde_json::Value>,
+    lock: &LockFile,
 ) -> miette::Result<crate::snap::SnapMeta> {
-    let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+    let mut meta = load_spec_meta(spec).map_err(|e| {
         miette::miette!(
             "cannot build declared package '{}': {e} (declaration at {})",
             spec.name,
             pod_lua_path(root, pod_name).display()
         )
     })?;
+    // ADR-0047: the COLLECTION's selection must satisfy the spec's own
+    // constraint whenever the sync would pin it — no pin yet (declare
+    // bootstrap), or a pin that already carries the resolved version. A
+    // DIFFERING pin takes the established pin-and-hold path (upstream
+    // drift past a constraint holds, it never refuses); a recipe that
+    // DROPPED the declared line already failed the eval above. The
+    // overlay applies AFTER the guard: an overlay version pin is the
+    // author's explicit choice and beats the constraint (issue #6).
+    if let Some(constraint) = &spec.constraint {
+        let pin_moved_to_candidate = lock
+            .packages
+            .get(&spec.name)
+            .is_some_and(|e| e.version != meta.version);
+        if !pin_moved_to_candidate {
+            refuse_spec_constraint_violation(&spec.name, &meta.version, constraint).map_err(
+                |e| miette::miette!("cannot build declared package '{}': {e}", spec.name),
+            )?;
+        }
+    }
     if let Some(patch) = overlay.get(&spec.name) {
         apply_overlay(&mut meta, patch).map_err(|e| {
             miette::miette!(
@@ -4601,7 +4711,7 @@ fn collect_own_packages(
             hold_blob_pinned(ctx, &spec.name, &pin.sha3_384, layer, build)?;
             continue;
         }
-        let mut meta = resolve_own_meta(ctx.root, ctx.pod_name, &spec, &decl.overlay)?;
+        let mut meta = resolve_own_meta(ctx.root, ctx.pod_name, &spec, &decl.overlay, ctx.lock)?;
         // Issue #175: the TOFU baseline follows the restamped lock pin,
         // not the recipe's stale baked-in seed.
         rebase_floating_source_pin(&mut meta, ctx.lock);
@@ -4737,14 +4847,17 @@ fn build_own_package(
 /// Resolve a loaded pod's package through BOTH overlay layers (issue
 /// #8): the loaded pod's own overlay (so the rebuilt payload carries
 /// the same build inputs it would get in the loaded pod itself)
-/// beneath the loading pod's overlay — the top layer wins.
+/// beneath the loading pod's overlay — the top layer wins. The loaded
+/// pod's constraint rides the eval (ADR-0047): the loading pod must
+/// re-resolve the SAME line the loaded pod selected.
 fn resolve_loaded_meta(
     name: &str,
+    constraint: Option<&str>,
     pod_name: &str,
     loaded_patch: Option<&serde_json::Value>,
     own_patch: Option<&serde_json::Value>,
 ) -> miette::Result<crate::snap::SnapMeta> {
-    let mut meta = crate::deps::load_meta(name).map_err(|e| {
+    let mut meta = crate::deps::load_meta_for(name, constraint).map_err(|e| {
         miette::miette!("loaded package '{name}' from pod '{pod_name}' cannot be resolved: {e}")
     })?;
     if let Some(patch) = loaded_patch {
@@ -4767,24 +4880,27 @@ fn resolve_loaded_meta(
 fn collect_loaded_packages(
     ctx: &ReconcileCtx<'_>,
     decl: &PodDeclaration,
-    loaded_versions: &BTreeMap<String, String>,
+    loaded_versions: &BTreeMap<String, ContributedPkg>,
     loaded_overlays: &BTreeMap<String, serde_json::Value>,
     build: &mut ReconcileBuild,
 ) -> miette::Result<()> {
-    for (name, version) in loaded_versions {
+    for (name, contributed) in loaded_versions {
         if build.declared_names.contains(name) {
             continue;
         }
         let mut meta = resolve_loaded_meta(
             name,
+            contributed.constraint.as_deref(),
             ctx.pod_name,
             loaded_overlays.get(name),
             decl.overlay.get(name),
         )?;
         // Pin the loaded package at the executing version (a loaded
         // pod's active generation version wins over collection drift).
-        if !version.is_empty() {
-            meta.version = version.clone();
+        if let Some(version) = &contributed.version {
+            if !version.is_empty() {
+                meta.version = version.clone();
+            }
         }
         build.declared_names.insert(meta.name.clone());
         // Runtime-closure seeds (issue #35): loaded packages need their
@@ -4845,13 +4961,18 @@ fn install_requires_closure(
     if build.requires_seeds.is_empty() {
         return Ok(());
     }
-    let members = crate::deps::resolve_dep_names(&build.requires_seeds, true)?;
+    // Constraint-aware closure resolution (ADR-0047): a `requires` edge
+    // may pin its member's line (`node@22`) — each member loads with
+    // its edge's constraint so the payload IS that line.
+    let members = crate::deps::resolve_dep_specs(&build.requires_seeds, true)?;
     let active_names: std::collections::BTreeSet<String> = ctx
         .active
         .map(|g| g.packages.keys().cloned().collect())
         .unwrap_or_default();
     let mut building: Vec<String> = Vec::new();
-    for name in members {
+    for member in members {
+        let name = member.name;
+        let constraint = member.constraint;
         if build.declared_names.contains(&name) {
             continue;
         }
@@ -4865,7 +4986,7 @@ fn install_requires_closure(
             build.declared_names.insert(name);
             continue;
         }
-        let dep_meta = crate::deps::load_meta(&name)?;
+        let dep_meta = crate::deps::load_meta_for(&name, constraint.as_deref())?;
         let payload = ensure_pod_dep_payload(
             ctx.store,
             &name,
@@ -5237,7 +5358,7 @@ fn push_declared_binary_claims(
             push_installed_binary_claims(claims, pkg, layer);
             continue;
         }
-        let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+        let mut meta = load_spec_meta(&spec).map_err(|e| {
             miette::miette!("cannot check '{}' for a binary collision: {e}", spec.name)
         })?;
         if let Some(patch) = decl.overlay.get(&spec.name) {
@@ -5258,7 +5379,7 @@ fn push_loaded_binary_claims(
     decl: &PodDeclaration,
     new_name: &str,
 ) -> miette::Result<()> {
-    for name in loaded_package_names(root, decl)? {
+    for (name, constraint) in loaded_package_specs(root, decl)? {
         let declared = decl.packages.iter().any(|s| {
             parse_pod_package(s)
                 .map(|p| p.name == name)
@@ -5267,7 +5388,7 @@ fn push_loaded_binary_claims(
         if declared || name == new_name {
             continue;
         }
-        let meta = crate::deps::load_meta(&name).map_err(|e| {
+        let meta = crate::deps::load_meta_for(&name, constraint.as_deref()).map_err(|e| {
             miette::miette!("cannot check loaded '{}' for a binary collision: {e}", name)
         })?;
         push_meta_binary_claims(claims, &meta, crate::farm::ClaimLayer::Loaded);
@@ -5434,7 +5555,7 @@ fn push_declared_service_claims(
             push_installed_service_claims(claims, pkg, layer);
             continue;
         }
-        let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+        let mut meta = load_spec_meta(&spec).map_err(|e| {
             miette::miette!("cannot check '{}' for a service collision: {e}", spec.name)
         })?;
         if let Some(patch) = decl.overlay.get(&spec.name) {
@@ -5455,7 +5576,7 @@ fn push_loaded_service_claims(
     decl: &PodDeclaration,
     new_name: &str,
 ) -> miette::Result<()> {
-    for name in loaded_package_names(root, decl)? {
+    for (name, constraint) in loaded_package_specs(root, decl)? {
         let declared = decl.packages.iter().any(|s| {
             parse_pod_package(s)
                 .map(|p| p.name == name)
@@ -5464,7 +5585,7 @@ fn push_loaded_service_claims(
         if declared || name == new_name {
             continue;
         }
-        let meta = crate::deps::load_meta(&name).map_err(|e| {
+        let meta = crate::deps::load_meta_for(&name, constraint.as_deref()).map_err(|e| {
             miette::miette!(
                 "cannot check loaded '{}' for a service collision: {e}",
                 name
@@ -5721,7 +5842,7 @@ fn walk_post_state_services(
     let mut declared: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for spec_str in &decl.packages {
         let spec = parse_pod_package(spec_str)?;
-        let mut meta = crate::deps::load_meta(&spec.name).map_err(|e| {
+        let mut meta = load_spec_meta(&spec).map_err(|e| {
             miette::miette!(
                 "cannot validate service overrides against '{}': {e}",
                 spec.name
@@ -5734,7 +5855,7 @@ fn walk_post_state_services(
         resolve_service_overrides_against_meta(overrides, &meta, pod_name)?;
         record_declared_services(&mut declared, &meta);
     }
-    for name in loaded_package_names(root, decl)? {
+    for (name, constraint) in loaded_package_specs(root, decl)? {
         let own = decl
             .packages
             .iter()
@@ -5743,7 +5864,7 @@ fn walk_post_state_services(
         if own {
             continue;
         }
-        let meta = crate::deps::load_meta(&name).map_err(|e| {
+        let meta = crate::deps::load_meta_for(&name, constraint.as_deref()).map_err(|e| {
             miette::miette!("cannot validate service overrides against loaded '{name}': {e}")
         })?;
         resolve_service_overrides_against_meta(overrides, &meta, pod_name)?;
@@ -5904,12 +6025,18 @@ fn pod_build_prefix(
     if seeds.is_empty() {
         return Ok(None);
     }
-    let closure_names = crate::deps::resolve_dep_names(&seeds, true)?;
+    // Constraint-aware closure (ADR-0047): build-payload members load
+    // with the line their edge selected (`node@22` in a consumer's
+    // requires), so the merged prefix stages the declared line.
+    let closure = crate::deps::resolve_dep_specs(&seeds, true)?;
     let mut payloads = Vec::new();
-    for name in closure_names {
-        let dep_meta = crate::deps::load_meta(&name)?;
-        let snap = ensure_pod_dep_payload(store, &name, &dep_meta, building, false)?;
-        payloads.push(crate::build_prefix::Payload { pkg: name, snap });
+    for member in closure {
+        let dep_meta = crate::deps::load_meta_for(&member.name, member.constraint.as_deref())?;
+        let snap = ensure_pod_dep_payload(store, &member.name, &dep_meta, building, false)?;
+        payloads.push(crate::build_prefix::Payload {
+            pkg: member.name,
+            snap,
+        });
     }
     let merged = crate::build_prefix::materialize_merged_prefix(&payloads)?;
     if !payloads.is_empty() {
@@ -6061,7 +6188,7 @@ pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListE
             .map(|e| e.version.clone());
         let (version, pinned) = match pin {
             Some(v) => (Some(v), true),
-            None => match crate::deps::load_meta(&spec.name) {
+            None => match load_spec_meta(&spec) {
                 Ok(meta) => (Some(meta.version), false),
                 Err(_) => (None, false),
             },
@@ -6075,9 +6202,7 @@ pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListE
             .and_then(|v| v.as_bool())
         {
             Some(b) => b,
-            None => crate::deps::load_meta(&spec.name)
-                .map(|m| m.floating)
-                .unwrap_or(false),
+            None => load_spec_meta(&spec).map(|m| m.floating).unwrap_or(false),
         };
         entries.push(PodListEntry {
             spec: spec_str.clone(),
@@ -6362,7 +6487,7 @@ pub fn fetch_pod_deps(
             report.sideloaded.push(spec.name.clone());
             continue;
         }
-        let mut meta = crate::deps::load_meta(&spec.name)?;
+        let mut meta = load_spec_meta(&spec)?;
         if let Some(patch) = decl.overlay.get(&spec.name) {
             apply_overlay(&mut meta, patch)?;
         }
@@ -7341,6 +7466,57 @@ pod {
         // Non-numeric components compare as exact strings.
         assert!(version_matches_constraint("14a", "14a"));
         assert!(!version_matches_constraint("14b", "14a"));
+    }
+
+    // ── the generalized constraint guard (ADR-0047) ──
+
+    #[test]
+    fn spec_constraint_guard_accepts_a_matching_selection() {
+        // node@22 resolving to a 22.x recipe line satisfies the pin.
+        refuse_spec_constraint_violation("node", "22.23.3", "22").unwrap();
+        refuse_spec_constraint_violation("node", "26.7.0", "26").unwrap();
+    }
+
+    #[test]
+    fn spec_constraint_guard_refuses_a_violating_selection() {
+        // The sync-drop shape: a recipe whose selection drifted off the
+        // declared line must refuse BEFORE any write — never silently
+        // re-pin another line.
+        let err = refuse_spec_constraint_violation("node", "26.7.0", "22")
+            .expect_err("a violating selection must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("resolved version 26.7.0 violates the declared constraint '@22'"),
+            "refusal must name the version and the constraint: {msg}"
+        );
+        assert!(
+            msg.contains("ADR-0047"),
+            "refusal must point at the selection contract: {msg}"
+        );
+        // And the dotted-prefix matcher stays the grammar (no ranges).
+        assert!(refuse_spec_constraint_violation("node", "23.1", "22").is_err());
+    }
+
+    #[test]
+    fn constraint_violation_refusal_reports_the_sideload_path_message() {
+        // The sideload path keeps its report shape: the generalized
+        // guard's message still carries the substrings the #169 gates
+        // assert on ("violates the declared constraint '@N'" +
+        // "version X").
+        let decl = PodDeclaration {
+            packages: vec!["thing@2".to_string()],
+            ..Default::default()
+        };
+        let err = refuse_constraint_violation(&decl, "thing", "1.0")
+            .expect_err("a violating sideload must refuse");
+        assert!(format!("{err:#}").contains("violates the declared constraint '@2'"));
+        // Constraint-less and undeclared specs are no-ops.
+        let bare = PodDeclaration {
+            packages: vec!["thing".to_string()],
+            ..Default::default()
+        };
+        refuse_constraint_violation(&bare, "thing", "9.9").unwrap();
+        refuse_constraint_violation(&PodDeclaration::default(), "other", "1.0").unwrap();
     }
 
     // ── shellenv (issue #47) ──
