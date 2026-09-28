@@ -92,6 +92,9 @@ _Avoid_: global, profile, environment
 **Pod generation**: A pinned selection of one pod's packages + overlays + loaded pods at one point in time. Rollback switches that pod's `current` link only; it never reboots or touches system generations.
 _Avoid_: system generation, snapshot
 
+**Package line**: A version line of one package name, selected by declaring `name@constraint` (e.g. `node@22`) — the constraint threads into recipe evaluation and the one recipe builds whichever line the pod pins. One version of a name per pod, permanently; a second line coexists in another pod, never in the same one. (ADR-0047)
+_Avoid_: slot, instance, variant, channel, alternative, versioned formula, parallel install, suffixed sibling (the `node22` anti-pattern)
+
 **Pod service**: A long-running process declared by a package (`services = { … }`, options + defaults) and overridden per pod (`pod {}` options, `enabled` explicit), emitted into the generation by the services emitter through a backend — systemd user unit, launchd agent, or packaged-supervisor config (portable hosts) — pod-namespaced in each; `shuttle pod sync` activates by diff-and-restart. Declared, never verb-managed; the host manager's own CLI is the ad-hoc control surface. (ADR-0032)
 _Avoid_: service verb, daemon verb (for the declared surface; "supervisor" and "process manager" name the portable backend's runtime, not the service)
 
