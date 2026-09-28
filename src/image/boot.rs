@@ -49,8 +49,11 @@ pub(crate) const RECOVER_SLOTS_EXEC: &str = "/usr/bin/shuttle runtime recover-sl
 /// Emit the systemd-sysupdate transfer files into the staged rootfs
 /// (`/usr/lib/sysupdate.d/`), pre-populate, so both slots carry them.
 /// Called only for `disk.ab = true` images with a declared
-/// `update_source`. Artifacts share one `@v` version: `{v}/root.img`,
-/// `{v}/verity-hash.img`, `{v}/{name}_@v.efi` under the base URL.
+/// `update_source`. The Source MatchPatterns here (`root_@v_@u.img`,
+/// `verity-hash_@v_@u.img`, `{name}_@v.efi`) are the contract the
+/// release's served payloads satisfy: `image --release` publishes those
+/// exact files — `@v` the version, `@u` the roothash-derived PARTUUID —
+/// beside the signed SHA256SUMS that lists them (#274).
 pub(crate) fn write_sysupdate_transfers(
     root: &Path,
     image: &ImageDeclaration,

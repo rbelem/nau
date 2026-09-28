@@ -25,6 +25,22 @@ QEMU live-update axis (tampered manifest refused by name inside a
 booting guest, and the guest `gpg` binary's payload presence) remains
 deferred and is the next acceptance surface.
 
+Amended (2026-09-28, #274 — the update channel's missing producer): the
+"#267 publishes `SHA256SUMS.gpg`" sentence above ran ahead of the code —
+the release sums then covered only the installer media, so the payloads
+the transfers fetch had no producer and the channel could not complete
+an update. `image --release` now carves the build's own per-partition
+artifacts into the exact names the Source MatchPatterns fetch
+(`root_@v_@u.img`, `verity-hash_@v_@u.img`, `{name}_@v.efi` — the
+populated+verity-formatted root extent, its hash extent, the staged UKI;
+`@u` is the roothash-derived PARTUUID the build pinned on its slots)
+beside the media set, and the served `SHA256SUMS` covers media +
+payloads. With that, the sentence is true as written: the published
+detached signature IS the one systemd-sysupdate checks at update time.
+A consumer-side contract test parses the emitted drop-ins' Source
+MatchPatterns and refuses any divergence from the signed sums; the
+QEMU live-update axis stays the deferred end-to-end proof.
+
 ## Context
 
 ADR-0011 step (d) chose systemd-sysupdate for A/B updates and step (e) made a

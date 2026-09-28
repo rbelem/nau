@@ -15,8 +15,15 @@
 //!   manifest: the build's authoritative boot-facts manifest (roothash,
 //!   cmdline, UKI, ESP identity) with the operator's Ed25519 signature
 //!   attached.
+//! - the sysupdate transfer payloads (#274, images with an
+//!   `update_source`) — `root_<version>_<data-partuuid>.img`,
+//!   `verity-hash_<version>_<hash-partuuid>.img`, `<name>_<version>.efi`:
+//!   the build's own root/verity extents and staged UKI, copied under the
+//!   exact names the emitted transfers fetch (`@u` expands to the
+//!   roothash-derived PARTUUID). Every byte is a build output; nothing is
+//!   recomputed.
 //! - `SHA256SUMS` — coreutils-format (`<sha256>␠␠<name>`), one line per
-//!   media file, deterministic order.
+//!   published file (media set + payloads), deterministic order.
 //! - `SHA256SUMS.gpg` (#267) — the detached OpenPGP signature over the
 //!   SHA256SUMS manifest, signed by the ceremony key's sysupdate
 //!   identity: what systemd-sysupdate's `Verify=yes` checks at update
@@ -89,6 +96,54 @@ pub fn media_set(version: &str, arch: &str) -> [String; 2] {
     [format!("{stem}.img"), format!("{stem}.manifest.json")]
 }
 
+/// One per-partition update payload the release publishes (#274): an
+/// already-built artifact copied into the release directory under the
+/// name its sysupdate transfer fetches.
+#[derive(Debug, Clone)]
+pub struct ReleasePayload {
+    /// The transient build artifact — the populated+verity-formatted root
+    /// extent file, its verity-hash extent file, or the staged UKI.
+    pub src: PathBuf,
+    /// The published file name — the transfer's Source `MatchPattern`
+    /// with `@v`/`@u` expanded (version + roothash-derived PARTUUID).
+    pub name: String,
+}
+
+/// The payload set for a verity A/B build (#274): the populated+verity-
+/// formatted root extent, its verity-hash extent, and the staged UKI —
+/// every byte already built, nothing recomputed. The names follow the
+/// emitted transfers' Source MatchPatterns verbatim (`root_@v_@u.img`,
+/// `verity-hash_@v_@u.img`, `{name}_@v.efi`), with `@u` = the
+/// roothash-derived PARTUUID the build pinned on its slots
+/// ([`super::generation_guids_from_roothash`]) — the substitution
+/// systemd-sysupdate performs at update time. The consumer-side contract
+/// test below parses the actual drop-ins and refuses any divergence from
+/// the published sums.
+pub(crate) fn update_payloads(
+    image_name: &str,
+    version: &str,
+    root_extent: &Path,
+    hash_extent: &Path,
+    data_guid: &str,
+    hash_guid: &str,
+    uki_stage: &Path,
+) -> Vec<ReleasePayload> {
+    vec![
+        ReleasePayload {
+            src: root_extent.to_path_buf(),
+            name: format!("root_{version}_{data_guid}.img"),
+        },
+        ReleasePayload {
+            src: hash_extent.to_path_buf(),
+            name: format!("verity-hash_{version}_{hash_guid}.img"),
+        },
+        ReleasePayload {
+            src: uki_stage.to_path_buf(),
+            name: format!("{image_name}_{version}.efi"),
+        },
+    ]
+}
+
 /// Attach the operator's Ed25519 signature to an image manifest over its
 /// CANONICAL BODY — [`super::verify::image_manifest_canonical_bytes`], the
 /// typed manifest with the signatures map emptied. This is the exact
@@ -111,7 +166,8 @@ pub fn sign_image_manifest(
 
 /// Publish the release media set: sign a copy of the build's
 /// authoritative manifest, write it beside the (already release-named)
-/// image, write `SHA256SUMS` over both, and print the media set with the
+/// image, persist the sysupdate transfer payloads beside it (#274), write
+/// `SHA256SUMS` over everything, and print the media set with the
 /// blocking checklist. Resolves the operator key and trust paths from
 /// `$HOME`.
 pub fn publish(
@@ -119,9 +175,10 @@ pub fn publish(
     manifest: &ImageManifest,
     arch: &str,
     args: &ReleaseArgs,
+    payloads: &[ReleasePayload],
 ) -> miette::Result<()> {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-    publish_with(&home, img, manifest, arch, args)
+    publish_with(&home, img, manifest, arch, args, payloads)
 }
 
 /// [`publish`] with the key home explicit — the test seam (mirrors
@@ -132,6 +189,7 @@ pub(crate) fn publish_with(
     manifest: &ImageManifest,
     arch: &str,
     args: &ReleaseArgs,
+    payloads: &[ReleasePayload],
 ) -> miette::Result<()> {
     // The signing key is the same ceremony key the build already demanded
     // for update_source images: load fail-closed, never mint.
@@ -149,6 +207,10 @@ pub(crate) fn publish_with(
     let manifest_name = format!("{stem}.manifest.json");
     let manifest_json = write_published_manifest(dir, manifest, &kp, &manifest_name)?;
 
+    // The per-partition payloads land BEFORE the sums, so the sums only
+    // ever name files the directory actually serves.
+    publish_payloads(dir, payloads)?;
+
     // The media file name for the report + the sums body (the file name
     // must exist — the sums cover the image bytes).
     let img_name = media_file_name(img)?;
@@ -158,10 +220,11 @@ pub(crate) fn publish_with(
         &img_name,
         manifest_json.as_bytes(),
         &manifest_name,
+        payloads,
         &kp,
     )?;
 
-    report_media_set(dir, &img_name, &manifest_name, &kp);
+    report_media_set(dir, &img_name, &manifest_name, payloads, &kp);
     Ok(())
 }
 
@@ -173,6 +236,27 @@ fn media_file_name(img: &Path) -> miette::Result<String> {
         .ok_or_else(|| miette::miette!("release image {} has no file name", img.display()))
 }
 
+/// Persist the build's per-partition payloads into the release directory
+/// under their `@u`-PARTUUID names (#274). Fail-closed: a missing
+/// artifact refuses BEFORE any sums are written — a release that names a
+/// payload it cannot serve is not a release.
+fn publish_payloads(dir: &Path, payloads: &[ReleasePayload]) -> miette::Result<()> {
+    for payload in payloads {
+        let dst = dir.join(&payload.name);
+        std::fs::copy(&payload.src, &dst)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "publishing update payload {} from {}",
+                    payload.name,
+                    payload.src.display()
+                )
+            })?;
+        eprintln!("  ✓ update payload: {} (carved, not rebuilt)", payload.name);
+    }
+    Ok(())
+}
+
 /// Write `SHA256SUMS` + its detached OpenPGP signature
 /// ([`crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME`], #267) under
 /// `dir`, returning the sums body the signature covers.
@@ -182,9 +266,10 @@ fn write_sums_and_signature(
     img_name: &str,
     manifest_json: &[u8],
     manifest_name: &str,
+    payloads: &[ReleasePayload],
     kp: &crate::sign::KeyPair,
 ) -> miette::Result<String> {
-    let sums_body = sha256sums_body(img, img_name, manifest_json, manifest_name)?;
+    let sums_body = sha256sums_body(img, img_name, manifest_json, manifest_name, payloads)?;
     let sums_path = dir.join("SHA256SUMS");
     std::fs::write(&sums_path, &sums_body)
         .into_diagnostic()
@@ -218,17 +303,22 @@ fn write_published_manifest(
 }
 
 /// The coreutils-format SHA256SUMS body: one `<hash>␠␠<name>` line per
-/// media file (the image and the signed manifest — never itself), names
-/// sorted by the BTreeMap for a byte-stable file.
+/// published file — the image, the signed manifest, and every sysupdate
+/// transfer payload (#274; never the sums themselves) — names sorted by
+/// the BTreeMap for a byte-stable file.
 fn sha256sums_body(
     img: &Path,
     img_name: &str,
     manifest_json: &[u8],
     manifest_name: &str,
+    payloads: &[ReleasePayload],
 ) -> miette::Result<String> {
     let mut sums = std::collections::BTreeMap::new();
     sums.insert(img_name.to_string(), sha256_file(img)?);
     sums.insert(manifest_name.to_string(), sha256_bytes(manifest_json));
+    for payload in payloads {
+        sums.insert(payload.name.clone(), sha256_file(&payload.src)?);
+    }
     Ok(sums
         .iter()
         .map(|(name, hash)| format!("{hash}  {name}\n"))
@@ -237,7 +327,13 @@ fn sha256sums_body(
 
 /// The operator-facing media-set report plus the BLOCKING checklist items
 /// this flow deliberately does not run for you (ADR-0044 D8).
-fn report_media_set(dir: &Path, img_name: &str, manifest_name: &str, kp: &crate::sign::KeyPair) {
+fn report_media_set(
+    dir: &Path,
+    img_name: &str,
+    manifest_name: &str,
+    payloads: &[ReleasePayload],
+    kp: &crate::sign::KeyPair,
+) {
     let epoch = std::env::var("SOURCE_DATE_EPOCH").unwrap_or_else(|_| "<unset>".into());
     eprintln!(
         "  ✓ release media set in {} (SOURCE_DATE_EPOCH={epoch}):",
@@ -245,11 +341,24 @@ fn report_media_set(dir: &Path, img_name: &str, manifest_name: &str, kp: &crate:
     );
     eprintln!("      {img_name}");
     eprintln!("      {manifest_name}  (signed, key {})", kp.key_id());
+    for payload in payloads {
+        eprintln!("      {}  (sysupdate transfer payload)", payload.name);
+    }
     eprintln!("      SHA256SUMS");
     eprintln!(
         "      {}  (Verify=yes anchor: import-pubring.pgp in the base rootfs)",
         crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME
     );
+    if !payloads.is_empty() {
+        eprintln!(
+            "  ℹ update serving (sysupdate Path= semantics): the transfer payloads \
+             above and SHA256SUMS/{} are SIBLINGS — url-file transfers resolve \
+             SHA256SUMS and every MatchPattern name RELATIVE to the transfer's \
+             Path= (the update_source URL), so this directory is the served \
+             update root (#274).",
+            crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME
+        );
+    }
     eprintln!(
         "  ℹ release checklist (ADR-0044 D8) — BLOCKING before distribution: run \
          examples/rebuild-compare.sh for two-machine byte-identity; the ADR-0013 \
@@ -436,7 +545,21 @@ mod tests {
 
     // ── Publish: determinism + SHA256SUMS ──
 
-    fn publish_fixture(tag: &str) -> (tempfile::TempDir, PathBuf, PathBuf, ReleaseArgs) {
+    /// The release fixture's image identity — the same name/version the
+    /// drop-ins in the contract test are generated from, so the fixture
+    /// and the transfer emitters cannot drift apart unnoticed.
+    const FIXTURE_IMAGE_NAME: &str = "nau-demo";
+    const FIXTURE_VERSION: &str = "1.0.0";
+
+    fn publish_fixture(
+        tag: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        ReleaseArgs,
+        Vec<String>,
+    ) {
         let (_home_guard, home) = temp_home("home");
         let kp = test_kp(7);
         write_secret_key(&home, &kp);
@@ -448,27 +571,56 @@ mod tests {
         // points output_dir at the export tree) — mirror that.
         let img = dir.join("nau-cassini-1.0.0-amd64.img");
         std::fs::write(&img, b"whole-disk-bytes").unwrap();
+        // The build's transient per-partition artifacts (#274): the
+        // verity-formatted root extent, its hash extent, the staged UKI —
+        // deterministic bytes a republish reproduces.
+        let build = work.path().join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let root_extent = build.join("root.img");
+        std::fs::write(&root_extent, b"verity-formatted-root-extent").unwrap();
+        let hash_extent = build.join("verity-hash.img");
+        std::fs::write(&hash_extent, b"verity-hash-extent").unwrap();
+        let uki_stage = build.join(format!("{FIXTURE_IMAGE_NAME}_{FIXTURE_VERSION}.efi"));
+        std::fs::write(&uki_stage, b"uki-pe-bytes").unwrap();
+        // Payload names come from the REAL producer, never hand-rolled —
+        // the contract test pins them against the drop-ins.
+        let (data_guid, hash_guid) = super::generation_guids_from_roothash(ROOTHASH).unwrap();
+        let payloads = update_payloads(
+            FIXTURE_IMAGE_NAME,
+            FIXTURE_VERSION,
+            &root_extent,
+            &hash_extent,
+            &data_guid,
+            &hash_guid,
+            &uki_stage,
+        );
         let args = ReleaseArgs { dir: dir.clone() };
-        publish_with(&home, &img, &manifest(), "amd64", &args).unwrap();
-        (work, home, dir, args)
+        publish_with(&home, &img, &manifest(), "amd64", &args, &payloads).unwrap();
+        let names = payloads.iter().map(|p| p.name.clone()).collect();
+        (work, home, dir, args, names)
     }
 
     /// The ticket's unit verify at the release layer: the same build
     /// output published twice lands a BYTE-IDENTICAL media set — image,
-    /// signed manifest, SHA256SUMS, and its detached signature (#267; two
-    /// builds at the same epoch produce identical image bytes by the
-    /// build's own determinism; the release layer must not add variance).
+    /// signed manifest, SHA256SUMS, its detached signature (#267), and
+    /// the carved transfer payloads (#274; two builds at the same epoch
+    /// produce identical build bytes by the build's own determinism; the
+    /// release layer must not add variance).
     #[test]
     fn two_publishes_of_the_same_build_are_byte_identical() {
-        let (_g1, _h1, dir1, _a1) = publish_fixture("release-a");
-        let (_g2, _h2, dir2, _a2) = publish_fixture("release-b");
+        let (_g1, _h1, dir1, _a1, _p1) = publish_fixture("release-a");
+        let (_g2, _h2, dir2, _a2, _p2) = publish_fixture("release-b");
+        let (data_guid, hash_guid) = super::generation_guids_from_roothash(ROOTHASH).unwrap();
         for name in [
-            "nau-cassini-1.0.0-amd64.manifest.json",
-            "SHA256SUMS",
-            crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME,
+            "nau-cassini-1.0.0-amd64.manifest.json".to_string(),
+            "SHA256SUMS".to_string(),
+            crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME.to_string(),
+            format!("root_{FIXTURE_VERSION}_{data_guid}.img"),
+            format!("verity-hash_{FIXTURE_VERSION}_{hash_guid}.img"),
+            format!("{FIXTURE_IMAGE_NAME}_{FIXTURE_VERSION}.efi"),
         ] {
-            let a = std::fs::read(dir1.join(name)).unwrap();
-            let b = std::fs::read(dir2.join(name)).unwrap();
+            let a = std::fs::read(dir1.join(&name)).unwrap();
+            let b = std::fs::read(dir2.join(&name)).unwrap();
             assert_eq!(a, b, "{name} must be byte-identical across publishes");
         }
     }
@@ -480,7 +632,7 @@ mod tests {
         // anchors into the rootfs — the sign↔verify round-trip the device
         // will run (systemd-sysupdate Verify=yes), driven here through
         // the exact release output.
-        let (_g, _h, dir, _a) = publish_fixture("release");
+        let (_g, _h, dir, _a, _payload_names) = publish_fixture("release");
         let sums = std::fs::read(dir.join("SHA256SUMS")).unwrap();
         let sig = std::fs::read(dir.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME)).unwrap();
         assert!(!sig.is_empty(), "a published release carries a signature");
@@ -501,29 +653,34 @@ mod tests {
     }
 
     #[test]
-    fn sums_cover_exactly_the_media_set_in_coreutils_format() {
-        let (_g, _h, dir, _a) = publish_fixture("release");
+    fn sums_cover_exactly_the_release_files_in_coreutils_format() {
+        let (_g, _h, dir, _a, _payload_names) = publish_fixture("release");
         let body = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap();
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2, "one line per media file: {body}");
+        assert_eq!(lines.len(), 5, "media set + payloads: {body}");
         // Sorted (BTreeMap) order — the manifest line sorts before the
-        // image line.
+        // image line, the payloads slot in by name.
+        let (data_guid, hash_guid) = super::generation_guids_from_roothash(ROOTHASH).unwrap();
         let mut names = Vec::new();
         for line in &lines {
             let (hash, name) = line.split_once("  ").expect("two-space separator");
             assert_eq!(hash.len(), 64, "sha256 hex: {line}");
             assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
-            names.push(name);
+            names.push(name.to_string());
         }
         names.sort();
         assert_eq!(
             names,
             vec![
-                "nau-cassini-1.0.0-amd64.img",
-                "nau-cassini-1.0.0-amd64.manifest.json"
+                "nau-cassini-1.0.0-amd64.img".to_string(),
+                "nau-cassini-1.0.0-amd64.manifest.json".to_string(),
+                format!("{FIXTURE_IMAGE_NAME}_{FIXTURE_VERSION}.efi"),
+                format!("root_{FIXTURE_VERSION}_{data_guid}.img"),
+                format!("verity-hash_{FIXTURE_VERSION}_{hash_guid}.img"),
             ]
         );
-        // The sums are the real digests, independently recomputed.
+        // The sums are the real digests of the PUBLISHED files,
+        // independently recomputed.
         for line in &lines {
             let (hash, name) = line.split_once("  ").unwrap();
             let bytes = std::fs::read(dir.join(name)).unwrap();
@@ -537,8 +694,147 @@ mod tests {
     }
 
     #[test]
+    fn release_without_transfer_payloads_sums_only_the_media_set() {
+        // Non-sysupdate images (no A/B, no update_source) keep today's
+        // shape: an empty payload set publishes exactly the media set.
+        let (_home_guard, home) = temp_home("home");
+        write_secret_key(&home, &test_kp(7));
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().join("release");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("nau-cassini-1.0.0-amd64.img");
+        std::fs::write(&img, b"whole-disk-bytes").unwrap();
+        let args = ReleaseArgs { dir: dir.clone() };
+        publish_with(&home, &img, &manifest(), "amd64", &args, &[]).unwrap();
+        let body = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap();
+        assert_eq!(body.lines().count(), 2, "media-only sums: {body}");
+    }
+
+    /// THE contract (#274, council H2): every Source MatchPattern the
+    /// emitted sysupdate drop-ins carry must resolve to a file listed in
+    /// the SIGNED SHA256SUMS — and every payload the sums list must be
+    /// fetchable by some transfer. The drop-ins are generated by the same
+    /// emitters the build uses (never copied constants) and parsed the
+    /// way a device reads them, so a rename on EITHER side fails this
+    /// test instead of a fleet's update night.
+    #[test]
+    fn sysupdate_matchpatterns_are_all_listed_in_the_signed_sums() {
+        let (_g, _h, dir, _a, payload_names) = publish_fixture("release");
+
+        // The signed sums body — read from the published file its .gpg
+        // covers, signature verified against the ceremony anchor first.
+        let sums = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap();
+        let sig = std::fs::read(dir.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME)).unwrap();
+        let pubring = crate::sign::import_pubring_pgp(&test_kp(7)).unwrap();
+        crate::sign::verify_sysupdate_manifest_signature(&pubring, sums.as_bytes(), &sig)
+            .expect("the sums carrying the MatchPattern contract are the signed ones");
+        let names: Vec<&str> = sums
+            .lines()
+            .map(|l| l.split_once("  ").expect("two-space separator").1)
+            .collect();
+
+        // The exact drop-ins the build emits, from the emitters
+        // themselves.
+        let base_url = "https://download.example/missions/cassini/";
+        let drop_ins = [
+            super::root_transfer(FIXTURE_IMAGE_NAME, base_url),
+            super::hash_transfer(FIXTURE_IMAGE_NAME, base_url),
+            super::uki_transfer(FIXTURE_IMAGE_NAME, base_url),
+        ];
+
+        // @u expands to a roothash-derived PARTUUID — try both derived
+        // guids the build may have pinned, exactly what a device
+        // substitutes for its target slot.
+        let (data_guid, hash_guid) = super::generation_guids_from_roothash(ROOTHASH).unwrap();
+        let mut patterns = Vec::new();
+        for drop_in in &drop_ins {
+            for pattern in source_matchpatterns(drop_in) {
+                let mut expansions = vec![pattern.replace("@v", FIXTURE_VERSION)];
+                for guid in [&data_guid, &hash_guid] {
+                    expansions.push(pattern.replace("@v", FIXTURE_VERSION).replace("@u", guid));
+                }
+                assert!(
+                    expansions.iter().any(|e| names.contains(&e.as_str())),
+                    "drop-in MatchPattern {pattern:?} matches no file in the \
+                     signed SHA256SUMS ({names:?}) — the update channel would \
+                     refuse this transfer"
+                );
+                patterns.push(pattern);
+            }
+        }
+        assert_eq!(patterns.len(), 3, "one source pattern per transfer");
+
+        // Reverse direction: every PAYLOAD the release published is
+        // fetchable by some transfer — no un-downloadable strays. (The
+        // media set is installer territory: served beside the channel,
+        // never fetched by a transfer.)
+        for name in &payload_names {
+            let hit = patterns.iter().any(|p| {
+                let mut expansions = vec![p.replace("@v", FIXTURE_VERSION)];
+                for guid in [&data_guid, &hash_guid] {
+                    expansions.push(p.replace("@v", FIXTURE_VERSION).replace("@u", guid));
+                }
+                expansions.iter().any(|e| e == name)
+            });
+            assert!(
+                hit,
+                "published payload {name:?} is matched by no transfer's \
+                 MatchPattern — the channel cannot serve it"
+            );
+        }
+    }
+
+    /// Parse the `[Source]`-section `MatchPattern=` entries of a sysupdate
+    /// drop-in the way sysupdate.d(5) defines them: whitespace-separated
+    /// glob patterns, matched against the SHA256SUMS file names.
+    fn source_matchpatterns(drop_in: &str) -> Vec<String> {
+        let mut in_source = false;
+        let mut patterns = Vec::new();
+        for line in drop_in.lines() {
+            match line.trim() {
+                "[Source]" => in_source = true,
+                "[Target]" => in_source = false,
+                _ if in_source => {
+                    if let Some(value) = line.trim().strip_prefix("MatchPattern=") {
+                        patterns.extend(value.split_whitespace().map(str::to_string));
+                    }
+                }
+                _ => {}
+            }
+        }
+        patterns
+    }
+
+    #[test]
+    fn publish_refuses_a_missing_payload_before_any_sums_land() {
+        let (_home_guard, home) = temp_home("home");
+        write_secret_key(&home, &test_kp(7));
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().join("release");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("nau-cassini-1.0.0-amd64.img");
+        std::fs::write(&img, b"whole-disk-bytes").unwrap();
+        let args = ReleaseArgs { dir: dir.clone() };
+        let payloads = vec![ReleasePayload {
+            src: work.path().join("absent-root.img"),
+            name: "root_1.0.0_deadbeef.img".into(),
+        }];
+        let err = publish_with(&home, &img, &manifest(), "amd64", &args, &payloads)
+            .expect_err("a missing payload must refuse");
+        let flat: String = format!("{err:#}").chars().filter(|c| *c != '\n').collect();
+        assert!(
+            flat.contains("root_1.0.0_deadbeef.img"),
+            "the refusal names the payload: {err:#}"
+        );
+        assert!(
+            !args.dir.join("SHA256SUMS").exists(),
+            "a refused release writes no sums"
+        );
+    }
+
+    #[test]
     fn published_manifest_parses_back_with_the_signature() {
-        let (_g, _h, dir, _a) = publish_fixture("release");
+        let (_g, _h, dir, _a, _payload_names) = publish_fixture("release");
         let text =
             std::fs::read_to_string(dir.join("nau-cassini-1.0.0-amd64.manifest.json")).unwrap();
         let parsed: ImageManifest = serde_json::from_str(&text).unwrap();
@@ -555,7 +851,7 @@ mod tests {
         let args = ReleaseArgs {
             dir: work.path().join("release"),
         };
-        let err = publish_with(home.path(), &img, &manifest(), "amd64", &args)
+        let err = publish_with(home.path(), &img, &manifest(), "amd64", &args, &[])
             .expect_err("no key must refuse");
         let flat: String = format!("{err:#}").chars().filter(|c| *c != '\n').collect();
         assert!(

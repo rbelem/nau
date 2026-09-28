@@ -134,7 +134,9 @@ pub enum Command {
 
         /// Release mode (ADR-0044 D5/D8, #266): publish the deterministic
         /// media set — nau-<mission>-<version>-<arch>.img + the SIGNED
-        /// .manifest.json + SHA256SUMS — into this ADR-0033 D10 export
+        /// .manifest.json + SHA256SUMS, plus the sysupdate transfer
+        /// payloads signed into those sums (#274) when the image declares
+        /// an update_source — into this ADR-0033 D10 export
         /// tree directory. Requires a pinned SOURCE_DATE_EPOCH, an
         /// explicit --arch, exactly one disk image (--output-name), and
         /// the operator signing key (`shuttle key keygen`). Replaces
