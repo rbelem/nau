@@ -378,3 +378,40 @@ gated_test!(verify_image_refuses_a_truncated_medium, {
     // truncation refusal itself is unit-tested in src/image/verify.rs.
     assert!(flatten(&stderr).contains("interrupted"), "{stderr}");
 });
+
+// #288: the block-device axis. A loop device's inode carries st_size 0,
+// so the medium-size probe must lseek(SEEK_END), not stat — before the
+// fix every real /dev target falsely refused as "truncated medium".
+// `losetup` needs root (or CAP_SYS_ADMIN); skip cleanly when it cannot
+// attach (the gate runs unprivileged — this is the live-axis gate).
+gated_test!(verify_image_verifies_a_real_block_device, {
+    let fx = build_fixture();
+    let Ok(out) = Command::new("losetup")
+        .args(["--find", "--show", fx.device.to_str().unwrap()])
+        .output()
+    else {
+        eprintln!("skipping: losetup not runnable");
+        return;
+    };
+    if !out.status.success() {
+        eprintln!(
+            "skipping: losetup could not attach ({})",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return;
+    }
+    let loop_dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!loop_dev.is_empty(), "losetup --show printed the device");
+
+    let mut args = verify_args(&fx);
+    args[2] = loop_dev.clone();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (code, _stdout, stderr) = run_in(fx.dir.path(), &refs);
+
+    let _ = Command::new("losetup").args(["-d", &loop_dev]).status();
+    assert_eq!(
+        code,
+        Some(0),
+        "a real block device must verify end to end: {stderr}"
+    );
+});

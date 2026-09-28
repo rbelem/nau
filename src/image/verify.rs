@@ -147,13 +147,25 @@ pub(crate) fn image_manifest_canonical_bytes(manifest: &ImageManifest) -> miette
 /// manifests refuse outright — verify-image checks the PUBLISHED signed
 /// manifest, and the ADR-0024 §4 device policy (revoked-first, then
 /// ANY-anchor) is the trust rule, not the rollout-friendly keychain
-/// default.
+/// default. An unset HOME refuses too — a CWD-relative fallback would
+/// silently anchor trust from `./.config/shuttle/keys`.
 pub fn verify_manifest_signature(
     manifest: &ImageManifest,
     extra_key: Option<&Path>,
 ) -> miette::Result<String> {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-    verify_manifest_signature_at(manifest, extra_key, &crate::sign::keys_dir(&home))
+    let home = std::env::var("HOME").map_err(|_| {
+        miette::miette!(
+            "HOME is not set — refusing to guess where the operator keychain \
+             lives (a CWD-relative fallback would silently anchor trust from \
+             './.config/shuttle/keys'); set HOME or pass --key <public-key-file> \
+             explicitly"
+        )
+    })?;
+    verify_manifest_signature_at(
+        manifest,
+        extra_key,
+        &crate::sign::keys_dir(Path::new(&home)),
+    )
 }
 
 /// [`verify_manifest_signature`] against an explicit keychain directory —
@@ -237,7 +249,9 @@ pub(crate) struct GptTable {
 }
 
 /// Parse `sfdisk -J` JSON. Fail closed on any missing field — a guessed
-/// geometry would verify the wrong bytes.
+/// geometry would verify the wrong bytes. The sector size's JSON key is
+/// sfdisk's `sectorsize` (no hyphen); refusing when it is absent or
+/// non-numeric is what keeps a 4K-sector device from being read as 512.
 fn parse_gpt(json: &str) -> miette::Result<GptTable> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| miette::miette!("sfdisk -J printed unparseable JSON ({e})"))?;
@@ -245,9 +259,14 @@ fn parse_gpt(json: &str) -> miette::Result<GptTable> {
         .get("partitiontable")
         .ok_or_else(|| miette::miette!("sfdisk -J output carries no 'partitiontable'"))?;
     let sector_size = table
-        .get("sector-size")
+        .get("sectorsize")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(512);
+        .ok_or_else(|| {
+            miette::miette!(
+                "sfdisk -J output carries no valid 'sectorsize' — refusing to guess \
+                 the geometry (a guessed sector size would verify the wrong bytes)"
+            )
+        })?;
     let label = table
         .get("label")
         .and_then(serde_json::Value::as_str)
@@ -482,13 +501,29 @@ fn check_esp_identity(table: &GptTable, slot: &SlotAIdentity) -> miette::Result<
 
 // ── 3. Truncation ──
 
-/// Any partition extending past the end of the medium is an interrupted
-/// flash — refuse by name before any recompute.
-fn check_truncation(device: &Path, table: &GptTable) -> miette::Result<()> {
+/// The medium's size in bytes: `st_size` for regular files, a read-only
+/// lseek to the end for everything else — a block device's inode reports
+/// `st_size` 0, so trusting metadata alone would refuse every real
+/// `/dev` target as "truncated" (#288).
+fn medium_len(device: &Path) -> miette::Result<u64> {
     let meta = std::fs::metadata(device)
         .into_diagnostic()
         .wrap_err_with(|| format!("stating {}", device.display()))?;
-    let len = meta.len();
+    if meta.is_file() {
+        return Ok(meta.len());
+    }
+    let mut f = std::fs::File::open(device)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("opening {} read-only", device.display()))?;
+    f.seek(std::io::SeekFrom::End(0))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("sizing {} (seek to end)", device.display()))
+}
+
+/// Any partition extending past the end of the medium is an interrupted
+/// flash — refuse by name before any recompute.
+fn check_truncation(device: &Path, table: &GptTable) -> miette::Result<()> {
+    let len = medium_len(device)?;
     for e in &table.entries {
         let end = e
             .start_bytes
@@ -624,6 +659,17 @@ mod tests {
         }
     }
 
+    /// The crate-wide test-env lock: every `verify_device_with` test
+    /// resolves HOME through [`verify_manifest_signature`], and the
+    /// unset-HOME test below mutates that process-global — hold the lock
+    /// for the whole body so parallel tests never read a half-removed
+    /// HOME (the `test_env` discipline, issue #149).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The canonical test keypair (deterministic seed).
     fn test_kp(seed_byte: u8) -> crate::sign::KeyPair {
         let seed = [seed_byte; 32];
@@ -673,7 +719,7 @@ mod tests {
     fn golden_gpt_json(esp_uuid: &str) -> String {
         let (data_up, hash_up) = expected_guids();
         format!(
-            r#"{{"partitiontable": {{"label": "gpt", "sector-size": 512, "partitions": [
+            r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
                 {{"start": 2048, "size": 2048, "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "uuid": "{esp_uuid}", "name": "ESP"}},
                 {{"start": 4096, "size": 4096, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "{}"}},
                 {{"start": 8192, "size": 256, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "{}"}}
@@ -688,7 +734,7 @@ mod tests {
     fn foreign_gpt_json() -> String {
         let (_, hash_up) = expected_guids();
         format!(
-            r#"{{"partitiontable": {{"label": "gpt", "sector-size": 512, "partitions": [
+            r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
                 {{"start": 2048, "size": 2048, "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "uuid": "AABBCCDD-0011-2233-4455-667788990011", "name": "ESP"}},
                 {{"start": 4096, "size": 4096, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "00000000-1111-2222-3333-444444444444", "name": "other_2.0.0_a"}},
                 {{"start": 8192, "size": 256, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "{}"}}
@@ -699,7 +745,7 @@ mod tests {
 
     /// A GPT with only a swap partition — no root slot at all.
     fn rootless_gpt_json() -> String {
-        r#"{"partitiontable": {"label": "gpt", "sector-size": 512, "partitions": [
+        r#"{"partitiontable": {"label": "gpt", "sectorsize": 512, "partitions": [
                 {"start": 2048, "size": 2048, "type": "0657fd6d-a4ab-43c4-84e5-0933c84b4f4f", "uuid": "AABB-CCDD", "name": "swap"}
             ]}}"#
             .to_string()
@@ -707,7 +753,7 @@ mod tests {
 
     /// A DOS-labeled table — mission images are GPT-only.
     fn dos_gpt_json() -> String {
-        r#"{"partitiontable": {"label": "dos", "sector-size": 512, "partitions": []}}"#.to_string()
+        r#"{"partitiontable": {"label": "dos", "sectorsize": 512, "partitions": []}}"#.to_string()
     }
 
     /// A runner answering `sfdisk -J` with `body` and `veritysetup` with
@@ -771,6 +817,7 @@ mod tests {
 
     #[test]
     fn golden_manifest_verifies_and_records_the_key_id() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let device = device_file(dir.path());
         let kp = test_kp(7);
@@ -869,6 +916,27 @@ mod tests {
     }
 
     #[test]
+    fn unset_home_refuses_instead_of_falling_back_to_cwd_anchors() {
+        // A CWD-relative `./.config/shuttle/keys` would silently join the
+        // anchor set; the env read must refuse by name instead. Mutating
+        // the process-global HOME is why every verify test here holds
+        // [`env_lock`].
+        let _lock = env_lock();
+        let old = std::env::var("HOME").ok();
+        std::env::remove_var("HOME");
+        let m = signed(manifest(Some(ROOTHASH), None), &test_kp(7));
+        // Restore before unwrapping so a refusal-shape mismatch can never
+        // leak the removal past this test.
+        let result = verify_manifest_signature(&m, None);
+        match old {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("HOME is not set"), "{err}");
+    }
+
+    #[test]
     fn revoked_signer_refuses_before_the_anchor_check() {
         let dir = tempfile::tempdir().unwrap();
         let kp = test_kp(7);
@@ -887,6 +955,7 @@ mod tests {
 
     #[test]
     fn non_gpt_table_is_refused_by_name() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let device = device_file(dir.path());
         let kp = test_kp(7);
@@ -908,6 +977,7 @@ mod tests {
 
     #[test]
     fn wrong_device_refuses_on_the_root_partuuid() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let device = device_file(dir.path());
         let kp = test_kp(7);
@@ -933,6 +1003,7 @@ mod tests {
 
     #[test]
     fn medium_without_a_root_slot_refuses_by_name() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let device = device_file(dir.path());
         let kp = test_kp(7);
@@ -954,6 +1025,7 @@ mod tests {
 
     #[test]
     fn esp_partuuid_mismatch_refuses_by_name() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let device = device_file(dir.path());
         let kp = test_kp(7);
@@ -981,6 +1053,7 @@ mod tests {
 
     #[test]
     fn nil_esp_partuuid_skips_the_esp_check() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let device = device_file(dir.path());
         let kp = test_kp(7);
@@ -1000,6 +1073,7 @@ mod tests {
 
     #[test]
     fn foreign_partlabels_warn_but_partuuid_identity_holds() {
+        let _lock = env_lock();
         // Build-time fail-open metadata: a degraded sfdisk skipped the
         // PARTLABEL stamp — the verify must warn, not refuse.
         let dir = tempfile::tempdir().unwrap();
@@ -1012,7 +1086,7 @@ mod tests {
         std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
         let (data_up, hash_up) = expected_guids();
         let body = format!(
-            r#"{{"partitiontable": {{"label": "gpt", "sector-size": 512, "partitions": [
+            r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
                 {{"start": 4096, "size": 4096, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "_empty"}},
                 {{"start": 8192, "size": 256, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "_empty"}}
             ]}}}}"#
@@ -1033,6 +1107,7 @@ mod tests {
 
     #[test]
     fn truncated_medium_refuses_by_name() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let device = device_file(dir.path());
         // Shrink the medium under the hash partition's extent.
@@ -1062,6 +1137,7 @@ mod tests {
 
     #[test]
     fn flipped_byte_refuses_naming_the_slot_a_regions() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let device = device_file(dir.path());
         let kp = test_kp(7);
@@ -1120,6 +1196,7 @@ mod tests {
 
     #[test]
     fn manifest_without_roothash_refuses_by_name() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let device = device_file(dir.path());
         let kp = test_kp(7);
@@ -1160,13 +1237,30 @@ mod tests {
     #[test]
     fn gpt_parser_fails_closed_on_missing_sectors() {
         let err = parse_gpt(
-            r#"{"partitiontable": {"label": "gpt", "sector-size": 512, "partitions": [
+            r#"{"partitiontable": {"label": "gpt", "sectorsize": 512, "partitions": [
                 {"size": 100, "type": "x", "uuid": "y"}
             ]}}"#,
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("no valid 'start'"), "{err}");
+    }
+
+    #[test]
+    fn gpt_parser_refuses_a_missing_sector_size() {
+        // sfdisk omitting the field must NOT default to 512: on a
+        // 4K-sector device that would guess the geometry.
+        let err = parse_gpt(
+            r#"{"partitiontable": {"label": "gpt", "partitions": [
+                {"start": 2048, "size": 2048, "type": "x", "uuid": "y"}
+            ]}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("no valid 'sectorsize'") && err.contains("guess"),
+            "{err}"
+        );
     }
 
     #[test]
