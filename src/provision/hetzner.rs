@@ -29,8 +29,9 @@ use crate::provision::{
 /// with the #269 v2 TTL sweep (writer here, reader there):
 /// `shuttle-worker` is the marker/presence key; `shuttle-worker-ttl`
 /// carries the TTL expiry in EPOCH SECONDS UTC (label values reject `:`,
-/// so ISO-8601 never rides a label — that shape lives only in the in-guest
-/// marker file, which is a fallback COPY, not the source of truth).
+/// so ISO-8601 never rides a label; the in-guest marker copy carries the
+/// same epoch-seconds shape — the sweep's `is_epoch` parses decimal
+/// only).
 pub const WORKER_LABEL: &str = "shuttle-worker";
 pub const WORKER_TTL_LABEL: &str = "shuttle-worker-ttl";
 
@@ -92,7 +93,7 @@ impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
             host_public_key: &minted.public_line,
             operator_key: &self.operator_key,
             binary_url: &self.binary_url,
-            ttl_expiry_iso: &expiry_iso,
+            ttl_expiry_epoch: expiry_epoch,
         });
         let user_data_sha256 = crate::oci::sha256_hex(user_data.as_bytes());
 
@@ -115,7 +116,7 @@ impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
         // enters argv. Presence is checked before any API call.
         self.require_token()?;
 
-        let user_data_file = write_user_data_file(&user_data)?;
+        let user_data_file = write_user_data_file(dir.path(), &user_data)?;
 
         // Create + describe; every successfully created name rides
         // `created` so any later failure tears the whole set down.
@@ -128,12 +129,25 @@ impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
             &mut created,
         );
         if let Err(e) = result {
+            let mut torn_down = 0usize;
+            let mut stuck: Vec<&str> = Vec::new();
             for (name, _) in &created {
-                let _ = self.hcloud(&["server", "delete", name]);
+                if self.hcloud(&["server", "delete", name]).is_ok() {
+                    torn_down += 1;
+                } else {
+                    stuck.push(name);
+                }
+            }
+            if stuck.is_empty() {
+                return Err(miette::miette!(
+                    "provision: {e:#} — tore down {torn_down} created server(s), config untouched"
+                ));
             }
             return Err(miette::miette!(
-                "provision: {e:#} — tore down {} created server(s), config untouched",
-                created.len()
+                "provision: {e:#} — tore down {torn_down} created server(s), config untouched; \
+                 FAILED to delete {} — it is still billing; re-run 'shuttle workers destroy' \
+                 or let the TTL sweep reclaim it",
+                stuck.join(", ")
             ));
         }
         Ok(created
@@ -146,7 +160,7 @@ impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
             .collect())
     }
 
-    fn destroy(&self, name: &str, config: &Path) -> miette::Result<()> {
+    fn destroy(&self, name: &str, config: &Path) -> miette::Result<bool> {
         self.require_token()?;
         let ip = self.server_ipv4(name)?;
         // The #269 v2 pre-delete check: attached volumes must not vanish
@@ -156,20 +170,20 @@ impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
         // the config pin must stay.
         self.hcloud(&["server", "delete", name])?;
         match evict_worker_entry(config, &address_for(&ip)) {
-            Ok(true) => {}
-            Ok(false) => crate::output::warn(format!(
-                "destroy: server '{name}' deleted, but no managed workers entry pins {} — \
-                 config left untouched",
-                address_for(&ip)
-            )),
-            Err(e) => {
-                return Err(miette::miette!(
-                    "destroy: server '{name}' deleted, but the config entry could not be \
-                     evicted: {e:#}"
-                ))
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                crate::output::warn(format!(
+                    "destroy: server '{name}' deleted, but no managed workers entry pins {} — \
+                     config left untouched",
+                    address_for(&ip)
+                ));
+                Ok(false)
             }
+            Err(e) => Err(miette::miette!(
+                "destroy: server '{name}' deleted, but the config entry could not be \
+                 evicted: {e:#}"
+            )),
         }
-        Ok(())
     }
 }
 
@@ -298,19 +312,22 @@ fn server_name(i: u32) -> String {
     format!("shuttle-worker-{nanos:x}-{:02}", i + 1)
 }
 
-/// Stage the user-data blob for `hcloud --user-datafile`. The path is
-/// content-addressed so concurrent provisions never overwrite each other;
-/// the file holds only the worker HOST key (server-auth, blast radius one
-/// machine per ADR-0045) and rides the OS temp cleaner.
-fn write_user_data_file(user_data: &str) -> miette::Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
-        "shuttle-userdata-{}.yaml",
-        crate::oci::sha256_hex(user_data.as_bytes())
-            .get(..16)
-            .unwrap_or("x")
-    ));
+/// Stage the user-data blob for `hcloud --user-datafile` INSIDE the mint
+/// tempdir (`dir`), mode 0600. The blob carries the minted private host
+/// half (server-auth, blast radius one machine per ADR-0045), so it must
+/// never sit at a fixed world-readable temp path: the per-run tempdir
+/// keeps concurrent provisions isolated, 0600 keeps it private while it
+/// exists, and it dies with the keypair when the tempdir drops.
+fn write_user_data_file(dir: &Path, user_data: &str) -> miette::Result<PathBuf> {
+    let path = dir.join("user-data.yaml");
     std::fs::write(&path, user_data)
         .map_err(|e| miette::miette!("provision: cannot write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| miette::miette!("provision: cannot chmod 0600 {}: {e}", path.display()))?;
+    }
     Ok(path)
 }
 
