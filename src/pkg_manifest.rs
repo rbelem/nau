@@ -141,7 +141,9 @@ pub struct PackageManifest {
 /// Canonical signature input: the manifest serialized with `signature`
 /// emptied (see the module docs — a signature never covers itself; the
 /// emptied field keeps the bytes byte-stable, the same rule
-/// `crate::sign::canonical_bytes` applies to the image manifest).
+/// `crate::sign::eval_manifest_canonical_bytes` applies to the eval
+/// manifest and `crate::image::verify::image_manifest_canonical_bytes`
+/// to the image one).
 pub fn canonical_bytes(pkg: &PackageManifest) -> miette::Result<Vec<u8>> {
     let mut clean = pkg.clone();
     clean.signature = String::new();

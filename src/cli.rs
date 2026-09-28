@@ -132,6 +132,16 @@ pub enum Command {
         #[arg(long)]
         source_date_epoch: Option<String>,
 
+        /// Release mode (ADR-0044 D5/D8, #266): publish the deterministic
+        /// media set — nau-<mission>-<version>-<arch>.img + the SIGNED
+        /// .manifest.json + SHA256SUMS — into this ADR-0033 D10 export
+        /// tree directory. Requires a pinned SOURCE_DATE_EPOCH, an
+        /// explicit --arch, exactly one disk image (--output-name), and
+        /// the operator signing key (`shuttle key keygen`). Replaces
+        /// --output as the destination.
+        #[arg(long, value_name = "DIR", conflicts_with = "output")]
+        release: Option<String>,
+
         /// Path to lockfile (default: shuttle.lock).
         #[arg(long, default_value = "shuttle.lock")]
         lockfile: String,
@@ -1746,6 +1756,32 @@ mod tests {
             }
             _ => panic!("expected Image"),
         }
+    }
+
+    #[test]
+    fn test_image_release_flag() {
+        match parse_build(&["shuttle", "image", "--release", "site/nau"]) {
+            Command::Image { release, .. } => {
+                assert_eq!(release.as_deref(), Some("site/nau"));
+            }
+            _ => panic!("expected Image"),
+        }
+    }
+
+    #[test]
+    fn test_image_release_conflicts_with_output() {
+        let result = Cli::try_parse_from([
+            "shuttle",
+            "image",
+            "--release",
+            "site/nau",
+            "--output",
+            "elsewhere",
+        ]);
+        assert!(
+            result.is_err(),
+            "--release replaces --output — combined use must fail at parse time"
+        );
     }
 
     // ── New flag tests ──
