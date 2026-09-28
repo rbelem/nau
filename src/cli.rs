@@ -800,7 +800,7 @@ pub enum WorkersCommand {
     /// public half into a machine-managed `workers` entry in shuttle.lua
     /// BEFORE first use — never ssh-keyscan (ADR-0045).
     Provision {
-        /// Provider driver (currently: hetzner, aws).
+        /// Provider driver (currently: hetzner, aws, gcp).
         #[arg(long)]
         provider: String,
 
@@ -837,6 +837,14 @@ pub enum WorkersCommand {
         #[arg(long, value_name = "USD_H")]
         max_price: Option<String>,
 
+        /// GCP spelling of --spot (gcp): a preemptible VM. Eviction is
+        /// T5 worker loss — re-dispatched, never migrated (ADR-0040
+        /// Amendment 1). Preemptible pricing is fixed per machine type,
+        /// so --max-price does not apply (refused by the gcp provider).
+        /// (`--spot` is the provider-independent spelling — same request.)
+        #[arg(long)]
+        preemptible: bool,
+
         /// Print the plan (type, location, count, TTL, user-data hash) and
         /// exit — resolved fully, no API call, no token needed.
         #[arg(long)]
@@ -850,7 +858,7 @@ pub enum WorkersCommand {
     /// Destroy one provisioned worker: removes the server and evicts its
     /// managed `workers` entry (operator-owned text is never rewritten).
     Destroy {
-        /// Provider driver (currently: hetzner).
+        /// Provider driver (currently: hetzner, aws, gcp).
         #[arg(long)]
         provider: String,
 
