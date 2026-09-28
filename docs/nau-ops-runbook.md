@@ -339,23 +339,26 @@ the successor kuma runs.
 
 > **DECISION SLOT B — RESOLVED (2026-09-29, operator): multi-notify
 > fan-out.** Alerts go to ALL configured mechanisms — first-class kuma push
-> and ntfy topics, extensible to further destinations — designed and landed
-> under #296 alongside #287's sweep axes. Until #296 lands, the interim
-> destination is the existing generic `SHUTTLE_SWEEP_ALERT_CMD` hook
-> (single command; chain notifiers there if needed). ADR-0046's monitoring
-> destination question is answered by the same design.
+> and ntfy topics, extensible to further destinations — LANDED under #296
+> alongside #287's sweep axes: the sweep's destination list is
+> `SHUTTLE_SWEEP_KUMA_URLS` + `SHUTTLE_SWEEP_NTFY_URLS` +
+> `SHUTTLE_SWEEP_ALERT_CMD` (the extensibility seam; a command string per
+> alert, "$1" = the one-line summary). Every alert fans out to all of
+> them; one destination failing is named and never silences the others
+> (the run fails when it does — an unacked alert is itself alarm-worthy).
+> ADR-0046's monitoring destination question is answered by the same
+> design.
 
-## 5. TTL sweep install (#269 — by reference)
+## 5. TTL sweep install (#269 + #287/#296 — by reference)
 
-Artifacts live in THIS repo and land via #269's lane — reference only,
-no content duplicated here (and not present in this worktree at
-authoring time):
+Artifacts live in THIS repo:
 
-- `scripts/shuttle-worker-ttl-sweep` — the sweep script (hcloud CLI only;
-  independent of shuttle code).
+- `scripts/shuttle-worker-ttl-sweep` — the sweep script (POSIX sh;
+  independent of shuttle code; fake-CLI test suite beside it,
+  `shuttle-worker-ttl-sweep-test.sh`).
 - `scripts/systemd-user/` — the workstation systemd **user** units,
   mirroring the zet repo's `update-timer.yml` pattern (systemd user
-  timer, not cron; workstation-only — the credential lives there).
+  timer, not cron; workstation-only — the credentials live there).
 
 Install sequence (unit names as #269 lands them; the steps are the
 standard user-unit path the `update-timer.yml` pattern uses — copy units
@@ -369,21 +372,71 @@ scripts/shuttle-worker-ttl-sweep                     # first run: dry-run IS the
                                                      # default for two weeks (#269)
 ```
 
-Behaviour contract it must satisfy (#269): list servers labeled
-`shuttle-worker`; destroy only on the three-condition match — label AND a
+### 5.1 Axes (#287)
+
+The hcloud axis is ALWAYS on (the #269 v2 rules, unchanged). The four
+non-hcloud axes are OPT-IN — each queries the exact `shuttle-worker` /
+`shuttle-worker-ttl` (epoch-seconds expiry) tags its provider stamps at
+create time, runs the SAME v2 rule engine (tag → in-guest marker copy →
+48h-alert/72h-destroy age floor), and mirrors its provider's own destroy
+verb and residual warnings:
+
+| axis | enable | CLI (+creds the CLI reads from the env/config) | destroy | residuals named before/after |
+|---|---|---|---|---|
+| hcloud | always on | `hcloud` (`HCLOUD_TOKEN`, §1) | `server delete` — **BLOCKED** unless `volume list --server X` is empty (checked in dry-run too) | — (the gate IS the check) |
+| aws | `SHUTTLE_SWEEP_AWS=1` | `aws` (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`; region from `AWS_DEFAULT_REGION`/profile — the create's `--region` discipline) | `ec2 terminate-instances` | attached volumes with `DeleteOnTermination=false` (warn, terminate proceeds); a FAILED volume check blocks |
+| gcp | `SHUTTLE_SWEEP_GCP=1` | `gcloud` (ADC / `gcloud auth`; project+zone from the CLI config) | `compute instances delete --zone Z` (zone from the listing) | disks with `autoDelete` off (warn, delete proceeds); a FAILED describe blocks |
+| azure | `SHUTTLE_SWEEP_AZURE=1` | `az` (`az login` state; subscription from the CLI config) | `vm delete --resource-group RG` | disks with `deleteOption != Delete` (warn, proceeds); post-delete unattached NIC + public-IP orphans (public IPs bill); a FAILED disk check blocks |
+| scaleway | `SHUTTLE_SWEEP_SCW=1` | `scw` (`SCW_ACCESS_KEY`/`SCW_SECRET_KEY`; zone from `SCW_DEFAULT_ZONE`/config — the create's `-z` discipline) | `instance server delete server-id=ID` | attached volumes (a delete only DETACHES them — they keep billing; warn, proceeds); a FAILED get blocks |
+
+Axis failure semantics: a named per-axis failure (missing binary/jq on an
+enabled axis, enumerate/parse/delete API failure) alerts, counts, fails
+the run (rc 1) — and NEVER blocks the other axes. An axis that is not
+enabled is logged in the summary, never alerted: a provider not in use
+must not page daily. Provider credential setup itself is out of scope
+here (per-provider worker accounts are #271-shaped; the sweep only needs
+READ+DELETE on the worker resources).
+
+### 5.2 Alert fan-out (#296 — DECISION SLOT B resolved)
+
+Every alert (sweep API failure, volume-blocked destroy, 48h floor,
+enabled-axis skip, notify failure) fans out to ALL configured
+destinations; each destination's failure is named, counted, and fails the
+run — and never blocks or silences the others:
+
+```bash
+# in ~/.config/shuttle/worker-ttl-sweep.env (the unit's EnvironmentFile)
+SHUTTLE_SWEEP_KUMA_URLS="https://kuma.example/api/push/TOKEN1 https://kuma.example/api/push/TOKEN2"
+SHUTTLE_SWEEP_NTFY_URLS="https://ntfy.example/shuttle-workers"
+SHUTTLE_SWEEP_ALERT_CMD='curl -s --data-binary "$1" https://example/hook'   # extensibility seam
+```
+
+- **kuma push** — alerts POST `status=down&msg=<alert>`; every CLEAN run
+  (rc 0) sends `status=up` (the machinery-alive heartbeat a push monitor
+  needs — create one push monitor per URL and the first missed sweep
+  pages by itself).
+- **ntfy** — alerts are POSTed as the topic message body; no clean-run
+  pings (a notification channel, not a status channel).
+- **`SHUTTLE_SWEEP_ALERT_CMD`** — the #269 seam, unchanged: evaluated
+  once per alert with the one-line summary as `"$1"`.
+
+Dependencies: `curl` (only when a kuma/ntfy destination is configured)
+and `jq` (only for enabled non-hcloud axes).
+
+Behaviour contract (#269, unchanged for hcloud): list workers labeled
+`shuttle-worker`; destroy only on the three-condition match — tag AND a
 parseable TTL marker AND past due (TTL markers are hcloud labels in epoch
-seconds — label values reject `:` so ISO-8601 will not fit; writer is
-#194, reader is this sweep — INFRA D5); refuse on a missing marker; run
-in **dry-run for the first two weeks** (log what it would destroy), then
-flip the flag to enforce (flag mechanism per #269's landed script; the
-two-week clock starts at install); **alert on any hcloud API failure** —
-a skipped sweep is the failure mode — via DECISION SLOT B's destination.
+seconds — label values reject `:` so ISO-8601 will not fit; writer is the
+provisioner, reader is this sweep — INFRA D5); refuse to widen a destroy
+on missing data; run in **dry-run for the first two weeks** (log what it
+would destroy), then flip the flag to enforce (the two-week clock starts
+at install); **alert on any provider API failure** — a skipped sweep is
+the failure mode — via the §5.2 fan-out.
 
 The sweep runs with the §1 worker token in the environment
 (`HCLOUD_TOKEN` from DECISION SLOT A storage), never `TOFU_INPUTS`
 (#271). TTL defaults behind the markers: 4h burst / 24h index runs /
-48h-alert + 72h-destroy floor (PROVIDERS §2; owned by #194's writer
-side).
+48h-alert + 72h-destroy floor (PROVIDERS §2; owned by the writers).
 
 ## 6. Order of operations
 
