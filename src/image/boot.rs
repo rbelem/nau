@@ -836,24 +836,24 @@ pub(crate) const VERIFY_STANZA: &str = "\
 # unconditionally regardless. See sysupdate.d(5) Verify=.
 Verify=yes";
 
-/// Embed the device trust anchor for `Verify=yes`: the ceremony key's
-/// OpenPGP identity at `/usr/lib/systemd/import-pubring.pgp`
+/// Embed the device trust SET for `Verify=yes`: the ceremony's OpenPGP
+/// identities at `/usr/lib/systemd/import-pubring.pgp`
 /// ([`crate::sign::IMPORT_PUBRING_EMBED_PATH`]), the exact file
 /// systemd-sysupdate hands to gpg (sysupdate.d(5)). The bytes derive
-/// deterministically from the ceremony key
-/// ([`crate::sign::import_pubring_pgp`]) — same key, same keyring, every
-/// build — and the file lands BEFORE root populate + dm-verity so it is
-/// hashed into the tree the device will trust.
-pub(crate) fn embed_import_pubring(root: &Path, kp: &crate::sign::KeyPair) -> miette::Result<()> {
+/// deterministically from the ceremony trust set
+/// ([`crate::sign::sysupdate_pubring_pgp`] — active key + designated
+/// successor + rotated-out keys during the overlap window, #290) — same
+/// keys, same keyring, every build — and the file lands BEFORE root
+/// populate + dm-verity so it is hashed into the tree the device will
+/// trust.
+pub(crate) fn embed_import_pubring(root: &Path, pubring: &[u8]) -> miette::Result<()> {
     let path = root.join(crate::sign::IMPORT_PUBRING_EMBED_PATH);
     std::fs::create_dir_all(path.parent().expect("pubring path has a parent")).into_diagnostic()?;
-    let bytes = crate::sign::import_pubring_pgp(kp)
-        .wrap_err("deriving the sysupdate import-pubring.pgp anchor")?;
-    std::fs::write(&path, &bytes)
+    std::fs::write(&path, pubring)
         .into_diagnostic()
         .wrap_err_with(|| format!("writing /{}", crate::sign::IMPORT_PUBRING_EMBED_PATH))?;
     eprintln!(
-        "  ✓ sysupdate trust anchor: /{} (gpg verifies SHA256SUMS.gpg, Verify=yes)",
+        "  ✓ sysupdate trust anchor set: /{} (gpg verifies SHA256SUMS.gpg, Verify=yes)",
         crate::sign::IMPORT_PUBRING_EMBED_PATH
     );
     Ok(())

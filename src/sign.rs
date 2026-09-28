@@ -645,13 +645,19 @@ pub fn rotate(home: &Path, manifest: &mut ImageManifest) -> miette::Result<KeyPa
 /// Requires an existing `secret-key`; refuses to overwrite an existing
 /// `secret-key.new`. The successor is NOT trusted until promoted (its
 /// `keys/<id>.pub` anchor is installed by [`promote_rotation_key`]).
+///
+/// The sysupdate half of the transition (issue #290): both keys' seeds
+/// exist only right now — the old one dies at `promote`, the successor's
+/// moves into `secret-key` — so each key's pubring fragment is persisted
+/// HERE, while it can be certified. The next build embeds the SET
+/// {current, designated successor} ([`sysupdate_pubring_pgp`]).
 pub fn mint_rotation_key(home: &Path) -> miette::Result<KeyPair> {
-    if load_secret_key(home)?.is_none() {
-        return Err(miette::miette!(
+    let old = load_secret_key(home)?.ok_or_else(|| {
+        miette::miette!(
             "no signing key at {} — nothing to rotate (run `shuttle key keygen` first)",
             secret_key_path(home).display()
-        ));
-    }
+        )
+    })?;
     let successor = derive_pair(&read_urandom32()?);
     let new_path = rotation_key_path(home);
     if new_path.exists() {
@@ -661,6 +667,9 @@ pub fn mint_rotation_key(home: &Path) -> miette::Result<KeyPair> {
             new_path.display()
         ));
     }
+    let dir = keys_dir(home);
+    write_sysupdate_fragment(&old, &dir)?;
+    write_sysupdate_fragment(&successor, &dir)?;
     write_secret_key_at(&new_path, &successor)?;
     eprintln!(
         "  ✓ rotation key minted: {} (key id {}) — not trusted until promoted",
@@ -702,6 +711,22 @@ pub fn promote_rotation_key(home: &Path, dir: &Path) -> miette::Result<KeyPair> 
             new_path.display()
         )
     })?;
+
+    // The sysupdate half of the promotion (issue #290): the successor's
+    // pubring fragment is (re)written from the parsed `.new` — the bytes
+    // are deterministic, so this repairs a fragment missing from an older
+    // ceremony — and the rotated-out key's fragment is repaired while its
+    // secret is still on disk (the rename below destroys it).
+    write_sysupdate_fragment(&successor, dir)?;
+    match load_secret_key(home) {
+        Ok(Some(old)) => write_sysupdate_fragment(&old, dir)?,
+        Ok(None) | Err(_) => eprintln!(
+            "  ⚠ cannot read the rotated-out key's secret at {} — its sysupdate pubring \
+             fragment may be missing and the next image build will refuse until the old \
+             anchor is revoked (`shuttle key revoke <old-key-id>`)",
+            secret_key_path(home).display()
+        ),
+    }
 
     let active = secret_key_path(home);
     std::fs::rename(&new_path, &active)
@@ -759,9 +784,7 @@ pub fn revoke_local(dir: &Path, key_id: &str) -> miette::Result<()> {
         ));
     }
     if pub_path.exists() {
-        std::fs::remove_file(&pub_path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("removing {}", pub_path.display()))?;
+        remove_anchor_and_fragment(dir, key_id)?;
     }
     if !listed {
         write_revoked_keys(dir, &{
@@ -771,6 +794,24 @@ pub fn revoke_local(dir: &Path, key_id: &str) -> miette::Result<()> {
         })?;
     }
     eprintln!("  ✓ key {key_id} revoked: anchor removed, listed in revoked-keys");
+    Ok(())
+}
+
+/// Remove a key's trust anchor and its sysupdate pubring fragment — a
+/// revoked key never re-enters the trust set an image embeds (issue
+/// #290). The fragment may be absent (pre-#290 keychains); the anchor
+/// must exist (the caller checked).
+fn remove_anchor_and_fragment(dir: &Path, key_id: &str) -> miette::Result<()> {
+    let pub_path = dir.join(format!("{key_id}.pub"));
+    std::fs::remove_file(&pub_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("removing {}", pub_path.display()))?;
+    let fragment = sysupdate_fragment_path(dir, key_id);
+    if fragment.exists() {
+        std::fs::remove_file(&fragment)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("removing {}", fragment.display()))?;
+    }
     Ok(())
 }
 
@@ -1576,14 +1617,19 @@ fn from_hex32(s: &str) -> miette::Result<[u8; 32]> {
 // verifies the signature with gpg against the keyring at
 // `/usr/lib/systemd/import-pubring.pgp` inside the running rootfs
 // (sysupdate.d(5) — the device's verity-protected copy of the file is the
-// trust anchor). This layer produces exactly those artifacts from the
-// ONE ceremony key:
+// trust anchor). This layer produces exactly those artifacts:
 //
-// - [`import_pubring_pgp`] — the device trust anchor: a transferable
-//   OpenPGP public key whose secret half IS the ceremony seed (the v4
-//   EdDSALegacy framing of the same ed25519 key that signs image
-//   manifests). One secret, two encodings; a rotation or revocation of
-//   the ceremony key is the same act for both.
+// - [`sysupdate_pubring_pgp`] — the device trust SET: the active ceremony
+//   key, its designated successor while a rotation is pending, and every
+//   rotated-out key whose anchor still stands (the overlap window,
+//   #290). Each member's secret half IS a ceremony seed (the v4
+//   EdDSALegacy framing of the same ed25519 keys that sign image
+//   manifests) — one secret, two encodings — but the SET, not the single
+//   key, is the unit of trust: the channel can only deliver new trust
+//   through images the receiver already accepts.
+// - [`import_pubring_pgp`] — ONE member's identity (key packet + user id
+//   + certification); also the legacy single-key spelling of the pubring
+//   that [`sysupdate_pubring_pgp`] reduces to when no rotation exists.
 // - [`sign_sysupdate_manifest`] — the `SHA256SUMS.gpg` detached
 //   signature over the manifest's RAW bytes. No canonicalization exists
 //   or may exist here: the signed body is byte-for-byte what sysupdate
@@ -1738,6 +1784,177 @@ pub fn import_pubring_pgp(kp: &KeyPair) -> miette::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The stored sysupdate pubring fragment for one ceremony key:
+/// `<keys-dir>/<key-id>.pgp`. The `.pgp` suffix keeps it invisible to the
+/// `.pub`-filtered Ed25519 anchor loaders ([`Keychain::load_dir`]).
+fn sysupdate_fragment_path(keys_dir: &Path, key_id: &str) -> PathBuf {
+    keys_dir.join(format!("{key_id}.pgp"))
+}
+
+/// Load the pending rotation successor (`secret-key.new`).
+/// `Ok(None)` when absent — no rotation is pending. A present-but-
+/// unparseable file is a named error: corrupt ceremony state must never
+/// silently drop the designated successor from the trust set.
+fn load_rotation_key(home: &Path) -> miette::Result<Option<KeyPair>> {
+    let path = rotation_key_path(home);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("reading {}", path.display()))?;
+    parse_secret_key(&text)
+        .map(Some)
+        .wrap_err_with(|| format!("parsing {}", path.display()))
+}
+
+/// Persist `kp`'s sysupdate pubring fragment (the [`import_pubring_pgp`]
+/// bytes) beside the trust anchors. The bytes are deterministic → the
+/// write is an idempotent overwrite. Only possible while `kp`'s SEED
+/// exists — the rotation ceremony writes each key's fragment at exactly
+/// those moments (mint: old + successor; promote: repairs from `.new`).
+fn write_sysupdate_fragment(kp: &KeyPair, keys_dir: &Path) -> miette::Result<()> {
+    std::fs::create_dir_all(keys_dir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("creating {}", keys_dir.display()))?;
+    let path = sysupdate_fragment_path(keys_dir, &kp.key_id());
+    let bytes = import_pubring_pgp(kp)?;
+    std::fs::write(&path, bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Load and PROVE one stored pubring fragment: it must parse as a
+/// transferable public key, hold a valid self-certification, and carry
+/// EXACTLY the anchor key's material (the same 32-byte Ed25519 public
+/// point — the same seed's framing, hence the same fingerprint the epoch
+/// contract pins). Any deviation is a named refusal, never a skip: a
+/// trust set that cannot be fully certified must not be silently
+/// narrowed to its remaining members.
+fn load_sysupdate_fragment(
+    keys_dir: &Path,
+    key_id: &str,
+    anchor_public: &[u8; 32],
+) -> miette::Result<Vec<u8>> {
+    use pgp::composed::Deserializable;
+    use pgp::types::{EddsaLegacyPublicParams, KeyDetails, PublicParams};
+
+    let path = sysupdate_fragment_path(keys_dir, key_id);
+    let bytes = std::fs::read(&path).map_err(|e| {
+        miette::miette!(
+            "sysupdate pubring fragment for key {key_id} is missing at {} — the sysupdate \
+             trust set is incomplete (fail closed); it is minted by `shuttle key rotate` \
+             while that key is active, so re-run the rotation for it, or \
+             `shuttle key revoke {key_id}` if the key is retired: {e}",
+            path.display()
+        )
+    })?;
+    let tpk = SignedPublicKey::from_bytes(std::io::Cursor::new(&bytes)).map_err(|e| {
+        miette::miette!(
+            "sysupdate pubring fragment {} does not parse as an OpenPGP public key — \
+             refusing (fail closed): {e}",
+            path.display()
+        )
+    })?;
+    tpk.verify_bindings().map_err(|e| {
+        miette::miette!(
+            "sysupdate pubring fragment {} fails its own self-certification — refusing \
+             (fail closed): {e}",
+            path.display()
+        )
+    })?;
+    match tpk.primary_key.public_params() {
+        PublicParams::EdDSALegacy(EddsaLegacyPublicParams::Ed25519 { key }) => {
+            if key.as_bytes() != anchor_public {
+                return Err(miette::miette!(
+                    "sysupdate pubring fragment {} carries different key material than \
+                     anchor {key_id}.pub — refusing (fail closed)",
+                    path.display()
+                ));
+            }
+        }
+        _ => {
+            return Err(miette::miette!(
+                "sysupdate pubring fragment {} is not an Ed25519 (EdDSALegacy) key — \
+                 refusing (fail closed)",
+                path.display()
+            ));
+        }
+    }
+    Ok(bytes)
+}
+
+/// The device trust SET for `Verify=yes` (issue #290): every key the
+/// ceremony has put in the trust path, each as a transferable OpenPGP
+/// identity, concatenated into the single keyring embedded at
+/// [`IMPORT_PUBRING_EMBED_PATH`] — the sysupdate analogue of the Ed25519
+/// trusted-keys directory. Members:
+///
+/// - the ACTIVE ceremony key (always; derived fresh from its seed),
+/// - the DESIGNATED successor while a rotation is pending
+///   (`secret-key.new`, derived fresh from its seed),
+/// - every trusted anchor `keys/<id>.pub` (the rotated-out keys of the
+///   overlap window), from their stored fragments `keys/<id>.pgp`.
+///
+/// # The overlap window (ADR-0024 §4, mirrored from the Ed25519 ledger)
+///
+/// `shuttle key rotate` OPENS it: the successor is designated, and the
+/// NEXT build embeds {current, successor} — while releases still SIGN
+/// under the current key. That pre-provisioning is what makes rotation
+/// survivable at all: the update channel can only deliver trust through
+/// images the receiver already trusts, so a successor that first appears
+/// in the pubring after `promote` (when it is already the signing key)
+/// could never reach a fielded device — every post-promote release would
+/// be refused by a single-key device, and the fleet would be bricked
+/// until reflash (the exact failure this closes). `shuttle key promote`
+/// flips the SIGNING key without changing pubring membership; `shuttle
+/// key revoke <old>` CLOSES the window — the old anchor and fragment
+/// drop out and the set narrows to the successor. (The Ed25519 keychain
+/// deliberately stays stricter — a successor is not trusted until
+/// promoted — because its verify path is operator-side and does not need
+/// to bootstrap itself through the channel it protects.)
+///
+/// Deterministic (sorted key ids, epoch-stable identities per
+/// [`SYSUPDATE_OPENPGP_EPOCH`]). Fail closed: a trusted anchor whose
+/// fragment is missing, unparsable, unproven, or does not match its
+/// anchor's material refuses the whole set ([`load_sysupdate_fragment`]).
+pub fn sysupdate_pubring_pgp(active: &KeyPair, home: &Path) -> miette::Result<Vec<u8>> {
+    let keys_dir = keys_dir(home);
+    // The trusted anchors are the SAME set the Ed25519 embed copies —
+    // `keys/*.pub`, malformed anchors refusing (fail closed).
+    let chain = Keychain::load_dir(&keys_dir)?;
+    let mut publics: std::collections::BTreeMap<String, [u8; 32]> =
+        std::collections::BTreeMap::new();
+    for (id, public) in chain.entries_for_verify() {
+        publics.entry(id).or_insert(public);
+    }
+
+    // (key id, identity bytes) per member, sorted by id for byte-stable
+    // keyrings.
+    let mut members: Vec<(String, Vec<u8>)> = Vec::new();
+    if let Some(pending) = load_rotation_key(home)? {
+        let id = pending.key_id();
+        if id != active.key_id() && !publics.contains_key(&id) {
+            members.push((id, import_pubring_pgp(&pending)?));
+        }
+    }
+    for (id, public) in &publics {
+        if *id == active.key_id() {
+            continue;
+        }
+        members.push((id.clone(), load_sysupdate_fragment(&keys_dir, id, public)?));
+    }
+    members.push((active.key_id(), import_pubring_pgp(active)?));
+    members.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = Vec::new();
+    for (_, identity) in &members {
+        out.extend_from_slice(identity);
+    }
+    Ok(out)
+}
+
 /// Sign the sysupdate manifest ([`SYSUPDATE_MANIFEST_NAME`], raw bytes)
 /// under the ceremony key's OpenPGP identity; returns the detached
 /// signature bytes for [`SYSUPDATE_MANIFEST_SIGNATURE_NAME`].
@@ -1782,11 +1999,14 @@ pub fn sign_sysupdate_manifest(kp: &KeyPair, manifest_sums: &[u8]) -> miette::Re
 
 /// Device-side enforcement, mirrored from what systemd-sysupdate's gpg
 /// step does with `Verify=yes`: parse the trust anchor
-/// ([`import_pubring_pgp`] bytes, fail closed on anything unparsable or
-/// without a valid self-certification), parse the detached signature
-/// (an empty or unparsable one is an UNSIGNED manifest — a named
-/// refusal, never a pass), and verify it over the manifest's raw bytes.
-/// A failed check names [`SYSUPDATE_MANIFEST_NAME`] — the operator sees
+/// ([`sysupdate_pubring_pgp`] bytes) as a SET of transferable public
+/// keys — fail closed on anything unparsable, on a set carrying secret
+/// material, on an empty set, or on any member without a valid
+/// self-certification — parse the detached signature (an empty or
+/// unparsable one is an UNSIGNED manifest — a named refusal, never a
+/// pass), and verify it over the manifest's raw bytes under ANY member
+/// (the overlap window: gpg accepts signatures from either key). A
+/// failed check names [`SYSUPDATE_MANIFEST_NAME`] — the operator sees
 /// WHICH artifact refused. Returns the verifying key's OpenPGP
 /// fingerprint.
 pub fn verify_sysupdate_manifest_signature(
@@ -1804,34 +2024,75 @@ pub fn verify_sysupdate_manifest_signature(
              verify against import-pubring.pgp; ADR-0024 §4)"
         ));
     }
-    let anchor = SignedPublicKey::from_bytes(std::io::Cursor::new(pubring)).map_err(|e| {
-        miette::miette!(
-            "import-pubring.pgp does not parse as an OpenPGP public key — refusing \
-                 to verify {SYSUPDATE_MANIFEST_NAME} against a broken trust anchor: {e}"
-        )
-    })?;
-    anchor.verify_bindings().map_err(|e| {
-        miette::miette!(
-            "import-pubring.pgp fails its own self-certification — refusing to verify \
-             {SYSUPDATE_MANIFEST_NAME} against an unproven trust anchor: {e}"
-        )
-    })?;
+    let anchors = parse_pubring_set(pubring)?;
+    for anchor in &anchors {
+        anchor.verify_bindings().map_err(|e| {
+            miette::miette!(
+                "import-pubring.pgp carries a key that fails its own self-certification — \
+                 refusing to verify {SYSUPDATE_MANIFEST_NAME} against an unproven trust \
+                 anchor: {e}"
+            )
+        })?;
+    }
     let detached = DetachedSignature::from_bytes(std::io::Cursor::new(signature)).map_err(|e| {
         miette::miette!(
             "{SYSUPDATE_MANIFEST_SIGNATURE_NAME} does not parse as an OpenPGP signature — \
              treating {SYSUPDATE_MANIFEST_NAME} as unsigned (fail closed): {e}"
         )
     })?;
-    detached
-        .verify(&anchor.primary_key, manifest_sums)
-        .map_err(|_| {
+    for anchor in &anchors {
+        if detached.verify(&anchor.primary_key, manifest_sums).is_ok() {
+            return Ok(anchor.primary_key.fingerprint().to_string());
+        }
+    }
+    Err(miette::miette!(
+        "{SYSUPDATE_MANIFEST_NAME} signature verification FAILED — the manifest \
+         does not match {SYSUPDATE_MANIFEST_SIGNATURE_NAME} under any key in \
+         import-pubring.pgp; refusing a tampered sysupdate manifest (ADR-0024 §4)"
+    ))
+}
+
+/// Parse the embedded trust anchor as a SET of transferable PUBLIC keys
+/// (issue #290): one OpenPGP identity per ceremony key, back to back.
+/// Every parse error, a secret key (a device anchor is public material —
+/// a secret packet here is a leak AND a broken anchor), or a set with no
+/// members at all is a named refusal — an anchor that cannot be fully
+/// parsed never verifies anything.
+fn parse_pubring_set(pubring: &[u8]) -> miette::Result<Vec<SignedPublicKey>> {
+    use pgp::composed::PublicOrSecret;
+
+    let members = PublicOrSecret::from_bytes_many(std::io::Cursor::new(pubring)).map_err(|e| {
+        miette::miette!(
+            "import-pubring.pgp does not parse as an OpenPGP public key set — refusing \
+             to verify {SYSUPDATE_MANIFEST_NAME} against a broken trust anchor: {e}"
+        )
+    })?;
+    let mut anchors = Vec::new();
+    for parsed in members {
+        let key = parsed.map_err(|e| {
             miette::miette!(
-                "{SYSUPDATE_MANIFEST_NAME} signature verification FAILED — the manifest \
-                 does not match {SYSUPDATE_MANIFEST_SIGNATURE_NAME} under any key in \
-                 import-pubring.pgp; refusing a tampered sysupdate manifest (ADR-0024 §4)"
+                "import-pubring.pgp does not parse as an OpenPGP public key set — refusing \
+                 to verify {SYSUPDATE_MANIFEST_NAME} against a broken trust anchor: {e}"
             )
         })?;
-    Ok(anchor.primary_key.fingerprint().to_string())
+        match key {
+            PublicOrSecret::Public(tpk) => anchors.push(tpk),
+            PublicOrSecret::Secret(_) => {
+                return Err(miette::miette!(
+                    "import-pubring.pgp carries a SECRET key — a device trust anchor is \
+                     public material only; refusing to verify {SYSUPDATE_MANIFEST_NAME} \
+                     (fail closed)"
+                ));
+            }
+        }
+    }
+    if anchors.is_empty() {
+        return Err(miette::miette!(
+            "import-pubring.pgp carries no OpenPGP keys — refusing an EMPTY trust set \
+             (fail closed): {SYSUPDATE_MANIFEST_NAME} cannot verify"
+        ));
+    }
+    Ok(anchors)
 }
 
 #[cfg(test)]
@@ -3219,6 +3480,282 @@ mod tests {
         assert!(
             format!("{err:#}").contains("import-pubring.pgp"),
             "the refusal names the anchor: {err:#}"
+        );
+    }
+
+    // ── Sysupdate pubring trust SET — the rotation story (#290) ──
+
+    /// The parsed members of a pubring blob: (fingerprint, Ed25519 public
+    /// bytes) per transferable key, refusing on anything unparsable.
+    fn pubring_members(pubring: &[u8]) -> Vec<[u8; 32]> {
+        use pgp::composed::PublicOrSecret;
+        use pgp::types::{EddsaLegacyPublicParams, KeyDetails, PublicParams};
+        PublicOrSecret::from_bytes_many(std::io::Cursor::new(pubring))
+            .unwrap()
+            .map(|k| k.unwrap())
+            .map(|k| match k {
+                PublicOrSecret::Public(tpk) => match tpk.primary_key.public_params() {
+                    PublicParams::EdDSALegacy(EddsaLegacyPublicParams::Ed25519 { key }) => {
+                        *key.as_bytes()
+                    }
+                    other => panic!("non-Ed25519 member: {other:?}"),
+                },
+                PublicOrSecret::Secret(_) => panic!("secret key in a device pubring"),
+            })
+            .collect()
+    }
+
+    /// Drive the real ceremony to the POST-PROMOTION overlap state: `old`
+    /// created and anchored (as `key keygen` does), successor minted
+    /// (fragments persisted), successor promoted (active; old anchor left
+    /// standing). Returns the temp home (keep alive!), the keys dir, and
+    /// both keys.
+    fn promoted_overlap_fixture() -> (tempfile::TempDir, PathBuf, KeyPair, KeyPair) {
+        let home = tempfile::tempdir().unwrap();
+        let old = create_secret_key(home.path()).unwrap();
+        let dir = keys_dir(home.path());
+        install_public_key(&old, &dir).unwrap();
+        let successor = mint_rotation_key(home.path()).unwrap();
+        promote_rotation_key(home.path(), &dir).unwrap();
+        (home, dir, old, successor)
+    }
+
+    fn openpgp_public(kp: &KeyPair) -> [u8; 32] {
+        kp.public
+    }
+
+    /// THE #290 overlap-window round-trip: after rotate+promote, the
+    /// embedded pubring is the SET {old, successor} and the device-side
+    /// verify accepts a signature from EITHER key, while a third/
+    /// unknown key still refuses. Both ceremony fragments were persisted
+    /// at mint time and re-derived identically.
+    #[test]
+    fn sysupdate_trust_set_accepts_signatures_from_both_overlap_keys() {
+        let (home, dir, old, successor) = promoted_overlap_fixture();
+        let pubring = sysupdate_pubring_pgp(&successor, home.path()).unwrap();
+
+        // Two members, and they are exactly the two ceremony keys'
+        // identities (order: sorted by key id).
+        let mut members = pubring_members(&pubring);
+        members.sort();
+        let mut want = vec![openpgp_public(&old), openpgp_public(&successor)];
+        want.sort();
+        assert_eq!(members, want, "the set is exactly the old + successor keys");
+
+        // Each member's fragment is byte-identical to a fresh derivation
+        // — the stored bytes ARE the epoch-stable identity.
+        assert_eq!(
+            std::fs::read(dir.join(format!("{}.pgp", old.key_id()))).unwrap(),
+            import_pubring_pgp(&old).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(dir.join(format!("{}.pgp", successor.key_id()))).unwrap(),
+            import_pubring_pgp(&successor).unwrap()
+        );
+
+        // Signatures from BOTH keys verify against the set.
+        let sums = sysupdate_sums();
+        let old_sig = sign_sysupdate_manifest(&old, &sums).unwrap();
+        let new_sig = sign_sysupdate_manifest(&successor, &sums).unwrap();
+        verify_sysupdate_manifest_signature(&pubring, &sums, &old_sig).unwrap();
+        verify_sysupdate_manifest_signature(&pubring, &sums, &new_sig).unwrap();
+
+        // A third/unknown key still refuses, by name.
+        let (_, stranger) = temp_keypair();
+        let stranger_sig = sign_sysupdate_manifest(&stranger, &sums).unwrap();
+        let err = verify_sysupdate_manifest_signature(&pubring, &sums, &stranger_sig).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("SHA256SUMS"), "{msg}");
+        assert!(msg.contains("FAILED"), "{msg}");
+
+        // A tampered manifest refuses under the set too.
+        let mut tampered = sums.clone();
+        let last = tampered.len() - 2;
+        tampered[last] ^= 0x01;
+        let err = verify_sysupdate_manifest_signature(&pubring, &tampered, &new_sig).unwrap_err();
+        assert!(format!("{err:#}").contains("FAILED"), "{err:#}");
+    }
+
+    /// The ROLLOUT half of #290: the window opens at `key rotate` —
+    /// BEFORE promotion — because the transition release must be signed
+    /// under the key fielded devices already trust while ALREADY carrying
+    /// the successor's identity. A pubring built pre-promotion accepts
+    /// both the old-key signature (what devices verify today) and the
+    /// successor's (what they must accept after `promote`).
+    #[test]
+    fn designated_successor_rides_the_pubring_before_promotion() {
+        let home = tempfile::tempdir().unwrap();
+        let old = create_secret_key(home.path()).unwrap();
+        let successor = mint_rotation_key(home.path()).unwrap();
+        let dir = keys_dir(home.path());
+
+        // Active is STILL the old key; the successor is designated only
+        // (secret-key.new, no anchor yet).
+        assert_eq!(load_secret_key(home.path()).unwrap().unwrap(), old);
+
+        let pubring = sysupdate_pubring_pgp(&old, home.path()).unwrap();
+        let mut members = pubring_members(&pubring);
+        members.sort();
+        let mut want = vec![openpgp_public(&old), openpgp_public(&successor)];
+        want.sort();
+        assert_eq!(
+            members, want,
+            "pre-promotion set is the current + designated keys"
+        );
+
+        let sums = sysupdate_sums();
+        verify_sysupdate_manifest_signature(
+            &pubring,
+            &sums,
+            &sign_sysupdate_manifest(&old, &sums).unwrap(),
+        )
+        .expect("the transition release (signed under the current key) verifies");
+        verify_sysupdate_manifest_signature(
+            &pubring,
+            &sums,
+            &sign_sysupdate_manifest(&successor, &sums).unwrap(),
+        )
+        .expect("the pubring pre-provisions the designated successor");
+    }
+
+    /// Backward compatibility pinned byte-for-byte: with no rotation in
+    /// flight, the trust set IS the legacy single-key pubring
+    /// ([`import_pubring_pgp`]) — the single-key case works exactly as
+    /// today.
+    #[test]
+    fn sysupdate_trust_set_without_a_rotation_is_the_legacy_single_key_pubring() {
+        let (home, kp) = temp_keypair();
+        // No keys-dir contents at all (no anchor even).
+        let legacy = import_pubring_pgp(&kp).unwrap();
+        assert_eq!(
+            sysupdate_pubring_pgp(&kp, home.path()).unwrap(),
+            legacy,
+            "no anchors, no pending rotation → exactly the legacy bytes"
+        );
+        // With the anchor installed (the usual keygen state): same.
+        install_public_key(&kp, &keys_dir(home.path())).unwrap();
+        assert_eq!(sysupdate_pubring_pgp(&kp, home.path()).unwrap(), legacy);
+        // And the device verify path is unchanged for it.
+        let sums = sysupdate_sums();
+        verify_sysupdate_manifest_signature(
+            &legacy,
+            &sums,
+            &sign_sysupdate_manifest(&kp, &sums).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Post-overlap semantics, mirroring the Ed25519 closed set: `key
+    /// revoke <old>` closes the window — the old anchor AND fragment drop
+    /// out, the set narrows to the successor alone, and an old-key
+    /// signature refuses.
+    #[test]
+    fn sysupdate_trust_set_narrows_when_the_overlap_window_closes() {
+        let (home, dir, old, successor) = promoted_overlap_fixture();
+        let full = sysupdate_pubring_pgp(&successor, home.path()).unwrap();
+        assert_eq!(pubring_members(&full).len(), 2);
+
+        revoke_local(&dir, &old.key_id()).unwrap();
+        assert!(
+            !dir.join(format!("{}.pgp", old.key_id())).exists(),
+            "revocation drops the fragment: the key cannot re-enter the set"
+        );
+
+        let narrowed = sysupdate_pubring_pgp(&successor, home.path()).unwrap();
+        assert_eq!(
+            narrowed,
+            import_pubring_pgp(&successor).unwrap(),
+            "post-revoke the set is the successor's solo (legacy-shaped) pubring"
+        );
+        assert_ne!(full, narrowed);
+
+        let sums = sysupdate_sums();
+        verify_sysupdate_manifest_signature(
+            &narrowed,
+            &sums,
+            &sign_sysupdate_manifest(&successor, &sums).unwrap(),
+        )
+        .unwrap();
+        let err = verify_sysupdate_manifest_signature(
+            &narrowed,
+            &sums,
+            &sign_sysupdate_manifest(&old, &sums).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("FAILED"),
+            "old-key signature refuses after the window closes: {err:#}"
+        );
+    }
+
+    /// Fail closed: a trusted anchor whose fragment is tampered (unparsable
+    /// bytes, or a DIFFERENT key's identity under the anchor's id) refuses
+    /// the whole set — never a silent skip that would narrow trust.
+    #[test]
+    fn sysupdate_trust_set_refuses_tampered_or_mismatched_fragments() {
+        let (home, dir, old, successor) = promoted_overlap_fixture();
+        let fragment = dir.join(format!("{}.pgp", old.key_id()));
+
+        std::fs::write(&fragment, b"not openpgp").unwrap();
+        let err = sysupdate_pubring_pgp(&successor, home.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not parse"),
+            "unparsable fragment named: {err:#}"
+        );
+
+        // A valid-but-foreign identity under old's id: parses and
+        // self-certifies, but the material does not match the anchor.
+        let (_, impostor) = temp_keypair();
+        std::fs::write(&fragment, import_pubring_pgp(&impostor).unwrap()).unwrap();
+        let err = sysupdate_pubring_pgp(&successor, home.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("different key material"), "{msg}");
+        assert!(msg.contains(&old.key_id()), "names the anchor: {msg}");
+    }
+
+    /// Fail closed: a trusted anchor with NO fragment refuses the build,
+    /// naming the key and both remedies (re-run the rotation while the
+    /// key is active, or revoke it).
+    #[test]
+    fn sysupdate_trust_set_refuses_a_missing_fragment_by_name() {
+        let (home, dir, old, successor) = promoted_overlap_fixture();
+        std::fs::remove_file(dir.join(format!("{}.pgp", old.key_id()))).unwrap();
+        let err = sysupdate_pubring_pgp(&successor, home.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing"), "{msg}");
+        assert!(msg.contains(&old.key_id()), "names the key: {msg}");
+        assert!(msg.contains("revoke"), "names the remedy: {msg}");
+    }
+
+    /// Fail closed (device side): a pubring with no keys at all refuses —
+    /// an empty trust set verifies nothing, even a valid signature.
+    #[test]
+    fn empty_pubring_set_is_a_named_refusal() {
+        let (_, kp) = temp_keypair();
+        let sums = sysupdate_sums();
+        let sig = sign_sysupdate_manifest(&kp, &sums).unwrap();
+        let err = verify_sysupdate_manifest_signature(b"", &sums, &sig).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("import-pubring.pgp"), "{msg}");
+        assert!(msg.contains("EMPTY"), "{msg}");
+    }
+
+    /// #290 on #289's contract: the whole trust SET is epoch-stable —
+    /// stored fragments are fixed bytes and the fresh derivations pin
+    /// [`SYSUPDATE_OPENPGP_EPOCH`], so the embedded keyring is
+    /// byte-identical across release epochs.
+    #[test]
+    fn sysupdate_trust_set_is_epoch_stable_across_release_epochs() {
+        let (home, _dir, _old, successor) = promoted_overlap_fixture();
+        let at_epoch = |secs: u64| {
+            with_source_date_epoch(secs, || {
+                sysupdate_pubring_pgp(&successor, home.path()).unwrap()
+            })
+        };
+        assert_eq!(
+            at_epoch(1_700_000_000),
+            at_epoch(1_900_000_000),
+            "the trust set must not move with SOURCE_DATE_EPOCH (#290 on #289's contract)"
         );
     }
 }
