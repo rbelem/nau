@@ -2,17 +2,23 @@
 //!
 //! Builds a REAL whole-disk GPT image file — sfdisk lays out ESP + root +
 //! verity-hash partitions with the build's type GUIDs and the identity
-//! PARTUUIDs derived from a real `veritysetup format` roothash — signs an
-//! image manifest over it in-process, and drives the real binary against
-//! the file. Then each refusal gate: a flipped byte, a wrong device, an
-//! unsigned manifest, a truncated medium.
+//! PARTUUIDs derived from a real `veritysetup format` roothash, and the
+//! ESP extent holds a REAL mtools FAT carrying the generation's UKI
+//! (#284: the ESP is the one region dm-verity does not cover, so the
+//! signed manifest pins its UKI digest and the verb recomputes it) —
+//! signs an image manifest over it in-process, and drives the real
+//! binary against the file. Then each refusal gate: a flipped byte, a
+//! wrong device, an unsigned manifest, a truncated medium, and the #284
+//! ESP shapes — tampered UKI bytes, a replaced ESP, a flipped ESP from
+//! another generation, the boot-count-suffixed name sysupdate installs.
 //!
 //! This is the deterministic half of the live axis: a FILE is a valid
 //! `--device` (the verb opens it read-only), so everything short of
 //! flashing an actual USB stick runs here. Gated on sfdisk + veritysetup
-//! (the build-host tools the suite spawns).
+//! + mtools (the build-host tools the suite spawns).
 
 use std::io::{Read, Seek, Write};
+use std::path::Path;
 use std::process::Command;
 
 // ── Gating ──
@@ -27,7 +33,9 @@ fn has_tool(tool: &str) -> bool {
 }
 
 fn chain_available() -> bool {
-    ["sfdisk", "veritysetup"].iter().all(|t| has_tool(t))
+    ["sfdisk", "veritysetup", "mformat", "mmd", "mcopy"]
+        .iter()
+        .all(|t| has_tool(t))
 }
 
 macro_rules! gated_test {
@@ -64,6 +72,91 @@ fn test_kp(seed_byte: u8) -> shuttle::sign::KeyPair {
         seed,
         public: sk.verifying_key().to_bytes(),
     }
+}
+
+/// The fixture UKI's filename on the ESP — the build's
+/// `{name}_{version}.efi` shape, and the name the fixture manifest pins.
+const UKI_NAME: &str = "nau-demo_1.0.0.efi";
+
+/// Deterministic UKI content — enough bytes to cross several FAT cluster
+/// boundaries, stable across runs (the digest is pinned in the manifest).
+fn uki_bytes() -> Vec<u8> {
+    (0..16384usize).map(|i| (i % 251) as u8).collect()
+}
+
+/// The fixture UKI's sha3-384, hashed through the same seam the binary
+/// uses ([`shuttle::store::sha3_384_file`]) so a divergence there fails
+/// here too.
+fn uki_digest_of(bytes: &[u8], dir: &Path) -> String {
+    let path = dir.join("uki-digest.payload");
+    std::fs::write(&path, bytes).unwrap();
+    shuttle::store::sha3_384_file(&path).unwrap()
+}
+
+/// Run one mtools/sfdisk tool, asserting success — the fixture's raw
+/// tool calls.
+fn run_tool(tool: &str, args: &[&str]) {
+    let out = Command::new(tool).args(args).output().unwrap_or_else(|e| {
+        panic!("{tool} failed to spawn: {e}");
+    });
+    assert!(
+        out.status.success(),
+        "{tool} {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A REAL FAT ESP image at `path`: mformat + mmd + mcopy (the build's
+/// unmounted populate shape), carrying `names` under EFI/Linux/ with
+/// [`uki_bytes`] content. Returns the bytes of the installed UKI.
+fn write_fat_esp(path: &Path, names: &[&str]) -> Vec<u8> {
+    std::fs::write(path, vec![0u8; (ESP_SIZE * SECTOR) as usize]).unwrap();
+    run_tool(
+        "mformat",
+        &[
+            "-i",
+            path.to_str().unwrap(),
+            "::",
+            "-C",
+            "-T",
+            &format!("{}", ESP_SIZE * SECTOR / 512),
+            "-F",
+        ],
+    );
+    run_tool("mmd", &["-i", path.to_str().unwrap(), "::/EFI"]);
+    run_tool("mmd", &["-i", path.to_str().unwrap(), "::/EFI/Linux"]);
+    let payload = path.with_extension("uki-payload");
+    std::fs::write(&payload, uki_bytes()).unwrap();
+    for name in names {
+        run_tool(
+            "mcopy",
+            &[
+                "-i",
+                path.to_str().unwrap(),
+                payload.to_str().unwrap(),
+                &format!("::/EFI/Linux/{name}"),
+            ],
+        );
+    }
+    let _ = std::fs::remove_file(&payload);
+    uki_bytes()
+}
+
+/// Replace one UKI name's content on an existing ESP FAT (mcopy
+/// overwrite) — the tampered-UKI shape.
+fn overwrite_esp_uki(esp: &Path, name: &str, content: &[u8], dir: &Path) {
+    let payload = dir.join("overwrite.payload");
+    std::fs::write(&payload, content).unwrap();
+    run_tool(
+        "mcopy",
+        &[
+            "-o",
+            "-i",
+            esp.to_str().unwrap(),
+            payload.to_str().unwrap(),
+            &format!("::/EFI/Linux/{name}"),
+        ],
+    );
 }
 
 /// GUIDs a roothash derives (data, hash), dashed — the same derivation
@@ -165,13 +258,20 @@ fn build_fixture() -> Fixture {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // 3. Splice the formatted regions into their extents.
+    // 3. The ESP extent: a real FAT carrying the generation's UKI — the
+    //    content the signed manifest pins (#284).
+    let esp_file = dir.path().join("esp.part");
+    write_fat_esp(&esp_file, &[UKI_NAME]);
+    let uki_digest = uki_digest_of(&uki_bytes(), dir.path());
+    splice(&device, &esp_file, ESP_START * SECTOR);
+
+    // 4. Splice the formatted regions into their extents.
     splice(&device, &root_file, ROOT_START * SECTOR);
     splice(&device, &hash_file, HASH_START * SECTOR);
 
-    // 4. The published pair: the signed manifest + the downloaded anchor.
+    // 5. The published pair: the signed manifest + the downloaded anchor.
     let manifest = dir.path().join("nau-demo-1.0.0-amd64.manifest.json");
-    write_signed_manifest(&manifest, &roothash);
+    write_signed_manifest(&manifest, &roothash, Some(&uki_digest));
     let key = dir.path().join("downloaded.pub");
     std::fs::write(&key, shuttle::sign::public_key_file(&test_kp(7))).unwrap();
 
@@ -195,7 +295,9 @@ fn splice(dst: &std::path::Path, src: &std::path::Path, offset: u64) {
 /// The manifest shuttle publishes beside a mission image, signed over its
 /// canonical body (the typed manifest serialized with the signatures map
 /// emptied) — the exact shape `shuttle image --release` attaches (#266).
-fn write_signed_manifest(path: &std::path::Path, roothash: &str) {
+/// `uki_sha3_384` rides the canonical body (#284); `None` models a
+/// manifest predating ESP coverage.
+fn write_signed_manifest(path: &std::path::Path, roothash: &str, uki_sha3_384: Option<&str>) {
     use shuttle::image::{ImageManifest, ImageSnapEntry};
     let manifest = ImageManifest {
         name: "nau-demo".into(),
@@ -209,7 +311,8 @@ fn write_signed_manifest(path: &std::path::Path, roothash: &str) {
         }],
         kernel_version: Some("6.11.0".into()),
         cmdline: Some("root=PARTUUID=... quiet".into()),
-        uki: Some("nau-demo_1.0.0.efi".into()),
+        uki: Some(UKI_NAME.into()),
+        uki_sha3_384: uki_sha3_384.map(|s| s.to_string()),
         esp_partuuid: Some(ESP_UUID.into()),
         roothash: Some(roothash.into()),
         signatures: Default::default(),
@@ -265,6 +368,12 @@ gated_test!(verify_image_passes_on_a_fresh_flash, {
     assert!(
         stderr.contains("verified 'nau-demo' 1.0.0"),
         "success names the image: {stderr}"
+    );
+    // #284: the ESP was actually inspected, not skipped — the success
+    // output names the UKI it recomputed.
+    assert!(
+        stderr.contains(UKI_NAME) && stderr.contains("ESP"),
+        "success names the covered ESP UKI: {stderr}"
     );
 });
 
@@ -379,6 +488,160 @@ gated_test!(verify_image_refuses_a_truncated_medium, {
     // names the interrupted-flash possibility. The extent-vs-medium
     // truncation refusal itself is unit-tested in src/image/verify.rs.
     assert!(flatten(&stderr).contains("interrupted"), "{stderr}");
+});
+
+// ── The #284 ESP shapes ──
+
+/// The path of the fixture's ESP extent file (kept inside the fixture's
+/// tempdir; `build_fixture` names it deterministically).
+fn esp_part_path(fx: &Fixture) -> std::path::PathBuf {
+    fx.dir.path().join("esp.part")
+}
+
+/// Re-splice the (mutated) ESP extent into the device after editing it.
+fn resplice_esp(fx: &Fixture) {
+    splice(&fx.device, &esp_part_path(fx), ESP_START * SECTOR);
+}
+
+// THE ticket acceptance, tamper shape: flipping a byte INSIDE the ESP's
+// UKI (outside every verity region) must refuse BY NAME — the pinned
+// sha3-384 is the only witness.
+gated_test!(verify_image_refuses_tampered_esp_content_by_name, {
+    let fx = build_fixture();
+    let esp = esp_part_path(&fx);
+    let mut tampered = uki_bytes();
+    tampered[512] ^= 0xFF;
+    overwrite_esp_uki(&esp, UKI_NAME, &tampered, fx.dir.path());
+    resplice_esp(&fx);
+
+    let (code, _stdout, stderr) = run_verify(&fx);
+    assert_ne!(code, Some(0), "a tampered ESP UKI must refuse");
+    let flat = flatten(&stderr);
+    assert!(
+        flat.contains("ESPcontentmismatch") && flat.contains(UKI_NAME),
+        "refusal names the ESP and the UKI: {stderr}"
+    );
+});
+
+// THE ticket acceptance, replaced shape: a whole-ESP replacement (fresh
+// FAT, correct PARTUUID re-stamped into the table) without the manifest's
+// UKI must refuse, listing what it did find.
+gated_test!(verify_image_refuses_a_replaced_esp, {
+    let fx = build_fixture();
+    let esp = esp_part_path(&fx);
+    write_fat_esp(&esp, &["nau-demo_0.9.0.efi"]);
+    resplice_esp(&fx);
+
+    let (code, _stdout, stderr) = run_verify(&fx);
+    assert_ne!(code, Some(0), "a replaced ESP must refuse");
+    let flat = flatten(&stderr);
+    assert!(
+        flat.contains("doesnotcarrythemanifest'sUKI")
+            && flat.contains(UKI_NAME)
+            && flat.contains("nau-demo_0.9.0.efi"),
+        "refusal names the expected UKI and the foreign content: {stderr}"
+    );
+});
+
+// THE ticket acceptance, flipped shape: an ESP from ANOTHER generation —
+// same filename stem on the foreign UKI is irrelevant; what the manifest
+// pins is absent. Here the foreign generation's UKI carries different
+// bytes UNDER the manifest's own name — the digest refuses it.
+gated_test!(verify_image_refuses_a_flipped_esp, {
+    let fx = build_fixture();
+    let esp = esp_part_path(&fx);
+    let foreign = vec![0x5Au8; uki_bytes().len()];
+    overwrite_esp_uki(&esp, UKI_NAME, &foreign, fx.dir.path());
+    resplice_esp(&fx);
+
+    let (code, _stdout, stderr) = run_verify(&fx);
+    assert_ne!(code, Some(0), "a flipped ESP must refuse");
+    let flat = flatten(&stderr);
+    assert!(
+        flat.contains("ESPcontentmismatch"),
+        "the flipped content refuses through the pinned digest: {stderr}"
+    );
+});
+
+// Post-sysupdate compatibility (#286): sysupdate installs the generation's
+// UKI WITH its boot-count suffix — byte-identical content under
+// `<name>+<left>-<done>.efi`. The verb must still verify that ESP.
+gated_test!(verify_image_verifies_the_boot_counted_uki_name, {
+    let fx = build_fixture();
+    let esp = esp_part_path(&fx);
+    let payload = fx.dir.path().join("uki-counted.payload");
+    std::fs::write(&payload, uki_bytes()).unwrap();
+    run_tool(
+        "mcopy",
+        &[
+            "-i",
+            esp.to_str().unwrap(),
+            payload.to_str().unwrap(),
+            &format!("::/EFI/Linux/nau-demo_1.0.0+3-0.efi"),
+        ],
+    );
+    run_tool(
+        "mdel",
+        &[
+            "-i",
+            esp.to_str().unwrap(),
+            &format!("::/EFI/Linux/{UKI_NAME}"),
+        ],
+    );
+    resplice_esp(&fx);
+
+    let (code, _stdout, stderr) = run_verify(&fx);
+    assert_eq!(
+        code,
+        Some(0),
+        "the boot-count-suffixed UKI is the same generation: {stderr}"
+    );
+    assert!(
+        stderr.contains("nau-demo_1.0.0+3-0.efi"),
+        "success names the counted name it verified: {stderr}"
+    );
+});
+
+// The backward-compat call, at the binary level: a manifest signed before
+// ESP coverage existed refuses with the named gap — it must not pass as
+// if the ESP had been verified.
+gated_test!(verify_image_refuses_a_manifest_predating_esp_coverage, {
+    let fx = build_fixture();
+    let body = std::fs::read_to_string(&fx.manifest).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v.get("uki_sha3_384").is_some(), "fixture carries the pin");
+    v.as_object_mut().unwrap().remove("uki_sha3_384");
+    // The signature no longer covers this body either — but the REFUSAL
+    // must be the coverage gap, reached only through a VALID signature.
+    // So re-sign the reduced body exactly as the release signer would.
+    let kp = test_kp(7);
+    let mut reduced: shuttle::image::ImageManifest =
+        serde_json::from_value(v).expect("the old field set still parses");
+    reduced.signatures.clear();
+    let canonical = serde_json::to_vec(&reduced).unwrap();
+    let sig = shuttle::sign::sign_bytes(&canonical, &kp);
+    reduced
+        .signatures
+        .insert(kp.key_id(), serde_json::Value::String(sig));
+    let legacy = fx.dir.path().join("legacy.manifest.json");
+    std::fs::write(&legacy, serde_json::to_string_pretty(&reduced).unwrap()).unwrap();
+
+    let args = vec![
+        "verify-image".to_string(),
+        "--device".to_string(),
+        fx.device.to_str().unwrap().to_string(),
+        "--manifest".to_string(),
+        legacy.to_str().unwrap().to_string(),
+        "--key".to_string(),
+        fx.key.to_str().unwrap().to_string(),
+    ];
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (code, _stdout, stderr) = run_in(fx.dir.path(), &refs);
+    assert_ne!(code, Some(0));
+    assert!(
+        flatten(&stderr).contains("predatesESPcoverage"),
+        "the refusal names the coverage gap: {stderr}"
+    );
 });
 
 // #288: the block-device axis. A loop device's inode carries st_size 0,

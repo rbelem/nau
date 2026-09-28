@@ -1170,6 +1170,12 @@ pub(crate) struct UkiFacts {
     pub(crate) kernel_version: String,
     pub(crate) cmdline: String,
     pub(crate) uki_filename: String,
+    /// SHA3-384 of the staged UKI exactly as installed on the ESP
+    /// (issue #284): the ESP's boot content is not covered by dm-verity
+    /// (it lives OUTSIDE the hashed root), so the signed manifest must
+    /// pin it — `shuttle verify-image` recomputes the digest from the
+    /// flashed medium's ESP and refuses a replaced or tampered UKI.
+    pub(crate) uki_sha3_384: String,
     pub(crate) esp_partuuid: Option<String>,
     /// dm-verity root hash embedded in the cmdline (ADR-0011 step (c));
     /// None for images that boot without verity.
@@ -1852,6 +1858,13 @@ pub(crate) fn assemble_uki(
         &uki_stage,
     )?;
     eprintln!("  ✓ UKI built: {filename}");
+    // #284: digest the staged UKI EXACTLY as it will be copied onto the
+    // ESP (`install_uki`/mtools copy the file verbatim), so the signed
+    // manifest pins the boot content the flashed medium must carry. The
+    // ESP is outside the dm-verity set — this is its only coverage.
+    let uki_sha3_384 = crate::store::sha3_384_file(&uki_stage)
+        .wrap_err_with(|| format!("digesting the staged UKI {}", uki_stage.display()))?;
+    eprintln!("  ✓ UKI sha3-384 pinned for the manifest: {uki_sha3_384}");
     if let Some(sbat) = payload.sbat.as_deref() {
         let lines = std::fs::read_to_string(sbat)
             .map(|t| t.lines().count().saturating_sub(1))
@@ -1867,6 +1880,7 @@ pub(crate) fn assemble_uki(
             kernel_version: payload.version.clone(),
             cmdline,
             uki_filename: filename,
+            uki_sha3_384,
             esp_partuuid,
             roothash: verity.map(|v| v.roothash.clone()),
         }),

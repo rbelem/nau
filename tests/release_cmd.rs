@@ -12,13 +12,15 @@
 //! attached), then round-tripped through the file system into
 //! `shuttle verify-image`.
 //!
-//! Gated on sfdisk + veritysetup (the build-host tools the suite spawns).
+//! Gated on sfdisk + veritysetup + mtools (the build-host tools the suite
+//! spawns; the fixture ESP is a real mtools FAT — #284's covered region).
 //! The live axis — a real mission through `shuttle image --release` into
 //! a scratch export tree (full ukify/mtools/mkfs chain), two-machine
 //! rebuild-compare byte-identity, and hardware — stays deferred; nothing
 //! here fakes it.
 
 use std::io::Write;
+use std::path::Path;
 use std::process::Command;
 
 // ── Gating ──
@@ -33,7 +35,9 @@ fn has_tool(tool: &str) -> bool {
 }
 
 fn chain_available() -> bool {
-    ["sfdisk", "veritysetup"].iter().all(|t| has_tool(t))
+    ["sfdisk", "veritysetup", "mformat", "mmd", "mcopy"]
+        .iter()
+        .all(|t| has_tool(t))
 }
 
 macro_rules! gated_test {
@@ -67,6 +71,57 @@ fn test_kp(seed_byte: u8) -> shuttle::sign::KeyPair {
         seed,
         public: sk.verifying_key().to_bytes(),
     }
+}
+
+/// The fixture UKI's filename on the ESP (the manifest's `uki`).
+const UKI_NAME: &str = "nau_1.0.0.efi";
+
+/// Deterministic UKI content the fixture FAT carries.
+fn uki_bytes() -> Vec<u8> {
+    (0..16384usize).map(|i| (i % 251) as u8).collect()
+}
+
+/// One mtools call, asserting success.
+fn run_tool(tool: &str, args: &[&str]) {
+    let out = Command::new(tool).args(args).output().unwrap_or_else(|e| {
+        panic!("{tool} failed to spawn: {e}");
+    });
+    assert!(
+        out.status.success(),
+        "{tool} {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A REAL FAT ESP at `path` carrying the generation's UKI under
+/// EFI/Linux/ — the mtools populate shape, unmounted.
+fn write_fat_esp(path: &Path) {
+    std::fs::write(path, vec![0u8; (ESP_SIZE * SECTOR) as usize]).unwrap();
+    run_tool(
+        "mformat",
+        &[
+            "-i",
+            path.to_str().unwrap(),
+            "::",
+            "-C",
+            "-T",
+            &format!("{}", ESP_SIZE * SECTOR / 512),
+            "-F",
+        ],
+    );
+    run_tool("mmd", &["-i", path.to_str().unwrap(), "::/EFI"]);
+    run_tool("mmd", &["-i", path.to_str().unwrap(), "::/EFI/Linux"]);
+    let payload = path.with_extension("uki-payload");
+    std::fs::write(&payload, uki_bytes()).unwrap();
+    run_tool(
+        "mcopy",
+        &[
+            "-i",
+            path.to_str().unwrap(),
+            payload.to_str().unwrap(),
+            &format!("::/EFI/Linux/{UKI_NAME}"),
+        ],
+    );
 }
 
 /// GUIDs a roothash derives (data, hash), dashed — the build's derivation,
@@ -164,11 +219,20 @@ fn build_fixture() -> Fixture {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // 3. Splice the formatted regions into their extents.
+    // 3. The ESP extent: a real FAT carrying the generation's UKI, whose
+    //    digest the release-signed manifest pins (#284).
+    let esp_file = dir.path().join("esp.part");
+    write_fat_esp(&esp_file);
+    let uki_payload = dir.path().join("uki.digest-payload");
+    std::fs::write(&uki_payload, uki_bytes()).unwrap();
+    let uki_digest = shuttle::store::sha3_384_file(&uki_payload).unwrap();
+    splice(&device, &esp_file, ESP_START * SECTOR);
+
+    // 4. Splice the formatted regions into their extents.
     splice(&device, &root_file, ROOT_START * SECTOR);
     splice(&device, &hash_file, HASH_START * SECTOR);
 
-    // 4. The published manifest — signed by the RELEASE signer over the
+    // 5. The published manifest — signed by the RELEASE signer over the
     //    image manifest's canonical body, serialized exactly as
     //    `--release` publishes it (pretty JSON, signatures map attached),
     //    and round-tripped through the file system like a download.
@@ -180,7 +244,7 @@ fn build_fixture() -> Fixture {
         "nau-cassini-1.0.0-amd64.manifest.json",
         "the media name carries the ADR-0013 vocabulary"
     );
-    write_release_signed_manifest(&manifest, &roothash);
+    write_release_signed_manifest(&manifest, &roothash, &uki_digest);
     let key = dir.path().join("downloaded.pub");
     std::fs::write(&key, shuttle::sign::public_key_file(&test_kp(7))).unwrap();
 
@@ -202,7 +266,7 @@ fn splice(dst: &std::path::Path, src: &std::path::Path, offset: u64) {
 
 /// Sign with the release signer and publish the exact bytes `--release`
 /// writes: the typed image manifest, pretty-printed, signature attached.
-fn write_release_signed_manifest(path: &std::path::Path, roothash: &str) {
+fn write_release_signed_manifest(path: &std::path::Path, roothash: &str, uki_sha3_384: &str) {
     use shuttle::image::{ImageManifest, ImageSnapEntry};
     let mut manifest = ImageManifest {
         name: "nau".into(),
@@ -216,7 +280,8 @@ fn write_release_signed_manifest(path: &std::path::Path, roothash: &str) {
         }],
         kernel_version: Some("6.11.0".into()),
         cmdline: Some("root=PARTUUID=... quiet".into()),
-        uki: Some("nau_1.0.0.efi".into()),
+        uki: Some(UKI_NAME.into()),
+        uki_sha3_384: Some(uki_sha3_384.to_string()),
         esp_partuuid: Some(ESP_UUID.into()),
         roothash: Some(roothash.into()),
         signatures: Default::default(),
@@ -270,6 +335,12 @@ gated_test!(release_signed_manifest_verifies_end_to_end, {
     assert!(
         stderr.contains("verified 'nau' 1.0.0"),
         "success names the image: {stderr}"
+    );
+    // #284: the release-pinned ESP UKI digest is recomputed from the
+    // flashed medium in the same pass.
+    assert!(
+        stderr.contains(UKI_NAME) && stderr.contains("ESP"),
+        "success names the covered ESP UKI: {stderr}"
     );
 });
 

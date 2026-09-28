@@ -30,7 +30,23 @@
 //! 3. Refuse a truncated medium: any partition extending past the end
 //!    of the device is an interrupted flash — a distinct refusal from an
 //!    undeterminable medium size, which refuses by its own name.
-//! 4. Recompute the verity hash regions: the root and hash partition
+//! 4. Verify the ESP's boot content (issue #284): the ESP is the one
+//!    flashed region dm-verity does NOT cover, so the signed manifest
+//!    pins the UKI's sha3-384 (`uki_sha3_384`, written by the build and
+//!    signed with the rest of the canonical body). The ESP region is
+//!    extracted read-only and its `EFI/Linux/` listing is read with
+//!    mtools (`mdir -b`), the manifest's UKI pulled out with
+//!    `mcopy -i` (byte-exact, the medium never written), and the digest
+//!    recomputed. The manifest names the UKI; boot-count suffices that
+//!    sysupdate adds AT INSTALL (`<name>+<left>-<done>.efi`,
+//!    stripped again once bless-boot marks a boot good) still match —
+//!    a post-sysupdate ESP stays verifiable (#286). A replaced ESP (no
+//!    such file), a flipped ESP (another generation's bytes), and a
+//!    tampered UKI all refuse by name. A manifest that predates ESP
+//!    coverage (UKI named, no digest) refuses: a verify pass that
+//!    ignores the ESP would stamp exactly the attack the verb exists to
+//!    catch.
+//! 5. Recompute the verity hash regions: the root and hash partition
 //!    bytes are read out to scratch files (plain reads; the device is
 //!    never opened for writing) and `veritysetup verify` checks them
 //!    against the manifest roothash — the userspace half of what the
@@ -146,24 +162,26 @@ pub struct VerifyOutcome {
 
 /// Verify a flashed device against its signed image manifest. Read-only
 /// over `args.device`; every failure names the region that refused.
-/// Resolves `veritysetup` from the host PATH.
+/// Resolves `veritysetup` and mtools' `mcopy` from the host PATH.
 pub fn verify_device(
     runner: &dyn crate::command::CommandRunner,
     args: &VerifyImageArgs,
 ) -> miette::Result<VerifyOutcome> {
     let veritysetup = find_veritysetup();
-    verify_device_with(runner, args, veritysetup.as_deref())
+    let mcopy = super::verity::find_host_tool("mcopy");
+    verify_device_with(runner, args, veritysetup.as_deref(), mcopy.as_deref())
 }
 
-/// [`verify_device`] with the tool injected — the fail-closed seam the
+/// [`verify_device`] with the tools injected — the fail-closed seam the
 /// tests drive (mirrors [`verity_format_with`]).
 pub(crate) fn verify_device_with(
     runner: &dyn crate::command::CommandRunner,
     args: &VerifyImageArgs,
     veritysetup: Option<&Path>,
+    mcopy: Option<&Path>,
 ) -> miette::Result<VerifyOutcome> {
     let keys_dir = crate::sign::keys_dir(&operator_home()?);
-    verify_device_at(runner, args, veritysetup, &keys_dir)
+    verify_device_at(runner, args, veritysetup, mcopy, &keys_dir)
 }
 
 /// [`verify_device_with`] against an explicit keychain directory — the
@@ -174,6 +192,7 @@ pub(crate) fn verify_device_at(
     runner: &dyn crate::command::CommandRunner,
     args: &VerifyImageArgs,
     veritysetup: Option<&Path>,
+    mcopy: Option<&Path>,
     keys_dir: &Path,
 ) -> miette::Result<VerifyOutcome> {
     let manifest = load_signed_manifest(&args.manifest)?;
@@ -184,6 +203,8 @@ pub(crate) fn verify_device_at(
     let (root, hash, position) = resolve_generation_regions(&table, &identity, args.slot)?;
     check_esp_identity(&table, &identity)?;
     check_truncation(&args.device, &table)?;
+    let esp = resolve_esp(&table, &identity)?;
+    check_esp_content(runner, &args.device, esp, &manifest, mcopy)?;
     run_verity_verify_with(runner, &args.device, root, hash, &roothash, veritysetup)?;
     Ok(VerifyOutcome {
         image_name: manifest.name,
@@ -203,7 +224,7 @@ pub(crate) fn verify_device_at(
 /// shuttle: serde would silently DROP the unknown fields and the run
 /// would die later as a generic "no trusted signature" — naming the skew
 /// here instead is what makes the diagnosis a one-liner (#293 item 9).
-const KNOWN_MANIFEST_FIELDS: [&str; 10] = [
+const KNOWN_MANIFEST_FIELDS: [&str; 11] = [
     "name",
     "version",
     "arch",
@@ -211,6 +232,7 @@ const KNOWN_MANIFEST_FIELDS: [&str; 10] = [
     "kernel_version",
     "cmdline",
     "uki",
+    "uki_sha3_384",
     "esp_partuuid",
     "roothash",
     "signatures",
@@ -804,7 +826,297 @@ fn check_truncation(device: &Path, table: &GptTable) -> miette::Result<()> {
     Ok(())
 }
 
-// ── 4. Verity recompute ──
+// ── 4. ESP content (issue #284) ──
+
+/// Locate the partition the ESP content check reads: the manifest's
+/// recorded ESP PARTUUID when the build resolved one (already proven to
+/// sit on an ESP-typed partition by [`check_esp_identity`] — a duplicate
+/// still refuses rather than pick), else the SINGLE ESP-typed partition.
+/// Multiple ESPs without a recorded identity are ambiguous; an absent
+/// ESP refuses under its own name — the UKI boots off it, so a medium
+/// without one cannot carry this image.
+fn resolve_esp<'t>(
+    table: &'t GptTable,
+    identity: &GenerationIdentity,
+) -> miette::Result<&'t GptEntry> {
+    let esp_type = ESP_TYPE_GUID.to_ascii_lowercase();
+    let esps = typed_partitions(table, &esp_type);
+    if let Some(uuid) = &identity.esp_partuuid {
+        let matching: Vec<&GptEntry> = esps
+            .iter()
+            .copied()
+            .filter(|e| e.partuuid == *uuid)
+            .collect();
+        if matching.len() > 1 {
+            return Err(miette::miette!(
+                "duplicate ESP PARTUUID {uuid} on partitions {} — refusing (a PARTUUID \
+                 must be unique: the UKI boot entry and the GPT both resolve the ESP by \
+                 it, and a duplicated identity makes the mapping ambiguous — the table \
+                 was copied or rewritten)",
+                matching
+                    .iter()
+                    .map(|e| format!("#{} ('{}')", e.partno, e.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return matching.into_iter().next().ok_or_else(|| {
+            // Unreachable after check_esp_identity; kept total so a
+            // reordering cannot panic on a hostile table.
+            miette::miette!(
+                "ESP PARTUUID mismatch: manifest records {uuid} but no ESP-typed \
+                 partition carries it — refusing"
+            )
+        });
+    }
+    match esps.as_slice() {
+        [one] => Ok(one),
+        [] => Err(miette::miette!(
+            "device carries no ESP partition (type {ESP_TYPE_GUID}) — a UKI mission \
+             image boots off its ESP, so a medium without one cannot carry the image \
+             the manifest signed (the ESP was deleted, or this is the wrong device); \
+             refusing"
+        )),
+        many => Err(miette::miette!(
+            "device carries {} ESP-typed partitions ({}) and the manifest records no \
+             esp_partuuid — cannot pin which one is the image's; refusing to verify \
+             the wrong partition's content",
+            many.len(),
+            many.iter()
+                .map(|e| format!("#{} ('{}', {})", e.partno, e.name, e.partuuid))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Does a listed `EFI/Linux/` name match the manifest's UKI, honoring
+/// the systemd-boot boot-count suffix? sysupdate writes the counters AT
+/// INSTALL (`<stem>+<left>-<done>.<ext>` — the transfer's
+/// `TriesLeft=3`/`TriesDone=0` stanza lands as `+3-0`), and
+/// systemd-bless-boot strips the suffix once a boot is marked good, so a
+/// post-sysupdate ESP legitimately carries the counted name over
+/// BYTE-IDENTICAL content — refusing on it would break the #286
+/// post-sysupdate contract. Anything else (a different stem, a foreign
+/// extension, a non-numeric suffix) is a different file and must not
+/// pass.
+fn uki_esp_name_matches(listed: &str, uki: &str) -> bool {
+    if listed == uki {
+        return true;
+    }
+    let (uki_stem, uki_ext) = match uki.rsplit_once('.') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let (listed_stem, listed_ext) = match listed.rsplit_once('.') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    if uki_ext != listed_ext {
+        return false;
+    }
+    match listed_stem
+        .strip_prefix(uki_stem)
+        .and_then(|rest| rest.strip_prefix('+'))
+    {
+        Some(counts) => match counts.split_once('-') {
+            Some((left, done)) => {
+                !left.is_empty()
+                    && !done.is_empty()
+                    && left.bytes().all(|b| b.is_ascii_digit())
+                    && done.bytes().all(|b| b.is_ascii_digit())
+            }
+            None => false,
+        },
+        None => false,
+    }
+}
+
+/// `mdir -b` listing of the extracted ESP image's `EFI/Linux` directory —
+/// the UKI file names sysupdate and bless-boot maintain there.
+/// Read-only (measured: a listing and an `mcopy -i` extraction leave the
+/// image byte-identical).
+fn list_esp_linux(
+    runner: &dyn crate::command::CommandRunner,
+    esp: &GptEntry,
+    esp_img: &Path,
+) -> miette::Result<Vec<String>> {
+    let argv = vec![
+        "mdir".to_string(),
+        "-b".to_string(),
+        "-i".to_string(),
+        esp_img.to_string_lossy().into_owned(),
+        "::/EFI/Linux".to_string(),
+    ];
+    let out = runner
+        .run(&argv)
+        .map_err(|e| miette::miette!("mdir not runnable: {e}"))?;
+    if out.code != 0 {
+        return Err(miette::miette!(
+            "cannot list the ESP's EFI/Linux directory (mdir exit {}: {}) — partition \
+             '{}' (#{} {}) does not hold a readable FAT filesystem; the ESP was \
+             replaced with foreign content or is corrupt; refusing",
+            out.code,
+            out.stderr.trim(),
+            esp.name,
+            esp.partno,
+            if esp.partuuid.is_empty() {
+                String::new()
+            } else {
+                format!("PARTUUID {} ", esp.partuuid)
+            }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Pull the UKI named `name` out of the extracted ESP image read-only
+/// (`mcopy -i`, byte-exact — the same access the build's populate uses
+/// in reverse).
+fn extract_esp_uki(
+    runner: &dyn crate::command::CommandRunner,
+    mcopy: &Path,
+    esp_img: &Path,
+    name: &str,
+    scratch_dir: &Path,
+) -> miette::Result<PathBuf> {
+    let dst = scratch_dir.join("esp-uki");
+    let argv = vec![
+        mcopy.to_string_lossy().into_owned(),
+        "-i".to_string(),
+        esp_img.to_string_lossy().into_owned(),
+        format!("::EFI/Linux/{name}"),
+        dst.to_string_lossy().into_owned(),
+    ];
+    let out = runner
+        .run(&argv)
+        .map_err(|e| miette::miette!("failed to run mcopy: {e}"))?;
+    if out.code != 0 {
+        return Err(miette::miette!(
+            "cannot read ::EFI/Linux/{name} out of the ESP (mcopy exit {}: {}) — the \
+             file vanished between listing and copy, or the filesystem is unreadable; \
+             refusing",
+            out.code,
+            out.stderr.trim()
+        ));
+    }
+    Ok(dst)
+}
+
+/// Verify the ESP's boot content against the signed manifest (#284):
+/// extract the ESP region, list its `EFI/Linux`, pull the manifest's UKI
+/// out (the boot-count-suffixed name sysupdate installs also matches —
+/// [`uki_esp_name_matches`]) and recompute its sha3-384 against the
+/// manifest's `uki_sha3_384`. Every gap refuses by name: a manifest
+/// predating ESP coverage (UKI named, no digest), a missing or foreign
+/// ESP, a replaced/tampered/flipped UKI.
+fn check_esp_content(
+    runner: &dyn crate::command::CommandRunner,
+    device: &Path,
+    esp: &GptEntry,
+    manifest: &ImageManifest,
+    mcopy: Option<&Path>,
+) -> miette::Result<()> {
+    let Some(uki) = manifest.uki.as_deref() else {
+        // roothash ⇒ UKI by construction (the verity path always
+        // assembles one); a manifest claiming verity without naming its
+        // UKI is incoherent — refuse rather than skip the ESP.
+        return Err(miette::miette!(
+            "manifest for '{} {}' carries a roothash but names no UKI — the ESP cannot \
+             be pinned without knowing which file to verify; refusing (incoherent \
+             manifest)",
+            manifest.name,
+            manifest.version
+        ));
+    };
+    let Some(expected) = manifest.uki_sha3_384.as_deref() else {
+        // The backward-compat call (fail closed, the repo's posture for
+        // trust inputs): a manifest signed before ESP coverage existed
+        // cannot prove the ESP — refusing names the gap instead of
+        // stamping a medium whose boot chain may have been swapped.
+        return Err(miette::miette!(
+            "manifest for '{} {}' predates ESP coverage: it names UKI '{uki}' but pins \
+             no sha3-384 digest (uki_sha3_384) — the ESP is the one flashed region \
+             dm-verity does not protect, so without the digest a verify pass would \
+             stamp exactly the replaced/flipped-ESP state this verb exists to catch. \
+             Re-publish the image with a current shuttle and verify against the new \
+             manifest; refusing to pass (issue #284)",
+            manifest.name,
+            manifest.version
+        ));
+    };
+    let Some(mcopy) = mcopy else {
+        return Err(miette::miette!(
+            "mcopy not found on PATH — reading the ESP's UKI off the flashed medium \
+             needs mtools (mcopy via -i, read-only). Run 'shuttle doctor' and install \
+             mtools (e.g. apt install mtools or add mtools to devbox.json packages)"
+        ));
+    };
+    let scratch =
+        tempfile::tempdir().map_err(|e| miette::miette!("failed to create scratch dir: {e}"))?;
+    let esp_img = extract_region(device, esp, scratch.path())?;
+    let listed = list_esp_linux(runner, esp, &esp_img)?;
+    let matches: Vec<&String> = listed
+        .iter()
+        .filter(|name| uki_esp_name_matches(name, uki))
+        .collect();
+    let name = match matches.as_slice() {
+        [] => {
+            return Err(miette::miette!(
+                "the ESP ('{}', #{} PARTUUID {}) does not carry the manifest's UKI \
+                 '{uki}' (EFI/Linux/ lists {}) — the ESP was replaced or flipped from \
+                 another generation, or this medium is not the image the manifest \
+                 signed; refusing",
+                esp.name,
+                esp.partno,
+                esp.partuuid,
+                if listed.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    listed.join(", ")
+                }
+            ));
+        }
+        [one] => (*one).clone(),
+        _ => {
+            return Err(miette::miette!(
+                "the ESP's EFI/Linux carries {} files matching the manifest's UKI \
+                 '{uki}' ({}) — boot counting must yield exactly one entry per \
+                 generation; refusing an ambiguous ESP",
+                matches.len(),
+                matches
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    };
+    let extracted = extract_esp_uki(runner, mcopy, &esp_img, &name, scratch.path())?;
+    let actual = crate::store::sha3_384_file(&extracted)?;
+    if actual != expected {
+        return Err(miette::miette!(
+            "ESP content mismatch: partition '{}' (#{}) carries EFI/Linux/{name} \
+             hashing {actual} (sha3-384) but the signed manifest pins {expected} — the \
+             ESP's UKI was replaced, flipped from another generation, or tampered with \
+             after the flash; refusing",
+            esp.name,
+            esp.partno
+        ));
+    }
+    eprintln!(
+        "  ✓ ESP: EFI/Linux/{name} recomputes to the signed UKI sha3-384 {}…",
+        expected.get(..16).unwrap_or(expected)
+    );
+    Ok(())
+}
+
+// ── 5. Verity recompute ──
 
 /// Read one partition's bytes out of the medium into a scratch file —
 /// plain reads; the device is never opened for writing. The scratch copy
@@ -912,6 +1224,32 @@ mod tests {
     /// runner only ever sees it echoed in argv.
     const FAKE_VERITYSETUP: &str = "/usr/bin/veritysetup";
 
+    /// The fake mcopy path, same discipline.
+    const FAKE_MCOPY: &str = "/usr/bin/mcopy";
+
+    /// The UKI filename the fixture manifests pin (the build's
+    /// `{name}_{version}.efi` shape).
+    const FIXTURE_UKI_NAME: &str = "nau-demo_1.0.0.efi";
+
+    /// The UKI bytes the FakeTools' mcopy materializes — the "factory"
+    /// boot content the fixture manifests pin.
+    fn fixture_uki() -> Vec<u8> {
+        b"UKI-PE-284-FACTORY-BYTES".to_vec()
+    }
+
+    /// sha3-384 of [`fixture_uki`] — what a manifest covering this ESP
+    /// pins in `uki_sha3_384`.
+    fn fixture_uki_sha3() -> String {
+        use sha3::Digest;
+        let mut hasher = sha3::Sha3_384::new();
+        hasher.update(&fixture_uki());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     /// A runner that must never be reached (guards the fail-closed paths).
     struct NoTools;
 
@@ -950,7 +1288,8 @@ mod tests {
             snaps: vec![],
             kernel_version: None,
             cmdline: None,
-            uki: None,
+            uki: Some(FIXTURE_UKI_NAME.into()),
+            uki_sha3_384: Some(fixture_uki_sha3()),
             esp_partuuid: esp.map(|s| s.into()),
             roothash: roothash.map(|s| s.into()),
             signatures: Default::default(),
@@ -1039,11 +1378,23 @@ mod tests {
         r#"{"partitiontable": {"label": "dos", "sectorsize": 512, "partitions": []}}"#.to_string()
     }
 
-    /// A runner answering `sfdisk -J` with `body` and `veritysetup` with
-    /// `verity_code` (recording every argv).
+    /// A runner answering `sfdisk -J` with `body`, `veritysetup` with
+    /// `verity_code`, and the mtools calls with the fixture ESP shape
+    /// (recording every argv). Defaults model a COVERED ESP: `mdir -b`
+    /// lists exactly the fixture UKI and `mcopy` materializes the fixture
+    /// bytes at its target — the covered pass path every fixture manifest
+    /// pins. Tests mutate the fields for the refusal shapes.
     struct FakeTools {
         sfdisk_body: String,
         verity_code: i32,
+        /// Names `mdir -b` reports for `EFI/Linux` (the fake emits each
+        /// as a `::/EFI/Linux/<name>` line, mtools' real shape).
+        mdir_listing: Vec<String>,
+        /// The exit code mdir answers with (1 ⇒ unreadable FAT).
+        mdir_code: i32,
+        /// Bytes the fake mcopy writes to its target argument;
+        /// `None` ⇒ mcopy exits 1 (file not found).
+        mcopy_payload: Option<Vec<u8>>,
         calls: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
@@ -1052,6 +1403,9 @@ mod tests {
             FakeTools {
                 sfdisk_body,
                 verity_code,
+                mdir_listing: vec![FIXTURE_UKI_NAME.to_string()],
+                mdir_code: 0,
+                mcopy_payload: Some(fixture_uki()),
                 calls: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -1064,16 +1418,53 @@ mod tests {
     impl crate::command::CommandRunner for FakeTools {
         fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
-            let (code, stderr) = if argv.first().is_some_and(|t| t.ends_with("veritysetup")) {
-                (self.verity_code, "hash mismatch".to_string())
+            let tool = argv.first().map(String::as_str).unwrap_or("");
+            let out = if tool.ends_with("veritysetup") {
+                RunnerOutput {
+                    code: self.verity_code,
+                    stdout: Vec::new(),
+                    stderr: "hash mismatch".to_string(),
+                }
+            } else if tool.ends_with("mdir") {
+                let stdout = self
+                    .mdir_listing
+                    .iter()
+                    .map(|n| format!("::/EFI/Linux/{n}\n"))
+                    .collect::<String>();
+                RunnerOutput {
+                    code: self.mdir_code,
+                    stdout: stdout.into_bytes(),
+                    stderr: if self.mdir_code == 0 {
+                        String::new()
+                    } else {
+                        "no such directory".to_string()
+                    },
+                }
+            } else if tool.ends_with("mcopy") {
+                match &self.mcopy_payload {
+                    Some(bytes) => {
+                        let target = argv.last().expect("mcopy target");
+                        std::fs::write(target, bytes).expect("fake mcopy write");
+                        RunnerOutput {
+                            code: 0,
+                            stdout: Vec::new(),
+                            stderr: String::new(),
+                        }
+                    }
+                    None => RunnerOutput {
+                        code: 1,
+                        stdout: Vec::new(),
+                        stderr: "File \"::/EFI/Linux/…\" not found".to_string(),
+                    },
+                }
             } else {
-                (0, String::new())
+                RunnerOutput {
+                    code: 0,
+                    stdout: self.sfdisk_body.clone().into_bytes(),
+                    stderr: String::new(),
+                }
             };
-            Ok(RunnerOutput {
-                code,
-                stdout: self.sfdisk_body.clone().into_bytes(),
-                stderr,
-            })
+            Ok(out)
         }
     }
 
@@ -1146,6 +1537,7 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .expect("golden manifest verifies");
         assert_eq!(outcome.verified_key_id, kp.key_id());
@@ -1165,6 +1557,27 @@ mod tests {
             .expect("veritysetup was invoked");
         assert_eq!(&verity[1], "verify");
         assert_eq!(&verity[4], ROOTHASH, "recompute pins the SIGNED roothash");
+
+        // #284: the ESP content check ran — read-only listing, then a
+        // byte-exact mcopy of the manifest's UKI out of the extracted
+        // ESP region (the pass itself proves the digest matched; the
+        // scratch file is gone by the time the outcome returns).
+        let mcopy = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.first().is_some_and(|t| t.ends_with("mcopy")))
+            .expect("mcopy was invoked to pull the UKI out of the ESP");
+        assert_eq!(&mcopy[1], "-i");
+        assert_eq!(
+            mcopy[3],
+            format!("::EFI/Linux/{FIXTURE_UKI_NAME}"),
+            "the manifest's UKI name, verbatim"
+        );
+        assert!(
+            mcopy[4].ends_with("esp-uki"),
+            "the UKI lands in the check's scratch dir: {:?}",
+            mcopy[4]
+        );
     }
 
     // ── Signature refusals ──
@@ -1287,6 +1700,7 @@ mod tests {
             &NoTools,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();
@@ -1301,26 +1715,53 @@ mod tests {
     }
 
     #[test]
-    fn legacy_manifest_shape_still_verifies() {
-        // The skew check must keep OLD manifests working: exactly the
-        // build's emitted field set (optional fields absent) parses and
-        // verifies end to end.
+    fn legacy_manifest_shape_refuses_naming_the_esp_coverage_gap() {
+        // The skew check must keep OLD manifests PARSING: exactly the
+        // pre-#284 build's emitted field set (optional fields absent) is
+        // a schema subset — no skew refusal. But a manifest signed before
+        // ESP coverage existed cannot prove the ESP, so the run refuses
+        // with THAT name (fail closed, the repo's posture for trust
+        // inputs) — never silently passes, never masquerades as a
+        // signature or schema failure.
         let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let device = device_file(dir.path());
         let kp = test_kp(7);
-        let m = signed(manifest(Some(ROOTHASH), None), &kp);
+        // Strip #284's field BEFORE signing: the exact pre-coverage
+        // manifest shape, validly signed.
+        let mut m = manifest(Some(ROOTHASH), None);
+        m.uki_sha3_384 = None;
+        let m = signed(m, &kp);
         let manifest_path = dir.path().join("legacy.manifest.json");
         std::fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
         std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
         let runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
-        verify_device_with(
+        let err = verify_device_with(
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
-        .expect("the legacy field set is a schema subset — no skew refusal");
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("predates ESP coverage") && err.contains(FIXTURE_UKI_NAME),
+            "the refusal names the coverage gap and the UKI it cannot prove: {err}"
+        );
+        assert!(
+            !err.contains("schema skew") && !err.contains("no trusted signature"),
+            "the old shape parses and signs — the refusal is about coverage: {err}"
+        );
+        // No ESP access ever happened: the refusal fires before the
+        // medium's ESP is listed or read (only the GPT read ran).
+        assert!(
+            !runner.calls().iter().any(|c| c
+                .first()
+                .is_some_and(|t| t.ends_with("mdir") || t.ends_with("mcopy"))),
+            "{:?}",
+            runner.calls()
+        );
     }
 
     // ── GPT identity refusals ──
@@ -1341,6 +1782,7 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();
@@ -1360,6 +1802,7 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();
@@ -1386,6 +1829,7 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();
@@ -1414,6 +1858,7 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();
@@ -1436,8 +1881,351 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .expect("nil placeholder does not demand a nil-GUID partition");
+    }
+
+    // ── ESP content (#284) ──
+
+    #[test]
+    fn tampered_esp_uki_refuses_naming_expected_and_actual() {
+        // A byte-level edit inside the ESP's UKI — outside the verity
+        // set, so ONLY the pinned digest sees it.
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let device = device_file(dir.path());
+        let (manifest_path, key_anchor) = signed_manifest_and_anchor(dir.path());
+        let mut runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
+        let mut tampered = fixture_uki();
+        tampered[0] ^= 0xFF;
+        runner.mcopy_payload = Some(tampered);
+        let err = verify_device_with(
+            &runner,
+            &args(&device, &manifest_path, Some(&key_anchor)),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("ESP content mismatch") && err.contains(FIXTURE_UKI_NAME),
+            "the refusal names the ESP and the UKI: {err}"
+        );
+        assert!(
+            err.contains(&fixture_uki_sha3()),
+            "the pinned (expected) digest is named: {err}"
+        );
+    }
+
+    #[test]
+    fn replaced_esp_without_the_uki_refuses_listing_what_is_there() {
+        // A whole-ESP replacement: a fresh FAT carrying only another
+        // generation's UKI. The PARTUUID identity check passes (a
+        // determined attacker re-stamps it), so the content check is what
+        // refuses — listing what it DID find.
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let device = device_file(dir.path());
+        let (manifest_path, key_anchor) = signed_manifest_and_anchor(dir.path());
+        let mut runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
+        runner.mdir_listing = vec!["nau-demo_0.9.0.efi".to_string()];
+        let err = verify_device_with(
+            &runner,
+            &args(&device, &manifest_path, Some(&key_anchor)),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("does not carry the manifest's UKI")
+                && err.contains(FIXTURE_UKI_NAME)
+                && err.contains("nau-demo_0.9.0.efi"),
+            "the refusal names the expected UKI and the foreign content: {err}"
+        );
+    }
+
+    #[test]
+    fn unreadable_esp_filesystem_refuses_by_name() {
+        // A replaced ESP whose bytes are not FAT at all.
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let device = device_file(dir.path());
+        let (manifest_path, key_anchor) = signed_manifest_and_anchor(dir.path());
+        let mut runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
+        runner.mdir_code = 1;
+        let err = verify_device_with(
+            &runner,
+            &args(&device, &manifest_path, Some(&key_anchor)),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("readable FAT filesystem"),
+            "the refusal names the unreadable ESP: {err}"
+        );
+    }
+
+    #[test]
+    fn boot_counted_uki_name_still_verifies() {
+        // Post-sysupdate shape: sysupdate installed the generation's UKI
+        // WITH its boot-count suffix (+3-0), content byte-identical. The
+        // check must pull THAT name and verify — refusing it would break
+        // the #286 post-sysupdate contract.
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let device = device_file(dir.path());
+        let (manifest_path, key_anchor) = signed_manifest_and_anchor(dir.path());
+        let mut runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
+        runner.mdir_listing = vec!["nau-demo_1.0.0+3-0.efi".to_string()];
+        verify_device_with(
+            &runner,
+            &args(&device, &manifest_path, Some(&key_anchor)),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
+        )
+        .expect("a boot-count-suffixed UKI is the same generation");
+        let mcopy = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.first().is_some_and(|t| t.ends_with("mcopy")))
+            .expect("mcopy ran");
+        assert_eq!(
+            mcopy[3], "::EFI/Linux/nau-demo_1.0.0+3-0.efi",
+            "the counted name is what got extracted"
+        );
+    }
+
+    #[test]
+    fn ambiguous_boot_counted_uki_names_refuse() {
+        // Bare AND counted names present: bless-boot's rename protocol
+        // yields exactly one per generation — two is a copied/rewritten
+        // ESP, and picking one would verify an arbitrary file.
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let device = device_file(dir.path());
+        let (manifest_path, key_anchor) = signed_manifest_and_anchor(dir.path());
+        let mut runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
+        runner.mdir_listing = vec![
+            FIXTURE_UKI_NAME.to_string(),
+            "nau-demo_1.0.0+3-0.efi".to_string(),
+        ];
+        let err = verify_device_with(
+            &runner,
+            &args(&device, &manifest_path, Some(&key_anchor)),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("ambiguous ESP") && err.contains("+3-0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn esp_absent_refuses_by_name() {
+        // No ESP-typed partition and no recorded esp_partuuid to follow:
+        // a UKI image cannot boot off this medium.
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let device = device_file(dir.path());
+        let (manifest_path, key_anchor) = signed_manifest_and_anchor(dir.path());
+        let (data_up, hash_up) = expected_guids();
+        let body = format!(
+            r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
+                {{"start": 4096, "size": 4096, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "{}"}},
+                {{"start": 8192, "size": 256, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "{}"}}
+            ]}}}}"#,
+            slot_partlabel("nau-demo", "1.0.0", 0),
+            hash_partlabel("nau-demo", "1.0.0", 0),
+        );
+        let runner = FakeTools::new(body, 0);
+        let err = verify_device_with(
+            &runner,
+            &args(&device, &manifest_path, Some(&key_anchor)),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no ESP partition"), "{err}");
+    }
+
+    #[test]
+    fn multiple_esps_without_recorded_identity_refuse() {
+        // Two ESP-typed partitions, manifest records no esp_partuuid:
+        // first-match would hash an arbitrary ESP — refuse naming both.
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // ESP2 sits at 8 MiB — the medium must cover it so the refusal
+        // is the ambiguity, not truncation.
+        let device = device_file_sized(dir.path(), 16 * 1024 * 1024);
+        let (manifest_path, key_anchor) = signed_manifest_and_anchor(dir.path());
+        let (data_up, hash_up) = expected_guids();
+        let body = format!(
+            r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
+                {{"start": 2048, "size": 2048, "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "uuid": "AABBCCDD-0011-2233-4455-667788990011", "name": "ESP"}},
+                {{"start": 16384, "size": 2048, "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "uuid": "DEADBEEF-0011-2233-4455-667788990011", "name": "ESP2"}},
+                {{"start": 4096, "size": 4096, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "{}"}},
+                {{"start": 8192, "size": 256, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "{}"}}
+            ]}}}}"#,
+            slot_partlabel("nau-demo", "1.0.0", 0),
+            hash_partlabel("nau-demo", "1.0.0", 0),
+        );
+        let runner = FakeTools::new(body, 0);
+        let err = verify_device_with(
+            &runner,
+            &args(&device, &manifest_path, Some(&key_anchor)),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cannot pin which one is the image's") && err.contains("ESP2"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_esp_partuuid_refuses_instead_of_first_match() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // ESP2 sits at 8 MiB — the medium must cover it so the refusal
+        // is the duplicated identity, not truncation.
+        let device = device_file_sized(dir.path(), 16 * 1024 * 1024);
+        let kp = test_kp(7);
+        let m = signed(
+            manifest(Some(ROOTHASH), Some("aabbccdd-0011-2233-4455-667788990011")),
+            &kp,
+        );
+        let manifest_path = dir.path().join("m.json");
+        std::fs::write(&manifest_path, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+        let key_anchor = dir.path().join("anchor.pub");
+        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        let (data_up, hash_up) = expected_guids();
+        let body = format!(
+            r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
+                {{"start": 2048, "size": 2048, "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "uuid": "AABBCCDD-0011-2233-4455-667788990011", "name": "ESP"}},
+                {{"start": 16384, "size": 2048, "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "uuid": "AABBCCDD-0011-2233-4455-667788990011", "name": "ESP2"}},
+                {{"start": 4096, "size": 4096, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "{}"}},
+                {{"start": 8192, "size": 256, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "{}"}}
+            ]}}}}"#,
+            slot_partlabel("nau-demo", "1.0.0", 0),
+            hash_partlabel("nau-demo", "1.0.0", 0),
+        );
+        let runner = FakeTools::new(body, 0);
+        let err = verify_device_with(
+            &runner,
+            &args(&device, &manifest_path, Some(&key_anchor)),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate ESP PARTUUID"), "{err}");
+    }
+
+    #[test]
+    fn manifest_naming_no_uki_but_carrying_roothash_refuses() {
+        // Incoherent manifest: verity without a UKI to pin. Skip-not.
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let device = device_file(dir.path());
+        let kp = test_kp(7);
+        // Drop the UKI name BEFORE signing: a validly signed but
+        // incoherent manifest (verity without a boot entry).
+        let mut m = manifest(Some(ROOTHASH), None);
+        m.uki = None;
+        let m = signed(m, &kp);
+        let manifest_path = dir.path().join("m.json");
+        std::fs::write(&manifest_path, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+        let key_anchor = dir.path().join("anchor.pub");
+        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        let runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
+        let err = verify_device_with(
+            &runner,
+            &args(&device, &manifest_path, Some(&key_anchor)),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("names no UKI"), "{err}");
+    }
+
+    #[test]
+    fn missing_mcopy_fails_closed_with_the_doctor_hint() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let device = device_file(dir.path());
+        let (manifest_path, key_anchor) = signed_manifest_and_anchor(dir.path());
+        let runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
+        let err = verify_device_with(
+            &runner,
+            &args(&device, &manifest_path, Some(&key_anchor)),
+            Some(Path::new(FAKE_VERITYSETUP)),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("mcopy not found on PATH") && err.contains("shuttle doctor"),
+            "{err}"
+        );
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.first().is_some_and(|t| t.ends_with("mcopy"))),
+            "no mcopy ran on the missing-tool path"
+        );
+    }
+
+    #[test]
+    fn uki_esp_name_matches_only_exact_and_counted_variants() {
+        assert!(uki_esp_name_matches(
+            "nau-demo_1.0.0.efi",
+            "nau-demo_1.0.0.efi"
+        ));
+        assert!(uki_esp_name_matches(
+            "nau-demo_1.0.0+3-0.efi",
+            "nau-demo_1.0.0.efi"
+        ));
+        assert!(uki_esp_name_matches(
+            "nau-demo_1.0.0+0-3.efi",
+            "nau-demo_1.0.0.efi"
+        ));
+        // Different generation / extension / tampered suffix: no.
+        assert!(!uki_esp_name_matches(
+            "nau-demo_0.9.0.efi",
+            "nau-demo_1.0.0.efi"
+        ));
+        assert!(!uki_esp_name_matches(
+            "nau-demo_1.0.0.efi.bak",
+            "nau-demo_1.0.0.efi"
+        ));
+        assert!(!uki_esp_name_matches(
+            "nau-demo_1.0.0+x-y.efi",
+            "nau-demo_1.0.0.efi"
+        ));
+        assert!(!uki_esp_name_matches(
+            "nau-demo_1.0.0+3-0-and-more.efi",
+            "nau-demo_1.0.0.efi"
+        ));
+        assert!(!uki_esp_name_matches(
+            "prefixed-nau-demo_1.0.0.efi",
+            "nau-demo_1.0.0.efi"
+        ));
+        assert!(!uki_esp_name_matches(
+            "nau-demo_1.0.0.txt",
+            "nau-demo_1.0.0.efi"
+        ));
     }
 
     #[test]
@@ -1456,6 +2244,7 @@ mod tests {
         let (data_up, hash_up) = expected_guids();
         let body = format!(
             r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
+                {{"start": 2048, "size": 2048, "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "uuid": "AABBCCDD-0011-2233-4455-667788990011", "name": "ESP"}},
                 {{"start": 4096, "size": 4096, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "_empty"}},
                 {{"start": 8192, "size": 256, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "_empty"}}
             ]}}}}"#
@@ -1466,6 +2255,7 @@ mod tests {
                 &runner,
                 &args(&device, &manifest_path, Some(&key_anchor)),
                 Some(Path::new(FAKE_VERITYSETUP)),
+                Some(Path::new(FAKE_MCOPY)),
             )
             .is_ok(),
             "partuuid is the fail-closed identity; the label only warns"
@@ -1489,6 +2279,7 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .expect("auto locates the sysupdate-filled generation");
         assert_eq!(outcome.slot, "b", "the generation sits in slot B");
@@ -1517,6 +2308,7 @@ mod tests {
             &runner,
             &args_with_slot(&device, &manifest_path, Some(&key_anchor), SlotSelector::B),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .expect("the demanded slot carries the generation");
         assert_eq!(outcome.slot, "b");
@@ -1533,6 +2325,7 @@ mod tests {
             &runner,
             &args_with_slot(&device, &manifest_path, Some(&key_anchor), SlotSelector::A),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();
@@ -1568,6 +2361,7 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();
@@ -1592,6 +2386,7 @@ mod tests {
             &runner,
             &args_with_slot(&device, &manifest_path, Some(&key_anchor), SlotSelector::B),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();
@@ -1625,6 +2420,7 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();
@@ -1676,6 +2472,7 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();
@@ -1734,6 +2531,7 @@ mod tests {
             &runner,
             &args(&device, &manifest_path, Some(&key_anchor)),
             Some(Path::new(FAKE_VERITYSETUP)),
+            Some(Path::new(FAKE_MCOPY)),
         )
         .unwrap_err()
         .to_string();

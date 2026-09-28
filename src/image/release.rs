@@ -201,6 +201,7 @@ pub fn publish(
         &manifest_name,
         &crate::sign::keys_dir(&home),
         super::verity::find_veritysetup().as_deref(),
+        super::verity::find_host_tool("mcopy").as_deref(),
         &kp,
     )?;
     report_media_set(&dir, &img_name, &manifest_name, payloads, &kp);
@@ -213,9 +214,10 @@ pub fn publish(
 ///
 /// 1. [`super::verify::verify_device_at`] over the published image +
 ///    published signed manifest under the release's OWN keychain — the
-///    GPT identity, slot resolution, truncation, and dm-verity recompute
-///    `shuttle verify-image` runs, minus the HOME dependency (the release
-///    signs and proves under the same keychain).
+///    GPT identity, slot resolution, truncation, ESP UKI digest (#284),
+///    and dm-verity recompute `shuttle verify-image` runs, minus the
+///    HOME dependency (the release signs and proves under the same
+///    keychain).
 /// 2. The update-night round-trip: the published `SHA256SUMS` verifies
 ///    under its published signature against the pubring the build embeds
 ///    at `/usr/lib/systemd/import-pubring.pgp` — in-process, the exact
@@ -225,6 +227,7 @@ pub fn publish(
 /// run here and stay printed as BLOCKING. Costs one region-extract pass
 /// over the image (the verify-image price) — the release is not in a
 /// hurry; a set that cannot verify its own bytes is not a release.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn self_check(
     runner: &dyn crate::command::CommandRunner,
     dir: &Path,
@@ -232,6 +235,7 @@ pub(crate) fn self_check(
     manifest_name: &str,
     keys_dir: &Path,
     veritysetup: Option<&Path>,
+    mcopy: Option<&Path>,
     kp: &crate::sign::KeyPair,
 ) -> miette::Result<()> {
     let args = super::VerifyImageArgs {
@@ -240,7 +244,7 @@ pub(crate) fn self_check(
         key: None,
         slot: super::SlotSelector::Auto,
     };
-    let outcome = super::verify::verify_device_at(runner, &args, veritysetup, keys_dir)?;
+    let outcome = super::verify::verify_device_at(runner, &args, veritysetup, mcopy, keys_dir)?;
     let sums = std::fs::read(dir.join("SHA256SUMS"))
         .into_diagnostic()
         .wrap_err("reading the published SHA256SUMS")?;
@@ -508,11 +512,35 @@ mod tests {
             snaps: vec![],
             kernel_version: Some("6.11.0".into()),
             cmdline: Some("root=PARTUUID=... quiet".into()),
-            uki: Some("nau-demo_1.0.0.efi".into()),
+            uki: Some(FIXTURE_UKI_NAME.into()),
+            uki_sha3_384: Some(fixture_uki_sha3()),
             esp_partuuid: None,
             roothash: Some(ROOTHASH.into()),
             signatures: Default::default(),
         }
+    }
+
+    /// The UKI filename the fixture manifest pins (the build's
+    /// `{name}_{version}.efi` shape).
+    const FIXTURE_UKI_NAME: &str = "nau-demo_1.0.0.efi";
+
+    /// The UKI bytes the FakeTools' mcopy materializes — the "factory"
+    /// boot content the fixture manifest pins (same helper shape as
+    /// verify.rs's tests, so both sides of the round-trip share one key
+    /// and content shape).
+    fn fixture_uki() -> Vec<u8> {
+        b"UKI-PE-284-FACTORY-BYTES".to_vec()
+    }
+
+    fn fixture_uki_sha3() -> String {
+        use sha3::Digest;
+        let mut hasher = sha3::Sha3_384::new();
+        hasher.update(&fixture_uki());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     fn temp_home(tag: &str) -> (tempfile::TempDir, PathBuf) {
@@ -1006,12 +1034,18 @@ mod tests {
 
     // ── #293 item 4: the self-check EXECUTES the printed advice ──
 
-    /// A runner answering `sfdisk -J` with `body` and `veritysetup` with
-    /// `verity_code`, recording every argv (the verify.rs FakeTools shape —
-    /// the self-check drives the same external seams verify-image does).
+    /// A runner answering `sfdisk -J` with `body`, `veritysetup` with
+    /// `verity_code`, and the mtools calls with the fixture ESP shape
+    /// (recording every argv — the verify.rs FakeTools shape, extended
+    /// for #284: the self-check now drives the ESP content check too).
     struct FakeTools {
         sfdisk_body: String,
         verity_code: i32,
+        /// Names `mdir -b` reports for `EFI/Linux` (covered default: the
+        /// fixture UKI; the extraction materializes [`fixture_uki`]).
+        mdir_listing: Vec<String>,
+        mdir_code: i32,
+        mcopy_payload: Option<Vec<u8>>,
         calls: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
@@ -1020,6 +1054,9 @@ mod tests {
             FakeTools {
                 sfdisk_body,
                 verity_code,
+                mdir_listing: vec![FIXTURE_UKI_NAME.to_string()],
+                mdir_code: 0,
+                mcopy_payload: Some(fixture_uki()),
                 calls: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -1032,28 +1069,72 @@ mod tests {
                 .iter()
                 .any(|argv| argv.first().is_some_and(|t| t.ends_with(tool)))
         }
+
+        /// Snapshot of every recorded argv (the verify.rs FakeTools
+        /// seam — the ESP assertions read the mtools calls).
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
     }
 
     impl crate::command::CommandRunner for FakeTools {
         fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
-            let (code, stderr) = if argv.first().is_some_and(|t| t.ends_with("veritysetup")) {
-                (self.verity_code, "hash mismatch".to_string())
+            let tool = argv.first().map(String::as_str).unwrap_or("");
+            let out = if tool.ends_with("veritysetup") {
+                crate::command::RunnerOutput {
+                    code: self.verity_code,
+                    stdout: Vec::new(),
+                    stderr: "hash mismatch".to_string(),
+                }
+            } else if tool.ends_with("mdir") {
+                let stdout = self
+                    .mdir_listing
+                    .iter()
+                    .map(|n| format!("::/EFI/Linux/{n}\n"))
+                    .collect::<String>();
+                crate::command::RunnerOutput {
+                    code: self.mdir_code,
+                    stdout: stdout.into_bytes(),
+                    stderr: if self.mdir_code == 0 {
+                        String::new()
+                    } else {
+                        "no such directory".to_string()
+                    },
+                }
+            } else if tool.ends_with("mcopy") {
+                match &self.mcopy_payload {
+                    Some(bytes) => {
+                        std::fs::write(argv.last().expect("mcopy target"), bytes)
+                            .expect("fake mcopy write");
+                        crate::command::RunnerOutput {
+                            code: 0,
+                            stdout: Vec::new(),
+                            stderr: String::new(),
+                        }
+                    }
+                    None => crate::command::RunnerOutput {
+                        code: 1,
+                        stdout: Vec::new(),
+                        stderr: "File \"::/EFI/Linux/…\" not found".to_string(),
+                    },
+                }
             } else {
-                (0, String::new())
+                crate::command::RunnerOutput {
+                    code: 0,
+                    stdout: self.sfdisk_body.clone().into_bytes(),
+                    stderr: String::new(),
+                }
             };
-            Ok(crate::command::RunnerOutput {
-                code,
-                stdout: self.sfdisk_body.clone().into_bytes(),
-                stderr,
-            })
+            Ok(out)
         }
     }
 
-    /// The published fixture's single-slot GPT table: root + hash carry the
-    /// roothash-derived PARTUUID identity the manifest pins (512-byte
-    /// sectors; the manifest's `esp_partuuid` is None, so the ESP check
-    /// skips — this module's manifest shape).
+    /// The published fixture's single-slot GPT table: ESP + root + hash,
+    /// with root/hash carrying the roothash-derived PARTUUID identity the
+    /// manifest pins (512-byte sectors; the manifest's `esp_partuuid` is
+    /// None, so the ESP is located as the single ESP-typed partition —
+    /// #284's content check runs against it).
     fn golden_gpt_json() -> String {
         let (data, hash) = super::generation_guids_from_roothash(ROOTHASH).unwrap();
         let (data_up, hash_up) = (data.to_ascii_uppercase(), hash.to_ascii_uppercase());
@@ -1123,15 +1204,77 @@ mod tests {
             FIXTURE_MANIFEST_NAME,
             &keys,
             Some(Path::new("veritysetup")),
+            Some(Path::new("mcopy")),
             &kp,
         )
         .expect("the published set must pass its own self-check");
         // The advice is EXECUTED, not printed: the runner really invoked
-        // sfdisk (GPT read) and veritysetup (dm-verity recompute).
+        // sfdisk (GPT read), mcopy (the #284 ESP UKI extraction), and
+        // veritysetup (dm-verity recompute).
         assert!(runner.called("sfdisk"), "the GPT was read in-process");
+        assert!(
+            runner.called("mcopy"),
+            "the ESP UKI was pulled off the published image in-process"
+        );
         assert!(
             runner.called("veritysetup"),
             "the dm-verity recompute ran in-process"
+        );
+    }
+
+    #[test]
+    fn release_self_check_covers_the_esp_uki_digest() {
+        // #284 at the release layer: the self-check proves the published
+        // image's ESP carries the UKI the SIGNED manifest pins — pulling
+        // the named file out of the published image and hashing it.
+        let (_work, release, keys, kp) = self_check_fixture("release");
+        let runner = FakeTools::new(golden_gpt_json(), 0);
+        self_check(
+            &runner,
+            &release,
+            FIXTURE_IMG_NAME,
+            FIXTURE_MANIFEST_NAME,
+            &keys,
+            Some(Path::new("veritysetup")),
+            Some(Path::new("mcopy")),
+            &kp,
+        )
+        .expect("a covered ESP passes the self-check");
+        let mcopy = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.first().is_some_and(|t| t.ends_with("mcopy")))
+            .expect("mcopy ran");
+        assert_eq!(
+            mcopy[3],
+            format!("::EFI/Linux/{FIXTURE_UKI_NAME}"),
+            "the manifest's UKI name, verbatim"
+        );
+    }
+
+    #[test]
+    fn release_self_check_refuses_a_tampered_esp_uki() {
+        // The published image's ESP carries UKI bytes that do not match
+        // the signed digest: the release must refuse to publish that set.
+        let (_work, release, keys, kp) = self_check_fixture("release");
+        let mut runner = FakeTools::new(golden_gpt_json(), 0);
+        let mut tampered = fixture_uki();
+        tampered[7] ^= 0x01;
+        runner.mcopy_payload = Some(tampered);
+        let err = self_check(
+            &runner,
+            &release,
+            FIXTURE_IMG_NAME,
+            FIXTURE_MANIFEST_NAME,
+            &keys,
+            Some(Path::new("veritysetup")),
+            Some(Path::new("mcopy")),
+            &kp,
+        )
+        .expect_err("a tampered ESP UKI must refuse the release");
+        assert!(
+            format!("{err:#}").contains("ESP content mismatch"),
+            "the refusal names the ESP region: {err:#}"
         );
     }
 
@@ -1146,6 +1289,7 @@ mod tests {
             FIXTURE_MANIFEST_NAME,
             &keys,
             Some(Path::new("veritysetup")),
+            Some(Path::new("mcopy")),
             &kp,
         )
         .expect_err("a verity-mismatching medium must refuse the release");
@@ -1169,6 +1313,7 @@ mod tests {
             FIXTURE_MANIFEST_NAME,
             &keys,
             Some(Path::new("veritysetup")),
+            Some(Path::new("mcopy")),
             &kp,
         )
         .expect_err("tampered sums must refuse");
@@ -1197,6 +1342,7 @@ mod tests {
                 FIXTURE_MANIFEST_NAME,
                 &foreign_keys,
                 Some(Path::new("veritysetup")),
+                Some(Path::new("mcopy")),
                 &test_kp(7),
             )
             .is_err(),
