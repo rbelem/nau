@@ -412,8 +412,11 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
     );
     s.push_str("  - systemctl restart ssh || systemctl restart sshd\n");
     // ADR-0045 D1: scrub the user-data blob once sshd serves the injected
-    // key — the metadata service would otherwise keep exposing the private
-    // half to anything that can read the instance metadata.
+    // key. NOTE (ADR-0045 addendum, 2026-09-28): this removes only the local
+    // copy — Hetzner's metadata service serves the create-time blob for the
+    // life of the server and re-serves it on rebuild; the private half must
+    // be assumed recoverable in-guest for the machine's lifetime. See the
+    // ADR addendum and the generate-and-publish proposal (#283).
     s.push_str(
         "  - sh -c 'rm -f /var/lib/cloud/instances/*/user-data.txt /var/lib/cloud/instance/user-data.txt'\n",
     );
