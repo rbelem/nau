@@ -797,6 +797,10 @@ section {
   .comms .ipa { width: auto; }
   .comms tr:last-child th, .comms tr:last-child td { border-bottom: 0; }
 
+  /* long lane URLs in running text must not clip — the page forbids
+     horizontal scroll (overflow-x: clip), so inline code wraps instead */
+  p code, .sec-lede code, li code, td code { overflow-wrap: anywhere; }
+
   /* manifest rows -> cards */
   .manifest li {
     grid-template-columns: 3rem 1fr;
