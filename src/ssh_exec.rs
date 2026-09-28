@@ -36,9 +36,31 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use miette::WrapErr;
+
 use crate::command::{exit_code, CommandRunner};
 use crate::lua::WorkerConfig;
 use crate::worker::{CapabilityDoc, JobManifest, JobResult, WORKER_PROTOCOL_VERSION};
+
+/// The SSH channel itself died: ssh/scp could not be spawned, or exited
+/// nonzero (connection refused, dropped session, keepalive deadline). The
+/// transport emits this as the typed payload of its leaf errors so the
+/// scheduler's loss-vs-build classification ([`crate::build_sched`]) keys
+/// on the type through the error's source chain — a reworded message, or
+/// remote-controlled stderr, can never flip the class (#193 review F3).
+/// The rendered message is unchanged.
+#[derive(Debug)]
+pub struct ChannelLoss(pub String);
+
+impl std::fmt::Display for ChannelLoss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ChannelLoss {}
+
+impl miette::Diagnostic for ChannelLoss {}
 
 /// TCP connect bound for every ssh/scp hop (the curl `--connect-timeout`
 /// convention: the bound rides the argv).
@@ -210,6 +232,19 @@ impl<R: CommandRunner> SshExecutor<R> {
         &self.worker.address
     }
 
+    /// The snap arch this worker's entry DECLARES (its `arch` override
+    /// mapped through the triplet rules); `None` when undeclared, which
+    /// accepts any reported arch. The bare preflight asserts this against
+    /// the worker's `__worker-cap` report before anything dispatches —
+    /// a declared-vs-reported mismatch is a config error refused at
+    /// preflight, not a mid-run world-stopper (#193 review F1).
+    pub fn declared_arch(&self) -> Option<&str> {
+        self.worker
+            .arch
+            .as_deref()
+            .and_then(crate::snap::triplet_arch)
+    }
+
     /// The ingest directory for `manifest`: `<cache>/remote/<jm1_<hex>>/`
     /// — the job-manifest identity namespace (ADR-0040 Decision 6), never
     /// a `v4:` closure key. The slug is the identity with its `:`
@@ -353,15 +388,18 @@ impl<R: CommandRunner> SshExecutor<R> {
         argv.push(self.destination());
         argv.push(remote_cmd.to_string());
         let out = self.runner.run(&argv).map_err(|e| {
-            miette::miette!("ssh to '{}' cannot be spawned: {e}", self.worker.address)
+            miette::Error::new(ChannelLoss(format!(
+                "ssh to '{}' cannot be spawned: {e}",
+                self.worker.address
+            )))
         })?;
         if exit_code(&out) != 0 {
-            return Err(miette::miette!(
+            return Err(miette::Error::new(ChannelLoss(format!(
                 "ssh to '{}' failed (code {}): {}",
                 self.worker.address,
                 exit_code(&out),
                 stderr_tail(&out.stderr)
-            ));
+            ))));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -384,15 +422,18 @@ impl<R: CommandRunner> SshExecutor<R> {
         argv.push(src.to_string());
         argv.push(dst.to_string());
         let out = self.runner.run(&argv).map_err(|e| {
-            miette::miette!("scp to '{}' cannot be spawned: {e}", self.worker.address)
+            miette::Error::new(ChannelLoss(format!(
+                "scp to '{}' cannot be spawned: {e}",
+                self.worker.address
+            )))
         })?;
         if exit_code(&out) != 0 {
-            return Err(miette::miette!(
+            return Err(miette::Error::new(ChannelLoss(format!(
                 "scp with '{}' failed (code {}): {}",
                 self.worker.address,
                 exit_code(&out),
                 stderr_tail(&out.stderr)
-            ));
+            ))));
         }
         Ok(())
     }
@@ -406,7 +447,7 @@ impl<R: CommandRunner> SshExecutor<R> {
         self.ensure_known_hosts()?;
         let stdout = self
             .run_ssh(&format!("{REMOTE_SHUTTLE} __worker-cap"))
-            .map_err(|e| miette::miette!("preflight reachability: {e:#}"))?;
+            .wrap_err("preflight reachability")?;
         let cap: CapabilityDoc = serde_json::from_str(stdout.trim()).map_err(|e| {
             miette::miette!(
                 "preflight cap: worker '{}' did not return a capability document: {e}",
@@ -539,9 +580,9 @@ impl<R: CommandRunner> SshExecutor<R> {
             .run_ssh(&format!(
                 "{REMOTE_SHUTTLE} __worker-job {REMOTE_BASE}/jobs/{id}/job.json"
             ))
-            .map_err(|e| {
-                miette::miette!(
-                    "dispatch failed on worker '{}' for job {id}: {e:#}",
+            .wrap_err_with(|| {
+                format!(
+                    "dispatch failed on worker '{}' for job {id}",
                     self.worker.address
                 )
             })?;
@@ -620,7 +661,7 @@ impl<R: CommandRunner> SshExecutor<R> {
     fn held_objects(&self) -> miette::Result<BTreeSet<String>> {
         let stdout = self
             .run_ssh(&format!("ls {REMOTE_BASE}/objects 2>/dev/null || true"))
-            .map_err(|e| miette::miette!("delta sync: cannot list the worker's objects: {e:#}"))?;
+            .wrap_err("delta sync: cannot list the worker's objects")?;
         Ok(stdout
             .lines()
             .map(str::trim)
@@ -640,11 +681,7 @@ impl<R: CommandRunner> SshExecutor<R> {
                     "cd {REMOTE_BASE}/objects && sha256sum {}",
                     chunk.join(" ")
                 ))
-                .map_err(|e| {
-                    miette::miette!(
-                        "delta sync: cannot re-hash the worker's claimed objects: {e:#}"
-                    )
-                })?;
+                .wrap_err("delta sync: cannot re-hash the worker's claimed objects")?;
             for line in stdout.lines() {
                 let mut it = line.split_whitespace();
                 let (Some(got), Some(name)) = (it.next(), it.next()) else {
@@ -699,9 +736,9 @@ impl<R: CommandRunner> SshExecutor<R> {
         // The landing directory exists before the first push — a fresh
         // worker holds nothing yet.
         self.run_ssh(&format!("mkdir -p {REMOTE_BASE}/incoming"))
-            .map_err(|e| miette::miette!("delta sync: cannot prepare the landing area: {e:#}"))?;
+            .wrap_err("delta sync: cannot prepare the landing area")?;
         self.scp_put(tar_path.path(), &incoming)
-            .map_err(|e| miette::miette!("delta sync: {e:#}"))?;
+            .wrap_err("delta sync")?;
 
         let staging = format!("{REMOTE_BASE}/staging/{nonce}");
         let stdout = self
@@ -709,15 +746,18 @@ impl<R: CommandRunner> SshExecutor<R> {
                 "mkdir -p {staging} && tar -C {staging} -xf {incoming} && cd {staging} && sha256sum {}",
                 missing.join(" ")
             ))
-            .map_err(|e| {
-                miette::miette!("delta sync: arrival verification failed on '{}': {e:#}", self.worker.address)
+            .wrap_err_with(|| {
+                format!(
+                    "delta sync: arrival verification failed on '{}'",
+                    self.worker.address
+                )
             })?;
         verify_arrival(self, &stdout, missing)?;
 
         self.run_ssh(&format!(
             "mkdir -p {REMOTE_BASE}/objects && mv {staging}/* {REMOTE_BASE}/objects/ && rm -rf {staging} {incoming}"
         ))
-        .map_err(|e| miette::miette!("delta sync: cannot commit the verified objects: {e:#}"))?;
+        .wrap_err("delta sync: cannot commit the verified objects")?;
         Ok(())
     }
 
@@ -740,9 +780,9 @@ impl<R: CommandRunner> SshExecutor<R> {
             format!(" && ln -f {} {payload}", sources.join(" "))
         };
         self.run_ssh(&format!("mkdir -p {payload} {out}{link}"))
-            .map_err(|e| {
-                miette::miette!(
-                    "dispatch: cannot prepare the job directory on '{}': {e:#}",
+            .wrap_err_with(|| {
+                format!(
+                    "dispatch: cannot prepare the job directory on '{}'",
                     self.worker.address
                 )
             })?;
@@ -750,7 +790,7 @@ impl<R: CommandRunner> SshExecutor<R> {
             .map_err(|e| miette::miette!("dispatch: cannot stage the job file: {e}"))?;
         let job_file = crate::worker::write_job_file(stage.path(), manifest)?;
         self.scp_put(&job_file, &format!("{job}/job.json"))
-            .map_err(|e| miette::miette!("dispatch: {e:#}"))?;
+            .wrap_err("dispatch")?;
         Ok(())
     }
 
@@ -774,9 +814,7 @@ impl<R: CommandRunner> SshExecutor<R> {
                 &format!("{REMOTE_BASE}/jobs/{id}/out/{}", art.filename),
                 &dst,
             )
-            .map_err(|e| {
-                miette::miette!("collect: cannot fetch artifact '{}': {e:#}", art.filename)
-            })?;
+            .wrap_err_with(|| format!("collect: cannot fetch artifact '{}'", art.filename))?;
             let got = crate::oci::sha256_file(&dst).map_err(|e| {
                 miette::miette!("collect: cannot hash artifact '{}': {e}", art.filename)
             })?;

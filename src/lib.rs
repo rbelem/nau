@@ -9,6 +9,7 @@ pub mod checks;
 pub mod cli;
 pub mod command;
 pub mod confine;
+pub mod coordinator;
 pub mod dep_fetch;
 pub mod deps;
 pub mod desktop;
