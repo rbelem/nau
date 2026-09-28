@@ -167,6 +167,7 @@ fn production_request(prelude: &str, index_data: Value, label: &str, source: &st
         entry: source.to_string(),
         entry_label: label.to_string(),
         allow_fetch: false,
+        constraint: None,
     }
 }
 
@@ -414,11 +415,15 @@ fn corpus_dual_eval_parity() {
         }
         roots.push("pkgs".to_string());
         let request_lua = format!(
-            "return {{\n  prelude = {},\n  entry = {},\n  entry_label = {},\n  arch = {},\n  roots = {{{}}},\n  index_data = {},\n}}\n",
+            "return {{\n  prelude = {},\n  entry = {},\n  entry_label = {},\n  arch = {},\n  constraint = {},\n  roots = {{{}}},\n  index_data = {},\n}}\n",
             lua_string_lit(&req.prelude),
             lua_string_lit(&source),
             lua_string_lit(def),
             lua_string_lit(&req.arch),
+            match &req.constraint {
+                Some(c) => lua_string_lit(c),
+                None => "nil".to_string(),
+            },
             roots
                 .iter()
                 .map(|r| lua_string_lit(r))

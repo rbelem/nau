@@ -492,6 +492,44 @@ function snap(opts)
         end
     end
 
+    -- lines: the version lines of a constraint-selected package
+    -- (ADR-0047 Decision 4). A map of line → { version, url, sha256 };
+    -- the recipe selects one entry via the `constraint` global and lifts
+    -- its fields into `version`/`source`. Schema-checked here so a
+    -- malformed entry dies at eval with a named error instead of surfacing
+    -- as a mystery nil at selection time. Pure data — carried verbatim;
+    -- the Rust conversion boundary tolerates it (unknown fields are
+    -- dropped there, selection already happened in Lua).
+    if opts.lines ~= nil then
+        if type(opts.lines) ~= "table" then
+            error("snap(): 'lines' must be a table of line → { version, url, sha256 }, got " .. type(opts.lines), 2)
+        end
+        local count = 0
+        for line, spec in pairs(opts.lines) do
+            count = count + 1
+            if type(line) ~= "string" or line == "" then
+                error(string.format(
+                    "snap(): lines[%s]: line keys must be non-empty strings (the dotted version prefix a constraint selects, e.g. [\"22\"])",
+                    tostring(line)), 2)
+            end
+            if type(spec) ~= "table" then
+                error(string.format("snap(): lines['%s'] must be a table { version, url, sha256 }, got %s", line, type(spec)), 2)
+            end
+            if type(spec.version) ~= "string" then
+                error(string.format("snap(): lines['%s'].version must be a string, got %s", line, type(spec.version)), 2)
+            end
+            if type(spec.url) ~= "string" then
+                error(string.format("snap(): lines['%s'].url must be a string, got %s", line, type(spec.url)), 2)
+            end
+            if type(spec.sha256) ~= "string" then
+                error(string.format("snap(): lines['%s'].sha256 must be a string, got %s", line, type(spec.sha256)), 2)
+            end
+        end
+        if count == 0 then
+            error("snap(): 'lines' must not be empty — declare at least one version line", 2)
+        end
+    end
+
     -- deps: dependency-closure resolvers (ADR-0017, issues #13/#36/#40).
     -- `deps = { npm = { lock = "package-lock.json" } }`,
     -- `deps = { pip = { lock = "requirements.lock", index = "https://..." } }`,
@@ -959,6 +997,16 @@ end
 function fetch(url)
     error("fetch() is disabled for this eval (--offline or hermetic context)", 2)
 end
+
+--- The eval-context constraint (ADR-0047 Decision 4): the pod spec's
+-- `@constraint` (`node@22` → "22"), injected by the Rust worker before
+-- the definition evaluates; nil when the eval has no pod context (plain
+-- builds, manifests). Version-lined recipes select their line from it
+-- and MUST refuse a constraint naming no declared line — never silently
+-- pin a default. Selection is pure data: fetch() at selection is banned
+-- because the lockfile pin must reproduce it.
+-- @usage local line = constraint or "26"
+-- constraint = "22"
 
 function pin(name, opts)
     if type(name) ~= "string" then

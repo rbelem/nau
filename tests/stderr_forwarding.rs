@@ -23,6 +23,7 @@ fn request(label: &str, source: &str) -> EvalRequest {
         entry: source.to_string(),
         entry_label: label.to_string(),
         allow_fetch: false,
+        constraint: None,
     }
 }
 

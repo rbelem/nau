@@ -311,6 +311,11 @@ local function run()
   -- 3. index() override — the Rust callback analog.
   rawset(_G, "index", make_index(R.index_data, R.arch))
 
+  -- 3b. the eval-context constraint (ADR-0047): the request carries it
+  --     verbatim; nil when the eval has no pod context. build_worker_lua
+  --     always sets the global, so the driver mirrors that exactly.
+  rawset(_G, "constraint", R.constraint)
+
   -- 4. require over allowlisted roots.
   rawset(_G, "require", make_require(R.roots))
 

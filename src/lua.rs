@@ -553,7 +553,18 @@ fn definition_dir_from_label(label: &str) -> Option<std::path::PathBuf> {
 /// Like `evaluate_file` but takes the Lua source string directly instead of
 /// reading from disk. Used for embedded packages that don't exist as files.
 pub fn evaluate_string(label: &str, source: &str) -> miette::Result<Outputs> {
-    let ok = run_worker_for(label, source)?;
+    evaluate_string_with_constraint(label, source, None)
+}
+
+/// [`evaluate_string`] with the eval-context constraint (ADR-0047): the
+/// pod spec's `@constraint`, exposed to the recipe as the `constraint`
+/// global for version-line selection.
+pub fn evaluate_string_with_constraint(
+    label: &str,
+    source: &str,
+    constraint: Option<&str>,
+) -> miette::Result<Outputs> {
+    let ok = run_worker_for(label, source, constraint)?;
     for diag in &ok.diagnostics {
         crate::output::warn(diag);
     }
@@ -592,6 +603,19 @@ pub fn evaluate_file(path: &str) -> miette::Result<Outputs> {
         .into_diagnostic()
         .wrap_err_with(|| format!("could not read {}", path))?;
     evaluate_string(path, &source)
+}
+
+/// [`evaluate_file`] with the eval-context constraint (ADR-0047): the
+/// pod spec's `@constraint`, exposed to the recipe as the `constraint`
+/// global for version-line selection.
+pub fn evaluate_file_with_constraint(
+    path: &str,
+    constraint: Option<&str>,
+) -> miette::Result<Outputs> {
+    let source = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("could not read {}", path))?;
+    evaluate_string_with_constraint(path, &source, constraint)
 }
 
 // ── Evaluation with global inputs ──
@@ -715,7 +739,7 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
     }
 
     let mut diagnostics: Vec<CheckDiagnostic> = Vec::new();
-    let ok = match run_worker_for(label, source) {
+    let ok = match run_worker_for(label, source, None) {
         Ok(ok) => ok,
         Err(e) => return failed(diagnostics, format!("{e:#}")),
     };
@@ -952,7 +976,7 @@ pub fn lint_eval_file(path: &str) -> miette::Result<LintEval> {
     let source = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("could not read {}", path))?;
-    let ok = run_worker_for(path, &source)?;
+    let ok = run_worker_for(path, &source, None)?;
     let definition_dir = definition_dir_from_label(path);
 
     let lua = mlua::Lua::new();
@@ -991,7 +1015,7 @@ pub fn evaluate_images_file(path: &str) -> miette::Result<HashMap<String, ImageD
     let source = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("could not read {}", path))?;
-    let ok = run_worker_for(path, &source)?;
+    let ok = run_worker_for(path, &source, None)?;
     for diag in &ok.diagnostics {
         crate::output::warn(diag);
     }
@@ -1023,7 +1047,13 @@ pub fn evaluate_images_file(path: &str) -> miette::Result<HashMap<String, ImageD
 
 /// Build the full worker request for one definition eval: prelude, index
 /// data, and source all cross the pipe; the child reads no project files.
-fn eval_request(label: &str, source: &str) -> miette::Result<crate::isolate::EvalRequest> {
+/// `constraint` is the pod spec's selected line (ADR-0047), or `None` for
+/// every constraint-free eval (plain builds, manifests, checks).
+fn eval_request(
+    label: &str,
+    source: &str,
+    constraint: Option<&str>,
+) -> miette::Result<crate::isolate::EvalRequest> {
     let arch = std::env::var("SHUTTLE_ARCH").unwrap_or_else(|_| "amd64".into());
     let index_path = std::env::var("SHUTTLE_INDEX_PATH")
         .map(std::path::PathBuf::from)
@@ -1041,11 +1071,16 @@ fn eval_request(label: &str, source: &str) -> miette::Result<crate::isolate::Eva
         // The CLI sets SHUTTLE_OFFLINE when --offline is parsed; the
         // eval worker then refuses fetch() with a named error.
         allow_fetch: std::env::var("SHUTTLE_OFFLINE").is_err(),
+        constraint: constraint.map(str::to_string),
     })
 }
 
-fn run_worker_for(label: &str, source: &str) -> miette::Result<crate::isolate::WorkerOk> {
-    let req = eval_request(label, source)?;
+fn run_worker_for(
+    label: &str,
+    source: &str,
+    constraint: Option<&str>,
+) -> miette::Result<crate::isolate::WorkerOk> {
+    let req = eval_request(label, source, constraint)?;
     crate::isolate::run_eval(&req)
 }
 
@@ -1811,5 +1846,134 @@ mod tests {
             "error should list the valid fields: {}",
             err
         );
+    }
+
+    // ── The eval-context constraint (ADR-0047 Decision 4) ──
+    //
+    // build_worker_lua injects the pod spec's `@constraint` as the
+    // `constraint` global before the definition evaluates (nil when
+    // unconstrained). These tests mirror that injection exactly — a fresh
+    // VM, the DSL prelude, then `globals().set("constraint", …)` — the
+    // same boundary the real worker crosses (the subprocess-carrying side
+    // is covered in tests/eval_subprocess.rs).
+
+    /// A minimal version-lined recipe in the shape of pkgs/n/node.lua:
+    /// selects version/source from `lines` by the constraint global and
+    /// REFUSES a constraint naming no declared line.
+    const LINED_RECIPE: &str = r#"
+local lines = {
+    ["26"] = { version = "26.7.0", url = "https://example.test/v26.tgz", sha256 = "a" },
+    ["22"] = { version = "22.23.3", url = "https://example.test/v22.tgz", sha256 = "b" },
+}
+local line = constraint or "26"
+local picked = lines[line]
+if picked == nil then
+    error(string.format("lined: constraint '@%s' selects no declared line", tostring(line)))
+end
+return {
+    default = snap {
+        name = "lined",
+        version = picked.version,
+        source = { url = picked.url, sha256 = picked.sha256 },
+        lines = lines,
+    },
+}
+"#;
+
+    /// Evaluate `source` with the constraint global set the way the worker
+    /// sets it, and return the parsed SnapMeta of the single output.
+    fn eval_constrained(source: &str, constraint: Option<&str>) -> crate::snap::SnapMeta {
+        let lua = with_dsl();
+        lua.globals()
+            .set("constraint", constraint.map(str::to_string))
+            .unwrap();
+        let value: Value = lua.load(source).eval().expect("lined recipe must eval");
+        let Value::Table(t) = &value else {
+            panic!("expected output table");
+        };
+        let default: Value = t.get("default").unwrap();
+        crate::snap::SnapMeta::from_lua_value(&default).expect("output must parse as SnapMeta")
+    }
+
+    #[test]
+    fn constraint_selects_the_default_line_when_nil() {
+        // No pod context: `constraint` is nil, the recipe falls to its
+        // default (the current 26 line) — the pre-change behavior.
+        let meta = eval_constrained(LINED_RECIPE, None);
+        assert_eq!(meta.version, "26.7.0");
+    }
+
+    #[test]
+    fn constraint_selects_the_named_line() {
+        let meta = eval_constrained(LINED_RECIPE, Some("22"));
+        assert_eq!(meta.version, "22.23.3");
+        match meta.source {
+            Some(crate::snap::SourceSpec::Pinned { url, sha256 }) => {
+                assert_eq!(url, "https://example.test/v22.tgz");
+                assert_eq!(sha256, "b");
+            }
+            other => panic!("expected pinned source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constraint_naming_no_line_refuses_at_eval() {
+        // The hard edge: a constraint whose line the recipe no longer
+        // declares must FAIL the eval (the sync-time refusal of ADR-0047)
+        // — never fall back to a default and silently re-pin.
+        let lua = with_dsl();
+        lua.globals().set("constraint", "20".to_string()).unwrap();
+        let result: Result<Value, mlua::Error> = lua.load(LINED_RECIPE).eval();
+        let err = result.expect_err("an undeclared line must refuse");
+        assert!(
+            err.to_string().contains("selects no declared line"),
+            "refusal must name the missing line: {err}"
+        );
+    }
+
+    #[test]
+    fn lines_schema_rejects_non_table() {
+        let result = eval_with_dsl(r#"return snap { name = "x", version = "1", lines = "22" }"#);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("'lines' must be a table"),
+            "error should name the lines field"
+        );
+    }
+
+    #[test]
+    fn lines_schema_requires_version_url_sha256_per_line() {
+        for body in [
+            r#"lines = { ["22"] = { url = "u", sha256 = "s" } }"#, // no version
+            r#"lines = { ["22"] = { version = "v", sha256 = "s" } }"#, // no url
+            r#"lines = { ["22"] = { version = "v", url = "u" } }"#, // no sha256
+            r#"lines = { ["22"] = "22.0.1" }"#,                    // not a table
+            r#"lines = { [22] = { version = "v", url = "u", sha256 = "s" } }"#, // non-string key
+        ] {
+            let src = format!(r#"return snap {{ name = "x", version = "1", {body} }}"#);
+            let result = eval_with_dsl(&src);
+            assert!(result.is_err(), "lines entry must refuse: {body}");
+            assert!(
+                result.unwrap_err().to_string().contains("lines"),
+                "refusal must name the lines field: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn lines_schema_accepts_a_well_formed_table() {
+        let result = eval_with_dsl(
+            r#"return snap {
+                name = "x", version = "1",
+                lines = {
+                    ["26"] = { version = "26.7.0", url = "https://e/v26", sha256 = "a" },
+                    ["22"] = { version = "22.23.3", url = "https://e/v22", sha256 = "b" },
+                },
+            }"#,
+        );
+        assert!(result.is_ok(), "a well-formed lines table must validate");
     }
 }
