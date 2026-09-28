@@ -86,6 +86,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use miette::{IntoDiagnostic, WrapErr};
+use pgp::composed::{DetachedSignature, SignedPublicKey};
 
 use crate::manifest::{ImageManifest, ManifestInput};
 
@@ -1567,6 +1568,249 @@ fn from_hex32(s: &str) -> miette::Result<[u8; 32]> {
     Ok(out)
 }
 
+// ── Sysupdate manifest signing (ADR-0024 §4, #267) ──
+//
+// systemd-sysupdate enforces the update channel ITSELF: a url-file
+// transfer with `Verify=yes` fetches the release media's `SHA256SUMS`
+// manifest plus a detached OpenPGP signature (`SHA256SUMS.gpg`) and
+// verifies the signature with gpg against the keyring at
+// `/usr/lib/systemd/import-pubring.pgp` inside the running rootfs
+// (sysupdate.d(5) — the device's verity-protected copy of the file is the
+// trust anchor). This layer produces exactly those artifacts from the
+// ONE ceremony key:
+//
+// - [`import_pubring_pgp`] — the device trust anchor: a transferable
+//   OpenPGP public key whose secret half IS the ceremony seed (the v4
+//   EdDSALegacy framing of the same ed25519 key that signs image
+//   manifests). One secret, two encodings; a rotation or revocation of
+//   the ceremony key is the same act for both.
+// - [`sign_sysupdate_manifest`] — the `SHA256SUMS.gpg` detached
+//   signature over the manifest's RAW bytes. No canonicalization exists
+//   or may exist here: the signed body is byte-for-byte what sysupdate
+//   downloads, so there is no third scheme alongside the eval-manifest
+//   and image-manifest canonicalizations (their rule — one canonical
+//   definition per manifest type — stays intact; this layer has none).
+//
+// Determinism: the key derivation is direct (no rng), and every
+// OpenPGP creation-time subpacket is pinned to the seed epoch
+// (`crate::uc::seed_epoch`) like the rest of the release media, so
+// two runs with the same ceremony key and the same SOURCE_DATE_EPOCH
+// produce byte-identical `import-pubring.pgp` and `SHA256SUMS.gpg`.
+
+/// The OpenPGP user id carried by the ceremony key's sysupdate identity
+/// (`import-pubring.pgp`). Pinned — it is part of the key's fingerprint
+/// material, so a change re-fingerprints the device keyring.
+pub const SYSUPDATE_OPENPGP_USER_ID: &str =
+    "shuttle sysupdate signing (ADR-0024 §4 import-pubring.pgp)";
+
+/// Where the device trust anchor lives inside the staged rootfs — the
+/// path systemd-sysupdate reads for `Verify=yes` (sysupdate.d(5)).
+pub const IMPORT_PUBRING_EMBED_PATH: &str = "usr/lib/systemd/import-pubring.pgp";
+
+/// The sysupdate manifest name (what the release publishes and what the
+/// transfers' `Verify=` layer protects). Refusals name it.
+pub const SYSUPDATE_MANIFEST_NAME: &str = "SHA256SUMS";
+
+/// The detached signature sysupdate fetches beside [`SYSUPDATE_MANIFEST_NAME`].
+pub const SYSUPDATE_MANIFEST_SIGNATURE_NAME: &str = "SHA256SUMS.gpg";
+
+/// The OpenPGP creation time pinned into every sysupdate-signature
+/// subpacket: the seed epoch, so media bytes reproduce (ADR-0044 D8).
+fn sysupdate_openpgp_created() -> miette::Result<pgp::types::Timestamp> {
+    let (secs, _) = crate::uc::seed_epoch();
+    pgp::types::Timestamp::try_from(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        .map_err(|e| miette::miette!("seed epoch out of OpenPGP timestamp range: {e}"))
+}
+
+/// The sysupdate OpenPGP key pair built from the ceremony seed: the v4
+/// EdDSALegacy framing (algorithm 22, curve Ed25519) — the framing every
+/// gpg since 2.1 verifies, unlike the RFC 9580 v6 framing. Returns the
+/// secret-key packet (the signer) and its public-key packet (the
+/// certification signee). The ed25519 secret IS the ceremony seed — no
+/// second key exists to guard, mint, or rotate.
+fn sysupdate_openpgp_packets(
+    kp: &KeyPair,
+) -> miette::Result<(pgp::packet::SecretKey, pgp::packet::PublicKey)> {
+    use pgp::crypto::ed25519::Mode;
+    use pgp::crypto::public_key::PublicKeyAlgorithm;
+    use pgp::types::{KeyVersion, PublicParams, SecretParams};
+
+    let secret = pgp::crypto::ed25519::SecretKey::try_from_bytes(kp.seed, Mode::EdDSALegacy)
+        .map_err(|e| miette::miette!("ceremony seed as OpenPGP Ed25519: {e}"))?;
+    let public_params = PublicParams::EdDSALegacy((&secret).into());
+    let secret_params = SecretParams::Plain(pgp::types::PlainSecretParams::EdDSALegacy(
+        pgp::crypto::eddsa_legacy::SecretKey::Ed25519(secret),
+    ));
+    let created = sysupdate_openpgp_created()?;
+    let inner = pgp::packet::PubKeyInner::new(
+        KeyVersion::V4,
+        PublicKeyAlgorithm::EdDSALegacy,
+        created,
+        None,
+        public_params,
+    )
+    .map_err(|e| miette::miette!("sysupdate OpenPGP public key packet: {e}"))?;
+    let public = pgp::packet::PublicKey::from_inner(inner)
+        .map_err(|e| miette::miette!("sysupdate OpenPGP public key packet: {e}"))?;
+    let secret_packet = pgp::packet::SecretKey::new(public.clone(), secret_params)
+        .map_err(|e| miette::miette!("sysupdate OpenPGP secret key packet: {e}"))?;
+    Ok((secret_packet, public))
+}
+
+/// The device trust anchor for `Verify=yes`: the ceremony key as a
+/// transferable OpenPGP public key (public-key packet + user id +
+/// positive-certification self-signature), ready to embed at
+/// [`IMPORT_PUBRING_EMBED_PATH`]. Deterministic — see the section docs.
+pub fn import_pubring_pgp(kp: &KeyPair) -> miette::Result<Vec<u8>> {
+    use pgp::crypto::hash::HashAlgorithm;
+    use pgp::crypto::public_key::PublicKeyAlgorithm;
+    use pgp::packet::{
+        KeyFlags, PacketTrait, SignatureConfig, SignatureType, Subpacket, SubpacketData, UserId,
+    };
+    use pgp::types::KeyDetails;
+
+    let (secret, public) = sysupdate_openpgp_packets(kp)?;
+    let created = sysupdate_openpgp_created()?;
+    let mut keyflags = KeyFlags::default();
+    keyflags.set_certify(true);
+    keyflags.set_sign(true);
+
+    let mut config = SignatureConfig::v4(
+        SignatureType::CertPositive,
+        PublicKeyAlgorithm::EdDSALegacy,
+        HashAlgorithm::Sha256,
+    );
+    config.hashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::SignatureCreationTime(created))
+            .map_err(|e| miette::miette!("creation-time subpacket: {e}"))?,
+        Subpacket::regular(SubpacketData::IssuerFingerprint(secret.fingerprint()))
+            .map_err(|e| miette::miette!("issuer-fingerprint subpacket: {e}"))?,
+        Subpacket::regular(SubpacketData::KeyFlags(keyflags))
+            .map_err(|e| miette::miette!("key-flags subpacket: {e}"))?,
+    ];
+    config.unhashed_subpackets = vec![];
+
+    let user_id = UserId::from_str(Default::default(), SYSUPDATE_OPENPGP_USER_ID)
+        .map_err(|e| miette::miette!("sysupdate OpenPGP user id: {e}"))?;
+    let cert = config
+        .sign_certification(
+            &secret,
+            &public,
+            &pgp::types::Password::empty(),
+            pgp::types::Tag::UserId,
+            &user_id,
+        )
+        .map_err(|e| miette::miette!("sysupdate key self-certification: {e}"))?;
+
+    // Old-style keyring layout: a plain packet stream (key, id, cert).
+    let mut out = Vec::new();
+    public
+        .to_writer_with_header(&mut out)
+        .map_err(|e| miette::miette!("serializing the pubring key packet: {e}"))?;
+    user_id
+        .to_writer_with_header(&mut out)
+        .map_err(|e| miette::miette!("serializing the pubring user id: {e}"))?;
+    cert.to_writer_with_header(&mut out)
+        .map_err(|e| miette::miette!("serializing the pubring certification: {e}"))?;
+    Ok(out)
+}
+
+/// Sign the sysupdate manifest ([`SYSUPDATE_MANIFEST_NAME`], raw bytes)
+/// under the ceremony key's OpenPGP identity; returns the detached
+/// signature bytes for [`SYSUPDATE_MANIFEST_SIGNATURE_NAME`].
+/// Deterministic — see the section docs.
+pub fn sign_sysupdate_manifest(kp: &KeyPair, manifest_sums: &[u8]) -> miette::Result<Vec<u8>> {
+    use pgp::crypto::hash::HashAlgorithm;
+    use pgp::crypto::public_key::PublicKeyAlgorithm;
+    use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+    use pgp::ser::Serialize;
+    use pgp::types::KeyDetails;
+
+    let (secret, _) = sysupdate_openpgp_packets(kp)?;
+    let created = sysupdate_openpgp_created()?;
+    let mut config = SignatureConfig::v4(
+        SignatureType::Binary,
+        PublicKeyAlgorithm::EdDSALegacy,
+        HashAlgorithm::Sha256,
+    );
+    config.hashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::SignatureCreationTime(created))
+            .map_err(|e| miette::miette!("creation-time subpacket: {e}"))?,
+        Subpacket::regular(SubpacketData::IssuerFingerprint(secret.fingerprint()))
+            .map_err(|e| miette::miette!("issuer-fingerprint subpacket: {e}"))?,
+    ];
+    config.unhashed_subpackets =
+        vec![
+            Subpacket::regular(SubpacketData::IssuerKeyId(secret.legacy_key_id()))
+                .map_err(|e| miette::miette!("issuer-key-id subpacket: {e}"))?,
+        ];
+
+    let signature = config
+        .sign(
+            &secret,
+            &pgp::types::Password::empty(),
+            std::io::Cursor::new(manifest_sums),
+        )
+        .map_err(|e| miette::miette!("signing {SYSUPDATE_MANIFEST_NAME}: {e}"))?;
+    DetachedSignature::new(signature)
+        .to_bytes()
+        .map_err(|e| miette::miette!("serializing {SYSUPDATE_MANIFEST_SIGNATURE_NAME}: {e}"))
+}
+
+/// Device-side enforcement, mirrored from what systemd-sysupdate's gpg
+/// step does with `Verify=yes`: parse the trust anchor
+/// ([`import_pubring_pgp`] bytes, fail closed on anything unparsable or
+/// without a valid self-certification), parse the detached signature
+/// (an empty or unparsable one is an UNSIGNED manifest — a named
+/// refusal, never a pass), and verify it over the manifest's raw bytes.
+/// A failed check names [`SYSUPDATE_MANIFEST_NAME`] — the operator sees
+/// WHICH artifact refused. Returns the verifying key's OpenPGP
+/// fingerprint.
+pub fn verify_sysupdate_manifest_signature(
+    pubring: &[u8],
+    manifest_sums: &[u8],
+    signature: &[u8],
+) -> miette::Result<String> {
+    use pgp::composed::Deserializable;
+    use pgp::types::KeyDetails;
+
+    if signature.is_empty() {
+        return Err(miette::miette!(
+            "{SYSUPDATE_MANIFEST_NAME} carries no signature — refusing an unsigned \
+             sysupdate manifest (fail closed: {SYSUPDATE_MANIFEST_SIGNATURE_NAME} must \
+             verify against import-pubring.pgp; ADR-0024 §4)"
+        ));
+    }
+    let anchor = SignedPublicKey::from_bytes(std::io::Cursor::new(pubring)).map_err(|e| {
+        miette::miette!(
+            "import-pubring.pgp does not parse as an OpenPGP public key — refusing \
+                 to verify {SYSUPDATE_MANIFEST_NAME} against a broken trust anchor: {e}"
+        )
+    })?;
+    anchor.verify_bindings().map_err(|e| {
+        miette::miette!(
+            "import-pubring.pgp fails its own self-certification — refusing to verify \
+             {SYSUPDATE_MANIFEST_NAME} against an unproven trust anchor: {e}"
+        )
+    })?;
+    let detached = DetachedSignature::from_bytes(std::io::Cursor::new(signature)).map_err(|e| {
+        miette::miette!(
+            "{SYSUPDATE_MANIFEST_SIGNATURE_NAME} does not parse as an OpenPGP signature — \
+             treating {SYSUPDATE_MANIFEST_NAME} as unsigned (fail closed): {e}"
+        )
+    })?;
+    detached
+        .verify(&anchor.primary_key, manifest_sums)
+        .map_err(|_| {
+            miette::miette!(
+                "{SYSUPDATE_MANIFEST_NAME} signature verification FAILED — the manifest \
+                 does not match {SYSUPDATE_MANIFEST_SIGNATURE_NAME} under any key in \
+                 import-pubring.pgp; refusing a tampered sysupdate manifest (ADR-0024 §4)"
+            )
+        })?;
+    Ok(anchor.primary_key.fingerprint().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2776,6 +3020,111 @@ mod tests {
         assert!(
             format!("{err:#}").contains("not a valid signature envelope"),
             "{err:#}"
+        );
+    }
+
+    // ── Sysupdate manifest signing (#267) ──
+
+    /// The sums-like sysupdate manifest body the tests sign/verify.
+    fn sysupdate_sums() -> Vec<u8> {
+        b"1111...  nau-cassini-1.0.0-amd64.img\n\
+          2222...  nau-cassini-1.0.0-amd64.manifest.json\n"
+            .to_vec()
+    }
+
+    #[test]
+    fn import_pubring_is_deterministic_and_self_certified() {
+        let (_, kp) = temp_keypair();
+        let first = import_pubring_pgp(&kp).unwrap();
+        let second = import_pubring_pgp(&kp).unwrap();
+        // Byte-stable derivation: the release determinism property (two
+        // builds at the same epoch embed identical keyrings).
+        assert_eq!(first, second);
+        // Parses as a transferable public key whose self-certification
+        // holds — the fail-closed precondition of the verify path.
+        use pgp::composed::Deserializable;
+        let tpk = SignedPublicKey::from_bytes(std::io::Cursor::new(&first)).unwrap();
+        tpk.verify_bindings().unwrap();
+    }
+
+    #[test]
+    fn sysupdate_manifest_signature_roundtrips_through_the_device_anchor() {
+        let (_, kp) = temp_keypair();
+        let sums = sysupdate_sums();
+        let sig = sign_sysupdate_manifest(&kp, &sums).unwrap();
+        let pubring = import_pubring_pgp(&kp).unwrap();
+
+        let fingerprint = verify_sysupdate_manifest_signature(&pubring, &sums, &sig).unwrap();
+        assert_eq!(fingerprint, {
+            use pgp::composed::Deserializable;
+            use pgp::types::KeyDetails;
+            let tpk = SignedPublicKey::from_bytes(std::io::Cursor::new(&pubring)).unwrap();
+            tpk.primary_key.fingerprint().to_string()
+        });
+        // Deterministic: same key + same body → same detached signature
+        // (the release media byte-identity property).
+        assert_eq!(sign_sysupdate_manifest(&kp, &sums).unwrap(), sig);
+    }
+
+    #[test]
+    fn tampered_sysupdate_manifest_is_refused_by_name() {
+        let (_, kp) = temp_keypair();
+        let sums = sysupdate_sums();
+        let sig = sign_sysupdate_manifest(&kp, &sums).unwrap();
+        let pubring = import_pubring_pgp(&kp).unwrap();
+
+        let mut tampered = sums.clone();
+        let last = tampered.len() - 2;
+        tampered[last] ^= 0x01;
+        let err = verify_sysupdate_manifest_signature(&pubring, &tampered, &sig).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("SHA256SUMS"),
+            "the refusal names the manifest: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("FAILED"),
+            "the refusal is a verification failure, not a parse error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn unsigned_sysupdate_manifest_is_refused_by_name() {
+        let (_, kp) = temp_keypair();
+        let sums = sysupdate_sums();
+        let pubring = import_pubring_pgp(&kp).unwrap();
+
+        for sig in [Vec::new(), b"not an openpgp signature".to_vec()] {
+            let err = verify_sysupdate_manifest_signature(&pubring, &sums, &sig).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("SHA256SUMS"),
+                "the refusal names the manifest: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn sysupdate_manifest_signed_by_a_foreign_key_is_refused() {
+        let (_, signer) = temp_keypair();
+        let (_, anchor_key) = temp_keypair();
+        let sums = sysupdate_sums();
+        let sig = sign_sysupdate_manifest(&signer, &sums).unwrap();
+        let pubring = import_pubring_pgp(&anchor_key).unwrap();
+        let err = verify_sysupdate_manifest_signature(&pubring, &sums, &sig).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("SHA256SUMS"),
+            "the refusal names the manifest: {err:#}"
+        );
+    }
+
+    #[test]
+    fn broken_trust_anchor_is_a_named_refusal() {
+        let (_, kp) = temp_keypair();
+        let sums = sysupdate_sums();
+        let sig = sign_sysupdate_manifest(&kp, &sums).unwrap();
+        let err = verify_sysupdate_manifest_signature(b"garbage", &sums, &sig).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("import-pubring.pgp"),
+            "the refusal names the anchor: {err:#}"
         );
     }
 }

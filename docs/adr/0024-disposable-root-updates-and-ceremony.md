@@ -6,6 +6,25 @@ Accepted (2026-09-10). Extends ADR-0011 (security stack, step (d) and (e)),
 ADR-0012 (generations), and ADR-0023 (state partition). Grounded in the
 production-delta grill session (2026-09-10).
 
+Amended (2026-09-28, #267 — the council-flagged signature gap closed): the
+§4 ceremony CLI landed earlier via #64/#51 (`shuttle key
+keygen/rotate/promote/revoke/list/verify`), and #267 closed the emission
+half this ADR flagged: every `update_source` image now embeds the device
+trust anchor `/usr/lib/systemd/import-pubring.pgp` (the ceremony key's
+OpenPGP identity, v4 EdDSALegacy framing of the same ed25519 seed — one
+secret, two encodings; derivation and every creation-time subpacket
+pinned to the seed epoch), the sysupdate transfers emit `Verify=yes`
+(fail-closed: transfers exist only when the ceremony key loaded and the
+anchor shipped), and `image --release` publishes `SHA256SUMS.gpg` — the
+detached signature systemd-sysupdate checks at update time. The
+manifest-signature scheme map is unchanged: eval manifest →
+`eval_manifest_canonical_bytes`, image manifest →
+`image_manifest_canonical_bytes`, and the sysupdate SHA256SUMS layer
+signs RAW bytes (OpenPGP, no canonicalization — no third scheme). The
+QEMU live-update axis (tampered manifest refused by name inside a
+booting guest, and the guest `gpg` binary's payload presence) remains
+deferred and is the next acceptance surface.
+
 ## Context
 
 ADR-0011 step (d) chose systemd-sysupdate for A/B updates and step (e) made a

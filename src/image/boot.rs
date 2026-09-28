@@ -771,21 +771,57 @@ pub(crate) fn transfer_header() -> String {
 
 /// The verify stanza shared by every url-file transfer.
 ///
-/// `Verify=no` skips only the GPG signature check on the SHA256SUMS
-/// manifest (sysupdate would need `/usr/lib/systemd/import-pubring.pgp` +
-/// a gpg binary, neither of which the base rootfs ships). The manifest
-/// itself is still fetched and every downloaded payload is
-/// UNCONDITIONALLY hashed against it — integrity is enforced, only the
-/// signature layer is absent. A production deployment closes that gap with
-/// a trusted import-pubring.pgp (Verify=yes) or shuttle's own signature
-/// story (ADR-0024 §4); until then this is the honest, documented posture
-/// rather than a transfer that fails at runtime (#80).
+/// `Verify=yes` turns systemd-sysupdate into the update channel's
+/// enforcer: sysupdate fetches the release media's `SHA256SUMS` manifest
+/// together with its detached OpenPGP signature (`SHA256SUMS.gpg`,
+/// [`crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME`]) and refuses the
+/// whole transaction unless the signature verifies with gpg against
+/// `/usr/lib/systemd/import-pubring.pgp` inside the running (verity-
+/// protected) rootfs — sysupdate.d(5).
+///
+/// The stanza may only be emitted when that anchor actually ships, and
+/// the emission order makes that unconditional: transfers exist only
+/// under [`super::state::emits_sysupdate`] (`disk.ab` + `update_source`),
+/// and an `update_source` build loads the ceremony key FAIL-CLOSED
+/// (never minting) and embeds the derived pubring beside the transfers —
+/// there is no code path that emits `Verify=yes` without the keyring.
+/// The guest-side `gpg` binary the check shells out to is payload
+/// territory; the QEMU live-update axis (#267, deferred) is what proves
+/// it end-to-end on a booting guest.
+///
+/// The hash layer stays unconditional underneath: every downloaded
+/// payload is still hashed against the manifest (sysupdate.d(5)), so a
+/// tampered payload fails even where the signature gate already refused
+/// the tampered manifest by name.
 pub(crate) const VERIFY_STANZA: &str = "\
-# Verify=no skips only the GPG signature on SHA256SUMS (the base rootfs
-# ships no gpg/import-pubring.pgp). File hashes are still checked against
-# the manifest unconditionally. Production must layer real verification
-# (ADR-0024 §4) on top — see sysupdate.d(5) Verify=.
-Verify=no";
+# Verify=yes: SHA256SUMS must carry a valid detached OpenPGP signature
+# (SHA256SUMS.gpg) against /usr/lib/systemd/import-pubring.pgp — embedded
+# by the build that emitted this file. Payload hashes are checked
+# unconditionally regardless. See sysupdate.d(5) Verify=.
+Verify=yes";
+
+/// Embed the device trust anchor for `Verify=yes`: the ceremony key's
+/// OpenPGP identity at `/usr/lib/systemd/import-pubring.pgp`
+/// ([`crate::sign::IMPORT_PUBRING_EMBED_PATH`]), the exact file
+/// systemd-sysupdate hands to gpg (sysupdate.d(5)). The bytes derive
+/// deterministically from the ceremony key
+/// ([`crate::sign::import_pubring_pgp`]) — same key, same keyring, every
+/// build — and the file lands BEFORE root populate + dm-verity so it is
+/// hashed into the tree the device will trust.
+pub(crate) fn embed_import_pubring(root: &Path, kp: &crate::sign::KeyPair) -> miette::Result<()> {
+    let path = root.join(crate::sign::IMPORT_PUBRING_EMBED_PATH);
+    std::fs::create_dir_all(path.parent().expect("pubring path has a parent")).into_diagnostic()?;
+    let bytes = crate::sign::import_pubring_pgp(kp)
+        .wrap_err("deriving the sysupdate import-pubring.pgp anchor")?;
+    std::fs::write(&path, &bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("writing /{}", crate::sign::IMPORT_PUBRING_EMBED_PATH))?;
+    eprintln!(
+        "  ✓ sysupdate trust anchor: /{} (gpg verifies SHA256SUMS.gpg, Verify=yes)",
+        crate::sign::IMPORT_PUBRING_EMBED_PATH
+    );
+    Ok(())
+}
 
 /// Root slot partition transfer: in-place update of the root slots,
 /// matched by the x86-64 root type GUID + the slot label scheme.

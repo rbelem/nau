@@ -934,6 +934,15 @@ pub(crate) fn build_disk_image_with(
         // UKI transfer (PathRelativeTo=boot) and bless-boot's rename would
         // otherwise race the mount.
         let esp_mount = esp_mount_point(disk_layout);
+        // ADR-0024 §4 (#267): the device trust anchor the transfers'
+        // `Verify=yes` stanza names — /usr/lib/systemd/import-pubring.pgp,
+        // derived deterministically from the ceremony key. Loaded
+        // FAIL-CLOSED like the §4 embeds below: a build with an update
+        // source but no ceremony key never ships unverifiable transfers,
+        // it refuses.
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+        let kp = load_signing_key_fail_closed(&home)?;
+        embed_import_pubring(&root, &kp)?;
         write_sysupdate_transfers(&root, image)?;
         emit_sysupdate_units(&root, esp_mount)?;
         // The transfers carry ProtectVersion=%A, which resolves to the
@@ -4668,19 +4677,41 @@ CONFIG_EXT4_FS=m
     }
 
     #[test]
-    fn sysupdate_transfers_skip_gpg_but_keep_manifest_hash_checks() {
-        // Verify=no is the documented test-environment posture: the GPG
-        // signature layer is skipped (no gpg/import-pubring in the base
-        // rootfs); the SHA256SUMS manifest itself is still fetched and
-        // every payload hash-checked unconditionally (sysupdate.d(5)).
+    fn sysupdate_transfers_verify_signatures_and_keep_hash_checks() {
+        // #267: Verify=yes — the SHA256SUMS manifest must carry a valid
+        // detached OpenPGP signature against the embedded
+        // import-pubring.pgp (the build refuses to emit transfers without
+        // embedding that anchor: same fail-closed ceremony-key gate). The
+        // SHA256SUMS manifest itself is still fetched and every payload
+        // hash-checked unconditionally (sysupdate.d(5)).
         for t in [
             root_transfer("os", "http://u.example/"),
             hash_transfer("os", "http://u.example/"),
             uki_transfer("os", "http://u.example/"),
         ] {
-            assert!(t.lines().any(|l| l.trim() == "Verify=no"), "{t}");
+            assert!(t.lines().any(|l| l.trim() == "Verify=yes"), "{t}");
+            assert!(!t.contains("Verify=no"), "{t}");
             assert!(t.lines().any(|l| l.trim() == "ProtectVersion=%A"), "{t}");
         }
+    }
+
+    #[test]
+    fn import_pubring_is_embedded_at_the_sysupdate_documented_path() {
+        // The exact file systemd-sysupdate's Verify=yes hands to gpg
+        // (sysupdate.d(5)); deterministic from the ceremony key, so two
+        // builds at the same epoch embed identical bytes.
+        let home = tempfile::tempdir().unwrap();
+        let kp = crate::sign::create_secret_key(home.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        embed_import_pubring(root.path(), &kp).unwrap();
+        let embedded =
+            std::fs::read(root.path().join(crate::sign::IMPORT_PUBRING_EMBED_PATH)).unwrap();
+        assert_eq!(embedded, crate::sign::import_pubring_pgp(&kp).unwrap());
+        // A public key: parses, and carries no secret material.
+        use pgp::composed::Deserializable;
+        let tpk =
+            pgp::composed::SignedPublicKey::from_bytes(std::io::Cursor::new(&embedded)).unwrap();
+        tpk.verify_bindings().unwrap();
     }
 
     /// Extract one section's lines from a transfer file body.
