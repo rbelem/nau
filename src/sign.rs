@@ -1591,11 +1591,18 @@ fn from_hex32(s: &str) -> miette::Result<[u8; 32]> {
 //   and image-manifest canonicalizations (their rule — one canonical
 //   definition per manifest type — stays intact; this layer has none).
 //
-// Determinism: the key derivation is direct (no rng), and every
-// OpenPGP creation-time subpacket is pinned to the seed epoch
-// (`crate::uc::seed_epoch`) like the rest of the release media, so
-// two runs with the same ceremony key and the same SOURCE_DATE_EPOCH
-// produce byte-identical `import-pubring.pgp` and `SHA256SUMS.gpg`.
+// Determinism: the key derivation is direct (no rng), and every OpenPGP
+// creation time — the v4 key packet's, the certification's, the detached
+// signature's — pins to a FIXED anchor epoch
+// ([`SYSUPDATE_OPENPGP_EPOCH`]), deliberately DECOUPLED from the
+// per-release `SOURCE_DATE_EPOCH` (#289): the v4 fingerprint is hashed
+// over the key packet's creation time, and that fingerprint is the
+// identity fielded devices resolve — derive it from a per-release epoch
+// and the first differently-epoch'd release re-keys the fleet out of its
+// own updates (gpg "No public key", every update refused). The pubring
+// and signature bytes are byte-identical across epochs for the same
+// ceremony key. (The release media's own byte-determinism pin — image
+// timestamps under SOURCE_DATE_EPOCH — is a different contract, unchanged.)
 
 /// The OpenPGP user id carried by the ceremony key's sysupdate identity
 /// (`import-pubring.pgp`). Pinned — it is part of the key's fingerprint
@@ -1614,12 +1621,28 @@ pub const SYSUPDATE_MANIFEST_NAME: &str = "SHA256SUMS";
 /// The detached signature sysupdate fetches beside [`SYSUPDATE_MANIFEST_NAME`].
 pub const SYSUPDATE_MANIFEST_SIGNATURE_NAME: &str = "SHA256SUMS.gpg";
 
+/// The epoch-stable creation time of the sysupdate OpenPGP identity
+/// (2026-01-01T00:00:00Z, the seed-epoch default): every v4 key packet,
+/// certification, and signature subpacket pins THIS constant, never the
+/// per-release `SOURCE_DATE_EPOCH` (#289). The v4 fingerprint is a hash
+/// over the key packet's creation time, and the fingerprint is the
+/// identity a fielded device's gpg resolves — per-release epochs would
+/// re-fingerprint the key on the first differently-epoch'd release and
+/// refuse every fleet update. This constant keeps the value anchors
+/// baked at the default epoch already carry. The release media's
+/// byte-determinism pin (SOURCE_DATE_EPOCH-clamped image timestamps) is
+/// a separate contract and stays as-is.
+pub const SYSUPDATE_OPENPGP_EPOCH: u64 = 1_767_225_600;
+
 /// The OpenPGP creation time pinned into every sysupdate-signature
-/// subpacket: the seed epoch, so media bytes reproduce (ADR-0044 D8).
+/// subpacket AND the key packet: [`SYSUPDATE_OPENPGP_EPOCH`], a fixed
+/// constant — deliberately NOT the per-release `SOURCE_DATE_EPOCH`
+/// (see the constant's docs; #289).
 fn sysupdate_openpgp_created() -> miette::Result<pgp::types::Timestamp> {
-    let (secs, _) = crate::uc::seed_epoch();
-    pgp::types::Timestamp::try_from(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
-        .map_err(|e| miette::miette!("seed epoch out of OpenPGP timestamp range: {e}"))
+    pgp::types::Timestamp::try_from(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(SYSUPDATE_OPENPGP_EPOCH),
+    )
+    .map_err(|e| miette::miette!("anchor epoch out of OpenPGP timestamp range: {e}"))
 }
 
 /// The sysupdate OpenPGP key pair built from the ceremony seed: the v4
@@ -3064,6 +3087,77 @@ mod tests {
         // Deterministic: same key + same body → same detached signature
         // (the release media byte-identity property).
         assert_eq!(sign_sysupdate_manifest(&kp, &sums).unwrap(), sig);
+    }
+
+    /// Runs `f` with `SOURCE_DATE_EPOCH` pinned to `secs`, restoring the
+    /// prior env afterwards. The env lock serializes the window against
+    /// the other sysupdate tests in this module; no other test in the
+    /// binary asserts env-derived values.
+    fn with_source_date_epoch<T>(secs: u64, f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var("SOURCE_DATE_EPOCH").ok();
+        std::env::set_var("SOURCE_DATE_EPOCH", secs.to_string());
+        let out = f();
+        match prior {
+            Some(v) => std::env::set_var("SOURCE_DATE_EPOCH", v),
+            None => std::env::remove_var("SOURCE_DATE_EPOCH"),
+        }
+        out
+    }
+
+    /// THE #289 invariant: the sysupdate anchor identity is EPOCH-STABLE.
+    /// A device's trust anchor is baked into its rootfs at its image's
+    /// build epoch; a later `--release` under a DIFFERENT SOURCE_DATE_EPOCH
+    /// must carry the SAME key id (the v4 fingerprint is hashed over the
+    /// key packet's creation time), or gpg's issuer lookup dies with
+    /// "No public key" and the whole fleet refuses its updates. Both legs
+    /// sit away from the anchor constant on purpose: the layer must not
+    /// read the per-release epoch AT ALL.
+    #[test]
+    fn sysupdate_anchor_identity_is_epoch_stable_cross_epoch_roundtrip() {
+        let (_, kp) = temp_keypair();
+        let sums = sysupdate_sums();
+
+        // Epoch A: the anchor a device's image baked at build time, and
+        // the signature of the release it shipped with.
+        let (anchor_a, sig_a) = with_source_date_epoch(1_700_000_000, || {
+            (
+                import_pubring_pgp(&kp).unwrap(),
+                sign_sysupdate_manifest(&kp, &sums).unwrap(),
+            )
+        });
+        // Epoch B ≠ A: the NEXT release, built on another machine, another
+        // year, another SOURCE_DATE_EPOCH.
+        let (anchor_b, sig_b) = with_source_date_epoch(1_900_000_000, || {
+            (
+                import_pubring_pgp(&kp).unwrap(),
+                sign_sysupdate_manifest(&kp, &sums).unwrap(),
+            )
+        });
+
+        // Identity stability: the anchor bytes (key packet + user id +
+        // certification — everything the fingerprint hashes over) are
+        // byte-identical across epochs. A moved fingerprint here IS the
+        // fleet-wide refusal.
+        assert_eq!(
+            anchor_a, anchor_b,
+            "the device trust anchor must not move with SOURCE_DATE_EPOCH (#289)"
+        );
+        // The detached signature is byte-identical too (deterministic
+        // EdDSA over an epoch-free subpacket set).
+        assert_eq!(
+            sig_a, sig_b,
+            "SHA256SUMS.gpg must be byte-identical across release epochs (#289)"
+        );
+
+        // The fleet scenario, both directions: verify the epoch-B release
+        // signature against the epoch-A anchor a fielded device carries —
+        // and the mirror leg.
+        verify_sysupdate_manifest_signature(&anchor_a, &sums, &sig_b)
+            .expect("a release signed at epoch B verifies under an anchor baked at epoch A");
+        verify_sysupdate_manifest_signature(&anchor_b, &sums, &sig_a)
+            .expect("a release signed at epoch A verifies under an anchor baked at epoch B");
     }
 
     #[test]
