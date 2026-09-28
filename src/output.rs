@@ -174,7 +174,28 @@ mod tests {
             filename: "tree_2.3.2_amd64.snap".into(),
             sha256: Some("abc".into()),
             sources: None,
+            executor: "local".into(),
+            worker: None,
         }
+    }
+
+    /// Farm events carry executor and worker; local events carry
+    /// executor and omit the worker field entirely (ADR-0040 D8).
+    #[test]
+    fn build_result_json_carries_executor_and_worker_fields() {
+        let mut local = sample_build_result();
+        local.executor = "local".into();
+        local.worker = None;
+        let v = serde_json::to_value(&local).unwrap();
+        assert_eq!(v["executor"], "local");
+        assert!(v.get("worker").is_none(), "local builds omit worker");
+
+        let mut farm = sample_build_result();
+        farm.executor = "ssh".into();
+        farm.worker = Some("nuci.local".into());
+        let v = serde_json::to_value(&farm).unwrap();
+        assert_eq!(v["executor"], "ssh");
+        assert_eq!(v["worker"], "nuci.local");
     }
 
     #[test]
@@ -276,6 +297,13 @@ pub struct BuildResultJson {
     /// single-source builds, which keep the flat `sha256` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sources: Option<Vec<SourcePinJson>>,
+    /// Which executor class built this snap (ADR-0040 Decision 8):
+    /// `local`, or `ssh` for a farm worker.
+    pub executor: String,
+    /// The worker that built it (the executor's attribution name) —
+    /// absent for local builds, present on every farm build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
 }
 
 /// One multi-source entry for JSON output (issue #41).

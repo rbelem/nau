@@ -10,6 +10,7 @@ use shuttle::cache::PackageCache;
 use shuttle::cli::{
     CacheCommand, Cli, Command, DepsCommand, IndexCommand, KeyCommand, PodCommand, RuntimeCommand,
 };
+use shuttle::command::CommandRunner as _;
 use shuttle::image::ImageDeclaration;
 use shuttle::index::{IndexEntry, PackageIndex, StoreRef};
 use shuttle::lock::{LockFile, SourceLockEntry};
@@ -1204,31 +1205,66 @@ fn build_all_deps(
     shuttle::output::set_quiet_build(true);
     shuttle::snap::set_buffer_child_stderr(true);
     let dispatch = AtomicUsize::new(0);
-    let ctx = DepJobCtx {
-        metas: &metas,
-        closures: &closures,
-        cli_archs,
-        output_dir,
-        pkg_cache,
-        lockfile,
-        json,
-        total: to_build,
-        dispatch: &dispatch,
-        executor: "local",
+
+    // The build invocation IS the coordinator (ADR-0040 Decision 4):
+    // with a declared `workers` table the same ready set schedules
+    // across the local slots and one SSH channel per worker. No
+    // `workers` table keeps today's single-executor path, byte for byte.
+    let scheduled = if workers.workers.is_empty() {
+        let ctx = DepJobCtx {
+            metas: &metas,
+            closures: &closures,
+            cli_archs,
+            output_dir,
+            pkg_cache,
+            lockfile,
+            json,
+            total: to_build,
+            dispatch: &dispatch,
+            executor: "local",
+        };
+        let executor = shuttle::build_sched::LocalExecutor::new(|name| ctx.run(name));
+        shuttle::build_sched::run_ready_set_with_executor(&graph, &pre_done, max_workers, &executor)
+            .map(|()| shuttle::build_sched::FarmOutcome {
+                result: Ok(()),
+                workers_lost: Vec::new(),
+            })
+            .unwrap_or_else(|failed| shuttle::build_sched::FarmOutcome {
+                result: Err(failed),
+                workers_lost: Vec::new(),
+            })
+    } else {
+        let ctx = DepJobCtx {
+            metas: &metas,
+            closures: &closures,
+            cli_archs,
+            output_dir,
+            pkg_cache,
+            lockfile,
+            json,
+            total: to_build,
+            dispatch: &dispatch,
+            executor: "local",
+        };
+        run_farm(&ctx, &graph, &pre_done, workers)
+            .unwrap_or_else(|e| refused_run(&graph, &format!("{e:#}")))
     };
-    let executor = shuttle::build_sched::LocalExecutor::new(|name| ctx.run(name));
-    let scheduled = shuttle::build_sched::run_ready_set_with_executor(
-        &graph,
-        &pre_done,
-        max_workers,
-        &executor,
-    );
     shuttle::snap::set_buffer_child_stderr(false);
     shuttle::output::set_quiet_build(false);
 
-    match scheduled {
-        Ok(()) => Ok(()),
-        Err(failed) => Err(report_failed_builds(&failed)),
+    match scheduled.result {
+        Ok(()) => {
+            if !scheduled.workers_lost.is_empty() {
+                shuttle::output::warn(format!(
+                    "worker(s) lost during the run (affected jobs re-dispatched and \
+                     completed): {} — the escape hatch is removing the worker from the \
+                     `workers` table, not retrying",
+                    scheduled.workers_lost.join(", ")
+                ));
+            }
+            Ok(())
+        }
+        Err(failed) => Err(report_failed_builds(&failed, &scheduled.workers_lost)),
     }
 }
 
@@ -1244,14 +1280,24 @@ fn prefix_error_lines(err: &str, name: &str) -> String {
 
 /// Render the scheduler's failed/skipped sets as the run's error: the run
 /// exits nonzero, naming what failed and what was never started because of
-/// it.
-fn report_failed_builds(failed: &shuttle::build_sched::FailedBuilds) -> miette::Error {
+/// it. The farm path adds the workers lost along the way — every failure
+/// names its worker, and the summary names every worker the run lost.
+fn report_failed_builds(
+    failed: &shuttle::build_sched::FailedBuilds,
+    workers_lost: &[String],
+) -> miette::Error {
     let names: Vec<String> = failed.failed.iter().map(|(n, _)| n.clone()).collect();
     let mut msg = format!(
         "{} package build(s) failed: {}",
         failed.failed.len(),
         names.join(", ")
     );
+    if !workers_lost.is_empty() {
+        msg.push_str(&format!(
+            "\nworkers lost during the run: {}",
+            workers_lost.join(", ")
+        ));
+    }
     if !failed.skipped.is_empty() {
         msg.push_str(&format!(
             "\nskipped (failed or unschedulable dependency): {}",
@@ -1262,6 +1308,552 @@ fn report_failed_builds(failed: &shuttle::build_sched::FailedBuilds) -> miette::
         msg.push_str(&format!("\n--- {name} ---\n{err}"));
     }
     miette::miette!("{}", msg)
+}
+
+// ── The farm coordinator (T5, ADR-0040 Decisions 3–8) ──
+
+/// Everything one node's remote job needs, resolved up front on the
+/// orchestrator thread: the recipe bytes, the transitive dep payload
+/// specs (name + version, resolved against the job's single arch at
+/// dispatch time), and the declared sources. An `Err` plans the node
+/// as local-only: the scheduler routes it to the coordinator's slots
+/// and the reason never surfaces unless someone force-dispatches it.
+struct NodeJobPlan {
+    /// The manifest's recipe key: `pkgs/<letter>/<name>.lua`, the
+    /// CWD-relative shape the worker's own `load_meta` resolves.
+    recipe_key: String,
+    recipe: String,
+    /// The job's single build arch (multi-arch nodes stay local).
+    arch: String,
+    /// The `--target` triplet, when the job cross-compiles.
+    cross_target: Option<String>,
+    package: String,
+    /// Transitive `requires` ∪ `build_deps` members, by name. Versions
+    /// resolve through `dep_metas` at dispatch time.
+    deps: Vec<String>,
+    sources: Vec<SourceSpec>,
+}
+
+/// The coordinator-side assembly feeding every worker's dispatches
+/// (the [`shuttle::build_sched::ManifestSource`] implementation).
+/// `manifest_for` is pure — every eval ran up front in
+/// [`precompute_farm_plans`] — so dispatch threads never touch the
+/// isolate worker; only payload staging downloads (curl, the repo's
+/// one network convention) and hash verification run there.
+struct FarmSource<'a> {
+    plans: HashMap<String, NodeJobPlan>,
+    dep_metas: HashMap<String, shuttle::snap::SnapMeta>,
+    dep_closures: HashMap<String, shuttle::cache::BuildClosure>,
+    lockfile: &'a LockFile,
+    output_dir: &'a Path,
+    pkg_cache: Option<&'a PackageCache>,
+    json: bool,
+    epoch: Option<i64>,
+}
+
+impl FarmSource<'_> {
+    /// Resolve one dep's payload: the run's output dir first (built
+    /// earlier in this run, local or remote alike), then the binary
+    /// cache (a dep that was fully cached before the run started).
+    fn dep_payload_path(&self, name: &str, arch: &str) -> miette::Result<PathBuf> {
+        let meta = self.dep_metas.get(name).ok_or_else(|| {
+            miette::miette!("farm job: dep '{name}' has no preloaded meta — plan gap")
+        })?;
+        let filename = format!("{name}_{}_{}.snap", meta.version, arch);
+        let in_output = self.output_dir.join(&filename);
+        if in_output.exists() {
+            return Ok(in_output);
+        }
+        if let (Some(cache), Some(closure)) = (self.pkg_cache, self.dep_closures.get(name)) {
+            if let Some(cached) = cache.lookup(meta, arch, closure) {
+                return Ok(cached);
+            }
+        }
+        Err(miette::miette!(
+            "farm job: dep payload '{filename}' is neither in {} nor in the binary cache — \
+             the scheduler builds deps before dependents, so this is a plan gap",
+            self.output_dir.display()
+        ))
+    }
+
+    /// The pin a source must ship under: the lockfile's recorded hash
+    /// (the fetch phase's current truth), else the recipe's declared
+    /// `sha256`. An unpinned source is a named refusal — the worker
+    /// refuses unpinned sources too (`refuse_unshipped_sources`), and
+    /// v1 ships pinned sources from the coordinator only (ADR-0040
+    /// Decision 6).
+    fn source_pin(&self, spec: &SourceSpec) -> miette::Result<(String, String)> {
+        let url = spec.url();
+        let pin = self
+            .lockfile
+            .lookup_source(url)
+            .or(spec.expected_sha256())
+            .ok_or_else(|| {
+                miette::miette!(
+                    "farm job: source '{url}' is unpinned — pin it (source.sha256 or the \
+                     lockfile) before dispatching to a worker; a worker never fetches \
+                     upstream (ADR-0040 Decision 6)"
+                )
+            })?;
+        Ok((url.to_string(), pin.to_string()))
+    }
+}
+
+impl shuttle::build_sched::ManifestSource for FarmSource<'_> {
+    fn manifest_for(&self, name: &str) -> miette::Result<shuttle::worker::JobManifest> {
+        let plan = self.plans.get(name).ok_or_else(|| {
+            miette::miette!("farm job: node '{name}' has no precomputed plan — plan gap")
+        })?;
+
+        // Recipe slice: one entry, the node's own recipe (#172: own
+        // recipe bytes included).
+        let mut recipes = BTreeMap::new();
+        recipes.insert(plan.recipe_key.clone(), plan.recipe.clone());
+
+        // Pin slice: every declared source under its verified hash.
+        let mut pins = Vec::new();
+        for spec in &plan.sources {
+            let (url, sha) = self.source_pin(spec)?;
+            pins.push(shuttle::worker::SourcePin { url, sha256: sha });
+        }
+
+        // Closure: dep payloads (hashed from the resolved files) plus
+        // the source blobs (hashes are the pins themselves — the blobs
+        // materialize only in `stage_payload`, and only when the job
+        // actually dispatches).
+        let mut closure = Vec::new();
+        for dep in &plan.deps {
+            let path = self.dep_payload_path(dep, &plan.arch)?;
+            let bytes = std::fs::read(&path).map_err(|e| {
+                miette::miette!("farm job: cannot read dep payload {}: {e}", path.display())
+            })?;
+            closure.push(shuttle::worker::ClosureObject {
+                sha256: shuttle::oci::sha256_hex(&bytes),
+                size: bytes.len() as u64,
+                purpose: format!("dep:{dep}"),
+            });
+        }
+        for spec in &plan.sources {
+            let (_, sha) = self.source_pin(spec)?;
+            closure.push(shuttle::worker::ClosureObject {
+                sha256: sha,
+                size: 0, // verified at arrival against the pin; the size is not known pre-fetch
+                purpose: "source".to_string(),
+            });
+        }
+
+        Ok(shuttle::worker::JobManifest {
+            protocol_version: shuttle::worker::WORKER_PROTOCOL_VERSION,
+            target: plan.arch.clone(),
+            cross_target: plan.cross_target.clone(),
+            source_date_epoch: self.epoch,
+            package: plan.package.clone(),
+            recipes,
+            pins,
+            closure,
+            payload_dir: None,
+        })
+    }
+
+    fn stage_payload(
+        &self,
+        manifest: &shuttle::worker::JobManifest,
+    ) -> miette::Result<tempfile::TempDir> {
+        let stage = tempfile::tempdir()
+            .map_err(|e| miette::miette!("farm job: cannot stage the payload dir: {e}"))?;
+        let plan = self.plans.get(&manifest.package).ok_or_else(|| {
+            miette::miette!(
+                "farm job: node '{}' has no precomputed plan",
+                manifest.package
+            )
+        })?;
+
+        // Dep payloads: hardlinked into the stage under their hash.
+        for dep in &plan.deps {
+            let path = self.dep_payload_path(dep, &plan.arch)?;
+            let bytes = std::fs::read(&path).map_err(|e| {
+                miette::miette!("farm job: cannot read dep payload {}: {e}", path.display())
+            })?;
+            let sha = shuttle::oci::sha256_hex(&bytes);
+            std::fs::hard_link(&path, stage.path().join(&sha)).map_err(|e| {
+                miette::miette!(
+                    "farm job: cannot link dep payload {} into the stage: {e}",
+                    path.display()
+                )
+            })?;
+        }
+
+        // Sources: fetched from upstream BY THE COORDINATOR (curl, the
+        // repo's one network convention), hash-verified against the pin
+        // before anything ships — a mismatch refuses the dispatch.
+        for spec in &plan.sources {
+            let (url, sha) = self.source_pin(spec)?;
+            let dest = stage.path().join(&sha);
+            fetch_pinned_source(&url, &sha, &dest)?;
+        }
+        Ok(stage)
+    }
+
+    fn ingest(
+        &self,
+        name: &str,
+        outcome: &shuttle::ssh_exec::DispatchOutcome,
+        artifacts_in: &Path,
+        display: &str,
+    ) -> miette::Result<()> {
+        // Place every returned artifact where the rest of the build
+        // finds it: the run's output directory (dependents' build
+        // prefixes resolve there first). The bytes are already
+        // hash-verified coordinator-side; the copy re-serves them from
+        // the ingest record.
+        for art in &outcome.result.artifacts {
+            let src = artifacts_in.join(&art.filename);
+            let dst = self.output_dir.join(&art.filename);
+            if src != dst {
+                std::fs::copy(&src, &dst).map_err(|e| {
+                    miette::miette!(
+                        "farm ingest: cannot place artifact {} into {}: {e}",
+                        src.display(),
+                        self.output_dir.display()
+                    )
+                })?;
+            }
+        }
+
+        // The JSON event: executor `ssh`, worker attributed. The
+        // version rides the artifact filename (`<name>_<version>_
+        // <arch>.snap`), matching the local path's post-build identity.
+        if self.json {
+            if let Some(art) = outcome.result.artifacts.first() {
+                let stem = art
+                    .filename
+                    .strip_prefix(&format!("{name}_"))
+                    .and_then(|s| s.strip_suffix(&format!("_{}.snap", outcome.result.target)));
+                shuttle::output::record_build_result(shuttle::output::BuildResultJson {
+                    name: name.to_string(),
+                    version: stem.unwrap_or("0").to_string(),
+                    arch: outcome.result.target.clone(),
+                    filename: art.filename.clone(),
+                    sha256: Some(art.sha256.clone()),
+                    sources: None,
+                    executor: "ssh".into(),
+                    worker: Some(display.to_string()),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Download one pinned source for the payload stage and verify it
+/// against the pin before it can ship. `curl` behind the CommandRunner
+/// (the oci.rs network convention), bounded connect + total time.
+fn fetch_pinned_source(url: &str, sha256: &str, dest: &Path) -> miette::Result<()> {
+    let out = shuttle::command::RealRunner
+        .run(&[
+            "curl".to_string(),
+            "-fsSL".to_string(),
+            "--connect-timeout".to_string(),
+            "30".to_string(),
+            "--max-time".to_string(),
+            "1800".to_string(),
+            "-A".to_string(),
+            concat!(
+                "shuttle/",
+                env!("CARGO_PKG_VERSION"),
+                " (farm dispatch source ship)"
+            )
+            .to_string(),
+            "-o".to_string(),
+            dest.to_string_lossy().into_owned(),
+            url.to_string(),
+        ])
+        .map_err(|e| miette::miette!("farm job: curl cannot be spawned for {url}: {e}"))?;
+    if shuttle::command::exit_code(&out) != 0 {
+        return Err(miette::miette!(
+            "farm job: source fetch failed for {url}: {}",
+            out.stderr.trim()
+        ));
+    }
+    let bytes = std::fs::read(dest)
+        .map_err(|e| miette::miette!("farm job: cannot read the fetched source {url}: {e}"))?;
+    let got = shuttle::oci::sha256_hex(&bytes);
+    if got != sha256 {
+        return Err(miette::miette!(
+            "farm job: source {url} hashes to {got} but the pin says {sha256} — refusing to \
+             ship (the lockfile pin is stale; refresh it before dispatching)"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve every node's remote-job plan up front, on the orchestrator
+/// thread: the recipe slice, the transitive dep payload specs (each
+/// dep's meta evaluated once, sequentially — the evals never run on
+/// dispatch threads), the declared sources, and the placement caps.
+/// A node whose plan cannot resolve (directory-form recipe, multi-arch
+/// job) plans as local-only: it builds on the coordinator's slots
+/// exactly as it did before the farm existed.
+#[allow(clippy::too_many_arguments)]
+/// Everything the farm's assembly phase precomputes, up front, on the
+/// orchestrator thread.
+struct FarmPlans {
+    plans: HashMap<String, NodeJobPlan>,
+    dep_metas: HashMap<String, shuttle::snap::SnapMeta>,
+    dep_closures: HashMap<String, shuttle::cache::BuildClosure>,
+    caps: HashMap<String, shuttle::build_sched::JobCaps>,
+}
+
+fn precompute_farm_plans(
+    metas: &BTreeMap<String, shuttle::snap::SnapMeta>,
+    cli_archs: &[String],
+    lockfile: &LockFile,
+) -> miette::Result<FarmPlans> {
+    let mut plans = HashMap::new();
+    let mut dep_metas: HashMap<String, shuttle::snap::SnapMeta> = HashMap::new();
+    let mut dep_closures: HashMap<String, shuttle::cache::BuildClosure> = HashMap::new();
+    let mut caps: HashMap<String, shuttle::build_sched::JobCaps> = HashMap::new();
+
+    for (name, meta) in metas {
+        let archs = shuttle::snap::resolve_archs(meta, cli_archs);
+        // A job building several archs mixes per-arch build prefixes
+        // into one manifest — a shape the v1 manifest does not carry;
+        // it stays local before anything else is even attempted.
+        let multi_arch = archs.len() > 1;
+        let plan = plan_node_job(
+            name,
+            meta,
+            &archs,
+            lockfile,
+            &mut dep_metas,
+            &mut dep_closures,
+        );
+        let local_only = multi_arch || plan.is_err();
+        if let Ok(p) = plan {
+            plans.insert(name.clone(), p);
+        }
+        caps.insert(
+            name.clone(),
+            shuttle::build_sched::JobCaps {
+                archs,
+                cross: meta.target.is_some(),
+                local_only,
+            },
+        );
+    }
+    Ok(FarmPlans {
+        plans,
+        dep_metas,
+        dep_closures,
+        caps,
+    })
+}
+
+/// Resolve one node's remote-job plan: the recipe slice, the transitive
+/// dep payload specs (each dep's meta evaluated exactly once, here, on
+/// the orchestrator thread — evals never run on dispatch threads), and
+/// the declared sources.
+fn plan_node_job(
+    name: &str,
+    meta: &shuttle::snap::SnapMeta,
+    archs: &[String],
+    lockfile: &LockFile,
+    dep_metas: &mut HashMap<String, shuttle::snap::SnapMeta>,
+    dep_closures: &mut HashMap<String, shuttle::cache::BuildClosure>,
+) -> miette::Result<NodeJobPlan> {
+    // The recipe bytes: single-file recipes only. A directory-form
+    // recipe (init.lua + sibling files) needs its whole directory in
+    // the slice — a v1 limit, named, routing the node local.
+    let (key, recipe) = match shuttle::pkg_source::resolve_pkg(name) {
+        shuttle::pkg_source::PkgResult::File(path) => {
+            if path.ends_with("init.lua") {
+                miette::bail!(
+                    "farm dispatch builds single-file recipes in v1; '{name}' is a \
+                     directory recipe ({path}) — it builds on the coordinator's slots"
+                );
+            }
+            let bytes = std::fs::read_to_string(&path)
+                .map_err(|e| miette::miette!("farm job: cannot read recipe {path}: {e}"))?;
+            (path, bytes)
+        }
+        shuttle::pkg_source::PkgResult::Found { content, .. } => {
+            let first = name.chars().next().unwrap_or('x').to_ascii_lowercase();
+            (format!("pkgs/{first}/{name}.lua"), content)
+        }
+        shuttle::pkg_source::PkgResult::NotFound => {
+            miette::bail!("farm job: recipe for '{name}' not found")
+        }
+    };
+
+    // Transitive build-time dep closure (the merged build prefix's
+    // members).
+    let mut deps = Vec::new();
+    for dep in shuttle::deps::resolve_dep_names(&[name.to_string()], true)? {
+        let dep_meta = match shuttle::deps::load_meta(&dep) {
+            Ok(m) => m,
+            Err(e) => miette::bail!("farm job: dep '{dep}' of '{name}': {e:#}"),
+        };
+        if !dep_metas.contains_key(&dep) {
+            dep_closures.insert(dep.clone(), build_closure(&dep_meta, lockfile));
+            dep_metas.insert(dep.clone(), dep_meta);
+        }
+        deps.push(dep);
+    }
+
+    let mut sources = Vec::new();
+    if let Some(spec) = &meta.source {
+        sources.push(spec.clone());
+    }
+    if let Some(named) = &meta.sources {
+        sources.extend(named.values().cloned());
+    }
+
+    Ok(NodeJobPlan {
+        recipe_key: key,
+        recipe,
+        arch: archs.first().cloned().unwrap_or_else(|| "all".to_string()),
+        cross_target: meta.target.clone(),
+        package: meta.name.clone(),
+        deps,
+        sources,
+    })
+}
+
+/// Assemble the farm (local slots + one channel per worker), preflight
+/// every worker (a config error refuses the run before any build
+/// starts, named by worker and probe — the escape hatch is removing
+/// the worker from config), and schedule the ready set across it.
+fn run_farm(
+    ctx: &DepJobCtx<'_>,
+    graph: &BTreeMap<String, Vec<String>>,
+    pre_done: &HashSet<String>,
+    workers: &shuttle::lua::WorkersConfig,
+) -> miette::Result<shuttle::build_sched::FarmOutcome> {
+    // Preflight first, sequentially, before anything dispatches: a
+    // refused worker (unpinned, unreachable, protocol drift, sandbox)
+    // is a config error that kills the run before an hours-long build
+    // starts. The refusal names the worker and the failed probe.
+    let executors: Vec<shuttle::ssh_exec::SshExecutor<shuttle::command::RealRunner>> = workers
+        .workers
+        .iter()
+        .map(|w| shuttle::ssh_exec::SshExecutor::new(w, shuttle::command::RealRunner))
+        .collect::<miette::Result<_>>()?;
+    for exec in &executors {
+        if let Err(e) = exec.preflight(shuttle::ssh_exec::PreflightChecks {
+            arch: None,
+            min_free_disk: shuttle::ssh_exec::PREFLIGHT_MIN_FREE_DISK_BYTES,
+        }) {
+            let text = format!("{e:#}");
+            return Ok(refused_run(graph, &text));
+        }
+    }
+
+    let plans = match precompute_farm_plans(ctx.metas, ctx.cli_archs, ctx.lockfile) {
+        Ok(x) => x,
+        Err(e) => {
+            // A precompute failure is a pre-run refusal: nothing
+            // dispatched, everything unstarted, reason named.
+            return Ok(refused_run(graph, &format!("{e:#}")));
+        }
+    };
+
+    let epoch = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok());
+    let FarmPlans {
+        plans,
+        dep_metas,
+        dep_closures,
+        caps,
+    } = plans;
+    let source = std::sync::Arc::new(FarmSource {
+        plans,
+        dep_metas,
+        dep_closures,
+        lockfile: ctx.lockfile,
+        output_dir: ctx.output_dir,
+        pkg_cache: ctx.pkg_cache,
+        json: ctx.json,
+        epoch,
+    });
+
+    if !ctx.json {
+        let roster: Vec<String> = workers
+            .workers
+            .iter()
+            .map(|w| {
+                let arch = w
+                    .arch
+                    .as_deref()
+                    .map(|a| format!(", {a}"))
+                    .unwrap_or_default();
+                format!(
+                    "{} ({} job{}){arch}",
+                    w.address,
+                    w.jobs,
+                    if w.jobs == 1 { "" } else { "s" }
+                )
+            })
+            .collect();
+        shuttle::output::status(format!(
+            "farm: {} worker(s): {} — placement by arch, then ready-set order",
+            workers.workers.len(),
+            roster.join(", ")
+        ));
+    }
+
+    let local = shuttle::build_sched::Slotted {
+        exec: shuttle::build_sched::LocalExecutor::new(|name| ctx.run(name)),
+        slots: workers.local_jobs as usize,
+        display: "local".into(),
+    };
+
+    let remote: Vec<shuttle::build_sched::RemoteExecutor<shuttle::command::RealRunner, _>> =
+        executors
+            .into_iter()
+            .zip(&workers.workers)
+            .map(|(exec, w)| {
+                shuttle::build_sched::RemoteExecutor::new(
+                    exec,
+                    std::sync::Arc::clone(&source),
+                    w.jobs as usize,
+                    ctx.total,
+                )
+            })
+            .collect();
+
+    let mut farm: Vec<shuttle::build_sched::FarmExecutor<'_>> =
+        vec![shuttle::build_sched::FarmExecutor {
+            job: &local,
+            kind: shuttle::build_sched::ExecutorKind::Local,
+        }];
+    for (re, w) in remote.iter().zip(&workers.workers) {
+        farm.push(shuttle::build_sched::FarmExecutor {
+            job: re,
+            kind: shuttle::build_sched::ExecutorKind::Worker {
+                declared_arch: w.arch.clone(),
+            },
+        });
+    }
+
+    Ok(shuttle::build_sched::run_ready_set_farm(
+        graph, pre_done, &farm, &caps,
+    ))
+}
+
+/// A pre-run refusal: the run fails before anything dispatched, every
+/// node unstarted, the reason named.
+fn refused_run(
+    graph: &BTreeMap<String, Vec<String>>,
+    reason: &str,
+) -> shuttle::build_sched::FarmOutcome {
+    shuttle::build_sched::FarmOutcome {
+        result: Err(shuttle::build_sched::FailedBuilds {
+            failed: vec![("(coordinator preflight)".to_string(), reason.to_string())],
+            skipped: graph.keys().cloned().collect(),
+        }),
+        workers_lost: Vec::new(),
+    }
 }
 
 /// Serializes pool-cache stores during the parallel dep-build phase (issue
@@ -1476,6 +2068,8 @@ fn build_one_arch(
                     })
                     .collect()
             }),
+            executor: "local".into(),
+            worker: None,
         });
     }
 
@@ -1944,6 +2538,8 @@ fn build_one_image(
             filename: fname,
             sha256: None,
             sources: None,
+            executor: "local".into(),
+            worker: None,
         });
     } else {
         shuttle::output::ok(&fname);
