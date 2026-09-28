@@ -84,6 +84,15 @@ pub struct EvalRequest {
     /// is its purpose; reproducibility stays the source pin's job.
     #[serde(default)]
     pub allow_fetch: bool,
+    /// The version line a pod spec selected, exposed to the recipe as the
+    /// `constraint` global (nil when unconstrained) — ADR-0047 Decision 4:
+    /// `@constraint` graduates from pod-package filter to recipe-selection
+    /// input. Version-lined recipes (node.lua) read it to pick their
+    /// `lines` entry; selection must stay reproducible from the lockfile
+    /// pin, so it rides the eval like every other input — never a network
+    /// read (`fetch()` at selection is banned by the ADR).
+    #[serde(default)]
+    pub constraint: Option<String>,
 }
 
 /// Child → parent: request for one require-able source.
@@ -958,6 +967,15 @@ fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
     lua.globals()
         .set("fetch", fetch_fn)
         .map_err(|e| miette::miette!("failed to set fetch global: {e}"))?;
+
+    // The eval-context constraint (ADR-0047 Decision 4): the pod spec's
+    // `@constraint`, exposed as a global the recipe reads for line
+    // selection. Always set — nil when unconstrained — so a recipe can
+    // distinguish "no constraint" from a constraint naming no line and
+    // refuse the latter instead of silently pinning a default.
+    lua.globals()
+        .set("constraint", req.constraint.clone())
+        .map_err(|e| miette::miette!("failed to set constraint global: {e}"))?;
 
     Ok(lua)
 }

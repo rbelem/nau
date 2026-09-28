@@ -82,6 +82,7 @@ fn fetch_is_refused_by_name_when_disallowed() {
         .to_string(),
         entry_label: "fetch-offline".into(),
         allow_fetch: false,
+        constraint: None,
     };
     let err = match shuttle::isolate::run_eval(&req) {
         Err(e) => format!("{e:#}"),

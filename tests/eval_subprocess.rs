@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use shuttle::isolate::{self, EvalRequest, WorkerOutcome};
-use shuttle::lua::{evaluate_file, evaluate_string};
+use shuttle::lua::{evaluate_file, evaluate_file_with_constraint, evaluate_string};
 
 fn request(entry_label: &str, source: &str) -> EvalRequest {
     EvalRequest {
@@ -21,6 +21,7 @@ fn request(entry_label: &str, source: &str) -> EvalRequest {
         entry: source.to_string(),
         entry_label: entry_label.to_string(),
         allow_fetch: false,
+        constraint: None,
     }
 }
 
@@ -427,4 +428,146 @@ fn phase15_fields_survive_subprocess_round_trip() {
         SnapPlug::Typed(p) => assert_eq!(p.interface, "content"),
         other => panic!("expected Typed slot, got {other:?}"),
     }
+}
+
+// ── The eval-context constraint (ADR-0047 Decision 4) ──
+//
+// The request carries the pod spec's `@constraint`; the worker exposes it
+// as the `constraint` global (nil when absent). These tests drive the real
+// subprocess: the parent builds the request, the child's recipe reads the
+// global — the exact boundary `load_meta_for` rides at pod resolution.
+
+/// The lined recipe shape of pkgs/n/node.lua: select by constraint,
+/// default to the current line, refuse an undeclared line.
+const LINED: &str = r#"
+local lines = {
+    ["26"] = { version = "26.7.0" },
+    ["22"] = { version = "22.23.3" },
+}
+local line = constraint or "26"
+local picked = lines[line]
+if picked == nil then
+    error("lined: constraint '@" .. tostring(line) .. "' selects no declared line")
+end
+return { default = snap { name = "lined", version = picked.version } }
+"#;
+
+#[test]
+fn constraint_global_absent_means_nil_in_the_recipe() {
+    let req = request("constraint-nil", r#"return { v = type(constraint) }"#);
+    let ok = isolate::run_eval(&req).expect("eval must succeed");
+    assert_eq!(ok.outputs["v"], "nil");
+}
+
+#[test]
+fn constraint_global_rides_the_request_into_the_recipe() {
+    let mut req = request("constraint-22", r#"return { v = constraint }"#);
+    req.constraint = Some("22".to_string());
+    let ok = isolate::run_eval(&req).expect("eval must succeed");
+    assert_eq!(ok.outputs["v"], "22");
+}
+
+#[test]
+fn constraint_selects_the_line_through_the_subprocess() {
+    let mut req = request("line-22", LINED);
+    req.constraint = Some("22".to_string());
+    let ok = isolate::run_eval(&req).expect("line selection must succeed");
+    assert_eq!(ok.outputs["default"]["version"], "22.23.3");
+}
+
+#[test]
+fn unconstrained_eval_selects_the_default_line() {
+    let req = request("line-default", LINED);
+    let ok = isolate::run_eval(&req).expect("default line must select");
+    assert_eq!(ok.outputs["default"]["version"], "26.7.0");
+}
+
+#[test]
+fn undeclared_line_refuses_through_the_subprocess() {
+    let mut req = request("line-missing", LINED);
+    req.constraint = Some("20".to_string());
+    match isolate::run_eval(&req) {
+        Err(e) => {
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains("selects no declared line"),
+                "refusal must name the missing line: {msg}"
+            );
+        }
+        Ok(_) => panic!("an undeclared line must refuse, not fall back"),
+    }
+}
+
+// ── The REAL pkgs/n/node.lua (ticket #278) ──
+//
+// The shipped recipe must select both lines at the eval boundary: the
+// current 26 line when unconstrained, the LTS 22 line under `node@22`,
+// and refuse a constraint naming no declared line. This is the
+// selection half of ADR-0047's "line selection must be reproducible
+// from the lockfile pin" — no build, no network, just the recipe.
+
+fn repo_recipe(rel: &str) -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(rel)
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[test]
+fn real_node_recipe_defaults_to_the_26_line() {
+    let outputs = evaluate_file(&repo_recipe("pkgs/n/node.lua"))
+        .expect("the real node recipe must eval unconstrained");
+    let meta = &outputs["default"];
+    assert_eq!(meta.name, "node");
+    assert_eq!(meta.version, "26.7.0");
+    // The ADR-0047 wrapper invariant landed: npm/npx are declared apps
+    // wrapping the bare interpreter name.
+    assert!(meta.apps.contains_key("node"));
+    let npm = &meta.apps["npm"];
+    assert_eq!(npm.interpreter.as_deref(), Some("node"));
+    assert_eq!(npm.command, "usr/bin/npm");
+    assert_eq!(meta.apps["npx"].interpreter.as_deref(), Some("node"));
+}
+
+#[test]
+fn real_node_recipe_selects_the_22_line_under_the_constraint() {
+    let outputs = evaluate_file_with_constraint(&repo_recipe("pkgs/n/node.lua"), Some("22"))
+        .expect("the real node recipe must eval at @22");
+    let meta = &outputs["default"];
+    assert_eq!(meta.name, "node", "one package, two lines — no rename");
+    assert_eq!(meta.version, "22.23.3");
+    match &meta.source {
+        Some(shuttle::snap::SourceSpec::Pinned { url, sha256 }) => {
+            assert_eq!(
+                url,
+                "https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz"
+            );
+            assert_eq!(
+                sha256,
+                "df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de"
+            );
+        }
+        other => panic!("expected pinned 22-line source, got {other:?}"),
+    }
+    // The build carries the real-copy fix verbatim (rm precedes cp -L).
+    let build = meta.build.as_deref().expect("node build declared");
+    assert!(
+        build.contains("rm $STAGE/usr/bin/npm $STAGE/usr/bin/npx")
+            && build.contains("cp -L bin/npm bin/npx $STAGE/usr/bin/"),
+        "the stashed real-copy fix must be in the build: {build}"
+    );
+    // The apps bind unsuffixed to the pod's selected line.
+    assert_eq!(meta.apps["npm"].interpreter.as_deref(), Some("node"));
+    assert_eq!(meta.apps["npx"].command, "usr/bin/npx");
+}
+
+#[test]
+fn real_node_recipe_refuses_a_dropped_line() {
+    let err = evaluate_file_with_constraint(&repo_recipe("pkgs/n/node.lua"), Some("20"))
+        .expect_err("a constraint naming no declared line must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("selects no declared line") && msg.contains("@20"),
+        "refusal must name the constraint: {msg}"
+    );
 }
