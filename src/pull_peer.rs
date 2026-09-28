@@ -2,11 +2,12 @@
 //! signed [`crate::pkg_manifest::PackageManifest`] plus its missing
 //! blobs from a `shuttle://` peer or an `http(s)://` export tree,
 //! verify fail-closed (signature first against the trusted-key set,
-//! then every blob hash), and stage into the named pod's store — the
-//! pull-staging inbox (`crate::pkg_manifest::manifest_path`).
-//! Installation stays the pod workflow, never a pull side effect.
+//! then the static tree's index cross-check, then every blob hash),
+//! and stage into the named pod's store — the pull-staging inbox
+//! (`crate::pkg_manifest::manifest_path`). Installation stays the pod
+//! workflow, never a pull side effect.
 //!
-//! # Verification order (ADR-0033 Decision 7, fail-closed)
+//! # Verification order (ADR-0033 Decisions 7 + 10, fail-closed)
 //!
 //! 1. JSON parse of the fetched manifest.
 //! 2. Signature: revocation check FIRST over the UNION of the device
@@ -21,13 +22,22 @@
 //!    provisionally accepted, never TOFU.
 //! 3. Target gate: a manifest built for another GNU triplet is
 //!    refused before anything downloads.
-//! 4. Freshness gate: a revision older than the newest the pod holds
+//! 4. Tree-index gate (static lane only, Decision 10 end-to-end): the
+//!    tree's `index.json` must advertise exactly the package the
+//!    verified manifest describes — the row must exist with the same
+//!    version and revision. The index is unsigned, so it carries no
+//!    trust of its own; the signature on the manifest is the
+//!    authority, and this gate makes a tampered, torn, or missing
+//!    index REFUSE the pull instead of letting the tree
+//!    mis-describe itself. A public tree verifies end to end: index,
+//!    manifest, and every blob.
+//! 5. Freshness gate: a revision older than the newest the pod holds
 //!    (installed or staged-inbox) is refused unless
 //!    `--allow-downgrade`.
-//! 5. Every manifest blob: present in the store → its sha256 is
+//! 6. Every manifest blob: present in the store → its sha256 is
 //!    re-verified and the download skipped; absent → fetched, hashed,
 //!    hard-refused on mismatch, written atomically.
-//! 6. The verified manifest lands in the staging inbox.
+//! 7. The verified manifest lands in the staging inbox.
 //!
 //! Transport is the repo's one network convention: curl behind
 //! [`crate::command::CommandRunner`] (`src/oci.rs` precedent), with a
@@ -38,7 +48,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::command::{exit_code, CommandRunner, RealRunner};
 use crate::oci::{sha256_file, sha256_hex, BLOB_TIMEOUT_SECS, CONNECT_TIMEOUT_SECS};
@@ -180,6 +190,71 @@ fn pkg_name(source: &PullRef) -> miette::Result<&str> {
             miette::bail!("OCI references ride the registry lane, not the peer lane")
         }
     }
+}
+
+// ── Tree-index gate (Decision 10: the static tree verifies end to end) ──
+
+/// One package row of the static tree's `index.json` — the pull lane's
+/// wire view of the shape the export lane freezes and `/info` serves.
+#[derive(Debug, Deserialize)]
+struct TreeIndexPackage {
+    name: String,
+    version: String,
+    revision: u32,
+}
+
+/// The static tree's `index.json` (the frozen `/info` payload). The
+/// publishing-host `name` is a label, not trust state — only the
+/// package rows are checked here.
+#[derive(Debug, Deserialize)]
+struct TreeIndex {
+    packages: Vec<TreeIndexPackage>,
+}
+
+/// The static-tree index gate (ADR-0033 Decision 10, fail-closed): the
+/// tree's `index.json` must advertise exactly the package the verified
+/// manifest describes — a row for the name, carrying the same version
+/// and the same revision. The index is unsigned and carries no trust
+/// of its own; the signature on the manifest is the authority, and
+/// this gate makes a tampered or torn index refuse the pull instead of
+/// letting the tree mis-describe itself. Peer lanes (Decision 4) serve
+/// dynamic views with no frozen index — the gate is static-only.
+fn verify_tree_index<F: Fetch>(
+    source: &PullRef,
+    pkg: &str,
+    manifest: &PackageManifest,
+    fetch: &F,
+) -> miette::Result<()> {
+    let PullRef::Url { url, .. } = source else {
+        return Ok(());
+    };
+    let dir = url_dir(url.as_str(), pkg)?;
+    let index_url = format!("{dir}/index.json");
+    let raw = fetch
+        .get(&index_url)
+        .wrap_err_with(|| format!("fetching the tree index from {index_url}"))?;
+    let index: TreeIndex = serde_json::from_slice(&raw).map_err(|e| {
+        miette::miette!(
+            "tree index from {index_url} is not a valid index.json — refusing the pull \
+             (a public tree must describe itself correctly): {e}"
+        )
+    })?;
+    let Some(row) = index.packages.iter().find(|p| p.name == pkg) else {
+        miette::bail!(
+            "tree index at {index_url} does not list package '{pkg}' though its signed \
+             manifest exists — refusing the pull (index/manifest divergence)"
+        );
+    };
+    let (index_version, index_revision) = (&row.version, row.revision);
+    let (manifest_version, manifest_revision) = (&manifest.version, manifest.revision);
+    if index_version != manifest_version || index_revision != manifest_revision {
+        miette::bail!(
+            "tree index at {index_url} advertises {pkg} {index_version} rev \
+             {index_revision} but the signed manifest is {manifest_version} rev \
+             {manifest_revision} — refusing the pull (index/manifest divergence)"
+        );
+    }
+    Ok(())
 }
 
 // ── Freshness gate (Decision 7) ──
@@ -424,8 +499,8 @@ pub fn pull_into_store<F: Fetch>(
     let pkg = pkg_name(source)?.to_string();
 
     // 1. Fetch the manifest, 2. parse it, 3. verify fail-closed, 4.
-    // gate target + freshness + boundary-validate the declared files —
-    // all BEFORE any blob moves.
+    // gate target + tree index + freshness + boundary-validate the
+    // declared files — all BEFORE any blob moves.
     let manifest_url = manifest_url(source, &pkg)?;
     let manifest_bytes = fetch
         .get(&manifest_url)
@@ -451,6 +526,9 @@ pub fn pull_into_store<F: Fetch>(
         );
     }
     let signer = verify_trust(&manifest, anchor, keys_dir)?;
+    // 4. The static tree's index must agree with the verified manifest
+    // before anything else moves (Decision 10 end-to-end).
+    verify_tree_index(source, &pkg, &manifest, fetch)?;
     let known = known_revision(store, &pkg)?;
     check_downgrade(known, manifest.revision, allow_downgrade)?;
 
@@ -459,7 +537,7 @@ pub fn pull_into_store<F: Fetch>(
         crate::pkg_manifest::validate_sha256(file)?;
     }
 
-    // 5. Stage the blobs, 6. stage the verified manifest (the inbox —
+    // 6. Stage the blobs, 7. stage the verified manifest (the inbox —
     // staging only; installation is the pod workflow, ADR-0033
     // Decision 5).
     let (fetched, already) = stage_blobs(store, source, &pkg, &manifest.files, fetch)?;
@@ -1145,27 +1223,300 @@ mod tests {
         }
     }
 
+    // ── Static-tree fixtures (Decision 10: index + manifest + blobs) ──
+
+    fn static_ref() -> PullRef {
+        PullRef::parse("http://mirror.test:9000/mirror/hello").unwrap()
+    }
+
+    fn manifest_route() -> String {
+        "http://mirror.test:9000/mirror/manifests/hello.json".to_string()
+    }
+
+    fn blob_route(sha: &str) -> String {
+        format!("http://mirror.test:9000/mirror/blobs/{sha}")
+    }
+
+    fn index_route() -> String {
+        "http://mirror.test:9000/mirror/index.json".to_string()
+    }
+
+    /// A minimal index.json carrying the given rows (name, version,
+    /// revision).
+    fn index_json(rows: &[(&str, &str, u32)]) -> Vec<u8> {
+        let packages: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(name, version, revision)| {
+                serde_json::json!({ "name": name, "version": version, "revision": revision })
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "name": "mirror.test", "packages": packages }))
+            .unwrap()
+    }
+
+    /// The index.json that agrees with `pkg` (same version/revision).
+    fn agreeing_index(pkg: &PackageManifest) -> Vec<u8> {
+        index_json(&[(pkg.name.as_str(), pkg.version.as_str(), pkg.revision)])
+    }
+
+    /// A static-tree transport for `pkg`: manifest + blob routes, plus
+    /// the tree index when `index` is `Some` (a test passes `None` to
+    /// model a tree that cannot serve index.json at all).
+    fn static_fetch(
+        pkg: &PackageManifest,
+        blobs: &[(&str, Vec<u8>)],
+        index: Option<Vec<u8>>,
+    ) -> FakeFetch {
+        let mut routes = BTreeMap::new();
+        routes.insert(manifest_route(), manifest_source(pkg));
+        for (sha, bytes) in blobs {
+            routes.insert(blob_route(sha), bytes.clone());
+        }
+        if let Some(index) = index {
+            routes.insert(index_route(), index);
+        }
+        FakeFetch { routes }
+    }
+
     #[test]
     fn static_lane_stages_through_the_same_pipeline() {
         let kp = test_kp(1);
         let fx = Fixture::with_trust(&kp);
         let pkg = signed_manifest(&kp);
-        let mut routes = BTreeMap::new();
-        routes.insert(
-            "http://mirror.test:9000/mirror/manifests/hello.json".to_string(),
-            manifest_source(&pkg),
+        let fetch = static_fetch(
+            &pkg,
+            &[(&blob_sha(), blob_bytes())],
+            Some(agreeing_index(&pkg)),
         );
-        routes.insert(
-            format!("http://mirror.test:9000/mirror/blobs/{}", blob_sha()),
-            blob_bytes(),
-        );
-        let fetch = FakeFetch { routes };
-        let r = PullRef::parse("http://mirror.test:9000/mirror/hello").unwrap();
 
-        let report = pull_into_store(&fx.store, &r, &fx.anchor, &fx.keys, false, &fetch)
-            .expect("the static lane shares the peer verification path");
+        let report = pull_into_store(
+            &fx.store,
+            &static_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch,
+        )
+        .expect("the static lane shares the peer verification path");
         assert_eq!(report.lane, "static");
         assert!(fx.store.blob_path(&blob_sha()).exists());
+        assert!(
+            crate::pkg_manifest::manifest_path(fx.store.root(), "hello").exists(),
+            "the verified manifest staged"
+        );
+    }
+
+    /// A corrupted blob served by the public tree is refused at the
+    /// hash gate: the mirror is untrusted infrastructure, so every
+    /// byte is re-hashed against the signed manifest (the same gate
+    /// the peer lane exercises in
+    /// `tampered_blob_is_refused_naming_expected_and_actual`).
+    #[test]
+    fn static_lane_corrupted_blob_fails_closed_naming_expected_and_actual() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        let pkg = signed_manifest(&kp);
+        let evil = b"mirror-supplied-bytes!!".to_vec();
+        let fetch = static_fetch(&pkg, &[(&blob_sha(), evil)], Some(agreeing_index(&pkg)));
+
+        let err = pull_into_store(
+            &fx.store,
+            &static_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch,
+        )
+        .expect_err("a corrupted blob from the tree must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains(&blob_sha()), "names expected: {msg}");
+        assert!(
+            msg.contains(&sha256_hex(b"mirror-supplied-bytes!!")),
+            "names actual: {msg}"
+        );
+        assert!(!fx.store.blob_path(&blob_sha()).exists(), "nothing staged");
+        assert!(
+            !crate::pkg_manifest::manifest_path(fx.store.root(), "hello").exists(),
+            "the manifest never stages when a blob fails"
+        );
+    }
+
+    /// A tampered index.json — the revision walked back — refuses the
+    /// pull: the signed manifest is the authority and the tree's own
+    /// index must agree with it (Decision 10 end-to-end).
+    #[test]
+    fn tampered_index_revision_fails_closed_naming_both_sides() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        let pkg = signed_manifest(&kp); // revision 7
+        let index = index_json(&[("hello", "2.10", 6)]); // tampered down
+        let fetch = static_fetch(&pkg, &[(&blob_sha(), blob_bytes())], Some(index));
+
+        let err = pull_into_store(
+            &fx.store,
+            &static_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch,
+        )
+        .expect_err("an index/manifest revision divergence must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("rev 6") && msg.contains("rev 7"), "{msg}");
+        assert!(msg.contains("divergence"), "{msg}");
+        assert!(!fx.store.blob_path(&blob_sha()).exists(), "nothing staged");
+        assert!(
+            !crate::pkg_manifest::manifest_path(fx.store.root(), "hello").exists(),
+            "nothing staged"
+        );
+    }
+
+    /// The index gate is a consistency gate, not the freshness policy:
+    /// `--allow-downgrade` cannot pull from a tree whose index diverges
+    /// from its own signed manifest.
+    #[test]
+    fn tampered_index_refuses_even_with_allow_downgrade() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        let pkg = signed_manifest(&kp);
+        let index = index_json(&[("hello", "2.10", 6)]);
+        let fetch = static_fetch(&pkg, &[(&blob_sha(), blob_bytes())], Some(index));
+
+        assert!(
+            pull_into_store(&fx.store, &static_ref(), &fx.anchor, &fx.keys, true, &fetch).is_err(),
+            "allow-downgrade must not lift the index gate"
+        );
+    }
+
+    #[test]
+    fn tampered_index_version_fails_closed_naming_both_versions() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        let pkg = signed_manifest(&kp); // version 2.10
+        let index = index_json(&[("hello", "9.9", 7)]); // tampered version
+        let fetch = static_fetch(&pkg, &[(&blob_sha(), blob_bytes())], Some(index));
+
+        let err = pull_into_store(
+            &fx.store,
+            &static_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch,
+        )
+        .expect_err("an index/manifest version divergence must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("9.9") && msg.contains("2.10"), "{msg}");
+        assert!(!fx.store.blob_path(&blob_sha()).exists(), "nothing staged");
+    }
+
+    /// An index that drops the package (the mirror "unlisting" content
+    /// whose manifest still serves) diverges → refuse.
+    #[test]
+    fn index_missing_the_package_fails_closed() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        let pkg = signed_manifest(&kp);
+        let index = index_json(&[("other", "1.0", 1)]);
+        let fetch = static_fetch(&pkg, &[(&blob_sha(), blob_bytes())], Some(index));
+
+        let err = pull_into_store(
+            &fx.store,
+            &static_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch,
+        )
+        .expect_err("a missing index row must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("does not list"), "{msg}");
+        assert!(msg.contains("hello"), "{msg}");
+        assert!(!fx.store.blob_path(&blob_sha()).exists(), "nothing staged");
+    }
+
+    /// A mirror fronted by an error page answering 200 with HTML: the
+    /// index does not parse, so the pull refuses instead of trusting a
+    /// tree that cannot describe itself.
+    #[test]
+    fn unparseable_index_fails_closed_naming_the_url() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        let pkg = signed_manifest(&kp);
+        let fetch = static_fetch(
+            &pkg,
+            &[(&blob_sha(), blob_bytes())],
+            Some(b"<html>502 Bad Gateway</html>".to_vec()),
+        );
+
+        let err = pull_into_store(
+            &fx.store,
+            &static_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch,
+        )
+        .expect_err("a non-JSON index must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("not a valid index.json"), "{msg}");
+        assert!(msg.contains(index_route().as_str()), "{msg}");
+        assert!(!fx.store.blob_path(&blob_sha()).exists(), "nothing staged");
+    }
+
+    /// The gate is not optional: a static tree that cannot serve
+    /// index.json at all (a 404 becomes a fetch error through the curl
+    /// seam) refuses the pull.
+    #[test]
+    fn static_pull_without_a_served_index_fails_closed() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        let pkg = signed_manifest(&kp);
+        let fetch = static_fetch(&pkg, &[(&blob_sha(), blob_bytes())], None);
+
+        let err = pull_into_store(
+            &fx.store,
+            &static_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch,
+        )
+        .expect_err("a tree with no index must refuse");
+        assert!(err.to_string().contains("fetching the tree index"), "{err}");
+    }
+
+    /// Manifest-layer fail-closed at the pull surface: flipping a byte
+    /// of a signed manifest's body invalidates the signature → refused
+    /// before any download (the fetch carries no blob routes — reaching
+    /// the trust error proves nothing was fetched, nothing staged).
+    #[test]
+    fn tampered_manifest_body_fails_closed_before_any_download() {
+        let kp = test_kp(1);
+        let fx = Fixture::with_trust(&kp);
+        let mut pkg = signed_manifest(&kp);
+        pkg.files[0].sha256 = "ee".repeat(32); // tampered AFTER signing
+        let fetch = static_fetch(&pkg, &[], Some(agreeing_index(&pkg)));
+
+        let err = pull_into_store(
+            &fx.store,
+            &static_ref(),
+            &fx.anchor,
+            &fx.keys,
+            false,
+            &fetch,
+        )
+        .expect_err("a tampered manifest body must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("no trusted anchor"), "{msg}");
+        assert!(
+            !fx.store.blob_path(&"ee".repeat(32)).exists(),
+            "nothing staged"
+        );
+        assert!(
+            !crate::pkg_manifest::manifest_path(fx.store.root(), "hello").exists(),
+            "nothing staged"
+        );
     }
 
     #[test]
