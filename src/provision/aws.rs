@@ -2,12 +2,17 @@
 //! [`CommandRunner`] — zero new crates, the avahi-fallback precedent, the
 //! same shape as the Hetzner module.
 //!
-//! Flow per ADR-0045 (mint-and-inject, Decision 1/6): mint the worker host
-//! keypair coordinator-side → render the shared cloud-init template →
-//! `run-instances` with that user-data (`--user-data file://`, the
-//! authenticated API channel that carries the private half) → describe for
-//! the public IPv4 → pin address + public half into the managed `workers`
-//! block. The pin exists BEFORE first use; `ssh-keyscan` is never called.
+//! Flow per ADR-0045's amendment (#295): mint a one-time publish token
+//! per instance + render the shared cloud-init template (guest-local
+//! host keypair generation — NO private half ships) → `run-instances`
+//! with that user-data (`--user-data file://`, the authenticated API
+//! channel that now carries public material + the one-time bearer only)
+//! → describe for the public IPv4 → pin the host CA fingerprint into the
+//! managed `workers` block. The pin exists BEFORE first use;
+//! `ssh-keyscan` is never called. EC2 user-data is immutable per
+//! instance and the one-time token is per machine, so the batch create
+//! becomes one `--count 1` create per instance — each with its own name,
+//! token, and blob.
 //!
 //! Spot (#195 scope, opt-in): `--spot` bids a `--max-price` cap through
 //! `--instance-market-options`. The interruption behavior is pinned to
@@ -39,10 +44,11 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::command::{exit_code, CommandRunner};
+use crate::provision::publish::PublishChannel;
 use crate::provision::{
-    append_worker_entry, evict_worker_entry, iso8601_utc, mint_host_keypair, now_epoch_secs,
-    render_user_data, stage_user_data, ProvisionPlan, ProvisionRequest, ProvisionedWorker,
-    Provisioner, UserDataParams,
+    append_worker_entry, evict_worker_entry, iso8601_utc, now_epoch_secs, render_user_data,
+    require_ca_pin, require_publish, PinPlan, ProvisionPlan, ProvisionRequest, ProvisionedWorker,
+    Provisioner, UserDataParams, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
 };
 
 /// The worker presence tag shuttle stamps at create time — the key shared
@@ -85,6 +91,10 @@ pub struct AwsProvisioner<R: CommandRunner> {
     /// CLI boundary (`SHUTTLE_OPERATOR_KEY` / default key halves) so the
     /// core stays env-free under test.
     operator_key: String,
+    /// The coordinator publish channel (callback URL + ceremony home) —
+    /// `None` is the no-channel refusal path for real runs; a dry run
+    /// runs without.
+    publish: Option<PublishChannel>,
 }
 
 impl<R: CommandRunner> AwsProvisioner<R> {
@@ -93,12 +103,14 @@ impl<R: CommandRunner> AwsProvisioner<R> {
         credentials: Option<String>,
         binary_url: String,
         operator_key: String,
+        publish: Option<PublishChannel>,
     ) -> Self {
         AwsProvisioner {
             runner,
             credentials,
             binary_url,
             operator_key,
+            publish,
         }
     }
 
@@ -132,16 +144,18 @@ impl<R: CommandRunner> Provisioner for AwsProvisioner<R> {
         // Local refusals first — every one of them API-free.
         validate_spot(req)?;
 
-        // Local resolution: mint, template, TTL. All of it is API-free,
-        // so the dry-run plan is the REAL plan.
+        // Local resolution first: template, TTL. All of it is API-free,
+        // so the dry-run plan is the REAL plan (with placeholder publish
+        // slots — the real per-instance blob differs only in token + name).
         let expiry_epoch = now_epoch_secs()? + req.ttl_secs;
         let expiry_iso = iso8601_utc(expiry_epoch);
-        let dir = tempfile::tempdir()
-            .map_err(|e| miette::miette!("provision: cannot create the mint scratch dir: {e}"))?;
-        let minted = mint_host_keypair(&self.runner, dir.path())?;
+        let dir = tempfile::tempdir().map_err(|e| {
+            miette::miette!("provision: cannot create the staging scratch dir: {e}")
+        })?;
         let user_data = render_user_data(&UserDataParams {
-            host_private_key: &minted.private_pem,
-            host_public_key: &minted.public_line,
+            machine_identity: PLAN_MACHINE_IDENTITY,
+            publish_url: PLAN_PUBLISH_URL,
+            publish_token: PLAN_PUBLISH_TOKEN,
             operator_key: &self.operator_key,
             binary_url: &self.binary_url,
             ttl_expiry_epoch: expiry_epoch,
@@ -166,26 +180,24 @@ impl<R: CommandRunner> Provisioner for AwsProvisioner<R> {
         }
 
         // The aws CLI reads credentials from the inherited environment;
-        // they never enter argv. Presence is checked before any API call.
+        // they never enter argv. Presence is checked before any API call
+        // — the outermost gate, then the fail-closed coordinator-side
+        // state: the publish channel (guest callback) and the CA pin the
+        // entries will carry.
         self.require_credentials()?;
-
-        let user_data_file = stage_user_data(dir.path(), &user_data)?;
+        let publish = require_publish(&self.publish)?;
+        let ca_pin = require_ca_pin(req)?.to_string();
+        let pin = PinPlan {
+            publish,
+            ca_pin: &ca_pin,
+        };
 
         // Resolve the pinned AMI, create + describe; every successfully
         // created instance id (and the address pinned for it) rides
         // `created` so any later failure terminates the whole set.
         let ami = self.resolve_ami(req)?;
-        let name = worker_name();
-        let tags = tag_spec(req, &name, expiry_epoch);
         let mut created: Vec<(String, String)> = Vec::new();
-        let result = self.create_and_pin(
-            req,
-            &ami,
-            &tags,
-            &user_data_file,
-            &minted.public_line,
-            &mut created,
-        );
+        let result = self.create_and_pin(req, &ami, dir.path(), expiry_epoch, &pin, &mut created);
         if let Err(e) = result {
             let mut torn_down = 0usize;
             let mut stuck: Vec<&str> = Vec::new();
@@ -217,7 +229,7 @@ impl<R: CommandRunner> Provisioner for AwsProvisioner<R> {
         Ok(created
             .into_iter()
             .map(|(id, address)| ProvisionedWorker {
-                host_key: pin_with_comment(&minted.public_line, &id),
+                host_key: ca_pin.clone(),
                 name: id,
                 address,
             })
@@ -295,56 +307,77 @@ impl<R: CommandRunner> AwsProvisioner<R> {
         Ok(ami.to_string())
     }
 
-    /// Create `count` instances, describe each for its public IPv4, then
-    /// pin every entry as it is resolved. `tags` is the prebuilt
-    /// `--tag-specifications` value (the contract stamps, resolved by the
-    /// caller). Records every created instance id in `created` as
+    /// Create `count` instances — ONE `--count 1` create per instance,
+    /// because EC2 user-data is immutable and the one-time publish token
+    /// is per machine — describe each for its public IPv4, and pin every
+    /// entry as it is resolved. Each instance gets its own machine
+    /// identity (its own name), its own one-time publish token (recorded
+    /// in the coordinator's registry BEFORE the create — the token must
+    /// be enforceable by first boot), and its own user-data blob.
+    /// Records every created instance id in `created` as
     /// teardown-on-failure state — pushed BEFORE the describe, so an
     /// instance that exists but fails its describe is still terminated.
     fn create_and_pin(
         &self,
         req: &ProvisionRequest,
         ami: &str,
-        tags: &str,
-        user_data_file: &Path,
-        public_line: &str,
+        staging: &Path,
+        expiry_epoch: u64,
+        pin: &PinPlan<'_>,
         created: &mut Vec<(String, String)>,
     ) -> miette::Result<()> {
-        let count = req.count.to_string();
-        let user_data_arg = format!("file://{}", user_data_file.display());
+        // EC2 user-data is immutable and the one-time publish token is
+        // per machine: every create is `--count 1` (one instance, one
+        // name, one token, one blob), `req.count` times.
+        let count = "1".to_string();
         let options = req
             .max_price
             .as_deref()
             .filter(|_| req.spot)
             .map(market_options);
-        let mut args = vec![
-            "ec2",
-            "run-instances",
-            "--image-id",
-            ami,
-            "--instance-type",
-            &req.server_type,
-            "--count",
-            &count,
-            "--user-data",
-            user_data_arg.as_str(),
-            "--tag-specifications",
-            tags,
-        ];
-        if let Some(o) = &options {
-            args.push("--instance-market-options");
-            args.push(o.as_str());
-        }
-        let body = self.aws(Some(&req.location), &args)?;
-        let ids = parse_instance_ids(&body)?;
-        for id in &ids {
-            // Teardown state FIRST: an instance that exists but fails its
-            // describe must still be terminated.
-            created.push((id.clone(), String::new()));
-            let ip = self.instance_public_ipv4(Some(&req.location), id)?;
-            let address = address_for(&ip);
-            created.last_mut().expect("just pushed").1 = address.clone();
-            append_worker_entry(&req.config, &address, &pin_with_comment(public_line, id))?;
+        for _ in 0..req.count {
+            let name = worker_name();
+            let tags = tag_spec(req, &name, expiry_epoch);
+            let user_data_file = crate::provision::stage_publishing_user_data(
+                staging,
+                pin.publish,
+                &self.binary_url,
+                &self.operator_key,
+                &name,
+                expiry_epoch,
+            )?;
+            let user_data_arg = format!("file://{}", user_data_file.display());
+            let mut args = vec![
+                "ec2",
+                "run-instances",
+                "--image-id",
+                ami,
+                "--instance-type",
+                &req.server_type,
+                "--count",
+                &count,
+                "--user-data",
+                user_data_arg.as_str(),
+                "--tag-specifications",
+                tags.as_str(),
+            ];
+            if let Some(o) = &options {
+                args.push("--instance-market-options");
+                args.push(o.as_str());
+            }
+            let body = self.aws(Some(&req.location), &args)?;
+            // The blob is served — the one-time bearer in it must not
+            // linger on disk past its create call.
+            let _ = std::fs::remove_file(&user_data_file);
+            for id in parse_instance_ids(&body)? {
+                // Teardown state FIRST: an instance that exists but fails
+                // its describe must still be terminated.
+                created.push((id.clone(), String::new()));
+                let ip = self.instance_public_ipv4(Some(&req.location), &id)?;
+                let address = address_for(&ip);
+                created.last_mut().expect("just pushed").1 = address.clone();
+                append_worker_entry(&req.config, &address, pin.ca_pin)?;
+            }
         }
         Ok(())
     }
@@ -508,19 +541,10 @@ fn address_for(ip: &str) -> String {
     format!("ssh://root@{ip}")
 }
 
-/// The pinned public half: `ssh-keygen`'s line with the instance id as the
-/// single comment word (the pin grammar allows at most one) —
-/// traceability from a known_hosts/`workers` line back to the EC2
-/// resource.
-fn pin_with_comment(public_line: &str, id: &str) -> String {
-    let mut parts = public_line.split_whitespace();
-    let key_type = parts.next().unwrap_or_default();
-    let key = parts.next().unwrap_or_default();
-    format!("{key_type} {key} {id}")
-}
-
-/// `shuttle-worker-<hex nanos>` — one batch identity (a `--count` run is
-/// one name; the instance ids are the per-machine handles).
+/// `shuttle-worker-<hex nanos>` — one name per create; the instance ids
+/// remain the per-machine handles (destroy verbs), while the name rides
+/// the contract tags and doubles as the machine identity the one-time
+/// publish token binds.
 fn worker_name() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

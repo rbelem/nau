@@ -1,10 +1,11 @@
 //! The GCP provider (#196) driven end to end against a scripted
-//! `CommandRunner` fake: the fake plays `ssh-keygen` (writes a fixed
-//! throwaway keypair) and the `gcloud` CLI (instances create, describe,
-//! delete — from scripted state), records every argv, and answers nothing
-//! else. No network, no real gcloud, no credentials — the ticket's live
-//! lanes (env-gated on GCP credentials) are deferred; this fake-API suite
-//! plus the dry-run plan is the proof surface.
+//! `CommandRunner` fake: the fake plays the `gcloud` CLI (instances
+//! create, describe, delete — from scripted state), records every argv,
+//! and answers nothing else. No network, no real gcloud, no credentials —
+//! the ticket's live lanes (env-gated on GCP credentials) are deferred;
+//! this fake-API suite plus the dry-run plan is the proof surface. (No
+//! ssh-keygen arm: the amendment removed the coordinator-side mint — a
+//! provision that tried to ssh-keygen would fail loudly here.)
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,16 +16,17 @@ use shuttle::provision::gcp::{
     GcpProvisioner, IMAGE_FAMILY, IMAGE_PROJECT, WORKER_LABEL, WORKER_PREEMPTIBLE_LABEL,
     WORKER_TTL_LABEL,
 };
+use shuttle::provision::publish::PublishChannel;
 use shuttle::provision::{parse_ttl, ProvisionRequest, Provisioner, BLOCK_BEGIN, BLOCK_END};
 
-/// A shape-valid ed25519 keypair — throwaway fixture bytes, no crypto.
-const TEST_HOST_PUB: &str =
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ shuttle-worker-host-key";
-const TEST_HOST_PRIV: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
 const OPERATOR_KEY: &str = "ssh-ed25519 AAAAoperatorkey operator@example";
 const BINARY_URL: &str = "https://example.invalid/shuttle-amd64";
 const ZONE: &str = "us-central1-a";
 const MACHINE_TYPE: &str = "e2-standard-4";
+/// The host CA fingerprint the request carries (valid
+/// `SHA256:` + 43 base64 chars — the pin grammar's fingerprint form).
+const CA_FPR: &str = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG";
+const PUBLISH_URL: &str = "https://coordinator.example/publish";
 
 // ── The scripted provider CLI ──
 
@@ -45,14 +47,14 @@ struct Script {
     attached_disks: usize,
 }
 
-/// Plays `ssh-keygen` + `gcloud` from scripted state and records every
-/// argv. Cheap to clone; all clones share one call log.
+/// Plays the `gcloud` CLI from scripted state and records every argv.
+/// Cheap to clone; all clones share one call log.
 #[derive(Clone)]
 struct FakeGcp {
     calls: Arc<Mutex<Vec<Vec<String>>>>,
     /// (path, unix mode, content) of every `--metadata-from-file` blob
-    /// the fake served, captured at call time — the real blob dies with
-    /// the mint tempdir.
+    /// the fake served, captured at call time — the real blob is removed
+    /// once its create call served it.
     user_data_files: Arc<Mutex<Vec<(PathBuf, u32, String)>>>,
     /// Successful delete count, shared across clones (drives
     /// `delete_fails_after`).
@@ -75,17 +77,6 @@ impl CommandRunner for FakeGcp {
     fn run(&self, argv: &[String]) -> io::Result<RunnerOutput> {
         self.calls.lock().unwrap().push(argv.to_vec());
         match argv[0].as_str() {
-            // Fake ssh-keygen: drop the fixed fixture keypair at -f <path>.
-            "ssh-keygen" => {
-                let path = argv
-                    .iter()
-                    .position(|a| a == "-f")
-                    .map(|i| argv[i + 1].clone())
-                    .expect("ssh-keygen fake requires -f");
-                std::fs::write(&path, TEST_HOST_PRIV).unwrap();
-                std::fs::write(format!("{path}.pub"), TEST_HOST_PUB).unwrap();
-                Ok(ok_out(""))
-            }
             "gcloud" => self.gcloud(argv),
             other => Ok(RunnerOutput {
                 code: 1,
@@ -228,6 +219,20 @@ fn request(config: &Path, dry_run: bool) -> ProvisionRequest {
         max_price: None,
         dry_run,
         config: config.to_path_buf(),
+        ca_fingerprint: Some(CA_FPR.into()),
+    }
+}
+
+/// A publish channel over a throwaway (recreated-on-demand) home — the
+/// provider tests never read the registry back.
+fn throwaway_publish_channel() -> PublishChannel {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    PublishChannel {
+        url: PUBLISH_URL.into(),
+        home: std::env::temp_dir().join(format!("shuttle-gcp-publish-test-{nanos}")),
     }
 }
 
@@ -237,6 +242,7 @@ fn provisioner(fake: &FakeGcp, credentials: Option<&str>) -> GcpProvisioner<Fake
         credentials.map(|c| c.to_string()),
         BINARY_URL.into(),
         OPERATOR_KEY.into(),
+        Some(throwaway_publish_channel()),
     )
 }
 
@@ -366,7 +372,8 @@ fn provision_resolves_creates_describes_pins_and_labels() {
 
     // The worker handle is the instance name (the destroy verb's
     // argument); the address comes from the describe document; the pin
-    // comments the instance name for traceability.
+    // is the CA fingerprint (the amendment's pin — one root, not
+    // per-worker keys).
     for w in &workers {
         assert!(w.name.starts_with("shuttle-worker-"), "{}", w.name);
         assert!(
@@ -374,9 +381,7 @@ fn provision_resolves_creates_describes_pins_and_labels() {
             "{}",
             w.address
         );
-        let pin: Vec<&str> = w.host_key.split_whitespace().collect();
-        assert_eq!(pin[0], "ssh-ed25519");
-        assert_eq!(pin[2], w.name, "the pin comments the instance name");
+        assert_eq!(w.host_key, CA_FPR, "the pin IS the CA fingerprint");
     }
 
     // The create shape: machine type, image family + project, the zone on
@@ -435,24 +440,38 @@ fn provision_resolves_creates_describes_pins_and_labels() {
         .expect("the ttl label value is decimal epoch seconds");
     assert!(epoch > 1_600_000_000, "{ttl_frag}");
 
-    // The staged blob (captured at create time — it dies with the mint
-    // tempdir after provision): the private half rides user-data, the
-    // operator key authorizes login. One staged FILE, handed to every
-    // per-instance create call.
+    // The staged blobs (captured at create time — removed once served):
+    // NO private half anywhere (the amendment's absence property, over
+    // the real sent bytes), the publish block rides each blob, and each
+    // instance carries its own machine identity + one-time token.
     let staged = fake.user_data_files.lock().unwrap();
     assert_eq!(staged.len(), 2, "one blob capture per create call");
-    assert_eq!(
-        staged[0].0, staged[1].0,
-        "one staged file, not one per instance"
+    let token_of = |blob: &str| {
+        blob.lines()
+            .find(|l| l.trim_start().starts_with("PUBLISH_TOKEN='"))
+            .map(|l| {
+                l.trim()
+                    .trim_start_matches("PUBLISH_TOKEN='")
+                    .trim_end_matches('\'')
+            })
+            .expect("token line")
+            .to_string()
+    };
+    assert_ne!(token_of(&staged[0].2), token_of(&staged[1].2));
+    assert_ne!(
+        staged[0].2, staged[1].2,
+        "each instance carries its own blob (distinct one-time token)"
     );
-    for (_, mode, content) in staged.iter() {
+    for (_, _mode, content) in staged.iter() {
         assert!(
-            content.contains("-----BEGIN OPENSSH PRIVATE KEY-----"),
-            "private half rides user-data"
+            !content.contains("BEGIN OPENSSH PRIVATE KEY"),
+            "no private half rides user-data"
         );
+        assert!(content.contains("/etc/shuttle/publish-host-key.sh"));
+        assert!(content.contains(OPERATOR_KEY));
         assert!(
-            content.contains(OPERATOR_KEY),
-            "operator key authorizes login"
+            content.contains("MACHINE_IDENTITY='shuttle-worker-"),
+            "the machine identity is the instance name"
         );
     }
     drop(staged);
@@ -651,9 +670,9 @@ fn teardown_reports_mixed_delete_results() {
 // ── User-data staging hygiene ──
 
 #[test]
-fn user_data_is_staged_inside_the_mint_tempdir_at_0600() {
-    // The blob carries the minted private host half: it must live in the
-    // mint tempdir (so it dies with the keypair) at mode 0600.
+fn user_data_is_staged_inside_the_provision_tempdir_at_0600() {
+    // The blob carries the one-time publish bearer: it must live in the
+    // provision tempdir (so it dies with the run) at mode 0600.
     let (_d, config) = workspace("shuttle.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeGcp::new(Script::default());
@@ -668,7 +687,7 @@ fn user_data_is_staged_inside_the_mint_tempdir_at_0600() {
     assert_eq!(
         path.file_name().unwrap(),
         "user-data.yaml",
-        "staged inside the mint tempdir"
+        "staged inside the provision tempdir"
     );
     assert_ne!(
         path.parent().unwrap(),
@@ -678,7 +697,7 @@ fn user_data_is_staged_inside_the_mint_tempdir_at_0600() {
     assert_eq!(mode, 0o600, "the blob is 0600 while it exists");
     assert!(
         !path.exists(),
-        "the staged blob dies with the mint tempdir after provision"
+        "the staged blob is removed once its create call served it"
     );
 }
 

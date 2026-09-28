@@ -2,11 +2,12 @@
 //! [`CommandRunner`] — zero new crates, the avahi-fallback precedent,
 //! the same shape as the Hetzner/AWS/GCP modules.
 //!
-//! Flow per ADR-0045 (mint-and-inject, Decision 1/6): mint the worker
-//! host keypair coordinator-side → render the shared cloud-init template
-//! → `vm create` with that user-data (`--custom-data @file`, the
-//! authenticated API channel that carries the private half) → `vm show
-//! --show-details` for the public IP → pin address + public half into
+//! Flow per ADR-0045's amendment (#295): mint a one-time publish token
+//! per VM + render the shared cloud-init template (guest-local host
+//! keypair generation — NO private half ships) → `vm create` with that
+//! user-data (`--custom-data @file`, the authenticated API channel that
+//! now carries public material + the one-time bearer only) → `vm show
+//! --show-details` for the public IP → pin the host CA fingerprint into
 //! the managed `workers` block. The pin exists BEFORE first use;
 //! `ssh-keyscan` is never called.
 //!
@@ -16,12 +17,13 @@
 //! YAML and the Custom Script Extension executes a SHELL script, where
 //! the YAML would fail. The pinned base image is cloud-init-capable
 //! Ubuntu (ADR-0046), so the template rides the cloud-init channel:
-//! `--custom-data @<file>` — the same authenticated channel that
-//! carries the private half, and a file hand-off (the blob never enters
-//! argv). Same rule as the sibling providers — the shared template is
-//! consumed, never forked (hcloud `--user-datafile`, aws `file://`,
-//! gcloud `user-data=`, azure `@file`). The Custom Script Extension
-//! remains the channel for non-cloud-init images; none is pinned here.
+//! `--custom-data @<file>` — the same authenticated channel that now
+//! carries the one-time publish bearer, and a file hand-off (the blob
+//! never enters argv). Same rule as the sibling providers — the shared
+//! template is consumed, never forked (hcloud `--user-datafile`, aws
+//! `file://`, gcloud `user-data=`, azure `@file`). The Custom Script
+//! Extension remains the channel for non-cloud-init images; none is
+//! pinned here.
 //!
 //! Spot (#197, opt-in): `--spot` rides `vm create` as `--priority Spot
 //! --eviction-policy Delete --max-price <cap>`. The eviction policy is
@@ -59,10 +61,11 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::command::{exit_code, CommandRunner};
+use crate::provision::publish::PublishChannel;
 use crate::provision::{
-    append_worker_entry, evict_worker_entry, iso8601_utc, mint_host_keypair, now_epoch_secs,
-    render_user_data, stage_user_data, ProvisionPlan, ProvisionRequest, ProvisionedWorker,
-    Provisioner, UserDataParams,
+    append_worker_entry, evict_worker_entry, iso8601_utc, now_epoch_secs, render_user_data,
+    require_ca_pin, require_publish, PinPlan, ProvisionPlan, ProvisionRequest, ProvisionedWorker,
+    Provisioner, UserDataParams, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
 };
 
 /// The worker presence tag shuttle stamps at create time — the key
@@ -119,6 +122,10 @@ pub struct AzureProvisioner<R: CommandRunner> {
     /// the CLI boundary (`SHUTTLE_OPERATOR_KEY` / default key halves) so
     /// the core stays env-free under test.
     operator_key: String,
+    /// The coordinator publish channel (callback URL + ceremony home) —
+    /// `None` is the no-channel refusal path for real runs; a dry run
+    /// runs without.
+    publish: Option<PublishChannel>,
 }
 
 impl<R: CommandRunner> AzureProvisioner<R> {
@@ -127,12 +134,14 @@ impl<R: CommandRunner> AzureProvisioner<R> {
         credentials: Option<String>,
         binary_url: String,
         operator_key: String,
+        publish: Option<PublishChannel>,
     ) -> Self {
         AzureProvisioner {
             runner,
             credentials,
             binary_url,
             operator_key,
+            publish,
         }
     }
 
@@ -164,16 +173,18 @@ impl<R: CommandRunner> Provisioner for AzureProvisioner<R> {
         // positive finite decimal.
         validate_spot(req)?;
 
-        // Local resolution: mint, template, TTL. All of it is API-free,
-        // so the dry-run plan is the REAL plan.
+        // Local resolution first: template, TTL. All of it is API-free,
+        // so the dry-run plan is the REAL plan (with placeholder publish
+        // slots — the real per-VM blob differs only in token + name).
         let expiry_epoch = now_epoch_secs()? + req.ttl_secs;
         let expiry_iso = iso8601_utc(expiry_epoch);
-        let dir = tempfile::tempdir()
-            .map_err(|e| miette::miette!("provision: cannot create the mint scratch dir: {e}"))?;
-        let minted = mint_host_keypair(&self.runner, dir.path())?;
+        let dir = tempfile::tempdir().map_err(|e| {
+            miette::miette!("provision: cannot create the staging scratch dir: {e}")
+        })?;
         let user_data = render_user_data(&UserDataParams {
-            host_private_key: &minted.private_pem,
-            host_public_key: &minted.public_line,
+            machine_identity: PLAN_MACHINE_IDENTITY,
+            publish_url: PLAN_PUBLISH_URL,
+            publish_token: PLAN_PUBLISH_TOKEN,
             operator_key: &self.operator_key,
             binary_url: &self.binary_url,
             ttl_expiry_epoch: expiry_epoch,
@@ -202,10 +213,17 @@ impl<R: CommandRunner> Provisioner for AzureProvisioner<R> {
 
         // az reads credentials from its inherited environment (`az
         // login` state / service-principal env); they never enter argv.
-        // Presence is checked before any API call.
+        // Presence is checked before any API call — the outermost gate,
+        // then the fail-closed coordinator-side state: the publish
+        // channel (guest callback) and the CA pin the entries will
+        // carry.
         self.require_credentials()?;
-
-        let user_data_file = stage_user_data(dir.path(), &user_data)?;
+        let publish = require_publish(&self.publish)?;
+        let ca_pin = require_ca_pin(req)?.to_string();
+        let pin = PinPlan {
+            publish,
+            ca_pin: &ca_pin,
+        };
 
         // The per-region group first (idempotent): the VM's region is
         // its group's region, so this is how `--location` takes effect.
@@ -222,14 +240,7 @@ impl<R: CommandRunner> Provisioner for AzureProvisioner<R> {
         // Create + describe; every successfully created name rides
         // `created` so any later failure tears the whole set down.
         let mut created: Vec<(String, String)> = Vec::new();
-        let result = self.create_and_pin(
-            req,
-            &rg,
-            &user_data_file,
-            expiry_epoch,
-            &minted.public_line,
-            &mut created,
-        );
+        let result = self.create_and_pin(req, &rg, dir.path(), expiry_epoch, &pin, &mut created);
         if let Err(e) = result {
             let mut torn_down = 0usize;
             let mut stuck: Vec<&str> = Vec::new();
@@ -266,7 +277,7 @@ impl<R: CommandRunner> Provisioner for AzureProvisioner<R> {
         Ok(created
             .into_iter()
             .map(|(name, address)| ProvisionedWorker {
-                host_key: pin_with_comment(&minted.public_line, &name),
+                host_key: ca_pin.clone(),
                 name,
                 address,
             })
@@ -333,22 +344,33 @@ impl<R: CommandRunner> AzureProvisioner<R> {
     }
 
     /// Create `count` VMs, describe each for its public IP, then pin all
-    /// entries in ONE pass. Records every created name in `created`
-    /// (name, address-so-far) as teardown-on-failure state — pushed
-    /// BEFORE the describe, so a VM that exists but fails its describe
-    /// is still deleted.
+    /// entries in ONE pass. Each VM gets its own machine identity, its
+    /// own one-time publish token (recorded in the coordinator's registry
+    /// BEFORE the create — the token must be enforceable by first boot),
+    /// and its own user-data blob. Records every created name in
+    /// `created` (name, address-so-far) as teardown-on-failure state —
+    /// pushed BEFORE the describe, so a VM that exists but fails its
+    /// describe is still deleted.
     fn create_and_pin(
         &self,
         req: &ProvisionRequest,
         rg: &str,
-        user_data_file: &Path,
+        staging: &Path,
         expiry_epoch: u64,
-        public_line: &str,
+        pin: &PinPlan<'_>,
         created: &mut Vec<(String, String)>,
     ) -> miette::Result<()> {
         let mut pins: Vec<(String, String)> = Vec::new();
         for i in 0..req.count {
             let name = instance_name(i);
+            let user_data_file = crate::provision::stage_publishing_user_data(
+                staging,
+                pin.publish,
+                &self.binary_url,
+                &self.operator_key,
+                &name,
+                expiry_epoch,
+            )?;
             let custom_data = format!("@{}", user_data_file.display());
             let tags_value = tags(req, expiry_epoch);
             let mut args = vec![
@@ -382,6 +404,9 @@ impl<R: CommandRunner> AzureProvisioner<R> {
                 ]);
             }
             self.az(&args)?;
+            // The blob is served — the one-time bearer in it must not
+            // linger on disk past its create call.
+            let _ = std::fs::remove_file(&user_data_file);
             // Teardown state FIRST: a VM that exists but fails its
             // describe must still be deleted.
             created.push((name.clone(), String::new()));
@@ -393,8 +418,8 @@ impl<R: CommandRunner> AzureProvisioner<R> {
         // The pin transaction: all entries after every VM is up — a
         // provision that dies here leaves no config (and the caller's
         // teardown leaves no VM). Nothing unpinned survives.
-        for (name, address) in &pins {
-            append_worker_entry(&req.config, address, &pin_with_comment(public_line, name))?;
+        for (_, address) in &pins {
+            append_worker_entry(&req.config, address, pin.ca_pin)?;
         }
         Ok(())
     }
@@ -618,19 +643,9 @@ fn address_for(ip: &str) -> String {
     format!("ssh://root@{ip}")
 }
 
-/// The pinned public half: `ssh-keygen`'s line with the VM name as the
-/// single comment word (the pin grammar allows at most one) —
-/// traceability from a known_hosts/`workers` line back to the Azure
-/// resource.
-fn pin_with_comment(public_line: &str, name: &str) -> String {
-    let mut parts = public_line.split_whitespace();
-    let key_type = parts.next().unwrap_or_default();
-    let key = parts.next().unwrap_or_default();
-    format!("{key_type} {key} {name}")
-}
-
 /// `shuttle-worker-<hex nanos>-<NN>` — unique per subscription; the
-/// prefix mirrors the tag key, so name and tags read as one identity.
+/// prefix mirrors the tag key, so name and tags read as one identity. The
+/// name doubles as the machine identity the one-time publish token binds.
 fn instance_name(i: u32) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -814,11 +814,13 @@ fn workers_count(raw: &str) -> Result<u32, String> {
 /// Subcommands for `shuttle workers`.
 #[derive(clap::Subcommand)]
 pub enum WorkersCommand {
-    /// Provision cloud workers: mints the worker host keypair
-    /// coordinator-side, injects the private half through cloud-init
-    /// user-data (the provider's authenticated channel), and pins the
-    /// public half into a machine-managed `workers` entry in shuttle.lua
-    /// BEFORE first use — never ssh-keyscan (ADR-0045).
+    /// Provision cloud workers: each guest GENERATES its own SSH host
+    /// keypair locally on first boot and publishes the PUBLIC half to the
+    /// coordinator over a one-time provisioning token (ADR-0045 amendment
+    /// — no private half ever ships in user-data); provision pins the
+    /// host CA's fingerprint into a machine-managed `workers` entry in
+    /// shuttle.lua BEFORE first use — never ssh-keyscan. Certificate
+    /// issuance from the published keys is #295 sub-task 3.
     Provision {
         /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
         #[arg(long)]
@@ -889,6 +891,16 @@ pub enum WorkersCommand {
         #[arg(short, long, default_value = "shuttle.lua")]
         file: String,
     },
+
+    /// Receive one guest publish (ADR-0045 amendment, #295): reads the
+    /// JSON payload on stdin with the bearer token in
+    /// `SHUTTLE_PUBLISH_TOKEN`, validates one-time-ness + key shape, and
+    /// stores the pending identity under
+    /// `~/.config/shuttle/ca/pending/` for issuance (#295 sub-task 3).
+    /// The transport binding for any TLS-terminating front: extract the
+    /// Authorization header, hand the body here — fail-closed on every
+    /// bad token, replay, or malformed key.
+    ReceivePublish,
 }
 
 /// Subcommands for `shuttle deps`.

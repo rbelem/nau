@@ -1,11 +1,12 @@
 //! The AWS provider (#195) driven end to end against a scripted
-//! `CommandRunner` fake: the fake plays `ssh-keygen` (writes a fixed
-//! throwaway keypair) and the `aws` CLI (SSM parameter, run-instances,
-//! describe, describe-volumes, terminate — from scripted state), records
-//! every argv, and answers nothing else. No network, no real aws, no
-//! credentials — the ticket's live lanes (env-gated on AWS credentials)
-//! are deferred; this fake-API suite plus the dry-run plan is the proof
-//! surface.
+//! `CommandRunner` fake: the fake plays the `aws` CLI (SSM parameter,
+//! run-instances, describe, describe-volumes, terminate — from scripted
+//! state), records every argv, and answers nothing else. No network, no
+//! real aws, no credentials — the ticket's live lanes (env-gated on AWS
+//! credentials) are deferred; this fake-API suite plus the dry-run plan
+//! is the proof surface. (No ssh-keygen arm: the amendment removed the
+//! coordinator-side mint — a provision that tried to ssh-keygen would
+//! fail loudly here.)
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,16 +16,17 @@ use shuttle::command::{CommandRunner, RunnerOutput};
 use shuttle::provision::aws::{
     AwsProvisioner, UBUNTU_LTS_SSM_PARAMETER, WORKER_SPOT_TAG, WORKER_TAG, WORKER_TTL_TAG,
 };
+use shuttle::provision::publish::PublishChannel;
 use shuttle::provision::{parse_ttl, ProvisionRequest, Provisioner, BLOCK_BEGIN, BLOCK_END};
 
-/// A shape-valid ed25519 keypair — throwaway fixture bytes, no crypto.
-const TEST_HOST_PUB: &str =
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ shuttle-worker-host-key";
-const TEST_HOST_PRIV: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
 const OPERATOR_KEY: &str = "ssh-ed25519 AAAAoperatorkey operator@example";
 const BINARY_URL: &str = "https://example.invalid/shuttle-amd64";
 const REGION: &str = "eu-central-1";
 const AMI: &str = "ami-0abcdef1234567890";
+/// The host CA fingerprint the request carries (valid
+/// `SHA256:` + 43 base64 chars — the pin grammar's fingerprint form).
+const CA_FPR: &str = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG";
+const PUBLISH_URL: &str = "https://coordinator.example/publish";
 
 // ── The scripted provider CLI ──
 
@@ -46,18 +48,21 @@ struct Script {
     attached_volumes: usize,
 }
 
-/// Plays `ssh-keygen` + `aws` from scripted state and records every argv.
+/// Plays the `aws` CLI from scripted state and records every argv.
 /// Cheap to clone; all clones share one call log.
 #[derive(Clone)]
 struct FakeAws {
     calls: Arc<Mutex<Vec<Vec<String>>>>,
     /// (path, unix mode, content) of every `--user-data file://` blob the
-    /// fake served, captured at call time — the real blob dies with the
-    /// mint tempdir.
+    /// fake served, captured at call time — the real blob is removed once
+    /// its create call served it.
     user_data_files: Arc<Mutex<Vec<(PathBuf, u32, String)>>>,
     /// Successful terminate count, shared across clones (drives
     /// `terminate_fails_after`).
     terminates_done: Arc<Mutex<usize>>,
+    /// Successful create count, shared across clones — the per-create
+    /// instance-id namespace.
+    creates_done: Arc<Mutex<usize>>,
     script: Script,
 }
 
@@ -67,6 +72,7 @@ impl FakeAws {
             calls: Arc::new(Mutex::new(Vec::new())),
             user_data_files: Arc::new(Mutex::new(Vec::new())),
             terminates_done: Arc::new(Mutex::new(0)),
+            creates_done: Arc::new(Mutex::new(0)),
             script,
         }
     }
@@ -76,17 +82,6 @@ impl CommandRunner for FakeAws {
     fn run(&self, argv: &[String]) -> io::Result<RunnerOutput> {
         self.calls.lock().unwrap().push(argv.to_vec());
         match argv[0].as_str() {
-            // Fake ssh-keygen: drop the fixed fixture keypair at -f <path>.
-            "ssh-keygen" => {
-                let path = argv
-                    .iter()
-                    .position(|a| a == "-f")
-                    .map(|i| argv[i + 1].clone())
-                    .expect("ssh-keygen fake requires -f");
-                std::fs::write(&path, TEST_HOST_PRIV).unwrap();
-                std::fs::write(format!("{path}.pub"), TEST_HOST_PUB).unwrap();
-                Ok(ok_out(""))
-            }
             "aws" => self.aws(argv),
             other => Ok(RunnerOutput {
                 code: 1,
@@ -141,8 +136,17 @@ impl FakeAws {
                     .position(|a| a == "--count")
                     .and_then(|i| argv[i + 1].parse().ok())
                     .unwrap_or(1);
+                // Distinct ids per create call: the amendment makes
+                // provision issue one `--count 1` create per machine,
+                // and two machines must never collide on an id.
+                assert_eq!(count, 1, "the amendment pins per-instance creates");
+                let call = {
+                    let mut c = self.creates_done.lock().unwrap();
+                    *c += 1;
+                    *c
+                };
                 let ids: Vec<serde_json::Value> = (1..=count)
-                    .map(|n| serde_json::json!(format!("i-0aaa{:x}{n}", count)))
+                    .map(|_| serde_json::json!(format!("i-0{call:04x}")))
                     .collect();
                 Ok(ok_out(&serde_json::Value::Array(ids).to_string()))
             }
@@ -227,6 +231,20 @@ fn request(config: &Path, dry_run: bool) -> ProvisionRequest {
         max_price: None,
         dry_run,
         config: config.to_path_buf(),
+        ca_fingerprint: Some(CA_FPR.into()),
+    }
+}
+
+/// A publish channel over a throwaway (recreated-on-demand) home — the
+/// provider tests never read the registry back.
+fn throwaway_publish_channel() -> PublishChannel {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    PublishChannel {
+        url: PUBLISH_URL.into(),
+        home: std::env::temp_dir().join(format!("shuttle-aws-publish-test-{nanos}")),
     }
 }
 
@@ -236,6 +254,7 @@ fn provisioner(fake: &FakeAws, credentials: Option<&str>) -> AwsProvisioner<Fake
         credentials.map(|c| c.to_string()),
         BINARY_URL.into(),
         OPERATOR_KEY.into(),
+        Some(throwaway_publish_channel()),
     )
 }
 
@@ -377,8 +396,8 @@ fn provision_resolves_creates_describes_pins_and_tags() {
     assert_eq!(workers.len(), 2);
 
     // The worker handle is the instance id (the destroy verb's argument);
-    // the address comes from the describe document; the pin comments the
-    // instance id for traceability.
+    // the address comes from the describe document; the pin is the CA
+    // fingerprint (the amendment's pin — one root, not per-worker keys).
     for w in &workers {
         assert!(w.name.starts_with("i-"), "{}", w.name);
         assert!(
@@ -386,74 +405,98 @@ fn provision_resolves_creates_describes_pins_and_tags() {
             "{}",
             w.address
         );
-        let pin: Vec<&str> = w.host_key.split_whitespace().collect();
-        assert_eq!(pin[0], "ssh-ed25519");
-        assert_eq!(pin[2], w.name, "the pin comments the instance id");
+        assert_eq!(w.host_key, CA_FPR, "the pin IS the CA fingerprint");
     }
 
     // The create shape: AMI from the SSM parameter, instance type, count,
     // user-data file, contract tags, and the region on every call — with
-    // NO market options on the on-demand default.
+    // NO market options on the on-demand default. One create PER
+    // instance (`--count 1` each): EC2 user-data is immutable and the
+    // one-time publish token is per machine, so the batch create became
+    // per-instance creates (the amendment's per-machine identity).
     let creates: Vec<Vec<String>> = aws_calls(&fake)
         .into_iter()
         .filter(|argv| flat(argv).contains("ec2\u{1f}run-instances"))
         .collect();
-    assert_eq!(creates.len(), 1, "one --count call, not N creates");
-    let f = flat(&creates[0]);
-    assert!(
-        f.contains("--region\u{1f}eu-central-1"),
-        "region rides the call: {f}"
+    assert_eq!(
+        creates.len(),
+        2,
+        "one create per instance (per-machine token + identity)"
     );
-    assert!(f.contains(&format!("--image-id\u{1f}{AMI}")), "{f}");
-    assert!(f.contains("--instance-type\u{1f}c7i.large"), "{f}");
-    assert!(f.contains("--count\u{1f}2"), "{f}");
-    assert!(
-        f.contains("--user-data\u{1f}file://"),
-        "user-data rides the authenticated channel: {f}"
-    );
-    let tag_idx = creates[0]
-        .iter()
-        .position(|a| a == "--tag-specifications")
-        .unwrap();
-    let tags = &creates[0][tag_idx + 1];
-    assert!(
-        tags.contains(&format!("Key={WORKER_TAG},Value=true")),
-        "{tags}"
-    );
-    assert!(
-        !tags.contains(WORKER_SPOT_TAG),
-        "on-demand carries no spot tag: {tags}"
-    );
-    let ttl_frag_start = tags
-        .find(&format!("Key={WORKER_TTL_TAG},"))
-        .expect("ttl tag present");
-    let rest = &tags[ttl_frag_start..];
-    let value_start = rest.find("Value=").unwrap() + "Value=".len();
-    let value_end = rest[value_start..].find('}').unwrap() + value_start;
-    let epoch: u64 = rest[value_start..value_end].parse().unwrap();
-    assert!(epoch > 1_600_000_000, "the tag value is the TTL epoch");
-    assert!(
-        !f.contains("--instance-market-options"),
-        "on-demand default never bids: {f}"
-    );
-    assert!(
-        !f.contains("AWS_ACCESS_KEY_ID"),
-        "credentials never enter argv: {f}"
-    );
+    for argv in &creates {
+        let f = flat(argv);
+        assert!(
+            f.contains("--region\u{1f}eu-central-1"),
+            "region rides the call: {f}"
+        );
+        assert!(f.contains(&format!("--image-id\u{1f}{AMI}")), "{f}");
+        assert!(f.contains("--instance-type\u{1f}c7i.large"), "{f}");
+        assert!(f.contains("--count\u{1f}1"), "{f}");
+        assert!(
+            f.contains("--user-data\u{1f}file://"),
+            "user-data rides the authenticated channel: {f}"
+        );
+        let tag_idx = argv
+            .iter()
+            .position(|a| a == "--tag-specifications")
+            .unwrap();
+        let tags = &argv[tag_idx + 1];
+        assert!(
+            tags.contains(&format!("Key={WORKER_TAG},Value=true")),
+            "{tags}"
+        );
+        assert!(
+            !tags.contains(WORKER_SPOT_TAG),
+            "on-demand carries no spot tag: {tags}"
+        );
+        let ttl_frag_start = tags
+            .find(&format!("Key={WORKER_TTL_TAG},"))
+            .expect("ttl tag present");
+        let rest = &tags[ttl_frag_start..];
+        let value_start = rest.find("Value=").unwrap() + "Value=".len();
+        let value_end = rest[value_start..].find('}').unwrap() + value_start;
+        let epoch: u64 = rest[value_start..value_end].parse().unwrap();
+        assert!(epoch > 1_600_000_000, "the tag value is the TTL epoch");
+        assert!(
+            !f.contains("--instance-market-options"),
+            "on-demand default never bids: {f}"
+        );
+        assert!(
+            !f.contains("AWS_ACCESS_KEY_ID"),
+            "credentials never enter argv: {f}"
+        );
+    }
 
-    // The staged blob (captured at create time — it dies with the mint
-    // tempdir after provision): the private half rides user-data, the
-    // operator key authorizes login.
+    // The staged blobs (captured at create time — removed once served):
+    // NO private half anywhere (the amendment's absence property, over
+    // the real sent bytes), the publish block rides it, each instance's
+    // machine identity is its own name, and the two tokens differ.
     let staged = fake.user_data_files.lock().unwrap();
-    assert_eq!(staged.len(), 1, "one staged blob per run");
-    assert!(
-        staged[0].2.contains("-----BEGIN OPENSSH PRIVATE KEY-----"),
-        "private half rides user-data"
-    );
-    assert!(
-        staged[0].2.contains(OPERATOR_KEY),
-        "operator key authorizes login"
-    );
+    assert_eq!(staged.len(), 2, "one staged blob per create");
+    for (_, _, user_data) in staged.iter() {
+        assert!(
+            !user_data.contains("BEGIN OPENSSH PRIVATE KEY"),
+            "no private half rides user-data"
+        );
+        assert!(user_data.contains("/etc/shuttle/publish-host-key.sh"));
+        assert!(user_data.contains(OPERATOR_KEY));
+        assert!(
+            user_data.contains("MACHINE_IDENTITY='shuttle-worker-"),
+            "the machine identity is the instance name"
+        );
+    }
+    let token_of = |blob: &str| {
+        blob.lines()
+            .find(|l| l.trim_start().starts_with("PUBLISH_TOKEN='"))
+            .map(|l| {
+                l.trim()
+                    .trim_start_matches("PUBLISH_TOKEN='")
+                    .trim_end_matches('\'')
+            })
+            .expect("token line")
+            .to_string()
+    };
+    assert_ne!(token_of(&staged[0].2), token_of(&staged[1].2));
     drop(staged);
 
     // Config: the managed block holds exactly the two entries; the file
@@ -679,7 +722,7 @@ fn teardown_reports_mixed_terminate_results() {
     // text), and the SECOND teardown terminate fails: the first is
     // honestly counted terminated AND the stuck one is named — neither
     // half can vanish into a blanket success line.
-    let (dir, config) = workspace("shuttle.lua");
+    let (_dir, config) = workspace("shuttle.lua");
     // Fake ids i-0aaa21 / i-0aaa22 describe to 203.0.113.11 / .12: the
     // operator-owned entry at .12 makes pin #2 refuse after pin #1
     // pinned .11.
@@ -707,9 +750,9 @@ fn teardown_reports_mixed_terminate_results() {
 // ── User-data staging hygiene ──
 
 #[test]
-fn user_data_is_staged_inside_the_mint_tempdir_at_0600() {
-    // The blob carries the minted private host half: it must live in the
-    // mint tempdir (so it dies with the keypair) at mode 0600.
+fn user_data_is_staged_inside_the_provision_tempdir_at_0600() {
+    // The blob carries the one-time publish bearer: it must live in the
+    // provision tempdir (so it dies with the run) at mode 0600.
     let (_d, config) = workspace("shuttle.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeAws::new(Script::default());
@@ -724,7 +767,7 @@ fn user_data_is_staged_inside_the_mint_tempdir_at_0600() {
     assert_eq!(
         path.file_name().unwrap(),
         "user-data.yaml",
-        "staged inside the mint tempdir"
+        "staged inside the provision tempdir"
     );
     assert_ne!(
         path.parent().unwrap(),
@@ -734,7 +777,7 @@ fn user_data_is_staged_inside_the_mint_tempdir_at_0600() {
     assert_eq!(mode, 0o600, "the blob is 0600 while it exists");
     assert!(
         !path.exists(),
-        "the staged blob dies with the mint tempdir after provision"
+        "the staged blob is removed once its create call served it"
     );
 }
 
