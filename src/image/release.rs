@@ -38,8 +38,8 @@
 //! (a different type, a different scheme; the eval signer is named for
 //! what it signs so this sentence can be checked mechanically). The
 //! signature is a bare base64 Ed25519 entry under the operator key's id,
-//! and [`super::verify::verify_manifest_signature`] accepts it under the
-//! ADR-0024 §4 anchor policy (revoked-first, then ANY of `--key` +
+//! and [`super::verify::verify_manifest_signature_at`] accepts it under
+//! the ADR-0024 §4 anchor policy (revoked-first, then ANY of `--key` +
 //! `~/.config/shuttle/keys/*.pub`). Tests pin the sign→verify round-trip
 //! through that exact seam.
 //!
@@ -49,8 +49,13 @@
 //!
 //! # The baked-in release checklist (ADR-0044 D8)
 //!
-//! Two steps stay BLOCKING on the operator and are printed with the media
-//! set, never silently skipped, never faked by this flow:
+//! The verify advice this flow used to only print is now EXECUTED: before
+//! the media set is reported, the release self-check runs in-process over
+//! the published set ([`self_check`]) — the same device policy
+//! `shuttle verify-image` applies, plus the device-side SHA256SUMS
+//! signature round-trip (#293 item 4). Two steps CANNOT run in-process
+//! and stay BLOCKING on the operator, printed with the media set, never
+//! silently skipped, never faked by this flow:
 //!
 //! - `examples/rebuild-compare.sh` byte-identity across two machines
 //!   BEFORE the media set is distributed;
@@ -167,22 +172,99 @@ pub fn sign_image_manifest(
 /// Publish the release media set: sign a copy of the build's
 /// authoritative manifest, write it beside the (already release-named)
 /// image, persist the sysupdate transfer payloads beside it (#274), write
-/// `SHA256SUMS` over everything, and print the media set with the
-/// blocking checklist. Resolves the operator key and trust paths from
-/// `$HOME`.
+/// `SHA256SUMS` + its signature over everything, then EXECUTE the release
+/// self-check in-process over the published set (#293 item 4) before
+/// printing the media set with the blocking checklist.
+///
+/// Trust paths resolve through the central fail-closed HOME helper
+/// ([`super::verify::operator_home`], #285/#293 item 8) — an unset HOME
+/// refuses instead of anchoring trust from the CWD.
 pub fn publish(
+    runner: &dyn crate::command::CommandRunner,
     img: &Path,
     manifest: &ImageManifest,
     arch: &str,
     args: &ReleaseArgs,
     payloads: &[ReleasePayload],
 ) -> miette::Result<()> {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-    publish_with(&home, img, manifest, arch, args, payloads)
+    let home = super::verify::operator_home()?;
+    let (dir, img_name, manifest_name, kp) =
+        publish_with(&home, img, manifest, arch, args, payloads)?;
+    // The printed verify advice, executed (#293 item 4): the published
+    // set must pass the SAME device policy verify-image applies — under
+    // the keychain this release signed with — before anyone can call it a
+    // release. The checklist print below is only what CANNOT run here.
+    self_check(
+        runner,
+        &dir,
+        &img_name,
+        &manifest_name,
+        &crate::sign::keys_dir(&home),
+        super::verity::find_veritysetup().as_deref(),
+        &kp,
+    )?;
+    report_media_set(&dir, &img_name, &manifest_name, payloads, &kp);
+    Ok(())
+}
+
+/// The in-process release self-check over the PUBLISHED media set (#293
+/// item 4): what the checklist used to only advertise, executed. Two
+/// halves, both device-shaped:
+///
+/// 1. [`super::verify::verify_device_at`] over the published image +
+///    published signed manifest under the release's OWN keychain — the
+///    GPT identity, slot resolution, truncation, and dm-verity recompute
+///    `shuttle verify-image` runs, minus the HOME dependency (the release
+///    signs and proves under the same keychain).
+/// 2. The update-night round-trip: the published `SHA256SUMS` verifies
+///    under its published signature against the pubring the build embeds
+///    at `/usr/lib/systemd/import-pubring.pgp` — in-process, the exact
+///    check the guest's `Verify=yes` gpg subprocess performs.
+///
+/// The operator-side checklist items (rebuild-compare, trademark) cannot
+/// run here and stay printed as BLOCKING. Costs one region-extract pass
+/// over the image (the verify-image price) — the release is not in a
+/// hurry; a set that cannot verify its own bytes is not a release.
+pub(crate) fn self_check(
+    runner: &dyn crate::command::CommandRunner,
+    dir: &Path,
+    img_name: &str,
+    manifest_name: &str,
+    keys_dir: &Path,
+    veritysetup: Option<&Path>,
+    kp: &crate::sign::KeyPair,
+) -> miette::Result<()> {
+    let args = super::VerifyImageArgs {
+        device: dir.join(img_name),
+        manifest: dir.join(manifest_name),
+        key: None,
+        slot: super::SlotSelector::Auto,
+    };
+    let outcome = super::verify::verify_device_at(runner, &args, veritysetup, keys_dir)?;
+    let sums = std::fs::read(dir.join("SHA256SUMS"))
+        .into_diagnostic()
+        .wrap_err("reading the published SHA256SUMS")?;
+    let sig = std::fs::read(dir.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME))
+        .into_diagnostic()
+        .wrap_err("reading the published SHA256SUMS signature")?;
+    let pubring = crate::sign::import_pubring_pgp(kp)?;
+    crate::sign::verify_sysupdate_manifest_signature(&pubring, &sums, &sig)?;
+    eprintln!(
+        "  ✓ release self-check passed in-process: verify-image device policy \
+         over the published set (slot {}, roothash {}…) and the device-side \
+         SHA256SUMS.gpg round-trip (#293)",
+        outcome.slot,
+        &outcome.roothash[..8.min(outcome.roothash.len())]
+    );
+    Ok(())
 }
 
 /// [`publish`] with the key home explicit — the test seam (mirrors
-/// [`super::verify::verify_manifest_signature`]'s split).
+/// [`super::verify::verify_manifest_signature_at`]'s split). Writes the whole
+/// media set and returns `(release dir, image file name, manifest file
+/// name, signing key)`; the report and the self-check are the caller's
+/// (the tests drive the write path on toy bytes no real verify could
+/// pass).
 pub(crate) fn publish_with(
     home: &Path,
     img: &Path,
@@ -190,7 +272,7 @@ pub(crate) fn publish_with(
     arch: &str,
     args: &ReleaseArgs,
     payloads: &[ReleasePayload],
-) -> miette::Result<()> {
+) -> miette::Result<(PathBuf, String, String, crate::sign::KeyPair)> {
     // The signing key is the same ceremony key the build already demanded
     // for update_source images: load fail-closed, never mint.
     let kp = super::load_signing_key_fail_closed(home)?;
@@ -224,8 +306,7 @@ pub(crate) fn publish_with(
         &kp,
     )?;
 
-    report_media_set(dir, &img_name, &manifest_name, payloads, &kp);
-    Ok(())
+    Ok((dir.clone(), img_name, manifest_name, kp))
 }
 
 /// The published image's media-set file name (the sums cover it by this
@@ -362,12 +443,11 @@ fn report_media_set(
     eprintln!(
         "  ℹ release checklist (ADR-0044 D8) — BLOCKING before distribution: run \
          examples/rebuild-compare.sh for two-machine byte-identity; the ADR-0013 \
-         trademark sweep remains blocking. Pre-ship check: shuttle verify-image \
-         --device <img> --manifest {manifest_name} verifies under the operator \
-         keychain (~/.config/shuttle/keys); any --key must be a copy from the \
-         ceremony keychain, NEVER a file served beside this media set — anchors \
-         travel OUT-OF-BAND (ADR-0033 D7); a --key fetched with the download is \
-         a self-bless. Procedure: docs/nau-ops-runbook.md §7."
+         trademark sweep remains blocking. The verify pass itself ran in-process \
+         above (#293): anchors still travel OUT-OF-BAND (ADR-0033 D7) — any --key \
+         is a copy from the ceremony keychain, NEVER a file served beside this \
+         media set; a --key fetched with the download is a self-bless. Procedure: \
+         docs/nau-ops-runbook.md §7."
     );
 }
 
@@ -376,11 +456,26 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     to_lower_hex(&sha2::Sha256::digest(bytes))
 }
 
+/// The read chunk for [`sha256_file`]: 1 MiB — large enough that a
+/// multi-GB image hashes in few syscalls, small enough that the buffer is
+/// noise next to the media it digests.
+const SHA256_STREAM_CHUNK: usize = 1024 * 1024;
+
+/// SHA-256 of a file, STREAMED in fixed chunks. A release image is
+/// multi-GB; buffering it whole with `std::fs::read` OOMed release hosts
+/// (#293 item 5). The digest is identical to the one-shot form — pinned
+/// by `sha256_file_matches_the_one_shot_digest_across_chunks`.
 fn sha256_file(path: &Path) -> miette::Result<String> {
-    let bytes = std::fs::read(path)
+    let file = std::fs::File::open(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("hashing {}", path.display()))?;
-    Ok(sha256_bytes(&bytes))
+    let mut reader = std::io::BufReader::with_capacity(SHA256_STREAM_CHUNK, file);
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut reader, &mut hasher)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("hashing {}", path.display()))?;
+    use sha2::Digest;
+    Ok(to_lower_hex(&hasher.finalize()))
 }
 
 fn to_lower_hex(bytes: &[u8]) -> String {
@@ -879,5 +974,233 @@ mod tests {
         // ANY-anchor: the successor key alone satisfies the device policy.
         let key_id = super::verify::verify_manifest_signature_at(&m, None, &keys_dir).unwrap();
         assert_eq!(key_id, new.key_id());
+    }
+
+    // ── #293 item 5: the digest streams, it does not buffer ──
+
+    #[test]
+    fn sha256_file_matches_the_one_shot_digest_across_chunks() {
+        // 2.5 MiB of deterministic bytes — crosses the 1 MiB read chunk
+        // twice and ends mid-chunk, the shapes a chunked reader gets wrong.
+        let len = 5 * SHA256_STREAM_CHUNK / 2;
+        let mut pattern = vec![0u8; len];
+        for (i, b) in pattern.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.img");
+        std::fs::write(&path, &pattern).unwrap();
+        assert_eq!(sha256_file(&path).unwrap(), sha256_bytes(&pattern));
+    }
+
+    #[test]
+    fn sha256_file_hashes_the_empty_file_to_the_known_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.img");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    // ── #293 item 4: the self-check EXECUTES the printed advice ──
+
+    /// A runner answering `sfdisk -J` with `body` and `veritysetup` with
+    /// `verity_code`, recording every argv (the verify.rs FakeTools shape —
+    /// the self-check drives the same external seams verify-image does).
+    struct FakeTools {
+        sfdisk_body: String,
+        verity_code: i32,
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl FakeTools {
+        fn new(sfdisk_body: String, verity_code: i32) -> FakeTools {
+            FakeTools {
+                sfdisk_body,
+                verity_code,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// True when some recorded call invoked `tool`.
+        fn called(&self, tool: &str) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|argv| argv.first().is_some_and(|t| t.ends_with(tool)))
+        }
+    }
+
+    impl crate::command::CommandRunner for FakeTools {
+        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            let (code, stderr) = if argv.first().is_some_and(|t| t.ends_with("veritysetup")) {
+                (self.verity_code, "hash mismatch".to_string())
+            } else {
+                (0, String::new())
+            };
+            Ok(crate::command::RunnerOutput {
+                code,
+                stdout: self.sfdisk_body.clone().into_bytes(),
+                stderr,
+            })
+        }
+    }
+
+    /// The published fixture's single-slot GPT table: root + hash carry the
+    /// roothash-derived PARTUUID identity the manifest pins (512-byte
+    /// sectors; the manifest's `esp_partuuid` is None, so the ESP check
+    /// skips — this module's manifest shape).
+    fn golden_gpt_json() -> String {
+        let (data, hash) = super::generation_guids_from_roothash(ROOTHASH).unwrap();
+        let (data_up, hash_up) = (data.to_ascii_uppercase(), hash.to_ascii_uppercase());
+        format!(
+            r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
+                {{"start": 2048, "size": 2048, "type": "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", "uuid": "AABBCCDD-0011-2233-4455-667788990011", "name": "ESP"}},
+                {{"start": 4096, "size": 4096, "type": "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709", "uuid": "{data_up}", "name": "nau-demo_1.0.0_a"}},
+                {{"start": 8192, "size": 256, "type": "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5", "uuid": "{hash_up}", "name": "nau-demo_1.0.0_hash_a"}}
+            ]}}}}"#
+        )
+    }
+
+    const FIXTURE_IMG_NAME: &str = "nau-cassini-1.0.0-amd64.img";
+    const FIXTURE_MANIFEST_NAME: &str = "nau-cassini-1.0.0-amd64.manifest.json";
+
+    /// A published media set shaped like the real one: release-named sparse
+    /// image, SIGNED published manifest, sums + detached signature, and the
+    /// keychain the release signed under. Returns (work guard, release dir,
+    /// keychain dir, signing key).
+    fn self_check_fixture(
+        tag: &str,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, crate::sign::KeyPair) {
+        let work = tempfile::tempdir().unwrap();
+        let release = work.path().join(tag);
+        std::fs::create_dir_all(&release).unwrap();
+        let kp = test_kp(7);
+        // The published image: a sparse medium big enough for the fixture
+        // extents (the verity recompute is runner-faked; only the size and
+        // the GPT answers matter).
+        let img = release.join(FIXTURE_IMG_NAME);
+        let f = std::fs::File::create(&img).unwrap();
+        f.set_len(5 * 1024 * 1024).unwrap();
+        drop(f);
+        // The published manifest: the release-signed form.
+        let mut m = manifest();
+        sign_image_manifest(&mut m, &kp).unwrap();
+        std::fs::write(
+            release.join(FIXTURE_MANIFEST_NAME),
+            serde_json::to_string_pretty(&m).unwrap(),
+        )
+        .unwrap();
+        // The published sums + their detached signature (the release shape).
+        let sums = "deadbeefdeadbeef  some-file\n";
+        std::fs::write(release.join("SHA256SUMS"), sums).unwrap();
+        let sig = crate::sign::sign_sysupdate_manifest(&kp, sums.as_bytes()).unwrap();
+        std::fs::write(
+            release.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME),
+            sig,
+        )
+        .unwrap();
+        // The keychain the release signed under — anchors installed.
+        let keys_home = work.path().join("keys-home");
+        std::fs::create_dir_all(&keys_home).unwrap();
+        let keys = crate::sign::keys_dir(&keys_home);
+        crate::sign::install_public_key(&kp, &keys).unwrap();
+        (work, release, keys, kp)
+    }
+
+    #[test]
+    fn release_self_check_executes_the_device_verify_in_process() {
+        let (_work, release, keys, kp) = self_check_fixture("release");
+        let runner = FakeTools::new(golden_gpt_json(), 0);
+        self_check(
+            &runner,
+            &release,
+            FIXTURE_IMG_NAME,
+            FIXTURE_MANIFEST_NAME,
+            &keys,
+            Some(Path::new("veritysetup")),
+            &kp,
+        )
+        .expect("the published set must pass its own self-check");
+        // The advice is EXECUTED, not printed: the runner really invoked
+        // sfdisk (GPT read) and veritysetup (dm-verity recompute).
+        assert!(runner.called("sfdisk"), "the GPT was read in-process");
+        assert!(
+            runner.called("veritysetup"),
+            "the dm-verity recompute ran in-process"
+        );
+    }
+
+    #[test]
+    fn release_self_check_refuses_a_verity_mismatch() {
+        let (_work, release, keys, kp) = self_check_fixture("release");
+        let runner = FakeTools::new(golden_gpt_json(), 1);
+        let err = self_check(
+            &runner,
+            &release,
+            FIXTURE_IMG_NAME,
+            FIXTURE_MANIFEST_NAME,
+            &keys,
+            Some(Path::new("veritysetup")),
+            &kp,
+        )
+        .expect_err("a verity-mismatching medium must refuse the release");
+        assert!(
+            format!("{err:#}").contains("veritysetup"),
+            "the refusal names the failing region/tool: {err:#}"
+        );
+    }
+
+    #[test]
+    fn release_self_check_refuses_tampered_sums_by_name() {
+        let (_work, release, keys, kp) = self_check_fixture("release");
+        // Rewrite the sums AFTER their signature landed — the device's
+        // update-night check must refuse through the self-check.
+        std::fs::write(release.join("SHA256SUMS"), "tampered  file\n").unwrap();
+        let runner = FakeTools::new(golden_gpt_json(), 0);
+        let err = self_check(
+            &runner,
+            &release,
+            FIXTURE_IMG_NAME,
+            FIXTURE_MANIFEST_NAME,
+            &keys,
+            Some(Path::new("veritysetup")),
+            &kp,
+        )
+        .expect_err("tampered sums must refuse");
+        assert!(
+            format!("{err:#}").contains("SHA256SUMS"),
+            "the refusal names the manifest: {err:#}"
+        );
+    }
+
+    #[test]
+    fn release_self_check_refuses_a_foreign_keychain() {
+        let (_work, release, _keys, _kp) = self_check_fixture("release");
+        // A keychain anchoring a DIFFERENT key than the manifest signer —
+        // the device policy (revoked-first, then ANY-anchor) refuses.
+        let foreign = test_kp(9);
+        let foreign_home = _work.path().join("foreign-home");
+        std::fs::create_dir_all(&foreign_home).unwrap();
+        let foreign_keys = crate::sign::keys_dir(&foreign_home);
+        crate::sign::install_public_key(&foreign, &foreign_keys).unwrap();
+        let runner = FakeTools::new(golden_gpt_json(), 0);
+        assert!(
+            self_check(
+                &runner,
+                &release,
+                FIXTURE_IMG_NAME,
+                FIXTURE_MANIFEST_NAME,
+                &foreign_keys,
+                Some(Path::new("veritysetup")),
+                &test_kp(7),
+            )
+            .is_err(),
+            "a release must refuse to self-check under a foreign keychain"
+        );
     }
 }

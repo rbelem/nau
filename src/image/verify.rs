@@ -162,8 +162,22 @@ pub(crate) fn verify_device_with(
     args: &VerifyImageArgs,
     veritysetup: Option<&Path>,
 ) -> miette::Result<VerifyOutcome> {
+    let keys_dir = crate::sign::keys_dir(&operator_home()?);
+    verify_device_at(runner, args, veritysetup, &keys_dir)
+}
+
+/// [`verify_device_with`] against an explicit keychain directory — the
+/// seam the release self-check drives (#293 item 4): the release must
+/// prove the published set verifies under the SAME keychain it signed
+/// with, independent of the process's HOME.
+pub(crate) fn verify_device_at(
+    runner: &dyn crate::command::CommandRunner,
+    args: &VerifyImageArgs,
+    veritysetup: Option<&Path>,
+    keys_dir: &Path,
+) -> miette::Result<VerifyOutcome> {
     let manifest = load_signed_manifest(&args.manifest)?;
-    let key_id = verify_manifest_signature(&manifest, args.key.as_deref())?;
+    let key_id = verify_manifest_signature_at(&manifest, args.key.as_deref(), keys_dir)?;
     let roothash = required_roothash(&manifest)?;
     let table = read_gpt(runner, &args.device)?;
     let identity = expected_identity(&manifest, &roothash)?;
@@ -259,35 +273,29 @@ pub(crate) fn image_manifest_canonical_bytes(manifest: &ImageManifest) -> miette
     serde_json::to_vec(&clean).map_err(|e| miette::miette!("canonical serialization: {e}"))
 }
 
-/// Verify the manifest's signature under the operator trust anchors:
-/// `--key` (when given) plus `~/.config/shuttle/keys/*.pub`. Unsigned
-/// manifests refuse outright — verify-image checks the PUBLISHED signed
-/// manifest, and the ADR-0024 §4 device policy (revoked-first, then
-/// ANY-anchor) is the trust rule, not the rollout-friendly keychain
-/// default. An unset HOME refuses too — a CWD-relative fallback would
-/// silently anchor trust from `./.config/shuttle/keys`.
-pub fn verify_manifest_signature(
-    manifest: &ImageManifest,
-    extra_key: Option<&Path>,
-) -> miette::Result<String> {
-    let home = std::env::var("HOME").map_err(|_| {
+/// The operator keychain home: `$HOME`, refusing to guess. #285's
+/// fail-closed resolution, promoted to the central helper every keychain
+/// consumer folds onto (#293 item 8): verify-image's trust anchors, the
+/// release signer, the build's pubring/trust embeds, and the UC assertion
+/// key. A CWD-relative fallback would silently anchor trust from
+/// `./.config/shuttle/*` — exactly the self-bless #285 closed.
+pub(crate) fn operator_home() -> miette::Result<PathBuf> {
+    std::env::var("HOME").map(PathBuf::from).map_err(|_| {
         miette::miette!(
             "HOME is not set — refusing to guess where the operator keychain \
              lives (a CWD-relative fallback would silently anchor trust from \
              './.config/shuttle/keys'); set HOME or pass --key <public-key-file> \
              explicitly"
         )
-    })?;
-    verify_manifest_signature_at(
-        manifest,
-        extra_key,
-        &crate::sign::keys_dir(Path::new(&home)),
-    )
+    })
 }
 
-/// [`verify_manifest_signature`] against an explicit keychain directory —
-/// the seam the release signer's tests drive too (the sign↔verify
-/// round-trip must exercise the EXACT device policy; mirrors
+/// Verify the manifest's signature against an EXPLICIT keychain directory:
+/// `extra_key` (when given) merges into the anchors, the ADR-0024 §4
+/// device policy (revoked-first, then ANY-anchor) is the trust rule. This
+/// is the seam the release self-check drives (#293 item 4: the release
+/// proves the published set under the SAME keychain it signed with,
+/// independent of process HOME; mirrors
 /// [`crate::runtime::verify_signatures_at`]).
 pub(crate) fn verify_manifest_signature_at(
     manifest: &ImageManifest,
@@ -914,7 +922,7 @@ mod tests {
     }
 
     /// The crate-wide test-env lock: every `verify_device_with` test
-    /// resolves HOME through [`verify_manifest_signature`], and the
+    /// resolves HOME through [`operator_home`], and the
     /// unset-HOME test below mutates that process-global — hold the lock
     /// for the whole body so parallel tests never read a half-removed
     /// HOME (the `test_env` discipline, issue #149).
@@ -1222,16 +1230,16 @@ mod tests {
     #[test]
     fn unset_home_refuses_instead_of_falling_back_to_cwd_anchors() {
         // A CWD-relative `./.config/shuttle/keys` would silently join the
-        // anchor set; the env read must refuse by name instead. Mutating
-        // the process-global HOME is why every verify test here holds
+        // anchor set; the central resolution ([`operator_home`], #285,
+        // #293 item 8) must refuse by name instead. Mutating the
+        // process-global HOME is why every verify test here holds
         // [`env_lock`].
         let _lock = env_lock();
         let old = std::env::var("HOME").ok();
         std::env::remove_var("HOME");
-        let m = signed(manifest(Some(ROOTHASH), None), &test_kp(7));
-        // Restore before unwrapping so a refusal-shape mismatch can never
+        // Resolve BEFORE restoring so a refusal-shape mismatch can never
         // leak the removal past this test.
-        let result = verify_manifest_signature(&m, None);
+        let result = operator_home();
         match old {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),

@@ -110,6 +110,39 @@ pub(crate) fn emits_sysupdate(image: &ImageDeclaration, layout: &DiskLayout) -> 
     layout.ab && image.update_source.is_some()
 }
 
+/// WHY the build will not emit sysupdate transfers/units, when it will
+/// not — the loud mirror of [`emits_sysupdate`], one message source so
+/// the two skip shapes cannot drift apart (#293 item 6). `None` when the
+/// build emits them. Both mirror shapes PRINT; neither is silent:
+///
+/// - A/B without `update_source`: nothing declared, nothing lost — the
+///   slots stay twin-ready, the skip is informational.
+/// - `update_source` without A/B: a declared update channel that can
+///   never deliver (no slot to flip to) — declared intent silently inert
+///   before #293 named it.
+pub(crate) fn sysupdate_skip_reason(
+    image: &ImageDeclaration,
+    layout: &DiskLayout,
+) -> Option<&'static str> {
+    if emits_sysupdate(image, layout) {
+        None
+    } else if layout.ab {
+        Some(
+            "disk.ab = true without update_source — sysupdate transfer files \
+             skipped (a local-source transfer carries no verification)",
+        )
+    } else if image.update_source.is_some() {
+        Some(
+            "update_source declared but disk.ab = false — a single-slot disk \
+             has no slot to flip to, so the declared update channel is INERT: \
+             no sysupdate transfer files or trigger units are emitted. Declare \
+             disk.ab = true or drop update_source (#293)",
+        )
+    } else {
+        None
+    }
+}
+
 /// The `/var` split, resolved against the effective partition table
 /// before anything is formatted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -645,6 +678,60 @@ mod tests {
             "UC data partitions keep snapd's growth story"
         );
         assert!(!state_fs_growable(&l.partitions[1]));
+    }
+
+    // ── #293 item 6: the sysupdate skip shapes are named, never silent ──
+
+    fn skip_reason(ab: bool, update_source: bool) -> Option<&'static str> {
+        let mut image = crate::image::test_support::sample_image();
+        image.update_source = update_source.then(|| "https://updates.example.com/os/".into());
+        let mut l = native_state_layout("gpt", "ext4");
+        l.ab = ab;
+        sysupdate_skip_reason(&image, &l)
+    }
+
+    #[test]
+    fn sysupdate_skip_reasons_cover_the_truth_table() {
+        // The emitting shape: no reason, no print.
+        assert!(skip_reason(true, true).is_none(), "emits ⇒ no skip");
+        // The mirror shapes both PRINT — neither stays silent.
+        let ab_only = skip_reason(true, false).expect("ab without source must print");
+        assert!(
+            ab_only.contains("without update_source"),
+            "the ab-only skip names its cause: {ab_only}"
+        );
+        let source_only = skip_reason(false, true).expect("source without ab must print");
+        assert!(
+            source_only.contains("INERT") && source_only.contains("disk.ab = false"),
+            "the source-only skip names the inert channel: {source_only}"
+        );
+        // Nothing declared, nothing skipped.
+        assert!(skip_reason(false, false).is_none(), "plain image ⇒ silent");
+    }
+
+    #[test]
+    fn sysupdate_skip_reason_agrees_with_the_emit_predicate() {
+        // The helper is the mirror of emits_sysupdate: wherever something
+        // IS declared (ab or source), exactly one of the two speaks.
+        for ab in [true, false] {
+            for source in [true, false] {
+                let mut image = crate::image::test_support::sample_image();
+                image.update_source = source.then(|| "https://u.example/".into());
+                let mut l = native_state_layout("gpt", "ext4");
+                l.ab = ab;
+                if ab || source {
+                    assert_eq!(
+                        sysupdate_skip_reason(&image, &l).is_none(),
+                        emits_sysupdate(&image, &l),
+                        "mirror disagreement at ab={ab}, source={source}"
+                    );
+                } else {
+                    // Nothing declared: nothing emitted, nothing printed.
+                    assert!(sysupdate_skip_reason(&image, &l).is_none());
+                    assert!(!emits_sysupdate(&image, &l));
+                }
+            }
+        }
     }
 
     #[test]

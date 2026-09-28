@@ -829,6 +829,37 @@ pub(crate) fn transfer_header() -> String {
 /// payload is still hashed against the manifest (sysupdate.d(5)), so a
 /// tampered payload fails even where the signature gate already refused
 /// the tampered manifest by name.
+///
+/// The update-night verification stanza every transfer carries.
+///
+/// # The device-side verification mechanism, recorded (#293 item 10)
+///
+/// At update time `systemd-sysupdate` verifies the sums manifest through a
+/// **gpg SUBPROCESS**, not internal crypto: the transfer's `Verify=yes`
+/// makes it hand `SHA256SUMS` + `SHA256SUMS.gpg` to the guest's `gpg`
+/// with the vendor keyring
+/// (`/usr/lib/systemd/import-pubring.pgp`, wired through
+/// `VENDOR_KEYRING_PATH` upstream) as the only trust input — the exact
+/// file the build embeds at [`crate::sign::IMPORT_PUBRING_EMBED_PATH`]
+/// before the root is hashed, so the anchor is covered by the dm-verity
+/// the device boots. The signature itself is OpenPGP over the RAW sums
+/// bytes (no canonicalization) with an **EdDSALegacy (algorithm 22)**
+/// Ed25519 identity — the framing `crate::sign::sign_sysupdate_manifest`
+/// produces and what a `gpg --list-packets` on `SHA256SUMS.gpg` shows.
+/// sysupdate's SHA256SUMS parser then checks every payload hash
+/// UNCONDITIONALLY (`Verify=no` only lifts the signature gate, never the
+/// hash checks).
+///
+/// **Minimum systemd: ≥ 251.** The url-file transfer + SHA256SUMS +
+/// `Verify=` machinery this stanza rides landed across the 251 cycle
+/// (cross-checked against systemd main by the trust-slice council:
+/// VENDOR_KEYRING_PATH wiring, the alg-22 signature path, the sums
+/// parser). The base-version gate below floors the boot-assessment
+/// machinery at 240; a base between the two runs updates with signature
+/// checks the base's systemd may not fully honor — recorded here, not
+/// enforced, until a base forces the question.
+///
+/// See sysupdate.d(5) `Verify=`.
 pub(crate) const VERIFY_STANZA: &str = "\
 # Verify=yes: SHA256SUMS must carry a valid detached OpenPGP signature
 # (SHA256SUMS.gpg) against /usr/lib/systemd/import-pubring.pgp — embedded
