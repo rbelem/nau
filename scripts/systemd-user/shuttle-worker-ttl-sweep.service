@@ -1,25 +1,45 @@
-# shuttle-worker-ttl-sweep.service — oneshot worker TTL sweep (ticket #269).
-# Installed as a systemd USER unit on the workstation (the hcloud token and
-# worker SSH key live only here — cf. the zet update-timer.yml convention).
+# shuttle-worker-ttl-sweep.service — oneshot worker TTL sweep (#269/#287/#296).
+# Installed as a systemd USER unit on the workstation (the provider
+# credentials and the worker SSH key live only here — cf. the zet
+# update-timer.yml convention).
 #
-# Ships in DRY-RUN (no --enforce): destroy-track servers (TTL label past
-# due; or label+marker unusable with server age past the 72h floor) are
-# logged WOULD-DESTROY and nothing is destroyed. 48h-floor servers fire
-# ALERT lines (and the hook, if set) with no destroy. The enforce flip —
-# two weeks after the first real #194 provision — is an operator act:
+# Ships in DRY-RUN (no --enforce): destroy-track workers (TTL tag past
+# due; or tag+marker unusable with age past the 72h floor) are logged
+# WOULD-DESTROY and nothing is destroyed. 48h-floor workers fire ALERT
+# lines with no destroy. The enforce flip — two weeks after the first
+# real provision — is an operator act:
 #   mkdir -p ~/.config/shuttle
 #   echo SHUTTLE_SWEEP_ENFORCE=1 >> ~/.config/shuttle/worker-ttl-sweep.env
 #   systemctl --user daemon-reload
-# (Optional, once the alert destination is decided — the command string
-# gets the one-line alert summary as "$1":)
-#   echo "SHUTTLE_SWEEP_ALERT_CMD='curl -s --data-binary \"\$1\" https://kuma/push/TOKEN'" \
+#
+# Alert destinations (#296 multi-notify fan-out — ALL configured
+# destinations fire on every alert; one failing never silences the
+# others). Optional; the kuma URLs get a status=up heartbeat on every
+# clean run (the machinery-alive proof the push monitor needs):
+#   echo 'SHUTTLE_SWEEP_KUMA_URLS="https://kuma.example/api/push/TOKEN1 https://kuma.example/api/push/TOKEN2"' \
 #     >> ~/.config/shuttle/worker-ttl-sweep.env
-# The script fails loud (nonzero + ALERT line in the journal) on any hcloud
-# API failure and on 48h-floor servers, so `systemctl --user list-timers` +
-# journalctl are the watch surface until hook routing lands.
+#   echo 'SHUTTLE_SWEEP_NTFY_URLS="https://ntfy.example/shuttle-workers"' \
+#     >> ~/.config/shuttle/worker-ttl-sweep.env
+#   # extensibility seam — command string, one-line alert summary as "$1":
+#   echo "SHUTTLE_SWEEP_ALERT_CMD='curl -s --data-binary \"\$1\" https://example/hook'" \
+#     >> ~/.config/shuttle/worker-ttl-sweep.env
+#
+# Provider axes (#287 — hcloud is always on; the others are opt-in, each
+# needs its CLI + credentials in this env file; see runbook §5):
+#   echo SHUTTLE_SWEEP_AWS=1     >> ~/.config/shuttle/worker-ttl-sweep.env   # + AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (+ AWS_DEFAULT_REGION or profile)
+#   echo SHUTTLE_SWEEP_GCP=1     >> ~/.config/shuttle/worker-ttl-sweep.env   # + GOOGLE_APPLICATION_CREDENTIALS or gcloud auth (project from the CLI config)
+#   echo SHUTTLE_SWEEP_AZURE=1   >> ~/.config/shuttle/worker-ttl-sweep.env   # + az login state (subscription from the CLI config)
+#   echo SHUTTLE_SWEEP_SCW=1     >> ~/.config/shuttle/worker-ttl-sweep.env   # + SCW_ACCESS_KEY/SCW_SECRET_KEY (+ SCW_DEFAULT_ZONE)
+# jq and curl (only when an axis/notifier is configured) must be on PATH.
+#
+# The script fails loud (nonzero + ALERT lines in the journal) on any
+# provider API failure, on any enabled-but-broken axis, on 48h-floor
+# workers, and when a configured alert destination failed — so
+# `systemctl --user list-timers` + journalctl are the watch surface; the
+# kuma push monitor pages on the first missed heartbeat.
 
 [Unit]
-Description=Shuttle worker TTL sweep — hcloud safety net for forgotten workers (#269)
+Description=Shuttle worker TTL sweep — multi-provider safety net for forgotten workers (#269/#287/#296)
 
 [Service]
 Type=oneshot

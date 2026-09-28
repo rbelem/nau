@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Test suite for scripts/shuttle-worker-ttl-sweep (ticket #269, v2 rules:
-# .planning/server-infra-plan.md decision 6) against fake `hcloud` and
-# fake `ssh` binaries. No network, no real hcloud account — the live
-# verify is operator-side per the ticket.
+# Test suite for scripts/shuttle-worker-ttl-sweep against fake provider
+# CLIs and a fake curl. No network, no real cloud account — the live
+# verify is operator-side per the tickets.
 #
-# Proves:
+# hcloud (#269, T1–T16):
 #   - v2 match rules in order: TTL label (epoch) past due → destroy
 #     track; label absent/garbage → marker copy decides; both unusable →
 #     server-age floor (alert at 48h, destroy at 72h)
@@ -22,6 +21,20 @@
 #   - hcloud API failures (list / describe / volume / delete) → ALERT +
 #     hook "$1" + nonzero exit; hook absent → still loud on stderr
 #   - empty label set → clean exit 0; unknown flag → usage error (rc 2)
+#
+# Notifier fan-out (#296, T17–T19):
+#   - every configured destination (kuma URLs ×2, ntfy topic, ALERT_CMD
+#     hook) fires on each alert; per-destination failures are named and
+#     never silence siblings (fan-out isolation)
+#   - clean run (rc 0) sends a kuma status=up heartbeat; ntfy is NOT
+#     pinged on a clean run
+#
+# Multi-provider axes (#287, T20–T26): aws/gcp/azure/scw enumerate by the
+# exact contract tags the providers stamp at create, share the same v2
+# rule engine and dry-run/enforce semantics, mirror each provider's
+# destroy + residual warnings, isolate per-axis failures (one axis
+# failing never blocks the others), and skip loudly when enabled but
+# broken.
 
 set -euo pipefail
 
@@ -39,6 +52,26 @@ VD=$TMP/volumes     # per-server volume-list fixtures (absent = empty)
 HOOK_OUT=$TMP/hook.out
 DELETE_LOG=$TMP/deletes.log
 LIST=$TMP/servers.list
+CURL_LOG=$TMP/curl.log
+# aws fixtures
+AWS_LIST=$TMP/aws-list.json
+AWS_VOLUME_DIR=$TMP/aws-volumes
+AWS_TERMINATE_LOG=$TMP/aws-terminate.log
+AWS_CALLS_LOG=$TMP/aws-calls.log
+# gcp fixtures
+GCLOUD_LIST=$TMP/gcp-list.json
+GCLOUD_DESCRIBE_DIR=$TMP/gcp-describe
+GCLOUD_DELETE_LOG=$TMP/gcp-delete.log
+# azure fixtures
+AZ_VM_LIST=$TMP/az-vms.json
+AZ_DISK_DIR=$TMP/az-disks
+AZ_NIC_DIR=$TMP/az-nics
+AZ_PIP_DIR=$TMP/az-pips
+AZ_DELETE_LOG=$TMP/az-delete.log
+# scw fixtures
+SCW_LIST=$TMP/scw-list.json
+SCW_GET_DIR=$TMP/scw-get
+SCW_DELETE_LOG=$TMP/scw-delete.log
 # Shell command string matching the SHUTTLE_SWEEP_ALERT_CMD contract:
 # evaluated with the alert summary as "$1".
 HOOK_CMD="printf '%s\n' \"\$1\" >>$HOOK_OUT"
@@ -58,7 +91,9 @@ assert_not_contains() { # desc needle haystack
     if grep -qF -- "$2" <<<"$3"; then bad "$1 (unexpected: [$2])"; else ok "$1"; fi
 }
 
-mkdir -p "$BIN" "$SSH_DIR" "$DCD" "$VD"
+mkdir -p "$BIN" "$SSH_DIR" "$DCD" "$VD" \
+    "$AWS_VOLUME_DIR" "$GCLOUD_DESCRIBE_DIR" \
+    "$AZ_DISK_DIR" "$AZ_NIC_DIR" "$AZ_PIP_DIR" "$SCW_GET_DIR"
 
 # --- fake hcloud -----------------------------------------------------------
 cat >"$BIN/hcloud" <<'EOF'
@@ -127,6 +162,179 @@ fi
 exec cat "$f"
 EOF
 chmod +x "$BIN/ssh"
+
+# --- fake aws (the sweep's --query output shape: [id, ip, launch, ttl]) ----
+cat >"$BIN/aws" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+"ec2 describe-instances")
+    if [ "${AWS_LIST_FAIL:-0}" = "1" ]; then
+        echo "aws: api failure (fake)" >&2
+        exit 1
+    fi
+    cat "${AWS_LIST:?}"
+    ;;
+"ec2 describe-volumes")
+    id=$(printf '%s\n' "$*" | sed -n 's/.*,Values=\([^ ]*\).*/\1/p')
+    if [ "${AWS_VOLUME_FAIL_ID:-}" = "$id" ]; then
+        echo "aws: api failure (fake)" >&2
+        exit 1
+    fi
+    f="${AWS_VOLUME_DIR:?}/$id"
+    if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi
+    ;;
+"ec2 terminate-instances")
+    if [ "${AWS_TERMINATE_FAIL:-0}" = "1" ]; then
+        echo "aws: terminate failed (fake)" >&2
+        exit 1
+    fi
+    id=$(printf '%s\n' "$*" | sed -n 's/.*--instance-ids \([^ ]*\).*/\1/p')
+    printf '%s\n' "$id" >>"${AWS_TERMINATE_LOG:?}"
+    ;;
+*)
+    echo "fake aws: unexpected invocation: $*" >&2
+    exit 64
+    ;;
+esac
+EOF
+chmod +x "$BIN/aws"
+
+# --- fake gcloud ------------------------------------------------------------
+cat >"$BIN/gcloud" <<'EOF'
+#!/bin/sh
+case "$1 $2 $3" in
+"compute instances list")
+    if [ "${GCLOUD_LIST_FAIL:-0}" = "1" ]; then
+        echo "gcloud: api failure (fake)" >&2
+        exit 1
+    fi
+    cat "${GCLOUD_LIST:?}"
+    ;;
+"compute instances describe")
+    f="${GCLOUD_DESCRIBE_DIR:?}/$4"
+    if [ -f "$f.fail" ]; then
+        echo "gcloud: describe failed (fake)" >&2
+        exit 1
+    fi
+    cat "$f"
+    ;;
+"compute instances delete")
+    if [ "${GCLOUD_DELETE_FAIL:-0}" = "1" ]; then
+        echo "gcloud: delete failed (fake)" >&2
+        exit 1
+    fi
+    printf '%s %s\n' "$4" "$6" >>"${GCLOUD_DELETE_LOG:?}"
+    ;;
+*)
+    echo "fake gcloud: unexpected invocation: $*" >&2
+    exit 64
+    ;;
+esac
+EOF
+chmod +x "$BIN/gcloud"
+
+# --- fake az -----------------------------------------------------------------
+cat >"$BIN/az" <<'EOF'
+#!/bin/sh
+rg=$(printf '%s\n' "$*" | sed -n 's/.*--resource-group \([^ ]*\).*/\1/p')
+case "$1 $2" in
+"vm list")
+    if [ "${AZ_VM_LIST_FAIL:-0}" = "1" ]; then
+        echo "az: api failure (fake)" >&2
+        exit 1
+    fi
+    cat "${AZ_VM_LIST:?}"
+    ;;
+"disk list")
+    f="${AZ_DISK_DIR:?}/$rg"
+    if [ "${AZ_DISK_FAIL_RG:-}" = "$rg" ]; then
+        echo "az: api failure (fake)" >&2
+        exit 1
+    fi
+    if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi
+    ;;
+"vm delete")
+    if [ "${AZ_DELETE_FAIL:-0}" = "1" ]; then
+        echo "az: vm delete failed (fake)" >&2
+        exit 1
+    fi
+    printf '%s %s\n' "$6" "$4" >>"${AZ_DELETE_LOG:?}"
+    ;;
+"network nic")
+    f="${AZ_NIC_DIR:?}/$rg"
+    if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi
+    ;;
+"network public-ip")
+    f="${AZ_PIP_DIR:?}/$rg"
+    if [ -f "$f" ]; then cat "$f"; else echo "[]"; fi
+    ;;
+*)
+    echo "fake az: unexpected invocation: $*" >&2
+    exit 64
+    ;;
+esac
+EOF
+chmod +x "$BIN/az"
+
+# --- fake scw ---------------------------------------------------------------
+cat >"$BIN/scw" <<'EOF'
+#!/bin/sh
+case "$1 $2 $3" in
+"instance server list")
+    if [ "${SCW_LIST_FAIL:-0}" = "1" ]; then
+        echo "scw: api failure (fake)" >&2
+        exit 1
+    fi
+    cat "${SCW_LIST:?}"
+    ;;
+"instance server get")
+    f="${SCW_GET_DIR:?}/$4"
+    if [ "${SCW_GET_FAIL_ID:-}" = "$4" ]; then
+        echo "scw: api failure (fake)" >&2
+        exit 1
+    fi
+    if [ -f "$f" ]; then cat "$f"; else echo "{}"; fi
+    ;;
+"instance server delete")
+    if [ "${SCW_DELETE_FAIL:-0}" = "1" ]; then
+        echo "scw: delete failed (fake)" >&2
+        exit 1
+    fi
+    printf '%s\n' "$4" >>"${SCW_DELETE_LOG:?}"
+    ;;
+*)
+    echo "fake scw: unexpected invocation: $*" >&2
+    exit 64
+    ;;
+esac
+EOF
+chmod +x "$BIN/scw"
+
+# --- fake curl (kuma -G --data-urlencode / ntfy -d POST) --------------------
+cat >"$BIN/curl" <<'EOF'
+#!/bin/sh
+url=
+q=
+body=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --data-urlencode) shift; q="$q$1&" ;;
+        -d) shift; body="$1" ;;
+        -H | -o | -m) shift ;;
+        -G | -sS | -s | -S) ;;
+        *) url="$1" ;;
+    esac
+    shift
+done
+printf 'curl %s\tq=%s\tbody=%s\n' "$url" "${q%&}" "$body" >>"${CURL_LOG:?}"
+case "$url" in
+    *"$(printf '%s' "${CURL_FAIL_URL:-__nomatch__}")"*)
+        echo "curl: connection refused (fake)" >&2
+        exit 7
+        ;;
+esac
+EOF
+chmod +x "$BIN/curl"
 
 # --- fixtures / runner -----------------------------------------------------
 
@@ -335,7 +543,7 @@ ERR=$(cat "$TMP/err.log")
 assert_eq "T9 volume-list fail: rc" "1" "$RC"
 assert_eq "T9 volume-list fail: NO delete" "" "$(cat "$DELETE_LOG")"
 assert_contains "T9 volume-list fail: alert" "ALERT: hcloud volume list failed for w-vol — destroy BLOCKED (fail loud)" "$ERR"
-assert_contains "T9 volume-list fail: hook rollup" "1 hcloud API failure(s): w-vol(volume-list)" "$(cat "$HOOK_OUT")"
+assert_contains "T9 volume-list fail: hook rollup" "1 sweep API failure(s): w-vol(volume-list)" "$(cat "$HOOK_OUT")"
 
 # --- T10: delete API failure → alert + hook + loud --------------------------
 printf 'w-due\n' >"$LIST"
@@ -349,7 +557,7 @@ ERR=$(cat "$TMP/err.log")
 assert_eq "T10 delete fail: rc" "1" "$RC"
 assert_not_contains "T10 delete fail: no false DESTROYED" "DESTROYED: w-due" "$ERR"
 assert_contains "T10 delete fail: alert" "ALERT: hcloud server delete failed for w-due" "$ERR"
-assert_contains "T10 delete fail: hook rollup" "1 hcloud API failure(s): w-due(delete)" "$(cat "$HOOK_OUT")"
+assert_contains "T10 delete fail: hook rollup" "1 sweep API failure(s): w-due(delete)" "$(cat "$HOOK_OUT")"
 
 # --- T11: list API failure → no server evaluated ----------------------------
 write_default_fixtures
@@ -409,6 +617,273 @@ RC=0
 run_sweep || RC=$?
 unset SHUTTLE_SWEEP_ALERT_CMD
 assert_contains "T16 hook receives floor alert as \$1" "w-floor-50: no usable TTL, age 50h past the 48h alert floor (destroy at 72h)" "$(cat "$HOOK_OUT")"
+
+# ── #296 notifier fan-out + #287 axes --------------------------------------
+# iso EPOCH → the LaunchTime/creationTimestamp shape the CLIs print.
+iso() { date -u -d "@$1" +"%Y-%m-%dT%H:%M:%S+00:00"; }
+
+# run_sweep_extra [sweep args...] — run_sweep plus the EXTRA_ENV array
+# (KEY=VALUE pairs) for axis/notifier fixtures.
+EXTRA_ENV=()
+run_sweep_extra() {
+    SHUTTLE_SWEEP_SSH="$BIN/ssh" \
+        SHUTTLE_SWEEP_HCLOUD="$BIN/hcloud" \
+        SHUTTLE_SWEEP_SSH_OPTS="-o BatchMode=yes" \
+        SSH_FIXTURE_DIR="$SSH_DIR" \
+        SSH_LOG="$SSH_LOG" \
+        HCLOUD_LIST="$LIST" \
+        HCLOUD_DESCRIBE_DIR="$DCD" \
+        HCLOUD_VOLUME_DIR="$VD" \
+        HCLOUD_DELETE_LOG="$DELETE_LOG" \
+        env "${EXTRA_ENV[@]}" \
+        "$SWEEP" "$@" >"$TMP/out.log" 2>"$TMP/err.log"
+}
+
+# single-alive farm: the minimal clean-run fixture (one future-TTL server).
+write_single_alive() {
+    printf 'w-clean\n' >"$LIST"
+    write_describe w-clean "$((NOW - 1 * H))" 10.6.0.1 "$((NOW + 24 * H))"
+}
+
+# --- T17: fan-out — every configured destination fires on an alert ---------
+write_default_fixtures
+: >"$CURL_LOG"; : >"$HOOK_OUT"
+EXTRA_ENV=(
+    SHUTTLE_SWEEP_CURL="$BIN/curl"
+    SHUTTLE_SWEEP_KUMA_URLS="https://kuma1.example/api/push/T1 https://kuma2.example/api/push/T2"
+    SHUTTLE_SWEEP_NTFY_URLS="https://ntfy.example/shuttle-workers"
+    SHUTTLE_SWEEP_ALERT_CMD="$HOOK_CMD"
+    CURL_LOG="$CURL_LOG"
+)
+RC=0
+run_sweep_extra || RC=$?
+unset EXTRA_ENV; EXTRA_ENV=()
+ERR=$(cat "$TMP/err.log")
+CL=$(cat "$CURL_LOG")
+FLOOR_MSG="w-floor-50: no usable TTL, age 50h past the 48h alert floor (destroy at 72h)"
+assert_eq "T17 fan-out: rc (floor alert)" "1" "$RC"
+assert_eq "T17 fan-out: 3 destination HTTP calls (2 kuma + 1 ntfy)" "3" "$(grep -c '^curl ' <<<"$CL")"
+assert_contains "T17 fan-out: kuma1 got status=down" "curl https://kuma1.example/api/push/T1	q=status=down&msg=$FLOOR_MSG" "$CL"
+assert_contains "T17 fan-out: kuma2 got status=down" "curl https://kuma2.example/api/push/T2	q=status=down&msg=$FLOOR_MSG" "$CL"
+assert_contains "T17 fan-out: ntfy got the message as body" "curl https://ntfy.example/shuttle-workers	q=	body=$FLOOR_MSG" "$CL"
+assert_contains "T17 fan-out: ALERT_CMD got the same alert" "$FLOOR_MSG" "$(cat "$HOOK_OUT")"
+assert_not_contains "T17 fan-out: no up-heartbeat on a failing run" "status=up" "$CL"
+
+# --- T18: fan-out isolation — one dead destination never silences the rest --
+write_default_fixtures
+: >"$CURL_LOG"; : >"$HOOK_OUT"
+EXTRA_ENV=(
+    SHUTTLE_SWEEP_CURL="$BIN/curl"
+    SHUTTLE_SWEEP_KUMA_URLS="https://kuma1.example/api/push/T1 https://kuma2.example/api/push/T2"
+    SHUTTLE_SWEEP_NTFY_URLS="https://ntfy.example/shuttle-workers"
+    SHUTTLE_SWEEP_ALERT_CMD="$HOOK_CMD"
+    CURL_LOG="$CURL_LOG"
+    CURL_FAIL_URL="kuma1.example"
+)
+RC=0
+run_sweep_extra || RC=$?
+unset EXTRA_ENV; EXTRA_ENV=()
+ERR=$(cat "$TMP/err.log")
+CL=$(cat "$CURL_LOG")
+assert_eq "T18 isolation: rc (floor + failed destination)" "1" "$RC"
+assert_contains "T18 isolation: kuma1 failure named" "notify: kuma destination failed: https://kuma1.example/api/push/T1 — other destinations still fired" "$ERR"
+assert_contains "T18 isolation: kuma2 STILL fired" "status=down&msg=$FLOOR_MSG" "$(grep kuma2 <<<"$CL")"
+assert_contains "T18 isolation: ntfy STILL fired" "body=$FLOOR_MSG" "$(grep ntfy <<<"$CL")"
+assert_contains "T18 isolation: hook STILL fired" "$FLOOR_MSG" "$(cat "$HOOK_OUT")"
+assert_contains "T18 isolation: rollup counted" "1 notify destination(s) failed: kuma(https://kuma1.example/api/push/T1)" "$ERR"
+
+# --- T19: clean run → kuma up-heartbeat only (ntfy stays silent) ------------
+write_single_alive
+: >"$CURL_LOG"
+EXTRA_ENV=(
+    SHUTTLE_SWEEP_CURL="$BIN/curl"
+    SHUTTLE_SWEEP_KUMA_URLS="https://kuma1.example/api/push/T1"
+    SHUTTLE_SWEEP_NTFY_URLS="https://ntfy.example/shuttle-workers"
+    CURL_LOG="$CURL_LOG"
+)
+RC=0
+run_sweep_extra || RC=$?
+unset EXTRA_ENV; EXTRA_ENV=()
+CL=$(cat "$CURL_LOG")
+assert_eq "T19 clean run: rc" "0" "$RC"
+assert_eq "T19 clean run: exactly one HTTP call (the kuma heartbeat)" "1" "$(grep -c '^curl ' <<<"$CL")"
+assert_contains "T19 clean run: kuma status=up" "q=status=up&msg=sweep ok (mode: dry-run)" "$CL"
+assert_not_contains "T19 clean run: ntfy NOT pinged" "ntfy" "$CL"
+
+# --- T20: aws axis — v2 rules, dry-run/enforce, volume residual warn --------
+write_aws_fixtures() {
+    printf 'w-clean\n' >"$LIST"
+    write_describe w-clean "$((NOW - 1 * H))" 10.6.0.1 "$((NOW + 24 * H))"
+    cat >"$AWS_LIST" <<EOF
+[
+  ["i-due", "10.20.0.1", "$(iso $((NOW - 3 * H)))", "$((NOW - 2 * H))"],
+  ["i-alive", "10.20.0.2", "$(iso $((NOW - 3 * H)))", "$((NOW + 24 * H))"],
+  ["i-noip", "", "$(iso $((NOW - 3 * H)))", "$((NOW - 1 * H))"]
+]
+EOF
+    printf '["vol-keep"]\n' >"$AWS_VOLUME_DIR/i-due"
+}
+write_aws_fixtures
+: >"$AWS_TERMINATE_LOG"; : >"$CURL_LOG"
+EXTRA_ENV=(
+    SHUTTLE_SWEEP_AWS=1 SHUTTLE_SWEEP_AWS_BIN="$BIN/aws"
+    AWS_LIST="$AWS_LIST" AWS_VOLUME_DIR="$AWS_VOLUME_DIR" AWS_TERMINATE_LOG="$AWS_TERMINATE_LOG"
+)
+RC=0
+run_sweep_extra || RC=$?
+ERR=$(cat "$TMP/err.log")
+assert_eq "T20 aws dry-run: rc (clean otherwise)" "0" "$RC"
+assert_contains "T20 aws dry-run: due instance WOULD-DESTROY (shared engine, tag wording)" "WOULD-DESTROY: i-due (TTL tag past due) — dry-run, no action" "$ERR"
+assert_eq "T20 aws dry-run: zero terminates" "" "$(cat "$AWS_TERMINATE_LOG")"
+assert_contains "T20 aws dry-run: no-ip instance still rule-1 decided" "WOULD-DESTROY: i-noip (TTL tag past due)" "$ERR"
+assert_contains "T20 aws axis summary" "axis aws: 3 labeled, 1 alive, 2 destroy-track, 0 destroyed, 0 volume-blocked, 0 floor-alerted, 0 api-failed" "$ERR"
+
+write_aws_fixtures
+: >"$AWS_TERMINATE_LOG"
+RC=0
+run_sweep_extra --enforce || RC=$?
+unset EXTRA_ENV; EXTRA_ENV=()
+ERR=$(cat "$TMP/err.log")
+assert_eq "T20 aws enforce: rc" "0" "$RC"
+assert_eq "T20 aws enforce: exactly the due instances terminated" "i-due
+i-noip" "$(cat "$AWS_TERMINATE_LOG")"
+assert_contains "T20 aws enforce: surviving volume named, terminate proceeds" "i-due: 1 attached volume(s) will NOT vanish with termination (DeleteOnTermination=false keeps billing) — terminating anyway" "$ERR"
+assert_contains "T20 aws enforce: DESTROYED" "DESTROYED: i-due (TTL tag past due)" "$ERR"
+
+# --- T21: aws enumerate failure isolates — hcloud keeps sweeping ------------
+write_aws_fixtures
+write_default_fixtures   # AFTER: resets the hcloud farm (LIST + fixtures)
+: >"$DELETE_LOG"; : >"$AWS_TERMINATE_LOG"
+EXTRA_ENV=(
+    SHUTTLE_SWEEP_AWS=1 SHUTTLE_SWEEP_AWS_BIN="$BIN/aws"
+    AWS_LIST="$AWS_LIST" AWS_VOLUME_DIR="$AWS_VOLUME_DIR" AWS_TERMINATE_LOG="$AWS_TERMINATE_LOG"
+    AWS_LIST_FAIL=1
+)
+RC=0
+run_sweep_extra --enforce || RC=$?
+unset EXTRA_ENV; EXTRA_ENV=()
+ERR=$(cat "$TMP/err.log")
+assert_eq "T21 cross-axis isolation: rc" "1" "$RC"
+assert_contains "T21 cross-axis isolation: aws axis named" "ALERT: aws describe-instances failed — aws axis skipped, NO aws worker evaluated" "$ERR"
+assert_contains "T21 cross-axis isolation: hcloud axis unaffected (deletes happened)" "DESTROYED: w-label-due (TTL label past due)" "$ERR"
+assert_contains "T21 cross-axis isolation: rollup names the aws failure" "1 sweep API failure(s): aws(server-list)" "$ERR"
+
+# --- T22: gcp axis — zone basename rides the delete, disk residual warn -----
+write_gcp_fixtures() {
+    printf 'w-clean\n' >"$LIST"
+    write_describe w-clean "$((NOW - 1 * H))" 10.6.0.1 "$((NOW + 24 * H))"
+    cat >"$GCLOUD_LIST" <<EOF
+[
+  {"name": "g-due",
+   "zone": "https://www.googleapis.com/compute/v1/projects/p/zones/europe-west1-b",
+   "creationTimestamp": "$(iso $((NOW - 3 * H)))",
+   "labels": {"shuttle-worker": "true", "shuttle-worker-ttl": "$((NOW - 2 * H))"},
+   "networkInterfaces": [{"accessConfigs": [{"natIP": "10.30.0.1"}]}]},
+  {"name": "g-alive",
+   "zone": "https://www.googleapis.com/compute/v1/projects/p/zones/europe-west1-b",
+   "creationTimestamp": "$(iso $((NOW - 3 * H)))",
+   "labels": {"shuttle-worker": "true", "shuttle-worker-ttl": "$((NOW + 24 * H))"},
+   "networkInterfaces": [{"accessConfigs": [{"natIP": "10.30.0.2"}]}]}
+]
+EOF
+    printf '{"disks": [{"autoDelete": true}, {"autoDelete": false}]}\n' >"$GCLOUD_DESCRIBE_DIR/g-due"
+}
+write_gcp_fixtures
+: >"$GCLOUD_DELETE_LOG"
+EXTRA_ENV=(
+    SHUTTLE_SWEEP_GCP=1 SHUTTLE_SWEEP_GCP_BIN="$BIN/gcloud"
+    GCLOUD_LIST="$GCLOUD_LIST" GCLOUD_DESCRIBE_DIR="$GCLOUD_DESCRIBE_DIR" GCLOUD_DELETE_LOG="$GCLOUD_DELETE_LOG"
+)
+RC=0
+run_sweep_extra --enforce || RC=$?
+unset EXTRA_ENV; EXTRA_ENV=()
+ERR=$(cat "$TMP/err.log")
+assert_eq "T22 gcp enforce: rc" "0" "$RC"
+assert_eq "T22 gcp enforce: delete carries the zone from the listing" "g-due europe-west1-b" "$(cat "$GCLOUD_DELETE_LOG")"
+assert_contains "T22 gcp enforce: auto-delete-off disk named" "g-due: 1 disk(s) will NOT be deleted with the instance (auto-delete off — the storage keeps billing) — deleting anyway" "$ERR"
+assert_not_contains "T22 gcp enforce: alive instance untouched" "DESTROYED: g-alive" "$ERR"
+
+# --- T23: azure axis — rg delete, disk + orphan residuals, no-age record ----
+write_az_fixtures() {
+    printf 'w-clean\n' >"$LIST"
+    write_describe w-clean "$((NOW - 1 * H))" 10.6.0.1 "$((NOW + 24 * H))"
+    cat >"$AZ_VM_LIST" <<EOF
+[
+  ["a-due", "rg-nau-eu", "10.40.0.1", "$(iso $((NOW - 3 * H)))", "$((NOW - 2 * H))"],
+  ["a-noage", "rg-nau-eu", null, null, ""]
+]
+EOF
+    printf '[{"name": "disk-1", "vm": "https://m/virtualMachines/a-due", "del": "Fixed"}]\n' >"$AZ_DISK_DIR/rg-nau-eu"
+    printf '["nic-left"]\n' >"$AZ_NIC_DIR/rg-nau-eu"
+    printf '["pip-1", "pip-2"]\n' >"$AZ_PIP_DIR/rg-nau-eu"
+}
+write_az_fixtures
+: >"$AZ_DELETE_LOG"
+EXTRA_ENV=(
+    SHUTTLE_SWEEP_AZURE=1 SHUTTLE_SWEEP_AZ_BIN="$BIN/az"
+    AZ_VM_LIST="$AZ_VM_LIST" AZ_DISK_DIR="$AZ_DISK_DIR" AZ_NIC_DIR="$AZ_NIC_DIR" AZ_PIP_DIR="$AZ_PIP_DIR" AZ_DELETE_LOG="$AZ_DELETE_LOG"
+)
+RC=0
+run_sweep_extra --enforce || RC=$?
+unset EXTRA_ENV; EXTRA_ENV=()
+ERR=$(cat "$TMP/err.log")
+assert_eq "T23 azure enforce: rc (no-age record fails loud)" "1" "$RC"
+assert_contains "T23 azure enforce: delete carries the rg" "a-due rg-nau-eu" "$(cat "$AZ_DELETE_LOG")"
+assert_contains "T23 azure enforce: deleteOption disk named" "a-due: 1 attached disk(s) will NOT be deleted with the VM (deleteOption is not Delete — the storage keeps billing) — deleting anyway" "$ERR"
+assert_contains "T23 azure enforce: NIC + public-ip orphans named" "a-due deleted, but 1 unattached network interface(s) and 2 unassociated public IP(s) remain in resource group 'rg-nau-eu' — public IPs keep billing; delete them by hand" "$ERR"
+assert_contains "T23 azure enforce: no-age record loud, NO destroy" "azure a-noage: no usable TTL and no parseable creation time — cannot age-check; NO destroy decision (stamp the TTL tag or fix the provider CLI)" "$ERR"
+assert_not_contains "T23 azure enforce: no-age never destroyed" "DESTROYED: a-noage" "$ERR"
+
+# --- T24: scw axis — string tags parse, volumes warn, strangers ignored -----
+write_scw_fixtures() {
+    printf 'w-clean\n' >"$LIST"
+    write_describe w-clean "$((NOW - 1 * H))" 10.6.0.1 "$((NOW + 24 * H))"
+    cat >"$SCW_LIST" <<EOF
+{"servers": [
+  {"id": "uuid-1", "name": "s-due", "creation_date": "$(iso $((NOW - 3 * H)))",
+   "tags": ["shuttle-worker=true", "shuttle-worker-ttl=$((NOW - 2 * H))"],
+   "public_ip": {"address": "10.50.0.1"}},
+  {"id": "uuid-2", "name": "s-other", "creation_date": "$(iso $((NOW - 3 * H)))",
+   "tags": ["some-other-tag"], "public_ip": null}
+]}
+EOF
+    printf '{"volumes": {"0": {}}}\n' >"$SCW_GET_DIR/uuid-1"
+}
+write_scw_fixtures
+: >"$SCW_DELETE_LOG"
+EXTRA_ENV=(
+    SHUTTLE_SWEEP_SCW=1 SHUTTLE_SWEEP_SCW_BIN="$BIN/scw"
+    SCW_LIST="$SCW_LIST" SCW_GET_DIR="$SCW_GET_DIR" SCW_DELETE_LOG="$SCW_DELETE_LOG"
+)
+RC=0
+run_sweep_extra --enforce || RC=$?
+unset EXTRA_ENV; EXTRA_ENV=()
+ERR=$(cat "$TMP/err.log")
+assert_eq "T24 scw enforce: rc" "0" "$RC"
+assert_eq "T24 scw enforce: exactly the tagged server deleted" "server-id=uuid-1" "$(cat "$SCW_DELETE_LOG")"
+assert_contains "T24 scw enforce: attached volumes named" "uuid-1: 1 attached volume(s) — a delete only DETACHES them (they keep billing) — deleting anyway" "$ERR"
+assert_contains "T24 scw enforce: DESTROYED with tag wording" "DESTROYED: uuid-1 (TTL tag past due)" "$ERR"
+
+# --- T25: enabled-but-broken axis → loud skip, run fails, siblings live -----
+write_default_fixtures
+EXTRA_ENV=(SHUTTLE_SWEEP_AWS=1 SHUTTLE_SWEEP_AWS_BIN="$TMP/definitely-not-here")
+RC=0
+run_sweep_extra || RC=$?
+unset EXTRA_ENV; EXTRA_ENV=()
+ERR=$(cat "$TMP/err.log")
+assert_eq "T25 broken axis: rc" "1" "$RC"
+assert_contains "T25 broken axis: named skip" "aws axis skipped: SHUTTLE_SWEEP_AWS=1 but a required binary was not found ($TMP/definitely-not-here) — NO aws worker evaluated" "$ERR"
+assert_contains "T25 broken axis: hcloud still swept" "WOULD-DESTROY: w-label-due (TTL label past due)" "$ERR"
+assert_contains "T25 broken axis: rollup" "1 enabled axis(es) skipped: aws — no worker from them was evaluated" "$ERR"
+
+# --- T26: axes rollup — hcloud on, others named not-enabled -----------------
+write_default_fixtures
+RC=0
+run_sweep || RC=$?
+ERR=$(cat "$TMP/err.log")
+assert_eq "T26 axes rollup: rc" "1" "$RC"
+assert_contains "T26 axes rollup: enabled/not-enabled line" "axes: enabled: hcloud; not enabled: aws gcp azure scw" "$ERR"
+assert_contains "T26 axes rollup: per-axis line" "axis hcloud: 8 labeled" "$ERR"
 
 printf '\nsuite: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

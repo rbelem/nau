@@ -1,18 +1,34 @@
 #!/bin/sh
-# shuttle-worker-ttl-sweep — workstation hcloud safety net for forgotten
-# shuttle workers (ticket #269; .planning/server-infra-plan.md decision 6,
-# v2 match rules).
+# shuttle-worker-ttl-sweep — workstation safety net for forgotten shuttle
+# workers (tickets #269/#287/#296; .planning/server-infra-plan.md decision
+# 6, v2 match rules).
 #
 # Runs as a daily workstation systemd user timer. Catches workers left
 # renting by a crashed `shuttle workers destroy`, a lost SSH path, or a
 # dead workstation mid-TTL.
 #
-# Match rules, in order, for every hcloud server labeled `shuttle-worker`:
-#   1. `shuttle-worker-ttl` label present and parseable (epoch seconds):
+# ── Axes (ticket #287) ──────────────────────────────────────────────────
+# The hcloud axis is ALWAYS on (unchanged behavior from #269). Four more
+# axes — aws (EC2), gcp (Compute Engine), azure (VMs), scaleway (Instances)
+# — are OPT-IN per axis, enabled in the unit's EnvironmentFile:
+#   SHUTTLE_SWEEP_AWS=1  SHUTTLE_SWEEP_GCP=1  SHUTTLE_SWEEP_AZURE=1
+#   SHUTTLE_SWEEP_SCW=1
+# An enabled axis needs its provider CLI (+ jq) and its credentials in the
+# environment; see the runbook (docs/nau-ops-runbook.md §5) for the
+# per-provider credential surface.
+#
+# Every axis queries the SAME contract the provider stamps at create time:
+# the `shuttle-worker` presence tag/label and the `shuttle-worker-ttl`
+# EXPIRY VALUE IN EPOCH SECONDS (UTC) — written by aws.rs/gcp.rs/azure.rs/
+# scaleway.rs at provision. The in-guest marker copy (/etc/shuttle/
+# worker-ttl, shared cloud-init template) backs every axis.
+#
+# Match rules, in order, for every labeled worker (all axes):
+#   1. `shuttle-worker-ttl` tag present and parseable (epoch seconds):
 #        expiry <= now → destroy track; expiry in the future → ALIVE.
-#   2. Label absent/unparseable, marker copy usable (see contract):
+#   2. Tag absent/unparseable, marker copy usable (see contract):
 #        copy past due → destroy track; copy in the future → ALIVE.
-#   3. Neither usable — server-age floor:
+#   3. Neither usable — worker-age floor:
 #        age >= 72h → destroy track; age >= 48h → ALERT, no destroy;
 #        younger → ALIVE (cloud-init may not have stamped anything yet).
 #   The v1 three-condition match (destroy only on a parseable marker)
@@ -20,55 +36,131 @@
 #   never got written. The age floor is the leak-case backstop; a destroy
 #   NEVER waits on the marker.
 #
-# Cross-lane contract (shared with the #194 provisioner, per the plan):
-#   - hcloud label `shuttle-worker-ttl` = expiry, VALUE IN EPOCH SECONDS
-#     (UTC). Hetzner label values reject `:`, so ISO-8601 will not fit.
-#     Set at create time; the label is the source of truth.
+# Cross-lane contract (shared with the provisioners, per the plan):
+#   - The `shuttle-worker-ttl` tag = expiry, VALUE IN EPOCH SECONDS (UTC).
+#     Hetzner label values reject `:`, so ISO-8601 will not fit there; the
+#     epoch shape is shared across all providers for one sweep grammar.
+#     Set at create time; the tag is the source of truth.
 #   - The in-guest marker file /etc/shuttle/worker-ttl is a COPY: single
-#     line, epoch seconds. Read over SSH only when the label is
+#     line, epoch seconds. Read over SSH only when the tag is
 #     missing/unparseable. Any parseable FUTURE value is alive.
 #   Missing/unparseable values never widen into a destroy — they fall to
-#   the next rule, never straight to `server delete`.
+#   the next rule, never straight to a delete. A worker with no usable TTL
+#   AND no parseable creation time is loud-alerted and left alone.
 #
-# Volume assertion: every destroy-track run requires
-# `hcloud volume list --server X` to be EMPTY (a detached volume outlives
-# its server and bills silently). Non-empty or API-failed → destroy is
-# BLOCKED, alert fired, no delete.
+# Per-axis destroy + residual semantics (each mirrors the provider's own
+# destroy verb, #194/#195/#196/#197/#269-v2):
+#   hcloud   `server delete` — GATED: `volume list --server X` must be
+#            EMPTY (a detached volume outlives its server and bills
+#            silently). Non-empty or API-failed → destroy BLOCKED, alert,
+#            no delete. Runs in BOTH dry-run and enforce.
+#   aws      `ec2 terminate-instances` — pre-delete `describe-volumes`
+#            names attached volumes that will NOT vanish (DeleteOnTermin-
+#            ation=false keeps billing), then terminates anyway (the aws
+#            provider's own destroy shape). A FAILED volume check blocks.
+#   gcp      `compute instances delete --zone Z` — pre-delete describe
+#            names disks with autoDelete off, then deletes anyway. A
+#            FAILED describe blocks.
+#   azure    `vm delete` — pre-delete `disk list` names disks with
+#            deleteOption != Delete, then deletes anyway; post-delete the
+#            unattached NIC + public-ip residuals are named (public IPs
+#            bill). A FAILED disk check blocks; a failed orphan check is a
+#            named API failure (the delete already happened).
+#   scaleway `instance server delete server-id=ID` — pre-delete `server
+#            get` names attached volumes (a delete only DETACHES them;
+#            they keep billing), then deletes anyway. A FAILED get blocks.
+# Residual WARNINGS fire only on --enforce (they precede the real delete);
+# the hcloud gate is the one check that also runs in dry-run.
 #
-# Dry-run is the DEFAULT: destroy-track servers are logged WOULD-DESTROY
+# Dry-run is the DEFAULT: destroy-track workers are logged WOULD-DESTROY
 # and nothing is touched. `--enforce` (or SHUTTLE_SWEEP_ENFORCE=1 in the
 # unit's EnvironmentFile) performs real deletes; the flip — two weeks
-# after the first real #194 provision — is an operator act.
+# after the first real provision — is an operator act.
 #
-# Fail loud: any hcloud API failure — or any binary missing — fires an
-# ALERT (stderr → journal) and exits nonzero. A silently skipped sweep
-# is the exact failure this net exists to catch. Optional hook:
-# SHUTTLE_SWEEP_ALERT_CMD is a SHELL COMMAND STRING evaluated once PER
-# ALERT (a sweep may fire several) with the one-line summary as "$1" —
-# e.g. SHUTTLE_SWEEP_ALERT_CMD='curl -s --data-binary "$1" https://kuma/push/TOKEN'.
-# No routing is built in; the alert destination is a pending operator
-# decision (plan: the kuma push monitor). Floor alerts at 48h also fire
-# the hook and fail the run — they are the sound of a lease with no TTL
-# paper trail.
+# Fail loud: any provider API failure — or any binary missing on an
+# ENABLED axis — fires an ALERT (stderr → journal) and fails the run
+# (nonzero). A silently skipped sweep is the exact failure this net exists
+# to catch. An axis that is NOT enabled is logged (never alerted): a
+# provider not in use must not page daily.
+#
+# ── Alert fan-out (ticket #296 — DECISION SLOT B resolved) ──────────────
+# Every alert fans out to ALL configured destinations; one destination's
+# failure never blocks or silences the others (each failure is named and
+# counted; the run fails if any destination failed):
+#   SHUTTLE_SWEEP_KUMA_URLS   space-separated Uptime-Kuma push URLs
+#                             (/api/push/TOKEN). Alerts → status=down with
+#                             the alert as msg; a CLEAN run (rc 0) sends a
+#                             status=up heartbeat — the machinery-alive
+#                             proof a push monitor needs.
+#   SHUTTLE_SWEEP_NTFY_URLS   space-separated ntfy topic URLs; alerts are
+#                             POSTed as the message body (no clean-run
+#                             pings — ntfy is a notification channel, not
+#                             a status channel).
+#   SHUTTLE_SWEEP_ALERT_CMD   SHELL COMMAND STRING evaluated once PER
+#                             ALERT with the one-line summary as "$1" —
+#                             the #269 seam, kept as the extensibility
+#                             escape hatch.
+# Notifiers ride curl (GET with query params for kuma via -G
+# --data-urlencode; plain POST for ntfy). Kuma/ntfy URLs must be
+# configured by the operator; nothing is routed by default.
 #
 # Knobs (env):
 #   SHUTTLE_SWEEP_ENFORCE      1 → real deletes (same as --enforce)
+#   SHUTTLE_SWEEP_KUMA_URLS    kuma push URLs (space-separated)
+#   SHUTTLE_SWEEP_NTFY_URLS    ntfy topic URLs (space-separated)
 #   SHUTTLE_SWEEP_ALERT_CMD    alert hook (see above)
+#   SHUTTLE_SWEEP_AWS          1 → enable the aws axis
+#   SHUTTLE_SWEEP_GCP          1 → enable the gcp axis
+#   SHUTTLE_SWEEP_AZURE        1 → enable the azure axis
+#   SHUTTLE_SWEEP_SCW          1 → enable the scaleway axis
 #   SHUTTLE_SWEEP_SSH          ssh binary      (default: ssh)
 #   SHUTTLE_SWEEP_SSH_OPTS     ssh options     (default: BatchMode, 10s connect timeout, accept-new host keys)
 #   SHUTTLE_SWEEP_SSH_USER     guest ssh user  (default: root)
 #   SHUTTLE_SWEEP_MARKER_PATH  in-guest marker (default: /etc/shuttle/worker-ttl)
 #   SHUTTLE_SWEEP_HCLOUD       hcloud binary   (default: hcloud)
+#   SHUTTLE_SWEEP_AWS_BIN      aws binary      (default: aws)
+#   SHUTTLE_SWEEP_GCP_BIN      gcloud binary   (default: gcloud)
+#   SHUTTLE_SWEEP_AZ_BIN       az binary       (default: az)
+#   SHUTTLE_SWEEP_SCW_BIN      scw binary      (default: scw)
+#   SHUTTLE_SWEEP_CURL         curl binary     (default: curl)
+#   SHUTTLE_SWEEP_JQ           jq binary       (default: jq)
+#   SHUTTLE_SWEEP_DATE         date binary     (default: date; GNU/BusyBox)
 #
-# hcloud CLI interface used (fake-able via SHUTTLE_SWEEP_HCLOUD):
-#   server list    --label-selector LABEL -o columns=name
-#   server describe NAME -o format='{{.Created.Unix}} {{.PublicNet.IPv4.IP}} {{index .Labels "KEY"}}'
-#   volume list    --server NAME -o columns=id        (must print nothing)
-#   server delete  NAME
+# CLI interfaces used (fake-able via the *_BIN knobs):
+#   hcloud  (unchanged from #269):
+#     server list    --label-selector LABEL -o columns=name
+#     server describe NAME -o format='{{.Created.Unix}} {{.PublicNet.IPv4.IP}} {{index .Labels "KEY"}}'
+#     volume list    --server NAME -o columns=id        (must print nothing)
+#     server delete  NAME
+#   aws (region discipline: ambient AWS_DEFAULT_REGION/profile, the same
+#       discipline as the aws provider's destroy verb):
+#     ec2 describe-instances  --filters Name=tag:shuttle-worker,Values=true
+#                             --query 'Reservations[].Instances[].[...]' --output json
+#     ec2 describe-volumes    --filters Name=attachment.instance-id,Values=ID
+#     ec2 terminate-instances --instance-ids ID
+#   gcp (list is project-wide; the zone from the listing rides --zone on
+#       the delete — names are zone-scoped):
+#     compute instances list   --filter 'labels.shuttle-worker=true' --format json
+#     compute instances describe NAME --zone Z --format json
+#     compute instances delete NAME --zone Z --quiet
+#   azure (subscription-scoped; the resource group from the listing rides
+#         --resource-group):
+#     vm list -d --query '[?tags."shuttle-worker"=='"'"'true'"'"']...' -o json
+#     disk list --resource-group RG --query '[?managedBy!=null]...' -o json
+#     vm delete --resource-group RG --name N --yes
+#     network nic list --resource-group RG --query '[?virtualMachine==null].name' -o json
+#     network public-ip list --resource-group RG --query '[?ipConfiguration==null].name' -o json
+#   scaleway (zone discipline: ambient SCW_DEFAULT_ZONE/config, the same
+#            discipline as the scw provider's destroy verb):
+#     instance server list   -o json
+#     instance server get ID -o json
+#     instance server delete server-id=ID
 #
-# Dependencies: POSIX sh; GNU/BusyBox `date` (epoch `now` only — every
-# other value in play is already epoch seconds, no date parsing); ssh;
-# hcloud CLI.
+# Dependencies: POSIX sh; GNU/BusyBox `date` (epoch `now`, plus ISO-8601 →
+# epoch for the non-hcloud axes' creation timestamps — every other value
+# in play is already epoch seconds); ssh; hcloud CLI; curl (only when a
+# kuma/ntfy destination is configured); jq (only for enabled non-hcloud
+# axes); the enabled axes' provider CLIs.
 
 set -eu
 
@@ -82,7 +174,21 @@ SSH_USER=${SHUTTLE_SWEEP_SSH_USER:-root}
 # NOTE: `:--o ...` — the default value itself starts with a dash.
 SSH_OPTS=${SHUTTLE_SWEEP_SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new}
 HCLOUD_BIN=${SHUTTLE_SWEEP_HCLOUD:-hcloud}
+AWS_BIN=${SHUTTLE_SWEEP_AWS_BIN:-aws}
+GCP_BIN=${SHUTTLE_SWEEP_GCP_BIN:-gcloud}
+AZ_BIN=${SHUTTLE_SWEEP_AZ_BIN:-az}
+SCW_BIN=${SHUTTLE_SWEEP_SCW_BIN:-scw}
+CURL_BIN=${SHUTTLE_SWEEP_CURL:-curl}
+JQ_BIN=${SHUTTLE_SWEEP_JQ:-jq}
+DATE_BIN=${SHUTTLE_SWEEP_DATE:-date}
 DESCRIBE_FMT="{{.Created.Unix}} {{.PublicNet.IPv4.IP}} {{index .Labels \"$TTL_LABEL\"}}"
+AWS_QUERY="Reservations[].Instances[].[InstanceId, PublicIpAddress, LaunchTime, Tags[?Key=='$TTL_LABEL'].Value | [0]]"
+AZ_QUERY="[?tags.\\\"$LABEL\\\"=='true'].[name, resourceGroup, publicIps, timeCreated, tags.\\\"$TTL_LABEL\\\"]"
+# SEP: the record field separator for the enumerated worker lines. NOT a
+# tab — tab is IFS whitespace and `read` would collapse empty fields (a
+# stopped instance with no public IP would shift every column). `|` never
+# appears in ids/addresses/timestamps.
+SEP='|'
 
 n_total=0
 n_alive=0
@@ -94,6 +200,12 @@ n_api=0
 floor_names=
 blocked_names=
 api_names=
+NOTIFY_FAIL=0
+notify_fail_names=
+n_skip=0
+skip_names=
+axes_on=
+axes_off=
 DRY_RUN=1
 
 log() {
@@ -108,13 +220,16 @@ usage() {
     cat <<'EOF'
 usage: shuttle-worker-ttl-sweep [--dry-run|--enforce]
 
-Sweeps hcloud servers labeled `shuttle-worker` and destroys those past
-due on the v2 rules: parseable `shuttle-worker-ttl` label past due, or —
-label/marker both unusable — server age past the 48h alert / 72h destroy
-floor. Every destroy requires `hcloud volume list --server X` empty.
-Dry-run is the default; --enforce (or SHUTTLE_SWEEP_ENFORCE=1) performs
-real deletes. See the script header for env knobs and the label/marker
-contract.
+Sweeps worker fleets for forgotten machines, per axis: hcloud (always
+on) + opt-in aws/gcp/azure/scaleway (SHUTTLE_SWEEP_AWS/GCP/AZURE/SCW=1).
+Workers matching the v2 rules — parseable `shuttle-worker-ttl` tag past
+due; or tag/marker both unusable with age past the 48h alert / 72h
+destroy floor — are destroyed (hcloud only after `volume list --server X`
+is empty). Dry-run is the default; --enforce (or SHUTTLE_SWEEP_ENFORCE=1)
+performs real deletes. Alerts fan out to ALL configured destinations:
+SHUTTLE_SWEEP_KUMA_URLS, SHUTTLE_SWEEP_NTFY_URLS, SHUTTLE_SWEEP_ALERT_CMD
+(#296 fan-out — one destination failing never silences the others). See
+the script header for env knobs and the tag/marker contract.
 EOF
 }
 
@@ -139,6 +254,12 @@ is_epoch() {
     esac
 }
 
+# iso_to_epoch ISO → epoch seconds on stdout; rc 1 if unparseable.
+iso_to_epoch() {
+    [ -n "${1:-}" ] || return 1
+    "$DATE_BIN" -u -d "$1" +%s 2>/dev/null
+}
+
 # fetch_marker IPV4 → marker text on stdout; nonzero rc if unreadable.
 fetch_marker() {
     "$SSH_BIN" $SSH_OPTS "$SSH_USER@$1" cat -- "$MARKER_PATH" 2>/dev/null
@@ -149,10 +270,52 @@ first_line() {
     printf '%s\n' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' | head -n 1
 }
 
-# fire_alert MESSAGE → ALERT line to stderr (journal) and, when set, the
-# SHUTTLE_SWEEP_ALERT_CMD hook once per alert, with MESSAGE as "$1".
+# ── Notifier fan-out (#296) ─────────────────────────────────────────────
+# notify_one KIND URL STATUS MSG — one HTTP push. Failures are NAMED and
+# counted; they never block or silence the sibling destinations.
+notify_one() {
+    n_kind=$1
+    n_url=$2
+    n_status=$3
+    n_msg=$4
+    case $n_kind in
+        kuma)
+            if "$CURL_BIN" -sS -m 10 -G \
+                --data-urlencode "status=$n_status" \
+                --data-urlencode "msg=$n_msg" \
+                -o /dev/null "$n_url"; then
+                return 0
+            fi
+            ;;
+        ntfy)
+            if "$CURL_BIN" -sS -m 10 -H "Title: shuttle worker TTL sweep" \
+                -d "$n_msg" -o /dev/null "$n_url"; then
+                return 0
+            fi
+            ;;
+    esac
+    NOTIFY_FAIL=$((NOTIFY_FAIL + 1))
+    notify_fail_names="$notify_fail_names $n_kind($n_url)"
+    alert_log "notify: $n_kind destination failed: $n_url — other destinations still fired"
+}
+
+# fire_notifiers STATUS MSG — every configured kuma URL and ntfy topic
+# gets the event (fan-out isolation: iterate, never chain).
+fire_notifiers() {
+    for f_url in ${SHUTTLE_SWEEP_KUMA_URLS:-}; do
+        notify_one kuma "$f_url" "$1" "$2"
+    done
+    for f_url in ${SHUTTLE_SWEEP_NTFY_URLS:-}; do
+        notify_one ntfy "$f_url" "$1" "$2"
+    done
+}
+
+# fire_alert MESSAGE → ALERT line to stderr (journal), the full fan-out
+# (all kuma/ntfy destinations), and — when set — the SHUTTLE_SWEEP_ALERT_CMD
+# hook once per alert, with MESSAGE as "$1".
 fire_alert() {
     alert_log "$1"
+    fire_notifiers down "$1"
     if [ -n "${SHUTTLE_SWEEP_ALERT_CMD:-}" ]; then
         if ! sh -c "$SHUTTLE_SWEEP_ALERT_CMD" shuttle-sweep-alert "$1"; then
             alert_log "alert hook (SHUTTLE_SWEEP_ALERT_CMD) exited nonzero"
@@ -160,24 +323,156 @@ fire_alert() {
     fi
 }
 
-# due_track NAME REASON — the destroy track: volume assertion, then the
-# dry-run log or the real delete. Never called without a positive expiry
-# signal (label epoch, marker-copy epoch, or the 72h age floor).
-due_track() {
-    d_name=$1
-    d_reason=$2
-    n_due=$((n_due + 1))
+# ── Axis bookkeeping ────────────────────────────────────────────────────
+# axis_snap remembers the global counters before an axis runs;
+# axis_line reports that axis's delta after it.
+axis_snap() {
+    m_total=$n_total
+    m_alive=$n_alive
+    m_due=$n_due
+    m_destroyed=$n_destroyed
+    m_blocked=$n_blocked
+    m_floor=$n_floor
+    m_api=$n_api
+}
 
-    if ! d_vol=$("$HCLOUD_BIN" volume list --server "$d_name" -o columns=id 2>/dev/null); then
-        n_api=$((n_api + 1))
-        api_names="$api_names $d_name(volume-list)"
-        fire_alert "hcloud volume list failed for $d_name — destroy BLOCKED (fail loud)"
+axis_line() {
+    log "axis $1: $((n_total - m_total)) labeled, $((n_alive - m_alive)) alive, \
+$((n_due - m_due)) destroy-track, $((n_destroyed - m_destroyed)) destroyed, \
+$((n_blocked - m_blocked)) volume-blocked, $((n_floor - m_floor)) floor-alerted, \
+$((n_api - m_api)) api-failed"
+}
+
+# recs_to_decide AXIS — reads TSV records (name, ip, created-iso, ttl,
+# extra) on stdin, converts creation timestamps to epoch, and feeds the
+# shared v2 rule engine. `extra` is the axis's second delete handle (gcp
+# zone / azure resource group; empty elsewhere).
+recs_to_decide() {
+    r_axis=$1
+    while IFS="$SEP" read -r r_name r_ip r_created r_ttl r_extra; do
+        [ -n "$r_name" ] || continue
+        n_total=$((n_total + 1))
+        r_epoch=
+        if [ -n "$r_created" ]; then
+            if ! r_epoch=$(iso_to_epoch "$r_created"); then
+                r_epoch="?"
+            fi
+        fi
+        decide_worker "$r_axis" "$r_name" "$r_ip" "$r_epoch" "$r_ttl" "$r_extra"
+    done
+}
+
+# ── The v2 rule engine (shared by every axis) ───────────────────────────
+# decide_worker AXIS NAME IP CREATED_EPOCH TTL EXTRA — the three match
+# rules, in order. CREATED_EPOCH is epoch seconds ("" absent, "?" unparsable
+# — the non-hcloud axes convert ISO at enumerate time; hcloud stamps epoch).
+decide_worker() {
+    w_axis=$1
+    w_name=$2
+    w_ip=$3
+    w_created=$4
+    w_ttl=$5
+    w_extra=$6
+    w_now=$(date -u +%s)
+
+    # hcloud vocabulary is "label"; every other provider calls them tags.
+    case $w_axis in
+        hcloud) w_word=label; W_WORD=LABEL ;;
+        *) w_word=tag; W_WORD=TAG ;;
+    esac
+
+    # Rule 1: the TTL tag is the source of truth.
+    if is_epoch "$w_ttl"; then
+        if [ "$w_ttl" -le "$w_now" ]; then
+            due_track "$w_axis" "$w_name" "TTL $w_word past due" "$w_extra"
+        else
+            n_alive=$((n_alive + 1))
+            log "ALIVE: $w_name (TTL $w_word in the future)"
+        fi
         return 0
     fi
-    if [ -n "$d_vol" ]; then
-        n_blocked=$((n_blocked + 1))
-        blocked_names="$blocked_names $d_name"
-        fire_alert "$d_name: volume(s) still attached, destroy BLOCKED — detach/delete them first: $d_vol"
+    if [ -n "$w_ttl" ]; then
+        log "$W_WORD-INVALID: $w_name — TTL $w_word not epoch seconds, falling back to the marker copy"
+    fi
+
+    # Rule 2: the in-guest marker copy (needs the worker's address).
+    if [ -n "$w_ip" ]; then
+        w_ts=
+        if w_marker=$(fetch_marker "$w_ip"); then
+            w_ts=$(first_line "$w_marker")
+        fi
+        if is_epoch "$w_ts"; then
+            if [ "$w_ts" -le "$w_now" ]; then
+                due_track "$w_axis" "$w_name" "no TTL $w_word; marker copy past due" "$w_extra"
+            else
+                n_alive=$((n_alive + 1))
+                log "ALIVE: $w_name (no TTL $w_word; marker copy in the future)"
+            fi
+            return 0
+        fi
+    fi
+
+    # Rule 3: worker-age floor — the marker-never-written leak case.
+    if is_epoch "$w_created"; then
+        w_age_h=$(((w_now - w_created) / 3600))
+        if [ "$w_age_h" -ge "$AGE_DESTROY_H" ]; then
+            due_track "$w_axis" "$w_name" "no usable TTL, age ${w_age_h}h past the ${AGE_DESTROY_H}h floor" "$w_extra"
+            return 0
+        fi
+        if [ "$w_age_h" -ge "$AGE_ALERT_H" ]; then
+            n_floor=$((n_floor + 1))
+            floor_names="$floor_names $w_name(${w_age_h}h)"
+            fire_alert "$w_name: no usable TTL, age ${w_age_h}h past the ${AGE_ALERT_H}h alert floor (destroy at ${AGE_DESTROY_H}h)"
+            return 0
+        fi
+        n_alive=$((n_alive + 1))
+        log "ALIVE: $w_name (no usable TTL; age ${w_age_h}h below the ${AGE_ALERT_H}h floor)"
+        return 0
+    fi
+
+    # Rule 3 is impossible — never widen into a destroy; fail loud.
+    n_api=$((n_api + 1))
+    api_names="$api_names $w_axis:$w_name(created)"
+    fire_alert "$w_axis $w_name: no usable TTL and no parseable creation time — cannot age-check; NO destroy decision (stamp the TTL $w_word or fix the provider CLI)"
+}
+
+# due_track AXIS NAME REASON EXTRA — the destroy track. Never called
+# without a positive expiry signal (tag epoch, marker-copy epoch, or the
+# 72h age floor). hcloud keeps the #269 volume gate (BOTH modes); every
+# other axis logs WOULD-DESTROY in dry-run and runs its provider-shaped
+# destroy in enforce.
+due_track() {
+    d_axis=$1
+    d_name=$2
+    d_reason=$3
+    d_extra=$4
+    n_due=$((n_due + 1))
+
+    if [ "$d_axis" = "hcloud" ]; then
+        if ! d_vol=$("$HCLOUD_BIN" volume list --server "$d_name" -o columns=id 2>/dev/null); then
+            n_api=$((n_api + 1))
+            api_names="$api_names $d_name(volume-list)"
+            fire_alert "hcloud volume list failed for $d_name — destroy BLOCKED (fail loud)"
+            return 0
+        fi
+        if [ -n "$d_vol" ]; then
+            n_blocked=$((n_blocked + 1))
+            blocked_names="$blocked_names $d_name"
+            fire_alert "$d_name: volume(s) still attached, destroy BLOCKED — detach/delete them first: $d_vol"
+            return 0
+        fi
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "WOULD-DESTROY: $d_name ($d_reason) — dry-run, no action"
+            return 0
+        fi
+        if ! "$HCLOUD_BIN" server delete "$d_name"; then
+            n_api=$((n_api + 1))
+            api_names="$api_names $d_name(delete)"
+            fire_alert "hcloud server delete failed for $d_name"
+            return 0
+        fi
+        n_destroyed=$((n_destroyed + 1))
+        log "DESTROYED: $d_name ($d_reason)"
         return 0
     fi
 
@@ -186,16 +481,154 @@ due_track() {
         return 0
     fi
 
-    if ! "$HCLOUD_BIN" server delete "$d_name"; then
+    case $d_axis in
+        aws) destroy_aws "$d_name" "$d_reason" ;;
+        gcp) destroy_gcp "$d_name" "$d_extra" "$d_reason" ;;
+        azure) destroy_azure "$d_name" "$d_extra" "$d_reason" ;;
+        scw) destroy_scw "$d_name" "$d_reason" ;;
+    esac
+}
+
+# destroy_aws ID REASON — the aws provider's destroy shape: name attached
+# volumes that survive termination, then terminate.
+destroy_aws() {
+    a_name=$1
+    a_reason=$2
+    a_n=
+    if a_vol=$("$AWS_BIN" ec2 describe-volumes \
+            --filters "Name=attachment.instance-id,Values=$a_name" \
+            --query "Volumes[].VolumeId" --output json 2>/dev/null) && [ -n "$a_vol" ]; then
+        a_n=$(printf '%s' "$a_vol" | "$JQ_BIN" 'length' 2>/dev/null) || a_n=
+    fi
+    if [ -z "$a_n" ]; then
         n_api=$((n_api + 1))
-        api_names="$api_names $d_name(delete)"
-        fire_alert "hcloud server delete failed for $d_name"
+        api_names="$api_names aws:$a_name(volume-check)"
+        fire_alert "aws describe-volumes failed for $a_name — terminate BLOCKED (fail loud)"
+        return 0
+    fi
+    if [ "$a_n" -gt 0 ]; then
+        fire_alert "$a_name: $a_n attached volume(s) will NOT vanish with termination (DeleteOnTermination=false keeps billing) — terminating anyway"
+    fi
+    if ! "$AWS_BIN" ec2 terminate-instances --instance-ids "$a_name"; then
+        n_api=$((n_api + 1))
+        api_names="$api_names aws:$a_name(terminate)"
+        fire_alert "aws terminate-instances failed for $a_name"
         return 0
     fi
     n_destroyed=$((n_destroyed + 1))
-    log "DESTROYED: $d_name ($d_reason)"
+    log "DESTROYED: $a_name ($a_reason)"
 }
 
+# destroy_gcp NAME ZONE REASON — the gcp provider's destroy shape: name
+# disks with auto-delete off, then delete (the zone rides from the
+# listing — names are zone-scoped).
+destroy_gcp() {
+    g_name=$1
+    g_zone=$2
+    g_reason=$3
+    g_n=
+    if g_doc=$("$GCP_BIN" compute instances describe "$g_name" --zone "$g_zone" --format json 2>/dev/null) && [ -n "$g_doc" ]; then
+        g_n=$(printf '%s' "$g_doc" | "$JQ_BIN" '[.disks[]? | select(.autoDelete != true)] | length' 2>/dev/null) || g_n=
+    fi
+    if [ -z "$g_n" ]; then
+        n_api=$((n_api + 1))
+        api_names="$api_names gcp:$g_name(disk-check)"
+        fire_alert "gcloud instances describe failed for $g_name — delete BLOCKED (fail loud)"
+        return 0
+    fi
+    if [ "$g_n" -gt 0 ]; then
+        fire_alert "$g_name: $g_n disk(s) will NOT be deleted with the instance (auto-delete off — the storage keeps billing) — deleting anyway"
+    fi
+    if ! "$GCP_BIN" compute instances delete "$g_name" --zone "$g_zone" --quiet; then
+        n_api=$((n_api + 1))
+        api_names="$api_names gcp:$g_name(delete)"
+        fire_alert "gcloud instances delete failed for $g_name"
+        return 0
+    fi
+    n_destroyed=$((n_destroyed + 1))
+    log "DESTROYED: $g_name ($g_reason)"
+}
+
+# destroy_azure NAME RG REASON — the azure provider's destroy shape: name
+# disks with deleteOption != Delete, delete, then name the NIC/public-ip
+# residuals `vm delete` leaves behind (public IPs bill).
+destroy_azure() {
+    z_name=$1
+    z_rg=$2
+    z_reason=$3
+    z_n=
+    if z_disks=$("$AZ_BIN" disk list --resource-group "$z_rg" \
+            --query "[?managedBy!=null].{name:name, vm:managedBy, del:deleteOption}" \
+            --output json 2>/dev/null) && [ -n "$z_disks" ]; then
+        z_n=$(printf '%s' "$z_disks" | "$JQ_BIN" --arg n "$z_name" \
+            '[.[] | select(.del != "Delete" and ((.vm // "") | endswith("/" + $n)))] | length' 2>/dev/null) || z_n=
+    fi
+    if [ -z "$z_n" ]; then
+        n_api=$((n_api + 1))
+        api_names="$api_names azure:$z_name(disk-check)"
+        fire_alert "az disk list failed for $z_name — delete BLOCKED (fail loud)"
+        return 0
+    fi
+    if [ "$z_n" -gt 0 ]; then
+        fire_alert "$z_name: $z_n attached disk(s) will NOT be deleted with the VM (deleteOption is not Delete — the storage keeps billing) — deleting anyway"
+    fi
+    if ! "$AZ_BIN" vm delete --resource-group "$z_rg" --name "$z_name" --yes; then
+        n_api=$((n_api + 1))
+        api_names="$api_names azure:$z_name(delete)"
+        fire_alert "az vm delete failed for $z_name"
+        return 0
+    fi
+    z_nic_n=
+    z_pip_n=
+    if z_nics=$("$AZ_BIN" network nic list --resource-group "$z_rg" \
+            --query "[?virtualMachine==null].name" --output json 2>/dev/null) \
+        && z_pips=$("$AZ_BIN" network public-ip list --resource-group "$z_rg" \
+            --query "[?ipConfiguration==null].name" --output json 2>/dev/null); then
+        z_nic_n=$(printf '%s' "$z_nics" | "$JQ_BIN" 'length' 2>/dev/null) || z_nic_n=
+        z_pip_n=$(printf '%s' "$z_pips" | "$JQ_BIN" 'length' 2>/dev/null) || z_pip_n=
+    fi
+    if [ -z "$z_nic_n" ] || [ -z "$z_pip_n" ]; then
+        n_api=$((n_api + 1))
+        api_names="$api_names azure:$z_name(orphan-check)"
+        fire_alert "az orphan check (nic/public-ip list) failed for $z_name — NICs/public IPs may be left billing"
+        return 0
+    fi
+    if [ "$z_nic_n" -gt 0 ] || [ "$z_pip_n" -gt 0 ]; then
+        fire_alert "$z_name deleted, but $z_nic_n unattached network interface(s) and $z_pip_n unassociated public IP(s) remain in resource group '$z_rg' — public IPs keep billing; delete them by hand"
+    fi
+    n_destroyed=$((n_destroyed + 1))
+    log "DESTROYED: $z_name ($z_reason)"
+}
+
+# destroy_scw ID REASON — the scw provider's destroy shape: name attached
+# volumes (a delete only DETACHES them), then delete.
+destroy_scw() {
+    s_name=$1
+    s_reason=$2
+    s_n=
+    if s_doc=$("$SCW_BIN" instance server get "$s_name" -o json 2>/dev/null) && [ -n "$s_doc" ]; then
+        s_n=$(printf '%s' "$s_doc" | "$JQ_BIN" '[.volumes[]?] | length' 2>/dev/null) || s_n=
+    fi
+    if [ -z "$s_n" ]; then
+        n_api=$((n_api + 1))
+        api_names="$api_names scw:$s_name(volume-check)"
+        fire_alert "scw server get failed for $s_name — delete BLOCKED (fail loud)"
+        return 0
+    fi
+    if [ "$s_n" -gt 0 ]; then
+        fire_alert "$s_name: $s_n attached volume(s) — a delete only DETACHES them (they keep billing) — deleting anyway"
+    fi
+    if ! "$SCW_BIN" instance server delete "server-id=$s_name"; then
+        n_api=$((n_api + 1))
+        api_names="$api_names scw:$s_name(delete)"
+        fire_alert "scw server delete failed for $s_name"
+        return 0
+    fi
+    n_destroyed=$((n_destroyed + 1))
+    log "DESTROYED: $s_name ($s_reason)"
+}
+
+# ── The hcloud axis (#269, unchanged behavior — always on) ─────────────
 sweep_server() {
     s_name=$1
     n_total=$((n_total + 1))
@@ -220,51 +653,214 @@ sweep_server() {
         return 0
     fi
 
-    s_now=$(date -u +%s)
-    s_age_h=$(((s_now - s_created) / 3600))
+    decide_worker hcloud "$s_name" "$s_ip" "$s_created" "$s_ttl" ""
+}
 
-    # Rule 1: the TTL label is the source of truth.
-    if is_epoch "$s_ttl"; then
-        if [ "$s_ttl" -le "$s_now" ]; then
-            due_track "$s_name" "TTL label past due"
+# fetch_servers → SERVERS global (one server name per line); nonzero rc
+# on API failure (the run continues — other axes still sweep; the failure
+# is counted and alerted).
+fetch_servers() {
+    if ! SERVERS=$("$HCLOUD_BIN" server list --label-selector "$LABEL" -o columns=name 2>/dev/null); then
+        n_api=$((n_api + 1))
+        api_names="$api_names (server-list)"
+        fire_alert "hcloud server list failed — sweep skipped, NO server evaluated"
+        return 1
+    fi
+    return 0
+}
+
+run_axis_hcloud() {
+    axes_on="$axes_on hcloud"
+    axis_snap
+    if fetch_servers; then
+        if [ -n "$SERVERS" ]; then
+            while read -r h_name; do
+                if [ -z "$h_name" ]; then continue; fi
+                sweep_server "$h_name"
+            done <<EOF
+$SERVERS
+EOF
         else
-            n_alive=$((n_alive + 1))
-            log "ALIVE: $s_name (TTL label in the future)"
+            log "no servers labeled $LABEL — nothing to sweep"
         fi
-        return 0
     fi
-    if [ -n "$s_ttl" ]; then
-        log "LABEL-INVALID: $s_name — TTL label not epoch seconds, falling back to the marker copy"
-    fi
+    axis_line hcloud
+}
 
-    # Rule 2: the in-guest marker copy.
-    s_ts=
-    if s_marker=$(fetch_marker "$s_ip"); then
-        s_ts=$(first_line "$s_marker")
-    fi
-    if is_epoch "$s_ts"; then
-        if [ "$s_ts" -le "$s_now" ]; then
-            due_track "$s_name" "no TTL label; marker copy past due"
-        else
-            n_alive=$((n_alive + 1))
-            log "ALIVE: $s_name (no TTL label; marker copy in the future)"
+# ── The opt-in non-hcloud axes (#287) ──────────────────────────────────
+# Shared skeleton: enablement check → binary/jq check (loud skip + fail
+# the run) → one enumerate call → jq-normalized TSV records → the shared
+# rule engine. A enumerate failure names the axis, counts one API failure,
+# and returns without touching the other axes.
+
+axis_require_bins() { # AXIS ENABLE_VAR ...bins
+    a_axis=$1
+    a_var=$2
+    shift 2
+    for a_bin in "$@"; do
+        if ! command -v "$a_bin" >/dev/null 2>&1; then
+            n_skip=$((n_skip + 1))
+            skip_names="$skip_names $a_axis"
+            fire_alert "$a_axis axis skipped: $a_var=1 but a required binary was not found ($a_bin) — NO $a_axis worker evaluated"
+            return 1
         fi
-        return 0
-    fi
+    done
+    return 0
+}
 
-    # Rule 3: server-age floor — the marker-never-written leak case.
-    if [ "$s_age_h" -ge "$AGE_DESTROY_H" ]; then
-        due_track "$s_name" "no usable TTL, age ${s_age_h}h past the ${AGE_DESTROY_H}h floor"
+axis_enumerate_fail() { # AXIS LABEL QUERYNAME
+    n_api=$((n_api + 1))
+    api_names="$api_names $1(server-list)"
+    fire_alert "$1 $2 failed — $1 axis skipped, NO $1 worker evaluated"
+}
+
+axis_parse_fail() { # AXIS
+    n_api=$((n_api + 1))
+    api_names="$api_names $1(parse)"
+    fire_alert "unparseable $1 enumerate output — $1 axis skipped"
+}
+
+run_axis_aws() {
+    if [ "${SHUTTLE_SWEEP_AWS:-0}" != "1" ]; then
+        axes_off="$axes_off aws"
         return 0
     fi
-    if [ "$s_age_h" -ge "$AGE_ALERT_H" ]; then
-        n_floor=$((n_floor + 1))
-        floor_names="$floor_names $s_name(${s_age_h}h)"
-        fire_alert "$s_name: no usable TTL, age ${s_age_h}h past the ${AGE_ALERT_H}h alert floor (destroy at ${AGE_DESTROY_H}h)"
+    axes_on="$axes_on aws"
+    axis_snap
+    axis_require_bins aws SHUTTLE_SWEEP_AWS "$AWS_BIN" "$JQ_BIN" || return 0
+
+    log "axis aws: enumerating EC2 instances tagged $LABEL..."
+    if ! ax_raw=$("$AWS_BIN" ec2 describe-instances \
+            --filters "Name=tag:$LABEL,Values=true" \
+            --query "$AWS_QUERY" --output json 2>/dev/null); then
+        axis_enumerate_fail aws "describe-instances"
+        axis_line aws
         return 0
     fi
-    n_alive=$((n_alive + 1))
-    log "ALIVE: $s_name (no usable TTL; age ${s_age_h}h below the ${AGE_ALERT_H}h floor)"
+    if ! ax_recs=$(printf '%s' "$ax_raw" | "$JQ_BIN" -r \
+            '.[] | [.[0], (.[1] // ""), (.[2] // ""), (.[3] // ""), ""] | join("|")' 2>/dev/null); then
+        axis_parse_fail aws
+        axis_line aws
+        return 0
+    fi
+    if [ -z "$ax_recs" ]; then
+        log "axis aws: no instances tagged $LABEL — nothing to sweep"
+        axis_line aws
+        return 0
+    fi
+    recs_to_decide aws <<EOF
+$ax_recs
+EOF
+    axis_line aws
+}
+
+run_axis_gcp() {
+    if [ "${SHUTTLE_SWEEP_GCP:-0}" != "1" ]; then
+        axes_off="$axes_off gcp"
+        return 0
+    fi
+    axes_on="$axes_on gcp"
+    axis_snap
+    axis_require_bins gcp SHUTTLE_SWEEP_GCP "$GCP_BIN" "$JQ_BIN" || return 0
+
+    log "axis gcp: enumerating Compute Engine instances labeled $LABEL..."
+    if ! ax_raw=$("$GCP_BIN" compute instances list \
+            --filter="labels.$LABEL=true" --format json 2>/dev/null); then
+        axis_enumerate_fail gcp "instances list"
+        axis_line gcp
+        return 0
+    fi
+    if ! ax_recs=$(printf '%s' "$ax_raw" | "$JQ_BIN" -r --arg ttl "$TTL_LABEL" \
+            '.[] | [.name,
+                    ((.networkInterfaces[0].accessConfigs[0].natIP) // ""),
+                    (.creationTimestamp // ""),
+                    ((.labels // {})[$ttl] // ""),
+                    ((.zone // "") | split("/") | last)] | join("|")' 2>/dev/null); then
+        axis_parse_fail gcp
+        axis_line gcp
+        return 0
+    fi
+    if [ -z "$ax_recs" ]; then
+        log "axis gcp: no instances labeled $LABEL — nothing to sweep"
+        axis_line gcp
+        return 0
+    fi
+    recs_to_decide gcp <<EOF
+$ax_recs
+EOF
+    axis_line gcp
+}
+
+run_axis_azure() {
+    if [ "${SHUTTLE_SWEEP_AZURE:-0}" != "1" ]; then
+        axes_off="$axes_off azure"
+        return 0
+    fi
+    axes_on="$axes_on azure"
+    axis_snap
+    axis_require_bins azure SHUTTLE_SWEEP_AZURE "$AZ_BIN" "$JQ_BIN" || return 0
+
+    log "axis azure: enumerating VMs tagged $LABEL..."
+    if ! ax_raw=$("$AZ_BIN" vm list -d \
+            --query "$AZ_QUERY" --output json 2>/dev/null); then
+        axis_enumerate_fail azure "vm list"
+        axis_line azure
+        return 0
+    fi
+    if ! ax_recs=$(printf '%s' "$ax_raw" | "$JQ_BIN" -r \
+            '.[] | [.[0], (.[2] // ""), (.[3] // ""), (.[4] // ""), (.[1] // "")] | join("|")' 2>/dev/null); then
+        axis_parse_fail azure
+        axis_line azure
+        return 0
+    fi
+    if [ -z "$ax_recs" ]; then
+        log "axis azure: no VMs tagged $LABEL — nothing to sweep"
+        axis_line azure
+        return 0
+    fi
+    recs_to_decide azure <<EOF
+$ax_recs
+EOF
+    axis_line azure
+}
+
+run_axis_scw() {
+    if [ "${SHUTTLE_SWEEP_SCW:-0}" != "1" ]; then
+        axes_off="$axes_off scw"
+        return 0
+    fi
+    axes_on="$axes_on scw"
+    axis_snap
+    axis_require_bins scw SHUTTLE_SWEEP_SCW "$SCW_BIN" "$JQ_BIN" || return 0
+
+    log "axis scw: enumerating servers tagged $LABEL..."
+    if ! ax_raw=$("$SCW_BIN" instance server list -o json 2>/dev/null); then
+        axis_enumerate_fail scw "server list"
+        axis_line scw
+        return 0
+    fi
+    if ! ax_recs=$(printf '%s' "$ax_raw" | "$JQ_BIN" -r --arg lbl "$LABEL" --arg ttl "$TTL_LABEL" \
+            '.servers[]?
+             | select(any(.tags[]?; . == ($lbl + "=true")))
+             | [(.id // ""),
+                (((.public_ip // {})["address"]) // ""),
+                (.creation_date // ""),
+                (([.tags[]? | select(startswith($ttl + "="))][0])
+                    | if . then (split("=")[1] // "") else "" end),
+                ""] | join("|")' 2>/dev/null); then
+        axis_parse_fail scw
+        axis_line scw
+        return 0
+    fi
+    if [ -z "$ax_recs" ]; then
+        log "axis scw: no servers tagged $LABEL — nothing to sweep"
+        axis_line scw
+        return 0
+    fi
+    recs_to_decide scw <<EOF
+$ax_recs
+EOF
+    axis_line scw
 }
 
 check_bins() {
@@ -279,19 +875,10 @@ check_bins() {
     return 0
 }
 
-# fetch_servers → SERVERS global (one server name per line); nonzero rc
-# on API failure.
-fetch_servers() {
-    if ! SERVERS=$("$HCLOUD_BIN" server list --label-selector "$LABEL" -o columns=name 2>/dev/null); then
-        fire_alert "hcloud server list failed — sweep skipped, NO server evaluated"
-        return 1
-    fi
-    return 0
-}
-
 finish() {
     if [ "$DRY_RUN" -eq 1 ]; then mode=dry-run; else mode=ENFORCE; fi
     log "sweep summary: $n_total labeled, $n_alive alive, $n_due destroy-track, $n_destroyed destroyed, $n_blocked volume-blocked, $n_floor floor-alerted, $n_api api-failed (mode: $mode)"
+    log "axes: enabled:$axes_on; not enabled:$axes_off"
 
     rc=0
     if [ "$n_floor" -gt 0 ]; then
@@ -304,7 +891,23 @@ finish() {
     fi
     if [ "$n_api" -gt 0 ]; then
         rc=1
-        fire_alert "$n_api hcloud API failure(s):$api_names"
+        fire_alert "$n_api sweep API failure(s):$api_names"
+    fi
+
+    # Clean-run heartbeat: a push monitor needs positive proof the sweep
+    # machinery is alive; rc!=0 already fanned the alerts out per event.
+    if [ "$rc" -eq 0 ] && [ -n "${SHUTTLE_SWEEP_KUMA_URLS:-}" ]; then
+        for h_url in $SHUTTLE_SWEEP_KUMA_URLS; do
+            notify_one kuma "$h_url" up "sweep ok (mode: $mode)"
+        done
+    fi
+    if [ "$NOTIFY_FAIL" -gt 0 ]; then
+        rc=1
+        alert_log "$NOTIFY_FAIL notify destination(s) failed:$notify_fail_names — alerts may be unacked"
+    fi
+    if [ "$n_skip" -gt 0 ]; then
+        rc=1
+        alert_log "$n_skip enabled axis(es) skipped:$skip_names — no worker from them was evaluated"
     fi
     return "$rc"
 }
@@ -313,19 +916,12 @@ main() {
     if [ "${SHUTTLE_SWEEP_ENFORCE:-}" = "1" ]; then DRY_RUN=0; fi
     parse_args "$@" || return $?
     check_bins || return 1
-    fetch_servers || return 1
 
-    if [ -z "$SERVERS" ]; then
-        log "no servers labeled $LABEL — nothing to sweep"
-        return 0
-    fi
-
-    while read -r w_name; do
-        if [ -z "$w_name" ]; then continue; fi
-        sweep_server "$w_name"
-    done <<EOF
-$SERVERS
-EOF
+    run_axis_hcloud
+    run_axis_aws
+    run_axis_gcp
+    run_axis_azure
+    run_axis_scw
 
     finish
 }
