@@ -219,6 +219,57 @@ fn oracle_note(unit: &DaemonUnit) -> String {
     })
 }
 
+// ── Version-suffix lint (ADR-0047 D5, issue #260) ──
+
+/// Split a `<base><digits>` name into its base: `Some(base)` when the
+/// name ends in one or more ASCII digits and stripping them leaves a
+/// non-empty base, `None` otherwise (`node22` → `node`, `foo` → `None`,
+/// `22` → `None`, `foo2bar` → `None`). Shared with the farm collision
+/// vocabulary, which points at `name@constraint` for version-line pairs.
+pub(crate) fn split_version_suffix(name: &str) -> Option<&str> {
+    let base = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    if base.is_empty() || base.len() == name.len() {
+        None
+    } else {
+        Some(base)
+    }
+}
+
+/// The eval lint (ADR-0047 Decision 5, #260): warn when a package name
+/// matches `<base><digits>` AND its unsuffixed base is also in the
+/// evaluated set — a suffixed sibling renaming itself to dodge its own
+/// base is the warnable anti-pattern shape. A `<base><digits>` name with
+/// no base sibling in the set survives cleanly: a genuinely different
+/// product may deliberately own the name (the anti-pattern's documented
+/// escape hatch), so this is a WARNING, never an error — the message
+/// points at `name@constraint` (ADR-0047), the only spelling of a second
+/// version line.
+pub fn version_suffix_lint(outputs: &Outputs) -> Vec<LintWarning> {
+    let names: std::collections::BTreeSet<&str> =
+        outputs.values().map(|m| m.name.as_str()).collect();
+    let mut warnings = Vec::new();
+    let mut keys: Vec<&String> = outputs.keys().collect();
+    keys.sort();
+    for key in keys {
+        let meta = &outputs[key];
+        let Some(base) = split_version_suffix(&meta.name) else {
+            continue;
+        };
+        if !names.contains(base) {
+            continue;
+        }
+        warnings.push(LintWarning {
+            key: key.clone(),
+            message: format!(
+                "package '{}' reads as the version-suffix anti-pattern — a second \
+                 version line is `{base}@constraint` in another pod; see ADR-0047",
+                meta.name
+            ),
+        });
+    }
+    warnings
+}
+
 /// Convenience for `shuttle check`: lint warnings keyed for the JSON
 /// report (`{"key", "message"}` pairs).
 pub fn lint_json(warnings: &[LintWarning]) -> Vec<BTreeMap<&'static str, String>> {
@@ -404,5 +455,55 @@ mod tests {
         let json = lint_json(&warnings);
         assert_eq!(json[0]["key"], "k");
         assert_eq!(json[0]["message"], "m");
+    }
+
+    // ── version_suffix_lint (ADR-0047 D5, #260) ──
+
+    #[test]
+    fn suffixed_sibling_name_warns_with_the_adr_pointer() {
+        let mut outputs = Outputs::new();
+        outputs.insert("default".into(), strict_meta("node"));
+        outputs.insert("lts".into(), strict_meta("node22"));
+        let lint = version_suffix_lint(&outputs);
+        assert_eq!(lint.len(), 1, "only the suffixed sibling warns: {lint:?}");
+        assert_eq!(lint[0].key, "lts");
+        let msg = &lint[0].message;
+        assert!(
+            msg.contains("a second version line is `node@constraint` in another pod")
+                && msg.contains("ADR-0047"),
+            "warning must carry the name@constraint remedy and the ADR pointer: {msg}"
+        );
+    }
+
+    #[test]
+    fn unsuffixed_names_and_baseless_suffixed_names_survive() {
+        // foo2 has no `foo` sibling in the set: a legitimate non-version
+        // name (the escape hatch) — silent.
+        let mut outputs = Outputs::new();
+        outputs.insert("default".into(), strict_meta("foo2"));
+        outputs.insert("other".into(), strict_meta("bar"));
+        assert!(
+            version_suffix_lint(&outputs).is_empty(),
+            "a <base><digits> name with no base sibling must survive"
+        );
+        // A plain unsuffixed set is silent.
+        let mut outputs = Outputs::new();
+        outputs.insert("default".into(), strict_meta("node"));
+        assert!(version_suffix_lint(&outputs).is_empty());
+        // Digits-only and non-trailing-digit names have no base to dodge.
+        let mut outputs = Outputs::new();
+        outputs.insert("a".into(), strict_meta("22"));
+        outputs.insert("b".into(), strict_meta("foo2bar"));
+        assert!(version_suffix_lint(&outputs).is_empty());
+    }
+
+    #[test]
+    fn split_version_suffix_shape() {
+        assert_eq!(super::split_version_suffix("node22"), Some("node"));
+        assert_eq!(super::split_version_suffix("gtk3"), Some("gtk"));
+        assert_eq!(super::split_version_suffix("node"), None);
+        assert_eq!(super::split_version_suffix("22"), None);
+        assert_eq!(super::split_version_suffix("foo2bar"), None);
+        assert_eq!(super::split_version_suffix(""), None);
     }
 }

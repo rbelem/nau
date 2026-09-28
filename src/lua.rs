@@ -590,6 +590,13 @@ pub fn evaluate_string_with_constraint(
             Err(e) => crate::output::warn(format!("skipping output '{key}' from {label}: {e}")),
         }
     }
+
+    // The eval lint (ADR-0047 D5, #260): a suffixed package name dodging
+    // its own base sibling in the same eval is the warnable shape. Warn
+    // and continue — a genuinely different product may own the name.
+    for w in crate::lint::version_suffix_lint(&outputs) {
+        crate::output::warn(&w.message);
+    }
     Ok(outputs)
 }
 
