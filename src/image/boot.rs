@@ -697,6 +697,36 @@ pub(crate) fn assert_bless_boot_tooling_staged(root: &Path) -> miette::Result<()
     Ok(())
 }
 
+/// Guest paths the `Verify=yes` verifier may live at: systemd-sysupdate
+/// shells out to `gpg` (or `gpg2`) inside the RUNNING rootfs.
+const GUEST_GPG_PATHS: [&str; 2] = ["usr/bin/gpg", "usr/bin/gpg2"];
+
+/// The `Verify=yes` gate's post-condition on the staged rootfs (#291,
+/// council M2): the transfers make systemd-sysupdate shell out to gpg in
+/// the guest to verify `SHA256SUMS.gpg` against the embedded
+/// import-pubring.pgp. A rootfs without gpg surfaces at update time as
+/// "Signature verification failed" — never "missing gpg" — so every
+/// update on such a device refuses with a misleading verdict. Same
+/// fail-closed shape as [`assert_bless_boot_tooling_staged`]: the build
+/// refuses to pack, the first update never sees it.
+pub(crate) fn assert_gpg_staged(root: &Path) -> miette::Result<()> {
+    if GUEST_GPG_PATHS.iter().any(|rel| root.join(rel).is_file()) {
+        eprintln!("  ✓ gpg present in the staged rootfs (Verify=yes verifier, #291)");
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "Verify=yes sysupdate transfers are emitted but the staged rootfs \
+         ships no gpg: none of /{} ({} looked for). systemd-sysupdate \
+         verifies SHA256SUMS.gpg by shelling out to gpg/gpg2 against \
+         import-pubring.pgp, and a guest without it fails EVERY update as \
+         \"Signature verification failed\" without naming the real cause — \
+         so refusing to pack this image. Ship gpg in the rootfs (#291, \
+         ADR-0024 §4).",
+        GUEST_GPG_PATHS.join(" / "),
+        GUEST_GPG_PATHS.len(),
+    ))
+}
+
 /// ADR-0013 identity matrix (#263): the distro is Nau — `shuttle` is the
 /// CLI and never appears as the distro identity. `ID` follows
 /// os-release(5) (lowercase, no spaces); releases carry mission names,
@@ -786,8 +816,11 @@ pub(crate) fn transfer_header() -> String {
 /// (never minting) and embeds the derived pubring beside the transfers —
 /// there is no code path that emits `Verify=yes` without the keyring.
 /// The guest-side `gpg` binary the check shells out to is payload
-/// territory; the QEMU live-update axis (#267, deferred) is what proves
-/// it end-to-end on a booting guest.
+/// territory: the build refuses to emit these transfers for a rootfs
+/// without gpg ([`assert_gpg_staged`], #291), and the produced
+/// pubring + signature framing is proven against the REAL gpg binary by
+/// `tests/sysupdate_gpg_interop.rs` — the QEMU live-update axis (#267,
+/// deferred) remains what proves it end-to-end on a booting guest.
 ///
 /// The hash layer stays unconditional underneath: every downloaded
 /// payload is still hashed against the manifest (sysupdate.d(5)), so a

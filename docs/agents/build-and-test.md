@@ -179,8 +179,19 @@ unions) — never a blanket `-w`.
   `"dependency closure"`), never a phrase long enough to straddle a wrap
   boundary — a `contains()` on a split phrase fails even though the exact
   sentence was printed.
-- **Gated tests skip silently.** `gated_test!` early-returns with an eprintln
-  when its tool is absent (issue #134 tracks a fail-loud canary). A green
-  local run proves nothing for gated tests: when a PR's proof rests on them,
-  grep the CI run log for their `... ok` lines and do not merge on a run
-  where they were skipped.
+- **Gated tests skip silently — outside the gate.** `gated_test!`
+  early-returns with an eprintln when its tool is absent (issue #134
+  tracks a fail-loud canary), and cargo swallows a passing test's
+  output, so a green local run proves nothing for gated tests: when a
+  PR's proof rests on them, grep the CI run log for their `... ok`
+  lines and do not merge on a run where they were skipped. The gate
+  flips the policy (#291): `scripts/gate.sh` provisions `gpg`
+  (`nixpkgs#gnupg`) and `veritysetup` (`nixpkgs#cryptsetup`) beside the
+  pinned compiler and exports `SHUTTLE_GATE=1`, which the gated tests
+  honor — a tool absent in the gate FAILS, it does not skip. Per-host
+  opt-out: `SHUTTLE_GATE_ALLOW_SKIP=1` proceeds with skips, logged
+  loudly by the gate and by the tests. One axis stays a skip even in
+  the gate: the loop-device test (#288) needs CAP_SYS_ADMIN to attach,
+  which unprivileged gate hosts permanently lack — so the gate probes
+  attachability up front (`losetup` on a scratch file) and prints the
+  verdict where it cannot be swallowed by cargo's output capture.

@@ -943,6 +943,11 @@ pub(crate) fn build_disk_image_with(
         let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
         let kp = load_signing_key_fail_closed(&home)?;
         embed_import_pubring(&root, &kp)?;
+        // #291 (council M2): the anchor's verifier is the GUEST's gpg —
+        // Verify=yes shells out to it. A rootfs without gpg fails every
+        // update under a misleading "Signature verification failed"
+        // verdict, so the gate moves the failure to the build.
+        assert_gpg_staged(&root)?;
         write_sysupdate_transfers(&root, image)?;
         emit_sysupdate_units(&root, esp_mount)?;
         // The transfers carry ProtectVersion=%A, which resolves to the
@@ -5464,6 +5469,43 @@ RequiredBy=boot-complete.target
     }
 
     #[test]
+    fn gpg_gate_fails_closed_when_the_guest_ships_no_gpg() {
+        // #291: Verify=yes shells out to the guest's gpg; without it
+        // every update fails as "Signature verification failed" — the
+        // build must refuse to pack, naming the missing verifier.
+        let root = tempfile::tempdir().unwrap();
+        let err =
+            assert_gpg_staged(root.path()).expect_err("a rootfs without gpg must refuse to pack");
+        let message = err.to_string();
+        assert!(
+            message.contains("Verify=yes"),
+            "names the stanza that needs gpg: {message}"
+        );
+        assert!(
+            message.contains("usr/bin/gpg"),
+            "names where gpg must live: {message}"
+        );
+        assert!(
+            message.contains("usr/bin/gpg2"),
+            "names the gpg2 alias too: {message}"
+        );
+    }
+
+    #[test]
+    fn gpg_gate_passes_when_gpg_or_gpg2_is_staged() {
+        // Either binary satisfies the verifier lookup (systemd shells
+        // out to gpg or gpg2), so either alone must hold the gate.
+        for rel in ["usr/bin/gpg", "usr/bin/gpg2"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"ELF").unwrap();
+            assert_gpg_staged(root.path())
+                .unwrap_or_else(|e| panic!("{rel} alone must satisfy the gate: {e}"));
+        }
+    }
+
+    #[test]
     fn base_systemd_shared_lib_reports_the_path_for_the_tooling_rpath() {
         // #85: the tooling staging reuses the guest's own shared lib when
         // the major matches, so it needs the PATH, not just the major.
@@ -6477,6 +6519,12 @@ RequiredBy=boot-complete.target
             )
             .unwrap();
             std::fs::write(Path::new(dir).join("bin").join("busybox"), b"ELF").unwrap();
+            // #291: the fake base ships the Verify=yes verifier — a base
+            // whose rootfs carries no gpg is the gate's fail-closed shape
+            // (unit-tested directly); the happy-path e2e build represents
+            // a COMPLIANT base, so the verifier must be in its tree.
+            std::fs::create_dir_all(Path::new(dir).join("usr").join("bin")).unwrap();
+            std::fs::write(Path::new(dir).join("usr").join("bin").join("gpg"), b"ELF").unwrap();
             if let Some(major) = systemd_major {
                 let systemd_dir = Path::new(dir).join("usr").join("lib").join("systemd");
                 std::fs::create_dir_all(&systemd_dir).unwrap();
