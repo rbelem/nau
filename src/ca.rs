@@ -13,10 +13,10 @@
 //!
 //! - `shuttle ca keygen` — mint the keypair via `ssh-keygen` behind the
 //!   [`CommandRunner`][crate::command::CommandRunner] seam (the repo's
-//!   subprocess convention — `mint_host_keypair` precedent — no new
-//!   crates). Refuses to overwrite an existing CA without `--force`:
-//!   replacing the high-value trust root is a deliberate act, never an
-//!   accident.
+//!   subprocess convention — every provisioning-side ssh-keygen call
+//!   rides it — no new crates). Refuses to overwrite an existing CA
+//!   without `--force`: replacing the high-value trust root is a
+//!   deliberate act, never an accident.
 //! - `shuttle ca list` — introspect: presence per half, the public line,
 //!   and the ssh-keygen SHA256 fingerprint (the identity workers entries
 //!   will carry once #295 sub-task 4 lands).

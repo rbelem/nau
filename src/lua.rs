@@ -456,8 +456,10 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
 /// known_hosts key — or an OpenSSH `SHA256:<43 base64 chars>` fingerprint.
 /// The fingerprint form is validated in shape only: it cannot build a
 /// known_hosts entry and shuttle learns no host keys, so the executor
-/// refuses a fingerprint-only pin at preflight.
-fn validate_host_key(raw: &str) -> miette::Result<()> {
+/// refuses a fingerprint-only pin at preflight. Shared with the publish
+/// receive surface (the guest's published public half must satisfy the
+/// same grammar it will ride a config with).
+pub fn validate_host_key(raw: &str) -> miette::Result<()> {
     const KEY_TYPES: &[&str] = &[
         "ssh-ed25519",
         "ecdsa-sha2-nistp256",

@@ -11,18 +11,25 @@ use std::sync::{Arc, Mutex};
 
 use shuttle::command::{CommandRunner, RunnerOutput};
 use shuttle::provision::hetzner::HetznerProvisioner;
+use shuttle::provision::publish::PublishChannel;
 use shuttle::provision::{
     append_worker_entry, now_epoch_secs, parse_ttl, render_user_data, ProvisionRequest,
-    Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END, SQUASHFS_TOOLS_RELEASE_DATE,
-    SQUASHFS_TOOLS_SHA256, SQUASHFS_TOOLS_TARBALL_URL, SQUASHFS_TOOLS_VERSION,
+    Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN,
+    PLAN_PUBLISH_URL, SQUASHFS_TOOLS_RELEASE_DATE, SQUASHFS_TOOLS_SHA256,
+    SQUASHFS_TOOLS_TARBALL_URL, SQUASHFS_TOOLS_VERSION,
 };
 
-/// A shape-valid ed25519 keypair — throwaway fixture bytes, no crypto.
+/// A shape-valid ed25519 public line — throwaway fixture bytes, no
+/// crypto. Reused as the published-key fixture in payload-shape tests.
 const TEST_HOST_PUB: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ shuttle-worker-host-key";
-const TEST_HOST_PRIV: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
 const OPERATOR_KEY: &str = "ssh-ed25519 AAAAoperatorkey operator@example";
 const BINARY_URL: &str = "https://example.invalid/shuttle-amd64";
+
+/// The host CA fingerprint the request carries (valid
+/// `SHA256:` + 43 base64 chars — the pin grammar's fingerprint form).
+const CA_FPR: &str = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG";
+const PUBLISH_URL: &str = "https://coordinator.example/publish";
 
 /// A fixed marker expiry for template-shape assertions (decimal epoch
 /// seconds — the #269 sweep's `is_epoch` shape).
@@ -44,14 +51,16 @@ struct Script {
     attached_volumes: usize,
 }
 
-/// Plays `ssh-keygen` + `hcloud` from scripted state and records every
-/// argv. Cheap to clone; all clones share one call log.
+/// Plays `hcloud` from scripted state and records every argv. Cheap to
+/// clone; all clones share one call log. (No ssh-keygen arm: the
+/// amendment removed the coordinator-side mint — a provision that tried
+/// to ssh-keygen would fail loudly here.)
 #[derive(Clone)]
 struct FakeProvider {
     calls: Arc<Mutex<Vec<Vec<String>>>>,
     /// (path, unix mode, content) of every `--user-datafile` the fake
-    /// served, captured at call time — the real blob dies with the mint
-    /// tempdir.
+    /// served, captured at call time — the real blob dies with the
+    /// staging tempdir.
     user_data_files: Arc<Mutex<Vec<(PathBuf, u32, String)>>>,
     /// Successful `server delete` count, shared across clones (drives
     /// `delete_fails_after`).
@@ -74,17 +83,6 @@ impl CommandRunner for FakeProvider {
     fn run(&self, argv: &[String]) -> io::Result<RunnerOutput> {
         self.calls.lock().unwrap().push(argv.to_vec());
         match argv[0].as_str() {
-            // Fake ssh-keygen: drop the fixed fixture keypair at -f <path>.
-            "ssh-keygen" => {
-                let path = argv
-                    .iter()
-                    .position(|a| a == "-f")
-                    .map(|i| argv[i + 1].clone())
-                    .expect("ssh-keygen fake requires -f");
-                std::fs::write(&path, TEST_HOST_PRIV).unwrap();
-                std::fs::write(format!("{path}.pub"), TEST_HOST_PUB).unwrap();
-                Ok(ok_out(""))
-            }
             "hcloud" => self.hcloud(argv),
             other => Ok(RunnerOutput {
                 code: 1,
@@ -196,15 +194,51 @@ fn request(config: &Path, dry_run: bool) -> ProvisionRequest {
         max_price: None,
         dry_run,
         config: config.to_path_buf(),
+        ca_fingerprint: Some(CA_FPR.into()),
     }
 }
 
+/// A publish channel pointed at a throwaway home: the one-time token
+/// registry lands there (recreated on demand) and the provider tests
+/// never read it back — tests that assert on the registry build their
+/// own channel with [`pubtmp`].
+fn throwaway_publish_channel() -> PublishChannel {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    PublishChannel {
+        url: PUBLISH_URL.into(),
+        home: std::env::temp_dir().join(format!("shuttle-hetzner-publish-test-{nanos}")),
+    }
+}
+
+/// A publish channel over a bound throwaway home — for tests that read
+/// the token registry back.
+fn pubtmp() -> (tempfile::TempDir, PublishChannel) {
+    let d = tempfile::tempdir().unwrap();
+    let channel = PublishChannel {
+        url: PUBLISH_URL.into(),
+        home: d.path().to_path_buf(),
+    };
+    (d, channel)
+}
+
 fn provisioner(fake: &FakeProvider, token: Option<&str>) -> HetznerProvisioner<FakeProvider> {
+    provisioner_with(fake, token, Some(throwaway_publish_channel()))
+}
+
+fn provisioner_with(
+    fake: &FakeProvider,
+    token: Option<&str>,
+    publish: Option<PublishChannel>,
+) -> HetznerProvisioner<FakeProvider> {
     HetznerProvisioner::new(
         fake.clone(),
         token.map(|t| t.to_string()),
         BINARY_URL.into(),
         OPERATOR_KEY.into(),
+        publish,
     )
 }
 
@@ -296,12 +330,15 @@ fn dry_run_makes_no_api_call_and_needs_no_token() {
 
 #[test]
 fn dry_run_user_data_resolves_to_the_real_template() {
-    // The dry-run mint + render path runs for real (local only); the
-    // rendered user-data must be byte-identical to the shared template's
-    // output for the same inputs — the plan is the REAL plan.
+    // The dry-run render path runs for real (local only); the rendered
+    // user-data must be byte-identical to the shared template's output
+    // for the same inputs — the plan is the REAL plan (shape-wise: the
+    // publish slots carry the documented placeholders, the real
+    // per-server blob differs only there).
     let user_data = render_user_data(&UserDataParams {
-        host_private_key: TEST_HOST_PRIV,
-        host_public_key: TEST_HOST_PUB,
+        machine_identity: PLAN_MACHINE_IDENTITY,
+        publish_url: PLAN_PUBLISH_URL,
+        publish_token: PLAN_PUBLISH_TOKEN,
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
         ttl_expiry_epoch: 1_700_000_000 + 14_400,
@@ -310,8 +347,9 @@ fn dry_run_user_data_resolves_to_the_real_template() {
     // Deterministic: same inputs, same blob, same hash — the plan lane
     // diffs this hash against the sent user-data.
     let again = render_user_data(&UserDataParams {
-        host_private_key: TEST_HOST_PRIV,
-        host_public_key: TEST_HOST_PUB,
+        machine_identity: PLAN_MACHINE_IDENTITY,
+        publish_url: PLAN_PUBLISH_URL,
+        publish_token: PLAN_PUBLISH_TOKEN,
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
         ttl_expiry_epoch: 1_700_000_000 + 14_400,
@@ -320,34 +358,84 @@ fn dry_run_user_data_resolves_to_the_real_template() {
 }
 
 #[test]
-fn user_data_carries_pinned_binary_operator_key_ttl_and_scrub() {
+fn user_data_generates_keys_guest_side_and_never_carries_a_private_half() {
+    // THE amendment assertion (ADR-0045): the template turns host-key
+    // generation ON (explicit — never a default relied on) and contains
+    // NO private half anywhere. The absence is the security property.
     let user_data = render_user_data(&UserDataParams {
-        host_private_key: TEST_HOST_PRIV,
-        host_public_key: TEST_HOST_PUB,
+        machine_identity: "shuttle-worker-abc-01",
+        publish_url: PUBLISH_URL,
+        publish_token: "a".repeat(64).as_str(),
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
         ttl_expiry_epoch: MARKER_EPOCH,
     });
-    // ADR-0045 D1: the minted host keypair, 0600 private half, public .pub.
-    assert!(user_data.contains("path: /etc/ssh/ssh_host_ed25519_key\n    permissions: \"0600\""));
-    assert!(user_data.contains("path: /etc/ssh/ssh_host_ed25519_key.pub"));
-    assert!(user_data.contains("-----BEGIN OPENSSH PRIVATE KEY-----"));
-    assert!(user_data.contains(TEST_HOST_PUB));
-    // cloud-init must not regenerate over the injected key.
-    assert!(user_data.contains("ssh_deletekeys: false"));
-    // Operator login key — separate from the host key.
+    // Guest-local generation, explicit.
+    assert!(user_data.contains("ssh_deletekeys: true"));
+    assert!(user_data.contains("ssh_genkey: true"));
+    // Absence: no injected keypair write_files, no PEM, no mint.
+    assert!(!user_data.contains("path: /etc/ssh/ssh_host_ed25519_key\n"));
+    assert!(!user_data.contains("BEGIN OPENSSH PRIVATE KEY"));
+    assert!(!user_data.contains("ssh-keygen"));
+    assert!(
+        !user_data.contains(TEST_HOST_PUB),
+        "no coordinator-minted key material rides the blob"
+    );
+    // The old post-sshd scrub is dead code under the amendment — removed.
+    assert!(!user_data.contains("rm -f /var/lib/cloud/instances"));
+    // The operator login flow is untouched.
     assert!(user_data.contains("path: /root/.ssh/authorized_keys"));
     assert!(user_data.contains(OPERATOR_KEY));
+}
+
+#[test]
+fn user_data_carries_the_publish_callback_and_one_time_token() {
+    // The publish block: a 0600 env file with the three per-machine
+    // slots, a 0700 script that reads the GUEST-GENERATED public half +
+    // the cloud-init instance-data document, and the POST with the
+    // one-time bearer. The URL/token/identity ride the env file, never
+    // loose argv interpolation.
+    let token = "b".repeat(64);
+    let user_data = render_user_data(&UserDataParams {
+        machine_identity: "shuttle-worker-abc-01",
+        publish_url: PUBLISH_URL,
+        publish_token: &token,
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: MARKER_EPOCH,
+    });
+    assert!(user_data.contains("path: /etc/shuttle/publish.env\n    permissions: \"0600\""));
+    assert!(user_data.contains(&format!("MACHINE_IDENTITY='shuttle-worker-abc-01'")));
+    assert!(user_data.contains(&format!("PUBLISH_URL='{PUBLISH_URL}'")));
+    assert!(user_data.contains(&format!("PUBLISH_TOKEN='{token}'")));
+    assert!(user_data.contains("path: /etc/shuttle/publish-host-key.sh\n    permissions: \"0700\""));
+    // The script reads the locally generated ed25519 public half and the
+    // cloud-init normalized instance-data (the D3 principal content).
+    assert!(user_data.contains("/etc/ssh/ssh_host_ed25519_key.pub"));
+    assert!(user_data.contains("/run/cloud-init/instance-data.json"));
+    assert!(user_data.contains("instance_identity"));
+    assert!(user_data.contains("Authorization: Bearer $PUBLISH_TOKEN"));
+    // The publish runs LAST (after curl is installed) and retries are
+    // bounded — a not-yet-up coordinator never bricks the boot.
+    let runcmds: Vec<&str> = user_data
+        .lines()
+        .filter(|l| l.starts_with("  - "))
+        .collect();
+    assert_eq!(
+        runcmds.last().copied(),
+        Some("  - /etc/shuttle/publish-host-key.sh"),
+        "publish is the final runcmd: {runcmds:?}"
+    );
+    assert!(user_data.contains("while [ \"$i\" -lt 10 ]"));
+    assert!(user_data.contains("curl -fsS -m 30"));
     // The TTL marker (the #269 sweep contract): one DECIMAL EPOCH-SECONDS
-    // line — the sweep's is_epoch parses decimal only, so ISO-8601 here
-    // would leave its marker fallback dead code.
+    // line — the sweep's is_epoch parses decimal only.
     assert!(user_data.contains("path: /etc/shuttle/worker-ttl"));
     assert!(user_data.contains(&format!("content: |\n      {MARKER_EPOCH}\n")));
-    // Pinned shuttle binary install + sshd hardening + user-data scrub.
+    // Pinned shuttle binary install + sshd hardening.
     assert!(user_data.contains(BINARY_URL));
     assert!(user_data.contains("PasswordAuthentication no"));
     assert!(user_data.contains("PermitRootLogin prohibit-password"));
-    assert!(user_data.contains("rm -f /var/lib/cloud/instances/*/user-data.txt"));
     // The provider token never rides user-data.
     assert!(!user_data.contains("HCLOUD_TOKEN"));
 }
@@ -355,8 +443,9 @@ fn user_data_carries_pinned_binary_operator_key_ttl_and_scrub() {
 #[test]
 fn user_data_builds_the_pinned_squashfs_tools_from_source() {
     let user_data = render_user_data(&UserDataParams {
-        host_private_key: TEST_HOST_PRIV,
-        host_public_key: TEST_HOST_PUB,
+        machine_identity: PLAN_MACHINE_IDENTITY,
+        publish_url: PLAN_PUBLISH_URL,
+        publish_token: PLAN_PUBLISH_TOKEN,
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
         ttl_expiry_epoch: MARKER_EPOCH,
@@ -394,8 +483,9 @@ fn user_data_builds_the_pinned_squashfs_tools_from_source() {
 #[test]
 fn user_data_installs_the_distro_bwrap_pin_and_keeps_the_userns_hardening() {
     let user_data = render_user_data(&UserDataParams {
-        host_private_key: TEST_HOST_PRIV,
-        host_public_key: TEST_HOST_PUB,
+        machine_identity: PLAN_MACHINE_IDENTITY,
+        publish_url: PLAN_PUBLISH_URL,
+        publish_token: PLAN_PUBLISH_TOKEN,
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
         ttl_expiry_epoch: MARKER_EPOCH,
@@ -437,17 +527,16 @@ fn provision_creates_describes_pins_and_labels() {
     let workers = provisioner(&fake, Some("tok-1")).provision(&req).unwrap();
     assert_eq!(workers.len(), 2);
 
-    // Addresses are pinned from the describe documents, host_key pin is
-    // the minted public half with the server name as comment.
+    // Addresses are pinned from the describe documents; the host_key pin
+    // is the CA fingerprint (the amendment's pin — one root, not
+    // per-worker keys).
     for w in &workers {
         assert!(
             w.address.starts_with("ssh://root@203.0.113."),
             "{}",
             w.address
         );
-        let pin: Vec<&str> = w.host_key.split_whitespace().collect();
-        assert_eq!(pin[0], "ssh-ed25519");
-        assert_eq!(pin[2], w.name, "the pin comments the server name");
+        assert_eq!(w.host_key, CA_FPR, "the pin IS the CA fingerprint");
     }
 
     // Every create carried the TTL label and the user-data file; the
@@ -500,18 +589,42 @@ fn provision_creates_describes_pins_and_labels() {
         assert!(!f.contains("tok-1"), "token never enters argv: {f}");
     }
 
-    // The staged blobs (captured at create time — they die with the mint
-    // tempdir after provision): the private half rides user-data, the
-    // operator key authorizes login.
+    // The staged blobs (captured at create time — they die with the
+    // staging tempdir after provision): NO private half anywhere (the
+    // amendment's absence property, over the real sent bytes), the
+    // publish block rides it, and each server's machine identity is its
+    // own name; the operator key authorizes login.
     let staged = fake.user_data_files.lock().unwrap();
     assert_eq!(staged.len(), 2, "one staged blob per create");
     for (_, _, user_data) in staged.iter() {
         assert!(
-            user_data.contains("-----BEGIN OPENSSH PRIVATE KEY-----"),
-            "private half rides user-data"
+            !user_data.contains("BEGIN OPENSSH PRIVATE KEY"),
+            "no private half rides user-data"
         );
+        assert!(
+            !user_data.contains("path: /etc/ssh/ssh_host_ed25519_key\n"),
+            "no injected host key"
+        );
+        assert!(user_data.contains("/etc/shuttle/publish-host-key.sh"));
         assert!(user_data.contains(OPERATOR_KEY));
+        assert!(
+            user_data.contains("MACHINE_IDENTITY='shuttle-worker-"),
+            "the machine identity is the server name"
+        );
     }
+    // The two blobs carry DIFFERENT one-time tokens.
+    let token_of = |blob: &str| {
+        blob.lines()
+            .find(|l| l.trim_start().starts_with("PUBLISH_TOKEN='"))
+            .map(|l| {
+                l.trim()
+                    .trim_start_matches("PUBLISH_TOKEN='")
+                    .trim_end_matches('\'')
+            })
+            .expect("token line")
+            .to_string()
+    };
+    assert_ne!(token_of(&staged[0].2), token_of(&staged[1].2));
     drop(staged);
 
     // Config: the managed block holds exactly the two entries; the file
@@ -834,9 +947,9 @@ fn destroy_of_a_server_without_a_managed_pin_reports_not_evicted() {
 // ── M1: user-data staging hygiene ──
 
 #[test]
-fn user_data_is_staged_inside_the_mint_tempdir_at_0600() {
-    // The blob carries the minted private host half: it must live in the
-    // mint tempdir (so it dies with the keypair) at mode 0600 — never at
+fn user_data_is_staged_inside_the_provision_tempdir_at_0600() {
+    // The blob carries the one-time publish bearer: it must live in the
+    // provision tempdir (so it dies with the run) at mode 0600 — never at
     // a fixed world-readable OS-temp path that outlives the run.
     let (_d, config) = workspace("shuttle.lua");
     std::fs::write(&config, operator_config()).unwrap();
@@ -852,7 +965,7 @@ fn user_data_is_staged_inside_the_mint_tempdir_at_0600() {
     assert_eq!(
         path.file_name().unwrap(),
         "user-data.yaml",
-        "staged inside the mint tempdir, not a content-addressed temp path"
+        "staged inside the provision tempdir, not a content-addressed temp path"
     );
     assert_ne!(
         path.parent().unwrap(),
@@ -862,7 +975,89 @@ fn user_data_is_staged_inside_the_mint_tempdir_at_0600() {
     assert_eq!(mode, 0o600, "the blob is 0600 while it exists");
     assert!(
         !path.exists(),
-        "the staged blob dies with the mint tempdir after provision"
+        "the staged blob is removed once its create call served it"
+    );
+}
+
+// ── Amendment convergence: one-time tokens, per-server identity ──
+
+#[test]
+fn each_server_gets_its_own_recorded_one_time_token() {
+    // The convergence property, read back from the coordinator registry:
+    // N servers → N recorded tokens, each bound to its own machine
+    // identity, none consumed (issuance is sub-task 3).
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let (pubhome, publish) = pubtmp();
+    let fake = FakeProvider::new(Script::default());
+    let mut req = request(&config, false);
+    req.count = 2;
+    provisioner_with(&fake, Some("tok"), Some(publish))
+        .provision(&req)
+        .unwrap();
+
+    let registry = std::fs::read_to_string(
+        pubhome
+            .path()
+            .join(".config/shuttle/ca/pending/tokens.json"),
+    )
+    .expect("the registry exists after provision");
+    let v: serde_json::Value = serde_json::from_str(&registry).unwrap();
+    let tokens = v["tokens"].as_array().unwrap();
+    assert_eq!(tokens.len(), 2, "one recorded issuance per server");
+    let mut identities: Vec<&str> = tokens
+        .iter()
+        .map(|t| t["machine_identity"].as_str().unwrap())
+        .collect();
+    identities.sort();
+    assert!(
+        identities.windows(2).all(|w| w[0] != w[1]),
+        "one identity per server: {identities:?}"
+    );
+    for t in tokens {
+        assert!(
+            t["consumed_at_epoch"].is_null(),
+            "nothing consumed yet — issuance is sub-task 3"
+        );
+    }
+}
+
+#[test]
+fn no_publish_channel_refuses_before_any_api_call() {
+    // Fail-closed: a provision whose guest cannot publish can never be
+    // issued a certificate — refused before the create, nothing torn
+    // down, config untouched.
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let fake = FakeProvider::new(Script::default());
+    let err = provisioner_with(&fake, Some("tok"), None)
+        .provision(&request(&config, false))
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("no publish channel"), "{text}");
+    assert!(text.contains("SHUTTLE_PUBLISH_URL"), "{text}");
+    assert!(
+        hcloud_calls(&fake).is_empty(),
+        "no API call before the publish-channel refusal"
+    );
+}
+
+#[test]
+fn no_ca_fingerprint_refuses_before_any_api_call() {
+    // Fail-closed interim: the pin IS the CA fingerprint; a request
+    // without one is a named refusal before any API call.
+    let (_d, config) = workspace("shuttle.lua");
+    std::fs::write(&config, operator_config()).unwrap();
+    let fake = FakeProvider::new(Script::default());
+    let mut req = request(&config, false);
+    req.ca_fingerprint = None;
+    let err = provisioner(&fake, Some("tok")).provision(&req).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("no host CA fingerprint"), "{text}");
+    assert!(text.contains("shuttle ca keygen"), "{text}");
+    assert!(
+        hcloud_calls(&fake).is_empty(),
+        "no API call before the CA-pin refusal"
     );
 }
 
@@ -959,15 +1154,17 @@ fn sweep_accepts_exactly_what_render_user_data_emits_as_the_marker() {
     // directions — past due → destroy track, future → ALIVE.
     let now = now_epoch_secs().unwrap();
     let past_blob = render_user_data(&UserDataParams {
-        host_private_key: TEST_HOST_PRIV,
-        host_public_key: TEST_HOST_PUB,
+        machine_identity: PLAN_MACHINE_IDENTITY,
+        publish_url: PLAN_PUBLISH_URL,
+        publish_token: PLAN_PUBLISH_TOKEN,
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
         ttl_expiry_epoch: now - 2 * 3600,
     });
     let future_blob = render_user_data(&UserDataParams {
-        host_private_key: TEST_HOST_PRIV,
-        host_public_key: TEST_HOST_PUB,
+        machine_identity: PLAN_MACHINE_IDENTITY,
+        publish_url: PLAN_PUBLISH_URL,
+        publish_token: PLAN_PUBLISH_TOKEN,
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
         ttl_expiry_epoch: now + 24 * 3600,

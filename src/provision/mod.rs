@@ -1,37 +1,49 @@
-//! The Provisioner seam (T6, ADR-0040 as rewritten by ADR-0045): turn a
-//! cloud account into a pinned `workers` entry in the operator's
-//! `shuttle.lua`, and take it back.
+//! The Provisioner seam (T6, ADR-0040 as rewritten by ADR-0045's
+//! amendment): turn a cloud account into a pinned `workers` entry in the
+//! operator's `shuttle.lua`, and take it back.
 //!
-//! Shape, fixed by the ratified host-key provenance decision (ADR-0045
-//! Decision 1/6): provision MINTS the worker's SSH host keypair
-//! coordinator-side, injects the private half through the provider's
-//! cloud-init user-data (the same authenticated channel that can already
-//! create and destroy machines), and pins the public half into the
-//! appended workers entry in the SAME transaction — the pin exists before
-//! first use, and `ssh-keyscan` is never called. A provision that fails
-//! after servers exist tears them down: nothing survives unpinned.
+//! Shape, fixed by the ratified amendment (#283 decided, #295 in
+//! flight): the guest GENERATES its SSH host keypair locally on first
+//! boot (cloud-init `ssh_genkey` — no private half is ever minted
+//! coordinator-side or shipped through user-data), then publishes the
+//! PUBLIC half to the coordinator over the one-time provisioning token
+//! ([`publish`] — the same authenticated create-time channel, now
+//! carrying public material only). Provision resolves before any API
+//! call, pins the host CA's fingerprint into the appended workers entry
+//! (the pin exists before first use — `@cert-authority` semantics land
+//! with #295 sub-task 4), and `ssh-keyscan` is never called. A provision
+//! that fails after servers exist tears them down: nothing survives
+//! unpinned.
 //!
 //! One provider module per cloud, each driving the provider's CLI through
 //! [`crate::command::CommandRunner`] (the repo's subprocess convention —
 //! zero new crates, the avahi-fallback precedent). The shared pieces live
-//! here: the [`Provisioner`] trait, the mint step, the TTL vocabulary the
-//! #269 sweep reads, and the shared cloud-init template.
+//! here: the [`Provisioner`] trait, the TTL vocabulary the #269 sweep
+//! reads, and the shared cloud-init template.
 //!
-//! Secrets never enter `shuttle.lua`: the config carries only the public
-//! pin (`host_key`) and the address. The private half rides user-data into
-//! the guest and is scrubbed from the guest's user-data copy once `sshd`
-//! is up.
+//! Secrets never enter `shuttle.lua`: the config carries only the CA
+//! fingerprint pin and the address. Nothing secret rides user-data at
+//! all — the one-time publish token is the only bearer it carries, and
+//! it dies at the first accepted publish.
+//!
+//! **Epic #295 interim state (by design)**: certificate issuance is
+//! sub-task 3 and the `@cert-authority` executor shape is sub-task 4 —
+//! until they land, the flow stops fail-closed at the pending store
+//! ([`publish::pending_dir`]) and [`crate::ssh_exec`] refuses the
+//! fingerprint-only pin at preflight. The fleet flow is intentionally
+//! incomplete in this window; every gap refuses by name rather than
+//! trusting anything unverified.
 
 pub mod aws;
 pub mod azure;
 pub mod gcp;
 pub mod hetzner;
+pub mod publish;
 pub mod scaleway;
 
 use std::path::{Path, PathBuf};
 
 use crate::cli::WorkersCommand;
-use crate::command::CommandRunner;
 
 /// The default shuttle binary URL the template installs: the project
 /// release artifact for the running version. Override with
@@ -182,7 +194,8 @@ fn scaleway_credentials_source() -> Option<String> {
     None
 }
 
-/// CLI entry for `shuttle workers provision` / `shuttle workers destroy`.
+/// CLI entry for `shuttle workers provision` / `shuttle workers destroy` /
+/// `shuttle workers receive-publish`.
 pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
     match command {
         WorkersCommand::Provision {
@@ -197,7 +210,6 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
             dry_run,
             file,
         } => {
-            let provisioner = provider_for(&provider)?;
             let req = ProvisionRequest {
                 server_type,
                 location,
@@ -210,29 +222,106 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
                 max_price,
                 dry_run,
                 config: PathBuf::from(&file),
+                ca_fingerprint: run_ca_fingerprint(dry_run)?,
             };
-            let workers = provisioner.provision(&req)?;
-            for w in &workers {
-                crate::output::ok(format!(
-                    "provisioned worker '{name}' — pinned {address} (host key {fingerprint}…)",
-                    name = w.name,
-                    address = w.address,
-                    fingerprint = w.host_key.chars().take(24).collect::<String>()
-                ));
-            }
-            Ok(())
+            provision_main(&provider, req, run_publish_channel(dry_run)?)
         }
         WorkersCommand::Destroy {
             provider,
             name,
             file,
         } => {
-            let provisioner = provider_for(&provider)?;
+            let provisioner = provider_for(&provider, None)?;
             let evicted = provisioner.destroy(&name, Path::new(&file))?;
             crate::output::ok(destroy_summary(&name, evicted));
             Ok(())
         }
+        WorkersCommand::ReceivePublish => receive_publish_main(),
     }
+}
+
+/// The provision verb body: dispatch the provider, run it, report the
+/// pins.
+fn provision_main(
+    provider: &str,
+    req: ProvisionRequest,
+    publish: Option<publish::PublishChannel>,
+) -> miette::Result<()> {
+    let provisioner = provider_for(provider, publish)?;
+    let workers = provisioner.provision(&req)?;
+    for w in &workers {
+        crate::output::ok(format!(
+            "provisioned worker '{name}' — pinned {address} (host CA {fingerprint}…)",
+            name = w.name,
+            address = w.address,
+            fingerprint = w.host_key.chars().take(24).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
+/// The publish channel a REAL provision runs with, resolved at this CLI
+/// boundary (`None` for a dry run: a plan makes no API call, ships no
+/// user-data, and pins nothing).
+fn run_publish_channel(dry_run: bool) -> miette::Result<Option<publish::PublishChannel>> {
+    if dry_run {
+        return Ok(None);
+    }
+    Ok(Some(publish::resolve_publish_channel()?))
+}
+
+/// The host CA fingerprint a REAL provision pins (the workers entry's
+/// mandatory `host_key` value under the amendment). `None` for a dry run.
+fn run_ca_fingerprint(dry_run: bool) -> miette::Result<Option<String>> {
+    if dry_run {
+        return Ok(None);
+    }
+    Ok(Some(resolve_ca_fingerprint()?))
+}
+
+/// The host CA's ssh-keygen fingerprint, from the ceremony home
+/// (`~/.config/shuttle/ca`): the workers pin IS this fingerprint under
+/// the amendment, so a real provision without a ceremony is a named
+/// refusal before any API call — fail-closed, never a pinless worker.
+pub fn resolve_ca_fingerprint() -> miette::Result<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    match crate::ca::inspect(&crate::command::RealRunner, Path::new(&home))? {
+        Some(info) => Ok(info.fingerprint),
+        None => Err(miette::miette!(
+            "workers provision: no host CA at {home}/.config/shuttle/ca — run 'shuttle ca \
+             keygen' first; provision pins the CA fingerprint (ADR-0045 amendment) and \
+             issuance signs with its private half"
+        )),
+    }
+}
+
+/// The `receive-publish` verb body: one guest publish from stdin, bearer
+/// token in `SHUTTLE_PUBLISH_TOKEN`. This is the transport binding any
+/// TLS-terminating front drives; the network listener itself is sub-task
+/// 3's surface (issuance).
+fn receive_publish_main() -> miette::Result<()> {
+    use std::io::Read;
+    let token = std::env::var("SHUTTLE_PUBLISH_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            miette::miette!(
+                "receive-publish: no bearer token — set SHUTTLE_PUBLISH_TOKEN (the front \
+                 that terminates the guest's POST extracts it from the Authorization header)"
+            )
+        })?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let mut payload = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut payload)
+        .map_err(|e| miette::miette!("receive-publish: cannot read the payload on stdin: {e}"))?;
+    let identity = publish::receive_publish(Path::new(&home), &token, &payload, now_epoch_secs()?)?;
+    crate::output::ok(format!(
+        "stored pending identity '{identity}' — awaiting certificate issuance \
+         (#295 sub-task 3); the flow stops here fail-closed until it lands"
+    ));
+    Ok(())
 }
 
 /// The destroy summary line. An absent managed entry is reported honestly:
@@ -246,39 +335,48 @@ fn destroy_summary(name: &str, evicted: bool) -> String {
 }
 
 /// Provider dispatch. One new provider = one module + one arm here. The
-/// operator login key resolves at this boundary (refusal names what was
-/// tried) so the provider core never reads the environment.
-fn provider_for(provider: &str) -> miette::Result<Box<dyn Provisioner>> {
+/// operator login key and the publish channel resolve at this boundary
+/// (refusal names what was tried) so the provider core never reads the
+/// environment.
+fn provider_for(
+    provider: &str,
+    publish: Option<publish::PublishChannel>,
+) -> miette::Result<Box<dyn Provisioner>> {
     match provider {
         "hetzner" => Ok(Box::new(hetzner::HetznerProvisioner::new(
             crate::command::RealRunner,
             token_from_env(),
             default_binary_url(),
             resolve_operator_key()?,
+            publish,
         ))),
         "aws" => Ok(Box::new(aws::AwsProvisioner::new(
             crate::command::RealRunner,
             aws_credentials_source(),
             default_binary_url(),
             resolve_operator_key()?,
+            publish,
         ))),
         "gcp" => Ok(Box::new(gcp::GcpProvisioner::new(
             crate::command::RealRunner,
             gcp_credentials_source(),
             default_binary_url(),
             resolve_operator_key()?,
+            publish,
         ))),
         "azure" => Ok(Box::new(azure::AzureProvisioner::new(
             crate::command::RealRunner,
             azure_credentials_source(),
             default_binary_url(),
             resolve_operator_key()?,
+            publish,
         ))),
         "scaleway" => Ok(Box::new(scaleway::ScalewayProvisioner::new(
             crate::command::RealRunner,
             scaleway_credentials_source(),
             default_binary_url(),
             resolve_operator_key()?,
+            publish,
         ))),
         other => Err(miette::miette!(
             "workers: unknown provider '{other}' (supported: hetzner, aws, gcp, azure, scaleway)"
@@ -360,6 +458,12 @@ pub struct ProvisionRequest {
     pub dry_run: bool,
     /// Path to the config file the workers entries are pinned into.
     pub config: PathBuf,
+    /// The host CA's fingerprint — the `host_key` value every provisioned
+    /// workers entry carries under the amendment (the pin-before-first-use
+    /// posture now pins the CA, not a minted public half). A real run
+    /// requires it (`None` is a named refusal before any API call; the
+    /// CLI resolves it from the ceremony home); a dry run runs without.
+    pub ca_fingerprint: Option<String>,
 }
 
 /// What a dry run reports: every value a real run would use, including the
@@ -378,7 +482,13 @@ pub struct ProvisionPlan {
     /// The `--max-price` cap when the plan is a spot plan, `None` for
     /// on-demand — the plan must show the bid the real run would place.
     pub spot_max_price: Option<String>,
-    /// SHA-256 of the exact user-data blob a real run would send.
+    /// SHA-256 of the template-shape user-data blob a real run would
+    /// send: rendered with the placeholder publish slots
+    /// ([`PLAN_MACHINE_IDENTITY`], [`PLAN_PUBLISH_TOKEN`],
+    /// [`PLAN_PUBLISH_URL`]) — the real per-server blob differs only in
+    /// those three slots (a fresh one-time token + the server name ride
+    /// each create), so the plan hash pins the template SHAPE, and a
+    /// determinism break in it is a template drift, not token noise.
     pub user_data_sha256: String,
 }
 
@@ -389,14 +499,18 @@ pub struct ProvisionedWorker {
     pub name: String,
     /// The `ssh://` address written into the workers entry.
     pub address: String,
-    /// The pinned public half (ADR-0045 Decision 4 grammar).
+    /// The pinned value (ADR-0045 amendment grammar): the host CA's
+    /// fingerprint — the same value for every worker of the operator,
+    /// which is the point (one `@cert-authority` root, not per-worker
+    /// pins).
     pub host_key: String,
 }
 
 /// One cloud provider backend.
 pub trait Provisioner {
-    /// Create servers, mint + inject + pin their host keys. All-or-nothing:
-    /// any failure after servers exist tears them down and leaves config
+    /// Create servers, let them generate + publish their host keys
+    /// guest-side, and pin the CA fingerprint. All-or-nothing: any
+    /// failure after servers exist tears them down and leaves config
     /// untouched.
     fn provision(&self, req: &ProvisionRequest) -> miette::Result<Vec<ProvisionedWorker>>;
 
@@ -407,58 +521,88 @@ pub trait Provisioner {
     fn destroy(&self, name: &str, config: &Path) -> miette::Result<bool>;
 }
 
-// ── Mint (ADR-0045 Decision 1) ──
+// ── The amendment's shared helpers (no coordinator-side mint) ──
 
-/// The minted worker host keypair: the private half rides user-data into
-/// the guest; the public half becomes the pin. Both die with the tempdir
-/// after injection — the coordinator never needs the private half again
-/// (it is a server-auth key, not a login credential).
-pub struct MintedHostKey {
-    pub private_pem: String,
-    pub public_line: String,
-}
+/// The dry-run placeholder for the per-server machine identity slot. The
+/// real blob differs only in this slot (+ token + URL) — see
+/// [`ProvisionPlan::user_data_sha256`].
+pub const PLAN_MACHINE_IDENTITY: &str = "<server-name-minted-at-create>";
 
-/// Mint an ed25519 host keypair via `ssh-keygen` through the command seam.
-/// The keypair lives entirely in `dir` (a tempdir the caller owns).
-pub fn mint_host_keypair(runner: &dyn CommandRunner, dir: &Path) -> miette::Result<MintedHostKey> {
-    let seed = dir.join("worker_host_ed25519");
-    let seed_str = seed.to_string_lossy().into_owned();
-    let argv = vec![
-        "ssh-keygen".to_string(),
-        "-t".to_string(),
-        "ed25519".to_string(),
-        "-N".to_string(),
-        String::new(),
-        "-C".to_string(),
-        "shuttle-worker-host-key".to_string(),
-        "-f".to_string(),
-        seed_str,
-    ];
-    let out = runner.run(&argv).map_err(|e| {
-        miette::miette!("provision: cannot run ssh-keygen (is openssh-client installed?): {e}")
-    })?;
-    if crate::command::exit_code(&out) != 0 {
-        return Err(miette::miette!(
-            "provision: ssh-keygen failed: {}",
-            out.stderr.trim()
-        ));
-    }
-    let private_pem = std::fs::read_to_string(&seed)
-        .map_err(|e| miette::miette!("provision: minted host key is unreadable: {e}"))?;
-    let public_line = std::fs::read_to_string(seed.with_file_name("worker_host_ed25519.pub"))
-        .map_err(|e| miette::miette!("provision: minted host public key is unreadable: {e}"))?;
-    Ok(MintedHostKey {
-        private_pem: private_pem.trim_end().to_string(),
-        public_line: public_line.trim_end().to_string(),
+/// The dry-run placeholder for the one-time publish token slot.
+pub const PLAN_PUBLISH_TOKEN: &str = "<one-time-publish-token-minted-at-create>";
+
+/// The dry-run placeholder for the callback URL slot.
+pub const PLAN_PUBLISH_URL: &str = "<publish-url>";
+
+/// The CA pin every provisioned entry carries, fail-closed: a real run
+/// with no resolved fingerprint is a named refusal BEFORE any API call —
+/// never a pinless worker.
+pub fn require_ca_pin(req: &ProvisionRequest) -> miette::Result<&str> {
+    req.ca_fingerprint.as_deref().ok_or_else(|| {
+        miette::miette!(
+            "provision: no host CA fingerprint on the request — the workers pin IS the CA \
+             fingerprint now (ADR-0045 amendment); run 'shuttle ca keygen' first"
+        )
     })
 }
 
-/// Stage the user-data blob for the provider's create call INSIDE the mint
-/// tempdir (`dir`), mode 0600. The blob carries the minted private host
-/// half (server-auth, blast radius one machine per ADR-0045), so it must
-/// never sit at a fixed world-readable temp path: the per-run tempdir
-/// keeps concurrent provisions isolated, 0600 keeps it private while it
-/// exists, and it dies with the keypair when the tempdir drops.
+/// The publish channel a real run uses, fail-closed: without it the
+/// guest cannot publish and no certificate can ever issue.
+pub fn require_publish(
+    publish: &Option<publish::PublishChannel>,
+) -> miette::Result<&publish::PublishChannel> {
+    publish.as_ref().ok_or_else(|| {
+        miette::miette!(
+            "provision: no publish channel — a real provision needs SHUTTLE_PUBLISH_URL \
+             (the coordinator endpoint the guest publishes its public host half to)"
+        )
+    })
+}
+
+/// The coordinator-side values every per-server create carries: the
+/// publish channel (one-time token mint + registry home) and the CA pin
+/// the workers entries get. One bundle, because the create paths hand
+/// them through together.
+pub struct PinPlan<'a> {
+    pub publish: &'a publish::PublishChannel,
+    pub ca_pin: &'a str,
+}
+
+/// One machine's publish prep + staged user-data, shared by every
+/// provider: machine identity = the coordinator-assigned server name, a
+/// fresh one-time publish token recorded in the coordinator's registry
+/// BEFORE the create call (the token must be enforceable by first boot),
+/// the blob rendered from the shared template and staged 0600 inside the
+/// provision tempdir. Returns the staged path; the caller removes it once
+/// its create call has served it — the one-time bearer must not linger
+/// on disk past the create.
+pub fn stage_publishing_user_data(
+    staging: &Path,
+    publish: &publish::PublishChannel,
+    binary_url: &str,
+    operator_key: &str,
+    machine_identity: &str,
+    ttl_expiry_epoch: u64,
+) -> miette::Result<PathBuf> {
+    let token = publish::mint_publish_token()?;
+    publish::record_issue(&publish.home, &token, machine_identity, now_epoch_secs()?)?;
+    let user_data = render_user_data(&UserDataParams {
+        machine_identity,
+        publish_url: &publish.url,
+        publish_token: &token,
+        operator_key,
+        binary_url,
+        ttl_expiry_epoch,
+    });
+    stage_user_data(staging, &user_data)
+}
+
+/// Stage the user-data blob for the provider's create call INSIDE the
+/// provision tempdir (`dir`), mode 0600. No private half rides the blob
+/// anymore — but the one-time publish token does, so the same hygiene
+/// stays: the per-run tempdir keeps concurrent provisions isolated, 0600
+/// keeps it private while it exists, and the staged file is removed
+/// right after its create call.
 pub fn stage_user_data(dir: &Path, user_data: &str) -> miette::Result<PathBuf> {
     let path = dir.join("user-data.yaml");
     std::fs::write(&path, user_data)
@@ -569,16 +713,24 @@ pub const SQUASHFS_TOOLS_SHA256: &str =
     "91c49f9a1ed972ad00688a38222119e2baf49ba74cf5fda05729a79d7d59d335";
 
 /// Everything the template needs. Nothing here is optional: a provision
-/// without a pin, a login key, or a TTL is not a shuttle worker.
+/// without a CA pin, a login key, a TTL, or a publish channel is not a
+/// shuttle worker. NOTE: there is no host-key slot — the guest generates
+/// its own keypair (ADR-0045 amendment); only public material and the
+/// one-time bearer cross user-data.
 pub struct UserDataParams<'a> {
-    /// The minted PRIVATE host key (ADR-0045 D1: injected through the
-    /// provider's authenticated channel, written 0600, scrubbed after
-    /// sshd starts).
-    pub host_private_key: &'a str,
-    /// The minted PUBLIC host key line.
-    pub host_public_key: &'a str,
+    /// The coordinator-assigned machine identity (the provider-side
+    /// server name) — the principal-binding name the pending store files
+    /// the published key under.
+    pub machine_identity: &'a str,
+    /// The coordinator publish callback URL the guest POSTs to
+    /// (single-line http(s), validated at the CLI boundary).
+    pub publish_url: &'a str,
+    /// The one-time publish token minted for THIS machine at create
+    /// time — consumed by the first accepted publish, refused on replay
+    /// ([`publish::receive_publish`]).
+    pub publish_token: &'a str,
     /// The operator's authorized public-key line — how the operator logs
-    /// in (never the host key).
+    /// in (never the host key; this flow is untouched by the amendment).
     pub operator_key: &'a str,
     /// The pinned shuttle binary URL cloud-init installs.
     pub binary_url: &'a str,
@@ -589,35 +741,78 @@ pub struct UserDataParams<'a> {
     pub ttl_expiry_epoch: u64,
 }
 
-/// Render the shared cloud-init user-data (ADR-0045 D1): the minted host
-/// keypair lands in `/etc/ssh` (0600) before the ssh module runs
-/// (`ssh_deletekeys: false` keeps cloud-init from regenerating it), the
-/// operator authorized key grants login, the TTL marker is stamped as the
-/// in-guest fallback COPY of the `shuttle-worker-ttl` label (the sweep's
-/// source of truth), the worker tool pins are installed (#273: distro
-/// bwrap + ca-certificates + curl, then the pinned squashfs-tools built
-/// from source to /usr/local/bin with its version asserted), the pinned
-/// shuttle binary is installed, sshd is hardened (key-only, root login by
-/// key), and the guest's copy of this very blob is scrubbed once sshd is
-/// up — the metadata service keeps serving user-data indefinitely, so the
-/// private half must not linger there.
+/// The first-boot publish script the template drops at
+/// `/etc/shuttle/publish-host-key.sh` (0700): read the GUEST-GENERATED
+/// public half, embed it with the machine identity and the cloud-init
+/// normalized instance-data document (the provider instance-identity
+/// content the certificate principal binds — ADR-0045 Decision 3) into
+/// one JSON payload, and POST it with the one-time bearer. Fire-and-
+/// forget with bounded retries: a coordinator that is not (yet) up never
+/// bricks the boot — it just means no issuance, and the TTL sweep
+/// reclaims the worker (fail-closed: nothing pins a key that never
+/// published).
+const PUBLISH_SCRIPT: &str = r#"#!/bin/sh
+# ADR-0045 amendment (#295): publish the guest-generated PUBLIC host half
+# to the coordinator. Public material only; authenticated by the one-time
+# token carried in publish.env. No private half ever exists off this
+# machine.
+set -eu
+. /etc/shuttle/publish.env
+PUB=$(tr -d '"\\' < /etc/ssh/ssh_host_ed25519_key.pub)
+if [ ! -s /run/cloud-init/instance-data.json ]; then
+  echo "publish-host-key: no cloud-init instance-data — the certificate principal would bind nothing; skipping publish (fail-closed)" >&2
+  exit 0
+fi
+IID=$(cat /run/cloud-init/instance-data.json)
+BODY=$(printf '{"machine_identity":"%s","public_key":"%s","instance_identity":%s}' "$MACHINE_IDENTITY" "$PUB" "$IID")
+i=0
+while [ "$i" -lt 10 ]; do
+  if printf '%s' "$BODY" | curl -fsS -m 30 \
+      -H "Authorization: Bearer $PUBLISH_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data-binary @- "$PUBLISH_URL"; then
+    exit 0
+  fi
+  i=$((i + 1))
+  sleep 4
+done
+echo "publish-host-key: coordinator unreachable after 10 attempts — without the publish no certificate issues; the TTL sweep reclaims this worker" >&2
+exit 0
+"#;
+
+/// The shell-sourceable env file the publish script reads (0600): the
+/// three per-machine slots, single-quoted (the CLI boundary refuses
+/// values that would break out of the quotes).
+fn publish_env(p: &UserDataParams<'_>) -> String {
+    format!(
+        "MACHINE_IDENTITY='{id}'\nPUBLISH_URL='{url}'\nPUBLISH_TOKEN='{token}'\n",
+        id = p.machine_identity,
+        url = p.publish_url,
+        token = p.publish_token
+    )
+}
+
+/// Render the shared cloud-init user-data (ADR-0045 amendment): the guest
+/// GENERATES its host keypair on first boot (`ssh_deletekeys: true` +
+/// `ssh_genkey: true`, explicit — guest-local generation is the security
+/// property, never a default relied on), the operator authorized key
+/// grants login (untouched by the amendment), the TTL marker is stamped
+/// as the in-guest fallback COPY of the `shuttle-worker-ttl` label (the
+/// sweep's source of truth), the worker tool pins are installed (#273),
+/// the pinned shuttle binary is installed, sshd is hardened (key-only,
+/// root login by key) — and the first-boot publish script drops the
+/// PUBLIC half plus instance identity to the coordinator over the
+/// one-time token. The old post-sshd user-data scrub is GONE: it existed
+/// to scrub an injected private half; nothing sensitive ships anymore
+/// (ADR-0045 amendment: the scrub step is dead code and is removed).
 pub fn render_user_data(p: &UserDataParams<'_>) -> String {
     let mut s = String::from("#cloud-config\n");
-    // cloud-init's ssh module must not delete/regenerate the injected key.
-    s.push_str("ssh_deletekeys: false\n");
+    // Guest-local generation, explicit: cloud-init's ssh module generates
+    // a fresh ed25519 keypair on THIS machine at first boot. The private
+    // half never exists coordinator-side and never crosses user-data.
+    s.push_str("ssh_deletekeys: true\n");
+    s.push_str("ssh_genkey: true\n");
     s.push_str("write_files:\n");
-    write_file(
-        &mut s,
-        "/etc/ssh/ssh_host_ed25519_key",
-        "0600",
-        p.host_private_key,
-    );
-    write_file(
-        &mut s,
-        "/etc/ssh/ssh_host_ed25519_key.pub",
-        "0644",
-        p.host_public_key,
-    );
     write_file(&mut s, "/root/.ssh/authorized_keys", "0600", p.operator_key);
     write_file(
         &mut s,
@@ -625,12 +820,20 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
         "0644",
         &p.ttl_expiry_epoch.to_string(),
     );
+    write_file(&mut s, "/etc/shuttle/publish.env", "0600", &publish_env(p));
+    write_file(
+        &mut s,
+        "/etc/shuttle/publish-host-key.sh",
+        "0700",
+        PUBLISH_SCRIPT,
+    );
     s.push_str("runcmd:\n");
     // Pin 2 first: the distro packages every later step needs — bwrap
     // (it ships its own AppArmor profile, so the current Ubuntu LTS
     // userns restriction does not break it; the hardening stays, and
     // `apparmor_restrict_unprivileged_userns` is NEVER touched here),
-    // plus the toolchain pin 1 builds against.
+    // plus the toolchain pin 1 builds against — and curl, which the
+    // publish step (last runcmd) drives.
     s.push_str("  - apt-get update\n");
     s.push_str(
         "  - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -650,15 +853,9 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
          > /etc/ssh/sshd_config.d/99-shuttle-worker.conf\n",
     );
     s.push_str("  - systemctl restart ssh || systemctl restart sshd\n");
-    // ADR-0045 D1: scrub the user-data blob once sshd serves the injected
-    // key. NOTE (ADR-0045 addendum, 2026-09-28): this removes only the local
-    // copy — Hetzner's metadata service serves the create-time blob for the
-    // life of the server and re-serves it on rebuild; the private half must
-    // be assumed recoverable in-guest for the machine's lifetime. See the
-    // ADR addendum and the generate-and-publish proposal (#283).
-    s.push_str(
-        "  - sh -c 'rm -f /var/lib/cloud/instances/*/user-data.txt /var/lib/cloud/instance/user-data.txt'\n",
-    );
+    // The publish: last runcmd (final stage — after the ssh module has
+    // generated the host keys and the network is up).
+    s.push_str("  - /etc/shuttle/publish-host-key.sh\n");
     s
 }
 
