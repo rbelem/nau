@@ -330,7 +330,9 @@ gated_test!(verify_image_refuses_a_wrong_device_by_name, {
     let (code, _stdout, stderr) = run_verify(&fx);
     assert_ne!(code, Some(0), "a wrong device must refuse");
     assert!(
-        stderr.contains("root slot PARTUUID mismatch"),
+        // The message head — always on the first render line, before any
+        // miette wrapping — names the identity mismatch.
+        stderr.contains("no root slot partition carries"),
         "refusal names the mismatch: {stderr}"
     );
 });

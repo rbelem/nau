@@ -729,6 +729,15 @@ pub enum Command {
         #[arg(long)]
         key: Option<String>,
 
+        /// Which slot's regions to verify: `a`, `b`, or `auto` (the
+        /// default). The manifest signs a generation, not a slot — auto
+        /// locates it wherever it sits (the post-sysupdate case: the new
+        /// manifest verifies the slot sysupdate filled); `a`/`b` demand
+        /// the physical slot (the build writes slot B contiguous behind
+        /// slot A) and refuse by name when the generation sits elsewhere.
+        #[arg(long, value_enum, default_value = "auto")]
+        slot: crate::image::SlotSelector,
+
         /// Output structured JSON instead of human-friendly output.
         #[arg(long)]
         json: bool,

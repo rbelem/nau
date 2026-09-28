@@ -120,10 +120,11 @@ fn main() -> miette::Result<()> {
             device,
             manifest,
             key,
+            slot,
             json,
         } => {
             shuttle::output::set_mode(json);
-            cmd_verify_image(&device, &manifest, key.as_deref(), json)
+            cmd_verify_image(&device, &manifest, key.as_deref(), slot, json)
         }
 
         Command::Deps(sub) => match sub {
@@ -2076,12 +2077,14 @@ fn cmd_verify_image(
     device: &str,
     manifest: &str,
     key: Option<&str>,
+    slot: shuttle::image::SlotSelector,
     json: bool,
 ) -> miette::Result<()> {
     let args = shuttle::image::VerifyImageArgs {
         device: PathBuf::from(device),
         manifest: PathBuf::from(manifest),
         key: key.map(PathBuf::from),
+        slot,
     };
     let outcome = shuttle::image::verify_device(&shuttle::command::RealRunner, &args)?;
     if json {
@@ -2089,6 +2092,7 @@ fn cmd_verify_image(
             "command": "verify-image",
             "device": device,
             "manifest": manifest,
+            "slot": outcome.slot,
             "image": format!("{} {}", outcome.image_name, outcome.image_version),
             "verified_key_id": outcome.verified_key_id,
             "roothash": outcome.roothash,
@@ -2102,10 +2106,11 @@ fn cmd_verify_image(
         );
     } else {
         shuttle::output::ok(format!(
-            "verified '{}' {} — slot A root ({}) over hash ({}) recomputes to the \
+            "verified '{}' {} — slot {} root ({}) over hash ({}) recomputes to the \
              manifest roothash, under key {}",
             outcome.image_name,
             outcome.image_version,
+            outcome.slot,
             outcome.root_partuuid,
             outcome.hash_partuuid,
             outcome.verified_key_id
