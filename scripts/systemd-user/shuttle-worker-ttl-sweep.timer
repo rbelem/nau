@@ -1,0 +1,15 @@
+# shuttle-worker-ttl-sweep.timer — daily workstation user timer (ticket #269).
+# 05:45 to stagger after the zet daily update (05:30, same workstation).
+# Persistent: catches up a missed run after downtime — a missed sweep is a
+# silently open safety net. Randomized delay: avoid a thundering herd.
+
+[Unit]
+Description=Run shuttle-worker-ttl-sweep daily at 05:45
+
+[Timer]
+OnCalendar=*-*-* 05:45:00
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,30 @@
+# shuttle-worker-ttl-sweep.service — oneshot worker TTL sweep (ticket #269).
+# Installed as a systemd USER unit on the workstation (the hcloud token and
+# worker SSH key live only here — cf. the zet update-timer.yml convention).
+#
+# Ships in DRY-RUN (no --enforce): destroy-track servers (TTL label past
+# due; or label+marker unusable with server age past the 72h floor) are
+# logged WOULD-DESTROY and nothing is destroyed. 48h-floor servers fire
+# ALERT lines (and the hook, if set) with no destroy. The enforce flip —
+# two weeks after the first real #194 provision — is an operator act:
+#   mkdir -p ~/.config/shuttle
+#   echo SHUTTLE_SWEEP_ENFORCE=1 >> ~/.config/shuttle/worker-ttl-sweep.env
+#   systemctl --user daemon-reload
+# (Optional, once the alert destination is decided — the command string
+# gets the one-line alert summary as "$1":)
+#   echo "SHUTTLE_SWEEP_ALERT_CMD='curl -s --data-binary \"\$1\" https://kuma/push/TOKEN'" \
+#     >> ~/.config/shuttle/worker-ttl-sweep.env
+# The script fails loud (nonzero + ALERT line in the journal) on any hcloud
+# API failure and on 48h-floor servers, so `systemctl --user list-timers` +
+# journalctl are the watch surface until hook routing lands.
+
+[Unit]
+Description=Shuttle worker TTL sweep — hcloud safety net for forgotten workers (#269)
+
+[Service]
+Type=oneshot
+# %h = user home; the script is POSIX sh with its own shebang.
+ExecStart=%h/Workspace/github.com/rbelem/shuttle/scripts/shuttle-worker-ttl-sweep
+# Optional operator config: SHUTTLE_SWEEP_ENFORCE=1, SHUTTLE_SWEEP_ALERT_CMD.
+# The leading `-` makes the file optional (dry-run needs nothing).
+EnvironmentFile=-%h/.config/shuttle/worker-ttl-sweep.env

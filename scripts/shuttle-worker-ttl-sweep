@@ -1,0 +1,333 @@
+#!/bin/sh
+# shuttle-worker-ttl-sweep — workstation hcloud safety net for forgotten
+# shuttle workers (ticket #269; .planning/server-infra-plan.md decision 6,
+# v2 match rules).
+#
+# Runs as a daily workstation systemd user timer. Catches workers left
+# renting by a crashed `shuttle workers destroy`, a lost SSH path, or a
+# dead workstation mid-TTL.
+#
+# Match rules, in order, for every hcloud server labeled `shuttle-worker`:
+#   1. `shuttle-worker-ttl` label present and parseable (epoch seconds):
+#        expiry <= now → destroy track; expiry in the future → ALIVE.
+#   2. Label absent/unparseable, marker copy usable (see contract):
+#        copy past due → destroy track; copy in the future → ALIVE.
+#   3. Neither usable — server-age floor:
+#        age >= 72h → destroy track; age >= 48h → ALERT, no destroy;
+#        younger → ALIVE (cloud-init may not have stamped anything yet).
+#   The v1 three-condition match (destroy only on a parseable marker)
+#   inverted the risk: the forgotten VM is precisely the one whose marker
+#   never got written. The age floor is the leak-case backstop; a destroy
+#   NEVER waits on the marker.
+#
+# Cross-lane contract (shared with the #194 provisioner, per the plan):
+#   - hcloud label `shuttle-worker-ttl` = expiry, VALUE IN EPOCH SECONDS
+#     (UTC). Hetzner label values reject `:`, so ISO-8601 will not fit.
+#     Set at create time; the label is the source of truth.
+#   - The in-guest marker file /etc/shuttle/worker-ttl is a COPY: single
+#     line, epoch seconds. Read over SSH only when the label is
+#     missing/unparseable. Any parseable FUTURE value is alive.
+#   Missing/unparseable values never widen into a destroy — they fall to
+#   the next rule, never straight to `server delete`.
+#
+# Volume assertion: every destroy-track run requires
+# `hcloud volume list --server X` to be EMPTY (a detached volume outlives
+# its server and bills silently). Non-empty or API-failed → destroy is
+# BLOCKED, alert fired, no delete.
+#
+# Dry-run is the DEFAULT: destroy-track servers are logged WOULD-DESTROY
+# and nothing is touched. `--enforce` (or SHUTTLE_SWEEP_ENFORCE=1 in the
+# unit's EnvironmentFile) performs real deletes; the flip — two weeks
+# after the first real #194 provision — is an operator act.
+#
+# Fail loud: any hcloud API failure — or any binary missing — fires an
+# ALERT (stderr → journal) and exits nonzero. A silently skipped sweep
+# is the exact failure this net exists to catch. Optional hook:
+# SHUTTLE_SWEEP_ALERT_CMD is a SHELL COMMAND STRING evaluated once PER
+# ALERT (a sweep may fire several) with the one-line summary as "$1" —
+# e.g. SHUTTLE_SWEEP_ALERT_CMD='curl -s --data-binary "$1" https://kuma/push/TOKEN'.
+# No routing is built in; the alert destination is a pending operator
+# decision (plan: the kuma push monitor). Floor alerts at 48h also fire
+# the hook and fail the run — they are the sound of a lease with no TTL
+# paper trail.
+#
+# Knobs (env):
+#   SHUTTLE_SWEEP_ENFORCE      1 → real deletes (same as --enforce)
+#   SHUTTLE_SWEEP_ALERT_CMD    alert hook (see above)
+#   SHUTTLE_SWEEP_SSH          ssh binary      (default: ssh)
+#   SHUTTLE_SWEEP_SSH_OPTS     ssh options     (default: BatchMode, 10s connect timeout, accept-new host keys)
+#   SHUTTLE_SWEEP_SSH_USER     guest ssh user  (default: root)
+#   SHUTTLE_SWEEP_MARKER_PATH  in-guest marker (default: /etc/shuttle/worker-ttl)
+#   SHUTTLE_SWEEP_HCLOUD       hcloud binary   (default: hcloud)
+#
+# hcloud CLI interface used (fake-able via SHUTTLE_SWEEP_HCLOUD):
+#   server list    --label-selector LABEL -o columns=name
+#   server describe NAME -o format='{{.Created.Unix}} {{.PublicNet.IPv4.IP}} {{index .Labels "KEY"}}'
+#   volume list    --server NAME -o columns=id        (must print nothing)
+#   server delete  NAME
+#
+# Dependencies: POSIX sh; GNU/BusyBox `date` (epoch `now` only — every
+# other value in play is already epoch seconds, no date parsing); ssh;
+# hcloud CLI.
+
+set -eu
+
+LABEL=shuttle-worker
+TTL_LABEL=shuttle-worker-ttl
+AGE_ALERT_H=48
+AGE_DESTROY_H=72
+MARKER_PATH=${SHUTTLE_SWEEP_MARKER_PATH:-/etc/shuttle/worker-ttl}
+SSH_BIN=${SHUTTLE_SWEEP_SSH:-ssh}
+SSH_USER=${SHUTTLE_SWEEP_SSH_USER:-root}
+# NOTE: `:--o ...` — the default value itself starts with a dash.
+SSH_OPTS=${SHUTTLE_SWEEP_SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new}
+HCLOUD_BIN=${SHUTTLE_SWEEP_HCLOUD:-hcloud}
+DESCRIBE_FMT="{{.Created.Unix}} {{.PublicNet.IPv4.IP}} {{index .Labels \"$TTL_LABEL\"}}"
+
+n_total=0
+n_alive=0
+n_due=0
+n_destroyed=0
+n_blocked=0
+n_floor=0
+n_api=0
+floor_names=
+blocked_names=
+api_names=
+DRY_RUN=1
+
+log() {
+    printf '[shuttle-worker-ttl-sweep] %s\n' "$*"
+} >&2
+
+alert_log() {
+    printf '[shuttle-worker-ttl-sweep] ALERT: %s\n' "$*"
+} >&2
+
+usage() {
+    cat <<'EOF'
+usage: shuttle-worker-ttl-sweep [--dry-run|--enforce]
+
+Sweeps hcloud servers labeled `shuttle-worker` and destroys those past
+due on the v2 rules: parseable `shuttle-worker-ttl` label past due, or —
+label/marker both unusable — server age past the 48h alert / 72h destroy
+floor. Every destroy requires `hcloud volume list --server X` empty.
+Dry-run is the default; --enforce (or SHUTTLE_SWEEP_ENFORCE=1) performs
+real deletes. See the script header for env knobs and the label/marker
+contract.
+EOF
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --enforce) DRY_RUN=0 ;;
+            --dry-run) DRY_RUN=1 ;;
+            -h | --help) usage; return 0 ;;
+            *) printf 'usage error: unknown argument: %s\n' "$1" >&2; usage >&2; return 2 ;;
+        esac
+        shift
+    done
+    return 0
+}
+
+# is_epoch TEXT → rc 0 iff TEXT is a non-empty decimal epoch string.
+is_epoch() {
+    case ${1:-} in
+        '' | *[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# fetch_marker IPV4 → marker text on stdout; nonzero rc if unreadable.
+fetch_marker() {
+    "$SSH_BIN" $SSH_OPTS "$SSH_USER@$1" cat -- "$MARKER_PATH" 2>/dev/null
+}
+
+# first_line TEXT → first non-empty, whitespace-trimmed line ("" if none).
+first_line() {
+    printf '%s\n' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' | head -n 1
+}
+
+# fire_alert MESSAGE → ALERT line to stderr (journal) and, when set, the
+# SHUTTLE_SWEEP_ALERT_CMD hook once per alert, with MESSAGE as "$1".
+fire_alert() {
+    alert_log "$1"
+    if [ -n "${SHUTTLE_SWEEP_ALERT_CMD:-}" ]; then
+        if ! sh -c "$SHUTTLE_SWEEP_ALERT_CMD" shuttle-sweep-alert "$1"; then
+            alert_log "alert hook (SHUTTLE_SWEEP_ALERT_CMD) exited nonzero"
+        fi
+    fi
+}
+
+# due_track NAME REASON — the destroy track: volume assertion, then the
+# dry-run log or the real delete. Never called without a positive expiry
+# signal (label epoch, marker-copy epoch, or the 72h age floor).
+due_track() {
+    d_name=$1
+    d_reason=$2
+    n_due=$((n_due + 1))
+
+    if ! d_vol=$("$HCLOUD_BIN" volume list --server "$d_name" -o columns=id 2>/dev/null); then
+        n_api=$((n_api + 1))
+        api_names="$api_names $d_name(volume-list)"
+        fire_alert "hcloud volume list failed for $d_name — destroy BLOCKED (fail loud)"
+        return 0
+    fi
+    if [ -n "$d_vol" ]; then
+        n_blocked=$((n_blocked + 1))
+        blocked_names="$blocked_names $d_name"
+        fire_alert "$d_name: volume(s) still attached, destroy BLOCKED — detach/delete them first: $d_vol"
+        return 0
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "WOULD-DESTROY: $d_name ($d_reason) — dry-run, no action"
+        return 0
+    fi
+
+    if ! "$HCLOUD_BIN" server delete "$d_name"; then
+        n_api=$((n_api + 1))
+        api_names="$api_names $d_name(delete)"
+        fire_alert "hcloud server delete failed for $d_name"
+        return 0
+    fi
+    n_destroyed=$((n_destroyed + 1))
+    log "DESTROYED: $d_name ($d_reason)"
+}
+
+sweep_server() {
+    s_name=$1
+    n_total=$((n_total + 1))
+
+    if ! s_desc=$("$HCLOUD_BIN" server describe "$s_name" -o "format=$DESCRIBE_FMT" 2>/dev/null); then
+        n_api=$((n_api + 1))
+        api_names="$api_names $s_name(describe)"
+        fire_alert "hcloud server describe failed for $s_name"
+        return 0
+    fi
+    s_created=${s_desc%% *}
+    s_rest=${s_desc#* }
+    s_ip=${s_rest%% *}
+    case $s_rest in
+        *\ *) s_ttl=${s_rest#* } ;;
+        *) s_ttl= ;;
+    esac
+    if ! is_epoch "$s_created" || [ -z "$s_ip" ]; then
+        n_api=$((n_api + 1))
+        api_names="$api_names $s_name(describe-garbage)"
+        fire_alert "unparseable hcloud describe output for $s_name: $s_desc"
+        return 0
+    fi
+
+    s_now=$(date -u +%s)
+    s_age_h=$(((s_now - s_created) / 3600))
+
+    # Rule 1: the TTL label is the source of truth.
+    if is_epoch "$s_ttl"; then
+        if [ "$s_ttl" -le "$s_now" ]; then
+            due_track "$s_name" "TTL label past due"
+        else
+            n_alive=$((n_alive + 1))
+            log "ALIVE: $s_name (TTL label in the future)"
+        fi
+        return 0
+    fi
+    if [ -n "$s_ttl" ]; then
+        log "LABEL-INVALID: $s_name — TTL label not epoch seconds, falling back to the marker copy"
+    fi
+
+    # Rule 2: the in-guest marker copy.
+    s_ts=
+    if s_marker=$(fetch_marker "$s_ip"); then
+        s_ts=$(first_line "$s_marker")
+    fi
+    if is_epoch "$s_ts"; then
+        if [ "$s_ts" -le "$s_now" ]; then
+            due_track "$s_name" "no TTL label; marker copy past due"
+        else
+            n_alive=$((n_alive + 1))
+            log "ALIVE: $s_name (no TTL label; marker copy in the future)"
+        fi
+        return 0
+    fi
+
+    # Rule 3: server-age floor — the marker-never-written leak case.
+    if [ "$s_age_h" -ge "$AGE_DESTROY_H" ]; then
+        due_track "$s_name" "no usable TTL, age ${s_age_h}h past the ${AGE_DESTROY_H}h floor"
+        return 0
+    fi
+    if [ "$s_age_h" -ge "$AGE_ALERT_H" ]; then
+        n_floor=$((n_floor + 1))
+        floor_names="$floor_names $s_name(${s_age_h}h)"
+        fire_alert "$s_name: no usable TTL, age ${s_age_h}h past the ${AGE_ALERT_H}h alert floor (destroy at ${AGE_DESTROY_H}h)"
+        return 0
+    fi
+    n_alive=$((n_alive + 1))
+    log "ALIVE: $s_name (no usable TTL; age ${s_age_h}h below the ${AGE_ALERT_H}h floor)"
+}
+
+check_bins() {
+    if ! command -v "$HCLOUD_BIN" >/dev/null 2>&1; then
+        fire_alert "hcloud binary not found: $HCLOUD_BIN — sweep cannot run"
+        return 1
+    fi
+    if ! command -v "$SSH_BIN" >/dev/null 2>&1; then
+        fire_alert "ssh binary not found: $SSH_BIN — sweep cannot run"
+        return 1
+    fi
+    return 0
+}
+
+# fetch_servers → SERVERS global (one server name per line); nonzero rc
+# on API failure.
+fetch_servers() {
+    if ! SERVERS=$("$HCLOUD_BIN" server list --label-selector "$LABEL" -o columns=name 2>/dev/null); then
+        fire_alert "hcloud server list failed — sweep skipped, NO server evaluated"
+        return 1
+    fi
+    return 0
+}
+
+finish() {
+    if [ "$DRY_RUN" -eq 1 ]; then mode=dry-run; else mode=ENFORCE; fi
+    log "sweep summary: $n_total labeled, $n_alive alive, $n_due destroy-track, $n_destroyed destroyed, $n_blocked volume-blocked, $n_floor floor-alerted, $n_api api-failed (mode: $mode)"
+
+    rc=0
+    if [ "$n_floor" -gt 0 ]; then
+        rc=1
+        log "floor alerts ($n_floor):$floor_names — no usable TTL, watch until the ${AGE_DESTROY_H}h floor"
+    fi
+    if [ "$n_blocked" -gt 0 ]; then
+        rc=1
+        fire_alert "$n_blocked volume-blocked destroy(s):$blocked_names — nothing deleted"
+    fi
+    if [ "$n_api" -gt 0 ]; then
+        rc=1
+        fire_alert "$n_api hcloud API failure(s):$api_names"
+    fi
+    return "$rc"
+}
+
+main() {
+    if [ "${SHUTTLE_SWEEP_ENFORCE:-}" = "1" ]; then DRY_RUN=0; fi
+    parse_args "$@" || return $?
+    check_bins || return 1
+    fetch_servers || return 1
+
+    if [ -z "$SERVERS" ]; then
+        log "no servers labeled $LABEL — nothing to sweep"
+        return 0
+    fi
+
+    while read -r w_name; do
+        if [ -z "$w_name" ]; then continue; fi
+        sweep_server "$w_name"
+    done <<EOF
+$SERVERS
+EOF
+
+    finish
+}
+
+main "$@"
