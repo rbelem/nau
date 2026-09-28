@@ -17,6 +17,11 @@
 //!   attached.
 //! - `SHA256SUMS` — coreutils-format (`<sha256>␠␠<name>`), one line per
 //!   media file, deterministic order.
+//! - `SHA256SUMS.gpg` (#267) — the detached OpenPGP signature over the
+//!   SHA256SUMS manifest, signed by the ceremony key's sysupdate
+//!   identity: what systemd-sysupdate's `Verify=yes` checks at update
+//!   time against the base rootfs's embedded
+//!   `/usr/lib/systemd/import-pubring.pgp`.
 //!
 //! # The signature scheme (must interoperate with `shuttle verify-image`)
 //!
@@ -30,6 +35,10 @@
 //! ADR-0024 §4 anchor policy (revoked-first, then ANY of `--key` +
 //! `~/.config/shuttle/keys/*.pub`). Tests pin the sign→verify round-trip
 //! through that exact seam.
+//!
+//! The SHA256SUMS signature is deliberately NOT part of that scheme
+//! family: systemd-sysupdate enforces it itself (OpenPGP, raw bytes — no
+//! canonicalization), via [`crate::sign::sign_sysupdate_manifest`].
 //!
 //! # The baked-in release checklist (ADR-0044 D8)
 //!
@@ -140,20 +149,52 @@ pub(crate) fn publish_with(
     let manifest_name = format!("{stem}.manifest.json");
     let manifest_json = write_published_manifest(dir, manifest, &kp, &manifest_name)?;
 
-    // SHA256SUMS over the media set (never over itself), sorted names —
-    // coreutils `sha256sum -c` compatible: `<hex>␠␠<name>`.
-    let img_name = img
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| miette::miette!("release image {} has no file name", img.display()))?;
-    let sums_path = dir.join("SHA256SUMS");
-    let sums_body = sha256sums_body(img, &img_name, manifest_json.as_bytes(), &manifest_name)?;
-    std::fs::write(&sums_path, &sums_body)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("writing {}", sums_path.display()))?;
+    // The media file name for the report + the sums body (the file name
+    // must exist — the sums cover the image bytes).
+    let img_name = media_file_name(img)?;
+    write_sums_and_signature(
+        dir,
+        img,
+        &img_name,
+        manifest_json.as_bytes(),
+        &manifest_name,
+        &kp,
+    )?;
 
     report_media_set(dir, &img_name, &manifest_name, &kp);
     Ok(())
+}
+
+/// The published image's media-set file name (the sums cover it by this
+/// exact name).
+fn media_file_name(img: &Path) -> miette::Result<String> {
+    img.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| miette::miette!("release image {} has no file name", img.display()))
+}
+
+/// Write `SHA256SUMS` + its detached OpenPGP signature
+/// ([`crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME`], #267) under
+/// `dir`, returning the sums body the signature covers.
+fn write_sums_and_signature(
+    dir: &Path,
+    img: &Path,
+    img_name: &str,
+    manifest_json: &[u8],
+    manifest_name: &str,
+    kp: &crate::sign::KeyPair,
+) -> miette::Result<String> {
+    let sums_body = sha256sums_body(img, img_name, manifest_json, manifest_name)?;
+    let sums_path = dir.join("SHA256SUMS");
+    std::fs::write(&sums_path, &sums_body)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("writing {}", sums_path.display()))?;
+    let sums_sig = crate::sign::sign_sysupdate_manifest(kp, sums_body.as_bytes())?;
+    let sums_sig_path = dir.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
+    std::fs::write(&sums_sig_path, &sums_sig)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("writing {}", sums_sig_path.display()))?;
+    Ok(sums_body)
 }
 
 /// Write the SIGNED published manifest (a clone of the build's
@@ -205,6 +246,10 @@ fn report_media_set(dir: &Path, img_name: &str, manifest_name: &str, kp: &crate:
     eprintln!("      {img_name}");
     eprintln!("      {manifest_name}  (signed, key {})", kp.key_id());
     eprintln!("      SHA256SUMS");
+    eprintln!(
+        "      {}  (Verify=yes anchor: import-pubring.pgp in the base rootfs)",
+        crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME
+    );
     eprintln!(
         "  ℹ release checklist (ADR-0044 D8) — BLOCKING before distribution: run \
          examples/rebuild-compare.sh for two-machine byte-identity; the ADR-0013 \
@@ -406,18 +451,49 @@ mod tests {
 
     /// The ticket's unit verify at the release layer: the same build
     /// output published twice lands a BYTE-IDENTICAL media set — image,
-    /// signed manifest, and SHA256SUMS (two builds at the same epoch
-    /// produce identical image bytes by the build's own determinism; the
-    /// release layer must not add variance).
+    /// signed manifest, SHA256SUMS, and its detached signature (#267; two
+    /// builds at the same epoch produce identical image bytes by the
+    /// build's own determinism; the release layer must not add variance).
     #[test]
     fn two_publishes_of_the_same_build_are_byte_identical() {
         let (_g1, _h1, dir1, _a1) = publish_fixture("release-a");
         let (_g2, _h2, dir2, _a2) = publish_fixture("release-b");
-        for name in ["nau-cassini-1.0.0-amd64.manifest.json", "SHA256SUMS"] {
+        for name in [
+            "nau-cassini-1.0.0-amd64.manifest.json",
+            "SHA256SUMS",
+            crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME,
+        ] {
             let a = std::fs::read(dir1.join(name)).unwrap();
             let b = std::fs::read(dir2.join(name)).unwrap();
             assert_eq!(a, b, "{name} must be byte-identical across publishes");
         }
+    }
+
+    #[test]
+    fn publish_signs_the_sysupdate_manifest_for_the_verify_yes_layer() {
+        // #267: SHA256SUMS.gpg exists beside SHA256SUMS and verifies the
+        // published sums bytes against the pubring the SAME ceremony key
+        // anchors into the rootfs — the sign↔verify round-trip the device
+        // will run (systemd-sysupdate Verify=yes), driven here through
+        // the exact release output.
+        let (_g, _h, dir, _a) = publish_fixture("release");
+        let sums = std::fs::read(dir.join("SHA256SUMS")).unwrap();
+        let sig = std::fs::read(dir.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME)).unwrap();
+        assert!(!sig.is_empty(), "a published release carries a signature");
+        let pubring = crate::sign::import_pubring_pgp(&test_kp(7)).unwrap();
+        crate::sign::verify_sysupdate_manifest_signature(&pubring, &sums, &sig)
+            .expect("the published SHA256SUMS.gpg verifies under the ceremony anchor");
+
+        // A tampered SHA256SUMS refuses BY NAME.
+        let mut tampered = sums.clone();
+        let last = tampered.len() - 2;
+        tampered[last] ^= 0x01;
+        let err = crate::sign::verify_sysupdate_manifest_signature(&pubring, &tampered, &sig)
+            .expect_err("tampered sysupdate manifest must refuse");
+        assert!(
+            format!("{err:#}").contains("SHA256SUMS"),
+            "the refusal names the manifest: {err:#}"
+        );
     }
 
     #[test]
