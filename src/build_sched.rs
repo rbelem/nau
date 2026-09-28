@@ -444,7 +444,7 @@ pub fn run_ready_set_farm(
                                         })
                                 });
                                 if let Some(n) = stuck {
-                                    let lost_list = s.lost.join(", ");
+                                    let lost_list = render_lost(&s.lost, farm);
                                     s.stop = true;
                                     s.failures.push((
                                         n,
@@ -482,10 +482,9 @@ pub fn run_ready_set_farm(
                             }
                         }
                         Err(JobFailure::Lost(err)) => {
-                            let display = farm[e].job.display_name().to_string();
-                            let first_loss = !s.lost.contains(&display);
+                            let first_loss = !s.lost.contains(&e);
                             if first_loss {
-                                s.lost.push(display);
+                                s.lost.push(e);
                             }
                             s.alive[e] = false;
                             if first_loss {
@@ -506,7 +505,7 @@ pub fn run_ready_set_farm(
                                 if s.redispatches[i] > farm.len() {
                                     // Every member had its shot — no
                                     // executor can run this job.
-                                    let lost_list = s.lost.join(", ");
+                                    let lost_list = render_lost(&s.lost, farm);
                                     s.stop = true;
                                     s.failures.push((
                                         i,
@@ -530,7 +529,7 @@ pub fn run_ready_set_farm(
                                             })
                                     });
                                     if let Some(n) = orphan {
-                                        let lost_list = s.lost.join(", ");
+                                        let lost_list = render_lost(&s.lost, farm);
                                         s.stop = true;
                                         s.failures.push((
                                             n,
@@ -557,7 +556,11 @@ pub fn run_ready_set_farm(
         .unwrap_or_else(|e| e.into_inner());
     FarmOutcome {
         result: partition_outcome(&names, &s),
-        workers_lost: s.lost,
+        workers_lost: s
+            .lost
+            .iter()
+            .map(|&m| farm[m].job.display_name().to_string())
+            .collect(),
     }
 }
 /// The farm scheduler's shared state — the single-executor fields plus
@@ -571,9 +574,12 @@ struct FarmShared {
     running: usize,
     stop: bool,
     failures: Vec<(usize, String)>,
-    /// Display names of executors that returned [`JobFailure::Lost`],
-    /// loss order, deduplicated.
-    lost: Vec<String>,
+    /// Member indices of executors that returned [`JobFailure::Lost`],
+    /// loss order, deduplicated. Keyed by member index — not display
+    /// name — so two same-short-name workers (nuci.local:22,
+    /// nuci.local:2222) each record their own loss; display names render
+    /// at the outcome (#193 review F4).
+    lost: Vec<usize>,
     alive: Vec<bool>,
     /// Re-dispatch counts per node — the no-cycle cap (a job visits
     /// each pool member at most once).
@@ -598,6 +604,17 @@ pub fn short_worker_name(address: &str) -> String {
         Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h.to_string(),
         _ => s.to_string(),
     }
+}
+
+/// Render the lost member indices as their display names, loss order —
+/// two same-short-name workers each render (the loss was per member, so
+/// the summary names every member the run lost, however they collide
+/// textually).
+fn render_lost(lost: &[usize], farm: &[FarmExecutor<'_>]) -> String {
+    lost.iter()
+        .map(|&m| farm[m].job.display_name().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The coordinator-side assembly feeding one worker's dispatches:
@@ -749,20 +766,26 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> FarmJob for Rem
 /// recovery. Everything else — a failed result document, a protocol,
 /// identity, or hash refusal, a capability preflight refusal — is a
 /// BUILD failure: re-dispatch cannot fix it, and stop-the-world names
-/// it. The match keys on the channel-failure shapes T4's executor
-/// emits; a no-cycle cap in the scheduler bounds any misclassification
-/// a hostile remote stderr could provoke.
+/// it. The class keys on the typed
+/// [`ChannelLoss`](crate::ssh_exec::ChannelLoss) payload the transport's
+/// leaf errors carry, found through the error's source chain — never on
+/// message wording, which a reword or a hostile remote stderr could
+/// otherwise flip (#193 review F3).
 fn classify_transport(err: &miette::Error) -> JobFailure {
     let text = format!("{err:#}");
-    let channel_death = ["ssh to '", "scp to '", "scp with '"]
-        .iter()
-        .any(|sig| text.contains(sig))
-        && (text.contains("cannot be spawned") || text.contains("failed (code"));
-    if channel_death {
+    if channel_loss_in(err) {
         JobFailure::Lost(text)
     } else {
         JobFailure::Build(text)
     }
+}
+
+/// Does this error's chain carry the transport's typed channel-loss
+/// payload? The leaf sits under any number of `wrap_err` contexts, and
+/// the chain walk starts at the error itself.
+fn channel_loss_in(err: &miette::Error) -> bool {
+    err.chain()
+        .any(|c| c.downcast_ref::<crate::ssh_exec::ChannelLoss>().is_some())
 }
 
 /// The pool budget (ADR-0040 Decision 4): the coordinator's own slots
@@ -1255,5 +1278,46 @@ mod tests {
         let err = out.expect_err("a cycle cannot be scheduled");
         assert!(err.failed.is_empty());
         assert_eq!(err.skipped, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// The loss/build class keys on the typed ChannelLoss payload found
+    /// through the error chain — never on message wording (#193 review
+    /// F3). Pinned here beside [`classify_transport`]:
+    ///
+    /// * the exact leaf shape `run_ssh` emits for a dead channel, under
+    ///   the contexts `dispatch` wraps it in, classifies LOST;
+    /// * a build refusal whose text MIMICS the old channel-death wording
+    ///   (remote-controlled result error — the injection the previous
+    ///   string match allowed) stays BUILD;
+    /// * a capability preflight refusal stays BUILD.
+    #[test]
+    fn transport_class_keys_on_the_typed_channel_loss_not_wording() {
+        let dead_channel = miette::Error::new(crate::ssh_exec::ChannelLoss(
+            "ssh to 'nuci.local' failed (code 255): Connection closed by remote host".to_string(),
+        ))
+        .wrap_err("preflight reachability")
+        .wrap_err("dispatch failed on worker 'nuci.local' for job jm1_dead");
+        assert!(
+            matches!(classify_transport(&dead_channel), JobFailure::Lost(_)),
+            "a typed channel death classifies LOST: {dead_channel:#}"
+        );
+
+        let injected = miette::miette!(
+            "job jm1_x failed on worker 'evil': ssh to 'evil' failed (code 255): \
+             not actually a channel death"
+        );
+        assert!(
+            matches!(classify_transport(&injected), JobFailure::Build(_)),
+            "wording alone cannot fake a channel death: {injected:#}"
+        );
+
+        let build_refusal = miette::miette!(
+            "dispatch: worker 'nuci.local' declares arch arm64 but the job targets amd64 — \
+             the entry's arch override and the job target disagree"
+        );
+        assert!(matches!(
+            classify_transport(&build_refusal),
+            JobFailure::Build(_)
+        ));
     }
 }

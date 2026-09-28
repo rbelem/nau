@@ -19,7 +19,10 @@ use shuttle::build_sched::{
     JobFailure, ManifestSource, RemoteExecutor,
 };
 use shuttle::command::{CommandRunner, RunnerOutput};
+use shuttle::coordinator::{farm_build_result, preflight_farm_workers, FarmSource, NodeJobPlan};
+use shuttle::lock::LockFile;
 use shuttle::lua::WorkerConfig;
+use shuttle::snap::{SnapMeta, SourceSpec};
 use shuttle::ssh_exec::{DispatchOutcome, SshExecutor};
 use shuttle::worker::{Artifact, CapabilityDoc, JobManifest, JobResult, WORKER_PROTOCOL_VERSION};
 
@@ -836,4 +839,381 @@ fn json_events_carry_executor_and_worker() {
     let v = serde_json::to_value(&farm).unwrap();
     assert_eq!(v["executor"], "ssh");
     assert_eq!(v["worker"], "nuci.local");
+}
+
+// ── The coordinator assembly (#282 F1, F2, F4, F5) ──
+
+/// Bare SnapMeta with every optional field empty (mirrors the bare_meta
+/// helper in snap.rs's unit tests).
+fn bare_meta(name: &str, version: &str) -> SnapMeta {
+    SnapMeta {
+        name: name.into(),
+        version: version.into(),
+        summary: None,
+        description: None,
+        license: None,
+        source: None,
+        sources: None,
+        build: None,
+        parts: None,
+        architectures: None,
+        grade: "stable".into(),
+        confinement: "strict".into(),
+        type_: None,
+        adopt_info: None,
+        version_adopted: false,
+        icon_source: None,
+        icon: None,
+        compression: None,
+        compression_level: None,
+        environment: None,
+        layout: None,
+        hooks: None,
+        plugs: None,
+        slots: None,
+        aliases: vec![],
+        requires: vec![],
+        build_deps: vec![],
+        leaks_ok: vec![],
+        target: None,
+        toolchain: None,
+        inputs: None,
+        confined: None,
+        apps: HashMap::new(),
+        services: BTreeMap::new(),
+        deps: None,
+        floating: false,
+        definition_dir: None,
+    }
+}
+
+fn empty_lockfile() -> LockFile {
+    LockFile {
+        version: 1,
+        sources: HashMap::new(),
+        snaps: HashMap::new(),
+        inputs: HashMap::new(),
+        packages: HashMap::new(),
+        build_deps: HashMap::new(),
+    }
+}
+
+fn plan_for(package: &str, deps: &[&str], sources: Vec<SourceSpec>) -> NodeJobPlan {
+    NodeJobPlan {
+        recipe_key: format!(
+            "pkgs/{}/{package}.lua",
+            package.chars().next().unwrap_or('x').to_ascii_lowercase()
+        ),
+        recipe: format!("return {{ default = snap {{ name = \"{package}\" }} }}"),
+        arch: "amd64".into(),
+        cross_target: None,
+        package: package.into(),
+        deps: deps.iter().map(|d| d.to_string()).collect(),
+        sources,
+    }
+}
+
+/// A curl fake: writes the canned body to the `-o` destination and
+/// exits 0 — the network convention `fetch_pinned_source` drives.
+struct FakeCurl {
+    body: &'static [u8],
+}
+
+impl CommandRunner for FakeCurl {
+    fn run(&self, argv: &[String]) -> io::Result<RunnerOutput> {
+        assert_eq!(argv[0], "curl");
+        let dest = argv.iter().position(|a| a == "-o").unwrap() + 1;
+        std::fs::write(&argv[dest], self.body)?;
+        Ok(RunnerOutput {
+            code: 0,
+            stdout: Vec::new(),
+            stderr: String::new(),
+        })
+    }
+}
+
+/// The fetch phase: a downloaded body that hashes to something other
+/// than the pin refuses the stage — nothing ships, and the refusal
+/// names both hashes (#282 F2: pin-verification-before-ship, pinned by
+/// test against the real assembly).
+#[test]
+fn farm_source_refuses_a_stale_pin_before_shipping() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let lockfile = empty_lockfile();
+
+    let url = "https://example.test/srv.tgz";
+    let source = FarmSource {
+        plans: HashMap::from([(
+            "srv".to_string(),
+            plan_for(
+                "srv",
+                &[],
+                vec![SourceSpec::Pinned {
+                    url: url.into(),
+                    sha256: sha256_hex(b"the bytes the lockfile saw"),
+                }],
+            ),
+        )]),
+        dep_metas: HashMap::new(),
+        dep_closures: HashMap::new(),
+        lockfile: &lockfile,
+        output_dir: &out_dir,
+        pkg_cache: None,
+        json: false,
+        epoch: None,
+        runner: FakeCurl {
+            body: b"the bytes upstream serves today",
+        },
+    };
+
+    let manifest = source
+        .manifest_for("srv")
+        .expect("a pinned source pins fine");
+    let err = source
+        .stage_payload(&manifest)
+        .expect_err("the served body hashes to something else");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("hashes to") && text.contains("refusing to ship"),
+        "the mismatch refusal names both hashes: {text}"
+    );
+}
+
+/// An unpinned source (no lockfile entry, no declared sha256) refuses
+/// at manifest time — a worker never fetches upstream (ADR-0040
+/// Decision 6).
+#[test]
+fn farm_source_refuses_an_unpinned_source() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let lockfile = empty_lockfile();
+
+    let source = FarmSource {
+        plans: HashMap::from([(
+            "srv".to_string(),
+            plan_for(
+                "srv",
+                &[],
+                vec![SourceSpec::Unverified(
+                    "https://example.test/srv.tgz".into(),
+                )],
+            ),
+        )]),
+        dep_metas: HashMap::new(),
+        dep_closures: HashMap::new(),
+        lockfile: &lockfile,
+        output_dir: &out_dir,
+        pkg_cache: None,
+        json: false,
+        epoch: None,
+        runner: FakeCurl { body: b"" },
+    };
+
+    let err = source
+        .manifest_for("srv")
+        .expect_err("an unpinned source refuses");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("is unpinned"),
+        "the refusal names the source and the pin duty: {text}"
+    );
+}
+
+/// The dep-payload closure: the manifest hashes each dep payload once
+/// (name, size, purpose), and staging hardlinks the payload under THAT
+/// manifest-carried hash — a second read+hash would be the double
+/// dispatch cost #282 F5 removes.
+#[test]
+fn farm_source_hashes_dep_payload_once_and_stages_under_that_hash() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let lockfile = empty_lockfile();
+
+    let payload = b"dep1 snap bytes for the closure";
+    std::fs::write(out_dir.join("dep1_1.0.0_amd64.snap"), payload).unwrap();
+
+    let mut dep_metas = HashMap::new();
+    dep_metas.insert("dep1".to_string(), bare_meta("dep1", "1.0.0"));
+    let source = FarmSource {
+        plans: HashMap::from([("app".to_string(), plan_for("app", &["dep1"], vec![]))]),
+        dep_metas,
+        dep_closures: HashMap::new(),
+        lockfile: &lockfile,
+        output_dir: &out_dir,
+        pkg_cache: None,
+        json: false,
+        epoch: Some(1700000000),
+        runner: FakeCurl { body: b"" },
+    };
+
+    let manifest = source
+        .manifest_for("app")
+        .expect("the dep payload resolves");
+    assert_eq!(manifest.closure.len(), 1, "one closure object: the dep");
+    assert_eq!(manifest.closure[0].sha256, sha256_hex(payload));
+    assert_eq!(manifest.closure[0].size, payload.len() as u64);
+    assert_eq!(manifest.closure[0].purpose, "dep:dep1");
+
+    let stage = source
+        .stage_payload(&manifest)
+        .expect("the stage assembles");
+    let staged: Vec<String> = std::fs::read_dir(stage.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        staged,
+        vec![sha256_hex(payload)],
+        "the payload is staged under the manifest's hash, named by sha256"
+    );
+    // The stage entry IS the run output's inode — a hardlink under the
+    // manifest-carried hash, not a second read+hash copy.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let out_ino = std::fs::metadata(out_dir.join("dep1_1.0.0_amd64.snap"))
+            .unwrap()
+            .ino();
+        let stage_ino = std::fs::metadata(stage.path().join(sha256_hex(payload)))
+            .unwrap()
+            .ino();
+        assert_eq!(
+            out_ino, stage_ino,
+            "staged by hardlink from the run output — no second read+hash"
+        );
+    }
+}
+
+/// The JSON event a farm dispatch emits: executor `ssh`, worker
+/// attributed, the version parsed from the artifact filename's stem —
+/// the "0" placeholder when the stem does not parse.
+#[test]
+fn farm_ingest_builds_the_json_event_shape() {
+    let outcome = |filename: &str| DispatchOutcome {
+        cache_hit: false,
+        result: JobResult {
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            package: "app".into(),
+            target: "amd64".into(),
+            ok: true,
+            artifacts: vec![Artifact {
+                filename: filename.into(),
+                path: "/remote/out/x".into(),
+                sha256: sha256_hex(b"app bytes"),
+                size: 9,
+            }],
+            error: None,
+            stderr: None,
+        },
+    };
+
+    let event = farm_build_result("app", &outcome("app_2.3.2_amd64.snap"), "nuci.local")
+        .expect("an artifact builds an event");
+    let v = serde_json::to_value(&event).unwrap();
+    assert_eq!(v["executor"], "ssh");
+    assert_eq!(v["worker"], "nuci.local");
+    assert_eq!(v["name"], "app");
+    assert_eq!(v["version"], "2.3.2", "the stem parses to the version");
+    assert_eq!(v["arch"], "amd64");
+    assert_eq!(v["filename"], "app_2.3.2_amd64.snap");
+    assert_eq!(v["sha256"], sha256_hex(b"app bytes"));
+
+    let odd = farm_build_result("app", &outcome("mystery.snap"), "nuci.local")
+        .expect("an artifact builds an event");
+    assert_eq!(
+        serde_json::to_value(&odd).unwrap()["version"],
+        "0",
+        "an unparseable stem keeps the placeholder identity"
+    );
+}
+
+/// Pre-run preflight passes the entry's DECLARED arch (#282 F1): a
+/// worker reporting an arch its config contradicts refuses the run at
+/// preflight — named by worker and probe — before anything dispatches;
+/// zero jobs cross the channel.
+#[test]
+fn preflight_refuses_a_declared_arch_mismatch_before_any_dispatch() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let machine = tmp.path().join("machine");
+    std::fs::create_dir_all(&machine).unwrap();
+
+    let reported = host_arch();
+    let declared = if reported == "amd64" {
+        "aarch64-linux-gnu"
+    } else {
+        "x86_64-linux-gnu"
+    };
+    let cfg = WorkerConfig {
+        address: "ssh://localhost:2226".into(),
+        jobs: 1,
+        arch: Some(declared.into()),
+        host_key: Some(ED25519_PIN.to_string()),
+    };
+    let exec = SshExecutor::with_cache_dir(
+        &cfg,
+        LoopbackWorker::new(&machine),
+        &tmp.path().join("cache"),
+    )
+    .expect("executor builds");
+    let err = preflight_farm_workers(&[exec])
+        .expect_err("the declared arch contradicts the worker's report");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("preflight arch") && text.contains("expected"),
+        "the refusal names the probe and the expectation: {text}"
+    );
+    assert!(
+        !machine.join(".cache/shuttle/worker/jobs").exists(),
+        "zero dispatches: the job never crossed the channel"
+    );
+
+    // The undeclared case passes the same probe (the worker's report is
+    // trusted — the mismatch duty is on the config's declaration).
+    let ok_cfg = WorkerConfig {
+        address: "ssh://localhost:2227".into(),
+        arch: None,
+        ..cfg
+    };
+    let exec = SshExecutor::with_cache_dir(
+        &ok_cfg,
+        LoopbackWorker::new(&machine),
+        &tmp.path().join("cache2"),
+    )
+    .expect("executor builds");
+    preflight_farm_workers(&[exec]).expect("an undeclared arch takes the worker's report");
+}
+
+/// Two workers whose short names collide (nuci.local:22,
+/// nuci.local:2222 — both render "nuci.local") each record their own
+/// loss (#282 F4): the lost set is keyed by member, not display name,
+/// so the second loss is neither merged away nor silenced.
+#[test]
+fn duplicate_short_names_each_record_their_loss() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let a = FakeMember::worker("nuci.local", 1, None, events.clone()).dies_on(1);
+    let b = FakeMember::worker("nuci.local", 1, None, events.clone()).dies_on(1);
+    let local = FakeMember::local(2, events.clone());
+    let members = vec![a, b, local];
+    let g = graph(&[("j1", &[]), ("j2", &[]), ("j3", &[]), ("j4", &[])]);
+    let caps_map: HashMap<String, JobCaps> = ["j1", "j2", "j3", "j4"]
+        .iter()
+        .map(|n| (n.to_string(), caps(&["amd64"], false)))
+        .collect();
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome
+        .result
+        .expect("both losses re-dispatch to the local slots");
+    let mut lost = outcome.workers_lost.clone();
+    lost.sort();
+    assert_eq!(
+        lost,
+        vec!["nuci.local".to_string(), "nuci.local".to_string(),],
+        "two same-short-name workers each record (and warn) their loss — \
+         no display-name merge: {:?}",
+        outcome.workers_lost
+    );
 }
