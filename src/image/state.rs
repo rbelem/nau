@@ -122,6 +122,12 @@ pub(crate) struct StateSplit {
     /// `tmpfs /var` mount is scoped (`x-systemd.requires-mounts-for=`)
     /// to avoid shadowing it.
     pub(crate) var_submount_partlabel: String,
+    /// Whether the state filesystem supports first-boot growth: the
+    /// fstab state line then carries `x-systemd.growfs`, so
+    /// systemd-growfs sizes the filesystem to the (grown) partition at
+    /// mount time (#264). UC data partitions are `false` — snapd owns
+    /// their growth.
+    pub(crate) growfs: bool,
 }
 
 /// The declared partition that mounts a path under `/var` — the
@@ -166,6 +172,7 @@ pub(crate) fn resolve_state_split(
         var_submount_partlabel: var_submount(layout)
             .map(|p| p.name.clone())
             .unwrap_or_default(),
+        growfs: state_fs_growable(part),
     })
 }
 
@@ -186,8 +193,15 @@ pub(crate) fn requires_mounts_for_option(partlabel: &str) -> String {
 /// tmpfs so cache/log/tmp never grow the persistent surface (ADR-0023 §2).
 /// Both carry `nofail` when declared `x-systemd.requires-mounts-for`, so a
 /// bad state partition cannot wedge early boot in the emergency shell.
+/// On a growable state filesystem the state line additionally carries
+/// `x-systemd.growfs` (#264): systemd-growfs sizes the filesystem to the
+/// partition at mount time — the partition side is grown on first boot by
+/// [`STATE_GROW_UNIT_NAME`], ordered before this mount.
 pub(crate) fn state_fstab_lines(split: &StateSplit) -> Vec<String> {
     let mut state_opts = String::from("defaults,nofail");
+    if split.growfs {
+        state_opts.push_str(",x-systemd.growfs");
+    }
     if !split.var_submount_partlabel.is_empty() {
         state_opts.push(',');
         state_opts.push_str(&requires_mounts_for_option(&split.var_submount_partlabel));
@@ -295,4 +309,490 @@ pub(crate) fn emit_runtime_activate_unit(root: &Path) -> miette::Result<()> {
     crate::emit::enable_unit(root, "multi-user.target", ACTIVATE_UNIT_NAME)?;
     eprintln!("  ✓ {ACTIVATE_UNIT_NAME} emitted (boot-time generation activation)");
     Ok(())
+}
+
+// ── First-boot state-partition growth (ADR-0044 D2, #264) ──
+
+/// GPT type GUID marking the state partition growable. The Discoverable
+/// Partitions Specification defines no state-partition type, so this is a
+/// shuttle-private GUID (minted once, source-pinned): the build stamps it
+/// onto the state partition (`sfdisk --part-type`) and the emitted repart
+/// definition matches its partition by exactly this type — systemd-repart
+/// matches existing partitions to definitions by type UUID alone
+/// (repart.d(5)), so a DPS-generic type would match the wrong partition
+/// (in a non-A/B image the verity root carries the same generic type).
+/// No other partition in a shuttle image carries this GUID, so the match
+/// is exact by construction.
+pub(crate) const STATE_TYPE_GUID: &str = "cd0f7aae-5570-4511-8dd4-182a4d25c72e";
+
+/// repart definition drop-in staged into the rootfs (guest path
+/// `/usr/lib/repart.d/`). Written before the rootfs is hashed, so
+/// dm-verity covers the growth contract like every other boot artifact.
+pub(crate) const REPART_DEFINITION_PATH: &str = "usr/lib/repart.d/40-shuttle-state.conf";
+
+/// Unit filename of the first-boot growth oneshot.
+pub(crate) const STATE_GROW_UNIT_NAME: &str = "shuttle-state-grow.service";
+
+/// Unit path inside the staged rootfs (`usr/lib/systemd/system/`).
+pub(crate) const STATE_GROW_UNIT_PATH: &str = "usr/lib/systemd/system/shuttle-state-grow.service";
+
+/// fstab-derived mount unit of [`STATE_MOUNT`] — the systemd-escaped unit
+/// name systemd generates from the `etc/fstab` state line. The growth
+/// unit orders itself before it so the partition is grown before
+/// `systemd-growfs` sizes the filesystem at mount time.
+pub(crate) const STATE_GROW_MOUNT_UNIT: &str = "var-lib.mount";
+
+/// Filesystem types systemd-growfs can grow online — the state
+/// filesystems first-boot growth applies to. Anything else keeps the
+/// historical fixed-size behavior (growth of the partition without the
+/// filesystem would strand the extra space inside the partition).
+const GROWABLE_STATE_FS: [&str; 3] = ["ext4", "btrfs", "xfs"];
+
+/// The systemd-repart binary the growth unit execs. Upstream installs it
+/// as a public program (`/usr/bin/`), unlike the libexec daemons.
+const REPART_BIN: &str = "/usr/bin/systemd-repart";
+
+/// True when `part` is a NATIVE state partition whose filesystem first
+/// boot can grow. UC `system-data`/`system-save` partitions are excluded:
+/// snapd owns their growth story, and stamping shuttle's type GUID onto
+/// them would fight the gadget.
+pub(crate) fn state_fs_growable(part: &Partition) -> bool {
+    is_state_role(&part.role) && GROWABLE_STATE_FS.contains(&part.fs.as_str())
+}
+
+/// The first-boot growth target resolved from the layout: the state
+/// partition's 1-based GPT partition number plus its PARTLABEL. `None`
+/// unless the table is GPT (repart.d is GPT-only per repart.d(5)) and a
+/// native state partition carries a growable filesystem.
+pub(crate) fn repart_growth_target(layout: &DiskLayout) -> Option<StateGrowth> {
+    if layout.label != "gpt" {
+        return None;
+    }
+    layout.partitions.iter().enumerate().find_map(|(i, part)| {
+        state_fs_growable(part).then(|| StateGrowth {
+            partno: i + 1,
+            partlabel: part.name.clone(),
+        })
+    })
+}
+
+/// The state partition's first-boot growth mark: the 1-based GPT
+/// partition number the type GUID is stamped onto, and the PARTLABEL the
+/// first-boot unit resolves the whole disk from.
+pub(crate) struct StateGrowth {
+    pub(crate) partno: usize,
+    pub(crate) partlabel: String,
+}
+
+/// Explain (never silently skip) why a layout with a native state
+/// partition does not get first-boot growth. Called only when
+/// [`repart_growth_target`] returned `None`; images with no native state
+/// partition stay silent — no state partition, nothing to grow, and the
+/// byte-comparable doctrine forbids new noise on plain images.
+fn log_growth_skipped(layout: &DiskLayout) {
+    let Some(part) = layout.partitions.iter().find(|p| is_state_role(&p.role)) else {
+        return;
+    };
+    if layout.label != "gpt" {
+        eprintln!(
+            "  ℹ state partition '{}' on a '{}' table — first-boot growth needs GPT \
+             (repart.d(5) is GPT-only); the state partition stays fixed-size",
+            part.name, layout.label
+        );
+    } else {
+        eprintln!(
+            "  ℹ state partition '{}' uses filesystem '{}' — first-boot growth needs \
+             one of {GROWABLE_STATE_FS:?} (systemd-growfs); the state partition stays \
+             fixed-size",
+            part.name, part.fs
+        );
+    }
+}
+
+/// The charset the growth unit's `sh -c` resolver can reference safely:
+/// the PARTLABEL is embedded in a single-quoted ExecStart, so anything
+/// outside `[A-Za-z0-9._-]` (a quote would break out of the quoting; a
+/// space would split the device path) is refused at build time — the
+/// same fail-closed shape as a declared `files[].dest`.
+fn validated_growth_partlabel(partlabel: &str) -> miette::Result<()> {
+    let ok = partlabel
+        .strip_prefix(|c: char| c.is_ascii_alphanumeric())
+        .is_some_and(|rest| {
+            rest.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(miette::miette!(
+            "state partition name {partlabel:?} cannot carry first-boot growth: the \
+             PARTLABEL is embedded in the growth unit's shell resolver, so only \
+             [A-Za-z0-9][A-Za-z0-9._-]* names are supported — rename the partition \
+             or drop role = \"state\""
+        ))
+    }
+}
+
+/// Emit the first-boot growth artifacts into the staged rootfs: the
+/// repart definition that marks the state partition growable and the
+/// oneshot that runs systemd-repart before the state mount. Gated on a
+/// resolvable growth target; a layout with a native state partition that
+/// cannot carry growth gets a named note instead (never silence).
+pub(crate) fn emit_state_growth(root: &Path, layout: &DiskLayout) -> miette::Result<()> {
+    let Some(growth) = repart_growth_target(layout) else {
+        log_growth_skipped(layout);
+        return Ok(());
+    };
+    validated_growth_partlabel(&growth.partlabel)?;
+    crate::emit::write_staged_file(
+        root,
+        Path::new(REPART_DEFINITION_PATH),
+        &state_repart_definition(),
+    )?;
+    crate::emit::write_unit(
+        root,
+        Path::new(STATE_GROW_UNIT_PATH),
+        &state_grow_unit(&growth),
+    )?;
+    crate::emit::enable_unit(root, "sysinit.target", STATE_GROW_UNIT_NAME)?;
+    if growth.partno - 1 != layout.partitions.len() - 1 {
+        eprintln!(
+            "  ℹ state partition is not the last partition — first-boot growth stops \
+             at the next partition (repart never moves partitions)"
+        );
+    }
+    eprintln!(
+        "  ✓ {STATE_GROW_UNIT_NAME} emitted (first-boot state growth: PARTLABEL={} \
+         grows to fill the disk via systemd-repart)",
+        growth.partlabel
+    );
+    Ok(())
+}
+
+/// The repart definition marking the state partition growable. No size
+/// constraints: repart.d(5) defaults (10M minimum, no maximum, weight
+/// 1000) are exactly the growth semantics wanted — grow into the free
+/// space following the partition, stop at the next partition or the disk
+/// end, and no-op once the table satisfies the definition.
+pub(crate) fn state_repart_definition() -> String {
+    let mut out = String::from("# Generated by shuttle — do not edit.\n");
+    out.push_str("# First-boot state-partition growth (ADR-0044 D2, #264): systemd-repart\n");
+    out.push_str("# matches the flashed state partition by its GPT type GUID and grows\n");
+    out.push_str("# it into the free space following it (default sizing: 10M minimum, no\n");
+    out.push_str("# maximum, weight 1000 — repart.d(5)), so a dd-flashed image takes\n");
+    out.push_str("# possession of the rest of the disk on first boot. Idempotent: once\n");
+    out.push_str("# the table satisfies the definition, repart no-ops.\n");
+    out.push_str("#\n");
+    out.push_str("# The filesystem inside is grown to match by systemd-growfs at mount\n");
+    out.push_str("# time: etc/fstab carries x-systemd.growfs on the state line, and\n");
+    out.push_str(&format!(
+        "# {STATE_GROW_UNIT_NAME} orders the partition growth before the mount.\n"
+    ));
+    out.push_str("[Partition]\n");
+    out.push_str("# Shuttle-private type GUID (the DPS defines no state-partition type).\n");
+    out.push_str("# Stamped onto the state partition at build time; no other partition in\n");
+    out.push_str("# a shuttle image carries it, so the match is exact. No Label=: repart\n");
+    out.push_str("# uses it only when CREATING a partition, and a definition that fails\n");
+    out.push_str("# to match must never mint a partition claiming the state PARTLABEL.\n");
+    out.push_str(&format!("Type={STATE_TYPE_GUID}\n"));
+    out
+}
+
+/// The `sh -c` script resolving the whole disk behind the state
+/// partition. repart operates on a DISK, and the disk's device name is
+/// not knowable at build time — but the state partition is, via its
+/// stable by-partlabel symlink; the sysfs parent of that symlink's
+/// target names the disk (`sda3` → `sda`, `nvme0n1p3` → `nvme0n1`).
+/// No single quotes inside: the unit wraps this in `sh -c '…'`. No
+/// `$VAR`/`${VAR}` references either — systemd expands those in
+/// ExecStart= (systemd.service(5)) even inside quotes, before sh ever
+/// sees them; `$(` command substitution is neither documented form and
+/// passes through to sh untouched.
+fn state_grow_exec(partlabel: &str) -> String {
+    format!(
+        "[ -e /dev/disk/by-partlabel/{partlabel} ] || {{ echo \"shuttle-state-grow: \
+         no /dev/disk/by-partlabel/{partlabel}\"; exit 1; }}; \
+         exec {REPART_BIN} --definitions=/{REPART_DEFINITION_PATH} \"/dev/$(basename \
+         \"$(dirname \"$(readlink -f /sys/class/block/$(basename \"$(readlink -f \
+         /dev/disk/by-partlabel/{partlabel})\")\")\")\")\""
+    )
+}
+
+/// Render the first-boot growth oneshot. `DefaultDependencies=no` and an
+/// explicit `Before=` on the state mount unit: a default-deps unit would
+/// order after basic.target, which sits behind local-fs.target — too
+/// late for the mount-time filesystem grow to see the grown partition.
+/// Enabled into `sysinit.target` ([`emit_state_growth`]), where the
+/// `Before=` carries the actual ordering.
+pub(crate) fn state_grow_unit(growth: &StateGrowth) -> String {
+    let mut out = String::from("# Generated by shuttle — do not edit.\n");
+    out.push_str("[Unit]\n");
+    out.push_str("Description=shuttle: grow the state partition to fill the disk (first boot)\n");
+    out.push_str("Documentation=man:systemd-repart.service(8)\n");
+    out.push_str("# Ordered BEFORE the state partition mounts: etc/fstab carries\n");
+    out.push_str("# x-systemd.growfs on the state line and systemd-growfs sizes the\n");
+    out.push_str("# filesystem to the partition at mount time — running after the mount\n");
+    out.push_str("# would grow the partition too late for the filesystem to follow.\n");
+    out.push_str("DefaultDependencies=no\n");
+    out.push_str("After=systemd-udevd.service systemd-udev-trigger.service\n");
+    out.push_str(&format!("Before=local-fs.target {STATE_GROW_MOUNT_UNIT}\n"));
+    out.push_str("Conflicts=shutdown.target\n");
+    out.push_str("Before=shutdown.target\n");
+    out.push_str("# The repart definition emitted beside this unit is the whole feature;\n");
+    out.push_str("# without it repart has nothing to match.\n");
+    out.push_str(&format!("ConditionPathExists=/{REPART_DEFINITION_PATH}\n"));
+    out.push('\n');
+    out.push_str("[Service]\n");
+    out.push_str("Type=oneshot\n");
+    out.push_str("RemainAfterExit=yes\n");
+    out.push_str("# repart operates on the WHOLE disk, not the state partition: the nested\n");
+    out.push_str("# $() below walks by-partlabel → sysfs → parent disk. Written variable-free:\n");
+    out.push_str("# systemd expands $VAR in ExecStart= (systemd.service(5)) before sh runs.\n");
+    out.push_str(&format!(
+        "ExecStart=/bin/sh -c '{}'\n",
+        state_grow_exec(&growth.partlabel)
+    ));
+    out
+}
+
+/// The `sfdisk` argv stamping the growable type GUID onto the state
+/// partition — the table-side half of the growth mark (the definition's
+/// `Type=` is the other half; the two share [`STATE_TYPE_GUID`] so they
+/// cannot drift). Pure so the argv is unit-testable without a runner,
+/// mirroring [`super::parted_mkpart_args`].
+pub(crate) fn state_growth_type_args(img_path: &Path, partno: usize) -> Vec<String> {
+    vec![
+        "sfdisk".to_string(),
+        "--part-type".to_string(),
+        img_path.to_string_lossy().into_owned(),
+        partno.to_string(),
+        STATE_TYPE_GUID.to_string(),
+    ]
+}
+
+/// Stamp the growable type GUID onto the state partition's table entry.
+/// Fail-open, never silent — the same posture as the A/B slot metadata
+/// (a failed stamp degrades first-boot growth to a no-op with a spare
+/// partition, it does not unboot anything), and the populate pre-flight
+/// has already failed closed on a missing sfdisk by this point.
+pub(crate) fn apply_state_growth_type(runner: &dyn CommandRunner, img_path: &Path, partno: usize) {
+    let argv = state_growth_type_args(img_path, partno);
+    if !runner.run(&argv).is_ok_and(|o| o.code == 0) {
+        eprintln!(
+            "  ⚠ sfdisk --part-type failed for partition {partno} ({STATE_TYPE_GUID}) — \
+             first-boot state growth will not match its partition (fail-open: repart \
+             would append a spare partition instead of growing)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(label: &str, parts: Vec<Partition>) -> DiskLayout {
+        DiskLayout {
+            label: label.into(),
+            partitions: parts,
+            swap: None,
+            ab: false,
+        }
+    }
+
+    fn part(name: &str, fs: &str, mount: &str, role: &str) -> Partition {
+        Partition {
+            name: name.into(),
+            size: "256M".into(),
+            fs: fs.into(),
+            mount: mount.into(),
+            options: vec![],
+            role: role.into(),
+        }
+    }
+
+    fn native_state_layout(label: &str, fs: &str) -> DiskLayout {
+        layout(
+            label,
+            vec![
+                part("UEFI", "vfat", "/boot/efi", ""),
+                part("root", "ext4", "/", ""),
+                part("state", fs, STATE_MOUNT, ROLE_STATE),
+            ],
+        )
+    }
+
+    #[test]
+    fn growth_target_selects_the_native_state_partition() {
+        let l = native_state_layout("gpt", "ext4");
+        let growth = repart_growth_target(&l).expect("native ext4 state on GPT grows");
+        assert_eq!(growth.partno, 3, "1-based GPT partition number");
+        assert_eq!(growth.partlabel, "state");
+    }
+
+    #[test]
+    fn growth_target_skips_uc_state_roles() {
+        // system-data describes the same runtime concept, but snapd owns
+        // UC growth — shuttle must not stamp its type GUID there.
+        let l = layout(
+            "gpt",
+            vec![
+                part("ubuntu-seed", "vfat", "/boot/efi", ""),
+                part("writable", "ext4", "/var/lib", "system-data"),
+            ],
+        );
+        assert!(
+            repart_growth_target(&l).is_none(),
+            "UC data partitions keep snapd's growth story"
+        );
+        assert!(!state_fs_growable(&l.partitions[1]));
+    }
+
+    #[test]
+    fn growth_target_requires_gpt() {
+        let l = native_state_layout("mbr", "ext4");
+        assert!(
+            repart_growth_target(&l).is_none(),
+            "repart.d(5) is GPT-only"
+        );
+    }
+
+    #[test]
+    fn growth_target_requires_a_growable_filesystem() {
+        let l = native_state_layout("gpt", "vfat");
+        assert!(
+            repart_growth_target(&l).is_none(),
+            "systemd-growfs cannot grow vfat — growth would strand the space"
+        );
+    }
+
+    #[test]
+    fn definition_type_is_the_stamped_type_guid() {
+        // The definition's match key and the table stamp share one
+        // constant — the two halves of the growth mark cannot drift.
+        assert!(state_repart_definition().contains(&format!("Type={STATE_TYPE_GUID}")));
+    }
+
+    #[test]
+    fn definition_pins_no_label() {
+        // A definition carrying Label= would MINT a state-labeled
+        // partition if it ever failed to match — shadowing the real one
+        // in /dev/disk/by-partlabel. It must not carry one.
+        assert!(
+            !state_repart_definition().contains("\nLabel="),
+            "unmatched definitions must not create state-labeled partitions"
+        );
+    }
+
+    #[test]
+    fn unit_orders_growth_before_the_state_mount() {
+        let l = native_state_layout("gpt", "ext4");
+        let unit = state_grow_unit(&repart_growth_target(&l).unwrap());
+        assert!(
+            unit.contains(&format!("Before=local-fs.target {STATE_GROW_MOUNT_UNIT}\n")),
+            "the fstab mount unit of {STATE_MOUNT} must come after growth: {unit}"
+        );
+        assert!(
+            unit.contains("DefaultDependencies=no"),
+            "default deps would order the unit after basic.target — too late: {unit}"
+        );
+        assert!(
+            unit.contains("After=systemd-udevd.service systemd-udev-trigger.service"),
+            "the by-partlabel symlink needs coldplug done: {unit}"
+        );
+        assert!(
+            unit.contains(&format!("ConditionPathExists=/{REPART_DEFINITION_PATH}")),
+            "the emitted definition is the feature; guard the exec: {unit}"
+        );
+        assert!(unit.contains("Type=oneshot") && unit.contains("RemainAfterExit=yes"));
+    }
+
+    #[test]
+    fn unit_exec_resolves_the_disk_and_runs_repart() {
+        let l = native_state_layout("gpt", "ext4");
+        let unit = state_grow_unit(&repart_growth_target(&l).unwrap());
+        let exec = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("one ExecStart");
+        assert!(exec.contains("/dev/disk/by-partlabel/state"), "{exec}");
+        assert!(exec.contains("/sys/class/block/"), "{exec}");
+        assert!(exec.contains(REPART_BIN), "{exec}");
+        assert!(
+            exec.contains(&format!("--definitions=/{REPART_DEFINITION_PATH}")),
+            "explicit definitions dir — no stray /etc/repart.d input: {exec}"
+        );
+        // systemd expands $VAR/${VAR} in ExecStart= even inside quotes —
+        // the script must carry no bare variable reference, or systemd
+        // substitutes (unset → empty) before sh sees it.
+        let bare_var = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        assert!(
+            !exec.match_indices('$').any(|(i, _)| {
+                exec[i + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c == '{' || bare_var(c))
+            }),
+            "no bare $-variable references (systemd eats them): {exec}"
+        );
+        assert!(!exec.contains('%'), "% is systemd specifier syntax: {exec}");
+    }
+
+    #[test]
+    fn growth_partlabel_charset_is_enforced() {
+        validated_growth_partlabel("state").unwrap();
+        validated_growth_partlabel("nau_state-1.0").unwrap();
+        for bad in ["state partition", "sta'te", "state;rm", "", "-leading"] {
+            assert!(
+                validated_growth_partlabel(bad).is_err(),
+                "{bad:?} must be refused (sh -c embedding)"
+            );
+        }
+    }
+
+    #[test]
+    fn sfdisk_args_carry_the_type_guid_and_partno() {
+        let args = state_growth_type_args(Path::new("/tmp/disk.img"), 3);
+        assert_eq!(args[0], "sfdisk");
+        assert_eq!(args[1], "--part-type");
+        assert_eq!(args[2], "/tmp/disk.img");
+        assert_eq!(args[3], "3");
+        assert_eq!(args[4], STATE_TYPE_GUID);
+    }
+
+    #[test]
+    fn stamp_failure_is_fail_open_not_fatal() {
+        struct Failing;
+        impl crate::command::CommandRunner for Failing {
+            fn run(&self, _argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+                Err(std::io::Error::other("sfdisk vanished"))
+            }
+        }
+        // Must not panic, must not error — the warning is the contract.
+        apply_state_growth_type(&Failing, Path::new("/tmp/disk.img"), 2);
+    }
+
+    #[test]
+    fn fstab_state_line_grows_only_when_the_split_says_so() {
+        let grow = StateSplit {
+            partlabel: "state".into(),
+            var_submount_partlabel: String::new(),
+            growfs: true,
+        };
+        let fixed = StateSplit {
+            partlabel: "state".into(),
+            var_submount_partlabel: String::new(),
+            growfs: false,
+        };
+        assert!(
+            state_fstab_lines(&grow)[1]
+                .contains("PARTLABEL=state /var/lib auto defaults,nofail,x-systemd.growfs"),
+            "growfs flag lands on the state line: {:?}",
+            state_fstab_lines(&grow)
+        );
+        assert_eq!(
+            state_fstab_lines(&fixed)[1],
+            "PARTLABEL=state /var/lib auto defaults,nofail",
+            "no growfs option without the flag (byte-stable)"
+        );
+    }
 }
