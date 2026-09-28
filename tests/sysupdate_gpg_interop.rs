@@ -134,14 +134,20 @@ fn produce_artifacts() -> SysupdateArtifacts {
 /// GNUPGHOME, the embedded keyring passed as `--keyring`, a detached
 /// `--verify` of the signature over the manifest bytes.
 fn gpg_verify(home: &Path, fx: &SysupdateArtifacts, sums: &Path) -> std::process::Output {
+    gpg_verify_paths(home, &fx.pubring, &fx.sig, sums)
+}
+
+/// The path-addressed spelling of [`gpg_verify`], for fixtures built
+/// outside [`SysupdateArtifacts`] (the #290 overlap-window pubring).
+fn gpg_verify_paths(home: &Path, pubring: &Path, sig: &Path, sums: &Path) -> std::process::Output {
     Command::new("gpg")
         .args(["--batch", "--no-secmem-warning", "--no-permission-warning"])
         .arg("--homedir")
         .arg(home)
         .arg("--keyring")
-        .arg(&fx.pubring)
+        .arg(pubring)
         .arg("--verify")
-        .arg(&fx.sig)
+        .arg(sig)
         .arg(sums)
         .output()
         .expect("failed to spawn gpg")
@@ -209,4 +215,67 @@ fn gpg_refuses_a_tampered_sysupdate_manifest() {
         text.contains("BAD signature"),
         "gpg's verdict must name the bad signature: {text}"
     );
+}
+
+/// #290: the overlap-window pubring is a KEYRING of two ceremony keys,
+/// and the real gpg accepts a signature from EITHER during the window.
+/// Driven through the landed ceremony (rotate mints both pubring
+/// fragments; the pre-promotion state is the rollout-critical one: the
+/// transition release signs under the OLD key while already carrying the
+/// successor's identity, so a fielded single-key device both accepts it
+/// and comes out of the window trusting the successor).
+#[test]
+fn gpg_accepts_signatures_from_either_key_in_the_overlap_pubring() {
+    if !gpg_available() {
+        skip_or_gate_fail();
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let old = shuttle::sign::create_secret_key(dir.path()).unwrap();
+    let keys_dir = shuttle::sign::keys_dir(dir.path());
+    shuttle::sign::install_public_key(&old, &keys_dir).unwrap();
+    let successor = shuttle::sign::mint_rotation_key(dir.path()).unwrap();
+
+    // The pre-promotion trust set: {current, designated successor}.
+    let pubring = dir.path().join("import-pubring.pgp");
+    std::fs::write(
+        &pubring,
+        shuttle::sign::sysupdate_pubring_pgp(&old, dir.path()).unwrap(),
+    )
+    .unwrap();
+
+    // The coreutils-format SHA256SUMS over real bytes.
+    let media: Vec<(&str, Vec<u8>)> = vec![("nau-cassini-1.0.1-amd64.img", vec![0x5Au8; 4096])];
+    use sha2::Digest;
+    let mut body = String::new();
+    for (name, bytes) in &media {
+        let digest = sha2::Sha256::digest(bytes);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        body.push_str(&format!("{hex}  {name}\n"));
+    }
+    let sums = dir.path().join(shuttle::sign::SYSUPDATE_MANIFEST_NAME);
+    std::fs::write(&sums, &body).unwrap();
+
+    for (role, signer) in [("current", &old), ("designated-successor", &successor)] {
+        let sig = dir
+            .path()
+            .join(shuttle::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
+        std::fs::write(
+            &sig,
+            shuttle::sign::sign_sysupdate_manifest(signer, body.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let gpg_home = tempfile::tempdir().unwrap();
+        let out = gpg_verify_paths(gpg_home.path(), &pubring, &sig, &sums);
+        assert!(
+            out.status.success(),
+            "real gpg must accept the {role} key's signature against the overlap pubring: {}",
+            output_text(&out)
+        );
+        let text = output_text(&out);
+        assert!(
+            text.contains("Good signature"),
+            "gpg's verdict must be a Good signature: {text}"
+        );
+    }
 }

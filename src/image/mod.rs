@@ -934,15 +934,19 @@ pub(crate) fn build_disk_image_with(
         // UKI transfer (PathRelativeTo=boot) and bless-boot's rename would
         // otherwise race the mount.
         let esp_mount = esp_mount_point(disk_layout);
-        // ADR-0024 §4 (#267): the device trust anchor the transfers'
-        // `Verify=yes` stanza names — /usr/lib/systemd/import-pubring.pgp,
-        // derived deterministically from the ceremony key. Loaded
+        // ADR-0024 §4 (#267, #290): the device trust SET the transfers'
+        // `Verify=yes` stanza names — /usr/lib/systemd/import-pubring.pgp:
+        // the active ceremony key plus every other key the ceremony has
+        // put in the trust path (the designated successor of a pending
+        // rotation, rotated-out keys during the overlap window). Loaded
         // FAIL-CLOSED like the §4 embeds below: a build with an update
         // source but no ceremony key never ships unverifiable transfers,
         // it refuses.
         let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
         let kp = load_signing_key_fail_closed(&home)?;
-        embed_import_pubring(&root, &kp)?;
+        let pubring = crate::sign::sysupdate_pubring_pgp(&kp, &home)
+            .wrap_err("deriving the sysupdate import-pubring.pgp trust set")?;
+        embed_import_pubring(&root, &pubring)?;
         // #291 (council M2): the anchor's verifier is the GUEST's gpg —
         // Verify=yes shells out to it. A rootfs without gpg fails every
         // update under a misleading "Signature verification failed"
@@ -4732,15 +4736,22 @@ CONFIG_EXT4_FS=m
     #[test]
     fn import_pubring_is_embedded_at_the_sysupdate_documented_path() {
         // The exact file systemd-sysupdate's Verify=yes hands to gpg
-        // (sysupdate.d(5)); deterministic from the ceremony key, so two
-        // builds at the same epoch embed identical bytes.
+        // (sysupdate.d(5)); deterministic from the ceremony trust set, so
+        // two builds at the same epoch embed identical bytes.
         let home = tempfile::tempdir().unwrap();
         let kp = crate::sign::create_secret_key(home.path()).unwrap();
         let root = tempfile::tempdir().unwrap();
-        embed_import_pubring(root.path(), &kp).unwrap();
+        embed_import_pubring(
+            root.path(),
+            &crate::sign::sysupdate_pubring_pgp(&kp, home.path()).unwrap(),
+        )
+        .unwrap();
         let embedded =
             std::fs::read(root.path().join(crate::sign::IMPORT_PUBRING_EMBED_PATH)).unwrap();
-        assert_eq!(embedded, crate::sign::import_pubring_pgp(&kp).unwrap());
+        assert_eq!(
+            embedded,
+            crate::sign::sysupdate_pubring_pgp(&kp, home.path()).unwrap()
+        );
         // A public key: parses, and carries no secret material.
         use pgp::composed::Deserializable;
         let tpk =
