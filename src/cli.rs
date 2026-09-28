@@ -537,6 +537,15 @@ pub enum Command {
     #[command(subcommand)]
     Key(KeyCommand),
 
+    /// SSH host CA ceremony (ADR-0045 amendment, #283 decided): generate
+    /// and introspect the coordinator CA that signs workers' short-lived
+    /// host certificates. A trust root DISTINCT from the update-manifest
+    /// signing key (`shuttle key`); the keypair lives under
+    /// `~/.config/shuttle/ca/` (`ca` 0600 private, `ca.pub` public — the
+    /// future `@cert-authority` line).
+    #[command(subcommand)]
+    Ca(CaCommand),
+
     /// Manage on-device installs: generations + file-level content store
     /// (ADR-0012 step 5, Phase 24b). Operates on a state root (default
     /// /var/lib/shuttle) holding generations/, store/ blobs, and the
@@ -1221,6 +1230,51 @@ pub enum KeyCommand {
         manifest: String,
 
         /// Key-ceremony home (default: $HOME).
+        #[arg(long)]
+        home: Option<String>,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Subcommands for `shuttle ca` (ADR-0045 amendment, #283 decided — the
+/// host CA ceremony joins ADR-0024's): the coordinator CA is the ONE
+/// trust root that signs every worker's short-lived host certificate,
+/// distinct from the update-manifest signing key. `--home` redirects the
+/// ceremony away from `$HOME` (tests, alternate operators).
+#[derive(clap::Subcommand)]
+pub enum CaCommand {
+    /// Generate the host CA keypair under `--home` via `ssh-keygen`
+    /// (ed25519, no passphrase). Refuses to overwrite an existing CA
+    /// without `--force` — replacing the high-value trust root is a
+    /// deliberate act. On success prints the public line and its
+    /// ssh-keygen SHA256 fingerprint (the identity workers entries carry).
+    Keygen {
+        /// CA ceremony home (default: $HOME). The keypair lives at
+        /// `<home>/.config/shuttle/ca/` (`ca` private 0600, `ca.pub`
+        /// public).
+        #[arg(long)]
+        home: Option<String>,
+
+        /// Replace an existing CA keypair. Both halves are removed
+        /// before the mint — a failed regeneration can never leave the
+        /// old public half paired with a new secret.
+        #[arg(long)]
+        force: bool,
+
+        /// Output structured JSON instead of human-friendly output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Introspect the host CA: which halves are on disk, the public
+    /// line, and the ssh-keygen SHA256 fingerprint. Absent CA is not an
+    /// error (an informational hint, exit 0); a private half without its
+    /// public half is a named refusal (fail closed).
+    List {
+        /// CA ceremony home (default: $HOME).
         #[arg(long)]
         home: Option<String>,
 
@@ -2363,6 +2417,52 @@ mod tests {
         }
         // `verify` requires its manifest positional.
         assert!(Cli::try_parse_from(["shuttle", "key", "verify"]).is_err());
+    }
+
+    #[test]
+    fn test_ca_keygen_and_list_parse() {
+        match Cli::try_parse_from(["shuttle", "ca", "keygen"])
+            .unwrap()
+            .command
+        {
+            Command::Ca(CaCommand::Keygen { home, force, json }) => {
+                assert!(home.is_none());
+                assert!(!force);
+                assert!(!json);
+            }
+            _ => panic!("expected Ca Keygen"),
+        }
+        match Cli::try_parse_from([
+            "shuttle",
+            "ca",
+            "keygen",
+            "--home",
+            "/tmp/ca-home",
+            "--force",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Ca(CaCommand::Keygen { home, force, json }) => {
+                assert_eq!(home.as_deref(), Some("/tmp/ca-home"));
+                assert!(force);
+                assert!(json);
+            }
+            _ => panic!("expected Ca Keygen with flags"),
+        }
+        match Cli::try_parse_from(["shuttle", "ca", "list", "--json"])
+            .unwrap()
+            .command
+        {
+            Command::Ca(CaCommand::List { home, json }) => {
+                assert!(home.is_none());
+                assert!(json);
+            }
+            _ => panic!("expected Ca List"),
+        }
+        // `ca` refuses to run without a verb.
+        assert!(Cli::try_parse_from(["shuttle", "ca"]).is_err());
     }
 
     // ── OCI push/pull (Phase 25) ──

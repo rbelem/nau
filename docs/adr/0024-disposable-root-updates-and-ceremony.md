@@ -41,6 +41,29 @@ A consumer-side contract test parses the emitted drop-ins' Source
 MatchPatterns and refuses any divergence from the signed sums; the
 QEMU live-update axis stays the deferred end-to-end proof.
 
+Amended (2026-09-29, #295 sub-task 1 — the SSH host CA joins this ADR's
+ceremony): ADR-0045's amendment (#283 decided) made the coordinator host
+CA the new high-value trust root, and its ceremony lives here alongside
+the signing-key ceremony. `shuttle ca keygen` mints a dedicated ed25519
+CA keypair via `ssh-keygen` behind the CommandRunner seam (the
+provision mint precedent — no new crates). It is a DIFFERENT trust root
+from the update-manifest signing key and never shares its keychain: a
+`ca.pub` dropped into `keys/` would be misread by the keychain loader
+as a manifest trust anchor, so the CA gets its own directory.
+Storage: `~/.config/shuttle/ca/` — private `ca` (0600; what
+`ssh-keygen -s` consumes at issuance time), public `ca.pub` (the future
+one-per-operator `@cert-authority` line), the directory itself 0700.
+Overwrite refuses by name without `--force` — replacing the trust root
+is a deliberate act, the same posture as keygen's refusal — and a
+forced mint removes both halves before regenerating so no mixed keypair
+can survive a failed run. `shuttle ca list` introspects: which halves
+are present, the public line, and the ssh-keygen SHA256 fingerprint
+(the identity workers entries carry once the executor side lands).
+Rotation/TTL policy is deliberately NOT decided here: the certificate
+TTL is the issuance half's parameter (#295 sub-task 3), and CA rotation
+is its own operator decision — this amendment records where the root
+lives, not how often it turns.
+
 ## Context
 
 ADR-0011 step (d) chose systemd-sysupdate for A/B updates and step (e) made a

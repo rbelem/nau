@@ -4,6 +4,7 @@ pub mod audit;
 pub mod boot_test;
 pub mod build_prefix;
 pub mod build_sched;
+pub mod ca;
 pub mod cache;
 pub mod checks;
 pub mod cli;
