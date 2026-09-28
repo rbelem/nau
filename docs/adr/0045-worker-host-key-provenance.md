@@ -165,6 +165,44 @@ invariant — no per-worker secrets in user-data — decides the mechanism:
   where the CA form deletes their subject (the scrub), rescored where it
   does not.
 
+### Executor shape (#295 sub-task 4)
+
+How "same config shape" enforces a certificate on the coordinator side —
+recorded here because the principal/address gap decides the mechanics:
+
+- The workers entry keeps `{ address, host_key }`; `host_key` is the CA
+  fingerprint. The entry deliberately does NOT carry the machine
+  identity: the config shape stays literally unchanged.
+- The executor resolves the pin at preflight: the ceremony CA's public
+  half (`~/.config/shuttle/ca/ca.pub`) must fingerprint to EXACTLY the
+  pin (`ssh-keygen -lf` behind the command seam), and the provision-time
+  machine linkage (`~/.config/shuttle/ca/machines/machine-<slug>.json`,
+  recorded next to the config pin transaction) must bind the entry's
+  address to its machine identity. Either gap is a named preflight
+  refusal naming the worker address — Decision 4's posture unchanged.
+- The shuttle-managed known_hosts gains ONE line:
+  `@cert-authority <principals> <keytype> <base64>` — the principals
+  comma-joined from the issued record, machine identity first (the
+  identity alone before issuance: the certificate binds it first). ssh
+  runs with `HostKeyAlias=<machine identity>` so the known_hosts match
+  AND the host-certificate principal check both happen against the
+  identity the coordinator issued the certificate for — verified against
+  a real sshd on loopback: an address-based connection to a
+  machine-identity cert fails host verification (the principal check),
+  and the alias form passes it (the connection reaches authentication).
+  Provisioned workers are dialed by address, so the alias is what makes
+  the form work end to end.
+- First boot picks the certificate up over the same one-time bearer
+  channel (GET the publish URL; `/etc/shuttle/publish.env` carries the
+  slots): a oneshot systemd unit polls with bounded retries until the
+  token TTL closes the window, installs the certificate as
+  `/etc/ssh/ssh_host_ed25519_key-cert.pub` beside the guest-generated
+  key (sshd serves it automatically), and restarts sshd. Fail-closed: a
+  worker whose certificate never arrives serves only its raw host key,
+  which the `@cert-authority` pin refuses at host verification — the
+  coordinator's preflight reports the worker unreachable, named by
+  address.
+
 ## Revisit triggers
 
 - Workers crossing trust domains (shared/multi-org pools) — replace the

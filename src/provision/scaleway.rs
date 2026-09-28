@@ -376,8 +376,12 @@ impl<R: CommandRunner> ScalewayProvisioner<R> {
         }
         // The pin transaction: all entries after every server is up — a
         // provision that dies here leaves no config (and the caller's
-        // teardown leaves no server). Nothing unpinned survives.
-        for (_, address) in &pins {
+        // teardown leaves no server). Nothing unpinned survives. Each
+        // address also records its machine-identity linkage — the
+        // executor's @cert-authority pin binds the certificate principal
+        // through it (#295 sub-task 4).
+        for (name, address) in &pins {
+            crate::provision::publish::record_machine_link(&pin.publish.home, name, address)?;
             append_worker_entry(&req.config, address, pin.ca_pin)?;
         }
         Ok(())

@@ -16,8 +16,22 @@
 //! for exactly this worker, and ssh runs with `StrictHostKeyChecking=yes`
 //! against it, `GlobalKnownHostsFile` parked on `/dev/null` so no ambient
 //! trust can leak in. There is no `ssh-keyscan` path anywhere; a worker
-//! whose pin cannot be enforced (absent, or fingerprint-only) is a named
-//! preflight refusal before any ssh runs.
+//! whose pin cannot be enforced is a named preflight refusal before any
+//! ssh runs.
+//!
+//! Two pin forms (ADR-0045 amendment, #295 sub-task 4). The CA form is
+//! the working one end to end: the pin is the host CA's `SHA256:`
+//! fingerprint (the `shuttle ca list` form), the executor verifies the
+//! ceremony CA's public half against it (`ssh-keygen -lf` behind the
+//! command seam), resolves the provision-time machine linkage for the
+//! address ([`crate::provision::publish::machine_link`]), and writes ONE
+//! `@cert-authority` line whose host-pattern is the certificate's
+//! principal list — comma-joined, machine identity first — while ssh
+//! runs with `HostKeyAlias=<machine identity>` so both the known_hosts
+//! match and the host-certificate principal check happen against the
+//! identity the coordinator issued the certificate for. The legacy form
+//! — a full public-key line, the retired mint-and-inject pin — still
+//! enforces exactly as before (sub-task 5 removes it).
 //!
 //! Content moves as content-addressed delta sync (ADR-0040 Decision 6):
 //! the Worker reports which closure objects its object store already
@@ -35,6 +49,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use miette::WrapErr;
 
@@ -117,6 +132,22 @@ pub struct DispatchOutcome {
     pub result: JobResult,
 }
 
+/// The pin resolved into its known_hosts form ([`SshExecutor::
+/// resolved_pin`]): the legacy public-key line (host-pattern scoped) or
+/// the CA form's `@cert-authority` line plus the `HostKeyAlias` (the
+/// machine identity) the ssh argv rides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedPin {
+    PublicKey(String),
+    CertificateAuthority { line: String, alias: String },
+}
+
+/// One base64 character (standard alphabet, no padding) — the
+/// fingerprint-pin shape check.
+fn is_base64_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'+' || b == b'/'
+}
+
 /// The parsed `ssh://[user@]host[:port]` worker address. Re-derived here
 /// (the config boundary already validated it) so the executor holds the
 /// argv-ready parts; the dash guards are re-asserted — the #189
@@ -197,27 +228,52 @@ pub struct SshExecutor<R: CommandRunner> {
     /// known_hosts pin under `workers/known_hosts.d/`, remote ingest
     /// records under `remote/`.
     cache_dir: PathBuf,
+    /// The ceremony home the CA form resolves against: the host CA's
+    /// public half (`~/.config/shuttle/ca/ca.pub`) and the provision-time
+    /// machine linkage (`ca/machines/`) live there. `$HOME` in
+    /// production; pinned by the test seam.
+    ceremony_home: PathBuf,
+    /// The `HostKeyAlias` the CA form resolved for this worker, cached by
+    /// [`SshExecutor::ensure_known_hosts`] (which every preflight runs
+    /// before any ssh) so the argv builder can ride it.
+    host_key_alias: Mutex<Option<String>>,
     dispatches: AtomicUsize,
 }
 
 impl<R: CommandRunner> SshExecutor<R> {
     /// Build an executor for one `workers` entry. The shuttle-managed
-    /// paths default to the cache convention (`$HOME/.cache/shuttle`).
+    /// paths default to the cache convention (`$HOME/.cache/shuttle`)
+    /// and the ceremony home to `$HOME` (the `ca.rs` convention).
     pub fn new(worker: &WorkerConfig, runner: R) -> miette::Result<Self> {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        Self::with_cache_dir(
+        Self::with_ceremony_home(
             worker,
             runner,
             &Path::new(&home).join(".cache").join("shuttle"),
+            Path::new(&home),
         )
     }
 
     /// [`SshExecutor::new`] with the managed-disk root pinned — the test
     /// seam (and a future explicit-config seam, should one be wanted).
+    /// The ceremony home stays `$HOME`.
     pub fn with_cache_dir(
         worker: &WorkerConfig,
         runner: R,
         cache_dir: &Path,
+    ) -> miette::Result<Self> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        Self::with_ceremony_home(worker, runner, cache_dir, Path::new(&home))
+    }
+
+    /// Both disk roots pinned: the managed cache and the ceremony home
+    /// (whose `ca/` subtree holds the host CA and the machine linkage) —
+    /// the full hermetic seam for the CA-form pin tests.
+    pub fn with_ceremony_home(
+        worker: &WorkerConfig,
+        runner: R,
+        cache_dir: &Path,
+        ceremony_home: &Path,
     ) -> miette::Result<Self> {
         let parts = parse_address(&worker.address)?;
         Ok(SshExecutor {
@@ -225,6 +281,8 @@ impl<R: CommandRunner> SshExecutor<R> {
             runner,
             parts,
             cache_dir: cache_dir.to_path_buf(),
+            ceremony_home: ceremony_home.to_path_buf(),
+            host_key_alias: Mutex::new(None),
             dispatches: AtomicUsize::new(0),
         })
     }
@@ -256,50 +314,166 @@ impl<R: CommandRunner> SshExecutor<R> {
         Ok(self.cache_dir.join("remote").join(identity_slug(&id)))
     }
 
-    /// The known_hosts entry this worker's pin builds: the host pattern
-    /// (OpenSSH form — `[host]:port` for non-default ports, bare
-    /// otherwise) plus the key half of the pin, comment dropped. `None`
-    /// when the pin cannot enforce a connection (absent, or
-    /// fingerprint-only).
-    fn known_hosts_line(&self) -> Option<String> {
-        let pin = self.worker.host_key.as_deref()?.trim();
+    /// The known_hosts entry this worker's pin builds, resolved fresh on
+    /// every preflight. Two forms:
+    ///
+    /// - CA form (the amendment's): a `SHA256:` fingerprint pin. The
+    ///   ceremony CA's public half must exist and fingerprint to EXACTLY
+    ///   the pin (`ssh-keygen -lf` behind the command seam — the pinned
+    ///   fingerprint ↔ presented cert's Signing CA identity), the
+    ///   provision-time machine linkage must bind this address to its
+    ///   machine identity, and the line is
+    ///   `@cert-authority <principals> <keytype> <base64>` — principals
+    ///   comma-joined from the issued record (machine identity first),
+    ///   the identity alone when issuance has not happened yet (the
+    ///   certificate binds the identity first, so the pattern matches
+    ///   from the moment the coordinator signs).
+    /// - Legacy form (mint-and-inject, sub-task 5 retires): a full
+    ///   public-key line used verbatim (comment dropped).
+    fn resolved_pin(&self) -> miette::Result<ResolvedPin> {
+        let pin = match self.worker.host_key.as_deref().map(str::trim) {
+            None | Some("") => return Err(self.unpinned_refusal()),
+            Some(pin) => pin,
+        };
+        if let Some(fp) = pin.strip_prefix("SHA256:") {
+            if fp.len() != 43 || !fp.bytes().all(is_base64_char) {
+                return Err(miette::miette!(
+                    "preflight host-key: worker '{}' carries the malformed fingerprint pin \
+                     '{pin}' — expected 'SHA256:' + 43 base64 characters (the OpenSSH form \
+                     `shuttle ca list` prints)",
+                    self.worker.address
+                ));
+            }
+            return self.resolve_ca_pin(pin);
+        }
         let key: Vec<&str> = pin.split_whitespace().take(2).collect();
         if key.len() < 2 {
-            return None;
+            return Err(miette::miette!(
+                "preflight host-key: worker '{}' carries the unenforceable pin '{pin}' — pin \
+                 the host CA fingerprint ('SHA256:…', the `shuttle ca list` form) or the legacy \
+                 full public-key line; shuttle never learns host keys (ADR-0045 Decision 4)",
+                self.worker.address
+            ));
         }
+        // The legacy line keeps the OpenSSH host-pattern scope
+        // (`[host]:port` for non-default ports, bare otherwise).
         let pattern = match self.parts.port {
             Some(port) => format!("[{}]:{port}", self.parts.host),
             None => self.parts.host.clone(),
         };
-        Some(format!("{pattern} {}", key.join(" ")))
+        Ok(ResolvedPin::PublicKey(format!(
+            "{pattern} {} {}",
+            key[0], key[1]
+        )))
     }
 
-    /// The preflight refusal for a worker whose pin cannot be enforced.
-    /// Named by address (ADR-0045 D4: "refuses an unpinned worker by
-    /// name").
-    fn pin_refusal(&self) -> miette::Error {
-        match self.worker.host_key.as_deref().map(str::trim) {
-            None | Some("") => miette::miette!(
-                "preflight host-key: worker '{}' is unpinned — every workers entry must carry \
-                 host_key; shuttle never learns host keys (ADR-0045 Decision 4)",
-                self.worker.address
-            ),
-            Some(pin) => miette::miette!(
-                "preflight host-key: worker '{}' carries only the fingerprint pin '{pin}' — a \
-                 fingerprint cannot enforce a connection; pin the full public key line \
-                 ('ssh-ed25519 AAAA...'). shuttle never learns host keys (ADR-0045 Decision 4)",
-                self.worker.address
-            ),
+    /// The CA form: verify the ceremony CA's public half against the pin,
+    /// resolve the machine linkage, and build the `@cert-authority` line.
+    fn resolve_ca_pin(&self, pin: &str) -> miette::Result<ResolvedPin> {
+        let public = crate::ca::ca_public_path(&self.ceremony_home);
+        let text = std::fs::read_to_string(&public).map_err(|_| {
+            miette::miette!(
+                "preflight host-key: worker '{}' pins host CA fingerprint '{pin}' but the \
+                 coordinator's CA public half {} is missing — run 'shuttle ca keygen' (the \
+                 @cert-authority pin needs the key that fingerprint names)",
+                self.worker.address,
+                public.display()
+            )
+        })?;
+        if text.trim().is_empty() {
+            return Err(miette::miette!(
+                "preflight host-key: worker '{}' pins host CA fingerprint '{pin}' but {} is \
+                 empty — restore the CA keypair ('shuttle ca keygen --force' re-keys)",
+                self.worker.address,
+                public.display()
+            ));
         }
+        let got = crate::ca::key_fingerprint(&self.runner, &public).map_err(|e| {
+            miette::miette!("preflight host-key: worker '{}': {e}", self.worker.address)
+        })?;
+        if got != pin {
+            return Err(miette::miette!(
+                "preflight host-key: worker '{}' pins host CA fingerprint '{pin}' but {} \
+                 fingerprints to '{got}' — the CA rotated; re-provision the worker or repin \
+                 (ADR-0045 Decision 4)",
+                self.worker.address,
+                public.display()
+            ));
+        }
+        let link =
+            crate::provision::publish::machine_link(&self.ceremony_home, &self.worker.address)?
+                .ok_or_else(|| {
+                    miette::miette!(
+                "preflight host-key: worker '{}' pins the host CA fingerprint but no machine \
+                 identity is linked to this address (expected {}) — the @cert-authority pin \
+                 binds the certificate principal shuttle records at provision time; \
+                 re-provision or pin the legacy public-key line (ADR-0045 Decision 4)",
+                self.worker.address,
+                crate::provision::publish::machines_dir(&self.ceremony_home).display()
+            )
+                })?;
+        // The pattern is the certificate's principal list — comma-joined,
+        // machine identity first — read back from the issued record when
+        // issuance has happened; the identity alone before that (the
+        // certificate binds the identity first, so the pattern matches
+        // either way).
+        let pattern = match crate::provision::publish::issued_entry(
+            &self.ceremony_home,
+            &link.machine_identity,
+        )? {
+            Some(issued) => issued.principals.join(","),
+            None => link.machine_identity.clone(),
+        };
+        let key: Vec<&str> = text.split_whitespace().take(2).collect();
+        if key.len() < 2 {
+            return Err(miette::miette!(
+                "preflight host-key: worker '{}': {} is not a usable public-key line — restore \
+                 the CA keypair ('shuttle ca keygen --force' re-keys)",
+                self.worker.address,
+                public.display()
+            ));
+        }
+        Ok(ResolvedPin::CertificateAuthority {
+            line: format!("@cert-authority {pattern} {} {}", key[0], key[1]),
+            alias: link.machine_identity,
+        })
+    }
+
+    /// The preflight refusal for a worker with no pin at all. Named by
+    /// address (ADR-0045 D4: "refuses an unpinned worker by name").
+    fn unpinned_refusal(&self) -> miette::Error {
+        miette::miette!(
+            "preflight host-key: worker '{}' is unpinned — every workers entry must carry \
+             host_key; shuttle never learns host keys (ADR-0045 Decision 4)",
+            self.worker.address
+        )
     }
 
     /// Write the shuttle-managed known_hosts for this worker: one file,
     /// one pinned line, written only when the content differs (atomic
     /// tempfile + persist, safe under the scheduler's concurrent
     /// dispatches to the same worker). Called before any ssh runs, so an
-    /// unenforceable pin refuses with zero channel activity.
+    /// unenforceable pin refuses with zero channel activity. The CA form
+    /// additionally caches the `HostKeyAlias` (the machine identity) the
+    /// ssh argv rides.
     fn ensure_known_hosts(&self) -> miette::Result<()> {
-        let line = self.known_hosts_line().ok_or_else(|| self.pin_refusal())?;
+        let resolved = self.resolved_pin()?;
+        let line = match &resolved {
+            ResolvedPin::PublicKey(line) => {
+                *self
+                    .host_key_alias
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                line.clone()
+            }
+            ResolvedPin::CertificateAuthority { line, alias } => {
+                *self
+                    .host_key_alias
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(alias.clone());
+                line.clone()
+            }
+        };
         let dir = self.known_hosts_dir();
         std::fs::create_dir_all(&dir)
             .map_err(|e| miette::miette!("cannot create {}: {e}", dir.display()))?;
@@ -356,6 +530,21 @@ impl<R: CommandRunner> SshExecutor<R> {
         if let Some(port) = self.parts.port {
             v.push(port_flag.to_string());
             v.push(port.to_string());
+        }
+        // The CA form connects under the machine identity: the alias is
+        // both the known_hosts lookup name (the @cert-authority pattern
+        // IS the certificate's principal list) and the name the
+        // host-certificate principal check runs against. Set only after
+        // ensure_known_hosts resolved the pin — preflight runs it before
+        // any ssh — and used verbatim by ssh (no [host]:port wrapping).
+        if let Some(alias) = self
+            .host_key_alias
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            v.push("-o".to_string());
+            v.push(format!("HostKeyAlias={alias}"));
         }
         v
     }

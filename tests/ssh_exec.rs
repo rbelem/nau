@@ -24,6 +24,11 @@ use shuttle::worker::{
 const ED25519_PIN: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux loopback-pin";
 const FINGERPRINT_PIN: &str = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG";
+/// The CA public half the ceremony fixture writes: the fake fingerprints
+/// it to [`FINGERPRINT_PIN`] unless a test overrides the report.
+const CA_PUB_LINE: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux loopback-ca";
+const CA_IDENTITY: &str = "shuttle-worker-ca-test-01";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -61,6 +66,9 @@ struct LoopbackWorker {
     scripted_files: Vec<(String, Vec<u8>)>,
     corrupt_payload_push: bool,
     corrupt_artifact: Option<String>,
+    /// What `ssh-keygen -lf` reports for any key file (the CA-form tests
+    /// pin the ceremony's fingerprint; the mismatch test overrides it).
+    reported_fingerprint: String,
     calls: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
@@ -74,6 +82,7 @@ impl LoopbackWorker {
             scripted_files: Vec::new(),
             corrupt_payload_push: false,
             corrupt_artifact: None,
+            reported_fingerprint: FINGERPRINT_PIN.to_string(),
             calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -363,6 +372,28 @@ impl CommandRunner for LoopbackWorker {
             "ssh" => self.ssh(argv),
             "scp" => self.scp(argv),
             "tar" => RealRunner.run(argv),
+            "ssh-keygen" => {
+                // `-lf <path>`: report the configured fingerprint for
+                // whichever key file the executor inspects (the CA-form
+                // resolution seam).
+                let Some(path) = argv
+                    .iter()
+                    .position(|a| a == "-lf")
+                    .map(|i| argv[i + 1].clone())
+                else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("loopback: unsupported ssh-keygen argv {argv:?}"),
+                    ));
+                };
+                let _ = path;
+                Ok(RunnerOutput {
+                    code: 0,
+                    stdout: format!("256 {} loopback-ca (ED25519)\n", self.reported_fingerprint)
+                        .into_bytes(),
+                    stderr: String::new(),
+                })
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("loopback: unexpected program {other}"),
@@ -576,7 +607,7 @@ fn known_hosts_pattern_covers_the_non_default_port() {
 }
 
 #[test]
-fn unpinned_and_fingerprint_only_workers_refuse_before_any_channel_activity() {
+fn unpinned_and_malformed_pins_refuse_before_any_channel_activity() {
     let cache = tempfile::tempdir().unwrap();
     let machine = tempfile::tempdir().unwrap();
 
@@ -594,10 +625,11 @@ fn unpinned_and_fingerprint_only_workers_refuse_before_any_channel_activity() {
     assert!(err.to_string().contains("unpinned"), "{err:#}");
     assert_eq!(calls.lock().unwrap().len(), 0, "no channel activity");
 
+    // A single unparseable token is not a pin in either grammar.
     let fake = LoopbackWorker::new(machine.path());
     let calls = fake.calls_handle();
     let ex = SshExecutor::with_cache_dir(
-        &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
+        &worker_cfg("ssh://localhost", Some("not-a-pin")),
         fake,
         cache.path(),
     )
@@ -607,10 +639,255 @@ fn unpinned_and_fingerprint_only_workers_refuse_before_any_channel_activity() {
             arch: None,
             min_free_disk: 0,
         })
-        .expect_err("fingerprint-only refuses");
-    assert!(err.to_string().contains("fingerprint"), "{err:#}");
-    assert!(err.to_string().contains("localhost"), "{err:#}");
+        .expect_err("malformed pin refuses");
+    let err = err.to_string();
+    assert!(err.contains("unenforceable pin"), "{err}");
+    assert!(err.contains("localhost"), "{err}");
     assert_eq!(calls.lock().unwrap().len(), 0, "no channel activity");
+}
+
+/// The ceremony fixture for the CA-form tests: the CA public half on
+/// disk and the machine linkage recorded for `ssh://localhost` under
+/// `ceremony` (the seam `with_ceremony_home` points the executor at).
+fn ca_ceremony(ceremony: &Path) {
+    let ca_dir = ceremony.join(".config/shuttle/ca");
+    std::fs::create_dir_all(ca_dir.join("machines")).unwrap();
+    std::fs::write(ca_dir.join("ca.pub"), format!("{CA_PUB_LINE}\n")).unwrap();
+    shuttle::provision::publish::record_machine_link(ceremony, CA_IDENTITY, "ssh://localhost")
+        .unwrap();
+}
+
+/// An issued record for [`CA_IDENTITY`] with the given principals — the
+/// pattern the @cert-authority line carries once issuance happened.
+fn issue_record(ceremony: &Path, principals: &[&str]) {
+    let record = shuttle::provision::publish::IssuedIdentity {
+        machine_identity: CA_IDENTITY.to_string(),
+        public_key: CA_PUB_LINE.to_string(),
+        instance_identity: serde_json::json!({"instance_id": "i-abc"}),
+        received_at_epoch: 1,
+        token_sha256: "a".repeat(64),
+        cert: "fake".to_string(),
+        principals: principals.iter().map(|s| s.to_string()).collect(),
+        validity: "+48h".to_string(),
+        issued_at_epoch: 1,
+        ca_fingerprint: FINGERPRINT_PIN.to_string(),
+    };
+    let dir = shuttle::provision::publish::issued_dir(ceremony);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("issued-{CA_IDENTITY}.json")),
+        serde_json::to_string_pretty(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn ca_fingerprint_pin_builds_the_cert_authority_line_and_connects_under_the_machine_identity() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let ceremony = tempfile::tempdir().unwrap();
+    ca_ceremony(ceremony.path());
+
+    let fake = LoopbackWorker::new(machine.path());
+    let calls = fake.calls_handle();
+    let ex = SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
+        fake,
+        cache.path(),
+        ceremony.path(),
+    )
+    .unwrap();
+    ex.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("the CA pin enforces: preflight runs");
+
+    // ONE @cert-authority line; the pattern is the machine identity (no
+    // issued record yet — the certificate binds the identity first, so
+    // the pattern matches from the moment the coordinator signs).
+    let pinned = std::fs::read_to_string(ex.known_hosts_path()).unwrap();
+    let key_half = CA_PUB_LINE
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(pinned, format!("@cert-authority {CA_IDENTITY} {key_half}"));
+
+    // The connection runs under the machine identity — the alias both
+    // matches the pattern and is the name the host-cert principal check
+    // runs against (ssh uses the alias verbatim, no [host]:port form).
+    let ssh_argv = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|argv| argv[0] == "ssh")
+        .expect("preflight probed the worker")
+        .clone();
+    let alias_at = ssh_argv
+        .iter()
+        .position(|a| a == "HostKeyAlias=shuttle-worker-ca-test-01")
+        .expect("HostKeyAlias rides the argv");
+    assert_eq!(
+        ssh_argv[alias_at - 1],
+        "-o",
+        "the alias rides as -o HostKeyAlias=…"
+    );
+    // StrictHostKeyChecking stays yes — the posture is unchanged.
+    assert!(ssh_argv.contains(&"StrictHostKeyChecking=yes".to_string()));
+}
+
+#[test]
+fn ca_form_pattern_is_the_issued_principals_machine_identity_first() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let ceremony = tempfile::tempdir().unwrap();
+    ca_ceremony(ceremony.path());
+    issue_record(
+        ceremony.path(),
+        &[
+            CA_IDENTITY,
+            "i-abc123",
+            "aws",
+            "eu-central-1",
+            "eu-central-1a",
+        ],
+    );
+
+    let fake = LoopbackWorker::new(machine.path());
+    let ex = SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
+        fake,
+        cache.path(),
+        ceremony.path(),
+    )
+    .unwrap();
+    ex.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("preflight runs");
+
+    let pinned = std::fs::read_to_string(ex.known_hosts_path()).unwrap();
+    let key_half = CA_PUB_LINE
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        pinned,
+        format!("@cert-authority {CA_IDENTITY},i-abc123,aws,eu-central-1,eu-central-1a {key_half}"),
+        "the pattern is the certificate's principal list, machine identity first"
+    );
+}
+
+#[test]
+fn ca_pin_refusals_name_the_gap_before_any_channel_activity() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+
+    // ── the ceremony CA's public half is absent ──
+    let ceremony = tempfile::tempdir().unwrap();
+    let fake = LoopbackWorker::new(machine.path());
+    let calls = fake.calls_handle();
+    let ex = SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
+        fake,
+        cache.path(),
+        ceremony.path(),
+    )
+    .unwrap();
+    let err = ex
+        .preflight(PreflightChecks {
+            arch: None,
+            min_free_disk: 0,
+        })
+        .expect_err("absent CA refuses");
+    let err = err.to_string();
+    assert!(err.contains("ca.pub"), "{err}");
+    assert!(err.contains("ca keygen"), "{err}");
+    assert!(err.contains("localhost"), "{err}");
+    assert_eq!(calls.lock().unwrap().len(), 0, "no subprocess ran at all");
+
+    // ── the ceremony CA fingerprints to something else (rotated) ──
+    let ceremony = tempfile::tempdir().unwrap();
+    ca_ceremony(ceremony.path());
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.reported_fingerprint = "SHA256:ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".into();
+    let calls = fake.calls_handle();
+    let ex = SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
+        fake,
+        cache.path(),
+        ceremony.path(),
+    )
+    .unwrap();
+    let err = ex
+        .preflight(PreflightChecks {
+            arch: None,
+            min_free_disk: 0,
+        })
+        .expect_err("mismatched CA refuses");
+    let err = err.to_string();
+    assert!(err.contains(FINGERPRINT_PIN), "the pin is named: {err}");
+    assert!(err.contains("fingerprints to"), "{err}");
+    assert_eq!(
+        LoopbackWorker::count_program(&calls, "ssh"),
+        0,
+        "no channel activity"
+    );
+
+    // ── no machine linkage for the address ──
+    let ceremony = tempfile::tempdir().unwrap();
+    let ca_dir = ceremony.path().join(".config/shuttle/ca");
+    std::fs::create_dir_all(&ca_dir).unwrap();
+    std::fs::write(ca_dir.join("ca.pub"), format!("{CA_PUB_LINE}\n")).unwrap();
+    let fake = LoopbackWorker::new(machine.path());
+    let calls = fake.calls_handle();
+    let ex = SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
+        fake,
+        cache.path(),
+        ceremony.path(),
+    )
+    .unwrap();
+    let err = ex
+        .preflight(PreflightChecks {
+            arch: None,
+            min_free_disk: 0,
+        })
+        .expect_err("unlinked address refuses");
+    let err = err.to_string();
+    assert!(err.contains("machine identity is linked"), "{err}");
+    assert!(err.contains("machines"), "{err}");
+    assert!(err.contains("localhost"), "{err}");
+    assert_eq!(
+        LoopbackWorker::count_program(&calls, "ssh"),
+        0,
+        "no channel activity"
+    );
+
+    // ── a malformed fingerprint shape ──
+    let ceremony = tempfile::tempdir().unwrap();
+    ca_ceremony(ceremony.path());
+    let fake = LoopbackWorker::new(machine.path());
+    let ex = SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost", Some("SHA256:tooshort")),
+        fake,
+        cache.path(),
+        ceremony.path(),
+    )
+    .unwrap();
+    let err = ex
+        .preflight(PreflightChecks {
+            arch: None,
+            min_free_disk: 0,
+        })
+        .expect_err("malformed fingerprint refuses");
+    assert!(
+        err.to_string().contains("malformed fingerprint pin"),
+        "{err:#}"
+    );
 }
 
 #[test]

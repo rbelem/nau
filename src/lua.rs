@@ -136,11 +136,15 @@ pub struct WorkerConfig {
     /// when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
-    /// The pinned SSH host key (ADR-0045 Decision 4): a full public-key
-    /// line (`ssh-ed25519 AAAA... [comment]`) or a `SHA256:` fingerprint.
-    /// Pins are never learned — the executor drives ssh with
-    /// `StrictHostKeyChecking=yes` against a shuttle-managed known_hosts
-    /// built from the pin, and preflight refuses a worker whose pin
+    /// The pinned SSH host identity (ADR-0045 Decision 4, amended by
+    /// #295): the host CA's `SHA256:` fingerprint (the `shuttle ca list`
+    /// form) — the executor builds a shuttle-managed `@cert-authority`
+    /// known_hosts entry from the ceremony CA whose fingerprint matches,
+    /// scoped to the worker's certificate principals and connected under
+    /// the provisioned machine identity — or the legacy full public-key
+    /// line (`ssh-ed25519 AAAA... [comment]`, the retired mint-and-inject
+    /// pin). Pins are never learned: `StrictHostKeyChecking=yes` against
+    /// the managed known_hosts, and preflight refuses a worker whose pin
     /// cannot be enforced by name. No `ssh-keyscan` path exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_key: Option<String>,
@@ -451,12 +455,13 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
     })
 }
 
-/// The `host_key` pin grammar (ADR-0045 Decision 4): either a full
-/// public-key line — `<keytype> <base64> [comment]`, usable verbatim as a
-/// known_hosts key — or an OpenSSH `SHA256:<43 base64 chars>` fingerprint.
-/// The fingerprint form is validated in shape only: it cannot build a
-/// known_hosts entry and shuttle learns no host keys, so the executor
-/// refuses a fingerprint-only pin at preflight. Shared with the publish
+/// The `host_key` pin grammar (ADR-0045 Decision 4, as amended by #295):
+/// either a full public-key line — `<keytype> <base64> [comment]`, usable
+/// verbatim as a known_hosts key (the legacy mint-and-inject pin;
+/// sub-task 5 retires it) — or an OpenSSH `SHA256:<43 base64 chars>`
+/// fingerprint, THE form: the host CA's fingerprint (`shuttle ca list`),
+/// which the executor enforces as a `@cert-authority` known_hosts entry
+/// bound to the worker's certificate principals. Shared with the publish
 /// receive surface (the guest's published public half must satisfy the
 /// same grammar it will ride a config with).
 pub fn validate_host_key(raw: &str) -> miette::Result<()> {

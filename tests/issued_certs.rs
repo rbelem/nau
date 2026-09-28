@@ -388,3 +388,151 @@ fn issue_refusals_name_the_gap() {
         run.stderr
     );
 }
+
+/// The executor side of the CA form (#295 sub-task 4), driven by the
+/// REAL `ssh-keygen`: the pinned fingerprint ↔ the presented certificate's
+/// Signing CA are the same identity, the executor resolves it through the
+/// real `ssh-keygen -lf`, the machine linkage binds the pinned address to
+/// the certificate principal, and the managed known_hosts becomes ONE
+/// `@cert-authority` line whose pattern is the issued principals
+/// (machine identity first) while ssh connects under `HostKeyAlias=<machine
+/// identity>`. The worker channel is a scripted fake — what this proves
+/// is the known_hosts/ssh-keygen layer; a live sshd handshake (the guest
+/// serving the cert, principal matching against the real connection
+/// name) is the QEMU/live-run axis.
+#[test]
+fn ca_form_executor_pins_the_signing_ca_through_the_real_keygen() {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use shuttle::command::{CommandRunner, RunnerOutput};
+    use shuttle::lua::WorkerConfig;
+    use shuttle::ssh_exec::{PreflightChecks, SshExecutor};
+
+    /// Answers the coordinator's channel without a network: `ssh` gets a
+    /// happy capability document, `ssh-keygen -lf` runs the REAL binary,
+    /// everything else is a bug.
+    struct CapWorker {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    impl CommandRunner for CapWorker {
+        fn run(&self, argv: &[String]) -> io::Result<RunnerOutput> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            match argv[0].as_str() {
+                "ssh" => Ok(RunnerOutput {
+                    code: 0,
+                    stdout: serde_json::to_vec(&serde_json::json!({
+                        "protocol": shuttle::worker::WORKER_PROTOCOL_VERSION,
+                        "arch": "x86_64",
+                        "nproc": 4,
+                        "ram_bytes": 8_000_000_000u64,
+                        "free_disk_bytes": 1024u64.pow(4),
+                        "bwrap": true,
+                        "mksquashfs": true,
+                        "kvm": false,
+                        "sandbox": true,
+                        "mksquashfs_version": shuttle::provision::SQUASHFS_TOOLS_VERSION,
+                    }))
+                    .unwrap(),
+                    stderr: String::new(),
+                }),
+                "ssh-keygen" => Command::new("ssh-keygen")
+                    .args(argv[1..].iter().map(String::as_str))
+                    .output()
+                    .map(|out| RunnerOutput {
+                        code: out.status.code().unwrap_or(1),
+                        stdout: out.stdout,
+                        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                    })
+                    .map_err(|e| io::Error::other(e.to_string())),
+                other => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("ca-form harness: unexpected program {other}"),
+                )),
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = format!("--home={}", dir.path().display());
+    let ceremony = dir.path();
+
+    // ── the ceremony mints a REAL CA; the fingerprint is the pin ──
+    let run = run_in(dir.path(), &["ca", "keygen", &home, "--json"]);
+    assert_eq!(run.code, Some(0), "keygen: {}", run.stderr);
+    let fingerprint = json_out(&run.stdout)["fingerprint"]
+        .as_str()
+        .expect("fingerprint in the --json report")
+        .to_string();
+    assert!(fingerprint.starts_with("SHA256:"), "{fingerprint}");
+
+    // ── enroll + publish + issue through the real verbs ──
+    let guest = real_guest_pub_line(dir.path());
+    enroll_and_publish_via_binary(dir.path(), IDENTITY, &guest);
+    let run = run_in(dir.path(), &["workers", "issue", &home, "--json"]);
+    assert_eq!(run.code, Some(0), "issue: {}", run.stderr);
+
+    // ── the issued record: the audit trail the executor consumes ──
+    let record_text = std::fs::read_to_string(
+        ceremony
+            .join(".config/shuttle/ca/issued")
+            .join(format!("issued-{IDENTITY}.json")),
+    )
+    .expect("issued record");
+    let record: shuttle::provision::publish::IssuedIdentity =
+        serde_json::from_str(&record_text).unwrap();
+    assert_eq!(record.ca_fingerprint, fingerprint);
+    assert_eq!(record.principals[0], IDENTITY, "machine identity first");
+
+    // ── the provision-time machine linkage: address → identity ──
+    let address = "ssh://root@203.0.113.9";
+    shuttle::provision::publish::record_machine_link(ceremony, IDENTITY, address).unwrap();
+
+    // ── the executor resolves the pin through the REAL ssh-keygen ──
+    let worker = WorkerConfig {
+        address: address.to_string(),
+        jobs: 1,
+        arch: None,
+        host_key: Some(fingerprint.clone()),
+    };
+    let fake = CapWorker {
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let calls = fake.calls.clone();
+    let cache = tempfile::tempdir().unwrap();
+    let ex = SshExecutor::with_ceremony_home(&worker, fake, cache.path(), ceremony)
+        .expect("executor builds");
+    ex.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("the CA pin enforces through the real ssh-keygen");
+
+    // ONE @cert-authority line; the pattern is the certificate's
+    // principal list, machine identity first; the key half is the
+    // ceremony CA whose REAL fingerprint equals the pin.
+    let pinned = std::fs::read_to_string(ex.known_hosts_path()).unwrap();
+    let ca_pub_line =
+        std::fs::read_to_string(ceremony.join(".config/shuttle/ca/ca.pub")).expect("ca.pub");
+    let key_half = ca_pub_line
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        pinned,
+        format!("@cert-authority {} {key_half}", record.principals.join(",")),
+        "the pinned fingerprint ↔ the cert's Signing CA are one identity"
+    );
+
+    // The connection runs under the machine identity.
+    let ssh_argv = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|argv| argv[0] == "ssh")
+        .expect("probed")
+        .clone();
+    assert!(ssh_argv.contains(&format!("HostKeyAlias={IDENTITY}")));
+    assert!(ssh_argv.contains(&"StrictHostKeyChecking=yes".to_string()));
+}
