@@ -8,7 +8,8 @@ use clap::Parser;
 use miette::{IntoDiagnostic, WrapErr};
 use shuttle::cache::PackageCache;
 use shuttle::cli::{
-    CacheCommand, Cli, Command, DepsCommand, IndexCommand, KeyCommand, PodCommand, RuntimeCommand,
+    CaCommand, CacheCommand, Cli, Command, DepsCommand, IndexCommand, KeyCommand, PodCommand,
+    RuntimeCommand,
 };
 use shuttle::image::ImageDeclaration;
 use shuttle::index::{IndexEntry, PackageIndex, StoreRef};
@@ -221,6 +222,8 @@ fn main() -> miette::Result<()> {
         Command::Cache(sub) => cmd_cache(sub),
 
         Command::Key(sub) => cmd_key(sub),
+
+        Command::Ca(sub) => cmd_ca(sub),
 
         Command::Runtime(sub) => cmd_runtime(sub),
 
@@ -3351,6 +3354,79 @@ fn verify_manifest_with_ceremony(
         shuttle::sign::check_provenance(entry, &parsed.inputs)?;
     }
     Ok(outcome)
+}
+
+// ── CA command (ADR-0045 amendment, #283 — the host CA ceremony) ──
+
+/// `shuttle ca` dispatch: keygen mints the host CA, list introspects it.
+fn cmd_ca(sub: CaCommand) -> miette::Result<()> {
+    match sub {
+        CaCommand::Keygen { home, force, json } => {
+            shuttle::output::set_mode(json);
+            ca_keygen(key_home(home), force)
+        }
+        CaCommand::List { home, json } => {
+            shuttle::output::set_mode(json);
+            ca_list(key_home(home))
+        }
+    }
+}
+
+/// `shuttle ca keygen`: mint the host CA keypair under the ceremony home
+/// and print its public line + ssh-keygen SHA256 fingerprint — the two
+/// values every downstream consumer (the `@cert-authority` pin, the
+/// workers-entry fingerprint) derives from.
+fn ca_keygen(home: PathBuf, force: bool) -> miette::Result<()> {
+    let runner = shuttle::command::RealRunner;
+    let info = shuttle::ca::create_ca_keypair(&runner, &home, force)?;
+    shuttle::output::ok(format!(
+        "host CA created: {} (fingerprint {})",
+        shuttle::ca::ca_secret_path(&home).display(),
+        info.fingerprint
+    ));
+    shuttle::output::info(format!(
+        "public half: {} — one @cert-authority line per operator (ADR-0045)",
+        shuttle::ca::ca_public_path(&home).display()
+    ));
+    print_report(&serde_json::json!({
+        "public_line": info.public_line,
+        "fingerprint": info.fingerprint,
+        "secret": shuttle::ca::ca_secret_path(&home).display().to_string(),
+        "public": shuttle::ca::ca_public_path(&home).display().to_string(),
+    }));
+    Ok(())
+}
+
+/// `shuttle ca list`: introspect the host CA. Absent is an informational
+/// hint (exit 0 — the ceremony has simply not run); a secret without its
+/// public half is a named refusal from [`shuttle::ca::inspect`].
+fn ca_list(home: PathBuf) -> miette::Result<()> {
+    let runner = shuttle::command::RealRunner;
+    match shuttle::ca::inspect(&runner, &home)? {
+        None => {
+            shuttle::output::info(format!(
+                "no host CA at {} (run `shuttle ca keygen`)",
+                shuttle::ca::ca_dir(&home).display()
+            ));
+            print_report(&serde_json::json!({ "present": false }));
+        }
+        Some(info) => {
+            shuttle::output::ok(format!("host CA: {}", info.fingerprint));
+            shuttle::output::info(format!("public line: {}", info.public_line));
+            if !info.secret_present {
+                shuttle::output::warn(
+                    "private half missing — introspection works, certificate issuance will not",
+                );
+            }
+            print_report(&serde_json::json!({
+                "present": true,
+                "secret_present": info.secret_present,
+                "public_line": info.public_line,
+                "fingerprint": info.fingerprint,
+            }));
+        }
+    }
+    Ok(())
 }
 
 // ── Runtime command (ADR-0012 step 5, Phase 24b) ──
