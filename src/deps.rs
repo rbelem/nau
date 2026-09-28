@@ -37,17 +37,98 @@ impl DepNode {
     }
 }
 
-/// Resolve transitive dependencies for a list of seed packages.
-///
-/// `seeds` can be package names (resolved via pkgs/) or paths to shuttle.lua files.
-/// Returns packages in topological build order (leaf dependencies first).
-pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<DepNode>> {
-    let mut nodes: Vec<DepNode> = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut pending: Vec<String> = seeds.to_vec();
+/// A resolved dependency node plus the constraint its edges selected
+/// (ADR-0047): `None` when every edge named the package bare; `Some(c)`
+/// when the edges carried `name@c` — the line the member's recipe must
+/// evaluate at.
+#[derive(Debug, Clone)]
+pub struct DepSpec {
+    pub name: String,
+    pub constraint: Option<String>,
+}
 
-    while let Some(seed) = pending.pop() {
-        let meta = load_meta(&seed)?;
+/// Split a requires/build_deps edge that may carry an `@constraint`
+/// (`name` or `name@constraint`) — the pod-spec grammar
+/// (`parse_pod_package`) applied to dependency edges (ADR-0047: a
+/// consumer pins a version line with the constraint, not a renamed
+/// sibling). A spec containing `/` is a path, not a name — never split.
+/// An empty or whitespace constraint is a malformed edge and errors.
+fn split_dep_spec(spec: &str) -> miette::Result<(&str, Option<&str>)> {
+    let Some((name, constraint)) = spec.split_once('@') else {
+        return Ok((spec, None));
+    };
+    if name.is_empty() || name.contains('/') {
+        return Ok((spec, None));
+    }
+    if constraint.is_empty() {
+        miette::bail!("invalid dependency spec '{spec}': version constraint must not be empty");
+    }
+    if constraint.contains(char::is_whitespace) {
+        miette::bail!(
+            "invalid dependency spec '{spec}': version constraint must not contain whitespace"
+        );
+    }
+    Ok((name, Some(constraint)))
+}
+
+/// One walked node: canonical name, effective constraint, raw edges.
+struct WalkNode {
+    name: String,
+    constraint: Option<String>,
+    requires: Vec<String>,
+    build_deps: Vec<String>,
+}
+
+/// Collapse the per-name edge-constraint sets into one effective
+/// constraint per name: the single declared line, or None when every
+/// edge was bare. Two DIFFERENT constraints for one name fail named:
+/// one pod holds one version of a name (ADR-0047 Decision 2), and
+/// disagreeing lines are a declaration conflict, not a first-match
+/// race. Bare edges impose no constraint and compose with any
+/// constrained edge of the same name.
+fn effective_constraints(
+    edge_constraints: &HashMap<String, Vec<String>>,
+) -> miette::Result<HashMap<String, Option<String>>> {
+    let mut out = HashMap::with_capacity(edge_constraints.len());
+    let mut ordered: Vec<&String> = edge_constraints.keys().collect();
+    ordered.sort();
+    for name in ordered {
+        let seen = &edge_constraints[name];
+        let constraint = match seen.len() {
+            0 => None,
+            1 => Some(seen[0].clone()),
+            _ => miette::bail!(
+                "conflicting version lines for '{name}' in one dependency closure: {} — \
+                 one pod holds one version of a name (ADR-0047); align the constraints",
+                seen.iter()
+                    .map(|c| format!("@{c}"))
+                    .collect::<Vec<_>>()
+                    .join(" vs ")
+            ),
+        };
+        out.insert(name.clone(), constraint);
+    }
+    Ok(out)
+}
+
+/// The shared resolution walk: loads each seed (its edge may carry an
+/// `@constraint` — the constraint rides the recipe eval), follows
+/// `requires` ∪ `build_deps` transitively when `recursive`, and returns
+/// nodes in topological build order. Constraints merge through
+/// [`effective_constraints`].
+fn resolve_walk(seeds: &[String], recursive: bool) -> miette::Result<Vec<WalkNode>> {
+    let mut nodes: Vec<WalkNode> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    // name → every constraint any edge used to reach it (deduped).
+    let mut edge_constraints: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pending: Vec<(String, Option<String>)> = Vec::new();
+    for seed in seeds {
+        let (base, constraint) = split_dep_spec(seed)?;
+        pending.push((base.to_string(), constraint.map(str::to_string)));
+    }
+
+    while let Some((seed, constraint)) = pending.pop() {
+        let meta = load_meta_for(&seed, constraint.as_deref())?;
         // Canonical identity: a seed may name a package through an alias
         // (e.g. "toolchain" → toolchain-gcc-gnu-x86_64). Every downstream
         // consumer — payload naming, cache keys, build order — keys on the
@@ -59,6 +140,12 @@ pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<Dep
         } else {
             meta.name.clone()
         };
+        if let Some(c) = &constraint {
+            let seen = edge_constraints.entry(name.clone()).or_default();
+            if !seen.contains(c) {
+                seen.push(c.clone());
+            }
+        }
         if !visited.insert(name.clone()) {
             continue;
         }
@@ -76,24 +163,87 @@ pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<Dep
             .cloned()
             .collect();
 
-        nodes.push(DepNode {
+        nodes.push(WalkNode {
             name: name.clone(),
+            constraint,
             requires: requires.clone(),
             build_deps: build_deps.clone(),
         });
 
         if recursive {
             for dep in requires.iter().chain(&build_deps) {
-                if !visited.contains(dep) {
-                    pending.push(dep.clone());
+                let (base, c) = split_dep_spec(dep)?;
+                if !visited.contains(base) {
+                    pending.push((base.to_string(), c.map(str::to_string)));
+                } else {
+                    // Already resolved — still record the edge's
+                    // constraint so a conflict between two edges that
+                    // both name an already-visited node fails loud.
+                    if let Some(c) = c {
+                        let seen = edge_constraints.entry(base.to_string()).or_default();
+                        if !seen.contains(&c.to_string()) {
+                            seen.push(c.to_string());
+                        }
+                    }
                 }
             }
         }
     }
 
+    // Conflicting lines: one name, two different constraints — refuse
+    // instead of letting edge order pick the winner silently.
+    let effective = effective_constraints(&edge_constraints)?;
+    for node in &mut nodes {
+        node.constraint = effective.get(&node.name).cloned().flatten();
+    }
+
     // Topological sort: leaves first
-    let sorted = topological_sort(&nodes);
-    Ok(sorted)
+    let sorted = topological_sort(
+        &nodes
+            .iter()
+            .map(|n| DepNode {
+                name: n.name.clone(),
+                requires: n.requires.clone(),
+                build_deps: n.build_deps.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut order: HashMap<String, usize> = HashMap::new();
+    for (i, node) in sorted.iter().enumerate() {
+        order.insert(node.name.clone(), i);
+    }
+    nodes.sort_by_key(|n| order.get(&n.name).copied().unwrap_or(usize::MAX));
+    Ok(nodes)
+}
+
+/// Resolve transitive dependencies for a list of seed packages.
+///
+/// `seeds` can be package names (resolved via pkgs/), paths to shuttle.lua files,
+/// or `name@constraint` edges — the constraint rides the recipe eval
+/// (ADR-0047). Returns packages in topological build order (leaf
+/// dependencies first).
+pub fn resolve_deps(seeds: &[String], recursive: bool) -> miette::Result<Vec<DepNode>> {
+    Ok(resolve_walk(seeds, recursive)?
+        .into_iter()
+        .map(|n| DepNode {
+            name: n.name,
+            requires: n.requires,
+            build_deps: n.build_deps,
+        })
+        .collect())
+}
+
+/// Like [`resolve_deps`], but each node also carries the constraint its
+/// edges selected — the load-with-constraint input for closure members
+/// (ADR-0047).
+pub fn resolve_dep_specs(seeds: &[String], recursive: bool) -> miette::Result<Vec<DepSpec>> {
+    Ok(resolve_walk(seeds, recursive)?
+        .into_iter()
+        .map(|n| DepSpec {
+            name: n.name,
+            constraint: n.constraint,
+        })
+        .collect())
 }
 
 /// Resolve transitive dependencies and return names in build order.
@@ -246,16 +396,26 @@ fn topological_sort(nodes: &[DepNode]) -> Vec<DepNode> {
 /// 1. Filesystem path or resolved pkgs/<letter>/<name>.lua
 /// 2. Package source inputs (cached GitHub repos, local paths)
 pub fn load_meta(name_or_path: &str) -> miette::Result<SnapMeta> {
+    load_meta_for(name_or_path, None)
+}
+
+/// [`load_meta`] with the eval-context constraint (ADR-0047 Decision 4):
+/// the pod spec's or dependency edge's `@constraint` rides the recipe
+/// eval as the `constraint` global, so a version-lined recipe selects its
+/// line. `name_or_path` must already be constraint-free — use
+/// [`split_dep_spec`] on raw edge specs.
+pub fn load_meta_for(name_or_path: &str, constraint: Option<&str>) -> miette::Result<SnapMeta> {
     match crate::pkg_source::resolve_pkg(name_or_path) {
         crate::pkg_source::PkgResult::File(path) => {
-            let outputs = crate::lua::evaluate_file(&path)?;
+            let outputs = crate::lua::evaluate_file_with_constraint(&path, constraint)?;
             outputs
                 .into_values()
                 .next()
                 .ok_or_else(|| miette::miette!("no outputs found in '{}'", path))
         }
         crate::pkg_source::PkgResult::Found { content, .. } => {
-            let outputs = crate::lua::evaluate_string(name_or_path, &content)?;
+            let outputs =
+                crate::lua::evaluate_string_with_constraint(name_or_path, &content, constraint)?;
             outputs
                 .into_values()
                 .next()
@@ -275,6 +435,16 @@ pub fn load_meta(name_or_path: &str) -> miette::Result<SnapMeta> {
 /// Resolve a package name to a path: checks local file system and input sources.
 pub fn resolve_path(name_or_path: &str) -> PathBuf {
     crate::pkg_source::resolve_path(name_or_path)
+}
+
+/// The constraint-free base of a recipe reference: [`split_dep_spec`]
+/// without the error cases — pod code uses this to strip a spec before
+/// re-resolution (`resolve_pkg` matches file names, not constraints).
+pub fn dep_spec_base(spec: &str) -> &str {
+    match split_dep_spec(spec) {
+        Ok((base, _)) => base,
+        Err(_) => spec,
+    }
 }
 
 /// The directory that ships beside a package's recipe: the parent of the
@@ -512,6 +682,59 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 3, "cycle members are not dropped: {names:?}");
         assert_eq!(names[0], "c", "free node sorts first");
+    }
+
+    // ── requires-edge constraints (ADR-0047) ──
+
+    #[test]
+    fn split_dep_spec_parses_name_and_constraint() {
+        assert_eq!(split_dep_spec("glibc").unwrap(), ("glibc", None));
+        assert_eq!(split_dep_spec("node@22").unwrap(), ("node", Some("22")));
+        assert_eq!(split_dep_spec("node@22.2").unwrap(), ("node", Some("22.2")));
+        // A path is never split, even when it contains '@'.
+        assert_eq!(
+            split_dep_spec("examples/x@1/pkg.lua").unwrap(),
+            ("examples/x@1/pkg.lua", None)
+        );
+        // Malformed edges error.
+        assert!(split_dep_spec("node@").is_err());
+        assert!(split_dep_spec("node@2 2").is_err());
+    }
+
+    #[test]
+    fn effective_constraints_pick_the_single_line() {
+        let map = HashMap::from([
+            ("glibc".to_string(), Vec::new()),
+            ("node".to_string(), vec!["22".to_string()]),
+        ]);
+        let eff = effective_constraints(&map).unwrap();
+        assert_eq!(eff["glibc"], None);
+        assert_eq!(eff["node"].as_deref(), Some("22"));
+    }
+
+    #[test]
+    fn effective_constraints_refuse_conflicting_lines() {
+        // Two edges naming one package with different constraints: one
+        // pod holds one version of a name (ADR-0047 D2) — the walk
+        // refuses instead of letting edge order pick the winner.
+        let map = HashMap::from([("node".to_string(), vec!["22".to_string(), "26".to_string()])]);
+        let err = effective_constraints(&map).expect_err("conflicting lines must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("conflicting version lines for 'node'")
+                && msg.contains("@22")
+                && msg.contains("@26"),
+            "refusal must name the package and both lines: {msg}"
+        );
+    }
+
+    #[test]
+    fn effective_constraints_compose_bare_and_constrained_edges() {
+        // A bare edge imposes no constraint: bare + @22 of one name is
+        // one node at line 22, not a conflict.
+        let map = HashMap::from([("node".to_string(), vec!["22".to_string()])]);
+        let eff = effective_constraints(&map).unwrap();
+        assert_eq!(eff["node"].as_deref(), Some("22"));
     }
 
     // ── input-source resolution (no eval; process-global state, serialized) ──
