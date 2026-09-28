@@ -447,8 +447,8 @@ pub fn parse_publish_payload(bytes: &[u8]) -> miette::Result<PublishPayload> {
              the full `<keytype> <base64>` half"
         ));
     }
-    crate::lua::validate_host_key(public_key)
-        .map_err(|e| miette::miette!("publish: 'public_key' fails the host-key grammar: {e}"))?;
+    crate::lua::validate_public_key_line(public_key)
+        .map_err(|e| miette::miette!("publish: 'public_key' fails the public-key grammar: {e}"))?;
     let instance_identity = obj
         .get("instance_identity")
         .and_then(Value::as_object)
@@ -852,7 +852,7 @@ pub fn issue_certificate(
     // Defense at the trust boundary: the pending store is on-disk state
     // a crash or tamper could have mangled — re-check the key grammar
     // before putting it in front of ssh-keygen.
-    crate::lua::validate_host_key(&entry.public_key).map_err(|e| {
+    crate::lua::validate_public_key_line(&entry.public_key).map_err(|e| {
         miette::miette!(
             "issue: pending entry for '{}' carries a malformed public key — refusing to sign \
              it: {e}",

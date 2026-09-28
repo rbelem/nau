@@ -203,6 +203,34 @@ recorded here because the principal/address gap decides the mechanics:
   coordinator's preflight reports the worker unreachable, named by
   address.
 
+### Retirement (#295 sub-task 5): mint-and-inject is removed
+
+The epic's closing step narrows the config/executor surface the
+amendment left temporarily alive, and the retirement is a breaking
+config change by design:
+
+- `SshExecutor` no longer resolves the legacy public-key-line pin — the
+  variant and its `[host]:port`-scoped known_hosts form are deleted.
+  The CA fingerprint (`SHA256:…`) is the ONLY pin form; the executor
+  refuses a retired pin at preflight, by name, with zero channel
+  activity.
+- The workers-entry `host_key` grammar is fingerprint-only at parse: a
+  config still carrying a full public-key line refuses with the remedy
+  — *re-pin with the CA fingerprint from `shuttle ca list`*. Existing
+  configs must re-pin; the migration is one `shuttle ca list` away.
+- The guest-published public half is a different grammar and keeps its
+  `<keytype> <base64> [comment]` validation (`validate_public_key_line`)
+  — the published half is a key, never a pin.
+- Port-coverage semantics survive the retirement: the `@cert-authority`
+  line scopes by certificate principal, so a non-default-port worker is
+  covered without the old `[host]:port` pattern; the port rides the ssh
+  argv and the match rides `HostKeyAlias`.
+- The amendment's claims are test-enforced: no user-data carries a
+  private half (per-provider absence assertions), the executor refuses
+  unpinned AND retired-pinned workers by name, and the pinned
+  fingerprint ≡ issued record's `ca_fingerprint` ≡ `ssh-keygen -L`
+  Signing CA chain keeps its real-binary proof.
+
 ## Revisit triggers
 
 - Workers crossing trust domains (shared/multi-org pools) — replace the

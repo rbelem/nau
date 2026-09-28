@@ -19,9 +19,11 @@ use shuttle::worker::{
     ClosureObject, JobManifest, JobResult, WORKER_PROTOCOL_VERSION,
 };
 
-/// A shape-valid ed25519 public-key line (the pin grammar needs the key
-/// type plus base64; the fake never validates cryptography).
-const ED25519_PIN: &str =
+/// The RETIRED pin form: a shape-valid ed25519 public-key line, the
+/// mint-and-inject pin. Kept only as the fixture the legacy-refusal
+/// tests prove refused (#295 sub-task 5) — no test pins a worker with
+/// it anymore.
+const LEGACY_LINE_PIN: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux loopback-pin";
 const FINGERPRINT_PIN: &str = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG";
 /// The CA public half the ceremony fixture writes: the fake fingerprints
@@ -429,10 +431,17 @@ fn worker_cfg(address: &str, pin: Option<&str>) -> WorkerConfig {
 }
 
 fn executor(fake: LoopbackWorker, cache: &Path) -> SshExecutor<LoopbackWorker> {
-    SshExecutor::with_cache_dir(
-        &worker_cfg("ssh://localhost", Some(ED25519_PIN)),
+    // The pin is the CA fingerprint (the only form), so the helper rides
+    // a hermetic ceremony fixture nested in the same tempdir root: the
+    // CA public half on disk, the machine linkage for the address, and
+    // the fake's default fingerprint report matching [`FINGERPRINT_PIN`].
+    let ceremony = cache.join("ceremony");
+    ca_ceremony(&ceremony);
+    SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
         fake,
         cache,
+        &ceremony,
     )
     .expect("executor builds")
 }
@@ -542,10 +551,14 @@ fn preflight_happy_and_the_pinned_bounded_argv() {
         .expect("happy preflight");
     assert_eq!(cap.protocol, WORKER_PROTOCOL_VERSION);
 
+    let ssh_hops = LoopbackWorker::count_program(&calls, "ssh");
     let calls = calls.lock().unwrap();
-    assert_eq!(calls.len(), 1, "exactly one channel hop");
-    let argv = &calls[0];
-    assert_eq!(argv[0], "ssh");
+    // One coordinator-side `ssh-keygen -lf` (the fingerprint check)
+    // precedes exactly one channel hop.
+    assert_eq!(calls.len(), 2, "fingerprint check, then the dial");
+    assert_eq!(calls[0][0], "ssh-keygen");
+    assert_eq!(ssh_hops, 1, "exactly one channel hop");
+    let argv = calls.iter().find(|a| a[0] == "ssh").expect("the ssh dial");
     assert_eq!(argv[argv.len() - 1], "shuttle __worker-cap");
     assert_eq!(argv[argv.len() - 2], "localhost");
     for opt in [
@@ -573,23 +586,40 @@ fn preflight_happy_and_the_pinned_bounded_argv() {
         .expect("managed known_hosts option");
     let known_path = known.strip_prefix("UserKnownHostsFile=").unwrap();
     let pinned = std::fs::read_to_string(known_path).expect("managed known_hosts written");
-    let key_half = ED25519_PIN
+    let key_half = CA_PUB_LINE
         .split_whitespace()
         .take(2)
         .collect::<Vec<_>>()
         .join(" ");
-    assert_eq!(pinned, format!("localhost {key_half}"));
+    assert_eq!(pinned, format!("@cert-authority {CA_IDENTITY} {key_half}"));
 }
 
 #[test]
 fn known_hosts_pattern_covers_the_non_default_port() {
+    // Port-coverage semantics survive the CA form: a worker dialed on a
+    // non-default port resolves its fingerprint pin the same way, and
+    // the @cert-authority line scopes by CERTIFICATE PRINCIPAL (the
+    // machine identity), not by an address pattern — so the pin covers
+    // every port by construction. The port still rides the argv; the
+    // HostKeyAlias (not a [host]:port known_hosts key) carries the
+    // match.
     let cache = tempfile::tempdir().unwrap();
     let machine = tempfile::tempdir().unwrap();
+    let ceremony = tempfile::tempdir().unwrap();
+    ca_ceremony(ceremony.path());
+    shuttle::provision::publish::record_machine_link(
+        ceremony.path(),
+        CA_IDENTITY,
+        "ssh://localhost:2222",
+    )
+    .unwrap();
     let fake = LoopbackWorker::new(machine.path());
-    let ex = SshExecutor::with_cache_dir(
-        &worker_cfg("ssh://localhost:2222", Some(ED25519_PIN)),
+    let calls = fake.calls_handle();
+    let ex = SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost:2222", Some(FINGERPRINT_PIN)),
         fake,
         cache.path(),
+        ceremony.path(),
     )
     .unwrap();
     ex.preflight(PreflightChecks {
@@ -598,12 +628,27 @@ fn known_hosts_pattern_covers_the_non_default_port() {
     })
     .expect("preflight with port");
     let pinned = std::fs::read_to_string(ex.known_hosts_path()).unwrap();
-    let key_half = ED25519_PIN
+    let key_half = CA_PUB_LINE
         .split_whitespace()
         .take(2)
         .collect::<Vec<_>>()
         .join(" ");
-    assert_eq!(pinned, format!("[localhost]:2222 {key_half}"));
+    // The pattern is the machine identity — the certificate principal —
+    // never a [host]:port form; the principal pattern is port-blind.
+    assert_eq!(pinned, format!("@cert-authority {CA_IDENTITY} {key_half}"));
+    // The dial itself carries the port; the alias is verbatim.
+    let ssh_argv = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|argv| argv[0] == "ssh")
+        .expect("preflight probed the worker")
+        .clone();
+    assert!(
+        ssh_argv.windows(2).any(|w| w[0] == "-p" && w[1] == "2222"),
+        "ssh carries -p 2222: {ssh_argv:?}"
+    );
+    assert!(ssh_argv.contains(&format!("HostKeyAlias={CA_IDENTITY}")));
 }
 
 #[test]
@@ -625,7 +670,8 @@ fn unpinned_and_malformed_pins_refuse_before_any_channel_activity() {
     assert!(err.to_string().contains("unpinned"), "{err:#}");
     assert_eq!(calls.lock().unwrap().len(), 0, "no channel activity");
 
-    // A single unparseable token is not a pin in either grammar.
+    // A single unparseable token is not a pin in the (only) fingerprint
+    // grammar — the retired-pin refusal names it and carries the remedy.
     let fake = LoopbackWorker::new(machine.path());
     let calls = fake.calls_handle();
     let ex = SshExecutor::with_cache_dir(
@@ -639,11 +685,52 @@ fn unpinned_and_malformed_pins_refuse_before_any_channel_activity() {
             arch: None,
             min_free_disk: 0,
         })
-        .expect_err("malformed pin refuses");
+        .expect_err("non-fingerprint pin refuses");
     let err = err.to_string();
-    assert!(err.contains("unenforceable pin"), "{err}");
+    assert!(err.contains("retired pin"), "{err}");
+    assert!(err.contains("shuttle ca list"), "the remedy rides: {err}");
     assert!(err.contains("localhost"), "{err}");
     assert_eq!(calls.lock().unwrap().len(), 0, "no channel activity");
+}
+
+/// The amendment contract, executor side: a config still carrying the
+/// retired mint-and-inject pin (a full public-key line) refuses at
+/// preflight — by name, with the re-pin remedy, and with zero channel
+/// activity. The fingerprint is the only pin form (#295 sub-task 5).
+#[test]
+fn legacy_public_key_line_pins_are_refused_with_the_re_pin_remedy() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let fake = LoopbackWorker::new(machine.path());
+    let calls = fake.calls_handle();
+    let ex = SshExecutor::with_cache_dir(
+        &worker_cfg("ssh://localhost", Some(LEGACY_LINE_PIN)),
+        fake,
+        cache.path(),
+    )
+    .unwrap();
+    let err = ex
+        .preflight(PreflightChecks {
+            arch: None,
+            min_free_disk: 0,
+        })
+        .expect_err("the retired pin form refuses");
+    let err = err.to_string();
+    assert!(err.contains("retired pin"), "{err}");
+    assert!(
+        err.contains("mint-and-inject"),
+        "names the retired mechanism: {err}"
+    );
+    assert!(
+        err.contains("re-pin with the CA fingerprint from `shuttle ca list`"),
+        "the operator migration path rides: {err}"
+    );
+    assert!(err.contains("localhost"), "refused by name: {err}");
+    assert_eq!(
+        LoopbackWorker::count_program(&calls, "ssh"),
+        0,
+        "no channel activity"
+    );
 }
 
 /// The ceremony fixture for the CA-form tests: the CA public half on
@@ -1247,10 +1334,19 @@ fn scp_rides_the_same_port_flag_shape() {
     fake.scripted_files = files;
     let calls = fake.calls_handle();
     preseed_object(machine.path(), &sha_a, &blob_a);
-    let ex = SshExecutor::with_cache_dir(
-        &worker_cfg("ssh://localhost:2222", Some(ED25519_PIN)),
+    let ceremony = tempfile::tempdir().unwrap();
+    ca_ceremony(ceremony.path());
+    shuttle::provision::publish::record_machine_link(
+        ceremony.path(),
+        CA_IDENTITY,
+        "ssh://localhost:2222",
+    )
+    .unwrap();
+    let ex = SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost:2222", Some(FINGERPRINT_PIN)),
         fake,
         cache.path(),
+        ceremony.path(),
     )
     .unwrap();
 

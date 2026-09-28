@@ -26,12 +26,14 @@
 //! all — the one-time publish token is the only bearer it carries, and
 //! it dies at the first accepted publish.
 //!
-//! **Epic #295 state (sub-tasks 1–4 landed)**: the CA flow works end to
-//! end — guest gen → publish → issue → pickup → cert served → the
-//! coordinator connects with a `@cert-authority` pin built from the CA
-//! fingerprint (the machine linkage under `ca/machines/` binds each
-//! pinned address to its certificate principal). Sub-task 5 retires the
-//! legacy mint-and-inject paths; until then nothing here emits them.
+//! **Epic #295 state (all five sub-tasks landed)**: the CA flow works
+//! end to end and is the ONLY flow — guest gen → publish → issue →
+//! pickup → cert served → the coordinator connects with a
+//! `@cert-authority` pin built from the CA fingerprint (the machine
+//! linkage under `ca/machines/` binds each pinned address to its
+//! certificate principal). Mint-and-inject is retired: nothing here
+//! ever mints or injects a host key, and config pins that predate the
+//! amendment refuse at parse with the re-pin remedy.
 
 pub mod aws;
 pub mod azure;

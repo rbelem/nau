@@ -136,16 +136,17 @@ pub struct WorkerConfig {
     /// when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
-    /// The pinned SSH host identity (ADR-0045 Decision 4, amended by
+    /// The pinned SSH host identity (ADR-0045 Decision 4, as amended by
     /// #295): the host CA's `SHA256:` fingerprint (the `shuttle ca list`
-    /// form) — the executor builds a shuttle-managed `@cert-authority`
-    /// known_hosts entry from the ceremony CA whose fingerprint matches,
-    /// scoped to the worker's certificate principals and connected under
-    /// the provisioned machine identity — or the legacy full public-key
-    /// line (`ssh-ed25519 AAAA... [comment]`, the retired mint-and-inject
-    /// pin). Pins are never learned: `StrictHostKeyChecking=yes` against
-    /// the managed known_hosts, and preflight refuses a worker whose pin
-    /// cannot be enforced by name. No `ssh-keyscan` path exists.
+    /// form) — the only pin form. The executor builds a shuttle-managed
+    /// `@cert-authority` known_hosts entry from the ceremony CA whose
+    /// fingerprint matches, scoped to the worker's certificate principals
+    /// and connected under the provisioned machine identity. Pins are
+    /// never learned: `StrictHostKeyChecking=yes` against the managed
+    /// known_hosts, and preflight refuses a worker whose pin cannot be
+    /// enforced by name. The retired mint-and-inject pin (a full
+    /// public-key line) refuses at parse with the re-pin remedy. No
+    /// `ssh-keyscan` path exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_key: Option<String>,
 }
@@ -456,24 +457,15 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
 }
 
 /// The `host_key` pin grammar (ADR-0045 Decision 4, as amended by #295):
-/// either a full public-key line — `<keytype> <base64> [comment]`, usable
-/// verbatim as a known_hosts key (the legacy mint-and-inject pin;
-/// sub-task 5 retires it) — or an OpenSSH `SHA256:<43 base64 chars>`
-/// fingerprint, THE form: the host CA's fingerprint (`shuttle ca list`),
-/// which the executor enforces as a `@cert-authority` known_hosts entry
-/// bound to the worker's certificate principals. Shared with the publish
-/// receive surface (the guest's published public half must satisfy the
-/// same grammar it will ride a config with).
+/// an OpenSSH `SHA256:<43 base64 chars>` fingerprint — THE form and the
+/// only one: the host CA's fingerprint (`shuttle ca list`), which the
+/// executor enforces as a `@cert-authority` known_hosts entry bound to
+/// the worker's certificate principals. The retired mint-and-inject pin
+/// (a full public-key line) refuses by name with the re-pin remedy;
+/// mint-and-inject is dead (#295 sub-task 5). The guest-published public
+/// half is a DIFFERENT grammar — [`validate_public_key_line`], which the
+/// publish receive surface uses.
 pub fn validate_host_key(raw: &str) -> miette::Result<()> {
-    const KEY_TYPES: &[&str] = &[
-        "ssh-ed25519",
-        "ecdsa-sha2-nistp256",
-        "ecdsa-sha2-nistp384",
-        "ecdsa-sha2-nistp521",
-        "ssh-rsa",
-        "rsa-sha2-256",
-        "rsa-sha2-512",
-    ];
     if let Some(fp) = raw.strip_prefix("SHA256:") {
         if fp.len() == 43 && fp.bytes().all(is_base64_char) {
             return Ok(());
@@ -482,17 +474,48 @@ pub fn validate_host_key(raw: &str) -> miette::Result<()> {
             "a fingerprint pin must be 'SHA256:' + 43 base64 characters (the OpenSSH form), got '{raw}'"
         ));
     }
+    if looks_like_public_key_line(raw) {
+        return Err(miette::miette!(
+            "host_key carries a full public-key line — the retired mint-and-inject pin form \
+             (ADR-0045 as amended by #295): re-pin with the CA fingerprint from `shuttle ca list`"
+        ));
+    }
+    Err(miette::miette!(
+        "host_key must be the host CA's fingerprint ('SHA256:' + 43 base64 characters, the \
+         `shuttle ca list` form), got '{raw}' — re-pin with the CA fingerprint from \
+         `shuttle ca list`"
+    ))
+}
+
+/// The known SSH host-key types (the published-half grammar and the
+/// legacy-pin shape check).
+const HOST_KEY_TYPES: &[&str] = &[
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "ssh-rsa",
+    "rsa-sha2-256",
+    "rsa-sha2-512",
+];
+
+/// The published public-key-line grammar: `<keytype> <base64> [comment]`,
+/// usable verbatim as a known_hosts key. This is the GUEST's published
+/// host-key half (the publish receive surface and the issue-path defense
+/// re-check), not a config pin — config pins are CA fingerprints only
+/// ([`validate_host_key`]).
+pub fn validate_public_key_line(raw: &str) -> miette::Result<()> {
     let mut parts = raw.split_whitespace();
     let key_type = parts.next();
     let key = parts.next();
     let comment = parts.next();
     if parts.next().is_some() {
         return Err(miette::miette!(
-            "expected '<keytype> <base64> [comment]' or 'SHA256:<fingerprint>', got '{raw}'"
+            "expected '<keytype> <base64> [comment]', got '{raw}'"
         ));
     }
     match (key_type, key, comment) {
-        (Some(k), Some(key), comment) if KEY_TYPES.contains(&k) => {
+        (Some(k), Some(key), comment) if HOST_KEY_TYPES.contains(&k) => {
             let comment_ok = comment.is_none_or(|c| !c.starts_with('-') && !c.contains(char::is_whitespace));
             let key_ok = key.len() >= 16 && key.bytes().all(|b| is_base64_char(b) || b == b'=');
             if key_ok && comment_ok {
@@ -502,13 +525,22 @@ pub fn validate_host_key(raw: &str) -> miette::Result<()> {
                 "'{k}' is a known host-key type, but the entry is not a valid public-key line: '{raw}'"
             ))
         }
-        (Some(k), ..) if !KEY_TYPES.contains(&k) => Err(miette::miette!(
-            "unknown host-key type '{k}' (expected ssh-ed25519, ecdsa-sha2-nistp*, ssh-rsa, rsa-sha2-*, or a SHA256: fingerprint)"
+        (Some(k), ..) if !HOST_KEY_TYPES.contains(&k) => Err(miette::miette!(
+            "unknown host-key type '{k}' (expected ssh-ed25519, ecdsa-sha2-nistp*, ssh-rsa, or rsa-sha2-*)"
         )),
         _ => Err(miette::miette!(
-            "expected '<keytype> <base64> [comment]' or 'SHA256:<fingerprint>', got '{raw}'"
+            "expected '<keytype> <base64> [comment]', got '{raw}'"
         )),
     }
+}
+
+/// True when `raw` opens like a known-keytype public-key line — the
+/// retired mint-and-inject pin shape, refused by name in
+/// [`validate_host_key`].
+fn looks_like_public_key_line(raw: &str) -> bool {
+    raw.split_whitespace()
+        .next()
+        .is_some_and(|k| HOST_KEY_TYPES.contains(&k))
 }
 
 /// One base64 character (standard alphabet, no padding).
