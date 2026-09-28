@@ -942,7 +942,7 @@ pub(crate) fn build_disk_image_with(
         // FAIL-CLOSED like the §4 embeds below: a build with an update
         // source but no ceremony key never ships unverifiable transfers,
         // it refuses.
-        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+        let home = verify::operator_home()?;
         let kp = load_signing_key_fail_closed(&home)?;
         let pubring = crate::sign::sysupdate_pubring_pgp(&kp, &home)
             .wrap_err("deriving the sysupdate import-pubring.pgp trust set")?;
@@ -977,11 +977,12 @@ pub(crate) fn build_disk_image_with(
         // bless tooling is present in the staged rootfs. An assessment the
         // staged tree cannot back is never packed.
         assert_bless_boot_tooling_staged(&root)?;
-    } else if disk_layout.ab {
-        eprintln!(
-            "  ℹ disk.ab = true without update_source — sysupdate transfer \
-             files skipped (a local-source transfer carries no verification)"
-        );
+    } else if let Some(reason) = sysupdate_skip_reason(image, disk_layout) {
+        // #293 item 6: the skip shapes PRINT — the ab-without-source
+        // mirror was always loud, so update_source-without-ab (a declared
+        // update channel that can never deliver) is loud too. One message
+        // source: state::sysupdate_skip_reason.
+        eprintln!("  ℹ {reason}");
     }
 
     // 5d. ADR-0024 §4: when the image declares an update source, embed the
@@ -992,7 +993,7 @@ pub(crate) fn build_disk_image_with(
     // trusts a key (that would contradict "a rotation whose new key has not
     // been promoted is not trusted"). Keygen is the operator's ceremony.
     if image.update_source.is_some() {
-        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+        let home = verify::operator_home()?;
         let kp = load_signing_key_fail_closed(&home)?;
 
         // 5d-i. The trusted key set: every local anchor, plus the current
@@ -1561,6 +1562,7 @@ pub(crate) fn build_disk_image_with(
     // plus, for sysupdate images, the carved transfer payloads (#274).
     if let Some(rel) = release {
         release::publish(
+            runner,
             &output_path,
             &manifest,
             arch,

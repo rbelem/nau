@@ -14,7 +14,7 @@ observed on the ESP through a real update — not a hand-planted UKI.
 | `gen2.lua` | the update payload build: version 2.0, health gate `/bin/false` so the counted UKI is never blessed — the `+3-0` → `+2-1` decrement stays observable |
 | `gen2-bless.lua` | same payload with health gate `/bin/true`: the boot-complete.target ceremony runs and the counter suffix is shed (bless path) |
 | `proof/` | per-generation proof oneshots (`shuttle-80-proof.service` echoes the generation into the boot), the clean-poweroff oneshot, the `/etc/generation` marker, the journald console drop-in |
-| `prepare.sh` | stages the guest sysupdate tooling, builds all three images, extracts the payload artifacts (`root_@v_@u.img`, `verity-hash_@v_@u.img`, `<name>_@v.efi`) plus `SHA256SUMS` from the payload build's slot A |
+| `prepare.sh` | stages the guest sysupdate tooling, builds all three images, and publishes each payload build through `shuttle image --release` (#274): the payload artifacts (`root_@v_@u.img`, `verity-hash_@v_@u.img`, `<name>_@v.efi`) land under their `@u` names with the SIGNED `SHA256SUMS` + `SHA256SUMS.gpg` beside them; real device-side verification folds into the QEMU axis |
 | `tools/` | `http-fetch`: a ~200-line Rust stand-in for `systemd-pull` (see "Why a fetcher stand-in" below) |
 | `local/` | (gitignored) populated by `prepare.sh`: the anchored fetcher binary and payload-tooling copies |
 

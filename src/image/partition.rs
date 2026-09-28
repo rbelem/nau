@@ -1427,7 +1427,10 @@ pub(crate) fn setup_uc_context(
 
     // Build the signed model assertion and stage the seed + modeenv trees.
     let model = crate::uc::ModelAssertion::from_image(image, arch, &snap_ids)?;
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    // #293 item 8: the central fail-closed HOME resolution — a CWD
+    // fallback would silently load-or-create the assertion key under
+    // ./.config/shuttle.
+    let home = super::verify::operator_home()?;
     // snapd verifies assertions with OpenPGP v4 RSA — a DIFFERENT key (and
     // crypto) from the ADR-0011 manifest key, persisted separately.
     let key = crate::uc::SnapdAssertionKey::load_or_create(&home)?;

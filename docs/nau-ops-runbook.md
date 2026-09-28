@@ -483,6 +483,36 @@ sysupdate identity bakes into the base rootfs as
 `/usr/lib/systemd/import-pubring.pgp` (the device-side anchor). That
 keychain is the ONLY legitimate source of `--key` files anywhere below.
 
+### 7.1-bis The device-side update verification mechanism (#293 item 10)
+
+What actually checks an update on the device — recorded so an operator
+can audit the chain without reading systemd sources:
+
+- `systemd-sysupdate` verifies `SHA256SUMS` through a **gpg subprocess**
+  (never internal crypto): `Verify=yes` hands `SHA256SUMS` +
+  `SHA256SUMS.gpg` to the guest's `gpg` with the vendor keyring
+  `/usr/lib/systemd/import-pubring.pgp` as the only trust input — the
+  file the build embeds BEFORE the root is hashed (§7.1), so the anchor
+  is covered by the dm-verity the device boots. The guest must ship gpg
+  (the build refuses to emit transfers for a gpg-less rootfs, #291).
+- The signature is OpenPGP over the RAW sums bytes with an
+  **EdDSALegacy (algorithm 22)** Ed25519 identity — the ceremony key's
+  sysupdate identity from §7.1.
+- sysupdate's SHA256SUMS parser checks every payload hash
+  unconditionally; `Verify=no` would only lift the signature gate, never
+  the hash checks.
+- **Minimum systemd: ≥ 251** — the url-file transfer + SHA256SUMS +
+  `Verify=` machinery this ride needs (cross-checked against systemd
+  main by the trust-slice council: `VENDOR_KEYRING_PATH` wiring, the
+  alg-22 path, the sums parser). The build's base-version gate floors
+  the boot-assessment machinery at 240 (src/image/boot.rs); a base
+  between the two runs updates with verification the base's systemd may
+  not fully honor — recorded, not yet enforced.
+- The host-side release self-check (src/image/release.rs) executes both
+  halves in-process before a media set is reported: the verify-image
+  device policy over the published set and the sums-signature round-trip
+  against the pubring the build embeds.
+
 ### 7.2 Pin SOURCE_DATE_EPOCH — and what it does NOT move (#289)
 
 `shuttle image --release` refuses to run with the epoch unset (the CLI
