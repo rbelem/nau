@@ -1449,11 +1449,15 @@ pub struct UserDataParams<'a> {
 /// public half, embed it with the machine identity and the cloud-init
 /// normalized instance-data document (the provider instance-identity
 /// content the certificate principal binds — ADR-0045 Decision 3) into
-/// one JSON payload, and POST it with the one-time bearer. Fire-and-
-/// forget with bounded retries: a coordinator that is not (yet) up never
-/// bricks the boot — it just means no issuance, and the TTL sweep
-/// reclaims the worker (fail-closed: nothing pins a key that never
-/// published).
+/// one JSON payload, and POST it with the one-time bearer. The retry
+/// budget is boot-scale (#308): the guest→front funnel flaps for the
+/// first minutes of boot (window 5 lost a publish to a mid-boot TLS
+/// reset the old 10×/4s budget could not outlive), so 60×10s ≈ 10 min.
+/// Exhaustion dies LOUDLY — non-zero exit + a named stderr line the
+/// cloud-init log records — because a lost publish is invisible
+/// guest-side otherwise and only shows up as a preflight refusal
+/// without a why. Fail-closed unchanged: no publish, no issuance; the
+/// TTL sweep reclaims the worker.
 const PUBLISH_SCRIPT: &str = r#"#!/bin/sh
 # ADR-0045 amendment (#295): publish the guest-generated PUBLIC host half
 # to the coordinator. Public material only; authenticated by the one-time
@@ -1469,7 +1473,7 @@ fi
 IID=$(cat /run/cloud-init/instance-data.json)
 BODY=$(printf '{"machine_identity":"%s","public_key":"%s","instance_identity":%s}' "$MACHINE_IDENTITY" "$PUB" "$IID")
 i=0
-while [ "$i" -lt 10 ]; do
+while [ "$i" -lt 60 ]; do
   if printf '%s' "$BODY" | curl -fsS -m 30 \
       -H "Authorization: Bearer $PUBLISH_TOKEN" \
       -H "Content-Type: application/json" \
@@ -1477,10 +1481,10 @@ while [ "$i" -lt 10 ]; do
     exit 0
   fi
   i=$((i + 1))
-  sleep 4
+  sleep 10
 done
-echo "publish-host-key: coordinator unreachable after 10 attempts — without the publish no certificate issues; the TTL sweep reclaims this worker" >&2
-exit 0
+echo "publish-host-key: enrollment publish failed after 60 tries — worker will be refused at preflight (fail-closed); the TTL sweep reclaims this worker" >&2
+exit 1
 "#;
 
 /// The first-boot pickup script the template drops at
@@ -1639,6 +1643,14 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
         url = p.binary_url
     ));
     s.push_str("  - chmod 0755 /usr/local/bin/nau\n");
+    // #308: the retry loop proves the transfer COMPLETED, not that the
+    // bytes are a runnable nau — a reset mid-transfer left a truncated
+    // binary that died at preflight with an opaque 127/126. Exec-check
+    // over hash-vs-served-SHA256SUMS: the SUMS file rides the same
+    // flappy channel from the same origin, so it verifies the transfer
+    // no better, while the exec check additionally proves the artifact
+    // is runnable (right arch, not a proxy 200-page).
+    s.push_str("  - sh -c '/usr/local/bin/nau --version >/dev/null || { echo \"nau binary verify failed — /usr/local/bin/nau does not exec (truncated or bad download); the worker is refused at preflight either way\" >&2; exit 1; }'\n");
     // The API-level create carries no --ssh-key (the operator key rides
     // user-data), so hcloud generates a root password with a forced
     // first-login change; PAM refuses even pubkey logins until it is
@@ -1650,7 +1662,9 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
     );
     s.push_str("  - systemctl restart ssh || systemctl restart sshd\n");
     // The publish: last runcmd (final stage — after the ssh module has
-    // generated the host keys and the network is up).
+    // generated the host keys and the network is up). #308: budget
+    // exhaustion exits non-zero, so the cloud-init log records WHY the
+    // worker will be refused at preflight.
     s.push_str("  - /etc/nau/publish-host-key.sh\n");
     // The pickup: a oneshot unit (NOT a runcmd — its bounded-retry loop
     // may run for the whole token window) enabled after the publish has

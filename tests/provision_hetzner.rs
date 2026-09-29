@@ -448,8 +448,31 @@ fn user_data_carries_the_publish_callback_and_one_time_token() {
         runcmds.len() - 1,
         "publish directly precedes the pickup enable (the channel is proven up): {runcmds:?}"
     );
-    assert!(user_data.contains("while [ \"$i\" -lt 10 ]"));
-    assert!(user_data.contains("curl -fsS -m 30"));
+    // The publish budget is boot-scale (#308): 60 × 10s ≈ 10 min to
+    // outlive the boot-time funnel flaps window 5 lost a publish to —
+    // and the exhaustion death is LOUD (non-zero + a named line the
+    // cloud-init log records) instead of the old invisible exit 0.
+    assert!(
+        user_data.contains("while [ \"$i\" -lt 60 ]"),
+        "the publish leg carries the 60-try boot-scale budget"
+    );
+    assert!(user_data.contains("sleep 10"));
+    assert!(
+        user_data.contains(
+            "enrollment publish failed after 60 tries — worker will be refused at preflight"
+        ),
+        "the publish death names itself: the guest log records why"
+    );
+    assert!(
+        user_data.contains("curl -fsS -m 30"),
+        "the publish POST keeps its per-attempt timeout"
+    );
+    // #308 adjacent: the runcmd plain scalars carry shell with quotes,
+    // braces, and pipes — one stray `: ` flips the item into a YAML
+    // mapping and the whole runcmd stage misparses. The render must
+    // stay parseable YAML.
+    serde_yaml::from_str::<serde_yaml::Value>(&user_data)
+        .expect("the rendered user-data parses as YAML");
     // The TTL marker (the #269 sweep contract): one DECIMAL EPOCH-SECONDS
     // line — the sweep's is_epoch parses decimal only.
     assert!(user_data.contains("path: /etc/nau/worker-ttl"));
@@ -564,11 +587,23 @@ fn user_data_download_legs_ride_the_publish_retry_budget() {
         "the unsquashfs leg lost its retry loop"
     );
     // One fail-closed exhaustion gate per download leg (the publish
-    // script's own bounded loop exits 0 by design and never matches).
+    // script's own loop is boot-scale now and dies with its own named
+    // exit 1 — #308 — which does not match this gate's shape).
     assert_eq!(
         user_data.matches("; [ \"$i\" -lt 10 ]").count(),
         3,
         "each download leg must exit non-zero when the retry budget is exhausted"
+    );
+    // #308: the nau leg verifies the artifact EXECUTES after install —
+    // a truncated download dies at install time with a named error
+    // instead of an opaque 127/126 at preflight.
+    assert!(
+        user_data.contains("/usr/local/bin/nau --version >/dev/null"),
+        "the installed binary is exec-checked before the runcmd passes"
+    );
+    assert!(
+        user_data.contains("nau binary verify failed"),
+        "the verify death names itself in the guest log"
     );
 }
 
