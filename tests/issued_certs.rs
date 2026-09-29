@@ -500,6 +500,7 @@ fn ca_form_executor_pins_the_signing_ca_through_the_real_keygen() {
         jobs: 1,
         arch: None,
         host_key: Some(fingerprint.clone()),
+        identity: None,
     };
     let fake = CapWorker {
         calls: Arc::new(Mutex::new(Vec::new())),

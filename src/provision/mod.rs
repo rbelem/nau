@@ -452,6 +452,7 @@ fn provider_for(
             token_from_env(),
             default_binary_url(),
             resolve_operator_key()?,
+            resolve_operator_identity()?,
             publish,
         ))),
         "aws" => Ok(Box::new(aws::AwsProvisioner::new(
@@ -459,6 +460,7 @@ fn provider_for(
             aws_credentials_source(),
             default_binary_url(),
             resolve_operator_key()?,
+            resolve_operator_identity()?,
             publish,
         ))),
         "gcp" => Ok(Box::new(gcp::GcpProvisioner::new(
@@ -466,6 +468,7 @@ fn provider_for(
             gcp_credentials_source(),
             default_binary_url(),
             resolve_operator_key()?,
+            resolve_operator_identity()?,
             publish,
         ))),
         "azure" => Ok(Box::new(azure::AzureProvisioner::new(
@@ -473,6 +476,7 @@ fn provider_for(
             azure_credentials_source(),
             default_binary_url(),
             resolve_operator_key()?,
+            resolve_operator_identity()?,
             publish,
         ))),
         "scaleway" => Ok(Box::new(scaleway::ScalewayProvisioner::new(
@@ -480,6 +484,7 @@ fn provider_for(
             scaleway_credentials_source(),
             default_binary_url(),
             resolve_operator_key()?,
+            resolve_operator_identity()?,
             publish,
         ))),
         other => Err(miette::miette!(
@@ -516,6 +521,41 @@ pub fn resolve_operator_key() -> miette::Result<String> {
     Err(miette::miette!(
         "workers provision: no operator SSH public key found (tried {}) — set \
          NAU_OPERATOR_KEY to the .pub file workers must trust for login",
+        tried.join("; ")
+    ))
+}
+
+/// The operator's client identity: the PRIVATE half of the key
+/// [`resolve_operator_key`] resolved — `NAU_OPERATOR_KEY` with its
+/// `.pub` suffix stripped, else the same default candidates. Refuses,
+/// naming what was tried, when no private half exists: provisioning
+/// pins the identity into the workers entry (#298), so a provision
+/// that cannot name its own login key must not create servers.
+pub fn resolve_operator_identity() -> miette::Result<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let candidates: Vec<PathBuf> = match std::env::var("NAU_OPERATOR_KEY").ok() {
+        Some(p) => vec![
+            match PathBuf::from(&p).extension().and_then(|e| e.to_str()) {
+                Some("pub") => PathBuf::from(&p).with_extension(""),
+                _ => PathBuf::from(&p),
+            },
+        ],
+        None => vec![
+            Path::new(&home).join(".ssh").join("id_ed25519"),
+            Path::new(&home).join(".ssh").join("id_rsa"),
+        ],
+    };
+    let mut tried = Vec::new();
+    for c in &candidates {
+        if c.exists() {
+            return Ok(c.display().to_string());
+        }
+        tried.push(format!("{} (absent)", c.display()));
+    }
+    Err(miette::miette!(
+        "workers provision: no operator SSH private key found for the workers entries' \
+         identity pin (tried {}) — the executor presents exactly the pinned key \
+         (`IdentitiesOnly`, #298); set NAU_OPERATOR_KEY to the key workers must log in with",
         tried.join("; ")
     ))
 }
@@ -670,6 +710,10 @@ pub fn require_publish(
 pub struct PinPlan<'a> {
     pub publish: &'a publish::PublishChannel,
     pub ca_pin: &'a str,
+    /// The client identity pinned into every workers entry (#298): the
+    /// private-key path resolved at the CLI boundary, so a provisioned
+    /// worker's login key is pinned by construction.
+    pub identity: String,
 }
 
 /// One machine's publish prep + staged user-data, shared by every
@@ -1096,8 +1140,15 @@ fn squashfs_build_runcmd() -> String {
 /// Append (or replace, when the address is already pinned in the managed
 /// block) one workers entry. The surrounding operator text is never
 /// rewritten; an operator-owned entry at the same address is a refusal —
-/// nau owns only its block.
-pub fn append_worker_entry(config: &Path, address: &str, host_key: &str) -> miette::Result<()> {
+/// nau owns only its block. `identity` rides the entry (#298): the
+/// executor presents exactly this key (`IdentitiesOnly`), so a
+/// provisioned worker's login is pinned by construction.
+pub fn append_worker_entry(
+    config: &Path,
+    address: &str,
+    host_key: &str,
+    identity: &str,
+) -> miette::Result<()> {
     let text = read_config(config)?;
     let block = block_line_range(&text)?;
     if outside_block_contains(&text, block, &format!("address = {}", lua_quote(address))) {
@@ -1112,6 +1163,7 @@ pub fn append_worker_entry(config: &Path, address: &str, host_key: &str) -> miet
     entries.push(ManagedEntry {
         address: address.to_string(),
         host_key: host_key.to_string(),
+        identity: Some(identity.to_string()),
     });
     write_config(config, &rebuild(&text, block, &entries)?)?;
     Ok(())
@@ -1142,11 +1194,14 @@ pub fn managed_entry_exists(config: &Path, address: &str) -> miette::Result<bool
         .any(|e| e.address == address))
 }
 
-/// One entry inside the managed block.
+/// One entry inside the managed block. `identity` is `None` for entries
+/// written before the client-identity pin (#298) — preserved verbatim,
+/// never backfilled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedEntry {
     pub address: String,
     pub host_key: String,
+    pub identity: Option<String>,
 }
 
 fn read_config(config: &Path) -> miette::Result<String> {
@@ -1265,7 +1320,12 @@ fn parse_managed_entries(
         let host_key = extract_quoted_field(inner, "host_key").ok_or_else(|| {
             miette::miette!("managed workers entry has no readable 'host_key': '{trimmed}'")
         })?;
-        entries.push(ManagedEntry { address, host_key });
+        let identity = extract_quoted_field(inner, "identity");
+        entries.push(ManagedEntry {
+            address,
+            host_key,
+            identity,
+        });
     }
     Ok(entries)
 }
@@ -1386,10 +1446,14 @@ fn render_block(entries: &[ManagedEntry]) -> String {
     s.push('\n');
     s.push_str("workers = workers or {}\n");
     for e in entries {
+        let identity = match &e.identity {
+            Some(id) => format!(", identity = {}", lua_quote(id)),
+            None => String::new(),
+        };
         s.push_str(&format!(
-            "table.insert(workers, {{ address = {addr}, host_key = {key} }})\n",
+            "table.insert(workers, {{ address = {addr}, host_key = {key}{identity} }})\n",
             addr = lua_quote(&e.address),
-            key = lua_quote(&e.host_key)
+            key = lua_quote(&e.host_key),
         ));
     }
     s.push_str(BLOCK_END);

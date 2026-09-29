@@ -24,6 +24,9 @@ use nau::provision::{
 const TEST_HOST_PUB: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ nau-worker-host-key";
 const OPERATOR_KEY: &str = "ssh-ed25519 AAAAoperatorkey operator@example";
+/// The client identity pinned into provisioned entries (#298) — a
+/// throwaway fixture path, no crypto.
+const OPERATOR_IDENTITY: &str = "/nau-test-fixtures/operator_ed25519";
 const BINARY_URL: &str = "https://example.invalid/nau-amd64";
 
 /// The host CA fingerprint the request carries (valid
@@ -240,6 +243,7 @@ fn provisioner_with(
         token.map(|t| t.to_string()),
         BINARY_URL.into(),
         OPERATOR_KEY.into(),
+        OPERATOR_IDENTITY.into(),
         publish,
     )
 }
@@ -645,10 +649,17 @@ fn provision_creates_describes_pins_and_labels() {
     drop(staged);
 
     // Config: the managed block holds exactly the two entries; the file
-    // still evaluates.
+    // still evaluates; every entry pins the client identity (#298) —
+    // provisioned workers present exactly the provisioner's key.
     let text = std::fs::read_to_string(&config).unwrap();
     assert!(text.contains(BLOCK_BEGIN) && text.contains(BLOCK_END));
     assert_eq!(text.matches("table.insert(workers, ").count(), 2);
+    assert_eq!(
+        text.matches(&format!("identity = \"{OPERATOR_IDENTITY}\""))
+            .count(),
+        2,
+        "both entries pin the operator's client key: {text}"
+    );
     assert!(text.contains("-- operator config"), "operator text intact");
     assert!(text.contains("return {}"), "return intact");
     assert!(nau::lua::evaluate_file(config.to_str().unwrap()).is_ok());
@@ -750,7 +761,13 @@ fn reprovision_replaces_the_same_address_instead_of_duplicating() {
     // Re-pin the same address through the direct seam (the fake always
     // answers the same IP per name; a real re-provision hits the same
     // address when the operator rebuilds the same machine).
-    append_worker_entry(&config, &address, "ssh-ed25519 AAAAsecond re-pin").unwrap();
+    append_worker_entry(
+        &config,
+        &address,
+        "ssh-ed25519 AAAAsecond re-pin",
+        OPERATOR_IDENTITY,
+    )
+    .unwrap();
     let text = std::fs::read_to_string(&config).unwrap();
     assert!(
         text.matches(&format!("address = \"{address}\"")).count() >= 1,
@@ -771,6 +788,7 @@ fn managed_block_places_itself_before_the_top_level_return() {
         &config,
         "ssh://root@203.0.113.10",
         "ssh-ed25519 AAAAfirst nau-worker-x",
+        OPERATOR_IDENTITY,
     )
     .unwrap();
     let text = std::fs::read_to_string(&config).unwrap();
@@ -790,7 +808,13 @@ fn managed_block_places_itself_before_the_top_level_return() {
 fn config_without_return_takes_the_block_at_eof() {
     let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, "workers = {}\n").unwrap();
-    append_worker_entry(&config, "ssh://root@203.0.113.11", "ssh-ed25519 AAAAa c").unwrap();
+    append_worker_entry(
+        &config,
+        "ssh://root@203.0.113.11",
+        "ssh-ed25519 AAAAa c",
+        OPERATOR_IDENTITY,
+    )
+    .unwrap();
     let text = std::fs::read_to_string(&config).unwrap();
     assert!(text.find(BLOCK_BEGIN).unwrap() > text.find("workers = {}").unwrap());
     assert!(text.trim_end().ends_with(BLOCK_END));
@@ -805,8 +829,13 @@ fn operator_owned_entry_at_the_same_address_is_a_refusal() {
     )
     .unwrap();
     let before = std::fs::read_to_string(&config).unwrap();
-    let err =
-        append_worker_entry(&config, "ssh://root@203.0.113.12", "ssh-ed25519 AAAAb c").unwrap_err();
+    let err = append_worker_entry(
+        &config,
+        "ssh://root@203.0.113.12",
+        "ssh-ed25519 AAAAb c",
+        OPERATOR_IDENTITY,
+    )
+    .unwrap_err();
     assert!(format!("{err:#}").contains("outside the nau-managed block"));
     assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
 }
@@ -1138,7 +1167,13 @@ fn config_mode_survives_a_managed_block_rewrite() {
     std::fs::write(&config, operator_config()).unwrap();
     for mode in [0o644, 0o600, 0o640] {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).unwrap();
-        append_worker_entry(&config, "ssh://root@203.0.113.99", "ssh-ed25519 AAAAm c").unwrap();
+        append_worker_entry(
+            &config,
+            "ssh://root@203.0.113.99",
+            "ssh-ed25519 AAAAm c",
+            OPERATOR_IDENTITY,
+        )
+        .unwrap();
         let got = std::fs::metadata(&config).unwrap().permissions().mode() & 0o777;
         assert_eq!(got, mode, "mode {mode:o} preserved across the rewrite");
     }

@@ -709,6 +709,7 @@ fn loopback_farm_dispatch_and_worker_loss() {
             jobs: 1,
             arch: None,
             host_key: Some(FINGERPRINT_PIN.to_string()),
+            identity: None,
         };
         let cache = tmp.path().join(format!("cache-{port}"));
         let exec = SshExecutor::with_ceremony_home(&cfg, fake, &cache, &ceremony)
@@ -1186,6 +1187,7 @@ fn preflight_refuses_a_declared_arch_mismatch_before_any_dispatch() {
         jobs: 1,
         arch: Some(declared.into()),
         host_key: Some(FINGERPRINT_PIN.to_string()),
+        identity: None,
     };
     let ceremony = tmp.path().join("ceremony");
     ca_ceremony(&ceremony, "ssh://localhost:2226");

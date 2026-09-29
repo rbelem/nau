@@ -33,6 +33,7 @@ fn worker(address: &str, jobs: u32) -> nau::lua::WorkerConfig {
         jobs,
         arch: None,
         host_key: None,
+        identity: None,
     }
 }
 
