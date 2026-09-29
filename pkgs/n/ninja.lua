@@ -32,7 +32,7 @@ to run builds as fast as possible.]],
         -- explicit flags (no FetchContent tests) stay visible. Pool cmake
         -- materializes into the merged build prefix whose bin dir leads
         -- the sandbox PATH (issue #33), so bare `cmake` resolves to it —
-        -- no explicit $SHUTTLE_BUILD_PREFIX path needed.
+        -- no explicit $NAU_BUILD_PREFIX path needed.
         build = table.concat({
             "cmake -S $SRC -B build "
                 .. "-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr "
@@ -46,12 +46,12 @@ to run builds as fast as possible.]],
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as tmux/htop/tig: the leaked nix gcc wrapper bakes
-        -- RUNPATH=/shuttle-build-prefix/usr/lib64 into the produced ninja
+        -- RUNPATH=/nau-build-prefix/usr/lib64 into the produced ninja
         -- binary (the lib64 spelling joined the baked set when the pool
         -- glibc payload's loader-lib list gained the lib64 dir). That
         -- path does not exist at runtime; silenced here, visibly logged
         -- by the leak scan, pending the RUNPATH repair (issue #22's
         -- portability follow-up).
-        leaks_ok = { "/shuttle-build-prefix/usr/lib64" },
+        leaks_ok = { "/nau-build-prefix/usr/lib64" },
     },
 }

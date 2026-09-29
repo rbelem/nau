@@ -1,8 +1,8 @@
 //! Dependency resolution — resolve requires/build_deps fields into build order.
 //!
-//! Traverses `requires` and `build_deps` fields declared in `shuttle.lua`
+//! Traverses `requires` and `build_deps` fields declared in `nau.lua`
 //! files and returns a topologically sorted build order. Used by
-//! `shuttle deps` and `shuttle build --order`.
+//! `nau deps` and `nau build --order`.
 //!
 //! `requires` are runtime dependencies (ADR-0018); `build_deps` are
 //! build-time-only. Both edges order a build (a dependency must exist
@@ -218,7 +218,7 @@ fn resolve_walk(seeds: &[String], recursive: bool) -> miette::Result<Vec<WalkNod
 
 /// Resolve transitive dependencies for a list of seed packages.
 ///
-/// `seeds` can be package names (resolved via pkgs/), paths to shuttle.lua files,
+/// `seeds` can be package names (resolved via pkgs/), paths to nau.lua files,
 /// or `name@constraint` edges — the constraint rides the recipe eval
 /// (ADR-0047). Returns packages in topological build order (leaf
 /// dependencies first).
@@ -259,7 +259,7 @@ pub fn resolve_dep_names(seeds: &[String], recursive: bool) -> miette::Result<Ve
 /// the package builds that dependency's payload — a glibc-from-source
 /// package IS its own glibc — so the payload must not materialize into
 /// the merged build prefix. It would inject the pool payload's installed
-/// headers (`-I/shuttle-build-prefix/usr/include` via `CPPFLAGS`) ahead
+/// headers (`-I/nau-build-prefix/usr/include` via `CPPFLAGS`) ahead
 /// of the package's own build tree, and the build compiles against the
 /// pool copy (empirically: glibc's gen-as-const probes die on pool
 /// glibc headers). The runtime closure keeps the entry; only the
@@ -506,10 +506,10 @@ mod tests {
         assert!(p.to_string_lossy().ends_with("pkgs/g/gcc.lua"));
 
         // File path -> raw path
-        let p = resolve_path("examples/full-system/system-base/shuttle.lua");
+        let p = resolve_path("examples/full-system/system-base/nau.lua");
         assert!(p
             .to_string_lossy()
-            .ends_with("examples/full-system/system-base/shuttle.lua"));
+            .ends_with("examples/full-system/system-base/nau.lua"));
     }
 
     #[test]

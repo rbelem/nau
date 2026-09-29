@@ -40,7 +40,7 @@ translation files. It is a core dependency for many GNU packages.]],
             "make install DESTDIR=$STAGE",
             "find $STAGE/usr/share/info -maxdepth 1 -name dir -delete",
             -- libtool .la metadata embeds the configure-time prefix
-            -- (/shuttle-build-prefix) and nothing in the pool consumes
+            -- (/nau-build-prefix) and nothing in the pool consumes
             -- .la files at runtime (libstdcpp/expat precedent) — strip
             -- them so the build prefix cannot leak.
             "find $STAGE/usr -name '*.la' -delete",
@@ -48,12 +48,12 @@ translation files. It is a core dependency for many GNU packages.]],
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as tmux/htop/tig: the leaked nix gcc wrapper bakes
-        -- RUNPATH=/shuttle-build-prefix/usr/lib64 into the produced
+        -- RUNPATH=/nau-build-prefix/usr/lib64 into the produced
         -- binaries (recode-sr-latin et al; the lib64 spelling joined the
         -- baked set when the pool glibc payload's loader-lib list gained
         -- the lib64 dir). That path does not exist at runtime; silenced
         -- here, visibly logged by the leak scan, pending the RUNPATH
         -- repair (issue #22's portability follow-up).
-        leaks_ok = { "/shuttle-build-prefix/usr/lib64" },
+        leaks_ok = { "/nau-build-prefix/usr/lib64" },
     },
 }

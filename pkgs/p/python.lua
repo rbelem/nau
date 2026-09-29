@@ -1,6 +1,6 @@
 -- Python: CPython 3.14 interpreter (python-build-standalone).
 --
--- Ported from the devbox global profile's python3 as a shuttle source
+-- Ported from the devbox global profile's python3 as a nau source
 -- package. Uses Astral's python-build-standalone install_only archive —
 -- the same prebuilt CPython distribution uv installs — so the build only
 -- relayouts the tarball into $STAGE. The staged bin/ tree carries the

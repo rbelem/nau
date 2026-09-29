@@ -9,16 +9,16 @@
 --   - GPT disk: ESP (vfat) + A/B roots (ext4, dm-verity) + state + swap
 --   - systemd-boot bootloader
 --   - disk.ab + update_source → sysupdate transfer files, the try-boot
---     counters, and boot-complete.target gated by the shipped shuttle
+--     counters, and boot-complete.target gated by the shipped nau
 --     binary (issue #81 — the default health path works, no override)
 --   - role = "state" partition → the persistent state surface (ADR-0023)
 --
 -- Build:
---   shuttle image --file examples/full-system/pc-rootfs-26/shuttle.lua \
---       --arch amd64 --output ~/.cache/shuttle-core26
+--   nau image --file examples/full-system/pc-rootfs-26/nau.lua \
+--       --arch amd64 --output ~/.cache/nau-core26
 --
 -- Boot proof (#63 harness, #28 bar):
---   shuttle test ~/.cache/shuttle-core26/ubuntu-core-pc-26_26.04_amd64.img \
+--   nau test ~/.cache/nau-core26/ubuntu-core-pc-26_26.04_amd64.img \
 --       --runs 1 --require "Reached target multi-user.target"
 --
 -- (Since #85 the emitted basic.target.wants/ link pulls boot-complete.target
@@ -26,9 +26,9 @@
 -- is assessed too: the health unit runs and the completion target is reached.)
 --
 -- Requires:
---   package-index.json with resolved pins (shuttle index resolve \
+--   package-index.json with resolved pins (nau index resolve \
 --       --base core22 --base core26)
---   a signing key for update_source (shuttle key keygen)
+--   a signing key for update_source (nau key keygen)
 --   parted, losetup, mkfs.vfat, mkfs.ext4, dd on PATH
 
 return {
@@ -47,7 +47,7 @@ return {
                 "quiet",
                 "splash",
                 -- tty1 is the local console; ttyS0 mirrors the boot to the
-                -- serial port so `shuttle test` (QEMU `-serial`) can observe
+                -- serial port so `nau test` (QEMU `-serial`) can observe
                 -- userspace. Without a serial console the harness sees an
                 -- empty log even on a successful boot.
                 "console=tty1",
@@ -127,11 +127,11 @@ return {
         -- Declaring it emits the transfer files + trigger units and the
         -- boot-complete.target machinery; it requires a signing key at
         -- build time (the build never mints one).
-        update_source = "https://updates.example.com/shuttle/ubuntu-core-pc-26/",
+        update_source = "https://updates.example.com/nau/ubuntu-core-pc-26/",
 
         -- Issue #81: no boot_health_exec override — the image ships the
-        -- shuttle binary at /usr/bin/shuttle (staged from the local build),
-        -- so the default gate `/usr/bin/shuttle runtime activate` works.
+        -- nau binary at /usr/bin/nau (staged from the local build),
+        -- so the default gate `/usr/bin/nau runtime activate` works.
         -- A real deployment can still override it with its own health
         -- check (issue #78).
 

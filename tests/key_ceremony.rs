@@ -1,5 +1,5 @@
 //! Issue #51 — the key ceremony (generation, rotation, revocation) end to
-//! end through the real binary: `shuttle key keygen → rotate --manifest →
+//! end through the real binary: `nau key keygen → rotate --manifest →
 //! promote → rotate → revoke → verify → list`. The ceremony ledger at
 //! `keys/ceremony.json` records the generation chain and the dates; the
 //! transition window accepts either key until revoked; a manifest signed
@@ -9,17 +9,17 @@
 
 use std::process::Command;
 
-use shuttle::manifest::ImageManifest;
+use nau::manifest::ImageManifest;
 
-/// Run shuttle with an isolated HOME so the key ceremony is private to
+/// Run nau with an isolated HOME so the key ceremony is private to
 /// the test. Returns (exit code, stdout, stderr).
 fn run_in(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+    let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args(args)
         .env("HOME", dir)
         .current_dir(dir)
         .output()
-        .expect("failed to spawn shuttle");
+        .expect("failed to spawn nau");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -50,16 +50,16 @@ fn report_json(stdout: &str) -> serde_json::Value {
 fn key_ceremony_lifecycle_through_the_cli() {
     let dir = tempfile::tempdir().unwrap();
     let home = format!("--home={}", dir.path().display());
-    let keys = dir.path().join(".config/shuttle/keys");
+    let keys = dir.path().join(".config/nau/keys");
     write_unsigned_manifest(&dir, "m.json");
 
     // ── gen ──
     let (code, _, stderr) = run_in(dir.path(), &["key", "keygen", &home]);
     assert_eq!(code, Some(0), "keygen: {stderr}");
-    let ledger: shuttle::sign::CeremonyLedger =
+    let ledger: nau::sign::CeremonyLedger =
         serde_json::from_str(&std::fs::read_to_string(keys.join("ceremony.json")).unwrap())
             .unwrap();
-    let id_a = shuttle::sign::load_secret_key(dir.path())
+    let id_a = nau::sign::load_secret_key(dir.path())
         .unwrap()
         .unwrap()
         .key_id();
@@ -70,9 +70,9 @@ fn key_ceremony_lifecycle_through_the_cli() {
 
     // ── sign ── (the release path signs at eval; here the old key signs
     // directly so the rotation has a prior signature to keep)
-    let old = shuttle::sign::load_secret_key(dir.path()).unwrap().unwrap();
+    let old = nau::sign::load_secret_key(dir.path()).unwrap().unwrap();
     let mut manifest = read_manifest(&dir, "m.json");
-    shuttle::sign::cosign(&mut manifest, &old).unwrap();
+    nau::sign::cosign(&mut manifest, &old).unwrap();
     std::fs::write(dir.path().join("m.json"), manifest.to_json().unwrap()).unwrap();
 
     // ── rotate ── dual-signs the manifest under the successor and
@@ -163,7 +163,7 @@ fn key_ceremony_lifecycle_through_the_cli() {
     // ── list ── the audit trail shows the chain and the revocation.
     let (code, stdout, stderr) = run_in(dir.path(), &["key", "list", &home, "--json"]);
     assert_eq!(code, Some(0), "list: {stderr}");
-    let ledger: shuttle::sign::CeremonyLedger =
+    let ledger: nau::sign::CeremonyLedger =
         serde_json::from_value(report_json(&stdout)).expect("ledger json");
     let chain_a = &ledger.keys[&id_a];
     assert_eq!(chain_a.replaced_by.as_deref(), Some(id_b.as_str()));
@@ -196,7 +196,7 @@ fn tampered_ceremony_ledger_fails_key_verify() {
     assert_eq!(code, Some(0), "clean ledger verifies");
 
     // Tamper: the ledger stops being interpretable, verify fails closed.
-    let ledger = dir.path().join(".config/shuttle/keys/ceremony.json");
+    let ledger = dir.path().join(".config/nau/keys/ceremony.json");
     std::fs::write(&ledger, "{\"version\":1,\"keys\":{\"zz\":").unwrap();
     let (code, _, stderr) = run_in(dir.path(), &["key", "verify", "m.json", home.as_str()]);
     assert_ne!(code, Some(0), "tampered ledger must fail closed");

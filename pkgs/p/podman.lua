@@ -11,7 +11,7 @@
 -- Nix:       pkgs.podman (buildGoModule over the tag tree; seccomp/
 --            systemd/btrfs tags per pkg-config probes)
 -- Snapcraft: no upstream snapcraft recipe in the podman repo
--- Shuttle:   declarative Lua — vendored Go source build via the pool
+-- Nau:   declarative Lua — vendored Go source build via the pool
 --            go toolchain. NO services declaration: podman is
 --            daemonless — there is nothing to run; `podman system
 --            service` is an on-demand invocation, not a v1 service
@@ -148,7 +148,7 @@ return {
         -- pool-resolved BUILDTAGS documented in the header.
         build = table.concat({
             "mkdir -p $STAGE/usr/bin $STAGE/usr/share/containers",
-            "export HOME=/tmp GOCACHE=/tmp/shuttle-go-gocache GOPATH=/tmp/shuttle-go-gopath",
+            "export HOME=/tmp GOCACHE=/tmp/nau-go-gocache GOPATH=/tmp/nau-go-gopath",
             'export GOFLAGS="-trimpath -mod=vendor" GOPROXY=off GOWORK=off GOTOOLCHAIN=local',
             -- containers_image_openpgp: WITHOUT it the signature
             -- mechanism is the cgo gpgme wrapper (proglottis/gpgme),

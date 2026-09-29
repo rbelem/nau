@@ -1,4 +1,4 @@
-//! `shuttle image --release` — the deterministic mission-media
+//! `nau image --release` — the deterministic mission-media
 //! publication path (ADR-0044 Decisions 5 + 8, issue #266).
 //!
 //! Cassini ships named artifacts, not ad-hoc builds. One release run
@@ -30,7 +30,7 @@
 //!   time against the base rootfs's embedded
 //!   `/usr/lib/systemd/import-pubring.pgp`.
 //!
-//! # The signature scheme (must interoperate with `shuttle verify-image`)
+//! # The signature scheme (must interoperate with `nau verify-image`)
 //!
 //! The signed body is [`super::verify::image_manifest_canonical_bytes`] —
 //! the typed image manifest serialized with the signatures map emptied —
@@ -40,7 +40,7 @@
 //! signature is a bare base64 Ed25519 entry under the operator key's id,
 //! and [`super::verify::verify_manifest_signature_at`] accepts it under
 //! the ADR-0024 §4 anchor policy (revoked-first, then ANY of `--key` +
-//! `~/.config/shuttle/keys/*.pub`). Tests pin the sign→verify round-trip
+//! `~/.config/nau/keys/*.pub`). Tests pin the sign→verify round-trip
 //! through that exact seam.
 //!
 //! The SHA256SUMS signature is deliberately NOT part of that scheme
@@ -52,7 +52,7 @@
 //! The verify advice this flow used to only print is now EXECUTED: before
 //! the media set is reported, the release self-check runs in-process over
 //! the published set ([`self_check`]) — the same device policy
-//! `shuttle verify-image` applies, plus the device-side SHA256SUMS
+//! `nau verify-image` applies, plus the device-side SHA256SUMS
 //! signature round-trip (#293 item 4). Two steps CANNOT run in-process
 //! and stay BLOCKING on the operator, printed with the media set, never
 //! silently skipped, never faked by this flow:
@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-/// Arguments of one `shuttle image --release` invocation (gathered by the
+/// Arguments of one `nau image --release` invocation (gathered by the
 /// CLI in [`crate::cli`]; the library entry takes the struct so tests
 /// drive the same path the binary does).
 #[derive(Debug, Clone)]
@@ -152,7 +152,7 @@ pub(crate) fn update_payloads(
 /// Attach the operator's Ed25519 signature to an image manifest over its
 /// CANONICAL BODY — [`super::verify::image_manifest_canonical_bytes`], the
 /// typed manifest with the signatures map emptied. This is the exact
-/// scheme `shuttle verify-image` checks; the round-trip test below drives
+/// scheme `nau verify-image` checks; the round-trip test below drives
 /// the verify side's own seam to pin the interop.
 ///
 /// Prior signatures keep verifying (the canonical bytes never include the
@@ -215,7 +215,7 @@ pub fn publish(
 /// 1. [`super::verify::verify_device_at`] over the published image +
 ///    published signed manifest under the release's OWN keychain — the
 ///    GPT identity, slot resolution, truncation, ESP UKI digest (#284),
-///    and dm-verity recompute `shuttle verify-image` runs, minus the
+///    and dm-verity recompute `nau verify-image` runs, minus the
 ///    HOME dependency (the release signs and proves under the same
 ///    keychain).
 /// 2. The update-night round-trip: the published `SHA256SUMS` verifies
@@ -547,7 +547,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join(tag);
         std::fs::create_dir_all(&home).unwrap();
-        // The ceremony key lives at <home>/.config/shuttle/secret-key.
+        // The ceremony key lives at <home>/.config/nau/secret-key.
         let keys = crate::sign::secret_key_path(&home);
         std::fs::create_dir_all(keys.parent().unwrap()).unwrap();
         (dir, home)
@@ -558,7 +558,7 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                "untrusted comment: shuttle signing secret key (ed25519)\n{}\n",
+                "untrusted comment: nau signing secret key (ed25519)\n{}\n",
                 hex_encode(&kp.seed)
             ),
         )
@@ -967,7 +967,7 @@ mod tests {
 
     #[test]
     fn publish_refuses_without_a_signing_key() {
-        let home = tempfile::tempdir().unwrap(); // no .config/shuttle/secret-key
+        let home = tempfile::tempdir().unwrap(); // no .config/nau/secret-key
         let work = tempfile::tempdir().unwrap();
         let img = work.path().join("nau-cassini-1.0.0-amd64.img");
         std::fs::write(&img, b"bytes").unwrap();
@@ -978,7 +978,7 @@ mod tests {
             .expect_err("no key must refuse");
         let flat: String = format!("{err:#}").chars().filter(|c| *c != '\n').collect();
         assert!(
-            flat.contains("shuttle key keygen"),
+            flat.contains("nau key keygen"),
             "refusal names the ceremony: {err:#}"
         );
         assert!(

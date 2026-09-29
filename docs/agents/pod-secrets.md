@@ -5,7 +5,7 @@ references, never values; values resolve at **serve time** through
 built-in **secret sources** and reach consumers through the existing
 env contract (ADR-0030). There is no credential material anywhere in
 the declaration, the lockfile, or the generation tree — the two value
-surfaces are the POSIX exports of `pod shellenv`/`shuttle run` and the
+surfaces are the POSIX exports of `pod shellenv`/`nau run` and the
 0600 services envfile, both under the session tmpfs.
 
 ## Declaration surface
@@ -70,13 +70,13 @@ secret).
 ## Serve-time semantics
 
 **One resolve entry point serves three consumers.** `pod shellenv`
-(exports after the `env` lines), the `shuttle run` overlay (declared
+(exports after the `env` lines), the `nau run` overlay (declared
 replaces inherited, same rule as env), and services (units reference a
 0600 `EnvironmentFile=` rendered *without* the `-` prefix — a missing
 file fails the unit start and names the path, never a silent
 start-without-secrets).
 
-**All-or-nothing (D7).** Resolution runs host-side in the shuttle
+**All-or-nothing (D7).** Resolution runs host-side in the nau
 process before exec or render. Any fetch failure fails the command
 naming the var and source; there is never a partial serve, never a
 truncated shellenv, and no `optional` flag in v1. Sync never resolves:
@@ -90,7 +90,7 @@ the envfile are the only value surfaces, both mode-contained (the
 runtime dir is 0700 by spec).
 
 **Cache lifecycle (D3).** Values cache at
-`$XDG_RUNTIME_DIR/shuttle/secrets/<pod>/<decl-hash>.json` — 0600,
+`$XDG_RUNTIME_DIR/nau/secrets/<pod>/<decl-hash>.json` — 0600,
 tmpfs-verified, dies at reboot, written atomically (temp + rename).
 `<decl-hash>` is the SHA-256 of the folded canonical reference JSON
 (the same bytes `generations/<n>/secrets.json` records), and the cache
@@ -122,7 +122,7 @@ services contract.
 ## Verbs
 
 ```console
-$ shuttle pod --name work secrets list
+$ nau pod --name work secrets list
 secret references for pod 'work':
   DB_PASS   vault secret/prod/db#pass   miss
   GH_TOKEN  bitwarden id 378c3347-…     miss
@@ -130,7 +130,7 @@ secret references for pod 'work':
 ```
 
 ```console
-$ shuttle pod --name work secrets check
+$ nau pod --name work secrets check
 secret health for pod 'work':
   DB_PASS   vault      ok
   GH_TOKEN  bitwarden  ok
@@ -142,7 +142,7 @@ session cache — a probe is a probe, and a partial success must not
 land a partial entry.
 
 ```console
-$ shuttle pod --name work secrets refresh
+$ nau pod --name work secrets refresh
 dropped 1 cached entry
 resolved 2 secret(s) from [bitwarden=1, vault=1] — values cached for this session
 ```

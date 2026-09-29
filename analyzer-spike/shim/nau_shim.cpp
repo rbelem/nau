@@ -1,12 +1,12 @@
-// shuttle_shim.cpp — minimal extern "C" bridge over Luau's type analyzer.
+// nau_shim.cpp — minimal extern "C" bridge over Luau's type analyzer.
 //
 // Mirrors how CLI/src/Analyze.cpp (luau-analyze) drives the analyzer:
 //   FileResolver (sources) + ConfigResolver (mode) -> Frontend ->
 //   registerBuiltinGlobals + freeze -> frontend.check(module) -> CheckResult.errors.
 //
 // Two entry patterns, so the spike can measure both honestly:
-//   * shuttle_check_once          — construct a fresh Frontend per check (subprocess model)
-//   * shuttle_checker_new/_check  — reuse one Frontend across many checks (worker model)
+//   * nau_check_once          — construct a fresh Frontend per check (subprocess model)
+//   * nau_checker_new/_check  — reuse one Frontend across many checks (worker model)
 //
 // Positions returned are 1-based lines / 1-based begin columns, end column
 // exclusive (same convention luau-analyze prints: `line.col-line.col`).
@@ -77,14 +77,14 @@ struct FixedConfigResolver final : Luau::ConfigResolver
 
 } // namespace
 
-struct ShuttleChecker
+struct NauChecker
 {
     InMemoryResolver fileResolver;
     FixedConfigResolver configResolver;
     Luau::Frontend* frontend = nullptr;
 };
 
-struct ShuttleCheckResult
+struct NauCheckResult
 {
     std::vector<Luau::TypeError> errors;
     std::vector<std::string> messages; // parallel to `errors`; pointers handed to Rust stay valid until free
@@ -96,9 +96,9 @@ extern "C"
 
     // Reusable checker (worker model): builtin globals are registered and
     // frozen once per checker, not once per check.
-    ShuttleChecker* shuttle_checker_new(int strict)
+    NauChecker* nau_checker_new(int strict)
     {
-        auto* checker = new ShuttleChecker();
+        auto* checker = new NauChecker();
         checker->configResolver.defaultConfig.mode = strict ? Luau::Mode::Strict : Luau::Mode::Nonstrict;
         Luau::FrontendOptions options;
         options.retainFullTypeGraphs = false;
@@ -109,7 +109,7 @@ extern "C"
         return checker;
     }
 
-    void shuttle_checker_free(ShuttleChecker* checker)
+    void nau_checker_free(NauChecker* checker)
     {
         if (!checker)
             return;
@@ -119,7 +119,7 @@ extern "C"
 
     // Make an extra module visible to readSource/resolveModule (typed prelude,
     // pkgs/lib templates). Copies the source.
-    void shuttle_checker_seed_module(ShuttleChecker* checker, const char* name, const char* source, size_t len)
+    void nau_checker_seed_module(NauChecker* checker, const char* name, const char* source, size_t len)
     {
         checker->fileResolver.sources[Luau::ModuleName(name)] = std::string(source, len);
     }
@@ -127,9 +127,9 @@ extern "C"
     // Run --!strict type checking of one in-memory module. Never throws across
     // the boundary; catastrophic failures come back as a single synthetic
     // diagnostic at 1:1.
-    ShuttleCheckResult* shuttle_checker_check(ShuttleChecker* checker, const char* name, const char* source, size_t len)
+    NauCheckResult* nau_checker_check(NauChecker* checker, const char* name, const char* source, size_t len)
     {
-        auto result = std::make_unique<ShuttleCheckResult>();
+        auto result = std::make_unique<NauCheckResult>();
         try
         {
             Luau::ModuleName moduleName(name);
@@ -149,26 +149,26 @@ extern "C"
             // surface as one synthetic 1:1 diagnostic instead of unwinding
             // across the C boundary.
             result->errors.push_back(Luau::TypeError());
-            result->messages.push_back(std::string("shuttle-shim: analyzer exception: ") + e.what());
+            result->messages.push_back(std::string("nau-shim: analyzer exception: ") + e.what());
         }
         catch (...)
         {
             result->errors.push_back(Luau::TypeError());
-            result->messages.push_back("shuttle-shim: unknown analyzer exception");
+            result->messages.push_back("nau-shim: unknown analyzer exception");
         }
         return result.release();
     }
 
-    int shuttle_error_count(ShuttleCheckResult* result)
+    int nau_error_count(NauCheckResult* result)
     {
         return result ? static_cast<int>(result->errors.size()) : 0;
     }
 
     // 1-based positions (begin col 1-based, end col exclusive), matching
     // luau-analyze's printed format. `message` points into the result handle;
-    // valid until shuttle_check_result_free.
-    int shuttle_error_at(
-        ShuttleCheckResult* result,
+    // valid until nau_check_result_free.
+    int nau_error_at(
+        NauCheckResult* result,
         int index,
         unsigned* beginLine,
         unsigned* beginCol,
@@ -193,12 +193,12 @@ extern "C"
         return 0;
     }
 
-    int shuttle_timeout_hits(ShuttleCheckResult* result)
+    int nau_timeout_hits(NauCheckResult* result)
     {
         return result ? result->timeoutHits : 0;
     }
 
-    void shuttle_check_result_free(ShuttleCheckResult* result)
+    void nau_check_result_free(NauCheckResult* result)
     {
         delete result;
     }

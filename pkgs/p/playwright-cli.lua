@@ -83,7 +83,7 @@ return {
             "pkg=$STAGE/usr/lib/node_modules/@playwright/cli",
             'mkdir -p "$pkg"',
             'cp -r $SRC/package.json $SRC/playwright-cli.js $SRC/skillCheck.js $SRC/skills "$pkg/"',
-            'tar -C "$SHUTTLE_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
+            'tar -C "$NAU_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
         }, " && "),
 
         type = "source",

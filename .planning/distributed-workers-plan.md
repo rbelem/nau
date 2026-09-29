@@ -1,6 +1,6 @@
 # Distributed build workers plan
 
-shuttle gains an SSH-driven build pool. The coordinator is the existing `shuttle build --all` process. A Worker is a machine the operator names in a new `workers = { ... }` array in `shuttle.lua`, driven over SSH, with no daemon and no new listening socket. Cloud burst (AWS, GCP, Azure, Scaleway, Hetzner) lands behind one Provisioner seam as per-provider tickets. The feature supersedes ADR-0022 Decision 4 and is designed in `docs/adr/0040-distributed-build-workers.md`. Tickets run T0 through T10 in dependency order.
+nau gains an SSH-driven build pool. The coordinator is the existing `nau build --all` process. A Worker is a machine the operator names in a new `workers = { ... }` array in `nau.lua`, driven over SSH, with no daemon and no new listening socket. Cloud burst (AWS, GCP, Azure, Scaleway, Hetzner) lands behind one Provisioner seam as per-provider tickets. The feature supersedes ADR-0022 Decision 4 and is designed in `docs/adr/0040-distributed-build-workers.md`. Tickets run T0 through T10 in dependency order.
 
 ## How to read this
 
@@ -22,7 +22,7 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 > merged; T4 (#192) and T6 (#194) landed 2026-09-27 — T6 deliberately ahead of
 > T5 (ADR-0045 ratification un-parked it); T5 (#193) is the only open box.
 > Contract note: the TTL source of truth is the hcloud label pair
-> (`shuttle-worker`, `shuttle-worker-ttl` = epoch seconds) per the #269
+> (`nau-worker`, `nau-worker-ttl` = epoch seconds) per the #269
 > amendment — the in-guest marker is a fallback copy; `--type cx22` examples
 > below are stale post-reprice (classes CX23/CX33/CAX11/21; cli.rs help is
 > authoritative).
@@ -58,9 +58,9 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 
 ### PR mechanics, for every PR
 
-- [ ] Resolve the forge once. Use `gh` for every PR operation. This repo is `rbelem/shuttle`.
+- [ ] Resolve the forge once. Use `gh` for every PR operation. This repo is `rbelem/nau`.
 - [ ] Open the PR ready, never draft, with `gh pr create --base main`.
-- [ ] Run the full gate once before the PR-facing push. `env -u LD_LIBRARY_PATH devbox run -- check`, then `shuttle run --pod gate -- cargo clippy -- -D warnings`, then `shuttle run --pod gate -- cargo fmt --check`.
+- [ ] Run the full gate once before the PR-facing push. `env -u LD_LIBRARY_PATH devbox run -- check`, then `nau run --pod gate -- cargo clippy -- -D warnings`, then `nau run --pod gate -- cargo fmt --check`.
 - [ ] Run `/stop-slop` before each commit and `/no-comments` before review.
 - [ ] Triage every Bugbot and security-reviewer comment per `~/.agents/skills/poteto-mode/references/bugbot-triage.md`.
 - [ ] Rebase onto current trunk before babysit and again before the merge-ready report.
@@ -78,7 +78,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 - [ ] `git fetch origin <head-branch> && git checkout <head SHA>`.
 - [ ] Build once. `env -u LD_LIBRARY_PATH devbox run -- build`.
 - [ ] Run the lane scenario through the built binary. Local-loopback SSH workers use `ssh://localhost` with the operator's own key; a second machine on the LAN is used where the lane names one, and when no second machine exists the lane records that fact and runs the loopback variant of the same scenario.
-- [ ] Deliver input only through the CLI. Name the read-only diagnostics, `shuttle doctor`, `--json` flags, and exit codes.
+- [ ] Deliver input only through the CLI. Name the read-only diagnostics, `nau doctor`, `--json` flags, and exit codes.
 - [ ] Save every run artifact, logs and JSON transcripts, to `/tmp/swarm-<ticket>/worker-<n>/<slug>.log` and return the paths with the report.
 
 ## Ratify the ADR and the vocabulary (T0)
@@ -106,7 +106,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 **Verify, live.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked. Ten lanes on `grok-4.6-fast-xhigh` at the PR head, per the boot recipe.
 
-- [ ] Lane 1. Regression lane against trunk. Run `shuttle build pkgs/h/htop.lua --all` at trunk and head. Trunk has no docs-only change, record that fact. Save `docs-parity.log`. Pass when head output equals trunk output byte for byte.
+- [ ] Lane 1. Regression lane against trunk. Run `nau build pkgs/h/htop.lua --all` at trunk and head. Trunk has no docs-only change, record that fact. Save `docs-parity.log`. Pass when head output equals trunk output byte for byte.
 - [ ] Lane 2. ADR cross-links resolve. Open ADR-0040 and follow every file pointer to a real file or line. Save `adr-links.log`. Pass when no pointer dangles.
 - [ ] Lane 3. Glossary vocabulary lands. Grep `CONTEXT.md` for Worker, Job manifest, Coordinator. Save `glossary.log`. Pass when all three entries exist with avoid-lists.
 - [ ] Lane 4. Supersession note reads correctly. Read ADR-0022 Decision 4. Save `supersession.log`. Pass when the note names ADR-0040 and scopes the supersession to build compute only.
@@ -119,7 +119,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 **Verify, perf.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked.
 
-- [ ] Metric. Build wall clock for `shuttle build pkgs/h/htop.lua --all` at trunk and head, docs-only change expected to move nothing.
+- [ ] Metric. Build wall clock for `nau build pkgs/h/htop.lua --all` at trunk and head, docs-only change expected to move nothing.
 - [ ] Probe. Time the build three times at trunk and three at head, interleaved, cold stage each run.
 - [ ] Baseline. Record the trunk median first.
 - [ ] Rule. Head median within 5 percent of the trunk median. A larger delta is a docs-process regression and fails.
@@ -151,7 +151,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 **You see.**
 
-- [ ] `shuttle eval` on a `shuttle.lua` with a workers table prints the payload carrying the parsed worker list. Absent the key, every existing command behaves exactly as before.
+- [ ] `nau eval` on a `nau.lua` with a workers table prints the payload carrying the parsed worker list. Absent the key, every existing command behaves exactly as before.
 
 **Verify, unit.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked.
 
@@ -159,8 +159,8 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 **Verify, live.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked. Ten lanes on `grok-4.6-fast-xhigh` at the PR head, per the boot recipe.
 
-- [ ] Lane 1. Regression lane against trunk. Run `shuttle build pkgs/h/htop.lua --all` at trunk and head with no workers key. Trunk has no workers feature, record that fact and gate that head adds no behavior. Save `no-key-parity.log`. Pass when head artifacts and output equal trunk.
-- [ ] Lane 2. Valid table evaluates. Run `shuttle eval` on a fixture with two workers. Save `eval-ok.log`. Pass when the payload JSON lists both addresses.
+- [ ] Lane 1. Regression lane against trunk. Run `nau build pkgs/h/htop.lua --all` at trunk and head with no workers key. Trunk has no workers feature, record that fact and gate that head adds no behavior. Save `no-key-parity.log`. Pass when head artifacts and output equal trunk.
+- [ ] Lane 2. Valid table evaluates. Run `nau eval` on a fixture with two workers. Save `eval-ok.log`. Pass when the payload JSON lists both addresses.
 - [ ] Lane 3. Missing address. Run eval on a worker without address. Save `missing-address.log`. Pass when the diagnostic names the address field and exits nonzero.
 - [ ] Lane 4. Bad scheme. Address `http://host` is refused. Save `bad-scheme.log`. Pass when the diagnostic names the ssh scheme rule.
 - [ ] Lane 5. Zero jobs refused. Save `zero-jobs.log`. Pass when the diagnostic names jobs and the minimum.
@@ -173,7 +173,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 **Verify, perf.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked.
 
 - [ ] Metric. Eval and build wall clock with no workers key, head against trunk. The diff-added work is one table parse on an absent key and must cost nothing measurable. The end state the user waits for is the same artifact at the same time.
-- [ ] Probe. Time `shuttle eval` and the htop build three times each at trunk and head, interleaved.
+- [ ] Probe. Time `nau eval` and the htop build three times each at trunk and head, interleaved.
 - [ ] Baseline. Record the trunk medians first.
 - [ ] Rule. Head within 5 percent of trunk on both metrics. Absolute budget for the diff-added parse, under 1 millisecond.
 
@@ -266,7 +266,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 
 **Verify, live.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked. Ten lanes on `grok-4.6-fast-xhigh` at the PR head, per the boot recipe.
 
-- [ ] Lane 1. Regression lane against trunk. Run `shuttle --help` at trunk and head. Trunk hides the verbs, record that fact and gate that head still hides them. Save `help-parity.log`. Pass when neither help output names the verbs.
+- [ ] Lane 1. Regression lane against trunk. Run `nau --help` at trunk and head. Trunk hides the verbs, record that fact and gate that head still hides them. Save `help-parity.log`. Pass when neither help output names the verbs.
 - [ ] Lane 2. Cap document. Run `__worker-cap` on the lane machine. Save `cap-ok.log`. Pass when the JSON carries protocol, arch, nproc, and tool flags.
 - [ ] Lane 3. Tool absence. Run the cap verb with bwrap removed from PATH. Save `cap-nobwrap.log`. Pass when the bwrap flag reads false and the verb still exits zero.
 - [ ] Lane 4. Happy job. Run `__worker-job` with a hello fixture manifest. Save `job-ok.log`. Pass when the result JSON hashes match the files on disk.
@@ -308,7 +308,7 @@ Each live lane runs in its own background agent at the PR head. Drive through di
 - [ ] `SshExecutor` drives `ssh` through `CommandRunner` with bounded timeouts, probe, dispatch, stream, collect.
 - [ ] Preflight runs `__worker-cap` and asserts protocol, arch match with the job target, tool presence, and free disk. Any failure is a named refusal naming the probe.
 - [ ] Delta sync ships only objects the worker reports missing, as a tar stream over the SSH channel, and verifies every sha256 on arrival. Returned artifacts are hash-verified before ingest under the job-manifest identity namespace (ADR-0040 D6) — never `v4:<closure_sha256>`, so a remote result can never silently substitute for a locally keyed entry.
-- [ ] Host keys are pinned, never learned. Each workers entry carries its `host_key` (an `ssh-ed25519 AAAA...` line or a `SHA256:` fingerprint); the executor drives ssh with `StrictHostKeyChecking=yes` against a shuttle-managed known_hosts built from the pins, and preflight refuses an unpinned worker by name. No `ssh-keyscan` path exists. (ADR-0045 D4; the pin mechanics land here, the provisioning form waits for ratification.)
+- [ ] Host keys are pinned, never learned. Each workers entry carries its `host_key` (an `ssh-ed25519 AAAA...` line or a `SHA256:` fingerprint); the executor drives ssh with `StrictHostKeyChecking=yes` against a nau-managed known_hosts built from the pins, and preflight refuses an unpinned worker by name. No `ssh-keyscan` path exists. (ADR-0045 D4; the pin mechanics land here, the provisioning form waits for ratification.)
 - [ ] Workers never fetch upstream. Pinned sources travel in the job payload.
 
 **You see.**
@@ -421,14 +421,14 @@ the promised un-park rewrite is realized in the landed Build box
 
 **Build.**
 
-- [ ] `shuttle workers provision --provider hetzner --type cx22 --location fsn1 --count 1` creates servers, waits for cloud-init, mints the worker host keypair coordinator-side, injects the private half through cloud-init user-data (the provider's authenticated API channel), pins the public half into the appended `workers` entry, and never calls `ssh-keyscan` (ADR-0045 posture; final shape set at ratification).
-- [ ] Cloud-init installs the pinned shuttle binary, writes the operator authorized key, and stamps a TTL marker file.
-- [ ] `shuttle workers destroy --provider hetzner --name <name>` removes the server and the config entry.
-- [ ] No token, invalid token, and dry-run are all handled before any API call. Secrets never enter `shuttle.lua`.
+- [ ] `nau workers provision --provider hetzner --type cx22 --location fsn1 --count 1` creates servers, waits for cloud-init, mints the worker host keypair coordinator-side, injects the private half through cloud-init user-data (the provider's authenticated API channel), pins the public half into the appended `workers` entry, and never calls `ssh-keyscan` (ADR-0045 posture; final shape set at ratification).
+- [ ] Cloud-init installs the pinned nau binary, writes the operator authorized key, and stamps a TTL marker file.
+- [ ] `nau workers destroy --provider hetzner --name <name>` removes the server and the config entry.
+- [ ] No token, invalid token, and dry-run are all handled before any API call. Secrets never enter `nau.lua`.
 
 **You see.**
 
-- [ ] One command turns a Hetzner account into a listed worker in `shuttle.lua` that a farm build uses. The minted host key is pinned before first use.
+- [ ] One command turns a Hetzner account into a listed worker in `nau.lua` that a farm build uses. The minted host key is pinned before first use.
 
 **Verify, unit.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked.
 
@@ -441,7 +441,7 @@ the promised un-park rewrite is realized in the landed Build box
 - [ ] Lane 3. Dry-run. Run provision with `--dry-run`. Save `dry-run.log`. Pass when the plan names type, location, count, and user-data hash, and no server exists after.
 - [ ] Lane 4. Real provision. Provision one `cx22`. Save `real-provision.log`. Pass when cloud-init completes and `__worker-cap` over SSH succeeds.
 - [ ] Lane 5. Host key pinning. Run provision a second time against the same server. Save `hostkey-pin.log`. Pass when the pinned key matches and no re-prompt happens.
-- [ ] Lane 6. Config append. Read `shuttle.lua` after provisioning. Save `config-append.log`. Pass when the workers array gains the entry and the file still evaluates.
+- [ ] Lane 6. Config append. Read `nau.lua` after provisioning. Save `config-append.log`. Pass when the workers array gains the entry and the file still evaluates.
 - [ ] Lane 7. End-to-end job. Build the htop closure with the provisioned worker in the pool. Save `prov-e2e.log`. Pass when the job attributes the Hetzner worker and exits zero.
 - [ ] Lane 8. Invalid token. Run provision with a bad token. Save `bad-token.log`. Pass when the provider error is named and no partial state remains.
 - [ ] Lane 9. TTL marker. SSH to the provisioned server and read the marker. Save `ttl-marker.log`. Pass when the marker names the TTL the cloud-init wrote.
@@ -452,7 +452,7 @@ the promised un-park rewrite is realized in the landed Build box
 - [ ] Metric. Provision wall clock, token check to cap probe success, head only. Trunk lacks the verb, record that fact. The end state the user waits for is a usable worker, so the budget covers the whole path.
 - [ ] Probe. Time three fresh provision runs to cap success, recording each phase, API create, cloud-init wait, cap probe.
 - [ ] Baseline. Record the first run's phase times first.
-- [ ] Rule. Under 4 minutes token to cap on `cx22`, cloud-init dominating. Budget the shuttle-side overhead alone at under 15 seconds.
+- [ ] Rule. Under 4 minutes token to cap on `cx22`, cloud-init dominating. Budget the nau-side overhead alone at under 15 seconds.
 
 **Review gate.** The operator reviews before merge. T6 adds a CLI verb that spends real money.
 
@@ -478,7 +478,7 @@ the promised un-park rewrite is realized in the landed Build box
 
 **Build.**
 
-- [ ] `shuttle workers provision --provider aws --type m5.large --region <region> --count 1 --spot` resolves an AMI, requests spot capacity at a price cap, and lands the worker in config with host-key pinning like T6.
+- [ ] `nau workers provision --provider aws --type m5.large --region <region> --count 1 --spot` resolves an AMI, requests spot capacity at a price cap, and lands the worker in config with host-key pinning like T6.
 - [ ] Spot eviction surfaces as a lost worker under T5's stop-the-world rule. No mid-flight migration.
 
 **You see.**
@@ -507,7 +507,7 @@ the promised un-park rewrite is realized in the landed Build box
 - [ ] Metric. Spot provision wall clock, request to cap probe, head only. Trunk lacks the provider, record that fact. The end state the user waits for is a usable spot worker.
 - [ ] Probe. Time three fresh spot provisions, recording request, fulfillment, cloud-init, cap phases.
 - [ ] Baseline. Record the first run's phases first.
-- [ ] Rule. Fulfillment to cap under 6 minutes on `m5.large` in the tested region. Shuttle-side overhead under 15 seconds.
+- [ ] Rule. Fulfillment to cap under 6 minutes on `m5.large` in the tested region. Nau-side overhead under 15 seconds.
 
 **Review gate.** The operator reviews before merge. T7 spends real money and adds a provider surface.
 
@@ -533,7 +533,7 @@ the promised un-park rewrite is realized in the landed Build box
 
 **Build.**
 
-- [ ] `shuttle workers provision --provider gcp --type e2-standard-4 --zone <zone> --count 1` creates the instance with the startup-script cloud-init template, pins the host key, and appends the worker entry.
+- [ ] `nau workers provision --provider gcp --type e2-standard-4 --zone <zone> --count 1` creates the instance with the startup-script cloud-init template, pins the host key, and appends the worker entry.
 - [ ] Preemptible VMs ride `--preemptible`, and eviction reads as T5 worker loss.
 
 **You see.**
@@ -562,7 +562,7 @@ the promised un-park rewrite is realized in the landed Build box
 - [ ] Metric. Provision wall clock, insert to cap probe, head only. Trunk lacks the provider, record that fact. The end state the user waits for is a usable worker.
 - [ ] Probe. Time three fresh provisions, recording insert, startup-script, cap phases.
 - [ ] Baseline. Record the first run's phases first.
-- [ ] Rule. Insert to cap under 5 minutes on `e2-standard-4`. Shuttle-side overhead under 15 seconds.
+- [ ] Rule. Insert to cap under 5 minutes on `e2-standard-4`. Nau-side overhead under 15 seconds.
 
 **Review gate.** The operator reviews before merge. T8 spends real money and adds a provider surface.
 
@@ -588,7 +588,7 @@ the promised un-park rewrite is realized in the landed Build box
 
 **Build.**
 
-- [ ] `shuttle workers provision --provider azure --type Standard_D4s_v5 --location <region> --count 1` creates the VM with the bootstrap template, pins the host key, and appends the worker entry.
+- [ ] `nau workers provision --provider azure --type Standard_D4s_v5 --location <region> --count 1` creates the VM with the bootstrap template, pins the host key, and appends the worker entry.
 - [ ] Spot VMs ride the priority flag, and eviction reads as T5 worker loss.
 
 **You see.**
@@ -617,7 +617,7 @@ the promised un-park rewrite is realized in the landed Build box
 - [ ] Metric. Provision wall clock, create to cap probe, head only. Trunk lacks the provider, record that fact. The end state the user waits for is a usable worker.
 - [ ] Probe. Time three fresh provisions, recording create, extension, cap phases.
 - [ ] Baseline. Record the first run's phases first.
-- [ ] Rule. Create to cap under 7 minutes on `Standard_D4s_v5`. Shuttle-side overhead under 15 seconds.
+- [ ] Rule. Create to cap under 7 minutes on `Standard_D4s_v5`. Nau-side overhead under 15 seconds.
 
 **Review gate.** The operator reviews before merge. T9 spends real money and adds a provider surface.
 
@@ -643,7 +643,7 @@ the promised un-park rewrite is realized in the landed Build box
 
 **Build.**
 
-- [ ] `shuttle workers provision --provider scaleway --type GP1-S --zone fr-par-1 --count 1` creates the server with the cloud-init template, pins the host key, and appends the worker entry.
+- [ ] `nau workers provision --provider scaleway --type GP1-S --zone fr-par-1 --count 1` creates the server with the cloud-init template, pins the host key, and appends the worker entry.
 
 **You see.**
 
@@ -671,7 +671,7 @@ the promised un-park rewrite is realized in the landed Build box
 - [ ] Metric. Provision wall clock, create to cap probe, head only. Trunk lacks the provider, record that fact. The end state the user waits for is a usable worker.
 - [ ] Probe. Time three fresh provisions, recording create, cloud-init, cap phases.
 - [ ] Baseline. Record the first run's phases first.
-- [ ] Rule. Create to cap under 5 minutes on `GP1-S`. Shuttle-side overhead under 15 seconds.
+- [ ] Rule. Create to cap under 5 minutes on `GP1-S`. Nau-side overhead under 15 seconds.
 
 **Review gate.** The operator reviews before merge. T10 spends real money and adds a provider surface.
 
@@ -695,7 +695,7 @@ the promised un-park rewrite is realized in the landed Build box
 
 ## Appendix A. Prototype evidence
 
-No prototype was run in the planning session. The design settled on ADR analysis and prior-art research, and these questions stay unproven until the named live gates run. Tar-over-SSH throughput for large closures, first measured at T4 lane 3 and the T4 perf block. Loopback SSHD availability on the operator's machines, assumed by every loopback lane, first checked at T3 lane 2, with the second-machine lane recording the fact when absent. Cloud-init shuttle install time on each provider, first measured at T6 lane 4 and T7 through T10 lane 4. Cap probe latency on a cold machine, first measured at T3 lane 2 and the T3 perf block. If T4 lane 3 shows delta sync moving over 10 percent of closure bytes on shared closures, revisit the coordinator-ships-sources decision before T5 merges.
+No prototype was run in the planning session. The design settled on ADR analysis and prior-art research, and these questions stay unproven until the named live gates run. Tar-over-SSH throughput for large closures, first measured at T4 lane 3 and the T4 perf block. Loopback SSHD availability on the operator's machines, assumed by every loopback lane, first checked at T3 lane 2, with the second-machine lane recording the fact when absent. Cloud-init nau install time on each provider, first measured at T6 lane 4 and T7 through T10 lane 4. Cap probe latency on a cold machine, first measured at T3 lane 2 and the T3 perf block. If T4 lane 3 shows delta sync moving over 10 percent of closure bytes on shared closures, revisit the coordinator-ships-sources decision before T5 merges.
 
 ## Appendix B. Alternatives rejected
 
@@ -704,7 +704,7 @@ The full ledger lives in ADR-0040's Alternatives section. The short list. Worker
 ## Appendix C. Risks
 
 - One flaky worker fails the whole run. Lands in T5. The owner watches the stop-the-world lanes and the operator decides if strict is too strict after living with it. The escape hatch is removing the worker from config, not silent retries.
-- Provisioned cloud VMs leak when a run dies mid-provision. Lands in T6 and every provider ticket. The leash: the `shuttle-worker`/`shuttle-worker-ttl` hcloud labels set at create (v2 contract, #269 amendment), the destroy verb's volume pre-check, and the #269 TTL sweep. The owner watches lane 10 of each provider.
+- Provisioned cloud VMs leak when a run dies mid-provision. Lands in T6 and every provider ticket. The leash: the `nau-worker`/`nau-worker-ttl` hcloud labels set at create (v2 contract, #269 amendment), the destroy verb's volume pre-check, and the #269 TTL sweep. The owner watches lane 10 of each provider.
 - Host-key pinning friction on first use. Lands in T6. ADR-0045 superseded the printed-key flow: mint-and-inject pins the host key into the workers entry atomically at provision — the operator's explicit-trust act is provisioning at all. The owner watches lane 5.
 - Protocol drift between coordinator and worker versions. Lands in T3 and T4. The constant plus preflight refusal is the guard. The owner watches lane 8 of T3.
 - Large source tarballs over slow links make coordinator-ships-sources painful. Surfaces at T4 lane 3 and the T4 perf block. The recorded answer is the fetch-at-worker revisit trigger, not a v1 mode.

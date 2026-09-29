@@ -10,7 +10,7 @@
 //! path through `snap.rs::build_snap` and prints one JSON result document.
 //!
 //! The never-fetch invariant is mechanically enforced, not just validated:
-//! the job sets `SHUTTLE_TOOL_CURL` (the documented per-tool override in
+//! the job sets `NAU_TOOL_CURL` (the documented per-tool override in
 //! `tools.rs`, which beats every other resolution rule) to a generated shim
 //! that serves ONLY the source bytes shipped in the job payload and refuses
 //! every other URL. A source the manifest did not ship cannot be fetched —
@@ -66,7 +66,7 @@ pub struct JobManifest {
     pub target: String,
 
     /// Optional GNU cross triplet, applied to the loaded recipe exactly
-    /// like `shuttle build --target` applies it coordinator-side.
+    /// like `nau build --target` applies it coordinator-side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_target: Option<String>,
 
@@ -86,7 +86,7 @@ pub struct JobManifest {
     pub recipes: BTreeMap<String, String>,
 
     /// The lockfile pin slice, written as the materialized root's
-    /// `shuttle.lock` and used to route source blobs to their URLs.
+    /// `nau.lock` and used to route source blobs to their URLs.
     #[serde(default)]
     pub pins: Vec<SourcePin>,
 
@@ -244,7 +244,7 @@ pub fn capability_document() -> CapabilityDoc {
     }
 }
 
-/// Entry point for `shuttle __worker-cap`: print the capability document
+/// Entry point for `nau __worker-cap`: print the capability document
 /// as one JSON object on stdout, then exit.
 pub fn cap_main() -> miette::Result<()> {
     let doc = capability_document();
@@ -326,7 +326,7 @@ fn free_disk_bytes(path: &Path) -> u64 {
 
 // ── __worker-job ──
 
-/// Entry point for `shuttle __worker-job <job-file>`: load the manifest,
+/// Entry point for `nau __worker-job <job-file>`: load the manifest,
 /// verify everything, execute one job, print one result document. The
 /// built artifacts land in an `out/` directory beside the job file — they
 /// must outlive the job's scratch, because the transport collects them by
@@ -425,7 +425,7 @@ impl JobStateGuard {
             cwd: std::env::current_dir()
                 .map_err(|e| miette::miette!("worker-job: cannot read current directory: {e}"))?,
             epoch: std::env::var_os("SOURCE_DATE_EPOCH"),
-            curl: std::env::var_os("SHUTTLE_TOOL_CURL"),
+            curl: std::env::var_os("NAU_TOOL_CURL"),
         })
     }
 }
@@ -436,7 +436,7 @@ impl Drop for JobStateGuard {
         // restore exists so in-process tests keep a sane environment.
         std::env::set_current_dir(&self.cwd).ok();
         restore_var("SOURCE_DATE_EPOCH", self.epoch.as_deref());
-        restore_var("SHUTTLE_TOOL_CURL", self.curl.as_deref());
+        restore_var("NAU_TOOL_CURL", self.curl.as_deref());
         crate::snap::set_buffer_child_stderr(false);
     }
 }
@@ -463,7 +463,7 @@ fn run_job(
     // which honors this override first) is the payload shim.
     let bin_dir = root.path().join(".worker-bin");
     let shim = write_curl_shim(&bin_dir, &payloads.sources)?;
-    std::env::set_var("SHUTTLE_TOOL_CURL", &shim);
+    std::env::set_var("NAU_TOOL_CURL", &shim);
 
     // Recipe slice → meta through the ordinary resolution path. The eval
     // runs in the bounded `__eval-worker` subprocess (ADR-0010), whose
@@ -854,7 +854,7 @@ fn refuse_unshipped_sources(
 }
 
 /// Write the recipe slice and the lockfile pin slice into a fresh job
-/// root. Recipe bytes land at their manifest-relative paths; `shuttle.lock`
+/// root. Recipe bytes land at their manifest-relative paths; `nau.lock`
 /// carries the pin slice.
 fn materialize_root(manifest: &JobManifest) -> miette::Result<tempfile::TempDir> {
     let root = tempfile::tempdir()
@@ -910,7 +910,7 @@ fn write_curl_shim(bin_dir: &Path, sources: &BTreeMap<String, PathBuf>) -> miett
         .map_err(|e| miette::miette!("worker-job: cannot create shim dir: {e}"))?;
     let mut script = String::from(
         "#!/bin/sh\n\
-         # shuttle __worker-job payload shim (ADR-0040 Decision 6): serves\n\
+         # nau __worker-job payload shim (ADR-0040 Decision 6): serves\n\
          # ONLY the source bytes shipped in the job payload. Any other URL\n\
          # is a refused upstream fetch — workers never fetch upstream.\n\
          out=\"\"; url=\"\"; prev=\"\"\n\
@@ -932,7 +932,7 @@ fn write_curl_shim(bin_dir: &Path, sources: &BTreeMap<String, PathBuf>) -> miett
     }
     script.push_str(
         "esac\n\
-         echo \"shuttle worker: refused upstream fetch of '${url:-<none>}' — workers never \
+         echo \"nau worker: refused upstream fetch of '${url:-<none>}' — workers never \
          fetch upstream; the source must ship in the job payload\" >&2\n\
          exit 1\n",
     );

@@ -1,5 +1,5 @@
 [package]
-name = "shuttle"
+name = "nau"
 version = "0.1.0"
 edition = "2021"
 description = "Build Snap packages from Lua declarations"
@@ -99,7 +99,7 @@ tar = "0.4"
 
 [profile.release]
 # The image build embeds this binary into every image it builds at
-# /usr/bin/shuttle (issue #81): strip the symbol table so the shipped
+# /usr/bin/nau (issue #81): strip the symbol table so the shipped
 # artifact — and every A/B slot and update payload carrying it — stays
 # small. The guest never needs symbols: the boot units exec it headlessly.
 strip = true

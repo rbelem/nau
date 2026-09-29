@@ -13,18 +13,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sha2::{Digest, Sha256};
-use shuttle::build_sched::{
+use nau::build_sched::{
     run_ready_set_farm, short_worker_name, ExecutorKind, FarmExecutor, FarmJob, JobCaps,
     JobFailure, ManifestSource, RemoteExecutor,
 };
-use shuttle::command::{CommandRunner, RunnerOutput};
-use shuttle::coordinator::{farm_build_result, preflight_farm_workers, FarmSource, NodeJobPlan};
-use shuttle::lock::LockFile;
-use shuttle::lua::WorkerConfig;
-use shuttle::snap::{SnapMeta, SourceSpec};
-use shuttle::ssh_exec::{DispatchOutcome, SshExecutor};
-use shuttle::worker::{Artifact, CapabilityDoc, JobManifest, JobResult, WORKER_PROTOCOL_VERSION};
+use nau::command::{CommandRunner, RunnerOutput};
+use nau::coordinator::{farm_build_result, preflight_farm_workers, FarmSource, NodeJobPlan};
+use nau::lock::LockFile;
+use nau::lua::WorkerConfig;
+use nau::snap::{SnapMeta, SourceSpec};
+use nau::ssh_exec::{DispatchOutcome, SshExecutor};
+use nau::worker::{Artifact, CapabilityDoc, JobManifest, JobResult, WORKER_PROTOCOL_VERSION};
+use sha2::{Digest, Sha256};
 
 // ── Shared helpers ──
 
@@ -430,16 +430,16 @@ fn a_lost_cross_job_falls_back_to_local() {
 const FINGERPRINT_PIN: &str = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG";
 const CA_PUB_LINE: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux loopback-ca";
-const CA_IDENTITY: &str = "shuttle-worker-farm-test-01";
+const CA_IDENTITY: &str = "nau-worker-farm-test-01";
 
 /// The ceremony fixture the CA-form pin resolves against: the CA public
 /// half on disk plus the machine linkage for `address`, under `home`
 /// (the seam `with_ceremony_home` points the executor at).
 fn ca_ceremony(home: &Path, address: &str) {
-    let ca_dir = home.join(".config/shuttle/ca");
+    let ca_dir = home.join(".config/nau/ca");
     std::fs::create_dir_all(ca_dir.join("machines")).unwrap();
     std::fs::write(ca_dir.join("ca.pub"), format!("{CA_PUB_LINE}\n")).unwrap();
-    shuttle::provision::publish::record_machine_link(home, CA_IDENTITY, address).unwrap();
+    nau::provision::publish::record_machine_link(home, CA_IDENTITY, address).unwrap();
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -449,7 +449,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn host_arch() -> String {
-    shuttle::snap::host_arch().to_string()
+    nau::snap::host_arch().to_string()
 }
 
 /// The scripted worker side of the SSH channel: real file moves for
@@ -481,7 +481,7 @@ impl LoopbackWorker {
                 mksquashfs: true,
                 kvm: false,
                 sandbox: true,
-                mksquashfs_version: Some(shuttle::provision::SQUASHFS_TOOLS_VERSION.into()),
+                mksquashfs_version: Some(nau::provision::SQUASHFS_TOOLS_VERSION.into()),
             },
         }
     }
@@ -544,7 +544,7 @@ impl LoopbackWorker {
         ))
     }
 
-    /// `shuttle __worker-job <job.json>`: write the scripted artifact
+    /// `nau __worker-job <job.json>`: write the scripted artifact
     /// into the job's out dir and print the result document.
     fn job(&self, cmd: &str) -> io::Result<RunnerOutput> {
         let job_file = self
@@ -851,7 +851,7 @@ fn short_worker_name_strips_to_the_host() {
 
 #[test]
 fn json_events_carry_executor_and_worker() {
-    let local = shuttle::output::BuildResultJson {
+    let local = nau::output::BuildResultJson {
         name: "tree".into(),
         version: "2.3.2".into(),
         arch: "amd64".into(),
@@ -865,7 +865,7 @@ fn json_events_carry_executor_and_worker() {
     assert_eq!(v["executor"], "local");
     assert!(v.get("worker").is_none(), "local events omit the worker");
 
-    let farm = shuttle::output::BuildResultJson {
+    let farm = nau::output::BuildResultJson {
         worker: Some("nuci.local".into()),
         executor: "ssh".into(),
         ..local
@@ -1204,7 +1204,7 @@ fn preflight_refuses_a_declared_arch_mismatch_before_any_dispatch() {
         "the refusal names the probe and the expectation: {text}"
     );
     assert!(
-        !machine.join(".cache/shuttle/worker/jobs").exists(),
+        !machine.join(".cache/nau/worker/jobs").exists(),
         "zero dispatches: the job never crossed the channel"
     );
 

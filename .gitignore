@@ -15,7 +15,7 @@ target
 
 # Build outputs from definition builds and smoke tests
 *.snap
-shuttle.lock
+nau.lock
 stage/
 # Cross-process default-stage lock (flock sibling of stage/, never wiped)
 stage.lock

@@ -19,13 +19,13 @@
 --   The build sandbox sets CC, CXX, LD, AR to the cross-tools.
 --
 -- Usage:
---   shuttle build --file examples/packages/toolchain-demo/shuttle.lua
+--   nau build --file examples/packages/toolchain-demo/nau.lua
 --   → builds hello using the default toolchain
 --
---   shuttle build --file examples/packages/toolchain-demo/shuttle.lua --all
+--   nau build --file examples/packages/toolchain-demo/nau.lua --all
 --   → builds all dependencies (toolchain) first, then hello
 --
---   shuttle build --file examples/packages/toolchain-demo/shuttle.lua --order
+--   nau build --file examples/packages/toolchain-demo/nau.lua --order
 --   → shows the full dependency tree
 
 return {
@@ -34,7 +34,7 @@ return {
         version = "0.1.0",
         summary = "Demonstrates building with the default toolchain",
         description = [[
-            This example shows how shuttle's default toolchain
+            This example shows how nau's default toolchain
             (toolchain-gcc-gnu-x86_64) is used to compile source
             packages. The toolchain includes GCC 14.2, binutils,
             glibc, and all supporting libraries.

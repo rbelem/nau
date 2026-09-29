@@ -1,6 +1,6 @@
 //! Confinement lint (ADR-0011 step (g), decision 3).
 //!
-//! Rust-side `shuttle check` stage-2 pass over the evaluated outputs:
+//! Rust-side `nau check` stage-2 pass over the evaluated outputs:
 //! when a snap declares `confinement = "strict"` — the default, so this
 //! fires often — it warns that snapd's dynamic strict confinement is
 //! formally not delivered (interface composition, D-Bus mediation, home
@@ -10,7 +10,7 @@
 //!
 //! # Severity
 //!
-//! WARNING, never error: the lint adds NO failure modes. `shuttle
+//! WARNING, never error: the lint adds NO failure modes. `nau
 //! check`'s ok/fail computation never consults these warnings; they are
 //! reported through the warn channel (human mode) and the `"lint"` JSON
 //! array (machine mode). The oracle is absent-binary-safe: without
@@ -270,7 +270,7 @@ pub fn version_suffix_lint(outputs: &Outputs) -> Vec<LintWarning> {
     warnings
 }
 
-/// Convenience for `shuttle check`: lint warnings keyed for the JSON
+/// Convenience for `nau check`: lint warnings keyed for the JSON
 /// report (`{"key", "message"}` pairs).
 pub fn lint_json(warnings: &[LintWarning]) -> Vec<BTreeMap<&'static str, String>> {
     warnings

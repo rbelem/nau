@@ -97,7 +97,7 @@ mod tests {
     /// the `render_unit` golden test in `units.rs`.
     const GOLDEN_UNIT: &str = "\
 [Unit]
-Description=shuttle: demo (srv)
+Description=nau: demo (srv)
 
 [Service]
 Type=exec
@@ -153,19 +153,19 @@ WantedBy=multi-user.target
         require_unit(
             root.path(),
             "boot-complete.target",
-            "shuttle-boot-health.service",
+            "nau-boot-health.service",
         )
         .unwrap();
 
         let link = root
             .path()
-            .join("etc/systemd/system/boot-complete.target.requires/shuttle-boot-health.service");
+            .join("etc/systemd/system/boot-complete.target.requires/nau-boot-health.service");
         let meta = std::fs::symlink_metadata(&link)
             .unwrap_or_else(|e| panic!("requires link missing at {}: {e}", link.display()));
         assert!(meta.file_type().is_symlink(), "requirement is a symlink");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
-            PathBuf::from("../shuttle-boot-health.service"),
+            PathBuf::from("../nau-boot-health.service"),
             "relative symlink target"
         );
         assert!(

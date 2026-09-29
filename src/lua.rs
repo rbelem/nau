@@ -7,7 +7,7 @@ use crate::analysis::Span;
 use crate::image::ImageDeclaration;
 use crate::snap::{PackageInput, SnapMeta};
 
-/// Named outputs from a `shuttle.lua`, fully converted to owned Rust types.
+/// Named outputs from a `nau.lua`, fully converted to owned Rust types.
 pub type Outputs = HashMap<String, SnapMeta>;
 
 // ── node {} declaration (ADR-0033 Decision 6) ──
@@ -27,7 +27,7 @@ pub struct NodeConfig {
     pub name: String,
     /// Serving surface — what to bind and whether to announce.
     pub serve: NodeServe,
-    /// Peer references (`shuttle://host[:port]`); the FIRST entry is
+    /// Peer references (`nau://host[:port]`); the FIRST entry is
     /// the origin peer — the default pull source, a hint, never a
     /// privilege (ADR-0033 Decision 1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -42,7 +42,7 @@ pub struct NodeServe {
     /// Bind address override; `None` = the loopback default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    /// Announce via mDNS (`_shuttle._tcp.local.`). Default off.
+    /// Announce via mDNS (`_nau._tcp.local.`). Default off.
     #[serde(default)]
     pub announce: bool,
 }
@@ -108,7 +108,7 @@ const NODE_MARKER: &str = "_node";
 
 /// The `workers` config surface (ADR-0040 Decision 3): the coordinator's
 /// own slot count plus the Worker entries, declared as one global table
-/// in `shuttle.lua` — the array part holds the entries, the
+/// in `nau.lua` — the array part holds the entries, the
 /// `local_jobs` hash key holds the slot count. Absent entirely means
 /// zero behavior change: no SSH, no sockets, no new code paths.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,8 +137,8 @@ pub struct WorkerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
     /// The pinned SSH host identity (ADR-0045 Decision 4, as amended by
-    /// #295): the host CA's `SHA256:` fingerprint (the `shuttle ca list`
-    /// form) — the only pin form. The executor builds a shuttle-managed
+    /// #295): the host CA's `SHA256:` fingerprint (the `nau ca list`
+    /// form) — the only pin form. The executor builds a nau-managed
     /// `@cert-authority` known_hosts entry from the ceremony CA whose
     /// fingerprint matches, scoped to the worker's certificate principals
     /// and connected under the provisioned machine identity. Pins are
@@ -458,7 +458,7 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
 
 /// The `host_key` pin grammar (ADR-0045 Decision 4, as amended by #295):
 /// an OpenSSH `SHA256:<43 base64 chars>` fingerprint — THE form and the
-/// only one: the host CA's fingerprint (`shuttle ca list`), which the
+/// only one: the host CA's fingerprint (`nau ca list`), which the
 /// executor enforces as a `@cert-authority` known_hosts entry bound to
 /// the worker's certificate principals. The retired mint-and-inject pin
 /// (a full public-key line) refuses by name with the re-pin remedy;
@@ -477,13 +477,13 @@ pub fn validate_host_key(raw: &str) -> miette::Result<()> {
     if looks_like_public_key_line(raw) {
         return Err(miette::miette!(
             "host_key carries a full public-key line — the retired mint-and-inject pin form \
-             (ADR-0045 as amended by #295): re-pin with the CA fingerprint from `shuttle ca list`"
+             (ADR-0045 as amended by #295): re-pin with the CA fingerprint from `nau ca list`"
         ));
     }
     Err(miette::miette!(
         "host_key must be the host CA's fingerprint ('SHA256:' + 43 base64 characters, the \
-         `shuttle ca list` form), got '{raw}' — re-pin with the CA fingerprint from \
-         `shuttle ca list`"
+         `nau ca list` form), got '{raw}' — re-pin with the CA fingerprint from \
+         `nau ca list`"
     ))
 }
 
@@ -642,7 +642,7 @@ pub fn evaluate_string_with_constraint(
 /// Evaluate a Lua file and return the converted snap outputs.
 ///
 /// The file must return a Lua table of snap declarations.
-/// The shuttle DSL globals (`snap()`, `app()`) are injected before evaluation.
+/// The nau DSL globals (`snap()`, `app()`) are injected before evaluation.
 /// All data is converted to owned Rust structs before returning.
 pub fn evaluate_file(path: &str) -> miette::Result<Outputs> {
     let source = std::fs::read_to_string(path)
@@ -767,7 +767,7 @@ fn parse_expected_actual(message: &str) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Evaluate Lua source for `shuttle check`: the exact same bounded
+/// Evaluate Lua source for `nau check`: the exact same bounded
 /// subprocess path and Rust-side validation as
 /// [`evaluate_string_with_inputs`], but every warn-and-continue diagnostic
 /// comes back as data instead of being printed, and hard eval failures are
@@ -914,7 +914,7 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
 }
 
 /// [`check_string_with_inputs`] for a file path; an unreadable file comes
-/// back as a hard-error [`CheckedEval`] so `shuttle check` reports it
+/// back as a hard-error [`CheckedEval`] so `nau check` reports it
 /// uniformly in both output modes.
 pub fn check_file_with_inputs(path: &str) -> CheckedEval {
     match std::fs::read_to_string(path) {
@@ -1000,7 +1000,7 @@ fn extract_inputs_from_lua(lua: &mlua::Lua) -> miette::Result<HashMap<String, Pa
 
 // ── Lint eval (issue #53) ──
 
-/// Everything `shuttle lint` needs from one definition eval: the raw
+/// Everything `nau lint` needs from one definition eval: the raw
 /// per-key JSON (pre-Rust-validation — the linter must see values that
 /// schema validation rejects; turning them into findings is its job), the
 /// keys that validated as snap outputs, the keys that validated as image
@@ -1100,8 +1100,8 @@ fn eval_request(
     source: &str,
     constraint: Option<&str>,
 ) -> miette::Result<crate::isolate::EvalRequest> {
-    let arch = std::env::var("SHUTTLE_ARCH").unwrap_or_else(|_| "amd64".into());
-    let index_path = std::env::var("SHUTTLE_INDEX_PATH")
+    let arch = std::env::var("NAU_ARCH").unwrap_or_else(|_| "amd64".into());
+    let index_path = std::env::var("NAU_INDEX_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
     let index = crate::index::PackageIndex::load_or_default(&index_path)?;
@@ -1114,9 +1114,9 @@ fn eval_request(
         sources: Default::default(),
         entry: source.to_string(),
         entry_label: label.to_string(),
-        // The CLI sets SHUTTLE_OFFLINE when --offline is parsed; the
+        // The CLI sets NAU_OFFLINE when --offline is parsed; the
         // eval worker then refuses fetch() with a named error.
-        allow_fetch: std::env::var("SHUTTLE_OFFLINE").is_err(),
+        allow_fetch: std::env::var("NAU_OFFLINE").is_err(),
         constraint: constraint.map(str::to_string),
     })
 }
@@ -1620,7 +1620,7 @@ mod tests {
 
     #[test]
     fn test_hello_example_roundtrip() {
-        // Match the examples/hello/shuttle.lua structure
+        // Match the examples/hello/nau.lua structure
         let result = eval_with_dsl(
             r#"
             return {
@@ -1750,15 +1750,15 @@ mod tests {
     #[test]
     fn test_definition_dir_from_label() {
         assert_eq!(
-            super::definition_dir_from_label("pkgs/s/mypkg/shuttle.lua"),
+            super::definition_dir_from_label("pkgs/s/mypkg/nau.lua"),
             Some(std::path::PathBuf::from("pkgs/s/mypkg"))
         );
         assert_eq!(
-            super::definition_dir_from_label("/abs/dir/shuttle.lua"),
+            super::definition_dir_from_label("/abs/dir/nau.lua"),
             Some(std::path::PathBuf::from("/abs/dir"))
         );
         // Bare labels (embedded definitions) carry no directory.
-        assert_eq!(super::definition_dir_from_label("shuttle.lua"), None);
+        assert_eq!(super::definition_dir_from_label("nau.lua"), None);
         assert_eq!(super::definition_dir_from_label("embedded:test"), None);
     }
 
@@ -1777,7 +1777,7 @@ mod tests {
             return node {
                 name = "devbox",
                 serve = { address = "127.0.0.1:7780", announce = true },
-                peers = { "shuttle://nuci.local:7780" },
+                peers = { "nau://nuci.local:7780" },
             }
             "#,
         );
@@ -1866,8 +1866,7 @@ mod tests {
 
     #[test]
     fn test_node_peers_must_be_string_array() {
-        let result =
-            eval_with_dsl(r#"return node { name = "x", peers = { "shuttle://a:1", 42 } }"#);
+        let result = eval_with_dsl(r#"return node { name = "x", peers = { "nau://a:1", 42 } }"#);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # #94 gate battery — proves the cutover set on current main from a
 # cold-store pilot pod. Every gate runs under the login-shell contract:
-# `eval "$(shuttle pod shellenv)"` puts the farm first on PATH and
+# `eval "$(nau pod shellenv)"` puts the farm first on PATH and
 # exports the #89 loader-lib LD_LIBRARY_PATH — the same env the rc port
 # delivers (§4.3). Under it: the parity trio resolves at its bumped
 # versions, the dynamic four start bare (no host LD_LIBRARY_PATH help),
@@ -14,10 +14,10 @@
 # Defaults to the #94 pilot root. Exit 1 lists failed gates.
 set -u
 
-ROOT="${1:-$HOME/.cache/issue94-pilot/shuttle/pods}"
+ROOT="${1:-$HOME/.cache/issue94-pilot/nau/pods}"
 POD="${2:-pilot94}"
 FARM="$ROOT/$POD/current"
-SHUTTLE="${SHUTTLE:-$PWD/target/debug/shuttle}"
+NAU="${NAU:-$PWD/target/debug/nau}"
 fail=0
 
 gate() { # gate <name> <command...>
@@ -51,8 +51,8 @@ gate_eq() { # gate_eq <name> <expected> <command...>
 # file is kept for triage.
 export PATH="/run/current-system/sw/bin:/usr/bin:/bin"
 unset LD_LIBRARY_PATH
-unset SHUTTLE_PYTHONPATH
-"$SHUTTLE" pod --name "$POD" shellenv --root "$ROOT" > /tmp/opencode/gate-shellenv.sh
+unset NAU_PYTHONPATH
+"$NAU" pod --name "$POD" shellenv --root "$ROOT" > /tmp/opencode/gate-shellenv.sh
 # shellcheck disable=SC1091
 . /tmp/opencode/gate-shellenv.sh
 
@@ -88,7 +88,7 @@ gate "ble.sh parses"        bash -n "$(blesh-share)/ble.sh"
 
 echo "=== pod list shows the trio ==="
 # pod list prints the table on stderr; capture both streams.
-LIST="$("$SHUTTLE" pod --name "$POD" list --root "$ROOT" 2>&1)"
+LIST="$("$NAU" pod --name "$POD" list --root "$ROOT" 2>&1)"
 for want in "git" "tmux" "python"; do
   if printf '%s\n' "$LIST" | grep -q "^  $want"; then
     printf 'ok   %-34s %s\n' "pod list: $want" "$(printf '%s\n' "$LIST" | grep "^  $want" | head -1 | xargs)"

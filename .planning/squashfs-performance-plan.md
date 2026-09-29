@@ -5,7 +5,7 @@ record: `docs/adr/0041-squashfs-pack-performance.md`.
 
 ## Goal
 
-Cut the time shuttle spends packing SquashFS payloads, and measure the
+Cut the time nau spends packing SquashFS payloads, and measure the
 unpack side, without breaking reproducibility, pod install fail-closed
 behavior, or snapd compatibility.
 
@@ -68,10 +68,10 @@ spike early, compressor change gated on the harness.
 
 1. Benchmark harness plus xz baseline (#152). Amended scope: baseline must
    reproduce production argv exactly (xz at the 128K default) and
-   byte-match an unmodified `shuttle build` output; matrix covers the
+   byte-match an unmodified `nau build` output; matrix covers the
    block-size and level curve; runs the 3-concurrent-pack shape; benches
    at least two tree profiles (source-heavy, media or already-compressed
-   heavy) plus one real shuttle payload; reports unpack and read-side
+   heavy) plus one real nau payload; reports unpack and read-side
    numbers per config.
 2. Doctor numeric version parse, 4.7 advice, unsquashfs zstd check (#155).
    This is a live bug fix: the substring check misreports 4.7 and

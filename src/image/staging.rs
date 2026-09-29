@@ -82,7 +82,7 @@ pub(crate) fn snap_yaml_base(yaml_text: &str) -> Option<String> {
 /// ADR-0019 backstop: a resolved kernel/gadget snap whose declared base
 /// mismatches the image base fails the build, naming both. A snap with no
 /// declared base skips the check (and says so) — store metadata quality is
-/// outside shuttle's control.
+/// outside nau's control.
 pub(crate) fn check_declared_base(
     role: &str,
     snap_name: &str,
@@ -212,9 +212,9 @@ fn resolve_image_snaps(
     let mut resolved = Vec::new();
 
     // #48/#69: the image path resolves through the index the declaration
-    // baked its pins from — SHUTTLE_INDEX_PATH, else package-index.json in
+    // baked its pins from — NAU_INDEX_PATH, else package-index.json in
     // the CWD (the same seam the eval worker uses). Loaded once per build.
-    let index_path = std::env::var("SHUTTLE_INDEX_PATH")
+    let index_path = std::env::var("NAU_INDEX_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
     let image_index = crate::index::PackageIndex::load_or_default(&index_path).ok();
@@ -482,7 +482,7 @@ pub(crate) enum KernelPayloadPolicy {
 
 // ── The host binary ships inside the image (#81) ──
 
-/// Staged-rootfs-relative path the running shuttle binary is embedded at.
+/// Staged-rootfs-relative path the running nau binary is embedded at.
 ///
 /// `/usr/bin` is deliberate (#81): the default boot units exec the binary,
 /// so it must live inside the hashed (dm-verity) base tree at a pinned,
@@ -492,21 +492,21 @@ pub(crate) enum KernelPayloadPolicy {
 /// ([`crate::units::emit_app_runtime`]), and systemd's own search-path
 /// convention puts package binaries there.
 ///
-/// The emitted units exec the ABSOLUTE spelling `/{SHUTTLE_BIN_PATH}`
-/// (systemd requires an absolute `ExecStart=`); [`SHUTTLE_BIN_PATH`] is the
+/// The emitted units exec the ABSOLUTE spelling `/{NAU_BIN_PATH}`
+/// (systemd requires an absolute `ExecStart=`); [`NAU_BIN_PATH`] is the
 /// single source of truth and the `unit_exec_targets_match_the_staged_binary_path`
 /// test asserts the two cannot drift.
-pub(crate) const SHUTTLE_BIN_PATH: &str = "usr/bin/shuttle";
+pub(crate) const NAU_BIN_PATH: &str = "usr/bin/nau";
 
-/// Copy the running shuttle binary into the staged rootfs at
-/// [`SHUTTLE_BIN_PATH`] (#81).
+/// Copy the running nau binary into the staged rootfs at
+/// [`NAU_BIN_PATH`] (#81).
 ///
-/// The image build runs inside the shuttle process, so
+/// The image build runs inside the nau process, so
 /// [`std::env::current_exe`] is the exact binary this build was made with —
 /// the local build ships itself, no network fetch, no host-path leakage into
 /// the image content (the staged file is a copy; the host source path is
 /// never written into any image file). Any failure fails the build closed:
-/// the emitted boot units exec `/usr/bin/shuttle` by absolute path, so an
+/// the emitted boot units exec `/usr/bin/nau` by absolute path, so an
 /// image whose health path cannot work must never be packed.
 ///
 /// Reproducibility: the staged file carries only the copied bytes and
@@ -519,13 +519,13 @@ pub(crate) const SHUTTLE_BIN_PATH: &str = "usr/bin/shuttle";
 /// staged rootfs slows the suite and starves the load-sensitive autotools
 /// e2e tests of I/O headroom); in production it is always the running
 /// binary — the KVM boot proof pins the real end-to-end behavior.
-pub(crate) fn embed_shuttle_binary(
+pub(crate) fn embed_nau_binary(
     runner: &dyn CommandRunner,
     root: &Path,
     arch: &str,
 ) -> miette::Result<()> {
     embed_binary_at(root, &embed_source()?)?;
-    anchor_binary_to_guest(runner, &root.join(SHUTTLE_BIN_PATH), arch)
+    anchor_binary_to_guest(runner, &root.join(NAU_BIN_PATH), arch)
 }
 
 /// The dynamic-loader path the guest provides for `arch`.
@@ -539,13 +539,13 @@ fn guest_interpreter(arch: &str) -> miette::Result<&'static str> {
         "arm64" | "aarch64" => Ok("/lib/ld-linux-aarch64.so.1"),
         other => Err(miette::miette!(
             "no guest interpreter mapping for arch '{other}' — cannot stage the \
-             shuttle binary for the image (issue #81)"
+             nau binary for the image (issue #81)"
         )),
     }
 }
 
-/// Re-anchor the staged shuttle binary to the guest (#81): the generic
-/// [`anchor_elf_to_guest`] with the shuttle path as the error label and the
+/// Re-anchor the staged nau binary to the guest (#81): the generic
+/// [`anchor_elf_to_guest`] with the nau path as the error label and the
 /// host RUNPATH dropped (the guest resolves libc through its own default
 /// search path).
 fn anchor_binary_to_guest(
@@ -553,7 +553,7 @@ fn anchor_binary_to_guest(
     staged: &Path,
     arch: &str,
 ) -> miette::Result<()> {
-    anchor_elf_to_guest(runner, staged, arch, &format!("/{SHUTTLE_BIN_PATH}"), None)
+    anchor_elf_to_guest(runner, staged, arch, &format!("/{NAU_BIN_PATH}"), None)
 }
 
 /// Re-anchor a staged ELF to the guest (#81; generalized for the #85
@@ -711,17 +711,16 @@ fn rewrite_interpreter(
     Ok(())
 }
 
-/// The bytes staged at [`SHUTTLE_BIN_PATH`]: the running shuttle binary
+/// The bytes staged at [`NAU_BIN_PATH`]: the running nau binary
 /// (production), a small fixture under test.
 #[cfg(test)]
 fn embed_source() -> miette::Result<PathBuf> {
     static FIXTURE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let path = FIXTURE.get_or_init(|| {
-        let dir =
-            std::env::temp_dir().join(format!("shuttle-embed-fixture-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nau-embed-fixture-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create embed fixture dir");
-        let file = dir.join("shuttle");
-        std::fs::write(&file, b"\x7fELF-shuttle-embed-fixture").expect("write embed fixture");
+        let file = dir.join("nau");
+        std::fs::write(&file, b"\x7fELF-nau-embed-fixture").expect("write embed fixture");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -733,12 +732,12 @@ fn embed_source() -> miette::Result<PathBuf> {
     Ok(path.clone())
 }
 
-/// The production [`embed_source`]: the running shuttle binary itself.
+/// The production [`embed_source`]: the running nau binary itself.
 #[cfg(not(test))]
 fn embed_source() -> miette::Result<PathBuf> {
     std::env::current_exe().map_err(|e| {
         miette::miette!(
-            "cannot locate the running shuttle binary to embed at /{SHUTTLE_BIN_PATH} \
+            "cannot locate the running nau binary to embed at /{NAU_BIN_PATH} \
              (issue #81): {e}"
         )
     })
@@ -780,7 +779,7 @@ fn multiarch_triplet(arch: &str) -> Option<&'static str> {
 /// `systemd-bless-boot` (and, alongside it, `system-generators/
 /// systemd-bless-boot-generator` and `libsystemd-shared-<major>.so`). For
 /// hosts whose tooling is installed outside the probed defaults.
-pub(crate) const BLESS_BOOT_TOOLING_DIR_ENV: &str = "SHUTTLE_BLESS_BOOT_DIR";
+pub(crate) const BLESS_BOOT_TOOLING_DIR_ENV: &str = "NAU_BLESS_BOOT_DIR";
 
 /// Ship the `systemd-bless-boot` helper and its boot generator into the
 /// staged rootfs when the base does not provide them (#85).
@@ -834,7 +833,7 @@ pub(crate) fn stage_bless_boot_binaries(
          provided (#85, gate #79): the base rootfs ships neither \
          systemd-bless-boot nor its generator, and the build host has no \
          usable systemd tooling to ship — install the host's systemd tooling \
-         or point SHUTTLE_BLESS_BOOT_DIR at it"
+         or point NAU_BLESS_BOOT_DIR at it"
     })?;
     bless_tooling_arch_gate(&bless, &generator, arch)?;
     let major = bless_tooling_version(runner, &bless)?;
@@ -1327,8 +1326,8 @@ fn assert_guest_libc_covers(root: &Path, arch: &str, host_elfs: &[PathBuf]) -> m
     Ok(())
 }
 
-/// [`embed_shuttle_binary`] with an explicit source file — the seam the
-/// unit tests drive. Copies `source` to `root/usr/bin/shuttle`, mode `0755`.
+/// [`embed_nau_binary`] with an explicit source file — the seam the
+/// unit tests drive. Copies `source` to `root/usr/bin/nau`, mode `0755`.
 /// Stage the image declaration's `files =` entries verbatim into the
 /// staged rootfs (#80). Runs before the rootfs is hashed, so dm-verity
 /// covers every declared file. Fails closed: a missing source, an
@@ -1409,15 +1408,15 @@ fn mirror_source_mode(source: &Path, dest: &Path, rel: &str) -> miette::Result<(
 }
 
 pub(crate) fn embed_binary_at(root: &Path, source: &Path) -> miette::Result<()> {
-    let dest = root.join(SHUTTLE_BIN_PATH);
+    let dest = root.join(NAU_BIN_PATH);
     std::fs::create_dir_all(dest.parent().expect("usr/bin has a parent"))
         .into_diagnostic()
-        .wrap_err_with(|| format!("creating /{}", SHUTTLE_BIN_PATH))?;
+        .wrap_err_with(|| format!("creating /{}", NAU_BIN_PATH))?;
     std::fs::copy(source, &dest)
         .into_diagnostic()
         .wrap_err_with(|| {
             format!(
-                "embedding the shuttle binary {} → /{SHUTTLE_BIN_PATH}",
+                "embedding the nau binary {} → /{NAU_BIN_PATH}",
                 source.display()
             )
         })?;
@@ -1426,12 +1425,12 @@ pub(crate) fn embed_binary_at(root: &Path, source: &Path) -> miette::Result<()> 
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
             .into_diagnostic()
-            .wrap_err_with(|| format!("setting exec mode on /{SHUTTLE_BIN_PATH}"))?;
+            .wrap_err_with(|| format!("setting exec mode on /{NAU_BIN_PATH}"))?;
     }
     let kib = std::fs::metadata(&dest)
         .map(|m| m.len() / 1024)
         .unwrap_or(0);
-    eprintln!("  ✓ embedded shuttle binary ({kib} KiB) → /{SHUTTLE_BIN_PATH} (#81)");
+    eprintln!("  ✓ embedded nau binary ({kib} KiB) → /{NAU_BIN_PATH} (#81)");
     Ok(())
 }
 
@@ -1497,10 +1496,10 @@ pub(crate) fn stage_rootfs(
         policy,
     )?;
 
-    // #81: the image ships the shuttle binary the boot units exec. Shared
-    // by both build paths so every staged rootfs carries /usr/bin/shuttle;
+    // #81: the image ships the nau binary the boot units exec. Shared
+    // by both build paths so every staged rootfs carries /usr/bin/nau;
     // a failure here fails the build closed (the units name it absolutely).
-    embed_shuttle_binary(runner, &root, arch)?;
+    embed_nau_binary(runner, &root, arch)?;
 
     Ok(StagedRootfs {
         build_dir,
@@ -1702,7 +1701,7 @@ fn merge_kernel(
 }
 
 /// Locate the kernel snap's boot payload and, for a prebuilt-UKI payload,
-/// replace its Canonical snap-bootstrap initramfs with shuttle's native one
+/// replace its Canonical snap-bootstrap initramfs with nau's native one
 /// (issue #75). Fails closed with the snap name in every message, including
 /// the payload↔bootloader pairing gate (#87): the Pi payload is only
 /// consumable by the piboot backend, and the piboot backend only consumes
@@ -1728,9 +1727,9 @@ fn locate_payload_for_snap(
     })?;
     piboot::assert_payload_bootloader_pairing(image, payload.pi_raw, snap_name)?;
     // Issue #75: a prebuilt `kernel.efi` carries Canonical's snap-bootstrap
-    // initramfs, which cannot honor shuttle's cmdline. Replace it with
-    // shuttle's native initramfs (busybox + veritysetup + the snap's own
-    // module closure) so the built UKI mounts and verifies the shuttle root.
+    // initramfs, which cannot honor nau's cmdline. Replace it with
+    // nau's native initramfs (busybox + veritysetup + the snap's own
+    // module closure) so the built UKI mounts and verifies the nau root.
     // The raw-convention path keeps its own initrd untouched.
     if !payload.prebuilt_uki {
         return Ok(payload);
@@ -1743,7 +1742,7 @@ fn locate_payload_for_snap(
     })
 }
 
-/// Build shuttle's native initramfs for a prebuilt-UKI payload (issue #75).
+/// Build nau's native initramfs for a prebuilt-UKI payload (issue #75).
 /// The module tree is `kernel_dir/modules/<version>`; the archive lands in a
 /// subdir of `kernel_dir`, whose `kernel_work` TempDir keeps it alive until
 /// the UKI is assembled. Every input failure names the exact missing file.
@@ -1803,7 +1802,7 @@ fn unsquashfs_kernel(
 /// `lib/firmware` of a source-built kernel snap, and the real Ubuntu Core
 /// `pc-kernel` layout (#70) which carries `modules/` + `firmware/` at the
 /// snap ROOT. The booted runtime needs `/lib/modules/<ver>` either way —
-/// shuttle's native runtime has no snapd to mount the kernel snap, so the
+/// nau's native runtime has no snapd to mount the kernel snap, so the
 /// modules must be in the rootfs. `discover_kernel_version` stays
 /// single-source on `lib/modules/`, so this mapping is what makes the UC
 /// layout discoverable.
@@ -1908,13 +1907,13 @@ mod tests {
     fn embed_binary_stages_the_executable_at_the_pinned_path() {
         let root = tempfile::tempdir().unwrap();
         let source = tempfile::tempdir().unwrap();
-        let src_file = source.path().join("shuttle-under-test");
+        let src_file = source.path().join("nau-under-test");
         std::fs::write(&src_file, b"\x7fELF-fake-binary").unwrap();
 
         embed_binary_at(root.path(), &src_file).unwrap();
 
-        let staged = root.path().join(SHUTTLE_BIN_PATH);
-        assert!(staged.is_file(), "binary staged at /{SHUTTLE_BIN_PATH}");
+        let staged = root.path().join(NAU_BIN_PATH);
+        assert!(staged.is_file(), "binary staged at /{NAU_BIN_PATH}");
         assert_eq!(
             std::fs::read(&staged).unwrap(),
             b"\x7fELF-fake-binary",
@@ -1931,13 +1930,13 @@ mod tests {
     #[test]
     fn embed_binary_fails_closed_on_an_unreadable_source() {
         let root = tempfile::tempdir().unwrap();
-        let err = embed_binary_at(root.path(), Path::new("/nonexistent/shuttle")).unwrap_err();
+        let err = embed_binary_at(root.path(), Path::new("/nonexistent/nau")).unwrap_err();
         assert!(
-            format!("{err:?}").contains(SHUTTLE_BIN_PATH),
+            format!("{err:?}").contains(NAU_BIN_PATH),
             "failure names the pinned install path: {err:?}"
         );
         assert!(
-            !root.path().join(SHUTTLE_BIN_PATH).exists(),
+            !root.path().join(NAU_BIN_PATH).exists(),
             "nothing staged on failure"
         );
     }
@@ -1947,7 +1946,7 @@ mod tests {
         // Issue #81: the units exec the binary the build embeds. The
         // absolute spelling and the staged-rootfs-relative path must agree,
         // or the emitted units are inert (203/EXEC) by construction.
-        let absolute = format!("/{SHUTTLE_BIN_PATH}");
+        let absolute = format!("/{NAU_BIN_PATH}");
         assert_eq!(BOOT_HEALTH_EXEC, format!("{absolute} runtime activate"));
         assert_eq!(ACTIVATE_EXEC, format!("{absolute} runtime activate"));
     }
@@ -1987,7 +1986,7 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let source = std::env::current_exe().unwrap();
-        let staged = root.path().join("shuttle");
+        let staged = root.path().join("nau");
         std::fs::copy(&source, &staged).unwrap();
 
         anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
@@ -2023,7 +2022,7 @@ mod tests {
         // The test embed fixture is not a real ELF; anchoring must skip it
         // (a static/foreign binary needs no loader) rather than fail.
         let root = tempfile::tempdir().unwrap();
-        let staged = root.path().join("shuttle");
+        let staged = root.path().join("nau");
         std::fs::write(&staged, b"not-an-elf").unwrap();
         anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
         assert!(staged.is_file(), "file untouched");
@@ -2041,7 +2040,7 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let source = std::env::current_exe().unwrap();
-        let staged = root.path().join("shuttle");
+        let staged = root.path().join("nau");
         std::fs::copy(&source, &staged).unwrap();
         // First anchor, then anchor again: the second pass must observe the
         // guest interpreter and change nothing (no second set call).
@@ -2353,7 +2352,7 @@ mod tests {
             "names the #85/#79 gate: {message}"
         );
         assert!(
-            message.contains("SHUTTLE_BLESS_BOOT_DIR"),
+            message.contains("NAU_BLESS_BOOT_DIR"),
             "names the override: {message}"
         );
     }
@@ -2612,7 +2611,7 @@ mod tests {
         (index_path, sha3.to_string())
     }
 
-    /// Lock the SHUTTLE_INDEX_PATH seam for the duration of one test — the
+    /// Lock the NAU_INDEX_PATH seam for the duration of one test — the
     /// resolve loop reads it, and parallel tests must not race it.
     struct IndexPathGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -2620,18 +2619,18 @@ mod tests {
 
     fn set_index_path(path: &Path) -> IndexPathGuard {
         // The ONE crate-global test-env lock (src/test_env.rs): the resolve
-        // loop reads SHUTTLE_INDEX_PATH, and parallel tests must not race it
+        // loop reads NAU_INDEX_PATH, and parallel tests must not race it
         // — a per-module static would exclude nothing across modules.
         let lock = crate::test_env::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SHUTTLE_INDEX_PATH", path);
+        std::env::set_var("NAU_INDEX_PATH", path);
         IndexPathGuard { _lock: lock }
     }
 
     impl Drop for IndexPathGuard {
         fn drop(&mut self) {
-            std::env::remove_var("SHUTTLE_INDEX_PATH");
+            std::env::remove_var("NAU_INDEX_PATH");
         }
     }
 

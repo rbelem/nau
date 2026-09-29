@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Auth-exempt S3-shaped stub for the shuttle-cache-publish e2e test.
+"""Auth-exempt S3-shaped stub for the nau-cache-publish e2e test.
 
 Test infrastructure for ticket #270 — deliberately does NOT validate
 SigV4 (the signature math is cross-checked by the test script against

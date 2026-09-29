@@ -1,4 +1,4 @@
-//! `shuttle serve` — the peer lane's read-only serving surface
+//! `nau serve` — the peer lane's read-only serving surface
 //! (ADR-0033 Decisions 4+5): plain TCP with a minimal HTTP/1.1 subset
 //! over the pod store (`GET /info`, `GET /manifests/<pkg>`,
 //! `GET /blobs/<sha256>`), foreground until interrupted.
@@ -7,7 +7,7 @@
 //! conditional on it, not intrinsic to "read-only"): a blob segment is
 //! exactly 64 lowercase hex resolved through
 //! [`crate::runtime::RuntimeStore::blob_path`], never a raw join — a
-//! naive join turns `GET /blobs/../../.config/shuttle/secret-key` into
+//! naive join turns `GET /blobs/../../.config/nau/secret-key` into
 //! an unauthenticated arbitrary-file read over plaintext HTTP. Package
 //! names are `[a-z0-9-]+` (the ADR-0032 collision-classifier charset).
 //! Everything else is 404. Request line + headers are capped at 8 KiB,
@@ -24,7 +24,7 @@
 //!
 //! Announce (ADR-0033 Decision 3): when the announce switch is set —
 //! `node { serve = { announce = true } }` or `serve --announce` — the
-//! lane registers `_shuttle._tcp.local.` via [`crate::discovery`] for
+//! lane registers `_nau._tcp.local.` via [`crate::discovery`] for
 //! the lifetime of the accept loop. Announce failure is a warning, not
 //! an error: on multicast-filtered networks explicit peer addresses
 //! degrade gracefully, and discovery sugar must not take serving down.
@@ -170,7 +170,7 @@ fn read_head<R: Read>(reader: &mut R) -> Head {
 #[derive(Clone)]
 struct ServerCtx {
     store: Arc<RuntimeStore>,
-    /// Home used for the signing key (`~/.config/shuttle/secret-key`)
+    /// Home used for the signing key (`~/.config/nau/secret-key`)
     /// when minting manifests. A seam: tests point it at a tempdir.
     home: PathBuf,
     /// The configured `node.name` (ADR-0033 Decision 6) — the identity
@@ -195,7 +195,7 @@ impl Handled {
     }
 }
 
-/// Run `shuttle serve` with the CLI's bind overrides. `address`/`port`
+/// Run `nau serve` with the CLI's bind overrides. `address`/`port`
 /// are `None` when the operator gave no flag — the defaults come from
 /// `node {}` conventions ([`DEFAULT_SERVE_ADDRESS`], loopback).
 /// `announce` + `node_name` come from `node {}` (source of truth) with
@@ -231,7 +231,7 @@ pub fn run(
         match crate::discovery::announce(&name, port) {
             Ok(guard) => {
                 crate::output::info(format!(
-                    "announcing as '{name}' on _shuttle._tcp (mDNS) — `shuttle peers` finds it"
+                    "announcing as '{name}' on _nau._tcp (mDNS) — `nau peers` finds it"
                 ));
                 if is_loopback {
                     crate::output::warn(
@@ -268,7 +268,7 @@ fn serve_ctx(
     if !pod_dir.is_dir() {
         miette::bail!(
             "no store for pod '{pod_name}' at {} — nothing to serve; \
-             sync a pod first (`shuttle pod sync`)",
+             sync a pod first (`nau pod sync`)",
             pod_dir.display()
         );
     }
@@ -609,7 +609,7 @@ fn write_handled(stream: &mut TcpStream, handled: Handled) -> std::io::Result<()
 }
 
 /// A JSON `{"error": ...}` refusal (e.g. a missing signing key — the
-/// mint error already names `shuttle key keygen`).
+/// mint error already names `nau key keygen`).
 fn write_json_error(stream: &mut TcpStream, status: u16, message: &str) -> std::io::Result<()> {
     let body = serde_json::json!({ "error": message }).to_string();
     write_response(stream, status, "application/json", body.as_bytes())
@@ -668,7 +668,7 @@ mod tests {
             Err(404)
         );
         assert_eq!(
-            parse_request("GET /blobs/../../../.config/shuttle/secret-key HTTP/1.1"),
+            parse_request("GET /blobs/../../../.config/nau/secret-key HTTP/1.1"),
             Err(404)
         );
         assert_eq!(
@@ -1011,7 +1011,7 @@ mod tests {
 
         // The ADR's exploit request: must be 404, never a file read —
         // and the key under the store tree must not leak.
-        let (status, _, body) = get(addr, "/blobs/../../home/.config/shuttle/secret-key");
+        let (status, _, body) = get(addr, "/blobs/../../home/.config/nau/secret-key");
         assert_eq!(status, 404);
         assert!(!body.is_empty());
 
@@ -1187,7 +1187,7 @@ mod tests {
 
     /// A dispatch error (here: no signing key for the /manifests mint)
     /// logs the chain locally but returns a GENERIC body — the error
-    /// text (key paths, `shuttle key keygen` hints, store layout) must
+    /// text (key paths, `nau key keygen` hints, store layout) must
     /// never reach the wire.
     #[test]
     fn internal_errors_return_a_generic_body_not_the_error_chain() {

@@ -1,4 +1,4 @@
-//! `shuttle verify-image` end to end (ADR-0044 D4, issue #265).
+//! `nau verify-image` end to end (ADR-0044 D4, issue #265).
 //!
 //! Builds a REAL whole-disk GPT image file — sfdisk lays out ESP + root +
 //! verity-hash partitions with the build's type GUIDs and the identity
@@ -65,10 +65,10 @@ const HASH_SIZE: u64 = 4096;
 const SECTOR: u64 = 512;
 const ESP_UUID: &str = "aabbccdd-0011-2233-4455-667788990011";
 
-fn test_kp(seed_byte: u8) -> shuttle::sign::KeyPair {
+fn test_kp(seed_byte: u8) -> nau::sign::KeyPair {
     let seed = [seed_byte; 32];
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    shuttle::sign::KeyPair {
+    nau::sign::KeyPair {
         seed,
         public: sk.verifying_key().to_bytes(),
     }
@@ -85,12 +85,12 @@ fn uki_bytes() -> Vec<u8> {
 }
 
 /// The fixture UKI's sha3-384, hashed through the same seam the binary
-/// uses ([`shuttle::store::sha3_384_file`]) so a divergence there fails
+/// uses ([`nau::store::sha3_384_file`]) so a divergence there fails
 /// here too.
 fn uki_digest_of(bytes: &[u8], dir: &Path) -> String {
     let path = dir.join("uki-digest.payload");
     std::fs::write(&path, bytes).unwrap();
-    shuttle::store::sha3_384_file(&path).unwrap()
+    nau::store::sha3_384_file(&path).unwrap()
 }
 
 /// Run one mtools/sfdisk tool, asserting success — the fixture's raw
@@ -273,7 +273,7 @@ fn build_fixture() -> Fixture {
     let manifest = dir.path().join("nau-demo-1.0.0-amd64.manifest.json");
     write_signed_manifest(&manifest, &roothash, Some(&uki_digest));
     let key = dir.path().join("downloaded.pub");
-    std::fs::write(&key, shuttle::sign::public_key_file(&test_kp(7))).unwrap();
+    std::fs::write(&key, nau::sign::public_key_file(&test_kp(7))).unwrap();
 
     Fixture {
         dir,
@@ -292,13 +292,13 @@ fn splice(dst: &std::path::Path, src: &std::path::Path, offset: u64) {
     std::io::copy(&mut reader, &mut writer).unwrap();
 }
 
-/// The manifest shuttle publishes beside a mission image, signed over its
+/// The manifest nau publishes beside a mission image, signed over its
 /// canonical body (the typed manifest serialized with the signatures map
-/// emptied) — the exact shape `shuttle image --release` attaches (#266).
+/// emptied) — the exact shape `nau image --release` attaches (#266).
 /// `uki_sha3_384` rides the canonical body (#284); `None` models a
 /// manifest predating ESP coverage.
 fn write_signed_manifest(path: &std::path::Path, roothash: &str, uki_sha3_384: Option<&str>) {
-    use shuttle::image::{ImageManifest, ImageSnapEntry};
+    use nau::image::{ImageManifest, ImageSnapEntry};
     let manifest = ImageManifest {
         name: "nau-demo".into(),
         version: "1.0.0".into(),
@@ -319,7 +319,7 @@ fn write_signed_manifest(path: &std::path::Path, roothash: &str, uki_sha3_384: O
     };
     let canonical = serde_json::to_vec(&manifest).unwrap();
     let kp = test_kp(7);
-    let sig = shuttle::sign::sign_bytes(&canonical, &kp);
+    let sig = nau::sign::sign_bytes(&canonical, &kp);
     let mut v = serde_json::to_value(&manifest).unwrap();
     v["signatures"] = serde_json::json!({ (kp.key_id()): sig });
     std::fs::write(path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
@@ -328,12 +328,12 @@ fn write_signed_manifest(path: &std::path::Path, roothash: &str, uki_sha3_384: O
 /// Run the real binary with HOME isolated to `dir`, so the operator
 /// keychain is empty and `--key` is the only trust anchor in play.
 fn run_in(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+    let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args(args)
         .env("HOME", dir)
         .current_dir(dir)
         .output()
-        .expect("failed to spawn shuttle");
+        .expect("failed to spawn nau");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -615,11 +615,11 @@ gated_test!(verify_image_refuses_a_manifest_predating_esp_coverage, {
     // must be the coverage gap, reached only through a VALID signature.
     // So re-sign the reduced body exactly as the release signer would.
     let kp = test_kp(7);
-    let mut reduced: shuttle::image::ImageManifest =
+    let mut reduced: nau::image::ImageManifest =
         serde_json::from_value(v).expect("the old field set still parses");
     reduced.signatures.clear();
     let canonical = serde_json::to_vec(&reduced).unwrap();
-    let sig = shuttle::sign::sign_bytes(&canonical, &kp);
+    let sig = nau::sign::sign_bytes(&canonical, &kp);
     reduced
         .signatures
         .insert(kp.key_id(), serde_json::Value::String(sig));

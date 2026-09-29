@@ -24,7 +24,7 @@
 -- upstream's byte-stable upload per push; sha256 pinned at port time,
 -- re-hashed by sync under the float. The flake has no tarball hash to
 -- cross-check (its SRI covers the source build), so TOFU via
--- shuttle.lock is the pin story, same as every prebuilt port whose
+-- nau.lock is the pin story, same as every prebuilt port whose
 -- flake builds from source.
 --
 -- Runtime deps (ldd on bin/nvim): glibc family + libgcc_s.so.1 only —

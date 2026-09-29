@@ -205,14 +205,14 @@ fn write_failing_pkg(project: &Path, name: &str, requires: &[&str], port: u16, t
 // ── Runners ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     // Desktop launchers write to the user data home — keep them inside
     // the test's tempdir; pod activation off the host bus.
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -252,12 +252,12 @@ fn farm_output(farm: &Path, bin: &str) -> String {
 
 /// The pod lockfile as JSON — the pin record under test.
 fn read_lock(root: &Path, pod: &str) -> serde_json::Value {
-    let bytes = std::fs::read(root.join(pod).join("shuttle.lock")).unwrap();
+    let bytes = std::fs::read(root.join(pod).join("nau.lock")).unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
 fn write_lock(root: &Path, pod: &str, lock: &serde_json::Value) {
-    let path = root.join(pod).join("shuttle.lock");
+    let path = root.join(pod).join("nau.lock");
     std::fs::write(&path, serde_json::to_string_pretty(lock).unwrap()).unwrap();
 }
 

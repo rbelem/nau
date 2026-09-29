@@ -57,7 +57,7 @@ return {
             -- out to the prefix lua wrapper and returned empty in the
             -- sandbox, producing config-.lua and a fatal sed on
             -- config-5.4.lua (observed in the #94 cold pilot).
-            "./configure --prefix=/usr --with-lua=$SHUTTLE_BUILD_PREFIX/usr --lua-version=5.4",
+            "./configure --prefix=/usr --with-lua=$NAU_BUILD_PREFIX/usr --lua-version=5.4",
             "make",
             "make install DESTDIR=$STAGE",
             "printf '%s\\n' "
@@ -123,7 +123,7 @@ return {
             -- The staged default config embeds the configure-time
             -- --with-lua prefix; point it at the install prefix instead
             -- (same build-prefix scrub as the launchers above).
-            'sed -i "s|$SHUTTLE_BUILD_PREFIX|/usr|g" $STAGE/etc/luarocks/config-5.4.lua',
+            'sed -i "s|$NAU_BUILD_PREFIX|/usr|g" $STAGE/etc/luarocks/config-5.4.lua',
         }, " && "),
 
         type = "source",

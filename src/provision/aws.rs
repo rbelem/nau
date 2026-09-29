@@ -20,7 +20,7 @@
 //! (ADR-0040 Amendment 1): the farm re-dispatches the lost job, and no
 //! mid-flight migration exists or will exist here; `stop`/`hibernate`
 //! would pretend a machine survives that does not. A
-//! `shuttle-worker-spot` tag names the eviction class on the instance.
+//! `nau-worker-spot` tag names the eviction class on the instance.
 //! On-demand hourly (per-second billing) is the default; spot is for
 //! eviction-tolerant lanes only (providers plan §1).
 //!
@@ -51,22 +51,22 @@ use crate::provision::{
     Provisioner, UserDataParams, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
 };
 
-/// The worker presence tag shuttle stamps at create time — the key shared
+/// The worker presence tag nau stamps at create time — the key shared
 /// with the #269 v2 TTL contract (Hetzner writer, cross-provider
-/// vocabulary): presence marks the instance as a shuttle worker. The
+/// vocabulary): presence marks the instance as a nau worker. The
 /// value is `true` (presence semantics; expiry rides the TTL tag only).
-pub const WORKER_TAG: &str = "shuttle-worker";
+pub const WORKER_TAG: &str = "nau-worker";
 
 /// The TTL tag: expiry in EPOCH SECONDS UTC, set AT CREATE — the source
 /// of truth of the #269 v2 contract (the in-guest marker is a fallback
-/// COPY). The same decimal shape the `shuttle-worker-ttl` hcloud label
+/// COPY). The same decimal shape the `nau-worker-ttl` hcloud label
 /// carries; the sweep's `is_epoch` parses decimal only.
-pub const WORKER_TTL_TAG: &str = "shuttle-worker-ttl";
+pub const WORKER_TTL_TAG: &str = "nau-worker-ttl";
 
 /// The spot tag, present (`true`) only on `--spot` instances: names the
 /// eviction class (T5 worker loss, ADR-0040 Amendment 1) so operator-side
 /// tooling can tell an interruptible lane from an on-demand one.
-pub const WORKER_SPOT_TAG: &str = "shuttle-worker-spot";
+pub const WORKER_SPOT_TAG: &str = "nau-worker-spot";
 
 /// The base image (providers plan §3, ADR-0046): the LATEST Ubuntu LTS —
 /// the contract pins "latest LTS", never a codename — resolved through
@@ -85,10 +85,10 @@ pub struct AwsProvisioner<R: CommandRunner> {
     /// the no-credentials refusal path, checked before any API call.
     /// The credential itself never enters argv; the aws CLI inherits it.
     credentials: Option<String>,
-    /// The pinned shuttle binary URL the template installs.
+    /// The pinned nau binary URL the template installs.
     binary_url: String,
     /// The operator's authorized public-key line (login), resolved at the
-    /// CLI boundary (`SHUTTLE_OPERATOR_KEY` / default key halves) so the
+    /// CLI boundary (`NAU_OPERATOR_KEY` / default key halves) so the
     /// core stays env-free under test.
     operator_key: String,
     /// The coordinator publish channel (callback URL + ceremony home) —
@@ -222,7 +222,7 @@ impl<R: CommandRunner> Provisioner for AwsProvisioner<R> {
             return Err(miette::miette!(
                 "provision: {e:#} — terminated {torn_down} created instance(s), config untouched; \
                  FAILED to terminate {} — it is still running and billing; terminate it with \
-                 'shuttle workers destroy' or by hand",
+                 'nau workers destroy' or by hand",
                 stuck.join(", ")
             ));
         }
@@ -484,9 +484,9 @@ fn validate_spot(req: &ProvisionRequest) -> miette::Result<()> {
 }
 
 /// The instance `--tag-specifications` value: the Name, the
-/// `shuttle-worker` presence tag, the `shuttle-worker-ttl` epoch-seconds
+/// `nau-worker` presence tag, the `nau-worker-ttl` epoch-seconds
 /// EXPIRY (the #269 v2 contract — the source of truth the sweep reads —
-/// set AT CREATE), and `shuttle-worker-spot` on spot instances. One argv
+/// set AT CREATE), and `nau-worker-spot` on spot instances. One argv
 /// element, no shell.
 fn tag_spec(req: &ProvisionRequest, name: &str, expiry_epoch: u64) -> String {
     let mut tags = vec![
@@ -545,7 +545,7 @@ fn address_for(ip: &str) -> String {
     format!("ssh://root@{ip}")
 }
 
-/// `shuttle-worker-<hex nanos>` — one name per create; the instance ids
+/// `nau-worker-<hex nanos>` — one name per create; the instance ids
 /// remain the per-machine handles (destroy verbs), while the name rides
 /// the contract tags and doubles as the machine identity the one-time
 /// publish token binds.
@@ -554,7 +554,7 @@ fn worker_name() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("shuttle-worker-{nanos:x}")
+    format!("nau-worker-{nanos:x}")
 }
 
 fn print_plan(plan: &ProvisionPlan) {

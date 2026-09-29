@@ -291,7 +291,7 @@ pub fn fetch_pinned_source<R: CommandRunner>(
             "1800".to_string(),
             "-A".to_string(),
             concat!(
-                "shuttle/",
+                "nau/",
                 env!("CARGO_PKG_VERSION"),
                 " (farm dispatch source ship)"
             )
@@ -509,7 +509,7 @@ pub fn build_closure(meta: &SnapMeta, lockfile: &LockFile) -> crate::cache::Buil
 /// sha3-384) wins — pure data, safe offline. Otherwise the dep's declared
 /// version pins it with `hash: None`: an unpinned store dep is only
 /// version-pinned, so content changes behind the version cannot invalidate
-/// the cache key (known limitation; `shuttle lock` and image builds record
+/// the cache key (known limitation; `nau lock` and image builds record
 /// snap pins that close this gap).
 pub fn requires_member(name: &str, lockfile: &LockFile) -> crate::cache::RequiresMember {
     if let Some(member) = crate::cache::pinned_member(name, lockfile) {

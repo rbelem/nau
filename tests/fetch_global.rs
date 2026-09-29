@@ -4,7 +4,7 @@
 //! Proven with a loopback HTTP server: the worker subprocess curls the
 //! server, the definition parses the body, and the resolved value lands
 //! in the snap's version. Also proves the named refusal when
-//! `SHUTTLE_OFFLINE` gates the eval, and that the loopback response
+//! `NAU_OFFLINE` gates the eval, and that the loopback response
 //! shape round-trips through the worker IPC unharmed.
 
 use std::io::{Read, Write};
@@ -33,8 +33,7 @@ fn spawn_loopback(body: &'static str) -> u16 {
 }
 
 fn eval_version(source: &str) -> Result<String, String> {
-    let outputs =
-        shuttle::lua::evaluate_string("fetch-test", source).map_err(|e| format!("{e:#}"))?;
+    let outputs = nau::lua::evaluate_string("fetch-test", source).map_err(|e| format!("{e:#}"))?;
     outputs
         .get("default")
         .map(|meta| meta.version.clone())
@@ -66,8 +65,8 @@ fn fetch_is_refused_by_name_when_disallowed() {
     // Drives the worker directly with allow_fetch: false — the hermetic
     // path (attack-isolation requests, --offline via the CLI's env gate)
     // — so no process-global env mutation races the sibling tests.
-    let req = shuttle::isolate::EvalRequest {
-        prelude: shuttle::dsl::INIT_LUA.to_string(),
+    let req = nau::isolate::EvalRequest {
+        prelude: nau::dsl::INIT_LUA.to_string(),
         index_data: serde_json::json!({ "version": 1, "snaps": [] }),
         arch: "amd64".into(),
         sources: Default::default(),
@@ -84,7 +83,7 @@ fn fetch_is_refused_by_name_when_disallowed() {
         allow_fetch: false,
         constraint: None,
     };
-    let err = match shuttle::isolate::run_eval(&req) {
+    let err = match nau::isolate::run_eval(&req) {
         Err(e) => format!("{e:#}"),
         Ok(ok) => match ok.diagnostics.first() {
             Some(d) => d.clone(),

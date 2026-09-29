@@ -1,4 +1,4 @@
-//! `shuttle pod` integration tests (issue #2: pod scaffold).
+//! `nau pod` integration tests (issue #2: pod scaffold).
 //!
 //! Drives the real binary end to end with fully isolated state: the
 //! project directory (package resolution source) and the pod state root
@@ -12,17 +12,17 @@ use std::path::Path;
 use std::process::Command;
 
 /// Run the real binary with `args` from `project` as cwd and `--root
-/// <root>` appended (unless the args rely on SHUTTLE_POD_ROOT).
+/// <root>` appended (unless the args rely on NAU_POD_ROOT).
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     // The desktop launcher surface (issue #7) writes to the user data
     // home — redirect it inside the test's tempdir, never the real home.
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66).
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -30,21 +30,21 @@ fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, Stri
     )
 }
 
-/// Same as `run`, but redirecting state via the SHUTTLE_POD_ROOT env var
+/// Same as `run`, but redirecting state via the NAU_POD_ROOT env var
 /// instead of the `--root` flag.
 fn run_env_root(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.args(args);
-    cmd.env("SHUTTLE_POD_ROOT", root);
+    cmd.env("NAU_POD_ROOT", root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66). This
     // helper was the one spawn site the #66 sweep missed: its `pod add`
     // reaches RuntimeStore::activate, which ran `systemctl daemon-reload`
     // on the host bus and raised a polkit prompt (and a ~25s auth stall)
     // on every test run.
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -69,7 +69,7 @@ fn pod_lua(root: &Path) -> std::path::PathBuf {
 }
 
 fn pod_lock(root: &Path) -> std::path::PathBuf {
-    root.join("default").join("shuttle.lock")
+    root.join("default").join("nau.lock")
 }
 
 fn named_pod_lua(root: &Path, pod: &str) -> std::path::PathBuf {
@@ -77,7 +77,7 @@ fn named_pod_lua(root: &Path, pod: &str) -> std::path::PathBuf {
 }
 
 fn named_pod_lock(root: &Path, pod: &str) -> std::path::PathBuf {
-    root.join(pod).join("shuttle.lock")
+    root.join(pod).join("nau.lock")
 }
 
 /// Seed a pod.lua by hand (for malformed-declaration tests).
@@ -157,7 +157,7 @@ fn add_is_repeatable_via_env_root_without_flag() {
     assert_eq!(
         code,
         Some(0),
-        "SHUTTLE_POD_ROOT must redirect pod state: {stderr}"
+        "NAU_POD_ROOT must redirect pod state: {stderr}"
     );
     assert!(
         pod_lua(root.path()).exists(),
@@ -849,12 +849,12 @@ fn secrets_runtime_dir(tag: &str) -> Option<std::path::PathBuf> {
     if !base.is_dir() {
         return None;
     }
-    let dir = base.join(format!("shuttle-test-{}-{tag}", std::process::id()));
+    let dir = base.join(format!("nau-test-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
-/// Run `shuttle pod <verb…>` with an isolated data home AND an isolated
+/// Run `nau pod <verb…>` with an isolated data home AND an isolated
 /// tmpfs `$XDG_RUNTIME_DIR` (the secrets cache base).
 fn run_with_runtime_dir(
     project: &Path,
@@ -862,13 +862,13 @@ fn run_with_runtime_dir(
     run_dir: &Path,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
-    cmd.env("SHUTTLE_SYSTEMD", "off");
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_SYSTEMD", "off");
     cmd.env("XDG_RUNTIME_DIR", run_dir);
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -913,14 +913,14 @@ fn provider_calls(counter: &Path) -> u32 {
 fn seed_generation_secrets(
     root: &Path,
     pod: &str,
-    refs: &std::collections::BTreeMap<String, shuttle::pod::SecretSource>,
+    refs: &std::collections::BTreeMap<String, nau::pod::SecretSource>,
 ) {
-    let store = shuttle::runtime::RuntimeStore::new(root.join(pod));
-    shuttle::farm::write_generation_secrets(&store, 1, refs).unwrap();
+    let store = nau::runtime::RuntimeStore::new(root.join(pod));
+    nau::farm::write_generation_secrets(&store, 1, refs).unwrap();
 }
 
-fn exec_secret(command: &str) -> shuttle::pod::SecretSource {
-    shuttle::pod::SecretSource::Exec {
+fn exec_secret(command: &str) -> nau::pod::SecretSource {
+    nau::pod::SecretSource::Exec {
         command: vec![command.to_string()],
     }
 }
@@ -957,8 +957,8 @@ fn shellenv_exports_resolved_secrets_after_env_lines_and_evals_safe() {
     // The declared env rides the generation record (env.json) — write it
     // the way sync does, so SH_EDITOR is a real declared export, not an
     // ambient accident.
-    let store = shuttle::runtime::RuntimeStore::new(root.path().join("default"));
-    shuttle::farm::write_generation_env(
+    let store = nau::runtime::RuntimeStore::new(root.path().join("default"));
+    nau::farm::write_generation_env(
         &store,
         1,
         &[("SH_EDITOR".to_string(), "vi".to_string())]

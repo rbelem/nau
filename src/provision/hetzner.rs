@@ -28,15 +28,15 @@ use crate::provision::{
     Provisioner, UserDataParams, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
 };
 
-/// The hcloud labels shuttle stamps at create time — the key names shared
+/// The hcloud labels nau stamps at create time — the key names shared
 /// with the #269 v2 TTL sweep (writer here, reader there):
-/// `shuttle-worker` is the marker/presence key; `shuttle-worker-ttl`
+/// `nau-worker` is the marker/presence key; `nau-worker-ttl`
 /// carries the TTL expiry in EPOCH SECONDS UTC (label values reject `:`,
 /// so ISO-8601 never rides a label; the in-guest marker copy carries the
 /// same epoch-seconds shape — the sweep's `is_epoch` parses decimal
 /// only).
-pub const WORKER_LABEL: &str = "shuttle-worker";
-pub const WORKER_TTL_LABEL: &str = "shuttle-worker-ttl";
+pub const WORKER_LABEL: &str = "nau-worker";
+pub const WORKER_TTL_LABEL: &str = "nau-worker-ttl";
 
 /// The worker base image (providers plan §3, ADR-0046): the LATEST
 /// Ubuntu LTS — the contract pins "latest LTS", never a codename — so
@@ -51,10 +51,10 @@ pub struct HetznerProvisioner<R: CommandRunner> {
     /// The dedicated project token (#271 account, never TOFU_INPUTS) —
     /// `None` is the no-token refusal path, checked before any API call.
     token: Option<String>,
-    /// The pinned shuttle binary URL the template installs.
+    /// The pinned nau binary URL the template installs.
     binary_url: String,
     /// The operator's authorized public-key line (login), resolved at the
-    /// CLI boundary (`SHUTTLE_OPERATOR_KEY` / default key halves) so the
+    /// CLI boundary (`NAU_OPERATOR_KEY` / default key halves) so the
     /// core stays env-free under test.
     operator_key: String,
     /// The coordinator publish channel (callback URL + ceremony home) —
@@ -178,7 +178,7 @@ impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
             }
             return Err(miette::miette!(
                 "provision: {e:#} — tore down {torn_down} created server(s), config untouched; \
-                 FAILED to delete {} — it is still billing; re-run 'shuttle workers destroy' \
+                 FAILED to delete {} — it is still billing; re-run 'nau workers destroy' \
                  or let the TTL sweep reclaim it",
                 stuck.join(", ")
             ));
@@ -330,7 +330,7 @@ impl<R: CommandRunner> HetznerProvisioner<R> {
         if attached > 0 {
             crate::output::warn(format!(
                 "destroy: server '{name}' still has {attached} attached volume(s) — \
-                 `shuttle workers destroy` does NOT delete them; the data goes with the \
+                 `nau workers destroy` does NOT delete them; the data goes with the \
                  volume, not the server"
             ));
         }
@@ -344,7 +344,7 @@ fn address_for(ip: &str) -> String {
     format!("ssh://root@{ip}")
 }
 
-/// `shuttle-worker-<hex nanos>-<NN>` — unique per project; the prefix
+/// `nau-worker-<hex nanos>-<NN>` — unique per project; the prefix
 /// mirrors the label key, so name and label read as one identity. The
 /// name doubles as the machine identity the one-time publish token binds.
 fn server_name(i: u32) -> String {
@@ -352,7 +352,7 @@ fn server_name(i: u32) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("shuttle-worker-{nanos:x}-{:02}", i + 1)
+    format!("nau-worker-{nanos:x}-{:02}", i + 1)
 }
 
 fn print_plan(plan: &ProvisionPlan) {

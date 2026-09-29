@@ -1,4 +1,4 @@
-//! `shuttle pod` native-ELF runtime-lib wrapper integration tests
+//! `nau pod` native-ELF runtime-lib wrapper integration tests
 //! (issue #10 part B) + the hermetic sandbox assertion (issue #10 part A).
 //!
 //! A package whose command binary is a native ELF that needs shared
@@ -99,7 +99,7 @@ fn serve_one(stream: &mut TcpStream, root: &Path) -> std::io::Result<()> {
 
 // ── Fixtures ──
 
-/// Host env vars to set on the shuttle invocation (to prove the hermetic
+/// Host env vars to set on the nau invocation (to prove the hermetic
 /// sandbox drops them).
 #[derive(Default)]
 struct RunOpts {
@@ -161,17 +161,17 @@ fn run_opts(
     args: &[&str],
     opts: &RunOpts,
 ) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66); explicit
     // per-call env overrides below still win.
-    cmd.env("SHUTTLE_SYSTEMD", "off");
+    cmd.env("NAU_SYSTEMD", "off");
     for (k, v) in &opts.env {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),

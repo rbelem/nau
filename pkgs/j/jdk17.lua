@@ -11,22 +11,22 @@
 --
 -- Issue #21 owner direction: per-version JVM PODS — a jdk21 pod, a
 -- jdk17 pod, … — each pod declaring exactly one JDK version, instead
--- of one mutable global default (the sdkman model shuttle absorbs
+-- of one mutable global default (the sdkman model nau absorbs
 -- selectively). This port is the jdk17 sibling of jdk21.lua, the
 -- same shape one LTS line down. A JDK source build is out of scope
 -- (multi-hour bootstrap); this port vendors the upstream Temurin
 -- binary tarball, which is redistributable.
 --
--- sdkman absorption (issue #21 steal-list), mapped onto shuttle:
+-- sdkman absorption (issue #21 steal-list), mapped onto nau:
 --
 --   .sdkmanrc per-project pins  →  the per-project pod: a project
 --     pod declares jdk17 (or jdk21, its sibling port) and nothing
 --     else mutates a global state
 --   `sdk home`                  →  the store-path query for
---     script-safe JAVA_HOME: `shuttle pod shellenv --json` serves
+--     script-safe JAVA_HOME: `nau pod shellenv --json` serves
 --     the generation's recorded env (`vars`), so
---     `JAVA_HOME=$(shuttle pod shellenv --json | jq -r .vars.JAVA_HOME)`
---     never parses shell text; `shuttle run --pod jdk17 -- ./mvnw`
+--     `JAVA_HOME=$(nau pod shellenv --json | jq -r .vars.JAVA_HOME)`
+--     never parses shell text; `nau run --pod jdk17 -- ./mvnw`
 --     overlays the same map onto the exec'd process
 --   vendor suffix variants      →  sibling ports, not a variant
 --     knob: jdk17 (this port, Temurin), future jdk17-zulu /
@@ -34,9 +34,9 @@
 --
 -- sdkman pieces NOT stolen (issue #21): the download network broker,
 -- imperative global state (the `sdk default`/`sdk current` mutable
--- symlinks — shuttle's generation chain is the substitute), and
+-- symlinks — nau's generation chain is the substitute), and
 -- shell auto-env hooks (.sdkmanrc auto-switching on cd — activation
--- stays opt-in `eval "$(shuttle pod shellenv)"`, never an ambient
+-- stays opt-in `eval "$(nau pod shellenv)"`, never an ambient
 -- hook that rewrites env behind the shell's back).
 --
 -- License class: Temurin builds are GPLv2 with the Classpath
@@ -101,7 +101,7 @@ return {
             bin/ tool set — staged from the upstream binary tarball.
             Designed for the per-version JVM pod model: declare this
             package in a dedicated pod; the pod declares JAVA_HOME
-            (ADR-0030 env); `shuttle pod shellenv --json` is the
+            (ADR-0030 env); `nau pod shellenv --json` is the
             script-safe store-path query. GPLv2 + Classpath
             Exception (redistributable).
         ]],

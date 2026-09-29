@@ -1,13 +1,13 @@
-//! mDNS peer discovery (ADR-0033 Decisions 3+6): `shuttle serve`
-//! announces the pod store as `_shuttle._tcp.local.` (the node name is
-//! the instance name) and `shuttle peers` browses the LAN for
+//! mDNS peer discovery (ADR-0033 Decisions 3+6): `nau serve`
+//! announces the pod store as `_nau._tcp.local.` (the node name is
+//! the instance name) and `nau peers` browses the LAN for
 //! announcing nodes.
 //!
 //! Discovery is never trust (ADR-0033 Decisions 3+7): an mDNS response
 //! is unauthenticated and raceable — it only yields `host:port` hints
 //! for [`crate::pull_ref`]; every manifest stays fail-closed on pull.
 //!
-//! Announcing uses a TXT record `shuttle=1` to version the protocol
+//! Announcing uses a TXT record `nau=1` to version the protocol
 //! cheaply: browse accepts only instances whose value matches
 //! [`PROTOCOL_VERSION`], so a future wire change can refuse stale peers
 //! instead of guessing. Host selection prefers an IPv4 address within a
@@ -33,16 +33,16 @@ use std::time::{Duration, Instant};
 
 use mdns_sd::{Receiver, RecvTimeoutError, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 
-/// The service type every shuttle node announces and browses for
+/// The service type every nau node announces and browses for
 /// (ADR-0033 Decision 3). The trailing dot is DNS-SD convention.
-pub const SERVICE_TYPE: &str = "_shuttle._tcp.local.";
+pub const SERVICE_TYPE: &str = "_nau._tcp.local.";
 
 /// The fullname suffix that separates an instance name from
-/// [`SERVICE_TYPE`] (`"<instance>._shuttle._tcp.local."`).
-const SERVICE_TYPE_SUFFIX: &str = "._shuttle._tcp.local.";
+/// [`SERVICE_TYPE`] (`"<instance>._nau._tcp.local."`).
+const SERVICE_TYPE_SUFFIX: &str = "._nau._tcp.local.";
 
 /// The TXT key carrying the discovery protocol version.
-pub const PROTOCOL_KEY: &str = "shuttle";
+pub const PROTOCOL_KEY: &str = "nau";
 
 /// The discovery protocol version announced in the TXT record and
 /// required from browsed peers — bump when the record's meaning changes
@@ -54,7 +54,7 @@ pub const PROTOCOL_VERSION: &str = "1";
 /// hang serve shutdown; best-effort either way.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
-/// One shuttle node found on the LAN. `name` is the mDNS instance name
+/// One nau node found on the LAN. `name` is the mDNS instance name
 /// (the announcing node's name); `host` is ready for `host:port` use
 /// (IPv6 literals arrive bracketed); `port` is the peer's serve port.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -65,22 +65,22 @@ pub struct DiscoveredPeer {
 }
 
 /// Keeps one mDNS registration alive; dropping it unregisters the
-/// service (goodbye packet) and shuts the daemon down. `shuttle serve`
+/// service (goodbye packet) and shuts the daemon down. `nau serve`
 /// holds it for the lifetime of the accept loop.
 pub struct AnnounceGuard {
     daemon: ServiceDaemon,
     fullname: String,
 }
 
-/// Register `name` on the LAN as `<name>._shuttle._tcp.local.` on
-/// `port`, with the `shuttle=1` version TXT. Addresses are published
+/// Register `name` on the LAN as `<name>._nau._tcp.local.` on
+/// `port`, with the `nau=1` version TXT. Addresses are published
 /// automatically from the host's interfaces (`addr_auto`) — the caller
 /// names and ports the service, the network layer owns the addresses.
 ///
 /// The registration stays alive until the returned guard is dropped.
 pub fn announce(name: &str, port: u16) -> miette::Result<AnnounceGuard> {
     if name.trim().is_empty() {
-        miette::bail!("cannot announce a shuttle node without a name");
+        miette::bail!("cannot announce a nau node without a name");
     }
     let daemon = ServiceDaemon::new().map_err(|e| miette::miette!("starting mDNS daemon: {e}"))?;
     // No static IP: with addr_auto the daemon fills in the host's
@@ -121,12 +121,12 @@ impl Drop for AnnounceGuard {
     }
 }
 
-/// Browse the LAN for announcing shuttle nodes, stopping after
+/// Browse the LAN for announcing nau nodes, stopping after
 /// `timeout` (mDNS responses trickle in over ~1-2s; [`SERVICE_TYPE`]
 /// queries repeat under the hood). One entry per instance name —
 /// re-resolutions of the same node collapse, and each repeat refines
 /// the host toward the best connectable address. Only peers whose TXT
-/// carries `shuttle=[PROTOCOL_VERSION]` are returned (the cheap
+/// carries `nau=[PROTOCOL_VERSION]` are returned (the cheap
 /// protocol version gate).
 pub fn browse(timeout: Duration) -> miette::Result<Vec<DiscoveredPeer>> {
     let daemon = ServiceDaemon::new().map_err(|e| miette::miette!("starting mDNS daemon: {e}"))?;
@@ -157,8 +157,8 @@ pub fn browse(timeout: Duration) -> miette::Result<Vec<DiscoveredPeer>> {
     Ok(peers)
 }
 
-/// True when a TXT `shuttle` value matches the protocol version this
-/// build speaks (absent = not a shuttle peer; wrong version = a peer
+/// True when a TXT `nau` value matches the protocol version this
+/// build speaks (absent = not a nau peer; wrong version = a peer
 /// speaking a different discovery protocol — both are skipped).
 fn protocol_version_matches(value: Option<&str>) -> bool {
     value == Some(PROTOCOL_VERSION)
@@ -191,7 +191,7 @@ fn upsert_unique(peers: &mut Vec<DiscoveredPeer>, peer: DiscoveredPeer) {
 }
 
 /// Connectability rank of a discovered host, highest wins: global IPv4
-/// (the LAN case `shuttle://host:port/` needs) > global IPv6 > loopback
+/// (the LAN case `nau://host:port/` needs) > global IPv6 > loopback
 /// IPv4 (loopback is only ever sighted same-host, where it does work) >
 /// link-local IPv6 (unscoped — unusable beyond the local link) > a
 /// hostname (resolves only where mDNS resolution works).
@@ -288,10 +288,10 @@ mod tests {
 
     #[test]
     fn txt_constants_are_the_versioned_protocol_marker() {
-        assert_eq!(PROTOCOL_KEY, "shuttle");
+        assert_eq!(PROTOCOL_KEY, "nau");
         assert_eq!(PROTOCOL_VERSION, "1");
-        assert_eq!(SERVICE_TYPE, "_shuttle._tcp.local.");
-        assert_eq!(SERVICE_TYPE_SUFFIX, "._shuttle._tcp.local.");
+        assert_eq!(SERVICE_TYPE, "_nau._tcp.local.");
+        assert_eq!(SERVICE_TYPE_SUFFIX, "._nau._tcp.local.");
     }
 
     // ── Instance-name shape ──
@@ -299,17 +299,17 @@ mod tests {
     #[test]
     fn instance_name_strips_the_service_suffix() {
         assert_eq!(
-            instance_name("devbox._shuttle._tcp.local."),
+            instance_name("devbox._nau._tcp.local."),
             Some("devbox".to_string())
         );
         // Dots and spaces are legal in instance names (RFC 6763) —
         // only the suffix is stripped.
         assert_eq!(
-            instance_name("lab bench 2._shuttle._tcp.local."),
+            instance_name("lab bench 2._nau._tcp.local."),
             Some("lab bench 2".to_string())
         );
         assert_eq!(instance_name("not-our-service._http._tcp.local."), None);
-        assert_eq!(instance_name("_shuttle._tcp.local."), None);
+        assert_eq!(instance_name("_nau._tcp.local."), None);
     }
 
     // ── Dedup ──
@@ -387,9 +387,9 @@ mod tests {
     // ── Resolved service → peer ──
 
     /// A [`mdns_sd::ResolvedService`] as the daemon would emit it for a
-    /// registered shuttle node: build the (pure, offline) ServiceInfo
+    /// registered nau node: build the (pure, offline) ServiceInfo
     /// and convert — `ips` are comma-fed to the crate's own IP parser,
-    /// `version` is the TXT `shuttle` value (`None` = property absent).
+    /// `version` is the TXT `nau` value (`None` = property absent).
     fn resolved(name: &str, ips: &[&str], version: Option<&str>) -> mdns_sd::ResolvedService {
         let props: HashMap<String, String> = match version {
             Some(v) => [(PROTOCOL_KEY.to_string(), v.to_string())].into(),
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     #[ignore = "needs a multicast-capable network; run explicitly: cargo test -- --ignored"]
     fn announce_is_visible_to_browse_on_the_lan() {
-        let name = "shuttle-mdns-it";
+        let name = "nau-mdns-it";
         let port = LOOPBACK_TEST_PORT;
         let guard = announce(name, port).expect("announce registers");
         // First probe may race the daemon's initial announcement; the

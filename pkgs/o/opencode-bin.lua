@@ -14,10 +14,10 @@
 -- official install script uses — and the definition interpolates the
 -- version into the CDN asset URL. Every build re-resolves; no hand
 -- bumps. The source stays deliberately NOT sha256-pinned (an unpinned
--- source is shuttle's supported mode for floating content; the
+-- source is nau's supported mode for floating content; the
 -- observed hash is recorded in the lockfile and printed as a pin
--- hint). `shuttle build --offline` and `shuttle eval --offline`
--- refuse fetch() by name; `shuttle check` of this file needs network.
+-- hint). `nau build --offline` and `nau eval --offline`
+-- refuse fetch() by name; `nau check` of this file needs network.
 --
 -- Asset choice: opencode-linux-x64-baseline.tar.gz — the glibc build
 -- (the -musl assets are dynamically linked against ld-musl and cannot

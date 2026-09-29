@@ -61,7 +61,7 @@
 //! entries) and execs the real binary at its normal target — the
 //! assembly leaf, the confined launcher, or the store blob. SET, never
 //! compose-prepend: pod processes see pod libraries, and the ambient
-//! environment stays clean. `shuttle run` keeps its own pod-scoped
+//! environment stays clean. `nau run` keeps its own pod-scoped
 //! overlay for the arbitrary-command form.
 
 use std::cmp::Ordering;
@@ -107,7 +107,7 @@ pub const LOADER_LIBS_FILE: &str = "loader-libs";
 /// The generation's recorded declared env: `generations/<n>/env.json` —
 /// the resolved pod env (own declaration composed over loaded pods) as a
 /// JSON object, written by the staging tail when a generation is
-/// presented. The shellenv reads it back and `shuttle run` overlays it.
+/// presented. The shellenv reads it back and `nau run` overlays it.
 pub const ENV_FILE: &str = "env.json";
 
 /// The generation's recorded secret references:
@@ -237,7 +237,7 @@ pub fn canonical_secrets_bytes(
 ///
 /// The lockfile gains nothing (ADR-0042 D2): references come from the
 /// declaration, values are never pinned, rotation never touches
-/// `shuttle.lock`.
+/// `nau.lock`.
 ///
 /// The canonical bytes come from [`canonical_secrets_bytes`] — the ONE
 /// serialization path, so `secrets.rs` hashes the very bytes this
@@ -324,7 +324,7 @@ pub fn package_assembly_dir(store: &RuntimeStore, n: u64, pkg: &str) -> PathBuf 
 
 /// The assembled path of one app's binary: the hardlinked leaf inside
 /// the generation's assembly subtree, whose directory holds the
-/// recorded siblings. `shuttle run` execs this path for multi-file
+/// recorded siblings. `nau run` execs this path for multi-file
 /// apps so relative-to-executable resolution finds the siblings.
 pub fn assembly_bin_path(store: &RuntimeStore, n: u64, pkg: &str, asm: &AppAssembly) -> PathBuf {
     package_assembly_dir(store, n, pkg).join(&asm.binary)
@@ -579,7 +579,7 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<PathBuf> {
     crate::services::emit(store, gen)?;
     // And the loader-lib list (issue #89): the generation's payload lib
     // dirs, consumed by the LD wrappers written above (issue #110,
-    // ADR-0034) and by `shuttle run`'s pod-scoped env overlay. The file
+    // ADR-0034) and by `nau run`'s pod-scoped env overlay. The file
     // lives inside the generation, so rollback and GC scope it exactly
     // like the farm and launchers.
     record_loader_libs(store, gen)?;
@@ -767,11 +767,11 @@ fn write_ld_wrapper(
 /// assembly subtree when the app needs one (issue #37).
 ///
 /// A multi-file app gets its per-package assembly subtree built
-/// regardless of confinement — `shuttle run` execs the assembled leaf
+/// regardless of confinement — `nau run` execs the assembled leaf
 /// — but only an UNCONFINED app's farm entry links into the subtree. A
 /// confined app (ticket #11) keeps the unchanged direct store link to
 /// its launcher-wrapper blob (its real binary is exec'd later by
-/// `shuttle run`, which performs its own assembly resolution). A
+/// `nau run`, which performs its own assembly resolution). A
 /// single-binary app keeps the unchanged direct store link.
 fn entry_target_rel(
     store: &RuntimeStore,
@@ -802,7 +802,7 @@ fn entry_target_rel(
         }
     }
     // Ticket #11: a confined app's farm entry points at its
-    // confined-launcher wrapper (which invokes `shuttle run`), not the
+    // confined-launcher wrapper (which invokes `nau run`), not the
     // raw command binary. This keeps `which`/PATH truthful while the
     // sandbox is set up transparently. The wrapper blob is recorded in
     // `launchers`; effective confinement is the per-app override or the
@@ -984,11 +984,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn store_fixture(dir: &Path) -> RuntimeStore {
-        // The documented pod layout `<data-home>/shuttle/pods/<pod>`:
+        // The documented pod layout `<data-home>/nau/pods/<pod>`:
         // the launcher emitter derives its user-level surface from this
         // shape, so a nested fixture root keeps every write inside the
         // test's tempdir without touching the environment.
-        RuntimeStore::new(dir.join("shuttle/pods/default"))
+        RuntimeStore::new(dir.join("nau/pods/default"))
     }
 
     fn gen_with_apps(n: u64, pkg: &str, apps: &[(&str, &str)]) -> Generation {
@@ -1330,7 +1330,7 @@ mod tests {
         let launchers = farm.parent().unwrap().join(crate::desktop::LAUNCHERS_DIR);
         let entry = launchers.join("myapp.desktop");
         let text = std::fs::read_to_string(&entry).unwrap();
-        crate::desktop::validate(&text, Some("shuttle-pod-default-myapp"), None).unwrap();
+        crate::desktop::validate(&text, Some("nau-pod-default-myapp"), None).unwrap();
         assert!(text.contains("Name=My App\n"), "got: {text}");
         assert!(text.contains("Categories=Utility;\n"));
         // Exec points at the pod's farm activation seam, never the store.
@@ -1345,7 +1345,7 @@ mod tests {
         let data_home = tmp.path();
         let user_link = data_home
             .join("applications")
-            .join("shuttle-pod-default-myapp.desktop");
+            .join("nau-pod-default-myapp.desktop");
         assert_eq!(
             std::fs::read_link(&user_link).unwrap(),
             entry,
@@ -1356,7 +1356,7 @@ mod tests {
         // resolves into the store blob.
         let icon_link = data_home
             .join("icons/hicolor/256x256/apps")
-            .join("shuttle-pod-default-myapp.png");
+            .join("nau-pod-default-myapp.png");
         assert_eq!(std::fs::read_link(&icon_link).unwrap(), blob);
         assert_eq!(std::fs::read(&icon_link).unwrap(), b"png-bytes");
     }
@@ -1375,7 +1375,7 @@ mod tests {
         let user_link = tmp
             .path()
             .join("applications")
-            .join("shuttle-pod-default-gone.desktop");
+            .join("nau-pod-default-gone.desktop");
         assert!(user_link.exists());
 
         let new = gen_with_desktops(
@@ -1388,7 +1388,7 @@ mod tests {
         assert!(!user_link.exists(), "stale entry withdrawn");
         assert!(
             tmp.path()
-                .join("applications/shuttle-pod-default-kept.desktop")
+                .join("applications/nau-pod-default-kept.desktop")
                 .exists(),
             "fresh entry present"
         );
@@ -1625,7 +1625,7 @@ mod tests {
             target.ends_with("store/bb/bb22"),
             "confined entries keep the wrapper link, got {target:?}"
         );
-        // But the assembly exists for `shuttle run`, which execs the
+        // But the assembly exists for `nau run`, which execs the
         // assembled binary beside its siblings inside the sandbox.
         let bin = assembly_bin_path(&store, 1, "gcmpkg", &gen.packages["gcmpkg"].assembly["gcm"]);
         assert!(bin.is_file());

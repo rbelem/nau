@@ -1,6 +1,6 @@
 //! Phase 23 image manifest IR integration tests.
 //!
-//! Drives the real `shuttle eval` binary over network-free paths: fully
+//! Drives the real `nau eval` binary over network-free paths: fully
 //! pinned image snaps, `path:` inputs, lockfile pins, and package-index
 //! pins. Covers determinism (byte-identical reruns), the schema version
 //! field, `--offline` behavior, fail-closed on missing pins (no manifest
@@ -12,19 +12,19 @@ use std::process::Command;
 const HASH_BASE: &str = "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111";
 const HASH_EXTRA: &str = "222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222";
 
-/// Run shuttle with an isolated HOME so the inputs cache root is private
+/// Run nau with an isolated HOME so the inputs cache root is private
 /// to the test and no global state can leak in.
 fn run_in(
     dir: &std::path::Path,
     home: &std::path::Path,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+    let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args(args)
         .env("HOME", home)
         .current_dir(dir)
         .output()
-        .expect("failed to spawn shuttle");
+        .expect("failed to spawn nau");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -40,7 +40,7 @@ fn setup_pinned_project() -> (tempfile::TempDir, tempfile::TempDir) {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         format!(
             r#"
 inputs = {{ vendored = {{ url = "path:vendor" }} }}
@@ -209,7 +209,7 @@ fn eval_resolves_lockfile_pins_offline() {
     let (dir, home) = setup_pinned_project();
     // Name-only pin in the definition; the lockfile carries the pin.
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 return {
     system = image {
@@ -249,7 +249,7 @@ return {
 fn eval_resolves_package_index_pins_offline() {
     let (dir, home) = setup_pinned_project();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 return {
     system = image {
@@ -297,7 +297,7 @@ fn eval_fails_closed_on_missing_pins_and_writes_nothing() {
     let (dir, home) = setup_pinned_project();
     // Unpinned base, no lockfile, no index: nothing to resolve from.
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 return {
     system = image {
@@ -344,7 +344,7 @@ fn eval_offline_github_input_without_lock_pin_fails_named() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 inputs = { remote = { url = "github:owner/repo/main" } }
 return {}
@@ -424,7 +424,7 @@ return { mylib = snap { name = "mylib", version = "0.1.0" } }
 "#,
     )
     .unwrap();
-    let def = dir.path().join("shuttle.lua");
+    let def = dir.path().join("nau.lua");
     let mut src = std::fs::read_to_string(&def).unwrap();
     src = src.replace(
         "summary = \"manifest fixture\",",

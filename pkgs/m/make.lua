@@ -27,7 +27,7 @@ recompile them.]],
         -- the RUNPATH; make only ever executes inside build sandboxes where
         -- that prefix is mounted (leaks_ok both-spellings treatment, the
         -- autoconf/automake/binutils precedent, #180 residual notes).
-        leaks_ok = { "/shuttle-build-prefix/usr/lib64", "/shuttle-build-prefix/usr/lib" },
+        leaks_ok = { "/nau-build-prefix/usr/lib64", "/nau-build-prefix/usr/lib" },
         build = "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
     },
 }

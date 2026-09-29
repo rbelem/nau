@@ -14,14 +14,14 @@
 -- outright. The compiler's own copies are the toolchain truth.)
 --
 -- Apps (issue #38): gcc, g++, and the toolchain alias itself, so
--- `shuttle pod add toolchain` works. The apps are what make the meta
+-- `nau pod add toolchain` works. The apps are what make the meta
 -- pod-installable in the first place: the farm exposes app commands,
 -- and the commands must exist in THIS payload — a meta's requires
 -- payloads never surface as another package's farm entries.
 --
 -- Payload shape — a self-contained toolchain tree at toolchain/:
 -- the build copies the merged build prefix (the requires' payloads,
--- /shuttle-build-prefix) wholesale into $STAGE/toolchain/, so the
+-- /nau-build-prefix) wholesale into $STAGE/toolchain/, so the
 -- tree carries the SAME layout the gcc build was configured against:
 -- usr/{bin,lib,libexec,include}, usr/lib64, and the runtime lib64/
 -- (ld-linux, libc.so.6) that glibc's absolute-path libc.so linker
@@ -36,7 +36,7 @@
 -- launcher resolves its real dir at run time (readlink -f through the
 -- farm symlink), execs the staged driver, and:
 --   --sysroot="$d"      — the driver was configured with
---                         --with-sysroot=/shuttle-build-prefix, which
+--                         --with-sysroot=/nau-build-prefix, which
 --                         exists only inside the build sandbox; the
 --                         assembled toolchain/ has the same shape, so
 --                         the launcher repoints the sysroot at itself
@@ -116,9 +116,9 @@ return {
         -- (where the prefix is bound at exactly that path), inert at
         -- pod runtime (the launchers repoint everything).
         leaks_ok = {
-            "/shuttle-build-prefix",
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
 
         source = {
@@ -135,7 +135,7 @@ return {
         -- sub-commands.
         build = table.concat({
             "mkdir -p $STAGE/toolchain",
-            "cp -a /shuttle-build-prefix/. $STAGE/toolchain/",
+            "cp -a /nau-build-prefix/. $STAGE/toolchain/",
             -- The cross build installs only target-prefixed driver names
             -- (x86_64-linux-gnu-gcc & co). Author the conventional
             -- unprefixed names as symlinks so build_deps consumers reach

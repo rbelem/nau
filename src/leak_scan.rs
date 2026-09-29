@@ -18,7 +18,7 @@
 //! build-only payload. Any RUNPATH/RPATH entry or interpreter pointing at
 //! the merged build prefix is a leak outright — that path does not exist at
 //! runtime (the live case: the nix gcc wrapper bakes
-//! `RUNPATH=/shuttle-build-prefix/usr/lib` into produced binaries).
+//! `RUNPATH=/nau-build-prefix/usr/lib` into produced binaries).
 //!
 //! Non-ELF files get a text scan for the prefix marker (the Nix-style
 //! reference scan — catches `#!/...` shebangs and embedded paths); binary
@@ -795,7 +795,7 @@ mod tests {
     fn elf64_parser_extracts_needed_runpath_interp() {
         let bytes = elf64_fixture(
             &["libc.so.6", "libfoo.so.1"],
-            Some("/shuttle-build-prefix/usr/lib"),
+            Some("/nau-build-prefix/usr/lib"),
             Some("/lib64/ld-linux-x86-64.so.2"),
         );
         let dir = tempfile::tempdir().unwrap();
@@ -803,7 +803,7 @@ mod tests {
         let mut f = std::fs::File::open(&path).unwrap();
         let dyni = parse_elf_dynamic(&mut f).unwrap();
         assert_eq!(dyni.needed, vec!["libc.so.6", "libfoo.so.1"]);
-        assert_eq!(dyni.runpath_entries, vec!["/shuttle-build-prefix/usr/lib"]);
+        assert_eq!(dyni.runpath_entries, vec!["/nau-build-prefix/usr/lib"]);
         assert_eq!(dyni.interp.as_deref(), Some("/lib64/ld-linux-x86-64.so.2"));
     }
 
@@ -925,7 +925,7 @@ mod tests {
         stage_file(
             dir.path(),
             "bin/run",
-            b"#!/bin/sh\nexec /shuttle-build-prefix/usr/bin/x\n",
+            b"#!/bin/sh\nexec /nau-build-prefix/usr/bin/x\n",
         );
         stage_file(dir.path(), "lib/x.so", b"\x7fELF\x02\x01\x01rest"); // looks like ELF, no phdrs → parser None
         stage_file(dir.path(), "data.bin", b"\x00\x01\x02");
@@ -944,10 +944,10 @@ mod tests {
         stage_file(
             dir.path(),
             "bin/run",
-            b"#!/bin/sh\n/shuttle-build-prefix/usr/bin/x\n",
+            b"#!/bin/sh\n/nau-build-prefix/usr/bin/x\n",
         );
         let l = PayloadListings::default();
-        let report = scan_stage(dir.path(), &l, &["/shuttle-build-prefix".to_string()]).unwrap();
+        let report = scan_stage(dir.path(), &l, &["/nau-build-prefix".to_string()]).unwrap();
         assert_eq!(report.leaks.len(), 0);
         assert_eq!(report.silenced.len(), 1);
     }
@@ -958,11 +958,11 @@ mod tests {
         stage_file(
             dir.path(),
             "bin/run",
-            b"#!/bin/sh\n/shuttle-build-prefix/usr/bin/x\n",
+            b"#!/bin/sh\n/nau-build-prefix/usr/bin/x\n",
         );
         let l = PayloadListings::default();
         // A substring entry does NOT silence the full-prefix marker.
-        let report = scan_stage(dir.path(), &l, &["/shuttle-build-prefix/us".to_string()]).unwrap();
+        let report = scan_stage(dir.path(), &l, &["/nau-build-prefix/us".to_string()]).unwrap();
         assert_eq!(report.leaks.len(), 1);
         assert!(report.silenced.is_empty());
     }

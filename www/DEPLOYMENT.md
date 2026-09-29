@@ -36,7 +36,7 @@ www.nau.rclb.dev {
 		-Server
 	}
 	# HSTS: PLAN decision 6 holds it until every consumer is confirmed
-	# https-capable. sysupdate is; old `shuttle pull` versions must be
+	# https-capable. sysupdate is; old `nau pull` versions must be
 	# checked first. Flip only then:
 	#	Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
 }

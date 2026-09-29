@@ -82,12 +82,12 @@ return {
             -- (editable source), so the resolver skips it: install the
             -- package from the source tree (pure Python, flat layout).
             "cp -r $SRC/graphify $STAGE/usr/lib/python3.14/site-packages/",
-            'for w in "$SHUTTLE_DEPS_DIR"/*.whl; do '
+            'for w in "$NAU_DEPS_DIR"/*.whl; do '
                 .. 'python3 -m zipfile -e "$w" "$STAGE/usr/lib/python3.14/site-packages/"; done',
             -- tree-sitter-perl is absent from the fork's uv.lock (see
             -- header): copy the pool tree-sitter-perl payload's built
             -- abi3 extension out of the merged build prefix.
-            'cp -r "$SHUTTLE_BUILD_PREFIX/usr/lib/python3.14/site-packages/tree_sitter_perl" '
+            'cp -r "$NAU_BUILD_PREFIX/usr/lib/python3.14/site-packages/tree_sitter_perl" '
                 .. "$STAGE/usr/lib/python3.14/site-packages/",
             -- The wheel console-script entry points
             -- (graphify = "graphify.__main__:main",
@@ -104,10 +104,10 @@ return {
         build_deps = { "tree-sitter-perl", "python" },
 
         -- The copied tree_sitter_perl/_binding .so was linked by the
-        -- nix gcc wrapper with RUNPATH=/shuttle-build-prefix/usr/lib
+        -- nix gcc wrapper with RUNPATH=/nau-build-prefix/usr/lib
         -- baked in (dead at runtime) — same interim leak-scan escape
         -- as tree-sitter-perl itself (ADR-0018 Decision 3, issue #22).
-        leaks_ok = { "/shuttle-build-prefix/usr/lib" },
+        leaks_ok = { "/nau-build-prefix/usr/lib" },
 
         apps = {
             graphify = app {

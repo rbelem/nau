@@ -9,10 +9,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use shuttle::command::{CommandRunner, RunnerOutput};
-use shuttle::provision::hetzner::HetznerProvisioner;
-use shuttle::provision::publish::PublishChannel;
-use shuttle::provision::{
+use nau::command::{CommandRunner, RunnerOutput};
+use nau::provision::hetzner::HetznerProvisioner;
+use nau::provision::publish::PublishChannel;
+use nau::provision::{
     append_worker_entry, now_epoch_secs, parse_ttl, render_user_data, ProvisionRequest,
     Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN,
     PLAN_PUBLISH_URL, SQUASHFS_TOOLS_RELEASE_DATE, SQUASHFS_TOOLS_SHA256,
@@ -22,9 +22,9 @@ use shuttle::provision::{
 /// A shape-valid ed25519 public line — throwaway fixture bytes, no
 /// crypto. Reused as the published-key fixture in payload-shape tests.
 const TEST_HOST_PUB: &str =
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ shuttle-worker-host-key";
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ nau-worker-host-key";
 const OPERATOR_KEY: &str = "ssh-ed25519 AAAAoperatorkey operator@example";
-const BINARY_URL: &str = "https://example.invalid/shuttle-amd64";
+const BINARY_URL: &str = "https://example.invalid/nau-amd64";
 
 /// The host CA fingerprint the request carries (valid
 /// `SHA256:` + 43 base64 chars — the pin grammar's fingerprint form).
@@ -209,7 +209,7 @@ fn throwaway_publish_channel() -> PublishChannel {
         .unwrap_or(0);
     PublishChannel {
         url: PUBLISH_URL.into(),
-        home: std::env::temp_dir().join(format!("shuttle-hetzner-publish-test-{nanos}")),
+        home: std::env::temp_dir().join(format!("nau-hetzner-publish-test-{nanos}")),
     }
 }
 
@@ -249,7 +249,7 @@ fn workspace(name: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 fn operator_config() -> &'static str {
-    "-- operator config: hand-written, never rewritten by shuttle\nlocal_jobs = 2\nworkers = {}\n\nreturn {}\n"
+    "-- operator config: hand-written, never rewritten by nau\nlocal_jobs = 2\nworkers = {}\n\nreturn {}\n"
 }
 
 fn calls(fake: &FakeProvider) -> Vec<Vec<String>> {
@@ -271,7 +271,7 @@ fn flat(argv: &[String]) -> String {
 
 #[test]
 fn no_token_refuses_before_any_api_call() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let err = provisioner(&fake, None)
@@ -294,7 +294,7 @@ fn hetzner_has_no_spot_product_and_refuses_the_flag() {
     // carrying --spot is a REFUSAL, never a silent on-demand fallback —
     // an on-demand instance pretending to be spot lies about its
     // eviction class.
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let mut req = request(&config, false);
@@ -314,7 +314,7 @@ fn hetzner_has_no_spot_product_and_refuses_the_flag() {
 
 #[test]
 fn dry_run_makes_no_api_call_and_needs_no_token() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let workers = provisioner(&fake, None)
@@ -363,7 +363,7 @@ fn user_data_generates_keys_guest_side_and_never_carries_a_private_half() {
     // generation ON (explicit — never a default relied on) and contains
     // NO private half anywhere. The absence is the security property.
     let user_data = render_user_data(&UserDataParams {
-        machine_identity: "shuttle-worker-abc-01",
+        machine_identity: "nau-worker-abc-01",
         publish_url: PUBLISH_URL,
         publish_token: "a".repeat(64).as_str(),
         operator_key: OPERATOR_KEY,
@@ -397,18 +397,18 @@ fn user_data_carries_the_publish_callback_and_one_time_token() {
     // loose argv interpolation.
     let token = "b".repeat(64);
     let user_data = render_user_data(&UserDataParams {
-        machine_identity: "shuttle-worker-abc-01",
+        machine_identity: "nau-worker-abc-01",
         publish_url: PUBLISH_URL,
         publish_token: &token,
         operator_key: OPERATOR_KEY,
         binary_url: BINARY_URL,
         ttl_expiry_epoch: MARKER_EPOCH,
     });
-    assert!(user_data.contains("path: /etc/shuttle/publish.env\n    permissions: \"0600\""));
-    assert!(user_data.contains(&format!("MACHINE_IDENTITY='shuttle-worker-abc-01'")));
+    assert!(user_data.contains("path: /etc/nau/publish.env\n    permissions: \"0600\""));
+    assert!(user_data.contains(&format!("MACHINE_IDENTITY='nau-worker-abc-01'")));
     assert!(user_data.contains(&format!("PUBLISH_URL='{PUBLISH_URL}'")));
     assert!(user_data.contains(&format!("PUBLISH_TOKEN='{token}'")));
-    assert!(user_data.contains("path: /etc/shuttle/publish-host-key.sh\n    permissions: \"0700\""));
+    assert!(user_data.contains("path: /etc/nau/publish-host-key.sh\n    permissions: \"0700\""));
     // The script reads the locally generated ed25519 public half and the
     // cloud-init normalized instance-data (the D3 principal content).
     assert!(user_data.contains("/etc/ssh/ssh_host_ed25519_key.pub"));
@@ -425,12 +425,12 @@ fn user_data_carries_the_publish_callback_and_one_time_token() {
         .collect();
     assert_eq!(
         runcmds.last().copied(),
-        Some("  - systemctl enable --now shuttle-pickup-host-cert.service"),
+        Some("  - systemctl enable --now nau-pickup-host-cert.service"),
         "the pickup unit enable is the final runcmd: {runcmds:?}"
     );
     let publish_at = runcmds
         .iter()
-        .position(|l| *l == "  - /etc/shuttle/publish-host-key.sh")
+        .position(|l| *l == "  - /etc/nau/publish-host-key.sh")
         .expect("publish is a runcmd");
     assert_eq!(
         publish_at + 1,
@@ -441,9 +441,9 @@ fn user_data_carries_the_publish_callback_and_one_time_token() {
     assert!(user_data.contains("curl -fsS -m 30"));
     // The TTL marker (the #269 sweep contract): one DECIMAL EPOCH-SECONDS
     // line — the sweep's is_epoch parses decimal only.
-    assert!(user_data.contains("path: /etc/shuttle/worker-ttl"));
+    assert!(user_data.contains("path: /etc/nau/worker-ttl"));
     assert!(user_data.contains(&format!("content: |\n      {MARKER_EPOCH}\n")));
-    // Pinned shuttle binary install + sshd hardening.
+    // Pinned nau binary install + sshd hardening.
     assert!(user_data.contains(BINARY_URL));
     assert!(user_data.contains("PasswordAuthentication no"));
     assert!(user_data.contains("PermitRootLogin prohibit-password"));
@@ -516,21 +516,21 @@ fn the_base_image_is_the_latest_ubuntu_lts_slug_never_a_codename() {
     // ADR-0046: the contract pins "latest LTS" — 26.04 at the 2026-09-27
     // decision. The slug shape (ubuntu-NN.NN) is the never-a-codename
     // rule made checkable; a codename like "resolute" must never land.
-    assert_eq!(shuttle::provision::hetzner::IMAGE, "ubuntu-26.04");
-    let slug = shuttle::provision::hetzner::IMAGE
+    assert_eq!(nau::provision::hetzner::IMAGE, "ubuntu-26.04");
+    let slug = nau::provision::hetzner::IMAGE
         .strip_prefix("ubuntu-")
         .expect("an ubuntu image slug");
     assert_eq!(
         slug.len(),
         "NN.NN".len(),
         "ubuntu-NN.NN, never a codename: {}",
-        shuttle::provision::hetzner::IMAGE
+        nau::provision::hetzner::IMAGE
     );
 }
 
 #[test]
 fn provision_creates_describes_pins_and_labels() {
-    let (dir, config) = workspace("shuttle.lua");
+    let (dir, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let mut req = request(&config, false);
@@ -561,8 +561,8 @@ fn provision_creates_describes_pins_and_labels() {
         let f = flat(argv);
         // The #269 v2 label pair: marker + TTL expiry in epoch seconds
         // (label values reject ':', so ISO-8601 never rides a label).
-        // Two `--label` flags: `shuttle-worker=<epoch>` and
-        // `shuttle-worker-ttl=<epoch>`.
+        // Two `--label` flags: `nau-worker=<epoch>` and
+        // `nau-worker-ttl=<epoch>`.
         let label_values: Vec<&String> = argv
             .iter()
             .zip(argv.iter().skip(1))
@@ -571,14 +571,12 @@ fn provision_creates_describes_pins_and_labels() {
             .collect();
         assert_eq!(label_values.len(), 2, "both contract labels: {f}");
         assert!(
-            label_values
-                .iter()
-                .any(|v| v.starts_with("shuttle-worker=")),
+            label_values.iter().any(|v| v.starts_with("nau-worker=")),
             "marker label present: {f}"
         );
         let ttl_value = label_values
             .iter()
-            .find(|v| v.starts_with("shuttle-worker-ttl="))
+            .find(|v| v.starts_with("nau-worker-ttl="))
             .unwrap_or_else(|| panic!("ttl label present: {f}"))
             .split('=')
             .nth(1)
@@ -591,10 +589,7 @@ fn provision_creates_describes_pins_and_labels() {
         // The base-image pin (ADR-0046 latest-Ubuntu-LTS slug) rides the
         // create argv — asserted against the const, so pin and test move
         // together.
-        assert!(f.contains(&format!(
-            "--image\u{1f}{}",
-            shuttle::provision::hetzner::IMAGE
-        )));
+        assert!(f.contains(&format!("--image\u{1f}{}", nau::provision::hetzner::IMAGE)));
         let udf = argv.iter().position(|a| a == "--user-datafile").unwrap();
         assert!(!argv[udf + 1].is_empty(), "a user-data file is passed");
         assert!(!f.contains("tok-1"), "token never enters argv: {f}");
@@ -616,10 +611,10 @@ fn provision_creates_describes_pins_and_labels() {
             !user_data.contains("path: /etc/ssh/ssh_host_ed25519_key\n"),
             "no injected host key"
         );
-        assert!(user_data.contains("/etc/shuttle/publish-host-key.sh"));
+        assert!(user_data.contains("/etc/nau/publish-host-key.sh"));
         assert!(user_data.contains(OPERATOR_KEY));
         assert!(
-            user_data.contains("MACHINE_IDENTITY='shuttle-worker-"),
+            user_data.contains("MACHINE_IDENTITY='nau-worker-"),
             "the machine identity is the server name"
         );
     }
@@ -645,7 +640,7 @@ fn provision_creates_describes_pins_and_labels() {
     assert_eq!(text.matches("table.insert(workers, ").count(), 2);
     assert!(text.contains("-- operator config"), "operator text intact");
     assert!(text.contains("return {}"), "return intact");
-    assert!(shuttle::lua::evaluate_file(config.to_str().unwrap()).is_ok());
+    assert!(nau::lua::evaluate_file(config.to_str().unwrap()).is_ok());
     // No server was deleted on the happy path.
     assert!(
         !hcloud_calls(&fake)
@@ -658,7 +653,7 @@ fn provision_creates_describes_pins_and_labels() {
 
 #[test]
 fn create_failure_leaves_no_server_and_no_config_change() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let before = std::fs::read_to_string(&config).unwrap();
     let fake = FakeProvider::new(Script {
@@ -688,7 +683,7 @@ fn create_failure_leaves_no_server_and_no_config_change() {
 
 #[test]
 fn describe_failure_after_create_tears_down() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let before = std::fs::read_to_string(&config).unwrap();
     let fake = FakeProvider::new(Script {
@@ -720,7 +715,7 @@ fn pin_failure_after_create_tears_down() {
     // A config that cannot be pinned (missing file) must not leave a
     // live server: teardown-on-failure is the ADR-0045 atomicity.
     let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("absent").join("shuttle.lua");
+    let config = dir.path().join("absent").join("nau.lua");
     let fake = FakeProvider::new(Script::default());
     let err = provisioner(&fake, Some("tok"))
         .provision(&request(&config, false))
@@ -732,7 +727,7 @@ fn pin_failure_after_create_tears_down() {
 
 #[test]
 fn reprovision_replaces_the_same_address_instead_of_duplicating() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     // Two runs describe DIFFERENT server names but the SAME address: the
@@ -759,12 +754,12 @@ fn reprovision_replaces_the_same_address_instead_of_duplicating() {
 
 #[test]
 fn managed_block_places_itself_before_the_top_level_return() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     append_worker_entry(
         &config,
         "ssh://root@203.0.113.10",
-        "ssh-ed25519 AAAAfirst shuttle-worker-x",
+        "ssh-ed25519 AAAAfirst nau-worker-x",
     )
     .unwrap();
     let text = std::fs::read_to_string(&config).unwrap();
@@ -782,7 +777,7 @@ fn managed_block_places_itself_before_the_top_level_return() {
 
 #[test]
 fn config_without_return_takes_the_block_at_eof() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, "workers = {}\n").unwrap();
     append_worker_entry(&config, "ssh://root@203.0.113.11", "ssh-ed25519 AAAAa c").unwrap();
     let text = std::fs::read_to_string(&config).unwrap();
@@ -792,7 +787,7 @@ fn config_without_return_takes_the_block_at_eof() {
 
 #[test]
 fn operator_owned_entry_at_the_same_address_is_a_refusal() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(
         &config,
         "workers = { { address = \"ssh://root@203.0.113.12\", host_key = \"SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG\" } }\nreturn {}\n",
@@ -801,7 +796,7 @@ fn operator_owned_entry_at_the_same_address_is_a_refusal() {
     let before = std::fs::read_to_string(&config).unwrap();
     let err =
         append_worker_entry(&config, "ssh://root@203.0.113.12", "ssh-ed25519 AAAAb c").unwrap_err();
-    assert!(format!("{err:#}").contains("outside the shuttle-managed block"));
+    assert!(format!("{err:#}").contains("outside the nau-managed block"));
     assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
 }
 
@@ -809,7 +804,7 @@ fn operator_owned_entry_at_the_same_address_is_a_refusal() {
 
 #[test]
 fn destroy_removes_the_server_and_evicts_the_managed_entry() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let workers = provisioner(&fake, Some("tok"))
@@ -846,11 +841,11 @@ fn destroy_removes_the_server_and_evicts_the_managed_entry() {
 
 #[test]
 fn destroy_requires_the_token_before_any_api_call() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let err = provisioner(&fake, None)
-        .destroy("shuttle-worker-x", &config)
+        .destroy("nau-worker-x", &config)
         .unwrap_err();
     assert!(format!("{err:#}").contains("HCLOUD_TOKEN"));
     assert!(hcloud_calls(&fake).is_empty());
@@ -858,7 +853,7 @@ fn destroy_requires_the_token_before_any_api_call() {
 
 #[test]
 fn destroy_checks_volumes_before_delete_and_proceeds_with_a_loud_warning() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let workers = provisioner(&fake, Some("tok"))
@@ -893,7 +888,7 @@ fn destroy_checks_volumes_before_delete_and_proceeds_with_a_loud_warning() {
 
 #[test]
 fn destroy_of_an_unknown_server_is_a_named_refusal() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script {
         describe_fails: true,
@@ -914,7 +909,7 @@ fn destroy_of_an_unknown_server_is_a_named_refusal() {
 
 #[test]
 fn destroy_keeps_the_pin_when_the_server_delete_fails() {
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let workers = provisioner(&fake, Some("tok"))
@@ -946,11 +941,11 @@ fn destroy_of_a_server_without_a_managed_pin_reports_not_evicted() {
     // Eviction honesty (#272 addendum): a deleted server whose address no
     // managed entry pins must read as NOT evicted — `Ok(false)` — so the
     // verb never claims an eviction that did not happen.
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let evicted = provisioner(&fake, Some("tok"))
-        .destroy("shuttle-worker-fake-01", &config)
+        .destroy("nau-worker-fake-01", &config)
         .unwrap();
     assert!(!evicted, "no managed entry → nothing evicted");
 }
@@ -962,7 +957,7 @@ fn user_data_is_staged_inside_the_provision_tempdir_at_0600() {
     // The blob carries the one-time publish bearer: it must live in the
     // provision tempdir (so it dies with the run) at mode 0600 — never at
     // a fixed world-readable OS-temp path that outlives the run.
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     provisioner(&fake, Some("tok"))
@@ -997,7 +992,7 @@ fn each_server_gets_its_own_recorded_one_time_token() {
     // The convergence property, read back from the coordinator registry:
     // N servers → N recorded tokens, each bound to its own machine
     // identity, none consumed (issuance is sub-task 3).
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let (pubhome, publish) = pubtmp();
     let fake = FakeProvider::new(Script::default());
@@ -1007,12 +1002,9 @@ fn each_server_gets_its_own_recorded_one_time_token() {
         .provision(&req)
         .unwrap();
 
-    let registry = std::fs::read_to_string(
-        pubhome
-            .path()
-            .join(".config/shuttle/ca/pending/tokens.json"),
-    )
-    .expect("the registry exists after provision");
+    let registry =
+        std::fs::read_to_string(pubhome.path().join(".config/nau/ca/pending/tokens.json"))
+            .expect("the registry exists after provision");
     let v: serde_json::Value = serde_json::from_str(&registry).unwrap();
     let tokens = v["tokens"].as_array().unwrap();
     assert_eq!(tokens.len(), 2, "one recorded issuance per server");
@@ -1038,7 +1030,7 @@ fn no_publish_channel_refuses_before_any_api_call() {
     // Fail-closed: a provision whose guest cannot publish can never be
     // issued a certificate — refused before the create, nothing torn
     // down, config untouched.
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let err = provisioner_with(&fake, Some("tok"), None)
@@ -1046,7 +1038,7 @@ fn no_publish_channel_refuses_before_any_api_call() {
         .unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("no publish channel"), "{text}");
-    assert!(text.contains("SHUTTLE_PUBLISH_URL"), "{text}");
+    assert!(text.contains("NAU_PUBLISH_URL"), "{text}");
     assert!(
         hcloud_calls(&fake).is_empty(),
         "no API call before the publish-channel refusal"
@@ -1057,7 +1049,7 @@ fn no_publish_channel_refuses_before_any_api_call() {
 fn no_ca_fingerprint_refuses_before_any_api_call() {
     // Fail-closed interim: the pin IS the CA fingerprint; a request
     // without one is a named refusal before any API call.
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let fake = FakeProvider::new(Script::default());
     let mut req = request(&config, false);
@@ -1065,7 +1057,7 @@ fn no_ca_fingerprint_refuses_before_any_api_call() {
     let err = provisioner(&fake, Some("tok")).provision(&req).unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("no host CA fingerprint"), "{text}");
-    assert!(text.contains("shuttle ca keygen"), "{text}");
+    assert!(text.contains("nau ca keygen"), "{text}");
     assert!(
         hcloud_calls(&fake).is_empty(),
         "no API call before the CA-pin refusal"
@@ -1078,7 +1070,7 @@ fn no_ca_fingerprint_refuses_before_any_api_call() {
 fn teardown_delete_failure_names_the_residual_server() {
     // A teardown delete that fails must NOT read as torn down: the error
     // names the still-billing residual and both reclaim paths.
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let before = std::fs::read_to_string(&config).unwrap();
     let fake = FakeProvider::new(Script {
@@ -1091,9 +1083,9 @@ fn teardown_delete_failure_names_the_residual_server() {
         .unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("tore down 0 created server(s)"), "{text}");
-    assert!(text.contains("FAILED to delete shuttle-worker-"), "{text}");
+    assert!(text.contains("FAILED to delete nau-worker-"), "{text}");
     assert!(text.contains("it is still billing"), "{text}");
-    assert!(text.contains("'shuttle workers destroy'"), "{text}");
+    assert!(text.contains("'nau workers destroy'"), "{text}");
     assert!(text.contains("TTL sweep reclaim it"), "{text}");
     assert_eq!(
         std::fs::read_to_string(&config).unwrap(),
@@ -1109,7 +1101,7 @@ fn teardown_reports_mixed_delete_results() {
     // one is named with its reclaim path — neither half can vanish into a
     // blanket success line.
     let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("absent").join("shuttle.lua");
+    let config = dir.path().join("absent").join("nau.lua");
     let fake = FakeProvider::new(Script {
         delete_fails_after: 1,
         ..Default::default()
@@ -1119,7 +1111,7 @@ fn teardown_reports_mixed_delete_results() {
     let err = provisioner(&fake, Some("tok")).provision(&req).unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("tore down 1 created server(s)"), "{text}");
-    assert!(text.contains("FAILED to delete shuttle-worker-"), "{text}");
+    assert!(text.contains("FAILED to delete nau-worker-"), "{text}");
     assert!(text.contains("it is still billing"), "{text}");
     assert!(text.contains("TTL sweep reclaim it"), "{text}");
 }
@@ -1129,9 +1121,9 @@ fn teardown_reports_mixed_delete_results() {
 #[test]
 fn config_mode_survives_a_managed_block_rewrite() {
     // The atomic rewrite persists a 0600 tempfile — the operator's
-    // shuttle.lua mode must survive every provision/destroy rewrite.
+    // nau.lua mode must survive every provision/destroy rewrite.
     use std::os::unix::fs::PermissionsExt;
-    let (_d, config) = workspace("shuttle.lua");
+    let (_d, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     for mode in [0o644, 0o600, 0o640] {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1144,11 +1136,11 @@ fn config_mode_survives_a_managed_block_rewrite() {
 // ── M6: the marker interop (writer here, reader = the sweep script) ──
 
 /// The single marker line `render_user_data` emits for `expiry`: the
-/// content line under the `/etc/shuttle/worker-ttl` write_files block.
+/// content line under the `/etc/nau/worker-ttl` write_files block.
 fn emitted_marker_line(user_data: &str) -> String {
     user_data
         .lines()
-        .skip_while(|line| !line.contains("path: /etc/shuttle/worker-ttl"))
+        .skip_while(|line| !line.contains("path: /etc/nau/worker-ttl"))
         .nth(3)
         .and_then(|line| line.strip_prefix("      "))
         .expect("the marker content line")
@@ -1189,7 +1181,7 @@ fn sweep_accepts_exactly_what_render_user_data_emits_as_the_marker() {
             "the marker line is decimal epoch seconds: '{marker}'"
         );
         let block = format!(
-            "  - path: /etc/shuttle/worker-ttl\n    permissions: \"0644\"\n    content: |\n      {marker}\n"
+            "  - path: /etc/nau/worker-ttl\n    permissions: \"0644\"\n    content: |\n      {marker}\n"
         );
         assert!(blob.contains(&block), "the marker block shape: {block}");
     }
@@ -1257,18 +1249,18 @@ fn sweep_accepts_exactly_what_render_user_data_emits_as_the_marker() {
     }
 
     // Dry-run is the sweep's default: prove classification, touch nothing.
-    let sweep = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/shuttle-worker-ttl-sweep");
+    let sweep = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/nau-worker-ttl-sweep");
     let out = std::process::Command::new("sh")
         .arg(&sweep)
-        .env("SHUTTLE_SWEEP_HCLOUD", &hcloud_fake)
-        .env("SHUTTLE_SWEEP_SSH", &ssh_fake)
-        .env("SHUTTLE_SWEEP_SSH_OPTS", "-o BatchMode=yes")
+        .env("NAU_SWEEP_HCLOUD", &hcloud_fake)
+        .env("NAU_SWEEP_SSH", &ssh_fake)
+        .env("NAU_SWEEP_SSH_OPTS", "-o BatchMode=yes")
         .env("SSH_FIXTURE_DIR", fx_path)
         .env("HCLOUD_LIST", fx_path.join("servers.list"))
         .env("HCLOUD_DESCRIBE_DIR", fx_path)
         .env("HCLOUD_DELETE_LOG", fx_path.join("deletes.log"))
-        .env_remove("SHUTTLE_SWEEP_ENFORCE")
-        .env_remove("SHUTTLE_SWEEP_ALERT_CMD")
+        .env_remove("NAU_SWEEP_ENFORCE")
+        .env_remove("NAU_SWEEP_ALERT_CMD")
         .output()
         .expect("run the sweep script");
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -1296,7 +1288,7 @@ fn provision_records_the_machine_linkage_next_to_the_pin() {
     // The executor's @cert-authority pin binds the certificate principal
     // through the address→identity linkage (#295 sub-task 4): one record
     // per pinned server, under the publish channel's ceremony home.
-    let (dir, config) = workspace("shuttle.lua");
+    let (dir, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let (pubtmp, channel) = pubtmp();
     let fake = FakeProvider::new(Script::default());
@@ -1307,12 +1299,12 @@ fn provision_records_the_machine_linkage_next_to_the_pin() {
         .unwrap();
     assert_eq!(workers.len(), 2);
 
-    let machines = shuttle::provision::publish::machines_dir(pubtmp.path());
+    let machines = nau::provision::publish::machines_dir(pubtmp.path());
     let mut links: Vec<(String, String)> = std::fs::read_dir(&machines)
         .unwrap()
         .flatten()
         .map(|e| {
-            let link: shuttle::provision::publish::MachineLink =
+            let link: nau::provision::publish::MachineLink =
                 serde_json::from_str(&std::fs::read_to_string(e.path()).unwrap()).unwrap();
             (link.address.clone(), link.machine_identity.clone())
         })
@@ -1323,7 +1315,7 @@ fn provision_records_the_machine_linkage_next_to_the_pin() {
         assert!(
             links
                 .iter()
-                .any(|(a, id)| a == &w.address && id.starts_with("shuttle-worker-")),
+                .any(|(a, id)| a == &w.address && id.starts_with("nau-worker-")),
             "address {} is linked to its machine identity: {links:?}",
             w.address
         );
@@ -1337,7 +1329,7 @@ fn user_data_picks_the_issued_certificate_up_on_first_boot() {
     // the generated key, and restarts sshd. The retry budget is exactly
     // the token TTL: 1440 × 60s = 86400s.
     let user_data = render_user_data(&UserDataParams {
-        machine_identity: "shuttle-worker-abc-01",
+        machine_identity: "nau-worker-abc-01",
         publish_url: PUBLISH_URL,
         publish_token: "a".repeat(64).leak(),
         operator_key: OPERATOR_KEY,
@@ -1347,16 +1339,16 @@ fn user_data_picks_the_issued_certificate_up_on_first_boot() {
 
     // The pickup rides a oneshot unit, not a runcmd — the retry loop may
     // legitimately run for the whole token window.
-    assert!(user_data.contains("path: /etc/shuttle/pickup-host-cert.sh\n    permissions: \"0700\""));
+    assert!(user_data.contains("path: /etc/nau/pickup-host-cert.sh\n    permissions: \"0700\""));
     assert!(user_data.contains(
-        "path: /etc/systemd/system/shuttle-pickup-host-cert.service\n    permissions: \"0644\""
+        "path: /etc/systemd/system/nau-pickup-host-cert.service\n    permissions: \"0644\""
     ));
     assert!(user_data.contains("Type=oneshot"));
     assert!(
         user_data.contains("TimeoutStartSec=infinity"),
         "the retry loop must not die at systemd's 90s default start timeout"
     );
-    assert!(user_data.contains("ExecStart=/etc/shuttle/pickup-host-cert.sh"));
+    assert!(user_data.contains("ExecStart=/etc/nau/pickup-host-cert.sh"));
 
     // The GET half of the same callback: same URL env, same bearer.
     assert!(user_data.contains("Authorization: Bearer $PUBLISH_TOKEN"));
@@ -1373,7 +1365,7 @@ fn user_data_picks_the_issued_certificate_up_on_first_boot() {
     assert!(user_data.contains("systemctl restart ssh || systemctl restart sshd"));
 
     // Bounded retries sized to the publish-token window.
-    let ttl = shuttle::provision::publish::PUBLISH_TOKEN_TTL_SECS;
+    let ttl = nau::provision::publish::PUBLISH_TOKEN_TTL_SECS;
     assert!(user_data.contains("while [ \"$i\" -lt 1440 ]"));
     assert!(user_data.contains("sleep 60"));
     assert_eq!(1440 * 60, ttl, "the retry budget IS the token TTL");

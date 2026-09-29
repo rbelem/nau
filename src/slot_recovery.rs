@@ -81,9 +81,9 @@
 //!
 //! # Where it runs
 //!
-//! In-guest, at boot: the emitted `shuttle-slot-recovery.service` oneshot
+//! In-guest, at boot: the emitted `nau-slot-recovery.service` oneshot
 //! ([`super::image::boot`] emits it on the same gate as the sysupdate
-//! transfers) runs `shuttle runtime recover-slots`, ordered
+//! transfers) runs `nau runtime recover-slots`, ordered
 //! `Before=systemd-sysupdate.service` — recovery must complete before the
 //! next install attempt looks for a writable slot.
 
@@ -658,7 +658,7 @@ fn apply_reclaims(
     Ok(reclaimed)
 }
 
-/// `shuttle runtime recover-slots` — assess and reclaim, in-guest. Every
+/// `nau runtime recover-slots` — assess and reclaim, in-guest. Every
 /// early exit is a named no-op: a boot must never wedge here, and an
 /// assessment error must never relabel half-blind.
 pub fn recover_slots(
@@ -737,7 +737,7 @@ mod tests {
     fn factory_partitions() -> Vec<SlotPartition> {
         vec![
             part("vda1", "vda", 1, "esp", ESP),
-            part("vda2", "vda", 2, "shuttle-80_1.0_a", ROOT),
+            part("vda2", "vda", 2, "nau-80_1.0_a", ROOT),
             part(
                 "vda3",
                 "vda",
@@ -745,7 +745,7 @@ mod tests {
                 "state",
                 "0fc63daf-8483-4772-8e79-3d69d8477de4",
             ),
-            part("vda4", "vda", 4, "shuttle-80_1.0_hash_a", VERITY),
+            part("vda4", "vda", 4, "nau-80_1.0_hash_a", VERITY),
             part("vda5", "vda", 5, EMPTY_SLOT_LABEL, ROOT),
             part("vda6", "vda", 6, EMPTY_SLOT_LABEL, VERITY),
             part("vda7", "vda", 7, "", "0657fd6d-a4ab-43c4-84e5-0933c84b4f4f"),
@@ -778,14 +778,14 @@ mod tests {
             partitions,
             uki_files: ukis,
             running_version: Some(running),
-            image_name: Some("shuttle-80"),
+            image_name: Some("nau-80"),
         }
     }
 
     #[test]
     fn factory_state_is_a_noop() {
         let parts = factory_partitions();
-        let ukis = vec![uki("shuttle-80_1.0.efi", true)];
+        let ukis = vec![uki("nau-80_1.0.efi", true)];
         let a = assess(&facts(&parts, &ukis, "1.0"));
         assert!(a.reclaims.is_empty(), "factory has nothing stranded");
         assert!(a.anomalies.is_empty(), "{:?}", a.anomalies);
@@ -797,15 +797,15 @@ mod tests {
         // label, hash still `_empty`, no UKI — the transaction never
         // completed, so the labeled half goes back to `_empty`.
         let mut parts = factory_partitions();
-        parts[4].partlabel = "shuttle-80_2.0_a".to_string();
-        let ukis = vec![uki("shuttle-80_1.0.efi", true)];
+        parts[4].partlabel = "nau-80_2.0_a".to_string();
+        let ukis = vec![uki("nau-80_1.0.efi", true)];
         let a = assess(&facts(&parts, &ukis, "1.0"));
         assert_eq!(a.reclaims.len(), 1, "{:?}", a.reclaims);
         let r = &a.reclaims[0];
         assert_eq!(r.version, "2.0");
         assert_eq!(r.partitions.len(), 1);
         assert_eq!(r.partitions[0].partno, 5);
-        assert_eq!(r.partitions[0].label, "shuttle-80_2.0_a");
+        assert_eq!(r.partitions[0].label, "nau-80_2.0_a");
         assert!(
             r.partitions[0].retype_to.is_none(),
             "healthy type: label-only reclaim"
@@ -818,9 +818,9 @@ mod tests {
         // Kill between the 50-* transfers and the 60-uki transfer: both
         // halves labeled, no boot entry. Both are reclaimable.
         let mut parts = factory_partitions();
-        parts[4].partlabel = "shuttle-80_2.0_a".to_string();
-        parts[5].partlabel = "shuttle-80_2.0_hash_a".to_string();
-        let ukis = vec![uki("shuttle-80_1.0.efi", true)];
+        parts[4].partlabel = "nau-80_2.0_a".to_string();
+        parts[5].partlabel = "nau-80_2.0_hash_a".to_string();
+        let ukis = vec![uki("nau-80_1.0.efi", true)];
         let a = assess(&facts(&parts, &ukis, "1.0"));
         assert_eq!(a.reclaims.len(), 1);
         let r = &a.reclaims[0];
@@ -831,12 +831,9 @@ mod tests {
     #[test]
     fn complete_install_is_left_alone() {
         let mut parts = factory_partitions();
-        parts[4].partlabel = "shuttle-80_2.0_a".to_string();
-        parts[5].partlabel = "shuttle-80_2.0_hash_a".to_string();
-        let ukis = vec![
-            uki("shuttle-80_1.0.efi", true),
-            uki("shuttle-80_2.0+3-0.efi", true),
-        ];
+        parts[4].partlabel = "nau-80_2.0_a".to_string();
+        parts[5].partlabel = "nau-80_2.0_hash_a".to_string();
+        let ukis = vec![uki("nau-80_1.0.efi", true), uki("nau-80_2.0+3-0.efi", true)];
         let a = assess(&facts(&parts, &ukis, "1.0"));
         assert!(a.reclaims.is_empty(), "{:?}", a.reclaims);
         assert!(a.anomalies.is_empty(), "{:?}", a.anomalies);
@@ -848,11 +845,11 @@ mod tests {
         // systemd-boot can never have loaded it. The slot pair is still
         // stranded.
         let mut parts = factory_partitions();
-        parts[4].partlabel = "shuttle-80_2.0_a".to_string();
-        parts[5].partlabel = "shuttle-80_2.0_hash_a".to_string();
+        parts[4].partlabel = "nau-80_2.0_a".to_string();
+        parts[5].partlabel = "nau-80_2.0_hash_a".to_string();
         let ukis = vec![
-            uki("shuttle-80_1.0.efi", true),
-            uki("shuttle-80_2.0+3-0.efi", false),
+            uki("nau-80_1.0.efi", true),
+            uki("nau-80_2.0+3-0.efi", false),
         ];
         let a = assess(&facts(&parts, &ukis, "1.0"));
         assert_eq!(a.reclaims.len(), 1, "truncated UKI ⇒ stranded");
@@ -864,8 +861,8 @@ mod tests {
         // Paranoia: even a label for the RUNNING version with no UKI on
         // the ESP must never be relabeled (we booted through it).
         let mut parts = factory_partitions();
-        parts[1].partlabel = "shuttle-80_3.0_a".to_string();
-        let ukis = vec![uki("shuttle-80_1.0.efi", true)];
+        parts[1].partlabel = "nau-80_3.0_a".to_string();
+        let ukis = vec![uki("nau-80_1.0.efi", true)];
         let a = assess(&facts(&parts, &ukis, "3.0"));
         assert!(a.reclaims.is_empty(), "{:?}", a.reclaims);
         // The untrustworthy-ESP refusal fired instead.
@@ -882,7 +879,7 @@ mod tests {
         // running system's own UKI is the sentinel proving the listing
         // is real. Without it: refuse everything.
         let mut parts = factory_partitions();
-        parts[4].partlabel = "shuttle-80_2.0_a".to_string();
+        parts[4].partlabel = "nau-80_2.0_a".to_string();
         let a = assess(&facts(&parts, &[], "1.0"));
         assert!(a.reclaims.is_empty(), "refusal must suppress reclaims");
         assert!(a.anomalies.iter().any(|m| m.contains("untrustworthy")));
@@ -891,12 +888,12 @@ mod tests {
     #[test]
     fn missing_os_release_anchor_refuses_everything() {
         let parts = factory_partitions();
-        let ukis = vec![uki("shuttle-80_1.0.efi", true)];
+        let ukis = vec![uki("nau-80_1.0.efi", true)];
         let f = SlotFacts {
             partitions: &parts,
             uki_files: &ukis,
             running_version: None,
-            image_name: Some("shuttle-80"),
+            image_name: Some("nau-80"),
         };
         let a = assess(&f);
         assert!(a.reclaims.is_empty());
@@ -909,11 +906,8 @@ mod tests {
         // so a bootable UKI over an `_empty` half is a state the policy
         // does not understand — surface it, touch nothing.
         let mut parts = factory_partitions();
-        parts[4].partlabel = "shuttle-80_2.0_a".to_string();
-        let ukis = vec![
-            uki("shuttle-80_1.0.efi", true),
-            uki("shuttle-80_2.0+3-0.efi", true),
-        ];
+        parts[4].partlabel = "nau-80_2.0_a".to_string();
+        let ukis = vec![uki("nau-80_1.0.efi", true), uki("nau-80_2.0+3-0.efi", true)];
         let a = assess(&facts(&parts, &ukis, "1.0"));
         assert!(a.reclaims.is_empty());
         assert!(
@@ -929,7 +923,7 @@ mod tests {
     fn foreign_image_labels_are_ignored() {
         let mut parts = factory_partitions();
         parts[4].partlabel = "other-os_9.9_a".to_string();
-        let ukis = vec![uki("shuttle-80_1.0.efi", true)];
+        let ukis = vec![uki("nau-80_1.0.efi", true)];
         let a = assess(&facts(&parts, &ukis, "1.0"));
         assert!(a.reclaims.is_empty());
         assert!(a.anomalies.is_empty());
@@ -943,11 +937,11 @@ mod tests {
         // matches neither by MatchPartitionType nor `_empty`.
         // Recovery restores the flavor type AND relabels.
         let mut parts = factory_partitions();
-        parts[4].partlabel = "shuttle-80_2.0_a".to_string();
+        parts[4].partlabel = "nau-80_2.0_a".to_string();
         parts[4].parttype = "64362e66-0c4f-4d42-a410-0f7f5a71e5a2".to_string(); // masked
-        parts[5].partlabel = "shuttle-80_2.0_hash_a".to_string();
+        parts[5].partlabel = "nau-80_2.0_hash_a".to_string();
         parts[5].parttype = "8c9d831f-e8b7-4285-994a-33623dd5ee68".to_string(); // masked
-        let ukis = vec![uki("shuttle-80_1.0.efi", true)];
+        let ukis = vec![uki("nau-80_1.0.efi", true)];
         let a = assess(&facts(&parts, &ukis, "1.0"));
         assert_eq!(a.reclaims.len(), 1, "{:?}", a.reclaims);
         let r = &a.reclaims[0];
@@ -960,12 +954,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{l} not in {:?}", r.partitions))
         };
         assert_eq!(
-            by_label("shuttle-80_2.0_a").retype_to.as_deref(),
+            by_label("nau-80_2.0_a").retype_to.as_deref(),
             Some(ROOT_TYPE_GUID_X86_64),
             "masked root type restored"
         );
         assert_eq!(
-            by_label("shuttle-80_2.0_hash_a").retype_to.as_deref(),
+            by_label("nau-80_2.0_hash_a").retype_to.as_deref(),
             Some(VERITY_TYPE_GUID_X86_64),
             "masked hash type restored"
         );
@@ -978,14 +972,14 @@ mod tests {
         // type), hash still `_empty`. The labeled half is reclaimable
         // regardless.
         let mut parts = factory_partitions();
-        parts[4].partlabel = "shuttle-80_2.0_a".to_string();
-        let ukis = vec![uki("shuttle-80_1.0.efi", true)];
+        parts[4].partlabel = "nau-80_2.0_a".to_string();
+        let ukis = vec![uki("nau-80_1.0.efi", true)];
         let a = assess(&facts(&parts, &ukis, "1.0"));
         assert_eq!(a.reclaims.len(), 1);
         let r = &a.reclaims[0];
         assert_eq!(r.partitions.len(), 1);
         assert_eq!(r.partitions[0].partno, 5);
-        assert_eq!(r.partitions[0].label, "shuttle-80_2.0_a");
+        assert_eq!(r.partitions[0].label, "nau-80_2.0_a");
         assert!(
             r.partitions[0].retype_to.is_none(),
             "healthy type: label-only reclaim"
@@ -997,12 +991,12 @@ mod tests {
     fn slot_label_parsing() {
         let ok = |l: &str| parse_slot_label(l).map(|s| (s.image, s.version, s.hash));
         assert_eq!(
-            ok("shuttle-80_2.0_a"),
-            Some(("shuttle-80".into(), "2.0".into(), false))
+            ok("nau-80_2.0_a"),
+            Some(("nau-80".into(), "2.0".into(), false))
         );
         assert_eq!(
-            ok("shuttle-80_2.0_hash_b"),
-            Some(("shuttle-80".into(), "2.0".into(), true))
+            ok("nau-80_2.0_hash_b"),
+            Some(("nau-80".into(), "2.0".into(), true))
         );
         // Multi-part versions and underscored names split at the LAST `_`.
         assert_eq!(
@@ -1017,13 +1011,13 @@ mod tests {
 
     #[test]
     fn uki_name_matching_covers_both_spellings() {
-        let m = |f| uki_name_matches(f, "shuttle-80", "2.0");
-        assert!(m("shuttle-80_2.0.efi"));
-        assert!(m("shuttle-80_2.0+3-0.efi"));
-        assert!(m("shuttle-80_2.0+2-1.efi"));
-        assert!(!m("shuttle-80_1.0.efi"));
-        assert!(!m("shuttle-80_2.0.efi.bak"));
-        assert!(!m("shuttle-80_20.efi"), "no version prefix collisions");
+        let m = |f| uki_name_matches(f, "nau-80", "2.0");
+        assert!(m("nau-80_2.0.efi"));
+        assert!(m("nau-80_2.0+3-0.efi"));
+        assert!(m("nau-80_2.0+2-1.efi"));
+        assert!(!m("nau-80_1.0.efi"));
+        assert!(!m("nau-80_2.0.efi.bak"));
+        assert!(!m("nau-80_20.efi"), "no version prefix collisions");
     }
 
     #[test]
@@ -1082,11 +1076,8 @@ IMAGE_VERSION=1.0
         // The real emitted definition: [Target] MatchPattern carries the
         // slot-label grammar the in-guest name must be derived from. The
         // [Source] artifact pattern (`root_@v_@u.img`) must NOT match.
-        let t = crate::image::root_transfer("shuttle-80", "http://10.0.2.2:8123/");
-        assert_eq!(
-            image_name_from_root_transfer(&t).as_deref(),
-            Some("shuttle-80")
-        );
+        let t = crate::image::root_transfer("nau-80", "http://10.0.2.2:8123/");
+        assert_eq!(image_name_from_root_transfer(&t).as_deref(), Some("nau-80"));
         assert_eq!(image_name_from_root_transfer("garbage"), None);
         assert_eq!(
             image_name_from_root_transfer("[Target]\nMatchPattern=other_@v_b\n").as_deref(),
@@ -1112,9 +1103,9 @@ IMAGE_VERSION=1.0
             fn run(&self, _argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
                 let out = b"vda\n\
 vda1 esp c12a7328-f81f-11d2-ba4b-00a0c93ec93b vda\n\
-vda2 shuttle-80_1.0_a 4f68bce3-e8cd-4db1-96e7-fbcaf984b709 vda\n\
+vda2 nau-80_1.0_a 4f68bce3-e8cd-4db1-96e7-fbcaf984b709 vda\n\
 vda3 state 0fc63daf-8483-4772-8e79-3d69d8477de4 vda\n\
-vda4 shuttle-80_1.0_hash_a 2c7357ed-ebd2-46d9-aec1-23d437ec2bf5 vda\n\
+vda4 nau-80_1.0_hash_a 2c7357ed-ebd2-46d9-aec1-23d437ec2bf5 vda\n\
 vda5 _empty 4f68bce3-e8cd-4db1-96e7-fbcaf984b709 vda\n\
 vda6 _empty 2c7357ed-ebd2-46d9-aec1-23d437ec2bf5 vda\n\
 vda7  0657fd6d-a4ab-43c4-84e5-0933c84b4f4f vda\n"
@@ -1132,7 +1123,7 @@ vda7  0657fd6d-a4ab-43c4-84e5-0933c84b4f4f vda\n"
         // are skipped; the 6 labeled partitions are kept.
         assert_eq!(parts.len(), 6, "disk + unlabeled lines skipped");
         let root_a = parts.iter().find(|p| p.name == "vda2").unwrap();
-        assert_eq!(root_a.partlabel, "shuttle-80_1.0_a");
+        assert_eq!(root_a.partlabel, "nau-80_1.0_a");
         assert_eq!(root_a.partno, Some(2));
         assert_eq!(root_a.pkname, "vda");
         assert!(parts
@@ -1201,22 +1192,22 @@ IMAGE_VERSION=1.2.3
         let transfer = "\
 [Transfer]
 [Source]
-MatchPattern=shuttle-80_1.0_+1;shuttle-80_1.0_+1
+MatchPattern=nau-80_1.0_+1;nau-80_1.0_+1
 [Target]
-MatchPattern=shuttle-80_@v_a
+MatchPattern=nau-80_@v_a
 ";
         assert_eq!(
             image_name_from_root_transfer(transfer),
-            Some("shuttle-80".into())
+            Some("nau-80".into())
         );
 
         let b_arm = "[Target]\nMatchPattern=img_2.0_@v_b\n";
         assert_eq!(image_name_from_root_transfer(b_arm), Some("img_2.0".into()));
 
-        let multi_arm = "[Target]\nMatchPattern=shuttle-80_@v_a shuttle-80_@v_b\n";
+        let multi_arm = "[Target]\nMatchPattern=nau-80_@v_a nau-80_@v_b\n";
         assert_eq!(
             image_name_from_root_transfer(multi_arm),
-            Some("shuttle-80".into())
+            Some("nau-80".into())
         );
 
         // [Target] without a slot-grammar MatchPattern names nothing.
@@ -1272,25 +1263,15 @@ MatchPattern=shuttle-80_@v_a
         let esp = tempfile::tempdir().unwrap();
         let dir = esp.path().join("EFI").join("Linux");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("shuttle-80_1.0_a.efi"), minimal_complete_pe()).unwrap();
-        std::fs::write(
-            dir.join("shuttle-80_0.9_a.efi"),
-            &minimal_complete_pe()[..0x60],
-        )
-        .unwrap();
+        std::fs::write(dir.join("nau-80_1.0_a.efi"), minimal_complete_pe()).unwrap();
+        std::fs::write(dir.join("nau-80_0.9_a.efi"), &minimal_complete_pe()[..0x60]).unwrap();
         std::fs::write(dir.join("README.txt"), "not a ukI").unwrap();
 
         let ukis = gather_ukis(esp.path());
         assert_eq!(ukis.len(), 2, "non-.efi files are not UKIs");
-        let complete = ukis
-            .iter()
-            .find(|u| u.name == "shuttle-80_1.0_a.efi")
-            .unwrap();
+        let complete = ukis.iter().find(|u| u.name == "nau-80_1.0_a.efi").unwrap();
         assert!(complete.pe_complete);
-        let truncated = ukis
-            .iter()
-            .find(|u| u.name == "shuttle-80_0.9_a.efi")
-            .unwrap();
+        let truncated = ukis.iter().find(|u| u.name == "nau-80_0.9_a.efi").unwrap();
         assert!(!truncated.pe_complete, "a cut-off PE is incomplete");
     }
 
@@ -1343,7 +1324,7 @@ MatchPattern=shuttle-80_@v_a
             name: "vda5".into(),
             pkname: "vda".into(),
             partno: 5,
-            label: "shuttle-80_0.9_a".into(),
+            label: "nau-80_0.9_a".into(),
             retype_to,
         }
     }
@@ -1378,7 +1359,7 @@ MatchPattern=shuttle-80_@v_a
             .to_string();
         assert!(err.contains("--part-label"), "{err}");
         assert!(err.contains("partition 5"), "{err}");
-        assert!(err.contains("shuttle-80_0.9_a"), "{err}");
+        assert!(err.contains("nau-80_0.9_a"), "{err}");
         assert!(err.contains("simulated failure"), "{err}");
     }
 

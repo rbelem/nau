@@ -1,6 +1,6 @@
 //! The Provisioner seam (T6, ADR-0040 as rewritten by ADR-0045's
 //! amendment): turn a cloud account into a pinned `workers` entry in the
-//! operator's `shuttle.lua`, and take it back.
+//! operator's `nau.lua`, and take it back.
 //!
 //! Shape, fixed by the ratified amendment (#283 decided, #295 in
 //! flight): the guest GENERATES its SSH host keypair locally on first
@@ -21,7 +21,7 @@
 //! here: the [`Provisioner`] trait, the TTL vocabulary the #269 sweep
 //! reads, and the shared cloud-init template.
 //!
-//! Secrets never enter `shuttle.lua`: the config carries only the CA
+//! Secrets never enter `nau.lua`: the config carries only the CA
 //! fingerprint pin and the address. Nothing secret rides user-data at
 //! all — the one-time publish token is the only bearer it carries, and
 //! it dies at the first accepted publish.
@@ -46,18 +46,18 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::WorkersCommand;
 
-/// The default shuttle binary URL the template installs: the project
+/// The default nau binary URL the template installs: the project
 /// release artifact for the running version. Override with
-/// `SHUTTLE_WORKER_BINARY_URL` (e.g. a pod- or cache-pinned copy) until
+/// `NAU_WORKER_BINARY_URL` (e.g. a pod- or cache-pinned copy) until
 /// release infra carries it.
 fn default_binary_url() -> String {
-    if let Ok(url) = std::env::var("SHUTTLE_WORKER_BINARY_URL") {
+    if let Ok(url) = std::env::var("NAU_WORKER_BINARY_URL") {
         if !url.trim().is_empty() {
             return url;
         }
     }
     format!(
-        "https://github.com/rbelem/shuttle/releases/download/v{version}/shuttle-{arch}",
+        "https://github.com/rbelem/nau/releases/download/v{version}/nau-{arch}",
         version = env!("CARGO_PKG_VERSION"),
         arch = crate::snap::host_arch()
     )
@@ -195,8 +195,8 @@ fn scaleway_credentials_source() -> Option<String> {
     None
 }
 
-/// CLI entry for `shuttle workers provision` / `shuttle workers destroy` /
-/// `shuttle workers receive-publish`.
+/// CLI entry for `nau workers provision` / `nau workers destroy` /
+/// `nau workers receive-publish`.
 pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
     match command {
         WorkersCommand::Provision {
@@ -289,7 +289,7 @@ fn run_ca_fingerprint(dry_run: bool) -> miette::Result<Option<String>> {
 }
 
 /// The host CA's ssh-keygen fingerprint, from the ceremony home
-/// (`~/.config/shuttle/ca`): the workers pin IS this fingerprint under
+/// (`~/.config/nau/ca`): the workers pin IS this fingerprint under
 /// the amendment, so a real provision without a ceremony is a named
 /// refusal before any API call — fail-closed, never a pinless worker.
 pub fn resolve_ca_fingerprint() -> miette::Result<String> {
@@ -297,7 +297,7 @@ pub fn resolve_ca_fingerprint() -> miette::Result<String> {
     match crate::ca::inspect(&crate::command::RealRunner, Path::new(&home))? {
         Some(info) => Ok(info.fingerprint),
         None => Err(miette::miette!(
-            "workers provision: no host CA at {home}/.config/shuttle/ca — run 'shuttle ca \
+            "workers provision: no host CA at {home}/.config/nau/ca — run 'nau ca \
              keygen' first; provision pins the CA fingerprint (ADR-0045 amendment) and \
              issuance signs with its private half"
         )),
@@ -305,18 +305,18 @@ pub fn resolve_ca_fingerprint() -> miette::Result<String> {
 }
 
 /// The `receive-publish` verb body: one guest publish from stdin, bearer
-/// token in `SHUTTLE_PUBLISH_TOKEN`. This is the transport binding any
+/// token in `NAU_PUBLISH_TOKEN`. This is the transport binding any
 /// TLS-terminating front drives; the network listener itself is sub-task
 /// 3's surface (issuance).
 fn receive_publish_main() -> miette::Result<()> {
     use std::io::Read;
-    let token = std::env::var("SHUTTLE_PUBLISH_TOKEN")
+    let token = std::env::var("NAU_PUBLISH_TOKEN")
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| {
             miette::miette!(
-                "receive-publish: no bearer token — set SHUTTLE_PUBLISH_TOKEN (the front \
+                "receive-publish: no bearer token — set NAU_PUBLISH_TOKEN (the front \
                  that terminates the guest's POST extracts it from the Authorization header)"
             )
         })?;
@@ -327,7 +327,7 @@ fn receive_publish_main() -> miette::Result<()> {
         .map_err(|e| miette::miette!("receive-publish: cannot read the payload on stdin: {e}"))?;
     let identity = publish::receive_publish(Path::new(&home), &token, &payload, now_epoch_secs()?)?;
     crate::output::ok(format!(
-        "stored pending identity '{identity}' — run 'shuttle workers issue' to sign its \
+        "stored pending identity '{identity}' — run 'nau workers issue' to sign its \
          host certificate"
     ));
     Ok(())
@@ -368,7 +368,7 @@ fn issue_main(
         ));
         crate::output::info(
             "the guest picks it up: GET the publish URL with its one-time token \
-             (shuttle workers pickup)"
+             (nau workers pickup)"
                 .to_string(),
         );
     }
@@ -400,19 +400,19 @@ fn issue_main(
 }
 
 /// The `pickup` verb body: the GET half of the publish callback URL.
-/// Bearer in `SHUTTLE_PUBLISH_TOKEN` (the same one-time token the guest
+/// Bearer in `NAU_PUBLISH_TOKEN` (the same one-time token the guest
 /// published under); the certificate goes to STDOUT — pure certificate
 /// text, the artifact the guest installs — status lines to stderr. A
 /// refusal is a nonzero exit, which the guest's bounded-retry loop
 /// reads as "not yet / not ever".
 fn pickup_main(home: Option<String>) -> miette::Result<()> {
-    let token = std::env::var("SHUTTLE_PUBLISH_TOKEN")
+    let token = std::env::var("NAU_PUBLISH_TOKEN")
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| {
             miette::miette!(
-                "pickup: no bearer token — set SHUTTLE_PUBLISH_TOKEN (the front that \
+                "pickup: no bearer token — set NAU_PUBLISH_TOKEN (the front that \
                  terminates the guest's GET extracts it from the Authorization header)"
             )
         })?;
@@ -434,7 +434,7 @@ fn destroy_summary(name: &str, evicted: bool) -> String {
     if evicted {
         format!("destroyed worker '{name}' and evicted its config entry")
     } else {
-        format!("destroyed worker '{name}' — not managed by shuttle — nothing evicted")
+        format!("destroyed worker '{name}' — not managed by nau — nothing evicted")
     }
 }
 
@@ -488,12 +488,12 @@ fn provider_for(
     }
 }
 
-/// The operator's authorized public key: `SHUTTLE_OPERATOR_KEY` names a
+/// The operator's authorized public key: `NAU_OPERATOR_KEY` names a
 /// file explicitly; otherwise the default id_ed25519/id_rsa public halves
 /// under `$HOME/.ssh`. Refusal names everything that was tried.
 pub fn resolve_operator_key() -> miette::Result<String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let candidates: Vec<PathBuf> = match std::env::var("SHUTTLE_OPERATOR_KEY").ok() {
+    let candidates: Vec<PathBuf> = match std::env::var("NAU_OPERATOR_KEY").ok() {
         Some(p) => vec![PathBuf::from(p)],
         None => vec![
             Path::new(&home).join(".ssh").join("id_ed25519.pub"),
@@ -515,17 +515,17 @@ pub fn resolve_operator_key() -> miette::Result<String> {
     }
     Err(miette::miette!(
         "workers provision: no operator SSH public key found (tried {}) — set \
-         SHUTTLE_OPERATOR_KEY to the .pub file workers must trust for login",
+         NAU_OPERATOR_KEY to the .pub file workers must trust for login",
         tried.join("; ")
     ))
 }
 
-/// The managed-block markers in `shuttle.lua`. Everything between them is
-/// shuttle-owned text, regenerated on every provision/destroy; everything
+/// The managed-block markers in `nau.lua`. Everything between them is
+/// nau-owned text, regenerated on every provision/destroy; everything
 /// outside them is the operator's and is never rewritten.
 pub const BLOCK_BEGIN: &str =
-    "-- BEGIN shuttle workers (machine-managed; `shuttle workers provision`/`destroy` own this block)";
-pub const BLOCK_END: &str = "-- END shuttle workers";
+    "-- BEGIN nau workers (machine-managed; `nau workers provision`/`destroy` own this block)";
+pub const BLOCK_END: &str = "-- END nau workers";
 
 /// One request to provision workers. Provider-independent; the provider
 /// module maps it onto its CLI.
@@ -540,9 +540,9 @@ pub struct ProvisionRequest {
     /// How many servers to create.
     pub count: u32,
     /// Worker lifetime in seconds — `--ttl`. Two stamps (the #269 v2
-    /// contract): the provider's `shuttle-worker-ttl` label/tag
+    /// contract): the provider's `nau-worker-ttl` label/tag
     /// (epoch-seconds expiry — the SOURCE OF TRUTH the sweep reads) and
-    /// the in-guest `/etc/shuttle/worker-ttl` marker (one decimal
+    /// the in-guest `/etc/nau/worker-ttl` marker (one decimal
     /// EPOCH-SECONDS line — the sweep's `is_epoch` parses decimal only —
     /// a fallback COPY).
     pub ttl_secs: u64,
@@ -599,7 +599,7 @@ pub struct ProvisionPlan {
 /// One provisioned worker, as pinned into config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionedWorker {
-    /// The provider-side server name (the `shuttle workers destroy` handle).
+    /// The provider-side server name (the `nau workers destroy` handle).
     pub name: String,
     /// The `ssh://` address written into the workers entry.
     pub address: String,
@@ -645,7 +645,7 @@ pub fn require_ca_pin(req: &ProvisionRequest) -> miette::Result<&str> {
     req.ca_fingerprint.as_deref().ok_or_else(|| {
         miette::miette!(
             "provision: no host CA fingerprint on the request — the workers pin IS the CA \
-             fingerprint now (ADR-0045 amendment); run 'shuttle ca keygen' first"
+             fingerprint now (ADR-0045 amendment); run 'nau ca keygen' first"
         )
     })
 }
@@ -657,7 +657,7 @@ pub fn require_publish(
 ) -> miette::Result<&publish::PublishChannel> {
     publish.as_ref().ok_or_else(|| {
         miette::miette!(
-            "provision: no publish channel — a real provision needs SHUTTLE_PUBLISH_URL \
+            "provision: no publish channel — a real provision needs NAU_PUBLISH_URL \
              (the coordinator endpoint the guest publishes its public host half to)"
         )
     })
@@ -746,7 +746,7 @@ pub fn parse_ttl(raw: &str) -> miette::Result<u64> {
 
 /// Format epoch seconds as one ISO-8601 UTC line — HUMAN DISPLAY ONLY
 /// (the dry-run plan). Every on-the-wire TTL stamp (the hcloud label AND
-/// the `/etc/shuttle/worker-ttl` marker) is decimal epoch seconds; the
+/// the `/etc/nau/worker-ttl` marker) is decimal epoch seconds; the
 /// sweep's `is_epoch` parses decimal only.
 pub fn iso8601_utc(epoch_secs: u64) -> String {
     let days = (epoch_secs / 86400) as i64;
@@ -818,7 +818,7 @@ pub const SQUASHFS_TOOLS_SHA256: &str =
 
 /// Everything the template needs. Nothing here is optional: a provision
 /// without a CA pin, a login key, a TTL, or a publish channel is not a
-/// shuttle worker. NOTE: there is no host-key slot — the guest generates
+/// nau worker. NOTE: there is no host-key slot — the guest generates
 /// its own keypair (ADR-0045 amendment); only public material and the
 /// one-time bearer cross user-data.
 pub struct UserDataParams<'a> {
@@ -836,17 +836,17 @@ pub struct UserDataParams<'a> {
     /// The operator's authorized public-key line — how the operator logs
     /// in (never the host key; this flow is untouched by the amendment).
     pub operator_key: &'a str,
-    /// The pinned shuttle binary URL cloud-init installs.
+    /// The pinned nau binary URL cloud-init installs.
     pub binary_url: &'a str,
     /// TTL expiry as DECIMAL EPOCH SECONDS — the exact shape the #269
-    /// sweep's `is_epoch` accepts for the `/etc/shuttle/worker-ttl`
+    /// sweep's `is_epoch` accepts for the `/etc/nau/worker-ttl`
     /// marker (one line). ISO-8601 here would leave the sweep's
     /// marker fallback rule dead code.
     pub ttl_expiry_epoch: u64,
 }
 
 /// The first-boot publish script the template drops at
-/// `/etc/shuttle/publish-host-key.sh` (0700): read the GUEST-GENERATED
+/// `/etc/nau/publish-host-key.sh` (0700): read the GUEST-GENERATED
 /// public half, embed it with the machine identity and the cloud-init
 /// normalized instance-data document (the provider instance-identity
 /// content the certificate principal binds — ADR-0045 Decision 3) into
@@ -861,7 +861,7 @@ const PUBLISH_SCRIPT: &str = r#"#!/bin/sh
 # token carried in publish.env. No private half ever exists off this
 # machine.
 set -eu
-. /etc/shuttle/publish.env
+. /etc/nau/publish.env
 PUB=$(tr -d '"\\' < /etc/ssh/ssh_host_ed25519_key.pub)
 if [ ! -s /run/cloud-init/instance-data.json ]; then
   echo "publish-host-key: no cloud-init instance-data — the certificate principal would bind nothing; skipping publish (fail-closed)" >&2
@@ -885,11 +885,11 @@ exit 0
 "#;
 
 /// The first-boot pickup script the template drops at
-/// `/etc/shuttle/pickup-host-cert.sh` (0700, #295 sub-task 4): GET the
+/// `/etc/nau/pickup-host-cert.sh` (0700, #295 sub-task 4): GET the
 /// issued host certificate over the SAME one-time bearer channel the
-/// publish used (`/etc/shuttle/publish.env` carries every slot the
+/// publish used (`/etc/nau/publish.env` carries every slot the
 /// pickup needs — URL, token). The certificate exists only after the
-/// coordinator signs (`shuttle workers issue`), so the guest polls with
+/// coordinator signs (`nau workers issue`), so the guest polls with
 /// bounded retries until the token TTL closes the window
 /// ([`crate::provision::publish::PUBLISH_TOKEN_TTL_SECS`] = 1440 × 60s).
 /// On arrival the certificate is shape-checked (a cert line, not a
@@ -907,7 +907,7 @@ const PICKUP_SCRIPT: &str = r#"#!/bin/sh
 # certificate over the same one-time bearer the publish used. Public
 # material only; the window closes at the publish-token TTL.
 set -eu
-. /etc/shuttle/publish.env
+. /etc/nau/publish.env
 CERT=/etc/ssh/ssh_host_ed25519_key-cert.pub
 TMP=$CERT.tmp
 i=0
@@ -937,13 +937,13 @@ exit 0
 /// unit is enabled by the last runcmd, after the publish runcmd has
 /// already proven the channel up.
 const PICKUP_UNIT: &str = r#"[Unit]
-Description=shuttle: pick up the issued SSH host certificate (ADR-0045 amendment)
+Description=nau: pick up the issued SSH host certificate (ADR-0045 amendment)
 After=network-online.target
 
 [Service]
 Type=oneshot
 TimeoutStartSec=infinity
-ExecStart=/etc/shuttle/pickup-host-cert.sh
+ExecStart=/etc/nau/pickup-host-cert.sh
 
 [Install]
 WantedBy=multi-user.target
@@ -966,9 +966,9 @@ fn publish_env(p: &UserDataParams<'_>) -> String {
 /// `ssh_genkey: true`, explicit — guest-local generation is the security
 /// property, never a default relied on), the operator authorized key
 /// grants login (untouched by the amendment), the TTL marker is stamped
-/// as the in-guest fallback COPY of the `shuttle-worker-ttl` label (the
+/// as the in-guest fallback COPY of the `nau-worker-ttl` label (the
 /// sweep's source of truth), the worker tool pins are installed (#273),
-/// the pinned shuttle binary is installed, sshd is hardened (key-only,
+/// the pinned nau binary is installed, sshd is hardened (key-only,
 /// root login by key) — the first-boot publish script drops the PUBLIC
 /// half plus instance identity to the coordinator over the one-time
 /// token, and the pickup unit (a oneshot service, not a runcmd) fetches
@@ -988,26 +988,26 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
     write_file(&mut s, "/root/.ssh/authorized_keys", "0600", p.operator_key);
     write_file(
         &mut s,
-        "/etc/shuttle/worker-ttl",
+        "/etc/nau/worker-ttl",
         "0644",
         &p.ttl_expiry_epoch.to_string(),
     );
-    write_file(&mut s, "/etc/shuttle/publish.env", "0600", &publish_env(p));
+    write_file(&mut s, "/etc/nau/publish.env", "0600", &publish_env(p));
     write_file(
         &mut s,
-        "/etc/shuttle/publish-host-key.sh",
+        "/etc/nau/publish-host-key.sh",
         "0700",
         PUBLISH_SCRIPT,
     );
     write_file(
         &mut s,
-        "/etc/shuttle/pickup-host-cert.sh",
+        "/etc/nau/pickup-host-cert.sh",
         "0700",
         PICKUP_SCRIPT,
     );
     write_file(
         &mut s,
-        "/etc/systemd/system/shuttle-pickup-host-cert.service",
+        "/etc/systemd/system/nau-pickup-host-cert.service",
         "0644",
         PICKUP_UNIT,
     );
@@ -1028,23 +1028,23 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
     // one fail-together step.
     s.push_str(&format!("  - {}\n", squashfs_build_runcmd()));
     s.push_str(&format!(
-        "  - curl -fsSL {url} -o /usr/local/bin/shuttle\n",
+        "  - curl -fsSL {url} -o /usr/local/bin/nau\n",
         url = p.binary_url
     ));
-    s.push_str("  - chmod 0755 /usr/local/bin/shuttle\n");
+    s.push_str("  - chmod 0755 /usr/local/bin/nau\n");
     s.push_str(
         "  - printf 'PermitRootLogin prohibit-password\\nPasswordAuthentication no\\n' \
-         > /etc/ssh/sshd_config.d/99-shuttle-worker.conf\n",
+         > /etc/ssh/sshd_config.d/99-nau-worker.conf\n",
     );
     s.push_str("  - systemctl restart ssh || systemctl restart sshd\n");
     // The publish: last runcmd (final stage — after the ssh module has
     // generated the host keys and the network is up).
-    s.push_str("  - /etc/shuttle/publish-host-key.sh\n");
+    s.push_str("  - /etc/nau/publish-host-key.sh\n");
     // The pickup: a oneshot unit (NOT a runcmd — its bounded-retry loop
     // may run for the whole token window) enabled after the publish has
     // proven the channel up; the guest installs the issued certificate
     // as /etc/ssh/ssh_host_ed25519_key-cert.pub and restarts sshd.
-    s.push_str("  - systemctl enable --now shuttle-pickup-host-cert.service\n");
+    s.push_str("  - systemctl enable --now nau-pickup-host-cert.service\n");
     s
 }
 
@@ -1085,19 +1085,19 @@ fn squashfs_build_runcmd() -> String {
     )
 }
 
-// ── The managed `workers` block in shuttle.lua ──
+// ── The managed `workers` block in nau.lua ──
 
 /// Append (or replace, when the address is already pinned in the managed
 /// block) one workers entry. The surrounding operator text is never
 /// rewritten; an operator-owned entry at the same address is a refusal —
-/// shuttle owns only its block.
+/// nau owns only its block.
 pub fn append_worker_entry(config: &Path, address: &str, host_key: &str) -> miette::Result<()> {
     let text = read_config(config)?;
     let block = block_line_range(&text)?;
     if outside_block_contains(&text, block, &format!("address = {}", lua_quote(address))) {
         return Err(miette::miette!(
-            "provision: {} already pins a worker at {address} outside the shuttle-managed \
-             block — shuttle never rewrites operator text; remove or move the entry first",
+            "provision: {} already pins a worker at {address} outside the nau-managed \
+             block — nau never rewrites operator text; remove or move the entry first",
             config.display()
         ));
     }
@@ -1155,7 +1155,7 @@ fn read_config(config: &Path) -> miette::Result<String> {
 /// Atomically replace `config` (tempfile + rename, the known_hosts-pin
 /// pattern) so a crashed provision never leaves a torn config. The
 /// operator's file mode survives: a NamedTempFile is 0600, and persisting
-/// it as-is would silently tighten every rewritten shuttle.lua.
+/// it as-is would silently tighten every rewritten nau.lua.
 fn write_config(config: &Path, content: &str) -> miette::Result<()> {
     let dir = config.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
@@ -1213,7 +1213,7 @@ fn block_line_range(text: &str) -> miette::Result<Option<(usize, usize)>> {
             (Marker::None, _) => {}
             _ => {
                 return Err(miette::miette!(
-                    "the shuttle-managed workers block in this config is duplicated or \
+                    "the nau-managed workers block in this config is duplicated or \
                      unpaired — fix the block by hand (keep exactly one {}…{} pair)",
                     BLOCK_BEGIN,
                     BLOCK_END
@@ -1249,8 +1249,8 @@ fn parse_managed_entries(
             .and_then(|s| s.strip_suffix(')'))
         else {
             return Err(miette::miette!(
-                "unexpected line inside the shuttle-managed workers block: '{trimmed}' — \
-                 the block is shuttle-owned; move hand edits outside it"
+                "unexpected line inside the nau-managed workers block: '{trimmed}' — \
+                 the block is nau-owned; move hand edits outside it"
             ));
         };
         let address = extract_quoted_field(inner, "address").ok_or_else(|| {
@@ -1339,7 +1339,7 @@ fn rebuild(
             let line_start = text[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
             if !text[line_start..off].trim().is_empty() {
                 return Err(miette::miette!(
-                    "cannot place the shuttle-managed workers block: this config has a \
+                    "cannot place the nau-managed workers block: this config has a \
                      top-level `return` sharing its line with other code — put the return \
                      on its own line and retry"
                 ));
@@ -1551,11 +1551,11 @@ mod tests {
     #[test]
     fn destroy_summary_reports_an_absent_entry_honestly() {
         assert_eq!(
-            destroy_summary("shuttle-worker-x-01", true),
-            "destroyed worker 'shuttle-worker-x-01' and evicted its config entry"
+            destroy_summary("nau-worker-x-01", true),
+            "destroyed worker 'nau-worker-x-01' and evicted its config entry"
         );
-        let absent = destroy_summary("shuttle-worker-x-01", false);
-        assert!(absent.contains("not managed by shuttle"), "{absent}");
+        let absent = destroy_summary("nau-worker-x-01", false);
+        assert!(absent.contains("not managed by nau"), "{absent}");
         assert!(absent.contains("nothing evicted"), "{absent}");
     }
 
@@ -1578,12 +1578,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("op.pub");
         std::fs::write(&key, "ssh-ed25519 AAAAoperator test@host\n").unwrap();
-        std::env::set_var("SHUTTLE_OPERATOR_KEY", &key);
+        std::env::set_var("NAU_OPERATOR_KEY", &key);
         assert_eq!(
             resolve_operator_key().unwrap(),
             "ssh-ed25519 AAAAoperator test@host"
         );
-        std::env::remove_var("SHUTTLE_OPERATOR_KEY");
+        std::env::remove_var("NAU_OPERATOR_KEY");
     }
 
     #[test]
@@ -1591,10 +1591,10 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         // SAFETY (test-only): single-threaded under ENV_LOCK.
-        std::env::set_var("SHUTTLE_OPERATOR_KEY", dir.path().join("absent.pub"));
+        std::env::set_var("NAU_OPERATOR_KEY", dir.path().join("absent.pub"));
         let err = format!("{}", resolve_operator_key().unwrap_err());
-        std::env::remove_var("SHUTTLE_OPERATOR_KEY");
+        std::env::remove_var("NAU_OPERATOR_KEY");
         assert!(err.contains("absent.pub"), "refusal names the file: {err}");
-        assert!(err.contains("SHUTTLE_OPERATOR_KEY"), "{err}");
+        assert!(err.contains("NAU_OPERATOR_KEY"), "{err}");
     }
 }

@@ -5,7 +5,7 @@
 --
 -- Nix:       no nixpkgs package; upstream ships a flake for dev only
 -- Snapcraft: no upstream snap
--- Shuttle:   declarative Lua — Go source build via the go module
+-- Nau:   declarative Lua — Go source build via the go module
 --            resolver, carrying a `services` declaration (ADR-0032
 --            Decision 2)
 --
@@ -82,9 +82,9 @@ return {
         build = table.concat({
             "mkdir -p $STAGE/usr/bin $SRC/transports/bifrost-http/ui",
             "printf '%s\\n' '<!doctype html><title>bifrost</title><p>bifrost API is running; web UI is not bundled in this port.</p>' > $SRC/transports/bifrost-http/ui/index.html",
-            "export GOMODCACHE=/tmp/shuttle-go-cache",
-            'export GOPROXY="file://$SHUTTLE_DEPS_DIR/cache/download"',
-            "export GOFLAGS=-mod=mod GOSUMDB=off GOPATH=/tmp/shuttle-go-cache",
+            "export GOMODCACHE=/tmp/nau-go-cache",
+            'export GOPROXY="file://$NAU_DEPS_DIR/cache/download"',
+            "export GOFLAGS=-mod=mod GOSUMDB=off GOPATH=/tmp/nau-go-cache",
             'mkdir -p "$GOMODCACHE"',
             'cd $SRC/transports && CGO_ENABLED=1 GOWORK=off go build -ldflags "-w -s -X main.Version=v1.7.2" -trimpath -tags sqlite_static -o $STAGE/usr/bin/bifrost ./bifrost-http',
         }, " && "),

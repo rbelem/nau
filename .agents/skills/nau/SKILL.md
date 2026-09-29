@@ -1,4 +1,4 @@
-# shuttle — Snap Package Builder
+# nau — Snap Package Builder
 
 A Rust CLI tool that builds Snap packages from Lua declarations.
 Replaces Snapcraft YAML with a programmable, composable Lua DSL.
@@ -6,13 +6,13 @@ Replaces Snapcraft YAML with a programmable, composable Lua DSL.
 ## Quick Reference
 
 ```bash
-shuttle build shuttle.lua          # build snaps from source
-shuttle image shuttle.lua          # build bootable disk image
-shuttle deps <pkg> --recursive  # dependency tree
-shuttle build --order            # print build order
-shuttle index add <name>         # register in package index
-shuttle index resolve            # resolve store pins
-shuttle doctor                   # system readiness check
+nau build nau.lua          # build snaps from source
+nau image nau.lua          # build bootable disk image
+nau deps <pkg> --recursive  # dependency tree
+nau build --order            # print build order
+nau index add <name>         # register in package index
+nau index resolve            # resolve store pins
+nau doctor                   # system readiness check
 ```
 
 ## Package Index
@@ -115,11 +115,11 @@ mkdir pkgs/<first-letter>/<name>
 vim pkgs/<first-letter>/<name>/init.lua
 ```
 
-**Resolve dependencies:** `shuttle deps pkgs/g/gcc --recursive --flat`
+**Resolve dependencies:** `nau deps pkgs/g/gcc --recursive --flat`
 
-**Check build order:** `shuttle build --order --file examples/full-system/system-base/shuttle.lua`
+**Check build order:** `nau build --order --file examples/full-system/system-base/nau.lua`
 
-**Register in index:** `shuttle index add <name> --alias <alias>`
+**Register in index:** `nau index add <name> --alias <alias>`
 
 **Test:** `devbox run test` (93 tests, clippy clean)
 

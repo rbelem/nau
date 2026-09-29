@@ -1,9 +1,9 @@
--- Hello snap — shuttle.lua equivalent of:
+-- Hello snap — nau.lua equivalent of:
 --
 -- Nix:       pkgs.hello (stdenv.mkDerivation { pname = "hello"; ... })
 -- Snapcraft: snapcraft.yaml with autotools plugin
 --
--- Per ADR-0003: shuttle.lua always returns a table of named outputs.
+-- Per ADR-0003: nau.lua always returns a table of named outputs.
 -- Single-snap configs return { default = { ... } }.
 -- Per ADR-0004: snap(...) returns a validated table — no mutation.
 

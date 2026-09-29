@@ -71,16 +71,16 @@ return {
         }, " && "),
 
         -- Interim leak-scan escapes (ADR-0018 Decision 3, issue #22):
-        -- 1. The nix gcc wrapper bakes RUNPATH=/shuttle-build-prefix/usr/lib
+        -- 1. The nix gcc wrapper bakes RUNPATH=/nau-build-prefix/usr/lib
         --    into libcurl.so and the curl binary (htop/tig/tmux precedent).
         -- 2. configure bakes the merged prefix into the libcurl.pc Libs line
         --    and the curl-config script — build-time metadata, same class as
         --    ncurses' ncursesw6-config. All silenced visibly, pending the
         --    RUNPATH/portability repair.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
-            "/shuttle-build-prefix",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
+            "/nau-build-prefix",
         },
     },
 }

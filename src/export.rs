@@ -1,4 +1,4 @@
-//! `shuttle export` — the static-HTTP lane (ADR-0033 Decision 10):
+//! `nau export` — the static-HTTP lane (ADR-0033 Decision 10):
 //! freeze a pod store's shareable content as a plain directory tree
 //! (`index.json`, `manifests/<pkg>.json`, `blobs/<sha256>`) any web
 //! server can serve — the same layout the `serve` endpoints expose, one
@@ -26,12 +26,12 @@
 //!
 //! # Ownership and pruning (ADR-0033 Decision 10)
 //!
-//! Every export writes a `.shuttle-export` marker at the out root
+//! Every export writes a `.nau-export` marker at the out root
 //! (content: the tree format version). On a re-export of a directory
 //! that HAS the marker, stale entries are pruned: manifests and blobs
 //! no longer part of the exportable set are removed, so a mirror never
 //! advertises packages the pod dropped. A directory WITHOUT the marker
-//! was not written by shuttle — it accumulates exactly as before,
+//! was not written by nau — it accumulates exactly as before,
 //! deleting nothing it did not write (and gets claimed by the marker
 //! from that export on).
 //!
@@ -73,7 +73,7 @@ pub type Curation = BTreeSet<String>;
 
 /// The curation list of one mission: the names its `image()`
 /// declaration pins. This is the existing mission schema — the same
-/// declaration `shuttle image --output-name` builds from; export adds
+/// declaration `nau image --output-name` builds from; export adds
 /// no new pin format.
 pub fn mission_curation(image: &ImageDeclaration) -> Curation {
     image
@@ -134,20 +134,20 @@ struct IndexJson {
 }
 
 /// The ownership marker written at the out root on every export
-/// (ADR-0033 Decision 10): its presence proves shuttle wrote the tree,
+/// (ADR-0033 Decision 10): its presence proves nau wrote the tree,
 /// licensing re-export pruning.
-const MARKER_FILE: &str = ".shuttle-export";
+const MARKER_FILE: &str = ".nau-export";
 
 /// The marker's content: the export-tree format version, one line.
 const MARKER_VERSION: &str = "v1";
 
-/// Run `shuttle export` into `out` for the named pod (`None` = the
+/// Run `nau export` into `out` for the named pod (`None` = the
 /// default pod).
 pub fn run(out: &str, pod: Option<&str>) -> miette::Result<()> {
     export_at(out, pod, None)
 }
 
-/// Run a CURATED `shuttle export` (#275): only the packages `curation`
+/// Run a CURATED `nau export` (#275): only the packages `curation`
 /// pins, for the named pod. Every pinned name must be in the pool —
 /// anything else is a named, fail-closed error before the tree is
 /// touched.
@@ -186,7 +186,7 @@ fn run_at(
     let inbox_only = pkg_manifest::union_inbox(&generation, &inbox);
     ensure_exportable(store.root(), generation_has_packages, &inbox_only)?;
     let (manifests_dir, blobs_dir) = prepare_dirs(out)?;
-    // Ownership is decided from the directory AS FOUND: a tree shuttle
+    // Ownership is decided from the directory AS FOUND: a tree nau
     // wrote before (marker present) gets stale-entry pruning this
     // export; a foreign directory accumulates, deleting nothing.
     let owned = out.join(MARKER_FILE).exists();
@@ -315,7 +315,7 @@ fn prune_stale(
 
 /// Remove the plain files of `dir` whose names are not in `keep`.
 /// Anything not a plain file (a foreign subdirectory, say) is left
-/// alone — pruning reclaims shuttle's own stale entries, nothing else.
+/// alone — pruning reclaims nau's own stale entries, nothing else.
 fn prune_dir(dir: &Path, keep: &BTreeSet<String>) -> miette::Result<()> {
     for entry in std::fs::read_dir(dir)
         .into_diagnostic()
@@ -650,7 +650,7 @@ mod tests {
         std::fs::write(&inbox_path, serde_json::to_vec(&gamma).unwrap()).unwrap();
 
         // The operator signing key, at the real on-disk location
-        // (`~/.config/shuttle/secret-key` under the injected home).
+        // (`~/.config/nau/secret-key` under the injected home).
         let home = tempfile::tempdir().unwrap();
         let kp = crate::sign::create_secret_key(home.path()).unwrap();
 
@@ -899,7 +899,7 @@ mod tests {
 
     /// A mission declaration in the image-module test shape: base +
     /// kernel + one extra snap. The pin set export curates from — the
-    /// same `image()` schema `shuttle image` consumes, no new format.
+    /// same `image()` schema `nau image` consumes, no new format.
     fn mission() -> ImageDeclaration {
         ImageDeclaration {
             name: "workstation".into(),

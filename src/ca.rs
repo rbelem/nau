@@ -1,31 +1,31 @@
 //! The coordinator SSH host CA (ADR-0045 amendment, #283 decided): the
 //! one ed25519 keypair that signs short-lived host certificates for every
 //! provisioned worker. A DIFFERENT trust root from the update-manifest
-//! signing key (`shuttle key` ceremony, ADR-0024 §4) — the CA anchors
+//! signing key (`nau key` ceremony, ADR-0024 §4) — the CA anchors
 //! host identity (`@cert-authority`, one pinned line per operator), the
 //! signing key anchors update manifests — so it never shares a keychain
-//! with it. A `ca.pub` dropped into `~/.config/shuttle/keys/` would be
+//! with it. A `ca.pub` dropped into `~/.config/nau/keys/` would be
 //! misread by [`crate::sign::Keychain::load_dir`] as a manifest trust
-//! anchor; the dedicated `~/.config/shuttle/ca/` directory keeps the two
+//! anchor; the dedicated `~/.config/nau/ca/` directory keeps the two
 //! roots apart by construction.
 //!
 //! Ceremony (joins ADR-0024's — the amendment records the join):
 //!
-//! - `shuttle ca keygen` — mint the keypair via `ssh-keygen` behind the
+//! - `nau ca keygen` — mint the keypair via `ssh-keygen` behind the
 //!   [`CommandRunner`][crate::command::CommandRunner] seam (the repo's
 //!   subprocess convention — every provisioning-side ssh-keygen call
 //!   rides it — no new crates). Refuses to overwrite an existing CA
 //!   without `--force`: replacing the high-value trust root is a
 //!   deliberate act, never an accident.
-//! - `shuttle ca list` — introspect: presence per half, the public line,
+//! - `nau ca list` — introspect: presence per half, the public line,
 //!   and the ssh-keygen SHA256 fingerprint (the identity workers entries
 //!   will carry once #295 sub-task 4 lands).
 //!
 //! Storage contract (tests pin it):
 //!
-//! - `~/.config/shuttle/ca/ca`     — private half, 0600 (ssh-keygen);
+//! - `~/.config/nau/ca/ca`     — private half, 0600 (ssh-keygen);
 //!   what `ssh-keygen -s` consumes at issuance time (sub-task 3).
-//! - `~/.config/shuttle/ca/ca.pub` — public half; the future
+//! - `~/.config/nau/ca/ca.pub` — public half; the future
 //!   `@cert-authority` line source (sub-task 4).
 //! - the directory itself is 0700.
 
@@ -37,20 +37,20 @@ use crate::command::{exit_code, CommandRunner};
 
 /// The keypair comment ssh-keygen stamps on both halves — the marker
 /// provisioning output greps for when wiring pins by hand.
-pub const CA_COMMENT: &str = "shuttle-host-ca";
+pub const CA_COMMENT: &str = "nau-host-ca";
 
 /// The CA keypair directory under the ceremony home:
-/// `~/.config/shuttle/ca/`.
+/// `~/.config/nau/ca/`.
 pub fn ca_dir(home: &Path) -> PathBuf {
-    home.join(".config").join("shuttle").join("ca")
+    home.join(".config").join("nau").join("ca")
 }
 
-/// The CA private key: `<home>/.config/shuttle/ca/ca` (0600).
+/// The CA private key: `<home>/.config/nau/ca/ca` (0600).
 pub fn ca_secret_path(home: &Path) -> PathBuf {
     ca_dir(home).join("ca")
 }
 
-/// The CA public key: `<home>/.config/shuttle/ca/ca.pub`.
+/// The CA public key: `<home>/.config/nau/ca/ca.pub`.
 pub fn ca_public_path(home: &Path) -> PathBuf {
     ca_dir(home).join("ca.pub")
 }
@@ -67,7 +67,7 @@ pub struct CaInfo {
 }
 
 /// Mint the host CA keypair under `home` via `ssh-keygen`. Creates
-/// `~/.config/shuttle/ca/` (0700) when absent. An existing CA is a named
+/// `~/.config/nau/ca/` (0700) when absent. An existing CA is a named
 /// refusal unless `force` — and `force` removes both stale halves BEFORE
 /// the mint so a failed regeneration cannot leave a mixed keypair.
 pub fn create_ca_keypair(
@@ -220,9 +220,9 @@ mod tests {
     /// Shape-valid throwaway ed25519 material — no crypto, like the
     /// provision fakes. Two distinct fixtures so a `--force` mint is
     /// observably different from the first.
-    const FIXTURE_A_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ shuttle-host-ca";
+    const FIXTURE_A_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ nau-host-ca";
     const FIXTURE_A_FPR: &str = "SHA256:FAKEAAAA";
-    const FIXTURE_B_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOrZfC0rKJdBX8mUJIKdClRNKdVKmShWU8rjHfDrBKUM shuttle-host-ca";
+    const FIXTURE_B_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOrZfC0rKJdBX8mUJIKdClRNKdVKmShWU8rjHfDrBKUM nau-host-ca";
     const FIXTURE_B_FPR: &str = "SHA256:FAKEBBBB";
 
     fn ok_out(stdout: &str) -> RunnerOutput {
@@ -315,7 +315,7 @@ mod tests {
     }
 
     fn fpr_out(fpr: &str) -> String {
-        format!("256 {fpr} shuttle-host-ca (ED25519)\n")
+        format!("256 {fpr} nau-host-ca (ED25519)\n")
     }
 
     #[test]
@@ -323,15 +323,15 @@ mod tests {
         let home = Path::new("/somewhere/home");
         assert_eq!(
             ca_dir(home),
-            PathBuf::from("/somewhere/home/.config/shuttle/ca")
+            PathBuf::from("/somewhere/home/.config/nau/ca")
         );
         assert_eq!(
             ca_secret_path(home),
-            PathBuf::from("/somewhere/home/.config/shuttle/ca/ca")
+            PathBuf::from("/somewhere/home/.config/nau/ca/ca")
         );
         assert_eq!(
             ca_public_path(home),
-            PathBuf::from("/somewhere/home/.config/shuttle/ca/ca.pub")
+            PathBuf::from("/somewhere/home/.config/nau/ca/ca.pub")
         );
     }
 
@@ -401,7 +401,7 @@ mod tests {
         assert_eq!(second.fingerprint, FIXTURE_B_FPR, "force regenerates");
         assert_eq!(second.public_line, FIXTURE_B_PUB);
         let pub_text = std::fs::read_to_string(ca_public_path(dir.path())).unwrap();
-        assert!(pub_text.contains("shuttle-host-ca"));
+        assert!(pub_text.contains("nau-host-ca"));
     }
 
     #[test]
@@ -457,7 +457,7 @@ mod tests {
             parse_fingerprint_line(&fpr_out("SHA256:AbCd+/12")).unwrap(),
             "SHA256:AbCd+/12"
         );
-        let err = parse_fingerprint_line("256 deadbeef shuttle-host-ca (ED25519)").unwrap_err();
+        let err = parse_fingerprint_line("256 deadbeef nau-host-ca (ED25519)").unwrap_err();
         assert!(format!("{err:?}").contains("SHA256:"), "{err:?}");
         let err = parse_fingerprint_line("").unwrap_err();
         assert!(format!("{err:?}").contains("SHA256:"), "{err:?}");

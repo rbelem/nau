@@ -1,8 +1,8 @@
 //! On-device runtime — generations + file-level content store
 //! (ADR-0012 step 5, Phase 24b).
 //!
-//! `shuttle install/remove/upgrade/rollback/gc` operate on a *state root*
-//! (default `/var/lib/shuttle`, overridable via `--state-dir`):
+//! `nau install/remove/upgrade/rollback/gc` operate on a *state root*
+//! (default `/var/lib/nau`, overridable via `--state-dir`):
 //!
 //! ```text
 //! <root>/
@@ -47,7 +47,7 @@
 //! warn, never fail, when the binary is absent. Production resolves those
 //! binaries with [`RuntimeTools::from_host`]; the test-aware
 //! [`RuntimeTools::for_pod_runtime`] resolves them to `None` when
-//! `SHUTTLE_SYSTEMD` is `off`/`0`/`no`, or when the host has no systemd
+//! `NAU_SYSTEMD` is `off`/`0`/`no`, or when the host has no systemd
 //! (`/run/systemd/system` absent) — so tests never reach the system bus.
 //!
 //! # Generations
@@ -79,11 +79,11 @@
 //! Snap downloads go through [`crate::store`]'s resolve path — the
 //! snap-revision assertion verification there is fail-closed and is
 //! reused, never reimplemented. Manifest signatures (ADR-0011 step (d))
-//! verify against the on-device trust set `/etc/shuttle/trusted-keys/`
-//! (with `/etc/shuttle/update-key.pub` kept as a single-anchor fallback)
-//! or the `~/.config/shuttle/keys/` keychain when present.
+//! verify against the on-device trust set `/etc/nau/trusted-keys/`
+//! (with `/etc/nau/update-key.pub` kept as a single-anchor fallback)
+//! or the `~/.config/nau/keys/` keychain when present.
 //!
-//! ADR-0024 §4: the embedded revocation list `/etc/shuttle/revoked-keys`
+//! ADR-0024 §4: the embedded revocation list `/etc/nau/revoked-keys`
 //! (one key id per line) is consulted first — a signature under a revoked
 //! id is refused with a precise message, even when another trusted key
 //! also signed. That is what makes "revoked" distinguishable from "never
@@ -107,13 +107,13 @@ use crate::units::{
 // ── Constants ──
 
 /// Default state root for generations + the content store.
-pub const DEFAULT_STATE_DIR: &str = "/var/lib/shuttle";
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/nau";
 
 /// Default systemd-sysext scan directory the activation links live in.
 pub const DEFAULT_EXTENSIONS_LINK_DIR: &str = "/var/lib/extensions";
 
 /// On-device trust anchor embedded at image build time (ADR-0011 step (d)).
-pub const DEVICE_ANCHOR: &str = "/etc/shuttle/update-key.pub";
+pub const DEVICE_ANCHOR: &str = "/etc/nau/update-key.pub";
 
 // ── Generation model ──
 
@@ -157,8 +157,8 @@ pub struct InstalledPackage {
     /// App name → sha256 of the app's confined-launcher wrapper blob in
     /// the store (ticket #11). Only present for confined apps. The farm
     /// emitter prefers this over `apps` for a confined app so the farm's
-    /// symlink points at a wrapper that invokes `shuttle run`, while
-    /// `apps` still records the real command binary `shuttle run` execs.
+    /// symlink points at a wrapper that invokes `nau run`, while
+    /// `apps` still records the real command binary `nau run` execs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub launchers: BTreeMap<String, String>,
     /// Multi-file app payloads (issue #37): app name → the app's
@@ -179,7 +179,7 @@ pub struct InstalledPackage {
     pub confined: Option<crate::snap::Confinement>,
     /// Per-app confinement overrides (ticket #11): app name → grants, only
     /// for apps whose `confined` differs from the package default. The
-    /// farm emitter and `shuttle run` resolve effective confinement as
+    /// farm emitter and `nau run` resolve effective confinement as
     /// `app_confined.get(app).or(confined.as_ref())`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub app_confined: BTreeMap<String, crate::snap::Confinement>,
@@ -396,7 +396,7 @@ pub struct RuntimeTools {
     pub bootctl: Option<PathBuf>,
     /// `loginctl` — the user-session probe behind the Decision 8 linger
     /// warning. Resolved from the host PATH like the rest, so the probe
-    /// rides the same seam (`SHUTTLE_POD_TOOLS=absent` silences it).
+    /// rides the same seam (`NAU_POD_TOOLS=absent` silences it).
     pub loginctl: Option<PathBuf>,
 }
 
@@ -448,7 +448,7 @@ impl RuntimeTools {
     }
 }
 
-/// `SHUTTLE_SYSTEMD` semantics for the system-bus tools:
+/// `NAU_SYSTEMD` semantics for the system-bus tools:
 ///
 /// - `off` / `0` / `no` → suppress them (tests pin this to keep the
 ///   suite off the real bus).
@@ -457,7 +457,7 @@ impl RuntimeTools {
 /// - unset / anything else → suppress them when the host has no
 ///   systemd ([`systemd_present`]); otherwise resolve from the host.
 fn systemd_disabled() -> bool {
-    match std::env::var("SHUTTLE_SYSTEMD")
+    match std::env::var("NAU_SYSTEMD")
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -1129,7 +1129,7 @@ impl RuntimeStore {
         let unsquashfs = tools.unsquashfs.as_ref().ok_or_else(|| {
             miette::miette!(
                 "no provisioned unsquashfs and none on PATH — on-device install \
-                 cannot unpack payloads; run `shuttle doctor --fix` or install \
+                 cannot unpack payloads; run `nau doctor --fix` or install \
                  squashfs-tools"
             )
         })?;
@@ -1707,7 +1707,7 @@ impl RuntimeStore {
     ///
     /// The refresh/reload steps warn when their tool is missing or
     /// failing. `skipped` counts the ones that were deliberately not run
-    /// (tool absent, `/run/systemd/system` missing, or `SHUTTLE_SYSTEMD`
+    /// (tool absent, `/run/systemd/system` missing, or `NAU_SYSTEMD`
     /// opted out) — a silent no-op is reported distinctly from a tool
     /// that ran and failed, so "nothing was exercised" is never mistaken
     /// for a successful reload.
@@ -1972,7 +1972,7 @@ struct PayloadRuntime {
     apps: BTreeMap<String, String>,
     /// app name → confined-launcher wrapper blob hash (ticket #11). Only
     /// populated for confined apps; the farm emitter prefers it over
-    /// `apps` for those so the farm symlink invokes `shuttle run`.
+    /// `apps` for those so the farm symlink invokes `nau run`.
     launchers: BTreeMap<String, String>,
     /// app name → sibling assembly (issue #37), only for apps whose
     /// payload directory carries content beside the binary; recorded in
@@ -2037,8 +2037,8 @@ fn plan_payload_runtime(
             out.assembly.insert(plan.app.clone(), asm);
         }
         // Ticket #11: a confined app records its launcher-wrapper blob
-        // (the `<command>.shuttle-launcher` sibling authored at build
-        // time) so the farm symlink points at a `shuttle run` wrapper,
+        // (the `<command>.nau-launcher` sibling authored at build
+        // time) so the farm symlink points at a `nau run` wrapper,
         // and its per-app confinement override when it differs from the
         // package default.
         if let Some(_confined) =
@@ -2224,8 +2224,8 @@ pub fn verify_signatures_at(
         return Ok(None);
     }
     // 0. ADR-0024 §4 revocation gate. The embedded revocation list lives
-    // beside the device anchor (/etc/shuttle/revoked-keys); the operator
-    // list lives under the keychain dir (~/.config/shuttle/keys/
+    // beside the device anchor (/etc/nau/revoked-keys); the operator
+    // list lives under the keychain dir (~/.config/nau/keys/
     // revoked-keys). A signature under a revoked id is refused BEFORE any
     // anchor check, so "trusted once, revoked now" cannot be masked by a
     // dual-signed manifest that a still-trusted key also signed.
@@ -2260,8 +2260,8 @@ fn verify_against_anchors(
     anchor: &Path,
     keys: &Path,
 ) -> miette::Result<Option<String>> {
-    // 1. The embedded device trust set (/etc/shuttle/trusted-keys/*.pub),
-    //    plus the single-anchor fallback (/etc/shuttle/update-key.pub) for
+    // 1. The embedded device trust set (/etc/nau/trusted-keys/*.pub),
+    //    plus the single-anchor fallback (/etc/nau/update-key.pub) for
     //    images built before the set shape existed.
     let embedded_chain = crate::sign::Keychain::load_dir(&trusted_keys_dir(anchor))?;
     for (key_id, public) in embedded_chain.entries_for_verify() {
@@ -2277,7 +2277,7 @@ fn verify_against_anchors(
         }
     }
 
-    // 2. The operator keychain (~/.config/shuttle/keys/*.pub). The
+    // 2. The operator keychain (~/.config/nau/keys/*.pub). The
     //    revocation gate ran above, so the closed-set verify is enough.
     let chain = crate::sign::Keychain::load_dir(keys)?;
     match crate::sign::verify_keychain(canonical, signatures, &chain) {
@@ -2292,7 +2292,7 @@ fn verify_against_anchors(
 }
 
 /// The embedded-key-set directory beside a device anchor: for
-/// `/etc/shuttle/update-key.pub` that is `/etc/shuttle/trusted-keys/`.
+/// `/etc/nau/update-key.pub` that is `/etc/nau/trusted-keys/`.
 pub(crate) fn trusted_keys_dir(anchor: &Path) -> PathBuf {
     anchor
         .parent()
@@ -3060,7 +3060,7 @@ plugs:
             base_version: "24.04".into(),
             packages: one_pkg_map(pkg("a", &["a-srv.service"], vec![H1.into()])),
             created_epoch: 42,
-            boot_entry: Some("shuttle-os-7.conf".into()),
+            boot_entry: Some("nau-os-7.conf".into()),
         };
         let json = serde_json::to_string(&gen).unwrap();
         let back: Generation = serde_json::from_str(&json).unwrap();
@@ -4192,7 +4192,7 @@ plugs:
         let home = tempfile::tempdir().unwrap();
         let kp = crate::sign::create_secret_key(home.path()).unwrap();
         // The image-embedded shape: anchor dir beside update-key.pub.
-        let anchor_dir = home.path().join("etc/shuttle");
+        let anchor_dir = home.path().join("etc/nau");
         crate::sign::install_public_key(&kp, &anchor_dir.join("trusted-keys")).unwrap();
         let (canonical, sigs) = manifest_signed_by(&kp);
         let verified = verify_signatures_at(
@@ -4209,7 +4209,7 @@ plugs:
     fn device_revocation_list_refuses_a_revoked_signer() {
         let home = tempfile::tempdir().unwrap();
         let revoked = crate::sign::create_secret_key(home.path()).unwrap();
-        let anchor_dir = home.path().join("etc/shuttle");
+        let anchor_dir = home.path().join("etc/nau");
         crate::sign::install_public_key(&revoked, &anchor_dir.join("trusted-keys")).unwrap();
         // The device carries the revocation list beside the anchor.
         std::fs::write(
@@ -4241,7 +4241,7 @@ plugs:
         let home = tempfile::tempdir().unwrap();
         let revoked = crate::sign::create_secret_key(home.path()).unwrap();
         let trusted = crate::sign::create_secret_key(&home.path().join("other")).unwrap();
-        let anchor_dir = home.path().join("etc/shuttle");
+        let anchor_dir = home.path().join("etc/nau");
         crate::sign::install_public_key(&revoked, &anchor_dir.join("trusted-keys")).unwrap();
         crate::sign::install_public_key(&trusted, &anchor_dir.join("trusted-keys")).unwrap();
         std::fs::write(

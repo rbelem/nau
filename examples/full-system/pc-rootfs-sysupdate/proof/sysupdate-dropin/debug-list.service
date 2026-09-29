@@ -8,4 +8,4 @@ Type=oneshot
 Environment=SYSTEMD_LOG_LEVEL=debug
 StandardOutput=journal+console
 StandardError=journal+console
-ExecStart=/usr/bin/sh /usr/libexec/shuttle-80/diag.sh
+ExecStart=/usr/bin/sh /usr/libexec/nau-80/diag.sh

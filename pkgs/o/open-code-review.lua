@@ -2,7 +2,7 @@
 -- staged/committed changes or PRs and posts line-level findings.
 --
 -- Cheap-tier flake port (issue #20): upstream ships the linux-amd64
--- build as a raw (unarchived) executable asset. Shuttle keeps
+-- build as a raw (unarchived) executable asset. Nau keeps
 -- non-tarball sources in place in the build dir, so the asset is
 -- installed directly from its download name into usr/bin under the
 -- package name. Statically linked Go (no pool deps).

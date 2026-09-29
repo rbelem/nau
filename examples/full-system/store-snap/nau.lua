@@ -5,10 +5,10 @@
 -- an image. No source compilation needed — snaps come pre-built.
 --
 -- Usage:
---   shuttle image --file examples/full-system/store-snap/shuttle.lua
+--   nau image --file examples/full-system/store-snap/nau.lua
 --   → produces store-snap_1.0.0_amd64.img
 --
---   shuttle image --file examples/full-system/store-snap/shuttle.lua --channel latest/edge
+--   nau image --file examples/full-system/store-snap/nau.lua --channel latest/edge
 --   → use edge channel instead of stable
 
 return {

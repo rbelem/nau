@@ -40,17 +40,17 @@ return {
         build = table.concat({
             -- Pool meson/ninja/pkg-config live in the merged build
             -- prefix; the sandbox does not extend PATH to it, so every
-            -- tool is invoked by its explicit $SHUTTLE_BUILD_PREFIX
+            -- tool is invoked by its explicit $NAU_BUILD_PREFIX
             -- path. The PATH export additionally puts the prefix's
             -- python3 on it for wayland's embed.py codegen helper and
             -- keeps HOME alive for meson's method lookups (no /etc in
             -- the sandbox, so no passwd entry).
-            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
+            'export PATH="$NAU_BUILD_PREFIX/usr/bin:$PATH"',
             "export HOME=/tmp",
-            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
+            '"$NAU_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
                 .. "-Dtests=false -Ddocumentation=false -Ddtd_validation=false",
-            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
-            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
+            '"$NAU_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$NAU_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
 
         type = "source",
@@ -64,8 +64,8 @@ return {
         -- logged by the leak scan, pending the RUNPATH repair. Same
         -- rationale as htop/libsecret.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
     },
 }

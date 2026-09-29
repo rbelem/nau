@@ -3,9 +3,9 @@
 //! Rust-side with one named diagnostic per malformed shape, and absent
 //! means the inert default — no workers, the pool's local slot count.
 
-use shuttle::lua::evaluate_string_with_inputs;
+use nau::lua::evaluate_string_with_inputs;
 
-fn eval_with(workers_decl: &str) -> Result<shuttle::lua::EvalOutput, String> {
+fn eval_with(workers_decl: &str) -> Result<nau::lua::EvalOutput, String> {
     let src = format!(
         r#"
 {workers_decl}
@@ -189,7 +189,7 @@ fn local_jobs_type_and_bound_are_checked() {
 fn legacy_public_key_line_pins_are_refused_with_the_re_pin_remedy() {
     // The retired mint-and-inject pin form (a full public-key line)
     // refuses at parse, by name, with the operator migration path.
-    // Breaking by design: re-pinning is one `shuttle ca list` away.
+    // Breaking by design: re-pinning is one `nau ca list` away.
     let err = eval_err(
         r#"
 workers = {
@@ -200,7 +200,7 @@ workers = {
     );
     assert!(err.contains("retired mint-and-inject pin form"), "{err:#}");
     assert!(
-        err.contains("re-pin with the CA fingerprint from `shuttle ca list`"),
+        err.contains("re-pin with the CA fingerprint from `nau ca list`"),
         "the remedy rides: {err:#}"
     );
 }
@@ -245,14 +245,14 @@ fn malformed_host_key_pins_are_refused() {
         r#"workers = { { address = "ssh://h", host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux" } }"#,
     );
     assert!(err.contains("retired mint-and-inject pin form"), "{err:#}");
-    assert!(err.contains("shuttle ca list"), "{err:#}");
+    assert!(err.contains("nau ca list"), "{err:#}");
 
     let err = eval_err(r#"workers = { { address = "ssh://h", host_key = "SHA256:tooshort" } }"#);
     assert!(err.contains("43 base64 characters"), "{err:#}");
 
     let err = eval_err(r#"workers = { { address = "ssh://h", host_key = "not-a-pin" } }"#);
     assert!(err.contains("host CA's fingerprint"), "{err:#}");
-    assert!(err.contains("shuttle ca list"), "{err:#}");
+    assert!(err.contains("nau ca list"), "{err:#}");
 
     let err = eval_err(r#"workers = { { address = "ssh://h", host_key = 42 } }"#);
     assert!(err.contains("field 'host_key' must be a string"), "{err:#}");

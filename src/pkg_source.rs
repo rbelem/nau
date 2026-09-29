@@ -1,15 +1,15 @@
 //! Package source resolution — fetch package definitions from declared inputs.
 //!
-//! Inspired by Nix flake inputs, shuttle supports:
+//! Inspired by Nix flake inputs, nau supports:
 //! - `github:user/repo[/branch]` — shallow clone from GitHub
 //! - `path:/local/directory`     — local filesystem path
 //!
-//! Global inputs (declared at the top of `shuttle.lua` before the return statement)
+//! Global inputs (declared at the top of `nau.lua` before the return statement)
 //! power the package index. Per-snap inputs declare additional sources.
 //!
-//! GitHub URLs are cached in `~/.cache/shuttle/inputs/<hash>/` after a shallow
+//! GitHub URLs are cached in `~/.cache/nau/inputs/<hash>/` after a shallow
 //! clone. Local paths are used directly. If no inputs are configured, a default
-//! input (`github:rbelem/shuttle/main`) is used as fallback so `shuttle build <pkg>`
+//! input (`github:rbelem/nau/main`) is used as fallback so `nau build <pkg>`
 //! works out of the box.
 
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ fn sha256_hex(input: &str) -> String {
 }
 
 /// Default input URL used when no inputs are configured.
-pub const DEFAULT_INPUT_URL: &str = "github:rbelem/shuttle/main";
+pub const DEFAULT_INPUT_URL: &str = "github:rbelem/nau/main";
 
 /// Default input name for the fallback.
 pub const DEFAULT_INPUT_NAME: &str = "packages";
@@ -42,7 +42,7 @@ pub const DEFAULT_INPUT_NAME: &str = "packages";
 /// Home-directory cache root for fetched inputs.
 fn cache_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".cache/shuttle/inputs")
+    PathBuf::from(home).join(".cache/nau/inputs")
 }
 
 /// Cache directory for a github: URL, under an explicit cache root
@@ -194,7 +194,7 @@ fn resolve_input_in(
             if actual != *expected {
                 return Err(miette::miette!(
                     "input '{url}' content changed since lock (lockfile: {expected}, cache: {actual}); \
-                     run 'shuttle lock' or 'shuttle build --update' to refresh the pin"
+                     run 'nau lock' or 'nau build --update' to refresh the pin"
                 ));
             }
         }
@@ -258,7 +258,7 @@ fn clone_github_branch(
 /// Shallow-clone a GitHub repo into a cache directory.
 ///
 /// Race-safe and idempotent: concurrent callers (parallel cargo test
-/// threads, two `shuttle build`s on a cold cache) clone into private
+/// threads, two `nau build`s on a cold cache) clone into private
 /// temp dirs and the winner atomically claims `dest` via rename; losers
 /// reuse the winner's copy, which carries the same content for the same
 /// URL + branch. A stale non-repo directory from an older partial state
@@ -320,7 +320,7 @@ const REFRESH_CLAIM_ATTEMPTS: usize = 3;
 /// instant between the two renames may the path be absent. Fully atomic
 /// reader isolation would need generation directories — deliberately not
 /// built; rename-swap makes the common cases (resolve-then-read,
-/// `shuttle index update` alongside a build) safe.
+/// `nau index update` alongside a build) safe.
 fn claim_branch_slot(clone: &Path, dest: &Path) -> miette::Result<bool> {
     let parent = dest
         .parent()
@@ -348,7 +348,7 @@ fn claim_branch_slot(clone: &Path, dest: &Path) -> miette::Result<bool> {
     }
 }
 
-/// Re-fetch a cached GitHub input (for `shuttle index update`).
+/// Re-fetch a cached GitHub input (for `nau index update`).
 pub fn refresh_input(input: &PackageInput) -> miette::Result<()> {
     refresh_input_in(&cache_root(), input)
 }
@@ -734,7 +734,7 @@ fn ensure_submodules(
 ///
 /// Fail-closed, named:
 /// - the declaration names a submodule the lockfile has no pin for
-///   (declared after locking) — error points at `shuttle lock`;
+///   (declared after locking) — error points at `nau lock`;
 /// - a pinned submodule is missing from the tree, or its content hash
 ///   moved (re-resolution moved it, or it was tampered with) — named
 ///   mismatch error.
@@ -759,7 +759,7 @@ fn verify_submodule_pins(
 /// A submodules-declaring input whose lockfile entry has no submodule pins
 /// at all is unresolved drift (declared after locking); a Named
 /// declaration naming a pin that does not exist is likewise drift. Both
-/// fail closed, pointing at `shuttle lock`.
+/// fail closed, pointing at `nau lock`.
 fn check_declaration_pins(
     declared: Option<&SubmoduleSpec>,
     pins: &HashMap<String, SubmoduleLockEntry>,
@@ -769,7 +769,7 @@ fn check_declaration_pins(
         if spec.active() && pins.is_empty() {
             return Err(miette::miette!(
                 "input '{input_url}' declares submodules but the lockfile has no submodule \
-                 pins; run 'shuttle lock' to record submodule pins"
+                 pins; run 'nau lock' to record submodule pins"
             ));
         }
     }
@@ -780,7 +780,7 @@ fn check_declaration_pins(
             if !pinned {
                 return Err(miette::miette!(
                     "input '{input_url}' declares submodule '{name}' but the lockfile has no \
-                     pin for it; run 'shuttle lock' to record submodule pins"
+                     pin for it; run 'nau lock' to record submodule pins"
                 ));
             }
         }
@@ -808,7 +808,7 @@ fn verify_one_submodule(
     if hash != sub.sha256 {
         return Err(miette::miette!(
             "submodule '{name}' of input '{input_url}' changed since lock \
-             (lockfile: {}, tree: {}); run 'shuttle lock' to refresh",
+             (lockfile: {}, tree: {}); run 'nau lock' to refresh",
             sub.sha256,
             hash
         ));
@@ -996,9 +996,9 @@ static GLOBAL_PATHS: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
 
 /// Initialize global package source paths from a set of inputs.
 ///
-/// Called during `shuttle build` / `shuttle deps` / etc. before any package
+/// Called during `nau build` / `nau deps` / etc. before any package
 /// resolution. If `inputs` is empty, the default input
-/// (`github:rbelem/shuttle/main`) is used. This can be called multiple times —
+/// (`github:rbelem/nau/main`) is used. This can be called multiple times —
 /// later calls override earlier ones (e.g. when a config file specifies inputs).
 pub fn init_global_inputs(inputs: &HashMap<String, PackageInput>) -> miette::Result<()> {
     init_global_inputs_with(inputs, &HashMap::new(), false)
@@ -1140,7 +1140,7 @@ pub fn resolve_pkg(name: &str) -> PkgResult {
 /// doubles as the eval/check stages' resolver entry, and
 /// `SourceResolver::for_build` allowlists the entry file's parent — so the
 /// write target determines the whole require() attack surface. The old
-/// predictable, world-writable `$TMPDIR/shuttle-<name>.lua` made that root
+/// predictable, world-writable `$TMPDIR/nau-<name>.lua` made that root
 /// `/tmp` itself, letting `require("anything")` read any `/tmp/*.lua` into
 /// eval. Here the tempdir is fresh and mode 0700 (created by `tempfile`),
 /// and the definition is created with `create_new` so a pre-planted symlink
@@ -1155,7 +1155,7 @@ pub fn materialize_embedded(content: &str) -> miette::Result<PathBuf> {
 
     let dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create embedded-package temp dir: {e}"))?;
-    let path = dir.path().join("shuttle.lua");
+    let path = dir.path().join("nau.lua");
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1217,7 +1217,7 @@ pub fn resolve_path(name_or_path: &str) -> PathBuf {
 }
 
 /// Iterate over all available package names from all sources.
-/// Used by `shuttle search`.
+/// Used by `nau search`.
 pub fn iter_packages() -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut names = Vec::new();
@@ -1309,17 +1309,17 @@ mod tests {
 
     #[test]
     fn test_resolve_path_contains_slash() {
-        let p = resolve_path("examples/full-system/system-base/shuttle.lua");
+        let p = resolve_path("examples/full-system/system-base/nau.lua");
         assert!(p
             .to_string_lossy()
-            .ends_with("examples/full-system/system-base/shuttle.lua"));
+            .ends_with("examples/full-system/system-base/nau.lua"));
     }
 
     #[test]
-    fn test_cache_root_contains_shuttle() {
+    fn test_cache_root_contains_nau() {
         let root = cache_root();
         let s = root.to_string_lossy();
-        assert!(s.contains(".cache/shuttle/inputs"));
+        assert!(s.contains(".cache/nau/inputs"));
     }
 
     #[test]
@@ -1385,7 +1385,7 @@ mod tests {
     #[test]
     fn test_offline_uncached_input_errors() {
         let input = PackageInput {
-            url: "github:shuttle-test-nonexistent-xyz/nope".into(),
+            url: "github:nau-test-nonexistent-xyz/nope".into(),
             submodules: None,
         };
         let err = resolve_input_with(&input, None, true)
@@ -1504,7 +1504,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (input, pin) = seed_pinned(
             root.path(),
-            "shuttle-test-fixture",
+            "nau-test-fixture",
             "roundtrip",
             "1111111111111111111111111111111111111111",
             b"contents",
@@ -1516,7 +1516,7 @@ mod tests {
             resolved,
             pinned_cache_dir_in(
                 root.path(),
-                "shuttle-test-fixture",
+                "nau-test-fixture",
                 "roundtrip",
                 "1111111111111111111111111111111111111111"
             )
@@ -1528,7 +1528,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (input, pin) = seed_pinned(
             root.path(),
-            "shuttle-test-fixture",
+            "nau-test-fixture",
             "tampered",
             "2222222222222222222222222222222222222222",
             b"original",
@@ -1537,7 +1537,7 @@ mod tests {
         // Tamper with the cached tree after locking.
         let dir = pinned_cache_dir_in(
             root.path(),
-            "shuttle-test-fixture",
+            "nau-test-fixture",
             "tampered",
             "2222222222222222222222222222222222222222",
         );
@@ -1551,7 +1551,7 @@ mod tests {
             "named mismatch error required, got: {err}"
         );
         assert!(
-            err.contains("shuttle build --update"),
+            err.contains("nau build --update"),
             "error must point at the refresh path, got: {err}"
         );
     }
@@ -1562,7 +1562,7 @@ mod tests {
         // Pin exists in the lockfile, but the pinned cache dir is absent —
         // exactly the "inputs absent from cache" offline scenario.
         let input = PackageInput {
-            url: "github:shuttle-test-fixture/absent/main".into(),
+            url: "github:nau-test-fixture/absent/main".into(),
             submodules: None,
         };
         let pin = InputLockEntry {
@@ -1672,7 +1672,7 @@ mod tests {
     // ── Git submodule fixtures (issue #43) ──
 
     /// Create a git repo with one committed file; returns (path, HEAD).
-    /// `allowAnySHA1InWant` so shuttle's shallow fetch-by-sha path works
+    /// `allowAnySHA1InWant` so nau's shallow fetch-by-sha path works
     /// against file:// fixtures the way it does against GitHub.
     fn fixture_repo(base: &Path, name: &str, body: &str) -> (PathBuf, String) {
         let dir = base.join(name);
@@ -1688,8 +1688,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("file.txt"), body).unwrap();
-        git(Some(&dir), &["config", "user.email", "test@shuttle"]).unwrap();
-        git(Some(&dir), &["config", "user.name", "shuttle-test"]).unwrap();
+        git(Some(&dir), &["config", "user.email", "test@nau"]).unwrap();
+        git(Some(&dir), &["config", "user.name", "nau-test"]).unwrap();
         git(
             Some(&dir),
             &["config", "uploadpack.allowAnySHA1InWant", "true"],
@@ -1733,19 +1733,19 @@ mod tests {
     }
 
     /// Install a parent+submodule fixture pair under the test cache root's
-    /// `__repos__/` seam (`github:shuttle-test-fixture/parent`) and return
+    /// `__repos__/` seam (`github:nau-test-fixture/parent`) and return
     /// the input plus both revisions.
     fn seed_submodule_input(
         root: &Path,
         submodules: SubmoduleSpec,
     ) -> (PackageInput, String, String) {
-        let repos = root.join("__repos__/shuttle-test-fixture");
+        let repos = root.join("__repos__/nau-test-fixture");
         std::fs::create_dir_all(&repos).unwrap();
         let (_, parent_rev, sub_rev) =
             fixture_parent_with_submodule(&repos, "parent", "mylib", "vendor/mylib");
         (
             PackageInput {
-                url: "github:shuttle-test-fixture/parent/main".into(),
+                url: "github:nau-test-fixture/parent/main".into(),
                 submodules: Some(submodules),
             },
             parent_rev,
@@ -1777,7 +1777,7 @@ mod tests {
 
         // The tree materialized with the submodule present, and the parent
         // tree hash covers it (hash recorded after initialization).
-        let dir = pinned_cache_dir_in(root.path(), "shuttle-test-fixture", "parent", &parent_rev);
+        let dir = pinned_cache_dir_in(root.path(), "nau-test-fixture", "parent", &parent_rev);
         assert_eq!(
             std::fs::read_to_string(dir.join("vendor/mylib/file.txt")).unwrap(),
             "sub-content\n"
@@ -1802,7 +1802,7 @@ mod tests {
         let resolved = resolve_input_in(root.path(), &input, Some(&entry), true).unwrap();
         assert_eq!(
             resolved,
-            pinned_cache_dir_in(root.path(), "shuttle-test-fixture", "parent", &parent_rev)
+            pinned_cache_dir_in(root.path(), "nau-test-fixture", "parent", &parent_rev)
         );
         assert_eq!(
             std::fs::read_to_string(resolved.join("vendor/mylib/file.txt")).unwrap(),
@@ -1878,11 +1878,11 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         // A plain parent repo: no .gitmodules at the pinned rev.
-        let repos = root.path().join("__repos__/shuttle-test-fixture");
+        let repos = root.path().join("__repos__/nau-test-fixture");
         std::fs::create_dir_all(&repos).unwrap();
         fixture_repo(&repos, "parent", "plain\n");
         let input = PackageInput {
-            url: "github:shuttle-test-fixture/parent/main".into(),
+            url: "github:nau-test-fixture/parent/main".into(),
             submodules: Some(SubmoduleSpec::All(true)),
         };
 
@@ -1905,7 +1905,7 @@ mod tests {
         let entry = lock_input_entry_in(root.path(), &input).unwrap();
 
         // Tamper INSIDE the materialized submodule tree after locking.
-        let dir = pinned_cache_dir_in(root.path(), "shuttle-test-fixture", "parent", &parent_rev);
+        let dir = pinned_cache_dir_in(root.path(), "nau-test-fixture", "parent", &parent_rev);
         std::fs::write(dir.join("vendor/mylib/file.txt"), b"tampered").unwrap();
 
         let err = resolve_input_in(root.path(), &input, Some(&entry), false)
@@ -1942,7 +1942,7 @@ mod tests {
             "named missing-pin error required, got: {err}"
         );
         assert!(
-            err.contains("shuttle lock"),
+            err.contains("nau lock"),
             "error must point at the re-lock path, got: {err}"
         );
     }
@@ -1958,7 +1958,7 @@ mod tests {
 
         // Tamper with a PARENT file (outside every submodule): the parent
         // tree-hash check catches what submodule verification passed over.
-        let dir = pinned_cache_dir_in(root.path(), "shuttle-test-fixture", "parent", &parent_rev);
+        let dir = pinned_cache_dir_in(root.path(), "nau-test-fixture", "parent", &parent_rev);
         std::fs::write(dir.join("file.txt"), b"tampered").unwrap();
         let err = resolve_input_in(root.path(), &input, Some(&entry), false)
             .unwrap_err()
@@ -1993,14 +1993,14 @@ mod tests {
     /// Seed a branch fixture repo under the cache root's `__repos__/`
     /// seam; returns (repo dir, HEAD sha).
     fn seed_branch_fixture(root: &Path, name: &str, body: &str) -> (PathBuf, String) {
-        let repos = root.join("__repos__/shuttle-test-fixture");
+        let repos = root.join("__repos__/nau-test-fixture");
         std::fs::create_dir_all(&repos).unwrap();
         fixture_repo(&repos, name, body)
     }
 
     fn branch_input(name: &str) -> PackageInput {
         PackageInput {
-            url: format!("github:shuttle-test-fixture/{name}/main"),
+            url: format!("github:nau-test-fixture/{name}/main"),
             submodules: None,
         }
     }
@@ -2012,8 +2012,7 @@ mod tests {
 
         refresh_input_in(root.path(), &branch_input("refresh-empty")).unwrap();
 
-        let dest =
-            github_cache_dir_in(root.path(), "shuttle-test-fixture", "refresh-empty", "main");
+        let dest = github_cache_dir_in(root.path(), "nau-test-fixture", "refresh-empty", "main");
         assert_eq!(dir_head(&dest).as_deref(), Some(rev.as_str()));
         assert_eq!(
             std::fs::read_to_string(dest.join("file.txt")).unwrap(),
@@ -2045,8 +2044,7 @@ mod tests {
 
         refresh_input_in(root.path(), &branch_input("refresh-stale")).unwrap();
 
-        let dest =
-            github_cache_dir_in(root.path(), "shuttle-test-fixture", "refresh-stale", "main");
+        let dest = github_cache_dir_in(root.path(), "nau-test-fixture", "refresh-stale", "main");
         assert_eq!(
             dir_head(&dest).as_deref(),
             Some(rev2.as_str()),

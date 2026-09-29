@@ -34,7 +34,7 @@ for building GCC, MPFR, and MPC.]],
             './configure --prefix=/usr CFLAGS="-O2 -std=gnu17" && make && make install DESTDIR=$STAGE',
             -- libtool drops .la metadata next to the libraries carrying
             -- absolute build-time paths (dependency_libs embeds the sandbox
-            -- LDFLAGS, -L/shuttle-build-prefix/usr/lib); nothing in the pool
+            -- LDFLAGS, -L/nau-build-prefix/usr/lib); nothing in the pool
             -- consumes libtool archives at runtime, so strip them from the
             -- payload rather than ship build-host paths (libstdcpp/curl
             -- precedent).

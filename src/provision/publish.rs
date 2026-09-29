@@ -21,11 +21,11 @@
 //! - On first boot the guest POSTs one JSON payload
 //!   (`{"machine_identity", "public_key", "instance_identity"}`) to the
 //!   callback URL with `Authorization: Bearer <token>`. The URL is
-//!   operator-supplied (`SHUTTLE_PUBLISH_URL`) — provider-independent,
+//!   operator-supplied (`NAU_PUBLISH_URL`) — provider-independent,
 //!   so one shape serves all five clouds. A TLS-terminating front that
 //!   hands the payload + bearer token to [`crate::provision::workers_main`]'s
 //!   `receive-publish` verb (payload on stdin, token in
-//!   `SHUTTLE_PUBLISH_TOKEN`) completes the channel in front of the
+//!   `NAU_PUBLISH_TOKEN`) completes the channel in front of the
 //!   pending store; the in-tree listener is sub-task 3's surface (it must
 //!   exist before issuance anyway, and the pending store decouples the
 //!   fire-and-forget publish from issuance consumption).
@@ -49,29 +49,29 @@
 //!
 //! ## Pending store (persisted; sub-task 3 consumes exactly this)
 //!
-//! - `<home>/.config/shuttle/ca/pending/` — 0700, under the CA's
+//! - `<home>/.config/nau/ca/pending/` — 0700, under the CA's
 //!   dedicated root (NEVER `keys/` — the sub-task-1 contract keeps the CA
 //!   flow out of the manifest keychain): one
 //!   `pending-<machine-identity>.json` entry per enrolled machine
 //!   (public half + instance identity + receipt), the intake queue
 //!   issuance signs from.
-//! - `<home>/.config/shuttle/ca/pending/tokens.json` — 0600, the one-time
+//! - `<home>/.config/nau/ca/pending/tokens.json` — 0600, the one-time
 //!   token registry. Tokens are stored SHA-256-hashed (a leaked registry
 //!   must not leak live bearers), each bound to its machine identity with
 //!   issue/consume stamps; one-time-ness is enforced by the consume
 //!   stamp, expiry by [`PUBLISH_TOKEN_TTL_SECS`].
 //! - **Issuance + delivery back (#295 sub-task 3)**: the operator (or
-//!   the provisioner loop) runs `shuttle workers issue` — the host CA
+//!   the provisioner loop) runs `nau workers issue` — the host CA
 //!   signs a SHORT-LIVED certificate per pending entry behind the
 //!   [`crate::command::CommandRunner`] seam (`ssh-keygen -s <ca> -h -I
 //!   <identity> -n <principals> -V <validity>`), principals bind the
 //!   machine identity PLUS the provider instance-identity content
 //!   (Decision 3's rule; default validity [`HOST_CERT_VALIDITY_DEFAULT`],
 //!   overridable at the verb), and the entry moves to
-//!   `<home>/.config/shuttle/ca/issued/issued-<identity>.json` — the
+//!   `<home>/.config/nau/ca/issued/issued-<identity>.json` — the
 //!   audit record, not a deletion. Delivery back is the pickup half of
 //!   the SAME channel: the guest GETs the callback URL with the SAME
-//!   one-time bearer and receives its certificate (`shuttle workers
+//!   one-time bearer and receives its certificate (`nau workers
 //!   pickup` is the transport binding). **Trust argument**: a host
 //!   certificate is PUBLIC material — sshd serves it to every client
 //!   that connects — so the channel residual class (ADR-0045's
@@ -99,7 +99,7 @@ pub const PUBLISH_TOKEN_TTL_SECS: u64 = 86_400;
 /// Token entropy: 32 bytes → 64 hex chars.
 const TOKEN_BYTES: usize = 32;
 
-/// The pending store root: `<home>/.config/shuttle/ca/pending/`.
+/// The pending store root: `<home>/.config/nau/ca/pending/`.
 pub fn pending_dir(home: &Path) -> PathBuf {
     crate::ca::ca_dir(home).join("pending")
 }
@@ -110,7 +110,7 @@ fn registry_path(home: &Path) -> PathBuf {
 }
 
 /// The machine-linkage store root:
-/// `<home>/.config/shuttle/ca/machines/` — the provision-time record of
+/// `<home>/.config/nau/ca/machines/` — the provision-time record of
 /// which machine identity each pinned workers address belongs to (#295
 /// sub-task 4). The config entry carries only the address and the CA
 /// fingerprint (the amendment's "same config shape"), so this
@@ -246,7 +246,7 @@ pub struct PublishChannel {
 }
 
 /// The machine-identity charset: provider server names are
-/// coordinator-generated (`shuttle-worker-<hex>-NN`); anything outside
+/// coordinator-generated (`nau-worker-<hex>-NN`); anything outside
 /// `[A-Za-z0-9._-]` is refused at BOTH ends (issue + receive), which
 /// also makes the pending filename traversal-proof.
 fn validate_machine_identity(identity: &str) -> miette::Result<()> {
@@ -258,7 +258,7 @@ fn validate_machine_identity(identity: &str) -> miette::Result<()> {
         Ok(())
     } else {
         Err(miette::miette!(
-            "machine identity '{identity}' is not a shuttle server name (expected \
+            "machine identity '{identity}' is not a nau server name (expected \
              [A-Za-z0-9._-] only) — refusing to bind or store it"
         ))
     }
@@ -276,23 +276,23 @@ pub fn validate_publish_url(url: &str) -> miette::Result<()> {
         Ok(())
     } else {
         Err(miette::miette!(
-            "SHUTTLE_PUBLISH_URL must be a single-line http(s):// URL with no whitespace or \
+            "NAU_PUBLISH_URL must be a single-line http(s):// URL with no whitespace or \
              quotes, got '{url}'"
         ))
     }
 }
 
-/// Resolve the publish channel from the environment: `SHUTTLE_PUBLISH_URL`
+/// Resolve the publish channel from the environment: `NAU_PUBLISH_URL`
 /// and `HOME`, read here at the CLI boundary like every other credential
 /// source — the provider cores stay env-free under test.
 pub fn resolve_publish_channel() -> miette::Result<PublishChannel> {
-    let url = std::env::var("SHUTTLE_PUBLISH_URL")
+    let url = std::env::var("NAU_PUBLISH_URL")
         .ok()
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty())
         .ok_or_else(|| {
             miette::miette!(
-                "provision: no publish callback URL — set SHUTTLE_PUBLISH_URL to the \
+                "provision: no publish callback URL — set NAU_PUBLISH_URL to the \
                  coordinator endpoint the guest publishes its public host half to \
                  (https-fronted; the one-time token authenticates each POST). A provision \
                  whose guest cannot publish can never be issued a certificate, so this is \
@@ -645,7 +645,7 @@ pub struct IssuedIdentity {
     pub ca_fingerprint: String,
 }
 
-/// The issued store root: `<home>/.config/shuttle/ca/issued/`.
+/// The issued store root: `<home>/.config/nau/ca/issued/`.
 pub fn issued_dir(home: &Path) -> PathBuf {
     crate::ca::ca_dir(home).join("issued")
 }
@@ -836,7 +836,7 @@ pub fn issue_certificate(
     // issued record.
     let ca = crate::ca::inspect(runner, home)?.ok_or_else(|| {
         miette::miette!(
-            "issue: no host CA at {} — run 'shuttle ca keygen' first; issuance signs with \
+            "issue: no host CA at {} — run 'nau ca keygen' first; issuance signs with \
              its private half (ADR-0045 amendment)",
             crate::ca::ca_secret_path(home).display()
         )
@@ -844,7 +844,7 @@ pub fn issue_certificate(
     if !ca.secret_present {
         return Err(miette::miette!(
             "issue: the host CA's private half {} is missing — its fingerprint is known but \
-             nothing can be signed; restore the keypair or re-key with 'shuttle ca keygen --force'",
+             nothing can be signed; restore the keypair or re-key with 'nau ca keygen --force'",
             crate::ca::ca_secret_path(home).display()
         ));
     }
@@ -1033,7 +1033,7 @@ pub fn issue_identities(
 
 /// The pickup half of the publish channel: the guest GETs the callback
 /// URL with the SAME one-time bearer it published under and receives its
-/// host certificate (`shuttle workers pickup` is the transport binding
+/// host certificate (`nau workers pickup` is the transport binding
 /// a TLS-terminating front drives, symmetric with `receive-publish`).
 /// Pickup is an idempotent READ — the guest polls until the coordinator
 /// signs — and it never mutates state: the one-time-ness of the PUBLISH
@@ -1099,8 +1099,8 @@ mod tests {
     use std::io;
     use std::sync::{Arc, Mutex};
 
-    const FIXTURE_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ shuttle-worker-host-key";
-    const IDENTITY: &str = "shuttle-worker-abc123-01";
+    const FIXTURE_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3UxQ nau-worker-host-key";
+    const IDENTITY: &str = "nau-worker-abc123-01";
 
     fn payload_bytes(identity: &str) -> Vec<u8> {
         serde_json::json!({
@@ -1143,7 +1143,7 @@ mod tests {
             let err = validate_publish_url(url).unwrap_err();
             let msg = format!("{err:#}");
             assert!(
-                msg.contains("SHUTTLE_PUBLISH_URL"),
+                msg.contains("NAU_PUBLISH_URL"),
                 "'{url}' must be a named refusal: {msg}"
             );
         }
@@ -1248,7 +1248,7 @@ mod tests {
         let err = receive_publish(
             home,
             &token,
-            &payload_bytes("shuttle-worker-abc123-02"),
+            &payload_bytes("nau-worker-abc123-02"),
             1_000_030,
         )
         .unwrap_err();
@@ -1299,7 +1299,7 @@ mod tests {
             (
                 "traversal identity",
                 serde_json::json!({
-                    "machine_identity": "../../etc/shuttle",
+                    "machine_identity": "../../etc/nau",
                     "public_key": FIXTURE_PUB,
                     "instance_identity": {"v1": {}}
                 })
@@ -1352,7 +1352,7 @@ mod tests {
     /// The CA halves as the fake harness sees them: the public half is a
     /// real-looking line on disk (`inspect` fingerprints it), the secret
     /// half just has to exist.
-    const CA_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOrZfC0rKJdBX8mUJIKdClRNKdVKmShWU8rjHfDrBKUM shuttle-host-ca";
+    const CA_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOrZfC0rKJdBX8mUJIKdClRNKdVKmShWU8rjHfDrBKUM nau-host-ca";
     const CA_FPR: &str = "SHA256:CAFAKE";
 
     fn ca_on_disk(home: &Path) {
@@ -1404,12 +1404,12 @@ mod tests {
             self.calls.lock().unwrap().push(argv.to_vec());
             if let Some(i) = argv.iter().position(|a| a == "-lf") {
                 let text = std::fs::read_to_string(&argv[i + 1]).unwrap();
-                let fpr = if text.contains("shuttle-host-ca") {
+                let fpr = if text.contains("nau-host-ca") {
                     CA_FPR
                 } else {
                     "SHA256:OTHER"
                 };
-                return Ok(ok_out(&format!("256 {fpr} shuttle-host-ca (ED25519)\n")));
+                return Ok(ok_out(&format!("256 {fpr} nau-host-ca (ED25519)\n")));
             }
             if argv.iter().any(|a| a == "-s") {
                 let mut n = self.sign_calls.lock().unwrap();
@@ -1490,7 +1490,7 @@ mod tests {
         // deliberately not bound).
         assert!(
             sign.windows(2)
-                .any(|w| w == ["-n", "shuttle-worker-abc123-01,i-123,hetzner,hel1"]),
+                .any(|w| w == ["-n", "nau-worker-abc123-01,i-123,hetzner,hel1"]),
             "principal binding: {sign:?}"
         );
         let input = sign.last().unwrap();
@@ -1514,9 +1514,9 @@ mod tests {
             }
         });
         assert_eq!(
-            cert_principals("shuttle-worker-x", &nested).unwrap(),
+            cert_principals("nau-worker-x", &nested).unwrap(),
             vec![
-                "shuttle-worker-x",
+                "nau-worker-x",
                 "i-9",
                 "aws",
                 "eu-central-1",
@@ -1526,20 +1526,20 @@ mod tests {
         );
         // A flat document binds too, and a value equal to the machine
         // identity is deduplicated away.
-        let flat = serde_json::json!({ "instance_id": "shuttle-worker-x", "region": "r1" });
+        let flat = serde_json::json!({ "instance_id": "nau-worker-x", "region": "r1" });
         assert_eq!(
-            cert_principals("shuttle-worker-x", &flat).unwrap(),
-            vec!["shuttle-worker-x", "r1"]
+            cert_principals("nau-worker-x", &flat).unwrap(),
+            vec!["nau-worker-x", "r1"]
         );
         // No instance-identity content at all → named refusal.
-        let err = cert_principals("shuttle-worker-x", &serde_json::json!({"v1": {}})).unwrap_err();
+        let err = cert_principals("nau-worker-x", &serde_json::json!({"v1": {}})).unwrap_err();
         assert!(
             format!("{err:#}").contains("no instance-identity content"),
             "{err:#}"
         );
         // A principal-hostile value is refused, never bound.
         let err = cert_principals(
-            "shuttle-worker-x",
+            "nau-worker-x",
             &serde_json::json!({"v1": {"region": "eu central"}}),
         )
         .unwrap_err();
@@ -1735,7 +1735,7 @@ mod tests {
         assert_eq!(rec.token_sha256, token_fingerprint(&token));
         assert_eq!(
             rec.principals,
-            vec!["shuttle-worker-abc123-01", "i-123", "hetzner", "hel1"]
+            vec!["nau-worker-abc123-01", "i-123", "hetzner", "hel1"]
         );
         assert_eq!(rec.validity, "+48h");
         assert_eq!(rec.issued_at_epoch, 1_000_100);
@@ -1785,7 +1785,7 @@ mod tests {
 
         // A token that never completed a publish has nothing to pick up.
         let virgin = mint_publish_token().unwrap();
-        record_issue(home, &virgin, "shuttle-worker-abc123-02", 1_000_000).unwrap();
+        record_issue(home, &virgin, "nau-worker-abc123-02", 1_000_000).unwrap();
         let err = pickup_certificate(home, &virgin, 1_000_110).unwrap_err();
         assert!(
             format!("{err:#}").contains("never completed a publish"),
@@ -1793,7 +1793,7 @@ mod tests {
         );
 
         // Published but not yet signed → the retryable refusal.
-        let token3 = enrolled_and_published(home, "shuttle-worker-abc123-02");
+        let token3 = enrolled_and_published(home, "nau-worker-abc123-02");
         let err = pickup_certificate(home, &token3, 1_000_110).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("no issued certificate yet"), "{msg}");
@@ -1812,8 +1812,8 @@ mod tests {
     fn batch_issue_processes_every_pending_and_reports_skips() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        enroll_with_ca(home, "shuttle-worker-abc123-01");
-        enroll_with_ca(home, "shuttle-worker-abc123-02");
+        enroll_with_ca(home, "nau-worker-abc123-01");
+        enroll_with_ca(home, "nau-worker-abc123-02");
 
         let report =
             issue_identities(&FakeSigner::new(), home, None, "+48h", false, 1_000_100).unwrap();
@@ -1824,9 +1824,7 @@ mod tests {
         // Crash-window overlap: the pending entry re-appears while the
         // issued record already stands (the write-issued-then-remove-
         // pending ordering makes this the only possible torn state).
-        let rec = issued_entry(home, "shuttle-worker-abc123-01")
-            .unwrap()
-            .unwrap();
+        let rec = issued_entry(home, "nau-worker-abc123-01").unwrap().unwrap();
         let torn = PendingIdentity {
             machine_identity: rec.machine_identity.clone(),
             public_key: rec.public_key.clone(),
@@ -1836,7 +1834,7 @@ mod tests {
         };
         std::fs::create_dir_all(pending_dir(home)).unwrap();
         std::fs::write(
-            pending_dir(home).join("pending-shuttle-worker-abc123-01.json"),
+            pending_dir(home).join("pending-nau-worker-abc123-01.json"),
             serde_json::to_string_pretty(&torn).unwrap(),
         )
         .unwrap();
@@ -1846,15 +1844,12 @@ mod tests {
         let report =
             issue_identities(&FakeSigner::new(), home, None, "+48h", false, 1_000_200).unwrap();
         assert!(report.issued.is_empty());
-        assert_eq!(report.skipped, vec!["shuttle-worker-abc123-01"]);
+        assert_eq!(report.skipped, vec!["nau-worker-abc123-01"]);
         // …and --force re-issues it.
         let report =
             issue_identities(&FakeSigner::new(), home, None, "+48h", true, 1_000_200).unwrap();
         assert_eq!(report.issued.len(), 1);
-        assert_eq!(
-            report.issued[0].machine_identity,
-            "shuttle-worker-abc123-01"
-        );
+        assert_eq!(report.issued[0].machine_identity, "nau-worker-abc123-01");
         assert!(pending_identities(home).unwrap().is_empty());
     }
 }
@@ -1868,7 +1863,7 @@ mod link_tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let address = "ssh://root@203.0.113.9";
-        let path = record_machine_link(home, "shuttle-worker-x-01", address).unwrap();
+        let path = record_machine_link(home, "nau-worker-x-01", address).unwrap();
         assert_eq!(
             path,
             machines_dir(home).join(format!(
@@ -1877,7 +1872,7 @@ mod link_tests {
             ))
         );
         let link = machine_link(home, address).unwrap().expect("linked");
-        assert_eq!(link.machine_identity, "shuttle-worker-x-01");
+        assert_eq!(link.machine_identity, "nau-worker-x-01");
         assert_eq!(link.address, address);
         // A differently-formed address is a different worker: no link.
         assert!(machine_link(home, "ssh://root@203.0.113.10")
@@ -1891,8 +1886,8 @@ mod link_tests {
         let err = record_machine_link(dir.path(), "bad identity!", "ssh://root@203.0.113.9")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("shuttle server name"), "{err}");
-        let err = record_machine_link(dir.path(), "shuttle-worker-x-01", "ssh://ro ot@h")
+        assert!(err.contains("nau server name"), "{err}");
+        let err = record_machine_link(dir.path(), "nau-worker-x-01", "ssh://ro ot@h")
             .unwrap_err()
             .to_string();
         assert!(err.contains("malformed address"), "{err}");
@@ -1904,7 +1899,7 @@ mod link_tests {
     fn machine_link_corrupt_record_is_a_named_refusal_not_a_guess() {
         let dir = tempfile::tempdir().unwrap();
         let address = "ssh://root@203.0.113.9";
-        record_machine_link(dir.path(), "shuttle-worker-x-01", address).unwrap();
+        record_machine_link(dir.path(), "nau-worker-x-01", address).unwrap();
         let path = machine_link_path(dir.path(), address);
         std::fs::write(&path, "{not json").unwrap();
         let err = machine_link(dir.path(), address).unwrap_err().to_string();

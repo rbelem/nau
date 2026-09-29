@@ -1,8 +1,8 @@
-# shuttle DSL prelude (ADR-0009 spike).
+# nau DSL prelude (ADR-0009 spike).
 #
 # Authored definitions never import this file: the HOST merges it into every
 # program as an in-memory input (the "wrap" of Decision 2 — the enforcement
-# point is shuttle's wrap, never the author's annotation).
+# point is nau's wrap, never the author's annotation).
 #
 # All machinery fields are `not_exported`, so eval_full_for_export yields the
 # pure data record for serde extraction (Decision 3).

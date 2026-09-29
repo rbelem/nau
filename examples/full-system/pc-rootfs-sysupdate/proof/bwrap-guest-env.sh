@@ -27,9 +27,9 @@ bwrap \
   --ro-bind "$NIX_SRC/libmount.so.1" "$ULIB/lib/libmount.so.1" \
   --ro-bind "$NIX_SRC/libsmartcols.so.1" "$ULIB/lib/libsmartcols.so.1" \
   --ro-bind "$NIX_SRC/libuuid.so.1" "$ULIB/lib/libuuid.so.1" \
-  --ro-bind "$HOME/.cache/shuttle-80/curl-libs-test/libcurl.so.4" "/nix/store/x4xicianwlchh2cadblv4pfz8syvl97b-curl-8.21.0/lib/libcurl.so.4" \
-  --ro-bind "$HOME/.cache/shuttle-80/usrlib-systemd/curl-libs" "/nix/store/x4xicianwlchh2cadblv4pfz8syvl97b-curl-8.21.0/../curl-test-libs" \
-  --ro-bind "$HOME/.cache/shuttle-80/curl-libs-test" /opt/curl-libs \
+  --ro-bind "$HOME/.cache/nau-80/curl-libs-test/libcurl.so.4" "/nix/store/x4xicianwlchh2cadblv4pfz8syvl97b-curl-8.21.0/lib/libcurl.so.4" \
+  --ro-bind "$HOME/.cache/nau-80/usrlib-systemd/curl-libs" "/nix/store/x4xicianwlchh2cadblv4pfz8syvl97b-curl-8.21.0/../curl-test-libs" \
+  --ro-bind "$HOME/.cache/nau-80/curl-libs-test" /opt/curl-libs \
   --ro-bind /tmp/pull /opt/systemd-pull-under-test \
   --ro-bind "$NIX_SRC/systemd-sysupdate" /opt/systemd-sysupdate \
   "$@"

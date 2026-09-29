@@ -24,7 +24,7 @@ used by configure scripts to generate platform-specific Makefiles.]],
             -- same version pin. The tree lib/ (Automake::Config et al)
             -- covers make-time doc generation, and the automake share
             -- dir covers post-install aclocal runs in the same build.
-            'export PERL5LIB="$PWD/lib:$SHUTTLE_BUILD_PREFIX/usr/share/automake-1.17:$SHUTTLE_BUILD_PREFIX/usr/lib/perl5/5.40.5:$SHUTTLE_BUILD_PREFIX/usr/lib/perl5/5.40.5/x86_64-linux-thread-multi"',
+            'export PERL5LIB="$PWD/lib:$NAU_BUILD_PREFIX/usr/share/automake-1.17:$NAU_BUILD_PREFIX/usr/lib/perl5/5.40.5:$NAU_BUILD_PREFIX/usr/lib/perl5/5.40.5/x86_64-linux-thread-multi"',
             "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
             -- The aclocal/automake drivers carry their perl lib dir
             -- (@datadir@/@PACKAGE@-@VERSION@) as a real-root path; wrap
@@ -75,6 +75,6 @@ used by configure scripts to generate platform-specific Makefiles.]],
         -- @PERL@/@AUTOM4TE@/@pkgdatadir@ substitutions resolve into the
         -- merged build prefix). Text references, silenced with the bare
         -- prefix entry, pending the RUNPATH repair (issue #22).
-        leaks_ok = { "/shuttle-build-prefix" },
+        leaks_ok = { "/nau-build-prefix" },
     },
 }

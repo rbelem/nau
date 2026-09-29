@@ -1,7 +1,7 @@
-# Floor-tool manifest (issue #101 disposition (c)): the tools shuttle
+# Floor-tool manifest (issue #101 disposition (c)): the tools nau
 # self-provisions so the pod surface works from a plain login shell.
 #
-# Threat model: root of trust is the git repo, same as the shuttle binary
+# Threat model: root of trust is the git repo, same as the nau binary
 # itself. sha256 pins bytes, not provenance.
 #
 # tools_version is monotonic — bump on any tool-set change; installed sets
@@ -16,7 +16,7 @@
 # name = "mksquashfs"                # mksquashfs | unsquashfs | bwrap | tar | curl
 # version = "4.7.2"
 # triple = "x86_64-linux-musl"
-# url = "https://example.invalid/shuttle-tools/1/mksquashfs-x86_64-linux-musl"
+# url = "https://example.invalid/nau-tools/1/mksquashfs-x86_64-linux-musl"
 # sha256_hex = "64 hex chars over the exact artifact bytes"
 # source_url = "https://example.invalid/source"   # license/source offer
 # license = "GPL-2.0+"

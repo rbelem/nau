@@ -21,7 +21,7 @@
 --             named fix; covered by unit tests and a live negative run)
 --
 -- Build:
---   shuttle build --file test-fixtures/toolchain-cgo-probe.lua
+--   nau build --file test-fixtures/toolchain-cgo-probe.lua
 
 return {
     default = snap {
@@ -71,8 +71,8 @@ return {
             "set -x",
             -- Sandbox wiring (issue #44): the pool toolchain and
             -- pkg-config shadow the host; CC/CXX name the pool driver.
-            "test \"$(command -v gcc)\" = /shuttle-build-prefix/usr/bin/gcc",
-            "test \"$(command -v pkg-config)\" = /shuttle-build-prefix/usr/bin/pkg-config",
+            "test \"$(command -v gcc)\" = /nau-build-prefix/usr/bin/gcc",
+            "test \"$(command -v pkg-config)\" = /nau-build-prefix/usr/bin/pkg-config",
             -- Go env (cgo side of the contract): the sandbox exports
             -- CGO_ENABLED=1 (this recipe's declaration) and CC resolves
             -- to the pool gcc for the C half of the build.
@@ -84,10 +84,10 @@ return {
             -- sysroot-rewritten .pc paths. Note --cflags is EMPTY by
             -- design: pkg-config filters default include dirs
             -- (-I/usr/include), and the headers are consumed through the
-            -- pool gcc's own baked sysroot (/shuttle-build-prefix) — the
+            -- pool gcc's own baked sysroot (/nau-build-prefix) — the
             -- --libs -L proves the sysroot rewrite is live.
             "pkg-config --modversion libffi | grep -q '^3\\.'",
-            "pkg-config --libs libffi | grep -q 'shuttle-build-prefix/usr/lib'",
+            "pkg-config --libs libffi | grep -q 'nau-build-prefix/usr/lib'",
             "pkg-config --libs libffi | grep -q -- '-lffi'",
             -- The cgo consumer: C half calls libffi, discovered via the
             -- #cgo pkg-config directive (cgo execs `pkg-config --cflags/
@@ -102,7 +102,7 @@ return {
             -- Smoke: RUN it in-sandbox against the prefix libffi (the
             -- loader resolves libc from the sandbox's system binds;
             -- libffi stages into usr/lib64 — hence both dirs).
-            "LD_LIBRARY_PATH=$SHUTTLE_BUILD_PREFIX/usr/lib:$SHUTTLE_BUILD_PREFIX/usr/lib64 ./cgoprobe | grep -q 'libffi default ABI'",
+            "LD_LIBRARY_PATH=$NAU_BUILD_PREFIX/usr/lib:$NAU_BUILD_PREFIX/usr/lib64 ./cgoprobe | grep -q 'libffi default ABI'",
             -- Stage it: the leak scan now verifies the closure split on a
             -- real ELF (libffi.so.8/libc.so.6 → requires payloads), and
             -- the snap ships a runnable app.

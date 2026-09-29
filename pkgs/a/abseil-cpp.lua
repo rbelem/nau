@@ -15,7 +15,7 @@
 -- Nix:       pkgs.abseil-cpp (cmake build; nixpkgs turns shared on)
 -- Snapcraft: no upstream recipe; distros carry it as a build
 --            dependency, not a user-facing snap
--- Shuttle:   declarative Lua — CMake source build via the sandbox
+-- Nau:   declarative Lua — CMake source build via the sandbox
 --            toolchain, static archives (upstream default).
 --
 -- Port strategy: upstream default flags — static libraries
@@ -74,7 +74,7 @@ return {
         build = table.concat({
             "cmake -S $SRC -B $SRC/build -G Ninja "
                 .. "-DCMAKE_BUILD_TYPE=Release "
-                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_PREFIX_PATH=$NAU_BUILD_PREFIX/usr "
                 .. "-DCMAKE_INSTALL_PREFIX=/usr "
                 .. "-DCMAKE_INSTALL_LIBDIR=lib "
                 .. "-DCMAKE_POSITION_INDEPENDENT_CODE=ON "
@@ -96,11 +96,11 @@ return {
         -- the file is not consulted. Silenced by reference, not by
         -- file.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
             -- Text-leak references carry the BARE prefix marker
             -- (leak_scan record() matches the reference exactly).
-            "/shuttle-build-prefix",
+            "/nau-build-prefix",
         },
     },
 }

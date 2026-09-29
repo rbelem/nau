@@ -1,4 +1,4 @@
--- Daemon/service templates for shuttle packages.
+-- Daemon/service templates for nau packages.
 -- app() returns an app config table, service() a service definition —
 -- both suitable for merge().
 --

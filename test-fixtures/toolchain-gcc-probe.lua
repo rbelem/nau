@@ -9,7 +9,7 @@
 -- against the prefix glibc.
 --
 -- Build:
---   shuttle build --file test-fixtures/toolchain-gcc-probe.lua
+--   nau build --file test-fixtures/toolchain-gcc-probe.lua
 
 return {
     default = snap {

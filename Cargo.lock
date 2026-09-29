@@ -1723,6 +1723,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "nau"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "cc",
+ "clap",
+ "clap_complete",
+ "dbus-secret-service",
+ "ed25519-dalek",
+ "flate2",
+ "full_moon",
+ "indicatif",
+ "libc",
+ "mdns-sd",
+ "miette",
+ "mlua",
+ "owo-colors",
+ "pgp",
+ "rand",
+ "rsa",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sha3",
+ "tar",
+ "tempfile",
+ "toml",
+ "ureq",
+ "xz2",
+ "zip",
+]
+
+[[package]]
 name = "nom"
 version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2582,40 +2616,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "shuttle"
-version = "0.1.0"
-dependencies = [
- "base64",
- "cc",
- "clap",
- "clap_complete",
- "dbus-secret-service",
- "ed25519-dalek",
- "flate2",
- "full_moon",
- "indicatif",
- "libc",
- "mdns-sd",
- "miette",
- "mlua",
- "owo-colors",
- "pgp",
- "rand",
- "rsa",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "sha3",
- "tar",
- "tempfile",
- "toml",
- "ureq",
- "xz2",
- "zip",
-]
 
 [[package]]
 name = "signature"

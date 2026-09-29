@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# E2E test for scripts/shuttle-cache-publish (ticket #270) against the
-# auth-exempt stub scripts/shuttle-cache-publish-stub.py.
+# E2E test for scripts/nau-cache-publish (ticket #270) against the
+# auth-exempt stub scripts/nau-cache-publish-stub.py.
 #
 # Proves, locally:
 #   - walk order: every blob op before any manifest op; per blob
@@ -23,14 +23,14 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-PUB=$SCRIPT_DIR/shuttle-cache-publish
-STUB=$SCRIPT_DIR/shuttle-cache-publish-stub.py
+PUB=$SCRIPT_DIR/nau-cache-publish
+STUB=$SCRIPT_DIR/nau-cache-publish-stub.py
 
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 command -v openssl >/dev/null || { echo "openssl required (SigV4 chain)"; exit 1; }
 command -v curl >/dev/null || { echo "curl required"; exit 1; }
 
-TMP=$(mktemp -d "${TMPDIR:-/tmp}/shuttle-cache-publish-test.XXXXXX")
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/nau-cache-publish-test.XXXXXX")
 STUB_PID=
 cleanup() {
     [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null || true
@@ -51,13 +51,13 @@ done
 [ -s "$PORTFILE" ] || { echo "stub did not start"; exit 1; }
 PORT=$(cat "$PORTFILE")
 
-export SHUTTLE_CACHE_S3_ACCESS_KEY=stub-access-key
-export SHUTTLE_CACHE_S3_SECRET_KEY=stub-secret-do-not-print-9f86d081884c7d65
-export SHUTTLE_CACHE_S3_ENDPOINT="http://127.0.0.1:$PORT"
-export SHUTTLE_CACHE_S3_BUCKET=shuttle-test-bucket
-export SHUTTLE_CACHE_S3_REGION=us-east-1
-BUCKET=$SHUTTLE_CACHE_S3_BUCKET
-SECRET=$SHUTTLE_CACHE_S3_SECRET_KEY
+export NAU_CACHE_S3_ACCESS_KEY=stub-access-key
+export NAU_CACHE_S3_SECRET_KEY=stub-secret-do-not-print-9f86d081884c7d65
+export NAU_CACHE_S3_ENDPOINT="http://127.0.0.1:$PORT"
+export NAU_CACHE_S3_BUCKET=nau-test-bucket
+export NAU_CACHE_S3_REGION=us-east-1
+BUCKET=$NAU_CACHE_S3_BUCKET
+SECRET=$NAU_CACHE_S3_SECRET_KEY
 
 PASS=0
 FAIL=0
@@ -139,7 +139,7 @@ check "blob bytes stored verbatim" cmp -s "$TREE/blobs/1111111111111111111111111
 check "manifest bytes stored verbatim" cmp -s "$TREE/cache/dead22222222222222222222222222222222222222222222222222222222222.json" "$STORE/$BUCKET/cache/dead22222222222222222222222222222222222222222222222222222222222.json"
 
 echo "scenario 2: SigV4 signature cross-check (independent python reimplementation)"
-python3 - "$TMP/s1.jsonl" "$SHUTTLE_CACHE_S3_ENDPOINT" <<'EOF'
+python3 - "$TMP/s1.jsonl" "$NAU_CACHE_S3_ENDPOINT" <<'EOF'
 import hashlib, hmac, json, os, sys
 from urllib.parse import urlsplit
 
@@ -147,9 +147,9 @@ ops = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 put = next(o for o in ops if o["method"] == "PUT" and o["authorization"])
 u = urlsplit(sys.argv[2])
 host = u.netloc
-secret = os.environ["SHUTTLE_CACHE_S3_SECRET_KEY"]
-access = os.environ["SHUTTLE_CACHE_S3_ACCESS_KEY"]
-region = os.environ["SHUTTLE_CACHE_S3_REGION"]
+secret = os.environ["NAU_CACHE_S3_SECRET_KEY"]
+access = os.environ["NAU_CACHE_S3_ACCESS_KEY"]
+region = os.environ["NAU_CACHE_S3_REGION"]
 amz = put["x_amz_date"]
 day = amz.split("T")[0]
 signed = "host;x-amz-content-sha256;x-amz-date"
@@ -242,13 +242,13 @@ check "failure names the object and status" grep -qF "FAIL      blobs/evil.failp
 check "summary reports 1 failed" grep -qF "0 uploaded, 0 skipped, 0 conflicts, 1 failed" "$OUT"
 
 echo "scenario 8: endpoint with a path is rejected (no silent wrong-prefix publish)"
-SAVED_EP=$SHUTTLE_CACHE_S3_ENDPOINT
-export SHUTTLE_CACHE_S3_ENDPOINT="$SAVED_EP/prefix"
+SAVED_EP=$NAU_CACHE_S3_ENDPOINT
+export NAU_CACHE_S3_ENDPOINT="$SAVED_EP/prefix"
 run_pub "$TREE"
 check "nonzero exit on endpoint with path" test "$RC" -ne 0
 check "error names the endpoint constraint" grep -qF "no path or query" "$ERR"
-export SHUTTLE_CACHE_S3_ENDPOINT="$SAVED_EP"
+export NAU_CACHE_S3_ENDPOINT="$SAVED_EP"
 
 echo
-echo "shuttle-cache-publish-test: $PASS passed, $FAIL failed"
+echo "nau-cache-publish-test: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

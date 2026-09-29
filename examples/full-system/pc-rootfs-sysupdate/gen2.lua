@@ -10,18 +10,18 @@
 -- so the ext4 root, its dm-verity roothash, and both derived partition
 -- GUIDs all differ. Observable in the boot: the proof unit's
 -- Description says generation 2, and the ESP gains
--- shuttle-80_2.0+3-0.efi with the tries suffix sysupdate wrote.
+-- nau-80_2.0+3-0.efi with the tries suffix sysupdate wrote.
 --
 -- This variant FAILS the health gate (`/bin/false`): the counted UKI is
--- never blessed, so the counters freeze in place and `shuttle test
+-- never blessed, so the counters freeze in place and `nau test
 -- --runs 2 --expect-counter-seq 3-0,2-1` can machine-assert the loader's
 -- +3-0 -> +2-1 bump. The bless/clear ceremony is gen2-bless.lua's job.
 --
--- Build: shuttle image --file gen2.lua --arch amd64 --output "$OUT/gen2"
+-- Build: nau image --file gen2.lua --arch amd64 --output "$OUT/gen2"
 
 return {
     rootfs = image {
-        name = "shuttle-80",
+        name = "nau-80",
         version = "2.0",
 
         base = index("core22"),
@@ -36,8 +36,8 @@ return {
                 -- has no sysupdate binary; gen1's wants list is
                 -- deliberately not inherited here) — only the proof and
                 -- poweroff oneshots.
-                "systemd.wants=shuttle-80-proof.service",
-                "systemd.wants=shuttle-80-poweroff.service",
+                "systemd.wants=nau-80-proof.service",
+                "systemd.wants=nau-80-poweroff.service",
             },
             modules = {
                 "nvme",
@@ -103,8 +103,8 @@ return {
         boot_health_exec = "/bin/false",
 
         files = {
-            { source = "proof/gen2/shuttle-80-proof.service", dest = "/etc/systemd/system/shuttle-80-proof.service" },
-            { source = "proof/poweroff.service",              dest = "/etc/systemd/system/shuttle-80-poweroff.service" },
+            { source = "proof/gen2/nau-80-proof.service", dest = "/etc/systemd/system/nau-80-proof.service" },
+            { source = "proof/poweroff.service",              dest = "/etc/systemd/system/nau-80-poweroff.service" },
             { source = "proof/gen2/generation",               dest = "/etc/generation" },
         },
     },

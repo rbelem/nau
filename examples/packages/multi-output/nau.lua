@@ -1,6 +1,6 @@
 -- multi-output: One file, multiple snaps
 --
--- Demonstrates the multi-output structure: a single shuttle.lua declares
+-- Demonstrates the multi-output structure: a single nau.lua declares
 -- multiple snaps, each with its own name, version, apps, and build
 -- configuration. Build them all at once or select specific outputs.
 --
@@ -8,13 +8,13 @@
 --   return { server = snap { ... }, cli    = snap { ... } }
 --
 -- Usage:
---   shuttle build --file examples/packages/multi-output/shuttle.lua
+--   nau build --file examples/packages/multi-output/nau.lua
 --   → builds both server and cli snaps
 --
---   shuttle build --file examples/packages/multi-output/shuttle.lua server
+--   nau build --file examples/packages/multi-output/nau.lua server
 --   → builds only the server snap
 --
---   shuttle build --file examples/packages/multi-output/shuttle.lua --order
+--   nau build --file examples/packages/multi-output/nau.lua --order
 --   → shows build order for all outputs
 
 return {

@@ -3,7 +3,7 @@
 //! The pod surface (`mksquashfs`, `unsquashfs`, `bwrap`, `tar`, `curl`) is
 //! absent from a fresh post-cutover login PATH, and pod-provided tools
 //! cannot cold-start (the squashfs unpacker cannot ride inside the thing
-//! it unpacks). This module is the rustup pattern: shuttle fetches pinned,
+//! it unpacks). This module is the rustup pattern: nau fetches pinned,
 //! statically-linked tool binaries into a versioned tools root and
 //! resolves them ahead of PATH.
 //!
@@ -24,8 +24,8 @@
 //! Per-tool, explicit: everything resolves provisioned-dir-first with PATH
 //! fallback, except `curl`, which resolves PATH-first (host network
 //! fidelity beats version fidelity for the one tool that lives behind
-//! corporate NSS/LDAP directories and custom CA bundles). `SHUTTLE_TOOLS_DIR`
-//! relocates the root; `SHUTTLE_TOOL_<UPPERNAME>` pins one tool to an exact
+//! corporate NSS/LDAP directories and custom CA bundles). `NAU_TOOLS_DIR`
+//! relocates the root; `NAU_TOOL_<UPPERNAME>` pins one tool to an exact
 //! path.
 //!
 //! Resolution stats only — it never executes anything, so it is safe
@@ -36,7 +36,7 @@
 //! # No silent fallback mid-build
 //!
 //! [`ensure`] is the build-path entry: for provisioned-first tools it
-//! accepts ONLY the provisioned set and points at `shuttle doctor --fix`
+//! accepts ONLY the provisioned set and points at `nau doctor --fix`
 //! otherwise. Provisioning is never invoked implicitly during resolution;
 //! the two operations stay separate.
 //!
@@ -46,7 +46,7 @@
 //! (fail closed, expected vs actual named) and then exec-tested
 //! (`--version`) BEFORE it moves into place. An EACCES/EPERM at the probe
 //! means the tools directory is likely mounted noexec — the diagnostic
-//! names it and prints the `SHUTTLE_TOOLS_DIR` workaround, failing closed
+//! names it and prints the `NAU_TOOLS_DIR` workaround, failing closed
 //! at provision time rather than at first build (Yocto's checksum-ok-≠-runs
 //! landmine).
 //!
@@ -54,7 +54,7 @@
 //!
 //! The manifest is compiled into this binary from `tools-manifest.toml`
 //! (`include_str!`) — the git repo is the root of trust, same as the
-//! shuttle binary itself. sha256 pins bytes, not provenance; per-tool
+//! nau binary itself. sha256 pins bytes, not provenance; per-tool
 //! `source_url` carries the license/source offer (mere aggregation — no
 //! embedding).
 
@@ -79,9 +79,9 @@ const CURRENT: &str = "current";
 /// verified set for one manifest, not a partial leftover of a crashed run.
 const STAMP: &str = ".stamp";
 /// Tools-root default under `$HOME` (Linux-only project; matches the XDG
-/// data location precedent of shuttle's own config handling).
-const DEFAULT_ROOT_SUFFIX: &str = ".local/share/shuttle/tools";
-const ENV_TOOLS_DIR: &str = "SHUTTLE_TOOLS_DIR";
+/// data location precedent of nau's own config handling).
+const DEFAULT_ROOT_SUFFIX: &str = ".local/share/nau/tools";
+const ENV_TOOLS_DIR: &str = "NAU_TOOLS_DIR";
 /// Provisioning moves a few MB total; generous body ceiling, short
 /// connect fail-fast.
 pub(crate) const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -128,9 +128,9 @@ impl ToolName {
         }
     }
 
-    /// Per-tool resolution override: `SHUTTLE_TOOL_<UPPERNAME>`.
+    /// Per-tool resolution override: `NAU_TOOL_<UPPERNAME>`.
     pub fn env_var(&self) -> String {
-        format!("SHUTTLE_TOOL_{}", self.as_str().to_uppercase())
+        format!("NAU_TOOL_{}", self.as_str().to_uppercase())
     }
 
     /// Policy default when the manifest carries no spec for the tool:
@@ -260,7 +260,7 @@ pub enum ToolsError {
         actual: String,
     },
     /// EACCES/EPERM running the exec probe: the tools root is likely on a
-    /// noexec mount. Names the cause and the `SHUTTLE_TOOLS_DIR` workaround.
+    /// noexec mount. Names the cause and the `NAU_TOOLS_DIR` workaround.
     Noexec {
         tool: String,
         path: PathBuf,
@@ -291,9 +291,9 @@ impl fmt::Display for ToolsError {
             ToolsError::Noexec { tool, path, source } => write!(
                 f,
                 "cannot execute staged '{tool}' at {}: {source} — the tools directory is likely \
-                 mounted noexec; relocate it by setting SHUTTLE_TOOLS_DIR to an exec-mounted \
-                 path (e.g. SHUTTLE_TOOLS_DIR=/var/tmp/shuttle-tools) and re-run \
-                 `shuttle doctor --fix`",
+                 mounted noexec; relocate it by setting NAU_TOOLS_DIR to an exec-mounted \
+                 path (e.g. NAU_TOOLS_DIR=/var/tmp/nau-tools) and re-run \
+                 `nau doctor --fix`",
                 path.display()
             ),
             ToolsError::ProbeFailed { tool, detail } => {
@@ -321,7 +321,7 @@ impl std::error::Error for ToolsError {
 // ---------------------------------------------------------------------------
 
 /// The in-tree manifest bytes, compiled into the binary: the git repo is
-/// the root of trust, same as the shuttle binary itself.
+/// the root of trust, same as the nau binary itself.
 pub const MANIFEST_TOML: &str = include_str!("../tools-manifest.toml");
 
 /// Parse manifest bytes. Tolerates an empty tools list (the shipped state
@@ -349,8 +349,8 @@ fn precedence_in(m: &ToolsManifest, name: ToolName) -> Precedence {
         .unwrap_or_else(|| name.default_precedence())
 }
 
-/// The tools root: `SHUTTLE_TOOLS_DIR` override, else
-/// `$HOME/.local/share/shuttle/tools`.
+/// The tools root: `NAU_TOOLS_DIR` override, else
+/// `$HOME/.local/share/nau/tools`.
 fn tools_root_opt() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os(ENV_TOOLS_DIR) {
         return Some(PathBuf::from(dir));
@@ -361,13 +361,13 @@ fn tools_root_opt() -> Option<PathBuf> {
 
 fn tools_root() -> ToolsResult<PathBuf> {
     tools_root_opt().ok_or_else(|| ToolsError::Io {
-        context: "cannot locate the tools root (HOME not set; set SHUTTLE_TOOLS_DIR)".into(),
+        context: "cannot locate the tools root (HOME not set; set NAU_TOOLS_DIR)".into(),
         source: io::Error::new(io::ErrorKind::NotFound, "HOME not set"),
     })
 }
 
 /// Resolve `name` following its manifest precedence, honouring
-/// `SHUTTLE_TOOL_<UPPERNAME>` (which pins the tool to an exact path and
+/// `NAU_TOOL_<UPPERNAME>` (which pins the tool to an exact path and
 /// beats every other rule — a missing or non-executable override fails
 /// loud rather than silently falling back). Stats only.
 pub fn resolve(name: ToolName) -> ToolsResult<ResolvedTool> {
@@ -410,7 +410,7 @@ fn resolve_explicit(
     };
     first.or(second).ok_or_else(|| ToolsError::NotResolved {
         tool: name.as_str().into(),
-        detail: "no provisioned set and no executable on PATH; run `shuttle doctor --fix` \
+        detail: "no provisioned set and no executable on PATH; run `nau doctor --fix` \
                      to provision the floor tools"
             .into(),
     })
@@ -419,7 +419,7 @@ fn resolve_explicit(
 /// The build-path entry point: like [`resolve`] but with the mid-build
 /// failure policy (issue #101 AC-7). For provisioned-first tools it
 /// accepts ONLY the provisioned set — a missing set is a hard error naming
-/// `shuttle doctor --fix`, never a silent PATH fallback. curl (PATH-first)
+/// `nau doctor --fix`, never a silent PATH fallback. curl (PATH-first)
 /// keeps its precedence: PATH, then the provisioned fallback.
 ///
 /// This never invokes the provisioner; resolution and provisioning stay
@@ -444,8 +444,8 @@ fn ensure_explicit(
         .map(|(path, version)| ResolvedTool::Provisioned { path, version })
         .ok_or_else(|| ToolsError::NotResolved {
             tool: name.as_str().into(),
-            detail: "not provisioned; shuttle never falls back to PATH mid-build for \
-                     provisioned-first tools — run `shuttle doctor --fix`"
+            detail: "not provisioned; nau never falls back to PATH mid-build for \
+                     provisioned-first tools — run `nau doctor --fix`"
                 .into(),
         })
 }
@@ -691,7 +691,7 @@ fn stage_verified(spec: &ToolSpec, src: &mut dyn Read, stage_bin: &Path) -> Tool
 /// place. EACCES/EPERM here is the noexec-mount signature (the artifact
 /// bytes are verified — it is the mount that refuses execution): the
 /// [`ToolsError::Noexec`] diagnostic names it and prints the
-/// `SHUTTLE_TOOLS_DIR` workaround, so `doctor --fix` fails closed now
+/// `NAU_TOOLS_DIR` workaround, so `doctor --fix` fails closed now
 /// instead of the first build failing later.
 ///
 /// ETXTBSY is retried briefly: the writable handle is long closed by then,
@@ -816,9 +816,9 @@ mod tests {
     /// statics of the pre-#186 era excluded nothing across modules.
     use crate::test_env::ENV_LOCK;
 
-    /// Points `SHUTTLE_TOOLS_DIR` at a tempdir for the test's lifetime and
+    /// Points `NAU_TOOLS_DIR` at a tempdir for the test's lifetime and
     /// restores the previous value on drop — provision tests must never
-    /// touch the real `$HOME/.local/share/shuttle/tools`.
+    /// touch the real `$HOME/.local/share/nau/tools`.
     struct ToolsDirGuard {
         saved: Option<std::ffi::OsString>,
     }
@@ -1013,7 +1013,7 @@ mod tests {
         let err = resolve(ToolName::Tar);
         std::env::remove_var(ToolName::Tar.env_var());
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("SHUTTLE_TOOL_TAR"), "{msg}");
+        assert!(msg.contains("NAU_TOOL_TAR"), "{msg}");
     }
 
     #[test]
@@ -1146,9 +1146,9 @@ mod tests {
         let _guard = ToolsDirGuard::at(root.path());
 
         // Provisioned-first tool with nothing provisioned: ensure refuses,
-        // naming `shuttle doctor --fix`.
+        // naming `nau doctor --fix`.
         let msg = ensure(ToolName::Mksquashfs).unwrap_err().to_string();
-        assert!(msg.contains("shuttle doctor --fix"), "{msg}");
+        assert!(msg.contains("nau doctor --fix"), "{msg}");
 
         let src = tempfile::tempdir().unwrap();
         write_fake_tool(src.path(), ToolName::Mksquashfs);
@@ -1201,7 +1201,7 @@ mod tests {
 
     /// Provisions `tools` from `src` into an explicit root — the shared
     /// arrange step for tests that must not touch the live env. Requires
-    /// the caller to hold ENV_LOCK (provision reads SHUTTLE_TOOLS_DIR).
+    /// the caller to hold ENV_LOCK (provision reads NAU_TOOLS_DIR).
     fn provision_rooted_fixture(root: &Path, version: u64, tools: &[ToolName], src: &Path) {
         let _guard = ToolsDirGuard::at(root);
         provision_with(
@@ -1220,7 +1220,7 @@ mod tests {
         write_fake_tool(src.path(), ToolName::Mksquashfs);
         provision_rooted_fixture(root.path(), 9, &[ToolName::Mksquashfs], src.path());
 
-        // curl comes from a SHUTTLE_TOOL_* override — module-local env, no
+        // curl comes from a NAU_TOOL_* override — module-local env, no
         // global PATH mutation.
         let pathdir = tempfile::tempdir().unwrap();
         let fake_curl = write_fake_tool(pathdir.path(), ToolName::Curl);
@@ -1249,7 +1249,7 @@ mod tests {
         // Hermetic smoke of the fetch path: port 1 on loopback is refused
         // immediately — no network egress, short timeout.
         let agent = fetch_agent(Duration::from_secs(1), Duration::from_secs(2));
-        let err = match http_get(&agent, "http://127.0.0.1:1/shuttle-tools-fake.bin") {
+        let err = match http_get(&agent, "http://127.0.0.1:1/nau-tools-fake.bin") {
             Err(e) => e,
             Ok(_) => panic!("fetch from a refused port must fail"),
         };

@@ -1,9 +1,9 @@
-//! `shuttle audit` — OSV/CVE scanning over lockfiles (issue #52).
+//! `nau audit` — OSV/CVE scanning over lockfiles (issue #52).
 //!
-//! Shuttle fetches npm/pip/cargo/go dependency closures (ADR-0017), so it
-//! owns a supply chain the Snap Store review does not cover. `shuttle
+//! Nau fetches npm/pip/cargo/go dependency closures (ADR-0017), so it
+//! owns a supply chain the Snap Store review does not cover. `nau
 //! audit` checks every pinned entry of a lockfile — the project's
-//! `shuttle.lock` or a pod's — against the OSV vulnerability database.
+//! `nau.lock` or a pod's — against the OSV vulnerability database.
 //!
 //! # Why a sibling command, not a registry check
 //!
@@ -46,10 +46,10 @@
 //! # Offline-first
 //!
 //! Online, queries go to `POST /v1/querybatch` (curl, one batch per ≤1000
-//! queries) and every per-query response is cached under the shuttle
+//! queries) and every per-query response is cached under the nau
 //! cache dir keyed by the canonical query JSON. Offline, cached responses
 //! still produce findings (tagged with their fetch date); queries with
-//! neither cache nor network degrade to a named `shuttle audit
+//! neither cache nor network degrade to a named `nau audit
 //! --update` warning. Exit 1 only on confirmed findings — an audit that
 //! hard-requires the network, or that fails on a stale database, is an
 //! audit nobody runs.
@@ -551,10 +551,10 @@ fn osv_query(t: &AuditTarget, eco: &str) -> Option<serde_json::Value> {
 /// from env at the CLI layer; tests build it explicitly.
 #[derive(Debug, Clone)]
 pub struct AuditConfig {
-    /// The querybatch endpoint (`SHUTTLE_OSV_URL` overrides).
+    /// The querybatch endpoint (`NAU_OSV_URL` overrides).
     pub url: String,
-    /// Response cache directory (`SHUTTLE_AUDIT_CACHE` overrides; default
-    /// `~/.cache/shuttle/audit/`).
+    /// Response cache directory (`NAU_AUDIT_CACHE` overrides; default
+    /// `~/.cache/nau/audit/`).
     pub cache_dir: PathBuf,
     /// Bypass cache reads and refetch everything (`--update`).
     pub update: bool,
@@ -562,15 +562,12 @@ pub struct AuditConfig {
 
 impl AuditConfig {
     pub fn from_env(update: bool) -> Self {
-        let url = std::env::var("SHUTTLE_OSV_URL").unwrap_or_else(|_| OSV_BATCH_URL.to_string());
-        let cache_dir = std::env::var("SHUTTLE_AUDIT_CACHE")
+        let url = std::env::var("NAU_OSV_URL").unwrap_or_else(|_| OSV_BATCH_URL.to_string());
+        let cache_dir = std::env::var("NAU_AUDIT_CACHE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                Path::new(&home)
-                    .join(".cache")
-                    .join("shuttle")
-                    .join("audit")
+                Path::new(&home).join(".cache").join("nau").join("audit")
             });
         AuditConfig {
             url,
@@ -701,7 +698,7 @@ fn curl_querybatch(
             "-H",
             "Content-Type: application/json",
             "-A",
-            concat!("shuttle/", env!("CARGO_PKG_VERSION"), " (osv audit)"),
+            concat!("nau/", env!("CARGO_PKG_VERSION"), " (osv audit)"),
             "--data-binary",
         ])
         .arg(format!("@{}", inp.display()))
@@ -887,7 +884,7 @@ fn confirmed_finding(
         ),
         format!(
             "upgrade {name} to a version fixed per {id} and re-lock \
-             (`shuttle lock`, or `shuttle deps fetch --latest` for closures)",
+             (`nau lock`, or `nau deps fetch --latest` for closures)",
             name = t.name
         ),
     )
@@ -1032,7 +1029,7 @@ fn unaudited_finding(t: &AuditTarget, cfg: &AuditConfig) -> Finding {
              unreachable (offline?) and the local cache has no entry"
         ),
         format!(
-            "run `shuttle audit --update` when online (cache: {})",
+            "run `nau audit --update` when online (cache: {})",
             cfg.cache_dir.display()
         ),
     )
@@ -1056,7 +1053,7 @@ fn closure_findings(lock: &LockFile) -> Vec<Finding> {
                  this pass (deliberate under-report, issue #52)",
                 deps.deps_hash
             ),
-            "re-fetch the closure (`shuttle deps fetch --latest`) to move the pin, then \
+            "re-fetch the closure (`nau deps fetch --latest`) to move the pin, then \
              re-audit; auditing vendored trees per package is future work"
                 .to_string(),
         ));

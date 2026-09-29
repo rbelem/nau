@@ -1,4 +1,4 @@
-# Tools artifacts — builds shuttle's self-provisioned floor tools
+# Tools artifacts — builds nau's self-provisioned floor tools
 # (issue #101, disposition (c)) as musl-static x86_64 binaries and attaches
 # them to releases with a generated sha256 manifest + source-offer bundle.
 #

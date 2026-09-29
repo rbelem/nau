@@ -9,6 +9,6 @@ return {
     node = node {
         name = "devbox",
         serve = { address = "127.0.0.1:7780", announce = true },
-        peers = { "shuttle://nuci.local:7780" },
+        peers = { "nau://nuci.local:7780" },
     },
 }

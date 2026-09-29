@@ -171,14 +171,14 @@ fn add_recipe_comment(project: &Path, name: &str) {
 // ── Runners ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     // Desktop launchers write to the user data home — keep them inside
     // the test's tempdir; pod activation off the host bus.
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -199,7 +199,7 @@ fn generation_count(root: &Path, pod: &str) -> usize {
 
 /// The pod lockfile as JSON — the pin record under test.
 fn read_lock(root: &Path, pod: &str) -> serde_json::Value {
-    let bytes = std::fs::read(root.join(pod).join("shuttle.lock")).unwrap();
+    let bytes = std::fs::read(root.join(pod).join("nau.lock")).unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -347,7 +347,7 @@ fn pre142_lockfile_stamped_without_rebuild() {
     let stamped = recipe_hash_of(&read_lock(&root, "p"), "app").unwrap();
 
     // Roll the lockfile back to the pre-#142 shape: drop the field.
-    let lock_path = root.join("p").join("shuttle.lock");
+    let lock_path = root.join("p").join("nau.lock");
     let mut lock: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
     lock["packages"]["app"]
@@ -662,7 +662,7 @@ fn v1_stamp_baselines_silently_then_drifts() {
     let (project, root) = sync_fixture_pod(server.path(), port, "p");
 
     // Simulate the v1 shape: a recorded digest with NO scheme marker.
-    let lock_path = root.join("p").join("shuttle.lock");
+    let lock_path = root.join("p").join("nau.lock");
     let mut lock: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
     let app = lock["packages"]["app"].as_object_mut().unwrap();

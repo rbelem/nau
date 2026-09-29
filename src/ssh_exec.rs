@@ -12,7 +12,7 @@
 //! keepalive deadline — a real build may legitimately run long.
 //!
 //! Host keys are pinned, never learned (ADR-0045 Decision 4): the pin on
-//! the `workers` entry is written to a shuttle-managed known_hosts file
+//! the `workers` entry is written to a nau-managed known_hosts file
 //! for exactly this worker, and ssh runs with `StrictHostKeyChecking=yes`
 //! against it, `GlobalKnownHostsFile` parked on `/dev/null` so no ambient
 //! trust can leak in. There is no `ssh-keyscan` path anywhere; a worker
@@ -21,7 +21,7 @@
 //!
 //! Two pin forms (ADR-0045 amendment, #295 sub-task 4). The CA form is
 //! the working one end to end: the pin is the host CA's `SHA256:`
-//! fingerprint (the `shuttle ca list` form), the executor verifies the
+//! fingerprint (the `nau ca list` form), the executor verifies the
 //! ceremony CA's public half against it (`ssh-keygen -lf` behind the
 //! command seam), resolves the provision-time machine linkage for the
 //! address ([`crate::provision::publish::machine_link`]), and writes ONE
@@ -103,12 +103,12 @@ pub const WORKER_DISK_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// staging areas, the incoming tar landings, and the job directories.
 /// The coordinator is the only writer; the Worker stays stateless beyond
 /// this cache (ADR-0040 Decision 2).
-const REMOTE_BASE: &str = "~/.cache/shuttle/worker";
+const REMOTE_BASE: &str = "~/.cache/nau/worker";
 
-/// The remote verb: a compatible `shuttle` on the worker's PATH
+/// The remote verb: a compatible `nau` on the worker's PATH
 /// (ADR-0040 Decision 2(b) — an operator duty preflight verifies through
-/// the protocol assertion, not a path shuttle manages).
-const REMOTE_SHUTTLE: &str = "shuttle";
+/// the protocol assertion, not a path nau manages).
+const REMOTE_NAU: &str = "nau";
 
 /// Where the manifest's closure blobs live coordinator-side.
 pub type PayloadDir = Path;
@@ -225,12 +225,12 @@ pub struct SshExecutor<R: CommandRunner> {
     worker: WorkerConfig,
     runner: R,
     parts: AddressParts,
-    /// Everything shuttle manages on disk for this worker: the
+    /// Everything nau manages on disk for this worker: the
     /// known_hosts pin under `workers/known_hosts.d/`, remote ingest
     /// records under `remote/`.
     cache_dir: PathBuf,
     /// The ceremony home the CA form resolves against: the host CA's
-    /// public half (`~/.config/shuttle/ca/ca.pub`) and the provision-time
+    /// public half (`~/.config/nau/ca/ca.pub`) and the provision-time
     /// machine linkage (`ca/machines/`) live there. `$HOME` in
     /// production; pinned by the test seam.
     ceremony_home: PathBuf,
@@ -242,15 +242,15 @@ pub struct SshExecutor<R: CommandRunner> {
 }
 
 impl<R: CommandRunner> SshExecutor<R> {
-    /// Build an executor for one `workers` entry. The shuttle-managed
-    /// paths default to the cache convention (`$HOME/.cache/shuttle`)
+    /// Build an executor for one `workers` entry. The nau-managed
+    /// paths default to the cache convention (`$HOME/.cache/nau`)
     /// and the ceremony home to `$HOME` (the `ca.rs` convention).
     pub fn new(worker: &WorkerConfig, runner: R) -> miette::Result<Self> {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         Self::with_ceremony_home(
             worker,
             runner,
-            &Path::new(&home).join(".cache").join("shuttle"),
+            &Path::new(&home).join(".cache").join("nau"),
             Path::new(&home),
         )
     }
@@ -343,7 +343,7 @@ impl<R: CommandRunner> SshExecutor<R> {
                 return Err(miette::miette!(
                     "preflight host-key: worker '{}' carries the malformed fingerprint pin \
                      '{pin}' — expected 'SHA256:' + 43 base64 characters (the OpenSSH form \
-                     `shuttle ca list` prints)",
+                     `nau ca list` prints)",
                     self.worker.address
                 ));
             }
@@ -352,7 +352,7 @@ impl<R: CommandRunner> SshExecutor<R> {
         Err(miette::miette!(
             "preflight host-key: worker '{}' carries the retired pin '{pin}' — the \
              mint-and-inject public-key-line pin was removed (ADR-0045 as amended by #295); \
-             re-pin with the CA fingerprint from `shuttle ca list`",
+             re-pin with the CA fingerprint from `nau ca list`",
             self.worker.address
         ))
     }
@@ -364,7 +364,7 @@ impl<R: CommandRunner> SshExecutor<R> {
         let text = std::fs::read_to_string(&public).map_err(|_| {
             miette::miette!(
                 "preflight host-key: worker '{}' pins host CA fingerprint '{pin}' but the \
-                 coordinator's CA public half {} is missing — run 'shuttle ca keygen' (the \
+                 coordinator's CA public half {} is missing — run 'nau ca keygen' (the \
                  @cert-authority pin needs the key that fingerprint names)",
                 self.worker.address,
                 public.display()
@@ -373,7 +373,7 @@ impl<R: CommandRunner> SshExecutor<R> {
         if text.trim().is_empty() {
             return Err(miette::miette!(
                 "preflight host-key: worker '{}' pins host CA fingerprint '{pin}' but {} is \
-                 empty — restore the CA keypair ('shuttle ca keygen --force' re-keys)",
+                 empty — restore the CA keypair ('nau ca keygen --force' re-keys)",
                 self.worker.address,
                 public.display()
             ));
@@ -396,7 +396,7 @@ impl<R: CommandRunner> SshExecutor<R> {
                     miette::miette!(
                 "preflight host-key: worker '{}' pins the host CA fingerprint but no machine \
                  identity is linked to this address (expected {}) — the @cert-authority pin \
-                 binds the certificate principal shuttle records at provision time; \
+                 binds the certificate principal nau records at provision time; \
                  re-provision the worker (ADR-0045 Decision 4)",
                 self.worker.address,
                 crate::provision::publish::machines_dir(&self.ceremony_home).display()
@@ -418,7 +418,7 @@ impl<R: CommandRunner> SshExecutor<R> {
         if key.len() < 2 {
             return Err(miette::miette!(
                 "preflight host-key: worker '{}': {} is not a usable public-key line — restore \
-                 the CA keypair ('shuttle ca keygen --force' re-keys)",
+                 the CA keypair ('nau ca keygen --force' re-keys)",
                 self.worker.address,
                 public.display()
             ));
@@ -434,12 +434,12 @@ impl<R: CommandRunner> SshExecutor<R> {
     fn unpinned_refusal(&self) -> miette::Error {
         miette::miette!(
             "preflight host-key: worker '{}' is unpinned — every workers entry must carry \
-             host_key; shuttle never learns host keys (ADR-0045 Decision 4)",
+             host_key; nau never learns host keys (ADR-0045 Decision 4)",
             self.worker.address
         )
     }
 
-    /// Write the shuttle-managed known_hosts for this worker: one file,
+    /// Write the nau-managed known_hosts for this worker: one file,
     /// one pinned line, written only when the content differs (atomic
     /// tempfile + persist, safe under the scheduler's concurrent
     /// dispatches to the same worker). Called before any ssh runs, so an
@@ -616,7 +616,7 @@ impl<R: CommandRunner> SshExecutor<R> {
         // The pin refusal lands before any channel activity.
         self.ensure_known_hosts()?;
         let stdout = self
-            .run_ssh(&format!("{REMOTE_SHUTTLE} __worker-cap"))
+            .run_ssh(&format!("{REMOTE_NAU} __worker-cap"))
             .wrap_err("preflight reachability")?;
         let cap: CapabilityDoc = serde_json::from_str(stdout.trim()).map_err(|e| {
             miette::miette!(
@@ -627,7 +627,7 @@ impl<R: CommandRunner> SshExecutor<R> {
         if cap.protocol != WORKER_PROTOCOL_VERSION {
             return Err(miette::miette!(
                 "preflight protocol: worker '{}' speaks protocol {}, this coordinator speaks \
-                 {WORKER_PROTOCOL_VERSION} — upgrade the worker's shuttle",
+                 {WORKER_PROTOCOL_VERSION} — upgrade the worker's nau",
                 self.worker.address,
                 cap.protocol
             ));
@@ -765,7 +765,7 @@ impl<R: CommandRunner> SshExecutor<R> {
 
         let stdout = self
             .run_ssh(&format!(
-                "{REMOTE_SHUTTLE} __worker-job {REMOTE_BASE}/jobs/{id}/job.json"
+                "{REMOTE_NAU} __worker-job {REMOTE_BASE}/jobs/{id}/job.json"
             ))
             .wrap_err_with(|| {
                 format!(
@@ -896,7 +896,7 @@ impl<R: CommandRunner> SshExecutor<R> {
     fn ship_missing(&self, missing: &[&str], payload_dir: &PayloadDir) -> miette::Result<()> {
         let nonce = self.next_nonce();
         let tar_path = tempfile::Builder::new()
-            .prefix("shuttle-worker-sync-")
+            .prefix("nau-worker-sync-")
             .tempfile()
             .map_err(|e| miette::miette!("delta sync: cannot stage the payload bundle: {e}"))?;
         let mut argv = vec![

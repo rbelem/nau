@@ -1,14 +1,14 @@
 //! Toolchain-meta pod install tests (issue #38).
 //!
 //! The toolchain meta carries no payload of its own: its build stages
-//! the merged build prefix (`requires` payloads, `/shuttle-build-prefix`)
+//! the merged build prefix (`requires` payloads, `/nau-build-prefix`)
 //! into a self-contained subtree and exposes apps through root launcher
 //! scripts, so the farm assembly (#37) carries the whole subtree beside
 //! each launcher. These tests drive that machinery end to end at pod
 //! scale — a tiny `dep` payload plays the toolchain pieces, a meta
 //! stages it into `toolchain/` and declares a launcher app, and the pod
 //! farm entry must execute the staged binary through the launcher —
-//! plus the alias entry contract (`shuttle pod add <alias>` resolves a
+//! plus the alias entry contract (`nau pod add <alias>` resolves a
 //! re-export to the canonical package).
 //!
 //! Same gates and shape as `pod_install.rs`: real snap builds over a
@@ -153,7 +153,7 @@ fn write_meta_pkg(project: &Path, port: u16) {
     type = "meta",
     requires = {{ "dep" }},
     source = "http://127.0.0.1:{port}/dep.tar.gz",
-    build = "mkdir -p $STAGE/toolchain && cp -a /shuttle-build-prefix/. $STAGE/toolchain/ && printf '#!/bin/sh\\np=$(readlink -f -- \"$0\") || exit 1\\nd=$(dirname -- \"$p\")\\nexec \"$d/usr/bin/hello\" \"$@\"\\n' > $STAGE/toolchain/hello && chmod +x $STAGE/toolchain/hello",
+    build = "mkdir -p $STAGE/toolchain && cp -a /nau-build-prefix/. $STAGE/toolchain/ && printf '#!/bin/sh\\np=$(readlink -f -- \"$0\") || exit 1\\nd=$(dirname -- \"$p\")\\nexec \"$d/usr/bin/hello\" \"$@\"\\n' > $STAGE/toolchain/hello && chmod +x $STAGE/toolchain/hello",
     apps = {{ hello = {{ command = "toolchain/hello" }} }},
 }} }}
 "#
@@ -176,12 +176,12 @@ fn write_alias_pkg(project: &Path) {
 // ── Runners ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -197,8 +197,8 @@ fn farm(root: &Path, pod: &str) -> PathBuf {
 /// by the caller when it matters).
 fn run_farm_entry(root: &Path, pod: &str, entry: &str) -> (Option<i32>, String) {
     let out = Command::new(farm(root, pod).join(entry))
-        .env("SHUTTLE_DATA_HOME", root.join("data-home"))
-        .env("SHUTTLE_SYSTEMD", "off")
+        .env("NAU_DATA_HOME", root.join("data-home"))
+        .env("NAU_SYSTEMD", "off")
         .output()
         .expect("failed to run farm entry");
     (

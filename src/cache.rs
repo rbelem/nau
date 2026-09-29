@@ -1,7 +1,7 @@
 //! Binary package cache — store and retrieve built `.snap` files by
 //! build-input closure hash.
 //!
-//! The cache lives at `~/.cache/shuttle/pkgs/` (configurable via `--cache`).
+//! The cache lives at `~/.cache/nau/pkgs/` (configurable via `--cache`).
 //! Each cached snap is stored as:
 //!
 //! ```text
@@ -45,7 +45,7 @@ pub struct CacheInfo {
     pub root: std::path::PathBuf,
 }
 
-/// Default cache directory name under `~/.cache/shuttle/`.
+/// Default cache directory name under `~/.cache/nau/`.
 const DEFAULT_CACHE_SUBDIR: &str = "pkgs";
 
 /// Magic string for packages without source (meta/store types).
@@ -109,7 +109,7 @@ pub struct RequiresMember {
 #[derive(Debug, Clone)]
 pub struct BuildClosure {
     /// SHA-256 over `name:version:url` (`none` for meta/store packages).
-    /// The tarball content hash is pinned separately in `shuttle.lock` and
+    /// The tarball content hash is pinned separately in `nau.lock` and
     /// verified at download time, so the key never needs the download.
     /// Multi-source snaps (issue #41) fold every named source's
     /// name/url/hash into this component.
@@ -256,7 +256,7 @@ pub fn pinned_member(name: &str, lock: &crate::lock::LockFile) -> Option<Require
 /// SHA-256 over the source identity: `name:version:url` (or `none` for
 /// meta/store packages). This is the source component of the closure — the
 /// parts spec is hashed separately, and the downloaded tarball's content
-/// hash is pinned in `shuttle.lock` and verified at download time.
+/// hash is pinned in `nau.lock` and verified at download time.
 ///
 /// Multi-source snaps (issue #41) fold each named source's
 /// `name=url:sha256` into the identity (sorted, BTreeMap order): every
@@ -331,13 +331,13 @@ pub struct PackageCache {
 impl PackageCache {
     /// Create a new cache at the specified directory.
     ///
-    /// If `dir` is `None`, defaults to `~/.cache/shuttle/pkgs/`.
+    /// If `dir` is `None`, defaults to `~/.cache/nau/pkgs/`.
     pub fn new(dir: Option<PathBuf>) -> Self {
         let root = dir.unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             Path::new(&home)
                 .join(".cache")
-                .join("shuttle")
+                .join("nau")
                 .join(DEFAULT_CACHE_SUBDIR)
         });
         PackageCache {
@@ -659,7 +659,7 @@ mod tests {
         // HOME internally) could straddle that mutation (issue #149).
         let home = std::env::var("HOME").unwrap();
         let cache = PackageCache::new(None);
-        let expected = Path::new(&home).join(".cache").join("shuttle").join("pkgs");
+        let expected = Path::new(&home).join(".cache").join("nau").join("pkgs");
         assert_eq!(cache.root(), expected);
     }
 

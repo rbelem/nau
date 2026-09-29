@@ -6,7 +6,7 @@
 //! (`examples/**/*.lua`) is evaluated through BOTH backends:
 //!
 //! - **Luau** (production): the real bounded subprocess path —
-//!   `isolate::run_eval` spawning `shuttle __eval-worker` with the exact
+//!   `isolate::run_eval` spawning `nau __eval-worker` with the exact
 //!   production request shape (prelude = `dsl::prelude()`, index data,
 //!   arch, IPC require).
 //! - **Lua 5.4** (reference): the locked devbox interpreter
@@ -39,8 +39,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use shuttle::index::{PackageIndex, DEFAULT_INDEX};
-use shuttle::isolate::{self, EvalRequest};
+use nau::index::{PackageIndex, DEFAULT_INDEX};
+use nau::isolate::{self, EvalRequest};
 
 /// Driver + interpreter wall-clock bound; sits just above the production
 /// worker deadline (`isolate::WALL_DEADLINE`, 5s) so both sides classify a
@@ -158,7 +158,7 @@ fn lua_literal(v: &Value) -> String {
 // ── Production request construction (mirrors lua.rs eval_request env) ──
 
 fn production_request(prelude: &str, index_data: Value, label: &str, source: &str) -> EvalRequest {
-    let arch = std::env::var("SHUTTLE_ARCH").unwrap_or_else(|_| "amd64".into());
+    let arch = std::env::var("NAU_ARCH").unwrap_or_else(|_| "amd64".into());
     EvalRequest {
         prelude: prelude.to_string(),
         index_data,
@@ -379,14 +379,14 @@ fn corpus_dual_eval_parity() {
     std::fs::write(&driver_path, DRIVER_SRC).expect("write driver");
 
     // Index data exactly as the production parent ships it
-    // (lua.rs eval_request: SHUTTLE_INDEX_PATH or DEFAULT_INDEX).
-    let index_path = std::env::var("SHUTTLE_INDEX_PATH")
+    // (lua.rs eval_request: NAU_INDEX_PATH or DEFAULT_INDEX).
+    let index_path = std::env::var("NAU_INDEX_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_INDEX));
     let index =
         PackageIndex::load_or_default(&index_path).expect("load package index for parity gate");
     let index_data = serde_json::to_value(&index).expect("serialize index");
-    let prelude = shuttle::dsl::prelude();
+    let prelude = nau::dsl::prelude();
 
     let mut pass = Vec::new();
     let mut both_fail = Vec::new();

@@ -40,7 +40,7 @@
 //!    (`asserts/crypto.go` — `golang.org/x/crypto/openpgp`; there is no
 //!    ed25519 anywhere in the codebase), so this module:
 //!    - signs assertions with an RSA-4096 key (PKCS#8-persisted at
-//!      `~/.config/shuttle/assertion-key.pem`),
+//!      `~/.config/nau/assertion-key.pem`),
 //!    - wraps signature bytes as `base64(0x01 ‖ OpenPGP signature packet)`
 //!      in 76-column lines (x/crypto's `encodeV1`),
 //!    - carries the account-key's public key as its assertion BODY in the
@@ -112,7 +112,7 @@ pub const ROLE_BOOT: &str = "system-boot";
 pub const ROLE_DATA: &str = "system-data";
 pub const ROLE_SAVE: &str = "system-save";
 
-/// Shuttle DSL-only role for a UC gap partition: a structure the gadget
+/// Nau DSL-only role for a UC gap partition: a structure the gadget
 /// declares (the pc gadget's `BIOS Boot`, say) that must EXIST on disk for
 /// snapd's gadget validation but is deliberately left unformatted — the
 /// build neither mounts nor populates it. Not a gadget.yaml role; the UC
@@ -215,12 +215,12 @@ pub struct SnapdAssertionKey {
 
 impl SnapdAssertionKey {
     /// Load the persisted assertion key, or generate one (RSA-4096) on
-    /// first use. Stored as PKCS#8 PEM at `~/.config/shuttle/
+    /// first use. Stored as PKCS#8 PEM at `~/.config/nau/
     /// assertion-key.pem` (mode 0600), like [`crate::sign`]'s manifest
     /// key but a SEPARATE key — the manifest chain keeps its Ed25519
     /// substrate (ADR-0011).
     pub fn load_or_create(home: &Path) -> miette::Result<Self> {
-        let dir = home.join(".config").join("shuttle");
+        let dir = home.join(".config").join("nau");
         let path = dir.join("assertion-key.pem");
         if path.is_file() {
             let pem = std::fs::read_to_string(&path)
@@ -464,7 +464,7 @@ pub fn brand_id_for(image_name: &str) -> String {
         .collect::<String>()
         .to_lowercase();
     if trimmed.chars().count() < 2 {
-        "shuttle".to_string()
+        "nau".to_string()
     } else {
         trimmed
     }
@@ -491,7 +491,7 @@ impl ModelAssertion {
                 miette::miette!(
                     "snap '{name}' has no store snap-id — the UC seed identifies every \
                      system snap by snap-id; resolve the image against the store (or set \
-                     SHUTTLE_SNAP_IDS='{name}=<snap-id>')"
+                     NAU_SNAP_IDS='{name}=<snap-id>')"
                 )
             })
         };
@@ -654,7 +654,7 @@ fn derive_track_channel(track: Option<&str>) -> String {
 // the key itself carries the proof), the `account` assertion is then
 // signed by that key, and the model signed by the same key verifies.
 
-/// The `type: account-key` assertion binding the shuttle Ed25519 public
+/// The `type: account-key` assertion binding the nau Ed25519 public
 /// key to the image's brand account. Self-signed by the declared key.
 /// The account-key assertion BODY: the public key in snapd's wire encoding
 /// — base64 over `format-id byte ++ key bytes` (ed25519 format id is 1),
@@ -686,7 +686,7 @@ pub fn account_key_assertion(
     let _ = writeln!(headers, "authority-id: {brand_id}");
     let _ = writeln!(headers, "account-id: {brand_id}");
     let _ = writeln!(headers, "public-key-sha3-384: {key_id}");
-    let _ = writeln!(headers, "name: shuttle-image-signing");
+    let _ = writeln!(headers, "name: nau-image-signing");
     let _ = writeln!(headers, "since: {timestamp}");
     let _ = writeln!(headers, "timestamp: {timestamp}");
     let _ = writeln!(headers, "body-length: {}", body.len());
@@ -716,7 +716,7 @@ pub fn account_assertion(
     let _ = writeln!(headers, "type: account");
     let _ = writeln!(headers, "authority-id: {brand_id}");
     let _ = writeln!(headers, "account-id: {brand_id}");
-    let _ = writeln!(headers, "display-name: Shuttle image signing account");
+    let _ = writeln!(headers, "display-name: Nau image signing account");
     // Mandatory per snapd's account assertion checks (boot-verified: seed
     // load fails with `assertion account: "validation" header is mandatory`
     // without it) — `certified` is what the store's own account carries.
@@ -876,7 +876,7 @@ pub fn grubenv(recovery_kernel: &str, extra_cmdline: &str) -> [u8; 1024] {
 /// snapd's recovery/first-boot grub config (`Snapd-Boot-Config-Edition:
 /// 2`), byte-identical to the template snap-bootstrap carries and installs.
 /// Default mode is **install** when the seed's `/EFI/ubuntu/grubenv` carries
-/// no mode — the first boot of a shuttle UC image; each `/systems/*` entry
+/// no mode — the first boot of a nau UC image; each `/systems/*` entry
 /// is loopback-mounted and chainloaded as `kernel.efi` with the
 /// `snapd_recovery_mode`/`snapd_recovery_system` cmdline snap-bootstrap's
 /// mode detection consumes.
@@ -1260,7 +1260,7 @@ mod tests {
             "ubuntu-core-uc26-seed"
         );
         assert_eq!(brand_id_for("My_Weird.Image!"), "my-weird-image");
-        assert_eq!(brand_id_for("x"), "shuttle");
+        assert_eq!(brand_id_for("x"), "nau");
         // ≤28 chars, [-a-z0-9] only.
         let long = brand_id_for("a-very-long-image-name-that-keeps-going");
         assert!(long.len() <= 28);

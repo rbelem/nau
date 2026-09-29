@@ -84,7 +84,7 @@ return {
         -- linked there for the build; the SQL schema and WASM grammars
         -- are copied into dist/ the way copy-assets does.
         build = table.concat({
-            'ln -s "$SHUTTLE_DEPS_DIR/node_modules" node_modules',
+            'ln -s "$NAU_DEPS_DIR/node_modules" node_modules',
             "node node_modules/typescript/bin/tsc -p tsconfig.json",
             "mkdir -p dist/db dist/extraction/wasm",
             "cp src/db/schema.sql dist/db/schema.sql",
@@ -92,7 +92,7 @@ return {
             "chmod 755 dist/bin/codegraph.js",
             "mkdir -p $STAGE/usr/lib/node_modules/@colbymchenry/codegraph",
             "cp -r dist package.json $STAGE/usr/lib/node_modules/@colbymchenry/codegraph/",
-            'tar -C "$SHUTTLE_DEPS_DIR" -cf - node_modules | tar -C $STAGE/usr/lib/node_modules/@colbymchenry/codegraph -xf -',
+            'tar -C "$NAU_DEPS_DIR" -cf - node_modules | tar -C $STAGE/usr/lib/node_modules/@colbymchenry/codegraph -xf -',
         }, " && "),
 
         type = "source",

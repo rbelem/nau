@@ -5,7 +5,7 @@
 -- that need a full OS environment.
 --
 -- Register in package index:
---   shuttle index add lxd --summary "System container manager"
+--   nau index add lxd --summary "System container manager"
 --
 -- Usage:
 --   image {

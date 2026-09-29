@@ -1,7 +1,7 @@
 //! Safe Rust wrapper over the Luau 0.663 type analyzer (`Luau.Analysis`).
 //!
-//! Built by `build.rs`: upstream C++ + `shim/shuttle_shim.cpp` compiled with
-//! the `cc` crate, linked statically. See `shim/shuttle_shim.cpp` for the
+//! Built by `build.rs`: upstream C++ + `shim/nau_shim.cpp` compiled with
+//! the `cc` crate, linked statically. See `shim/nau_shim.cpp` for the
 //! C++ side and `REPORT.md` for the spike conclusions.
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
@@ -27,22 +27,22 @@ impl Diagnostic {
 
 // Raw FFI surface (see shim for semantics).
 extern "C" {
-    fn shuttle_checker_new(strict: c_int) -> *mut c_void;
-    fn shuttle_checker_free(checker: *mut c_void);
-    fn shuttle_checker_seed_module(
+    fn nau_checker_new(strict: c_int) -> *mut c_void;
+    fn nau_checker_free(checker: *mut c_void);
+    fn nau_checker_seed_module(
         checker: *mut c_void,
         name: *const c_char,
         source: *const c_char,
         len: usize,
     );
-    fn shuttle_checker_check(
+    fn nau_checker_check(
         checker: *mut c_void,
         name: *const c_char,
         source: *const c_char,
         len: usize,
     ) -> *mut c_void;
-    fn shuttle_error_count(result: *mut c_void) -> c_int;
-    fn shuttle_error_at(
+    fn nau_error_count(result: *mut c_void) -> c_int;
+    fn nau_error_at(
         result: *mut c_void,
         index: c_int,
         begin_line: *mut c_uint,
@@ -52,25 +52,25 @@ extern "C" {
         message: *mut *const c_char,
         message_len: *mut usize,
     ) -> c_int;
-    fn shuttle_timeout_hits(result: *mut c_void) -> c_int;
-    fn shuttle_check_result_free(result: *mut c_void);
+    fn nau_timeout_hits(result: *mut c_void) -> c_int;
+    fn nau_check_result_free(result: *mut c_void);
 }
 
 /// Read a result handle into owned Rust diagnostics, then free the handle.
 ///
 /// # Safety
-/// `result` must be a valid handle from `shuttle_checker_check`, or null.
+/// `result` must be a valid handle from `nau_checker_check`, or null.
 unsafe fn collect_diagnostics(result: *mut c_void) -> (Vec<Diagnostic>, u32) {
     let mut out = Vec::new();
     if result.is_null() {
         return (out, 0);
     }
-    let count = shuttle_error_count(result);
+    let count = nau_error_count(result);
     for i in 0..count {
         let (mut bl, mut bc, mut el, mut ec) = (0u32, 0u32, 0u32, 0u32);
         let mut msg: *const c_char = std::ptr::null();
         let mut msg_len: usize = 0;
-        if shuttle_error_at(
+        if nau_error_at(
             result,
             i,
             &mut bl,
@@ -92,8 +92,8 @@ unsafe fn collect_diagnostics(result: *mut c_void) -> (Vec<Diagnostic>, u32) {
             message: String::from_utf8_lossy(bytes).into_owned(),
         });
     }
-    let timeouts = shuttle_timeout_hits(result);
-    shuttle_check_result_free(result);
+    let timeouts = nau_timeout_hits(result);
+    nau_check_result_free(result);
     (out, timeouts.max(0) as u32)
 }
 
@@ -111,10 +111,10 @@ impl Checker {
     /// `strict`). First construction parses and freezes the builtin type
     /// graph — this is the cold-start cost (see REPORT.md latency numbers).
     pub fn new(strict: bool) -> Checker {
-        // SAFETY: shuttle_checker_new returns a fresh handle or dies inside
+        // SAFETY: nau_checker_new returns a fresh handle or dies inside
         // C++ (no error return path); null-check on the Rust side.
-        let inner = unsafe { shuttle_checker_new(strict as c_int) };
-        assert!(!inner.is_null(), "shuttle_checker_new returned null");
+        let inner = unsafe { nau_checker_new(strict as c_int) };
+        assert!(!inner.is_null(), "nau_checker_new returned null");
         Checker { inner }
     }
 
@@ -129,7 +129,7 @@ impl Checker {
         // SAFETY: valid handle; C++ copies both strings (name via C-string
         // semantics, source via explicit length).
         unsafe {
-            shuttle_checker_seed_module(
+            nau_checker_seed_module(
                 self.inner,
                 c_name.as_ptr(),
                 source.as_ptr().cast::<c_char>(),
@@ -145,7 +145,7 @@ impl Checker {
         assert!(!source.contains('\0'), "source contains NUL byte");
         // SAFETY: valid handle; C++ copies both strings.
         let result = unsafe {
-            shuttle_checker_check(
+            nau_checker_check(
                 self.inner,
                 c_name.as_ptr(),
                 source.as_ptr().cast::<c_char>(),
@@ -160,14 +160,14 @@ impl Checker {
     /// (always 0 here — `moduleTimeLimitSec` is not set by the shim).
     pub fn timeout_hits(&self) -> u32 {
         // SAFETY: valid handle.
-        unsafe { shuttle_timeout_hits(self.inner) }.max(0) as u32
+        unsafe { nau_timeout_hits(self.inner) }.max(0) as u32
     }
 }
 
 impl Drop for Checker {
     fn drop(&mut self) {
         // SAFETY: valid handle, runs exactly once.
-        unsafe { shuttle_checker_free(self.inner) }
+        unsafe { nau_checker_free(self.inner) }
     }
 }
 
@@ -229,7 +229,7 @@ snap { name = 42, version = "2.10" }
     fn in_source_mode_hotcomment_overrides_resolver_default() {
         // Feasibility-critical behavior: `--!nonstrict` inside the source
         // overrides the checker's strict default (Frontend::parse ->
-        // parseMode(hotcomments) wins over ConfigResolver). shuttle's gate
+        // parseMode(hotcomments) wins over ConfigResolver). nau's gate
         // must strip or reject mode hot-comments in authored definitions.
         let downgraded = "--!nonstrict\nlocal function f(x)\n    return x + 1\nend\nf(\"hello\")\n";
         let res = check_once("hotcomment-downgrade", downgraded, true);

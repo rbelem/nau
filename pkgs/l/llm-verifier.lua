@@ -11,7 +11,7 @@
 --
 -- DEPENDENCY CLOSURE — KNOWN GAP, DELIBERATE: the flake propagates
 -- google-genai, openai, and tqdm from nixpkgs, which resolves versions at
--- eval time. The shuttle pip resolver (ADR-0017) is lock-driven, but this
+-- eval time. The nau pip resolver (ADR-0017) is lock-driven, but this
 -- sdist ships NO lockfile (no uv.lock, no requirements.lock — verified
 -- against the pinned artifact), and the upstream GitHub repo named in the
 -- metadata is gone, so no lock artifact exists to pin against. Declaring

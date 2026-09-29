@@ -18,11 +18,11 @@
 --
 -- Requires: glibc
 -- build_deps: tree-sitter (the CLI that generates parser.c; invoked via
--- $SHUTTLE_BUILD_PREFIX — the merged prefix is not on PATH) and python
+-- $NAU_BUILD_PREFIX — the merged prefix is not on PATH) and python
 -- (setup.py interpreter plus Python.h for the extension build).
 --
 -- Distutils links the extension with the sandbox's nix gcc wrapper,
--- which bakes RUNPATH=/shuttle-build-prefix/usr/lib into produced
+-- which bakes RUNPATH=/nau-build-prefix/usr/lib into produced
 -- binaries: same interim leak-scan escape as dconf/htop/tmux
 -- (ADR-0018 Decision 3, issue #22).
 
@@ -54,7 +54,7 @@ return {
         -- resolves Python.h inside the prefix (python-build-standalone
         -- stages include/python3.14 there).
         build = table.concat({
-            '"$SHUTTLE_BUILD_PREFIX/usr/bin/tree-sitter" generate src/grammar.json',
+            '"$NAU_BUILD_PREFIX/usr/bin/tree-sitter" generate src/grammar.json',
             "rm -f setup.py pyproject.toml",
             "mkdir -p tree_sitter_perl",
             "cat > tree_sitter_perl/__init__.py <<'EOF'",
@@ -84,10 +84,10 @@ return {
             "    return PyModule_Create(&_module);",
             "}",
             "EOF",
-            "PYINC=$($SHUTTLE_BUILD_PREFIX/usr/bin/python3 -c 'import sysconfig; print(sysconfig.get_paths()[\"include\"])')",
+            "PYINC=$($NAU_BUILD_PREFIX/usr/bin/python3 -c 'import sysconfig; print(sysconfig.get_paths()[\"include\"])')",
             'cc -shared -fPIC -O2 -I"$PYINC" -Isrc -DPy_LIMITED_API=0x030A0000 binding.c src/parser.c src/scanner.c -o tree_sitter_perl/_binding.so',
             -- The flake's pythonImportsCheck, against the built tree.
-            'PYTHONPATH=$PWD "$SHUTTLE_BUILD_PREFIX/usr/bin/python3" -c "import tree_sitter_perl"',
+            'PYTHONPATH=$PWD "$NAU_BUILD_PREFIX/usr/bin/python3" -c "import tree_sitter_perl"',
             -- Stage as the whichllm pattern, minus console scripts.
             "mkdir -p $STAGE/usr/lib/python3.14/site-packages",
             "cp -r tree_sitter_perl $STAGE/usr/lib/python3.14/site-packages/",
@@ -98,12 +98,12 @@ return {
         build_deps = { "tree-sitter", "python", "gcc" },
 
         -- Same interim leak-scan escape as dconf/htop/tmux: produced
-        -- .so carries RUNPATH=/shuttle-build-prefix/usr/lib (dead at
+        -- .so carries RUNPATH=/nau-build-prefix/usr/lib (dead at
         -- runtime). Silenced here, visibly logged by the leak scan,
         -- pending the RUNPATH repair.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
     },
 }

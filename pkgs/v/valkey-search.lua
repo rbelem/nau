@@ -30,7 +30,7 @@
 -- Nix:       no nixpkgs package (upstream ships a container image;
 --            the module is loaded INTO valkey-server)
 -- Snapcraft: no upstream snapcraft recipe
--- Shuttle:   declarative Lua — CMake source build; the module is a
+-- Nau:   declarative Lua — CMake source build; the module is a
 --            payload FILE (usr/lib/libsearch.so), not a runnable app.
 --
 -- Port strategy (two-stage build, mirroring ./build.sh
@@ -185,13 +185,13 @@ return {
             -- tree (minus the C++ subtree) under the build tree and
             -- -idirafter that (distinct canonical path, after every
             -- system dir).
-            "mkdir -p $SRC/build-release/c-include && cp -a $SHUTTLE_BUILD_PREFIX/usr/include/. $SRC/build-release/c-include/ && rm -rf $SRC/build-release/c-include/c++ $SRC/build-release/c-include/x86_64-linux-gnu/c++",
+            "mkdir -p $SRC/build-release/c-include && cp -a $NAU_BUILD_PREFIX/usr/include/. $SRC/build-release/c-include/ && rm -rf $SRC/build-release/c-include/c++ $SRC/build-release/c-include/x86_64-linux-gnu/c++",
             "SAN_BUILD=no cmake -S $SRC -B $SRC/build-release -G Ninja "
                 .. "-DCMAKE_BUILD_TYPE=Release "
                 .. "-DCMAKE_POLICY_VERSION_MINIMUM=3.5 "
                 .. "-DBUILD_UNIT_TESTS=OFF "
                 .. "-DWITH_SUBMODULES_SYSTEM=ON "
-                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_PREFIX_PATH=$NAU_BUILD_PREFIX/usr "
                 .. "-DCMAKE_INSTALL_PREFIX=/usr "
                 .. "-DCMAKE_CXX_FLAGS=\"-idirafter $SRC/build-release/c-include\"",
             "cmake --build $SRC/build-release -j$(nproc)",
@@ -222,15 +222,15 @@ return {
             "gcc"},
 
         -- ADR-0018 interim escape (libsecret precedent): the nix gcc
-        -- wrapper bakes RUNPATH=/shuttle-build-prefix/usr/lib into
+        -- wrapper bakes RUNPATH=/nau-build-prefix/usr/lib into
         -- the produced module — dead at pod runtime, visibly logged
         -- by the leak scan, pending the RUNPATH repair.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
             -- Text-leak references carry the BARE prefix marker
             -- (leak_scan record() matches the reference exactly).
-            "/shuttle-build-prefix",
+            "/nau-build-prefix",
         },
     },
 }

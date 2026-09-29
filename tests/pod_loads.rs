@@ -1,4 +1,4 @@
-//! `shuttle pod` loads composition integration tests (issue #8).
+//! `nau pod` loads composition integration tests (issue #8).
 //!
 //! Drives the real binary end to end through the FULL chain: a pod
 //! declares `loads = { "base" }` and resolves as shared collection <
@@ -160,7 +160,7 @@ fn write_app_pkg(project: &Path, name: &str, version: &str, marker: &str, app: &
 
 // ── Runners ──
 
-/// Run `shuttle pod [--name <pod>] <verb...>` against the project and
+/// Run `nau pod [--name <pod>] <verb...>` against the project and
 /// pod root. Pod names come BEFORE the verb by design (issue #4).
 fn run_named(
     project: &Path,
@@ -168,17 +168,17 @@ fn run_named(
     pod: &str,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod");
     if !pod.is_empty() {
         cmd.arg("--name").arg(pod);
     }
     cmd.args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66).
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -351,7 +351,7 @@ gated_test!(load_chain_resolves_transitively, {
     assert_eq!(code, Some(0), "core add failed: {stderr}");
     assert_eq!(current_generation(root.path(), "core"), 1);
 
-    // `base` has no own packages and loads `core`. `shuttle pod --name base
+    // `base` has no own packages and loads `core`. `nau pod --name base
     // add` requires at least one package to initialize the pod, so give
     // core a proxy: actually, initialize base with NO package by writing
     // pod.lua directly. But read verbs against an uninitialized pod fail.
@@ -437,8 +437,8 @@ gated_test!(load_cycle_errors_with_name_and_mutates_nothing, {
 
     let a_gen_before = generation_count(root.path(), "a");
     let b_gen_before = generation_count(root.path(), "b");
-    let a_lock_before = snapshot(&pod_dir(root.path(), "a").join("shuttle.lock"));
-    let b_lock_before = snapshot(&pod_dir(root.path(), "b").join("shuttle.lock"));
+    let a_lock_before = snapshot(&pod_dir(root.path(), "a").join("nau.lock"));
+    let b_lock_before = snapshot(&pod_dir(root.path(), "b").join("nau.lock"));
     let a_link_before = std::fs::read_link(pod_dir(root.path(), "a").join("current")).unwrap();
     let b_link_before = std::fs::read_link(pod_dir(root.path(), "b").join("current")).unwrap();
 
@@ -461,12 +461,12 @@ gated_test!(load_cycle_errors_with_name_and_mutates_nothing, {
         "b must not be touched"
     );
     assert_eq!(
-        snapshot(&pod_dir(root.path(), "a").join("shuttle.lock")),
+        snapshot(&pod_dir(root.path(), "a").join("nau.lock")),
         a_lock_before,
         "a's lockfile must be untouched"
     );
     assert_eq!(
-        snapshot(&pod_dir(root.path(), "b").join("shuttle.lock")),
+        snapshot(&pod_dir(root.path(), "b").join("nau.lock")),
         b_lock_before,
         "b's lockfile must be untouched"
     );
@@ -500,7 +500,7 @@ gated_test!(same_precedence_binary_collision_errors_with_zero_writes, {
     let (code, _, stderr) = run(project.path(), root.path(), &["add", "alpha"]);
     assert_eq!(code, Some(0), "alpha add failed: {stderr}");
     let gen_before = generation_count(root.path(), "default");
-    let lock_before = snapshot(&pod_dir(root.path(), "default").join("shuttle.lock"));
+    let lock_before = snapshot(&pod_dir(root.path(), "default").join("nau.lock"));
 
     // Adding `beta` at the SAME precedence (both Own) shipping the same
     // binary `dup` must be a hard error with zero writes.
@@ -520,7 +520,7 @@ gated_test!(same_precedence_binary_collision_errors_with_zero_writes, {
         "collision must not bump the generation"
     );
     assert_eq!(
-        snapshot(&pod_dir(root.path(), "default").join("shuttle.lock")),
+        snapshot(&pod_dir(root.path(), "default").join("nau.lock")),
         lock_before,
         "collision must not write the lockfile"
     );
@@ -588,7 +588,7 @@ gated_test!(load_nonexistent_pod_fails_before_any_mutation, {
     let (code, _, stderr) = run(project.path(), root.path(), &["add", "tool"]);
     assert_eq!(code, Some(0), "add failed: {stderr}");
     let gen_before = generation_count(root.path(), "default");
-    let lock_before = snapshot(&pod_dir(root.path(), "default").join("shuttle.lock"));
+    let lock_before = snapshot(&pod_dir(root.path(), "default").join("nau.lock"));
 
     // Loading a pod that has no declaration must fail before any write.
     let decl_path = pod_dir(root.path(), "default").join("pod.lua");
@@ -618,7 +618,7 @@ gated_test!(load_nonexistent_pod_fails_before_any_mutation, {
         "no generation must be created"
     );
     assert_eq!(
-        snapshot(&pod_dir(root.path(), "default").join("shuttle.lock")),
+        snapshot(&pod_dir(root.path(), "default").join("nau.lock")),
         lock_before,
         "lockfile must be untouched"
     );

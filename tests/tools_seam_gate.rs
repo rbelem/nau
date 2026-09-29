@@ -1,8 +1,8 @@
 //! Grep-gate for the floor-tool seam (issue #101 AC-1): no production or
 //! fixture code outside the tools module may spawn a floor tool by bare
-//! name. Every floor-tool spawn must resolve through `shuttle::tools`
+//! name. Every floor-tool spawn must resolve through `nau::tools`
 //! (per-tool precedence: provisioned-first, curl PATH-first) so the
-//! provisioned set, `SHUTTLE_TOOL_<NAME>` overrides, and doctor's resolved
+//! provisioned set, `NAU_TOOL_<NAME>` overrides, and doctor's resolved
 //! origin report stay the single source of truth.
 
 use std::fs;
@@ -58,7 +58,7 @@ fn no_raw_floor_tool_spawns_outside_the_tools_module() {
                 if line.contains(&format!(r#"Command::new("{tool}")"#)) {
                     offenders.push(format!(
                         "{rel}:{}: bare spawn of '{tool}' — resolve through \
-                         shuttle::tools{}",
+                         nau::tools{}",
                         lineno + 1,
                         EXCEPTIONS
                             .iter()

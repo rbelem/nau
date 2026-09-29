@@ -1,0 +1,246 @@
+{
+  "version": 1,
+  "sources": {
+    "https://nodejs.org/dist/v26.7.0/node-v26.7.0-linux-x64.tar.xz": {
+      "sha256": "982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee"
+    },
+    "https://download.gnome.org/sources/glib/2.88/glib-2.88.3.tar.xz": {
+      "sha256": "ab24d24e698dfa1e408b7bcdb508f4aafc906185a8b8ce72fdf79bbbdc9b383b"
+    },
+    "https://zlib.net/zlib-1.3.2.tar.gz": {
+      "sha256": "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
+    },
+    "https://static.rust-lang.org/dist/2026-09-03/rust-1.98.1-x86_64-unknown-linux-gnu.tar.xz": {
+      "sha256": "5326b36c53de11d148c8f8dab6553a3d1006c2cfd32123683073fad3c302605b"
+    },
+    "https://cpan.metacpan.org/authors/id/S/SH/SHAY/perl-5.40.5.tar.gz": {
+      "sha256": "09d926ae2d1b277c3bce62054c41da47c981380d719c41cf980b67945cc581ed"
+    },
+    "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz": {
+      "sha256": "ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888"
+    },
+    "https://github.com/seccomp/libseccomp/releases/download/v2.6.1/libseccomp-2.6.1.tar.gz": {
+      "sha256": "501f66c667225d53791b97e1d7cf85ab764c297d04881f60f38f451c4b0ee1be"
+    },
+    "https://ftp.gnu.org/gnu/gperf/gperf-3.3.tar.gz": {
+      "sha256": "fd87e0aba7e43ae054837afd6cd4db03a3f2693deb3619085e6ed9d8d9604ad8"
+    },
+    "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz": {
+      "sha256": "63aede5c6d33b6d9b13511cd0be2cac046f2e70fd0a07aa9573a04a82783af96"
+    },
+    "https://github.com/1jehuang/jcode/releases/download/v0.61.1/jcode-linux-x86_64.tar.gz": {
+      "sha256": "0ccaa2338887b18c3da76b9f3cd84e7d3a762bda691e71df83440190f4825da0"
+    },
+    "https://github.com/can1357/oh-my-pi/releases/download/v17.3.0/omp-linux-x64": {
+      "sha256": "287f07366f29896ef1e345423dab79b82a8dc0c1593383e20dfdd62a9dd2e799"
+    },
+    "https://github.com/jonas/tig/releases/download/tig-2.6.1/tig-2.6.1.tar.gz": {
+      "sha256": "5adeabdcd93aa0423d618da8b878b53482bef6e0e9e1fe224acc0f18031fe91e"
+    },
+    "https://opencode.ai/files/bin/2.0.18/opencode-linux-x64-baseline.tar.gz": {
+      "sha256": "5db6a93cadec1704b150e3cc807b95e0d6366651c906b0003fb994fba05b7b40"
+    },
+    "https://ftp.gnu.org/gnu/binutils/binutils-2.44.tar.xz": {
+      "sha256": "ce2017e059d63e67ddb9240e9d4ec49c2893605035cd60e92ad53177f4377237"
+    },
+    "https://go.dev/dl/go1.27.1.linux-amd64.tar.gz": {
+      "sha256": "63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445"
+    },
+    "https://github.com/libexpat/libexpat/releases/download/R_2_8_4/expat-2.8.4.tar.gz": {
+      "sha256": "b8ece2437692dad44d851c4532723390a5a330990007706be9c8d2b90d294f36"
+    },
+    "https://gitlab.freedesktop.org/-/project/2891/uploads/7ed597f0cad076a17fe36f8860596f8c/wayland-protocols-1.49.tar.xz": {
+      "sha256": "ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14"
+    },
+    "https://github.com/ogulcancelik/herdr/releases/download/v0.9.0/herdr-linux-x86_64": {
+      "sha256": "4fa1a01158dd8043da92d31b270780b0dcc10603038d9b61cac4d81ab63fb71f"
+    },
+    "https://github.com/bugaevc/wl-clipboard/archive/refs/tags/v2.3.0.tar.gz": {
+      "sha256": "b4dc560973f0cd74e02f817ffa2fd44ba645a4f1ea94b7b9614dacc9f895f402"
+    },
+    "http://deb.debian.org/debian/pool/main/g/gcc-14/libgcc-s1_14.2.0-19_amd64.deb": {
+      "sha256": "3c71917b490d1a17aed43196a2787a256ecf060526cdb20216a74bedc061b150"
+    },
+    "https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz": {
+      "sha256": "92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb"
+    },
+    "https://www.x.org/releases/individual/data/xkeyboard-config/xkeyboard-config-2.48.tar.xz": {
+      "sha256": "b77041324f0109f77161ee43743fe04baa485866af8460d31e476ad3f7648fd5"
+    },
+    "https://github.com/Kitware/CMake/releases/download/v3.31.0/cmake-3.31.0.tar.gz": {
+      "sha256": "300b71db6d69dcc1ab7c5aae61cbc1aa2778a3e00cbd918bc720203e311468c3"
+    },
+    "https://github.com/xkbcommon/libxkbcommon/archive/refs/tags/xkbcommon-1.13.2.tar.gz": {
+      "sha256": "acc4d5f7c3cbba5f9f8d08d8bdbeede84ecede46792f47929aa9321873385528"
+    },
+    "https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz": {
+      "sha256": "a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9"
+    },
+    "https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz": {
+      "sha256": "df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de"
+    },
+    "https://github.com/git-ecosystem/git-credential-manager/releases/download/v2.7.3/gcm-linux-x64-2.7.3.tar.gz": {
+      "sha256": "c7935c3e1b22681d56011b580086aeb6d60f3f0aaf6ef9c581480356988ff804"
+    },
+    "https://ftp.gnu.org/gnu/glibc/glibc-2.43.tar.xz": {
+      "sha256": "d9c86c6b5dbddb43a3e08270c5844fc5177d19442cf5b8df4be7c07cd5fa3831"
+    },
+    "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/v0.14.1/dcg-x86_64-unknown-linux-musl.tar.xz": {
+      "sha256": "e7b39be070ad98f74a1edd59fefb8ac41865ab2aa2c5a4252eb71c5413f3f9df"
+    },
+    "https://github.com/htop-dev/htop/releases/download/3.5.3/htop-3.5.3.tar.xz": {
+      "sha256": "a8b164386494cb85bb255a415a3f5f80afe7a0c4491da5d113b3a0f951087e65"
+    },
+    "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz": {
+      "sha256": "277807353a6726978996945af13e52829e3abd7a9a5b7fb2793894e18f1fcbb2"
+    },
+    "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.0.tar.xz": {
+      "sha256": "bb7f6d80b387c757b7d14bb93028fcb90f793c5c0d367736ee815a100b3891f0"
+    },
+    "https://pkgconfig.freedesktop.org/releases/pkg-config-0.29.2.tar.gz": {
+      "sha256": "6fc69c01688c9458a57eb9a1664c9aba372ccda420a02bf4429fe610e7e7d591"
+    },
+    "https://download.gnome.org/sources/libsecret/0.21/libsecret-0.21.7.tar.xz": {
+      "sha256": "6b452e4750590a2b5617adc40026f28d2f4903de15f1250e1d1c40bfd68ed55e"
+    },
+    "https://github.com/iii-hq/iii/releases/download/iii/v0.11.2/iii-x86_64-unknown-linux-gnu.tar.gz": {
+      "sha256": "9c83c47788b4ef4beeb65dd9bf37e94f993770cd3db874464c3ce1cdc92352cd"
+    },
+    "https://cpan.metacpan.org/authors/id/S/SH/SHANCOCK/Perl-Tidy-20260826.tar.gz": {
+      "sha256": "104e3e5ee5c84524d5e50324d664c7859b1ac422ab97a3e7a248985a4b4f7f64"
+    },
+    "https://github.com/ninja-build/ninja/archive/refs/tags/v1.12.1.tar.gz": {
+      "sha256": "821bdff48a3f683bc4bb3b6f0b5fe7b2d647cf65d52aeb63328c91a6c6df285a"
+    },
+    "https://libisl.sourceforge.io/isl-0.27.tar.xz": {
+      "sha256": "6d8babb59e7b672e8cb7870e874f3f7b813b6e00e6af3f8b04f7579965643d5c"
+    },
+    "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz": {
+      "sha256": "13f74202a3c4c51118b797a39ea4200d3f6cfbe224da6d1d95bb938480132dfd"
+    },
+    "https://opencode.ai/files/bin/2.0.10/opencode-linux-x64-baseline.tar.gz": {
+      "sha256": "d1a5381170301abaddefe461be5c45f1d22136c6064b8c0f79df0db2aa7d5e1e"
+    },
+    "https://github.com/git/git/archive/refs/tags/v2.47.2.tar.gz": {
+      "sha256": "9d9e5d9b762188550b1dffaacea7f9709a43979b030c17f9424b2b27333ad52b"
+    },
+    "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz": {
+      "sha256": "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898"
+    },
+    "https://github.com/tmux/tmux/releases/download/3.5a/tmux-3.5a.tar.gz": {
+      "sha256": "16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951"
+    },
+    "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64-baseline.zip": {
+      "sha256": "c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f"
+    },
+    "https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz": {
+      "sha256": "ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8"
+    },
+    "https://github.com/libffi/libffi/releases/download/v3.8.0/libffi-3.8.0.tar.gz": {
+      "sha256": "7da3e2d9a171eb0a038f592ecad3ff2bb2550f3496d87b3b29ad0cf4430c0db4"
+    },
+    "https://github.com/mesonbuild/meson/releases/download/1.12.0/meson-1.12.0.tar.gz": {
+      "sha256": "88afe0c20e52030218924ac37d0c81c59b4b5f3ae3752c8c6d7470c7d365886c"
+    },
+    "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-x64-baseline.tar.gz": {
+      "sha256": "b283e8dbe9e6fc224bb4b79992ce3bd2174b8b7b0c3e7d1b4e6024a1d11edc84"
+    },
+    "https://gitlab.freedesktop.org/-/project/121/uploads/5f5d2e19a230e8b8250d9a7c2f280846/wayland-1.26.0.tar.xz": {
+      "sha256": "64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3"
+    },
+    "https://github.com/astral-sh/python-build-standalone/releases/download/20250918/cpython-3.12.11%2B20250918-x86_64-unknown-linux-gnu-install_only.tar.gz": {
+      "sha256": "ece4001b4fe88f5fb0dea8a08d84853bad13ebb7077b862a654ea9f2e01f48e6"
+    },
+    "https://opencode.ai/files/bin/2.0.15/opencode-linux-x64-baseline.tar.gz": {
+      "sha256": "71c15a7e31dcb0d4ab9a5c9081f3afe37db4bc7bce623275b42401a4a3a82034"
+    },
+    "https://download.gnome.org/sources/dconf/0.49/dconf-0.49.0.tar.xz": {
+      "sha256": "16a47e49a58156dbb96578e1708325299e4c19eea9be128d5bd12fd0963d6c36"
+    },
+    "https://ftp.gnu.org/gnu/ncurses/ncurses-6.5.tar.gz": {
+      "sha256": "136d91bc269a9a5785e5f9e980bc76ab57428f604ce3e5a5a90cebc767971cc6"
+    },
+    "https://dbus.freedesktop.org/releases/dbus/dbus-1.16.2.tar.xz": {
+      "sha256": "0ba2a1a4b16afe7bceb2c07e9ce99a8c2c3508e5dec290dbb643384bd6beb7e2"
+    }
+  },
+  "snaps": {
+    "lxd": {
+      "revision": 40424,
+      "sha3-384": "f82e214a0977f46c62a908a2c5b54b69caac5b4ca20c7ecf69670f2d3b0f4144eec3887b1c9626cc42ba2f1fe5ca16b3"
+    },
+    "network-manager": {
+      "revision": 952,
+      "sha3-384": "a470f756976132cdfa9c033fa79f262b472dc59b1c5704e6efa4cdfc9c15c329cc95b306f57e1983271854569517ab93"
+    },
+    "snapd": {
+      "revision": 27738,
+      "sha3-384": "dc3bf15d908c01fd2577731b7f6ff2e2d78222101ff23521cadff43e77cb4a5a75294dc9a5d4489a14bb10224d86db44"
+    },
+    "pc-kernel": {
+      "revision": 3654,
+      "sha3-384": "f2dfa2c70b0745e4941a7acd6b60a28c61a91e96fecbbe0be55bd3330618d0520d9422687d96a79b7113f5b11f6ce05d"
+    },
+    "pc": {
+      "revision": 194,
+      "sha3-384": "6f8d511038f88430349a0fa8c05d404b0b8f4e66cd2369ad81523986796122091612b3ff3583d418a0281948721324d1"
+    },
+    "core22": {
+      "revision": 2955,
+      "sha3-384": "f9ef8626ccda54c0d973d0fcd5759c9c1e32ad59f33baf864eed49bc196dd337f94860607db96052617aad934b7beba6"
+    }
+  },
+  "inputs": {
+    "packages": {
+      "revision": "d0f16eb24cba8647d9645c270413ceb60f660fa0",
+      "sha256": "0c019d770344ae4980acfd00b064cc6fba1b2d97eff1dd17439b347d887ed7a3"
+    }
+  },
+  "build_deps": {
+    "rust": {
+      "pin": "1.98.1"
+    },
+    "go": {
+      "pin": "1.27.1"
+    },
+    "dbus": {
+      "pin": "1.16.2"
+    },
+    "gperf": {
+      "pin": "3.3"
+    },
+    "gettext": {
+      "pin": "0.22.5"
+    },
+    "make": {
+      "pin": "4.4.1"
+    },
+    "wayland-protocols": {
+      "pin": "1.49"
+    },
+    "wayland": {
+      "pin": "1.26.0"
+    },
+    "m4": {
+      "pin": "1.4.19"
+    },
+    "p7zip": {
+      "pin": "26.03"
+    },
+    "ninja": {
+      "pin": "1.12.1"
+    },
+    "pkg-config": {
+      "pin": "0.29.2"
+    },
+    "cmake": {
+      "pin": "3.31.0"
+    },
+    "meson": {
+      "pin": "1.12.0"
+    },
+    "gcc": {
+      "pin": "14.2.0"
+    }
+  }
+}

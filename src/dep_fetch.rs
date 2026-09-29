@@ -6,10 +6,10 @@
 //! that runs OUTSIDE the build sandbox with network, resolves the
 //! dependency closure from the lockfile, and materializes it into a
 //! deterministic tree. The tree is digested NAR-style (sorted paths +
-//! contents) into a `deps_hash`, recorded in the pod's `shuttle.lock`, and
+//! contents) into a `deps_hash`, recorded in the pod's `nau.lock`, and
 //! stored as ONE content-addressed pod-store blob. The sandbox build later
 //! verifies that hash and mounts the entry read-only
-//! (`$SHUTTLE_DEPS_DIR`).
+//! (`$NAU_DEPS_DIR`).
 //!
 //! Safety property (council-reviewed): **the fetch never executes
 //! lifecycle/install scripts on the host.** npm closures come from tarball
@@ -62,7 +62,7 @@ pub const DEFAULT_GO_PROXY: &str = "https://proxy.golang.org";
 // ── Orchestration ──
 
 /// Ensure the package's dependency closure is fetched and cached in the
-/// pod store, returning the pin to record in `shuttle.lock`.
+/// pod store, returning the pin to record in `nau.lock`.
 ///
 /// Locked packages (`floating == false`) with a cached store entry never
 /// re-fetch — bit-reproducible. A locked package whose store entry went
@@ -110,7 +110,7 @@ pub fn ensure_pod_deps(
                 miette::bail!(
                     "dependency closure for '{}' changed upstream ({:.12} → {:.12}) \
                      but the package is locked and its cached store entry was missing — \
-                     refusing to move the pin; run `shuttle deps fetch --latest` to move it deliberately",
+                     refusing to move the pin; run `nau deps fetch --latest` to move it deliberately",
                     meta.name,
                     old,
                     hash
@@ -130,7 +130,7 @@ pub fn ensure_pod_deps(
             // TOFU (ADR-0017 Decision 3): print the hash; the lockfile IS
             // the pin record.
             crate::output::ok(format!(
-                "pinned dependency closure for '{}': {:.12}… (recorded in shuttle.lock)",
+                "pinned dependency closure for '{}': {:.12}… (recorded in nau.lock)",
                 meta.name, hash
             ));
             Ok(PackageDepsLock {
@@ -217,7 +217,7 @@ pub fn materialize_deps_entry(
     if !blob.exists() {
         miette::bail!(
             "cached dependency closure {deps_hash:.12}… is missing from the pod store — \
-             run `shuttle deps fetch` to fetch it"
+             run `nau deps fetch` to fetch it"
         );
     }
     let actual = sha256_file(&blob)?;
@@ -881,7 +881,7 @@ fn wheel_python_rank(w: &UvWheel, target_minor: Option<u8>) -> u8 {
 /// The PEP 503-normalized names of packages that exist ONLY for
 /// development (issue #14): the transitive closure of every package's
 /// `dev-dependencies`, minus the closure reachable from the packages
-/// shuttle installs from source. Those prod roots are every NON-registry
+/// nau installs from source. Those prod roots are every NON-registry
 /// source (editable/virtual/directory/git — their regular dependency
 /// closure IS the wanted closure). Fail-safe: a lock with no
 /// source-installed package has no reliable dev/prod split, so an empty
@@ -2107,7 +2107,7 @@ fn http_get_to_file(url: &str, dest: &Path) -> miette::Result<()> {
             "-fsSL",
             "-A",
             concat!(
-                "shuttle/",
+                "nau/",
                 env!("CARGO_PKG_VERSION"),
                 " (dependency-closure fetch)"
             ),
@@ -2222,7 +2222,7 @@ fn resolve_lock(
 /// The sha256 of the first declared lock that resolves from the recipe
 /// directory (resolver order npm → pip → cargo → go; single-resolver
 /// packages are the norm) — the audit value recorded beside `deps_hash`
-/// in shuttle.lock. Every declared lock is resolved here first, so a
+/// in nau.lock. Every declared lock is resolved here first, so a
 /// missing recipe lock fails BEFORE any source download; the per-resolver
 /// fetches re-read the same files.
 fn recipe_lock_sha256(
@@ -3051,7 +3051,7 @@ checksum = "1e37cfd5e7657ada45f742d6e99ca5788580b5c529dc78faf11ece6dc702656f"
 
     #[test]
     fn parse_go_requires_reads_block_and_single_line() {
-        let gomod = r#"module shuttle.test/app
+        let gomod = r#"module nau.test/app
 
 go 1.21
 
@@ -3074,14 +3074,14 @@ require github.com/only/one v0.1.0
 
     #[test]
     fn parse_go_requires_rejects_malformed_entry() {
-        let gomod = "module shuttle.test/app\n\nrequire (\n    github.com/foo/bar\n)\n";
+        let gomod = "module nau.test/app\n\nrequire (\n    github.com/foo/bar\n)\n";
         let err = parse_go_requires(gomod.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("malformed require"), "{err}");
     }
 
     #[test]
     fn parse_go_requires_rejects_unterminated_block() {
-        let gomod = "module shuttle.test/app\n\nrequire (\n    github.com/foo/bar v1.2.3\n";
+        let gomod = "module nau.test/app\n\nrequire (\n    github.com/foo/bar v1.2.3\n";
         let err = parse_go_requires(gomod.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("unterminated"), "{err}");
     }
@@ -3089,11 +3089,10 @@ require github.com/only/one v0.1.0
     #[test]
     fn parse_go_sum_merges_zip_and_mod_hashes() {
         // go.sum records both the module zip hash and its /go.mod hash.
-        let gosum =
-            "shuttle.test/godep v1.0.0 h1:AAAA=\nshuttle.test/godep v1.0.0/go.mod h1:BBBB=\n";
+        let gosum = "nau.test/godep v1.0.0 h1:AAAA=\nnau.test/godep v1.0.0/go.mod h1:BBBB=\n";
         let map = parse_go_sum(gosum.as_bytes()).unwrap();
         let (zip, gm) = map
-            .get(&("shuttle.test/godep".to_string(), "v1.0.0".to_string()))
+            .get(&("nau.test/godep".to_string(), "v1.0.0".to_string()))
             .unwrap();
         assert_eq!(zip, "h1:AAAA=");
         assert_eq!(gm, "h1:BBBB=");
@@ -3101,7 +3100,7 @@ require github.com/only/one v0.1.0
 
     #[test]
     fn parse_go_sum_rejects_non_dirhash() {
-        let gosum = "shuttle.test/godep v1.0.0 sha256:abcd=\n";
+        let gosum = "nau.test/godep v1.0.0 sha256:abcd=\n";
         let err = parse_go_sum(gosum.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("only h1:"), "{err}");
     }
@@ -3110,7 +3109,9 @@ require github.com/only/one v0.1.0
     fn go_dirhash_matches_hermetic_known_vector() {
         // A hand-computed dirhash over two files — the exact formula cmd/go
         // applies. This pins the algorithm so a refactor of the hashing
-        // cannot silently drift from what go.sum records.
+        // cannot silently drift from what go.sum records. The fixture module
+        // path stays `shuttle.test` (fake .test domain, pre-rename): the
+        // expected vectors below were hand-computed over it.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("shuttle.test:godep@v1.0.0");
         std::fs::create_dir_all(&root).unwrap();

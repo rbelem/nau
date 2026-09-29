@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# install.sh — user-home installer for shuttle (https://github.com/rbelem/shuttle)
+# install.sh — user-home installer for nau (https://github.com/rbelem/nau)
 #
 # Installs into the user's home, no root-owned files:
-#   ~/.local/bin/shuttle          the binary
-#   ~/.local/bin/stl              symlink to shuttle (3-key alias)
-#   ~/.local/share/shuttle/repo   managed source clone (builds + updates)
+#   ~/.local/bin/nau              the binary
+#   ~/.local/bin/stl              symlink to nau (3-key alias)
+#   ~/.local/share/nau/repo       managed source clone (builds + updates)
 #   ~/.cargo, ~/.rustup           rust toolchain, bootstrapped only if cargo is missing
 #
 # System packages (squashfs-tools, bubblewrap) are installed via the distro
@@ -17,12 +17,12 @@
 #   ./install.sh --skip-deps --prefix ~/.local      # options
 #
 # Platform support: Linux first (any distro + NixOS + WSL2). macOS is not
-# supported yet — shuttle's sandbox uses bubblewrap and mount namespaces.
+# supported yet — nau's sandbox uses bubblewrap and mount namespaces.
 set -euo pipefail
 
-PREFIX="${SHUTTLE_PREFIX:-$HOME/.local}"
-REF="${SHUTTLE_REF:-main}"
-REPO_URL="${SHUTTLE_REPO_URL:-https://github.com/rbelem/shuttle.git}"
+PREFIX="${NAU_PREFIX:-$HOME/.local}"
+REF="${NAU_REF:-main}"
+REPO_URL="${NAU_REPO_URL:-https://github.com/rbelem/nau.git}"
 SKIP_DEPS=0
 DRY_RUN=0
 
@@ -50,9 +50,9 @@ OS="$(uname -s)"
 case "$OS" in
     Linux) ;;
     Darwin)
-        die "shuttle is Linux-only today: its build sandbox uses bubblewrap and
+        die "nau is Linux-only today: its build sandbox uses bubblewrap and
        mount namespaces, neither of which exists on macOS.
-       Track macOS support at https://github.com/rbelem/shuttle/issues" ;;
+       Track macOS support at https://github.com/rbelem/nau/issues" ;;
     *) die "unsupported OS: $OS" ;;
 esac
 
@@ -67,7 +67,7 @@ if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
     if grep -qi 'WSL2\|microsoft-standard' /proc/version 2>/dev/null; then
         log "WSL2 detected"
     else
-        die "WSL1 detected: no mount namespaces, shuttle cannot run here.
+        die "WSL1 detected: no mount namespaces, nau cannot run here.
        Upgrade to WSL2: https://learn.microsoft.com/windows/wsl/install"
     fi
 fi
@@ -146,17 +146,17 @@ fi
 have cargo || die "cargo still not on PATH after rustup bootstrap"
 
 # ── Source ───────────────────────────────────────────────────────────────
-SHUTTLE_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/shuttle"
-SRC_DIR="${SHUTTLE_SRC:-$SHUTTLE_HOME/repo}"
-if [ -n "${SHUTTLE_SRC:-}" ] && [ -d "$SHUTTLE_SRC" ]; then
-    SRC_DIR="$SHUTTLE_SRC"
-    log "using source at $SRC_DIR (SHUTTLE_SRC override)"
+NAU_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/nau"
+SRC_DIR="${NAU_SRC:-$NAU_HOME/repo}"
+if [ -n "${NAU_SRC:-}" ] && [ -d "$NAU_SRC" ]; then
+    SRC_DIR="$NAU_SRC"
+    log "using source at $SRC_DIR (NAU_SRC override)"
 elif [ -d "$SRC_DIR/.git" ]; then
     log "updating managed clone at $SRC_DIR (ref $REF)"
     run git -C "$SRC_DIR" fetch --depth 1 origin "$REF"
     run git -C "$SRC_DIR" checkout --force FETCH_HEAD
 else
-    mkdir -p "$SHUTTLE_HOME"
+    mkdir -p "$NAU_HOME"
     log "cloning $REPO_URL (ref $REF) into $SRC_DIR"
     run git clone --depth 1 --branch "$REF" "$REPO_URL" "$SRC_DIR" \
         || run git clone --depth 1 "$REPO_URL" "$SRC_DIR"
@@ -167,22 +167,22 @@ log "building (release) — a few minutes on first run"
 run cargo build --release --manifest-path "$SRC_DIR/Cargo.toml"
 
 BIN_DIR="$PREFIX/bin"
-log "installing to $BIN_DIR/shuttle"
+log "installing to $BIN_DIR/nau"
 run mkdir -p "$BIN_DIR"
-run install -m 755 "$SRC_DIR/target/release/shuttle" "$BIN_DIR/shuttle"
-run ln -sfn shuttle "$BIN_DIR/stl"
+run install -m 755 "$SRC_DIR/target/release/nau" "$BIN_DIR/nau"
+run ln -sfn nau "$BIN_DIR/stl"
 
 # ── Verify ───────────────────────────────────────────────────────────────
 if [ "$DRY_RUN" != 1 ]; then
-    log "installed: $("$BIN_DIR/shuttle" --version)"
+    log "installed: $("$BIN_DIR/nau" --version)"
     # Pod-scope readiness (issue #97): doctor --pod gates exactly the pod
     # surface this installer provisions, so its verdict replaces the
     # duplicated bash tool loop. A missing-tool report still warns; a
     # nonzero exit never aborts the install.
-    if "$BIN_DIR/shuttle" doctor --pod; then
-        log "pod surface verified — ready for 'shuttle pod sync'"
+    if "$BIN_DIR/nau" doctor --pod; then
+        log "pod surface verified — ready for 'nau pod sync'"
     else
-        warn "shuttle doctor --pod failed (report above) — 'shuttle pod sync' will fail until present"
+        warn "nau doctor --pod failed (report above) — 'nau pod sync' will fail until present"
     fi
 fi
 
@@ -193,7 +193,7 @@ case ":$PATH:" in
 esac
 
 log "next steps:"
-printf '    shuttle pod --name daily add <package> ...\n'
-printf '    shuttle pod --name daily sync\n'
-printf '    eval "$(shuttle pod shellenv --name daily)"   # put the farm on PATH\n'
+printf '    nau pod --name daily add <package> ...\n'
+printf '    nau pod --name daily sync\n'
+printf '    eval "$(nau pod shellenv --name daily)"   # put the farm on PATH\n'
 printf '\nDocs: %s\n' "$SRC_DIR/README.md"

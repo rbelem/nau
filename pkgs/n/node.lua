@@ -4,7 +4,7 @@
 -- node22 package: two lines coexist ACROSS pods, never within one, and
 -- a pod pins its line with the constraint, not a renamed sibling.
 --
--- Ported from the devbox global profile into a shuttle source package.
+-- Ported from the devbox global profile into a nau source package.
 -- Uses the official prebuilt linux-x64 binaries (same artifact class as
 -- nixpkgs' nodejs): the build only relayouts the tarball into $STAGE;
 -- the #12 portability step repoints the ELF interpreter/RUNPATH at build

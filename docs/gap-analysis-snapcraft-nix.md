@@ -1,30 +1,30 @@
-# Competitive Gap Analysis: shuttle vs Snapcraft & Nix
+# Competitive Gap Analysis: nau vs Snapcraft & Nix
 
 **Date:** 2026-06-01
-**Author:** AI-assisted research (Snapcraft docs, Nix docs, shuttle codebase mapping)
+**Author:** AI-assisted research (Snapcraft docs, Nix docs, nau codebase mapping)
 
 ---
 
 ## 1. Executive Summary
 
-shuttle is a Rust CLI that builds Snap packages from Lua declarations. It has
+nau is a Rust CLI that builds Snap packages from Lua declarations. It has
 completed an 8-phase MVP (single-snap packaging) plus 6 extension phases
 (image assembly, package index, toolchain bootstrap, cross-compilation, etc.).
 121 tests pass, clippy clean.
 
-This document systematically compares shuttle against **Snapcraft** (the
+This document systematically compares nau against **Snapcraft** (the
 established Python Snap builder) and **Nix/NixOS** (the declarative build &
 deployment reference) to identify gaps, opportunities, and priorities.
 
-**Key finding:** shuttle is strongest where Snapcraft is weakest (Lua
+**Key finding:** nau is strongest where Snapcraft is weakest (Lua
 composability, cross-compilation, self-contained binary) and weakest where
 Snapcraft is strongest (plugin ecosystem, remote builds, Store integration).
-Against Nix, shuttle's input system is on the right track but lacks lockfile
+Against Nix, nau's input system is on the right track but lacks lockfile
 pinning and a module system.
 
 ---
 
-## 2. shuttle Current Capabilities (Codebase Map)
+## 2. nau Current Capabilities (Codebase Map)
 
 | Area | Capability | Code Location |
 |------|-----------|---------------|
@@ -36,9 +36,9 @@ pinning and a module system.
 | **Cross-compilation** | `--target` flag, CC/CXX/LD/AR env vars, sysroot mount, CONFIGURE_TARGET | `src/snap.rs` |
 | **Image assembly** | Multi-snap rootfs images (base + kernel + gadget + extras), disk images (GPT partitions, ESP, bootloader) | `src/image.rs` |
 | **Package index** | `package-index.json`, `index()` DSL, store resolution | `src/index.rs` |
-| **Package inputs** | `github:user/repo[/branch]` and `path:/local/dir`, cache at `~/.cache/shuttle/inputs/` | `src/pkg_source.rs` |
-| **Lockfile** | `shuttle.lock` — source hash pinning + snap revision/checksum pinning | `src/lock.rs` |
-| **Binary cache** | `~/.cache/shuttle/pkgs/`, SHA-256 keyed, LRU pruning | `src/cache.rs` |
+| **Package inputs** | `github:user/repo[/branch]` and `path:/local/dir`, cache at `~/.cache/nau/inputs/` | `src/pkg_source.rs` |
+| **Lockfile** | `nau.lock` — source hash pinning + snap revision/checksum pinning | `src/lock.rs` |
+| **Binary cache** | `~/.cache/nau/pkgs/`, SHA-256 keyed, LRU pruning | `src/cache.rs` |
 | **Dependencies** | `requires` field, topological resolution, `--order`, `--tree`, `--flat` | `src/deps.rs` |
 | **Toolchain** | GCC/LLVM bootstrap packages, meta-package orchestrator, `toolchain` field | `pkgs/` |
 | **CLI** | build, image, deps, search, doctor, completion, cache, index subcommands | `src/cli.rs` |
@@ -47,7 +47,7 @@ pinning and a module system.
 
 ---
 
-## 3. Gap Analysis: shuttle vs Snapcraft
+## 3. Gap Analysis: nau vs Snapcraft
 
 ### 3.1 Plugin System — CRITICAL GAP
 
@@ -56,7 +56,7 @@ dotnet, flutter, etc.). Each plugin knows how to configure, build, stage, and
 prime a specific language/build system. Custom plugins are deprecated (core22+)
 in favor of `plugin: nil` + scriptlets.
 
-**shuttle:** No plugin system. Everything is `build = "shell-command"` with
+**nau:** No plugin system. Everything is `build = "shell-command"` with
 `$SRC`, `$STAGE` env vars. This works for simple cases but misses:
 - Language-specific dependency management (cargo fetch, pip install)
 - Build system integration (cmake --build with correct flags)
@@ -74,7 +74,7 @@ Parts have `after:` ordering. The `stage/` directory merges outputs from all
 parts. The `prime/` directory filters staged files per-snap. File-set filtering
 (`stage-files`, `prime-files`) controls what lands where.
 
-**shuttle:** Single build command per snap, no parts. Dependencies are
+**nau:** Single build command per snap, no parts. Dependencies are
 external snaps (via `requires`), not co-packaged build units. No staging
 merge from multiple parts.
 
@@ -85,13 +85,13 @@ Phase B — implement stage/prime lifecycle with merge semantics.
 
 ### 3.3 snap.yaml Coverage — MEDIUM GAP
 
-**Snapcraft snapcraft.yaml fields shuttle does NOT support:**
+**Snapcraft snapcraft.yaml fields nau does NOT support:**
 
 | Field | Importance | Notes |
 |-------|-----------|-------|
 | `layout` | HIGH | Bind mounts, symlinks, tmpfs for FHS compat |
 | `hooks` | HIGH | install, configure, pre-refresh, post-refresh scripts |
-| `plugs` (typed) | MEDIUM | shuttle supports string arrays but not typed plug definitions |
+| `plugs` (typed) | MEDIUM | nau supports string arrays but not typed plug definitions |
 | `slots` (typed) | MEDIUM | Same — string arrays only, not typed with interface/attributes |
 | `environment` (global) | MEDIUM | Per-app env exists, global env missing |
 | `system-usernames` | LOW | Daemon user configuration |
@@ -116,7 +116,7 @@ serialization). Priority order: layout, hooks, typed plugs/slots, environment.
 builds with `--use-lxd` or `--destructive-mode`. Parallel builds via multiple
 containers.
 
-**shuttle:** bubblewrap sandbox only. Host-based with namespace isolation.
+**nau:** bubblewrap sandbox only. Host-based with namespace isolation.
 No container/VM build providers. No parallel builds.
 
 **Priority:** MEDIUM
@@ -130,7 +130,7 @@ Parallelism follows from multi-part support.
 builds. `snapcraft upload --release <channel>` publishes to Snap Store.
 Progressive releases, tracks, channels.
 
-**shuttle:** No remote build. No Store publishing. `shuttle build` is local-only.
+**nau:** No remote build. No Store publishing. `nau build` is local-only.
 Store integration is read-only (resolution + download for image assembly).
 
 **Priority:** MEDIUM
@@ -143,7 +143,7 @@ then Snap Store CLI upload via snapcraft's own tools, then native integration.
 **Snapcraft:** GNOME, KDE, Flutter, ROS extensions pre-configure build/runtime
 environment. `snapcraft expand-extensions` shows the expanded YAML.
 
-**shuttle:** No extension system. Equivalent: Lua modules + merge() pattern.
+**nau:** No extension system. Equivalent: Lua modules + merge() pattern.
 Users can `require("desktop")` and `merge(base, desktop)` — this is arguably
 more flexible than Snapcraft extensions but requires manual authoring.
 
@@ -155,15 +155,15 @@ more flexible than Snapcraft extensions but requires manual authoring.
 **Snapcraft:** Content interface providers/consumers share directories between
 snaps. Layout declarations bind-mount snap-internal paths to host locations.
 
-**shuttle:** Has `plugs` and `slots` as string arrays but no typed content
+**nau:** Has `plugs` and `slots` as string arrays but no typed content
 interface definitions. No `layout` DSL at all.
 
 **Priority:** MEDIUM-HIGH (content sharing is core to the snap ecosystem)
 **Effort:** Medium per feature
 
-### 3.8 Known Snapcraft Pain Points (shuttle advantages)
+### 3.8 Known Snapcraft Pain Points (nau advantages)
 
-| Snapcraft Pain Point | shuttle Advantage |
+| Snapcraft Pain Point | nau Advantage |
 |---------------------|-----------------|
 | YAML complexity + multiple base versions | Single Lua DSL, one base target |
 | Cryptic Pydantic validation errors | Lua stack traces + Rust type safety |
@@ -175,7 +175,7 @@ interface definitions. No `layout` DSL at all.
 
 ---
 
-## 4. Gap Analysis: shuttle vs Nix/NixOS
+## 4. Gap Analysis: nau vs Nix/NixOS
 
 ### 4.1 Lockfile for Inputs — CRITICAL GAP
 
@@ -183,12 +183,12 @@ interface definitions. No `layout` DSL at all.
 hashes (`narHash`). Transitive locking — indirect dependencies are also pinned.
 `nix flake update` updates specific inputs. `follows` prevents duplication.
 
-**shuttle:** Package inputs (`github:user/repo[/branch]`) have a local cache
-but **no lockfile**. `shuttle index update` re-fetches the default input but
+**nau:** Package inputs (`github:user/repo[/branch]`) have a local cache
+but **no lockfile**. `nau index update` re-fetches the default input but
 doesn't pin revisions. This means builds are NOT reproducible across time.
 
 **Priority:** CRITICAL
-**Effort:** Medium (extend `shuttle.lock` with input entries, add `--update`
+**Effort:** Medium (extend `nau.lock` with input entries, add `--update`
 flag to update specific inputs, add `follows`-like dependency propagation)
 
 ### 4.2 Module System — MEDIUM-HIGH GAP
@@ -197,11 +197,11 @@ flag to update specific inputs, add `follows`-like dependency propagation)
 types, `mkIf`/`mkMerge`/`mkForce` priorities, submodules, import composition.
 The `evalModules` function handles configuration merging declaratively.
 
-**shuttle:** Lua `merge()` function handles shallow/deep merging but has no
+**nau:** Lua `merge()` function handles shallow/deep merging but has no
 option declaration system, no type checking beyond ad-hoc validation, no
 conditional enabling (`mkIf` equivalent), no override priorities.
 
-**Priority:** MEDIUM-HIGH (positions shuttle for declarative system assembly)
+**Priority:** MEDIUM-HIGH (positions nau for declarative system assembly)
 **Effort:** Large (new subsystem: option declaration + type system + merge)
 **Path:** Borrow from NixOS: `option { type = "string", default = "x" }`,
 `config = mkIf(condition, { ... })`. Full scope is Phases 6-7 material.
@@ -212,7 +212,7 @@ conditional enabling (`mkIf` equivalent), no override priorities.
 GC-rooted. Hash encodes all build inputs (source + dependencies + build
 script). This enables binary caching, reproducibility, and safe GC.
 
-**shuttle:** Binary cache at `~/.cache/shuttle/pkgs/` is SHA-256 keyed by source
+**nau:** Binary cache at `~/.cache/nau/pkgs/` is SHA-256 keyed by source
 tarball, NOT by full build input. Cache entries can be stale if dependencies
 change without source change. GC is manual (LRU time-based, not reference-
 counted).
@@ -226,7 +226,7 @@ counted).
 **Nix:** Global registry resolves short names (e.g. `nixpkgs` →
 `github:NixOS/nixpkgs/nixos-unstable`). Can be overridden in `nix.conf`.
 
-**shuttle:** Package index (`package-index.json`) serves a similar role but
+**nau:** Package index (`package-index.json`) serves a similar role but
 only covers snap definitions, not input sources. No registry for package
 inputs.
 
@@ -238,15 +238,15 @@ inputs.
 **Nix:** `nix why-depends` shows why a package depends on something. `nix
 store --query --requisites` lists full closure. Tree visualization.
 
-**shuttle:** `shuttle deps` shows direct + transitive dependencies. `--tree` and
+**nau:** `nau deps` shows direct + transitive dependencies. `--tree` and
 `--flat` output modes exist. JSON output for tooling. This is actually
 relatively mature for the current scope.
 
 **Priority:** LOW (already functional)
 
-### 4.6 Nix Pain Points (shuttle advantages)
+### 4.6 Nix Pain Points (nau advantages)
 
-| Nix Pain Point | shuttle Advantage |
+| Nix Pain Point | nau Advantage |
 |----------------|-----------------|
 | Custom functional language | Lua — familiar to many |
 | FHS incompatibility | Snap packages use FHS — no compat layer needed |
@@ -301,10 +301,10 @@ snap {
 **Goal:** Reproducible builds from locked input revisions
 **Effort:** Medium
 **Tasks:**
-1. Extend `shuttle.lock` format with `inputs` section (name → { url, rev, narHash })
-2. `shuttle build --lock` or implicit locking when building with inputs
-3. `shuttle build --update <input>` to refresh a specific input
-4. `shuttle lock` subcommand — generate/update lockfile without building
+1. Extend `nau.lock` format with `inputs` section (name → { url, rev, narHash })
+2. `nau build --lock` or implicit locking when building with inputs
+3. `nau build --update <input>` to refresh a specific input
+4. `nau lock` subcommand — generate/update lockfile without building
 5. Use locked revisions in pkg_source resolution (fail if missing)
 6. Add `--offline` mode that uses only cached/locked inputs
 
@@ -314,7 +314,7 @@ snap {
   "version": 1,
   "inputs": {
     "packages": {
-      "url": "github:rbelem/shuttle/main",
+      "url": "github:rbelem/nau/main",
       "rev": "abcdef1234567890",
       "narHash": "sha256-..."
     }
@@ -403,10 +403,10 @@ snap {
 **Goal:** Build snaps in CI pipelines
 **Effort:** Medium
 **Tasks:**
-1. GitHub Action: `rbelem/shuttle-action` (install shuttle, build, output .snap)
-2. `shuttle github-action` subcommand to generate CI workflow
-3. `shuttle upload` — upload to Snap Store (via snapcraft's store API)
-4. `shuttle release --channel` — release to channels
+1. GitHub Action: `rbelem/nau-action` (install nau, build, output .snap)
+2. `nau github-action` subcommand to generate CI workflow
+3. `nau upload` — upload to Snap Store (via snapcraft's store API)
+4. `nau release --channel` — release to channels
 
 ### Phase 21: NixOS-Inspired Module System
 **Goal:** Declarative system assembly with typed options
@@ -445,7 +445,7 @@ return {
 2. GC using reference counting (Nix-style reachability from roots)
 3. `nix-store --query --requisites` equivalent for snaps
 4. Binary cache export/import for air-gapped builds
-5. `shuttle store --serve` — local binary cache HTTP endpoint
+5. `nau store --serve` — local binary cache HTTP endpoint
 
 ---
 
@@ -475,25 +475,25 @@ return {
 
 ## 7. Competitive Positioning
 
-### Where shuttle wins TODAY:
+### Where nau wins TODAY:
 - **Lua config vs YAML**: Composability, merging, require(), conditionals
 - **Cross-compilation**: Built-in `--target` flag, bubblewrap sandbox
 - **Self-contained binary**: Single Rust binary, no Python dependency
 - **Image assembly**: Full disk image creation from multiple snaps
 - **Package index + inputs**: Nix-inspired runtime package resolution
 
-### Where shuttle needs to catch up:
+### Where nau needs to catch up:
 - **Plugins**: Must implement 4-5 language plugins to be credible
 - **snap.yaml completeness**: Must cover layout, hooks, typed plugs/slots
 - **Lockfile reproducibility**: Must pin input revisions
 - **Multi-part builds**: Single-part snaps are limiting
 
 ### Differentiation strategy:
-1. **Lua DSL as moat** — Snapcraft's YAML is painful; shuttle's Lua is the
+1. **Lua DSL as moat** — Snapcraft's YAML is painful; nau's Lua is the
    core value proposition
 2. **Cross-compilation first** — Snapcraft cross-compilation is complex;
-   shuttle makes it first-class with `--target`
-3. **Ubuntu Core image builder** — shuttle's image assembly is something
+   nau makes it first-class with `--target`
+3. **Ubuntu Core image builder** — nau's image assembly is something
    Snapcraft doesn't do directly (snapcraft doesn't build Ubuntu Core images)
 4. **Nix-inspired architecture** — lockfile + inputs + module system =
    Nix-level reproducibility without Nix's complexity
@@ -509,5 +509,5 @@ return {
 - Nix flakes: https://nix.dev/manual/nix/2.18/command-ref/new-cli/nix3-flake.html
 - NixOS modules: https://nlewo.github.io/nixos-manual-sphinx/development/writing-modules.xml.html
 - Nix derivations: https://nix.dev/manual/nix/latest/language/derivations
-- shuttle codebase: `src/` modules as of commit 92d207a
-- shuttle roadmap: `.planning/archive/ROADMAP.md`
+- nau codebase: `src/` modules as of commit 92d207a
+- nau roadmap: `.planning/archive/ROADMAP.md`

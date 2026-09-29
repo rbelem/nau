@@ -7,7 +7,7 @@
 -- script can invoke go by bare name inside the hermetic sandbox.
 --
 -- Build:
---   shuttle build --file test-fixtures/toolchain-go-probe.lua
+--   nau build --file test-fixtures/toolchain-go-probe.lua
 
 return {
     default = snap {

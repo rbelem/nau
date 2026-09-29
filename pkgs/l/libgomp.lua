@@ -17,7 +17,7 @@
 --
 -- Nix:       part of pkgs.gcc (no standalone split)
 -- Snapcraft: no standalone recipe; ships inside the gcc/lib packages
--- Shuttle:   declarative Lua — the libstdcpp pattern: standalone
+-- Nau:   declarative Lua — the libstdcpp pattern: standalone
 --            configure of gcc's libgomp/ subtree.
 --
 -- Port strategy: pinned to the SAME gcc 14.2 release tarball the

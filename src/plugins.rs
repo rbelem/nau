@@ -1,6 +1,6 @@
 //! Built-in builder plugin registry (ADR-0014).
 //!
-//! Plugins are compiled into shuttle: a part selects one with
+//! Plugins are compiled into nau: a part selects one with
 //! `plugin = "<name>"` plus an options table, and the plugin expands to a
 //! declarative [`BuildPlan`] (commands + env + extra requires/build_deps)
 //! consumed by the existing `run_parts` machinery. No dynamic plugin
@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Version of the built-in plugin registry. Folded into cache keys for
-/// plugin parts (ADR-0014 Decision 5): a shuttle release that changes plugin
+/// plugin parts (ADR-0014 Decision 5): a nau release that changes plugin
 /// expansion invalidates cached artifacts built by older plugins. Bumped to
 /// "2" when `make` gained `variables`/`prefix`/`install` and `autotools`
 /// gained `prefix`/`in_source` (the `make` install line now carries

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# ci-nix-free.sh — prototype nix-free CI bootstrap for the shuttle repo.
+# ci-nix-free.sh — prototype nix-free CI bootstrap for the nau repo.
 #
 # Lane E1 deliverable (docs/agents/devbox-deprecation-plan.md §P2).
 # NOT wired into CI. Four stages, each idempotent and independently
 # runnable:
 #
-#   ./scripts/ci-nix-free.sh --stage install   # (a) apt tools + shuttle binary
+#   ./scripts/ci-nix-free.sh --stage install   # (a) apt tools + nau binary
 #   ./scripts/ci-nix-free.sh --stage payload   # (b) gate pod ← export-tree pull
 #   ./scripts/ci-nix-free.sh --stage gate      # (c) the four gate commands
 #   ./scripts/ci-nix-free.sh --stage summary   # (d) machine-readable summary
@@ -15,12 +15,12 @@
 # apt, GH artifact); the pull in stage (b) is served from loopback.
 set -euo pipefail
 
-REPO="${SHUTTLE_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
-POD="${SHUTTLE_GATE_POD:-gate}"
-PORT="${SHUTTLE_EXPORT_PORT:-8091}"
-ARTIFACT_DIR="${SHUTTLE_EXPORT_DIR:-$REPO/.ci-export}"
-STATE_FILE="${SHUTTLE_GATE_STATE:-$REPO/.ci-gate-state.env}"
-SHUTTLE="${SHUTTLE_BIN:-$HOME/.local/bin/shuttle}"
+REPO="${NAU_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+POD="${NAU_GATE_POD:-gate}"
+PORT="${NAU_EXPORT_PORT:-8091}"
+ARTIFACT_DIR="${NAU_EXPORT_DIR:-$REPO/.ci-export}"
+STATE_FILE="${NAU_GATE_STATE:-$REPO/.ci-gate-state.env}"
+NAU="${NAU_BIN:-$HOME/.local/bin/nau}"
 
 log()  { printf '[ci-nix-free] %s\n' "$*"; }
 die()  { printf '[ci-nix-free] FATAL: %s\n' "$*" >&2; record "$STAGE" fail; exit 1; }
@@ -69,8 +69,8 @@ stage_install() {
         die "mksquashfs/unsquashfs/bwrap missing and no root to install them"
     fi
 
-    log "stage install: shuttle binary"
-    # install.sh: rustup-bootstraps cargo if absent, uses SHUTTLE_SRC to
+    log "stage install: nau binary"
+    # install.sh: rustup-bootstraps cargo if absent, uses NAU_SRC to
     # build *this checkout* (no extra clone), --skip-deps continues past
     # missing system packages with a warning (verified: install.sh:136).
     # Idempotent: cargo build is incremental; install overwrites.
@@ -80,15 +80,15 @@ stage_install() {
             | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
         export PATH="$HOME/.cargo/bin:$PATH"
     fi
-    # NOT-VERIFIED: SHUTTLE_SRC + --skip-deps together on a bare runner —
+    # NOT-VERIFIED: NAU_SRC + --skip-deps together on a bare runner —
     # check that the installer does not abort when bwrap/curl are already
     # present (it should not: NEED_PKGS is only filled from `have` probes).
-    SHUTTLE_SRC="$REPO" "$REPO/install.sh" --skip-deps --prefix "$HOME/.local"
+    NAU_SRC="$REPO" "$REPO/install.sh" --skip-deps --prefix "$HOME/.local"
 
-    log "  $($SHUTTLE --version)"
+    log "  $($NAU --version)"
     # Pod-scope readiness (issue #97 doctor): warnings allowed, this is
     # informational only — a nonzero exit does not abort the bootstrap.
-    $SHUTTLE doctor --pod || log "  WARNING: doctor --pod reported gaps (see above)"
+    $NAU doctor --pod || log "  WARNING: doctor --pod reported gaps (see above)"
     record install pass
 }
 
@@ -97,21 +97,21 @@ stage_payload() {
     STAGE=payload
     log "stage payload: gate pod ← static export tree"
 
-    # Mechanism (plan §4): a pod-bearing machine runs `shuttle export` and
+    # Mechanism (plan §4): a pod-bearing machine runs `nau export` and
     # uploads the tree as a GH Actions artifact; here we download it, serve
     # it on loopback, and pull through the farm's signed-manifest protocol.
     if [ ! -f "$ARTIFACT_DIR/index.json" ]; then
         # NOT-VERIFIED: artifact download. Pick ONE of:
-        #   gh run download <run-id> --name shuttle-export -D "$ARTIFACT_DIR"
+        #   gh run download <run-id> --name nau-export -D "$ARTIFACT_DIR"
         #   (needs gh auth on the runner — GITHUB_TOKEN suffices), or the
         #   actions/artifact v4 REST API via curl. The publisher lane must
-        #   also exist first: `shuttle export --out export-tree/` on a pod
+        #   also exist first: `nau export --out export-tree/` on a pod
         #   machine + actions/upload-artifact. Until that lane lands, this
         #   stage cannot run end-to-end on CI.
         die "no export tree at $ARTIFACT_DIR — download the GH artifact first (see NOT-VERIFIED above)"
     fi
-    # NOT-VERIFIED: `shuttle export` flag spelling (--out vs -o / --dir) —
-    # confirm against `shuttle export --help` when wiring the publisher.
+    # NOT-VERIFIED: `nau export` flag spelling (--out vs -o / --dir) —
+    # confirm against `nau export --help` when wiring the publisher.
 
     # Serve the tree on loopback (idempotent: kill a stale server first).
     if [ -f "$ARTIFACT_DIR/.server.pid" ] && kill -0 "$(cat "$ARTIFACT_DIR/.server.pid")" 2>/dev/null; then
@@ -123,15 +123,15 @@ stage_payload() {
     # Idempotent re-pull: pull verifies sha256 blobs fail-closed, so a
     # repeat pull of the same content is a cheap verified no-op.
     # NOT-VERIFIED: the per-package URL shape for static trees —
-    # `shuttle pull http://127.0.0.1:$PORT/<pkg> --pod "$POD"` is the
+    # `nau pull http://127.0.0.1:$PORT/<pkg> --pod "$POD"` is the
     # documented form (src/cli.rs Pull doc: "http(s)://…/<pkg> from a
     # static export tree"), but confirm whether one call stages the whole
     # generation or each package needs its own pull (expect: rust, glibc,
     # libgcc — the rust recipe's `requires` chain). Also confirm the
-    # --pod staging flag name on `shuttle pull --help`.
+    # --pod staging flag name on `nau pull --help`.
     for pkg in rust glibc libgcc; do
         log "  pull $pkg"
-        $SHUTTLE pull "http://127.0.0.1:$PORT/$pkg" --pod "$POD"
+        $NAU pull "http://127.0.0.1:$PORT/$pkg" --pod "$POD"
     done
 
     # Reconcile the pod so pulled content becomes the active generation the
@@ -141,10 +141,10 @@ stage_payload() {
     # export docstring describes pull as *staging into the pod store*).
     # A sync is harmless either way (reconcile is idempotent) but needs
     # mksquashfs on PATH — stage (a) guarantees that.
-    $SHUTTLE pod sync --name "$POD"
+    $NAU pod sync --name "$POD"
 
     # Smoke: the gate program resolves farm-first.
-    SHUTTLE_SYSTEMD=off $SHUTTLE run --pod "$POD" -- cargo --version \
+    NAU_SYSTEMD=off $NAU run --pod "$POD" -- cargo --version \
         || die "cargo not resolvable through the pod farm"
     record payload pass
 }
@@ -152,21 +152,21 @@ stage_payload() {
 # ═══════════════════════════ (c) gate ═══════════════════════════════════
 stage_gate() {
     STAGE=gate
-    log "stage gate: SHUTTLE_SYSTEMD=off shuttle run -- cargo …"
-    export SHUTTLE_SYSTEMD=off
+    log "stage gate: NAU_SYSTEMD=off nau run -- cargo …"
+    export NAU_SYSTEMD=off
     cd "$REPO"
 
-    $SHUTTLE run --pod "$POD" -- cargo build  --locked
+    $NAU run --pod "$POD" -- cargo build  --locked
     # The test run's stdout is the skip-guard's evidence: pod tests skip
     # silently when mksquashfs/unsquashfs/curl/tar/bwrap are missing
     # (bwrap_gate() pattern) — green but hollow. Fail on that marker.
     TEST_LOG="$REPO/.ci-gate-test.log"
-    $SHUTTLE run --pod "$POD" -- cargo test --locked 2>&1 | tee "$TEST_LOG"
+    $NAU run --pod "$POD" -- cargo test --locked 2>&1 | tee "$TEST_LOG"
     if grep -q "skipping: mksquashfs/unsquashfs/curl/tar/bwrap unavailable" "$TEST_LOG"; then
         die "skip-guard: pod tests ran with gate tools missing — coverage was hollow"
     fi
-    $SHUTTLE run --pod "$POD" -- cargo clippy --locked -- -D warnings
-    $SHUTTLE run --pod "$POD" -- cargo fmt --check
+    $NAU run --pod "$POD" -- cargo clippy --locked -- -D warnings
+    $NAU run --pod "$POD" -- cargo fmt --check
     record gate pass
 }
 

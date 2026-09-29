@@ -81,7 +81,7 @@ return {
             'mkdir -p "$pkg"',
             'cp -r $SRC/dist $SRC/package.json "$pkg/"',
             'cp $SRC/README.md $SRC/LICENSE $SRC/NOTICE $SRC/SKILL.md "$pkg/"',
-            'tar -C "$SHUTTLE_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
+            'tar -C "$NAU_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
         }, " && "),
 
         type = "source",

@@ -22,10 +22,10 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use shuttle::farm::ClaimLayer;
-use shuttle::runtime::{Generation, InstalledPackage};
-use shuttle::services::ServiceUnit;
-use shuttle::snap::ServiceDaemon;
+use nau::farm::ClaimLayer;
+use nau::runtime::{Generation, InstalledPackage};
+use nau::services::ServiceUnit;
+use nau::snap::ServiceDaemon;
 
 // ── Fake systemd tools (pod_deps.rs pattern) ──
 
@@ -169,7 +169,7 @@ fn seed_generation(pod: &Path, n: u64, units: &[ServiceUnit]) {
     let pod_name = pod.file_name().unwrap().to_string_lossy().into_owned();
     for u in units {
         std::fs::write(
-            svc_dir.join(format!("shuttle-pod-{pod_name}-{}.service", u.name)),
+            svc_dir.join(format!("nau-pod-{pod_name}-{}.service", u.name)),
             &u.text,
         )
         .unwrap();
@@ -215,7 +215,7 @@ fn unit_link(config_home: &Path, pod: &str, svc: &str) -> PathBuf {
     config_home
         .join("systemd")
         .join("user")
-        .join(format!("shuttle-pod-{pod}-{svc}.service"))
+        .join(format!("nau-pod-{pod}-{svc}.service"))
 }
 
 fn seed_link(config_home: &Path, pod: &str, svc: &str, target: &Path) {
@@ -247,7 +247,7 @@ impl RollbackRig {
         self.root.path().join("config-home")
     }
 
-    /// Run `shuttle pod [--name <pod>] rollback <target>` through the
+    /// Run `nau pod [--name <pod>] rollback <target>` through the
     /// real binary with the fake tools dir as the ONLY PATH entry (the
     /// rollback path spawns nothing else; every shim is a /bin/sh script
     /// with an absolute shebang).
@@ -258,13 +258,13 @@ impl RollbackRig {
         let argv = argv_path(self.markers.path());
         let _ = std::fs::remove_file(&argv);
         let svc_link = unit_link(&self.config_home(), "alpha", "valkey");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
         cmd.args(["pod", "rollback", target, "--root"])
             .arg(self.root.path())
             .current_dir(self.root.path());
-        cmd.env("SHUTTLE_SYSTEMD", "on");
-        cmd.env("SHUTTLE_POD_TOOLS", "");
-        cmd.env("SHUTTLE_SERVICE_BACKEND", "systemd");
+        cmd.env("NAU_SYSTEMD", "on");
+        cmd.env("NAU_POD_TOOLS", "");
+        cmd.env("NAU_SERVICE_BACKEND", "systemd");
         cmd.env("XDG_CONFIG_HOME", self.config_home());
         cmd.env("PATH", &tools_bin);
         cmd.env("SVC_ARGV", &argv);
@@ -272,7 +272,7 @@ impl RollbackRig {
         if !pod.is_empty() {
             cmd.arg("--name").arg(pod);
         }
-        let out = cmd.output().expect("failed to spawn shuttle pod rollback");
+        let out = cmd.output().expect("failed to spawn nau pod rollback");
         (
             out.status.code(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -302,7 +302,7 @@ fn rollback_restarts_changed_service_on_the_flip() {
         &rig.config_home(),
         "alpha",
         "valkey",
-        &pod.join("generations/2/services/shuttle-pod-alpha-valkey.service"),
+        &pod.join("generations/2/services/nau-pod-alpha-valkey.service"),
     );
 
     let (code, stdout, stderr, argv) = rig.run("alpha", "1");
@@ -316,7 +316,7 @@ fn rollback_restarts_changed_service_on_the_flip() {
         .unwrap();
     let restart = lines
         .iter()
-        .position(|l| l.contains("restart shuttle-pod-alpha-valkey"))
+        .position(|l| l.contains("restart nau-pod-alpha-valkey"))
         .unwrap();
     assert!(reload < restart, "reload must precede restart: {lines:?}");
     assert!(
@@ -360,7 +360,7 @@ fn rollback_activates_newly_enabled_unit_reload_before_enable() {
         .unwrap_or_else(|| panic!("no daemon-reload in log: {lines:?}"));
     let enable = lines
         .iter()
-        .position(|l| l.contains("enable --now shuttle-pod-alpha-valkey"))
+        .position(|l| l.contains("enable --now nau-pod-alpha-valkey"))
         .unwrap_or_else(|| panic!("no enable --now in log: {lines:?}"));
     assert!(reload < enable, "reload must precede enable: {lines:?}");
     assert!(link_of(&rig, "alpha", "valkey").exists());
@@ -392,13 +392,13 @@ fn linger_warning_when_loginctl_reports_no() {
         0,
         "echo Linger=no",
     );
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.args(["pod", "--name", "alpha", "rollback", "1", "--root"])
         .arg(rig.root.path())
         .current_dir(rig.root.path());
-    cmd.env("SHUTTLE_SYSTEMD", "on");
-    cmd.env("SHUTTLE_POD_TOOLS", "");
-    cmd.env("SHUTTLE_SERVICE_BACKEND", "systemd");
+    cmd.env("NAU_SYSTEMD", "on");
+    cmd.env("NAU_POD_TOOLS", "");
+    cmd.env("NAU_SERVICE_BACKEND", "systemd");
     cmd.env("XDG_CONFIG_HOME", rig.config_home());
     cmd.env("PATH", &tools_bin);
     let out = cmd.output().unwrap();
@@ -429,13 +429,13 @@ fn linger_warning_when_loginctl_reports_no() {
         0,
         "echo Linger=yes",
     );
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.args(["pod", "--name", "alpha", "rollback", "1", "--root"])
         .arg(rig2.root.path())
         .current_dir(rig2.root.path());
-    cmd.env("SHUTTLE_SYSTEMD", "on");
-    cmd.env("SHUTTLE_POD_TOOLS", "");
-    cmd.env("SHUTTLE_SERVICE_BACKEND", "systemd");
+    cmd.env("NAU_SYSTEMD", "on");
+    cmd.env("NAU_POD_TOOLS", "");
+    cmd.env("NAU_SERVICE_BACKEND", "systemd");
     cmd.env("XDG_CONFIG_HOME", rig2.config_home());
     cmd.env("PATH", &tools_bin2);
     let out = cmd.output().unwrap();
@@ -456,7 +456,7 @@ fn rollback_withdraws_with_stop_before_unlink() {
     seed_generation(&pod, 2, &[]);
     set_active(&pod, 1);
     seed_state(&pod, &[("valkey", "hash-a", true)]);
-    let gen1_artifact = pod.join("generations/1/services/shuttle-pod-alpha-valkey.service");
+    let gen1_artifact = pod.join("generations/1/services/nau-pod-alpha-valkey.service");
     seed_link(&rig.config_home(), "alpha", "valkey", &gen1_artifact);
 
     // Roll forward to the service-less generation: withdrawn.
@@ -467,7 +467,7 @@ fn rollback_withdraws_with_stop_before_unlink() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("disable --now shuttle-pod-alpha-valkey")),
+            .any(|l| l.contains("disable --now nau-pod-alpha-valkey")),
         "the withdrawal must disable --now: {lines:?}"
     );
     // The stop-then-withdraw witness recorded by the shim: at disable
@@ -504,7 +504,7 @@ fn rollback_disables_newly_disabled_and_removes_the_link() {
         &rig.config_home(),
         "alpha",
         "valkey",
-        &pod.join("generations/2/services/shuttle-pod-alpha-valkey.service"),
+        &pod.join("generations/2/services/nau-pod-alpha-valkey.service"),
     );
 
     let (code, stdout, stderr, argv) = rig.run("alpha", "1");
@@ -514,7 +514,7 @@ fn rollback_disables_newly_disabled_and_removes_the_link() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("disable --now shuttle-pod-alpha-valkey")),
+            .any(|l| l.contains("disable --now nau-pod-alpha-valkey")),
         "newly-disabled stops + disables: {lines:?}"
     );
     assert!(
@@ -548,18 +548,18 @@ fn absent_tools_skip_bus_steps_but_files_still_reconcile() {
         &rig.config_home(),
         "alpha",
         "valkey",
-        &pod.join("generations/2/services/shuttle-pod-alpha-valkey.service"),
+        &pod.join("generations/2/services/nau-pod-alpha-valkey.service"),
     );
 
-    // SHUTTLE_POD_TOOLS=absent: every tool is None — the suite stays
+    // NAU_POD_TOOLS=absent: every tool is None — the suite stays
     // off the real bus, the verb succeeds, and the FILE truth (links +
     // state) still reconciles.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.args(["pod", "--name", "alpha", "rollback", "1", "--root"])
         .arg(rig.root.path())
         .current_dir(rig.root.path());
-    cmd.env("SHUTTLE_POD_TOOLS", "absent");
-    cmd.env("SHUTTLE_SERVICE_BACKEND", "systemd");
+    cmd.env("NAU_POD_TOOLS", "absent");
+    cmd.env("NAU_SERVICE_BACKEND", "systemd");
     cmd.env("XDG_CONFIG_HOME", rig.config_home());
     let out = cmd.output().unwrap();
     let code = out.status.code();
@@ -587,7 +587,7 @@ fn absent_tools_skip_bus_steps_but_files_still_reconcile() {
     assert!(link_target.to_string_lossy().contains("generations/1"));
 }
 
-// N8: an explicit SHUTTLE_SERVICE_BACKEND=launchd|portable must no-op
+// N8: an explicit NAU_SERVICE_BACKEND=launchd|portable must no-op
 // the service emit like the reconcile tail does (named skip, verb
 // succeeds) — while an unknown value still fails the verb.
 #[test]
@@ -610,13 +610,13 @@ fn known_non_systemd_backend_noops_the_services_tail() {
         // rollback path must never reach the host's real bus tools.
         let tools_bin = tools_bin_with(rig.markers.path());
         let _ = std::fs::remove_file(argv_path(rig.markers.path()));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
         cmd.args(["pod", "--name", "alpha", "rollback", "1", "--root"])
             .arg(rig.root.path())
             .current_dir(rig.root.path());
-        cmd.env("SHUTTLE_SYSTEMD", "on");
-        cmd.env("SHUTTLE_POD_TOOLS", "");
-        cmd.env("SHUTTLE_SERVICE_BACKEND", backend);
+        cmd.env("NAU_SYSTEMD", "on");
+        cmd.env("NAU_POD_TOOLS", "");
+        cmd.env("NAU_SERVICE_BACKEND", backend);
         cmd.env("XDG_CONFIG_HOME", rig.config_home());
         cmd.env("PATH", &tools_bin);
         let out = cmd.output().unwrap();
@@ -651,7 +651,7 @@ fn known_non_systemd_backend_noops_the_services_tail() {
     let (code, combined) = run_with_backend("openrc");
     assert_ne!(code, Some(0), "unknown backend must fail: {combined}");
     assert!(
-        combined.contains("SHUTTLE_SERVICE_BACKEND"),
+        combined.contains("NAU_SERVICE_BACKEND"),
         "the failure names the override: {combined}"
     );
 }
@@ -681,7 +681,7 @@ fn tools_arriving_later_converge_the_skipped_registration() {
         &rig.config_home(),
         "alpha",
         "valkey",
-        &pod.join("generations/1/services/shuttle-pod-alpha-valkey.service"),
+        &pod.join("generations/1/services/nau-pod-alpha-valkey.service"),
     );
 
     let (code, _, stderr, argv) = rig.run("alpha", "1");
@@ -740,7 +740,7 @@ fn cross_pod_same_endpoint_collides_without_bus_calls() {
     assert!(
         !argv_lines(&argv)
             .iter()
-            .any(|l| l.contains("shuttle-pod-alpha-valkey")),
+            .any(|l| l.contains("nau-pod-alpha-valkey")),
         "no service unit may be touched: {stdout}{stderr}"
     );
 }
@@ -921,7 +921,7 @@ impl SyncRig {
         // Each invocation gets a fresh log.
         let _ = std::fs::remove_file(argv_path(self.markers.path()));
         let host_path = std::env::var("PATH").unwrap_or_default();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
         cmd.arg("pod");
         if !pod.is_empty() {
             cmd.arg("--name").arg(pod);
@@ -930,15 +930,15 @@ impl SyncRig {
             .arg("--root")
             .arg(self.root.path())
             .current_dir(self.project.path());
-        cmd.env("SHUTTLE_DATA_HOME", self.root.path().join("data-home"));
-        cmd.env("SHUTTLE_SERVICE_BACKEND", "systemd");
+        cmd.env("NAU_DATA_HOME", self.root.path().join("data-home"));
+        cmd.env("NAU_SERVICE_BACKEND", "systemd");
         cmd.env("XDG_CONFIG_HOME", self.config_home());
-        cmd.env("SHUTTLE_SYSTEMD", "on");
-        cmd.env("SHUTTLE_POD_TOOLS", "");
+        cmd.env("NAU_SYSTEMD", "on");
+        cmd.env("NAU_POD_TOOLS", "");
         cmd.env("SVC_ARGV", argv_path(self.markers.path()));
         cmd.env("SVC_LINK", link_of_sync(self, "valkey"));
         cmd.env("PATH", format!("{}:{}", tools_bin.display(), host_path));
-        let out = cmd.output().expect("failed to spawn shuttle pod");
+        let out = cmd.output().expect("failed to spawn nau pod");
         (
             out.status.code(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -946,10 +946,10 @@ impl SyncRig {
         )
     }
 
-    /// The same, but with the suite-default env (`SHUTTLE_SYSTEMD=off`):
+    /// The same, but with the suite-default env (`NAU_SYSTEMD=off`):
     /// no tools resolve, the tail skips with named entries.
     fn run_default_env(&self, pod: &str, args: &[&str]) -> (Option<i32>, String, String) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
         cmd.arg("pod");
         if !pod.is_empty() {
             cmd.arg("--name").arg(pod);
@@ -958,11 +958,11 @@ impl SyncRig {
             .arg("--root")
             .arg(self.root.path())
             .current_dir(self.project.path());
-        cmd.env("SHUTTLE_DATA_HOME", self.root.path().join("data-home"));
-        cmd.env("SHUTTLE_SERVICE_BACKEND", "systemd");
+        cmd.env("NAU_DATA_HOME", self.root.path().join("data-home"));
+        cmd.env("NAU_SERVICE_BACKEND", "systemd");
         cmd.env("XDG_CONFIG_HOME", self.config_home());
-        cmd.env("SHUTTLE_SYSTEMD", "off");
-        let out = cmd.output().expect("failed to spawn shuttle pod");
+        cmd.env("NAU_SYSTEMD", "off");
+        let out = cmd.output().expect("failed to spawn nau pod");
         (
             out.status.code(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1026,7 +1026,7 @@ gated_test!(sync_enable_runs_reload_then_enable_now, {
         .unwrap();
     let enable = lines
         .iter()
-        .position(|l| l.contains("enable --now shuttle-pod-default-valkey"))
+        .position(|l| l.contains("enable --now nau-pod-default-valkey"))
         .unwrap();
     assert!(reload < enable, "reload must precede enable: {lines:?}");
     assert!(link_of_sync(&rig, "valkey").exists());
@@ -1059,7 +1059,7 @@ gated_test!(sync_option_change_restarts_the_service, {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("restart shuttle-pod-default-valkey")),
+            .any(|l| l.contains("restart nau-pod-default-valkey")),
         "an option change restarts: {lines:?}"
     );
     assert!(
@@ -1100,7 +1100,7 @@ gated_test!(sync_version_bump_restarts_the_service, {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("restart shuttle-pod-default-valkey")),
+            .any(|l| l.contains("restart nau-pod-default-valkey")),
         "a binary-only upgrade restarts (hash covers the package digest): {lines:?}"
     );
 });
@@ -1131,7 +1131,7 @@ gated_test!(remove_withdraws_with_stop_before_unlink, {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("disable --now shuttle-pod-default-valkey")),
+            .any(|l| l.contains("disable --now nau-pod-default-valkey")),
         "the removal withdraws with disable --now: {lines:?}"
     );
     assert!(

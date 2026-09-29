@@ -1,6 +1,6 @@
 //! Peer and static-lane `pull` (ADR-0033 Decisions 5, 7, 10): fetch a
 //! signed [`crate::pkg_manifest::PackageManifest`] plus its missing
-//! blobs from a `shuttle://` peer or an `http(s)://` export tree,
+//! blobs from a `nau://` peer or an `http(s)://` export tree,
 //! verify fail-closed (signature first against the trusted-key set,
 //! then the static tree's index cross-check, then every blob hash),
 //! and stage into the named pod's store — the pull-staging inbox
@@ -168,7 +168,7 @@ fn url_dir<'a>(raw: &'a str, pkg: &str) -> miette::Result<&'a str> {
 fn reference_string(source: &PullRef) -> String {
     match source {
         PullRef::Peer { host, port, pkg } => {
-            format!("shuttle://{}:{port}/{pkg}", host_for_url(host))
+            format!("nau://{}:{port}/{pkg}", host_for_url(host))
         }
         PullRef::Url { url, .. } => url.as_str().to_string(),
         PullRef::Oci(_) => "oci".to_string(),
@@ -438,7 +438,7 @@ pub struct StagedBlob {
     pub sha256: String,
 }
 
-/// `shuttle pull <peer|url> --json` payload — mirrors
+/// `nau pull <peer|url> --json` payload — mirrors
 /// [`crate::oci::PullReportJson`]'s shape (command/reference/digest +
 /// per-file records) adapted to staging.
 #[derive(Debug, Serialize)]
@@ -462,7 +462,7 @@ pub struct PullPeerReport {
 
 // ── The pipeline ──
 
-/// The operator keychain directory (`~/.config/shuttle/keys/`).
+/// The operator keychain directory (`~/.config/nau/keys/`).
 fn operator_keys_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     crate::sign::keys_dir(&PathBuf::from(home))
@@ -471,7 +471,7 @@ fn operator_keys_dir() -> PathBuf {
 /// Run a peer or static pull for `source` into the named pod (`None` =
 /// the default pod). `allow_downgrade` lifts the freshness rule's
 /// older-revision refusal (ADR-0033 Decision 7). Trust anchors come
-/// from the device image (`/etc/shuttle/update-key.pub` — the runtime
+/// from the device image (`/etc/nau/update-key.pub` — the runtime
 /// anchor) AND the operator keychain. Verifies and stages;
 /// installation stays the pod workflow.
 pub fn run(source: &PullRef, pod: Option<&str>, allow_downgrade: bool) -> miette::Result<()> {
@@ -783,7 +783,7 @@ mod tests {
     }
 
     fn peer_ref() -> PullRef {
-        PullRef::parse("shuttle://peer.test:7780/hello").unwrap()
+        PullRef::parse("nau://peer.test:7780/hello").unwrap()
     }
 
     // ── Pure: the downgrade decision ──
@@ -824,7 +824,7 @@ mod tests {
     /// URL is not parseable by curl).
     #[test]
     fn bracketed_ipv6_references_map_to_bracketed_urls() {
-        let r = PullRef::parse("shuttle://[::1]:7780/hello").unwrap();
+        let r = PullRef::parse("nau://[::1]:7780/hello").unwrap();
         match &r {
             PullRef::Peer { host, port, pkg } => {
                 assert_eq!(host, "::1");
@@ -833,7 +833,7 @@ mod tests {
             }
             other => panic!("expected Peer, got {other:?}"),
         }
-        let default = PullRef::parse("shuttle://[::1]/hello").unwrap();
+        let default = PullRef::parse("nau://[::1]/hello").unwrap();
         match &default {
             PullRef::Peer { host, port, .. } => {
                 assert_eq!(host, "::1");
@@ -845,7 +845,7 @@ mod tests {
             manifest_url(&default, "hello").unwrap(),
             "http://[::1]:7780/manifests/hello"
         );
-        assert_eq!(reference_string(&r), "shuttle://[::1]:7780/hello");
+        assert_eq!(reference_string(&r), "nau://[::1]:7780/hello");
     }
 
     #[test]
@@ -859,10 +859,10 @@ mod tests {
             blob_url(&r, "vim", &"cd".repeat(32)).unwrap(),
             format!("http://mirror.test:9000/mirror/blobs/{}", "cd".repeat(32))
         );
-        let nested = PullRef::parse("https://mirror.example/shuttle/ghi").unwrap();
+        let nested = PullRef::parse("https://mirror.example/nau/ghi").unwrap();
         assert_eq!(
             manifest_url(&nested, "ghi").unwrap(),
-            "https://mirror.example/shuttle/manifests/ghi.json"
+            "https://mirror.example/nau/manifests/ghi.json"
         );
     }
 

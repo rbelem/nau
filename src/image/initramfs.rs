@@ -1,12 +1,12 @@
 //! Native initramfs construction (issue #75).
 //!
 //! A kernel that follows the native verity contract (`root=PARTUUID=…` plus
-//! the shuttle-private `shuttle.roothash` and `shuttle.verity_data` /
+//! the nau-private `nau.roothash` and `nau.verity_data` /
 //! `_hash` devices, issue #92) needs an initramfs that mounts that root
 //! read-only and `switch_root`s into it. A stock Ubuntu Core `pc-kernel`
 //! snap ships
 //! Canonical's snap-bootstrap initramfs instead, which mounts a writable
-//! `ubuntu-data` and never verifies a shuttle root, so shuttle builds its
+//! `ubuntu-data` and never verifies a nau root, so nau builds its
 //! own.
 //!
 //! This module owns the pure, host-independent pieces: reading the snap's
@@ -18,7 +18,7 @@
 //!
 //! `modules.dep` maps a module path (`kernel/drivers/md/dm-verity.ko`) to
 //! that module's dependency paths, all relative to the `modules/<ver>/`
-//! directory. Shuttle's boot-chain requirement is expressed as module
+//! directory. Nau's boot-chain requirement is expressed as module
 //! *names* (`dm-verity`, from [`crate::doctor::required_initrd_modules`]),
 //! so [`module_closure`] resolves each name to its one `.ko` path (a
 //! `.ko.xz`/`.ko.zst`/`.ko.gz` on-disk spelling resolves to the same
@@ -453,8 +453,8 @@ pub(crate) fn discover_initramfs_tools() -> miette::Result<InitramfsTools> {
         }
         crate::snap::resolve_in_path(name, &entries).ok_or_else(|| {
             miette::miette!(
-                "initramfs tool '{name}' not found — shuttle builds a native initramfs \
-                 for a prebuilt-UKI kernel and needs {name}; run 'shuttle doctor' and \
+                "initramfs tool '{name}' not found — nau builds a native initramfs \
+                 for a prebuilt-UKI kernel and needs {name}; run 'nau doctor' and \
                  add {package} to devbox.json packages"
             )
         })
@@ -937,10 +937,10 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
                 kind: CpioKind::Directory { mode: 0o755 },
             },
             CpioEntry {
-                name: "etc/shuttle.conf",
+                name: "etc/nau.conf",
                 kind: CpioKind::File {
                     mode: 0o644,
-                    data: b"root=PARTUUID=x shuttle.roothash=deadbeef\n",
+                    data: b"root=PARTUUID=x nau.roothash=deadbeef\n",
                 },
             },
             CpioEntry {
@@ -966,7 +966,7 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
             members,
             vec![
                 "etc".to_string(),
-                "etc/shuttle.conf".to_string(),
+                "etc/nau.conf".to_string(),
                 "sbin/init".to_string(),
                 "sbin".to_string(),
             ]
@@ -1236,12 +1236,12 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
     }
 
     /// Assemble against the real extracted `pc-kernel` rev 3654 tree when
-    /// `SHUTTLE_REAL_PCKERNEL` names it — skipped by default so the suite has
+    /// `NAU_REAL_PCKERNEL` names it — skipped by default so the suite has
     /// no host-path dependency. Proves the closure, `/modules.load`, and the
     /// archive against the shipped module tree, not a fixture.
     #[test]
     fn build_native_initramfs_against_the_real_pc_kernel_tree() {
-        let Ok(tree) = std::env::var("SHUTTLE_REAL_PCKERNEL") else {
+        let Ok(tree) = std::env::var("NAU_REAL_PCKERNEL") else {
             return;
         };
         let root = Path::new(&tree);

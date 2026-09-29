@@ -44,11 +44,11 @@ purchase action, not automated here.
 |---|---|---|---|
 | `www.nau.rclb.dev` | Distro landing page: what Nau is, mission list, download links, verification instructions (SHA256SUMS + signed manifest check), pronunciation guide (ADR-0013 ships one) | Static files, Caddy `file_server` | Everyone |
 | `download.nau.rclb.dev` | Mission images: `nau-<mission>-<version>-<arch>.img` + `SHA256SUMS` + signed image manifest (ADR-0044 D5), plus sysupdate transfer artifacts — the `update_source` URL baked into released images | Static files, Caddy `file_server` | Installing users; installed machines (updates) |
-| `cache.nau.rclb.dev` | Public package mirror: the ADR-0033 Decision 10 export tree (`index.json`, `manifests/`, `blobs/`) for the released pool — what `shuttle pull https://…` and Nau pods consume | Static files, Caddy `file_server` | Nau users' machines |
+| `cache.nau.rclb.dev` | Public package mirror: the ADR-0033 Decision 10 export tree (`index.json`, `manifests/`, `blobs/`) for the released pool — what `nau pull https://…` and Nau pods consume | Static files, Caddy `file_server` | Nau users' machines |
 
 Deliberately absent: no auth service, no API, no state. Everything under
 `nau.rclb.dev` is a static file served read-only. The operator's build cache
-stays on `cache.zet.rclb.dev/shuttle-cache/` — different content class
+stays on `cache.zet.rclb.dev/nau-cache/` — different content class
 (build cache vs released pool), different audience, different lifecycle.
 
 ## Decisions
@@ -84,7 +84,7 @@ stays on `cache.zet.rclb.dev/shuttle-cache/` — different content class
 3. **Publishing is rsync over the tailnet, per lane.** `www` and `download`
    publish from the repo/tree the release flow produces (#266 emits the
    media set; this plan gives it a destination directory layout);
-   `cache` publishes from `shuttle export` of the released pool. All
+   `cache` publishes from `nau export` of the released pool. All
    three are `rsync -r --delete` runs from the workstation (download
    scoped to the staging area, never over released mission dirs per
    decision 2) — idempotent, secrets-free. Each publish updates a
@@ -113,7 +113,7 @@ stays on `cache.zet.rclb.dev/shuttle-cache/` — different content class
    — landing page 200, `download` HEAD on the current `SHA256SUMS`,
    `cache` GET on `index.json`, plus the stamp content-match of decision
    3. Security headers on all three vhosts; HSTS only after every
-   consumer is confirmed https-capable (sysupdate is; old `shuttle pull`
+   consumer is confirmed https-capable (sysupdate is; old `nau pull`
    versions must be checked before flipping it). `www` gets robots.txt +
    sitemap (#275 scope). Directory listing stays off; a checklist
    assertion proves `GET /missions/<m>/` returns the index file or 404,
@@ -145,15 +145,15 @@ stays on `cache.zet.rclb.dev/shuttle-cache/` — different content class
 6. **Deploy** — the standard `scripts/deploy.sh` phases (tofu → dns →
    caddy → deploy); no secrets phases needed (nothing new authenticates).
 
-## shuttle-side tickets
+## nau-side tickets
 
 - **#274 (new): publication lane wiring** — the download directory layout
   per mission (`missions/<mission>/{images,SHA256SUMS,manifest,updates}`
   plus the `current.json` pointer file of decision 4), the `update_source`
-  value baked by `shuttle image --release` pointing at
+  value baked by `nau image --release` pointing at
   `download.nau.rclb.dev`, and the rsync publish wrapper. Rides ADR-0044
   ratification (#261) and lands with #266.
-- **#275 (new): public package mirror** — `shuttle export` of the released
+- **#275 (new): public package mirror** — `nau export` of the released
   pool to the `cache.nau.rclb.dev` tree: which packages a mission pins,
   export-tree freshness stamp, the publish wrapper, and confirmation that
   the signed-manifest verification machinery covers `index.json` and the

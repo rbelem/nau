@@ -456,7 +456,7 @@ pub struct DoctorOutputJson {
 
 // ── Lock JSON ──
 
-/// One pinned input for `shuttle lock --json`.
+/// One pinned input for `nau lock --json`.
 #[derive(Debug, Clone, Serialize)]
 pub struct LockPinJson {
     pub name: String,

@@ -9,7 +9,7 @@ return {
         -- adopt-info end-to-end: version/summary/description are extracted
         -- at build time from the adopted part (configure.ac AC_INIT gives
         -- the version). Nothing is hardcoded here — the real version lands
-        -- in snap.yaml and the output filename, and `shuttle check` shows
+        -- in snap.yaml and the output filename, and `nau check` shows
         -- the identity as adopted-at-build.
         adopt_info = "tools",
         grade = "stable",

@@ -17,10 +17,10 @@ use super::*;
 /// Derivation namespaces for the deterministic identity GUIDs (#48).
 /// Distinct constants keep a partition's PARTUUID, its filesystem UUID, and
 /// its directory-hash seed from ever colliding by accident.
-pub(crate) const GUID_NS_DISK: &str = "shuttle.gpt.disk.v1";
-pub(crate) const GUID_NS_PARTITION: &str = "shuttle.gpt.part.v1";
-pub(crate) const GUID_NS_FSUUID: &str = "shuttle.ext4.uuid.v1";
-pub(crate) const GUID_NS_HASH_SEED: &str = "shuttle.ext4.hashseed.v1";
+pub(crate) const GUID_NS_DISK: &str = "nau.gpt.disk.v1";
+pub(crate) const GUID_NS_PARTITION: &str = "nau.gpt.part.v1";
+pub(crate) const GUID_NS_FSUUID: &str = "nau.ext4.uuid.v1";
+pub(crate) const GUID_NS_HASH_SEED: &str = "nau.ext4.hashseed.v1";
 
 /// A deterministic GUID derived from `namespace` + `parts` (SHA-256, first
 /// 16 bytes, dashed) — the reproducible replacement for the random GUIDs
@@ -948,7 +948,7 @@ fn route_side_partition<'a>(
 
 /// mkfs an EMPTY ext4 filesystem for a `role = "state"` partition
 /// (ADR-0023). The state surface is populated at BOOT by tmpfiles
-/// (`/var/lib/shuttle`, `/var/lib/extensions`) — its correct build-time
+/// (`/var/lib/nau`, `/var/lib/extensions`) — its correct build-time
 /// content is nothing at all. Populating it from `ctx.root` (the data
 /// path) filled the whole partition with the ~3 GiB rootfs and overflowed
 /// a modest state extent, leaving a zeroed partition where fstab mounts
@@ -1031,7 +1031,7 @@ fn mkfs_vfat_partition(
             "mkfs.fat not found on PATH — the disk build formats the ESP (and any \
              vfat partition) with dosfstools ≥ 4.2 ('mkfs.fat --invariant') so the \
              volume identity is reproducible; refusing to emit an irreproducible \
-             ESP. Run 'shuttle doctor' and install it (e.g. apt install dosfstools \
+             ESP. Run 'nau doctor' and install it (e.g. apt install dosfstools \
              or add dosfstools to devbox.json packages)"
         ));
     };
@@ -1270,7 +1270,7 @@ pub(crate) fn uc_role_for_partlabel(label: &str) -> Option<&'static str> {
 /// (`device/modeenv`) are staged into scratch dirs for the populate stage.
 ///
 /// Every snap in the seed must carry its store snap-id (resolved here, or
-/// overridden through `SHUTTLE_SNAP_IDS`); a kernel snap without a
+/// overridden through `NAU_SNAP_IDS`); a kernel snap without a
 /// `kernel.efi`, a gadget snap missing its boot assets, or a seed
 /// partition with the wrong filesystem are all named, fail-closed errors.
 ///
@@ -1429,7 +1429,7 @@ pub(crate) fn setup_uc_context(
     let model = crate::uc::ModelAssertion::from_image(image, arch, &snap_ids)?;
     // #293 item 8: the central fail-closed HOME resolution — a CWD
     // fallback would silently load-or-create the assertion key under
-    // ./.config/shuttle.
+    // ./.config/nau.
     let home = super::verify::operator_home()?;
     // snapd verifies assertions with OpenPGP v4 RSA — a DIFFERENT key (and
     // crypto) from the ADR-0011 manifest key, persisted separately.
@@ -1609,7 +1609,7 @@ fn resolve_snap_ids(
 /// The STORE name for a declared snap name: the package index maps aliases
 /// (`pc-gadget` → store `pc`); names the index doesn't know pass through.
 fn store_name_for(name: &str) -> String {
-    let path = std::env::var("SHUTTLE_INDEX_PATH")
+    let path = std::env::var("NAU_INDEX_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
     let Ok(index) = crate::index::PackageIndex::load_or_default(&path) else {

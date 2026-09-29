@@ -1,7 +1,7 @@
 //! End-to-end probes for the worker stderr forwarder (issue #76). The
 //! forwarder must stay a containment-neutral piece of plumbing:
 //!
-//! * the forwarded stream is capped at [`shuttle::isolate`]'s documented
+//! * the forwarded stream is capped at [`nau::isolate`]'s documented
 //!   cap and DRAINED (discarded) past it, so a print() flood cannot stall
 //!   the child or balloon the parent;
 //! * a parent stderr sink that stops reading cannot hold the parent past
@@ -12,11 +12,11 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use shuttle::isolate::{self, EvalRequest, RunStatus, WorkerOutcome};
+use nau::isolate::{self, EvalRequest, RunStatus, WorkerOutcome};
 
 fn request(label: &str, source: &str) -> EvalRequest {
     EvalRequest {
-        prelude: shuttle::dsl::INIT_LUA.to_string(),
+        prelude: nau::dsl::INIT_LUA.to_string(),
         index_data: serde_json::json!({ "version": 1, "snaps": [] }),
         arch: "amd64".into(),
         sources: BTreeMap::new(),

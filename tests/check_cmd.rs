@@ -1,4 +1,4 @@
-//! `shuttle check` integration tests (ADR-0010 Decisions 2-3).
+//! `nau check` integration tests (ADR-0010 Decisions 2-3).
 //!
 //! Drives the real binary over the real subprocess-eval path: success
 //! reporting, failing definitions (exit code + diagnostics), and the
@@ -7,12 +7,12 @@
 use std::process::Command;
 
 fn run_check(dir: &std::path::Path, json: bool) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
-    cmd.arg("check").arg("shuttle.lua").current_dir(dir);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
+    cmd.arg("check").arg("nau.lua").current_dir(dir);
     if json {
         cmd.arg("--json");
     }
-    let out = cmd.output().expect("failed to spawn shuttle check");
+    let out = cmd.output().expect("failed to spawn nau check");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -21,7 +21,7 @@ fn run_check(dir: &std::path::Path, json: bool) -> (Option<i32>, String, String)
 }
 
 fn write_def(dir: &std::path::Path, source: &str) {
-    std::fs::write(dir.join("shuttle.lua"), source).unwrap();
+    std::fs::write(dir.join("nau.lua"), source).unwrap();
 }
 
 const GOOD_DEF: &str = r#"
@@ -127,10 +127,7 @@ fn check_missing_file_exits_one() {
     let dir = tempfile::tempdir().unwrap();
     let (code, _, stderr) = run_check(dir.path(), false);
     assert_eq!(code, Some(1));
-    assert!(
-        stderr.contains("could not read shuttle.lua"),
-        "got: {stderr}"
-    );
+    assert!(stderr.contains("could not read nau.lua"), "got: {stderr}");
 }
 
 // ── JSON mode ──
@@ -142,7 +139,7 @@ fn check_json_success_shape() {
     let (code, stdout, _) = run_check(dir.path(), true);
     assert_eq!(code, Some(0));
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON on stdout");
-    assert_eq!(v["file"], "shuttle.lua");
+    assert_eq!(v["file"], "nau.lua");
     assert_eq!(v["ok"], true);
     assert_eq!(v["outputs"], serde_json::json!(["default"]));
     assert_eq!(v["diagnostics"], serde_json::json!([]));
@@ -163,14 +160,14 @@ return {
     let (code, stdout, _) = run_check(dir.path(), true);
     assert_eq!(code, Some(1));
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON on stdout");
-    assert_eq!(v["file"], "shuttle.lua");
+    assert_eq!(v["file"], "nau.lua");
     assert_eq!(v["ok"], false);
     // The output that passed validation is still listed.
     assert_eq!(v["outputs"], serde_json::json!(["good"]));
 
     let diags = v["diagnostics"].as_array().expect("diagnostics array");
     assert_eq!(diags.len(), 1);
-    assert_eq!(diags[0]["label"], "shuttle.lua");
+    assert_eq!(diags[0]["label"], "nau.lua");
     assert_eq!(diags[0]["key"], "bad");
     assert_eq!(diags[0]["expected"], serde_json::Value::Null);
     assert_eq!(diags[0]["actual"], serde_json::Value::Null);
@@ -203,7 +200,7 @@ fn check_json_hard_error_carries_diagnostic_with_null_key() {
     );
 }
 
-// ── Analyzer gate (ADR-0010 Decision 2, stage 1 of `shuttle check`) ──
+// ── Analyzer gate (ADR-0010 Decision 2, stage 1 of `nau check`) ──
 
 /// A `name = 42`-style type error against an explicit annotation: the
 /// analyzer stage reports it with a 1-based span and fast-fails before the
@@ -249,7 +246,7 @@ fn check_analyzer_type_error_fast_fails_before_eval_human() {
     let (code, _, stderr) = run_check(dir.path(), false);
     assert_eq!(code, Some(1));
     assert!(
-        stderr.contains("shuttle.lua:2:"),
+        stderr.contains("nau.lua:2:"),
         "human output must carry the 1-based span: {stderr}"
     );
     // Fast fail: the eval stage (which would report the same problem as a
@@ -276,7 +273,7 @@ return M
     )
     .unwrap();
     std::fs::write(
-        dir.path().join("pkg/shuttle.lua"),
+        dir.path().join("pkg/nau.lua"),
         r#"
 local tpl = require("apptpl")
 
@@ -289,8 +286,8 @@ return {
 "#,
     )
     .unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
-    cmd.arg("check").arg("pkg/shuttle.lua").arg("--json");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
+    cmd.arg("check").arg("pkg/nau.lua").arg("--json");
     let out = cmd.current_dir(dir.path()).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value =
@@ -314,7 +311,7 @@ fn check_real_pkgs_file_passes_analyzer_gate() {
     // A real corpus definition must type-check cleanly against the typed
     // prelude (injected globals bound, require resolution live) — the
     // "no false positives" property of the gate.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("check").arg("pkgs/h/hello.lua").arg("--json");
     let out = cmd
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -390,7 +387,7 @@ return {
     let (code, _, stderr) = run_check(dir.path(), false);
     assert_eq!(code, Some(1));
     assert!(
-        stderr.contains("shuttle.lua:4:5: [bad]"),
+        stderr.contains("nau.lua:4:5: [bad]"),
         "human output must point at the declaration site: {stderr}"
     );
 }
@@ -434,11 +431,11 @@ fn check_reports_timeout_diagnostic_and_exits_one() {
     // diagnostic, eval-grade partial results discarded) are exercised here
     // through the injected bound on the test-only in-process entry point —
     // the same normalization the `__check-worker` child applies for
-    // `shuttle check` (see tests/attack_isolation.rs
+    // `nau check` (see tests/attack_isolation.rs
     // `attack_worker_timeout_is_single_fail_closed_diagnostic` for the
     // subprocess-level contract).
     let source = "return { default = snap { name = \"t\", version = \"1\" } }";
-    let diags = shuttle::analysis::check_definition_with_limit("timeout-test", source, Some(0.0));
+    let diags = nau::analysis::check_definition_with_limit("timeout-test", source, Some(0.0));
     assert_eq!(diags.len(), 1, "partial results are discarded: {diags:?}");
     assert!(
         diags[0].message.contains("analysis timed out"),
@@ -449,7 +446,7 @@ fn check_reports_timeout_diagnostic_and_exits_one() {
 
 #[test]
 fn check_wall_latency_stays_sub_second() {
-    // The latency target for `shuttle check` is <100ms wall including the
+    // The latency target for `nau check` is <100ms wall including the
     // eval subprocess (ADR-0010 Decision 8); measured manually on release
     // builds (see analyzer integration report). CI machines are noisy, so
     // this test is a coarse regression tripwire at 1s, not the target proof.

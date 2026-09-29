@@ -27,7 +27,7 @@ const LUAU_TAG: &str = "0.736";
 // 0.21.0+luau736 Ast+VM+Compiler (same sources, same LUAI_MAXCSTACK /
 // LUA_VECTOR_SIZE defines), and compiling any of them again duplicates
 // every symbol at link time (issue #230-land: the duplicate Parser.o
-// between libshuttle and libmlua_sys made 12 test targets fail to link
+// between libnau and libmlua_sys made 12 test targets fail to link
 // once a full rebuild reordered object pull). The analyzer's undefined
 // refs resolve against mlua's luauast/luau libs at final link, exactly as
 // the VM ones always have.
@@ -53,7 +53,7 @@ fn main() {
     // Only these three inputs trigger a C++ rebuild — incremental Rust-only
     // rebuilds reuse the cached object files in target/.
     println!("cargo:rerun-if-changed={}", tarball.display());
-    println!("cargo:rerun-if-changed=shim/shuttle_shim.cpp");
+    println!("cargo:rerun-if-changed=shim/nau_shim.cpp");
     println!("cargo:rerun-if-changed=build.rs");
 
     let src_root = out_dir.join("luau-src");
@@ -101,9 +101,9 @@ fn main() {
             build.file(src_root.join(cpp));
         }
     }
-    build.file(manifest_dir.join("shim/shuttle_shim.cpp"));
+    build.file(manifest_dir.join("shim/nau_shim.cpp"));
 
-    build.compile("shuttle_luau_analysis");
+    build.compile("nau_luau_analysis");
 }
 
 /// Unpack `luau-0.663/{Analysis,Ast,...}/{include,src}` from the vendored

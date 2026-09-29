@@ -22,7 +22,7 @@
 -- registry closure the lock pins into a content-addressed store blob
 -- at FETCH time, and the sandbox build consumes it OFFLINE
 -- (CARGO_NET_OFFLINE + source replacement at the mounted
--- $SHUTTLE_DEPS_DIR/vendor).
+-- $NAU_DEPS_DIR/vendor).
 --
 -- requires = { glibc }: pure Rust CLI over the glibc family (no C
 -- deps; the flake declares no buildInputs).
@@ -62,7 +62,7 @@ return {
             -- the flake's SRI: fetchFromGitHub hashes nix's own
             -- normalized tree archive, GitHub's archive endpoint
             -- re-gzips — different bytes, same tree (statix.lua
-            -- precedent). Content pinning rides shuttle.lock TOFU.
+            -- precedent). Content pinning rides nau.lock TOFU.
             sha256 = "2e6d2d2435ae052e3ca753d12a973e341b5f4f5ba65a12e47995b9d6bcbaa0ca",
         },
 
@@ -75,9 +75,9 @@ return {
             -- writable CARGO_HOME on the sandbox's /tmp tmpfs plus a
             -- source replacement pointing at the mounted, hash-verified
             -- vendor closure.
-            "export CARGO_HOME=/tmp/shuttle-cargo-home CARGO_NET_OFFLINE=true",
+            "export CARGO_HOME=/tmp/nau-cargo-home CARGO_NET_OFFLINE=true",
             'mkdir -p "$CARGO_HOME"',
-            'printf \'[source.crates-io]\\nreplace-with = "shuttle-vendored"\\n\\n[source.shuttle-vendored]\\ndirectory = "%s"\\n\' "$SHUTTLE_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
+            'printf \'[source.crates-io]\\nreplace-with = "nau-vendored"\\n\\n[source.nau-vendored]\\ndirectory = "%s"\\n\' "$NAU_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
             -- Root crate carries the lib + all three bins; cargo
             -- install lays them out under $STAGE/bin.
             "cargo install --path $SRC --root $STAGE",

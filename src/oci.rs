@@ -53,9 +53,9 @@
 //!
 //! ```text
 //! docker run -d -p 5000:5000 registry:2
-//! shuttle build && shuttle push localhost:5000/demo/myapp --insecure-http
+//! nau build && nau push localhost:5000/demo/myapp --insecure-http
 //! curl -s localhost:5000/v2/_catalog
-//! shuttle pull localhost:5000/demo/myapp:v1 --out-dir ./pulled --insecure-http
+//! nau pull localhost:5000/demo/myapp:v1 --out-dir ./pulled --insecure-http
 //! # (insecure-http only needed because registry:2 ships without TLS)
 //! ```
 //!
@@ -63,7 +63,7 @@
 //! manifest.rs `Artifact` extension ([`BuiltBlob`]): `push --record`
 //! writes the host-side built-manifest record, `pull --expect` verifies
 //! received blobs against it fail-closed; `pull --install` resolves
-//! revisions from `shuttle.lock` pins and hands [`PendingSnap`]s to
+//! revisions from `nau.lock` pins and hands [`PendingSnap`]s to
 //! `install_batch`.
 
 use std::cell::{Cell, RefCell};
@@ -86,14 +86,14 @@ use crate::store::sha3_384_file;
 
 /// The manifest envelope itself.
 pub const MEDIA_TYPE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
-/// `artifactType` of a shuttle bundle (snap + optional disk image).
-pub const MEDIA_TYPE_ARTIFACT: &str = "application/vnd.shuttle.bundle.v1";
+/// `artifactType` of a nau bundle (snap + optional disk image).
+pub const MEDIA_TYPE_ARTIFACT: &str = "application/vnd.nau.bundle.v1";
 /// Custom (non-image-config) media type for the inline descriptor blob.
-pub const MEDIA_TYPE_CONFIG: &str = "application/vnd.shuttle.config.v1+json";
+pub const MEDIA_TYPE_CONFIG: &str = "application/vnd.nau.config.v1+json";
 /// A `.snap` payload layer.
-pub const MEDIA_TYPE_SNAP: &str = "application/vnd.shuttle.snap.v1";
+pub const MEDIA_TYPE_SNAP: &str = "application/vnd.nau.snap.v1";
 /// A disk image (`.img`) payload layer.
-pub const MEDIA_TYPE_DISK_IMG: &str = "application/vnd.shuttle.disk-img.v1";
+pub const MEDIA_TYPE_DISK_IMG: &str = "application/vnd.nau.disk-img.v1";
 
 // ── Timeouts (bounded transfers; see module docs) ──
 
@@ -1030,7 +1030,7 @@ pub struct BundleMeta {
     pub arch: String,
 }
 
-/// Map a file extension to its shuttle layer media type.
+/// Map a file extension to its nau layer media type.
 pub fn media_type_for_path(path: &Path) -> miette::Result<&'static str> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("snap") => Ok(MEDIA_TYPE_SNAP),
@@ -1214,12 +1214,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 // ── Manifest assembly ──
 
 #[derive(Serialize)]
-struct ShuttleConfigJson {
+struct NauConfigJson {
     name: String,
     version: String,
     arch: String,
     created: String,
-    shuttle_manifest_version: u32,
+    nau_manifest_version: u32,
 }
 
 #[derive(Serialize)]
@@ -1246,19 +1246,19 @@ struct ManifestJson {
 }
 
 /// The inline config blob WE generate (NOT the eval manifest): identity
-/// metadata + the shuttle manifest IR version this bundle was built
+/// metadata + the nau manifest IR version this bundle was built
 /// from. Returns (bytes, sha256).
 ///
 /// Binding these artifacts cryptographically to the signed eval manifest
 /// is the documented follow-up (requires the manifest.rs `Artifact`
 /// extension); this config is registry-visible identity only.
 pub fn build_config(meta: &BundleMeta, created: &str) -> miette::Result<(Vec<u8>, String)> {
-    let config = ShuttleConfigJson {
+    let config = NauConfigJson {
         name: meta.name.clone(),
         version: meta.version.clone(),
         arch: meta.arch.clone(),
         created: created.to_string(),
-        shuttle_manifest_version: MANIFEST_VERSION,
+        nau_manifest_version: MANIFEST_VERSION,
     };
     let bytes = serde_json::to_vec(&config).map_err(|e| miette!("config serialization: {e}"))?;
     let digest = sha256_hex(&bytes);
@@ -1400,7 +1400,7 @@ pub struct PushedBlobJson {
     pub mounted: bool,
 }
 
-/// `shuttle push --json` payload.
+/// `nau push --json` payload.
 #[derive(Debug, Serialize)]
 pub struct PushReportJson {
     pub command: String,
@@ -1418,7 +1418,7 @@ pub struct PulledFileJson {
     pub size: u64,
 }
 
-/// `shuttle pull --json` payload.
+/// `nau pull --json` payload.
 #[derive(Debug, Serialize)]
 pub struct PullReportJson {
     pub command: String,
@@ -1686,7 +1686,7 @@ pub fn pending_from_blob(payload: &Path, lockfile: &LockFile) -> miette::Result<
         miette!(
             "'{name}' has no {pin} entry — refusing to install a blob whose \
              store revision cannot be established; use plain `pull` (without \
-             --install) or `shuttle lock` the snap first",
+             --install) or `nau lock` the snap first",
             pin = LockFile::FILENAME
         )
     })?;
@@ -1725,7 +1725,7 @@ pub fn built_record(plan: &PushPlan) -> Artifact {
     }
 }
 
-/// Write the host-side built-manifest record (`shuttle push --record`):
+/// Write the host-side built-manifest record (`nau push --record`):
 /// the [`Artifact`] extension JSON for the pushed blobs.
 pub fn write_built_record(path: &Path, plan: &PushPlan) -> miette::Result<()> {
     let mut json = serde_json::to_vec_pretty(&built_record(plan))
@@ -2057,7 +2057,7 @@ mod tests {
         assert_eq!(cfg["arch"], "amd64");
         assert_eq!(cfg["created"], created);
         assert_eq!(
-            cfg["shuttle_manifest_version"],
+            cfg["nau_manifest_version"],
             crate::manifest::MANIFEST_VERSION
         );
 
@@ -2454,7 +2454,7 @@ mod tests {
         // name absent from the lockfile → unpinned refusal
         let lock = lock_with("other", 7, &sha3);
         let err = pending_from_blob(&payload, &lock).unwrap_err().to_string();
-        assert!(err.contains("no shuttle.lock entry"), "{err}");
+        assert!(err.contains("no nau.lock entry"), "{err}");
         assert!(err.contains("plain `pull`"), "{err}");
 
         // pinned but content diverged → fail-closed

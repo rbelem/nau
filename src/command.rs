@@ -1,6 +1,6 @@
 //! Shared subprocess command seam.
 //!
-//! One injectable adapter for every host tool shuttle shells out to. A
+//! One injectable adapter for every host tool nau shells out to. A
 //! production caller passes the real [`RealRunner`], which executes the
 //! exact argv it is handed ([`CommandRunner::run`]); hermetic tests inject
 //! a fake that records invocations and answers from scripted state. The
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn real_runner_reports_a_missing_program_as_io_error() {
-        let argv = vec!["shuttle-no-such-binary-zz9x".to_string()];
+        let argv = vec!["nau-no-such-binary-zz9x".to_string()];
         assert!(RealRunner.run(&argv).is_err());
     }
 }

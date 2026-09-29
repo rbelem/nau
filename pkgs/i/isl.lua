@@ -25,12 +25,12 @@ loop optimization framework to perform advanced loop nest optimizations.]],
         }, " && "),
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as libstdcpp/gmp/mpfr/mpc: the nix gcc wrapper bakes
-        -- RUNPATH=/shuttle-build-prefix/usr/lib into libisl.so (gmp on the
+        -- RUNPATH=/nau-build-prefix/usr/lib into libisl.so (gmp on the
         -- merged prefix via requires). Silenced, visibly logged, pending
         -- issue #22.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
     },
 }

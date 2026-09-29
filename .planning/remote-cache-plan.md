@@ -13,11 +13,11 @@ this plan defines).
 
 | Concern | Today | Where |
 |---|---|---|
-| LAN P2P lane | `shuttle serve` (GET /info, /manifests/<pkg>, /blobs/<sha256>, port 7780) + mDNS announce/browse; `shuttle pull shuttle://host[:port]/<pkg>` verifies fail-closed (ed25519, revoked-first, strict-set) then hash-checks blobs | docs/adr/0033 Decisions 3-7; src/serve.rs; src/pull_peer.rs; src/discovery.rs |
+| LAN P2P lane | `nau serve` (GET /info, /manifests/<pkg>, /blobs/<sha256>, port 7780) + mDNS announce/browse; `nau pull nau://host[:port]/<pkg>` verifies fail-closed (ed25519, revoked-first, strict-set) then hash-checks blobs | docs/adr/0033 Decisions 3-7; src/serve.rs; src/pull_peer.rs; src/discovery.rs |
 | Internet lane | Static export tree (`index.json`, `manifests/`, `blobs/`) served by any web server; `pull https://...` same verification; TLS belongs to the web server | docs/adr/0033 Decision 10; src/export.rs |
 | Content format | Signed canonical-JSON PackageManifest (name/version/revision/files/install metadata/signer) + sha256-addressed blobs | docs/adr/0033 Decision 2; src/pkg_manifest.rs |
 | Trust | ADR-0024 ceremony; anchor sources union (device baked + operator keychain); revocation; no TOFU; key distribution out-of-band | docs/adr/0033 Decision 7 |
-| Build cache | Local-only, closure-keyed dirs under `~/.cache/shuttle/pkgs`, v4 key, existence-only lookup, plain-copy store | src/cache.rs; build-perf-plan item 1a upgrades this |
+| Build cache | Local-only, closure-keyed dirs under `~/.cache/nau/pkgs`, v4 key, existence-only lookup, plain-copy store | src/cache.rs; build-perf-plan item 1a upgrades this |
 | Pod downloads dir | Existence-only cache, WEAKER than the pool cache: keyed on `name_version_arch` with no closure key, plus a `force_build` bypass | src/pod.rs:5938-5957, downloads dir at :5860; field-confirmed 2026-09-27 |
 | Recorded constraint | The clause to reverse originates in ADR-0022 Decision 4 ("no remote build farm, no remote cache, no substituters") and is PRESERVED by ADR-0040 Decision 1:89-92 ("no remote cache, no substituters, no new content lane; result sharing stays on ADR-0033's lanes"). ADR-0040 D6 also deliberately kept worker job-manifest identity separate from the `v4:` cache namespace, and D7 records the fabrication-hazard controls | docs/adr/0022 D4; docs/adr/0040 D1, D6, D7 |
 
@@ -64,7 +64,7 @@ ADR-0033).
    fetch() TLS fails behind the pod's leaked `LD_LIBRARY_PATH` (curl
    resolves the pod libcurl, whose CA bundle fails verification) — every
    network path in this plan inherits that trap.
-3. **Publish seam** — `shuttle serve` and `shuttle export` gain the
+3. **Publish seam** — `nau serve` and `nau export` gain the
    cache content type; a cache export tree is servable by any web server
    exactly like Decision 10. **Minting point (decided): sign at publish
    time** (serve/export), matching ADR-0033 D2's existing minting and
@@ -112,7 +112,7 @@ ADR-0033).
   installed — the packed snap IS the artifact, a different content
   class.
 - **Confirm the operator call:** builds consume cache lanes only when
-  configured (lanes declared in `shuttle.lua`, mirroring `node {}.peers`).
+  configured (lanes declared in `nau.lua`, mirroring `node {}.peers`).
   No auto-discover-and-trust (council 4/4). LAN-auto consumption is a
   named alternative, defaulting off; even if enabled it would refuse
   unsigned entries — discovery is never trust (D3).
@@ -181,7 +181,7 @@ settle:
    settled, not open. (Seat positions from round 2 — alpha/beta for flat,
    delta/gamma for the scoped role — are preserved in git history.)
 3. **Published-tree retention: RESOLVED in shape (4/4), details for the
-   ADR.** Decision 10's `.shuttle-export` ownership-marker semantics
+   ADR.** Decision 10's `.nau-export` ownership-marker semantics
    verbatim, plus a cache-tree marker. Cache-specific asymmetry (delta):
    a stale package manifest is harmful (wrong version served), a stale
    cache entry is inert (immutable, key-addressed, digest-checked) — so

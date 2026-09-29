@@ -29,12 +29,12 @@ a required dependency for GCC's internal computations.]],
         }, " && "),
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as libstdcpp/gmp's neighbors: the nix gcc wrapper bakes
-        -- RUNPATH=/shuttle-build-prefix/usr/lib into libmpfr.so (gmp is on
+        -- RUNPATH=/nau-build-prefix/usr/lib into libmpfr.so (gmp is on
         -- the merged build prefix via requires). That path does not exist
         -- at runtime; silenced, visibly logged, pending issue #22.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
     },
 }

@@ -29,38 +29,38 @@
 # Anything not identical is a finding: the script prints a per-artifact
 # comparison table and exits nonzero on ANY mismatch, listing the offenders.
 #
-# Requirements (see `shuttle doctor`): the devbox toolchain (parted, sfdisk,
+# Requirements (see `nau doctor`): the devbox toolchain (parted, sfdisk,
 # dosfstools >= 4.2, e2fsprogs, mtools, ukify, veritysetup), a warm snap
-# cache (~/.cache/shuttle/snaps), and an update signing key
-# (~/.config/shuttle/secret-key — `shuttle key keygen`).
+# cache (~/.cache/nau/snaps), and an update signing key
+# (~/.config/nau/secret-key — `nau key keygen`).
 #
 # Usage:
 #   devbox run -- examples/rebuild-compare.sh
 #
 # Environment overrides:
-#   SHUTTLE_BIN       binary to build with (default: target/debug/shuttle)
-#   SHUTTLE_LUA       declaration to build (default:
-#                     examples/full-system/pc-rootfs-26/shuttle.lua)
-#   SHUTTLE_ARCH      target arch (default: amd64)
-#   SHUTTLE_WORK      scratch/output root (default:
-#                     ~/.cache/shuttle-rebuild-compare)
+#   NAU_BIN       binary to build with (default: target/debug/nau)
+#   NAU_LUA       declaration to build (default:
+#                     examples/full-system/pc-rootfs-26/nau.lua)
+#   NAU_ARCH      target arch (default: amd64)
+#   NAU_WORK      scratch/output root (default:
+#                     ~/.cache/nau-rebuild-compare)
 #   SOURCE_DATE_EPOCH pinned build epoch (default: 1704067200)
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SHUTTLE_BIN="${SHUTTLE_BIN:-$REPO_ROOT/target/debug/shuttle}"
-SHUTTLE_LUA="${SHUTTLE_LUA:-$REPO_ROOT/examples/full-system/pc-rootfs-26/shuttle.lua}"
-SHUTTLE_ARCH="${SHUTTLE_ARCH:-amd64}"
+NAU_BIN="${NAU_BIN:-$REPO_ROOT/target/debug/nau}"
+NAU_LUA="${NAU_LUA:-$REPO_ROOT/examples/full-system/pc-rootfs-26/nau.lua}"
+NAU_ARCH="${NAU_ARCH:-amd64}"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1704067200}"
-WORK="${SHUTTLE_WORK:-$HOME/.cache/shuttle-rebuild-compare}"
+WORK="${NAU_WORK:-$HOME/.cache/nau-rebuild-compare}"
 
 # The build's scratch tempdirs hold ~14G at peak (disk.img + root.img +
 # partition files) — /tmp is often too small, so anchor TMPDIR to WORK.
 mkdir -p "$WORK/tmp"
 export TMPDIR="$WORK/tmp"
 
-IMG_NAME="ubuntu-core-pc-26_26.04_${SHUTTLE_ARCH}.img"
+IMG_NAME="ubuntu-core-pc-26_26.04_${NAU_ARCH}.img"
 OUT1="$WORK/build1"
 OUT2="$WORK/build2"
 
@@ -106,16 +106,16 @@ PYEOF
 
 # ── preconditions ────────────────────────────────────────────────────────
 
-[[ -x "$SHUTTLE_BIN" ]] || { echo "error: $SHUTTLE_BIN not built (cargo build first)" >&2; exit 2; }
-[[ -f "$SHUTTLE_LUA" ]] || { echo "error: declaration $SHUTTLE_LUA not found" >&2; exit 2; }
+[[ -x "$NAU_BIN" ]] || { echo "error: $NAU_BIN not built (cargo build first)" >&2; exit 2; }
+[[ -f "$NAU_LUA" ]] || { echo "error: declaration $NAU_LUA not found" >&2; exit 2; }
 for tool in sfdisk debugfs mcopy mdir objcopy python3; do
     command -v "$tool" >/dev/null || { echo "error: $tool not on PATH (run inside devbox)" >&2; exit 2; }
 done
 
 echo "rebuild-compare (issue #48)"
-echo "  declaration : $SHUTTLE_LUA"
-echo "  binary      : $SHUTTLE_BIN"
-echo "  arch        : $SHUTTLE_ARCH"
+echo "  declaration : $NAU_LUA"
+echo "  binary      : $NAU_BIN"
+echo "  arch        : $NAU_ARCH"
 echo "  epoch       : $SOURCE_DATE_EPOCH"
 echo "  work        : $WORK"
 echo
@@ -130,17 +130,17 @@ fi
 # The builds run from per-build output dirs (their own CWD → own lockfile),
 # so the committed index is pinned by path — the same package-index.json
 # serves both builds no matter where the script runs from.
-export SHUTTLE_INDEX_PATH="${SHUTTLE_INDEX_PATH:-$REPO_ROOT/package-index.json}"
+export NAU_INDEX_PATH="${NAU_INDEX_PATH:-$REPO_ROOT/package-index.json}"
 
 # The #85 boot-assessment staging needs host bless-boot tooling. On FHS
 # distros /usr/lib/systemd has it; in a devbox environment it lives in the
 # systemd store path next to ukify — derive it when unset.
-if [[ -z "${SHUTTLE_BLESS_BOOT_DIR:-}" ]] && command -v ukify >/dev/null; then
+if [[ -z "${NAU_BLESS_BOOT_DIR:-}" ]] && command -v ukify >/dev/null; then
     ukify_real="$(readlink -f "$(command -v ukify)")"
     candidate="${ukify_real%/bin/ukify}/lib/systemd"
     if [[ -f "$candidate/systemd-bless-boot" ]]; then
-        export SHUTTLE_BLESS_BOOT_DIR="$candidate"
-        echo "  bless-boot tooling: $SHUTTLE_BLESS_BOOT_DIR (devbox systemd)"
+        export NAU_BLESS_BOOT_DIR="$candidate"
+        echo "  bless-boot tooling: $NAU_BLESS_BOOT_DIR (devbox systemd)"
     fi
 fi
 
@@ -219,8 +219,8 @@ for n in 1 2; do
     out="$WORK/build$n"
     echo "==> build $n/2 → $out"
     mkdir -p "$out"
-    if ! ( cd "$out" && "$SHUTTLE_BIN" image \
-            --file "$SHUTTLE_LUA" --arch "$SHUTTLE_ARCH" \
+    if ! ( cd "$out" && "$NAU_BIN" image \
+            --file "$NAU_LUA" --arch "$NAU_ARCH" \
             --output "$out" --lockfile "$WORK/build$n.lock" --json ) \
             >"$WORK/build$n.log" 2>"$WORK/build$n.stderr.log"; then
         echo "error: build $n failed — see $WORK/build$n.stderr.log" >&2

@@ -72,7 +72,7 @@ return {
             "make install DESTDIR=$STAGE",
             -- libtool drops .la metadata next to the libraries carrying
             -- absolute build-time paths (dependency_libs with
-            -- -L/shuttle-build-prefix/...); nothing in the pool consumes
+            -- -L/nau-build-prefix/...); nothing in the pool consumes
             -- libtool archives at runtime, so strip them from the payload
             -- rather than ship build-host paths.
             "find $STAGE -name '*.la' -type f -delete",
@@ -80,13 +80,13 @@ return {
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as git/htop/libsecret: the nix gcc wrapper bakes
-        -- RUNPATH=/shuttle-build-prefix/usr/lib into the produced
+        -- RUNPATH=/nau-build-prefix/usr/lib into the produced
         -- libstdc++.so. That path does not exist at runtime; silenced
         -- here, visibly logged by the leak scan, pending the RUNPATH
         -- repair (issue #22's portability follow-up). usr/lib64 joined
         -- the baked set when the pool glibc payload's loader-lib list
         -- gained the lib64 dir (the wrapper bakes the loader-lib dirs it
         -- sees) — both spellings silenced.
-        leaks_ok = { "/shuttle-build-prefix/usr/lib", "/shuttle-build-prefix/usr/lib64" },
+        leaks_ok = { "/nau-build-prefix/usr/lib", "/nau-build-prefix/usr/lib64" },
     },
 }

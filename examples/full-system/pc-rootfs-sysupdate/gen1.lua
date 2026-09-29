@@ -12,23 +12,23 @@
 -- absolute /nix/store paths — the library needs glibc >= 2.36 for
 -- GLIBC_ABI_GNU2_TLS, so it cannot run against the guest's 2.35 libc)
 -- plus the per-generation proof oneshots:
---   - shuttle-80-proof.service  echoes its generation into the boot
+--   - nau-80-proof.service  echoes its generation into the boot
 --     transaction (serial-observable payload identity), and
---   - shuttle-80-poweroff.service ends the boot cleanly once the evidence
+--   - nau-80-poweroff.service ends the boot cleanly once the evidence
 --     (update finished, completion targets reached) is on the console.
 --
 -- Build (from this directory, after prepare.sh):
---   shuttle image --file gen1.lua --arch amd64 --output "$OUT/gen1"
+--   nau image --file gen1.lua --arch amd64 --output "$OUT/gen1"
 --
 -- Boot proof:
---   shuttle test "$OUT/gen1/shuttle-80_1.0_amd64.img" --runs 1 --timeout 180 \
---       --require "Finished shuttle: apply systemd-sysupdate A/B updates" \
+--   nau test "$OUT/gen1/nau-80_1.0_amd64.img" --runs 1 --timeout 180 \
+--       --require "Finished nau: apply systemd-sysupdate A/B updates" \
 --       --require "Reached target Multi-User System" \
 --       --qemu-arg=-nic --qemu-arg user,model=virtio-net-pci
 
 return {
     rootfs = image {
-        name = "shuttle-80",
+        name = "nau-80",
         version = "1.0",
 
         base = index("core22"),
@@ -36,7 +36,7 @@ return {
         kernel = merge(pin("pc-kernel"), {
             params = {
                 -- tty1 is the local console; ttyS0 mirrors the boot to the
-                -- serial port so `shuttle test` can observe userspace.
+                -- serial port so `nau test` can observe userspace.
                 "console=tty1",
                 "console=ttyS0",
                 "net.ifnames=0",
@@ -45,9 +45,9 @@ return {
                 -- transaction: the emitted sysupdate unit runs the real
                 -- url-file A/B install on the first boot.
                 "systemd.wants=systemd-sysupdate.service",
-                "systemd.wants=shuttle-80-debug-list.service",
-                "systemd.wants=shuttle-80-proof.service",
-                "systemd.wants=shuttle-80-poweroff.service",
+                "systemd.wants=nau-80-debug-list.service",
+                "systemd.wants=nau-80-proof.service",
+                "systemd.wants=nau-80-poweroff.service",
             },
             modules = {
                 "nvme",
@@ -110,7 +110,7 @@ return {
 
         -- The try-boot health gate under test is the CEREMONY itself
         -- (counters, boot-complete.target, bless), not the shipped
-        -- /usr/bin/shuttle probe — pin the trivially-true gate so a
+        -- /usr/bin/nau probe — pin the trivially-true gate so a
         -- generation change is the only variable (#78's escape hatch).
         boot_health_exec = "/bin/true",
 
@@ -146,7 +146,7 @@ return {
             { source = "local/nix/libmount.so.1",            dest = "/nix/store/17xmg38m60inc59az3frp540ccrwn2r8-util-linux-minimal-2.42.2-lib/lib/libmount.so.1" },
             { source = "local/nix/libsmartcols.so.1",        dest = "/nix/store/17xmg38m60inc59az3frp540ccrwn2r8-util-linux-minimal-2.42.2-lib/lib/libsmartcols.so.1" },
             { source = "local/nix/libuuid.so.1",             dest = "/nix/store/17xmg38m60inc59az3frp540ccrwn2r8-util-linux-minimal-2.42.2-lib/lib/libuuid.so.1" },
-            -- #86 proof-only: a GUEST-RUNNABLE /usr/bin/shuttle. The
+            -- #86 proof-only: a GUEST-RUNNABLE /usr/bin/nau. The
             -- build-host embed (#81) needs glibc >= 2.38; the core22
             -- guest ships 2.35, so `runtime activate` and `runtime
             -- recover-slots` could not exec at all (measured: "GLIBC_2.39
@@ -157,19 +157,19 @@ return {
             -- and libm staged at their absolute store paths. Product
             -- images keep the #81 embed; this is harness plumbing,
             -- exactly like the sysupdate tooling above.
-            { source = "local/nix/shuttle-guest",            dest = "/usr/bin/shuttle" },
+            { source = "local/nix/nau-guest",            dest = "/usr/bin/nau" },
             { source = "local/nix/libstdcpp.so.6",           dest = "/nix/store/chqq8mpmpyfi9kgsngya71akv5xicn03-gcc-15.2.0-lib/lib/libstdc++.so.6" },
             { source = "local/nix/libgcc_s.so.1",            dest = "/nix/store/chqq8mpmpyfi9kgsngya71akv5xicn03-gcc-15.2.0-lib/lib/libgcc_s.so.1" },
             { source = "local/nix/libm.so.6",                dest = "/nix/store/n51dhmdbik1kfrsm62j5knavmigwrl1a-glibc-2.42-84/lib/libm.so.6" },
             -- Per-generation payload proof + clean end of boot.
-            { source = "proof/gen1/shuttle-80-proof.service", dest = "/etc/systemd/system/shuttle-80-proof.service" },
-            { source = "proof/poweroff.service",              dest = "/etc/systemd/system/shuttle-80-poweroff.service" },
+            { source = "proof/gen1/nau-80-proof.service", dest = "/etc/systemd/system/nau-80-proof.service" },
+            { source = "proof/poweroff.service",              dest = "/etc/systemd/system/nau-80-poweroff.service" },
             -- Diagnostic: mirror the journal to the serial console so a
             -- failed update unit shows its actual error output.
             { source = "proof/journald/80-forward.conf",      dest = "/etc/systemd/journald.conf.d/80-forward.conf" },
             { source = "proof/sysupdate-dropin/10-console.conf", dest = "/etc/systemd/system/systemd-sysupdate.service.d/10-console.conf" },
-            { source = "proof/sysupdate-dropin/debug-list.service", dest = "/etc/systemd/system/shuttle-80-debug-list.service" },
-            { source = "proof/sysupdate-dropin/diag.sh", dest = "/usr/libexec/shuttle-80/diag.sh" },
+            { source = "proof/sysupdate-dropin/debug-list.service", dest = "/etc/systemd/system/nau-80-debug-list.service" },
+            { source = "proof/sysupdate-dropin/diag.sh", dest = "/usr/libexec/nau-80/diag.sh" },
             -- Host-side post-mortem: debugfs this out of each slot to prove
             -- the two slots carry different generations.
             { source = "proof/gen1/generation",               dest = "/etc/generation" },

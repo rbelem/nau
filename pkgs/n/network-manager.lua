@@ -5,7 +5,7 @@
 -- Essential for systems that need dynamic network setup.
 --
 -- Register in package index:
---   shuttle index add network-manager --summary "Network management daemon"
+--   nau index add network-manager --summary "Network management daemon"
 --
 -- Usage:
 --   image {

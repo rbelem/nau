@@ -10,8 +10,8 @@ live store.
 
 devbox-global (`~/.local/share/devbox/global/default`, wired in via
 `~/.bashrc.d/90-devbox.sh` → `source <(devbox global shellenv --init-hook)`)
-is replaced by a shuttle **pod** whose bin farm sits on `PATH` through
-`shuttle pod shellenv` (#47). Per #29, the nix-specific tools
+is replaced by a nau **pod** whose bin farm sits on `PATH` through
+`nau pod shellenv` (#47). Per #29, the nix-specific tools
 (`attic-client`, `nix-search-cli`, `nix-prefetch-git`) are dropped, not
 ported.
 
@@ -26,7 +26,7 @@ Preconditions verified before writing this checklist:
   `nerd-fonts-*` set) had no activation surface — they declare no `apps`,
   so the farm exposed nothing, and the fonts were only visible through the
   devbox profile's `share/` riding `XDG_DATA_DIRS`. Pods now surface font
-  payloads at `$XDG_DATA_HOME/fonts/shuttle-pod-<pod>/…` (the same
+  payloads at `$XDG_DATA_HOME/fonts/nau-pod-<pod>/…` (the same
   generation-versioned mechanism as desktop launchers), which fontconfig
   scans by default (`<dir prefix="xdg">fonts</dir>`, verified empirically:
   `fc-match 'Hack Nerd Font'` resolves from the pilot surface and falls
@@ -41,18 +41,18 @@ Inventory basis: `devbox global list` (91 entries), `devbox.json`
 
 | devbox-global capability | pod equivalent | verdict |
 |---|---|---|
-| nixpkgs packages (48 named) | pool packages + `shuttle pod add` | covered — matrix §2 |
+| nixpkgs packages (48 named) | pool packages + `nau pod add` | covered — matrix §2 |
 | ~30 local path flakes (`devbox.d/*`) | pool packages (port per tool) | partial — follow-ups §5.1 |
-| PATH activation (`devbox global shellenv`) | `eval "$(shuttle pod shellenv)"` (#47) | covered |
-| `env:` block (EDITOR, LOCALE_ARCHIVE, PYTHONPATH, VENV_DIR, …) | `shuttle run -- <cmd…>` env overlay (farm-first PATH + loader seam, #102); per-var `env:` surface still deferred (ADR-0016 §7) | partial — §5.3 |
-| Secrets: init-hook sources `$XDG_RUNTIME_DIR/devbox-secrets.sh`, regenerated from `~/.config/bws/sm.ini` via `bws` + `BWS_ACCESS_TOKEN` (libsecret fallback) | none needed in shuttle — user-level init snippet | checklist step §4.3 |
+| PATH activation (`devbox global shellenv`) | `eval "$(nau pod shellenv)"` (#47) | covered |
+| `env:` block (EDITOR, LOCALE_ARCHIVE, PYTHONPATH, VENV_DIR, …) | `nau run -- <cmd…>` env overlay (farm-first PATH + loader seam, #102); per-var `env:` surface still deferred (ADR-0016 §7) | partial — §5.3 |
+| Secrets: init-hook sources `$XDG_RUNTIME_DIR/devbox-secrets.sh`, regenerated from `~/.config/bws/sm.ini` via `bws` + `BWS_ACCESS_TOKEN` (libsecret fallback) | none needed in nau — user-level init snippet | checklist step §4.3 |
 | Shell init: ble.sh, starship, zoxide (`cd` alias), fzf bindings, atuin, `set -o vi`, `SUDO_EDITOR`, XDG_DATA_DIRS completions | same init lines in the user's `~/.bashrc.d`, binaries now resolve from the pod farm | checklist step §4.4; ble.sh gap §5.2 |
 | Services: process-compose (`valkey`+search module, `bifrost`, `wigolo`) | declared services, emitted per backend (ADR-0032) | resolved 2026-09-19, §5.4 |
 | Scripts: `update-flake`, `upload-flakes`, `config-sync/pull/push`, `setup-*`, `first-install`, `nix-store-gc` | nix/flake-specific → die with devbox-global (per #29) | dropped, §5.5 |
 | `~/.local/bin` shims (`bitw`, `jcode`, `iii`, `starship`, `yq`, …) | untouched — not devbox-managed | persists; shadowing note §4.6 |
 | Nerd fonts (hack, noto, fira-code) | `nerd-fonts-*` pool packages + **new font surface** | covered by this branch |
 | GUI: `.desktop` launchers for pod apps | desktop launcher emit (#7) | covered |
-| Rollback of the tool set | `shuttle pod rollback` (flips the pod's `current` only) | covered |
+| Rollback of the tool set | `nau pod rollback` (flips the pod's `current` only) | covered |
 
 ## 2. Version parity matrix (daily set)
 
@@ -90,10 +90,10 @@ Ran in `/home/rodrigo/.cache/issue29-pilot` (a copy of an earlier
 `/tmp/opencode/issue-29-pilot` after the shared `/tmp` filled up), pod
 name `pilot`, against this worktree's pool. Re-runnable: §6.
 
-- `shuttle pod --name pilot sync` — green at the third stage: ~60
+- `nau pod --name pilot sync` — green at the third stage: ~60
   packages declared, generation **2** installed, bin farm emitted
   (68 direct symlinks), desktop launchers + font surface re-emitted.
-- `shuttle pod list` — versions match the pool pins in §2 (jq 1.8.2,
+- `nau pod list` — versions match the pool pins in §2 (jq 1.8.2,
   ripgrep 15.2.0, gh 2.97.0, node 26.7.0, python 3.12.11, go 1.27.1,
   rust/cargo 1.98.1, bun 1.4.2, git 2.47.2, bws 2.1.0, starship 1.26.0,
   nerd-fonts 3.5.1 ×3, …).
@@ -107,7 +107,7 @@ name `pilot`, against this worktree's pool. Re-runnable: §6.
   `go1.27.1`, … (68 farm entries; renamed apps surface as declared:
   `difft`, `gmc`).
 - **Fonts**: the pod surface at
-  `$XDG_DATA_HOME/fonts/shuttle-pod-pilot/` carries all three nerd
+  `$XDG_DATA_HOME/fonts/nau-pod-pilot/` carries all three nerd
   fonts as store symlinks; `fc-match 'Hack Nerd Font'` and
   `fc-match 'FiraCode Nerd Font'` resolve to the pod's files
   (XDG_DATA_DIRS neutralized), and fall back to DejaVu without the
@@ -132,7 +132,7 @@ name `pilot`, against this worktree's pool. Re-runnable: §6.
 
 ### 3.1 What blocked the meson class — RESOLVED (issue #114, closed 2026-09-21)
 
-Struck by the cold scratch-pod repro (`~/.cache/shuttle-meson-repro`,
+Struck by the cold scratch-pod repro (`~/.cache/nau-meson-repro`,
 generation 1 green): the blocker was missing runtime-lib declarations on
 the C++ prefix tools — `cmake` and `ninja` linked
 `libstdc++.so.6`/`libgcc_s.so.1` while declaring `requires = {}`, and
@@ -147,8 +147,8 @@ together closed the class.
 <details><summary>Original blocker record (superseded)</summary>
 
 ```
-/shuttle-build-prefix/usr/bin/python3: line 6:
-  /shuttle-build-prefix/active/extensions/python/usr/usr/bin/python3.real: No such file or directory
+/nau-build-prefix/usr/bin/python3: line 6:
+  /nau-build-prefix/active/extensions/python/usr/usr/bin/python3.real: No such file or directory
 ```
 
 This was the **already-recorded ADR-0017-addendum gap**: pod-built
@@ -159,7 +159,7 @@ the same prefix (same family).
 
 </details>
 
-<!-- EVIDENCE: /tmp/opencode/shuttle-night/meson-repro-3.log (cold build,
+<!-- EVIDENCE: /tmp/opencode/nau-night/meson-repro-3.log (cold build,
 zero "Could not detect Ninja"), meson-repro-4.log (skip-if-installed
 re-sync, issue #113, 4.5 s no-op). -->
 
@@ -184,13 +184,13 @@ leaves the old stack intact (rollback = §4.7).**
 ```bash
 # One-time: create the daily pod mirroring the audited set.
 # (Pool pins for git/tmux/python first bumped per §2 if desired.)
-shuttle pod --name daily add <each package from §2 matrix>
-shuttle pod --name daily sync
+nau pod --name daily add <each package from §2 matrix>
+nau pod --name daily sync
 
 # Parity smoke BEFORE any rc change:
-shuttle pod --name daily list
-eval "$(shuttle pod --name daily shellenv)"
-which jq rg fd fzf gh git tmux bws starship zoxide atuin   # → ~/.local/share/shuttle/pods/daily/current/bin/…
+nau pod --name daily list
+eval "$(nau pod --name daily shellenv)"
+which jq rg fd fzf gh git tmux bws starship zoxide atuin   # → ~/.local/share/nau/pods/daily/current/bin/…
 fc-match 'Hack Nerd Font'                                   # resolves from the pod surface
 ```
 
@@ -199,7 +199,7 @@ fc-match 'Hack Nerd Font'                                   # resolves from the 
 ```bash
 # Replace the devbox lines in ~/.bashrc.d/90-devbox.sh with:
 #   [ ! -t 0 ] || [ -z "$PS1" ] && return
-#   eval "$(shuttle pod --name daily shellenv)"
+#   eval "$(nau pod --name daily shellenv)"
 # (no `devbox completion bash`; no `devbox global shellenv --init-hook`)
 # First take the rollback anchor §4.7 restores — OUTSIDE ~/.bashrc.d,
 # because ~/.bashrc sources EVERY file in that directory (§4.6):
@@ -218,14 +218,14 @@ env | grep -i devbox    # must be empty
 but never called `bws`, and would leave the cache empty on a fresh boot).
 The real port of the devbox init-hook logic — bws `--output env`
 regeneration, libsecret `BWS_ACCESS_TOKEN` fallback, `[aliases]`
-re-exporting — lives in `examples/cutover/90-shuttle.sh` together with the
+re-exporting — lives in `examples/cutover/90-nau.sh` together with the
 §4.4 init lines, the pod-python venv setup, and the nix-ld cache. Deploy it
-as `~/.bashrc.d/90-shuttle.sh` (one file, proven ordering: farm first so
+as `~/.bashrc.d/90-nau.sh` (one file, proven ordering: farm first so
 `bws`/`blesh-share`/prompt binaries resolve from the pod).
 
 ### 4.4 Shell init lines (starship/zoxide/fzf/atuin/vi)
 
-Carried by the same `examples/cutover/90-shuttle.sh` (§4.3). Two deltas
+Carried by the same `examples/cutover/90-nau.sh` (§4.3). Two deltas
 from the devbox init-hook: `SUDO_EDITOR=vi` (the pod's neovim package
 provides `vi`; devbox's nvim path died with the global profile), and the
 `XDG_DATA_DIRS` completions prepend is dropped (pods don't surface a
@@ -235,14 +235,14 @@ provides `vi`; devbox's nvim path died with the global profile), and the
 
 **ORDERING GATE (issue #96 → #101): nothing below runs until the floor
 tools are provisioned.** Disposition (c) superseded the systemPackages
-plan (see §5.9): shuttle provisions `mksquashfs`/`unsquashfs`/`bwrap`/
+plan (see §5.9): nau provisions `mksquashfs`/`unsquashfs`/`bwrap`/
 `tar`/`curl` itself, checksum-pinned, resolved ahead of PATH. The pool
 still cannot provide them (store payloads are themselves squashfs images;
-chicken-and-egg, disposition (b), rejected) — but the provider is shuttle
+chicken-and-egg, disposition (b), rejected) — but the provider is nau
 itself, not the host. One command, no sudo:
 
 ```bash
-shuttle doctor --pod --fix   # provisions the floor, re-checks, must exit 0 (§5.9)
+nau doctor --pod --fix   # provisions the floor, re-checks, must exit 0 (§5.9)
 ```
 
 Then, and only then:
@@ -257,7 +257,7 @@ rm -f ~/.bashrc.d/90-devbox.sh                               # the hook (already
 rm -rf ~/.local/share/devbox
 rm -rf ~/.cache/devbox                                       # download/build cache
 # The devbox BINARY itself (system profile:
-# /etc/profiles/per-user/<user>/bin/devbox) STAYS until the shuttle repo
+# /etc/profiles/per-user/<user>/bin/devbox) STAYS until the nau repo
 # drops its own devbox.json ("target state is devbox-free", AGENTS.md) —
 # the project build still pins cargo through it.
 nix store gc             # reclaim the freed closures — DEFER per §4.7:
@@ -278,11 +278,11 @@ env; a fresh login matches this shape):
 
 - [x] Fresh shell resolves daily tools from the pod farm only: sweep
       checks ~50 tools (`type -aP`), first hit
-      `~/.local/share/shuttle/pods/daily/current/…`, zero
+      `~/.local/share/nau/pods/daily/current/…`, zero
       `/devbox/` hits.
 - [x] devbox-global removed from PATH/rc: sweep reports `env is
       devbox-free`; `~/.bashrc.d/` holds only `10-android-sdk.sh`,
-      `10-bit.sh`, `90-shuttle.sh` (note: `~/.bashrc` sources
+      `10-bit.sh`, `90-nau.sh` (note: `~/.bashrc` sources
       `~/.bashrc.d/*` — ALL files, so deactivated rc fragments must be
       moved out of the directory, not renamed in place; the
       `90-devbox.sh` backup lives in `/tmp/opencode/`).
@@ -293,7 +293,7 @@ env; a fresh login matches this shape):
 - [x] Secrets present in a fresh shell (`GITHUB_TOKEN` from the bws SM
       cache).
 - [x] venv live: `$VIRTUAL_ENV/bin/python3 -c 'import whichllm'` ok
-      (pod python 3.14 venv at `~/.local/share/shuttle/python-venv`,
+      (pod python 3.14 venv at `~/.local/share/nau/python-venv`,
       12 top-level pins — sources per
       `examples/cutover/python-freeze.txt` header).
 - [x] ble.sh attached in the pty login shell (`BLE_VERSION` set;
@@ -307,7 +307,7 @@ env; a fresh login matches this shape):
       the pod.
       Council disposition (2026-09-18): sweep, don't guess — every
       `~/.local/bin` entry that also exists under
-      `~/.local/share/shuttle/pods/daily/current/` gets its local copy
+      `~/.local/share/nau/pods/daily/current/` gets its local copy
       moved to an attic dir (NEVER rm; `starship-patched` proves
       deliberate local builds exist), or the deliberate build folds
       into the pool as an overlay package so one source of truth wins
@@ -316,9 +316,9 @@ env; a fresh login matches this shape):
       runtime gap recorded in the freeze header).
 - [x] shellenv hardening: NixOS `/etc/profile` rebuilds PATH without
       `~/.local/bin`, so the rc falls back to
-      `$HOME/.local/bin/shuttle` for the shellenv eval.
+      `$HOME/.local/bin/nau` for the shellenv eval.
 - [ ] Provisioned floor tools green in a fresh login shell (#101):
-      from the same fresh login shell the sweep uses, `shuttle doctor
+      from the same fresh login shell the sweep uses, `nau doctor
       --pod --fix` provisions (first run) and exits 0 — mksquashfs/
       unsquashfs/bwrap/tar resolve provisioned-first (curl PATH-first),
       the functional probes pass, devbox is irrelevant to the result)
@@ -396,7 +396,7 @@ it via the pod's `blesh-share` (§4.3).
 `EDITOR`/`VISUAL`, `LOCALE_ARCHIVE`, `PYTHONPATH`+`VENV_DIR`,
 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS` come from devbox.json's
 `env:`. The command half of the surface LANDED first (2026-09-18,
-#102): `shuttle run -- <cmd…>` execs any command with the pod env
+#102): `nau run -- <cmd…>` execs any command with the pod env
 overlaid (farm-first PATH + loader-lib LD_LIBRARY_PATH per the
 ADR-0028 shellenv contract), no sandbox, transparent exec — the
 `devbox run` equivalent. Declared-app-first: a name that is a declared
@@ -405,10 +405,10 @@ app still runs that app (confined).
 The declared-env half LANDED (2026-09-18, ADR-0030): pod.lua accepts
 `env = { KEY = "value", … }`; staging resolves it (own beats loaded per
 key, loads fold transitively, first-declared load wins collisions) into
-`generations/<n>/env.json`; `shuttle pod shellenv` renders one
-`export KEY='value'` per var and `shuttle run` overlays the same map.
+`generations/<n>/env.json`; `nau pod shellenv` renders one
+`export KEY='value'` per var and `nau run` overlays the same map.
 The devbox init-hook's env exports can move into the pod declaration;
-`90-shuttle.sh` keeps only genuine shell-init lines. Council disposition
+`90-nau.sh` keeps only genuine shell-init lines. Council disposition
 (2026-09-18): LOCALE_ARCHIVE decided — system locales win; pods never
 auto-generate or ship locale payloads; a pod that needs its own declares
 a `glibc-locales` package and sets `LOCALE_ARCHIVE` through this
@@ -418,7 +418,7 @@ stays deferred per the Alternatives section; if it lands, the sketch is
 `env = {...}` folded into `generations/<n>/env.json` with package
 provenance and same-precedence collisions as a hard error.
 
-Semantic target for that surface: `shuttle run` becomes the single
+Semantic target for that surface: `nau run` becomes the single
 entry point the way `flatpak run` is — the confined-app half exists
 (#11: sandbox from declared grants); the command half is LANDED
 (#102): an arbitrary command executed with the pod env overlaid
@@ -430,14 +430,14 @@ env-overlay half: isolated env, transparent exec, nothing else.
 
 `valkey` (with the valkey-search module), `bifrost`, `wigolo` run under
 devbox's process-compose. Pods have no service verb (ADR-0015). Options:
-a `shuttle pod service` verb backed by systemd user units, or keep a
+a `nau pod service` verb backed by systemd user units, or keep a
 standalone process-compose launched from a user unit. None exists today.
 
 Council disposition (2026-09-18): no verb, no process-compose. Services
 run as out-of-band systemd USER units shipping in
-`examples/cutover/shuttle-{valkey,bifrost,wigolo}.service`, with
+`examples/cutover/nau-{valkey,bifrost,wigolo}.service`, with
 `ExecStart` through
-`%h/.local/share/shuttle/pods/daily/current/<bin>` — the `current`
+`%h/.local/share/nau/pods/daily/current/<bin>` — the `current`
 symlink makes the units generation-proof with zero templating, and
 valkey's `--loadmodule` reaches `current/extensions/valkey-search/…`
 the same way. ADR-0015 Decision 10's "no systemd user units" was scoped
@@ -480,7 +480,7 @@ pool grows share-heavy packages.
 Council disposition (2026-09-18): accepted permanently for now. Re-open
 when a pool package ships completions or man pages users actually
 consume; the implementation is the font-surface pattern again
-(`$XDG_DATA_HOME/shuttle-pod-<pod>/share` plus optional `MANPATH` /
+(`$XDG_DATA_HOME/nau-pod-<pod>/share` plus optional `MANPATH` /
 `XDG_DATA_DIRS` shellenv lines).
 
 ### 5.7 Loader path for requires-closure libraries (NEW, demonstrated)
@@ -495,11 +495,11 @@ into per-package assemblies, not across packages). Interim workaround
 extension lib dirs — but a generation-versioned, automatic seam is
 required for cutover (options: emit-time wrapper setting LD_LIBRARY_PATH
 in the #12 wrapper family, an ld.so.conf.d drop-in per pod, or binding
-the extensions tree via the `shuttle run` assembly). Until landed:
+the extensions tree via the `nau run` assembly). Until landed:
 cutover keeps git/tmux/htop/tig working only via the devbox profile —
 i.e. **this was the one code-level blocker for those four tools.**
 
-**LANDED 2026-09-18** (shellenv seam): `shuttle pod --name daily
+**LANDED 2026-09-18** (shellenv seam): `nau pod --name daily
 shellenv` emits `LD_LIBRARY_PATH` over the generation's extension lib
 dirs, compose-prepending (`${LD_LIBRARY_PATH:+…}`) so it never wipes a
 host list. The sweep proves git/tmux/htop/tig resolve and run from the
@@ -539,12 +539,12 @@ the extension-tree layout (`usr/usr` doubling) together.
 **The #101 gate is no longer a host change.** The original plan here —
 NixOS `systemPackages` one-liner (`squashfs-tools bubblewrap gnumake gcc`)
 plus `sudo nixos-rebuild switch` — is REJECTED: it re-imposes a
-per-distro, sudo-gated dependency and contradicts shuttle's
+per-distro, sudo-gated dependency and contradicts nau's
 host-independence thesis (the vendor-SDK postmortem: hosts pinned to one
 distro break onboarding everywhere else). Disposition (c) ships the floor
-with shuttle instead (rustup pattern): checksum-pinned musl-static
-artifacts provisioned by `shuttle doctor --fix` into
-`~/.local/share/shuttle/tools/`, resolved ahead of PATH — except `curl`,
+with nau instead (rustup pattern): checksum-pinned musl-static
+artifacts provisioned by `nau doctor --fix` into
+`~/.local/share/nau/tools/`, resolved ahead of PATH — except `curl`,
 which resolves PATH-first (host network fidelity: NSS, CA bundles).
 `make`/`cc` are NOT provisioned: recipes needing a compiler declare
 `build_deps` (ADR-0018) and resolve them from the pool. Verification is
@@ -557,8 +557,8 @@ with no devbox env on PATH, no sudo, no distro packages:
 ```bash
 bash -l
 env | grep -i devbox                                    # must be empty
-shuttle doctor --pod --fix                              # provisions the floor, re-checks, exits 0
-shuttle pod --name daily add jq && shuttle pod --name daily remove jq
+nau doctor --pod --fix                              # provisions the floor, re-checks, exits 0
+nau pod --name daily add jq && nau pod --name daily remove jq
 ```
 
 The pilot's environment traps, restated for the (c) world:
@@ -573,14 +573,14 @@ The pilot's environment traps, restated for the (c) world:
   `pod add` fix (explicit-beats-implicit, ADR-0018), not a mysterious
   `cc: not found` mid-sync.
 - Transient download flakes: re-run is incremental, and
-  `shuttle doctor --fix --from <dir>` provisions offline through the
+  `nau doctor --fix --from <dir>` provisions offline through the
   identical checksum-verify path.
 
 
 ### 5.10 Global-config sync (`devbox global push/pull` parity) — NEW
 
 Council disposition (2026-09-18): NOT-do. A pod is two portable files —
-`pod.lua` + `shuttle.lock` — at a stable path; version them with a plain
+`pod.lua` + `nau.lock` — at a stable path; version them with a plain
 git attic (chezmoi-managing `pod.lua` fights the imperative verbs that
 rewrite it). The store and generations rebuild via `pod sync` on any
 machine. Re-open trigger: a second machine — then the design is
@@ -604,16 +604,16 @@ export PATH=/tmp/fixbin:$PWD/.devbox/nix/profile/default/bin:\
 $HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:\
 /run/current-system/sw/bin:/usr/bin:/bin
 
-ROOT=$HOME/.cache/issue29-pilot/shuttle/pods
+ROOT=$HOME/.cache/issue29-pilot/nau/pods
 mkdir -p "$ROOT/pilot"
 cat > "$ROOT/pilot/pod.lua" <<'EOF'
 pod { packages = { "jq", "nerd-fonts-hack" } }
 EOF
-target/debug/shuttle pod --name pilot sync --root "$ROOT"
-target/debug/shuttle pod --name pilot list --root "$ROOT"
+target/debug/nau pod --name pilot sync --root "$ROOT"
+target/debug/nau pod --name pilot list --root "$ROOT"
 
-eval "$(target/debug/shuttle pod --name pilot shellenv --root "$ROOT")"
-which jq            # .../issue-29-pilot/shuttle/pods/pilot/current/jq
+eval "$(target/debug/nau pod --name pilot shellenv --root "$ROOT")"
+which jq            # .../issue-29-pilot/nau/pods/pilot/current/jq
 jq --version
 
 # Font activation through the pilot surface (redirected XDG_DATA_HOME):

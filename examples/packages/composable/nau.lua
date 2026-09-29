@@ -10,10 +10,10 @@
 --   3. Override with `merge()` — deep merge for tables, replace for scalars
 --
 -- Usage:
---   shuttle build --file examples/packages/composable/shuttle.lua
+--   nau build --file examples/packages/composable/nau.lua
 --   → builds both web and tools snaps from the shared base
 --
---   shuttle build --file examples/packages/composable/shuttle.lua --order
+--   nau build --file examples/packages/composable/nau.lua --order
 --   → shows build order
 
 local base = require("base")

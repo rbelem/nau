@@ -19,7 +19,7 @@
 #   - rsync -rlt --delete for the rebuildable tree (--delete scoped to
 #     blobs/ and manifests/; see docs/nau-cache-publish.md for why
 #     index.json is replaced last and root-level extras are untouched).
-#   - Order contract (mirrors scripts/shuttle-cache-publish #270):
+#   - Order contract (mirrors scripts/nau-cache-publish #270):
 #     every blob, then every manifest, index.json LAST as the commit
 #     point — in-flight trees never advertise blobs they don't have.
 #   - The freshness stamp (freshness.stamp, tree root) is appended
@@ -35,7 +35,7 @@
 # server is an operator step.
 #
 # NOT proven here (operator-gated): the remote-ssh path and a live
-# `shuttle pull` from https://cache.nau.rclb.dev/ — both unblock when
+# `nau pull` from https://cache.nau.rclb.dev/ — both unblock when
 # the Nau host exists. The smoke test covers the local-target path
 # end to end.
 

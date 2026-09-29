@@ -1,4 +1,4 @@
--- shuttle DSL — injected globals for snap declarations
+-- nau DSL — injected globals for snap declarations
 --
 -- Per ADR-0002: Lua DSL is the schema source of truth.
 -- These functions validate arguments at eval time.
@@ -149,7 +149,7 @@ function snap(opts)
         end
     end
 
-    -- "source"/"meta"/"store" are shuttle build classifications (not
+    -- "source"/"meta"/"store" are nau build classifications (not
     -- emitted to snap.yaml); "app"/"base"/"gadget"/"kernel"/"snapd" are
     -- the snapd snap types (emitted except "app", the default).
     local valid_types = { "source", "meta", "store",
@@ -321,7 +321,7 @@ function snap(opts)
     -- instead of a raw command. `build` and `plugin` are mutually exclusive
     -- per part (a plugin IS the build). Plugin options go in `options`;
     -- per ADR-0014 Decision 3, Lua only checks that the plugin is a known
-    -- name (registry injected as `shuttle_plugins` by the Rust prelude) and
+    -- name (registry injected as `nau_plugins` by the Rust prelude) and
     -- that options are a table — deep option validation lives in Rust at
     -- the plugin boundary and produces named errors.
     if opts.parts ~= nil then
@@ -355,7 +355,7 @@ function snap(opts)
                         "snap(): parts['%s'].options must be a table, got %s",
                         name, type(part.options)), 2)
                 end
-                local known = shuttle_plugins
+                local known = nau_plugins
                 if known ~= nil and known[part.plugin] ~= true then
                     local available = {}
                     for plugin_name in pairs(known) do
@@ -916,7 +916,7 @@ end
 -- @usage node {
 --     name = "devbox",
 --     serve = { address = "127.0.0.1:7780", announce = true },
---     peers = { "shuttle://nuci.local:7780" },
+--     peers = { "nau://nuci.local:7780" },
 -- }
 function node(opts)
     if type(opts) ~= "table" then
@@ -940,7 +940,7 @@ function node(opts)
         end
     end
 
-    -- peers: array of peer references (shuttle://host[:port])
+    -- peers: array of peer references (nau://host[:port])
     check_string_array(opts.peers, "node", "peers")
 
     -- Unknown fields are rejected, not silently dropped (the app()

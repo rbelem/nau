@@ -9,7 +9,7 @@
 --            npm tarball, better-sqlite3/sqlite-vec rebuilt against
 --            the matching node headers)
 -- Snapcraft: no upstream snap
--- Shuttle:   declarative Lua — npm-tarball relayout (agentmemory
+-- Nau:   declarative Lua — npm-tarball relayout (agentmemory
 --            pattern), carrying a `services` declaration (ADR-0032
 --            Decision 2)
 --
@@ -105,7 +105,7 @@ return {
                 -- default PATH does not carry: the unit environment
                 -- must resolve the pod farm's node (the interpreter
                 -- wrapper above cannot serve a service command in v1).
-                -- The bootstrap unit (examples/cutover/shuttle-wigolo.service)
+                -- The bootstrap unit (examples/cutover/nau-wigolo.service)
                 -- sets Environment=PATH over the generation root.
                 command = "usr/bin/wigolo",
                 daemon = "simple",

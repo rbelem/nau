@@ -1,17 +1,17 @@
-# Devbox deprecation plan — gate on shuttle's own pod toolchain
+# Devbox deprecation plan — gate on nau's own pod toolchain
 
 Lane E1 deliverable. Goal: retire devbox+nix from this repo's dev/test gate
 and CI. Endgame (per `docs/agents/build-and-test.md` "Devbox-free endgame"
-and issue #102): the gate is explicit `shuttle run -- cargo …` commands
+and issue #102): the gate is explicit `nau run -- cargo …` commands
 against a reconciled pod, and CI needs no nix at all.
 
 Sources swept for this doc: `devbox.json`, `docs/agents/build-and-test.md`,
 issue #102 (CLOSED — the arbitrary-command form), `src/cli.rs` (`Run` with
 `trailing_var_arg`, ~line 556), `src/confine.rs:161` (`run_command` —
 farm-first PATH + env overlay + transparent exec, verified real),
-`install.sh` (`--skip-deps`, `SHUTTLE_SRC` override, rustup bootstrap),
+`install.sh` (`--skip-deps`, `NAU_SRC` override, rustup bootstrap),
 `src/export.rs` (static-HTTP lane, ADR-0033 Decision 10), `src/pull_ref.rs`
-/ `shuttle pull --pod` (signed-PackageManifest staging), CI (`.github/workflows/ci.yml`:
+/ `nau pull --pod` (signed-PackageManifest staging), CI (`.github/workflows/ci.yml`:
 devbox-install-action on ubuntu-24.04), and a `Command::new` / tool-name
 sweep over `src/` + `tests/`.
 
@@ -22,11 +22,11 @@ sweep over `src/` + `tests/`.
 What the devbox shell actually carries, what invokes each binary, and what
 it would take to provide it without nix.
 
-### 1a. Gate path — needed by `SHUTTLE_SYSTEMD=off cargo test` + clippy/fmt
+### 1a. Gate path — needed by `NAU_SYSTEMD=off cargo test` + clippy/fmt
 
 | Binary | Who invokes it | Pool recipe? | Upstream prebuilt? | CI-buildable <2 min? |
 | --- | --- | --- | --- | --- |
-| `cargo`/`rustc`/`rustfmt`/`cargo-clippy` | The gate itself; via farm PATH under `shuttle run --` (confine.rs `resolve_command`) | ✅ `pkgs/r/rust.lua` (1.98.1 official dist tarball, FETCH) | ✅ static.rust-lang.org dist tarball (the recipe IS the prebuilt) | ✅ fetch+unpack+mksquashfs ≈2–3 min (borderline) |
+| `cargo`/`rustc`/`rustfmt`/`cargo-clippy` | The gate itself; via farm PATH under `nau run --` (confine.rs `resolve_command`) | ✅ `pkgs/r/rust.lua` (1.98.1 official dist tarball, FETCH) | ✅ static.rust-lang.org dist tarball (the recipe IS the prebuilt) | ✅ fetch+unpack+mksquashfs ≈2–3 min (borderline) |
 | `cc`/`c++`/`ar` | `build.rs` (vendored Luau analyzer, 120 C++ TUs via `cc` crate); `src/snap.rs:12468+` cc probes for build_deps detection | ❌ (pool `gcc` exists but is a multi-hour source build — not for CI) | Host distro gcc/g++ (GH runners preinstall) | ✅ distro package, 0 min |
 | `mksquashfs`/`unsquashfs` | `src/snap.rs:4243` (`mksquashfs` build step), `src/pod.rs:2245` store install, `src/runtime.rs` `RuntimeTools` (payload unpack), ~20 `tests/pod_*` | ❌ no `squashfs` recipe | Distro package; upstream source is small | ✅ `apt squashfs-tools`, seconds |
 | `bwrap` | `src/snap.rs:5257` `run_bwrapped` hermetic build sandbox (**falls back to direct exec when absent**); `src/confine.rs:269` `run_bwrap` confined apps (**fails closed**); `tests/pod_confined.rs` `bwrap_gate()` (skips when absent) | ❌ no `bubblewrap` recipe | Distro package | ✅ `apt bubblewrap`, seconds |
@@ -42,7 +42,7 @@ it would take to provide it without nix.
 
 ### 1b. Image / boot path — NOT in the gate (disk-image + try-boot verbs only)
 
-These fail closed (with `shuttle doctor` hints) when absent; the gate never
+These fail closed (with `nau doctor` hints) when absent; the gate never
 touches them. They are why devbox carries qemu & co — the boot tests, not
 `cargo test`.
 
@@ -58,7 +58,7 @@ touches them. They are why devbox carries qemu & co — the boot tests, not
 | `cryptsetup` | `src/image/initramfs.rs`, `src/doctor.rs` (LUKS) | ❌ | distro | ⚠️ binary trivial; static musl build is fragile (the devbox static-pin breakage of ef63400 was exactly this family) |
 | `busybox` | `src/image/staging.rs`, `image/initramfs.rs` (initramfs shell) | ❌ | ✅ static musl binaries from busybox.net | ✅ fetch prebuilt |
 | `qemu-system-*` | `src/boot_test.rs` try-boot harness (`qemu_argv`, ~line 666) | ❌ | ⚠️ distro package (huge); static builds exist via third parties | ❌ apt install alone is ~500 MB, boot tests also need edk2 firmware |
-| `systemctl`/`systemd-sysext`/`bootctl`/`loginctl` | `src/runtime.rs` `RuntimeTools` — **suppressed by `SHUTTLE_SYSTEMD=off`** (runtime.rs:445) | ✅ `pkgs/s/systemd.lua` (partially) | ✅ distro systemd | n/a (host provides) |
+| `systemctl`/`systemd-sysext`/`bootctl`/`loginctl` | `src/runtime.rs` `RuntimeTools` — **suppressed by `NAU_SYSTEMD=off`** (runtime.rs:445) | ✅ `pkgs/s/systemd.lua` (partially) | ✅ distro systemd | n/a (host provides) |
 | `systemd-analyze` | `src/units.rs` unit verification (doctor path) | ❌ | ✅ distro | ✅ `apt systemd` (already on runners) |
 
 ### 1c. Lint/coverage lanes — in devbox, not in ci.yml
@@ -80,7 +80,7 @@ Devbox packages with **no pool recipe and no trivial on-runner story**, and
 whether the gate actually needs them:
 
 - **qemu** — no recipe, huge, needs edk2 firmware. Only `src/boot_test.rs`
-  (try-boot) needs it; `SHUTTLE_SYSTEMD=off cargo test` never spawns it.
+  (try-boot) needs it; `NAU_SYSTEMD=off cargo test` never spawns it.
   Boot tests are a separate explicit verb, not the gate. **Not a blocker.**
 - **bubblewrap / squashfs-tools / mtools / parted / gdisk / cryptsetup / ukify** —
   no recipes. bwrap + squashfs-tools are gate-relevant but are one
@@ -114,12 +114,12 @@ Net: **nothing blocks the gate.** Every gate binary is either distro-provided
 1. **Gate pod.** Create a dedicated pod holding the pinned toolchain:
 
    ```sh
-   shuttle pod --name gate add rust
-   shuttle pod --name gate sync
+   nau pod --name gate add rust
+   nau pod --name gate sync
    ```
 
    The pool recipe (`pkgs/r/rust.lua`, official dist tarball) is the
-   version pin; `shuttle.lock` in the pod root carries the resolved pin.
+   version pin; `nau.lock` in the pod root carries the resolved pin.
    Committed project declaration: check in `gate/pod.lua`
    (`pod { packages = { "rust" } }`) so the pod is reproducible; note the
    gap — **there is no `pod declare --file` verb today**, so the checked-in
@@ -135,14 +135,14 @@ Net: **nothing blocks the gate.** Every gate binary is either distro-provided
 3. **The gate** (replaces `devbox run -- check`):
 
    ```sh
-   export SHUTTLE_SYSTEMD=off
-   shuttle run --pod gate -- cargo build --locked
-   shuttle run --pod gate -- cargo test  --locked
-   shuttle run --pod gate -- cargo clippy --locked -- -D warnings
-   shuttle run --pod gate -- cargo fmt --check
+   export NAU_SYSTEMD=off
+   nau run --pod gate -- cargo build --locked
+   nau run --pod gate -- cargo test  --locked
+   nau run --pod gate -- cargo clippy --locked -- -D warnings
+   nau run --pod gate -- cargo fmt --check
    ```
 
-   `shuttle run --` resolves `cargo` farm-first (the pod's rust), children
+   `nau run --` resolves `cargo` farm-first (the pod's rust), children
    inherit the overlaid env (loader-lib `LD_LIBRARY_PATH` from the farm —
    this is what kills the `env -u LD_LIBRARY_PATH` ritual), and host
    distro tools (mksquashfs, bwrap, cc, git, …) resolve via the PATH
@@ -152,7 +152,7 @@ Net: **nothing blocks the gate.** Every gate binary is either distro-provided
 4. Update `docs/agents/build-and-test.md` gate table; devbox stays as
    fallback until P3.
 
-Bootstrap note: building shuttle itself needs a host `cargo` + C++
+Bootstrap note: building nau itself needs a host `cargo` + C++
 toolchain (`install.sh` rustup-bootstraps cargo if absent; the vendored
 Luau analyzer needs cc/c++). On any dev machine both already exist. No nix
 involved.
@@ -163,14 +163,14 @@ Job on `ubuntu-24.04`, no devbox action:
 
 1. `sudo apt-get install -y squashfs-tools bubblewrap` (runners have
    passwordless sudo; gcc/g++/curl/tar/git/python3 preinstalled).
-2. Install shuttle from the checkout:
-   `SHUTTLE_SRC="$GITHUB_WORKSPACE" ./install.sh --skip-deps --prefix "$HOME/.local"`
+2. Install nau from the checkout:
+   `NAU_SRC="$GITHUB_WORKSPACE" ./install.sh --skip-deps --prefix "$HOME/.local"`
    (`--skip-deps` continues with a warning instead of dying — verified in
    `install.sh:136`; rustup bootstrap if no cargo).
-3. **Payload mechanism — `shuttle export` tree shipped as a GH Actions
+3. **Payload mechanism — `nau export` tree shipped as a GH Actions
    artifact, pulled back via the farm's own signed protocol** (details in
    §4 below).
-4. Gate: same four `SHUTTLE_SYSTEMD=off shuttle run --pod gate -- cargo …`
+4. Gate: same four `NAU_SYSTEMD=off nau run --pod gate -- cargo …`
    commands, plus a **skip-guard**: the pod tests skip silently when
    mksquashfs/unsquashfs/bwrap are missing (`bwrap_gate()` pattern) —
    green-but-hollow. The job must grep the test output for
@@ -184,7 +184,7 @@ Job on `ubuntu-24.04`, no devbox action:
 
 - Delete `devbox.json` + `devbox.lock`.
 - Rewrite `docs/agents/build-and-test.md`: gate = the four
-  `shuttle run --pod gate -- cargo …` commands; drop the
+  `nau run --pod gate -- cargo …` commands; drop the
   `env -u LD_LIBRARY_PATH` ritual entirely (it existed because the pod's
   loader-lib `LD_LIBRARY_PATH` leak broke devbox's node — no devbox, no
   leak, no ritual). Update the top-level `AGENTS.md` build section to
@@ -194,7 +194,7 @@ Job on `ubuntu-24.04`, no devbox action:
   Add relayout recipes (`libgcc.lua` prebuilt precedent) if they should be
   farm-visible.
 - Local shell: nothing to migrate — the login shell is already pod-shellenv
-  (`~/.bashrc.d/90-shuttle.sh`); devbox was only ever entered for the gate.
+  (`~/.bashrc.d/90-nau.sh`); devbox was only ever entered for the gate.
 - Uninstall nix/devbox from the machine (owner-gated; see issue #96 family
   and the open dogfood uninstall ticket).
 
@@ -202,16 +202,16 @@ Job on `ubuntu-24.04`, no devbox action:
 
 ## 4. Payload delivery for CI — recommended mechanism
 
-**One mechanism: `shuttle export` → GH Actions artifact → `shuttle pull`.**
+**One mechanism: `nau export` → GH Actions artifact → `nau pull`.**
 
 - The owner's machine (or any pod-bearing machine) runs
-  `shuttle export --out export-tree/` — a plain directory
+  `nau export --out export-tree/` — a plain directory
   (`index.json`, signed `manifests/<pkg>.json`, content-addressed
   `blobs/<sha256>`; ADR-0033 Decision 10). Upload it with
   `actions/upload-artifact`.
 - The CI job downloads the artifact, serves it on loopback
   (`python3 -m http.server --bind 127.0.0.1`), and runs
-  `shuttle pull "http://127.0.0.1:<port>/<pkg>" --pod gate` for each
+  `nau pull "http://127.0.0.1:<port>/<pkg>" --pod gate` for each
   package of the gate generation (rust + its requires: glibc, libgcc).
 
 Why this one: it reuses the farm's own pull protocol with fail-closed
@@ -221,7 +221,7 @@ so the glibc source-build problem never touches CI, and `export`'s
 union+prune rules keep the published tree exactly the pod's generation.
 
 Rejected alternatives: (a) on-runner `pod sync` from recipes — dead end,
-glibc is a hours-long source build; (b) `shuttle serve` peer pull from the
+glibc is a hours-long source build; (b) `nau serve` peer pull from the
 owner's machine — CI would require an online home machine; (c) raw upstream
 tarballs (rust dist tarball only) — works for rust but bypasses the pod
 protocol and re-builds the snap on-runner, and doesn't generalize to the
@@ -282,14 +282,14 @@ this) so "green locally, red in CI" never means "different rustc".
   incremental artifacts; CI already builds this same crate on 14 GB
   ubuntu-24.04 runners today under devbox, so the budget precedent holds —
   keep `CARGO_INCREMENTAL=0` (GH default) and don't add profiles. The rust
-  payload is ~250 MB download / ~1.5 GB installed; shuttle's own release
+  payload is ~250 MB download / ~1.5 GB installed; nau's own release
   build (with 120 vendored C++ TUs) is a few minutes.
-- **Chicken-and-egg.** Installing shuttle needs a host cargo + cc (rustup
+- **Chicken-and-egg.** Installing nau needs a host cargo + cc (rustup
   minimal + distro gcc) — that bootstrap stays distro/rustup-based
   forever; only the *gate* toolchain rides the pod.
 - **Pod surface on CI.** Issue #101 (open) notes pod-surface mutation verbs
   fail closed without their tools; `pod sync` needs mksquashfs — apt
-  covers it. `shuttle run --` itself is a transparent exec, no extra
+  covers it. `nau run --` itself is a transparent exec, no extra
   surface.
 - **`pod declare --file` gap.** P1's checked-in `gate/pod.lua` is not yet
   loadable by a CLI verb; bootstrap remains `pod add` + `sync`. Small

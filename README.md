@@ -1,4 +1,4 @@
-# shuttle
+# nau
 
 Build Snap packages from Lua declarations.
 
@@ -9,11 +9,11 @@ YAML needed. Pins all inputs by content hash for reproducible builds.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rbelem/shuttle/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rbelem/nau/main/install.sh | bash
 ```
 
-Installs to `~/.local/bin/shuttle` (plus an `stl` symlink for 3-key
-invocation) and `~/.local/share/shuttle/repo` (managed
+Installs to `~/.local/bin/nau` (plus an `stl` symlink for 3-key
+invocation) and `~/.local/share/nau/repo` (managed
 source clone, used for updates — re-run the installer to update). Bootstraps
 rustup if cargo is missing and installs distro packages (`squashfs-tools`,
 `bubblewrap`) with sudo when absent; `--skip-deps` to manage those yourself.
@@ -23,10 +23,10 @@ Linux first (any distro, NixOS, WSL2); macOS is not supported yet.
 
 ```bash
 # Build a snap from source
-shuttle build --file examples/jq-from-source/shuttle.lua
+nau build --file examples/jq-from-source/nau.lua
 
 # Build a system image from pinned snaps
-shuttle image --file shuttle.lua --source-date-epoch 0
+nau image --file nau.lua --source-date-epoch 0
 ```
 
 ## Dev Environment (devbox)
@@ -48,7 +48,7 @@ definition's `source` / `inputs` instead.
 Also disable build-time downloads — e.g. for CMake, pass
 `-DBUILD_TESTING=OFF` so FetchContent doesn't try to clone test
 dependencies at build time. When a build command fails and its output
-looks like a download attempt (curl/wget/fetch/clone/download), shuttle
+looks like a download attempt (curl/wget/fetch/clone/download), nau
 prints a best-effort no-network hint; the match is advisory, not exact.
 
 ## Porting a single `build` to `parts`
@@ -82,6 +82,6 @@ See `CONTEXT.md` (domain glossary) and `docs/adr/` (architecture decisions) for 
 
 ## Sponsors
 
-shuttle is free, open source software (GPL-3.0), maintained nights and weekends
+nau is free, open source software (GPL-3.0), maintained nights and weekends
 on hardware that's due for an upgrade. If you'd like to keep development moving,
 please consider [sponsoring the project](https://github.com/sponsors/rbelem).

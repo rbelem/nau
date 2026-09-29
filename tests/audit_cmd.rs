@@ -1,4 +1,4 @@
-//! `shuttle audit` integration tests (issue #52).
+//! `nau audit` integration tests (issue #52).
 //!
 //! Drives the real binary over fixture lockfiles against a mock OSV
 //! querybatch server (an in-test TCP listener speaking just enough HTTP
@@ -152,7 +152,7 @@ fn dead_url() -> String {
 /// Fixture lockfile: one registry-proven source pin, one deps-bearing
 /// pod package, one store snap.
 fn write_lockfile(root: &std::path::Path) -> String {
-    let path = root.join("shuttle.lock");
+    let path = root.join("nau.lock");
     std::fs::write(
         &path,
         r#"{
@@ -183,16 +183,16 @@ struct AuditRun {
 }
 
 fn run_audit(lockfile: &str, url: &str, cache_dir: &std::path::Path, extra: &[&str]) -> AuditRun {
-    let bin = env!("CARGO_BIN_EXE_shuttle");
+    let bin = env!("CARGO_BIN_EXE_nau");
     let mut cmd = Command::new(bin);
     cmd.arg("audit")
         .arg("--lockfile")
         .arg(lockfile)
         .args(extra)
-        .env("SHUTTLE_OSV_URL", url)
-        .env("SHUTTLE_AUDIT_CACHE", cache_dir)
+        .env("NAU_OSV_URL", url)
+        .env("NAU_AUDIT_CACHE", cache_dir)
         .current_dir(env!("CARGO_MANIFEST_DIR"));
-    let out = cmd.output().expect("failed to spawn shuttle audit");
+    let out = cmd.output().expect("failed to spawn nau audit");
     AuditRun {
         code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -394,7 +394,7 @@ fn audit_update_flag_bypasses_a_warm_cache() {
 fn audit_unmapped_source_pin_warns() {
     let (url, _) = spawn_mock();
     let dir = tempfile::tempdir().unwrap();
-    let lockfile = dir.path().join("shuttle.lock");
+    let lockfile = dir.path().join("nau.lock");
     std::fs::write(
         &lockfile,
         r#"{
@@ -427,7 +427,7 @@ fn audit_unmapped_source_pin_warns() {
 fn audit_tampered_lockfile_fails_hard() {
     let (url, _) = spawn_mock();
     let dir = tempfile::tempdir().unwrap();
-    let lockfile = dir.path().join("shuttle.lock");
+    let lockfile = dir.path().join("nau.lock");
     std::fs::write(&lockfile, "{ definitely not json").unwrap();
     let cache = fresh_cache();
     let run = run_audit(

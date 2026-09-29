@@ -1,4 +1,4 @@
-//! `shuttle pod declare --file` integration tests (gate-pod gap 5).
+//! `nau pod declare --file` integration tests (gate-pod gap 5).
 //!
 //! Drives the real binary end to end: a checked-in pod.lua is loaded,
 //! validated, and made the pod's declaration (replacing whatever was
@@ -197,15 +197,15 @@ fn write_pod_file(project: &Path, file_name: &str, packages: &[&str]) -> PathBuf
 // ── Runners ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     // The desktop launcher surface (issue #7) writes to the user data
     // home — redirect it inside the test's tempdir, never the real home.
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66).
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -222,7 +222,7 @@ fn pod_lua(root: &Path, pod: &str) -> PathBuf {
 }
 
 fn pod_lock(root: &Path, pod: &str) -> PathBuf {
-    pod_dir(root, pod).join("shuttle.lock")
+    pod_dir(root, pod).join("nau.lock")
 }
 
 fn current_link(root: &Path, pod: &str) -> PathBuf {
@@ -581,7 +581,7 @@ gated_test!(declare_sync_failure_names_written_declaration, {
     );
     assert!(
         stderr.contains("sync"),
-        "error must point at `shuttle pod sync`: {stderr}"
+        "error must point at `nau pod sync`: {stderr}"
     );
     // The post-write contract (same residual as add_package): the new
     // declaration stays in place for the converging re-run.

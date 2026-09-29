@@ -4,7 +4,7 @@
 -- Companion to pi-gadget for Raspberry Pi Ubuntu Core images.
 --
 -- Register in package index:
---   shuttle index add pi-kernel --summary "Raspberry Pi kernel snap"
+--   nau index add pi-kernel --summary "Raspberry Pi kernel snap"
 --
 -- Usage:
 --   image {

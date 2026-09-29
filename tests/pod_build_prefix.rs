@@ -7,14 +7,14 @@
 //! 1. Merged build prefix + requires closure: a pod package whose
 //!    `requires` name pool libraries builds against the merged
 //!    `/usr`-like prefix (headers + link libs visible at
-//!    `$SHUTTLE_BUILD_PREFIX`), and its transitive requires closure is
+//!    `$NAU_BUILD_PREFIX`), and its transitive requires closure is
 //!    resolved, built, and INSTALLED into the pod so the generation and
 //!    the farm carry it. The dependency chain is two levels deep — the
 //!    middle dependency itself builds against the prefix — proving the
 //!    prefix machinery applies recursively to dep payloads too.
 //!
 //! 2. Leak scan on the pod build path (ADR-0018 Decision 3): a pod
-//!    package that bakes a `/shuttle-build-prefix` RUNPATH into its
+//!    package that bakes a `/nau-build-prefix` RUNPATH into its
 //!    binary FAILS `pod add`; declaring the hit in `leaks_ok` makes the
 //!    build pass (visibly logged). Pod-built payloads carry no
 //!    build-only references.
@@ -176,12 +176,12 @@ fn write_libbar(project: &Path, port: u16) {
     name = "libbar",
     version = "1.0",
     source = "http://127.0.0.1:{port}/libbar.tar.gz",
-    build = "mkdir -p $STAGE/usr/lib $STAGE/usr/include && gcc -shared -fPIC -Wl,-soname,libbar.so.1 -o $STAGE/usr/lib/libbar.so.1 $SRC/libbar.c -I$SHUTTLE_BUILD_PREFIX/usr/include -L$SHUTTLE_BUILD_PREFIX/usr/lib -lfoo && cp $SRC/libbar.h $STAGE/usr/include/ && ln -s libbar.so.1 $STAGE/usr/lib/libbar.so",
+    build = "mkdir -p $STAGE/usr/lib $STAGE/usr/include && gcc -shared -fPIC -Wl,-soname,libbar.so.1 -o $STAGE/usr/lib/libbar.so.1 $SRC/libbar.c -I$NAU_BUILD_PREFIX/usr/include -L$NAU_BUILD_PREFIX/usr/lib -lfoo && cp $SRC/libbar.h $STAGE/usr/include/ && ln -s libbar.so.1 $STAGE/usr/lib/libbar.so",
     architectures = {{ "amd64" }},
     requires = {{ "libfoo" }},
     -- The nix gcc wrapper bakes every -L path into RUNPATH (issue #22
     -- escape, same rationale as the lua/htop pool fixtures).
-    leaks_ok = {{ "/shuttle-build-prefix/usr/lib", "/shuttle-build-prefix/usr/lib64" }},
+    leaks_ok = {{ "/nau-build-prefix/usr/lib", "/nau-build-prefix/usr/lib64" }},
 }} }}
 
 "#,
@@ -212,12 +212,12 @@ fn write_mytool(project: &Path, port: u16) {
     name = "mytool",
     version = "1.0",
     source = "http://127.0.0.1:{port}/mytool.tar.gz",
-    build = "mkdir -p $STAGE/usr/bin $STAGE/usr/lib && gcc -o $STAGE/usr/bin/mytool $SRC/main.c -I$SHUTTLE_BUILD_PREFIX/usr/include -L$SHUTTLE_BUILD_PREFIX/usr/lib -lbar -lfoo && cp $SHUTTLE_BUILD_PREFIX/usr/lib/libbar.so.1 $SHUTTLE_BUILD_PREFIX/usr/lib/libfoo.so.1 $STAGE/usr/lib/",
+    build = "mkdir -p $STAGE/usr/bin $STAGE/usr/lib && gcc -o $STAGE/usr/bin/mytool $SRC/main.c -I$NAU_BUILD_PREFIX/usr/include -L$NAU_BUILD_PREFIX/usr/lib -lbar -lfoo && cp $NAU_BUILD_PREFIX/usr/lib/libbar.so.1 $NAU_BUILD_PREFIX/usr/lib/libfoo.so.1 $STAGE/usr/lib/",
     architectures = {{ "amd64" }},
     requires = {{ "libbar" }},
     -- The staged runtime copies carry libbar's nix-wrapper RUNPATH (see
     -- libbar; issue #22 escape, same rationale as the lua pool fixture).
-    leaks_ok = {{ "/shuttle-build-prefix/usr/lib", "/shuttle-build-prefix/usr/lib64" }},
+    leaks_ok = {{ "/nau-build-prefix/usr/lib", "/nau-build-prefix/usr/lib64" }},
     apps = {{
         mytool = {{ command = "usr/bin/mytool" }},
     }},
@@ -259,7 +259,7 @@ fn write_leaker(project: &Path, port: u16, leaks_ok: &[&str]) {
     name = "leaker",
     version = "1.0",
     source = "http://127.0.0.1:{port}/leaker.tar.gz",
-    build = "mkdir -p $STAGE/usr/bin && gcc -o $STAGE/usr/bin/leaker $SRC/main.c -I$SHUTTLE_BUILD_PREFIX/usr/include -L$SHUTTLE_BUILD_PREFIX/usr/lib -lbar",
+    build = "mkdir -p $STAGE/usr/bin && gcc -o $STAGE/usr/bin/leaker $SRC/main.c -I$NAU_BUILD_PREFIX/usr/include -L$NAU_BUILD_PREFIX/usr/lib -lbar",
     architectures = {{ "amd64" }},
     build_deps = {{ "libbar" }},{leak_lines}
     apps = {{
@@ -276,16 +276,16 @@ fn write_leaker(project: &Path, port: u16, leaks_ok: &[&str]) {
 // ── Drivers ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     // The desktop launcher surface writes to the user data home —
     // redirect it inside the test's tempdir, never the real home.
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (no polkit prompt
     // locally, no silent "Access denied" on CI). Issue #66.
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -362,10 +362,10 @@ gated_test!(requires_closure_builds_installs_and_runs, {
 
     // A second sync is a no-op: closure members in the active generation
     // keep their store content — no new generation, no rebuild.
-    let before = std::fs::read(pod_dir(root.path(), "default").join("shuttle.lock")).unwrap();
+    let before = std::fs::read(pod_dir(root.path(), "default").join("nau.lock")).unwrap();
     let (code, _, stderr) = run(project.path(), root.path(), &["sync"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
-    let after = std::fs::read(pod_dir(root.path(), "default").join("shuttle.lock")).unwrap();
+    let after = std::fs::read(pod_dir(root.path(), "default").join("nau.lock")).unwrap();
     assert_eq!(before, after, "no-op sync must not touch the lockfile");
     let lock: serde_json::Value = serde_json::from_slice(&after).expect("valid JSON lockfile");
     assert!(
@@ -577,7 +577,7 @@ gated_toolchain_free_test!(declared_gcc_payload_feeds_the_sandbox_toolchain, {
 
 // The doctor hint's exact flow: the builder pod builds the compiler
 // payload; the target pod — empty project, no collection — sideloads it
-// (`shuttle pod add --ack-unsigned --snap …`); a recipe in the target
+// (`nau pod add --ack-unsigned --snap …`); a recipe in the target
 // project then declares the tool by name via build_deps, and the pod's
 // build resolves the compilers from it. A pod-side compiler therefore
 // serves builds with no host compiler anywhere in the flow.

@@ -23,10 +23,10 @@
 -- Requires: stage0-gcc, stage1-gcc
 --
 -- Usage:
---   shuttle build --order --file pkgs/t/toolchain-bootstrap.lua
+--   nau build --order --file pkgs/t/toolchain-bootstrap.lua
 --   → prints build order: stage0 → binutils → gmp → ... → stage1
 --
---   shuttle build --file pkgs/t/toolchain-bootstrap.lua bootstrap
+--   nau build --file pkgs/t/toolchain-bootstrap.lua bootstrap
 --   → builds the full bootstrap chain
 return {
     default = snap {

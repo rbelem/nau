@@ -2,7 +2,7 @@
 
 Status: **gate proven — the devbox-free cargo path works.** Round 4
 shipped the C toolchain payload (#164) and the loader-seam changes it
-needed; `shuttle run --pod gate -- cargo build` now compiles C build
+needed; `nau run --pod gate -- cargo build` now compiles C build
 scripts through the pod's own gcc and runs the output. The clippy/fmt
 drift re-test ran in round 6: drift is real. Round 7 landed the lint
 enablers — the farm exposes the cargo subcommand shims and the one
@@ -13,12 +13,12 @@ payload: the gate pod now carries 1.97.1 — the pinned toolchain — and
 pod/devbox lint verdicts are identical by construction (see Round 8 +
 gap 2; what remains of the lint axis is policy documentation in
 build-and-test.md, not code). All claims come from commands
-run on NixOS 26.11, shuttle 0.1.0.
+run on NixOS 26.11, nau 0.1.0.
 
 ## What worked
 
-- `shuttle pod --name gate add rust` — records the declaration (`rust
-  1.98.1`; `pod.lua` + `shuttle.lock` under `~/.local/share/shuttle/pods/
+- `nau pod --name gate add rust` — records the declaration (`rust
+  1.98.1`; `pod.lua` + `nau.lock` under `~/.local/share/nau/pods/
   gate/`), then reconciles. Without `mksquashfs` on PATH it fails closed
   (`cannot reconcile pod 'gate': mksquashfs/unsquashfs not found on
   PATH`). This is NixOS — no apt — so the distro-tools step became a PATH
@@ -44,11 +44,11 @@ run on NixOS 26.11, shuttle 0.1.0.
    No C compiler on that PATH (host has none, doctor agrees, pool `gcc`
    is a multi-hour source build).
 
-`shuttle run --pod gate -- cargo build --locked` correctly refuses (`pod
+`nau run --pod gate -- cargo build --locked` correctly refuses (`pod
 'gate' has not been reconciled yet`). The 1.98.1-vs-1.97.1 clippy/fmt
 drift is **not yet observable** — it needs a live pod.
 
-## Round 2 (2026-09-22, shuttle @ a3cc98b, debug build)
+## Round 2 (2026-09-22, nau @ a3cc98b, debug build)
 
 1. `pod --name gate sync` with the daily farm first on PATH — still the
    exit-60 CA failure: the farm curl is the daily pod's generation 67,
@@ -122,7 +122,7 @@ swap (no remove/re-add churn). The payload hash changes again with the
 review fixes (shim -L guard, gcc routed through the shim), so existing
 gate pods need one re-sideload to pick up all three fixes.
 
-## Round 5 — curl refresh path end to end (#142) (2026-09-23, daily pod, shuttle @ 97bdfaa + #138/#142 in tree, debug build)
+## Round 5 — curl refresh path end to end (#142) (2026-09-23, daily pod, nau @ 97bdfaa + #138/#142 in tree, debug build)
 
 **Verdict: negative — `pod sync` does not sweep the stranded #138 curl
 fix.** The recipe-closure hash pin never fires for it: the migration
@@ -195,7 +195,7 @@ situation it was filed for. Follow-up candidates for the issue (none
 attempted here): a one-shot migration rebuild, a `pod refresh` verb, or
 the documented remove/re-add churn.
 
-## Round 3 (2026-09-23, shuttle @ 0ab0912, debug build) — sideload route proven
+## Round 3 (2026-09-23, nau @ 0ab0912, debug build) — sideload route proven
 
 The prebuilt-payload route (gap 2) works end to end. All four payloads
 existed as Sep-14 lane artifacts in the repo root (`rust_1.98.1`,
@@ -219,7 +219,7 @@ export verb needed, no recipe build, no gcc.
      with current code would stamp `requires: glibc, libgcc` and #151's
      preflight would demand exactly the other three.
 
-2. `shuttle run --pod gate -- cargo build --locked` **executed**: the
+2. `nau run --pod gate -- cargo build --locked` **executed**: the
    pod reconciled, the farm exposed cargo, and cargo 1.98.1 (pod, not
    devbox) compiled rust deps of this repo. It died at the first C
    build script:
@@ -269,13 +269,13 @@ build hash).
    wants the `cargo-*` entry points. Workaround for measurement only,
    caller-side, no pod mutation: symlink the three binaries from
    `apps/rust/usr/bin/` into a `/tmp` shim dir and prepend it to PATH
-   before `shuttle run` (farm-first overlay keeps pod bins ahead).
+   before `nau run` (farm-first overlay keeps pod bins ahead).
 
 2. **Clippy axis — verdicts differ.** Devbox (`devbox run -- clippy`,
    forced fresh with `touch src/**/*.rs` to defeat the warm target/
-   fingerprint cache): exit 0, `Checking shuttle v0.1.0`, 0 diagnostics,
+   fingerprint cache): exit 0, `Checking nau v0.1.0`, 0 diagnostics,
    15.1 s wall (deps cached; first clippy-cold run was 1m10s). Pod
-   (`shuttle run --pod gate -- cargo clippy -- -D warnings` + shims,
+   (`nau run --pod gate -- cargo clippy -- -D warnings` + shims,
    all 147 dep crates checked fresh under 1.98.1): exit 101, 55.7 s:
 
         error: useless use of `format!`
@@ -286,7 +286,7 @@ build hash).
            = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#useless_format
            = note: `-D clippy::useless-format` implied by `-D warnings`
 
-        error: could not compile `shuttle` (lib) due to 1 previous error
+        error: could not compile `nau` (lib) due to 1 previous error
 
    Identical source, identical `-D warnings`: 1.97.1 clean, 1.98.1
    rejects. `useless_format` in 1.98 catches captured-identifier
@@ -334,7 +334,7 @@ rustfmt 1.9.0.
    current) re-presents and re-emits the farm of the EXISTING
    sideloaded rust payload:
 
-        $ ls ~/.local/share/shuttle/pods/gate/current | grep cargo
+        $ ls ~/.local/share/nau/pods/gate/current | grep cargo
         cargo
         cargo-clippy
         cargo-fmt
@@ -347,12 +347,12 @@ rustfmt 1.9.0.
 3. **Clippy axis — parity, both green, no shims.** Pod-side, from this
    tree, no caller PATH shims:
 
-        $ shuttle run --pod gate -- cargo clippy --version
+        $ nau run --pod gate -- cargo clippy --version
         clippy 0.1.98 (48a229ceae 2026-09-01)          # exit 0, 0.16 s
-        $ time shuttle run --pod gate -- cargo clippy -- -D warnings
+        $ time nau run --pod gate -- cargo clippy -- -D warnings
           Compiling libc v0.2.189
           … every dep crate checked fresh under 1.98.1, then:
-          Checking shuttle v0.1.0 (…/lint-enable)
+          Checking nau v0.1.0 (…/lint-enable)
           Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 07s
         real    1m7.119s
         # exit 0; zero diagnostics
@@ -361,7 +361,7 @@ rustfmt 1.9.0.
    after the source edit; 0.2 s warm). Round 6's verdict flips:
    identical source, identical `-D warnings`, both toolchains accept.
 
-4. **Fmt axis — still parity.** Pod `shuttle run --pod gate -- cargo
+4. **Fmt axis — still parity.** Pod `nau run --pod gate -- cargo
    fmt --check`: exit 0, empty output, 0.77 s; `cargo fmt --version`
    through the run → `rustfmt 1.9.0-stable (48a229ceae 2026-09-01)`,
    `rustc 1.98.1`, `cargo 1.98.1`. Devbox `devbox run -- fmt-check`:
@@ -453,13 +453,13 @@ exactly.
 4. **The parity proof** — from this tree, raw caller shell, NO shims,
    NO `CURL_CA_BUNDLE` in the run env. Versions through the pod run:
 
-        $ shuttle run --pod gate -- cargo clippy --version
+        $ nau run --pod gate -- cargo clippy --version
         clippy 0.1.97 (8bab26f4f6 2026-07-14)
-        $ shuttle run --pod gate -- rustc --version
+        $ nau run --pod gate -- rustc --version
         rustc 1.97.1 (8bab26f4f 2026-07-14)
-        $ shuttle run --pod gate -- cargo --version
+        $ nau run --pod gate -- cargo --version
         cargo 1.97.1 (c980f4866 2026-06-30)
-        $ shuttle run --pod gate -- cargo fmt --version
+        $ nau run --pod gate -- cargo fmt --version
         rustfmt 1.9.0-stable (8bab26f4f6 2026-07-14)
 
    Clippy axis — every dep crate checked fresh under the pod's 1.97.1
@@ -467,7 +467,7 @@ exactly.
    from devbox's nixpkgs build, so cargo fingerprints differ and
    nothing is shared through target/):
 
-        $ time shuttle run --pod gate -- cargo clippy -- -D warnings
+        $ time nau run --pod gate -- cargo clippy -- -D warnings
           Checking serde_yaml v0.9.34+deprecated
           … (every dep crate, then)
           Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 17s
@@ -477,7 +477,7 @@ exactly.
    Devbox side (`devbox run -- clippy`): exit 0, zero diagnostics,
    1m13.8s (it rechecked after the pod run — each side rebuilds the
    other's artifacts, but the verdicts are what matter and they are
-   identical). Fmt axis: pod `shuttle run --pod gate -- cargo fmt
+   identical). Fmt axis: pod `nau run --pod gate -- cargo fmt
    --check` exit 0, empty output, 1.3s; devbox `devbox run --
    fmt-check` exit 0, empty, 0.9s.
 
@@ -514,7 +514,7 @@ payload is already gone — the gate pod's gcc payload as installed in
 generation 38 (pre-dating this lane, which touched only rust)
 carries the post-77964ae dispatch
 (`c++|cxx|g++) exec "$d/x86_64-linux-gnu-g++-14"`), and a C++
-compile through the pod succeeds (`shuttle run --pod gate -- c++ -o
+compile through the pod succeeds (`nau run --pod gate -- c++ -o
 … exit 0`, 18,888-byte binary produced). Should a stale gcc payload
 ever reappear, the documented repair is a same-version re-sideload
 of a rebuilt payload — content hash is the identity since b8afa43;
@@ -531,7 +531,7 @@ gcc.lua is another lane's file, untouched here.
    the cargo external-subcommand shims — `cargo-clippy`/`cargo-fmt`
    are emitted from the cargo app's recorded payload siblings, a
    no-op-reconcile re-emit surfaces them on the EXISTING pod, and
-   `cargo clippy`/`cargo fmt` run through `shuttle run` with no caller
+   `cargo clippy`/`cargo fmt` run through `nau run` with no caller
    PATH shims; (b) the one-line source fix (`src/isolate.rs:1081`,
    `format!("{e}")` → `e.to_string()`) dissolves the divergence for
    this repo — both toolchains' clippy and fmt axes pass, pod-side and
@@ -581,7 +581,7 @@ Same-version blob swaps ran the documented content-identity path; rollback
 across a swap reactivates content the blob pin no longer names (tool prints
 the caveat).
 
-Round-4 acceptance `shuttle run --pod gate -- cargo build --locked` FAILED on
+Round-4 acceptance `nau run --pod gate -- cargo build --locked` FAILED on
 `62cf65b8…`: every C++ TU died with `c++/14/cstdlib:79: fatal error:
 stdlib.h: No such file or directory`. Root cause: `#include_next` only
 searches dirs AFTER the C++ headers; the #171 shim rewrite dropped the gen-39
@@ -605,14 +605,14 @@ were pure C and never reached the chain.
 The #182-#186 secret-sources series went live on the gate pod: one real
 Bitwarden reference declared, resolved through `bws` host-side, and the
 whole round's transcripts carry zero value bytes. Executed 2026-09-26,
-shuttle built from this repo at 207021f (the secrets series landed);
+nau built from this repo at 207021f (the secrets series landed);
 issue #187's dogfood leg.
 
 1. **Declaration.** `gate`'s `pod.lua` gained one reference:
 
        secrets = { GH_TOKEN = { source = "bitwarden", id = "378c3347-1667-4341-8312-b49f01887394" } }
 
-2. **Sync — references only.** `shuttle pod --name gate sync`
+2. **Sync — references only.** `nau pod --name gate sync`
    re-presented generation 41 with all pins held (a secrets edit is
    not a package change). The staging tail wrote
    `generations/41/secrets.json`, mode 0600 — canonical, ref-only
@@ -623,13 +623,13 @@ issue #187's dogfood leg.
 3. **Cache lifecycle.** `pod secrets list` before any resolve → the
    GH_TOKEN row shows `miss`; after the run below it shows `hit`.
    Values never print — the list footer says so verbatim. The cache
-   entry landed at `$XDG_RUNTIME_DIR/shuttle/secrets/gate/<decl-hash>.json`
+   entry landed at `$XDG_RUNTIME_DIR/nau/secrets/gate/<decl-hash>.json`
    (0600; the decl-hash is the SHA-256 of the `secrets.json` bytes
    above, and the cache key drops the generation on purpose).
 
 4. **Live resolve (the acceptance).** From this tree:
 
-       $ shuttle run --pod gate -- sh -c 'test -n "$GH_TOKEN" && echo LIVE_RESOLVE_OK'
+       $ nau run --pod gate -- sh -c 'test -n "$GH_TOKEN" && echo LIVE_RESOLVE_OK'
        LIVE_RESOLVE_OK
 
    Exit 0, stdout exactly `LIVE_RESOLVE_OK` — the non-empty check
@@ -658,7 +658,7 @@ Honest deviations, both recorded rather than smoothed over:
   on a cold build queue under session load — an infra flake tracked
   separately, not a secrets defect; the gate pod's own sync was
   unaffected.
-- **The INSTALLED shuttle binary (0.1.0, pre-secrets) rejects the new
+- **The INSTALLED nau binary (0.1.0, pre-secrets) rejects the new
   declaration** with `unknown field 'secrets'` — correct fail-closed
   behavior for a binary from before the surface existed. The round ran
   the freshly built repo binary; installed fleets pick the surface up

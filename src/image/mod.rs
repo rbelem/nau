@@ -197,7 +197,7 @@ pub struct ImageDeclaration {
     /// transfer would carry no verification, and unverifiable update
     /// config is never emitted silently.
     pub update_source: Option<String>,
-    /// Override for the generated `shuttle-boot-health.service`'s
+    /// Override for the generated `nau-boot-health.service`'s
     /// `ExecStart` (issue #78). Unset keeps [`boot::BOOT_HEALTH_EXEC`],
     /// so existing images emit a byte-identical unit. Set it to e.g.
     /// `/bin/true` to satisfy the try-boot health gate on demand, or
@@ -612,7 +612,7 @@ fn get_opt_swap(table: &mlua::Table) -> miette::Result<Option<SwapConfig>> {
 
 // ── Image output ──
 
-/// Named image outputs from a `shuttle.lua`.
+/// Named image outputs from a `nau.lua`.
 pub type ImageOutputs = HashMap<String, ImageDeclaration>;
 
 /// The production image runner: every host tool the pipeline invokes runs
@@ -693,7 +693,7 @@ pub(crate) fn build_image_with(
             .into_diagnostic()
             .wrap_err("creating /etc/sysctl.d")?;
         let sysctl_content = image.sysctl.join("\n") + "\n";
-        std::fs::write(root.join("etc/sysctl.d/99-shuttle.conf"), &sysctl_content)
+        std::fs::write(root.join("etc/sysctl.d/99-nau.conf"), &sysctl_content)
             .into_diagnostic()
             .wrap_err("writing sysctl")?;
         eprintln!("  ✓ sysctl written ({} entries)", image.sysctl.len());
@@ -782,8 +782,8 @@ pub(crate) fn build_image_with(
 /// the root partition file is populated first, then dm-verity is formatted
 /// over the quiescent file (`veritysetup`) into an auto-appended hash
 /// partition, and the captured roothash is embedded in the UKI cmdline
-/// (shuttle-private `shuttle.roothash` / `shuttle.verity_data` /
-/// `shuttle.verity_hash` by-partuuid devices, issue #92 — invisible to
+/// (nau-private `nau.roothash` / `nau.verity_data` /
+/// `nau.verity_hash` by-partuuid devices, issue #92 — invisible to
 /// systemd-veritysetup-generator; boot needs no dm-verity type GUIDs). Every
 /// condition that would yield an unbootable or unverifiable image —
 /// missing ukify, missing sd-stub, missing veritysetup, missing mtools or
@@ -865,7 +865,7 @@ pub(crate) fn build_disk_image_with(
         let sysctl_dir = root.join("etc").join("sysctl.d");
         std::fs::create_dir_all(&sysctl_dir).into_diagnostic()?;
         let sysctl_content = image.sysctl.join("\n") + "\n";
-        std::fs::write(sysctl_dir.join("99-shuttle.conf"), &sysctl_content).into_diagnostic()?;
+        std::fs::write(sysctl_dir.join("99-nau.conf"), &sysctl_content).into_diagnostic()?;
         eprintln!("  ✓ sysctl written ({} entries)", image.sysctl.len());
     }
 
@@ -986,9 +986,9 @@ pub(crate) fn build_disk_image_with(
     }
 
     // 5d. ADR-0024 §4: when the image declares an update source, embed the
-    // trusted key SET (/etc/shuttle/trusted-keys/<id>.pub), the revocation
-    // list (/etc/shuttle/revoked-keys), and the current signing key's
-    // anchor (/etc/shuttle/update-key.pub, kept for backward compatibility).
+    // trusted key SET (/etc/nau/trusted-keys/<id>.pub), the revocation
+    // list (/etc/nau/revoked-keys), and the current signing key's
+    // anchor (/etc/nau/update-key.pub, kept for backward compatibility).
     // A missing local key FAILS CLOSED — an ordinary build never mints or
     // trusts a key (that would contradict "a rotation whose new key has not
     // been promoted is not trusted"). Keygen is the operator's ceremony.
@@ -1107,8 +1107,8 @@ pub(crate) fn build_disk_image_with(
     // fail-closed contract is the built-in boot-chain audit below.
     // #32: UC gadget-proper images run neither either — the boot chain is
     // the GADGET's grub + the kernel snap's kernel.efi (staged onto
-    // ubuntu-seed by setup_uc_context below), not a shuttle UKI, and the
-    // root comes from the seed unpack, not a verity-hashed shuttle rootfs.
+    // ubuntu-seed by setup_uc_context below), not a nau UKI, and the
+    // root comes from the seed unpack, not a verity-hashed nau rootfs.
     let uc_active = crate::uc::uc_requested(image, Some(disk_layout));
     let verity = image.kernel.is_some() && !is_pi && !uc_active;
     if verity {
@@ -1263,7 +1263,7 @@ pub(crate) fn build_disk_image_with(
     // GUIDs + PARTLABELs so systemd-sysupdate can match the slots.
     apply_gpt_slot_metadata(runner, &img_path, image, &effective_layout, &slots)?;
     // ADR-0044 D2, #264: the table-side half of the first-boot growth
-    // mark — the state partition carries the shuttle-private growable
+    // mark — the state partition carries the nau-private growable
     // type GUID the emitted repart definition matches (the definition's
     // `Type=` shares the constant, so the two cannot drift).
     if let Some(growth) = repart_growth_target(&effective_layout) {
@@ -1501,7 +1501,7 @@ pub(crate) fn build_disk_image_with(
         eprintln!("  ✓ piboot: no UKI — the firmware loads kernel.img (issue #87)");
         (None, PathBuf::new(), slots.skip_indices(), Some(stage))
     } else if uc_active {
-        // #32/#28: the gadget-proper chain. No shuttle UKI — grub chainloads
+        // #32/#28: the gadget-proper chain. No nau UKI — grub chainloads
         // the kernel snap's own kernel.efi out of the recovery system
         // (staged in step 6c), and snap-bootstrap manages the boot
         // variables on ubuntu-boot after the first-boot seed.
@@ -1663,13 +1663,13 @@ pub(super) fn calculate_disk_size_mb(layout: &DiskLayout) -> u64 {
 
 /// Load the update signing key for an `update_source` image, FAILING
 /// CLOSED when there is none (ADR-0024 §4). A build never mints or trusts
-/// a key: the ceremony (`shuttle key keygen`) is the operator's, and a
+/// a key: the ceremony (`nau key keygen`) is the operator's, and a
 /// key minted but not promoted must not anchor device verification.
 fn load_signing_key_fail_closed(home: &Path) -> miette::Result<crate::sign::KeyPair> {
     crate::sign::load_secret_key(home)?.ok_or_else(|| {
         miette::miette!(
             "image declares update_source but no signing key exists at {} — run \
-             `shuttle key keygen` first (a build never mints a key: an untrusted key \
+             `nau key keygen` first (a build never mints a key: an untrusted key \
              cannot anchor device verification)",
             crate::sign::secret_key_path(home).display()
         )
@@ -1722,9 +1722,9 @@ pub struct ImageManifest {
     /// SHA3-384 of the UKI `uki` names, as built and installed on the ESP
     /// (issue #284). The ESP is the one flashed region dm-verity does NOT
     /// cover, so the signed manifest pins its boot content directly —
-    /// `shuttle verify-image` recomputes this digest from the medium and
+    /// `nau verify-image` recomputes this digest from the medium and
     /// refuses a replaced or tampered UKI by name. A manifest signed by
-    /// a shuttle predating the field carries no digest: verify-image
+    /// a nau predating the field carries no digest: verify-image
     /// refuses it (fail-closed — the repo's posture for trust inputs),
     /// naming the coverage gap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1743,9 +1743,9 @@ pub struct ImageManifest {
     /// with this map emptied — [`crate::sign`]'s scheme), keyed by key id.
     /// The build writes NO entries — `skip_serializing_if` keeps the
     /// emitted `image-manifest.json` byte-identical to before this field
-    /// existed (byte-comparable doctrine) — and `shuttle image --release`
+    /// existed (byte-comparable doctrine) — and `nau image --release`
     /// (#266) attaches the published signatures. Parsed back by
-    /// `shuttle verify-image` ([`crate::image::verify`]).
+    /// `nau verify-image` ([`crate::image::verify`]).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub signatures: std::collections::BTreeMap<String, serde_json::Value>,
 }
@@ -1896,7 +1896,7 @@ pub(crate) use verity::*;
 // Genuinely public partition-type GUIDs keep their original `pub` surface.
 pub use verity::{ESP_TYPE_GUID, ROOT_TYPE_GUID_X86_64, VERITY_TYPE_GUID_X86_64};
 
-// The `shuttle verify-image` surface (ADR-0044 D4, #265).
+// The `nau verify-image` surface (ADR-0044 D4, #265).
 pub use verify::{verify_device, SlotSelector, VerifyImageArgs, VerifyOutcome};
 
 #[cfg(test)]
@@ -2830,7 +2830,7 @@ mod tests {
     fn tmpfiles_create_the_state_and_volatile_var_skeleton() {
         let state = state_tmpfiles_content();
         assert!(state.contains("d /var/lib 0755 root root -"));
-        assert!(state.contains("d /var/lib/shuttle 0755 root root -"));
+        assert!(state.contains("d /var/lib/nau 0755 root root -"));
         assert!(state.contains("d /var/lib/extensions 0755 root root -"));
 
         let var = var_tmpfiles_content_with(&[]);
@@ -2974,9 +2974,9 @@ mod tests {
         // `render_unit` golden tests. The unit is emitted data (ADR-0011
         // §5), so its exact body is the contract.
         let expected = "\
-# Generated by shuttle — do not edit.
+# Generated by nau — do not edit.
 [Unit]
-Description=shuttle: activate the current runtime generation
+Description=nau: activate the current runtime generation
 # The store lives on the persistent state partition (ADR-0023);
 # wait for its mount before touching generations.
 After=local-fs.target
@@ -2987,7 +2987,7 @@ Type=oneshot
 RemainAfterExit=yes
 # Idempotent and boot-safe: a cold store is a no-op and a
 # half-written journal is discarded (see activate_current).
-ExecStart=/usr/bin/shuttle runtime activate
+ExecStart=/usr/bin/nau runtime activate
 
 [Install]
 WantedBy=multi-user.target
@@ -3005,7 +3005,7 @@ WantedBy=multi-user.target
         let text = std::fs::read_to_string(&unit).unwrap();
         assert!(text.contains("Type=oneshot"), "oneshot: {text}");
         assert!(text.contains("RemainAfterExit=yes"));
-        assert!(text.contains("ExecStart=/usr/bin/shuttle runtime activate"));
+        assert!(text.contains("ExecStart=/usr/bin/nau runtime activate"));
         assert!(text.contains("WantedBy=multi-user.target"));
         assert!(
             text.contains("RequiresMountsFor=/var/lib"),
@@ -3022,7 +3022,7 @@ WantedBy=multi-user.target
         assert!(meta.file_type().is_symlink());
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
-            Path::new("../shuttle-runtime-activate.service")
+            Path::new("../nau-runtime-activate.service")
         );
     }
 
@@ -3094,23 +3094,23 @@ WantedBy=multi-user.target
 
     #[test]
     fn cmdline_leaves_room_for_verity_trailer() {
-        // The dm-verity boot appends shuttle.roothash= — composition is
+        // The dm-verity boot appends nau.roothash= — composition is
         // programmatic from parts so the trailer lands after root=.
         let base = compose_cmdline(&["ro".to_string()], Some("abcd"), &[]);
         let full = compose_cmdline(
             &["ro".to_string()],
             Some("abcd"),
-            &["shuttle.roothash=9f86d081".to_string()],
+            &["nau.roothash=9f86d081".to_string()],
         );
-        assert_eq!(full, format!("{base} shuttle.roothash=9f86d081"));
-        assert!(full.ends_with("root=PARTUUID=abcd shuttle.roothash=9f86d081"));
+        assert_eq!(full, format!("{base} nau.roothash=9f86d081"));
+        assert!(full.ends_with("root=PARTUUID=abcd nau.roothash=9f86d081"));
     }
 
     // ── dm-verity over the root partition (ADR-0011 step (c)) ──
 
     #[test]
     fn verity_cmdline_composes_root_then_roothash_then_devices() {
-        // Exact trailer shape: shuttle.roothash= first, then the explicit
+        // Exact trailer shape: nau.roothash= first, then the explicit
         // by-partuuid data/hash devices — boot needs no dm-verity type
         // GUIDs, and every verity argument lands AFTER root=.
         let trailing = verity_trailing(
@@ -3126,17 +3126,14 @@ WantedBy=multi-user.target
         assert_eq!(
             cmdline,
             "quiet root=PARTUUID=1234abcd-00aa-bbcc-ddee-ff0011223344 \
-             shuttle.roothash=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 \
-             shuttle.verity_data=/dev/disk/by-partuuid/1234abcd-00aa-bbcc-ddee-ff0011223344 \
-             shuttle.verity_hash=/dev/disk/by-partuuid/abcdef01-00aa-bbcc-ddee-ff0011223344"
+             nau.roothash=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 \
+             nau.verity_data=/dev/disk/by-partuuid/1234abcd-00aa-bbcc-ddee-ff0011223344 \
+             nau.verity_hash=/dev/disk/by-partuuid/abcdef01-00aa-bbcc-ddee-ff0011223344"
         );
         let root = cmdline.find("root=PARTUUID=").unwrap();
+        assert!(cmdline.find("nau.roothash=").unwrap() > root, "{cmdline}");
         assert!(
-            cmdline.find("shuttle.roothash=").unwrap() > root,
-            "{cmdline}"
-        );
-        assert!(
-            cmdline.find("shuttle.verity_hash=").unwrap() > root,
+            cmdline.find("nau.verity_hash=").unwrap() > root,
             "{cmdline}"
         );
     }
@@ -3149,7 +3146,7 @@ WantedBy=multi-user.target
         // (`roothash=`, `systemd.verity_root_data=`, `systemd.verity_root_hash=`,
         // `systemd.verity=`) would instantiate redundant root-side units
         // that stalled verity boots 90 s and busy-failed the re-attach.
-        // Every trailer token carries the shuttle. prefix instead.
+        // Every trailer token carries the nau. prefix instead.
         let trailing = verity_trailing(
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
             Some("1234abcd-00aa-bbcc-ddee-ff0011223344"),
@@ -3162,8 +3159,8 @@ WantedBy=multi-user.target
         );
         for tok in &trailing {
             assert!(
-                tok.starts_with("shuttle."),
-                "verity trailer token {tok:?} lost its shuttle. prefix — it would \
+                tok.starts_with("nau."),
+                "verity trailer token {tok:?} lost its nau. prefix — it would \
                  feed systemd-veritysetup-generator in the real root (issue #92)"
             );
         }
@@ -3173,7 +3170,7 @@ WantedBy=multi-user.target
                     && !tok.starts_with("systemd.verity")
                     && !tok.starts_with("rd.systemd.verity"),
                 "cmdline token {tok:?} is a systemd-veritysetup-generator key — \
-                 the /init contract must stay shuttle-private (issue #92): {cmdline}"
+                 the /init contract must stay nau-private (issue #92): {cmdline}"
             );
         }
     }
@@ -3211,8 +3208,12 @@ WantedBy=multi-user.target
         // Positive: both partitions are referenced, by the lowercase form.
         assert!(
             cmdline.contains("root=PARTUUID=b7046865-c340-18cd-817d-e4009f80214c")
-                && cmdline.contains("shuttle.verity_data=/dev/disk/by-partuuid/b7046865-c340-18cd-817d-e4009f80214c")
-                && cmdline.contains("shuttle.verity_hash=/dev/disk/by-partuuid/97f8e4ce-855f-7cab-ab3a-aa643a1fa0b7"),
+                && cmdline.contains(
+                    "nau.verity_data=/dev/disk/by-partuuid/b7046865-c340-18cd-817d-e4009f80214c"
+                )
+                && cmdline.contains(
+                    "nau.verity_hash=/dev/disk/by-partuuid/97f8e4ce-855f-7cab-ab3a-aa643a1fa0b7"
+                ),
             "{cmdline}"
         );
     }
@@ -3226,9 +3227,9 @@ WantedBy=multi-user.target
         assert_eq!(
             trailing,
             vec![
-                format!("shuttle.roothash={hash}"),
-                format!("shuttle.verity_data=/dev/disk/by-partuuid/{NIL_PARTUUID}"),
-                format!("shuttle.verity_hash=/dev/disk/by-partuuid/{NIL_PARTUUID}"),
+                format!("nau.roothash={hash}"),
+                format!("nau.verity_data=/dev/disk/by-partuuid/{NIL_PARTUUID}"),
+                format!("nau.verity_hash=/dev/disk/by-partuuid/{NIL_PARTUUID}"),
             ]
         );
     }
@@ -3367,7 +3368,7 @@ WantedBy=multi-user.target
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("ukify") && msg.contains("shuttle doctor"),
+            msg.contains("ukify") && msg.contains("nau doctor"),
             "fail-closed error must name ukify and the doctor hint: {msg}"
         );
     }
@@ -3397,7 +3398,7 @@ WantedBy=multi-user.target
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("veritysetup") && msg.contains("shuttle doctor"),
+            msg.contains("veritysetup") && msg.contains("nau doctor"),
             "fail-closed error must name veritysetup and the doctor hint: {msg}"
         );
     }
@@ -3420,7 +3421,7 @@ WantedBy=multi-user.target
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("veritysetup") && msg.contains("shuttle doctor"),
+            msg.contains("veritysetup") && msg.contains("nau doctor"),
             "fail-closed error must name veritysetup and the doctor hint: {msg}"
         );
     }
@@ -4315,7 +4316,7 @@ CONFIG_EXT4_FS=m
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("ukify") && msg.contains("shuttle doctor"),
+            msg.contains("ukify") && msg.contains("nau doctor"),
             "fail-closed error must name ukify and the doctor hint: {msg}"
         );
     }
@@ -4373,7 +4374,7 @@ CONFIG_EXT4_FS=m
         assert_eq!(uki_filename(&image), "my-system_1.2.3.efi");
         assert_eq!(
             loader_conf(&image),
-            "# Generated by shuttle — do not edit.\ntimeout 3\ndefault my-system_*\n"
+            "# Generated by nau — do not edit.\ntimeout 3\ndefault my-system_*\n"
         );
     }
 
@@ -4911,9 +4912,9 @@ CONFIG_EXT4_FS=m
         // golden tests. The unit is emitted data (ADR-0011 §5), so its
         // exact body is the contract.
         let expected = "\
-# Generated by shuttle — do not edit.
+# Generated by nau — do not edit.
 [Unit]
-Description=shuttle: apply systemd-sysupdate A/B updates
+Description=nau: apply systemd-sysupdate A/B updates
 # url-file transfers fetch over the network.
 After=network-online.target
 Wants=network-online.target
@@ -4933,9 +4934,9 @@ ExecStart=systemd-sysupdate update
         // fleet-wide thundering herd. `Unit=` pulls the service; the timer
         // is the only thing enabled.
         let expected = "\
-# Generated by shuttle — do not edit.
+# Generated by nau — do not edit.
 [Unit]
-Description=shuttle: periodic systemd-sysupdate check
+Description=nau: periodic systemd-sysupdate check
 
 [Timer]
 OnCalendar=daily
@@ -5011,7 +5012,7 @@ WantedBy=timers.target
         assert!(text.contains("After=local-fs.target"), "{text}");
         assert!(text.contains("RequiresMountsFor=/boot"), "{text}");
         assert!(
-            text.contains("ExecStart=/usr/bin/shuttle runtime recover-slots --esp-mount /boot"),
+            text.contains("ExecStart=/usr/bin/nau runtime recover-slots --esp-mount /boot"),
             "pinned binary + the image's own ESP mount: {text}"
         );
         assert!(text.contains("WantedBy=multi-user.target"), "{text}");
@@ -5021,7 +5022,7 @@ WantedBy=timers.target
     fn slot_recovery_exec_is_the_pinned_staged_binary() {
         // Same drift guard as BOOT_HEALTH_EXEC: the constant and the
         // staged path cannot diverge (issue #81).
-        assert!(RECOVER_SLOTS_EXEC.starts_with("/usr/bin/shuttle "));
+        assert!(RECOVER_SLOTS_EXEC.starts_with("/usr/bin/nau "));
         assert!(RECOVER_SLOTS_EXEC.ends_with(" runtime recover-slots"));
     }
 
@@ -5074,7 +5075,7 @@ WantedBy=timers.target
         // boot-complete.target, so the target (and the health gate
         // ordering before it) must succeed before the counters are cleared.
         let expected = "\
-# Generated by shuttle — do not edit.
+# Generated by nau — do not edit.
 [Unit]
 Description=Mark the Current Boot Loader Entry as Good
 Documentation=man:systemd-bless-boot.service(8)
@@ -5134,7 +5135,7 @@ ExecStart=/usr/lib/systemd/systemd-bless-boot good
         // would otherwise close the ordering loop basic → target → health
         // → basic through the implicit target defaults.
         let expected = "\
-# Generated by shuttle — do not edit.
+# Generated by nau — do not edit.
 [Unit]
 Description=Boot Completion Check
 Documentation=man:systemd.special(7)
@@ -5156,9 +5157,9 @@ After=sysinit.target
         // pull-in, and systemd would delete boot-complete.target from the
         // transaction.
         let expected = "\
-# Generated by shuttle — do not edit.
+# Generated by nau — do not edit.
 [Unit]
-Description=shuttle: boot health check (gates boot-complete.target)
+Description=nau: boot health check (gates boot-complete.target)
 DefaultDependencies=no
 # The state surface the default gate activates is mounted by local-fs; it
 # completes before basic.target, so this edge cannot cycle with the #85
@@ -5173,7 +5174,7 @@ Before=boot-complete.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/shuttle runtime activate
+ExecStart=/usr/bin/nau runtime activate
 
 [Install]
 RequiredBy=boot-complete.target
@@ -5186,8 +5187,8 @@ RequiredBy=boot-complete.target
         // The default command is a single constant; assert the emitted unit
         // spells it exactly so an override cannot silently drift it.
         // Issue #81: the constant is the absolute pinned install path the
-        // build stages — a bare `shuttle` PATH lookup shipped no binary.
-        assert_eq!(BOOT_HEALTH_EXEC, "/usr/bin/shuttle runtime activate");
+        // build stages — a bare `nau` PATH lookup shipped no binary.
+        assert_eq!(BOOT_HEALTH_EXEC, "/usr/bin/nau runtime activate");
         assert!(
             boot_health_service_content(BOOT_HEALTH_EXEC)
                 .contains(&format!("ExecStart={BOOT_HEALTH_EXEC}\n")),
@@ -5212,7 +5213,7 @@ RequiredBy=boot-complete.target
         assert_eq!(
             overridden.replace(
                 "ExecStart=/bin/true",
-                "ExecStart=/usr/bin/shuttle runtime activate",
+                "ExecStart=/usr/bin/nau runtime activate",
             ),
             boot_health_service_content(BOOT_HEALTH_EXEC),
             "override changes only the ExecStart command"
@@ -5241,7 +5242,7 @@ RequiredBy=boot-complete.target
         assert!(meta.file_type().is_symlink(), "requires is a symlink");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
-            Path::new("../shuttle-boot-health.service"),
+            Path::new("../nau-boot-health.service"),
             "relative symlink target"
         );
         assert!(
@@ -6121,7 +6122,7 @@ RequiredBy=boot-complete.target
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("mmd") && msg.contains("shuttle doctor") && msg.contains("mtools"),
+            msg.contains("mmd") && msg.contains("nau doctor") && msg.contains("mtools"),
             "fail-closed error must name the tool, the doctor hint, and the package: {msg}"
         );
     }
@@ -6876,11 +6877,11 @@ RequiredBy=boot-complete.target
                 packed.iter().any(|p| p == "bin"),
                 "packed rootfs carries the extracted base tree: {packed:?}"
             );
-            // Issue #81: the staged rootfs ships the shuttle binary the
+            // Issue #81: the staged rootfs ships the nau binary the
             // boot units exec — staged here from the test embed fixture.
             assert!(
-                packed.iter().any(|p| p == staging::SHUTTLE_BIN_PATH),
-                "packed rootfs carries the embedded shuttle binary: {packed:?}"
+                packed.iter().any(|p| p == staging::NAU_BIN_PATH),
+                "packed rootfs carries the embedded nau binary: {packed:?}"
             );
 
             // Seam proof: the expected tools were invoked through the
@@ -7256,7 +7257,7 @@ RequiredBy=boot-complete.target
             // #121: the update_source build fails closed without a signing
             // key under $HOME — right for production, host-state-dependent
             // for a test. Point HOME at a tempdir and mint a throwaway key
-            // through the same calls `shuttle key keygen` makes, so the test
+            // through the same calls `nau key keygen` makes, so the test
             // is hermetic and CI needs no key step.
             let old_home = std::env::var("HOME").ok();
             let home_dir = tempfile::tempdir().unwrap();
@@ -7645,7 +7646,7 @@ RequiredBy=boot-complete.target
         let home = tempfile::tempdir().unwrap();
         let err = load_signing_key_fail_closed(home.path()).unwrap_err();
         assert!(
-            format!("{err:#}").contains("shuttle key keygen"),
+            format!("{err:#}").contains("nau key keygen"),
             "the error tells the operator to run keygen: {err:#}"
         );
         assert!(

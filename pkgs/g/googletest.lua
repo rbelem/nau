@@ -18,7 +18,7 @@
 --
 -- Nix:       pkgs.gtest (cmake build; shared or static per flag)
 -- Snapcraft: no upstream recipe; a pure build-time dependency
--- Shuttle:   declarative Lua — CMake source build, static archives.
+-- Nau:   declarative Lua — CMake source build, static archives.
 --
 -- Port strategy: upstream defaults — static libraries
 -- (BUILD_SHARED_LIBS=OFF default), gmock built beside gtest
@@ -66,7 +66,7 @@ return {
         build = table.concat({
             "cmake -S $SRC -B $SRC/build -G Ninja "
                 .. "-DCMAKE_BUILD_TYPE=Release "
-                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_PREFIX_PATH=$NAU_BUILD_PREFIX/usr "
                 .. "-DCMAKE_INSTALL_PREFIX=/usr "
                 .. "-DCMAKE_INSTALL_LIBDIR=lib "
                 .. "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",

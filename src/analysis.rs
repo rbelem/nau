@@ -2,7 +2,7 @@
 //!
 //! Ported from `analyzer-spike/src/lib.rs` (the proven recipe; see
 //! `analyzer-spike/REPORT.md`). Built by `build.rs`: upstream C++ +
-//! `shim/shuttle_shim.cpp` compiled with the `cc` crate, linked statically.
+//! `shim/nau_shim.cpp` compiled with the `cc` crate, linked statically.
 //!
 //! Check-stage entry points:
 //!   * [`check_definition_file`] — the production gate: the strict-analyzer
@@ -22,7 +22,7 @@
 //! One AST feeds require seeding ([`ast_requires`]), the named
 //! literal-require gate ([`LITERAL_REQUIRE_MESSAGE`]), and schema-stage
 //! spans ([`locate_output_key`]); the earlier ad-hoc text scanners and the
-//! `shuttle_locate_output_key` FFI are gone.
+//! `nau_locate_output_key` FFI are gone.
 //!
 //! Strict-mode policy: definitions are checked in strict mode. Mode
 //! hot-comments that would downgrade the gate (`--!nonstrict` /
@@ -39,7 +39,7 @@
 //! time limit ([`ANALYZER_TIME_LIMIT_SECS`], wired to upstream's
 //! `FrontendOptions::moduleTimeLimitSec`). A module that exceeds the bound
 //! is aborted by the solver and reported as a single
-//! `analysis timed out after Ns` diagnostic — `shuttle check` fails closed
+//! `analysis timed out after Ns` diagnostic — `nau check` fails closed
 //! (the eval stage never sees a source the analyzer could not finish). The
 //! check worker also carries a parent-side wall-clock killer
 //! (src/isolate.rs) as the backstop, mirroring the eval stage's.
@@ -59,14 +59,14 @@ use serde::{Deserialize, Serialize};
 /// The typed prelude loaded into every definition checker: binds the globals
 /// the eval prelude injects at runtime (`snap`, `merge`, `pin`, `index`,
 /// `app`, `image`). See the file header for the loose-typing rationale.
-pub const PRELUDE_DEFS: &str = include_str!("shuttle-prelude.d.luau");
+pub const PRELUDE_DEFS: &str = include_str!("nau-prelude.d.luau");
 
 /// Upper bound on modules seeded from `require()` resolution per check.
 /// Matches the scale of real corpora (templates + their deps); anything
 /// beyond this fails closed as "Unknown require" diagnostics.
 const MAX_SEED_MODULES: usize = 64;
 
-/// Wall-clock bound on the strict-analyzer stage of `shuttle check`, in
+/// Wall-clock bound on the strict-analyzer stage of `nau check`, in
 /// seconds (analyzer-spike REPORT.md §5 deferred `moduleTimeLimitSec`; now
 /// wired). Generous by design: a cold in-process check of a corpus-scale
 /// definition is ~1.4ms, so 10s only fires on pathological sources — the
@@ -135,7 +135,7 @@ impl Diagnostic {
 
 // Raw FFI surface (see shim for semantics).
 extern "C" {
-    fn shuttle_checker_new(
+    fn nau_checker_new(
         strict: c_int,
         prelude: *const c_char,
         prelude_len: usize,
@@ -143,21 +143,21 @@ extern "C" {
         // (0.0 is a valid, immediately-expiring bound — the test hook).
         module_time_limit_secs: c_double,
     ) -> *mut c_void;
-    fn shuttle_checker_free(checker: *mut c_void);
-    fn shuttle_checker_seed_module(
+    fn nau_checker_free(checker: *mut c_void);
+    fn nau_checker_seed_module(
         checker: *mut c_void,
         name: *const c_char,
         source: *const c_char,
         len: usize,
     );
-    fn shuttle_checker_check(
+    fn nau_checker_check(
         checker: *mut c_void,
         name: *const c_char,
         source: *const c_char,
         len: usize,
     ) -> *mut c_void;
-    fn shuttle_error_count(result: *mut c_void) -> c_int;
-    fn shuttle_error_at(
+    fn nau_error_count(result: *mut c_void) -> c_int;
+    fn nau_error_at(
         result: *mut c_void,
         index: c_int,
         begin_line: *mut c_uint,
@@ -167,25 +167,25 @@ extern "C" {
         message: *mut *const c_char,
         message_len: *mut usize,
     ) -> c_int;
-    fn shuttle_timeout_hits(result: *mut c_void) -> c_int;
-    fn shuttle_check_result_free(result: *mut c_void);
+    fn nau_timeout_hits(result: *mut c_void) -> c_int;
+    fn nau_check_result_free(result: *mut c_void);
 }
 
 /// Read a result handle into owned Rust diagnostics, then free the handle.
 ///
 /// # Safety
-/// `result` must be a valid handle from `shuttle_checker_check`, or null.
+/// `result` must be a valid handle from `nau_checker_check`, or null.
 unsafe fn collect_diagnostics(result: *mut c_void) -> (Vec<Diagnostic>, u32) {
     let mut out = Vec::new();
     if result.is_null() {
         return (out, 0);
     }
-    let count = shuttle_error_count(result);
+    let count = nau_error_count(result);
     for i in 0..count {
         let (mut bl, mut bc, mut el, mut ec) = (0u32, 0u32, 0u32, 0u32);
         let mut msg: *const c_char = std::ptr::null();
         let mut msg_len: usize = 0;
-        if shuttle_error_at(
+        if nau_error_at(
             result,
             i,
             &mut bl,
@@ -207,8 +207,8 @@ unsafe fn collect_diagnostics(result: *mut c_void) -> (Vec<Diagnostic>, u32) {
             message: String::from_utf8_lossy(bytes).into_owned(),
         });
     }
-    let timeouts = shuttle_timeout_hits(result);
-    shuttle_check_result_free(result);
+    let timeouts = nau_timeout_hits(result);
+    nau_check_result_free(result);
     (out, timeouts.max(0) as u32)
 }
 
@@ -233,7 +233,7 @@ impl Checker {
         Checker::with_prelude(strict, "", None)
     }
 
-    /// Create a strict analyzer with shuttle's typed prelude bound, so
+    /// Create a strict analyzer with nau's typed prelude bound, so
     /// definitions using the injected globals (`snap`, `merge`, `pin`,
     /// `index`, `app`, `image`) check cleanly.
     pub fn for_definitions() -> Checker {
@@ -261,8 +261,8 @@ impl Checker {
         // path); null-check on the Rust side. `prelude` is only read during
         // construction; the copied sources outlive the call.
         let inner =
-            unsafe { shuttle_checker_new(strict as c_int, prelude_ptr, prelude.len(), limit_arg) };
-        assert!(!inner.is_null(), "shuttle_checker_new returned null");
+            unsafe { nau_checker_new(strict as c_int, prelude_ptr, prelude.len(), limit_arg) };
+        assert!(!inner.is_null(), "nau_checker_new returned null");
         Checker {
             inner,
             time_limit_secs,
@@ -280,7 +280,7 @@ impl Checker {
         // SAFETY: valid handle; C++ copies both strings (name via C-string
         // semantics, source via explicit length).
         unsafe {
-            shuttle_checker_seed_module(
+            nau_checker_seed_module(
                 self.inner,
                 c_name.as_ptr(),
                 source.as_ptr().cast::<c_char>(),
@@ -298,7 +298,7 @@ impl Checker {
     /// Like [`Checker::check`], but honors the checker's time limit: when any
     /// module hit the bound, the (partial, unreliable) result set is replaced
     /// by a single `analysis timed out after Ns` diagnostic — the fail-closed
-    /// shape `shuttle check` consumes. Unbounded checkers behave like
+    /// shape `nau check` consumes. Unbounded checkers behave like
     /// [`Checker::check`].
     pub fn check_bounded(&mut self, name: &str, source: &str) -> Vec<Diagnostic> {
         let (diagnostics, timeouts) = self.check_collect(name, source);
@@ -324,7 +324,7 @@ impl Checker {
         assert!(!source.contains('\0'), "source contains NUL byte");
         // SAFETY: valid handle; C++ copies both strings.
         let result = unsafe {
-            shuttle_checker_check(
+            nau_checker_check(
                 self.inner,
                 c_name.as_ptr(),
                 source.as_ptr().cast::<c_char>(),
@@ -339,7 +339,7 @@ impl Checker {
 impl Drop for Checker {
     fn drop(&mut self) {
         // SAFETY: valid handle, runs exactly once.
-        unsafe { shuttle_checker_free(self.inner) }
+        unsafe { nau_checker_free(self.inner) }
     }
 }
 
@@ -350,7 +350,7 @@ pub fn check_once(name: &str, source: &str, strict: bool) -> Vec<Diagnostic> {
     checker.check(name, source)
 }
 
-/// Check one shuttle definition in-process: strict mode, typed prelude
+/// Check one nau definition in-process: strict mode, typed prelude
 /// bound, [`ANALYZER_TIME_LIMIT_SECS`] wall-clock bound, and constant
 /// `require()` names resolved (transitively) through the same
 /// allowlisted-root policy as the eval subprocess
@@ -412,7 +412,7 @@ pub fn check_definition_in_worker(label: &str, source: &str) -> Vec<Diagnostic> 
 
 /// [`check_definition_in_worker`] for a file path. An unreadable file yields
 /// no diagnostics here — the eval stage reports read failures uniformly for
-/// both output modes of `shuttle check`.
+/// both output modes of `nau check`.
 pub fn check_definition_file(path: &str) -> Vec<Diagnostic> {
     match std::fs::read_to_string(path) {
         Ok(source) => check_definition_in_worker(path, &source),
@@ -1074,7 +1074,7 @@ return { default = snap(meta) }
         let dir = tempfile::tempdir().unwrap();
         let label = write_module(
             dir.path(),
-            "shuttle.lua",
+            "nau.lua",
             r#"
 local tpl = require("apptpl")
 
@@ -1115,7 +1115,7 @@ return M
         let dir = tempfile::tempdir().unwrap();
         let label = write_module(
             dir.path(),
-            "shuttle.lua",
+            "nau.lua",
             r#"
 local tpl = require("apptpl")
 
@@ -1395,7 +1395,7 @@ r("indirect-call-is-not-a-site")
         let dir = tempfile::tempdir().unwrap();
         let label = write_module(
             dir.path(),
-            "shuttle.lua",
+            "nau.lua",
             r#"
 local tpl = require("shady")
 return { default = tpl.output }

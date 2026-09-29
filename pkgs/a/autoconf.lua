@@ -18,7 +18,7 @@ script from a template file that lists operating system features.]],
         -- interpreter must ride the payload closure (#180 payoff: the
         -- host perl used to leak through the sandbox PATH; the
         -- canonicalized build PATH no longer carries it).
-        leaks_ok = { "/shuttle-build-prefix/usr/share/autoconf", "/shuttle-build-prefix" },
+        leaks_ok = { "/nau-build-prefix/usr/share/autoconf", "/nau-build-prefix" },
         requires = { "m4", "perl" },
         source = { url = "https://ftp.gnu.org/gnu/autoconf/autoconf-2.72.tar.xz" },
         build = table.concat({
@@ -26,7 +26,7 @@ script from a template file that lists operating system features.]],
             -- /usr (its Config); in a merged prefix the perl lib dirs
             -- sit under the prefix — perltidy.lua's export, same
             -- version pin.
-            'export PERL5LIB="$SHUTTLE_BUILD_PREFIX/usr/lib/perl5/5.40.5:$SHUTTLE_BUILD_PREFIX/usr/lib/perl5/5.40.5/x86_64-linux-thread-multi"',
+            'export PERL5LIB="$NAU_BUILD_PREFIX/usr/lib/perl5/5.40.5:$NAU_BUILD_PREFIX/usr/lib/perl5/5.40.5/x86_64-linux-thread-multi"',
             "./configure --prefix=/usr && make && make install DESTDIR=$STAGE",
             -- The autoconf drivers bake --prefix=/usr paths (the lib dir
             -- a real-root install would serve), which no merged prefix

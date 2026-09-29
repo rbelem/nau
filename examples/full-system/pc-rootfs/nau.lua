@@ -9,10 +9,10 @@
 --   - systemd-boot bootloader
 --
 -- Build:
---   shuttle image --file examples/full-system/pc-rootfs/shuttle.lua --arch amd64
+--   nau image --file examples/full-system/pc-rootfs/nau.lua --arch amd64
 --
 -- Requires:
---   package-index.json with resolved snaps (shuttle index resolve)
+--   package-index.json with resolved snaps (nau index resolve)
 --   parted, losetup, mkfs.vfat, mkfs.btrfs, dd on PATH
 --   sudo or permissions for loop device + mount
 
@@ -28,7 +28,7 @@ return {
                 "quiet",
                 "splash",
                 -- tty1 is the local console; ttyS0 mirrors the boot to the
-                -- serial port so `shuttle test` (QEMU `-serial`) can observe
+                -- serial port so `nau test` (QEMU `-serial`) can observe
                 -- userspace. Without a serial console the harness sees an
                 -- empty log even on a successful boot.
                 "console=tty1",

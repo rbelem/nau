@@ -4,7 +4,7 @@
 -- hardware-specific configuration for x86_64 Ubuntu Core devices.
 --
 -- Register in package index:
---   shuttle index add pc-gadget --store-name pc --summary "PC gadget snap"
+--   nau index add pc-gadget --store-name pc --summary "PC gadget snap"
 --
 -- The --store-name is required (issue #68): the store has no snap named
 -- 'pc-gadget' — the generic-PC gadget snap is named 'pc'. Without the

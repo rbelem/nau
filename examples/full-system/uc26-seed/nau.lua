@@ -17,11 +17,11 @@
 --   ubuntu-data 2G   ext4, role system-data — snap-bootstrap seeds it
 --
 -- Build:
---   shuttle image --file examples/full-system/uc26-seed/shuttle.lua \
---       --arch amd64 --output ~/.cache/shuttle-uc26
+--   nau image --file examples/full-system/uc26-seed/nau.lua \
+--       --arch amd64 --output ~/.cache/nau-uc26
 --
 -- Boot proof (#28 bar: snapd userspace, serial archived):
---   shuttle test ~/.cache/shuttle-uc26/ubuntu-core-uc26-seed_26.04_amd64.img \
+--   nau test ~/.cache/nau-uc26/ubuntu-core-uc26-seed_26.04_amd64.img \
 --       --runs 2 --require "snapd_recovery_mode=install" \
 --       --require "Reached target Basic System"
 --
@@ -109,6 +109,6 @@ return {
 
         -- No bootloader block: the pc gadget ships the chain (shim + grub
         -- + snapd's managed configs). `bootloader.type = "grub"` stays a
-        -- declaration error (#71) — nothing here is shuttle-managed.
+        -- declaration error (#71) — nothing here is nau-managed.
     },
 }

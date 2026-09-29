@@ -12,7 +12,7 @@ use std::time::Instant;
 
 const PRELUDE_DECL: &str = r#"
 --!strict
--- Stand-in for shuttle's typed prelude (what loadDefinitionFile or a seeded
+-- Stand-in for nau's typed prelude (what loadDefinitionFile or a seeded
 -- module would provide). Typed snap/merge/app signatures, no implementation.
 export type SnapMeta = {
     name: string,
@@ -72,10 +72,10 @@ local x = { name = "unbalanced"
 
 const PRELUDE_WIRED_CASE: &str = r#"
 --!strict
-local shuttle = require("shuttle-prelude")
+local nau = require("nau-prelude")
 
 return {
-    default = shuttle.snap {
+    default = nau.snap {
         name = "hello",
         version = "2.10",
         summary = "typed via seeded prelude module",
@@ -86,10 +86,10 @@ return {
 
 const PRELUDE_WIRED_BAD_CASE: &str = r#"
 --!strict
-local shuttle = require("shuttle-prelude")
+local nau = require("nau-prelude")
 
 return {
-    default = shuttle.snap {
+    default = nau.snap {
         name = 42,
         version = "2.10",
     },
@@ -209,13 +209,13 @@ fn main() {
 
     // Case (e): require wired to a seeded typed prelude — clean + failing variant.
     let mut wired = Checker::new(true);
-    wired.seed_module("shuttle-prelude", PRELUDE_DECL);
+    wired.seed_module("nau-prelude", PRELUDE_DECL);
     print_case(
-        "(e1) require(\"shuttle-prelude\") + valid definition",
+        "(e1) require(\"nau-prelude\") + valid definition",
         &wired.check("wired-ok", PRELUDE_WIRED_CASE),
     );
     print_case(
-        "(e2) require(\"shuttle-prelude\") + `name = 42` (type flows across the module boundary)",
+        "(e2) require(\"nau-prelude\") + `name = 42` (type flows across the module boundary)",
         &wired.check("wired-bad", PRELUDE_WIRED_BAD_CASE),
     );
 
@@ -240,7 +240,7 @@ fn main() {
     );
 
     let mut bench = Checker::new(true);
-    bench.seed_module("shuttle-prelude", PRELUDE_DECL);
+    bench.seed_module("nau-prelude", PRELUDE_DECL);
     println!(
         "   warm  (reused Frontend, worker model, clean case, n={n_warm}):  {}",
         fmt_us(bench_warm(&mut bench, "warm-clean", CLEAN_CASE, n_warm))

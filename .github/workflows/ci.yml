@@ -1,4 +1,4 @@
-# CI for shuttle — Rust CLI tool that builds Snap packages from Lua declarations.
+# CI for nau — Rust CLI tool that builds Snap packages from Lua declarations.
 #
 # Jobs, cheapest first:
 #   lint-workflow — actionlint over this file; no toolchain, runs in seconds.
