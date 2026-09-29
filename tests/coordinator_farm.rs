@@ -2330,3 +2330,73 @@ fn precompute_local_held_set_is_the_union_of_the_placement_caps() {
         "a plan-less run holds nothing locally"
     );
 }
+
+/// #309, window-7 tuning: when BOTH local and an eligible worker fully
+/// hold a node, the WORKER reserves it — local (the scarce coordinator
+/// resource, holding the inflated union set) defers in both pick paths,
+/// and the busy worker holder drains its reserved nodes itself. Pool
+/// use is the acceptance bar: warm dispatches ride the worker holder.
+#[test]
+fn both_hold_reserves_the_worker_and_local_defers() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let worker =
+        FakeMember::worker("62.238.62.155", 1, None, events.clone()).holds(&["sha-1", "sha-2"]);
+    let empty_worker = FakeMember::worker("2.29.39.212", 1, None, events.clone()).holds(&[]);
+    let local = FakeMember::local(1, events.clone()).holds(&["sha-1", "sha-2"]);
+    let members = vec![worker, empty_worker, local];
+    let mut caps_map = no_caps();
+    for (name, sha) in [("n1", "sha-1"), ("n2", "sha-2")] {
+        caps_map.insert(name.to_string(), caps_holding(&["amd64"], false, &[sha]));
+    }
+    let g = graph(&[("n1", &[]), ("n2", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome
+        .result
+        .expect("the worker holder drains both reserved nodes");
+    assert_eq!(
+        members[0].started("n1") + members[0].started("n2"),
+        2,
+        "the worker holder wins the warm dispatches: {events:?}"
+    );
+    assert_eq!(
+        members[2].calls(),
+        0,
+        "local defers — its union set never steals worker-held work: {events:?}"
+    );
+    assert_eq!(
+        members[1].calls(),
+        0,
+        "the empty worker's fallback skips reserved nodes: {events:?}"
+    );
+}
+
+/// #309: the worker holder dies mid-run — the reservation dissolves and
+/// the node falls to local's pick (the gate lifts with the
+/// reservation), instead of waiting on the dead member.
+#[test]
+fn worker_holder_death_falls_to_local() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let worker = FakeMember::worker("62.238.62.155", 1, None, events.clone())
+        .holds(&["sha-n"])
+        .dies_on(1);
+    let local = FakeMember::local(1, events.clone()).holds(&["sha-n"]);
+    let members = vec![worker, local];
+    let mut caps_map = no_caps();
+    caps_map.insert("n".to_string(), caps_holding(&["amd64"], false, &["sha-n"]));
+    let g = graph(&[("n", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome
+        .result
+        .expect("the loss is absorbed once the reservation dissolves");
+    assert_eq!(outcome.workers_lost, vec!["62.238.62.155".to_string()]);
+    assert_eq!(
+        members[0].started("n"),
+        1,
+        "the worker holder took the warm node and died on it: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("n"),
+        1,
+        "local picks the re-queued node after unreservation: {events:?}"
+    );
+}

@@ -459,10 +459,11 @@ fn farm_eligible(
 /// holds everything, nobody is preferred, and ready-set order rules as
 /// before. #309 sharpens the race out of the fallback: a node whose
 /// non-empty set some runnable member fully holds is RESERVED for that
-/// member — other members' fallbacks skip it until their holder takes
-/// it or dies — and the local member joins holder consideration with
-/// the coordinator's own resolvable set. Failure classes per
-/// ADR-0040 Amendment 1: `JobFailure::Build` stops the world named;
+/// member — worker holders first (local's union set only reserves what
+/// no worker holds), other members' fallbacks skip it, local defers in
+/// both pick paths — until their holder takes it or dies.
+/// Failure classes per ADR-0040 Amendment 1: `JobFailure::Build` stops
+/// the world named;
 /// `JobFailure::Lost` marks the executor dead, re-queues its job at
 /// the front, and stops the world only when no alive executor is
 /// eligible for an orphaned job. A re-dispatched job never cycles: it
@@ -487,25 +488,34 @@ pub fn run_ready_set_farm(
         .collect();
 
     // #309: holder reservations, computed once at setup — every member
-    // is alive here. First member in pool order that can actually run
-    // the node (slots > 0 — a zero-slot member could never wake to take
+    // is alive here. The node goes to the first member that can actually
+    // run it (slots > 0 — a zero-slot member could never wake to take
     // its reservation), is eligible for it (a held set never buys
-    // eligibility), and fully holds its NON-EMPTY placement set. ∅-set
-    // and no-holder nodes stay unreserved; the vacuous-guard twin.
+    // eligibility), and fully holds its NON-EMPTY placement set —
+    // WORKER holders first, local last (window 7: local's precomputed
+    // union set reads as holding every node, so pool-order search
+    // reserved the whole warm set for the coordinator and the workers
+    // starved; a worker holder wins, local reserves only what no
+    // eligible worker holds). ∅-set and no-holder nodes stay
+    // unreserved; the vacuous-guard twin.
     let held: Vec<Option<BTreeSet<String>>> = farm.iter().map(|fe| fe.job.store_held()).collect();
     let alive_at_setup: Vec<bool> = vec![true; farm.len()];
+    let is_local = |m: usize| matches!(farm[m].kind, ExecutorKind::Local);
+    let holder_of = |i: usize, m: usize| {
+        farm[m].job.slots() > 0
+            && farm_eligible(farm, &alive_at_setup, &node_caps, m, i)
+            && held[m]
+                .as_ref()
+                .is_some_and(|h| node_caps[i].objects.iter().all(|o| h.contains(o)))
+    };
     let reserved: Vec<Option<usize>> = (0..names.len())
         .map(|i| {
             if node_caps[i].objects.is_empty() {
                 return None;
             }
-            (0..farm.len()).find(|&m| {
-                farm[m].job.slots() > 0
-                    && farm_eligible(farm, &alive_at_setup, &node_caps, m, i)
-                    && held[m]
-                        .as_ref()
-                        .is_some_and(|h| node_caps[i].objects.iter().all(|o| h.contains(o)))
-            })
+            (0..farm.len())
+                .find(|&m| !is_local(m) && holder_of(i, m))
+                .or_else(|| (0..farm.len()).find(|&m| is_local(m) && holder_of(i, m)))
         })
         .collect();
 
@@ -802,12 +812,13 @@ struct FarmShared {
     /// store; a lost worker's store died with its channel.
     held: Vec<Option<BTreeSet<String>>>,
     /// Nodes reserved for the member that fully holds their NON-EMPTY
-    /// placement set (#309): fallback picks skip them, so an
-    /// earlier-scanning empty worker cannot steal a warm job from its
-    /// holder; the holder's own pick_ready hit takes it. Computed once
-    /// from the preflight snapshot (within-run store learning keeps
-    /// flowing through the plain preference); dissolves when the
-    /// reserved holder dies.
+    /// placement set (#309): fallback picks skip them — and local defers
+    /// in both pick paths, its union set would preference-hit everything
+    /// — so warm nodes run on their holder. WORKER holders win the
+    /// reservation; local reserves only what no eligible worker holds
+    /// (window 7). Computed once from the preflight snapshot
+    /// (within-run store learning keeps flowing through the plain
+    /// preference); dissolves when the reserved holder dies.
     reserved: Vec<Option<usize>>,
 }
 
@@ -823,11 +834,17 @@ struct Placement<'a> {
 /// nodes, the first whose known objects `e` fully holds beats queue
 /// order (#303 — a warm store saves a payload ship); none fully held,
 /// the first eligible as before — except a node reserved for another
-/// member (#309): the fallback skips it, its holder's store hit (or its
-/// holder's death, which dissolves the reservation) unlocks it.
-/// Eligibility ([`farm_eligible`]) stays the gate — the preference only
-/// reorders what a member picks, never whether a node can run
-/// somewhere. Done entries met along the scan drop out of the queue.
+/// member (#309): the fallback skips it, and LOCAL defers in BOTH pick
+/// paths (window 7: local's precomputed union set preference-hits every
+/// resolvable node, so an ungated local re-fires the all-local drain
+/// the reservation exists to prevent; the reserved holder's store hit
+/// — or its death, which dissolves the reservation — unlocks the node).
+/// Workers keep today's holder preference among themselves: a node two
+/// workers hold runs on whichever frees first, no artificial
+/// serialization. Eligibility ([`farm_eligible`]) stays the gate — the
+/// preference only reorders what a member picks, never whether a node
+/// can run somewhere. Done entries met along the scan drop out of the
+/// queue.
 fn pick_ready(
     farm: &[FarmExecutor<'_>],
     alive: &[bool],
@@ -838,6 +855,11 @@ fn pick_ready(
     done: &[bool],
 ) -> Option<(usize, usize)> {
     let Placement { held, reserved } = placement;
+    // #309: local is the scarce coordinator resource and its held set
+    // is the inflated precomputed union — when a node is reserved for
+    // another member, local reaches neither through the fallback nor
+    // the store hit.
+    let local_defers = matches!(farm[e].kind, ExecutorKind::Local);
     let mut fallback: Option<(usize, usize)> = None;
     let mut k = 0;
     while k < ready.len() {
@@ -847,20 +869,19 @@ fn pick_ready(
             continue;
         }
         if farm_eligible(farm, alive, node_caps, e, i) {
-            // #309: reserved for someone else → invisible to this
-            // member's fallback. The store hit below is never gated:
-            // taking a node you fully hold ships no payload regardless
-            // of who it was reserved for.
-            if fallback.is_none() && !reserved[i].is_some_and(|m| m != e) {
+            let taken_elsewhere = reserved[i].is_some_and(|m| m != e);
+            if fallback.is_none() && !taken_elsewhere {
                 fallback = Some((k, i));
             }
             // The non-empty gate keeps a vacuous set (∅ ⊆ anything) from
             // reading as "held by everyone" — an empty placement set gets
             // the fallback, never a fake store hit (#307).
-            if held.is_some_and(|h| {
-                !node_caps[i].objects.is_empty()
-                    && node_caps[i].objects.iter().all(|o| h.contains(o))
-            }) {
+            if !(local_defers && taken_elsewhere)
+                && held.is_some_and(|h| {
+                    !node_caps[i].objects.is_empty()
+                        && node_caps[i].objects.iter().all(|o| h.contains(o))
+                })
+            {
                 return Some((k, i));
             }
         }
