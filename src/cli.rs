@@ -821,6 +821,62 @@ fn workers_count(raw: &str) -> Result<u32, String> {
     Ok(n)
 }
 
+/// `workers burst --count`: an explicit fleet size, or `auto` — size the
+/// burst from the wrapped build's pending jobs (#304). The explicit
+/// spelling keeps the #301 bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BurstCount {
+    /// min(--max, ceil(pending / jobs-per-worker)) of the wrapped build.
+    Auto,
+    /// An explicit worker count within the #301 bounds.
+    Fixed(u32),
+}
+
+/// The burst `--count` value parser: `auto`, else the shared
+/// [`workers_count`] bounds.
+fn burst_count(raw: &str) -> Result<BurstCount, String> {
+    if raw == "auto" {
+        return Ok(BurstCount::Auto);
+    }
+    Ok(BurstCount::Fixed(workers_count(raw)?))
+}
+
+/// The wrapped argv of `workers burst --count auto` (#304): it must BE a
+/// nau build, parsed through the same Cli definition the real build uses,
+/// so sizing sees exactly the flags a real build would. Anything else is
+/// a named refusal — no pending set exists to size from. Accepts the
+/// `nau build …` spelling and the bare `build …` shorthand.
+pub fn wrapped_build(command: &[String]) -> miette::Result<Command> {
+    let not_a_build = || {
+        miette::miette!(
+            "workers burst: --count auto sizes a wrapped 'nau build' — '{}' is not one, \
+             and there is no pending set to size from",
+            command.join(" ")
+        )
+    };
+    let argv: Vec<String> = match command {
+        [first, rest @ ..] if first == "nau" => {
+            if rest.first().map(String::as_str) != Some("build") {
+                return Err(not_a_build());
+            }
+            rest.to_vec()
+        }
+        [..] if command.first().map(String::as_str) == Some("build") => command.to_vec(),
+        _ => return Err(not_a_build()),
+    };
+    let mut full = vec!["nau".to_string()];
+    full.extend(argv);
+    let cli = Cli::try_parse_from(full).map_err(|e| {
+        miette::miette!("workers burst: the wrapped build's arguments do not parse: {e}")
+    })?;
+    match cli.command {
+        cmd @ Command::Build { .. } => Ok(cmd),
+        // Unreachable through try_parse_from of a `build` argv; kept
+        // fail-closed for future Cli reshapes.
+        _ => Err(not_a_build()),
+    }
+}
+
 /// Subcommands for `nau workers`.
 #[derive(clap::Subcommand)]
 pub enum WorkersCommand {
@@ -999,9 +1055,12 @@ pub enum WorkersCommand {
         #[arg(long)]
         location: String,
 
-        /// How many workers this burst provisions (default: 1).
-        #[arg(long, default_value_t = WORKERS_MIN_COUNT, value_parser = workers_count)]
-        count: u32,
+        /// How many workers this burst provisions (default: 1), or
+        /// `auto` — size the burst from the wrapped build's pending jobs
+        /// (#304); a wrapped command that is not a build is a named
+        /// refusal before any API call.
+        #[arg(long, default_value = "1", value_parser = burst_count)]
+        count: BurstCount,
 
         /// Guardrail: refuse `--count` above it. A fat-fingered count is
         /// an hourly bill; raising it is a deliberate act.

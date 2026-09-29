@@ -11,13 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser as _;
-use nau::cli::{Cli, Command, WorkersCommand};
+use nau::cli::{BurstCount, Cli, Command, WorkersCommand};
 use nau::command::{CommandRunner, RunnerOutput};
 use nau::provision::hetzner::HetznerProvisioner;
 use nau::provision::publish::{pending_dir, pending_identities, PendingIdentity, PublishChannel};
 use nau::provision::{
-    managed_entries, parse_ttl, refuse_burst_above_max, run_burst, run_down_all_managed,
-    ProvisionRequest, BLOCK_BEGIN, BLOCK_END,
+    burst_auto_count, managed_entries, parse_ttl, refuse_burst_above_max, run_burst,
+    run_down_all_managed, ProvisionRequest, BLOCK_BEGIN, BLOCK_END,
 };
 
 // ── Fixtures (same shapes as provision_hetzner) ──
@@ -499,7 +499,11 @@ fn burst_cli_parses_the_defaults_and_the_wrapped_command() {
             assert_eq!(provider, "hetzner");
             assert_eq!(server_type, "CX33");
             assert_eq!(location, "hel1");
-            assert_eq!(count, 1, "v1 bursts are explicit-count, default 1");
+            assert_eq!(
+                count,
+                BurstCount::Fixed(1),
+                "v1 bursts are explicit-count, default 1"
+            );
             assert_eq!(max, 4, "the fat-finger guard");
             assert_eq!(ttl, "4h");
             assert_eq!(timeout, 600, "the seeded issue --wait ceiling");
@@ -592,4 +596,119 @@ fn down_cli_requires_all_managed() {
         err.to_string().contains("--all-managed"),
         "the mode flag is required: {err}"
     );
+}
+
+// ── `--count auto` (#304) ──
+
+#[test]
+fn burst_auto_count_sizes_the_ticket_fixture() {
+    // pending=5, jobs-per-worker=2, max=4 → ceil(5/2)=3, under the guard.
+    assert_eq!(burst_auto_count(5, 2, 4).unwrap(), 3);
+    assert_eq!(
+        burst_auto_count(4, 2, 4).unwrap(),
+        2,
+        "an exact division never rounds up"
+    );
+}
+
+#[test]
+fn burst_auto_count_clamps_at_max() {
+    assert_eq!(
+        burst_auto_count(100, 2, 4).unwrap(),
+        4,
+        "pending beyond the guard cannot buy more workers"
+    );
+    assert_eq!(
+        burst_auto_count(9, 3, 2).unwrap(),
+        2,
+        "ceil(9/3)=3 clamps to --max 2"
+    );
+}
+
+#[test]
+fn burst_auto_count_refuses_zero_pending_by_name() {
+    let err = burst_auto_count(0, 2, 4).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("0 pending"), "names the count: {text}");
+    assert!(
+        text.contains("nothing to build"),
+        "names why nothing is provisioned: {text}"
+    );
+}
+
+#[test]
+fn burst_auto_refuses_a_non_build_command_by_name() {
+    let err = nau::cli::wrapped_build(&["echo".to_string(), "hi".to_string()])
+        .map(|_| ())
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("is not one"), "names the refusal: {text}");
+    assert!(
+        text.contains("echo hi"),
+        "names the wrapped command: {text}"
+    );
+
+    let err = nau::cli::wrapped_build(&[
+        "nau".to_string(),
+        "workers".to_string(),
+        "burst".to_string(),
+    ])
+    .map(|_| ())
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("is not one"),
+        "a nau command that is not a build refuses the same way: {err:#}"
+    );
+
+    assert!(
+        nau::cli::wrapped_build(&["build".to_string(), "--offline".to_string()]).is_ok(),
+        "the bare `build` shorthand is the documented wrapped spelling"
+    );
+}
+
+#[test]
+fn burst_cli_parses_count_auto_beside_explicit_counts() {
+    let burst = |count: &[&str]| {
+        Cli::try_parse_from(
+            [
+                "nau",
+                "workers",
+                "burst",
+                "--provider",
+                "hetzner",
+                "--type",
+                "CX33",
+                "--location",
+                "hel1",
+            ]
+            .iter()
+            .copied()
+            .chain(count.iter().copied())
+            .chain(["--", "true"])
+            .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    match burst(&["--count", "auto"]).command {
+        Command::Workers {
+            command: WorkersCommand::Burst { count, .. },
+        } => assert_eq!(count, BurstCount::Auto, "`auto` parses as the sizing mode"),
+        _ => panic!("expected Workers Burst"),
+    }
+    match burst(&["--count", "3"]).command {
+        Command::Workers {
+            command: WorkersCommand::Burst { count, .. },
+        } => assert_eq!(
+            count,
+            BurstCount::Fixed(3),
+            "an explicit count is unchanged"
+        ),
+        _ => panic!("expected Workers Burst"),
+    }
+    match burst(&[]).command {
+        Command::Workers {
+            command: WorkersCommand::Burst { count, .. },
+        } => assert_eq!(count, BurstCount::Fixed(1), "the default stays 1"),
+        _ => panic!("expected Workers Burst"),
+    }
 }

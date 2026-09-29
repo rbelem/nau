@@ -348,7 +348,9 @@ fn main() -> miette::Result<()> {
 
         Command::WorkerJob { job_file } => nau::worker::job_main(&job_file),
 
-        Command::Workers { command } => nau::provision::workers_main(command),
+        Command::Workers { command } => {
+            nau::provision::workers_main(command, crate::wrapped_build_pending_jobs)
+        }
     }
 }
 
@@ -420,71 +422,8 @@ fn cmd_build(
         ));
     }
 
-    // Initialize package source inputs
-    // 1. If the config file exists, extract its global inputs first
-    // 2. Otherwise fall back to the default input (github:rbelem/nau/main)
-    let original_file = file.clone();
-    let file_exists = Path::new(&original_file).exists();
-
-    // Strategy 1: eval the config file directly (uses its declared inputs).
-    // An existing file whose eval fails is TERMINAL: the fallback below
-    // exists only to resolve a package NAME (a nonexistent positional)
-    // through the default input, and its plain eval never validates the
-    // workers surface — falling through would launder a workers-config
-    // refusal into a silent local-only build (#297).
-    if file_exists {
-        // Extract global inputs from the config file and use those
-        match nau::lua::evaluate_file_with_inputs(&original_file) {
-            Ok(eval) => {
-                let lockfile = prepare_inputs(
-                    &eval.global_inputs,
-                    &lockfile_path,
-                    update.as_deref(),
-                    offline,
-                )?;
-                nau::pkg_source::init_global_inputs_with(
-                    &eval.global_inputs,
-                    &lockfile.inputs,
-                    offline,
-                )?;
-                // We already have the outputs — use them directly
-                let all_outputs = eval.outputs;
-                return run_build(
-                    all_outputs,
-                    file, // unresolved — run_build handles it
-                    stage,
-                    output,
-                    arch,
-                    output_name,
-                    source_date_epoch,
-                    lockfile_path,
-                    all,
-                    cache,
-                    cache_max_size,
-                    target,
-                    json,
-                    eval.workers,
-                );
-            }
-            Err(e) => {
-                return Err(miette::miette!(
-                    "evaluating '{}' failed: {e:#}",
-                    original_file
-                ));
-            }
-        }
-    }
-
-    // No config file — use the default input and resolve the positional
-    // as a package name. This is the ONLY fallback (#297): the plain
-    // eval carries no workers surface, so the inert default applies
-    // (zero behavior change, ADR-0040 Decision 3).
-    let default_inputs = default_input_map();
-    let lockfile = prepare_inputs(&default_inputs, &lockfile_path, update.as_deref(), offline)?;
-    nau::pkg_source::init_global_inputs_with(&default_inputs, &lockfile.inputs, offline)?;
-    let file = resolve_file(&file)?;
-    let all_outputs = evaluate_file_or_embedded(&file)?;
-
+    let (all_outputs, workers, file) =
+        resolve_build_outputs(&file, update.as_deref(), offline, &lockfile_path)?;
     run_build(
         all_outputs,
         file,
@@ -499,9 +438,132 @@ fn cmd_build(
         cache_max_size,
         target,
         json,
-        // The plain eval carries no workers surface — inert default.
-        nau::lua::WorkersConfig::default(),
+        workers,
     )
+}
+
+/// Resolve a build's evaluated outputs under the #297 rules — shared by
+/// [`cmd_build`] and the burst auto-count ([`wrapped_build_pending_jobs`],
+/// #304) so sizing and building cannot drift: the config file's own eval
+/// (its declared inputs) when it exists, a failing eval TERMINAL — the
+/// fallback below exists only to resolve a package NAME (a nonexistent
+/// positional) through the default input, and its plain eval never
+/// validates the workers surface. Returns (outputs, workers config, file
+/// label for diagnostics — resolved only in the fallback branch).
+fn resolve_build_outputs(
+    file: &str,
+    update: Option<&str>,
+    offline: bool,
+    lockfile_path: &str,
+) -> miette::Result<(nau::lua::Outputs, nau::lua::WorkersConfig, String)> {
+    if Path::new(file).exists() {
+        let eval = nau::lua::evaluate_file_with_inputs(file)
+            .map_err(|e| miette::miette!("evaluating '{file}' failed: {e:#}"))?;
+        let lockfile = prepare_inputs(&eval.global_inputs, lockfile_path, update, offline)?;
+        nau::pkg_source::init_global_inputs_with(&eval.global_inputs, &lockfile.inputs, offline)?;
+        Ok((eval.outputs, eval.workers, file.to_string()))
+    } else {
+        // No config file — use the default input and resolve the
+        // positional as a package name. This is the ONLY fallback
+        // (#297): the plain eval carries no workers surface, so the
+        // inert default applies (ADR-0040 Decision 3).
+        let default_inputs = default_input_map();
+        let lockfile = prepare_inputs(&default_inputs, lockfile_path, update, offline)?;
+        nau::pkg_source::init_global_inputs_with(&default_inputs, &lockfile.inputs, offline)?;
+        let file = resolve_file(file)?;
+        let all_outputs = evaluate_file_or_embedded(&file)?;
+        Ok((all_outputs, nau::lua::WorkersConfig::default(), file))
+    }
+}
+
+/// `workers burst --count auto`'s sizing source (#304): the wrapped
+/// build's pending farmed jobs — its resolved outputs' dep set minus the
+/// fully-cached names — plus the jobs-per-worker the sizing divides by.
+/// Same resolution path as cmd_build by construction: the wrapped argv
+/// parses through the real Cli definition and the config resolves in
+/// [`resolve_build_outputs`]. Quiet: sizing prints only its own decision
+/// line, not the build's progress.
+pub(crate) fn wrapped_build_pending_jobs(command: &[String]) -> miette::Result<(usize, u32)> {
+    let Command::Build {
+        file,
+        output_name,
+        arch,
+        all,
+        cache,
+        cache_max_size,
+        target,
+        update,
+        offline,
+        lockfile: lockfile_path,
+        ..
+    } = nau::cli::wrapped_build(command)?
+    else {
+        // wrapped_build cannot return a non-build; fail-closed anyway.
+        return Err(miette::miette!(
+            "workers burst: --count auto sizes a wrapped 'nau build'"
+        ));
+    };
+
+    // main()'s positional fallback, applied before cmd_build sees the
+    // args: a package name in place of a missing nau.lua resolves through
+    // the input sources, and an embedded:// resolution never carries an
+    // output filter.
+    let file = if file == "nau.lua" && !Path::new("nau.lua").exists() {
+        match &output_name {
+            Some(name) => resolve_file(name)?,
+            None => file,
+        }
+    } else {
+        resolve_file(&file)?
+    };
+    let output_name = if file.starts_with("embedded://") {
+        None
+    } else {
+        output_name
+    };
+
+    let (all_outputs, workers, file) =
+        resolve_build_outputs(&file, update.as_deref(), offline, &lockfile_path)?;
+    let lockfile = load_lockfile_or_default(Path::new(&lockfile_path))?;
+    let pkg_cache = init_pkg_cache(all, cache, cache_max_size, true);
+    let pending = pending_dep_jobs(
+        &all_outputs,
+        &output_name,
+        &file,
+        target.as_ref(),
+        &arch,
+        pkg_cache.as_ref(),
+        &lockfile,
+    )?;
+    // The burst's own pins carry no explicit `jobs`, so the fleet takes
+    // the lua.rs default 2 — unless the wrapped config's entries say
+    // otherwise (one homogeneous fleet is the real shape).
+    let jobs_per_worker = workers.workers.first().map(|w| w.jobs).unwrap_or(2);
+    Ok((pending.len(), jobs_per_worker))
+}
+
+/// The farmed pending set of a build (#304): the selected outputs' dep
+/// graph, metas loaded, closure keys precomputed, fully-cached names
+/// subtracted — exactly what `build_all_deps` schedules onto the workers.
+/// Output-free: the `select_outputs` target line and the "(cached)" lines
+/// are suppressed for the burst's silent sizing.
+pub(crate) fn pending_dep_jobs(
+    all_outputs: &nau::lua::Outputs,
+    output_name: &Option<String>,
+    file: &str,
+    target: Option<&String>,
+    cli_archs: &[String],
+    pkg_cache: Option<&nau::cache::PackageCache>,
+    lockfile: &LockFile,
+) -> miette::Result<BTreeMap<String, nau::snap::SnapMeta>> {
+    let iter = select_outputs(all_outputs, output_name, file, target, true)?;
+    let dep_nodes = collect_dep_graph(&iter);
+    let (metas, _closures, pre_done) =
+        dep_pending(&dep_nodes, target, pkg_cache, cli_archs, lockfile, true);
+    Ok(metas
+        .into_iter()
+        .filter(|(name, _)| !pre_done.contains(name))
+        .collect())
 }
 
 /// The default input map used when no config file is present.
@@ -1066,26 +1128,55 @@ fn precompute_dep_closures(
 /// key: complete before scheduling starts, releasing dependents at once.
 /// (The check reads only the dep's own closure key, so checking here
 /// equals checking just before its build — nothing else writes its
-/// entries.)
+/// entries.) `quiet` silences the "(cached)" lines — the burst's sizing
+/// (#304) must not emit build progress; the build passes its `json` flag,
+/// which is exactly this switch.
 fn cached_dep_names(
     metas: &BTreeMap<String, nau::snap::SnapMeta>,
     closures: &HashMap<String, Option<nau::cache::BuildClosure>>,
     pkg_cache: Option<&nau::cache::PackageCache>,
     cli_archs: &[String],
-    json: bool,
+    quiet: bool,
 ) -> HashSet<String> {
     let mut cached = HashSet::new();
     for (name, meta) in metas {
         if let (Some(cache), Some(closure)) = (pkg_cache, closures[name].as_ref()) {
             if dep_fully_cached(cache, closure, meta, cli_archs) {
                 cached.insert(name.clone());
-                if !json {
+                if !quiet {
                     nau::output::ok(format!("{} (cached)", name));
                 }
             }
         }
     }
     cached
+}
+
+/// The [`dep_pending`] result: metas by name, their precomputed closure
+/// keys, and the fully-cached names.
+type DepPending = (
+    BTreeMap<String, nau::snap::SnapMeta>,
+    HashMap<String, Option<nau::cache::BuildClosure>>,
+    HashSet<String>,
+);
+
+/// The pending computation shared by `build_all_deps` (the build path)
+/// and the burst auto-count ([`pending_dep_jobs`], #304): dep metas
+/// loaded with `--target` applied, closure keys precomputed, and the
+/// fully-cached names subtracted. Sized by the burst; scheduled by the
+/// build — one computation, no drift.
+fn dep_pending(
+    dep_nodes: &[nau::deps::DepNode],
+    effective_target: Option<&String>,
+    pkg_cache: Option<&nau::cache::PackageCache>,
+    cli_archs: &[String],
+    lockfile: &LockFile,
+    quiet: bool,
+) -> DepPending {
+    let metas = load_dep_metas(dep_nodes, effective_target);
+    let closures = precompute_dep_closures(&metas, pkg_cache, lockfile);
+    let pre_done = cached_dep_names(&metas, &closures, pkg_cache, cli_archs, quiet);
+    (metas, closures, pre_done)
 }
 
 /// Resolve and build every transitive dependency of the selected outputs
@@ -1121,12 +1212,17 @@ fn build_all_deps(
     if dep_nodes.is_empty() {
         return Ok(());
     }
-    let metas = load_dep_metas(dep_nodes, effective_target);
+    let (metas, closures, pre_done) = dep_pending(
+        dep_nodes,
+        effective_target,
+        pkg_cache,
+        cli_archs,
+        lockfile,
+        json,
+    );
     if metas.is_empty() {
         return Ok(());
     }
-    let closures = precompute_dep_closures(&metas, pkg_cache, lockfile);
-    let pre_done = cached_dep_names(&metas, &closures, pkg_cache, cli_archs, json);
 
     // Scheduling graph: declared deps of each loaded node. The scheduler
     // drops self-edges (issue #33 self-host marker) and edges to names
