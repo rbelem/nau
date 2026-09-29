@@ -750,7 +750,13 @@ fn pick_ready(
             if fallback.is_none() {
                 fallback = Some((k, i));
             }
-            if held.is_some_and(|h| node_caps[i].objects.iter().all(|o| h.contains(o))) {
+            // The non-empty gate keeps a vacuous set (∅ ⊆ anything) from
+            // reading as "held by everyone" — an empty placement set gets
+            // the fallback, never a fake store hit (#307).
+            if held.is_some_and(|h| {
+                !node_caps[i].objects.is_empty()
+                    && node_caps[i].objects.iter().all(|o| h.contains(o))
+            }) {
                 return Some((k, i));
             }
         }
