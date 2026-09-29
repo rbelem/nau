@@ -1221,6 +1221,14 @@ impl<R: CommandRunner> SshExecutor<R> {
             }
         }
 
+        // The worker keeps what it built (#307), before the ingest
+        // commit: a persist failure aborts the commit, so a retry
+        // re-dispatches and re-persists — the store never silently
+        // misses. Objects are content-addressed (`ln -f` over an
+        // existing entry is a no-op), so persisting twice dedupes by
+        // construction.
+        self.persist_result_objects(id, &result)?;
+
         let dir = self.ingest_dir(manifest)?;
         std::fs::create_dir_all(&dir)
             .map_err(|e| miette::miette!("collect: cannot create {}: {e}", dir.display()))?;
@@ -1253,6 +1261,38 @@ impl<R: CommandRunner> SshExecutor<R> {
             self.dispatches.fetch_add(1, Ordering::SeqCst),
             std::process::id()
         )
+    }
+
+    /// The worker keeps what it built (#307): every hash-verified
+    /// artifact is hardlinked into the object store under its content
+    /// hash — the same hash a dependent's closure names (`dep:<pkg>`) —
+    /// so a warm dispatch to this worker skips re-pushing bytes it
+    /// already produced (the delta path content-verifies claims before
+    /// it ever skips). The job-dir cleanup deletes `out/`; the links
+    /// keep the bytes alive in the store.
+    fn persist_result_objects(&self, id: &str, result: &JobResult) -> miette::Result<()> {
+        let mut links = Vec::new();
+        for art in &result.artifacts {
+            validate_remote_filename(&art.filename)?;
+            links.push(format!(
+                "ln -f {REMOTE_BASE}/jobs/{id}/out/{} {REMOTE_BASE}/objects/{}",
+                art.filename, art.sha256
+            ));
+        }
+        if links.is_empty() {
+            return Ok(());
+        }
+        self.run_ssh(&format!(
+            "mkdir -p {REMOTE_BASE}/objects && {}",
+            links.join(" && ")
+        ))
+        .wrap_err_with(|| {
+            format!(
+                "store persist: cannot link the built artifacts into the object store on '{}'",
+                self.worker.address
+            )
+        })?;
+        Ok(())
     }
 }
 
