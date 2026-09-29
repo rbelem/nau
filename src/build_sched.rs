@@ -833,18 +833,17 @@ struct Placement<'a> {
 /// Which ready node member `e` takes, front-to-back: among ELIGIBLE
 /// nodes, the first whose known objects `e` fully holds beats queue
 /// order (#303 — a warm store saves a payload ship); none fully held,
-/// the first eligible as before — except a node reserved for another
-/// member (#309): the fallback skips it, and LOCAL defers in BOTH pick
-/// paths (window 7: local's precomputed union set preference-hits every
-/// resolvable node, so an ungated local re-fires the all-local drain
-/// the reservation exists to prevent; the reserved holder's store hit
-/// — or its death, which dissolves the reservation — unlocks the node).
-/// Workers keep today's holder preference among themselves: a node two
-/// workers hold runs on whichever frees first, no artificial
-/// serialization. Eligibility ([`farm_eligible`]) stays the gate — the
-/// preference only reorders what a member picks, never whether a node
-/// can run somewhere. Done entries met along the scan drop out of the
-/// queue.
+/// the first eligible as before. #309 fences the fallback and local's
+/// reach: a node reserved for another member is invisible to everyone
+/// but its holder, local's fallback defers to any alive eligible
+/// worker (window 8 — see [`local_fallback_reaches`]), and local's
+/// store hit stays gated on foreign reservations (window 7 — see
+/// [`store_hit_allowed`]). Workers keep today's holder preference and
+/// fallback among themselves: a node two workers hold runs on whichever
+/// frees first, no artificial serialization. Eligibility
+/// ([`farm_eligible`]) stays the gate — the preference only reorders
+/// what a member picks, never whether a node can run somewhere. Done
+/// entries met along the scan drop out of the queue.
 fn pick_ready(
     farm: &[FarmExecutor<'_>],
     alive: &[bool],
@@ -855,11 +854,7 @@ fn pick_ready(
     done: &[bool],
 ) -> Option<(usize, usize)> {
     let Placement { held, reserved } = placement;
-    // #309: local is the scarce coordinator resource and its held set
-    // is the inflated precomputed union — when a node is reserved for
-    // another member, local reaches neither through the fallback nor
-    // the store hit.
-    let local_defers = matches!(farm[e].kind, ExecutorKind::Local);
+    let local = matches!(farm[e].kind, ExecutorKind::Local);
     let mut fallback: Option<(usize, usize)> = None;
     let mut k = 0;
     while k < ready.len() {
@@ -868,26 +863,71 @@ fn pick_ready(
             ready.remove(k);
             continue;
         }
-        if farm_eligible(farm, alive, node_caps, e, i) {
-            let taken_elsewhere = reserved[i].is_some_and(|m| m != e);
-            if fallback.is_none() && !taken_elsewhere {
-                fallback = Some((k, i));
-            }
-            // The non-empty gate keeps a vacuous set (∅ ⊆ anything) from
-            // reading as "held by everyone" — an empty placement set gets
-            // the fallback, never a fake store hit (#307).
-            if !(local_defers && taken_elsewhere)
-                && held.is_some_and(|h| {
-                    !node_caps[i].objects.is_empty()
-                        && node_caps[i].objects.iter().all(|o| h.contains(o))
-                })
-            {
-                return Some((k, i));
-            }
+        if !farm_eligible(farm, alive, node_caps, e, i) {
+            k += 1;
+            continue;
+        }
+        let taken_elsewhere = reserved[i].is_some_and(|m| m != e);
+        if fallback.is_none()
+            && local_fallback_reaches(farm, alive, node_caps, e, i, local, taken_elsewhere)
+        {
+            fallback = Some((k, i));
+        }
+        if store_hit_allowed(local, taken_elsewhere) && store_hit(held, &node_caps[i]) {
+            return Some((k, i));
         }
         k += 1;
     }
     fallback
+}
+
+/// May member `e`'s FALLBACK reach node `i`? A node reserved for
+/// another member never does (#309). LOCAL's fallback additionally
+/// defers while some OTHER alive, eligible worker can run the node
+/// (#309 window 8: workers are the pool, local is reservations +
+/// overflow — the cold fallback used to absorb the whole graph into the
+/// coordinator before a worker ever received a byte, leaving warm with
+/// no worker holder to prefer). Alive-eligible, not free-slot:
+/// FarmShared tracks no per-member occupancy and the gate must not
+/// invent it — a saturated worker still frees and takes the queued node
+/// (the drain is test-proven), and its death lifts the gate. The
+/// `slots() > 0` term keeps a zero-slot worker (it can never wake to
+/// take the node) from fencing local off forever. Arch-mismatch nodes
+/// (no eligible worker) and worker-less remainders stay local's.
+fn local_fallback_reaches(
+    farm: &[FarmExecutor<'_>],
+    alive: &[bool],
+    node_caps: &[JobCaps],
+    e: usize,
+    i: usize,
+    local: bool,
+    taken_elsewhere: bool,
+) -> bool {
+    !taken_elsewhere
+        && (!local
+            || !(0..farm.len()).any(|x| {
+                x != e
+                    && alive[x]
+                    && farm[x].job.slots() > 0
+                    && matches!(farm[x].kind, ExecutorKind::Worker { .. })
+                    && farm_eligible(farm, alive, node_caps, x, i)
+            }))
+}
+
+/// May member `e`'s store hit fire on this node? A worker's always may
+/// (#303 — taking a node you fully hold ships no payload); local's may
+/// not when the node is reserved for another member (#309 window 7 —
+/// its precomputed union set would preference-hit everything and
+/// re-fire the all-local drain).
+fn store_hit_allowed(local: bool, taken_elsewhere: bool) -> bool {
+    !local || !taken_elsewhere
+}
+
+/// The non-empty gate keeps a vacuous set (∅ ⊆ anything) from reading
+/// as "held by everyone" — an empty placement set gets the fallback,
+/// never a fake store hit (#307).
+fn store_hit(held: Option<&BTreeSet<String>>, caps: &JobCaps) -> bool {
+    held.is_some_and(|h| !caps.objects.is_empty() && caps.objects.iter().all(|o| h.contains(o)))
 }
 
 /// The blindness clause for the placement banner (#307): a WORKER
