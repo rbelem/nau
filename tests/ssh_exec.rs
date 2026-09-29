@@ -81,6 +81,10 @@ struct LoopbackWorker {
     /// channel death shape the preflight store probe must survive as
     /// "store unknown" (#303).
     fail_object_ls: bool,
+    /// Script the store-persist refusal (#307) — the ln into the object
+    /// store fails, and the dispatch must refuse with it (fail-closed:
+    /// a store that silently misses is the #307 bug shape).
+    fail_persist: bool,
     calls: Arc<Mutex<Vec<Vec<String>>>>,
     /// Bytes of every scp push whose remote path ends in job.json, in
     /// push order — the shipped manifest's shape is a transport contract.
@@ -100,6 +104,7 @@ impl LoopbackWorker {
             reported_fingerprint: FINGERPRINT_PIN.to_string(),
             deny_cap: false,
             fail_object_ls: false,
+            fail_persist: false,
             calls: Arc::new(Mutex::new(Vec::new())),
             pushed_job_files: Arc::new(Mutex::new(Vec::new())),
         }
@@ -209,6 +214,13 @@ impl LoopbackWorker {
             return self.hash_command(cmd);
         }
         if cmd.contains("ln -f") {
+            if self.fail_persist && cmd.contains("/objects &&") {
+                return Ok(RunnerOutput {
+                    code: 255,
+                    stdout: Vec::new(),
+                    stderr: "ln: cannot create hard link: No space left on device".into(),
+                });
+            }
             return self.job_prep(cmd);
         }
         if cmd.contains(" mv ") {
@@ -313,23 +325,42 @@ impl LoopbackWorker {
         })
     }
 
-    /// `mkdir -p <payload> <out> && ln -f <objects...> <payload>` — the
-    /// job-directory preparation with real hardlinks.
+    /// `mkdir -p <dirs> && ln -f <srcs...> <dstdir>` segments — the
+    /// job-directory preparation and the #307 store persist, with real
+    /// hardlinks. `ln -f src dst` (a pair) links one file into the
+    /// store; `ln -f srcs... dstdir` is prepare_job_dir's dir form.
     fn job_prep(&self, cmd: &str) -> io::Result<RunnerOutput> {
-        let toks: Vec<&str> = cmd.split_whitespace().collect();
-        let mp = toks.iter().position(|t| *t == "-p").unwrap();
-        let mut i = mp + 1;
-        while i < toks.len() && toks[i] != "&&" {
-            std::fs::create_dir_all(self.remote_path(toks[i]).unwrap())?;
-            i += 1;
-        }
-        let ln = toks.iter().position(|t| *t == "-f").unwrap();
-        let (dst, srcs) = toks[ln + 1..].split_last().unwrap();
-        let dst_dir = self.remote_path(dst).unwrap();
-        for src in srcs {
-            let from = self.remote_path(src).unwrap();
-            let name = Path::new(src).file_name().unwrap();
-            std::fs::hard_link(&from, dst_dir.join(name))?;
+        for seg in cmd.split("&&") {
+            let toks: Vec<&str> = seg.split_whitespace().collect();
+            if let Some(mp) = toks.iter().position(|t| *t == "-p") {
+                for dir in &toks[mp + 1..] {
+                    std::fs::create_dir_all(self.remote_path(dir).unwrap())?;
+                }
+            }
+            let Some(ln) = toks.iter().position(|t| *t == "-f") else {
+                continue;
+            };
+            let rest = &toks[ln + 1..];
+            // `ln -f src dst` with a non-directory dst is the pair form
+            // (the #307 store persist, `ln -f`-idempotent); any dst that
+            // already exists as a directory (or extra sources) is
+            // prepare_job_dir's dir form.
+            if rest.len() == 2 {
+                let from = self.remote_path(rest[0]).unwrap();
+                let to = self.remote_path(rest[1]).unwrap();
+                if !to.is_dir() {
+                    let _ = std::fs::remove_file(&to);
+                    std::fs::hard_link(&from, &to)?;
+                    continue;
+                }
+            }
+            let (dst, srcs) = rest.split_last().unwrap();
+            let dst_dir = self.remote_path(dst).unwrap();
+            for src in srcs {
+                let from = self.remote_path(src).unwrap();
+                let name = Path::new(src).file_name().unwrap();
+                std::fs::hard_link(&from, dst_dir.join(name))?;
+            }
         }
         Ok(Self::ok(String::new()))
     }
@@ -1234,7 +1265,10 @@ fn preflight_refusals_name_the_probe() {
     let cache = tempfile::tempdir().unwrap();
     let machine = tempfile::tempdir().unwrap();
 
-    let cases: &[(&str, &dyn Fn(&mut LoopbackWorker))] = &[
+    /// One refusal case: the probe's name and the cap mutation that
+    /// triggers it.
+    type RefusalCase<'a> = (&'a str, &'a dyn Fn(&mut LoopbackWorker));
+    let cases: &[RefusalCase] = &[
         ("preflight protocol", &|f: &mut LoopbackWorker| {
             f.set_cap(|c| c.protocol = 99)
         }),
@@ -1492,6 +1526,117 @@ fn all_objects_held_means_no_transfer_at_all() {
             .last()
             .is_some_and(|c| c.contains("__worker-job"))),
         "the job ran"
+    );
+}
+
+/// The built artifact outlives the job dir (#307): collect hardlinks it
+/// into the object store under its content hash, so the cleanup's
+/// `rm -rf jobs/<id>` deletes only the scratch — the store keeps the
+/// bytes a dependent's closure will name.
+#[test]
+fn dispatch_persists_the_built_artifact_into_the_store() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let artifact_bytes = b"scripted snap artifact".to_vec();
+    let artifact_sha = sha256_hex(&artifact_bytes);
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", &artifact_bytes);
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    let ex = executor(fake, cache.path());
+
+    let manifest = hello_manifest();
+    ex.dispatch(&manifest, tempfile::tempdir().unwrap().path())
+        .expect("dispatch");
+
+    // The store entry survives the job-dir cleanup, byte-identical.
+    let job_dir = machine.path().join(".cache/nau/worker/jobs");
+    assert!(
+        std::fs::read_dir(&job_dir).map(|d| d.count()).unwrap_or(0) == 0,
+        "the job scratch is cleaned; only the store keeps the bytes"
+    );
+    let stored = machine
+        .path()
+        .join(".cache/nau/worker/objects")
+        .join(&artifact_sha);
+    assert_eq!(
+        nau::oci::sha256_file(&stored).unwrap(),
+        artifact_sha,
+        "the built artifact is content-addressed in the store"
+    );
+}
+
+/// The warm-run shape (#307): a dispatch to the worker that BUILT an
+/// object must not re-push it. The first dispatch persists its result;
+/// the second dispatch's closure names that hash — held, verified, and
+/// skipped: no tar, no landing, no blob scp.
+#[test]
+fn warm_dispatch_to_the_builder_skips_the_built_object() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let artifact_bytes = b"the snap a dependent will name".to_vec();
+    let artifact_sha = sha256_hex(&artifact_bytes);
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", &artifact_bytes);
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    let calls = fake.calls_handle();
+    let ex = executor(fake, cache.path());
+
+    // Cold: builds and persists its result into the store.
+    let cold = hello_manifest();
+    ex.dispatch(&cold, tempfile::tempdir().unwrap().path())
+        .expect("cold dispatch");
+
+    // Warm: a dependent job whose closure names the built snap. The
+    // persisted store entry satisfies it without a transfer.
+    let payload = tempfile::tempdir().unwrap();
+    std::fs::write(payload.path().join(&artifact_sha), &artifact_bytes).unwrap();
+    let warm = blob_manifest(&[(artifact_sha.as_str(), "dep:builder")]);
+    let outcome = ex.dispatch(&warm, payload.path()).expect("warm dispatch");
+    assert!(!outcome.cache_hit, "the job ran; only the transfer skips");
+    assert_eq!(
+        LoopbackWorker::count_program(&calls, "tar"),
+        0,
+        "the built object never re-ships: the store holds it"
+    );
+    let blob_scp = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|argv| argv[0] == "scp")
+        .count();
+    assert_eq!(
+        blob_scp, 4,
+        "two job.json pushes + two artifact pulls — zero blob transfers"
+    );
+}
+
+/// A failed store persist refuses the dispatch before the ingest
+/// commit (#307, fail-closed): the retry re-dispatches and re-persists,
+/// so the store never silently misses what it claims.
+#[test]
+fn a_failed_store_persist_refuses_before_the_ingest_commit() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", b"artifact");
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    fake.fail_persist = true;
+    let ex = executor(fake, cache.path());
+
+    let manifest = hello_manifest();
+    let err = ex
+        .dispatch(&manifest, tempfile::tempdir().unwrap().path())
+        .expect_err("the persist refusal must fail the dispatch");
+    assert!(
+        format!("{err:#}").contains("store persist"),
+        "the refusal names the store persist: {err:#}"
+    );
+    assert!(
+        ex.cached_result(&manifest).unwrap().is_none(),
+        "nothing committed: the retry re-dispatches"
     );
 }
 
