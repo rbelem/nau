@@ -759,6 +759,31 @@ fn pick_ready(
     fallback
 }
 
+/// The blindness clause for the placement banner (#307): a WORKER
+/// whose store is Unknown at scheduling time (`store_held` `None` —
+/// the probe failed or never ran) gets no holder preference, silently.
+/// The banner names such members so the fail-open is visible. Not
+/// blind: the local slots (their `None` is the trait default — locals
+/// sit outside holder consideration by design) and a known-empty store
+/// (`Some(empty)` — a fresh worker legitimately holds nothing). Empty
+/// string on the happy path: every store known renders no clause.
+pub fn placement_blind_clause(farm: &[FarmExecutor<'_>]) -> String {
+    let blind: Vec<&str> = farm
+        .iter()
+        .filter(|fe| matches!(fe.kind, ExecutorKind::Worker { .. }))
+        .filter(|fe| fe.job.store_held().is_none())
+        .map(|fe| fe.job.display_name())
+        .collect();
+    if blind.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (store unknown: {} — no holder preference for them)",
+            blind.join(", ")
+        )
+    }
+}
+
 /// The short attribution name for a worker address: the host token
 /// (`ssh://op@nuci.local:22` → `nuci.local`), the only identity the
 /// v1 config carries for line prefixes.
