@@ -77,6 +77,10 @@ struct LoopbackWorker {
     /// Script the ssh-side auth refusal on the cap probe — the
     /// Permission-denied shape the identity narrative rides (#298).
     deny_cap: bool,
+    /// Script a transport loss on the object-store listing — the
+    /// channel death shape the preflight store probe must survive as
+    /// "store unknown" (#303).
+    fail_object_ls: bool,
     calls: Arc<Mutex<Vec<Vec<String>>>>,
     /// Bytes of every scp push whose remote path ends in job.json, in
     /// push order — the shipped manifest's shape is a transport contract.
@@ -95,6 +99,7 @@ impl LoopbackWorker {
             corrupt_artifact: None,
             reported_fingerprint: FINGERPRINT_PIN.to_string(),
             deny_cap: false,
+            fail_object_ls: false,
             calls: Arc::new(Mutex::new(Vec::new())),
             pushed_job_files: Arc::new(Mutex::new(Vec::new())),
         }
@@ -177,6 +182,13 @@ impl LoopbackWorker {
             return Ok(Self::ok(String::new()));
         }
         if cmd.starts_with("ls ") {
+            if self.fail_object_ls {
+                return Ok(RunnerOutput {
+                    code: 255,
+                    stdout: Vec::new(),
+                    stderr: "ssh: connection closed".into(),
+                });
+            }
             let dir = cmd.split_whitespace().nth(1).unwrap();
             let mut names: Vec<String> = self
                 .remote_path(dir)
@@ -589,10 +601,15 @@ fn preflight_happy_and_the_pinned_bounded_argv() {
     let ssh_hops = LoopbackWorker::count_program(&calls, "ssh");
     let calls = calls.lock().unwrap();
     // One coordinator-side `ssh-keygen -lf` (the fingerprint check)
-    // precedes exactly one channel hop.
-    assert_eq!(calls.len(), 2, "fingerprint check, then the dial");
+    // precedes the channel hops: the cap probe, then the object-store
+    // listing the preflight learns once (#303).
+    assert_eq!(
+        calls.len(),
+        3,
+        "fingerprint check, cap probe, store listing"
+    );
     assert_eq!(calls[0][0], "ssh-keygen");
-    assert_eq!(ssh_hops, 1, "exactly one channel hop");
+    assert_eq!(ssh_hops, 2, "cap probe, then the store listing");
     let argv = calls.iter().find(|a| a[0] == "ssh").expect("the ssh dial");
     assert_eq!(argv[argv.len() - 1], "nau __worker-cap");
     assert_eq!(argv[argv.len() - 2], "localhost");
@@ -1792,4 +1809,85 @@ fn write_job_file_carries_the_payload_dir_out_of_the_identity() {
     let canonical = canonical_manifest_bytes(&manifest).unwrap();
     assert_eq!(format!("jm1:{}", sha256_hex(&canonical)), id);
     assert!(!String::from_utf8_lossy(&canonical).contains("payload"));
+}
+
+// ── The preflight store probe (#303) ──
+
+/// A pre-populated store rides preflight into placement's hands: the
+/// listing learns exactly the sha256-named objects (junk names filter),
+/// `store_held` is `None` before any preflight, and the probe runs ONCE
+/// per executor — the second preflight (every dispatch runs one) reuses
+/// the learned listing.
+#[test]
+fn preflight_learns_the_store_once_and_filters_junk_names() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let sha_a = sha256_hex(b"the warm object");
+    preseed_object(machine.path(), &sha_a, b"the warm object");
+    // A junk name the sha256 filter must never surface.
+    preseed_object(machine.path(), "not-a-sha", b"junk");
+    let fake = LoopbackWorker::new(machine.path());
+    let calls = fake.calls_handle();
+    let ex = executor(fake, cache.path());
+
+    assert_eq!(
+        ex.store_held(),
+        None,
+        "nothing learned before any preflight"
+    );
+    ex.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("happy preflight");
+    assert_eq!(
+        ex.store_held(),
+        Some(std::collections::BTreeSet::from([sha_a.clone()])),
+        "the listing learns the sha-named object, filtering junk"
+    );
+
+    // The probe is once-per-executor: a second preflight (the dispatch
+    // path runs one per job) adds no second listing.
+    ex.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("second preflight");
+    let listings = LoopbackWorker::any_call(&calls, |a| {
+        a[0] == "ssh" && a[a.len() - 1].starts_with("ls ")
+    });
+    assert!(listings, "the store listing rode the channel");
+    let n = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|a| a[0] == "ssh" && a[a.len() - 1].starts_with("ls "))
+        .count();
+    assert_eq!(n, 1, "one listing per executor, never per preflight");
+}
+
+/// A transport loss DURING the listing never fails the worker (#303 —
+/// fail-open for PLACEMENT is the deliberate exception): the preflight
+/// passes, the store reads unknown, and delta_sync at dispatch remains
+/// the correctness authority.
+#[test]
+fn a_failed_store_listing_reads_unknown_and_passes_preflight() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let sha_a = sha256_hex(b"the warm object");
+    preseed_object(machine.path(), &sha_a, b"the warm object");
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.fail_object_ls = true;
+    let ex = executor(fake, cache.path());
+
+    ex.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("a failed listing never fails the worker");
+    assert_eq!(
+        ex.store_held(),
+        None,
+        "the store reads unknown — placement cannot prefer this worker"
+    );
 }

@@ -7,7 +7,7 @@
 //! through the landed T4 transport — `ssh://localhost`, a scripted
 //! in-process worker fake, no network, no sshd.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -45,6 +45,15 @@ fn caps(archs: &[&str], cross: bool) -> JobCaps {
         archs: archs.iter().map(|a| a.to_string()).collect(),
         cross,
         local_only: false,
+        objects: BTreeSet::new(),
+    }
+}
+
+/// [`caps`] with the node's placement-known objects (#303).
+fn caps_holding(archs: &[&str], cross: bool, objects: &[&str]) -> JobCaps {
+    JobCaps {
+        objects: objects.iter().map(|o| o.to_string()).collect(),
+        ..caps(archs, cross)
     }
 }
 
@@ -72,6 +81,9 @@ struct FakeMember {
     /// The 1-based call count on which the member reports
     /// [`JobFailure::Lost`] (0 = never dies). The member stays dead.
     lose_on_call: usize,
+    /// The store listing the member's preflight "learned" (#303):
+    /// `None` = store unknown (never preferred).
+    store: Option<BTreeSet<String>>,
     events: Arc<Mutex<Vec<String>>>,
     calls: Arc<AtomicUsize>,
     running: Arc<AtomicUsize>,
@@ -88,6 +100,7 @@ impl FakeMember {
             declared_arch: None,
             fail_build: Vec::new(),
             lose_on_call: 0,
+            store: None,
             events,
             calls: Arc::new(AtomicUsize::new(0)),
             running: Arc::new(AtomicUsize::new(0)),
@@ -109,12 +122,25 @@ impl FakeMember {
             declared_arch: declared_arch.map(str::to_string),
             fail_build: Vec::new(),
             lose_on_call: 0,
+            store: None,
             events,
             calls: Arc::new(AtomicUsize::new(0)),
             running: Arc::new(AtomicUsize::new(0)),
             max_running: Arc::new(AtomicUsize::new(0)),
             dead: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Preconfigure the member's store (#303): the shas its preflight
+    /// "listed" — `Some` even when empty (a known-empty store), `None`
+    /// meaning unknown stays the constructor default.
+    fn holds(mut self, shas: &[&str]) -> Self {
+        self.store = Some(
+            shas.iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<String>>(),
+        );
+        self
     }
 
     fn fails_build(mut self, names: &[&'static str]) -> Self {
@@ -186,6 +212,10 @@ impl FarmJob for FakeMember {
     fn slots(&self) -> usize {
         self.slots
     }
+
+    fn store_held(&self) -> Option<BTreeSet<String>> {
+        self.store.clone()
+    }
 }
 
 fn farm<'a>(members: &'a [FakeMember]) -> Vec<FarmExecutor<'a>> {
@@ -248,6 +278,7 @@ fn local_only_jobs_never_reach_a_worker() {
             archs: vec!["amd64".to_string()],
             cross: false,
             local_only: true,
+            objects: BTreeSet::new(),
         },
     );
     let g = graph(&[("sticky", &[])]);
@@ -422,6 +453,312 @@ fn a_lost_cross_job_falls_back_to_local() {
     assert_eq!(outcome.workers_lost, vec!["armbox".to_string()]);
 }
 
+// ── Store-aware placement (#303) ──
+
+/// The benchmark's anomaly, inverted. Live (two ccx workers, ~6 MB/s
+/// uplink): the warm rerun sent farm-dep — whose 300MB object one
+/// worker already held — to the OTHER worker while the holder built
+/// farm-dep2 locally; the object re-shipped and the warm run cost the
+/// same as cold. Placement now asks the store: the member holding a
+/// node's known objects takes it over queue order.
+#[test]
+fn warm_rerun_sends_the_job_to_its_holder() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let holder = FakeMember::worker("62.238.62.155", 1, None, events.clone()).holds(&["sha-dep2"]);
+    let local = FakeMember::local(1, events.clone());
+    let members = vec![holder, local];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "farm-dep".to_string(),
+        caps_holding(&["amd64"], false, &["sha-dep"]),
+    );
+    caps_map.insert(
+        "farm-dep2".to_string(),
+        caps_holding(&["amd64"], false, &["sha-dep2"]),
+    );
+    let g = graph(&[("farm-dep", &[]), ("farm-dep2", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome.result.expect("farm builds clean");
+    // Deterministic in both thread-arrival orders: the holder's scan
+    // skips unheld farm-dep and takes farm-dep2; local takes farm-dep.
+    assert_eq!(
+        members[0].started("farm-dep2"),
+        1,
+        "the job rides its holder: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("farm-dep"),
+        0,
+        "the holder never takes a node it does not hold: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("farm-dep"),
+        1,
+        "the unheld node builds local — no re-ship: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("farm-dep2"),
+        0,
+        "local never steals a node a member holds: {events:?}"
+    );
+}
+
+/// A cold run — both stores known and empty — cannot prefer anyone:
+/// placement is today's, the ready set fills whichever member is free,
+/// and every node still builds.
+#[test]
+fn cold_run_with_empty_stores_keeps_todays_placement() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let x = FakeMember::worker("box", 1, None, events.clone()).holds(&[]);
+    let local = FakeMember::local(1, events.clone());
+    let members = vec![x, local];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "farm-dep".to_string(),
+        caps_holding(&["amd64"], false, &["sha-dep"]),
+    );
+    caps_map.insert(
+        "farm-dep2".to_string(),
+        caps_holding(&["amd64"], false, &["sha-dep2"]),
+    );
+    let g = graph(&[("farm-dep", &[]), ("farm-dep2", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome.result.expect("farm builds clean");
+    assert_eq!(members[0].calls(), 1, "each member takes one: {events:?}");
+    assert_eq!(members[1].calls(), 1, "each member takes one: {events:?}");
+    assert_eq!(
+        members[0].started("farm-dep") + members[1].started("farm-dep"),
+        1
+    );
+    assert_eq!(
+        members[0].started("farm-dep2") + members[1].started("farm-dep2"),
+        1
+    );
+}
+
+/// An unknown store (the preflight listing failed) falls back cleanly:
+/// the member is never preferred but never stalls either — placement
+/// reads it exactly like a cold store.
+#[test]
+fn unknown_store_falls_back_cleanly() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    // store: None — the constructor default — is the unknown store.
+    let x = FakeMember::worker("box", 1, None, events.clone());
+    let local = FakeMember::local(1, events.clone());
+    let members = vec![x, local];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "farm-dep".to_string(),
+        caps_holding(&["amd64"], false, &["sha-dep"]),
+    );
+    caps_map.insert(
+        "farm-dep2".to_string(),
+        caps_holding(&["amd64"], false, &["sha-dep2"]),
+    );
+    let g = graph(&[("farm-dep", &[]), ("farm-dep2", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome.result.expect("farm builds clean");
+    assert_eq!(
+        members[0].calls(),
+        1,
+        "the unknown store did not stall: {events:?}"
+    );
+    assert_eq!(members[1].calls(), 1, "{events:?}");
+}
+
+/// Eligibility stays the gate: a member holding a node's objects but
+/// incapable of its arch never takes it — the capable (cold) member
+/// does. This is the loss re-dispatch invariant too: preference
+/// reorders picks inside [`farm_eligible`], never past it.
+#[test]
+fn holder_preference_never_overrides_eligibility() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    // Declared amd64, yet "holding" the arm job's object — an
+    // impossible store in practice, exactly the case the gate must
+    // refuse.
+    let x = FakeMember::worker("amdbox", 1, Some("x86_64-linux-gnu"), events.clone())
+        .holds(&["sha-arm"]);
+    let arm = FakeMember::worker("armbox", 1, Some("aarch64-linux-gnu"), events.clone());
+    let members = vec![x, arm];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "arm-job".to_string(),
+        caps_holding(&["arm64"], false, &["sha-arm"]),
+    );
+    caps_map.insert(
+        "host-job".to_string(),
+        caps_holding(&["amd64"], false, &["sha-host"]),
+    );
+    let g = graph(&[("arm-job", &[]), ("host-job", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome.result.expect("farm builds clean");
+    assert_eq!(
+        members[0].started("arm-job"),
+        0,
+        "holding an object never buys eligibility: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("arm-job"),
+        1,
+        "the capable member takes the arm job: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("host-job"),
+        1,
+        "each node has exactly one eligible member: {events:?}"
+    );
+}
+
+/// A lost worker's job re-dispatches and the survivor's WITHIN-RUN
+/// learning aims it: the survivor built the sibling first, so it holds
+/// the shared source object when the re-queued (or dependent) node
+/// comes around — no re-ship after the loss.
+#[test]
+fn loss_redispatch_lands_on_the_survivor_that_learned_the_store() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    // Y dies on its first call; X starts cold (known-empty store).
+    let x = FakeMember::worker("survivor", 1, None, events.clone()).holds(&[]);
+    let y = FakeMember::worker("doomed", 1, None, events.clone()).dies_on(1);
+    let members = vec![x, y];
+    // Both nodes share one source object; whichever Y grabbed dies
+    // with it, re-queues, and X builds it — learning the object —
+    // before the second node comes around.
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "farm-dep".to_string(),
+        caps_holding(&["amd64"], false, &["sha-shared"]),
+    );
+    caps_map.insert(
+        "farm-dep2".to_string(),
+        caps_holding(&["amd64"], false, &["sha-shared"]),
+    );
+    let g = graph(&[("farm-dep", &[]), ("farm-dep2", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome
+        .result
+        .expect("the loss is absorbed by the survivor");
+    assert_eq!(members[0].calls(), 2, "X builds both nodes: {events:?}");
+    assert_eq!(
+        members[1].calls(),
+        1,
+        "Y died on its first and only dispatch: {events:?}"
+    );
+    assert_eq!(outcome.workers_lost, vec!["doomed".to_string()]);
+}
+
+/// The real preflight plumbing: the store listing rides the loopback
+/// channel (one `ls` hop), lands in the executor, and surfaces through
+/// the farm member placement sees ([`RemoteExecutor`] wraps the same
+/// executor). The placement RULE over these sets is proven by the
+/// FakeMember tests above.
+#[test]
+fn preflight_store_learning_reaches_the_farm_member() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let machine = tmp.path().join("machine");
+    let sha = format!("{:x}", {
+        use sha2::Digest as _;
+        let mut h = Sha256::new();
+        h.update(b"the warm 300MB object");
+        h.finalize()
+    });
+    let objects = machine.join(".cache/nau/worker/objects");
+    std::fs::create_dir_all(&objects).unwrap();
+    std::fs::write(objects.join(&sha), b"obj").unwrap();
+    std::fs::write(objects.join("junk-name"), b"junk").unwrap();
+
+    let cfg = WorkerConfig {
+        address: "ssh://localhost:2228".into(),
+        jobs: 1,
+        arch: None,
+        host_key: Some(FINGERPRINT_PIN.to_string()),
+        identity: None,
+    };
+    let ceremony = tmp.path().join("ceremony");
+    ca_ceremony(&ceremony, "ssh://localhost:2228");
+    let exec = SshExecutor::with_ceremony_home(
+        &cfg,
+        LoopbackWorker::new(&machine),
+        &tmp.path().join("cache"),
+        &ceremony,
+    )
+    .expect("executor builds");
+    assert_eq!(exec.store_held(), None, "nothing learned before preflight");
+    preflight_farm_workers(std::slice::from_ref(&exec)).expect("preflight passes");
+    assert_eq!(
+        exec.store_held(),
+        Some(BTreeSet::from([sha.clone()])),
+        "the listing learns the sha-named object, filtering junk"
+    );
+
+    // The learning rides the executor into the farm member.
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let remote = RemoteExecutor::new(exec, Arc::new(FakeSource { out_dir }), 1, 1);
+    assert_eq!(
+        FarmJob::store_held(&remote),
+        Some(BTreeSet::from([sha])),
+        "placement sees the worker's store through the farm member"
+    );
+}
+
+/// The caps' objects come from the plan's source pins, resolved exactly
+/// like dispatch's `source_pin` (lockfile pin first, then the recipe's
+/// declared one); unpinned sources contribute nothing — dispatch
+/// refuses them, named. A node whose plan cannot resolve carries no
+/// objects, and needs none: it never leaves the coordinator.
+#[test]
+fn plan_objects_resolve_the_source_pins_like_dispatch() {
+    let declared = sha256_hex(b"the recipe-declared hash");
+    let plan = plan_for(
+        "warm",
+        &[],
+        vec![SourceSpec::Pinned {
+            url: "https://example.test/srv.tgz".into(),
+            sha256: declared.clone(),
+        }],
+    );
+    // No lockfile entry: the declared pin stands.
+    assert_eq!(
+        nau::coordinator::plan_objects(&plan, &empty_lockfile()),
+        BTreeSet::from([declared.clone()]),
+        "the declared pin is the placement-known object"
+    );
+    // A lockfile pin overrides the declared hash.
+    let mut pinned = empty_lockfile();
+    pinned.sources.insert(
+        "https://example.test/srv.tgz".to_string(),
+        nau::lock::SourceLockEntry {
+            sha256: sha256_hex(b"the hash the lockfile saw"),
+        },
+    );
+    assert_eq!(
+        nau::coordinator::plan_objects(&plan, &pinned),
+        BTreeSet::from([sha256_hex(b"the hash the lockfile saw")]),
+        "the lockfile pin wins — the same resolution dispatch applies"
+    );
+    // An unpinned source contributes nothing to placement.
+    let unverified = plan_for(
+        "warm",
+        &[],
+        vec![SourceSpec::Unverified("https://example.test/x.tgz".into())],
+    );
+    assert!(
+        nau::coordinator::plan_objects(&unverified, &pinned).is_empty(),
+        "an unpinned source is dispatch's refusal, not placement's guess"
+    );
+    // A node whose plan cannot resolve carries no objects.
+    let plans = nau::coordinator::precompute_farm_plans(
+        &BTreeMap::from([("meta-only".to_string(), bare_meta("meta-only", "1.0.0"))]),
+        &[],
+        &empty_lockfile(),
+    )
+    .expect("a build-less plan precomputes");
+    assert!(
+        plans.caps["meta-only"].objects.is_empty(),
+        "a plan-less node carries no objects"
+    );
+}
+
 // ── The loopback dispatch (T4 transport under the T5 pool) ──
 
 /// The workers-entry pin is the host CA's fingerprint (the only pin
@@ -530,6 +867,24 @@ impl LoopbackWorker {
             return Ok(RunnerOutput {
                 code: 0,
                 stdout: Vec::new(),
+                stderr: String::new(),
+            });
+        }
+        if cmd.starts_with("ls ") {
+            let dir = cmd.split_whitespace().nth(1).unwrap();
+            let mut names: Vec<String> = self
+                .remote_path(dir)
+                .and_then(|p| std::fs::read_dir(p).ok())
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            return Ok(RunnerOutput {
+                code: 0,
+                stdout: names.join("\n").into_bytes(),
                 stderr: String::new(),
             });
         }
