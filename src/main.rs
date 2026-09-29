@@ -1348,7 +1348,7 @@ fn run_farm(
             })
             .collect();
         nau::output::status(format!(
-            "farm: {} worker(s): {} — placement by arch, then ready-set order",
+            "farm: {} worker(s): {} — placement by arch, then store preference, then ready-set order",
             workers.workers.len(),
             roster.join(", ")
         ));
