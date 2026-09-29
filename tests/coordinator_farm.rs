@@ -460,7 +460,9 @@ fn a_lost_cross_job_falls_back_to_local() {
 /// worker already held — to the OTHER worker while the holder built
 /// farm-dep2 locally; the object re-shipped and the warm run cost the
 /// same as cold. Placement now asks the store: the member holding a
-/// node's known objects takes it over queue order.
+/// node's known objects takes it over queue order. #309 window 8
+/// completes it: the unheld node goes to the pool too (a worker's
+/// fallback seeds its store) — local is reservations + overflow.
 #[test]
 fn warm_rerun_sends_the_job_to_its_holder() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -480,7 +482,9 @@ fn warm_rerun_sends_the_job_to_its_holder() {
     let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
     outcome.result.expect("farm builds clean");
     // Deterministic in both thread-arrival orders: the holder's scan
-    // skips unheld farm-dep and takes farm-dep2; local takes farm-dep.
+    // skips unheld farm-dep and takes farm-dep2; the unheld farm-dep
+    // falls back to the holder as well — local defers its fallback to
+    // the eligible worker (window 8) and never dispatches.
     assert_eq!(
         members[0].started("farm-dep2"),
         1,
@@ -488,24 +492,20 @@ fn warm_rerun_sends_the_job_to_its_holder() {
     );
     assert_eq!(
         members[0].started("farm-dep"),
-        0,
-        "the holder never takes a node it does not hold: {events:?}"
-    );
-    assert_eq!(
-        members[1].started("farm-dep"),
         1,
-        "the unheld node builds local — no re-ship: {events:?}"
+        "the unheld node feeds the pool's fallback (seeding the store): {events:?}"
     );
     assert_eq!(
-        members[1].started("farm-dep2"),
+        members[1].calls(),
         0,
-        "local never steals a node a member holds: {events:?}"
+        "local takes nothing — reserved work and overflow only: {events:?}"
     );
 }
 
-/// A cold run — both stores known and empty — cannot prefer anyone:
-/// placement is today's, the ready set fills whichever member is free,
-/// and every node still builds.
+/// A cold run — both stores known and empty — cannot prefer anyone for
+/// the store, and #309 window 8 sends the set to the POOL: local
+/// defers its fallback to the eligible worker, whose store the run
+/// then seeds for the warm rerun.
 #[test]
 fn cold_run_with_empty_stores_keeps_todays_placement() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -524,21 +524,25 @@ fn cold_run_with_empty_stores_keeps_todays_placement() {
     let g = graph(&[("farm-dep", &[]), ("farm-dep2", &[])]);
     let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
     outcome.result.expect("farm builds clean");
-    assert_eq!(members[0].calls(), 1, "each member takes one: {events:?}");
-    assert_eq!(members[1].calls(), 1, "each member takes one: {events:?}");
     assert_eq!(
-        members[0].started("farm-dep") + members[1].started("farm-dep"),
-        1
+        members[0].calls(),
+        2,
+        "the worker takes the whole cold set: {events:?}"
     );
     assert_eq!(
-        members[0].started("farm-dep2") + members[1].started("farm-dep2"),
-        1
+        members[1].calls(),
+        0,
+        "local defers its fallback while a worker can run the nodes: {events:?}"
     );
+    for n in ["farm-dep", "farm-dep2"] {
+        assert_eq!(members[0].started(n), 1, "{events:?}");
+    }
 }
 
 /// An unknown store (the preflight listing failed) falls back cleanly:
 /// the member is never preferred but never stalls either — placement
-/// reads it exactly like a cold store.
+/// reads it exactly like a cold store. #309 window 8: the unknown-store
+/// worker is still the pool — local defers and the worker drains.
 #[test]
 fn unknown_store_falls_back_cleanly() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -560,10 +564,14 @@ fn unknown_store_falls_back_cleanly() {
     outcome.result.expect("farm builds clean");
     assert_eq!(
         members[0].calls(),
-        1,
+        2,
         "the unknown store did not stall: {events:?}"
     );
-    assert_eq!(members[1].calls(), 1, "{events:?}");
+    assert_eq!(
+        members[1].calls(),
+        0,
+        "the eligible worker is the pool; local defers: {events:?}"
+    );
 }
 
 // ── Placement-banner blindness clause (#307) ──
@@ -940,8 +948,10 @@ fn warm_rerun_derives_the_holder_preference_from_the_dep_closure() {
     let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
     outcome.result.expect("farm builds clean");
     // Deterministic in both thread-arrival orders: the holder's scan
-    // skips unheld farm-dep and takes the dep-key-holding farm-dep2;
-    // local takes farm-dep.
+    // skips the unheld cold node for the store hit and takes the
+    // dep-key-holding farm-dep2; the cold node then falls back to the
+    // holder too — local defers its fallback to the eligible worker
+    // (#309 window 8), the run seeds the holder's store instead.
     assert_eq!(
         members[0].started("farm-dep2"),
         1,
@@ -949,18 +959,13 @@ fn warm_rerun_derives_the_holder_preference_from_the_dep_closure() {
     );
     assert_eq!(
         members[0].started("farm-dep"),
-        0,
-        "the holder never takes a node it does not hold: {events:?}"
-    );
-    assert_eq!(
-        members[1].started("farm-dep"),
         1,
-        "the cold node builds local: {events:?}"
+        "the unheld cold node feeds the pool's fallback: {events:?}"
     );
     assert_eq!(
-        members[1].started("farm-dep2"),
+        members[1].calls(),
         0,
-        "local never steals the dep-key node: {events:?}"
+        "local takes nothing — reserved work and overflow only: {events:?}"
     );
 }
 
@@ -2398,5 +2403,138 @@ fn worker_holder_death_falls_to_local() {
         members[1].started("n"),
         1,
         "local picks the re-queued node after unreservation: {events:?}"
+    );
+}
+
+// ── Local defers fallback to eligible workers (#309 window 8) ──
+
+/// The window-8 cold shape: the locally-held dep completes on local
+/// (its reservation), and the root — ∅-set at cold plan time, unheld by
+/// anyone — goes to an idle WORKER by fallback. Local takes nothing
+/// via fallback, so the dispatch seeds the worker's store and warm
+/// gains a worker holder to prefer.
+#[test]
+fn cold_root_goes_to_an_idle_worker_and_local_takes_no_fallback() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let worker = FakeMember::worker("box", 2, None, events.clone()).holds(&[]);
+    let local = FakeMember::local(1, events.clone()).holds(&["sha-dep"]);
+    let members = vec![worker, local];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "dep".to_string(),
+        caps_holding(&["amd64"], false, &["sha-dep"]),
+    );
+    // root: ∅ placement set at cold plan time — no reservation, no
+    // store hit anywhere.
+    let g = graph(&[("root", &["dep"]), ("dep", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome.result.expect("farm builds clean");
+    assert_eq!(
+        members[1].started("dep"),
+        1,
+        "the locally-held dep builds on local (its reservation): {events:?}"
+    );
+    assert_eq!(
+        members[0].started("root"),
+        1,
+        "the ∅-set root feeds an idle worker — the pool seeds: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("root"),
+        0,
+        "local defers its fallback while an eligible worker exists: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("dep"),
+        0,
+        "the worker never takes local's reserved dep: {events:?}"
+    );
+}
+
+/// All workers die mid-queue — the alive-eligible gate lifts with the
+/// deaths and local drains everything (no stall on the overflow rule).
+#[test]
+fn worker_death_lifts_the_fallback_gate_and_local_drains() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let worker = FakeMember::worker("doomed", 1, None, events.clone()).dies_on(1);
+    let local = FakeMember::local(2, events.clone());
+    let members = vec![worker, local];
+    let g = graph(&[("r1", &[]), ("r2", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &no_caps());
+    outcome
+        .result
+        .expect("local drains once no eligible worker remains");
+    assert_eq!(outcome.workers_lost, vec!["doomed".to_string()]);
+    assert_eq!(
+        members[0].started("r1"),
+        1,
+        "the worker took a queued node and died on it: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("r1"),
+        1,
+        "the re-queued node falls to local after the death: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("r2"),
+        1,
+        "the still-queued node falls to local too: {events:?}"
+    );
+}
+
+/// An arch-mismatch node — no worker is eligible for it — stays
+/// local's even while other workers are alive and busy elsewhere.
+#[test]
+fn arch_mismatch_node_stays_local_despite_alive_workers() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let arm = FakeMember::worker("armbox", 1, Some("aarch64-linux-gnu"), events.clone());
+    let local = FakeMember::local(1, events.clone());
+    let members = vec![arm, local];
+    let mut caps_map = no_caps();
+    caps_map.insert("arm-node".to_string(), caps(&["arm64"], false));
+    caps_map.insert("host-node".to_string(), caps(&["amd64"], false));
+    let g = graph(&[("arm-node", &[]), ("host-node", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome.result.expect("farm builds clean");
+    assert_eq!(
+        members[1].started("host-node"),
+        1,
+        "no worker is eligible for the amd64 node — local takes it: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("host-node"),
+        0,
+        "the declared arm worker cannot take it: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("arm-node"),
+        1,
+        "the arm node rides the eligible worker: {events:?}"
+    );
+}
+
+/// Saturation is accepted throughput, not a stall: two ∅-set nodes on
+/// a one-slot worker — local defers while the worker lives, the worker
+/// drains them one after the other, and the run completes.
+#[test]
+fn saturated_worker_still_drains_what_local_defers() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let worker = FakeMember::worker("box", 1, None, events.clone()).holds(&[]);
+    let local = FakeMember::local(1, events.clone());
+    let members = vec![worker, local];
+    let g = graph(&[("r1", &[]), ("r2", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &no_caps());
+    outcome
+        .result
+        .expect("the busy worker frees and drains the deferred queue");
+    assert_eq!(
+        members[0].calls(),
+        2,
+        "the worker drained both deferred nodes: {events:?}"
+    );
+    assert_eq!(
+        members[1].calls(),
+        0,
+        "local never took overflow while the worker lived: {events:?}"
     );
 }
