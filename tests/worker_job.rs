@@ -332,6 +332,91 @@ fn bare_dep_purpose_is_refused() {
     );
 }
 
+/// #310: a second `stage` blob is a dispatch bug, not content to merge —
+/// one job packs exactly one stage.
+#[test]
+fn duplicate_stage_blobs_are_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blobs = dir.path().join("blobs");
+    std::fs::create_dir_all(&blobs).expect("blobs dir");
+    let mut obj = payload_fixture(&blobs, b"stage tar bytes");
+    obj.purpose = "stage".to_string();
+
+    let mut manifest = hello_manifest();
+    manifest.closure.push(obj.clone());
+    manifest.closure.push(obj);
+    manifest.payload_dir = Some(blobs.to_string_lossy().into_owned());
+    let out = out_dir();
+    let err = execute_job(&manifest, Some(&blobs), out.path()).expect_err("two stage blobs refuse");
+    assert!(
+        format!("{err:#}").contains("more than one 'stage' blob"),
+        "names the dispatch bug: {err:#}"
+    );
+}
+
+/// #310 end to end worker-side: the `stage` closure object is unpacked
+/// into the job's build stage, so a stage-only recipe (no source, no
+/// build — the shape that never populates its own stage) packs its
+/// declared content instead of a meta-only shell.
+#[test]
+fn stage_blob_unpacks_into_the_pack_of_a_stage_only_job() {
+    if !loopback_tools_available() {
+        eprintln!("skipping: mksquashfs unavailable");
+        return;
+    }
+
+    // The coordinator-side pack: the deterministic tar of a staged tree.
+    let staged = tempfile::tempdir().expect("stage dir");
+    std::fs::create_dir_all(staged.path().join("usr/share")).expect("stage tree");
+    std::fs::write(
+        staged.path().join("usr/share/stage-marker.txt"),
+        b"declared\n",
+    )
+    .expect("marker");
+    let tar_bytes = nau::coordinator::pack_stage_tar(staged.path()).expect("the stage tars");
+    let sha = sha256_hex(&tar_bytes);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blobs = dir.path().join("blobs");
+    std::fs::create_dir_all(&blobs).expect("blobs dir");
+    std::fs::write(blobs.join(&sha), &tar_bytes).expect("blob");
+
+    let mut manifest = hello_manifest();
+    manifest.closure.push(ClosureObject {
+        sha256: sha,
+        size: tar_bytes.len() as u64,
+        purpose: "stage".to_string(),
+    });
+    manifest.payload_dir = Some(blobs.to_string_lossy().into_owned());
+    let out = out_dir();
+    let result = execute_job(&manifest, Some(&blobs), out.path()).expect("job executes");
+    assert!(
+        result.ok,
+        "the stage-only job builds clean: {:?}",
+        result.error
+    );
+    assert_eq!(result.artifacts.len(), 1, "one artifact");
+
+    if !has_tool("unsquashfs") {
+        eprintln!("skipping content check: unsquashfs unavailable");
+        return;
+    }
+    let extract = tempfile::tempdir().expect("extract dir");
+    let status = Command::new("unsquashfs")
+        .args(["-f", "-d"])
+        .arg(extract.path())
+        .arg(&result.artifacts[0].path)
+        .status()
+        .expect("unsquashfs spawns");
+    assert!(status.success(), "unsquashfs failed");
+    let carried =
+        std::fs::read(extract.path().join("usr/share/stage-marker.txt")).expect("staged file");
+    assert_eq!(
+        carried, b"declared\n",
+        "the declared content rides the snap"
+    );
+}
+
 // ── Never-fetch source gates ──
 
 const SRC_URL: &str = "https://example.invalid/src.tar.xz";
