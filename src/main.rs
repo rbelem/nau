@@ -5467,12 +5467,21 @@ mod tests {
         );
 
         // The declared content rides the snap — a payload, not a shell.
-        if !tool_on_path("unsquashfs") {
-            eprintln!("skipping content check: unsquashfs unavailable");
-            return;
-        }
+        // The extraction spawns through the tools seam (#101 AC-1):
+        // resolution IS the availability check (provisioned set,
+        // NAU_TOOL_ override, PATH fallback), so a miss skips the check.
+        let unsquashfs = match nau::tools::resolve(nau::tools::ToolName::Unsquashfs) {
+            Ok(
+                nau::tools::ResolvedTool::Provisioned { path, .. }
+                | nau::tools::ResolvedTool::Path { path, .. },
+            ) => path,
+            Err(_) => {
+                eprintln!("skipping content check: unsquashfs unavailable");
+                return;
+            }
+        };
         let extract = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("unsquashfs")
+        let status = std::process::Command::new(&unsquashfs)
             .args(["-f", "-d"])
             .arg(extract.path())
             .arg(&snap)
