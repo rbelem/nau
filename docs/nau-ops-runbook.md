@@ -162,6 +162,48 @@ hcloud volume delete fw-attach-test-vol
 hcloud server list && hcloud volume list   # → both empty
 ```
 
+### 1.6 Live worker ceremony
+
+The operational sequence for one build window — provision → build →
+destroy (§1.3's "workers live ONLY while a lane uses them"). Distilled
+from two live runs (2026-09-29); every step was executed, not planned.
+
+1. **Preflight channel.** Serve the publish front on `127.0.0.1:8477`
+   (any shim that 404s unknown paths but serves the token paths works)
+   and expose it ONLY via `tailscale funnel --https=8443
+   127.0.0.1:8477`. The worker binary rides the same front at
+   `/bin/nau-amd64`, patchelf'd first: interpreter
+   `/lib64/ld-linux-x86-64.so.2`, rpath removed — unpatched, the
+   nix-linked binary dies on Ubuntu with "required file not found".
+2. **Provision.**
+   `nau workers provision --provider hetzner --type ccx13 --location
+   hel1 --count 1 --ttl 1h --file <proj>/nau.lua`. The `hcloud` CLI
+   resolves ONLY inside `nix shell nixpkgs#hcloud -c ...`; the token is
+   SM `HETZNER_WORKER_TOKEN` via the secrets cache (DECISION SLOT A),
+   never `TOFU_INPUTS` (§1).
+3. **Issue is explicit AND racy (proven live).** `nau workers issue`
+   signs only identities whose publish has landed in the pending store,
+   and a guest's publish lands 1-4 minutes after server create (boot +
+   binary download). An issue run too early signs NOTHING and the guest
+   polls its cert for the whole token window (pickup-host-cert:
+   1440 × 60s). Until #296-style auto-issue exists, loop: run
+   `nau workers issue`, probe the cert (`ssh -o
+   HostKeyAlias=<worker-name> ... 'echo cert-present'`), repeat ~every
+   15s until it presents.
+4. **Workers-table gotchas.** `local_jobs` must sit OUTSIDE the
+   machine-managed BEGIN/END block: inside it the validator refuses any
+   line that is not its own (provision/destroy own the block); outside
+   the table entirely it silently defaults to 3 and starves the worker.
+5. **Build + destroy in ONE window.** Dedicated vCPU is too expensive
+   to idle (operator directive, §1.3) — the TTL sweep is the backstop,
+   not the plan. Destroy in the same session that built.
+6. **Force the client identity.** The executor spawns plain
+   `ssh`/`scp`; an operator `~/.ssh/config` Host-block with
+   `IdentitiesOnly yes` + an unrelated `IdentityFile` silently
+   overrides the agent-held lane key. Until the identity field ships,
+   force the lane identity via PATH-wrapped `ssh`/`scp` with
+   `-F <lane-ssh-config>`.
+
 ## 2. DNS: `*.nau.rclb.dev` wildcard (PLAN decision 1)
 
 One DNS-only A record in the existing `rclb.dev` Cloudflare zone —
