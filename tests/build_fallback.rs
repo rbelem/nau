@@ -59,3 +59,175 @@ fn broken_workers_config_refuses_the_build_instead_of_building_locally() {
         "no snap may be produced off a refused config"
     );
 }
+
+// ── `workers burst --count auto` (#304): the extracted pending
+// computation, driven end to end through the real binary. The sizing
+// decision must land on stderr BEFORE any API call — these bursts never
+// get past it (no CA, no publish channel), which is exactly the
+// fail-closed point.
+
+/// A minimal dep recipe; served from `pkgs/<letter>/<name>.lua`, which is
+/// how the dep graph's names resolve (nodes carry the DECLARED name, not
+/// the seed path).
+fn burst_dep_recipe(letter: &str) -> String {
+    format!("return {{ d = snap {{ name = \"dep-{letter}\", version = \"1.0\" }} }}\n")
+}
+
+#[test]
+fn burst_auto_sizes_the_wrapped_builds_pending_jobs() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join("pkgs/d")).unwrap();
+    for letter in ["a", "b", "c", "d", "e"] {
+        std::fs::write(
+            project.path().join(format!("pkgs/d/dep-{letter}.lua")),
+            burst_dep_recipe(letter),
+        )
+        .unwrap();
+    }
+    // An offline-resolvable declared input: an empty config would fall
+    // through init_global_inputs_with to the default github input, which
+    // is exactly the refusal the wrapped build itself would hit offline.
+    std::fs::create_dir_all(project.path().join("fixtures")).unwrap();
+    let deps = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|l| format!("\"dep-{l}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        project.path().join("nau.lua"),
+        format!(
+            "inputs = {{ lib = {{ url = \"path:fixtures\" }} }}\n\
+             return {{ app = snap {{ name = \"burst-auto\", version = \"1.0\", \
+             build_deps = {{ {deps} }} }} }}\n"
+        ),
+    )
+    .unwrap();
+
+    // No cache, no --all overrides: all five deps are pending. With the
+    // default 2 jobs/worker and --max 4, ceil(5/2) = 3.
+    let result = Command::new(env!("CARGO_BIN_EXE_nau"))
+        .env("HOME", project.path())
+        .args([
+            "workers",
+            "burst",
+            "--provider",
+            "hetzner",
+            "--type",
+            "CX33",
+            "--location",
+            "hel1",
+            "--count",
+            "auto",
+            "--max",
+            "4",
+            "--",
+            "build",
+            "--offline",
+            "--output",
+            "out",
+        ])
+        .current_dir(project.path())
+        .output()
+        .expect("failed to spawn nau workers burst");
+
+    assert_ne!(
+        result.status.code(),
+        Some(0),
+        "no CA / no publish channel must stop the burst after sizing"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("5 pending"),
+        "the sizing line must name the pending count: {stderr}"
+    );
+    assert!(
+        stderr.contains("provisioning 3 workers"),
+        "the sizing decision must name the chosen count (ceil(5/2)=3): {stderr}"
+    );
+    assert!(
+        stderr.contains("max 4"),
+        "the sizing line must name the guard: {stderr}"
+    );
+}
+
+#[test]
+fn burst_auto_refuses_zero_pending_before_any_api_call() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join("fixtures")).unwrap();
+    std::fs::write(
+        project.path().join("nau.lua"),
+        "inputs = { lib = { url = \"path:fixtures\" } }\n\
+         return { app = snap { name = \"burst-zero\", version = \"1.0\" } }\n",
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_nau"))
+        .env("HOME", project.path())
+        .args([
+            "workers",
+            "burst",
+            "--provider",
+            "hetzner",
+            "--type",
+            "CX33",
+            "--location",
+            "hel1",
+            "--count",
+            "auto",
+            "--",
+            "build",
+            "--offline",
+        ])
+        .current_dir(project.path())
+        .output()
+        .expect("failed to spawn nau workers burst");
+
+    assert_ne!(result.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("0 pending"),
+        "zero pending must refuse by name: {stderr}"
+    );
+    assert!(
+        stderr.contains("nothing to build"),
+        "the refusal must say why nothing is provisioned: {stderr}"
+    );
+}
+
+#[test]
+fn burst_auto_refuses_a_non_build_wrapped_command() {
+    let project = tempfile::tempdir().unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_nau"))
+        .env("HOME", project.path())
+        .args([
+            "workers",
+            "burst",
+            "--provider",
+            "hetzner",
+            "--type",
+            "CX33",
+            "--location",
+            "hel1",
+            "--count",
+            "auto",
+            "--",
+            "echo",
+            "hi",
+        ])
+        .current_dir(project.path())
+        .output()
+        .expect("failed to spawn nau workers burst");
+
+    assert_ne!(result.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    // Short fragments only: miette wraps stderr mid-sentence.
+    assert!(
+        stderr.contains("echo hi"),
+        "the refusal must name the wrapped command: {stderr}"
+    );
+    assert!(
+        stderr.contains("no pending set"),
+        "the refusal must name why sizing is impossible: {stderr}"
+    );
+}

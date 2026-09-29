@@ -223,8 +223,9 @@ fn scaleway_credentials_source() -> Option<String> {
 }
 
 /// CLI entry for `nau workers provision` / `nau workers destroy` /
-/// `nau workers receive-publish`.
-pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
+/// `nau workers receive-publish`. `burst_sizing` is the binary's pending
+/// computation, injected for `--count auto` (#304 — see [`BurstSizing`]).
+pub fn workers_main(command: WorkersCommand, burst_sizing: BurstSizing) -> miette::Result<()> {
     match command {
         WorkersCommand::Provision {
             provider,
@@ -305,6 +306,7 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
             keep,
             &file,
             command,
+            burst_sizing,
         ),
         WorkersCommand::Down { provider, file, .. } => down_all_managed_main(&provider, &file),
     }
@@ -646,6 +648,54 @@ pub fn refuse_burst_above_max(count: u32, max: u32) -> miette::Result<()> {
     Ok(())
 }
 
+/// The bin-side sizing source (#304): the wrapped build's pending jobs +
+/// jobs-per-worker. A function pointer because provision lives in the
+/// library while the pending computation lives in the binary's build
+/// orchestrator — the binary injects it, the library only sizes from it.
+pub type BurstSizing = fn(&[String]) -> miette::Result<(usize, u32)>;
+
+/// The `--count auto` rule (#304), pure for testability: min(--max,
+/// ceil(pending / jobs_per_worker)) — and zero pending refuses, since
+/// provisioning an idle fleet is pure hourly bill. The decision is named
+/// in the output line so the operator can audit why the count was chosen.
+pub fn burst_auto_count(pending: usize, jobs_per_worker: u32, max: u32) -> miette::Result<u32> {
+    if pending == 0 {
+        return Err(miette::miette!(
+            "workers burst: --count auto found 0 pending jobs — nothing to build, \
+             nothing to provision"
+        ));
+    }
+    // Fits u32: the result is clamped at `max`, a u32.
+    let count = (max as usize).min(pending.div_ceil(jobs_per_worker as usize)) as u32;
+    crate::output::info(format!(
+        "auto: {pending} pending / {jobs_per_worker} jobs-per-worker → provisioning \
+         {count} workers (max {max})"
+    ));
+    Ok(count)
+}
+
+/// The burst's worker count (#304): an explicit `--count` keeps the
+/// `--max` guard; `auto` sizes from the wrapped build's pending jobs.
+/// Both land BEFORE any API call — a refused burst must never
+/// provision, never pin, never bill.
+fn resolve_burst_count(
+    count: crate::cli::BurstCount,
+    max: u32,
+    command: &[String],
+    sizing: BurstSizing,
+) -> miette::Result<u32> {
+    match count {
+        crate::cli::BurstCount::Fixed(n) => {
+            refuse_burst_above_max(n, max)?;
+            Ok(n)
+        }
+        crate::cli::BurstCount::Auto => {
+            let (pending, jobs_per_worker) = sizing(command)?;
+            burst_auto_count(pending, jobs_per_worker, max)
+        }
+    }
+}
+
 /// The `burst` verb body: build the request exactly like `workers
 /// provision`, resolve the real publish channel + provisioner, and run
 /// the burst window. A nonzero wrapped-command exit code becomes the
@@ -655,15 +705,15 @@ fn burst_main(
     provider: &str,
     server_type: String,
     location: String,
-    count: u32,
+    count: crate::cli::BurstCount,
     max: u32,
     ttl: &str,
     timeout_secs: u64,
     keep: bool,
     file: &str,
     command: Vec<String>,
+    sizing: BurstSizing,
 ) -> miette::Result<()> {
-    refuse_burst_above_max(count, max)?;
     if command.is_empty() {
         // Unreachable through clap (`num_args(1..)`); kept fail-closed
         // for direct callers.
@@ -671,6 +721,7 @@ fn burst_main(
             "workers burst: no wrapped command — give it after '--'"
         ));
     }
+    let count = resolve_burst_count(count, max, &command, sizing)?;
     let req = ProvisionRequest {
         server_type,
         location,
