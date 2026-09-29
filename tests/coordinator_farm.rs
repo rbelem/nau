@@ -801,11 +801,166 @@ fn plan_objects_resolve_the_source_pins_like_dispatch() {
         &BTreeMap::from([("meta-only".to_string(), bare_meta("meta-only", "1.0.0"))]),
         &[],
         &empty_lockfile(),
+        Path::new("no-such-run-output"),
+        None,
     )
     .expect("a build-less plan precomputes");
     assert!(
         plans.caps["meta-only"].objects.is_empty(),
         "a plan-less node carries no objects"
+    );
+}
+
+/// #307: the dep closure's RESOLVED payload hash joins the placement
+/// set — hashed exactly like the manifest's `dep:<pkg>` objects (the
+/// sha256 the worker store persists), so a source-less node with deps
+/// is no longer invisible to the preference. An unresolvable dep (the
+/// cold run's still-to-build snap) contributes nothing: fail-open,
+/// delta_sync stays the authority.
+#[test]
+fn placement_objects_carry_the_resolved_dep_snap_hashes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let dep_bytes = b"the farm-dep snap last run built".to_vec();
+    let dep_sha = sha256_hex(&dep_bytes);
+    std::fs::write(out_dir.join("farm-dep_1.0.0_amd64.snap"), &dep_bytes).unwrap();
+
+    let dep_meta = bare_meta("farm-dep", "1.0.0");
+    let dep_closures = HashMap::from([(
+        "farm-dep".to_string(),
+        nau::cache::BuildClosure::for_meta(&dep_meta, vec![], vec![]),
+    )]);
+    let dep_metas = HashMap::from([("farm-dep".to_string(), dep_meta)]);
+
+    // A source-less node with one dep: the dep's resolved sha256 is the
+    // whole placement set.
+    let plan = plan_for("warm", &["farm-dep"], vec![]);
+    assert_eq!(
+        nau::coordinator::placement_objects(
+            &plan,
+            &empty_lockfile(),
+            &dep_metas,
+            &dep_closures,
+            &out_dir,
+            None,
+        ),
+        BTreeSet::from([dep_sha.clone()]),
+        "the dep snap's content hash is the placement-known object"
+    );
+
+    // A cold run: the dep not yet in the output dir resolves to nothing.
+    let cold = nau::coordinator::placement_objects(
+        &plan_for("warm", &["farm-dep2"], vec![]),
+        &empty_lockfile(),
+        &dep_metas,
+        &dep_closures,
+        &out_dir,
+        None,
+    );
+    assert!(
+        cold.is_empty(),
+        "an unbuilt dep contributes nothing — placement only aims"
+    );
+}
+
+/// The full #307 preference chain at the coordinator boundary: the
+/// placement sets derived from the run's output dir name the dep snap's
+/// hash for the warm node and stay empty for the cold one, and the
+/// member holding exactly that hash takes the warm node over queue
+/// order (precompute's own recipe resolution runs against the process
+/// package registry, so this drives its object-set half directly; two
+/// nodes keep the outcome deterministic in both thread-arrival orders).
+#[test]
+fn warm_rerun_derives_the_holder_preference_from_the_dep_closure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let dep_bytes = b"the farm-dep snap last run built".to_vec();
+    let dep_sha = sha256_hex(&dep_bytes);
+    std::fs::write(out_dir.join("farm-dep_1.0.0_amd64.snap"), &dep_bytes).unwrap();
+    let dep_meta = bare_meta("farm-dep", "1.0.0");
+    let dep_closures = HashMap::from([(
+        "farm-dep".to_string(),
+        nau::cache::BuildClosure::for_meta(&dep_meta, vec![], vec![]),
+    )]);
+    let dep_metas = HashMap::from([("farm-dep".to_string(), dep_meta)]);
+    let derived = |deps: &[&str]| {
+        nau::coordinator::placement_objects(
+            &plan_for("warm", deps, vec![]),
+            &empty_lockfile(),
+            &dep_metas,
+            &dep_closures,
+            &out_dir,
+            None,
+        )
+    };
+
+    // The caps the way precompute derives them: farm-dep2's set comes
+    // from the output dir's dep snap; farm-dep's dep is not built yet —
+    // an empty set, the cold node.
+    let warm_objects = derived(&["farm-dep"]);
+    assert_eq!(
+        warm_objects,
+        BTreeSet::from([dep_sha.clone()]),
+        "the derived placement set names the dep snap"
+    );
+    assert!(
+        derived(&["farm-dep0"]).is_empty(),
+        "the cold node stays cold"
+    );
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let holder = FakeMember::worker("box", 1, None, events.clone()).holds(&[dep_sha.as_str()]);
+    let local = FakeMember::local(1, events.clone());
+    let members = vec![holder, local];
+    let mut caps_map = no_caps();
+    // The cold node carries an object no member holds (a non-empty set
+    // keeps pick_ready's vacuous `all()` on empty objects from firing —
+    // an empty placement set reads as "held by everyone").
+    caps_map.insert(
+        "farm-dep".to_string(),
+        JobCaps {
+            archs: vec!["amd64".to_string()],
+            cross: false,
+            local_only: false,
+            objects: BTreeSet::from(["sha-no-member-holds".to_string()]),
+        },
+    );
+    caps_map.insert(
+        "farm-dep2".to_string(),
+        JobCaps {
+            archs: vec!["amd64".to_string()],
+            cross: false,
+            local_only: false,
+            objects: warm_objects,
+        },
+    );
+    let g = graph(&[("farm-dep", &[]), ("farm-dep2", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome.result.expect("farm builds clean");
+    // Deterministic in both thread-arrival orders: the holder's scan
+    // skips unheld farm-dep and takes the dep-key-holding farm-dep2;
+    // local takes farm-dep.
+    assert_eq!(
+        members[0].started("farm-dep2"),
+        1,
+        "the node rides the member holding the resolved dep key: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("farm-dep"),
+        0,
+        "the holder never takes a node it does not hold: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("farm-dep"),
+        1,
+        "the cold node builds local: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("farm-dep2"),
+        0,
+        "local never steals the dep-key node: {events:?}"
     );
 }
 
@@ -1689,8 +1844,14 @@ fn duplicate_short_names_each_record_their_loss() {
 fn metadata_only_all_jobs_are_local_only() {
     let mut metas = BTreeMap::new();
     metas.insert("meta-only".to_string(), bare_meta("meta-only", "1.0.0"));
-    let plans = nau::coordinator::precompute_farm_plans(&metas, &[], &empty_lockfile())
-        .expect("a build-less plan precomputes");
+    let plans = nau::coordinator::precompute_farm_plans(
+        &metas,
+        &[],
+        &empty_lockfile(),
+        Path::new("no-such-run-output"),
+        None,
+    )
+    .expect("a build-less plan precomputes");
     let caps = plans
         .caps
         .get("meta-only")

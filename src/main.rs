@@ -1394,15 +1394,20 @@ fn run_farm(
         return Ok(refused_run(graph, &text));
     }
 
-    let plans =
-        match nau::coordinator::precompute_farm_plans(ctx.metas, ctx.cli_archs, ctx.lockfile) {
-            Ok(x) => x,
-            Err(e) => {
-                // A precompute failure is a pre-run refusal: nothing
-                // dispatched, everything unstarted, reason named.
-                return Ok(refused_run(graph, &format!("{e:#}")));
-            }
-        };
+    let plans = match nau::coordinator::precompute_farm_plans(
+        ctx.metas,
+        ctx.cli_archs,
+        ctx.lockfile,
+        ctx.output_dir,
+        ctx.pkg_cache,
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            // A precompute failure is a pre-run refusal: nothing
+            // dispatched, everything unstarted, reason named.
+            return Ok(refused_run(graph, &format!("{e:#}")));
+        }
+    };
 
     let epoch = std::env::var("SOURCE_DATE_EPOCH")
         .ok()
