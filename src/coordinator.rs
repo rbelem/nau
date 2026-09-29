@@ -351,6 +351,15 @@ pub struct FarmPlans {
     pub dep_metas: HashMap<String, SnapMeta>,
     pub dep_closures: HashMap<String, crate::cache::BuildClosure>,
     pub caps: HashMap<String, crate::build_sched::JobCaps>,
+    /// The coordinator's own store as a holder set (#309): the union of
+    /// every node's placement-known objects — exactly the sha256s the
+    /// local build resolves offline (output dir first, then the binary
+    /// cache, per `resolved_dep_payload`; source pins ride the
+    /// lockfile). Threaded into the LOCAL member's `store_held`, whose
+    /// trait-default `None` kept locally-held jobs out of the holder
+    /// preference and reservation — they fell to the racy fallback and
+    /// paid a full sync leg onto an empty worker (window 6).
+    pub local_held: BTreeSet<String>,
 }
 
 /// The placement-known objects of one RESOLVED plan (#303): the pinned
@@ -500,11 +509,18 @@ pub fn precompute_farm_plans(
             },
         );
     }
+    // #309: the local held set — everything the local build resolves
+    // offline is exactly the union of the placement sets just computed.
+    let local_held: BTreeSet<String> = caps
+        .values()
+        .flat_map(|c| c.objects.iter().cloned())
+        .collect();
     Ok(FarmPlans {
         plans,
         dep_metas,
         dep_closures,
         caps,
+        local_held,
     })
 }
 
