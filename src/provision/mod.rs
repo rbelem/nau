@@ -43,6 +43,7 @@ pub mod publish;
 pub mod scaleway;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::cli::WorkersCommand;
@@ -282,6 +283,30 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
             timeout,
         ),
         WorkersCommand::Pickup { home } => pickup_main(home),
+        WorkersCommand::Burst {
+            provider,
+            server_type,
+            location,
+            count,
+            max,
+            ttl,
+            timeout,
+            keep,
+            file,
+            command,
+        } => burst_main(
+            &provider,
+            server_type,
+            location,
+            count,
+            max,
+            &ttl,
+            timeout,
+            keep,
+            &file,
+            command,
+        ),
+        WorkersCommand::Down { provider, file, .. } => down_all_managed_main(&provider, &file),
     }
 }
 
@@ -585,6 +610,311 @@ pub fn issue_wait_nudge(home: &Path) -> Option<String> {
              'nau workers issue --wait' to sign each as its publish lands"
         )
     })
+}
+
+// ── Burst + down (#301): the one-command build window ──
+
+/// Per-worker `issue --wait` budget ADDED to the operator's ceiling:
+/// each guest publishes 1-4 min after create, so the effective window
+/// scales with the count and a big burst never times out on queueing
+/// alone.
+const BURST_ISSUE_WAIT_SECS_PER_WORKER: u64 = 180;
+
+/// The SIGINT trap's target: the wrapped command's pid while it runs, 0
+/// otherwise. Async-signal-safe by construction — one atomic read.
+static BURST_CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn burst_forward_sigint(_: libc::c_int) {
+    // Forward to the child: its death unblocks the parent's wait() into
+    // the burst teardown, so cleanup fires on Ctrl-C exactly as on any
+    // other command failure.
+    let pid = BURST_CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        unsafe { libc::kill(pid, libc::SIGINT) };
+    }
+}
+
+/// The `--max` guardrail: a count above it is a named refusal BEFORE any
+/// API call — raising the guard is a deliberate act, never a typo.
+pub fn refuse_burst_above_max(count: u32, max: u32) -> miette::Result<()> {
+    if count > max {
+        return Err(miette::miette!(
+            "workers burst: count {count} exceeds --max {max} — each burst worker bills \
+             hourly; raise --max only when the fleet really needs it"
+        ));
+    }
+    Ok(())
+}
+
+/// The `burst` verb body: build the request exactly like `workers
+/// provision`, resolve the real publish channel + provisioner, and run
+/// the burst window. A nonzero wrapped-command exit code becomes the
+/// process exit code — after the teardown has run.
+#[allow(clippy::too_many_arguments)]
+fn burst_main(
+    provider: &str,
+    server_type: String,
+    location: String,
+    count: u32,
+    max: u32,
+    ttl: &str,
+    timeout_secs: u64,
+    keep: bool,
+    file: &str,
+    command: Vec<String>,
+) -> miette::Result<()> {
+    refuse_burst_above_max(count, max)?;
+    if command.is_empty() {
+        // Unreachable through clap (`num_args(1..)`); kept fail-closed
+        // for direct callers.
+        return Err(miette::miette!(
+            "workers burst: no wrapped command — give it after '--'"
+        ));
+    }
+    let req = ProvisionRequest {
+        server_type,
+        location,
+        count,
+        ttl_secs: parse_ttl(ttl)?,
+        spot: false,
+        max_price: None,
+        dry_run: false,
+        config: PathBuf::from(file),
+        ca_fingerprint: run_ca_fingerprint(false)?,
+    };
+    let channel = run_publish_channel(false)?;
+    let publish_home = match &channel {
+        Some(c) => c.home.clone(),
+        None => {
+            return Err(miette::miette!(
+                "workers burst: no publish channel — a burst pins and issues like a \
+                 real provision, never a dry run"
+            ))
+        }
+    };
+    let provisioner = provider_for(provider, channel)?;
+    let code = run_burst(
+        provisioner.as_ref(),
+        &crate::command::RealRunner,
+        &publish_home,
+        &req,
+        Duration::from_secs(timeout_secs.max(BURST_ISSUE_WAIT_SECS_PER_WORKER * u64::from(count))),
+        keep,
+        &command,
+    )?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// The burst window (the testable core — provisioner, signer, and
+/// publish home are injected). Order is fixed: provision → issue --wait
+/// → run → destroy+evict. Everything after the provision runs under the
+/// teardown, so a refused issue window or a failing command still
+/// reclaims the workers unless `--keep` parks them.
+pub fn run_burst(
+    provisioner: &dyn Provisioner,
+    signer: &dyn crate::command::CommandRunner,
+    publish_home: &Path,
+    req: &ProvisionRequest,
+    issue_timeout: Duration,
+    keep: bool,
+    command: &[String],
+) -> miette::Result<i32> {
+    if command.is_empty() {
+        return Err(miette::miette!(
+            "workers burst: no wrapped command — give it after '--'"
+        ));
+    }
+    // Same managed-block pinning as `workers provision` — the burst is
+    // that verb plus a window and a teardown, nothing more.
+    let workers = provisioner.provision(req)?;
+    for w in &workers {
+        crate::output::ok(format!(
+            "burst worker '{name}' provisioned — pinned {address}",
+            name = w.name,
+            address = w.address
+        ));
+    }
+
+    let window = || -> miette::Result<i32> {
+        // Sign each host certificate as its publish lands (#299's loop —
+        // the ceremony compression IS this verb's reason to exist).
+        let report = issue_wait(
+            signer,
+            publish_home,
+            publish::HOST_CERT_VALIDITY_DEFAULT,
+            false,
+            issue_timeout,
+            ISSUE_WAIT_POLL,
+            now_epoch_secs()?,
+        )?;
+        crate::output::ok(format!(
+            "burst: {} host certificate(s) issued — the workers are green",
+            report.issued.len()
+        ));
+        run_wrapped(command)
+    };
+    let outcome = window();
+
+    if keep {
+        crate::output::info(format!(
+            "burst: keeping {} worker(s) — tear them down later with \
+             'nau workers down --all-managed'",
+            workers.len()
+        ));
+        return outcome;
+    }
+
+    let stuck = destroy_burst_workers(provisioner, &req.config, &workers);
+    let code = outcome?;
+    if !stuck.is_empty() {
+        // A clean command with a leaked worker is still a failure: the
+        // leak bills hourly until the TTL sweep or a manual destroy.
+        return Err(miette::miette!(
+            "burst: the command exited 0, but {stuck_n} worker(s) survived the teardown: \
+             [{stuck}] — destroy them by hand or let the TTL sweep reclaim them",
+            stuck_n = stuck.len(),
+            stuck = stuck.join(", ")
+        ));
+    }
+    Ok(code)
+}
+
+/// Destroy every worker of a burst (newest first), reporting each.
+/// Individual failures never stop the sweep — the stuck names come back
+/// for the caller's final verdict.
+fn destroy_burst_workers(
+    provisioner: &dyn Provisioner,
+    config: &Path,
+    workers: &[ProvisionedWorker],
+) -> Vec<String> {
+    let mut stuck = Vec::new();
+    for w in workers.iter().rev() {
+        match provisioner.destroy(&w.name, config) {
+            Ok(evicted) => crate::output::ok(destroy_summary(&w.name, evicted)),
+            Err(e) => {
+                crate::output::warn(format!(
+                    "burst teardown: worker '{}' survived: {e:#}",
+                    w.name
+                ));
+                stuck.push(w.name.clone());
+            }
+        }
+    }
+    stuck
+}
+
+/// Run the wrapped command with inherited stdio under the SIGINT trap.
+/// Returns the exit code to propagate (128+signal on a signal death).
+fn run_wrapped(command: &[String]) -> miette::Result<i32> {
+    let mut child = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .spawn()
+        .map_err(|e| miette::miette!("burst: cannot run '{}': {e}", command.join(" ")))?;
+    BURST_CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
+    // The trap lives exactly as long as the child: before it, the
+    // default disposition ends the process (the TTL sweep reclaims
+    // workers from an early Ctrl-C); after it, the teardown already ran.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            burst_forward_sigint as *const () as libc::sighandler_t,
+        );
+    }
+    let status = child
+        .wait()
+        .map_err(|e| miette::miette!("burst: waiting on the wrapped command failed: {e}"))?;
+    BURST_CHILD_PID.store(0, Ordering::SeqCst);
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+    }
+    Ok(match status.code() {
+        Some(code) => code,
+        None => {
+            use std::os::unix::process::ExitStatusExt;
+            // Signal death: the conventional 128+signal the shell reports.
+            128 + status.signal().unwrap_or(0)
+        }
+    })
+}
+
+/// The `down --all-managed` verb body: resolve the real publish channel
+/// (the machine-linkage store names each pinned address's server) and
+/// drain the block.
+fn down_all_managed_main(provider: &str, file: &str) -> miette::Result<()> {
+    let channel = run_publish_channel(false)?;
+    let publish_home = match &channel {
+        Some(c) => c.home.clone(),
+        None => {
+            return Err(miette::miette!(
+                "workers down: no publish channel — the machine linkage that names each \
+                 pinned server lives there"
+            ))
+        }
+    };
+    let provisioner = provider_for(provider, channel)?;
+    run_down_all_managed(provisioner.as_ref(), &publish_home, Path::new(file))?;
+    Ok(())
+}
+
+/// Drain the managed block (the testable core): resolve each entry's
+/// server name through the machine linkage, destroy it, evict its pin.
+/// An empty or absent block is a green no-op. Every entry is attempted
+/// even when some fail — the run refuses only at the end, naming exactly
+/// which addresses need a hand.
+pub fn run_down_all_managed(
+    provisioner: &dyn Provisioner,
+    publish_home: &Path,
+    config: &Path,
+) -> miette::Result<usize> {
+    let entries = managed_entries(config)?;
+    if entries.is_empty() {
+        crate::output::ok(format!(
+            "{} carries no managed workers — nothing to destroy",
+            config.display()
+        ));
+        return Ok(0);
+    }
+    let mut failed: Vec<String> = Vec::new();
+    for entry in &entries {
+        let outcome = publish::machine_link(publish_home, &entry.address)
+            .and_then(|link| {
+                link.map(|l| l.machine_identity)
+                    .ok_or_else(|| miette::miette!("no machine linkage names this server"))
+            })
+            .and_then(|name| provisioner.destroy(&name, config).map(|_| name));
+        match outcome {
+            Ok(name) => crate::output::ok(format!(
+                "destroyed managed worker '{name}' and evicted its config entry"
+            )),
+            Err(e) => {
+                crate::output::warn(format!(
+                    "down: entry {address} survived: {cause:#}",
+                    address = entry.address,
+                    cause = e
+                ));
+                failed.push(entry.address.clone());
+            }
+        }
+    }
+    if !failed.is_empty() {
+        return Err(miette::miette!(
+            "down: {failed_n} of {total} managed entries could not be destroyed: [{failed}] \
+             — the rest are gone; destroy these by hand ('nau workers destroy <name>') and \
+             re-run",
+            failed_n = failed.len(),
+            total = entries.len(),
+            failed = failed.join(", ")
+        ));
+    }
+    crate::output::ok(format!(
+        "down: destroyed {} managed worker(s) — the block in {} is empty now",
+        entries.len(),
+        config.display()
+    ));
+    Ok(entries.len())
 }
 
 /// The destroy summary line. An absent managed entry is reported honestly:
@@ -1364,6 +1694,15 @@ pub fn managed_entry_exists(config: &Path, address: &str) -> miette::Result<bool
     Ok(parse_managed_entries(&text, block)?
         .iter()
         .any(|e| e.address == address))
+}
+
+/// Every entry currently pinned in the managed block — the `down
+/// --all-managed` inventory. An absent block is an empty set, not an
+/// error: nothing nau-owned to drain.
+pub fn managed_entries(config: &Path) -> miette::Result<Vec<ManagedEntry>> {
+    let text = read_config(config)?;
+    let block = block_line_range(&text)?;
+    parse_managed_entries(&text, block)
 }
 
 /// One entry inside the managed block. `identity` is `None` for entries
