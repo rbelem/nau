@@ -186,23 +186,40 @@ from two live runs (2026-09-29); every step was executed, not planned.
    and a guest's publish lands 1-4 minutes after server create (boot +
    binary download). An issue run too early signs NOTHING and the guest
    polls its cert for the whole token window (pickup-host-cert:
-   1440 × 60s). Until #296-style auto-issue exists, loop: run
-   `nau workers issue`, probe the cert (`ssh -o
-   HostKeyAlias=<worker-name> ... 'echo cert-present'`), repeat ~every
-   15s until it presents.
+   1440 × 60s). #299 productized the wait: `nau workers issue --wait`
+   polls (~5s) until every published identity is signed, with a loud
+   named timeout (default ceiling 600s). The manual fallback — run
+   `nau workers issue`, probe the cert, repeat — still works, but probe
+   the CERT (`test -s /etc/ssh/sshd_config.d/nau-host-cert.conf`), not
+   just the ssh login: a login success says nothing about the cert.
 4. **Workers-table gotchas.** `local_jobs` must sit OUTSIDE the
    machine-managed BEGIN/END block: inside it the validator refuses any
    line that is not its own (provision/destroy own the block); outside
    the table entirely it silently defaults to 3 and starves the worker.
 5. **Build + destroy in ONE window.** Dedicated vCPU is too expensive
    to idle (operator directive, §1.3) — the TTL sweep is the backstop,
-   not the plan. Destroy in the same session that built.
-6. **Force the client identity.** The executor spawns plain
-   `ssh`/`scp`; an operator `~/.ssh/config` Host-block with
-   `IdentitiesOnly yes` + an unrelated `IdentityFile` silently
-   overrides the agent-held lane key. Until the identity field ships,
-   force the lane identity via PATH-wrapped `ssh`/`scp` with
-   `-F <lane-ssh-config>`.
+   not the plan. Destroy in the same session that built — or use
+   `nau workers burst … -- <cmd>` (#301), which wraps provision → issue
+   --wait → command → destroy (failure and Ctrl-C included) in one
+   command; `--keep` parks the window, `nau workers down --all-managed`
+   drains it later.
+6. **Client identity is pinned (#298).** Provision records the resolved
+   key path as the entry's `identity` field, and the executor presents
+   exactly that key (`IdentitiesOnly`) — ambient `~/.ssh/config` can no
+   longer hijack the channel. The PATH-wrapped `ssh`/`scp` with
+   `-F <lane-ssh-config>` remains the workaround ONLY for entries
+   written before the pin (legacy entries are preserved verbatim, never
+   backfilled) — or set `NAU_SSH_IDENTITY` for them.
+7. **The mksquashfs pin ships as a prebuilt artifact (#300).** Workers
+   `curl` + sha256-verify it from `NAU_MKSQUASHFS_ARTIFACT_URL` (default:
+   the GitHub release — empty until #305 publishes it). Provisioning
+   against a funnel front MUST export the override (e.g.
+   `https://<funnel>/bin`, where the lane's `dist/` already holds the
+   pinned binaries); a worker that missed the pin is REFUSED at
+   preflight by design — admission is fail-closed, so a missing env var
+   wastes the window silently-until-preflight. If preflight refuses and
+   the guests are still alive, pull `/var/log/cloud-init-output.log`
+   BEFORE destroying: it is the only forensic for install-leg failures.
 
 ## 2. DNS: `*.nau.rclb.dev` wildcard (PLAN decision 1)
 
