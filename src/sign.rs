@@ -3587,7 +3587,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let old = create_secret_key(home.path()).unwrap();
         let successor = mint_rotation_key(home.path()).unwrap();
-        let dir = keys_dir(home.path());
+        let _dir = keys_dir(home.path());
 
         // Active is STILL the old key; the successor is designated only
         // (secret-key.new, no anchor yet).

@@ -20,8 +20,8 @@ use nau::provision::{
     append_worker_entry, issue_wait, issue_wait_nudge, now_epoch_secs, parse_ttl, render_user_data,
     ProvisionRequest, Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END,
     MKSQUASHFS_ARTIFACT_SHA256, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
-    SQUASHFS_TOOLS_RELEASE_DATE, SQUASHFS_TOOLS_SHA256, SQUASHFS_TOOLS_TARBALL_URL,
-    SQUASHFS_TOOLS_VERSION, UNSQUASHFS_ARTIFACT_SHA256,
+    SQUASHFS_TOOLS_RELEASE_DATE, SQUASHFS_TOOLS_TARBALL_URL, SQUASHFS_TOOLS_VERSION,
+    UNSQUASHFS_ARTIFACT_SHA256,
 };
 
 /// A shape-valid ed25519 public line — throwaway fixture bytes, no

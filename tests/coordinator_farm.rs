@@ -1324,6 +1324,7 @@ fn dispatch_timings_reach_the_run_summary() {
         jobs: 1,
         arch: None,
         host_key: Some(FINGERPRINT_PIN.to_string()),
+        identity: None,
     };
     let exec = SshExecutor::with_ceremony_home(&cfg, fake, &tmp.path().join("cache"), &ceremony)
         .expect("executor builds");
@@ -1400,6 +1401,7 @@ fn cache_hit_records_no_timing_entry() {
         jobs: 1,
         arch: None,
         host_key: Some(FINGERPRINT_PIN.to_string()),
+        identity: None,
     };
     let exec = SshExecutor::with_ceremony_home(&cfg, fake, &tmp.path().join("cache"), &ceremony)
         .expect("executor builds");
