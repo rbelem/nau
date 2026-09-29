@@ -21,7 +21,7 @@
 //! that now carries the one-time publish bearer, and a file hand-off (the
 //! blob never enters argv). Same rule as the sibling providers — the
 //! shared template is consumed, never forked, and lands on the provider's
-//! cloud-init channel (hcloud `--user-datafile`, aws `file://`, gcloud
+//! cloud-init channel (hcloud `--user-data-from-file`, aws `file://`, gcloud
 //! `user-data`).
 //!
 //! Preemptible (#196, opt-in): `--preemptible` rides `instances create`.

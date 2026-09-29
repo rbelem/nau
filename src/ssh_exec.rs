@@ -975,7 +975,16 @@ impl<R: CommandRunner> SshExecutor<R> {
             })?;
         let stage = tempfile::tempdir()
             .map_err(|e| miette::miette!("dispatch: cannot stage the job file: {e}"))?;
-        let job_file = crate::worker::write_job_file(stage.path(), manifest)?;
+        // The job file's payload_dir is TRANSPORT-LOCAL (relative to the
+        // job file, which the worker resolves against its own directory):
+        // the blobs were just hard-linked into {job}/payload above. The
+        // identity digests the canonical manifest, which strips this field
+        // — coordinator-side disk never leaks into the job identity.
+        let mut job_manifest = manifest.clone();
+        if !manifest.closure.is_empty() {
+            job_manifest.payload_dir = Some("payload".to_string());
+        }
+        let job_file = crate::worker::write_job_file(stage.path(), &job_manifest)?;
         self.scp_put(&job_file, &format!("{job}/job.json"))
             .wrap_err("dispatch")?;
         Ok(())

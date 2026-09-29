@@ -15,7 +15,7 @@
 //! YAML, and Scaleway consumes it under the reserved `cloud-init` user-data
 //! key. The blob is staged 0600 in the provision tempdir and handed off as
 //! a `file://` reference — the same file hand-off discipline as the
-//! sibling providers (hcloud `--user-datafile`, aws `file://`, gcloud
+//! sibling providers (hcloud `--user-data-from-file`, aws `file://`, gcloud
 //! `user-data=<file>`, azure `@file`), so the one-time bearer never
 //! enters argv. WIRE-FORM NOTE (flagged for review, the one T10-text
 //! choice): the `user-data.0.content=` argument is the create-time

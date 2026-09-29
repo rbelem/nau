@@ -175,8 +175,20 @@ pub fn write_job_file(dir: &Path, manifest: &JobManifest) -> miette::Result<Path
     std::fs::create_dir_all(dir)
         .map_err(|e| miette::miette!("worker-job: cannot create {}: {e}", dir.display()))?;
     let path = dir.join("job.json");
-    std::fs::write(&path, canonical_manifest_bytes(manifest)?)
-        .map_err(|e| miette::miette!("worker-job: cannot write {}: {e}", path.display()))?;
+    // The job file serializes the manifest AS THE WORKER LOADS IT —
+    // payload_dir included: the field is transport-local routing (the
+    // worker resolves it against this file's directory), and a manifest
+    // that names closure objects must name where they are or the worker
+    // refuses fail-closed. The JOB IDENTITY still digests the canonical
+    // bytes, which strip payload_dir — the worker recomputes it from the
+    // loaded manifest, so a coordinator-local path never enters the
+    // identity.
+    std::fs::write(
+        &path,
+        serde_json::to_vec(manifest)
+            .map_err(|e| miette::miette!("worker-job: cannot serialize the job manifest: {e}"))?,
+    )
+    .map_err(|e| miette::miette!("worker-job: cannot write {}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -332,15 +344,37 @@ fn free_disk_bytes(path: &Path) -> u64 {
 /// must outlive the job's scratch, because the transport collects them by
 /// the paths in the result document.
 pub fn job_main(job_file: &str) -> miette::Result<()> {
-    let path = PathBuf::from(job_file);
+    // The transport contract (ADR-0040 T3/T4): this verb's stdout carries
+    // the result document and NOTHING else. Build children inherit fd 1
+    // (mksquashfs's progress banner is .status()-spawned), and over the
+    // ssh channel that inherited stdout corrupts the document the
+    // coordinator parses — so the job runs with its process stdout
+    // re-pointed at stderr, and the document goes to the saved original.
+    use std::os::unix::io::FromRawFd;
+    let saved_stdout = unsafe { libc::dup(1) };
+    if saved_stdout < 0 {
+        return Err(miette::miette!(
+            "worker-job: cannot save the result stream (dup failed)"
+        ));
+    }
+    unsafe { libc::dup2(2, 1) };
+    let result = execute_job_manifest(PathBuf::from(job_file))?;
+    let json = serde_json::to_string_pretty(&result)
+        .map_err(|e| miette::miette!("worker-job: cannot serialize result document: {e}"))?;
+    let mut out = unsafe { std::fs::File::from_raw_fd(saved_stdout) };
+    use std::io::Write;
+    writeln!(out, "{json}")
+        .map_err(|e| miette::miette!("worker-job: cannot write the result document: {e}"))?;
+    Ok(())
+}
+
+/// Load, execute, return — the testable core of [`job_main`]; the verb
+/// wrapper owns the stdout contract.
+fn execute_job_manifest(path: PathBuf) -> miette::Result<JobResult> {
     let manifest = load_manifest(&path)?;
     let payload_dir = resolve_payload_dir(&path, &manifest);
     let out_dir = path.parent().unwrap_or(Path::new(".")).join("out");
-    let result = execute_job(&manifest, payload_dir.as_deref(), &out_dir)?;
-    let json = serde_json::to_string_pretty(&result)
-        .map_err(|e| miette::miette!("worker-job: cannot serialize result document: {e}"))?;
-    println!("{json}");
-    Ok(())
+    execute_job(&manifest, payload_dir.as_deref(), &out_dir)
 }
 
 /// Parse the job manifest file. A missing or unparseable file is a named

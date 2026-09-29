@@ -58,7 +58,7 @@ struct Script {
 #[derive(Clone)]
 struct FakeProvider {
     calls: Arc<Mutex<Vec<Vec<String>>>>,
-    /// (path, unix mode, content) of every `--user-datafile` the fake
+    /// (path, unix mode, content) of every `--user-data-from-file` the fake
     /// served, captured at call time — the real blob dies with the
     /// staging tempdir.
     user_data_files: Arc<Mutex<Vec<(PathBuf, u32, String)>>>,
@@ -102,7 +102,7 @@ impl FakeProvider {
                     return Ok(fail_out("hcloud: invalid credentials (fake)"));
                 }
                 use std::os::unix::fs::PermissionsExt;
-                if let Some(i) = argv.iter().position(|a| a == "--user-datafile") {
+                if let Some(i) = argv.iter().position(|a| a == "--user-data-from-file") {
                     let path = PathBuf::from(&argv[i + 1]);
                     let mode = std::fs::metadata(&path)
                         .map(|m| m.permissions().mode() & 0o777)
@@ -132,9 +132,11 @@ impl FakeProvider {
                 *done += 1;
                 Ok(ok_out(""))
             }
-            ["volume", "list", "--server", _name, "-o", "json"] => {
+            ["volume", "list", "-o", "json"] => {
                 let volumes: Vec<serde_json::Value> = (1..=self.script.attached_volumes)
-                    .map(|i| serde_json::json!({ "id": i, "name": format!("vol-{i}") }))
+                    .map(|i| {
+                        serde_json::json!({ "id": i, "name": format!("vol-{i}"), "server": {"id": 42} })
+                    })
                     .collect();
                 Ok(ok_out(&serde_json::Value::Array(volumes).to_string()))
             }
@@ -482,8 +484,14 @@ fn user_data_builds_the_pinned_squashfs_tools_from_source() {
     assert!(user_data.contains(&format!(
         "RELEASE_VERSION={SQUASHFS_TOOLS_VERSION} RELEASE_DATE={SQUASHFS_TOOLS_RELEASE_DATE}"
     )));
+    // The binaries are copied, not `make install`ed: a second make
+    // invocation re-evaluates the default target and pulls lzo_wrapper.o
+    // (no liblzo2-dev on the worker image) — found live on the first
+    // cloud worker, whose mksquashfs built fine and whose install leg
+    // died, leaving the distro mksquashfs to answer the pin check.
     assert!(user_data.contains(&format!(
-        "make -C squashfs-tools-{SQUASHFS_TOOLS_VERSION}/squashfs-tools install"
+        "cp -a squashfs-tools-{SQUASHFS_TOOLS_VERSION}/squashfs-tools/mksquashfs \
+         squashfs-tools-{SQUASHFS_TOOLS_VERSION}/squashfs-tools/unsquashfs /usr/local/bin/"
     )));
     assert!(user_data.contains("/usr/local/bin/mksquashfs -version"));
     assert!(user_data.contains(&format!("grep -q \"version {SQUASHFS_TOOLS_VERSION} \"")));
@@ -590,7 +598,10 @@ fn provision_creates_describes_pins_and_labels() {
         // create argv — asserted against the const, so pin and test move
         // together.
         assert!(f.contains(&format!("--image\u{1f}{}", nau::provision::hetzner::IMAGE)));
-        let udf = argv.iter().position(|a| a == "--user-datafile").unwrap();
+        let udf = argv
+            .iter()
+            .position(|a| a == "--user-data-from-file")
+            .unwrap();
         assert!(!argv[udf + 1].is_empty(), "a user-data file is passed");
         assert!(!f.contains("tok-1"), "token never enters argv: {f}");
     }
@@ -1362,7 +1373,20 @@ fn user_data_picks_the_issued_certificate_up_on_first_boot() {
         user_data.contains("chmod 0644 \"$TMP\"") && user_data.contains("mv \"$TMP\" \"$CERT\""),
         "atomic install, cert mode 0644 (public material)"
     );
+    assert!(
+        user_data.contains("nau-host-cert.conf"),
+        "the pickup installs the HostCertificate drop-in — sshd never presents \
+         a certificate it was never told about"
+    );
     assert!(user_data.contains("systemctl restart ssh || systemctl restart sshd"));
+
+    // The API-level create carries no --ssh-key, so hcloud's root
+    // password ages out at first boot; PAM refuses pubkey logins until
+    // the forced change is cleared.
+    assert!(
+        user_data.contains("chage -d -1 root"),
+        "the forced password change must never gate the coordinator's login"
+    );
 
     // Bounded retries sized to the publish-token window.
     let ttl = nau::provision::publish::PUBLISH_TOKEN_TTL_SECS;
