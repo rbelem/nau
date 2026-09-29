@@ -8,14 +8,18 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use nau::command::{CommandRunner, RunnerOutput};
 use nau::provision::hetzner::HetznerProvisioner;
-use nau::provision::publish::PublishChannel;
+use nau::provision::publish::{
+    issue_identities, issued_entry, pending_dir, pending_identities, PendingIdentity,
+    PublishChannel,
+};
 use nau::provision::{
-    append_worker_entry, now_epoch_secs, parse_ttl, render_user_data, ProvisionRequest,
-    Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN,
-    PLAN_PUBLISH_URL, SQUASHFS_TOOLS_RELEASE_DATE, SQUASHFS_TOOLS_SHA256,
+    append_worker_entry, issue_wait, issue_wait_nudge, now_epoch_secs, parse_ttl, render_user_data,
+    ProvisionRequest, Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END, PLAN_MACHINE_IDENTITY,
+    PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL, SQUASHFS_TOOLS_RELEASE_DATE, SQUASHFS_TOOLS_SHA256,
     SQUASHFS_TOOLS_TARBALL_URL, SQUASHFS_TOOLS_VERSION,
 };
 
@@ -1433,4 +1437,207 @@ fn user_data_picks_the_issued_certificate_up_on_first_boot() {
     // raw host key.
     assert!(user_data.contains("no certificate within the publish-token window (1440 x 60s)"));
     assert!(user_data.contains("the coordinator refuses this worker's raw host key"));
+}
+
+// ── `workers issue --wait` (#299) ──
+//
+// The publish/issue race: a guest publishes its host key 1-4 min after
+// server create, so a plain `workers issue` run right after provision
+// signs NOTHING. These tests pin the opt-in `--wait` semantics against a
+// scripted ssh-keygen fake and a pending store the test mutates
+// mid-wait — no network, no real guests.
+
+/// The machine identity the wait tests publish under.
+const WAIT_IDENTITY: &str = "nau-worker-def456-02";
+
+/// The CA public half as the fake harness sees it (the publish-store
+/// unit tests' fixture): a real-looking line on disk for `inspect`.
+const WAIT_CA_PUB: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOrZfC0rKJdBX8mUJIKdClRNKdVKmShWU8rjHfDrBKUM nau-host-ca";
+
+/// The CA halves on disk: the public half for `inspect` to fingerprint,
+/// the private half present so issuance believes it can sign.
+fn wait_ca_on_disk(home: &Path) {
+    std::fs::create_dir_all(nau::ca::ca_dir(home)).unwrap();
+    std::fs::write(nau::ca::ca_secret_path(home), "test-ca-secret").unwrap();
+    std::fs::write(nau::ca::ca_public_path(home), format!("{WAIT_CA_PUB}\n")).unwrap();
+}
+
+/// Drop one pending entry straight into the store — the state
+/// receive-publish leaves after an accepted guest POST, minus the token
+/// registry these tests never exercise. The instance identity carries an
+/// instance_id so the principal rule binds more than the machine name.
+fn seed_pending(home: &Path, identity: &str) {
+    std::fs::create_dir_all(pending_dir(home)).unwrap();
+    let entry = PendingIdentity {
+        machine_identity: identity.to_string(),
+        public_key: TEST_HOST_PUB.into(),
+        instance_identity: serde_json::json!({
+            "v1": { "instance_id": "i-wait", "cloud_name": "hetzner", "region": "hel1" }
+        }),
+        received_at_epoch: 1_000_000,
+        token_sha256: "fake-token-sha".into(),
+    };
+    let text = serde_json::to_string_pretty(&entry).unwrap();
+    std::fs::write(
+        pending_dir(home).join(format!("pending-{identity}.json")),
+        format!("{text}\n"),
+    )
+    .unwrap();
+}
+
+/// Plays `ssh-keygen` for the wait tests: answers `-lf` (CA
+/// fingerprint) and plays `-s` by writing the `<input>-cert.pub`
+/// sibling — the same script the publish-store unit tests use, minus
+/// the knobs these tests never touch. Records every argv.
+struct FakeSigner {
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+    sign_calls: Arc<Mutex<usize>>,
+}
+
+impl FakeSigner {
+    fn new() -> Self {
+        FakeSigner {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            sign_calls: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+}
+
+impl CommandRunner for FakeSigner {
+    fn run(&self, argv: &[String]) -> io::Result<RunnerOutput> {
+        self.calls.lock().unwrap().push(argv.to_vec());
+        if argv.contains(&"-lf".to_string()) {
+            return Ok(ok_out(&format!("256 {CA_FPR} nau-host-ca (ED25519)\n")));
+        }
+        if argv.iter().any(|a| a == "-s") {
+            let mut n = self.sign_calls.lock().unwrap();
+            *n += 1;
+            let k = *n;
+            drop(n);
+            let input = argv.last().unwrap();
+            std::fs::write(format!("{input}-cert.pub"), format!("fake-cert-{k}\n")).unwrap();
+            return Ok(ok_out(""));
+        }
+        panic!("unexpected program in test: {argv:?}")
+    }
+}
+
+#[test]
+fn wait_signs_once_the_publish_lands_mid_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    wait_ca_on_disk(home);
+    let fake = FakeSigner::new();
+
+    // Production: the guest publishes 1-4 min after create. Here the
+    // publish lands between two short polls of the waiter.
+    let inject_home = home.to_path_buf();
+    let injector = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        seed_pending(&inject_home, WAIT_IDENTITY);
+    });
+
+    let report = issue_wait(
+        &fake,
+        home,
+        "+48h",
+        false,
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        1_000_100,
+    )
+    .unwrap();
+    injector.join().unwrap();
+
+    assert_eq!(report.issued.len(), 1, "the landed publish got signed");
+    assert_eq!(report.issued[0].machine_identity, WAIT_IDENTITY);
+    assert_eq!(report.issued[0].cert, "fake-cert-1");
+    assert_eq!(report.issued[0].ca_fingerprint, CA_FPR);
+    assert!(
+        pending_identities(home).unwrap().is_empty(),
+        "a signed identity leaves the pending store"
+    );
+    assert!(
+        issued_entry(home, WAIT_IDENTITY).unwrap().is_some(),
+        "the issued record is durable — pickup can serve it"
+    );
+}
+
+#[test]
+fn wait_times_out_loud_when_no_publish_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    wait_ca_on_disk(home);
+    let fake = FakeSigner::new();
+
+    let err = issue_wait(
+        &fake,
+        home,
+        "+48h",
+        false,
+        Duration::from_millis(120),
+        Duration::from_millis(20),
+        1_000_100,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("issue --wait"), "named failure: {msg}");
+    assert!(msg.contains("timed out"), "names the ceiling: {msg}");
+    assert!(
+        msg.contains("never landed"),
+        "says the publish never landed: {msg}"
+    );
+    assert!(
+        msg.contains("no identity ever published"),
+        "names the empty waited-for set: {msg}"
+    );
+    assert_eq!(
+        fake.call_count(),
+        0,
+        "nothing was signed on the timeout path"
+    );
+}
+
+#[test]
+fn no_wait_signs_only_what_already_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let fake = FakeSigner::new();
+
+    // The unchanged explicit-trust posture: an empty store signs nothing
+    // and returns — it does not wait for the guest.
+    let report = issue_identities(&fake, home, None, "+48h", false, 1_000_100).unwrap();
+    assert!(report.issued.is_empty(), "signed nothing: {report:?}");
+
+    // A publish landing afterwards is NOT picked up — no waiter exists
+    // without --wait; the entry sits pending until an explicit run.
+    seed_pending(home, WAIT_IDENTITY);
+    assert_eq!(pending_identities(home).unwrap().len(), 1);
+    assert_eq!(
+        fake.call_count(),
+        0,
+        "the no-wait run never touches ssh-keygen for a store it cannot see into the future of"
+    );
+}
+
+#[test]
+fn provision_summary_nudges_issue_wait_when_unsigned_pending_remain() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    assert!(
+        issue_wait_nudge(home).is_none(),
+        "an empty pending store draws no nudge"
+    );
+
+    seed_pending(home, WAIT_IDENTITY);
+    let nudge = issue_wait_nudge(home).expect("unsigned pending — the nudge names the fix");
+    assert!(
+        nudge.contains("nau workers issue --wait"),
+        "the nudge names the exact remedy: {nudge}"
+    );
 }

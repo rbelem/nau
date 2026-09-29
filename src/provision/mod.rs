@@ -43,8 +43,15 @@ pub mod publish;
 pub mod scaleway;
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::cli::WorkersCommand;
+
+/// `--wait` cadence and default ceiling (#299): guests publish their host
+/// key 1-4 min after server create (boot + binary download); ten minutes
+/// covers a slow boot without hanging the operator's shell forever.
+pub const ISSUE_WAIT_DEFAULT_TIMEOUT_SECS: u64 = 600;
+pub const ISSUE_WAIT_POLL: Duration = Duration::from_secs(5);
 
 /// The default nau binary URL the template installs: the project
 /// release artifact for the running version. Override with
@@ -244,7 +251,17 @@ pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
             validity,
             force,
             json,
-        } => issue_main(home, identity.as_deref(), &validity, force, json),
+            wait,
+            timeout,
+        } => issue_main(
+            home,
+            identity.as_deref(),
+            &validity,
+            force,
+            json,
+            wait,
+            timeout,
+        ),
         WorkersCommand::Pickup { home } => pickup_main(home),
     }
 }
@@ -256,7 +273,9 @@ fn provision_main(
     req: ProvisionRequest,
     publish: Option<publish::PublishChannel>,
 ) -> miette::Result<()> {
-    let provisioner = provider_for(provider, publish)?;
+    // The nudge below reads the pending store after the run, so the
+    // channel clones into the provider (which stores it).
+    let provisioner = provider_for(provider, publish.clone())?;
     let workers = provisioner.provision(&req)?;
     for w in &workers {
         crate::output::ok(format!(
@@ -265,6 +284,15 @@ fn provision_main(
             address = w.address,
             fingerprint = w.host_key.chars().take(24).collect::<String>()
         ));
+    }
+    // The #299 race made visible: a pending entry visible NOW was
+    // published during the run and is still unsigned — name the fix in
+    // the summary instead of letting the operator discover the silent
+    // no-op after the guests give up polling.
+    if let Some(channel) = &publish {
+        if let Some(nudge) = issue_wait_nudge(&channel.home) {
+            crate::output::info(nudge);
+        }
     }
     Ok(())
 }
@@ -344,19 +372,14 @@ fn issue_main(
     validity: &str,
     force: bool,
     json: bool,
+    wait: bool,
+    timeout_secs: u64,
 ) -> miette::Result<()> {
     crate::output::set_mode(json);
     let home = home
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())));
-    let report = publish::issue_identities(
-        &crate::command::RealRunner,
-        &home,
-        identity,
-        validity,
-        force,
-        now_epoch_secs()?,
-    )?;
+    let report = run_issue(&home, identity, validity, force, wait, timeout_secs)?;
     for issued in &report.issued {
         crate::output::ok(format!(
             "issued host certificate for '{id}' — principals [{principals}], validity \
@@ -399,6 +422,48 @@ fn issue_main(
     Ok(())
 }
 
+/// The issue run behind the report: one batch over the pending store, or
+/// the `--wait` polling loop when the operator asked to wait publishes
+/// out (#299).
+fn run_issue(
+    home: &Path,
+    identity: Option<&str>,
+    validity: &str,
+    force: bool,
+    wait: bool,
+    timeout_secs: u64,
+) -> miette::Result<publish::IssueReport> {
+    // --wait waits for publishes that have not landed; --identity names
+    // one that has. The combination has no single meaning — refuse it
+    // rather than guess which window the operator meant.
+    if wait && identity.is_some() {
+        return Err(miette::miette!(
+            "issue: --wait and --identity do not combine — --wait signs every identity \
+             published during the window; name one machine only after its publish landed \
+             (the pending store lists what is signable now)"
+        ));
+    }
+    if wait {
+        return issue_wait(
+            &crate::command::RealRunner,
+            home,
+            validity,
+            force,
+            Duration::from_secs(timeout_secs),
+            ISSUE_WAIT_POLL,
+            now_epoch_secs()?,
+        );
+    }
+    publish::issue_identities(
+        &crate::command::RealRunner,
+        home,
+        identity,
+        validity,
+        force,
+        now_epoch_secs()?,
+    )
+}
+
 /// The `pickup` verb body: the GET half of the publish callback URL.
 /// Bearer in `NAU_PUBLISH_TOKEN` (the same one-time token the guest
 /// published under); the certificate goes to STDOUT — pure certificate
@@ -426,6 +491,81 @@ fn pickup_main(home: Option<String>) -> miette::Result<()> {
     ));
     println!("{}", issued.cert);
     Ok(())
+}
+
+/// The `--wait` polling loop (#299): sign every identity the guests
+/// publish within the window. The pending store is re-read each poll, so
+/// a publish that lands after the run started is still signed — that is
+/// the provision→issue race. Exits once every identity observed so far is
+/// resolved (signed, or deliberately skipped as already issued); the
+/// timeout is a LOUD named failure naming the waited-for identities,
+/// never a silent nothing-signed.
+pub fn issue_wait(
+    runner: &dyn crate::command::CommandRunner,
+    home: &Path,
+    validity: &str,
+    force: bool,
+    timeout: Duration,
+    poll: Duration,
+    now_epoch: u64,
+) -> miette::Result<publish::IssueReport> {
+    let deadline = Instant::now() + timeout;
+    let mut report = publish::IssueReport::default();
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        for entry in publish::pending_identities(home)? {
+            if !seen.contains(&entry.machine_identity) {
+                seen.push(entry.machine_identity);
+            }
+        }
+        let batch = publish::issue_identities(runner, home, None, validity, force, now_epoch)?;
+        report.issued.extend(batch.issued);
+        report.skipped.extend(batch.skipped);
+        if !seen.is_empty() && wait_all_resolved(&seen, &report) {
+            return Ok(report);
+        }
+        if Instant::now() >= deadline {
+            let waited = if seen.is_empty() {
+                "no identity ever published".to_string()
+            } else {
+                format!("identities waited for: [{}]", seen.join(", "))
+            };
+            return Err(miette::miette!(
+                "issue --wait: timed out after {secs}s — {waited}; the guest publish never \
+                 landed in {dir} (guests publish 1-4 min after server create — check the \
+                 guest's publish attempt and the front's receive-publish wiring)",
+                secs = timeout.as_secs(),
+                dir = publish::pending_dir(home).display()
+            ));
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// True when every identity the wait observed is accounted for in the
+/// report — signed, or skipped as already issued (`--force` not given).
+fn wait_all_resolved(seen: &[String], report: &publish::IssueReport) -> bool {
+    seen.iter().all(|name| {
+        report.issued.iter().any(|i| i.machine_identity == *name)
+            || report.skipped.iter().any(|s| s == name)
+    })
+}
+
+/// The end-of-provision nudge (#299): when the pending store already
+/// holds unsigned identities, name `nau workers issue --wait` in the
+/// summary — the moment the operator still remembers the publish/issue
+/// race exists. Best-effort: an unreadable store skips the line, because
+/// issuance itself fails closed on the same corruption and the provision
+/// pins are already durable.
+pub fn issue_wait_nudge(home: &Path) -> Option<String> {
+    let pending = publish::pending_identities(home).ok()?;
+    let count = pending.len();
+    (!pending.is_empty()).then(|| {
+        format!(
+            "{count} published host key(s) awaiting a signature — run \
+             'nau workers issue --wait' to sign each as its publish lands"
+        )
+    })
 }
 
 /// The destroy summary line. An absent managed entry is reported honestly:

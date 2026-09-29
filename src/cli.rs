@@ -935,6 +935,24 @@ pub enum WorkersCommand {
         #[arg(long)]
         force: bool,
 
+        /// Wait for guest publishes that have not landed yet (#299):
+        /// poll the pending store and sign each identity as its publish
+        /// lands, instead of signing only what is already pending. The
+        /// provision→issue race fix; opt-in, so ADR-0045's
+        /// explicit-trust posture is unchanged without it.
+        #[arg(long)]
+        wait: bool,
+
+        /// `--wait` ceiling in seconds: how long to keep polling for
+        /// publishes before failing loudly (guests publish 1-4 min
+        /// after server create).
+        #[arg(
+            long,
+            default_value_t = crate::provision::ISSUE_WAIT_DEFAULT_TIMEOUT_SECS,
+            requires = "wait"
+        )]
+        timeout: u64,
+
         /// Output structured JSON instead of human-friendly output.
         #[arg(long)]
         json: bool,
@@ -3036,7 +3054,7 @@ mod tests {
     #[test]
     fn test_workers_issue_and_pickup_parse() {
         // Defaults: all pending identities, the 48h default validity, no
-        // force.
+        // force, no wait (the #299 race fix is opt-in).
         match Cli::try_parse_from(["nau", "workers", "issue"])
             .unwrap()
             .command
@@ -3048,6 +3066,8 @@ mod tests {
                         identity,
                         validity,
                         force,
+                        wait,
+                        timeout,
                         json,
                     },
             } => {
@@ -3058,6 +3078,8 @@ mod tests {
                     crate::provision::publish::HOST_CERT_VALIDITY_DEFAULT
                 );
                 assert!(!force);
+                assert!(!wait);
+                assert_eq!(timeout, crate::provision::ISSUE_WAIT_DEFAULT_TIMEOUT_SECS);
                 assert!(!json);
             }
             _ => panic!("expected Workers Issue"),
@@ -3073,6 +3095,9 @@ mod tests {
             "--validity",
             "+2d12h",
             "--force",
+            "--wait",
+            "--timeout",
+            "30",
             "--json",
         ])
         .unwrap()
@@ -3085,6 +3110,8 @@ mod tests {
                         identity,
                         validity,
                         force,
+                        wait,
+                        timeout,
                         json,
                     },
             } => {
@@ -3092,6 +3119,8 @@ mod tests {
                 assert_eq!(identity.as_deref(), Some("nau-worker-abc123-01"));
                 assert_eq!(validity, "+2d12h");
                 assert!(force);
+                assert!(wait);
+                assert_eq!(timeout, 30);
                 assert!(json);
             }
             _ => panic!("expected Workers Issue with flags"),
