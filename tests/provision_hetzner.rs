@@ -475,15 +475,18 @@ fn user_data_installs_the_pinned_prebuilt_squashfs_artifact() {
     // Pin 1 (#300): the per-worker source build is GONE — the two
     // prebuilt binaries ride the artifact URL (same publish front as the
     // worker binary), are checked against the COMPILED-IN hashes, are
-    // cp -a'd to /usr/local/bin (PATH-precedence over the distro's
-    // 4.6.1), and a version assert so a drifted artifact fails
-    // provisioning instead of joining the fleet.
+    // install -m 0755'd to /usr/local/bin (PATH-precedence over the
+    // distro's 4.6.1; 0755 — #306: curl -o lands 0644 and cp -a kept it,
+    // so the version check died on Permission denied), and a version
+    // assert so a drifted artifact fails provisioning instead of joining
+    // the fleet.
     assert!(user_data.contains(MKSQUASHFS_ARTIFACT_SHA256));
     assert!(user_data.contains(UNSQUASHFS_ARTIFACT_SHA256));
     assert!(user_data.contains("sha256sum -c"));
     assert!(user_data.contains("-o mksquashfs"));
     assert!(user_data.contains("-o unsquashfs"));
-    assert!(user_data.contains("cp -a mksquashfs unsquashfs /usr/local/bin/"));
+    // The exec bit lands on BOTH pin binaries before the version gate.
+    assert!(user_data.contains("install -m 0755 mksquashfs unsquashfs /usr/local/bin/"));
     // The EXACT version gate: version AND release date, proving the
     // artifact is the pinned build and not a codeload-hash build.
     assert!(user_data.contains(&format!(
@@ -512,7 +515,7 @@ fn user_data_verifies_the_prebuilt_hashes_before_anything_installs() {
     });
     // Fail-closed order (#300): fetch → hash-check against the
     // compiled-in consts → install. Nothing runs between the fetch and
-    // the hash gate; the cp leg only executes after both binaries
+    // the hash gate; the install leg only executes after both binaries
     // verified.
     let fetch = user_data
         .find("curl -fsSL")
@@ -521,11 +524,51 @@ fn user_data_verifies_the_prebuilt_hashes_before_anything_installs() {
         .find("sha256sum -c")
         .expect("the compiled-in hash gate");
     let install = user_data
-        .find("cp -a mksquashfs unsquashfs")
+        .find("install -m 0755 mksquashfs unsquashfs")
         .expect("the install leg");
     assert!(
         fetch < check && check < install,
         "nothing may run or install before the hash gate"
+    );
+}
+
+#[test]
+fn user_data_download_legs_ride_the_publish_retry_budget() {
+    let user_data = render_user_data(&UserDataParams {
+        machine_identity: PLAN_MACHINE_IDENTITY,
+        publish_url: PLAN_PUBLISH_URL,
+        publish_token: PLAN_PUBLISH_TOKEN,
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: MARKER_EPOCH,
+    });
+    // #306: a single-shot download curl was one early-boot TLS flap from
+    // a dead worker (error 35 ×5-8, self-healing — the publish script's
+    // own loop survived the same flap). All THREE download legs (nau,
+    // mksquashfs, unsquashfs) now carry the publish pattern's 10×/4s
+    // loop, break on success, and fail closed: the bare `[ "$i" -lt 10 ]`
+    // after each loop is non-zero under `set -e` once the budget is
+    // exhausted.
+    assert!(
+        user_data.contains(&format!(
+            "if curl -fsSL {BINARY_URL} -o /usr/local/bin/nau; then break; fi"
+        )),
+        "the nau binary leg lost its retry loop"
+    );
+    assert!(
+        user_data.contains("-o mksquashfs; then break; fi"),
+        "the mksquashfs leg lost its retry loop"
+    );
+    assert!(
+        user_data.contains("-o unsquashfs; then break; fi"),
+        "the unsquashfs leg lost its retry loop"
+    );
+    // One fail-closed exhaustion gate per download leg (the publish
+    // script's own bounded loop exits 0 by design and never matches).
+    assert_eq!(
+        user_data.matches("; [ \"$i\" -lt 10 ]").count(),
+        3,
+        "each download leg must exit non-zero when the retry budget is exhausted"
     );
 }
 
