@@ -930,6 +930,10 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> FarmJob for Rem
                 result,
                 sync: Duration::ZERO,
                 total: Duration::ZERO,
+                // No fine legs on a manifest-cache hit (#309).
+                prep: Duration::ZERO,
+                run: Duration::ZERO,
+                collect: Duration::ZERO,
             }),
             Ok(None) => {
                 let stage = self

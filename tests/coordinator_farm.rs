@@ -1704,6 +1704,9 @@ fn farm_ingest_builds_the_json_event_shape() {
         cache_hit: false,
         sync: std::time::Duration::ZERO,
         total: std::time::Duration::ZERO,
+        prep: std::time::Duration::ZERO,
+        run: std::time::Duration::ZERO,
+        collect: std::time::Duration::ZERO,
         result: JobResult {
             protocol_version: WORKER_PROTOCOL_VERSION,
             package: "app".into(),

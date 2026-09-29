@@ -1396,6 +1396,13 @@ fn second_identical_dispatch_is_a_cache_hit_that_transfers_nothing() {
         after_first,
         "zero channel activity on the cache hit"
     );
+    // #309: no channel activity — no fine legs, even though the wall is
+    // real time.
+    assert_eq!(
+        second.prep + second.sync + second.run + second.collect,
+        std::time::Duration::ZERO,
+        "a cache hit carries zero fine legs"
+    );
     assert_eq!(second.result.artifacts.len(), first.result.artifacts.len());
     let (second_hashes, first_hashes) = (
         second
@@ -1527,6 +1534,83 @@ fn all_objects_held_means_no_transfer_at_all() {
             .is_some_and(|c| c.contains("__worker-job"))),
         "the job ran"
     );
+}
+
+/// The fine legs (#309): a real dispatch decomposes the fixed
+/// per-dispatch cost into prep (preflight + job dir), sync (delta),
+/// run (the job ssh), collect (ingest + persist + cleanup) — each
+/// nonzero on channel activity, together bounded by the dispatch wall.
+#[test]
+fn dispatch_reports_the_fine_timing_legs() {
+    let (sha_a, blob_a, sha_b, blob_b) = blob_pair();
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", b"artifact");
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    preseed_object(machine.path(), &sha_a, &blob_a);
+    let ex = executor(fake, cache.path());
+
+    let payload = tempfile::tempdir().unwrap();
+    std::fs::write(payload.path().join(&sha_a), &blob_a).unwrap();
+    std::fs::write(payload.path().join(&sha_b), &blob_b).unwrap();
+    let manifest = blob_manifest(&[(&sha_a, "dep:dep-a"), (&sha_b, "dep:dep-b")]);
+    let outcome = ex
+        .dispatch(&manifest, payload.path())
+        .expect("delta dispatch");
+
+    assert!(
+        outcome.prep > std::time::Duration::ZERO,
+        "prep (preflight + job dir) is a real leg: {outcome:?}"
+    );
+    assert!(
+        outcome.run > std::time::Duration::ZERO,
+        "run (the job ssh) is a real leg: {outcome:?}"
+    );
+    assert!(
+        outcome.collect > std::time::Duration::ZERO,
+        "collect (ingest + persist + cleanup) is a real leg: {outcome:?}"
+    );
+    assert!(
+        outcome.prep + outcome.sync + outcome.run + outcome.collect <= outcome.total,
+        "the legs are bounded by the dispatch wall: {outcome:?}"
+    );
+}
+
+/// The multiplexing options ride EVERY spawned ssh and scp (#309): the
+/// measured ~19s fixed cost is ~11 fresh handshakes per dispatch, and
+/// one master per destination collapses them to one.
+#[test]
+fn ssh_and_scp_argv_carry_the_connection_multiplexing() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let (result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", b"artifact");
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    let calls = fake.calls_handle();
+    let ex = executor(fake, cache.path());
+    ex.dispatch(&hello_manifest(), tempfile::tempdir().unwrap().path())
+        .expect("dispatch");
+
+    let calls = calls.lock().unwrap();
+    for program in ["ssh", "scp"] {
+        let argv = calls
+            .iter()
+            .find(|a| a[0] == program)
+            .unwrap_or_else(|| panic!("a {program} call rides the channel"));
+        for opt in [
+            "ControlMaster=auto",
+            "ControlPersist=600",
+            "ControlPath=~/.ssh/nau-cm-%C",
+        ] {
+            assert!(
+                argv.contains(&opt.to_string()),
+                "{program} carries {opt}: {argv:?}"
+            );
+        }
+    }
 }
 
 /// The built artifact outlives the job dir (#307): collect hardlinks it
