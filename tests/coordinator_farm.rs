@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nau::build_sched::{
-    run_ready_set_farm, short_worker_name, ExecutorKind, FarmExecutor, FarmJob, JobCaps,
-    JobFailure, ManifestSource, RemoteExecutor,
+    placement_blind_clause, run_ready_set_farm, short_worker_name, ExecutorKind, FarmExecutor,
+    FarmJob, JobCaps, JobFailure, ManifestSource, RemoteExecutor,
 };
 use nau::command::{CommandRunner, RunnerOutput};
 use nau::coordinator::{farm_build_result, preflight_farm_workers, FarmSource, NodeJobPlan};
@@ -566,10 +566,60 @@ fn unknown_store_falls_back_cleanly() {
     assert_eq!(members[1].calls(), 1, "{events:?}");
 }
 
-/// Eligibility stays the gate: a member holding a node's objects but
-/// incapable of its arch never takes it — the capable (cold) member
-/// does. This is the loss re-dispatch invariant too: preference
-/// reorders picks inside [`farm_eligible`], never past it.
+// ── Placement-banner blindness clause (#307) ──
+
+/// The banner names a WORKER whose store is Unknown (#307): the probe
+/// failed or never ran, so holder preference cannot bind for it and
+/// placement fails open — silently, which is how #303 hid in window 4.
+/// Not named: a populated store, and the local slots (their `None` is
+/// the trait default — locals sit outside holder consideration).
+#[test]
+fn blind_banner_names_only_the_store_unknown_worker() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let blind = FakeMember::worker("nuci.local", 1, None, events.clone());
+    let known = FakeMember::worker("ccx23", 1, None, events.clone()).holds(&["sha-dep2"]);
+    let local = FakeMember::local(1, events.clone());
+    let members = vec![blind, known, local];
+    assert_eq!(
+        placement_blind_clause(&farm(&members)),
+        " (store unknown: nuci.local — no holder preference for them)",
+        "exactly the unknown worker is named"
+    );
+}
+
+/// A known store — populated or empty — never renders the clause: a
+/// fresh worker legitimately holds nothing, and the happy path stays
+/// silent (#307).
+#[test]
+fn blind_banner_silent_when_stores_are_known() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let empty = FakeMember::worker("box", 1, None, events.clone()).holds(&[]);
+    let populated = FakeMember::worker("ccx23", 1, None, events.clone()).holds(&["sha-dep2"]);
+    let local = FakeMember::local(1, events.clone());
+    let members = vec![empty, populated, local];
+    assert_eq!(
+        placement_blind_clause(&farm(&members)),
+        "",
+        "empty-but-known is not blindness; no clause, no noise"
+    );
+}
+
+/// A multi-worker mix renders each blind member exactly once, in pool
+/// order; known members and the local slots stay unnamed (#307).
+#[test]
+fn blind_banner_renders_each_blind_member_once() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let blind_a = FakeMember::worker("nuci.local", 1, None, events.clone());
+    let known = FakeMember::worker("ccx23", 1, None, events.clone()).holds(&[]);
+    let blind_b = FakeMember::worker("worker-b", 1, None, events.clone());
+    let local = FakeMember::local(1, events.clone());
+    let members = vec![blind_a, known, blind_b, local];
+    assert_eq!(
+        placement_blind_clause(&farm(&members)),
+        " (store unknown: nuci.local, worker-b — no holder preference for them)",
+        "each blind member once, pool order"
+    );
+}
 #[test]
 fn holder_preference_never_overrides_eligibility() {
     let events = Arc::new(Mutex::new(Vec::new()));
