@@ -1425,31 +1425,6 @@ fn run_farm(
         runner: nau::command::RealRunner,
     });
 
-    if !ctx.json {
-        let roster: Vec<String> = workers
-            .workers
-            .iter()
-            .map(|w| {
-                let arch = w
-                    .arch
-                    .as_deref()
-                    .map(|a| format!(", {a}"))
-                    .unwrap_or_default();
-                format!(
-                    "{} ({} job{}){arch}",
-                    w.address,
-                    w.jobs,
-                    if w.jobs == 1 { "" } else { "s" }
-                )
-            })
-            .collect();
-        nau::output::status(format!(
-            "farm: {} worker(s): {} — placement by arch, then store preference, then ready-set order",
-            workers.workers.len(),
-            roster.join(", ")
-        ));
-    }
-
     let local = nau::build_sched::Slotted {
         exec: nau::build_sched::LocalExecutor::new(|name| ctx.run(name)),
         slots: workers.local_jobs as usize,
@@ -1480,6 +1455,35 @@ fn run_farm(
                 declared_arch: w.arch.clone(),
             },
         });
+    }
+
+    // The banner needs the assembled pool: the blind clause names
+    // store-unknown worker members (#307 — fail-open placement must be
+    // visible, not silent).
+    if !ctx.json {
+        let roster: Vec<String> = workers
+            .workers
+            .iter()
+            .map(|w| {
+                let arch = w
+                    .arch
+                    .as_deref()
+                    .map(|a| format!(", {a}"))
+                    .unwrap_or_default();
+                format!(
+                    "{} ({} job{}){arch}",
+                    w.address,
+                    w.jobs,
+                    if w.jobs == 1 { "" } else { "s" }
+                )
+            })
+            .collect();
+        nau::output::status(format!(
+            "farm: {} worker(s): {} — placement by arch, then store preference, then ready-set order{}",
+            workers.workers.len(),
+            roster.join(", "),
+            nau::build_sched::placement_blind_clause(&farm)
+        ));
     }
 
     Ok(nau::build_sched::run_ready_set_farm(
