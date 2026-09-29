@@ -67,20 +67,21 @@ impl<R: CommandRunner> FarmSource<'_, R> {
             miette::miette!("farm job: dep '{name}' has no preloaded meta — plan gap")
         })?;
         let filename = format!("{name}_{}_{}.snap", meta.version, arch);
-        let in_output = self.output_dir.join(&filename);
-        if in_output.exists() {
-            return Ok(in_output);
-        }
-        if let (Some(cache), Some(closure)) = (self.pkg_cache, self.dep_closures.get(name)) {
-            if let Some(cached) = cache.lookup(meta, arch, closure) {
-                return Ok(cached);
-            }
-        }
-        Err(miette::miette!(
-            "farm job: dep payload '{filename}' is neither in {} nor in the binary cache — \
-             the scheduler builds deps before dependents, so this is a plan gap",
-            self.output_dir.display()
-        ))
+        resolved_dep_payload(
+            name,
+            arch,
+            &self.dep_metas,
+            &self.dep_closures,
+            self.output_dir,
+            self.pkg_cache,
+        )
+        .ok_or_else(|| {
+            miette::miette!(
+                "farm job: dep payload '{filename}' is neither in {} nor in the binary cache — \
+                 the scheduler builds deps before dependents, so this is a plan gap",
+                self.output_dir.display()
+            )
+        })
     }
 
     /// The pin a source must ship under: the lockfile's recorded hash
@@ -371,6 +372,66 @@ pub fn plan_objects(plan: &NodeJobPlan, lockfile: &LockFile) -> BTreeSet<String>
         .collect()
 }
 
+/// Where a dep's payload resolves: the run's output dir first (built
+/// earlier in this run, local or remote alike), then the binary cache
+/// (a dep fully cached before the run started). `None` when
+/// unresolvable — dispatch refuses, named; plan-time placement just
+/// contributes nothing. The ONE resolution both the manifest and the
+/// placement caps go through, so store keys and capability keys agree
+/// by construction.
+fn resolved_dep_payload(
+    name: &str,
+    arch: &str,
+    dep_metas: &HashMap<String, SnapMeta>,
+    dep_closures: &HashMap<String, crate::cache::BuildClosure>,
+    output_dir: &Path,
+    pkg_cache: Option<&crate::cache::PackageCache>,
+) -> Option<PathBuf> {
+    let meta = dep_metas.get(name)?;
+    let filename = format!("{name}_{}_{}.snap", meta.version, arch);
+    let in_output = output_dir.join(&filename);
+    if in_output.exists() {
+        return Some(in_output);
+    }
+    let closure = dep_closures.get(name)?;
+    let cache = pkg_cache?;
+    cache.lookup(meta, arch, closure)
+}
+
+/// The full placement-known object set of one RESOLVED plan (#303 +
+/// #307): the source pins ([`plan_objects`]) plus the dep closure's
+/// RESOLVED payload hashes — the same sha256 the manifest's `dep:<pkg>`
+/// objects carry and the worker store now persists
+/// (`SshExecutor::persist_result_objects`), so on a warm rerun the
+/// preference has something to match. An unresolvable dep (still to be
+/// built this run) contributes nothing: placement only aims, delta_sync
+/// stays the authority.
+pub fn placement_objects(
+    plan: &NodeJobPlan,
+    lockfile: &LockFile,
+    dep_metas: &HashMap<String, SnapMeta>,
+    dep_closures: &HashMap<String, crate::cache::BuildClosure>,
+    output_dir: &Path,
+    pkg_cache: Option<&crate::cache::PackageCache>,
+) -> BTreeSet<String> {
+    let mut objects = plan_objects(plan, lockfile);
+    for dep in &plan.deps {
+        if let Some(path) = resolved_dep_payload(
+            dep,
+            &plan.arch,
+            dep_metas,
+            dep_closures,
+            output_dir,
+            pkg_cache,
+        ) {
+            if let Ok(bytes) = std::fs::read(&path) {
+                objects.insert(crate::oci::sha256_hex(&bytes));
+            }
+        }
+    }
+    objects
+}
+
 /// Resolve every node's remote-job plan up front, on the orchestrator
 /// thread: the recipe slice, the transitive dep payload specs (each
 /// dep's meta evaluated once, sequentially — the evals never run on
@@ -382,6 +443,8 @@ pub fn precompute_farm_plans(
     metas: &BTreeMap<String, SnapMeta>,
     cli_archs: &[String],
     lockfile: &LockFile,
+    output_dir: &Path,
+    pkg_cache: Option<&crate::cache::PackageCache>,
 ) -> miette::Result<FarmPlans> {
     let mut plans = HashMap::new();
     let mut dep_metas: HashMap<String, SnapMeta> = HashMap::new();
@@ -408,10 +471,21 @@ pub fn precompute_farm_plans(
             &mut dep_closures,
         );
         let local_only = multi_arch || all_only || plan.is_err();
-        // The placement-known objects (#303) — see [`plan_objects`].
+        // The placement-known objects (#303) — see [`plan_objects`] for
+        // the source pins; #307 adds the dep closure's resolved payload
+        // hashes, the keys the worker store persists.
         let objects = plan
             .as_ref()
-            .map(|p| plan_objects(p, lockfile))
+            .map(|p| {
+                placement_objects(
+                    p,
+                    lockfile,
+                    &dep_metas,
+                    &dep_closures,
+                    output_dir,
+                    pkg_cache,
+                )
+            })
             .unwrap_or_default();
         if let Ok(p) = plan {
             plans.insert(name.clone(), p);
