@@ -259,7 +259,24 @@ pub struct SshExecutor<R: CommandRunner> {
     /// `-o IdentitiesOnly=yes -i <path>`; `None` = nothing resolved, no
     /// `-i` (ssh's ambient behavior, unchanged).
     identity: Mutex<Option<PathBuf>>,
+    /// The worker's object-store listing, learned at preflight (#303).
+    /// `Unprobed` until the first preflight; `Known(None)` = the listing
+    /// failed — the store reads as UNKNOWN, placement cannot prefer this
+    /// worker, and delta_sync at dispatch remains the correctness
+    /// authority. Fail-open for PLACEMENT is the deliberate exception to
+    /// the transport's fail-closed rule: a store listing says where a
+    /// payload may be skipped, never whether a build may run.
+    store: Mutex<StoreProbe>,
     dispatches: AtomicUsize,
+}
+
+/// The preflight store probe's state (#303): probed exactly once per
+/// executor per process — the first preflight (the farm's, before
+/// anything dispatches) pays the one listing; later dispatch preflights
+/// reuse it.
+enum StoreProbe {
+    Unprobed,
+    Known(Option<BTreeSet<String>>),
 }
 
 impl<R: CommandRunner> SshExecutor<R> {
@@ -306,6 +323,7 @@ impl<R: CommandRunner> SshExecutor<R> {
             ceremony_home: ceremony_home.to_path_buf(),
             host_key_alias: Mutex::new(None),
             identity: Mutex::new(None),
+            store: Mutex::new(StoreProbe::Unprobed),
             dispatches: AtomicUsize::new(0),
         })
     }
@@ -822,7 +840,27 @@ impl<R: CommandRunner> SshExecutor<R> {
                 checks.min_free_disk
             ));
         }
+        // The store probe (#303): one cheap listing per worker per
+        // process, riding the channel preflight opened anyway. A failed
+        // listing never fails the worker — an unlistable store just
+        // reads as "unknown" and placement cannot prefer it (fail-open
+        // for PLACEMENT; delta_sync at dispatch stays the correctness
+        // authority).
+        let mut probe = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*probe, StoreProbe::Unprobed) {
+            *probe = StoreProbe::Known(self.held_objects().ok());
+        }
         Ok(cap)
+    }
+
+    /// The store listing preflight learned (#303): `None` = unknown —
+    /// no preflight ran yet, or the listing failed. Placement may only
+    /// prefer this worker on `Some`.
+    pub fn store_held(&self) -> Option<BTreeSet<String>> {
+        match &*self.store.lock().unwrap_or_else(|e| e.into_inner()) {
+            StoreProbe::Known(held) => held.clone(),
+            StoreProbe::Unprobed => None,
+        }
     }
 
     /// A result already ingested under this manifest's identity — served
@@ -979,7 +1017,7 @@ impl<R: CommandRunner> SshExecutor<R> {
                 ));
             }
         }
-        let held = self.held_objects()?;
+        let held = self.held_objects().wrap_err("delta sync")?;
         let claimed: Vec<&str> = wanted.intersection(&held).map(String::as_str).collect();
         self.verify_claimed(&claimed)?;
         let missing: Vec<&str> = wanted.difference(&held).map(String::as_str).collect();
@@ -994,7 +1032,7 @@ impl<R: CommandRunner> SshExecutor<R> {
     fn held_objects(&self) -> miette::Result<BTreeSet<String>> {
         let stdout = self
             .run_ssh(&format!("ls {REMOTE_BASE}/objects 2>/dev/null || true"))
-            .wrap_err("delta sync: cannot list the worker's objects")?;
+            .wrap_err("cannot list the worker's object store")?;
         Ok(stdout
             .lines()
             .map(str::trim)

@@ -31,12 +31,14 @@
 //! The farm pool (T5): with a declared `workers` table the same ready
 //! set schedules across the coordinator's slots and one SSH channel per
 //! worker ([`run_ready_set_farm`], [`RemoteExecutor`]). Placement is
-//! capability match then ready-set order; failure classes split per
+//! capability match, then a worker already holding the node's known
+//! closure objects (#303 — a warm store saves a payload ship), then
+//! ready-set order; failure classes split per
 //! ADR-0040 Amendment 1 — a build failure stops the world named, a lost
 //! worker's job re-dispatches to any eligible executor (local slots
 //! included) and stops the run only when no eligible executor remains.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -233,6 +235,14 @@ pub struct JobCaps {
     /// only the coordinator's own slots take it, exactly as it built
     /// before the farm existed.
     pub local_only: bool,
+    /// The closure objects placement KNOWS at schedule time (#303): the
+    /// pinned source blobs, whose hashes resolve at plan time. Dep
+    /// payload hashes do not exist until their deps build (the payload
+    /// is hashed from the built snap), so they stay outside this set —
+    /// it aims placement only, and delta_sync at dispatch remains the
+    /// correctness authority. Empty = nothing to hold: every worker
+    /// qualifies vacuously (today's behavior).
+    pub objects: BTreeSet<String>,
 }
 
 /// How the scheduler sees one pool member. Placement rules read the
@@ -281,6 +291,15 @@ pub trait FarmJob: Sync {
     /// jobs are not phase-timed (nothing changed for them).
     fn job_timings(&self) -> Vec<JobTiming> {
         Vec::new()
+    }
+
+    /// The store listing this member's preflight learned (#303): `None`
+    /// = store unknown — placement cannot prefer the member. The default
+    /// keeps the local slots out of holder consideration (they read the
+    /// coordinator's own store; placement leaves local exactly as it
+    /// was) and store-blind test fakes on today's behavior.
+    fn store_held(&self) -> Option<BTreeSet<String>> {
+        None
     }
 }
 
@@ -394,7 +413,11 @@ fn farm_eligible(
 ///
 /// Readiness, ready-set ordering, and the stop-the-world sets are the
 /// single-executor scheduler's, unchanged. Placement adds the
-/// capability match of [`farm_eligible`]. Failure classes per
+/// capability match of [`farm_eligible`] and, inside it, the holder
+/// preference (#303): a member takes an eligible node it already holds
+/// over an unheld one — a warm store saves a payload ship; when nobody
+/// holds everything, nobody is preferred, and ready-set order rules as
+/// before. Failure classes per
 /// ADR-0040 Amendment 1: `JobFailure::Build` stops the world named;
 /// `JobFailure::Lost` marks the executor dead, re-queues its job at
 /// the front, and stops the world only when no alive executor is
@@ -431,6 +454,7 @@ pub fn run_ready_set_farm(
         lost: Vec::new(),
         alive: vec![true; farm.len()],
         redispatches: vec![0; names.len()],
+        held: farm.iter().map(|fe| fe.job.store_held()).collect(),
     };
     for (i, name) in names.iter().enumerate() {
         let mut seen: HashSet<&str> = HashSet::new();
@@ -485,23 +509,25 @@ pub fn run_ready_set_farm(
                         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                         'take: loop {
                             if !s.stop {
-                                // Capability match, then ready-set order:
-                                // front-to-back scan, first eligible wins.
-                                let mut k = 0;
-                                while k < s.ready.len() {
-                                    let i = s.ready[k];
-                                    if s.done[i] {
-                                        s.ready.remove(k);
-                                        s.queued[i] = false;
-                                        continue;
-                                    }
-                                    if farm_eligible(farm, &s.alive, &node_caps, e, i) {
-                                        s.ready.remove(k);
-                                        s.queued[i] = false;
-                                        s.running += 1;
-                                        break 'take Some(i);
-                                    }
-                                    k += 1;
+                                // Placement: holder preference inside the
+                                // eligibility gate, ready-set order breaking
+                                // every tie (#303). The split borrow lets
+                                // pick_ready prune the queue and read the
+                                // held set in one call.
+                                let sref = &mut *s;
+                                if let Some((k, i)) = pick_ready(
+                                    farm,
+                                    &sref.alive,
+                                    &node_caps,
+                                    e,
+                                    sref.held[e].as_ref(),
+                                    &mut sref.ready,
+                                    &sref.done,
+                                ) {
+                                    s.ready.remove(k);
+                                    s.queued[i] = false;
+                                    s.running += 1;
+                                    break 'take Some(i);
                                 }
                             }
                             if s.stop {
@@ -554,7 +580,17 @@ pub fn run_ready_set_farm(
                     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                     s.running -= 1;
                     match outcome {
-                        Ok(()) => farm_mark_complete(&mut s, i),
+                        Ok(()) => {
+                            farm_mark_complete(&mut s, i);
+                            // The dispatch just left the node's objects in
+                            // this worker's store (#303): keep placement
+                            // current — matters when a later node re-queues
+                            // after a loss and this worker already holds the
+                            // shared objects.
+                            if let Some(h) = s.held[e].as_mut() {
+                                h.extend(node_caps[i].objects.iter().cloned());
+                            }
+                        }
                         Err(JobFailure::Build(err)) => {
                             // Stop-the-world: name the failure, let
                             // in-flight jobs finish, never dispatch anew.
@@ -570,6 +606,11 @@ pub fn run_ready_set_farm(
                                 s.lost.push(e);
                             }
                             s.alive[e] = false;
+                            // The store died with the channel (#303):
+                            // never prefer this member again (alive already
+                            // gates eligibility; the reset keeps the held
+                            // set honest).
+                            s.held[e] = None;
                             if first_loss {
                                 // The loss reason is operator-visible the
                                 // moment it happens: a re-dispatch can
@@ -674,6 +715,48 @@ struct FarmShared {
     /// Re-dispatch counts per node — the no-cycle cap (a job visits
     /// each pool member at most once).
     redispatches: Vec<usize>,
+    /// Each member's known store, learned at preflight (#303):
+    /// `None` = unknown, never preferred. Kept current within the run:
+    /// a completed dispatch leaves the node's objects in the worker's
+    /// store; a lost worker's store died with its channel.
+    held: Vec<Option<BTreeSet<String>>>,
+}
+
+/// Which ready node member `e` takes, front-to-back: among ELIGIBLE
+/// nodes, the first whose known objects `e` fully holds beats queue
+/// order (#303 — a warm store saves a payload ship); none fully held,
+/// the first eligible as before. Eligibility ([`farm_eligible`]) stays
+/// the gate — the preference only reorders what a member picks, never
+/// whether a node can run somewhere. Done entries met along the scan
+/// drop out of the queue.
+fn pick_ready(
+    farm: &[FarmExecutor<'_>],
+    alive: &[bool],
+    node_caps: &[JobCaps],
+    e: usize,
+    held: Option<&BTreeSet<String>>,
+    ready: &mut VecDeque<usize>,
+    done: &[bool],
+) -> Option<(usize, usize)> {
+    let mut fallback: Option<(usize, usize)> = None;
+    let mut k = 0;
+    while k < ready.len() {
+        let i = ready[k];
+        if done[i] {
+            ready.remove(k);
+            continue;
+        }
+        if farm_eligible(farm, alive, node_caps, e, i) {
+            if fallback.is_none() {
+                fallback = Some((k, i));
+            }
+            if held.is_some_and(|h| node_caps[i].objects.iter().all(|o| h.contains(o))) {
+                return Some((k, i));
+            }
+        }
+        k += 1;
+    }
+    fallback
 }
 
 /// The short attribution name for a worker address: the host token
@@ -886,6 +969,10 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> FarmJob for Rem
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    fn store_held(&self) -> Option<BTreeSet<String>> {
+        self.exec.store_held()
     }
 }
 

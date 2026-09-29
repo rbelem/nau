@@ -7,7 +7,7 @@
 //! against temp dirs and a fake command runner (the binary's `run_farm`
 //! wires it to the real runner and the parsed `workers` table).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::build_sched::ManifestSource;
@@ -325,7 +325,10 @@ pub fn fetch_pinned_source<R: CommandRunner>(
 /// named by worker and probe — instead of mid-run, per dispatch, after
 /// other work has already gone out (#193 review F1). Alongside the arch
 /// assertion, the bare probes run: pin, reachability, protocol, bwrap,
-/// functioning sandbox, mksquashfs, free disk. A refusal is a config
+/// functioning sandbox, mksquashfs, free disk. The same channel also
+/// learns the worker's object-store listing (#303 — placement's warm
+/// hint; a failed listing never fails the worker, the store just reads
+/// unknown). A refusal is a config
 /// error that kills the run before an hours-long build starts; the
 /// escape hatch is removing the worker from config.
 pub fn preflight_farm_workers<R: CommandRunner>(
@@ -347,6 +350,25 @@ pub struct FarmPlans {
     pub dep_metas: HashMap<String, SnapMeta>,
     pub dep_closures: HashMap<String, crate::cache::BuildClosure>,
     pub caps: HashMap<String, crate::build_sched::JobCaps>,
+}
+
+/// The placement-known objects of one RESOLVED plan (#303): the pinned
+/// sources' hashes, resolved exactly like dispatch's `source_pin`
+/// (lockfile first, then the recipe's declared pin); unpinned sources
+/// contribute nothing here — dispatch refuses them, named. Dep payload
+/// hashes are not knowable at plan time — they hash built snaps — so
+/// they stay out; this set only aims placement, delta_sync remains the
+/// authority.
+pub fn plan_objects(plan: &NodeJobPlan, lockfile: &LockFile) -> BTreeSet<String> {
+    plan.sources
+        .iter()
+        .filter_map(|spec| {
+            lockfile
+                .lookup_source(spec.url())
+                .or(spec.expected_sha256())
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// Resolve every node's remote-job plan up front, on the orchestrator
@@ -386,6 +408,11 @@ pub fn precompute_farm_plans(
             &mut dep_closures,
         );
         let local_only = multi_arch || all_only || plan.is_err();
+        // The placement-known objects (#303) — see [`plan_objects`].
+        let objects = plan
+            .as_ref()
+            .map(|p| plan_objects(p, lockfile))
+            .unwrap_or_default();
         if let Ok(p) = plan {
             plans.insert(name.clone(), p);
         }
@@ -395,6 +422,7 @@ pub fn precompute_farm_plans(
                 archs,
                 cross: meta.target.is_some(),
                 local_only,
+                objects,
             },
         );
     }
