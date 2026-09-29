@@ -2001,3 +2001,332 @@ fn cache_hit_records_no_timing_entry() {
         "the cache hit adds no timing entry"
     );
 }
+
+// ── Local-held placement + holder reservation (#309) ──
+
+/// #309 item 1, the window-6 shape: a node the LOCAL build produced has
+/// no worker holder — the coordinator's own store resolves it — and the
+/// empty-store worker scans first. The local held set makes local the
+/// holder: the worker's fallback skips the reserved node entirely and
+/// takes the unreserved work instead; local preference-hits its node.
+/// Deterministic in every thread-arrival order — that is the point.
+#[test]
+fn locally_held_node_rides_local_over_the_earlier_scanning_empty_worker() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    // Worker first in pool order: pre-fix, its fallback would grab
+    // farm-dep before local's slot ever scanned.
+    let worker = FakeMember::worker("2.29.39.212", 2, None, events.clone()).holds(&[]);
+    let local = FakeMember::local(1, events.clone()).holds(&["sha-dep"]);
+    let members = vec![worker, local];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "farm-dep".to_string(),
+        caps_holding(&["amd64"], false, &["sha-dep"]),
+    );
+    let g = graph(&[("farm-dep", &[]), ("plain1", &[]), ("plain2", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome.result.expect("farm builds clean");
+    assert_eq!(
+        members[1].started("farm-dep"),
+        1,
+        "the locally-held node builds on the coordinator: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("farm-dep"),
+        0,
+        "the empty worker never steals a locally-held node: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("plain1") + members[0].started("plain2"),
+        2,
+        "the worker is not starved — unreserved work still reaches it: {events:?}"
+    );
+}
+
+/// #309 item 2: a node reserved for its holder is invisible to other
+/// members' FALLBACK picks — queue position cannot steal it — while the
+/// holder's store hit takes it from anywhere in the queue.
+#[test]
+fn reserved_node_is_skipped_by_fallback_and_taken_by_its_holder() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    // The empty worker scans first (pool order); the holder's slot
+    // would lose the race pre-reservation (window 6, farm-dep3).
+    let empty = FakeMember::worker("2.29.39.212", 1, None, events.clone()).holds(&[]);
+    let holder = FakeMember::worker("62.238.62.155", 1, None, events.clone()).holds(&["sha-n2"]);
+    let members = vec![empty, holder];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "n1".to_string(),
+        JobCaps {
+            objects: BTreeSet::new(),
+            ..caps(&["amd64"], false)
+        },
+    );
+    caps_map.insert(
+        "n2".to_string(),
+        caps_holding(&["amd64"], false, &["sha-n2"]),
+    );
+    // n2 first in the queue — the exact position a first-scanner wins.
+    let g = graph(&[("n2", &[]), ("n1", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome.result.expect("farm builds clean");
+    assert_eq!(
+        members[0].started("n2"),
+        0,
+        "the empty worker's fallback skips the reserved node: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("n2"),
+        1,
+        "the holder takes its reserved node despite queue position: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("n1"),
+        1,
+        "the unreserved node still reaches the first scanner: {events:?}"
+    );
+}
+
+/// #309: every remaining node reserved for a busy-but-alive holder —
+/// the fallback pickers skip them all and wait; the holder drains the
+/// queue itself slot by slot. The running>0 wait never hangs and the
+/// drain path (running==0 between the holder's jobs) never exits with
+/// reserved work pending.
+#[test]
+fn all_reserved_for_a_busy_holder_still_drain_through_it() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let empty = FakeMember::worker("2.29.39.212", 2, None, events.clone()).holds(&[]);
+    let holder = FakeMember::worker("62.238.62.155", 1, None, events.clone())
+        .holds(&["sha-1", "sha-2", "sha-3"]);
+    let members = vec![empty, holder];
+    let mut caps_map = no_caps();
+    for (name, sha) in [("n1", "sha-1"), ("n2", "sha-2"), ("n3", "sha-3")] {
+        caps_map.insert(name.to_string(), caps_holding(&["amd64"], false, &[sha]));
+    }
+    let g = graph(&[("n1", &[]), ("n2", &[]), ("n3", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome
+        .result
+        .expect("the holder drains every reserved node");
+    for n in ["n1", "n2", "n3"] {
+        assert_eq!(
+            members[1].started(n),
+            1,
+            "the holder took {n} itself: {events:?}"
+        );
+    }
+    assert_eq!(
+        members[0].calls(),
+        0,
+        "the empty worker took nothing — every node was reserved: {events:?}"
+    );
+}
+
+/// #309: the holder dies mid-run — its reservations dissolve with its
+/// store and the surviving members' fallbacks take the nodes (the
+/// alive[] machinery is the hook; no stall on the dead member).
+#[test]
+fn reserved_holder_death_unreserves_its_nodes() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let survivor = FakeMember::worker("survivor", 2, None, events.clone()).holds(&[]);
+    let doomed = FakeMember::worker("doomed", 1, None, events.clone())
+        .holds(&["sha-1", "sha-2"])
+        .dies_on(1);
+    let members = vec![survivor, doomed];
+    let mut caps_map = no_caps();
+    for (name, sha) in [("n1", "sha-1"), ("n2", "sha-2")] {
+        caps_map.insert(name.to_string(), caps_holding(&["amd64"], false, &[sha]));
+    }
+    let g = graph(&[("n1", &[]), ("n2", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome
+        .result
+        .expect("the loss is absorbed once the reservations dissolve");
+    assert_eq!(outcome.workers_lost, vec!["doomed".to_string()]);
+    assert_eq!(
+        members[1].started("n1"),
+        1,
+        "the doomed holder took its node and died on it: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("n1"),
+        1,
+        "the re-queued node reaches the survivor after unreservation: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("n2"),
+        1,
+        "the still-pending reserved node reaches the survivor too: {events:?}"
+    );
+}
+
+/// #309: a ∅-set node is NEVER reserved — the vacuous guard's twin. A
+/// member holding unrelated objects must not fence off empty-set work:
+/// it still reaches every member's fallback.
+#[test]
+fn empty_set_nodes_are_never_reserved() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    // The worker scans first; held-node is reserved for local (local
+    // holds sha-x), plain carries ∅ and must not be fenced off.
+    let worker = FakeMember::worker("box", 2, None, events.clone()).holds(&[]);
+    let local = FakeMember::local(1, events.clone()).holds(&["sha-x"]);
+    let members = vec![worker, local];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "held-node".to_string(),
+        caps_holding(&["amd64"], false, &["sha-x"]),
+    );
+    let g = graph(&[("held-node", &[]), ("plain", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome.result.expect("farm builds clean");
+    assert_eq!(
+        members[0].started("held-node"),
+        0,
+        "the held node stays with its holder: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("held-node"),
+        1,
+        "local takes what it holds: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("plain"),
+        1,
+        "the ∅-set node is not reserved — it reaches the fallback: {events:?}"
+    );
+}
+
+/// #309: a reservation never outruns eligibility — a member "holding"
+/// an object for a job it cannot legally take (declared amd64, arm
+/// job's set) is skipped by the reservation search, so the node stays
+/// reachable by its capable member instead of stalling behind a
+/// reserved-for-nobody mark.
+#[test]
+fn reservation_respects_eligibility() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    // An impossible store in practice — exactly the shape the
+    // eligibility gate must refuse (mirrors the #303 preference gate).
+    let amd = FakeMember::worker("amdbox", 1, Some("x86_64-linux-gnu"), events.clone())
+        .holds(&["sha-arm", "sha-host"]);
+    let arm = FakeMember::worker("armbox", 1, Some("aarch64-linux-gnu"), events.clone());
+    let members = vec![amd, arm];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "arm-job".to_string(),
+        caps_holding(&["arm64"], false, &["sha-arm"]),
+    );
+    caps_map.insert(
+        "host-job".to_string(),
+        caps_holding(&["amd64"], false, &["sha-host"]),
+    );
+    let g = graph(&[("arm-job", &[]), ("host-job", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome
+        .result
+        .expect("no stall: the ineligible holder never reserves the arm job");
+    assert_eq!(
+        members[1].started("arm-job"),
+        1,
+        "the capable member takes the arm job: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("arm-job"),
+        0,
+        "holding an object never buys eligibility — nor a reservation: {events:?}"
+    );
+    assert_eq!(
+        members[0].started("host-job"),
+        1,
+        "the eligible holder keeps its own node: {events:?}"
+    );
+}
+
+/// #309: a member with zero slots can never wake to take its
+/// reservation — the search skips it, so a held set cannot make a
+/// zero-slot member (local_jobs 0) a candidate its node would wait on
+/// forever.
+#[test]
+fn zero_slot_member_never_holds_a_reservation() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let local = FakeMember::local(0, events.clone()).holds(&["sha-x"]);
+    let worker = FakeMember::worker("box", 1, None, events.clone()).holds(&[]);
+    let members = vec![local, worker];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "n1".to_string(),
+        caps_holding(&["amd64"], false, &["sha-x"]),
+    );
+    let g = graph(&[("n1", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome
+        .result
+        .expect("no stall: the zero-slot member never reserves its node");
+    assert_eq!(
+        members[0].calls(),
+        0,
+        "a zero-slot member takes nothing: {events:?}"
+    );
+    assert_eq!(
+        members[1].started("n1"),
+        1,
+        "the node flows to the runnable member: {events:?}"
+    );
+}
+
+/// #309 wiring seam: the local held set rides
+/// `LocalExecutor::with_held` → `Slotted` → `FarmJob::store_held`, the
+/// exact path the farm's held snapshot reads; the plain constructor
+/// keeps the store-blind default.
+#[test]
+fn local_held_set_reaches_the_farm_member_through_the_slot_adapter() {
+    let local = nau::build_sched::LocalExecutor::with_held(
+        |_name| Ok(()),
+        BTreeSet::from(["sha-x".to_string()]),
+    );
+    let slotted = nau::build_sched::Slotted {
+        exec: local,
+        slots: 2,
+        display: "local".into(),
+    };
+    assert_eq!(
+        FarmJob::store_held(&slotted),
+        Some(BTreeSet::from(["sha-x".to_string()])),
+        "the coordinator's resolvable set is placement-visible"
+    );
+    let plain = nau::build_sched::LocalExecutor::new(|_name: &str| Ok(()));
+    assert_eq!(
+        FarmJob::store_held(&plain),
+        None,
+        "the default stays store-blind"
+    );
+}
+
+/// #309: the precomputed LOCAL held set is exactly the union of the
+/// placement caps' objects — the sha256s the local build resolves
+/// offline. A run whose plans resolve nothing carries an empty set
+/// (still `Some` — a known-empty store, never the unknown default);
+/// the farm-side tests pin what the set then does to placement.
+#[test]
+fn precompute_local_held_set_is_the_union_of_the_placement_caps() {
+    let plans = nau::coordinator::precompute_farm_plans(
+        &BTreeMap::from([("meta-only".to_string(), bare_meta("meta-only", "1.0.0"))]),
+        &[],
+        &empty_lockfile(),
+        Path::new("no-such-run-output"),
+        None,
+    )
+    .expect("a build-less plan precomputes");
+    let union: BTreeSet<String> = plans
+        .caps
+        .values()
+        .flat_map(|c| c.objects.iter().cloned())
+        .collect();
+    assert_eq!(
+        plans.local_held, union,
+        "the local store is the placement caps' union"
+    );
+    assert!(
+        plans.local_held.is_empty(),
+        "a plan-less run holds nothing locally"
+    );
+}

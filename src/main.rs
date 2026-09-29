@@ -1417,6 +1417,7 @@ fn run_farm(
         dep_metas,
         dep_closures,
         caps,
+        local_held,
     } = plans;
     let source = std::sync::Arc::new(nau::coordinator::FarmSource {
         plans,
@@ -1431,7 +1432,10 @@ fn run_farm(
     });
 
     let local = nau::build_sched::Slotted {
-        exec: nau::build_sched::LocalExecutor::new(|name| ctx.run(name)),
+        // #309: the local member joins holder consideration with the
+        // coordinator's own resolvable set — locally-held nodes get the
+        // preference and the reservation instead of the racy fallback.
+        exec: nau::build_sched::LocalExecutor::with_held(|name| ctx.run(name), local_held),
         slots: workers.local_jobs as usize,
         display: "local".into(),
     };
