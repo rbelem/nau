@@ -51,6 +51,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use miette::WrapErr;
 
@@ -126,11 +127,16 @@ pub struct PreflightChecks<'a> {
 
 /// One completed dispatch. `cache_hit` marks a result served from the
 /// coordinator's manifest-identity ingest record — nothing crossed the
-/// channel.
+/// channel. The timings are the run summary's coordinator-observed
+/// phases (#302): `sync` is the delta sync's channel wall (zero when no
+/// object shipped), `total` the dispatch wall — dispatch start → result
+/// parsed + artifacts ingested.
 #[derive(Debug, Clone)]
 pub struct DispatchOutcome {
     pub cache_hit: bool,
     pub result: JobResult,
+    pub sync: Duration,
+    pub total: Duration,
 }
 
 /// The pin resolved into its known_hosts form ([`SshExecutor::
@@ -850,10 +856,13 @@ impl<R: CommandRunner> SshExecutor<R> {
         manifest: &JobManifest,
         payload_dir: &PayloadDir,
     ) -> miette::Result<DispatchOutcome> {
+        let started = Instant::now();
         if let Some(result) = self.cached_result(manifest)? {
             return Ok(DispatchOutcome {
                 cache_hit: true,
                 result,
+                sync: Duration::ZERO,
+                total: started.elapsed(),
             });
         }
         // The remote paths carry the slug (the identity's `:` flattened —
@@ -891,7 +900,9 @@ impl<R: CommandRunner> SshExecutor<R> {
             min_free_disk: closure_bytes.saturating_add(WORKER_DISK_HEADROOM_BYTES),
         })?;
 
+        let sync_started = Instant::now();
         self.delta_sync(manifest, payload_dir)?;
+        let sync = sync_started.elapsed();
         self.prepare_job_dir(&id, manifest)?;
 
         let stdout = self
@@ -943,7 +954,11 @@ impl<R: CommandRunner> SshExecutor<R> {
             ));
         }
 
-        let outcome = self.collect_and_ingest(&id, manifest, result)?;
+        let mut outcome = self.collect_and_ingest(&id, manifest, result)?;
+        // The wall the summary reports ends at "result parsed + artifacts
+        // ingested" — the best-effort job-dir cleanup is not the job.
+        outcome.sync = sync;
+        outcome.total = started.elapsed();
         // Best-effort job-dir cleanup — the object store (the worker's
         // cache) persists, the job scratch does not.
         let _ = self.run_ssh(&format!("rm -rf {REMOTE_BASE}/jobs/{id}"));
@@ -1188,6 +1203,9 @@ impl<R: CommandRunner> SshExecutor<R> {
         Ok(DispatchOutcome {
             cache_hit: false,
             result,
+            // Stamped by dispatch() — the timings live on its wall clock.
+            sync: Duration::ZERO,
+            total: Duration::ZERO,
         })
     }
 

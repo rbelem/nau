@@ -463,6 +463,12 @@ struct LoopbackWorker {
     /// What `ssh-keygen -lf` reports for any key file — the CA-form pin
     /// resolution seam (must match the pinned fingerprint).
     reported_fingerprint: String,
+    /// Sleep injected into the `__worker-job` handler — a known remote
+    /// build wall the timing assertions bound loosely (#302).
+    job_delay_ms: u64,
+    /// The build_ms the scripted result document reports — the injected
+    /// duration a test asserts propagates (#302).
+    result_build_ms: Option<u64>,
 }
 
 impl LoopbackWorker {
@@ -471,6 +477,8 @@ impl LoopbackWorker {
             root: root.to_path_buf(),
             dies: false,
             reported_fingerprint: FINGERPRINT_PIN.to_string(),
+            job_delay_ms: 0,
+            result_build_ms: None,
             cap: CapabilityDoc {
                 protocol: WORKER_PROTOCOL_VERSION,
                 arch: host_arch(),
@@ -547,6 +555,9 @@ impl LoopbackWorker {
     /// `nau __worker-job <job.json>`: write the scripted artifact
     /// into the job's out dir and print the result document.
     fn job(&self, cmd: &str) -> io::Result<RunnerOutput> {
+        if self.job_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.job_delay_ms));
+        }
         let job_file = self
             .remote_path(cmd.split_whitespace().last().unwrap())
             .expect("job file under ~");
@@ -573,6 +584,7 @@ impl LoopbackWorker {
             }],
             error: None,
             stderr: None,
+            build_ms: self.result_build_ms,
         };
         Ok(RunnerOutput {
             code: 0,
@@ -1130,6 +1142,8 @@ fn farm_source_hashes_dep_payload_once_and_stages_under_that_hash() {
 fn farm_ingest_builds_the_json_event_shape() {
     let outcome = |filename: &str| DispatchOutcome {
         cache_hit: false,
+        sync: std::time::Duration::ZERO,
+        total: std::time::Duration::ZERO,
         result: JobResult {
             protocol_version: WORKER_PROTOCOL_VERSION,
             package: "app".into(),
@@ -1143,6 +1157,7 @@ fn farm_ingest_builds_the_json_event_shape() {
             }],
             error: None,
             stderr: None,
+            build_ms: None,
         },
     };
 
@@ -1278,5 +1293,140 @@ fn metadata_only_all_jobs_are_local_only() {
     assert!(
         caps.local_only,
         "an `all` job must never leave the coordinator: {caps:?}"
+    );
+}
+
+// ── Per-job phase timings (#302) ──
+
+/// A loopback farm run records one JobTiming per dispatched job and the
+/// numbers are the ones the fakes injected: the scripted result's
+/// build_ms propagates EXACTLY (it is carried, not measured), the known
+/// job delay bounds the total wall loosely, total covers sync, and the
+/// artifact bytes are the shipped artifact's size. The end-of-run block
+/// renders the same numbers.
+#[test]
+fn dispatch_timings_reach_the_run_summary() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let source = Arc::new(FakeSource {
+        out_dir: out_dir.clone(),
+    });
+
+    let ceremony = tmp.path().join("ceremony");
+    let address = "ssh://localhost:2228";
+    ca_ceremony(&ceremony, address);
+    let mut fake = LoopbackWorker::new(&tmp.path().join("machine"));
+    fake.job_delay_ms = 150;
+    fake.result_build_ms = Some(1500);
+    let cfg = WorkerConfig {
+        address: address.to_string(),
+        jobs: 1,
+        arch: None,
+        host_key: Some(FINGERPRINT_PIN.to_string()),
+    };
+    let exec = SshExecutor::with_ceremony_home(&cfg, fake, &tmp.path().join("cache"), &ceremony)
+        .expect("executor builds");
+    let alive = RemoteExecutor::new(exec, Arc::clone(&source), 1, 1);
+
+    let stage: Vec<FarmExecutor<'_>> = vec![
+        FarmExecutor {
+            job: &alive,
+            kind: ExecutorKind::Worker {
+                declared_arch: None,
+            },
+        },
+        FarmExecutor {
+            job: &LocalNothing,
+            kind: ExecutorKind::Local,
+        },
+    ];
+    let g = graph(&[("worker-hello", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &stage, &no_caps());
+    outcome.result.expect("the dispatch completes");
+
+    let timings = alive.job_timings();
+    assert_eq!(timings.len(), 1, "one dispatched job, one timing entry");
+    let t = &timings[0];
+    assert_eq!(t.node, "worker-hello");
+    assert_eq!(t.worker, "localhost");
+    assert_eq!(
+        t.build,
+        Some(std::time::Duration::from_millis(1500)),
+        "the result document's build_ms propagates as carried"
+    );
+    assert!(
+        t.total >= std::time::Duration::from_millis(150),
+        "the known job delay bounds the dispatch wall: {t:?}"
+    );
+    assert!(
+        t.total >= t.sync,
+        "total (dispatch start → ingest) covers the sync phase: {t:?}"
+    );
+    assert_eq!(
+        t.artifact_bytes,
+        "snap bytes of worker-hello".len() as u64,
+        "the artifact's size rides the timing entry"
+    );
+
+    let block = nau::build_sched::render_farm_timings(&timings);
+    assert!(
+        block.contains("worker-hello on localhost"),
+        "the block attributes the job: {block}"
+    );
+    assert!(
+        block.contains("sync") && block.contains("build 1.5s") && block.contains("total"),
+        "the phases render with the injected build number: {block}"
+    );
+    assert!(block.contains("26 B"), "the artifact bytes render: {block}");
+}
+
+/// A manifest-cache hit crosses no channel and records no second timing
+/// entry — the summary counts dispatched work, and the ✓ line keeps its
+/// `(manifest cache)` marker instead.
+#[test]
+fn cache_hit_records_no_timing_entry() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let source = Arc::new(FakeSource { out_dir });
+
+    let ceremony = tmp.path().join("ceremony");
+    let address = "ssh://localhost:2229";
+    ca_ceremony(&ceremony, address);
+    let fake = LoopbackWorker::new(&tmp.path().join("machine"));
+    let cfg = WorkerConfig {
+        address: address.to_string(),
+        jobs: 1,
+        arch: None,
+        host_key: Some(FINGERPRINT_PIN.to_string()),
+    };
+    let exec = SshExecutor::with_ceremony_home(&cfg, fake, &tmp.path().join("cache"), &ceremony)
+        .expect("executor builds");
+    let alive = RemoteExecutor::new(exec, Arc::clone(&source), 1, 1);
+
+    let stage: Vec<FarmExecutor<'_>> = vec![
+        FarmExecutor {
+            job: &alive,
+            kind: ExecutorKind::Worker {
+                declared_arch: None,
+            },
+        },
+        FarmExecutor {
+            job: &LocalNothing,
+            kind: ExecutorKind::Local,
+        },
+    ];
+    let g = graph(&[("worker-hello", &[])]);
+    run_ready_set_farm(&g, &Default::default(), &stage, &no_caps())
+        .result
+        .expect("first dispatch lands");
+    run_ready_set_farm(&g, &Default::default(), &stage, &no_caps())
+        .result
+        .expect("the re-run is served from the ingest record");
+    assert_eq!(
+        alive.job_timings().len(),
+        1,
+        "the cache hit adds no timing entry"
     );
 }

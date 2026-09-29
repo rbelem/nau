@@ -130,6 +130,12 @@ pub struct JobResult {
     /// failure carried one (the `--- build output ---` block).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// Worker-side wall time of the build child itself, in ms — the
+    /// remote half of the run summary's phase split (#302). Optional and
+    /// serde-default so an older worker's result document keeps parsing:
+    /// an optional field never bumps the protocol version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_ms: Option<u64>,
 }
 
 // ── Transport side (ADR-0040 Decision 6, T4) ──
@@ -546,6 +552,9 @@ fn finish_job(
     // document instead of interleaving into the worker's own stderr
     // (issue #55 precedent).
     crate::snap::set_buffer_child_stderr(true);
+    // The build child's own wall — the number the coordinator cannot
+    // observe across the channel and the summary's `build` phase (#302).
+    let build_started = std::time::Instant::now();
     let build = crate::snap::build_snap(
         meta,
         stage.path(),
@@ -558,16 +567,19 @@ fn finish_job(
         prefix.as_ref().map(|p| p.path()),
         Some(&scan_listings),
     );
+    let build_ms = Some(build_started.elapsed().as_millis() as u64);
 
-    Ok(job_result(manifest, out_dir, build))
+    Ok(job_result(manifest, out_dir, build, build_ms))
 }
 
 /// Collect the result document: artifacts (path + hash + size) plus the
-/// failure text and its buffered-output section on error.
+/// failure text and its buffered-output section on error. `build_ms` is
+/// the worker-measured build wall (#302).
 fn job_result(
     manifest: &JobManifest,
     out_dir: &Path,
     build: miette::Result<crate::snap::BuildResult>,
+    build_ms: Option<u64>,
 ) -> JobResult {
     let mut result = JobResult {
         protocol_version: WORKER_PROTOCOL_VERSION,
@@ -577,6 +589,7 @@ fn job_result(
         artifacts: Vec::new(),
         error: None,
         stderr: None,
+        build_ms,
     };
     match build {
         Ok(_) => {

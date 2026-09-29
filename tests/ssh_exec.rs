@@ -549,6 +549,7 @@ fn scripted_dispatch(outcome_artifact: &str, bytes: &[u8]) -> (JobResult, Vec<(S
         }],
         error: None,
         stderr: None,
+        build_ms: None,
     };
     (result, vec![(outcome_artifact.to_string(), bytes.to_vec())])
 }
@@ -1667,6 +1668,82 @@ fn manifest_identity_is_canonical_namespaced_and_transport_local_free() {
     manifest.payload_dir = Some("local/only".into());
     let bytes2 = canonical_manifest_bytes(&manifest).unwrap();
     assert_eq!(bytes, bytes2, "payload_dir never enters the identity");
+}
+
+// ── Per-job phase timings (#302) ──
+
+/// The result document's build_ms rides the dispatch: the scripted
+/// worker reports an injected build wall and the coordinator reads it
+/// back unchanged. A document WITHOUT the field — an older worker —
+/// still parses, defaulted to None: the optional field never bumps the
+/// protocol version. The dispatch walls themselves are plausible, not
+/// asserted tightly: total covers sync and both are real time.
+#[test]
+fn result_document_build_ms_is_carried_and_stays_optional() {
+    let (sha_a, blob_a, _sha_b, _blob_b) = blob_pair();
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let artifact_bytes = b"scripted snap artifact".to_vec();
+    let (mut result, files) = scripted_dispatch("worker-hello_1.0_amd64.snap", &artifact_bytes);
+    result.build_ms = Some(1500);
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.scripted_result = Some(result);
+    fake.scripted_files = files;
+    preseed_object(machine.path(), &sha_a, &blob_a);
+    let ex = executor(fake, cache.path());
+
+    let payload = tempfile::tempdir().unwrap();
+    std::fs::write(payload.path().join(&sha_a), &blob_a).unwrap();
+    let manifest = blob_manifest(&[(sha_a.as_str(), "dep:dep-a")]);
+    let outcome = ex
+        .dispatch(&manifest, payload.path())
+        .expect("delta dispatch");
+    assert_eq!(
+        outcome.result.build_ms,
+        Some(1500),
+        "the worker-reported build wall arrives as carried"
+    );
+    assert!(
+        outcome.total >= outcome.sync && outcome.total > std::time::Duration::ZERO,
+        "the dispatch wall covers the sync phase and is real time: {outcome:?}"
+    );
+
+    // An older worker's document — no build_ms key — parses with the
+    // serde default. No protocol bump for an optional field.
+    let old = format!(
+        r#"{{"protocol_version":{WORKER_PROTOCOL_VERSION},"package":"worker-hello","target":"amd64","ok":true}}"#
+    );
+    let parsed: JobResult = serde_json::from_str(&old).expect("an old document keeps parsing");
+    assert_eq!(parsed.build_ms, None, "absent means unreported");
+}
+
+/// The REAL worker verb measures its build child: a loopback dispatch
+/// running the actual `__worker-job` reports a build wall, and the
+/// ingest record carries it for later runs.
+#[test]
+fn real_worker_job_reports_its_build_wall() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.real_job = true;
+    let ex = executor(fake, cache.path());
+
+    let manifest = hello_manifest();
+    let payload = tempfile::tempdir().unwrap();
+    let outcome = ex
+        .dispatch(&manifest, payload.path())
+        .expect("loopback dispatch");
+    assert!(
+        outcome.result.build_ms.is_some(),
+        "the worker measures its build child: {outcome:?}"
+    );
+    let record = ex.ingest_dir(&manifest).unwrap().join("result.json");
+    let stored: JobResult =
+        serde_json::from_slice(&std::fs::read(&record).expect("ingest record")).expect("json");
+    assert_eq!(
+        stored.build_ms, outcome.result.build_ms,
+        "the ingest record keeps the build wall"
+    );
 }
 
 #[test]

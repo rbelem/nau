@@ -39,6 +39,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 /// The coordinator's default build-slot count (issue #55), also the
 /// default of the `workers.local_jobs` config key (ADR-0040 Decision 3):
@@ -128,6 +129,81 @@ where
 // local slots included — and only a job with no eligible executor
 // left stops the run.
 
+/// Per-job phase timings, the run summary's answer to "where did the
+/// wall time go" (#302 — the sizing work scraped these by hand,
+/// docs/worker-pool-sizing.md). `sync` and `total` are coordinator-side
+/// walls ([`crate::ssh_exec::DispatchOutcome`]); `build` is the
+/// worker-reported build child's wall, carried by an optional
+/// result-document field — `None` when an older worker did not report
+/// it.
+#[derive(Debug, Clone)]
+pub struct JobTiming {
+    /// The scheduled node.
+    pub node: String,
+    /// The executor's display name (`nuci.local`).
+    pub worker: String,
+    /// Delta-sync channel wall (object transfer).
+    pub sync: Duration,
+    /// The remote build child's wall, when reported.
+    pub build: Option<Duration>,
+    /// Dispatch start → result parsed + artifacts ingested.
+    pub total: Duration,
+    /// Artifact bytes returned (the summary's size column).
+    pub artifact_bytes: u64,
+}
+
+impl JobTiming {
+    /// The timing suffix the ✓ attribution line and the end-of-run block
+    /// share: `sync 0.4s build 12.3s total 13.1s 1.2 MiB`.
+    pub fn line_suffix(&self) -> String {
+        let mut s = format!("sync {} ", secs(self.sync));
+        if let Some(build) = self.build {
+            s.push_str(&format!("build {} ", secs(build)));
+        }
+        s.push_str(&format!(
+            "total {} {}",
+            secs(self.total),
+            human_bytes(self.artifact_bytes)
+        ));
+        s
+    }
+}
+
+/// Seconds with one decimal, the summary's duration form (47.9s).
+fn secs(d: Duration) -> String {
+    format!("{:.1}s", d.as_secs_f64())
+}
+
+/// Human bytes, the summary's size form.
+fn human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= KIB * KIB * KIB {
+        format!("{:.1} GiB", b / (KIB * KIB * KIB))
+    } else if b >= KIB * KIB {
+        format!("{:.1} MiB", b / (KIB * KIB))
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The end-of-run per-job block, in the run summary's line style: one
+/// line per dispatched job, completion order.
+pub fn render_farm_timings(timings: &[JobTiming]) -> String {
+    let mut out = String::from("── farm phase timings ──\n");
+    for t in timings {
+        out.push_str(&format!(
+            "  {} on {} — {}\n",
+            t.node,
+            t.worker,
+            t.line_suffix()
+        ));
+    }
+    out
+}
+
 /// Why one scheduled job failed (ADR-0040 Amendment 1, ticket #268):
 /// the two classes the farm scheduler treats differently.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +274,13 @@ pub trait FarmJob: Sync {
     /// Concurrent jobs this member takes.
     fn slots(&self) -> usize {
         1
+    }
+
+    /// The per-job phase timings this member recorded, for the
+    /// end-of-run summary (#302). Default: none — the local executor's
+    /// jobs are not phase-timed (nothing changed for them).
+    fn job_timings(&self) -> Vec<JobTiming> {
+        Vec::new()
     }
 }
 
@@ -554,6 +637,13 @@ pub fn run_ready_set_farm(
         .expect("all scheduler threads joined; the state Arc has no other owners")
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
+    // The farm run's end-of-run timing summary (#302): every dispatched
+    // job's phases, in completion order. Members without timings (the
+    // local slots) record none, so a worker-less run prints nothing.
+    let timings: Vec<JobTiming> = farm.iter().flat_map(|fe| fe.job.job_timings()).collect();
+    if !timings.is_empty() && !crate::output::is_json() {
+        eprint!("{}", render_farm_timings(&timings));
+    }
     FarmOutcome {
         result: partition_outcome(&names, &s),
         workers_lost: s
@@ -680,6 +770,9 @@ pub struct RemoteExecutor<R: crate::command::CommandRunner + Sync, S: ManifestSo
     slots: usize,
     total: usize,
     dispatch: AtomicUsize,
+    /// One entry per completed dispatch, completion order — the
+    /// end-of-run summary's source (`job_timings` reads it).
+    timings: Mutex<Vec<JobTiming>>,
 }
 
 impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> RemoteExecutor<R, S> {
@@ -699,6 +792,7 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> RemoteExecutor<
             slots: slots.max(1),
             total,
             dispatch: AtomicUsize::new(0),
+            timings: Mutex::new(Vec::new()),
         }
     }
 }
@@ -720,6 +814,8 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> FarmJob for Rem
             Ok(Some(result)) => Ok(crate::ssh_exec::DispatchOutcome {
                 cache_hit: true,
                 result,
+                sync: Duration::ZERO,
+                total: Duration::ZERO,
             }),
             Ok(None) => {
                 let stage = self
@@ -734,9 +830,36 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> FarmJob for Rem
         };
         match outcome {
             Ok(o) => {
-                if !crate::output::is_json() {
-                    let cached = if o.cache_hit { " (manifest cache)" } else { "" };
-                    eprintln!("✓ [{} {slot}/{}] {name}{cached}", self.display, self.total);
+                if o.cache_hit {
+                    if !crate::output::is_json() {
+                        eprintln!(
+                            "✓ [{} {slot}/{}] {name} (manifest cache)",
+                            self.display, self.total
+                        );
+                    }
+                } else {
+                    // The dispatch's own telemetry records regardless of
+                    // output mode; only the human line is suppressed.
+                    let timing = JobTiming {
+                        node: name.to_string(),
+                        worker: self.display.clone(),
+                        sync: o.sync,
+                        build: o.result.build_ms.map(Duration::from_millis),
+                        total: o.total,
+                        artifact_bytes: o.result.artifacts.iter().map(|a| a.size).sum(),
+                    };
+                    self.timings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(timing.clone());
+                    if !crate::output::is_json() {
+                        eprintln!(
+                            "✓ [{} {slot}/{}] {name} — {}",
+                            self.display,
+                            self.total,
+                            timing.line_suffix()
+                        );
+                    }
                 }
                 let artifacts_in = self
                     .exec
@@ -756,6 +879,13 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> FarmJob for Rem
 
     fn slots(&self) -> usize {
         self.slots
+    }
+
+    fn job_timings(&self) -> Vec<JobTiming> {
+        self.timings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
