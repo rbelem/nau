@@ -1,7 +1,7 @@
 //! Phase 16 input-lockfile integration tests.
 //!
 //! Drives the real binary over the lock/CLI paths that need no network:
-//! `shuttle lock` (human + `--json` pin state), build `--offline`
+//! `nau lock` (human + `--json` pin state), build `--offline`
 //! fail-closed behavior with inputs absent from the cache, and the
 //! `--update`/`--offline` conflict guard. All `github:` fetching paths are
 //! deliberately avoided — every fixture declares `path:` inputs or relies on
@@ -9,19 +9,19 @@
 
 use std::process::Command;
 
-/// Run shuttle with an isolated HOME so the inputs cache root
-/// (`$HOME/.cache/shuttle/inputs`) is private to the test.
+/// Run nau with an isolated HOME so the inputs cache root
+/// (`$HOME/.cache/nau/inputs`) is private to the test.
 fn run_in(
     dir: &std::path::Path,
     home: &std::path::Path,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+    let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args(args)
         .env("HOME", home)
         .current_dir(dir)
         .output()
-        .expect("failed to spawn shuttle");
+        .expect("failed to spawn nau");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -36,7 +36,7 @@ fn setup_local_input_project() -> (tempfile::TempDir, tempfile::TempDir) {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 inputs = { vendored = { url = "path:vendor" } }
 return {}
@@ -46,7 +46,7 @@ return {}
     (dir, home)
 }
 
-// ── `shuttle lock` subcommand ──
+// ── `nau lock` subcommand ──
 
 #[test]
 fn lock_human_mode_records_local_pin() {
@@ -54,7 +54,7 @@ fn lock_human_mode_records_local_pin() {
     let (code, stdout, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["lock", "--file", "shuttle.lua", "--lockfile", "proj.lock"],
+        &["lock", "--file", "nau.lua", "--lockfile", "proj.lock"],
     );
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(
@@ -89,7 +89,7 @@ fn lock_json_mode_reports_pin_state() {
         &[
             "lock",
             "--file",
-            "shuttle.lua",
+            "nau.lua",
             "--lockfile",
             "proj.lock",
             "--json",
@@ -122,7 +122,7 @@ fn lock_is_idempotent_rerun_reports_zero_updated() {
     let args = [
         "lock",
         "--file",
-        "shuttle.lua",
+        "nau.lua",
         "--lockfile",
         "proj.lock",
         "--json",
@@ -143,8 +143,8 @@ fn lock_is_idempotent_rerun_reports_zero_updated() {
 
 #[test]
 fn build_offline_without_cache_fails_named_and_fetches_nothing() {
-    // Empty project: no shuttle.lua, no lockfile, pristine isolated HOME.
-    // The default input (github:rbelem/shuttle) is absent from the cache, so
+    // Empty project: no nau.lua, no lockfile, pristine isolated HOME.
+    // The default input (github:rbelem/nau) is absent from the cache, so
     // a build attempt must fail with the named offline error — never touch
     // the network (asserted by the inputs cache root staying uncreated).
     let dir = tempfile::tempdir().unwrap();
@@ -164,7 +164,7 @@ fn build_offline_without_cache_fails_named_and_fetches_nothing() {
         "named offline error required, got: {stderr}"
     );
 
-    let inputs_cache = home.path().join(".cache/shuttle/inputs");
+    let inputs_cache = home.path().join(".cache/nau/inputs");
     assert!(
         !inputs_cache.exists(),
         "no fetch may run in offline mode; cache root was created: {}",
@@ -194,7 +194,7 @@ fn update_reports_local_pin_refresh() {
     let (code, _, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["lock", "--file", "shuttle.lua", "--lockfile", "proj.lock"],
+        &["lock", "--file", "nau.lua", "--lockfile", "proj.lock"],
     );
     assert_eq!(code, Some(0), "pre-lock: {stderr}");
 
@@ -205,7 +205,7 @@ fn update_reports_local_pin_refresh() {
             "build",
             "--update",
             "--file",
-            "shuttle.lua",
+            "nau.lua",
             "--lockfile",
             "proj.lock",
         ],
@@ -234,7 +234,7 @@ fn lock_rejects_submodules_on_path_input_named() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 inputs = { vendored = { url = "path:vendor", submodules = true } }
 return {}
@@ -245,7 +245,7 @@ return {}
     let (code, _, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["lock", "--file", "shuttle.lua", "--lockfile", "proj.lock"],
+        &["lock", "--file", "nau.lua", "--lockfile", "proj.lock"],
     );
     assert_ne!(code, Some(0), "submodules on a path input must fail");
     assert!(
@@ -261,7 +261,7 @@ fn lock_rejects_malformed_submodules_declaration_named() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 inputs = { pkgs = { url = "github:o/r", submodules = "yes" } }
 return {}
@@ -272,12 +272,20 @@ return {}
     let (code, _, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["lock", "--file", "shuttle.lua", "--lockfile", "proj.lock"],
+        &["lock", "--file", "nau.lua", "--lockfile", "proj.lock"],
     );
     assert_ne!(code, Some(0), "malformed declaration must fail");
-    // miette wraps long messages; match a substring that survives wrapping.
+    // miette wraps long messages at width-dependent points and paints `│`
+    // gutters on continuation lines; the file name in the message shifts
+    // the wrap. Strip the gutters and flatten whitespace so the match
+    // survives any wrap position.
+    let flat = stderr
+        .replace('│', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        stderr.contains("must be true or a list of submodule names"),
+        flat.contains("must be true or a list of submodule names"),
         "named shape error required, got: {stderr}"
     );
 }
@@ -287,7 +295,7 @@ fn lock_rejects_empty_submodules_list_named() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 inputs = { pkgs = { url = "github:o/r", submodules = {} } }
 return {}
@@ -298,7 +306,7 @@ return {}
     let (code, _, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["lock", "--file", "shuttle.lua", "--lockfile", "proj.lock"],
+        &["lock", "--file", "nau.lua", "--lockfile", "proj.lock"],
     );
     assert_ne!(
         code,

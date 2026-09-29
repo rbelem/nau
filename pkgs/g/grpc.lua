@@ -16,7 +16,7 @@
 --
 -- Nix:       pkgs.grpc (cmake, all package providers)
 -- Snapcraft: no upstream recipe; a library/tool dependency
--- Shuttle:   declarative Lua — CMake source build, everything from
+-- Nau:   declarative Lua — CMake source build, everything from
 --            the pool.
 --
 -- Port strategy: the full package-provider sweep —
@@ -136,7 +136,7 @@ return {
             "cp -r protoc-gen-validate/. grpc/third_party/protoc-gen-validate/",
             "cmake -S grpc -B grpc/build -G Ninja "
                 .. "-DCMAKE_BUILD_TYPE=Release "
-                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_PREFIX_PATH=$NAU_BUILD_PREFIX/usr "
                 .. "-DCMAKE_INSTALL_PREFIX=/usr "
                 .. "-DCMAKE_INSTALL_LIBDIR=lib "
                 .. "-DCMAKE_CXX_STANDARD=20 "
@@ -176,16 +176,16 @@ return {
         build_deps = { "cmake", "ninja" },
 
         -- ADR-0018 interim escape (libsecret precedent): the nix gcc
-        -- wrapper bakes RUNPATH=/shuttle-build-prefix/usr/lib into
+        -- wrapper bakes RUNPATH=/nau-build-prefix/usr/lib into
         -- produced shared libs — that path does not exist at pod
         -- runtime. Silenced here, visibly logged by the leak scan,
         -- pending the RUNPATH repair.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
             -- Text-leak references carry the BARE prefix marker
             -- (leak_scan record() matches the reference exactly).
-            "/shuttle-build-prefix",
+            "/nau-build-prefix",
         },
     },
 }

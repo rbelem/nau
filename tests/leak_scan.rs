@@ -1,8 +1,8 @@
 //! Post-build leak scan integration tests (ADR-0018 Decision 3, issue #22).
 //!
-//! Drives `shuttle build` over the real binary against a synthetic package
+//! Drives `nau build` over the real binary against a synthetic package
 //! that links a library available only as a `build_dep` (and bakes a
-//! `/shuttle-build-prefix` RUNPATH). The build fails with a precise message
+//! `/nau-build-prefix` RUNPATH). The build fails with a precise message
 //! naming the file, soname, and build-only payload; adding a `leaks_ok`
 //! entry silences the hits (visibly logged) and the build passes.
 
@@ -132,7 +132,7 @@ fn write_libfoo(project: &Path, port: u16) {
 }
 
 /// Write the app package that links libfoo (build-only) and bakes a
-/// `/shuttle-build-prefix` RUNPATH. `leaks_ok` lines optional.
+/// `/nau-build-prefix` RUNPATH. `leaks_ok` lines optional.
 fn write_app(project: &Path, port: u16, leaks_ok: &[&str]) {
     make_tarball(
         &project.join("srcs"),
@@ -155,7 +155,7 @@ fn write_app(project: &Path, port: u16, leaks_ok: &[&str]) {
     name = "app",
     version = "1.0",
     source = "http://127.0.0.1:{port}/app.tar.gz",
-    build = "mkdir -p $STAGE/usr/bin && gcc -o $STAGE/usr/bin/app $SRC/app.c -L$SHUTTLE_BUILD_PREFIX/usr/lib -lfoo -Wl,-rpath,$SHUTTLE_BUILD_PREFIX/usr/lib",
+    build = "mkdir -p $STAGE/usr/bin && gcc -o $STAGE/usr/bin/app $SRC/app.c -L$NAU_BUILD_PREFIX/usr/lib -lfoo -Wl,-rpath,$NAU_BUILD_PREFIX/usr/lib",
     architectures = {{ "amd64" }},
     requires = {{}},
     build_deps = {{ "libfoo" }},{leak_lines}
@@ -172,7 +172,7 @@ fn write_app(project: &Path, port: u16, leaks_ok: &[&str]) {
 fn run_build(project: &Path, output: &Path, stage: &Path) -> (Option<i32>, String, String) {
     std::fs::create_dir_all(output).unwrap();
     std::fs::create_dir_all(stage).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("build")
         .arg("--file")
         .arg("app.lua")
@@ -181,7 +181,7 @@ fn run_build(project: &Path, output: &Path, stage: &Path) -> (Option<i32>, Strin
         .arg("--stage")
         .arg(stage)
         .current_dir(project);
-    let out = cmd.output().expect("failed to spawn shuttle build");
+    let out = cmd.output().expect("failed to spawn nau build");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -222,7 +222,7 @@ gated_test!(
             "must name the leaking file: {stderr}"
         );
         assert!(
-            stderr.contains("/shuttle-build-prefix"),
+            stderr.contains("/nau-build-prefix"),
             "must name the merged build prefix marker: {stderr}"
         );
     }
@@ -238,7 +238,7 @@ gated_test!(leaks_ok_silences_and_logs_then_build_passes, {
     write_app(
         project.path(),
         port,
-        &["/shuttle-build-prefix/usr/lib", "libfoo.so.1"],
+        &["/nau-build-prefix/usr/lib", "libfoo.so.1"],
     );
 
     let output = project.path().join("out");
@@ -314,7 +314,7 @@ gated_test!(build_records_build_dep_pin_in_lockfile, {
     write_app(
         project.path(),
         port,
-        &["/shuttle-build-prefix/usr/lib", "libfoo.so.1"],
+        &["/nau-build-prefix/usr/lib", "libfoo.so.1"],
     );
 
     let output = project.path().join("out");
@@ -324,7 +324,7 @@ gated_test!(build_records_build_dep_pin_in_lockfile, {
 
     // The lockfile records the build_dep pin (the lockfile IS the pin
     // record, ADR-0018 Decision 4).
-    let lock_path = project.path().join("shuttle.lock");
+    let lock_path = project.path().join("nau.lock");
     assert!(lock_path.exists(), "lockfile must be written");
     let lock: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();

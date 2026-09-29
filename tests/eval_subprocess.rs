@@ -1,6 +1,6 @@
 //! Subprocess eval bounding (ADR-0010 Decisions 4+5).
 //!
-//! Integration tests over the real `shuttle __eval-worker` subprocess + IPC
+//! Integration tests over the real `nau __eval-worker` subprocess + IPC
 //! path: happy-path eval, require-over-IPC with parent-side root
 //! allowlisting, and the adversarial suite ported from
 //! `spike/src/gates.rs` to Luau (containment: <5s wall, under rlimits,
@@ -9,12 +9,12 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use shuttle::isolate::{self, EvalRequest, WorkerOutcome};
-use shuttle::lua::{evaluate_file, evaluate_file_with_constraint, evaluate_string};
+use nau::isolate::{self, EvalRequest, WorkerOutcome};
+use nau::lua::{evaluate_file, evaluate_file_with_constraint, evaluate_string};
 
 fn request(entry_label: &str, source: &str) -> EvalRequest {
     EvalRequest {
-        prelude: shuttle::dsl::INIT_LUA.to_string(),
+        prelude: nau::dsl::INIT_LUA.to_string(),
         index_data: serde_json::json!({ "version": 1, "snaps": [] }),
         arch: "amd64".into(),
         sources: BTreeMap::new(),
@@ -64,7 +64,7 @@ fn require_goes_over_ipc_and_resolves_from_entry_dir() {
     // it from the entry file's directory (allowlisted root).
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 local base = require("base")
 return { default = snap(merge(base, { name = "composed", version = "9.9.9" })) }
@@ -77,7 +77,7 @@ return { default = snap(merge(base, { name = "composed", version = "9.9.9" })) }
     )
     .unwrap();
 
-    let entry = dir.path().join("shuttle.lua");
+    let entry = dir.path().join("nau.lua");
     let outputs = evaluate_file(entry.to_str().unwrap())
         .expect("require over IPC must resolve the sibling module");
     assert_eq!(outputs["default"].name, "composed");
@@ -102,7 +102,7 @@ fn global_inputs_cross_back_as_data() {
 inputs = { core = { url = "github:core/core22/main" } }
 return { default = snap { name = "with-inputs", version = "1.0" } }
 "#;
-    let out = shuttle::lua::evaluate_string_with_inputs("inputs-test", src)
+    let out = nau::lua::evaluate_string_with_inputs("inputs-test", src)
         .expect("inputs must be extracted through the subprocess");
     assert_eq!(out.outputs["default"].name, "with-inputs");
     assert_eq!(out.global_inputs["core"].url, "github:core/core22/main");
@@ -115,13 +115,13 @@ fn file_label_threads_definition_dir_into_outputs() {
     // A file-path label must land in every output's definition_dir so
     // hook/icon paths resolve relative to the definition first.
     let dir = tempfile::tempdir().unwrap();
-    let def = dir.path().join("shuttle.lua");
+    let def = dir.path().join("nau.lua");
     std::fs::write(
         &def,
         r#"return { default = snap { name = "wired", version = "1.0" } }"#,
     )
     .unwrap();
-    let checked = shuttle::lua::check_file_with_inputs(def.to_str().unwrap());
+    let checked = nau::lua::check_file_with_inputs(def.to_str().unwrap());
     assert!(checked.error.is_none(), "{:?}", checked.error);
     let meta = &checked.outputs["default"];
     assert_eq!(meta.definition_dir.as_deref(), Some(dir.path()));
@@ -129,7 +129,7 @@ fn file_label_threads_definition_dir_into_outputs() {
 
 #[test]
 fn embedded_label_has_no_definition_dir() {
-    let checked = shuttle::lua::check_string_with_inputs(
+    let checked = nau::lua::check_string_with_inputs(
         "embedded:test",
         r#"return { default = snap { name = "embedded-snap", version = "1.0" } }"#,
     );
@@ -334,7 +334,7 @@ fn composed_config_via_evaluate_file() {
     assert_eq!(meta.name, "my-composed-app");
     assert_eq!(meta.version, "1.0.0");
     // From the base template via merge
-    assert_eq!(meta.summary.as_deref(), Some("A snap built with shuttle"));
+    assert_eq!(meta.summary.as_deref(), Some("A snap built with nau"));
     assert_eq!(meta.grade, "stable");
     assert_eq!(meta.confinement, "strict");
 }
@@ -345,7 +345,7 @@ fn composed_config_via_evaluate_file() {
 fn phase15_fields_survive_subprocess_round_trip() {
     // The full Phase 15 surface must survive the real worker subprocess:
     // Lua eval → lua_to_json → json_to_lua → SnapMeta.
-    use shuttle::snap::{LayoutEntry, SnapPlug, TmpfsSpec};
+    use nau::snap::{LayoutEntry, SnapPlug, TmpfsSpec};
 
     let outputs = evaluate_string(
         "phase15-round-trip",
@@ -537,7 +537,7 @@ fn real_node_recipe_selects_the_22_line_under_the_constraint() {
     assert_eq!(meta.name, "node", "one package, two lines — no rename");
     assert_eq!(meta.version, "22.23.3");
     match &meta.source {
-        Some(shuttle::snap::SourceSpec::Pinned { url, sha256 }) => {
+        Some(nau::snap::SourceSpec::Pinned { url, sha256 }) => {
             assert_eq!(
                 url,
                 "https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz"

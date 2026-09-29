@@ -27,7 +27,7 @@
 -- Nix:       no nixpkgs package (upstream has no releases; distros
 --            that need it vendor the tree)
 -- Snapcraft: no upstream recipe
--- Shuttle:   declarative Lua — CMake source build, hand-staged
+-- Nau:   declarative Lua — CMake source build, hand-staged
 --            artifacts.
 --
 -- Port strategy: upstream's CMakeLists (added for exactly this
@@ -77,7 +77,7 @@ return {
         build = table.concat({
             "cmake -S $SRC -B $SRC/build -G Ninja "
                 .. "-DCMAKE_BUILD_TYPE=Release "
-                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_PREFIX_PATH=$NAU_BUILD_PREFIX/usr "
                 .. "-DCMAKE_INSTALL_PREFIX=/usr",
             "cmake --build $SRC/build -j$(nproc) --target highwayhash",
             -- No upstream install() rule: hand-stage the two

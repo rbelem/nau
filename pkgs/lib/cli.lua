@@ -1,4 +1,4 @@
--- CLI app template for shuttle packages.
+-- CLI app template for nau packages.
 -- Returns an app config table suitable for merge().
 --
 -- Usage:

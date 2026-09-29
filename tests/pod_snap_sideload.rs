@@ -1,4 +1,4 @@
-//! `shuttle pod add --snap` sideload integration tests (issue #116).
+//! `nau pod add --snap` sideload integration tests (issue #116).
 //!
 //! The split that defines a sideload: a BUILDER pod resolves a package
 //! from a real collection (loopback HTTP source, sandboxed build,
@@ -189,7 +189,7 @@ fn harvest_payload(builder_root: &Path, dest_dir: &Path, name: &str, version: &s
     dest
 }
 
-/// A fake payload from a bare `meta/snap.yaml` — no build, no shuttle
+/// A fake payload from a bare `meta/snap.yaml` — no build, no nau
 /// recipe, packed directly with mksquashfs.
 fn fake_snap(dest: &Path, yaml: &str) {
     let stage = tempfile::tempdir().unwrap();
@@ -282,14 +282,14 @@ fn build_requires_payload(
 // ── Runners ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     // Desktop launchers (issue #7) write to the user data home — keep
     // them inside the test's tempdir; pod activation off the host bus.
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -297,15 +297,15 @@ fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, Stri
     )
 }
 
-/// Run a non-`pod` subcommand (`shuttle deps ...`) against the same
+/// Run a non-`pod` subcommand (`nau deps ...`) against the same
 /// redirected state as [`run`].
 fn run_plain(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle");
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -353,7 +353,7 @@ fn current_farm(root: &Path, pod: &str) -> PathBuf {
 }
 
 fn lockfile(root: &Path, pod: &str) -> serde_json::Value {
-    serde_json::from_str(&std::fs::read_to_string(pod_dir(root, pod).join("shuttle.lock")).unwrap())
+    serde_json::from_str(&std::fs::read_to_string(pod_dir(root, pod).join("nau.lock")).unwrap())
         .unwrap()
 }
 
@@ -651,9 +651,7 @@ gated_test!(infrastructure_refused_store_warns, {
     assert_ne!(code, Some(0));
     assert!(stderr.contains("infrastructure"), "stderr: {stderr}");
     assert!(
-        !pod_dir(root.path(), "default")
-            .join("shuttle.lock")
-            .exists(),
+        !pod_dir(root.path(), "default").join("nau.lock").exists(),
         "the refusal must leave zero writes"
     );
 
@@ -982,7 +980,7 @@ gated_test!(loading_pod_with_blob_pin_refused, {
         "must cite the issue: {stderr}"
     );
     assert!(
-        !pod_dir(root.path(), "other").join("shuttle.lock").exists(),
+        !pod_dir(root.path(), "other").join("nau.lock").exists(),
         "the refusal must leave zero writes"
     );
 });
@@ -1211,7 +1209,7 @@ gated_test!(sideload_over_declared_in_loaded_pod_refused, {
         "must name the loaded pod's blob pins: {stderr}"
     );
     assert!(
-        !pod_dir(root.path(), "other").join("shuttle.lock").exists(),
+        !pod_dir(root.path(), "other").join("nau.lock").exists(),
         "the refusal must leave zero writes"
     );
 });
@@ -1599,7 +1597,7 @@ gated_test!(
             "the cause must name the failed fetch: {stderr}"
         );
         assert!(
-            stderr.contains("`shuttle pod sync`") && stderr.contains("`shuttle pod remove app`"),
+            stderr.contains("`nau pod sync`") && stderr.contains("`nau pod remove app`"),
             "must name both recovery verbs: {stderr}"
         );
         assert!(stderr.contains("to abandon"), "stderr: {stderr}");
@@ -1754,9 +1752,7 @@ gated_test!(foreign_arch_payload_refused, {
         "must name the arch mismatch: {stderr}"
     );
     assert!(
-        !pod_dir(root.path(), "default")
-            .join("shuttle.lock")
-            .exists(),
+        !pod_dir(root.path(), "default").join("nau.lock").exists(),
         "the refusal must leave zero writes"
     );
 
@@ -1854,7 +1850,7 @@ gated_test!(constraint_violating_sideload_refused, {
         "must name the violated constraint: {stderr}"
     );
     assert!(
-        !dir.join("shuttle.lock").exists(),
+        !dir.join("nau.lock").exists(),
         "the refusal must leave zero writes"
     );
 
@@ -2129,7 +2125,7 @@ gated_test!(pins_without_content_refuses_then_readd_repairs, {
     // install fails after the writes.
     let dir = pod_dir(root.path(), "default");
     std::fs::write(dir.join("pod.lua"), "pod { packages = { \"hello\" } }\n").unwrap();
-    let lock_path = dir.join("shuttle.lock");
+    let lock_path = dir.join("nau.lock");
     let mut lock: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
     lock["packages"]["hello"] = serde_json::json!({ "version": "1.0" });

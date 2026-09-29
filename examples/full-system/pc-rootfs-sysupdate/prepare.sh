@@ -5,7 +5,7 @@
 #    into local/nix/, patchelf'd to guest paths;
 # 2. build the three images (gen1 device, gen2 payload, gen2-bless payload);
 # 3. publish each payload build through the LANDED RELEASE PRODUCER
-#    (`shuttle image --release`, #274): the slot-A artifacts land under
+#    (`nau image --release`, #274): the slot-A artifacts land under
 #    their `@u`-PARTUUID names with the SIGNED SHA256SUMS +
 #    SHA256SUMS.gpg beside them — the same sums signature the device's
 #    `Verify=yes` checks at update time. The release self-check (verify
@@ -16,14 +16,14 @@
 # below swapped back for the real systemd-pull — folds into the deferred
 # QEMU axis (#80 live update run).
 #
-# Everything lands in $WORK (default ~/.cache/shuttle-80). Individual steps
+# Everything lands in $WORK (default ~/.cache/nau-80). Individual steps
 # are idempotent: remove $WORK/payload-gen2 to redo a payload release.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
 export PATH="$REPO_ROOT/target/debug:$PATH"
-WORK="${SHUTTLE_80_WORK:-$HOME/.cache/shuttle-80}"
+WORK="${NAU_80_WORK:-$HOME/.cache/nau-80}"
 # Pin the epoch once: `--release` refuses without it (ADR-0044 D8), and
 # the pin is what keeps the payload releases deterministic.
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1704067200}"
@@ -39,9 +39,9 @@ mkdir -p "$OUT" "$WORK" "$HERE/local/nix"
 log() { printf '\n=== %s ===\n' "$*"; }
 
 # ── 0. the update signing key (ADR-0024 §4: builds never mint one) ──────
-if [[ ! -f "$WORK/key-home/.config/shuttle/secret-key" ]]; then
-    log "minting the proof signing key (shuttle key keygen)"
-    HOME="$WORK/key-home" shuttle key keygen
+if [[ ! -f "$WORK/key-home/.config/nau/secret-key" ]]; then
+    log "minting the proof signing key (nau key keygen)"
+    HOME="$WORK/key-home" nau key keygen
 else
     log "signing key present"
 fi
@@ -100,11 +100,11 @@ build_one() { # $1 = lua, $2 = outdir, $3 = image file name
     # Run from the repo root so the default package-index.json is found;
     # the lua's own dir is where --file points and where files[] sources
     # resolve (relative to the lua, not the cwd).
-    ( cd "$REPO_ROOT" && HOME="$WORK/key-home" shuttle image \
+    ( cd "$REPO_ROOT" && HOME="$WORK/key-home" nau image \
         --file "$HERE/$1" --arch amd64 --output "$OUT/$2" )
 }
 
-# Payload builds go through `shuttle image --release` (#274): the producer
+# Payload builds go through `nau image --release` (#274): the producer
 # publishes the slot-A artifacts under the exact `@u`-PARTUUID names the
 # emitted transfers fetch, with SHA256SUMS + its detached signature
 # (SHA256SUMS.gpg) beside them. The @u names are derived from the same
@@ -117,7 +117,7 @@ build_release() { # $1 = lua, $2 = payload dest dir
         return
     fi
     log "building + publishing $1 (release producer: signed SHA256SUMS)"
-    ( cd "$REPO_ROOT" && HOME="$WORK/key-home" shuttle image \
+    ( cd "$REPO_ROOT" && HOME="$WORK/key-home" nau image \
         --file "$HERE/$1" --arch amd64 --release "$2" )
     for artifact in SHA256SUMS SHA256SUMS.gpg; do
         [[ -s "$2/$artifact" ]] || {
@@ -133,11 +133,11 @@ build_release gen2-bless.lua "$WORK/payload-gen2b"
 
 # The device image last: it is the biggest transient and the payload
 # releases above only need the gen2 images.
-build_one gen1.lua        gen1  shuttle-80_1.0_amd64.img
+build_one gen1.lua        gen1  nau-80_1.0_amd64.img
 
 # #86 strand CONTROL device (recovery masked via systemd.mask=): built
 # from the same tree, so it only differs from gen1 by the kernel cmdline.
-build_one gen1-strand.lua gen1-strand  shuttle-80_1.0_amd64.img
+build_one gen1-strand.lua gen1-strand  nau-80_1.0_amd64.img
 
 log "preparation complete"
 echo "images:   $OUT  (gen1 devices)"

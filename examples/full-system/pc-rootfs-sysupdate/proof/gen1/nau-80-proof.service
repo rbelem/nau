@@ -1,0 +1,6 @@
+[Unit]
+Description=nau-80 payload proof: generation 1 (1.0)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/echo nau-80 GEN-1-PAYLOAD booted

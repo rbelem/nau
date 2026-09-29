@@ -50,7 +50,7 @@ return {
             "_ble_base_package_type=nix",
             "",
             "function ble/base/package:nix/update {",
-            "  echo 'ble.sh is installed by the shuttle pod. Update the pool package.' >&2",
+            "  echo 'ble.sh is installed by the nau pod. Update the pool package.' >&2",
             "  return 1",
             "}",
             "EOF",

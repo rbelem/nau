@@ -27,16 +27,16 @@ return {
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22 / #30 lane
         -- follow-up): the nix gcc wrapper bakes the merged build prefix into
         -- the installed `ncursesw6-config`, whose --prefix/--libdir echoes
-        -- /shuttle-build-prefix/usr/lib. The text scanner's Leak.reference is
-        -- the exact prefix marker `/shuttle-build-prefix`, so leaks_ok must
+        -- /nau-build-prefix/usr/lib. The text scanner's Leak.reference is
+        -- the exact prefix marker `/nau-build-prefix`, so leaks_ok must
         -- match that string. Silenced here, visibly logged by the leak scan,
         -- pending the RUNPATH/config repair (portability follow-up).
         -- The exact usr/lib64 entry: RUNPATH entries match exactly (the
         -- bare string only covers text references) — the wrapper now
         -- bakes the lib64 spelling into the ELFs too.
         leaks_ok = {
-            "/shuttle-build-prefix",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix",
+            "/nau-build-prefix/usr/lib64",
         },
     },
 }

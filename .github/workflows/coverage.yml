@@ -1,4 +1,4 @@
-# Nightly coverage measurement for shuttle.
+# Nightly coverage measurement for nau.
 #
 # Instrumented build roughly doubles the gate's cost, so this runs on a
 # schedule instead of every PR. The floor ratchets as tails get covered —
@@ -98,7 +98,7 @@ jobs:
           env -u LD_LIBRARY_PATH \
             LLVM_COV=/tmp/llvm-link/bin/llvm-cov \
             LLVM_PROFDATA=/tmp/llvm-link/bin/llvm-profdata \
-            devbox run -- bash -c 'SHUTTLE_SYSTEMD=off cargo llvm-cov \
+            devbox run -- bash -c 'NAU_SYSTEMD=off cargo llvm-cov \
               --workspace --all-targets --locked \
               --fail-under-lines 86 \
               --lcov --output-path lcov.info \

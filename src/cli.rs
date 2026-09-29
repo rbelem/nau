@@ -4,7 +4,7 @@ use crate::boot_test::Accel;
 
 #[derive(Parser)]
 #[command(
-    name = "shuttle",
+    name = "nau",
     version,
     about = "Build Snap packages from Lua declarations"
 )]
@@ -17,12 +17,12 @@ pub struct Cli {
 pub enum Command {
     /// Build a snap from a Lua declaration file
     Build {
-        /// Path to the Lua config file (default: shuttle.lua)
-        #[arg(short, long, default_value = "shuttle.lua")]
+        /// Path to the Lua config file (default: nau.lua)
+        #[arg(short, long, default_value = "nau.lua")]
         file: String,
 
         /// Directory containing pre-built binaries (default: ./stage/).
-        /// The default ./stage/ is shuttle-managed: wiped before every
+        /// The default ./stage/ is nau-managed: wiped before every
         /// build phase so stale files cannot leak into a snap. A directory
         /// passed explicitly via --stage is never wiped — it must be empty
         /// (or new), or the build is refused.
@@ -38,7 +38,7 @@ pub enum Command {
         #[arg(short = 'A', long)]
         arch: Vec<String>,
 
-        /// Output name to build (from shuttle.lua outputs table).
+        /// Output name to build (from nau.lua outputs table).
         /// Default: build all outputs.
         output_name: Option<String>,
 
@@ -48,9 +48,9 @@ pub enum Command {
         #[arg(long)]
         source_date_epoch: Option<String>,
 
-        /// Path to lockfile (default: shuttle.lock).
+        /// Path to lockfile (default: nau.lock).
         /// Locks source hashes for reproducible builds.
-        #[arg(long, default_value = "shuttle.lock")]
+        #[arg(long, default_value = "nau.lock")]
         lockfile: String,
 
         /// Print dependency build order and exit (no build).
@@ -63,7 +63,7 @@ pub enum Command {
         #[arg(long)]
         all: bool,
 
-        /// Binary cache directory for built packages (default: ~/.cache/shuttle/pkgs).
+        /// Binary cache directory for built packages (default: ~/.cache/nau/pkgs).
         /// Cached builds are keyed by source SHA-256, so rebuilds only happen when
         /// source changes. Combine with --all to build full dependency trees efficiently.
         #[arg(long)]
@@ -99,8 +99,8 @@ pub enum Command {
 
     /// Build a system image from pinned snaps
     Image {
-        /// Path to the Lua config file (default: shuttle.lua)
-        #[arg(short, long, default_value = "shuttle.lua")]
+        /// Path to the Lua config file (default: nau.lua)
+        #[arg(short, long, default_value = "nau.lua")]
         file: String,
 
         /// Output directory for the .img file (default: current dir)
@@ -115,7 +115,7 @@ pub enum Command {
         #[arg(long, default_value = "latest/stable")]
         channel: String,
 
-        /// Cache directory for downloaded snaps (default: ~/.cache/shuttle/snaps)
+        /// Cache directory for downloaded snaps (default: ~/.cache/nau/snaps)
         #[arg(long)]
         cache: Option<String>,
 
@@ -123,7 +123,7 @@ pub enum Command {
         #[arg(long)]
         cache_max_size: Option<String>,
 
-        /// Image output name to build (from shuttle.lua images table).
+        /// Image output name to build (from nau.lua images table).
         /// Default: build the first image found.
         output_name: Option<String>,
 
@@ -139,13 +139,13 @@ pub enum Command {
         /// an update_source — into this ADR-0033 D10 export
         /// tree directory. Requires a pinned SOURCE_DATE_EPOCH, an
         /// explicit --arch, exactly one disk image (--output-name), and
-        /// the operator signing key (`shuttle key keygen`). Replaces
+        /// the operator signing key (`nau key keygen`). Replaces
         /// --output as the destination.
         #[arg(long, value_name = "DIR", conflicts_with = "output")]
         release: Option<String>,
 
-        /// Path to lockfile (default: shuttle.lock).
-        #[arg(long, default_value = "shuttle.lock")]
+        /// Path to lockfile (default: nau.lock).
+        #[arg(long, default_value = "nau.lock")]
         lockfile: String,
 
         /// Output structured JSON instead of human-friendly colored output.
@@ -215,8 +215,8 @@ pub enum Command {
     /// package, a severity, and a one-line fix hint. Exits nonzero only on
     /// errors, never warnings. Fully offline: index/lockfile data only.
     Lint {
-        /// Path to the Lua definition file (default: shuttle.lua)
-        #[arg(short, long, default_value = "shuttle.lua")]
+        /// Path to the Lua definition file (default: nau.lua)
+        #[arg(short, long, default_value = "nau.lua")]
         file: String,
 
         /// Lint a pod's declared packages (app collisions) instead of a
@@ -249,8 +249,8 @@ pub enum Command {
         #[arg(short, long)]
         file: Option<String>,
 
-        /// Path to lockfile (project shuttle.lock or a pod's lockfile).
-        #[arg(short, long, default_value = "shuttle.lock")]
+        /// Path to lockfile (project nau.lock or a pod's lockfile).
+        #[arg(short, long, default_value = "nau.lock")]
         lockfile: String,
 
         /// Force a refresh: bypass the local OSV response cache and
@@ -267,13 +267,13 @@ pub enum Command {
     /// Pins each github input to its current branch head and records a
     /// content hash; `path:` inputs are marked local (unlocked).
     Lock {
-        /// Path to the Lua config file (default: shuttle.lua).
+        /// Path to the Lua config file (default: nau.lua).
         /// If not found, locks the default package index input.
-        #[arg(short, long, default_value = "shuttle.lua")]
+        #[arg(short, long, default_value = "nau.lua")]
         file: String,
 
-        /// Path to lockfile (default: shuttle.lock).
-        #[arg(long, default_value = "shuttle.lock")]
+        /// Path to lockfile (default: nau.lock).
+        #[arg(long, default_value = "nau.lock")]
         lockfile: String,
 
         /// Output structured JSON with pin state instead of human output.
@@ -287,8 +287,8 @@ pub enum Command {
     /// lockfile, package index) — fully pinned projects eval offline; the
     /// --offline flag additionally forbids fetching uncached inputs.
     Eval {
-        /// Path to the Lua config file (default: shuttle.lua)
-        #[arg(short, long, default_value = "shuttle.lua")]
+        /// Path to the Lua config file (default: nau.lua)
+        #[arg(short, long, default_value = "nau.lua")]
         file: String,
 
         /// Write the manifest to this file atomically (default: stdout)
@@ -307,9 +307,9 @@ pub enum Command {
         #[arg(long, default_value = "latest/stable")]
         channel: String,
 
-        /// Path to lockfile (default: shuttle.lock).
+        /// Path to lockfile (default: nau.lock).
         /// Pins source hashes and snap revisions for reproducible evals.
-        #[arg(long, default_value = "shuttle.lock")]
+        #[arg(long, default_value = "nau.lock")]
         lockfile: String,
 
         /// Use only pinned/cached inputs — never touch the network.
@@ -393,7 +393,7 @@ pub enum Command {
     /// download every blob with sha256 verification (fail-closed on any
     /// mismatch), and write the files under their original names.
     ///
-    /// Sharing lanes (ADR-0033): a `shuttle://host[:port]/<pkg>`
+    /// Sharing lanes (ADR-0033): a `nau://host[:port]/<pkg>`
     /// reference pulls from a peer and an `http(s)://…/<pkg>` reference
     /// from a static export tree — both verify the signed
     /// PackageManifest fail-closed and stage into the pod named by
@@ -428,17 +428,17 @@ pub enum Command {
         expect: Option<String>,
 
         /// Install pulled `.snap` payloads into the state root after the
-        /// download. Revisions resolve from the `shuttle.lock` pins in
+        /// download. Revisions resolve from the `nau.lock` pins in
         /// the current directory (matched by sha3-384); unpinned or
         /// divergent blobs are refused (use plain pull to keep files).
         #[arg(long)]
         install: bool,
 
-        /// State root for --install (default: /var/lib/shuttle).
+        /// State root for --install (default: /var/lib/nau).
         #[arg(long)]
         state_dir: Option<String>,
 
-        /// Pod store that peer (`shuttle://`) and static-URL
+        /// Pod store that peer (`nau://`) and static-URL
         /// (`http(s)://`) pulls stage into (default: `default`) — the
         /// verified manifest + blobs land in the named pod's store and
         /// installation stays the pod workflow, never a pull side
@@ -449,7 +449,7 @@ pub enum Command {
 
         /// Accept a manifest whose revision is OLDER than the installed
         /// or staged one for that name (ADR-0033 Decision 7 freshness
-        /// rule). Peer/URL pulls only. Note: `shuttle.lock` pins do NOT
+        /// rule). Peer/URL pulls only. Note: `nau.lock` pins do NOT
         /// bind on the peer lane yet — PackageManifest carries no store
         /// pin; pin-binding is deferred (ADR-0033 Decision 7).
         #[arg(long = "allow-downgrade")]
@@ -464,7 +464,7 @@ pub enum Command {
     /// (ADR-0033 Decisions 4+5): `GET /info`, `GET /manifests/<pkg>`,
     /// `GET /blobs/<sha256>`. Runs in the foreground until interrupted;
     /// unsigned store entries are never served. Binding and announce
-    /// policy come from `node {}` in shuttle.lua — absent `node {}`,
+    /// policy come from `node {}` in nau.lua — absent `node {}`,
     /// the loopback default applies and nothing is announced.
     Serve {
         /// Bind address override. Default: `node {}`'s
@@ -478,7 +478,7 @@ pub enum Command {
         #[arg(long)]
         port: Option<u16>,
 
-        /// Announce the node on the LAN via mDNS (`_shuttle._tcp`,
+        /// Announce the node on the LAN via mDNS (`_nau._tcp`,
         /// ADR-0033 Decision 3), overriding `node {}`'s
         /// `serve.announce`. The declaration is the source of truth;
         /// absent both, serve does not announce.
@@ -492,8 +492,8 @@ pub enum Command {
         pod: Option<String>,
     },
 
-    /// Browse the LAN for announcing shuttle peers (ADR-0033 Decision
-    /// 3): mDNS `_shuttle._tcp.local.` for a bounded window, printing
+    /// Browse the LAN for announcing nau peers (ADR-0033 Decision
+    /// 3): mDNS `_nau._tcp.local.` for a bounded window, printing
     /// every node found. Discovery only, never trust — pulls still
     /// verify every manifest fail-closed (ADR-0033 Decision 7).
     Peers {
@@ -510,7 +510,7 @@ pub enum Command {
     /// tree any web server can serve (ADR-0033 Decision 10):
     /// `index.json` (the `/info` payload), `manifests/<pkg>.json`
     /// (signed PackageManifests), `blobs/<sha256>`. Upload the directory
-    /// to publish — no shuttle code runs server-side.
+    /// to publish — no nau code runs server-side.
     Export {
         /// Directory to write the export tree into
         out: String,
@@ -537,7 +537,7 @@ pub enum Command {
 
     /// Key ceremony (ADR-0011 step (e), ADR-0024 §4): generate, rotate,
     /// promote, and revoke the update-manifest signing keys. The operator
-    /// surface over `~/.config/shuttle/` (secret-key, secret-key.new,
+    /// surface over `~/.config/nau/` (secret-key, secret-key.new,
     /// keys/<id>.pub) and the local `keys/revoked-keys` list.
     #[command(subcommand)]
     Key(KeyCommand),
@@ -545,20 +545,20 @@ pub enum Command {
     /// SSH host CA ceremony (ADR-0045 amendment, #283 decided): generate
     /// and introspect the coordinator CA that signs workers' short-lived
     /// host certificates. A trust root DISTINCT from the update-manifest
-    /// signing key (`shuttle key`); the keypair lives under
-    /// `~/.config/shuttle/ca/` (`ca` 0600 private, `ca.pub` public — the
+    /// signing key (`nau key`); the keypair lives under
+    /// `~/.config/nau/ca/` (`ca` 0600 private, `ca.pub` public — the
     /// future `@cert-authority` line).
     #[command(subcommand)]
     Ca(CaCommand),
 
     /// Manage on-device installs: generations + file-level content store
     /// (ADR-0012 step 5, Phase 24b). Operates on a state root (default
-    /// /var/lib/shuttle) holding generations/, store/ blobs, and the
+    /// /var/lib/nau) holding generations/, store/ blobs, and the
     /// `active` symlink.
     #[command(subcommand)]
     Runtime(RuntimeCommand),
 
-    /// Manage user-level pods (CONTEXT.md: Pod). `shuttle pod [--name <n>]
+    /// Manage user-level pods (CONTEXT.md: Pod). `nau pod [--name <n>]
     /// <verb>`: imperative edits to one pod's declaration + lockfile pins,
     /// reconciled into that pod's store, generation chain, and bin farm.
     /// `--name` selects the pod (default: `default`) and is accepted before
@@ -568,7 +568,7 @@ pub enum Command {
     Pod {
         /// Pod to operate on (default: `default`). Belongs to the `pod`
         /// command itself, so it goes before the verb:
-        /// `shuttle pod --name work add jq`. Every verb also accepts it
+        /// `nau pod --name work add jq`. Every verb also accepts it
         /// after the verb (see `PodTarget`); the two positions must agree.
         #[arg(long, value_name = "POD")]
         name: Option<String>,
@@ -580,18 +580,18 @@ pub enum Command {
     /// Run an app from a pod (ADR-0016, ticket #11). Two forms,
     /// dispatched declared-app-first:
     ///
-    /// Declared app — `shuttle run [--pod N] <app> [args…]`: resolve the
+    /// Declared app — `nau run [--pod N] <app> [args…]`: resolve the
     /// app's declared grants, set up the sandbox with the chosen backend,
     /// then exec the app — transparent to the user (the pod's `current`/
     /// bin farm symlink points at a wrapper that invokes this). A
     /// `confined` app on a host where the backend is unavailable FAILS
     /// CLOSED (never silently runs unconfined).
     ///
-    /// Arbitrary command — `shuttle run [--pod N] -- <cmd…>` (issue
+    /// Arbitrary command — `nau run [--pod N] -- <cmd…>` (issue
     /// #102): exec any command with the pod's env overlaid (farm-first
     /// PATH + loader-lib LD_LIBRARY_PATH), no sandbox. Declared-first
     /// order: a name that IS a declared app always wins, so
-    /// `shuttle run -- <declared-app>` runs the declared app (confined),
+    /// `nau run -- <declared-app>` runs the declared app (confined),
     /// not the command.
     ///
     /// TRUST BOUNDARY: the command form runs unsandboxed with the
@@ -613,7 +613,7 @@ pub enum Command {
         #[arg(long, value_name = "POD")]
         pod: Option<String>,
 
-        /// Pod state root (default: $XDG_DATA_HOME/shuttle/pods).
+        /// Pod state root (default: $XDG_DATA_HOME/nau/pods).
         #[arg(long)]
         root: Option<String>,
 
@@ -629,7 +629,7 @@ pub enum Command {
     /// and archives the serial console as evidence when the assertion fails.
     ///
     /// Success requires no kernel panic, a userspace marker, the
-    /// `SHUTTLE-INIT: switch-root` line shuttle's own `/init` prints after it
+    /// `NAU-INIT: switch-root` line nau's own `/init` prints after it
     /// opens dm-verity and hands PID 1 to systemd, and a COMPLETION signal:
     /// a `Reached target Boot Completion Check` line (A/B images with the
     /// try-boot machinery) or a completed `default.target` (`Reached target
@@ -738,8 +738,8 @@ pub enum Command {
         manifest: String,
 
         /// Extra trust anchor for the manifest signature: a public-key
-        /// file (same two-line format `shuttle key keygen` writes),
-        /// accepted beside the operator keychain (~/.config/shuttle/keys).
+        /// file (same two-line format `nau key keygen` writes),
+        /// accepted beside the operator keychain (~/.config/nau/keys).
         #[arg(long)]
         key: Option<String>,
 
@@ -796,7 +796,7 @@ pub enum Command {
     },
 }
 
-/// `--count` bounds for `shuttle workers provision` (M5): at least ONE
+/// `--count` bounds for `nau workers provision` (M5): at least ONE
 /// server — a zero count would run nothing and exit 0 — and at most
 /// [`WORKERS_MAX_COUNT`] per run, the API fan-out cap; larger fleets
 /// should be split into runs.
@@ -816,7 +816,7 @@ fn workers_count(raw: &str) -> Result<u32, String> {
     Ok(n)
 }
 
-/// Subcommands for `shuttle workers`.
+/// Subcommands for `nau workers`.
 #[derive(clap::Subcommand)]
 pub enum WorkersCommand {
     /// Provision cloud workers: each guest GENERATES its own SSH host
@@ -824,7 +824,7 @@ pub enum WorkersCommand {
     /// coordinator over a one-time provisioning token (ADR-0045 amendment
     /// — no private half ever ships in user-data); provision pins the
     /// host CA's fingerprint into a machine-managed `workers` entry in
-    /// shuttle.lua BEFORE first use — never ssh-keyscan. Certificate
+    /// nau.lua BEFORE first use — never ssh-keyscan. Certificate
     /// issuance from the published keys is #295 sub-task 3.
     Provision {
         /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
@@ -847,8 +847,8 @@ pub enum WorkersCommand {
         count: u32,
 
         /// Worker lifetime before the TTL sweep reclaims it (e.g. 4h,
-        /// 30m). Stamped into /etc/shuttle/worker-ttl and the
-        /// `shuttle-worker` hcloud label (epoch-seconds expiry).
+        /// 30m). Stamped into /etc/nau/worker-ttl and the
+        /// `nau-worker` hcloud label (epoch-seconds expiry).
         #[arg(long, default_value = "4h")]
         ttl: String,
 
@@ -878,7 +878,7 @@ pub enum WorkersCommand {
         dry_run: bool,
 
         /// Config file the workers entries are pinned into.
-        #[arg(short, long, default_value = "shuttle.lua")]
+        #[arg(short, long, default_value = "nau.lua")]
         file: String,
     },
 
@@ -893,15 +893,15 @@ pub enum WorkersCommand {
         name: String,
 
         /// Config file the workers entry is evicted from.
-        #[arg(short, long, default_value = "shuttle.lua")]
+        #[arg(short, long, default_value = "nau.lua")]
         file: String,
     },
 
     /// Receive one guest publish (ADR-0045 amendment, #295): reads the
     /// JSON payload on stdin with the bearer token in
-    /// `SHUTTLE_PUBLISH_TOKEN`, validates one-time-ness + key shape, and
+    /// `NAU_PUBLISH_TOKEN`, validates one-time-ness + key shape, and
     /// stores the pending identity under
-    /// `~/.config/shuttle/ca/pending/` for `shuttle workers issue`.
+    /// `~/.config/nau/ca/pending/` for `nau workers issue`.
     /// The transport binding for any TLS-terminating front: extract the
     /// Authorization header, hand the body here — fail-closed on every
     /// bad token, replay, or malformed key.
@@ -911,9 +911,9 @@ pub enum WorkersCommand {
     /// sub-task 3): the host CA signs one certificate per pending
     /// identity — principals bind the machine identity plus the provider
     /// instance-identity content (Decision 3) — and the identity moves to
-    /// the issued record (`~/.config/shuttle/ca/issued/`), the audit
+    /// the issued record (`~/.config/nau/ca/issued/`), the audit
     /// trail. The guest picks its certificate up with
-    /// `shuttle workers pickup`.
+    /// `nau workers pickup`.
     Issue {
         /// CA ceremony home (default: $HOME).
         #[arg(long)]
@@ -942,7 +942,7 @@ pub enum WorkersCommand {
 
     /// Serve one issued certificate back to its guest (the pickup half
     /// of the publish channel): authenticates with the machine's
-    /// one-time publish token (`SHUTTLE_PUBLISH_TOKEN` — the same bearer
+    /// one-time publish token (`NAU_PUBLISH_TOKEN` — the same bearer
     /// that carried the publish) and prints the certificate to stdout.
     /// The GET of the callback URL, symmetric with receive-publish's
     /// POST. Idempotent reads; refuses (nonzero exit) while the identity
@@ -955,12 +955,12 @@ pub enum WorkersCommand {
     },
 }
 
-/// Subcommands for `shuttle deps`.
+/// Subcommands for `nau deps`.
 #[derive(clap::Subcommand)]
 pub enum DepsCommand {
     /// Show dependency tree for a package
     Show {
-        /// Package name or path to shuttle.lua file
+        /// Package name or path to nau.lua file
         package: String,
 
         /// Resolve all transitive dependencies (recursive)
@@ -990,7 +990,7 @@ pub enum DepsCommand {
         #[arg(long, value_name = "POD")]
         name: Option<String>,
 
-        /// Pod state root (default: $XDG_DATA_HOME/shuttle/pods).
+        /// Pod state root (default: $XDG_DATA_HOME/nau/pods).
         #[arg(long)]
         root: Option<String>,
 
@@ -1004,19 +1004,19 @@ pub enum DepsCommand {
     },
 }
 
-/// Subcommands for `shuttle cache`.
+/// Subcommands for `nau cache`.
 #[derive(clap::Subcommand)]
 pub enum CacheCommand {
     /// Show cache statistics (entries, packages, disk usage)
     Info {
-        /// Cache directory (default: ~/.cache/shuttle/pkgs)
+        /// Cache directory (default: ~/.cache/nau/pkgs)
         #[arg(long)]
         cache: Option<String>,
     },
 
     /// Remove all cached packages
     Clear {
-        /// Cache directory (default: ~/.cache/shuttle/pkgs)
+        /// Cache directory (default: ~/.cache/nau/pkgs)
         #[arg(long)]
         cache: Option<String>,
 
@@ -1031,7 +1031,7 @@ pub enum CacheCommand {
         #[arg(long, default_value_t = 30)]
         days: u64,
 
-        /// Cache directory (default: ~/.cache/shuttle/pkgs)
+        /// Cache directory (default: ~/.cache/nau/pkgs)
         #[arg(long)]
         cache: Option<String>,
 
@@ -1041,7 +1041,7 @@ pub enum CacheCommand {
     },
 }
 
-/// Subcommands for `shuttle runtime` (ADR-0012 step 5, Phase 24b):
+/// Subcommands for `nau runtime` (ADR-0012 step 5, Phase 24b):
 /// on-device install/remove/upgrade/rollback/gc over generations.
 #[derive(clap::Subcommand)]
 pub enum RuntimeCommand {
@@ -1057,7 +1057,7 @@ pub enum RuntimeCommand {
         channel: String,
 
         /// State root for generations + content store
-        /// (default: /var/lib/shuttle)
+        /// (default: /var/lib/nau)
         #[arg(long)]
         state_dir: Option<String>,
 
@@ -1073,7 +1073,7 @@ pub enum RuntimeCommand {
         name: String,
 
         /// State root for generations + content store
-        /// (default: /var/lib/shuttle)
+        /// (default: /var/lib/nau)
         #[arg(long)]
         state_dir: Option<String>,
 
@@ -1098,7 +1098,7 @@ pub enum RuntimeCommand {
         channel: String,
 
         /// State root for generations + content store
-        /// (default: /var/lib/shuttle)
+        /// (default: /var/lib/nau)
         #[arg(long)]
         state_dir: Option<String>,
 
@@ -1115,7 +1115,7 @@ pub enum RuntimeCommand {
         generation: Option<u64>,
 
         /// State root for generations + content store
-        /// (default: /var/lib/shuttle)
+        /// (default: /var/lib/nau)
         #[arg(long)]
         state_dir: Option<String>,
 
@@ -1135,7 +1135,7 @@ pub enum RuntimeCommand {
         prune: bool,
 
         /// State root for generations + content store
-        /// (default: /var/lib/shuttle)
+        /// (default: /var/lib/nau)
         #[arg(long)]
         state_dir: Option<String>,
 
@@ -1147,10 +1147,10 @@ pub enum RuntimeCommand {
     /// Activate the current generation (ADR-0023 §4). Idempotent and
     /// boot-safe: a cold store is a clean no-op, and a half-written
     /// journal is discarded so boot never wedges. The emitted
-    /// `shuttle-runtime-activate.service` oneshot runs this at boot.
+    /// `nau-runtime-activate.service` oneshot runs this at boot.
     Activate {
         /// State root for generations + content store
-        /// (default: /var/lib/shuttle)
+        /// (default: /var/lib/nau)
         #[arg(long)]
         state_dir: Option<String>,
 
@@ -1166,7 +1166,7 @@ pub enum RuntimeCommand {
     /// relabels such slots `_empty` when the evidence proves the loader
     /// never selected them, surfaces a named anomaly otherwise, and never
     /// touches the running version. Boot-safe: every refusal is a named
-    /// no-op. The emitted `shuttle-slot-recovery.service` oneshot runs
+    /// no-op. The emitted `nau-slot-recovery.service` oneshot runs
     /// this at boot, ordered before `systemd-sysupdate.service`.
     RecoverSlots {
         /// Where the image mounts the ESP — the emitted unit bakes the
@@ -1176,7 +1176,7 @@ pub enum RuntimeCommand {
     },
 }
 
-/// Subcommands for `shuttle key` (ADR-0011 step (e), ADR-0024 §4): the
+/// Subcommands for `nau key` (ADR-0011 step (e), ADR-0024 §4): the
 /// key-ceremony operator surface. `--home` redirects the whole ceremony
 /// away from `$HOME` (tests, alternate operators); it defaults to `HOME`.
 ///
@@ -1199,7 +1199,7 @@ pub enum KeyCommand {
     /// directory so the freshly minted key is immediately trusted.
     Keygen {
         /// Key-ceremony home (default: $HOME). The secret key lives at
-        /// `<home>/.config/shuttle/secret-key`, anchors under `keys/`.
+        /// `<home>/.config/nau/secret-key`, anchors under `keys/`.
         #[arg(long)]
         home: Option<String>,
 
@@ -1208,7 +1208,7 @@ pub enum KeyCommand {
         json: bool,
     },
 
-    /// Mint the rotation successor at `<home>/.config/shuttle/secret-key.new`.
+    /// Mint the rotation successor at `<home>/.config/nau/secret-key.new`.
     /// The successor is NOT trusted until `key promote`: it has no anchor,
     /// so the keychain cannot accept its signature. Requires an existing
     /// `secret-key`; refuses to overwrite a pending `secret-key.new`.
@@ -1303,7 +1303,7 @@ pub enum KeyCommand {
     },
 }
 
-/// Subcommands for `shuttle ca` (ADR-0045 amendment, #283 decided — the
+/// Subcommands for `nau ca` (ADR-0045 amendment, #283 decided — the
 /// host CA ceremony joins ADR-0024's): the coordinator CA is the ONE
 /// trust root that signs every worker's short-lived host certificate,
 /// distinct from the update-manifest signing key. `--home` redirects the
@@ -1317,7 +1317,7 @@ pub enum CaCommand {
     /// ssh-keygen SHA256 fingerprint (the identity workers entries carry).
     Keygen {
         /// CA ceremony home (default: $HOME). The keypair lives at
-        /// `<home>/.config/shuttle/ca/` (`ca` private 0600, `ca.pub`
+        /// `<home>/.config/nau/ca/` (`ca` private 0600, `ca.pub`
         /// public).
         #[arg(long)]
         home: Option<String>,
@@ -1348,7 +1348,7 @@ pub enum CaCommand {
     },
 }
 
-/// Verbs for `shuttle pod` (pods, issue #2): imperative edits to one
+/// Verbs for `nau pod` (pods, issue #2): imperative edits to one
 /// pod's declaration + lockfile, mirroring the runtime command group's
 /// lifecycle shape. The `--root` state override travels with each verb
 /// (test-scoped redirection); `--name` travels on the `pod` command
@@ -1386,8 +1386,8 @@ pub enum PodCommand {
         #[arg(long, requires = "snap")]
         ack_unsigned: bool,
 
-        /// Pod state root (default: $XDG_DATA_HOME/shuttle/pods, i.e.
-        /// ~/.local/share/shuttle/pods). Overridable via SHUTTLE_POD_ROOT.
+        /// Pod state root (default: $XDG_DATA_HOME/nau/pods, i.e.
+        /// ~/.local/share/nau/pods). Overridable via NAU_POD_ROOT.
         /// Tests redirect this into tempdirs.
         #[arg(long)]
         root: Option<String>,
@@ -1459,7 +1459,7 @@ pub enum PodCommand {
     },
 
     /// Print shell statements that put the selected pod's bin farm on
-    /// PATH in the current shell (issue #47): `eval "$(shuttle pod
+    /// PATH in the current shell (issue #47): `eval "$(nau pod
     /// shellenv)"`. Pure stdout — never writes an RC file, never starts
     /// a daemon (ADR-0015 §7, ADR-0016 §7). Fails on an unknown pod or
     /// one with no active generation.
@@ -1597,7 +1597,7 @@ pub enum PodCommand {
     },
 }
 
-/// Subcommands for `shuttle pod secrets` (ADR-0042 D3/D7/D8).
+/// Subcommands for `nau pod secrets` (ADR-0042 D3/D7/D8).
 #[derive(clap::Subcommand)]
 pub enum PodSecretsCommand {
     /// List the pod's folded secret references with their session-cache
@@ -1612,8 +1612,8 @@ pub enum PodSecretsCommand {
     Refresh,
 }
 
-/// Pod selector shared by every `shuttle pod` verb: the `--name` flag
-/// accepted AFTER the verb (`shuttle pod add jq --name work`). Merged
+/// Pod selector shared by every `nau pod` verb: the `--name` flag
+/// accepted AFTER the verb (`nau pod add jq --name work`). Merged
 /// fail-closed in `cmd_pod` against the before-verb value on the `pod`
 /// command itself — conflicting values are a hard error, never a silent
 /// precedence.
@@ -1645,7 +1645,7 @@ impl PodCommand {
     }
 }
 
-/// Subcommands for `shuttle index`.
+/// Subcommands for `nau index`.
 #[derive(clap::Subcommand)]
 pub enum IndexCommand {
     /// List snaps in the package index
@@ -1702,9 +1702,9 @@ pub enum IndexCommand {
     /// Update package source inputs (re-fetch GitHub repositories).
     /// Ensures the local cache matches the remote.
     Update {
-        /// Path to the Lua config file (default: shuttle.lua).
+        /// Path to the Lua config file (default: nau.lua).
         /// If not found, updates the default package index.
-        #[arg(short, long, default_value = "shuttle.lua")]
+        #[arg(short, long, default_value = "nau.lua")]
         file: String,
     },
 }
@@ -1725,7 +1725,7 @@ mod tests {
 
     #[test]
     fn test_build_defaults() {
-        match parse_build(&["shuttle", "build"]) {
+        match parse_build(&["nau", "build"]) {
             Command::Build {
                 file,
                 stage,
@@ -1734,9 +1734,9 @@ mod tests {
                 output_name,
                 ..
             } => {
-                assert_eq!(file, "shuttle.lua");
+                assert_eq!(file, "nau.lua");
                 // No --stage flag: default stage, tracked as None so the
-                // build knows it may wipe shuttle's own ./stage/.
+                // build knows it may wipe nau's own ./stage/.
                 assert_eq!(stage, None);
                 assert_eq!(output, ".");
                 assert!(arch.is_empty());
@@ -1748,7 +1748,7 @@ mod tests {
 
     #[test]
     fn test_build_with_file_flag() {
-        match parse_build(&["shuttle", "build", "--file", "my-snap.lua"]) {
+        match parse_build(&["nau", "build", "--file", "my-snap.lua"]) {
             Command::Build { file, .. } => assert_eq!(file, "my-snap.lua"),
             _ => panic!("expected Build"),
         }
@@ -1756,7 +1756,7 @@ mod tests {
 
     #[test]
     fn test_build_with_short_file_flag() {
-        match parse_build(&["shuttle", "build", "-f", "other.lua"]) {
+        match parse_build(&["nau", "build", "-f", "other.lua"]) {
             Command::Build { file, .. } => assert_eq!(file, "other.lua"),
             _ => panic!("expected Build"),
         }
@@ -1765,7 +1765,7 @@ mod tests {
     #[test]
     fn test_build_with_stage_and_output() {
         match parse_build(&[
-            "shuttle",
+            "nau",
             "build",
             "--stage",
             "/tmp/stage",
@@ -1782,7 +1782,7 @@ mod tests {
 
     #[test]
     fn test_build_with_single_arch() {
-        match parse_build(&["shuttle", "build", "--arch", "arm64"]) {
+        match parse_build(&["nau", "build", "--arch", "arm64"]) {
             Command::Build { arch, .. } => assert_eq!(arch, &["arm64"]),
             _ => panic!("expected Build"),
         }
@@ -1790,7 +1790,7 @@ mod tests {
 
     #[test]
     fn test_build_with_multi_arch() {
-        match parse_build(&["shuttle", "build", "--arch", "amd64", "-A", "arm64"]) {
+        match parse_build(&["nau", "build", "--arch", "amd64", "-A", "arm64"]) {
             Command::Build { arch, .. } => assert_eq!(arch, &["amd64", "arm64"]),
             _ => panic!("expected Build"),
         }
@@ -1798,7 +1798,7 @@ mod tests {
 
     #[test]
     fn test_build_with_positional_output_name() {
-        match parse_build(&["shuttle", "build", "server"]) {
+        match parse_build(&["nau", "build", "server"]) {
             Command::Build { output_name, .. } => {
                 assert_eq!(output_name.as_deref(), Some("server"))
             }
@@ -1809,7 +1809,7 @@ mod tests {
     #[test]
     fn test_build_with_positional_and_flags() {
         match parse_build(&[
-            "shuttle",
+            "nau",
             "build",
             "cli",
             "--file",
@@ -1833,7 +1833,7 @@ mod tests {
 
     #[test]
     fn test_image_defaults() {
-        match parse_build(&["shuttle", "image"]) {
+        match parse_build(&["nau", "image"]) {
             Command::Image {
                 file,
                 output,
@@ -1843,7 +1843,7 @@ mod tests {
                 output_name,
                 ..
             } => {
-                assert_eq!(file, "shuttle.lua");
+                assert_eq!(file, "nau.lua");
                 assert_eq!(output, ".");
                 assert_eq!(arch, "amd64");
                 assert_eq!(channel, "latest/stable");
@@ -1857,7 +1857,7 @@ mod tests {
     #[test]
     fn test_image_with_flags() {
         match parse_build(&[
-            "shuttle",
+            "nau",
             "image",
             "--file",
             "my-image.lua",
@@ -1893,13 +1893,13 @@ mod tests {
 
     #[test]
     fn test_missing_subcommand_fails() {
-        let result = Cli::try_parse_from(["shuttle"]);
+        let result = Cli::try_parse_from(["nau"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_image_source_date_epoch() {
-        match parse_build(&["shuttle", "image", "--source-date-epoch", "0"]) {
+        match parse_build(&["nau", "image", "--source-date-epoch", "0"]) {
             Command::Image {
                 source_date_epoch, ..
             } => {
@@ -1911,7 +1911,7 @@ mod tests {
 
     #[test]
     fn test_image_release_flag() {
-        match parse_build(&["shuttle", "image", "--release", "site/nau"]) {
+        match parse_build(&["nau", "image", "--release", "site/nau"]) {
             Command::Image { release, .. } => {
                 assert_eq!(release.as_deref(), Some("site/nau"));
             }
@@ -1922,7 +1922,7 @@ mod tests {
     #[test]
     fn test_image_release_conflicts_with_output() {
         let result = Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "image",
             "--release",
             "site/nau",
@@ -1939,7 +1939,7 @@ mod tests {
 
     #[test]
     fn test_build_all_flag() {
-        match parse_build(&["shuttle", "build", "--all"]) {
+        match parse_build(&["nau", "build", "--all"]) {
             Command::Build { all, .. } => assert!(all),
             _ => panic!("expected Build"),
         }
@@ -1947,7 +1947,7 @@ mod tests {
 
     #[test]
     fn test_build_cache_flag() {
-        match parse_build(&["shuttle", "build", "--cache", "/tmp/cache"]) {
+        match parse_build(&["nau", "build", "--cache", "/tmp/cache"]) {
             Command::Build { cache, .. } => {
                 assert_eq!(cache.as_deref(), Some("/tmp/cache"));
             }
@@ -1957,7 +1957,7 @@ mod tests {
 
     #[test]
     fn test_build_json_flag() {
-        match parse_build(&["shuttle", "build", "--json"]) {
+        match parse_build(&["nau", "build", "--json"]) {
             Command::Build { json, .. } => assert!(json),
             _ => panic!("expected Build"),
         }
@@ -1965,7 +1965,7 @@ mod tests {
 
     #[test]
     fn test_build_target_flag() {
-        match parse_build(&["shuttle", "build", "--target", "aarch64-linux-gnu"]) {
+        match parse_build(&["nau", "build", "--target", "aarch64-linux-gnu"]) {
             Command::Build { target, .. } => {
                 assert_eq!(target.as_deref(), Some("aarch64-linux-gnu"));
             }
@@ -1975,7 +1975,7 @@ mod tests {
 
     #[test]
     fn test_build_update_one_input() {
-        match parse_build(&["shuttle", "build", "--update", "pkgs"]) {
+        match parse_build(&["nau", "build", "--update", "pkgs"]) {
             Command::Build { update, .. } => assert_eq!(update.as_deref(), Some("pkgs")),
             _ => panic!("expected Build"),
         }
@@ -1983,7 +1983,7 @@ mod tests {
 
     #[test]
     fn test_build_update_all_inputs() {
-        match parse_build(&["shuttle", "build", "--update"]) {
+        match parse_build(&["nau", "build", "--update"]) {
             Command::Build { update, .. } => assert_eq!(update.as_deref(), Some("")),
             _ => panic!("expected Build"),
         }
@@ -1991,7 +1991,7 @@ mod tests {
 
     #[test]
     fn test_build_offline_flag() {
-        match parse_build(&["shuttle", "build", "--offline"]) {
+        match parse_build(&["nau", "build", "--offline"]) {
             Command::Build { offline, .. } => assert!(offline),
             _ => panic!("expected Build"),
         }
@@ -1999,14 +1999,14 @@ mod tests {
 
     #[test]
     fn test_lock_subcommand_defaults() {
-        match Cli::try_parse_from(["shuttle", "lock"]).unwrap().command {
+        match Cli::try_parse_from(["nau", "lock"]).unwrap().command {
             Command::Lock {
                 file,
                 lockfile,
                 json,
             } => {
-                assert_eq!(file, "shuttle.lua");
-                assert_eq!(lockfile, "shuttle.lock");
+                assert_eq!(file, "nau.lua");
+                assert_eq!(lockfile, "nau.lock");
                 assert!(!json);
             }
             _ => panic!("expected Lock"),
@@ -2016,7 +2016,7 @@ mod tests {
     #[test]
     fn test_lock_subcommand_flags() {
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "lock",
             "--file",
             "cfg.lua",
@@ -2036,7 +2036,7 @@ mod tests {
 
     #[test]
     fn test_lock_subcommand_json_flag() {
-        match Cli::try_parse_from(["shuttle", "lock", "--json", "--lockfile", "p.lock"])
+        match Cli::try_parse_from(["nau", "lock", "--json", "--lockfile", "p.lock"])
             .unwrap()
             .command
         {
@@ -2050,7 +2050,7 @@ mod tests {
 
     #[test]
     fn test_image_json_flag() {
-        match parse_build(&["shuttle", "image", "--json"]) {
+        match parse_build(&["nau", "image", "--json"]) {
             Command::Image { json, .. } => assert!(json),
             _ => panic!("expected Image"),
         }
@@ -2058,7 +2058,7 @@ mod tests {
 
     #[test]
     fn test_deps_json_flag() {
-        let args = ["shuttle", "deps", "show", "glibc", "--json"];
+        let args = ["nau", "deps", "show", "glibc", "--json"];
         let cmd = Cli::try_parse_from(args).unwrap().command;
         match cmd {
             Command::Deps(DepsCommand::Show { json, .. }) => assert!(json),
@@ -2068,7 +2068,7 @@ mod tests {
 
     #[test]
     fn test_deps_fetch_parses() {
-        let args = ["shuttle", "deps", "fetch", "--name", "work", "--latest"];
+        let args = ["nau", "deps", "fetch", "--name", "work", "--latest"];
         let cmd = Cli::try_parse_from(args).unwrap().command;
         match cmd {
             Command::Deps(DepsCommand::Fetch { name, latest, .. }) => {
@@ -2082,7 +2082,7 @@ mod tests {
     #[test]
     fn test_build_all_flags_combo() {
         match parse_build(&[
-            "shuttle",
+            "nau",
             "build",
             "--all",
             "--cache",
@@ -2109,7 +2109,7 @@ mod tests {
 
     #[test]
     fn test_check_with_json_flag() {
-        match Cli::try_parse_from(["shuttle", "check", "cfg.lua", "--json"])
+        match Cli::try_parse_from(["nau", "check", "cfg.lua", "--json"])
             .unwrap()
             .command
         {
@@ -2123,7 +2123,7 @@ mod tests {
 
     #[test]
     fn test_completion_bash() {
-        match Cli::try_parse_from(["shuttle", "completion", "bash"])
+        match Cli::try_parse_from(["nau", "completion", "bash"])
             .unwrap()
             .command
         {
@@ -2136,7 +2136,7 @@ mod tests {
 
     #[test]
     fn test_cache_info() {
-        match Cli::try_parse_from(["shuttle", "cache", "info"])
+        match Cli::try_parse_from(["nau", "cache", "info"])
             .unwrap()
             .command
         {
@@ -2147,7 +2147,7 @@ mod tests {
 
     #[test]
     fn test_cache_clear() {
-        match Cli::try_parse_from(["shuttle", "cache", "clear", "--force"])
+        match Cli::try_parse_from(["nau", "cache", "clear", "--force"])
             .unwrap()
             .command
         {
@@ -2158,7 +2158,7 @@ mod tests {
 
     #[test]
     fn test_cache_prune() {
-        match Cli::try_parse_from(["shuttle", "cache", "prune", "--days", "60", "--force"])
+        match Cli::try_parse_from(["nau", "cache", "prune", "--days", "60", "--force"])
             .unwrap()
             .command
         {
@@ -2172,7 +2172,7 @@ mod tests {
 
     #[test]
     fn test_runtime_install_defaults() {
-        match Cli::try_parse_from(["shuttle", "runtime", "install", "hello"])
+        match Cli::try_parse_from(["nau", "runtime", "install", "hello"])
             .unwrap()
             .command
         {
@@ -2194,7 +2194,7 @@ mod tests {
     #[test]
     fn test_runtime_install_flags() {
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "runtime",
             "install",
             "hello",
@@ -2223,7 +2223,7 @@ mod tests {
 
     #[test]
     fn test_runtime_remove_and_rollback_and_gc() {
-        match Cli::try_parse_from(["shuttle", "runtime", "remove", "hello", "--json"])
+        match Cli::try_parse_from(["nau", "runtime", "remove", "hello", "--json"])
             .unwrap()
             .command
         {
@@ -2233,7 +2233,7 @@ mod tests {
             }
             _ => panic!("expected Runtime Remove"),
         }
-        match Cli::try_parse_from(["shuttle", "runtime", "rollback", "3"])
+        match Cli::try_parse_from(["nau", "runtime", "rollback", "3"])
             .unwrap()
             .command
         {
@@ -2242,7 +2242,7 @@ mod tests {
             }
             _ => panic!("expected Runtime Rollback"),
         }
-        match Cli::try_parse_from(["shuttle", "runtime", "rollback"])
+        match Cli::try_parse_from(["nau", "runtime", "rollback"])
             .unwrap()
             .command
         {
@@ -2251,7 +2251,7 @@ mod tests {
             }
             _ => panic!("expected Runtime Rollback default"),
         }
-        match Cli::try_parse_from(["shuttle", "runtime", "gc", "--prune"])
+        match Cli::try_parse_from(["nau", "runtime", "gc", "--prune"])
             .unwrap()
             .command
         {
@@ -2263,7 +2263,7 @@ mod tests {
     #[test]
     fn test_runtime_activate() {
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "runtime",
             "activate",
             "--state-dir",
@@ -2280,7 +2280,7 @@ mod tests {
             _ => panic!("expected Runtime Activate"),
         }
         // Defaults: no state-dir, human output.
-        match Cli::try_parse_from(["shuttle", "runtime", "activate"])
+        match Cli::try_parse_from(["nau", "runtime", "activate"])
             .unwrap()
             .command
         {
@@ -2294,7 +2294,7 @@ mod tests {
 
     #[test]
     fn test_runtime_upgrade_all() {
-        match Cli::try_parse_from(["shuttle", "runtime", "upgrade", "--all"])
+        match Cli::try_parse_from(["nau", "runtime", "upgrade", "--all"])
             .unwrap()
             .command
         {
@@ -2304,7 +2304,7 @@ mod tests {
             }
             _ => panic!("expected Runtime Upgrade"),
         }
-        match Cli::try_parse_from(["shuttle", "runtime", "upgrade", "hello"])
+        match Cli::try_parse_from(["nau", "runtime", "upgrade", "hello"])
             .unwrap()
             .command
         {
@@ -2320,7 +2320,7 @@ mod tests {
 
     #[test]
     fn test_runtime_recover_slots_defaults_and_flag() {
-        match Cli::try_parse_from(["shuttle", "runtime", "recover-slots"])
+        match Cli::try_parse_from(["nau", "runtime", "recover-slots"])
             .unwrap()
             .command
         {
@@ -2330,7 +2330,7 @@ mod tests {
             _ => panic!("expected Runtime RecoverSlots"),
         }
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "runtime",
             "recover-slots",
             "--esp-mount",
@@ -2350,7 +2350,7 @@ mod tests {
 
     #[test]
     fn test_key_keygen_defaults_and_flags() {
-        match Cli::try_parse_from(["shuttle", "key", "keygen"])
+        match Cli::try_parse_from(["nau", "key", "keygen"])
             .unwrap()
             .command
         {
@@ -2360,7 +2360,7 @@ mod tests {
             }
             _ => panic!("expected Key Keygen"),
         }
-        match Cli::try_parse_from(["shuttle", "key", "keygen", "--home", "/tmp/k", "--json"])
+        match Cli::try_parse_from(["nau", "key", "keygen", "--home", "/tmp/k", "--json"])
             .unwrap()
             .command
         {
@@ -2374,7 +2374,7 @@ mod tests {
 
     #[test]
     fn test_key_rotate_promote_and_revoke() {
-        match Cli::try_parse_from(["shuttle", "key", "rotate"])
+        match Cli::try_parse_from(["nau", "key", "rotate"])
             .unwrap()
             .command
         {
@@ -2396,7 +2396,7 @@ mod tests {
             _ => panic!("expected Key Rotate"),
         }
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "key",
             "rotate",
             "--manifest",
@@ -2423,7 +2423,7 @@ mod tests {
             }
             _ => panic!("expected Key Rotate with manifest and window"),
         }
-        match Cli::try_parse_from(["shuttle", "key", "promote", "--json"])
+        match Cli::try_parse_from(["nau", "key", "promote", "--json"])
             .unwrap()
             .command
         {
@@ -2431,7 +2431,7 @@ mod tests {
             _ => panic!("expected Key Promote"),
         }
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "key",
             "revoke",
             "deadbeef00112233",
@@ -2449,12 +2449,12 @@ mod tests {
             _ => panic!("expected Key Revoke"),
         }
         // `revoke` requires its key-id positional.
-        assert!(Cli::try_parse_from(["shuttle", "key", "revoke"]).is_err());
+        assert!(Cli::try_parse_from(["nau", "key", "revoke"]).is_err());
     }
 
     #[test]
     fn test_key_list_and_verify_parse() {
-        match Cli::try_parse_from(["shuttle", "key", "list", "--json"])
+        match Cli::try_parse_from(["nau", "key", "list", "--json"])
             .unwrap()
             .command
         {
@@ -2464,7 +2464,7 @@ mod tests {
             }
             _ => panic!("expected Key List"),
         }
-        match Cli::try_parse_from(["shuttle", "key", "verify", "m.json"])
+        match Cli::try_parse_from(["nau", "key", "verify", "m.json"])
             .unwrap()
             .command
         {
@@ -2480,12 +2480,12 @@ mod tests {
             _ => panic!("expected Key Verify"),
         }
         // `verify` requires its manifest positional.
-        assert!(Cli::try_parse_from(["shuttle", "key", "verify"]).is_err());
+        assert!(Cli::try_parse_from(["nau", "key", "verify"]).is_err());
     }
 
     #[test]
     fn test_ca_keygen_and_list_parse() {
-        match Cli::try_parse_from(["shuttle", "ca", "keygen"])
+        match Cli::try_parse_from(["nau", "ca", "keygen"])
             .unwrap()
             .command
         {
@@ -2497,7 +2497,7 @@ mod tests {
             _ => panic!("expected Ca Keygen"),
         }
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "ca",
             "keygen",
             "--home",
@@ -2515,7 +2515,7 @@ mod tests {
             }
             _ => panic!("expected Ca Keygen with flags"),
         }
-        match Cli::try_parse_from(["shuttle", "ca", "list", "--json"])
+        match Cli::try_parse_from(["nau", "ca", "list", "--json"])
             .unwrap()
             .command
         {
@@ -2526,14 +2526,14 @@ mod tests {
             _ => panic!("expected Ca List"),
         }
         // `ca` refuses to run without a verb.
-        assert!(Cli::try_parse_from(["shuttle", "ca"]).is_err());
+        assert!(Cli::try_parse_from(["nau", "ca"]).is_err());
     }
 
     // ── OCI push/pull (Phase 25) ──
 
     #[test]
     fn test_push_defaults() {
-        match Cli::try_parse_from(["shuttle", "push", "localhost:5000/team/app"])
+        match Cli::try_parse_from(["nau", "push", "localhost:5000/team/app"])
             .unwrap()
             .command
         {
@@ -2568,7 +2568,7 @@ mod tests {
     #[test]
     fn test_push_flags() {
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "push",
             "localhost:5000/team/app",
             "--dir",
@@ -2614,12 +2614,12 @@ mod tests {
 
     #[test]
     fn test_push_requires_reference() {
-        assert!(Cli::try_parse_from(["shuttle", "push"]).is_err());
+        assert!(Cli::try_parse_from(["nau", "push"]).is_err());
     }
 
     #[test]
     fn test_pull_defaults() {
-        match Cli::try_parse_from(["shuttle", "pull", "ghcr.io/owner/repo:v1"])
+        match Cli::try_parse_from(["nau", "pull", "ghcr.io/owner/repo:v1"])
             .unwrap()
             .command
         {
@@ -2657,7 +2657,7 @@ mod tests {
     #[test]
     fn test_pull_flags() {
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "pull",
             "localhost:5000/team/app",
             "--out-dir",
@@ -2704,7 +2704,7 @@ mod tests {
 
     #[test]
     fn test_test_defaults() {
-        match Cli::try_parse_from(["shuttle", "test", "disk.img"])
+        match Cli::try_parse_from(["nau", "test", "disk.img"])
             .unwrap()
             .command
         {
@@ -2740,7 +2740,7 @@ mod tests {
     #[test]
     fn test_test_flags() {
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "test",
             "disk.img",
             "--timeout",
@@ -2792,7 +2792,7 @@ mod tests {
         // value is one argv token; values starting with '-' use clap's
         // `=` form so they are not parsed as flags.
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "test",
             "disk.img",
             "--qemu-arg=-nic",
@@ -2811,17 +2811,17 @@ mod tests {
 
     #[test]
     fn test_test_requires_image() {
-        assert!(Cli::try_parse_from(["shuttle", "test"]).is_err());
+        assert!(Cli::try_parse_from(["nau", "test"]).is_err());
     }
 
-    // ── `shuttle run` command form (issue #102) ──
+    // ── `nau run` command form (issue #102) ──
 
     #[test]
     fn test_run_double_dash_starts_the_command_form() {
         // `--` is sugar for the command form: the first word after it is
         // the program, the rest its args — forwarded verbatim, hyphens
         // included.
-        match parse_build(&["shuttle", "run", "--", "git", "-c", "x", "status"]) {
+        match parse_build(&["nau", "run", "--", "git", "-c", "x", "status"]) {
             Command::Run { app, app_args, .. } => {
                 assert_eq!(app.as_deref(), Some("git"));
                 assert_eq!(app_args, ["-c", "x", "status"]);
@@ -2832,7 +2832,7 @@ mod tests {
 
     #[test]
     fn test_run_pod_flag_before_the_double_dash() {
-        match parse_build(&["shuttle", "run", "--pod", "daily", "--", "true"]) {
+        match parse_build(&["nau", "run", "--pod", "daily", "--", "true"]) {
             Command::Run { app, pod, .. } => {
                 assert_eq!(app.as_deref(), Some("true"));
                 assert_eq!(pod.as_deref(), Some("daily"));
@@ -2843,11 +2843,11 @@ mod tests {
 
     #[test]
     fn test_run_bare_parses_without_an_app() {
-        // Bare `shuttle run` parses (the dispatch turns it into a usage
+        // Bare `nau run` parses (the dispatch turns it into a usage
         // error naming both forms). It must NOT be a clap error: the
         // confined launcher forwards `<app> "$@"` without a `--`, so the
         // positional has to stay optional.
-        match parse_build(&["shuttle", "run"]) {
+        match parse_build(&["nau", "run"]) {
             Command::Run { app, app_args, .. } => {
                 assert_eq!(app, None);
                 assert!(app_args.is_empty());
@@ -2862,7 +2862,7 @@ mod tests {
         // no `--` anywhere. (Hyphen-leading values here never parsed
         // without a `--`, before or after #102 — clap rejects them as
         // unknown flags.)
-        match parse_build(&["shuttle", "run", "--pod", "work", "gcm", "cred"]) {
+        match parse_build(&["nau", "run", "--pod", "work", "gcm", "cred"]) {
             Command::Run {
                 app, pod, app_args, ..
             } => {
@@ -2877,7 +2877,7 @@ mod tests {
     // `--name` before the verb lands on the `pod` command's own field.
     #[test]
     fn pod_name_before_verb_parses_into_parent_field() {
-        match Cli::try_parse_from(["shuttle", "pod", "--name", "daily", "add", "jq"])
+        match Cli::try_parse_from(["nau", "pod", "--name", "daily", "add", "jq"])
             .unwrap()
             .command
         {
@@ -2892,7 +2892,7 @@ mod tests {
     // `--name` after the verb lands on the verb's flattened PodTarget.
     #[test]
     fn pod_name_after_verb_parses_into_verb_field() {
-        match Cli::try_parse_from(["shuttle", "pod", "shellenv", "--name", "daily"])
+        match Cli::try_parse_from(["nau", "pod", "shellenv", "--name", "daily"])
             .unwrap()
             .command
         {
@@ -2917,7 +2917,7 @@ mod tests {
     fn pod_add_requires_package_or_snap() {
         use clap::error::ErrorKind;
         assert_eq!(
-            parse_err(&["shuttle", "pod", "add"]).kind(),
+            parse_err(&["nau", "pod", "add"]).kind(),
             ErrorKind::MissingRequiredArgument
         );
     }
@@ -2927,7 +2927,7 @@ mod tests {
     fn pod_add_snap_conflicts_with_package() {
         use clap::error::ErrorKind;
         assert_eq!(
-            parse_err(&["shuttle", "pod", "add", "--snap", "p.snap", "hello"]).kind(),
+            parse_err(&["nau", "pod", "add", "--snap", "p.snap", "hello"]).kind(),
             ErrorKind::ArgumentConflict
         );
     }
@@ -2937,7 +2937,7 @@ mod tests {
     fn pod_add_ack_unsigned_requires_snap() {
         use clap::error::ErrorKind;
         assert_eq!(
-            parse_err(&["shuttle", "pod", "add", "--ack-unsigned"]).kind(),
+            parse_err(&["nau", "pod", "add", "--ack-unsigned"]).kind(),
             ErrorKind::MissingRequiredArgument
         );
     }
@@ -2945,7 +2945,7 @@ mod tests {
     // The two happy shapes parse into their fields.
     #[test]
     fn pod_add_happy_shapes_parse() {
-        match Cli::try_parse_from(["shuttle", "pod", "add", "hello"])
+        match Cli::try_parse_from(["nau", "pod", "add", "hello"])
             .unwrap()
             .command
         {
@@ -2965,16 +2965,9 @@ mod tests {
             }
             _ => panic!("expected pod add"),
         }
-        match Cli::try_parse_from([
-            "shuttle",
-            "pod",
-            "add",
-            "--snap",
-            "p.snap",
-            "--ack-unsigned",
-        ])
-        .unwrap()
-        .command
+        match Cli::try_parse_from(["nau", "pod", "add", "--snap", "p.snap", "--ack-unsigned"])
+            .unwrap()
+            .command
         {
             Command::Pod {
                 command:
@@ -3000,7 +2993,7 @@ mod tests {
         // refuses it (and anything past the 50 fan-out cap) at the CLI
         // boundary.
         let base = [
-            "shuttle",
+            "nau",
             "workers",
             "provision",
             "--provider",
@@ -3044,7 +3037,7 @@ mod tests {
     fn test_workers_issue_and_pickup_parse() {
         // Defaults: all pending identities, the 48h default validity, no
         // force.
-        match Cli::try_parse_from(["shuttle", "workers", "issue"])
+        match Cli::try_parse_from(["nau", "workers", "issue"])
             .unwrap()
             .command
         {
@@ -3070,13 +3063,13 @@ mod tests {
             _ => panic!("expected Workers Issue"),
         }
         match Cli::try_parse_from([
-            "shuttle",
+            "nau",
             "workers",
             "issue",
             "--home",
             "/tmp/ca-home",
             "--identity",
-            "shuttle-worker-abc123-01",
+            "nau-worker-abc123-01",
             "--validity",
             "+2d12h",
             "--force",
@@ -3096,14 +3089,14 @@ mod tests {
                     },
             } => {
                 assert_eq!(home.as_deref(), Some("/tmp/ca-home"));
-                assert_eq!(identity.as_deref(), Some("shuttle-worker-abc123-01"));
+                assert_eq!(identity.as_deref(), Some("nau-worker-abc123-01"));
                 assert_eq!(validity, "+2d12h");
                 assert!(force);
                 assert!(json);
             }
             _ => panic!("expected Workers Issue with flags"),
         }
-        match Cli::try_parse_from(["shuttle", "workers", "pickup", "--home", "/tmp/ca-home"])
+        match Cli::try_parse_from(["nau", "workers", "pickup", "--home", "/tmp/ca-home"])
             .unwrap()
             .command
         {
@@ -3118,7 +3111,7 @@ mod tests {
 
     #[test]
     fn doctor_pod_bare_is_scope_only() {
-        match Cli::try_parse_from(["shuttle", "doctor", "--pod"])
+        match Cli::try_parse_from(["nau", "doctor", "--pod"])
             .unwrap()
             .command
         {
@@ -3135,7 +3128,7 @@ mod tests {
 
     #[test]
     fn doctor_pod_with_name_carries_identity() {
-        match Cli::try_parse_from(["shuttle", "doctor", "--pod", "work"])
+        match Cli::try_parse_from(["nau", "doctor", "--pod", "work"])
             .unwrap()
             .command
         {
@@ -3143,7 +3136,7 @@ mod tests {
             _ => panic!("expected Doctor"),
         }
         // The `=` form too.
-        match Cli::try_parse_from(["shuttle", "doctor", "--pod=work"])
+        match Cli::try_parse_from(["nau", "doctor", "--pod=work"])
             .unwrap()
             .command
         {
@@ -3154,7 +3147,7 @@ mod tests {
 
     #[test]
     fn doctor_pod_does_not_swallow_a_following_flag() {
-        match Cli::try_parse_from(["shuttle", "doctor", "--pod", "--fix"])
+        match Cli::try_parse_from(["nau", "doctor", "--pod", "--fix"])
             .unwrap()
             .command
         {
@@ -3168,7 +3161,7 @@ mod tests {
 
     #[test]
     fn doctor_without_pod_behaves_as_today() {
-        match Cli::try_parse_from(["shuttle", "doctor", "--fix"])
+        match Cli::try_parse_from(["nau", "doctor", "--fix"])
             .unwrap()
             .command
         {

@@ -1,7 +1,7 @@
 -- Minimal rootfs image for QEMU/KVM (issue #74 sanity chain)
 --
 -- The original draft of this example declared every member as a local
--- shuttle-built package (`base = pin("systemd")`, `pin("glibc")`,
+-- nau-built package (`base = pin("systemd")`, `pin("glibc")`,
 -- `pin("bash")`, …). Image builds resolve EVERY reference through the Snap
 -- Store, and none of those names exist in series 16 (verified against the
 -- store API, 2026-09-13) — the example could not build at all. It now
@@ -11,14 +11,14 @@
 -- Compose a bootable disk image with:
 --   - core22 base rootfs
 --   - pc-kernel with serial-console boot params (the #70 payload:
---     a prebuilt kernel.efi UKI, split and re-assembled by shuttle)
+--     a prebuilt kernel.efi UKI, split and re-assembled by nau)
 --   - pc-gadget
 --   - snapd
 --   - GPT disk: ESP (vfat) + root (ext4)
 --   - systemd-boot bootloader
 --
 -- Build:
---   shuttle image --file examples/full-system/system-base/shuttle.lua --arch amd64
+--   nau image --file examples/full-system/system-base/nau.lua --arch amd64
 --
 -- Boot:
 --   qemu-system-x86_64 -m 2G -smp 2 -enable-kvm        \

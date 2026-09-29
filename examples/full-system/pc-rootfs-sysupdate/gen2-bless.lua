@@ -10,13 +10,13 @@
 -- FRESH copy of the gen-1 device: sysupdate sees 1.0 -> 2.0 exactly once,
 -- the counted boot is asserted with `--expect-counter-seq 3-0`, and the
 -- next boot's archived ESP listing shows the shed
--- `shuttle-80_2.0.efi` — blessing proven via the ESP.
+-- `nau-80_2.0.efi` — blessing proven via the ESP.
 --
--- Build: shuttle image --file gen2-bless.lua --arch amd64 --output "$OUT/gen2b"
+-- Build: nau image --file gen2-bless.lua --arch amd64 --output "$OUT/gen2b"
 
 return {
     rootfs = image {
-        name = "shuttle-80",
+        name = "nau-80",
         version = "2.0",
 
         base = index("core22"),
@@ -27,8 +27,8 @@ return {
                 "console=ttyS0",
                 "net.ifnames=0",
                 "systemd.unified_cgroup_hierarchy=1",
-                "systemd.wants=shuttle-80-proof.service",
-                "systemd.wants=shuttle-80-poweroff.service",
+                "systemd.wants=nau-80-proof.service",
+                "systemd.wants=nau-80-poweroff.service",
             },
             modules = {
                 "nvme",
@@ -89,8 +89,8 @@ return {
         boot_health_exec = "/bin/true",
 
         files = {
-            { source = "proof/gen2/shuttle-80-proof.service", dest = "/etc/systemd/system/shuttle-80-proof.service" },
-            { source = "proof/poweroff.service",              dest = "/etc/systemd/system/shuttle-80-poweroff.service" },
+            { source = "proof/gen2/nau-80-proof.service", dest = "/etc/systemd/system/nau-80-proof.service" },
+            { source = "proof/poweroff.service",              dest = "/etc/systemd/system/nau-80-poweroff.service" },
             { source = "proof/gen2/generation",               dest = "/etc/generation" },
         },
     },

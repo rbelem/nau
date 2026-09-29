@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nau — the ship you live on</title>
-  <meta name="description" content="Nau is the immutable, verity-protected A/B distribution shuttle assembles. First mission: Cassini, 1.0. Install is a flash of a mission image; updates ride the ground track.">
+  <meta name="description" content="Nau is the immutable, verity-protected A/B distribution nau assembles. First mission: Cassini, 1.0. Install is a flash of a mission image; updates ride the ground track.">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'">
   <link rel="icon" type="image/svg+xml" href="/assets/patch.svg">
   <link rel="stylesheet" href="/css/fonts.css">
@@ -48,13 +48,13 @@
           <div>
             <p class="tag">The ship you <em>live on</em>.</p>
             <p class="blurb">Nau is the immutable, verity-protected A/B distribution that
-              <a href="https://github.com/rbelem/shuttle">shuttle</a> assembles from declared
+              <a href="https://github.com/rbelem/nau">nau</a> assembles from declared
               packages. Install is a flash of a mission image; updates ride the ground track
               from the download lane; rollback is simply the other slot.</p>
           </div>
           <div class="hero-cta">
             <a class="btn" href="/download.html">Open the payload bay</a>
-            <a class="btn ghost" href="https://github.com/rbelem/shuttle/blob/main/docs/adr/0044-nau-install-path.md">Flight rules — ADR-0044</a>
+            <a class="btn ghost" href="https://github.com/rbelem/nau/blob/main/docs/adr/0044-nau-install-path.md">Flight rules — ADR-0044</a>
           </div>
         </div>
       </div>
@@ -143,16 +143,16 @@
 
         <ul class="lanes">
           <li>
-            <a href="https://github.com/rbelem/shuttle">
+            <a href="https://github.com/rbelem/nau">
               <span class="lane-id">Repo</span>
-              <span class="lane-name">rbelem/shuttle</span>
-              <span class="lane-desc">The assembler. shuttle builds Nau from Lua
+              <span class="lane-name">rbelem/nau</span>
+              <span class="lane-desc">The assembler. nau builds Nau from Lua
                 declarations — a programmable replacement for Snapcraft's YAML.
                 GPL-3.0-only, Linux-only.</span>
             </a>
           </li>
           <li>
-            <a href="https://github.com/rbelem/shuttle/blob/main/docs/adr/0013-project-rename-shuttle.md">
+            <a href="https://github.com/rbelem/nau/blob/main/docs/adr/0013-project-rename-nau.md">
               <span class="lane-id">ADR-0013</span>
               <span class="lane-name">Brand rules</span>
               <span class="lane-desc">The rename record: why Nau, how missions are
@@ -160,7 +160,7 @@
             </a>
           </li>
           <li>
-            <a href="https://github.com/rbelem/shuttle/blob/main/docs/adr/0044-nau-install-path.md">
+            <a href="https://github.com/rbelem/nau/blob/main/docs/adr/0044-nau-install-path.md">
               <span class="lane-id">ADR-0044</span>
               <span class="lane-name">Flight rules</span>
               <span class="lane-desc">The install path: mission images, the dd flash,
@@ -169,7 +169,7 @@
             </a>
           </li>
           <li>
-            <a href="https://github.com/rbelem/shuttle/blob/main/docs/nau-ops-runbook.md">
+            <a href="https://github.com/rbelem/nau/blob/main/docs/nau-ops-runbook.md">
               <span class="lane-id">Runbook</span>
               <span class="lane-name">Operator runbook</span>
               <span class="lane-desc">The release-to-flash trust chain, end to end:
@@ -191,7 +191,7 @@
               <span class="lane-id">Lane · cache</span>
               <span class="lane-name">cache.nau.rclb.dev</span>
               <span class="lane-desc">The public package mirror of the released pool —
-                what <code>shuttle pull</code> and Nau pods consume, with a freshness
+                what <code>nau pull</code> and Nau pods consume, with a freshness
                 stamp per publish.</span>
             </a>
           </li>
@@ -203,12 +203,12 @@
 
   <footer class="colophon">
     <div class="wrap">
-      <span>Nau — assembled by shuttle · content per ADR-0013</span>
+      <span>Nau — assembled by nau · content per ADR-0013</span>
       <nav aria-label="Footer">
         <ul>
           <li><a href="/">Landing</a></li>
           <li><a href="/download.html">Download</a></li>
-          <li><a href="https://github.com/rbelem/shuttle">rbelem/shuttle</a></li>
+          <li><a href="https://github.com/rbelem/nau">rbelem/nau</a></li>
           <li><a href="https://cache.nau.rclb.dev/">cache lane</a></li>
         </ul>
       </nav>

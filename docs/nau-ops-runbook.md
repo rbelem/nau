@@ -43,7 +43,7 @@ structural isolation beats procedural care (#271; INFRA D5).
 
 1. Create a dedicated project in the Hetzner Cloud Console (projects are
    console-level; the API/token surface sits *inside* a project, so this
-   step is manual). Name is free — `shuttle-workers` reads well.
+   step is manual). Name is free — `nau-workers` reads well.
 2. In the new project: Security → API tokens → create an API token with
    **Read + Write** (the CLI needs write for server create/destroy and
    firewall attach; hcloud project tokens cannot reach resources in other
@@ -74,8 +74,8 @@ export HCLOUD_TOKEN="$HETZNER_WORKER_TOKEN"
 # source: #271 "firewall attached at create time; ssh ingress from the
 # operator's addresses only" — PLAN checklist has no server-side firewall
 # step, so this is account-side by design
-hcloud firewall create --name shuttle-workers-fw
-hcloud firewall add-rule shuttle-workers-fw \
+hcloud firewall create --name nau-workers-fw
+hcloud firewall add-rule nau-workers-fw \
     --direction in --protocol tcp --port 22 \
     --source-ips <coordinator-or-tailnet-ip>/32[,<second-ip>/32]
 ```
@@ -145,9 +145,9 @@ hcloud server list
 #    (image choice is immaterial to this test; the fleet OS contract is
 #    PROVIDERS §3's, owned by #194/#276):
 hcloud server create --name fw-attach-test --type cx23 --location hel1 \
-    --image ubuntu-24.04 --firewall shuttle-workers-fw \
+    --image ubuntu-24.04 --firewall nau-workers-fw \
     --ssh-key <operator-key>
-hcloud firewall describe shuttle-workers-fw   # → applied_to: fw-attach-test
+hcloud firewall describe nau-workers-fw   # → applied_to: fw-attach-test
 
 # 3. Clean destroy — server + volume (#271 gate):
 hcloud volume create --name fw-attach-test-vol --size 10 \
@@ -248,7 +248,7 @@ www.nau.rclb.dev {
 	# three vhosts" but no source pins the exact set — OPEN ITEM, decide
 	# before serving real traffic. HSTS waits until every consumer is
 	# confirmed https-capable (PLAN decision 6): sysupdate is; old
-	# `shuttle pull` versions must be checked before flipping it.
+	# `nau pull` versions must be checked before flipping it.
 	# header { ... }
 }
 
@@ -341,8 +341,8 @@ the successor kuma runs.
 > fan-out.** Alerts go to ALL configured mechanisms — first-class kuma push
 > and ntfy topics, extensible to further destinations — LANDED under #296
 > alongside #287's sweep axes: the sweep's destination list is
-> `SHUTTLE_SWEEP_KUMA_URLS` + `SHUTTLE_SWEEP_NTFY_URLS` +
-> `SHUTTLE_SWEEP_ALERT_CMD` (the extensibility seam; a command string per
+> `NAU_SWEEP_KUMA_URLS` + `NAU_SWEEP_NTFY_URLS` +
+> `NAU_SWEEP_ALERT_CMD` (the extensibility seam; a command string per
 > alert, "$1" = the one-line summary). Every alert fans out to all of
 > them; one destination failing is named and never silences the others
 > (the run fails when it does — an unacked alert is itself alarm-worthy).
@@ -353,9 +353,9 @@ the successor kuma runs.
 
 Artifacts live in THIS repo:
 
-- `scripts/shuttle-worker-ttl-sweep` — the sweep script (POSIX sh;
-  independent of shuttle code; fake-CLI test suite beside it,
-  `shuttle-worker-ttl-sweep-test.sh`).
+- `scripts/nau-worker-ttl-sweep` — the sweep script (POSIX sh;
+  independent of nau code; fake-CLI test suite beside it,
+  `nau-worker-ttl-sweep-test.sh`).
 - `scripts/systemd-user/` — the workstation systemd **user** units,
   mirroring the zet repo's `update-timer.yml` pattern (systemd user
   timer, not cron; workstation-only — the credentials live there).
@@ -368,15 +368,15 @@ to `~/.config/systemd/user/`, then):
 systemctl --user daemon-reload
 systemctl --user enable --now <sweep-timer>.timer    # name per #269
 systemctl --user is-active <sweep-timer>.timer       # verify
-scripts/shuttle-worker-ttl-sweep                     # first run: dry-run IS the
+scripts/nau-worker-ttl-sweep                     # first run: dry-run IS the
                                                      # default for two weeks (#269)
 ```
 
 ### 5.1 Axes (#287)
 
 The hcloud axis is ALWAYS on (the #269 v2 rules, unchanged). The four
-non-hcloud axes are OPT-IN — each queries the exact `shuttle-worker` /
-`shuttle-worker-ttl` (epoch-seconds expiry) tags its provider stamps at
+non-hcloud axes are OPT-IN — each queries the exact `nau-worker` /
+`nau-worker-ttl` (epoch-seconds expiry) tags its provider stamps at
 create time, runs the SAME v2 rule engine (tag → in-guest marker copy →
 48h-alert/72h-destroy age floor), and mirrors its provider's own destroy
 verb and residual warnings:
@@ -384,10 +384,10 @@ verb and residual warnings:
 | axis | enable | CLI (+creds the CLI reads from the env/config) | destroy | residuals named before/after |
 |---|---|---|---|---|
 | hcloud | always on | `hcloud` (`HCLOUD_TOKEN`, §1) | `server delete` — **BLOCKED** unless `volume list --server X` is empty (checked in dry-run too) | — (the gate IS the check) |
-| aws | `SHUTTLE_SWEEP_AWS=1` | `aws` (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`; region from `AWS_DEFAULT_REGION`/profile — the create's `--region` discipline) | `ec2 terminate-instances` | attached volumes with `DeleteOnTermination=false` (warn, terminate proceeds); a FAILED volume check blocks |
-| gcp | `SHUTTLE_SWEEP_GCP=1` | `gcloud` (ADC / `gcloud auth`; project+zone from the CLI config) | `compute instances delete --zone Z` (zone from the listing) | disks with `autoDelete` off (warn, delete proceeds); a FAILED describe blocks |
-| azure | `SHUTTLE_SWEEP_AZURE=1` | `az` (`az login` state; subscription from the CLI config) | `vm delete --resource-group RG` | disks with `deleteOption != Delete` (warn, proceeds); post-delete unattached NIC + public-IP orphans (public IPs bill); a FAILED disk check blocks |
-| scaleway | `SHUTTLE_SWEEP_SCW=1` | `scw` (`SCW_ACCESS_KEY`/`SCW_SECRET_KEY`; zone from `SCW_DEFAULT_ZONE`/config — the create's `-z` discipline) | `instance server delete server-id=ID` | attached volumes (a delete only DETACHES them — they keep billing; warn, proceeds); a FAILED get blocks |
+| aws | `NAU_SWEEP_AWS=1` | `aws` (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`; region from `AWS_DEFAULT_REGION`/profile — the create's `--region` discipline) | `ec2 terminate-instances` | attached volumes with `DeleteOnTermination=false` (warn, terminate proceeds); a FAILED volume check blocks |
+| gcp | `NAU_SWEEP_GCP=1` | `gcloud` (ADC / `gcloud auth`; project+zone from the CLI config) | `compute instances delete --zone Z` (zone from the listing) | disks with `autoDelete` off (warn, delete proceeds); a FAILED describe blocks |
+| azure | `NAU_SWEEP_AZURE=1` | `az` (`az login` state; subscription from the CLI config) | `vm delete --resource-group RG` | disks with `deleteOption != Delete` (warn, proceeds); post-delete unattached NIC + public-IP orphans (public IPs bill); a FAILED disk check blocks |
+| scaleway | `NAU_SWEEP_SCW=1` | `scw` (`SCW_ACCESS_KEY`/`SCW_SECRET_KEY`; zone from `SCW_DEFAULT_ZONE`/config — the create's `-z` discipline) | `instance server delete server-id=ID` | attached volumes (a delete only DETACHES them — they keep billing; warn, proceeds); a FAILED get blocks |
 
 Axis failure semantics: a named per-axis failure (missing binary/jq on an
 enabled axis, enumerate/parse/delete API failure) alerts, counts, fails
@@ -405,10 +405,10 @@ destinations; each destination's failure is named, counted, and fails the
 run — and never blocks or silences the others:
 
 ```bash
-# in ~/.config/shuttle/worker-ttl-sweep.env (the unit's EnvironmentFile)
-SHUTTLE_SWEEP_KUMA_URLS="https://kuma.example/api/push/TOKEN1 https://kuma.example/api/push/TOKEN2"
-SHUTTLE_SWEEP_NTFY_URLS="https://ntfy.example/shuttle-workers"
-SHUTTLE_SWEEP_ALERT_CMD='curl -s --data-binary "$1" https://example/hook'   # extensibility seam
+# in ~/.config/nau/worker-ttl-sweep.env (the unit's EnvironmentFile)
+NAU_SWEEP_KUMA_URLS="https://kuma.example/api/push/TOKEN1 https://kuma.example/api/push/TOKEN2"
+NAU_SWEEP_NTFY_URLS="https://ntfy.example/nau-workers"
+NAU_SWEEP_ALERT_CMD='curl -s --data-binary "$1" https://example/hook'   # extensibility seam
 ```
 
 - **kuma push** — alerts POST `status=down&msg=<alert>`; every CLEAN run
@@ -417,14 +417,14 @@ SHUTTLE_SWEEP_ALERT_CMD='curl -s --data-binary "$1" https://example/hook'   # ex
   pages by itself).
 - **ntfy** — alerts are POSTed as the topic message body; no clean-run
   pings (a notification channel, not a status channel).
-- **`SHUTTLE_SWEEP_ALERT_CMD`** — the #269 seam, unchanged: evaluated
+- **`NAU_SWEEP_ALERT_CMD`** — the #269 seam, unchanged: evaluated
   once per alert with the one-line summary as `"$1"`.
 
 Dependencies: `curl` (only when a kuma/ntfy destination is configured)
 and `jq` (only for enabled non-hcloud axes).
 
 Behaviour contract (#269, unchanged for hcloud): list workers labeled
-`shuttle-worker`; destroy only on the three-condition match — tag AND a
+`nau-worker`; destroy only on the three-condition match — tag AND a
 parseable TTL marker AND past due (TTL markers are hcloud labels in epoch
 seconds — label values reject `:` so ISO-8601 will not fit; writer is the
 provisioner, reader is this sweep — INFRA D5); refuse to widen a destroy
@@ -454,7 +454,7 @@ The sweep runs with the §1 worker token in the environment
 6. §7 release-to-flash — the trust-chain procedure, the operator gate
    for "first real flash by anyone" (#292): needs §3 serving the media
    set, the ceremony keychain (§7.1), and a pinned epoch (§7.2).
-7. Live verification of the cache lane (`shuttle pull` against the real
+7. Live verification of the cache lane (`nau pull` against the real
    host) waits for the Nau host to exist (CACHE-SPEC "Not proven yet") —
    do not attempt before that.
 
@@ -466,7 +466,7 @@ contract; none of it runs automatically.
 
 > **THE OUT-OF-BAND RULE (ADR-0033 D7) — anchors and key material travel
 > OUT-OF-BAND, NEVER from the medium being verified.** `verify-image`'s
-> `--key` MERGES into the ANY-anchor set beside `~/.config/shuttle/keys/*.pub`
+> `--key` MERGES into the ANY-anchor set beside `~/.config/nau/keys/*.pub`
 > (src/image/verify.rs, the ADR-0024 §4 anchor policy), so a key fetched from
 > the same download lane as the manifest verifies the attacker's own manifest
 > — a self-bless. Anchors come from the ceremony keychain (§7.1) or nowhere;
@@ -475,9 +475,9 @@ contract; none of it runs automatically.
 ### 7.1 Key ceremony (operator-executed — pointer)
 
 The ceremony is ADR-0024's, executed by the operator; this runbook does
-not re-derive it. The CLI surface is `shuttle key
+not re-derive it. The CLI surface is `nau key
 keygen|rotate|promote|revoke|list|verify` (ADR-0024 §4, landed via
-#64/#51); operator anchors install under `~/.config/shuttle/keys/*.pub` —
+#64/#51); operator anchors install under `~/.config/nau/keys/*.pub` —
 the keychain `verify-image` trusts by default, and the same ceremony key's
 sysupdate identity bakes into the base rootfs as
 `/usr/lib/systemd/import-pubring.pgp` (the device-side anchor). That
@@ -515,7 +515,7 @@ can audit the chain without reading systemd sources:
 
 ### 7.2 Pin SOURCE_DATE_EPOCH — and what it does NOT move (#289)
 
-`shuttle image --release` refuses to run with the epoch unset (the CLI
+`nau image --release` refuses to run with the epoch unset (the CLI
 refuses a release without a pinned epoch, ADR-0044 D8). Export it for the
 whole release session:
 
@@ -540,7 +540,7 @@ UUIDs); only the anchor identity is exempted.
 ```bash
 # source: ADR-0044 D5 — named artifacts in the ADR-0033 D10 export tree;
 # src/image/release.rs module doc
-shuttle image --release
+nau image --release
 ```
 
 Emits `nau-<mission>-<version>-<arch>.img`, the SIGNED
@@ -580,7 +580,7 @@ before it boots anything:
 # source: ADR-0044 D4 + #288. No --key needed with the ceremony keychain
 # installed (§7.1); --key, when used, is a ceremony-keychain copy — never
 # a file the download lane supplied (out-of-band rule above).
-shuttle verify-image --device /dev/disk/by-id/<target> \
+nau verify-image --device /dev/disk/by-id/<target> \
     --manifest nau-<mission>-<version>-<arch>.manifest.json
 ```
 

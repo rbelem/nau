@@ -2,7 +2,7 @@
 --
 -- The pool "toolchain" alias is OWNED by toolchain-gcc-gnu-x86_64
 -- (declared in that meta's `aliases`). Alias names must resolve
--- wherever package names do: `shuttle pod add toolchain`,
+-- wherever package names do: `nau pod add toolchain`,
 -- `build_deps = { "toolchain" }`, and `build-deps`'s own
 -- `requires = { "toolchain" }` all resolve THROUGH this file — the
 -- Rust-side package resolver (resolve_pkg) is path-based, so the alias

@@ -202,7 +202,7 @@ fn apply_plugs(spec: &AppUnitSpec) -> PlugEffects {
 fn render_unit(spec: &AppUnitSpec, effects: &PlugEffects) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push("[Unit]".into());
-    lines.push(format!("Description=shuttle: {} ({})", spec.snap, spec.app));
+    lines.push(format!("Description=nau: {} ({})", spec.snap, spec.app));
     lines.push(String::new());
     lines.push("[Service]".into());
     lines.push("Type=exec".into());
@@ -460,7 +460,7 @@ pub enum RuntimeClass {
 
 /// Classify a payload by its `type` field. An absent type is the snapd
 /// app default — and the shape every shoot-built payload serializes
-/// with (shuttle never emits `source`/`meta` into snap.yaml), so it is
+/// with (nau never emits `source`/`meta` into snap.yaml), so it is
 /// shoot-built.
 pub fn classify(snap_type: Option<&str>) -> RuntimeClass {
     match snap_type {
@@ -714,7 +714,7 @@ mod tests {
         assert_eq!(unit.unit_name, "mysnap-srv.service");
         let expected = "\
 [Unit]
-Description=shuttle: mysnap (srv)
+Description=nau: mysnap (srv)
 
 [Service]
 Type=exec

@@ -39,7 +39,7 @@ return {
         -- the RUNPATH (same autoconf/binutils/make class); gperf's real
         -- runtime deps are declared above, and the prefix only ever exists
         -- inside build sandboxes where gperf executes.
-        leaks_ok = { "/shuttle-build-prefix/usr/lib64", "/shuttle-build-prefix/usr/lib" },
+        leaks_ok = { "/nau-build-prefix/usr/lib64", "/nau-build-prefix/usr/lib" },
         build = table.concat({
             "./configure --prefix=/usr --disable-static",
             "make -j$(nproc)",

@@ -124,7 +124,7 @@ pub(crate) fn expand_ab_slots(layout: &mut DiskLayout, verity: bool) -> miette::
         }
         let a = roots[0];
         // The persistent state partition (ADR-0023) is never cloned into a
-        // slot: it holds the shuttle store and must survive every flip,
+        // slot: it holds the nau store and must survive every flip,
         // not be a second, divergent copy. It is also never a root, so it
         // cannot reach the clone below — this guard keeps a future
         // refactor from silently cloning it.
@@ -218,7 +218,7 @@ pub(crate) fn preflight_disk_tools_with(
     if ukify.is_none() {
         return Err(miette::miette!(
             "ukify not found on PATH — a kernel disk image cannot boot without a UKI, \
-             so refusing to produce an unbootable image. Run 'shuttle doctor' and \
+             so refusing to produce an unbootable image. Run 'nau doctor' and \
              install ukify (systemd >= 254; e.g. apt install systemd-ukify or add \
              systemd to devbox.json packages)"
         ));
@@ -226,7 +226,7 @@ pub(crate) fn preflight_disk_tools_with(
     if stub.is_none() {
         return Err(miette::miette!(
             "systemd sd-stub (linuxx64.efi.stub) not found — the UKI cannot be assembled \
-             without it. Run 'shuttle doctor'; checked locations: {}",
+             without it. Run 'nau doctor'; checked locations: {}",
             EFI_STUB_CANDIDATES.join(", ")
         ));
     }
@@ -234,7 +234,7 @@ pub(crate) fn preflight_disk_tools_with(
         return Err(miette::miette!(
             "veritysetup not found on PATH — dm-verity over the root partition cannot \
              be formatted, so refusing to emit an unverifiable boot path. Run \
-             'shuttle doctor' and install veritysetup (cryptsetup >= 2.4; e.g. \
+             'nau doctor' and install veritysetup (cryptsetup >= 2.4; e.g. \
              apt install cryptsetup or add cryptsetup to devbox.json packages)"
         ));
     }
@@ -255,7 +255,7 @@ pub(crate) fn preflight_populate_tools_with(
             return Err(miette::miette!(
                 "{name} not found on PATH — the disk build reads back partition \
                  extents and formats + populates standalone partition files with \
-                 it, so refusing to start. Run 'shuttle doctor' and install it \
+                 it, so refusing to start. Run 'nau doctor' and install it \
                  (e.g. apt install {package} or add {package} to devbox.json \
                  packages)"
             ));
@@ -350,7 +350,7 @@ pub(crate) fn verity_format_with(
         return Err(miette::miette!(
             "veritysetup not found on PATH — dm-verity over the root partition cannot \
              be formatted, so refusing to emit an unverifiable boot path. Run \
-             'shuttle doctor' and install veritysetup (cryptsetup >= 2.4; e.g. \
+             'nau doctor' and install veritysetup (cryptsetup >= 2.4; e.g. \
              apt install cryptsetup or add cryptsetup to devbox.json packages)"
         ));
     };
@@ -420,7 +420,7 @@ pub(crate) fn parse_roothash(stdout: &str) -> miette::Result<String> {
 /// back to the documented nil-GUID placeholder — loud failure at boot, no
 /// silent boot from the wrong volume.
 ///
-/// All three keys are SHUTTLE-PRIVATE (`shuttle.*`), not the systemd
+/// All three keys are NAU-PRIVATE (`nau.*`), not the systemd
 /// spelling (`roothash=`, `systemd.verity_root_data=`, `systemd.verity_root_hash=`,
 /// issue #92). The kernel-embedded initramfs `/init` is the only contract
 /// consumer: it opens the dm-verity mapping BEFORE switch-root, so any
@@ -428,7 +428,7 @@ pub(crate) fn parse_roothash(stdout: &str) -> miette::Result<String> {
 /// a guaranteed busy-fail re-attaching the live mapping — and when the
 /// contract rode the systemd keys, that generator ALSO instantiated device
 /// units from these paths; a case mismatch against udev's lowercase
-/// by-partuuid symlinks stalled every verity boot 90 s. Shuttle-private
+/// by-partuuid symlinks stalled every verity boot 90 s. Nau-private
 /// keys are invisible to the generator: no units, no stall, no busy-fail,
 /// and `veritysetup.target` is reached empty (the no-verity pi-image boot
 /// already proved the clean path). Device paths stay lowercase
@@ -439,13 +439,13 @@ pub(crate) fn verity_trailing(
     hash_partuuid: Option<&str>,
 ) -> Vec<String> {
     vec![
-        format!("shuttle.roothash={roothash}"),
+        format!("nau.roothash={roothash}"),
         format!(
-            "shuttle.verity_data=/dev/disk/by-partuuid/{}",
+            "nau.verity_data=/dev/disk/by-partuuid/{}",
             root_partuuid.unwrap_or(NIL_PARTUUID)
         ),
         format!(
-            "shuttle.verity_hash=/dev/disk/by-partuuid/{}",
+            "nau.verity_hash=/dev/disk/by-partuuid/{}",
             hash_partuuid.unwrap_or(NIL_PARTUUID)
         ),
     ]

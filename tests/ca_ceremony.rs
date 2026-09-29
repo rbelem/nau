@@ -1,23 +1,23 @@
 //! The SSH host CA ceremony (ADR-0045 amendment, #283 decided) end to
-//! end through the real binary with the REAL `ssh-keygen`: `shuttle ca
+//! end through the real binary with the REAL `ssh-keygen`: `nau ca
 //! keygen` mints a dedicated ed25519 keypair at
-//! `~/.config/shuttle/ca/` (`ca` 0600 private, `ca.pub` public), the
-//! fingerprint is introspectable (`shuttle ca list`), an existing CA
+//! `~/.config/nau/ca/` (`ca` 0600 private, `ca.pub` public), the
+//! fingerprint is introspectable (`nau ca list`), an existing CA
 //! refuses overwrite without `--force`, and `--force` regenerates both
 //! halves. Every path runs under an isolated `--home` — the operator's
 //! real CA is never touched.
 
 use std::process::Command;
 
-/// Run shuttle with an isolated HOME so the CA ceremony is private to
+/// Run nau with an isolated HOME so the CA ceremony is private to
 /// the test. Returns (exit code, stdout, stderr).
 fn run_in(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+    let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args(args)
         .env("HOME", dir)
         .current_dir(dir)
         .output()
-        .expect("failed to spawn shuttle");
+        .expect("failed to spawn nau");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -35,7 +35,7 @@ fn report_json(stdout: &str) -> serde_json::Value {
 fn ca_ceremony_lifecycle_through_the_cli() {
     let dir = tempfile::tempdir().unwrap();
     let home = format!("--home={}", dir.path().display());
-    let ca_dir = dir.path().join(".config/shuttle/ca");
+    let ca_dir = dir.path().join(".config/nau/ca");
     let secret = ca_dir.join("ca");
     let public = ca_dir.join("ca.pub");
 
@@ -64,7 +64,7 @@ fn ca_ceremony_lifecycle_through_the_cli() {
         "the CA is an ed25519 key: {public_line_a}"
     );
     assert!(
-        public_line_a.ends_with(" shuttle-host-ca"),
+        public_line_a.ends_with(" nau-host-ca"),
         "the minted comment marks the CA: {public_line_a}"
     );
     assert!(secret.exists(), "private half at {secret:?}");
@@ -129,7 +129,7 @@ fn ca_secret_without_its_public_half_is_a_named_refusal() {
     assert_eq!(code, Some(0), "keygen: {stderr}");
 
     // Sabotage: drop the public half behind the ceremony's back.
-    let public = dir.path().join(".config/shuttle/ca/ca.pub");
+    let public = dir.path().join(".config/nau/ca/ca.pub");
     std::fs::remove_file(&public).unwrap();
     let (code, _, stderr) = run_in(dir.path(), &["ca", "list", &home, "--json"]);
     assert_ne!(code, Some(0), "incomplete keypair must fail closed");
@@ -148,7 +148,7 @@ fn ca_corrupt_public_half_fails_fingerprint_introspection() {
     assert_eq!(code, Some(0), "keygen: {stderr}");
 
     // Sabotage: the public half stops being a key.
-    let public = dir.path().join(".config/shuttle/ca/ca.pub");
+    let public = dir.path().join(".config/nau/ca/ca.pub");
     std::fs::write(&public, "not a key\n").unwrap();
     let (code, _, stderr) = run_in(dir.path(), &["ca", "list", &home]);
     assert_ne!(code, Some(0), "corrupt public half must fail closed");

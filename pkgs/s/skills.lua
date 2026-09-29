@@ -19,7 +19,7 @@
 -- with devDependencies stripped (`npm install --package-lock-only
 -- --ignore-scripts`; regenerate on bump): tar 7.5.22 / yaml 2.9.1 — fresh
 -- in-range resolves of ^7.5.20 / ^2.8.3 (upstream's pnpm lock pinned
--- 7.5.20 / 2.9.0); the recipe lock plus the shuttle.lock deps_hash pin is
+-- 7.5.20 / 2.9.0); the recipe lock plus the nau.lock deps_hash pin is
 -- the reproducibility contract. Pure-JS closure (tar v7, yaml) — no native
 -- addons, no ELF repair.
 --
@@ -71,7 +71,7 @@ return {
             "pkg=$STAGE/usr/lib/node_modules/skills",
             'mkdir -p "$pkg"',
             'cp -r $SRC/dist $SRC/bin $SRC/package.json "$pkg/"',
-            'tar -C "$SHUTTLE_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
+            'tar -C "$NAU_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
         }, " && "),
 
         type = "source",

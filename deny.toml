@@ -32,12 +32,12 @@ version = 2
 yanked = "deny"
 ignore = [
   # rsa 0.9 (via pgp, src/assert.rs + src/uc.rs): RUSTSEC-2023-0071, the
-  # Marvin timing sidechannel is a PKCS#1 v1.5 DECRYPTION oracle. shuttle
+  # Marvin timing sidechannel is a PKCS#1 v1.5 DECRYPTION oracle. nau
   # never decrypts attacker-chosen ciphertexts with the rsa crate — it
   # generates keys (src/uc.rs) and signs snapd model/account assertions
   # locally with no oracle on the unpadding path — so the vulnerable
   # behavior is unreachable. No fixed release exists upstream
-  # (RustCrypto/RSA#626, still affected 2026-09). Re-evaluate if shuttle
+  # (RustCrypto/RSA#626, still affected 2026-09). Re-evaluate if nau
   # ever decrypts with rsa.
   "RUSTSEC-2023-0071",
   # paste is unmaintained (RUSTSEC-2024-0436); pulled by full_moon (the

@@ -1,5 +1,5 @@
 #!/bin/sh
-# shuttle-cache-publish — push a cache export tree to the shuttle-cache
+# nau-cache-publish — push a cache export tree to the nau-cache
 # S3 bucket over plain HTTPS (path-style), AWS SigV4-signed.
 #
 # Ticket #270 (cache publish transport; server-infra-plan decision 4).
@@ -17,16 +17,16 @@
 #
 # Credentials come ONLY from the environment (SM-rendered on the
 # workstation per server-infra-plan checklist step 1); never from
-# shuttle.lua, never echoed to stdout/stderr/logs. The Authorization
+# nau.lua, never echoed to stdout/stderr/logs. The Authorization
 # header is handed to curl via `--header @file` (curl >= 7.55) so it
 # never appears in process args; the secret itself appears only inside
 # the openssl invocation args (same-user ps visibility — the accepted
 # workstation threat model).
-#   SHUTTLE_CACHE_S3_ACCESS_KEY   (required)
-#   SHUTTLE_CACHE_S3_SECRET_KEY   (required)
-#   SHUTTLE_CACHE_S3_ENDPOINT     scheme://host[:port] (no path/query)
-#   SHUTTLE_CACHE_S3_BUCKET       (required)
-#   SHUTTLE_CACHE_S3_REGION       (optional, default us-east-1)
+#   NAU_CACHE_S3_ACCESS_KEY   (required)
+#   NAU_CACHE_S3_SECRET_KEY   (required)
+#   NAU_CACHE_S3_ENDPOINT     scheme://host[:port] (no path/query)
+#   NAU_CACHE_S3_BUCKET       (required)
+#   NAU_CACHE_S3_REGION       (optional, default us-east-1)
 #
 # Transport: curl only, bounded (--connect-timeout 10; --max-time 30 s
 # metadata / 300 s blob — the oci.rs convention). Signing: SigV4 with
@@ -35,7 +35,7 @@
 # cmp, mktemp.
 #
 # Usage:
-#   shuttle-cache-publish [--dry-run] [--tree DIR]
+#   nau-cache-publish [--dry-run] [--tree DIR]
 #     DIR  export/cache tree holding cache/*.json and blobs/*
 #          (default: the current directory)
 #
@@ -46,7 +46,7 @@ LC_ALL=C
 export LC_ALL
 umask 077
 
-PROG=shuttle-cache-publish
+PROG=nau-cache-publish
 CONNECT_TIMEOUT=10
 META_TIMEOUT=30
 BLOB_TIMEOUT=300
@@ -63,17 +63,17 @@ usage() {
 usage: $PROG [--dry-run] [--tree DIR]
 
 Publish a cache export tree (cache/*.json manifests, blobs/*) to the
-shuttle-cache S3 bucket. Blobs first, manifests last; blobs
+nau-cache S3 bucket. Blobs first, manifests last; blobs
 skip-if-exists; manifests fail on a bytes difference (equivocation
 signal).
 
-Required environment (never shuttle.lua, never printed):
-  SHUTTLE_CACHE_S3_ACCESS_KEY
-  SHUTTLE_CACHE_S3_SECRET_KEY
-  SHUTTLE_CACHE_S3_ENDPOINT   scheme://host[:port] (no path/query)
-  SHUTTLE_CACHE_S3_BUCKET
+Required environment (never nau.lua, never printed):
+  NAU_CACHE_S3_ACCESS_KEY
+  NAU_CACHE_S3_SECRET_KEY
+  NAU_CACHE_S3_ENDPOINT   scheme://host[:port] (no path/query)
+  NAU_CACHE_S3_BUCKET
 Optional:
-  SHUTTLE_CACHE_S3_REGION     default us-east-1
+  NAU_CACHE_S3_REGION     default us-east-1
 
 Requires: curl (>= 7.55) and openssl on PATH.
 EOF
@@ -99,16 +99,16 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-[ -n "${SHUTTLE_CACHE_S3_ACCESS_KEY:-}" ] || die 'SHUTTLE_CACHE_S3_ACCESS_KEY is not set'
-[ -n "${SHUTTLE_CACHE_S3_SECRET_KEY:-}" ] || die 'SHUTTLE_CACHE_S3_SECRET_KEY is not set'
-[ -n "${SHUTTLE_CACHE_S3_ENDPOINT:-}" ] || die 'SHUTTLE_CACHE_S3_ENDPOINT is not set'
-[ -n "${SHUTTLE_CACHE_S3_BUCKET:-}" ] || die 'SHUTTLE_CACHE_S3_BUCKET is not set'
+[ -n "${NAU_CACHE_S3_ACCESS_KEY:-}" ] || die 'NAU_CACHE_S3_ACCESS_KEY is not set'
+[ -n "${NAU_CACHE_S3_SECRET_KEY:-}" ] || die 'NAU_CACHE_S3_SECRET_KEY is not set'
+[ -n "${NAU_CACHE_S3_ENDPOINT:-}" ] || die 'NAU_CACHE_S3_ENDPOINT is not set'
+[ -n "${NAU_CACHE_S3_BUCKET:-}" ] || die 'NAU_CACHE_S3_BUCKET is not set'
 
-ACCESS_KEY=$SHUTTLE_CACHE_S3_ACCESS_KEY
-SECRET_KEY=$SHUTTLE_CACHE_S3_SECRET_KEY
-ENDPOINT=$SHUTTLE_CACHE_S3_ENDPOINT
-BUCKET=$SHUTTLE_CACHE_S3_BUCKET
-REGION=${SHUTTLE_CACHE_S3_REGION:-us-east-1}
+ACCESS_KEY=$NAU_CACHE_S3_ACCESS_KEY
+SECRET_KEY=$NAU_CACHE_S3_SECRET_KEY
+ENDPOINT=$NAU_CACHE_S3_ENDPOINT
+BUCKET=$NAU_CACHE_S3_BUCKET
+REGION=${NAU_CACHE_S3_REGION:-us-east-1}
 
 case $REGION in
     ''|*[!A-Za-z0-9-]*) die "bad region: $REGION" ;;
@@ -118,11 +118,11 @@ case $BUCKET in
 esac
 case $ENDPOINT in
     http://*|https://*) ;;
-    *) die 'SHUTTLE_CACHE_S3_ENDPOINT must start with http:// or https://' ;;
+    *) die 'NAU_CACHE_S3_ENDPOINT must start with http:// or https://' ;;
 esac
 HOST=${ENDPOINT#*://}
 case $HOST in
-    ''|*/*|*\?*|*#*) die 'SHUTTLE_CACHE_S3_ENDPOINT must be scheme://host[:port] with no path or query' ;;
+    ''|*/*|*\?*|*#*) die 'NAU_CACHE_S3_ENDPOINT must be scheme://host[:port] with no path or query' ;;
 esac
 
 [ -n "$TREE" ] || TREE=.

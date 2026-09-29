@@ -6,16 +6,16 @@ use std::time::Duration;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, WrapErr};
-use shuttle::cache::PackageCache;
-use shuttle::cli::{
+use nau::cache::PackageCache;
+use nau::cli::{
     CaCommand, CacheCommand, Cli, Command, DepsCommand, IndexCommand, KeyCommand, PodCommand,
     RuntimeCommand,
 };
-use shuttle::image::ImageDeclaration;
-use shuttle::index::{IndexEntry, PackageIndex, StoreRef};
-use shuttle::lock::{LockFile, SourceLockEntry};
-use shuttle::runtime::{changed_pins, PendingSnap, RuntimeStore, RuntimeTools, SignatureEnvelope};
-use shuttle::snap::{PackageInput, SnapRef, SourceSpec};
+use nau::image::ImageDeclaration;
+use nau::index::{IndexEntry, PackageIndex, StoreRef};
+use nau::lock::{LockFile, SourceLockEntry};
+use nau::runtime::{changed_pins, PendingSnap, RuntimeStore, RuntimeTools, SignatureEnvelope};
+use nau::snap::{PackageInput, SnapRef, SourceSpec};
 
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
@@ -38,14 +38,14 @@ fn main() -> miette::Result<()> {
             offline,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             // The eval worker reads this to refuse fetch() (ADR: eval-time
             // network is opt-in and never survives --offline).
             if offline {
-                std::env::set_var("SHUTTLE_OFFLINE", "1");
+                std::env::set_var("NAU_OFFLINE", "1");
             }
             // If --file is default and doesn't exist, try output_name as package name
-            let file = if file == "shuttle.lua" && !Path::new("shuttle.lua").exists() {
+            let file = if file == "nau.lua" && !Path::new("nau.lua").exists() {
                 if let Some(ref name) = output_name {
                     resolve_file(name)?
                 } else {
@@ -63,7 +63,7 @@ fn main() -> miette::Result<()> {
             };
             if order {
                 let r = cmd_order(&file, &output_name, json);
-                shuttle::output::flush_json("order");
+                nau::output::flush_json("order");
                 return r;
             }
             let r = cmd_build(
@@ -82,7 +82,7 @@ fn main() -> miette::Result<()> {
                 offline,
                 json,
             );
-            shuttle::output::flush_json("build");
+            nau::output::flush_json("build");
             r
         }
 
@@ -99,7 +99,7 @@ fn main() -> miette::Result<()> {
             lockfile: lockfile_path,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             let r = cmd_image(
                 file,
                 output,
@@ -113,7 +113,7 @@ fn main() -> miette::Result<()> {
                 lockfile_path,
                 json,
             );
-            shuttle::output::flush_json("image");
+            nau::output::flush_json("image");
             r
         }
 
@@ -124,7 +124,7 @@ fn main() -> miette::Result<()> {
             slot,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             cmd_verify_image(&device, &manifest, key.as_deref(), slot, json)
         }
 
@@ -136,9 +136,9 @@ fn main() -> miette::Result<()> {
                 flat,
                 json,
             } => {
-                shuttle::output::set_mode(json);
+                nau::output::set_mode(json);
                 let r = cmd_deps(package, recursive, tree, flat, json);
-                shuttle::output::flush_json("deps");
+                nau::output::flush_json("deps");
                 r
             }
             DepsCommand::Fetch {
@@ -147,15 +147,15 @@ fn main() -> miette::Result<()> {
                 latest,
                 json,
             } => {
-                shuttle::output::set_mode(json);
+                nau::output::set_mode(json);
                 let r = cmd_deps_fetch(name.as_deref(), root.as_deref(), latest);
-                shuttle::output::flush_json("deps");
+                nau::output::flush_json("deps");
                 r
             }
         },
 
         Command::Search { query, json } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             cmd_search(&query, json);
             Ok(())
         }
@@ -165,7 +165,7 @@ fn main() -> miette::Result<()> {
         Command::Doctor { pod, fix, from } => cmd_doctor(pod, fix, from.as_deref()),
 
         Command::Check { file, json } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             cmd_check(&file, json)
         }
 
@@ -188,7 +188,7 @@ fn main() -> miette::Result<()> {
             lockfile,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             cmd_lock(file, lockfile)
         }
 
@@ -202,9 +202,9 @@ fn main() -> miette::Result<()> {
             offline,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             if offline {
-                std::env::set_var("SHUTTLE_OFFLINE", "1");
+                std::env::set_var("NAU_OFFLINE", "1");
             }
             cmd_eval(
                 file,
@@ -249,7 +249,7 @@ fn main() -> miette::Result<()> {
             qemu_args,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             cmd_test(
                 image,
                 timeout,
@@ -278,7 +278,7 @@ fn main() -> miette::Result<()> {
             record,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             cmd_push(
                 &reference,
                 &dir,
@@ -306,7 +306,7 @@ fn main() -> miette::Result<()> {
             allow_downgrade,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             run_pull(
                 &reference,
                 out_dir,
@@ -329,7 +329,7 @@ fn main() -> miette::Result<()> {
         } => cmd_serve(address.as_deref(), port, announce, pod.as_deref()),
 
         Command::Peers { secs, json } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             cmd_peers(secs)
         }
 
@@ -340,15 +340,15 @@ fn main() -> miette::Result<()> {
             file,
         } => cmd_export(&out, pod.as_deref(), mission.as_deref(), file.as_deref()),
 
-        Command::EvalWorker => shuttle::isolate::worker_main(),
+        Command::EvalWorker => nau::isolate::worker_main(),
 
-        Command::CheckWorker => shuttle::isolate::check_worker_main(),
+        Command::CheckWorker => nau::isolate::check_worker_main(),
 
-        Command::WorkerCap => shuttle::worker::cap_main(),
+        Command::WorkerCap => nau::worker::cap_main(),
 
-        Command::WorkerJob { job_file } => shuttle::worker::job_main(&job_file),
+        Command::WorkerJob { job_file } => nau::worker::job_main(&job_file),
 
-        Command::Workers { command } => shuttle::provision::workers_main(command),
+        Command::Workers { command } => nau::provision::workers_main(command),
     }
 }
 
@@ -360,24 +360,24 @@ fn resolve_file(file: &str) -> miette::Result<String> {
     if Path::new(file).exists() {
         return Ok(file.to_string());
     }
-    match shuttle::pkg_source::resolve_pkg(file) {
-        shuttle::pkg_source::PkgResult::File(path) => Ok(path),
-        shuttle::pkg_source::PkgResult::Found { path, content } => {
+    match nau::pkg_source::resolve_pkg(file) {
+        nau::pkg_source::PkgResult::File(path) => Ok(path),
+        nau::pkg_source::PkgResult::Found { path, content } => {
             eprintln!("  ℹ using package '{}' ({})", file, path);
             // Materialize into a fresh private temp dir (never the shared,
             // predictable $TMPDIR): the definition path's parent becomes the
             // eval/check resolver's allowlisted root, so it must be this
             // invocation's private directory only — never /tmp.
-            let tmp = shuttle::pkg_source::materialize_embedded(&content)?;
+            let tmp = nau::pkg_source::materialize_embedded(&content)?;
             Ok(tmp.to_string_lossy().to_string())
         }
-        shuttle::pkg_source::PkgResult::NotFound => Ok(file.to_string()),
+        nau::pkg_source::PkgResult::NotFound => Ok(file.to_string()),
     }
 }
 
 /// Evaluate a file path or resolved package source, returning snap outputs.
-fn evaluate_file_or_embedded(file: &str) -> miette::Result<shuttle::lua::Outputs> {
-    shuttle::lua::evaluate_file(file)
+fn evaluate_file_or_embedded(file: &str) -> miette::Result<nau::lua::Outputs> {
+    nau::lua::evaluate_file(file)
 }
 
 // ── Build command ──
@@ -422,7 +422,7 @@ fn cmd_build(
 
     // Initialize package source inputs
     // 1. If the config file exists, extract its global inputs first
-    // 2. Otherwise fall back to the default input (github:rbelem/shuttle/main)
+    // 2. Otherwise fall back to the default input (github:rbelem/nau/main)
     let original_file = file.clone();
     let file_exists = Path::new(&original_file).exists();
 
@@ -435,7 +435,7 @@ fn cmd_build(
     let mut direct_eval_error: Option<String> = None;
     if file_exists {
         // Extract global inputs from the config file and use those
-        match shuttle::lua::evaluate_file_with_inputs(&original_file) {
+        match nau::lua::evaluate_file_with_inputs(&original_file) {
             Ok(eval) => {
                 let lockfile = prepare_inputs(
                     &eval.global_inputs,
@@ -443,7 +443,7 @@ fn cmd_build(
                     update.as_deref(),
                     offline,
                 )?;
-                shuttle::pkg_source::init_global_inputs_with(
+                nau::pkg_source::init_global_inputs_with(
                     &eval.global_inputs,
                     &lockfile.inputs,
                     offline,
@@ -476,7 +476,7 @@ fn cmd_build(
     // No config file or it failed — use default input and resolve by name
     let default_inputs = default_input_map();
     let lockfile = prepare_inputs(&default_inputs, &lockfile_path, update.as_deref(), offline)?;
-    shuttle::pkg_source::init_global_inputs_with(&default_inputs, &lockfile.inputs, offline)?;
+    nau::pkg_source::init_global_inputs_with(&default_inputs, &lockfile.inputs, offline)?;
     let file = resolve_file(&file)?;
     let all_outputs = evaluate_file_or_embedded(&file).map_err(|e| match &direct_eval_error {
         Some(first) => miette::miette!(
@@ -504,7 +504,7 @@ fn cmd_build(
         // The fallback path re-evaluated into plain Outputs — the workers
         // surface was never part of it, so the inert default applies
         // (zero behavior change, ADR-0040 Decision 3).
-        shuttle::lua::WorkersConfig::default(),
+        nau::lua::WorkersConfig::default(),
     )
 }
 
@@ -512,9 +512,9 @@ fn cmd_build(
 fn default_input_map() -> HashMap<String, PackageInput> {
     let mut m = HashMap::new();
     m.insert(
-        shuttle::pkg_source::DEFAULT_INPUT_NAME.to_string(),
+        nau::pkg_source::DEFAULT_INPUT_NAME.to_string(),
         PackageInput {
-            url: shuttle::pkg_source::DEFAULT_INPUT_URL.to_string(),
+            url: nau::pkg_source::DEFAULT_INPUT_URL.to_string(),
             submodules: None,
         },
     );
@@ -548,20 +548,20 @@ fn prepare_inputs(
         } else {
             vec![name]
         };
-        let updates = shuttle::pkg_source::update_input_pins(inputs, &names, &mut lockfile)?;
+        let updates = nau::pkg_source::update_input_pins(inputs, &names, &mut lockfile)?;
         for u in &updates {
-            shuttle::output::status(pin_update_line(u));
+            nau::output::status(pin_update_line(u));
         }
         changed |= !updates.is_empty();
     } else if !offline {
         // Record-once: pin inputs missing from the lockfile (first build).
-        let n = shuttle::pkg_source::ensure_input_pins(inputs, &mut lockfile)?;
+        let n = nau::pkg_source::ensure_input_pins(inputs, &mut lockfile)?;
         changed |= n > 0;
     }
 
     if changed {
         lockfile.save(lock_path)?;
-        shuttle::output::ok(format!("lockfile updated: {lockfile_path}"));
+        nau::output::ok(format!("lockfile updated: {lockfile_path}"));
     }
     Ok(lockfile)
 }
@@ -570,18 +570,18 @@ fn prepare_inputs(
 /// closure key. Replaces the old hardcoded `"amd64"` lookup, which could
 /// serve a stale amd64 artifact for an aarch64 build of the same source.
 fn dep_fully_cached(
-    cache: &shuttle::cache::PackageCache,
-    closure: &shuttle::cache::BuildClosure,
-    dep_meta: &shuttle::snap::SnapMeta,
+    cache: &nau::cache::PackageCache,
+    closure: &nau::cache::BuildClosure,
+    dep_meta: &nau::snap::SnapMeta,
     cli_archs: &[String],
 ) -> bool {
-    shuttle::snap::resolve_archs(dep_meta, cli_archs)
+    nau::snap::resolve_archs(dep_meta, cli_archs)
         .iter()
         .all(|a| cache.lookup(dep_meta, a, closure).is_some())
 }
 
 /// True when `given` names the same stage directory as the
-/// shuttle-owned default (`./stage/`): by canonical path when both
+/// nau-owned default (`./stage/`): by canonical path when both
 /// exist (the live lock-holder's wipe window), else by components with
 /// `.` separators dropped — so `./stage`, `stage`, and `./stage/` all
 /// match even before the directory exists.
@@ -602,7 +602,7 @@ fn names_default_stage(given: &Path) -> bool {
 /// explicit-stage precondition: a user-chosen directory that already has
 /// contents is refused up front — never wiped. The default `./stage/` is
 /// additionally pinned by a cross-process advisory lock
-/// ([`shuttle::snap::StageLock`], gate-pod gap 6): two concurrent builds
+/// ([`nau::snap::StageLock`], gate-pod gap 6): two concurrent builds
 /// must not silently share it, so the second build refuses loudly and is
 /// pointed at `--stage`. The lock is returned to the caller, which holds
 /// it for the whole build; an explicit `--stage` is user-owned and never
@@ -611,8 +611,8 @@ fn resolve_stage(
     stage: Option<String>,
 ) -> miette::Result<(
     std::path::PathBuf,
-    shuttle::snap::StagePolicy,
-    Option<shuttle::snap::StageLock>,
+    nau::snap::StagePolicy,
+    Option<nau::snap::StageLock>,
 )> {
     match stage {
         Some(path) => {
@@ -628,14 +628,14 @@ fn resolve_stage(
                      pass a different directory as --stage"
                 );
             }
-            let policy = shuttle::snap::StagePolicy::Explicit;
-            shuttle::snap::check_explicit_stage(Path::new(&path))?;
+            let policy = nau::snap::StagePolicy::Explicit;
+            nau::snap::check_explicit_stage(Path::new(&path))?;
             Ok((std::path::PathBuf::from(path), policy, None))
         }
         None => {
             let stage = std::path::PathBuf::from("./stage/");
-            let lock = shuttle::snap::StageLock::acquire(&stage)?;
-            Ok((stage, shuttle::snap::StagePolicy::Default, Some(lock)))
+            let lock = nau::snap::StageLock::acquire(&stage)?;
+            Ok((stage, nau::snap::StagePolicy::Default, Some(lock)))
         }
     }
 }
@@ -643,7 +643,7 @@ fn resolve_stage(
 /// Inner build logic after outputs are resolved.
 #[allow(clippy::too_many_arguments)]
 fn run_build(
-    all_outputs: shuttle::lua::Outputs,
+    all_outputs: nau::lua::Outputs,
     file: String,
     stage: Option<String>,
     output: String,
@@ -656,7 +656,7 @@ fn run_build(
     cache_max_size: Option<String>,
     target: Option<String>,
     json: bool,
-    workers: shuttle::lua::WorkersConfig,
+    workers: nau::lua::WorkersConfig,
 ) -> miette::Result<()> {
     if let Some(ref epoch) = source_date_epoch {
         std::env::set_var("SOURCE_DATE_EPOCH", epoch);
@@ -667,7 +667,7 @@ fn run_build(
 
     // Stage policy: an explicitly passed --stage belongs to the user — it
     // must be empty to start and is never wiped. The default ./stage/ is
-    // shuttle-managed scratch, wiped before every build phase (snap.rs).
+    // nau-managed scratch, wiped before every build phase (snap.rs).
     // `_stage_lock` pins the default stage against concurrent builds for
     // this whole invocation (gate-pod gap 6): it must stay bound for the
     // rest of the function — dropping it releases the flock.
@@ -740,20 +740,20 @@ fn init_pkg_cache(
     cache: Option<String>,
     cache_max_size: Option<String>,
     json: bool,
-) -> Option<shuttle::cache::PackageCache> {
+) -> Option<nau::cache::PackageCache> {
     if !(all || cache.is_some() || cache_max_size.is_some()) {
         return None;
     }
 
-    let mut pc = shuttle::cache::PackageCache::new(cache.map(std::path::PathBuf::from));
+    let mut pc = nau::cache::PackageCache::new(cache.map(std::path::PathBuf::from));
     if let Some(ref size_str) = cache_max_size {
         if let Some(bytes) = parse_size(size_str) {
             pc = pc.with_max_size(bytes);
             if !json {
-                shuttle::output::info(format!("max cache size: {}", size_str));
+                nau::output::info(format!("max cache size: {}", size_str));
             }
         } else if !json {
-            shuttle::output::warn(format!("invalid cache size: {}", size_str));
+            nau::output::warn(format!("invalid cache size: {}", size_str));
         }
     }
     Some(pc)
@@ -763,13 +763,13 @@ fn init_pkg_cache(
 /// every output in the file. Applies --target to each selected meta
 /// (announced once in text mode).
 fn select_outputs<'a>(
-    all_outputs: &'a shuttle::lua::Outputs,
+    all_outputs: &'a nau::lua::Outputs,
     output_name: &'a Option<String>,
     file: &str,
     target: Option<&String>,
     json: bool,
-) -> miette::Result<Vec<(&'a String, shuttle::snap::SnapMeta)>> {
-    let iter: Vec<(&String, shuttle::snap::SnapMeta)> = match output_name {
+) -> miette::Result<Vec<(&'a String, nau::snap::SnapMeta)>> {
+    let iter: Vec<(&String, nau::snap::SnapMeta)> = match output_name {
         Some(name) => {
             let mut meta = all_outputs
                 .get(name)
@@ -778,13 +778,13 @@ fn select_outputs<'a>(
             if let Some(t) = target {
                 meta.target = Some(t.clone());
                 if !json {
-                    shuttle::output::info(format!("target: {t}"));
+                    nau::output::info(format!("target: {t}"));
                 }
             }
             vec![(name, meta)]
         }
         None => {
-            let mut vec: Vec<(&String, shuttle::snap::SnapMeta)> = Vec::new();
+            let mut vec: Vec<(&String, nau::snap::SnapMeta)> = Vec::new();
             for (name, meta_ref) in all_outputs {
                 let mut meta = meta_ref.clone();
                 if let Some(t) = target {
@@ -797,7 +797,7 @@ fn select_outputs<'a>(
             vec.sort_by_key(|(a, _)| *a);
             if let Some(t) = target {
                 if !json {
-                    shuttle::output::info(format!("target: {t}"));
+                    nau::output::info(format!("target: {t}"));
                 }
             }
             vec
@@ -809,14 +809,14 @@ fn select_outputs<'a>(
 /// Collect the unique dependency names of every selected output, in
 /// first-seen order. Seeds are the build-time dependency union
 /// (`requires` ∪ `build_deps`) — both kinds get built (ADR-0018).
-fn collect_dep_graph(iter: &[(&String, shuttle::snap::SnapMeta)]) -> Vec<shuttle::deps::DepNode> {
-    let mut nodes: Vec<shuttle::deps::DepNode> = Vec::new();
+fn collect_dep_graph(iter: &[(&String, nau::snap::SnapMeta)]) -> Vec<nau::deps::DepNode> {
+    let mut nodes: Vec<nau::deps::DepNode> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (_name, meta) in iter {
-        let seeds = shuttle::deps::build_dep_seeds(meta);
+        let seeds = nau::deps::build_dep_seeds(meta);
         if !seeds.is_empty() {
-            if let Ok(deps) = shuttle::deps::resolve_deps(&seeds, true) {
+            if let Ok(deps) = nau::deps::resolve_deps(&seeds, true) {
                 for node in deps {
                     if seen.insert(node.name.clone()) {
                         nodes.push(node);
@@ -841,7 +841,7 @@ fn collect_dep_graph(iter: &[(&String, shuttle::snap::SnapMeta)]) -> Vec<shuttle
 /// the scheduler prints attributable lines instead).
 #[allow(clippy::too_many_arguments)]
 fn ensure_build_prefix(
-    meta: &shuttle::snap::SnapMeta,
+    meta: &nau::snap::SnapMeta,
     arch: &str,
     output_dir: &Path,
     pkg_cache: Option<&PackageCache>,
@@ -849,29 +849,29 @@ fn ensure_build_prefix(
     json: bool,
     quiet: bool,
     building: &mut Vec<String>,
-) -> miette::Result<Option<shuttle::build_prefix::MergedPrefix>> {
+) -> miette::Result<Option<nau::build_prefix::MergedPrefix>> {
     // Only source builds consume a build prefix — meta/store snaps and
     // fetch-only declarations never run a build command.
     if meta.build.is_none() && meta.parts.is_none() {
         return Ok(None);
     }
-    let seeds = shuttle::deps::build_dep_seeds(meta);
+    let seeds = nau::deps::build_dep_seeds(meta);
     if seeds.is_empty() {
         return Ok(None);
     }
-    let closure_names = shuttle::deps::resolve_dep_names(&seeds, true)?;
+    let closure_names = nau::deps::resolve_dep_names(&seeds, true)?;
     let mut payloads = Vec::new();
     for name in closure_names {
-        let dep_meta = shuttle::deps::load_meta(&name)?;
+        let dep_meta = nau::deps::load_meta(&name)?;
         let snap = ensure_dep_payload(
             &name, &dep_meta, arch, output_dir, pkg_cache, lockfile, json, quiet, building,
         )?;
-        payloads.push(shuttle::build_prefix::Payload { pkg: name, snap });
+        payloads.push(nau::build_prefix::Payload { pkg: name, snap });
     }
-    let merged = shuttle::build_prefix::materialize_merged_prefix(&payloads)?;
+    let merged = nau::build_prefix::materialize_merged_prefix(&payloads)?;
     if !json && !quiet && !payloads.is_empty() {
         let names: Vec<&str> = payloads.iter().map(|p| p.pkg.as_str()).collect();
-        shuttle::output::status(format!(
+        nau::output::status(format!(
             "build prefix: merged {} payload(s) — {}",
             payloads.len(),
             names.join(", ")
@@ -892,7 +892,7 @@ fn ensure_build_prefix(
 #[allow(clippy::too_many_arguments)]
 fn ensure_dep_payload(
     name: &str,
-    dep_meta: &shuttle::snap::SnapMeta,
+    dep_meta: &nau::snap::SnapMeta,
     arch: &str,
     output_dir: &Path,
     pkg_cache: Option<&PackageCache>,
@@ -909,7 +909,7 @@ fn ensure_dep_payload(
 
     // Closure key for the cache lookup/store (same computation the --all
     // dep path uses).
-    let closure = pkg_cache.map(|_| shuttle::coordinator::build_closure(dep_meta, lockfile));
+    let closure = pkg_cache.map(|_| nau::coordinator::build_closure(dep_meta, lockfile));
     if let (Some(cache), Some(closure)) = (pkg_cache, closure.as_ref()) {
         if let Some(cached) = cache.lookup(dep_meta, arch, closure) {
             return Ok(cached);
@@ -928,23 +928,23 @@ fn ensure_dep_payload(
         dep_meta, arch, output_dir, pkg_cache, lockfile, json, quiet, building,
     )?;
 
-    shuttle::snap::check_cross_build(arch, dep_meta.target.as_deref())?;
+    nau::snap::check_cross_build(arch, dep_meta.target.as_deref())?;
     if !json && !quiet {
-        shuttle::output::status(format!("building dependency {name} ({arch})..."));
+        nau::output::status(format!("building dependency {name} ({arch})..."));
     }
     let stage = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create temp stage for {name}: {e}"))?;
     let scan_listings = match &dep_prefix {
-        Some(p) => shuttle::leak_scan::listings_for_build(dep_meta, p)?,
-        None => shuttle::leak_scan::PayloadListings::default(),
+        Some(p) => nau::leak_scan::listings_for_build(dep_meta, p)?,
+        None => nau::leak_scan::PayloadListings::default(),
     };
 
-    let result = shuttle::snap::build_snap(
+    let result = nau::snap::build_snap(
         dep_meta,
         stage.path(),
         output_dir,
         arch,
-        shuttle::snap::StagePolicy::Default,
+        nau::snap::StagePolicy::Default,
         // Dependency builds have no pod store and no interpreted closure.
         None,
         None,
@@ -952,12 +952,12 @@ fn ensure_dep_payload(
         Some(&scan_listings),
     )?;
     if !json && !quiet {
-        shuttle::output::ok(&result.snap_filename);
+        nau::output::ok(&result.snap_filename);
     }
     if let (Some(cache), Some(closure)) = (pkg_cache, closure.as_ref()) {
         let _store_lock = CACHE_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = cache.store(dep_meta, &result, output_dir, closure) {
-            shuttle::output::warn(format!("cache store failed: {e}"));
+            nau::output::warn(format!("cache store failed: {e}"));
         }
     }
 
@@ -969,11 +969,11 @@ fn ensure_dep_payload(
 /// ready-node build borrows from the orchestrator. Fields are read-only
 /// for the whole phase; the scheduler runs one `run` per node.
 struct DepJobCtx<'a> {
-    metas: &'a BTreeMap<String, shuttle::snap::SnapMeta>,
-    closures: &'a HashMap<String, Option<shuttle::cache::BuildClosure>>,
+    metas: &'a BTreeMap<String, nau::snap::SnapMeta>,
+    closures: &'a HashMap<String, Option<nau::cache::BuildClosure>>,
     cli_archs: &'a [String],
     output_dir: &'a Path,
-    pkg_cache: Option<&'a shuttle::cache::PackageCache>,
+    pkg_cache: Option<&'a nau::cache::PackageCache>,
     lockfile: &'a LockFile,
     json: bool,
     total: usize,
@@ -988,7 +988,7 @@ impl DepJobCtx<'_> {
     /// quiet build inside, error prefixed per line for the final report.
     fn run(&self, name: &str) -> Result<(), String> {
         let meta = self.metas.get(name).expect("scheduled node was loaded");
-        let archs = shuttle::snap::resolve_archs(meta, self.cli_archs);
+        let archs = nau::snap::resolve_archs(meta, self.cli_archs);
         let dep_closure = self.closures[name].as_ref();
         let slot = self.dispatch.fetch_add(1, Ordering::SeqCst) + 1;
         if !self.json {
@@ -1025,12 +1025,12 @@ impl DepJobCtx<'_> {
 /// `--target`. A node whose meta cannot load is skipped with a warning,
 /// as the sequential loop did.
 fn load_dep_metas(
-    dep_nodes: &[shuttle::deps::DepNode],
+    dep_nodes: &[nau::deps::DepNode],
     effective_target: Option<&String>,
-) -> BTreeMap<String, shuttle::snap::SnapMeta> {
+) -> BTreeMap<String, nau::snap::SnapMeta> {
     let mut metas = BTreeMap::new();
     for node in dep_nodes {
-        match shuttle::deps::load_meta(&node.name) {
+        match nau::deps::load_meta(&node.name) {
             Ok(mut m) => {
                 // Apply --target to deps as well
                 if let Some(t) = effective_target {
@@ -1039,7 +1039,7 @@ fn load_dep_metas(
                 metas.insert(node.name.clone(), m);
             }
             Err(e) => {
-                shuttle::output::warn(format!("skipping dependency '{}': {}", node.name, e));
+                nau::output::warn(format!("skipping dependency '{}': {}", node.name, e));
             }
         }
     }
@@ -1051,16 +1051,16 @@ fn load_dep_metas(
 /// re-resolves the dep closure through the isolate worker, and evals stay
 /// sequential. Both the cache checks and the per-dep cache store use it.
 fn precompute_dep_closures(
-    metas: &BTreeMap<String, shuttle::snap::SnapMeta>,
-    pkg_cache: Option<&shuttle::cache::PackageCache>,
+    metas: &BTreeMap<String, nau::snap::SnapMeta>,
+    pkg_cache: Option<&nau::cache::PackageCache>,
     lockfile: &LockFile,
-) -> HashMap<String, Option<shuttle::cache::BuildClosure>> {
+) -> HashMap<String, Option<nau::cache::BuildClosure>> {
     metas
         .iter()
         .map(|(name, meta)| {
             (
                 name.clone(),
-                pkg_cache.map(|_| shuttle::coordinator::build_closure(meta, lockfile)),
+                pkg_cache.map(|_| nau::coordinator::build_closure(meta, lockfile)),
             )
         })
         .collect()
@@ -1072,9 +1072,9 @@ fn precompute_dep_closures(
 /// equals checking just before its build — nothing else writes its
 /// entries.)
 fn cached_dep_names(
-    metas: &BTreeMap<String, shuttle::snap::SnapMeta>,
-    closures: &HashMap<String, Option<shuttle::cache::BuildClosure>>,
-    pkg_cache: Option<&shuttle::cache::PackageCache>,
+    metas: &BTreeMap<String, nau::snap::SnapMeta>,
+    closures: &HashMap<String, Option<nau::cache::BuildClosure>>,
+    pkg_cache: Option<&nau::cache::PackageCache>,
     cli_archs: &[String],
     json: bool,
 ) -> HashSet<String> {
@@ -1084,7 +1084,7 @@ fn cached_dep_names(
             if dep_fully_cached(cache, closure, meta, cli_archs) {
                 cached.insert(name.clone());
                 if !json {
-                    shuttle::output::ok(format!("{} (cached)", name));
+                    nau::output::ok(format!("{} (cached)", name));
                 }
             }
         }
@@ -1096,9 +1096,9 @@ fn cached_dep_names(
 /// (--all mode), consulting the binary cache per dep when one is active.
 ///
 /// Parallel across packages (issue #55, ADR-0022 Decision 3): the graph
-/// from `deps.rs` is scheduled by [`shuttle::build_sched`] — every READY
+/// from `deps.rs` is scheduled by [`nau::build_sched`] — every READY
 /// node builds concurrently up to the pool budget,
-/// [`shuttle::build_sched::pool_budget`] of the `workers` config
+/// [`nau::build_sched::pool_budget`] of the `workers` config
 /// (ADR-0040 Decision 4; no `workers` table = the fixed three), and
 /// dependents wake as their last dependency completes. Jobs dispatch
 /// through the local executor seam. Build isolation is unchanged: each
@@ -1113,14 +1113,14 @@ fn cached_dep_names(
 /// used to warn and keep building garbage.
 #[allow(clippy::too_many_arguments)]
 fn build_all_deps(
-    dep_nodes: &[shuttle::deps::DepNode],
+    dep_nodes: &[nau::deps::DepNode],
     effective_target: Option<&String>,
-    pkg_cache: Option<&shuttle::cache::PackageCache>,
+    pkg_cache: Option<&nau::cache::PackageCache>,
     cli_archs: &[String],
     output_dir: &Path,
     lockfile: &LockFile,
     json: bool,
-    workers: &shuttle::lua::WorkersConfig,
+    workers: &nau::lua::WorkersConfig,
 ) -> miette::Result<()> {
     if dep_nodes.is_empty() {
         return Ok(());
@@ -1153,7 +1153,7 @@ fn build_all_deps(
     if to_build == 0 {
         return Ok(());
     }
-    let max_workers = shuttle::build_sched::pool_budget(workers);
+    let max_workers = nau::build_sched::pool_budget(workers);
     if !json {
         eprintln!(
             "── Building {to_build} dependencies (up to {} in parallel) ──",
@@ -1167,8 +1167,8 @@ fn build_all_deps(
     // per package instead of streaming into other packages' output. Both
     // flags are set once around the whole phase — the orchestrator thread
     // blocks inside `run_ready_set` — and restored before returning.
-    shuttle::output::set_quiet_build(true);
-    shuttle::snap::set_buffer_child_stderr(true);
+    nau::output::set_quiet_build(true);
+    nau::snap::set_buffer_child_stderr(true);
     let dispatch = AtomicUsize::new(0);
 
     // The build invocation IS the coordinator (ADR-0040 Decision 4):
@@ -1188,13 +1188,13 @@ fn build_all_deps(
             dispatch: &dispatch,
             executor: "local",
         };
-        let executor = shuttle::build_sched::LocalExecutor::new(|name| ctx.run(name));
-        shuttle::build_sched::run_ready_set_with_executor(&graph, &pre_done, max_workers, &executor)
-            .map(|()| shuttle::build_sched::FarmOutcome {
+        let executor = nau::build_sched::LocalExecutor::new(|name| ctx.run(name));
+        nau::build_sched::run_ready_set_with_executor(&graph, &pre_done, max_workers, &executor)
+            .map(|()| nau::build_sched::FarmOutcome {
                 result: Ok(()),
                 workers_lost: Vec::new(),
             })
-            .unwrap_or_else(|failed| shuttle::build_sched::FarmOutcome {
+            .unwrap_or_else(|failed| nau::build_sched::FarmOutcome {
                 result: Err(failed),
                 workers_lost: Vec::new(),
             })
@@ -1214,13 +1214,13 @@ fn build_all_deps(
         run_farm(&ctx, &graph, &pre_done, workers)
             .unwrap_or_else(|e| refused_run(&graph, &format!("{e:#}")))
     };
-    shuttle::snap::set_buffer_child_stderr(false);
-    shuttle::output::set_quiet_build(false);
+    nau::snap::set_buffer_child_stderr(false);
+    nau::output::set_quiet_build(false);
 
     match scheduled.result {
         Ok(()) => {
             if !scheduled.workers_lost.is_empty() {
-                shuttle::output::warn(format!(
+                nau::output::warn(format!(
                     "worker(s) lost during the run (affected jobs re-dispatched and \
                      completed): {} — the escape hatch is removing the worker from the \
                      `workers` table, not retrying",
@@ -1248,7 +1248,7 @@ fn prefix_error_lines(err: &str, name: &str) -> String {
 /// it. The farm path adds the workers lost along the way — every failure
 /// names its worker, and the summary names every worker the run lost.
 fn report_failed_builds(
-    failed: &shuttle::build_sched::FailedBuilds,
+    failed: &nau::build_sched::FailedBuilds,
     workers_lost: &[String],
 ) -> miette::Error {
     let names: Vec<String> = failed.failed.iter().map(|(n, _)| n.clone()).collect();
@@ -1283,8 +1283,8 @@ fn run_farm(
     ctx: &DepJobCtx<'_>,
     graph: &BTreeMap<String, Vec<String>>,
     pre_done: &HashSet<String>,
-    workers: &shuttle::lua::WorkersConfig,
-) -> miette::Result<shuttle::build_sched::FarmOutcome> {
+    workers: &nau::lua::WorkersConfig,
+) -> miette::Result<nau::build_sched::FarmOutcome> {
     // Preflight first, sequentially, before anything dispatches: a
     // refused worker (arch mismatch, unpinned, unreachable, protocol
     // drift, sandbox) is a config error that kills the run before an
@@ -1292,18 +1292,18 @@ fn run_farm(
     // failed probe. The entry's declared arch rides the check, so a
     // declared-vs-reported mismatch refuses here rather than mid-run,
     // per dispatch, after other work has gone out (#193 review F1).
-    let executors: Vec<shuttle::ssh_exec::SshExecutor<shuttle::command::RealRunner>> = workers
+    let executors: Vec<nau::ssh_exec::SshExecutor<nau::command::RealRunner>> = workers
         .workers
         .iter()
-        .map(|w| shuttle::ssh_exec::SshExecutor::new(w, shuttle::command::RealRunner))
+        .map(|w| nau::ssh_exec::SshExecutor::new(w, nau::command::RealRunner))
         .collect::<miette::Result<_>>()?;
-    if let Err(e) = shuttle::coordinator::preflight_farm_workers(&executors) {
+    if let Err(e) = nau::coordinator::preflight_farm_workers(&executors) {
         let text = format!("{e:#}");
         return Ok(refused_run(graph, &text));
     }
 
     let plans =
-        match shuttle::coordinator::precompute_farm_plans(ctx.metas, ctx.cli_archs, ctx.lockfile) {
+        match nau::coordinator::precompute_farm_plans(ctx.metas, ctx.cli_archs, ctx.lockfile) {
             Ok(x) => x,
             Err(e) => {
                 // A precompute failure is a pre-run refusal: nothing
@@ -1315,13 +1315,13 @@ fn run_farm(
     let epoch = std::env::var("SOURCE_DATE_EPOCH")
         .ok()
         .and_then(|s| s.parse::<i64>().ok());
-    let shuttle::coordinator::FarmPlans {
+    let nau::coordinator::FarmPlans {
         plans,
         dep_metas,
         dep_closures,
         caps,
     } = plans;
-    let source = std::sync::Arc::new(shuttle::coordinator::FarmSource {
+    let source = std::sync::Arc::new(nau::coordinator::FarmSource {
         plans,
         dep_metas,
         dep_closures,
@@ -1330,7 +1330,7 @@ fn run_farm(
         pkg_cache: ctx.pkg_cache,
         json: ctx.json,
         epoch,
-        runner: shuttle::command::RealRunner,
+        runner: nau::command::RealRunner,
     });
 
     if !ctx.json {
@@ -1351,48 +1351,46 @@ fn run_farm(
                 )
             })
             .collect();
-        shuttle::output::status(format!(
+        nau::output::status(format!(
             "farm: {} worker(s): {} — placement by arch, then ready-set order",
             workers.workers.len(),
             roster.join(", ")
         ));
     }
 
-    let local = shuttle::build_sched::Slotted {
-        exec: shuttle::build_sched::LocalExecutor::new(|name| ctx.run(name)),
+    let local = nau::build_sched::Slotted {
+        exec: nau::build_sched::LocalExecutor::new(|name| ctx.run(name)),
         slots: workers.local_jobs as usize,
         display: "local".into(),
     };
 
-    let remote: Vec<shuttle::build_sched::RemoteExecutor<shuttle::command::RealRunner, _>> =
-        executors
-            .into_iter()
-            .zip(&workers.workers)
-            .map(|(exec, w)| {
-                shuttle::build_sched::RemoteExecutor::new(
-                    exec,
-                    std::sync::Arc::clone(&source),
-                    w.jobs as usize,
-                    ctx.total,
-                )
-            })
-            .collect();
+    let remote: Vec<nau::build_sched::RemoteExecutor<nau::command::RealRunner, _>> = executors
+        .into_iter()
+        .zip(&workers.workers)
+        .map(|(exec, w)| {
+            nau::build_sched::RemoteExecutor::new(
+                exec,
+                std::sync::Arc::clone(&source),
+                w.jobs as usize,
+                ctx.total,
+            )
+        })
+        .collect();
 
-    let mut farm: Vec<shuttle::build_sched::FarmExecutor<'_>> =
-        vec![shuttle::build_sched::FarmExecutor {
-            job: &local,
-            kind: shuttle::build_sched::ExecutorKind::Local,
-        }];
+    let mut farm: Vec<nau::build_sched::FarmExecutor<'_>> = vec![nau::build_sched::FarmExecutor {
+        job: &local,
+        kind: nau::build_sched::ExecutorKind::Local,
+    }];
     for (re, w) in remote.iter().zip(&workers.workers) {
-        farm.push(shuttle::build_sched::FarmExecutor {
+        farm.push(nau::build_sched::FarmExecutor {
             job: re,
-            kind: shuttle::build_sched::ExecutorKind::Worker {
+            kind: nau::build_sched::ExecutorKind::Worker {
                 declared_arch: w.arch.clone(),
             },
         });
     }
 
-    Ok(shuttle::build_sched::run_ready_set_farm(
+    Ok(nau::build_sched::run_ready_set_farm(
         graph, pre_done, &farm, &caps,
     ))
 }
@@ -1402,9 +1400,9 @@ fn run_farm(
 fn refused_run(
     graph: &BTreeMap<String, Vec<String>>,
     reason: &str,
-) -> shuttle::build_sched::FarmOutcome {
-    shuttle::build_sched::FarmOutcome {
-        result: Err(shuttle::build_sched::FailedBuilds {
+) -> nau::build_sched::FarmOutcome {
+    nau::build_sched::FarmOutcome {
+        result: Err(nau::build_sched::FailedBuilds {
             failed: vec![("(coordinator preflight)".to_string(), reason.to_string())],
             skipped: graph.keys().cloned().collect(),
         }),
@@ -1431,19 +1429,19 @@ static CACHE_STORE_LOCK: Mutex<()> = Mutex::new(());
 #[allow(clippy::too_many_arguments)]
 fn build_dep_archs(
     dep_name: &str,
-    dep_meta: &shuttle::snap::SnapMeta,
+    dep_meta: &nau::snap::SnapMeta,
     dep_archs: &[String],
     output_dir: &Path,
-    pkg_cache: Option<&shuttle::cache::PackageCache>,
-    dep_closure: Option<&shuttle::cache::BuildClosure>,
+    pkg_cache: Option<&nau::cache::PackageCache>,
+    dep_closure: Option<&nau::cache::BuildClosure>,
     lockfile: &LockFile,
     json: bool,
     quiet: bool,
 ) -> miette::Result<()> {
     for a in dep_archs {
-        shuttle::snap::check_cross_build(a, dep_meta.target.as_deref())?;
+        nau::snap::check_cross_build(a, dep_meta.target.as_deref())?;
         if !json && !quiet {
-            shuttle::output::status(format!("building {} ({})...", dep_name, a));
+            nau::output::status(format!("building {} ({})...", dep_name, a));
         }
         let dep_stage = tempfile::tempdir()
             .map_err(|e| miette::miette!("failed to create temp stage: {}", e))?;
@@ -1461,16 +1459,16 @@ fn build_dep_archs(
         )?;
 
         let scan_listings = match &build_prefix {
-            Some(p) => shuttle::leak_scan::listings_for_build(dep_meta, p)?,
-            None => shuttle::leak_scan::PayloadListings::default(),
+            Some(p) => nau::leak_scan::listings_for_build(dep_meta, p)?,
+            None => nau::leak_scan::PayloadListings::default(),
         };
 
-        match shuttle::snap::build_snap(
+        match nau::snap::build_snap(
             dep_meta,
             dep_stage.path(),
             output_dir,
             a,
-            shuttle::snap::StagePolicy::Default,
+            nau::snap::StagePolicy::Default,
             None,
             // Plain recursive builds have no pod dependency closure.
             None,
@@ -1479,12 +1477,12 @@ fn build_dep_archs(
         ) {
             Ok(result) => {
                 if !json && !quiet {
-                    shuttle::output::ok(&result.snap_filename);
+                    nau::output::ok(&result.snap_filename);
                 }
                 if let (Some(cache), Some(closure)) = (pkg_cache, dep_closure) {
                     let _store_lock = CACHE_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                     if let Err(e) = cache.store(dep_meta, &result, output_dir, closure) {
-                        shuttle::output::warn(format!("cache store failed: {}", e));
+                        nau::output::warn(format!("cache store failed: {}", e));
                     }
                 }
             }
@@ -1500,19 +1498,19 @@ fn build_dep_archs(
 /// source infos recorded during the builds (for lockfile pinning).
 #[allow(clippy::too_many_arguments)]
 fn build_outputs(
-    iter: &[(&String, shuttle::snap::SnapMeta)],
+    iter: &[(&String, nau::snap::SnapMeta)],
     cli_archs: &[String],
     stage_dir: &Path,
-    stage_policy: shuttle::snap::StagePolicy,
+    stage_policy: nau::snap::StagePolicy,
     output_dir: &Path,
     pkg_cache: Option<&PackageCache>,
     lockfile: &LockFile,
     json: bool,
-) -> miette::Result<Vec<shuttle::snap::SourceInfo>> {
-    let mut all_source_info: Vec<shuttle::snap::SourceInfo> = Vec::new();
+) -> miette::Result<Vec<nau::snap::SourceInfo>> {
+    let mut all_source_info: Vec<nau::snap::SourceInfo> = Vec::new();
 
     for (name, meta) in iter {
-        let archs = shuttle::snap::resolve_archs(meta, cli_archs);
+        let archs = nau::snap::resolve_archs(meta, cli_archs);
         if !json {
             // adopt-info snaps show their adopted-at-build identity here,
             // never the "0" placeholder.
@@ -1545,23 +1543,23 @@ fn build_outputs(
 #[allow(clippy::too_many_arguments)]
 fn build_one_arch(
     name: &str,
-    meta: &shuttle::snap::SnapMeta,
+    meta: &nau::snap::SnapMeta,
     arch: &str,
     stage_dir: &Path,
-    stage_policy: shuttle::snap::StagePolicy,
+    stage_policy: nau::snap::StagePolicy,
     output_dir: &Path,
     pkg_cache: Option<&PackageCache>,
     lockfile: &LockFile,
     json: bool,
-) -> miette::Result<Vec<shuttle::snap::SourceInfo>> {
-    shuttle::snap::check_cross_build(arch, meta.target.as_deref())?;
+) -> miette::Result<Vec<nau::snap::SourceInfo>> {
+    nau::snap::check_cross_build(arch, meta.target.as_deref())?;
     if !json {
-        shuttle::output::status(format!("{}/{}:", name, arch));
+        nau::output::status(format!("{}/{}:", name, arch));
     }
 
     if let Some(SourceSpec::Unverified(ref url)) = meta.source {
         if lockfile.lookup_source(url).is_some() {
-            shuttle::output::info(format!("using lockfile hash for {url}"));
+            nau::output::info(format!("using lockfile hash for {url}"));
         }
     }
 
@@ -1586,11 +1584,11 @@ fn build_one_arch(
     // there are no payloads, so the listings are empty and the scan just
     // reports zero build-only refs.
     let scan_listings = match &build_prefix {
-        Some(p) => shuttle::leak_scan::listings_for_build(meta, p)?,
-        None => shuttle::leak_scan::PayloadListings::default(),
+        Some(p) => nau::leak_scan::listings_for_build(meta, p)?,
+        None => nau::leak_scan::PayloadListings::default(),
     };
 
-    let result = shuttle::snap::build_snap(
+    let result = nau::snap::build_snap(
         meta,
         stage_dir,
         output_dir,
@@ -1602,9 +1600,9 @@ fn build_one_arch(
         Some(&scan_listings),
     )?;
     if !json {
-        shuttle::output::ok(&result.snap_filename);
+        nau::output::ok(&result.snap_filename);
     } else {
-        shuttle::output::record_build_result(shuttle::output::BuildResultJson {
+        nau::output::record_build_result(nau::output::BuildResultJson {
             name: meta.name.clone(),
             // The version the build actually resolved to (extracted for
             // adopt-info snaps — never the declared placeholder).
@@ -1618,7 +1616,7 @@ fn build_one_arch(
                 result
                     .source_infos
                     .iter()
-                    .map(|i| shuttle::output::SourcePinJson {
+                    .map(|i| nau::output::SourcePinJson {
                         url: i.url.clone(),
                         sha256: i.sha256.clone(),
                     })
@@ -1637,7 +1635,7 @@ fn build_one_arch(
 fn persist_new_sources(
     lockfile: &mut LockFile,
     lock_path: &Path,
-    source_info: &[shuttle::snap::SourceInfo],
+    source_info: &[nau::snap::SourceInfo],
     lockfile_path: &str,
     json: bool,
 ) -> miette::Result<()> {
@@ -1656,7 +1654,7 @@ fn persist_new_sources(
 
     if changed {
         lockfile.save(lock_path)?;
-        shuttle::output::ok(format!("lockfile updated: {}", lockfile_path));
+        nau::output::ok(format!("lockfile updated: {}", lockfile_path));
     }
 
     if !source_info.is_empty() && !json {
@@ -1666,7 +1664,7 @@ fn persist_new_sources(
             } else {
                 "recorded"
             };
-            shuttle::output::status(format!("source {status}: {:16} {}", info.sha256, info.url));
+            nau::output::status(format!("source {status}: {:16} {}", info.sha256, info.url));
         }
     }
 
@@ -1682,7 +1680,7 @@ fn persist_new_sources(
 fn persist_build_deps_pins(
     lockfile: &mut LockFile,
     lock_path: &Path,
-    iter: &[(&String, shuttle::snap::SnapMeta)],
+    iter: &[(&String, nau::snap::SnapMeta)],
     lockfile_path: &str,
 ) -> miette::Result<()> {
     let mut changed = false;
@@ -1691,10 +1689,10 @@ fn persist_build_deps_pins(
             if lockfile.lookup_build_dep(dep).is_some() {
                 continue;
             }
-            let member = shuttle::coordinator::requires_member(dep, lockfile);
+            let member = nau::coordinator::requires_member(dep, lockfile);
             lockfile.record_build_dep(
                 dep,
-                &shuttle::lock::BuildDepPin {
+                &nau::lock::BuildDepPin {
                     pin: member.pin.clone(),
                     hash: member.hash.clone(),
                 },
@@ -1705,7 +1703,7 @@ fn persist_build_deps_pins(
 
     if changed {
         lockfile.save(lock_path)?;
-        shuttle::output::ok(format!("lockfile updated: {lockfile_path}"));
+        nau::output::ok(format!("lockfile updated: {lockfile_path}"));
     }
     Ok(())
 }
@@ -1714,11 +1712,11 @@ fn persist_build_deps_pins(
 
 fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Result<()> {
     // Initialize global inputs (default if no config)
-    shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
+    nau::pkg_source::init_global_inputs(&HashMap::new())?;
     let file = resolve_file(file)?;
     let all_outputs = evaluate_file_or_embedded(&file)?;
 
-    let iter: Vec<&shuttle::snap::SnapMeta> = match output_name {
+    let iter: Vec<&nau::snap::SnapMeta> = match output_name {
         Some(name) => {
             let meta = all_outputs
                 .get(name)
@@ -1728,7 +1726,7 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
         None => {
             // `Outputs` is a HashMap: sort for deterministic multi-output
             // report order run to run.
-            let mut metas: Vec<(&String, &shuttle::snap::SnapMeta)> = all_outputs.iter().collect();
+            let mut metas: Vec<(&String, &nau::snap::SnapMeta)> = all_outputs.iter().collect();
             metas.sort_by_key(|(name, _)| *name);
             metas.into_iter().map(|(_, meta)| meta).collect()
         }
@@ -1747,20 +1745,20 @@ fn cmd_order(file: &str, output_name: &Option<String>, json: bool) -> miette::Re
 
 /// JSON-mode order report for one output. Seeds resolution with the
 /// build-time dependency union (`requires` ∪ `build_deps`).
-fn report_order_json(meta: &shuttle::snap::SnapMeta) {
-    let seeds = shuttle::deps::build_dep_seeds(meta);
+fn report_order_json(meta: &nau::snap::SnapMeta) {
+    let seeds = nau::deps::build_dep_seeds(meta);
     if seeds.is_empty() {
         return;
     }
     let seen: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
-    if let Ok(order) = shuttle::deps::resolve_dep_names(&seeds, true) {
+    if let Ok(order) = nau::deps::resolve_dep_names(&seeds, true) {
         for dep in &order {
             let kind = if seen.contains(dep.as_str()) {
                 "direct"
             } else {
                 "transitive"
             };
-            shuttle::output::record_order_result(shuttle::output::OrderResultJson {
+            nau::output::record_order_result(nau::output::OrderResultJson {
                 name: dep.clone(),
                 kind: kind.to_string(),
             });
@@ -1769,7 +1767,7 @@ fn report_order_json(meta: &shuttle::snap::SnapMeta) {
 }
 
 /// Text-mode order report for one output.
-fn report_order_human(meta: &shuttle::snap::SnapMeta) {
+fn report_order_human(meta: &nau::snap::SnapMeta) {
     eprintln!("Package: {} {}", meta.name, meta.version);
 
     if meta.requires.is_empty() && meta.build_deps.is_empty() {
@@ -1790,8 +1788,8 @@ fn report_order_human(meta: &shuttle::snap::SnapMeta) {
     }
 
     eprintln!("  Resolved build order (transitive):");
-    let seeds = shuttle::deps::build_dep_seeds(meta);
-    match shuttle::deps::resolve_dep_names(&seeds, true) {
+    let seeds = nau::deps::build_dep_seeds(meta);
+    match nau::deps::resolve_dep_names(&seeds, true) {
         Ok(order) => {
             let seen: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
             for dep in &order {
@@ -1811,38 +1809,38 @@ fn report_order_human(meta: &shuttle::snap::SnapMeta) {
 
 // ── Deps command ──
 
-/// `shuttle deps fetch` (ADR-0017, issue #13): force a dependency-closure
+/// `nau deps fetch` (ADR-0017, issue #13): force a dependency-closure
 /// fetch for the pod's interpreted packages. Reports each fetched closure
 /// (and whether content moved) plus locked packages left untouched.
 fn cmd_deps_fetch(pod: Option<&str>, root: Option<&str>, latest: bool) -> miette::Result<()> {
-    let pod_name = pod.unwrap_or(shuttle::pod::DEFAULT_POD);
-    let root = shuttle::pod::pod_root(root);
-    let report = shuttle::pod::fetch_pod_deps(&root, pod_name, latest)?;
+    let pod_name = pod.unwrap_or(nau::pod::DEFAULT_POD);
+    let root = nau::pod::pod_root(root);
+    let report = nau::pod::fetch_pod_deps(&root, pod_name, latest)?;
     for entry in &report.fetched {
         if entry.changed {
-            shuttle::output::ok(format!(
+            nau::output::ok(format!(
                 "fetched dependency closure for '{}' ({:.12}…)",
                 entry.name, entry.deps_hash
             ));
         } else {
-            shuttle::output::info(format!(
+            nau::output::info(format!(
                 "dependency closure for '{}' re-fetched, content unchanged ({:.12}…)",
                 entry.name, entry.deps_hash
             ));
         }
     }
     for name in &report.skipped {
-        shuttle::output::info(format!(
+        nau::output::info(format!(
             "skipped '{name}': locked and its closure pin is cached (use --latest to re-resolve)"
         ));
     }
     for name in &report.sideloaded {
-        shuttle::output::info(format!(
+        nau::output::info(format!(
             "skipped '{name}' (sideloaded — blob pins never re-resolve from the collection)"
         ));
     }
     if report.fetched.is_empty() && report.skipped.is_empty() && report.sideloaded.is_empty() {
-        shuttle::output::info(format!(
+        nau::output::info(format!(
             "pod '{pod_name}' declares no dependency closures (deps = {{ npm = ... }} / pip)"
         ));
     }
@@ -1856,9 +1854,9 @@ fn cmd_deps(
     flat: bool,
     json: bool,
 ) -> miette::Result<()> {
-    shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
+    nau::pkg_source::init_global_inputs(&HashMap::new())?;
     let names = vec![package.clone()];
-    let nodes = shuttle::deps::resolve_deps(&names, recursive)?;
+    let nodes = nau::deps::resolve_deps(&names, recursive)?;
 
     if nodes.is_empty() {
         if json {
@@ -1878,7 +1876,7 @@ fn cmd_deps(
 }
 
 /// JSON-mode dependency report.
-fn report_deps_json(nodes: &[shuttle::deps::DepNode]) {
+fn report_deps_json(nodes: &[nau::deps::DepNode]) {
     let seen: std::collections::HashSet<&str> = nodes
         .iter()
         .flat_map(|n| n.requires.iter().chain(&n.build_deps))
@@ -1890,7 +1888,7 @@ fn report_deps_json(nodes: &[shuttle::deps::DepNode]) {
         } else {
             "transitive"
         };
-        shuttle::output::record_dep_result(shuttle::output::DepResultJson {
+        nau::output::record_dep_result(nau::output::DepResultJson {
             name: node.name.clone(),
             requires: node.requires.clone(),
             build_deps: node.build_deps.clone(),
@@ -1902,7 +1900,7 @@ fn report_deps_json(nodes: &[shuttle::deps::DepNode]) {
 /// Text-mode dependency report (tree / flat / direct-requires views).
 fn report_deps_human(
     package: &str,
-    nodes: &[shuttle::deps::DepNode],
+    nodes: &[nau::deps::DepNode],
     tree: bool,
     recursive: bool,
     flat: bool,
@@ -1910,7 +1908,7 @@ fn report_deps_human(
     if tree && recursive {
         eprintln!("Dependency tree for '{}':", package);
         let names = vec![package.to_string()];
-        let tree_str = shuttle::deps::format_tree(&names, true)?;
+        let tree_str = nau::deps::format_tree(&names, true)?;
         eprintln!("{}", tree_str);
     } else if flat {
         let names_only: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
@@ -1960,7 +1958,7 @@ fn release_args(
     release: &Option<String>,
     arch: &str,
     source_date_epoch: Option<&str>,
-) -> miette::Result<Option<shuttle::image::release::ReleaseArgs>> {
+) -> miette::Result<Option<nau::image::release::ReleaseArgs>> {
     let Some(dir) = release else {
         return Ok(None);
     };
@@ -1978,7 +1976,7 @@ fn release_args(
              e.g. --arch amd64"
         ));
     }
-    Ok(Some(shuttle::image::release::ReleaseArgs {
+    Ok(Some(nau::image::release::ReleaseArgs {
         dir: PathBuf::from(dir),
     }))
 }
@@ -1987,7 +1985,7 @@ fn release_args(
 /// the `--output` directory.
 fn image_output_dir<'a>(
     output: &'a str,
-    release_args: Option<&'a shuttle::image::release::ReleaseArgs>,
+    release_args: Option<&'a nau::image::release::ReleaseArgs>,
 ) -> &'a Path {
     release_args
         .map(|r| r.dir.as_path())
@@ -2013,7 +2011,7 @@ fn select_build_images<'a>(
     Ok(iter)
 }
 
-/// `shuttle image` (the #266 release gates live in [`release_args`] and
+/// `nau image` (the #266 release gates live in [`release_args`] and
 /// [`select_build_images`]).
 #[allow(clippy::too_many_arguments)]
 fn cmd_image(
@@ -2029,7 +2027,7 @@ fn cmd_image(
     lockfile_path: String,
     json: bool,
 ) -> miette::Result<()> {
-    shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
+    nau::pkg_source::init_global_inputs(&HashMap::new())?;
     let file = resolve_file(&file)?;
 
     // #266 gates (ADR-0044 D5/D8): a release pins the epoch, names the
@@ -2038,7 +2036,7 @@ fn cmd_image(
     let release_args = release_args(&release, &arch, source_date_epoch.as_deref())?;
 
     pin_epoch(source_date_epoch.as_deref());
-    std::env::set_var("SHUTTLE_ARCH", &arch);
+    std::env::set_var("NAU_ARCH", &arch);
 
     let lock_path = Path::new(&lockfile_path);
     let mut lockfile = load_lockfile_or_default(lock_path)?;
@@ -2066,30 +2064,30 @@ fn cmd_image(
 
     if lock_changed {
         lockfile.save(lock_path)?;
-        shuttle::output::ok(format!("lockfile updated: {}", lockfile_path));
+        nau::output::ok(format!("lockfile updated: {}", lockfile_path));
     }
 
     Ok(())
 }
 
-/// `shuttle verify-image` (ADR-0044 D4, #265): read-only flash
+/// `nau verify-image` (ADR-0044 D4, #265): read-only flash
 /// verification against the published signed image manifest. The
-/// machinery lives in [`shuttle::image::verify`]; this handler binds the
+/// machinery lives in [`nau::image::verify`]; this handler binds the
 /// real runner and reports the outcome.
 fn cmd_verify_image(
     device: &str,
     manifest: &str,
     key: Option<&str>,
-    slot: shuttle::image::SlotSelector,
+    slot: nau::image::SlotSelector,
     json: bool,
 ) -> miette::Result<()> {
-    let args = shuttle::image::VerifyImageArgs {
+    let args = nau::image::VerifyImageArgs {
         device: PathBuf::from(device),
         manifest: PathBuf::from(manifest),
         key: key.map(PathBuf::from),
         slot,
     };
-    let outcome = shuttle::image::verify_device(&shuttle::command::RealRunner, &args)?;
+    let outcome = nau::image::verify_device(&nau::command::RealRunner, &args)?;
     if json {
         let report = serde_json::json!({
             "command": "verify-image",
@@ -2108,7 +2106,7 @@ fn cmd_verify_image(
                 .map_err(|e| miette::miette!("verify-image JSON serialization: {e}"))?
         );
     } else {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "verified '{}' {} — slot {} root ({}) over hash ({}) recomputes to the \
              manifest roothash, under key {}",
             outcome.image_name,
@@ -2118,7 +2116,7 @@ fn cmd_verify_image(
             outcome.hash_partuuid,
             outcome.verified_key_id
         ));
-        shuttle::output::info("the flashed medium matches the signed manifest (ADR-0044 D4)");
+        nau::output::info("the flashed medium matches the signed manifest (ADR-0044 D4)");
     }
     Ok(())
 }
@@ -2128,12 +2126,12 @@ fn cmd_verify_image(
 fn resolve_images(file: &str) -> miette::Result<HashMap<String, ImageDeclaration>> {
     if let Some(_embedded) = file.strip_prefix("embedded://") {
         // Embedded packages are single snaps, not images — return empty
-        if !shuttle::output::is_json() {
-            shuttle::output::warn(format!("'{}' is a package, not an image", file));
+        if !nau::output::is_json() {
+            nau::output::warn(format!("'{}' is a package, not an image", file));
         }
         Ok(std::collections::HashMap::new())
     } else {
-        shuttle::lua::evaluate_images_file(file)
+        nau::lua::evaluate_images_file(file)
     }
 }
 
@@ -2143,7 +2141,7 @@ fn image_cache_dir(cache: Option<&str>) -> std::path::PathBuf {
     cache.map_or_else(
         || {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            Path::new(&home).join(".cache/shuttle/snaps")
+            Path::new(&home).join(".cache/nau/snaps")
         },
         |c| Path::new(c).to_path_buf(),
     )
@@ -2176,7 +2174,7 @@ fn build_images(
     channel: &str,
     arch: &str,
     lockfile: &mut LockFile,
-    release: Option<&shuttle::image::release::ReleaseArgs>,
+    release: Option<&nau::image::release::ReleaseArgs>,
     json: bool,
 ) -> miette::Result<()> {
     for (name, image_decl) in iter {
@@ -2202,7 +2200,7 @@ fn build_one_image(
     channel: &str,
     arch: &str,
     lockfile: &mut LockFile,
-    release: Option<&shuttle::image::release::ReleaseArgs>,
+    release: Option<&nau::image::release::ReleaseArgs>,
     json: bool,
 ) -> miette::Result<()> {
     // #266: the release media set is the verity-protected whole-disk
@@ -2217,11 +2215,11 @@ fn build_one_image(
         ));
     }
     let result = if image_decl.disk.is_some() {
-        shuttle::image::build_disk_image(
+        nau::image::build_disk_image(
             image_decl, output_dir, cache_dir, channel, arch, lockfile, release,
         )?
     } else {
-        shuttle::image::build_image(image_decl, output_dir, cache_dir, channel, arch, lockfile)?
+        nau::image::build_image(image_decl, output_dir, cache_dir, channel, arch, lockfile)?
     };
 
     let fname = result
@@ -2231,7 +2229,7 @@ fn build_one_image(
         .to_string();
 
     if json {
-        shuttle::output::record_build_result(shuttle::output::BuildResultJson {
+        nau::output::record_build_result(nau::output::BuildResultJson {
             name: name.to_string(),
             version: image_decl.version.clone(),
             arch: arch.to_string(),
@@ -2242,7 +2240,7 @@ fn build_one_image(
             worker: None,
         });
     } else {
-        shuttle::output::ok(&fname);
+        nau::output::ok(&fname);
     }
     Ok(())
 }
@@ -2255,11 +2253,11 @@ fn cmd_doctor(pod: Option<Option<String>>, fix: bool, from: Option<&str>) -> mie
     }
     if fix {
         let source = match from {
-            Some(dir) => shuttle::tools::ProvisionSource::FromDir(PathBuf::from(dir)),
-            None => shuttle::tools::ProvisionSource::Fetch,
+            Some(dir) => nau::tools::ProvisionSource::FromDir(PathBuf::from(dir)),
+            None => nau::tools::ProvisionSource::Fetch,
         };
         println!("provisioning floor tools (issue #101)...");
-        let installed = shuttle::tools::provision(source)
+        let installed = nau::tools::provision(source)
             .into_diagnostic()
             .wrap_err("floor-tool provisioning failed")?;
         println!(
@@ -2269,21 +2267,20 @@ fn cmd_doctor(pod: Option<Option<String>>, fix: bool, from: Option<&str>) -> mie
         );
     }
     let mut checks = if pod.is_some() || fix {
-        shuttle::doctor::run_pod()
+        nau::doctor::run_pod()
     } else {
-        shuttle::doctor::run_all()
+        nau::doctor::run_all()
     };
     // `--pod <name>` (issue #231): the failed-unit scan for the named
     // pod. The name is validated fail-closed at the CLI boundary; the
     // scan itself is advisory (hint-only, never fails the report).
     if let Some(pod_name) = pod.clone().flatten().as_deref() {
-        let (name, _) =
-            shuttle::pod::resolve_pod_dir_under(&shuttle::pod::pod_root(None), Some(pod_name))?;
-        checks.push(shuttle::doctor::check_pod_failed_units(&name));
+        let (name, _) = nau::pod::resolve_pod_dir_under(&nau::pod::pod_root(None), Some(pod_name))?;
+        checks.push(nau::doctor::check_pod_failed_units(&name));
     }
-    shuttle::doctor::print_report(&checks);
-    shuttle::doctor::print_notices();
-    if !shuttle::doctor::all_ok(&checks) {
+    nau::doctor::print_report(&checks);
+    nau::doctor::print_notices();
+    if !nau::doctor::all_ok(&checks) {
         std::process::exit(1);
     }
     Ok(())
@@ -2291,7 +2288,7 @@ fn cmd_doctor(pod: Option<Option<String>>, fix: bool, from: Option<&str>) -> mie
 
 // ── Check command ──
 
-/// `shuttle check`: run one definition through the analyzer gate first
+/// `nau check`: run one definition through the analyzer gate first
 /// (ADR-0010 Decision 2 — `--!strict` type checking in the bounded
 /// `__check-worker` subprocess, fail-closed on timeout with a single
 /// `analysis timed out` diagnostic; fast fail with spanned diagnostics
@@ -2302,16 +2299,16 @@ fn cmd_doctor(pod: Option<Option<String>>, fix: bool, from: Option<&str>) -> mie
 fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
     // Stage 1 — analyzer gate. A definition that does not type-check never
     // reaches the eval stage.
-    let analyzer_diagnostics = shuttle::analysis::check_definition_file(file);
-    let mut diagnostics: Vec<shuttle::lua::CheckDiagnostic> = analyzer_diagnostics
+    let analyzer_diagnostics = nau::analysis::check_definition_file(file);
+    let mut diagnostics: Vec<nau::lua::CheckDiagnostic> = analyzer_diagnostics
         .into_iter()
-        .map(|d| shuttle::lua::CheckDiagnostic::from_analyzer(file, d))
+        .map(|d| nau::lua::CheckDiagnostic::from_analyzer(file, d))
         .collect();
 
     // Stage 2 — bounded subprocess eval + Rust-side validation (unchanged
     // path; the analyzer is check-only). `None` when stage 1 failed fast.
     let checked = if diagnostics.is_empty() {
-        Some(shuttle::lua::check_file_with_inputs(file))
+        Some(nau::lua::check_file_with_inputs(file))
     } else {
         None
     };
@@ -2321,7 +2318,7 @@ fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
         // A hard eval failure is a diagnostic too, so both output modes carry
         // the complete problem list in one shape.
         if let Some(err) = &checked.error {
-            diagnostics.push(shuttle::lua::CheckDiagnostic {
+            diagnostics.push(nau::lua::CheckDiagnostic {
                 label: file.to_string(),
                 key: None,
                 expected: None,
@@ -2338,13 +2335,13 @@ fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
     // lint NEVER adds a failure mode: `ok` above is computed before it
     // runs, and its findings travel a separate channel (warn output /
     // `"lint"` JSON array), never the diagnostics list.
-    let lint: Vec<shuttle::lint::LintWarning> = checked
+    let lint: Vec<nau::lint::LintWarning> = checked
         .as_ref()
         .filter(|c| c.error.is_none())
-        .map(|c| shuttle::lint::confinement_lint(&c.outputs))
+        .map(|c| nau::lint::confinement_lint(&c.outputs))
         .unwrap_or_default();
     for w in &lint {
-        shuttle::output::warn(&w.message);
+        nau::output::warn(&w.message);
     }
 
     let outputs: Vec<(String, String)> = checked
@@ -2386,8 +2383,8 @@ fn cmd_check(file: &str, json: bool) -> miette::Result<()> {
 fn report_check_json(
     file: &str,
     outputs: &[String],
-    diagnostics: &[shuttle::lua::CheckDiagnostic],
-    lint: &[shuttle::lint::LintWarning],
+    diagnostics: &[nau::lua::CheckDiagnostic],
+    lint: &[nau::lint::LintWarning],
 ) {
     let diags: Vec<serde_json::Value> = diagnostics
         .iter()
@@ -2429,7 +2426,7 @@ fn report_check_json(
     );
 }
 
-/// Success message for `shuttle check` — each output shown with its
+/// Success message for `nau check` — each output shown with its
 /// version so the declared identity is visible, not just the name.
 fn check_ok_message(outputs: &[(String, String)]) -> String {
     let list = if outputs.is_empty() {
@@ -2445,37 +2442,37 @@ fn check_ok_message(outputs: &[(String, String)]) -> String {
 }
 
 fn report_check_ok(outputs: &[(String, String)]) {
-    shuttle::output::ok(check_ok_message(outputs));
+    nau::output::ok(check_ok_message(outputs));
 }
 
-fn report_check_diagnostic(d: &shuttle::lua::CheckDiagnostic) {
+fn report_check_diagnostic(d: &nau::lua::CheckDiagnostic) {
     match (&d.key, &d.span) {
         // Keyed diagnostics with a located declaration site show both: the
         // file:line:col prefix (grep-friendly, matches the analyzer arm)
         // plus the output key in brackets.
-        (Some(key), Some(s)) => shuttle::output::err(format!(
+        (Some(key), Some(s)) => nau::output::err(format!(
             "{}:{}:{}: [{key}] {}",
             d.label, s.begin_line, s.begin_col, d.message
         )),
-        (Some(key), None) => shuttle::output::err(format!("{}[{key}]: {}", d.label, d.message)),
+        (Some(key), None) => nau::output::err(format!("{}[{key}]: {}", d.label, d.message)),
         // Analyzer diagnostics print with their 1-based begin span.
-        (None, Some(s)) => shuttle::output::err(format!(
+        (None, Some(s)) => nau::output::err(format!(
             "{}:{}:{}: {}",
             d.label, s.begin_line, s.begin_col, d.message
         )),
-        (None, None) => shuttle::output::err(&d.message),
+        (None, None) => nau::output::err(&d.message),
     }
 }
 
 // ── Lint command (issue #53) ──
 
 /// Load the package index the same way the eval worker does
-/// (`SHUTTLE_INDEX_PATH`, else `package-index.json` in the CWD).
-fn lint_index() -> miette::Result<shuttle::index::PackageIndex> {
-    let path = std::env::var("SHUTTLE_INDEX_PATH")
+/// (`NAU_INDEX_PATH`, else `package-index.json` in the CWD).
+fn lint_index() -> miette::Result<nau::index::PackageIndex> {
+    let path = std::env::var("NAU_INDEX_PATH")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(shuttle::index::DEFAULT_INDEX));
-    shuttle::index::PackageIndex::load_or_default(&path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(nau::index::DEFAULT_INDEX));
+    nau::index::PackageIndex::load_or_default(&path)
 }
 
 /// The declared stage directory of a definition file, when it exists:
@@ -2490,17 +2487,17 @@ fn lint_stage_dir(file: &str) -> Option<std::path::PathBuf> {
 
 /// One pod package's lint entry: resolved meta when the package resolves
 /// from local inputs, `None` (warned later) when it does not.
-fn lint_pod_package(spec_str: &str) -> shuttle::checks::PodPackageMeta {
-    let Ok(spec) = shuttle::pod::parse_pod_package(spec_str) else {
-        return shuttle::checks::PodPackageMeta {
+fn lint_pod_package(spec_str: &str) -> nau::checks::PodPackageMeta {
+    let Ok(spec) = nau::pod::parse_pod_package(spec_str) else {
+        return nau::checks::PodPackageMeta {
             spec: spec_str.to_string(),
             name: spec_str.to_string(),
             meta: None,
         };
     };
     // Resolution is data-only over local inputs — never the network.
-    let meta = shuttle::deps::load_meta(&spec.name).ok();
-    shuttle::checks::PodPackageMeta {
+    let meta = nau::deps::load_meta(&spec.name).ok();
+    nau::checks::PodPackageMeta {
         spec: spec_str.to_string(),
         name: spec.name,
         meta,
@@ -2510,29 +2507,29 @@ fn lint_pod_package(spec_str: &str) -> shuttle::checks::PodPackageMeta {
 /// Resolve a pod's declared packages to metas for the lint, offline: the
 /// declaration comes from the pod state directory, each package
 /// declaration from local inputs.
-fn lint_pod(pod_name: &str) -> miette::Result<shuttle::checks::PodLintData> {
-    let root = shuttle::pod::pod_root(None);
-    let decl_path = shuttle::pod::pod_lua_path(&root, pod_name);
+fn lint_pod(pod_name: &str) -> miette::Result<nau::checks::PodLintData> {
+    let root = nau::pod::pod_root(None);
+    let decl_path = nau::pod::pod_lua_path(&root, pod_name);
     if !decl_path.exists() {
         miette::bail!(
             "pod '{pod_name}' has no declaration at {} (read verbs do not initialize pods)",
             decl_path.display()
         );
     }
-    let decl = shuttle::pod::evaluate_pod_file(&decl_path)?;
+    let decl = nau::pod::evaluate_pod_file(&decl_path)?;
     let packages = decl
         .packages
         .iter()
         .map(|spec| lint_pod_package(spec))
         .collect();
-    Ok(shuttle::checks::PodLintData {
+    Ok(nau::checks::PodLintData {
         name: pod_name.to_string(),
         packages,
     })
 }
 
 /// One finding's human-readable line pair (message + fix hint).
-fn lint_finding_lines(f: &shuttle::checks::Finding, label: &str) -> String {
+fn lint_finding_lines(f: &nau::checks::Finding, label: &str) -> String {
     format!(
         "[{}] {label}: {} {}: {}\n           fix: {}",
         f.severity.as_str(),
@@ -2544,30 +2541,30 @@ fn lint_finding_lines(f: &shuttle::checks::Finding, label: &str) -> String {
 }
 
 /// Human report: every finding on its channel, then a one-line summary.
-fn report_lint_human(findings: &[shuttle::checks::Finding], label: &str) {
+fn report_lint_human(findings: &[nau::checks::Finding], label: &str) {
     for f in findings {
         let lines = lint_finding_lines(f, label);
         match f.severity {
-            shuttle::checks::Severity::Error => shuttle::output::err(lines),
-            shuttle::checks::Severity::Warn => shuttle::output::warn(lines),
+            nau::checks::Severity::Error => nau::output::err(lines),
+            nau::checks::Severity::Warn => nau::output::warn(lines),
         }
     }
     if findings.is_empty() {
-        shuttle::output::ok("lint clean: 0 findings");
+        nau::output::ok("lint clean: 0 findings");
     } else {
         let errors = findings
             .iter()
-            .filter(|f| f.severity == shuttle::checks::Severity::Error)
+            .filter(|f| f.severity == nau::checks::Severity::Error)
             .count();
-        shuttle::output::status(format!(
+        nau::output::status(format!(
             "lint: {errors} error(s), {} warning(s)",
             findings.len() - errors
         ));
     }
 }
 
-/// JSON report shape for `shuttle lint --json`.
-fn report_lint_json(findings: &[shuttle::checks::Finding], label: &str) {
+/// JSON report shape for `nau lint --json`.
+fn report_lint_json(findings: &[nau::checks::Finding], label: &str) {
     let findings_json: Vec<serde_json::Value> = findings
         .iter()
         .map(|f| {
@@ -2582,7 +2579,7 @@ fn report_lint_json(findings: &[shuttle::checks::Finding], label: &str) {
         .collect();
     let errors = findings
         .iter()
-        .filter(|f| f.severity == shuttle::checks::Severity::Error)
+        .filter(|f| f.severity == nau::checks::Severity::Error)
         .count();
     let report = serde_json::json!({
         "file": label,
@@ -2597,33 +2594,33 @@ fn report_lint_json(findings: &[shuttle::checks::Finding], label: &str) {
     );
 }
 
-/// `shuttle lint`: run the check battery over a definition file (or a
+/// `nau lint`: run the check battery over a definition file (or a
 /// pod's packages) and report findings. Exit code 1 only on error findings.
 fn cmd_lint(file: String, pod: Option<String>, channel: String, json: bool) -> miette::Result<()> {
-    shuttle::output::set_mode(json);
+    nau::output::set_mode(json);
     let index = lint_index()?;
 
     let (label, eval, pod_data) = if let Some(pod_name) = pod.as_deref() {
         let data = lint_pod(pod_name)?;
-        let path = shuttle::pod::pod_lua_path(&shuttle::pod::pod_root(None), pod_name);
+        let path = nau::pod::pod_lua_path(&nau::pod::pod_root(None), pod_name);
         (path.display().to_string(), None, Some(data))
     } else {
-        let eval = shuttle::lua::lint_eval_file(&file)?;
+        let eval = nau::lua::lint_eval_file(&file)?;
         for d in &eval.diagnostics {
-            shuttle::output::warn(d);
+            nau::output::warn(d);
         }
         (file.clone(), Some(eval), None)
     };
 
     let empty_raw = BTreeMap::new();
-    let empty_outputs = shuttle::lua::Outputs::new();
-    let empty_images: std::collections::HashMap<String, shuttle::image::ImageDeclaration> =
+    let empty_outputs = nau::lua::Outputs::new();
+    let empty_images: std::collections::HashMap<String, nau::image::ImageDeclaration> =
         Default::default();
     let no_unparsed: Vec<String> = Vec::new();
     let stage_dir = eval.is_some().then(|| lint_stage_dir(&file)).flatten();
-    let arch = std::env::var("SHUTTLE_ARCH").unwrap_or_else(|_| "amd64".into());
+    let arch = std::env::var("NAU_ARCH").unwrap_or_else(|_| "amd64".into());
 
-    let input = shuttle::checks::LintInput {
+    let input = nau::checks::LintInput {
         file: std::path::Path::new(&label),
         arch: &arch,
         channel: &channel,
@@ -2636,14 +2633,14 @@ fn cmd_lint(file: String, pod: Option<String>, channel: String, json: bool) -> m
         stage_dir: stage_dir.as_deref(),
     };
 
-    let findings = shuttle::checks::run_battery(&input);
+    let findings = nau::checks::run_battery(&input);
     if json {
         report_lint_json(&findings, &label);
     } else {
         report_lint_human(&findings, &label);
     }
 
-    if shuttle::checks::has_errors(&findings) {
+    if nau::checks::has_errors(&findings) {
         std::process::exit(1);
     }
     Ok(())
@@ -2653,41 +2650,41 @@ fn cmd_lint(file: String, pod: Option<String>, channel: String, json: bool) -> m
 
 /// Human report: every finding on its channel, then summary lines
 /// carrying the audit counters and the database state.
-fn report_audit_human(report: &shuttle::audit::AuditReport, label: &str, cache_dir: &Path) {
+fn report_audit_human(report: &nau::audit::AuditReport, label: &str, cache_dir: &Path) {
     for f in &report.findings {
         let lines = lint_finding_lines(f, label);
         match f.severity {
-            shuttle::checks::Severity::Error => shuttle::output::err(lines),
-            shuttle::checks::Severity::Warn => shuttle::output::warn(lines),
+            nau::checks::Severity::Error => nau::output::err(lines),
+            nau::checks::Severity::Warn => nau::output::warn(lines),
         }
     }
     if report.findings.is_empty() {
-        shuttle::output::ok("audit clean: 0 findings");
+        nau::output::ok("audit clean: 0 findings");
     } else {
         let errors = report
             .findings
             .iter()
-            .filter(|f| f.severity == shuttle::checks::Severity::Error)
+            .filter(|f| f.severity == nau::checks::Severity::Error)
             .count();
-        shuttle::output::status(format!(
+        nau::output::status(format!(
             "audit: {} lockfile pin(s), {errors} error(s), {} warning(s)",
             report.targets,
             report.findings.len() - errors
         ));
     }
     if report.degraded {
-        shuttle::output::warn(format!(
+        nau::output::warn(format!(
             "OSV database unreachable (offline?) — {} pin(s) left unaudited; run \
-             `shuttle audit --update` when online (cache: {})",
+             `nau audit --update` when online (cache: {})",
             report.unaudited,
             cache_dir.display()
         ));
     }
 }
 
-/// JSON report: the `shuttle lint --json` shape (file/ok/errors/warnings/
+/// JSON report: the `nau lint --json` shape (file/ok/errors/warnings/
 /// findings) plus an additive `database` object for the audit counters.
-fn report_audit_json(report: &shuttle::audit::AuditReport, label: &str) {
+fn report_audit_json(report: &nau::audit::AuditReport, label: &str) {
     let findings_json: Vec<serde_json::Value> = report
         .findings
         .iter()
@@ -2704,7 +2701,7 @@ fn report_audit_json(report: &shuttle::audit::AuditReport, label: &str) {
     let errors = report
         .findings
         .iter()
-        .filter(|f| f.severity == shuttle::checks::Severity::Error)
+        .filter(|f| f.severity == nau::checks::Severity::Error)
         .count();
     let out = serde_json::json!({
         "file": label,
@@ -2723,7 +2720,7 @@ fn report_audit_json(report: &shuttle::audit::AuditReport, label: &str) {
     );
 }
 
-/// `shuttle audit`: check lockfile pins against the OSV vulnerability
+/// `nau audit`: check lockfile pins against the OSV vulnerability
 /// database (issue #52). Exit code 1 only on confirmed (version-matched)
 /// findings; offline/stale databases warn, never fail.
 fn cmd_audit(
@@ -2732,7 +2729,7 @@ fn cmd_audit(
     update: bool,
     json: bool,
 ) -> miette::Result<()> {
-    shuttle::output::set_mode(json);
+    nau::output::set_mode(json);
     let lock_path = Path::new(&lockfile);
     let Some(lock) = LockFile::load(lock_path)? else {
         miette::bail!(
@@ -2743,12 +2740,12 @@ fn cmd_audit(
     // An explicitly-given definition enriches the audit (declared
     // versions, output-key labels); a failing eval is a hard error.
     let raw = match &file {
-        Some(f) => Some(shuttle::lua::lint_eval_file(f)?.raw),
+        Some(f) => Some(nau::lua::lint_eval_file(f)?.raw),
         None => None,
     };
 
-    let cfg = shuttle::audit::AuditConfig::from_env(update);
-    let report = shuttle::audit::run_audit(&lock, raw.as_ref(), &cfg)?;
+    let cfg = nau::audit::AuditConfig::from_env(update);
+    let report = nau::audit::run_audit(&lock, raw.as_ref(), &cfg)?;
 
     if json {
         report_audit_json(&report, &lockfile);
@@ -2756,7 +2753,7 @@ fn cmd_audit(
         report_audit_human(&report, &lockfile, &cfg.cache_dir);
     }
 
-    if shuttle::checks::has_errors(&report.findings) {
+    if nau::checks::has_errors(&report.findings) {
         std::process::exit(1);
     }
     Ok(())
@@ -2765,7 +2762,7 @@ fn cmd_audit(
 // ── Lock command ──
 
 /// Human-readable old→new line for one refreshed input pin.
-fn pin_update_line(u: &shuttle::pkg_source::InputPinUpdate) -> String {
+fn pin_update_line(u: &nau::pkg_source::InputPinUpdate) -> String {
     let short = |s: &Option<String>| s.as_deref().map(|r| r.get(..7).unwrap_or(r).to_string());
     if u.local {
         return format!("{}: local (unlocked)", u.name);
@@ -2778,7 +2775,7 @@ fn pin_update_line(u: &shuttle::pkg_source::InputPinUpdate) -> String {
     }
 }
 
-/// `shuttle lock`: resolve/refresh all input pins without building.
+/// `nau lock`: resolve/refresh all input pins without building.
 fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
     let inputs = resolve_lock_inputs(&file)?;
 
@@ -2794,7 +2791,7 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
 
     // Empty names = refresh every declared input. All pins are resolved
     // before any is applied: a failed refresh never half-updates the lock.
-    let updates = shuttle::pkg_source::update_input_pins(&inputs, &[], &mut lockfile)?;
+    let updates = nau::pkg_source::update_input_pins(&inputs, &[], &mut lockfile)?;
 
     report_lock_status(&updates, &lockfile);
 
@@ -2804,15 +2801,15 @@ fn cmd_lock(file: String, lockfile_path: String) -> miette::Result<()> {
     Ok(())
 }
 
-/// The inputs a `shuttle lock` run refreshes: the definition's global
+/// The inputs a `nau lock` run refreshes: the definition's global
 /// inputs when the config exists and declares any, the default input
 /// otherwise.
 fn resolve_lock_inputs(file: &str) -> miette::Result<HashMap<String, PackageInput>> {
     let inputs = if Path::new(file).exists() {
-        match shuttle::lua::evaluate_file_with_inputs(file) {
+        match nau::lua::evaluate_file_with_inputs(file) {
             Ok(eval) if !eval.global_inputs.is_empty() => eval.global_inputs,
             Ok(_) => {
-                shuttle::output::info(format!("no inputs declared in '{file}', using default"));
+                nau::output::info(format!("no inputs declared in '{file}', using default"));
                 default_input_map()
             }
             Err(e) => {
@@ -2820,7 +2817,7 @@ fn resolve_lock_inputs(file: &str) -> miette::Result<HashMap<String, PackageInpu
             }
         }
     } else {
-        shuttle::output::info(format!("no config at '{file}', using default input"));
+        nau::output::info(format!("no config at '{file}', using default input"));
         default_input_map()
     };
     Ok(inputs)
@@ -2828,31 +2825,31 @@ fn resolve_lock_inputs(file: &str) -> miette::Result<HashMap<String, PackageInpu
 
 /// Status lines for a lock run: each refreshed pin (old→new), then every
 /// pin currently recorded in the lockfile.
-fn report_lock_status(updates: &[shuttle::pkg_source::InputPinUpdate], lockfile: &LockFile) {
+fn report_lock_status(updates: &[nau::pkg_source::InputPinUpdate], lockfile: &LockFile) {
     for u in updates {
-        shuttle::output::status(pin_update_line(u));
+        nau::output::status(pin_update_line(u));
     }
     for (name, entry) in &lockfile.inputs {
         if entry.local {
-            shuttle::output::status(format!("{name}: local (unlocked)"));
+            nau::output::status(format!("{name}: local (unlocked)"));
         } else if let Some(rev) = &entry.revision {
-            shuttle::output::status(format!("{name}: pinned to {}", rev.get(..7).unwrap_or(rev)));
+            nau::output::status(format!("{name}: pinned to {}", rev.get(..7).unwrap_or(rev)));
         }
     }
 }
 
-/// JSON/human output tail for `shuttle lock` (the lockfile is already
+/// JSON/human output tail for `nau lock` (the lockfile is already
 /// saved by the time this runs).
 fn report_lock_output(
     lockfile: &LockFile,
     lockfile_path: &str,
     updated: usize,
 ) -> miette::Result<()> {
-    if shuttle::output::is_json() {
-        let mut pins: Vec<shuttle::output::LockPinJson> = lockfile
+    if nau::output::is_json() {
+        let mut pins: Vec<nau::output::LockPinJson> = lockfile
             .inputs
             .iter()
-            .map(|(name, e)| shuttle::output::LockPinJson {
+            .map(|(name, e)| nau::output::LockPinJson {
                 name: name.clone(),
                 local: e.local,
                 revision: e.revision.clone(),
@@ -2860,7 +2857,7 @@ fn report_lock_output(
             })
             .collect();
         pins.sort_by(|a, b| a.name.cmp(&b.name));
-        let out = shuttle::output::LockOutputJson {
+        let out = nau::output::LockOutputJson {
             command: "lock".to_string(),
             lockfile: lockfile_path.to_string(),
             updated,
@@ -2870,14 +2867,14 @@ fn report_lock_output(
             .map_err(|e| miette::miette!("failed to serialize lock output: {e}"))?;
         println!("{json}");
     } else {
-        shuttle::output::ok(format!("{} input(s) locked -> {lockfile_path}", updated));
+        nau::output::ok(format!("{} input(s) locked -> {lockfile_path}", updated));
     }
     Ok(())
 }
 
 // ── Eval command ──
 
-/// `shuttle eval`: evaluate a definition and emit the image manifest IR
+/// `nau eval`: evaluate a definition and emit the image manifest IR
 /// (Phase 23, cross-distro-synthesis §5). No build, no store writes.
 ///
 /// Resolution is data-only — definition pins, the Phase 16 lockfile, and
@@ -2899,14 +2896,14 @@ fn cmd_eval(
     let file = resolve_file(&file)?;
     // Image resolution (index pins are per-arch) and the DSL's `arch`
     // global both key off this.
-    std::env::set_var("SHUTTLE_ARCH", &arch);
+    std::env::set_var("NAU_ARCH", &arch);
 
     let lock_path = Path::new(&lockfile_path);
     let mut lockfile = load_lockfile_or_default(lock_path)?;
 
     // Definition eval: snap outputs + global inputs, through the bounded
     // subprocess worker.
-    let eval = shuttle::lua::evaluate_file_with_inputs(&file)?;
+    let eval = nau::lua::evaluate_file_with_inputs(&file)?;
 
     materialize_eval_input_pins(&eval.global_inputs, &mut lockfile, lock_path, offline)?;
 
@@ -2914,7 +2911,7 @@ fn cmd_eval(
     // the worker output table with the snap outputs).
     let images = resolve_images(&file)?;
 
-    let mut manifest = shuttle::manifest::build_manifest(
+    let mut manifest = nau::manifest::build_manifest(
         &eval.outputs,
         &images,
         &eval.global_inputs,
@@ -2946,10 +2943,10 @@ fn materialize_eval_input_pins(
     }
     let mut pins_recorded = false;
     if !offline {
-        let n = shuttle::pkg_source::ensure_input_pins(global_inputs, lockfile)?;
+        let n = nau::pkg_source::ensure_input_pins(global_inputs, lockfile)?;
         pins_recorded |= n > 0;
     }
-    shuttle::pkg_source::init_global_inputs_with(global_inputs, &lockfile.inputs, offline)?;
+    nau::pkg_source::init_global_inputs_with(global_inputs, &lockfile.inputs, offline)?;
     if pins_recorded {
         lockfile.save(lock_path)?;
     }
@@ -2957,27 +2954,27 @@ fn materialize_eval_input_pins(
 }
 
 /// ADR-0011 step (d) + issue #56: opt-in manifest signing. A key at
-/// ~/.config/shuttle/secret-key attests the canonical bytes (signatures
+/// ~/.config/nau/secret-key attests the canonical bytes (signatures
 /// map excluded) and carries the SLSA-lite provenance under the
 /// signature — builder, invocation, materials, subject digest. An
 /// absent key keeps `signatures` {} with a note — eval never fails on
 /// signing and never generates keys (that is the image build's
 /// deliberate engagement; mandated signing is step (e)).
 fn sign_eval_manifest(
-    manifest: &mut shuttle::manifest::ImageManifest,
+    manifest: &mut nau::manifest::ImageManifest,
     arch: &str,
     channel: &str,
     offline: bool,
 ) {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-    match shuttle::sign::load_secret_key(&home) {
+    match nau::sign::load_secret_key(&home) {
         Ok(Some(kp)) => {
             let version = env!("CARGO_PKG_VERSION");
-            match shuttle::sign::attest_eval(manifest, &kp, version, arch, channel, offline) {
+            match nau::sign::attest_eval(manifest, &kp, version, arch, channel, offline) {
                 Ok(()) => eprintln!(
                     "  ✓ manifest signed with provenance (key id {}, builder {})",
                     kp.key_id(),
-                    shuttle::sign::builder_id(version)
+                    nau::sign::builder_id(version)
                 ),
                 Err(e) => eprintln!("  ⚠ signing skipped: {e:#}"),
             }
@@ -2986,7 +2983,7 @@ fn sign_eval_manifest(
             eprintln!(
                 "  ℹ no signing key at {} — signatures left empty (opt-in until \
                  ceremony)",
-                shuttle::sign::secret_key_path(&home).display()
+                nau::sign::secret_key_path(&home).display()
             );
         }
         Err(e) => eprintln!("  ⚠ signing skipped: {e:#}"),
@@ -2996,14 +2993,14 @@ fn sign_eval_manifest(
 /// Write the eval result: the manifest file plus a human confirmation
 /// line, or the JSON bytes on stdout when no `--output` was given.
 fn emit_eval_output(
-    manifest: &shuttle::manifest::ImageManifest,
+    manifest: &nau::manifest::ImageManifest,
     output: Option<&str>,
 ) -> miette::Result<()> {
     match output {
         Some(out_path) => {
             manifest.write_atomic(Path::new(out_path))?;
-            if !shuttle::output::is_json() {
-                shuttle::output::ok(format!(
+            if !nau::output::is_json() {
+                nau::output::ok(format!(
                     "manifest -> {out_path} ({} output(s), {} image(s))",
                     manifest.outputs.len(),
                     manifest.images.len()
@@ -3041,7 +3038,7 @@ fn cmd_cache(sub: CacheCommand) -> miette::Result<()> {
     }
 }
 
-/// `shuttle cache info`: print cache statistics.
+/// `nau cache info`: print cache statistics.
 fn cache_info(cache: PackageCache) -> miette::Result<()> {
     let info = cache.info()?;
     eprintln!("Cache directory: {}", info.root.display());
@@ -3060,7 +3057,7 @@ fn cache_info(cache: PackageCache) -> miette::Result<()> {
     Ok(())
 }
 
-/// `shuttle cache clear`: remove all cached packages, guarded by `--force`.
+/// `nau cache clear`: remove all cached packages, guarded by `--force`.
 fn cache_clear(cache: PackageCache, force: bool) -> miette::Result<()> {
     let info = cache.info()?;
     if info.entries == 0 {
@@ -3078,11 +3075,11 @@ fn cache_clear(cache: PackageCache, force: bool) -> miette::Result<()> {
         return Ok(());
     }
     cache.clear()?;
-    shuttle::output::ok("cache cleared");
+    nau::output::ok("cache cleared");
     Ok(())
 }
 
-/// `shuttle cache prune`: remove cache entries not accessed in `days`,
+/// `nau cache prune`: remove cache entries not accessed in `days`,
 /// guarded by `--force`.
 fn cache_prune(days: u64, cache: PackageCache, force: bool) -> miette::Result<()> {
     if !force {
@@ -3095,7 +3092,7 @@ fn cache_prune(days: u64, cache: PackageCache, force: bool) -> miette::Result<()
     }
     let removed = cache.prune(days)?;
     if removed > 0 {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "pruned {} cache entr{}",
             removed,
             if removed == 1 { "y" } else { "ies" }
@@ -3110,7 +3107,7 @@ fn cache_prune(days: u64, cache: PackageCache, force: bool) -> miette::Result<()
 
 /// Resolve the key-ceremony home: the `--home` override, else `$HOME`
 /// (the same default the build path uses). All ceremony state lives under
-/// `<home>/.config/shuttle/`.
+/// `<home>/.config/nau/`.
 fn key_home(home: Option<String>) -> PathBuf {
     home.map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())))
@@ -3119,7 +3116,7 @@ fn key_home(home: Option<String>) -> PathBuf {
 fn cmd_key(sub: KeyCommand) -> miette::Result<()> {
     match sub {
         KeyCommand::Keygen { home, json } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             key_keygen(key_home(home))
         }
         KeyCommand::Rotate {
@@ -3128,19 +3125,19 @@ fn cmd_key(sub: KeyCommand) -> miette::Result<()> {
             window_days,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             key_rotate(key_home(home), manifest, window_days)
         }
         KeyCommand::Promote { home, json } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             key_promote(key_home(home))
         }
         KeyCommand::Revoke { key_id, home, json } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             key_revoke(key_home(home), &key_id)
         }
         KeyCommand::List { home, json } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             key_list(key_home(home))
         }
         KeyCommand::Verify {
@@ -3148,58 +3145,58 @@ fn cmd_key(sub: KeyCommand) -> miette::Result<()> {
             home,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             key_verify(key_home(home), &manifest)
         }
     }
 }
 
-/// `shuttle key keygen`: mint the secret key and trust it immediately.
+/// `nau key keygen`: mint the secret key and trust it immediately.
 /// Never prints the seed. The creation date is recorded in the ceremony
 /// ledger (issue #51) — the audit trail starts here.
 fn key_keygen(home: PathBuf) -> miette::Result<()> {
-    let kp = shuttle::sign::create_secret_key(&home)?;
-    let anchor = shuttle::sign::install_public_key(&kp, &shuttle::sign::keys_dir(&home))?;
-    let mut ledger = shuttle::sign::CeremonyLedger::load(&shuttle::sign::keys_dir(&home))?;
-    ledger.record_created(&kp, &shuttle::sign::now_rfc3339());
-    ledger.save(&shuttle::sign::keys_dir(&home))?;
-    shuttle::output::ok(format!(
+    let kp = nau::sign::create_secret_key(&home)?;
+    let anchor = nau::sign::install_public_key(&kp, &nau::sign::keys_dir(&home))?;
+    let mut ledger = nau::sign::CeremonyLedger::load(&nau::sign::keys_dir(&home))?;
+    ledger.record_created(&kp, &nau::sign::now_rfc3339());
+    ledger.save(&nau::sign::keys_dir(&home))?;
+    nau::output::ok(format!(
         "signing key created: {} (key id {})",
-        shuttle::sign::secret_key_path(&home).display(),
+        nau::sign::secret_key_path(&home).display(),
         kp.key_id()
     ));
-    shuttle::output::info(format!("trust anchor installed: {}", anchor.display()));
+    nau::output::info(format!("trust anchor installed: {}", anchor.display()));
     print_report(&serde_json::json!({
         "key_id": kp.key_id(),
-        "secret_key": shuttle::sign::secret_key_path(&home).display().to_string(),
+        "secret_key": nau::sign::secret_key_path(&home).display().to_string(),
         "anchor": anchor.display().to_string(),
     }));
     Ok(())
 }
 
-/// `shuttle key rotate`: mint `secret-key.new`, record the generation
+/// `nau key rotate`: mint `secret-key.new`, record the generation
 /// chain in the ledger (old id → successor → date → overlap window), and
 /// dual-sign `--manifest` under the successor when given — the old
 /// signature entry is kept, and an attested entry's provenance is
 /// re-attached under the new signature (same claims, new key; issue #51).
 fn key_rotate(home: PathBuf, manifest: Option<String>, window_days: u32) -> miette::Result<()> {
-    let successor = shuttle::sign::mint_rotation_key(&home)?;
-    let old = shuttle::sign::load_secret_key(&home)?.expect("rotation key requires an active key");
-    let keys_dir = shuttle::sign::keys_dir(&home);
-    let mut ledger = shuttle::sign::CeremonyLedger::load(&keys_dir)?;
-    ledger.record_rotation(&old, &successor, &shuttle::sign::now_rfc3339(), window_days);
+    let successor = nau::sign::mint_rotation_key(&home)?;
+    let old = nau::sign::load_secret_key(&home)?.expect("rotation key requires an active key");
+    let keys_dir = nau::sign::keys_dir(&home);
+    let mut ledger = nau::sign::CeremonyLedger::load(&keys_dir)?;
+    ledger.record_rotation(&old, &successor, &nau::sign::now_rfc3339(), window_days);
     ledger.save(&keys_dir)?;
 
     if let Some(path) = &manifest {
         rotate_dual_sign_manifest(path, &successor)?;
     }
 
-    shuttle::output::ok(format!(
+    nau::output::ok(format!(
         "rotation key minted: {} (key id {}) — not trusted until promoted",
-        shuttle::sign::rotation_key_path(&home).display(),
+        nau::sign::rotation_key_path(&home).display(),
         successor.key_id()
     ));
-    shuttle::output::info(format!(
+    nau::output::info(format!(
         "generation chain recorded: {} replaced by {} (window {} days)",
         old.key_id(),
         successor.key_id(),
@@ -3209,14 +3206,14 @@ fn key_rotate(home: PathBuf, manifest: Option<String>, window_days: u32) -> miet
     Ok(())
 }
 
-/// The `--manifest` half of `shuttle key rotate`: dual-sign the manifest
+/// The `--manifest` half of `nau key rotate`: dual-sign the manifest
 /// file under the successor (old entries kept, provenance re-attached)
 /// and write it back atomically.
-fn rotate_dual_sign_manifest(path: &str, successor: &shuttle::sign::KeyPair) -> miette::Result<()> {
+fn rotate_dual_sign_manifest(path: &str, successor: &nau::sign::KeyPair) -> miette::Result<()> {
     let mut parsed = read_manifest(path)?;
-    shuttle::sign::cosign_reattaching_provenance(&mut parsed, successor)?;
+    nau::sign::cosign_reattaching_provenance(&mut parsed, successor)?;
     parsed.write_atomic(std::path::Path::new(path))?;
-    shuttle::output::ok(format!(
+    nau::output::ok(format!(
         "manifest dual-signed: {path} (key id {} beside the existing entries)",
         successor.key_id()
     ));
@@ -3227,14 +3224,14 @@ fn rotate_dual_sign_manifest(path: &str, successor: &shuttle::sign::KeyPair) -> 
 /// dual-signed.
 fn print_rotate_report(
     home: &Path,
-    old: &shuttle::sign::KeyPair,
-    successor: &shuttle::sign::KeyPair,
+    old: &nau::sign::KeyPair,
+    successor: &nau::sign::KeyPair,
     window_days: u32,
     manifest: Option<&str>,
 ) {
     let mut report = serde_json::json!({
         "key_id": successor.key_id(),
-        "rotation_key": shuttle::sign::rotation_key_path(home).display().to_string(),
+        "rotation_key": nau::sign::rotation_key_path(home).display().to_string(),
         "trusted": false,
         "replaces": old.key_id(),
         "window_days": window_days,
@@ -3245,31 +3242,31 @@ fn print_rotate_report(
     print_report(&report);
 }
 
-/// `shuttle key promote`: move the successor into place and trust it.
+/// `nau key promote`: move the successor into place and trust it.
 fn key_promote(home: PathBuf) -> miette::Result<()> {
-    let kp = shuttle::sign::promote_rotation_key(&home, &shuttle::sign::keys_dir(&home))?;
-    shuttle::output::ok(format!(
+    let kp = nau::sign::promote_rotation_key(&home, &nau::sign::keys_dir(&home))?;
+    nau::output::ok(format!(
         "rotation promoted: key id {} is now the signing key",
         kp.key_id()
     ));
     print_report(&serde_json::json!({
         "key_id": kp.key_id(),
-        "secret_key": shuttle::sign::secret_key_path(&home).display().to_string(),
+        "secret_key": nau::sign::secret_key_path(&home).display().to_string(),
         "trusted": true,
     }));
     Ok(())
 }
 
-/// `shuttle key revoke`: drop the local anchor, record the revocation in
+/// `nau key revoke`: drop the local anchor, record the revocation in
 /// `keys/revoked-keys`, and date it in the ceremony ledger.
 fn key_revoke(home: PathBuf, key_id: &str) -> miette::Result<()> {
-    shuttle::sign::revoke_local(&shuttle::sign::keys_dir(&home), key_id)?;
-    let keys_dir = shuttle::sign::keys_dir(&home);
-    let mut ledger = shuttle::sign::CeremonyLedger::load(&keys_dir)?;
-    let revoked_at = shuttle::sign::now_rfc3339();
+    nau::sign::revoke_local(&nau::sign::keys_dir(&home), key_id)?;
+    let keys_dir = nau::sign::keys_dir(&home);
+    let mut ledger = nau::sign::CeremonyLedger::load(&keys_dir)?;
+    let revoked_at = nau::sign::now_rfc3339();
     ledger.record_revocation(key_id, &revoked_at);
     ledger.save(&keys_dir)?;
-    shuttle::output::ok(format!("key {key_id} revoked (recorded {revoked_at})"));
+    nau::output::ok(format!("key {key_id} revoked (recorded {revoked_at})"));
     print_report(&serde_json::json!({
         "key_id": key_id,
         "revoked": true,
@@ -3278,14 +3275,14 @@ fn key_revoke(home: PathBuf, key_id: &str) -> miette::Result<()> {
     Ok(())
 }
 
-/// `shuttle key list`: print the ceremony ledger — the auditable trail of
+/// `nau key list`: print the ceremony ledger — the auditable trail of
 /// every key the ceremony touched (issue #51).
 fn key_list(home: PathBuf) -> miette::Result<()> {
-    let ledger = shuttle::sign::CeremonyLedger::load(&shuttle::sign::keys_dir(&home))?;
+    let ledger = nau::sign::CeremonyLedger::load(&nau::sign::keys_dir(&home))?;
     if ledger.keys.is_empty() {
-        shuttle::output::info(format!(
-            "no ceremony ledger yet at {} (run `shuttle key keygen`)",
-            shuttle::sign::ceremony_ledger_path(&shuttle::sign::keys_dir(&home)).display()
+        nau::output::info(format!(
+            "no ceremony ledger yet at {} (run `nau key keygen`)",
+            nau::sign::ceremony_ledger_path(&nau::sign::keys_dir(&home)).display()
         ));
         return Ok(());
     }
@@ -3295,15 +3292,13 @@ fn key_list(home: PathBuf) -> miette::Result<()> {
         if let (Some(succ), Some(at)) = (&entry.replaced_by, &entry.rotated_at) {
             line.push_str(&format!(
                 "  rotated→{succ} {at} (window {}d)",
-                entry
-                    .window_days
-                    .unwrap_or(shuttle::sign::DEFAULT_WINDOW_DAYS)
+                entry.window_days.unwrap_or(nau::sign::DEFAULT_WINDOW_DAYS)
             ));
         }
         if let Some(at) = &entry.revoked_at {
             line.push_str(&format!("  REVOKED {at}"));
         }
-        if !shuttle::output::is_json() {
+        if !nau::output::is_json() {
             println!("{line}");
         }
     }
@@ -3311,7 +3306,7 @@ fn key_list(home: PathBuf) -> miette::Result<()> {
     Ok(())
 }
 
-/// `shuttle key verify`: verify a manifest JSON under the ceremony policy
+/// `nau key verify`: verify a manifest JSON under the ceremony policy
 /// (issue #51) — either key during a rotation window, a warning once an
 /// expired window's key is the only signer, a named error for
 /// revoked-only signatures. Provenance binding (issue #56) is enforced
@@ -3320,9 +3315,9 @@ fn key_verify(home: PathBuf, manifest: &str) -> miette::Result<()> {
     let parsed = read_manifest(manifest)?;
     let outcome = verify_manifest_with_ceremony(&home, &parsed)?;
     for warning in &outcome.warnings {
-        shuttle::output::warn(warning);
+        nau::output::warn(warning);
     }
-    shuttle::output::ok(format!("manifest verified under key id {}", outcome.key_id));
+    nau::output::ok(format!("manifest verified under key id {}", outcome.key_id));
     print_report(&serde_json::json!({
         "manifest": manifest,
         "key_id": outcome.key_id,
@@ -3334,95 +3329,90 @@ fn key_verify(home: PathBuf, manifest: &str) -> miette::Result<()> {
 
 /// Read and parse a manifest JSON file (shared by `key rotate --manifest`
 /// and `key verify`).
-fn read_manifest(path: &str) -> miette::Result<shuttle::manifest::ImageManifest> {
+fn read_manifest(path: &str) -> miette::Result<nau::manifest::ImageManifest> {
     let text = std::fs::read_to_string(path).map_err(|e| miette::miette!("reading {path}: {e}"))?;
     serde_json::from_str(&text).map_err(|e| miette::miette!("parsing manifest {path}: {e}"))
 }
 
-/// The ceremony-policy verify half of `shuttle key verify`: canonical
+/// The ceremony-policy verify half of `nau key verify`: canonical
 /// bytes, operator keychain + ledger + `revoked-keys`, then the ledger
 /// verify with provenance binding enforced on the winning entry.
 fn verify_manifest_with_ceremony(
     home: &Path,
-    parsed: &shuttle::manifest::ImageManifest,
-) -> miette::Result<shuttle::sign::LedgerVerification> {
-    let keys_dir = shuttle::sign::keys_dir(home);
-    let body = shuttle::sign::eval_manifest_canonical_bytes(parsed)?;
-    let chain = shuttle::sign::Keychain::load_dir(&keys_dir)?;
-    let ledger = shuttle::sign::CeremonyLedger::load(&keys_dir)?;
-    let revoked = shuttle::sign::read_revoked_keys(&keys_dir)?;
-    let outcome = shuttle::sign::verify_with_ledger_now(
-        &body,
-        &parsed.signatures,
-        &chain,
-        &ledger,
-        &revoked,
-    )?;
+    parsed: &nau::manifest::ImageManifest,
+) -> miette::Result<nau::sign::LedgerVerification> {
+    let keys_dir = nau::sign::keys_dir(home);
+    let body = nau::sign::eval_manifest_canonical_bytes(parsed)?;
+    let chain = nau::sign::Keychain::load_dir(&keys_dir)?;
+    let ledger = nau::sign::CeremonyLedger::load(&keys_dir)?;
+    let revoked = nau::sign::read_revoked_keys(&keys_dir)?;
+    let outcome =
+        nau::sign::verify_with_ledger_now(&body, &parsed.signatures, &chain, &ledger, &revoked)?;
     if let Some(entry) = parsed.signatures.get(&outcome.key_id) {
-        shuttle::sign::check_provenance(entry, &parsed.inputs)?;
+        nau::sign::check_provenance(entry, &parsed.inputs)?;
     }
     Ok(outcome)
 }
 
 // ── CA command (ADR-0045 amendment, #283 — the host CA ceremony) ──
 
-/// `shuttle ca` dispatch: keygen mints the host CA, list introspects it.
+/// `nau ca` dispatch: keygen mints the host CA, list introspects it.
 fn cmd_ca(sub: CaCommand) -> miette::Result<()> {
     match sub {
         CaCommand::Keygen { home, force, json } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             ca_keygen(key_home(home), force)
         }
         CaCommand::List { home, json } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             ca_list(key_home(home))
         }
     }
 }
 
-/// `shuttle ca keygen`: mint the host CA keypair under the ceremony home
+/// `nau ca keygen`: mint the host CA keypair under the ceremony home
 /// and print its public line + ssh-keygen SHA256 fingerprint — the two
 /// values every downstream consumer (the `@cert-authority` pin, the
 /// workers-entry fingerprint) derives from.
 fn ca_keygen(home: PathBuf, force: bool) -> miette::Result<()> {
-    let runner = shuttle::command::RealRunner;
-    let info = shuttle::ca::create_ca_keypair(&runner, &home, force)?;
-    shuttle::output::ok(format!(
+    let runner = nau::command::RealRunner;
+    let info = nau::ca::create_ca_keypair(&runner, &home, force)?;
+    nau::output::ok(format!(
         "host CA created: {} (fingerprint {})",
-        shuttle::ca::ca_secret_path(&home).display(),
+        nau::ca::ca_secret_path(&home).display(),
         info.fingerprint
     ));
-    shuttle::output::info(format!(
+    nau::output::info(format!(
         "public half: {} — one @cert-authority line per operator (ADR-0045)",
-        shuttle::ca::ca_public_path(&home).display()
+        nau::ca::ca_public_path(&home).display()
     ));
     print_report(&serde_json::json!({
         "public_line": info.public_line,
         "fingerprint": info.fingerprint,
-        "secret": shuttle::ca::ca_secret_path(&home).display().to_string(),
-        "public": shuttle::ca::ca_public_path(&home).display().to_string(),
+        "secret": nau::ca::ca_secret_path(&home).display().to_string(),
+        "public": nau::ca::ca_public_path(&home).display().to_string(),
     }));
     Ok(())
 }
 
-/// `shuttle ca list`: introspect the host CA. Absent is an informational
+/// `nau ca list`: introspect the host CA. Absent is an informational
 /// hint (exit 0 — the ceremony has simply not run); a secret without its
-/// public half is a named refusal from [`shuttle::ca::inspect`].
+/// public half is a named refusal from [`nau::ca::inspect`].
 fn ca_list(home: PathBuf) -> miette::Result<()> {
-    let runner = shuttle::command::RealRunner;
-    match shuttle::ca::inspect(&runner, &home)? {
+    let runner = nau::command::RealRunner;
+    match nau::ca::inspect(&runner, &home)? {
         None => {
-            shuttle::output::info(format!(
-                "no host CA at {} (run `shuttle ca keygen`)",
-                shuttle::ca::ca_dir(&home).display()
+            nau::output::info(format!(
+                "no host CA at {} (run `nau ca keygen`)",
+                nau::ca::ca_dir(&home).display()
             ));
             print_report(&serde_json::json!({ "present": false }));
         }
         Some(info) => {
-            shuttle::output::ok(format!("host CA: {}", info.fingerprint));
-            shuttle::output::info(format!("public line: {}", info.public_line));
+            nau::output::ok(format!("host CA: {}", info.fingerprint));
+            nau::output::info(format!("public line: {}", info.public_line));
             if !info.secret_present {
-                shuttle::output::warn(
+                nau::output::warn(
                     "private half missing — introspection works, certificate issuance will not",
                 );
             }
@@ -3447,7 +3437,7 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
             state_dir,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             runtime_install(&name, &channel, state_dir)
         }
         RuntimeCommand::Remove {
@@ -3455,7 +3445,7 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
             state_dir,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             runtime_remove(&name, state_dir)
         }
         RuntimeCommand::Upgrade {
@@ -3465,7 +3455,7 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
             state_dir,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             runtime_upgrade(name, all, &channel, state_dir)
         }
         RuntimeCommand::Rollback {
@@ -3473,7 +3463,7 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
             state_dir,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             runtime_rollback(generation, state_dir)
         }
         RuntimeCommand::Gc {
@@ -3481,11 +3471,11 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
             state_dir,
             json,
         } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             runtime_gc(prune, state_dir)
         }
         RuntimeCommand::Activate { state_dir, json } => {
-            shuttle::output::set_mode(json);
+            nau::output::set_mode(json);
             runtime_activate(state_dir)
         }
         RuntimeCommand::RecoverSlots { esp_mount } => runtime_recover_slots(&esp_mount),
@@ -3494,65 +3484,65 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
 
 // ── Pods (issues #2 + #4) ──
 
-/// `shuttle pod shellenv` (issue #47): print the selected pod's
+/// `nau pod shellenv` (issue #47): print the selected pod's
 /// environment as shell statements — `export PATH="<farm>:$PATH"`, plus
 /// the #89 loader-lib `LD_LIBRARY_PATH` prepend when the generation
 /// ships payload libs — or as structured JSON with `--json`. The caller
 /// `eval`s the output; this process only prints, never touching an RC
 /// file.
 fn cmd_pod_shellenv(pod_name: &str, json: bool, root: Option<String>) -> miette::Result<()> {
-    shuttle::output::set_mode(json);
-    let root = shuttle::pod::pod_root(root.as_deref());
-    let env = shuttle::pod::shellenv(&root, pod_name)?;
+    nau::output::set_mode(json);
+    let root = nau::pod::pod_root(root.as_deref());
+    let env = nau::pod::shellenv(&root, pod_name)?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&env).unwrap_or_else(|_| "{}".to_string())
         );
     } else {
-        print!("{}", shuttle::pod::render_shellenv(&env));
+        print!("{}", nau::pod::render_shellenv(&env));
     }
     Ok(())
 }
 
-/// `shuttle pod secrets` (ADR-0042, issue #183): references, health,
+/// `nau pod secrets` (ADR-0042, issue #183): references, health,
 /// and the session-cache lifecycle. Values never reach any output here
 /// (D8) — the reference table, the health report, and refresh counts
 /// are the entire surface.
 fn cmd_pod_secrets(
     pod_name: &str,
-    command: shuttle::cli::PodSecretsCommand,
+    command: nau::cli::PodSecretsCommand,
     root: Option<String>,
 ) -> miette::Result<()> {
-    let root = shuttle::pod::pod_root(root.as_deref());
+    let root = nau::pod::pod_root(root.as_deref());
     match command {
-        shuttle::cli::PodSecretsCommand::List => {
-            let rows = shuttle::secrets::list_pod(&root, pod_name, None)?;
+        nau::cli::PodSecretsCommand::List => {
+            let rows = nau::secrets::list_pod(&root, pod_name, None)?;
             if rows.is_empty() {
-                shuttle::output::info(format!("pod '{pod_name}' has no secret references"));
+                nau::output::info(format!("pod '{pod_name}' has no secret references"));
             } else {
-                print!("{}", shuttle::secrets::render_list_rows(pod_name, &rows));
+                print!("{}", nau::secrets::render_list_rows(pod_name, &rows));
             }
             Ok(())
         }
-        shuttle::cli::PodSecretsCommand::Check => {
-            let rows = shuttle::secrets::check_pod(&root, pod_name)?;
-            print!("{}", shuttle::secrets::render_check_rows(pod_name, &rows));
-            if !shuttle::secrets::check_healthy(&rows) {
+        nau::cli::PodSecretsCommand::Check => {
+            let rows = nau::secrets::check_pod(&root, pod_name)?;
+            print!("{}", nau::secrets::render_check_rows(pod_name, &rows));
+            if !nau::secrets::check_healthy(&rows) {
                 let bad = rows.iter().filter(|r| r.status != "ok").count();
                 miette::bail!("{bad} secret reference(s) unhealthy for pod '{pod_name}'");
             }
             Ok(())
         }
-        shuttle::cli::PodSecretsCommand::Refresh => {
-            let tools = shuttle::runtime::RuntimeTools::for_pod_runtime();
-            let report = shuttle::secrets::refresh_pod(&root, pod_name, None, &tools)?;
+        nau::cli::PodSecretsCommand::Refresh => {
+            let tools = nau::runtime::RuntimeTools::for_pod_runtime();
+            let report = nau::secrets::refresh_pod(&root, pod_name, None, &tools)?;
             if report.resolved == 0 {
-                shuttle::output::info(format!("pod '{pod_name}' has no secret references"));
+                nau::output::info(format!("pod '{pod_name}' has no secret references"));
                 return Ok(());
             }
             print_refresh_counts(&report);
-            shuttle::output::ok(format!(
+            nau::output::ok(format!(
                 "resolved {} secret(s) from [{}] — values cached for this session",
                 report.resolved,
                 report
@@ -3570,7 +3560,7 @@ fn cmd_pod_secrets(
 
 /// The refresh report's cache counts: the dropped-entry line, only
 /// when something was actually dropped (a quiet no-op stays quiet).
-fn print_refresh_counts(report: &shuttle::secrets::SecretsRefreshReport) {
+fn print_refresh_counts(report: &nau::secrets::SecretsRefreshReport) {
     if report.purged == 0 {
         return;
     }
@@ -3579,28 +3569,28 @@ fn print_refresh_counts(report: &shuttle::secrets::SecretsRefreshReport) {
     } else {
         "entries"
     };
-    shuttle::output::info(format!("dropped {} cached {noun}", report.purged));
+    nau::output::info(format!("dropped {} cached {noun}", report.purged));
 }
 
 /// The refresh report's rotate-restart half (ADR-0042 D3, issue #224):
 /// name every unit that moved and every named skip.
-fn print_refresh_restarts(report: &shuttle::secrets::SecretsRefreshReport) {
+fn print_refresh_restarts(report: &nau::secrets::SecretsRefreshReport) {
     if !report.restarted.is_empty() {
-        shuttle::output::ok(format!("restarted {}", report.restarted.join(", ")));
+        nau::output::ok(format!("restarted {}", report.restarted.join(", ")));
     }
     if !report.skipped.is_empty() {
-        shuttle::output::info(format!(
+        nau::output::info(format!(
             "restart skipped for {} — systemctl unavailable",
             report.skipped.join(", ")
         ));
     }
 }
 
-/// Render `shuttle pod list` output: one spec + resolved version per
+/// Render `nau pod list` output: one spec + resolved version per
 /// line (float-marked per ADR-0017), or an empty-pod notice.
-fn print_pod_packages(pod_name: &str, entries: &[shuttle::pod::PodListEntry]) {
+fn print_pod_packages(pod_name: &str, entries: &[nau::pod::PodListEntry]) {
     if entries.is_empty() {
-        shuttle::output::info(format!("pod '{pod_name}' has no packages"));
+        nau::output::info(format!("pod '{pod_name}' has no packages"));
         return;
     }
     let width = entries.iter().map(|e| e.spec.len()).max().unwrap_or(0);
@@ -3608,7 +3598,7 @@ fn print_pod_packages(pod_name: &str, entries: &[shuttle::pod::PodListEntry]) {
         let version = entry.version.as_deref().unwrap_or("(unresolved)");
         // Float marking (ADR-0017): floating packages say so.
         let tag = if entry.floating { " (float)" } else { "" };
-        shuttle::output::status(format!(
+        nau::output::status(format!(
             "{:<width$}  {}{}",
             entry.spec,
             version,
@@ -3619,8 +3609,8 @@ fn print_pod_packages(pod_name: &str, entries: &[shuttle::pod::PodListEntry]) {
 }
 
 /// Resolve the effective pod name from the two `--name` positions
-/// (issue #4): before-verb (`shuttle pod --name X <verb>`) and
-/// after-verb (`shuttle pod <verb> --name X`). Both given and equal →
+/// (issue #4): before-verb (`nau pod --name X <verb>`) and
+/// after-verb (`nau pod <verb> --name X`). Both given and equal →
 /// fine; both given and different → hard error naming both values; one
 /// given → it wins. No silent precedence.
 fn merge_pod_name<'a>(parent: Option<&'a str>, verb: Option<&'a str>) -> miette::Result<&'a str> {
@@ -3631,11 +3621,11 @@ fn merge_pod_name<'a>(parent: Option<&'a str>, verb: Option<&'a str>) -> miette:
         )),
         (Some(parent), _) => Ok(parent),
         (None, Some(verb)) => Ok(verb),
-        (None, None) => Ok(shuttle::pod::DEFAULT_POD),
+        (None, None) => Ok(nau::pod::DEFAULT_POD),
     }
 }
 
-/// `shuttle pod add`: a collection package by name, or — with `--snap`
+/// `nau pod add`: a collection package by name, or — with `--snap`
 /// — a sideloaded `.snap` payload (issue #116).
 fn cmd_pod_add(
     pod_name: &str,
@@ -3644,11 +3634,11 @@ fn cmd_pod_add(
     ack_unsigned: bool,
     root: Option<String>,
 ) -> miette::Result<()> {
-    let root = shuttle::pod::pod_root(root.as_deref());
+    let root = nau::pod::pod_root(root.as_deref());
     if let Some(snap) = snap {
-        let report = shuttle::pod::add_snap_pod(&root, pod_name, Path::new(&snap), ack_unsigned)?;
+        let report = nau::pod::add_snap_pod(&root, pod_name, Path::new(&snap), ack_unsigned)?;
         if report.noop {
-            shuttle::output::ok(format!(
+            nau::output::ok(format!(
                 "'{}' is already sideloaded into pod '{pod_name}' at this content \
                  ({:.12}…) — nothing to do",
                 report.name, report.sha3_384
@@ -3664,7 +3654,7 @@ fn cmd_pod_add(
             if let Some(n) = report.generation {
                 line.push_str(&format!(", generation {n}"));
             }
-            shuttle::output::ok(line);
+            nau::output::ok(line);
         } else {
             let mut line = format!(
                 "sideloaded '{}' ({}) into pod '{pod_name}'",
@@ -3673,27 +3663,27 @@ fn cmd_pod_add(
             if let Some(n) = report.generation {
                 line.push_str(&format!(" (generation {n})"));
             }
-            shuttle::output::ok(line);
+            nau::output::ok(line);
         }
         return Ok(());
     }
     // clap enforces: required unless --snap.
     let package = package.expect("clap: package required unless --snap");
-    let report = shuttle::pod::add_package(&root, pod_name, &package)?;
-    shuttle::output::ok(format!(
+    let report = nau::pod::add_package(&root, pod_name, &package)?;
+    nau::output::ok(format!(
         "added '{}' ({}) to pod '{}'",
         report.name, report.version, report.pod
     ));
     Ok(())
 }
 
-/// `shuttle pod declare --file <pod.lua>` (gate-pod gap 5): make a
+/// `nau pod declare --file <pod.lua>` (gate-pod gap 5): make a
 /// checked-in file the pod's declaration and reconcile. The summary is
 /// the declaration delta vs the previous state — one line, not a
 /// report.
 fn cmd_pod_declare(pod_name: &str, file: &str, root: Option<String>) -> miette::Result<()> {
-    let root = shuttle::pod::pod_root(root.as_deref());
-    let report = shuttle::pod::declare_pod(&root, pod_name, Path::new(file))?;
+    let root = nau::pod::pod_root(root.as_deref());
+    let report = nau::pod::declare_pod(&root, pod_name, Path::new(file))?;
     let mut line = format!("declared pod '{}' from {file}", report.pod);
     let mut changes = Vec::new();
     if !report.added.is_empty() {
@@ -3707,23 +3697,23 @@ fn cmd_pod_declare(pod_name: &str, file: &str, root: Option<String>) -> miette::
     } else {
         line.push_str(&format!(" ({})", changes.join("; ")));
     }
-    shuttle::output::ok(line);
+    nau::output::ok(line);
     for name in &report.sync.held {
-        shuttle::output::warn(format!("held '{name}' at its pin"));
+        nau::output::warn(format!("held '{name}' at its pin"));
     }
     if let Some(n) = report.sync.generation {
-        shuttle::output::info(format!("generation {n} current"));
+        nau::output::info(format!("generation {n} current"));
     }
     Ok(())
 }
 
-/// `shuttle pod refresh <member…>` (issue #142): rebuild the named
+/// `nau pod refresh <member…>` (issue #142): rebuild the named
 /// members from their current recipes and report per-member outcomes —
 /// installed (generation named) or byte-identical (store content kept).
 /// Unrelated drifted members are baselined, not rebuilt, and the
 /// summary names them.
 fn cmd_pod_refresh(root: &Path, pod_name: &str, members: &[String]) -> miette::Result<()> {
-    let report = shuttle::pod::refresh_pod(root, pod_name, members)?;
+    let report = nau::pod::refresh_pod(root, pod_name, members)?;
     for member in &report.members {
         if member.installed {
             let generation = report
@@ -3731,26 +3721,26 @@ fn cmd_pod_refresh(root: &Path, pod_name: &str, members: &[String]) -> miette::R
                 .generation
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "unknown".into());
-            shuttle::output::ok(format!(
+            nau::output::ok(format!(
                 "refreshed '{}' ({}) — installed on generation {generation}",
                 member.name, member.version
             ));
         } else {
-            shuttle::output::ok(format!(
+            nau::output::ok(format!(
                 "refreshed '{}' ({}) — rebuild byte-identical, store content kept",
                 member.name, member.version
             ));
         }
     }
     for name in &report.sync.baselined {
-        shuttle::output::warn(format!(
+        nau::output::warn(format!(
             "baselined '{name}' — drift pre-dating this refresh: recipe hash \
-             recorded, installed content kept (`shuttle pod refresh {name}` \
+             recorded, installed content kept (`nau pod refresh {name}` \
              rebuilds it)"
         ));
     }
     if let Some(n) = report.sync.generation {
-        shuttle::output::info(format!("generation {n} current"));
+        nau::output::info(format!("generation {n} current"));
     }
     Ok(())
 }
@@ -3769,9 +3759,9 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
         } => cmd_pod_add(pod_name, package, snap, ack_unsigned, root),
         PodCommand::Declare { file, root, .. } => cmd_pod_declare(pod_name, &file, root),
         PodCommand::Remove { package, root, .. } => {
-            let root = shuttle::pod::pod_root(root.as_deref());
-            let report = shuttle::pod::remove_package(&root, pod_name, &package)?;
-            shuttle::output::ok(format!(
+            let root = nau::pod::pod_root(root.as_deref());
+            let report = nau::pod::remove_package(&root, pod_name, &package)?;
+            nau::output::ok(format!(
                 "removed '{}' from pod '{}'",
                 report.name, report.pod
             ));
@@ -3782,25 +3772,25 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
             root,
             ..
         } => {
-            let root = shuttle::pod::pod_root(root.as_deref());
-            let report = shuttle::pod::sync_pod_with(&root, pod_name, rebuild_unstamped)?;
+            let root = nau::pod::pod_root(root.as_deref());
+            let report = nau::pod::sync_pod_with(&root, pod_name, rebuild_unstamped)?;
             print_pod_sync_report(&report);
             Ok(())
         }
         PodCommand::Refresh { members, root, .. } => {
-            let root = shuttle::pod::pod_root(root.as_deref());
+            let root = nau::pod::pod_root(root.as_deref());
             cmd_pod_refresh(&root, pod_name, &members)
         }
         PodCommand::List { root, .. } => {
-            let root = shuttle::pod::pod_root(root.as_deref());
-            let entries = shuttle::pod::list_packages(&root, pod_name)?;
+            let root = nau::pod::pod_root(root.as_deref());
+            let entries = nau::pod::list_packages(&root, pod_name)?;
             print_pod_packages(pod_name, &entries);
             Ok(())
         }
         PodCommand::Shellenv { json, root, .. } => cmd_pod_shellenv(pod_name, json, root),
         PodCommand::Update { packages, root, .. } => {
-            let root = shuttle::pod::pod_root(root.as_deref());
-            let report = shuttle::pod::update_pod(&root, pod_name, &packages)?;
+            let root = nau::pod::pod_root(root.as_deref());
+            let report = nau::pod::update_pod(&root, pod_name, &packages)?;
             print_pod_update_report(&report);
             Ok(())
         }
@@ -3818,7 +3808,7 @@ fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
     }
 }
 
-/// `shuttle pod rebuild <pkg>` (issue #15): rebuild one declared
+/// `nau pod rebuild <pkg>` (issue #15): rebuild one declared
 /// package at its pins, reusing the cached dependency closure (or
 /// deliberately moving it with `--latest`).
 fn cmd_pod_rebuild(
@@ -3827,15 +3817,15 @@ fn cmd_pod_rebuild(
     latest: bool,
     root: Option<String>,
 ) -> miette::Result<()> {
-    let root = shuttle::pod::pod_root(root.as_deref());
-    let report = shuttle::pod::rebuild_package(&root, pod_name, package, latest)?;
+    let root = nau::pod::pod_root(root.as_deref());
+    let report = nau::pod::rebuild_package(&root, pod_name, package, latest)?;
     if report.held {
         // A blob-pinned (sideloaded) package cannot rebuild — the
         // payload is its content. Report the hold the way sync does,
         // never as "rebuilt" (issue #116).
-        shuttle::output::warn(format!("held '{}' at its pin", report.name));
+        nau::output::warn(format!("held '{}' at its pin", report.name));
         if let Some(n) = report.generation {
-            shuttle::output::info(format!("generation {n} current"));
+            nau::output::info(format!("generation {n} current"));
         }
     } else {
         let mut line = format!(
@@ -3845,13 +3835,13 @@ fn cmd_pod_rebuild(
         if let Some(n) = report.generation {
             line.push_str(&format!(" (generation {n})"));
         }
-        shuttle::output::ok(line);
+        nau::output::ok(line);
     }
     print_report(&report);
     Ok(())
 }
 
-/// `shuttle run`: run a declared confined app from a pod (ADR-0016,
+/// `nau run`: run a declared confined app from a pod (ADR-0016,
 /// ticket #11) or, with `--`, an arbitrary command with the pod's env
 /// overlaid (issue #102). For a declared app this resolves the pod's
 /// active generation to find the package providing `app`, reads its
@@ -3867,35 +3857,35 @@ fn cmd_run(
 ) -> miette::Result<()> {
     let Some(app) = app else {
         return Err(miette::miette!(
-            "shuttle run: nothing to run — name a declared app \
-             (`shuttle run <app>`) or a command (`shuttle run -- <cmd...>`)"
+            "nau run: nothing to run — name a declared app \
+             (`nau run <app>`) or a command (`nau run -- <cmd...>`)"
         ));
     };
-    let pod_name = pod.unwrap_or(shuttle::pod::DEFAULT_POD);
-    shuttle::pod::validate_pod_name(pod_name).map_err(|e| miette::miette!("shuttle run: {e}"))?;
-    let root = shuttle::pod::pod_root(root);
-    let dir = shuttle::pod::pod_dir(&root, pod_name);
+    let pod_name = pod.unwrap_or(nau::pod::DEFAULT_POD);
+    nau::pod::validate_pod_name(pod_name).map_err(|e| miette::miette!("nau run: {e}"))?;
+    let root = nau::pod::pod_root(root);
+    let dir = nau::pod::pod_dir(&root, pod_name);
     // Confinement is a runtime concern: the pod must have been reconciled
     // (a pod with no store/generation fails with a clear error).
     if !dir.join("generations").is_dir() {
         return Err(miette::miette!(
-            "pod '{pod_name}' has not been reconciled yet — run `shuttle pod --name {pod_name} \
-             sync` (or `add`) before `shuttle run`"
+            "pod '{pod_name}' has not been reconciled yet — run `nau pod --name {pod_name} \
+             sync` (or `add`) before `nau run`"
         ));
     }
-    shuttle::confine::run(&dir, pod_name, app, app_args)
+    nau::confine::run(&dir, pod_name, app, app_args)
 }
 
 // ── Test command (QEMU boot-and-assert, issue #50) ──
 
 /// The resolved host environment for a boot test — everything
-/// [`shuttle::boot_test::BootTest`] needs that is not a flag. Kept separate
+/// [`nau::boot_test::BootTest`] needs that is not a flag. Kept separate
 /// from the run so the scratch firmware dir lives across the QEMU call.
 struct TestHost {
     qemu: PathBuf,
     timeout_bin: PathBuf,
     kvm_available: bool,
-    firmware: shuttle::boot_test::Firmware,
+    firmware: nau::boot_test::Firmware,
     _scratch: tempfile::TempDir,
 }
 
@@ -3905,12 +3895,12 @@ struct TestHost {
 fn validate_sequence_args(
     runs: u32,
     expect_counter_seq: Option<&str>,
-) -> miette::Result<Vec<shuttle::boot_test::ExpectedCounters>> {
+) -> miette::Result<Vec<nau::boot_test::ExpectedCounters>> {
     if runs == 0 {
         return Err(miette::miette!("--runs must be at least 1"));
     }
     let expect_counters = match expect_counter_seq {
-        Some(spec) => shuttle::boot_test::parse_expect_counters(spec)?,
+        Some(spec) => nau::boot_test::parse_expect_counters(spec)?,
         None => Vec::new(),
     };
     if !expect_counters.is_empty() && runs == 1 {
@@ -3921,18 +3911,18 @@ fn validate_sequence_args(
     Ok(expect_counters)
 }
 
-/// `shuttle test`: boot a built image in QEMU and assert it reached
+/// `nau test`: boot a built image in QEMU and assert it reached
 /// userspace. The host-side wrapper around
-/// [`shuttle::boot_test::run_sequence`] — it resolves the
+/// [`nau::boot_test::run_sequence`] — it resolves the
 /// QEMU/firmware/timeout environment, runs the boot(s) through the real
-/// [`RealRunner`][shuttle::command::RealRunner], prints each verdict, and
+/// [`RealRunner`][nau::command::RealRunner], prints each verdict, and
 /// exits non-zero when any boot or sequence assertion fails (so this can gate
 /// CI and, later, #63's revert test).
 #[allow(clippy::too_many_arguments)]
 fn cmd_test(
     image: String,
     timeout: u64,
-    accel: shuttle::boot_test::Accel,
+    accel: nau::boot_test::Accel,
     log: Option<String>,
     require: Vec<String>,
     firmware_dir: Option<String>,
@@ -3945,17 +3935,17 @@ fn cmd_test(
     let image_path = PathBuf::from(&image);
     if !image_path.is_file() {
         return Err(miette::miette!(
-            "image not found: {image} — build it first with `shuttle image` and pass the \
+            "image not found: {image} — build it first with `nau image` and pass the \
              resulting *.img"
         ));
     }
     let expect_counters = validate_sequence_args(runs, expect_counter_seq.as_deref())?;
     let log_path = log
         .map(PathBuf::from)
-        .unwrap_or_else(|| shuttle::boot_test::default_log_path(&image_path));
+        .unwrap_or_else(|| nau::boot_test::default_log_path(&image_path));
     let host = resolve_test_host(firmware_dir.as_deref())?;
 
-    let test = shuttle::boot_test::BootTest {
+    let test = nau::boot_test::BootTest {
         image: image_path,
         log: log_path.clone(),
         accel,
@@ -3973,15 +3963,15 @@ fn cmd_test(
 
     if !json {
         if runs > 1 {
-            shuttle::output::status(format!(
+            nau::output::status(format!(
                 "booting {image} {runs} times (accel {})...",
                 accel.qemu_arg()
             ));
         } else {
-            shuttle::output::status(format!("booting {image} (accel {})...", accel.qemu_arg()));
+            nau::output::status(format!("booting {image} (accel {})...", accel.qemu_arg()));
         }
     }
-    let outcome = shuttle::boot_test::run_sequence(&shuttle::command::RealRunner, &test)?;
+    let outcome = nau::boot_test::run_sequence(&nau::command::RealRunner, &test)?;
     report_sequence_result(&image, &log_path, &outcome, json);
 
     if !outcome.passed() {
@@ -3993,16 +3983,16 @@ fn cmd_test(
 /// Resolve qemu, `timeout`, KVM availability, and the UEFI firmware (with a
 /// writable VARS copy staged in the returned scratch dir).
 fn resolve_test_host(firmware_dir: Option<&str>) -> miette::Result<TestHost> {
-    let qemu = shuttle::boot_test::resolve_qemu()?;
-    let timeout_bin = shuttle::boot_test::resolve_timeout()?;
+    let qemu = nau::boot_test::resolve_qemu()?;
+    let timeout_bin = nau::boot_test::resolve_timeout()?;
     let scratch = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create scratch dir for firmware: {e}"))?;
     let firmware =
-        shuttle::boot_test::prepare_firmware(&qemu, firmware_dir.map(Path::new), scratch.path())?;
+        nau::boot_test::prepare_firmware(&qemu, firmware_dir.map(Path::new), scratch.path())?;
     Ok(TestHost {
         qemu,
         timeout_bin,
-        kvm_available: shuttle::boot_test::kvm_available(),
+        kvm_available: nau::boot_test::kvm_available(),
         firmware,
         _scratch: scratch,
     })
@@ -4012,7 +4002,7 @@ fn resolve_test_host(firmware_dir: Option<&str>) -> miette::Result<TestHost> {
 fn report_sequence_result(
     image: &str,
     log: &Path,
-    outcome: &shuttle::boot_test::SequenceOutcome,
+    outcome: &nau::boot_test::SequenceOutcome,
     json: bool,
 ) {
     if json {
@@ -4020,7 +4010,7 @@ fn report_sequence_result(
         return;
     }
     if outcome.records.is_empty() {
-        shuttle::output::err(outcome.message());
+        nau::output::err(outcome.message());
     } else {
         for record in &outcome.records {
             let label = format!("boot {}", record.index);
@@ -4028,33 +4018,33 @@ fn report_sequence_result(
                 .counters
                 .map(|c| {
                     let name = record.uki.as_deref().unwrap_or("");
-                    let base = shuttle::esp::parse_uki_name(name).base;
+                    let base = nau::esp::parse_uki_name(name).base;
                     format!(" (ESP {base} +{}-{})", c.tries_left, c.tries_done)
                 })
                 .unwrap_or_default();
             if record.outcome.passed() {
-                shuttle::output::ok(format!("{label}: {}{counters}", record.outcome.message()));
+                nau::output::ok(format!("{label}: {}{counters}", record.outcome.message()));
             } else {
-                shuttle::output::err(format!("{label}: {}{counters}", record.outcome.message()));
+                nau::output::err(format!("{label}: {}{counters}", record.outcome.message()));
             }
         }
         if let Some(failure) = &outcome.failure {
-            shuttle::output::err(format!("sequence: {}", failure.message()));
+            nau::output::err(format!("sequence: {}", failure.message()));
         }
     }
     if let Some(root) = &outcome.run_root {
-        shuttle::output::status(format!("sequence evidence: {}", root.display()));
+        nau::output::status(format!("sequence evidence: {}", root.display()));
     } else {
-        shuttle::output::status(format!("serial evidence: {}", log.display()));
+        nau::output::status(format!("serial evidence: {}", log.display()));
         if !log.is_file() {
-            shuttle::output::warn(format!("no serial log was written at {}", log.display()));
+            nau::output::warn(format!("no serial log was written at {}", log.display()));
         }
     }
 }
 
 /// `--json` boot report: the sequence summary (one entry per boot) plus the
 /// overall verdict, run root, and image.
-fn report_sequence_json(image: &str, outcome: &shuttle::boot_test::SequenceOutcome) {
+fn report_sequence_json(image: &str, outcome: &nau::boot_test::SequenceOutcome) {
     let boots: Vec<serde_json::Value> = outcome
         .records
         .iter()
@@ -4130,61 +4120,61 @@ fn report_sequence_json(image: &str, outcome: &shuttle::boot_test::SequenceOutco
     );
 }
 
-/// Report the update outcome for `shuttle pod update`: a no-op says so,
+/// Report the update outcome for `nau pod update`: a no-op says so,
 /// updates name the version moves, held packages explain their
 /// constraint, and the current generation closes the story.
-fn print_pod_update_report(report: &shuttle::pod::PodUpdateReport) {
+fn print_pod_update_report(report: &nau::pod::PodUpdateReport) {
     if report.updated.is_empty() && report.held.is_empty() && report.skipped.is_empty() {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "pod '{}' is already at its newest matching versions — no new generation",
             report.pod
         ));
     }
     for name in &report.skipped {
-        shuttle::output::warn(format!(
+        nau::output::warn(format!(
             "skipped '{name}' (sideloaded — blob pins never float; re-add with a \
              new --snap to move it)"
         ));
     }
     for entry in &report.updated {
         let from = entry.from.as_deref().unwrap_or("(unpinned)");
-        shuttle::output::ok(format!("updated '{}' {} -> {}", entry.name, from, entry.to));
+        nau::output::ok(format!("updated '{}' {} -> {}", entry.name, from, entry.to));
     }
     for held in &report.held {
         let pinned = held.pinned.as_deref().unwrap_or("(unpinned)");
-        shuttle::output::warn(format!(
+        nau::output::warn(format!(
             "held '{}' at {} (constraint @{:?}: newest available {} does not match)",
             held.name, pinned, held.constraint, held.candidate
         ));
     }
     if let Some(n) = report.generation {
-        shuttle::output::info(format!("generation {n} current"));
+        nau::output::info(format!("generation {n} current"));
     }
     print_report(report);
 }
 
-/// `shuttle pod rollback`: report the flip (from → to) and the farm now
+/// `nau pod rollback`: report the flip (from → to) and the farm now
 /// behind the pod's `current` link.
 fn cmd_pod_rollback(
     pod_name: &str,
     generation: Option<u64>,
     root: Option<String>,
 ) -> miette::Result<()> {
-    let root = shuttle::pod::pod_root(root.as_deref());
-    let report = shuttle::pod::rollback_pod(&root, pod_name, generation)?;
-    shuttle::output::ok(format!(
+    let root = nau::pod::pod_root(root.as_deref());
+    let report = nau::pod::rollback_pod(&root, pod_name, generation)?;
+    nau::output::ok(format!(
         "pod '{}' rolled back generation {} -> {}",
         report.pod, report.from, report.to
     ));
     if let Some(farm) = &report.farm {
-        shuttle::output::info(format!("farm: {}", farm.display()));
+        nau::output::info(format!("farm: {}", farm.display()));
     }
     if !report.blob_pins_without_content.is_empty() {
         // Issue #135: the flipped generation predates a blob pin — every
         // mutating verb fails named until the pin is repaired.
-        shuttle::output::warn(format!(
+        nau::output::warn(format!(
             "generation {} does not carry blob pin(s) ({}) — mutating verbs fail \
-             until each is re-added (`shuttle pod --name {} add --snap`) or removed",
+             until each is re-added (`nau pod --name {} add --snap`) or removed",
             report.to,
             report.blob_pins_without_content.join(", "),
             report.pod
@@ -4197,12 +4187,12 @@ fn cmd_pod_rollback(
     Ok(())
 }
 
-/// `shuttle pod gc`: report pruned generations and swept blobs.
+/// `nau pod gc`: report pruned generations and swept blobs.
 fn cmd_pod_gc(pod_name: &str, prune: bool, root: Option<String>) -> miette::Result<()> {
-    let root = shuttle::pod::pod_root(root.as_deref());
-    let report = shuttle::pod::gc_pod(&root, pod_name, prune)?;
+    let root = nau::pod::pod_root(root.as_deref());
+    let report = nau::pod::gc_pod(&root, pod_name, prune)?;
     if !report.generations_removed.is_empty() {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "pruned generation(s): {}",
             report
                 .generations_removed
@@ -4213,9 +4203,9 @@ fn cmd_pod_gc(pod_name: &str, prune: bool, root: Option<String>) -> miette::Resu
         ));
     }
     if report.blobs_removed == 0 {
-        shuttle::output::ok("pod store clean — nothing to sweep");
+        nau::output::ok("pod store clean — nothing to sweep");
     } else {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "swept {} blob(s), {} bytes reclaimed",
             report.blobs_removed, report.bytes_reclaimed
         ));
@@ -4224,31 +4214,31 @@ fn cmd_pod_gc(pod_name: &str, prune: bool, root: Option<String>) -> miette::Resu
     Ok(())
 }
 
-/// Report the reconcile outcome for `shuttle pod sync`: a no-op says
+/// Report the reconcile outcome for `nau pod sync`: a no-op says
 /// so (no new generation), changes name what moved, and the current
 /// generation + farm path close the story.
-fn print_pod_sync_report(report: &shuttle::pod::PodSyncReport) {
+fn print_pod_sync_report(report: &nau::pod::PodSyncReport) {
     if report.noop {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "pod '{}' already matches its declaration — no new generation",
             report.pod
         ));
     } else {
         for name in &report.installed {
-            shuttle::output::ok(format!("installed {name}"));
+            nau::output::ok(format!("installed {name}"));
         }
         for name in &report.removed {
-            shuttle::output::ok(format!("removed {name}"));
+            nau::output::ok(format!("removed {name}"));
         }
     }
     for name in &report.held {
-        shuttle::output::warn(format!("held '{name}' at its pin"));
+        nau::output::warn(format!("held '{name}' at its pin"));
     }
     if let Some(n) = report.generation {
-        shuttle::output::info(format!("generation {n} current"));
+        nau::output::info(format!("generation {n} current"));
     }
     if let Some(farm) = &report.farm {
-        shuttle::output::info(format!("farm: {}", farm.display()));
+        nau::output::info(format!("farm: {}", farm.display()));
     }
     if let Some(services) = &report.services {
         print_pod_services(services);
@@ -4259,33 +4249,33 @@ fn print_pod_sync_report(report: &shuttle::pod::PodSyncReport) {
 /// The compact services section of a pod report (ADR-0032 Decision 8):
 /// printed only when the reconcile did anything — a no-op stays as
 /// quiet about services as the sync report is about packages.
-fn print_pod_services(report: &shuttle::services::ServiceReconcileReport) {
+fn print_pod_services(report: &nau::services::ServiceReconcileReport) {
     if report.is_trivial() {
         return;
     }
     if report.reloaded {
-        shuttle::output::info("systemd user manager reloaded");
+        nau::output::info("systemd user manager reloaded");
     }
     if !report.activated.is_empty() {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "services activated: {}",
             report.activated.join(", ")
         ));
     }
     if !report.restarted.is_empty() {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "services restarted: {}",
             report.restarted.join(", ")
         ));
     }
     if !report.deactivated.is_empty() {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "services deactivated: {}",
             report.deactivated.join(", ")
         ));
     }
     for skip in &report.skipped {
-        shuttle::output::warn(format!("service skip: {skip}"));
+        nau::output::warn(format!("service skip: {skip}"));
     }
 }
 
@@ -4294,10 +4284,7 @@ fn print_pod_services(report: &shuttle::services::ServiceReconcileReport) {
 /// Assemble registry credentials from the CLI flags: anonymous by
 /// default; `--username` requires `--password-stdin` (fail-closed) and
 /// the password is read as one line from stdin.
-fn registry_auth(
-    username: Option<&str>,
-    password_stdin: bool,
-) -> miette::Result<shuttle::oci::Auth> {
+fn registry_auth(username: Option<&str>, password_stdin: bool) -> miette::Result<nau::oci::Auth> {
     match (username, password_stdin) {
         (Some(user), true) => {
             let mut line = String::new();
@@ -4308,7 +4295,7 @@ fn registry_auth(
             if password.is_empty() {
                 miette::bail!("no password received on stdin (provide one line)");
             }
-            Ok(shuttle::oci::Auth {
+            Ok(nau::oci::Auth {
                 username: Some(user.to_string()),
                 password: Some(password),
             })
@@ -4317,7 +4304,7 @@ fn registry_auth(
             miette::bail!("--password-stdin is required with --username (no interactive prompt)")
         }
         (None, true) => miette::bail!("--username is required with --password-stdin"),
-        (None, false) => Ok(shuttle::oci::Auth::default()),
+        (None, false) => Ok(nau::oci::Auth::default()),
     }
 }
 
@@ -4335,30 +4322,30 @@ fn cmd_push(
     record: Option<&str>,
 ) -> miette::Result<()> {
     let auth = registry_auth(username, password_stdin)?;
-    let reference = shuttle::oci::Reference::parse(reference)?;
+    let reference = nau::oci::Reference::parse(reference)?;
     let explicit: Vec<PathBuf> = snap.iter().chain(image).map(PathBuf::from).collect();
     for p in &explicit {
         if !p.exists() {
             miette::bail!("artifact {} does not exist", p.display());
         }
     }
-    let plan = shuttle::oci::plan_push(Path::new(dir), &explicit, tag, &reference)?;
-    shuttle::output::info(format!(
+    let plan = nau::oci::plan_push(Path::new(dir), &explicit, tag, &reference)?;
+    nau::output::info(format!(
         "bundle {} v{} ({}) → tag '{}'",
         plan.meta.name, plan.meta.version, plan.meta.arch, plan.tag
     ));
-    let report = shuttle::oci::push(&reference, &plan, auth, insecure_http, mount_from)?;
+    let report = nau::oci::push(&reference, &plan, auth, insecure_http, mount_from)?;
     if let Some(rec) = record {
-        shuttle::oci::write_built_record(Path::new(rec), &plan)?;
-        shuttle::output::ok(format!("built-manifest record written to {rec}"));
+        nau::oci::write_built_record(Path::new(rec), &plan)?;
+        nau::output::ok(format!("built-manifest record written to {rec}"));
     }
     print_report(&report);
     Ok(())
 }
 
-/// `shuttle pull` dispatch across the reference lanes (ADR-0033): the
+/// `nau pull` dispatch across the reference lanes (ADR-0033): the
 /// OCI lane keeps the original body unchanged — same parse, same flags —
-/// while `shuttle://` peer references and `http(s)://` static-tree
+/// while `nau://` peer references and `http(s)://` static-tree
 /// references hand off to the pull lane.
 #[allow(clippy::too_many_arguments)]
 fn run_pull(
@@ -4373,8 +4360,8 @@ fn run_pull(
     pod: Option<&str>,
     allow_downgrade: bool,
 ) -> miette::Result<()> {
-    match shuttle::pull_ref::PullRef::parse(reference)? {
-        shuttle::pull_ref::PullRef::Oci(_) => cmd_pull(
+    match nau::pull_ref::PullRef::parse(reference)? {
+        nau::pull_ref::PullRef::Oci(_) => cmd_pull(
             reference,
             out_dir,
             username,
@@ -4400,12 +4387,12 @@ fn cmd_pull(
     state_dir: Option<String>,
 ) -> miette::Result<()> {
     let auth = registry_auth(username, password_stdin)?;
-    let reference = shuttle::oci::Reference::parse(reference)?;
+    let reference = nau::oci::Reference::parse(reference)?;
     let expected = match expect {
-        Some(p) => Some(shuttle::oci::read_built_record(Path::new(p))?),
+        Some(p) => Some(nau::oci::read_built_record(Path::new(p))?),
         None => None,
     };
-    let mut report = shuttle::oci::pull(
+    let mut report = nau::oci::pull(
         &reference,
         Path::new(&out_dir),
         auth,
@@ -4421,7 +4408,7 @@ fn cmd_pull(
     Ok(())
 }
 
-/// `shuttle serve`: evaluate `node {}` from shuttle.lua for the
+/// `nau serve`: evaluate `node {}` from nau.lua for the
 /// binding + announce policy (ADR-0033 Decisions 3+5+6), then hand the
 /// overrides to the serve lane. `--announce` forces announcing over the
 /// declaration; the declaration is the source of truth — absent both,
@@ -4439,50 +4426,46 @@ fn cmd_serve(
     let address = address
         .map(str::to_string)
         .or_else(|| node.as_ref().map(|n| n.serve_address().to_string()));
-    shuttle::serve::run(address.as_deref(), port, announce, node_name, pod)
+    nau::serve::run(address.as_deref(), port, announce, node_name, pod)
 }
 
-/// The `node {}` declaration from `./shuttle.lua`, if the file exists
+/// The `node {}` declaration from `./nau.lua`, if the file exists
 /// (ADR-0033 Decision 6 — same eval path as every other verb). A
 /// missing file yields `None`: zero behavior change. A file that fails
-/// to evaluate fails the verb — a config shuttle cannot evaluate must
+/// to evaluate fails the verb — a config nau cannot evaluate must
 /// not be silently ignored by a serving verb.
-fn load_node_decl() -> miette::Result<Option<shuttle::lua::NodeConfig>> {
-    if !Path::new("shuttle.lua").exists() {
+fn load_node_decl() -> miette::Result<Option<nau::lua::NodeConfig>> {
+    if !Path::new("nau.lua").exists() {
         return Ok(None);
     }
-    let evaluated = shuttle::lua::evaluate_file_with_inputs("shuttle.lua")?;
+    let evaluated = nau::lua::evaluate_file_with_inputs("nau.lua")?;
     Ok(evaluated.node)
 }
 
-/// `shuttle peers`: browse the LAN for announcing nodes (ADR-0033
+/// `nau peers`: browse the LAN for announcing nodes (ADR-0033
 /// Decision 3) and print name + host:port. Discovery only, never trust:
 /// every manifest stays fail-closed on pull (ADR-0033 Decision 7).
 fn cmd_peers(secs: u64) -> miette::Result<()> {
-    shuttle::output::status(format!(
-        "browsing the LAN for _shuttle._tcp peers ({secs}s)…"
-    ));
-    let mut peers = shuttle::discovery::browse(Duration::from_secs(secs))?;
+    nau::output::status(format!("browsing the LAN for _nau._tcp peers ({secs}s)…"));
+    let mut peers = nau::discovery::browse(Duration::from_secs(secs))?;
     peers.sort_by(|a, b| a.name.cmp(&b.name));
     if peers.is_empty() {
-        shuttle::output::warn(
-            "no shuttle peers found — is `shuttle serve` running there with announce on?",
-        );
+        nau::output::warn("no nau peers found — is `nau serve` running there with announce on?");
     } else {
         for peer in &peers {
             // Instance names arrive off the LAN unauthenticated: strip
             // control characters (terminal escapes) before the name
             // reaches the operator's terminal.
-            let name = shuttle::output::strip_control_chars(&peer.name);
-            shuttle::output::status(format!("{:<24} {}:{}", name, peer.host, peer.port));
+            let name = nau::output::strip_control_chars(&peer.name);
+            nau::output::status(format!("{:<24} {}:{}", name, peer.host, peer.port));
         }
-        shuttle::output::ok(format!("{} peer(s) found", peers.len()));
+        nau::output::ok(format!("{} peer(s) found", peers.len()));
     }
     print_report(&serde_json::json!({ "command": "peers", "peers": peers }));
     Ok(())
 }
 
-/// `shuttle export`: hand the destination and pod to the export lane
+/// `nau export`: hand the destination and pod to the export lane
 /// (ADR-0033 Decision 10 — a static tree any web server can serve).
 /// With `--mission`, the export is CURATED (#275): only the packages
 /// the named `image()` declaration pins are exported — the curation
@@ -4495,25 +4478,25 @@ fn cmd_export(
     file: Option<&str>,
 ) -> miette::Result<()> {
     match mission {
-        None => shuttle::export::run(out, pod)?,
+        None => nau::export::run(out, pod)?,
         Some(name) => {
-            // The same eval path `shuttle image` builds from: missions
+            // The same eval path `nau image` builds from: missions
             // ARE image declarations (this is the mission schema).
-            shuttle::pkg_source::init_global_inputs(&HashMap::new())?;
-            let file = file.unwrap_or("shuttle.lua");
+            nau::pkg_source::init_global_inputs(&HashMap::new())?;
+            let file = file.unwrap_or("nau.lua");
             let file = resolve_file(file)?;
-            let images = shuttle::lua::evaluate_images_file(&file)?;
+            let images = nau::lua::evaluate_images_file(&file)?;
             let decl = images.get(name).ok_or_else(|| {
                 miette::miette!(
                     "mission '{name}' not found in {file} — curate from an \
-                     image() declaration (shuttle image --output-name {name})"
+                     image() declaration (nau image --output-name {name})"
                 )
             })?;
-            let curation = shuttle::export::mission_curation(decl);
-            shuttle::export::run_mission(out, pod, &curation)?;
+            let curation = nau::export::mission_curation(decl);
+            nau::export::run_mission(out, pod, &curation)?;
         }
     }
-    shuttle::output::ok(format!("exported static tree to {out}"));
+    nau::output::ok(format!("exported static tree to {out}"));
     Ok(())
 }
 
@@ -4521,22 +4504,22 @@ fn cmd_export(
 /// pod's store; installation stays the pod workflow (ADR-0033
 /// Decision 5).
 fn cmd_pull_peer(
-    pull_ref: &shuttle::pull_ref::PullRef,
+    pull_ref: &nau::pull_ref::PullRef,
     pod: Option<&str>,
     allow_downgrade: bool,
 ) -> miette::Result<()> {
-    shuttle::pull_peer::run(pull_ref, pod, allow_downgrade)
+    nau::pull_peer::run(pull_ref, pod, allow_downgrade)
 }
 
 /// `pull --install`: resolve revisions for the pulled `.snap` payloads
 /// from the local lockfile pins and install them as one generation.
 /// The revision-resolution rule lives in
-/// [`shuttle::oci::pending_from_blob`]; unpinned or divergent blobs are
+/// [`nau::oci::pending_from_blob`]; unpinned or divergent blobs are
 /// refused there (fail-closed).
 fn install_pulled(
-    report: &shuttle::oci::PullReportJson,
+    report: &nau::oci::PullReportJson,
     state_dir: Option<&str>,
-) -> miette::Result<shuttle::runtime::InstallReport> {
+) -> miette::Result<nau::runtime::InstallReport> {
     let lock_path = Path::new(LockFile::FILENAME);
     let lockfile = LockFile::load(lock_path)?.ok_or_else(|| {
         miette::miette!(
@@ -4548,10 +4531,7 @@ fn install_pulled(
     let mut pending: Vec<PendingSnap> = Vec::new();
     for f in &report.files {
         if f.path.ends_with(".snap") {
-            pending.push(shuttle::oci::pending_from_blob(
-                Path::new(&f.path),
-                &lockfile,
-            )?);
+            pending.push(nau::oci::pending_from_blob(Path::new(&f.path), &lockfile)?);
         }
     }
     if pending.is_empty() {
@@ -4569,17 +4549,17 @@ fn install_pulled(
 /// fail-closed snap-revision assertion path is reused, never
 /// reimplemented) into the state root's downloads dir.
 fn runtime_fetch(name: &str, channel: &str, downloads: &Path) -> miette::Result<PendingSnap> {
-    let arch = shuttle::snap::host_arch();
+    let arch = nau::snap::host_arch();
     let pin = SnapRef {
         name: name.to_string(),
         revision: None,
         sha3_384: None,
     };
-    let resolved = shuttle::store::StoreClient::resolve(&pin, channel, arch)?;
+    let resolved = nau::store::StoreClient::resolve(&pin, channel, arch)?;
     let payload =
-        shuttle::store::StoreClient::download(&shuttle::command::RealRunner, &resolved, downloads)?;
-    shuttle::store::StoreClient::verify(&payload, &resolved.sha3_384)?;
-    shuttle::output::ok(format!(
+        nau::store::StoreClient::download(&nau::command::RealRunner, &resolved, downloads)?;
+    nau::store::StoreClient::verify(&payload, &resolved.sha3_384)?;
+    nau::output::ok(format!(
         "{name} revision {} — sha3-384 verified",
         resolved.revision
     ));
@@ -4593,7 +4573,7 @@ fn runtime_fetch(name: &str, channel: &str, downloads: &Path) -> miette::Result<
 }
 
 fn print_report<T: serde::Serialize>(value: &T) {
-    if shuttle::output::is_json() {
+    if nau::output::is_json() {
         println!(
             "{}",
             serde_json::to_string_pretty(value).unwrap_or_default()
@@ -4616,12 +4596,12 @@ fn runtime_install(name: &str, channel: &str, state_dir: Option<String>) -> miet
 fn runtime_remove(name: &str, state_dir: Option<String>) -> miette::Result<()> {
     let store = RuntimeStore::from_state_dir(state_dir.as_deref());
     let report = store.remove(name, &RuntimeTools::for_pod_runtime())?;
-    shuttle::output::ok(format!(
+    nau::output::ok(format!(
         "removed {name} — generation {} active",
         report.generation
     ));
     for note in &report.notes {
-        shuttle::output::info(note);
+        nau::output::info(note);
     }
     print_report(&report);
     Ok(())
@@ -4640,7 +4620,7 @@ fn runtime_upgrade(
     let resolved = resolve_targets(&targets, channel)?;
     let changed = changed_pins(&resolved, &active.packages);
     if changed.is_empty() {
-        shuttle::output::ok("everything already at its channel head — no-op, no new generation");
+        nau::output::ok("everything already at its channel head — no-op, no new generation");
         print_report(&serde_json::json!({ "noop": true, "changed": [] }));
         return Ok(());
     }
@@ -4654,7 +4634,7 @@ fn runtime_upgrade(
     Ok(())
 }
 
-fn active_or_err(store: &RuntimeStore) -> miette::Result<shuttle::runtime::Generation> {
+fn active_or_err(store: &RuntimeStore) -> miette::Result<nau::runtime::Generation> {
     store
         .active_generation()?
         .ok_or_else(|| miette::miette!("nothing installed — no active generation to upgrade"))
@@ -4675,7 +4655,7 @@ fn fetch_changed(
 /// `upgrade <name>` targets one installed snap; anything else (bare
 /// `upgrade` or `--all`) targets the whole installed set.
 fn upgrade_targets(
-    active: &shuttle::runtime::Generation,
+    active: &nau::runtime::Generation,
     name: &Option<String>,
 ) -> miette::Result<Vec<String>> {
     if let Some(n) = name {
@@ -4696,7 +4676,7 @@ fn resolve_targets(
     targets: &[String],
     channel: &str,
 ) -> miette::Result<Vec<(String, u32, String)>> {
-    let arch = shuttle::snap::host_arch();
+    let arch = nau::snap::host_arch();
     let mut resolved = Vec::new();
     for target in targets {
         let pin = SnapRef {
@@ -4704,21 +4684,21 @@ fn resolve_targets(
             revision: None,
             sha3_384: None,
         };
-        let r = shuttle::store::StoreClient::resolve(&pin, channel, arch)?;
+        let r = nau::store::StoreClient::resolve(&pin, channel, arch)?;
         resolved.push((target.clone(), r.revision, r.sha3_384));
     }
     Ok(resolved)
 }
 
-fn print_install_summary(report: &shuttle::runtime::InstallReport) {
+fn print_install_summary(report: &nau::runtime::InstallReport) {
     for note in &report.notes {
-        shuttle::output::info(note);
+        nau::output::info(note);
     }
     if report.noop {
-        shuttle::output::ok("already installed at this revision — no-op");
+        nau::output::ok("already installed at this revision — no-op");
     } else {
         for installed in &report.installed {
-            shuttle::output::ok(format!(
+            nau::output::ok(format!(
                 "installed {} {} (revision {}) into generation {}",
                 installed.name,
                 installed.version,
@@ -4729,7 +4709,7 @@ fn print_install_summary(report: &shuttle::runtime::InstallReport) {
     }
 }
 
-fn print_install_report(report: &shuttle::runtime::InstallReport) {
+fn print_install_report(report: &nau::runtime::InstallReport) {
     print_install_summary(report);
     print_report(report);
 }
@@ -4737,18 +4717,18 @@ fn print_install_report(report: &shuttle::runtime::InstallReport) {
 fn runtime_rollback(generation: Option<u64>, state_dir: Option<String>) -> miette::Result<()> {
     let store = RuntimeStore::from_state_dir(state_dir.as_deref());
     let report = store.rollback(generation, &RuntimeTools::for_pod_runtime())?;
-    shuttle::output::ok(format!(
+    nau::output::ok(format!(
         "rolled back generation {} -> {}",
         report.from, report.to
     ));
     if !report.started.is_empty() {
-        shuttle::output::info(format!("started: {}", report.started.join(", ")));
+        nau::output::info(format!("started: {}", report.started.join(", ")));
     }
     if !report.stopped.is_empty() {
-        shuttle::output::info(format!("stopped: {}", report.stopped.join(", ")));
+        nau::output::info(format!("stopped: {}", report.stopped.join(", ")));
     }
     for note in &report.notes {
-        shuttle::output::info(note);
+        nau::output::info(note);
     }
     print_report(&report);
     Ok(())
@@ -4758,7 +4738,7 @@ fn runtime_gc(prune: bool, state_dir: Option<String>) -> miette::Result<()> {
     let store = RuntimeStore::from_state_dir(state_dir.as_deref());
     let report = store.gc(prune)?;
     if !report.generations_removed.is_empty() {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "pruned generation(s): {}",
             report
                 .generations_removed
@@ -4769,9 +4749,9 @@ fn runtime_gc(prune: bool, state_dir: Option<String>) -> miette::Result<()> {
         ));
     }
     if report.blobs_removed == 0 {
-        shuttle::output::ok("store clean — nothing to sweep");
+        nau::output::ok("store clean — nothing to sweep");
     } else {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "swept {} blob(s), {} bytes reclaimed",
             report.blobs_removed, report.bytes_reclaimed
         ));
@@ -4780,37 +4760,37 @@ fn runtime_gc(prune: bool, state_dir: Option<String>) -> miette::Result<()> {
     Ok(())
 }
 
-/// `shuttle runtime activate` (ADR-0023 §4, #60): activate the current
+/// `nau runtime activate` (ADR-0023 §4, #60): activate the current
 /// generation. Boot-safe and idempotent — a cold store is a no-op and a
 /// half-written journal is discarded, so the emitted
-/// `shuttle-runtime-activate.service` oneshot never wedges boot.
+/// `nau-runtime-activate.service` oneshot never wedges boot.
 fn runtime_activate(state_dir: Option<String>) -> miette::Result<()> {
     let store = RuntimeStore::from_state_dir(state_dir.as_deref());
     let report = store.activate_current(&RuntimeTools::for_pod_runtime())?;
     if report.noop {
-        shuttle::output::ok("no active generation — nothing to activate");
+        nau::output::ok("no active generation — nothing to activate");
     } else {
-        shuttle::output::ok(format!(
+        nau::output::ok(format!(
             "activated generation {}",
             report.generation.unwrap_or(0)
         ));
     }
     for note in &report.notes {
-        shuttle::output::info(note);
+        nau::output::info(note);
     }
     print_report(&report);
     Ok(())
 }
 
-/// `shuttle runtime recover-slots` (issue #86): assess and reclaim
+/// `nau runtime recover-slots` (issue #86): assess and reclaim
 /// sysupdate slots stranded mid-install. Runs in-guest at boot (the
-/// emitted `shuttle-slot-recovery.service` oneshot); see
-/// [`shuttle::slot_recovery`] for the invariant and the conservative
+/// emitted `nau-slot-recovery.service` oneshot); see
+/// [`nau::slot_recovery`] for the invariant and the conservative
 /// recovery policy.
 fn runtime_recover_slots(esp_mount: &str) -> miette::Result<()> {
-    let runner = shuttle::command::RealRunner;
-    let tools = shuttle::slot_recovery::SlotRecoveryTools::resolve();
-    shuttle::slot_recovery::recover_slots(Path::new(esp_mount), &runner, &tools)
+    let runner = nau::command::RealRunner;
+    let tools = nau::slot_recovery::SlotRecoveryTools::resolve();
+    nau::slot_recovery::recover_slots(Path::new(esp_mount), &runner, &tools)
 }
 
 // ── Search command ──
@@ -4878,9 +4858,9 @@ fn fuzzy_score(query: &str, target: &str) -> u32 {
 
 fn cmd_search(query: &str, json: bool) {
     // Ensure global inputs are initialized for iter_packages
-    let _ = shuttle::pkg_source::init_global_inputs(&HashMap::new());
+    let _ = nau::pkg_source::init_global_inputs(&HashMap::new());
 
-    let candidates = shuttle::pkg_source::iter_packages();
+    let candidates = nau::pkg_source::iter_packages();
     let mut scored: Vec<(u32, String)> = Vec::new();
 
     // Score all candidates
@@ -4952,11 +4932,11 @@ fn cmd_index(sub: IndexCommand) -> miette::Result<()> {
     }
 }
 
-/// `shuttle index update`: refresh package inputs from the config file, or
+/// `nau index update`: refresh package inputs from the config file, or
 /// the default input when the file is absent/unreadable/empty.
 fn index_update(file: &str) {
     let inputs = if Path::new(file).exists() {
-        match shuttle::lua::evaluate_file_with_inputs(file) {
+        match nau::lua::evaluate_file_with_inputs(file) {
             Ok(eval) => eval.global_inputs,
             Err(_) => {
                 eprintln!("  could not read inputs from '{file}', using default");
@@ -4969,11 +4949,11 @@ fn index_update(file: &str) {
 
     if inputs.is_empty() {
         let default = PackageInput {
-            url: "github:rbelem/shuttle/main".into(),
+            url: "github:rbelem/nau/main".into(),
             submodules: None,
         };
         eprintln!("  Updating default package index...");
-        if let Err(e) = shuttle::pkg_source::refresh_input(&default) {
+        if let Err(e) = nau::pkg_source::refresh_input(&default) {
             eprintln!("  ✗ failed: {e}");
         } else {
             eprintln!("  ✓ default package index updated");
@@ -4981,7 +4961,7 @@ fn index_update(file: &str) {
     } else {
         for (name, input) in &inputs {
             eprintln!("  Updating input '{name}'...");
-            match shuttle::pkg_source::refresh_input(input) {
+            match nau::pkg_source::refresh_input(input) {
                 Ok(_) => eprintln!("  ✓ '{name}' updated"),
                 Err(e) => eprintln!("  ✗ '{name}' failed: {e}"),
             }
@@ -4989,7 +4969,7 @@ fn index_update(file: &str) {
     }
 }
 
-/// `shuttle index list`: print every index entry with its kind and pin
+/// `nau index list`: print every index entry with its kind and pin
 /// count.
 fn index_list(index: &str) -> miette::Result<()> {
     let path = Path::new(index);
@@ -5019,7 +4999,7 @@ fn index_list(index: &str) -> miette::Result<()> {
     Ok(())
 }
 
-/// `shuttle index add`: upsert a store-backed entry and save the index.
+/// `nau index add`: upsert a store-backed entry and save the index.
 fn index_add(
     name: String,
     summary: Option<String>,
@@ -5054,11 +5034,11 @@ fn index_add(
 
     idx.upsert(entry);
     idx.save(path)?;
-    shuttle::output::ok(format!("added '{}' to index", name));
+    nau::output::ok(format!("added '{}' to index", name));
     Ok(())
 }
 
-/// `shuttle index resolve`: query the Snap Store for every entry's pins and
+/// `nau index resolve`: query the Snap Store for every entry's pins and
 /// save the updated index. Base-track passes (`--base core22 …`) pin the
 /// channels the image build derives for kernel/gadget snaps (issue #69).
 fn index_resolve(index: &str, channel: &str, bases: &[String]) -> miette::Result<()> {
@@ -5073,7 +5053,7 @@ fn index_resolve(index: &str, channel: &str, bases: &[String]) -> miette::Result
     eprintln!("Resolving snap pins from store (channel: {channel})...");
     idx.resolve_all(channel, bases)?;
     idx.save(path)?;
-    shuttle::output::ok(format!("index updated: {}", index));
+    nau::output::ok(format!("index updated: {}", index));
     Ok(())
 }
 
@@ -5127,7 +5107,7 @@ mod tests {
         let (path, policy, lock) =
             resolve_stage(Some(other.to_string_lossy().into_owned())).unwrap();
         assert_eq!(path, other);
-        assert_eq!(policy, shuttle::snap::StagePolicy::Explicit);
+        assert_eq!(policy, nau::snap::StagePolicy::Explicit);
         assert!(lock.is_none(), "an explicit stage is never locked");
     }
 
@@ -5139,7 +5119,7 @@ mod tests {
 
         let (path, policy, lock) =
             resolve_stage(Some(stage.to_string_lossy().into_owned())).unwrap();
-        assert_eq!(policy, shuttle::snap::StagePolicy::Explicit);
+        assert_eq!(policy, nau::snap::StagePolicy::Explicit);
         assert_eq!(path, stage);
         // An explicit --stage is user-owned: no cross-process lock, and no
         // lock file appears next to it.
@@ -5152,7 +5132,7 @@ mod tests {
         // Runs against the repo's ./stage/ (the real default): the lock
         // file it creates is gitignored. Only this test touches it.
         let (path, policy, lock) = resolve_stage(None).unwrap();
-        assert_eq!(policy, shuttle::snap::StagePolicy::Default);
+        assert_eq!(policy, nau::snap::StagePolicy::Default);
         assert_eq!(path, std::path::Path::new("./stage/"));
         assert!(lock.is_some(), "default stage must be pinned by a lock");
 
@@ -5161,7 +5141,7 @@ mod tests {
         let err = resolve_stage(None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("held by another shuttle build"),
+            msg.contains("held by another nau build"),
             "conflict must be loud: {msg}"
         );
         assert!(

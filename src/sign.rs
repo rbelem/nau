@@ -2,8 +2,8 @@
 //!
 //! A separate module — not folded into [`crate::manifest`] — because
 //! manifest.rs is pure IR construction while this is an optional post-pass
-//! over canonical bytes, shared by `shuttle eval` (signatures map) and image
-//! builds (pubkey embedding at `/etc/shuttle/update-key.pub`).
+//! over canonical bytes, shared by `nau eval` (signatures map) and image
+//! builds (pubkey embedding at `/etc/nau/update-key.pub`).
 //!
 //! # Format
 //!
@@ -13,16 +13,16 @@
 //! an untrusted comment line, then lowercase hex of the key material
 //! (secret file: the 32-byte seed; public file: the 32-byte public key).
 //!
-//! - Secret key: `$HOME/.config/shuttle/secret-key` (mode 0600). Keygen
+//! - Secret key: `$HOME/.config/nau/secret-key` (mode 0600). Keygen
 //!   draws 32 bytes from `/dev/urandom` (Linux-only per project
 //!   constraints). Creation refuses to overwrite an existing key —
 //!   rotation/revocation is the key ceremony below (step (e)).
-//! - Trusted public keys: `$HOME/.config/shuttle/keys/<key-id>.pub` —
+//! - Trusted public keys: `$HOME/.config/nau/keys/<key-id>.pub` —
 //!   every `*.pub` file is a trust anchor for multi-key verification.
-//! - Public key in images: `/etc/shuttle/update-key.pub` — the anchor the
+//! - Public key in images: `/etc/nau/update-key.pub` — the anchor the
 //!   device-side verify path checks manifest signatures against.
-//! - Trusted key SET in images: `/etc/shuttle/trusted-keys/<key-id>.pub`
-//!   plus `/etc/shuttle/revoked-keys` (one revoked id per line) — so a
+//! - Trusted key SET in images: `/etc/nau/trusted-keys/<key-id>.pub`
+//!   plus `/etc/nau/revoked-keys` (one revoked id per line) — so a
 //!   device can tell "not trusted anymore" from "never trusted"
 //!   (ADR-0024 §4).
 //!
@@ -40,7 +40,7 @@
 //! A signature entry may carry a SLSA-lite provenance attestation: what
 //! was built (the sha3-384 subject digest over the canonical body bytes),
 //! from which inputs (the declared materials at their lockfile pins), and
-//! by which builder (`shuttle:<version>` + the eval invocation flags).
+//! by which builder (`nau:<version>` + the eval invocation flags).
 //! The provenance lives INSIDE the signatures-map entry —
 //! `{"signature": …, "provenance": …}` — never in the canonical body, so
 //! it is covered by the signature (tamper breaks verify) while
@@ -56,7 +56,7 @@
 //!
 //! Deliberately omitted (the "lite"): no full SLSA levels, no transparency
 //! log, no external rekor/keyling infrastructure, no independent builder
-//! identity — the builder id is shuttle's own version, self-asserted
+//! identity — the builder id is nau's own version, self-asserted
 //! under the operator's key. The claim is only as strong as the signing
 //! key; that is the issue's stated bar.
 //!
@@ -79,7 +79,7 @@
 //!
 //! systemd-sysupdate verifies the update payload's SHA256SUMS with its GPG
 //! keyring at update time (device provisioning — step (e)/24b). THIS
-//! signature is shuttle's own manifest attestation, delivered now.
+//! signature is nau's own manifest attestation, delivered now.
 
 use std::path::{Path, PathBuf};
 
@@ -91,36 +91,36 @@ use pgp::composed::{DetachedSignature, SignedPublicKey};
 use crate::manifest::{ImageManifest, ManifestInput};
 
 /// Untrusted-comment header on the secret key file.
-const SECRET_COMMENT: &str = "untrusted comment: shuttle signing secret key (ed25519)";
+const SECRET_COMMENT: &str = "untrusted comment: nau signing secret key (ed25519)";
 
 /// Untrusted-comment header on embedded public keys.
-pub const PUBLIC_COMMENT: &str = "untrusted comment: shuttle update public key (ed25519)";
+pub const PUBLIC_COMMENT: &str = "untrusted comment: nau update public key (ed25519)";
 
 /// Public key file embedded into image builds when signing is engaged.
-pub const PUBKEY_EMBED_PATH: &str = "etc/shuttle/update-key.pub";
+pub const PUBKEY_EMBED_PATH: &str = "etc/nau/update-key.pub";
 
 /// Trusted-key-set directory embedded into image builds (ADR-0024 §4).
 /// Every `<key-id>.pub` in it is an anchor the device-side verify path
 /// accepts. The current signing key is also copied to
 /// [`PUBKEY_EMBED_PATH`] for backward compatibility with anchors that
 /// predate the trust-set shape.
-pub const TRUSTED_KEYS_EMBED_DIR: &str = "etc/shuttle/trusted-keys";
+pub const TRUSTED_KEYS_EMBED_DIR: &str = "etc/nau/trusted-keys";
 
 /// Revocation list embedded into image builds (ADR-0024 §4): one key id
 /// per line. A device-side verifier consults it so "revoked" is
 /// distinguishable from "never trusted".
-pub const REVOKED_KEYS_EMBED_PATH: &str = "etc/shuttle/revoked-keys";
+pub const REVOKED_KEYS_EMBED_PATH: &str = "etc/nau/revoked-keys";
 
-/// Secret key location under the user's home (`~/.config/shuttle/`).
+/// Secret key location under the user's home (`~/.config/nau/`).
 pub fn secret_key_path(home: &Path) -> PathBuf {
-    home.join(".config").join("shuttle").join("secret-key")
+    home.join(".config").join("nau").join("secret-key")
 }
 
 /// Rotation successor secret location under `home`
-/// (`~/.config/shuttle/secret-key.new`, 0600): minted by rotation, moved
+/// (`~/.config/nau/secret-key.new`, 0600): minted by rotation, moved
 /// into place by promotion.
 pub fn rotation_key_path(home: &Path) -> PathBuf {
-    home.join(".config").join("shuttle").join("secret-key.new")
+    home.join(".config").join("nau").join("secret-key.new")
 }
 
 /// An Ed25519 signing key pair: the seed and its derived public key.
@@ -256,7 +256,7 @@ pub struct Subject {
 pub struct Provenance {
     pub version: u32,
 
-    /// Builder identity — `shuttle:<CARGO_PKG_VERSION>`. Self-asserted
+    /// Builder identity — `nau:<CARGO_PKG_VERSION>`. Self-asserted
     /// under the signing key; there is no independent builder registry
     /// (the "lite").
     pub builder_id: String,
@@ -279,9 +279,9 @@ pub struct Provenance {
     pub subject: Subject,
 }
 
-/// The builder id for a shuttle version.
-pub fn builder_id(shuttle_version: &str) -> String {
-    format!("shuttle:{shuttle_version}")
+/// The builder id for a nau version.
+pub fn builder_id(nau_version: &str) -> String {
+    format!("nau:{nau_version}")
 }
 
 /// SHA3-384 hex over the canonical body bytes — the provenance subject
@@ -299,11 +299,11 @@ pub fn provenance_bytes(provenance: &Provenance) -> miette::Result<Vec<u8>> {
 
 impl Provenance {
     /// Build the SLSA-lite attestation for an eval-produced manifest:
-    /// builder `shuttle:<version>`, the invocation flags, the declared
+    /// builder `nau:<version>`, the invocation flags, the declared
     /// inputs as materials, and the sha3-384 subject over `body` (the
     /// canonical bytes [`eval_manifest_canonical_bytes`] produced).
     pub fn for_manifest(
-        shuttle_version: &str,
+        nau_version: &str,
         arch: &str,
         channel: &str,
         offline: bool,
@@ -312,7 +312,7 @@ impl Provenance {
     ) -> miette::Result<Provenance> {
         Ok(Provenance {
             version: PROVENANCE_VERSION,
-            builder_id: builder_id(shuttle_version),
+            builder_id: builder_id(nau_version),
             invocation: Invocation {
                 arch: arch.to_string(),
                 channel: channel.to_string(),
@@ -351,7 +351,7 @@ pub fn sign_attested(
 }
 
 /// Eval-time attestation (issue #56): sign the manifest and attach the
-/// SLSA-lite provenance under the signature — builder `shuttle:<version>`,
+/// SLSA-lite provenance under the signature — builder `nau:<version>`,
 /// invocation = the eval flags, materials = the declared inputs, subject =
 /// the body's sha3-384. The provenance lives inside the signatures-map
 /// entry, never in the canonical body, so byte-identical eval is
@@ -359,14 +359,14 @@ pub fn sign_attested(
 pub fn attest_eval(
     manifest: &mut ImageManifest,
     kp: &KeyPair,
-    shuttle_version: &str,
+    nau_version: &str,
     arch: &str,
     channel: &str,
     offline: bool,
 ) -> miette::Result<()> {
     let body = eval_manifest_canonical_bytes(manifest)?;
     let provenance =
-        Provenance::for_manifest(shuttle_version, arch, channel, offline, manifest, &body)?;
+        Provenance::for_manifest(nau_version, arch, channel, offline, manifest, &body)?;
     sign_attested(manifest, kp, &provenance)
 }
 
@@ -469,32 +469,32 @@ pub fn load_secret_key(home: &Path) -> miette::Result<Option<KeyPair>> {
         .wrap_err_with(|| format!("parsing {}", path.display()))
 }
 
-/// Serialize the public key for embedding (`/etc/shuttle/update-key.pub`)
-/// and for trust-anchor files (`~/.config/shuttle/keys/<key-id>.pub`).
+/// Serialize the public key for embedding (`/etc/nau/update-key.pub`)
+/// and for trust-anchor files (`~/.config/nau/keys/<key-id>.pub`).
 pub fn public_key_file(kp: &KeyPair) -> String {
     format!("{}\n{}\n", PUBLIC_COMMENT, kp.public_hex())
 }
 
 // ── Key ceremony (ADR-0011 step (e)): keychain, rotation, revocation ──
 //
-// Paths (documented contract — `shuttle key keygen|rotate|promote|revoke|
+// Paths (documented contract — `nau key keygen|rotate|promote|revoke|
 // list|verify` is the operator surface, the device half consumes the
 // embedded copies from the image build):
 //
-// - Secret key:            `~/.config/shuttle/secret-key`   (0600)
-// - Rotation secret:       `~/.config/shuttle/secret-key.new` (0600)
-// - Trusted public keys:   `~/.config/shuttle/keys/<key-id>.pub`
+// - Secret key:            `~/.config/nau/secret-key`   (0600)
+// - Rotation secret:       `~/.config/nau/secret-key.new` (0600)
+// - Trusted public keys:   `~/.config/nau/keys/<key-id>.pub`
 //   (every `*.pub` file is a trust anchor; same two-line format as the
-//   embedded `/etc/shuttle/update-key.pub`).
-// - Ceremony ledger:       `~/.config/shuttle/keys/ceremony.json` — the
+//   embedded `/etc/nau/update-key.pub`).
+// - Ceremony ledger:       `~/.config/nau/keys/ceremony.json` — the
 //   audit trail (issue #51): created/rotated/revoked dates and the
 //   generation chain (key id → replaced-by → date → window). The
 //   ceremony as a first-class thing, not just the crypto.
 
 /// Trusted public-key directory under the user's home:
-/// `~/.config/shuttle/keys/`.
+/// `~/.config/nau/keys/`.
 pub fn keys_dir(home: &Path) -> PathBuf {
-    home.join(".config").join("shuttle").join("keys")
+    home.join(".config").join("nau").join("keys")
 }
 
 /// A set of trusted public keys (the verification trust anchors).
@@ -534,7 +534,7 @@ impl Keychain {
     }
 
     /// Load ONE public-key file as a trust anchor — the legacy
-    /// single-anchor shape (`/etc/shuttle/update-key.pub`) that predates
+    /// single-anchor shape (`/etc/nau/update-key.pub`) that predates
     /// the trusted-keys directory. Anchor walkers treat `Err` as "no
     /// legacy anchor here" (the runtime's best-effort fallback), so the
     /// error is a miss, never a silent trust grant.
@@ -634,11 +634,11 @@ pub fn rotate(home: &Path, manifest: &mut ImageManifest) -> miette::Result<KeyPa
 }
 
 /// Mint the rotation successor (`secret-key.new`) WITHOUT signing — the
-/// CLI's `shuttle key rotate`, where no manifest is in hand.
+/// CLI's `nau key rotate`, where no manifest is in hand.
 ///
 /// `rotate` is split this way because its signing half needs an
 /// [`ImageManifest`] and the operator CLI has none: fabricating one just
-/// to carry a signature would be a lie, and a bare `shuttle key rotate`
+/// to carry a signature would be a lie, and a bare `nau key rotate`
 /// is exactly the "mint the successor" ceremony. `rotate` keeps its
 /// dual-sign contract for the build path by calling this, then cosigning.
 ///
@@ -654,7 +654,7 @@ pub fn rotate(home: &Path, manifest: &mut ImageManifest) -> miette::Result<KeyPa
 pub fn mint_rotation_key(home: &Path) -> miette::Result<KeyPair> {
     let old = load_secret_key(home)?.ok_or_else(|| {
         miette::miette!(
-            "no signing key at {} — nothing to rotate (run `shuttle key keygen` first)",
+            "no signing key at {} — nothing to rotate (run `nau key keygen` first)",
             secret_key_path(home).display()
         )
     })?;
@@ -663,7 +663,7 @@ pub fn mint_rotation_key(home: &Path) -> miette::Result<KeyPair> {
     if new_path.exists() {
         return Err(miette::miette!(
             "rotation key already exists at {} — refusing to overwrite (promote it with \
-             `shuttle key promote`, or remove it to abandon the pending rotation)",
+             `nau key promote`, or remove it to abandon the pending rotation)",
             new_path.display()
         ));
     }
@@ -696,7 +696,7 @@ pub fn promote_rotation_key(home: &Path, dir: &Path) -> miette::Result<KeyPair> 
     let new_path = rotation_key_path(home);
     if !new_path.exists() {
         return Err(miette::miette!(
-            "no rotation key at {} — nothing to promote (mint one with `shuttle key rotate`)",
+            "no rotation key at {} — nothing to promote (mint one with `nau key rotate`)",
             new_path.display()
         ));
     }
@@ -723,7 +723,7 @@ pub fn promote_rotation_key(home: &Path, dir: &Path) -> miette::Result<KeyPair> 
         Ok(None) | Err(_) => eprintln!(
             "  ⚠ cannot read the rotated-out key's secret at {} — its sysupdate pubring \
              fragment may be missing and the next image build will refuse until the old \
-             anchor is revoked (`shuttle key revoke <old-key-id>`)",
+             anchor is revoked (`nau key revoke <old-key-id>`)",
             secret_key_path(home).display()
         ),
     }
@@ -769,7 +769,7 @@ pub fn revoke(dir: &Path, manifest: &mut ImageManifest, key_id: &str) -> miette:
 ///
 /// Distinct from [`revoke`] in that it names the key even after the
 /// anchor is gone: the local `revoked-keys` file is what the image build
-/// copies into `etc/shuttle/revoked-keys` so a device can tell "revoked"
+/// copies into `etc/nau/revoked-keys` so a device can tell "revoked"
 /// (anchor absent *and* listed) apart from "never trusted" (anchor absent,
 /// not listed). `revoking an absent anchor is refused unless it is
 /// already listed` — a named error, never a silent no-op.
@@ -1123,7 +1123,7 @@ impl CeremonyLedger {
     fn validate(&self) -> miette::Result<()> {
         if self.version > CEREMONY_LEDGER_VERSION {
             return Err(miette::miette!(
-                "ledger version {} is newer than this shuttle understands ({})",
+                "ledger version {} is newer than this nau understands ({})",
                 self.version,
                 CEREMONY_LEDGER_VERSION
             ));
@@ -1316,7 +1316,7 @@ pub fn cosign_reattaching_provenance(
             if prov.subject.manifest_sha3_384 != subject_digest(&body) {
                 return Err(miette::miette!(
                     "the existing provenance does not bind the current manifest bytes — \
-                     refusing to re-attach stale claims under key {} (re-run `shuttle eval` \
+                     refusing to re-attach stale claims under key {} (re-run `nau eval` \
                      to re-attest, then rotate)",
                     kp.key_id()
                 ));
@@ -1654,7 +1654,7 @@ fn from_hex32(s: &str) -> miette::Result<[u8; 32]> {
 /// (`import-pubring.pgp`). Pinned — it is part of the key's fingerprint
 /// material, so a change re-fingerprints the device keyring.
 pub const SYSUPDATE_OPENPGP_USER_ID: &str =
-    "shuttle sysupdate signing (ADR-0024 §4 import-pubring.pgp)";
+    "nau sysupdate signing (ADR-0024 §4 import-pubring.pgp)";
 
 /// Where the device trust anchor lives inside the staged rootfs — the
 /// path systemd-sysupdate reads for `Verify=yes` (sysupdate.d(5)).
@@ -1844,9 +1844,9 @@ fn load_sysupdate_fragment(
     let bytes = std::fs::read(&path).map_err(|e| {
         miette::miette!(
             "sysupdate pubring fragment for key {key_id} is missing at {} — the sysupdate \
-             trust set is incomplete (fail closed); it is minted by `shuttle key rotate` \
+             trust set is incomplete (fail closed); it is minted by `nau key rotate` \
              while that key is active, so re-run the rotation for it, or \
-             `shuttle key revoke {key_id}` if the key is retired: {e}",
+             `nau key revoke {key_id}` if the key is retired: {e}",
             path.display()
         )
     })?;
@@ -1899,7 +1899,7 @@ fn load_sysupdate_fragment(
 ///
 /// # The overlap window (ADR-0024 §4, mirrored from the Ed25519 ledger)
 ///
-/// `shuttle key rotate` OPENS it: the successor is designated, and the
+/// `nau key rotate` OPENS it: the successor is designated, and the
 /// NEXT build embeds {current, successor} — while releases still SIGN
 /// under the current key. That pre-provisioning is what makes rotation
 /// survivable at all: the update channel can only deliver trust through
@@ -1907,8 +1907,8 @@ fn load_sysupdate_fragment(
 /// in the pubring after `promote` (when it is already the signing key)
 /// could never reach a fielded device — every post-promote release would
 /// be refused by a single-key device, and the fleet would be bricked
-/// until reflash (the exact failure this closes). `shuttle key promote`
-/// flips the SIGNING key without changing pubring membership; `shuttle
+/// until reflash (the exact failure this closes). `nau key promote`
+/// flips the SIGNING key without changing pubring membership; `nau
 /// key revoke <old>` CLOSES the window — the old anchor and fragment
 /// drop out and the set narrows to the successor. (The Ed25519 keychain
 /// deliberately stays stricter — a successor is not trusted until
@@ -2376,7 +2376,7 @@ mod tests {
 
         // The old secret is untouched; the successor lives at secret-key.new.
         assert_eq!(load_secret_key(home.path()).unwrap().unwrap(), old);
-        let new_path = home.path().join(".config/shuttle/secret-key.new");
+        let new_path = home.path().join(".config/nau/secret-key.new");
         let loaded_new = std::fs::read_to_string(&new_path).unwrap();
         assert!(
             loaded_new.contains(&successor.seed_hex()),
@@ -2442,7 +2442,7 @@ mod tests {
         );
         // The failed second rotation did not clobber the first successor.
         let stored =
-            std::fs::read_to_string(home.path().join(".config/shuttle/secret-key.new")).unwrap();
+            std::fs::read_to_string(home.path().join(".config/nau/secret-key.new")).unwrap();
         assert!(stored.contains(&first.seed_hex()));
     }
 
@@ -2524,7 +2524,7 @@ mod tests {
 
         // The active secret is still the old key; `.new` is pending.
         assert_eq!(load_secret_key(home.path()).unwrap().unwrap(), old);
-        assert!(home.path().join(".config/shuttle/secret-key.new").exists());
+        assert!(home.path().join(".config/nau/secret-key.new").exists());
 
         // Before promotion the successor has NO anchor, so a manifest it
         // signed cannot verify under the keychain.
@@ -2543,7 +2543,7 @@ mod tests {
         let promoted = promote_rotation_key(home.path(), dir.path()).unwrap();
         assert_eq!(promoted, successor);
         assert_eq!(load_secret_key(home.path()).unwrap().unwrap(), successor);
-        assert!(!home.path().join(".config/shuttle/secret-key.new").exists());
+        assert!(!home.path().join(".config/nau/secret-key.new").exists());
         assert!(dir
             .path()
             .join(format!("{}.pub", successor.key_id()))
@@ -2576,7 +2576,7 @@ mod tests {
         // A `.new` that carries no key material must never clobber the
         // active secret.
         std::fs::write(
-            home.path().join(".config/shuttle/secret-key.new"),
+            home.path().join(".config/nau/secret-key.new"),
             "untrusted comment: x\nzzzz\n",
         )
         .unwrap();
@@ -2591,7 +2591,7 @@ mod tests {
             "the active key survived the failed promotion"
         );
         assert!(
-            home.path().join(".config/shuttle/secret-key.new").exists(),
+            home.path().join(".config/nau/secret-key.new").exists(),
             "the malformed .new is left for the operator to inspect"
         );
     }
@@ -3104,7 +3104,7 @@ mod tests {
             serde_json::from_value(manifest.signatures[key_id].clone()).unwrap();
         match &mut entry {
             SignatureEntry::Attested { provenance, .. } => {
-                provenance.as_mut().unwrap().builder_id = "shuttle:0.0.0-lies".into();
+                provenance.as_mut().unwrap().builder_id = "nau:0.0.0-lies".into();
             }
             SignatureEntry::Bare(_) => panic!("expected an attested entry"),
         }
@@ -3127,7 +3127,7 @@ mod tests {
             serde_json::from_value(manifest.signatures[&kp.key_id()].clone()).unwrap();
         let prov = parsed.provenance().expect("attested entry carries claims");
         assert_eq!(prov.version, PROVENANCE_VERSION);
-        assert_eq!(prov.builder_id, "shuttle:9.9.9");
+        assert_eq!(prov.builder_id, "nau:9.9.9");
         assert_eq!(prov.invocation.arch, "amd64");
         assert_eq!(prov.invocation.channel, "latest/stable");
         assert!(!prov.invocation.offline);
@@ -3241,7 +3241,7 @@ mod tests {
         // the deliberate golden; update it only with the schema.
         let want = format!(
             concat!(
-                r#"{{"provenance":{{"builder_id":"shuttle:9.9.9","#,
+                r#"{{"provenance":{{"builder_id":"nau:9.9.9","#,
                 r#""invocation":{{"arch":"amd64","channel":"latest/stable","offline":false}},"#,
                 r#""materials":{{"pkgs":{{"revision":"c0ffee","sha256":"beef","#,
                 r#""url":"github:owner/repo/main"}}}},"#,

@@ -120,7 +120,7 @@ The two pins, both research-confirmed:
 
 The template stays provider-neutral (stock Ubuntu image + cloud-init), so
 every provider module is a thin SKU mapping. **Dogfood path:** the worker
-contract is exactly four things — sshd, the pinned shuttle binary,
+contract is exactly four things — sshd, the pinned nau binary,
 bwrap working, the pinned mksquashfs — and `__worker-cap` verifies all of
 them. When Nau can boot and carry that set, switching the fleet to Nau is
 a template change (new image + same cloud-init), which is itself the

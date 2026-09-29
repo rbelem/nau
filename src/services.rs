@@ -12,7 +12,7 @@
 //! The mechanism mirrors the desktop launchers (`desktop.rs`) and the
 //! font surface (`fonts.rs`): the generation is the versioned source of
 //! truth, install/remove/rollback re-emit the target generation's unit
-//! set, and unit ids are pod-namespaced (`shuttle-pod-<pod>-<svc>`) so
+//! set, and unit ids are pod-namespaced (`nau-pod-<pod>-<svc>`) so
 //! two pods' same-named services coexist exactly like their binaries.
 //! Nothing is ever written outside the pod state and the user's config
 //! directory.
@@ -118,10 +118,10 @@ pub fn units_path(store: &RuntimeStore, n: u64) -> PathBuf {
 }
 
 /// The unit file name for one service: pod-namespaced
-/// (`shuttle-pod-<pod>-<svc>.service`) so two pods' same-named services
+/// (`nau-pod-<pod>-<svc>.service`) so two pods' same-named services
 /// coexist in the shared systemd user namespace.
 fn unit_name(pod: &str, svc: &str) -> String {
-    format!("shuttle-pod-{pod}-{svc}.service")
+    format!("nau-pod-{pod}-{svc}.service")
 }
 
 // ── Backend selection (ADR-0032 Decision 11) ──
@@ -148,7 +148,7 @@ impl ServiceBackend {
     }
 }
 
-/// Parse one `SHUTTLE_SERVICE_BACKEND` override value (pure; the test
+/// Parse one `NAU_SERVICE_BACKEND` override value (pure; the test
 /// seam for the override grammar).
 fn backend_from_override(value: &str) -> miette::Result<ServiceBackend> {
     match value {
@@ -156,18 +156,18 @@ fn backend_from_override(value: &str) -> miette::Result<ServiceBackend> {
         "launchd" => Ok(ServiceBackend::Launchd),
         "portable" => Ok(ServiceBackend::Portable),
         other => miette::bail!(
-            "invalid SHUTTLE_SERVICE_BACKEND '{other}' — must be systemd, launchd, or \
+            "invalid NAU_SERVICE_BACKEND '{other}' — must be systemd, launchd, or \
              portable (ADR-0032 Decision 11)"
         ),
     }
 }
 
 /// Select the service backend (ADR-0032 Decision 11): the
-/// `SHUTTLE_SERVICE_BACKEND` override wins (tests, explicit choice);
+/// `NAU_SERVICE_BACKEND` override wins (tests, explicit choice);
 /// a macOS host means launchd; anything else is systemd. Reachability
 /// probing of the user manager is ticket #107.
 pub fn select_backend() -> miette::Result<ServiceBackend> {
-    if let Ok(value) = std::env::var("SHUTTLE_SERVICE_BACKEND") {
+    if let Ok(value) = std::env::var("NAU_SERVICE_BACKEND") {
         if !value.is_empty() {
             return backend_from_override(&value);
         }
@@ -260,7 +260,7 @@ pub fn record_in(
     // Shared service names resolve at emit time exactly like binaries:
     // packages iterate in layer order, a later (higher-layer) claim
     // overwrites an earlier one, and the resolution is never silent.
-    let (winners, shuttle_services) = resolve_service_claims(gen);
+    let (winners, nau_services) = resolve_service_claims(gen);
 
     let mut units = Vec::new();
     for (svc, pkg) in &winners {
@@ -274,7 +274,7 @@ pub fn record_in(
             "the pod declaration",
             "the package default",
         )?;
-        let unit = build_unit(&ctx, svc, pkg, decl, &resolved, &shuttle_services)?;
+        let unit = build_unit(&ctx, svc, pkg, decl, &resolved, &nau_services)?;
         units.push(unit);
     }
 
@@ -351,7 +351,7 @@ fn build_unit(
     pkg: &crate::runtime::InstalledPackage,
     decl: &crate::snap::ServiceDecl,
     resolved: &crate::pod::ResolvedServiceOptions,
-    shuttle_services: &BTreeSet<String>,
+    nau_services: &BTreeSet<String>,
 ) -> miette::Result<ServiceUnit> {
     let args = expand_all_args(svc, &decl.args, &resolved.options, ctx)?;
 
@@ -371,7 +371,7 @@ fn build_unit(
         &args,
         &environment,
         ld_library_path,
-        shuttle_services,
+        nau_services,
     )?;
 
     Ok(ServiceUnit {
@@ -414,15 +414,15 @@ fn render_unit(
     args: &[String],
     environment: &BTreeMap<String, String>,
     ld_library_path: Option<String>,
-    shuttle_services: &BTreeSet<String>,
+    nau_services: &BTreeSet<String>,
 ) -> miette::Result<String> {
     let mut out = String::new();
     out.push_str("[Unit]\n");
     out.push_str(&format!(
-        "Description=shuttle pod '{}' service '{}'\n",
+        "Description=nau pod '{}' service '{}'\n",
         ctx.pod, svc
     ));
-    render_after_lines(&mut out, svc, ctx, &decl.after, shuttle_services);
+    render_after_lines(&mut out, svc, ctx, &decl.after, nau_services);
     out.push_str("\n[Service]\n");
     out.push_str(&format!("Type={}\n", daemon_type(decl.daemon)));
     let exec = format!("{}/{}", ctx.current, svc);
@@ -470,7 +470,7 @@ fn render_unit(
 }
 
 /// The advisory `After=` lines (ADR-0032 Decision 5): a target that is
-/// another declared shuttle service of this generation renders
+/// another declared nau service of this generation renders
 /// namespaced; anything else (a systemd target like `network.target`,
 /// typically) warns and renders raw — advisory, never a readiness
 /// contract. A self-reference is a no-op (self-ordering is meaningless).
@@ -479,18 +479,18 @@ fn render_after_lines(
     svc: &str,
     ctx: &ResolveCtx,
     after: &[String],
-    shuttle_services: &BTreeSet<String>,
+    nau_services: &BTreeSet<String>,
 ) {
     for target in after {
         if target == svc {
             continue;
         }
-        if shuttle_services.contains(target.as_str()) {
-            out.push_str(&format!("After=shuttle-pod-{}-{target}.service\n", ctx.pod));
+        if nau_services.contains(target.as_str()) {
+            out.push_str(&format!("After=nau-pod-{}-{target}.service\n", ctx.pod));
             continue;
         }
         crate::output::warn(format!(
-            "service '{svc}': after target '{target}' is not a shuttle service of this \
+            "service '{svc}': after target '{target}' is not a nau service of this \
              generation — emitted as a raw unit target (advisory, ADR-0032 Decision 5)"
         ));
         out.push_str(&format!("After={target}.service\n"));
@@ -577,9 +577,9 @@ fn option_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Expand shuttle's specifiers in one declared string (ADR-0032
+/// Expand nau's specifiers in one declared string (ADR-0032
 /// Decision 2): `${ref}` names a declared option of this service or the
-/// `extensions` built-in; `%h`/`%p` are shuttle's own emit-time
+/// `extensions` built-in; `%h`/`%p` are nau's own emit-time
 /// specifiers (home, pod); `%%` is the `%` escape. `%` followed by a
 /// non-letter is a literal. Option values may themselves carry
 /// specifiers and resolve recursively (cycle-checked). Unknown refs
@@ -683,7 +683,7 @@ fn resolve_percent(
         Some('p') => Ok((ctx.pod.to_string(), 2)),
         Some('%') => Ok(("%".into(), 2)),
         Some(c) if c.is_ascii_alphabetic() => miette::bail!(
-            "service '{service}': field '{field}': '%{c}' is not a shuttle specifier — \
+            "service '{service}': field '{field}': '%{c}' is not a nau specifier — \
              only %h, %p, and the escape %% are valid (ADR-0032 Decision 2)"
         ),
         _ => Ok(("%".into(), 1)),
@@ -728,7 +728,7 @@ fn read_generation_env(path: &std::path::Path) -> miette::Result<BTreeMap<String
 /// still a withdrawal pass — stale links a previous generation left are
 /// removed.
 ///
-/// An explicit `SHUTTLE_SERVICE_BACKEND=launchd|portable` is a named
+/// An explicit `NAU_SERVICE_BACKEND=launchd|portable` is a named
 /// no-op, matching the reconcile tail's skip contract for non-systemd
 /// hosts (Decision 11): those hosts must keep syncing pods, and emitting
 /// systemd-shaped artifacts for them would be wrong. Unknown override
@@ -849,14 +849,14 @@ fn prune_stale_artifacts(dir: &std::path::Path, pod: &str, file: &UnitsFile) -> 
 
 /// Remove the user-level unit links this pod owns but `keep` does not
 /// name (a service removed, disabled, or the pod cleared). Only links
-/// matching the pod-namespaced `shuttle-pod-<pod>-*.service` pattern are
+/// matching the pod-namespaced `nau-pod-<pod>-*.service` pattern are
 /// touched — never other tools' units.
 fn withdraw_stale_services(
     unit_dir: &std::path::Path,
     pod: &str,
     keep: &BTreeSet<String>,
 ) -> miette::Result<()> {
-    let prefix = format!("shuttle-pod-{pod}-");
+    let prefix = format!("nau-pod-{pod}-");
     if let Ok(rd) = std::fs::read_dir(unit_dir) {
         for entry in rd.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -1334,10 +1334,10 @@ fn apply_unit_steps(
 
 /// The Decision 8 linger warning: with enabled services just brought
 /// into the running set, a `Linger=no` user means they stop at the last
-/// logout. Best-effort and read-only — shuttle NEVER enables linger
+/// logout. Best-effort and read-only — nau NEVER enables linger
 /// (a documented one-time manual host step). A missing loginctl (or any
 /// probe failure) stays silent. `loginctl` rides the [`RuntimeTools`]
-/// seam like every other tool, so `SHUTTLE_POD_TOOLS=absent` silences
+/// seam like every other tool, so `NAU_POD_TOOLS=absent` silences
 /// the probe instead of tests having to scrub PATH.
 fn check_linger(
     tools: &crate::runtime::RuntimeTools,
@@ -1427,7 +1427,7 @@ pub fn reconcile(
     Ok(report)
 }
 
-/// The withdrawal-on-empty reconcile (`shuttle pod` with nothing
+/// The withdrawal-on-empty reconcile (`nau pod` with nothing
 /// active): stop + disable everything the applied state remembers being
 /// live, then withdraw all of the pod's links — the same
 /// stop-then-withdraw rule, with no generation to serve. Skips the
@@ -1809,10 +1809,10 @@ mod tests {
     use crate::snap::{ServiceDaemon, ServiceDecl};
 
     fn store_fixture(dir: &std::path::Path) -> RuntimeStore {
-        // The documented pod layout `<data-home>/shuttle/pods/<pod>`:
+        // The documented pod layout `<data-home>/nau/pods/<pod>`:
         // pod_name derives from the root's last component, so a nested
         // fixture root keeps every write inside the test's tempdir.
-        RuntimeStore::new(dir.join("shuttle/pods/pilot"))
+        RuntimeStore::new(dir.join("nau/pods/pilot"))
     }
 
     fn decl(command: &str) -> ServiceDecl {
@@ -1955,10 +1955,10 @@ mod tests {
         let artifact = store
             .generation_dir(1)
             .join(SERVICES_DIR)
-            .join("shuttle-pod-pilot-valkey.service");
+            .join("nau-pod-pilot-valkey.service");
         let text = std::fs::read_to_string(&artifact).unwrap();
         assert!(text.starts_with("[Unit]\n"));
-        assert!(text.contains("Description=shuttle pod 'pilot' service 'valkey'\n"));
+        assert!(text.contains("Description=nau pod 'pilot' service 'valkey'\n"));
         assert!(text.contains("Type=simple\n"));
         assert!(text.contains(&format!(
             "ExecStart='{current}/valkey' '--port' '7002' '--dir' '{}/data/pilot' '--loadmodule' '{current}/extensions/valkey-search.so'\n",
@@ -1973,7 +1973,7 @@ mod tests {
         assert!(text.contains("RestartSec=5\n"));
         assert!(text.contains("[Install]\nWantedBy=default.target\n"));
         // The enabled service's user link points at the generation artifact.
-        let link = dir.join("shuttle-pod-pilot-valkey.service");
+        let link = dir.join("nau-pod-pilot-valkey.service");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
             artifact,
@@ -1999,7 +1999,7 @@ mod tests {
         );
         std::fs::create_dir_all(store.generation_dir(1)).unwrap();
 
-        let envfile = "/run/user/1000/shuttle/secrets/pilot/abc123.env";
+        let envfile = "/run/user/1000/nau/secrets/pilot/abc123.env";
         record_in(&store, &gen, &BTreeMap::new(), "pilot", Some(envfile)).unwrap();
         let unit = &units_of(&store, 1)[0];
         let expected = format!("EnvironmentFile=\"{envfile}\"\n");
@@ -2089,9 +2089,9 @@ mod tests {
         let units = units_of(&store, 1);
         let api = units.iter().find(|u| u.name == "api").unwrap();
         let db = units.iter().find(|u| u.name == "db").unwrap();
-        // A sibling shuttle service renders namespaced; an unknown target
+        // A sibling nau service renders namespaced; an unknown target
         // (advisory) renders raw; the daemon kind maps to Type=.
-        assert!(api.text.contains("After=shuttle-pod-pilot-db.service\n"));
+        assert!(api.text.contains("After=nau-pod-pilot-db.service\n"));
         assert!(api.text.contains("After=network.target.service\n"));
         assert_eq!(db.text.matches("Type=forking").count(), 1);
     }
@@ -2196,11 +2196,11 @@ mod tests {
             store
                 .generation_dir(1)
                 .join(SERVICES_DIR)
-                .join("shuttle-pod-pilot-x.service")
+                .join("nau-pod-pilot-x.service")
                 .exists(),
             "the artifact is written even when disabled"
         );
-        assert!(!dir.join("shuttle-pod-pilot-x.service").exists());
+        assert!(!dir.join("nau-pod-pilot-x.service").exists());
     }
 
     #[test]
@@ -2216,7 +2216,7 @@ mod tests {
         record_in(&store, &gen, &BTreeMap::new(), "pilot", None).unwrap();
         let dir = unit_dir(&tmp);
         emit_in(&store, &gen, &dir, "pilot").unwrap();
-        assert!(dir.join("shuttle-pod-pilot-x.service").exists());
+        assert!(dir.join("nau-pod-pilot-x.service").exists());
 
         // A re-record that no longer declares the service: the empty
         // units file IS what `record` produces then. The next emit
@@ -2224,7 +2224,7 @@ mod tests {
         let empty = serde_json::to_vec(&UnitsFile::default()).unwrap();
         std::fs::write(units_path(&store, 1), &empty).unwrap();
         emit_in(&store, &gen, &dir, "pilot").unwrap();
-        assert!(!dir.join("shuttle-pod-pilot-x.service").exists());
+        assert!(!dir.join("nau-pod-pilot-x.service").exists());
     }
 
     #[test]
@@ -2233,7 +2233,7 @@ mod tests {
         let store = store_fixture(tmp.path());
         let gen = gen_with(1, vec![pkg_with_services("p", &"0".repeat(96), vec![])]);
         let dir = unit_dir(&tmp);
-        let stale = dir.join("shuttle-pod-pilot-old.service");
+        let stale = dir.join("nau-pod-pilot-old.service");
         std::fs::write(&stale, b"stale").unwrap();
         emit_in(&store, &gen, &dir, "pilot").unwrap();
         assert!(!stale.exists(), "the stale link is withdrawn");
@@ -2277,7 +2277,7 @@ mod tests {
         );
         let err = format!("{}", backend_from_override("bogus").unwrap_err());
         assert!(
-            err.contains("SHUTTLE_SERVICE_BACKEND") && err.contains("systemd"),
+            err.contains("NAU_SERVICE_BACKEND") && err.contains("systemd"),
             "{err}"
         );
     }
@@ -2582,7 +2582,7 @@ mod tests {
         a.name = "valkey".into();
         a.options.insert(
             "data_dir".into(),
-            serde_json::json!("%h/.local/share/shuttle/valkey/%p"),
+            serde_json::json!("%h/.local/share/nau/valkey/%p"),
         );
         seed_scan_pod(root, "alpha", &[a.clone()]);
         seed_scan_pod(root, "beta", &[a]);
@@ -2632,7 +2632,7 @@ mod tests {
 
     #[test]
     fn linger_probe_rides_the_runtime_tools_seam() {
-        // No loginctl on the seam → silent (SHUTTLE_POD_TOOLS=absent).
+        // No loginctl on the seam → silent (NAU_POD_TOOLS=absent).
         let mut report = ServiceReconcileReport::default();
         check_linger(
             &crate::runtime::RuntimeTools::default(),
@@ -2680,7 +2680,7 @@ mod tests {
         // Leftovers an interrupted pass could leave: a stale artifact
         // for a withdrawn service and an orphaned temp file.
         let svc_dir = store.generation_dir(1).join(SERVICES_DIR);
-        std::fs::write(svc_dir.join("shuttle-pod-pilot-gone.service"), "stale").unwrap();
+        std::fs::write(svc_dir.join("nau-pod-pilot-gone.service"), "stale").unwrap();
         std::fs::write(svc_dir.join(format!(".{UNITS_FILE}.tmp")), "junk").unwrap();
 
         emit_in(&store, &gen, &dir, "pilot").unwrap();
@@ -2689,8 +2689,8 @@ mod tests {
             "units.json survives its own rewrite"
         );
         assert_eq!(units_of(&store, 1).len(), 1);
-        assert!(svc_dir.join("shuttle-pod-pilot-x.service").exists());
-        assert!(!svc_dir.join("shuttle-pod-pilot-gone.service").exists());
+        assert!(svc_dir.join("nau-pod-pilot-x.service").exists());
+        assert!(!svc_dir.join("nau-pod-pilot-gone.service").exists());
         assert!(
             !svc_dir.join(format!(".{UNITS_FILE}.tmp")).exists(),
             "the temp file must not outlive a successful emit"

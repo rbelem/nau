@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build shuttle's provisioned floor tools as stripped musl-static x86_64
+# Build nau's provisioned floor tools as stripped musl-static x86_64
 # binaries (issue #101, disposition (c)).
 #
 # Recipe: pinned-digest Alpine 3.20 container — GitHub runners ship Docker

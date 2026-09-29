@@ -97,7 +97,7 @@ stale tree; the index monitor only catches a dead origin.
 
 - The remote-ssh path (`[user@]host` targets): unblocks with the Nau
   host; the smoke test drives the identical local-directory path.
-- Live `shuttle pull https://cache.nau.rclb.dev/` on a clean machine:
+- Live `nau pull https://cache.nau.rclb.dev/` on a clean machine:
   pending the Nau host existing. Do not attempt before that.
 - Caddy vhost, DNS record, kuma server application: documented here,
   applied operator-side (plan execution checklist steps 1-2, 5).

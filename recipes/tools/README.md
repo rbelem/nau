@@ -1,8 +1,8 @@
 # recipes/tools — provisioned floor tool builds
 
-Builds the five binaries shuttle self-provisions (issue #101, disposition
+Builds the five binaries nau self-provisions (issue #101, disposition
 (c)): `mksquashfs` + `unsquashfs` (squashfs-tools), `bwrap`, `tar`, `curl` —
-musl-static, x86_64, shipped attached to shuttle releases with a sha256
+musl-static, x86_64, shipped attached to nau releases with a sha256
 manifest.
 
 ## Files
@@ -31,7 +31,7 @@ Locally, one tool at a time (requires Docker, x86_64):
 ```sh
 recipes/tools/build-tool.sh curl /tmp/downloads /tmp/out
 recipes/tools/gen-manifest.sh 1 /tmp/out /tmp/tools-manifest.toml \
-    https://github.com/rbelem/shuttle/releases/download/vX.Y.Z
+    https://github.com/rbelem/nau/releases/download/vX.Y.Z
 ```
 
 `build-tool.sh fetch <dir>` downloads and verifies all four pinned source

@@ -187,7 +187,7 @@ else
 fi
 
 # ------------------------------------------------------------ run matrix ----
-# Config list mirrors ticket #152. "current" is the exact shuttle argv from
+# Config list mirrors ticket #152. "current" is the exact nau argv from
 # src/image/mod.rs: mksquashfs <tree> <out> -noappend -comp xz -all-root
 # (-no-progress added everywhere; cosmetic, does not affect image bytes).
 IMAGES="$SCRATCH/images"

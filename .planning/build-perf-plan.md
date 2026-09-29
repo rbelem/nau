@@ -11,7 +11,7 @@ partially landed). Feeds tickets; changes no code by itself.
 
 ## Goal
 
-Cut the daily `shuttle build --all` loop and single-package rebuilds, in
+Cut the daily `nau build --all` loop and single-package rebuilds, in
 that order, without breaking reproducibility (byte-identical artifacts,
 sha3-384 pins), snapd compatibility, or ADR-0039's offline sandbox.
 Success is measured against the #152 benchmark harness plus live profiles
@@ -52,7 +52,7 @@ stale xz artifacts.
 Reconciled by two council rounds (round 2: 4/4 agree-with-changes) and
 amended with field evidence. Each item names its acceptance check.
 
-0. **Now, zero code.** Raise `workers.local_jobs` in `shuttle.lua`.
+0. **Now, zero code.** Raise `workers.local_jobs` in `nau.lua`.
    Correct mechanism notes from review: the flock is inter-process only,
    so raising the pool puts N mksquashfs in flight inside one process —
    the 16 s ↔ 66 s swing in the field evidence is exactly this shape.
@@ -65,7 +65,7 @@ amended with field evidence. Each item names its acceptance check.
    Facts first: `tempfile::tempdir` already deletes on Drop (pod.rs:5859)
    — the leaks are SIGKILL/timeout paths where Drop never runs, so a
    startup sweep IS the mechanism, not "cleanup-on-drop plus a sweep."
-   Scope: sweep only shuttle-owned temp-name prefixes, gated on age plus
+   Scope: sweep only nau-owned temp-name prefixes, gated on age plus
    liveness (pid-stamp or store lock), never payload names; the pod
    downloads dir is a cache, not scratch — it gets repair-via-digest in
    item 1a, never deletion-by-pattern. One-time operator cleanup of the
@@ -75,7 +75,7 @@ amended with field evidence. Each item names its acceptance check.
    partition (root 92%, /home 90%), and disk-bound scratch may slow
    builds. Gate scripts fail loud on low disk before linking (ENOSPC at
    `ld.bfd` presented as a code failure three times in one day).
-   Acceptance: a SIGKILLed build leaves no shuttle-owned tempdir behind;
+   Acceptance: a SIGKILLed build leaves no nau-owned tempdir behind;
    no sweep ever deletes a live build's scratch or a downloads-dir
    payload; gate scripts refuse to start under headroom thresholds.
 1a. **v5 closure key + top-level store/serve, atomic (perf half).**
@@ -108,7 +108,7 @@ amended with field evidence. Each item names its acceptance check.
    publish. This is the remote-cache plan's artifact, not a perf fix;
    it rides separately so the perf wave never blocks on the ADR.
 2. **Tarball cache by pre-known sha256**
-   (`~/.cache/shuttle/src/<sha256>`), with the same atomic
+   (`~/.cache/nau/src/<sha256>`), with the same atomic
    temp-then-rename + digest-on-read treatment — a partial fetch under a
    final digest name would poison every later build. Scope carve-out from
    review: zero-network acceptance holds for PINNED sources with a warm
@@ -119,7 +119,7 @@ amended with field evidence. Each item names its acceptance check.
    bench; pack numbers are otherwise noise (identical configs swung
    16 s ↔ 66 s wall when mksquashfs ran beside four compiling lanes).
    Acceptance: two consecutive harness runs on an unchanged tree agree.
-3. **Profile gate.** Live profiles of both loops — plain `shuttle build
+3. **Profile gate.** Live profiles of both loops — plain `nau build
    --all` AND the pod sync the operator actually runs daily — after item
    1a: residual time split (eval storm / prefix materialization / pack /
    leak scan / fetch), the adopt-info/store snap share, and cache
@@ -154,7 +154,7 @@ amended with field evidence. Each item names its acceptance check.
   profile gate runs.
 - Harness: #152 (`291eb8c`), tree 26.6 GB / 614k files; re-run per change
   with `-processors` pinned.
-- Live loops: instrumented `shuttle build --all` and pod sync before item
+- Live loops: instrumented `nau build --all` and pod sync before item
   1a and after each item; log per-phase wall clock. Timing anchor from
   the field: a warm single-package rebuild (opencode-bin, 80 MB fetch +
   81 MB mksquashfs) takes about 2-3 minutes today.
@@ -167,7 +167,7 @@ amended with field evidence. Each item names its acceptance check.
 Two sibling agent sessions reviewed the draft; their corrections are
 folded above. Raw observations:
 
-- ~63 GB of shuttle-pattern build tempdirs (`/tmp/.tmpXXXXXX`) accumulated
+- ~63 GB of nau-pattern build tempdirs (`/tmp/.tmpXXXXXX`) accumulated
   Sep 19-27; /tmp at 93% through the period. No build was running — the
   trees are leaks from killed/interrupted builds. Attribution correction
   from the pod-sync session: /tmp sat at ~93% with zero mksquashfs I/O

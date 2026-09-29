@@ -1,16 +1,16 @@
-//! `shuttle verify-image` — read-only flash verification against the
+//! `nau verify-image` — read-only flash verification against the
 //! signed image manifest (ADR-0044 Decision 4, issue #265).
 //!
 //! A flashed device cannot verify its own medium — trust is established
 //! at download; this verb proves the write. It is the entire 1.0
-//! installer surface inside shuttle: read-only, unprivileged, no write
+//! installer surface inside nau: read-only, unprivileged, no write
 //! path, ever.
 //!
 //! # Pipeline (every refusal names its region)
 //!
 //! 1. Parse the published signed image manifest and verify its Ed25519
 //!    signature under the operator trust anchors (`--key` and/or
-//!    `~/.config/shuttle/keys/*.pub`, the ADR-0024 §4 anchor set the
+//!    `~/.config/nau/keys/*.pub`, the ADR-0024 §4 anchor set the
 //!    operator held at download; the device-embedded copy is unreachable
 //!    unprivileged — it lives inside the dm-verity root). The signature
 //!    input is the manifest serialized with the signatures map emptied —
@@ -80,7 +80,7 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-/// Which physical slot's regions one `shuttle verify-image` run
+/// Which physical slot's regions one `nau verify-image` run
 /// verifies (`--slot`, gathered by the CLI in [`crate::cli`]; the
 /// library entry takes the struct so tests drive the same path the
 /// binary does).
@@ -219,9 +219,9 @@ pub(crate) fn verify_device_at(
 
 // ── 1. Signed manifest ──
 
-/// The top-level fields this shuttle's image-manifest schema defines.
+/// The top-level fields this nau's image-manifest schema defines.
 /// A manifest carrying anything else was written by a newer (or foreign)
-/// shuttle: serde would silently DROP the unknown fields and the run
+/// nau: serde would silently DROP the unknown fields and the run
 /// would die later as a generic "no trusted signature" — naming the skew
 /// here instead is what makes the diagnosis a one-liner (#293 item 9).
 const KNOWN_MANIFEST_FIELDS: [&str; 11] = [
@@ -240,7 +240,7 @@ const KNOWN_MANIFEST_FIELDS: [&str; 11] = [
 
 /// Load and parse the published signed image manifest. Anything that
 /// does not parse is a named refusal — the file is the trust input. A
-/// manifest whose top-level field set is not a subset of this shuttle's
+/// manifest whose top-level field set is not a subset of this nau's
 /// schema refuses as SCHEMA SKEW before any signature check: newer-schema
 /// manifests must not masquerade as signature failures.
 fn load_signed_manifest(path: &Path) -> miette::Result<ImageManifest> {
@@ -265,9 +265,9 @@ fn load_signed_manifest(path: &Path) -> miette::Result<ImageManifest> {
         .unwrap_or_default();
     if !unknown.is_empty() {
         return Err(miette::miette!(
-            "manifest schema skew: field(s) {} are not part of this shuttle's \
+            "manifest schema skew: field(s) {} are not part of this nau's \
              image-manifest schema (known fields: {}) — the manifest was written \
-             by a newer or foreign shuttle; refusing before signature checks \
+             by a newer or foreign nau; refusing before signature checks \
              (its fields would be silently dropped here and its canonical bytes \
              would not reproduce the signer's input)",
             unknown.join(", "),
@@ -287,7 +287,7 @@ fn load_signed_manifest(path: &Path) -> miette::Result<ImageManifest> {
 /// signatures map emptied — byte-stable, and a signature never covers
 /// itself. The exact scheme [`crate::sign::eval_manifest_canonical_bytes`]
 /// applies to the eval manifest, applied to the image one. This — NOT the
-/// eval scheme — is what `shuttle image --release` signs (#266) and what
+/// eval scheme — is what `nau image --release` signs (#266) and what
 /// this module verifies.
 pub(crate) fn image_manifest_canonical_bytes(manifest: &ImageManifest) -> miette::Result<Vec<u8>> {
     let mut clean = manifest.clone();
@@ -300,13 +300,13 @@ pub(crate) fn image_manifest_canonical_bytes(manifest: &ImageManifest) -> miette
 /// consumer folds onto (#293 item 8): verify-image's trust anchors, the
 /// release signer, the build's pubring/trust embeds, and the UC assertion
 /// key. A CWD-relative fallback would silently anchor trust from
-/// `./.config/shuttle/*` — exactly the self-bless #285 closed.
+/// `./.config/nau/*` — exactly the self-bless #285 closed.
 pub(crate) fn operator_home() -> miette::Result<PathBuf> {
     std::env::var("HOME").map(PathBuf::from).map_err(|_| {
         miette::miette!(
             "HOME is not set — refusing to guess where the operator keychain \
              lives (a CWD-relative fallback would silently anchor trust from \
-             './.config/shuttle/keys'); set HOME or pass --key <public-key-file> \
+             './.config/nau/keys'); set HOME or pass --key <public-key-file> \
              explicitly"
         )
     })
@@ -340,7 +340,7 @@ pub(crate) fn verify_manifest_signature_at(
     if chain.is_empty() {
         return Err(miette::miette!(
             "no trust anchors — pass --key <public-key-file> or install anchors under {} \
-             (`shuttle key keygen` installs one); refusing to verify unsigned-by-anyone-\
+             (`nau key keygen` installs one); refusing to verify unsigned-by-anyone-\
              trusted input (fail closed)",
             keys_dir.display()
         ));
@@ -1044,7 +1044,7 @@ fn check_esp_content(
              no sha3-384 digest (uki_sha3_384) — the ESP is the one flashed region \
              dm-verity does not protect, so without the digest a verify pass would \
              stamp exactly the replaced/flipped-ESP state this verb exists to catch. \
-             Re-publish the image with a current shuttle and verify against the new \
+             Re-publish the image with a current nau and verify against the new \
              manifest; refusing to pass (issue #284)",
             manifest.name,
             manifest.version
@@ -1053,7 +1053,7 @@ fn check_esp_content(
     let Some(mcopy) = mcopy else {
         return Err(miette::miette!(
             "mcopy not found on PATH — reading the ESP's UKI off the flashed medium \
-             needs mtools (mcopy via -i, read-only). Run 'shuttle doctor' and install \
+             needs mtools (mcopy via -i, read-only). Run 'nau doctor' and install \
              mtools (e.g. apt install mtools or add mtools to devbox.json packages)"
         ));
     };
@@ -1182,7 +1182,7 @@ fn run_verity_verify_with(
     let Some(tool) = veritysetup else {
         return Err(miette::miette!(
             "veritysetup not found on PATH — recomputing the dm-verity hash regions \
-             needs it. Run 'shuttle doctor' and install veritysetup (cryptsetup >= 2.4; \
+             needs it. Run 'nau doctor' and install veritysetup (cryptsetup >= 2.4; \
              e.g. apt install cryptsetup or add cryptsetup to devbox.json packages)"
         ));
     };
@@ -1642,7 +1642,7 @@ mod tests {
 
     #[test]
     fn unset_home_refuses_instead_of_falling_back_to_cwd_anchors() {
-        // A CWD-relative `./.config/shuttle/keys` would silently join the
+        // A CWD-relative `./.config/nau/keys` would silently join the
         // anchor set; the central resolution ([`operator_home`], #285,
         // #293 item 8) must refuse by name instead. Mutating the
         // process-global HOME is why every verify test here holds
@@ -1678,7 +1678,7 @@ mod tests {
 
     #[test]
     fn newer_schema_manifest_refuses_naming_the_skew_before_signature_checks() {
-        // L-batch item 9: a newer shuttle's manifest carries a field this
+        // L-batch item 9: a newer nau's manifest carries a field this
         // schema doesn't know. Without the skew check it would parse with
         // the field dropped and die as a generic "no trusted signature";
         // it must refuse as SCHEMA SKEW instead — and before any tool so
@@ -2175,7 +2175,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("mcopy not found on PATH") && err.contains("shuttle doctor"),
+            err.contains("mcopy not found on PATH") && err.contains("nau doctor"),
             "{err}"
         );
         assert!(
@@ -2510,7 +2510,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("veritysetup not found on PATH") && err.contains("shuttle doctor"),
+            err.contains("veritysetup not found on PATH") && err.contains("nau doctor"),
             "{err}"
         );
     }

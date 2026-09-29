@@ -4,7 +4,7 @@
 //! declares a node, absent when it does not, and never mistaken for a
 //! snap output.
 
-use shuttle::lua::{evaluate_file_with_inputs, DEFAULT_SERVE_ADDRESS};
+use nau::lua::{evaluate_file_with_inputs, DEFAULT_SERVE_ADDRESS};
 
 fn fixture(path: &str) -> String {
     format!("{}/tests/{path}", env!("CARGO_MANIFEST_DIR"))
@@ -12,7 +12,7 @@ fn fixture(path: &str) -> String {
 
 #[test]
 fn eval_without_node_carries_no_config() {
-    let out = evaluate_file_with_inputs(&fixture("fixtures/node-absent/shuttle.lua"))
+    let out = evaluate_file_with_inputs(&fixture("fixtures/node-absent/nau.lua"))
         .expect("eval without node{} must succeed");
     assert!(out.node.is_none(), "absent node declaration = nothing");
     assert_eq!(out.outputs.len(), 1);
@@ -21,14 +21,14 @@ fn eval_without_node_carries_no_config() {
 
 #[test]
 fn eval_with_node_carries_the_declaration() {
-    let out = evaluate_file_with_inputs(&fixture("fixtures/node-decl/shuttle.lua"))
+    let out = evaluate_file_with_inputs(&fixture("fixtures/node-decl/nau.lua"))
         .expect("eval with node{} must succeed");
     let node = out.node.expect("node{} must ride the eval payload");
     assert_eq!(node.name, "devbox");
     assert!(node.serve.announce);
     assert_eq!(
         node.peers,
-        vec!["shuttle://nuci.local:7780".to_string()],
+        vec!["nau://nuci.local:7780".to_string()],
         "the first entry is the origin peer"
     );
     // The node table is config, not a snap output — it must not leak
@@ -43,7 +43,7 @@ fn node_config_defaults_serve_address_to_loopback() {
     let src = r#"
     return { node = node { name = "bare" } }
     "#;
-    let out = shuttle::lua::evaluate_string_with_inputs("bare-node", src)
+    let out = nau::lua::evaluate_string_with_inputs("bare-node", src)
         .expect("minimal node{} must evaluate");
     let node = out.node.expect("node{} must ride the eval payload");
     assert!(!node.serve.announce);

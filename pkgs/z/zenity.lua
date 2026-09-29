@@ -55,11 +55,11 @@ return {
             -- prefix; the sandbox does not extend PATH to it, and the
             -- sandbox tool preflight only accepts PATH-resolved bare
             -- command words, so every tool is invoked by its explicit
-            -- $SHUTTLE_BUILD_PREFIX path (or via the PATH export for
+            -- $NAU_BUILD_PREFIX path (or via the PATH export for
             -- meson-internal find_program calls, e.g. msgfmt). HOME
             -- keeps cmake-method dependency lookups alive (no /etc in
             -- the sandbox, so no passwd entry).
-            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
+            'export PATH="$NAU_BUILD_PREFIX/usr/bin:$PATH"',
             "export HOME=/tmp",
             -- glib's .pc advertises its tools at /usr/bin/... (the
             -- install prefix path), which does not exist in the sandbox
@@ -68,12 +68,12 @@ return {
             -- the pkg-config variable, so a native file overrides every
             -- glib tool variable zenity uses at once
             -- (glib-compile-resources, glib-mkenums).
-            "printf '[binaries]\\nglib-compile-resources = '\\''%s'\\''\\nglib-mkenums = '\\''%s'\\''\\n' \"$SHUTTLE_BUILD_PREFIX/usr/bin/glib-compile-resources\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/glib-mkenums\" > zenity-tools-native.ini",
-            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
+            "printf '[binaries]\\nglib-compile-resources = '\\''%s'\\''\\nglib-mkenums = '\\''%s'\\''\\n' \"$NAU_BUILD_PREFIX/usr/bin/glib-compile-resources\" \"$NAU_BUILD_PREFIX/usr/bin/glib-mkenums\" > zenity-tools-native.ini",
+            '"$NAU_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
                 .. "--native-file zenity-tools-native.ini "
                 .. "-Dmanpage=false -Dwebkitgtk=false",
-            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
-            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
+            '"$NAU_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$NAU_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
 
         type = "source",
@@ -83,12 +83,12 @@ return {
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22/#19)
         -- until the nix gcc wrapper stops baking the merged build prefix
         -- into produced binaries: produced ELFs carry
-        -- RUNPATH=/shuttle-build-prefix/usr/lib (that path does not exist
+        -- RUNPATH=/nau-build-prefix/usr/lib (that path does not exist
         -- at runtime). Silenced here, visibly logged by the build's leak
         -- scan, pending the RUNPATH repair. Same rationale as dconf.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
 
         apps = {

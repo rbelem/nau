@@ -34,7 +34,7 @@ return {
             "./configure --prefix=/usr --disable-all-programs --enable-libuuid --without-systemd",
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
-            -- libtool .la files embed the build-time /shuttle-build-prefix
+            -- libtool .la files embed the build-time /nau-build-prefix
             -- path in their dependency_libs; they are linker metadata, not
             -- runtime objects, so drop them instead of shipping a
             -- build-only reference.

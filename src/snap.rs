@@ -136,7 +136,7 @@ impl SubmoduleSpec {
 ///   `path:/local/dir`            — Local filesystem path
 #[derive(Debug, Clone, Serialize)]
 pub struct PackageInput {
-    /// URL in Nix-inspired format (e.g. "github:rbelem/shuttle/main",
+    /// URL in Nix-inspired format (e.g. "github:rbelem/nau/main",
     /// "path:/home/user/pkgs").
     pub url: String,
 
@@ -311,7 +311,7 @@ pub struct SnapMeta {
     #[serde(default = "default_confinement")]
     pub confinement: String,
 
-    /// Snap type. Doubles as a shuttle build classification
+    /// Snap type. Doubles as a nau build classification
     /// ("source"/"meta"/"store" — build-time only, skipped in YAML) and the
     /// snapd `type` field ("app"/"base"/"gadget"/"kernel"/"snapd").
     /// snapd defaults to "app", so `type:` is only emitted for the non-app
@@ -419,7 +419,7 @@ pub struct SnapMeta {
     pub confined: Option<Confinement>,
 
     /// Package input references. Maps input name to a URL.
-    /// Example: `{ packages = { url = "github:rbelem/shuttle/main" } }`
+    /// Example: `{ packages = { url = "github:rbelem/nau/main" } }`
     /// Skipped in YAML — build metadata only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<HashMap<String, PackageInput>>,
@@ -470,7 +470,7 @@ pub struct SnapMeta {
     pub definition_dir: Option<std::path::PathBuf>,
 }
 
-/// Skip `type:` in snap.yaml for shuttle build classifications
+/// Skip `type:` in snap.yaml for nau build classifications
 /// ("source"/"meta"/"store") and snapd's default ("app").
 fn skip_internal_or_default_type(t: &Option<String>) -> bool {
     !matches!(t.as_deref(), Some("base" | "gadget" | "kernel" | "snapd"))
@@ -966,7 +966,7 @@ fn validate_service_interpolation(
                 Some('h') | Some('p') | Some('%') => i += 2,
                 Some(c) if c.is_ascii_alphabetic() => {
                     miette::bail!(
-                        "service '{service}': field '{field}': '%{c}' is not a shuttle \
+                        "service '{service}': field '{field}': '%{c}' is not a nau \
                          specifier (only %h, %p, and the escape %%) (ADR-0032 Decision 2)"
                     );
                 }
@@ -2975,7 +2975,7 @@ impl SnapMeta {
             .map_err(|e| miette::miette!("failed to serialize snap metadata to YAML: {}", e))
     }
 
-    /// The version to show in identity output (`shuttle check`, build
+    /// The version to show in identity output (`nau check`, build
     /// status): an adopt-info snap has no declared version until build
     /// time, and the "0" placeholder must never read as one.
     pub fn display_version(&self) -> &str {
@@ -2992,24 +2992,24 @@ impl SnapMeta {
 /// Who owns the stage directory for a build.
 ///
 /// Tracks whether `--stage` was passed explicitly (the CLI flag is
-/// `Option<String>`; `None` means shuttle's default `./stage/`).
+/// `Option<String>`; `None` means nau's default `./stage/`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagePolicy {
-    /// No `--stage` flag: the stage is shuttle-owned scratch space. Its
+    /// No `--stage` flag: the stage is nau-owned scratch space. Its
     /// contents are wiped whenever a build phase is about to populate it,
     /// so leftovers from previous builds can never leak into a new snap.
     /// (A build-less snap — pre-built binaries staged by hand — never
     /// reaches the wipe: its stage is the input, not an output.)
     Default,
     /// `--stage` passed explicitly: the directory belongs to the user and
-    /// is never wiped. It must be empty (or new) to start; `shuttle build`
+    /// is never wiped. It must be empty (or new) to start; `nau build`
     /// refuses up front otherwise — see [`check_explicit_stage`].
     Explicit,
 }
 
-/// One-time guard at the start of `shuttle build`: an explicitly passed
+/// One-time guard at the start of `nau build`: an explicitly passed
 /// `--stage` directory that already exists and is non-empty is refused.
-/// shuttle never deletes a user-chosen directory.
+/// nau never deletes a user-chosen directory.
 pub fn check_explicit_stage(stage_dir: &Path) -> miette::Result<()> {
     let nonempty = stage_dir.exists()
         && std::fs::read_dir(stage_dir)
@@ -3018,8 +3018,8 @@ pub fn check_explicit_stage(stage_dir: &Path) -> miette::Result<()> {
     if nonempty {
         return Err(miette::miette!(
             "stage directory '{}' exists and is not empty — refusing to build. \
-             shuttle never deletes a directory passed via --stage; pass a fresh \
-             (empty or new) directory, or omit --stage to let shuttle wipe and \
+             nau never deletes a directory passed via --stage; pass a fresh \
+             (empty or new) directory, or omit --stage to let nau wipe and \
              manage its default './stage/' automatically.",
             stage_dir.display()
         ));
@@ -3027,7 +3027,7 @@ pub fn check_explicit_stage(stage_dir: &Path) -> miette::Result<()> {
     Ok(())
 }
 
-/// Cross-process advisory lock over the shuttle-owned default stage
+/// Cross-process advisory lock over the nau-owned default stage
 /// (gate-pod gap 6: two concurrent builds silently shared `./stage/`, a
 /// watcher catching the stage inode flipping mid-build).
 ///
@@ -3051,7 +3051,7 @@ pub fn check_explicit_stage(stage_dir: &Path) -> miette::Result<()> {
 /// between our open and our check — drops the orphaned fd and retries,
 /// bounded. A followed pre-planted symlink is refused outright
 /// (O_NOFOLLOW): the fd must lock the file at the path, never a victim
-/// inode behind a link. Shuttle itself never unlinks the lock file.
+/// inode behind a link. Nau itself never unlinks the lock file.
 ///
 /// Scope: `flock(2)` is SINGLE-HOST mutual exclusion (on NFS it is
 /// client-local, since Linux 2.6.12) — this lock never coordinates
@@ -3112,7 +3112,7 @@ fn run_stage_lock_test_swap(lock_path: &Path) {
 /// victim` link into a loud failure instead of silently flocking the
 /// victim inode. The file is never written, so the link is harmless
 /// today — but a followed link would still have us locking an inode
-/// shuttle does not own.
+/// nau does not own.
 fn open_stage_lock(lock_path: &Path) -> miette::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
@@ -3125,7 +3125,7 @@ fn open_stage_lock(lock_path: &Path) -> miette::Result<std::fs::File> {
             if e.raw_os_error() == Some(libc::ELOOP) {
                 miette::miette!(
                     "stage lock {} is a symlink — refusing to follow it. Remove the \
-                     symlink so shuttle can create a real lock file.",
+                     symlink so nau can create a real lock file.",
                     lock_path.display()
                 )
             } else {
@@ -3149,7 +3149,7 @@ fn flock_stage_lock(
     let err = std::io::Error::last_os_error();
     if err.kind() == std::io::ErrorKind::WouldBlock {
         return Err(miette::miette!(
-            "default stage '{}' is held by another shuttle build — wait \
+            "default stage '{}' is held by another nau build — wait \
              for it to finish, or pass --stage <dir> to build into a \
              separate stage",
             stage_dir.display()
@@ -3198,7 +3198,7 @@ impl StageLock {
             // actor (git clean, a *.lock sweeper) unlinked and recreated
             // it between the open and the check. Drop this fd —
             // releasing its orphaned flock — and take the fresh one.
-            // Shuttle itself never unlinks the lock file.
+            // Nau itself never unlinks the lock file.
             if attempt >= STAGE_LOCK_IDENTITY_ATTEMPTS {
                 return Err(miette::miette!(
                     "stage lock {} was replaced {} times while acquiring it — something \
@@ -3213,7 +3213,7 @@ impl StageLock {
     }
 }
 
-/// Wipe and recreate the shuttle-owned default stage. Only called right
+/// Wipe and recreate the nau-owned default stage. Only called right
 /// before a build phase populates it.
 fn clear_stage_dir(stage_dir: &Path) -> miette::Result<()> {
     if stage_dir.exists() {
@@ -3356,11 +3356,11 @@ fn wrap_app(
     }
 
     // Ticket #11: a confined app gets a separate launcher wrapper blob
-    // (at `<command>.shuttle-launcher`) that invokes `shuttle run`. The
+    // (at `<command>.nau-launcher`) that invokes `nau run`. The
     // farm's direct symlink for a confined app points at this wrapper,
-    // so `which`/PATH stay truthful while `shuttle run` sets up the
+    // so `which`/PATH stay truthful while `nau run` sets up the
     // sandbox. The real command binary stays untouched — `apps[app]`
-    // still records it and `shuttle run` execs it inside the sandbox.
+    // still records it and `nau run` execs it inside the sandbox.
     if Confinement::for_app(app.confined.as_ref(), meta.confined.as_ref()).is_some() {
         emit_confined_launcher(app_name, &entry, pod_store)?;
     }
@@ -3626,7 +3626,7 @@ fn emit_script_tree_wrapper(
              \x20 [ -d \"$sp\" ] && PYTHONPATH=\"${{PYTHONPATH:+$PYTHONPATH:}}$sp\"\n\
              done\n\
              export PYTHONPATH\n\
-             export SHUTTLE_PYTHONPATH=\"$PYTHONPATH\"\n"
+             export NAU_PYTHONPATH=\"$PYTHONPATH\"\n"
         )
     } else if interpreter.starts_with("perl") {
         // Issue #90 (perltidy): a perl script resolves modules through
@@ -3739,7 +3739,7 @@ fn emit_elf_tree_wrapper(
     // thread every extension's site-packages (the PERL5LIB shape from
     // the #90 perltidy wrapper): the pod interpreter must import
     // cross-package modules (mesonbuild from the meson extension — #94
-    // gates). SHUTTLE_PYTHONPATH stays first: the reserved channel a
+    // gates). NAU_PYTHONPATH stays first: the reserved channel a
     // pod app wrapper uses to hand the interpreter its own
     // site-packages, ahead of the pod-wide sweep.
     // The farm symlink resolves to the wrapper blob at
@@ -3750,7 +3750,7 @@ fn emit_elf_tree_wrapper(
          SCRIPT=\"$(readlink -f \"$0\")\"\n\
          PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
          {libroot_line}\
-         PYTHONPATH=\"${{SHUTTLE_PYTHONPATH:-}}\"\n\
+         PYTHONPATH=\"${{NAU_PYTHONPATH:-}}\"\n\
          for sp in \"$PODROOT\"/active/extensions/*/usr/usr/lib/python3.*/site-packages; do\n\
          \x20 [ -d \"$sp\" ] && PYTHONPATH=\"${{PYTHONPATH:+$PYTHONPATH:}}$sp\"\n\
          done\n\
@@ -3824,13 +3824,13 @@ fn emit_elf_lib_wrapper(
 }
 
 /// Author the confined app launcher (ADR-0016 ticket #11): a wrapper blob
-/// at `<command>.shuttle-launcher` that single-`exec`s `shuttle run` for
+/// at `<command>.nau-launcher` that single-`exec`s `nau run` for
 /// the app. The wrapper derives its pod from its own store-blob path (the
 /// #10 `readlink -f $0` pattern): `store/<aa>/<hash>` sits two levels
 /// under the pod root, whose basename is the pod name.
 ///
 /// The farm's direct symlink for a confined app points at this wrapper;
-/// `shuttle run` resolves the app's grants from the pod's generation
+/// `nau run` resolves the app's grants from the pod's generation
 /// manifest and execs the real command binary inside the sandbox.
 fn emit_confined_launcher(
     app_name: &str,
@@ -3839,24 +3839,24 @@ fn emit_confined_launcher(
 ) -> miette::Result<()> {
     let launcher_path = launcher_sibling_path(entry);
     let wrapper = format!(
-        "#!/bin/sh\nSELF=\"$(readlink -f \"$0\")\"\nPODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SELF\")\")\")\"\nPOD=\"$(basename \"$PODROOT\")\"\nexec shuttle run --pod \"$POD\" --root \"$(dirname \"$PODROOT\")\" {app_name} \"$@\"\n"
+        "#!/bin/sh\nSELF=\"$(readlink -f \"$0\")\"\nPODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SELF\")\")\")\"\nPOD=\"$(basename \"$PODROOT\")\"\nexec nau run --pod \"$POD\" --root \"$(dirname \"$PODROOT\")\" {app_name} \"$@\"\n"
     );
     write_wrapper(app_name, &launcher_path, &wrapper)
 }
 
 /// The sibling path of a command entry that carries the confined launcher
-/// wrapper (e.g. `usr/bin/app` → `usr/bin/app.shuttle-launcher`).
+/// wrapper (e.g. `usr/bin/app` → `usr/bin/app.nau-launcher`).
 pub fn launcher_sibling_path(entry: &Path) -> PathBuf {
     let mut name = entry
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    name.push_str(".shuttle-launcher");
+    name.push_str(".nau-launcher");
     entry.with_file_name(name)
 }
 
 /// The relative payload path of a command's confined launcher wrapper
-/// (e.g. `usr/bin/app` → `usr/bin/app.shuttle-launcher`), for the
+/// (e.g. `usr/bin/app` → `usr/bin/app.nau-launcher`), for the
 /// install-time planner to locate the wrapper blob in the payload tree.
 pub fn launcher_sibling_rel_path(command_rel: &str) -> String {
     let path = Path::new(command_rel);
@@ -4504,7 +4504,7 @@ fn probe_zstd_support(mksquashfs: &Path, level: u32) -> miette::Result<()> {
     }
     let probe = tempfile::tempdir()
         .map_err(|e| miette::miette!("zstd probe: failed to create probe directory: {e}"))?;
-    std::fs::write(probe.path().join("probe"), b"shuttle zstd probe\n")
+    std::fs::write(probe.path().join("probe"), b"nau zstd probe\n")
         .map_err(|e| miette::miette!("zstd probe: failed to write probe file: {e}"))?;
     let image = probe.path().join("probe.snap");
     let output = std::process::Command::new(mksquashfs)
@@ -4542,7 +4542,7 @@ fn probe_zstd_support(mksquashfs: &Path, level: u32) -> miette::Result<()> {
 /// `pod_store` is `Some` only when building into a pod's store (issue #9):
 /// it is what a build-time interpreter wrapper bakes the script's
 /// content-addressed store path from (see [`emit_build_wrappers`]). The
-/// generic `shuttle build` path passes `None` — those builds have no store
+/// generic `nau build` path passes `None` — those builds have no store
 /// to bake and produce no wrappers.
 ///
 /// `deps_dir` is the fetched interpreted-deps closure (ADR-0017) bound
@@ -4943,7 +4943,7 @@ fn run_build(
     let src_root = find_source_root(&extract_dir).unwrap_or_else(|| extract_dir.clone());
 
     // 6. Create stage dir and run the build plan. Stage hygiene: the
-    // default stage is shuttle-owned scratch — wipe it so leftovers from
+    // default stage is nau-owned scratch — wipe it so leftovers from
     // previous builds can never leak into this snap (observed: pciutils
     // files inside a bzip2 snap). An explicit --stage belongs to the user:
     // it was verified empty before the build started and is never wiped.
@@ -5037,12 +5037,12 @@ fn run_multi_source_build(
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
     let build_path = build_dir.path().to_path_buf();
-    // SHUTTLE_KEEP_BUILD_DIR=1: leak the tempdir so a failed build's tree
+    // NAU_KEEP_BUILD_DIR=1: leak the tempdir so a failed build's tree
     // (meson-log.txt, config.log, ...) survives for post-mortem debugging.
-    if std::env::var("SHUTTLE_KEEP_BUILD_DIR").as_deref() == Ok("1") {
+    if std::env::var("NAU_KEEP_BUILD_DIR").as_deref() == Ok("1") {
         std::mem::forget(build_dir);
         crate::output::status(format!(
-            "SHUTTLE_KEEP_BUILD_DIR=1 — build tree kept at {}",
+            "NAU_KEEP_BUILD_DIR=1 — build tree kept at {}",
             build_path.display()
         ));
     }
@@ -5060,7 +5060,7 @@ fn run_multi_source_build(
         infos.push(fetch_and_extract_source(name, spec, &build_path)?);
     }
 
-    // Stage hygiene mirrors the single-source path: wipe shuttle-owned
+    // Stage hygiene mirrors the single-source path: wipe nau-owned
     // scratch stage, never an explicit --stage.
     if stage_policy == StagePolicy::Default {
         clear_stage_dir(stage_dir)?;
@@ -5378,7 +5378,7 @@ fn extract_version_from_rungs(
                 .join(", ");
             Err(miette::miette!(
                 "adopt-info: conflicting version metadata within part '{part_name}' ({plugin}): \
-                 {listed} — fix the source metadata; shuttle never picks arbitrarily"
+                 {listed} — fix the source metadata; nau never picks arbitrarily"
             ))
         }
     }
@@ -5874,17 +5874,17 @@ pub const SANDBOX_ETC_RO_PATHS: [&str; 3] = ["/etc/resolv.conf", "/etc/hosts", "
 pub const SANDBOX_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
 /// Where the fetched dependency closure (ADR-0017, issue #13) is mounted
-/// inside the build sandbox (read-only), and what `$SHUTTLE_DEPS_DIR`
+/// inside the build sandbox (read-only), and what `$NAU_DEPS_DIR`
 /// points the build command at.
-pub const SANDBOX_DEPS_DIR: &str = "/shuttle-deps";
+pub const SANDBOX_DEPS_DIR: &str = "/nau-deps";
 
 /// Where the merged build prefix (ADR-0018 Decision 2, issue #17) is
 /// mounted inside the build sandbox (read-only), and what
-/// `$SHUTTLE_BUILD_PREFIX` points the build command at. The prefix holds
+/// `$NAU_BUILD_PREFIX` points the build command at. The prefix holds
 /// the payload files of the package's `requires` + `build_deps` entries,
 /// merged into one `/usr`-like tree, so `./configure`, `pkg-config`, and
 /// compilers consume pool libraries unmodified.
-pub const SANDBOX_BUILD_PREFIX: &str = "/shuttle-build-prefix";
+pub const SANDBOX_BUILD_PREFIX: &str = "/nau-build-prefix";
 
 /// The env a build command sees for the merged build prefix: the prefix
 /// root plus the standard variables that steer `./configure`, `pkg-config`,
@@ -5897,7 +5897,7 @@ pub const SANDBOX_BUILD_PREFIX: &str = "/shuttle-build-prefix";
 /// header/link probes when no `.pc` file exists.
 pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
     vec![
-        ("SHUTTLE_BUILD_PREFIX", prefix.to_string()),
+        ("NAU_BUILD_PREFIX", prefix.to_string()),
         (
             "CPPFLAGS",
             format!("-I{}/usr/include -I{}/usr/usr/include", prefix, prefix),
@@ -6054,7 +6054,7 @@ fn default_curl_ca_bundle(
 /// LD_DEBUG capture attributes every cc1 probe to LD_LIBRARY_PATH
 /// entries with no RUNPATH candidate — and link searches ride the cc
 /// shim's LIBRARY_PATH→-L translation (the gcc.lua shim contract). The
-/// earlier "cc1 carries RUNPATH=/shuttle-build-prefix/usr/lib{,64}"
+/// earlier "cc1 carries RUNPATH=/nau-build-prefix/usr/lib{,64}"
 /// claim here described the pre-#164 source-built gcc recipe and died
 /// with it (#209 watch item).
 pub fn build_prefix_toolchain_env(prefix: &Path) -> Vec<(&'static str, String)> {
@@ -6766,7 +6766,7 @@ fn run_bwrapped(
         cmd_proc.env(key, val);
     }
     if deps_dir.is_some() {
-        cmd_proc.env("SHUTTLE_DEPS_DIR", SANDBOX_DEPS_DIR);
+        cmd_proc.env("NAU_DEPS_DIR", SANDBOX_DEPS_DIR);
     }
     if let Some(prefix) = build_prefix {
         for (key, val) in build_prefix_env(SANDBOX_BUILD_PREFIX) {
@@ -6820,7 +6820,7 @@ fn run_direct(
     // No sandbox means no read-only bind — the closure tree is exposed at
     // its host path (degraded mode only; the bwrap path binds it RO).
     if let Some(deps) = deps_dir {
-        cmd_proc.env("SHUTTLE_DEPS_DIR", deps);
+        cmd_proc.env("NAU_DEPS_DIR", deps);
     }
     // Same for the merged build prefix: exposed at its host path with the
     // prefix env pointing there (degraded mode only).
@@ -6899,7 +6899,7 @@ fn apply_extra_env(cmd: &mut std::process::Command, extra_env: &[(String, String
 /// `dep_fetch` uses for npm closures): gzip via `flate2`, xz via `xz2`,
 /// plain tar raw. Extraction must never depend on whatever `tar` binary
 /// the caller's PATH carries — pod builds run inside user environments
-/// (`shuttle run --pod …`) whose PATH may shadow GNU tar with an
+/// (`nau run --pod …`) whose PATH may shadow GNU tar with an
 /// implementation that cannot read the archives real recipes pin
 /// (observed: busybox tar rejects the rust dist tarball's 128 MiB
 /// LZMA2 dictionary with an instant "corrupted data / short read",
@@ -6976,7 +6976,7 @@ fn find_source_root(dir: &Path) -> Option<std::path::PathBuf> {
 ///
 /// Absolute paths pass through unchanged. Relative paths resolve against
 /// the definition file's directory first — so a definition in a subpackage
-/// dir can reference sibling files regardless of where `shuttle build` runs
+/// dir can reference sibling files regardless of where `nau build` runs
 /// — falling back to the process CWD for definitions that predate
 /// definition-relative resolution (and for `definition_dir: None`).
 fn resolve_definition_relative(definition_dir: Option<&Path>, path: &str) -> std::path::PathBuf {
@@ -7017,7 +7017,7 @@ fn hook_exec_warning(name: &str, src: &Path) -> Option<String> {
 /// Copy hook scripts from the DSL's source paths into `<build_root>/meta/hooks/<name>`.
 ///
 /// Relative paths resolve against the definition file's directory first,
-/// then the project directory `shuttle build` runs from. A script whose
+/// then the project directory `nau build` runs from. A script whose
 /// mode lacks owner+x is copied but warned about — snapd would never run it.
 fn copy_hook_scripts(meta: &SnapMeta, build_root: &Path) -> miette::Result<()> {
     let Some(hooks) = &meta.hooks else {
@@ -7219,7 +7219,7 @@ mod tests {
         inputs.insert(
             "pkgs".to_string(),
             PackageInput {
-                url: "github:rbelem/shuttle/main".into(),
+                url: "github:rbelem/nau/main".into(),
                 submodules: None,
             },
         );
@@ -7271,7 +7271,7 @@ mod tests {
         inputs.insert(
             "pkgs".to_string(),
             PackageInput {
-                url: "github:rbelem/shuttle/main".into(),
+                url: "github:rbelem/nau/main".into(),
                 submodules: None,
             },
         );
@@ -8168,7 +8168,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("%z") && err.contains("not a shuttle specifier"),
+            err.contains("%z") && err.contains("not a nau specifier"),
             "got: {err}"
         );
         // Unterminated ${ fails closed.
@@ -11667,7 +11667,7 @@ mod tests {
                     version = "1.0",
                     build_deps = { "ncurses", "pkgconf" },
                     leaks_ok = {
-                        "/shuttle-build-prefix/usr/lib",
+                        "/nau-build-prefix/usr/lib",
                         "libncurses.so.6",
                     },
                 },
@@ -11680,7 +11680,7 @@ mod tests {
         assert_eq!(
             meta.leaks_ok,
             vec![
-                "/shuttle-build-prefix/usr/lib".to_string(),
+                "/nau-build-prefix/usr/lib".to_string(),
                 "libncurses.so.6".to_string()
             ]
         );
@@ -12587,7 +12587,7 @@ fi
         let err = StageLock::acquire(&stage).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("held by another shuttle build"),
+            msg.contains("held by another nau build"),
             "conflict error must name the holder: {msg}"
         );
         assert!(
@@ -12641,7 +12641,7 @@ fi
                 }
                 Err(err) if std::time::Instant::now() < deadline => {
                     assert!(
-                        format!("{err:#}").contains("held by another shuttle build"),
+                        format!("{err:#}").contains("held by another nau build"),
                         "unexpected lock error while waiting for release: {err:#}"
                     );
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -12711,7 +12711,7 @@ fi
         // is excluded, proving the retry took the fresh inode.
         let err = StageLock::acquire(&stage).unwrap_err();
         assert!(
-            format!("{err:#}").contains("held by another shuttle build"),
+            format!("{err:#}").contains("held by another nau build"),
             "retry must land on the current inode: {err:#}"
         );
         drop(lock);
@@ -12930,62 +12930,62 @@ fi
         // ADR-0018 (issue #17): the env a build sees for the merged prefix —
         // root, configure probes, and pkg-config with the sysroot rewrite
         // that fixes `/usr`-rooted .pc files.
-        let env = build_prefix_env("/shuttle-build-prefix");
+        let env = build_prefix_env("/nau-build-prefix");
         let get = |k: &str| {
             env.iter()
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| v.clone())
                 .unwrap_or_else(|| panic!("missing {k}"))
         };
-        assert_eq!(get("SHUTTLE_BUILD_PREFIX"), "/shuttle-build-prefix");
+        assert_eq!(get("NAU_BUILD_PREFIX"), "/nau-build-prefix");
         assert_eq!(
             get("CPPFLAGS"),
-            "-I/shuttle-build-prefix/usr/include -I/shuttle-build-prefix/usr/usr/include",
+            "-I/nau-build-prefix/usr/include -I/nau-build-prefix/usr/usr/include",
             "the dpkg usr/usr doubling: deb payloads keep their ./usr tree, \
              so include probes need both spellings (#180)"
         );
         assert_eq!(
             get("LIBRARY_PATH"),
-            "/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64:\
-             /shuttle-build-prefix/lib64:\
-             /shuttle-build-prefix/usr/lib/x86_64-linux-gnu:\
-             /shuttle-build-prefix/usr/lib/aarch64-linux-gnu:\
-             /shuttle-build-prefix/usr/lib/arm-linux-gnueabihf",
+            "/nau-build-prefix/usr/lib:/nau-build-prefix/usr/lib64:\
+             /nau-build-prefix/lib64:\
+             /nau-build-prefix/usr/lib/x86_64-linux-gnu:\
+             /nau-build-prefix/usr/lib/aarch64-linux-gnu:\
+             /nau-build-prefix/usr/lib/arm-linux-gnueabihf",
             "the gcc cc-shim composes -L from this (gcc.lua contract) (#180); \
              /lib64 is the glibc source build's slibdir (08061c8)"
         );
         assert_eq!(
             get("LDFLAGS"),
-            "-L/shuttle-build-prefix/usr/lib -L/shuttle-build-prefix/usr/lib64 \
-             -L/shuttle-build-prefix/lib64 \
-             -L/shuttle-build-prefix/usr/lib/x86_64-linux-gnu \
-             -L/shuttle-build-prefix/usr/lib/aarch64-linux-gnu \
-             -L/shuttle-build-prefix/usr/lib/arm-linux-gnueabihf",
+            "-L/nau-build-prefix/usr/lib -L/nau-build-prefix/usr/lib64 \
+             -L/nau-build-prefix/lib64 \
+             -L/nau-build-prefix/usr/lib/x86_64-linux-gnu \
+             -L/nau-build-prefix/usr/lib/aarch64-linux-gnu \
+             -L/nau-build-prefix/usr/lib/arm-linux-gnueabihf",
             "one -L per LIBRARY_PATH dir, same order — configure/meson probes \
              get the multiarch dirs the cc shim covers (#209); usr/lib keeps \
              priority so existing search order only widens"
         );
         assert_eq!(
             get("LD_LIBRARY_PATH"),
-            "/shuttle-build-prefix/usr/lib:/shuttle-build-prefix/usr/lib64:\
-             /shuttle-build-prefix/lib64:\
-             /shuttle-build-prefix/usr/lib/x86_64-linux-gnu:\
-             /shuttle-build-prefix/usr/lib/aarch64-linux-gnu:\
-             /shuttle-build-prefix/usr/lib/arm-linux-gnueabihf",
+            "/nau-build-prefix/usr/lib:/nau-build-prefix/usr/lib64:\
+             /nau-build-prefix/lib64:\
+             /nau-build-prefix/usr/lib/x86_64-linux-gnu:\
+             /nau-build-prefix/usr/lib/aarch64-linux-gnu:\
+             /nau-build-prefix/usr/lib/arm-linux-gnueabihf",
             "prefix-built ELFs carry no RUNPATH (#12) — build-time execs \
              resolve merged libs through this var; the deb-gcc multiarch \
              dir rides along for cc1's own DT_NEEDED (#180)"
         );
         assert_eq!(
             get("PKG_CONFIG_PATH"),
-            "/shuttle-build-prefix/usr/lib/pkgconfig:\
-             /shuttle-build-prefix/usr/lib64/pkgconfig:\
-             /shuttle-build-prefix/usr/share/pkgconfig:\
-             /shuttle-build-prefix/usr/usr/lib/pkgconfig:\
-             /shuttle-build-prefix/usr/usr/share/pkgconfig",
+            "/nau-build-prefix/usr/lib/pkgconfig:\
+             /nau-build-prefix/usr/lib64/pkgconfig:\
+             /nau-build-prefix/usr/share/pkgconfig:\
+             /nau-build-prefix/usr/usr/lib/pkgconfig:\
+             /nau-build-prefix/usr/usr/share/pkgconfig",
             "deb payload pc files live under the usr/usr doubling (#180)"
         );
-        assert_eq!(get("PKG_CONFIG_SYSROOT_DIR"), "/shuttle-build-prefix");
+        assert_eq!(get("PKG_CONFIG_SYSROOT_DIR"), "/nau-build-prefix");
     }
 
     // ── C-toolchain prefix wiring (issue #44) ──

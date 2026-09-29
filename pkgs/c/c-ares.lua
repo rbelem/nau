@@ -13,7 +13,7 @@
 --
 -- Nix:       pkgs.c-ares (cmake build; shared by default)
 -- Snapcraft: no upstream recipe; a library dependency, not a snap
--- Shuttle:   declarative Lua — CMake source build via the sandbox
+-- Nau:   declarative Lua — CMake source build via the sandbox
 --            toolchain, static archive.
 --
 -- Port strategy: static-only build (CARES_STATIC=ON,
@@ -63,7 +63,7 @@ return {
         build = table.concat({
             "cmake -S $SRC -B $SRC/build -G Ninja "
                 .. "-DCMAKE_BUILD_TYPE=Release "
-                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_PREFIX_PATH=$NAU_BUILD_PREFIX/usr "
                 .. "-DCMAKE_INSTALL_PREFIX=/usr "
                 .. "-DCMAKE_INSTALL_LIBDIR=lib "
                 .. "-DCMAKE_POSITION_INDEPENDENT_CODE=ON "

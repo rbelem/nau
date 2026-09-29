@@ -1,9 +1,9 @@
-# Bend 2 as shuttle's package language — research brief
+# Bend 2 as nau's package language — research brief
 
-> **Purpose:** Evaluate what moving shuttle (Rust CLI; Snap packages from Luau
+> **Purpose:** Evaluate what moving nau (Rust CLI; Snap packages from Luau
 > declarations) to Bend 2 would buy a package manager — package language,
 > implementation language, or neither — against primary sources.
-> **Question:** "what are the benefits of moving shuttle to bend2, and how can
+> **Question:** "what are the benefits of moving nau to bend2, and how can
 > it help us build a better package manager?"
 > **Sources:** bendlang/bend main branch (`README.md`, `guide/GUIDE.md`,
 > `guide/EFFECTS.md`, `WONTFIX.txt`, `CHANGELOG.md`, `LICENSE`, GitHub
@@ -25,7 +25,7 @@
 1. **Bend 2 cannot be embedded in a Rust host.** The implementation is
    TypeScript (`bend2/comp.ts`); the only build outputs are a whole-program C
    file (clang-only) or JS. A native library target is explicitly
-   "planned, not scheduled" (`WONTFIX.txt`, #813). Shuttle's entire eval model
+   "planned, not scheduled" (`WONTFIX.txt`, #813). Nau's entire eval model
    — in-process mlua, one JSON line to a re-exec'd worker, structured outputs
    back — has no Bend equivalent.
 2. **The toolchain is 7 days old and already shipped a sandbox escape.**
@@ -33,7 +33,7 @@
    program) read `bunfig.toml`/`.env` from the project being checked, so a
    malicious package could preload code into bend itself, print a forged
    `All terms check.`, swap hub packages for forgeries, and exfiltrate the
-   user's Bender API key on `--publish`. Shuttle's core premise is evaluating
+   user's Bender API key on `--publish`. Nau's core premise is evaluating
    *untrusted, AI-authored* definitions before the build sandbox — exactly the
    threat that hole lived in.
 
@@ -97,9 +97,9 @@ and implicit arguments — the phases where those tools spend their time;
 Liam Powell: the site claims nowhere "formal verification", and GNATprove
 proves the demo game's properties automatically, no hand proofs).
 
-## 3. The evaluation/embedding facts that decide shuttle's case
+## 3. The evaluation/embedding facts that decide nau's case
 
-| Question | Bend 2 answer (source) | Luau today (shuttle) |
+| Question | Bend 2 answer (source) | Luau today (nau) |
 |---|---|---|
 | Rust library API | None. TS compiler; emits whole-program C/JS only; "native library target for pure defs… planned, not scheduled" (`WONTFIX.txt` #813) | `mlua = "0.10"` vendored, in-process (Cargo.toml:10) |
 | Structured results back to host | JS lane: constructors as `{$: "Name", field: value}` (`GUIDE.md`); C lane: runtime-internal `Term` API (`EFFECTS.md`) | Validated table → JSON → typed `SnapMeta` (src/lua.rs:145-167) |
@@ -111,9 +111,9 @@ proves the demo game's properties automatically, no hand proofs).
 
 Moving the DSL to Bend 2 therefore means: ship Bun (or clang 14+ per eval) in
 the eval worker's TCB, round-trip manifests through JS glue or C-runtime
-internals, keep shuttle's whole rlimit/tempdir/IPC isolation layer anyway
+internals, keep nau's whole rlimit/tempdir/IPC isolation layer anyway
 (purity is not isolation — see 2.0.27), and lose the native `index()`
-callback. Nothing in shuttle's threat model gets easier; the trust base gets
+callback. Nothing in nau's threat model gets easier; the trust base gets
 younger.
 
 ## 4. Steelman — what Bend 2 would actually give the package language
@@ -125,28 +125,28 @@ they're not zero:
    "reproducibility is a runtime property, not a language property" and the
    language only needs "deterministic, side-effect-free evaluation with a
    real termination bound". Bend 2 makes that bound a type-check property
-   instead of a wall-clock kill. Elegant; but shuttle already has the
+   instead of a wall-clock kill. Elegant; but nau already has the
    subprocess bound, and `@unsafe` (exit 0, WONTFIX) means it's a *policy*
    guarantee we'd have to enforce by linting the source anyway — the same
-   way shuttle already rejects `--!nonstrict` hot-comments (analysis.rs:523-555).
+   way nau already rejects `--!nonstrict` hot-comments (analysis.rs:523-555).
 2. **Purity by construction.** No stdlib denylist to maintain, no
    `math.random` to excise, no `os` table to exclude. Genuine maintenance
    win over the sandbox mask — worth maybe a few hundred lines of
    isolate.rs, which is code that already works and has tests.
-3. **Laws over manifest contracts.** This is the strongest idea for shuttle.
-   Shuttle's premise (ADR-0009) is that definitions will be AI-authored and
+3. **Laws over manifest contracts.** This is the strongest idea for nau.
+   Nau's premise (ADR-0009) is that definitions will be AI-authored and
    untrusted. Today the manifest contract lives in Rust validators
    (lua.rs:314-402) — the *host* checks, the package author sees nothing.
    Bend's model inverts it: `LAWS.bend` states e.g. "every entry in `inputs`
    carries a content pin", "two outputs never declare the same path", and
    the AI-authored definition ships with machine-checked evidence. The
    failure Akita documented — a mutation that passed a test suite but the
-   proof gate rejected — is exactly the guarantee class shuttle wants for
+   proof gate rejected — is exactly the guarantee class nau wants for
    package definitions. Nothing about it requires *adopting Bend as the
    package language*; the model ports (§6).
 4. **BendHub's content-addressed imports** (`import 0x<hash>/main.bend`)
-   validate shuttle's existing design (lockfile pins, content hashes,
-   ADR-0037's sideload blob pins) rather than improve it — shuttle already
+   validate nau's existing design (lockfile pins, content hashes,
+   ADR-0037's sideload blob pins) rather than improve it — nau already
    has all three mechanics, self-hosted, without a third-party terms-of-service.
 
 ## 5. What the migration would cost
@@ -164,7 +164,7 @@ they're not zero:
 - **Toolchain:** full_moon/selene/StyLua/mlua and the vendored Luau analyzer
   replaced by a Bun/clang dependency chain per eval worker; clang-only
   ("The C compiler is clang only", #773); Windows unsupported (irrelevant to
-  shuttle, but the pod/gate images gain a new moving part either way).
+  nau, but the pod/gate images gain a new moving part either way).
 - **Ecosystem risk:** 21k GitHub stars are inherited from the Bend 1 repo
   rename; Taelin on launch week: *"there is also my own failure into making
   the language actually be used, rather than just a viral moment"* (HN
@@ -182,22 +182,22 @@ they're not zero:
 
 1. **A machine-checkable law layer for package definitions** — the actionable
    outcome. Keep Luau for description; add a `laws` table per package
-   (or a `shuttle law` subcommand) whose predicates run over the evaluated
+   (or a `nau law` subcommand) whose predicates run over the evaluated
    `SnapMeta` in Rust, with results cached into the lockfile. Same trust
    shape as Bend's gate (evidence travels with the definition), zero new
-   TCB. Start with the invariants shuttle already enforces implicitly
+   TCB. Start with the invariants nau already enforces implicitly
    (pinned inputs, output-path disjointness) so authors can state and see
    them per-package.
-2. **Termination discipline as lint policy.** A `shuttle lint` rule
+2. **Termination discipline as lint policy.** A `nau lint` rule
    rejecting non-tail unbounded recursion patterns in definitions would be a
    cheap nod toward the same guarantee — optional; the wall-clock bound
    already covers the failure mode.
 3. **The 0.1 s check-loop DX.** Bend's real product insight is that
-   AI-authored code needs a sub-second gate it can iterate against. Shuttle's
+   AI-authored code needs a sub-second gate it can iterate against. Nau's
    Luau analyzer is already in that class; keeping check latency a budgeted
    metric is the transferable practice.
 4. **Watch BendHub's mechanics** (hash imports, LICENSE-in-hash, publish
-   permanence) for the `shuttle index`/store layer's evolution — adopt ideas,
+   permanence) for the `nau index`/store layer's evolution — adopt ideas,
    not the hub.
 
 ## 7. Revisit triggers
@@ -205,7 +205,7 @@ they're not zero:
 The answer changes if bend2 lands these (tracked upstream):
 
 - **#813 — native library target for pure defs.** The single blocker for any
-  embedding story; until then bend2 cannot live inside shuttle's binary or
+  embedding story; until then bend2 cannot live inside nau's binary or
   worker.
 - A stable, versioned effects ABI (today: "rebuild your effects with every
   update" — no ABI promise, per the guide as quoted by Akita's port notes).
@@ -216,7 +216,7 @@ The answer changes if bend2 lands these (tracked upstream):
 - Bend 2.1+: evidence of usage outside demos — the killer-app test bend 1
   failed.
 
-**Alternative reading — implementing shuttle *in* Bend 2:** even less
+**Alternative reading — implementing nau *in* Bend 2:** even less
 viable today. The dep-resolver/scheduler core is squarely in Bend's proven-
 pure-core niche (Akita's list: "allocators, schedulers, rate limiters"),
 but with no library target (#813) the output cannot link into the existing
@@ -252,5 +252,5 @@ Third-party (screened with jev_screen before use; injection prob. ≤0.09):
   https://gist.github.com/Nezk/dda0511c492cf9bd673885f0341dca0e
 - Liam Powell, "Bend 2 and the Vibe-Coding Trap" — https://blog.liampwll.com/posts/bend_vibe_coding/
 
-Shuttle internals: file:line refs as cited in §3-§5 (src/lua.rs, src/isolate.rs,
+Nau internals: file:line refs as cited in §3-§5 (src/lua.rs, src/isolate.rs,
 src/analysis.rs, src/dsl/, Cargo.toml), docs/adr/0009, docs/adr/0010.

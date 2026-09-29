@@ -10,14 +10,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use sha2::{Digest, Sha256};
-use shuttle::command::{CommandRunner, RealRunner, RunnerOutput};
-use shuttle::lua::WorkerConfig;
-use shuttle::ssh_exec::{DispatchOutcome, PreflightChecks, SshExecutor};
-use shuttle::worker::{
+use nau::command::{CommandRunner, RealRunner, RunnerOutput};
+use nau::lua::WorkerConfig;
+use nau::ssh_exec::{DispatchOutcome, PreflightChecks, SshExecutor};
+use nau::worker::{
     canonical_manifest_bytes, manifest_identity, write_job_file, Artifact, CapabilityDoc,
     ClosureObject, JobManifest, JobResult, WORKER_PROTOCOL_VERSION,
 };
+use sha2::{Digest, Sha256};
 
 /// The RETIRED pin form: a shape-valid ed25519 public-key line, the
 /// mint-and-inject pin. Kept only as the fixture the legacy-refusal
@@ -30,7 +30,7 @@ const FINGERPRINT_PIN: &str = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf
 /// it to [`FINGERPRINT_PIN`] unless a test overrides the report.
 const CA_PUB_LINE: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGkvsDFv9XrohqXsJvKK8dFbGFe5vN3fGcLgoW8cR3Ux loopback-ca";
-const CA_IDENTITY: &str = "shuttle-worker-ca-test-01";
+const CA_IDENTITY: &str = "nau-worker-ca-test-01";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -39,7 +39,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn host_arch() -> String {
-    shuttle::snap::host_arch().to_string()
+    nau::snap::host_arch().to_string()
 }
 
 fn flip_last(bytes: &mut [u8]) {
@@ -195,17 +195,17 @@ impl LoopbackWorker {
         ))
     }
 
-    /// `shuttle __worker-job <job.json>` — the real verb for the hello
+    /// `nau __worker-job <job.json>` — the real verb for the hello
     /// fixture, or the scripted document for transport-only scenarios.
     fn job(&self, cmd: &str) -> io::Result<RunnerOutput> {
         let job_file = self
             .remote_path(cmd.split_whitespace().last().unwrap())
             .expect("job file under ~");
-        let manifest = shuttle::worker::load_manifest(&job_file)
+        let manifest = nau::worker::load_manifest(&job_file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:#}")))?;
         let dir = job_file.parent().unwrap();
         if self.real_job {
-            return match shuttle::worker::execute_job(
+            return match nau::worker::execute_job(
                 &manifest,
                 Some(&dir.join("payload")),
                 &dir.join("out"),
@@ -417,7 +417,7 @@ fn cap_happy() -> CapabilityDoc {
         mksquashfs: true,
         kvm: false,
         sandbox: true,
-        mksquashfs_version: Some(shuttle::provision::SQUASHFS_TOOLS_VERSION.into()),
+        mksquashfs_version: Some(nau::provision::SQUASHFS_TOOLS_VERSION.into()),
     }
 }
 
@@ -509,7 +509,7 @@ fn scripted_dispatch(outcome_artifact: &str, bytes: &[u8]) -> (JobResult, Vec<(S
         ok: true,
         artifacts: vec![Artifact {
             filename: outcome_artifact.to_string(),
-            path: "~/.cache/shuttle/worker/jobs/x/out/x".to_string(),
+            path: "~/.cache/nau/worker/jobs/x/out/x".to_string(),
             sha256: sha256_hex(bytes),
             size: bytes.len() as u64,
         }],
@@ -528,7 +528,7 @@ fn blob_pair() -> (String, Vec<u8>, String, Vec<u8>) {
 fn preseed_object(root: &Path, sha: &str, bytes: &[u8]) {
     // The fake machine's `~` is `root`; the object store lives at the
     // same remote path the real layout uses.
-    let dir = root.join(".cache/shuttle/worker/objects");
+    let dir = root.join(".cache/nau/worker/objects");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(sha), bytes).unwrap();
 }
@@ -559,7 +559,7 @@ fn preflight_happy_and_the_pinned_bounded_argv() {
     assert_eq!(calls[0][0], "ssh-keygen");
     assert_eq!(ssh_hops, 1, "exactly one channel hop");
     let argv = calls.iter().find(|a| a[0] == "ssh").expect("the ssh dial");
-    assert_eq!(argv[argv.len() - 1], "shuttle __worker-cap");
+    assert_eq!(argv[argv.len() - 1], "nau __worker-cap");
     assert_eq!(argv[argv.len() - 2], "localhost");
     for opt in [
         "-o",
@@ -607,7 +607,7 @@ fn known_hosts_pattern_covers_the_non_default_port() {
     let machine = tempfile::tempdir().unwrap();
     let ceremony = tempfile::tempdir().unwrap();
     ca_ceremony(ceremony.path());
-    shuttle::provision::publish::record_machine_link(
+    nau::provision::publish::record_machine_link(
         ceremony.path(),
         CA_IDENTITY,
         "ssh://localhost:2222",
@@ -688,7 +688,7 @@ fn unpinned_and_malformed_pins_refuse_before_any_channel_activity() {
         .expect_err("non-fingerprint pin refuses");
     let err = err.to_string();
     assert!(err.contains("retired pin"), "{err}");
-    assert!(err.contains("shuttle ca list"), "the remedy rides: {err}");
+    assert!(err.contains("nau ca list"), "the remedy rides: {err}");
     assert!(err.contains("localhost"), "{err}");
     assert_eq!(calls.lock().unwrap().len(), 0, "no channel activity");
 }
@@ -722,7 +722,7 @@ fn legacy_public_key_line_pins_are_refused_with_the_re_pin_remedy() {
         "names the retired mechanism: {err}"
     );
     assert!(
-        err.contains("re-pin with the CA fingerprint from `shuttle ca list`"),
+        err.contains("re-pin with the CA fingerprint from `nau ca list`"),
         "the operator migration path rides: {err}"
     );
     assert!(err.contains("localhost"), "refused by name: {err}");
@@ -737,17 +737,16 @@ fn legacy_public_key_line_pins_are_refused_with_the_re_pin_remedy() {
 /// disk and the machine linkage recorded for `ssh://localhost` under
 /// `ceremony` (the seam `with_ceremony_home` points the executor at).
 fn ca_ceremony(ceremony: &Path) {
-    let ca_dir = ceremony.join(".config/shuttle/ca");
+    let ca_dir = ceremony.join(".config/nau/ca");
     std::fs::create_dir_all(ca_dir.join("machines")).unwrap();
     std::fs::write(ca_dir.join("ca.pub"), format!("{CA_PUB_LINE}\n")).unwrap();
-    shuttle::provision::publish::record_machine_link(ceremony, CA_IDENTITY, "ssh://localhost")
-        .unwrap();
+    nau::provision::publish::record_machine_link(ceremony, CA_IDENTITY, "ssh://localhost").unwrap();
 }
 
 /// An issued record for [`CA_IDENTITY`] with the given principals — the
 /// pattern the @cert-authority line carries once issuance happened.
 fn issue_record(ceremony: &Path, principals: &[&str]) {
-    let record = shuttle::provision::publish::IssuedIdentity {
+    let record = nau::provision::publish::IssuedIdentity {
         machine_identity: CA_IDENTITY.to_string(),
         public_key: CA_PUB_LINE.to_string(),
         instance_identity: serde_json::json!({"instance_id": "i-abc"}),
@@ -759,7 +758,7 @@ fn issue_record(ceremony: &Path, principals: &[&str]) {
         issued_at_epoch: 1,
         ca_fingerprint: FINGERPRINT_PIN.to_string(),
     };
-    let dir = shuttle::provision::publish::issued_dir(ceremony);
+    let dir = nau::provision::publish::issued_dir(ceremony);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join(format!("issued-{CA_IDENTITY}.json")),
@@ -813,7 +812,7 @@ fn ca_fingerprint_pin_builds_the_cert_authority_line_and_connects_under_the_mach
         .clone();
     let alias_at = ssh_argv
         .iter()
-        .position(|a| a == "HostKeyAlias=shuttle-worker-ca-test-01")
+        .position(|a| a == "HostKeyAlias=nau-worker-ca-test-01")
         .expect("HostKeyAlias rides the argv");
     assert_eq!(
         ssh_argv[alias_at - 1],
@@ -926,7 +925,7 @@ fn ca_pin_refusals_name_the_gap_before_any_channel_activity() {
 
     // ── no machine linkage for the address ──
     let ceremony = tempfile::tempdir().unwrap();
-    let ca_dir = ceremony.path().join(".config/shuttle/ca");
+    let ca_dir = ceremony.path().join(".config/nau/ca");
     std::fs::create_dir_all(&ca_dir).unwrap();
     std::fs::write(ca_dir.join("ca.pub"), format!("{CA_PUB_LINE}\n")).unwrap();
     let fake = LoopbackWorker::new(machine.path());
@@ -1045,7 +1044,7 @@ fn preflight_refuses_an_mksquashfs_off_the_fleet_pin() {
             "names what the worker reported: {text}"
         );
         assert!(
-            text.contains(shuttle::provision::SQUASHFS_TOOLS_VERSION),
+            text.contains(nau::provision::SQUASHFS_TOOLS_VERSION),
             "names the fleet pin: {text}"
         );
     }
@@ -1081,7 +1080,7 @@ fn dispatch_lands_the_artifact_in_the_coordinator_ingest() {
         let stored = dir.join(&art.filename);
         assert!(stored.exists(), "artifact ingested: {stored:?}");
         assert_eq!(
-            shuttle::oci::sha256_file(&stored).unwrap(),
+            nau::oci::sha256_file(&stored).unwrap(),
             art.sha256,
             "stored bytes hash to the verified claim"
         );
@@ -1166,7 +1165,7 @@ fn delta_sync_ships_only_the_missing_objects() {
     assert!(!tarred_held, "the held object never shipped");
 
     // The worker's object store now holds both.
-    let objects = machine.path().join(".cache/shuttle/worker/objects");
+    let objects = machine.path().join(".cache/nau/worker/objects");
     assert!(objects.join(&sha_a).exists());
     assert!(objects.join(&sha_b).exists());
 
@@ -1174,7 +1173,7 @@ fn delta_sync_ships_only_the_missing_objects() {
     let dir = ex.ingest_dir(&manifest).unwrap();
     let stored = dir.join("worker-hello_1.0_amd64.snap");
     assert_eq!(
-        shuttle::oci::sha256_file(&stored).unwrap(),
+        nau::oci::sha256_file(&stored).unwrap(),
         sha256_hex(&artifact_bytes)
     );
 }
@@ -1285,7 +1284,7 @@ fn corruption_in_flight_refuses_before_commit() {
     assert!(
         !machine
             .path()
-            .join(".cache/shuttle/worker/objects")
+            .join(".cache/nau/worker/objects")
             .join(&sha_b)
             .exists(),
         "a dead transfer commits nothing"
@@ -1336,7 +1335,7 @@ fn scp_rides_the_same_port_flag_shape() {
     preseed_object(machine.path(), &sha_a, &blob_a);
     let ceremony = tempfile::tempdir().unwrap();
     ca_ceremony(ceremony.path());
-    shuttle::provision::publish::record_machine_link(
+    nau::provision::publish::record_machine_link(
         ceremony.path(),
         CA_IDENTITY,
         "ssh://localhost:2222",
@@ -1389,11 +1388,11 @@ fn manifest_identity_is_canonical_namespaced_and_transport_local_free() {
 
     let mut with_pins = hello_manifest();
     with_pins.pins = vec![
-        shuttle::worker::SourcePin {
+        nau::worker::SourcePin {
             url: "https://a".into(),
             sha256: "a".repeat(64),
         },
-        shuttle::worker::SourcePin {
+        nau::worker::SourcePin {
             url: "https://b".into(),
             sha256: "b".repeat(64),
         },

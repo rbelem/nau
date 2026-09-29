@@ -29,12 +29,12 @@ during compilation.]],
         }, " && "),
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as libstdcpp/gmp/mpfr: the nix gcc wrapper bakes
-        -- RUNPATH=/shuttle-build-prefix/usr/lib into libmpc.so (gmp/mpfr on
+        -- RUNPATH=/nau-build-prefix/usr/lib into libmpc.so (gmp/mpfr on
         -- the merged prefix via requires). Silenced, visibly logged, pending
         -- issue #22.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
     },
 }

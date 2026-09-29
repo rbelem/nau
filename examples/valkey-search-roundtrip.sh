@@ -2,7 +2,7 @@
 # examples/valkey-search-roundtrip.sh — issue #109: PROVE the --loadmodule
 # round-trip live.
 #
-# Boots the shuttle-built valkey-server with the shuttle-built valkey-search
+# Boots the nau-built valkey-server with the nau-built valkey-search
 # module (libsearch.so from the valkey-search snap payload) and drives real
 # commands over a unix socket:
 #
@@ -20,7 +20,7 @@
 # up on exit, pass or fail.
 #
 # Requirements: devbox on PATH (unsquashfs rides it when not installed; the
-# valkey snap is built through devbox+shuttle when missing) and the artifact
+# valkey snap is built through devbox+nau when missing) and the artifact
 # set from the valkey-search chain build (issue #109).
 #
 # Usage:
@@ -31,19 +31,19 @@
 #                    (default: /tmp/opencode/vsbuild)
 #   VS_VALKEY_SNAP   path to the valkey snap; discovered in VS_ARTIFACTS by
 #                    default, built from pkgs/v/valkey/init.lua when absent
-#   SHUTTLE_BIN      shuttle binary used for the on-demand valkey build
-#                    (default: target/release/shuttle, then target/debug)
+#   NAU_BIN      nau binary used for the on-demand valkey build
+#                    (default: target/release/nau, then target/debug)
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VS_ARTIFACTS="${VS_ARTIFACTS:-/tmp/opencode/vsbuild}"
 VS_VALKEY_SNAP="${VS_VALKEY_SNAP:-}"
-if [ -z "${SHUTTLE_BIN:-}" ]; then
-    if [ -x "$REPO_ROOT/target/release/shuttle" ]; then
-        SHUTTLE_BIN="$REPO_ROOT/target/release/shuttle"
+if [ -z "${NAU_BIN:-}" ]; then
+    if [ -x "$REPO_ROOT/target/release/nau" ]; then
+        NAU_BIN="$REPO_ROOT/target/release/nau"
     else
-        SHUTTLE_BIN="$REPO_ROOT/target/debug/shuttle"
+        NAU_BIN="$REPO_ROOT/target/debug/nau"
     fi
 fi
 
@@ -85,9 +85,9 @@ fi
 if [ -z "$VS_VALKEY_SNAP" ]; then
     echo "no valkey snap in $VS_ARTIFACTS — building from pkgs/v/valkey/init.lua"
     mkdir -p "$WORK/out"
-    (cd "$REPO_ROOT" && env -u LD_LIBRARY_PATH devbox run -- "$SHUTTLE_BIN" build \
+    (cd "$REPO_ROOT" && env -u LD_LIBRARY_PATH devbox run -- "$NAU_BIN" build \
         --file pkgs/v/valkey/init.lua -A amd64 --output "$WORK/out") \
-        >"$WORK/valkey-build.log" 2>&1 || die "shuttle build of valkey failed ($WORK/valkey-build.log)"
+        >"$WORK/valkey-build.log" 2>&1 || die "nau build of valkey failed ($WORK/valkey-build.log)"
     VS_VALKEY_SNAP="$(find "$WORK/out" -maxdepth 1 -name 'valkey_*.snap' | sort | tail -1)"
 fi
 [ -n "$VS_VALKEY_SNAP" ] && [ -f "$VS_VALKEY_SNAP" ] || die "valkey snap not resolvable"
@@ -165,18 +165,18 @@ out="$(cli FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA title TEXT)"
 [ "$out" = "OK" ] || die "FT.CREATE returned '$out'"
 pass "FT.CREATE idx (HASH, TEXT field) -> OK"
 
-out="$(cli HSET doc:1 title "hello shuttle roundtrip")"
+out="$(cli HSET doc:1 title "hello nau roundtrip")"
 [ "$out" = "1" ] || die "HSET returned '$out'"
 pass "HSET doc:1 -> 1"
 
 search_out=""
 for _ in $(seq 1 25); do  # index propagation is async on the module side
-    search_out="$(cli FT.SEARCH idx "shuttle" DIALECT 2)" || true
+    search_out="$(cli FT.SEARCH idx "nau" DIALECT 2)" || true
     echo "$search_out" | grep -q "doc:1" && break
     sleep 0.2
 done
 echo "$search_out" | grep -q "doc:1" || die "FT.SEARCH did not return doc:1: $search_out"
-pass "FT.SEARCH 'shuttle' -> doc:1 (module indexed and matched)"
+pass "FT.SEARCH 'nau' -> doc:1 (module indexed and matched)"
 
 info_out="$(cli FT.INFO idx)"
 echo "$info_out" | grep -q "idx" || die "FT.INFO returned nothing usable: $info_out"

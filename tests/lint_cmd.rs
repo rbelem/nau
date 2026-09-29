@@ -1,4 +1,4 @@
-//! `shuttle lint` integration tests (issue #53).
+//! `nau lint` integration tests (issue #53).
 //!
 //! Drives the real binary over the real eval path: the examples battery
 //! must pass clean (no error findings), rejected declaration values must
@@ -15,9 +15,9 @@ fn repo_root() -> &'static str {
 }
 
 fn run_lint(cwd: &str, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("lint").args(args).current_dir(cwd);
-    let out = cmd.output().expect("failed to spawn shuttle lint");
+    let out = cmd.output().expect("failed to spawn nau lint");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -82,7 +82,7 @@ fn walk_lua(dir: &Path) -> Vec<std::path::PathBuf> {
 fn lint_rejected_bootloader_type_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 return {
     rootfs = image {
@@ -95,7 +95,7 @@ return {
 "#,
     )
     .unwrap();
-    let file = dir.path().join("shuttle.lua");
+    let file = dir.path().join("nau.lua");
     let (code, stdout, stderr) = lint_file(repo_root(), file.to_str().unwrap());
     assert_eq!(code, Some(1), "stdout: {stdout}\nstderr: {stderr}");
     let report = format!("{stdout}{stderr}");
@@ -111,7 +111,7 @@ return {
 fn lint_warning_does_not_gate_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 return {
     rootfs = image {
@@ -130,7 +130,7 @@ return {
 "#,
     )
     .unwrap();
-    let file = dir.path().join("shuttle.lua");
+    let file = dir.path().join("nau.lua");
     let (code, stdout, stderr) = lint_file(repo_root(), file.to_str().unwrap());
     assert_eq!(
         code,
@@ -150,7 +150,7 @@ return {
 fn lint_json_report_shape() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         r#"
 return {
     rootfs = image {
@@ -163,7 +163,7 @@ return {
 "#,
     )
     .unwrap();
-    let file = dir.path().join("shuttle.lua");
+    let file = dir.path().join("nau.lua");
     let (code, stdout, _) = run_lint(repo_root(), &["--file", file.to_str().unwrap(), "--json"]);
     assert_eq!(code, Some(1));
     let report: serde_json::Value = serde_json::from_str(&stdout)

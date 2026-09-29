@@ -17,7 +17,7 @@
 #   - commit-point property: a failed publish never appends the stamp
 #
 # NOT proven here (operator-gated, recorded in #275): the remote-ssh
-# path ([user@]host targets) and a live `shuttle pull` from
+# path ([user@]host targets) and a live `nau pull` from
 # https://cache.nau.rclb.dev/ — both unblock when the Nau host exists.
 
 set -euo pipefail

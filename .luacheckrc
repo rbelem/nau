@@ -1,12 +1,12 @@
--- luacheck configuration for the shuttle recipe corpus.
+-- luacheck configuration for the nau recipe corpus.
 --
 -- Recipes under pkgs/ are Lua 5.4 modules returning a single table
--- literal. The shuttle eval prelude (src/shuttle-prelude.d.luau) injects
+-- literal. The nau eval prelude (src/nau-prelude.d.luau) injects
 -- the DSL globals at runtime — snap, merge, pin, index, app, image,
 -- node, fetch — so luacheck sees them as provided globals, matching the
 -- typed prelude one-for-one.
 --
--- src/shuttle-prelude.d.luau is NOT lintable here: it is Luau (declare
+-- src/nau-prelude.d.luau is NOT lintable here: it is Luau (declare
 -- statements, type annotations) and luacheck's parser rejects it
 -- ("expected '=' near 'snap'" at the first declare). It is covered by
 -- stylua (syntax = "All") and the check-stage Luau gate instead.
@@ -33,5 +33,5 @@ globals = {
 }
 
 exclude_files = {
-    "src/shuttle-prelude.d.luau",
+    "src/nau-prelude.d.luau",
 }

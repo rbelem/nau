@@ -5,11 +5,11 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use shuttle::isolate::{self, CheckRequest, EvalRequest, SourceResolver, WorkerOutcome};
+use nau::isolate::{self, CheckRequest, EvalRequest, SourceResolver, WorkerOutcome};
 
 fn request(label: &str, source: &str) -> EvalRequest {
     EvalRequest {
-        prelude: shuttle::dsl::INIT_LUA.to_string(),
+        prelude: nau::dsl::INIT_LUA.to_string(),
         index_data: serde_json::json!({ "version": 1, "snaps": [] }),
         arch: "amd64".into(),
         sources: BTreeMap::new(),
@@ -59,7 +59,7 @@ fn attack_dot_prefix_name_cannot_reach_absolute_decoy() {
     let entry_dir = tempfile::tempdir().unwrap();
     let label = entry_dir
         .path()
-        .join("shuttle.lua")
+        .join("nau.lua")
         .to_str()
         .unwrap()
         .to_string();
@@ -95,12 +95,7 @@ fn attack_symlink_escape_from_inside_root() {
     // directory symlink escaping the root
     std::os::unix::fs::symlink(&outside_canon, root.path().join("linkdir")).unwrap();
 
-    let label = root
-        .path()
-        .join("shuttle.lua")
-        .to_str()
-        .unwrap()
-        .to_string();
+    let label = root.path().join("nau.lua").to_str().unwrap().to_string();
     let src = r#"
 local results = {}
 local function try(n)
@@ -341,12 +336,7 @@ fn attack_colluding_requires_cannot_extract_outside_content() {
         r#"return { evil = "../secret", evil2 = "." .. "./secret", evil3 = string.char(46,46,47) .. "secret" }"#,
     )
     .unwrap();
-    let label = root
-        .path()
-        .join("shuttle.lua")
-        .to_str()
-        .unwrap()
-        .to_string();
+    let label = root.path().join("nau.lua").to_str().unwrap().to_string();
 
     let src = r#"
 local c = require("collud")           -- legitimate in-root require, returns attacker data
@@ -544,7 +534,7 @@ fn attack_worker_process_observations() {
 // ── Attack 9: direct protocol abuse — hand-crafted lines to __eval-worker ──
 #[test]
 fn attack_raw_protocol_via_stdin() {
-    let bin = std::env::var("CARGO_BIN_EXE_shuttle").expect("cargo-provided binary");
+    let bin = std::env::var("CARGO_BIN_EXE_nau").expect("cargo-provided binary");
     let scratch = tempfile::tempdir().unwrap();
 
     let req = serde_json::json!({
@@ -596,12 +586,7 @@ fn attack_resolver_hostile_names() {
     std::fs::write(&secret, "return { leaked = 'PASSWORD' }").unwrap();
 
     let root = tempfile::tempdir().unwrap();
-    let label = root
-        .path()
-        .join("shuttle.lua")
-        .to_str()
-        .unwrap()
-        .to_string();
+    let label = root.path().join("nau.lua").to_str().unwrap().to_string();
     let resolver = SourceResolver::for_build(&label);
 
     let abs_dotted = dotted_abs(&secret);
@@ -637,7 +622,7 @@ fn check_request(label: &str, source: &str) -> CheckRequest {
         label: label.to_string(),
         entry: source.to_string(),
         sources: BTreeMap::new(),
-        time_limit_secs: Some(shuttle::analysis::ANALYZER_TIME_LIMIT_SECS),
+        time_limit_secs: Some(nau::analysis::ANALYZER_TIME_LIMIT_SECS),
     }
 }
 
@@ -756,7 +741,7 @@ fn attack_hot_comment_downgrade_rejected_through_worker() {
 /// writable file sitting in /tmp must NOT be require()-able.
 #[test]
 fn attack_embedded_pkg_resolver_root_is_private_tmpdir_not_tmp() {
-    let label = shuttle::pkg_source::materialize_embedded(
+    let label = nau::pkg_source::materialize_embedded(
         "return { default = snap { name = \"embedded\", version = \"1\" } }",
     )
     .expect("embedded materialization must succeed");

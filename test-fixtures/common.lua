@@ -4,7 +4,7 @@
 return {
     name = "app-template",
     version = "0.1.0",
-    summary = "A snap built with shuttle",
+    summary = "A snap built with nau",
     grade = "stable",
     confinement = "strict",
     apps = {

@@ -8,7 +8,7 @@
 -- (outside the sandbox, which stays net-unshared), extracted into a
 -- `cargo vendor`-equivalent tree, and stored as one content-addressed
 -- pod-store blob. The sandbox build consumes it OFFLINE: a source
--- replacement config points cargo at the mounted `$SHUTTLE_DEPS_DIR`
+-- replacement config points cargo at the mounted `$NAU_DEPS_DIR`
 -- vendor tree and `CARGO_NET_OFFLINE=true` makes hermeticity explicit.
 --
 -- build_deps: none — cargo/rustc resolve from the host toolchain
@@ -48,12 +48,12 @@ return {
             -- Cargo offline wiring (issue #36): a writable CARGO_HOME on
             -- the sandbox's /tmp tmpfs plus a source replacement pointing
             -- at the mounted, hash-verified vendor closure.
-            "export CARGO_HOME=/tmp/shuttle-cargo-home CARGO_NET_OFFLINE=true",
+            "export CARGO_HOME=/tmp/nau-cargo-home CARGO_NET_OFFLINE=true",
             'mkdir -p "$CARGO_HOME"',
-            'printf \'[source.crates-io]\\nreplace-with = "shuttle-vendored"\\n\\n[source.shuttle-vendored]\\ndirectory = "%s"\\n\' "$SHUTTLE_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
+            'printf \'[source.crates-io]\\nreplace-with = "nau-vendored"\\n\\n[source.nau-vendored]\\ndirectory = "%s"\\n\' "$NAU_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
             -- statix is a virtual workspace (root Cargo.toml carries only
             -- [workspace]); the installable package is the bin/ member.
-            "$SHUTTLE_BUILD_PREFIX/usr/bin/cargo install --path $SRC/bin --root $STAGE",
+            "$NAU_BUILD_PREFIX/usr/bin/cargo install --path $SRC/bin --root $STAGE",
         }, " && "),
 
         type = "source",

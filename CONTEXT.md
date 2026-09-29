@@ -1,4 +1,4 @@
-# shuttle
+# nau
 
 A Rust CLI that builds Snap packages from Lua declarations — like Nix for Snapcraft. Formerly named *shoot* (renamed 2026-08, ADR-0013).
 
@@ -7,10 +7,10 @@ A Rust CLI that builds Snap packages from Lua declarations — like Nix for Snap
 **Snap**: A self-contained Linux application package (`.snap` file) installable by `snapd`.
 _Avoid_: AppImage, Flatpak, container image
 
-**shuttle.lua**: The entry-point configuration file. Returns a table of named snap outputs.
+**nau.lua**: The entry-point configuration file. Returns a table of named snap outputs.
 _Avoid_: config file, manifest, snapcraft.yaml
 
-**Snap output**: One named snap declaration inside a `shuttle.lua`. Single-snap projects use the `default` key; multi-output projects name them (`server`, `cli`).
+**Snap output**: One named snap declaration inside a `nau.lua`. Single-snap projects use the `default` key; multi-output projects name them (`server`, `cli`).
 _Avoid_: target, artifact, build product
 
 **Package**: A static snap definition — either single-file (`pkgs/<letter>/<name>.lua`) or directory (`pkgs/<letter>/<name>/init.lua`).
@@ -18,7 +18,7 @@ _Avoid_: recipe, formula, formula file
 
 **Package type**: `source` (build from upstream tarball), `meta` (dependency group, no build), `store` (pulled from Snap Store, no local source).
 
-**Input**: A package source declaration, inspired by Nix flake inputs. URL schemes: `github:user/repo[/branch]` (shallow-cloned to `~/.cache/shuttle/inputs/`) or `path:/local/dir` (local filesystem). Declared as a Lua global before the return statement in `shuttle.lua`, or per-snap via `inputs` on a `snap()` declaration. If no inputs are declared, a default `github:rbelem/shuttle/main` is used at runtime. A github input may declare `submodules` — `true` (every `.gitmodules` entry) or a list of entry names/paths — materializing each declared submodule at the parent pin's gitlink and recording its commit in the lockfile (see ADR-0029).
+**Input**: A package source declaration, inspired by Nix flake inputs. URL schemes: `github:user/repo[/branch]` (shallow-cloned to `~/.cache/nau/inputs/`) or `path:/local/dir` (local filesystem). Declared as a Lua global before the return statement in `nau.lua`, or per-snap via `inputs` on a `snap()` declaration. If no inputs are declared, a default `github:rbelem/nau/main` is used at runtime. A github input may declare `submodules` — `true` (every `.gitmodules` entry) or a list of entry names/paths — materializing each declared submodule at the parent pin's gitlink and recording its commit in the lockfile (see ADR-0029).
 _Avoid_: registry, flake, source declaration
 
 **Toolchain**: A meta-package (`type = "meta"`) that aggregates compiler, linker, and runtime libraries needed to build source packages. Named by GNU triplet: `toolchain-<compiler>-<libc>-<arch>`.
@@ -35,7 +35,7 @@ _Avoid_: cross-compile setup, toolchain init
 **Package index**: The `package-index.json` file mapping snap names to store pins or source definitions. Queried by the `index()` DSL function.
 _Avoid_: registry, catalog, database
 
-**Requires**: A package's runtime dependencies, declared as a string array in the `snap()` table. Everything listed enters the runtime closure (pod/generation) transitively; resolved by `shuttle deps` and `shuttle build --all`. A package that links a library at build time lists it here *and* in `build_deps` — the explicit-duplication norm (Gentoo DEPEND/RDEPEND, conda host/run).
+**Requires**: A package's runtime dependencies, declared as a string array in the `snap()` table. Everything listed enters the runtime closure (pod/generation) transitively; resolved by `nau deps` and `nau build --all`. A package that links a library at build time lists it here *and* in `build_deps` — the explicit-duplication norm (Gentoo DEPEND/RDEPEND, conda host/run).
 _Avoid_: depends, deps, links, build dependencies
 
 **Build dependency**: A package's build-time-only dependencies, declared as `build_deps` in the `snap()` table. Visible inside the build sandbox for the duration of the build; never enters the runtime closure. Compilers, pkg-config, codegen tools, and build-time-only libraries are build dependencies (ADR-0018).
@@ -47,19 +47,19 @@ _Avoid_: makedepends, nativeBuildInputs, build requires
 
 **Image**: A bootable disk image (`.img`) assembled from multiple snaps — base, kernel, gadget, and application snaps. Declared via the `image()` DSL function.
 
-**Nau**: The Linux distribution assembled by shuttle — an immutable verity-protected base updated via A/B, plus a content-addressed package store on the state partition (ADR-0011/0012). The ship the missions launch from: releases carry mission names, 1.0 is "Cassini".
+**Nau**: The Linux distribution assembled by nau — an immutable verity-protected base updated via A/B, plus a content-addressed package store on the state partition (ADR-0011/0012). The ship the missions launch from: releases carry mission names, 1.0 is "Cassini".
 _Avoid_: shoot distro, shuttle distro, ShuttleOS, Cassini (as the distro name — it is release 1.0)
 
-**Store**: The content-addressed, file-level repository of package content — local build cache (`~/.cache/shuttle/`) and on-device under the state partition. Packages are signed manifests of store file hashes, not monolithic blobs (ADR-0012).
+**Store**: The content-addressed, file-level repository of package content — local build cache (`~/.cache/nau/`) and on-device under the state partition. Packages are signed manifests of store file hashes, not monolithic blobs (ADR-0012).
 _Avoid_: cache, registry, spool
 
-**Node**: A shuttle instance configured for sharing via the `node {}` declaration in `shuttle.lua` (ADR-0033). A node serves its store (signed manifests + blobs) and pulls from peers. Absent `node {}`, a shuttle install is not a node and opens no sockets.
+**Node**: A nau instance configured for sharing via the `node {}` declaration in `nau.lua` (ADR-0033). A node serves its store (signed manifests + blobs) and pulls from peers. Absent `node {}`, a nau install is not a node and opens no sockets.
 _Avoid_: master, server, hub, seed
 
-**Peer**: Another shuttle node on the network — discovered via mDNS (`_shuttle._tcp`) on the LAN or addressed explicitly (`shuttle://host:port/<pkg>`). Discovery confers no trust; a peer's content is accepted only when its signed manifest verifies against the local trusted-key set (ADR-0024, ADR-0033). The first entry of `node {}.peers` is the *origin peer*: the default pull source, a hint like a git remote named `origin`, never a privilege.
+**Peer**: Another nau node on the network — discovered via mDNS (`_nau._tcp`) on the LAN or addressed explicitly (`nau://host:port/<pkg>`). Discovery confers no trust; a peer's content is accepted only when its signed manifest verifies against the local trusted-key set (ADR-0024, ADR-0033). The first entry of `node {}.peers` is the *origin peer*: the default pull source, a hint like a git remote named `origin`, never a privilege.
 _Avoid_: master, remote, replica
 
-**Export tree**: The static, servable-by-any-web-server image of a shareable store — `index.json`, `manifests/<pkg>.json`, `blobs/<sha256>` — written by `shuttle export` and pulled via plain `http(s)://` references (ADR-0033 Decision 10). A frozen export tree is a cold peer: same manifests, same signatures, no announce.
+**Export tree**: The static, servable-by-any-web-server image of a shareable store — `index.json`, `manifests/<pkg>.json`, `blobs/<sha256>` — written by `nau export` and pulled via plain `http(s)://` references (ADR-0033 Decision 10). A frozen export tree is a cold peer: same manifests, same signatures, no announce.
 _Avoid_: mirror site, repo, download page
 
 **Generation**: A pinned selection of base-image version + package set + configuration that boots as one unit. Rollback means booting a previous generation; GC is rooted at generations (ADR-0012).
@@ -68,28 +68,28 @@ _Avoid_: profile, snapshot, deployment
 **State partition**: The persistent, non-verity partition that survives A/B flips — mounted at `/var/lib`, holding the store, extension links, and device identity. Everything else under `/var` is volatile (tmpfs + tmpfiles). Declared as a partition with `role = "state"` (native) or `"system-data"` (UC). (ADR-0023)
 _Avoid_: data partition, writable partition, persistent volume
 
-**Boot assessment**: The try-boot mechanism that marks a booted generation good via `boot-complete.target` and reverts after `TriesLeft` is exhausted. Stock systemd (`systemd-bless-boot`), not shuttle-owned logic. (ADR-0024)
+**Boot assessment**: The try-boot mechanism that marks a booted generation good via `boot-complete.target` and reverts after `TriesLeft` is exhausted. Stock systemd (`systemd-bless-boot`), not nau-owned logic. (ADR-0024)
 _Avoid_: health check, boot verification, watchdog
 
 **Key ceremony**: Generating, rotating (minting and promoting a new key), and revoking signing keys, plus distributing the trusted key set to devices so revoked keys are refused at install/update time. (ADR-0024)
 _Avoid_: key management, PKI
 
-**Image manifest**: The flat, serializable, signed result of evaluating `image()` — partitions, UKI/roothash digests, package lists. The shuttle-side analog of a model assertion (ADR-0011).
+**Image manifest**: The flat, serializable, signed result of evaluating `image()` — partitions, UKI/roothash digests, package lists. The nau-side analog of a model assertion (ADR-0011).
 _Avoid_: model assertion, lockfile (the lockfile pins *inputs*; the manifest describes the *system*)
 
 **Mission image**: The published, whole-disk artifact of one release — `nau-<mission>-<version>-<arch>.img` plus `SHA256SUMS` and the signed image manifest. What users download and flash; what released machines update against. (ADR-0044)
 _Avoid_: installer, ISO, release build
 
-**Install**: An on-device operation that adds a package to the store and the current generation without mutating the base (`shuttle install`, ADR-0012).
+**Install**: An on-device operation that adds a package to the store and the current generation without mutating the base (`nau install`, ADR-0012).
 _Avoid_: snap install, layering
 
 **Flash**: Installing Nau on bare metal by writing a mission image to a whole disk. Install copies bytes; it never lays out partitions, re-derives a roothash, or signs. Trust is established at download (SHA256SUMS + signed manifest), not on the device. (ADR-0044)
 _Avoid_: install (that is the package operation), burn, image write
 
-**Verify-image**: The read-only, unprivileged proof that a flashed target still matches its signed image manifest — `shuttle verify-image --device <by-id path>` reads the target's GPT and verity hash regions, recomputes them against the manifest, and refuses by name on any mismatch. The write itself stays documented `dd`; this verb has no write path. (ADR-0044)
+**Verify-image**: The read-only, unprivileged proof that a flashed target still matches its signed image manifest — `nau verify-image --device <by-id path>` reads the target's GPT and verity hash regions, recomputes them against the manifest, and refuses by name on any mismatch. The write itself stays documented `dd`; this verb has no write path. (ADR-0044)
 _Avoid_: installer, integrity check (that is the update-time half), disk doctor
 
-**Pod**: A named user-level package selection owned by one user; the small shuttle served by the system mothership. Each pod has its own packages, overlays, lockfile, and generation chain; rollback switches that pod only.
+**Pod**: A named user-level package selection owned by one user; the small nau served by the system mothership. Each pod has its own packages, overlays, lockfile, and generation chain; rollback switches that pod only.
 _Avoid_: global, profile, environment
 
 **Pod generation**: A pinned selection of one pod's packages + overlays + loaded pods at one point in time. Rollback switches that pod's `current` link only; it never reboots or touches system generations.
@@ -98,7 +98,7 @@ _Avoid_: system generation, snapshot
 **Package line**: A version line of one package name, selected by declaring `name@constraint` (e.g. `node@22`) — the constraint threads into recipe evaluation and the one recipe builds whichever line the pod pins. One version of a name per pod, permanently; a second line coexists in another pod, never in the same one. (ADR-0047)
 _Avoid_: slot, instance, variant, channel, alternative, versioned formula, parallel install, suffixed sibling (the `node22` anti-pattern)
 
-**Pod service**: A long-running process declared by a package (`services = { … }`, options + defaults) and overridden per pod (`pod {}` options, `enabled` explicit), emitted into the generation by the services emitter through a backend — systemd user unit, launchd agent, or packaged-supervisor config (portable hosts) — pod-namespaced in each; `shuttle pod sync` activates by diff-and-restart. Declared, never verb-managed; the host manager's own CLI is the ad-hoc control surface. (ADR-0032)
+**Pod service**: A long-running process declared by a package (`services = { … }`, options + defaults) and overridden per pod (`pod {}` options, `enabled` explicit), emitted into the generation by the services emitter through a backend — systemd user unit, launchd agent, or packaged-supervisor config (portable hosts) — pod-namespaced in each; `nau pod sync` activates by diff-and-restart. Declared, never verb-managed; the host manager's own CLI is the ad-hoc control surface. (ADR-0032)
 _Avoid_: service verb, daemon verb (for the declared surface; "supervisor" and "process manager" name the portable backend's runtime, not the service)
 
 **Secret reference**: A declared `{ source = "…", … }` table in `pod.lua` (`secrets = { KEY = { … } }`) naming a credential without carrying it: generations pin references, never values, and resolution happens at serve time. (ADR-0042)
@@ -106,7 +106,7 @@ _Avoid_: credential store
 
 **Secret source**: A built-in provider from the compiled-in registry that resolves a secret reference at serve time: `bitwarden`, `vault`, `libsecret`, `exec`, `env`. New providers grow the registry; `exec` argv covers the long tail. (ADR-0042)
 
-**Secrets cache**: The session-scoped tmpfs record of resolved values at `$XDG_RUNTIME_DIR/shuttle/secrets/<pod>/<decl-hash>.json` (0600); the cache key drops the generation on purpose (a rollback must not serve a dead generation's values), and `pod secrets refresh` busts it. (ADR-0042)
+**Secrets cache**: The session-scoped tmpfs record of resolved values at `$XDG_RUNTIME_DIR/nau/secrets/<pod>/<decl-hash>.json` (0600); the cache key drops the generation on purpose (a rollback must not serve a dead generation's values), and `pod secrets refresh` busts it. (ADR-0042)
 _Avoid_: secret store
 
 **Overlay**: An inline, code-only patch to an existing package declaration inside `pod.lua`, layered over `pkgs/` and loaded pods. Later layers win; upstream files are never modified.
@@ -121,21 +121,21 @@ _Avoid_: interfaces, permissions, capabilities
 **Pod isolation**: The execution boundary every process of a pod runs inside — `run` forms, services, shells, and unconfined apps alike. Three levels: `host` (processes run directly on the host; the default), `sandbox` (one bubblewrap boundary around the whole pod, fail-closed, with pod-scoped grants), and `machine` (a microVM boundary with its own guest kernel, driven through smolvm, fail-closed without KVM). Distinct from per-app confinement and from the build sandbox. (ADR-0038)
 _Avoid_: pod sandbox, full sandbox, VM pod, sandboxed environment
 
-**Worker**: A machine shuttle drives over SSH to execute build jobs offloaded from a local build (ADR-0040). Operator-controlled, stateless beyond its own cache, reachable only coordinator-initiated. Absent a `workers = { … }` declaration, no Worker exists and nothing remote happens. Each entry's `host_key` pin is the host CA's `SHA256:` fingerprint (`shuttle ca list`); the coordinator enforces it as a `@cert-authority` known_hosts entry bound to the worker's certificate principal (ADR-0045 amendment, #295).
+**Worker**: A machine nau drives over SSH to execute build jobs offloaded from a local build (ADR-0040). Operator-controlled, stateless beyond its own cache, reachable only coordinator-initiated. Absent a `workers = { … }` declaration, no Worker exists and nothing remote happens. Each entry's `host_key` pin is the host CA's `SHA256:` fingerprint (`nau ca list`); the coordinator enforces it as a `@cert-authority` known_hosts entry bound to the worker's certificate principal (ADR-0045 amendment, #295).
 _Avoid_: node, peer, farm, builder, agent, remote
 
 **Job manifest**: The content-addressed description of one package build dispatched to a Worker — recipe slice, lockfile pin slice, full closure list, toolchain identity, target arch, epoch, protocol version (ADR-0040). Its canonical-bytes SHA-256 is the job identity and the remote result's cache identity.
 _Avoid_: task, work item
 
-**Coordinator**: The `shuttle build` process scheduling a build across executors — local threads plus any declared Workers (ADR-0040). Not a role, verb, or daemon; it exists only while the build runs.
+**Coordinator**: The `nau build` process scheduling a build across executors — local threads plus any declared Workers (ADR-0040). Not a role, verb, or daemon; it exists only while the build runs.
 _Avoid_: master, server, orchestrator
 
 ## Flagged ambiguities
 
-- **"Build"** can mean: (a) the `shuttle build` CLI command, (b) a source package's compile step (`snap { build = "..." }`), or (c) the build sandbox environment. Use "build command", "build script", and "build sandbox" respectively.
+- **"Build"** can mean: (a) the `nau build` CLI command, (b) a source package's compile step (`snap { build = "..." }`), or (c) the build sandbox environment. Use "build command", "build script", and "build sandbox" respectively.
 - **"Sandbox"** can mean: (a) the build-time *build sandbox* (bubblewrap, ADR-0004), or (b) runtime *confinement* (level applied to the installed app). They are different axes; use "build sandbox" and "confinement" to disambiguate. The pod-level boundary is named *pod isolation*; prefer naming the level (`host`/`sandbox`/`machine`) over the bare word "sandboxed".
 - **"Package"** can refer to a Lua declaration in `pkgs/` or to the Snap Store concept of a snap. Use "package index entry" or "store snap" to disambiguate.
-- **"Worker"** can mean: (a) a build-farm machine shuttle drives over SSH (ADR-0040), (b) the eval/check child-process types in `isolate.rs`/`cli.rs`, or (c) a scheduler pool thread. The machine sense is the glossary term; qualify the others ("eval worker process", "local build slot") when prose must touch them.
+- **"Worker"** can mean: (a) a build-farm machine nau drives over SSH (ADR-0040), (b) the eval/check child-process types in `isolate.rs`/`cli.rs`, or (c) a scheduler pool thread. The machine sense is the glossary term; qualify the others ("eval worker process", "local build slot") when prose must touch them.
 
 ## Example dialogue
 
@@ -153,11 +153,11 @@ _Avoid_: master, server, orchestrator
 
 **Dev**: How do I build an entire system image from these?
 
-**Domain expert**: Write an `image()` declaration with a base snap, kernel, gadget, and any extra snaps. `shuttle image shuttle.lua` resolves everything from the Snap Store, extracts the base as a rootfs, merges kernel modules, and packs the result into a SquashFS `.img`.
+**Domain expert**: Write an `image()` declaration with a base snap, kernel, gadget, and any extra snaps. `nau image nau.lua` resolves everything from the Snap Store, extracts the base as a rootfs, merges kernel modules, and packs the result into a SquashFS `.img`.
 
-**Dev**: The default input fetches from `github:rbelem/shuttle/main`. Can I use a different repo?
+**Dev**: The default input fetches from `github:rbelem/nau/main`. Can I use a different repo?
 
-**Domain expert**: Set a global `inputs` table at the top of your `shuttle.lua`:
+**Domain expert**: Set a global `inputs` table at the top of your `nau.lua`:
 ```lua
 inputs = {
     mypkgs = { url = "github:myorg/mypackages/main" },
@@ -171,10 +171,10 @@ inputs = {
 ```
 Per-snap inputs work the same way, declared inside a `snap()` table.
 
-**Dev**: What if I don't have a `shuttle.lua` at all?
+**Dev**: What if I don't have a `nau.lua` at all?
 
-**Domain expert**: `shuttle build hello` auto-fetches the default input (`github:rbelem/shuttle/main`) on first run. It's cached in `~/.cache/shuttle/inputs/`. Run `shuttle index update` to refresh.
+**Domain expert**: `nau build hello` auto-fetches the default input (`github:rbelem/nau/main`) on first run. It's cached in `~/.cache/nau/inputs/`. Run `nau index update` to refresh.
 
 **Dev**: My team builds the same packages on five machines. Do I need a registry to share them?
 
-**Domain expert**: No. Declare a `node {}` in each `shuttle.lua` and run `shuttle serve`. Peers find each other over mDNS on the LAN and pull verified store content directly. There is no master; a package is accepted only if its signed manifest verifies against your trusted keys.
+**Domain expert**: No. Declare a `node {}` in each `nau.lua` and run `nau serve`. Peers find each other over mDNS on the LAN and pull verified store content directly. There is no master; a package is accepted only if its signed manifest verifies against your trusted keys.

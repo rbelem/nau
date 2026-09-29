@@ -34,13 +34,13 @@
 //! keeps billing its disks. Azure spot pricing is variable like AWS's,
 //! so the cap is REQUIRED with `--spot` — an uncapped bid is not a cap
 //! (GCP preemptibles are fixed-price and refuse `--max-price`; azure
-//! follows the aws pairing). A `shuttle-worker-spot` tag names the
+//! follows the aws pairing). A `nau-worker-spot` tag names the
 //! eviction class on the VM.
 //!
 //! Region discipline: provision's `--location` IS the Azure region. A
 //! VM is created inside its resource group's region (`az vm create`
 //! carries no `--location`), so provision first ensures the per-region
-//! `shuttle-workers-<location>` group exists (`az group create` is
+//! `nau-workers-<location>` group exists (`az group create` is
 //! idempotent) and every create-path call carries `--resource-group`.
 //! Destroy resolves the group by listing — the destroy verb carries no
 //! location: `az vm list` finds the VM by name anywhere in the
@@ -68,24 +68,24 @@ use crate::provision::{
     Provisioner, UserDataParams, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
 };
 
-/// The worker presence tag shuttle stamps at create time — the key
+/// The worker presence tag nau stamps at create time — the key
 /// shared with the #269 v2 TTL contract (Hetzner writer, cross-provider
-/// vocabulary): presence marks the VM as a shuttle worker. The value is
+/// vocabulary): presence marks the VM as a nau worker. The value is
 /// `true` (presence semantics; expiry rides the TTL tag only).
-pub const WORKER_TAG: &str = "shuttle-worker";
+pub const WORKER_TAG: &str = "nau-worker";
 
 /// The TTL tag: expiry in EPOCH SECONDS UTC, set AT CREATE — the source
 /// of truth of the #269 v2 contract (the in-guest marker is a fallback
-/// COPY). The same decimal shape the `shuttle-worker-ttl` hcloud label
+/// COPY). The same decimal shape the `nau-worker-ttl` hcloud label
 /// carries; the sweep's `is_epoch` parses decimal only. (The sweep
 /// itself is hcloud-only today — #287; the same gap applies to azure.)
-pub const WORKER_TTL_TAG: &str = "shuttle-worker-ttl";
+pub const WORKER_TTL_TAG: &str = "nau-worker-ttl";
 
 /// The spot tag, present (`true`) only on `--spot` VMs: names the
 /// eviction class (T5 worker loss, ADR-0040 Amendment 1) so
 /// operator-side tooling can tell an interruptible lane from an
 /// on-demand one.
-pub const WORKER_SPOT_TAG: &str = "shuttle-worker-spot";
+pub const WORKER_SPOT_TAG: &str = "nau-worker-spot";
 
 /// The worker base image (providers plan §3, ADR-0046): the LATEST
 /// Ubuntu LTS — the contract pins "latest LTS", never a codename — as
@@ -98,10 +98,10 @@ pub const WORKER_SPOT_TAG: &str = "shuttle-worker-spot";
 pub const IMAGE_URN: &str = "Canonical:ubuntu-26_04-lts:ubuntu-2604-lts-amd64:latest";
 
 /// The resource-group prefix; the group is per-region
-/// (`shuttle-workers-<location>`) because a VM's region is its group's
+/// (`nau-workers-<location>`) because a VM's region is its group's
 /// region. Created (idempotently) at provision; NEVER deleted at
 /// destroy — the group may hold operator resources.
-pub const RESOURCE_GROUP_PREFIX: &str = "shuttle-workers";
+pub const RESOURCE_GROUP_PREFIX: &str = "nau-workers";
 
 /// The `az vm create --admin-username`. The shared template authorizes
 /// root (key-only), so the admin user is a CLI-required artifact that
@@ -116,10 +116,10 @@ pub struct AzureProvisioner<R: CommandRunner> {
     /// no-credentials refusal path, checked before any API call. The
     /// credential itself never enters argv; the az CLI inherits it.
     credentials: Option<String>,
-    /// The pinned shuttle binary URL the template installs.
+    /// The pinned nau binary URL the template installs.
     binary_url: String,
     /// The operator's authorized public-key line (login), resolved at
-    /// the CLI boundary (`SHUTTLE_OPERATOR_KEY` / default key halves) so
+    /// the CLI boundary (`NAU_OPERATOR_KEY` / default key halves) so
     /// the core stays env-free under test.
     operator_key: String,
     /// The coordinator publish channel (callback URL + ceremony home) —
@@ -270,7 +270,7 @@ impl<R: CommandRunner> Provisioner for AzureProvisioner<R> {
             return Err(miette::miette!(
                 "provision: {e:#} — deleted {torn_down} created VM(s), config untouched; \
                  FAILED to delete {} — it is still running and billing; delete it with \
-                 'shuttle workers destroy' or by hand",
+                 'nau workers destroy' or by hand",
                 stuck.join(", ")
             ));
         }
@@ -526,7 +526,7 @@ impl<R: CommandRunner> AzureProvisioner<R> {
 
     /// Post-delete residual check: `az vm delete` leaves the VM's NIC
     /// and public IP behind (public IPs bill). Name them — they were
-    /// created for this VM but shuttle never removes resources it
+    /// created for this VM but nau never removes resources it
     /// cannot attribute beyond doubt.
     fn warn_orphans(&self, rg: &str, name: &str) -> miette::Result<()> {
         let nics = self.unattached_names(
@@ -616,10 +616,10 @@ fn validate_spot(req: &ProvisionRequest) -> miette::Result<()> {
     }
 }
 
-/// The `--tags` value: the `shuttle-worker` presence tag, the
-/// `shuttle-worker-ttl` epoch-seconds EXPIRY (the #269 v2 contract —
+/// The `--tags` value: the `nau-worker` presence tag, the
+/// `nau-worker-ttl` epoch-seconds EXPIRY (the #269 v2 contract —
 /// the source of truth the sweep reads — set AT CREATE), and
-/// `shuttle-worker-spot` on spot VMs. One argv element (the az
+/// `nau-worker-spot` on spot VMs. One argv element (the az
 /// space-separated convention), no shell.
 fn tags(req: &ProvisionRequest, expiry_epoch: u64) -> String {
     let mut t = vec![
@@ -632,7 +632,7 @@ fn tags(req: &ProvisionRequest, expiry_epoch: u64) -> String {
     t.join(" ")
 }
 
-/// The per-region resource group: `shuttle-workers-<location>`. A VM's
+/// The per-region resource group: `nau-workers-<location>`. A VM's
 /// region is its group's region, so this is the shape `--location`
 /// takes on the wire.
 fn resource_group(location: &str) -> String {
@@ -647,7 +647,7 @@ fn address_for(ip: &str) -> String {
     format!("ssh://root@{ip}")
 }
 
-/// `shuttle-worker-<hex nanos>-<NN>` — unique per subscription; the
+/// `nau-worker-<hex nanos>-<NN>` — unique per subscription; the
 /// prefix mirrors the tag key, so name and tags read as one identity. The
 /// name doubles as the machine identity the one-time publish token binds.
 fn instance_name(i: u32) -> String {
@@ -655,7 +655,7 @@ fn instance_name(i: u32) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("shuttle-worker-{nanos:x}-{:02}", i + 1)
+    format!("nau-worker-{nanos:x}-{:02}", i + 1)
 }
 
 fn print_plan(plan: &ProvisionPlan, spot: bool) {

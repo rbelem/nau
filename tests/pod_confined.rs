@@ -1,13 +1,13 @@
-//! `shuttle run` confined-runtime integration tests (ticket #11).
+//! `nau run` confined-runtime integration tests (ticket #11).
 //!
 //! A package declared `confined` runs inside a backend sandbox with
-//! declared grants, launched via a `shuttle run <app>` interposing
+//! declared grants, launched via a `nau run <app>` interposing
 //! launcher. The farm's `current/bin/<app>` symlink points at a wrapper
-//! that invokes `shuttle run` (transparent — `which`/PATH stay truthful);
-//! `shuttle run` sets up the sandbox then execs the app.
+//! that invokes `nau run` (transparent — `which`/PATH stay truthful);
+//! `nau run` sets up the sandbox then execs the app.
 //!
 //! Drives the real binary end to end through the FULL chain (confined
-//! pod add → farm → `shuttle run` → confined-executes with grants), all
+//! pod add → farm → `nau run` → confined-executes with grants), all
 //! state in tempdirs. Same gating + loopback-source server patterns as
 //! `tests/pod_install.rs`. The happy path runs the bwrap backend (the
 //! test environment provides bubblewrap + unprivileged userns); the
@@ -153,17 +153,17 @@ fn run(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66); explicit
     // per-call env overrides below still win.
-    cmd.env("SHUTTLE_SYSTEMD", "off");
+    cmd.env("NAU_SYSTEMD", "off");
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -171,19 +171,19 @@ fn run(
     )
 }
 
-/// Run `shuttle run <app>` directly (the launcher's exec target).
-fn run_shuttle_run(
+/// Run `nau run <app>` directly (the launcher's exec target).
+fn run_nau_run(
     project: &Path,
     root: &Path,
     pod: &str,
     app: &str,
     env: &[(&str, &str)],
 ) -> (Option<i32>, String, String) {
-    run_shuttle_run_with(project, root, pod, app, &[], env)
+    run_nau_run_with(project, root, pod, app, &[], env)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_shuttle_run_with(
+fn run_nau_run_with(
     project: &Path,
     root: &Path,
     pod: &str,
@@ -191,7 +191,7 @@ fn run_shuttle_run_with(
     app_args: &[&str],
     env: &[(&str, &str)],
 ) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("run").arg("--pod").arg(pod).arg("--root").arg(root);
     cmd.arg(app);
     for a in app_args {
@@ -201,7 +201,7 @@ fn run_shuttle_run_with(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("failed to spawn shuttle run");
+    let out = cmd.output().expect("failed to spawn nau run");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -210,8 +210,8 @@ fn run_shuttle_run_with(
 }
 
 /// Exec the pod's farm entry for `app` (the wrapper the farm's symlink
-/// points at), proving it is transparent (`shuttle run` under the hood).
-/// The `shuttle` binary is placed on PATH so the wrapper's `exec shuttle
+/// points at), proving it is transparent (`nau run` under the hood).
+/// The `nau` binary is placed on PATH so the wrapper's `exec nau
 /// run` resolves.
 fn exec_farm_entry(root: &Path, pod: &str, app: &str) -> (Option<i32>, String, String) {
     let farm = farm_dir(root, pod);
@@ -219,12 +219,12 @@ fn exec_farm_entry(root: &Path, pod: &str, app: &str) -> (Option<i32>, String, S
     // Resolve the symlink chain to the actual store blob (the wrapper).
     let canonical = std::fs::canonicalize(&entry).expect("farm entry resolves");
     let mut cmd = Command::new(&canonical);
-    // Put the test's shuttle binary dir on PATH (the wrapper execs
-    // `shuttle run`).
-    let shuttle_bin = std::path::Path::new(env!("CARGO_BIN_EXE_shuttle"))
+    // Put the test's nau binary dir on PATH (the wrapper execs
+    // `nau run`).
+    let nau_bin = std::path::Path::new(env!("CARGO_BIN_EXE_nau"))
         .parent()
         .unwrap();
-    let mut path = shuttle_bin.to_path_buf().into_os_string();
+    let mut path = nau_bin.to_path_buf().into_os_string();
     if let Some(existing) = std::env::var_os("PATH") {
         path.push(":");
         path.push(existing);
@@ -250,7 +250,7 @@ fn farm_dir(root: &Path, pod: &str) -> PathBuf {
 // ── Tests ──
 
 #[test]
-fn confined_app_farm_entry_points_at_a_shuttle_run_wrapper() {
+fn confined_app_farm_entry_points_at_a_nau_run_wrapper() {
     if !bwrap_gate() {
         return;
     }
@@ -286,13 +286,13 @@ fn confined_app_farm_entry_points_at_a_shuttle_run_wrapper() {
     assert!(farm.join("confinapp").exists(), "farm entry present");
 
     // The farm entry must point at a store blob whose content is a
-    // wrapper that invokes `shuttle run` (not the raw command binary).
+    // wrapper that invokes `nau run` (not the raw command binary).
     let entry = farm.join("confinapp");
     let blob = std::fs::canonicalize(&entry).unwrap();
     let content = std::fs::read_to_string(&blob).unwrap();
     assert!(
-        content.contains("shuttle run"),
-        "confined farm wrapper must invoke shuttle run; got: {content}"
+        content.contains("nau run"),
+        "confined farm wrapper must invoke nau run; got: {content}"
     );
     assert!(
         content.contains("--pod"),
@@ -301,7 +301,7 @@ fn confined_app_farm_entry_points_at_a_shuttle_run_wrapper() {
 }
 
 #[test]
-fn confined_app_executes_with_grants_via_shuttle_run() {
+fn confined_app_executes_with_grants_via_nau_run() {
     if !bwrap_gate() {
         return;
     }
@@ -327,13 +327,13 @@ fn confined_app_executes_with_grants_via_shuttle_run() {
     let (code, _out, err) = run(project.path(), root.path(), &["add", "confinapp"], &[]);
     assert_eq!(code, Some(0), "confined pod add failed: {err}");
 
-    // `shuttle run` sets up the bwrap sandbox with the rw grant and execs
+    // `nau run` sets up the bwrap sandbox with the rw grant and execs
     // the app — which writes the marker into the granted dir.
     let marker = grant_dir.path().join("marker");
     assert!(!marker.exists(), "no marker before run");
     let (rcode, _stdout, rerr) =
-        run_shuttle_run(project.path(), root.path(), "default", "confinapp", &[]);
-    assert_eq!(rcode, Some(0), "shuttle run failed: {rerr}");
+        run_nau_run(project.path(), root.path(), "default", "confinapp", &[]);
+    assert_eq!(rcode, Some(0), "nau run failed: {rerr}");
     assert!(
         marker.exists(),
         "confined app must write its marker via the rw filesystem grant"
@@ -358,7 +358,7 @@ fn confined_app_executes_with_grants_via_shuttle_run() {
 /// is a socket, device node is visible) before writing its marker; a
 /// grant-check failure exits 3/4 instead.
 #[test]
-fn confined_app_executes_with_socket_and_device_grants_via_shuttle_run() {
+fn confined_app_executes_with_socket_and_device_grants_via_nau_run() {
     if !bwrap_gate() {
         return;
     }
@@ -405,7 +405,7 @@ fn confined_app_executes_with_socket_and_device_grants_via_shuttle_run() {
     let marker = grant_dir.path().join("marker");
     assert!(!marker.exists(), "no marker before run");
     let (rcode, _stdout, rerr) =
-        run_shuttle_run(project.path(), root.path(), "default", "confsock", &[]);
+        run_nau_run(project.path(), root.path(), "default", "confsock", &[]);
     assert_ne!(
         rcode,
         Some(3),
@@ -416,7 +416,7 @@ fn confined_app_executes_with_socket_and_device_grants_via_shuttle_run() {
         Some(4),
         "device grant did not resolve inside sandbox: {rerr}"
     );
-    assert_eq!(rcode, Some(0), "shuttle run failed: {rerr}");
+    assert_eq!(rcode, Some(0), "nau run failed: {rerr}");
     assert!(
         marker.exists(),
         "confined app must write its marker with socket+device grants"
@@ -451,12 +451,12 @@ fn confined_app_fails_closed_when_backend_unavailable() {
     assert_eq!(code, Some(0), "confined pod add failed: {err}");
 
     // Fail closed: hide bwrap from PATH so the backend is unavailable. A
-    // confined app must NOT run unconfined — `shuttle run` errors.
+    // confined app must NOT run unconfined — `nau run` errors.
     let marker = grant_dir.path().join("marker");
     assert!(!marker.exists());
     // Empty PATH hides bwrap (and everything else), so the confined
     // backend check fails before any exec.
-    let (rcode, _stdout, rerr) = run_shuttle_run(
+    let (rcode, _stdout, rerr) = run_nau_run(
         project.path(),
         root.path(),
         "default",
@@ -510,11 +510,11 @@ fn unconfined_app_is_unaffected_and_uses_direct_farm_symlink() {
     let entry = farm.join("uapp");
     let blob = std::fs::canonicalize(&entry).unwrap();
     // Unconfined: the farm entry is the raw command binary (no wrapper),
-    // so the payload content is the app script, not a `shuttle run` shim.
+    // so the payload content is the app script, not a `nau run` shim.
     let content = std::fs::read_to_string(&blob).unwrap();
     assert!(
-        !content.contains("shuttle run"),
-        "unconfined app must have no shuttle-run wrapper; got: {content}"
+        !content.contains("nau run"),
+        "unconfined app must have no nau-run wrapper; got: {content}"
     );
     assert!(content.contains("unconfined-ok"), "got: {content}");
 }
@@ -548,8 +548,7 @@ fn apparmor_backend_fails_closed_when_unavailable() {
 
     // When `aa-exec` is absent (or AppArmor not enforced), a confined
     // apparmor app must fail with a clear error — never run unconfined.
-    let (rcode, _stdout, rerr) =
-        run_shuttle_run(project.path(), root.path(), "default", "aaconf", &[]);
+    let (rcode, _stdout, rerr) = run_nau_run(project.path(), root.path(), "default", "aaconf", &[]);
     if has_tool("aa-exec") {
         // aa-exec present: the run may attempt (root-only enforcement),
         // but it must not silently succeed as unconfined.
@@ -566,7 +565,7 @@ fn apparmor_backend_fails_closed_when_unavailable() {
 /// ADR-0016 escape hatch: a pod can override a confined package to
 /// unconfined for that pod via `overlay.<pkg>.confinement = "unconfined"`.
 /// The override is the explicit, user-acknowledged opt-out — the package
-/// then runs the direct farm symlink (no `shuttle run` wrapper).
+/// then runs the direct farm symlink (no `nau run` wrapper).
 #[test]
 fn pod_confinement_unconfined_override_lifts_the_sandbox() {
     if !bwrap_gate() {
@@ -615,21 +614,21 @@ fn pod_confinement_unconfined_override_lifts_the_sandbox() {
     );
 
     // After the override, the farm entry is the raw command binary — no
-    // `shuttle run` wrapper — proving the app runs unconfined.
+    // `nau run` wrapper — proving the app runs unconfined.
     let farm = farm_dir(root.path(), "default");
     let entry = farm.join("confinapp");
     let blob = std::fs::canonicalize(&entry).unwrap();
     let content = std::fs::read_to_string(&blob).unwrap();
     assert!(
-        !content.contains("shuttle run"),
-        "unconfined-override app must have no shuttle-run wrapper; got: {content}"
+        !content.contains("nau run"),
+        "unconfined-override app must have no nau-run wrapper; got: {content}"
     );
     assert!(content.contains("confined-marker"), "got: {content}");
     // Running the overridden app directly on the host writes the marker
     // (no sandbox involved) — the explicit escape-hatch path.
     let _ = grant_dir.path().join("marker");
     let (rcode, _stdout, rerr) =
-        run_shuttle_run(project.path(), root.path(), "default", "confinapp", &[]);
+        run_nau_run(project.path(), root.path(), "default", "confinapp", &[]);
     assert_eq!(rcode, Some(0), "unconfined override run failed: {rerr}");
     assert!(
         grant_dir.path().join("marker").exists(),
@@ -637,7 +636,7 @@ fn pod_confinement_unconfined_override_lifts_the_sandbox() {
     );
 }
 
-// ── `shuttle run` secrets overlay (ADR-0042 D3/D6/D7, issue #184) ──
+// ── `nau run` secrets overlay (ADR-0042 D3/D6/D7, issue #184) ──
 //
 // Hand-seeded pod (no builds): the arbitrary-command form resolves the
 // pod's secrets host-side (D6) and overlays them onto the exec'd
@@ -650,13 +649,13 @@ fn run_overlay_runtime_dir(tag: &str) -> Option<std::path::PathBuf> {
     if !base.is_dir() {
         return None;
     }
-    let dir = base.join(format!("shuttle-run-{}-{tag}", std::process::id()));
+    let dir = base.join(format!("nau-run-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
 #[test]
-fn shuttle_run_overlays_resolved_secrets_declared_replaces_inherited() {
+fn nau_run_overlays_resolved_secrets_declared_replaces_inherited() {
     let Some(run_dir) = run_overlay_runtime_dir("overlay") else {
         eprintln!("skipping: no tmpfs runtime dir available");
         return;
@@ -710,16 +709,16 @@ fn shuttle_run_overlays_resolved_secrets_declared_replaces_inherited() {
     .unwrap();
     let refs = std::collections::BTreeMap::from([(
         "RUN_SECRET".to_string(),
-        shuttle::pod::SecretSource::Exec {
+        nau::pod::SecretSource::Exec {
             command: vec![provider_s.clone()],
         },
     )]);
-    let store = shuttle::runtime::RuntimeStore::new(pod.clone());
-    shuttle::farm::write_generation_secrets(&store, 1, &refs).unwrap();
+    let store = nau::runtime::RuntimeStore::new(pod.clone());
+    nau::farm::write_generation_secrets(&store, 1, &refs).unwrap();
 
     let expected = "-----BEGIN RUN KEY-----\nMIIrun\n-----END RUN KEY-----";
     let run_with = |ambient: Option<&str>| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
         cmd.arg("run")
             .arg("--pod")
             .arg("default")
@@ -738,9 +737,9 @@ fn shuttle_run_overlays_resolved_secrets_declared_replaces_inherited() {
             }
         }
         cmd.current_dir(project.path());
-        cmd.env("SHUTTLE_DATA_HOME", root.path().join("data-home"));
+        cmd.env("NAU_DATA_HOME", root.path().join("data-home"));
         cmd.env("XDG_RUNTIME_DIR", &run_dir);
-        let out = cmd.output().expect("failed to spawn shuttle run");
+        let out = cmd.output().expect("failed to spawn nau run");
         (
             out.status.code(),
             String::from_utf8_lossy(&out.stdout).into_owned(),

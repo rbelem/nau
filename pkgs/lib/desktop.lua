@@ -1,4 +1,4 @@
--- Desktop app template for shuttle packages.
+-- Desktop app template for nau packages.
 -- Returns an app config table suitable for merge().
 --
 -- Usage:

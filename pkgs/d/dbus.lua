@@ -44,32 +44,32 @@ return {
             -- prefix; the sandbox does not extend PATH to it, and the
             -- sandbox tool preflight only accepts PATH-resolved bare
             -- command words, so every tool is invoked by its explicit
-            -- $SHUTTLE_BUILD_PREFIX path. HOME keeps cmake-method
+            -- $NAU_BUILD_PREFIX path. HOME keeps cmake-method
             -- dependency lookups alive (no /etc in the sandbox, so no
             -- passwd entry).
-            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
+            'export PATH="$NAU_BUILD_PREFIX/usr/bin:$PATH"',
             "export HOME=/tmp",
-            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
+            '"$NAU_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
                 .. "--sysconfdir=/etc --localstatedir=/var "
                 .. "-Dselinux=disabled -Dapparmor=disabled -Dsystemd=disabled "
                 .. "-Dmodular_tests=disabled "
                 .. "-Dxml_docs=disabled -Ddoxygen_docs=disabled "
                 .. "-Dducktype_docs=disabled -Dqt_help=disabled",
-            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
-            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
+            '"$NAU_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$NAU_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22/#19)
         -- until the nix gcc wrapper stops baking the merged build prefix
         -- into produced binaries: produced ELFs carry
-        -- RUNPATH=/shuttle-build-prefix/usr/lib and (since the pool
+        -- RUNPATH=/nau-build-prefix/usr/lib and (since the pool
         -- glibc loader-lib list gained the lib64 dir) the lib64
         -- spelling — neither path exists at runtime. Silenced here,
         -- visibly logged by the build's leak scan, pending the RUNPATH
         -- repair. Same rationale as htop.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
     },
 }

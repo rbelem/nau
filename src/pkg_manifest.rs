@@ -183,12 +183,12 @@ pub fn verify(pkg: &PackageManifest, public_hex: &str) -> miette::Result<()> {
 /// [`crate::sign::load_secret_key`] — whose `Ok(None)` means signing is
 /// opt-out — minting REQUIRES a key: unsigned store entries are never
 /// served (ADR-0033 Decision 2). Absence is a named error pointing at
-/// the `shuttle key` ceremony.
+/// the `nau key` ceremony.
 pub fn load_signing_key(home: &Path) -> miette::Result<KeyPair> {
     crate::sign::load_secret_key(home)?.ok_or_else(|| {
         miette::miette!(
             "no signing key at {} — shareable package manifests are always signed; \
-             run `shuttle key keygen` first (see `shuttle key list` for the ceremony ledger)",
+             run `nau key keygen` first (see `nau key list` for the ceremony ledger)",
             crate::sign::secret_key_path(home).display()
         )
     })
@@ -474,10 +474,10 @@ mod tests {
 
     #[test]
     fn inbox_path_is_store_scoped_per_package() {
-        let root = Path::new("/srv/shuttle-state");
+        let root = Path::new("/srv/nau-state");
         assert_eq!(
             manifest_path(root, "hello"),
-            PathBuf::from("/srv/shuttle-state/store/manifests/hello.json")
+            PathBuf::from("/srv/nau-state/store/manifests/hello.json")
         );
     }
 

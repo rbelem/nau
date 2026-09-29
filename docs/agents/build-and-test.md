@@ -7,7 +7,7 @@ cargo, plus the Linux tools the build and test suite exercise (`squashfs-tools`,
 `bubblewrap`, `patchelf`, `gnumake`, `flex`/`bison`, `lua54`, …).
 
 The login shell is already devbox-free: it sources the pod shellenv
-(`~/.bashrc.d/90-shuttle.sh`), and the pod env exports the farm's loader-lib
+(`~/.bashrc.d/90-nau.sh`), and the pod env exports the farm's loader-lib
 `LD_LIBRARY_PATH`. That leak breaks devbox's own node (`node: symbol lookup
 error`), so every devbox runner is invoked with `env -u LD_LIBRARY_PATH`.
 
@@ -27,8 +27,8 @@ failures from `gh`/watchers get an immediate retry/re-arm, not dismissal.
 | Format | `env -u LD_LIBRARY_PATH devbox run -- fmt` | `cargo fmt` |
 | Format check | `env -u LD_LIBRARY_PATH devbox run -- fmt-check` | `cargo fmt --check` |
 | Full gate | `bash scripts/gate.sh` | gcc14-pinned test + clippy + fmt-check |
-| Lint (pod gate) | `shuttle run --pod gate -- cargo clippy -- -D warnings` | pod-side clippy |
-| Format check (pod gate) | `shuttle run --pod gate -- cargo fmt --check` | pod-side rustfmt |
+| Lint (pod gate) | `nau run --pod gate -- cargo clippy -- -D warnings` | pod-side clippy |
+| Format check (pod gate) | `nau run --pod gate -- cargo fmt --check` | pod-side rustfmt |
 
 `bash scripts/gate.sh` is the definition of green; `clippy` treats warnings
 as errors. The two pod-gate rows are the ratified substitute for the lint
@@ -68,7 +68,7 @@ the Luau include sensitivity).
 
 ### Devbox-free endgame (target state)
 
-The gate is meant to move off devbox onto `shuttle run -- <cmd…>` (issue
+The gate is meant to move off devbox onto `nau run -- <cmd…>` (issue
 #102): exec any command with a reconciled pod's env overlaid — farm-first
 PATH plus the pod's declared vars, no sandbox, transparent exec. The command
 form is real, and as of the ratification it carries the lint axes (clippy,
@@ -93,7 +93,7 @@ Two blockers, precisely:
 2. ~~**Exposure.**~~ **CLOSED at the farm layer (round 7, commit
    45cabf9):** the farm bin set now emits a shim for every bare
    `cargo-*` sibling recorded beside a declared `cargo` app, so
-   `cargo clippy`/`cargo fmt` resolve inside `shuttle run` with no
+   `cargo clippy`/`cargo fmt` resolve inside `nau run` with no
    payload rebuild; proven pod-side in round 7 (`cargo clippy
    -- -D warnings` exit 0). The payload keeps shipping both binaries;
    the apps-map route (declaring `cargo-clippy`/`cargo-fmt` apps)
@@ -111,7 +111,7 @@ pin itself (round 8 — the gate pod carries rust 1.97.1, and pod-side
 clippy/fmt verdicts match the devbox pin exactly).
 
 **Ratified (post-round-8 rerun on the daily host):** the pod gate is the
-verified substitute for the lint axes — `shuttle run --pod gate -- cargo
+verified substitute for the lint axes — `nau run --pod gate -- cargo
 clippy -- -D warnings` (≈1m25s warm vs devbox's ≈15s; the accepted cost of
 the flip) and `… cargo fmt --check` both passed with verdicts matching the
 devbox pin, re-confirmed after the five-lane merge of 2026-09-23. The
@@ -187,9 +187,9 @@ unions) — never a blanket `-w`.
   lines and do not merge on a run where they were skipped. The gate
   flips the policy (#291): `scripts/gate.sh` provisions `gpg`
   (`nixpkgs#gnupg`) and `veritysetup` (`nixpkgs#cryptsetup`) beside the
-  pinned compiler and exports `SHUTTLE_GATE=1`, which the gated tests
+  pinned compiler and exports `NAU_GATE=1`, which the gated tests
   honor — a tool absent in the gate FAILS, it does not skip. Per-host
-  opt-out: `SHUTTLE_GATE_ALLOW_SKIP=1` proceeds with skips, logged
+  opt-out: `NAU_GATE_ALLOW_SKIP=1` proceeds with skips, logged
   loudly by the gate and by the tests. One axis stays a skip even in
   the gate: the loop-device test (#288) needs CAP_SYS_ADMIN to attach,
   which unprivileged gate hosts permanently lack — so the gate probes

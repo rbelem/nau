@@ -50,9 +50,9 @@ return {
         -- mounted, hash-verified module cache download dir. GOSUMDB=off
         -- keeps the sumdb unreachable (go.sum pins everything).
         build = table.concat({
-            "export GOMODCACHE=/tmp/shuttle-go-cache",
-            'export GOPROXY="file://$SHUTTLE_DEPS_DIR/cache/download"',
-            "export GOFLAGS=-mod=mod GOSUMDB=off GOPATH=/tmp/shuttle-go-cache",
+            "export GOMODCACHE=/tmp/nau-go-cache",
+            'export GOPROXY="file://$NAU_DEPS_DIR/cache/download"',
+            "export GOFLAGS=-mod=mod GOSUMDB=off GOPATH=/tmp/nau-go-cache",
             'mkdir -p "$GOMODCACHE"',
             "go build -o $STAGE/gojq ./cmd/gojq",
         }, " && "),

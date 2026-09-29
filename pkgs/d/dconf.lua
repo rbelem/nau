@@ -45,10 +45,10 @@ return {
             -- prefix; the sandbox does not extend PATH to it, and the
             -- sandbox tool preflight only accepts PATH-resolved bare
             -- command words, so every tool is invoked by its explicit
-            -- $SHUTTLE_BUILD_PREFIX path. HOME keeps cmake-method
+            -- $NAU_BUILD_PREFIX path. HOME keeps cmake-method
             -- dependency lookups alive (no /etc in the sandbox, so no
             -- passwd entry).
-            'export PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH"',
+            'export PATH="$NAU_BUILD_PREFIX/usr/bin:$PATH"',
             "export HOME=/tmp",
             -- gio-2.0.pc advertises its tools at /usr/bin/... (the install
             -- prefix path), which does not exist in the sandbox — the tools
@@ -56,12 +56,12 @@ return {
             -- machine-file binary entries BEFORE the pkg-config variable,
             -- so a native file overrides every gio-2.0 tool variable at
             -- once (dconf reads gio_querymodules and gdbus_codegen).
-            "printf '[binaries]\\ngdbus-codegen = '\\''%s'\\''\\ngio = '\\''%s'\\''\\ngio-querymodules = '\\''%s'\\''\\nglib-compile-schemas = '\\''%s'\\''\\nglib-compile-resources = '\\''%s'\\''\\ngdbus = '\\''%s'\\''\\ngresource = '\\''%s'\\''\\ngsettings = '\\''%s'\\''\\n' \"$SHUTTLE_BUILD_PREFIX/usr/bin/gdbus-codegen\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gio\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gio-querymodules\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/glib-compile-schemas\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/glib-compile-resources\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gdbus\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gresource\" \"$SHUTTLE_BUILD_PREFIX/usr/bin/gsettings\" > gio-tools-native.ini",
-            '"$SHUTTLE_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
+            "printf '[binaries]\\ngdbus-codegen = '\\''%s'\\''\\ngio = '\\''%s'\\''\\ngio-querymodules = '\\''%s'\\''\\nglib-compile-schemas = '\\''%s'\\''\\nglib-compile-resources = '\\''%s'\\''\\ngdbus = '\\''%s'\\''\\ngresource = '\\''%s'\\''\\ngsettings = '\\''%s'\\''\\n' \"$NAU_BUILD_PREFIX/usr/bin/gdbus-codegen\" \"$NAU_BUILD_PREFIX/usr/bin/gio\" \"$NAU_BUILD_PREFIX/usr/bin/gio-querymodules\" \"$NAU_BUILD_PREFIX/usr/bin/glib-compile-schemas\" \"$NAU_BUILD_PREFIX/usr/bin/glib-compile-resources\" \"$NAU_BUILD_PREFIX/usr/bin/gdbus\" \"$NAU_BUILD_PREFIX/usr/bin/gresource\" \"$NAU_BUILD_PREFIX/usr/bin/gsettings\" > gio-tools-native.ini",
+            '"$NAU_BUILD_PREFIX/usr/bin/meson" setup build --prefix=/usr '
                 .. "--native-file gio-tools-native.ini "
                 .. "-Dbash_completion=false -Dman=false -Dvapi=false",
-            '"$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build',
-            'DESTDIR=$STAGE "$SHUTTLE_BUILD_PREFIX/usr/bin/ninja" -C build install',
+            '"$NAU_BUILD_PREFIX/usr/bin/ninja" -C build',
+            'DESTDIR=$STAGE "$NAU_BUILD_PREFIX/usr/bin/ninja" -C build install',
         }, " && "),
 
         type = "source",
@@ -79,12 +79,12 @@ return {
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22/#19)
         -- until the nix gcc wrapper stops baking the merged build prefix
         -- into produced binaries: produced ELFs carry
-        -- RUNPATH=/shuttle-build-prefix/usr/lib (that path does not exist
+        -- RUNPATH=/nau-build-prefix/usr/lib (that path does not exist
         -- at runtime). Silenced here, visibly logged by the build's leak
         -- scan, pending the RUNPATH repair. Same rationale as htop.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
     },
 }

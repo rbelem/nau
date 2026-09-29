@@ -14,7 +14,7 @@
 --            CGO-free)
 -- Snapcraft: no upstream snapcraft recipe in the gum repo (distributions
 --            ship the goreleaser RPM/DEB assets)
--- Shuttle:   declarative Lua — Go source build via the pool go
+-- Nau:   declarative Lua — Go source build via the pool go
 --            toolchain. NO services declaration: gum is an interactive
 --            CLI invoked by scripts, not a daemon.
 --
@@ -25,7 +25,7 @@
 -- #40 / ADR-0017 extension): go.sum's 30-module closure is fetched at
 -- FETCH time, every zip verified against its h1: dirhash, and the
 -- sandbox build reads it offline through a file:// GOPROXY on
--- $SHUTTLE_DEPS_DIR.
+-- $NAU_DEPS_DIR.
 --
 -- go.mod declares `module charm.land/gum/v2` with `go 1.26.7`; the
 -- pool go 1.27.1 satisfies it, pinned locally with GOTOOLCHAIN=local
@@ -96,8 +96,8 @@ return {
         -- gum has no cmd/ layout.
         build = table.concat({
             "mkdir -p $STAGE/usr/bin",
-            "export HOME=/tmp GOCACHE=/tmp/shuttle-go-gocache GOPATH=/tmp/shuttle-go-gopath GOMODCACHE=/tmp/shuttle-go-gopath/pkg/mod",
-            'export GOFLAGS="-trimpath -mod=mod" GOPROXY="file://$SHUTTLE_DEPS_DIR/cache/download" GOSUMDB=off GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=0',
+            "export HOME=/tmp GOCACHE=/tmp/nau-go-gocache GOPATH=/tmp/nau-go-gopath GOMODCACHE=/tmp/nau-go-gopath/pkg/mod",
+            'export GOFLAGS="-trimpath -mod=mod" GOPROXY="file://$NAU_DEPS_DIR/cache/download" GOSUMDB=off GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=0',
             'cd $SRC && go build -ldflags "-s -w -X main.Version=2.0.1" -o $STAGE/usr/bin/gum .',
         }, " && "),
 

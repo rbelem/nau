@@ -1,4 +1,4 @@
-//! `shuttle pod` desktop launchers (issue #7): GUI packages surface
+//! `nau pod` desktop launchers (issue #7): GUI packages surface
 //! user-level `.desktop` entries + icons, versioned with the pod
 //! generation.
 //!
@@ -7,11 +7,11 @@
 //! package in `pkgs/` is built (source over loopback HTTP, bwrap build,
 //! mksquashfs), installed into the pod's runtime store, and surfaced —
 //! generated entry inside the generation, pod-namespaced user-level
-//! links in a REDIRECTED data home (`SHUTTLE_DATA_HOME`). Never the real
+//! links in a REDIRECTED data home (`NAU_DATA_HOME`). Never the real
 //! home or the real `~/.local/share/applications`.
 //!
 //! Every generated entry is validated with the strict spec-conformance
-//! checker (`shuttle::desktop::validate`: required keys, valid quoted
+//! checker (`nau::desktop::validate`: required keys, valid quoted
 //! Exec, registered categories, icon resolvable).
 
 use std::io::{Read, Write};
@@ -177,15 +177,15 @@ fn run(
     data_home: &Path,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     // The launcher surface is redirected — never the real home or the
     // real ~/.local/share/applications.
-    cmd.env("SHUTTLE_DATA_HOME", data_home);
+    cmd.env("NAU_DATA_HOME", data_home);
     // Keep pod activation off the host systemd bus (issue #66).
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -225,14 +225,14 @@ fn generation_count(root: &Path, pod: &str) -> usize {
 fn user_entry(data_home: &Path, pod: &str, app: &str) -> PathBuf {
     data_home
         .join("applications")
-        .join(format!("shuttle-pod-{pod}-{app}.desktop"))
+        .join(format!("nau-pod-{pod}-{app}.desktop"))
 }
 
 /// The user-level icon link for one app.
 fn user_icon(data_home: &Path, pod: &str, app: &str, ext: &str) -> PathBuf {
     data_home
         .join("icons/hicolor/256x256/apps")
-        .join(format!("shuttle-pod-{pod}-{app}.{ext}"))
+        .join(format!("nau-pod-{pod}-{app}.{ext}"))
 }
 
 /// The generation's launcher file for one app.
@@ -298,7 +298,7 @@ gated_test!(install_produces_valid_entry_with_icon_and_links, {
 
     // STRICT spec conformance: required keys, valid quoted Exec,
     // registered categories.
-    shuttle::desktop::validate(&entry_text, Some("shuttle-pod-default-guifix"), None)
+    nau::desktop::validate(&entry_text, Some("nau-pod-default-guifix"), None)
         .expect("generated entry must pass the strict validator");
     assert!(
         entry_text.contains("Name=GUI Fix\n"),
@@ -320,7 +320,7 @@ gated_test!(install_produces_valid_entry_with_icon_and_links, {
     let icon_link = user_icon(data_home.path(), "default", "guifix", "png");
     assert_eq!(std::fs::read_link(&icon_link).unwrap(), blob);
     assert_eq!(std::fs::read(&icon_link).unwrap(), ICON_PNG);
-    shuttle::desktop::validate(&entry_text, Some("shuttle-pod-default-guifix"), Some(&blob))
+    nau::desktop::validate(&entry_text, Some("nau-pod-default-guifix"), Some(&blob))
         .expect("entry must validate with its icon blob resolvable");
 
     // The launcher's Exec target EXECUTES the farm binary.
@@ -362,7 +362,7 @@ gated_test!(entry_without_icon_is_valid_and_links_nothing, {
     assert_eq!(code, Some(0), "stderr: {stderr}");
 
     let text = std::fs::read_to_string(gen_entry(root.path(), "default", 1, "baregui")).unwrap();
-    shuttle::desktop::validate(&text, None, None)
+    nau::desktop::validate(&text, None, None)
         .expect("icon-less entry must still pass the strict validator");
     assert!(
         !text.lines().any(|l| l.starts_with("Icon=")),
@@ -506,7 +506,7 @@ gated_test!(rollback_restores_previous_launcher_set, {
     let hash = icon_hash(root.path(), "default", 1, "guifix", "guifix");
     let (aa, _) = hash.split_at(2);
     let blob = pod_dir(root.path(), "default").join(format!("store/{aa}/{hash}"));
-    shuttle::desktop::validate(&text, Some("shuttle-pod-default-guifix"), Some(&blob)).unwrap();
+    nau::desktop::validate(&text, Some("nau-pod-default-guifix"), Some(&blob)).unwrap();
 });
 
 gated_test!(same_precedence_app_id_collision_errors, {

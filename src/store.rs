@@ -85,10 +85,10 @@ impl ResolvedSnap {
 
 // ── Store client ──
 
-/// `SHUTTLE_SNAP_IDS` override: `name=id` pairs (comma/whitespace
+/// `NAU_SNAP_IDS` override: `name=id` pairs (comma/whitespace
 /// separated), consulted before any store query.
 fn env_snap_id(name: &str) -> Option<String> {
-    let spec = std::env::var("SHUTTLE_SNAP_IDS").ok()?;
+    let spec = std::env::var("NAU_SNAP_IDS").ok()?;
     for pair in spec.split([',', ' ', '\t']) {
         let pair = pair.trim();
         if let Some((n, id)) = pair.split_once('=') {
@@ -155,7 +155,7 @@ impl StoreClient {
 
     /// The store snap-id for one snap name (the top-level `snap-id` of the
     /// `/v2/snaps/info` response) — the identity UC model assertions and
-    /// seed.yaml carry for every system snap. `SHUTTLE_SNAP_IDS` entries
+    /// seed.yaml carry for every system snap. `NAU_SNAP_IDS` entries
     /// (`name=id`, comma- or whitespace-separated) override per-name, so an
     /// offline build can pin the identities it already knows.
     pub fn snap_id_with(runner: &dyn CommandRunner, name: &str) -> miette::Result<String> {
@@ -166,7 +166,7 @@ impl StoreClient {
         info.snap_id.ok_or_else(|| {
             miette::miette!(
                 "store returned no snap-id for '{name}' — the UC seed identifies every \
-                 system snap by snap-id (or set SHUTTLE_SNAP_IDS='{name}=<snap-id>')"
+                 system snap by snap-id (or set NAU_SNAP_IDS='{name}=<snap-id>')"
             )
         })
     }
@@ -598,38 +598,38 @@ mod tests {
         }
     }
 
-    // ── SHUTTLE_SNAP_IDS override ──
+    // ── NAU_SNAP_IDS override ──
 
     #[test]
     fn env_snap_id_parses_name_id_pairs_across_separators() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SHUTTLE_SNAP_IDS");
+        std::env::remove_var("NAU_SNAP_IDS");
         assert_eq!(env_snap_id("hello-world"), None);
 
-        std::env::set_var("SHUTTLE_SNAP_IDS", "core22=aaa,hello-world=bbb\tlxd=ccc");
+        std::env::set_var("NAU_SNAP_IDS", "core22=aaa,hello-world=bbb\tlxd=ccc");
         assert_eq!(env_snap_id("hello-world"), Some("bbb".to_string()));
         assert_eq!(env_snap_id("core22"), Some("aaa".to_string()));
         assert_eq!(env_snap_id("lxd"), Some("ccc".to_string()));
 
-        std::env::set_var("SHUTTLE_SNAP_IDS", "hello-world=");
+        std::env::set_var("NAU_SNAP_IDS", "hello-world=");
         assert_eq!(env_snap_id("hello-world"), None);
 
-        std::env::set_var("SHUTTLE_SNAP_IDS", "noequals");
+        std::env::set_var("NAU_SNAP_IDS", "noequals");
         assert_eq!(env_snap_id("hello-world"), None);
 
-        std::env::set_var("SHUTTLE_SNAP_IDS", "hello-world=bbb");
+        std::env::set_var("NAU_SNAP_IDS", "hello-world=bbb");
         assert_eq!(env_snap_id("hello-world"), Some("bbb".to_string()));
         assert_eq!(env_snap_id(" hello-world"), None);
-        std::env::remove_var("SHUTTLE_SNAP_IDS");
+        std::env::remove_var("NAU_SNAP_IDS");
     }
 
     #[test]
     fn snap_id_with_prefers_the_env_override_without_a_store_query() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("SHUTTLE_SNAP_IDS", "hello-world=snapid123");
+        std::env::set_var("NAU_SNAP_IDS", "hello-world=snapid123");
         let id = StoreClient::snap_id_with(&NoRunner, "hello-world").unwrap();
         assert_eq!(id, "snapid123");
-        std::env::remove_var("SHUTTLE_SNAP_IDS");
+        std::env::remove_var("NAU_SNAP_IDS");
     }
 
     #[test]
@@ -643,7 +643,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no snap-id"), "{err}");
-        assert!(err.contains("SHUTTLE_SNAP_IDS"), "{err}");
+        assert!(err.contains("NAU_SNAP_IDS"), "{err}");
     }
 
     // ── query_info_with error paths ──

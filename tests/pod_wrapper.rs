@@ -1,4 +1,4 @@
-//! `shuttle pod` build-time wrapper integration tests (issue #9).
+//! `nau pod` build-time wrapper integration tests (issue #9).
 //!
 //! An interpreter-based package (its real entrypoint is a script, not a
 //! standalone ELF) is exposed through the pod farm by a launcher wrapper
@@ -215,13 +215,13 @@ fn write_pkg_elf_stdlib(project: &Path, name: &str, app: &str, port: u16, tarbal
 // ── Runners / helpers ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66).
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),

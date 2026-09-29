@@ -55,11 +55,11 @@ return {
         requires = { "glibc", "ncurses" },
 
         -- Same interim escape as htop: the nix gcc wrapper bakes a
-        -- /shuttle-build-prefix RUNPATH into produced binaries (issue
+        -- /nau-build-prefix RUNPATH into produced binaries (issue
         -- #22 portability follow-up).
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
 
         apps = {

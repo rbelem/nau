@@ -1,13 +1,13 @@
 -- jq built from source — alternate config showing the `build` field.
 --
--- This demonstrates shuttle's source-fetch + build pipeline.
--- shuttle downloads the tarball, extracts it, and runs the build command
+-- This demonstrates nau's source-fetch + build pipeline.
+-- nau downloads the tarball, extracts it, and runs the build command
 -- with $STAGE pointing to the stage directory.
 --
 -- Compare with:
 --   Nix:       stdenv.mkDerivation { src = fetchurl { ... }; ... }
 --   Snapcraft: parts: { jq: { plugin: autotools; source: ... } }
---   Shuttle:    snap { source = "...", build = "...", stage = "./stage/" }
+--   Nau:    snap { source = "...", build = "...", stage = "./stage/" }
 
 return {
     default = snap {
@@ -23,7 +23,7 @@ return {
         confinement = "strict",
 
         -- Source URL + pinned SHA-256 for reproducible builds.
-        -- On first build, shuttle verifies the hash. On rebuild, the lockfile
+        -- On first build, nau verifies the hash. On rebuild, the lockfile
         -- captures it so even bare URLs become pinned.
         source = {
             url = "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-1.8.1.tar.gz",

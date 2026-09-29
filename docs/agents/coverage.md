@@ -19,7 +19,7 @@ nix build github:NixOS/nixpkgs/nixos-unstable#llvm --out-link /tmp/opencode/llvm
 env -u LD_LIBRARY_PATH \
   LLVM_COV=/tmp/opencode/llvm-link/bin/llvm-cov \
   LLVM_PROFDATA=/tmp/opencode/llvm-link/bin/llvm-profdata \
-  devbox run -- bash -c 'SHUTTLE_SYSTEMD=off cargo llvm-cov --workspace --all-targets --locked'
+  devbox run -- bash -c 'NAU_SYSTEMD=off cargo llvm-cov --workspace --all-targets --locked'
 
 # Per-file uncovered line numbers, without re-running tests (fast):
 env -u LD_LIBRARY_PATH LLVM_COV=… LLVM_PROFDATA=… \
@@ -31,7 +31,7 @@ Notes:
 - `--summary` and `--llvm-path` are **not** valid flags of this
   cargo-llvm-cov version; the `LLVM_COV`/`LLVM_PROFDATA` env vars are its
   supported seam (its own error message names them).
-- Tests run offline (`SHUTTLE_SYSTEMD=off`), same as the `check` gate.
+- Tests run offline (`NAU_SYSTEMD=off`), same as the `check` gate.
 
 ## Baseline (2026-09-22, commit ef63400 + doc worktree edits)
 

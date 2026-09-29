@@ -1,4 +1,4 @@
-# shuttle pod activation — T13 cutover (issue #95), replaces 90-devbox.sh.
+# nau pod activation — T13 cutover (issue #95), replaces 90-devbox.sh.
 # Ported from the devbox-global init-hook; the proven ordering is kept:
 # farm first (bws/starship/... resolve from the pod), then secrets, then
 # prompt, then venv, then the ble.sh attach.
@@ -10,10 +10,10 @@
 # generation; a broken eval must never take the shell down. NixOS
 # /etc/profile rebuilds PATH without ~/.local/bin, so fall back to the
 # release binary's install location before giving up.
-if command -v shuttle >/dev/null 2>&1; then
-  eval "$(shuttle pod --name daily shellenv)"
-elif [ -x "$HOME/.local/bin/shuttle" ]; then
-  eval "$("$HOME/.local/bin/shuttle" pod --name daily shellenv)"
+if command -v nau >/dev/null 2>&1; then
+  eval "$(nau pod --name daily shellenv)"
+elif [ -x "$HOME/.local/bin/nau" ]; then
+  eval "$("$HOME/.local/bin/nau" pod --name daily shellenv)"
 fi
 
 # ── Secrets: Bitwarden SM cache, regenerated from ~/.config/bws/sm.ini ──
@@ -21,7 +21,7 @@ fi
 # names to env vars; [aliases] maps third-party names (GH_TOKEN) onto
 # canonical SM secrets. Cache is fast and regenerable (XDG_RUNTIME_DIR).
 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
-_sm_cache="${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR/shuttle-secrets.sh"}"
+_sm_cache="${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR/nau-secrets.sh"}"
 _sm_manifest="$HOME/.config/bws/sm.ini"
 # Legacy pre-bws path (bitw era) — fallback for machines not yet migrated
 [ -f "$_sm_manifest" ] || _sm_manifest="$HOME/.config/bitw/sm.ini"
@@ -32,7 +32,7 @@ _sm_manifest="$HOME/.config/bws/sm.ini"
 # Regenerate cache if missing — atomic write, single bws call
 if [ -n "$XDG_RUNTIME_DIR" ] && [ ! -f "$_sm_cache" ] && command -v bws >/dev/null 2>&1; then
   if [ ! -f "$_sm_manifest" ]; then
-    echo "90-shuttle.sh: SM manifest missing ($HOME/.config/bws/sm.ini) — secrets loading disabled" >&2
+    echo "90-nau.sh: SM manifest missing ($HOME/.config/bws/sm.ini) — secrets loading disabled" >&2
   else
     # Ensure BWS_ACCESS_TOKEN is available (libsecret fallback for headless
     # environments). Store via: secret-tool store --label='bws SM token' bitwarden sm-access-token
@@ -69,7 +69,7 @@ if [ -n "$XDG_RUNTIME_DIR" ] && [ ! -f "$_sm_cache" ] && command -v bws >/dev/nu
       _sm_bws_err="$_sm_tmp.bws.err"
       if ! _sm_env="$(bws secret list --output env 2>"$_sm_bws_err")"; then
         _sm_last="$(tail -n 1 "$_sm_bws_err" 2>/dev/null || true)"
-        echo "90-shuttle.sh: bws secret list failed — ${_sm_last:-unknown error}" >&2
+        echo "90-nau.sh: bws secret list failed — ${_sm_last:-unknown error}" >&2
         rm -f "$_sm_bws_err"
         exit 1
       fi
@@ -83,7 +83,7 @@ if [ -n "$XDG_RUNTIME_DIR" ] && [ ! -f "$_sm_cache" ] && command -v bws >/dev/nu
     ) > "$_sm_tmp" && mv -f "$_sm_tmp" "$_sm_cache" || rm -f "$_sm_tmp"
     unset _sm_tmp _sm_keys _in_secrets _sm_bws_err _sm_env _sm_last
   else
-    echo "90-shuttle.sh: BWS_ACCESS_TOKEN not found (env or libsecret 'bitwarden sm-access-token') — secrets loading disabled" >&2
+    echo "90-nau.sh: BWS_ACCESS_TOKEN not found (env or libsecret 'bitwarden sm-access-token') — secrets loading disabled" >&2
   fi
   fi
 fi
@@ -157,7 +157,7 @@ set -o vi
 # Replaces the devbox VENV_DIR + PYTHONPATH pair: the venv carries the
 # python3.14 packages that used to live in the devbox-global profile
 # (inventory: examples/cutover/python-freeze.txt).
-VENV_DIR="$HOME/.local/share/shuttle/python-venv"
+VENV_DIR="$HOME/.local/share/nau/python-venv"
 export VENV_DIR
 [ -d "$VENV_DIR" ] || python3 -m venv "$VENV_DIR"
 [ -f "$VENV_DIR/bin/activate" ] && . "$VENV_DIR/bin/activate"

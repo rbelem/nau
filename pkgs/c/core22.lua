@@ -4,7 +4,7 @@
 -- Downloaded from the Snap Store, consumed by image() DSL.
 --
 -- Register in package index:
---   shuttle index add core22 --summary "Runtime based on Ubuntu 22.04"
+--   nau index add core22 --summary "Runtime based on Ubuntu 22.04"
 --
 -- Usage in an image declaration:
 --   image {

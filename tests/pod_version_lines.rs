@@ -253,13 +253,13 @@ fn make_consumer_tarball(server_dir: &Path) {
 // ── Runners / helpers ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66).
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -271,8 +271,8 @@ fn pod_dir(root: &Path, pod: &str) -> PathBuf {
     root.join(pod)
 }
 
-fn load_lock(root: &Path, pod: &str) -> shuttle::lock::LockFile {
-    shuttle::lock::LockFile::load(&pod_dir(root, pod).join("shuttle.lock"))
+fn load_lock(root: &Path, pod: &str) -> nau::lock::LockFile {
+    nau::lock::LockFile::load(&pod_dir(root, pod).join("nau.lock"))
         .expect("pod lockfile must parse")
         .expect("pod lockfile must exist")
 }
@@ -540,7 +540,7 @@ gated_test!(recipe_dropping_the_line_refuses_at_add_too, {
         "refusal must name the missing line: {stderr}"
     );
     assert!(
-        !pod_dir(root.path(), "fresh").join("shuttle.lock").exists(),
+        !pod_dir(root.path(), "fresh").join("nau.lock").exists(),
         "the refusal must be zero-write: no lockfile recorded"
     );
 });

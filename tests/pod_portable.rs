@@ -1,11 +1,11 @@
-//! `shuttle pod` native-ELF interpreter portability integration tests
+//! `nau pod` native-ELF interpreter portability integration tests
 //! (issue #12).
 //!
 //! A pod build on a nix devbox host compiles with the nix gcc-wrapper, so a
 //! built native binary's ELF **interpreter** references
 //! `/nix/store/...-glibc.../ld-linux-x86-64.so.2` and its RUNPATH carries
 //! the build machine's nix toolchain paths — a non-nix host cannot run it.
-//! Shuttle repoints the interpreter at the system loader
+//! Nau repoints the interpreter at the system loader
 //! (`/lib64/ld-linux-x86-64.so.2`) and clears RUNPATH at build time, so the
 //! export path carries no `/nix/store` reference and runs on a plain host.
 //!
@@ -149,13 +149,13 @@ fn write_pkg(project: &Path, name: &str, port: u16, tarball: &str) {
 // ── Runners / helpers ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66).
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),

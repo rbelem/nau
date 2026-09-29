@@ -195,9 +195,9 @@ runtime (user profile / environment)? Official docs preferred as sources.
    update-alternatives, keg links). One PATH entry, per-invocation
    resolution. Cost: exec hop, env-leak risk, surprising resolution rules.
 
-## Relevance to shuttle
+## Relevance to nau
 
-Shuttle already has primitive 1's store (content-addressed, per-build). The
+Nau already has primitive 1's store (content-addressed, per-build). The
 hard problems live at two seams: the merged build prefix (where Nix's own
 implementation also collides and aborts unless priority disambiguates) and
 the flat farm (where ADR-0015 already mandates loud, never-silent collision

@@ -30,7 +30,7 @@ analyzer-spike/
 ├── build.rs              # extracts tarball → OUT_DIR, parses upstream Sources.cmake,
 │                         # compiles Ast+Config+EqSat+Analysis+Compiler+VM (120 .cpp) + shim
 ├── luau-0.663.tar.gz     # vendored upstream source (single auditable file, 1.8 MB)
-├── shim/shuttle_shim.cpp # 206 LOC extern "C" bridge (the only code we own in C++)
+├── shim/nau_shim.cpp # 206 LOC extern "C" bridge (the only code we own in C++)
 └── src/{lib,main}.rs     # safe wrapper (Checker, check_once, Diagnostic) + spike harness
 ```
 
@@ -57,7 +57,7 @@ Two access patterns, both measured: `check_once` (fresh Frontend per check — t
 | (b) `snap { name = 42 }` vs `{ name: string, version: string }` | **1 structured diagnostic** at 7:6–7:36: `'{ name: number, … }' could not be converted into '{\| name: string, … \|}' … Property 'name' is not compatible. Type 'number' could not be converted into 'string'` — mapped to `{span, message}` JSON (ADR-0009 Decision-8 shape; `expected`/`actual` ride inside `message`) |
 | (b2) same source, non-strict | Same error — correct 0.663 semantics: explicitly annotated parameters are enforced in both modes |
 | (d) syntax error | Structured: `4:1-4:0 Expected '}' (to close '{' at line 3), got <eof>` |
-| (e1) `require("shuttle-prelude")` + valid definition, **typed prelude seeded as a module** | **0 diagnostics** — require resolution + cross-module type inference work with only `FileResolver::resolveModule` + `readSource` wired |
+| (e1) `require("nau-prelude")` + valid definition, **typed prelude seeded as a module** | **0 diagnostics** — require resolution + cross-module type inference work with only `FileResolver::resolveModule` + `readSource` wired |
 | (e2) same, but `name = 42` | Caught **through the module boundary**: `could not be converted into 'SnapMeta'` (the exported type alias flows) |
 | (c1) `pkgs/h/hello.lua` raw | `11:15 Unknown global 'snap'`, `39:21 Unknown global 'app'` — exactly the unbound-prelude surface |
 | (c2) `pkgs/j/jq/init.lua` raw | `Unknown require` (lib not seeded) + `Unknown global 'snap'`, `'merge'` — as predicted, requires need resolution wiring |
@@ -73,9 +73,9 @@ Two access patterns, both measured: `check_once` (fresh Frontend per check — t
 
 Debug build latencies: cold ~7 ms, warm <0.5 ms — release is the honest production configuration (matches the Nickel spike's finding).
 
-## 4. `require` / prelude: how resolution works, what shuttle must implement
+## 4. `require` / prelude: how resolution works, what nau must implement
 
-- **Resolution hook:** `FileResolver` gets two calls: `readSource(name)` (load a module's text) and `resolveModule(context, expr)` (map a `require` argument expression to a module name). Both are pure virtual; the shim implements them over an in-memory `HashMap<ModuleName, String>` — the exact seam where shuttle's lockfile-store resolver goes. `ConfigResolver::getConfig(name)` carries the per-module mode (strict) and can later carry lint config.
+- **Resolution hook:** `FileResolver` gets two calls: `readSource(name)` (load a module's text) and `resolveModule(context, expr)` (map a `require` argument expression to a module name). Both are pure virtual; the shim implements them over an in-memory `HashMap<ModuleName, String>` — the exact seam where nau's lockfile-store resolver goes. `ConfigResolver::getConfig(name)` carries the per-module mode (strict) and can later carry lint config.
 - **Flow proof (e1/e2):** a seeded typed prelude module + a definition that `require`s it type-checks cleanly, and errors on the definition side carry the prelude's exported types (`SnapMeta`) in messages. No `loadDefinitionFile` needed for the gate; it remains the richer option if typed *globals* (bare `snap`, `merge`, `app` without `require`) are wanted instead — that is how Roblox Studio injects definitions.
 - **Unresolved requires** produce `Unknown require: <path>` (or "unsupported path" when the tracer can't resolve the expression) — i.e. the gate fails *closed* on unseeded requires. Good for untrusted definitions.
 - **Gotchas found (each cost a debugging round):**
@@ -90,7 +90,7 @@ Debug build latencies: cold ~7 ms, warm <0.5 ms — release is the honest produc
 
 | Item | Measured | Notes |
 |---|---|---|
-| C++ code shuttle would own | **206 LOC shim** | The only first-party C++; everything else is upstream verbatim |
+| C++ code nau would own | **206 LOC shim** | The only first-party C++; everything else is upstream verbatim |
 | C++ TUs compiled | **121** (Ast 9, Config 2, EqSat 2, Analysis 64, Compiler 10, VM 33, shim 1) | Source lists read from upstream `Sources.cmake` at build time — no hand-maintained list |
 | Cold build delta | **+2 m06 s release / +54 s debug**, one-time, cached in `target/` | vs. mlua+luau0-src baseline (~30–60 s for VM+Compiler per ADR-0010): roughly +3× on cold builds; incremental Rust-only rebuilds stay ~2–5 s. CI is where this lands — cache `target/` or the cc object dir |
 | Vendored payload | 1.8 MB tarball in-tree | Expands to ~6 MB in `OUT_DIR` at build time |

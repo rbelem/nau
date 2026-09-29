@@ -36,7 +36,7 @@ return {
             -- io_get_line) that older compilers allowed as a warning. Downgrade
             -- that diagnostic to a warning (keeping -Wall -O2) so tig builds on
             -- the pool's modern toolchain without patching upstream source.
-            -- CPPFLAGS (the -I/shuttle-build-prefix include path) is handled
+            -- CPPFLAGS (the -I/nau-build-prefix include path) is handled
             -- separately by tig's Makefile via TIG_CPPFLAGS, so overriding
             -- CFLAGS on the make line does not drop the build-prefix headers.
             "./configure --prefix=/usr --without-readline",
@@ -50,13 +50,13 @@ return {
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22) until the
         -- nix gcc wrapper stops baking the merged build prefix into produced
-        -- binaries. The gcc wrapper emits RUNPATH=/shuttle-build-prefix/usr/lib
+        -- binaries. The gcc wrapper emits RUNPATH=/nau-build-prefix/usr/lib
         -- into the tig binary; that path does not exist at runtime. Silenced
         -- here, visibly logged by the build's leak scan, pending the RUNPATH
         -- repair (issue #22's portability follow-up). Same rationale as htop.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
 
         apps = {

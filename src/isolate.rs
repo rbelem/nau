@@ -2,7 +2,7 @@
 //! spike `spike/src/isolate.rs`).
 //!
 //! Untrusted definitions never evaluate in-process: the parent spawns a
-//! short-lived worker (`shuttle __eval-worker`), ships ALL eval inputs
+//! short-lived worker (`nau __eval-worker`), ships ALL eval inputs
 //! (prelude, index data, pre-seeded sources, the entry source) as one JSON
 //! request on the child's stdin, and serves `require()` requests from
 //! allowlisted roots. The child sets rlimits before eval, runs Luau with a
@@ -14,8 +14,8 @@
 //! only from allowlisted roots and rejects everything else before the source
 //! ever crosses the boundary.
 //!
-//! The strict-analyzer stage of `shuttle check` runs the same way: the
-//! parent spawns `shuttle __check-worker`, ships the definition plus every
+//! The strict-analyzer stage of `nau check` runs the same way: the
+//! parent spawns `nau __check-worker`, ships the definition plus every
 //! parent-resolved module source as one JSON request, and reads one JSON
 //! diagnostics array back. The analyzer never runs on untrusted sources
 //! in-process; timeouts (wall-clock kill or the in-worker analyzer bound)
@@ -311,17 +311,17 @@ impl SourceResolver {
 // ── Worker executable discovery ──
 
 /// Path of the binary to re-exec as the eval worker. Production re-executes
-/// itself (`current_exe`); integration tests get the real shuttle binary via
-/// cargo's `CARGO_BIN_EXE_shuttle`. No env override and no PATH fallback:
+/// itself (`current_exe`); integration tests get the real nau binary via
+/// cargo's `CARGO_BIN_EXE_nau`. No env override and no PATH fallback:
 /// anything able to influence the parent's env/PATH must not get to choose
 /// which binary receives the eval request.
 pub fn worker_exe() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_shuttle") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_nau") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
-    std::env::current_exe().expect("failed to locate the shuttle binary (current_exe)")
+    std::env::current_exe().expect("failed to locate the nau binary (current_exe)")
 }
 
 // ── Parent side ──
@@ -404,7 +404,7 @@ pub fn run_eval(req: &EvalRequest) -> miette::Result<WorkerOk> {
 /// cannot corrupt the stdout protocol channel. Inheriting the parent's stderr
 /// makes those two rules collide: the child's fd is then whatever the caller
 /// had, and a caller that redirected its own stderr into a log file — an
-/// ordinary `shuttle build > build.log 2>&1`, or `devbox run -- check > log` —
+/// ordinary `nau build > build.log 2>&1`, or `devbox run -- check > log` —
 /// turns the child's first `print()` into an immediate `SIGXFSZ` (signal 25)
 /// death, before it can report any outcome. Piping the child's stderr
 /// decouples the child's fd kind from the caller's environment; this forwarder
@@ -416,7 +416,7 @@ pub fn run_eval(req: &EvalRequest) -> miette::Result<WorkerOk> {
 /// * At most [`MAX_FORWARDED_STDERR_BYTES`] are forwarded ([`forward_capped`]);
 ///   past the cap the pipe is still drained to EOF, only discarded.
 /// * The parent waits for completion only until the containment deadline. A
-///   stderr sink that stops draining (`shuttle build 2>&1 | stalled-reader`)
+///   stderr sink that stops draining (`nau build 2>&1 | stalled-reader`)
 ///   would otherwise wedge `write_all` forever and hold the parent past the
 ///   wall-clock deadline that exists to bound the run.
 ///
@@ -863,7 +863,7 @@ fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
     lua.load(req.prelude.as_str())
         .set_name("=init.lua".to_string())
         .exec()
-        .map_err(|e| miette::miette!("failed to initialize shuttle DSL: {e}"))?;
+        .map_err(|e| miette::miette!("failed to initialize nau DSL: {e}"))?;
 
     // index() backed by the shipped index data — no filesystem access.
     let index: crate::index::PackageIndex = serde_json::from_value(req.index_data.clone())
@@ -1183,7 +1183,7 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
     })
 }
 
-/// Entry point for `shuttle __eval-worker`. Reads one JSON request from
+/// Entry point for `nau __eval-worker`. Reads one JSON request from
 /// stdin, evaluates, writes one JSON outcome to stdout, exits.
 pub fn worker_main() -> miette::Result<()> {
     if let Err(e) = set_rlimits(RLIMIT_CPU_SECS) {
@@ -1419,7 +1419,7 @@ fn run_check_worker(req: &CheckRequest) -> CheckOutcome {
     checker.check_bounded(&req.label, &req.entry)
 }
 
-/// Entry point for `shuttle __check-worker` (the strict-analyzer stage
+/// Entry point for `nau __check-worker` (the strict-analyzer stage
 /// subprocess). One JSON request on stdin, one JSON diagnostics array on
 /// stdout, exit.
 pub fn check_worker_main() -> miette::Result<()> {

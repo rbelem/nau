@@ -66,7 +66,7 @@ return {
             -- file's dir). Search the source root first.
             -- LDFLAGS passed through: git's Makefile assigns LDFLAGS
             -- internally, silently discarding the sandbox's
-            -- -L/shuttle-build-prefix/usr/lib (configure-based builds bake it
+            -- -L/nau-build-prefix/usr/lib (configure-based builds bake it
             -- into their Makefiles; plain-make git does not) — so -lz/-lssl/
             -- -lcrypto/-lpcre2-8 fail to link. Re-pass it as an override.
             -- PATH prepends the merged prefix bin: git probes dependencies by
@@ -75,8 +75,8 @@ return {
             -- launcher documents the same convention). LD_LIBRARY_PATH makes
             -- those probe/build tools loadable (msgfmt needs the prefix's
             -- libgettextsrc).
-            'PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH" LD_LIBRARY_PATH="$SHUTTLE_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" make -j$(nproc) prefix=/usr NO_EXPAT=1 NO_TCLTK=1 USE_LIBPCRE2=1 CFLAGS="-g -O2 -std=gnu17" CPPFLAGS="-I. $CPPFLAGS" LDFLAGS="$LDFLAGS"',
-            'PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH" LD_LIBRARY_PATH="$SHUTTLE_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" make install prefix=/usr NO_EXPAT=1 NO_TCLTK=1 USE_LIBPCRE2=1 CFLAGS="-g -O2 -std=gnu17" CPPFLAGS="-I. $CPPFLAGS" LDFLAGS="$LDFLAGS" DESTDIR=$STAGE',
+            'PATH="$NAU_BUILD_PREFIX/usr/bin:$PATH" LD_LIBRARY_PATH="$NAU_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" make -j$(nproc) prefix=/usr NO_EXPAT=1 NO_TCLTK=1 USE_LIBPCRE2=1 CFLAGS="-g -O2 -std=gnu17" CPPFLAGS="-I. $CPPFLAGS" LDFLAGS="$LDFLAGS"',
+            'PATH="$NAU_BUILD_PREFIX/usr/bin:$PATH" LD_LIBRARY_PATH="$NAU_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" make install prefix=/usr NO_EXPAT=1 NO_TCLTK=1 USE_LIBPCRE2=1 CFLAGS="-g -O2 -std=gnu17" CPPFLAGS="-I. $CPPFLAGS" LDFLAGS="$LDFLAGS" DESTDIR=$STAGE',
             -- git-credential-libsecret: the libsecret credential helper
             -- is NOT built by git's main Makefile — it lives in
             -- contrib/credential/libsecret with its own plain Makefile
@@ -93,7 +93,7 @@ return {
             -- pool recipe — the helper resolves at runtime through the
             -- farm PATH entry (app below), the same PATH fallback that
             -- makes `helper = oauth` work, not through git's exec-path.
-            'PATH="$SHUTTLE_BUILD_PREFIX/usr/bin:$PATH" LD_LIBRARY_PATH="$SHUTTLE_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" make -C contrib/credential/libsecret CFLAGS="-g -O2 -std=gnu17" CPPFLAGS="$CPPFLAGS" LDFLAGS="$LDFLAGS"',
+            'PATH="$NAU_BUILD_PREFIX/usr/bin:$PATH" LD_LIBRARY_PATH="$NAU_BUILD_PREFIX/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" make -C contrib/credential/libsecret CFLAGS="-g -O2 -std=gnu17" CPPFLAGS="$CPPFLAGS" LDFLAGS="$LDFLAGS"',
             "install -Dm755 contrib/credential/libsecret/git-credential-libsecret $STAGE/usr/bin/git-credential-libsecret",
             -- Farm app assemblies carry only the command's usr/bin
             -- subtree (issue #37 siblings), so git cannot find its
@@ -167,14 +167,14 @@ return {
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as htop/tig/tmux: the nix gcc wrapper bakes
-        -- RUNPATH=/shuttle-build-prefix/usr/lib into every binary and
+        -- RUNPATH=/nau-build-prefix/usr/lib into every binary and
         -- libexec/git-core helper git installs (~90 outputs, one shared
         -- reference string). That path does not exist at runtime; silenced
         -- here, visibly logged by the leak scan, pending the RUNPATH repair
         -- (issue #22's portability follow-up).
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
 
         apps = {

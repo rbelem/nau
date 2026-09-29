@@ -44,7 +44,7 @@ return {
         -- pool readline.so leaves the terminfo symbols undefined for the
         -- final link.
         build = table.concat({
-            'make -C src all SYSCFLAGS="-DLUA_USE_LINUX -DLUA_USE_READLINE -I$SHUTTLE_BUILD_PREFIX/usr/include" SYSLIBS="-Wl,-E -ldl -L$SHUTTLE_BUILD_PREFIX/usr/lib -lreadline -ltinfow"',
+            'make -C src all SYSCFLAGS="-DLUA_USE_LINUX -DLUA_USE_READLINE -I$NAU_BUILD_PREFIX/usr/include" SYSLIBS="-Wl,-E -ldl -L$NAU_BUILD_PREFIX/usr/lib -lreadline -ltinfow"',
             "make install INSTALL_TOP=$STAGE/usr",
         }, " && "),
 
@@ -58,8 +58,8 @@ return {
         -- logged by the leak scan, pending the RUNPATH repair. Same
         -- rationale as htop.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
         },
 
         apps = {

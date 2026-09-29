@@ -1,8 +1,9 @@
-# shuttle — AGENTS.md
+# nau — AGENTS.md
 
 Rust CLI that builds Snap packages from Lua declarations — a programmable
 replacement for Snapcraft's YAML. GPL-3.0-only, Linux-only. Formerly named
-*shoot* (ADR-0013). Package manager: Cargo, pinned through devbox (not npm).
+*shoot*, then *shuttle* (ADR-0013, ADR-0031). Package manager: Cargo, pinned
+through devbox (not npm).
 
 ## Build, test, lint
 
@@ -16,8 +17,8 @@ into pod store blobs (libbfd load deaths), so strip all three and pin CC/CXX:
 nix shell nixpkgs#gcc -c env -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH CC=gcc CXX=g++ devbox run -- build
 nix shell nixpkgs#gcc -c env -u LD_LIBRARY_PATH -u COMPILER_PATH -u LIBRARY_PATH CC=gcc CXX=g++ devbox run -- test
 bash scripts/gate.sh   # full gate (test + clippy -D + fmt-check, gcc14 pinned)
-shuttle run --pod gate -- cargo clippy -- -D warnings   # lint axis, pod gate
-shuttle run --pod gate -- cargo fmt --check             # fmt axis, pod gate
+nau run --pod gate -- cargo clippy -- -D warnings   # lint axis, pod gate
+nau run --pod gate -- cargo fmt --check             # fmt axis, pod gate
 ```
 
 Keep the pod shellenv on PATH (git and the curl shim ride it); the nix gcc

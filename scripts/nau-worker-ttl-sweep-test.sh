@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test suite for scripts/shuttle-worker-ttl-sweep against fake provider
+# Test suite for scripts/nau-worker-ttl-sweep against fake provider
 # CLIs and a fake curl. No network, no real cloud account — the live
 # verify is operator-side per the tickets.
 #
@@ -15,8 +15,8 @@
 #   - volume assertion: non-empty or API-failed `volume list` BLOCKS the
 #     delete, alert fires
 #   - dry-run is the DEFAULT: zero `hcloud server delete` invocations;
-#     --dry-run overrides SHUTTLE_SWEEP_ENFORCE=1
-#   - --enforce / SHUTTLE_SWEEP_ENFORCE=1 destroy exactly the
+#     --dry-run overrides NAU_SWEEP_ENFORCE=1
+#   - --enforce / NAU_SWEEP_ENFORCE=1 destroy exactly the
 #     destroy-track servers
 #   - hcloud API failures (list / describe / volume / delete) → ALERT +
 #     hook "$1" + nonzero exit; hook absent → still loud on stderr
@@ -39,7 +39,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-SWEEP=$SCRIPT_DIR/shuttle-worker-ttl-sweep
+SWEEP=$SCRIPT_DIR/nau-worker-ttl-sweep
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -72,7 +72,7 @@ AZ_DELETE_LOG=$TMP/az-delete.log
 SCW_LIST=$TMP/scw-list.json
 SCW_GET_DIR=$TMP/scw-get
 SCW_DELETE_LOG=$TMP/scw-delete.log
-# Shell command string matching the SHUTTLE_SWEEP_ALERT_CMD contract:
+# Shell command string matching the NAU_SWEEP_ALERT_CMD contract:
 # evaluated with the alert summary as "$1".
 HOOK_CMD="printf '%s\n' \"\$1\" >>$HOOK_OUT"
 
@@ -390,9 +390,9 @@ EOF
 
 # run_sweep [extra sweep args...] — captures stderr in $TMP/err.log, rc in RC.
 run_sweep() {
-    SHUTTLE_SWEEP_SSH="$BIN/ssh" \
-        SHUTTLE_SWEEP_HCLOUD="$BIN/hcloud" \
-        SHUTTLE_SWEEP_SSH_OPTS="-o BatchMode=yes" \
+    NAU_SWEEP_SSH="$BIN/ssh" \
+        NAU_SWEEP_HCLOUD="$BIN/hcloud" \
+        NAU_SWEEP_SSH_OPTS="-o BatchMode=yes" \
         SSH_FIXTURE_DIR="$SSH_DIR" \
         SSH_LOG="$SSH_LOG" \
         HCLOUD_LIST="$LIST" \
@@ -440,13 +440,13 @@ assert_not_contains "T2 floor-alerted (50h) NOT destroyed" "DESTROYED: w-floor-5
 assert_not_contains "T2 label-due server never ssh'd" "10.0.0.1" "$(cat "$SSH_LOG")"
 assert_contains "T2 no-label server ssh'd for marker" "10.0.0.6" "$(cat "$SSH_LOG")"
 
-# --- T3: SHUTTLE_SWEEP_ENFORCE=1 env equals the flag ------------------------
+# --- T3: NAU_SWEEP_ENFORCE=1 env equals the flag ------------------------
 write_default_fixtures
 : >"$DELETE_LOG"
 RC=0
-export SHUTTLE_SWEEP_ENFORCE=1
+export NAU_SWEEP_ENFORCE=1
 run_sweep || RC=$?
-unset SHUTTLE_SWEEP_ENFORCE
+unset NAU_SWEEP_ENFORCE
 assert_eq "T3 env enforce: rc" "1" "$RC"
 assert_eq "T3 env enforce: deleted set" "w-label-due
 w-floor-73
@@ -456,9 +456,9 @@ w-nolabel-due" "$(cat "$DELETE_LOG")"
 write_default_fixtures
 : >"$DELETE_LOG"
 RC=0
-export SHUTTLE_SWEEP_ENFORCE=1
+export NAU_SWEEP_ENFORCE=1
 run_sweep --dry-run || RC=$?
-unset SHUTTLE_SWEEP_ENFORCE
+unset NAU_SWEEP_ENFORCE
 assert_eq "T4 flag beats env: zero deletes" "" "$(cat "$DELETE_LOG")"
 assert_contains "T4 flag beats env: mode dry-run" "(mode: dry-run)" "$(cat "$TMP/err.log")"
 
@@ -522,10 +522,10 @@ printf 'w-vol\n' >"$LIST"
 write_describe w-vol "$((NOW - 1 * H))" 10.8.0.1 "$((NOW - 2 * H))"
 printf '12345\n' >"$VD/w-vol"
 : >"$DELETE_LOG"; : >"$HOOK_OUT"
-export SHUTTLE_SWEEP_ALERT_CMD="$HOOK_CMD"
+export NAU_SWEEP_ALERT_CMD="$HOOK_CMD"
 RC=0
 run_sweep --enforce || RC=$?
-unset SHUTTLE_SWEEP_ALERT_CMD
+unset NAU_SWEEP_ALERT_CMD
 ERR=$(cat "$TMP/err.log")
 assert_eq "T8 volumes present: rc" "1" "$RC"
 assert_eq "T8 volumes present: NO delete" "" "$(cat "$DELETE_LOG")"
@@ -535,10 +535,10 @@ assert_contains "T8 volumes present: hook rollup" "1 volume-blocked destroy(s): 
 
 # --- T9: volume-list API failure blocks too ---------------------------------
 : >"$DELETE_LOG"; : >"$HOOK_OUT"
-export SHUTTLE_SWEEP_ALERT_CMD="$HOOK_CMD" HCLOUD_VOLUME_FAIL_NAME=w-vol
+export NAU_SWEEP_ALERT_CMD="$HOOK_CMD" HCLOUD_VOLUME_FAIL_NAME=w-vol
 RC=0
 run_sweep --enforce || RC=$?
-unset SHUTTLE_SWEEP_ALERT_CMD HCLOUD_VOLUME_FAIL_NAME
+unset NAU_SWEEP_ALERT_CMD HCLOUD_VOLUME_FAIL_NAME
 ERR=$(cat "$TMP/err.log")
 assert_eq "T9 volume-list fail: rc" "1" "$RC"
 assert_eq "T9 volume-list fail: NO delete" "" "$(cat "$DELETE_LOG")"
@@ -549,10 +549,10 @@ assert_contains "T9 volume-list fail: hook rollup" "1 sweep API failure(s): w-vo
 printf 'w-due\n' >"$LIST"
 write_describe w-due "$((NOW - 1 * H))" 10.8.0.2 "$((NOW - 2 * H))"
 : >"$DELETE_LOG"; : >"$HOOK_OUT"
-export SHUTTLE_SWEEP_ALERT_CMD="$HOOK_CMD" HCLOUD_DELETE_FAIL=1
+export NAU_SWEEP_ALERT_CMD="$HOOK_CMD" HCLOUD_DELETE_FAIL=1
 RC=0
 run_sweep --enforce || RC=$?
-unset SHUTTLE_SWEEP_ALERT_CMD HCLOUD_DELETE_FAIL
+unset NAU_SWEEP_ALERT_CMD HCLOUD_DELETE_FAIL
 ERR=$(cat "$TMP/err.log")
 assert_eq "T10 delete fail: rc" "1" "$RC"
 assert_not_contains "T10 delete fail: no false DESTROYED" "DESTROYED: w-due" "$ERR"
@@ -562,10 +562,10 @@ assert_contains "T10 delete fail: hook rollup" "1 sweep API failure(s): w-due(de
 # --- T11: list API failure → no server evaluated ----------------------------
 write_default_fixtures
 : >"$DELETE_LOG"; : >"$HOOK_OUT"
-export SHUTTLE_SWEEP_ALERT_CMD="$HOOK_CMD" HCLOUD_LIST_FAIL=1
+export NAU_SWEEP_ALERT_CMD="$HOOK_CMD" HCLOUD_LIST_FAIL=1
 RC=0
 run_sweep || RC=$?
-unset SHUTTLE_SWEEP_ALERT_CMD HCLOUD_LIST_FAIL
+unset NAU_SWEEP_ALERT_CMD HCLOUD_LIST_FAIL
 assert_eq "T11 list fail: rc" "1" "$RC"
 assert_eq "T11 list fail: no deletes" "" "$(cat "$DELETE_LOG")"
 assert_contains "T11 list fail: alert" "ALERT: hcloud server list failed — sweep skipped, NO server evaluated" "$(cat "$TMP/err.log")"
@@ -588,7 +588,7 @@ assert_contains "T12 describe fail: summary" "2 labeled, 1 alive, 0 destroy-trac
 RC=0
 run_sweep || RC=$?
 assert_eq "T13 empty label set: rc" "0" "$RC"
-assert_contains "T13 empty label set: message" "no servers labeled shuttle-worker — nothing to sweep" "$(cat "$TMP/err.log")"
+assert_contains "T13 empty label set: message" "no servers labeled nau-worker — nothing to sweep" "$(cat "$TMP/err.log")"
 
 # --- T14: unknown flag → usage error ----------------------------------------
 write_default_fixtures
@@ -599,12 +599,12 @@ assert_contains "T14 unknown flag: usage" "usage error: unknown argument: --dest
 
 # --- T15: hook failure does not mask the alert ------------------------------
 write_default_fixtures
-export SHUTTLE_SWEEP_ALERT_CMD="exit 3"
+export NAU_SWEEP_ALERT_CMD="exit 3"
 RC=0
 run_sweep || RC=$?
-unset SHUTTLE_SWEEP_ALERT_CMD
+unset NAU_SWEEP_ALERT_CMD
 assert_eq "T15 hook failure: rc still 1" "1" "$RC"
-assert_contains "T15 hook failure: reported" "ALERT: alert hook (SHUTTLE_SWEEP_ALERT_CMD) exited nonzero" "$(cat "$TMP/err.log")"
+assert_contains "T15 hook failure: reported" "ALERT: alert hook (NAU_SWEEP_ALERT_CMD) exited nonzero" "$(cat "$TMP/err.log")"
 
 # --- T16: hook absent → still loud; hook receives the alert message ---------
 write_default_fixtures
@@ -612,10 +612,10 @@ write_default_fixtures
 RC=0
 run_sweep || RC=$?
 assert_contains "T16 no hook: alert still loud on stderr" "ALERT: w-floor-50: no usable TTL, age 50h past the 48h alert floor" "$(cat "$TMP/err.log")"
-export SHUTTLE_SWEEP_ALERT_CMD="$HOOK_CMD"
+export NAU_SWEEP_ALERT_CMD="$HOOK_CMD"
 RC=0
 run_sweep || RC=$?
-unset SHUTTLE_SWEEP_ALERT_CMD
+unset NAU_SWEEP_ALERT_CMD
 assert_contains "T16 hook receives floor alert as \$1" "w-floor-50: no usable TTL, age 50h past the 48h alert floor (destroy at 72h)" "$(cat "$HOOK_OUT")"
 
 # ── #296 notifier fan-out + #287 axes --------------------------------------
@@ -626,9 +626,9 @@ iso() { date -u -d "@$1" +"%Y-%m-%dT%H:%M:%S+00:00"; }
 # (KEY=VALUE pairs) for axis/notifier fixtures.
 EXTRA_ENV=()
 run_sweep_extra() {
-    SHUTTLE_SWEEP_SSH="$BIN/ssh" \
-        SHUTTLE_SWEEP_HCLOUD="$BIN/hcloud" \
-        SHUTTLE_SWEEP_SSH_OPTS="-o BatchMode=yes" \
+    NAU_SWEEP_SSH="$BIN/ssh" \
+        NAU_SWEEP_HCLOUD="$BIN/hcloud" \
+        NAU_SWEEP_SSH_OPTS="-o BatchMode=yes" \
         SSH_FIXTURE_DIR="$SSH_DIR" \
         SSH_LOG="$SSH_LOG" \
         HCLOUD_LIST="$LIST" \
@@ -649,10 +649,10 @@ write_single_alive() {
 write_default_fixtures
 : >"$CURL_LOG"; : >"$HOOK_OUT"
 EXTRA_ENV=(
-    SHUTTLE_SWEEP_CURL="$BIN/curl"
-    SHUTTLE_SWEEP_KUMA_URLS="https://kuma1.example/api/push/T1 https://kuma2.example/api/push/T2"
-    SHUTTLE_SWEEP_NTFY_URLS="https://ntfy.example/shuttle-workers"
-    SHUTTLE_SWEEP_ALERT_CMD="$HOOK_CMD"
+    NAU_SWEEP_CURL="$BIN/curl"
+    NAU_SWEEP_KUMA_URLS="https://kuma1.example/api/push/T1 https://kuma2.example/api/push/T2"
+    NAU_SWEEP_NTFY_URLS="https://ntfy.example/nau-workers"
+    NAU_SWEEP_ALERT_CMD="$HOOK_CMD"
     CURL_LOG="$CURL_LOG"
 )
 RC=0
@@ -665,7 +665,7 @@ assert_eq "T17 fan-out: rc (floor alert)" "1" "$RC"
 assert_eq "T17 fan-out: 3 destination HTTP calls (2 kuma + 1 ntfy)" "3" "$(grep -c '^curl ' <<<"$CL")"
 assert_contains "T17 fan-out: kuma1 got status=down" "curl https://kuma1.example/api/push/T1	q=status=down&msg=$FLOOR_MSG" "$CL"
 assert_contains "T17 fan-out: kuma2 got status=down" "curl https://kuma2.example/api/push/T2	q=status=down&msg=$FLOOR_MSG" "$CL"
-assert_contains "T17 fan-out: ntfy got the message as body" "curl https://ntfy.example/shuttle-workers	q=	body=$FLOOR_MSG" "$CL"
+assert_contains "T17 fan-out: ntfy got the message as body" "curl https://ntfy.example/nau-workers	q=	body=$FLOOR_MSG" "$CL"
 assert_contains "T17 fan-out: ALERT_CMD got the same alert" "$FLOOR_MSG" "$(cat "$HOOK_OUT")"
 assert_not_contains "T17 fan-out: no up-heartbeat on a failing run" "status=up" "$CL"
 
@@ -673,10 +673,10 @@ assert_not_contains "T17 fan-out: no up-heartbeat on a failing run" "status=up" 
 write_default_fixtures
 : >"$CURL_LOG"; : >"$HOOK_OUT"
 EXTRA_ENV=(
-    SHUTTLE_SWEEP_CURL="$BIN/curl"
-    SHUTTLE_SWEEP_KUMA_URLS="https://kuma1.example/api/push/T1 https://kuma2.example/api/push/T2"
-    SHUTTLE_SWEEP_NTFY_URLS="https://ntfy.example/shuttle-workers"
-    SHUTTLE_SWEEP_ALERT_CMD="$HOOK_CMD"
+    NAU_SWEEP_CURL="$BIN/curl"
+    NAU_SWEEP_KUMA_URLS="https://kuma1.example/api/push/T1 https://kuma2.example/api/push/T2"
+    NAU_SWEEP_NTFY_URLS="https://ntfy.example/nau-workers"
+    NAU_SWEEP_ALERT_CMD="$HOOK_CMD"
     CURL_LOG="$CURL_LOG"
     CURL_FAIL_URL="kuma1.example"
 )
@@ -696,9 +696,9 @@ assert_contains "T18 isolation: rollup counted" "1 notify destination(s) failed:
 write_single_alive
 : >"$CURL_LOG"
 EXTRA_ENV=(
-    SHUTTLE_SWEEP_CURL="$BIN/curl"
-    SHUTTLE_SWEEP_KUMA_URLS="https://kuma1.example/api/push/T1"
-    SHUTTLE_SWEEP_NTFY_URLS="https://ntfy.example/shuttle-workers"
+    NAU_SWEEP_CURL="$BIN/curl"
+    NAU_SWEEP_KUMA_URLS="https://kuma1.example/api/push/T1"
+    NAU_SWEEP_NTFY_URLS="https://ntfy.example/nau-workers"
     CURL_LOG="$CURL_LOG"
 )
 RC=0
@@ -726,7 +726,7 @@ EOF
 write_aws_fixtures
 : >"$AWS_TERMINATE_LOG"; : >"$CURL_LOG"
 EXTRA_ENV=(
-    SHUTTLE_SWEEP_AWS=1 SHUTTLE_SWEEP_AWS_BIN="$BIN/aws"
+    NAU_SWEEP_AWS=1 NAU_SWEEP_AWS_BIN="$BIN/aws"
     AWS_LIST="$AWS_LIST" AWS_VOLUME_DIR="$AWS_VOLUME_DIR" AWS_TERMINATE_LOG="$AWS_TERMINATE_LOG"
 )
 RC=0
@@ -755,7 +755,7 @@ write_aws_fixtures
 write_default_fixtures   # AFTER: resets the hcloud farm (LIST + fixtures)
 : >"$DELETE_LOG"; : >"$AWS_TERMINATE_LOG"
 EXTRA_ENV=(
-    SHUTTLE_SWEEP_AWS=1 SHUTTLE_SWEEP_AWS_BIN="$BIN/aws"
+    NAU_SWEEP_AWS=1 NAU_SWEEP_AWS_BIN="$BIN/aws"
     AWS_LIST="$AWS_LIST" AWS_VOLUME_DIR="$AWS_VOLUME_DIR" AWS_TERMINATE_LOG="$AWS_TERMINATE_LOG"
     AWS_LIST_FAIL=1
 )
@@ -777,12 +777,12 @@ write_gcp_fixtures() {
   {"name": "g-due",
    "zone": "https://www.googleapis.com/compute/v1/projects/p/zones/europe-west1-b",
    "creationTimestamp": "$(iso $((NOW - 3 * H)))",
-   "labels": {"shuttle-worker": "true", "shuttle-worker-ttl": "$((NOW - 2 * H))"},
+   "labels": {"nau-worker": "true", "nau-worker-ttl": "$((NOW - 2 * H))"},
    "networkInterfaces": [{"accessConfigs": [{"natIP": "10.30.0.1"}]}]},
   {"name": "g-alive",
    "zone": "https://www.googleapis.com/compute/v1/projects/p/zones/europe-west1-b",
    "creationTimestamp": "$(iso $((NOW - 3 * H)))",
-   "labels": {"shuttle-worker": "true", "shuttle-worker-ttl": "$((NOW + 24 * H))"},
+   "labels": {"nau-worker": "true", "nau-worker-ttl": "$((NOW + 24 * H))"},
    "networkInterfaces": [{"accessConfigs": [{"natIP": "10.30.0.2"}]}]}
 ]
 EOF
@@ -791,7 +791,7 @@ EOF
 write_gcp_fixtures
 : >"$GCLOUD_DELETE_LOG"
 EXTRA_ENV=(
-    SHUTTLE_SWEEP_GCP=1 SHUTTLE_SWEEP_GCP_BIN="$BIN/gcloud"
+    NAU_SWEEP_GCP=1 NAU_SWEEP_GCP_BIN="$BIN/gcloud"
     GCLOUD_LIST="$GCLOUD_LIST" GCLOUD_DESCRIBE_DIR="$GCLOUD_DESCRIBE_DIR" GCLOUD_DELETE_LOG="$GCLOUD_DELETE_LOG"
 )
 RC=0
@@ -820,7 +820,7 @@ EOF
 write_az_fixtures
 : >"$AZ_DELETE_LOG"
 EXTRA_ENV=(
-    SHUTTLE_SWEEP_AZURE=1 SHUTTLE_SWEEP_AZ_BIN="$BIN/az"
+    NAU_SWEEP_AZURE=1 NAU_SWEEP_AZ_BIN="$BIN/az"
     AZ_VM_LIST="$AZ_VM_LIST" AZ_DISK_DIR="$AZ_DISK_DIR" AZ_NIC_DIR="$AZ_NIC_DIR" AZ_PIP_DIR="$AZ_PIP_DIR" AZ_DELETE_LOG="$AZ_DELETE_LOG"
 )
 RC=0
@@ -841,7 +841,7 @@ write_scw_fixtures() {
     cat >"$SCW_LIST" <<EOF
 {"servers": [
   {"id": "uuid-1", "name": "s-due", "creation_date": "$(iso $((NOW - 3 * H)))",
-   "tags": ["shuttle-worker=true", "shuttle-worker-ttl=$((NOW - 2 * H))"],
+   "tags": ["nau-worker=true", "nau-worker-ttl=$((NOW - 2 * H))"],
    "public_ip": {"address": "10.50.0.1"}},
   {"id": "uuid-2", "name": "s-other", "creation_date": "$(iso $((NOW - 3 * H)))",
    "tags": ["some-other-tag"], "public_ip": null}
@@ -852,7 +852,7 @@ EOF
 write_scw_fixtures
 : >"$SCW_DELETE_LOG"
 EXTRA_ENV=(
-    SHUTTLE_SWEEP_SCW=1 SHUTTLE_SWEEP_SCW_BIN="$BIN/scw"
+    NAU_SWEEP_SCW=1 NAU_SWEEP_SCW_BIN="$BIN/scw"
     SCW_LIST="$SCW_LIST" SCW_GET_DIR="$SCW_GET_DIR" SCW_DELETE_LOG="$SCW_DELETE_LOG"
 )
 RC=0
@@ -866,13 +866,13 @@ assert_contains "T24 scw enforce: DESTROYED with tag wording" "DESTROYED: uuid-1
 
 # --- T25: enabled-but-broken axis → loud skip, run fails, siblings live -----
 write_default_fixtures
-EXTRA_ENV=(SHUTTLE_SWEEP_AWS=1 SHUTTLE_SWEEP_AWS_BIN="$TMP/definitely-not-here")
+EXTRA_ENV=(NAU_SWEEP_AWS=1 NAU_SWEEP_AWS_BIN="$TMP/definitely-not-here")
 RC=0
 run_sweep_extra || RC=$?
 unset EXTRA_ENV; EXTRA_ENV=()
 ERR=$(cat "$TMP/err.log")
 assert_eq "T25 broken axis: rc" "1" "$RC"
-assert_contains "T25 broken axis: named skip" "aws axis skipped: SHUTTLE_SWEEP_AWS=1 but a required binary was not found ($TMP/definitely-not-here) — NO aws worker evaluated" "$ERR"
+assert_contains "T25 broken axis: named skip" "aws axis skipped: NAU_SWEEP_AWS=1 but a required binary was not found ($TMP/definitely-not-here) — NO aws worker evaluated" "$ERR"
 assert_contains "T25 broken axis: hcloud still swept" "WOULD-DESTROY: w-label-due (TTL label past due)" "$ERR"
 assert_contains "T25 broken axis: rollup" "1 enabled axis(es) skipped: aws — no worker from them was evaluated" "$ERR"
 

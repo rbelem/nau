@@ -61,18 +61,18 @@ return {
 
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as git/htop/libstdcpp: the nix gcc wrapper bakes
-        -- RUNPATH=/shuttle-build-prefix/usr/lib into the produced perl
+        -- RUNPATH=/nau-build-prefix/usr/lib into the produced perl
         -- binary and every XS-shared object, and (since the pool glibc
         -- loader-lib list gained the lib64 dir) the lib64 spelling on
         -- the thread module's shared.so. Neither path exists at
         -- runtime; silenced here, visibly logged by the leak scan,
         -- pending the RUNPATH repair (issue #22's portability follow-up).
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
             -- Config_heavy.pl embeds the build-time prefix as a text
             -- reference (perl's Config records compile-time paths).
-            "/shuttle-build-prefix",
+            "/nau-build-prefix",
         },
 
         apps = {

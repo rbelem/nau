@@ -29,7 +29,7 @@
 //! VM, the farm re-dispatches the lost job, and no mid-flight migration
 //! exists or will exist here. Preemptible pricing is fixed per machine
 //! type — there is no bid to cap, so `--max-price` is refused (aws-only
-//! vocabulary). A `shuttle-worker-preemptible` label names the eviction
+//! vocabulary). A `nau-worker-preemptible` label names the eviction
 //! class. On-demand is the default; preemptible is for eviction-tolerant
 //! lanes only (providers plan §1).
 //!
@@ -61,24 +61,24 @@ use crate::provision::{
     Provisioner, UserDataParams, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
 };
 
-/// The worker presence label shuttle stamps at create time — the key
+/// The worker presence label nau stamps at create time — the key
 /// shared with the #269 v2 TTL contract (Hetzner writer, cross-provider
-/// vocabulary): presence marks the instance as a shuttle worker. The
+/// vocabulary): presence marks the instance as a nau worker. The
 /// value is `true` (presence semantics; expiry rides the TTL label only).
-pub const WORKER_LABEL: &str = "shuttle-worker";
+pub const WORKER_LABEL: &str = "nau-worker";
 
 /// The TTL label: expiry in EPOCH SECONDS UTC, set AT CREATE — the source
 /// of truth of the #269 v2 contract (the in-guest marker is a fallback
-/// COPY). The same decimal shape the `shuttle-worker-ttl` hcloud label
+/// COPY). The same decimal shape the `nau-worker-ttl` hcloud label
 /// carries; the sweep's `is_epoch` parses decimal only. (The sweep itself
 /// is hcloud-only today — #287; the same gap applies to gcp.)
-pub const WORKER_TTL_LABEL: &str = "shuttle-worker-ttl";
+pub const WORKER_TTL_LABEL: &str = "nau-worker-ttl";
 
 /// The preemptible label, present (`true`) only on `--preemptible`
 /// instances: names the eviction class (T5 worker loss, ADR-0040
 /// Amendment 1) so operator-side tooling can tell an interruptible lane
 /// from an on-demand one.
-pub const WORKER_PREEMPTIBLE_LABEL: &str = "shuttle-worker-preemptible";
+pub const WORKER_PREEMPTIBLE_LABEL: &str = "nau-worker-preemptible";
 
 /// The worker base image (providers plan §3, ADR-0046): the LATEST
 /// Ubuntu LTS — the contract pins "latest LTS", never a codename — as the
@@ -98,10 +98,10 @@ pub struct GcpProvisioner<R: CommandRunner> {
     /// refusal path, checked before any API call. The credential itself
     /// never enters argv; the gcloud CLI inherits it.
     credentials: Option<String>,
-    /// The pinned shuttle binary URL the template installs.
+    /// The pinned nau binary URL the template installs.
     binary_url: String,
     /// The operator's authorized public-key line (login), resolved at the
-    /// CLI boundary (`SHUTTLE_OPERATOR_KEY` / default key halves) so the
+    /// CLI boundary (`NAU_OPERATOR_KEY` / default key halves) so the
     /// core stays env-free under test.
     operator_key: String,
     /// The coordinator publish channel (callback URL + ceremony home) —
@@ -244,7 +244,7 @@ impl<R: CommandRunner> Provisioner for GcpProvisioner<R> {
             return Err(miette::miette!(
                 "provision: {e:#} — tore down {torn_down} created instance(s), config untouched; \
                  FAILED to delete {} — it is still running and billing; delete it with \
-                 'shuttle workers destroy' or by hand",
+                 'nau workers destroy' or by hand",
                 stuck.join(", ")
             ));
         }
@@ -426,10 +426,10 @@ fn warn_surviving_disks(name: &str, doc: &Value) {
 
 // ── Local shape helpers ──
 
-/// The `--labels` value: the `shuttle-worker` presence label, the
-/// `shuttle-worker-ttl` epoch-seconds EXPIRY (the #269 v2 contract — the
+/// The `--labels` value: the `nau-worker` presence label, the
+/// `nau-worker-ttl` epoch-seconds EXPIRY (the #269 v2 contract — the
 /// source of truth the sweep reads — set AT CREATE), and
-/// `shuttle-worker-preemptible` on preemptible instances. One argv
+/// `nau-worker-preemptible` on preemptible instances. One argv
 /// element, no shell.
 fn labels(req: &ProvisionRequest, expiry_epoch: u64) -> String {
     let mut l = vec![
@@ -449,7 +449,7 @@ fn address_for(ip: &str) -> String {
     format!("ssh://root@{ip}")
 }
 
-/// `shuttle-worker-<hex nanos>-<NN>` — unique per project; the prefix
+/// `nau-worker-<hex nanos>-<NN>` — unique per project; the prefix
 /// mirrors the label key, so name and label read as one identity. The
 /// name doubles as the machine identity the one-time publish token binds.
 fn instance_name(i: u32) -> String {
@@ -457,7 +457,7 @@ fn instance_name(i: u32) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("shuttle-worker-{nanos:x}-{:02}", i + 1)
+    format!("nau-worker-{nanos:x}-{:02}", i + 1)
 }
 
 fn print_plan(plan: &ProvisionPlan, preemptible: bool) {

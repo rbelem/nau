@@ -77,7 +77,7 @@ return {
             "pkg=$STAGE/usr/lib/node_modules/impeccable",
             'mkdir -p "$pkg"',
             'cp -r $SRC/cli $SRC/package.json "$pkg/"',
-            'tar -C "$SHUTTLE_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
+            'tar -C "$NAU_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
         }, " && "),
 
         type = "source",

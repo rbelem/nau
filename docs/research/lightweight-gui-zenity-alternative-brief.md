@@ -45,7 +45,7 @@ Any "alternative" that covers message+entry+file+list+progress+notification hits
 - **Dialog fit:** immediate mode is ideal for short-lived single-window tools — one `eframe::run_native`, one `update()` returning based on button clicks, process exits. No Elm message plumbing (iced) and no DSL (Slint). File dialogs delegated to `rfd` (official FAQ recommendation).
 - **Platform:** `wayland` and `x11` are first-class features; wayland is in the **default feature set** ("Required for Linux support (including CI!)" — Cargo.toml). No D-Bus/systemd hard deps.
 - **Maintenance:** 0.36.2 released 2026-09-08, pushed 2026-09-20, 30.6k stars, sponsored by Rerun. Low risk.
-- **License:** MIT OR Apache-2.0 — compatible with GPL-3.0-only shuttle-style projects.
+- **License:** MIT OR Apache-2.0 — compatible with GPL-3.0-only nau-style projects.
 - **Weakness (honest):** non-native look; accessibility via AccessKit is on by default in eframe, which is good, but Linux accessibility support still lags Windows/macOS (README FAQ).
 
 ### Slint — runner-up

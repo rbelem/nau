@@ -91,7 +91,7 @@ main() {
     {
         # Header verbatim per #101 / AC-10 — do not reword.
         cat <<EOF
-# Root of trust is the git repo, same as the shuttle binary itself.
+# Root of trust is the git repo, same as the nau binary itself.
 # sha256 pins bytes, not provenance.
 tools_version = $tools_version
 min_kernel = "$MANIFEST_MIN_KERNEL"

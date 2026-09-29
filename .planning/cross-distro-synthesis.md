@@ -17,7 +17,7 @@
 > (validation-sets, boot health checks, bootc positioning, VM-test harness, manifest provenance/SBOM).
 > **Revision 3 (2026-08-31):** §7 records the grill-session resolutions (runtime ownership, native
 > target, security stack, file-level store, generations, runtime installs) and the project rename
-> (shoot → shuttle; distro ShuttleOS). Normative decisions now live in `docs/adr/0010-0012`.
+> (shoot → nau; distro NauOS). Normative decisions now live in `docs/adr/0010-0012`.
 
 ---
 
@@ -405,14 +405,14 @@ Answered in a grill session (decision set ratified by the owner; full rationale 
 
 | # | Question | Resolution |
 |---|---|---|
-| Q1 | Does shoot own the runtime? | **Yes — shuttle owns day-2** (updates, rollback, installs, health). Phases 22b/24 de-gated. |
+| Q1 | Does shoot own the runtime? | **Yes — nau owns day-2** (updates, rollback, installs, health). Phases 22b/24 de-gated. |
 | Q2 | ADR-0009 spike | **Ran; owner invoked the Luau fallback** — ADR-0010 supersedes ADR-0009 (Nickel retained as evaluation record). Phase 21 lands in Luau. |
 | Q3/Q4 | State contract; snapd-compatible vs snapd-free | **Native snapd-free.** UC-compat is a gated future profile (manifest IR target-agnostic, `target = native \| uc-seed` at assembly). Hybrid rejected: two runtime owners. T6 staged position stands. |
 | Q5 | Daemon law | Amended: no privileged *long-lived* daemon; emitted systemd units/timers + short-lived commands. sysupdate complies. |
 | Q6 | Sequence | Confirmed, extended (below). |
 | Q7 | Values call | Interpretation **(A)**: parity on boot trust / image integrity / update trust. Per-app confinement = build-time systemd directives + confinement lint; snap-strict dynamic confinement formally not delivered. |
 | Q14 | Dedup depth | **File-level content-addressed store directly** (no package-level interim; "no users, build the destination"). |
-| Q15 | Runtime installs | **In scope** — Phase 24b: `shuttle install/remove/upgrade/rollback`, store on state partition, generations, signed installs. |
+| Q15 | Runtime installs | **In scope** — Phase 24b: `nau install/remove/upgrade/rollback`, store on state partition, generations, signed installs. |
 
 Security stack (ordered, from council review — see ADR-0011 for the ledger and verified file:line
 findings): boot-chain fix → snap-revision assertion verification (TOFU fix; the Store sha3-384 pin
@@ -424,15 +424,15 @@ bootc, composefs-for-base, Flatpak (docs-only).
 **Sequence (final):** `16 → 23 → 22a → boot-chain + TOFU fixes → 15 → 17 → 21 → 22b (file store +
 GC) → 24a → 24 → 24b → 25`. (ADR-0009 spike completed 2026-08-30, ahead of its old slot.)
 
-**Rename (2026-08-31):** shoot → **shuttle** (CLI/package manager); the distro is **ShuttleOS**.
+**Rename (2026-08-31):** shoot → **nau** (CLI/package manager); the distro is **NauOS**.
 GitHub repo renamed with redirects; historical artifacts untouched; naming invariant recorded in
 ADR-0013 (paths carry the name, concepts never, digests never). Council had unanimously recommended
-against "shuttle" (shuttle.dev PATH collision, crates.io awslabs holder, SEO); owner accepted the
+against "nau" (nau.dev PATH collision, crates.io awslabs holder, SEO); owner accepted the
 tax knowingly in favor of the two-name split.
 
 **Remaining open:** pc-kernel `CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG` audit; kernel sourcing
-(vanilla vs Ubuntu-patched swappability); BlastOff-class namesake monitoring for ShuttleOS
-(GitHub org `shuttleos` stale-claimed; shuttleos.com unrelated; `.dev/.org/.io` available);
+(vanilla vs Ubuntu-patched swappability); BlastOff-class namesake monitoring for NauOS
+(GitHub org `nauos` stale-claimed; nauos.com unrelated; `.dev/.org/.io` available);
 UC-profile demand; 3-way `/etc` merge promotion trigger.
 
 **Superseded 2026-09-04:** the pc-kernel `CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG` audit is
@@ -440,8 +440,8 @@ closed (ADR-0011 "Kernel-config audit"): nix kernel 6.18.45 has the option **not
 roothash signature enforcement on this kernel; the declared UKI/PCR fallback (roothash bound
 via signed UKI cmdline) is the operative path. Same boot proof supersedes the *"Phase 24 —
 Transactional image updates + rollback (gated on Q1; speculative until then)"* framing
-(§ "Post-Q1 ordering" above and elsewhere): Q1 was resolved by ADR-0011 (shuttle owns the
-runtime, Phase 24 de-gated) and the QEMU missions (2026-09-04, `/tmp/opencode/shuttle-verity/`,
-`/tmp/opencode/shuttle-userspace/`) proved a shuttle-assembled disk boots to a dm-verity
+(§ "Post-Q1 ordering" above and elsewhere): Q1 was resolved by ADR-0011 (nau owns the
+runtime, Phase 24 de-gated) and the QEMU missions (2026-09-04, `/tmp/opencode/nau-verity/`,
+`/tmp/opencode/nau-userspace/`) proved a nau-assembled disk boots to a dm-verity
 verified root with userspace running from the verified device — image bootability and
 dm-verity activation are no longer speculative.

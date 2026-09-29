@@ -1,5 +1,5 @@
 //! Issue #56 — SLSA-lite provenance under the manifest signature, end to
-//! end through the real binary. `shuttle key keygen` + `shuttle eval`
+//! end through the real binary. `nau key keygen` + `nau eval`
 //! attach the attested envelope (`{"signature": …, "provenance": …}`) to
 //! the signatures map; the claims ride UNDER the signature, never in the
 //! canonical body, and an unsigned eval keeps `signatures` exactly `{}`.
@@ -10,19 +10,19 @@ use std::process::Command;
 const HASH_BASE: &str = "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111";
 const HASH_EXTRA: &str = "222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222";
 
-/// Run shuttle with an isolated HOME so the key ceremony and inputs cache
+/// Run nau with an isolated HOME so the key ceremony and inputs cache
 /// are private to the test.
 fn run_in(
     dir: &std::path::Path,
     home: &std::path::Path,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+    let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args(args)
         .env("HOME", home)
         .current_dir(dir)
         .output()
-        .expect("failed to spawn shuttle");
+        .expect("failed to spawn nau");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -36,7 +36,7 @@ fn setup_project() -> (tempfile::TempDir, tempfile::TempDir) {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
     std::fs::write(
-        dir.path().join("shuttle.lua"),
+        dir.path().join("nau.lua"),
         format!(
             r#"
 inputs = {{ vendored = {{ url = "path:vendor" }} }}
@@ -101,8 +101,8 @@ fn eval_with_a_signing_key_attaches_provenance() {
     assert_eq!(prov["version"], 1, "{prov}");
     assert_eq!(
         prov["builder_id"],
-        format!("shuttle:{}", env!("CARGO_PKG_VERSION")),
-        "builder id is the running shuttle version: {prov}"
+        format!("nau:{}", env!("CARGO_PKG_VERSION")),
+        "builder id is the running nau version: {prov}"
     );
     assert_eq!(prov["invocation"]["arch"], "amd64", "{prov}");
     assert_eq!(prov["invocation"]["channel"], "latest/stable", "{prov}");

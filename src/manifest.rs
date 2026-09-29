@@ -1,5 +1,5 @@
 //! Image manifest IR — the flat, serializable, diffable result of evaluating
-//! a definition (`shuttle eval`, Phase 23 of
+//! a definition (`nau eval`, Phase 23 of
 //! `.planning/cross-distro-synthesis.md`).
 //!
 //! The manifest is the Nix `.drv`/toplevel + UC model-assertion analog: one
@@ -192,12 +192,12 @@ pub struct ImageEntry {
     pub kernel_modprobe_config: Option<String>,
 
     /// Kernel version of the packed payload (lib/modules/<ver>) — build
-    /// fact, populated by `shuttle image`, never by eval.
+    /// fact, populated by `nau image`, never by eval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_version: Option<String>,
 
     /// Composed UKI cmdline (declared params + root= + verity trailer)
-    /// — build fact, populated by `shuttle image`, never by eval.
+    /// — build fact, populated by `nau image`, never by eval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmdline: Option<String>,
 
@@ -210,7 +210,7 @@ pub struct ImageEntry {
     pub esp_partuuid: Option<String>,
 
     /// dm-verity root hash embedded in the UKI cmdline (ADR-0011 step (c))
-    /// — build fact, populated by `shuttle image`, never by eval.
+    /// — build fact, populated by `nau image`, never by eval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roothash: Option<String>,
 
@@ -259,7 +259,7 @@ pub enum SnapRole {
 pub enum PinSource {
     /// Fully pinned in the definition's `pin()`.
     Definition,
-    /// Resolved from the `snaps` section of `shuttle.lock`.
+    /// Resolved from the `snaps` section of `nau.lock`.
     Lockfile,
     /// Resolved from a pre-resolved package-index pin for the arch.
     Index,
@@ -267,7 +267,7 @@ pub enum PinSource {
 
 /// Build artifact state. Eval never builds; it only ever reports
 /// [`ArtifactState::Unbuilt`]. The `Built` state exists for host-side
-/// records only (`shuttle push --record` / `pull --expect`).
+/// records only (`nau push --record` / `pull --expect`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArtifactState {
@@ -423,7 +423,7 @@ fn manifest_inputs(
             None => {
                 return Err(miette::miette!(
                     "input '{name}' ({}) has no lockfile pin; eval resolves pins from \
-                     data only — run 'shuttle lock' (or build once online) to record it",
+                     data only — run 'nau lock' (or build once online) to record it",
                     input.url
                 ));
             }
@@ -498,7 +498,7 @@ fn image_entry(
 
     // ADR-0011 step (a): the declared kernel config is part of the IR —
     // eval echoes what was declared. Build facts (kernel_version, cmdline,
-    // uki, esp_partuuid, roothash) are only known once `shuttle image`
+    // uki, esp_partuuid, roothash) are only known once `nau image`
     // assembles the UKI, so they stay None (skipped) here.
     let kernel = image.kernel.as_ref();
     let kernel_params = kernel
@@ -582,8 +582,8 @@ fn resolve_snap_pin(
     // 4. Fail closed — never emit a manifest with unresolved contents.
     Err(miette::miette!(
         "image snap '{}' is unresolved: the definition pin lacks revision + content \
-         hash, shuttle.lock has no entry, and the package index has no pre-resolved \
-         pin for arch '{arch}'; pin it explicitly or record pins via 'shuttle image'",
+         hash, nau.lock has no entry, and the package index has no pre-resolved \
+         pin for arch '{arch}'; pin it explicitly or record pins via 'nau image'",
         snap_ref.name
     ))
 }
@@ -953,7 +953,7 @@ mod tests {
             blobs: vec![BuiltBlob {
                 digest: format!("sha256:{}", "a".repeat(64)),
                 size: 7,
-                media_type: "application/vnd.shuttle.snap.v1".into(),
+                media_type: "application/vnd.nau.snap.v1".into(),
             }],
         };
         let v: serde_json::Value =
@@ -964,10 +964,7 @@ mod tests {
             format!("sha256:{}", "a".repeat(64))
         );
         assert_eq!(v["blobs"][0]["size"], 7);
-        assert_eq!(
-            v["blobs"][0]["media_type"],
-            "application/vnd.shuttle.snap.v1"
-        );
+        assert_eq!(v["blobs"][0]["media_type"], "application/vnd.nau.snap.v1");
 
         // Unbuilt (eval): the blobs list must NOT appear — eval manifests
         // stay byte-identical (byte-stability + sign canonical tests).

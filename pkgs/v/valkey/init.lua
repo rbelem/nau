@@ -7,7 +7,7 @@
 --            jemalloc by default on Linux)
 -- Snapcraft: no upstream snapcraft recipe; the Redis snap's core
 --            make-plugin shape is the precedent
--- Shuttle:   declarative Lua — source build via the pool toolchain,
+-- Nau:   declarative Lua — source build via the pool toolchain,
 --            carrying a `services` declaration (ADR-0032 Decision 2)
 --
 -- Source build (issue #108): `make valkey-server valkey-cli` against
@@ -105,7 +105,7 @@ return {
                 },
                 options = {
                     port = 6379,
-                    data_dir = "%h/.local/share/shuttle/valkey/%p",
+                    data_dir = "%h/.local/share/nau/valkey/%p",
                     enabled = false,
                 },
                 environment = {},

@@ -1,30 +1,30 @@
 #!/bin/sh
-# shuttle-worker-ttl-sweep — workstation safety net for forgotten shuttle
+# nau-worker-ttl-sweep — workstation safety net for forgotten nau
 # workers (tickets #269/#287/#296; .planning/server-infra-plan.md decision
 # 6, v2 match rules).
 #
 # Runs as a daily workstation systemd user timer. Catches workers left
-# renting by a crashed `shuttle workers destroy`, a lost SSH path, or a
+# renting by a crashed `nau workers destroy`, a lost SSH path, or a
 # dead workstation mid-TTL.
 #
 # ── Axes (ticket #287) ──────────────────────────────────────────────────
 # The hcloud axis is ALWAYS on (unchanged behavior from #269). Four more
 # axes — aws (EC2), gcp (Compute Engine), azure (VMs), scaleway (Instances)
 # — are OPT-IN per axis, enabled in the unit's EnvironmentFile:
-#   SHUTTLE_SWEEP_AWS=1  SHUTTLE_SWEEP_GCP=1  SHUTTLE_SWEEP_AZURE=1
-#   SHUTTLE_SWEEP_SCW=1
+#   NAU_SWEEP_AWS=1  NAU_SWEEP_GCP=1  NAU_SWEEP_AZURE=1
+#   NAU_SWEEP_SCW=1
 # An enabled axis needs its provider CLI (+ jq) and its credentials in the
 # environment; see the runbook (docs/nau-ops-runbook.md §5) for the
 # per-provider credential surface.
 #
 # Every axis queries the SAME contract the provider stamps at create time:
-# the `shuttle-worker` presence tag/label and the `shuttle-worker-ttl`
+# the `nau-worker` presence tag/label and the `nau-worker-ttl`
 # EXPIRY VALUE IN EPOCH SECONDS (UTC) — written by aws.rs/gcp.rs/azure.rs/
-# scaleway.rs at provision. The in-guest marker copy (/etc/shuttle/
+# scaleway.rs at provision. The in-guest marker copy (/etc/nau/
 # worker-ttl, shared cloud-init template) backs every axis.
 #
 # Match rules, in order, for every labeled worker (all axes):
-#   1. `shuttle-worker-ttl` tag present and parseable (epoch seconds):
+#   1. `nau-worker-ttl` tag present and parseable (epoch seconds):
 #        expiry <= now → destroy track; expiry in the future → ALIVE.
 #   2. Tag absent/unparseable, marker copy usable (see contract):
 #        copy past due → destroy track; copy in the future → ALIVE.
@@ -37,11 +37,11 @@
 #   NEVER waits on the marker.
 #
 # Cross-lane contract (shared with the provisioners, per the plan):
-#   - The `shuttle-worker-ttl` tag = expiry, VALUE IN EPOCH SECONDS (UTC).
+#   - The `nau-worker-ttl` tag = expiry, VALUE IN EPOCH SECONDS (UTC).
 #     Hetzner label values reject `:`, so ISO-8601 will not fit there; the
 #     epoch shape is shared across all providers for one sweep grammar.
 #     Set at create time; the tag is the source of truth.
-#   - The in-guest marker file /etc/shuttle/worker-ttl is a COPY: single
+#   - The in-guest marker file /etc/nau/worker-ttl is a COPY: single
 #     line, epoch seconds. Read over SSH only when the tag is
 #     missing/unparseable. Any parseable FUTURE value is alive.
 #   Missing/unparseable values never widen into a destroy — they fall to
@@ -73,7 +73,7 @@
 # the hcloud gate is the one check that also runs in dry-run.
 #
 # Dry-run is the DEFAULT: destroy-track workers are logged WOULD-DESTROY
-# and nothing is touched. `--enforce` (or SHUTTLE_SWEEP_ENFORCE=1 in the
+# and nothing is touched. `--enforce` (or NAU_SWEEP_ENFORCE=1 in the
 # unit's EnvironmentFile) performs real deletes; the flip — two weeks
 # after the first real provision — is an operator act.
 #
@@ -87,16 +87,16 @@
 # Every alert fans out to ALL configured destinations; one destination's
 # failure never blocks or silences the others (each failure is named and
 # counted; the run fails if any destination failed):
-#   SHUTTLE_SWEEP_KUMA_URLS   space-separated Uptime-Kuma push URLs
+#   NAU_SWEEP_KUMA_URLS   space-separated Uptime-Kuma push URLs
 #                             (/api/push/TOKEN). Alerts → status=down with
 #                             the alert as msg; a CLEAN run (rc 0) sends a
 #                             status=up heartbeat — the machinery-alive
 #                             proof a push monitor needs.
-#   SHUTTLE_SWEEP_NTFY_URLS   space-separated ntfy topic URLs; alerts are
+#   NAU_SWEEP_NTFY_URLS   space-separated ntfy topic URLs; alerts are
 #                             POSTed as the message body (no clean-run
 #                             pings — ntfy is a notification channel, not
 #                             a status channel).
-#   SHUTTLE_SWEEP_ALERT_CMD   SHELL COMMAND STRING evaluated once PER
+#   NAU_SWEEP_ALERT_CMD   SHELL COMMAND STRING evaluated once PER
 #                             ALERT with the one-line summary as "$1" —
 #                             the #269 seam, kept as the extensibility
 #                             escape hatch.
@@ -105,26 +105,26 @@
 # configured by the operator; nothing is routed by default.
 #
 # Knobs (env):
-#   SHUTTLE_SWEEP_ENFORCE      1 → real deletes (same as --enforce)
-#   SHUTTLE_SWEEP_KUMA_URLS    kuma push URLs (space-separated)
-#   SHUTTLE_SWEEP_NTFY_URLS    ntfy topic URLs (space-separated)
-#   SHUTTLE_SWEEP_ALERT_CMD    alert hook (see above)
-#   SHUTTLE_SWEEP_AWS          1 → enable the aws axis
-#   SHUTTLE_SWEEP_GCP          1 → enable the gcp axis
-#   SHUTTLE_SWEEP_AZURE        1 → enable the azure axis
-#   SHUTTLE_SWEEP_SCW          1 → enable the scaleway axis
-#   SHUTTLE_SWEEP_SSH          ssh binary      (default: ssh)
-#   SHUTTLE_SWEEP_SSH_OPTS     ssh options     (default: BatchMode, 10s connect timeout, accept-new host keys)
-#   SHUTTLE_SWEEP_SSH_USER     guest ssh user  (default: root)
-#   SHUTTLE_SWEEP_MARKER_PATH  in-guest marker (default: /etc/shuttle/worker-ttl)
-#   SHUTTLE_SWEEP_HCLOUD       hcloud binary   (default: hcloud)
-#   SHUTTLE_SWEEP_AWS_BIN      aws binary      (default: aws)
-#   SHUTTLE_SWEEP_GCP_BIN      gcloud binary   (default: gcloud)
-#   SHUTTLE_SWEEP_AZ_BIN       az binary       (default: az)
-#   SHUTTLE_SWEEP_SCW_BIN      scw binary      (default: scw)
-#   SHUTTLE_SWEEP_CURL         curl binary     (default: curl)
-#   SHUTTLE_SWEEP_JQ           jq binary       (default: jq)
-#   SHUTTLE_SWEEP_DATE         date binary     (default: date; GNU/BusyBox)
+#   NAU_SWEEP_ENFORCE      1 → real deletes (same as --enforce)
+#   NAU_SWEEP_KUMA_URLS    kuma push URLs (space-separated)
+#   NAU_SWEEP_NTFY_URLS    ntfy topic URLs (space-separated)
+#   NAU_SWEEP_ALERT_CMD    alert hook (see above)
+#   NAU_SWEEP_AWS          1 → enable the aws axis
+#   NAU_SWEEP_GCP          1 → enable the gcp axis
+#   NAU_SWEEP_AZURE        1 → enable the azure axis
+#   NAU_SWEEP_SCW          1 → enable the scaleway axis
+#   NAU_SWEEP_SSH          ssh binary      (default: ssh)
+#   NAU_SWEEP_SSH_OPTS     ssh options     (default: BatchMode, 10s connect timeout, accept-new host keys)
+#   NAU_SWEEP_SSH_USER     guest ssh user  (default: root)
+#   NAU_SWEEP_MARKER_PATH  in-guest marker (default: /etc/nau/worker-ttl)
+#   NAU_SWEEP_HCLOUD       hcloud binary   (default: hcloud)
+#   NAU_SWEEP_AWS_BIN      aws binary      (default: aws)
+#   NAU_SWEEP_GCP_BIN      gcloud binary   (default: gcloud)
+#   NAU_SWEEP_AZ_BIN       az binary       (default: az)
+#   NAU_SWEEP_SCW_BIN      scw binary      (default: scw)
+#   NAU_SWEEP_CURL         curl binary     (default: curl)
+#   NAU_SWEEP_JQ           jq binary       (default: jq)
+#   NAU_SWEEP_DATE         date binary     (default: date; GNU/BusyBox)
 #
 # CLI interfaces used (fake-able via the *_BIN knobs):
 #   hcloud  (unchanged from #269):
@@ -134,18 +134,18 @@
 #     server delete  NAME
 #   aws (region discipline: ambient AWS_DEFAULT_REGION/profile, the same
 #       discipline as the aws provider's destroy verb):
-#     ec2 describe-instances  --filters Name=tag:shuttle-worker,Values=true
+#     ec2 describe-instances  --filters Name=tag:nau-worker,Values=true
 #                             --query 'Reservations[].Instances[].[...]' --output json
 #     ec2 describe-volumes    --filters Name=attachment.instance-id,Values=ID
 #     ec2 terminate-instances --instance-ids ID
 #   gcp (list is project-wide; the zone from the listing rides --zone on
 #       the delete — names are zone-scoped):
-#     compute instances list   --filter 'labels.shuttle-worker=true' --format json
+#     compute instances list   --filter 'labels.nau-worker=true' --format json
 #     compute instances describe NAME --zone Z --format json
 #     compute instances delete NAME --zone Z --quiet
 #   azure (subscription-scoped; the resource group from the listing rides
 #         --resource-group):
-#     vm list -d --query '[?tags."shuttle-worker"=='"'"'true'"'"']...' -o json
+#     vm list -d --query '[?tags."nau-worker"=='"'"'true'"'"']...' -o json
 #     disk list --resource-group RG --query '[?managedBy!=null]...' -o json
 #     vm delete --resource-group RG --name N --yes
 #     network nic list --resource-group RG --query '[?virtualMachine==null].name' -o json
@@ -164,23 +164,23 @@
 
 set -eu
 
-LABEL=shuttle-worker
-TTL_LABEL=shuttle-worker-ttl
+LABEL=nau-worker
+TTL_LABEL=nau-worker-ttl
 AGE_ALERT_H=48
 AGE_DESTROY_H=72
-MARKER_PATH=${SHUTTLE_SWEEP_MARKER_PATH:-/etc/shuttle/worker-ttl}
-SSH_BIN=${SHUTTLE_SWEEP_SSH:-ssh}
-SSH_USER=${SHUTTLE_SWEEP_SSH_USER:-root}
+MARKER_PATH=${NAU_SWEEP_MARKER_PATH:-/etc/nau/worker-ttl}
+SSH_BIN=${NAU_SWEEP_SSH:-ssh}
+SSH_USER=${NAU_SWEEP_SSH_USER:-root}
 # NOTE: `:--o ...` — the default value itself starts with a dash.
-SSH_OPTS=${SHUTTLE_SWEEP_SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new}
-HCLOUD_BIN=${SHUTTLE_SWEEP_HCLOUD:-hcloud}
-AWS_BIN=${SHUTTLE_SWEEP_AWS_BIN:-aws}
-GCP_BIN=${SHUTTLE_SWEEP_GCP_BIN:-gcloud}
-AZ_BIN=${SHUTTLE_SWEEP_AZ_BIN:-az}
-SCW_BIN=${SHUTTLE_SWEEP_SCW_BIN:-scw}
-CURL_BIN=${SHUTTLE_SWEEP_CURL:-curl}
-JQ_BIN=${SHUTTLE_SWEEP_JQ:-jq}
-DATE_BIN=${SHUTTLE_SWEEP_DATE:-date}
+SSH_OPTS=${NAU_SWEEP_SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new}
+HCLOUD_BIN=${NAU_SWEEP_HCLOUD:-hcloud}
+AWS_BIN=${NAU_SWEEP_AWS_BIN:-aws}
+GCP_BIN=${NAU_SWEEP_GCP_BIN:-gcloud}
+AZ_BIN=${NAU_SWEEP_AZ_BIN:-az}
+SCW_BIN=${NAU_SWEEP_SCW_BIN:-scw}
+CURL_BIN=${NAU_SWEEP_CURL:-curl}
+JQ_BIN=${NAU_SWEEP_JQ:-jq}
+DATE_BIN=${NAU_SWEEP_DATE:-date}
 DESCRIBE_FMT="{{.Created.Unix}} {{.PublicNet.IPv4.IP}} {{index .Labels \"$TTL_LABEL\"}}"
 AWS_QUERY="Reservations[].Instances[].[InstanceId, PublicIpAddress, LaunchTime, Tags[?Key=='$TTL_LABEL'].Value | [0]]"
 AZ_QUERY="[?tags.\\\"$LABEL\\\"=='true'].[name, resourceGroup, publicIps, timeCreated, tags.\\\"$TTL_LABEL\\\"]"
@@ -209,25 +209,25 @@ axes_off=
 DRY_RUN=1
 
 log() {
-    printf '[shuttle-worker-ttl-sweep] %s\n' "$*"
+    printf '[nau-worker-ttl-sweep] %s\n' "$*"
 } >&2
 
 alert_log() {
-    printf '[shuttle-worker-ttl-sweep] ALERT: %s\n' "$*"
+    printf '[nau-worker-ttl-sweep] ALERT: %s\n' "$*"
 } >&2
 
 usage() {
     cat <<'EOF'
-usage: shuttle-worker-ttl-sweep [--dry-run|--enforce]
+usage: nau-worker-ttl-sweep [--dry-run|--enforce]
 
 Sweeps worker fleets for forgotten machines, per axis: hcloud (always
-on) + opt-in aws/gcp/azure/scaleway (SHUTTLE_SWEEP_AWS/GCP/AZURE/SCW=1).
-Workers matching the v2 rules — parseable `shuttle-worker-ttl` tag past
+on) + opt-in aws/gcp/azure/scaleway (NAU_SWEEP_AWS/GCP/AZURE/SCW=1).
+Workers matching the v2 rules — parseable `nau-worker-ttl` tag past
 due; or tag/marker both unusable with age past the 48h alert / 72h
 destroy floor — are destroyed (hcloud only after `volume list --server X`
-is empty). Dry-run is the default; --enforce (or SHUTTLE_SWEEP_ENFORCE=1)
+is empty). Dry-run is the default; --enforce (or NAU_SWEEP_ENFORCE=1)
 performs real deletes. Alerts fan out to ALL configured destinations:
-SHUTTLE_SWEEP_KUMA_URLS, SHUTTLE_SWEEP_NTFY_URLS, SHUTTLE_SWEEP_ALERT_CMD
+NAU_SWEEP_KUMA_URLS, NAU_SWEEP_NTFY_URLS, NAU_SWEEP_ALERT_CMD
 (#296 fan-out — one destination failing never silences the others). See
 the script header for env knobs and the tag/marker contract.
 EOF
@@ -288,7 +288,7 @@ notify_one() {
             fi
             ;;
         ntfy)
-            if "$CURL_BIN" -sS -m 10 -H "Title: shuttle worker TTL sweep" \
+            if "$CURL_BIN" -sS -m 10 -H "Title: nau worker TTL sweep" \
                 -d "$n_msg" -o /dev/null "$n_url"; then
                 return 0
             fi
@@ -302,23 +302,23 @@ notify_one() {
 # fire_notifiers STATUS MSG — every configured kuma URL and ntfy topic
 # gets the event (fan-out isolation: iterate, never chain).
 fire_notifiers() {
-    for f_url in ${SHUTTLE_SWEEP_KUMA_URLS:-}; do
+    for f_url in ${NAU_SWEEP_KUMA_URLS:-}; do
         notify_one kuma "$f_url" "$1" "$2"
     done
-    for f_url in ${SHUTTLE_SWEEP_NTFY_URLS:-}; do
+    for f_url in ${NAU_SWEEP_NTFY_URLS:-}; do
         notify_one ntfy "$f_url" "$1" "$2"
     done
 }
 
 # fire_alert MESSAGE → ALERT line to stderr (journal), the full fan-out
-# (all kuma/ntfy destinations), and — when set — the SHUTTLE_SWEEP_ALERT_CMD
+# (all kuma/ntfy destinations), and — when set — the NAU_SWEEP_ALERT_CMD
 # hook once per alert, with MESSAGE as "$1".
 fire_alert() {
     alert_log "$1"
     fire_notifiers down "$1"
-    if [ -n "${SHUTTLE_SWEEP_ALERT_CMD:-}" ]; then
-        if ! sh -c "$SHUTTLE_SWEEP_ALERT_CMD" shuttle-sweep-alert "$1"; then
-            alert_log "alert hook (SHUTTLE_SWEEP_ALERT_CMD) exited nonzero"
+    if [ -n "${NAU_SWEEP_ALERT_CMD:-}" ]; then
+        if ! sh -c "$NAU_SWEEP_ALERT_CMD" nau-sweep-alert "$1"; then
+            alert_log "alert hook (NAU_SWEEP_ALERT_CMD) exited nonzero"
         fi
     fi
 }
@@ -721,13 +721,13 @@ axis_parse_fail() { # AXIS
 }
 
 run_axis_aws() {
-    if [ "${SHUTTLE_SWEEP_AWS:-0}" != "1" ]; then
+    if [ "${NAU_SWEEP_AWS:-0}" != "1" ]; then
         axes_off="$axes_off aws"
         return 0
     fi
     axes_on="$axes_on aws"
     axis_snap
-    axis_require_bins aws SHUTTLE_SWEEP_AWS "$AWS_BIN" "$JQ_BIN" || return 0
+    axis_require_bins aws NAU_SWEEP_AWS "$AWS_BIN" "$JQ_BIN" || return 0
 
     log "axis aws: enumerating EC2 instances tagged $LABEL..."
     if ! ax_raw=$("$AWS_BIN" ec2 describe-instances \
@@ -755,13 +755,13 @@ EOF
 }
 
 run_axis_gcp() {
-    if [ "${SHUTTLE_SWEEP_GCP:-0}" != "1" ]; then
+    if [ "${NAU_SWEEP_GCP:-0}" != "1" ]; then
         axes_off="$axes_off gcp"
         return 0
     fi
     axes_on="$axes_on gcp"
     axis_snap
-    axis_require_bins gcp SHUTTLE_SWEEP_GCP "$GCP_BIN" "$JQ_BIN" || return 0
+    axis_require_bins gcp NAU_SWEEP_GCP "$GCP_BIN" "$JQ_BIN" || return 0
 
     log "axis gcp: enumerating Compute Engine instances labeled $LABEL..."
     if ! ax_raw=$("$GCP_BIN" compute instances list \
@@ -792,13 +792,13 @@ EOF
 }
 
 run_axis_azure() {
-    if [ "${SHUTTLE_SWEEP_AZURE:-0}" != "1" ]; then
+    if [ "${NAU_SWEEP_AZURE:-0}" != "1" ]; then
         axes_off="$axes_off azure"
         return 0
     fi
     axes_on="$axes_on azure"
     axis_snap
-    axis_require_bins azure SHUTTLE_SWEEP_AZURE "$AZ_BIN" "$JQ_BIN" || return 0
+    axis_require_bins azure NAU_SWEEP_AZURE "$AZ_BIN" "$JQ_BIN" || return 0
 
     log "axis azure: enumerating VMs tagged $LABEL..."
     if ! ax_raw=$("$AZ_BIN" vm list -d \
@@ -825,13 +825,13 @@ EOF
 }
 
 run_axis_scw() {
-    if [ "${SHUTTLE_SWEEP_SCW:-0}" != "1" ]; then
+    if [ "${NAU_SWEEP_SCW:-0}" != "1" ]; then
         axes_off="$axes_off scw"
         return 0
     fi
     axes_on="$axes_on scw"
     axis_snap
-    axis_require_bins scw SHUTTLE_SWEEP_SCW "$SCW_BIN" "$JQ_BIN" || return 0
+    axis_require_bins scw NAU_SWEEP_SCW "$SCW_BIN" "$JQ_BIN" || return 0
 
     log "axis scw: enumerating servers tagged $LABEL..."
     if ! ax_raw=$("$SCW_BIN" instance server list -o json 2>/dev/null); then
@@ -896,8 +896,8 @@ finish() {
 
     # Clean-run heartbeat: a push monitor needs positive proof the sweep
     # machinery is alive; rc!=0 already fanned the alerts out per event.
-    if [ "$rc" -eq 0 ] && [ -n "${SHUTTLE_SWEEP_KUMA_URLS:-}" ]; then
-        for h_url in $SHUTTLE_SWEEP_KUMA_URLS; do
+    if [ "$rc" -eq 0 ] && [ -n "${NAU_SWEEP_KUMA_URLS:-}" ]; then
+        for h_url in $NAU_SWEEP_KUMA_URLS; do
             notify_one kuma "$h_url" up "sweep ok (mode: $mode)"
         done
     fi
@@ -913,7 +913,7 @@ finish() {
 }
 
 main() {
-    if [ "${SHUTTLE_SWEEP_ENFORCE:-}" = "1" ]; then DRY_RUN=0; fi
+    if [ "${NAU_SWEEP_ENFORCE:-}" = "1" ]; then DRY_RUN=0; fi
     parse_args "$@" || return $?
     check_bins || return 1
 

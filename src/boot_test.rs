@@ -1,4 +1,4 @@
-//! `shuttle test` — the QEMU boot-and-assert harness (issue #50).
+//! `nau test` — the QEMU boot-and-assert harness (issue #50).
 //!
 //! Boots a built disk image in QEMU and asserts the guest actually reached
 //! userspace. This is the programmatic "did the image boot?" proof behind
@@ -7,7 +7,7 @@
 //!
 //! # Why UEFI (and not SeaBIOS)
 //!
-//! Shuttle disk images boot a UKI discovered by systemd-boot from the EFI
+//! Nau disk images boot a UKI discovered by systemd-boot from the EFI
 //! System Partition. The legacy SeaBIOS firmware has no EFI execution
 //! environment, so a BIOS boot cannot start that image at all — QEMU is
 //! therefore driven with UEFI firmware (OVMF/edk2) through two pflash
@@ -22,7 +22,7 @@
 //! 1. no kernel panic, **and**
 //! 2. a userspace marker (`systemd[1]:`, a `Reached target …` line, `Started …`,
 //!    or the `Welcome to …` banner), **and**
-//! 3. the shuttle init handoff that this project's own initramfs prints after
+//! 3. the nau init handoff that this project's own initramfs prints after
 //!    the verified root is mounted and `switch_root` is issued (required
 //!    minimum, never sufficient alone), **and**
 //! 4. a *completion* signal: a `Reached target …` line for a target that
@@ -114,7 +114,7 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub const USERSPACE_MARKERS: &[&str] =
     &["systemd[1]:", "Reached target ", "Started ", "Welcome to "];
 
-/// The line shuttle's own `/init` prints immediately before it hands PID 1 to
+/// The line nau's own `/init` prints immediately before it hands PID 1 to
 /// `systemd` (see `src/image/initramfs/init`, `main()` step 6).
 ///
 /// This is the default "the image booted" proof. It appears in the serial log
@@ -122,9 +122,9 @@ pub const USERSPACE_MARKERS: &[&str] =
 /// `proc`/`sys`/`dev` mounts, the module closure from `/modules.load`, PARTUUID
 /// resolution without udev, `veritysetup open` on the dm-verity mapping, the
 /// read-only mount of the verified root, and the `switch_root` handoff itself.
-/// It is present in every image shuttle builds, unlike `boot-complete.target`,
+/// It is present in every image nau builds, unlike `boot-complete.target`,
 /// which only an A/B image with an `update_source` emits.
-pub const BOOT_HANDOFF_MARKER: &str = "SHUTTLE-INIT: switch-root";
+pub const BOOT_HANDOFF_MARKER: &str = "NAU-INIT: switch-root";
 
 /// The systemd line for the completion target an A/B image emits
 /// (`src/image/boot.rs`, `Description=Boot Completion Check`). Reaching this
@@ -186,10 +186,10 @@ pub const COMPLETION_MARKERS: &[&str] = &[
 /// other evidence.
 pub const PANIC_MARKERS: &[&str] = &["Kernel panic", "end Kernel panic", "panic - not syncing"];
 
-/// The boot-time shuttle activation unit (ADR-0023 §4). Its presence in the
+/// The boot-time nau activation unit (ADR-0023 §4). Its presence in the
 /// log is reported (`activate`) but not required — a plain image need not
 /// carry it.
-pub const ACTIVATE_UNIT: &str = "shuttle-runtime-activate";
+pub const ACTIVATE_UNIT: &str = "nau-runtime-activate";
 
 // ── Firmware ────────────────────────────────────────────────────────────
 
@@ -720,7 +720,7 @@ pub struct Evidence {
     pub target: Option<String>,
     /// First service-level line (`Reached target …` or `Started …`), if any.
     pub service: Option<String>,
-    /// The shuttle init handoff line, if any.
+    /// The nau init handoff line, if any.
     pub handoff: Option<String>,
     /// First boot-complete line, if any (only an A/B image emits it).
     pub boot_complete: Option<String>,
@@ -729,7 +729,7 @@ pub struct Evidence {
     pub completion: Option<String>,
     /// First panic marker line, if any.
     pub panic: Option<String>,
-    /// The shuttle activation unit was mentioned.
+    /// The nau activation unit was mentioned.
     pub activate: bool,
     /// Which [`USERSPACE_MARKERS`] matched.
     pub markers: Vec<String>,
@@ -820,7 +820,7 @@ pub enum Failure {
     Timeout,
     /// QEMU finished without reaching userspace (and without a panic).
     NoUserspace,
-    /// Userspace was reached but the shuttle init handoff never appeared.
+    /// Userspace was reached but the nau init handoff never appeared.
     NoHandoff,
     /// The handoff happened but no completion target was reached (and the
     /// run did not pass `--allow-no-completion`): a stall, a failed oneshot,
@@ -901,8 +901,8 @@ impl Outcome {
                     .to_string()
             }
             Failure::NoHandoff => format!(
-                "userspace reached but no shuttle init handoff ('{BOOT_HANDOFF_MARKER}') in the \
-                 serial log — the image did not boot through shuttle's own initramfs, or the \
+                "userspace reached but no nau init handoff ('{BOOT_HANDOFF_MARKER}') in the \
+                 serial log — the image did not boot through nau's own initramfs, or the \
                  boot never got as far as the verify+switch_root handoff; raise --timeout or \
                  inspect the serial evidence"
             ),
@@ -1202,7 +1202,7 @@ fn system_path() -> String {
 pub fn resolve_qemu() -> miette::Result<PathBuf> {
     resolve_on_path("qemu-system-x86_64", &system_path()).ok_or_else(|| {
         miette::miette!(
-            "qemu-system-x86_64 not found on PATH — install QEMU to run 'shuttle test' \
+            "qemu-system-x86_64 not found on PATH — install QEMU to run 'nau test' \
              (devbox provides it via the 'qemu' package)"
         )
     })
@@ -1235,14 +1235,14 @@ pub fn default_log_path(image: &Path) -> PathBuf {
 }
 
 /// Directories searched for UEFI firmware, in order: an explicit override,
-/// `$SHUTTLE_FIRMWARE_DIR`, QEMU's own share directory (derived from the
+/// `$NAU_FIRMWARE_DIR`, QEMU's own share directory (derived from the
 /// resolved binary), then standard system locations.
 pub fn firmware_search_dirs(qemu: &Path, extra: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(dir) = extra {
         dirs.push(dir.to_path_buf());
     }
-    if let Ok(env_dir) = std::env::var("SHUTTLE_FIRMWARE_DIR") {
+    if let Ok(env_dir) = std::env::var("NAU_FIRMWARE_DIR") {
         if !env_dir.is_empty() {
             dirs.push(PathBuf::from(env_dir));
         }
@@ -1298,7 +1298,7 @@ pub fn prepare_firmware_in(dirs: &[PathBuf], scratch: &Path) -> miette::Result<F
             .collect::<Vec<_>>()
             .join(", ");
         return Err(miette::miette!(
-            "UEFI firmware not found — a shuttle image boots a UKI via systemd-boot, so \
+            "UEFI firmware not found — a nau image boots a UKI via systemd-boot, so \
              SeaBIOS is not sufficient. Looked for OVMF_CODE.fd/OVMF_VARS.fd (or the edk2 \
              equivalents) in: {searched}. Install OVMF/edk2 or pass --firmware-dir"
         ));
@@ -1424,17 +1424,17 @@ mod tests {
 
     const PASS_LOG: &str = "\
 [    0.000000] Linux version 6.8.0\n\
-SHUTTLE-INIT: start\n\
-SHUTTLE-INIT: modules-loaded\n\
-SHUTTLE-INIT: root=/dev/vda2 hash=/dev/vda3\n\
-SHUTTLE-INIT: verity-open\n\
-SHUTTLE-INIT: mounted\n\
-SHUTTLE-INIT: switch-root\n\
+NAU-INIT: start\n\
+NAU-INIT: modules-loaded\n\
+NAU-INIT: root=/dev/vda2 hash=/dev/vda3\n\
+NAU-INIT: verity-open\n\
+NAU-INIT: mounted\n\
+NAU-INIT: switch-root\n\
 [    2.100000] systemd[1]: systemd 255 running in system mode.\n\
 [    3.200000] systemd[1]: Reached target Basic System.\n\
 [    4.400000] systemd[1]: Reached target Multi-User System.\n\
-[    4.900000] systemd[1]: Starting shuttle-runtime-activate.service...\n\
-[    5.100000] systemd[1]: Started shuttle: activate the current runtime generation.\n";
+[    4.900000] systemd[1]: Starting nau-runtime-activate.service...\n\
+[    5.100000] systemd[1]: Started nau: activate the current runtime generation.\n";
 
     const PANIC_LOG: &str = "\
 [    0.000000] Linux version 6.8.0\n\
@@ -1621,7 +1621,7 @@ SHUTTLE-INIT: switch-root\n\
     // ── log analysis ──
 
     /// The strict marker is systemd's rendering of the target's
-    /// `Description=`, so it must track the unit shuttle actually emits. Read
+    /// `Description=`, so it must track the unit nau actually emits. Read
     /// the emitted unit text and assert the description is the one the marker
     /// expects; if either side moves, this fails rather than silently never
     /// matching.
@@ -1647,7 +1647,7 @@ SHUTTLE-INIT: switch-root\n\
         let ev = analyze_log(PASS_LOG);
         assert!(ev.userspace);
         assert!(ev.target.is_some());
-        assert_eq!(ev.handoff.as_deref(), Some("SHUTTLE-INIT: switch-root"));
+        assert_eq!(ev.handoff.as_deref(), Some("NAU-INIT: switch-root"));
         assert!(ev.panic.is_none());
     }
 
@@ -1656,7 +1656,7 @@ SHUTTLE-INIT: switch-root\n\
     /// pins the parser to genuine systemd output, not just a synthetic
     /// fixture. Only the lines the parser keys on are kept.
     ///
-    /// This is an **initrd** boot, so it never runs shuttle's `/init` and
+    /// This is an **initrd** boot, so it never runs nau's `/init` and
     /// prints no handoff marker. It proves userspace is parsed; the default
     /// gate is covered by [`PASS_LOG`] and [`CONSOLE_CONF_LOG`].
     const REAL_BOOT_EXCERPT: &str = "\
@@ -1680,13 +1680,13 @@ SHUTTLE-INIT: switch-root\n\
         );
         assert!(
             ev.handoff.is_none(),
-            "an initrd excerpt never runs shuttle's /init"
+            "an initrd excerpt never runs nau's /init"
         );
     }
 
     #[test]
     fn run_boot_without_handoff_fails() {
-        // Userspace is up, but this boot did not go through shuttle's own
+        // Userspace is up, but this boot did not go through nau's own
         // initramfs, so the default gate must fail.
         let tmp = tempfile::tempdir().unwrap();
         let test = sample_test(tmp.path(), Accel::Kvm, true);
@@ -1707,13 +1707,13 @@ SHUTTLE-INIT: switch-root\n\
     /// service line.
     const CONSOLE_CONF_LOG: &str = "\
 BdsDxe: starting Boot0001 \"UEFI Misc Device\"\n\
-SHUTTLE-INIT: start\n\
-SHUTTLE-INIT: modules-loaded\n\
-SHUTTLE-INIT: root=/dev/vda2 hash=/dev/vda3\n\
-SHUTTLE-INIT: verity-open\n\
+NAU-INIT: start\n\
+NAU-INIT: modules-loaded\n\
+NAU-INIT: root=/dev/vda2 hash=/dev/vda3\n\
+NAU-INIT: verity-open\n\
 [    0.545547] EXT4-fs (dm-0): write access unavailable, skipping orphan cleanup\n\
-SHUTTLE-INIT: mounted\n\
-SHUTTLE-INIT: switch-root\n\
+NAU-INIT: mounted\n\
+NAU-INIT: switch-root\n\
 [    0.786046] systemd[1]: network-manager-networkmanager.service: Two services allocated for the same bus name fi.w1.wpa_supplicant1, refusing operation.\n\
 [FAILED] Failed to start Network Time Synchronization.\n\
 [FAILED] Failed to start Network Time Synchronization.\n\
@@ -1731,7 +1731,7 @@ Press enter to configure.\n";
             !is_completion_line(painted),
             "raw colored text must not be the matching path"
         );
-        let ev = analyze_log(&format!("SHUTTLE-INIT: switch-root\n{painted}"));
+        let ev = analyze_log(&format!("NAU-INIT: switch-root\n{painted}"));
         assert!(
             ev.completion
                 .as_deref()
@@ -1748,14 +1748,14 @@ Press enter to configure.\n";
     }
 
     fn console_conf_stall_fails_by_default() {
-        // The regression from issue #84: userspace is up and shuttle's own
+        // The regression from issue #84: userspace is up and nau's own
         // /init handed off, but the boot parks on console-conf and never
         // reaches default.target. The handoff-only gate passed it; the
         // default completion gate must fail it.
         let ev = analyze_log(CONSOLE_CONF_LOG);
         assert!(ev.userspace, "console-conf proves userspace");
         assert!(ev.panic.is_none());
-        assert_eq!(ev.handoff.as_deref(), Some("SHUTTLE-INIT: switch-root"));
+        assert_eq!(ev.handoff.as_deref(), Some("NAU-INIT: switch-root"));
         assert!(
             ev.completion.is_none(),
             "a console-conf stall never reaches a completed target"
@@ -1801,7 +1801,7 @@ Press enter to configure.\n";
     /// exits 0 on the guest reboot. Userspace and handoff markers are all
     /// present — which is exactly why the old gate passed it.
     const EMERGENCY_REBOOT_LOG: &str = "\
-SHUTTLE-INIT: switch-root\n\
+NAU-INIT: switch-root\n\
 [    1.512003] systemd[1]: systemd 255 running in system mode.\n\
 [    2.113744] systemd[1]: Reached target Local File Systems.\n\
 [    2.204112] systemd[1]: Reached target Emergency Mode.\n\
@@ -1833,7 +1833,7 @@ SHUTTLE-INIT: switch-root\n\
         // markers were written used to pass; without a completion signal it
         // must fail — the markers say systemd ran, not that boot finished.
         let log = "\
-SHUTTLE-INIT: switch-root\n\
+NAU-INIT: switch-root\n\
 [    2.100000] systemd[1]: systemd 255 running in system mode.\n\
 [    3.200000] systemd[1]: Reached target Basic System.\n\
 [    4.900000] systemd[1]: Started some-long-running-unit.service.\n";
@@ -1856,7 +1856,7 @@ SHUTTLE-INIT: switch-root\n\
         // gate is the default, not an opt-in.
         let log = format!(
             "\
-SHUTTLE-INIT: switch-root\n\
+NAU-INIT: switch-root\n\
 [    2.100000] systemd[1]: systemd 255 running in system mode.\n\
 [    3.200000] systemd[1]: Reached target Basic System.\n\
 [    4.400000] systemd[1]: {BOOT_COMPLETE_MARKER}.\n"
@@ -1931,7 +1931,7 @@ SHUTTLE-INIT: switch-root\n\
 
         // With it, the boot passes and the target line is reported.
         let log = "\
-SHUTTLE-INIT: switch-root\n\
+NAU-INIT: switch-root\n\
 [    0.786046] systemd[1]: systemd 255 running in system mode.\n\
 [    4.400000] systemd[1]: Reached target Boot Completion Check.\n";
         let runner = FakeRunner::new(vec![Script {
@@ -2019,7 +2019,7 @@ SHUTTLE-INIT: switch-root\n\
     fn run_boot_no_handoff_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let test = sample_test(tmp.path(), Accel::Kvm, true);
-        // Userspace marker present, but no shuttle init handoff.
+        // Userspace marker present, but no nau init handoff.
         let log = "[    2.000000] systemd[1]: systemd 255 running in system mode.\n";
         let runner = FakeRunner::new(vec![Script {
             code: 124,

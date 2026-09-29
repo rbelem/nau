@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # T13 cutover acceptance sweep — checklist §4.6, issues #95/#96.
 # Enters a fresh interactive login shell on a pty so ~/.bashrc.d
-# (90-shuttle.sh) is sourced and the pod farm, secrets, and venv are live.
+# (90-nau.sh) is sourced and the pod farm, secrets, and venv are live.
 #
 #   examples/cutover/verify-sweep.sh          # post-cutover: must exit 0
 set -u
 
-DAILY="$HOME/.local/share/shuttle/pods/daily"
+DAILY="$HOME/.local/share/nau/pods/daily"
 
 inner() {
   local rc=0
@@ -83,13 +83,13 @@ inner() {
   return "$rc"
 }
 
-if [ -n "${SHUTTLE_SWEEP_INNER:-}" ]; then
+if [ -n "${NAU_SWEEP_INNER:-}" ]; then
   inner
   rc=$?
   [ "$rc" -eq 0 ] && echo 'INNER: all gates green' || echo 'INNER: gates red'
   # ble.sh intercepts the interactive exit and can swallow the status,
   # so the verdict travels through a file, not the pty's exit code.
-  printf '%s\n' "$rc" > "${SHUTTLE_SWEEP_RCFILE:?SHUTTLE_SWEEP_RCFILE required}"
+  printf '%s\n' "$rc" > "${NAU_SWEEP_RCFILE:?NAU_SWEEP_RCFILE required}"
   set +u
   exit "$rc"
 fi
@@ -101,7 +101,7 @@ trap 'rm -f "$RCFILE"' EXIT
 # pty before the login shell has read the source line (racy). The
 # inner's `exit` ends the session long before the window expires.
 { printf 'source %q\n' "$SELF"; sleep 60; } \
-  | script -qec "env SHUTTLE_SWEEP_INNER=1 SHUTTLE_SWEEP_RCFILE='$RCFILE' bash -li" /dev/null \
+  | script -qec "env NAU_SWEEP_INNER=1 NAU_SWEEP_RCFILE='$RCFILE' bash -li" /dev/null \
   && [ -f "$RCFILE" ] && [ "$(cat "$RCFILE")" = 0 ]
 rc=$?
 [ "$rc" -eq 0 ] && { echo 'SWEEP: all gates green'; exit 0; }

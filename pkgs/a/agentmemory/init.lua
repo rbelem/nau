@@ -89,7 +89,7 @@ return {
             -- Stage the production node_modules closure next to dist/
             -- (zg.lua tar-copy pattern): dist's bare-specifier imports
             -- (see header) resolve via node's upward node_modules walk.
-            'tar -C "$SHUTTLE_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
+            'tar -C "$NAU_DEPS_DIR" -cf - node_modules | tar -C "$pkg" -xf -',
             "install -m755 $SRC/iii/iii $STAGE/usr/bin/iii",
         }, " && "),
 

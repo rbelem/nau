@@ -1,4 +1,4 @@
-//! Package lint — the check battery behind `shuttle lint` (issue #53).
+//! Package lint — the check battery behind `nau lint` (issue #53).
 //!
 //! One function per check, registered in [`registry`]; the CLI iterates the
 //! registry, so adding a check is one function plus one registration line.
@@ -13,7 +13,7 @@
 //! `Error` means the build (or pod mutation) would fail — or provably ship
 //! a broken artifact. `Warn` means suspicious: the build would succeed, but
 //! the declaration carries a shape this repo has already been burned by.
-//! `shuttle lint` exits nonzero ONLY on errors, never warnings.
+//! `nau lint` exits nonzero ONLY on errors, never warnings.
 //!
 //! # Offline guarantee
 //!
@@ -101,14 +101,14 @@ pub struct PodPackageMeta {
     pub meta: Option<crate::snap::SnapMeta>,
 }
 
-/// The pod half of the lint input (populated by `shuttle lint --pod`).
+/// The pod half of the lint input (populated by `nau lint --pod`).
 #[derive(Debug, Clone, Default)]
 pub struct PodLintData {
     pub name: String,
     pub packages: Vec<PodPackageMeta>,
 }
 
-/// Everything the check battery sees. Built once by `shuttle lint`, shared
+/// Everything the check battery sees. Built once by `nau lint`, shared
 /// by every check — the seam where future inputs (lockfiles for the #52
 /// audit, built payload listings) would land.
 pub struct LintInput<'a> {
@@ -203,7 +203,7 @@ pub fn run_battery(input: &LintInput) -> Vec<Finding> {
     findings
 }
 
-/// Whether any finding is an error — the only thing `shuttle lint` gates on.
+/// Whether any finding is an error — the only thing `nau lint` gates on.
 pub fn has_errors(findings: &[Finding]) -> bool {
     findings.iter().any(|f| f.severity == Severity::Error)
 }
@@ -408,7 +408,7 @@ fn audit_snap_pins(
                 ),
                 format!(
                     "re-record the pin on the channel it was resolved from \
-                     (`shuttle index resolve --base {base}`) or delete it"
+                     (`nau index resolve --base {base}`) or delete it"
                 ),
             ));
         }
@@ -438,7 +438,7 @@ fn audit_snap_pins(
                  the build ignores them and resolves from the store (offline builds fail \
                  here)",
             ),
-            format!("bake pins for the derived channel: `shuttle index resolve --base {base}`"),
+            format!("bake pins for the derived channel: `nau index resolve --base {base}`"),
         ));
     }
     findings
@@ -570,7 +570,7 @@ fn check_store_aliases(input: &LintInput) -> Vec<Finding> {
                  Store by this exact name; a wrong store name fails like issue #68 \
                  ('pc-gadget' has no store snap; the gadget is 'pc')",
                 "add the index entry with the store's real name: \
-                 `shuttle index add <name> --store-name <store-name>`",
+                 `nau index add <name> --store-name <store-name>`",
             ));
         }
     }
@@ -937,7 +937,7 @@ fn duplicate_app_finding(
                  package's app deterministically",
                 names.join(" and ")
             ),
-            "rename one app or drop one of the packages so `shuttle run` is unambiguous",
+            "rename one app or drop one of the packages so `nau run` is unambiguous",
         )
     }
 }
@@ -946,7 +946,7 @@ fn duplicate_app_finding(
 ///
 /// The farm resolves duplicate binary names deterministically with a
 /// warning (`farm::warn_emit_collision`) — the earlier package's app
-/// becomes unreachable by name, which is a real foot-gun (`shuttle run`
+/// becomes unreachable by name, which is a real foot-gun (`nau run`
 /// execs the survivor). When BOTH duplicates carry `.desktop` files, pod
 /// mutation fails outright (same-precedence desktop app-ID collision,
 /// issue #7) — an **error**. Plain duplicates are a **warning**.
@@ -972,7 +972,7 @@ fn check_unparsed_declarations(input: &LintInput) -> Vec<Finding> {
                 key.clone(),
                 Severity::Warn,
                 "validates as neither a package nor an image declaration — eval skips it",
-                "fix the schema error `shuttle check` reports for this output",
+                "fix the schema error `nau check` reports for this output",
             )
         })
         .collect()
@@ -1118,7 +1118,7 @@ mod tests {
         }
         fn build(&self) -> LintInput<'_> {
             LintInput {
-                file: Path::new("shuttle.lua"),
+                file: Path::new("nau.lua"),
                 arch: "amd64",
                 channel: "latest/stable",
                 outputs: &self.outputs,

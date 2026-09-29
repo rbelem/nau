@@ -19,7 +19,7 @@
 //! conflicts → the merge is a no-op beyond copying.
 //!
 //! The payloads come from the existing build machinery: a dependency's
-//! `.snap` (built by `shuttle build` into the output dir or fetched from
+//! `.snap` (built by `nau build` into the output dir or fetched from
 //! the binary cache) is data-only unpacked with `unsquashfs` — never
 //! executed, never mounted.
 
@@ -312,7 +312,7 @@ fn rewrite_file(
     let real = crate::snap::real_sibling_name(file_name);
     let rewritten = rewrite_blob_execs(&rewritten, &real);
 
-    // 3. Preserve the caller's PYTHONPATH behind the SHUTTLE_PYTHONPATH
+    // 3. Preserve the caller's PYTHONPATH behind the NAU_PYTHONPATH
     //    channel (farm scrub → prefix append; see the fn doc).
     let rewritten = preserve_caller_pythonpath(&rewritten);
 
@@ -389,7 +389,7 @@ fn strip_extension_segments(text: &str) -> String {
 }
 
 /// Re-point the python tree wrapper's `PYTHONPATH` scrub for the prefix.
-/// The farm wrapper replaces `PYTHONPATH` with the `SHUTTLE_PYTHONPATH`
+/// The farm wrapper replaces `PYTHONPATH` with the `NAU_PYTHONPATH`
 /// channel (a host PYTHONPATH would shadow the pod's site-packages). In
 /// the merged build prefix the caller IS the build system: meson hands
 /// build-time generators the source root through `PYTHONPATH`, and the
@@ -398,8 +398,8 @@ fn strip_extension_segments(text: &str) -> String {
 /// caller value expands to today's behavior exactly.
 fn preserve_caller_pythonpath(text: &str) -> String {
     text.replace(
-        "PYTHONPATH=\"${SHUTTLE_PYTHONPATH:-}\"\n",
-        "PYTHONPATH=\"${SHUTTLE_PYTHONPATH:-}${PYTHONPATH:+:$PYTHONPATH}\"\n",
+        "PYTHONPATH=\"${NAU_PYTHONPATH:-}\"\n",
+        "PYTHONPATH=\"${NAU_PYTHONPATH:-}${PYTHONPATH:+:$PYTHONPATH}\"\n",
     )
 }
 
@@ -1097,7 +1097,7 @@ mod tests {
             "#!/bin/sh\n\
              SCRIPT=\"$(readlink -f \"$0\")\"\n\
              PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
-             PYTHONPATH=\"${{SHUTTLE_PYTHONPATH:-}}\"\n\
+             PYTHONPATH=\"${{NAU_PYTHONPATH:-}}\"\n\
              export PYTHONPATH\n\
              exec \"$PODROOT/active/extensions/{pkg}/usr/{real_rel}\" \"$@\"\n"
         )
@@ -1211,7 +1211,7 @@ mod tests {
 
     /// The python tree wrapper scrubs inherited `PYTHONPATH` for the farm;
     /// in the prefix the caller's value must survive behind the
-    /// `SHUTTLE_PYTHONPATH` channel (xkeyboard-config `rules.generator`
+    /// `NAU_PYTHONPATH` channel (xkeyboard-config `rules.generator`
     /// died on this: meson hands build-time generators the source root
     /// through `PYTHONPATH`, the wrapper dropped it, `-m` import failed).
     #[test]
@@ -1240,12 +1240,11 @@ mod tests {
         .expect("the python wrapper must stage");
         let rewritten = std::fs::read_to_string(merged.path().join("usr/bin/python3")).unwrap();
         assert!(
-            rewritten
-                .contains("PYTHONPATH=\"${SHUTTLE_PYTHONPATH:-}${PYTHONPATH:+:$PYTHONPATH}\"\n"),
+            rewritten.contains("PYTHONPATH=\"${NAU_PYTHONPATH:-}${PYTHONPATH:+:$PYTHONPATH}\"\n"),
             "the scrub must append the caller's PYTHONPATH: {rewritten}"
         );
         assert!(
-            !rewritten.contains("PYTHONPATH=\"${SHUTTLE_PYTHONPATH:-}\"\n"),
+            !rewritten.contains("PYTHONPATH=\"${NAU_PYTHONPATH:-}\"\n"),
             "the bare scrub must not survive prefix staging: {rewritten}"
         );
     }

@@ -1,4 +1,4 @@
-//! `shuttle pod` services declarations (ADR-0032, issue #105).
+//! `nau pod` services declarations (ADR-0032, issue #105).
 //!
 //! Drives the real binary end to end through the FULL chain: a package
 //! declares `services = { … }`, `pod add` records it through the
@@ -146,10 +146,10 @@ fn write_service_pkg(project: &Path, name: &str, service: &str, marker: &str, po
 
 // ── Runners ──
 
-/// Run `shuttle pod [--name <pod>] <verb...>` against the project and
+/// Run `nau pod [--name <pod>] <verb...>` against the project and
 /// pod root. Pod names come BEFORE the verb by design (issue #4).
 ///
-/// `SHUTTLE_SERVICE_BACKEND=systemd` pins the service backend (ADR-0032
+/// `NAU_SERVICE_BACKEND=systemd` pins the service backend (ADR-0032
 /// Decision 11 fail-closed selection); `XDG_CONFIG_HOME` redirects the
 /// systemd user unit dir the emitter links enabled services into. Both
 /// tempdirs live under the test root — never the real home.
@@ -159,19 +159,19 @@ fn run_named(
     pod: &str,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod");
     if !pod.is_empty() {
         cmd.arg("--name").arg(pod);
     }
     cmd.args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
-    cmd.env("SHUTTLE_SERVICE_BACKEND", "systemd");
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_SERVICE_BACKEND", "systemd");
     cmd.env("XDG_CONFIG_HOME", root.join("config-home"));
     // Keep pod activation off the host systemd bus (issue #66).
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -261,7 +261,7 @@ gated_test!(same_precedence_service_collision_errors_with_zero_writes, {
     let (code, _, stderr) = run(project.path(), root.path(), &["add", "svc-a"]);
     assert_eq!(code, Some(0), "svc-a add failed: {stderr}");
     let gens_before = generation_count(root.path(), "default");
-    let lock_before = snapshot(&pod_dir(root.path(), "default").join("shuttle.lock"));
+    let lock_before = snapshot(&pod_dir(root.path(), "default").join("nau.lock"));
     let current_before = snapshot(&pod_dir(root.path(), "default").join("current"));
 
     let (code, _, stderr) = run(project.path(), root.path(), &["add", "svc-b"]);
@@ -280,7 +280,7 @@ gated_test!(same_precedence_service_collision_errors_with_zero_writes, {
         "collision must not bump the generation"
     );
     assert_eq!(
-        snapshot(&pod_dir(root.path(), "default").join("shuttle.lock")),
+        snapshot(&pod_dir(root.path(), "default").join("nau.lock")),
         lock_before,
         "collision must not write the lockfile"
     );
@@ -304,7 +304,7 @@ gated_test!(service_override_unknown_name_fails_before_any_mutation, {
     let (code, _, stderr) = run(project.path(), root.path(), &["add", "svc-a"]);
     assert_eq!(code, Some(0), "svc-a add failed: {stderr}");
     let gens_before = generation_count(root.path(), "default");
-    let lock_before = snapshot(&pod_dir(root.path(), "default").join("shuttle.lock"));
+    let lock_before = snapshot(&pod_dir(root.path(), "default").join("nau.lock"));
 
     // A typo'd service name is a hard error at reconcile — the override
     // must reference a declared service (ADR-0032 Decision 3).
@@ -333,7 +333,7 @@ gated_test!(service_override_unknown_name_fails_before_any_mutation, {
         "failed validation must not bump the generation"
     );
     assert_eq!(
-        snapshot(&pod_dir(root.path(), "default").join("shuttle.lock")),
+        snapshot(&pod_dir(root.path(), "default").join("nau.lock")),
         lock_before,
         "failed validation must not write the lockfile"
     );
@@ -382,7 +382,7 @@ fn unit_link(root: &Path, pod: &str, svc: &str) -> PathBuf {
     root.join("config-home")
         .join("systemd")
         .join("user")
-        .join(format!("shuttle-pod-{pod}-{svc}.service"))
+        .join(format!("nau-pod-{pod}-{svc}.service"))
 }
 
 fn services_dir(root: &Path, pod: &str, gen: u64) -> PathBuf {
@@ -450,7 +450,7 @@ gated_test!(service_unit_is_recorded_and_artifact_is_emitted_disabled, {
         .unwrap_or(false));
     assert!(
         services_dir(root.path(), "default", 1)
-            .join("shuttle-pod-default-dup-svc.service")
+            .join("nau-pod-default-dup-svc.service")
             .exists(),
         "the unit artifact is emitted inside the generation"
     );
@@ -594,7 +594,7 @@ fn secret_svc_fixture() -> Option<SecretSvcFixture> {
     }
     let project = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
-    let run_dir = shm.join(format!("shuttle-svc-{}-sec", std::process::id()));
+    let run_dir = shm.join(format!("nau-svc-{}-sec", std::process::id()));
     std::fs::create_dir_all(&run_dir).unwrap();
     let serve = root.path().join("serve");
     std::fs::create_dir_all(&serve).unwrap();
@@ -645,11 +645,11 @@ fn svc_envfile_hash(root: &Path) -> String {
         .to_string();
     let refs = std::collections::BTreeMap::from([(
         "SVC_KEY".to_string(),
-        shuttle::pod::SecretSource::Exec {
+        nau::pod::SecretSource::Exec {
             command: vec![command],
         },
     )]);
-    shuttle::secrets::decl_hash(&refs).unwrap()
+    nau::secrets::decl_hash(&refs).unwrap()
 }
 
 gated_test!(
@@ -660,7 +660,7 @@ gated_test!(
             return;
         };
         let run_named_in = |args: &[&str]| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
             cmd.arg("pod").arg("--name").arg("default");
             // `secrets` is the one verb whose `--root` precedes its
             // subcommand; every other verb takes it last.
@@ -671,10 +671,10 @@ gated_test!(
                 cmd.args(args).arg("--root").arg(fx.root.path());
             }
             cmd.current_dir(fx.project.path());
-            cmd.env("SHUTTLE_DATA_HOME", fx.root.path().join("data-home"));
-            cmd.env("SHUTTLE_SERVICE_BACKEND", "systemd");
+            cmd.env("NAU_DATA_HOME", fx.root.path().join("data-home"));
+            cmd.env("NAU_SERVICE_BACKEND", "systemd");
             cmd.env("XDG_CONFIG_HOME", fx.root.path().join("config-home"));
-            cmd.env("SHUTTLE_SYSTEMD", "off");
+            cmd.env("NAU_SYSTEMD", "off");
             cmd.env("XDG_RUNTIME_DIR", &fx.run_dir);
             let out = cmd.output().unwrap();
             (
@@ -693,10 +693,10 @@ gated_test!(
         let hash = svc_envfile_hash(fx.root.path());
         let artifact = pod_dir(fx.root.path(), "default")
             .join("generations/1/services")
-            .join("shuttle-pod-default-sec-svc.service");
+            .join("nau-pod-default-sec-svc.service");
         let unit_text = std::fs::read_to_string(&artifact).unwrap();
         let expected_line = format!(
-            "EnvironmentFile=\"{}/shuttle/secrets/default/{hash}.env\"\n",
+            "EnvironmentFile=\"{}/nau/secrets/default/{hash}.env\"\n",
             fx.run_dir.display()
         );
         assert!(
@@ -709,7 +709,7 @@ gated_test!(
         );
         let envfile = fx
             .run_dir
-            .join("shuttle")
+            .join("nau")
             .join("secrets")
             .join("default")
             .join(format!("{hash}.env"));

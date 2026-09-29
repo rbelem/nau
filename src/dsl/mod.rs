@@ -1,6 +1,6 @@
 /// The injected Lua globals source (snap(), app(), etc.).
 ///
-/// Loaded into the mlua context before evaluating the user's shuttle.lua.
+/// Loaded into the mlua context before evaluating the user's nau.lua.
 pub const INIT_LUA: &str = include_str!("init.lua");
 
 /// The full eval prelude: the DSL globals plus the built-in plugin registry
@@ -11,7 +11,7 @@ pub fn prelude() -> String {
         .into_iter()
         .map(|name| format!("{name} = true"))
         .collect();
-    format!("{INIT_LUA}\nshuttle_plugins = {{ {} }}\n", names.join(", "))
+    format!("{INIT_LUA}\nnau_plugins = {{ {} }}\n", names.join(", "))
 }
 
 #[cfg(test)]

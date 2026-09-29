@@ -1,7 +1,7 @@
 //! Pull reference grammar for the sharing lanes (ADR-0033 Decisions 5
-//! and 10): one `shuttle pull <reference>` argument dispatches across
+//! and 10): one `nau pull <reference>` argument dispatches across
 //! three lanes — the existing OCI registries, direct peer addresses
-//! (`shuttle://host[:port]/<pkg>`), and static export trees behind any
+//! (`nau://host[:port]/<pkg>`), and static export trees behind any
 //! web server (`http(s)://…/<pkg>`).
 //!
 //! Parsing is total and fail-closed: every lane's package name is
@@ -14,7 +14,7 @@
 
 use crate::oci;
 
-/// Default port of a `shuttle://` peer reference (ADR-0033 Decision 4:
+/// Default port of a `nau://` peer reference (ADR-0033 Decision 4:
 /// one configurable, unprivileged port; 7780 everywhere a default is
 /// needed — CLI flag, `node {}` serve address, peer reference).
 pub const DEFAULT_PEER_PORT: u16 = 7780;
@@ -36,20 +36,20 @@ impl Url {
     }
 }
 
-/// One parsed `shuttle pull` reference.
+/// One parsed `nau pull` reference.
 #[derive(Debug, Clone)]
 pub enum PullRef {
     /// The existing OCI-registry lane (ADR-0012 Decision 7) — behavior
     /// unchanged, dispatched to the original pull body.
     Oci(crate::oci::Reference),
-    /// A peer serving its store: `shuttle://host[:port]/<pkg>`.
+    /// A peer serving its store: `nau://host[:port]/<pkg>`.
     Peer {
         host: String,
         port: u16,
         pkg: String,
     },
     /// A static export tree (Decision 10): `http(s)://…/<pkg>` — any
-    /// web server works, no shuttle code runs server-side.
+    /// web server works, no nau code runs server-side.
     Url { url: Url, pkg: String },
 }
 
@@ -57,7 +57,7 @@ impl PullRef {
     /// Parse a pull reference across the three lanes (see the module
     /// docs for the grammar and the charset rule).
     pub fn parse(s: &str) -> miette::Result<PullRef> {
-        if let Some(rest) = s.strip_prefix("shuttle://") {
+        if let Some(rest) = s.strip_prefix("nau://") {
             return Self::parse_peer(rest, s);
         }
         if s.starts_with("http://") || s.starts_with("https://") {
@@ -66,12 +66,12 @@ impl PullRef {
         Ok(PullRef::Oci(oci::Reference::parse(s)?))
     }
 
-    /// `host[:port]/pkg` — the part after `shuttle://`.
+    /// `host[:port]/pkg` — the part after `nau://`.
     fn parse_peer(rest: &str, original: &str) -> miette::Result<PullRef> {
         let Some((authority, pkg)) = rest.split_once('/') else {
             miette::bail!(
                 "peer reference '{original}' carries no package name — \
-                 expected shuttle://host[:port]/<pkg>"
+                 expected nau://host[:port]/<pkg>"
             );
         };
         Self::validate_pkg(pkg, original)?;
@@ -87,7 +87,7 @@ impl PullRef {
     }
 
     /// The authority: `host[:port]`. Bracketed IPv6 literals
-    /// (`shuttle://[::1]/pkg`, `shuttle://[::1]:7780/pkg`) parse whole —
+    /// (`nau://[::1]/pkg`, `nau://[::1]:7780/pkg`) parse whole —
     /// a bare `rsplit_once(':')` would split inside the brackets. The
     /// stored `host` is the bare literal; URL builders re-bracket it.
     fn parse_authority(authority: &str, original: &str) -> miette::Result<(String, u16)> {
@@ -95,7 +95,7 @@ impl PullRef {
             let Some((host, tail)) = inner.split_once(']') else {
                 miette::bail!(
                     "peer reference '{original}' has an unterminated '[' — \
-                     expected shuttle://[host][:port]/<pkg>"
+                     expected nau://[host][:port]/<pkg>"
                 );
             };
             let port = match tail.strip_prefix(':') {
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn peer_reference_parses_host_port_pkg() {
-        let r = PullRef::parse("shuttle://nuci.local:7780/hello").unwrap();
+        let r = PullRef::parse("nau://nuci.local:7780/hello").unwrap();
         match r {
             PullRef::Peer { host, port, pkg } => {
                 assert_eq!(host, "nuci.local");
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn peer_reference_defaults_port() {
-        let r = PullRef::parse("shuttle://nuci.local/hello").unwrap();
+        let r = PullRef::parse("nau://nuci.local/hello").unwrap();
         match r {
             PullRef::Peer { host, port, pkg } => {
                 assert_eq!(host, "nuci.local");
@@ -212,7 +212,7 @@ mod tests {
     /// brackets and mis-parse both shapes.
     #[test]
     fn bracketed_ipv6_peer_references_parse_whole() {
-        let explicit = PullRef::parse("shuttle://[::1]:7780/hello").unwrap();
+        let explicit = PullRef::parse("nau://[::1]:7780/hello").unwrap();
         match explicit {
             PullRef::Peer { host, port, pkg } => {
                 assert_eq!(host, "::1");
@@ -221,7 +221,7 @@ mod tests {
             }
             other => panic!("expected Peer, got {other:?}"),
         }
-        let defaulted = PullRef::parse("shuttle://[::1]/hello").unwrap();
+        let defaulted = PullRef::parse("nau://[::1]/hello").unwrap();
         match defaulted {
             PullRef::Peer { host, port, pkg } => {
                 assert_eq!(host, "::1");
@@ -234,17 +234,17 @@ mod tests {
 
     #[test]
     fn unterminated_bracket_is_refused() {
-        assert!(PullRef::parse("shuttle://[::1/hello").is_err());
-        assert!(PullRef::parse("shuttle://[]/hello").is_err());
+        assert!(PullRef::parse("nau://[::1/hello").is_err());
+        assert!(PullRef::parse("nau://[]/hello").is_err());
     }
 
     #[test]
     fn static_url_parses_pkg_from_final_segment() {
-        let r = PullRef::parse("https://mirror.example/shuttle/git").unwrap();
+        let r = PullRef::parse("https://mirror.example/nau/git").unwrap();
         match r {
             PullRef::Url { url, pkg } => {
                 assert_eq!(pkg, "git");
-                assert_eq!(url.as_str(), "https://mirror.example/shuttle/git");
+                assert_eq!(url.as_str(), "https://mirror.example/nau/git");
             }
             other => panic!("expected Url, got {other:?}"),
         }
@@ -274,17 +274,16 @@ mod tests {
 
     #[test]
     fn peer_reference_with_empty_pkg_is_refused() {
-        assert!(PullRef::parse("shuttle://nuci.local/").is_err());
-        assert!(PullRef::parse("shuttle://nuci.local").is_err());
-        assert!(PullRef::parse("shuttle:///hello").is_err());
+        assert!(PullRef::parse("nau://nuci.local/").is_err());
+        assert!(PullRef::parse("nau://nuci.local").is_err());
+        assert!(PullRef::parse("nau:///hello").is_err());
     }
 
     #[test]
     fn peer_reference_with_out_of_range_port_is_refused() {
-        let err =
-            PullRef::parse("shuttle://nuci.local:99999/hello").expect_err("99999 exceeds u16");
+        let err = PullRef::parse("nau://nuci.local:99999/hello").expect_err("99999 exceeds u16");
         assert!(err.to_string().contains("out-of-range port '99999'"));
-        assert!(PullRef::parse("shuttle://nuci.local:/hello").is_err());
+        assert!(PullRef::parse("nau://nuci.local:/hello").is_err());
     }
 
     #[test]
@@ -297,16 +296,16 @@ mod tests {
 
     #[test]
     fn package_names_are_charset_checked_on_both_lanes() {
-        let err = PullRef::parse("shuttle://nuci.local/Hello_World")
+        let err = PullRef::parse("nau://nuci.local/Hello_World")
             .expect_err("uppercase/underscore must be refused");
         assert!(err.to_string().contains("[a-z0-9-]"));
-        assert!(PullRef::parse("https://mirror.example/shuttle/..%2fetc").is_err());
+        assert!(PullRef::parse("https://mirror.example/nau/..%2fetc").is_err());
     }
 
     #[test]
     fn static_url_without_final_pkg_segment_is_refused() {
         assert!(PullRef::parse("https://mirror.example").is_err());
         assert!(PullRef::parse("https://mirror.example/").is_err());
-        assert!(PullRef::parse("https://mirror.example/shuttle/git/").is_err());
+        assert!(PullRef::parse("https://mirror.example/nau/git/").is_err());
     }
 }

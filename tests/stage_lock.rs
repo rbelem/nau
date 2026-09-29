@@ -4,7 +4,7 @@
 //! stage inode flipping mid-build. Now a default-stage build takes a
 //! cross-process flock (`stage.lock` next to `stage/`): a second
 //! concurrent default-stage build refuses loudly, pointing at `--stage`.
-//! Drives `shuttle build` over the real binary against a synthetic
+//! Drives `nau build` over the real binary against a synthetic
 //! package, exactly like tests/leak_scan.rs.
 
 use std::path::{Path, PathBuf};
@@ -91,7 +91,7 @@ fn write_project(project: &Path, port: u16, sleep_secs: u32) {
     assert!(status.success(), "tar failed");
 
     std::fs::write(
-        project.join("shuttle.lua"),
+        project.join("nau.lua"),
         format!(
             r#"return {{ default = snap {{
     name = "hello",
@@ -106,7 +106,7 @@ fn write_project(project: &Path, port: u16, sleep_secs: u32) {
     .unwrap();
 }
 
-/// Spawn `shuttle build` in `project`; `extra` carries --stage/--output.
+/// Spawn `nau build` in `project`; `extra` carries --stage/--output.
 /// Returns a handle so tests can run builds concurrently.
 fn spawn_build(
     project: PathBuf,
@@ -115,13 +115,13 @@ fn spawn_build(
 ) -> std::thread::JoinHandle<(Option<i32>, String, String)> {
     std::thread::spawn(move || {
         std::fs::create_dir_all(&out).unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
         cmd.arg("build")
             .arg("--output")
             .arg(&out)
             .args(&extra)
             .current_dir(&project);
-        let result = cmd.output().expect("failed to spawn shuttle build");
+        let result = cmd.output().expect("failed to spawn nau build");
         (
             result.status.code(),
             String::from_utf8_lossy(&result.stdout).into_owned(),
@@ -156,7 +156,7 @@ gated_test!(two_concurrent_default_stage_builds_conflict_loudly, {
     );
     let (_, loser_err, _) = attempts.iter().find(|(c, _, _)| *c != Some(0)).unwrap();
     assert!(
-        loser_err.contains("held by another shuttle build"),
+        loser_err.contains("held by another nau build"),
         "loser must refuse loudly naming the conflict: {loser_err}"
     );
     assert!(

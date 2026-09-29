@@ -1,4 +1,4 @@
-//! `shuttle pod` install integration tests (issue #3: pod install).
+//! `nau pod` install integration tests (issue #3: pod install).
 //!
 //! Drives the real binary end to end through the FULL chain: a declared
 //! package in `pkgs/` is built with the normal snap build path (source
@@ -195,15 +195,15 @@ fn write_pkg_missing_binary(project: &Path, name: &str) {
 // ── Runners ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     // The desktop launcher surface (issue #7) writes to the user data
     // home — redirect it inside the test's tempdir, never the real home.
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66).
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -575,7 +575,7 @@ gated_test!(degraded_mode_without_squashfs_tools_installs_nothing, {
     .unwrap();
 
     // Strip the PATH so mksquashfs/unsquashfs are unfindable.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod")
         .args(["add", "jq"])
         .arg("--root")
@@ -583,7 +583,7 @@ gated_test!(degraded_mode_without_squashfs_tools_installs_nothing, {
     cmd.current_dir(project.path());
     cmd.env("PATH", "/nonexistent-empty-path");
     // Redirect the launcher surface into the test's tempdir (issue #7).
-    cmd.env("SHUTTLE_DATA_HOME", root.path().join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.path().join("data-home"));
     let out = cmd.output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     // Fail closed (issue #16): a reconcile without the squashfs pair
@@ -613,7 +613,7 @@ gated_test!(degraded_mode_without_squashfs_tools_installs_nothing, {
 /// The version a package is pinned at in the pod's lockfile.
 fn lock_pin(root: &Path, pod: &str, name: &str) -> Option<String> {
     let lock: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(pod_dir(root, pod).join("shuttle.lock")).unwrap(),
+        &std::fs::read_to_string(pod_dir(root, pod).join("nau.lock")).unwrap(),
     )
     .unwrap();
     lock["packages"][name]["version"]

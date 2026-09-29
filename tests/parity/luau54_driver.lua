@@ -1,11 +1,11 @@
 -- Lua 5.4 reference side of the ADR-0010 dual-eval parity gate (tests/eval_parity.rs).
 --
--- Mirrors the `shuttle __eval-worker` child environment (src/isolate.rs) on a
+-- Mirrors the `nau __eval-worker` child environment (src/isolate.rs) on a
 -- plain Lua 5.4 interpreter so every corpus definition can be evaluated
 -- through BOTH backends and compared at the post-eval data level:
 --
 --   1. loads the exact prelude the parent ships (dsl::prelude(), incl.
---      shuttle_plugins);
+--      nau_plugins);
 --   2. replaces the prelude's index() stub with a faithful port of the Rust
 --      callback from build_worker_lua (find-by-name-or-alias over the shipped
 --      index data + arch pin selection);

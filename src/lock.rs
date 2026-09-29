@@ -7,7 +7,7 @@ use crate::snap::SnapRef;
 
 /// A lockfile captures resolved hashes of all build inputs for reproducibility.
 ///
-/// On first build: creates `shuttle.lock` with SHA-256 of every downloaded source
+/// On first build: creates `nau.lock` with SHA-256 of every downloaded source
 /// and sha3-384 of every pinned snap.
 /// On subsequent builds: lockfile entries pin inputs even if the DSL only
 /// specified names/channels.
@@ -126,7 +126,7 @@ pub struct BuildDepsLockEntry {
 }
 
 /// The resolved-pin shape [`LockFile::record_build_dep`] records — the
-/// build_deps member of a `shuttle.lock` entry.
+/// build_deps member of a `nau.lock` entry.
 pub struct BuildDepPin {
     pub pin: Option<String>,
     pub hash: Option<String>,
@@ -209,7 +209,7 @@ pub struct SnapLockEntry {
 
 impl LockFile {
     /// Default lockfile filename.
-    pub const FILENAME: &'static str = "shuttle.lock";
+    pub const FILENAME: &'static str = "nau.lock";
 
     /// A fresh, empty lockfile at the current format version.
     pub fn empty() -> Self {
@@ -251,7 +251,7 @@ impl LockFile {
             ".{}.tmp-{}",
             path.file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("shuttle.lock"),
+                .unwrap_or("nau.lock"),
             std::process::id()
         ));
         let cleanup = |tmp: &Path| {
@@ -372,7 +372,7 @@ mod tests {
     #[test]
     fn test_lockfile_save_and_reload() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shuttle.lock");
+        let path = dir.path().join("nau.lock");
 
         let mut sources = HashMap::new();
         sources.insert(
@@ -696,7 +696,7 @@ mod tests {
     #[test]
     fn test_save_atomic_no_temp_residue_and_replaces_content() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shuttle.lock");
+        let path = dir.path().join("nau.lock");
 
         let lock = LockFile {
             version: 1,
@@ -716,13 +716,13 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(entries, vec!["shuttle.lock".to_string()], "no temp residue");
+        assert_eq!(entries, vec!["nau.lock".to_string()], "no temp residue");
     }
 
     #[test]
     fn test_save_failure_leaves_existing_lockfile_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shuttle.lock");
+        let path = dir.path().join("nau.lock");
         let lock = LockFile {
             version: 1,
             sources: HashMap::new(),
@@ -739,7 +739,7 @@ mod tests {
         // next to it.
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"x").unwrap();
-        let bad_path = blocker.join("nested").join("shuttle.lock");
+        let bad_path = blocker.join("nested").join("nau.lock");
         assert!(lock.save(&bad_path).is_err());
 
         let after = std::fs::read_to_string(&path).unwrap();

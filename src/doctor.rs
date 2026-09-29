@@ -1,8 +1,8 @@
-//! System readiness checks — `shuttle doctor`.
+//! System readiness checks — `nau doctor`.
 //!
 //! Verifies that all required tools are installed and working before
-//! attempting a build. Run via `shuttle doctor` (full surface) or
-//! `shuttle doctor --pod` (pod-verb surface only, issue #97).
+//! attempting a build. Run via `nau doctor` (full surface) or
+//! `nau doctor --pod` (pod-verb surface only, issue #97).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -72,7 +72,7 @@ impl Check {
 ///
 /// Only tools that run INSIDE the sandbox are listed: `sh` (the sandbox
 /// wrapper), `make`, and the C toolchain entry point. Host-side tools
-/// (`mksquashfs`, `bwrap`) are invoked by shuttle itself before/after the
+/// (`mksquashfs`, `bwrap`) are invoked by nau itself before/after the
 /// sandbox and are covered by the host-PATH checks above — listing them
 /// here would flag every devbox setup (devbox puts declared packages on
 /// PATH via the unbound `.devbox` profile dir, while stdenv toolchain
@@ -97,7 +97,7 @@ const SANDBOX_TOOLS: [(&str, &str); 3] = [
 /// The pod-surface floor tools (#101): doctor resolves each through
 /// [`tools::resolve`] and reports origin (provisioned vs PATH) + version.
 /// The fix text is the distro-package FALLBACK — the primary fix for a
-/// missing floor tool is `shuttle doctor --fix`, which self-provisions.
+/// missing floor tool is `nau doctor --fix`, which self-provisions.
 const POD_TOOL_FIXES: [(ToolName, &str); 5] = [
     (
         ToolName::Mksquashfs,
@@ -144,13 +144,13 @@ const POD_SANDBOX_TOOLS: [(&str, &str); 4] = [
     ),
     (
         "cc",
-        "sideload the gcc payload (`shuttle pod add --ack-unsigned --snap \
+        "sideload the gcc payload (`nau pod add --ack-unsigned --snap \
          gcc_14.2.0.snap` — carries cc and c++), or install gcc system-wide \
          (e.g. NixOS systemPackages, apt install gcc)",
     ),
     (
         "c++",
-        "sideload the gcc payload (`shuttle pod add --ack-unsigned --snap \
+        "sideload the gcc payload (`nau pod add --ack-unsigned --snap \
          gcc_14.2.0.snap` — carries cc and c++), or install g++ (e.g. apt \
          install g++, dnf install gcc-c++)",
     ),
@@ -158,7 +158,7 @@ const POD_SANDBOX_TOOLS: [(&str, &str); 4] = [
 
 /// The pod-scope tools that additionally credit the pod farms (issue
 /// #178): both C toolchain names ride the gcc payload's farm shims
-/// (commit 77964ae), and `shuttle run --pod` composes a farm-first
+/// (commit 77964ae), and `nau run --pod` composes a farm-first
 /// PATH ([`crate::confine`] `overlay_pod_env_with`) that resolves them
 /// with no host install — the check must read readiness the same way
 /// the run form does. `sh`/`make` have no payload-shim contract, so
@@ -192,7 +192,7 @@ pub fn run_all() -> Vec<Check> {
     run_scoped(Scope::Full)
 }
 
-/// Run the pod-verb checks (`shuttle doctor --pod`, issue #97): the pod
+/// Run the pod-verb checks (`nau doctor --pod`, issue #97): the pod
 /// tools (mksquashfs/unsquashfs, bwrap, curl, tar), the sandbox build
 /// toolchain (sh, make, cc, c++), and — since #155 — the mksquashfs
 /// version gate, because pod builds pay the pack cost. The remaining
@@ -200,7 +200,7 @@ pub fn run_all() -> Vec<Check> {
 /// this scope, so a machine with the pod set but no image tools reads as
 /// ready. The cc/c++ checks also credit toolchains reachable through the
 /// farm-first pod env of any healthy pod (issue #178) — readiness as
-/// `shuttle run --pod` would see it.
+/// `nau run --pod` would see it.
 pub fn run_pod() -> Vec<Check> {
     run_scoped(Scope::Pod)
 }
@@ -232,7 +232,7 @@ fn run_scoped(scope: Scope) -> Vec<Check> {
     match scope {
         Scope::Full => checks.extend(check_sandbox_tools_with(toolchain, &entries)),
         // Pod scope takes the #178 variant: cc/c++ also credit the pod
-        // farms (`shuttle run --pod`'s farm-first PATH surface).
+        // farms (`nau run --pod`'s farm-first PATH surface).
         Scope::Pod => checks.extend(
             toolchain
                 .iter()
@@ -253,7 +253,7 @@ fn run_scoped(scope: Scope) -> Vec<Check> {
 /// Check one floor tool through [`tools::resolve`]: the origin report
 /// (#101 AC-5) — `provisioned <upstream version> (tools v<set>)` vs
 /// `PATH <path> <version>` — so shadowing is visible, and a missing tool
-/// names `shuttle doctor --fix` plus the escape hatches (#101 AC-6).
+/// names `nau doctor --fix` plus the escape hatches (#101 AC-6).
 /// Resolution is stat-only (never executes), matching `tools`' policy.
 fn check_floor_tool(name: ToolName) -> Check {
     let manifest = tools::manifest();
@@ -295,8 +295,8 @@ fn floor_tool_check_with(
         Err(_) => Check::missing(
             name.as_str(),
             format!(
-                "run: shuttle doctor --fix (distro fallback: {distro_fix}; overrides: \
-                 SHUTTLE_TOOLS_DIR, {})",
+                "run: nau doctor --fix (distro fallback: {distro_fix}; overrides: \
+                 NAU_TOOLS_DIR, {})",
                 name.env_var()
             ),
         ),
@@ -366,7 +366,7 @@ fn check_veritysetup() -> Check {
 /// Minimum systemd major version that reads `*.transfer` transfer files
 /// from `sysupdate.d`. As of v257 transfer definitions carry the
 /// `.transfer` extension; <=256 reads `*.conf`, so the `.transfer` files
-/// shuttle emits are silently ignored on an older systemd (systemd-devel
+/// nau emits are silently ignored on an older systemd (systemd-devel
 /// v257.5 report; `sysupdate.d(5)`).
 const SYSUPDATE_TRANSFER_MIN_MAJOR: u32 = 257;
 
@@ -475,7 +475,7 @@ impl From<SysupdatePrereq> for Check {
             SysupdatePrereq::TooOld { major } => Check::error(
                 "systemd-sysupdate",
                 format!(
-                    "systemd {major} reads sysupdate.d/*.conf, but shuttle emits \
+                    "systemd {major} reads sysupdate.d/*.conf, but nau emits \
                      *.transfer — transfer definitions are only read from systemd {min}+; \
                      upgrade systemd to {min} or newer",
                     min = SYSUPDATE_TRANSFER_MIN_MAJOR,
@@ -484,7 +484,7 @@ impl From<SysupdatePrereq> for Check {
             SysupdatePrereq::Undetectable { reason } => Check::error(
                 "systemd-sysupdate",
                 format!(
-                    "cannot determine the systemd version ({reason}) — shuttle emits \
+                    "cannot determine the systemd version ({reason}) — nau emits \
                      *.transfer definitions, which only systemd {min}+ reads; verify the \
                      target has systemd {min} or newer",
                     min = SYSUPDATE_TRANSFER_MIN_MAJOR,
@@ -1145,7 +1145,7 @@ pub fn initrd_modules_check(kernel_version: &str, outcome: &InitrdModuleAudit) -
 /// hint on its existing status — the advice is advisory and never fails
 /// a command. The version gate is a tolerant triple parse (#101 AC-8:
 /// the closed 4.4/4.5/4.6 allowlist rejected the provisioner's 4.7.x
-/// builds and labelled shuttle's own provisioned tool "untested").
+/// builds and labelled nau's own provisioned tool "untested").
 fn check_squashfs_version() -> Check {
     let manifest = tools::manifest();
     let spec_version = manifest
@@ -1237,7 +1237,7 @@ const SQUASHFS_PERF_MIN: (u32, u32, u32) = (4, 7, 0);
 /// hint text, never a status — the check must not fail a command on it.
 const SQUASHFS_UPGRADE_HINT: &str = "upgrade squashfs-tools to >= 4.7 for faster builds \
      (4.7 parallelized reads — worth 20% to >10x on I/O-bound packs; \
-     `shuttle doctor --fix` provisions a pinned 4.7.x)";
+     `nau doctor --fix` provisions a pinned 4.7.x)";
 
 /// Append [`SQUASHFS_UPGRADE_HINT`] to a report line whose detected
 /// version is below [`SQUASHFS_PERF_MIN`].
@@ -1257,10 +1257,14 @@ fn version_string(v: (u32, u32, u32)) -> String {
 /// Run `-version` on a resolved mksquashfs and parse the leading
 /// `<major>.<minor>[.<patch>]` triple.
 fn mksquashfs_version(path: &Path) -> Option<(u32, u32, u32)> {
-    let out = std::process::Command::new(path)
-        .arg("-version")
-        .output()
-        .ok()?;
+    // A transient fork/exec failure under heavy parallel load (test hosts,
+    // CI runners) must not read as "version unparsable" — the probe retries
+    // once before degrading to the advisory unknown-version check.
+    let mut out = std::process::Command::new(path).arg("-version").output();
+    if out.is_err() {
+        out = std::process::Command::new(path).arg("-version").output();
+    }
+    let out = out.ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1306,11 +1310,11 @@ fn leading_u32(s: &str) -> Option<u32> {
 // tools::ToolsError::Noexec's wording.
 
 /// A probe file's content, asserted verbatim after the round-trip.
-const PROBE_CONTENT: &str = "shuttle doctor squashfs round-trip probe\n";
+const PROBE_CONTENT: &str = "nau doctor squashfs round-trip probe\n";
 /// The user xattr exercised when the host carries setfattr/getfattr.
 const XATTR_PROBE: &str = "user.probe";
 /// The marker value stored in [`XATTR_PROBE`].
-const XATTR_MARKER: &str = "shuttle-probe";
+const XATTR_MARKER: &str = "nau-probe";
 
 /// The probe checks for one doctor run: the squashfs round-trip when the
 /// pair resolves, the bwrap sandbox exec when bwrap resolves.
@@ -1380,9 +1384,9 @@ fn probe_step(bin: &Path, args: &[&str], what: &str) -> Result<(), String> {
 fn noexec_hint(what: &str, source: &io::Error) -> String {
     format!(
         "cannot execute {what}: {source} — the path is likely mounted noexec; \
-         relocate the tools root by setting SHUTTLE_TOOLS_DIR to an exec-mounted \
-         path (e.g. SHUTTLE_TOOLS_DIR=/var/tmp/shuttle-tools) and re-run \
-         `shuttle doctor --fix`"
+         relocate the tools root by setting NAU_TOOLS_DIR to an exec-mounted \
+         path (e.g. NAU_TOOLS_DIR=/var/tmp/nau-tools) and re-run \
+         `nau doctor --fix`"
     )
 }
 
@@ -1623,7 +1627,7 @@ fn check_sandbox_tools_with(tools: &[(&str, &str)], entries: &[PathBuf]) -> Vec<
 
 /// Check one pod-scope toolchain tool (issue #178):
 /// [`check_sandbox_tool`] plus a pod-env credit — the pod farms under
-/// the pod root are the surface `shuttle run --pod` searches FIRST
+/// the pod root are the surface `nau run --pod` searches FIRST
 /// (farm-first PATH), so a cc/c++ that only resolves there is ready for
 /// pod-side work and must not read as missing. The pre-#178 check
 /// flagged exactly that setup on gate pods carrying the gcc payload
@@ -1655,7 +1659,7 @@ fn check_pod_toolchain_tool_with(
 }
 
 /// Resolve `tool` through the pod farms — the first PATH entries
-/// `shuttle run --pod` composes, one farm per healthy pod.
+/// `nau run --pod` composes, one farm per healthy pod.
 fn resolve_pod_tool_in(tool: &str, farms: &[PathBuf]) -> Option<PathBuf> {
     farms
         .iter()
@@ -1672,7 +1676,7 @@ fn resolve_pod_tool_in(tool: &str, farms: &[PathBuf]) -> Option<PathBuf> {
 /// inside the bwrap sandbox the merged prefix's `usr/bin` leads
 /// instead, so a gcc `build_dep` build is unaffected by a foreign host
 /// cc), judged against the farms a healthy pod composes
-/// ([`resolve_pod_tool_in`], `shuttle run --pod`'s first entries).
+/// ([`resolve_pod_tool_in`], `nau run --pod`'s first entries).
 /// Status stays Ok in every verdict — this is the issue's "doctor
 /// hint": a wrong-tool warning, never a second missing-tool flag
 /// (absence already has the `sandbox: cc` check) and never a hard
@@ -1718,7 +1722,7 @@ fn check_cc_provenance_with(entries: &[PathBuf], farms: &[PathBuf]) -> Check {
 
 /// Farm bin dirs of every pod under the pod root whose `current` link
 /// resolves to an active generation — the farm-first PATH entries
-/// `shuttle run --pod` prepends. `doctor --pod` takes no pod name, so
+/// `nau run --pod` prepends. `doctor --pod` takes no pod name, so
 /// any healthy pod's farm counts as reachable. A missing or dangling
 /// `current` contributes nothing — doctor is a diagnostic, never a
 /// state initializer.
@@ -1827,7 +1831,7 @@ const POD_FAILED_UNITS_CHECK: &str = "pod failed units";
 /// mandatory `EnvironmentFile=` starts failed until
 /// `pod secrets refresh` re-resolves and restarts the consumers (the
 /// rotate-restart contract landed in #224). This check names that fix —
-/// `shuttle doctor --pod <name>` selects the pod. Advisory by
+/// `nau doctor --pod <name>` selects the pod. Advisory by
 /// construction: the status stays `Ok` (hint-only, the
 /// [`check_pod_version_lines`] idiom); only tool absence turns into a
 /// NAMED skip, never a failed check.
@@ -1958,7 +1962,7 @@ fn failed_unit_notice(unit: &str, envfile: &Path) -> String {
 pub fn print_report(checks: &[Check]) {
     let mut all_ok = true;
 
-    println!("shuttle doctor — system readiness check");
+    println!("nau doctor — system readiness check");
     println!();
 
     for check in checks {
@@ -2007,13 +2011,13 @@ pub fn print_notices() {
 }
 
 /// The stale-shadow warning (#101 AC-5): the installed tools set is not
-/// the manifest's version. Warn-only; `shuttle doctor --fix` re-provisions.
+/// the manifest's version. Warn-only; `nau doctor --fix` re-provisions.
 /// Carries the escape hatches (AC-6 — this reports a stale provisioned set).
 fn stale_notice() -> Option<String> {
     let stale = tools::detect_stale()?;
     Some(format!(
         "provisioned tools stale (installed v{}, manifest v{}) — run: \
-         shuttle doctor --fix (overrides: SHUTTLE_TOOLS_DIR, SHUTTLE_TOOL_<NAME>)",
+         nau doctor --fix (overrides: NAU_TOOLS_DIR, NAU_TOOL_<NAME>)",
         stale.installed, stale.manifest
     ))
 }
@@ -2464,7 +2468,7 @@ mod tests {
             "host-only out-of-roots cc must stay the error verdict: {bare:?}"
         );
 
-        // …but `shuttle run --pod` composes the farm FIRST, so with the
+        // …but `nau run --pod` composes the farm FIRST, so with the
         // farm present the tool resolves and the check must say so.
         let check = check_pod_toolchain_tool_with("cc", pod_tool("cc").1, &entries, &[farm]);
         assert!(
@@ -2533,7 +2537,7 @@ mod tests {
         );
     }
 
-    /// A cc resolving from a farm dir (the `shuttle run --pod` PATH
+    /// A cc resolving from a farm dir (the `nau run --pod` PATH
     /// shape) IS the pool toolchain — no warning.
     #[test]
     fn doctor_credits_a_cc_that_resolves_from_a_pod_farm() {
@@ -3101,44 +3105,32 @@ CONFIG_EXT4_FS=y
 
     #[test]
     fn state_partition_not_requested_is_ok() {
-        let check = state_partition_check(
-            "img",
-            false,
-            false,
-            ["/var/lib/shuttle", "/var/lib/extensions"],
-        );
+        let check =
+            state_partition_check("img", false, false, ["/var/lib/nau", "/var/lib/extensions"]);
         assert!(matches!(check.status, CheckStatus::Ok));
         assert!(check.hint.is_some());
     }
 
     #[test]
     fn state_partition_requested_and_present_is_ok() {
-        let check = state_partition_check(
-            "img",
-            true,
-            true,
-            ["/var/lib/shuttle", "/var/lib/extensions"],
-        );
+        let check =
+            state_partition_check("img", true, true, ["/var/lib/nau", "/var/lib/extensions"]);
         assert!(matches!(check.status, CheckStatus::Ok));
         let hint = check.hint.as_deref().unwrap_or_default();
         assert!(
-            hint.contains("/var/lib/shuttle"),
+            hint.contains("/var/lib/nau"),
             "hint names the paths: {hint}"
         );
     }
 
     #[test]
     fn state_partition_requested_but_absent_names_the_paths() {
-        let check = state_partition_check(
-            "img",
-            true,
-            false,
-            ["/var/lib/shuttle", "/var/lib/extensions"],
-        );
+        let check =
+            state_partition_check("img", true, false, ["/var/lib/nau", "/var/lib/extensions"]);
         assert!(matches!(check.status, CheckStatus::Missing));
         let hint = check.hint.as_deref().unwrap_or_default();
         assert!(
-            hint.contains("/var/lib/shuttle") && hint.contains("/var/lib/extensions"),
+            hint.contains("/var/lib/nau") && hint.contains("/var/lib/extensions"),
             "hint must name the affected paths: {hint}"
         );
         assert!(hint.contains("img"), "hint names the image: {hint}");
@@ -3393,7 +3385,7 @@ CONFIG_EXT4_FS=y
         // install.sh's pkg_for map: squashfs-tools, bubblewrap, curl, tar,
         // and g++ (gcc-c++ on dnf/zypper) for cc/c++ — the latter now the
         // FALLBACK text behind the gcc payload sideload (#164 follow-up).
-        // The floor tools' PRIMARY fix is `shuttle doctor --fix` (#101);
+        // The floor tools' PRIMARY fix is `nau doctor --fix` (#101);
         // the distro text stays as the named fallback.
         for (tool, fix) in POD_TOOL_FIXES {
             assert!(!fix.is_empty(), "{tool} must carry a fix hint");
@@ -3410,7 +3402,7 @@ CONFIG_EXT4_FS=y
                 "bwrap hint must name the distro package: {hint}"
             );
             assert!(
-                hint.contains("shuttle doctor --fix"),
+                hint.contains("nau doctor --fix"),
                 "missing floor tool must lead with the provision fix: {hint}"
             );
         }
@@ -3450,7 +3442,7 @@ CONFIG_EXT4_FS=y
     /// pre-#186 era excluded nothing across modules.
     use crate::test_env::ENV_LOCK;
 
-    /// Points `SHUTTLE_TOOLS_DIR` at a tempdir for the test's lifetime and
+    /// Points `NAU_TOOLS_DIR` at a tempdir for the test's lifetime and
     /// restores the previous value on drop.
     struct ToolsDirGuard {
         saved: Option<std::ffi::OsString>,
@@ -3458,7 +3450,7 @@ CONFIG_EXT4_FS=y
 
     impl ToolsDirGuard {
         fn at(path: &Path) -> Self {
-            const ENV_TOOLS_DIR: &str = "SHUTTLE_TOOLS_DIR";
+            const ENV_TOOLS_DIR: &str = "NAU_TOOLS_DIR";
             let saved = std::env::var_os(ENV_TOOLS_DIR);
             std::env::set_var(ENV_TOOLS_DIR, path);
             ToolsDirGuard { saved }
@@ -3467,7 +3459,7 @@ CONFIG_EXT4_FS=y
 
     impl Drop for ToolsDirGuard {
         fn drop(&mut self) {
-            const ENV_TOOLS_DIR: &str = "SHUTTLE_TOOLS_DIR";
+            const ENV_TOOLS_DIR: &str = "NAU_TOOLS_DIR";
             match self.saved.take() {
                 Some(v) => std::env::set_var(ENV_TOOLS_DIR, v),
                 None => std::env::remove_var(ENV_TOOLS_DIR),
@@ -3579,11 +3571,11 @@ done
         assert!(matches!(check.status, CheckStatus::Missing));
         let hint = check.hint.as_deref().unwrap_or_default();
         assert!(
-            hint.contains("shuttle doctor --fix"),
+            hint.contains("nau doctor --fix"),
             "the primary fix is the provisioner: {hint}"
         );
         assert!(
-            hint.contains("SHUTTLE_TOOLS_DIR") && hint.contains("SHUTTLE_TOOL_BWRAP"),
+            hint.contains("NAU_TOOLS_DIR") && hint.contains("NAU_TOOL_BWRAP"),
             "missing floor tools must list the escape hatches (AC-6): {hint}"
         );
         assert!(
@@ -3776,7 +3768,7 @@ done
             "{pinned:?}"
         );
 
-        // The advisory outcomes all read as ok: `shuttle doctor` exits 0.
+        // The advisory outcomes all read as ok: `nau doctor` exits 0.
         assert!(
             all_ok(&[older, modern, pinned]),
             "the version advice must never fail a command"
@@ -3887,9 +3879,9 @@ done
             "{notice}"
         );
         assert!(
-            notice.contains("shuttle doctor --fix")
-                && notice.contains("SHUTTLE_TOOLS_DIR")
-                && notice.contains("SHUTTLE_TOOL_<NAME>"),
+            notice.contains("nau doctor --fix")
+                && notice.contains("NAU_TOOLS_DIR")
+                && notice.contains("NAU_TOOL_<NAME>"),
             "stale reports must carry the fix and the escape hatches: {notice}"
         );
     }
@@ -3903,7 +3895,7 @@ done
             ProbeRun::Noexec(e) => {
                 let hint = noexec_hint("the resolved tool", &e);
                 assert!(
-                    hint.contains("noexec") && hint.contains("SHUTTLE_TOOLS_DIR"),
+                    hint.contains("noexec") && hint.contains("NAU_TOOLS_DIR"),
                     "the noexec diagnostic names the cause and workaround: {hint}"
                 );
             }
@@ -3994,12 +3986,12 @@ done
     #[test]
     fn getfattr_output_parser_reads_both_shapes() {
         // GNU getfattr prints a header plus the quoted attribute.
-        let gnu = "# file: probe.txt\nuser.probe=\"shuttle-probe\"\n";
-        assert_eq!(parse_getfattr_value(gnu).as_deref(), Some("shuttle-probe"));
+        let gnu = "# file: probe.txt\nuser.probe=\"nau-probe\"\n";
+        assert_eq!(parse_getfattr_value(gnu).as_deref(), Some("nau-probe"));
         // busybox getfattr prints just the name="value" line.
         assert_eq!(
-            parse_getfattr_value("user.probe=\"shuttle-probe\"\n").as_deref(),
-            Some("shuttle-probe")
+            parse_getfattr_value("user.probe=\"nau-probe\"\n").as_deref(),
+            Some("nau-probe")
         );
         assert_eq!(parse_getfattr_value(""), None);
         assert_eq!(parse_getfattr_value("# file: x\n"), None);
@@ -4164,7 +4156,7 @@ done
     fn pod_failed_units_names_refresh_when_envfile_gone_and_unit_failed() {
         let tmp = tempfile::tempdir().unwrap();
         let (cache, envfile) = seed_consumer_pod(tmp.path(), true);
-        let tools = fake_is_failed(tmp.path(), &["shuttle-pod-work-web.service"]);
+        let tools = fake_is_failed(tmp.path(), &["nau-pod-work-web.service"]);
         let check = check_pod_failed_units_with(tmp.path(), "work", Some(&cache), &tools);
         // Hint-only: the boot story is advisory, never a failing check.
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
@@ -4172,7 +4164,7 @@ done
         assert_eq!(
             hint,
             format!(
-                "unit 'shuttle-pod-work-web.service' starts failed: envfile {} \
+                "unit 'nau-pod-work-web.service' starts failed: envfile {} \
                  is gone (tmpfs secrets die at reboot) — run `pod secrets \
                  refresh` to re-resolve the pod's secrets and restart its \
                  consumers",
@@ -4185,7 +4177,7 @@ done
     fn pod_failed_units_quiet_when_envfile_present() {
         let tmp = tempfile::tempdir().unwrap();
         let (cache, _) = seed_consumer_pod(tmp.path(), false);
-        let tools = fake_is_failed(tmp.path(), &["shuttle-pod-work-web.service"]);
+        let tools = fake_is_failed(tmp.path(), &["nau-pod-work-web.service"]);
         let check = check_pod_failed_units_with(tmp.path(), "work", Some(&cache), &tools);
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
         assert!(check.hint.is_none(), "nothing to name: {check:?}");
@@ -4211,16 +4203,13 @@ done
         // of scope for the scan — only the consumer is named.
         let tools = fake_is_failed(
             tmp.path(),
-            &[
-                "shuttle-pod-work-web.service",
-                "shuttle-pod-work-side.service",
-            ],
+            &["nau-pod-work-web.service", "nau-pod-work-side.service"],
         );
         let check = check_pod_failed_units_with(tmp.path(), "work", Some(&cache), &tools);
         let hint = check.hint.expect("the consumer must be named");
-        assert!(hint.contains("shuttle-pod-work-web.service"), "{hint}");
+        assert!(hint.contains("nau-pod-work-web.service"), "{hint}");
         assert!(
-            !hint.contains("shuttle-pod-work-side.service"),
+            !hint.contains("nau-pod-work-side.service"),
             "non-consumer is out of scope: {hint}"
         );
     }
@@ -4236,7 +4225,7 @@ done
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
         let hint = check.hint.expect("the skip must be named");
         assert!(hint.starts_with("skipped: systemctl unavailable"), "{hint}");
-        assert!(hint.contains("shuttle-pod-work-web.service"), "{hint}");
+        assert!(hint.contains("nau-pod-work-web.service"), "{hint}");
     }
 
     #[test]
@@ -4267,7 +4256,7 @@ done
         std::fs::write(pod.join("pod.lua"), "pod {}\n").unwrap();
         activate_generation(tmp.path(), "plain");
         seed_generation_units(&pod, 3, &[("web", "ExecStart=/bin/true\n".to_string())]);
-        let tools = fake_is_failed(tmp.path(), &["shuttle-pod-plain-web.service"]);
+        let tools = fake_is_failed(tmp.path(), &["nau-pod-plain-web.service"]);
         let check =
             check_pod_failed_units_with(tmp.path(), "plain", Some(&tmp.path().join("c")), &tools);
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");

@@ -26,5 +26,5 @@ Cargo defaults, already covered by `.gitignore`:
 Project build outputs, also ignored:
 
 - `*.snap` — built packages
-- `shuttle.lock` — generated input lockfile
+- `nau.lock` — generated input lockfile
 - `stage/` — staging directory used during builds

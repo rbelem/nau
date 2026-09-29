@@ -37,7 +37,7 @@ return {
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
             -- libtool .la metadata files embed the configure-time prefix
-            -- (/shuttle-build-prefix) and are obsolete at runtime — the shared
+            -- (/nau-build-prefix) and are obsolete at runtime — the shared
             -- .so libraries and .pc pkg-config files are what consumers need.
             -- Strip them so they cannot leak the build prefix.
             "find $STAGE/usr/lib -name '*.la' -delete",
@@ -47,12 +47,12 @@ return {
         requires = { "glibc" },
         -- Interim leak-scan escape (ADR-0018 Decision 3, issue #22), same
         -- rationale as tmux/htop/tig: the leaked nix gcc wrapper bakes
-        -- RUNPATH=/shuttle-build-prefix/usr/lib64 into the produced
+        -- RUNPATH=/nau-build-prefix/usr/lib64 into the produced
         -- libraries and binaries (the lib64 spelling joined the baked
         -- set when the pool glibc payload's loader-lib list gained the
         -- lib64 dir). That path does not exist at runtime; silenced
         -- here, visibly logged by the leak scan, pending the RUNPATH
         -- repair (issue #22's portability follow-up).
-        leaks_ok = { "/shuttle-build-prefix/usr/lib64" },
+        leaks_ok = { "/nau-build-prefix/usr/lib64" },
     },
 }

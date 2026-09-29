@@ -26,7 +26,7 @@ fn main() {
 
     let tarball = manifest_dir.join(format!("luau-{LUAU_TAG}.tar.gz"));
     println!("cargo:rerun-if-changed={}", tarball.display());
-    println!("cargo:rerun-if-changed=shim/shuttle_shim.cpp");
+    println!("cargo:rerun-if-changed=shim/nau_shim.cpp");
     println!("cargo:rerun-if-changed=build.rs");
 
     let src_root = out_dir.join("luau-src");
@@ -65,9 +65,9 @@ fn main() {
             build.file(src_root.join(cpp));
         }
     }
-    build.file(manifest_dir.join("shim/shuttle_shim.cpp"));
+    build.file(manifest_dir.join("shim/nau_shim.cpp"));
 
-    build.compile("shuttle_luau_analysis");
+    build.compile("nau_luau_analysis");
 }
 
 /// Unpack `luau-0.663/{Analysis,Ast,...}/{include,src}` from the vendored

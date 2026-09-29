@@ -187,12 +187,12 @@ sync</code></pre>
               mounted, undersized, or foreign-signature target without an explicit
               override — which is exactly the argument for running it. It re-checks
               the device's roothash and the manifest's Ed25519 signature against the
-              ceremony keychain (<code>~/.config/shuttle/keys/*.pub</code>), so no
+              ceremony keychain (<code>~/.config/nau/keys/*.pub</code>), so no
               <code>--key</code> is needed once that is installed; a
               <code>--key</code> copy, like the key in step 2, comes out of band or
               nowhere. Record the reported <code>verified_key_id</code> with the
               release notes, then pull the medium and boot.</p>
-            <pre tabindex="0"><code>shuttle verify-image \
+            <pre tabindex="0"><code>nau verify-image \
     --device /dev/disk/by-id/&lt;model&gt;_&lt;serial&gt; \
     --manifest nau-cassini-1.0.0-amd64.manifest.json</code></pre>
             <p>Slot A runs Cassini; the <code>update_source</code> baked into the image
@@ -255,12 +255,12 @@ sync</code></pre>
 
   <footer class="colophon">
     <div class="wrap">
-      <span>Nau — assembled by shuttle · content per ADR-0013</span>
+      <span>Nau — assembled by nau · content per ADR-0013</span>
       <nav aria-label="Footer">
         <ul>
           <li><a href="/">Landing</a></li>
           <li><a href="/download.html">Download</a></li>
-          <li><a href="https://github.com/rbelem/shuttle">rbelem/shuttle</a></li>
+          <li><a href="https://github.com/rbelem/nau">rbelem/nau</a></li>
           <li><a href="https://cache.nau.rclb.dev/">cache lane</a></li>
         </ul>
       </nav>

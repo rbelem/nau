@@ -16,7 +16,7 @@
 --     cannot honor this image's cmdline).
 --
 -- Named scope limits (ADR-0025 amendment, #87): NO dm-verity (raspi
--- builds DM_VERITY=m and shuttle has no arm64 native initramfs yet — the
+-- builds DM_VERITY=m and nau has no arm64 native initramfs yet — the
 -- root is a plain ext4 partition, audited built-in), and NO boot
 -- assessment (try-boot/revert is a systemd-boot protocol; disk.ab and
 -- update_source are REFUSED for piboot rather than shipped inert).
@@ -43,10 +43,10 @@
 -- MMC partition) is verified only on hardware — recipe in ADR-0025.
 --
 -- Build:
---   shuttle image --file examples/full-system/pi-rootfs/shuttle.lua --arch arm64
+--   nau image --file examples/full-system/pi-rootfs/nau.lua --arch arm64
 --
 -- Requires:
---   package-index.json with resolved snaps (shuttle index resolve)
+--   package-index.json with resolved snaps (nau index resolve)
 --   parted, sfdisk, mtools, mkfs.vfat, mkfs.ext4, dd, unsquashfs on PATH
 
 return {
@@ -99,7 +99,7 @@ return {
                     name = "root",
                     -- #87, measured: the real arm64 rootfs (core22 + 4,446
                     -- pi-kernel module files + snapd + NM + the embedded
-                    -- shuttle binary) exceeds 1 GB — the "0" grow-to-fill
+                    -- nau binary) exceeds 1 GB — the "0" grow-to-fill
                     -- default is 1 GB, and a too-small root fails closed at
                     -- populate. Declare a real size.
                     size = "4G",

@@ -40,7 +40,7 @@ fn chain_available(extra: &[&str]) -> bool {
 
 /// The go closure tests build through the bwrap sandbox, so host `go`
 /// must also be sandbox-visible: a `go` resolving only from an unbound
-/// PATH entry (e.g. a shuttle pod bin dir) fails the build pre-flight
+/// PATH entry (e.g. a nau pod bin dir) fails the build pre-flight
 /// by design. Skip instead of run-to-fail, using the same resolution
 /// rules as the pre-flight itself.
 fn go_sandbox_visible() -> bool {
@@ -49,8 +49,8 @@ fn go_sandbox_visible() -> bool {
         None => return false,
     };
     let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    let visible = shuttle::snap::sandbox_visible_entries(&entries);
-    shuttle::snap::resolve_in_path("go", &visible).is_some()
+    let visible = nau::snap::sandbox_visible_entries(&entries);
+    nau::snap::resolve_in_path("go", &visible).is_some()
 }
 
 macro_rules! gated_test {
@@ -194,7 +194,7 @@ fn write_npm_dep(
         // A prebuilt native addon with a nix-store RUNPATH baked in — the
         // build-time ELF repair (tickets #12/#13) must repoint it.
         std::fs::create_dir_all(pkg.join("native")).unwrap();
-        std::fs::write(pkg.join("native/empty.c"), "void shuttle_marker(void) {}\n").unwrap();
+        std::fs::write(pkg.join("native/empty.c"), "void nau_marker(void) {}\n").unwrap();
         let status = Command::new("cc")
             .args(["-shared", "-o", "native/binding.node", "native/empty.c"])
             .arg(format!("-Wl,-rpath,{rpath}"))
@@ -218,7 +218,7 @@ fn write_npm_dep(
 }
 
 /// Write the interpreted package's source tarball (the lockfile ships
-/// inside it) and the resolvable shuttle package. `say` flows into the
+/// inside it) and the resolvable nau package. `say` flows into the
 /// lockfile's dep tarball name; `floating` toggles float mode.
 fn write_npm_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16, floating: bool) {
     let letter = name.chars().next().unwrap().to_ascii_lowercase();
@@ -271,7 +271,7 @@ fn write_npm_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16
     version = "1.0",
     source = "http://127.0.0.1:{port}/app-src.tar.gz",{float_decl}
     deps = {{ npm = {{ lock = "package-lock.json" }} }},
-    build = "mkdir -p $STAGE/lib/node_modules/{name} && cp $SRC/cli.js $STAGE/lib/node_modules/{name}/cli.js && cp -r \"$SHUTTLE_DEPS_DIR/node_modules\" $STAGE/lib/node_modules/{name}/node_modules",
+    build = "mkdir -p $STAGE/lib/node_modules/{name} && cp $SRC/cli.js $STAGE/lib/node_modules/{name}/cli.js && cp -r \"$NAU_DEPS_DIR/node_modules\" $STAGE/lib/node_modules/{name}/node_modules",
     apps = {{ {name} = {{ command = "lib/node_modules/{name}/cli.js", interpreter = "node" }} }},
 }} }}
 "#
@@ -351,7 +351,7 @@ fn write_pip_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16
     version = "1.0",
     source = "http://127.0.0.1:{port}/py-src.tar.gz",
     deps = {{ pip = {{ lock = "requirements.lock", index = "http://127.0.0.1:{port}/simple" }} }},
-    build = "mkdir -p $STAGE/lib/pymods/site-packages && python3 -m zipfile -e \"$SHUTTLE_DEPS_DIR/pcalc-1.0-py3-none-any.whl\" $STAGE/lib/pymods/site-packages && cp $SRC/main.py $STAGE/lib/pymods/main.py",
+    build = "mkdir -p $STAGE/lib/pymods/site-packages && python3 -m zipfile -e \"$NAU_DEPS_DIR/pcalc-1.0-py3-none-any.whl\" $STAGE/lib/pymods/site-packages && cp $SRC/main.py $STAGE/lib/pymods/main.py",
     apps = {{ {name} = {{ command = "lib/pymods/main.py", interpreter = "python3" }} }},
 }} }}
 "#
@@ -362,16 +362,16 @@ fn write_pip_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16
 // ── Runners (same shape as pod_install.rs) ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep the suite off the real systemd bus: without this, a pod command
     // that activates reaches `systemctl daemon-reload` on the host bus and
     // pops a polkit prompt (locally) or silently swallows "Access denied"
     // (CI). Tests that genuinely want the system tools override this.
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -434,7 +434,7 @@ fn lock_deps_pin(root: &Path, pod: &str, pkg: &str) -> (String, Option<String>) 
         #[serde(default)]
         fetched_at: Option<String>,
     }
-    let text = std::fs::read_to_string(pod_dir(root, pod).join("shuttle.lock")).unwrap();
+    let text = std::fs::read_to_string(pod_dir(root, pod).join("nau.lock")).unwrap();
     let lock: Lock = serde_json::from_str(&text).unwrap();
     let pin = lock
         .packages
@@ -686,7 +686,7 @@ gated_test!(floating_refetch_marks_and_rolls_back, &["node"], {
     );
 });
 
-// ── `shuttle deps fetch` CLI: skip cached locked, re-resolve with --latest ──
+// ── `nau deps fetch` CLI: skip cached locked, re-resolve with --latest ──
 
 gated_test!(
     deps_fetch_cli_skips_locked_and_latest_refetches,
@@ -758,7 +758,7 @@ gated_test!(
             "module.exports = { say: () => \"elf-ok\" };\n",
         )
         .unwrap();
-        std::fs::write(pkg.join("native/empty.c"), "void shuttle_marker(void) {}\n").unwrap();
+        std::fs::write(pkg.join("native/empty.c"), "void nau_marker(void) {}\n").unwrap();
         let status = Command::new("cc")
             .args(["-shared", "-o", "native/binding.node", "native/empty.c"])
             .arg("-Wl,-rpath,/nix/store/0000000000000000000000000000-libfoo/lib")
@@ -816,7 +816,7 @@ gated_test!(
     version = "1.0",
     source = "http://127.0.0.1:{port}/elf-src.tar.gz",
     deps = {{ npm = {{ lock = "package-lock.json" }} }},
-    build = "mkdir -p $STAGE/lib/node_modules/zelfapp && cp $SRC/cli.js $STAGE/lib/node_modules/zelfapp/cli.js && cp -r \"$SHUTTLE_DEPS_DIR/node_modules\" $STAGE/lib/node_modules/zelfapp/node_modules",
+    build = "mkdir -p $STAGE/lib/node_modules/zelfapp && cp $SRC/cli.js $STAGE/lib/node_modules/zelfapp/cli.js && cp -r \"$NAU_DEPS_DIR/node_modules\" $STAGE/lib/node_modules/zelfapp/node_modules",
     apps = {{ zelfapp = {{ command = "lib/node_modules/zelfapp/cli.js", interpreter = "node" }} }},
 }} }}
 "#
@@ -925,7 +925,7 @@ fn write_npm_exclude_pkg(project: &Path, server: &Path, port: u16) {
     version = "1.0",
     source = "http://127.0.0.1:{port}/ex-src.tar.gz",
     deps = {{ npm = {{ lock = "package-lock.json", exclude = {{ "node_modules/ndrop" }} }} }},
-    build = "mkdir -p $STAGE/lib/node_modules/{name} && cp $SRC/cli.js $STAGE/lib/node_modules/{name}/cli.js && cp -r \"$SHUTTLE_DEPS_DIR/node_modules\" $STAGE/lib/node_modules/{name}/node_modules",
+    build = "mkdir -p $STAGE/lib/node_modules/{name} && cp $SRC/cli.js $STAGE/lib/node_modules/{name}/cli.js && cp -r \"$NAU_DEPS_DIR/node_modules\" $STAGE/lib/node_modules/{name}/node_modules",
     apps = {{ {name} = {{ command = "lib/node_modules/{name}/cli.js", interpreter = "node" }} }},
 }} }}
 "#
@@ -1069,7 +1069,7 @@ wheels = [
     version = "1.0",
     source = "http://127.0.0.1:{port}/uv-src.tar.gz",
     deps = {{ pip = {{ lock = "uv.lock", index = "http://127.0.0.1:{port}/simple" }} }},
-    build = "mkdir -p $STAGE/lib/pymods/site-packages && python3 -m zipfile -e \"$SHUTTLE_DEPS_DIR/prod-1.0-py3-none-any.whl\" $STAGE/lib/pymods/site-packages && cp $SRC/main.py $STAGE/lib/pymods/main.py",
+    build = "mkdir -p $STAGE/lib/pymods/site-packages && python3 -m zipfile -e \"$NAU_DEPS_DIR/prod-1.0-py3-none-any.whl\" $STAGE/lib/pymods/site-packages && cp $SRC/main.py $STAGE/lib/pymods/main.py",
     apps = {{ {name} = {{ command = "lib/pymods/main.py", interpreter = "python3" }} }},
 }} }}
 "#
@@ -1200,7 +1200,7 @@ fn write_cargo_dep_crate(server: &Path, say: &str) -> String {
 }
 
 /// Write the cargo fixture: a single-crate app whose Cargo.lock pins
-/// `pcrate` (loopback-served), plus the shuttle package building it
+/// `pcrate` (loopback-served), plus the nau package building it
 /// OFFLINE against the mounted vendor closure.
 fn write_cargo_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16) {
     let letter = name.chars().next().unwrap().to_ascii_lowercase();
@@ -1240,9 +1240,9 @@ fn write_cargo_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u
     source = "http://127.0.0.1:@PORT@/cargo-src.tar.gz",
     deps = { cargo = { lock = "Cargo.lock", index = "http://127.0.0.1:@PORT@/api/v1/crates" } },
     build = table.concat({
-        "export CARGO_HOME=/tmp/shuttle-cargo-home CARGO_NET_OFFLINE=true",
+        "export CARGO_HOME=/tmp/nau-cargo-home CARGO_NET_OFFLINE=true",
         "mkdir -p \"$CARGO_HOME\"",
-        "printf '[source.crates-io]\\nreplace-with = \"shuttle-vendored\"\\n\\n[source.shuttle-vendored]\\ndirectory = \"%s\"\\n' \"$SHUTTLE_DEPS_DIR/vendor\" > \"$CARGO_HOME/config.toml\"",
+        "printf '[source.crates-io]\\nreplace-with = \"nau-vendored\"\\n\\n[source.nau-vendored]\\ndirectory = \"%s\"\\n' \"$NAU_DEPS_DIR/vendor\" > \"$CARGO_HOME/config.toml\"",
         "cargo install --path $SRC --root $STAGE",
     }, " && "),
     apps = { @NAME@ = { command = "bin/@NAME@" } },
@@ -1411,7 +1411,7 @@ gated_test!(
 // fetched source tarball: `deps.<ecosystem>.lock = "recipe/<path>"`
 // resolves against the package recipe directory (fail-closed), plain
 // values keep source-tree-first resolution with the recipe dir as
-// fallback. Exercised through the fetch-only `shuttle deps fetch` path
+// fallback. Exercised through the fetch-only `nau deps fetch` path
 // (hand-seeded pod.lua): the closure fetch is proven without a sandbox
 // build, so these tests need no language toolchain.
 
@@ -1428,7 +1428,7 @@ fn seed_pod_declaration(root: &Path, packages: &[&str]) {
     std::fs::write(
         dir.join("pod.lua"),
         format!(
-            "-- Pod declaration, maintained by `shuttle pod add/remove`.\npod {{\n    packages = {{ {list} }},\n}}\n"
+            "-- Pod declaration, maintained by `nau pod add/remove`.\npod {{\n    packages = {{ {list} }},\n}}\n"
         ),
     )
     .unwrap();
@@ -1450,7 +1450,7 @@ fn lock_deps_lock_sha256(root: &Path, pod: &str, pkg: &str) -> Option<String> {
         #[serde(default)]
         lock_sha256: Option<String>,
     }
-    let text = std::fs::read_to_string(pod_dir(root, pod).join("shuttle.lock")).unwrap();
+    let text = std::fs::read_to_string(pod_dir(root, pod).join("nau.lock")).unwrap();
     let lock: Lock = serde_json::from_str(&text).unwrap();
     lock.packages
         .get(pkg)
@@ -1535,7 +1535,7 @@ gated_test!(recipe_prefixed_cargo_lock_resolves_from_recipe_dir, &[], {
     assert_eq!(
         lock_deps_lock_sha256(root.path(), "default", "zcrlapp").as_deref(),
         Some(sha256_hex(&recipe_lock_bytes)).as_deref(),
-        "shuttle.lock must record the recipe-shipped Cargo.lock's sha256"
+        "nau.lock must record the recipe-shipped Cargo.lock's sha256"
     );
 
     // The closure came from the recipe-shipped lock: the pinned crate was
@@ -1640,7 +1640,7 @@ gated_test!(recipe_prefixed_npm_lock_resolves_from_recipe_dir, &[], {
     assert_eq!(
         lock_deps_lock_sha256(root.path(), "default", "znrlapp").as_deref(),
         Some(sha256_hex(&recipe_lock_bytes)).as_deref(),
-        "shuttle.lock must record the recipe-shipped package-lock.json's sha256"
+        "nau.lock must record the recipe-shipped package-lock.json's sha256"
     );
 
     // The registry tarball was resolved FROM the recipe-shipped lock.
@@ -1742,7 +1742,7 @@ fn write_go_dep_module(server: &Path, module: &str, version: &str, say: &str) ->
 
 /// The Go dirhash (`h1:`) over a module zip member list, exactly as the
 /// resolver computes it — reimplemented here so the fixture's go.sum
-/// matches what shuttle's fetch verifies.
+/// matches what nau's fetch verifies.
 fn go_dirhash_zip(zip_path: &Path) -> String {
     let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path).unwrap()).unwrap();
     let mut hashes: Vec<(String, String)> = Vec::new();
@@ -1790,30 +1790,30 @@ fn go_dirhash_file(bytes: &[u8]) -> String {
 }
 
 /// Write the go fixture: a single-module app whose go.mod requires
-/// `gdmodule` (loopback-served), plus the shuttle package building it
+/// `gdmodule` (loopback-served), plus the nau package building it
 /// OFFLINE via a `file://` GOPROXY onto the mounted closure.
 fn write_go_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16) {
     let letter = name.chars().next().unwrap().to_ascii_lowercase();
     let dir = project.join("pkgs").join(letter.to_string());
     std::fs::create_dir_all(&dir).unwrap();
-    let (zip_h, mod_h) = write_go_dep_module(server, "shuttle.test/godep", "v1.0.0", say);
+    let (zip_h, mod_h) = write_go_dep_module(server, "nau.test/godep", "v1.0.0", say);
 
     let approot = server.join("goapproot");
     let _ = std::fs::remove_dir_all(&approot);
     std::fs::create_dir_all(&approot).unwrap();
     std::fs::write(
         approot.join("go.mod"),
-        "module shuttle.test/app\n\ngo 1.21\n\nrequire shuttle.test/godep v1.0.0\n",
+        "module nau.test/app\n\ngo 1.21\n\nrequire nau.test/godep v1.0.0\n",
     )
     .unwrap();
     std::fs::write(
         approot.join("go.sum"),
-        format!("shuttle.test/godep v1.0.0 {zip_h}\nshuttle.test/godep v1.0.0/go.mod {mod_h}\n"),
+        format!("nau.test/godep v1.0.0 {zip_h}\nnau.test/godep v1.0.0/go.mod {mod_h}\n"),
     )
     .unwrap();
     std::fs::write(
         approot.join("main.go"),
-        "package main\n\nimport (\n\t\"fmt\"\n\t\"shuttle.test/godep\"\n)\n\nfunc main() {\n\tfmt.Println(godep.Say())\n}\n",
+        "package main\n\nimport (\n\t\"fmt\"\n\t\"nau.test/godep\"\n)\n\nfunc main() {\n\tfmt.Println(godep.Say())\n}\n",
     )
     .unwrap();
     tar_czf(server, "go-src.tar.gz", "goapproot");
@@ -1824,8 +1824,8 @@ fn write_go_pkg(project: &Path, server: &Path, name: &str, say: &str, port: u16)
     source = "http://127.0.0.1:@PORT@/go-src.tar.gz",
     deps = { go = { mods = "go.mod", index = "http://127.0.0.1:@PORT@" } },
     build = table.concat({
-        "export GOMODCACHE=/tmp/shuttle-go-cache GOPROXY=\"file://$SHUTTLE_DEPS_DIR/cache/download\"",
-        "export GOFLAGS=-mod=mod GOSUMDB=off GOPATH=/tmp/shuttle-go-cache",
+        "export GOMODCACHE=/tmp/nau-go-cache GOPROXY=\"file://$NAU_DEPS_DIR/cache/download\"",
+        "export GOFLAGS=-mod=mod GOSUMDB=off GOPATH=/tmp/nau-go-cache",
         "mkdir -p \"$GOMODCACHE\"",
         "go build -o $STAGE/@NAME@ .",
     }, " && "),
@@ -1868,7 +1868,7 @@ gated_test!(go_deps_fetch_build_and_farm_executes, &["go"], {
 
     // The fetch hit the proxy zip path on the loopback.
     assert!(
-        requests_for(&log, "/shuttle.test/godep/@v/") >= 1,
+        requests_for(&log, "/nau.test/godep/@v/") >= 1,
         "the resolver must fetch the pinned module: {:#?}",
         log.lock().unwrap()
     );
@@ -2058,7 +2058,7 @@ gated_test!(go_sum_change_moves_the_deps_hash, &["go"], {
     let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zgolck"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
     let (hash_a, _) = lock_deps_pin(root.path(), "default", "zgolck");
-    let fetches_after_add = requests_for(&log, "/shuttle.test/godep/@v/");
+    let fetches_after_add = requests_for(&log, "/nau.test/godep/@v/");
 
     // Upstream moves: same module, new bytes (new `say`) — the go.sum
     // pins the new zip hash, so the closure content and its hash move.
@@ -2072,7 +2072,7 @@ gated_test!(go_sum_change_moves_the_deps_hash, &["go"], {
     );
     assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
     assert!(
-        requests_for(&log, "/shuttle.test/godep/@v/") > fetches_after_add,
+        requests_for(&log, "/nau.test/godep/@v/") > fetches_after_add,
         "--latest must re-fetch the moved closure; requests: {:#?}",
         log.lock().unwrap()
     );
@@ -2099,7 +2099,7 @@ fn lock_version_pin(root: &Path, pod: &str, pkg: &str) -> Option<String> {
     struct Entry {
         version: String,
     }
-    let text = std::fs::read_to_string(pod_dir(root, pod).join("shuttle.lock")).ok()?;
+    let text = std::fs::read_to_string(pod_dir(root, pod).join("nau.lock")).ok()?;
     let lock: Lock = serde_json::from_str(&text).ok()?;
     lock.packages.get(pkg).map(|e| e.version.clone())
 }
@@ -2286,7 +2286,7 @@ gated_test!(rebuild_unknown_package_fails_without_writes, &["node"], {
 
     let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zrapp"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
-    let lock_path = pod_dir(root.path(), "default").join("shuttle.lock");
+    let lock_path = pod_dir(root.path(), "default").join("nau.lock");
     let before = std::fs::read(&lock_path).unwrap();
 
     let (code, stdout, stderr) = run(
@@ -2318,21 +2318,21 @@ gated_test!(rebuild_unknown_package_fails_without_writes, &["node"], {
 // package generation by generation. Build-capable verbs must fail
 // closed; the removal flow must keep working without the wipe.
 
-/// Run shuttle with an EMPTY PATH: `find_on_path` resolves nothing, so
+/// Run nau with an EMPTY PATH: `find_on_path` resolves nothing, so
 /// the reconcile runs degraded (no squashfs pair). The binary is
 /// invoked by absolute path; degraded paths exec no external tools, so
 /// the empty PATH is safe for the assertion phase.
 fn run_degraded(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.args(args).arg("--root").arg(root);
     cmd.current_dir(project);
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     cmd.env("PATH", "");
     // Belt-and-braces with the empty PATH above: the empty PATH already
     // makes find_on_path resolve no systemd tool, but state the intent
     // explicitly so this stays off the bus if the PATH assumption changes.
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -2360,7 +2360,7 @@ fn snapshot_pod(root: &Path, pod: &str) -> (PathBuf, Vec<String>, Vec<u8>) {
         !farm.is_empty(),
         "fixture must be installed before degrading"
     );
-    let lock = std::fs::read(pod_dir(root, pod).join("shuttle.lock")).unwrap();
+    let lock = std::fs::read(pod_dir(root, pod).join("nau.lock")).unwrap();
     (link, farm, lock)
 }
 
@@ -2385,7 +2385,7 @@ gated_test!(
         let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zdgapp"]);
         assert_eq!(code, Some(0), "stderr: {stderr}");
         let (link, farm, lock) = snapshot_pod(root.path(), "default");
-        let lock_path = pod_dir(root.path(), "default").join("shuttle.lock");
+        let lock_path = pod_dir(root.path(), "default").join("nau.lock");
 
         // Degraded rebuild: must FAIL CLOSED, touching nothing.
         let (code, stdout, stderr) =
@@ -2434,7 +2434,7 @@ gated_test!(degraded_sync_fails_closed_the_same_way, &["node"], {
     let (code, _, stderr) = run(project.path(), root.path(), &["pod", "add", "zdsapp"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
     let (link, farm, lock) = snapshot_pod(root.path(), "default");
-    let lock_path = pod_dir(root.path(), "default").join("shuttle.lock");
+    let lock_path = pod_dir(root.path(), "default").join("nau.lock");
 
     // Degraded sync: the same fail-closed contract as rebuild.
     let (code, stdout, stderr) = run_degraded(project.path(), root.path(), &["pod", "sync"]);
@@ -2561,7 +2561,7 @@ gated_test!(
         let pod_lua = pod_dir(root.path(), "default").join("pod.lua");
         std::fs::write(
         &pod_lua,
-        "-- Pod declaration, maintained by `shuttle pod add/remove`.\npod {\n    packages = { \"zdaapp\", \"zdbapp\", \"zdcapp\" },\n}\n",
+        "-- Pod declaration, maintained by `nau pod add/remove`.\npod {\n    packages = { \"zdaapp\", \"zdbapp\", \"zdcapp\" },\n}\n",
     )
     .unwrap();
 
@@ -2623,8 +2623,8 @@ fn fake_systemd_tool(dir: &Path, name: &str, marker: &Path, exit_code: i32) -> P
 /// state dir — enough for `pod rollback` to reach activation without a
 /// payload build (the store layout is a plain directory contract).
 fn seed_pod_generation(pod_dir: &Path, n: u64, pkg: &str, unit: &str) {
-    use shuttle::farm::ClaimLayer;
-    use shuttle::runtime::{Generation, InstalledPackage};
+    use nau::farm::ClaimLayer;
+    use nau::runtime::{Generation, InstalledPackage};
 
     let mut packages = std::collections::BTreeMap::new();
     packages.insert(
@@ -2704,17 +2704,17 @@ fn pod_rollback_activates_with_injected_tools_never_the_host_bus() {
     fake_systemd_tool(tools_bin.path(), "systemctl", &systemctl_marker, 0);
 
     // Real binary, explicit root; PATH carries ONLY the fake tools (+ the
-    // shell) and SHUTTLE_SYSTEMD=on overrides the suite's default `off`,
+    // shell) and NAU_SYSTEMD=on overrides the suite's default `off`,
     // so the pod path resolves the fakes rather than suppressing them.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.args(["pod", "rollback", "--root"])
         .arg(root.path())
         .current_dir(project.path())
-        .env("SHUTTLE_DATA_HOME", root.path().join("data-home"))
-        .env("SHUTTLE_POD_TOOLS", "")
-        .env("SHUTTLE_SYSTEMD", "on")
+        .env("NAU_DATA_HOME", root.path().join("data-home"))
+        .env("NAU_POD_TOOLS", "")
+        .env("NAU_SYSTEMD", "on")
         .env("PATH", tools_bin.path());
-    let out = cmd.output().expect("failed to spawn shuttle pod rollback");
+    let out = cmd.output().expect("failed to spawn nau pod rollback");
     let code = out.status.code();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -2749,7 +2749,7 @@ fn pod_rollback_activates_with_injected_tools_never_the_host_bus() {
 
 /// With no systemd tools resolved (the suite default), activation reports
 /// the skip distinctly instead of a fake success — the "silent no-op"
-/// the issue calls out. `SHUTTLE_POD_TOOLS=absent` resolves every tool to
+/// the issue calls out. `NAU_POD_TOOLS=absent` resolves every tool to
 /// None at the CLI seam.
 #[test]
 fn pod_rollback_reports_skipped_systemd_tools_distinctly() {
@@ -2762,13 +2762,13 @@ fn pod_rollback_reports_skipped_systemd_tools_distinctly() {
     seed_pod_generation(&pd, 2, "my-snap", "");
     std::os::unix::fs::symlink("generations/2", pd.join("active")).unwrap();
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.args(["pod", "rollback", "--root"])
         .arg(root.path())
         .current_dir(project.path())
-        .env("SHUTTLE_DATA_HOME", root.path().join("data-home"))
-        .env("SHUTTLE_POD_TOOLS", "absent");
-    let out = cmd.output().expect("failed to spawn shuttle pod rollback");
+        .env("NAU_DATA_HOME", root.path().join("data-home"))
+        .env("NAU_POD_TOOLS", "absent");
+    let out = cmd.output().expect("failed to spawn nau pod rollback");
     let code = out.status.code();
     let combined = format!(
         "{}{}",

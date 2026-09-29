@@ -12,7 +12,7 @@
 //! `desktop.rs`): the generation manifest records each package's font
 //! files at install time (path under `usr/share/fonts` → sha256), and
 //! the emit surfaces them as user-level symlinks into the content
-//! store under `$XDG_DATA_HOME/fonts/shuttle-pod-<pod>/<pkg>/…` — the
+//! store under `$XDG_DATA_HOME/fonts/nau-pod-<pod>/<pkg>/…` — the
 //! fontconfig-scanned user font directory (the default `fonts.conf`
 //! ships `<dir prefix="xdg">fonts</dir>`; subdirectories are scanned
 //! recursively). The generation is the versioned source of truth:
@@ -20,7 +20,7 @@
 //! so fonts follow generations exactly like launchers and farm
 //! binaries. Nothing is ever written outside user directories.
 //!
-//! Per-package namespacing (`shuttle-pod-<pod>/<pkg>/`) means two
+//! Per-package namespacing (`nau-pod-<pod>/<pkg>/`) means two
 //! packages shipping the same font file name never collide at the
 //! user level — both ship, and fontconfig resolves family conflicts
 //! by its own ordering (the same behavior a merged profile prefix has
@@ -38,11 +38,11 @@ pub fn user_fonts_dir(data_home: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// The pod-namespaced directory this emitter owns under the user's
-/// fonts directory: `shuttle-pod-<pod>`. The same ownership rule as
+/// fonts directory: `nau-pod-<pod>`. The same ownership rule as
 /// the desktop entry prefix — withdrawal recognizes only its own
 /// subtree, never the user's own fonts or other pods'.
 pub fn surface_dir(pod: &str) -> String {
-    format!("shuttle-pod-{pod}")
+    format!("nau-pod-{pod}")
 }
 
 /// Emit a generation's font set to the user level. The surface is
@@ -147,11 +147,11 @@ mod tests {
     use crate::farm::ClaimLayer;
 
     fn store_fixture(dir: &std::path::Path) -> RuntimeStore {
-        // The documented pod layout `<data-home>/shuttle/pods/<pod>`:
+        // The documented pod layout `<data-home>/nau/pods/<pod>`:
         // the emitter derives its user-level surface from this shape,
         // so a nested fixture root keeps every write inside the test's
         // tempdir without touching the environment.
-        RuntimeStore::new(dir.join("shuttle/pods/pilot"))
+        RuntimeStore::new(dir.join("nau/pods/pilot"))
     }
 
     fn gen_with_fonts(n: u64, packages: &[(&str, &[(&str, &str)])]) -> Generation {
@@ -215,7 +215,7 @@ mod tests {
         emit(&store, &gen).unwrap();
         let link = tmp
             .path()
-            .join("fonts/shuttle-pod-pilot/nerd-fonts-hack/truetype/HackNerdFont-Regular.ttf");
+            .join("fonts/nau-pod-pilot/nerd-fonts-hack/truetype/HackNerdFont-Regular.ttf");
         assert!(link.is_file(), "font surface link missing");
         assert_eq!(std::fs::read_link(&link).unwrap(), blob);
         assert_eq!(std::fs::read(&link).unwrap(), b"ttf-bytes");
@@ -232,7 +232,7 @@ mod tests {
         emit(&store, &old).unwrap();
         let new = gen_with_fonts(2, &[("fonts-b", &[("t/B.ttf", "bb22")]), ("fonts-c", &[])]);
         emit(&store, &new).unwrap();
-        let surface = tmp.path().join("fonts/shuttle-pod-pilot");
+        let surface = tmp.path().join("fonts/nau-pod-pilot");
         assert!(!surface.join("fonts-a").exists(), "stale package pruned");
         assert!(
             surface.join("fonts-b/t/B.ttf").is_file(),
@@ -252,7 +252,7 @@ mod tests {
         let without = gen_with_fonts(2, &[]);
         emit(&store, &without).unwrap();
         assert!(
-            !tmp.path().join("fonts/shuttle-pod-pilot").exists(),
+            !tmp.path().join("fonts/nau-pod-pilot").exists(),
             "pod font surface withdrawn"
         );
         // The user's own fonts dir survives.
@@ -262,16 +262,16 @@ mod tests {
     #[test]
     fn two_pods_surfaces_coexist() {
         let tmp = tempfile::tempdir().unwrap();
-        let pilot = RuntimeStore::new(tmp.path().join("shuttle/pods/pilot"));
-        let work = RuntimeStore::new(tmp.path().join("shuttle/pods/work"));
+        let pilot = RuntimeStore::new(tmp.path().join("nau/pods/pilot"));
+        let work = RuntimeStore::new(tmp.path().join("nau/pods/work"));
         for store in [&pilot, &work] {
             seed_blob(store, "aa11", b"font");
         }
         let gen = gen_with_fonts(1, &[("fonts-a", &[("t/A.ttf", "aa11")])]);
         emit(&pilot, &gen).unwrap();
         emit(&work, &gen).unwrap();
-        assert!(tmp.path().join("fonts/shuttle-pod-pilot/fonts-a").is_dir());
-        assert!(tmp.path().join("fonts/shuttle-pod-work/fonts-a").is_dir());
+        assert!(tmp.path().join("fonts/nau-pod-pilot/fonts-a").is_dir());
+        assert!(tmp.path().join("fonts/nau-pod-work/fonts-a").is_dir());
     }
 
     #[test]

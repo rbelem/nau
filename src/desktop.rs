@@ -20,7 +20,7 @@
 //! An absolute farm path is baked into each entry.
 //!
 //! App-ID collision rule (issue #7): the desktop file ID is pod-namespaced
-//! (`shuttle-pod-<pod>-<app>`), so two pods' same-ID apps coexist exactly
+//! (`nau-pod-<pod>-<app>`), so two pods' same-ID apps coexist exactly
 //! like their binaries (separate farms, no clash). WITHIN one pod, two
 //! packages claiming the same application ID go through the shared
 //! collision classifier (`crate::farm::classify_collision`, kept
@@ -59,17 +59,17 @@ pub fn user_icons_dir(data_home: &std::path::Path) -> std::path::PathBuf {
 /// The user's data-home root the launcher surface follows. Resolution
 /// order:
 ///
-/// 1. `SHUTTLE_DATA_HOME` — the explicit redirect knob (tests MUST set
+/// 1. `NAU_DATA_HOME` — the explicit redirect knob (tests MUST set
 ///    this or nest their pod root; never the real home).
-/// 2. The documented pod layout `<data-home>/shuttle/pods/<pod>`: derived
+/// 2. The documented pod layout `<data-home>/nau/pods/<pod>`: derived
 ///    from the pod root, so a pod rooted at that layout (the production
-///    default AND tests that root at `<tmp>/shuttle/pods/<name>`) gets
+///    default AND tests that root at `<tmp>/nau/pods/<name>`) gets
 ///    its surface under the same data home with no environment at all.
 /// 3. `XDG_DATA_HOME`, then `~/.local/share` — the standard user
 ///    locations (only for pod roots redirected off the documented
 ///    layout).
 pub fn user_data_home(root: &std::path::Path) -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("SHUTTLE_DATA_HOME") {
+    if let Ok(dir) = std::env::var("NAU_DATA_HOME") {
         if !dir.is_empty() {
             return std::path::PathBuf::from(dir);
         }
@@ -85,17 +85,17 @@ pub fn user_data_home(root: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// The data home of a pod rooted at the documented
-/// `<data-home>/shuttle/pods/<pod>` layout — `<root>/../../../`.
+/// `<data-home>/nau/pods/<pod>` layout — `<root>/../../../`.
 fn documented_layout_data_home(root: &std::path::Path) -> Option<&std::path::Path> {
     let pods = root.parent()?;
     if pods.file_name()? != "pods" {
         return None;
     }
-    let shuttle = pods.parent()?;
-    if shuttle.file_name()? != "shuttle" {
+    let nau = pods.parent()?;
+    if nau.file_name()? != "nau" {
         return None;
     }
-    shuttle.parent()
+    nau.parent()
 }
 
 /// The pod name behind a store: the last component of its root path.
@@ -112,7 +112,7 @@ pub(crate) fn pod_name(store: &RuntimeStore) -> miette::Result<String> {
 /// apps never collide at the theme level, and so withdrawal can recognize
 /// its own icons.
 pub fn icon_name(pod: &str, app_id: &str) -> String {
-    format!("shuttle-pod-{pod}-{app_id}")
+    format!("nau-pod-{pod}-{app_id}")
 }
 
 /// The launcher directory of generation `n`.
@@ -239,11 +239,11 @@ fn icon_theme_dir(ext: &str) -> &'static str {
 }
 
 /// The pod-namespaced prefix of every user-level file this emitter owns:
-/// `shuttle-pod-<pod>-`. The desktop file ID and the icon name share it,
+/// `nau-pod-<pod>-`. The desktop file ID and the icon name share it,
 /// so withdrawal can recognize its own links and two pods' same-app IDs
 /// never collide at the user level.
 fn entry_prefix(pod: &str) -> String {
-    format!("shuttle-pod-{pod}-")
+    format!("nau-pod-{pod}-")
 }
 
 /// Withdraw the user-level `.desktop` and icon links this pod owns but
@@ -876,18 +876,18 @@ mod tests {
     #[test]
     fn render_emits_required_keys_and_escapes_exec() {
         let l = launcher(Some("My App"), &["Graphics", "Viewer"]);
-        let exec = std::path::Path::new("/home/u/.local/share/shuttle/pods/default/current/myapp");
-        let text = render(&l, "myapp", exec, Some("shuttle-pod-default-myapp"));
+        let exec = std::path::Path::new("/home/u/.local/share/nau/pods/default/current/myapp");
+        let text = render(&l, "myapp", exec, Some("nau-pod-default-myapp"));
         assert!(text.starts_with("[Desktop Entry]\n"));
         assert!(text.contains("Type=Application\n"));
         assert!(text.contains("Name=My App\n"));
-        assert!(text.contains("Icon=shuttle-pod-default-myapp\n"));
+        assert!(text.contains("Icon=nau-pod-default-myapp\n"));
         assert!(text.contains("Categories=Graphics;Viewer;\n"));
         assert!(text.contains("Exec=\""));
-        assert!(text.contains("/home/u/.local/share/shuttle/pods/default/current/myapp\""));
+        assert!(text.contains("/home/u/.local/share/nau/pods/default/current/myapp\""));
         assert!(text.contains("Terminal=false\n"));
         // Round-trip through the validator — a strict conformance proof.
-        validate(&text, Some("shuttle-pod-default-myapp"), None).unwrap();
+        validate(&text, Some("nau-pod-default-myapp"), None).unwrap();
     }
 
     #[test]
@@ -1016,8 +1016,8 @@ mod tests {
             }),
         };
         let exec =
-            std::path::Path::new("/home/u/.local/share/shuttle/pods/default/current/gui-example");
-        let icon_name = "shuttle-pod-default-gui-example";
+            std::path::Path::new("/home/u/.local/share/nau/pods/default/current/gui-example");
+        let icon_name = "nau-pod-default-gui-example";
         let text = render(&l, "gui-example", exec, Some(icon_name));
         validate(&text, Some(icon_name), None).unwrap();
     }

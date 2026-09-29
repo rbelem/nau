@@ -6,7 +6,7 @@
 //! Governing decisions:
 //!
 //! - **D3 (serve-time resolve; session cache on tmpfs).** Values cache
-//!   at `$XDG_RUNTIME_DIR/shuttle/secrets/<pod>/<decl-hash>.json`, mode
+//!   at `$XDG_RUNTIME_DIR/nau/secrets/<pod>/<decl-hash>.json`, mode
 //!   0600, written ATOMICALLY (temp file in the same dir + rename). The
 //!   cache key is the SHA-256 of the canonical reference bytes and
 //!   DELIBERATELY drops the generation — a rollback to an old
@@ -66,7 +66,7 @@
 //! every exec-form consumer shares — resolve (D3), publish the session
 //! cache, and materialize the envfile the service units reference.
 //! `pod shellenv` renders the values as POSIX exports after the env
-//! lines; `shuttle run` overlays them onto the exec'd process (declared
+//! lines; `nau run` overlays them onto the exec'd process (declared
 //! replaces inherited — the same rule as env); services read the
 //! envfile through a mandatory `EnvironmentFile=` (no `-` prefix — a
 //! missing file fails the unit start loud, never a silent
@@ -392,7 +392,7 @@ fn bitwarden_value(key: &str, body: &str) -> miette::Result<String> {
 /// The Secret Service attribute-query seam. The ONE place the tree
 /// touches the D-Bus session; tests reseat it to an in-memory fake,
 /// production always runs [`secret_service_lookup`], live-bus tests
-/// stay env-gated (`SHUTTLE_SECRETS_LIVE_DBUS=1`).
+/// stay env-gated (`NAU_SECRETS_LIVE_DBUS=1`).
 type AttributeLookup = fn(&BTreeMap<String, String>) -> miette::Result<Option<Vec<u8>>>;
 
 static SECRET_SERVICE_LOOKUP: Mutex<AttributeLookup> = Mutex::new(secret_service_lookup);
@@ -650,7 +650,7 @@ pub struct CacheEntry {
 }
 
 /// The cache base: the caller's override, or
-/// `$XDG_RUNTIME_DIR/shuttle/secrets` (created 0700, tmpfs-verified).
+/// `$XDG_RUNTIME_DIR/nau/secrets` (created 0700, tmpfs-verified).
 fn cache_base(override_base: Option<&Path>) -> miette::Result<PathBuf> {
     match override_base {
         Some(base) => Ok(base.to_path_buf()),
@@ -674,10 +674,10 @@ fn xdg_cache_base() -> miette::Result<PathBuf> {
     if run.is_empty() {
         return Err(gap());
     }
-    let base = Path::new(&run).join("shuttle").join("secrets");
+    let base = Path::new(&run).join("nau").join("secrets");
     std::fs::create_dir_all(&base)
         .map_err(|e| miette::miette!("creating {}: {e}", base.display()))?;
-    set_dir_mode(Path::new(&run).join("shuttle").as_path(), 0o700)?;
+    set_dir_mode(Path::new(&run).join("nau").as_path(), 0o700)?;
     set_dir_mode(&base, 0o700)?;
     if !is_tmpfs(&base)? {
         miette::bail!(
@@ -697,7 +697,7 @@ fn xdg_cache_base_passive() -> Option<PathBuf> {
     if run.is_empty() {
         return None;
     }
-    Some(Path::new(&run).join("shuttle").join("secrets"))
+    Some(Path::new(&run).join("nau").join("secrets"))
 }
 
 /// One pod's cache directory: `<base>/<pod>/`.
@@ -981,7 +981,7 @@ pub fn pod_envfile_path_passive(
                 miette::bail!(
                     "pod '{pod_name}' declares secrets, but XDG_RUNTIME_DIR is \
                      not set — the service envfile lives under \
-                     $XDG_RUNTIME_DIR/shuttle/secrets (ADR-0042 D3/D7: no \
+                     $XDG_RUNTIME_DIR/nau/secrets (ADR-0042 D3/D7: no \
                      disk fallback). Export XDG_RUNTIME_DIR and sync again."
                 )
             }
@@ -1090,7 +1090,7 @@ pub fn render_pod_envfile_from_warm_cache(
     usize::from(rendered)
 }
 
-// ── Verbs (`shuttle pod secrets …`) ──
+// ── Verbs (`nau pod secrets …`) ──
 
 /// Everything the `pod secrets` verbs read before touching providers:
 /// the pod's state dir, its active generation, and the folded reference
@@ -1108,7 +1108,7 @@ fn verb_inputs(root: &Path, pod_name: &str) -> miette::Result<VerbInputs> {
     let pod_dir = root.join(pod_name);
     if !pod_dir.is_dir() {
         miette::bail!(
-            "pod '{pod_name}' has no state at {} (`shuttle pod --name {pod_name} \
+            "pod '{pod_name}' has no state at {} (`nau pod --name {pod_name} \
              add <package>` does)",
             pod_dir.display()
         );
@@ -1116,7 +1116,7 @@ fn verb_inputs(root: &Path, pod_name: &str) -> miette::Result<VerbInputs> {
     let generation = crate::farm::current_generation(&pod_dir)?.ok_or_else(|| {
         miette::miette!(
             "pod '{pod_name}' has no active generation — sync the pod first \
-             (`shuttle pod --name {pod_name} sync`)"
+             (`nau pod --name {pod_name} sync`)"
         )
     })?;
     let decl = crate::pod::load_declaration(root, pod_name)?;
@@ -1493,8 +1493,8 @@ mod tests {
     fn env_source_resolves_the_caller_var() {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("SHUTTLE_SECRETS_TEST_OK", SENTINEL);
-        let refs = BTreeMap::from([("K".to_string(), env_ref("SHUTTLE_SECRETS_TEST_OK"))]);
+        std::env::set_var("NAU_SECRETS_TEST_OK", SENTINEL);
+        let refs = BTreeMap::from([("K".to_string(), env_ref("NAU_SECRETS_TEST_OK"))]);
         let values = resolve_references(
             tmp.path(),
             "p",
@@ -1503,25 +1503,22 @@ mod tests {
             Some(tmp.path().join("cache").as_path()),
         )
         .unwrap();
-        std::env::remove_var("SHUTTLE_SECRETS_TEST_OK");
+        std::env::remove_var("NAU_SECRETS_TEST_OK");
         assert_eq!(values.get("K").map(String::as_str), Some(SENTINEL));
     }
 
     #[test]
     fn env_source_missing_var_fails_named_and_leaks_nothing() {
         let _lock = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SHUTTLE_SECRETS_TEST_MISSING");
-        let refs = BTreeMap::from([(
-            "API_TOKEN".to_string(),
-            env_ref("SHUTTLE_SECRETS_TEST_MISSING"),
-        )]);
+        std::env::remove_var("NAU_SECRETS_TEST_MISSING");
+        let refs = BTreeMap::from([("API_TOKEN".to_string(), env_ref("NAU_SECRETS_TEST_MISSING"))]);
         let err = format!(
             "{}",
             resolve_references(Path::new("/nonexistent-pod"), "p", 3, &refs, None).unwrap_err()
         );
         assert!(err.contains("secret 'API_TOKEN'"), "{err}");
         assert!(err.contains("source 'env'"), "{err}");
-        assert!(err.contains("SHUTTLE_SECRETS_TEST_MISSING"), "{err}");
+        assert!(err.contains("NAU_SECRETS_TEST_MISSING"), "{err}");
         assert!(!err.contains(SENTINEL), "value leaked into error: {err}");
     }
 
@@ -1970,8 +1967,8 @@ mod tests {
 
     #[test]
     fn digest_diff_selection_restarts_only_changed_consumers() {
-        let web = "shuttle-pod-work-web.service".to_string();
-        let side = "shuttle-pod-work-side.service".to_string();
+        let web = "nau-pod-work-web.service".to_string();
+        let side = "nau-pod-work-side.service".to_string();
         let both = vec![web.clone(), side.clone()];
         // Changed digest: every current consumer restarts…
         assert_eq!(
@@ -2050,7 +2047,7 @@ mod tests {
         let first = refresh_pod(tmp.path(), "work", Some(&cache), &tools).unwrap();
         assert_eq!(
             first.restarted,
-            vec!["shuttle-pod-work-web.service".to_string()]
+            vec!["nau-pod-work-web.service".to_string()]
         );
         assert!(first.unchanged.is_empty());
 
@@ -2060,7 +2057,7 @@ mod tests {
         assert!(second.restarted.is_empty());
         assert_eq!(
             second.unchanged,
-            vec!["shuttle-pod-work-web.service".to_string()]
+            vec!["nau-pod-work-web.service".to_string()]
         );
 
         // Rotate the value: the digest moves and "web" restarts again.
@@ -2068,14 +2065,14 @@ mod tests {
         let third = refresh_pod(tmp.path(), "work", Some(&cache), &tools).unwrap();
         assert_eq!(
             third.restarted,
-            vec!["shuttle-pod-work-web.service".to_string()]
+            vec!["nau-pod-work-web.service".to_string()]
         );
 
         // The fake ran `--user restart <consumer>` exactly twice and
         // NEVER touched the non-consumer.
         let ran = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(ran.matches("shuttle-pod-work-web.service").count(), 2);
-        assert!(!ran.contains("shuttle-pod-work-side.service"));
+        assert_eq!(ran.matches("nau-pod-work-web.service").count(), 2);
+        assert!(!ran.contains("nau-pod-work-side.service"));
         assert!(ran.contains("--user"));
         assert!(ran.contains("restart"));
     }
@@ -2119,10 +2116,7 @@ mod tests {
         )
         .unwrap();
         assert!(report.restarted.is_empty());
-        assert_eq!(
-            report.skipped,
-            vec!["shuttle-pod-work-web.service".to_string()]
-        );
+        assert_eq!(report.skipped, vec!["nau-pod-work-web.service".to_string()]);
     }
 
     #[test]
@@ -2162,7 +2156,7 @@ mod tests {
         let err = refresh_pod(tmp.path(), "work", Some(&cache), &tools).unwrap_err();
         let err = format!("{err:#}");
         assert!(
-            err.contains("shuttle-pod-work-web.service"),
+            err.contains("nau-pod-work-web.service"),
             "the error must name the unit: {err}"
         );
         assert!(
@@ -2181,7 +2175,7 @@ mod tests {
         let counter = tmp.path().join("calls");
         let path = counting_script(tmp.path(), &counter);
         let refs = BTreeMap::from([
-            ("A_KEY".to_string(), env_ref("SHUTTLE_SECRETS_TEST_SERVE")),
+            ("A_KEY".to_string(), env_ref("NAU_SECRETS_TEST_SERVE")),
             (
                 "B_KEY".to_string(),
                 SecretSource::Exec {
@@ -2190,9 +2184,9 @@ mod tests {
             ),
         ]);
         let _lock = ENV_LOCK.lock().unwrap();
-        std::env::set_var("SHUTTLE_SECRETS_TEST_SERVE", "plain");
+        std::env::set_var("NAU_SECRETS_TEST_SERVE", "plain");
         let served = serve_pod(&pod, "p", 5, &refs, Some(&cache)).unwrap();
-        std::env::remove_var("SHUTTLE_SECRETS_TEST_SERVE");
+        std::env::remove_var("NAU_SECRETS_TEST_SERVE");
         assert_eq!(calls(&counter), 1, "cold resolve calls the provider");
         assert_eq!(
             served.values.get("B_KEY").map(String::as_str),
@@ -2287,17 +2281,17 @@ end'"#
         let cache = tmp.path().join("cache");
         let pod = pod_state_root(tmp.path());
         let refs = BTreeMap::from([
-            ("GOOD".to_string(), env_ref("SHUTTLE_SECRETS_TEST_GOOD")),
-            ("BAD".to_string(), env_ref("SHUTTLE_SECRETS_TEST_ABSENT")),
+            ("GOOD".to_string(), env_ref("NAU_SECRETS_TEST_GOOD")),
+            ("BAD".to_string(), env_ref("NAU_SECRETS_TEST_ABSENT")),
         ]);
         let _lock = ENV_LOCK.lock().unwrap();
-        std::env::set_var("SHUTTLE_SECRETS_TEST_GOOD", "v");
+        std::env::set_var("NAU_SECRETS_TEST_GOOD", "v");
         let err = format!(
             "{}",
             serve_pod(&pod, "p", 1, &refs, Some(&cache)).unwrap_err()
         );
-        std::env::remove_var("SHUTTLE_SECRETS_TEST_GOOD");
-        assert!(err.contains("SHUTTLE_SECRETS_TEST_ABSENT"), "{err}");
+        std::env::remove_var("NAU_SECRETS_TEST_GOOD");
+        assert!(err.contains("NAU_SECRETS_TEST_ABSENT"), "{err}");
         assert!(err.contains("BAD"), "{err}");
         // D7: an all-or-nothing resolve means NOTHING landed — no cache
         // entry, no envfile, no partial export set downstream.
@@ -2382,7 +2376,7 @@ end'"#
         assert!(err.contains("p"), "{err}");
         assert!(none.is_none(), "secret-less pods get no envfile line");
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("run/shuttle/secrets");
+        let base = tmp.path().join("run/nau/secrets");
         let some = pod_envfile_path_passive("p", &refs, Some(&base))
             .unwrap()
             .unwrap();
@@ -2446,7 +2440,7 @@ end'"#
                 r#"pod {{
     secrets = {{
         EXEC_VAR = {{ source = "exec", command = {{ "{provider}" }} }},
-        ENV_VAR  = {{ source = "env", var = "SHUTTLE_SECRETS_TEST_LIST" }},
+        ENV_VAR  = {{ source = "env", var = "NAU_SECRETS_TEST_LIST" }},
     }},
 }}
 "#
@@ -2472,10 +2466,10 @@ end'"#
         assert!(rows.iter().all(|r| r.cache == "miss"));
         assert_eq!(
             rows.iter().find(|r| r.key == "ENV_VAR").unwrap().reference,
-            "env SHUTTLE_SECRETS_TEST_LIST"
+            "env NAU_SECRETS_TEST_LIST"
         );
         // Resolve (warms the entry at generation 3), then hit.
-        std::env::set_var("SHUTTLE_SECRETS_TEST_LIST", SENTINEL);
+        std::env::set_var("NAU_SECRETS_TEST_LIST", SENTINEL);
         let refs = folded_refs(tmp.path(), "work");
         let pod_dir = tmp.path().join("work");
         resolve_references(&pod_dir, "work", 3, &refs, Some(&cache)).unwrap();
@@ -2492,7 +2486,7 @@ end'"#
         )
         .unwrap();
         let rows = list_pod(tmp.path(), "work", Some(&cache)).unwrap();
-        std::env::remove_var("SHUTTLE_SECRETS_TEST_LIST");
+        std::env::remove_var("NAU_SECRETS_TEST_LIST");
         assert!(rows.iter().all(|r| r.cache == "stale"));
         // The rendered output must not carry a single value substring.
         let text = render_list_rows("work", &rows);
@@ -2997,7 +2991,7 @@ end'"#
                 r#"pod {{
     secrets = {{
         VAULT_ITEM = {{ source = "vault", mount = "secret", path = "app", field = "token" }},
-        ENV_VAR    = {{ source = "env", var = "SHUTTLE_SECRETS_TEST_CHECK" }},
+        ENV_VAR    = {{ source = "env", var = "NAU_SECRETS_TEST_CHECK" }},
         EXEC_VAR   = {{ source = "exec", command = {{ "{provider}" }} }},
     }},
 }}
@@ -3014,16 +3008,14 @@ end'"#
     fn check_reports_per_source_health_and_fails_named() {
         let _lock = ENV_LOCK.lock().unwrap();
         let (tmp, server, _env) = check_fixture();
-        std::env::remove_var("SHUTTLE_SECRETS_TEST_CHECK");
+        std::env::remove_var("NAU_SECRETS_TEST_CHECK");
         let rows = check_pod(tmp.path(), "work").unwrap();
         assert_eq!(rows.len(), 3);
         let by_key = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
         assert_eq!(by_key("VAULT_ITEM").status, "ok");
         assert_eq!(by_key("ENV_VAR").status, "failed");
         assert!(
-            by_key("ENV_VAR")
-                .note
-                .contains("SHUTTLE_SECRETS_TEST_CHECK"),
+            by_key("ENV_VAR").note.contains("NAU_SECRETS_TEST_CHECK"),
             "{}",
             by_key("ENV_VAR").note
         );
@@ -3036,9 +3028,9 @@ end'"#
         let text = render_check_rows("work", &rows);
         assert!(!text.contains(SENTINEL), "value leaked into check output");
         // Everything goes green once the env var exists (exit-0 shape).
-        std::env::set_var("SHUTTLE_SECRETS_TEST_CHECK", SENTINEL);
+        std::env::set_var("NAU_SECRETS_TEST_CHECK", SENTINEL);
         let rows = check_pod(tmp.path(), "work").unwrap();
-        std::env::remove_var("SHUTTLE_SECRETS_TEST_CHECK");
+        std::env::remove_var("NAU_SECRETS_TEST_CHECK");
         assert!(
             check_healthy(&rows),
             "all three D4 sources are live → exit 0: {rows:?}"
@@ -3620,18 +3612,18 @@ end'"#
         assert!(err.contains("empty"), "{err}");
     }
 
-    /// Live-bus gate: SHUTTLE_SECRETS_LIVE_DBUS=1 opts into a REAL
+    /// Live-bus gate: NAU_SECRETS_LIVE_DBUS=1 opts into a REAL
     /// session bus + unlocked keyring. Writes a uniquely-attributed
     /// item, reads it back through the PRODUCTION seam fn, deletes it.
     #[test]
     fn live_dbus_secret_service_round_trip_when_gated_on() {
         let _lock = ENV_LOCK.lock().unwrap();
-        if std::env::var("SHUTTLE_SECRETS_LIVE_DBUS").as_deref() != Ok("1") {
+        if std::env::var("NAU_SECRETS_LIVE_DBUS").as_deref() != Ok("1") {
             return;
         }
         use dbus_secret_service::{EncryptionType, SecretService};
         let attrs: BTreeMap<String, String> = BTreeMap::from([
-            ("shuttle-test".to_string(), "issue-185".to_string()),
+            ("nau-test".to_string(), "issue-185".to_string()),
             ("nonce".to_string(), std::process::id().to_string()),
         ]);
         let pairs: std::collections::HashMap<&str, &str> = attrs
@@ -3642,7 +3634,7 @@ end'"#
         let collection = service.get_default_collection().unwrap();
         let item = collection
             .create_item(
-                "shuttle issue-185 live test",
+                "nau issue-185 live test",
                 pairs,
                 SENTINEL.as_bytes(),
                 true,

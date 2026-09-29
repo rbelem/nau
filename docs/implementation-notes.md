@@ -19,14 +19,14 @@ wrong twice.
   `src/units.rs`).
 - **`SOURCE_DATE_EPOCH` is native to mksquashfs 4.4+.** Do not pass `-mkfs-time`;
   just ensure the environment variable is inherited by the child process
-  (`src/snap.rs`, `src/image.rs`, `src/pod.rs`). `shuttle doctor` checks the
+  (`src/snap.rs`, `src/image.rs`, `src/pod.rs`). `nau doctor` checks the
   mksquashfs version for this capability.
 
 ## Lua DSL ↔ Rust boundary (`src/lua.rs`)
 
 - **`index()` is a Rust closure** registered on the Lua state in `src/lua.rs`,
-  not defined in the Lua DSL file. It reads the `SHUTTLE_ARCH` and
-  `SHUTTLE_INDEX_PATH` environment variables for context (set by the CLI in
+  not defined in the Lua DSL file. It reads the `NAU_ARCH` and
+  `NAU_INDEX_PATH` environment variables for context (set by the CLI in
   `src/main.rs`).
-- Environment variables use the current `SHUTTLE_` prefix; the old `SHOOT_`
+- Environment variables use the current `NAU_` prefix; the old `SHOOT_`
   prefix is gone.

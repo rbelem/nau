@@ -9,7 +9,7 @@
 -- compile, link and in-sandbox run.
 --
 -- Build:
---   shuttle build --file test-fixtures/toolchain-pkg-config-probe.lua
+--   nau build --file test-fixtures/toolchain-pkg-config-probe.lua
 
 return {
     default = snap {
@@ -45,16 +45,16 @@ return {
         -- include dirs; headers ride the compiler's baked sysroot).
         build = table.concat({
             "set -x",
-            "test \"$(command -v pkg-config)\" = /shuttle-build-prefix/usr/bin/pkg-config",
+            "test \"$(command -v pkg-config)\" = /nau-build-prefix/usr/bin/pkg-config",
             "pkg-config --modversion libffi | grep -q '^3\\.'",
-            "pkg-config --libs libffi | grep -q 'shuttle-build-prefix/usr/lib'",
+            "pkg-config --libs libffi | grep -q 'nau-build-prefix/usr/lib'",
             "pkg-config --libs libffi | grep -q -- '-lffi'",
             -- A real consumer: the resolved flags feed pool gcc; the
             -- result runs in-sandbox against the prefix lib.
             "printf 'int main(void){return 0;}\\n' > t.c",
             "gcc t.c -o t $(pkg-config --cflags --libs libffi)",
             "test -x t",
-            "LD_LIBRARY_PATH=$SHUTTLE_BUILD_PREFIX/usr/lib:$SHUTTLE_BUILD_PREFIX/usr/lib64 ./t",
+            "LD_LIBRARY_PATH=$NAU_BUILD_PREFIX/usr/lib:$NAU_BUILD_PREFIX/usr/lib64 ./t",
             "echo toolchain-pkg-config-probe: pkg-config resolves sibling build_deps green",
         }, " && "),
     },

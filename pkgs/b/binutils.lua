@@ -83,8 +83,8 @@ archives, and binaries. This build targets x86_64-linux-gnu.]],
         -- dlopened only by the plugin-capable linkers at build time, so
         -- the exact RUNPATH entry is the same build-only class.
         leaks_ok = {
-            "/shuttle-build-prefix",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix",
+            "/nau-build-prefix/usr/lib64",
         },
     },
 }

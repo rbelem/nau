@@ -1,11 +1,11 @@
 # Project Context
 
-**shuttle** — a Rust CLI that builds Snap packages from Lua declarations,
+**nau** — a Rust CLI that builds Snap packages from Lua declarations,
 replacing Snapcraft's YAML with a programmable, composable Lua DSL. Inspired by
 Nix's declarative reproducibility and Neovim's Lua-based configurability.
 
 - **Former name:** *shoot* (renamed 2026-08, ADR-0013). The checkout directory
-  may still be named `shoot/`; the project and remote are `rbelem/shuttle`.
+  may still be named `shoot/`; the project and remote are `rbelem/nau`.
 - **Core value:** define any Snap package with a single Lua file — packaged,
   composable, version-controllable.
 

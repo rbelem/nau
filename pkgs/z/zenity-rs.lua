@@ -20,7 +20,7 @@
 --            time); buildRustPackage over the crates.io artifact
 --            would be the shape
 -- Snapcraft: no snap recipe upstream, none in the store
--- Shuttle:   declarative Lua — cargo source build against the
+-- Nau:   declarative Lua — cargo source build against the
 --            vendored deps closure. NO services declaration: an
 --            interactive dialog tool invoked by scripts; the process
 --            lives exactly as long as the dialog.
@@ -41,7 +41,7 @@
 -- deps), so the cargo resolver (issue #36, ADR-0017) vendors the
 -- closure at FETCH time exactly as statix/pdf-inspector do, and the
 -- sandbox build consumes it OFFLINE (CARGO_NET_OFFLINE + source
--- replacement at the mounted $SHUTTLE_DEPS_DIR/vendor).
+-- replacement at the mounted $NAU_DEPS_DIR/vendor).
 -- MSRV 1.88, edition 2024 — the pool toolchain (rust 1.97.1 through
 -- the /nix bind) satisfies both. build_deps: none — the pool-wide
 -- source-build posture (statix.lua; flipping to the pool `rust`
@@ -119,9 +119,9 @@ return {
             -- writable CARGO_HOME on the sandbox's /tmp tmpfs plus a
             -- source replacement pointing at the mounted, hash-verified
             -- vendor closure.
-            "export CARGO_HOME=/tmp/shuttle-cargo-home CARGO_NET_OFFLINE=true",
+            "export CARGO_HOME=/tmp/nau-cargo-home CARGO_NET_OFFLINE=true",
             'mkdir -p "$CARGO_HOME"',
-            'printf \'[source.crates-io]\\nreplace-with = "shuttle-vendored"\\n\\n[source.shuttle-vendored]\\ndirectory = "%s"\\n\' "$SHUTTLE_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
+            'printf \'[source.crates-io]\\nreplace-with = "nau-vendored"\\n\\n[source.nau-vendored]\\ndirectory = "%s"\\n\' "$NAU_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
             -- Single root crate ([lib] zenity_rs + [[bin]] zenity-rs);
             -- cargo install stages the bin under $STAGE/bin.
             "cargo install --path $SRC --root $STAGE",

@@ -1,4 +1,4 @@
-//! `shuttle pod` overlay integration tests (issue #6: inline code-only
+//! `nau pod` overlay integration tests (issue #6: inline code-only
 //! overlays).
 //!
 //! Drives the real binary end to end through the FULL chain: an overlay
@@ -147,15 +147,15 @@ fn write_pkg_version(project: &Path, name: &str, version: &str, marker: &str, po
 // ── Runners ──
 
 fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shuttle"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("pod").args(args).arg("--root").arg(root);
     cmd.current_dir(project);
     // The desktop launcher surface (issue #7) writes to the user data
     // home — redirect it inside the test's tempdir, never the real home.
-    cmd.env("SHUTTLE_DATA_HOME", root.join("data-home"));
+    cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66).
-    cmd.env("SHUTTLE_SYSTEMD", "off");
-    let out = cmd.output().expect("failed to spawn shuttle pod");
+    cmd.env("NAU_SYSTEMD", "off");
+    let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -214,7 +214,7 @@ fn farm_output(farm: &Path, name: &str) -> String {
 
 fn lock_pin(root: &Path, pod: &str, name: &str) -> Option<String> {
     let lock: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(pod_dir(root, pod).join("shuttle.lock")).unwrap(),
+        &std::fs::read_to_string(pod_dir(root, pod).join("nau.lock")).unwrap(),
     )
     .unwrap();
     lock["packages"][name]["version"]
@@ -443,7 +443,7 @@ gated_test!(overlay_nonexistent_package_fails_before_any_mutation, {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(generation_count(root.path(), "default"), 1);
 
-    let lock_before = snapshot(&pod_dir(root.path(), "default").join("shuttle.lock"));
+    let lock_before = snapshot(&pod_dir(root.path(), "default").join("nau.lock"));
     let link_before = std::fs::read_link(pod_dir(root.path(), "default").join("current")).unwrap();
 
     // Hand-edit pod.lua: overlay a package the pod does not declare
@@ -475,7 +475,7 @@ gated_test!(overlay_nonexistent_package_fails_before_any_mutation, {
         "declaration must not be re-rendered"
     );
     assert_eq!(
-        snapshot(&pod_dir(root.path(), "default").join("shuttle.lock")),
+        snapshot(&pod_dir(root.path(), "default").join("nau.lock")),
         lock_before,
         "lockfile must be untouched"
     );
@@ -502,7 +502,7 @@ gated_test!(overlay_unsupported_field_fails_before_any_mutation, {
     let (code, _, stderr) = run(project.path(), root.path(), &["add", "tool"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
 
-    let lock_before = snapshot(&pod_dir(root.path(), "default").join("shuttle.lock"));
+    let lock_before = snapshot(&pod_dir(root.path(), "default").join("nau.lock"));
 
     let decl_path = pod_dir(root.path(), "default").join("pod.lua");
     let decl = std::fs::read_to_string(&decl_path).unwrap();
@@ -527,7 +527,7 @@ gated_test!(overlay_unsupported_field_fails_before_any_mutation, {
         "declaration must not be re-rendered"
     );
     assert_eq!(
-        snapshot(&pod_dir(root.path(), "default").join("shuttle.lock")),
+        snapshot(&pod_dir(root.path(), "default").join("nau.lock")),
         lock_before,
         "lockfile must be untouched"
     );

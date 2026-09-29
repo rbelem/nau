@@ -9,17 +9,17 @@
 //! shape) and asking it to verify a detached binary signature over the
 //! downloaded `SHA256SUMS` bytes. This test produces the trust anchor
 //! and a signed manifest through the landed producers
-//! ([`shuttle::sign::import_pubring_pgp`],
-//! [`shuttle::sign::sign_sysupdate_manifest`]) and hands BOTH to the
+//! ([`nau::sign::import_pubring_pgp`],
+//! [`nau::sign::sign_sysupdate_manifest`]) and hands BOTH to the
 //! real gpg. If gpg rejects the EdDSALegacy(22)+SHA256 framing, every
 //! fielded device refuses every update — that verdict must come from
 //! gpg, not from the crate grading its own homework.
 //!
 //! Gated on the `gpg` binary (skip-if-absent on a dev host). In the
-//! automated gate the skip is NOT allowed: `SHUTTLE_GATE=1` turns a
+//! automated gate the skip is NOT allowed: `NAU_GATE=1` turns a
 //! missing gpg into a hard failure (#291 M3 — a silently-skipped
 //! round-trip is what hid the trust-slice council's H1), unless the
-//! host opts out with `SHUTTLE_GATE_ALLOW_SKIP=1`. `scripts/gate.sh`
+//! host opts out with `NAU_GATE_ALLOW_SKIP=1`. `scripts/gate.sh`
 //! provisions gpg via nix, so the gate runs this for real.
 
 use std::path::{Path, PathBuf};
@@ -40,26 +40,26 @@ fn gpg_available() -> bool {
     has_tool("gpg")
 }
 
-/// The gate exports SHUTTLE_GATE=1; the tests treat a missing gpg as a
+/// The gate exports NAU_GATE=1; the tests treat a missing gpg as a
 /// failure there, never a silent skip.
 fn in_gate() -> bool {
-    std::env::var("SHUTTLE_GATE").as_deref() == Ok("1")
+    std::env::var("NAU_GATE").as_deref() == Ok("1")
 }
 
 /// The documented per-host opt-out: a gate host that cannot carry the
 /// tools (no nix, offline) proceeds with VISIBLE skips.
 fn gate_skips_allowed() -> bool {
-    std::env::var("SHUTTLE_GATE_ALLOW_SKIP").as_deref() == Ok("1")
+    std::env::var("NAU_GATE_ALLOW_SKIP").as_deref() == Ok("1")
 }
 
 /// Skip-if-absent on a dev host; panic in the gate (#291 M3).
 fn skip_or_gate_fail() {
     if in_gate() && !gate_skips_allowed() {
         panic!(
-            "SHUTTLE_GATE=1 but gpg is unavailable — the gate must RUN the \
+            "NAU_GATE=1 but gpg is unavailable — the gate must RUN the \
              real-gpg sysupdate interop, not skip it (scripts/gate.sh \
              provisions nixpkgs#gnupg; a silent skip here is the #291 M3 \
-             meta-cause). Set SHUTTLE_GATE_ALLOW_SKIP=1 to proceed with \
+             meta-cause). Set NAU_GATE_ALLOW_SKIP=1 to proceed with \
              visible skips on a host that cannot carry gpg."
         );
     }
@@ -68,10 +68,10 @@ fn skip_or_gate_fail() {
 
 // ── Fixture ──
 
-fn test_kp(seed_byte: u8) -> shuttle::sign::KeyPair {
+fn test_kp(seed_byte: u8) -> nau::sign::KeyPair {
     let seed = [seed_byte; 32];
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    shuttle::sign::KeyPair {
+    nau::sign::KeyPair {
         seed,
         public: sk.verifying_key().to_bytes(),
     }
@@ -92,7 +92,7 @@ fn produce_artifacts() -> SysupdateArtifacts {
     let kp = test_kp(7);
 
     let pubring = dir.path().join("import-pubring.pgp");
-    std::fs::write(&pubring, shuttle::sign::import_pubring_pgp(&kp).unwrap()).unwrap();
+    std::fs::write(&pubring, nau::sign::import_pubring_pgp(&kp).unwrap()).unwrap();
 
     // The coreutils-format manifest the release layer publishes: one
     // `<sha256>␠␠<name>` line per media file, over real bytes.
@@ -104,7 +104,7 @@ fn produce_artifacts() -> SysupdateArtifacts {
         ),
     ];
     use sha2::Digest;
-    let sums = dir.path().join(shuttle::sign::SYSUPDATE_MANIFEST_NAME);
+    let sums = dir.path().join(nau::sign::SYSUPDATE_MANIFEST_NAME);
     let mut body = String::new();
     for (name, bytes) in &media {
         let digest = sha2::Sha256::digest(bytes);
@@ -115,10 +115,10 @@ fn produce_artifacts() -> SysupdateArtifacts {
 
     let sig = dir
         .path()
-        .join(shuttle::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
+        .join(nau::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
     std::fs::write(
         &sig,
-        shuttle::sign::sign_sysupdate_manifest(&kp, body.as_bytes()).unwrap(),
+        nau::sign::sign_sysupdate_manifest(&kp, body.as_bytes()).unwrap(),
     )
     .unwrap();
 
@@ -231,16 +231,16 @@ fn gpg_accepts_signatures_from_either_key_in_the_overlap_pubring() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let old = shuttle::sign::create_secret_key(dir.path()).unwrap();
-    let keys_dir = shuttle::sign::keys_dir(dir.path());
-    shuttle::sign::install_public_key(&old, &keys_dir).unwrap();
-    let successor = shuttle::sign::mint_rotation_key(dir.path()).unwrap();
+    let old = nau::sign::create_secret_key(dir.path()).unwrap();
+    let keys_dir = nau::sign::keys_dir(dir.path());
+    nau::sign::install_public_key(&old, &keys_dir).unwrap();
+    let successor = nau::sign::mint_rotation_key(dir.path()).unwrap();
 
     // The pre-promotion trust set: {current, designated successor}.
     let pubring = dir.path().join("import-pubring.pgp");
     std::fs::write(
         &pubring,
-        shuttle::sign::sysupdate_pubring_pgp(&old, dir.path()).unwrap(),
+        nau::sign::sysupdate_pubring_pgp(&old, dir.path()).unwrap(),
     )
     .unwrap();
 
@@ -253,16 +253,16 @@ fn gpg_accepts_signatures_from_either_key_in_the_overlap_pubring() {
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         body.push_str(&format!("{hex}  {name}\n"));
     }
-    let sums = dir.path().join(shuttle::sign::SYSUPDATE_MANIFEST_NAME);
+    let sums = dir.path().join(nau::sign::SYSUPDATE_MANIFEST_NAME);
     std::fs::write(&sums, &body).unwrap();
 
     for (role, signer) in [("current", &old), ("designated-successor", &successor)] {
         let sig = dir
             .path()
-            .join(shuttle::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
+            .join(nau::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
         std::fs::write(
             &sig,
-            shuttle::sign::sign_sysupdate_manifest(signer, body.as_bytes()).unwrap(),
+            nau::sign::sign_sysupdate_manifest(signer, body.as_bytes()).unwrap(),
         )
         .unwrap();
         let gpg_home = tempfile::tempdir().unwrap();

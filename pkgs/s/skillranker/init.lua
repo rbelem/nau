@@ -107,9 +107,9 @@ return {
             -- Cargo offline wiring (statix pattern, issue #36): writable
             -- CARGO_HOME on the sandbox /tmp tmpfs, source replacement
             -- pointing at the mounted, hash-verified vendor closure.
-            "export CARGO_HOME=/tmp/shuttle-cargo-home CARGO_NET_OFFLINE=true",
+            "export CARGO_HOME=/tmp/nau-cargo-home CARGO_NET_OFFLINE=true",
             'mkdir -p "$CARGO_HOME"',
-            'printf \'[source.crates-io]\\nreplace-with = "shuttle-vendored"\\n\\n[source.shuttle-vendored]\\ndirectory = "%s"\\n\' "$SHUTTLE_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
+            'printf \'[source.crates-io]\\nreplace-with = "nau-vendored"\\n\\n[source.nau-vendored]\\ndirectory = "%s"\\n\' "$NAU_DEPS_DIR/vendor" > "$CARGO_HOME/config.toml"',
             -- Root package carries the sr bin ([[bin]] in the root
             -- Cargo.toml); --root $STAGE lands it at $STAGE/bin/sr.
             'cargo install --path . --root "$STAGE"',

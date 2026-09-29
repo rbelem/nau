@@ -1,14 +1,14 @@
 //! The confined runtime backend (ADR-0016, ticket #11).
 //!
 //! A `confined` app runs inside a sandbox with declared grants, launched
-//! via a `shuttle run <app>` interposing launcher. `shuttle run` resolves
+//! via a `nau run <app>` interposing launcher. `nau run` resolves
 //! the app's package + grants from the pod's generation manifest, selects
 //! the enforcement backend (bwrap or AppArmor), verifies the backend is
 //! available (FAIL CLOSED — a confined app must never silently run
 //! unconfined), and execs the app's real command binary inside the
 //! sandbox.
 //!
-//! Issue #102 adds the arbitrary-command form: `shuttle run -- <cmd…>`
+//! Issue #102 adds the arbitrary-command form: `nau run -- <cmd…>`
 //! execs any command with the pod's env overlaid (farm-first PATH +
 //! loader-lib LD_LIBRARY_PATH) and no sandbox — fail-open by design.
 //!
@@ -31,7 +31,7 @@ use crate::snap::{BackendKind, Confinement, SANDBOX_RO_ROOTS};
 /// A name no package provides falls through to the arbitrary-command
 /// form (issue #102): `[app] ++ args` runs with the pod env, unconfined.
 ///
-/// An unconfined app reached here (explicit `shuttle run` misuse, or a
+/// An unconfined app reached here (explicit `nau run` misuse, or a
 /// pod overridden to unconfined) is exec'd directly — transparent, no
 /// sandbox. This is never invoked by the farm for an unconfined app.
 /// Every exec form (direct, bwrap, apparmor, arbitrary command) carries
@@ -75,7 +75,7 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
 
     // Effective confinement: the per-app override, else the package default.
     let Some(confined) = pkg.app_confined.get(app).or(pkg.confined.as_ref()) else {
-        // Unconfined app reached `shuttle run` directly — exec the real
+        // Unconfined app reached `nau run` directly — exec the real
         // binary with no sandbox (the farm never routes an unconfined app
         // here). Two invariants keep this form equivalent to running the
         // app THROUGH the farm:
@@ -122,7 +122,7 @@ pub fn run(pod_dir: &Path, pod_name: &str, app: &str, args: &[String]) -> miette
     }
 }
 
-/// The binary `shuttle run` execs for `app` (issue #37): the assembled
+/// The binary `nau run` execs for `app` (issue #37): the assembled
 /// leaf in the generation's assembly subtree when the package records a
 /// sibling assembly for the app, else the lone content blob.
 fn exec_target(
@@ -140,7 +140,7 @@ fn exec_target(
 }
 
 /// Locate the installed package providing `app` and the real command
-/// binary hash `shuttle run` should exec.
+/// binary hash `nau run` should exec.
 fn resolve_app<'a>(
     gen: &'a crate::runtime::Generation,
     app: &str,
@@ -172,7 +172,7 @@ fn overlay_declared_vars(
 /// [`crate::pod::shellenv`] — the SAME env contract the shell export
 /// uses, never a second one. No confinement, no sandbox (fail-open by
 /// design). Transparent exec: the command replaces this process, so its
-/// exit status is `shuttle run`'s.
+/// exit status is `nau run`'s.
 ///
 /// Trust: the command runs with the caller's full privileges, and a
 /// farm name resolves BEFORE the caller's PATH — the pod's active
@@ -184,7 +184,7 @@ pub fn run_command(pod_dir: &Path, pod_name: &str, command: &[String]) -> miette
     let env = crate::pod::shellenv(root, pod_name)?;
     let farm = PathBuf::from(&env.farm);
     let Some(prog) = command.first() else {
-        miette::bail!("shuttle run: empty command — nothing to exec");
+        miette::bail!("nau run: empty command — nothing to exec");
     };
     let program = resolve_command(prog, &farm)?;
     let mut cmd = std::process::Command::new(program);
@@ -218,7 +218,7 @@ fn resolve_command_in(name: &str, entries: &[PathBuf]) -> miette::Result<PathBuf
         miette::miette!(
             "command '{name}' not found in the pod's farm ({}), or PATH — \
              add the package that provides it to the pod \
-             (`shuttle pod add <package>`) or install it on the host PATH",
+             (`nau pod add <package>`) or install it on the host PATH",
             entries
                 .first()
                 .map(|p| p.display().to_string())
@@ -299,7 +299,7 @@ fn run_bwrap(
         miette::miette!(
             "confined app '{app}' uses the bwrap backend, but bubblewrap is not \
              available on this host (no provisioned set and none on PATH) — refusing \
-             to run unconfined. Run `shuttle doctor --fix` to provision it, install \
+             to run unconfined. Run `nau doctor --fix` to provision it, install \
              bubblewrap (e.g. `apt install bubblewrap`), or override the package to \
              unconfined via the pod declaration."
         )
@@ -494,13 +494,13 @@ fn run_apparmor(
 
 /// A deterministic per-pod, per-app profile name.
 pub fn profile_name(pod_name: &str, app: &str) -> String {
-    format!("shuttle-{pod_name}-{app}")
+    format!("nau-{pod_name}-{app}")
 }
 
 /// Generate the AppArmor profile text honoring the shared grants
 /// vocabulary: filesystem path rules, network allowance, socket/device
 /// path rules, plus a minimal deny-by-default base. The profile carries a
-/// `## SHUTTLE` marker line; the seccomp filter is a separate policy the
+/// `## NAU` marker line; the seccomp filter is a separate policy the
 /// runtime applies via the profile (AppArmor's seccomp integration).
 ///
 /// This is the vocabulary-honoring implementation — the profile is the
@@ -509,7 +509,7 @@ pub fn profile_name(pod_name: &str, app: &str) -> String {
 pub fn render_apparmor_profile(pod_name: &str, app: &str, confined: &Confinement) -> String {
     let mut out = String::new();
     out.push_str("#include <tunables/global>\n");
-    out.push_str(&format!("## SHUTTLE profile for '{}'\n", app));
+    out.push_str(&format!("## NAU profile for '{}'\n", app));
     out.push_str(&format!(
         "profile {} flags=(attach_disconnected,mediate_deleted) {{\n",
         profile_name(pod_name, app)
@@ -795,7 +795,7 @@ mod tests {
         // Network is a shared grant: request it and the profile must allow.
         c.network = true;
         let profile = render_apparmor_profile("work", "myapp", &c);
-        assert!(profile.contains("profile shuttle-work-myapp"));
+        assert!(profile.contains("profile nau-work-myapp"));
         // Filesystem grants → path rules.
         assert!(profile.contains("/usr r,"));
         assert!(profile.contains("/lib rw,"));
@@ -827,11 +827,11 @@ mod tests {
 
     #[test]
     fn profile_name_is_deterministic_and_namespaced() {
-        assert_eq!(profile_name("default", "app"), "shuttle-default-app");
-        assert_eq!(profile_name("work", "gui"), "shuttle-work-gui");
+        assert_eq!(profile_name("default", "app"), "nau-default-app");
+        assert_eq!(profile_name("work", "gui"), "nau-work-gui");
     }
 
-    // ── Issue #37: shuttle run resolves multi-file apps via the assembly ──
+    // ── Issue #37: nau run resolves multi-file apps via the assembly ──
 
     #[test]
     fn exec_target_prefers_the_assembly_leaf_for_multifile_apps() {
@@ -1133,7 +1133,7 @@ mod tests {
         // caller's real PATH too — the name is unique enough to miss
         // everywhere), proving the command form was entered, not the old
         // "not provided by any package" error.
-        let missing = "shuttle-102-definitely-missing-zz7f3a9b";
+        let missing = "nau-102-definitely-missing-zz7f3a9b";
         let err = run(&dir, "default", missing, &[]).unwrap_err().to_string();
         assert!(
             err.contains(missing) && err.contains("PATH"),

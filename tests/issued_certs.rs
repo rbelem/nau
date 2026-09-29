@@ -15,7 +15,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const IDENTITY: &str = "shuttle-worker-itest-01";
+const IDENTITY: &str = "nau-worker-itest-01";
 
 struct Run {
     code: Option<i32>,
@@ -24,12 +24,12 @@ struct Run {
 }
 
 fn run_in(dir: &Path, args: &[&str]) -> Run {
-    let out = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+    let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args(args)
         .env("HOME", dir)
         .current_dir(dir)
         .output()
-        .expect("failed to spawn shuttle");
+        .expect("failed to spawn nau");
     Run {
         code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -37,26 +37,26 @@ fn run_in(dir: &Path, args: &[&str]) -> Run {
     }
 }
 
-/// Run shuttle with stdin piped (the receive-publish payload) and the
+/// Run nau with stdin piped (the receive-publish payload) and the
 /// publish bearer in the environment (the transport front's contract).
 fn run_in_with_stdin(dir: &Path, args: &[&str], stdin: &[u8], token: &str) -> Run {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args(args)
         .env("HOME", dir)
-        .env("SHUTTLE_PUBLISH_TOKEN", token)
+        .env("NAU_PUBLISH_TOKEN", token)
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to spawn shuttle");
+        .expect("failed to spawn nau");
     child
         .stdin
         .as_mut()
         .expect("stdin piped")
         .write_all(stdin)
         .expect("payload written");
-    let out = child.wait_with_output().expect("shuttle waited");
+    let out = child.wait_with_output().expect("nau waited");
     Run {
         code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -119,8 +119,8 @@ fn enroll_and_publish_via_binary(dir: &Path, identity: &str, guest_pub: &str) ->
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let token = shuttle::provision::publish::mint_publish_token().unwrap();
-    shuttle::provision::publish::record_issue(dir, &token, identity, now).unwrap();
+    let token = nau::provision::publish::mint_publish_token().unwrap();
+    nau::provision::publish::record_issue(dir, &token, identity, now).unwrap();
     let payload = serde_json::json!({
         "machine_identity": identity,
         "public_key": guest_pub,
@@ -146,7 +146,7 @@ fn enroll_and_publish_via_binary(dir: &Path, identity: &str, guest_pub: &str) ->
 fn issue_and_pickup_round_trip_through_the_real_binary() {
     let dir = tempfile::tempdir().unwrap();
     let home = format!("--home={}", dir.path().display());
-    let ca_dir = dir.path().join(".config/shuttle/ca");
+    let ca_dir = dir.path().join(".config/nau/ca");
 
     // ── the ceremony: a real CA keypair ──
     let run = run_in(dir.path(), &["ca", "keygen", &home, "--json"]);
@@ -207,7 +207,7 @@ fn issue_and_pickup_round_trip_through_the_real_binary() {
     assert_eq!(record["public_key"], serde_json::json!(guest_pub));
     assert_eq!(
         record["token_sha256"],
-        serde_json::json!(shuttle::oci::sha256_hex(token.as_bytes())),
+        serde_json::json!(nau::oci::sha256_hex(token.as_bytes())),
         "the record ties back to the publish token (hashed at rest)"
     );
     assert!(
@@ -315,29 +315,31 @@ fn issue_refusals_name_the_gap() {
     let token = enroll_and_publish_via_binary(dir.path(), IDENTITY, &guest_pub);
     let _ = token;
 
-    // (a) No CA — the refusal names the ceremony verb.
+    // (a) No CA — the refusal names the ceremony verb. miette wraps long
+    // refusals at width-dependent points and paints `│` gutters on
+    // continuation lines; strip the gutters and flatten whitespace so
+    // phrase matches survive any wrap position.
     let run = run_in(dir.path(), &["workers", "issue", &home]);
     assert_ne!(run.code, Some(0), "issue without a CA must refuse");
-    assert!(run.stderr.contains("no host CA"), "{}", run.stderr);
-    assert!(run.stderr.contains("ca keygen"), "{}", run.stderr);
+    let flat = |s: &str| {
+        s.replace('│', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert!(flat(&run.stderr).contains("no host CA"), "{}", run.stderr);
+    assert!(flat(&run.stderr).contains("ca keygen"), "{}", run.stderr);
 
     // (b) Unknown identity.
     let run = run_in(dir.path(), &["ca", "keygen", &home]);
     assert_eq!(run.code, Some(0), "ca keygen: {}", run.stderr);
     let run = run_in(
         dir.path(),
-        &[
-            "workers",
-            "issue",
-            &home,
-            "--identity",
-            "shuttle-worker-nope",
-        ],
+        &["workers", "issue", &home, "--identity", "nau-worker-nope"],
     );
     assert_ne!(run.code, Some(0));
     assert!(
-        run.stderr
-            .contains("no pending identity named 'shuttle-worker-nope'"),
+        flat(&run.stderr).contains("no pending identity named 'nau-worker-nope'"),
         "{}",
         run.stderr
     );
@@ -350,8 +352,12 @@ fn issue_refusals_name_the_gap() {
         &["workers", "issue", &home, "--identity", IDENTITY],
     );
     assert_ne!(run.code, Some(0));
-    assert!(run.stderr.contains("already issued"), "{}", run.stderr);
-    assert!(run.stderr.contains("--force"), "{}", run.stderr);
+    assert!(
+        flat(&run.stderr).contains("already issued"),
+        "{}",
+        run.stderr
+    );
+    assert!(flat(&run.stderr).contains("--force"), "{}", run.stderr);
     let run = run_in(
         dir.path(),
         &[
@@ -405,9 +411,9 @@ fn ca_form_executor_pins_the_signing_ca_through_the_real_keygen() {
     use std::io;
     use std::sync::{Arc, Mutex};
 
-    use shuttle::command::{CommandRunner, RunnerOutput};
-    use shuttle::lua::WorkerConfig;
-    use shuttle::ssh_exec::{PreflightChecks, SshExecutor};
+    use nau::command::{CommandRunner, RunnerOutput};
+    use nau::lua::WorkerConfig;
+    use nau::ssh_exec::{PreflightChecks, SshExecutor};
 
     /// Answers the coordinator's channel without a network: `ssh` gets a
     /// happy capability document, `ssh-keygen -lf` runs the REAL binary,
@@ -422,7 +428,7 @@ fn ca_form_executor_pins_the_signing_ca_through_the_real_keygen() {
                 "ssh" => Ok(RunnerOutput {
                     code: 0,
                     stdout: serde_json::to_vec(&serde_json::json!({
-                        "protocol": shuttle::worker::WORKER_PROTOCOL_VERSION,
+                        "protocol": nau::worker::WORKER_PROTOCOL_VERSION,
                         "arch": "x86_64",
                         "nproc": 4,
                         "ram_bytes": 8_000_000_000u64,
@@ -431,7 +437,7 @@ fn ca_form_executor_pins_the_signing_ca_through_the_real_keygen() {
                         "mksquashfs": true,
                         "kvm": false,
                         "sandbox": true,
-                        "mksquashfs_version": shuttle::provision::SQUASHFS_TOOLS_VERSION,
+                        "mksquashfs_version": nau::provision::SQUASHFS_TOOLS_VERSION,
                     }))
                     .unwrap(),
                     stderr: String::new(),
@@ -475,18 +481,18 @@ fn ca_form_executor_pins_the_signing_ca_through_the_real_keygen() {
     // ── the issued record: the audit trail the executor consumes ──
     let record_text = std::fs::read_to_string(
         ceremony
-            .join(".config/shuttle/ca/issued")
+            .join(".config/nau/ca/issued")
             .join(format!("issued-{IDENTITY}.json")),
     )
     .expect("issued record");
-    let record: shuttle::provision::publish::IssuedIdentity =
+    let record: nau::provision::publish::IssuedIdentity =
         serde_json::from_str(&record_text).unwrap();
     assert_eq!(record.ca_fingerprint, fingerprint);
     assert_eq!(record.principals[0], IDENTITY, "machine identity first");
 
     // ── the provision-time machine linkage: address → identity ──
     let address = "ssh://root@203.0.113.9";
-    shuttle::provision::publish::record_machine_link(ceremony, IDENTITY, address).unwrap();
+    nau::provision::publish::record_machine_link(ceremony, IDENTITY, address).unwrap();
 
     // ── the executor resolves the pin through the REAL ssh-keygen ──
     let worker = WorkerConfig {
@@ -513,7 +519,7 @@ fn ca_form_executor_pins_the_signing_ca_through_the_real_keygen() {
     // ceremony CA whose REAL fingerprint equals the pin.
     let pinned = std::fs::read_to_string(ex.known_hosts_path()).unwrap();
     let ca_pub_line =
-        std::fs::read_to_string(ceremony.join(".config/shuttle/ca/ca.pub")).expect("ca.pub");
+        std::fs::read_to_string(ceremony.join(".config/nau/ca/ca.pub")).expect("ca.pub");
     let key_half = ca_pub_line
         .split_whitespace()
         .take(2)

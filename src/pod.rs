@@ -4,7 +4,7 @@
 //! Ticket scaffold (issue #2): parse, validate, and render the `pod()`
 //! declaration in a pod's `pod.lua`; resolve package versions from the
 //! shared package collection (`pkgs/` + inputs); pin the resolved versions
-//! in the pod's lockfile. `shuttle pod add/remove/list` round-trip through
+//! in the pod's lockfile. `nau pod add/remove/list` round-trip through
 //! the declaration file.
 //!
 //! Issue #3: `add`/`remove` reconcile the declaration into the pod's
@@ -12,18 +12,18 @@
 //! pointed at the pod's state directory — no forked store), building each
 //! declared package with the normal snap build path. The bin farm
 //! (`crate::farm`) is re-emitted for the active generation and the pod's
-//! `current` link flipped after every mutation; `shuttle pod sync`
+//! `current` link flipped after every mutation; `nau pod sync`
 //! re-runs the whole reconcile (hand-edited `pod.lua` included) and is a
 //! no-op — no new generation — when nothing changed.
 //!
 //! Issue #5: pods move forward deliberately and backward safely.
-//! `shuttle pod update` re-resolves every declared package to the newest
+//! `nau pod update` re-resolves every declared package to the newest
 //! version matching its constraint, repins the lockfile, and reconciles
 //! (only what changed is rebuilt — content identity is the no-op
-//! detector). `shuttle pod rollback` flips ONLY that pod's `current`
+//! detector). `nau pod rollback` flips ONLY that pod's `current`
 //! link to a previous generation through the store's rollback machinery
 //! (system generations are never touched); the farm follows, so binaries
-//! the newer generation added disappear. `shuttle pod gc [--prune]`
+//! the newer generation added disappear. `nau pod gc [--prune]`
 //! reuses the store's mark-sweep: unreferenced pod generations are
 //! pruned and their exclusive blobs freed, live generations keep theirs.
 //!
@@ -84,7 +84,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lock::{LockFile, PodPackageLockEntry};
 
-/// The implicit pod when no `--name` is given (`shuttle pod <verb>`).
+/// The implicit pod when no `--name` is given (`nau pod <verb>`).
 pub const DEFAULT_POD: &str = "default";
 
 /// The pod declaration file, inside the pod's state directory.
@@ -93,14 +93,14 @@ pub const POD_FILE: &str = "pod.lua";
 // ── State layout ──
 
 /// Root of all pod state. Resolution order: explicit `--root` flag, then
-/// the `SHUTTLE_POD_ROOT` env var, then the user's local share state
-/// (`$XDG_DATA_HOME/shuttle/pods`, defaulting to `~/.local/share`). Tests
+/// the `NAU_POD_ROOT` env var, then the user's local share state
+/// (`$XDG_DATA_HOME/nau/pods`, defaulting to `~/.local/share`). Tests
 /// MUST redirect via the flag or the env var — never the real home.
 pub fn pod_root(explicit: Option<&str>) -> PathBuf {
     if let Some(root) = explicit.filter(|r| !r.is_empty()) {
         return PathBuf::from(root);
     }
-    if let Ok(root) = std::env::var("SHUTTLE_POD_ROOT") {
+    if let Ok(root) = std::env::var("NAU_POD_ROOT") {
         if !root.is_empty() {
             return PathBuf::from(root);
         }
@@ -111,7 +111,7 @@ pub fn pod_root(explicit: Option<&str>) -> PathBuf {
             PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/share")
         }
     };
-    data_home.join("shuttle").join("pods")
+    data_home.join("nau").join("pods")
 }
 
 /// One pod's state directory: `<root>/<name>` (holding `pod.lua`, the
@@ -1137,7 +1137,7 @@ fn validate_overlay_value(pkg: &str, key: &str, value: &serde_json::Value) -> mi
 /// validated data-only at parse time).
 pub fn render_pod_source(decl: &PodDeclaration) -> String {
     let mut out = String::new();
-    out.push_str("-- Pod declaration, maintained by `shuttle pod add/remove`.\n");
+    out.push_str("-- Pod declaration, maintained by `nau pod add/remove`.\n");
     out.push_str("-- Hand edits are allowed; malformed declarations fail validation.\n");
     out.push_str("pod {\n");
     if !decl.loads.is_empty() {
@@ -1412,7 +1412,7 @@ pub fn validate_loads(root: &Path, pod_name: &str, decl: &PodDeclaration) -> mie
             miette::bail!(
                 "pod '{pod_name}' loads '{loaded}', but pod '{loaded}' has no declaration \
                  at {} — create the loaded pod first \
-                 (`shuttle pod --name {loaded} add <package>` initializes it)",
+                 (`nau pod --name {loaded} add <package>` initializes it)",
                 path.display()
             );
         }
@@ -1873,9 +1873,9 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
                 // recipe to rebuild); name the real escapes.
                 miette::bail!(
                     "package '{}' is already in pod '{}' as a sideloaded blob \
-                     pin — `shuttle pod sync` holds it at its pin (no collection \
-                     recipe to rebuild); re-run `shuttle pod add --snap` to move \
-                     the pin, or `shuttle pod remove '{}'` first",
+                     pin — `nau pod sync` holds it at its pin (no collection \
+                     recipe to rebuild); re-run `nau pod add --snap` to move \
+                     the pin, or `nau pod remove '{}'` first",
                     spec.name,
                     pod_name,
                     spec.name
@@ -1883,7 +1883,7 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
             }
             miette::bail!(
                 "package '{}' is already in pod '{}' (remove it first to change its \
-                 constraint; `shuttle pod sync` rebuilds it at its pins)",
+                 constraint; `nau pod sync` rebuilds it at its pins)",
                 spec.name,
                 pod_name
             );
@@ -1952,7 +1952,7 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
     // The declaration is the source of truth; the store reconcile
     // follows it. A failed reconcile (unbuildable package) leaves the
     // declaration + pin in place — fix the package and re-run
-    // `shuttle pod sync`.
+    // `nau pod sync`.
     let sync = sync_pod(root, pod_name)?;
     if let Some(n) = sync.generation {
         crate::output::ok(format!(
@@ -1971,7 +1971,7 @@ pub fn add_package(root: &Path, pod_name: &str, spec_str: &str) -> miette::Resul
     })
 }
 
-/// Report for `shuttle pod add --snap` (issue #116).
+/// Report for `nau pod add --snap` (issue #116).
 #[derive(Debug, Serialize)]
 pub struct PodSnapAddReport {
     pub pod: String,
@@ -2037,7 +2037,7 @@ pub fn add_snap_pod(
     // construction, so the acknowledgment is the only proof of intent.
     if !ack_unsigned {
         miette::bail!(
-            "refusing to sideload '{}': the payload carries no shuttle \
+            "refusing to sideload '{}': the payload carries no nau \
              signature — pass --ack-unsigned to accept an unsigned payload",
             payload.display()
         );
@@ -2255,7 +2255,7 @@ pub fn add_snap_pod(
         crate::output::warn(format!(
             "pod '{pod_name}' is loaded by pod '{loader}' — this sideload makes \
              '{loader}' refuse its mutating verbs (loading pods that carry blob \
-             pins is unsupported, issue #116); `shuttle pod remove` the pin from \
+             pins is unsupported, issue #116); `nau pod remove` the pin from \
              '{pod_name}' to restore it"
         ));
     }
@@ -2356,9 +2356,9 @@ pub fn add_snap_pod(
         let previous = sync.generation.unwrap() - 1;
         crate::output::warn(format!(
             "'{name}' content replaced: generation {previous} and older still \
-             carry sha3-384 {replaced:.12}… — `shuttle pod rollback` across \
+             carry sha3-384 {replaced:.12}… — `nau pod rollback` across \
              this swap reactivates content the blob pin no longer names; the \
-             next sync refuses until `shuttle pod add --snap` realigns it",
+             next sync refuses until `nau pod add --snap` realigns it",
             replaced = replaced.clone().unwrap(),
         ));
     }
@@ -2419,7 +2419,7 @@ fn sync_failure_wrap(
         "sideloaded '{name}' ('{version}') is ACTIVE on generation \
          {generation} with its `requires` closure incomplete ({cause}): \
          libraries missing, farm/services not re-presented — provide the \
-         collection and run `shuttle pod sync` to complete, or `shuttle \
+         collection and run `nau pod sync` to complete, or `nau \
          pod remove {name}` to abandon"
     )
 }
@@ -2553,7 +2553,7 @@ fn unpack_payload_identity(
         .into_diagnostic()
         .wrap_err_with(|| {
             format!(
-                "reading {} (no meta/snap.yaml — not a shuttle-built payload)",
+                "reading {} (no meta/snap.yaml — not a nau-built payload)",
                 yaml_path.display()
             )
         })?;
@@ -2770,7 +2770,7 @@ pub fn remove_package(
     })
 }
 
-/// Report for `shuttle pod declare --file` (gate-pod gap 5).
+/// Report for `nau pod declare --file` (gate-pod gap 5).
 #[derive(Debug, Serialize)]
 pub struct PodDeclareReport {
     pub pod: String,
@@ -2852,7 +2852,7 @@ fn precheck_declare_collisions(root: &Path, decl: &PodDeclaration) -> miette::Re
 /// Post-write failures remain possible (the same residual as
 /// `add_package`): a failed reconcile leaves the new declaration (and
 /// any pins sync already recorded) in place — fix the cause and re-run
-/// `shuttle pod sync` (or re-declare the file) to converge.
+/// `nau pod sync` (or re-declare the file) to converge.
 pub fn declare_pod(root: &Path, pod_name: &str, file: &Path) -> miette::Result<PodDeclareReport> {
     validate_pod_name(pod_name)?;
     if !file.is_file() {
@@ -2882,12 +2882,12 @@ pub fn declare_pod(root: &Path, pod_name: &str, file: &Path) -> miette::Result<P
     // The declaration is the source of truth; the reconcile follows it.
     // A failed reconcile (unbuildable package) leaves the new
     // declaration — and any pins sync already recorded — in place:
-    // fix the cause and re-run `shuttle pod sync` (or re-declare).
+    // fix the cause and re-run `nau pod sync` (or re-declare).
     let sync = sync_pod(root, pod_name).map_err(|cause| {
         miette::miette!(
             "declaration written to {} but its reconcile failed ({cause}): the \
              new declaration and its pins stay in place — fix the cause and \
-             run `shuttle pod sync` (or re-declare the file) to converge",
+             run `nau pod sync` (or re-declare the file) to converge",
             decl_path.display()
         )
     })?;
@@ -2955,7 +2955,7 @@ pub fn rebuild_package(
     if deps_pin_moved {
         if let Some(deps) = entry.and_then(|e| e.deps.as_ref()) {
             crate::output::ok(format!(
-                "moved dependency closure for '{}': {:.12}… (recorded in shuttle.lock)",
+                "moved dependency closure for '{}': {:.12}… (recorded in nau.lock)",
                 spec.name, deps.deps_hash
             ));
         }
@@ -3003,7 +3003,7 @@ pub struct PodUpdateHeld {
     pub constraint: String,
 }
 
-/// Report for `shuttle pod update`.
+/// Report for `nau pod update`.
 #[derive(Debug, Serialize)]
 pub struct PodUpdateReport {
     pub pod: String,
@@ -3231,7 +3231,7 @@ pub fn update_pod(
 
 // ── Rollback (issue #5) ──
 
-/// Report for `shuttle pod rollback`.
+/// Report for `nau pod rollback`.
 #[derive(Debug, Serialize)]
 pub struct PodRollbackReport {
     pub pod: String,
@@ -3345,7 +3345,7 @@ pub fn gc_pod(
     store.gc(prune)
 }
 
-/// Report for the pod reconcile (`shuttle pod sync`, and the tail of
+/// Report for the pod reconcile (`nau pod sync`, and the tail of
 /// every add/remove).
 #[derive(Debug, Serialize)]
 pub struct PodSyncReport {
@@ -3360,7 +3360,7 @@ pub struct PodSyncReport {
     pub removed: Vec<String>,
     /// Names HELD at their lockfile pins this reconcile: the package
     /// collection resolves a newer version but the pin (and the active
-    /// generation's content) say otherwise — `shuttle pod update` moves
+    /// generation's content) say otherwise — `nau pod update` moves
     /// them deliberately (issue #5).
     pub held: Vec<String>,
     /// Names whose recipe-closure drift this reconcile BASELINED
@@ -3402,14 +3402,14 @@ pub fn resolve_pod_store(pod: Option<&str>) -> miette::Result<crate::runtime::Ru
 
 /// Runtime tools for the pod paths. Default: the host binaries with the
 /// system-bus set suppressed when the host has no systemd or
-/// `SHUTTLE_SYSTEMD` opts out (see [`RuntimeTools::for_pod_runtime`]).
+/// `NAU_SYSTEMD` opts out (see [`RuntimeTools::for_pod_runtime`]).
 ///
-/// `SHUTTLE_POD_TOOLS=absent` is a test-only seam (issue #66): it
+/// `NAU_POD_TOOLS=absent` is a test-only seam (issue #66): it
 /// resolves every tool to `None`, so `pod sync`/`pod rollback` reach
 /// activation with no external tool at all and cannot touch the host
 /// system bus. Production never sets it.
 fn pod_runtime_tools() -> crate::runtime::RuntimeTools {
-    match std::env::var("SHUTTLE_POD_TOOLS").as_deref() {
+    match std::env::var("NAU_POD_TOOLS").as_deref() {
         Ok("absent") => crate::runtime::RuntimeTools::default(),
         _ => crate::runtime::RuntimeTools::for_pod_runtime(),
     }
@@ -3427,7 +3427,7 @@ fn pod_runtime_tools() -> crate::runtime::RuntimeTools {
 /// of truth for what stays installed. When a declared package's pin
 /// differs from the freshly resolved candidate AND the active generation
 /// already carries the pinned version, the package is HELD at its store
-/// content — not rebuilt at the candidate (that is what `shuttle pod
+/// content — not rebuilt at the candidate (that is what `nau pod
 /// update` is for). Otherwise it builds normally.
 ///
 /// Composition (issue #8): the pod's `loads` resolve FIRST — each loaded
@@ -3473,7 +3473,7 @@ pub struct PodRefreshedMember {
     pub installed: bool,
 }
 
-/// Report for `shuttle pod refresh` (issue #142).
+/// Report for `nau pod refresh` (issue #142).
 #[derive(Debug, Serialize)]
 pub struct PodRefreshReport {
     pub pod: String,
@@ -3529,7 +3529,7 @@ pub fn refresh_pod(
             miette::bail!(
                 "cannot refresh '{member}': it is blob-pinned (sideloaded) — the \
                  payload is its content, there is no recipe to rebuild; re-run \
-                 `shuttle pod add --snap` to replace it"
+                 `nau pod add --snap` to replace it"
             );
         }
         if !declared.contains(member) {
@@ -3689,7 +3689,7 @@ fn verify_held_deps_blob(ctx: &ReconcileCtx<'_>, name: &str) -> miette::Result<(
     if !blob.exists() {
         miette::bail!(
             "held package '{name}': dependency closure {hash:.12}… is missing from the pod \
-             store — the held sync refuses to proceed; run `shuttle deps fetch` to fetch it"
+             store — the held sync refuses to proceed; run `nau deps fetch` to fetch it"
         );
     }
     let actual = crate::dep_fetch::sha256_file(&blob)?;
@@ -3710,7 +3710,7 @@ fn verify_held_deps_blob(ctx: &ReconcileCtx<'_>, name: &str) -> miette::Result<(
 /// package's desktop IDs, binaries, and services; its runtime `requires`
 /// seeds the closure so the libraries it needs stay carried. A pin whose
 /// content the active generation does NOT carry fails named (the
-/// repair path is a re-add: `shuttle pod add --snap`).
+/// repair path is a re-add: `nau pod add --snap`).
 fn hold_blob_pinned(
     ctx: &ReconcileCtx<'_>,
     name: &str,
@@ -3722,7 +3722,7 @@ fn hold_blob_pinned(
         miette::bail!(
             "package '{name}' is blob-pinned (sideloaded) but the pod's active \
              generation does not carry its pinned content — re-run \
-             `shuttle pod --name {} add --snap` to reinstall it",
+             `nau pod --name {} add --snap` to reinstall it",
             ctx.pod_name
         );
     };
@@ -3730,7 +3730,7 @@ fn hold_blob_pinned(
         miette::bail!(
             "package '{name}' is blob-pinned (sha3-384 {pin_sha3_384}) but the \
              active generation carries different content ({}) — re-run \
-             `shuttle pod --name {} add --snap` to realign it",
+             `nau pod --name {} add --snap` to realign it",
             installed_pkg.sha3_384,
             ctx.pod_name
         );
@@ -3868,7 +3868,7 @@ fn detect_recipe_drift(
         } else {
             crate::output::status(format!(
                 "baseline recorded for '{}': recipe drift predating this sync \
-                 is unrecoverable — run `shuttle pod refresh <member>` to \
+                 is unrecoverable — run `nau pod refresh <member>` to \
                  rebuild a member from its current recipe",
                 spec.name
             ));
@@ -4439,7 +4439,7 @@ fn warn_degraded_missing(state: &ReconcileState, build: &ReconcileBuild) {
     if !missing.is_empty() {
         crate::output::warn(format!(
             "unsquashfs/mksquashfs not found — declared but not installed: {}; \
-             install squashfs-tools and run `shuttle pod sync`",
+             install squashfs-tools and run `nau pod sync`",
             missing.join(", ")
         ));
     }
@@ -5071,7 +5071,7 @@ fn ensure_refresh_targets_are_members(
         miette::bail!(
             "cannot refresh {}: not a member of pod '{}' — not declared, not \
              loaded, and in no package's requires closure; declare it with \
-             `shuttle pod add` first",
+             `nau pod add` first",
             foreign.join(", "),
             ctx.pod_name
         );
@@ -5910,7 +5910,7 @@ fn resolve_service_overrides_against_meta(
 
 /// Degraded-mode banner for `pod add` when the squashfs pair is absent:
 /// the declaration is written, the install is deferred to
-/// `shuttle pod sync` once the tools exist.
+/// `nau pod sync` once the tools exist.
 /// Epoch stamped into pod-built payloads so the same content builds to
 /// the same bytes on every sync (mksquashfs embeds build time otherwise
 /// — verified: two builds of an identical tree differ without this, and
@@ -5929,8 +5929,8 @@ fn set_pod_build_epoch() {
 }
 
 /// Build one declared package into a `.snap` payload with the normal
-/// snap build path (`shuttle::snap::build_snap` — the same pipeline
-/// `shuttle build` uses, sandbox included) and shape it as a pending
+/// snap build path (`nau::snap::build_snap` — the same pipeline
+/// `nau build` uses, sandbox included) and shape it as a pending
 /// store install at the given composition layer. Local builds carry
 /// revision 0; content identity is the payload's sha3-384, which is
 /// what the no-op detection compares.
@@ -5943,7 +5943,7 @@ fn set_pod_build_epoch() {
 ///
 /// A package with `requires`/`build_deps` builds against the merged
 /// build prefix (ADR-0018, issue #35 — the same machinery the pool
-/// `shuttle build` path uses): every closure member's payload is
+/// `nau build` path uses): every closure member's payload is
 /// ensured in the pod's downloads dir ([`ensure_pod_dep_payload`]) and
 /// materialized into one `/usr`-like tree bound read-only into the
 /// sandbox. The leak scan runs on the same data — pod-built payloads
@@ -5963,7 +5963,7 @@ fn build_pending_snap(
         (Some(_), None) => miette::bail!(
             "package '{}' declares deps but no closure pin exists for it here — \
              dependency closures resolve in the pod that declares the package \
-             (`shuttle deps fetch`)",
+             (`nau deps fetch`)",
             meta.name
         ),
         (None, _) => None,
@@ -6165,14 +6165,14 @@ fn build_pending_snap_at(
 
 /// List a pod's packages with resolved versions. Read verbs do not
 /// initialize pods: an unknown pod (no `pod.lua`) is a clear error —
-/// `shuttle pod add` is what initializes a pod.
+/// `nau pod add` is what initializes a pod.
 pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListEntry>> {
     validate_pod_name(pod_name)?;
     let decl_path = pod_lua_path(root, pod_name);
     if !decl_path.exists() {
         miette::bail!(
             "pod '{pod_name}' has no declaration at {} (read verbs do not \
-             initialize pods; `shuttle pod --name {pod_name} add <package>` does)",
+             initialize pods; `nau pod --name {pod_name} add <package>` does)",
             decl_path.display()
         );
     }
@@ -6219,7 +6219,7 @@ pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListE
 // ── Interactive shellenv (issue #47) ──
 
 /// The environment a pod exposes to an interactive shell (issue #47):
-/// the pod's bin farm behind its `current` link. `shuttle pod shellenv`
+/// the pod's bin farm behind its `current` link. `nau pod shellenv`
 /// renders it as POSIX shell statements the user `eval`s — the
 /// interactive half of farm activation (ADR-0015 §7: "a single PATH
 /// prepend"), never an RC-file write, daemon, or watcher.
@@ -6248,13 +6248,13 @@ pub struct PodShellenv {
     pub generation: Option<u64>,
     /// The generation's recorded declared env (ADR-0030): sorted key →
     /// literal value, read from `generations/<n>/env.json`. Empty for
-    /// env-less generations; the renderer exports nothing and `shuttle
+    /// env-less generations; the renderer exports nothing and `nau
     /// run` overlays nothing in that case.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub vars: BTreeMap<String, String>,
     /// Resolved secret values (ADR-0042 D3, issue #184): the recorded
     /// references resolved at serve time, all-or-nothing (D7). The
-    /// renderer exports these AFTER the env lines; `shuttle run`
+    /// renderer exports these AFTER the env lines; `nau run`
     /// overlays them onto the exec'd process with the same
     /// declared-replaces-inherited rule. NEVER serialized (D8): the
     /// JSON branch of `pod shellenv` must not become a value
@@ -6291,7 +6291,7 @@ pub fn shellenv_with(
     if !pod.is_dir() {
         miette::bail!(
             "pod '{pod_name}' has no state at {} (read verbs do not \
-             initialize pods; `shuttle pod --name {pod_name} add <package>` does)",
+             initialize pods; `nau pod --name {pod_name} add <package>` does)",
             pod.display()
         );
     }
@@ -6301,7 +6301,7 @@ pub fn shellenv_with(
     std::fs::metadata(&farm).map_err(|_| {
         miette::miette!(
             "pod '{pod_name}' has no active generation at {} — sync the \
-             pod first (`shuttle pod --name {pod_name} sync`)",
+             pod first (`nau pod --name {pod_name} sync`)",
             farm.display()
         )
     })?;
@@ -6313,7 +6313,7 @@ pub fn shellenv_with(
     // surface: issue #110 (ADR-0034) moved the seam into per-app LD
     // wrappers written by the farm emit, so no `LD_LIBRARY_PATH` is
     // exported here. The recorded list still feeds the wrappers and
-    // `shuttle run`'s pod-scoped overlay.
+    // `nau run`'s pod-scoped overlay.
     // ADR-0030: the generation's recorded declared env. A missing file
     // is a pre-env surface generation (or an env-less one) — an empty
     // map is the correct answer, exactly like the loader-lib list
@@ -6413,7 +6413,7 @@ pub fn render_shellenv(env: &PodShellenv) -> String {
     // exports — one POSIX single-quoted export per resolved secret,
     // sorted keys. Single quotes survive any bytes the providers yield,
     // newline-bearing PEM values included; the same
-    // declared-replaces-inherited rule `shuttle run` overlays with.
+    // declared-replaces-inherited rule `nau run` overlays with.
     for (key, value) in &env.secret_vars {
         script.push_str(&format!("export {key}={}\n", sh_single_quote(value)));
     }
@@ -6433,7 +6433,7 @@ pub struct DepsFetchedEntry {
     pub changed: bool,
 }
 
-/// Report for `shuttle deps fetch`.
+/// Report for `nau deps fetch`.
 #[derive(Debug, Serialize)]
 pub struct DepsFetchReport {
     pub pod: String,
@@ -6722,7 +6722,7 @@ pod {
         );
         assert_eq!(
             pod_lock_path(root, DEFAULT_POD),
-            PathBuf::from("/state-root/default/shuttle.lock")
+            PathBuf::from("/state-root/default/nau.lock")
         );
     }
 
@@ -7642,10 +7642,10 @@ pod {
     #[test]
     fn test_shellenv_exports_no_loader_libs_even_for_lib_payloads() {
         let tmp = tempfile::tempdir().unwrap();
-        // The documented layout `<data-home>/shuttle/pods/<pod>`: the
+        // The documented layout `<data-home>/nau/pods/<pod>`: the
         // emit's desktop/font surfaces derive their user-level dirs
         // from this shape, so every write stays inside the tempdir.
-        let root = tmp.path().join("data/shuttle/pods");
+        let root = tmp.path().join("data/nau/pods");
         let dir = pod_dir(&root, "default");
         let store = pod_store(&dir);
         // Generation 1 carries a lib payload (the emit records its lib
@@ -8113,7 +8113,7 @@ pod {
     #[test]
     fn test_shellenv_serves_the_generation_env_and_the_flip_restores_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("data/shuttle/pods");
+        let root = tmp.path().join("data/nau/pods");
         let dir = pod_dir(&root, "default");
         let store = pod_store(&dir);
         crate::farm::emit(&store, &gen_with_one_pkg(1, "jq")).unwrap();
@@ -8514,7 +8514,7 @@ pod {
     #[test]
     fn present_active_records_the_declared_env_on_staging() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("data/shuttle/pods");
+        let root = tmp.path().join("data/nau/pods");
         let dir = pod_dir(&root, "default");
         let store = pod_store(&dir);
         crate::farm::emit(&store, &gen_with_one_pkg(1, "jq")).unwrap();
@@ -8569,7 +8569,7 @@ pod {
     #[test]
     fn present_active_records_declared_secrets_on_staging() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("data/shuttle/pods");
+        let root = tmp.path().join("data/nau/pods");
         let dir = pod_dir(&root, "default");
         let store = pod_store(&dir);
         crate::farm::emit(&store, &gen_with_one_pkg(1, "jq")).unwrap();

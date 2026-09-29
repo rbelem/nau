@@ -43,7 +43,7 @@
 //! server are only DETACHED by a delete and keep billing — the pre-delete
 //! `server get` names them loudly (the #269 v2 residual warning, the Azure
 //! deleteOption analog) before the delete proceeds. The #269 v2 contract
-//! tags (`shuttle-worker` presence, `shuttle-worker-ttl` epoch-seconds
+//! tags (`nau-worker` presence, `nau-worker-ttl` epoch-seconds
 //! expiry) are stamped AT CREATE as server tags — Scaleway instance tags
 //! are free-form strings, so the key=value vocabulary rides inside each
 //! string. The TTL sweep itself is hcloud-only today — #287; the same gap
@@ -70,20 +70,20 @@ use crate::provision::{
     Provisioner, UserDataParams, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
 };
 
-/// The worker presence tag shuttle stamps at create time — the key
+/// The worker presence tag nau stamps at create time — the key
 /// shared with the #269 v2 TTL contract (Hetzner writer, cross-provider
-/// vocabulary): presence marks the server as a shuttle worker. The value
+/// vocabulary): presence marks the server as a nau worker. The value
 /// is `true` (presence semantics; expiry rides the TTL tag only). Scaleway
 /// instance tags are free-form strings, so the pair rides as one
 /// `key=value` string per tag.
-pub const WORKER_TAG: &str = "shuttle-worker";
+pub const WORKER_TAG: &str = "nau-worker";
 
 /// The TTL tag: expiry in EPOCH SECONDS UTC, set AT CREATE — the source
 /// of truth of the #269 v2 contract (the in-guest marker is a fallback
-/// COPY). The same decimal shape the `shuttle-worker-ttl` hcloud label
+/// COPY). The same decimal shape the `nau-worker-ttl` hcloud label
 /// carries; the sweep's `is_epoch` parses decimal only. (The sweep itself
 /// is hcloud-only today — #287; the same gap applies to scaleway.)
-pub const WORKER_TTL_TAG: &str = "shuttle-worker-ttl";
+pub const WORKER_TTL_TAG: &str = "nau-worker-ttl";
 
 /// The worker base image (providers plan §3, ADR-0046): the LATEST
 /// Ubuntu LTS — the contract pins "latest LTS", never a codename — as the
@@ -107,10 +107,10 @@ pub struct ScalewayProvisioner<R: CommandRunner> {
     /// any API call. The credential itself never enters argv; the scw CLI
     /// inherits it from its environment/config store.
     credentials: Option<String>,
-    /// The pinned shuttle binary URL the template installs.
+    /// The pinned nau binary URL the template installs.
     binary_url: String,
     /// The operator's authorized public-key line (login), resolved at the
-    /// CLI boundary (`SHUTTLE_OPERATOR_KEY` / default key halves) so the
+    /// CLI boundary (`NAU_OPERATOR_KEY` / default key halves) so the
     /// core stays env-free under test.
     operator_key: String,
     /// The coordinator publish channel (callback URL + ceremony home) —
@@ -245,7 +245,7 @@ impl<R: CommandRunner> Provisioner for ScalewayProvisioner<R> {
             return Err(miette::miette!(
                 "provision: {e:#} — tore down {torn_down} created server(s), config untouched; \
                  FAILED to delete {} — it is still running and billing; delete it with \
-                 'shuttle workers destroy' or by hand",
+                 'nau workers destroy' or by hand",
                 stuck.join(", ")
             ));
         }
@@ -514,7 +514,7 @@ fn address_for(ip: &str) -> String {
     format!("ssh://root@{ip}")
 }
 
-/// `shuttle-worker-<hex nanos>-<NN>` — unique per project; the prefix
+/// `nau-worker-<hex nanos>-<NN>` — unique per project; the prefix
 /// mirrors the tag key, so name and tags read as one identity. The name
 /// doubles as the machine identity the one-time publish token binds.
 fn instance_name(i: u32) -> String {
@@ -522,7 +522,7 @@ fn instance_name(i: u32) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("shuttle-worker-{nanos:x}-{:02}", i + 1)
+    format!("nau-worker-{nanos:x}-{:02}", i + 1)
 }
 
 fn print_plan(plan: &ProvisionPlan) {

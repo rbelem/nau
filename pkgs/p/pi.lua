@@ -12,7 +12,7 @@
 -- bytecode and corrupt under ELF rewriting.
 --
 -- Known caveat (farm/run layout): the pod content store keeps files
--- as individual content-addressed blobs and `shuttle run`/the farm
+-- as individual content-addressed blobs and `nau run`/the farm
 -- exec the lone command blob, so the usr/bin siblings exist in the
 -- snap payload but not beside the executed blob. Effect: `pi
 -- --version` falls back to 0.0.0 (update nag) and themes use

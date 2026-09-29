@@ -1,4 +1,4 @@
-//! `shuttle image --release` ↔ `shuttle verify-image` interop, end to end
+//! `nau image --release` ↔ `nau verify-image` interop, end to end
 //! (ADR-0044 D4+D5, issues #266 and #265).
 //!
 //! The trust contract: the release signer attaches the operator's Ed25519
@@ -10,11 +10,11 @@
 //! roothash — but the manifest is signed by the RELEASE signer, exactly
 //! as `--release` publishes it (pretty JSON with the signatures map
 //! attached), then round-tripped through the file system into
-//! `shuttle verify-image`.
+//! `nau verify-image`.
 //!
 //! Gated on sfdisk + veritysetup + mtools (the build-host tools the suite
 //! spawns; the fixture ESP is a real mtools FAT — #284's covered region).
-//! The live axis — a real mission through `shuttle image --release` into
+//! The live axis — a real mission through `nau image --release` into
 //! a scratch export tree (full ukify/mtools/mkfs chain), two-machine
 //! rebuild-compare byte-identity, and hardware — stays deferred; nothing
 //! here fakes it.
@@ -64,10 +64,10 @@ const HASH_SIZE: u64 = 4096;
 const SECTOR: u64 = 512;
 const ESP_UUID: &str = "aabbccdd-0011-2233-4455-667788990011";
 
-fn test_kp(seed_byte: u8) -> shuttle::sign::KeyPair {
+fn test_kp(seed_byte: u8) -> nau::sign::KeyPair {
     let seed = [seed_byte; 32];
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    shuttle::sign::KeyPair {
+    nau::sign::KeyPair {
         seed,
         public: sk.verifying_key().to_bytes(),
     }
@@ -225,7 +225,7 @@ fn build_fixture() -> Fixture {
     write_fat_esp(&esp_file);
     let uki_payload = dir.path().join("uki.digest-payload");
     std::fs::write(&uki_payload, uki_bytes()).unwrap();
-    let uki_digest = shuttle::store::sha3_384_file(&uki_payload).unwrap();
+    let uki_digest = nau::store::sha3_384_file(&uki_payload).unwrap();
     splice(&device, &esp_file, ESP_START * SECTOR);
 
     // 4. Splice the formatted regions into their extents.
@@ -238,7 +238,7 @@ fn build_fixture() -> Fixture {
     //    and round-tripped through the file system like a download.
     let manifest = dir
         .path()
-        .join(shuttle::image::release::release_stem("1.0.0", "amd64") + ".manifest.json");
+        .join(nau::image::release::release_stem("1.0.0", "amd64") + ".manifest.json");
     assert_eq!(
         manifest.file_name().unwrap().to_str().unwrap(),
         "nau-cassini-1.0.0-amd64.manifest.json",
@@ -246,7 +246,7 @@ fn build_fixture() -> Fixture {
     );
     write_release_signed_manifest(&manifest, &roothash, &uki_digest);
     let key = dir.path().join("downloaded.pub");
-    std::fs::write(&key, shuttle::sign::public_key_file(&test_kp(7))).unwrap();
+    std::fs::write(&key, nau::sign::public_key_file(&test_kp(7))).unwrap();
 
     Fixture {
         dir,
@@ -267,7 +267,7 @@ fn splice(dst: &std::path::Path, src: &std::path::Path, offset: u64) {
 /// Sign with the release signer and publish the exact bytes `--release`
 /// writes: the typed image manifest, pretty-printed, signature attached.
 fn write_release_signed_manifest(path: &std::path::Path, roothash: &str, uki_sha3_384: &str) {
-    use shuttle::image::{ImageManifest, ImageSnapEntry};
+    use nau::image::{ImageManifest, ImageSnapEntry};
     let mut manifest = ImageManifest {
         name: "nau".into(),
         version: "1.0.0".into(),
@@ -286,7 +286,7 @@ fn write_release_signed_manifest(path: &std::path::Path, roothash: &str, uki_sha
         roothash: Some(roothash.into()),
         signatures: Default::default(),
     };
-    shuttle::image::release::sign_image_manifest(&mut manifest, &test_kp(7)).unwrap();
+    nau::image::release::sign_image_manifest(&mut manifest, &test_kp(7)).unwrap();
     let json = serde_json::to_string_pretty(&manifest).unwrap();
     std::fs::write(path, json).unwrap();
 }
@@ -294,7 +294,7 @@ fn write_release_signed_manifest(path: &std::path::Path, roothash: &str, uki_sha
 /// Run the real binary with HOME isolated to `dir` (empty keychain —
 /// `--key` is the only anchor in play, the download posture).
 fn run_verify(fx: &Fixture, manifest: &std::path::Path) -> (Option<i32>, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+    let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args([
             "verify-image",
             "--device",
@@ -307,7 +307,7 @@ fn run_verify(fx: &Fixture, manifest: &std::path::Path) -> (Option<i32>, String)
         .env("HOME", fx.dir.path())
         .current_dir(fx.dir.path())
         .output()
-        .expect("failed to spawn shuttle");
+        .expect("failed to spawn nau");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -366,17 +366,17 @@ gated_test!(tampered_release_manifest_refuses, {
 // revoked key id refuses even when the key is also an installed anchor.
 gated_test!(revoked_release_key_refuses, {
     let fx = build_fixture();
-    let keys_dir = fx.dir.path().join(".config/shuttle/keys");
+    let keys_dir = fx.dir.path().join(".config/nau/keys");
     std::fs::create_dir_all(&keys_dir).unwrap();
     let kp = test_kp(7);
     std::fs::write(
         keys_dir.join(format!("{}.pub", kp.key_id())),
-        shuttle::sign::public_key_file(&kp),
+        nau::sign::public_key_file(&kp),
     )
     .unwrap();
     std::fs::write(keys_dir.join("revoked-keys"), format!("{}\n", kp.key_id())).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_shuttle"))
+    let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args([
             "verify-image",
             "--device",
@@ -387,7 +387,7 @@ gated_test!(revoked_release_key_refuses, {
         .env("HOME", fx.dir.path())
         .current_dir(fx.dir.path())
         .output()
-        .expect("failed to spawn shuttle");
+        .expect("failed to spawn nau");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_ne!(out.status.code(), Some(0));
     assert!(

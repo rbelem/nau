@@ -1,4 +1,4 @@
--- shuttle typed prelude — analyzer definition file (Luau Mode::Definition).
+-- nau typed prelude — analyzer definition file (Luau Mode::Definition).
 --
 -- Loaded via Frontend::loadDefinitionFile by the check stage so that the
 -- globals the eval prelude injects at runtime (src/dsl/init.lua: snap,

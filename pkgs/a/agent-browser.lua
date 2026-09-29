@@ -2,7 +2,7 @@
 -- navigate, snapshot a11y trees, click/type/screenshot via a CLI.
 --
 -- Cheap-tier flake port (issue #20): upstream ships the linux-x64
--- build as a raw (unarchived) Bun-compile executable. Shuttle keeps
+-- build as a raw (unarchived) Bun-compile executable. Nau keeps
 -- non-tarball sources in place in the build dir, so the asset is
 -- installed directly from its download name. Runtime note: driving a
 -- real browser needs a Chromium at run time (the flake wired nixpkgs

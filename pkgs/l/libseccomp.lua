@@ -68,9 +68,9 @@ return {
         -- files matter only at libtool link time, so the bare-prefix entry
         -- covers it while ELF scanning stays strict).
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib64",
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix",
+            "/nau-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix",
         },
 
         apps = {},

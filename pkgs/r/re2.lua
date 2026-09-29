@@ -15,7 +15,7 @@
 --
 -- Nix:       pkgs.re2 (cmake build, shared)
 -- Snapcraft: no upstream recipe; a library dependency
--- Shuttle:   declarative Lua — CMake source build, shared lib.
+-- Nau:   declarative Lua — CMake source build, shared lib.
 --
 -- Port strategy: shared library (BUILD_SHARED_LIBS=ON — grpc links
 -- re2 from package providers; a static libre2 would get baked into
@@ -62,7 +62,7 @@ return {
         build = table.concat({
             "cmake -S $SRC -B $SRC/build -G Ninja "
                 .. "-DCMAKE_BUILD_TYPE=Release "
-                .. "-DCMAKE_PREFIX_PATH=$SHUTTLE_BUILD_PREFIX/usr "
+                .. "-DCMAKE_PREFIX_PATH=$NAU_BUILD_PREFIX/usr "
                 .. "-DCMAKE_INSTALL_PREFIX=/usr "
                 .. "-DCMAKE_INSTALL_LIBDIR=lib "
                 .. "-DCMAKE_POSITION_INDEPENDENT_CODE=ON "
@@ -79,11 +79,11 @@ return {
         -- text embeds configure-time absolute paths under the merged
         -- build prefix; silenced by reference.
         leaks_ok = {
-            "/shuttle-build-prefix/usr/lib",
-            "/shuttle-build-prefix/usr/lib64",
+            "/nau-build-prefix/usr/lib",
+            "/nau-build-prefix/usr/lib64",
             -- Text-leak references carry the BARE prefix marker
             -- (leak_scan record() matches the reference exactly).
-            "/shuttle-build-prefix",
+            "/nau-build-prefix",
         },
     },
 }

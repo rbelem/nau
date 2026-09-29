@@ -8,7 +8,7 @@
 -- hermetic sandbox.
 --
 -- Build:
---   shuttle build --file test-fixtures/toolchain-rust-probe.lua
+--   nau build --file test-fixtures/toolchain-rust-probe.lua
 
 return {
     default = snap {

@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use shuttle::build_sched::{
+use nau::build_sched::{
     pool_budget, run_ready_set_with_executor, BuildExecutor, FailedBuilds, LocalExecutor,
     MAX_PARALLEL_BUILD_WORKERS,
 };
-use shuttle::lua::WorkersConfig;
+use nau::lua::WorkersConfig;
 
 fn graph(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
     pairs
@@ -27,8 +27,8 @@ fn graph(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
-fn worker(address: &str, jobs: u32) -> shuttle::lua::WorkerConfig {
-    shuttle::lua::WorkerConfig {
+fn worker(address: &str, jobs: u32) -> nau::lua::WorkerConfig {
+    nau::lua::WorkerConfig {
         address: address.to_string(),
         jobs,
         arch: None,
@@ -72,7 +72,7 @@ workers = {
 }
 return { default = snap { name = "pool-budget", version = "1.0" } }
 "#;
-    let out = shuttle::lua::evaluate_string_with_inputs("pool-budget-test", src)
+    let out = nau::lua::evaluate_string_with_inputs("pool-budget-test", src)
         .expect("valid workers table must eval");
     assert_eq!(pool_budget(&out.workers), 11, "5 local + 4 + default 2");
 }
@@ -86,7 +86,7 @@ fn eval_err(workers_decl: &str) -> String {
 return {{ default = snap {{ name = "dense-idx", version = "1.0" }} }}
 "#
     );
-    shuttle::lua::evaluate_string_with_inputs("dense-idx-test", &src)
+    nau::lua::evaluate_string_with_inputs("dense-idx-test", &src)
         .err()
         .map(|e| e.to_string())
         .unwrap_or_else(|| panic!("expected a refusal, got green: {workers_decl}"))
@@ -133,7 +133,7 @@ workers = {
 }
 return { default = snap { name = "dense-idx", version = "1.0" } }
 "#;
-    let out = shuttle::lua::evaluate_string_with_inputs("dense-idx-test", src)
+    let out = nau::lua::evaluate_string_with_inputs("dense-idx-test", src)
         .expect("dense mixed key spellings must eval");
     assert_eq!(out.workers.workers.len(), 2);
     assert_eq!(out.workers.workers[0].address, "ssh://a");

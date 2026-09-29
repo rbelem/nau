@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use shuttle::worker::{
+use nau::worker::{
     capability_document, execute_job, load_manifest, CapabilityDoc, ClosureObject, JobManifest,
     SourcePin, WORKER_PROTOCOL_VERSION,
 };
@@ -20,7 +20,7 @@ use shuttle::worker::{
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// A mode-0755 stub binary: the tool-resolution override
-/// (`SHUTTLE_TOOL_<NAME>`) routes the named tool's probes through it.
+/// (`NAU_TOOL_<NAME>`) routes the named tool's probes through it.
 fn stub_tool(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, body).expect("stub body");
@@ -39,7 +39,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn host_arch() -> &'static str {
-    shuttle::snap::host_arch()
+    nau::snap::host_arch()
 }
 
 /// The directory a job's artifacts are written to. It must live outside
@@ -507,7 +507,7 @@ fn pin_url_with_shell_metacharacters_is_refused() {
 
 #[test]
 fn capability_document_carries_every_probe() {
-    let cap = shuttle::worker::capability_document();
+    let cap = nau::worker::capability_document();
     assert_eq!(cap.protocol, WORKER_PROTOCOL_VERSION);
     assert_eq!(cap.arch, host_arch());
     assert!(cap.nproc >= 1, "nproc is a real count");
@@ -543,7 +543,7 @@ fn sandbox_probe_passes_when_userns_works_and_fails_closed_when_broken() {
     // bwrap present and a minimal unshared invocation succeeding (#273
     // verify-unit: the cap probe passes on a working sandbox).
     std::env::set_var(
-        "SHUTTLE_TOOL_BWRAP",
+        "NAU_TOOL_BWRAP",
         stub_tool(dir.path(), "bwrap-ok", "#!/bin/sh\nexit 0\n"),
     );
     let cap = capability_document();
@@ -557,13 +557,13 @@ fn sandbox_probe_passes_when_userns_works_and_fails_closed_when_broken() {
     // CLOSED with userns deliberately broken). bwrap stays true; sandbox
     // goes false, and preflight refuses by design.
     std::env::set_var(
-        "SHUTTLE_TOOL_BWRAP",
+        "NAU_TOOL_BWRAP",
         stub_tool(dir.path(), "bwrap-broken", "#!/bin/sh\nexit 1\n"),
     );
     let cap = capability_document();
     assert!(cap.bwrap, "bwrap presence is reported honestly");
     assert!(!cap.sandbox, "a broken userns fails the probe closed");
-    std::env::remove_var("SHUTTLE_TOOL_BWRAP");
+    std::env::remove_var("NAU_TOOL_BWRAP");
 }
 
 #[test]
@@ -574,7 +574,7 @@ fn cap_reports_the_resolved_mksquashfs_version_for_admission() {
     // shape; the document carries the parsed version so preflight can
     // pin the fleet to exactly it (#273).
     std::env::set_var(
-        "SHUTTLE_TOOL_MKSQUASHFS",
+        "NAU_TOOL_MKSQUASHFS",
         stub_tool(
             dir.path(),
             "mksquashfs",
@@ -585,19 +585,19 @@ fn cap_reports_the_resolved_mksquashfs_version_for_admission() {
     assert!(cap.mksquashfs, "the stub resolves as mksquashfs");
     assert_eq!(
         cap.mksquashfs_version.as_deref(),
-        Some(shuttle::provision::SQUASHFS_TOOLS_VERSION),
+        Some(nau::provision::SQUASHFS_TOOLS_VERSION),
         "the parsed version is exactly the fleet pin"
     );
     // A digit-less (unreadable) report stays None — and admission reads
     // None as a refusal, not a pass.
     std::env::set_var(
-        "SHUTTLE_TOOL_MKSQUASHFS",
+        "NAU_TOOL_MKSQUASHFS",
         stub_tool(dir.path(), "mksquashfs-mute", "#!/bin/sh\necho 'nothing'\n"),
     );
     let cap = capability_document();
     assert!(cap.mksquashfs);
     assert_eq!(cap.mksquashfs_version, None, "unreadable stays None");
-    std::env::remove_var("SHUTTLE_TOOL_MKSQUASHFS");
+    std::env::remove_var("NAU_TOOL_MKSQUASHFS");
 }
 
 // ── Result document shape on a failing build (offline) ──
@@ -708,7 +708,7 @@ fn job_main_prints_the_result_document_for_a_valid_manifest() {
     // asserted by execute_job's tests above — here the wiring is the unit.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = write_manifest(dir.path(), &hello_manifest());
-    shuttle::worker::job_main(&path.to_string_lossy()).expect("job_main succeeds");
+    nau::worker::job_main(&path.to_string_lossy()).expect("job_main succeeds");
     let out = dir.path().join("out");
     let packed: Vec<_> = std::fs::read_dir(&out)
         .expect("out/ exists")
@@ -723,7 +723,7 @@ fn job_main_refuses_a_bad_manifest_nonzero() {
     let mut manifest = hello_manifest();
     manifest.protocol_version = 99;
     let path = write_manifest(dir.path(), &manifest);
-    let err = shuttle::worker::job_main(&path.to_string_lossy()).expect_err("refused");
+    let err = nau::worker::job_main(&path.to_string_lossy()).expect_err("refused");
     assert!(
         format!("{err:#}").contains("protocol version mismatch"),
         "refusal names the version: {err:#}"
