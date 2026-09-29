@@ -122,6 +122,10 @@ pub struct AzureProvisioner<R: CommandRunner> {
     /// the CLI boundary (`NAU_OPERATOR_KEY` / default key halves) so
     /// the core stays env-free under test.
     operator_key: String,
+    /// The client identity pinned into every workers entry (#298): the
+    /// private-key path resolved at the CLI boundary beside
+    /// `operator_key` — same env-free posture.
+    identity_path: String,
     /// The coordinator publish channel (callback URL + ceremony home) —
     /// `None` is the no-channel refusal path for real runs; a dry run
     /// runs without.
@@ -134,6 +138,7 @@ impl<R: CommandRunner> AzureProvisioner<R> {
         credentials: Option<String>,
         binary_url: String,
         operator_key: String,
+        identity_path: String,
         publish: Option<PublishChannel>,
     ) -> Self {
         AzureProvisioner {
@@ -141,6 +146,7 @@ impl<R: CommandRunner> AzureProvisioner<R> {
             credentials,
             binary_url,
             operator_key,
+            identity_path,
             publish,
         }
     }
@@ -223,6 +229,7 @@ impl<R: CommandRunner> Provisioner for AzureProvisioner<R> {
         let pin = PinPlan {
             publish,
             ca_pin: &ca_pin,
+            identity: self.identity_path.clone(),
         };
 
         // The per-region group first (idempotent): the VM's region is
@@ -423,7 +430,7 @@ impl<R: CommandRunner> AzureProvisioner<R> {
         // through it (#295 sub-task 4).
         for (name, address) in &pins {
             crate::provision::publish::record_machine_link(&pin.publish.home, name, address)?;
-            append_worker_entry(&req.config, address, pin.ca_pin)?;
+            append_worker_entry(&req.config, address, pin.ca_pin, &pin.identity)?;
         }
         Ok(())
     }

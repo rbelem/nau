@@ -149,6 +149,13 @@ pub struct WorkerConfig {
     /// `ssh-keyscan` path exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_key: Option<String>,
+    /// The client identity ssh presents to this worker (#298): the path
+    /// of a private key, pinned so ambient `~/.ssh/config` cannot
+    /// substitute its own `IdentityFile`. Absent = resolution falls to
+    /// `NAU_SSH_IDENTITY`, then the operator's default key halves —
+    /// the executor's resolution order, never ssh_config's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 fn default_local_jobs() -> u32 {
@@ -405,7 +412,7 @@ fn entry_field_name(key: &mlua::Value, index: usize) -> miette::Result<String> {
 
 /// Parse one array entry of the `workers` table.
 fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<WorkerConfig> {
-    const KNOWN: &str = "known fields: address, jobs, arch, host_key";
+    const KNOWN: &str = "known fields: address, jobs, arch, host_key, identity";
     let mlua::Value::Table(table) = value else {
         return Err(miette::miette!(
             "workers[{index}] must be a table, got {}",
@@ -416,6 +423,7 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
     let mut jobs = default_worker_jobs();
     let mut arch: Option<String> = None;
     let mut host_key: Option<String> = None;
+    let mut identity: Option<String> = None;
     for pair in table.pairs::<mlua::Value, mlua::Value>() {
         let (key, val) = pair.map_err(|e| miette::miette!("workers[{index}] entry: {e}"))?;
         let field = entry_field_name(&key, index)?;
@@ -439,6 +447,15 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
                     .map_err(|e| miette::miette!("workers[{index}]: field 'host_key': {e}"))?;
                 host_key = Some(k);
             }
+            "identity" => {
+                let i = entry_string_field(&val, index, "identity")?;
+                if i.is_empty() {
+                    return Err(miette::miette!(
+                        "workers[{index}]: field 'identity' must be a non-empty private-key path"
+                    ));
+                }
+                identity = Some(i);
+            }
             other => {
                 return Err(miette::miette!(
                     "workers[{index}]: unknown field '{other}' ({KNOWN})"
@@ -453,6 +470,7 @@ fn parse_worker_entry(value: &mlua::Value, index: usize) -> miette::Result<Worke
         jobs,
         arch,
         host_key,
+        identity,
     })
 }
 

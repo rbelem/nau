@@ -143,6 +143,16 @@ enum ResolvedPin {
     CertificateAuthority { line: String, alias: String },
 }
 
+/// What client-identity resolution concluded: the path the argv rides
+/// (`None` = nothing resolved) plus the sources narrative that rides
+/// the preflight failure text — a "Permission denied" probe must point
+/// at the resolution, not just at the host (#298).
+#[derive(Debug, Clone)]
+struct ClientIdentity {
+    path: Option<PathBuf>,
+    tried: String,
+}
+
 /// One base64 character (standard alphabet, no padding) — the
 /// fingerprint-pin shape check.
 fn is_base64_char(b: u8) -> bool {
@@ -238,6 +248,11 @@ pub struct SshExecutor<R: CommandRunner> {
     /// [`SshExecutor::ensure_known_hosts`] (which every preflight runs
     /// before any ssh) so the argv builder can ride it.
     host_key_alias: Mutex<Option<String>>,
+    /// The client identity resolved at preflight (#298), cached the same
+    /// way the alias is: `Some(path)` rides the argv as
+    /// `-o IdentitiesOnly=yes -i <path>`; `None` = nothing resolved, no
+    /// `-i` (ssh's ambient behavior, unchanged).
+    identity: Mutex<Option<PathBuf>>,
     dispatches: AtomicUsize,
 }
 
@@ -284,6 +299,7 @@ impl<R: CommandRunner> SshExecutor<R> {
             cache_dir: cache_dir.to_path_buf(),
             ceremony_home: ceremony_home.to_path_buf(),
             host_key_alias: Mutex::new(None),
+            identity: Mutex::new(None),
             dispatches: AtomicUsize::new(0),
         })
     }
@@ -439,6 +455,96 @@ impl<R: CommandRunner> SshExecutor<R> {
         )
     }
 
+    /// The client identity for this worker's channel (#298), resolved in
+    /// a fixed order — the entry's `identity` field, then
+    /// `NAU_SSH_IDENTITY`, then the private halves of the same default
+    /// candidates `provision::resolve_operator_key` walks, anchored at
+    /// the ceremony home (which IS `$HOME` in the production wiring and
+    /// the pinned test seam). An explicitly named path that does not
+    /// exist is a named refusal (the caller raises it before any channel
+    /// activity): a silent fallthrough to agent auth is exactly the
+    /// ambient-config hijack this pin kills. The default walk is lenient
+    /// — first existing candidate wins, nothing found = `None` (today's
+    /// argv, no `-i`).
+    fn resolve_identity(&self) -> miette::Result<ClientIdentity> {
+        let explicit = self
+            .worker
+            .identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(path) = explicit {
+            let path = PathBuf::from(path);
+            if !path.exists() {
+                return Err(miette::miette!(
+                    "preflight identity: worker '{}' names identity '{}' but the file does \
+                     not exist — fix the entry's identity or drop the field to fall back to \
+                     NAU_SSH_IDENTITY / the operator's default key",
+                    self.worker.address,
+                    path.display()
+                ));
+            }
+            let tried = format!("entry identity '{}'", path.display());
+            return Ok(ClientIdentity {
+                path: Some(path),
+                tried,
+            });
+        }
+        if let Ok(env) = std::env::var("NAU_SSH_IDENTITY") {
+            let env = env.trim();
+            if !env.is_empty() {
+                let path = PathBuf::from(env);
+                if !path.exists() {
+                    return Err(miette::miette!(
+                        "preflight identity: worker '{}' resolves NAU_SSH_IDENTITY to '{}' \
+                         but the file does not exist — fix the variable or clear it to fall \
+                         back to the operator's default key",
+                        self.worker.address,
+                        path.display()
+                    ));
+                }
+                let tried = format!("NAU_SSH_IDENTITY '{}'", path.display());
+                return Ok(ClientIdentity {
+                    path: Some(path),
+                    tried,
+                });
+            }
+        }
+        let candidates = [
+            self.ceremony_home.join(".ssh").join("id_ed25519"),
+            self.ceremony_home.join(".ssh").join("id_rsa"),
+        ];
+        let mut tried = Vec::new();
+        for c in &candidates {
+            if c.exists() {
+                return Ok(ClientIdentity {
+                    path: Some(c.clone()),
+                    tried: format!("default key '{}'", c.display()),
+                });
+            }
+            tried.push(format!("{} (absent)", c.display()));
+        }
+        Ok(ClientIdentity {
+            path: None,
+            tried: format!(
+                "none resolved (entry identity unset, NAU_SSH_IDENTITY unset, defaults \
+                 tried: {})",
+                tried.join("; ")
+            ),
+        })
+    }
+
+    /// Cache the resolved identity for [`SshExecutor::base_argv`] and
+    /// return the sources narrative for the preflight failure text.
+    /// Runs before any ssh — the explicit-path refusal lands here, with
+    /// zero channel activity, the same gate `ensure_known_hosts` gives
+    /// the pin.
+    fn ensure_identity(&self) -> miette::Result<String> {
+        let resolved = self.resolve_identity()?;
+        *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = resolved.path.clone();
+        Ok(resolved.tried)
+    }
+
     /// Write the nau-managed known_hosts for this worker: one file,
     /// one pinned line, written only when the content differs (atomic
     /// tempfile + persist, safe under the scheduler's concurrent
@@ -524,6 +630,22 @@ impl<R: CommandRunner> SshExecutor<R> {
         {
             v.push("-o".to_string());
             v.push(format!("HostKeyAlias={alias}"));
+        }
+        // The client-identity pin (#298): `IdentitiesOnly=yes` binds
+        // auth to exactly the resolved key — ambient `~/.ssh/config`
+        // cannot substitute its own `IdentityFile`. Set only after
+        // preflight resolved it (`ensure_identity`), the alias
+        // precedent; nothing resolved = no `-i` (ambient behavior).
+        if let Some(id) = self
+            .identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            v.push("-o".to_string());
+            v.push("IdentitiesOnly=yes".to_string());
+            v.push("-i".to_string());
+            v.push(id.display().to_string());
         }
         v
     }
@@ -615,8 +737,17 @@ impl<R: CommandRunner> SshExecutor<R> {
     pub fn preflight(&self, checks: PreflightChecks<'_>) -> miette::Result<CapabilityDoc> {
         // The pin refusal lands before any channel activity.
         self.ensure_known_hosts()?;
+        // So does the client-identity refusal (#298) — and the sources
+        // narrative rides any reachability failure below: a "Permission
+        // denied" probe must say which identity sources were consulted.
+        let identity_tried = self.ensure_identity()?;
         let stdout = self
             .run_ssh(&format!("{REMOTE_NAU} __worker-cap"))
+            .map_err(|e| {
+                miette::Error::new(ChannelLoss(format!(
+                    "{e}; client identity: {identity_tried}"
+                )))
+            })
             .wrap_err("preflight reachability")?;
         let cap: CapabilityDoc = serde_json::from_str(stdout.trim()).map_err(|e| {
             miette::miette!(

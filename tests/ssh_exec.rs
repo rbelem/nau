@@ -42,6 +42,9 @@ fn host_arch() -> String {
     nau::snap::host_arch().to_string()
 }
 
+/// Serializes the env-mutating identity tests (process-global state).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 fn flip_last(bytes: &mut [u8]) {
     let n = bytes.len();
     bytes[n - 1] ^= 0x01;
@@ -71,6 +74,9 @@ struct LoopbackWorker {
     /// What `ssh-keygen -lf` reports for any key file (the CA-form tests
     /// pin the ceremony's fingerprint; the mismatch test overrides it).
     reported_fingerprint: String,
+    /// Script the ssh-side auth refusal on the cap probe — the
+    /// Permission-denied shape the identity narrative rides (#298).
+    deny_cap: bool,
     calls: Arc<Mutex<Vec<Vec<String>>>>,
     /// Bytes of every scp push whose remote path ends in job.json, in
     /// push order — the shipped manifest's shape is a transport contract.
@@ -88,6 +94,7 @@ impl LoopbackWorker {
             corrupt_payload_push: false,
             corrupt_artifact: None,
             reported_fingerprint: FINGERPRINT_PIN.to_string(),
+            deny_cap: false,
             calls: Arc::new(Mutex::new(Vec::new())),
             pushed_job_files: Arc::new(Mutex::new(Vec::new())),
         }
@@ -148,6 +155,13 @@ impl LoopbackWorker {
             ));
         };
         if cmd.contains("__worker-cap") {
+            if self.deny_cap {
+                return Ok(RunnerOutput {
+                    code: 255,
+                    stdout: Vec::new(),
+                    stderr: "Permission denied (publickey,password)".into(),
+                });
+            }
             return Ok(Self::ok(serde_json::to_string(&self.cap).unwrap()));
         }
         if cmd.contains("__worker-job") {
@@ -438,6 +452,15 @@ fn worker_cfg(address: &str, pin: Option<&str>) -> WorkerConfig {
         jobs: 2,
         arch: None,
         host_key: pin.map(str::to_string),
+        identity: None,
+    }
+}
+
+/// [`worker_cfg`] with a client identity pinned (#298).
+fn worker_cfg_identity(address: &str, pin: Option<&str>, identity: &str) -> WorkerConfig {
+    WorkerConfig {
+        identity: Some(identity.to_string()),
+        ..worker_cfg(address, pin)
     }
 }
 
@@ -603,6 +626,207 @@ fn preflight_happy_and_the_pinned_bounded_argv() {
         .collect::<Vec<_>>()
         .join(" ");
     assert_eq!(pinned, format!("@cert-authority {CA_IDENTITY} {key_half}"));
+}
+
+// ── The client-identity pin (#298) ──
+
+/// An executor whose entry pins `identity`, over a ceremony fixture.
+fn identity_executor(
+    cache: &Path,
+    identity: &str,
+    fake: LoopbackWorker,
+) -> SshExecutor<LoopbackWorker> {
+    let ceremony = cache.join("ceremony");
+    ca_ceremony(&ceremony);
+    SshExecutor::with_ceremony_home(
+        &worker_cfg_identity("ssh://localhost", Some(FINGERPRINT_PIN), identity),
+        fake,
+        cache,
+        &ceremony,
+    )
+    .expect("executor builds")
+}
+
+#[test]
+fn entry_identity_rides_the_argv_as_identities_only() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let key = cache.path().join("lane-key");
+    std::fs::write(&key, "private-bytes").unwrap();
+    let fake = LoopbackWorker::new(machine.path());
+    let calls = fake.calls_handle();
+    let ex = identity_executor(cache.path(), &key.to_string_lossy(), fake);
+    ex.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("preflight with a pinned identity");
+    let calls = calls.lock().unwrap();
+    let argv = calls.iter().find(|a| a[0] == "ssh").expect("the ssh dial");
+    let i = argv.iter().position(|a| a == "-i").expect("the -i pin");
+    assert_eq!(argv[i + 1], key.to_string_lossy(), "exactly the pinned key");
+    assert!(
+        argv.contains(&"IdentitiesOnly=yes".to_string()),
+        "auth is bound to the pinned key: {argv:?}"
+    );
+}
+
+#[test]
+fn missing_entry_identity_refuses_before_any_channel_activity() {
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let absent = cache.path().join("absent-key");
+    let fake = LoopbackWorker::new(machine.path());
+    let calls = fake.calls_handle();
+    let ex = identity_executor(cache.path(), &absent.to_string_lossy(), fake);
+    let err = ex
+        .preflight(PreflightChecks {
+            arch: None,
+            min_free_disk: 0,
+        })
+        .expect_err("a nonexistent pinned identity refuses");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("preflight identity"),
+        "the refusal names the probe: {text}"
+    );
+    assert!(
+        text.contains("absent-key"),
+        "the refusal names the path: {text}"
+    );
+    assert!(
+        !LoopbackWorker::any_call(&calls, |a| a[0] == "ssh" || a[0] == "scp"),
+        "zero channel activity before the refusal"
+    );
+}
+
+#[test]
+fn identity_resolution_prefers_entry_then_env_then_defaults() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY (test-only): single-threaded under ENV_LOCK.
+    std::env::remove_var("NAU_SSH_IDENTITY");
+
+    // The entry field beats the environment.
+    let cache = tempfile::tempdir().unwrap();
+    let entry_key = cache.path().join("entry-key");
+    let env_key = cache.path().join("env-key");
+    std::fs::write(&entry_key, "entry").unwrap();
+    std::fs::write(&env_key, "env").unwrap();
+    std::env::set_var("NAU_SSH_IDENTITY", &env_key);
+    let fake = LoopbackWorker::new(cache.path());
+    let calls = fake.calls_handle();
+    let ex = identity_executor(cache.path(), &entry_key.to_string_lossy(), fake);
+    ex.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("entry-field preflight");
+    {
+        let calls = calls.lock().unwrap();
+        let argv = calls.iter().find(|a| a[0] == "ssh").expect("the ssh dial");
+        let i = argv.iter().position(|a| a == "-i").expect("the -i pin");
+        assert_eq!(argv[i + 1], entry_key.to_string_lossy());
+    }
+
+    // The environment beats the default candidates.
+    let cache2 = tempfile::tempdir().unwrap();
+    let fake2 = LoopbackWorker::new(cache2.path());
+    let calls2 = fake2.calls_handle();
+    let ex2 = {
+        let ceremony = cache2.path().join("ceremony");
+        ca_ceremony(&ceremony);
+        SshExecutor::with_ceremony_home(
+            &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
+            fake2,
+            cache2.path(),
+            &ceremony,
+        )
+        .unwrap()
+    };
+    ex2.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("env-identity preflight");
+    {
+        let calls = calls2.lock().unwrap();
+        let argv = calls.iter().find(|a| a[0] == "ssh").expect("the ssh dial");
+        let i = argv.iter().position(|a| a == "-i").expect("the -i pin");
+        assert_eq!(argv[i + 1], env_key.to_string_lossy());
+    }
+    std::env::remove_var("NAU_SSH_IDENTITY");
+
+    // With no entry field and no env, the ceremony home's default key
+    // half wins (the same candidates `resolve_operator_key` walks).
+    let cache3 = tempfile::tempdir().unwrap();
+    let ceremony3 = cache3.path().join("ceremony");
+    ca_ceremony(&ceremony3);
+    let default_key = ceremony3.join(".ssh").join("id_ed25519");
+    std::fs::create_dir_all(default_key.parent().unwrap()).unwrap();
+    std::fs::write(&default_key, "default").unwrap();
+    let fake3 = LoopbackWorker::new(cache3.path());
+    let calls3 = fake3.calls_handle();
+    let ex3 = SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
+        fake3,
+        cache3.path(),
+        &ceremony3,
+    )
+    .unwrap();
+    ex3.preflight(PreflightChecks {
+        arch: None,
+        min_free_disk: 0,
+    })
+    .expect("default-identity preflight");
+    let calls = calls3.lock().unwrap();
+    let argv = calls.iter().find(|a| a[0] == "ssh").expect("the ssh dial");
+    let i = argv.iter().position(|a| a == "-i").expect("the -i pin");
+    assert_eq!(argv[i + 1], default_key.to_string_lossy());
+}
+
+#[test]
+fn permission_denied_preflight_names_the_identity_sources_tried() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY (test-only): single-threaded under ENV_LOCK.
+    std::env::remove_var("NAU_SSH_IDENTITY");
+
+    // Nothing resolves: no entry field, no env, no default candidates
+    // under the ceremony home. The auth refusal must carry the sources.
+    let cache = tempfile::tempdir().unwrap();
+    let machine = tempfile::tempdir().unwrap();
+    let mut fake = LoopbackWorker::new(machine.path());
+    fake.deny_cap = true;
+    let ceremony = cache.path().join("ceremony");
+    ca_ceremony(&ceremony);
+    let ex = SshExecutor::with_ceremony_home(
+        &worker_cfg("ssh://localhost", Some(FINGERPRINT_PIN)),
+        fake,
+        cache.path(),
+        &ceremony,
+    )
+    .unwrap();
+    let err = ex
+        .preflight(PreflightChecks {
+            arch: None,
+            min_free_disk: 0,
+        })
+        .expect_err("the scripted auth refusal");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("Permission denied"),
+        "the host's refusal rides the message: {text}"
+    );
+    assert!(
+        text.contains("client identity: none resolved"),
+        "the preflight names what was tried: {text}"
+    );
+    assert!(
+        text.contains("entry identity unset")
+            && text.contains("NAU_SSH_IDENTITY unset")
+            && text.contains("id_ed25519")
+            && text.contains("id_rsa"),
+        "every source is named: {text}"
+    );
 }
 
 #[test]

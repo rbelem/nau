@@ -23,6 +23,9 @@ use nau::provision::{
 };
 
 const OPERATOR_KEY: &str = "ssh-ed25519 AAAAoperatorkey operator@example";
+/// The client identity pinned into provisioned entries (#298) — a
+/// throwaway fixture path, no crypto.
+const OPERATOR_IDENTITY: &str = "/nau-test-fixtures/operator_ed25519";
 const BINARY_URL: &str = "https://example.invalid/nau-amd64";
 const REGION: &str = "westeurope";
 const SIZE: &str = "Standard_D4s_v5";
@@ -354,6 +357,7 @@ fn provisioner_with(
         credentials.map(|c| c.to_string()),
         BINARY_URL.into(),
         OPERATOR_KEY.into(),
+        OPERATOR_IDENTITY.into(),
         publish,
     )
 }
