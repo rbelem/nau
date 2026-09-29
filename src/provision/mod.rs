@@ -918,6 +918,7 @@ while [ "$i" -lt 1440 ]; do
     if head -n 1 "$TMP" | grep -q 'ssh-ed25519-cert-v01@openssh.com'; then
       chmod 0644 "$TMP"
       mv "$TMP" "$CERT"
+      printf 'HostCertificate %s\n' "$CERT" > /etc/ssh/sshd_config.d/nau-host-cert.conf
       systemctl restart ssh || systemctl restart sshd
       exit 0
     fi
@@ -1032,6 +1033,11 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
         url = p.binary_url
     ));
     s.push_str("  - chmod 0755 /usr/local/bin/nau\n");
+    // The API-level create carries no --ssh-key (the operator key rides
+    // user-data), so hcloud generates a root password with a forced
+    // first-login change; PAM refuses even pubkey logins until it is
+    // cleared — the coordinator could never reach the worker.
+    s.push_str("  - chage -d -1 root\n");
     s.push_str(
         "  - printf 'PermitRootLogin prohibit-password\\nPasswordAuthentication no\\n' \
          > /etc/ssh/sshd_config.d/99-nau-worker.conf\n",
@@ -1078,8 +1084,8 @@ fn squashfs_build_runcmd() -> String {
          tar -xzf {tarball}; \
          make -C {srcdir}/squashfs-tools XZ_SUPPORT=1 ZSTD_SUPPORT=1 LZ4_SUPPORT=1 LZO_SUPPORT=0 \
          RELEASE_VERSION={SQUASHFS_TOOLS_VERSION} RELEASE_DATE={SQUASHFS_TOOLS_RELEASE_DATE} \
-         -j\"$(nproc)\"; \
-         make -C {srcdir}/squashfs-tools install; \
+         -j\"$(nproc)\" mksquashfs unsquashfs; \
+         cp -a {srcdir}/squashfs-tools/mksquashfs {srcdir}/squashfs-tools/unsquashfs /usr/local/bin/; \
          /usr/local/bin/mksquashfs -version | grep -q \"version {SQUASHFS_TOOLS_VERSION} \"; \
          rm -rf /tmp/{srcdir} /tmp/{tarball}'"
     )

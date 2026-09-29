@@ -20,7 +20,7 @@
 //! `--custom-data @<file>` — the same authenticated channel that now
 //! carries the one-time publish bearer, and a file hand-off (the blob
 //! never enters argv). Same rule as the sibling providers — the shared
-//! template is consumed, never forked (hcloud `--user-datafile`, aws
+//! template is consumed, never forked (hcloud `--user-data-from-file`, aws
 //! `file://`, gcloud `user-data=`, azure `@file`). The Custom Script
 //! Extension remains the channel for non-cloud-init images; none is
 //! pinned here.

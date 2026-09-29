@@ -1256,3 +1256,25 @@ fn duplicate_short_names_each_record_their_loss() {
         outcome.workers_lost
     );
 }
+
+/// A metadata-only job (no declared architectures → resolve_archs yields
+/// `["all"]`) can never run on a real worker: the worker always reports a
+/// concrete arch and the dispatch preflight refuses `all`. The caps
+/// computation must therefore mark it local_only, or placement routes it
+/// to an undeclared worker and the run dies at dispatch (found live: the
+/// first ccx13 cloud worker refused both fixtures exactly this way).
+#[test]
+fn metadata_only_all_jobs_are_local_only() {
+    let mut metas = BTreeMap::new();
+    metas.insert("meta-only".to_string(), bare_meta("meta-only", "1.0.0"));
+    let plans = nau::coordinator::precompute_farm_plans(&metas, &[], &empty_lockfile())
+        .expect("a build-less plan precomputes");
+    let caps = plans
+        .caps
+        .get("meta-only")
+        .expect("the node's caps are computed");
+    assert!(
+        caps.local_only,
+        "an `all` job must never leave the coordinator: {caps:?}"
+    );
+}

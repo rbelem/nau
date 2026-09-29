@@ -4,7 +4,7 @@
 //! Flow per ADR-0045's amendment (#295): mint a one-time publish token
 //! per server + render the shared cloud-init template (guest-local host
 //! keypair generation — NO private half ships) → create the server with
-//! that user-data (`--user-datafile`, the authenticated API channel that
+//! that user-data (`--user-data-from-file`, the authenticated API channel that
 //! now carries public material + the one-time bearer only) → describe for
 //! the IPv4 → pin the host CA fingerprint into the managed `workers`
 //! block. The pin exists BEFORE first use; `ssh-keyscan` is never
@@ -196,9 +196,10 @@ impl<R: CommandRunner> Provisioner for HetznerProvisioner<R> {
     fn destroy(&self, name: &str, config: &Path) -> miette::Result<bool> {
         self.require_token()?;
         let ip = self.server_ipv4(name)?;
+        let server_id = self.server_id(name)?;
         // The #269 v2 pre-delete check: attached volumes must not vanish
         // with the server unnoticed.
-        self.warn_attached_volumes(name)?;
+        self.warn_attached_volumes(name, server_id)?;
         // Server first: if the delete fails the worker is still live and
         // the config pin must stay.
         self.hcloud(&["server", "delete", name])?;
@@ -272,7 +273,7 @@ impl<R: CommandRunner> HetznerProvisioner<R> {
                 &format!("{WORKER_LABEL}={expiry_epoch}"),
                 "--label",
                 &format!("{WORKER_TTL_LABEL}={expiry_epoch}"),
-                "--user-datafile",
+                "--user-data-from-file",
                 &user_data_file.display().to_string(),
                 "--start-after-create",
             ])?;
@@ -301,6 +302,18 @@ impl<R: CommandRunner> HetznerProvisioner<R> {
     }
 
     /// The server's primary IPv4 from `hcloud server describe -o json`.
+    /// The server's numeric id from the describe document — the volume
+    /// attach match rides it (`volume list` carries the attached server's
+    /// id, and the CLI exposes no server filter to lean on).
+    fn server_id(&self, name: &str) -> miette::Result<u64> {
+        let body = self.hcloud(&["server", "describe", name, "-o", "json"])?;
+        let v: Value = serde_json::from_str(&body)
+            .map_err(|e| miette::miette!("provision: hcloud describe '{name}' is not JSON: {e}"))?;
+        v["id"]
+            .as_u64()
+            .ok_or_else(|| miette::miette!("provision: server '{name}' describe carries no id"))
+    }
+
     fn server_ipv4(&self, name: &str) -> miette::Result<String> {
         let body = self.hcloud(&["server", "describe", name, "-o", "json"])?;
         let v: Value = serde_json::from_str(&body)
@@ -316,17 +329,26 @@ impl<R: CommandRunner> HetznerProvisioner<R> {
         Ok(ip.to_string())
     }
 
-    /// `hcloud volume list --server <name>` MUST come back empty before a
+    /// The volumes attached to `server_id` MUST come back empty before a
     /// delete. Anything attached gets a loud warning naming the count —
     /// volumes are NOT deleted (or silently detached) by this command —
     /// and then the delete proceeds anyway: the operator asked for the
     /// destruction, the warning exists so data loss is never silent.
-    fn warn_attached_volumes(&self, name: &str) -> miette::Result<()> {
-        let body = self.hcloud(&["volume", "list", "--server", name, "-o", "json"])?;
+    /// (hcloud 1.x `volume list` has no `--server` filter: the list comes
+    /// back whole and the attach match is client-side, by server id.)
+    fn warn_attached_volumes(&self, name: &str, server_id: u64) -> miette::Result<()> {
+        let body = self.hcloud(&["volume", "list", "-o", "json"])?;
         let v: Value = serde_json::from_str(&body).map_err(|e| {
             miette::miette!("destroy: hcloud volume list for '{name}' is not JSON: {e}")
         })?;
-        let attached = v.as_array().map(Vec::len).unwrap_or(0);
+        let attached = v
+            .as_array()
+            .map(|vols| {
+                vols.iter()
+                    .filter(|vol| vol["server"]["id"].as_u64() == Some(server_id))
+                    .count()
+            })
+            .unwrap_or(0);
         if attached > 0 {
             crate::output::warn(format!(
                 "destroy: server '{name}' still has {attached} attached volume(s) — \

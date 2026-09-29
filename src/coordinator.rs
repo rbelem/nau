@@ -370,8 +370,13 @@ pub fn precompute_farm_plans(
         let archs = crate::snap::resolve_archs(meta, cli_archs);
         // A job building several archs mixes per-arch build prefixes
         // into one manifest — a shape the v1 manifest does not carry;
-        // it stays local before anything else is even attempted.
+        // it stays local before anything else is even attempted. Same
+        // for a metadata-only "all" job (no declared architectures): a
+        // real worker always reports a concrete arch and the dispatch
+        // preflight refuses "all", so placement must never route it
+        // away from the coordinator.
         let multi_arch = archs.len() > 1;
+        let all_only = archs.len() == 1 && archs[0] == "all";
         let plan = plan_node_job(
             name,
             meta,
@@ -380,7 +385,7 @@ pub fn precompute_farm_plans(
             &mut dep_metas,
             &mut dep_closures,
         );
-        let local_only = multi_arch || plan.is_err();
+        let local_only = multi_arch || all_only || plan.is_err();
         if let Ok(p) = plan {
             plans.insert(name.clone(), p);
         }

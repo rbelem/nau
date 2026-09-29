@@ -94,22 +94,27 @@ cache.zet.rclb.dev"; PROVIDERS §4 amend: "placement hel1 stands"; ADR-0046
 neutral: #271 stands). The locality rationale named the zet cache, which
 ADR-0046 re-homed — if the Nau host lands in another region, re-checking
 placement before the first provision is an operator call, not a recorded
-change. Classes per PROVIDERS §1 (post-2026-06-15 repricing — #194's
-`cx22` example is stale and MUST NOT be copied):
+change. Classes per PROVIDERS §1, AMENDED 2026-09-29 (operator relayed
+Hetzner's policy: sustained high CPU belongs on DEDICATED vCPU — shared
+CX lines are not sanctioned for build workers; the post-2026-06-15
+repricing note stands, and #194's `cx22` example is stale and MUST NOT
+be copied):
 
-| Class | SKU | vCPU/RAM/disk | €/hr (cap €/mo) | Note |
-|---|---|---|---|---|
-| build-light | CX23 | 2/4/40 | 0.0088 (5.49) | single-package bursts |
-| build-default | CX33 | 4/8/80 | 0.0136 (8.49) | daily loop, index runs |
-| build-aarch64 | CAX11/CAX21 | 2/4/40, 4/8/80 | 0.0096/0.0168 | **deferred** — pool is x86_64-only (operator decision 2026-09-27, PROVIDERS §1) |
+| Class | SKU | vCPU/RAM/disk | Note |
+|---|---|---|---|
+| build-light | ccx13 | 2/8/80 | single-package bursts; the first live worker (2026-09-29 lane) |
+| build-default | ccx23 | 4/16/160 | daily loop, index runs |
+| build-aarch64 | CAX11/CAX21 | 2/4/40, 4/8/80 | **deferred** — pool is x86_64-only (operator decision 2026-09-27, PROVIDERS §1) |
 
 - IPv4 by default (#271); post-reprice it is a separately billed resource
   (≈ €0.30/mo community figure, unit price unverified — PROVIDERS §1).
   IPv6-only is the recorded later cost cut (#271).
-- CPX dedicated-vCPU SKUs are not builder candidates (repriced steeply,
-  EU small-size availability unconfirmed — PROVIDERS §1). No nested KVM
-  on Hetzner Cloud; a kvm-capable class is a future dedicated-root
-  question (PROVIDERS §1).
+- CPX SKUs remain non-candidates (repriced steeply, PROVIDERS §1). No
+  nested KVM on Hetzner Cloud; a kvm-capable class is a future
+  dedicated-root question (PROVIDERS §1).
+- Workers live ONLY while a lane uses them: provision → build → destroy
+  in one window (operator directive 2026-09-29 — dedicated vCPU is too
+  expensive to idle). The TTL sweep is the backstop, not the plan.
 - Placement groups: out of scope, recorded so nobody adds them for
   ephemeral singletons (#271; INFRA D5).
 - Worker OS: the template pins **latest Ubuntu LTS, never a codename**

@@ -72,6 +72,9 @@ struct LoopbackWorker {
     /// pin the ceremony's fingerprint; the mismatch test overrides it).
     reported_fingerprint: String,
     calls: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Bytes of every scp push whose remote path ends in job.json, in
+    /// push order — the shipped manifest's shape is a transport contract.
+    pushed_job_files: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl LoopbackWorker {
@@ -86,7 +89,12 @@ impl LoopbackWorker {
             corrupt_artifact: None,
             reported_fingerprint: FINGERPRINT_PIN.to_string(),
             calls: Arc::new(Mutex::new(Vec::new())),
+            pushed_job_files: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn job_files_handle(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        self.pushed_job_files.clone()
     }
 
     fn calls_handle(&self) -> Arc<Mutex<Vec<Vec<String>>>> {
@@ -353,8 +361,11 @@ impl LoopbackWorker {
             else {
                 panic!("scp push: unparsable destination {dst:?}");
             };
-            std::fs::create_dir_all(to.parent().unwrap())?;
             let mut bytes = std::fs::read(src)?;
+            if to.file_name().is_some_and(|n| n == "job.json") {
+                self.pushed_job_files.lock().unwrap().push(bytes.clone());
+            }
+            std::fs::create_dir_all(to.parent().unwrap())?;
             // The intercepting wrapper corrupts the payload tar in
             // flight — a byte inside the first member's data, so the
             // extraction succeeds but the content is wrong.
@@ -1140,6 +1151,7 @@ fn delta_sync_ships_only_the_missing_objects() {
     fake.scripted_result = Some(result);
     fake.scripted_files = files;
     let calls = fake.calls_handle();
+    let job_files = fake.job_files_handle();
     // The worker already holds blob A — exactly.
     preseed_object(machine.path(), &sha_a, &blob_a);
     let ex = executor(fake, cache.path());
@@ -1153,6 +1165,23 @@ fn delta_sync_ships_only_the_missing_objects() {
         .dispatch(&manifest, payload.path())
         .expect("delta dispatch");
     assert!(!outcome.cache_hit);
+
+    // The shipped job file names the transport-local payload dir — the
+    // worker refuses a manifest with objects but no payload_dir, and
+    // coordinator-side paths never cross the channel (the identity
+    // strips this field).
+    let shipped = job_files.lock().unwrap().clone();
+    assert_eq!(shipped.len(), 1, "one job.json ships per dispatch");
+    let job: serde_json::Value = serde_json::from_slice(&shipped[0]).expect("json");
+    assert_eq!(
+        job["payload_dir"], "payload",
+        "the job file points at the staged payload dir, relative to itself"
+    );
+    assert_eq!(
+        job["closure"].as_array().map(Vec::len),
+        Some(2),
+        "both objects ride the manifest"
+    );
 
     // The tar bundle carried only the missing object.
     let tarred = LoopbackWorker::any_call(&calls, |argv| {
@@ -1423,11 +1452,43 @@ fn write_job_file_writes_exactly_the_identity_bytes() {
     let path = write_job_file(dir.path(), &manifest).expect("job file");
     assert_eq!(path.file_name().unwrap(), "job.json");
     let bytes = std::fs::read(&path).unwrap();
-    assert_eq!(bytes, canonical_manifest_bytes(&manifest).unwrap());
-    let id = manifest_identity(&manifest).unwrap();
+    // The worker loads the file and recomputes the identity from the
+    // loaded manifest — the file need not BE the canonical bytes, it
+    // must ROUND-TRIP to them.
+    let loaded: JobManifest = serde_json::from_slice(&bytes).expect("job file parses");
+    assert_eq!(loaded, manifest, "the job file round-trips the manifest");
     assert_eq!(
-        format!("jm1:{}", sha256_hex(&bytes)),
-        id,
+        manifest_identity(&loaded).unwrap(),
+        manifest_identity(&manifest).unwrap(),
         "the shipped job file digests to the manifest identity"
     );
+}
+
+/// A transport-local payload_dir rides the job FILE (the worker resolves
+/// it against the file's own directory — a manifest naming closure
+/// objects without it is refused fail-closed) while the identity still
+/// digests the canonical form that strips it.
+#[test]
+fn write_job_file_carries_the_payload_dir_out_of_the_identity() {
+    let mut manifest = hello_manifest();
+    manifest.closure.push(nau::worker::ClosureObject {
+        sha256: "ab".repeat(32),
+        size: 42,
+        purpose: "dep:dep-a".to_string(),
+    });
+    manifest.payload_dir = Some("payload".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_job_file(dir.path(), &manifest).expect("job file");
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("json");
+    assert_eq!(
+        value["payload_dir"], "payload",
+        "the file routes the worker"
+    );
+    // The identity the worker recomputes from the loaded manifest strips
+    // the field — coordinator-local paths never enter it.
+    let id = manifest_identity(&manifest).unwrap();
+    let canonical = canonical_manifest_bytes(&manifest).unwrap();
+    assert_eq!(format!("jm1:{}", sha256_hex(&canonical)), id);
+    assert!(!String::from_utf8_lossy(&canonical).contains("payload"));
 }
