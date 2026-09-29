@@ -427,12 +427,11 @@ fn cmd_build(
     let file_exists = Path::new(&original_file).exists();
 
     // Strategy 1: eval the config file directly (uses its declared inputs).
-    // If it fails we keep the error: the fallback below may re-evaluate the
-    // same source (resolve_file returns the same existing path), and when
-    // that second attempt also fails, the real diagnostic is the first one —
-    // discarding it turned a hostile busy-loop file into a silent 2×5s eval
-    // that reported only the fallback's error.
-    let mut direct_eval_error: Option<String> = None;
+    // An existing file whose eval fails is TERMINAL: the fallback below
+    // exists only to resolve a package NAME (a nonexistent positional)
+    // through the default input, and its plain eval never validates the
+    // workers surface — falling through would launder a workers-config
+    // refusal into a silent local-only build (#297).
     if file_exists {
         // Extract global inputs from the config file and use those
         match nau::lua::evaluate_file_with_inputs(&original_file) {
@@ -468,24 +467,23 @@ fn cmd_build(
                 );
             }
             Err(e) => {
-                direct_eval_error = Some(format!("{e:#}"));
+                return Err(miette::miette!(
+                    "evaluating '{}' failed: {e:#}",
+                    original_file
+                ));
             }
         }
     }
 
-    // No config file or it failed — use default input and resolve by name
+    // No config file — use the default input and resolve the positional
+    // as a package name. This is the ONLY fallback (#297): the plain
+    // eval carries no workers surface, so the inert default applies
+    // (zero behavior change, ADR-0040 Decision 3).
     let default_inputs = default_input_map();
     let lockfile = prepare_inputs(&default_inputs, &lockfile_path, update.as_deref(), offline)?;
     nau::pkg_source::init_global_inputs_with(&default_inputs, &lockfile.inputs, offline)?;
     let file = resolve_file(&file)?;
-    let all_outputs = evaluate_file_or_embedded(&file).map_err(|e| match &direct_eval_error {
-        Some(first) => miette::miette!(
-            "evaluating '{}' failed: {first}; fallback resolution of '{}' also failed: {e:#}",
-            original_file,
-            file
-        ),
-        None => e,
-    })?;
+    let all_outputs = evaluate_file_or_embedded(&file)?;
 
     run_build(
         all_outputs,
@@ -501,9 +499,7 @@ fn cmd_build(
         cache_max_size,
         target,
         json,
-        // The fallback path re-evaluated into plain Outputs — the workers
-        // surface was never part of it, so the inert default applies
-        // (zero behavior change, ADR-0040 Decision 3).
+        // The plain eval carries no workers surface — inert default.
         nau::lua::WorkersConfig::default(),
     )
 }
