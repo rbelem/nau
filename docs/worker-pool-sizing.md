@@ -121,7 +121,9 @@ into the ADR-0043 shared cache.
 ## Revisit triggers
 
 - Store-aware placement shipped + phase timings (#302/#303) → re-measure ccx33
-  vs 2×ccx23 on warm index runs (decision point C).
+  vs 2×ccx23 on warm index runs (decision point C) — BLOCKED on #307: window 4
+  (below) proved the preference never binds live, so warm-vs-cold SKU deltas
+  are unmeasurable until payload objects actually persist in the probed store.
 - Uplink upgrade (or coordinator colocation) → sync stops dominating and worker
   CPU (SKU, jobs per box) becomes the live question; re-run the pack benchmark
   with a COMPRESSIBLE payload (the 2026-09-29 run could not measure zstd CPU
@@ -129,6 +131,42 @@ into the ADR-0043 shared cache.
 - Bursts become daily-with-cold-starts and `--keep` windows fail → snapshots
   reopen (#194's recorded open decision).
 - Multiple coordinators or sustained builds/hour → only then, a queue.
+
+## Live verification: benchmark windows 1-4 (2026-09-29)
+
+Four one-window runs (provision → bench → destroy, EXIT-trap teardown), each
+fully root-caused from pulled guest logs. Windows 1-3 invalid, window 4 the
+first valid e2e — and the verdict on the warm win is NEGATIVE:
+
+| window | outcome | root cause (fixed where) |
+|---|---|---|
+| 1 | invalid — pin 404 + `nau: command not found` | missing `NAU_MKSQUASHFS_ARTIFACT_URL` export (lane script) |
+| 2 | invalid — pin 404; cert signed, never picked up | front lacked squashfs routes; fast-400 pickup burned the guest's retry budget (lane front: routes + long-poll) |
+| 3 | invalid — TLS-flap × single-shot curls; pin 0644 | #306: retry legs + `install -m 0755` (repo, landed `2669cd4`) |
+| 4 | **valid — NEGATIVE** | see below |
+
+Window 4 numbers: cold 44.9s, warm 45.0s (baseline pre-#303: 47.9/48.4 —
+warm saved nothing then, saves nothing now). Warm dispatches bypassed the
+holder on BOTH ccx23-held deps; warm syncs cost full price (14.7-14.9s) —
+#303's preference never fired and delta sync never skipped. Root cause filed
+as **#307**: `held_objects` probes `{REMOTE_BASE}/objects`, which does not
+retain dispatched payload objects, so `JobCaps.objects` (source-pin sha256s)
+never intersects the probed set — the preference is dead in the live path.
+
+Where the wall actually goes (3-dep fixture, 2 workers × 2 jobs): remote farm
+phase ~31.4s — BOTH remote deps stacked on ONE worker and run sequentially
+while the second sat idle — plus ~13.5s local default build. The biggest
+fixture lever is worker-stacking, not sync; even a perfect #303 saves at most
+the sync half of one stacked leg.
+
+Healthy now: uplinks 7.9-8.1 MB/s on both SKUs (window 1's 0.8 MB/s was an
+outlier); pack-wall (600MB urandom, zstd-6) 0.7s; sha-wall 2.0s; pin 4.7.4
+verified executable on both guests. Pricing table unchanged (§ Measured).
+
+The harness proves things instead of eating them: front routes verified at
+request level, cert enrollment ≤2 min via long-poll pickup, guest
+cloud-init logs pulled before teardown on every failure. Ceremony + lane
+artifacts: runbook §1.6, /tmp/opencode/farm-lane (front + size-bench.sh).
 
 ## jev baseline (farm implementation, 2026-09-29)
 
@@ -139,3 +177,8 @@ abstractionQuality/testQuality 7.1 · projectStructure/consistency 7.0 ·
 readability/documentation 7.3. All priorities low-severity; the weak axes map
 1:1 onto tickets #298 (security), #302 (observability), #303/#301
 (scalability), #297 (reliability/correctness).
+
+Post-landing rescore (same day, after #297-#304): every axis 7.8-8.6 —
+observability 8.1, security 8.0, reliability 8.1, scalability 7.8,
+correctness 8.2, compatibility 8.6; priorities reduced to two low-severity
+notes (maintainability 7.9, scalability 7.8). Loop converged.
