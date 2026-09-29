@@ -137,6 +137,17 @@ pub struct DispatchOutcome {
     pub result: JobResult,
     pub sync: Duration,
     pub total: Duration,
+    /// The fine legs (#309) — window 6 measured ~19s of fixed
+    /// per-dispatch cost total−sync−build; these decompose it:
+    /// `prep` = per-dispatch preflight + prepare_job_dir (channel
+    /// probes + job-dir round-trips), `run` = the `__worker-job` ssh
+    /// leg (worker bootstrap + build; `result.build_ms` covers the
+    /// build child inside it), `collect` = collect_and_ingest (scp +
+    /// #307 store persist) + the job-dir cleanup. Zero on a
+    /// manifest-cache hit.
+    pub prep: Duration,
+    pub run: Duration,
+    pub collect: Duration,
 }
 
 /// The pin resolved into its known_hosts form ([`SshExecutor::
@@ -671,6 +682,21 @@ impl<R: CommandRunner> SshExecutor<R> {
             v.push("-i".to_string());
             v.push(id.display().to_string());
         }
+        // Connection multiplexing (#309): window 6 measured ~19s of fixed
+        // per-dispatch cost that is ~11 fresh TCP+KEX+auth handshakes
+        // (8 ssh + 3 scp), not bytes — each ≈1.5s against a cloud host.
+        // One master per destination (the %C hash keys host+port+user,
+        // so distinct workers never share); ControlPersist bounds the
+        // master to 10 min past the last session; the socket lives under
+        // ~/.ssh (ssh tilde-expands ControlPath). A master death fails
+        // the multiplexed session fast → the ChannelLoss classification
+        // and re-dispatch treat it exactly like today's connection loss.
+        v.push("-o".to_string());
+        v.push("ControlMaster=auto".to_string());
+        v.push("-o".to_string());
+        v.push("ControlPersist=600".to_string());
+        v.push("-o".to_string());
+        v.push("ControlPath=~/.ssh/nau-cm-%C".to_string());
         v
     }
 
@@ -901,6 +927,10 @@ impl<R: CommandRunner> SshExecutor<R> {
                 result,
                 sync: Duration::ZERO,
                 total: started.elapsed(),
+                // No channel activity — no fine legs (#309).
+                prep: Duration::ZERO,
+                run: Duration::ZERO,
+                collect: Duration::ZERO,
             });
         }
         // The remote paths carry the slug (the identity's `:` flattened —
@@ -933,16 +963,28 @@ impl<R: CommandRunner> SshExecutor<R> {
         };
 
         let closure_bytes: u64 = manifest.closure.iter().map(|o| o.size).sum();
+        // The fine legs (#309): decompose the fixed per-dispatch cost —
+        // prep (preflight + job dir), sync (delta), run (the job ssh),
+        // collect (ingest + persist + cleanup) — so the live window can
+        // attribute the ~19s no single leg owned.
+        let prep_started = Instant::now();
         self.preflight(PreflightChecks {
             arch: arch_expect,
             min_free_disk: closure_bytes.saturating_add(WORKER_DISK_HEADROOM_BYTES),
         })?;
+        // prep accumulates its two disjoint segments — preflight here,
+        // prepare_job_dir after the sync bracket — so the legs never
+        // overlap (#309).
+        let mut prep = prep_started.elapsed();
 
         let sync_started = Instant::now();
         self.delta_sync(manifest, payload_dir)?;
         let sync = sync_started.elapsed();
+        let prep_dir_started = Instant::now();
         self.prepare_job_dir(&id, manifest)?;
+        prep += prep_dir_started.elapsed();
 
+        let run_started = Instant::now();
         let stdout = self
             .run_ssh(&format!(
                 "{REMOTE_NAU} __worker-job {REMOTE_BASE}/jobs/{id}/job.json"
@@ -953,6 +995,7 @@ impl<R: CommandRunner> SshExecutor<R> {
                     self.worker.address
                 )
             })?;
+        let run = run_started.elapsed();
         let result: JobResult = serde_json::from_str(stdout.trim()).map_err(|e| {
             miette::miette!(
                 "worker '{}' returned no result document for job {id}: {e} (stdout tail: {})",
@@ -992,14 +1035,20 @@ impl<R: CommandRunner> SshExecutor<R> {
             ));
         }
 
+        let collect_started = Instant::now();
         let mut outcome = self.collect_and_ingest(&id, manifest, result)?;
+        outcome.sync = sync;
+        outcome.prep = prep;
+        outcome.run = run;
         // The wall the summary reports ends at "result parsed + artifacts
         // ingested" — the best-effort job-dir cleanup is not the job.
-        outcome.sync = sync;
-        outcome.total = started.elapsed();
         // Best-effort job-dir cleanup — the object store (the worker's
         // cache) persists, the job scratch does not.
         let _ = self.run_ssh(&format!("rm -rf {REMOTE_BASE}/jobs/{id}"));
+        // The collect leg includes the cleanup: it is a real channel
+        // round-trip the fixed-cost window must see (#309).
+        outcome.collect = collect_started.elapsed();
+        outcome.total = started.elapsed();
         Ok(outcome)
     }
 
@@ -1252,6 +1301,9 @@ impl<R: CommandRunner> SshExecutor<R> {
             // Stamped by dispatch() — the timings live on its wall clock.
             sync: Duration::ZERO,
             total: Duration::ZERO,
+            prep: Duration::ZERO,
+            run: Duration::ZERO,
+            collect: Duration::ZERO,
         })
     }
 
