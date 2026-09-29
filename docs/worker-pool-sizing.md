@@ -121,9 +121,10 @@ into the ADR-0043 shared cache.
 ## Revisit triggers
 
 - Store-aware placement shipped + phase timings (#302/#303) → re-measure ccx33
-  vs 2×ccx23 on warm index runs (decision point C) — BLOCKED on #307: window 4
-  (below) proved the preference never binds live, so warm-vs-cold SKU deltas
-  are unmeasurable until payload objects actually persist in the probed store.
+  vs 2×ccx23 on warm index runs (decision point C) — the store now works
+  (#307, window 6) but warm placement still loses 2/3 jobs to the gaps in
+  **#309** (local-held jobs, fallback races, ~19s dispatch overhead); warm
+  SKU deltas stay unmeasurable until those land.
 - Uplink upgrade (or coordinator colocation) → sync stops dominating and worker
   CPU (SKU, jobs per box) becomes the live question; re-run the pack benchmark
   with a COMPRESSIBLE payload (the 2026-09-29 run could not measure zstd CPU
@@ -132,26 +133,40 @@ into the ADR-0043 shared cache.
   reopen (#194's recorded open decision).
 - Multiple coordinators or sustained builds/hour → only then, a queue.
 
-## Live verification: benchmark windows 1-4 (2026-09-29)
+## Live verification: benchmark windows 1-6 (2026-09-29)
 
-Four one-window runs (provision → bench → destroy, EXIT-trap teardown), each
-fully root-caused from pulled guest logs. Windows 1-3 invalid, window 4 the
-first valid e2e — and the verdict on the warm win is NEGATIVE:
+Six one-window runs (provision → bench → destroy, EXIT-trap teardown), each
+failure root-caused. Windows 1-3 + 5 invalid (each fix landed), window 4 the
+first valid e2e, window 6 the first fully clean run — verdict on the warm
+win: the #307 mechanism is PROVEN, the placement outcome is still negative.
 
 | window | outcome | root cause (fixed where) |
 |---|---|---|
 | 1 | invalid — pin 404 + `nau: command not found` | missing `NAU_MKSQUASHFS_ARTIFACT_URL` export (lane script) |
 | 2 | invalid — pin 404; cert signed, never picked up | front lacked squashfs routes; fast-400 pickup burned the guest's retry budget (lane front: routes + long-poll) |
 | 3 | invalid — TLS-flap × single-shot curls; pin 0644 | #306: retry legs + `install -m 0755` (repo, landed `2669cd4`) |
-| 4 | **valid — NEGATIVE** | see below |
+| 4 | valid — NEGATIVE (preference never fired) | `#307`: store probe saw no result objects; fixture sets were ∅ (landed `5925f62` series) |
+| 5 | invalid — enrollment publish lost to boot TLS flap | `#308`: 10-min publish budget + loud death + binary exec check (landed `4422c49`); lane log-pulls now cert-independent |
+| 6 | **valid — mechanism PROVEN, bar partially met** | `#309`: placement/scheduling layer, below |
 
-Window 4 numbers: cold 44.9s, warm 45.0s (baseline pre-#303: 47.9/48.4 —
-warm saved nothing then, saves nothing now). Warm dispatches bypassed the
-holder on BOTH ccx23-held deps; warm syncs cost full price (14.7-14.9s) —
-#303's preference never fired and delta sync never skipped. Root cause filed
-as **#307**: `held_objects` probes `{REMOTE_BASE}/objects`, which does not
-retain dispatched payload objects, so `JobCaps.objects` (source-pin sha256s)
-never intersects the probed set — the preference is dead in the live path.
+Window 4 (44.9/45.0s): warm bypassed holders, syncs full-price — probed
+store lacked result objects and the fixture's placement sets were ∅.
+Window 6 (first clean run, 47.4/47.8s): the #307 chain FIRES end-to-end —
+the holder won farm-dep2 and its sync leg collapsed 14.7s → 5.4s — but 2 of
+3 warm jobs still paid full sync freight. Root causes filed as **#309**:
+(1) local-held jobs have no holder candidate (`LocalExecutor::store_held` =
+None by design — farm-dep's holder was local, so it placed by racy
+fallback); (2) fallback scanners race the holder (greedy per-scan, no
+coordination — the empty-store worker's second slot beat the holder's);
+(3) ~19s FIXED per-dispatch overhead dominates the wall (paid on every leg,
+2-3× per run — bigger than any sync win); plus a ±2.8s single-run noise
+floor: future acceptance runs need 3× medians. Where the wall goes (window
+6): ~34s per remote job = 14.8s sync + ~19s overhead, two jobs stacked on
+one worker while the other sat partly idle.
+
+fix-12's window-4 "unreconcilable 14.7s sync legs on 4 KiB snaps" are
+explained: they were full legs against unreconciled stores — the ~15s is
+overhead + payload staging, not 4 KiB transfer.
 
 Where the wall actually goes (3-dep fixture, 2 workers × 2 jobs): remote farm
 phase ~31.4s — BOTH remote deps stacked on ONE worker and run sequentially
