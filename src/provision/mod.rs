@@ -1628,8 +1628,14 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
     // Pin 1: the prebuilt mksquashfs artifact, fetched + hash-verified +
     // installed as one fail-together step.
     s.push_str(&format!("  - {}\n", squashfs_install_runcmd()));
+    // The binary download rides the publish script's bounded retry
+    // (10×/4s — #306: the guest→front TLS path flaps during early boot)
+    // and stays fail-closed: the bare `[ "$i" -lt 10 ]` dies under
+    // `set -e` once the budget is exhausted.
     s.push_str(&format!(
-        "  - curl -fsSL {url} -o /usr/local/bin/nau\n",
+        "  - sh -c 'set -e; i=0; while [ \"$i\" -lt 10 ]; do if curl -fsSL {url} -o \
+         /usr/local/bin/nau; then break; fi; i=$((i + 1)); sleep 4; done; \
+         [ \"$i\" -lt 10 ]'\n",
         url = p.binary_url
     ));
     s.push_str("  - chmod 0755 /usr/local/bin/nau\n");
@@ -1664,24 +1670,29 @@ fn write_file(s: &mut String, path: &str, mode: &str, content: &str) {
 }
 
 /// The single `sh -c` runcmd that installs pin 1 (#300): fetch the two
-/// prebuilt binaries from the artifact URL, verify BOTH against the
-/// COMPILED-IN hashes BEFORE anything runs or installs (the served
-/// SHA256SUMS is never trusted — the gate is the const, same trust
-/// shape the source build had, minus the compiler), `cp -a` to
-/// /usr/local/bin (PATH-precedence over the distro's 4.6.1), and fail
-/// the step unless the installed binary reports the EXACT pin — version
-/// AND release date, proving the artifact is the pinned build and not a
-/// codeload-hash build. One step, because the tool pin succeeds or fails
-/// as a unit in the cloud-init log; a worker that missed it is refused
-/// at preflight by design (admission is fail-closed).
+/// prebuilt binaries from the artifact URL (each fetch rides the publish
+/// script's 10×/4s retry budget — #306: a first-boot TLS flap killed the
+/// single-shot curls, and the bare `[ "$i" -lt 10 ]` after each loop
+/// fails under `set -e` when the budget is exhausted), verify BOTH
+/// against the COMPILED-IN hashes BEFORE anything runs or installs (the
+/// served SHA256SUMS is never trusted — the gate is the const, same trust
+/// shape the source build had, minus the compiler), `install -m 0755`
+/// to /usr/local/bin (PATH-precedence over the distro's 4.6.1; 0755
+/// because `curl -o` lands 0644 and the version check below died on
+/// Permission denied — #306 Mode B), and fail the step unless the
+/// installed binary reports the EXACT pin — version AND release date,
+/// proving the artifact is the pinned build and not a codeload-hash
+/// build. One step, because the tool pin succeeds or fails as a unit in
+/// the cloud-init log; a worker that missed it is refused at preflight
+/// by design (admission is fail-closed).
 fn squashfs_install_runcmd() -> String {
     format!(
         "sh -c 'set -e; cd /tmp; \
-         curl -fsSL {url}/mksquashfs -o mksquashfs; \
-         curl -fsSL {url}/unsquashfs -o unsquashfs; \
+         i=0; while [ \"$i\" -lt 10 ]; do if curl -fsSL {url}/mksquashfs -o mksquashfs; then break; fi; i=$((i + 1)); sleep 4; done; [ \"$i\" -lt 10 ]; \
+         i=0; while [ \"$i\" -lt 10 ]; do if curl -fsSL {url}/unsquashfs -o unsquashfs; then break; fi; i=$((i + 1)); sleep 4; done; [ \"$i\" -lt 10 ]; \
          printf \"%s  %s\\n%s  %s\\n\" {MKSQUASHFS_ARTIFACT_SHA256} mksquashfs \
          {UNSQUASHFS_ARTIFACT_SHA256} unsquashfs | sha256sum -c -; \
-         cp -a mksquashfs unsquashfs /usr/local/bin/; \
+         install -m 0755 mksquashfs unsquashfs /usr/local/bin/; \
          /usr/local/bin/mksquashfs -version | grep -q \"version {SQUASHFS_TOOLS_VERSION} ({SQUASHFS_TOOLS_RELEASE_DATE})\"; \
          rm -f /tmp/mksquashfs /tmp/unsquashfs'",
         url = default_squashfs_artifact_url()
