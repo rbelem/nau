@@ -811,6 +811,7 @@ fn plan_objects_resolve_the_source_pins_like_dispatch() {
         &empty_lockfile(),
         Path::new("no-such-run-output"),
         None,
+        None,
     )
     .expect("a build-less plan precomputes");
     assert!(
@@ -1522,6 +1523,7 @@ fn plan_for(package: &str, deps: &[&str], sources: Vec<SourceSpec>) -> NodeJobPl
         package: package.into(),
         deps: deps.iter().map(|d| d.to_string()).collect(),
         sources,
+        stage_from: None,
     }
 }
 
@@ -1700,6 +1702,88 @@ fn farm_source_hashes_dep_payload_once_and_stages_under_that_hash() {
     }
 }
 
+/// #310: a stage-only node's resolved stage content rides the dispatch
+/// as the `stage` closure object — hashed at manifest time, staged under
+/// that same hash — because the worker's build stage is scratch its
+/// (absent) build phase never populates.
+#[test]
+fn farm_source_ships_a_stage_only_nodes_stage_content() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let lockfile = empty_lockfile();
+
+    let stage_dir = tmp.path().join("stage");
+    std::fs::create_dir_all(stage_dir.join("usr/share")).unwrap();
+    std::fs::write(stage_dir.join("usr/share/dep-payload.txt"), b"declared\n").unwrap();
+
+    let mut plan = plan_for("meta-dep", &[], vec![]);
+    plan.stage_from = Some(stage_dir.clone());
+    let source = FarmSource {
+        plans: HashMap::from([("meta-dep".to_string(), plan)]),
+        dep_metas: HashMap::new(),
+        dep_closures: HashMap::new(),
+        lockfile: &lockfile,
+        output_dir: &out_dir,
+        pkg_cache: None,
+        json: false,
+        epoch: None,
+        runner: FakeCurl { body: b"" },
+    };
+
+    let manifest = source
+        .manifest_for("meta-dep")
+        .expect("a stage-only node plans fine");
+    let obj = manifest
+        .closure
+        .iter()
+        .find(|o| o.purpose == "stage")
+        .expect("the stage content rides the closure");
+    let bytes = nau::coordinator::pack_stage_tar(&stage_dir).expect("the stage tars");
+    assert_eq!(
+        obj.sha256,
+        sha256_hex(&bytes),
+        "identity is the content hash"
+    );
+    assert_eq!(obj.size as usize, bytes.len());
+
+    let staged = source
+        .stage_payload(&manifest)
+        .expect("the stage assembles");
+    let blob = std::fs::read(staged.path().join(&obj.sha256)).expect("the blob is staged");
+    assert_eq!(
+        blob, bytes,
+        "staged under the manifest's hash — the tar is deterministic"
+    );
+}
+
+/// #310 identity sanity: the stage tar is byte-stable across packings
+/// of identical content, so a warm rerun (same recipe, same stage)
+/// computes the same manifest identity — placement dedupes, never
+/// re-ships.
+#[test]
+fn pack_stage_tar_is_deterministic_for_identical_content() {
+    let mk = |root: &Path| {
+        std::fs::create_dir_all(root.join("usr/share")).unwrap();
+        std::fs::write(root.join("usr/share/b.txt"), b"b\n").unwrap();
+        std::fs::write(root.join("usr/share/a.txt"), b"a\n").unwrap();
+        std::fs::create_dir_all(root.join("opt")).unwrap();
+    };
+    let one = tempfile::tempdir().unwrap();
+    let two = tempfile::tempdir().unwrap();
+    mk(&one.path().join("stage"));
+    // Same content, created in a different order — the pack must not
+    // lean on filesystem iteration order.
+    std::fs::create_dir_all(two.path().join("stage/opt")).unwrap();
+    std::fs::create_dir_all(two.path().join("stage/usr/share")).unwrap();
+    std::fs::write(two.path().join("stage/usr/share/a.txt"), b"a\n").unwrap();
+    std::fs::write(two.path().join("stage/usr/share/b.txt"), b"b\n").unwrap();
+
+    let first = nau::coordinator::pack_stage_tar(&one.path().join("stage")).unwrap();
+    let second = nau::coordinator::pack_stage_tar(&two.path().join("stage")).unwrap();
+    assert_eq!(first, second, "identical content packs identical bytes");
+}
+
 /// The JSON event a farm dispatch emits: executor `ssh`, worker
 /// attributed, the version parsed from the artifact filename's stem —
 /// the "0" placeholder when the stem does not parse.
@@ -1857,6 +1941,7 @@ fn metadata_only_all_jobs_are_local_only() {
         &[],
         &empty_lockfile(),
         Path::new("no-such-run-output"),
+        None,
         None,
     )
     .expect("a build-less plan precomputes");
@@ -2318,6 +2403,7 @@ fn precompute_local_held_set_is_the_union_of_the_placement_caps() {
         &[],
         &empty_lockfile(),
         Path::new("no-such-run-output"),
+        None,
         None,
     )
     .expect("a build-less plan precomputes");

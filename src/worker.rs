@@ -41,8 +41,11 @@ pub struct ClosureObject {
     pub sha256: String,
     pub size: u64,
     /// What the blob is for: `source` (a pinned source tarball shipped in
-    /// the payload) or `dep:<package>` (a built dependency `.snap` merged
-    /// into the build prefix). Anything else is a named refusal.
+    /// the payload), `dep:<package>` (a built dependency `.snap` merged
+    /// into the build prefix), or `stage` (#310: the coordinator's
+    /// resolved stage content for a stage-only recipe — the tarball the
+    /// worker unpacks into its build stage before packing). Anything
+    /// else is a named refusal.
     pub purpose: String,
 }
 
@@ -419,6 +422,9 @@ struct PayloadSet {
     sources: BTreeMap<String, PathBuf>,
     /// `dep:<pkg>` blobs: package name → the verified `.snap` path.
     deps: Vec<(String, PathBuf)>,
+    /// The `stage` blob (#310): the verified stage tarball a stage-only
+    /// recipe packs — unpacked into the build stage before the pack.
+    stage: Option<PathBuf>,
 }
 
 /// Process-global state a job mutates for its duration (CWD, a few env
@@ -525,6 +531,18 @@ fn run_job(
     result
 }
 
+/// Unpack the coordinator's stage blob into the job's build stage
+/// (#310). `tar::Archive::unpack` refuses traversal paths by default —
+/// a hostile blob cannot write outside the stage.
+fn extract_stage_blob(blob: &Path, stage: &Path) -> miette::Result<()> {
+    let file = std::fs::File::open(blob)
+        .map_err(|e| miette::miette!("worker-job: cannot open the stage blob: {e}"))?;
+    let mut archive = tar::Archive::new(file);
+    archive
+        .unpack(stage)
+        .map_err(|e| miette::miette!("worker-job: cannot unpack the stage blob: {e}"))
+}
+
 /// The build half of `run_job`, after meta is loaded and checked.
 fn finish_job(
     manifest: &JobManifest,
@@ -545,6 +563,13 @@ fn finish_job(
 
     let stage =
         tempfile::tempdir().map_err(|e| miette::miette!("worker-job: cannot create stage: {e}"))?;
+    // #310: a stage-only recipe's content rides the `stage` closure
+    // object — unpacked into the otherwise-empty build stage before the
+    // pack, because the recipe's (absent) build phase is what would have
+    // populated it locally.
+    if let Some(blob) = &payloads.stage {
+        extract_stage_blob(blob, stage.path())?;
+    }
     std::fs::create_dir_all(out_dir)
         .map_err(|e| miette::miette!("worker-job: cannot create output dir: {e}"))?;
 
@@ -685,7 +710,7 @@ fn validate_manifest(manifest: &JobManifest) -> miette::Result<()> {
 
 /// Recognized purposes only; `dep:<pkg>` must name a package.
 fn validate_purpose(obj: &ClosureObject) -> miette::Result<()> {
-    if obj.purpose == "source" {
+    if obj.purpose == "source" || obj.purpose == "stage" {
         return Ok(());
     }
     if let Some(pkg) = obj.purpose.strip_prefix("dep:") {
@@ -698,7 +723,8 @@ fn validate_purpose(obj: &ClosureObject) -> miette::Result<()> {
         ));
     }
     Err(miette::miette!(
-        "worker-job: closure object {} declares unknown purpose '{}' (expected 'source' or 'dep:<package>')",
+        "worker-job: closure object {} declares unknown purpose '{}' (expected 'source', \
+         'dep:<package>', or 'stage')",
         short_sha(&obj.sha256),
         obj.purpose
     ))
@@ -720,6 +746,7 @@ fn verify_payloads(
         return Ok(PayloadSet {
             sources: BTreeMap::new(),
             deps: Vec::new(),
+            stage: None,
         });
     }
     let Some(dir) = payload_dir else {
@@ -738,11 +765,21 @@ fn verify_payloads(
     let mut payloads = PayloadSet {
         sources: BTreeMap::new(),
         deps: Vec::new(),
+        stage: None,
     };
     for obj in &manifest.closure {
         let blob = dir.join(&obj.sha256);
         if obj.purpose == "source" {
             route_source_blob(manifest, obj, &blob, &mut payloads.sources)?;
+        } else if obj.purpose == "stage" {
+            // One stage per job — a second is a dispatch bug, not
+            // content to merge.
+            if payloads.stage.is_some() {
+                return Err(miette::miette!(
+                    "worker-job: manifest carries more than one 'stage' blob — refusing"
+                ));
+            }
+            payloads.stage = Some(blob);
         } else if let Some(pkg) = obj.purpose.strip_prefix("dep:") {
             payloads.deps.push((pkg.to_string(), blob));
         }

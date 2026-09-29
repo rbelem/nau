@@ -9,12 +9,107 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+// Repo is Linux-only (GPL-3.0, AGENTS.md): mode bits come from
+// `PermissionsExt` in the deterministic stage tar (#310).
+use std::os::unix::fs::PermissionsExt;
 
 use crate::build_sched::ManifestSource;
 use crate::command::{exit_code, CommandRunner};
 use crate::lock::LockFile;
 use crate::snap::{SnapMeta, SourceSpec};
 use crate::ssh_exec::{PreflightChecks, SshExecutor, PREFLIGHT_MIN_FREE_DISK_BYTES};
+
+/// Stage-only recipe: no `build`, no `parts` — exactly the shape
+/// `snap.rs::run_build` early-returns on, so the stage is never
+/// populated by a build phase and packs as-is (#310).
+pub fn is_stage_only(meta: &SnapMeta) -> bool {
+    meta.parts.is_none() && meta.build.is_none()
+}
+
+/// Deterministically tar one directory's content (#310): entries sorted
+/// by relative path, GNU headers with zeroed ownership and timestamps
+/// and normalized modes. The sha256 of these bytes is the `stage`
+/// closure object's identity — manifest time and staging time must
+/// agree byte for byte, so the packing cannot lean on filesystem
+/// iteration order or metadata.
+pub fn pack_stage_tar(dir: &Path) -> miette::Result<Vec<u8>> {
+    let mut all: Vec<PathBuf> = Vec::new();
+    collect_stage_entries(dir, &mut all)?;
+    all.sort();
+    all.dedup();
+
+    let mut builder = tar::Builder::new(Vec::new());
+    for p in &all {
+        let rel = p.strip_prefix(dir).map_err(|e| {
+            miette::miette!("stage tar: {} escapes {}: {e}", p.display(), dir.display())
+        })?;
+        let name = rel.to_string_lossy().replace('\\', "/");
+        let meta = std::fs::symlink_metadata(p)
+            .map_err(|e| miette::miette!("stage tar: cannot stat {}: {e}", p.display()))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        if meta.is_dir() {
+            header.set_mode(0o755);
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            builder
+                .append_data(&mut header, &name, std::io::empty())
+                .map_err(|e| miette::miette!("stage tar: {e}"))?;
+        } else if meta.is_symlink() {
+            let target = std::fs::read_link(p)
+                .map_err(|e| miette::miette!("stage tar: cannot read link {}: {e}", p.display()))?;
+            header.set_mode(0o777);
+            header.set_entry_type(tar::EntryType::Symlink);
+            builder
+                .append_link(&mut header, &name, &target)
+                .map_err(|e| miette::miette!("stage tar: {e}"))?;
+        } else {
+            let file = std::fs::File::open(p)
+                .map_err(|e| miette::miette!("stage tar: cannot open {}: {e}", p.display()))?;
+            let exec = meta.permissions().mode() & 0o111 != 0;
+            header.set_mode(if exec { 0o755 } else { 0o644 });
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(meta.len());
+            builder
+                .append_data(&mut header, &name, file)
+                .map_err(|e| miette::miette!("stage tar: {e}"))?;
+        }
+    }
+    builder
+        .into_inner()
+        .map_err(|e| miette::miette!("stage tar: {e}"))
+}
+
+/// Depth-first collection of every path under `root` — dirs and
+/// symlinks included, symlink targets never followed (a stage is
+/// user-authored; cycles are its problem, not the pack's).
+fn collect_stage_entries(root: &Path, out: &mut Vec<PathBuf>) -> miette::Result<()> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        // A missing stage packs nothing — build_snap's copy step treats
+        // it the same way.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(miette::miette!(
+                "stage tar: cannot read {}: {e}",
+                root.display()
+            ))
+        }
+    };
+    for entry in entries {
+        let p = entry
+            .map_err(|e| miette::miette!("stage tar: {}: {e}", root.display()))?
+            .path();
+        out.push(p.clone());
+        let is_dir = p.is_dir() && !p.is_symlink();
+        if is_dir {
+            collect_stage_entries(&p, out)?;
+        }
+    }
+    Ok(())
+}
 
 /// Everything one node's remote job needs, resolved up front on the
 /// orchestrator thread: the recipe bytes, the transitive dep payload
@@ -36,6 +131,12 @@ pub struct NodeJobPlan {
     /// resolve through `dep_metas` at dispatch time.
     pub deps: Vec<String>,
     pub sources: Vec<SourceSpec>,
+    /// The run's resolved stage dir (#310), carried only for stage-only
+    /// recipes: `run_build` never populates their stage, so its content
+    /// is the payload and must ship to the worker as the `stage` closure
+    /// object. `None` for every build-populated node — those stage into
+    /// the worker's own scratch.
+    pub stage_from: Option<PathBuf>,
 }
 
 /// The coordinator-side assembly feeding every worker's dispatches
@@ -150,6 +251,18 @@ impl<R: CommandRunner + Sync> ManifestSource for FarmSource<'_, R> {
             });
         }
 
+        // #310: a stage-only node packs its resolved stage as one
+        // deterministic blob — the worker's build stage is scratch it
+        // never populates, so the content must ride the payload.
+        if let Some(stage) = &plan.stage_from {
+            let bytes = pack_stage_tar(stage)?;
+            closure.push(crate::worker::ClosureObject {
+                sha256: crate::oci::sha256_hex(&bytes),
+                size: bytes.len() as u64,
+                purpose: "stage".to_string(),
+            });
+        }
+
         Ok(crate::worker::JobManifest {
             protocol_version: crate::worker::WORKER_PROTOCOL_VERSION,
             target: plan.arch.clone(),
@@ -207,6 +320,18 @@ impl<R: CommandRunner + Sync> ManifestSource for FarmSource<'_, R> {
             let (url, sha) = self.source_pin(spec)?;
             let dest = stage.path().join(&sha);
             fetch_pinned_source(&self.runner, &url, &sha, &dest)?;
+        }
+
+        // #310: the stage-only node's stage blob lands under its hash —
+        // the same bytes `manifest_for` hashed (the tar is
+        // deterministic), so the manifest identity and the shipped blob
+        // agree by construction.
+        if let Some(stage_dir) = &plan.stage_from {
+            let bytes = pack_stage_tar(stage_dir)?;
+            let sha = crate::oci::sha256_hex(&bytes);
+            std::fs::write(stage.path().join(&sha), &bytes).map_err(|e| {
+                miette::miette!("farm job: cannot write the stage blob into the payload: {e}")
+            })?;
         }
         Ok(stage)
     }
@@ -424,6 +549,14 @@ pub fn placement_objects(
     pkg_cache: Option<&crate::cache::PackageCache>,
 ) -> BTreeSet<String> {
     let mut objects = plan_objects(plan, lockfile);
+    // #310: a stage-only node's stage blob is placement-known the same
+    // way its dep payloads are — the deterministic tar's hash, so a warm
+    // worker holding it earns the preference.
+    if let Some(stage) = &plan.stage_from {
+        if let Ok(bytes) = pack_stage_tar(stage) {
+            objects.insert(crate::oci::sha256_hex(&bytes));
+        }
+    }
     for dep in &plan.deps {
         if let Some(path) = resolved_dep_payload(
             dep,
@@ -454,6 +587,7 @@ pub fn precompute_farm_plans(
     lockfile: &LockFile,
     output_dir: &Path,
     pkg_cache: Option<&crate::cache::PackageCache>,
+    stage: Option<&Path>,
 ) -> miette::Result<FarmPlans> {
     let mut plans = HashMap::new();
     let mut dep_metas: HashMap<String, SnapMeta> = HashMap::new();
@@ -478,6 +612,7 @@ pub fn precompute_farm_plans(
             lockfile,
             &mut dep_metas,
             &mut dep_closures,
+            stage,
         );
         let local_only = multi_arch || all_only || plan.is_err();
         // The placement-known objects (#303) — see [`plan_objects`] for
@@ -535,6 +670,7 @@ pub fn plan_node_job(
     lockfile: &LockFile,
     dep_metas: &mut HashMap<String, SnapMeta>,
     dep_closures: &mut HashMap<String, crate::cache::BuildClosure>,
+    stage: Option<&Path>,
 ) -> miette::Result<NodeJobPlan> {
     // The recipe bytes: single-file recipes only. A directory-form
     // recipe (init.lua + sibling files) needs its whole directory in
@@ -591,6 +727,13 @@ pub fn plan_node_job(
         package: meta.name.clone(),
         deps,
         sources,
+        // #310: only a stage-only recipe packs the run's resolved stage;
+        // a build-populated node stages into the worker's own scratch.
+        stage_from: if is_stage_only(meta) {
+            stage.map(Path::to_path_buf)
+        } else {
+            None
+        },
     })
 }
 

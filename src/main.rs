@@ -749,6 +749,8 @@ fn run_build(
             &lockfile,
             json,
             &workers,
+            stage_dir,
+            stage_policy,
         )?;
     }
 
@@ -907,6 +909,8 @@ fn ensure_build_prefix(
     json: bool,
     quiet: bool,
     building: &mut Vec<String>,
+    run_stage: &Path,
+    run_stage_policy: nau::snap::StagePolicy,
 ) -> miette::Result<Option<nau::build_prefix::MergedPrefix>> {
     // Only source builds consume a build prefix — meta/store snaps and
     // fetch-only declarations never run a build command.
@@ -922,7 +926,17 @@ fn ensure_build_prefix(
     for name in closure_names {
         let dep_meta = nau::deps::load_meta(&name)?;
         let snap = ensure_dep_payload(
-            &name, &dep_meta, arch, output_dir, pkg_cache, lockfile, json, quiet, building,
+            &name,
+            &dep_meta,
+            arch,
+            output_dir,
+            pkg_cache,
+            lockfile,
+            json,
+            quiet,
+            building,
+            run_stage,
+            run_stage_policy,
         )?;
         payloads.push(nau::build_prefix::Payload { pkg: name, snap });
     }
@@ -958,6 +972,8 @@ fn ensure_dep_payload(
     json: bool,
     quiet: bool,
     building: &mut Vec<String>,
+    run_stage: &Path,
+    run_stage_policy: nau::snap::StagePolicy,
 ) -> miette::Result<PathBuf> {
     let filename = format!("{}_{}_{}.snap", name, dep_meta.version, arch);
     let in_output = output_dir.join(&filename);
@@ -983,15 +999,25 @@ fn ensure_dep_payload(
     building.push(name.to_string());
 
     let dep_prefix = ensure_build_prefix(
-        dep_meta, arch, output_dir, pkg_cache, lockfile, json, quiet, building,
+        dep_meta,
+        arch,
+        output_dir,
+        pkg_cache,
+        lockfile,
+        json,
+        quiet,
+        building,
+        run_stage,
+        run_stage_policy,
     )?;
 
     nau::snap::check_cross_build(arch, dep_meta.target.as_deref())?;
     if !json && !quiet {
         nau::output::status(format!("building dependency {name} ({arch})..."));
     }
-    let stage = tempfile::tempdir()
-        .map_err(|e| miette::miette!("failed to create temp stage for {name}: {e}"))?;
+    // #310: stage-only deps pack the run's resolved stage; the rest keep
+    // the private scratch they always had.
+    let stage = resolve_dep_stage(dep_meta, run_stage)?;
     let scan_listings = match &dep_prefix {
         Some(p) => nau::leak_scan::listings_for_build(dep_meta, p)?,
         None => nau::leak_scan::PayloadListings::default(),
@@ -1002,7 +1028,7 @@ fn ensure_dep_payload(
         stage.path(),
         output_dir,
         arch,
-        nau::snap::StagePolicy::Default,
+        stage.policy(run_stage_policy),
         // Dependency builds have no pod store and no interpreted closure.
         None,
         None,
@@ -1036,6 +1062,11 @@ struct DepJobCtx<'a> {
     json: bool,
     total: usize,
     dispatch: &'a AtomicUsize,
+    /// The run's resolved stage (#310): stage-only deps pack it; the
+    /// farm plan carries it so remote stage-only dispatches ship the
+    /// content.
+    run_stage: &'a Path,
+    run_stage_policy: nau::snap::StagePolicy,
     /// Executor name stamped into the scheduler prefixes (ADR-0040
     /// Decision 4): `local` until the SSH executor integrates.
     executor: &'a str,
@@ -1067,6 +1098,8 @@ impl DepJobCtx<'_> {
             self.lockfile,
             self.json,
             true,
+            self.run_stage,
+            self.run_stage_policy,
         ) {
             Ok(()) => {
                 if !self.json {
@@ -1208,6 +1241,8 @@ fn build_all_deps(
     lockfile: &LockFile,
     json: bool,
     workers: &nau::lua::WorkersConfig,
+    run_stage: &Path,
+    run_stage_policy: nau::snap::StagePolicy,
 ) -> miette::Result<()> {
     if dep_nodes.is_empty() {
         return Ok(());
@@ -1278,6 +1313,8 @@ fn build_all_deps(
             json,
             total: to_build,
             dispatch: &dispatch,
+            run_stage,
+            run_stage_policy,
             executor: "local",
         };
         let executor = nau::build_sched::LocalExecutor::new(|name| ctx.run(name));
@@ -1301,6 +1338,8 @@ fn build_all_deps(
             json,
             total: to_build,
             dispatch: &dispatch,
+            run_stage,
+            run_stage_policy,
             executor: "local",
         };
         run_farm(&ctx, &graph, &pre_done, workers)
@@ -1400,6 +1439,7 @@ fn run_farm(
         ctx.lockfile,
         ctx.output_dir,
         ctx.pkg_cache,
+        Some(ctx.run_stage),
     ) {
         Ok(x) => x,
         Err(e) => {
@@ -1542,14 +1582,17 @@ fn build_dep_archs(
     lockfile: &LockFile,
     json: bool,
     quiet: bool,
+    run_stage: &Path,
+    run_stage_policy: nau::snap::StagePolicy,
 ) -> miette::Result<()> {
     for a in dep_archs {
         nau::snap::check_cross_build(a, dep_meta.target.as_deref())?;
         if !json && !quiet {
             nau::output::status(format!("building {} ({})...", dep_name, a));
         }
-        let dep_stage = tempfile::tempdir()
-            .map_err(|e| miette::miette!("failed to create temp stage: {}", e))?;
+        // #310: stage-only deps pack the run's resolved stage; the rest
+        // keep the private scratch they always had.
+        let dep_stage = resolve_dep_stage(dep_meta, run_stage)?;
 
         let mut building: Vec<String> = vec![dep_name.to_string()];
         let build_prefix = ensure_build_prefix(
@@ -1561,6 +1604,8 @@ fn build_dep_archs(
             json,
             quiet,
             &mut building,
+            run_stage,
+            run_stage_policy,
         )?;
 
         let scan_listings = match &build_prefix {
@@ -1573,7 +1618,7 @@ fn build_dep_archs(
             dep_stage.path(),
             output_dir,
             a,
-            nau::snap::StagePolicy::Default,
+            dep_stage.policy(run_stage_policy),
             None,
             // Plain recursive builds have no pod dependency closure.
             None,
@@ -1597,6 +1642,52 @@ fn build_dep_archs(
         }
     }
     Ok(())
+}
+
+/// The stage a dep build packs into (#310): a stage-only recipe packs
+/// the run's resolved stage — `run_build` never populates that stage,
+/// so its content IS the recipe's declaration — while anything with a
+/// build phase keeps its own private scratch: wiping the shared stage
+/// would destroy the user's pre-staged content, and dep builds run
+/// concurrently (#55).
+enum DepStage<'a> {
+    Shared(&'a Path),
+    Private(tempfile::TempDir),
+}
+
+impl DepStage<'_> {
+    fn path(&self) -> &Path {
+        match self {
+            DepStage::Shared(p) => p,
+            DepStage::Private(t) => t.path(),
+        }
+    }
+
+    /// The shared stage rides the run's own policy (the same resolution
+    /// the parent build uses); a private stage is nau-owned scratch.
+    fn policy(&self, run_policy: nau::snap::StagePolicy) -> nau::snap::StagePolicy {
+        match self {
+            DepStage::Shared(_) => run_policy,
+            DepStage::Private(_) => nau::snap::StagePolicy::Default,
+        }
+    }
+}
+
+/// Which stage one dependency build packs into (#310): the run's
+/// resolved stage for a stage-only recipe, a fresh private tempdir
+/// otherwise (the shape every dep build had before #310 — the tempdir
+/// guards the user's staged content and the parallel phase).
+fn resolve_dep_stage<'a>(
+    dep_meta: &nau::snap::SnapMeta,
+    run_stage: &'a Path,
+) -> miette::Result<DepStage<'a>> {
+    if nau::coordinator::is_stage_only(dep_meta) {
+        Ok(DepStage::Shared(run_stage))
+    } else {
+        Ok(DepStage::Private(tempfile::tempdir().map_err(|e| {
+            miette::miette!("failed to create temp stage: {}", e)
+        })?))
+    }
 }
 
 /// Build every selected output across its resolved archs, collecting the
@@ -1682,6 +1773,8 @@ fn build_one_arch(
         // Top-level output builds are sequential — full output.
         false,
         &mut building,
+        stage_dir,
+        stage_policy,
     )?;
 
     // Post-build leak-scan resolution data (ADR-0018 Decision 3, issue
@@ -5258,5 +5351,143 @@ mod tests {
         drop(lock);
         let (_p, _pol, again) = resolve_stage(None).unwrap();
         assert!(again.is_some());
+    }
+
+    // ── #310: stage-only deps pack the run's resolved stage ──
+
+    fn dep_fixture_meta(name: &str) -> nau::snap::SnapMeta {
+        nau::snap::SnapMeta {
+            name: name.into(),
+            version: "1.0".into(),
+            summary: None,
+            description: None,
+            license: None,
+            source: None,
+            sources: None,
+            build: None,
+            parts: None,
+            architectures: None,
+            grade: "stable".into(),
+            confinement: "strict".into(),
+            type_: None,
+            adopt_info: None,
+            version_adopted: false,
+            icon_source: None,
+            icon: None,
+            compression: None,
+            compression_level: None,
+            environment: None,
+            layout: None,
+            hooks: None,
+            plugs: None,
+            slots: None,
+            aliases: vec![],
+            requires: vec![],
+            build_deps: vec![],
+            leaks_ok: vec![],
+            target: None,
+            toolchain: None,
+            inputs: None,
+            confined: None,
+            apps: HashMap::new(),
+            services: BTreeMap::new(),
+            deps: None,
+            floating: false,
+            definition_dir: None,
+        }
+    }
+
+    fn tool_on_path(tool: &str) -> bool {
+        std::process::Command::new("which")
+            .arg(tool)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The stage SELECTION: a stage-only recipe packs the run's stage
+    /// (its content IS the declaration); anything with a build phase
+    /// keeps a private scratch — the shared stage must never be a
+    /// build's wipe target.
+    #[test]
+    fn resolve_dep_stage_shares_the_run_stage_only_for_stage_only_deps() {
+        let run = tempfile::tempdir().unwrap();
+        match resolve_dep_stage(&dep_fixture_meta("meta-dep"), run.path()).unwrap() {
+            DepStage::Shared(p) => assert_eq!(p, run.path()),
+            DepStage::Private(_) => panic!("a stage-only dep must pack the run stage"),
+        }
+        let mut built = dep_fixture_meta("built-dep");
+        built.build = Some("true".into());
+        match resolve_dep_stage(&built, run.path()).unwrap() {
+            DepStage::Private(t) => assert_ne!(t.path(), run.path()),
+            DepStage::Shared(_) => panic!("a build-bearing dep must keep its private scratch"),
+        }
+    }
+
+    /// The whole local dep leg: a stage-only dep builds a snap carrying
+    /// the pre-staged content (the #310 bug built a meta-only shell),
+    /// and the shared stage survives the build untouched.
+    #[test]
+    fn stage_only_dep_build_packs_the_run_stage_content() {
+        if !tool_on_path("mksquashfs") {
+            eprintln!("skipping: mksquashfs unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let run_stage = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(run_stage.path().join("usr/share")).unwrap();
+        std::fs::write(
+            run_stage.path().join("usr/share/dep-payload.txt"),
+            b"declared content\n",
+        )
+        .unwrap();
+        let output_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        build_dep_archs(
+            "stage-dep",
+            &dep_fixture_meta("stage-dep"),
+            &["amd64".to_string()],
+            &output_dir,
+            None,
+            None,
+            &LockFile::empty(),
+            false,
+            true,
+            run_stage.path(),
+            nau::snap::StagePolicy::Default,
+        )
+        .expect("the stage-only dep builds");
+
+        let snap = output_dir.join("stage-dep_1.0_amd64.snap");
+        assert!(
+            snap.is_file(),
+            "the dep snap exists in {}",
+            output_dir.display()
+        );
+
+        // The declared content rides the snap — a payload, not a shell.
+        if !tool_on_path("unsquashfs") {
+            eprintln!("skipping content check: unsquashfs unavailable");
+            return;
+        }
+        let extract = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("unsquashfs")
+            .args(["-f", "-d"])
+            .arg(extract.path())
+            .arg(&snap)
+            .status()
+            .unwrap();
+        assert!(status.success(), "unsquashfs failed");
+        let carried = std::fs::read(extract.path().join("usr/share/dep-payload.txt"))
+            .expect("the staged payload is inside the snap");
+        assert_eq!(carried, b"declared content\n");
+
+        // The collision guard holds: the shared stage was read, never
+        // wiped or consumed.
+        assert_eq!(
+            std::fs::read(run_stage.path().join("usr/share/dep-payload.txt")).unwrap(),
+            b"declared content\n",
+        );
     }
 }
