@@ -70,6 +70,25 @@ fn default_binary_url() -> String {
     )
 }
 
+/// The prebuilt mksquashfs/unsquashfs artifact base URL the template
+/// installs (ticket #300): the pin's binaries ride the SAME publish
+/// front as the worker binary (`/bin/mksquashfs`, `/bin/unsquashfs` —
+/// scripts/build-mksquashfs-artifact.sh output). Override with
+/// `NAU_MKSQUASHFS_ARTIFACT_URL` (e.g. the funnel host's `/bin`) until
+/// release infra carries the artifact.
+fn default_squashfs_artifact_url() -> String {
+    if let Ok(url) = std::env::var("NAU_MKSQUASHFS_ARTIFACT_URL") {
+        let trimmed = url.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    format!(
+        "https://github.com/rbelem/nau/releases/download/v{version}",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
 /// `HCLOUD_TOKEN` (trimmed; empty = absent). Read at the CLI boundary so
 /// the provisioner core stays env-free and hermetic under test.
 fn token_from_env() -> Option<String> {
@@ -978,11 +997,11 @@ pub fn now_epoch_secs() -> miette::Result<u64> {
 // the coordinator-side admission checks all read the SAME values, so a
 // pin bump is one commit that moves template + admission together.
 
-/// The pinned mksquashfs, built from source in the template (pin 1).
+/// The pinned mksquashfs, shipped as a prebuilt artifact (pin 1).
 /// Every stable distro ships 4.6.1; ADR-0041's zstd defaults make
 /// mksquashfs behavior part of artifact identity, so the fleet runs one
-/// source-built 4.7.x. The preflight admission refuses any worker whose
-/// resolved mksquashfs reports anything else.
+/// pinned 4.7.x artifact. The preflight admission refuses any worker
+/// whose resolved mksquashfs reports anything else.
 pub const SQUASHFS_TOOLS_VERSION: &str = "4.7.4";
 
 /// The release date baked into the pinned build's version string. The
@@ -992,13 +1011,28 @@ pub const SQUASHFS_TOOLS_VERSION: &str = "4.7.4";
 pub const SQUASHFS_TOOLS_RELEASE_DATE: &str = "2025-11-09";
 
 /// The pinned source tarball (GitHub codeload, tag `4.7.4`). Verified by
-/// sha256 IN the template before a single byte is built.
+/// sha256 by scripts/build-mksquashfs-artifact.sh before a single byte is
+/// built into the pinned prebuilt artifact.
 pub const SQUASHFS_TOOLS_TARBALL_URL: &str =
     "https://codeload.github.com/plougher/squashfs-tools/tar.gz/refs/tags/4.7.4";
 
 /// sha256 of [`SQUASHFS_TOOLS_TARBALL_URL`]'s exact bytes.
 pub const SQUASHFS_TOOLS_SHA256: &str =
     "91c49f9a1ed972ad00688a38222119e2baf49ba74cf5fda05729a79d7d59d335";
+
+/// sha256 of the prebuilt artifact `mksquashfs` binary (ticket #300) —
+/// the scripts/build-mksquashfs-artifact.sh output served at the publish
+/// front's /bin/ (same lane as the worker binary). Re-pinning is a
+/// DELIBERATE act: one commit moves the artifact, its SHA256SUMS, and
+/// this const together; no worker ever installs bytes this const does
+/// not name (the runcmd gates on it BEFORE anything runs or installs).
+pub const MKSQUASHFS_ARTIFACT_SHA256: &str =
+    "b8b43077806da524d2e6b6be1bb1377f20c30e4107a5cd762ef76750994d13d6";
+
+/// sha256 of the prebuilt artifact `unsquashfs` binary (see
+/// [`MKSQUASHFS_ARTIFACT_SHA256`]).
+pub const UNSQUASHFS_ARTIFACT_SHA256: &str =
+    "6b97812c869c1254466e361732717d7c590c64cc89e6757d7f2e0d4039a4caf3";
 
 /// Everything the template needs. Nothing here is optional: a provision
 /// without a CA pin, a login key, a TTL, or a publish channel is not a
@@ -1201,17 +1235,18 @@ pub fn render_user_data(p: &UserDataParams<'_>) -> String {
     // (it ships its own AppArmor profile, so the current Ubuntu LTS
     // userns restriction does not break it; the hardening stays, and
     // `apparmor_restrict_unprivileged_userns` is NEVER touched here),
-    // plus the toolchain pin 1 builds against — and curl, which the
-    // publish step (last runcmd) drives.
+    // curl for the pinned-binary installs, and build-essential for the
+    // package builds jobs run. NO compressor -dev debs: their only
+    // consumer was the per-worker source build, which #300 replaced —
+    // the prebuilt artifact is self-contained.
     s.push_str("  - apt-get update\n");
     s.push_str(
         "  - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-         bubblewrap ca-certificates curl build-essential liblz4-dev libzstd-dev liblzma-dev \
-         zlib1g-dev\n",
+         bubblewrap ca-certificates curl build-essential\n",
     );
-    // Pin 1: the source-built mksquashfs, fetched+verified+installed as
-    // one fail-together step.
-    s.push_str(&format!("  - {}\n", squashfs_build_runcmd()));
+    // Pin 1: the prebuilt mksquashfs artifact, fetched + hash-verified +
+    // installed as one fail-together step.
+    s.push_str(&format!("  - {}\n", squashfs_install_runcmd()));
     s.push_str(&format!(
         "  - curl -fsSL {url} -o /usr/local/bin/nau\n",
         url = p.binary_url
@@ -1247,31 +1282,28 @@ fn write_file(s: &mut String, path: &str, mode: &str, content: &str) {
     }
 }
 
-/// The single `sh -c` runcmd that installs pin 1 (providers plan §3):
-/// fetch the pinned squashfs-tools tarball, verify its sha256 BEFORE
-/// anything runs, build against lz4/zstd/xz with the release VERSION
-/// forced (the codeload tarball otherwise bakes the commit hash into the
-/// version string — the fleet pin must read exactly
-/// [`SQUASHFS_TOOLS_VERSION`]), `make install` to /usr/local/bin
-/// (PATH-precedence over the distro's 4.6.1), and fail the step unless
-/// the built binary reports the pin. One step, because the tool pin
-/// succeeds or fails as a unit in the cloud-init log; a worker that
-/// missed it is refused at preflight by design (admission is
-/// fail-closed).
-fn squashfs_build_runcmd() -> String {
-    let tarball = format!("squashfs-tools-{SQUASHFS_TOOLS_VERSION}.tar.gz");
-    let srcdir = format!("squashfs-tools-{SQUASHFS_TOOLS_VERSION}");
+/// The single `sh -c` runcmd that installs pin 1 (#300): fetch the two
+/// prebuilt binaries from the artifact URL, verify BOTH against the
+/// COMPILED-IN hashes BEFORE anything runs or installs (the served
+/// SHA256SUMS is never trusted — the gate is the const, same trust
+/// shape the source build had, minus the compiler), `cp -a` to
+/// /usr/local/bin (PATH-precedence over the distro's 4.6.1), and fail
+/// the step unless the installed binary reports the EXACT pin — version
+/// AND release date, proving the artifact is the pinned build and not a
+/// codeload-hash build. One step, because the tool pin succeeds or fails
+/// as a unit in the cloud-init log; a worker that missed it is refused
+/// at preflight by design (admission is fail-closed).
+fn squashfs_install_runcmd() -> String {
     format!(
         "sh -c 'set -e; cd /tmp; \
-         curl -fsSL {SQUASHFS_TOOLS_TARBALL_URL} -o {tarball}; \
-         echo \"{SQUASHFS_TOOLS_SHA256}  {tarball}\" | sha256sum -c -; \
-         tar -xzf {tarball}; \
-         make -C {srcdir}/squashfs-tools XZ_SUPPORT=1 ZSTD_SUPPORT=1 LZ4_SUPPORT=1 LZO_SUPPORT=0 \
-         RELEASE_VERSION={SQUASHFS_TOOLS_VERSION} RELEASE_DATE={SQUASHFS_TOOLS_RELEASE_DATE} \
-         -j\"$(nproc)\" mksquashfs unsquashfs; \
-         cp -a {srcdir}/squashfs-tools/mksquashfs {srcdir}/squashfs-tools/unsquashfs /usr/local/bin/; \
-         /usr/local/bin/mksquashfs -version | grep -q \"version {SQUASHFS_TOOLS_VERSION} \"; \
-         rm -rf /tmp/{srcdir} /tmp/{tarball}'"
+         curl -fsSL {url}/mksquashfs -o mksquashfs; \
+         curl -fsSL {url}/unsquashfs -o unsquashfs; \
+         printf \"%s  %s\\n%s  %s\\n\" {MKSQUASHFS_ARTIFACT_SHA256} mksquashfs \
+         {UNSQUASHFS_ARTIFACT_SHA256} unsquashfs | sha256sum -c -; \
+         cp -a mksquashfs unsquashfs /usr/local/bin/; \
+         /usr/local/bin/mksquashfs -version | grep -q \"version {SQUASHFS_TOOLS_VERSION} ({SQUASHFS_TOOLS_RELEASE_DATE})\"; \
+         rm -f /tmp/mksquashfs /tmp/unsquashfs'",
+        url = default_squashfs_artifact_url()
     )
 }
 
