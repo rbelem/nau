@@ -18,9 +18,10 @@ use nau::provision::publish::{
 };
 use nau::provision::{
     append_worker_entry, issue_wait, issue_wait_nudge, now_epoch_secs, parse_ttl, render_user_data,
-    ProvisionRequest, Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END, PLAN_MACHINE_IDENTITY,
-    PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL, SQUASHFS_TOOLS_RELEASE_DATE, SQUASHFS_TOOLS_SHA256,
-    SQUASHFS_TOOLS_TARBALL_URL, SQUASHFS_TOOLS_VERSION,
+    ProvisionRequest, Provisioner, UserDataParams, BLOCK_BEGIN, BLOCK_END,
+    MKSQUASHFS_ARTIFACT_SHA256, PLAN_MACHINE_IDENTITY, PLAN_PUBLISH_TOKEN, PLAN_PUBLISH_URL,
+    SQUASHFS_TOOLS_RELEASE_DATE, SQUASHFS_TOOLS_SHA256, SQUASHFS_TOOLS_TARBALL_URL,
+    SQUASHFS_TOOLS_VERSION, UNSQUASHFS_ARTIFACT_SHA256,
 };
 
 /// A shape-valid ed25519 public line — throwaway fixture bytes, no
@@ -415,7 +416,7 @@ fn user_data_carries_the_publish_callback_and_one_time_token() {
         ttl_expiry_epoch: MARKER_EPOCH,
     });
     assert!(user_data.contains("path: /etc/nau/publish.env\n    permissions: \"0600\""));
-    assert!(user_data.contains(&format!("MACHINE_IDENTITY='nau-worker-abc-01'")));
+    assert!(user_data.contains("MACHINE_IDENTITY='nau-worker-abc-01'"));
     assert!(user_data.contains(&format!("PUBLISH_URL='{PUBLISH_URL}'")));
     assert!(user_data.contains(&format!("PUBLISH_TOKEN='{token}'")));
     assert!(user_data.contains("path: /etc/nau/publish-host-key.sh\n    permissions: \"0700\""));
@@ -462,7 +463,7 @@ fn user_data_carries_the_publish_callback_and_one_time_token() {
 }
 
 #[test]
-fn user_data_builds_the_pinned_squashfs_tools_from_source() {
+fn user_data_installs_the_pinned_prebuilt_squashfs_artifact() {
     let user_data = render_user_data(&UserDataParams {
         machine_identity: PLAN_MACHINE_IDENTITY,
         publish_url: PLAN_PUBLISH_URL,
@@ -471,40 +472,61 @@ fn user_data_builds_the_pinned_squashfs_tools_from_source() {
         binary_url: BINARY_URL,
         ttl_expiry_epoch: MARKER_EPOCH,
     });
-    // Pin 1 (providers plan §3): the exact 4.7.x pin rides the template —
-    // exact tarball URL, exact bytes (sha256 verified BEFORE the build),
-    // the lz4/zstd/xz build the plan names, the install to /usr/local/bin
-    // (PATH-precedence over the distro's 4.6.1), and a version assert so
-    // a drifted build fails provisioning instead of joining the fleet.
-    assert!(
-        SQUASHFS_TOOLS_VERSION.starts_with("4.7."),
-        "the fleet pin is a 4.7.x, got {SQUASHFS_TOOLS_VERSION}"
-    );
-    assert!(user_data.contains(SQUASHFS_TOOLS_TARBALL_URL));
-    assert!(user_data.contains(SQUASHFS_TOOLS_SHA256));
+    // Pin 1 (#300): the per-worker source build is GONE — the two
+    // prebuilt binaries ride the artifact URL (same publish front as the
+    // worker binary), are checked against the COMPILED-IN hashes, are
+    // cp -a'd to /usr/local/bin (PATH-precedence over the distro's
+    // 4.6.1), and a version assert so a drifted artifact fails
+    // provisioning instead of joining the fleet.
+    assert!(user_data.contains(MKSQUASHFS_ARTIFACT_SHA256));
+    assert!(user_data.contains(UNSQUASHFS_ARTIFACT_SHA256));
     assert!(user_data.contains("sha256sum -c"));
-    // The compression set the plan names, explicit over the Makefile's
-    // defaults (lzo defaults ON in 4.7.x; the pin is xz/zstd/lz4).
-    assert!(user_data.contains("XZ_SUPPORT=1 ZSTD_SUPPORT=1 LZ4_SUPPORT=1 LZO_SUPPORT=0"));
-    // The release VERSION is forced: the codeload tarball otherwise bakes
-    // the commit hash into the version string, and admission pins the
-    // exact string the resolved binary reports.
+    assert!(user_data.contains("-o mksquashfs"));
+    assert!(user_data.contains("-o unsquashfs"));
+    assert!(user_data.contains("cp -a mksquashfs unsquashfs /usr/local/bin/"));
+    // The EXACT version gate: version AND release date, proving the
+    // artifact is the pinned build and not a codeload-hash build.
     assert!(user_data.contains(&format!(
-        "RELEASE_VERSION={SQUASHFS_TOOLS_VERSION} RELEASE_DATE={SQUASHFS_TOOLS_RELEASE_DATE}"
+        "grep -q \"version {SQUASHFS_TOOLS_VERSION} ({SQUASHFS_TOOLS_RELEASE_DATE})\""
     )));
-    // The binaries are copied, not `make install`ed: a second make
-    // invocation re-evaluates the default target and pulls lzo_wrapper.o
-    // (no liblzo2-dev on the worker image) — found live on the first
-    // cloud worker, whose mksquashfs built fine and whose install leg
-    // died, leaving the distro mksquashfs to answer the pin check.
-    assert!(user_data.contains(&format!(
-        "cp -a squashfs-tools-{SQUASHFS_TOOLS_VERSION}/squashfs-tools/mksquashfs \
-         squashfs-tools-{SQUASHFS_TOOLS_VERSION}/squashfs-tools/unsquashfs /usr/local/bin/"
-    )));
-    assert!(user_data.contains("/usr/local/bin/mksquashfs -version"));
-    assert!(user_data.contains(&format!("grep -q \"version {SQUASHFS_TOOLS_VERSION} \"")));
-    // The build tree never rides into a snapshot (#271 bills per GB-month).
-    assert!(user_data.contains("rm -rf /tmp/squashfs-tools-"));
+    // No compiler on the critical path: no make, no source tarball, no
+    // source dir — and the compressor -dev debs lost their only consumer.
+    assert!(!user_data.contains("make -C"));
+    assert!(!user_data.contains("tar -xzf"));
+    assert!(!user_data.contains(SQUASHFS_TOOLS_TARBALL_URL));
+    assert!(!user_data.contains("libzstd-dev"));
+    assert!(!user_data.contains("liblzma-dev"));
+    assert!(!user_data.contains("liblz4-dev"));
+    assert!(!user_data.contains("zlib1g-dev"));
+}
+
+#[test]
+fn user_data_verifies_the_prebuilt_hashes_before_anything_installs() {
+    let user_data = render_user_data(&UserDataParams {
+        machine_identity: PLAN_MACHINE_IDENTITY,
+        publish_url: PLAN_PUBLISH_URL,
+        publish_token: PLAN_PUBLISH_TOKEN,
+        operator_key: OPERATOR_KEY,
+        binary_url: BINARY_URL,
+        ttl_expiry_epoch: MARKER_EPOCH,
+    });
+    // Fail-closed order (#300): fetch → hash-check against the
+    // compiled-in consts → install. Nothing runs between the fetch and
+    // the hash gate; the cp leg only executes after both binaries
+    // verified.
+    let fetch = user_data
+        .find("curl -fsSL")
+        .expect("the pin-1 fetch leg is the first runcmd curl");
+    let check = user_data
+        .find("sha256sum -c")
+        .expect("the compiled-in hash gate");
+    let install = user_data
+        .find("cp -a mksquashfs unsquashfs")
+        .expect("the install leg");
+    assert!(
+        fetch < check && check < install,
+        "nothing may run or install before the hash gate"
+    );
 }
 
 #[test]
@@ -1338,7 +1360,7 @@ fn provision_records_the_machine_linkage_next_to_the_pin() {
     // The executor's @cert-authority pin binds the certificate principal
     // through the address→identity linkage (#295 sub-task 4): one record
     // per pinned server, under the publish channel's ceremony home.
-    let (dir, config) = workspace("nau.lua");
+    let (_dir, config) = workspace("nau.lua");
     std::fs::write(&config, operator_config()).unwrap();
     let (pubtmp, channel) = pubtmp();
     let fake = FakeProvider::new(Script::default());
