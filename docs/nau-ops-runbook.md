@@ -211,15 +211,21 @@ from two live runs (2026-09-29); every step was executed, not planned.
    written before the pin (legacy entries are preserved verbatim, never
    backfilled) — or set `NAU_SSH_IDENTITY` for them.
 7. **The mksquashfs pin ships as a prebuilt artifact (#300).** Workers
-   `curl` + sha256-verify it from `NAU_MKSQUASHFS_ARTIFACT_URL` (default:
-   the GitHub release — empty until #305 publishes it). Provisioning
-   against a funnel front MUST export the override (e.g.
-   `https://<funnel>/bin`, where the lane's `dist/` already holds the
-   pinned binaries); a worker that missed the pin is REFUSED at
-   preflight by design — admission is fail-closed, so a missing env var
-   wastes the window silently-until-preflight. If preflight refuses and
-   the guests are still alive, pull `/var/log/cloud-init-output.log`
-   BEFORE destroying: it is the only forensic for install-leg failures.
+   `curl` + sha256-verify it from `NAU_MKSQUASHFS_ARTIFACT_URL`. The
+   default now RESOLVES: the pinned artifacts ride the `v0.1.0` release
+   on the public repo (#305), so unauthenticated fetches succeed and
+   byte-match the compiled-in consts. Funnel-front windows KEEP the
+   export (e.g. `https://<funnel>/bin`, where the lane's `dist/` holds
+   the pinned binaries) — the worker BINARY still rides the funnel
+   regardless, and the artifact override rides along. Re-pins are
+   DELIBERATE: rebuilding via `scripts/build-mksquashfs-artifact.sh`
+   moves the artifacts, the SHA256SUMS, and the consts in
+   `src/provision/mod.rs` in one commit. A worker that missed the pin is
+   REFUSED at preflight by design — admission is fail-closed, so a bad
+   or missing artifact wastes the window silently-until-preflight. If
+   preflight refuses and the guests are still alive, pull
+   `/var/log/cloud-init-output.log` BEFORE destroying: it is the only
+   forensic for install-leg failures.
 
 ## 2. DNS: `*.nau.rclb.dev` wildcard (PLAN decision 1)
 
