@@ -803,6 +803,11 @@ pub enum Command {
 const WORKERS_MIN_COUNT: u32 = 1;
 const WORKERS_MAX_COUNT: u32 = 50;
 
+/// `nau workers burst --max` default (#301): the council's daily fleet
+/// is 2-3 workers, so 4 is the fat-finger guard — a count above it is a
+/// deliberate `--max` raise, never a silent oversized bill.
+const WORKERS_BURST_MAX_DEFAULT: u32 = 4;
+
 /// The `--count` value parser: decimal u32 within the named bounds.
 fn workers_count(raw: &str) -> Result<u32, String> {
     let n: u32 = raw
@@ -970,6 +975,86 @@ pub enum WorkersCommand {
         /// CA ceremony home (default: $HOME).
         #[arg(long)]
         home: Option<String>,
+    },
+
+    /// One-command build window (#301): provision N workers, wait for
+    /// every host certificate to be issued (`issue --wait` semantics),
+    /// run the wrapped command with inherited stdio, then destroy +
+    /// evict every worker THIS burst provisioned — the teardown fires on
+    /// command failure and Ctrl-C alike, unless `--keep` parks the
+    /// workers for a later `nau workers down --all-managed`. The burst
+    /// exit code is the wrapped command's exit code.
+    Burst {
+        /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
+        #[arg(long)]
+        provider: String,
+
+        /// Server SKU — operator-supplied, never hardcoded (same
+        /// vocabulary as `workers provision`).
+        #[arg(long = "type", value_name = "SKU")]
+        server_type: String,
+
+        /// Provider location (e.g. hel1, fsn1; AWS: the region, e.g.
+        /// eu-central-1).
+        #[arg(long)]
+        location: String,
+
+        /// How many workers this burst provisions (default: 1).
+        #[arg(long, default_value_t = WORKERS_MIN_COUNT, value_parser = workers_count)]
+        count: u32,
+
+        /// Guardrail: refuse `--count` above it. A fat-fingered count is
+        /// an hourly bill; raising it is a deliberate act.
+        #[arg(long, default_value_t = WORKERS_BURST_MAX_DEFAULT)]
+        max: u32,
+
+        /// Worker lifetime before the TTL sweep reclaims it (e.g. 4h).
+        /// The safety net under the burst teardown, not a substitute.
+        #[arg(long, default_value = "4h")]
+        ttl: String,
+
+        /// `issue --wait` ceiling in seconds for the whole burst. The
+        /// effective ceiling scales with the count (each guest publishes
+        /// 1-4 min after create).
+        #[arg(
+            long,
+            default_value_t = crate::provision::ISSUE_WAIT_DEFAULT_TIMEOUT_SECS
+        )]
+        timeout: u64,
+
+        /// Skip the teardown: leave the burst workers provisioned and
+        /// pinned (for inspection or a follow-up run). Tear them down
+        /// later with `nau workers down --all-managed`.
+        #[arg(long)]
+        keep: bool,
+
+        /// Config file the workers entries are pinned into.
+        #[arg(short, long, default_value = "nau.lua")]
+        file: String,
+
+        /// The command to run against the burst workers, after `--`.
+        /// Stdio is inherited; its exit code is the burst's.
+        #[arg(last = true, num_args = 1.., required = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
+
+    /// Tear down every entry in the managed `workers` block (#301): the
+    /// `--keep` burst's promised drain. Each entry's server is destroyed
+    /// (the machine linkage names it) and its pin evicted; an empty or
+    /// absent block is a green no-op.
+    Down {
+        /// Destroy every managed-block entry (v1's only mode — per-entry
+        /// destruction stays `workers destroy`).
+        #[arg(long, required = true)]
+        all_managed: bool,
+
+        /// Provider driver the block's servers were provisioned with.
+        #[arg(long)]
+        provider: String,
+
+        /// Config file the workers entries are evicted from.
+        #[arg(short, long, default_value = "nau.lua")]
+        file: String,
     },
 }
 
