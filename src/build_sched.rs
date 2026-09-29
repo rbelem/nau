@@ -165,6 +165,13 @@ pub struct JobTiming {
     pub worker: String,
     /// Delta-sync channel wall (object transfer).
     pub sync: Duration,
+    /// The fine dispatch legs (#309): prep (preflight + job-dir
+    /// round-trips), run (the worker-job ssh leg), collect (artifact
+    /// pull + store persist + cleanup). Together with `sync` they
+    /// decompose `total`.
+    pub prep: Duration,
+    pub run: Duration,
+    pub collect: Duration,
     /// The remote build child's wall, when reported.
     pub build: Option<Duration>,
     /// Dispatch start → result parsed + artifacts ingested.
@@ -175,9 +182,16 @@ pub struct JobTiming {
 
 impl JobTiming {
     /// The timing suffix the ✓ attribution line and the end-of-run block
-    /// share: `sync 0.4s build 12.3s total 13.1s 1.2 MiB`.
+    /// share: `sync 0.4s prep 0.1s run 1.2s collect 0.3s build 12.3s
+    /// total 13.1s 1.2 MiB`.
     pub fn line_suffix(&self) -> String {
-        let mut s = format!("sync {} ", secs(self.sync));
+        let mut s = format!(
+            "sync {} prep {} run {} collect {} ",
+            secs(self.sync),
+            secs(self.prep),
+            secs(self.run),
+            secs(self.collect)
+        );
         if let Some(build) = self.build {
             s.push_str(&format!("build {} ", secs(build)));
         }
@@ -1053,6 +1067,9 @@ impl<R: crate::command::CommandRunner + Sync, S: ManifestSource> FarmJob for Rem
                         node: name.to_string(),
                         worker: self.display.clone(),
                         sync: o.sync,
+                        prep: o.prep,
+                        run: o.run,
+                        collect: o.collect,
                         build: o.result.build_ms.map(Duration::from_millis),
                         total: o.total,
                         artifact_bytes: o.result.artifacts.iter().map(|a| a.size).sum(),
