@@ -33,6 +33,7 @@ pub mod lint;
 pub mod lock;
 pub mod lua;
 pub mod manifest;
+pub mod manifest_ir;
 pub mod oci;
 pub mod output;
 pub mod pkg_manifest;

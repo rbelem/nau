@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 
 use miette::{IntoDiagnostic, WrapErr};
 use mlua::Value;
-use serde::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::command::CommandRunner;
@@ -26,6 +25,12 @@ use crate::doctor;
 use crate::lock::LockFile;
 use crate::snap::SnapRef;
 use crate::store::ResolvedSnap;
+
+// Moved to the IR home ([`crate::manifest_ir`], #317); re-exported so
+// every pre-existing `crate::image::` path keeps compiling.
+pub use crate::manifest_ir::{
+    BootloaderConfig, DiskLayout, ImageDeclaration, KernelEntry, Partition, StagedFile, SwapConfig,
+};
 
 #[cfg(test)]
 pub mod test_support {
@@ -71,145 +76,6 @@ pub mod test_support {
             update_source: None,
             boot_health_exec: None,
         }
-    }
-}
-
-// ── Additional types ──
-
-/// Kernel snap reference plus kernel configuration.
-#[derive(Debug, Clone)]
-pub struct KernelEntry {
-    pub snap: SnapRef,
-    pub params: Vec<String>,
-    pub modules: Vec<String>,
-    pub modprobe_config: Option<String>,
-    /// ADR-0019 escape hatch: an author-pinned store channel (e.g.
-    /// "latest/stable") carried on the kernel pin entry
-    /// (`pin("pc-kernel", { channel = "…" })`). When set, resolution uses
-    /// the channel verbatim — no base-track derivation — and the
-    /// declared-base check is skipped; the override is logged at build
-    /// time.
-    pub channel: Option<String>,
-}
-
-/// Bootloader configuration for disk images.
-#[derive(Debug, Clone)]
-pub struct BootloaderConfig {
-    /// Two implemented backends: `"systemd-boot"` (UEFI targets — UKI on
-    /// the ESP, issue #71) and `"piboot"` (Raspberry Pi firmware chain —
-    /// boot-assets + Pi-spelled kernel payload, issue #87, ADR-0025
-    /// amendment). Any other declared value fails declaration validation
-    /// instead of being accepted and silently ignored.
-    pub type_: String,
-    pub timeout: u32,
-}
-
-/// One host file staged verbatim into the image rootfs (`files =` in the
-/// image declaration, #80).
-///
-/// `dest` must be an absolute path inside the guest tree
-/// (`/usr/bin/systemd-sysupdate`); `source` is resolved against the
-/// directory of the declaring `--file` lua (absolute paths pass through).
-/// Staged BEFORE the rootfs is hashed, so dm-verity covers them.
-#[derive(Debug, Clone)]
-pub struct StagedFile {
-    pub source: PathBuf,
-    pub dest: String,
-}
-
-/// Full disk layout definition.
-#[derive(Debug, Clone)]
-pub struct DiskLayout {
-    pub label: String, // "gpt" or "mbr"
-    pub partitions: Vec<Partition>,
-    pub swap: Option<SwapConfig>,
-    /// A/B slot updates (ADR-0011 step (d)). Opt-in, default off —
-    /// kernel-free and single-slot images build byte-identically without
-    /// it. When set, the root (and its dm-verity hash partition, for kernel
-    /// images) is cloned into a same-size slot B after slot A, sysupdate
-    /// transfer files are emitted when `update_source` is declared, and GPT
-    /// type GUIDs + PARTLABELs are applied so systemd-sysupdate can match
-    /// the slots. Requires a "gpt" label.
-    pub ab: bool,
-}
-
-/// One partition in the disk layout.
-#[derive(Debug, Clone)]
-pub struct Partition {
-    pub name: String,
-    pub size: String,         // e.g. "512M", "0" for remaining
-    pub fs: String,           // e.g. "vfat", "btrfs", "ext4"
-    pub mount: String,        // mount point
-    pub options: Vec<String>, // mount options
-    /// UC gadget role (issue #32): `"system-seed"`, `"system-boot"`,
-    /// `"system-data"` (or `"system-save"`). Only honored when the image
-    /// base is a UC coreN base; the role selects the UC PARTLABEL
-    /// (`ubuntu-seed` / `ubuntu-boot` / `ubuntu-data`) and the populate
-    /// routing (seed / boot / data). Empty for non-UC partitions — the
-    /// simplified path is untouched.
-    pub role: String,
-}
-
-/// Swap configuration.
-#[derive(Debug, Clone)]
-pub struct SwapConfig {
-    pub size: String, // e.g. "8G"
-}
-
-// ── Image declaration ──
-
-/// A declarative image composed from multiple snaps.
-///
-/// Created by the `image()` DSL function:
-/// ```lua
-/// image {
-///     name = "my-system",
-///     version = "1.0.0",
-///     base = pin("core22"),
-///     kernel = pin("pc-kernel"),
-///     gadget = pin("pi-gadget"),
-///     snaps = { pin("lxd") },
-/// }
-/// ```
-#[derive(Debug, Clone)]
-pub struct ImageDeclaration {
-    pub name: String,
-    pub version: String,
-    pub base: SnapRef,
-    pub kernel: Option<KernelEntry>,
-    pub gadget: Option<SnapRef>,
-    /// ADR-0019 escape hatch for the gadget entry — an author-pinned store
-    /// channel (`gadget = pin("pc", { channel = "…" })`). Semantics match
-    /// [`KernelEntry::channel`]: verbatim channel, no track derivation, no
-    /// declared-base check, logged override.
-    pub gadget_channel: Option<String>,
-    pub extra_snaps: Vec<SnapRef>,
-    pub bootloader: Option<BootloaderConfig>,
-    pub disk: Option<DiskLayout>,
-    pub sysctl: Vec<String>,
-    /// Extra host files staged verbatim into the rootfs (#80). The
-    /// update flow needs system tooling the base rootfs does not ship
-    /// (systemd-sysupdate), so an image can declare `files =` entries;
-    /// they land in the hashed tree before dm-verity formats it.
-    pub files: Vec<StagedFile>,
-    /// Base URL of the systemd-sysupdate payload source (ADR-0011 step
-    /// (d)); transfer files are emitted only when set — a local-source
-    /// transfer would carry no verification, and unverifiable update
-    /// config is never emitted silently.
-    pub update_source: Option<String>,
-    /// Override for the generated `nau-boot-health.service`'s
-    /// `ExecStart` (issue #78). Unset keeps [`boot::BOOT_HEALTH_EXEC`],
-    /// so existing images emit a byte-identical unit. Set it to e.g.
-    /// `/bin/true` to satisfy the try-boot health gate on demand, or
-    /// `/bin/false` to fail it deliberately (ADR-0024 §3 fixtures).
-    /// Rust-level only for now — the per-image DSL surface is a follow-up.
-    pub boot_health_exec: Option<String>,
-}
-
-/// Serialize as the name string (for `meta/snap.yaml`).
-impl Serialize for ImageDeclaration {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.name.serialize(serializer)
     }
 }
 
@@ -323,33 +189,6 @@ impl ImageDeclaration {
             update_source,
             boot_health_exec,
         })
-    }
-
-    /// Resolve every [`Self::files`] entry's `source` against the directory
-    /// of the declaring lua file (called from [`crate::lua::`
-    /// `evaluate_images_file`], the one place that knows the `--file`
-    /// path). Absolute sources pass through untouched.
-    pub fn resolve_files_against(&mut self, base_dir: &Path) {
-        for file in &mut self.files {
-            if file.source.is_relative() {
-                file.source = base_dir.join(&file.source);
-            }
-        }
-    }
-
-    /// Collect all snap references (base + kernel + gadget + extras).
-    pub fn all_snaps(&self) -> Vec<&SnapRef> {
-        let mut snaps: Vec<&SnapRef> = vec![&self.base];
-        if let Some(ref k) = self.kernel {
-            snaps.push(&k.snap);
-        }
-        if let Some(ref g) = self.gadget {
-            snaps.push(g);
-        }
-        for s in &self.extra_snaps {
-            snaps.push(s);
-        }
-        snaps
     }
 }
 
