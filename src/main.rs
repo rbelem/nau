@@ -8,8 +8,10 @@ use clap::Parser;
 use miette::{IntoDiagnostic, WrapErr};
 use nau::cache::PackageCache;
 use nau::cli::{
-    CaCommand, CacheCommand, Cli, Command, DepsCommand, IndexCommand, KeyCommand, PodCommand,
-    RuntimeCommand,
+    normalize_domain, AuditArgs, BuildArgs, CaCommand, CacheCommand, CheckArgs, Cli, Command,
+    DepsCommand, EvalArgs, ExportArgs, ImageArgs, IndexCommand, KeyCommand, LintArgs, LockArgs,
+    PeersArgs, PodCommand, PullArgs, PushArgs, RuntimeCommand, SearchArgs, ServeArgs, TestArgs,
+    VerifyImageArgs,
 };
 use nau::image::ImageDeclaration;
 use nau::index::{IndexEntry, PackageIndex, StoreRef};
@@ -20,23 +22,27 @@ use nau::snap::{PackageInput, SnapRef, SourceSpec};
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    match normalize_domain(cli.command) {
         Command::Build {
-            file,
-            stage,
-            output,
-            arch,
-            output_name,
-            source_date_epoch,
-            lockfile: lockfile_path,
-            order,
-            all,
-            cache,
-            cache_max_size,
-            target,
-            update,
-            offline,
-            json,
+            args:
+                BuildArgs {
+                    file,
+                    stage,
+                    output,
+                    arch,
+                    output_name,
+                    source_date_epoch,
+                    lockfile: lockfile_path,
+                    order,
+                    all,
+                    cache,
+                    cache_max_size,
+                    target,
+                    update,
+                    offline,
+                    json,
+                },
+            ..
         } => {
             nau::output::set_mode(json);
             // The eval worker reads this to refuse fetch() (ADR: eval-time
@@ -87,17 +93,21 @@ fn main() -> miette::Result<()> {
         }
 
         Command::Image {
-            file,
-            output,
-            arch,
-            channel,
-            cache,
-            cache_max_size,
-            output_name,
-            source_date_epoch,
-            release,
-            lockfile: lockfile_path,
-            json,
+            args:
+                ImageArgs {
+                    file,
+                    output,
+                    arch,
+                    channel,
+                    cache,
+                    cache_max_size,
+                    output_name,
+                    source_date_epoch,
+                    release,
+                    lockfile: lockfile_path,
+                    json,
+                },
+            ..
         } => {
             nau::output::set_mode(json);
             let r = cmd_image(
@@ -117,13 +127,13 @@ fn main() -> miette::Result<()> {
             r
         }
 
-        Command::VerifyImage {
+        Command::VerifyImage(VerifyImageArgs {
             device,
             manifest,
             key,
             slot,
             json,
-        } => {
+        }) => {
             nau::output::set_mode(json);
             cmd_verify_image(&device, &manifest, key.as_deref(), slot, json)
         }
@@ -154,7 +164,7 @@ fn main() -> miette::Result<()> {
             }
         },
 
-        Command::Search { query, json } => {
+        Command::Search(SearchArgs { query, json }) => {
             nau::output::set_mode(json);
             cmd_search(&query, json);
             Ok(())
@@ -164,35 +174,35 @@ fn main() -> miette::Result<()> {
 
         Command::Doctor { pod, fix, from } => cmd_doctor(pod, fix, from.as_deref()),
 
-        Command::Check { file, json } => {
+        Command::Check(CheckArgs { file, json }) => {
             nau::output::set_mode(json);
             cmd_check(&file, json)
         }
 
-        Command::Lint {
+        Command::Lint(LintArgs {
             file,
             pod,
             channel,
             json,
-        } => cmd_lint(file, pod, channel, json),
+        }) => cmd_lint(file, pod, channel, json),
 
-        Command::Audit {
+        Command::Audit(AuditArgs {
             file,
             lockfile,
             update,
             json,
-        } => cmd_audit(file, lockfile, update, json),
+        }) => cmd_audit(file, lockfile, update, json),
 
-        Command::Lock {
+        Command::Lock(LockArgs {
             file,
             lockfile,
             json,
-        } => {
+        }) => {
             nau::output::set_mode(json);
             cmd_lock(file, lockfile)
         }
 
-        Command::Eval {
+        Command::Eval(EvalArgs {
             file,
             output,
             output_name,
@@ -201,7 +211,7 @@ fn main() -> miette::Result<()> {
             lockfile: lockfile_path,
             offline,
             json,
-        } => {
+        }) => {
             nau::output::set_mode(json);
             if offline {
                 std::env::set_var("NAU_OFFLINE", "1");
@@ -236,7 +246,7 @@ fn main() -> miette::Result<()> {
             app_args,
         } => cmd_run(pod.as_deref(), root.as_deref(), app.as_deref(), &app_args),
 
-        Command::Test {
+        Command::Test(TestArgs {
             image,
             timeout,
             accel,
@@ -248,7 +258,7 @@ fn main() -> miette::Result<()> {
             allow_no_completion,
             qemu_args,
             json,
-        } => {
+        }) => {
             nau::output::set_mode(json);
             cmd_test(
                 image,
@@ -265,7 +275,7 @@ fn main() -> miette::Result<()> {
             )
         }
 
-        Command::Push {
+        Command::Push(PushArgs {
             reference,
             dir,
             snap,
@@ -277,7 +287,7 @@ fn main() -> miette::Result<()> {
             mount_from,
             record,
             json,
-        } => {
+        }) => {
             nau::output::set_mode(json);
             cmd_push(
                 &reference,
@@ -293,7 +303,7 @@ fn main() -> miette::Result<()> {
             )
         }
 
-        Command::Pull {
+        Command::Pull(PullArgs {
             reference,
             out_dir,
             username,
@@ -305,7 +315,7 @@ fn main() -> miette::Result<()> {
             pod,
             allow_downgrade,
             json,
-        } => {
+        }) => {
             nau::output::set_mode(json);
             run_pull(
                 &reference,
@@ -321,24 +331,24 @@ fn main() -> miette::Result<()> {
             )
         }
 
-        Command::Serve {
+        Command::Serve(ServeArgs {
             address,
             port,
             announce,
             pod,
-        } => cmd_serve(address.as_deref(), port, announce, pod.as_deref()),
+        }) => cmd_serve(address.as_deref(), port, announce, pod.as_deref()),
 
-        Command::Peers { secs, json } => {
+        Command::Peers(PeersArgs { secs, json }) => {
             nau::output::set_mode(json);
             cmd_peers(secs)
         }
 
-        Command::Export {
+        Command::Export(ExportArgs {
             out,
             pod,
             mission,
             file,
-        } => cmd_export(&out, pod.as_deref(), mission.as_deref(), file.as_deref()),
+        }) => cmd_export(&out, pod.as_deref(), mission.as_deref(), file.as_deref()),
 
         Command::EvalWorker => nau::isolate::worker_main(),
 
@@ -351,6 +361,21 @@ fn main() -> miette::Result<()> {
         Command::Workers { command } => {
             nau::provision::workers_main(command, crate::wrapped_build_pending_jobs)
         }
+
+        // External fallthrough (ADR-0049 Decision 5): reachable only
+        // when no real variant matched — run_external validates the
+        // verb charset and resolves `nau-<verb>` (exe-dir sibling,
+        // then PATH) before exec'ing it.
+        Command::External(argv) => nau::cli::run_external(&argv),
+
+        // Unreachable: normalize_domain folds every ADR-0049 namespace
+        // group onto the legacy variants above. Kept for match
+        // exhaustiveness.
+        Command::Chart { .. }
+        | Command::Ship { .. }
+        | Command::Peer { .. }
+        | Command::Trust { .. }
+        | Command::Pool { .. } => unreachable!("normalize_domain folds the namespace groups"),
     }
 }
 
@@ -485,16 +510,20 @@ fn resolve_build_outputs(
 /// line, not the build's progress.
 pub(crate) fn wrapped_build_pending_jobs(command: &[String]) -> miette::Result<(usize, u32)> {
     let Command::Build {
-        file,
-        output_name,
-        arch,
-        all,
-        cache,
-        cache_max_size,
-        target,
-        update,
-        offline,
-        lockfile: lockfile_path,
+        args:
+            BuildArgs {
+                file,
+                output_name,
+                arch,
+                all,
+                cache,
+                cache_max_size,
+                target,
+                update,
+                offline,
+                lockfile: lockfile_path,
+                ..
+            },
         ..
     } = nau::cli::wrapped_build(command)?
     else {
@@ -1034,6 +1063,8 @@ fn ensure_dep_payload(
         None,
         dep_prefix.as_ref().map(|t| t.path()),
         Some(&scan_listings),
+        // Not a drift-observation point.
+        false,
     )?;
     if !json && !quiet {
         nau::output::ok(&result.snap_filename);
@@ -1624,6 +1655,8 @@ fn build_dep_archs(
             None,
             build_prefix.as_ref().map(|p| p.path()),
             Some(&scan_listings),
+            // Not a drift-observation point.
+            false,
         ) {
             Ok(result) => {
                 if !json && !quiet {
@@ -1796,6 +1829,8 @@ fn build_one_arch(
         None,
         build_prefix.as_ref().map(|p| p.path()),
         Some(&scan_listings),
+        // Not a drift-observation point.
+        false,
     )?;
     if !json {
         nau::output::ok(&result.snap_filename);

@@ -1,7 +1,7 @@
 //! The SSH transport (T4, ADR-0040 Decisions 4–7 / ADR-0045 Decision 4),
 //! driven through a loopback harness: the worker side is played in-process
 //! by a scripted `CommandRunner` fake that runs the REAL verbs — the real
-//! local tar, the real extraction, the real `__worker-job` execution for
+//! local tar, the real extraction, the real `pool job` execution for
 //! the build-less hello fixture — so every byte the coordinator hashes,
 //! ships, verifies, and ingests is real. `ssh://localhost` is the
 //! address under test throughout; no network, no sshd, no keyscan.
@@ -164,7 +164,7 @@ impl LoopbackWorker {
                 "empty ssh argv",
             ));
         };
-        if cmd.contains("__worker-cap") {
+        if cmd.contains("pool probe") {
             if self.deny_cap {
                 return Ok(RunnerOutput {
                     code: 255,
@@ -174,7 +174,7 @@ impl LoopbackWorker {
             }
             return Ok(Self::ok(serde_json::to_string(&self.cap).unwrap()));
         }
-        if cmd.contains("__worker-job") {
+        if cmd.contains("pool job") {
             return self.job(cmd);
         }
         if cmd.starts_with("rm -rf") {
@@ -241,7 +241,7 @@ impl LoopbackWorker {
         ))
     }
 
-    /// `nau __worker-job <job.json>` — the real verb for the hello
+    /// `nau pool job <job.json>` — the real verb for the hello
     /// fixture, or the scripted document for transport-only scenarios.
     fn job(&self, cmd: &str) -> io::Result<RunnerOutput> {
         let job_file = self
@@ -642,7 +642,7 @@ fn preflight_happy_and_the_pinned_bounded_argv() {
     assert_eq!(calls[0][0], "ssh-keygen");
     assert_eq!(ssh_hops, 2, "cap probe, then the store listing");
     let argv = calls.iter().find(|a| a[0] == "ssh").expect("the ssh dial");
-    assert_eq!(argv[argv.len() - 1], "nau __worker-cap");
+    assert_eq!(argv[argv.len() - 1], "nau pool probe");
     assert_eq!(argv[argv.len() - 2], "localhost");
     for opt in [
         "-o",
@@ -1531,7 +1531,7 @@ fn all_objects_held_means_no_transfer_at_all() {
     assert!(
         LoopbackWorker::any_call(&calls, |argv| argv
             .last()
-            .is_some_and(|c| c.contains("__worker-job"))),
+            .is_some_and(|c| c.contains("pool job"))),
         "the job ran"
     );
 }
@@ -1750,7 +1750,7 @@ fn corrupt_claimed_object_refuses_before_anything_runs() {
     assert!(
         !LoopbackWorker::any_call(&calls, |argv| argv
             .last()
-            .is_some_and(|c| c.contains("__worker-job"))),
+            .is_some_and(|c| c.contains("pool job"))),
         "nothing dispatched after a failed claim check"
     );
     assert_eq!(LoopbackWorker::count_program(&calls, "tar"), 0);
@@ -1792,7 +1792,7 @@ fn corruption_in_flight_refuses_before_commit() {
     assert!(
         !LoopbackWorker::any_call(&calls, |argv| argv
             .last()
-            .is_some_and(|c| c.contains("__worker-job"))),
+            .is_some_and(|c| c.contains("pool job"))),
         "the job never ran"
     );
 }
@@ -1964,7 +1964,7 @@ fn result_document_build_ms_is_carried_and_stays_optional() {
 }
 
 /// The REAL worker verb measures its build child: a loopback dispatch
-/// running the actual `__worker-job` reports a build wall, and the
+/// running the actual `pool job` reports a build wall, and the
 /// ingest record carries it for later runs.
 #[test]
 fn real_worker_job_reports_its_build_wall() {

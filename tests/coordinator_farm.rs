@@ -1011,7 +1011,7 @@ struct LoopbackWorker {
     /// What `ssh-keygen -lf` reports for any key file — the CA-form pin
     /// resolution seam (must match the pinned fingerprint).
     reported_fingerprint: String,
-    /// Sleep injected into the `__worker-job` handler — a known remote
+    /// Sleep injected into the `pool job` handler — a known remote
     /// build wall the timing assertions bound loosely (#302).
     job_delay_ms: u64,
     /// The build_ms the scripted result document reports — the injected
@@ -1058,14 +1058,14 @@ impl LoopbackWorker {
         let Some(cmd) = argv.last() else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
         };
-        if cmd.contains("__worker-cap") {
+        if cmd.contains("pool probe") {
             return Ok(RunnerOutput {
                 code: 0,
                 stdout: serde_json::to_vec(&self.cap).unwrap(),
                 stderr: String::new(),
             });
         }
-        if cmd.contains("__worker-job") {
+        if cmd.contains("pool job") {
             return self.job(cmd);
         }
         if cmd.starts_with("rm -rf") {
@@ -1118,7 +1118,7 @@ impl LoopbackWorker {
         ))
     }
 
-    /// `nau __worker-job <job.json>`: write the scripted artifact
+    /// `nau pool job <job.json>`: write the scripted artifact
     /// into the job's out dir and print the result document.
     fn job(&self, cmd: &str) -> io::Result<RunnerOutput> {
         if self.job_delay_ms > 0 {

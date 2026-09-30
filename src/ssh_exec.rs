@@ -140,7 +140,7 @@ pub struct DispatchOutcome {
     /// The fine legs (#309) — window 6 measured ~19s of fixed
     /// per-dispatch cost total−sync−build; these decompose it:
     /// `prep` = per-dispatch preflight + prepare_job_dir (channel
-    /// probes + job-dir round-trips), `run` = the `__worker-job` ssh
+    /// probes + job-dir round-trips), `run` = the `pool job` ssh
     /// leg (worker bootstrap + build; `result.build_ms` covers the
     /// build child inside it), `collect` = collect_and_ingest (scp +
     /// #307 store persist) + the job-dir cleanup. Zero on a
@@ -346,7 +346,7 @@ impl<R: CommandRunner> SshExecutor<R> {
     /// The snap arch this worker's entry DECLARES (its `arch` override
     /// mapped through the triplet rules); `None` when undeclared, which
     /// accepts any reported arch. The bare preflight asserts this against
-    /// the worker's `__worker-cap` report before anything dispatches —
+    /// the worker's `pool probe` report before anything dispatches —
     /// a declared-vs-reported mismatch is a config error refused at
     /// preflight, not a mid-run world-stopper (#193 review F1).
     pub fn declared_arch(&self) -> Option<&str> {
@@ -780,7 +780,8 @@ impl<R: CommandRunner> SshExecutor<R> {
     }
 
     /// Probe → assert (ADR-0040 D8: every failure names its probe).
-    /// Runs `__worker-cap` and refuses, by name, on reachability, an
+    /// Runs `pool probe` (the revealed ADR-0049 spelling of
+    /// `__worker-cap`) and refuses, by name, on reachability, an
     /// unparseable cap document, protocol version, arch, bwrap, the
     /// functioning-sandbox probe, mksquashfs, the mksquashfs fleet pin,
     /// or free disk.
@@ -792,7 +793,7 @@ impl<R: CommandRunner> SshExecutor<R> {
         // denied" probe must say which identity sources were consulted.
         let identity_tried = self.ensure_identity()?;
         let stdout = self
-            .run_ssh(&format!("{REMOTE_NAU} __worker-cap"))
+            .run_ssh(&format!("{REMOTE_NAU} pool probe"))
             .map_err(|e| {
                 miette::Error::new(ChannelLoss(format!(
                     "{e}; client identity: {identity_tried}"
@@ -987,7 +988,7 @@ impl<R: CommandRunner> SshExecutor<R> {
         let run_started = Instant::now();
         let stdout = self
             .run_ssh(&format!(
-                "{REMOTE_NAU} __worker-job {REMOTE_BASE}/jobs/{id}/job.json"
+                "{REMOTE_NAU} pool job {REMOTE_BASE}/jobs/{id}/job.json"
             ))
             .wrap_err_with(|| {
                 format!(

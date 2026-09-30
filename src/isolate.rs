@@ -2,7 +2,8 @@
 //! spike `spike/src/isolate.rs`).
 //!
 //! Untrusted definitions never evaluate in-process: the parent spawns a
-//! short-lived worker (`nau __eval-worker`), ships ALL eval inputs
+//! short-lived worker (`nau chart eval-worker`, the revealed ADR-0049
+//! spelling of the hidden `__eval-worker` alias), ships ALL eval inputs
 //! (prelude, index data, pre-seeded sources, the entry source) as one JSON
 //! request on the child's stdin, and serves `require()` requests from
 //! allowlisted roots. The child sets rlimits before eval, runs Luau with a
@@ -15,7 +16,8 @@
 //! ever crosses the boundary.
 //!
 //! The strict-analyzer stage of `nau check` runs the same way: the
-//! parent spawns `nau __check-worker`, ships the definition plus every
+//! parent spawns `nau chart check-worker` (the revealed spelling of
+//! `__check-worker`), ships the definition plus every
 //! parent-resolved module source as one JSON request, and reads one JSON
 //! diagnostics array back. The analyzer never runs on untrusted sources
 //! in-process; timeouts (wall-clock kill or the in-worker analyzer bound)
@@ -492,7 +494,12 @@ pub fn run_eval_raw(req: &EvalRequest) -> miette::Result<EvalRun> {
     let scratch = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create eval scratch dir: {e}"))?;
     let mut child = Command::new(worker_exe())
-        .arg("__eval-worker")
+        // The revealed spelling (ADR-0049, #321). Discovery stays
+        // current_exe() self-re-exec — no env override, no PATH fallback
+        // (ADR-0010). The hidden `__eval-worker` alias keeps parsing for
+        // one migration window.
+        .arg("chart")
+        .arg("eval-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1183,7 +1190,8 @@ fn run_worker(req: &EvalRequest) -> WorkerOutcome {
     })
 }
 
-/// Entry point for `nau __eval-worker`. Reads one JSON request from
+/// Entry point for `nau chart eval-worker` (the hidden `__eval-worker`
+/// alias keeps parsing for the migration window). Reads one JSON request from
 /// stdin, evaluates, writes one JSON outcome to stdout, exits.
 pub fn worker_main() -> miette::Result<()> {
     if let Err(e) = set_rlimits(RLIMIT_CPU_SECS) {
@@ -1248,7 +1256,10 @@ pub fn run_check_raw(req: &CheckRequest) -> miette::Result<CheckRun> {
     let scratch = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create check scratch dir: {e}"))?;
     let mut child = Command::new(worker_exe())
-        .arg("__check-worker")
+        // The revealed spelling (ADR-0049, #321); same discovery ruling
+        // as the eval worker above.
+        .arg("chart")
+        .arg("check-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1419,7 +1430,7 @@ fn run_check_worker(req: &CheckRequest) -> CheckOutcome {
     checker.check_bounded(&req.label, &req.entry)
 }
 
-/// Entry point for `nau __check-worker` (the strict-analyzer stage
+/// Entry point for `nau chart check-worker` (the strict-analyzer stage
 /// subprocess). One JSON request on stdin, one JSON diagnostics array on
 /// stdout, exit.
 pub fn check_worker_main() -> miette::Result<()> {

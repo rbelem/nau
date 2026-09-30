@@ -46,7 +46,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::cli::WorkersCommand;
+use crate::cli::{
+    WorkersBurstArgs, WorkersCommand, WorkersDestroyArgs, WorkersDownArgs, WorkersIssueArgs,
+    WorkersPickupArgs, WorkersProvisionArgs,
+};
 
 /// `--wait` cadence and default ceiling (#299): guests publish their host
 /// key 1-4 min after server create (boot + binary download); ten minutes
@@ -227,18 +230,19 @@ fn scaleway_credentials_source() -> Option<String> {
 /// computation, injected for `--count auto` (#304 — see [`BurstSizing`]).
 pub fn workers_main(command: WorkersCommand, burst_sizing: BurstSizing) -> miette::Result<()> {
     match command {
-        WorkersCommand::Provision {
-            provider,
-            server_type,
-            location,
-            count,
-            ttl,
-            spot,
-            max_price,
-            preemptible,
-            dry_run,
-            file,
-        } => {
+        WorkersCommand::Provision(args) => {
+            let WorkersProvisionArgs {
+                provider,
+                server_type,
+                location,
+                count,
+                ttl,
+                spot,
+                max_price,
+                preemptible,
+                dry_run,
+                file,
+            } = args;
             let req = ProvisionRequest {
                 server_type,
                 location,
@@ -255,60 +259,73 @@ pub fn workers_main(command: WorkersCommand, burst_sizing: BurstSizing) -> miett
             };
             provision_main(&provider, req, run_publish_channel(dry_run)?)
         }
-        WorkersCommand::Destroy {
-            provider,
-            name,
-            file,
-        } => {
+        WorkersCommand::Destroy(args) => {
+            let WorkersDestroyArgs {
+                provider,
+                name,
+                file,
+            } = args;
             let provisioner = provider_for(&provider, None)?;
             let evicted = provisioner.destroy(&name, Path::new(&file))?;
             crate::output::ok(destroy_summary(&name, evicted));
             Ok(())
         }
         WorkersCommand::ReceivePublish => receive_publish_main(),
-        WorkersCommand::Issue {
-            home,
-            identity,
-            validity,
-            force,
-            json,
-            wait,
-            timeout,
-        } => issue_main(
-            home,
-            identity.as_deref(),
-            &validity,
-            force,
-            json,
-            wait,
-            timeout,
-        ),
-        WorkersCommand::Pickup { home } => pickup_main(home),
-        WorkersCommand::Burst {
-            provider,
-            server_type,
-            location,
-            count,
-            max,
-            ttl,
-            timeout,
-            keep,
-            file,
-            command,
-        } => burst_main(
-            &provider,
-            server_type,
-            location,
-            count,
-            max,
-            &ttl,
-            timeout,
-            keep,
-            &file,
-            command,
-            burst_sizing,
-        ),
-        WorkersCommand::Down { provider, file, .. } => down_all_managed_main(&provider, &file),
+        WorkersCommand::Issue(args) => {
+            let WorkersIssueArgs {
+                home,
+                identity,
+                validity,
+                force,
+                json,
+                wait,
+                timeout,
+            } = args;
+            issue_main(
+                home,
+                identity.as_deref(),
+                &validity,
+                force,
+                json,
+                wait,
+                timeout,
+            )
+        }
+        WorkersCommand::Pickup(args) => {
+            let WorkersPickupArgs { home } = args;
+            pickup_main(home)
+        }
+        WorkersCommand::Burst(args) => {
+            let WorkersBurstArgs {
+                provider,
+                server_type,
+                location,
+                count,
+                max,
+                ttl,
+                timeout,
+                keep,
+                file,
+                command,
+            } = args;
+            burst_main(
+                &provider,
+                server_type,
+                location,
+                count,
+                max,
+                &ttl,
+                timeout,
+                keep,
+                &file,
+                command,
+                burst_sizing,
+            )
+        }
+        WorkersCommand::Down(args) => {
+            let WorkersDownArgs { provider, file, .. } = args;
+            down_all_managed_main(&provider, &file)
+        }
     }
 }
 
