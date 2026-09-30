@@ -176,20 +176,20 @@ from two live runs (2026-09-29); every step was executed, not planned.
    `/lib64/ld-linux-x86-64.so.2`, rpath removed — unpatched, the
    nix-linked binary dies on Ubuntu with "required file not found".
 2. **Provision.**
-   `nau workers provision --provider hetzner --type ccx13 --location
+   `nau pool provision --provider hetzner --type ccx13 --location
    hel1 --count 1 --ttl 1h --file <proj>/nau.lua`. The `hcloud` CLI
    resolves ONLY inside `nix shell nixpkgs#hcloud -c ...`; the token is
    SM `HETZNER_WORKER_TOKEN` via the secrets cache (DECISION SLOT A),
    never `TOFU_INPUTS` (§1).
-3. **Issue is explicit AND racy (proven live).** `nau workers issue`
+3. **Issue is explicit AND racy (proven live).** `nau pool issue`
    signs only identities whose publish has landed in the pending store,
    and a guest's publish lands 1-4 minutes after server create (boot +
    binary download). An issue run too early signs NOTHING and the guest
    polls its cert for the whole token window (pickup-host-cert:
-   1440 × 60s). #299 productized the wait: `nau workers issue --wait`
+   1440 × 60s). #299 productized the wait: `nau pool issue --wait`
    polls (~5s) until every published identity is signed, with a loud
    named timeout (default ceiling 600s). The manual fallback — run
-   `nau workers issue`, probe the cert, repeat — still works, but probe
+   `nau pool issue`, probe the cert, repeat — still works, but probe
    the CERT (`test -s /etc/ssh/sshd_config.d/nau-host-cert.conf`), not
    just the ssh login: a login success says nothing about the cert.
 4. **Workers-table gotchas.** `local_jobs` must sit OUTSIDE the
@@ -199,9 +199,9 @@ from two live runs (2026-09-29); every step was executed, not planned.
 5. **Build + destroy in ONE window.** Dedicated vCPU is too expensive
    to idle (operator directive, §1.3) — the TTL sweep is the backstop,
    not the plan. Destroy in the same session that built — or use
-   `nau workers burst … -- <cmd>` (#301), which wraps provision → issue
+   `nau pool burst … -- <cmd>` (#301), which wraps provision → issue
    --wait → command → destroy (failure and Ctrl-C included) in one
-   command; `--keep` parks the window, `nau workers down --all-managed`
+   command; `--keep` parks the window, `nau pool down --all-managed`
    drains it later.
 6. **Client identity is pinned (#298).** Provision records the resolved
    key path as the entry's `identity` field, and the executor presents
@@ -524,7 +524,7 @@ The sweep runs with the §1 worker token in the environment
 6. §7 release-to-flash — the trust-chain procedure, the operator gate
    for "first real flash by anyone" (#292): needs §3 serving the media
    set, the ceremony keychain (§7.1), and a pinned epoch (§7.2).
-7. Live verification of the cache lane (`nau pull` against the real
+7. Live verification of the cache lane (`nau ship pull` against the real
    host) waits for the Nau host to exist (CACHE-SPEC "Not proven yet") —
    do not attempt before that.
 
@@ -535,7 +535,7 @@ boot — the gate before anyone's first real flash. Each step cites its
 contract; none of it runs automatically.
 
 > **THE OUT-OF-BAND RULE (ADR-0033 D7) — anchors and key material travel
-> OUT-OF-BAND, NEVER from the medium being verified.** `verify-image`'s
+> OUT-OF-BAND, NEVER from the medium being verified.** `image verify`'s
 > `--key` MERGES into the ANY-anchor set beside `~/.config/nau/keys/*.pub`
 > (src/image/verify.rs, the ADR-0024 §4 anchor policy), so a key fetched from
 > the same download lane as the manifest verifies the attacker's own manifest
@@ -545,10 +545,10 @@ contract; none of it runs automatically.
 ### 7.1 Key ceremony (operator-executed — pointer)
 
 The ceremony is ADR-0024's, executed by the operator; this runbook does
-not re-derive it. The CLI surface is `nau key
+not re-derive it. The CLI surface is `nau trust
 keygen|rotate|promote|revoke|list|verify` (ADR-0024 §4, landed via
 #64/#51); operator anchors install under `~/.config/nau/keys/*.pub` —
-the keychain `verify-image` trusts by default, and the same ceremony key's
+the keychain `image verify` trusts by default, and the same ceremony key's
 sysupdate identity bakes into the base rootfs as
 `/usr/lib/systemd/import-pubring.pgp` (the device-side anchor). That
 keychain is the ONLY legitimate source of `--key` files anywhere below.
@@ -585,7 +585,7 @@ can audit the chain without reading systemd sources:
 
 ### 7.2 Pin SOURCE_DATE_EPOCH — and what it does NOT move (#289)
 
-`nau image --release` refuses to run with the epoch unset (the CLI
+`nau image build --release` refuses to run with the epoch unset (the CLI
 refuses a release without a pinned epoch, ADR-0044 D8). Export it for the
 whole release session:
 
@@ -610,7 +610,7 @@ UUIDs); only the anchor identity is exempted.
 ```bash
 # source: ADR-0044 D5 — named artifacts in the ADR-0033 D10 export tree;
 # src/image/release.rs module doc
-nau image --release
+nau image build --release
 ```
 
 Emits `nau-<mission>-<version>-<arch>.img`, the SIGNED
@@ -650,7 +650,7 @@ before it boots anything:
 # source: ADR-0044 D4 + #288. No --key needed with the ceremony keychain
 # installed (§7.1); --key, when used, is a ceremony-keychain copy — never
 # a file the download lane supplied (out-of-band rule above).
-nau verify-image --device /dev/disk/by-id/<target> \
+nau image verify --device /dev/disk/by-id/<target> \
     --manifest nau-<mission>-<version>-<arch>.manifest.json
 ```
 

@@ -35,7 +35,7 @@ pkgs/o/openssl.lua          # package: openssl (single file)
 
 ## Usage with the index
 
-The `nau index` command can scan `pkgs/` to build `package-index.json`,
+The `nau chart index` command can scan `pkgs/` to build `package-index.json`,
 which the `index()` DSL function uses at require time.
 
 ## Adding a package

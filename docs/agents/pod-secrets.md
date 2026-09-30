@@ -5,7 +5,7 @@ references, never values; values resolve at **serve time** through
 built-in **secret sources** and reach consumers through the existing
 env contract (ADR-0030). There is no credential material anywhere in
 the declaration, the lockfile, or the generation tree — the two value
-surfaces are the POSIX exports of `pod shellenv`/`nau run` and the
+surfaces are the POSIX exports of `pod shellenv`/`nau pod run` and the
 0600 services envfile, both under the session tmpfs.
 
 ## Declaration surface
@@ -70,7 +70,7 @@ secret).
 ## Serve-time semantics
 
 **One resolve entry point serves three consumers.** `pod shellenv`
-(exports after the `env` lines), the `nau run` overlay (declared
+(exports after the `env` lines), the `nau pod run` overlay (declared
 replaces inherited, same rule as env), and services (units reference a
 0600 `EnvironmentFile=` rendered *without* the `-` prefix — a missing
 file fails the unit start and names the path, never a silent

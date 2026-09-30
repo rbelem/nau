@@ -100,7 +100,7 @@ for the tries suffix (`nau-80_2.0+3-0.efi` installed by sysupdate,
    `src/lua.rs`, `src/image/staging.rs`): stage extra host files into the
    rootfs before it is hashed (needed for the sysupdate tooling the base
    lacks).
-5. **`nau test --qemu-arg`** (`src/cli.rs`, `src/main.rs`,
+5. **`nau image test --qemu-arg`** (`src/cli.rs`, `src/main.rs`,
    `src/boot_test.rs`): pass-through QEMU argv tokens, used for guest
    networking (`--qemu-arg=-nic --qemu-arg user,model=virtio-net-pci`).
 

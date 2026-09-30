@@ -23,10 +23,10 @@ Linux first (any distro, NixOS, WSL2); macOS is not supported yet.
 
 ```bash
 # Build a snap from source
-nau build --file examples/jq-from-source/nau.lua
+nau build snap --file examples/jq-from-source/nau.lua
 
 # Build a system image from pinned snaps
-nau image --file nau.lua --source-date-epoch 0
+nau image build --file nau.lua --source-date-epoch 0
 ```
 
 ## Dev Environment (devbox)

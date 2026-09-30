@@ -115,11 +115,11 @@ mkdir pkgs/<first-letter>/<name>
 vim pkgs/<first-letter>/<name>/init.lua
 ```
 
-**Resolve dependencies:** `nau deps pkgs/g/gcc --recursive --flat`
+**Resolve dependencies:** `nau chart deps pkgs/g/gcc --recursive --flat`
 
-**Check build order:** `nau build --order --file examples/full-system/system-base/nau.lua`
+**Check build order:** `nau build snap --order --file examples/full-system/system-base/nau.lua`
 
-**Register in index:** `nau index add <name> --alias <alias>`
+**Register in index:** `nau chart index add <name> --alias <alias>`
 
 **Test:** `devbox run test` (93 tests, clippy clean)
 
