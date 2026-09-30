@@ -226,9 +226,10 @@ fn scaleway_credentials_source() -> Option<String> {
 }
 
 /// CLI entry for `nau workers provision` / `nau workers destroy` /
-/// `nau workers receive-publish`. `burst_sizing` is the binary's pending
-/// computation, injected for `--count auto` (#304 — see [`BurstSizing`]).
-pub fn workers_main(command: WorkersCommand, burst_sizing: BurstSizing) -> miette::Result<()> {
+/// `nau workers receive-publish`. Burst sizing (#304) calls the
+/// library's own wrapped-build helper — since #313 the orchestration
+/// lives in the library, so there is nothing left to inject.
+pub fn workers_main(command: WorkersCommand) -> miette::Result<()> {
     match command {
         WorkersCommand::Provision(args) => {
             let WorkersProvisionArgs {
@@ -319,7 +320,6 @@ pub fn workers_main(command: WorkersCommand, burst_sizing: BurstSizing) -> miett
                 keep,
                 &file,
                 command,
-                burst_sizing,
             )
         }
         WorkersCommand::Down(args) => {
@@ -665,12 +665,6 @@ pub fn refuse_burst_above_max(count: u32, max: u32) -> miette::Result<()> {
     Ok(())
 }
 
-/// The bin-side sizing source (#304): the wrapped build's pending jobs +
-/// jobs-per-worker. A function pointer because provision lives in the
-/// library while the pending computation lives in the binary's build
-/// orchestrator — the binary injects it, the library only sizes from it.
-pub type BurstSizing = fn(&[String]) -> miette::Result<(usize, u32)>;
-
 /// The `--count auto` rule (#304), pure for testability: min(--max,
 /// ceil(pending / jobs_per_worker)) — and zero pending refuses, since
 /// provisioning an idle fleet is pure hourly bill. The decision is named
@@ -699,7 +693,6 @@ fn resolve_burst_count(
     count: crate::cli::BurstCount,
     max: u32,
     command: &[String],
-    sizing: BurstSizing,
 ) -> miette::Result<u32> {
     match count {
         crate::cli::BurstCount::Fixed(n) => {
@@ -707,7 +700,8 @@ fn resolve_burst_count(
             Ok(n)
         }
         crate::cli::BurstCount::Auto => {
-            let (pending, jobs_per_worker) = sizing(command)?;
+            let (pending, jobs_per_worker) =
+                crate::farm_dispatch::wrapped_build_pending_jobs(command)?;
             burst_auto_count(pending, jobs_per_worker, max)
         }
     }
@@ -729,7 +723,6 @@ fn burst_main(
     keep: bool,
     file: &str,
     command: Vec<String>,
-    sizing: BurstSizing,
 ) -> miette::Result<()> {
     if command.is_empty() {
         // Unreachable through clap (`num_args(1..)`); kept fail-closed
@@ -738,7 +731,7 @@ fn burst_main(
             "workers burst: no wrapped command — give it after '--'"
         ));
     }
-    let count = resolve_burst_count(count, max, &command, sizing)?;
+    let count = resolve_burst_count(count, max, &command)?;
     let req = ProvisionRequest {
         server_type,
         location,
