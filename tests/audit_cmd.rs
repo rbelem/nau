@@ -185,7 +185,8 @@ struct AuditRun {
 fn run_audit(lockfile: &str, url: &str, cache_dir: &std::path::Path, extra: &[&str]) -> AuditRun {
     let bin = env!("CARGO_BIN_EXE_nau");
     let mut cmd = Command::new(bin);
-    cmd.arg("audit")
+    cmd.arg("chart")
+        .arg("audit")
         .arg("--lockfile")
         .arg(lockfile)
         .args(extra)

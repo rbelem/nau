@@ -1,4 +1,4 @@
-//! `nau image --release` ↔ `nau verify-image` interop, end to end
+//! `nau image --release` ↔ `nau image verify` interop, end to end
 //! (ADR-0044 D4+D5, issues #266 and #265).
 //!
 //! The trust contract: the release signer attaches the operator's Ed25519
@@ -10,7 +10,7 @@
 //! roothash — but the manifest is signed by the RELEASE signer, exactly
 //! as `--release` publishes it (pretty JSON with the signatures map
 //! attached), then round-tripped through the file system into
-//! `nau verify-image`.
+//! `nau image verify`.
 //!
 //! Gated on sfdisk + veritysetup + mtools (the build-host tools the suite
 //! spawns; the fixture ESP is a real mtools FAT — #284's covered region).
@@ -296,7 +296,8 @@ fn write_release_signed_manifest(path: &std::path::Path, roothash: &str, uki_sha
 fn run_verify(fx: &Fixture, manifest: &std::path::Path) -> (Option<i32>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args([
-            "verify-image",
+            "image",
+            "verify",
             "--device",
             fx.device.to_str().unwrap(),
             "--manifest",
@@ -378,7 +379,8 @@ gated_test!(revoked_release_key_refuses, {
 
     let out = Command::new(env!("CARGO_BIN_EXE_nau"))
         .args([
-            "verify-image",
+            "image",
+            "verify",
             "--device",
             fx.device.to_str().unwrap(),
             "--manifest",

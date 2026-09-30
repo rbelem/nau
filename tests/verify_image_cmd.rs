@@ -1,4 +1,4 @@
-//! `nau verify-image` end to end (ADR-0044 D4, issue #265).
+//! `nau image verify` end to end (ADR-0044 D4, issue #265).
 //!
 //! Builds a REAL whole-disk GPT image file — sfdisk lays out ESP + root +
 //! verity-hash partitions with the build's type GUIDs and the identity
@@ -343,7 +343,8 @@ fn run_in(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String, String)
 
 fn verify_args(fx: &Fixture) -> Vec<String> {
     vec![
-        "verify-image".into(),
+        "image".into(),
+        "verify".into(),
         "--device".into(),
         fx.device.to_str().unwrap().into(),
         "--manifest".into(),
@@ -455,7 +456,8 @@ gated_test!(verify_image_refuses_an_unsigned_manifest, {
     std::fs::write(&unsigned, serde_json::to_string_pretty(&v).unwrap()).unwrap();
 
     let args = vec![
-        "verify-image".to_string(),
+        "image".to_string(),
+        "verify".to_string(),
         "--device".to_string(),
         fx.device.to_str().unwrap().to_string(),
         "--manifest".to_string(),
@@ -627,7 +629,8 @@ gated_test!(verify_image_refuses_a_manifest_predating_esp_coverage, {
     std::fs::write(&legacy, serde_json::to_string_pretty(&reduced).unwrap()).unwrap();
 
     let args = vec![
-        "verify-image".to_string(),
+        "image".to_string(),
+        "verify".to_string(),
         "--device".to_string(),
         fx.device.to_str().unwrap().to_string(),
         "--manifest".to_string(),

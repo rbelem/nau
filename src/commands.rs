@@ -2174,6 +2174,29 @@ fn cmd_pod_refresh(root: &Path, pod_name: &str, members: &[String]) -> miette::R
 }
 
 pub fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
+    // `pod run` carries the legacy `nau run` flag surface: its `--pod`
+    // is the run verb's own flag, not the pod-domain `--name`. The
+    // pre-verb `--name` still selects the pod, so the two merge
+    // fail-closed here — then the IDENTICAL handler the legacy spelling
+    // dispatches to runs (cmd_run, via main()'s `Command::Run` arm).
+    if let PodCommand::Run { args } = sub {
+        let pod = match (name, args.pod.as_deref()) {
+            (Some(n), Some(p)) if n != p => {
+                return Err(miette::miette!(
+                    "conflicting pod selectors: '{n}' (--name before the verb) \
+                     and '{p}' (--pod after the verb) select different pods"
+                ));
+            }
+            (Some(n), _) => Some(n.to_string()),
+            (None, p) => p.map(str::to_string),
+        };
+        return crate::commands::cmd_run(
+            pod.as_deref(),
+            args.root.as_deref(),
+            args.app.as_deref(),
+            &args.app_args,
+        );
+    }
     // Owned so `pod_name` doesn't borrow `sub` across the match's move.
     let verb_name = sub.pod_name().map(str::to_owned);
     let pod_name = merge_pod_name(name, verb_name.as_deref())?;
@@ -2233,6 +2256,9 @@ pub fn cmd_pod(name: Option<&str>, sub: PodCommand) -> miette::Result<()> {
         } => cmd_pod_rollback(pod_name, generation, root),
         PodCommand::Gc { prune, root, .. } => cmd_pod_gc(pod_name, prune, root),
         PodCommand::Secrets { command, root, .. } => cmd_pod_secrets(pod_name, command, root),
+        // Unreachable: the `pod run` arm returned above (it carries the
+        // legacy `nau run` flag surface, not the common `--name` merge).
+        PodCommand::Run { .. } => unreachable!("pod run dispatches before the verb merge"),
     }
 }
 
@@ -3331,11 +3357,60 @@ pub fn cmd_search(query: &str, json: bool) {
 // ── Completion command ──
 
 pub fn cmd_completion(shell: clap_complete::Shell) -> miette::Result<()> {
-    use clap::CommandFactory;
-    let mut cmd = Cli::command();
+    let mut cmd = visible_completion_tree();
     let name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
     Ok(())
+}
+
+/// The completion tree (ADR-0049 Decision 3b): the full [`Cli::command`]
+/// surface minus the hidden legacy spellings and the `__*` workers —
+/// they stay runnable aliases through the window, but completion offers
+/// only the visible (domain) tree.
+///
+/// Built fresh rather than pruned in place: clap's builder API has no
+/// subcommand removal, and every clap_complete generator enumerates
+/// `get_subcommands()` wholesale (none of the five shells respects
+/// `hide` for subcommands). Each visible level is rebuilt from the
+/// getters the generators actually consume — name, about/long_about,
+/// version, aliases, args (cloned verbatim: actions, hints, possible
+/// values, hide/last/global all ride along), groups, and the root's
+/// allow-external-subcommands dispatch — so the emitted scripts are
+/// faithful for everything that survives. `clap_complete::generate`
+/// builds the fresh tree, which re-adds the standard help/version
+/// surface.
+#[must_use]
+pub fn visible_completion_tree() -> clap::Command {
+    use clap::CommandFactory;
+    visible_tree(&Cli::command())
+}
+
+fn visible_tree(cmd: &clap::Command) -> clap::Command {
+    // get_name() borrows; `Str` without clap's "string" feature accepts
+    // only &'static — leak the (few-byte) copy. Bounded by the command
+    // count, and `nau completion` exits right after generating.
+    let name: &'static str = Box::leak(cmd.get_name().to_owned().into_boxed_str());
+    let mut fresh = clap::Command::new(name)
+        .hide(cmd.is_hide_set())
+        .allow_external_subcommands(cmd.is_allow_external_subcommands_set())
+        .args(cmd.get_arguments().cloned().collect::<Vec<_>>())
+        .groups(cmd.get_groups().cloned().collect::<Vec<_>>())
+        .subcommands(
+            cmd.get_subcommands()
+                .filter(|sub| !sub.is_hide_set())
+                .map(visible_tree),
+        );
+    if let Some(about) = cmd.get_about() {
+        fresh = fresh.about(about.to_owned());
+    }
+    if let Some(long_about) = cmd.get_long_about() {
+        fresh = fresh.long_about(long_about.to_owned());
+    }
+    // Subcommand aliases are not copied: the CLI defines none (its
+    // legacy spellings are separate hidden variants, not clap aliases),
+    // and `Str` without clap's "string" feature accepts only &'static
+    // names. If a real clap alias ever lands on a verb, carry it here.
+    fresh
 }
 
 // ── Index command ──
@@ -3503,5 +3578,56 @@ mod tests {
             "ok: 2 output(s): bzip2 1.0.8, hello 2.10"
         );
         assert_eq!(check_ok_message(&[]), "ok: 0 output(s)");
+    }
+
+    /// ADR-0049 Decision 3b: the completion generation emits the domain
+    /// tree — the ten namespaces are offered, the hidden legacy spellings
+    /// and the `__*` workers are not. Bash is the pinning shell here
+    /// because its output is command/flag enumeration only (no help
+    /// text), so the legacy names cannot appear in description prose.
+    #[test]
+    fn completion_offers_the_domain_tree_not_the_legacy_aliases() {
+        let mut cmd = visible_completion_tree();
+        let mut buf = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut cmd,
+            "nau".to_string(),
+            &mut buf,
+        );
+        let script = String::from_utf8(buf).unwrap();
+
+        for domain in [
+            "chart",
+            "build",
+            "image",
+            "ship",
+            "peer",
+            "trust",
+            "pool",
+            "runtime",
+            "pod",
+            "doctor",
+            "completion",
+        ] {
+            assert!(
+                script.contains(domain),
+                "the {domain} domain must be offered"
+            );
+        }
+        for legacy in [
+            "verify-image",
+            "__worker-cap",
+            "__worker-job",
+            "__eval-worker",
+            "__check-worker",
+            "peers",
+            "workers",
+        ] {
+            assert!(
+                !script.contains(legacy),
+                "the hidden legacy spelling '{legacy}' must not be offered"
+            );
+        }
     }
 }

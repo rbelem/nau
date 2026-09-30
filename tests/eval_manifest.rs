@@ -75,6 +75,7 @@ fn eval_twice_produces_byte_identical_manifests() {
         dir.path(),
         home.path(),
         &[
+            "chart",
             "eval",
             "--offline",
             "--lockfile",
@@ -89,6 +90,7 @@ fn eval_twice_produces_byte_identical_manifests() {
         dir.path(),
         home.path(),
         &[
+            "chart",
             "eval",
             "--offline",
             "--lockfile",
@@ -122,7 +124,7 @@ fn eval_stdout_and_file_output_agree() {
     let (code, stdout, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock"],
+        &["chart", "eval", "--offline", "--lockfile", "proj.lock"],
     );
     assert_eq!(code, Some(0), "stdout eval: {stderr}");
 
@@ -130,6 +132,7 @@ fn eval_stdout_and_file_output_agree() {
         dir.path(),
         home.path(),
         &[
+            "chart",
             "eval",
             "--offline",
             "--lockfile",
@@ -155,7 +158,7 @@ fn eval_manifest_carries_version_inputs_outputs_images_signatures() {
     let (code, stdout, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock"],
+        &["chart", "eval", "--offline", "--lockfile", "proj.lock"],
     );
     assert_eq!(code, Some(0), "{stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout)
@@ -237,7 +240,7 @@ return {
     let (code, stdout, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock"],
+        &["chart", "eval", "--offline", "--lockfile", "proj.lock"],
     );
     assert_eq!(code, Some(0), "lockfile pin must resolve offline: {stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -280,7 +283,7 @@ return {
     let (code, stdout, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock"],
+        &["chart", "eval", "--offline", "--lockfile", "proj.lock"],
     );
     assert_eq!(code, Some(0), "index pin must resolve offline: {stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -314,6 +317,7 @@ return {
         dir.path(),
         home.path(),
         &[
+            "chart",
             "eval",
             "--offline",
             "--lockfile",
@@ -355,7 +359,7 @@ return {}
     let (code, _, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock"],
+        &["chart", "eval", "--offline", "--lockfile", "proj.lock"],
     );
     assert_ne!(code, Some(0), "uncached github input must fail offline");
     // miette wraps with continuation bars; strip them before matching.
@@ -380,7 +384,14 @@ fn eval_selects_a_single_output_or_image() {
     let (code, stdout, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock", "system"],
+        &[
+            "chart",
+            "eval",
+            "--offline",
+            "--lockfile",
+            "proj.lock",
+            "system",
+        ],
     );
     assert_eq!(code, Some(0), "{stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -394,7 +405,14 @@ fn eval_selects_a_single_output_or_image() {
     let (code, stdout, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock", "app"],
+        &[
+            "chart",
+            "eval",
+            "--offline",
+            "--lockfile",
+            "proj.lock",
+            "app",
+        ],
     );
     assert_eq!(code, Some(0), "{stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -404,7 +422,14 @@ fn eval_selects_a_single_output_or_image() {
     let (code, _, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock", "nope"],
+        &[
+            "chart",
+            "eval",
+            "--offline",
+            "--lockfile",
+            "proj.lock",
+            "nope",
+        ],
     );
     assert_ne!(code, Some(0), "unknown selection must fail");
     assert!(stderr.contains("nope"), "named error required: {stderr}");
@@ -435,7 +460,7 @@ return { mylib = snap { name = "mylib", version = "0.1.0" } }
     let (code, stdout, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock"],
+        &["chart", "eval", "--offline", "--lockfile", "proj.lock"],
     );
     assert_eq!(code, Some(0), "{stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();

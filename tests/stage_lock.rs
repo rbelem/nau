@@ -117,6 +117,7 @@ fn spawn_build(
         std::fs::create_dir_all(&out).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
         cmd.arg("build")
+            .arg("snap")
             .arg("--output")
             .arg(&out)
             .args(&extra)

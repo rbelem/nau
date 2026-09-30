@@ -32,6 +32,7 @@ fn broken_workers_config_refuses_the_build_instead_of_building_locally() {
 
     let result = Command::new(env!("CARGO_BIN_EXE_nau"))
         .arg("build")
+        .arg("snap")
         .arg("--output")
         .arg(&out)
         .arg("--offline")
@@ -60,7 +61,7 @@ fn broken_workers_config_refuses_the_build_instead_of_building_locally() {
     );
 }
 
-// ── `workers burst --count auto` (#304): the extracted pending
+// ── `pool burst --count auto` (#304): the extracted pending
 // computation, driven end to end through the real binary. The sizing
 // decision must land on stderr BEFORE any API call — these bursts never
 // get past it (no CA, no publish channel), which is exactly the
@@ -104,11 +105,13 @@ fn burst_auto_sizes_the_wrapped_builds_pending_jobs() {
     .unwrap();
 
     // No cache, no --all overrides: all five deps are pending. With the
-    // default 2 jobs/worker and --max 4, ceil(5/2) = 3.
+    // default 2 jobs/worker and --max 4, ceil(5/2) = 3. The burst wraps
+    // the build in the ADR-0049 domain spelling — `pool burst` sizing
+    // `build snap` — the same pending set the legacy spellings size.
     let result = Command::new(env!("CARGO_BIN_EXE_nau"))
         .env("HOME", project.path())
         .args([
-            "workers",
+            "pool",
             "burst",
             "--provider",
             "hetzner",
@@ -122,13 +125,14 @@ fn burst_auto_sizes_the_wrapped_builds_pending_jobs() {
             "4",
             "--",
             "build",
+            "snap",
             "--offline",
             "--output",
             "out",
         ])
         .current_dir(project.path())
         .output()
-        .expect("failed to spawn nau workers burst");
+        .expect("failed to spawn nau pool burst");
 
     assert_ne!(
         result.status.code(),
@@ -164,7 +168,7 @@ fn burst_auto_refuses_zero_pending_before_any_api_call() {
     let result = Command::new(env!("CARGO_BIN_EXE_nau"))
         .env("HOME", project.path())
         .args([
-            "workers",
+            "pool",
             "burst",
             "--provider",
             "hetzner",
@@ -176,11 +180,12 @@ fn burst_auto_refuses_zero_pending_before_any_api_call() {
             "auto",
             "--",
             "build",
+            "snap",
             "--offline",
         ])
         .current_dir(project.path())
         .output()
-        .expect("failed to spawn nau workers burst");
+        .expect("failed to spawn nau pool burst");
 
     assert_ne!(result.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -201,7 +206,7 @@ fn burst_auto_refuses_a_non_build_wrapped_command() {
     let result = Command::new(env!("CARGO_BIN_EXE_nau"))
         .env("HOME", project.path())
         .args([
-            "workers",
+            "pool",
             "burst",
             "--provider",
             "hetzner",
@@ -217,13 +222,55 @@ fn burst_auto_refuses_a_non_build_wrapped_command() {
         ])
         .current_dir(project.path())
         .output()
-        .expect("failed to spawn nau workers burst");
+        .expect("failed to spawn nau pool burst");
 
     assert_ne!(result.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&result.stderr);
     // Short fragments only: miette wraps stderr mid-sentence.
     assert!(
         stderr.contains("echo hi"),
+        "the refusal must name the wrapped command: {stderr}"
+    );
+    assert!(
+        stderr.contains("no pending set"),
+        "the refusal must name why sizing is impossible: {stderr}"
+    );
+}
+
+#[test]
+fn burst_auto_refuses_a_domain_non_build_wrapped_command() {
+    // `build cache` sits INSIDE the build group but is not a build —
+    // the sizing must refuse it by name, never size a cache verb.
+    let project = tempfile::tempdir().unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_nau"))
+        .env("HOME", project.path())
+        .args([
+            "pool",
+            "burst",
+            "--provider",
+            "hetzner",
+            "--type",
+            "CX33",
+            "--location",
+            "hel1",
+            "--count",
+            "auto",
+            "--",
+            "nau",
+            "build",
+            "cache",
+            "info",
+        ])
+        .current_dir(project.path())
+        .output()
+        .expect("failed to spawn nau pool burst");
+
+    assert_ne!(result.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    // Short fragments only: miette wraps stderr mid-sentence.
+    assert!(
+        stderr.contains("nau build cache"),
         "the refusal must name the wrapped command: {stderr}"
     );
     assert!(

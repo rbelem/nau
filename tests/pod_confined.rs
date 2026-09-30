@@ -192,7 +192,12 @@ fn run_nau_run_with(
     env: &[(&str, &str)],
 ) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
-    cmd.arg("run").arg("--pod").arg(pod).arg("--root").arg(root);
+    cmd.arg("pod")
+        .arg("run")
+        .arg("--pod")
+        .arg(pod)
+        .arg("--root")
+        .arg(root);
     cmd.arg(app);
     for a in app_args {
         cmd.arg(a);
@@ -719,7 +724,8 @@ fn nau_run_overlays_resolved_secrets_declared_replaces_inherited() {
     let expected = "-----BEGIN RUN KEY-----\nMIIrun\n-----END RUN KEY-----";
     let run_with = |ambient: Option<&str>| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
-        cmd.arg("run")
+        cmd.arg("pod")
+            .arg("run")
             .arg("--pod")
             .arg("default")
             .arg("--root")

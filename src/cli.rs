@@ -299,28 +299,13 @@ pub enum Command {
     /// `--pod` selects the pod (default: `default`). Also the future
     /// home for env hooks.
     ///
-    /// Hidden under ADR-0049: the pod-domain reshape lands separately;
-    /// the spelling keeps working unchanged.
+    /// Hidden under ADR-0049: legacy hidden alias of `pod run` (ADR-0049)
+    /// — the spelling keeps working through the window, dispatching to
+    /// the identical handler over the shared [`RunArgs`].
     #[command(trailing_var_arg = true, hide = true)]
     Run {
-        /// App name: a declared app from the pod, or — as everything
-        /// after `--` — the start of an arbitrary command whose remaining
-        /// words are the rest of the args. Declared-first: a name that
-        /// matches a declared app always runs that app, confined.
-        app: Option<String>,
-
-        /// Pod to operate on (default: `default`).
-        #[arg(long, value_name = "POD")]
-        pod: Option<String>,
-
-        /// Pod state root (default: $XDG_DATA_HOME/nau/pods).
-        #[arg(long)]
-        root: Option<String>,
-
-        /// Arguments passed through to the app. Everything after `--` is
-        /// forwarded verbatim.
-        #[arg(trailing_var_arg = true)]
-        app_args: Vec<String>,
+        #[command(flatten)]
+        args: RunArgs,
     },
 
     /// Boot a built disk image in QEMU and assert the boot actually
@@ -1460,7 +1445,10 @@ fn burst_count(raw: &str) -> Result<BurstCount, String> {
 /// nau build, parsed through the same Cli definition the real build uses,
 /// so sizing sees exactly the flags a real build would. Anything else is
 /// a named refusal — no pending set exists to size from. Accepts the
-/// `nau build …` spelling and the bare `build …` shorthand.
+/// legacy `nau build …` spelling, the bare `build …` shorthand, and
+/// their ADR-0049 domain forms (`nau build snap …` / `build snap …` —
+/// [`normalize_domain`] folds the subcommand onto the same flat
+/// [`Command::Build`], which the sizing caller does).
 pub fn wrapped_build(command: &[String]) -> miette::Result<Command> {
     let not_a_build = || {
         miette::miette!(
@@ -2524,6 +2512,23 @@ pub enum PodCommand {
         #[arg(long)]
         root: Option<String>,
     },
+
+    /// Run an app from the pod (ADR-0016, ticket #11) — the visible
+    /// ADR-0049 spelling of the hidden `nau run` alias, over the same
+    /// shared RunArgs struct. Two forms, dispatched declared-app-first: a
+    /// declared app runs confined behind its declared grants (a
+    /// `confined` app on a host without its backend FAILS CLOSED);
+    /// `pod run [--pod N] -- <cmd…>` execs an arbitrary command with the
+    /// pod's env overlaid (farm-first PATH + loader-lib
+    /// LD_LIBRARY_PATH), no sandbox — a name that IS a declared app
+    /// always wins over the command form. TRUST BOUNDARY: the command
+    /// form runs unsandboxed with the caller's full privileges and farm
+    /// names shadow host PATH. The pre-verb pod `--name` merges
+    /// fail-closed onto the run's own `--pod`.
+    Run {
+        #[command(flatten)]
+        args: RunArgs,
+    },
 }
 
 /// Subcommands for `nau pod secrets` (ADR-0042 D3/D7/D8).
@@ -2539,6 +2544,35 @@ pub enum PodSecretsCommand {
     /// through its provider, and rewrite the active entry (rotation,
     /// ADR-0042 D3). Prunes stale-generation entries.
     Refresh,
+}
+
+/// The `nau pod run` / legacy `nau run` arguments (ADR-0049): one
+/// `#[derive(clap::Args)]` struct shared by both spellings, so each
+/// parses to the same shape and dispatches to the identical handler
+/// ([`crate::commands::cmd_run`]). The struct-level `trailing_var_arg`
+/// lands on whichever command flattens it — both the hidden top-level
+/// `run` and the visible `pod run` verb.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[command(trailing_var_arg = true)]
+pub struct RunArgs {
+    /// App name: a declared app from the pod, or — as everything after
+    /// `--` — the start of an arbitrary command whose remaining words
+    /// are the rest of the args. Declared-first: a name that matches a
+    /// declared app always runs that app, confined.
+    pub app: Option<String>,
+
+    /// Pod to operate on (default: `default`).
+    #[arg(long, value_name = "POD")]
+    pub pod: Option<String>,
+
+    /// Pod state root (default: $XDG_DATA_HOME/nau/pods).
+    #[arg(long)]
+    pub root: Option<String>,
+
+    /// Arguments passed through to the app. Everything after `--` is
+    /// forwarded verbatim.
+    #[arg(trailing_var_arg = true)]
+    pub app_args: Vec<String>,
 }
 
 /// Pod selector shared by every `nau pod` verb: the `--name` flag
@@ -2570,6 +2604,10 @@ impl PodCommand {
             | PodCommand::Rollback { target, .. }
             | PodCommand::Gc { target, .. }
             | PodCommand::Secrets { target, .. } => target.name.as_deref(),
+            // `pod run` carries the legacy `nau run` flag surface (`--pod`),
+            // not the verb-position `--name`; its pod selection merges in
+            // the cmd_pod early arm.
+            PodCommand::Run { .. } => None,
         }
     }
 }
@@ -3819,7 +3857,9 @@ mod tests {
         // the program, the rest its args — forwarded verbatim, hyphens
         // included.
         match parse_build(&["nau", "run", "--", "git", "-c", "x", "status"]) {
-            Command::Run { app, app_args, .. } => {
+            Command::Run {
+                args: RunArgs { app, app_args, .. },
+            } => {
                 assert_eq!(app.as_deref(), Some("git"));
                 assert_eq!(app_args, ["-c", "x", "status"]);
             }
@@ -3830,7 +3870,9 @@ mod tests {
     #[test]
     fn test_run_pod_flag_before_the_double_dash() {
         match parse_build(&["nau", "run", "--pod", "daily", "--", "true"]) {
-            Command::Run { app, pod, .. } => {
+            Command::Run {
+                args: RunArgs { app, pod, .. },
+            } => {
                 assert_eq!(app.as_deref(), Some("true"));
                 assert_eq!(pod.as_deref(), Some("daily"));
             }
@@ -3845,7 +3887,9 @@ mod tests {
         // confined launcher forwards `<app> "$@"` without a `--`, so the
         // positional has to stay optional.
         match parse_build(&["nau", "run"]) {
-            Command::Run { app, app_args, .. } => {
+            Command::Run {
+                args: RunArgs { app, app_args, .. },
+            } => {
                 assert_eq!(app, None);
                 assert!(app_args.is_empty());
             }
@@ -3861,13 +3905,79 @@ mod tests {
         // unknown flags.)
         match parse_build(&["nau", "run", "--pod", "work", "gcm", "cred"]) {
             Command::Run {
-                app, pod, app_args, ..
+                args: RunArgs {
+                    app, pod, app_args, ..
+                },
             } => {
                 assert_eq!(app.as_deref(), Some("gcm"));
                 assert_eq!(pod.as_deref(), Some("work"));
                 assert_eq!(app_args, ["cred"]);
             }
             _ => panic!("expected Run"),
+        }
+    }
+
+    // ── `nau pod run` — the visible ADR-0049 spelling (ADR-0049 D3a) ──
+
+    #[test]
+    fn pod_run_parses_to_the_shared_args() {
+        match parse_build(&["nau", "pod", "run", "--pod", "work", "gcm", "cred"]) {
+            Command::Pod {
+                name,
+                command: PodCommand::Run { args },
+            } => {
+                assert_eq!(name, None);
+                assert_eq!(
+                    args,
+                    RunArgs {
+                        app: Some("gcm".to_string()),
+                        pod: Some("work".to_string()),
+                        root: None,
+                        app_args: vec!["cred".to_string()],
+                    }
+                );
+            }
+            _ => panic!("expected Pod Run"),
+        }
+    }
+
+    #[test]
+    fn pod_run_and_legacy_run_parse_identically() {
+        // The two spellings land on the same shared RunArgs — identical
+        // effective flags parse identically, and both dispatch to the
+        // one cmd_run handler (main()'s `Command::Run` arm for the
+        // legacy spelling, cmd_pod's early `pod run` arm for the domain
+        // one).
+        let legacy = match parse_build(&[
+            "nau", "run", "--pod", "work", "--root", "/tmp/r", "app", "--", "x", "-y",
+        ]) {
+            Command::Run { args } => args,
+            _ => panic!("expected Run"),
+        };
+        match parse_build(&[
+            "nau", "pod", "run", "--pod", "work", "--root", "/tmp/r", "app", "--", "x", "-y",
+        ]) {
+            Command::Pod {
+                name,
+                command: PodCommand::Run { args },
+            } => {
+                assert_eq!(name, None);
+                assert_eq!(args, legacy, "both spellings parse identically");
+            }
+            _ => panic!("expected Pod Run"),
+        }
+
+        // The pre-verb `--name` still lands on the pod command itself.
+        match parse_build(&["nau", "pod", "--name", "work", "run", "app"]) {
+            Command::Pod {
+                name,
+                command: PodCommand::Run { args },
+            } => {
+                assert_eq!(name.as_deref(), Some("work"));
+                assert_eq!(args.app.as_deref(), Some("app"));
+                assert_eq!(args.pod, None);
+            }
+            _ => panic!("expected Pod Run"),
         }
     }
 

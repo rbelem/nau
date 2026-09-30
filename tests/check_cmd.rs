@@ -8,11 +8,14 @@ use std::process::Command;
 
 fn run_check(dir: &std::path::Path, json: bool) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
-    cmd.arg("check").arg("nau.lua").current_dir(dir);
+    cmd.arg("chart")
+        .arg("check")
+        .arg("nau.lua")
+        .current_dir(dir);
     if json {
         cmd.arg("--json");
     }
-    let out = cmd.output().expect("failed to spawn nau check");
+    let out = cmd.output().expect("failed to spawn nau chart check");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -287,7 +290,10 @@ return {
     )
     .unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
-    cmd.arg("check").arg("pkg/nau.lua").arg("--json");
+    cmd.arg("chart")
+        .arg("check")
+        .arg("pkg/nau.lua")
+        .arg("--json");
     let out = cmd.current_dir(dir.path()).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value =
@@ -312,7 +318,10 @@ fn check_real_pkgs_file_passes_analyzer_gate() {
     // prelude (injected globals bound, require resolution live) — the
     // "no false positives" property of the gate.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
-    cmd.arg("check").arg("pkgs/h/hello.lua").arg("--json");
+    cmd.arg("chart")
+        .arg("check")
+        .arg("pkgs/h/hello.lua")
+        .arg("--json");
     let out = cmd
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
