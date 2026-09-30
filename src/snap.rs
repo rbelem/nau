@@ -4568,12 +4568,22 @@ pub fn build_snap(
     deps_dir: Option<&Path>,
     build_prefix: Option<&Path>,
     leak_scan: Option<&crate::leak_scan::PayloadListings>,
+    bypass_source_cache: bool,
 ) -> miette::Result<BuildResult> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
 
-    // 1. Run build phase (download source, run build command) if configured
-    let outcome = run_build(meta, stage_dir, stage_policy, deps_dir, build_prefix)?;
+    // 1. Run build phase (download source, run build command) if configured.
+    // `bypass_source_cache` marks a drift-observing fetch: a locked-source
+    // refresh must contact upstream, so the cache never serves it.
+    let outcome = run_build(
+        meta,
+        stage_dir,
+        stage_policy,
+        deps_dir,
+        build_prefix,
+        bypass_source_cache,
+    )?;
 
     // 1a. Repair native-ELF command binaries for portability (ticket #12):
     // a nix-toolchain build bakes `/nix/store/...` interpreter + RUNPATH
@@ -4763,6 +4773,91 @@ fn verify_source_download(
     ))
 }
 
+/// The source-cache eligibility rule (ADR-0048 Phase 2): the pin is the
+/// cache's content key, and floating semantics forbid serving — a
+/// floating source must re-observe upstream drift (issue #175).
+/// `None` means the cache is never consulted, in either direction.
+fn source_cache_pin(floating: bool, spec: &SourceSpec) -> Option<&str> {
+    if floating {
+        return None;
+    }
+    spec.expected_sha256()
+}
+
+/// Fetch the single-source tarball to `dest`, returning its SHA-256.
+///
+/// Pinned-and-not-floating sources are served from the content-addressed
+/// source cache when a verified entry exists (ADR-0048 Phase 2); a hit
+/// is byte-identical to the download it replaces — same destination,
+/// same pin verify at the caller. A miss curls exactly as before,
+/// verifies, then populates the cache. `bypass_source_cache` skips the
+/// lookup for drift-observing fetches (a locked-source refresh must
+/// contact upstream so moved bytes still refuse); `store` stays active
+/// — bytes that pass the pin verify are correct cache content by
+/// definition. The cache is best-effort in both directions: a lookup or
+/// store failure is a miss, never a build failure.
+fn fetch_single_source(
+    meta: &SnapMeta,
+    spec: &SourceSpec,
+    url: &str,
+    dest: &Path,
+    bypass_source_cache: bool,
+) -> miette::Result<String> {
+    let pkg_label = format!("{} {}", meta.name, meta.display_version());
+    let dl_spinner = output::spinner(&format!("downloading {}...", pkg_label));
+
+    if let Some(expected) = source_cache_pin(meta.floating, spec) {
+        if !bypass_source_cache {
+            if let Some(cached) =
+                crate::source_cache::lookup(&crate::source_cache::default_root(), expected)
+            {
+                // A copy failure is a miss, not a failure: fall through
+                // to the network path.
+                if std::fs::copy(&cached, dest).is_ok() {
+                    // A hit is not a download — name the cache
+                    // (ADR-0048 no-silent-substitution): the operator
+                    // must see the network was not touched.
+                    output::finish_ok(
+                        &dl_spinner,
+                        &format!("served {} from the source cache", meta.name),
+                    );
+                    // Lookup re-hashed the entry, so this is exactly the
+                    // pinned digest.
+                    return Ok(expected.to_string());
+                }
+            }
+        }
+    }
+
+    let curl = floor_tool(crate::tools::ToolName::Curl)?;
+    let status = std::process::Command::new(&curl)
+        .args(["-fsSL", "-o", &dest.to_string_lossy(), url])
+        .status()
+        .map_err(|e| miette::miette!("curl not found: {}", e))?;
+
+    if !status.success() {
+        output::finish_err(&dl_spinner, &format!("download failed: {}", meta.name));
+        return Err(miette::miette!("failed to download {}", url));
+    }
+    output::finish_ok(&dl_spinner, &format!("downloaded {}", meta.name));
+
+    let computed = sha256_file(dest)?;
+    // A locked source refuses moved bytes; a FLOATING source
+    // re-resolves — its pin is a moving target by design, so the new
+    // hash is TOFU-recorded (it rides out as the build's SourceInfo)
+    // and the pod lockfile pin is restamped once the rebuild lands.
+    verify_source_download(meta, spec, url, &computed)?;
+
+    // Verified bytes: populate the cache under the pin — same
+    // eligibility as the read path; a store failure never fails the
+    // build.
+    if let Some(expected) = source_cache_pin(meta.floating, spec) {
+        let _ = crate::source_cache::store(&crate::source_cache::default_root(), dest, expected);
+    }
+
+    Ok(computed)
+}
+
 /// What a build phase produced: lockfile-relevant source info plus the
 /// adopt-info metadata extracted from the built part, if any.
 #[derive(Debug, Default)]
@@ -4795,6 +4890,7 @@ fn run_build(
     stage_policy: StagePolicy,
     deps_dir: Option<&Path>,
     build_prefix: Option<&Path>,
+    bypass_source_cache: bool,
 ) -> miette::Result<BuildOutcome> {
     // Build plan: `parts` and `build` are mutually exclusive (the DSL
     // enforces this; re-checked here for non-DSL constructors).
@@ -4857,6 +4953,7 @@ fn run_build(
             stage_policy,
             deps_dir,
             build_prefix,
+            bypass_source_cache,
         );
     }
 
@@ -4882,36 +4979,18 @@ fn run_build(
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
     let build_path = build_dir.path();
 
-    let pkg_label = format!("{} {}", meta.name, meta.display_version());
-
-    // 1. Download source tarball
+    // 1. Fetch the source tarball: pinned, non-floating sources are
+    // served from the content-addressed source cache when a verified
+    // entry exists (ADR-0048 Phase 2); a miss curls exactly as before
+    // and populates the cache once verification passes. A drift-observing
+    // fetch (locked-source refresh) bypasses the lookup so moved bytes
+    // still refuse.
     let filename = source_url.rsplit('/').next().unwrap_or("source.tar.gz");
     let tarball = build_path.join(filename);
+    let computed_sha256 =
+        fetch_single_source(meta, source_spec, source_url, &tarball, bypass_source_cache)?;
 
-    let dl_spinner = output::spinner(&format!("downloading {}...", pkg_label));
-    let curl = floor_tool(crate::tools::ToolName::Curl)?;
-    let status = std::process::Command::new(&curl)
-        .args(["-fsSL", "-o", &tarball.to_string_lossy(), source_url])
-        .status()
-        .map_err(|e| miette::miette!("curl not found: {}", e))?;
-
-    if !status.success() {
-        output::finish_err(&dl_spinner, &format!("download failed: {}", meta.name));
-        return Err(miette::miette!("failed to download {}", source_url));
-    }
-    output::finish_ok(&dl_spinner, &format!("downloaded {}", meta.name));
-
-    // 2. Compute SHA-256 of downloaded file
-    let computed_sha256 = sha256_file(&tarball)?;
-
-    // 3. Verify against pinned hash (issue #175): a locked source
-    // refuses moved bytes; a FLOATING source re-resolves — its pin is a
-    // moving target by design, so the new hash is TOFU-recorded (it
-    // rides out as the build's SourceInfo) and the pod lockfile pin is
-    // restamped once the rebuild lands.
-    verify_source_download(meta, source_spec, source_url, &computed_sha256)?;
-
-    // 4. Extract the tarball into the shared source dir (parts mode keeps
+    // 2. Extract the tarball into the shared source dir (parts mode keeps
     // part work dirs separate) or the build tree root (single-part mode,
     // unchanged layout).
     let extract_dir: std::path::PathBuf = if parts_mode {
@@ -4937,12 +5016,12 @@ fn run_build(
         output::finish_ok(&xtract_spinner, &format!("extracted {}", meta.name));
     }
 
-    // 5. `$SRC` points at the source root (the single top-level dir after
+    // 3. `$SRC` points at the source root (the single top-level dir after
     // extraction, if there is exactly one) — shared and identical for every
     // part in multi-part mode.
     let src_root = find_source_root(&extract_dir).unwrap_or_else(|| extract_dir.clone());
 
-    // 6. Create stage dir and run the build plan. Stage hygiene: the
+    // 4. Create stage dir and run the build plan. Stage hygiene: the
     // default stage is nau-owned scratch — wipe it so leftovers from
     // previous builds can never leak into this snap (observed: pciutils
     // files inside a bzip2 snap). An explicit --stage belongs to the user:
@@ -4991,7 +5070,7 @@ fn run_build(
         output::finish_ok(&build_spinner, &format!("built {}", meta.name));
     }
 
-    // 7. adopt-info: extract the adopted part's metadata now that the
+    // 5. adopt-info: extract the adopted part's metadata now that the
     //    named part has built — the pinned source tree is unpacked and the
     //    part's files are staged (the two read-only inputs of the ladder).
     //    Post-build by design: version feeds the snap filename and cache
@@ -5033,6 +5112,7 @@ fn run_multi_source_build(
     stage_policy: StagePolicy,
     deps_dir: Option<&Path>,
     build_prefix: Option<&Path>,
+    bypass_source_cache: bool,
 ) -> miette::Result<BuildOutcome> {
     let build_dir = tempfile::tempdir()
         .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
@@ -5057,7 +5137,13 @@ fn run_multi_source_build(
                 "source '{name}' collides with a part of the same name — source trees and part work dirs share the build tree"
             ));
         }
-        infos.push(fetch_and_extract_source(name, spec, &build_path)?);
+        infos.push(fetch_and_extract_source(
+            name,
+            spec,
+            &build_path,
+            meta.floating,
+            bypass_source_cache,
+        )?);
     }
 
     // Stage hygiene mirrors the single-source path: wipe nau-owned
@@ -5105,12 +5191,51 @@ fn run_multi_source_build(
     })
 }
 
+/// Strict multi-source miss path: curl to `tarball` and enforce the pin
+/// (no floating restamp — multi-source entries are locked by
+/// construction), then populate the source cache best-effort when
+/// `cache_pin` says the bytes are cache-eligible (ADR-0048 Phase 2).
+fn download_multi_source_tarball(
+    name: &str,
+    url: &str,
+    expected: &str,
+    cache_pin: Option<&str>,
+    tarball: &Path,
+) -> miette::Result<String> {
+    let dl_spinner = output::spinner(&format!("downloading source '{name}'..."));
+    let curl = floor_tool(crate::tools::ToolName::Curl)?;
+    let status = std::process::Command::new(&curl)
+        .args(["-fsSL", "-o", &tarball.to_string_lossy(), url])
+        .status()
+        .map_err(|e| miette::miette!("curl not found: {}", e))?;
+    if !status.success() {
+        output::finish_err(&dl_spinner, &format!("download failed: {name}"));
+        return Err(miette::miette!(
+            "failed to download {url} (source '{name}')"
+        ));
+    }
+    output::finish_ok(&dl_spinner, &format!("downloaded source '{name}'"));
+
+    let computed = sha256_file(tarball)?;
+    if computed != expected {
+        return Err(miette::miette!(
+            "SHA-256 mismatch for source '{name}' ({url}):\n  expected: {expected}\n  got:      {computed}"
+        ));
+    }
+    if let Some(pin) = cache_pin {
+        let _ = crate::source_cache::store(&crate::source_cache::default_root(), tarball, pin);
+    }
+    Ok(computed)
+}
+
 /// Download, verify, and extract one named source into `<build>/<name>`
 /// (see [`run_multi_source_build`] for the layout contract).
 fn fetch_and_extract_source(
     name: &str,
     spec: &SourceSpec,
     build_path: &Path,
+    floating: bool,
+    bypass_source_cache: bool,
 ) -> miette::Result<SourceInfo> {
     let url = spec.url();
     if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -5129,26 +5254,35 @@ fn fetch_and_extract_source(
     // Download to a hidden scratch name so it can never collide with a
     // source tree directory.
     let tarball = build_path.join(format!(".dl-{name}.download"));
-    let dl_spinner = output::spinner(&format!("downloading source '{name}'..."));
-    let curl = floor_tool(crate::tools::ToolName::Curl)?;
-    let status = std::process::Command::new(&curl)
-        .args(["-fsSL", "-o", &tarball.to_string_lossy(), url])
-        .status()
-        .map_err(|e| miette::miette!("curl not found: {}", e))?;
-    if !status.success() {
-        output::finish_err(&dl_spinner, &format!("download failed: {name}"));
-        return Err(miette::miette!(
-            "failed to download {url} (source '{name}')"
-        ));
-    }
-    output::finish_ok(&dl_spinner, &format!("downloaded source '{name}'"));
 
-    let computed = sha256_file(&tarball)?;
-    if computed != expected {
-        return Err(miette::miette!(
-            "SHA-256 mismatch for source '{name}' ({url}):\n  expected: {expected}\n  got:      {computed}"
-        ));
-    }
+    // Content-addressed cache first (ADR-0048 Phase 2): the pin is the
+    // key and floating never consults the cache, in either direction. A
+    // drift-observing fetch (bypass) skips the lookup so moved bytes
+    // still refuse; store stays active. A verified hit is byte-identical
+    // to the download it replaces; a lookup or copy failure is a miss,
+    // never a failure.
+    let cache_pin = source_cache_pin(floating, spec);
+    let cached_hit = if bypass_source_cache {
+        None
+    } else {
+        cache_pin.and_then(|pin| {
+            crate::source_cache::lookup(&crate::source_cache::default_root(), pin).and_then(
+                |cached| {
+                    std::fs::copy(&cached, &tarball).ok()?;
+                    Some(pin.to_string())
+                },
+            )
+        })
+    };
+    let computed = match cached_hit {
+        Some(hit) => {
+            // A hit is not a download — name the cache, matching the
+            // single-source form (ADR-0048 no-silent-substitution).
+            output::ok(format!("served source '{name}' from the source cache"));
+            hit
+        }
+        None => download_multi_source_tarball(name, url, expected, cache_pin, &tarball)?,
+    };
     output::ok(format!(
         "SHA-256 verified for '{name}': {:.16}...",
         computed
@@ -8393,6 +8527,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -8463,6 +8598,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(snap_amd64.snap_filename, "multi-test_2.0_amd64.snap");
@@ -8479,6 +8615,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(snap_arm64.snap_filename, "multi-test_2.0_arm64.snap");
@@ -10110,6 +10247,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         let snap_path = output_dir.path().join(&result.snap_filename);
@@ -10224,6 +10362,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         let snap_path = output_dir.path().join(&result.snap_filename);
@@ -10311,6 +10450,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .unwrap();
         }
@@ -10372,6 +10512,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         std::env::remove_var(&override_var);
 
@@ -10846,6 +10987,7 @@ mod tests {
             StagePolicy::Default,
             None,
             None,
+            false,
         )
         .unwrap_err()
         .to_string();
@@ -10875,6 +11017,7 @@ mod tests {
             StagePolicy::Default,
             None,
             None,
+            false,
         )
         .unwrap_err()
         .to_string();
@@ -11010,13 +11153,242 @@ mod tests {
         let default_table: mlua::Table = table.get("default").unwrap();
         let meta = SnapMeta::from_lua_table(&default_table).unwrap();
 
-        let stage = tempfile::tempdir().unwrap();
-        let outcome = run_build(&meta, stage.path(), StagePolicy::Default, None, None)
-            .unwrap_or_else(|e| panic!("extraction must survive the caller PATH's tar: {e:#}"));
-        assert_eq!(outcome.sources.len(), 1);
-        assert_eq!(outcome.sources[0].sha256, hash);
-        // The build command ran against the extracted tree.
-        assert!(stage.path().join("ok").exists());
+        // Scratch HOME: the pinned fetch now populates the source cache,
+        // and a 65 MiB test tarball must not land in the user's real one.
+        with_scratch_home(|_| {
+            let stage = tempfile::tempdir().unwrap();
+            let outcome = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("extraction must survive the caller PATH's tar: {e:#}"));
+            assert_eq!(outcome.sources.len(), 1);
+            assert_eq!(outcome.sources[0].sha256, hash);
+            // The build command ran against the extracted tree.
+            assert!(stage.path().join("ok").exists());
+        })
+    }
+
+    // ── Source cache wiring (ADR-0048 Phase 2) ──
+
+    /// Serve a directory over loopback HTTP, counting accepted
+    /// connections in `hits` — the network-contact counter a cache hit
+    /// must be able to keep flat.
+    fn serve_dir_counting(dir: &Path, hits: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let root = dir.to_path_buf();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                loop {
+                    use std::io::Read;
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&data);
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                use std::io::Write;
+                let mut file = root.join(path.trim_start_matches('/'));
+                if file.is_dir() {
+                    file = file.join("index.html");
+                }
+                let (status, body) = match std::fs::read(&file) {
+                    Ok(b) => ("200 OK", b),
+                    Err(_) => ("404 Not Found", b"not found".to_vec()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    /// Run `f` with HOME pointed at a scratch dir so the source cache
+    /// (resolved via HOME at fetch time) lands in a throwaway tree.
+    /// HOME is process-global, so callers hold ENV_LOCK.
+    fn with_scratch_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home.path());
+        let out = f(home.path());
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        out
+    }
+
+    fn loopback_source_meta(env: &LuaEnv, port: u16, hash: &str, extra: &str) -> SnapMeta {
+        let table = env
+            .eval(&format!(
+                r#"
+            return {{
+                default = snap {{
+                    name = "src-cache-demo",
+                    version = "1.0",
+                    type = "source",
+                    source = {{
+                        url = "http://127.0.0.1:{port}/src.txt",
+                        sha256 = "{hash}",
+                    }},
+                    floating = {extra},
+                    build = "true",
+                }},
+            }}
+            "#
+            ))
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        SnapMeta::from_lua_table(&default_table).unwrap()
+    }
+
+    fn loopback_unpinned_meta(env: &LuaEnv, port: u16) -> SnapMeta {
+        let table = env
+            .eval(&format!(
+                r#"
+            return {{
+                default = snap {{
+                    name = "src-cache-demo",
+                    version = "1.0",
+                    type = "source",
+                    source = "http://127.0.0.1:{port}/src.txt",
+                    build = "true",
+                }},
+            }}
+            "#
+            ))
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        SnapMeta::from_lua_table(&default_table).unwrap()
+    }
+
+    /// A pinned, non-floating source stores on the first build and the
+    /// second build is served from the cache with zero network contact,
+    /// byte-identical (ADR-0048 Phase 2).
+    #[test]
+    fn test_pinned_source_second_build_skips_the_network() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let bytes = b"cacheable pinned source bytes\n";
+        std::fs::write(server.path().join("src.txt"), bytes).unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = serve_dir_counting(server.path(), hits.clone());
+        let hash = sha256_hex(bytes);
+
+        with_scratch_home(|_| {
+            let env = LuaEnv::new();
+            let meta = loopback_source_meta(&env, port, &hash, "false");
+
+            let stage = tempfile::tempdir().unwrap();
+            let first = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "first build downloads"
+            );
+
+            let second = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "second build must be served from the source cache, not the network"
+            );
+            assert_eq!(first.sources[0].sha256, hash);
+            assert_eq!(second.sources[0].sha256, first.sources[0].sha256);
+
+            // The entry exists at the documented layout under HOME.
+            let entry = crate::source_cache::default_root()
+                .join(&hash[..2])
+                .join(&hash);
+            assert_eq!(std::fs::read(&entry).unwrap(), bytes);
+        });
+    }
+
+    /// Floating sources never consult the cache in either direction
+    /// (issue #175): every build re-observes upstream, and no entry is
+    /// ever created.
+    #[test]
+    fn test_floating_source_never_consults_the_source_cache() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let bytes = b"floating source bytes\n";
+        std::fs::write(server.path().join("src.txt"), bytes).unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = serve_dir_counting(server.path(), hits.clone());
+        let hash = sha256_hex(bytes);
+
+        with_scratch_home(|_| {
+            let env = LuaEnv::new();
+            let meta = loopback_source_meta(&env, port, &hash, "true");
+
+            let stage = tempfile::tempdir().unwrap();
+            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
+            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "floating must re-download every build"
+            );
+            assert!(
+                !crate::source_cache::default_root().exists(),
+                "floating sources must not populate the cache"
+            );
+        });
+    }
+
+    /// Unpinned sources never consult the cache in either direction: a
+    /// URL-keyed memo would silently convert an unpinned source into a
+    /// pinned one (ADR-0048).
+    #[test]
+    fn test_unpinned_source_never_consults_the_source_cache() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let bytes = b"unpinned source bytes\n";
+        std::fs::write(server.path().join("src.txt"), bytes).unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = serve_dir_counting(server.path(), hits.clone());
+
+        with_scratch_home(|_| {
+            let env = LuaEnv::new();
+            let meta = loopback_unpinned_meta(&env, port);
+
+            let stage = tempfile::tempdir().unwrap();
+            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
+            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "unpinned must re-download every build"
+            );
+            assert!(
+                !crate::source_cache::default_root().exists(),
+                "unpinned sources must not populate the cache"
+            );
+        });
     }
 
     // ── Issue #41: multi-source build inputs ──
@@ -11220,6 +11592,9 @@ mod tests {
         // `find_source_root` flattening: foo-1.2.tar.gz with a single
         // top-level dir lands at `<build>/<name>`/ contents, NOT
         // <build>/<name>/<name>-1.2/.
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let server = tempfile::tempdir().unwrap();
         let bytes = make_single_root_tarball(server.path(), "foo-1.2");
         std::fs::write(server.path().join("foo.tar.gz"), &bytes).unwrap();
@@ -11231,16 +11606,23 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/foo.tar.gz"),
             sha256: hash.clone(),
         };
-        let info = fetch_and_extract_source("foo", &spec, build.path()).unwrap();
-        assert_eq!(info.url, spec.url());
-        assert_eq!(info.sha256, hash);
-        // The flattening landed the *contents* of foo-1.2 at $SRC/foo.
-        assert!(build.path().join("foo/echo.txt").exists());
-        assert!(!build.path().join("foo/foo-1.2").exists());
+        // Scratch HOME: the fetch now consults the source cache, and
+        // this test must not populate the user's real one.
+        with_scratch_home(|_| {
+            let info = fetch_and_extract_source("foo", &spec, build.path(), false, false).unwrap();
+            assert_eq!(info.url, spec.url());
+            assert_eq!(info.sha256, hash);
+            // The flattening landed the *contents* of foo-1.2 at $SRC/foo.
+            assert!(build.path().join("foo/echo.txt").exists());
+            assert!(!build.path().join("foo/foo-1.2").exists());
+        });
     }
 
     #[test]
     fn test_fetch_and_extract_source_non_tarball_lands_as_file() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let server = tempfile::tempdir().unwrap();
         let bytes = b"deb-data-placeholder".to_vec();
         std::fs::write(server.path().join("deps.deb"), &bytes).unwrap();
@@ -11252,7 +11634,9 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/deps.deb"),
             sha256: hash.clone(),
         };
-        let info = fetch_and_extract_source("deps", &spec, build.path()).unwrap();
+        let info = with_scratch_home(|_| {
+            fetch_and_extract_source("deps", &spec, build.path(), false, false).unwrap()
+        });
         assert_eq!(info.sha256, hash);
         // Non-tarball lands at $SRC/<name> as the file itself, addressable
         // by its declared source name.
@@ -11261,6 +11645,9 @@ mod tests {
 
     #[test]
     fn test_fetch_and_extract_source_hash_mismatch_fails() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let server = tempfile::tempdir().unwrap();
         let bytes = make_single_root_tarball(server.path(), "pkg");
         std::fs::write(server.path().join("pkg.tar.gz"), &bytes).unwrap();
@@ -11271,9 +11658,11 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/pkg.tar.gz"),
             sha256: "deadbeef".repeat(8), // wrong
         };
-        let err = fetch_and_extract_source("pkg", &spec, build.path())
-            .unwrap_err()
-            .to_string();
+        let err = with_scratch_home(|_| {
+            fetch_and_extract_source("pkg", &spec, build.path(), false, false)
+                .unwrap_err()
+                .to_string()
+        });
         assert!(err.contains("SHA-256 mismatch"), "got: {err}");
         assert!(err.contains("expected: deadbeef"), "got: {err}");
     }
@@ -11283,6 +11672,9 @@ mod tests {
         // Full two-source build: both trees present at $SRC/<name>/; the
         // build command verifies and writes into the stage. This is the
         // acceptance demo of the mechanism.
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let server = tempfile::tempdir().unwrap();
         let foo = make_single_root_tarball(server.path(), "foo-1.0");
         let bar = make_single_root_tarball(server.path(), "bar-2.0");
@@ -11292,30 +11684,36 @@ mod tests {
         let h1 = sha256_hex(&foo);
         let h2 = sha256_hex(&bar);
 
-        let env = LuaEnv::new();
-        let meta = two_source_meta(&env, port, &h1, &h2);
+        with_scratch_home(|_| {
+            let env = LuaEnv::new();
+            let meta = two_source_meta(&env, port, &h1, &h2);
 
-        let stage = tempfile::tempdir().unwrap();
-        let outcome = run_build(&meta, stage.path(), StagePolicy::Default, None, None).unwrap();
-        // Two source infos recorded — one per named source, in BTreeMap
-        // (sorted-by-name) order.
-        assert_eq!(outcome.sources.len(), 2);
-        assert_eq!(
-            outcome.sources[0].url,
-            format!("http://127.0.0.1:{port}/bar.tar.gz")
-        );
-        assert_eq!(
-            outcome.sources[1].url,
-            format!("http://127.0.0.1:{port}/foo.tar.gz")
-        );
-        assert_eq!(outcome.sources[0].sha256, h2);
-        assert_eq!(outcome.sources[1].sha256, h1);
-        // The build command's `touch $STAGE/ok` ran (both trees were seen).
-        assert!(stage.path().join("ok").exists());
+            let stage = tempfile::tempdir().unwrap();
+            let outcome =
+                run_build(&meta, stage.path(), StagePolicy::Default, None, None, false).unwrap();
+            // Two source infos recorded — one per named source, in BTreeMap
+            // (sorted-by-name) order.
+            assert_eq!(outcome.sources.len(), 2);
+            assert_eq!(
+                outcome.sources[0].url,
+                format!("http://127.0.0.1:{port}/bar.tar.gz")
+            );
+            assert_eq!(
+                outcome.sources[1].url,
+                format!("http://127.0.0.1:{port}/foo.tar.gz")
+            );
+            assert_eq!(outcome.sources[0].sha256, h2);
+            assert_eq!(outcome.sources[1].sha256, h1);
+            // The build command's `touch $STAGE/ok` ran (both trees were seen).
+            assert!(stage.path().join("ok").exists());
+        })
     }
 
     #[test]
     fn test_run_build_two_source_hash_mismatch_fails_precisely() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let server = tempfile::tempdir().unwrap();
         let foo = make_single_root_tarball(server.path(), "foo-1.0");
         let bar = make_single_root_tarball(server.path(), "bar-2.0");
@@ -11325,23 +11723,25 @@ mod tests {
         let h1 = sha256_hex(&foo);
         let h2 = sha256_hex(&bar);
 
-        let env = LuaEnv::new();
-        // Corrupt hash for the SECOND source: the error must name it
-        // precisely (and its pin) after a real download.
-        let mut meta = two_source_meta(&env, port, &h1, &h2);
-        let wrong = "feedfacedeadbeef".repeat(8);
-        let sources = meta.sources.as_mut().unwrap();
-        *sources.get_mut("bar").unwrap() = SourceSpec::Pinned {
-            url: format!("http://127.0.0.1:{port}/bar.tar.gz"),
-            sha256: wrong,
-        };
+        with_scratch_home(|_| {
+            let env = LuaEnv::new();
+            // Corrupt hash for the SECOND source: the error must name it
+            // precisely (and its pin) after a real download.
+            let mut meta = two_source_meta(&env, port, &h1, &h2);
+            let wrong = "feedfacedeadbeef".repeat(8);
+            let sources = meta.sources.as_mut().unwrap();
+            *sources.get_mut("bar").unwrap() = SourceSpec::Pinned {
+                url: format!("http://127.0.0.1:{port}/bar.tar.gz"),
+                sha256: wrong,
+            };
 
-        let stage = tempfile::tempdir().unwrap();
-        let err = run_build(&meta, stage.path(), StagePolicy::Default, None, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("source 'bar'"), "got: {err}");
-        assert!(err.contains("SHA-256 mismatch"), "got: {err}");
+            let stage = tempfile::tempdir().unwrap();
+            let err = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("source 'bar'"), "got: {err}");
+            assert!(err.contains("SHA-256 mismatch"), "got: {err}");
+        })
     }
 
     #[test]
@@ -12810,6 +13210,7 @@ fi
             None,
             None,
             None,
+            false,
         )
         .unwrap();
 

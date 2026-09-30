@@ -212,6 +212,13 @@ fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, Stri
     // the test's tempdir; pod activation off the host bus.
     cmd.env("NAU_DATA_HOME", root.join("data-home"));
     cmd.env("NAU_SYSTEMD", "off");
+    // Scratch HOME for the child: pod builds consult the content-addressed
+    // source cache under ~/.cache/nau/src (ADR-0048 Phase 2), and these
+    // tests must never read or populate the user's real one. The env var
+    // is per-child, so no process-global lock is needed. The dir only has
+    // to outlive the child process, which has exited by the time it drops.
+    let home = tempfile::tempdir().expect("scratch HOME tempdir");
+    cmd.env("HOME", home.path());
     let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),

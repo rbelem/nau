@@ -597,6 +597,8 @@ fn finish_job(
         None,
         prefix.as_ref().map(|p| p.path()),
         Some(&scan_listings),
+        // Not a drift-observation point.
+        false,
     );
     let build_ms = Some(build_started.elapsed().as_millis() as u64);
 
