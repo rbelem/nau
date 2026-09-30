@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::Serializer;
 use serde::{Deserialize, Serialize};
 
-use crate::snap::SnapRef;
+use crate::snap_types::SnapRef;
 
 /// Manifest schema version. Bump on any breaking field change; consumers
 /// gate on this value.
