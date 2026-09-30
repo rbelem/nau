@@ -1696,11 +1696,16 @@ struct LoadedContribution {
 }
 
 /// One contributed name: the version the loaded pod executes (None:
-/// resolve live) and the constraint its line was selected with.
+/// resolve live), the constraint its line was selected with, and the
+/// `loads` entry the member rode in through (ADR-0048) — the pod named
+/// by the closure-gate remedy when a LOADED member must rebuild without
+/// a resolvable deps pin. Sub-load names ride the top-level entry that
+/// folded them in.
 #[derive(Debug, Clone)]
 struct ContributedPkg {
     version: Option<String>,
     constraint: Option<String>,
+    source_pod: Option<String>,
 }
 
 /// Fold a pod's DECLARATION alone: its own packages resolved live (the
@@ -1732,6 +1737,7 @@ fn declared_contribution(
             ContributedPkg {
                 version: Some(meta.version),
                 constraint: spec.constraint,
+                source_pod: None,
             },
         );
     }
@@ -1770,6 +1776,7 @@ fn loaded_contribution(root: &Path, pod_name: &str) -> miette::Result<LoadedCont
                         ContributedPkg {
                             version: Some(pkg.version.clone()),
                             constraint: None,
+                            source_pod: None,
                         },
                     )
                 })
@@ -3585,21 +3592,24 @@ enum OwnScope {
 /// hold path, and the scoped rebuild's off-scope skip, issue #15): the
 /// generation must still present the package's desktop IDs and
 /// binaries, so they are claimed from the INSTALLED package record
-/// rather than from a freshly resolved meta.
+/// rather than from a freshly resolved meta. `layer` is the composition
+/// layer the member occupies in the POST-STATE (own holds claim at
+/// `Own`, loaded holds at `Loaded`, ADR-0048).
 fn hold_style_skip_claims(
     desktop_claims: &mut Vec<DesktopClaim>,
     binary_claims: &mut Vec<BinaryClaim>,
     service_claims: &mut Vec<ServiceClaim>,
     installed_pkg: &crate::runtime::InstalledPackage,
     meta: &crate::snap::SnapMeta,
+    layer: crate::farm::ClaimLayer,
 ) {
-    push_desktop_claims(desktop_claims, installed_pkg, crate::farm::ClaimLayer::Own);
-    push_installed_binary_claims(binary_claims, installed_pkg, crate::farm::ClaimLayer::Own);
+    push_desktop_claims(desktop_claims, installed_pkg, layer);
+    push_installed_binary_claims(binary_claims, installed_pkg, layer);
     // Services have no installed-record entry yet (the manifest record is
     // ticket #106), so a held pin claims them from the freshly resolved
     // meta — the pin's content only differs when the pin MOVES, and a
     // move rebuilds.
-    push_meta_service_claims(service_claims, meta, crate::farm::ClaimLayer::Own);
+    push_meta_service_claims(service_claims, meta, layer);
 }
 
 /// True when a freshly resolved own package would be HELD at its
@@ -3662,6 +3672,7 @@ fn hold_plain_sync(
             &mut build.service_claims,
             installed_pkg,
             meta,
+            crate::farm::ClaimLayer::Own,
         );
     }
     OwnScope::Held
@@ -3671,21 +3682,65 @@ fn hold_plain_sync(
 /// (issue #125): the hold skips the build that would otherwise hash the
 /// blob (issue #113), so a corrupted or missing store entry would ride
 /// along silently — the held sync instead fails loud, fail-closed like
-/// [`crate::dep_fetch::materialize_deps_entry`]. One stat + one
-/// streaming hash of the already-local blob; no fetch, no unpack, no
-/// auto-heal. Packages without a recorded deps pin (no `deps`
-/// declaration, store/pull installs) skip cleanly: nothing to verify.
+/// [`crate::dep_fetch::materialize_deps_entry`]. Packages without a
+/// recorded deps pin (no `deps` declaration, store/pull installs) skip
+/// cleanly: nothing to verify.
 fn verify_held_deps_blob(ctx: &ReconcileCtx<'_>, name: &str) -> miette::Result<()> {
-    let Some(hash) = ctx
+    let hash = ctx
         .lock
         .packages
         .get(name)
         .and_then(|e| e.deps.as_ref())
-        .map(|d| d.deps_hash.as_str())
-    else {
+        .map(|d| d.deps_hash.as_str());
+    verify_deps_blob_hash(ctx.store, name, hash)
+}
+
+/// The deps pin a LOADED member's declaring pod carries for `name`
+/// (ADR-0048): loaded packages are never pinned in this pod's own
+/// lockfile, so a pin — when one exists — lives in the declaring pod's
+/// lock. `None` when there is no declaring pod or no pin there. An
+/// unreadable lockfile is an error: we cannot know whether a pin
+/// exists, so a silent skip could let corruption ride a hold.
+fn declaring_pod_deps_pin(
+    ctx: &ReconcileCtx<'_>,
+    source_pod: Option<&str>,
+    name: &str,
+) -> miette::Result<Option<crate::lock::PackageDepsLock>> {
+    let Some(pod) = source_pod else {
+        return Ok(None);
+    };
+    let lock = LockFile::load(&pod_lock_path(ctx.root, pod))?;
+    Ok(lock.and_then(|l| l.packages.get(name).and_then(|e| e.deps.clone())))
+}
+
+/// Re-verify the recorded deps-closure blob of a content-held LOADED
+/// member (ADR-0048; the [`verify_held_deps_blob`] shape): the hold
+/// skips the build that would otherwise hash the blob, so a corrupted
+/// store entry would ride the hold silently. The pin resolves from the
+/// DECLARING pod's lockfile ([`declaring_pod_deps_pin`]); no declaring
+/// pod or no pin there: nothing resolvable to verify, skip cleanly.
+fn verify_held_loaded_deps_blob(
+    ctx: &ReconcileCtx<'_>,
+    source_pod: Option<&str>,
+    name: &str,
+) -> miette::Result<()> {
+    let hash = declaring_pod_deps_pin(ctx, source_pod, name)?.map(|d| d.deps_hash);
+    verify_deps_blob_hash(ctx.store, name, hash.as_deref())
+}
+
+/// The blob check both hold paths share (issue #125, ADR-0048): one
+/// stat + one streaming hash of the already-local blob; no fetch, no
+/// unpack, no auto-heal. A missing or tampered entry fails the sync
+/// loud, fail-closed like [`crate::dep_fetch::materialize_deps_entry`].
+fn verify_deps_blob_hash(
+    store: &crate::runtime::RuntimeStore,
+    name: &str,
+    hash: Option<&str>,
+) -> miette::Result<()> {
+    let Some(hash) = hash else {
         return Ok(());
     };
-    let blob = ctx.store.blob_path(hash);
+    let blob = store.blob_path(hash);
     if !blob.exists() {
         miette::bail!(
             "held package '{name}': dependency closure {hash:.12}… is missing from the pod \
@@ -3974,6 +4029,7 @@ fn scope_own_package(
                 &mut build.service_claims,
                 installed_pkg,
                 meta,
+                crate::farm::ClaimLayer::Own,
             );
             return Ok(OwnScope::SkipInstalled);
         }
@@ -4020,6 +4076,7 @@ fn scope_own_package(
                 &mut build.service_claims,
                 installed_pkg,
                 meta,
+                crate::farm::ClaimLayer::Own,
             );
             return Ok(OwnScope::SkipInstalled);
         }
@@ -4068,6 +4125,7 @@ fn hold_baselined_drift(
         &mut build.service_claims,
         installed,
         meta,
+        crate::farm::ClaimLayer::Own,
     );
     Some(OwnScope::SkipInstalled)
 }
@@ -4591,7 +4649,15 @@ fn loaded_contributions(
     for loaded in &decl.loads {
         let contribution = loaded_contribution(root, loaded)?;
         for (name, pkg) in contribution.packages {
-            loaded_versions.entry(name).or_insert(pkg);
+            // The first contributing pod wins the name clash; it is
+            // also the declaring pod the closure-gate remedy names
+            // (ADR-0048).
+            loaded_versions
+                .entry(name)
+                .or_insert_with(|| ContributedPkg {
+                    source_pod: Some(loaded.clone()),
+                    ..pkg
+                });
         }
         for (name, patch) in contribution.overlay {
             loaded_overlays.entry(name).or_insert(patch);
@@ -4830,7 +4896,17 @@ fn build_own_package(
             .find(|(name, _)| *name == spec.name)
             .map(|(_, digest)| digest.as_str()),
     );
-    let (pending, source_infos) = build_pending_snap(ctx.store, meta, layer, deps_pin.as_ref())?;
+    let (pending, source_infos) = build_pending_snap(
+        ctx.store,
+        meta,
+        layer,
+        deps_pin.as_ref(),
+        None,
+        // A locked-source refresh must observe drift (issue #175's
+        // counterfactual): a named refresh member never takes a cache
+        // hit, so moved upstream bytes still refuse the build.
+        build.refresh_members.contains(&meta.name),
+    )?;
     // Floating sources (issue #175): the build re-resolved the pin, so
     // the observed hashes restamp the lockfile's `sources` record once
     // the reconcile lands. Loaded packages don't restamp here — their
@@ -4877,6 +4953,16 @@ fn resolve_loaded_meta(
 /// executes exactly what the loaded pod executes. Deterministic build
 /// output keeps a no-change reconcile a no-op. Own packages with the
 /// same NAME shadow them outright (the loaded copy never enters).
+///
+/// Content holds (ADR-0048 Decision 1, the issue #113 hold one layer
+/// down): a loaded member whose installed record was built from THIS
+/// recipe at THIS version holds — its store content is kept, its claims
+/// materialize from the installed record at `ClaimLayer::Loaded`, and
+/// no build is queued. Floating members never hold (they must observe
+/// upstream drift), and a `pod refresh` target or recipe-drift rebuild
+/// bypasses the hold like its own-package twin. A held member is still
+/// inserted into `declared_names`, or [`remove_undeclared`] would wipe
+/// its store content.
 fn collect_loaded_packages(
     ctx: &ReconcileCtx<'_>,
     decl: &PodDeclaration,
@@ -4895,36 +4981,170 @@ fn collect_loaded_packages(
             loaded_overlays.get(name),
             decl.overlay.get(name),
         )?;
-        // Pin the loaded package at the executing version (a loaded
-        // pod's active generation version wins over collection drift).
-        if let Some(version) = &contributed.version {
-            if !version.is_empty() {
-                meta.version = version.clone();
-            }
-        }
+        pin_loaded_version(&mut meta, contributed);
+        // The declared_names guard (ADR-0048): recorded BEFORE the
+        // hold/build decision — a held member or a contained build
+        // failure keeps its store content, and remove_undeclared wipes
+        // anything absent from this set.
         build.declared_names.insert(meta.name.clone());
         // Runtime-closure seeds (issue #35): loaded packages need their
-        // requires members in THIS pod's store too.
+        // requires members in THIS pod's store too — held members
+        // included, so their libraries stay carried.
         build.requires_seeds.extend(meta.requires.iter().cloned());
-        push_meta_desktop_claims(
-            &mut build.desktop_claims,
-            &meta,
-            crate::farm::ClaimLayer::Loaded,
-        );
-        push_meta_binary_claims(
-            &mut build.binary_claims,
-            &meta,
-            crate::farm::ClaimLayer::Loaded,
-        );
-        push_meta_service_claims(
-            &mut build.service_claims,
-            &meta,
-            crate::farm::ClaimLayer::Loaded,
-        );
-        let (pending, _) =
-            build_pending_snap(ctx.store, &meta, crate::farm::ClaimLayer::Loaded, None)?;
-        build.pending.push(pending);
+        if let Some(installed) = loaded_hold_record(ctx, &meta, build) {
+            hold_loaded_member(
+                ctx,
+                contributed.source_pod.as_deref(),
+                installed,
+                &meta,
+                build,
+            )?;
+            continue;
+        }
+        build_loaded_member(ctx, &meta, contributed, build)?;
     }
+    Ok(())
+}
+
+/// Pin the loaded package at the executing version (a loaded pod's
+/// active generation version wins over collection drift).
+fn pin_loaded_version(meta: &mut crate::snap::SnapMeta, contributed: &ContributedPkg) {
+    if let Some(version) = &contributed.version {
+        if !version.is_empty() {
+            meta.version = version.clone();
+        }
+    }
+}
+
+/// True-and-record when a loaded member would be HELD at its installed
+/// content (ADR-0048 Decision 1): the active generation carries it at
+/// the executing version AND its recorded build-input digest matches
+/// the freshly resolved recipe (the [`held_at_content`] contract, one
+/// layer down — `None` digests never match), the member is not a
+/// `pod refresh` target and not a recipe-drift rebuild, and it is not
+/// floating. Returns the installed record to materialize claims from.
+fn loaded_hold_record<'a>(
+    ctx: &ReconcileCtx<'a>,
+    meta: &crate::snap::SnapMeta,
+    build: &ReconcileBuild,
+) -> Option<&'a crate::runtime::InstalledPackage> {
+    if meta.floating
+        || build.refresh_members.contains(&meta.name)
+        || build.recipe_drift_members.contains(&meta.name)
+    {
+        return None;
+    }
+    let installed = ctx.active?.packages.get(&meta.name)?;
+    let digest = meta.build_input_digest();
+    (installed.version == meta.version && installed.meta_digest.as_deref() == Some(digest.as_str()))
+        .then_some(installed)
+}
+
+/// The loaded-member hold body (ADR-0048): re-verify the recorded deps
+/// blob where the declaring pod resolves a pin (a corrupted closure
+/// must not ride the hold), record the hold, and contribute the
+/// installed record's claims at the `Loaded` layer so the generation
+/// still presents the member's desktop IDs and binaries.
+fn hold_loaded_member(
+    ctx: &ReconcileCtx<'_>,
+    source_pod: Option<&str>,
+    installed: &crate::runtime::InstalledPackage,
+    meta: &crate::snap::SnapMeta,
+    build: &mut ReconcileBuild,
+) -> miette::Result<()> {
+    verify_held_loaded_deps_blob(ctx, source_pod, &meta.name)?;
+    build.held.push(meta.name.clone());
+    hold_style_skip_claims(
+        &mut build.desktop_claims,
+        &mut build.binary_claims,
+        &mut build.service_claims,
+        installed,
+        meta,
+        crate::farm::ClaimLayer::Loaded,
+    );
+    Ok(())
+}
+
+/// Build one loaded member that did not hold: contribute its claims at
+/// the `Loaded` layer and queue the pending build. A deps-declaring
+/// member resolves its pin from the DECLARING pod's lockfile (ADR-0048
+/// Phase 5 item 1): the closure blob it names is already in THIS pod's
+/// store when the declaring pod fetched it, so the rebuild proceeds.
+/// No declaring pod or no pin there: `deps_pin: None` keeps the named
+/// gate refusal (fail-loud — a drifted, deps-declaring loaded member is
+/// never silently dropped from the post-state).
+///
+/// A build failure is contained per member (ADR-0048; the issue #177
+/// hostage shape) — the reconcile continues for the sibling members —
+/// EXCEPT the deps-closure gate, which stays a whole-verb named
+/// failure.
+///
+/// Claims are contributed only AFTER the build succeeds: a contained
+/// failure must not leave claims for a member that never installs (the
+/// collision classifier would see a phantom Loaded claim).
+fn build_loaded_member(
+    ctx: &ReconcileCtx<'_>,
+    meta: &crate::snap::SnapMeta,
+    contributed: &ContributedPkg,
+    build: &mut ReconcileBuild,
+) -> miette::Result<()> {
+    let deps_pin = if meta.deps.is_some() {
+        declaring_pod_deps_pin(ctx, contributed.source_pod.as_deref(), &meta.name)?
+    } else {
+        None
+    };
+    match build_pending_snap(
+        ctx.store,
+        meta,
+        crate::farm::ClaimLayer::Loaded,
+        deps_pin.as_ref(),
+        contributed.source_pod.as_deref(),
+        // Same drift-observation rule as the own path: a named refresh
+        // member never takes a cache hit.
+        build.refresh_members.contains(&meta.name),
+    ) {
+        Ok((pending, _)) => {
+            push_meta_desktop_claims(
+                &mut build.desktop_claims,
+                meta,
+                crate::farm::ClaimLayer::Loaded,
+            );
+            push_meta_binary_claims(
+                &mut build.binary_claims,
+                meta,
+                crate::farm::ClaimLayer::Loaded,
+            );
+            push_meta_service_claims(
+                &mut build.service_claims,
+                meta,
+                crate::farm::ClaimLayer::Loaded,
+            );
+            build.pending.push(pending);
+            Ok(())
+        }
+        Err(e) => contain_loaded_build_failure(meta, e),
+    }
+}
+
+/// The loaded-member containment decision (ADR-0048): a deps-declaring
+/// member without a pin can ONLY fail at the closure gate
+/// (build_pending_snap's first step), so its error IS the whole-verb
+/// named refusal; every other failure is contained with a warning —
+/// the pod keeps whatever content it carries for the member (it stays
+/// in `declared_names`, so remove_undeclared never wipes it).
+fn contain_loaded_build_failure(
+    meta: &crate::snap::SnapMeta,
+    err: miette::Error,
+) -> miette::Result<()> {
+    if meta.deps.is_some() {
+        return Err(err);
+    }
+    crate::output::warn(format!(
+        "loaded package '{}' failed to build — contained: continuing with the remaining \
+         members; the pod keeps the content it carries for '{}' (re-run `nau pod sync` \
+         after fixing the recipe)",
+        meta.name, meta.name
+    ));
     Ok(())
 }
 
@@ -5939,7 +6159,9 @@ fn set_pod_build_epoch() {
 /// store-mounted dependency closure (ADR-0017): the pin must exist —
 /// own packages fetch it in [`ensure_own_deps`] right before this call;
 /// a loaded package has no pin here and fails with a clear error (deps
-/// resolve in the pod that declares the package).
+/// resolve in the pod that declares the package). `source_pod` is the
+/// declaring pod for a LOADED member (ADR-0048): its presence upgrades
+/// the gate refusal to name the declaring pod and the sync remedy.
 ///
 /// A package with `requires`/`build_deps` builds against the merged
 /// build prefix (ADR-0018, issue #35 — the same machinery the pool
@@ -5953,6 +6175,8 @@ fn build_pending_snap(
     meta: &crate::snap::SnapMeta,
     layer: crate::farm::ClaimLayer,
     deps_pin: Option<&crate::lock::PackageDepsLock>,
+    source_pod: Option<&str>,
+    bypass_source_cache: bool,
 ) -> miette::Result<(crate::runtime::PendingSnap, Vec<crate::snap::SourceInfo>)> {
     set_pod_build_epoch();
     let deps_dir = match (meta.deps.as_ref(), deps_pin) {
@@ -5960,12 +6184,7 @@ fn build_pending_snap(
             store,
             &pin.deps_hash,
         )?),
-        (Some(_), None) => miette::bail!(
-            "package '{}' declares deps but no closure pin exists for it here — \
-             dependency closures resolve in the pod that declares the package \
-             (`nau deps fetch`)",
-            meta.name
-        ),
+        (Some(_), None) => return Err(deps_gate_error(&meta.name, source_pod)),
         (None, _) => None,
     };
     // Merged build prefix (ADR-0018, issue #35): `requires` ∪ `build_deps`
@@ -5993,6 +6212,7 @@ fn build_pending_snap(
         deps_dir.as_ref().map(|d| d.path()),
         build_prefix.as_ref().map(|p| p.path()),
         scan_listings.as_ref(),
+        bypass_source_cache,
     )?;
     let payload = downloads.join(&result.snap_filename);
     let sha3_384 = crate::store::sha3_384_file(&payload)?;
@@ -6000,6 +6220,26 @@ fn build_pending_snap(
         build_pending_snap_at(meta, &payload, sha3_384, layer),
         result.source_infos,
     ))
+}
+
+/// The deps-closure gate refusal, fail-loud (ADR-0048 Decision 1): a
+/// LOADED member names its declaring pod and the remedy — `nau pod
+/// sync` in THAT pod reconciles the closure there, or the loading pod
+/// refreshes the member after its pod lands; the own-package form keeps
+/// the existing message (the closure never had a pod-side home).
+fn deps_gate_error(name: &str, source_pod: Option<&str>) -> miette::Error {
+    match source_pod {
+        Some(pod) => miette::miette!(
+            "loaded package '{name}' (from pod '{pod}') declares interpreted deps; \
+             run `nau pod --name {pod} sync` in that pod, or refresh this member \
+             after its pod reconciles"
+        ),
+        None => miette::miette!(
+            "package '{name}' declares deps but no closure pin exists for it here — \
+             dependency closures resolve in the pod that declares the package \
+             (`nau deps fetch`)"
+        ),
+    }
 }
 
 /// Resolve `meta`'s build-time dependency closure (`requires` ∪
@@ -6113,6 +6353,8 @@ fn ensure_pod_dep_payload(
         None,
         dep_prefix.as_ref().map(|p| p.path()),
         scan_listings.as_ref(),
+        // A dependency payload fetch is not a drift-observation point.
+        false,
     )?;
     building.pop();
     Ok(downloads.join(&result.snap_filename))
@@ -7388,6 +7630,448 @@ pod {
             build.held.is_empty(),
             "a refused hold must not be recorded: {:?}",
             build.held
+        );
+    }
+
+    // ── Loaded-member content holds (ADR-0048 Decision 1) ──
+
+    /// An installed record for a LOADED member: the shape a prior
+    /// sync's install of a loaded member leaves in the active
+    /// generation, carrying an app and a desktop entry so the hold's
+    /// installed-record claims are observable.
+    fn installed_loaded_tool(meta_digest: Option<String>) -> crate::runtime::InstalledPackage {
+        crate::runtime::InstalledPackage {
+            layer: crate::farm::ClaimLayer::Loaded,
+            apps: BTreeMap::from([("toolbin".to_string(), "sha-toolbin".to_string())]),
+            desktops: BTreeMap::from([(
+                "tooldesk".to_string(),
+                crate::runtime::DesktopLauncher {
+                    name: Some("Tool".to_string()),
+                    generic_name: None,
+                    comment: None,
+                    categories: Vec::new(),
+                    icon_ref: None,
+                    icon: None,
+                },
+            )]),
+            ..installed_tool(meta_digest)
+        }
+    }
+
+    /// Save a declaring pod's lockfile pinning `tool`'s deps closure at
+    /// `hash` — the resolvable pin source for a held LOADED member
+    /// (loaded packages are never pinned in the LOADING pod's lock).
+    fn pin_declaring_pod_deps(fixture: &HoldFixture, pod: &str, hash: &str) {
+        let mut lock = LockFile::empty();
+        lock.packages.insert(
+            "tool".to_string(),
+            PodPackageLockEntry {
+                version: "1.0".into(),
+                constraint: None,
+                deps: Some(crate::lock::PackageDepsLock {
+                    deps_hash: hash.to_string(),
+                    fetched_at: None,
+                    lock_sha256: None,
+                }),
+                recipe_sha256: None,
+                recipe_digest_scheme: None,
+            },
+        );
+        std::fs::create_dir_all(fixture._dir.path().join(pod)).unwrap();
+        lock.save(&pod_lock_path(fixture._dir.path(), pod)).unwrap();
+    }
+
+    /// Digest match + version match + no refresh/drift naming + not
+    /// floating → the loaded member HELDS: no build queued, the hold
+    /// recorded, claims materialized from the INSTALLED record at the
+    /// `Loaded` layer.
+    #[test]
+    fn test_loaded_member_holds_when_the_recipe_matches_the_installed_record() {
+        let meta = bare_meta("tool", "1.0");
+        let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
+        let ctx = fixture.ctx();
+        let mut build = ReconcileBuild::default();
+        let installed = loaded_hold_record(&ctx, &meta, &build)
+            .expect("a digest-matching loaded member must hold");
+        hold_loaded_member(&ctx, None, installed, &meta, &mut build).unwrap();
+        assert_eq!(build.held, vec!["tool".to_string()]);
+        assert!(
+            build.pending.is_empty(),
+            "a held loaded member must not queue a build: {:?}",
+            build.pending
+        );
+        assert!(
+            build.desktop_claims.iter().any(|c| c.app_id == "tooldesk"
+                && c.pkg == "tool"
+                && c.layer == crate::farm::ClaimLayer::Loaded),
+            "desktop claims must come from the installed record at the Loaded layer: {:?}",
+            build.desktop_claims
+        );
+        assert!(
+            build.binary_claims.iter().any(|c| c.binary == "toolbin"
+                && c.pkg == "tool"
+                && c.layer == crate::farm::ClaimLayer::Loaded),
+            "binary claims must come from the installed record at the Loaded layer: {:?}",
+            build.binary_claims
+        );
+    }
+
+    /// A floating loaded member never holds: float mode follows
+    /// upstream content drift at a constant recipe — a hold would
+    /// silently skip the re-resolve.
+    #[test]
+    fn test_floating_loaded_member_never_holds() {
+        let mut meta = bare_meta("tool", "1.0");
+        meta.floating = true;
+        let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
+        let build = ReconcileBuild::default();
+        assert!(
+            loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
+            "a floating loaded member must rebuild"
+        );
+    }
+
+    /// A `pod refresh` target and a recipe-drift rebuild bypass the
+    /// loaded hold — same scoping as the own-package content hold.
+    #[test]
+    fn test_refresh_named_or_recipe_drifted_loaded_member_never_holds() {
+        let meta = bare_meta("tool", "1.0");
+        let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
+
+        let mut build = ReconcileBuild::default();
+        build.refresh_members = std::collections::BTreeSet::from(["tool".to_string()]);
+        assert!(
+            loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
+            "a refresh-named loaded member must rebuild"
+        );
+
+        let mut build = ReconcileBuild::default();
+        build.recipe_drift_members = std::collections::BTreeSet::from(["tool".to_string()]);
+        assert!(
+            loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
+            "a recipe-drifted loaded member must rebuild"
+        );
+    }
+
+    /// The loaded pod's executing version moved → the member rebuilds:
+    /// the hold requires the installed record to carry the pinned
+    /// version. A pre-#113 record (no digest) never holds either.
+    #[test]
+    fn test_loaded_member_version_mismatch_never_holds() {
+        let meta = bare_meta("tool", "1.0");
+        // Digest matches but the installed version is the pod's OLD
+        // one: the version conjunct alone must refuse the hold.
+        let mut moved = installed_loaded_tool(Some(meta.build_input_digest()));
+        moved.version = "2.0".into();
+        let mut fixture = hold_fixture(moved);
+        let build = ReconcileBuild::default();
+        assert!(
+            loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
+            "a version mismatch must rebuild"
+        );
+
+        // Same version, but the manifest predates the digest record:
+        // never matches — the first sync rebuilds once and records it.
+        let mut fixture = hold_fixture(installed_loaded_tool(None));
+        let build = ReconcileBuild::default();
+        assert!(
+            loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
+            "a digest-less manifest must rebuild once"
+        );
+    }
+
+    /// The declared_names trap (ADR-0048): the hold flow records the
+    /// member into `declared_names` BEFORE the hold decision, so
+    /// `remove_undeclared` keeps its store content — a held loaded
+    /// member absent from that set would be wiped every sync.
+    #[test]
+    fn test_held_loaded_member_survives_remove_undeclared() {
+        let meta = bare_meta("tool", "1.0");
+        let record = installed_loaded_tool(Some(meta.build_input_digest()));
+        let mut fixture = hold_fixture(record.clone());
+
+        // The member holds (the store content that must survive).
+        let build = ReconcileBuild::default();
+        assert!(loaded_hold_record(&fixture.ctx(), &meta, &build).is_some());
+
+        // A real store whose active generation carries the record, the
+        // way the previous sync's install left it.
+        let gen_dir = fixture.store.generation_dir(1);
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(
+            gen_dir.join("manifest.json"),
+            serde_json::to_string(&crate::runtime::Generation {
+                n: 1,
+                base_version: "24.04".into(),
+                packages: BTreeMap::from([("tool".to_string(), record)]),
+                created_epoch: 0,
+                boot_entry: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("generations/1", fixture.store.root().join("active")).unwrap();
+
+        // The hold flow inserts the name into declared_names first —
+        // with the name present, nothing is removed.
+        let mut declared = std::collections::BTreeSet::new();
+        declared.insert("tool".to_string());
+        let removed = remove_undeclared(
+            &fixture.store,
+            &crate::runtime::RuntimeTools::default(),
+            &declared,
+        )
+        .unwrap();
+        assert!(
+            removed.is_empty(),
+            "a held loaded member's store content must survive remove_undeclared: {removed:?}"
+        );
+    }
+
+    /// A held LOADED member with a pin resolvable from the DECLARING
+    /// pod's lockfile re-verifies the blob: tampered content fails the
+    /// hold loud, never riding along (the #125 shape, one layer down).
+    #[test]
+    fn test_held_loaded_member_verifies_the_declaring_pods_deps_blob() {
+        use sha2::{Digest, Sha256};
+        let meta = bare_meta("tool", "1.0");
+        let content = b"closure bytes";
+        let hash: String = Sha256::digest(content)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        // Intact blob → the hold lands.
+        let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
+        let blob = fixture.store.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, content).unwrap();
+        pin_declaring_pod_deps(&fixture, "upstream", &hash);
+        let ctx = fixture.ctx();
+        let mut build = ReconcileBuild::default();
+        let installed = loaded_hold_record(&ctx, &meta, &build).unwrap();
+        hold_loaded_member(&ctx, Some("upstream"), installed, &meta, &mut build).unwrap();
+        assert_eq!(build.held, vec!["tool".to_string()]);
+
+        // Tampered blob → the hold refuses loud.
+        let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
+        let blob = fixture.store.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"not the closure").unwrap();
+        pin_declaring_pod_deps(&fixture, "upstream", &hash);
+        let ctx = fixture.ctx();
+        let mut build = ReconcileBuild::default();
+        let installed = loaded_hold_record(&ctx, &meta, &build).unwrap();
+        let err =
+            hold_loaded_member(&ctx, Some("upstream"), installed, &meta, &mut build).unwrap_err();
+        assert!(
+            format!("{err}").contains("hash mismatch"),
+            "the loaded hold must refuse loud on a tampered closure: {err}"
+        );
+        assert!(
+            build.held.is_empty(),
+            "a refused hold must not be recorded: {:?}",
+            build.held
+        );
+    }
+
+    /// A deps-declaring loaded member whose declaring pod carries the
+    /// pin BUILDS (ADR-0048 Phase 5 item 1): the pin resolves from the
+    /// declaring pod's lockfile, the closure blob already sits in THIS
+    /// pod's store, so materialize succeeds and no gate refusal fires.
+    /// The blob is a minimal canonical archive (an empty closure tree).
+    #[test]
+    fn test_loaded_member_builds_through_the_declaring_pods_deps_pin() {
+        use sha2::{Digest, Sha256};
+        let content = b"END\n";
+        let hash: String = Sha256::digest(content)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        let mut meta = bare_meta("codegraph", "1.0");
+        meta.deps = Some(crate::snap::PackageDeps {
+            npm: None,
+            pip: None,
+            cargo: None,
+            go: None,
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runtime::RuntimeStore::new(dir.path().join("store"));
+        // The closure blob the pin names, already fetched into the
+        // consuming pod's store (`nau deps fetch` in the declaring pod
+        // shares the store layout this unit simulates).
+        let blob = store.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, content).unwrap();
+
+        // The declaring pod's lockfile carries the deps pin.
+        let mut lock = LockFile::empty();
+        lock.packages.insert(
+            "codegraph".to_string(),
+            PodPackageLockEntry {
+                version: "1.0".into(),
+                constraint: None,
+                deps: Some(crate::lock::PackageDepsLock {
+                    deps_hash: hash.clone(),
+                    fetched_at: None,
+                    lock_sha256: None,
+                }),
+                recipe_sha256: None,
+                recipe_digest_scheme: None,
+            },
+        );
+        std::fs::create_dir_all(dir.path().join("upstream")).unwrap();
+        lock.save(&pod_lock_path(dir.path(), "upstream")).unwrap();
+
+        let mut consumer_lock = LockFile::empty();
+        let mut ctx = ReconcileCtx {
+            store: &store,
+            lock: &mut consumer_lock,
+            lock_path: dir.path(),
+            active: None,
+            root: dir.path(),
+            pod_name: "consumer",
+        };
+        let contributed = ContributedPkg {
+            version: Some("1.0".into()),
+            constraint: None,
+            source_pod: Some("upstream".into()),
+        };
+        let mut build = ReconcileBuild::default();
+        build_loaded_member(&mut ctx, &meta, &contributed, &mut build)
+            .expect("the declaring pod's pin must route the build past the gate");
+        assert_eq!(build.pending.len(), 1, "the member must queue a build");
+        assert_eq!(build.pending[0].name, "codegraph");
+        assert!(
+            build.held.is_empty(),
+            "this is a rebuild, not a hold: {:?}",
+            build.held
+        );
+    }
+
+    /// A deps-declaring loaded member whose declaring pod exists but
+    /// carries NO pin still refuses at the closure gate, naming the
+    /// declaring pod and the remedy — fail-loud is preserved through
+    /// the new resolution path (ADR-0048).
+    #[test]
+    fn test_loaded_member_without_a_declaring_pod_pin_still_refuses_at_the_gate() {
+        let mut meta = bare_meta("codegraph", "1.0");
+        meta.deps = Some(crate::snap::PackageDeps {
+            npm: None,
+            pip: None,
+            cargo: None,
+            go: None,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runtime::RuntimeStore::new(dir.path().join("store"));
+        // The declaring pod's lockfile exists but pins nothing.
+        std::fs::create_dir_all(dir.path().join("upstream")).unwrap();
+        LockFile::empty()
+            .save(&pod_lock_path(dir.path(), "upstream"))
+            .unwrap();
+
+        let mut consumer_lock = LockFile::empty();
+        let mut ctx = ReconcileCtx {
+            store: &store,
+            lock: &mut consumer_lock,
+            lock_path: dir.path(),
+            active: None,
+            root: dir.path(),
+            pod_name: "consumer",
+        };
+        let contributed = ContributedPkg {
+            version: Some("1.0".into()),
+            constraint: None,
+            source_pod: Some("upstream".into()),
+        };
+        let mut build = ReconcileBuild::default();
+        let err = build_loaded_member(&mut ctx, &meta, &contributed, &mut build).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("loaded package 'codegraph' (from pod 'upstream')"),
+            "must name the declaring pod: {msg}"
+        );
+        assert!(
+            msg.contains("nau pod --name upstream sync"),
+            "must name the remedy: {msg}"
+        );
+        assert!(
+            build.pending.is_empty(),
+            "a gated member must not queue a build: {:?}",
+            build.pending
+        );
+    }
+
+    /// Containment (ADR-0048): a NON-deps loaded-member build failure
+    /// is contained per member; the deps-closure gate refusal stays a
+    /// whole-verb error.
+    #[test]
+    fn test_loaded_build_failure_containment() {
+        let mut meta = bare_meta("tool", "1.0");
+        contain_loaded_build_failure(&meta, miette::miette!("build exploded"))
+            .expect("a deps-less member's failure must be contained");
+
+        meta.deps = Some(crate::snap::PackageDeps {
+            npm: None,
+            pip: None,
+            cargo: None,
+            go: None,
+        });
+        let err = contain_loaded_build_failure(&meta, miette::miette!("gate refusal"))
+            .expect_err("the deps gate must stay a whole-verb named failure");
+        assert!(
+            format!("{err}").contains("gate refusal"),
+            "the gate error must propagate untouched: {err}"
+        );
+    }
+
+    /// The closure-gate error for a LOADED member names the declaring
+    /// pod and the remedy; the own-package form keeps its message.
+    #[test]
+    fn test_deps_gate_error_names_the_declaring_pod() {
+        let mut meta = bare_meta("codegraph", "1.0");
+        meta.deps = Some(crate::snap::PackageDeps {
+            npm: None,
+            pip: None,
+            cargo: None,
+            go: None,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::runtime::RuntimeStore::new(dir.path().join("store"));
+
+        let err = build_pending_snap(
+            &store,
+            &meta,
+            crate::farm::ClaimLayer::Loaded,
+            None,
+            Some("codegraph"),
+            false,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("loaded package 'codegraph' (from pod 'codegraph')"),
+            "must name the declaring pod: {msg}"
+        );
+        assert!(
+            msg.contains("nau pod --name codegraph sync"),
+            "must name the remedy: {msg}"
+        );
+
+        let err = build_pending_snap(
+            &store,
+            &meta,
+            crate::farm::ClaimLayer::Own,
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("no closure pin exists for it here"),
+            "the own-package gate keeps its message: {err}"
         );
     }
 
