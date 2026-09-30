@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use crate::boot_test::Accel;
 
@@ -6,7 +8,12 @@ use crate::boot_test::Accel;
 #[command(
     name = "nau",
     version,
-    about = "Build Snap packages from Lua declarations"
+    about = "Build Snap packages from Lua declarations",
+    long_about = "Build Snap packages from Lua declarations.
+
+Unknown verbs fall through to `nau-<verb>` executables — a sibling of
+the nau binary first, then PATH (git-style extensibility).",
+    allow_external_subcommands = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -15,162 +22,56 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Build a snap from a Lua declaration file
+    /// Chart: define & resolve (ADR-0049) — the definition lifecycle:
+    /// check, eval, lock, lint, audit, search, index, deps, plus the
+    /// two internal workers in their revealed forms.
+    Chart {
+        #[command(subcommand)]
+        command: ChartCommand,
+    },
+
+    /// Build a snap from a Lua declaration, or manage the binary
+    /// package cache (ADR-0049): `nau build snap` is the build,
+    /// `nau build cache` the cache verbs. The build's own arguments are
+    /// also accepted directly on `build` — the pre-0049 spelling, kept
+    /// working beside the namespace.
     Build {
-        /// Path to the Lua config file (default: nau.lua)
-        #[arg(short, long, default_value = "nau.lua")]
-        file: String,
+        #[command(flatten)]
+        args: BuildArgs,
 
-        /// Directory containing pre-built binaries (default: ./stage/).
-        /// The default ./stage/ is nau-managed: wiped before every
-        /// build phase so stale files cannot leak into a snap. A directory
-        /// passed explicitly via --stage is never wiped — it must be empty
-        /// (or new), or the build is refused.
-        #[arg(short, long)]
-        stage: Option<String>,
-
-        /// Output directory for the .snap file (default: current dir)
-        #[arg(short, long, default_value = ".")]
-        output: String,
-
-        /// Build only for specific architecture(s). Repeat for multiple.
-        /// Default: build for all architectures declared in the config.
-        #[arg(short = 'A', long)]
-        arch: Vec<String>,
-
-        /// Output name to build (from nau.lua outputs table).
-        /// Default: build all outputs.
-        output_name: Option<String>,
-
-        /// Reproducible timestamp for SquashFS (Unix epoch seconds).
-        /// Also read from SOURCE_DATE_EPOCH environment variable.
-        /// Default: current time (non-reproducible).
-        #[arg(long)]
-        source_date_epoch: Option<String>,
-
-        /// Path to lockfile (default: nau.lock).
-        /// Locks source hashes for reproducible builds.
-        #[arg(long, default_value = "nau.lock")]
-        lockfile: String,
-
-        /// Print dependency build order and exit (no build).
-        #[arg(long)]
-        order: bool,
-
-        /// Build all transitive dependencies before building the requested output(s).
-        /// Deps are built in topological order and stored in the binary cache.
-        /// Use --cache to control where cached builds are stored.
-        #[arg(long)]
-        all: bool,
-
-        /// Binary cache directory for built packages (default: ~/.cache/nau/pkgs).
-        /// Cached builds are keyed by source SHA-256, so rebuilds only happen when
-        /// source changes. Combine with --all to build full dependency trees efficiently.
-        #[arg(long)]
-        cache: Option<String>,
-
-        /// Maximum cache size (e.g. "500M", "2G"). When exceeded, oldest entries
-        /// are pruned automatically. Only applies when --cache is set or --all is used.
-        #[arg(long)]
-        cache_max_size: Option<String>,
-
-        /// Override cross-compilation target for all packages.
-        /// Sets the GNU target triplet (e.g. "aarch64-linux-gnu") and exports
-        /// CC/CXX/LD/AR environment variables in the build sandbox.
-        /// Overrides the `target` field on individual snap() declarations.
-        #[arg(long)]
-        target: Option<String>,
-
-        /// Re-resolve input(s) to their latest branch head and update the
-        /// lockfile pins before building. Pass an input name to update one
-        /// input; omit the value to update all inputs.
-        #[arg(long, num_args = 0..=1, default_missing_value = "")]
-        update: Option<String>,
-
-        /// Use only cached/locked inputs — never touch the network.
-        #[arg(long)]
-        offline: bool,
-
-        /// Output structured JSON instead of human-friendly colored output.
-        /// Useful for tooling, CI, or machine parsing.
-        #[arg(long)]
-        json: bool,
+        #[command(subcommand)]
+        command: Option<BuildCommand>,
     },
 
-    /// Build a system image from pinned snaps
+    /// Build, test, and verify system images (ADR-0049): `nau image
+    /// build` builds from pinned snaps, `nau image test` boots one in
+    /// QEMU and asserts the boot, `nau image verify` checks a flashed
+    /// target against its signed manifest. The build's own arguments are
+    /// also accepted directly on `image` — the pre-0049 spelling, kept
+    /// working beside the namespace.
     Image {
-        /// Path to the Lua config file (default: nau.lua)
-        #[arg(short, long, default_value = "nau.lua")]
-        file: String,
+        #[command(flatten)]
+        args: ImageArgs,
 
-        /// Output directory for the .img file (default: current dir)
-        #[arg(short, long, default_value = ".")]
-        output: String,
-
-        /// Target architecture
-        #[arg(short, long, default_value = "amd64")]
-        arch: String,
-
-        /// Snap channel to use for store queries (default: latest/stable)
-        #[arg(long, default_value = "latest/stable")]
-        channel: String,
-
-        /// Cache directory for downloaded snaps (default: ~/.cache/nau/snaps)
-        #[arg(long)]
-        cache: Option<String>,
-
-        /// Maximum cache size (e.g. "500M", "2G"). Auto-prunes oldest entries.
-        #[arg(long)]
-        cache_max_size: Option<String>,
-
-        /// Image output name to build (from nau.lua images table).
-        /// Default: build the first image found.
-        output_name: Option<String>,
-
-        /// Reproducible timestamp for SquashFS (Unix epoch seconds).
-        /// Also read from SOURCE_DATE_EPOCH environment variable.
-        #[arg(long)]
-        source_date_epoch: Option<String>,
-
-        /// Release mode (ADR-0044 D5/D8, #266): publish the deterministic
-        /// media set — nau-<mission>-<version>-<arch>.img + the SIGNED
-        /// .manifest.json + SHA256SUMS, plus the sysupdate transfer
-        /// payloads signed into those sums (#274) when the image declares
-        /// an update_source — into this ADR-0033 D10 export
-        /// tree directory. Requires a pinned SOURCE_DATE_EPOCH, an
-        /// explicit --arch, exactly one disk image (--output-name), and
-        /// the operator signing key (`nau key keygen`). Replaces
-        /// --output as the destination.
-        #[arg(long, value_name = "DIR", conflicts_with = "output")]
-        release: Option<String>,
-
-        /// Path to lockfile (default: nau.lock).
-        #[arg(long, default_value = "nau.lock")]
-        lockfile: String,
-
-        /// Output structured JSON instead of human-friendly colored output.
-        #[arg(long)]
-        json: bool,
+        #[command(subcommand)]
+        command: Option<ImageCommand>,
     },
 
-    /// Manage the package index (list, add, resolve)
-    #[command(subcommand)]
+    /// Manage the package index (list, add, resolve) — legacy hidden
+    /// alias of `chart index` (ADR-0049).
+    #[command(subcommand, hide = true)]
     Index(IndexCommand),
 
     /// Show dependency tree for a package, or fetch dependency closures
-    /// for interpreted packages (ADR-0017, issue #13).
-    #[command(subcommand)]
+    /// for interpreted packages (ADR-0017, issue #13) — legacy hidden
+    /// alias of `chart deps` (ADR-0049).
+    #[command(subcommand, hide = true)]
     Deps(DepsCommand),
 
-    /// Search available packages by name or keyword
-    Search {
-        /// Search query (package name or partial match)
-        query: String,
-
-        /// Output structured JSON instead of human-friendly output.
-        #[arg(long)]
-        json: bool,
-    },
+    /// Search available packages by name or keyword — legacy hidden
+    /// alias of `chart search` (ADR-0049).
+    #[command(hide = true)]
+    Search(SearchArgs),
 
     /// Check system readiness (required tools). The default gates the
     /// full surface; --pod gates only what the pod verbs need (issue #97).
@@ -200,40 +101,18 @@ pub enum Command {
 
     /// Validate a Lua definition without building: bounded subprocess eval
     /// plus Rust-side schema checks, printing every diagnostic (ADR-0010
-    /// Decisions 2-3). The fast AI feedback-loop entry point.
-    Check {
-        /// Path to the Lua definition file
-        file: String,
-
-        /// Output structured JSON instead of human-friendly output.
-        #[arg(long)]
-        json: bool,
-    },
+    /// Decisions 2-3). The fast AI feedback-loop entry point — legacy
+    /// hidden alias of `chart check` (ADR-0049).
+    #[command(hide = true)]
+    Check(CheckArgs),
 
     /// Lint declarations: a battery of package/image/pod checks beyond the
     /// leak scan (issue #53). Every finding carries the check name, the
     /// package, a severity, and a one-line fix hint. Exits nonzero only on
     /// errors, never warnings. Fully offline: index/lockfile data only.
-    Lint {
-        /// Path to the Lua definition file (default: nau.lua)
-        #[arg(short, long, default_value = "nau.lua")]
-        file: String,
-
-        /// Lint a pod's declared packages (app collisions) instead of a
-        /// definition file.
-        #[arg(long)]
-        pod: Option<String>,
-
-        /// Snap channel for resolution context (default: latest/stable).
-        /// Kernel/gadget snaps derive their channel from the image base
-        /// track on top of this (ADR-0019).
-        #[arg(long, default_value = "latest/stable")]
-        channel: String,
-
-        /// Output structured JSON instead of human-friendly output.
-        #[arg(long)]
-        json: bool,
-    },
+    /// Legacy hidden alias of `chart lint` (ADR-0049).
+    #[command(hide = true)]
+    Lint(LintArgs),
 
     /// Audit lockfile pins against the OSV vulnerability database (issue
     /// #52). Source and dependency pins are version-matched (confirmed
@@ -241,86 +120,26 @@ pub enum Command {
     /// the lockfile pins store revisions, not upstream versions).
     /// Online-first with a local response cache; offline it degrades to a
     /// named stale-database warning, never a hard failure. Exits nonzero
-    /// only on confirmed findings.
-    Audit {
-        /// Path to the Lua definition file. Optional: when given, its
-        /// evaluated outputs enrich the audit with declared versions and
-        /// declaration labels for source pins.
-        #[arg(short, long)]
-        file: Option<String>,
-
-        /// Path to lockfile (project nau.lock or a pod's lockfile).
-        #[arg(short, long, default_value = "nau.lock")]
-        lockfile: String,
-
-        /// Force a refresh: bypass the local OSV response cache and
-        /// rewrite it from the live database.
-        #[arg(long)]
-        update: bool,
-
-        /// Output structured JSON instead of human-friendly output.
-        #[arg(long)]
-        json: bool,
-    },
+    /// only on confirmed findings. Legacy hidden alias of `chart audit`
+    /// (ADR-0049).
+    #[command(hide = true)]
+    Audit(AuditArgs),
 
     /// Resolve and refresh all input pins in the lockfile (no build).
     /// Pins each github input to its current branch head and records a
     /// content hash; `path:` inputs are marked local (unlocked).
-    Lock {
-        /// Path to the Lua config file (default: nau.lua).
-        /// If not found, locks the default package index input.
-        #[arg(short, long, default_value = "nau.lua")]
-        file: String,
-
-        /// Path to lockfile (default: nau.lock).
-        #[arg(long, default_value = "nau.lock")]
-        lockfile: String,
-
-        /// Output structured JSON with pin state instead of human output.
-        #[arg(long)]
-        json: bool,
-    },
+    /// Legacy hidden alias of `chart lock` (ADR-0049).
+    #[command(hide = true)]
+    Lock(LockArgs),
 
     /// Evaluate a definition and emit the image manifest IR (no build).
     /// Deterministic: the same definition + lockfile always produce
     /// byte-identical JSON. Resolution is data-only (definition pins,
     /// lockfile, package index) — fully pinned projects eval offline; the
     /// --offline flag additionally forbids fetching uncached inputs.
-    Eval {
-        /// Path to the Lua config file (default: nau.lua)
-        #[arg(short, long, default_value = "nau.lua")]
-        file: String,
-
-        /// Write the manifest to this file atomically (default: stdout)
-        #[arg(short, long)]
-        output: Option<String>,
-
-        /// Only evaluate this output or image (from the definition's
-        /// returned table). Default: everything declared.
-        output_name: Option<String>,
-
-        /// Target architecture for image contents (default: amd64)
-        #[arg(short, long, default_value = "amd64")]
-        arch: String,
-
-        /// Snap channel for the resolution context (default: latest/stable)
-        #[arg(long, default_value = "latest/stable")]
-        channel: String,
-
-        /// Path to lockfile (default: nau.lock).
-        /// Pins source hashes and snap revisions for reproducible evals.
-        #[arg(long, default_value = "nau.lock")]
-        lockfile: String,
-
-        /// Use only pinned/cached inputs — never touch the network.
-        #[arg(long)]
-        offline: bool,
-
-        /// Suppress human-readable status output (the manifest is JSON
-        /// either way).
-        #[arg(long)]
-        json: bool,
-    },
+    /// Legacy hidden alias of `chart eval` (ADR-0049).
+    #[command(hide = true)]
+    Eval(EvalArgs),
 
     /// Generate shell completion scripts
     Completion {
@@ -330,64 +149,10 @@ pub enum Command {
 
     /// Push built artifacts (`.snap`/`.img`) to an OCI registry as one
     /// OCI image manifest bundle (Phase 25). Blobs are sha256-content-
-    /// addressed; blobs already in the registry are skipped.
-    Push {
-        /// Destination reference: [registry[:port]/]repo[:tag|@digest].
-        /// An explicit registry host is required (e.g. localhost:5000/ns/repo,
-        /// ghcr.io/owner/repo) — the docker.io implicit default is
-        /// deliberately out of scope. Pushing by @digest is an error.
-        reference: String,
-
-        /// Directory to auto-discover artifacts in (*.snap, *.img;
-        /// default: current dir, matching build/image --output)
-        #[arg(short = 'd', long, default_value = ".")]
-        dir: String,
-
-        /// Explicit artifact file(s) to push (repeatable; overrides --dir
-        /// discovery). Extension decides the layer media type.
-        #[arg(long)]
-        snap: Vec<String>,
-
-        /// Explicit disk image file(s) to push (repeatable; overrides
-        /// --dir discovery).
-        #[arg(long)]
-        image: Vec<String>,
-
-        /// Tag to push under (default: <name>-<version> derived from the
-        /// artifact file names and sanitized to the registry tag charset).
-        #[arg(long)]
-        tag: Option<String>,
-
-        /// Registry username (requires --password-stdin).
-        #[arg(long)]
-        username: Option<String>,
-
-        /// Read the registry password from stdin (one line, no echo).
-        #[arg(long)]
-        password_stdin: bool,
-
-        /// Talk plain http:// (no TLS) — intended for local registries
-        /// (e.g. registry:2 on localhost:5000). Refused otherwise.
-        #[arg(long)]
-        insecure_http: bool,
-
-        /// Attempt cross-repo blob mounts from this source repository
-        /// (`POST ...?mount=<digest>&from=<repo>`) before uploading:
-        /// a 201 response reuses the bytes already in the registry (no
-        /// transfer). Default: empty = mounts skipped.
-        #[arg(long)]
-        mount_from: Option<String>,
-
-        /// Write the built-manifest record (the manifest Artifact
-        /// extension: per-blob sha256 digest, size, media type) to this
-        /// file after a successful push. `pull --expect` consumes it.
-        #[arg(long)]
-        record: Option<String>,
-
-        /// Output structured JSON instead of human-friendly output.
-        #[arg(long)]
-        json: bool,
-    },
+    /// addressed; blobs already in the registry are skipped. Legacy
+    /// hidden alias of `ship push` (ADR-0049).
+    #[command(hide = true)]
+    Push(PushArgs),
 
     /// Pull an artifact bundle from an OCI registry: fetch the manifest,
     /// download every blob with sha256 verification (fail-closed on any
@@ -397,149 +162,49 @@ pub enum Command {
     /// reference pulls from a peer and an `http(s)://…/<pkg>` reference
     /// from a static export tree — both verify the signed
     /// PackageManifest fail-closed and stage into the pod named by
-    /// `--pod` instead of writing files.
-    Pull {
-        /// Source reference: [registry[:port]/]repo[:tag|@digest]. An
-        /// explicit registry host is required. A tag or @digest is
-        /// required — there is no default tag. When pulled by @digest,
-        /// the received manifest itself is digest-verified.
-        reference: String,
-
-        /// Directory to write pulled artifact files into (default: current dir)
-        #[arg(short, long, default_value = ".")]
-        out_dir: String,
-
-        /// Registry username (requires --password-stdin).
-        #[arg(long)]
-        username: Option<String>,
-
-        /// Read the registry password from stdin (one line, no echo).
-        #[arg(long)]
-        password_stdin: bool,
-
-        /// Talk plain http:// (no TLS) — intended for local registries.
-        #[arg(long)]
-        insecure_http: bool,
-
-        /// Verify received blobs against a built-manifest record (from
-        /// `push --record`) IN ADDITION to the OCI descriptors —
-        /// fail-closed on any digest, size, or media-type mismatch.
-        #[arg(long)]
-        expect: Option<String>,
-
-        /// Install pulled `.snap` payloads into the state root after the
-        /// download. Revisions resolve from the `nau.lock` pins in
-        /// the current directory (matched by sha3-384); unpinned or
-        /// divergent blobs are refused (use plain pull to keep files).
-        #[arg(long)]
-        install: bool,
-
-        /// State root for --install (default: /var/lib/nau).
-        #[arg(long)]
-        state_dir: Option<String>,
-
-        /// Pod store that peer (`nau://`) and static-URL
-        /// (`http(s)://`) pulls stage into (default: `default`) — the
-        /// verified manifest + blobs land in the named pod's store and
-        /// installation stays the pod workflow, never a pull side
-        /// effect (ADR-0033 Decision 5). Ignored for plain registry
-        /// references.
-        #[arg(long, value_name = "POD")]
-        pod: Option<String>,
-
-        /// Accept a manifest whose revision is OLDER than the installed
-        /// or staged one for that name (ADR-0033 Decision 7 freshness
-        /// rule). Peer/URL pulls only. Note: `nau.lock` pins do NOT
-        /// bind on the peer lane yet — PackageManifest carries no store
-        /// pin; pin-binding is deferred (ADR-0033 Decision 7).
-        #[arg(long = "allow-downgrade")]
-        allow_downgrade: bool,
-
-        /// Output structured JSON instead of human-friendly output.
-        #[arg(long)]
-        json: bool,
-    },
+    /// `--pod` instead of writing files. Legacy hidden alias of
+    /// `ship pull` (ADR-0049).
+    #[command(hide = true)]
+    Pull(PullArgs),
 
     /// Serve the pod store to LAN peers over a minimal HTTP/1.1 subset
     /// (ADR-0033 Decisions 4+5): `GET /info`, `GET /manifests/<pkg>`,
     /// `GET /blobs/<sha256>`. Runs in the foreground until interrupted;
     /// unsigned store entries are never served. Binding and announce
     /// policy come from `node {}` in nau.lua — absent `node {}`,
-    /// the loopback default applies and nothing is announced.
-    Serve {
-        /// Bind address override. Default: `node {}`'s
-        /// `serve.address`, else 127.0.0.1 (loopback — `/info`
-        /// publishes the pod inventory to everyone who can reach the
-        /// socket; `0.0.0.0` is an explicit choice).
-        #[arg(long)]
-        address: Option<String>,
-
-        /// Bind port override (default: 7780, unprivileged).
-        #[arg(long)]
-        port: Option<u16>,
-
-        /// Announce the node on the LAN via mDNS (`_nau._tcp`,
-        /// ADR-0033 Decision 3), overriding `node {}`'s
-        /// `serve.announce`. The declaration is the source of truth;
-        /// absent both, serve does not announce.
-        #[arg(long)]
-        announce: bool,
-
-        /// Pod whose store to serve (default: `default`) — the named
-        /// pod's store is the served surface, matching `--pod` on
-        /// `pull` and `export` (ADR-0033 Decision 5).
-        #[arg(long, value_name = "POD")]
-        pod: Option<String>,
-    },
+    /// the loopback default applies and nothing is announced. Legacy
+    /// hidden alias of `peer serve` (ADR-0049).
+    #[command(hide = true)]
+    Serve(ServeArgs),
 
     /// Browse the LAN for announcing nau peers (ADR-0033 Decision
     /// 3): mDNS `_nau._tcp.local.` for a bounded window, printing
     /// every node found. Discovery only, never trust — pulls still
-    /// verify every manifest fail-closed (ADR-0033 Decision 7).
-    Peers {
-        /// Browse window in seconds (default: 2).
-        #[arg(long, default_value_t = 2)]
-        secs: u64,
-
-        /// Output structured JSON instead of human-friendly output.
-        #[arg(long)]
-        json: bool,
-    },
+    /// verify every manifest fail-closed (ADR-0033 Decision 7). Legacy
+    /// hidden alias of `peer browse` (ADR-0049).
+    #[command(hide = true)]
+    Peers(PeersArgs),
 
     /// Export the pod store's shareable content as a static directory
     /// tree any web server can serve (ADR-0033 Decision 10):
     /// `index.json` (the `/info` payload), `manifests/<pkg>.json`
     /// (signed PackageManifests), `blobs/<sha256>`. Upload the directory
-    /// to publish — no nau code runs server-side.
-    Export {
-        /// Directory to write the export tree into
-        out: String,
+    /// to publish — no nau code runs server-side. Legacy hidden alias of
+    /// `peer export` (ADR-0049).
+    #[command(hide = true)]
+    Export(ExportArgs),
 
-        /// Pod whose store to export (default: `default`).
-        #[arg(long, value_name = "POD")]
-        pod: Option<String>,
-
-        /// Curate the export to one mission's pinned pool (#275): only
-        /// the packages the named `image()` declaration pins (base,
-        /// kernel, gadget, snaps). Every pinned package must be in the
-        /// pod store — a missing pin fails the export.
-        #[arg(long, value_name = "MISSION")]
-        mission: Option<String>,
-
-        /// Project Lua declaring the mission (with --mission).
-        #[arg(long, value_name = "FILE", requires = "mission")]
-        file: Option<String>,
-    },
-
-    /// Manage the binary package cache
-    #[command(subcommand)]
+    /// Manage the binary package cache — legacy hidden alias of
+    /// `build cache` (ADR-0049).
+    #[command(subcommand, hide = true)]
     Cache(CacheCommand),
 
     /// Key ceremony (ADR-0011 step (e), ADR-0024 §4): generate, rotate,
     /// promote, and revoke the update-manifest signing keys. The operator
     /// surface over `~/.config/nau/` (secret-key, secret-key.new,
-    /// keys/<id>.pub) and the local `keys/revoked-keys` list.
-    #[command(subcommand)]
+    /// keys/<id>.pub) and the local `keys/revoked-keys` list. Legacy
+    /// hidden alias of `trust key` (ADR-0049).
+    #[command(subcommand, hide = true)]
     Key(KeyCommand),
 
     /// SSH host CA ceremony (ADR-0045 amendment, #283 decided): generate
@@ -547,9 +212,41 @@ pub enum Command {
     /// host certificates. A trust root DISTINCT from the update-manifest
     /// signing key (`nau key`); the keypair lives under
     /// `~/.config/nau/ca/` (`ca` 0600 private, `ca.pub` public — the
-    /// future `@cert-authority` line).
-    #[command(subcommand)]
+    /// future `@cert-authority` line). Legacy hidden alias of
+    /// `trust ca` (ADR-0049).
+    #[command(subcommand, hide = true)]
     Ca(CaCommand),
+
+    /// Ship: distribute (ADR-0049) — push and pull OCI artifact
+    /// bundles.
+    Ship {
+        #[command(subcommand)]
+        command: ShipCommand,
+    },
+
+    /// Peer: LAN sharing (ADR-0049, ADR-0033) — serve the pod store,
+    /// browse announcing peers, export a static tree.
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
+
+    /// Trust: the ceremony domain (ADR-0049) — the key-ceremony verbs
+    /// flattened one level: keygen, rotate, promote, revoke, list,
+    /// verify. `--ca` scopes keygen/list to the SSH host CA ceremony.
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
+    },
+
+    /// Pool: the build-worker fleet (ADR-0049, as amended by the #321
+    /// council — `pool` replaces ADR-0040's "farm" naming, which already
+    /// belongs to the pod bin farm) — provision, destroy, burst, down,
+    /// issue, publish, pickup, plus the worker-side probe and job verbs.
+    Pool {
+        #[command(subcommand)]
+        command: PoolCommand,
+    },
 
     /// Manage on-device installs: generations + file-level content store
     /// (ADR-0012 step 5, Phase 24b). Operates on a state root (default
@@ -601,7 +298,10 @@ pub enum Command {
     ///
     /// `--pod` selects the pod (default: `default`). Also the future
     /// home for env hooks.
-    #[command(trailing_var_arg = true)]
+    ///
+    /// Hidden under ADR-0049: the pod-domain reshape lands separately;
+    /// the spelling keeps working unchanged.
+    #[command(trailing_var_arg = true, hide = true)]
     Run {
         /// App name: a declared app from the pod, or — as everything
         /// after `--` — the start of an arbitrary command whose remaining
@@ -647,115 +347,19 @@ pub enum Command {
     /// `--runs N` boots the image N times in sequence, and
     /// `--expect-counter-seq` asserts the systemd-boot try-boot counters
     /// observed on the ESP before each boot (issue #77).
-    Test {
-        /// Path to the built disk image (`.img`) to boot.
-        image: String,
-
-        /// Boot timeout in seconds. QEMU is killed when it elapses; the kill
-        /// still passes when a completion target was reached before it.
-        #[arg(long, default_value_t = 120)]
-        timeout: u64,
-
-        /// QEMU accelerator. `kvm` (default) falls back to `tcg` when KVM is
-        /// unavailable — `tcg` is software emulation (much slower).
-        #[arg(long, value_enum, default_value = "kvm")]
-        accel: Accel,
-
-        /// Write the captured serial console here (default:
-        /// `<image>.serial.log`). This is the auditable boot evidence.
-        #[arg(long)]
-        log: Option<String>,
-
-        /// Extra substring the serial log MUST contain to pass (repeatable).
-        /// Tightens the boot assertion beyond the built-in markers, e.g.
-        /// `--require "Reached target Boot Completion Check"` for an A/B image
-        /// that emits the try-boot completion target.
-        #[arg(long = "require")]
-        require: Vec<String>,
-
-        /// Accept a boot that reached the init handoff without ever reaching
-        /// a completed target (issue #84 opt-out). Restores the pre-#84
-        /// handoff-only gate; use only for images that legitimately never
-        /// reach `boot-complete.target` or `default.target`.
-        #[arg(long = "allow-no-completion")]
-        allow_no_completion: bool,
-
-        /// Directory holding the UEFI firmware (`OVMF_CODE.fd`/`OVMF_VARS.fd`
-        /// or the edk2 equivalents). Default: auto-discovered.
-        #[arg(long)]
-        firmware_dir: Option<String>,
-
-        /// Boot the image N times in sequence (default 1). With N > 1 a single
-        /// sparse copy is booted repeatedly so guest mutations persist; each
-        /// boot's serial log and ESP listing are archived.
-        #[arg(long, default_value_t = 1)]
-        runs: u32,
-
-        /// Expected try-boot counter sequence, one element per boot, observed
-        /// BEFORE each boot. `3-0,2-1` pins tries-left and tries-done; a bare
-        /// `3,2,1,0` leaves tries-done unchecked.
-        ///
-        /// Boot counting lives in the ESP filename: systemd-boot renames the
-        /// selected UKI (`foo+3-0.efi` -> `foo+2-1.efi`) before the kernel
-        /// loads, so the serial console cannot see it. A fixture MUST use a
-        /// DISTINCT version for a counted entry: systemd-boot strips the
-        /// `+N-M` counter when deriving an entry id, so a counted UKI
-        /// differing from its sibling only by the counter shares its id; with
-        /// one entry counterless the comparator returns 0 and selection
-        /// becomes arbitrary.
-        #[arg(long = "expect-counter-seq")]
-        expect_counter_seq: Option<String>,
-
-        /// Extra argv token passed through to QEMU verbatim (repeatable;
-        /// each value is ONE argv token, so an option and its value are two
-        /// `--qemu-arg` occurrences; values starting with `-` need clap's
-        /// `=` form: `--qemu-arg=-nic`). Appended after the built-in
-        /// drives — this is how the update proof (#80) attaches guest
-        /// networking: `--qemu-arg=-nic --qemu-arg user,model=virtio-net-pci`.
-        #[arg(long = "qemu-arg")]
-        qemu_args: Vec<String>,
-
-        /// Output structured JSON instead of human-friendly output.
-        #[arg(long)]
-        json: bool,
-    },
+    ///
+    /// Legacy hidden alias of `image test` (ADR-0049).
+    #[command(hide = true)]
+    Test(TestArgs),
 
     /// Verify a flashed mission image against its signed manifest
     /// (ADR-0044 D4). Read-only and unprivileged: reads the target's GPT
     /// and dm-verity hash regions, recomputes them against the published
     /// signed image manifest, and refuses by name on any mismatch. This
-    /// verb has no write path.
-    VerifyImage {
-        /// Flashed target to verify: a block device named by stable id
-        /// (/dev/disk/by-id/...) or a whole-disk image file. Only ever
-        /// opened for reading.
-        #[arg(long)]
-        device: String,
-
-        /// Signed image manifest (.manifest.json) published with the
-        /// mission image (ADR-0044 D5).
-        #[arg(long)]
-        manifest: String,
-
-        /// Extra trust anchor for the manifest signature: a public-key
-        /// file (same two-line format `nau key keygen` writes),
-        /// accepted beside the operator keychain (~/.config/nau/keys).
-        #[arg(long)]
-        key: Option<String>,
-
-        /// Which slot's regions to verify: `a`, `b`, or `auto` (the
-        /// default). The manifest signs a generation, not a slot — auto
-        /// locates it wherever it sits (the post-sysupdate case: the new
-        /// manifest verifies the slot sysupdate filled); `a`/`b` demand
-        /// the physical slot (the build writes slot B contiguous behind
-        /// slot A) and refuse by name when the generation sits elsewhere.
-        #[arg(long, value_enum, default_value = "auto")]
-        slot: crate::image::SlotSelector,
-
-        /// Output structured JSON instead of human-friendly output.
-        #[arg(long)]
-        json: bool,
-    },
+    /// verb has no write path. Legacy hidden alias of `image verify`
+    /// (ADR-0049).
+    #[command(hide = true)]
+    VerifyImage(VerifyImageArgs),
 
     /// Internal: evaluation worker process (hidden). Re-executed by the
     /// parent to evaluate untrusted definitions in a bounded subprocess
@@ -790,10 +394,1021 @@ pub enum Command {
 
     /// Manage build-farm workers (ADR-0040): provision cloud workers
     /// (mint + inject + pin the host key per ADR-0045) or destroy them.
+    /// Legacy hidden alias of `pool` (ADR-0049).
+    #[command(hide = true)]
     Workers {
         #[command(subcommand)]
         command: WorkersCommand,
     },
+
+    /// External-subcommand catch-all (ADR-0049 Decision 5): an unknown
+    /// verb lands here ONLY after every real variant — the public domain
+    /// groups, the hidden legacy spellings, and the hidden `__*` workers
+    /// — has had its chance to match. Element 0 is the verb itself; the
+    /// rest is the remaining argv, forwarded verbatim to a `nau-<verb>`
+    /// executable (exe-dir sibling first, then PATH — never an
+    /// environment override). Dispatched by [`run_external`].
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
+}
+
+// ── Domain namespaces (ADR-0049) ────────────────────────────────────
+//
+// Each legacy top-level command's fields live in one `clap::Args`
+// struct, shared verbatim by the legacy hidden spelling (a tuple
+// variant of [`Command`]) and the domain namespace's verb. Both
+// spellings parse to the same struct; `From<$group> for Command` folds
+// the namespace parse onto the legacy variant so main() dispatches
+// every command through one match.
+
+/// The `nau build` / `nau build snap` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct BuildArgs {
+    /// Path to the Lua config file (default: nau.lua)
+    #[arg(short, long, default_value = "nau.lua")]
+    pub file: String,
+
+    /// Directory containing pre-built binaries (default: ./stage/).
+    /// The default ./stage/ is nau-managed: wiped before every
+    /// build phase so stale files cannot leak into a snap. A directory
+    /// passed explicitly via --stage is never wiped — it must be empty
+    /// (or new), or the build is refused.
+    #[arg(short, long)]
+    pub stage: Option<String>,
+
+    /// Output directory for the .snap file (default: current dir)
+    #[arg(short, long, default_value = ".")]
+    pub output: String,
+
+    /// Build only for specific architecture(s). Repeat for multiple.
+    /// Default: build for all architectures declared in the config.
+    #[arg(short = 'A', long)]
+    pub arch: Vec<String>,
+
+    /// Output name to build (from nau.lua outputs table).
+    /// Default: build all outputs.
+    pub output_name: Option<String>,
+
+    /// Reproducible timestamp for SquashFS (Unix epoch seconds).
+    /// Also read from SOURCE_DATE_EPOCH environment variable.
+    /// Default: current time (non-reproducible).
+    #[arg(long)]
+    pub source_date_epoch: Option<String>,
+
+    /// Path to lockfile (default: nau.lock).
+    /// Locks source hashes for reproducible builds.
+    #[arg(long, default_value = "nau.lock")]
+    pub lockfile: String,
+
+    /// Print dependency build order and exit (no build).
+    #[arg(long)]
+    pub order: bool,
+
+    /// Build all transitive dependencies before building the requested output(s).
+    /// Deps are built in topological order and stored in the binary cache.
+    /// Use --cache to control where cached builds are stored.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Binary cache directory for built packages (default: ~/.cache/nau/pkgs).
+    /// Cached builds are keyed by source SHA-256, so rebuilds only happen when
+    /// source changes. Combine with --all to build full dependency trees efficiently.
+    #[arg(long)]
+    pub cache: Option<String>,
+
+    /// Maximum cache size (e.g. "500M", "2G"). When exceeded, oldest entries
+    /// are pruned automatically. Only applies when --cache is set or --all is used.
+    #[arg(long)]
+    pub cache_max_size: Option<String>,
+
+    /// Override cross-compilation target for all packages.
+    /// Sets the GNU target triplet (e.g. "aarch64-linux-gnu") and exports
+    /// CC/CXX/LD/AR environment variables in the build sandbox.
+    /// Overrides the `target` field on individual snap() declarations.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Re-resolve input(s) to their latest branch head and update the
+    /// lockfile pins before building. Pass an input name to update one
+    /// input; omit the value to update all inputs.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub update: Option<String>,
+
+    /// Use only cached/locked inputs — never touch the network.
+    #[arg(long)]
+    pub offline: bool,
+
+    /// Output structured JSON instead of human-friendly colored output.
+    /// Useful for tooling, CI, or machine parsing.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Verbs for `nau build` (ADR-0049).
+#[derive(clap::Subcommand)]
+pub enum BuildCommand {
+    /// Build a snap from a Lua declaration file
+    Snap(Box<BuildArgs>),
+
+    /// Manage the binary package cache
+    #[command(subcommand)]
+    Cache(CacheCommand),
+}
+
+/// The `nau image` / `nau image build` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct ImageArgs {
+    /// Path to the Lua config file (default: nau.lua)
+    #[arg(short, long, default_value = "nau.lua")]
+    pub file: String,
+
+    /// Output directory for the .img file (default: current dir)
+    #[arg(short, long, default_value = ".")]
+    pub output: String,
+
+    /// Target architecture
+    #[arg(short, long, default_value = "amd64")]
+    pub arch: String,
+
+    /// Snap channel to use for store queries (default: latest/stable)
+    #[arg(long, default_value = "latest/stable")]
+    pub channel: String,
+
+    /// Cache directory for downloaded snaps (default: ~/.cache/nau/snaps)
+    #[arg(long)]
+    pub cache: Option<String>,
+
+    /// Maximum cache size (e.g. "500M", "2G"). Auto-prunes oldest entries.
+    #[arg(long)]
+    pub cache_max_size: Option<String>,
+
+    /// Image output name to build (from nau.lua images table).
+    /// Default: build the first image found.
+    pub output_name: Option<String>,
+
+    /// Reproducible timestamp for SquashFS (Unix epoch seconds).
+    /// Also read from SOURCE_DATE_EPOCH environment variable.
+    #[arg(long)]
+    pub source_date_epoch: Option<String>,
+
+    /// Release mode (ADR-0044 D5/D8, #266): publish the deterministic
+    /// media set — nau-<mission>-<version>-<arch>.img + the SIGNED
+    /// .manifest.json + SHA256SUMS, plus the sysupdate transfer
+    /// payloads signed into those sums (#274) when the image declares
+    /// an update_source — into this ADR-0033 D10 export
+    /// tree directory. Requires a pinned SOURCE_DATE_EPOCH, an
+    /// explicit --arch, exactly one disk image (--output-name), and
+    /// the operator signing key (`nau key keygen`). Replaces
+    /// --output as the destination.
+    #[arg(long, value_name = "DIR", conflicts_with = "output")]
+    pub release: Option<String>,
+
+    /// Path to lockfile (default: nau.lock).
+    #[arg(long, default_value = "nau.lock")]
+    pub lockfile: String,
+
+    /// Output structured JSON instead of human-friendly colored output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Verbs for `nau image` (ADR-0049).
+#[derive(clap::Subcommand)]
+pub enum ImageCommand {
+    /// Build a system image from pinned snaps
+    Build(ImageArgs),
+
+    /// Boot a built disk image in QEMU and assert the boot completed
+    /// (the `nau test` harness)
+    Test(TestArgs),
+
+    /// Verify a flashed mission image against its signed manifest
+    /// (the `nau verify-image` surface)
+    Verify(VerifyImageArgs),
+}
+
+/// Verbs for `nau chart` (ADR-0049): the definition lifecycle — check,
+/// eval, lock, lint, audit, search, index, deps — plus the two internal
+/// workers in their revealed forms.
+#[derive(clap::Subcommand)]
+pub enum ChartCommand {
+    /// Validate a Lua definition without building: bounded subprocess eval
+    /// plus Rust-side schema checks, printing every diagnostic (ADR-0010
+    /// Decisions 2-3). The fast AI feedback-loop entry point.
+    Check(CheckArgs),
+
+    /// Evaluate a definition and emit the image manifest IR (no build).
+    /// Deterministic: the same definition + lockfile always produce
+    /// byte-identical JSON.
+    Eval(EvalArgs),
+
+    /// Advanced: invoked by nau itself. The bounded evaluation worker the
+    /// parent re-executes via `current_exe()` to evaluate untrusted
+    /// definitions (ADR-0010 Decisions 4+5) — the revealed form of the
+    /// hidden `__eval-worker` alias. Not an operator surface.
+    EvalWorker,
+
+    /// Advanced: invoked by nau itself. The bounded analyzer worker the
+    /// parent re-executes for the strict-analyzer gate (containment
+    /// parity with `chart eval-worker`) — the revealed form of the
+    /// hidden `__check-worker` alias. Not an operator surface.
+    CheckWorker,
+
+    /// Resolve and refresh all input pins in the lockfile (no build).
+    /// Pins each github input to its current branch head and records a
+    /// content hash; `path:` inputs are marked local (unlocked).
+    Lock(LockArgs),
+
+    /// Lint declarations: a battery of package/image/pod checks beyond
+    /// the leak scan (issue #53). Exits nonzero only on errors, never
+    /// warnings. Fully offline.
+    Lint(LintArgs),
+
+    /// Audit lockfile pins against the OSV vulnerability database
+    /// (issue #52). Exits nonzero only on confirmed findings.
+    Audit(AuditArgs),
+
+    /// Search available packages by name or keyword
+    Search(SearchArgs),
+
+    /// Manage the package index (list, add, resolve)
+    #[command(subcommand)]
+    Index(IndexCommand),
+
+    /// Show dependency tree for a package, or fetch dependency closures
+    /// for interpreted packages (ADR-0017, issue #13)
+    #[command(subcommand)]
+    Deps(DepsCommand),
+}
+
+impl From<ChartCommand> for Command {
+    fn from(sub: ChartCommand) -> Self {
+        match sub {
+            ChartCommand::Check(args) => Command::Check(args),
+            ChartCommand::Eval(args) => Command::Eval(args),
+            ChartCommand::EvalWorker => Command::EvalWorker,
+            ChartCommand::CheckWorker => Command::CheckWorker,
+            ChartCommand::Lock(args) => Command::Lock(args),
+            ChartCommand::Lint(args) => Command::Lint(args),
+            ChartCommand::Audit(args) => Command::Audit(args),
+            ChartCommand::Search(args) => Command::Search(args),
+            ChartCommand::Index(index) => Command::Index(index),
+            ChartCommand::Deps(deps) => Command::Deps(deps),
+        }
+    }
+}
+
+/// Verbs for `nau ship` (ADR-0049): distribute — push and pull OCI
+/// artifact bundles.
+#[derive(clap::Subcommand)]
+pub enum ShipCommand {
+    /// Push built artifacts (`.snap`/`.img`) to an OCI registry as one
+    /// OCI image manifest bundle (Phase 25).
+    Push(PushArgs),
+
+    /// Pull an artifact bundle from an OCI registry: fetch the manifest,
+    /// download every blob with sha256 verification (fail-closed on any
+    /// mismatch), and write the files under their original names.
+    Pull(PullArgs),
+}
+
+impl From<ShipCommand> for Command {
+    fn from(sub: ShipCommand) -> Self {
+        match sub {
+            ShipCommand::Push(args) => Command::Push(args),
+            ShipCommand::Pull(args) => Command::Pull(args),
+        }
+    }
+}
+
+/// Verbs for `nau peer` (ADR-0049, ADR-0033): LAN sharing — serve the
+/// pod store, browse announcing peers, export a static tree.
+#[derive(clap::Subcommand)]
+pub enum PeerCommand {
+    /// Serve the pod store to LAN peers over a minimal HTTP/1.1 subset
+    /// (ADR-0033 Decisions 4+5).
+    Serve(ServeArgs),
+
+    /// Browse the LAN for announcing nau peers (ADR-0033 Decision 3):
+    /// mDNS discovery only, never trust.
+    Browse(PeersArgs),
+
+    /// Export the pod store's shareable content as a static directory
+    /// tree any web server can serve (ADR-0033 Decision 10).
+    Export(ExportArgs),
+}
+
+impl From<PeerCommand> for Command {
+    fn from(sub: PeerCommand) -> Self {
+        match sub {
+            PeerCommand::Serve(args) => Command::Serve(args),
+            PeerCommand::Browse(args) => Command::Peers(args),
+            PeerCommand::Export(args) => Command::Export(args),
+        }
+    }
+}
+
+/// Verbs for `nau trust` (ADR-0049): the key-ceremony surface
+/// flattened one level — keygen, rotate, promote, revoke, list, verify
+/// — with `--ca` scoping `keygen`/`list` to the SSH host CA ceremony.
+/// Every verb folds onto the existing `KeyCommand`/`CaCommand` handlers.
+#[derive(clap::Subcommand)]
+pub enum TrustCommand {
+    /// Generate the update signing key under `--home` (refuses to
+    /// overwrite; installs the public key as a trust anchor). With
+    /// `--ca`, generate the SSH host CA keypair instead (ADR-0045):
+    /// refuses to overwrite an existing CA without `--force`.
+    Keygen(TrustKeygenArgs),
+
+    /// Mint the rotation successor at `<home>/.config/nau/secret-key.new`.
+    /// NOT trusted until `trust promote`; the generation chain is
+    /// recorded in `keys/ceremony.json` (issue #51), and `--manifest`
+    /// is dual-signed under the successor.
+    Rotate(TrustRotateArgs),
+
+    /// Promote the pending rotation: `secret-key.new` → `secret-key`,
+    /// installing the successor's public key as a trust anchor (the old
+    /// anchor stays, dual-trust overlap window).
+    Promote(TrustPromoteArgs),
+
+    /// Revoke `key-id`: remove its trust anchor, record it in
+    /// `keys/revoked-keys`, and date the revocation in the ledger.
+    Revoke(TrustRevokeArgs),
+
+    /// Print the ceremony ledger (`keys/ceremony.json`). With `--ca`,
+    /// introspect the SSH host CA instead: which halves are on disk,
+    /// the public line, and the fingerprint.
+    List(TrustListArgs),
+
+    /// Verify a manifest JSON under the ceremony policy: any signature
+    /// from a live trusted key verifies; rotated-out keys past their
+    /// overlap window verify with a warning; revoked-only fails.
+    Verify(TrustVerifyArgs),
+}
+
+impl From<TrustCommand> for Command {
+    fn from(sub: TrustCommand) -> Self {
+        match sub {
+            TrustCommand::Keygen(args) => {
+                if args.ca {
+                    Command::Ca(CaCommand::Keygen {
+                        home: args.home,
+                        force: args.force,
+                        json: args.json,
+                    })
+                } else {
+                    Command::Key(KeyCommand::Keygen {
+                        home: args.home,
+                        json: args.json,
+                    })
+                }
+            }
+            TrustCommand::Rotate(args) => Command::Key(KeyCommand::Rotate {
+                home: args.home,
+                manifest: args.manifest,
+                window_days: args.window_days,
+                json: args.json,
+            }),
+            TrustCommand::Promote(args) => Command::Key(KeyCommand::Promote {
+                home: args.home,
+                json: args.json,
+            }),
+            TrustCommand::Revoke(args) => Command::Key(KeyCommand::Revoke {
+                key_id: args.key_id,
+                home: args.home,
+                json: args.json,
+            }),
+            TrustCommand::List(args) => {
+                if args.ca {
+                    Command::Ca(CaCommand::List {
+                        home: args.home,
+                        json: args.json,
+                    })
+                } else {
+                    Command::Key(KeyCommand::List {
+                        home: args.home,
+                        json: args.json,
+                    })
+                }
+            }
+            TrustCommand::Verify(args) => Command::Key(KeyCommand::Verify {
+                manifest: args.manifest,
+                home: args.home,
+                json: args.json,
+            }),
+        }
+    }
+}
+
+/// The `nau trust keygen` arguments: the manifest-key ceremony, or the
+/// SSH host CA ceremony with `--ca`.
+#[derive(clap::Args)]
+pub struct TrustKeygenArgs {
+    /// Key-ceremony home (default: $HOME). The secret key lives at
+    /// `<home>/.config/nau/secret-key`, anchors under `keys/`; with
+    /// `--ca`, the host CA keypair lives at `<home>/.config/nau/ca/`.
+    #[arg(long)]
+    pub home: Option<String>,
+
+    /// Scope the ceremony to the SSH host CA (ADR-0045) instead of the
+    /// update-manifest signing key.
+    #[arg(long)]
+    pub ca: bool,
+
+    /// Replace an existing CA keypair (`--ca` only). Both halves are
+    /// removed before the mint — a failed regeneration can never leave
+    /// the old public half paired with a new secret.
+    #[arg(long, requires = "ca")]
+    pub force: bool,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau trust rotate` arguments.
+#[derive(clap::Args)]
+pub struct TrustRotateArgs {
+    /// Key-ceremony home (default: $HOME).
+    #[arg(long)]
+    pub home: Option<String>,
+
+    /// Manifest JSON to dual-sign under the successor (old signature
+    /// kept; provenance re-attached when present).
+    #[arg(long)]
+    pub manifest: Option<String>,
+
+    /// Overlap window, in days, recorded with the rotation: how long
+    /// the rotated-out key's signatures stay first-class while the
+    /// successor rolls out. Expired windows downgrade to a verify
+    /// warning.
+    #[arg(long, default_value_t = crate::sign::DEFAULT_WINDOW_DAYS)]
+    pub window_days: u32,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau trust promote` arguments.
+#[derive(clap::Args)]
+pub struct TrustPromoteArgs {
+    /// Key-ceremony home (default: $HOME).
+    #[arg(long)]
+    pub home: Option<String>,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau trust revoke` arguments.
+#[derive(clap::Args)]
+pub struct TrustRevokeArgs {
+    /// Key id (first 16 hex chars of the public key).
+    pub key_id: String,
+
+    /// Key-ceremony home (default: $HOME).
+    #[arg(long)]
+    pub home: Option<String>,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau trust list` arguments: the ceremony ledger, or the SSH
+/// host CA introspection with `--ca`.
+#[derive(clap::Args)]
+pub struct TrustListArgs {
+    /// Key-ceremony home (default: $HOME).
+    #[arg(long)]
+    pub home: Option<String>,
+
+    /// Scope the listing to the SSH host CA (ADR-0045) instead of the
+    /// ceremony ledger.
+    #[arg(long)]
+    pub ca: bool,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau trust verify` arguments.
+#[derive(clap::Args)]
+pub struct TrustVerifyArgs {
+    /// Path to the manifest JSON to verify.
+    pub manifest: String,
+
+    /// Key-ceremony home (default: $HOME).
+    #[arg(long)]
+    pub home: Option<String>,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Verbs for `nau pool` (ADR-0049, as amended by the #321 council —
+/// `pool` replaces ADR-0040's "farm" naming, which already belongs to
+/// the pod bin farm): the build-worker fleet coordinator surface plus
+/// the two worker-side verbs. The coordinator verbs share their
+/// argument structs with the legacy `WorkersCommand` variants;
+/// `publish` is `workers receive-publish`.
+#[derive(clap::Subcommand)]
+pub enum PoolCommand {
+    /// Provision cloud workers (ADR-0040, ADR-0045)
+    Provision(WorkersProvisionArgs),
+
+    /// Destroy one provisioned worker
+    Destroy(WorkersDestroyArgs),
+
+    /// One-command build window (#301): provision, wait for issuance,
+    /// run the wrapped command, then tear down
+    Burst(WorkersBurstArgs),
+
+    /// Tear down every entry in the managed `workers` block (#301)
+    Down(WorkersDownArgs),
+
+    /// Issue short-lived host certificates (ADR-0045 amendment, #295)
+    Issue(WorkersIssueArgs),
+
+    /// Receive one guest publish (ADR-0045 amendment, #295): the
+    /// coordinator half of the publish channel (`workers
+    /// receive-publish`)
+    Publish,
+
+    /// Serve one issued certificate back to its guest (the pickup half
+    /// of the publish channel)
+    Pickup(WorkersPickupArgs),
+
+    /// Advanced: invoked by nau itself. Build-worker capability probe:
+    /// prints one JSON capability document (protocol, arch, nproc, RAM,
+    /// free disk, tool presence, functioning-sandbox and KVM probes) on
+    /// stdout, then exits (ADR-0040 Decision 2) — the revealed form of
+    /// the hidden `__worker-cap` alias.
+    Probe,
+
+    /// Advanced: invoked by nau itself. Build-worker job executor:
+    /// executes exactly one job manifest — verifies every payload
+    /// sha256, then runs the ordinary offline sandbox build path — and
+    /// prints one JSON result document on stdout (ADR-0040 Decision 2).
+    /// Any refusal exits nonzero before anything runs. The revealed
+    /// form of the hidden `__worker-job` alias.
+    Job {
+        /// Path to the job manifest file.
+        job_file: String,
+    },
+}
+
+impl From<PoolCommand> for Command {
+    fn from(sub: PoolCommand) -> Self {
+        match sub {
+            PoolCommand::Provision(args) => Command::Workers {
+                command: WorkersCommand::Provision(args),
+            },
+            PoolCommand::Destroy(args) => Command::Workers {
+                command: WorkersCommand::Destroy(args),
+            },
+            PoolCommand::Burst(args) => Command::Workers {
+                command: WorkersCommand::Burst(args),
+            },
+            PoolCommand::Down(args) => Command::Workers {
+                command: WorkersCommand::Down(args),
+            },
+            PoolCommand::Issue(args) => Command::Workers {
+                command: WorkersCommand::Issue(args),
+            },
+            PoolCommand::Publish => Command::Workers {
+                command: WorkersCommand::ReceivePublish,
+            },
+            PoolCommand::Pickup(args) => Command::Workers {
+                command: WorkersCommand::Pickup(args),
+            },
+            PoolCommand::Probe => Command::WorkerCap,
+            PoolCommand::Job { job_file } => Command::WorkerJob { job_file },
+        }
+    }
+}
+
+/// The `nau chart search` / legacy `nau search` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct SearchArgs {
+    /// Search query (package name or partial match)
+    pub query: String,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau chart check` / legacy `nau check` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct CheckArgs {
+    /// Path to the Lua definition file
+    pub file: String,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau chart lint` / legacy `nau lint` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct LintArgs {
+    /// Path to the Lua definition file (default: nau.lua)
+    #[arg(short, long, default_value = "nau.lua")]
+    pub file: String,
+
+    /// Lint a pod's declared packages (app collisions) instead of a
+    /// definition file.
+    #[arg(long)]
+    pub pod: Option<String>,
+
+    /// Snap channel for resolution context (default: latest/stable).
+    /// Kernel/gadget snaps derive their channel from the image base
+    /// track on top of this (ADR-0019).
+    #[arg(long, default_value = "latest/stable")]
+    pub channel: String,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau chart audit` / legacy `nau audit` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct AuditArgs {
+    /// Path to the Lua definition file. Optional: when given, its
+    /// evaluated outputs enrich the audit with declared versions and
+    /// declaration labels for source pins.
+    #[arg(short, long)]
+    pub file: Option<String>,
+
+    /// Path to lockfile (project nau.lock or a pod's lockfile).
+    #[arg(short, long, default_value = "nau.lock")]
+    pub lockfile: String,
+
+    /// Force a refresh: bypass the local OSV response cache and
+    /// rewrite it from the live database.
+    #[arg(long)]
+    pub update: bool,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau chart lock` / legacy `nau lock` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct LockArgs {
+    /// Path to the Lua config file (default: nau.lua).
+    /// If not found, locks the default package index input.
+    #[arg(short, long, default_value = "nau.lua")]
+    pub file: String,
+
+    /// Path to lockfile (default: nau.lock).
+    #[arg(long, default_value = "nau.lock")]
+    pub lockfile: String,
+
+    /// Output structured JSON with pin state instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau chart eval` / legacy `nau eval` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct EvalArgs {
+    /// Path to the Lua config file (default: nau.lua)
+    #[arg(short, long, default_value = "nau.lua")]
+    pub file: String,
+
+    /// Write the manifest to this file atomically (default: stdout)
+    #[arg(short, long)]
+    pub output: Option<String>,
+
+    /// Only evaluate this output or image (from the definition's
+    /// returned table). Default: everything declared.
+    pub output_name: Option<String>,
+
+    /// Target architecture for image contents (default: amd64)
+    #[arg(short, long, default_value = "amd64")]
+    pub arch: String,
+
+    /// Snap channel for the resolution context (default: latest/stable)
+    #[arg(long, default_value = "latest/stable")]
+    pub channel: String,
+
+    /// Path to lockfile (default: nau.lock).
+    /// Pins source hashes and snap revisions for reproducible evals.
+    #[arg(long, default_value = "nau.lock")]
+    pub lockfile: String,
+
+    /// Use only pinned/cached inputs — never touch the network.
+    #[arg(long)]
+    pub offline: bool,
+
+    /// Suppress human-readable status output (the manifest is JSON
+    /// either way).
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau ship push` / legacy `nau push` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct PushArgs {
+    /// Destination reference: [registry[:port]/]repo[:tag|@digest].
+    /// An explicit registry host is required (e.g. localhost:5000/ns/repo,
+    /// ghcr.io/owner/repo) — the docker.io implicit default is
+    /// deliberately out of scope. Pushing by @digest is an error.
+    pub reference: String,
+
+    /// Directory to auto-discover artifacts in (*.snap, *.img;
+    /// default: current dir, matching build/image --output)
+    #[arg(short = 'd', long, default_value = ".")]
+    pub dir: String,
+
+    /// Explicit artifact file(s) to push (repeatable; overrides --dir
+    /// discovery). Extension decides the layer media type.
+    #[arg(long)]
+    pub snap: Vec<String>,
+
+    /// Explicit disk image file(s) to push (repeatable; overrides
+    /// --dir discovery).
+    #[arg(long)]
+    pub image: Vec<String>,
+
+    /// Tag to push under (default: <name>-<version> derived from the
+    /// artifact file names and sanitized to the registry tag charset).
+    #[arg(long)]
+    pub tag: Option<String>,
+
+    /// Registry username (requires --password-stdin).
+    #[arg(long)]
+    pub username: Option<String>,
+
+    /// Read the registry password from stdin (one line, no echo).
+    #[arg(long)]
+    pub password_stdin: bool,
+
+    /// Talk plain http:// (no TLS) — intended for local registries
+    /// (e.g. registry:2 on localhost:5000). Refused otherwise.
+    #[arg(long)]
+    pub insecure_http: bool,
+
+    /// Attempt cross-repo blob mounts from this source repository
+    /// (`POST ...?mount=<digest>&from=<repo>`) before uploading:
+    /// a 201 response reuses the bytes already in the registry (no
+    /// transfer). Default: empty = mounts skipped.
+    #[arg(long)]
+    pub mount_from: Option<String>,
+
+    /// Write the built-manifest record (the manifest Artifact
+    /// extension: per-blob sha256 digest, size, media type) to this
+    /// file after a successful push. `pull --expect` consumes it.
+    #[arg(long)]
+    pub record: Option<String>,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau ship pull` / legacy `nau pull` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct PullArgs {
+    /// Source reference: [registry[:port]/]repo[:tag|@digest]. An
+    /// explicit registry host is required. A tag or @digest is
+    /// required — there is no default tag. When pulled by @digest,
+    /// the received manifest itself is digest-verified.
+    pub reference: String,
+
+    /// Directory to write pulled artifact files into (default: current dir)
+    #[arg(short, long, default_value = ".")]
+    pub out_dir: String,
+
+    /// Registry username (requires --password-stdin).
+    #[arg(long)]
+    pub username: Option<String>,
+
+    /// Read the registry password from stdin (one line, no echo).
+    #[arg(long)]
+    pub password_stdin: bool,
+
+    /// Talk plain http:// (no TLS) — intended for local registries.
+    #[arg(long)]
+    pub insecure_http: bool,
+
+    /// Verify received blobs against a built-manifest record (from
+    /// `push --record`) IN ADDITION to the OCI descriptors —
+    /// fail-closed on any digest, size, or media-type mismatch.
+    #[arg(long)]
+    pub expect: Option<String>,
+
+    /// Install pulled `.snap` payloads into the state root after the
+    /// download. Revisions resolve from the `nau.lock` pins in
+    /// the current directory (matched by sha3-384); unpinned or
+    /// divergent blobs are refused (use plain pull to keep files).
+    #[arg(long)]
+    pub install: bool,
+
+    /// State root for --install (default: /var/lib/nau).
+    #[arg(long)]
+    pub state_dir: Option<String>,
+
+    /// Pod store that peer (`nau://`) and static-URL
+    /// (`http(s)://`) pulls stage into (default: `default`) — the
+    /// verified manifest + blobs land in the named pod's store and
+    /// installation stays the pod workflow, never a pull side
+    /// effect (ADR-0033 Decision 5). Ignored for plain registry
+    /// references.
+    #[arg(long, value_name = "POD")]
+    pub pod: Option<String>,
+
+    /// Accept a manifest whose revision is OLDER than the installed
+    /// or staged one for that name (ADR-0033 Decision 7 freshness
+    /// rule). Peer/URL pulls only. Note: `nau.lock` pins do NOT
+    /// bind on the peer lane yet — PackageManifest carries no store
+    /// pin; pin-binding is deferred (ADR-0033 Decision 7).
+    #[arg(long = "allow-downgrade")]
+    pub allow_downgrade: bool,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau peer serve` / legacy `nau serve` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct ServeArgs {
+    /// Bind address override. Default: `node {}`'s
+    /// `serve.address`, else 127.0.0.1 (loopback — `/info`
+    /// publishes the pod inventory to everyone who can reach the
+    /// socket; `0.0.0.0` is an explicit choice).
+    #[arg(long)]
+    pub address: Option<String>,
+
+    /// Bind port override (default: 7780, unprivileged).
+    #[arg(long)]
+    pub port: Option<u16>,
+
+    /// Announce the node on the LAN via mDNS (`_nau._tcp`,
+    /// ADR-0033 Decision 3), overriding `node {}`'s
+    /// `serve.announce`. The declaration is the source of truth;
+    /// absent both, serve does not announce.
+    #[arg(long)]
+    pub announce: bool,
+
+    /// Pod whose store to serve (default: `default`) — the named
+    /// pod's store is the served surface, matching `--pod` on
+    /// `pull` and `export` (ADR-0033 Decision 5).
+    #[arg(long, value_name = "POD")]
+    pub pod: Option<String>,
+}
+
+/// The `nau peer browse` / legacy `nau peers` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct PeersArgs {
+    /// Browse window in seconds (default: 2).
+    #[arg(long, default_value_t = 2)]
+    pub secs: u64,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau peer export` / legacy `nau export` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct ExportArgs {
+    /// Directory to write the export tree into
+    pub out: String,
+
+    /// Pod whose store to export (default: `default`).
+    #[arg(long, value_name = "POD")]
+    pub pod: Option<String>,
+
+    /// Curate the export to one mission's pinned pool (#275): only
+    /// the packages the named `image()` declaration pins (base,
+    /// kernel, gadget, snaps). Every pinned package must be in the
+    /// pod store — a missing pin fails the export.
+    #[arg(long, value_name = "MISSION")]
+    pub mission: Option<String>,
+
+    /// Project Lua declaring the mission (with --mission).
+    #[arg(long, value_name = "FILE", requires = "mission")]
+    pub file: Option<String>,
+}
+
+/// The `nau image test` / legacy `nau test` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct TestArgs {
+    /// Path to the built disk image (`.img`) to boot.
+    pub image: String,
+
+    /// Boot timeout in seconds. QEMU is killed when it elapses; the kill
+    /// still passes when a completion target was reached before it.
+    #[arg(long, default_value_t = 120)]
+    pub timeout: u64,
+
+    /// QEMU accelerator. `kvm` (default) falls back to `tcg` when KVM is
+    /// unavailable — `tcg` is software emulation (much slower).
+    #[arg(long, value_enum, default_value = "kvm")]
+    pub accel: Accel,
+
+    /// Write the captured serial console here (default:
+    /// `<image>.serial.log`). This is the auditable boot evidence.
+    #[arg(long)]
+    pub log: Option<String>,
+
+    /// Extra substring the serial log MUST contain to pass (repeatable).
+    /// Tightens the boot assertion beyond the built-in markers, e.g.
+    /// `--require "Reached target Boot Completion Check"` for an A/B image
+    /// that emits the try-boot completion target.
+    #[arg(long = "require")]
+    pub require: Vec<String>,
+
+    /// Accept a boot that reached the init handoff without ever reaching
+    /// a completed target (issue #84 opt-out). Restores the pre-#84
+    /// handoff-only gate; use only for images that legitimately never
+    /// reach `boot-complete.target` or `default.target`.
+    #[arg(long = "allow-no-completion")]
+    pub allow_no_completion: bool,
+
+    /// Directory holding the UEFI firmware (`OVMF_CODE.fd`/`OVMF_VARS.fd`
+    /// or the edk2 equivalents). Default: auto-discovered.
+    #[arg(long)]
+    pub firmware_dir: Option<String>,
+
+    /// Boot the image N times in sequence (default 1). With N > 1 a single
+    /// sparse copy is booted repeatedly so guest mutations persist; each
+    /// boot's serial log and ESP listing are archived.
+    #[arg(long, default_value_t = 1)]
+    pub runs: u32,
+
+    /// Expected try-boot counter sequence, one element per boot, observed
+    /// BEFORE each boot. `3-0,2-1` pins tries-left and tries-done; a bare
+    /// `3,2,1,0` leaves tries-done unchecked.
+    ///
+    /// Boot counting lives in the ESP filename: systemd-boot renames the
+    /// selected UKI (`foo+3-0.efi` -> `foo+2-1.efi`) before the kernel
+    /// loads, so the serial console cannot see it. A fixture MUST use a
+    /// DISTINCT version for a counted entry: systemd-boot strips the
+    /// `+N-M` counter when deriving an entry id, so a counted UKI
+    /// differing from its sibling only by the counter shares its id; with
+    /// one entry counterless the comparator returns 0 and selection
+    /// becomes arbitrary.
+    #[arg(long = "expect-counter-seq")]
+    pub expect_counter_seq: Option<String>,
+
+    /// Extra argv token passed through to QEMU verbatim (repeatable;
+    /// each value is ONE argv token, so an option and its value are two
+    /// `--qemu-arg` occurrences; values starting with `-` need clap's
+    /// `=` form: `--qemu-arg=-nic`). Appended after the built-in
+    /// drives — this is how the update proof (#80) attaches guest
+    /// networking: `--qemu-arg=-nic --qemu-arg user,model=virtio-net-pci`.
+    #[arg(long = "qemu-arg")]
+    pub qemu_args: Vec<String>,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau image verify` / legacy `nau verify-image` arguments
+/// (ADR-0049).
+#[derive(clap::Args)]
+pub struct VerifyImageArgs {
+    /// Flashed target to verify: a block device named by stable id
+    /// (/dev/disk/by-id/...) or a whole-disk image file. Only ever
+    /// opened for reading.
+    #[arg(long)]
+    pub device: String,
+
+    /// Signed image manifest (.manifest.json) published with the
+    /// mission image (ADR-0044 D5).
+    #[arg(long)]
+    pub manifest: String,
+
+    /// Extra trust anchor for the manifest signature: a public-key
+    /// file (same two-line format `nau key keygen` writes),
+    /// accepted beside the operator keychain (~/.config/nau/keys).
+    #[arg(long)]
+    pub key: Option<String>,
+
+    /// Which slot's regions to verify: `a`, `b`, or `auto` (the
+    /// default). The manifest signs a generation, not a slot — auto
+    /// locates it wherever it sits (the post-sysupdate case: the new
+    /// manifest verifies the slot sysupdate filled); `a`/`b` demand
+    /// the physical slot (the build writes slot B contiguous behind
+    /// slot A) and refuse by name when the generation sits elsewhere.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub slot: crate::image::SlotSelector,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `--count` bounds for `nau workers provision` (M5): at least ONE
@@ -877,6 +1492,133 @@ pub fn wrapped_build(command: &[String]) -> miette::Result<Command> {
     }
 }
 
+/// Fold the ADR-0049 domain-namespace spellings onto the legacy
+/// [`Command`] variants: one dispatch, two grammars. The legacy
+/// spellings keep parsing as hidden aliases and land here unchanged;
+/// every namespace verb lands on the same variant its legacy spelling
+/// produces, so main() dispatches through a single match.
+pub fn normalize_domain(command: Command) -> Command {
+    match command {
+        Command::Chart { command } => command.into(),
+        Command::Ship { command } => command.into(),
+        Command::Peer { command } => command.into(),
+        Command::Trust { command } => command.into(),
+        Command::Pool { command } => command.into(),
+        Command::Build { args, command } => match command {
+            None => Command::Build {
+                args,
+                command: None,
+            },
+            Some(BuildCommand::Snap(args)) => Command::Build {
+                args: *args,
+                command: None,
+            },
+            Some(BuildCommand::Cache(cache)) => Command::Cache(cache),
+        },
+        Command::Image { args, command } => match command {
+            None => Command::Image {
+                args,
+                command: None,
+            },
+            Some(ImageCommand::Build(args)) => Command::Image {
+                args,
+                command: None,
+            },
+            Some(ImageCommand::Test(test)) => Command::Test(test),
+            Some(ImageCommand::Verify(verify)) => Command::VerifyImage(verify),
+        },
+        other => other,
+    }
+}
+
+// ── External subcommands (ADR-0049 Decision 5) ─────────────────────
+//
+// git's dashed-external mechanism: an unknown verb falls through to an
+// executable `nau-<verb>`. This is a DISPATCH contract, not a code
+// split — nau stays one binary; third parties (and pods, whose bin
+// farms land on PATH via `pod shellenv`) extend the CLI by shipping
+// helpers, exactly as `git-credential-*` extends git.
+
+/// The external-verb charset (ADR-0049 Decision 5): git's own rule,
+/// `[a-z][a-z0-9-]*`. No dots, no colons, no path separators, no
+/// leading dash, no uppercase, never empty — a verb failing this is
+/// refused by name BEFORE any `nau-<verb>` lookup, so a verb can never
+/// smuggle a path component into the search.
+fn is_external_verb(verb: &str) -> bool {
+    let mut chars = verb.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// An executable helper: exists, is a regular file (symlinks resolve —
+/// packagers ship `nau-x -> ../libexec/nau-x`), and carries an exec
+/// bit.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Resolve `nau-<verb>` for an unknown verb: a sibling of the running
+/// nau binary first, then PATH in order. Deliberately NOT
+/// environment-overridable — the house isolation posture forbids
+/// env-influenced lookup; PATH itself is the documented fallback, the
+/// same rule git's dashed-external search follows.
+fn resolve_external_helper(verb: &str) -> Option<PathBuf> {
+    let name = format!("nau-{verb}");
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join(&name);
+            if is_executable_file(&sibling) {
+                return Some(sibling);
+            }
+        }
+    }
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .find(|dir| is_executable_file(&dir.join(&name)))
+        .map(|dir| dir.join(name))
+}
+
+/// Dispatch an unknown verb to a `nau-<verb>` executable (ADR-0049
+/// Decision 5). `argv` is clap's external catch-all: element 0 is the
+/// verb, the rest is the remaining command line, forwarded verbatim —
+/// the helper never sees the verb itself, exactly like `git-<cmd>`.
+/// EXEC, not spawn-and-wait: the process image is replaced, stdio is
+/// inherited, and the helper's exit code is nau's own.
+pub fn run_external(argv: &[OsString]) -> miette::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let Some((verb, args)) = argv.split_first() else {
+        // Unreachable through clap: the catch-all always carries the
+        // verb as element 0. Kept fail-closed for direct callers.
+        return Err(miette::miette!(
+            "nau: external subcommand arrived without a verb"
+        ));
+    };
+    let verb = verb.to_string_lossy();
+    if !is_external_verb(&verb) {
+        return Err(miette::miette!(
+            "unknown command '{verb}' — verb names must match [a-z][a-z0-9-]* \
+             (no dots, colons, path separators, leading dashes, or uppercase)"
+        ));
+    }
+    let Some(helper) = resolve_external_helper(&verb) else {
+        return Err(miette::miette!(
+            "unknown command `{verb}` — and no `nau-{verb}` extension found on PATH"
+        ));
+    };
+    let error = std::process::Command::new(&helper).args(args).exec();
+    // exec() only returns on failure — the image was not replaced.
+    Err(miette::miette!(
+        "nau {verb}: failed to exec {}: {error}",
+        helper.display()
+    ))
+}
+
 /// Subcommands for `nau workers`.
 #[derive(clap::Subcommand)]
 pub enum WorkersCommand {
@@ -887,76 +1629,11 @@ pub enum WorkersCommand {
     /// host CA's fingerprint into a machine-managed `workers` entry in
     /// nau.lua BEFORE first use — never ssh-keyscan. Certificate
     /// issuance from the published keys is #295 sub-task 3.
-    Provision {
-        /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
-        #[arg(long)]
-        provider: String,
-
-        /// Server SKU — operator-supplied, never hardcoded (Hetzner
-        /// repriced the lineup 2026-06-15; classes CX23/CX33/CAX11/CAX21;
-        /// AWS: the EC2 instance type, e.g. c7i.large).
-        #[arg(long = "type", value_name = "SKU")]
-        server_type: String,
-
-        /// Provider location (e.g. hel1, fsn1; AWS: the region, e.g.
-        /// eu-central-1).
-        #[arg(long)]
-        location: String,
-
-        /// How many servers to create (1-50).
-        #[arg(long, default_value_t = WORKERS_MIN_COUNT, value_parser = workers_count)]
-        count: u32,
-
-        /// Worker lifetime before the TTL sweep reclaims it (e.g. 4h,
-        /// 30m). Stamped into /etc/nau/worker-ttl and the
-        /// `nau-worker` hcloud label (epoch-seconds expiry).
-        #[arg(long, default_value = "4h")]
-        ttl: String,
-
-        /// Request a spot/preemptible instance (aws only; hetzner has no
-        /// spot product). Eviction is T5 worker loss — re-dispatched,
-        /// never migrated (ADR-0040 Amendment 1). On-demand hourly is the
-        /// default; spot is for eviction-tolerant lanes only.
-        #[arg(long)]
-        spot: bool,
-
-        /// Hourly USD price cap for `--spot` (e.g. 0.05). Required with
-        /// `--spot` — an uncapped bid is not a cap; refused without it.
-        #[arg(long, value_name = "USD_H")]
-        max_price: Option<String>,
-
-        /// GCP spelling of --spot (gcp): a preemptible VM. Eviction is
-        /// T5 worker loss — re-dispatched, never migrated (ADR-0040
-        /// Amendment 1). Preemptible pricing is fixed per machine type,
-        /// so --max-price does not apply (refused by the gcp provider).
-        /// (`--spot` is the provider-independent spelling — same request.)
-        #[arg(long)]
-        preemptible: bool,
-
-        /// Print the plan (type, location, count, TTL, user-data hash) and
-        /// exit — resolved fully, no API call, no token needed.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Config file the workers entries are pinned into.
-        #[arg(short, long, default_value = "nau.lua")]
-        file: String,
-    },
+    Provision(WorkersProvisionArgs),
 
     /// Destroy one provisioned worker: removes the server and evicts its
     /// managed `workers` entry (operator-owned text is never rewritten).
-    Destroy {
-        /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
-        #[arg(long)]
-        provider: String,
-
-        /// Server name, as printed by provision.
-        name: String,
-
-        /// Config file the workers entry is evicted from.
-        #[arg(short, long, default_value = "nau.lua")]
-        file: String,
-    },
+    Destroy(WorkersDestroyArgs),
 
     /// Receive one guest publish (ADR-0045 amendment, #295): reads the
     /// JSON payload on stdin with the bearer token in
@@ -975,49 +1652,7 @@ pub enum WorkersCommand {
     /// the issued record (`~/.config/nau/ca/issued/`), the audit
     /// trail. The guest picks its certificate up with
     /// `nau workers pickup`.
-    Issue {
-        /// CA ceremony home (default: $HOME).
-        #[arg(long)]
-        home: Option<String>,
-
-        /// Issue only this machine identity (default: every pending
-        /// identity).
-        #[arg(long)]
-        identity: Option<String>,
-
-        /// Certificate validity — short-lived and relative to now,
-        /// ssh-keygen form (e.g. +48h, +2d12h). Absolute dates and
-        /// forever windows are refused: certificates must age out.
-        #[arg(long, default_value = crate::provision::publish::HOST_CERT_VALIDITY_DEFAULT)]
-        validity: String,
-
-        /// Re-issue an identity that already has an issued record (the
-        /// previous certificate stays valid until its own expiry).
-        #[arg(long)]
-        force: bool,
-
-        /// Wait for guest publishes that have not landed yet (#299):
-        /// poll the pending store and sign each identity as its publish
-        /// lands, instead of signing only what is already pending. The
-        /// provision→issue race fix; opt-in, so ADR-0045's
-        /// explicit-trust posture is unchanged without it.
-        #[arg(long)]
-        wait: bool,
-
-        /// `--wait` ceiling in seconds: how long to keep polling for
-        /// publishes before failing loudly (guests publish 1-4 min
-        /// after server create).
-        #[arg(
-            long,
-            default_value_t = crate::provision::ISSUE_WAIT_DEFAULT_TIMEOUT_SECS,
-            requires = "wait"
-        )]
-        timeout: u64,
-
-        /// Output structured JSON instead of human-friendly output.
-        #[arg(long)]
-        json: bool,
-    },
+    Issue(WorkersIssueArgs),
 
     /// Serve one issued certificate back to its guest (the pickup half
     /// of the publish channel): authenticates with the machine's
@@ -1027,11 +1662,7 @@ pub enum WorkersCommand {
     /// POST. Idempotent reads; refuses (nonzero exit) while the identity
     /// is not yet issued or the token is expired/unknown — the guest
     /// retries, and the TTL sweep reclaims a guest that never picks up.
-    Pickup {
-        /// CA ceremony home (default: $HOME).
-        #[arg(long)]
-        home: Option<String>,
-    },
+    Pickup(WorkersPickupArgs),
 
     /// One-command build window (#301): provision N workers, wait for
     /// every host certificate to be issued (`issue --wait` semantics),
@@ -1040,81 +1671,217 @@ pub enum WorkersCommand {
     /// command failure and Ctrl-C alike, unless `--keep` parks the
     /// workers for a later `nau workers down --all-managed`. The burst
     /// exit code is the wrapped command's exit code.
-    Burst {
-        /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
-        #[arg(long)]
-        provider: String,
-
-        /// Server SKU — operator-supplied, never hardcoded (same
-        /// vocabulary as `workers provision`).
-        #[arg(long = "type", value_name = "SKU")]
-        server_type: String,
-
-        /// Provider location (e.g. hel1, fsn1; AWS: the region, e.g.
-        /// eu-central-1).
-        #[arg(long)]
-        location: String,
-
-        /// How many workers this burst provisions (default: 1), or
-        /// `auto` — size the burst from the wrapped build's pending jobs
-        /// (#304); a wrapped command that is not a build is a named
-        /// refusal before any API call.
-        #[arg(long, default_value = "1", value_parser = burst_count)]
-        count: BurstCount,
-
-        /// Guardrail: refuse `--count` above it. A fat-fingered count is
-        /// an hourly bill; raising it is a deliberate act.
-        #[arg(long, default_value_t = WORKERS_BURST_MAX_DEFAULT)]
-        max: u32,
-
-        /// Worker lifetime before the TTL sweep reclaims it (e.g. 4h).
-        /// The safety net under the burst teardown, not a substitute.
-        #[arg(long, default_value = "4h")]
-        ttl: String,
-
-        /// `issue --wait` ceiling in seconds for the whole burst. The
-        /// effective ceiling scales with the count (each guest publishes
-        /// 1-4 min after create).
-        #[arg(
-            long,
-            default_value_t = crate::provision::ISSUE_WAIT_DEFAULT_TIMEOUT_SECS
-        )]
-        timeout: u64,
-
-        /// Skip the teardown: leave the burst workers provisioned and
-        /// pinned (for inspection or a follow-up run). Tear them down
-        /// later with `nau workers down --all-managed`.
-        #[arg(long)]
-        keep: bool,
-
-        /// Config file the workers entries are pinned into.
-        #[arg(short, long, default_value = "nau.lua")]
-        file: String,
-
-        /// The command to run against the burst workers, after `--`.
-        /// Stdio is inherited; its exit code is the burst's.
-        #[arg(last = true, num_args = 1.., required = true, value_name = "CMD")]
-        command: Vec<String>,
-    },
+    Burst(WorkersBurstArgs),
 
     /// Tear down every entry in the managed `workers` block (#301): the
     /// `--keep` burst's promised drain. Each entry's server is destroyed
     /// (the machine linkage names it) and its pin evicted; an empty or
     /// absent block is a green no-op.
-    Down {
-        /// Destroy every managed-block entry (v1's only mode — per-entry
-        /// destruction stays `workers destroy`).
-        #[arg(long, required = true)]
-        all_managed: bool,
+    Down(WorkersDownArgs),
+}
 
-        /// Provider driver the block's servers were provisioned with.
-        #[arg(long)]
-        provider: String,
+/// The `nau workers provision` / `nau pool provision` arguments
+/// (ADR-0049).
+#[derive(clap::Args)]
+pub struct WorkersProvisionArgs {
+    /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
+    #[arg(long)]
+    pub provider: String,
 
-        /// Config file the workers entries are evicted from.
-        #[arg(short, long, default_value = "nau.lua")]
-        file: String,
-    },
+    /// Server SKU — operator-supplied, never hardcoded (Hetzner
+    /// repriced the lineup 2026-06-15; classes CX23/CX33/CAX11/CAX21;
+    /// AWS: the EC2 instance type, e.g. c7i.large).
+    #[arg(long = "type", value_name = "SKU")]
+    pub server_type: String,
+
+    /// Provider location (e.g. hel1, fsn1; AWS: the region, e.g.
+    /// eu-central-1).
+    #[arg(long)]
+    pub location: String,
+
+    /// How many servers to create (1-50).
+    #[arg(long, default_value_t = WORKERS_MIN_COUNT, value_parser = workers_count)]
+    pub count: u32,
+
+    /// Worker lifetime before the TTL sweep reclaims it (e.g. 4h,
+    /// 30m). Stamped into /etc/nau/worker-ttl and the
+    /// `nau-worker` hcloud label (epoch-seconds expiry).
+    #[arg(long, default_value = "4h")]
+    pub ttl: String,
+
+    /// Request a spot/preemptible instance (aws only; hetzner has no
+    /// spot product). Eviction is T5 worker loss — re-dispatched,
+    /// never migrated (ADR-0040 Amendment 1). On-demand hourly is the
+    /// default; spot is for eviction-tolerant lanes only.
+    #[arg(long)]
+    pub spot: bool,
+
+    /// Hourly USD price cap for `--spot` (e.g. 0.05). Required with
+    /// `--spot` — an uncapped bid is not a cap; refused without it.
+    #[arg(long, value_name = "USD_H")]
+    pub max_price: Option<String>,
+
+    /// GCP spelling of --spot (gcp): a preemptible VM. Eviction is
+    /// T5 worker loss — re-dispatched, never migrated (ADR-0040
+    /// Amendment 1). Preemptible pricing is fixed per machine type,
+    /// so --max-price does not apply (refused by the gcp provider).
+    /// (`--spot` is the provider-independent spelling — same request.)
+    #[arg(long)]
+    pub preemptible: bool,
+
+    /// Print the plan (type, location, count, TTL, user-data hash) and
+    /// exit — resolved fully, no API call, no token needed.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Config file the workers entries are pinned into.
+    #[arg(short, long, default_value = "nau.lua")]
+    pub file: String,
+}
+
+/// The `nau workers destroy` / `nau pool destroy` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct WorkersDestroyArgs {
+    /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
+    #[arg(long)]
+    pub provider: String,
+
+    /// Server name, as printed by provision.
+    pub name: String,
+
+    /// Config file the workers entry is evicted from.
+    #[arg(short, long, default_value = "nau.lua")]
+    pub file: String,
+}
+
+/// The `nau workers issue` / `nau pool issue` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct WorkersIssueArgs {
+    /// CA ceremony home (default: $HOME).
+    #[arg(long)]
+    pub home: Option<String>,
+
+    /// Issue only this machine identity (default: every pending
+    /// identity).
+    #[arg(long)]
+    pub identity: Option<String>,
+
+    /// Certificate validity — short-lived and relative to now,
+    /// ssh-keygen form (e.g. +48h, +2d12h). Absolute dates and
+    /// forever windows are refused: certificates must age out.
+    #[arg(long, default_value = crate::provision::publish::HOST_CERT_VALIDITY_DEFAULT)]
+    pub validity: String,
+
+    /// Re-issue an identity that already has an issued record (the
+    /// previous certificate stays valid until its own expiry).
+    #[arg(long)]
+    pub force: bool,
+
+    /// Wait for guest publishes that have not landed yet (#299):
+    /// poll the pending store and sign each identity as its publish
+    /// lands, instead of signing only what is already pending. The
+    /// provision→issue race fix; opt-in, so ADR-0045's
+    /// explicit-trust posture is unchanged without it.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// `--wait` ceiling in seconds: how long to keep polling for
+    /// publishes before failing loudly (guests publish 1-4 min
+    /// after server create).
+    #[arg(
+        long,
+        default_value_t = crate::provision::ISSUE_WAIT_DEFAULT_TIMEOUT_SECS,
+        requires = "wait"
+    )]
+    pub timeout: u64,
+
+    /// Output structured JSON instead of human-friendly output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `nau workers pickup` / `nau pool pickup` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct WorkersPickupArgs {
+    /// CA ceremony home (default: $HOME).
+    #[arg(long)]
+    pub home: Option<String>,
+}
+
+/// The `nau workers burst` / `nau pool burst` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct WorkersBurstArgs {
+    /// Provider driver (currently: hetzner, aws, gcp, azure, scaleway).
+    #[arg(long)]
+    pub provider: String,
+
+    /// Server SKU — operator-supplied, never hardcoded (same
+    /// vocabulary as `workers provision`).
+    #[arg(long = "type", value_name = "SKU")]
+    pub server_type: String,
+
+    /// Provider location (e.g. hel1, fsn1; AWS: the region, e.g.
+    /// eu-central-1).
+    #[arg(long)]
+    pub location: String,
+
+    /// How many workers this burst provisions (default: 1), or
+    /// `auto` — size the burst from the wrapped build's pending jobs
+    /// (#304); a wrapped command that is not a build is a named
+    /// refusal before any API call.
+    #[arg(long, default_value = "1", value_parser = burst_count)]
+    pub count: BurstCount,
+
+    /// Guardrail: refuse `--count` above it. A fat-fingered count is
+    /// an hourly bill; raising it is a deliberate act.
+    #[arg(long, default_value_t = WORKERS_BURST_MAX_DEFAULT)]
+    pub max: u32,
+
+    /// Worker lifetime before the TTL sweep reclaims it (e.g. 4h).
+    /// The safety net under the burst teardown, not a substitute.
+    #[arg(long, default_value = "4h")]
+    pub ttl: String,
+
+    /// `issue --wait` ceiling in seconds for the whole burst. The
+    /// effective ceiling scales with the count (each guest publishes
+    /// 1-4 min after create).
+    #[arg(
+        long,
+        default_value_t = crate::provision::ISSUE_WAIT_DEFAULT_TIMEOUT_SECS
+    )]
+    pub timeout: u64,
+
+    /// Skip the teardown: leave the burst workers provisioned and
+    /// pinned (for inspection or a follow-up run). Tear them down
+    /// later with `nau workers down --all-managed`.
+    #[arg(long)]
+    pub keep: bool,
+
+    /// Config file the workers entries are pinned into.
+    #[arg(short, long, default_value = "nau.lua")]
+    pub file: String,
+
+    /// The command to run against the burst workers, after `--`.
+    /// Stdio is inherited; its exit code is the burst's.
+    #[arg(last = true, num_args = 1.., required = true, value_name = "CMD")]
+    pub command: Vec<String>,
+}
+
+/// The `nau workers down` / `nau pool down` arguments (ADR-0049).
+#[derive(clap::Args)]
+pub struct WorkersDownArgs {
+    /// Destroy every managed-block entry (v1's only mode — per-entry
+    /// destruction stays `workers destroy`).
+    #[arg(long, required = true)]
+    pub all_managed: bool,
+
+    /// Provider driver the block's servers were provisioned with.
+    #[arg(long)]
+    pub provider: String,
+
+    /// Config file the workers entries are evicted from.
+    #[arg(short, long, default_value = "nau.lua")]
+    pub file: String,
 }
 
 /// Subcommands for `nau deps`.
@@ -1889,12 +2656,16 @@ mod tests {
     fn test_build_defaults() {
         match parse_build(&["nau", "build"]) {
             Command::Build {
-                file,
-                stage,
-                output,
-                arch,
-                output_name,
-                ..
+                args:
+                    BuildArgs {
+                        file,
+                        stage,
+                        output,
+                        arch,
+                        output_name,
+                        ..
+                    },
+                command: None,
             } => {
                 assert_eq!(file, "nau.lua");
                 // No --stage flag: default stage, tracked as None so the
@@ -1911,7 +2682,10 @@ mod tests {
     #[test]
     fn test_build_with_file_flag() {
         match parse_build(&["nau", "build", "--file", "my-snap.lua"]) {
-            Command::Build { file, .. } => assert_eq!(file, "my-snap.lua"),
+            Command::Build {
+                args: BuildArgs { file, .. },
+                command: None,
+            } => assert_eq!(file, "my-snap.lua"),
             _ => panic!("expected Build"),
         }
     }
@@ -1919,7 +2693,10 @@ mod tests {
     #[test]
     fn test_build_with_short_file_flag() {
         match parse_build(&["nau", "build", "-f", "other.lua"]) {
-            Command::Build { file, .. } => assert_eq!(file, "other.lua"),
+            Command::Build {
+                args: BuildArgs { file, .. },
+                command: None,
+            } => assert_eq!(file, "other.lua"),
             _ => panic!("expected Build"),
         }
     }
@@ -1934,7 +2711,10 @@ mod tests {
             "--output",
             "/tmp/out",
         ]) {
-            Command::Build { stage, output, .. } => {
+            Command::Build {
+                args: BuildArgs { stage, output, .. },
+                command: None,
+            } => {
                 assert_eq!(stage, Some("/tmp/stage".to_string()));
                 assert_eq!(output, "/tmp/out");
             }
@@ -1945,7 +2725,10 @@ mod tests {
     #[test]
     fn test_build_with_single_arch() {
         match parse_build(&["nau", "build", "--arch", "arm64"]) {
-            Command::Build { arch, .. } => assert_eq!(arch, &["arm64"]),
+            Command::Build {
+                args: BuildArgs { arch, .. },
+                command: None,
+            } => assert_eq!(arch, &["arm64"]),
             _ => panic!("expected Build"),
         }
     }
@@ -1953,7 +2736,10 @@ mod tests {
     #[test]
     fn test_build_with_multi_arch() {
         match parse_build(&["nau", "build", "--arch", "amd64", "-A", "arm64"]) {
-            Command::Build { arch, .. } => assert_eq!(arch, &["amd64", "arm64"]),
+            Command::Build {
+                args: BuildArgs { arch, .. },
+                command: None,
+            } => assert_eq!(arch, &["amd64", "arm64"]),
             _ => panic!("expected Build"),
         }
     }
@@ -1961,7 +2747,10 @@ mod tests {
     #[test]
     fn test_build_with_positional_output_name() {
         match parse_build(&["nau", "build", "server"]) {
-            Command::Build { output_name, .. } => {
+            Command::Build {
+                args: BuildArgs { output_name, .. },
+                command: None,
+            } => {
                 assert_eq!(output_name.as_deref(), Some("server"))
             }
             _ => panic!("expected Build"),
@@ -1980,10 +2769,14 @@ mod tests {
             "arm64",
         ]) {
             Command::Build {
-                output_name,
-                file,
-                arch,
-                ..
+                args:
+                    BuildArgs {
+                        output_name,
+                        file,
+                        arch,
+                        ..
+                    },
+                command: None,
             } => {
                 assert_eq!(output_name.as_deref(), Some("cli"));
                 assert_eq!(file, "multi.lua");
@@ -1997,13 +2790,17 @@ mod tests {
     fn test_image_defaults() {
         match parse_build(&["nau", "image"]) {
             Command::Image {
-                file,
-                output,
-                arch,
-                channel,
-                cache,
-                output_name,
-                ..
+                args:
+                    ImageArgs {
+                        file,
+                        output,
+                        arch,
+                        channel,
+                        cache,
+                        output_name,
+                        ..
+                    },
+                command: None,
             } => {
                 assert_eq!(file, "nau.lua");
                 assert_eq!(output, ".");
@@ -2034,13 +2831,17 @@ mod tests {
             "my-system",
         ]) {
             Command::Image {
-                file,
-                output,
-                arch,
-                channel,
-                cache,
-                output_name,
-                ..
+                args:
+                    ImageArgs {
+                        file,
+                        output,
+                        arch,
+                        channel,
+                        cache,
+                        output_name,
+                        ..
+                    },
+                command: None,
             } => {
                 assert_eq!(file, "my-image.lua");
                 assert_eq!(output, "/tmp/img");
@@ -2063,7 +2864,10 @@ mod tests {
     fn test_image_source_date_epoch() {
         match parse_build(&["nau", "image", "--source-date-epoch", "0"]) {
             Command::Image {
-                source_date_epoch, ..
+                args: ImageArgs {
+                    source_date_epoch, ..
+                },
+                ..
             } => {
                 assert_eq!(source_date_epoch.as_deref(), Some("0"));
             }
@@ -2074,7 +2878,10 @@ mod tests {
     #[test]
     fn test_image_release_flag() {
         match parse_build(&["nau", "image", "--release", "site/nau"]) {
-            Command::Image { release, .. } => {
+            Command::Image {
+                args: ImageArgs { release, .. },
+                ..
+            } => {
                 assert_eq!(release.as_deref(), Some("site/nau"));
             }
             _ => panic!("expected Image"),
@@ -2102,7 +2909,10 @@ mod tests {
     #[test]
     fn test_build_all_flag() {
         match parse_build(&["nau", "build", "--all"]) {
-            Command::Build { all, .. } => assert!(all),
+            Command::Build {
+                args: BuildArgs { all, .. },
+                command: None,
+            } => assert!(all),
             _ => panic!("expected Build"),
         }
     }
@@ -2110,7 +2920,10 @@ mod tests {
     #[test]
     fn test_build_cache_flag() {
         match parse_build(&["nau", "build", "--cache", "/tmp/cache"]) {
-            Command::Build { cache, .. } => {
+            Command::Build {
+                args: BuildArgs { cache, .. },
+                command: None,
+            } => {
                 assert_eq!(cache.as_deref(), Some("/tmp/cache"));
             }
             _ => panic!("expected Build"),
@@ -2120,7 +2933,10 @@ mod tests {
     #[test]
     fn test_build_json_flag() {
         match parse_build(&["nau", "build", "--json"]) {
-            Command::Build { json, .. } => assert!(json),
+            Command::Build {
+                args: BuildArgs { json, .. },
+                command: None,
+            } => assert!(json),
             _ => panic!("expected Build"),
         }
     }
@@ -2128,7 +2944,10 @@ mod tests {
     #[test]
     fn test_build_target_flag() {
         match parse_build(&["nau", "build", "--target", "aarch64-linux-gnu"]) {
-            Command::Build { target, .. } => {
+            Command::Build {
+                args: BuildArgs { target, .. },
+                command: None,
+            } => {
                 assert_eq!(target.as_deref(), Some("aarch64-linux-gnu"));
             }
             _ => panic!("expected Build"),
@@ -2138,7 +2957,10 @@ mod tests {
     #[test]
     fn test_build_update_one_input() {
         match parse_build(&["nau", "build", "--update", "pkgs"]) {
-            Command::Build { update, .. } => assert_eq!(update.as_deref(), Some("pkgs")),
+            Command::Build {
+                args: BuildArgs { update, .. },
+                command: None,
+            } => assert_eq!(update.as_deref(), Some("pkgs")),
             _ => panic!("expected Build"),
         }
     }
@@ -2146,7 +2968,10 @@ mod tests {
     #[test]
     fn test_build_update_all_inputs() {
         match parse_build(&["nau", "build", "--update"]) {
-            Command::Build { update, .. } => assert_eq!(update.as_deref(), Some("")),
+            Command::Build {
+                args: BuildArgs { update, .. },
+                command: None,
+            } => assert_eq!(update.as_deref(), Some("")),
             _ => panic!("expected Build"),
         }
     }
@@ -2154,7 +2979,10 @@ mod tests {
     #[test]
     fn test_build_offline_flag() {
         match parse_build(&["nau", "build", "--offline"]) {
-            Command::Build { offline, .. } => assert!(offline),
+            Command::Build {
+                args: BuildArgs { offline, .. },
+                command: None,
+            } => assert!(offline),
             _ => panic!("expected Build"),
         }
     }
@@ -2162,11 +2990,11 @@ mod tests {
     #[test]
     fn test_lock_subcommand_defaults() {
         match Cli::try_parse_from(["nau", "lock"]).unwrap().command {
-            Command::Lock {
+            Command::Lock(LockArgs {
                 file,
                 lockfile,
                 json,
-            } => {
+            }) => {
                 assert_eq!(file, "nau.lua");
                 assert_eq!(lockfile, "nau.lock");
                 assert!(!json);
@@ -2188,7 +3016,7 @@ mod tests {
         .unwrap()
         .command
         {
-            Command::Lock { file, lockfile, .. } => {
+            Command::Lock(LockArgs { file, lockfile, .. }) => {
                 assert_eq!(file, "cfg.lua");
                 assert_eq!(lockfile, "other.lock");
             }
@@ -2202,7 +3030,7 @@ mod tests {
             .unwrap()
             .command
         {
-            Command::Lock { lockfile, json, .. } => {
+            Command::Lock(LockArgs { lockfile, json, .. }) => {
                 assert!(json);
                 assert_eq!(lockfile, "p.lock");
             }
@@ -2213,7 +3041,10 @@ mod tests {
     #[test]
     fn test_image_json_flag() {
         match parse_build(&["nau", "image", "--json"]) {
-            Command::Image { json, .. } => assert!(json),
+            Command::Image {
+                args: ImageArgs { json, .. },
+                ..
+            } => assert!(json),
             _ => panic!("expected Image"),
         }
     }
@@ -2254,11 +3085,15 @@ mod tests {
             "aarch64-linux-gnu",
         ]) {
             Command::Build {
-                all,
-                cache,
-                json,
-                target,
-                ..
+                args:
+                    BuildArgs {
+                        all,
+                        cache,
+                        json,
+                        target,
+                        ..
+                    },
+                command: None,
             } => {
                 assert!(all);
                 assert_eq!(cache.as_deref(), Some("/tmp/cache"));
@@ -2275,7 +3110,7 @@ mod tests {
             .unwrap()
             .command
         {
-            Command::Check { file, json } => {
+            Command::Check(CheckArgs { file, json }) => {
                 assert_eq!(file, "cfg.lua");
                 assert!(json);
             }
@@ -2699,7 +3534,7 @@ mod tests {
             .unwrap()
             .command
         {
-            Command::Push {
+            Command::Push(PushArgs {
                 reference,
                 dir,
                 snap,
@@ -2711,7 +3546,7 @@ mod tests {
                 mount_from,
                 record,
                 json,
-            } => {
+            }) => {
                 assert_eq!(reference, "localhost:5000/team/app");
                 assert_eq!(dir, ".");
                 assert!(snap.is_empty() && image.is_empty());
@@ -2750,7 +3585,7 @@ mod tests {
         .unwrap()
         .command
         {
-            Command::Push {
+            Command::Push(PushArgs {
                 dir,
                 snap,
                 image,
@@ -2760,7 +3595,7 @@ mod tests {
                 insecure_http,
                 json,
                 ..
-            } => {
+            }) => {
                 assert_eq!(dir, "out");
                 assert_eq!(snap, ["a_1.0_amd64.snap"]);
                 assert_eq!(image, ["b_1.0_amd64.img"]);
@@ -2785,7 +3620,7 @@ mod tests {
             .unwrap()
             .command
         {
-            Command::Pull {
+            Command::Pull(PullArgs {
                 reference,
                 out_dir,
                 username,
@@ -2797,7 +3632,7 @@ mod tests {
                 pod,
                 allow_downgrade,
                 json,
-            } => {
+            }) => {
                 assert_eq!(reference, "ghcr.io/owner/repo:v1");
                 assert_eq!(out_dir, ".");
                 assert!(username.is_none());
@@ -2838,7 +3673,7 @@ mod tests {
         .unwrap()
         .command
         {
-            Command::Pull {
+            Command::Pull(PullArgs {
                 out_dir,
                 username,
                 password_stdin,
@@ -2848,7 +3683,7 @@ mod tests {
                 state_dir,
                 json,
                 ..
-            } => {
+            }) => {
                 assert_eq!(out_dir, "pulled");
                 assert_eq!(username.as_deref(), Some("ci"));
                 assert!(password_stdin);
@@ -2870,7 +3705,7 @@ mod tests {
             .unwrap()
             .command
         {
-            Command::Test {
+            Command::Test(TestArgs {
                 image,
                 timeout,
                 accel,
@@ -2882,7 +3717,7 @@ mod tests {
                 allow_no_completion,
                 qemu_args,
                 json,
-            } => {
+            }) => {
                 assert_eq!(image, "disk.img");
                 assert_eq!(timeout, 120);
                 assert_eq!(accel, Accel::Kvm);
@@ -2924,7 +3759,7 @@ mod tests {
         .unwrap()
         .command
         {
-            Command::Test {
+            Command::Test(TestArgs {
                 timeout,
                 accel,
                 log,
@@ -2934,7 +3769,7 @@ mod tests {
                 allow_no_completion,
                 json,
                 ..
-            } => {
+            }) => {
                 assert_eq!(timeout, 300);
                 assert_eq!(accel, Accel::Tcg);
                 assert_eq!(log.as_deref(), Some("evidence.log"));
@@ -2964,7 +3799,7 @@ mod tests {
         .unwrap()
         .command
         {
-            Command::Test { qemu_args, .. } => {
+            Command::Test(TestArgs { qemu_args, .. }) => {
                 assert_eq!(qemu_args, ["-nic", "user,model=virtio-net-pci"]);
             }
             _ => panic!("expected Test"),
@@ -3167,7 +4002,7 @@ mod tests {
         ];
         match Cli::try_parse_from(base).unwrap().command {
             Command::Workers {
-                command: WorkersCommand::Provision { count, .. },
+                command: WorkersCommand::Provision(WorkersProvisionArgs { count, .. }),
             } => assert_eq!(count, 1, "default count is one"),
             _ => panic!("expected Workers Provision"),
         }
@@ -3176,7 +4011,7 @@ mod tests {
             args.extend(["--count", good]);
             match Cli::try_parse_from(args).unwrap().command {
                 Command::Workers {
-                    command: WorkersCommand::Provision { count, .. },
+                    command: WorkersCommand::Provision(WorkersProvisionArgs { count, .. }),
                 } => assert_eq!(count, good.parse::<u32>().unwrap()),
                 _ => panic!("expected Workers Provision"),
             }
@@ -3205,7 +4040,7 @@ mod tests {
         {
             Command::Workers {
                 command:
-                    WorkersCommand::Issue {
+                    WorkersCommand::Issue(WorkersIssueArgs {
                         home,
                         identity,
                         validity,
@@ -3213,7 +4048,7 @@ mod tests {
                         wait,
                         timeout,
                         json,
-                    },
+                    }),
             } => {
                 assert!(home.is_none());
                 assert!(identity.is_none());
@@ -3249,7 +4084,7 @@ mod tests {
         {
             Command::Workers {
                 command:
-                    WorkersCommand::Issue {
+                    WorkersCommand::Issue(WorkersIssueArgs {
                         home,
                         identity,
                         validity,
@@ -3257,7 +4092,7 @@ mod tests {
                         wait,
                         timeout,
                         json,
-                    },
+                    }),
             } => {
                 assert_eq!(home.as_deref(), Some("/tmp/ca-home"));
                 assert_eq!(identity.as_deref(), Some("nau-worker-abc123-01"));
@@ -3274,7 +4109,7 @@ mod tests {
             .command
         {
             Command::Workers {
-                command: WorkersCommand::Pickup { home },
+                command: WorkersCommand::Pickup(WorkersPickupArgs { home }),
             } => assert_eq!(home.as_deref(), Some("/tmp/ca-home")),
             _ => panic!("expected Workers Pickup"),
         }
@@ -3344,6 +4179,455 @@ mod tests {
                 assert_eq!(from, None);
             }
             _ => panic!("expected Doctor"),
+        }
+    }
+
+    // ── Domain namespaces (ADR-0049, as amended: `pool` not `farm`,
+    //    `trust` flattened) ──
+
+    #[test]
+    fn domain_groups_are_visible_legacy_spellings_hidden() {
+        let cmd = Cli::command();
+        for visible in [
+            "chart",
+            "build",
+            "image",
+            "ship",
+            "peer",
+            "trust",
+            "pool",
+            "pod",
+            "runtime",
+            "doctor",
+            "completion",
+        ] {
+            let sub = cmd
+                .find_subcommand(visible)
+                .unwrap_or_else(|| panic!("{visible} must exist"));
+            assert!(!sub.is_hide_set(), "{visible} must be visible");
+        }
+        for hidden in [
+            "check",
+            "eval",
+            "lock",
+            "lint",
+            "audit",
+            "search",
+            "index",
+            "deps",
+            "cache",
+            "key",
+            "ca",
+            "push",
+            "pull",
+            "serve",
+            "peers",
+            "export",
+            "test",
+            "verify-image",
+            "run",
+            "workers",
+            "__eval-worker",
+            "__check-worker",
+            "__worker-cap",
+            "__worker-job",
+        ] {
+            let sub = cmd
+                .find_subcommand(hidden)
+                .unwrap_or_else(|| panic!("{hidden} must exist"));
+            assert!(sub.is_hide_set(), "{hidden} must be hidden");
+        }
+    }
+
+    // ── External subcommands (ADR-0049 Decision 5, #324) ──
+
+    #[test]
+    fn unknown_verbs_arrive_as_the_external_catch_all() {
+        // git semantics: the verb is consumed, the rest forwarded verbatim.
+        match Cli::try_parse_from(["nau", "foo", "a", "-b"])
+            .unwrap()
+            .command
+        {
+            Command::External(argv) => {
+                let strs: Vec<String> = argv
+                    .iter()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(strs, ["foo", "a", "-b"]);
+            }
+            _ => panic!("expected the external catch-all"),
+        }
+        // Shapes clap only delivers after `--` or as bare values still
+        // land in the catch-all — where the charset validator refuses
+        // them before any lookup.
+        for bad in [
+            ["nau", "--", "-x"].as_slice(),
+            ["nau", ""].as_slice(),
+            ["nau", "foo.bar"].as_slice(),
+        ] {
+            match Cli::try_parse_from(bad).unwrap().command {
+                Command::External(_) => {}
+                _ => panic!("expected {bad:?} in the external catch-all"),
+            }
+        }
+        // A bare hyphen-leading verb never reaches the catch-all: clap
+        // refuses it as an unknown flag first (parse must fail).
+        assert!(
+            Cli::try_parse_from(["nau", "-x"]).is_err(),
+            "-x without -- is clap's unknown-argument refusal, not a lookup"
+        );
+    }
+
+    #[test]
+    fn real_variants_never_reach_the_external_catch_all() {
+        // Public domain group.
+        assert!(matches!(
+            Cli::try_parse_from(["nau", "chart", "check", "cfg.lua"])
+                .unwrap()
+                .command,
+            Command::Chart { .. }
+        ));
+        // Hidden legacy spelling.
+        assert!(matches!(
+            Cli::try_parse_from(["nau", "push", "localhost:5000/team/app"])
+                .unwrap()
+                .command,
+            Command::Push { .. }
+        ));
+        // Hidden internal workers.
+        assert!(matches!(
+            Cli::try_parse_from(["nau", "__eval-worker"])
+                .unwrap()
+                .command,
+            Command::EvalWorker
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["nau", "__worker-cap"])
+                .unwrap()
+                .command,
+            Command::WorkerCap
+        ));
+        // A planted `nau-chart`/`nau-__eval-worker` helper is only ever
+        // consulted for verbs no real variant claims; these never get
+        // there (clap matches real subcommands before the external
+        // capture). normalize_domain passes the catch-all through
+        // untouched so main's dispatch owns it.
+        let external = Command::External(vec!["foo".into()]);
+        assert!(matches!(normalize_domain(external), Command::External(_)));
+    }
+
+    #[test]
+    fn external_verb_charset_is_gits_rule() {
+        assert!(is_external_verb("foo"));
+        assert!(is_external_verb("credential-manager"));
+        assert!(is_external_verb("a1-2b"));
+        // Dots, colons, path separators, leading dash, uppercase, empty.
+        assert!(!is_external_verb("foo.bar"));
+        assert!(!is_external_verb("foo:bar"));
+        assert!(!is_external_verb("foo/bar"));
+        assert!(!is_external_verb("../evil"));
+        assert!(!is_external_verb("-x"));
+        assert!(!is_external_verb("Foo"));
+        assert!(!is_external_verb(""));
+        assert!(!is_external_verb("á"));
+    }
+
+    #[test]
+    fn external_dispatch_refuses_bad_verbs_and_missing_helpers() {
+        // Charset refusals name the rule and never reach a lookup.
+        let err = run_external(&["foo.bar".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("must match [a-z][a-z0-9-]*"),
+            "unexpected refusal: {err:#}"
+        );
+        // Unknown verb with no helper anywhere: the named not-found
+        // refusal. (No sibling of this test binary and nothing on PATH
+        // is named nau-definitely-not-a-verb-324.)
+        let err = run_external(&["definitely-not-a-verb-324".into()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown command `definitely-not-a-verb-324`")
+                && msg.contains("no `nau-definitely-not-a-verb-324` extension found"),
+            "unexpected refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn chart_namespace_folds_onto_the_legacy_commands() {
+        let fold = |argv: &[&str]| normalize_domain(Cli::try_parse_from(argv).unwrap().command);
+        match fold(&["nau", "chart", "check", "cfg.lua", "--json"]) {
+            Command::Check(CheckArgs { file, json }) => {
+                assert_eq!(file, "cfg.lua");
+                assert!(json);
+            }
+            _ => panic!("expected chart check → Check"),
+        }
+        match fold(&["nau", "chart", "eval-worker"]) {
+            Command::EvalWorker => {}
+            _ => panic!("expected chart eval-worker → EvalWorker"),
+        }
+        match fold(&["nau", "chart", "check-worker"]) {
+            Command::CheckWorker => {}
+            _ => panic!("expected chart check-worker → CheckWorker"),
+        }
+        match fold(&["nau", "chart", "deps", "show", "jq"]) {
+            Command::Deps(DepsCommand::Show { package, .. }) => assert_eq!(package, "jq"),
+            _ => panic!("expected chart deps → Deps"),
+        }
+        match fold(&["nau", "chart", "index", "list"]) {
+            Command::Index(IndexCommand::List { .. }) => {}
+            _ => panic!("expected chart index → Index"),
+        }
+        // The legacy spelling still folds through unchanged.
+        match fold(&["nau", "check", "cfg.lua"]) {
+            Command::Check(CheckArgs { file, .. }) => assert_eq!(file, "cfg.lua"),
+            _ => panic!("expected legacy check"),
+        }
+    }
+
+    #[test]
+    fn build_namespace_accepts_snap_and_cache_beside_the_legacy_spelling() {
+        let fold = |argv: &[&str]| normalize_domain(Cli::try_parse_from(argv).unwrap().command);
+        // `build snap` — the namespaced build (`snap` dispatches the
+        // verb, it never lands in the positional).
+        match fold(&["nau", "build", "snap", "--file", "x.lua"]) {
+            Command::Build {
+                args: BuildArgs {
+                    file, output_name, ..
+                },
+                command: None,
+            } => {
+                assert_eq!(file, "x.lua");
+                assert!(
+                    output_name.is_none(),
+                    "`snap` dispatches the verb, not the positional"
+                );
+            }
+            _ => panic!("expected build snap → Build"),
+        }
+        // Bare `build` — the legacy spelling: flags on the group itself.
+        match fold(&["nau", "build", "--file", "x.lua"]) {
+            Command::Build {
+                args: BuildArgs { file, .. },
+                command: None,
+            } => assert_eq!(file, "x.lua"),
+            _ => panic!("expected bare build → Build"),
+        }
+        // The positional output_name survives beside the subcommands.
+        match fold(&["nau", "build", "server"]) {
+            Command::Build {
+                args: BuildArgs { output_name, .. },
+                command: None,
+            } => {
+                assert_eq!(output_name.as_deref(), Some("server"))
+            }
+            _ => panic!("expected positional output name"),
+        }
+        // `build cache` — the cache verbs under the build domain.
+        match fold(&["nau", "build", "cache", "info"]) {
+            Command::Cache(CacheCommand::Info { .. }) => {}
+            _ => panic!("expected build cache → Cache"),
+        }
+    }
+
+    #[test]
+    fn image_ship_peer_namespaces_fold_onto_the_legacy_commands() {
+        let fold = |argv: &[&str]| normalize_domain(Cli::try_parse_from(argv).unwrap().command);
+        match fold(&["nau", "image", "build", "--arch", "arm64"]) {
+            Command::Image {
+                args: ImageArgs {
+                    arch, output_name, ..
+                },
+                command: None,
+            } => {
+                assert_eq!(arch, "arm64");
+                assert!(
+                    output_name.is_none(),
+                    "`build` dispatches the verb, not the positional"
+                );
+            }
+            _ => panic!("expected image build → Image"),
+        }
+        // The legacy spelling: build flags directly on `image`.
+        match fold(&["nau", "image", "--arch", "arm64"]) {
+            Command::Image {
+                args: ImageArgs { arch, .. },
+                command: None,
+            } => assert_eq!(arch, "arm64"),
+            _ => panic!("expected bare image → Image"),
+        }
+        match fold(&["nau", "image", "test", "d.img"]) {
+            Command::Test(TestArgs { image, .. }) => assert_eq!(image, "d.img"),
+            _ => panic!("expected image test → Test"),
+        }
+        match fold(&[
+            "nau",
+            "image",
+            "verify",
+            "--device",
+            "/dev/disk/by-id/x",
+            "--manifest",
+            "m.json",
+        ]) {
+            Command::VerifyImage(VerifyImageArgs {
+                device, manifest, ..
+            }) => {
+                assert_eq!(device, "/dev/disk/by-id/x");
+                assert_eq!(manifest, "m.json");
+            }
+            _ => panic!("expected image verify → VerifyImage"),
+        }
+        match fold(&["nau", "ship", "push", "localhost:5000/a/b"]) {
+            Command::Push(PushArgs { reference, .. }) => {
+                assert_eq!(reference, "localhost:5000/a/b")
+            }
+            _ => panic!("expected ship push → Push"),
+        }
+        match fold(&["nau", "ship", "pull", "localhost:5000/a:b"]) {
+            Command::Pull(PullArgs { reference, .. }) => {
+                assert_eq!(reference, "localhost:5000/a:b")
+            }
+            _ => panic!("expected ship pull → Pull"),
+        }
+        match fold(&["nau", "peer", "browse", "--secs", "5"]) {
+            Command::Peers(PeersArgs { secs, .. }) => assert_eq!(secs, 5),
+            _ => panic!("expected peer browse → Peers"),
+        }
+        match fold(&["nau", "peer", "serve", "--port", "8080"]) {
+            Command::Serve(ServeArgs { port, .. }) => assert_eq!(port, Some(8080)),
+            _ => panic!("expected peer serve → Serve"),
+        }
+        match fold(&["nau", "peer", "export", "out"]) {
+            Command::Export(ExportArgs { out, .. }) => assert_eq!(out, "out"),
+            _ => panic!("expected peer export → Export"),
+        }
+    }
+
+    #[test]
+    fn trust_verbs_map_onto_the_key_and_ca_ceremonies() {
+        let fold = |argv: &[&str]| normalize_domain(Cli::try_parse_from(argv).unwrap().command);
+        // Without --ca: the manifest-key ceremony.
+        match fold(&["nau", "trust", "keygen"]) {
+            Command::Key(KeyCommand::Keygen { home, json }) => {
+                assert!(home.is_none());
+                assert!(!json);
+            }
+            _ => panic!("expected trust keygen → Key"),
+        }
+        match fold(&["nau", "trust", "rotate", "--manifest", "m.json"]) {
+            Command::Key(KeyCommand::Rotate { manifest, .. }) => {
+                assert_eq!(manifest.as_deref(), Some("m.json"));
+            }
+            _ => panic!("expected trust rotate → Key"),
+        }
+        match fold(&["nau", "trust", "promote"]) {
+            Command::Key(KeyCommand::Promote { .. }) => {}
+            _ => panic!("expected trust promote → Key"),
+        }
+        match fold(&["nau", "trust", "revoke", "deadbeef00112233"]) {
+            Command::Key(KeyCommand::Revoke { key_id, .. }) => {
+                assert_eq!(key_id, "deadbeef00112233");
+            }
+            _ => panic!("expected trust revoke → Key"),
+        }
+        match fold(&["nau", "trust", "list"]) {
+            Command::Key(KeyCommand::List { .. }) => {}
+            _ => panic!("expected trust list → Key"),
+        }
+        match fold(&["nau", "trust", "verify", "m.json"]) {
+            Command::Key(KeyCommand::Verify { manifest, .. }) => assert_eq!(manifest, "m.json"),
+            _ => panic!("expected trust verify → Key"),
+        }
+        // With --ca: the host CA ceremony.
+        match fold(&["nau", "trust", "keygen", "--ca", "--force"]) {
+            Command::Ca(CaCommand::Keygen { force, .. }) => assert!(force),
+            _ => panic!("expected trust keygen --ca → Ca"),
+        }
+        match fold(&["nau", "trust", "list", "--ca"]) {
+            Command::Ca(CaCommand::List { .. }) => {}
+            _ => panic!("expected trust list --ca → Ca"),
+        }
+        // `--force` is CA-scoped: refused without `--ca`.
+        assert!(Cli::try_parse_from(["nau", "trust", "keygen", "--force"]).is_err());
+        // The legacy spellings still parse.
+        assert!(matches!(
+            fold(&["nau", "key", "keygen"]),
+            Command::Key(KeyCommand::Keygen { .. })
+        ));
+        assert!(matches!(
+            fold(&["nau", "ca", "keygen"]),
+            Command::Ca(CaCommand::Keygen { .. })
+        ));
+    }
+
+    #[test]
+    fn pool_namespace_wraps_workers_and_reveals_the_worker_verbs() {
+        let fold = |argv: &[&str]| normalize_domain(Cli::try_parse_from(argv).unwrap().command);
+        match fold(&[
+            "nau",
+            "pool",
+            "provision",
+            "--provider",
+            "hetzner",
+            "--type",
+            "CX33",
+            "--location",
+            "hel1",
+        ]) {
+            Command::Workers {
+                command: WorkersCommand::Provision(WorkersProvisionArgs { provider, .. }),
+            } => assert_eq!(provider, "hetzner"),
+            _ => panic!("expected pool provision → Workers"),
+        }
+        match fold(&[
+            "nau",
+            "pool",
+            "burst",
+            "--provider",
+            "hetzner",
+            "--type",
+            "CX33",
+            "--location",
+            "hel1",
+            "--",
+            "true",
+        ]) {
+            Command::Workers {
+                command: WorkersCommand::Burst(_),
+            } => {}
+            _ => panic!("expected pool burst → Workers"),
+        }
+        match fold(&["nau", "pool", "publish"]) {
+            Command::Workers {
+                command: WorkersCommand::ReceivePublish,
+            } => {}
+            _ => panic!("expected pool publish → ReceivePublish"),
+        }
+        match fold(&["nau", "pool", "issue", "--wait"]) {
+            Command::Workers {
+                command: WorkersCommand::Issue(WorkersIssueArgs { wait, .. }),
+            } => assert!(wait),
+            _ => panic!("expected pool issue → Workers"),
+        }
+        // The revealed worker verbs.
+        match fold(&["nau", "pool", "probe"]) {
+            Command::WorkerCap => {}
+            _ => panic!("expected pool probe → WorkerCap"),
+        }
+        match fold(&["nau", "pool", "job", "job.json"]) {
+            Command::WorkerJob { job_file } => assert_eq!(job_file, "job.json"),
+            _ => panic!("expected pool job → WorkerJob"),
+        }
+        // The legacy spellings still parse (hidden aliases).
+        match fold(&["nau", "workers", "pickup"]) {
+            Command::Workers {
+                command: WorkersCommand::Pickup(_),
+            } => {}
+            _ => panic!("expected workers pickup"),
+        }
+        match fold(&["nau", "__worker-cap"]) {
+            Command::WorkerCap => {}
+            _ => panic!("expected __worker-cap alias"),
         }
     }
 }

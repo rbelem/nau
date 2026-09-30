@@ -418,7 +418,14 @@ fn attack_worker_process_observations() {
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string())
                             .collect();
-                        if !parts.iter().any(|p| p == "__eval-worker") {
+                        // The parent re-execs the revealed ADR-0049
+                        // spelling (`chart eval-worker`); the hidden
+                        // `__eval-worker` alias keeps parsing for the
+                        // migration window, so sample either form.
+                        if !parts
+                            .iter()
+                            .any(|p| p == "eval-worker" || p == "__eval-worker")
+                        {
                             continue;
                         }
                         let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))

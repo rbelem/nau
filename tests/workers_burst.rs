@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser as _;
-use nau::cli::{BurstCount, Cli, Command, WorkersCommand};
+use nau::cli::{BurstCount, Cli, Command, WorkersBurstArgs, WorkersCommand, WorkersDownArgs};
 use nau::command::{CommandRunner, RunnerOutput};
 use nau::provision::hetzner::HetznerProvisioner;
 use nau::provision::publish::{pending_dir, pending_identities, PendingIdentity, PublishChannel};
@@ -483,7 +483,7 @@ fn burst_cli_parses_the_defaults_and_the_wrapped_command() {
     match cli.command {
         Command::Workers {
             command:
-                WorkersCommand::Burst {
+                WorkersCommand::Burst(WorkersBurstArgs {
                     provider,
                     server_type,
                     location,
@@ -494,7 +494,7 @@ fn burst_cli_parses_the_defaults_and_the_wrapped_command() {
                     keep,
                     file,
                     command,
-                },
+                }),
         } => {
             assert_eq!(provider, "hetzner");
             assert_eq!(server_type, "CX33");
@@ -576,11 +576,11 @@ fn down_cli_requires_all_managed() {
     match cli.command {
         Command::Workers {
             command:
-                WorkersCommand::Down {
+                WorkersCommand::Down(WorkersDownArgs {
                     all_managed,
                     provider,
                     file,
-                },
+                }),
         } => {
             assert!(all_managed);
             assert_eq!(provider, "hetzner");
@@ -691,13 +691,13 @@ fn burst_cli_parses_count_auto_beside_explicit_counts() {
     };
     match burst(&["--count", "auto"]).command {
         Command::Workers {
-            command: WorkersCommand::Burst { count, .. },
+            command: WorkersCommand::Burst(WorkersBurstArgs { count, .. }),
         } => assert_eq!(count, BurstCount::Auto, "`auto` parses as the sizing mode"),
         _ => panic!("expected Workers Burst"),
     }
     match burst(&["--count", "3"]).command {
         Command::Workers {
-            command: WorkersCommand::Burst { count, .. },
+            command: WorkersCommand::Burst(WorkersBurstArgs { count, .. }),
         } => assert_eq!(
             count,
             BurstCount::Fixed(3),
@@ -707,7 +707,7 @@ fn burst_cli_parses_count_auto_beside_explicit_counts() {
     }
     match burst(&[]).command {
         Command::Workers {
-            command: WorkersCommand::Burst { count, .. },
+            command: WorkersCommand::Burst(WorkersBurstArgs { count, .. }),
         } => assert_eq!(count, BurstCount::Fixed(1), "the default stays 1"),
         _ => panic!("expected Workers Burst"),
     }
