@@ -476,14 +476,17 @@ pub struct FarmPlans {
     pub dep_metas: HashMap<String, SnapMeta>,
     pub dep_closures: HashMap<String, crate::cache::BuildClosure>,
     pub caps: HashMap<String, crate::build_sched::JobCaps>,
-    /// The coordinator's own store as a holder set (#309): the union of
-    /// every node's placement-known objects — exactly the sha256s the
-    /// local build resolves offline (output dir first, then the binary
-    /// cache, per `resolved_dep_payload`; source pins ride the
-    /// lockfile). Threaded into the LOCAL member's `store_held`, whose
-    /// trait-default `None` kept locally-held jobs out of the holder
-    /// preference and reservation — they fell to the racy fallback and
-    /// paid a full sync leg onto an empty worker (window 6).
+    /// The coordinator's own store as a holder set (#309): the sha256s
+    /// whose BYTES verifiably sit on the coordinator — per kind, the
+    /// bytes-present filter [`local_held_objects`] runs over each
+    /// resolved plan (dep payloads via output dir then binary cache;
+    /// #310 stage tars, offline-computable; source pins only when the
+    /// blob itself is in the output dir and hashes to the pin — pin-KNOWN
+    /// is not bytes-PRESENT, #309). Threaded into the LOCAL member's
+    /// `store_held`, whose trait-default `None` kept locally-held jobs
+    /// out of the holder preference and reservation — they fell to the
+    /// racy fallback and paid a full sync leg onto an empty worker
+    /// (window 6).
     pub local_held: BTreeSet<String>,
 }
 
@@ -574,6 +577,71 @@ pub fn placement_objects(
     objects
 }
 
+/// The bytes-present local-held object set of one RESOLVED plan (#309):
+/// pin-KNOWN is not bytes-PRESENT, so [`JobCaps::objects`]'s placement
+/// set is only a holder candidate here after the local resolvers verify
+/// the bytes. Per kind:
+/// - dep payloads: [`resolved_dep_payload`] (output dir, then the
+///   binary cache) — an unbuilt dep contributes nothing, unchanged;
+/// - #310 stage tars: `pack_stage_tar` is offline-computable —
+///   genuinely local-held, so stage-only deps stay local-reserved
+///   (zero transfer beats shipping coordinator-local bytes);
+/// - source pins: the pin resolves like dispatch's `source_pin`
+///   (lockfile first, then the declared hash), but held only when the
+///   blob sits in the output dir under its URL name and hashes to the
+///   pin — a never-fetched pin is not coordinator-held, so the node
+///   dispatches and the pool seeds (windows 8/9's all-local shape).
+///   The binary-cache leg of [`resolved_dep_payload`] has no source
+///   shape (closure-keyed built snaps), so the output dir is the only
+///   place a fetched blob can verifiably sit.
+pub fn local_held_objects(
+    plan: &NodeJobPlan,
+    lockfile: &LockFile,
+    dep_metas: &HashMap<String, SnapMeta>,
+    dep_closures: &HashMap<String, crate::cache::BuildClosure>,
+    output_dir: &Path,
+    pkg_cache: Option<&crate::cache::PackageCache>,
+) -> BTreeSet<String> {
+    let mut held = BTreeSet::new();
+    if let Some(stage) = &plan.stage_from {
+        if let Ok(bytes) = pack_stage_tar(stage) {
+            held.insert(crate::oci::sha256_hex(&bytes));
+        }
+    }
+    for dep in &plan.deps {
+        if let Some(path) = resolved_dep_payload(
+            dep,
+            &plan.arch,
+            dep_metas,
+            dep_closures,
+            output_dir,
+            pkg_cache,
+        ) {
+            if let Ok(bytes) = std::fs::read(&path) {
+                held.insert(crate::oci::sha256_hex(&bytes));
+            }
+        }
+    }
+    for spec in &plan.sources {
+        let Some(pin) = lockfile
+            .lookup_source(spec.url())
+            .or(spec.expected_sha256())
+        else {
+            continue;
+        };
+        // The URL's last segment — the same filename rule the fetch
+        // paths use (dep_fetch's source tree, curl's `-o` dest).
+        let filename = spec.url().rsplit('/').next().unwrap_or("");
+        let blob = output_dir.join(filename);
+        if let Ok(bytes) = std::fs::read(&blob) {
+            if crate::oci::sha256_hex(&bytes) == pin {
+                held.insert(pin.to_string());
+            }
+        }
+    }
+    held
+}
+
 /// Resolve every node's remote-job plan up front, on the orchestrator
 /// thread: the recipe slice, the transitive dep payload specs (each
 /// dep's meta evaluated once, sequentially — the evals never run on
@@ -644,11 +712,23 @@ pub fn precompute_farm_plans(
             },
         );
     }
-    // #309: the local held set — everything the local build resolves
-    // offline is exactly the union of the placement sets just computed.
-    let local_held: BTreeSet<String> = caps
+    // #309: the local held set is bytes-PRESENT, per kind — the union
+    // of the placement sets would conflate pin-KNOWN with bytes-PRESENT
+    // (a pinned external source never fetched read as coordinator-held,
+    // local-reserving pinned deps on cold and never seeding the pool);
+    // each object stays only when its bytes verifiably sit locally.
+    let local_held: BTreeSet<String> = plans
         .values()
-        .flat_map(|c| c.objects.iter().cloned())
+        .flat_map(|p| {
+            local_held_objects(
+                p,
+                lockfile,
+                &dep_metas,
+                &dep_closures,
+                output_dir,
+                pkg_cache,
+            )
+        })
         .collect();
     Ok(FarmPlans {
         plans,
