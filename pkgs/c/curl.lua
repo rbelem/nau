@@ -34,12 +34,21 @@ return {
         source = {
             url = "https://curl.se/download/curl-8.20.0.tar.xz",
         },
+        -- --with-ca-bundle/--with-ca-path: bake the host trust anchors
+        -- into libcurl ITSELF, not just the curl binary. The bin farm's
+        -- loader path exports the curl extension's lib dir, so any
+        -- binary in the shell resolves libcurl.so.4 from the pod tree
+        -- (system curl included); only curl.real runs behind the
+        -- CURL_CA_BUNDLE wrapper below, everything else needs the
+        -- library's own compile-time default (exit 60 without it).
+        -- Host pair = trust anchors are host policy (ADR-0030, git
+        -- wrapper precedent); explicit CURL_CA_BUNDLE/--cacert still win.
         -- --without-libpsl: curl 8.x makes libpsl a hard configure dependency
         -- (PSL cookie hardening); it is not in the pool and is optional
         -- functionality, so disable it explicitly or configure errors out
         -- ("libpsl libs and/or directories were not found").
         build = table.concat({
-            "./configure --prefix=/usr --with-openssl --without-libpsl",
+            "./configure --prefix=/usr --with-openssl --without-libpsl --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt --with-ca-path=/etc/ssl/certs",
             "make -j$(nproc)",
             "make install DESTDIR=$STAGE",
             -- libtool .la metadata embeds the configure-time prefix and is
