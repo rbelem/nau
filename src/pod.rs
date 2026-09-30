@@ -6232,7 +6232,10 @@ pub fn list_packages(root: &Path, pod_name: &str) -> miette::Result<Vec<PodListE
 /// libs-carrying app in a generation-scoped LD wrapper
 /// (`farm::ld_wrappers`), so the pod's libraries ride only the
 /// processes the pod launches and this export exports nothing but PATH
-/// plus the declared env (ADR-0030).
+/// plus the declared env (ADR-0030) — and *clears* any ambient
+/// loader-lib value the hosting shell inherited (issue #311: a stale
+/// pre-#110 ancestor would otherwise keep poisoning host flatpak/curl
+/// /node until it dies).
 #[derive(Debug, PartialEq, Serialize)]
 pub struct PodShellenv {
     /// The pod this environment belongs to.
@@ -6394,16 +6397,26 @@ fn sh_single_quote(value: &str) -> String {
 }
 
 /// Render a shellenv as eval-safe POSIX shell statements (issue #47):
-/// the PATH prepend plus the declared env exports (ADR-0030). Pure —
-/// the JSON branch prints the struct instead.
+/// the PATH prepend, the loader-lib strip, and the declared env exports
+/// (ADR-0030). Pure — the JSON branch prints the struct instead.
 ///
 /// The loader-lib `LD_LIBRARY_PATH` export lived here until issue #110
 /// (ADR-0034) moved the seam into the emit-time LD wrappers: an env
 /// export reached every child of the hosting shell and broke host curl,
-/// nix git, and node. Nothing in the rendered script touches the
-/// loader path anymore.
+/// nix git, and node. Issue #311 completed the seam: shells launched
+/// from pre-#110 ancestors (a stale eval, or a long-lived daemon
+/// started under one) still carry the poisoned ambient value for as
+/// long as that ancestor lives, so the render now *clears* all four
+/// loader-lib vars instead of merely not exporting them. Pod payloads
+/// get loader env only from their wrappers, per process.
 pub fn render_shellenv(env: &PodShellenv) -> String {
     let mut script = format!("export PATH=\"{}:$PATH\"\n", env.farm);
+    // The wrappers (farm::ld_wrappers, issue #164) set LD_LIBRARY_PATH
+    // and LIBRARY_PATH and clear CPATH/COMPILER_PATH per pod process,
+    // so an ambient value here can only be stale inheritance — poison
+    // to every host binary the shell launches (flatpak/curl TLS deaths,
+    // node symbol mismatches, gcc startfile loss).
+    script.push_str("unset LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n");
     // ADR-0030: one export per declared var, BTreeMap order (sorted —
     // byte-deterministic across syncs and rebuilds).
     for (key, value) in &env.vars {
@@ -7661,35 +7674,45 @@ pod {
 
         // Issue #110 (ADR-0034): the shell export carries NO loader
         // libs — the seam moved into the emit's per-app LD wrappers.
+        // Issue #311: the render also CLEARS the ambient loader vars,
+        // so a stale pre-#110 ancestor's value cannot survive the eval.
         // The wrappers themselves are the farm emit's contract (tested
-        // there); here the absence from the shell surface is the point.
+        // there); here the shell surface's strip is the point.
         let env = shellenv(&root, "default").unwrap();
         let script = render_shellenv(&env);
         assert!(
-            !script.contains("LD_LIBRARY_PATH"),
-            "shellenv must not export loader libs: {script}"
+            script.contains("unset LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH"),
+            "shellenv must strip ambient loader-lib env: {script}"
+        );
+        assert!(
+            !script.contains("export LD_LIBRARY_PATH"),
+            "shellenv must never export loader libs: {script}"
         );
 
         // Rollback semantics: the flipped-to generation re-emits and
-        // the shell surface stays clean either way.
+        // the shell surface strips either way.
         crate::farm::flip_current(&dir, 2).unwrap();
         let env2 = shellenv(&root, "default").unwrap();
         assert!(
-            !render_shellenv(&env2).contains("LD_LIBRARY_PATH"),
+            render_shellenv(&env2).contains("unset LD_LIBRARY_PATH"),
             "rollback target: {env2:?}"
         );
     }
 
     #[test]
-    fn test_shellenv_without_a_loader_lib_list_exports_none() {
+    fn test_shellenv_without_a_loader_lib_list_still_strips_ambient() {
         let tmp = tempfile::tempdir().unwrap();
         // A generation emitted before the seam existed: no loader-libs
-        // file. The shellenv must degrade to the #47 PATH-only export.
+        // file. The shellenv degrades to the #47 PATH export plus the
+        // #311 ambient loader strip.
         seed_active_pod(tmp.path(), "default", 4);
         let env = shellenv(tmp.path(), "default").unwrap();
         assert_eq!(
             render_shellenv(&env),
-            format!("export PATH=\"{}:$PATH\"\n", env.farm)
+            format!(
+                "export PATH=\"{}:$PATH\"\nunset LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n",
+                env.farm
+            )
         );
     }
 
@@ -7707,21 +7730,35 @@ pod {
             secrets: BTreeMap::new(),
         };
         let script = render_shellenv(&env);
-        assert_eq!(script, "export PATH=\"/root/default/current:$PATH\"\n");
+        assert_eq!(
+            script,
+            "export PATH=\"/root/default/current:$PATH\"\n\
+             unset LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n"
+        );
 
-        // The real proof: eval the script under `set -u` with
-        // LD_LIBRARY_PATH unset, set, and empty. The rendered script
-        // never mentions the variable (issue #110: the loader seam
-        // moved into the emit's per-app wrappers), so the caller's
-        // value passes through untouched in every case.
+        // The real proof: eval the script under `set -u` with each
+        // loader var unset, set, and empty. Issue #110 moved the seam
+        // into the emit's per-app wrappers; issue #311 makes the eval
+        // actively clear what it inherited, so a stale pre-#110
+        // ancestor's poisoned value cannot reach this shell's children
+        // in any case.
         let eval = |pre: Option<&str>| {
             let mut cmd = std::process::Command::new("sh");
             cmd.arg("-c").arg(format!(
-                "set -u\n{script}\nprintf '%s' \"${{LD_LIBRARY_PATH-__UNSET__}}\""
+                "set -u\n{script}\nprintf '%s' \"${{LD_LIBRARY_PATH-__UNSET__}},\
+                 ${{LIBRARY_PATH-__UNSET__}},${{CPATH-__UNSET__}},${{COMPILER_PATH-__UNSET__}}\""
             ));
             match pre {
-                Some(v) => cmd.env("LD_LIBRARY_PATH", v),
-                None => cmd.env_remove("LD_LIBRARY_PATH"),
+                Some(v) => {
+                    for k in ["LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "COMPILER_PATH"] {
+                        cmd.env(k, v);
+                    }
+                }
+                None => {
+                    for k in ["LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "COMPILER_PATH"] {
+                        cmd.env_remove(k);
+                    }
+                }
             };
             let out = cmd.output().unwrap();
             assert!(
@@ -7731,9 +7768,12 @@ pod {
             );
             String::from_utf8(out.stdout).unwrap()
         };
-        assert_eq!(eval(None), "__UNSET__");
-        assert_eq!(eval(Some("keep")), "keep");
-        assert_eq!(eval(Some("")), "");
+        assert_eq!(eval(None), "__UNSET__,__UNSET__,__UNSET__,__UNSET__");
+        assert_eq!(
+            eval(Some("keep")),
+            "__UNSET__,__UNSET__,__UNSET__,__UNSET__"
+        );
+        assert_eq!(eval(Some("")), "__UNSET__,__UNSET__,__UNSET__,__UNSET__");
     }
 
     // ── declared pod env (ADR-0030) ──
@@ -8159,7 +8199,11 @@ pod {
         );
         assert_eq!(
             render_shellenv(&env),
-            format!("export PATH=\"{}:$PATH\"\n", env.farm)
+            format!(
+                "export PATH=\"{}:$PATH\"\n\
+                 unset LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n",
+                env.farm
+            )
         );
     }
 
@@ -8198,10 +8242,12 @@ pod {
             secrets: BTreeMap::new(),
         };
         let script = render_shellenv(&env);
-        // Sorted keys, POSIX single-quote escaping (`'` → `'\''`).
+        // Sorted keys, POSIX single-quote escaping (`'` → `'\''`),
+        // and the #311 loader strip right after the PATH prepend.
         assert_eq!(
             script,
             "export PATH=\"/root/default/current:$PATH\"\n\
+             unset LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n\
              export A_FIRST='sorted'\n\
              export EDITOR='vi'\n\
              export EMPTY=''\n\

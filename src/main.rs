@@ -3683,9 +3683,10 @@ fn cmd_runtime(sub: RuntimeCommand) -> miette::Result<()> {
 // ── Pods (issues #2 + #4) ──
 
 /// `nau pod shellenv` (issue #47): print the selected pod's
-/// environment as shell statements — `export PATH="<farm>:$PATH"`, plus
-/// the #89 loader-lib `LD_LIBRARY_PATH` prepend when the generation
-/// ships payload libs — or as structured JSON with `--json`. The caller
+/// environment as shell statements — `export PATH="<farm>:$PATH"`, the
+/// #311 ambient loader-lib strip (never a loader-lib export; the seam
+/// lives in the emit-time wrappers, ADR-0034), and the declared env /
+/// secret exports — or as structured JSON with `--json`. The caller
 /// `eval`s the output; this process only prints, never touching an RC
 /// file.
 fn cmd_pod_shellenv(pod_name: &str, json: bool, root: Option<String>) -> miette::Result<()> {

@@ -22,6 +22,12 @@ fn run(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, String, Stri
     cmd.env("NAU_DATA_HOME", root.join("data-home"));
     // Keep pod activation off the host systemd bus (issue #66).
     cmd.env("NAU_SYSTEMD", "off");
+    // The shuttle pod env leaks LD_LIBRARY_PATH/LIBRARY_PATH/CPATH/
+    // COMPILER_PATH; shellenv (correctly) emits unset lines for any it
+    // sees, so exact-output assertions must not depend on the host env.
+    for var in ["LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "COMPILER_PATH"] {
+        cmd.env_remove(var);
+    }
     let out = cmd.output().expect("failed to spawn nau pod");
     (
         out.status.code(),
@@ -38,6 +44,11 @@ fn run_env_root(project: &Path, root: &Path, args: &[&str]) -> (Option<i32>, Str
     cmd.env("NAU_POD_ROOT", root);
     cmd.current_dir(project);
     cmd.env("NAU_DATA_HOME", root.join("data-home"));
+    // Same env-determinism as run(): shellenv unsets whatever leak vars
+    // it sees, and exact-output assertions must not depend on the host.
+    for var in ["LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "COMPILER_PATH"] {
+        cmd.env_remove(var);
+    }
     // Keep pod activation off the host systemd bus (issue #66). This
     // helper was the one spawn site the #66 sweep missed: its `pod add`
     // reaches RuntimeStore::activate, which ran `systemctl daemon-reload`
@@ -724,13 +735,17 @@ fn shellenv_prints_an_export_line_for_the_farm() {
     let (code, stdout, stderr) = run(project.path(), root.path(), &["shellenv"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
 
-    // Exactly one eval-able line: the farm prepended to the caller's
-    // PATH, `current` kept as the link so rollback flips stay visible.
+    // Two eval-able lines: the farm prepended to the caller's PATH,
+    // `current` kept as the link so rollback flips stay visible, then
+    // the #311 ambient loader-lib strip.
     let expected_farm = root.path().canonicalize().unwrap().join("default/current");
     assert_eq!(
         stdout,
-        format!("export PATH=\"{}:$PATH\"\n", expected_farm.display()),
-        "shellenv must print exactly one export line"
+        format!(
+            "export PATH=\"{}:$PATH\"\nunset LD_LIBRARY_PATH LIBRARY_PATH CPATH COMPILER_PATH\n",
+            expected_farm.display()
+        ),
+        "shellenv must print the PATH export plus the loader strip"
     );
     assert!(
         stdout.contains(&expected_farm.display().to_string()),
