@@ -2391,13 +2391,15 @@ fn local_held_set_reaches_the_farm_member_through_the_slot_adapter() {
     );
 }
 
-/// #309: the precomputed LOCAL held set is exactly the union of the
-/// placement caps' objects — the sha256s the local build resolves
-/// offline. A run whose plans resolve nothing carries an empty set
-/// (still `Some` — a known-empty store, never the unknown default);
-/// the farm-side tests pin what the set then does to placement.
+/// #309: the precomputed LOCAL held set is bytes-present, per kind —
+/// never the raw union of the placement caps (pin-KNOWN is not
+/// bytes-PRESENT: a pinned external source never fetched must not read
+/// as coordinator-held). A run whose plans resolve nothing carries an
+/// empty set (still `Some` — a known-empty store, never the unknown
+/// default); the per-kind fixtures live in the `local_held_objects`
+/// tests below, the farm-level composite in the seeding test.
 #[test]
-fn precompute_local_held_set_is_the_union_of_the_placement_caps() {
+fn precompute_local_held_set_is_bytes_present_not_the_placement_union() {
     let plans = nau::coordinator::precompute_farm_plans(
         &BTreeMap::from([("meta-only".to_string(), bare_meta("meta-only", "1.0.0"))]),
         &[],
@@ -2413,12 +2415,230 @@ fn precompute_local_held_set_is_the_union_of_the_placement_caps() {
         .flat_map(|c| c.objects.iter().cloned())
         .collect();
     assert_eq!(
-        plans.local_held, union,
-        "the local store is the placement caps' union"
+        plans.local_held.difference(&union).count(),
+        0,
+        "the local held set is a subset of the placement-known objects"
     );
     assert!(
         plans.local_held.is_empty(),
         "a plan-less run holds nothing locally"
+    );
+}
+
+/// #309: a source pin enters local_held only when its BYTES sit in the
+/// run's output dir and hash to the pin — the placement set still names
+/// the pin (it aims; delta_sync stays the authority), but a never-fetched
+/// pin is not coordinator-held. A stale blob (bytes that do not hash to
+/// the pin) is not held either — pin-known ≠ bytes-present.
+#[test]
+fn local_held_objects_gate_source_pins_on_bytes_presence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let url = "https://example.test/srv.tgz";
+    let pin = sha256_hex(b"the bytes upstream served");
+    let plan = plan_for(
+        "srv",
+        &[],
+        vec![SourceSpec::Pinned {
+            url: url.into(),
+            sha256: pin.clone(),
+        }],
+    );
+
+    // Never fetched: placement aims, local_held does not claim.
+    assert_eq!(
+        nau::coordinator::plan_objects(&plan, &empty_lockfile()),
+        BTreeSet::from([pin.clone()]),
+        "the pin stays placement-known"
+    );
+    assert!(
+        nau::coordinator::local_held_objects(
+            &plan,
+            &empty_lockfile(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &out_dir,
+            None,
+        )
+        .is_empty(),
+        "an unfetched pin is not coordinator-held — the node dispatches"
+    );
+
+    // Previously fetched: the blob sits in the output dir under its URL
+    // name and hashes to the pin — held.
+    let bytes = b"the bytes upstream served".to_vec();
+    std::fs::write(out_dir.join("srv.tgz"), &bytes).unwrap();
+    assert_eq!(
+        nau::coordinator::local_held_objects(
+            &plan,
+            &empty_lockfile(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &out_dir,
+            None,
+        ),
+        BTreeSet::from([pin.clone()]),
+        "a previously-fetched pin is coordinator-held"
+    );
+
+    // A stale blob under the same name hashes to something else — not
+    // held (the hash check is the verification).
+    let stale = plan_for(
+        "srv2",
+        &[],
+        vec![SourceSpec::Pinned {
+            url: url.into(),
+            sha256: sha256_hex(b"different bytes"),
+        }],
+    );
+    assert!(
+        nau::coordinator::local_held_objects(
+            &stale,
+            &empty_lockfile(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &out_dir,
+            None,
+        )
+        .is_empty(),
+        "bytes that do not hash to the pin are not held"
+    );
+}
+
+/// #309, unchanged halves of the rule: dep payloads stay held exactly
+/// when [`resolved_dep_payload`] resolves them (output dir first — an
+/// unbuilt dep contributes nothing), and the #310 stage tar stays held
+/// (offline-computable — stage-only deps keep their local reservation).
+#[test]
+fn local_held_objects_keep_resolved_dep_payloads_and_stage_tars() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let dep_bytes = b"the farm-dep snap last run built".to_vec();
+    let dep_sha = sha256_hex(&dep_bytes);
+    std::fs::write(out_dir.join("farm-dep_1.0.0_amd64.snap"), &dep_bytes).unwrap();
+    let dep_meta = bare_meta("farm-dep", "1.0.0");
+    let dep_closures = HashMap::from([(
+        "farm-dep".to_string(),
+        nau::cache::BuildClosure::for_meta(&dep_meta, vec![], vec![]),
+    )]);
+    let dep_metas = HashMap::from([("farm-dep".to_string(), dep_meta)]);
+
+    // The built dep's payload is held; an unbuilt dep is not.
+    assert_eq!(
+        nau::coordinator::local_held_objects(
+            &plan_for("warm", &["farm-dep"], vec![]),
+            &empty_lockfile(),
+            &dep_metas,
+            &dep_closures,
+            &out_dir,
+            None,
+        ),
+        BTreeSet::from([dep_sha.clone()]),
+        "the resolved dep payload stays local-held"
+    );
+    assert!(
+        nau::coordinator::local_held_objects(
+            &plan_for("warm", &["farm-dep2"], vec![]),
+            &empty_lockfile(),
+            &dep_metas,
+            &dep_closures,
+            &out_dir,
+            None,
+        )
+        .is_empty(),
+        "an unbuilt dep contributes nothing"
+    );
+
+    // The stage tar: offline-computable, so genuinely local-held.
+    let stage = tempfile::tempdir().unwrap();
+    std::fs::write(stage.path().join("launcher"), b"#!/bin/sh\n").unwrap();
+    let mut staged = plan_for("stage-only", &[], vec![]);
+    staged.stage_from = Some(stage.path().to_path_buf());
+    let stage_sha = sha256_hex(&nau::coordinator::pack_stage_tar(stage.path()).unwrap());
+    assert_eq!(
+        nau::coordinator::local_held_objects(
+            &staged,
+            &empty_lockfile(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &out_dir,
+            None,
+        ),
+        BTreeSet::from([stage_sha]),
+        "the stage tar is local-held — stage-only deps stay local-reserved"
+    );
+}
+
+/// The #309 composite, end to end at the farm: a pinned node whose pin
+/// was never fetched is placement-known (caps name it) but NOT
+/// local-held (bytes-present is empty) — no member fully holds it, so
+/// no reservation fires, local's fallback defers to the eligible worker
+/// (20405f4's gate), and the worker takes the node on cold: the pool
+/// seeds instead of the coordinator absorbing the graph.
+#[test]
+fn unfetched_pin_keeps_the_pinned_node_dispatchable_on_cold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let pin = sha256_hex(b"the bytes nobody fetched yet");
+    let plan = plan_for(
+        "pinned",
+        &[],
+        vec![SourceSpec::Pinned {
+            url: "https://example.test/srv.tgz".into(),
+            sha256: pin.clone(),
+        }],
+    );
+    // The sets the real precompute derives: placement names the pin,
+    // the local held set is empty (bytes-present filter).
+    let objects = nau::coordinator::placement_objects(
+        &plan,
+        &empty_lockfile(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &out_dir,
+        None,
+    );
+    assert_eq!(objects, BTreeSet::from([pin.clone()]));
+    let local_held = nau::coordinator::local_held_objects(
+        &plan,
+        &empty_lockfile(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &out_dir,
+        None,
+    );
+    assert!(local_held.is_empty(), "the pin was never fetched");
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    // local FIRST: under the old union rule its inflated held set won
+    // the pinned node before the worker ever scanned — the windows 8/9
+    // all-local shape.
+    let local = FakeMember::local(2, events.clone())
+        .holds(&local_held.iter().map(String::as_str).collect::<Vec<_>>());
+    let worker = FakeMember::worker("box", 1, None, events.clone()).holds(&[]);
+    let members = vec![local, worker];
+    let mut caps_map = no_caps();
+    caps_map.insert(
+        "pinned".to_string(),
+        caps_holding(&["amd64"], false, &[pin.as_str()]),
+    );
+    let g = graph(&[("pinned", &[])]);
+    let outcome = run_ready_set_farm(&g, &Default::default(), &farm(&members), &caps_map);
+    outcome
+        .result
+        .expect("the cold pinned node still builds — on the pool");
+    assert_eq!(
+        members[1].started("pinned"),
+        1,
+        "the unfetched-pin node dispatches to the worker — the pool seeds: {events:?}"
+    );
+    assert_eq!(
+        members[0].calls(),
+        0,
+        "local takes nothing: pin-known but not bytes-present: {events:?}"
     );
 }
 
