@@ -1023,7 +1023,7 @@ gated_test!(deps_fetch_skips_sideloaded, {
     let (code, _, stderr) = run_plain(
         project.path(),
         root.path(),
-        &["deps", "fetch", "--name", "default"],
+        &["chart", "deps", "fetch", "--name", "default"],
     );
     assert_eq!(
         code,

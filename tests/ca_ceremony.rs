@@ -40,12 +40,12 @@ fn ca_ceremony_lifecycle_through_the_cli() {
     let public = ca_dir.join("ca.pub");
 
     // ── list on an empty ceremony home: a hint, not an error ──
-    let (code, stdout, stderr) = run_in(dir.path(), &["ca", "list", &home, "--json"]);
+    let (code, stdout, stderr) = run_in(dir.path(), &["trust", "list", "--ca", &home, "--json"]);
     assert_eq!(code, Some(0), "empty list: {stderr}");
     assert_eq!(report_json(&stdout)["present"], serde_json::json!(false));
     // The human form carries the hint (the JSON form intentionally
     // stays machine-clean — status lines are suppressed under --json).
-    let (code, _, stderr) = run_in(dir.path(), &["ca", "list", &home]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "list", "--ca", &home]);
     assert_eq!(code, Some(0));
     assert!(
         stderr.contains("ca keygen"),
@@ -53,7 +53,7 @@ fn ca_ceremony_lifecycle_through_the_cli() {
     );
 
     // ── keygen: mints the keypair at the contract paths ──
-    let (code, stdout, stderr) = run_in(dir.path(), &["ca", "keygen", &home, "--json"]);
+    let (code, stdout, stderr) = run_in(dir.path(), &["trust", "keygen", "--ca", &home, "--json"]);
     assert_eq!(code, Some(0), "keygen: {stderr}");
     let report = report_json(&stdout);
     let fingerprint_a = report["fingerprint"].as_str().unwrap().to_string();
@@ -76,7 +76,7 @@ fn ca_ceremony_lifecycle_through_the_cli() {
     assert_eq!(mode, 0o600, "the CA secret is 0600");
 
     // ── list now introspects the minted CA ──
-    let (code, stdout, stderr) = run_in(dir.path(), &["ca", "list", &home, "--json"]);
+    let (code, stdout, stderr) = run_in(dir.path(), &["trust", "list", "--ca", &home, "--json"]);
     assert_eq!(code, Some(0), "list: {stderr}");
     let listed = report_json(&stdout);
     assert_eq!(listed["present"], serde_json::json!(true));
@@ -85,7 +85,7 @@ fn ca_ceremony_lifecycle_through_the_cli() {
     assert_eq!(listed["public_line"], serde_json::json!(public_line_a));
 
     // ── re-keygen refuses without --force ──
-    let (code, _, stderr) = run_in(dir.path(), &["ca", "keygen", &home]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "keygen", "--ca", &home]);
     assert_ne!(code, Some(0), "overwrite without --force must fail");
     assert!(stderr.contains("already exists"), "named refusal: {stderr}");
     assert!(
@@ -93,7 +93,7 @@ fn ca_ceremony_lifecycle_through_the_cli() {
         "refusal names the opt-in: {stderr}"
     );
     // The original CA survives the refusal.
-    let (code, stdout, _) = run_in(dir.path(), &["ca", "list", &home, "--json"]);
+    let (code, stdout, _) = run_in(dir.path(), &["trust", "list", "--ca", &home, "--json"]);
     assert_eq!(code, Some(0));
     assert_eq!(
         report_json(&stdout)["fingerprint"],
@@ -102,7 +102,10 @@ fn ca_ceremony_lifecycle_through_the_cli() {
     );
 
     // ── --force regenerates both halves (fresh ed25519 keypair) ──
-    let (code, stdout, stderr) = run_in(dir.path(), &["ca", "keygen", &home, "--force", "--json"]);
+    let (code, stdout, stderr) = run_in(
+        dir.path(),
+        &["trust", "keygen", "--ca", &home, "--force", "--json"],
+    );
     assert_eq!(code, Some(0), "force keygen: {stderr}");
     let fingerprint_b = report_json(&stdout)["fingerprint"]
         .as_str()
@@ -112,7 +115,7 @@ fn ca_ceremony_lifecycle_through_the_cli() {
         fingerprint_a, fingerprint_b,
         "a forced mint produces a NEW root"
     );
-    let (code, stdout, _) = run_in(dir.path(), &["ca", "list", &home, "--json"]);
+    let (code, stdout, _) = run_in(dir.path(), &["trust", "list", "--ca", &home, "--json"]);
     assert_eq!(code, Some(0));
     assert_eq!(
         report_json(&stdout)["fingerprint"],
@@ -125,13 +128,13 @@ fn ca_ceremony_lifecycle_through_the_cli() {
 fn ca_secret_without_its_public_half_is_a_named_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let home = format!("--home={}", dir.path().display());
-    let (code, _, stderr) = run_in(dir.path(), &["ca", "keygen", &home]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "keygen", "--ca", &home]);
     assert_eq!(code, Some(0), "keygen: {stderr}");
 
     // Sabotage: drop the public half behind the ceremony's back.
     let public = dir.path().join(".config/nau/ca/ca.pub");
     std::fs::remove_file(&public).unwrap();
-    let (code, _, stderr) = run_in(dir.path(), &["ca", "list", &home, "--json"]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "list", "--ca", &home, "--json"]);
     assert_ne!(code, Some(0), "incomplete keypair must fail closed");
     assert!(stderr.contains("incomplete"), "named error: {stderr}");
     assert!(
@@ -144,13 +147,13 @@ fn ca_secret_without_its_public_half_is_a_named_refusal() {
 fn ca_corrupt_public_half_fails_fingerprint_introspection() {
     let dir = tempfile::tempdir().unwrap();
     let home = format!("--home={}", dir.path().display());
-    let (code, _, stderr) = run_in(dir.path(), &["ca", "keygen", &home]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "keygen", "--ca", &home]);
     assert_eq!(code, Some(0), "keygen: {stderr}");
 
     // Sabotage: the public half stops being a key.
     let public = dir.path().join(".config/nau/ca/ca.pub");
     std::fs::write(&public, "not a key\n").unwrap();
-    let (code, _, stderr) = run_in(dir.path(), &["ca", "list", &home]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "list", "--ca", &home]);
     assert_ne!(code, Some(0), "corrupt public half must fail closed");
     assert!(
         stderr.contains("not a usable public key"),

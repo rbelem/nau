@@ -6,8 +6,8 @@
 use clap::Parser;
 use nau::cli::{
     normalize_domain, AuditArgs, CheckArgs, Cli, Command, DepsCommand, EvalArgs, ExportArgs,
-    ImageArgs, LintArgs, LockArgs, PeersArgs, PullArgs, PushArgs, SearchArgs, ServeArgs, TestArgs,
-    VerifyImageArgs,
+    ImageArgs, LintArgs, LockArgs, PeersArgs, PullArgs, PushArgs, RunArgs, SearchArgs, ServeArgs,
+    TestArgs, VerifyImageArgs,
 };
 
 fn main() -> miette::Result<()> {
@@ -164,10 +164,13 @@ fn main() -> miette::Result<()> {
         Command::Pod { name, command } => nau::commands::cmd_pod(name.as_deref(), command),
 
         Command::Run {
-            app,
-            pod,
-            root,
-            app_args,
+            args:
+                RunArgs {
+                    app,
+                    pod,
+                    root,
+                    app_args,
+                },
         } => nau::commands::cmd_run(pod.as_deref(), root.as_deref(), app.as_deref(), &app_args),
 
         Command::Test(TestArgs {

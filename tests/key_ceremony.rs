@@ -1,5 +1,5 @@
 //! Issue #51 — the key ceremony (generation, rotation, revocation) end to
-//! end through the real binary: `nau key keygen → rotate --manifest →
+//! end through the real binary: `nau trust keygen → rotate --manifest →
 //! promote → rotate → revoke → verify → list`. The ceremony ledger at
 //! `keys/ceremony.json` records the generation chain and the dates; the
 //! transition window accepts either key until revoked; a manifest signed
@@ -54,7 +54,7 @@ fn key_ceremony_lifecycle_through_the_cli() {
     write_unsigned_manifest(&dir, "m.json");
 
     // ── gen ──
-    let (code, _, stderr) = run_in(dir.path(), &["key", "keygen", &home]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "keygen", &home]);
     assert_eq!(code, Some(0), "keygen: {stderr}");
     let ledger: nau::sign::CeremonyLedger =
         serde_json::from_str(&std::fs::read_to_string(keys.join("ceremony.json")).unwrap())
@@ -80,7 +80,7 @@ fn key_ceremony_lifecycle_through_the_cli() {
     let (code, stdout, stderr) = run_in(
         dir.path(),
         &[
-            "key",
+            "trust",
             "rotate",
             "--manifest",
             "m.json",
@@ -110,12 +110,12 @@ fn key_ceremony_lifecycle_through_the_cli() {
     // Either key's rule holds inside the window: the anchored (old) key
     // still verifies; the successor's signature exists but is not yet
     // trusted (no anchor until promote).
-    let (code, _, stderr) = run_in(dir.path(), &["key", "verify", "m.json", &home]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "verify", "m.json", &home]);
     assert_eq!(code, Some(0), "verify inside window: {stderr}");
     assert!(stderr.contains("verified under key id"));
 
     // ── promote ── the successor becomes the signing key.
-    let (code, stdout, stderr) = run_in(dir.path(), &["key", "promote", &home, "--json"]);
+    let (code, stdout, stderr) = run_in(dir.path(), &["trust", "promote", &home, "--json"]);
     assert_eq!(code, Some(0), "promote: {stderr}");
     assert_eq!(report_json(&stdout)["key_id"], serde_json::json!(id_b));
 
@@ -123,23 +123,23 @@ fn key_ceremony_lifecycle_through_the_cli() {
     // dual-signing the manifest (now three signatures).
     let (code, stdout, stderr) = run_in(
         dir.path(),
-        &["key", "rotate", "--manifest", "m.json", &home, "--json"],
+        &["trust", "rotate", "--manifest", "m.json", &home, "--json"],
     );
     assert_eq!(code, Some(0), "second rotate: {stderr}");
     let id_c = report_json(&stdout)["key_id"].as_str().unwrap().to_string();
     assert_ne!(id_c, id_b);
-    let (code, _, stderr) = run_in(dir.path(), &["key", "promote", &home]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "promote", &home]);
     assert_eq!(code, Some(0), "second promote: {stderr}");
     assert_eq!(read_manifest(&dir, "m.json").signatures.len(), 3);
 
     // ── revoke ── the middle generation drops out; dated in the ledger.
-    let (code, stdout, stderr) = run_in(dir.path(), &["key", "revoke", &id_b, &home, "--json"]);
+    let (code, stdout, stderr) = run_in(dir.path(), &["trust", "revoke", &id_b, &home, "--json"]);
     assert_eq!(code, Some(0), "revoke: {stderr}");
     assert!(report_json(&stdout)["revoked_at"].is_string());
 
     // only-new (and old-a) verify: the revoked key is skipped, not a
     // retroactive break.
-    let (code, _, stderr) = run_in(dir.path(), &["key", "verify", "m.json", &home]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "verify", "m.json", &home]);
     assert_eq!(code, Some(0), "post-revoke verify: {stderr}");
     assert!(
         !stderr.contains("REVOKED"),
@@ -155,13 +155,13 @@ fn key_ceremony_lifecycle_through_the_cli() {
     sigs.clear();
     sigs.insert(id_b.clone(), keep);
     std::fs::write(dir.path().join("old-only.json"), value.to_string()).unwrap();
-    let (code, _, stderr) = run_in(dir.path(), &["key", "verify", "old-only.json", &home]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "verify", "old-only.json", &home]);
     assert_ne!(code, Some(0), "revoked-only manifest must fail");
     assert!(stderr.contains("REVOKED"), "named error: {stderr}");
     assert!(stderr.contains(&id_b), "names the revoked key: {stderr}");
 
     // ── list ── the audit trail shows the chain and the revocation.
-    let (code, stdout, stderr) = run_in(dir.path(), &["key", "list", &home, "--json"]);
+    let (code, stdout, stderr) = run_in(dir.path(), &["trust", "list", &home, "--json"]);
     assert_eq!(code, Some(0), "list: {stderr}");
     let ledger: nau::sign::CeremonyLedger =
         serde_json::from_value(report_json(&stdout)).expect("ledger json");
@@ -185,20 +185,20 @@ fn tampered_ceremony_ledger_fails_key_verify() {
     write_unsigned_manifest(&dir, "m.json");
 
     for args in [
-        vec!["key", "keygen", home.as_str()],
-        vec!["key", "rotate", "--manifest", "m.json", home.as_str()],
-        vec!["key", "promote", home.as_str()],
+        vec!["trust", "keygen", home.as_str()],
+        vec!["trust", "rotate", "--manifest", "m.json", home.as_str()],
+        vec!["trust", "promote", home.as_str()],
     ] {
         let (code, _, stderr) = run_in(dir.path(), &args);
         assert_eq!(code, Some(0), "{args:?}: {stderr}");
     }
-    let (code, _, _) = run_in(dir.path(), &["key", "verify", "m.json", home.as_str()]);
+    let (code, _, _) = run_in(dir.path(), &["trust", "verify", "m.json", home.as_str()]);
     assert_eq!(code, Some(0), "clean ledger verifies");
 
     // Tamper: the ledger stops being interpretable, verify fails closed.
     let ledger = dir.path().join(".config/nau/keys/ceremony.json");
     std::fs::write(&ledger, "{\"version\":1,\"keys\":{\"zz\":").unwrap();
-    let (code, _, stderr) = run_in(dir.path(), &["key", "verify", "m.json", home.as_str()]);
+    let (code, _, stderr) = run_in(dir.path(), &["trust", "verify", "m.json", home.as_str()]);
     assert_ne!(code, Some(0), "tampered ledger must fail closed");
     assert!(stderr.contains("corrupt"), "named error: {stderr}");
 }

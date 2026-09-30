@@ -16,8 +16,8 @@ fn repo_root() -> &'static str {
 
 fn run_lint(cwd: &str, args: &[&str]) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
-    cmd.arg("lint").args(args).current_dir(cwd);
-    let out = cmd.output().expect("failed to spawn nau lint");
+    cmd.arg("chart").arg("lint").args(args).current_dir(cwd);
+    let out = cmd.output().expect("failed to spawn nau chart lint");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),

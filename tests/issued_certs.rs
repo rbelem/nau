@@ -127,12 +127,7 @@ fn enroll_and_publish_via_binary(dir: &Path, identity: &str, guest_pub: &str) ->
         "instance_identity": instance_identity(),
     })
     .to_string();
-    let run = run_in_with_stdin(
-        dir,
-        &["workers", "receive-publish"],
-        payload.as_bytes(),
-        &token,
-    );
+    let run = run_in_with_stdin(dir, &["pool", "publish"], payload.as_bytes(), &token);
     assert_eq!(run.code, Some(0), "receive-publish: {}", run.stderr);
     assert!(
         run.stderr.contains("pending identity"),
@@ -149,7 +144,7 @@ fn issue_and_pickup_round_trip_through_the_real_binary() {
     let ca_dir = dir.path().join(".config/nau/ca");
 
     // ── the ceremony: a real CA keypair ──
-    let run = run_in(dir.path(), &["ca", "keygen", &home, "--json"]);
+    let run = run_in(dir.path(), &["trust", "keygen", "--ca", &home, "--json"]);
     assert_eq!(run.code, Some(0), "ca keygen: {}", run.stderr);
     let ca_fingerprint = json_out(&run.stdout)["fingerprint"]
         .as_str()
@@ -160,7 +155,7 @@ fn issue_and_pickup_round_trip_through_the_real_binary() {
     let token = enroll_and_publish_via_binary(dir.path(), IDENTITY, &guest_pub);
 
     // ── issuance through the real binary, REAL ssh-keygen -s ──
-    let run = run_in(dir.path(), &["workers", "issue", &home, "--json"]);
+    let run = run_in(dir.path(), &["pool", "issue", &home, "--json"]);
     assert_eq!(run.code, Some(0), "issue: {}", run.stderr);
     let report = json_out(&run.stdout);
     let issued = &report["issued"];
@@ -220,7 +215,7 @@ fn issue_and_pickup_round_trip_through_the_real_binary() {
     );
 
     // ── pickup through the real binary: same bearer, cert on stdout ──
-    let run = run_in_with_stdin(dir.path(), &["workers", "pickup", &home], b"", &token);
+    let run = run_in_with_stdin(dir.path(), &["pool", "pickup", &home], b"", &token);
     assert_eq!(run.code, Some(0), "pickup: {}", run.stderr);
     let cert = run.stdout.trim().to_string();
     assert!(
@@ -229,17 +224,12 @@ fn issue_and_pickup_round_trip_through_the_real_binary() {
     );
 
     // Idempotent: the guest polls; every GET serves the same cert.
-    let again = run_in_with_stdin(dir.path(), &["workers", "pickup", &home], b"", &token);
+    let again = run_in_with_stdin(dir.path(), &["pool", "pickup", &home], b"", &token);
     assert_eq!(again.code, Some(0));
     assert_eq!(again.stdout.trim(), cert);
 
     // A wrong bearer never serves anything.
-    let run = run_in_with_stdin(
-        dir.path(),
-        &["workers", "pickup", &home],
-        b"",
-        &"f".repeat(64),
-    );
+    let run = run_in_with_stdin(dir.path(), &["pool", "pickup", &home], b"", &"f".repeat(64));
     assert_ne!(run.code, Some(0), "unknown token must refuse");
     assert!(run.stderr.contains("unknown publish token"));
 
@@ -284,14 +274,14 @@ fn issue_and_pickup_round_trip_through_the_real_binary() {
 fn pickup_before_issue_refuses_then_serves_after_issue() {
     let dir = tempfile::tempdir().unwrap();
     let home = format!("--home={}", dir.path().display());
-    let run = run_in(dir.path(), &["ca", "keygen", &home, "--json"]);
+    let run = run_in(dir.path(), &["trust", "keygen", "--ca", &home, "--json"]);
     assert_eq!(run.code, Some(0), "ca keygen: {}", run.stderr);
 
     let guest_pub = real_guest_pub_line(dir.path());
     let token = enroll_and_publish_via_binary(dir.path(), IDENTITY, &guest_pub);
 
     // Not yet signed → the retryable refusal (nonzero; the guest retries).
-    let run = run_in_with_stdin(dir.path(), &["workers", "pickup", &home], b"", &token);
+    let run = run_in_with_stdin(dir.path(), &["pool", "pickup", &home], b"", &token);
     assert_ne!(run.code, Some(0), "pre-issuance pickup must refuse");
     assert!(
         run.stderr.contains("no issued certificate yet"),
@@ -299,10 +289,10 @@ fn pickup_before_issue_refuses_then_serves_after_issue() {
         run.stderr
     );
 
-    let run = run_in(dir.path(), &["workers", "issue", &home, "--json"]);
+    let run = run_in(dir.path(), &["pool", "issue", &home, "--json"]);
     assert_eq!(run.code, Some(0), "issue: {}", run.stderr);
 
-    let run = run_in_with_stdin(dir.path(), &["workers", "pickup", &home], b"", &token);
+    let run = run_in_with_stdin(dir.path(), &["pool", "pickup", &home], b"", &token);
     assert_eq!(run.code, Some(0), "post-issuance pickup: {}", run.stderr);
     assert!(run.stdout.contains("ssh-ed25519-cert-v01"));
 }
@@ -319,7 +309,7 @@ fn issue_refusals_name_the_gap() {
     // refusals at width-dependent points and paints `│` gutters on
     // continuation lines; strip the gutters and flatten whitespace so
     // phrase matches survive any wrap position.
-    let run = run_in(dir.path(), &["workers", "issue", &home]);
+    let run = run_in(dir.path(), &["pool", "issue", &home]);
     assert_ne!(run.code, Some(0), "issue without a CA must refuse");
     let flat = |s: &str| {
         s.replace('│', " ")
@@ -331,11 +321,11 @@ fn issue_refusals_name_the_gap() {
     assert!(flat(&run.stderr).contains("ca keygen"), "{}", run.stderr);
 
     // (b) Unknown identity.
-    let run = run_in(dir.path(), &["ca", "keygen", &home]);
+    let run = run_in(dir.path(), &["trust", "keygen", "--ca", &home]);
     assert_eq!(run.code, Some(0), "ca keygen: {}", run.stderr);
     let run = run_in(
         dir.path(),
-        &["workers", "issue", &home, "--identity", "nau-worker-nope"],
+        &["pool", "issue", &home, "--identity", "nau-worker-nope"],
     );
     assert_ne!(run.code, Some(0));
     assert!(
@@ -345,11 +335,11 @@ fn issue_refusals_name_the_gap() {
     );
 
     // (c) Already issued → named refusal unless --force.
-    let run = run_in(dir.path(), &["workers", "issue", &home, "--json"]);
+    let run = run_in(dir.path(), &["pool", "issue", &home, "--json"]);
     assert_eq!(run.code, Some(0), "first issue: {}", run.stderr);
     let run = run_in(
         dir.path(),
-        &["workers", "issue", &home, "--identity", IDENTITY],
+        &["pool", "issue", &home, "--identity", IDENTITY],
     );
     assert_ne!(run.code, Some(0));
     assert!(
@@ -361,7 +351,7 @@ fn issue_refusals_name_the_gap() {
     let run = run_in(
         dir.path(),
         &[
-            "workers",
+            "pool",
             "issue",
             &home,
             "--identity",
@@ -377,7 +367,7 @@ fn issue_refusals_name_the_gap() {
     let run = run_in(
         dir.path(),
         &[
-            "workers",
+            "pool",
             "issue",
             &home,
             "--identity",
@@ -464,7 +454,7 @@ fn ca_form_executor_pins_the_signing_ca_through_the_real_keygen() {
     let ceremony = dir.path();
 
     // ── the ceremony mints a REAL CA; the fingerprint is the pin ──
-    let run = run_in(dir.path(), &["ca", "keygen", &home, "--json"]);
+    let run = run_in(dir.path(), &["trust", "keygen", "--ca", &home, "--json"]);
     assert_eq!(run.code, Some(0), "keygen: {}", run.stderr);
     let fingerprint = json_out(&run.stdout)["fingerprint"]
         .as_str()
@@ -475,7 +465,7 @@ fn ca_form_executor_pins_the_signing_ca_through_the_real_keygen() {
     // ── enroll + publish + issue through the real verbs ──
     let guest = real_guest_pub_line(dir.path());
     enroll_and_publish_via_binary(dir.path(), IDENTITY, &guest);
-    let run = run_in(dir.path(), &["workers", "issue", &home, "--json"]);
+    let run = run_in(dir.path(), &["pool", "issue", &home, "--json"]);
     assert_eq!(run.code, Some(0), "issue: {}", run.stderr);
 
     // ── the issued record: the audit trail the executor consumes ──

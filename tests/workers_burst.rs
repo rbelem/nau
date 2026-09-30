@@ -1,4 +1,4 @@
-//! `nau workers burst` + `nau workers down --all-managed` (#301), driven
+//! `nau pool burst` + `nau pool down --all-managed` (#301), driven
 //! end to end against the same scripted fakes as provision_hetzner: the
 //! provider fake plays `hcloud` and — uniquely here — the GUESTS too:
 //! each scripted create publishes its server's host key into the pending
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser as _;
-use nau::cli::{BurstCount, Cli, Command, WorkersBurstArgs, WorkersCommand, WorkersDownArgs};
+use nau::cli::{BurstCount, Cli, Command, PoolCommand, WorkersBurstArgs, WorkersDownArgs};
 use nau::command::{CommandRunner, RunnerOutput};
 use nau::provision::hetzner::HetznerProvisioner;
 use nau::provision::publish::{pending_dir, pending_identities, PendingIdentity, PublishChannel};
@@ -466,7 +466,7 @@ fn down_all_managed_is_green_on_an_empty_block() {
 fn burst_cli_parses_the_defaults_and_the_wrapped_command() {
     let cli = Cli::try_parse_from([
         "nau",
-        "workers",
+        "pool",
         "burst",
         "--provider",
         "hetzner",
@@ -481,9 +481,9 @@ fn burst_cli_parses_the_defaults_and_the_wrapped_command() {
     ])
     .unwrap();
     match cli.command {
-        Command::Workers {
+        Command::Pool {
             command:
-                WorkersCommand::Burst(WorkersBurstArgs {
+                PoolCommand::Burst(WorkersBurstArgs {
                     provider,
                     server_type,
                     location,
@@ -511,7 +511,7 @@ fn burst_cli_parses_the_defaults_and_the_wrapped_command() {
             assert_eq!(file, "nau.lua");
             assert_eq!(command, vec!["echo", "hi", "there"]);
         }
-        _ => panic!("expected Workers Burst"),
+        _ => panic!("expected Pool Burst"),
     }
 }
 
@@ -519,7 +519,7 @@ fn burst_cli_parses_the_defaults_and_the_wrapped_command() {
 fn burst_cli_refuses_a_count_over_the_flag_and_a_missing_command() {
     let err = Cli::try_parse_from([
         "nau",
-        "workers",
+        "pool",
         "burst",
         "--provider",
         "hetzner",
@@ -543,7 +543,7 @@ fn burst_cli_refuses_a_count_over_the_flag_and_a_missing_command() {
 
     let err = Cli::try_parse_from([
         "nau",
-        "workers",
+        "pool",
         "burst",
         "--provider",
         "hetzner",
@@ -564,7 +564,7 @@ fn burst_cli_refuses_a_count_over_the_flag_and_a_missing_command() {
 fn down_cli_requires_all_managed() {
     let cli = Cli::try_parse_from([
         "nau",
-        "workers",
+        "pool",
         "down",
         "--all-managed",
         "--provider",
@@ -574,9 +574,9 @@ fn down_cli_requires_all_managed() {
     ])
     .unwrap();
     match cli.command {
-        Command::Workers {
+        Command::Pool {
             command:
-                WorkersCommand::Down(WorkersDownArgs {
+                PoolCommand::Down(WorkersDownArgs {
                     all_managed,
                     provider,
                     file,
@@ -586,10 +586,10 @@ fn down_cli_requires_all_managed() {
             assert_eq!(provider, "hetzner");
             assert_eq!(file, "farm.lua");
         }
-        _ => panic!("expected Workers Down"),
+        _ => panic!("expected Pool Down"),
     }
 
-    let err = Cli::try_parse_from(["nau", "workers", "down", "--provider", "hetzner"])
+    let err = Cli::try_parse_from(["nau", "pool", "down", "--provider", "hetzner"])
         .map(|_| ())
         .unwrap_err();
     assert!(
@@ -648,13 +648,10 @@ fn burst_auto_refuses_a_non_build_command_by_name() {
         "names the wrapped command: {text}"
     );
 
-    let err = nau::cli::wrapped_build(&[
-        "nau".to_string(),
-        "workers".to_string(),
-        "burst".to_string(),
-    ])
-    .map(|_| ())
-    .unwrap_err();
+    let err =
+        nau::cli::wrapped_build(&["nau".to_string(), "pool".to_string(), "burst".to_string()])
+            .map(|_| ())
+            .unwrap_err();
     assert!(
         format!("{err:#}").contains("is not one"),
         "a nau command that is not a build refuses the same way: {err:#}"
@@ -666,13 +663,84 @@ fn burst_auto_refuses_a_non_build_command_by_name() {
     );
 }
 
+// ── Wrapped-build spellings (ADR-0049 Decision 3b) ──
+
+/// Fold a wrapped argv the way the burst's sizing does: parse through
+/// [`nau::cli::wrapped_build`], then flatten the ADR-0049 domain
+/// subcommands with [`nau::cli::normalize_domain`].
+fn fold_wrapped(argv: &[&str]) -> miette::Result<Command> {
+    let command: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    Ok(nau::cli::normalize_domain(nau::cli::wrapped_build(
+        &command,
+    )?))
+}
+
+#[test]
+fn wrapped_build_accepts_legacy_domain_and_bare_spellings_identically() {
+    // The three accepted forms: the legacy `nau build …`, the domain
+    // `nau build snap …`, and the bare `build snap …` shorthand.
+    let spellings: [&[&str]; 3] = [
+        &["nau", "build", "web", "--file", "site.lua", "--all"],
+        &["nau", "build", "snap", "web", "--file", "site.lua", "--all"],
+        &["build", "snap", "web", "--file", "site.lua", "--all"],
+    ];
+    for argv in spellings {
+        // The fold must land the subcommand's args on the flat build,
+        // never drop them for defaults — identical effective flags size
+        // identically under either spelling.
+        let flat =
+            fold_wrapped(argv).unwrap_or_else(|e| panic!("{argv:?} must parse as a build: {e:#}"));
+        let Command::Build {
+            args,
+            command: None,
+        } = flat
+        else {
+            panic!("{argv:?} must fold to a flat Build");
+        };
+        assert_eq!(args.file, "site.lua", "{argv:?}");
+        assert_eq!(args.output_name.as_deref(), Some("web"), "{argv:?}");
+        assert!(args.all, "{argv:?}");
+    }
+
+    // The bare legacy shorthand parses to the same flat shape.
+    let Command::Build {
+        args,
+        command: None,
+    } = fold_wrapped(&["build", "--offline"]).unwrap()
+    else {
+        panic!("bare build must fold to a flat Build");
+    };
+    assert!(args.offline);
+}
+
+#[test]
+fn wrapped_build_refuses_domain_non_builds_by_name() {
+    // A domain-group command that is not a build.
+    let err = fold_wrapped(&["nau", "image", "build", "sys"])
+        .map(|_| ())
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("is not one"), "names the refusal: {text}");
+    assert!(
+        text.contains("nau image build sys"),
+        "names the wrapped command: {text}"
+    );
+
+    // `build cache` is a build-GROUP command but not a build — the fold
+    // must land it OUTSIDE Build, where the sizing refuses it by name.
+    match fold_wrapped(&["nau", "build", "cache", "info"]).unwrap() {
+        Command::Cache(_) => {}
+        _ => panic!("`build cache` must fold away from the flat Build"),
+    }
+}
+
 #[test]
 fn burst_cli_parses_count_auto_beside_explicit_counts() {
     let burst = |count: &[&str]| {
         Cli::try_parse_from(
             [
                 "nau",
-                "workers",
+                "pool",
                 "burst",
                 "--provider",
                 "hetzner",
@@ -690,25 +758,25 @@ fn burst_cli_parses_count_auto_beside_explicit_counts() {
         .unwrap()
     };
     match burst(&["--count", "auto"]).command {
-        Command::Workers {
-            command: WorkersCommand::Burst(WorkersBurstArgs { count, .. }),
+        Command::Pool {
+            command: PoolCommand::Burst(WorkersBurstArgs { count, .. }),
         } => assert_eq!(count, BurstCount::Auto, "`auto` parses as the sizing mode"),
-        _ => panic!("expected Workers Burst"),
+        _ => panic!("expected Pool Burst"),
     }
     match burst(&["--count", "3"]).command {
-        Command::Workers {
-            command: WorkersCommand::Burst(WorkersBurstArgs { count, .. }),
+        Command::Pool {
+            command: PoolCommand::Burst(WorkersBurstArgs { count, .. }),
         } => assert_eq!(
             count,
             BurstCount::Fixed(3),
             "an explicit count is unchanged"
         ),
-        _ => panic!("expected Workers Burst"),
+        _ => panic!("expected Pool Burst"),
     }
     match burst(&[]).command {
-        Command::Workers {
-            command: WorkersCommand::Burst(WorkersBurstArgs { count, .. }),
+        Command::Pool {
+            command: PoolCommand::Burst(WorkersBurstArgs { count, .. }),
         } => assert_eq!(count, BurstCount::Fixed(1), "the default stays 1"),
-        _ => panic!("expected Workers Burst"),
+        _ => panic!("expected Pool Burst"),
     }
 }

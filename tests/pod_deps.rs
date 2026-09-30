@@ -710,7 +710,7 @@ gated_test!(
         let after_add = requests_for(&log, "/registry/");
 
         // Locked + cached: `deps fetch` skips without touching the network.
-        let (code, _stdout, stderr) = run(project.path(), root.path(), &["deps", "fetch"]);
+        let (code, _stdout, stderr) = run(project.path(), root.path(), &["chart", "deps", "fetch"]);
         assert_eq!(code, Some(0), "stderr: {stderr}");
         assert_eq!(
             requests_for(&log, "/registry/"),
@@ -721,8 +721,11 @@ gated_test!(
         // --latest re-resolves even locked packages; identical upstream means
         // the closure content (and pin) stays put.
         let (hash_a, _) = lock_deps_pin(root.path(), "default", "zndapp");
-        let (code, _stdout, stderr) =
-            run(project.path(), root.path(), &["deps", "fetch", "--latest"]);
+        let (code, _stdout, stderr) = run(
+            project.path(),
+            root.path(),
+            &["chart", "deps", "fetch", "--latest"],
+        );
         assert_eq!(code, Some(0), "stderr: {stderr}");
         assert!(
             requests_for(&log, "/registry/") > after_add,
@@ -1523,7 +1526,7 @@ gated_test!(recipe_prefixed_cargo_lock_resolves_from_recipe_dir, &[], {
     );
     seed_pod_declaration(root.path(), &["zcrlapp"]);
 
-    let (code, stdout, stderr) = run(project.path(), root.path(), &["deps", "fetch"]);
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["chart", "deps", "fetch"]);
     assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
 
     // The closure pin is recorded, and the recipe lockfile's sha256 rides
@@ -1630,7 +1633,7 @@ gated_test!(recipe_prefixed_npm_lock_resolves_from_recipe_dir, &[], {
     );
     seed_pod_declaration(root.path(), &["znrlapp"]);
 
-    let (code, stdout, stderr) = run(project.path(), root.path(), &["deps", "fetch"]);
+    let (code, stdout, stderr) = run(project.path(), root.path(), &["chart", "deps", "fetch"]);
     assert_eq!(code, Some(0), "stderr: {stderr}\nstdout: {stdout}");
 
     let (hash, fetched_at) = lock_deps_pin(root.path(), "default", "znrlapp");
@@ -1672,7 +1675,7 @@ gated_test!(missing_lock_failure_names_both_candidate_paths, &[], {
     );
     seed_pod_declaration(root.path(), &["zmbapp"]);
 
-    let (code, _, stderr) = run(project.path(), root.path(), &["deps", "fetch"]);
+    let (code, _, stderr) = run(project.path(), root.path(), &["chart", "deps", "fetch"]);
     assert_ne!(code, Some(0), "a missing lock must fail the fetch");
     // The error renderer wraps lines mid-path with box-drawing prefixes,
     // so match against output reduced to path-safe characters: the

@@ -54,7 +54,14 @@ fn lock_human_mode_records_local_pin() {
     let (code, stdout, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["lock", "--file", "nau.lua", "--lockfile", "proj.lock"],
+        &[
+            "chart",
+            "lock",
+            "--file",
+            "nau.lua",
+            "--lockfile",
+            "proj.lock",
+        ],
     );
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(
@@ -87,6 +94,7 @@ fn lock_json_mode_reports_pin_state() {
         dir.path(),
         home.path(),
         &[
+            "chart",
             "lock",
             "--file",
             "nau.lua",
@@ -120,6 +128,7 @@ fn lock_json_mode_reports_pin_state() {
 fn lock_is_idempotent_rerun_reports_zero_updated() {
     let (dir, home) = setup_local_input_project();
     let args = [
+        "chart",
         "lock",
         "--file",
         "nau.lua",
@@ -194,7 +203,14 @@ fn update_reports_local_pin_refresh() {
     let (code, _, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["lock", "--file", "nau.lua", "--lockfile", "proj.lock"],
+        &[
+            "chart",
+            "lock",
+            "--file",
+            "nau.lua",
+            "--lockfile",
+            "proj.lock",
+        ],
     );
     assert_eq!(code, Some(0), "pre-lock: {stderr}");
 
@@ -245,7 +261,14 @@ return {}
     let (code, _, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["lock", "--file", "nau.lua", "--lockfile", "proj.lock"],
+        &[
+            "chart",
+            "lock",
+            "--file",
+            "nau.lua",
+            "--lockfile",
+            "proj.lock",
+        ],
     );
     assert_ne!(code, Some(0), "submodules on a path input must fail");
     assert!(
@@ -272,7 +295,14 @@ return {}
     let (code, _, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["lock", "--file", "nau.lua", "--lockfile", "proj.lock"],
+        &[
+            "chart",
+            "lock",
+            "--file",
+            "nau.lua",
+            "--lockfile",
+            "proj.lock",
+        ],
     );
     assert_ne!(code, Some(0), "malformed declaration must fail");
     // miette wraps long messages at width-dependent points and paints `│`
@@ -306,7 +336,14 @@ return {}
     let (code, _, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["lock", "--file", "nau.lua", "--lockfile", "proj.lock"],
+        &[
+            "chart",
+            "lock",
+            "--file",
+            "nau.lua",
+            "--lockfile",
+            "proj.lock",
+        ],
     );
     assert_ne!(
         code,

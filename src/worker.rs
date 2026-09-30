@@ -31,7 +31,13 @@ use serde::{Deserialize, Serialize};
 /// Wire protocol version carried by the cap document, every job manifest,
 /// and every result document (ADR-0040 Decision 7). A mismatch is a named
 /// refusal at load time, never a runtime surprise.
-pub const WORKER_PROTOCOL_VERSION: u32 = 1;
+///
+/// History: 1 → 2 at ADR-0049 Decision 4 — the coordinator invokes
+/// workers BY NAME over SSH, so the `__worker-cap`/`__worker-job` →
+/// `pool probe`/`pool job` rename (#321) is wire-visible; the bump rolls
+/// coordinator + workers in lockstep (the burst provision→teardown
+/// lifecycle makes fleet rollover cheap).
+pub const WORKER_PROTOCOL_VERSION: u32 = 2;
 
 /// One payload blob the sandbox must see (ADR-0040 Decision 6 closure
 /// entry). Content-addressed: the blob file is named by its sha256 in the

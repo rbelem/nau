@@ -174,6 +174,7 @@ fn run_build(project: &Path, output: &Path, stage: &Path) -> (Option<i32>, Strin
     std::fs::create_dir_all(stage).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nau"));
     cmd.arg("build")
+        .arg("snap")
         .arg("--file")
         .arg("app.lua")
         .arg("--output")

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::cli::{BuildArgs, Command};
+use crate::cli::{normalize_domain, BuildArgs, Command};
 use crate::lock::LockFile;
 
 use crate::build_orch::{
@@ -19,9 +19,17 @@ use crate::build_orch::{
 /// fully-cached names — plus the jobs-per-worker the sizing divides by.
 /// Same resolution path as cmd_build by construction: the wrapped argv
 /// parses through the real Cli definition and the config resolves in
-/// [`resolve_build_outputs`]. Quiet: sizing prints only its own decision
-/// line, not the build's progress.
+/// [`resolve_build_outputs`]. Both the legacy spelling (`nau build …`,
+/// bare `build …`) and the ADR-0049 domain spelling (`nau build snap …`,
+/// bare `build snap …`) are accepted — the fold in
+/// [`normalize_domain`] flattens `build snap` onto the same variant, so
+/// identical effective flags size identically under either spelling.
+/// Quiet: sizing prints only its own decision line, not the build's
+/// progress.
 pub(crate) fn wrapped_build_pending_jobs(command: &[String]) -> miette::Result<(usize, u32)> {
+    // normalize_domain folds the `build snap` subcommand's args onto the
+    // flat Build variant; `build cache …` folds to a non-build and is
+    // refused below with the other non-builds.
     let Command::Build {
         args:
             BuildArgs {
@@ -37,12 +45,15 @@ pub(crate) fn wrapped_build_pending_jobs(command: &[String]) -> miette::Result<(
                 lockfile: lockfile_path,
                 ..
             },
-        ..
-    } = crate::cli::wrapped_build(command)?
+        command: None,
+    } = normalize_domain(crate::cli::wrapped_build(command)?)
     else {
-        // wrapped_build cannot return a non-build; fail-closed anyway.
+        // Neither wrapped_build nor the fold produces a flat Build for a
+        // non-build (nor for `build cache …`); fail-closed anyway.
         return Err(miette::miette!(
-            "workers burst: --count auto sizes a wrapped 'nau build'"
+            "workers burst: --count auto sizes a wrapped 'nau build' — '{}' is not one, \
+             and there is no pending set to size from",
+            command.join(" ")
         ));
     };
 

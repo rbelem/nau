@@ -77,7 +77,7 @@ fn eval_with_a_signing_key_attaches_provenance() {
     let (code, stdout, stderr) = run_in(
         dir.path(),
         home.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock"],
+        &["chart", "eval", "--offline", "--lockfile", "proj.lock"],
     );
     assert_eq!(code, Some(0), "eval: {stderr}");
     assert!(
@@ -140,7 +140,15 @@ fn signed_evals_stay_byte_identical_and_unsigned_evals_keep_the_reservation() {
         let (code, _, stderr) = run_in(
             dir.path(),
             home.path(),
-            &["eval", "--offline", "--lockfile", "proj.lock", "-o", name],
+            &[
+                "chart",
+                "eval",
+                "--offline",
+                "--lockfile",
+                "proj.lock",
+                "-o",
+                name,
+            ],
         );
         assert_eq!(code, Some(0), "{name}: {stderr}");
     }
@@ -157,7 +165,7 @@ fn signed_evals_stay_byte_identical_and_unsigned_evals_keep_the_reservation() {
     let (code, stdout, stderr) = run_in(
         dir2.path(),
         home2.path(),
-        &["eval", "--offline", "--lockfile", "proj.lock"],
+        &["chart", "eval", "--offline", "--lockfile", "proj.lock"],
     );
     assert_eq!(code, Some(0), "{stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
