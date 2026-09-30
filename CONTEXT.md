@@ -121,6 +121,12 @@ _Avoid_: interfaces, permissions, capabilities
 **Pod isolation**: The execution boundary every process of a pod runs inside — `run` forms, services, shells, and unconfined apps alike. Three levels: `host` (processes run directly on the host; the default), `sandbox` (one bubblewrap boundary around the whole pod, fail-closed, with pod-scoped grants), and `machine` (a microVM boundary with its own guest kernel, driven through smolvm, fail-closed without KVM). Distinct from per-app confinement and from the build sandbox. (ADR-0038)
 _Avoid_: pod sandbox, full sandbox, VM pod, sandboxed environment
 
+**Pool**: The CLI domain (`nau pool`) over the Worker fleet — provision, destroy, burst, issue/publish/pickup certificates, probe, job (ADR-0040's own term: "an SSH-driven build pool with no daemons").
+_Avoid_: farm (that is the pod bin farm, `src/farm.rs`), cluster, fleet, workers (the legacy command spelling)
+
+**Farm**: A pod generation's bin directory (`generations/<n>/farm`) — symlinks to the pod's package binaries, prepended to PATH by `pod shellenv` (ADR-0015, ADR-0028). The word belongs to pods; the Worker fleet's domain is the Pool.
+_Avoid_: build farm, worker pool
+
 **Worker**: A machine nau drives over SSH to execute build jobs offloaded from a local build (ADR-0040). Operator-controlled, stateless beyond its own cache, reachable only coordinator-initiated. Absent a `workers = { … }` declaration, no Worker exists and nothing remote happens. Each entry's `host_key` pin is the host CA's `SHA256:` fingerprint (`nau ca list`); the coordinator enforces it as a `@cert-authority` known_hosts entry bound to the worker's certificate principal (ADR-0045 amendment, #295).
 _Avoid_: node, peer, farm, builder, agent, remote
 
