@@ -719,7 +719,7 @@ fn nau_run_overlays_resolved_secrets_declared_replaces_inherited() {
         },
     )]);
     let store = nau::runtime::RuntimeStore::new(pod.clone());
-    nau::farm::write_generation_secrets(&store, 1, &refs).unwrap();
+    nau::farm::write_generation_secrets(&store.store_view(), 1, &refs).unwrap();
 
     let expected = "-----BEGIN RUN KEY-----\nMIIrun\n-----END RUN KEY-----";
     let run_with = |ambient: Option<&str>| {

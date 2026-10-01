@@ -29,7 +29,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::runtime::{Generation, RuntimeStore};
+use nau_core::generation_view::StoreView;
+use nau_core::pkg_manifest::Generation;
 
 /// The user-level fonts directory (redirectable for tests), inside the
 /// data home the desktop launchers use.
@@ -48,7 +49,7 @@ pub fn surface_dir(pod: &str) -> String {
 /// Emit a generation's font set to the user level. The surface is
 /// redirected through [`crate::desktop::user_data_home`]; use
 /// [`emit_in`] for an explicit data home (tests).
-pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<()> {
+pub fn emit(store: &StoreView, gen: &Generation) -> miette::Result<()> {
     let data_home = crate::desktop::user_data_home(store.root());
     let pod = crate::desktop::pod_name(store)?;
     emit_in(store, gen, &data_home, &pod)
@@ -60,7 +61,7 @@ pub fn emit(store: &RuntimeStore, gen: &Generation) -> miette::Result<()> {
 /// call (fully idempotent): the subtree is owned by this pod alone, so
 /// a full wipe cannot touch other pods' fonts or the user's own.
 pub fn emit_in(
-    store: &RuntimeStore,
+    store: &StoreView,
     gen: &Generation,
     data_home: &std::path::Path,
     pod: &str,
@@ -104,7 +105,7 @@ pub fn emit_in(
 /// Link one package's font files into its surface subtree: recreate the
 /// package directory, then symlink every recorded file into the store.
 fn link_package_fonts(
-    store: &RuntimeStore,
+    store: &StoreView,
     surface: &std::path::Path,
     pkg_name: &str,
     files: &[(&str, &str)],
@@ -144,14 +145,23 @@ fn font_rel(rel: &str) -> miette::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::farm::ClaimLayer;
+    use nau_core::blob_store::BlobStore;
+    use nau_core::pkg_manifest::{ClaimLayer, InstalledPackage};
 
-    fn store_fixture(dir: &std::path::Path) -> RuntimeStore {
+    /// The crate-side fixture for a pod state root: the view over it
+    /// with the paired `<state-root>/store` blob store.
+    fn store_view(root: impl Into<std::path::PathBuf>) -> StoreView {
+        let root = root.into();
+        let blobs = BlobStore::new(root.join("store"));
+        StoreView::new(root, blobs)
+    }
+
+    fn store_fixture(dir: &std::path::Path) -> StoreView {
         // The documented pod layout `<data-home>/nau/pods/<pod>`:
         // the emitter derives its user-level surface from this shape,
         // so a nested fixture root keeps every write inside the test's
         // tempdir without touching the environment.
-        RuntimeStore::new(dir.join("nau/pods/pilot"))
+        store_view(dir.join("nau/pods/pilot"))
     }
 
     fn gen_with_fonts(n: u64, packages: &[(&str, &[(&str, &str)])]) -> Generation {
@@ -159,7 +169,7 @@ mod tests {
         for (name, fonts) in packages {
             pkgs.insert(
                 name.to_string(),
-                crate::runtime::InstalledPackage {
+                InstalledPackage {
                     name: name.to_string(),
                     version: "1.0".into(),
                     revision: 1,
@@ -193,7 +203,7 @@ mod tests {
         }
     }
 
-    fn seed_blob(store: &RuntimeStore, hash: &str, content: &[u8]) -> std::path::PathBuf {
+    fn seed_blob(store: &StoreView, hash: &str, content: &[u8]) -> std::path::PathBuf {
         let blob = store.blob_path(hash);
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
         std::fs::write(&blob, content).unwrap();
@@ -262,8 +272,8 @@ mod tests {
     #[test]
     fn two_pods_surfaces_coexist() {
         let tmp = tempfile::tempdir().unwrap();
-        let pilot = RuntimeStore::new(tmp.path().join("nau/pods/pilot"));
-        let work = RuntimeStore::new(tmp.path().join("nau/pods/work"));
+        let pilot = store_view(tmp.path().join("nau/pods/pilot"));
+        let work = store_view(tmp.path().join("nau/pods/work"));
         for store in [&pilot, &work] {
             seed_blob(store, "aa11", b"font");
         }

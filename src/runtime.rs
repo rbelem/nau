@@ -510,6 +510,14 @@ impl RuntimeStore {
         nau_core::blob_store::BlobStore::new(self.store_dir())
     }
 
+    /// The narrow read-only view over this store's state root (issue
+    /// #326 PR 6): generations + the paired blob store — what the pod
+    /// emit family and the peer lanes consume. Shares this store's
+    /// on-disk truth (the view delegates to the same core fns).
+    pub fn store_view(&self) -> nau_core::generation_view::StoreView {
+        nau_core::generation_view::StoreView::new(self.root.clone(), self.blob_store())
+    }
+
     /// Path of the content blob with hash `sha256` (`store/<aa>/<sha>`).
     /// Public for the pod farm emitter, whose farm entries are direct
     /// symlinks into the store. Delegates to [`Self::blob_store`] — no

@@ -35,6 +35,11 @@
 #              serve/export; no dev-edge: the serve tests dropped the
 #              ship sha256 for the core cache key, and export tests
 #              build core literals)
+#   nau-pod    {nau-core, nau-infra}   — the pod domain (farm/desktop/
+#              fonts emit + confine + secrets resolve + the pod grammar's
+#              pure halves; no dev-edge: the eval-coupled verb/test
+#              suites stay root, the crate's own tests use core+infra
+#              only)
 #   nau (root) exempt                  — the root composes everything
 set -euo pipefail
 
@@ -56,6 +61,7 @@ allowed_normal() {
         nau-image)  echo "nau-core nau-infra" ;;
         nau-ship)   echo "nau-core nau-infra" ;;
         nau-peer)   echo "nau-core nau-infra" ;;
+        nau-pod)    echo "nau-core nau-infra" ;;
         *)          return 1 ;;
     esac
 }

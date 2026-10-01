@@ -760,3 +760,45 @@ pub fn resolve_archs(meta: &SnapMeta, cli_archs: &[String]) -> Vec<String> {
             .unwrap_or_else(|| vec!["all".to_string()])
     }
 }
+
+/// Host path roots bound read-only into the build sandbox (see the
+/// build crate's `bind_system_ro_paths`). This is the sandbox's entire
+/// view of the host filesystem apart from the resolver/trust files of
+/// the build's `SANDBOX_ETC_RO_PATHS`: a build tool resolves inside the
+/// sandbox only if its PATH entry lives under one of these roots.
+/// Entries elsewhere (e.g. a project's `.devbox` profile dir) are
+/// invisible to sandboxed builds, and a `nix store` garbage collection
+/// can delete `/nix/store` paths a stale shell still exports — both turn
+/// a working host setup into an obscure mid-build failure. Doctor and
+/// the sandboxed build runner resolve tools against this same list so
+/// that failure mode becomes a named pre-flight diagnostic instead.
+///
+/// Moved DOWN into `nau_core::snap_types` (issue #326 PR 6: the
+/// confinement backend consumes the same roots); the build crate
+/// re-exports it.
+pub const SANDBOX_RO_ROOTS: [&str; 6] = [
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/nix",
+    "/bin",
+    "/run/current-system",
+];
+
+/// Split a `<base><digits>` name into its base: `Some(base)` when the
+/// name ends in one or more ASCII digits and stripping them leaves a
+/// non-empty base, `None` otherwise (`node22` → `node`, `foo` → `None`,
+/// `22` → `None`, `foo2bar` → `None`). Shared with the farm collision
+/// vocabulary, which points at `name@constraint` for version-line pairs.
+///
+/// Moved DOWN into `nau_core::snap_types` (issue #326 PR 6: the chart
+/// lint and the pod farm's collision classifier both consume it);
+/// `nau-chart` re-exports it.
+pub fn split_version_suffix(name: &str) -> Option<&str> {
+    let base = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    if base.is_empty() || base.len() == name.len() {
+        None
+    } else {
+        Some(base)
+    }
+}

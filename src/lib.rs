@@ -11,13 +11,9 @@ pub mod build_sched;
 pub mod ca;
 pub mod cli;
 pub mod commands;
-pub mod confine;
 pub mod coordinator;
-pub mod desktop;
 pub mod doctor;
-pub mod farm;
 pub mod farm_dispatch;
-pub mod fonts;
 pub mod leak_scan;
 pub mod pkg_manifest;
 pub mod plugins;
@@ -51,6 +47,12 @@ pub use nau_ship::pull_ref;
 // the env-reading `pod_root`/`pod_store` stay root); the plain
 // re-export keeps every `crate::<module>::` path resolving.
 pub use nau_peer::{discovery, export, serve};
+// The pod domain (issue #326 PR 6): confine/desktop/fonts/farm moved
+// whole (emitters take the core `StoreView` seam); `secrets` stays a
+// root shim FILE (it keeps the `pod secrets` verb layer + its suite —
+// see src/secrets.rs); the pod grammar's pure halves re-export from
+// src/pod.rs, which remains the orchestrator file.
+pub use nau_pod::{confine, desktop, farm, fonts};
 pub mod oci;
 pub mod snap;
 pub mod ssh_exec;

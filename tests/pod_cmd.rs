@@ -931,7 +931,7 @@ fn seed_generation_secrets(
     refs: &std::collections::BTreeMap<String, nau::pod::SecretSource>,
 ) {
     let store = nau::runtime::RuntimeStore::new(root.join(pod));
-    nau::farm::write_generation_secrets(&store, 1, refs).unwrap();
+    nau::farm::write_generation_secrets(&store.store_view(), 1, refs).unwrap();
 }
 
 fn exec_secret(command: &str) -> nau::pod::SecretSource {
@@ -974,7 +974,7 @@ fn shellenv_exports_resolved_secrets_after_env_lines_and_evals_safe() {
     // ambient accident.
     let store = nau::runtime::RuntimeStore::new(root.path().join("default"));
     nau::farm::write_generation_env(
-        &store,
+        &store.store_view(),
         1,
         &[("SH_EDITOR".to_string(), "vi".to_string())]
             .into_iter()

@@ -1741,6 +1741,7 @@ dependencies = [
  "nau-image",
  "nau-infra",
  "nau-peer",
+ "nau-pod",
  "nau-ship",
  "pgp",
  "rand",
@@ -1752,7 +1753,6 @@ dependencies = [
  "sha3",
  "tar",
  "tempfile",
- "ureq",
  "xz2",
  "zip",
 ]
@@ -1874,6 +1874,22 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "nau-pod"
+version = "0.1.0"
+dependencies = [
+ "dbus-secret-service",
+ "libc",
+ "miette",
+ "nau-core",
+ "nau-infra",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "ureq",
 ]
 
 [[package]]
