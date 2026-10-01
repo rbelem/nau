@@ -5,7 +5,18 @@ edition = "2021"
 description = "Build Snap packages from Lua declarations"
 license = "GPL-3.0-only"
 
+# The ADR-0051 workspace: the root package stays the only shipped binary;
+# the lib's domain seams peel off into member crates one per PR. resolver
+# "2" is implied by the root package's edition 2021, pinned here explicitly.
+[workspace]
+members = ["crates/nau-core"]
+resolver = "2"
+
 [dependencies]
+# The core crate (ADR-0051): the shared vocabulary — snap value types,
+# manifest IR, plugin option values. Domains may depend on it; it never
+# depends on a domain or on this root package.
+nau-core = { path = "crates/nau-core" }
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["luau"] }
 miette = { version = "7", features = ["fancy"] }

@@ -1,0 +1,17 @@
+[package]
+name = "nau-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared vocabulary of nau: snap value types, manifest IR, plugin option values (ADR-0051)"
+license = "GPL-3.0-only"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# snap_types::SnapMeta::to_yaml renders the meta/snap.yaml content.
+serde_yaml = "0.9"
+# Error vocabulary: manifest_ir's to_json/write_atomic and snap_types'
+# to_yaml return miette::Result. Type-only use: no "fancy" feature here
+# (that is the root CLI's presentation layer) — feature unification with
+# the root keeps one miette in the graph.
+miette = "7"

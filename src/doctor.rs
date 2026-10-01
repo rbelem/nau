@@ -1259,16 +1259,25 @@ fn version_string(v: (u32, u32, u32)) -> String {
 fn mksquashfs_version(path: &Path) -> Option<(u32, u32, u32)> {
     // A transient fork/exec failure under heavy parallel load (test hosts,
     // CI runners) must not read as "version unparsable" — the probe retries
-    // once before degrading to the advisory unknown-version check.
-    let mut out = std::process::Command::new(path).arg("-version").output();
-    if out.is_err() {
-        out = std::process::Command::new(path).arg("-version").output();
+    // before degrading to the advisory unknown-version check. The retry
+    // covers both a failed spawn AND a child that spawned but died on a
+    // transient resource error (non-zero exit: under fork pressure the
+    // interpreter's own exec can fail after the parent's spawn succeeded).
+    // Only the failure path pays the backoff; a healthy probe returns on
+    // the first attempt.
+    for attempt in 0..3u64 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
+        }
+        if let Ok(out) = std::process::Command::new(path).arg("-version").output() {
+            if out.status.success() {
+                if let Some(v) = parse_squashfs_version(&String::from_utf8_lossy(&out.stdout)) {
+                    return Some(v);
+                }
+            }
+        }
     }
-    let out = out.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_squashfs_version(&String::from_utf8_lossy(&out.stdout))
+    None
 }
 
 /// Parse the first `<major>.<minor>[.<patch>]` token of the version

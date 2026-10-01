@@ -41,35 +41,12 @@ pub const REGISTRY_VERSION: &str = "2";
 const CARGO_BUILD_DEP: &str = "toolchain-gcc-gnu-x86_64";
 
 /// One option value from a definition's plugin options table.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PluginValue {
-    Str(String),
-    Bool(bool),
-    Arr(Vec<String>),
-    Map(BTreeMap<String, String>),
-}
-
-impl PluginValue {
-    /// Canonical JSON for cache keys: maps serialize with sorted keys
-    /// (BTreeMap), arrays keep order, booleans map to JSON booleans.
-    pub fn to_json(&self) -> serde_json::Value {
-        match self {
-            PluginValue::Str(s) => serde_json::Value::String(s.clone()),
-            PluginValue::Bool(b) => serde_json::Value::Bool(*b),
-            PluginValue::Arr(items) => serde_json::Value::Array(
-                items
-                    .iter()
-                    .map(|s| serde_json::Value::String(s.clone()))
-                    .collect(),
-            ),
-            PluginValue::Map(map) => serde_json::Value::Object(
-                map.iter()
-                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                    .collect(),
-            ),
-        }
-    }
-}
+///
+/// The type lives in `nau-core` ([`nau_core::snap_types::PluginValue`] —
+/// `SnapPart` carries it, so ADR-0051 moves the vocabulary down into the
+/// core crate); re-exported here so every `crate::plugins::PluginValue`
+/// path keeps resolving unchanged.
+pub use nau_core::snap_types::PluginValue;
 
 /// The declarative build plan a plugin expands to (ADR-0014 Decision 4).
 ///

@@ -1739,6 +1739,7 @@ dependencies = [
  "mdns-sd",
  "miette",
  "mlua",
+ "nau-core",
  "owo-colors",
  "pgp",
  "rand",
@@ -1754,6 +1755,16 @@ dependencies = [
  "ureq",
  "xz2",
  "zip",
+]
+
+[[package]]
+name = "nau-core"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
