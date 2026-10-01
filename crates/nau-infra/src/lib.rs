@@ -8,6 +8,7 @@
 //! appear in this crate's dependency graph (ADR-0051 dependency
 //! direction; asserted by the gate's dep-direction pass).
 
+pub mod archive;
 pub mod output;
 pub mod tools;
 

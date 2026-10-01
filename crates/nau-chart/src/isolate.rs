@@ -881,7 +881,7 @@ fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
             let entry = index.find_by_name_or_alias(&name).ok_or_else(|| {
                 mlua::Error::external(miette::miette!("snap '{name}' not found in package index"))
             })?;
-            crate::index::PackageIndex::entry_to_lua_table(entry, &arch, lua)
+            crate::index::index_entry_to_lua_table(entry, &arch, lua)
         })
         .map_err(|e| miette::miette!("failed to create index(): {e}"))?;
     lua.globals()

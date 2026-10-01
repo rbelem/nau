@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use nau_core::snap_types::SnapRef;
+use crate::snap_types::SnapRef;
 
 /// A lockfile captures resolved hashes of all build inputs for reproducibility.
 ///
@@ -326,10 +326,10 @@ impl LockFile {
 /// Lives beside the lockfile vocabulary it reads (moved from the root
 /// `cache.rs`, issue #326); the root `cache` module re-exports it so the
 /// build path keeps resolving.
-pub fn pinned_member(name: &str, lock: &LockFile) -> Option<nau_core::cache_key::RequiresMember> {
+pub fn pinned_member(name: &str, lock: &LockFile) -> Option<crate::cache_key::RequiresMember> {
     lock.snaps
         .get(name)
-        .map(|snap| nau_core::cache_key::RequiresMember {
+        .map(|snap| crate::cache_key::RequiresMember {
             name: name.to_string(),
             pin: Some(snap.revision.to_string()),
             hash: Some(snap.sha3_384.clone()),

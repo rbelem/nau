@@ -23,11 +23,11 @@ pub use crate::snap_types::{
 // nau-chart::snap_lua with the Lua-parse machinery that uses them
 // (issue #326). Re-exported so the root build path (pod.rs) keeps
 // resolving.
-pub use nau_chart::snap_lua::{
-    effective_compression, validate_compression_choice, validate_compression_level,
-};
 pub use nau_chart::snap_lua::{validate_exec_text, validate_service_interpolation};
 pub use nau_chart::snap_lua::{validate_service_name, SOURCE_DIR_NAME};
+pub use nau_core::snap::{
+    effective_compression, validate_compression_choice, validate_compression_level,
+};
 
 // The Lua-side constructors for the shared vocabulary moved to nau-chart
 // (issue #326 — eval-side machinery; the orphan rule pins the trait
@@ -35,8 +35,10 @@ pub use nau_chart::snap_lua::{validate_service_name, SOURCE_DIR_NAME};
 // so every `crate::snap::{FromLuaTable,…}` path — including this
 // module's remaining build machinery and its tests — keeps resolving.
 pub use nau_chart::snap_lua::{
-    confinement_from_lua, deps_lock_spec_from_lua, parse_submodule_spec, FromLuaTable,
-    FromLuaTableNamed, FromLuaValue, FromPinTable,
+    confinement_from_lua, deps_lock_spec_from_lua, image_declaration_from_lua,
+    parse_submodule_spec, service_decl_from_lua_table, snap_app_from_lua_table,
+    snap_meta_from_lua_table, snap_ref_from_pin, FromLuaTable, FromLuaTableNamed, FromLuaValue,
+    FromPinTable,
 };
 
 /// Build-side identity machinery that stays out of `nau-core`: the
@@ -4403,7 +4405,7 @@ fn apply_extra_env(cmd: &mut std::process::Command, extra_env: &[(String, String
 // Moved to nau-chart::pkg_source with the tarball vocabulary it serves
 // (issue #326; dep_fetch shares the seam). Re-exported so the root
 // fetch/parse path and this module tests keep resolving.
-pub use nau_chart::pkg_source::extract_tarball;
+pub use nau_infra::archive::extract_tarball;
 
 fn find_source_root(dir: &Path) -> Option<std::path::PathBuf> {
     let mut entries: Vec<std::path::PathBuf> = Vec::new();

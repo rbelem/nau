@@ -6,6 +6,13 @@ description = "nau's non-domain leaf: terminal presentation and external-tool pr
 license = "GPL-3.0-only"
 
 [dependencies]
+# archive.rs: in-process source-archive extraction (issue #170 seam).
+flate2 = "1"
+tar = "0.4"
+xz2 = "0.1"
+# archive.rs: Result/error vocabulary for the extraction seam. No "fancy"
+# here either — the root keeps one miette in the graph (see nau-core).
+miette = "7"
 # output.rs: progress bars and colored status lines.
 indicatif = "0.18"
 owo-colors = "4"

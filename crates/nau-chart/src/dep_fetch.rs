@@ -282,9 +282,9 @@ fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<PathBuf> {
     let src_dir = work.join("src");
     std::fs::create_dir_all(&src_dir)
         .map_err(|e| miette::miette!("creating {}: {e}", src_dir.display()))?;
-    // Issue #170: extraction is in-process (crate::pkg_source::extract_tarball) —
+    // Issue #170: extraction is in-process (nau_infra::archive::extract_tarball) —
     // never at the mercy of the caller PATH's `tar` binary.
-    crate::pkg_source::extract_tarball(&tarball, &src_dir)
+    nau_infra::archive::extract_tarball(&tarball, &src_dir)
         .map_err(|e| e.wrap_err(format!("failed to extract {filename}")))?;
     nau_infra::output::finish_ok(&spinner, &format!("fetched source of {}", meta.name));
     Ok(find_source_root(&src_dir))
