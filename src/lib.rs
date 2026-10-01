@@ -14,9 +14,7 @@ pub mod commands;
 pub mod confine;
 pub mod coordinator;
 pub mod desktop;
-pub mod discovery;
 pub mod doctor;
-pub mod export;
 pub mod farm;
 pub mod farm_dispatch;
 pub mod fonts;
@@ -28,7 +26,6 @@ pub mod provision;
 pub mod pull_peer;
 pub mod runtime;
 pub mod secrets;
-pub mod serve;
 pub mod services;
 pub mod sign;
 pub mod slot_recovery;
@@ -49,6 +46,11 @@ pub use nau_image::{boot_test, emit, esp, image, uc};
 // revision resolution rides the runtime's lockfile records); pull_ref
 // and the peer-lane glue re-export from nau-ship.
 pub use nau_ship::pull_ref;
+// The peer domain (issue #326 PR 5): discovery/serve/export moved
+// whole (the serve/export signatures now take the resolved pod roots —
+// the env-reading `pod_root`/`pod_store` stay root); the plain
+// re-export keeps every `crate::<module>::` path resolving.
+pub use nau_peer::{discovery, export, serve};
 pub mod oci;
 pub mod snap;
 pub mod ssh_exec;

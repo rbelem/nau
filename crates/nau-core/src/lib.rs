@@ -12,6 +12,7 @@
 pub mod blob_store;
 pub mod cache_key;
 pub mod channels;
+pub mod generation_view;
 pub mod index;
 pub mod lock;
 pub mod manifest_ir;

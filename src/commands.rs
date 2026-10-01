@@ -2316,7 +2316,16 @@ pub fn cmd_serve(
     let address = address
         .map(str::to_string)
         .or_else(|| node.as_ref().map(|n| n.serve_address().to_string()));
-    crate::serve::run(address.as_deref(), port, announce, node_name, pod)
+    // The env-reading pod root stays root (issue #326 PR 5): resolved
+    // here, handed to the peer lane.
+    crate::serve::run(
+        &crate::pod::pod_root(None),
+        address.as_deref(),
+        port,
+        announce,
+        node_name,
+        pod,
+    )
 }
 
 /// The `node {}` declaration from `./nau.lua`, if the file exists
@@ -2367,8 +2376,11 @@ pub fn cmd_export(
     mission: Option<&str>,
     file: Option<&str>,
 ) -> miette::Result<()> {
+    // The env-reading pod root stays root (issue #326 PR 5): resolved
+    // once, handed to the peer lane.
+    let pod_root = crate::pod::pod_root(None);
     match mission {
-        None => crate::export::run(out, pod)?,
+        None => crate::export::run(out, &pod_root, pod)?,
         Some(name) => {
             // The same eval path `nau image` builds from: missions
             // ARE image declarations (this is the mission schema).
@@ -2383,7 +2395,7 @@ pub fn cmd_export(
                 )
             })?;
             let curation = crate::export::mission_curation(decl);
-            crate::export::run_mission(out, pod, &curation)?;
+            crate::export::run_mission(out, &pod_root, pod, &curation)?;
         }
     }
     crate::output::ok(format!("exported static tree to {out}"));

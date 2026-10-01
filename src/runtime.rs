@@ -119,106 +119,14 @@ pub use nau_core::paths::DEVICE_ANCHOR;
 
 // ── Generation model ──
 
-/// One installed package as pinned in a generation manifest.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InstalledPackage {
-    pub name: String,
-    pub version: String,
-    pub revision: u32,
-    /// sha3-384 of the payload — the snap-level content address, carried
-    /// through from the store resolve.
-    pub sha3_384: String,
-    /// sha256 content hashes of every file the package contributes to
-    /// the store — the GC mark set for this package.
-    pub files: Vec<String>,
-    /// Daemon unit names this package contributed (empty for plain
-    /// apps) — the unit reconciliation set difference works over these.
-    pub units: Vec<String>,
-    /// The composition precedence layer this package was installed at
-    /// (issue #8): what a loaded pod provided (`Loaded`), the pod's own
-    /// declaration (`Own`), or the pod's overlay (`Overlay`). The farm
-    /// and launcher emitters iterate in this order so the higher layer
-    /// wins a shared binary or desktop-entry name. Manifests from
-    /// before the field default to `Own`.
-    #[serde(default)]
-    pub layer: crate::farm::ClaimLayer,
-    /// App name → sha256 of the app's command binary in the store.
-    /// The farm emitter's source of truth (pod farm, `farm.rs`): each
-    /// entry becomes a direct symlink from the farm into the content
-    /// store. Empty for packages without apps and store-recorded snaps.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub apps: BTreeMap<String, String>,
-    /// The package's declared runtime requires (ADR-0018), recorded so
-    /// the farm emitter can tell libs-carrying packages (requires
-    /// beyond the glibc family → their apps get the emit-time LD
-    /// wrapper, issue #110/ADR-0034) from self-contained ones without
-    /// re-reading the pool. Manifests from before the field default to
-    /// empty (unwrapped — the conservative old behavior).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requires: Vec<String>,
-    /// App name → sha256 of the app's confined-launcher wrapper blob in
-    /// the store (ticket #11). Only present for confined apps. The farm
-    /// emitter prefers this over `apps` for a confined app so the farm's
-    /// symlink points at a wrapper that invokes `nau run`, while
-    /// `apps` still records the real command binary `nau run` execs.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub launchers: BTreeMap<String, String>,
-    /// Multi-file app payloads (issue #37): app name → the app's
-    /// in-payload binary path plus the sibling content recorded beside
-    /// it at install time. The pod farm builds multi-file packages a
-    /// per-package assembly subtree from this (`crate::farm`), so
-    /// relative-to-executable sibling reads (`pi`'s package.json,
-    /// git-credential-manager's libSkiaSharp.so) resolve beside the
-    /// executed binary; single-binary packages record nothing here and
-    /// keep the bare direct farm link.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub assembly: BTreeMap<String, crate::farm::AppAssembly>,
-    /// Runtime confinement grants (ADR-0016, ticket #11): the package-level
-    /// `confined` declaration. `Some` = the package is confined (its
-    /// apps default to confined), `None` = unconfined. Recorded from the
-    /// payload's snap.yaml at install time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confined: Option<crate::snap::Confinement>,
-    /// Per-app confinement overrides (ticket #11): app name → grants, only
-    /// for apps whose `confined` differs from the package default. The
-    /// farm emitter and `nau run` resolve effective confinement as
-    /// `app_confined.get(app).or(confined.as_ref())`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub app_confined: BTreeMap<String, crate::snap::Confinement>,
-    /// Desktop-launcher metadata per GUI app (issue #7), parsed from the
-    /// package's `.desktop` file at install time and recorded in the
-    /// manifest so the launcher emitter rebuilds entries from the
-    /// manifest alone — rollback re-emits without re-unpacking. Empty
-    /// for packages without GUI apps.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub desktops: BTreeMap<String, DesktopLauncher>,
-    /// Payload font files (issue #29 cutover): path under the payload's
-    /// `usr/share/fonts` → sha256, recorded at install time so the font
-    /// emitter rebuilds the user-level surface from the manifest alone —
-    /// rollback re-emits without re-unpacking. Empty for packages that
-    /// ship no fonts (the common case; the hashes also appear in `files`).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub fonts: BTreeMap<String, String>,
-    /// Service declarations (ADR-0032, issue #106), recorded verbatim from
-    /// the payload's snap.yaml at install time: service name → decl. This
-    /// is the declaration record the service emitter re-renders into the
-    /// generation's `units.json` (pod-level overrides are applied at
-    /// record time, not stored here). Empty for packages without services.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub services: BTreeMap<String, crate::snap::ServiceDecl>,
-    /// Service name → sha256 of the service's command binary blob in the
-    /// store — the farm-link source, the `apps` precedent: each entry
-    /// becomes a flat farm link `current/<svc>` exactly like an app
-    /// binary. Empty for packages without services.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub service_bins: BTreeMap<String, String>,
-    /// Canonical build-input digest (sha3-384) of the resolved recipe
-    /// meta recorded at install time (issue #113). `None` for manifests
-    /// recorded before the field existed — those never hold, so the
-    /// first sync after upgrade rebuilds once and records it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub meta_digest: Option<String>,
-}
+// The install-record cluster (`InstalledPackage`, `Generation`) and the
+// composition layer (`ClaimLayer`, via `farm`) moved DOWN into
+// `nau_core::pkg_manifest` (issue #326 PR 5: records follow their
+// consumers — the shareable-manifest minting half lives there, and the
+// peer lanes consume the records). Re-exported so every
+// `crate::runtime::InstalledPackage` / `crate::runtime::Generation`
+// path keeps resolving.
+pub use nau_core::pkg_manifest::{Generation, InstalledPackage};
 
 /// One GUI app's desktop-launcher metadata (issue #7).
 ///
@@ -226,22 +134,6 @@ pub struct InstalledPackage {
 /// `AppAssembly`); re-exported so every
 /// `crate::runtime::DesktopLauncher` path keeps resolving.
 pub use nau_core::pkg_manifest::{DesktopIcon, DesktopLauncher};
-
-/// One bootable selection: base version + package set + content hashes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Generation {
-    pub n: u64,
-    /// Base OS version this generation was created on (from the host
-    /// os-release; the base axis itself updates via sysupdate, never
-    /// through these commands).
-    pub base_version: String,
-    /// The full installed package set, keyed by snap name.
-    pub packages: BTreeMap<String, InstalledPackage>,
-    pub created_epoch: u64,
-    /// The boot entry id this generation corresponds to, when known
-    /// (sysupdate integration); None for package-axis-only generations.
-    pub boot_entry: Option<String>,
-}
 
 // ── Journal ──
 
@@ -596,9 +488,11 @@ impl RuntimeStore {
 
     /// Directory of generation `n` (manifest + per-package extension
     /// trees + the farm). Public for the pod farm emitter (`farm.rs`),
-    /// which hangs per-generation artifacts off it.
+    /// which hangs per-generation artifacts off it. Delegates to the
+    /// core generation view (`nau_core::generation_view`, issue #326
+    /// PR 5 store seam) — no duplicated layout.
     pub fn generation_dir(&self, n: u64) -> PathBuf {
-        self.generations_dir().join(n.to_string())
+        nau_core::generation_view::generation_dir(&self.root, n)
     }
 
     fn staging_dir(&self, n: u64) -> PathBuf {
@@ -733,31 +627,12 @@ impl RuntimeStore {
     }
 
     /// The generation `active` points at, or None when nothing is
-    /// installed yet.
+    /// installed yet. Delegates to the core generation view
+    /// (`nau_core::generation_view`, issue #326 PR 5 store seam) — the
+    /// narrow read-only view the peer lanes consume; the declared
+    /// design intent at [`Self::blob_store`] applies here too.
     pub fn active_generation(&self) -> miette::Result<Option<Generation>> {
-        let link = self.active_link();
-        let target = match std::fs::read_link(&link) {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
-        };
-        let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
-            return Err(miette::miette!(
-                "active symlink {} points at a non-generation target {:?}",
-                link.display(),
-                target
-            ));
-        };
-        let n: u64 = name.parse().map_err(|_| {
-            miette::miette!("active symlink points at non-numeric generation {name:?}")
-        })?;
-        let manifest = self.generation_dir(n).join("manifest.json");
-        let text = std::fs::read_to_string(&manifest)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("reading {}", manifest.display()))?;
-        let gen = serde_json::from_str(&text).map_err(|e| {
-            miette::miette!("corrupt generation manifest {}: {e}", manifest.display())
-        })?;
-        Ok(Some(gen))
+        nau_core::generation_view::active_generation(&self.root)
     }
 
     /// Next generation number: max existing + 1; the first is 1.

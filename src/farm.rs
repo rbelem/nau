@@ -68,8 +68,6 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 use crate::runtime::{Generation, InstalledPackage, RuntimeStore};
 
 /// The farm directory inside a generation: `<root>/generations/<n>/farm`.
@@ -296,6 +294,12 @@ pub fn read_generation_secrets(
 /// every `crate::farm::AppAssembly` path keeps resolving.
 pub use nau_core::pkg_manifest::AppAssembly;
 
+/// The precedence layer moved DOWN into `nau_core::pkg_manifest` with
+/// `InstalledPackage` (issue #326 PR 5: records follow their
+/// consumers); re-exported so every `crate::farm::ClaimLayer` path
+/// keeps resolving.
+pub use nau_core::pkg_manifest::ClaimLayer;
+
 /// The generation's assembly area: `<root>/generations/<n>/apps`.
 pub fn assembly_dir(store: &RuntimeStore, n: u64) -> PathBuf {
     store.generation_dir(n).join(ASSEMBLY_DIR)
@@ -315,25 +319,6 @@ pub fn assembly_bin_path(store: &RuntimeStore, n: u64, pkg: &str, asm: &AppAssem
 }
 
 // ── ID-collision classifier (shared, not desktop-specific) ──
-
-/// The precedence layer a claim on a shared ID (a desktop application ID
-/// or a binary name) comes from. Derived from the pod composition chain
-/// (CONTEXT.md: Pod, Overlay — issue #8): a package provided by a loaded
-/// pod is `Loaded` (lowest); the loading pod's own declaration is `Own`;
-/// a package patched by this pod's inline overlay is `Overlay`, which
-/// strictly dominates. A pod never sits below what it loads: the loading
-/// pod wins cross-layer binary conflicts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ClaimLayer {
-    /// Provided by a loaded pod (issue #8) — the composition floor.
-    Loaded,
-    /// This pod's own declared packages.
-    #[default]
-    Own,
-    /// This pod's inline overlay — the top layer.
-    Overlay,
-}
 
 /// The verdict for two claims on the same ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

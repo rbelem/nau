@@ -1,0 +1,40 @@
+[package]
+name = "nau-peer"
+version = "0.1.0"
+edition = "2021"
+description = "nau's peer domain: mDNS discovery, the read-only serve surface, and the static export lane (ADR-0033, ADR-0051, ADR-0053)"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The spine (ADR-0051 Decision 3): the serve address + pod path
+# vocabulary, the install records, the shareable-manifest schema + its
+# minting half, the keychain, the blob-store seam, the generation view,
+# the manifest IR (mission curation), and the sha256 cache keys.
+nau-core = { path = "../nau-core" }
+# The mechanism leaf (issue #326): terminal presentation (the serve
+# request log, the peers browse output).
+nau-infra = { path = "../nau-infra" }
+# Error vocabulary (unified with the root's fancy feature).
+miette = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# LAN peer discovery (ADR-0033 Decisions 3+4, discovery.rs): the ONE
+# new runtime crate of the peer-sharing feature. mdns-sd is synchronous
+# pure Rust with no async-runtime dependency. Its transitive tree (from
+# `cargo tree -e normal -p mdns-sd` at 0.21.3): fastrand, flume
+# (+ futures-core, futures-sink, spin → lock_api → scopeguard), if-addrs,
+# log, mio, socket-pktinfo, socket2. Genuinely NEW units in the lock
+# (git diff Cargo.lock, `+name` lines): mdns-sd, flume, futures-sink,
+# if-addrs, mio, socket-pktinfo, socket2 — fastrand/futures-core/spin/
+# lock_api/scopeguard/log were already vendored via pgp/tempfile, and
+# libc only bumps. No tokio, no hyper.
+mdns-sd = "0.21"
+
+[dev-dependencies]
+# serve/export tests stage pod stores and signing homes.
+tempfile = "3"
+# export tests hash real blob preimages (content addresses must be true
+# sha256 preimages for the re-hash assertions).
+sha2 = "0.10"
+# export tests mint inbox manifests under a throwaway peer key.
+ed25519-dalek = "2"

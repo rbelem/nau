@@ -1,20 +1,291 @@
 //! The per-package install-record vocabulary + the signed shareable
 //! manifest (issue #326 PR 4 down-moves). Shapes recorded at install
 //! time and shared by the pod runtime, the farm emitter, the pull
-//! lanes, and the shareable package manifest. The root crate's
-//! `pkg_manifest` module keeps the minting half (who signs is the
-//! serve/export/pull lanes' business) and re-exports everything here.
+//! lanes, and the shareable package manifest. Issue #326 PR 5 moved the
+//! MINTING half down too (`mint_manifest`, `load_signing_key`,
+//! `inbox_manifests`, `union_inbox`): once the install records landed
+//! here the mint is core vocabulary — one mint, one truth, wherever the
+//! serving lane lives. The root crate's `pkg_manifest` module is a pure
+//! re-export shim over everything here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use miette::bail;
+use miette::{bail, IntoDiagnostic, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::sign::KeyPair;
 use crate::snap_types::{Confinement, ServiceDecl};
 
 // ── Install-time records ──
+
+/// The precedence layer a claim on a shared ID (a desktop application ID
+/// or a binary name) comes from. Derived from the pod composition chain
+/// (CONTEXT.md: Pod, Overlay — issue #8): a package provided by a loaded
+/// pod is `Loaded` (lowest); the loading pod's own declaration is `Own`;
+/// a package patched by this pod's inline overlay is `Overlay`, which
+/// strictly dominates. A pod never sits below what it loads: the loading
+/// pod wins cross-layer binary conflicts.
+///
+/// Moved DOWN into `nau_core::pkg_manifest` (issue #326 PR 5: records
+/// follow their consumers — `InstalledPackage` carries a layer); the
+/// root `farm` module re-exports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaimLayer {
+    /// Provided by a loaded pod (issue #8) — the composition floor.
+    Loaded,
+    /// This pod's own declared packages.
+    #[default]
+    Own,
+    /// This pod's inline overlay — the top layer.
+    Overlay,
+}
+
+/// One installed package as pinned in a generation manifest.
+///
+/// Moved DOWN into `nau_core::pkg_manifest` (issue #326 PR 5: the
+/// record follows its consumers — the shareable-manifest minting half
+/// lives here, and the peer lanes consume the record). The root
+/// `runtime` module re-exports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstalledPackage {
+    pub name: String,
+    pub version: String,
+    pub revision: u32,
+    /// sha3-384 of the payload — the snap-level content address, carried
+    /// through from the store resolve.
+    pub sha3_384: String,
+    /// sha256 content hashes of every file the package contributes to
+    /// the store — the GC mark set for this package.
+    pub files: Vec<String>,
+    /// Daemon unit names this package contributed (empty for plain
+    /// apps) — the unit reconciliation set difference works over these.
+    pub units: Vec<String>,
+    /// The composition precedence layer this package was installed at
+    /// (issue #8): what a loaded pod provided (`Loaded`), the pod's own
+    /// declaration (`Own`), or the pod's overlay (`Overlay`). The farm
+    /// and launcher emitters iterate in this order so the higher layer
+    /// wins a shared binary or desktop-entry name. Manifests from
+    /// before the field default to `Own`.
+    #[serde(default)]
+    pub layer: ClaimLayer,
+    /// App name → sha256 of the app's command binary in the store.
+    /// The farm emitter's source of truth (pod farm, `farm.rs`): each
+    /// entry becomes a direct symlink from the farm into the content
+    /// store. Empty for packages without apps and store-recorded snaps.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub apps: BTreeMap<String, String>,
+    /// The package's declared runtime requires (ADR-0018), recorded so
+    /// the farm emitter can tell libs-carrying packages (requires
+    /// beyond the glibc family → their apps get the emit-time LD
+    /// wrapper, issue #110/ADR-0034) from self-contained ones without
+    /// re-reading the pool. Manifests from before the field default to
+    /// empty (unwrapped — the conservative old behavior).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+    /// App name → sha256 of the app's confined-launcher wrapper blob in
+    /// the store (ticket #11). Only present for confined apps. The farm
+    /// emitter prefers this over `apps` for a confined app so the farm's
+    /// symlink points at a wrapper that invokes `nau run`, while
+    /// `apps` still records the real command binary `nau run` execs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub launchers: BTreeMap<String, String>,
+    /// Multi-file app payloads (issue #37): app name → the app's
+    /// in-payload binary path plus the sibling content recorded beside
+    /// it at install time. The pod farm builds multi-file packages a
+    /// per-package assembly subtree from this (`crate::farm`), so
+    /// relative-to-executable sibling reads (`pi`'s package.json,
+    /// git-credential-manager's libSkiaSharp.so) resolve beside the
+    /// executed binary; single-binary packages record nothing here and
+    /// keep the bare direct farm link.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub assembly: BTreeMap<String, AppAssembly>,
+    /// Runtime confinement grants (ADR-0016, ticket #11): the package-level
+    /// `confined` declaration. `Some` = the package is confined (its
+    /// apps default to confined), `None` = unconfined. Recorded from the
+    /// payload's snap.yaml at install time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confined: Option<Confinement>,
+    /// Per-app confinement overrides (ticket #11): app name → grants, only
+    /// for apps whose `confined` differs from the package default. The
+    /// farm emitter and `nau run` resolve effective confinement as
+    /// `app_confined.get(app).or(confined.as_ref())`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub app_confined: BTreeMap<String, Confinement>,
+    /// Desktop-launcher metadata per GUI app (issue #7), parsed from the
+    /// package's `.desktop` file at install time and recorded in the
+    /// manifest so the launcher emitter rebuilds entries from the
+    /// manifest alone — rollback re-emits without re-unpacking. Empty
+    /// for packages without GUI apps.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub desktops: BTreeMap<String, DesktopLauncher>,
+    /// Payload font files (issue #29 cutover): path under the payload's
+    /// `usr/share/fonts` → sha256, recorded at install time so the font
+    /// emitter rebuilds the user-level surface from the manifest alone —
+    /// rollback re-emits without re-unpacking. Empty for packages that
+    /// ship no fonts (the common case; the hashes also appear in `files`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fonts: BTreeMap<String, String>,
+    /// Service declarations (ADR-0032, issue #106), recorded verbatim from
+    /// the payload's snap.yaml at install time: service name → decl. This
+    /// is the declaration record the service emitter re-renders into the
+    /// generation's `units.json` (pod-level overrides are applied at
+    /// record time, not stored here). Empty for packages without services.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, ServiceDecl>,
+    /// Service name → sha256 of the service's command binary blob in the
+    /// store — the farm-link source, the `apps` precedent: each entry
+    /// becomes a flat farm link `current/<svc>` exactly like an app
+    /// binary. Empty for packages without services.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service_bins: BTreeMap<String, String>,
+    /// Canonical build-input digest (sha3-384) of the resolved recipe
+    /// meta recorded at install time (issue #113). `None` for manifests
+    /// recorded before the field existed — those never hold, so the
+    /// first sync after upgrade rebuilds once and records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_digest: Option<String>,
+}
+
+/// One bootable selection: base version + package set + content hashes.
+///
+/// Moved DOWN into `nau_core::pkg_manifest` (issue #326 PR 5, beside
+/// `InstalledPackage`); the root `runtime` module re-exports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Generation {
+    pub n: u64,
+    /// Base OS version this generation was created on (from the host
+    /// os-release; the base axis itself updates via sysupdate, never
+    /// through these commands).
+    pub base_version: String,
+    /// The full installed package set, keyed by snap name.
+    pub packages: BTreeMap<String, InstalledPackage>,
+    pub created_epoch: u64,
+    /// The boot entry id this generation corresponds to, when known
+    /// (sysupdate integration); None for package-axis-only generations.
+    pub boot_entry: Option<String>,
+}
+
+// ── The minting half (issue #326 PR 5 down-move) ──
+
+/// Load the operator's signing key for manifest minting. Unlike
+/// [`crate::sign::load_secret_key`] — whose `Ok(None)` means signing is
+/// opt-out — minting REQUIRES a key: unsigned store entries are never
+/// served (ADR-0033 Decision 2). Absence is a named error pointing at
+/// the `nau key` ceremony.
+pub fn load_signing_key(home: &Path) -> miette::Result<KeyPair> {
+    crate::sign::load_secret_key(home)?.ok_or_else(|| {
+        miette::miette!(
+            "no signing key at {} — shareable package manifests are always signed; \
+             run `nau key keygen` first (see `nau key list` for the ceremony ledger)",
+            crate::sign::secret_key_path(home).display()
+        )
+    })
+}
+
+// ── One mint, one truth (ADR-0033 Decision 2) ──
+//
+// Every minting lane (serve, export — build/ingest when they land)
+// calls [`mint_manifest`]; there is exactly one implementation so the
+// body a peer fetches over `/manifests/<pkg>` and the file a mirror
+// freezes are the same bytes by construction, not by discipline.
+
+/// Mint a [`PackageManifest`] from a generation record (ADR-0033
+/// Decision 2). The record keeps per-file CONTENT ADDRESSES only — no
+/// payload paths and no executable bits — so `files[].path` carries the
+/// store identity (the sha256 itself) and `executable` is true for the
+/// recorded command binaries (apps, confined launchers, service
+/// binaries — the farm links those for direct execution). `install`
+/// mirrors the snap.yaml-derived records verbatim: metadata travels,
+/// never re-derived. `signer`/`signature` are stamped by [`sign`].
+pub fn mint_manifest(record: &InstalledPackage) -> PackageManifest {
+    let binaries: BTreeSet<&str> = record
+        .apps
+        .values()
+        .chain(record.launchers.values())
+        .chain(record.service_bins.values())
+        .map(String::as_str)
+        .collect();
+    let files: Vec<ManifestFile> = record
+        .files
+        .iter()
+        .map(|sha256| ManifestFile {
+            path: sha256.clone(),
+            sha256: sha256.clone(),
+            executable: binaries.contains(sha256.as_str()),
+        })
+        .collect();
+    PackageManifest {
+        name: record.name.clone(),
+        version: record.version.clone(),
+        revision: record.revision,
+        target: host_target(),
+        files,
+        install: InstallMeta {
+            units: record.units.clone(),
+            apps: record.apps.clone(),
+            launchers: record.launchers.clone(),
+            assembly: record.assembly.clone(),
+            confined: record.confined.clone(),
+            app_confined: record.app_confined.clone(),
+            desktops: record.desktops.clone(),
+            fonts: record.fonts.clone(),
+            services: record.services.clone(),
+            service_bins: record.service_bins.clone(),
+            requires: record.requires.clone(),
+        },
+        signer: String::new(),
+        signature: String::new(),
+    }
+}
+
+// ── The union rule (ADR-0033 Decision 5 invariant) ──
+
+/// The pull-staging inbox: staged peer manifests under
+/// `<root>/store/manifests/` (see [`manifest_path`] for the layout
+/// invariant), sorted by package name. A missing directory is an empty
+/// inbox — an installed-only store is still publishable.
+pub fn inbox_manifests(store_root: &Path) -> miette::Result<Vec<(String, PathBuf)>> {
+    let dir = store_root.join("store").join("manifests");
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for entry in read {
+        let entry = entry
+            .into_diagnostic()
+            .wrap_err_with(|| format!("reading {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        out.push((stem.to_string(), path));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// The union's inbox half: staged manifests whose package is NOT in the
+/// current generation — the ones published verbatim instead of minted
+/// fresh. Both `serve /info` and `export index.json` walk this, so the
+/// dynamic view and the frozen tree never disagree on visibility.
+pub fn union_inbox<'a>(
+    generation: &Option<Generation>,
+    inbox: &'a [(String, PathBuf)],
+) -> Vec<&'a (String, PathBuf)> {
+    let gen_names: BTreeSet<&str> = generation
+        .as_ref()
+        .map(|g| g.packages.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    inbox
+        .iter()
+        .filter(|(name, _)| !gen_names.contains(name.as_str()))
+        .collect()
+}
 
 /// One app's multi-file payload assembly (issue #37): the app binary's
 /// in-payload path plus the content that ships beside it (same payload
@@ -440,5 +711,120 @@ mod tests {
             let err = validate_payload_path(&file(bad)).expect_err(bad);
             assert!(err.to_string().contains(bad), "{err}");
         }
+    }
+
+    // ── Minting half (moved beside `mint_manifest`, issue #326 PR 5) ──
+
+    /// A generation record with one app, one launcher and one service
+    /// binary (the executable bits' sources) plus two plain blobs.
+    fn record() -> InstalledPackage {
+        let mut apps = BTreeMap::new();
+        apps.insert("hello".to_string(), "aa".repeat(32));
+        let mut launchers = BTreeMap::new();
+        launchers.insert("hello".to_string(), "bb".repeat(32));
+        let mut service_bins = BTreeMap::new();
+        service_bins.insert("srv".to_string(), "cc".repeat(32));
+        InstalledPackage {
+            name: "hello".into(),
+            version: "2.10".into(),
+            revision: 7,
+            sha3_384: "a3".repeat(48),
+            files: vec![
+                "aa".repeat(32),
+                "bb".repeat(32),
+                "cc".repeat(32),
+                "dd".repeat(32),
+            ],
+            units: vec![],
+            layer: ClaimLayer::Own,
+            apps,
+            requires: vec!["libc6".into()],
+            launchers,
+            assembly: BTreeMap::new(),
+            confined: None,
+            app_confined: BTreeMap::new(),
+            desktops: BTreeMap::new(),
+            fonts: BTreeMap::new(),
+            services: BTreeMap::new(),
+            service_bins,
+            meta_digest: None,
+        }
+    }
+
+    /// The regression guard the council demanded: serve and export mint
+    /// through this one function, so the same record serializes to the
+    /// SAME bytes (ed25519 signatures are deterministic) — the `/info`-
+    /// adjacent `manifests/<pkg>.json` a mirror freezes can never drift
+    /// from the body `/manifests/<pkg>` serves.
+    #[test]
+    fn one_mint_serve_and_export_serialize_byte_identically() {
+        let kp = test_kp(1);
+        let mut served = mint_manifest(&record());
+        sign(&mut served, &kp).unwrap();
+        let mut exported = mint_manifest(&record());
+        sign(&mut exported, &kp).unwrap();
+
+        // The exact serializations the two lanes emit.
+        let serve_body = serde_json::to_vec_pretty(&served).unwrap();
+        let export_file = serde_json::to_vec_pretty(&exported).unwrap();
+        assert_eq!(serve_body, export_file);
+    }
+
+    /// The minted manifest's documented semantics (export semantics won
+    /// when the mints were consolidated): `files[].path` is the sha256
+    /// store identity and `executable` is the recorded-command union.
+    #[test]
+    fn minted_files_carry_store_identity_and_command_executable_bits() {
+        let manifest = mint_manifest(&record());
+        assert_eq!(manifest.target, host_target());
+        assert_eq!(manifest.files.len(), 4);
+        for file in &manifest.files {
+            assert_eq!(file.path, file.sha256, "path = store identity");
+        }
+        let exe: Vec<&str> = manifest
+            .files
+            .iter()
+            .filter(|f| f.executable)
+            .map(|f| f.sha256.as_str())
+            .collect();
+        // The app binary, the launcher wrapper and the service binary —
+        // in `files` order; the plain blob stays non-executable.
+        let (aa, bb, cc) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
+        assert_eq!(exe, vec![aa.as_str(), bb.as_str(), cc.as_str()]);
+        assert_eq!(manifest.install.apps.len(), 1);
+        assert_eq!(manifest.install.requires, vec!["libc6".to_string()]);
+    }
+
+    // ── Union helpers ──
+
+    #[test]
+    fn union_inbox_keeps_only_packages_outside_the_generation() {
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            "alpha".to_string(),
+            InstalledPackage {
+                name: "alpha".into(),
+                revision: 1,
+                ..record()
+            },
+        );
+        let gen = Generation {
+            n: 1,
+            base_version: "test".into(),
+            packages,
+            created_epoch: 0,
+            boot_entry: None,
+        };
+        let inbox = vec![
+            ("alpha".to_string(), PathBuf::from("/x/alpha.json")),
+            ("gamma".to_string(), PathBuf::from("/x/gamma.json")),
+        ];
+        let inbox_only: Vec<&(String, PathBuf)> = union_inbox(&Some(gen), &inbox);
+        assert_eq!(inbox_only.len(), 1);
+        assert_eq!(inbox_only[0].0, "gamma");
+        assert!(
+            union_inbox(&None, &inbox).len() == 2,
+            "no generation → all inbox"
+        );
     }
 }
