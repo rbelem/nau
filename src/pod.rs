@@ -1788,7 +1788,12 @@ pub fn add_snap_pod(
         layer: payload_layer(&decl, &name),
         meta_digest: None,
     };
-    let install = store.install_batch(&[pending], &Default::default(), &tools)?;
+    let install = store.install_batch(
+        &[pending],
+        &Default::default(),
+        &tools,
+        &crate::runtime::verify_signatures,
+    )?;
     for note in &install.notes {
         crate::output::info(note.clone());
     }
@@ -3987,10 +3992,12 @@ fn install_pending(
     resolve_service_claims(&build.service_claims)?;
     let mut installed = Vec::new();
     if !build.pending.is_empty() {
-        let report =
-            state
-                .store
-                .install_batch(&build.pending, &Default::default(), &state.tools)?;
+        let report = state.store.install_batch(
+            &build.pending,
+            &Default::default(),
+            &state.tools,
+            &crate::runtime::verify_signatures,
+        )?;
         if !report.noop {
             installed = report.installed.iter().map(|s| s.name.clone()).collect();
         }

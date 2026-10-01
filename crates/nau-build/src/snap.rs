@@ -948,16 +948,11 @@ fn emit_wrapped_script(
 /// The sibling name a build-time wrapper preserves the real entry under
 /// (`<stem>.real.<ext>`, or `<file>.real` without an extension).
 /// Public for the install path, which must recognize wrapper-managed
-/// commands (issue #37).
-/// The real-sibling name for a wrapped command (`app` → `app.real`).
-/// `pub` because the root runtime module resolves the same sibling name
-/// for installed wrappers (via the root `snap` shim re-export).
-pub fn real_sibling_name(file_name: &str) -> String {
-    match file_name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => format!("{stem}.real.{ext}"),
-        _ => format!("{file_name}.real"),
-    }
-}
+/// commands (issue #37). Moved DOWN into `nau_core::snap_types` (issue
+/// #326 PR 7: the on-device runtime resolves the same sibling name for
+/// installed wrappers); re-exported so every build-internal and
+/// `crate::snap::real_sibling_name` path keeps resolving.
+pub use nau_core::snap_types::real_sibling_name;
 
 /// True when the payload stages a CPython stdlib tree beside the command
 /// (`<prefix>/lib/python3.*/` next to `<prefix>/bin/<cmd>`): such an ELF
@@ -1259,23 +1254,17 @@ fn emit_confined_launcher(
 }
 
 /// The sibling path of a command entry that carries the confined launcher
-/// wrapper (e.g. `usr/bin/app` → `usr/bin/app.nau-launcher`).
-pub fn launcher_sibling_path(entry: &Path) -> PathBuf {
-    let mut name = entry
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    name.push_str(".nau-launcher");
-    entry.with_file_name(name)
-}
+/// wrapper (e.g. `usr/bin/app` → `usr/bin/app.nau-launcher`). Moved DOWN
+/// into `nau_core::snap_types` (issue #326 PR 7, with
+/// [`launcher_sibling_rel_path`]); re-exported.
+pub use nau_core::snap_types::launcher_sibling_path;
 
 /// The relative payload path of a command's confined launcher wrapper
 /// (e.g. `usr/bin/app` → `usr/bin/app.nau-launcher`), for the
 /// install-time planner to locate the wrapper blob in the payload tree.
-pub fn launcher_sibling_rel_path(command_rel: &str) -> String {
-    let path = Path::new(command_rel);
-    launcher_sibling_path(path).to_string_lossy().into_owned()
-}
+/// Moved DOWN into `nau_core::snap_types` (issue #326 PR 7: the
+/// on-device install planner consumes it); re-exported.
+pub use nau_core::snap_types::launcher_sibling_rel_path;
 
 /// Write a launcher wrapper at `entry` and mark it owner-executable.
 fn write_wrapper(app_name: &str, entry: &Path, wrapper: &str) -> miette::Result<()> {

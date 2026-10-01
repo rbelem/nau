@@ -1,0 +1,38 @@
+[package]
+name = "nau-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "nau's on-device runtime domain: generations, the content store, install/remove/rollback/gc, activation, and the slot-recovery assessment (ADR-0012, ADR-0051, ADR-0053)"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The spine (ADR-0051 Decision 3): the generation/store view (layout
+# truth — RuntimeStore delegates every read to it), the blob-store seam,
+# the install records, snap value types, the unit planner, the keychain
+# envelope, the device path vocabulary.
+nau-core = { path = "../nau-core" }
+# The mechanism leaf (issue #326): the store client (payload
+# sha3-384s), tool provisioning (the squashfs pair), terminal output
+# (best-effort activation warnings), the command seam (slot recovery's
+# lsblk/sfdisk runs).
+nau-infra = { path = "../nau-infra" }
+# Error vocabulary (unified with the root's fancy feature).
+miette = "7"
+# unpack_payload: the payload's meta/snap.yaml parse (PayloadSnap +
+# version) — the install records derive from it verbatim.
+serde_yaml = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# payload tree recording: the font/assembly blobs are content-addressed
+# by sha256 at ingest.
+sha2 = "0.10"
+# RuntimeTools probes executability (mode bits); the farm emit's link
+# fallback specializes on libc errno shapes via std::io::Error.
+libc = "0.2"
+# journal/manifest writes stage through same-directory temp files
+# (rename(2) atomicity is the durability shape).
+tempfile = "3"
+
+[dev-dependencies]
+# store fixtures stage pod roots.
+tempfile = "3"

@@ -10,6 +10,7 @@
 //! stay in the root `sign` module, which re-exports everything here —
 //! every pre-existing `crate::sign::` path keeps resolving.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -1090,4 +1091,22 @@ fn parse_revoked_keys(text: &str, path: &Path) -> miette::Result<Vec<String>> {
         ids.push(line.to_ascii_lowercase());
     }
     Ok(ids)
+}
+
+/// A channel-side manifest signature envelope (ADR-0011 step (d)): the
+/// canonical bytes the signatures cover plus the signatures map. Empty
+/// = unsigned — install proceeds with a note. Moved DOWN from the root
+/// runtime module (issue #326 PR 7, completing amendment 7's envelope
+/// clause: the envelope is wire vocabulary the install gate consumes);
+/// the root `runtime`/`sign` modules re-export it.
+#[derive(Debug, Clone, Default)]
+pub struct SignatureEnvelope {
+    pub canonical_bytes: Vec<u8>,
+    pub signatures: BTreeMap<String, serde_json::Value>,
+}
+
+impl SignatureEnvelope {
+    pub fn is_unsigned(&self) -> bool {
+        self.signatures.is_empty()
+    }
 }

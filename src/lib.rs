@@ -24,7 +24,6 @@ pub mod runtime;
 pub mod secrets;
 pub mod services;
 pub mod sign;
-pub mod slot_recovery;
 // The build domain (issue #326 PR 2): snap/cache/build_prefix/
 // source_cache moved to nau-build; the plain re-export keeps every
 // `crate::<module>::` path resolving. snap and leak_scan stay root shim
@@ -53,6 +52,11 @@ pub use nau_peer::{discovery, export, serve};
 // see src/secrets.rs); the pod grammar's pure halves re-export from
 // src/pod.rs, which remains the orchestrator file.
 pub use nau_pod::{confine, desktop, farm, fonts};
+// The runtime domain (issue #326 PR 7): RuntimeStore + the mutation
+// machinery + slot_recovery moved to nau-runtime; src/runtime.rs stays
+// a real shim FILE (the verify cluster + its cosign/attest suite —
+// the trust domain, later crate) re-exporting the moved names.
+pub use nau_runtime::slot_recovery;
 pub mod oci;
 pub mod snap;
 pub mod ssh_exec;

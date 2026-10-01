@@ -50,6 +50,17 @@ pub fn image_snap_channel(
     }
 }
 
+/// GPT partition type GUIDs systemd-sysupdate matches slots by (x86-64
+/// types) — the device vocabulary slot (`BOOTLOADER_PIBOOT`
+/// precedent). Set on the image at build time via sfdisk; the UKI boot
+/// path needs none of them (cmdline carries explicit by-partuuid
+/// devices), but sysupdate's MatchPartitionType does. Moved DOWN from
+/// nau-image (issue #326 PR 7: the on-device slot-recovery lane reads
+/// the same table); nau-image re-exports.
+pub const ESP_TYPE_GUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
+pub const ROOT_TYPE_GUID_X86_64: &str = "4f68bce3-e8cd-4db1-96e7-fbcaf984b709";
+pub const VERITY_TYPE_GUID_X86_64: &str = "2c7357ed-ebd2-46d9-aec1-23d437ec2bf5";
+
 #[cfg(test)]
 mod tests {
     use super::*;

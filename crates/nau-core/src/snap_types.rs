@@ -802,3 +802,37 @@ pub fn split_version_suffix(name: &str) -> Option<&str> {
         Some(base)
     }
 }
+
+/// The real-sibling name for a wrapped command (`app` → `app.real`,
+/// `app.sh` → `app.real.sh`). Moved DOWN from the build crate (issue
+/// #326 PR 7: the on-device runtime resolves the same sibling name for
+/// installed wrappers); the build crate re-exports it.
+pub fn real_sibling_name(file_name: &str) -> String {
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}.real.{ext}"),
+        _ => format!("{file_name}.real"),
+    }
+}
+
+/// The sibling path of a command entry that carries the confined
+/// launcher wrapper (e.g. `usr/bin/app` → `usr/bin/app.nau-launcher`).
+/// Moved DOWN from the build crate (issue #326 PR 7); the build crate
+/// re-exports it.
+pub fn launcher_sibling_path(entry: &std::path::Path) -> std::path::PathBuf {
+    let mut name = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.push_str(".nau-launcher");
+    entry.with_file_name(name)
+}
+
+/// The relative payload path of a command's confined launcher wrapper
+/// (e.g. `usr/bin/app` → `usr/bin/app.nau-launcher`), for the
+/// install-time planner to locate the wrapper blob in the payload tree.
+/// Moved DOWN from the build crate (issue #326 PR 7); the build crate
+/// re-exports it.
+pub fn launcher_sibling_rel_path(command_rel: &str) -> String {
+    let path = std::path::Path::new(command_rel);
+    launcher_sibling_path(path).to_string_lossy().into_owned()
+}

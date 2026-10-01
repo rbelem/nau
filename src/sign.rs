@@ -99,8 +99,9 @@ pub use nau_core::sign::{
     revoke_local, rfc3339_to_unix, rotation_key_path, secret_key_path, sign_bytes, subject_digest,
     sysupdate_fragment_path, to_hex, unix_to_rfc3339, verify, verify_keychain, verify_one,
     verify_trust_set, write_secret_key_at, CeremonyLedger, Invocation, KeyPair, Keychain,
-    LedgerEntry, Provenance, SignatureEntry, Subject, CEREMONY_LEDGER_VERSION, DEFAULT_WINDOW_DAYS,
-    PUBKEY_EMBED_PATH, PUBLIC_COMMENT, REVOKED_KEYS_EMBED_PATH, TRUSTED_KEYS_EMBED_DIR,
+    LedgerEntry, Provenance, SignatureEntry, SignatureEnvelope, Subject, CEREMONY_LEDGER_VERSION,
+    DEFAULT_WINDOW_DAYS, PUBKEY_EMBED_PATH, PUBLIC_COMMENT, REVOKED_KEYS_EMBED_PATH,
+    TRUSTED_KEYS_EMBED_DIR,
 };
 
 /// Canonical signature input for the EVAL manifest

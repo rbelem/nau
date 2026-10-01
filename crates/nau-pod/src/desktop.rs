@@ -40,6 +40,7 @@
 use std::collections::BTreeSet;
 
 use nau_core::generation_view::StoreView;
+pub use nau_core::pkg_manifest::{parse_source, DesktopSource};
 use nau_core::pkg_manifest::{DesktopLauncher, Generation};
 
 /// The launcher directory inside a generation: `<root>/generations/<n>/
@@ -341,128 +342,10 @@ pub fn link_or_replace(src: &std::path::Path, dest: &std::path::Path) -> miette:
 }
 
 // ── Source parsing (the package's .desktop file) ──
-
-/// The metadata subset the launcher takes from a package's `.desktop`
-/// file, parsed at install time and recorded in the generation manifest.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DesktopSource {
-    /// `Name=` (required for a valid entry).
-    pub name: Option<String>,
-    /// `GenericName=`, passed through.
-    pub generic_name: Option<String>,
-    /// `Comment=`, passed through.
-    pub comment: Option<String>,
-    /// `Categories=`, split on `;` (empties dropped).
-    pub categories: Vec<String>,
-    /// `Icon=` — a theme icon name passed through ONLY when the package
-    /// ships no icon of its own (the emitter then substitutes the
-    /// pod-namespaced link name).
-    pub icon_ref: Option<String>,
-}
-
-/// Parse a package's `.desktop` file. Strict about what the launcher
-/// NEEDS: the file must carry a `[Desktop Entry]` group with
-/// `Type=Application` and a non-empty `Name=`; everything else the
-/// launcher uses is optional. Unknown keys and locale variants
-/// (`Name[de]=`) are ignored — the source file is the package's own.
-pub fn parse_source(text: &str, label: &str) -> miette::Result<DesktopSource> {
-    let mut source = DesktopSource::default();
-    let mut in_entry = false;
-    let mut saw_entry_group = false;
-    let mut type_is_application = false;
-    for line in text.lines() {
-        if line.starts_with('[') {
-            // A new group ends the Desktop Entry group.
-            if in_entry {
-                break;
-            }
-            in_entry = line == "[Desktop Entry]";
-            saw_entry_group |= in_entry;
-            continue;
-        }
-        if !in_entry || line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        // Locale variants (`Name[de]=`) are distinct keys — the
-        // launcher uses the un-localized base key only.
-        if key.contains('[') {
-            continue;
-        }
-        match key {
-            "Type" => type_is_application = value == "Application",
-            "Name" => source.name = Some(unescape_value(value)),
-            "GenericName" => source.generic_name = Some(unescape_value(value)),
-            "Comment" => source.comment = Some(unescape_value(value)),
-            "Categories" => {
-                source.categories = value
-                    .split(';')
-                    .filter(|c| !c.is_empty())
-                    .map(str::to_string)
-                    .collect();
-            }
-            "Icon" => source.icon_ref = Some(unescape_value(value)),
-            _ => {}
-        }
-    }
-    if !saw_entry_group {
-        miette::bail!("{label}: .desktop file has no [Desktop Entry] group");
-    }
-    if !type_is_application {
-        miette::bail!("{label}: .desktop file must have Type=Application");
-    }
-    match &source.name {
-        Some(n) if !n.trim().is_empty() => {}
-        _ => miette::bail!("{label}: .desktop file must have a non-empty Name="),
-    }
-    Ok(source)
-}
-
-/// Unescape a `.desktop` string value: `\n`, `\t`, `\r`, `\s`, `\\`.
-fn unescape_value(value: &str) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    let mut out = String::with_capacity(value.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        i += 1;
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.get(i) {
-            Some('n') => {
-                out.push('\n');
-                i += 1;
-            }
-            Some('t') => {
-                out.push('\t');
-                i += 1;
-            }
-            Some('r') => {
-                out.push('\r');
-                i += 1;
-            }
-            Some('s') => {
-                out.push(' ');
-                i += 1;
-            }
-            Some('\\') => {
-                out.push('\\');
-                i += 1;
-            }
-            Some(&other) => {
-                out.push('\\');
-                out.push(other);
-                i += 1;
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
-}
+//
+// `DesktopSource` + `parse_source` moved DOWN into `nau_core::pkg_manifest`
+// (issue #326 PR 7: the on-device install records the parsed metadata;
+// pure text parsing, no store) — re-exported above.
 
 // ── Rendering ──
 
@@ -973,39 +856,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err3.contains("invalid escape"), "got {err3}");
-    }
-
-    #[test]
-    fn parse_source_reads_the_metadata_subset() {
-        let text = "[Desktop Entry]\nType=Application\nName=My App\nGenericName=Editor\n\
-                    Comment=Does things\nCategories=Graphics;Viewer;\nIcon=theme-icon\n\
-                    Exec=/somewhere/original\nName[de]=Meine App\nX-Custom=1\n";
-        let src = parse_source(text, "test").unwrap();
-        assert_eq!(src.name.as_deref(), Some("My App"));
-        assert_eq!(src.generic_name.as_deref(), Some("Editor"));
-        assert_eq!(src.comment.as_deref(), Some("Does things"));
-        assert_eq!(src.categories, vec!["Graphics", "Viewer"]);
-        assert_eq!(src.icon_ref.as_deref(), Some("theme-icon"));
-    }
-
-    #[test]
-    fn parse_source_unescapes_values() {
-        let src = parse_source("[Desktop Entry]\nType=Application\nName=a\\sb\n", "t").unwrap();
-        assert_eq!(src.name.as_deref(), Some("a b"));
-    }
-
-    #[test]
-    fn parse_source_requires_entry_group_type_and_name() {
-        for (what, text) in [
-            ("no group", "Type=Application\nName=x\n"),
-            ("wrong type", "[Desktop Entry]\nType=Link\nName=x\n"),
-            ("no type", "[Desktop Entry]\nName=x\n"),
-            ("no name", "[Desktop Entry]\nType=Application\n"),
-            ("empty name", "[Desktop Entry]\nType=Application\nName=  \n"),
-        ] {
-            let err = parse_source(text, "t").unwrap_err().to_string();
-            assert!(!err.is_empty(), "{what} must fail");
-        }
     }
 
     #[test]

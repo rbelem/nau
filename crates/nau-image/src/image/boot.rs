@@ -11,7 +11,8 @@ use nau_infra::pathsearch;
 
 /// sysupdate.d file name prefix for nau-generated transfers — ordering
 /// keeps root+verity ahead of the UKI within one sysupdate transaction.
-pub const SYSUPDATE_DIR: &str = "usr/lib/sysupdate.d";
+/// Moved DOWN into `nau_core::paths` (issue #326 PR 7); re-exported.
+pub use nau_core::paths::SYSUPDATE_DIR;
 
 /// systemd-sysupdate trigger pair (ADR-0024 §2, #62). These are systemd's
 /// own unit names — nau ships no update daemon (ADR-0011 §5).
