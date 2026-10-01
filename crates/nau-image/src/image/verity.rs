@@ -457,9 +457,11 @@ pub(crate) fn verity_trailing(
 /// types). Set on the image at build time via sfdisk; the UKI boot path
 /// needs none of them (cmdline carries explicit by-partuuid devices), but
 /// sysupdate's MatchPartitionType does.
-pub const ESP_TYPE_GUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
-pub const ROOT_TYPE_GUID_X86_64: &str = "4f68bce3-e8cd-4db1-96e7-fbcaf984b709";
-pub const VERITY_TYPE_GUID_X86_64: &str = "2c7357ed-ebd2-46d9-aec1-23d437ec2bf5";
+pub use nau_core::channels::ESP_TYPE_GUID;
+// Moved DOWN into `nau_core::channels` (issue #326 PR 7: the
+// on-device slot-recovery lane reads the same device table);
+// re-exported so nau-image-internal and `crate::image::` paths resolve.
+pub use nau_core::channels::{ROOT_TYPE_GUID_X86_64, VERITY_TYPE_GUID_X86_64};
 
 /// Slot letter for the n-th root slot (0 → "a", 1 → "b").
 pub(crate) fn slot_suffix(slot: usize) -> &'static str {

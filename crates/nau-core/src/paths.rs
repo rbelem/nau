@@ -80,3 +80,10 @@ pub fn resolve_pod_dir_under(root: &Path, pod: Option<&str>) -> miette::Result<(
     validate_pod_name(name)?;
     Ok((name.to_string(), pod_dir(root, name)))
 }
+
+/// sysupdate.d file name prefix for nau-generated transfers (payload-
+/// relative): ordering keeps root+verity ahead of the UKI within one
+/// sysupdate transaction. Moved DOWN from nau-image (issue #326 PR 7:
+/// the on-device slot-recovery lane walks the same directory);
+/// nau-image re-exports.
+pub const SYSUPDATE_DIR: &str = "usr/lib/sysupdate.d";

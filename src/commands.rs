@@ -2447,6 +2447,7 @@ fn install_pulled(
         &pending,
         &SignatureEnvelope::default(),
         &RuntimeTools::for_pod_runtime(),
+        &crate::runtime::verify_signatures,
     )
 }
 
@@ -2493,6 +2494,7 @@ fn runtime_install(name: &str, channel: &str, state_dir: Option<String>) -> miet
         &[pending],
         &SignatureEnvelope::default(),
         &RuntimeTools::for_pod_runtime(),
+        &crate::runtime::verify_signatures,
     )?;
     print_install_report(&report);
     Ok(())
@@ -2534,6 +2536,7 @@ fn runtime_upgrade(
         &pending,
         &SignatureEnvelope::default(),
         &RuntimeTools::for_pod_runtime(),
+        &crate::runtime::verify_signatures,
     )?;
     print_install_report(&report);
     Ok(())

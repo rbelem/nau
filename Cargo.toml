@@ -18,6 +18,7 @@ members = [
     "crates/nau-ship",
     "crates/nau-peer",
     "crates/nau-pod",
+    "crates/nau-runtime",
 ]
 resolver = "2"
 
@@ -51,6 +52,10 @@ nau-peer = { path = "crates/nau-peer" }
 # family, the `nau run` confinement backend, secret resolution, and the
 # pod grammar's pure halves.
 nau-pod = { path = "crates/nau-pod" }
+# The runtime domain (issue #326 PR 7): on-device generations, the
+# content store's mutation machinery, install/remove/rollback/gc,
+# activation, and the slot-recovery assessment.
+nau-runtime = { path = "crates/nau-runtime" }
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["luau"] }
 miette = { version = "7", features = ["fancy"] }

@@ -40,6 +40,10 @@
 #              pure halves; no dev-edge: the eval-coupled verb/test
 #              suites stay root, the crate's own tests use core+infra
 #              only)
+#   nau-runtime {nau-core, nau-infra}  — the on-device runtime (store
+#              mutation, install/remove/rollback/gc, activation, slot
+#              recovery; no dev-edge: the store-fixture suites are
+#              in-crate, the cosign/attest fixtures stay root)
 #   nau (root) exempt                  — the root composes everything
 set -euo pipefail
 
@@ -62,6 +66,7 @@ allowed_normal() {
         nau-ship)   echo "nau-core nau-infra" ;;
         nau-peer)   echo "nau-core nau-infra" ;;
         nau-pod)    echo "nau-core nau-infra" ;;
+        nau-runtime) echo "nau-core nau-infra" ;;
         *)          return 1 ;;
     esac
 }
