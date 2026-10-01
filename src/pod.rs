@@ -6182,7 +6182,7 @@ fn build_pending_snap(
     set_pod_build_epoch();
     let deps_dir = match (meta.deps.as_ref(), deps_pin) {
         (Some(_), Some(pin)) => Some(crate::dep_fetch::materialize_deps_entry(
-            store,
+            &store.blob_store(),
             &pin.deps_hash,
         )?),
         (Some(_), None) => return Err(deps_gate_error(&meta.name, source_pod)),
@@ -6380,9 +6380,15 @@ fn ensure_own_deps(
     let prev = lock.packages.get(pkg_name).and_then(|e| e.deps.clone());
     let floating = force_float || meta.floating;
     let recipe_dir = crate::deps::recipe_dir(pkg_name);
-    crate::dep_fetch::ensure_pod_deps(store, meta, prev.as_ref(), floating, recipe_dir.as_deref())
-        .map(Some)
-        .map_err(|e| miette::miette!("package '{pkg_name}': {e}"))
+    crate::dep_fetch::ensure_pod_deps(
+        &store.blob_store(),
+        meta,
+        prev.as_ref(),
+        floating,
+        recipe_dir.as_deref(),
+    )
+    .map(Some)
+    .map_err(|e| miette::miette!("package '{pkg_name}': {e}"))
 }
 
 /// Shape a built, content-hashed payload as a [`PendingSnap`] at the
@@ -6764,7 +6770,7 @@ pub fn fetch_pod_deps(
         let old_hash = prev.as_ref().map(|p| p.deps_hash.clone());
         let recipe_dir = crate::deps::recipe_dir(&spec.name);
         let pin = crate::dep_fetch::ensure_pod_deps(
-            &store,
+            &store.blob_store(),
             &meta,
             prev.as_ref(),
             floating,

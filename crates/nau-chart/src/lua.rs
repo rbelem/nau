@@ -4,8 +4,9 @@ use miette::{IntoDiagnostic, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::Span;
-use crate::image::ImageDeclaration;
-use crate::snap::{FromLuaTable, FromLuaValue, PackageInput, SnapMeta};
+use crate::snap_lua::{FromLuaTable, FromLuaValue};
+use nau_core::manifest_ir::ImageDeclaration;
+use nau_core::snap_types::{PackageInput, SnapMeta};
 
 /// Named outputs from a `nau.lua`, fully converted to owned Rust types.
 pub type Outputs = HashMap<String, SnapMeta>;
@@ -159,7 +160,7 @@ pub struct WorkerConfig {
 }
 
 fn default_local_jobs() -> u32 {
-    crate::build_sched::MAX_PARALLEL_BUILD_WORKERS as u32
+    nau_core::MAX_PARALLEL_BUILD_WORKERS as u32
 }
 
 fn default_worker_jobs() -> u32 {
@@ -623,7 +624,7 @@ pub fn evaluate_string_with_constraint(
 ) -> miette::Result<Outputs> {
     let ok = run_worker_for(label, source, constraint)?;
     for diag in &ok.diagnostics {
-        crate::output::warn(diag);
+        nau_infra::output::warn(diag);
     }
 
     // Map the worker's JSON outputs back into typed SnapMeta through a
@@ -644,7 +645,7 @@ pub fn evaluate_string_with_constraint(
                 meta.definition_dir = definition_dir_from_label(label);
                 outputs.insert(key.clone(), meta);
             }
-            Err(e) => crate::output::warn(format!("skipping output '{key}' from {label}: {e}")),
+            Err(e) => nau_infra::output::warn(format!("skipping output '{key}' from {label}: {e}")),
         }
     }
 
@@ -652,7 +653,7 @@ pub fn evaluate_string_with_constraint(
     // its own base sibling in the same eval is the warnable shape. Warn
     // and continue — a genuinely different product may own the name.
     for w in crate::lint::version_suffix_lint(&outputs) {
-        crate::output::warn(&w.message);
+        nau_infra::output::warn(&w.message);
     }
     Ok(outputs)
 }
@@ -838,7 +839,7 @@ pub fn check_string_with_inputs(label: &str, source: &str) -> CheckedEval {
             match NodeConfig::from_lua_value(&value) {
                 Ok(cfg) => {
                     if node.replace(cfg).is_some() {
-                        crate::output::warn(format!(
+                        nau_infra::output::warn(format!(
                             "ignoring extra node declaration '{key}' from {label} — \
                              a definition declares one node",
                         ));
@@ -954,7 +955,7 @@ pub fn check_file_with_inputs(path: &str) -> CheckedEval {
 pub fn evaluate_string_with_inputs(label: &str, source: &str) -> miette::Result<EvalOutput> {
     let checked = check_string_with_inputs(label, source);
     for diag in &checked.diagnostics {
-        crate::output::warn(&diag.message);
+        nau_infra::output::warn(&diag.message);
     }
     if let Some(err) = checked.error {
         return Err(miette::miette!("{err}"));
@@ -990,7 +991,7 @@ fn extract_inputs_from_lua(lua: &mlua::Lua) -> miette::Result<HashMap<String, Pa
                         let url: String = input_table
                             .get("url")
                             .map_err(|_| miette::miette!("inputs['{name}']: missing 'url'"))?;
-                        let submodules = crate::snap::parse_submodule_spec(
+                        let submodules = crate::snap_lua::parse_submodule_spec(
                             input_table
                                 .get::<mlua::Value>("submodules")
                                 .unwrap_or(mlua::Value::Nil),
@@ -1081,7 +1082,7 @@ pub fn evaluate_images_file(path: &str) -> miette::Result<HashMap<String, ImageD
         .wrap_err_with(|| format!("could not read {}", path))?;
     let ok = run_worker_for(path, &source, None)?;
     for diag in &ok.diagnostics {
-        crate::output::warn(diag);
+        nau_infra::output::warn(diag);
     }
 
     let lua = mlua::Lua::new();
@@ -1100,7 +1101,9 @@ pub fn evaluate_images_file(path: &str) -> miette::Result<HashMap<String, ImageD
                     }
                     images.insert(key.clone(), decl);
                 }
-                Err(e) => crate::output::warn(format!("skipping image '{key}' from {path}: {e}")),
+                Err(e) => {
+                    nau_infra::output::warn(format!("skipping image '{key}' from {path}: {e}"))
+                }
             }
         }
     }
@@ -1177,7 +1180,7 @@ fn json_to_lua(lua: &mlua::Lua, v: &serde_json::Value) -> mlua::Result<mlua::Val
 
 #[cfg(test)]
 mod tests {
-    use crate::snap::FromLuaValue;
+    use crate::snap_lua::FromLuaValue;
     use mlua::Value;
 
     /// Create a fresh Lua instance with the DSL globals injected.
@@ -1946,7 +1949,7 @@ return {
 
     /// Evaluate `source` with the constraint global set the way the worker
     /// sets it, and return the parsed SnapMeta of the single output.
-    fn eval_constrained(source: &str, constraint: Option<&str>) -> crate::snap::SnapMeta {
+    fn eval_constrained(source: &str, constraint: Option<&str>) -> nau_core::snap_types::SnapMeta {
         let lua = with_dsl();
         lua.globals()
             .set("constraint", constraint.map(str::to_string))
@@ -1956,7 +1959,8 @@ return {
             panic!("expected output table");
         };
         let default: Value = t.get("default").unwrap();
-        crate::snap::SnapMeta::from_lua_value(&default).expect("output must parse as SnapMeta")
+        nau_core::snap_types::SnapMeta::from_lua_value(&default)
+            .expect("output must parse as SnapMeta")
     }
 
     #[test]
@@ -1972,7 +1976,7 @@ return {
         let meta = eval_constrained(LINED_RECIPE, Some("22"));
         assert_eq!(meta.version, "22.23.3");
         match meta.source {
-            Some(crate::snap::SourceSpec::Pinned { url, sha256 }) => {
+            Some(nau_core::snap_types::SourceSpec::Pinned { url, sha256 }) => {
                 assert_eq!(url, "https://example.test/v22.tgz");
                 assert_eq!(sha256, "b");
             }

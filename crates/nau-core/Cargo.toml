@@ -15,3 +15,11 @@ serde_yaml = "0.9"
 # (that is the root CLI's presentation layer) — feature unification with
 # the root keeps one miette in the graph.
 miette = "7"
+# cache_key::sha256_hex / blob_store::write_blob (issue #326): the
+# content-hash vocabulary is spine material — build cache keys and the
+# pod blob store both speak sha256.
+sha2 = "0.10"
+
+[dev-dependencies]
+# blob_store tests stage a store root.
+tempfile = "3"

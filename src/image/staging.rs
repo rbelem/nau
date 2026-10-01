@@ -20,49 +20,10 @@ pub(crate) enum SnapRole {
     Extra,
 }
 
-/// Derive the store channel track from an image base name:
-/// "core22" → Some("22"), "core26" → Some("26"); bases without a numeric
-/// series ("core", custom bases) derive nothing.
-pub(crate) fn base_track(base_name: &str) -> Option<&str> {
-    let series = base_name.strip_prefix("core")?;
-    if !series.is_empty() && series.bytes().all(|b| b.is_ascii_digit()) {
-        Some(series)
-    } else {
-        None
-    }
-}
-
-/// Replace the track of a "track/risk" (or bare risk) channel, keeping the
-/// risk: "latest/stable" + track "22" → "22/stable"; "stable" → "22/stable".
-pub(crate) fn channel_on_track(channel: &str, track: &str) -> String {
-    // Mirrors the StoreClient channel parse: one part is a risk, two parts
-    // are track/risk.
-    let risk = channel.split('/').nth(1).unwrap_or(channel);
-    format!("{track}/{risk}")
-}
-
-/// The effective store channel for a kernel/gadget image snap (ADR-0019).
-///
-/// An author-pinned channel (`channel` opt on the pin entry) wins verbatim
-/// and marks the override; otherwise the image base's track replaces the
-/// default track ("core22" + "latest/stable" → "22/stable" — the
-/// `latest` kernel line carries the legacy 4.4 ESM payloads); a base with
-/// no numeric series leaves the channel untouched.
-///
-/// Returns `(channel, override_used)`.
-pub(crate) fn image_snap_channel(
-    default_channel: &str,
-    base_name: &str,
-    explicit: Option<&str>,
-) -> (String, bool) {
-    if let Some(explicit) = explicit {
-        return (explicit.to_string(), true);
-    }
-    match base_track(base_name) {
-        Some(track) => (channel_on_track(default_channel, track), false),
-        None => (default_channel.to_string(), false),
-    }
-}
+// The channel math moved down to nau-core (issue #326): the chart lint
+// battery and the package index share it. Re-exported (pub(crate), via
+// image/mod.rs's glob) so `crate::image::staging::…` paths keep resolving.
+pub(crate) use nau_core::channels::{base_track, image_snap_channel};
 
 /// The declared `base:` of a downloaded snap's `meta/snap.yaml`, if the
 /// metadata carries one.

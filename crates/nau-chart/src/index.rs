@@ -44,8 +44,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::snap::{SnapApp, SnapMeta, SourceSpec};
-use crate::store::StoreClient;
+use nau_core::snap_types::{SnapApp, SnapMeta, SnapRef, SourceSpec};
 
 /// Default filename for the package index.
 pub const DEFAULT_INDEX: &str = "package-index.json";
@@ -218,6 +217,16 @@ pub fn default_entries() -> Vec<IndexEntry> {
 
 // ── Index operations ──
 
+/// One store-resolved pin as the index records it. The resolver is
+/// injected (see [`PackageIndex::resolve_all`]) so this module never
+/// imports the Snap Store client — ADR-0051: the store domain stays
+/// root-side; nau-chart depends only on nau-core and nau-infra.
+pub struct PinResolution {
+    pub revision: u32,
+    /// sha3-384 hex digest from the store.
+    pub sha3_384: String,
+}
+
 impl PackageIndex {
     /// Load index from file, or create default if file doesn't exist.
     pub fn load_or_default(path: &Path) -> miette::Result<Self> {
@@ -294,7 +303,12 @@ impl PackageIndex {
     ///
     /// Pins carry their channel; the image build refuses a pin whose
     /// recorded channel differs from the channel it derived (#69).
-    pub fn resolve_all(&mut self, channel: &str, bases: &[String]) -> miette::Result<()> {
+    pub fn resolve_all(
+        &mut self,
+        channel: &str,
+        bases: &[String],
+        resolve_pin: &dyn Fn(&SnapRef, &str, &str) -> miette::Result<PinResolution>,
+    ) -> miette::Result<()> {
         let archs = ["amd64", "arm64", "armhf"];
         // Collect entry info before any mutable borrow
         let entries: Vec<(String, String)> = self
@@ -315,9 +329,9 @@ impl PackageIndex {
         // (channel, label) for each pass; the label names the pass in logs.
         let mut passes: Vec<(String, String)> = vec![(channel.to_string(), "default".into())];
         for base in bases {
-            match crate::image::staging::base_track(base) {
+            match nau_core::channels::base_track(base) {
                 Some(track) => {
-                    let pass_channel = crate::image::staging::channel_on_track(channel, track);
+                    let pass_channel = nau_core::channels::channel_on_track(channel, track);
                     passes.push((pass_channel, format!("base {base}")));
                 }
                 None => eprintln!(
@@ -330,13 +344,13 @@ impl PackageIndex {
         for (name, store_name) in &entries {
             for (pass_channel, pass_label) in &passes {
                 for arch in &archs {
-                    let pin = crate::snap::SnapRef {
+                    let pin = nau_core::snap_types::SnapRef {
                         name: store_name.to_string(),
                         revision: None,
                         sha3_384: None,
                     };
 
-                    match StoreClient::resolve(&pin, pass_channel, arch) {
+                    match resolve_pin(&pin, pass_channel, arch) {
                         Ok(resolved) => {
                             let entry = self.find_mut(name).unwrap();
                             let pins = entry.pins.get_or_insert_with(HashMap::new);
@@ -861,7 +875,7 @@ mod tests {
         };
         let meta = PackageIndex::entry_to_snap_meta(&entry).unwrap();
         match meta.source {
-            Some(crate::snap::SourceSpec::Unverified(url)) => {
+            Some(nau_core::snap_types::SourceSpec::Unverified(url)) => {
                 assert_eq!(url, "https://example.com/hello.tar.gz");
             }
             other => panic!("expected an unverified source, got {other:?}"),

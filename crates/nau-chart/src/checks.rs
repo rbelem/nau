@@ -98,7 +98,7 @@ impl Finding {
 pub struct PodPackageMeta {
     pub spec: String,
     pub name: String,
-    pub meta: Option<crate::snap::SnapMeta>,
+    pub meta: Option<nau_core::snap_types::SnapMeta>,
 }
 
 /// The pod half of the lint input (populated by `nau lint --pod`).
@@ -123,7 +123,7 @@ pub struct LintInput<'a> {
     /// Outputs that validated as snap declarations, keyed by output name.
     pub outputs: &'a crate::lua::Outputs,
     /// Outputs that validated as image declarations, keyed by name.
-    pub images: &'a HashMap<String, crate::image::ImageDeclaration>,
+    pub images: &'a HashMap<String, nau_core::manifest_ir::ImageDeclaration>,
     /// The worker's raw per-key eval JSON, PRE-Rust-validation — checks
     /// that must see values validation rejects (e.g. `bootloader.type`)
     /// read here. Every key of `outputs`/`images` also appears here.
@@ -212,7 +212,7 @@ pub fn has_errors(findings: &[Finding]) -> bool {
 
 /// The lenient view of an image declaration, read straight off the worker's
 /// raw JSON. `bootloader.type = "grub"` and other shapes Rust-side
-/// validation rejects never reach [`crate::image::ImageDeclaration`] — they
+/// validation rejects never reach [`nau_core::manifest_ir::ImageDeclaration`] — they
 /// are exactly what the linter must still see.
 struct RawImage {
     base: Option<String>,
@@ -381,7 +381,7 @@ fn audit_snap_pins(
     const CHECK: &str = "dead-store-pin";
     let mut findings = Vec::new();
     let (derived, _override) = if base_tracked {
-        crate::image::staging::image_snap_channel(input.channel, base, explicit)
+        nau_core::channels::image_snap_channel(input.channel, base, explicit)
     } else {
         (input.channel.to_string(), false)
     };
@@ -448,7 +448,7 @@ fn audit_snap_pins(
 ///
 /// For every image-referenced store snap the check derives the effective
 /// channel exactly as the build does — kernel/gadget ride the base track
-/// ([`crate::image::staging::image_snap_channel`]), base/extra use the
+/// ([`nau_core::channels::image_snap_channel`]), base/extra use the
 /// lint channel verbatim — then audits the index pins for that arch:
 ///
 /// - a keyed pin whose recorded channel disagrees with its key is trusted
@@ -668,7 +668,7 @@ fn check_bootloader_type(input: &LintInput) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (key, img) in raw_images(input) {
         if let Some(t) = &img.bootloader_type {
-            if t != "systemd-boot" && t != crate::image::BOOTLOADER_PIBOOT {
+            if t != "systemd-boot" && t != nau_core::channels::BOOTLOADER_PIBOOT {
                 findings.push(Finding::new(
                     CHECK,
                     key,
@@ -736,7 +736,11 @@ fn base_guaranteed(interp: &str) -> bool {
 }
 
 /// Findings for one package's staged scripts.
-fn package_shebang_findings(key: &str, meta: &crate::snap::SnapMeta, stage: &Path) -> Vec<Finding> {
+fn package_shebang_findings(
+    key: &str,
+    meta: &nau_core::snap_types::SnapMeta,
+    stage: &Path,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     for rel in staged_scripts(stage) {
         let path = stage.join(&rel);
@@ -983,7 +987,7 @@ mod tests {
     use super::*;
     use crate::index::{IndexEntry, PinEntry, StoreRef};
     use crate::lua::Outputs;
-    use crate::snap::SnapMeta;
+    use nau_core::snap_types::SnapMeta;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -1089,7 +1093,7 @@ mod tests {
     struct Builder {
         raw: BTreeMap<String, serde_json::Value>,
         outputs: Outputs,
-        images: HashMap<String, crate::image::ImageDeclaration>,
+        images: HashMap<String, nau_core::manifest_ir::ImageDeclaration>,
         unparsed: Vec<String>,
         index: PackageIndex,
     }
@@ -1561,7 +1565,7 @@ mod tests {
     fn meta_with_apps(name: &str, apps: &[(&str, bool)]) -> SnapMeta {
         let mut meta = bare_meta(name);
         for (app, desktop) in apps {
-            let mut a = crate::snap::SnapApp {
+            let mut a = nau_core::snap_types::SnapApp {
                 command: format!("bin/{app}"),
                 daemon: None,
                 plugs: None,

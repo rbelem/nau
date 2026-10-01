@@ -1,0 +1,25 @@
+[package]
+name = "nau-infra"
+version = "0.1.0"
+edition = "2021"
+description = "nau's non-domain leaf: terminal presentation and external-tool provisioning (ADR-0053)"
+license = "GPL-3.0-only"
+
+[dependencies]
+# output.rs: progress bars and colored status lines.
+indicatif = "0.18"
+owo-colors = "4"
+# Structured (--json) output records.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# tools.rs: sha256 verification of provisioned artifacts.
+sha2 = "0.10"
+# tools.rs: staged temp files and atomic pointer flips.
+tempfile = "3"
+# tools.rs: parsing the in-tree tools-manifest.toml.
+toml = "0.8"
+# tools.rs: native HTTPS for fetching pinned tool binaries (issue #101):
+# rustls TLS (`tls` feature, webpki roots bundled — no reliance on the
+# host trust store); the gzip/json/charset defaults are dead weight for
+# streaming raw binaries — off.
+ureq = { version = "2", default-features = false, features = ["tls"] }

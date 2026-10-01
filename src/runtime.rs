@@ -634,12 +634,19 @@ impl RuntimeStore {
         self.root.join("store")
     }
 
+    /// The content-blob store seam (`nau_core::blob_store`, issue #326):
+    /// the on-disk layout knowledge lives in the core crate so the chart
+    /// dep-fetcher can materialize closures without importing this module.
+    pub(crate) fn blob_store(&self) -> nau_core::blob_store::BlobStore {
+        nau_core::blob_store::BlobStore::new(self.store_dir())
+    }
+
     /// Path of the content blob with hash `sha256` (`store/<aa>/<sha>`).
     /// Public for the pod farm emitter, whose farm entries are direct
-    /// symlinks into the store.
+    /// symlinks into the store. Delegates to [`Self::blob_store`] — no
+    /// duplicated layout.
     pub fn blob_path(&self, sha256: &str) -> PathBuf {
-        let (aa, _) = sha256.split_at(2.min(sha256.len()));
-        self.store_dir().join(aa).join(sha256)
+        self.blob_store().blob_path(sha256)
     }
 
     fn active_link(&self) -> PathBuf {
@@ -1356,7 +1363,7 @@ impl RuntimeStore {
     fn ingest_icon(&self, extract: &Path, icon_rel: &str) -> miette::Result<DesktopIcon> {
         let path = payload_subpath(extract, icon_rel)?;
         let sha256 = sha256_file(&path)?;
-        self.blob_store(&path, &sha256)?;
+        self.blob_content_address(&path, &sha256)?;
         let ext = Path::new(icon_rel)
             .extension()
             .and_then(|e| e.to_str())
@@ -1458,14 +1465,16 @@ impl RuntimeStore {
         entries: &mut Vec<TreeEntry>,
     ) -> miette::Result<()> {
         let sha256 = sha256_file(path)?;
-        self.blob_store(path, &sha256)?;
+        self.blob_content_address(path, &sha256)?;
         entries.push(TreeEntry::Blob { rel, sha256 });
         Ok(())
     }
 
     /// Content-address one file into the store: store/<aa>/<sha256>.
     /// Present blobs are kept (dedup across payloads and generations).
-    fn blob_store(&self, src: &Path, sha256: &str) -> miette::Result<()> {
+    /// (Renamed from `blob_store`: that name now hands out the
+    /// `nau_core::blob_store` seam handle, issue #326.)
+    fn blob_content_address(&self, src: &Path, sha256: &str) -> miette::Result<()> {
         let dest = self.blob_path(sha256);
         if dest.exists() {
             return Ok(());

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::lock::{InputLockEntry, LockFile, SubmoduleLockEntry};
-use crate::snap::{PackageInput, SubmoduleSpec};
+use nau_core::snap_types::{PackageInput, SubmoduleSpec};
 
 // ── Cache paths ──
 
@@ -1281,6 +1281,117 @@ pub fn iter_packages() -> Vec<String> {
 }
 
 // ── Tests ──
+
+// ── The default package input (issue #326) ──
+
+/// The default package input map: one `github:rbelem/nau/main` entry
+/// under [`DEFAULT_INPUT_NAME`]. Moved from the root `build_orch.rs` —
+/// it is pkg-source vocabulary (the chart lock/eval paths build on it);
+/// build_orch re-exports it.
+pub fn default_input_map() -> HashMap<String, PackageInput> {
+    let mut m = HashMap::new();
+    m.insert(
+        DEFAULT_INPUT_NAME.to_string(),
+        PackageInput {
+            url: DEFAULT_INPUT_URL.to_string(),
+            submodules: None,
+        },
+    );
+    m
+}
+
+// ── In-process tarball extraction (issue #170 seam; moved from root snap.rs, #326) ──
+
+/// Find the single top-level directory in a path (the source root
+/// after extracting a tarball). If there's more than one entry or
+/// no entry, returns None.
+/// Extract one source archive into `dest` (issue #170).
+///
+/// Tarballs are unpacked IN-PROCESS with the `tar` crate (the same seam
+/// `dep_fetch` uses for npm closures): gzip via `flate2`, xz via `xz2`,
+/// plain tar raw. Extraction must never depend on whatever `tar` binary
+/// the caller's PATH carries — pod builds run inside user environments
+/// (`nau run --pod …`) whose PATH may shadow GNU tar with an
+/// implementation that cannot read the archives real recipes pin
+/// (observed: busybox tar rejects the rust dist tarball's 128 MiB
+/// LZMA2 dictionary with an instant "corrupted data / short read",
+/// while the SHA-256 of the same bytes verified clean).
+///
+/// Permissions, symlinks, and hardlinks are preserved; `unpack` refuses
+/// path-escaping entries, so this is also the safer extractor. Archives
+/// in formats the crates do not cover (bz2, zst, …) fall back to the
+/// external `tar` spawn — the pre-#170 behavior for those extensions.
+pub fn extract_tarball(archive: &Path, dest: &Path) -> miette::Result<()> {
+    let filename = archive.to_string_lossy();
+    let result = if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
+        let file = std::fs::File::open(archive)
+            .map_err(|e| miette::miette!("opening {}: {e}", archive.display()))?;
+        unpack_tar(flate2::read::GzDecoder::new(file), dest)
+    } else if filename.ends_with(".tar.xz") {
+        let file = std::fs::File::open(archive)
+            .map_err(|e| miette::miette!("opening {}: {e}", archive.display()))?;
+        unpack_tar(xz2::read::XzDecoder::new(file), dest)
+    } else if filename.ends_with(".tar") {
+        let file = std::fs::File::open(archive)
+            .map_err(|e| miette::miette!("opening {}: {e}", archive.display()))?;
+        unpack_tar(file, dest)
+    } else {
+        extract_tarball_external(archive, dest)
+    };
+    result.map_err(|e| miette::miette!("extracting {}: {e}", archive.display()))
+}
+
+/// Decode `reader` as a tar archive and unpack it into `dest`.
+fn unpack_tar<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    archive.set_preserve_permissions(true);
+    archive.unpack(dest)
+}
+
+/// The external-`tar` fallback for formats the in-process crates do not
+/// cover. Same spawn the pre-#170 code used for every archive.
+fn extract_tarball_external(archive: &Path, dest: &Path) -> std::io::Result<()> {
+    let tar = tar_tool().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let status = std::process::Command::new(&tar)
+        .arg("xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("tar exited with {}", status)))
+    }
+}
+
+/// The `tar` binary through the tools module: the external fallback only
+/// fires for formats the in-process crates do not cover, so plain
+/// resolution (PATH-first with the provisioned fallback) matches the
+/// root snap.rs `floor_tool` contract this code was moved from.
+fn tar_tool() -> miette::Result<std::path::PathBuf> {
+    let resolved = nau_infra::tools::resolve(nau_infra::tools::ToolName::Tar).map_err(|e| {
+        miette::miette!("resolve {Tar}: {e}", Tar = nau_infra::tools::ToolName::Tar)
+    })?;
+    Ok(match resolved {
+        nau_infra::tools::ResolvedTool::Provisioned { path, .. }
+        | nau_infra::tools::ResolvedTool::Path { path, .. } => path,
+    })
+}
+
+/// Human-readable old→new line for one refreshed input pin.
+pub fn pin_update_line(u: &InputPinUpdate) -> String {
+    let short = |s: &Option<String>| s.as_deref().map(|r| r.get(..7).unwrap_or(r).to_string());
+    if u.local {
+        return format!("{}: local (unlocked)", u.name);
+    }
+    match (short(&u.old), short(&u.new)) {
+        (Some(old), Some(new)) if old != new => format!("{}: {} -> {}", u.name, old, new),
+        (Some(rev), _) => format!("{}: {} (unchanged)", u.name, rev),
+        (None, Some(new)) => format!("{}: new pin {}", u.name, new),
+        (None, None) => format!("{}: no revision resolved", u.name),
+    }
+}
 
 #[cfg(test)]
 mod tests {

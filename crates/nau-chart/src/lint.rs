@@ -20,8 +20,8 @@
 use std::collections::BTreeMap;
 
 use crate::lua::Outputs;
-use crate::snap::SnapPlug;
-use crate::units::{self, AppUnitSpec, DaemonUnit, PlugRef};
+use nau_core::snap_types::SnapPlug;
+use nau_core::units::{self, AppUnitSpec, DaemonUnit, PlugRef};
 
 /// One lint finding: the output key it belongs to plus the message.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,7 +63,7 @@ pub fn tier1_missing(unit: &DaemonUnit) -> Vec<String> {
 }
 
 /// Convert a snap's typed plugs into planner plug refs.
-fn plug_refs(meta: &crate::snap::SnapMeta) -> Vec<PlugRef> {
+fn plug_refs(meta: &nau_core::snap_types::SnapMeta) -> Vec<PlugRef> {
     let mut refs = Vec::new();
     for (name, plug) in meta.plugs.iter().flatten() {
         match plug {
@@ -98,13 +98,13 @@ pub fn confinement_lint(outputs: &Outputs) -> Vec<LintWarning> {
 }
 
 /// Lint one strict-confinement snap.
-fn lint_one(key: &str, meta: &crate::snap::SnapMeta) -> LintWarning {
+fn lint_one(key: &str, meta: &nau_core::snap_types::SnapMeta) -> LintWarning {
     let snap_plugs = plug_refs(meta);
     let mut dropped: Vec<String> = Vec::new();
     let mut oracle_notes: Vec<String> = Vec::new();
 
     // Deterministic app order.
-    let mut apps: Vec<(&String, &crate::snap::SnapApp)> = meta.apps.iter().collect();
+    let mut apps: Vec<(&String, &nau_core::snap_types::SnapApp)> = meta.apps.iter().collect();
     apps.sort_by(|a, b| a.0.cmp(b.0));
 
     for (app_name, app) in &apps {
@@ -226,7 +226,7 @@ fn oracle_note(unit: &DaemonUnit) -> String {
 /// non-empty base, `None` otherwise (`node22` → `node`, `foo` → `None`,
 /// `22` → `None`, `foo2bar` → `None`). Shared with the farm collision
 /// vocabulary, which points at `name@constraint` for version-line pairs.
-pub(crate) fn split_version_suffix(name: &str) -> Option<&str> {
+pub fn split_version_suffix(name: &str) -> Option<&str> {
     let base = name.trim_end_matches(|c: char| c.is_ascii_digit());
     if base.is_empty() || base.len() == name.len() {
         None
@@ -282,7 +282,7 @@ pub fn lint_json(warnings: &[LintWarning]) -> Vec<BTreeMap<&'static str, String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snap::{SnapApp, SnapMeta};
+    use nau_core::snap_types::{SnapApp, SnapMeta};
     use std::collections::HashMap;
 
     fn strict_meta(name: &str) -> SnapMeta {

@@ -91,18 +91,10 @@ pub(crate) fn resolve_build_outputs(
     }
 }
 
-/// The default input map used when no config file is present.
-pub(crate) fn default_input_map() -> HashMap<String, PackageInput> {
-    let mut m = HashMap::new();
-    m.insert(
-        crate::pkg_source::DEFAULT_INPUT_NAME.to_string(),
-        PackageInput {
-            url: crate::pkg_source::DEFAULT_INPUT_URL.to_string(),
-            submodules: None,
-        },
-    );
-    m
-}
+// Moved to nau-chart::pkg_source with the input vocabulary it names
+// (issue #326). Re-exported so every
+// `crate::build_orch::default_input_map` path keeps resolving.
+pub use nau_chart::pkg_source::default_input_map;
 
 /// Handle `--update` and first-build pin recording for package inputs,
 /// saving the lockfile when it changed. Returns the lockfile to resolve
@@ -1440,19 +1432,9 @@ fn persist_build_deps_pins(
     Ok(())
 }
 
-/// Human-readable old→new line for one refreshed input pin.
-pub(crate) fn pin_update_line(u: &crate::pkg_source::InputPinUpdate) -> String {
-    let short = |s: &Option<String>| s.as_deref().map(|r| r.get(..7).unwrap_or(r).to_string());
-    if u.local {
-        return format!("{}: local (unlocked)", u.name);
-    }
-    match (short(&u.old), short(&u.new)) {
-        (Some(old), Some(new)) if old != new => format!("{}: {} -> {}", u.name, old, new),
-        (Some(rev), _) => format!("{}: {} (unchanged)", u.name, rev),
-        (None, Some(new)) => format!("{}: new pin {}", u.name, new),
-        (None, None) => format!("{}: no revision resolved", u.name),
-    }
-}
+// Moved to nau-chart::pkg_source beside InputPinUpdate (issue #326).
+// Re-exported so crate::build_orch::pin_update_line keeps resolving.
+pub use nau_chart::pkg_source::pin_update_line;
 
 #[cfg(test)]
 mod tests {

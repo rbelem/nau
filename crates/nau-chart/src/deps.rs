@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::snap::SnapMeta;
+use nau_core::snap_types::SnapMeta;
 
 /// A resolved dependency node with its transitive closure.
 #[derive(Debug, Clone)]
@@ -750,7 +750,7 @@ mod tests {
     fn init_local_input_source(root: &Path) {
         crate::pkg_source::init_global_inputs(&HashMap::from([(
             "test".to_string(),
-            crate::snap::PackageInput {
+            nau_core::snap_types::PackageInput {
                 url: format!("path:{}", root.display()),
                 submodules: None,
             },
