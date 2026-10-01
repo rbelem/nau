@@ -6201,15 +6201,18 @@ fn build_pending_snap(
     let downloads = store.downloads_dir();
     std::fs::create_dir_all(&downloads)
         .map_err(|e| miette::miette!("creating {}: {e}", downloads.display()))?;
+    // Issue #9: a pod build supplies its store so build-time interpreter
+    // wrappers can bake the script's content-addressed store path. The
+    // build path takes the crate-agnostic `nau_core::blob_store` seam
+    // handle (issue #326 PR 2), not the runtime store itself.
+    let blob_store = store.blob_store();
     let result = crate::snap::build_snap(
         meta,
         stage.path(),
         &downloads,
         crate::snap::host_arch(),
         crate::snap::StagePolicy::Default,
-        // Issue #9: a pod build supplies its store so build-time interpreter
-        // wrappers can bake the script's content-addressed store path.
-        Some(store),
+        Some(&blob_store),
         deps_dir.as_ref().map(|d| d.path()),
         build_prefix.as_ref().map(|p| p.path()),
         scan_listings.as_ref(),
@@ -6342,15 +6345,18 @@ fn ensure_pod_dep_payload(
 
     let stage =
         tempfile::tempdir().map_err(|e| miette::miette!("temp stage dir for {name}: {e}"))?;
+    // Same pod-store treatment as any pod build (issue #9 wrappers,
+    // #12 ELF repair): the payload may expose host-run binaries. The
+    // build path takes the `nau_core::blob_store` seam handle (issue
+    // #326 PR 2), not the runtime store itself.
+    let blob_store = store.blob_store();
     let result = crate::snap::build_snap(
         dep_meta,
         stage.path(),
         &downloads,
         crate::snap::host_arch(),
         crate::snap::StagePolicy::Default,
-        // Same pod-store treatment as any pod build (issue #9 wrappers,
-        // #12 ELF repair): the payload may expose host-run binaries.
-        Some(store),
+        Some(&blob_store),
         None,
         dep_prefix.as_ref().map(|p| p.path()),
         scan_listings.as_ref(),
