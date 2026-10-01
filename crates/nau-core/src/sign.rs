@@ -1033,3 +1033,61 @@ pub fn verify_one(
     vk.verify(manifest_bytes, &sig)
         .map_err(|_| miette::miette!("signature verification FAILED for key id {key_id}"))
 }
+
+// ── Device trust-anchor paths (issue #326 PR 4 down-move) ──
+//
+// The embedded-key-set walk the runtime install path and the peer pull
+// lane share: the same anchor directory layout, the same unioned
+// revocation view (ADR-0024 §4, ADR-0033 Decision 7).
+
+/// The embedded-key-set directory beside a device anchor: for
+/// `/etc/nau/update-key.pub` that is `/etc/nau/trusted-keys/`.
+pub fn trusted_keys_dir(anchor: &Path) -> PathBuf {
+    anchor
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("trusted-keys")
+}
+
+/// Read the device revocation list beside the anchor, unioned with the
+/// operator list under the keychain dir. A missing file is an empty list;
+/// the operator side is the local `revoked-keys` the key ceremony writes.
+/// Shared with the peer verify path (ADR-0033 Decision 7) so both lanes
+/// police the same unioned revocation set.
+pub fn embedded_revoked_keys(anchor: &Path, keys: &Path) -> miette::Result<Vec<String>> {
+    let mut revoked = Vec::new();
+    let device = anchor
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("revoked-keys");
+    if let Ok(text) = std::fs::read_to_string(&device) {
+        revoked.extend(parse_revoked_keys(&text, &device)?);
+    }
+    revoked.extend(read_revoked_keys(keys)?);
+    revoked.sort();
+    revoked.dedup();
+    Ok(revoked)
+}
+
+/// Parse a revocation list body: one 16-hex key id per line, `#` comments
+/// and blanks skipped. Malformed lines are named errors — a corrupt
+/// revocation list is never treated as empty (that would silently bless
+/// revoked keys).
+fn parse_revoked_keys(text: &str, path: &Path) -> miette::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.len() != 16 || !line.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(miette::miette!(
+                "revocation list {} line {} is not a 16-hex key id: {line:?}",
+                path.display(),
+                n + 1
+            ));
+        }
+        ids.push(line.to_ascii_lowercase());
+    }
+    Ok(ids)
+}

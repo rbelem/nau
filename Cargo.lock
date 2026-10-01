@@ -1741,6 +1741,7 @@ dependencies = [
  "nau-core",
  "nau-image",
  "nau-infra",
+ "nau-ship",
  "pgp",
  "rand",
  "rsa",
@@ -1858,6 +1859,18 @@ dependencies = [
  "toml",
  "ureq",
  "xz2",
+]
+
+[[package]]
+name = "nau-ship"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "nau-core",
+ "nau-infra",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

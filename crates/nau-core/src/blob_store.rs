@@ -29,6 +29,13 @@ impl BlobStore {
         self.root.join(aa).join(sha256)
     }
 
+    /// The store root this handle was built over (the parent of the
+    /// `<aa>` shard dirs) — the pull lane derives sibling layout paths
+    /// (the manifest inbox) from it.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Write `bytes` into the store content-addressed by their sha256
     /// (atomic: temp file + rename). Returns the hash. Idempotent: an
     /// already-present blob short-circuits.

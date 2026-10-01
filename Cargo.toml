@@ -15,6 +15,7 @@ members = [
     "crates/nau-chart",
     "crates/nau-build",
     "crates/nau-image",
+    "crates/nau-ship",
 ]
 resolver = "2"
 
@@ -38,6 +39,9 @@ nau-build = { path = "crates/nau-build" }
 # The image domain (issue #326 PR 3): the UC image build/verify pipeline,
 # the release media, the UC seed, the app-runtime unit emission.
 nau-image = { path = "crates/nau-image" }
+# The ship domain (issue #326 PR 4): the OCI registry client, the pull
+# reference grammar, the peer/static pull transport lane.
+nau-ship = { path = "crates/nau-ship" }
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["luau"] }
 miette = { version = "7", features = ["fancy"] }

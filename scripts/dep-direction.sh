@@ -28,6 +28,9 @@
 #   nau-image  {nau-core, nau-infra}   — the image domain; dev-edge:
 #              nau-chart (§4 image_declaration_from_lua + INIT_LUA in
 #              tests; expires at the final reconciliation, ADR-0053)
+#   nau-ship   {nau-core, nau-infra}   — the ship domain (no dev-edge:
+#              the moved tests are RuntimeStore-fixture tests that stay
+#              root; nau-ship's own tests use core + infra only)
 #   nau (root) exempt                  — the root composes everything
 set -euo pipefail
 
@@ -47,6 +50,7 @@ allowed_normal() {
         nau-chart)  echo "nau-core nau-infra" ;;
         nau-build)  echo "nau-core nau-infra" ;;
         nau-image)  echo "nau-core nau-infra" ;;
+        nau-ship)   echo "nau-core nau-infra" ;;
         *)          return 1 ;;
     esac
 }

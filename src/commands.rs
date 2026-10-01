@@ -2288,7 +2288,11 @@ fn cmd_pull(
     if install {
         let install_report = install_pulled(&report, state_dir.as_deref())?;
         print_install_summary(&install_report);
-        report.install = Some(install_report);
+        // Serialize the runtime record into the report field here (the
+        // ship crate's report carries an opaque JSON value — issue #326
+        // PR 4, §5 record-shape rule). `to_value` of the Serialize struct
+        // is the exact JSON `--json` has always emitted for this field.
+        report.install = Some(serde_json::to_value(&install_report).into_diagnostic()?);
     }
     print_report(&report);
     Ok(())
