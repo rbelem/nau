@@ -1,0 +1,20 @@
+[package]
+name = "nau-ship"
+version = "0.1.0"
+edition = "2021"
+description = "nau's ship domain: the OCI registry client, pull reference grammar, and the peer/static pull transport lane (ADR-0051, ADR-0053)"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The spine (ADR-0051 Decision 3): store vocabulary, cache keys, the
+# package manifest wire schema, the keychain, the blob-store seam.
+nau-core = { path = "../nau-core" }
+# The mechanism leaf (issue #326): command seam, tool provisioning,
+# output, the store client's digest helpers.
+nau-infra = { path = "../nau-infra" }
+# Error vocabulary (unified with the root's fancy feature).
+miette = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Client scratch space (the packed-bundle staging dir).
+tempfile = "3"

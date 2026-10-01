@@ -11,3 +11,8 @@ pub const DEFAULT_STATE_DIR: &str = "/var/lib/nau";
 
 /// Sysext link directory the extensions link dir defaults to.
 pub const DEFAULT_EXTENSIONS_LINK_DIR: &str = "/var/lib/extensions";
+
+/// On-device trust anchor embedded at image build time (ADR-0011 step
+/// (d)); its siblings `trusted-keys/` and `revoked-keys` are consulted
+/// beside it (see `nau_core::sign`). The runtime re-exports this.
+pub const DEVICE_ANCHOR: &str = "/etc/nau/update-key.pub";

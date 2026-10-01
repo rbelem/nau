@@ -112,8 +112,10 @@ use nau_core::units::{
 // #326 PR 3, R4: the image state layer names the same defaults).
 pub use nau_core::paths::{DEFAULT_EXTENSIONS_LINK_DIR, DEFAULT_STATE_DIR};
 
-/// On-device trust anchor embedded at image build time (ADR-0011 step (d)).
-pub const DEVICE_ANCHOR: &str = "/etc/nau/update-key.pub";
+/// On-device trust anchor embedded at image build time (ADR-0011 step
+/// (d)). Moved DOWN into `nau_core::paths` (issue #326 PR 4); the peer
+// pull lane names the same anchor.
+pub use nau_core::paths::DEVICE_ANCHOR;
 
 // ── Generation model ──
 
@@ -219,38 +221,11 @@ pub struct InstalledPackage {
 }
 
 /// One GUI app's desktop-launcher metadata (issue #7).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DesktopLauncher {
-    /// `Name=` of the source `.desktop` file (falls back to the app id
-    /// in the generated entry when absent).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// `GenericName=` of the source file, passed through.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generic_name: Option<String>,
-    /// `Comment=` of the source file, passed through.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-    /// Menu categories, split from the source file's `Categories=`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub categories: Vec<String>,
-    /// `Icon=` of the source file, passed through ONLY when the package
-    /// ships no icon blob (a theme icon name); when the package ships
-    /// one, the emitter substitutes the pod-namespaced link name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub icon_ref: Option<String>,
-    /// The package's shipped icon, ingested into the store at install
-    /// time and linked by the launcher emitter.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub icon: Option<DesktopIcon>,
-}
-
-/// An icon blob in the content store plus its file extension.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DesktopIcon {
-    pub sha256: String,
-    pub ext: String,
-}
+///
+/// Moved DOWN into `nau_core::pkg_manifest` (issue #326 PR 4, beside
+/// `AppAssembly`); re-exported so every
+/// `crate::runtime::DesktopLauncher` path keeps resolving.
+pub use nau_core::pkg_manifest::{DesktopIcon, DesktopLauncher};
 
 /// One bootable selection: base version + package set + content hashes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2300,57 +2275,10 @@ fn verify_against_anchors(
     }
 }
 
-/// The embedded-key-set directory beside a device anchor: for
-/// `/etc/nau/update-key.pub` that is `/etc/nau/trusted-keys/`.
-pub(crate) fn trusted_keys_dir(anchor: &Path) -> PathBuf {
-    anchor
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("trusted-keys")
-}
-
-/// Read the device revocation list beside the anchor, unioned with the
-/// operator list under the keychain dir. A missing file is an empty list;
-/// the operator side is the local `revoked-keys` the key ceremony writes.
-/// Shared with the peer verify path (ADR-0033 Decision 7) so both lanes
-/// police the same unioned revocation set.
-pub(crate) fn embedded_revoked_keys(anchor: &Path, keys: &Path) -> miette::Result<Vec<String>> {
-    let mut revoked = Vec::new();
-    let device = anchor
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("revoked-keys");
-    if let Ok(text) = std::fs::read_to_string(&device) {
-        revoked.extend(parse_revoked_keys(&text, &device)?);
-    }
-    revoked.extend(crate::sign::read_revoked_keys(keys)?);
-    revoked.sort();
-    revoked.dedup();
-    Ok(revoked)
-}
-
-/// Parse a revocation list body: one 16-hex key id per line, `#` comments
-/// and blanks skipped. Malformed lines are named errors — a corrupt
-/// revocation list is never treated as empty (that would silently bless
-/// revoked keys).
-fn parse_revoked_keys(text: &str, path: &Path) -> miette::Result<Vec<String>> {
-    let mut ids = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.len() != 16 || !line.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(miette::miette!(
-                "revocation list {} line {} is not a 16-hex key id: {line:?}",
-                path.display(),
-                n + 1
-            ));
-        }
-        ids.push(line.to_ascii_lowercase());
-    }
-    Ok(ids)
-}
+// The embedded-key-set walk moved DOWN into `nau_core::sign` (issue
+// #326 PR 4): the peer pull lane polices the same unioned revocation
+// view. Re-exported so every `crate::runtime::` path keeps resolving.
+pub use nau_core::sign::{embedded_revoked_keys, trusted_keys_dir};
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

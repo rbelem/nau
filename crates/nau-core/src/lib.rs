@@ -16,6 +16,7 @@ pub mod index;
 pub mod lock;
 pub mod manifest_ir;
 pub mod paths;
+pub mod pkg_manifest;
 pub mod pkg_source;
 pub mod plugins;
 pub mod sign;

@@ -30,10 +30,32 @@ const KEY_PREFIX: &str = "v4";
 /// Target value for builds without an explicit cross-compilation triplet.
 const NATIVE_TARGET: &str = "native";
 
-/// SHA-256 hex digest of a string.
-pub fn sha256_hex(input: &str) -> String {
-    let hash = sha2::Sha256::digest(input.as_bytes());
+/// SHA-256 hex digest — of a string, of in-memory bytes (`impl
+/// AsRef<[u8]>` covers both; issue #326 PR 4 folded the OCI client's
+/// byte-slice variant into this one so the vocabulary has one home).
+pub fn sha256_hex(input: impl AsRef<[u8]>) -> String {
+    let hash = sha2::Sha256::digest(input.as_ref());
     hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Hex sha256 of a file (streaming, memory-efficient) — the sha2 twin of
+/// `sha3_384_file` (issue #326 PR 4: the OCI client's streaming digest
+/// is store/cache vocabulary).
+pub fn sha256_file(path: &std::path::Path) -> miette::Result<String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| miette::miette!("failed to open {}: {e}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)
+            .map_err(|e| miette::miette!("failed to read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let hash = hasher.finalize();
+    Ok(hash.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// One member of the resolved `requires` closure.
@@ -190,7 +212,7 @@ impl BuildClosure {
 
     /// Version-prefixed cache key: `v4:<sha256 of canonical JSON>`.
     pub fn cache_key(&self) -> String {
-        format!("{}:{}", KEY_PREFIX, sha256_hex(&self.canonical_json()))
+        format!("{}:{}", KEY_PREFIX, sha256_hex(self.canonical_json()))
     }
 }
 
@@ -231,7 +253,7 @@ fn source_identity_hash(meta: &SnapMeta) -> String {
                 .as_ref()
                 .map(|s| s.url().to_string())
                 .unwrap_or_default();
-            sha256_hex(&format!("{}:{}:{}", meta.name, meta.version, url))
+            sha256_hex(format!("{}:{}:{}", meta.name, meta.version, url))
         }
         _ => NO_SOURCE_HASH.to_string(),
     }

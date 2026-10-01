@@ -290,27 +290,11 @@ pub fn read_generation_secrets(
 /// binary's directory and reproduce the payload layout the binary
 /// resolves against. Empty maps mean the payload ships the binary
 /// alone — nothing recorded, the farm keeps the bare direct link.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct AppAssembly {
-    /// In-payload path of the app's command binary (e.g.
-    /// `usr/bin/git-credential-manager`).
-    pub binary: String,
-    /// Files beside the binary: path relative to the binary's payload
-    /// directory → sha256 of the content blob in the store.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub files: BTreeMap<String, String>,
-    /// Symlinks beside the binary, recreated verbatim: relative path →
-    /// link target (never followed — payload links stay payload-scoped).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub links: BTreeMap<String, String>,
-}
-
-impl AppAssembly {
-    /// Whether the payload ships this app's binary alone.
-    pub fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.links.is_empty()
-    }
-}
+///
+/// Moved DOWN into `nau_core::pkg_manifest` (issue #326 PR 4: install-
+/// record vocabulary shared with the package manifest); re-exported so
+/// every `crate::farm::AppAssembly` path keeps resolving.
+pub use nau_core::pkg_manifest::AppAssembly;
 
 /// The generation's assembly area: `<root>/generations/<n>/apps`.
 pub fn assembly_dir(store: &RuntimeStore, n: u64) -> PathBuf {
