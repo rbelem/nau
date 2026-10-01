@@ -1,0 +1,46 @@
+[package]
+name = "nau-build"
+version = "0.1.0"
+edition = "2021"
+description = "nau's build domain: snap build machinery, build cache, build prefixes, leak scanning, the source cache (ADR-0051, ADR-0053)"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The spine (ADR-0051 Decision 3): snap value types, manifest IR, the blob
+# store seam, plugin machinery, the cache-key vocabulary, lockfiles, the
+# pure unit planner.
+nau-core = { path = "../nau-core" }
+# The non-domain leaf (issue #326): terminal presentation, external-tool
+# provisioning, the archive extraction quad.
+nau-infra = { path = "../nau-infra" }
+# Error vocabulary (unified with the root's fancy feature).
+miette = "7"
+# Content hashes: source digests, wrapper blob paths.
+sha2 = "0.10"
+# The resolved-recipe digest (`SnapMetaDigest`, issue #113) and the
+# store-ingest digest in the zstd-reproducibility test.
+sha3 = "0.10"
+# Content-addressed source cache sizing and staging.
+tempfile = "3"
+# Adopt-info metadata reads and the package-cache parts document.
+serde_json = "1"
+# Store-blob hash encoding in wrapper emission.
+base64 = "0.22"
+# mksquashfs stream compression.
+flate2 = "1"
+# StageLock flock + O_NOFOLLOW stage-lock opens.
+libc = "0.2"
+
+[dev-dependencies]
+# The §4 sanctioned dev-edge (ADR-0053 §4 + council amendment): the
+# build-side Lua constructors (`snap_meta_from_lua_table` and friends),
+# the `FromLua*`/`FromPinTable` extension traits, and the `dsl::prelude`
+# live in nau-chart (orphan rule) — the build's tests drive them through
+# this edge. EXPIRES at the final reconciliation PR, which dissolves the
+# traits into nau-core behind the mlua feature.
+nau-chart = { path = "../nau-chart" }
+# The tests drive the real Luau VM (recipe loading, `mlua::Value`).
+mlua = { version = "0.12", features = ["luau"] }
+# Test fixtures: tarball construction and recipe-YAML comparisons.
+tar = "0.4"
+serde_yaml = "0.9"

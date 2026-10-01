@@ -21,8 +21,10 @@
 #   nau-core   {}                      — the spine depends on nothing
 #   nau-infra  {}                      — the leaf depends on nothing
 #   nau-chart  {nau-core, nau-infra}   — the eval domain
+#   nau-build  {nau-core, nau-infra}   — the build domain; dev-edge:
+#              nau-chart (§4 constructors + dsl prelude in tests;
+#              expires at the final reconciliation, ADR-0053)
 #   nau (root) exempt                  — the root composes everything
-#   nau-build's row lands with its crate commit.
 set -euo pipefail
 
 fail() {
@@ -39,15 +41,20 @@ allowed_normal() {
         nau-core)   echo "" ;;
         nau-infra)  echo "" ;;
         nau-chart)  echo "nau-core nau-infra" ;;
+        nau-build)  echo "nau-core nau-infra" ;;
         *)          return 1 ;;
     esac
 }
 
 # dev_allowed CRATE: the NAMED dev-edge table — workspace crates allowed
-# as dev-dependencies BEYOND the crate's normal+build closure. Currently
-# empty for every crate; nau-build's row lands with its crate commit.
+# as dev-dependencies BEYOND the crate's normal+build closure.
 dev_allowed() {
     case "$1" in
+        # §4 sanctioned entry: the build tests drive the Lua constructors
+        # (snap_meta_from_lua_table & friends) and the dsl prelude through
+        # nau-chart (orphan rule pins them there). EXPIRES at the final
+        # reconciliation PR (ADR-0053).
+        nau-build)  echo "nau-chart" ;;
         *) return 1 ;;
     esac
 }

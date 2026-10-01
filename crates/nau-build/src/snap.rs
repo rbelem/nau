@@ -1,0 +1,11942 @@
+use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(test)]
+use mlua::Value;
+use sha2::Digest;
+
+use nau_infra::output;
+
+// Re-exported from the value-type home ([`nau_core::snap_types`], #316)
+// so every pre-existing `crate::snap::` path keeps compiling.
+pub use nau_core::snap_types::{
+    BackendKind, Confinement, ConfinementLevel, DepsLockSpec, LayoutEntry, PackageDeps,
+    PackageInput, PlugSlot, ServiceDaemon, ServiceDecl, SnapApp, SnapHook, SnapMeta, SnapPart,
+    SnapPlug, SnapRef, SourceSpec, SubmoduleSpec, TmpfsSpec,
+};
+
+// The source dir name lives in `nau_core::snap` (shared by the Lua parse
+// path and the source-extraction path here); the service/exec validation
+// helpers stay beside the Lua-parse machinery in `nau-chart::snap_lua`
+// (issue #326) and are re-exported by the ROOT shim — a normal
+// nau-build → nau-chart edge would breach the dep-direction table.
+pub use nau_core::snap::{
+    effective_compression, validate_compression_choice, validate_compression_level, SOURCE_DIR_NAME,
+};
+
+/// Build-side identity machinery that stays out of `nau-core`: the
+/// resolved-recipe digest (sha3 + the `feed_*` helpers below).
+pub trait SnapMetaDigest {
+    fn build_input_digest(&self) -> String;
+}
+
+// ── Build result ──
+
+/// Info about a downloaded source, for lockfile recording.
+#[derive(Debug, Clone)]
+pub struct SourceInfo {
+    pub url: String,
+    pub sha256: String,
+}
+
+/// Result of building one snap, including lockfile-relevant metadata.
+#[derive(Debug)]
+pub struct BuildResult {
+    /// The output `.snap` filename (e.g. `hello_2.10_amd64.snap`).
+    pub snap_filename: String,
+    /// The snap version actually built: the declared version, or the
+    /// version extracted at build time for adopt-info snaps (the declared
+    /// placeholder never reaches the filename).
+    pub version: String,
+    /// Source info per materialized source (one for a single `source`;
+    /// one per named tree for a `sources` map).
+    pub source_infos: Vec<SourceInfo>,
+}
+
+// ── Build-input digest (issue #113) ──
+//
+// Canonical content digest over the BUILD-RELEVANT fields of a resolved
+// recipe meta. Recorded on the installed package at install time; a
+// plain sync holds a package whose freshly resolved recipe digests
+// identically to the installed record instead of rebuilding it (the
+// content hold in `pod.rs`). Deliberately NOT serde serialization of
+// the whole struct: many build fields are `#[serde(skip)]` and several
+// carried fields (summary, compression, aliases) are not build inputs.
+//
+// The contract is DETERMINISM, not secrecy: the same recipe must digest
+// identically across processes. The stream is length-prefixed fields in
+// a fixed order; `HashMap`-backed fields (`apps`, `inputs`) are fed in
+// sorted key order — Rust HashMap iteration order is randomized per
+// process and would otherwise flip the digest run to run.
+
+/// Feed a length-prefixed byte string into the canonical stream.
+fn feed_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Feed a length-prefixed UTF-8 string.
+fn feed_str(buf: &mut Vec<u8>, s: &str) {
+    feed_bytes(buf, s.as_bytes());
+}
+
+/// Feed an optional string: a 0/1 presence tag, then the value.
+fn feed_opt_str(buf: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(v) => {
+            buf.push(1);
+            feed_str(buf, v);
+        }
+        None => buf.push(0),
+    }
+}
+
+/// Feed an optional structured value: a 0/1 presence tag, then the
+/// value as encoded by `feed`.
+fn feed_opt<T, F>(buf: &mut Vec<u8>, value: Option<&T>, feed: F)
+where
+    F: Fn(&mut Vec<u8>, &T),
+{
+    match value {
+        Some(v) => {
+            buf.push(1);
+            feed(buf, v);
+        }
+        None => buf.push(0),
+    }
+}
+
+/// Feed a boolean as one byte.
+fn feed_bool(buf: &mut Vec<u8>, b: bool) {
+    buf.push(u8::from(b));
+}
+
+/// Feed a canonical JSON encoding. serde_json's object map is a
+/// BTreeMap (no `preserve_order` feature), so key order is sorted and
+/// the encoding is deterministic.
+fn feed_json(buf: &mut Vec<u8>, value: &serde_json::Value) {
+    let bytes = serde_json::to_vec(value).expect("serde_json::Value is always serializable");
+    feed_bytes(buf, &bytes);
+}
+
+/// Feed a string list in declared order — order carries meaning for
+/// declared lists (build sequencing, dependency ordering).
+fn feed_str_list(buf: &mut Vec<u8>, items: &[String]) {
+    buf.extend_from_slice(&(items.len() as u64).to_le_bytes());
+    for item in items {
+        feed_str(buf, item);
+    }
+}
+
+/// Feed a `HashMap`-backed map in SORTED key order: count, then
+/// key-sorted entries. Never iterate a HashMap directly — its order is
+/// per-process noise.
+fn feed_sorted_map<V, F>(buf: &mut Vec<u8>, map: &HashMap<String, V>, feed_value: F)
+where
+    F: Fn(&mut Vec<u8>, &V),
+{
+    let mut names: Vec<&String> = map.keys().collect();
+    names.sort();
+    buf.extend_from_slice(&(names.len() as u64).to_le_bytes());
+    for name in names {
+        feed_str(buf, name);
+        feed_value(buf, &map[name]);
+    }
+}
+
+/// The BTreeMap twin: already ordered, feed as-is.
+fn feed_ordered_map<V, F>(buf: &mut Vec<u8>, map: &BTreeMap<String, V>, feed_value: F)
+where
+    F: Fn(&mut Vec<u8>, &V),
+{
+    buf.extend_from_slice(&(map.len() as u64).to_le_bytes());
+    for (name, value) in map {
+        feed_str(buf, name);
+        feed_value(buf, value);
+    }
+}
+
+/// Feed one pinned source: variant tag + url + optional pin hash (the
+/// hash IS the source identity when pinned).
+fn feed_source(buf: &mut Vec<u8>, source: &SourceSpec) {
+    match source {
+        SourceSpec::Unverified(url) => {
+            buf.push(0);
+            feed_str(buf, url);
+        }
+        SourceSpec::Pinned { url, sha256 } => {
+            buf.push(1);
+            feed_str(buf, url);
+            feed_str(buf, sha256);
+        }
+    }
+}
+
+fn feed_source_map(buf: &mut Vec<u8>, sources: &BTreeMap<String, SourceSpec>) {
+    feed_ordered_map(buf, sources, feed_source);
+}
+
+/// Feed one build part: command, ordering edges, plugin shape.
+fn feed_part(buf: &mut Vec<u8>, part: &SnapPart) {
+    feed_str(buf, &part.build);
+    feed_str_list(buf, &part.after);
+    feed_opt_str(buf, part.plugin.as_deref());
+    feed_opt(buf, part.plugin_options.as_ref(), |buf, opts| {
+        feed_ordered_map(buf, opts, |buf, value| feed_json(buf, &value.to_json()));
+    });
+}
+
+fn feed_part_map(buf: &mut Vec<u8>, parts: &BTreeMap<String, SnapPart>) {
+    feed_ordered_map(buf, parts, feed_part);
+}
+
+fn feed_env_map(buf: &mut Vec<u8>, env: &BTreeMap<String, String>) {
+    feed_ordered_map(buf, env, |buf, value| feed_str(buf, value));
+}
+
+/// Feed one layout entry: variant tag + payload.
+fn feed_layout(buf: &mut Vec<u8>, layout: &LayoutEntry) {
+    match layout {
+        LayoutEntry::Bind(v) => {
+            buf.push(0);
+            feed_str(buf, v);
+        }
+        LayoutEntry::BindFile(v) => {
+            buf.push(1);
+            feed_str(buf, v);
+        }
+        LayoutEntry::Symlink(v) => {
+            buf.push(2);
+            feed_str(buf, v);
+        }
+        LayoutEntry::Tmpfs(TmpfsSpec::Bare(b)) => {
+            buf.push(3);
+            feed_bool(buf, *b);
+        }
+        LayoutEntry::Tmpfs(TmpfsSpec::Sized { size }) => {
+            buf.push(4);
+            feed_str(buf, size);
+        }
+    }
+}
+
+fn feed_layout_map(buf: &mut Vec<u8>, layout: &BTreeMap<String, LayoutEntry>) {
+    feed_ordered_map(buf, layout, feed_layout);
+}
+
+/// Feed one hook: the executed command plus the declared source path.
+fn feed_hook(buf: &mut Vec<u8>, hook: &SnapHook) {
+    feed_str(buf, &hook.command);
+    feed_str(buf, &hook.source);
+}
+
+fn feed_hook_map(buf: &mut Vec<u8>, hooks: &BTreeMap<String, SnapHook>) {
+    feed_ordered_map(buf, hooks, feed_hook);
+}
+
+/// Feed one plug/slot: bare interface name or typed attributes.
+fn feed_plug(buf: &mut Vec<u8>, plug: &SnapPlug) {
+    match plug {
+        SnapPlug::Name(name) => {
+            buf.push(0);
+            feed_str(buf, name);
+        }
+        SnapPlug::Typed(typed) => {
+            buf.push(1);
+            feed_str(buf, &typed.interface);
+            feed_ordered_map(buf, &typed.attributes, |buf, value| feed_str(buf, value));
+        }
+    }
+}
+
+fn feed_plug_map(buf: &mut Vec<u8>, plugs: &BTreeMap<String, SnapPlug>) {
+    feed_ordered_map(buf, plugs, feed_plug);
+}
+
+/// Feed confinement grants: backend + the shared grants vocabulary.
+fn feed_confinement(buf: &mut Vec<u8>, conf: &Confinement) {
+    feed_str(buf, conf.backend.as_str());
+    feed_str_list(buf, &conf.filesystem);
+    feed_bool(buf, conf.network);
+    feed_str_list(buf, &conf.sockets);
+    feed_str_list(buf, &conf.devices);
+    feed_ordered_map(buf, &conf.backend_options, feed_json);
+}
+
+/// Feed one app: every app field shapes the payload — command, daemon
+/// mode, plug/slot wiring, env, desktop entry, interpreter wrapper,
+/// per-app confinement.
+fn feed_app(buf: &mut Vec<u8>, app: &SnapApp) {
+    feed_str(buf, &app.command);
+    feed_opt_str(buf, app.daemon.as_deref());
+    feed_opt(buf, app.plugs.as_ref(), |buf, plugs: &Vec<String>| {
+        feed_str_list(buf, plugs)
+    });
+    feed_opt(buf, app.slots.as_ref(), |buf, slots: &Vec<String>| {
+        feed_str_list(buf, slots)
+    });
+    feed_opt(buf, app.environment.as_ref(), feed_env_map);
+    feed_opt_str(buf, app.desktop.as_deref());
+    feed_opt_str(buf, app.interpreter.as_deref());
+    feed_opt(buf, app.confined.as_ref(), feed_confinement);
+}
+
+fn feed_app_map(buf: &mut Vec<u8>, apps: &HashMap<String, SnapApp>) {
+    feed_sorted_map(buf, apps, feed_app);
+}
+
+/// Feed one service: everything the backend artifact renders from.
+fn feed_service(buf: &mut Vec<u8>, svc: &ServiceDecl) {
+    feed_str(buf, &svc.command);
+    let daemon = match svc.daemon {
+        ServiceDaemon::Simple => "simple",
+        ServiceDaemon::Notify => "notify",
+        ServiceDaemon::Forking => "forking",
+    };
+    feed_str(buf, daemon);
+    feed_str_list(buf, &svc.args);
+    feed_ordered_map(buf, &svc.options, feed_json);
+    feed_str_list(buf, &svc.after);
+    feed_env_map(buf, &svc.environment);
+    feed_ordered_map(buf, &svc.backend_options, feed_json);
+}
+
+fn feed_service_map(buf: &mut Vec<u8>, services: &BTreeMap<String, ServiceDecl>) {
+    feed_ordered_map(buf, services, feed_service);
+}
+
+/// Feed one package input: URL + submodule policy.
+fn feed_input(buf: &mut Vec<u8>, input: &PackageInput) {
+    feed_str(buf, &input.url);
+    match &input.submodules {
+        Some(SubmoduleSpec::All(b)) => {
+            buf.push(1);
+            feed_bool(buf, *b);
+        }
+        Some(SubmoduleSpec::Named(names)) => {
+            buf.push(2);
+            feed_str_list(buf, names);
+        }
+        None => buf.push(0),
+    }
+}
+
+fn feed_input_map(buf: &mut Vec<u8>, inputs: &HashMap<String, PackageInput>) {
+    feed_sorted_map(buf, inputs, feed_input);
+}
+
+/// Feed one ecosystem resolver spec of a deps closure declaration.
+fn feed_deps_lock_spec(buf: &mut Vec<u8>, spec: &DepsLockSpec) {
+    feed_str(buf, &spec.lock);
+    feed_opt_str(buf, spec.sum.as_deref());
+    feed_opt_str(buf, spec.index.as_deref());
+    feed_str_list(buf, &spec.exclude);
+    feed_opt_str(buf, spec.python.as_deref());
+}
+
+fn feed_deps(buf: &mut Vec<u8>, deps: &PackageDeps) {
+    for slot in [&deps.npm, &deps.pip, &deps.cargo, &deps.go] {
+        feed_opt(buf, slot.as_ref(), feed_deps_lock_spec);
+    }
+}
+
+impl SnapMetaDigest for SnapMeta {
+    /// Canonical build-input digest (sha3-384, hex) of this resolved
+    /// recipe meta (issue #113). Deterministic: the same recipe digests
+    /// identically across processes. Recorded on the installed package
+    /// at install time; a plain sync whose freshly resolved meta digests
+    /// the same as the installed record holds instead of rebuilding.
+    ///
+    /// Hashed: identity (name, version, type, grade, confinement,
+    /// adopt-info), source inputs (single + named, url + pin hash), the
+    /// build tree (command, parts with plugin shape), dependency
+    /// declarations (build_deps, requires, deps closures), the runtime
+    /// surface that rides the payload (environment, layout, hooks,
+    /// plugs, slots, confinement, apps, services, inputs), and the
+    /// build-sandbox selectors (target, toolchain). Deliberately
+    /// excluded: docs-only fields (summary, description, license),
+    /// distribution metadata (compression, aliases, architectures), and
+    /// machine-local paths (definition_dir).
+    fn build_input_digest(&self) -> String {
+        let mut buf = Vec::new();
+        feed_str(&mut buf, &self.name);
+        feed_str(&mut buf, &self.version);
+        feed_opt_str(&mut buf, self.type_.as_deref());
+        feed_str(&mut buf, &self.grade);
+        feed_str(&mut buf, &self.confinement);
+        feed_opt_str(&mut buf, self.adopt_info.as_deref());
+        feed_bool(&mut buf, self.version_adopted);
+        feed_opt(&mut buf, self.source.as_ref(), feed_source);
+        feed_opt(&mut buf, self.sources.as_ref(), feed_source_map);
+        feed_opt_str(&mut buf, self.build.as_deref());
+        feed_opt(&mut buf, self.parts.as_ref(), feed_part_map);
+        feed_str_list(&mut buf, &self.build_deps);
+        feed_str_list(&mut buf, &self.requires);
+        feed_opt(&mut buf, self.environment.as_ref(), feed_env_map);
+        feed_opt(&mut buf, self.layout.as_ref(), feed_layout_map);
+        feed_opt(&mut buf, self.hooks.as_ref(), feed_hook_map);
+        feed_opt(&mut buf, self.plugs.as_ref(), feed_plug_map);
+        feed_opt(&mut buf, self.slots.as_ref(), feed_plug_map);
+        feed_opt(&mut buf, self.confined.as_ref(), feed_confinement);
+        // HashMap-backed fields: sorted — see the determinism note above.
+        feed_app_map(&mut buf, &self.apps);
+        feed_service_map(&mut buf, &self.services);
+        feed_opt(&mut buf, self.inputs.as_ref(), feed_input_map);
+        feed_opt_str(&mut buf, self.target.as_deref());
+        feed_opt_str(&mut buf, self.toolchain.as_deref());
+        feed_opt_str(&mut buf, self.icon_source.as_deref());
+        feed_opt_str(&mut buf, self.icon.as_deref());
+        feed_opt(&mut buf, self.deps.as_ref(), feed_deps);
+        let hash = <sha3::Sha3_384 as sha3::Digest>::digest(&buf);
+        hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+// ── Phase 4: YAML serialization ──
+// (`SnapMeta::to_yaml`/`display_version` live with the type in nau-core.)
+
+// ── Phase 5/6: Snap directory assembly + SquashFS packaging ──
+
+/// Who owns the stage directory for a build.
+///
+/// Tracks whether `--stage` was passed explicitly (the CLI flag is
+/// `Option<String>`; `None` means nau's default `./stage/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagePolicy {
+    /// No `--stage` flag: the stage is nau-owned scratch space. Its
+    /// contents are wiped whenever a build phase is about to populate it,
+    /// so leftovers from previous builds can never leak into a new snap.
+    /// (A build-less snap — pre-built binaries staged by hand — never
+    /// reaches the wipe: its stage is the input, not an output.)
+    Default,
+    /// `--stage` passed explicitly: the directory belongs to the user and
+    /// is never wiped. It must be empty (or new) to start; `nau build`
+    /// refuses up front otherwise — see [`check_explicit_stage`].
+    Explicit,
+}
+
+/// One-time guard at the start of `nau build`: an explicitly passed
+/// `--stage` directory that already exists and is non-empty is refused.
+/// nau never deletes a user-chosen directory.
+pub fn check_explicit_stage(stage_dir: &Path) -> miette::Result<()> {
+    let nonempty = stage_dir.exists()
+        && std::fs::read_dir(stage_dir)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+    if nonempty {
+        return Err(miette::miette!(
+            "stage directory '{}' exists and is not empty — refusing to build. \
+             nau never deletes a directory passed via --stage; pass a fresh \
+             (empty or new) directory, or omit --stage to let nau wipe and \
+             manage its default './stage/' automatically.",
+            stage_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Cross-process advisory lock over the nau-owned default stage
+/// (gate-pod gap 6: two concurrent builds silently shared `./stage/`, a
+/// watcher catching the stage inode flipping mid-build).
+///
+/// The lock lives in a SIBLING file (`stage.lock` next to `stage/`) —
+/// never inside the stage and never on the stage directory itself:
+/// `clear_stage_dir` removes and recreates the stage directory on every
+/// default-stage build phase, which would strand a lock held on (or in)
+/// the wiped directory and silently break mutual exclusion. The sibling
+/// file is untouched by the wipe, so its inode — and the flock on it —
+/// survives for the whole build.
+///
+/// Acquired with `flock(LOCK_EX | LOCK_NB)`: a second concurrent build
+/// fails loudly and immediately instead of hanging, and the kernel drops
+/// the lock when the fd closes — on drop or on crash. The empty lock
+/// file is simply left behind (deleting it would reintroduce an
+/// unlink/unlock race); no stale-lock cleanup exists or is needed.
+///
+/// Hardened against an external `stage.lock` unlink mid-acquire (issue
+/// #173): after the flock, the fd's `(dev, ino)` is checked against the
+/// path's, and a mismatch — something swept and recreated the file
+/// between our open and our check — drops the orphaned fd and retries,
+/// bounded. A followed pre-planted symlink is refused outright
+/// (O_NOFOLLOW): the fd must lock the file at the path, never a victim
+/// inode behind a link. Nau itself never unlinks the lock file.
+///
+/// Scope: `flock(2)` is SINGLE-HOST mutual exclusion (on NFS it is
+/// client-local, since Linux 2.6.12) — this lock never coordinates
+/// builds across machines. And it covers the default stage only:
+/// explicit `--stage` directories are never locked — they are
+/// user-owned, so sharing one across concurrent builds is the user's
+/// responsibility.
+#[derive(Debug)]
+pub struct StageLock {
+    /// Held open for the lock's lifetime: closing this fd releases the
+    /// flock, so dropping the guard releases the stage.
+    _file: std::fs::File,
+}
+
+/// Sibling lock-file path for a stage directory: `./stage/` →
+/// `./stage.lock`. `None` when the stage path carries no file name (`/`,
+/// `..`) — such a path has no sibling to pin a lock to.
+fn stage_lock_path(stage_dir: &Path) -> Option<std::path::PathBuf> {
+    let name = stage_dir.file_name()?;
+    Some(
+        stage_dir
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(format!("{}.lock", name.to_string_lossy())),
+    )
+}
+
+/// Bounded re-open attempts when the lock file's identity flips between
+/// the open and the check (an external unlink+recreate racing the
+/// acquire): enough to absorb a one-shot sweeper, small enough that a
+/// pathological sweeper fails the build loudly instead of spinning.
+const STAGE_LOCK_IDENTITY_ATTEMPTS: usize = 5;
+
+/// Test-only seam (issue #173): runs between the flock and the inode
+/// check, so a unit test can race an external unlink+recreate into
+/// exactly that window deterministically. Registered per lock path:
+/// unit tests run in parallel, so a single global hook would either fire
+/// inside a concurrent test's acquire or be replaced by it.
+#[cfg(test)]
+type StageLockHook = Box<dyn Fn(&Path) + Send>;
+#[cfg(test)]
+static STAGE_LOCK_TEST_SWAP: std::sync::Mutex<Vec<(std::path::PathBuf, StageLockHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_stage_lock_test_swap(lock_path: &Path) {
+    let hooks = STAGE_LOCK_TEST_SWAP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (target, hook) in hooks.iter() {
+        if target == lock_path {
+            hook(lock_path);
+        }
+    }
+}
+
+/// Open the sibling lock file without following a symlink planted at the
+/// path (issue #173): O_NOFOLLOW turns a pre-planted `stage.lock →
+/// victim` link into a loud failure instead of silently flocking the
+/// victim inode. The file is never written, so the link is harmless
+/// today — but a followed link would still have us locking an inode
+/// nau does not own.
+fn open_stage_lock(lock_path: &Path) -> miette::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                miette::miette!(
+                    "stage lock {} is a symlink — refusing to follow it. Remove the \
+                     symlink so nau can create a real lock file.",
+                    lock_path.display()
+                )
+            } else {
+                miette::miette!("failed to open stage lock {}: {}", lock_path.display(), e)
+            }
+        })
+}
+
+/// Take the exclusive flock on an already-open lock file. Non-blocking:
+/// a held lock is the normal second-build outcome, not an inode race.
+fn flock_stage_lock(
+    file: &std::fs::File,
+    stage_dir: &Path,
+    lock_path: &Path,
+) -> miette::Result<()> {
+    use std::os::fd::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return Err(miette::miette!(
+            "default stage '{}' is held by another nau build — wait \
+             for it to finish, or pass --stage <dir> to build into a \
+             separate stage",
+            stage_dir.display()
+        ));
+    }
+    Err(miette::miette!(
+        "failed to lock stage {}: {}",
+        lock_path.display(),
+        err
+    ))
+}
+
+/// Unlink-and-recreate check (issue #173): true while the fd we flocked
+/// is still the inode now at `lock_path`. Without it, an external unlink
+/// between the open and the check lets the next build O_CREAT a fresh
+/// inode and take its own flock — reopening the mutual-exclusion gap.
+fn stage_lock_identity_holds(file: &std::fs::File, lock_path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(fd_meta), Ok(path_meta)) = (file.metadata(), std::fs::metadata(lock_path)) else {
+        return false;
+    };
+    fd_meta.ino() == path_meta.ino() && fd_meta.dev() == path_meta.dev()
+}
+
+impl StageLock {
+    /// Take the default-stage lock, failing loudly when another build
+    /// already holds it. Non-blocking: never waits.
+    pub fn acquire(stage_dir: &Path) -> miette::Result<Self> {
+        let lock_path = stage_lock_path(stage_dir).ok_or_else(|| {
+            miette::miette!(
+                "cannot lock stage '{}': path has no file name to derive a sibling lock from",
+                stage_dir.display()
+            )
+        })?;
+        let mut attempt = 0usize;
+        let file = loop {
+            attempt += 1;
+            let file = open_stage_lock(&lock_path)?;
+            flock_stage_lock(&file, stage_dir, &lock_path)?;
+            #[cfg(test)]
+            run_stage_lock_test_swap(&lock_path);
+            if stage_lock_identity_holds(&file, &lock_path) {
+                break file;
+            }
+            // The inode we just locked is gone from the path: an outside
+            // actor (git clean, a *.lock sweeper) unlinked and recreated
+            // it between the open and the check. Drop this fd —
+            // releasing its orphaned flock — and take the fresh one.
+            // Nau itself never unlinks the lock file.
+            if attempt >= STAGE_LOCK_IDENTITY_ATTEMPTS {
+                return Err(miette::miette!(
+                    "stage lock {} was replaced {} times while acquiring it — something \
+                     is sweeping or recreating the file mid-acquire (git clean, a *.lock \
+                     watcher). Stop the sweeper and retry the build.",
+                    lock_path.display(),
+                    attempt
+                ));
+            }
+        };
+        Ok(Self { _file: file })
+    }
+}
+
+/// Wipe and recreate the nau-owned default stage. Only called right
+/// before a build phase populates it.
+fn clear_stage_dir(stage_dir: &Path) -> miette::Result<()> {
+    if stage_dir.exists() {
+        std::fs::remove_dir_all(stage_dir).map_err(|e| {
+            miette::miette!("failed to clear stage dir {}: {}", stage_dir.display(), e)
+        })?;
+    }
+    std::fs::create_dir_all(stage_dir)
+        .map_err(|e| miette::miette!("failed to create stage dir {}: {}", stage_dir.display(), e))
+}
+
+/// Host architecture in snapd naming ("amd64", "arm64", …). Rust's
+/// `consts::ARCH` passes through unchanged for other targets.
+pub fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Leading-component architecture of a GNU target triplet.
+/// "aarch64-linux-gnu" → Some("arm64"), "x86_64-linux-gnu" → Some("amd64"),
+/// "arm-linux-gnueabihf" → Some("armhf"). Unknown vendor/OS suffixes are not
+/// interpreted: the first component maps by the rules above, else identity.
+pub fn triplet_arch(triplet: &str) -> Option<&str> {
+    let first = triplet.split('-').next()?;
+    match first {
+        "x86_64" | "amd64" => Some("amd64"),
+        "aarch64" | "arm64" => Some("arm64"),
+        "arm" => Some("armhf"),
+        other => Some(other),
+    }
+}
+
+/// Refuse builds whose requested architecture cannot be produced honestly.
+///
+/// Building for a foreign arch without a cross toolchain silently produces
+/// `arm64`-named snaps full of host binaries. Allowed when:
+/// * the arch is `"all"` (arch-independent), or
+/// * it matches the host arch, or
+/// * a cross toolchain is configured for exactly that arch (a `--target`
+///   triplet — or the snap's own `target` field — whose leading component
+///   names the requested arch).
+pub fn check_cross_build(arch: &str, target: Option<&str>) -> miette::Result<()> {
+    if arch == "all" || arch == host_arch() {
+        return Ok(());
+    }
+    if target.is_some_and(|t| triplet_arch(t) == Some(arch)) {
+        return Ok(());
+    }
+    let hint = match arch {
+        "arm64" => "aarch64-linux-gnu",
+        "amd64" => "x86_64-linux-gnu",
+        _ => "<triplet>",
+    };
+    Err(match target {
+        Some(t) => miette::miette!(
+            "refusing to build for '{arch}' on this {host} host: --target '{t}' does \
+             not select an {arch} toolchain (expected a triplet like {hint}); the \
+             build would silently pack {host} binaries into an {arch} snap",
+            host = host_arch(),
+        ),
+        None => miette::miette!(
+            "refusing to build for '{arch}' on this {host} host: no cross toolchain \
+             is configured, so the snap would silently contain {host} binaries. \
+             Pass --target <triplet> (e.g. --target {hint}) to select a cross \
+             toolchain, or build for '{host}'",
+            host = host_arch(),
+        ),
+    })
+}
+
+/// Author build-time launcher wrappers (issues #9 and #10).
+///
+/// Two cases, both authored into the store payload at build time — the nix
+/// `makeWrapper`/`wrapProgram` analogy — so the pod farm's direct symlink
+/// points at a working launcher and the farm never adds shims:
+///
+/// 1. **Interpreter script (issue #9).** An app declaring `interpreter`
+///    (e.g. `interpreter = "node"`) whose command binary is a **script**
+///    (no native ELF magic) gets a wrapper: the original script is preserved
+///    at a sibling `<command>.real` path (still shipped in the payload) and
+///    the command path is replaced by a wrapper that single-`exec`s the
+///    interpreter with the script's extension-tree path (the only
+///    runtime-correct shape — a flat blob path strands scripts that derive
+///    from their own path; #94), e.g.
+///    `exec "node" "$POD/active/extensions/<pkg>/usr/bin/<cmd>.real" "$@"`.
+///
+/// 2. **Native-ELF with bundled runtime libs (issue #10 part B).** A native
+///    ELF command binary that needs shared libraries the payload itself
+///    ships (`libjq.so.1`, `libonig.so.5` for jq — separate content-
+///    addressed store blobs, NOT on the binary's runpath) gets a wrapper:
+///    the real ELF is preserved at `<command>.real` and the command path is
+///    replaced by a wrapper that sets `LD_LIBRARY_PATH` to the active
+///    generation's name-preserving lib dir (where those blobs are
+///    hardlinked) and single-`exec`s the real binary's store blob.
+///
+/// Native-ELF packages whose libs are already resolvable (no bundled libs)
+/// get NO wrapper; apps without an `interpreter` were never touched by #9
+/// and only get wrapped by #10 when they bundle a runtime lib.
+///
+/// Runs only when a pod store is provided (the build is a pod build) —
+/// `pod_store` is used to bake the command's future store blob path, which
+/// is only defined for a pod content store.
+fn emit_build_wrappers(
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    pod_store: &nau_core::blob_store::BlobStore,
+    listings: Option<&crate::leak_scan::PayloadListings>,
+) -> miette::Result<()> {
+    for (app_name, app) in &meta.apps {
+        wrap_app(app_name, app, meta, stage_dir, pod_store, listings)?;
+    }
+    Ok(())
+}
+
+/// Wrap one app's command, if it qualifies (see [`emit_build_wrappers`]).
+fn wrap_app(
+    app_name: &str,
+    app: &SnapApp,
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    pod_store: &nau_core::blob_store::BlobStore,
+    listings: Option<&crate::leak_scan::PayloadListings>,
+) -> miette::Result<()> {
+    if app.interpreter.as_deref() == Some("") {
+        return Err(miette::miette!(
+            "app '{app_name}': 'interpreter' must not be empty"
+        ));
+    }
+    let Some(cmd_path) = nau_core::units::resolve_command_path(&app.command) else {
+        return Ok(());
+    };
+    let entry = stage_dir.join(&cmd_path);
+    if !entry.is_file() {
+        // A missing command binary is caught later by the install-time
+        // planner's fail-closed lookup — nothing to wrap.
+        return Ok(());
+    }
+
+    // Ticket #11: a confined app gets a separate launcher wrapper blob
+    // (at `<command>.nau-launcher`) that invokes `nau run`. The
+    // farm's direct symlink for a confined app points at this wrapper,
+    // so `which`/PATH stay truthful while `nau run` sets up the
+    // sandbox. The real command binary stays untouched — `apps[app]`
+    // still records it and `nau run` execs it inside the sandbox.
+    if Confinement::for_app(app.confined.as_ref(), meta.confined.as_ref()).is_some() {
+        emit_confined_launcher(app_name, &entry, pod_store)?;
+    }
+
+    if is_elf(&entry) {
+        // Issue #10 part B: native-ELF wrapper ONLY when the payload
+        // bundles a runtime lib the binary needs (separate store blob
+        // not on its runpath). Already-resolvable ELFs stay unwrapped.
+        let lib_dirs = bundled_runtime_lib_dirs(&entry, stage_dir);
+        if stage_bundles_python_stdlib(stage_dir, Path::new(&cmd_path)) {
+            // CPython resolves its stdlib from its own on-disk path: a
+            // flat content-addressed blob would strand it ("Could not
+            // find platform independent libraries"), so it must exec
+            // from the generation's extension tree — the same shape the
+            // #13 script tree wrapper uses for interpreter scripts.
+            emit_elf_tree_wrapper(
+                app_name,
+                &entry,
+                &meta.name,
+                Path::new(&cmd_path),
+                &lib_dirs,
+            )
+        } else if lib_dirs.is_empty() {
+            Ok(())
+        } else {
+            emit_elf_lib_wrapper(app_name, &entry, &lib_dirs, meta, pod_store)
+        }
+    } else {
+        // Issue #9: interpreter-script wrapper.
+        let Some(interpreter) = &app.interpreter else {
+            // Issue #90: no declared interpreter — the shebang is the
+            // interpreter. Resolve it against the payload set; unresolvable
+            // shebangs fail closed there.
+            return wrap_shebang_script(
+                app_name,
+                &entry,
+                meta,
+                stage_dir,
+                Path::new(&cmd_path),
+                listings,
+            );
+        };
+        // The tree shape is the only runtime-correct one for a script
+        // that resolves resources relative to its own path (arg[0]
+        // package.path, require() adjacency): a flat content-addressed
+        // blob path strands the derivation (luarocks, blesh-share —
+        // #94 gates). The extension tree mirrors the payload layout
+        // for every installed package, so every interpreter script
+        // execs from there (#13 shaped the wrapper; #94 extended the
+        // routing beyond deps closures).
+        emit_script_tree_wrapper(app_name, &entry, interpreter, &meta.name, &cmd_path)
+    }
+}
+
+/// The interpreter a script's shebang names, when it is one our wrapper
+/// family must handle: an absolute path (the pod's closure root, e.g.
+/// `/usr/bin/perl`) that is neither a host-guaranteed interpreter (`/bin/sh`,
+/// `/usr/bin/env`) nor a PATH-resolved form (`env <name>`, bare name) —
+/// those resolve from the farm today and are left untouched.
+fn rewriteable_shebang(entry: &Path) -> miette::Result<Option<String>> {
+    let Ok(mut f) = std::fs::File::open(entry) else {
+        return Ok(None);
+    };
+    use std::io::Read;
+    let mut head = [0u8; 128];
+    let n = f.read(&mut head).unwrap_or(0);
+    let Ok(text) = std::str::from_utf8(&head[..n]) else {
+        return Ok(None);
+    };
+    let Some(first) = text.lines().next() else {
+        return Ok(None);
+    };
+    let Some(rest) = first.strip_prefix("#!") else {
+        return Ok(None);
+    };
+    let interp = rest.split_whitespace().next().unwrap_or("");
+    match interp {
+        "" | "/bin/sh" | "/usr/bin/env" => return Ok(None),
+        other if !other.starts_with('/') => return Ok(None),
+        other if other.ends_with("/env") => return Ok(None),
+        _ => {}
+    }
+    Ok(Some(interp.to_string()))
+}
+
+/// Issue #90: a script command with no declared `interpreter` still names an
+/// interpreter — its shebang. Perltidy's `#!/usr/bin/perl` is the shape:
+/// authored against the pod's root-mounted closure (`/usr/bin/perl` inside
+/// the sandbox), it cannot resolve when the farm symlinks straight at the
+/// store blob on a host without that path. When the shebang's interpreter
+/// resolves into the payload set — the payload itself or a declared
+/// `requires` — author the #9 wrapper so the farm execs the pod interpreter
+/// by bare name. An interpreter resolving only into build-only payloads, or
+/// nowhere, fails closed: a silently broken wrapper is what ships otherwise.
+#[allow(clippy::too_many_arguments)]
+fn wrap_shebang_script(
+    app_name: &str,
+    entry: &Path,
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    cmd_rel: &Path,
+    listings: Option<&crate::leak_scan::PayloadListings>,
+) -> miette::Result<()> {
+    let Some(interp) = rewriteable_shebang(entry)? else {
+        return Ok(());
+    };
+    let Some(listings) = listings else {
+        // No resolution data (direct calls in tests, non-scanned paths):
+        // keep the historical behavior — no wrapper, no error.
+        return Ok(());
+    };
+    let name = interp.rsplit('/').next().unwrap_or(&interp);
+    // The payload itself provides the interpreter at the mirrored prefix
+    // path (`/usr/bin/<name>` staged in this payload).
+    if stage_dir.join("usr/bin").join(name).is_file() {
+        return emit_wrapped_script(app_name, entry, meta, name, cmd_rel);
+    }
+    // A declared `requires` (runtime-closure payload) provides it.
+    let runtime_provides = listings
+        .runtime
+        .iter()
+        .any(|pkg| listings.payloads.get(pkg).is_some_and(|f| f.contains(name)));
+    if runtime_provides {
+        return emit_wrapped_script(app_name, entry, meta, name, cmd_rel);
+    }
+    let build_only_provides = listings
+        .payloads
+        .iter()
+        .filter(|(pkg, _)| !listings.runtime.contains(*pkg))
+        .find(|(_, files)| files.contains(name))
+        .map(|(pkg, _)| pkg.clone());
+    if let Some(pkg) = build_only_provides {
+        return Err(miette::miette!(
+            "app '{app_name}': command script's interpreter '{interp}' resolves \
+             only into build-only payload '{pkg}' — at runtime neither the \
+             payload nor a declared requires provides it, so the wrapper \
+             would be broken the moment it shipped (issue #90)"
+        ));
+    }
+    Err(miette::miette!(
+        "app '{app_name}': command script's interpreter '{interp}' resolves to \
+         neither the payload nor a declared requires — no merged payload \
+         provides '{name}'; refusing to ship a silently broken wrapper \
+         (issue #90)"
+    ))
+}
+
+/// Author the wrapper for a shebang-resolved interpreter: same routing as a
+/// declared `interpreter` (issue #13 tree shape — the only runtime-correct
+/// shape for scripts that derive from their own path).
+fn emit_wrapped_script(
+    app_name: &str,
+    entry: &Path,
+    meta: &SnapMeta,
+    name: &str,
+    cmd_rel: &Path,
+) -> miette::Result<()> {
+    // Same #94 routing as declared interpreters: the tree shape is the
+    // only one that keeps payload-relative derivation alive.
+    emit_script_tree_wrapper(
+        app_name,
+        entry,
+        name,
+        &meta.name,
+        &cmd_rel.to_string_lossy(),
+    )
+}
+
+/// The preserved-script sibling name. Inserts `.real` before the final
+/// extension when there is one (`index.js` → `index.real.js`), else
+/// appends (`zdemo` → `zdemo.real`). The extension must survive: Node's
+/// ESM loader dispatches on it and rejects `index.js.real` with
+/// ERR_UNKNOWN_FILE_EXTENSION.
+/// The sibling name a build-time wrapper preserves the real entry under
+/// (`<stem>.real.<ext>`, or `<file>.real` without an extension).
+/// Public for the install path, which must recognize wrapper-managed
+/// commands (issue #37).
+/// The real-sibling name for a wrapped command (`app` → `app.real`).
+/// `pub` because the root runtime module resolves the same sibling name
+/// for installed wrappers (via the root `snap` shim re-export).
+pub fn real_sibling_name(file_name: &str) -> String {
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}.real.{ext}"),
+        _ => format!("{file_name}.real"),
+    }
+}
+
+/// True when the payload stages a CPython stdlib tree beside the command
+/// (`<prefix>/lib/python3.*/` next to `<prefix>/bin/<cmd>`): such an ELF
+/// locates its stdlib relative to its own path at runtime, so it must
+/// exec from the generation's extension tree — a flat content-addressed
+/// store blob would leave it without a stdlib.
+fn stage_bundles_python_stdlib(stage_dir: &Path, cmd_path: &Path) -> bool {
+    let Some(bin_dir) = cmd_path.parent() else {
+        return false;
+    };
+    let Some(prefix) = bin_dir.parent() else {
+        return false;
+    };
+    let lib = stage_dir.join(prefix).join("lib");
+    std::fs::read_dir(&lib)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("python3."))
+        })
+        .unwrap_or(false)
+}
+
+/// Author the interpreter-script wrapper for a package WITH a dependency
+/// closure (ADR-0017, issue #13): the same preserve-and-replace shape the
+/// flat #9 wrapper used, but the wrapper execs the `.real` script from
+/// the active generation's extension tree —
+/// `$PODROOT/active/extensions/<pkg>/usr/<command>.real` — where modules
+/// staged next to it (`node_modules`, site-packages) resolve. PODROOT is
+/// derived from the wrapper's own store-blob path (`store/<aa>/<hash>`),
+/// the same derivation the #10 ELF lib wrapper uses.
+///
+/// The store blob is not the wrapper's only install site: the generation
+/// tree hardlinks the same blob at
+/// `generations/<n>/extensions/<pkg>/usr/bin/<pkg>-<app>` (issue #210),
+/// and the pod's top-level extensions tree carries it too. There the
+/// three-dirname derivation lands on the extension, not the pod root, so
+/// the primary tree target misses and the wrapper falls back to the
+/// payload root two dirnames up from its own resolved path — the SAME
+/// generation's copy, so a generation-pinned invocation execs its own
+/// payload rather than racing `active`.
+fn emit_script_tree_wrapper(
+    app_name: &str,
+    entry: &Path,
+    interpreter: &str,
+    pkg_name: &str,
+    cmd_rel: &str,
+) -> miette::Result<()> {
+    let file_name = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let script_path = entry.with_file_name(real_sibling_name(&file_name));
+    std::fs::rename(entry, &script_path).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': preserving interpreter script {}: {e}",
+            script_path.display()
+        )
+    })?;
+    // The extension-preserving sibling in the extension tree (same rule
+    // as the preserve-rename above, applied to the command's relative
+    // path — the tree path must name the SAME file).
+    let cmd_rel_real = match cmd_rel.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/{}", real_sibling_name(file)),
+        None => real_sibling_name(cmd_rel),
+    };
+    let tree_script = format!("$PODROOT/active/extensions/{pkg_name}/usr/{cmd_rel_real}");
+    // Python does not discover staged wheels by adjacency the way Node's
+    // require() walks up from the script: site-packages must be handed to
+    // the interpreter via PYTHONPATH. The variable is SCRUBBED first, not
+    // appended to: an inherited host PYTHONPATH (e.g. a devbox profile's
+    // site-packages) shadows the pod tree's modules with foreign
+    // installations — the same failure the hermes-agent packaging had to
+    // scrub around.
+    let pythonpath_block = if interpreter.starts_with("python") {
+        format!(
+            "\n         PKGROOT=\"$PODROOT/active/extensions/{pkg_name}/usr\"\n\
+             PYTHONPATH=\"\"\n\
+             for sp in \"$PKGROOT\"/usr/lib/python3.*/site-packages; do\n\
+             \x20 [ -d \"$sp\" ] && PYTHONPATH=\"${{PYTHONPATH:+$PYTHONPATH:}}$sp\"\n\
+             done\n\
+             export PYTHONPATH\n\
+             export NAU_PYTHONPATH=\"$PYTHONPATH\"\n"
+        )
+    } else if interpreter.starts_with("perl") {
+        // Issue #90 (perltidy): a perl script resolves modules through
+        // @INC, which perl roots at /usr — the pod's root-mounted closure.
+        // From the farm there is no root mount, so PERL5LIB re-points @INC
+        // at the extension trees: every perl5 module dir one to three
+        // levels deep, across the whole pod closure (the core modules ship
+        // in the interpreter's own payload — 5.40.5/warnings.pm — while a
+        // script's modules ship in its own — site_perl/<ver>/...). The
+        // merged-prefix staging rewrite re-points the same segment at the
+        // prefix root for build time.
+        String::from(
+            "\n         PERL5LIB=\"\"\n\
+             for d in \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/ \
+             \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/*/ \
+             \"$PODROOT\"/active/extensions/*/usr/usr/lib/perl5/*/*/*/; do\n\
+             \x20 [ -d \"$d\" ] && PERL5LIB=\"${PERL5LIB:+$PERL5LIB:}$d\"\n\
+             done\n\
+             export PERL5LIB\n",
+        )
+    } else {
+        String::new()
+    };
+    // The farm symlink resolves to the wrapper blob at
+    // `<podroot>/store/<aa>/<hash>` — three dirnames to the pod root
+    // (same derivation as the #10 ELF lib wrapper). Args forward to the
+    // tool exactly like the flat #9 wrapper (`exec "$i" "$s" "$@"`).
+    // The tree target is resolved adaptively (issue #210): primary hit
+    // through `$PODROOT/active` for the store-blob invocation (and the
+    // prefix, where the rewrite strips the extension segment), fallback
+    // to the payload root two dirnames up for direct generation-tree
+    // invocation — the wrapper commands at `<payload-root>/bin/<name>`,
+    // so appending the command's own rel path reproduces the `usr/usr`
+    // doubling the extension tree shows.
+    let wrapper = format!(
+        "#!/bin/sh\n\
+         SCRIPT=\"$(readlink -f \"$0\")\"\n\
+         PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+         TREE=\"{tree_script}\"\n\
+         [ -f \"$TREE\" ] || TREE=\"$(dirname \"$(dirname \"$SCRIPT\")\")/{cmd_rel_real}\"\n\
+         {pythonpath_block}\
+         exec \"{interpreter}\" \"$TREE\" \"$@\"\n"
+    );
+    write_wrapper(app_name, entry, &wrapper)
+}
+
+/// Author the native-ELF tree wrapper: like [`emit_script_tree_wrapper`],
+/// the command execs from the active generation's extension tree instead
+/// of a flat content-addressed blob — required when the binary resolves
+/// bundled resources relative to its own path (CPython's stdlib
+/// discovery, detected by [`stage_bundles_python_stdlib`]). Bundled
+/// runtime libs (the #10 LD_LIBRARY_PATH set) still resolve, now from the
+/// tree's name-preserving lib dirs.
+///
+/// Like the script tree wrapper (#210), the blob is hardlinked into every
+/// generation at `generations/<n>/extensions/<pkg>/usr/bin/<pkg>-<app>`,
+/// where the three-dirname PODROOT derivation lands on the extension. The
+/// exec target and the LD_LIBRARY_PATH root therefore resolve adaptively:
+/// primary hit through `$PODROOT/active/...` (store-blob invocation and
+/// the merged prefix, where the #90 rewrite strips the extension
+/// segment), fallback to the payload root two dirnames up — the SAME
+/// generation's copy.
+fn emit_elf_tree_wrapper(
+    app_name: &str,
+    entry: &Path,
+    pkg_name: &str,
+    cmd_rel: &Path,
+    lib_dirs: &[PathBuf],
+) -> miette::Result<()> {
+    let file_name = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let real_path = entry.with_file_name(real_sibling_name(&file_name));
+    std::fs::rename(entry, &real_path).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': preserving native-ELF {}: {e}",
+            real_path.display()
+        )
+    })?;
+    let cmd_rel_real = match cmd_rel.to_string_lossy().rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/{}", real_sibling_name(file)),
+        None => real_sibling_name(&cmd_rel.to_string_lossy()),
+    };
+    let tree_elf = format!("$PODROOT/active/extensions/{pkg_name}/usr/{cmd_rel_real}");
+    // Gen-tree fallback (#210): when the primary `$PODROOT/active/...`
+    // misses, both the exec target and the bundled-lib root re-point at
+    // the payload root two dirnames up from the wrapper — appending each
+    // reference's own rel path reproduces the extension tree's `usr/usr`
+    // doubling for usr/-staged payloads.
+    let libroot_line = if lib_dirs.is_empty() {
+        String::new()
+    } else {
+        let libroot = format!("$PODROOT/active/extensions/{pkg_name}/usr");
+        let ld_list = lib_dirs
+            .iter()
+            .map(|rel| format!("$LIBROOT/{}", rel.display()))
+            .collect::<Vec<_>>()
+            .join(":");
+        format!(
+            "LIBROOT=\"{libroot}\"\n\
+             [ -d \"$LIBROOT\" ] || LIBROOT=\"$(dirname \"$(dirname \"$SCRIPT\")\")\"\n\
+             export LD_LIBRARY_PATH=\"{ld_list}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"\n"
+        )
+    };
+    // The only ELF that takes this wrapper is a prefix-relative runtime
+    // (CPython, detected by stage_bundles_python_stdlib). Its sys.path
+    // inherits the host's PYTHONPATH, which would shadow the pod's
+    // stdlib/site-packages with foreign installations — scrub it, then
+    // thread every extension's site-packages (the PERL5LIB shape from
+    // the #90 perltidy wrapper): the pod interpreter must import
+    // cross-package modules (mesonbuild from the meson extension — #94
+    // gates). NAU_PYTHONPATH stays first: the reserved channel a
+    // pod app wrapper uses to hand the interpreter its own
+    // site-packages, ahead of the pod-wide sweep.
+    // The farm symlink resolves to the wrapper blob at
+    // `<podroot>/store/<aa>/<hash>` — three dirnames to the pod root
+    // (same derivation as the #10 ELF lib wrapper).
+    let wrapper = format!(
+        "#!/bin/sh\n\
+         SCRIPT=\"$(readlink -f \"$0\")\"\n\
+         PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
+         {libroot_line}\
+         PYTHONPATH=\"${{NAU_PYTHONPATH:-}}\"\n\
+         for sp in \"$PODROOT\"/active/extensions/*/usr/usr/lib/python3.*/site-packages; do\n\
+         \x20 [ -d \"$sp\" ] && PYTHONPATH=\"${{PYTHONPATH:+$PYTHONPATH:}}$sp\"\n\
+         done\n\
+         export PYTHONPATH\n\
+         TREE=\"{tree_elf}\"\n\
+         [ -f \"$TREE\" ] || TREE=\"$(dirname \"$(dirname \"$SCRIPT\")\")/{cmd_rel_real}\"\n\
+         exec \"$TREE\" \"$@\"\n"
+    );
+    write_wrapper(app_name, entry, &wrapper)
+}
+
+/// Author the native-ELF runtime-lib wrapper (issue #10 part B): preserves
+/// the real ELF at `<command>.real`, then replaces the command path with a
+/// wrapper that PREPENDS the active generation's name-preserving lib dirs
+/// (where the payload's bundled runtime blobs are hardlinked) to
+/// `LD_LIBRARY_PATH` — prepend, never replace: the caller's list (the #89
+/// shellenv seam) must survive, or cross-package libs (glib under dconf,
+/// #94) vanish — and single-`exec`s the real binary's store blob.
+fn emit_elf_lib_wrapper(
+    app_name: &str,
+    entry: &Path,
+    lib_dirs: &[std::path::PathBuf],
+    meta: &SnapMeta,
+    pod_store: &nau_core::blob_store::BlobStore,
+) -> miette::Result<()> {
+    let file_name = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let real_path = entry.with_file_name(real_sibling_name(&file_name));
+    std::fs::rename(entry, &real_path).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': preserving native-ELF {}: {e}",
+            real_path.display()
+        )
+    })?;
+    let real_sha256 = sha256_file(&real_path).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': hashing native-ELF {}: {e}",
+            real_path.display()
+        )
+    })?;
+    let real_store_path = pod_store.blob_path(&real_sha256);
+
+    // The payload's bundled libs are materialized (by name) under the
+    // generation tree at `extensions/<pkg>/usr/<rel-dir>`; the pod's
+    // `active` link points at the current generation. The wrapper resolves
+    // its own store blob path to derive the pod root, then points
+    // LD_LIBRARY_PATH at those name-preserving lib dirs.
+    let ld_paths: Vec<String> = lib_dirs
+        .iter()
+        .map(|rel| {
+            format!(
+                "$PODROOT/active/extensions/{}/usr/{}",
+                meta.name,
+                rel.display()
+            )
+        })
+        .collect();
+    let wrapper = format!(
+        "#!/bin/sh\n\
+         SCRIPT=\"$(readlink -f \"$0\")\"\n\
+         BLODIR=\"$(dirname \"$SCRIPT\")\"\n\
+         PODROOT=\"$(dirname \"$(dirname \"$BLODIR\")\")\"\n\
+         export LD_LIBRARY_PATH=\"{}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"\n\
+         exec \"{}\" \"$@\"\n",
+        ld_paths.join(":"),
+        real_store_path.display()
+    );
+    write_wrapper(app_name, entry, &wrapper)
+}
+
+/// Author the confined app launcher (ADR-0016 ticket #11): a wrapper blob
+/// at `<command>.nau-launcher` that single-`exec`s `nau run` for
+/// the app. The wrapper derives its pod from its own store-blob path (the
+/// #10 `readlink -f $0` pattern): `store/<aa>/<hash>` sits two levels
+/// under the pod root, whose basename is the pod name.
+///
+/// The farm's direct symlink for a confined app points at this wrapper;
+/// `nau run` resolves the app's grants from the pod's generation
+/// manifest and execs the real command binary inside the sandbox.
+fn emit_confined_launcher(
+    app_name: &str,
+    entry: &Path,
+    _pod_store: &nau_core::blob_store::BlobStore,
+) -> miette::Result<()> {
+    let launcher_path = launcher_sibling_path(entry);
+    let wrapper = format!(
+        "#!/bin/sh\nSELF=\"$(readlink -f \"$0\")\"\nPODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SELF\")\")\")\"\nPOD=\"$(basename \"$PODROOT\")\"\nexec nau run --pod \"$POD\" --root \"$(dirname \"$PODROOT\")\" {app_name} \"$@\"\n"
+    );
+    write_wrapper(app_name, &launcher_path, &wrapper)
+}
+
+/// The sibling path of a command entry that carries the confined launcher
+/// wrapper (e.g. `usr/bin/app` → `usr/bin/app.nau-launcher`).
+pub fn launcher_sibling_path(entry: &Path) -> PathBuf {
+    let mut name = entry
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.push_str(".nau-launcher");
+    entry.with_file_name(name)
+}
+
+/// The relative payload path of a command's confined launcher wrapper
+/// (e.g. `usr/bin/app` → `usr/bin/app.nau-launcher`), for the
+/// install-time planner to locate the wrapper blob in the payload tree.
+pub fn launcher_sibling_rel_path(command_rel: &str) -> String {
+    let path = Path::new(command_rel);
+    launcher_sibling_path(path).to_string_lossy().into_owned()
+}
+
+/// Write a launcher wrapper at `entry` and mark it owner-executable.
+fn write_wrapper(app_name: &str, entry: &Path, wrapper: &str) -> miette::Result<()> {
+    std::fs::write(entry, wrapper).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': writing launcher wrapper {}: {e}",
+            entry.display()
+        )
+    })?;
+    make_owner_executable(entry).map_err(|e| {
+        miette::miette!(
+            "app '{app_name}': making wrapper executable {}: {e}",
+            entry.display()
+        )
+    })
+}
+
+/// True when `path` is a native ELF binary (its first four bytes are the
+/// ELF magic). Used by [`emit_build_wrappers`] to route a command path to
+/// the native-ELF vs interpreter-script wrapper logic.
+fn is_elf(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && &magic == b"\x7fELF"
+}
+
+/// Set the owner-execute bit plus read for group/other so a wrapper is
+/// runnable from the farm the way a built binary is.
+fn make_owner_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(path, perms)
+}
+
+/// Add the owner-write bit so a build-time tool (patchelf) can rewrite a
+/// possibly read-only ELF in place. Returns the original mode to restore.
+fn with_write_permission(path: &Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::metadata(path)?.permissions();
+    let mode = perms.mode();
+    let mut perms = perms;
+    perms.set_mode(mode | 0o200);
+    std::fs::set_permissions(path, perms)?;
+    Ok(mode)
+}
+
+/// Restore the original mode captured by [`with_write_permission`].
+fn restore_write_permission(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(perms) = std::fs::metadata(path) {
+        let mut perms = perms.permissions();
+        perms.set_mode(mode);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+/// ELF class / byte-order of a file's ELF header, if it is an ELF.
+fn elf_class_endian(bytes: &[u8]) -> Option<(u8, u8)> {
+    if bytes.len() < 16 || &bytes[..4] != b"\x7fELF" {
+        return None;
+    }
+    Some((bytes[4], bytes[5])) // EI_CLASS, EI_DATA
+}
+
+/// Read one endian-aware unsigned integer from `bytes` at `off`.
+fn read_uint(bytes: &[u8], off: usize, size: usize, big: bool) -> Option<u64> {
+    if off.checked_add(size)? > bytes.len() {
+        return None;
+    }
+    let slice = &bytes[off..off + size];
+    Some(if big {
+        slice.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
+    } else {
+        slice
+            .iter()
+            .rev()
+            .fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
+    })
+}
+
+/// Shared-library SONAMEs listed in an ELF's `DT_NEEDED` dynamic entries.
+/// Minimal, dependency-free ELF parser (ELF32/ELF64, either byte order):
+/// walks the program headers to `PT_DYNAMIC`, reads `DT_NEEDED` offsets
+/// into the `DT_STRTAB` string table. A statically-linked binary returns
+/// an empty list; an unparseable (non-ELF/truncated) binary returns
+/// `None`.
+fn elf_needed_libs(path: &Path) -> Option<Vec<String>> {
+    const PT_DYNAMIC: u64 = 2;
+    const DT_NULL: u64 = 0;
+    const DT_NEEDED: u64 = 1;
+    const DT_STRTAB: u64 = 5;
+    let bytes = std::fs::read(path).ok()?;
+    let (class, data) = elf_class_endian(&bytes)?;
+    let big = data == 2; // ELFDATA2MSB
+    let is64 = class == 2; // ELFCLASS64
+    let (phoff, _phentsize, phnum) = if is64 {
+        (
+            read_uint(&bytes, 0x20, 8, big)?,
+            read_uint(&bytes, 0x36, 2, big)?,
+            read_uint(&bytes, 0x38, 2, big)?,
+        )
+    } else {
+        (
+            read_uint(&bytes, 0x1c, 4, big)?,
+            read_uint(&bytes, 0x2a, 2, big)?,
+            read_uint(&bytes, 0x2c, 2, big)?,
+        )
+    };
+    let (entry_size, offset_off, filesz_off) = if is64 {
+        (56usize, 8usize, 32usize)
+    } else {
+        (32usize, 4usize, 16usize)
+    };
+    // Locate PT_DYNAMIC's file range.
+    let mut dyn_range = None;
+    for i in 0..phnum {
+        let off = phoff as usize + (i as usize) * entry_size;
+        let p_type = read_uint(&bytes, off, 4, big)?;
+        if p_type == PT_DYNAMIC {
+            let p_offset = read_uint(&bytes, off + offset_off, if is64 { 8 } else { 4 }, big)?;
+            let p_filesz = read_uint(&bytes, off + filesz_off, if is64 { 8 } else { 4 }, big)?;
+            dyn_range = Some((p_offset as usize, p_filesz as usize));
+            break;
+        }
+    }
+    let (dyn_off, dyn_sz) = dyn_range?;
+    let (tag_size, val_size) = if is64 {
+        (8usize, 8usize)
+    } else {
+        (4usize, 4usize)
+    };
+    let mut strtab = None;
+    let mut needed = Vec::new();
+    let mut i = dyn_off;
+    let end = dyn_off + dyn_sz;
+    while i + tag_size + val_size <= end {
+        let tag = read_uint(&bytes, i, tag_size, big)?;
+        let val = read_uint(&bytes, i + tag_size, val_size, big)?;
+        if tag == DT_NULL {
+            break;
+        }
+        if tag == DT_NEEDED {
+            needed.push(val as usize);
+        } else if tag == DT_STRTAB {
+            strtab = Some(val as usize);
+        }
+        i += tag_size + val_size;
+    }
+    let strtab = strtab?;
+    Some(
+        needed
+            .into_iter()
+            .filter_map(|n| {
+                // Read a NUL-terminated C string at strtab + n.
+                let j = strtab + n;
+                let mut end0 = j;
+                while end0 < bytes.len() && bytes[end0] != 0 {
+                    end0 += 1;
+                }
+                if end0 >= bytes.len() {
+                    return None;
+                }
+                Some(String::from_utf8_lossy(&bytes[j..end0]).into_owned())
+            })
+            .collect(),
+    )
+}
+
+/// ELF machine type (`e_machine`) of a file, if it is an ELF.
+fn elf_machine(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
+        return None;
+    }
+    read_uint(bytes, 0x12, 2, bytes[5] == 2) // EI_DATA: MSB=2
+}
+
+/// The `PT_INTERP` interpreter string of an ELF (e.g.
+/// `/nix/store/...-/lib/ld-linux-x86-64.so.2`), or `None` if the ELF has no
+/// interpreter (a static binary) or is unparseable.
+fn elf_interpreter(path: &Path) -> Option<String> {
+    const PT_INTERP: u64 = 3;
+    let bytes = std::fs::read(path).ok()?;
+    let (class, data) = elf_class_endian(&bytes)?;
+    let big = data == 2;
+    let is64 = class == 2;
+    let (phoff, phnum) = if is64 {
+        (
+            read_uint(&bytes, 0x20, 8, big)?,
+            read_uint(&bytes, 0x38, 2, big)?,
+        )
+    } else {
+        (
+            read_uint(&bytes, 0x1c, 4, big)?,
+            read_uint(&bytes, 0x2c, 2, big)?,
+        )
+    };
+    let (entry_size, offset_off, filesz_off) = if is64 {
+        (56usize, 8usize, 32usize)
+    } else {
+        (32usize, 4usize, 16usize)
+    };
+    for i in 0..phnum {
+        let off = phoff as usize + (i as usize) * entry_size;
+        let p_type = read_uint(&bytes, off, 4, big)?;
+        if p_type != PT_INTERP {
+            continue;
+        }
+        let p_offset = read_uint(&bytes, off + offset_off, if is64 { 8 } else { 4 }, big)?;
+        let p_filesz = read_uint(&bytes, off + filesz_off, if is64 { 8 } else { 4 }, big)?;
+        let start = p_offset as usize;
+        let end = start + p_filesz as usize;
+        if end > bytes.len() || end <= start {
+            return None;
+        }
+        // The string is NUL-terminated within PT_INTERP's file range.
+        let str_bytes = &bytes[start..end];
+        let nul = str_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(str_bytes.len());
+        return Some(String::from_utf8_lossy(&str_bytes[..nul]).into_owned());
+    }
+    None
+}
+
+/// The `DT_RUNPATH`/`DT_RPATH` string of an ELF, or `None` if the dynamic
+/// section carries neither (or the ELF is unparseable).
+fn elf_runpath(path: &Path) -> Option<String> {
+    const DT_RUNPATH: u64 = 29;
+    const DT_RPATH: u64 = 15;
+    let bytes = std::fs::read(path).ok()?;
+    let (class, data) = elf_class_endian(&bytes)?;
+    let big = data == 2;
+    let is64 = class == 2;
+    let (phoff, _phentsize, phnum) = if is64 {
+        (
+            read_uint(&bytes, 0x20, 8, big)?,
+            read_uint(&bytes, 0x36, 2, big)?,
+            read_uint(&bytes, 0x38, 2, big)?,
+        )
+    } else {
+        (
+            read_uint(&bytes, 0x1c, 4, big)?,
+            read_uint(&bytes, 0x2a, 2, big)?,
+            read_uint(&bytes, 0x2c, 2, big)?,
+        )
+    };
+    let (entry_size, offset_off, filesz_off) = if is64 {
+        (56usize, 8usize, 32usize)
+    } else {
+        (32usize, 4usize, 16usize)
+    };
+    let mut dyn_range = None;
+    for i in 0..phnum {
+        let off = phoff as usize + (i as usize) * entry_size;
+        let p_type = read_uint(&bytes, off, 4, big)?;
+        if p_type == 2
+        /* PT_DYNAMIC */
+        {
+            let p_offset = read_uint(&bytes, off + offset_off, if is64 { 8 } else { 4 }, big)?;
+            let p_filesz = read_uint(&bytes, off + filesz_off, if is64 { 8 } else { 4 }, big)?;
+            dyn_range = Some((p_offset as usize, p_filesz as usize));
+            break;
+        }
+    }
+    let (dyn_off, dyn_sz) = dyn_range?;
+    let (tag_size, val_size) = if is64 {
+        (8usize, 8usize)
+    } else {
+        (4usize, 4usize)
+    };
+    let mut strtab = None;
+    let mut rpath_off = None;
+    let mut i = dyn_off;
+    let end = dyn_off + dyn_sz;
+    while i + tag_size + val_size <= end {
+        let tag = read_uint(&bytes, i, tag_size, big)?;
+        let val = read_uint(&bytes, i + tag_size, val_size, big)?;
+        if tag == 0
+        /* DT_NULL */
+        {
+            break;
+        }
+        if tag == DT_RUNPATH || tag == DT_RPATH {
+            // Either tag marks a runtime search path we must not leave
+            // pointing into the build machine's nix store. (Detection only;
+            // `patchelf` clears both when it rewrites.)
+            rpath_off = Some(val as usize);
+        } else if tag == 5
+        /* DT_STRTAB */
+        {
+            strtab = Some(val as usize);
+        }
+        i += tag_size + val_size;
+    }
+    let (strtab, rpath_off) = (strtab?, rpath_off?);
+    let j = strtab + rpath_off;
+    if j >= bytes.len() {
+        return None;
+    }
+    let mut end0 = j;
+    while end0 < bytes.len() && bytes[end0] != 0 {
+        end0 += 1;
+    }
+    Some(String::from_utf8_lossy(&bytes[j..end0]).into_owned())
+}
+
+/// The system ELF interpreter path a non-nix Linux host provides for the
+/// given ELF machine type (e.g. x86-64 → `/lib64/ld-linux-x86-64.so.2`).
+/// This is the interpreter a pod-built binary will use so it runs on a
+/// host without the build machine's nix store.
+fn system_elf_interpreter_for(machine: u64) -> String {
+    match machine {
+        62 => "/lib64/ld-linux-x86-64.so.2".to_string(), // EM_X86_64
+        183 => "/lib/ld-linux-aarch64.so.1".to_string(), // EM_AARCH64
+        // Unknown arch: keep the standard `lib/`-relative location for the
+        // interpreter basename; correct for the common glibc loaders.
+        _ => "/lib64/ld-linux.so.2".to_string(),
+    }
+}
+
+/// Find the `patchelf` binary on PATH (used to repoint an ELF
+/// interpreter/RUNPATH at build time). Returns `None` when unavailable.
+fn find_patchelf() -> Option<String> {
+    std::process::Command::new("which")
+        .arg("patchelf")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        })
+}
+
+/// Rewrite a native command binary's ELF interpreter and RUNPATH so it runs
+/// on a non-nix host (ticket #12). A nix-toolchain build bakes the build
+/// machine's `/nix/store/...-glibc.../ld-linux-x86-64.so.2` as the
+/// interpreter and `/nix/store/.../lib` paths into RUNPATH; a plain host has
+/// neither. At build time we repoint the interpreter at the system loader
+/// (`/lib64/ld-linux-x86-64.so.2`) and clear RUNPATH so runtime libs resolve
+/// from the host's default search path plus the #10 pod library wrapper's
+/// `LD_LIBRARY_PATH` — never the build machine's nix store.
+///
+/// Returns the number of ELF binaries repointed. Binaries whose interpreter
+/// and RUNPATH already carry no `/nix/store` reference are left untouched.
+fn repair_elf_for_portability(meta: &SnapMeta, stage_dir: &Path) -> miette::Result<usize> {
+    let patchelf = find_patchelf();
+    let mut repaired = 0usize;
+    for (app_name, app) in &meta.apps {
+        let Some(cmd_path) = nau_core::units::resolve_command_path(&app.command) else {
+            continue;
+        };
+        repaired += repair_command_elf(
+            app_name,
+            &cmd_path,
+            &stage_dir.join(&cmd_path),
+            patchelf.as_ref(),
+        )?;
+    }
+    // ADR-0017 (issue #13): prebuilt native addons inside a fetched
+    // dependency closure (`.node`/`.so`/bundled executables under
+    // `node_modules`) get the same build-time ELF repair as commands, so
+    // a nix-built prebuild's interpreter/RUNPATH resolves on any host.
+    if meta.deps.is_some() {
+        let mut elves = Vec::new();
+        collect_stage_elves(stage_dir, &mut elves);
+        for path in elves {
+            repaired += repair_closure_elf(&path, patchelf.as_ref())?;
+        }
+    }
+    Ok(repaired)
+}
+
+/// The command-binary repair (ticket #12): repoint a nix interpreter at
+/// the system loader and clear the nix RUNPATH. Returns 1 when repaired.
+fn repair_command_elf(
+    app_name: &str,
+    cmd_path: &str,
+    entry: &Path,
+    patchelf: Option<&String>,
+) -> miette::Result<usize> {
+    if !entry.is_file() || !is_elf(entry) {
+        return Ok(0);
+    }
+    if !elf_has_nix_refs(entry) {
+        return Ok(0);
+    }
+    repair_elf_on_host(app_name, cmd_path, entry, patchelf, "")
+}
+
+/// True when the ELF's interpreter OR RUNPATH references the build
+/// machine's /nix/store (a nix-toolchain build baked in).
+fn elf_has_nix_refs(entry: &Path) -> bool {
+    let nix_interp = elf_interpreter(entry)
+        .map(|i| i.contains("/nix/store/"))
+        .unwrap_or(false);
+    let nix_rpath = elf_runpath(entry)
+        .map(|r| r.contains("/nix/store/"))
+        .unwrap_or(false);
+    nix_interp || nix_rpath
+}
+
+/// Shared patchelf invocation: set the system interpreter (when the ELF
+/// has one) and set RUNPATH to `rpath`, returning 1 on success.
+fn repair_elf_on_host(
+    label: &str,
+    display_path: &str,
+    entry: &Path,
+    patchelf: Option<&String>,
+    rpath: &str,
+) -> miette::Result<usize> {
+    let Some(patchelf) = patchelf else {
+        return Err(miette::miette!(
+            "{label}: native-ELF {display_path} references the build machine's \
+             /nix/store toolchain in its interpreter/RUNPATH (ticket #12), but 'patchelf' is \
+             not on PATH — install it (e.g. add patchelf to devbox.json) so pod builds can \
+             repoint the interpreter to a non-nix system loader",
+        ));
+    };
+    // Derive the system interpreter from the ELF's machine type.
+    let bytes = std::fs::read(entry)
+        .map_err(|e| miette::miette!("{label}: reading {display_path}: {e}"))?;
+    let machine = elf_machine(&bytes).unwrap_or(62); // default x86-64
+    let interpreter = system_elf_interpreter_for(machine);
+    // patchelf rewrites the file in place, so a copied read-only ELF
+    // (e.g. `cp /bin/sh $STAGE/...`) needs a write bit during repair.
+    let saved = with_write_permission(entry).map_err(|e| {
+        miette::miette!("{label}: making {display_path} writable for patchelf: {e}")
+    })?;
+    let mut cmd = std::process::Command::new(patchelf);
+    if elf_interpreter(entry).is_some() {
+        cmd.arg("--set-interpreter").arg(&interpreter);
+    }
+    cmd.arg("--set-rpath").arg(rpath).arg(entry);
+    let status = cmd
+        .status()
+        .map_err(|e| miette::miette!("{label}: running patchelf on {display_path}: {e}"))?;
+    restore_write_permission(entry, saved);
+    if !status.success() {
+        return Err(miette::miette!(
+            "{label}: patchelf failed on {display_path} (exit {:?})",
+            status.code()
+        ));
+    }
+    Ok(1)
+}
+
+/// Repair one ELF found in the staged dependency closure (ADR-0017):
+/// bundled executables get the full command treatment (interpreter + clear
+/// RUNPATH); shared objects (`.node`/`.so` — no PT_INTERP) keep sibling
+/// resolution with RUNPATH `$ORIGIN` and simply drop the nix leak.
+fn repair_closure_elf(entry: &Path, patchelf: Option<&String>) -> miette::Result<usize> {
+    let rel = entry.to_string_lossy().to_string();
+    if elf_interpreter(entry).is_some() {
+        return repair_elf_on_host("deps closure", &rel, entry, patchelf, "");
+    }
+    if elf_runpath(entry)
+        .map(|r| r.contains("/nix/store/"))
+        .unwrap_or(false)
+    {
+        return repair_elf_on_host("deps closure", &rel, entry, patchelf, "$ORIGIN");
+    }
+    Ok(0)
+}
+
+/// Collect every ELF regular file under `dir` (depth-first, symlink-free).
+fn collect_stage_elves(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => collect_stage_elves(&path, out),
+            Ok(t) if t.is_file() && is_elf(&path) => out.push(path),
+            _ => {}
+        }
+    }
+}
+
+/// Relative (to the stage root) parent directories of shared libraries the
+/// payload itself ships that an ELF needs — i.e. runtime libs that will be
+/// separate content-addressed store blobs and are NOT resolvable from the
+/// binary's own runpath/system dirs. A package whose ELF needs no bundled
+/// lib is self-resolvable and needs no wrapper (issue #10 part B).
+fn bundled_runtime_lib_dirs(elf_path: &Path, stage_dir: &Path) -> Vec<std::path::PathBuf> {
+    let Some(needed) = elf_needed_libs(elf_path) else {
+        return Vec::new();
+    };
+    if needed.is_empty() {
+        return Vec::new();
+    }
+    // Walk the stage once, mapping each shared-library basename to its
+    // parent dir relative to the stage root.
+    let mut by_name: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    collect_shared_libs(stage_dir, stage_dir, &mut by_name);
+    let mut dirs = Vec::new();
+    for soname in &needed {
+        let found = by_name.iter().find_map(|(name, rel_dir)| {
+            if name == soname
+                || name
+                    .strip_prefix(soname.as_str())
+                    .is_some_and(|s| s.starts_with('.'))
+            {
+                Some(rel_dir.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(dir) = found {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
+/// Recursively record `(shared-lib basename → parent dir rel to root)`
+/// for every regular `.so`/`.so.<n>` file under `dir`.
+fn collect_shared_libs(
+    root: &Path,
+    dir: &Path,
+    out: &mut std::collections::HashMap<String, std::path::PathBuf>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_shared_libs(root, &path, out);
+        } else if path.is_file() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_shared_lib_name(&name) {
+                if let Ok(rel_dir) = path.parent().unwrap_or(root).strip_prefix(root) {
+                    out.insert(name, rel_dir.to_path_buf());
+                }
+            }
+        }
+    }
+}
+
+/// True for a shared-library filename (`lib*.so[.<digits>]` or a bare
+/// `*.so`).
+fn is_shared_lib_name(name: &str) -> bool {
+    let Some(dot) = name.rfind(".so") else {
+        return false;
+    };
+    let (base, rest) = name.split_at(dot);
+    let rest = &rest[3..]; // past ".so"
+    !base.is_empty()
+        && rest.chars().all(|c| c == '.' || c.is_ascii_digit())
+        && (rest.is_empty() || rest.starts_with('.'))
+}
+
+/// Build a `.snap` package for a single architecture.
+///
+/// The `arch` parameter controls which architecture appears in the
+/// `meta/snap.yaml` and the output filename `{name}_{version}_{arch}.snap`.
+/// `stage_policy` selects stage hygiene: under [`StagePolicy::Default`] the
+/// stage is wiped before a build phase populates it; under
+/// [`StagePolicy::Explicit`] it is never wiped (an existing non-empty
+/// explicit stage is rejected up front by [`check_explicit_stage`]).
+///
+/// Resolve a floor tool (issue #101) through the tools module — its
+/// per-tool precedence (provisioned-first, curl PATH-first) with PATH
+/// fallback — to the executable path every floor-tool spawn uses.
+fn floor_tool(name: nau_infra::tools::ToolName) -> miette::Result<PathBuf> {
+    let resolved =
+        nau_infra::tools::resolve(name).map_err(|e| miette::miette!("resolve {name}: {e}"))?;
+    Ok(match resolved {
+        nau_infra::tools::ResolvedTool::Provisioned { path, .. }
+        | nau_infra::tools::ResolvedTool::Path { path, .. } => path,
+    })
+}
+
+/// The pinned zstd level for the default pack path (ticket #154, ADR-0038
+/// decision 2): mksquashfs' own zstd default is level 15 and slow, so the
+/// level is always explicit.
+const DEFAULT_ZSTD_LEVEL: u32 = 6;
+
+/// mksquashfs compression arguments (ticket #154, ADR-0038 decisions 1-3):
+/// the zstd path (the default) pins the level — 6 unless declared — and 1M
+/// blocks; lzo passes an explicit level only when declared; xz keeps the
+/// legacy argv byte-identical (no `-b`: published data shows xz at 1M
+/// blocks regresses pack time ~16%, and its wrapper takes no level).
+fn mksquashfs_compression_args(
+    compression: Option<&str>,
+    compression_level: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec![effective_compression(compression).to_string()];
+    match args[0].as_str() {
+        "zstd" => {
+            args.push("-Xcompression-level".to_string());
+            args.push(compression_level.unwrap_or(DEFAULT_ZSTD_LEVEL).to_string());
+            args.push("-b".to_string());
+            args.push("1M".to_string());
+        }
+        "lzo" => {
+            if let Some(level) = compression_level {
+                args.push("-Xcompression-level".to_string());
+                args.push(level.to_string());
+            }
+        }
+        _ => {} // xz: unchanged argv
+    }
+    args
+}
+
+/// Memoized zstd-support probe outcomes, keyed by the resolved mksquashfs
+/// path: one tiny pack per binary per process — support is a property of
+/// the binary, and multi-arch builds would otherwise re-probe per arch.
+type ZstdProbeCache = std::collections::HashMap<PathBuf, Result<(), String>>;
+
+fn zstd_probe_cache() -> &'static std::sync::Mutex<ZstdProbeCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ZstdProbeCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Fail-closed zstd support probe (ticket #154, ADR-0038 decision 5): run
+/// one tiny mksquashfs pack at the requested level through the same
+/// resolved binary the real pack will use. On failure the pack errors with
+/// an actionable message — never a silent fallback to another compressor.
+fn probe_zstd_support(mksquashfs: &Path, level: u32) -> miette::Result<()> {
+    let mut cache = zstd_probe_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = cache.get(mksquashfs) {
+        return cached.clone().map_err(|e| miette::miette!("{e}"));
+    }
+    let probe = tempfile::tempdir()
+        .map_err(|e| miette::miette!("zstd probe: failed to create probe directory: {e}"))?;
+    std::fs::write(probe.path().join("probe"), b"nau zstd probe\n")
+        .map_err(|e| miette::miette!("zstd probe: failed to write probe file: {e}"))?;
+    let image = probe.path().join("probe.snap");
+    let output = std::process::Command::new(mksquashfs)
+        .arg(probe.path())
+        .arg(&image)
+        .arg("-noappend")
+        .arg("-comp")
+        .arg("zstd")
+        .arg("-Xcompression-level")
+        .arg(level.to_string())
+        .arg("-no-progress")
+        .output()
+        .map_err(|e| {
+            miette::miette!(
+                "zstd probe: failed to execute {}: {e}",
+                mksquashfs.display()
+            )
+        });
+    let result = match output {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(format!(
+            "mksquashfs at {} cannot pack zstd at level {level} (exit {:?}, stderr: {}) — \
+             install a zstd-enabled squashfs-tools, or set compression = \"xz\" in the snap \
+             definition to keep building",
+            mksquashfs.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(e.to_string()),
+    };
+    cache.insert(mksquashfs.to_path_buf(), result.clone());
+    result.map_err(|e| miette::miette!("{e}"))
+}
+
+/// `pod_store` is `Some` only when building into a pod's store (issue #9):
+/// it is what a build-time interpreter wrapper bakes the script's
+/// content-addressed store path from (see [`emit_build_wrappers`]). The
+/// generic `nau build` path passes `None` — those builds have no store
+/// to bake and produce no wrappers.
+///
+/// `deps_dir` is the fetched interpreted-deps closure (ADR-0017) bound
+/// read-only into the sandbox; `build_prefix` is the merged `/usr`-like
+/// prefix of `requires` + `build_deps` payloads (ADR-0018, issue #17),
+/// likewise bound read-only. Both are `None` for builds that need neither.
+///
+/// `leak_scan` supplies the post-build leak scan's resolution data (ADR-0018
+/// Decision 3): which payloads are runtime members and which are build-only.
+/// `None` skips the scan. Every wired build path scans (issue #35): pool
+/// and pod builds alike pass listings resolved against the merged build
+/// prefix — empty listings when the build materialized no prefix.
+///
+/// Returns the output filename (not the full path).
+#[allow(clippy::too_many_arguments)]
+pub fn build_snap(
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    output_dir: &Path,
+    arch: &str,
+    stage_policy: StagePolicy,
+    pod_store: Option<&nau_core::blob_store::BlobStore>,
+    deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
+    leak_scan: Option<&crate::leak_scan::PayloadListings>,
+    bypass_source_cache: bool,
+) -> miette::Result<BuildResult> {
+    let build_dir = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
+
+    // 1. Run build phase (download source, run build command) if configured.
+    // `bypass_source_cache` marks a drift-observing fetch: a locked-source
+    // refresh must contact upstream, so the cache never serves it.
+    let outcome = run_build(
+        meta,
+        stage_dir,
+        stage_policy,
+        deps_dir,
+        build_prefix,
+        bypass_source_cache,
+    )?;
+
+    // 1a. Repair native-ELF command binaries for portability (ticket #12):
+    // a nix-toolchain build bakes `/nix/store/...` interpreter + RUNPATH
+    // into a built binary, which a non-nix host cannot execute. Repoint the
+    // interpreter at the system loader and clear RUNPATH at build time
+    // (never host-side). Only pod builds export binaries to a host, so this
+    // runs when a pod store is provided. patchelf is a build tool the pod
+    // build path provides.
+    if pod_store.is_some() {
+        repair_elf_for_portability(meta, stage_dir)?;
+    }
+
+    // 1b. Author build-time launcher wrappers into the stage for
+    // interpreter-based apps (issue #9): an app declaring `interpreter`
+    // whose command binary is a script (no native ELF) gets its command
+    // path replaced by a single-`exec` wrapper referencing the script's
+    // content-addressed store path. Only pod builds provide a store.
+    if let Some(store) = pod_store {
+        emit_build_wrappers(meta, stage_dir, store, leak_scan)?;
+    }
+
+    // 1b'. Post-build leak scan (ADR-0018 Decision 3, issue #22): after the
+    // package's staging completes, every produced file is scanned for
+    // references that resolve only into build-only payloads or into the
+    // merged build prefix ([`SANDBOX_BUILD_PREFIX`]). Hard error on a hit;
+    // `leaks_ok` entries silence named hits (visibly logged); a clean scan
+    // emits one status line. All wired build paths run it (issue #35):
+    // pool and pod builds pass listings against their merged prefix, or
+    // empty listings when the build materialized none.
+    if let Some(listings) = leak_scan {
+        let report = crate::leak_scan::scan_stage(stage_dir, listings, &meta.leaks_ok)?;
+        report.enforce()?;
+    }
+
+    // Clone meta with architecture filtered to the target arch
+    let mut arch_meta = meta.clone();
+    arch_meta.architectures = Some(vec![arch.to_string()]);
+
+    // 1c. Apply adopt-info metadata extracted at build time (post-build by
+    // design: the adopted part's files and the pinned tree are what the
+    // ladder reads). The extracted version feeds the snap.yaml AND the
+    // output filename — version identity is only honest once extracted.
+    if let Some(adopted) = &outcome.adopted {
+        for warning in &adopted.warnings {
+            output::warn(warning);
+        }
+        if let Some(v) = &adopted.version {
+            arch_meta.version = v.value.clone();
+        }
+        if arch_meta.summary.is_none() {
+            arch_meta.summary = adopted.summary.clone();
+        }
+        if arch_meta.description.is_none() {
+            arch_meta.description = adopted.description.clone();
+        }
+    }
+
+    // 2. Write meta/snap.yaml
+    let meta_dir = build_dir.path().join("meta");
+    std::fs::create_dir_all(&meta_dir)
+        .map_err(|e| miette::miette!("failed to create meta/ directory: {}", e))?;
+
+    let yaml = arch_meta.to_yaml()?;
+    std::fs::write(meta_dir.join("snap.yaml"), &yaml)
+        .map_err(|e| miette::miette!("failed to write meta/snap.yaml: {}", e))?;
+
+    // 2b. Copy hook scripts to meta/hooks/<name> — the location the emitted
+    // `hooks: <name>: command:` entries point at (snapd convention).
+    copy_hook_scripts(&arch_meta, build_dir.path())?;
+
+    // 2c. Copy the icon to meta/gui/icon.<ext> — the location the emitted
+    // `icon:` field points at.
+    copy_icon(&arch_meta, build_dir.path())?;
+
+    // 3. Copy stage contents into build root
+    if stage_dir.exists() {
+        cp_r(stage_dir, build_dir.path())
+            .map_err(|e| miette::miette!("failed to copy from {:?}: {}", stage_dir, e))?;
+    }
+
+    // 4. Output filename — built from the resolved arch_meta so an
+    // adopt-info snap is named by its real extracted version.
+    let output_filename = format!("{}_{}_{}.snap", arch_meta.name, arch_meta.version, arch);
+    let output_path = output_dir.join(&output_filename);
+
+    // 5. Run mksquashfs with optional SOURCE_DATE_EPOCH
+    let pack_spinner = output::spinner(&format!("packaging {} as .snap...", meta.name));
+    // Issue #154: the zstd default path probes zstd support (with the
+    // requested level) through the same resolved binary before packing —
+    // fail closed, no silent fallback.
+    let mksquashfs_path = floor_tool(nau_infra::tools::ToolName::Mksquashfs)?;
+    if effective_compression(meta.compression.as_deref()) == "zstd" {
+        probe_zstd_support(
+            &mksquashfs_path,
+            meta.compression_level.unwrap_or(DEFAULT_ZSTD_LEVEL),
+        )?;
+    }
+    let mut mksquashfs = std::process::Command::new(&mksquashfs_path);
+    mksquashfs
+        .arg(build_dir.path())
+        .arg(&output_path)
+        .arg("-noappend")
+        .arg("-comp");
+    for arg in mksquashfs_compression_args(meta.compression.as_deref(), meta.compression_level) {
+        mksquashfs.arg(arg);
+    }
+    mksquashfs.arg("-all-root");
+    // Parallel dep builds (issue #55): mksquashfs's progress meter would
+    // interleave across packages — disable it when output is buffered.
+    if buffer_child_stderr() {
+        mksquashfs.arg("-no-progress");
+    }
+
+    // Reproducible timestamps via SOURCE_DATE_EPOCH.
+    // mksquashfs 4.4+ reads this env var natively — we just need to
+    // ensure it's propagated into the child process.
+    // (We set it in main.rs from the --source-date-epoch flag.)
+
+    let status = mksquashfs
+        .status()
+        .map_err(|e| miette::miette!("failed to execute mksquashfs: {}", e))?;
+
+    if !status.success() {
+        output::finish_err(&pack_spinner, &format!("packaging {} failed", meta.name));
+        return Err(miette::miette!("mksquashfs exited with error"));
+    }
+    output::finish_ok(
+        &pack_spinner,
+        &format!(
+            "packaged {}.snap",
+            &output_filename[..output_filename.len().min(60)]
+        ),
+    );
+
+    Ok(BuildResult {
+        snap_filename: output_filename,
+        version: arch_meta.version.clone(),
+        source_infos: outcome.sources,
+    })
+}
+
+/// The source-cache eligibility rule (ADR-0048 Phase 2): the pin is the
+/// cache's content key, and floating semantics forbid serving — a
+/// floating source must re-observe upstream drift (issue #175).
+/// `None` means the cache is never consulted, in either direction.
+fn source_cache_pin(floating: bool, spec: &SourceSpec) -> Option<&str> {
+    if floating {
+        return None;
+    }
+    spec.expected_sha256()
+}
+
+/// Fetch the single-source tarball to `dest`, returning its SHA-256.
+///
+/// Pinned-and-not-floating sources are served from the content-addressed
+/// source cache when a verified entry exists (ADR-0048 Phase 2); a hit
+/// is byte-identical to the download it replaces — same destination,
+/// same pin verify at the caller. A miss curls exactly as before,
+/// verifies, then populates the cache. `bypass_source_cache` skips the
+/// lookup for drift-observing fetches (a locked-source refresh must
+/// contact upstream so moved bytes still refuse); `store` stays active
+/// — bytes that pass the pin verify are correct cache content by
+/// definition. The cache is best-effort in both directions: a lookup or
+/// store failure is a miss, never a build failure.
+fn fetch_single_source(
+    meta: &SnapMeta,
+    spec: &SourceSpec,
+    url: &str,
+    dest: &Path,
+    bypass_source_cache: bool,
+) -> miette::Result<String> {
+    let pkg_label = format!("{} {}", meta.name, meta.display_version());
+    let dl_spinner = output::spinner(&format!("downloading {}...", pkg_label));
+
+    if let Some(expected) = source_cache_pin(meta.floating, spec) {
+        if !bypass_source_cache {
+            if let Some(cached) =
+                crate::source_cache::lookup(&crate::source_cache::default_root(), expected)
+            {
+                // A copy failure is a miss, not a failure: fall through
+                // to the network path.
+                if std::fs::copy(&cached, dest).is_ok() {
+                    // A hit is not a download — name the cache
+                    // (ADR-0048 no-silent-substitution): the operator
+                    // must see the network was not touched.
+                    output::finish_ok(
+                        &dl_spinner,
+                        &format!("served {} from the source cache", meta.name),
+                    );
+                    // Lookup re-hashed the entry, so this is exactly the
+                    // pinned digest.
+                    return Ok(expected.to_string());
+                }
+            }
+        }
+    }
+
+    let curl = floor_tool(nau_infra::tools::ToolName::Curl)?;
+    let status = std::process::Command::new(&curl)
+        .args(["-fsSL", "-o", &dest.to_string_lossy(), url])
+        .status()
+        .map_err(|e| miette::miette!("curl not found: {}", e))?;
+
+    if !status.success() {
+        output::finish_err(&dl_spinner, &format!("download failed: {}", meta.name));
+        return Err(miette::miette!("failed to download {}", url));
+    }
+    output::finish_ok(&dl_spinner, &format!("downloaded {}", meta.name));
+
+    let computed = sha256_file(dest)?;
+    // A locked source refuses moved bytes; a FLOATING source
+    // re-resolves — its pin is a moving target by design, so the new
+    // hash is TOFU-recorded (it rides out as the build's SourceInfo)
+    // and the pod lockfile pin is restamped once the rebuild lands.
+    verify_source_download(meta, spec, url, &computed)?;
+
+    // Verified bytes: populate the cache under the pin — same
+    // eligibility as the read path; a store failure never fails the
+    // build.
+    if let Some(expected) = source_cache_pin(meta.floating, spec) {
+        let _ = crate::source_cache::store(&crate::source_cache::default_root(), dest, expected);
+    }
+
+    Ok(computed)
+}
+
+/// What a build phase produced: lockfile-relevant source info plus the
+/// adopt-info metadata extracted from the built part, if any.
+#[derive(Debug, Default)]
+struct BuildOutcome {
+    /// One entry per materialized source (single `source` → one entry;
+    /// `sources` map → one per named tree).
+    sources: Vec<SourceInfo>,
+    adopted: Option<AdoptedMeta>,
+}
+
+/// Run the build phase: download source, extract, and execute build command(s).
+///
+/// Single-part form (`build = "..."`): one command runs with `$STAGE`
+/// pointing to the stage directory and `$SRC` to the downloaded/extracted
+/// source — unchanged since before parts existed.
+///
+/// Multi-part form (`parts = { ... }`): the source is downloaded and
+/// extracted once, then each part runs sequentially in `after`-dependency
+/// order (see [`order_parts`]) in its own work dir under the build tree,
+/// all installing into the shared stage.
+///
+/// When the snap declares `adopt-info`, the adopted part's metadata is
+/// extracted after the parts have built (see [`extract_adopted_meta`]).
+///
+/// Returns the [`BuildOutcome`]: `SourceInfo` with the computed SHA-256 if
+/// a source was downloaded, and the extracted adopt metadata if any.
+fn run_build(
+    meta: &SnapMeta,
+    stage_dir: &Path,
+    stage_policy: StagePolicy,
+    deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
+    bypass_source_cache: bool,
+) -> miette::Result<BuildOutcome> {
+    // Build plan: `parts` and `build` are mutually exclusive (the DSL
+    // enforces this; re-checked here for non-DSL constructors).
+    match (&meta.parts, &meta.build) {
+        (Some(_), Some(_)) => {
+            return Err(miette::miette!(
+                "snap has both 'build' and 'parts' — use one or the other"
+            ));
+        }
+        (Some(parts), None) if parts.is_empty() => {
+            return Err(miette::miette!("'parts' must not be empty"));
+        }
+        (Some(_), None) => {} // multi-part mode
+        (None, Some(_)) => {} // single-part mode
+        (None, None) => {
+            // adopt-info names a part to adopt from — a snap with nothing
+            // built has nothing to adopt from.
+            if let Some(part) = &meta.adopt_info {
+                return Err(miette::miette!(
+                    "adopt-info names part '{part}' but the snap has no source or parts to adopt from"
+                ));
+            }
+            return Ok(BuildOutcome::default());
+        }
+    }
+    let parts_mode = meta.parts.is_some();
+
+    // adopt-info names a parts: entry to adopt from — a single-`build` snap
+    // has no part, so the definition can never work. Fail before any
+    // download work.
+    if let Some(part) = &meta.adopt_info {
+        if !parts_mode {
+            return Err(miette::miette!(
+                "adopt-info names part '{part}' but the snap has no parts (adopt-info refers to a parts: entry)"
+            ));
+        }
+    }
+
+    // Multi-source mode (issue #41): every declared source downloads,
+    // verifies, and extracts into its own `$SRC/<name>/` tree, then
+    // execution proceeds exactly as single-source — the build script
+    // (or each part) addresses each tree at `$SRC/<name>`. The parse
+    // boundary guarantees mutual exclusion with `source`; re-checked
+    // here for non-DSL constructors.
+    if meta.source.is_some() && meta.sources.is_some() {
+        return Err(miette::miette!(
+            "snap has both 'source' and 'sources' — use one or the other"
+        ));
+    }
+    if let Some(sources) = &meta.sources {
+        if meta.adopt_info.is_some() {
+            return Err(miette::miette!(
+                "adopt-info is not supported with 'sources' — the adoption ladder reads a single source tree"
+            ));
+        }
+        return run_multi_source_build(
+            meta,
+            sources,
+            stage_dir,
+            stage_policy,
+            deps_dir,
+            build_prefix,
+            bypass_source_cache,
+        );
+    }
+
+    let source_spec = match &meta.source {
+        Some(s) => s,
+        None => {
+            return Err(miette::miette!(
+                "build is set but no source — add 'source = \"...\"' to snap()"
+            ));
+        }
+    };
+
+    let source_url = source_spec.url();
+
+    if !source_url.starts_with("http://") && !source_url.starts_with("https://") {
+        return Err(miette::miette!(
+            "build requires a URL source, got: {}",
+            source_url
+        ));
+    }
+
+    let build_dir = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
+    let build_path = build_dir.path();
+
+    // 1. Fetch the source tarball: pinned, non-floating sources are
+    // served from the content-addressed source cache when a verified
+    // entry exists (ADR-0048 Phase 2); a miss curls exactly as before
+    // and populates the cache once verification passes. A drift-observing
+    // fetch (locked-source refresh) bypasses the lookup so moved bytes
+    // still refuse.
+    let filename = source_url.rsplit('/').next().unwrap_or("source.tar.gz");
+    let tarball = build_path.join(filename);
+    let computed_sha256 =
+        fetch_single_source(meta, source_spec, source_url, &tarball, bypass_source_cache)?;
+
+    // 2. Extract the tarball into the shared source dir (parts mode keeps
+    // part work dirs separate) or the build tree root (single-part mode,
+    // unchanged layout).
+    let extract_dir: std::path::PathBuf = if parts_mode {
+        let dir = build_path.join(SOURCE_DIR_NAME);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| miette::miette!("failed to create source dir: {}", e))?;
+        dir
+    } else {
+        build_path.to_path_buf()
+    };
+    let is_tarball = filename.ends_with(".tar.gz")
+        || filename.ends_with(".tar.xz")
+        || filename.ends_with(".tgz");
+    if is_tarball {
+        let xtract_spinner = output::spinner(&format!("extracting {}...", meta.name));
+        if let Err(e) = extract_tarball(&tarball, &extract_dir) {
+            output::finish_err(
+                &xtract_spinner,
+                &format!("extraction failed: {}", meta.name),
+            );
+            return Err(e.wrap_err(format!("failed to extract {filename}")));
+        }
+        output::finish_ok(&xtract_spinner, &format!("extracted {}", meta.name));
+    }
+
+    // 3. `$SRC` points at the source root (the single top-level dir after
+    // extraction, if there is exactly one) — shared and identical for every
+    // part in multi-part mode.
+    let src_root = find_source_root(&extract_dir).unwrap_or_else(|| extract_dir.clone());
+
+    // 4. Create stage dir and run the build plan. Stage hygiene: the
+    // default stage is nau-owned scratch — wipe it so leftovers from
+    // previous builds can never leak into this snap (observed: pciutils
+    // files inside a bzip2 snap). An explicit --stage belongs to the user:
+    // it was verified empty before the build started and is never wiped.
+    if stage_policy == StagePolicy::Default {
+        clear_stage_dir(stage_dir)?;
+    }
+    std::fs::create_dir_all(stage_dir)
+        .map_err(|e| miette::miette!("failed to create stage dir: {}", e))?;
+
+    // Convert stage_dir to absolute path (DESTDIR requires absolute)
+    let abs_stage = std::fs::canonicalize(stage_dir).unwrap_or_else(|_| stage_dir.to_path_buf());
+
+    if parts_mode {
+        let parts = meta
+            .parts
+            .as_ref()
+            .expect("parts_mode implies a parts spec");
+        run_parts(
+            parts,
+            build_path,
+            &src_root,
+            &abs_stage,
+            meta.target.as_deref(),
+            deps_dir,
+            build_prefix,
+        )?;
+    } else {
+        // Single-part: cwd and $SRC both point at the source root, as before.
+        let build_cmd = meta.build.as_deref().ok_or_else(|| {
+            miette::miette!("internal: neither parts nor build plan for {}", meta.name)
+        })?;
+        let build_spinner = output::spinner(&format!("building {}...", meta.name));
+        run_build_command(
+            build_cmd,
+            build_path,
+            &src_root,
+            &src_root,
+            &abs_stage,
+            meta.target.as_deref(),
+            None,
+            &[],
+            deps_dir,
+            build_prefix,
+        )?;
+        output::finish_ok(&build_spinner, &format!("built {}", meta.name));
+    }
+
+    // 5. adopt-info: extract the adopted part's metadata now that the
+    //    named part has built — the pinned source tree is unpacked and the
+    //    part's files are staged (the two read-only inputs of the ladder).
+    //    Post-build by design: version feeds the snap filename and cache
+    //    identity, so it must come from what was actually built, and a
+    //    missing version hard-errors here instead of shipping "0".
+    let adopted = extract_adopted_meta(meta, &src_root, &abs_stage)?;
+
+    Ok(BuildOutcome {
+        sources: vec![SourceInfo {
+            url: source_url.to_string(),
+            sha256: computed_sha256,
+        }],
+        adopted,
+    })
+}
+
+/// Multi-source build phase (issue #41): materialize every named source,
+/// then run the build plan exactly like the single-source flow.
+///
+/// Materialization contract, per entry (sorted by name — BTreeMap order):
+/// download with curl, verify the pinned SHA-256 (mandatory — the parse
+/// boundary and the DSL both reject unpinned entries), then land the tree
+/// at `<build-tree>/<name>/`. Tarballs extract with the same single-top-dir
+/// flattening the single-source path applies via `find_source_root`, so
+/// `foo-1.2.tar.gz` unpacked under source name `foo` puts its contents at
+/// `$SRC/foo/` — not `$SRC/foo/foo-1.2/`. Non-tarball entries (a .deb, a
+/// bare binary) land as the file `$SRC/<name>` — addressable by exactly
+/// the name the build script declared.
+///
+/// `$SRC` points at the build tree root, so the build script addresses
+/// each tree at `$SRC/<name>`. In parts mode every part sees the same
+/// `$SRC` (trees are siblings of part work dirs; name collisions are
+/// rejected in the DSL and at the parse boundary). `cwd` is the build
+/// tree root in single-part mode.
+fn run_multi_source_build(
+    meta: &SnapMeta,
+    sources: &std::collections::BTreeMap<String, SourceSpec>,
+    stage_dir: &Path,
+    stage_policy: StagePolicy,
+    deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
+    bypass_source_cache: bool,
+) -> miette::Result<BuildOutcome> {
+    let build_dir = tempfile::tempdir()
+        .map_err(|e| miette::miette!("failed to create build directory: {}", e))?;
+    let build_path = build_dir.path().to_path_buf();
+    // NAU_KEEP_BUILD_DIR=1: leak the tempdir so a failed build's tree
+    // (meson-log.txt, config.log, ...) survives for post-mortem debugging.
+    if std::env::var("NAU_KEEP_BUILD_DIR").as_deref() == Ok("1") {
+        std::mem::forget(build_dir);
+        output::status(format!(
+            "NAU_KEEP_BUILD_DIR=1 — build tree kept at {}",
+            build_path.display()
+        ));
+    }
+
+    let mut infos = Vec::with_capacity(sources.len());
+    for (name, spec) in sources {
+        // A source tree and a part work dir share the build tree: a name
+        // collision would overwrite. The DSL rejects it; this is the
+        // non-DSL constructor backstop.
+        if meta.parts.as_ref().is_some_and(|p| p.contains_key(name)) {
+            return Err(miette::miette!(
+                "source '{name}' collides with a part of the same name — source trees and part work dirs share the build tree"
+            ));
+        }
+        infos.push(fetch_and_extract_source(
+            name,
+            spec,
+            &build_path,
+            meta.floating,
+            bypass_source_cache,
+        )?);
+    }
+
+    // Stage hygiene mirrors the single-source path: wipe nau-owned
+    // scratch stage, never an explicit --stage.
+    if stage_policy == StagePolicy::Default {
+        clear_stage_dir(stage_dir)?;
+    }
+    std::fs::create_dir_all(stage_dir)
+        .map_err(|e| miette::miette!("failed to create stage dir: {}", e))?;
+    let abs_stage = std::fs::canonicalize(stage_dir).unwrap_or_else(|_| stage_dir.to_path_buf());
+
+    if let Some(parts) = &meta.parts {
+        run_parts(
+            parts,
+            &build_path,
+            &build_path,
+            &abs_stage,
+            meta.target.as_deref(),
+            deps_dir,
+            build_prefix,
+        )?;
+    } else {
+        let build_cmd = meta.build.as_deref().ok_or_else(|| {
+            miette::miette!("internal: neither parts nor build plan for {}", meta.name)
+        })?;
+        let build_spinner = output::spinner(&format!("building {}...", meta.name));
+        run_build_command(
+            build_cmd,
+            &build_path,
+            &build_path,
+            &build_path,
+            &abs_stage,
+            meta.target.as_deref(),
+            None,
+            &[],
+            deps_dir,
+            build_prefix,
+        )?;
+        output::finish_ok(&build_spinner, &format!("built {}", meta.name));
+    }
+
+    Ok(BuildOutcome {
+        sources: infos,
+        adopted: None,
+    })
+}
+
+/// Strict multi-source miss path: curl to `tarball` and enforce the pin
+/// (no floating restamp — multi-source entries are locked by
+/// construction), then populate the source cache best-effort when
+/// `cache_pin` says the bytes are cache-eligible (ADR-0048 Phase 2).
+fn download_multi_source_tarball(
+    name: &str,
+    url: &str,
+    expected: &str,
+    cache_pin: Option<&str>,
+    tarball: &Path,
+) -> miette::Result<String> {
+    let dl_spinner = output::spinner(&format!("downloading source '{name}'..."));
+    let curl = floor_tool(nau_infra::tools::ToolName::Curl)?;
+    let status = std::process::Command::new(&curl)
+        .args(["-fsSL", "-o", &tarball.to_string_lossy(), url])
+        .status()
+        .map_err(|e| miette::miette!("curl not found: {}", e))?;
+    if !status.success() {
+        output::finish_err(&dl_spinner, &format!("download failed: {name}"));
+        return Err(miette::miette!(
+            "failed to download {url} (source '{name}')"
+        ));
+    }
+    output::finish_ok(&dl_spinner, &format!("downloaded source '{name}'"));
+
+    let computed = sha256_file(tarball)?;
+    if computed != expected {
+        return Err(miette::miette!(
+            "SHA-256 mismatch for source '{name}' ({url}):\n  expected: {expected}\n  got:      {computed}"
+        ));
+    }
+    if let Some(pin) = cache_pin {
+        let _ = crate::source_cache::store(&crate::source_cache::default_root(), tarball, pin);
+    }
+    Ok(computed)
+}
+
+/// Download, verify, and extract one named source into `<build>/<name>`
+/// (see [`run_multi_source_build`] for the layout contract).
+fn fetch_and_extract_source(
+    name: &str,
+    spec: &SourceSpec,
+    build_path: &Path,
+    floating: bool,
+    bypass_source_cache: bool,
+) -> miette::Result<SourceInfo> {
+    let url = spec.url();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(miette::miette!(
+            "sources['{name}'] requires an http(s) URL, got: {url}"
+        ));
+    }
+    // The parse boundary and the DSL both require a pinned hash; this is
+    // the last line of defense for non-DSL constructors.
+    let Some(expected) = spec.expected_sha256() else {
+        return Err(miette::miette!(
+            "sources['{name}'] must be sha256-pinned: multi-source builds are always hash-verified"
+        ));
+    };
+
+    // Download to a hidden scratch name so it can never collide with a
+    // source tree directory.
+    let tarball = build_path.join(format!(".dl-{name}.download"));
+
+    // Content-addressed cache first (ADR-0048 Phase 2): the pin is the
+    // key and floating never consults the cache, in either direction. A
+    // drift-observing fetch (bypass) skips the lookup so moved bytes
+    // still refuse; store stays active. A verified hit is byte-identical
+    // to the download it replaces; a lookup or copy failure is a miss,
+    // never a failure.
+    let cache_pin = source_cache_pin(floating, spec);
+    let cached_hit = if bypass_source_cache {
+        None
+    } else {
+        cache_pin.and_then(|pin| {
+            crate::source_cache::lookup(&crate::source_cache::default_root(), pin).and_then(
+                |cached| {
+                    std::fs::copy(&cached, &tarball).ok()?;
+                    Some(pin.to_string())
+                },
+            )
+        })
+    };
+    let computed = match cached_hit {
+        Some(hit) => {
+            // A hit is not a download — name the cache, matching the
+            // single-source form (ADR-0048 no-silent-substitution).
+            output::ok(format!("served source '{name}' from the source cache"));
+            hit
+        }
+        None => download_multi_source_tarball(name, url, expected, cache_pin, &tarball)?,
+    };
+    output::ok(format!(
+        "SHA-256 verified for '{name}': {:.16}...",
+        computed
+    ));
+
+    let target = build_path.join(name);
+    let filename = url.rsplit('/').next().unwrap_or("source");
+    let is_tarball = filename.ends_with(".tar.gz")
+        || filename.ends_with(".tar.xz")
+        || filename.ends_with(".tgz");
+    if is_tarball {
+        // Extract into a hidden scratch dir, then flatten the single
+        // top-level dir (if any) onto `<build>/<name>` — one rename in
+        // both cases.
+        let scratch = build_path.join(format!(".extract-{name}"));
+        std::fs::create_dir_all(&scratch)
+            .map_err(|e| miette::miette!("failed to create extract dir for '{name}': {}", e))?;
+        let xtract_spinner = output::spinner(&format!("extracting source '{name}'..."));
+        if let Err(e) = extract_tarball(&tarball, &scratch) {
+            output::finish_err(&xtract_spinner, &format!("extraction failed: {name}"));
+            return Err(e.wrap_err(format!("failed to extract {filename} (source '{name}')")));
+        }
+        output::finish_ok(&xtract_spinner, &format!("extracted source '{name}'"));
+        match find_source_root(&scratch) {
+            Some(top) => std::fs::rename(&top, &target)
+                .map_err(|e| miette::miette!("failed to move source tree '{name}': {}", e))?,
+            None => std::fs::rename(&scratch, &target)
+                .map_err(|e| miette::miette!("failed to move source tree '{name}': {}", e))?,
+        }
+        let _ = std::fs::remove_dir(&scratch);
+    } else {
+        // Non-tarball (a .deb, a bare binary): the file lands AT
+        // `$SRC/<name>`, addressable by its declared source name.
+        std::fs::rename(&tarball, &target)
+            .map_err(|e| miette::miette!("failed to move source '{name}': {}", e))?;
+    }
+
+    Ok(SourceInfo {
+        url: url.to_string(),
+        sha256: computed,
+    })
+}
+
+// ── adopt-info: build-time metadata extraction ──
+
+/// Metadata extracted at build time for an adopt-info snap. Only the fields
+/// the ladder actually found are present — explicit DSL fields never move.
+#[derive(Debug, Clone, Default)]
+pub struct AdoptedMeta {
+    /// The extracted version, with where it came from. `None` when the
+    /// snap declared an explicit version (which wins, with a warning).
+    pub version: Option<ExtractedField>,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    /// Human-readable warnings for the caller to print (explicit-field
+    /// divergence etc.).
+    pub warnings: Vec<String>,
+}
+
+/// A value extracted from the build tree, with where it came from.
+#[derive(Debug, Clone)]
+pub struct ExtractedField {
+    pub value: String,
+    pub from: String,
+}
+
+/// snapd's real per-field limits for the adoptable identity fields (snapd
+/// `snap/validate.go`): version ≤ 32 *bytes* (with a constrained charset),
+/// summary ≤ 128 Unicode codepoints, description ≤ 4096 codepoints —
+/// version is the only byte-measured field (see [`check_adopt_cap`]).
+const SNAPD_VERSION_MAX_BYTES: usize = 32;
+const SNAPD_SUMMARY_MAX_CHARS: usize = 128;
+const SNAPD_DESCRIPTION_MAX_CHARS: usize = 4096;
+
+/// The adopt-info extraction ladder for one snap, run at build time after
+/// the named part has built:
+///
+/// 1. An explicit `version` in the definition wins outright — with a
+///    warning, because version feeds the cache identity and the snap
+///    filename, so silently diverging from the adopted metadata would be a
+///    reproducibility lie. Explicit summary/description win per-field,
+///    silently (they feed no identity).
+/// 2. `$STAGE/snap/metadata.json` — snapcraft's own convention file.
+/// 3. The adopted part's plugin reads the pinned source tree post-unpack
+///    (autotools `AC_INIT`, `Cargo.toml [package]`, CMake
+///    `project(VERSION)`, meson `project(version:)`); two extracted
+///    sources within the part disagreeing on version is a hard error —
+///    never an arbitrary pick.
+/// 4. An installed AppStream `metainfo.xml` under
+///    `$STAGE/usr/share/metainfo` supplies summary/description (snapcraft
+///    parse-info precedent).
+///
+/// The ladder is per-field: each field takes the first rung that provides
+/// it. A version that no rung provides is a hard error — the "0"
+/// placeholder never survives into snap.yaml.
+fn extract_adopted_meta(
+    meta: &SnapMeta,
+    src_root: &Path,
+    stage: &Path,
+) -> miette::Result<Option<AdoptedMeta>> {
+    let Some(adopt_name) = &meta.adopt_info else {
+        return Ok(None);
+    };
+
+    let Some(parts) = &meta.parts else {
+        return Err(miette::miette!(
+            "adopt-info names part '{adopt_name}' but the snap has no parts (adopt-info refers to a parts: entry)"
+        ));
+    };
+    let part = parts.get(adopt_name).ok_or_else(|| {
+        miette::miette!(
+            "adopt-info names part '{adopt_name}' but the snap has no such part (parts: {})",
+            parts.keys().cloned().collect::<Vec<_>>().join(", ")
+        )
+    })?;
+
+    let mut warnings = Vec::new();
+
+    // ── version ──
+    let version = if !meta.version_adopted {
+        let explicit = &meta.version;
+        match extract_version_from_rungs(adopt_name, part, src_root, stage)? {
+            Some(found) => warnings.push(format!(
+                "adopt-info: explicit version '{explicit}' wins over the extracted version '{}' (from {}) — \
+                 version feeds the cache identity and the snap filename, so this divergence is deliberate only if kept",
+                found.value, found.from
+            )),
+            None => warnings.push(format!(
+                "adopt-info: explicit version '{explicit}' wins (no version metadata found to adopt from part '{adopt_name}')"
+            )),
+        }
+        None
+    } else {
+        match extract_version_from_rungs(adopt_name, part, src_root, stage)? {
+            Some(found) => {
+                check_adopt_cap("version", &found.value, &found.from)?;
+                Some(found)
+            }
+            None => {
+                return Err(miette::miette!(
+                    "adopt-info: no version metadata found for part '{adopt_name}' (plugin '{}'); \
+                     snapd requires a real version — declare version = \"…\" explicitly, or ship \
+                     snap/metadata.json or plugin metadata in the source",
+                    part.plugin.as_deref().unwrap_or("(none)")
+                ));
+            }
+        }
+    };
+
+    // ── summary/description ──
+    let json_summary = metadata_json_field(stage, "summary")?;
+    let json_description = metadata_json_field(stage, "description")?;
+    let (metainfo_summary, metainfo_description, metainfo_from) =
+        metainfo_summary_description(stage)?;
+
+    let summary = if meta.summary.is_some() {
+        None
+    } else if let Some(s) = json_summary {
+        check_adopt_cap("summary", &s, "snap/metadata.json")?;
+        Some(s)
+    } else if let Some(s) = metainfo_summary {
+        check_adopt_cap("summary", &s, &metainfo_from)?;
+        Some(s)
+    } else {
+        None
+    };
+
+    let description = if meta.description.is_some() {
+        None
+    } else if let Some(d) = json_description {
+        check_adopt_cap("description", &d, "snap/metadata.json")?;
+        Some(d)
+    } else if let Some(d) = metainfo_description {
+        check_adopt_cap("description", &d, &metainfo_from)?;
+        Some(d)
+    } else {
+        None
+    };
+
+    Ok(Some(AdoptedMeta {
+        version,
+        summary,
+        description,
+        warnings,
+    }))
+}
+
+/// Rungs 2-3 for the version field: `$STAGE/snap/metadata.json`, then the
+/// part's plugin reading the pinned source tree. More than one distinct
+/// extracted value within the part is a hard error (never an arbitrary
+/// pick); agreeing sources collapse to one hit.
+fn extract_version_from_rungs(
+    part_name: &str,
+    part: &SnapPart,
+    src_root: &Path,
+    stage: &Path,
+) -> miette::Result<Option<ExtractedField>> {
+    if let Some(v) = metadata_json_field(stage, "version")? {
+        return Ok(Some(ExtractedField {
+            value: v,
+            from: "snap/metadata.json".to_string(),
+        }));
+    }
+
+    let Some(plugin) = &part.plugin else {
+        return Ok(None);
+    };
+    let hits = nau_core::plugins::extract_versions(plugin, src_root);
+    let mut distinct: Vec<&nau_core::plugins::ExtractedVersion> = Vec::new();
+    for hit in &hits {
+        if distinct.iter().any(|d| d.value == hit.value) {
+            continue;
+        }
+        distinct.push(hit);
+    }
+    match distinct.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(ExtractedField {
+            value: one.value.clone(),
+            from: one.from.clone(),
+        })),
+        many => {
+            let listed = many
+                .iter()
+                .map(|h| format!("{} says '{}'", h.from, h.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(miette::miette!(
+                "adopt-info: conflicting version metadata within part '{part_name}' ({plugin}): \
+                 {listed} — fix the source metadata; nau never picks arbitrarily"
+            ))
+        }
+    }
+}
+
+/// Read a string field from `$STAGE/snap/metadata.json` (snapcraft's
+/// convention file). A present-but-unparsable file is a hard error —
+/// silently ignoring it would bury a broken stage.
+fn metadata_json_field(stage: &Path, field: &str) -> miette::Result<Option<String>> {
+    let path = stage.join("snap").join("metadata.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| miette::miette!("adopt-info: failed to read {}: {}", path.display(), e))?;
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| miette::miette!("adopt-info: {} is not valid JSON: {e}", path.display()))?;
+    Ok(value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
+}
+
+/// Summary/description from an installed AppStream metainfo file (snapcraft
+/// parse-info precedent): the first `*.metainfo.xml` / `*.appdata.xml` in
+/// `$STAGE/usr/share/metainfo`, name-sorted for determinism. Minimal
+/// deterministic scan — no XML crate.
+fn metainfo_summary_description(
+    stage: &Path,
+) -> miette::Result<(Option<String>, Option<String>, String)> {
+    let dir = stage.join("usr/share/metainfo");
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|e| miette::miette!("adopt-info: failed to read {}: {}", dir.display(), e))?
+        {
+            let entry = entry
+                .map_err(|e| miette::miette!("adopt-info: failed to read metainfo entry: {e}"))?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".metainfo.xml") || name.ends_with(".appdata.xml") {
+                candidates.push(entry.path());
+            }
+        }
+    }
+    candidates.sort();
+    let Some(path) = candidates.into_iter().next() else {
+        return Ok((None, None, String::new()));
+    };
+    let from = format!(
+        "usr/share/metainfo/{}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| miette::miette!("adopt-info: failed to read {}: {}", path.display(), e))?;
+    let summary = xml_element_text(&content, "summary");
+    let description = xml_element_text(&content, "description").map(|d| xml_paragraphs(&d));
+    Ok((summary, description, from))
+}
+
+/// Inner text of the first `<tag>` element in an XML document, whitespace-
+/// collapsed. Handles attribute soup on the open tag (`<summary
+/// xml:lang="en">`); self-closing or unclosed elements yield nothing.
+fn xml_element_text(content: &str, tag: &str) -> Option<String> {
+    xml_element_span(content, tag)
+        .map(|(inner, _)| inner.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// (inner text, remainder after the closing tag) of the first `<tag>`
+/// element. Skips false positives like `<summaryfoo>`.
+fn xml_element_span<'a>(content: &'a str, tag: &str) -> Option<(&'a str, &'a str)> {
+    let open = format!("<{tag}");
+    let mut search = content;
+    loop {
+        let idx = search.find(&open)?;
+        let after = &search[idx + open.len()..];
+        if !(after.starts_with('>')
+            || after.starts_with(' ')
+            || after.starts_with('\t')
+            || after.starts_with('\n'))
+        {
+            search = after;
+            continue;
+        }
+        let gt = after.find('>')?;
+        let body = &after[gt + 1..];
+        let close = format!("</{tag}>");
+        let close_idx = body.find(&close)?;
+        return Some((&body[..close_idx], &body[close_idx + close.len()..]));
+    }
+}
+
+/// Description text: the `<p>` paragraphs inside an AppStream
+/// `<description>`, joined by blank lines (markdown-ish, the convention
+/// snapcraft parse-info follows). Falls back to the tag-stripped inner text
+/// when the element holds no paragraphs.
+fn xml_paragraphs(description_inner: &str) -> String {
+    let mut paragraphs = Vec::new();
+    let mut rest = description_inner;
+    while let Some((inner, remainder)) = xml_element_span(rest, "p") {
+        paragraphs.push(inner.split_whitespace().collect::<Vec<_>>().join(" "));
+        rest = remainder;
+    }
+    if paragraphs.is_empty() {
+        return strip_tags(description_inner);
+    }
+    paragraphs.join("\n\n")
+}
+
+/// Remove `<…>` markup from a string.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Enforce snapd's per-field limits on an extracted value — error, never
+/// truncate (a truncated summary or version would be published as if it
+/// were the source's own; snapd likewise `fmt.Errorf`s every over-limit
+/// field rather than cutting it, `snap/validate.go`). Version counts bytes;
+/// summary and description count Unicode codepoints.
+fn check_adopt_cap(field: &str, value: &str, from: &str) -> miette::Result<()> {
+    match field {
+        "version" => {
+            if value.len() > SNAPD_VERSION_MAX_BYTES {
+                return Err(miette::miette!(
+                    "adopt-info: extracted version \"{value}\" (from {from}) exceeds snapd's \
+                     {SNAPD_VERSION_MAX_BYTES}-byte limit — shorten the source metadata or \
+                     declare the field explicitly instead"
+                ));
+            }
+            if !is_snapd_version_charset_ok(value) {
+                return Err(miette::miette!(
+                    "adopt-info: extracted version \"{value}\" (from {from}) does not match \
+                     snapd's version charset (must start and end with a letter or digit; \
+                     interior characters may also be one of : . + ~ -)"
+                ));
+            }
+            Ok(())
+        }
+        "summary" => check_adopt_text_cap("summary", value, from, SNAPD_SUMMARY_MAX_CHARS),
+        "description" => {
+            check_adopt_text_cap("description", value, from, SNAPD_DESCRIPTION_MAX_CHARS)
+        }
+        other => unreachable!("unknown adopt-info field {other:?}"),
+    }
+}
+
+/// snapd's version charset (`snap/validate.go`): one or more characters,
+/// starting with a letter or digit, ending with a letter/digit/`+`/`~`, and
+/// interior characters may additionally be one of `:`, `.`, `+`, `~`, `-`.
+/// All classes are ASCII (so ≤ 32 bytes follows from the shape); non-ASCII
+/// never matches. Hand-rolled to keep a regex dependency out of this path.
+fn is_snapd_version_charset_ok(v: &str) -> bool {
+    let alnum = |c: char| c.is_ascii_alphanumeric();
+    let tail = |c: char| alnum(c) || matches!(c, '+' | '~');
+    let interior = |c: char| tail(c) || matches!(c, ':' | '.' | '-');
+    let mut chars = v.chars();
+    match chars.next() {
+        Some(first) => {
+            alnum(first)
+                && chars.all(interior)
+                && v.chars().next_back().is_some_and(tail)
+                && v.len() <= SNAPD_VERSION_MAX_BYTES
+        }
+        None => false,
+    }
+}
+
+/// snapd counts summary/description in Unicode codepoints (not bytes).
+fn check_adopt_text_cap(field: &str, value: &str, from: &str, max: usize) -> miette::Result<()> {
+    if value.chars().count() > max {
+        return Err(miette::miette!(
+            "adopt-info: extracted {field} \"{value}\" (from {from}) exceeds snapd's \
+             {max}-character limit — shorten the source metadata or declare \
+             the field explicitly instead"
+        ));
+    }
+    Ok(())
+}
+
+/// Deterministic execution order for parts: a part is runnable once every
+/// `after` dependency has completed; parts with no `after` are runnable
+/// immediately. Among ready parts the name-sorted one runs first — the
+/// documented deterministic tie-break (Lua tables don't preserve order, so
+/// any non-`after` ordering is intentionally unspecified beyond this
+/// determinism).
+pub fn order_parts(parts: &BTreeMap<String, SnapPart>) -> miette::Result<Vec<String>> {
+    for name in parts.keys() {
+        validate_part_name(name)?;
+    }
+    let mut order = Vec::with_capacity(parts.len());
+    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while order.len() < parts.len() {
+        // Smallest ready part name.
+        let next = parts
+            .iter()
+            .filter(|(name, part)| {
+                !done.contains(name.as_str())
+                    && part.after.iter().all(|dep| done.contains(dep.as_str()))
+            })
+            .map(|(name, _)| name)
+            .min()
+            .cloned();
+        let Some(next) = next else {
+            let stuck: Vec<String> = parts
+                .keys()
+                .filter(|name| !done.contains(name.as_str()))
+                .cloned()
+                .collect();
+            return Err(miette::miette!(
+                "circular or unsatisfiable dependency among parts: {}",
+                stuck.join(", ")
+            ));
+        };
+        done.insert(next.clone());
+        order.push(next);
+    }
+    Ok(order)
+}
+
+/// Part names become directory names under the build tree; keep them plain,
+/// and reserve the shared source dir name.
+fn validate_part_name(name: &str) -> miette::Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(miette::miette!(
+            "invalid part name '{name}': must be a plain directory name (no '/', '.', '..')"
+        ));
+    }
+    if name == SOURCE_DIR_NAME {
+        return Err(miette::miette!(
+            "invalid part name '{name}': reserved for the shared build source directory"
+        ));
+    }
+    Ok(())
+}
+
+/// Run named parts sequentially in dependency order (v1 — no parallelism).
+///
+/// Each part runs in its own work dir under the build tree
+/// (`<build-tree>/<part-name>/`) with `$STAGE` shared across parts — the
+/// integration point: every part installs into the same stage. `$PART_NAME`
+/// holds the running part's name. The whole build tree (shared source dir
+/// included) is visible in every sandbox and sandbox env/inputs are
+/// identical for every part; per-part sources/inputs are future work.
+fn run_parts(
+    parts: &BTreeMap<String, SnapPart>,
+    build_tree: &Path,
+    src_dir: &Path,
+    stage_dir: &Path,
+    target: Option<&str>,
+    deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
+) -> miette::Result<()> {
+    for name in order_parts(parts)? {
+        let part = parts.get(&name).expect("name comes from the same map");
+        let plan = part_build_plan(&name, part)?;
+        let part_dir = build_tree.join(&name);
+        std::fs::create_dir_all(&part_dir)
+            .map_err(|e| miette::miette!("failed to create work dir for part '{name}': {}", e))?;
+        let spinner = output::spinner(&format!("[{name}] building..."));
+        for cmd in &plan.commands {
+            run_build_command(
+                cmd,
+                build_tree,
+                &part_dir,
+                src_dir,
+                stage_dir,
+                target,
+                Some(&name),
+                &plan.env,
+                deps_dir,
+                build_prefix,
+            )?;
+        }
+        output::finish_ok(&spinner, &format!("[{name}] built"));
+    }
+    Ok(())
+}
+
+/// The command sequence a part runs. Plugin parts expand to their
+/// declarative [`nau_core::plugins::BuildPlan`] (ADR-0014 Decision 4) — the
+/// plugin cannot execute arbitrary logic beyond the commands it emits.
+/// Command parts run their single `build` command unchanged.
+fn part_build_plan(name: &str, part: &SnapPart) -> miette::Result<nau_core::plugins::BuildPlan> {
+    match (&part.plugin, part.build.is_empty()) {
+        (Some(plugin), true) => nau_core::plugins::expand(plugin, part.plugin_options.as_ref()),
+        (Some(_), false) | (None, true) => Err(miette::miette!(
+            "part '{name}' must have exactly one of 'build' or 'plugin'"
+        )),
+        (None, false) => Ok(nau_core::plugins::BuildPlan {
+            commands: vec![part.build.clone()],
+            env: Vec::new(),
+            extra_requires: Vec::new(),
+            extra_build_deps: Vec::new(),
+        }),
+    }
+}
+
+/// Compute SHA-256 of a file (streaming, memory-efficient for large files).
+fn sha256_file(path: &Path) -> miette::Result<String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| miette::miette!("failed to open {}: {}", path.display(), e))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| miette::miette!("failed to read {}: {}", path.display(), e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let hash = hasher.finalize();
+    Ok(hash.iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+/// Run a build command, optionally wrapped in a bubblewrap sandbox.
+///
+/// `build_path` is the root build directory (host-side).
+/// `work_dir` is the command's working directory (inside `build_path`).
+/// `src_dir` is the source root `$SRC` points at (inside `build_path`;
+/// equals `work_dir` for single-part builds).
+/// Inside the sandbox the build dir is mounted at `/build` and
+/// `$SRC` points to the source subdirectory.
+/// If `bwrap` is unavailable, falls back to direct execution.
+///
+/// `part_name` is set for multi-part builds and exported as `$PART_NAME`.
+///
+/// Cross-compilation support:
+/// - If `target` is set, env vars CC, CXX, LD, AR, etc. are set to
+///   `{target}-{tool}` (using the GNU cross-compiler naming convention).
+/// - `CONFIGURE_TARGET` is exported for autotools-based packages.
+/// - The cross-toolchain sysroot is expected at the standard host path
+///   `/usr/{target}` or can be provided via `CROSS_SYSROOT`.
+///
+/// `extra_env` carries plugin BuildPlan env vars (ADR-0014 Decision 4),
+/// exported to the command in both sandboxed and direct modes.
+#[allow(clippy::too_many_arguments)]
+fn run_build_command(
+    cmd: &str,
+    build_path: &Path,
+    work_dir: &Path,
+    src_dir: &Path,
+    stage_dir: &Path,
+    target: Option<&str>,
+    part_name: Option<&str>,
+    extra_env: &[(String, String)],
+    deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
+) -> miette::Result<()> {
+    let bwrap_bin = detect_bwrap();
+    let cross_env = cross_compile_env(target);
+    // Fail closed (issue #44): a CGO-declaring build without a declared C
+    // toolchain stops here, naming the fix, before any command runs.
+    ensure_cgo_toolchain(cmd, extra_env, build_prefix, target)?;
+
+    if let Some(bwrap_bin) = bwrap_bin {
+        run_bwrapped(
+            &bwrap_bin,
+            cmd,
+            build_path,
+            work_dir,
+            src_dir,
+            stage_dir,
+            target,
+            &cross_env,
+            part_name,
+            extra_env,
+            deps_dir,
+            build_prefix,
+        )
+    } else {
+        output::warn("sandbox unavailable — building WITHOUT isolation");
+        run_direct(
+            cmd,
+            work_dir,
+            src_dir,
+            stage_dir,
+            &cross_env,
+            part_name,
+            extra_env,
+            deps_dir,
+            build_prefix,
+        )
+    }
+}
+/// Detect the bubblewrap binary, if available.
+fn detect_bwrap() -> Option<String> {
+    std::process::Command::new("which")
+        .arg("bwrap")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        })
+}
+
+/// Build cross-compilation environment variables if target is set.
+/// These follow the GNU cross-compiler naming convention:
+///   CC = <target>-gcc, CXX = <target>-g++, etc.
+fn cross_compile_env(target: Option<&str>) -> Vec<(&'static str, String)> {
+    let Some(triplet) = target else {
+        return Vec::new();
+    };
+    let mut env = Vec::new();
+    env.push(("CONFIGURE_TARGET", triplet.to_string()));
+    env.push(("CC", format!("{}-gcc", triplet)));
+    env.push(("CXX", format!("{}-g++", triplet)));
+    env.push(("LD", format!("{}-ld", triplet)));
+    env.push(("AR", format!("{}-ar", triplet)));
+    env.push(("AS", format!("{}-as", triplet)));
+    env.push(("RANLIB", format!("{}-ranlib", triplet)));
+    env.push(("STRIP", format!("{}-strip", triplet)));
+    env.push(("OBJCOPY", format!("{}-objcopy", triplet)));
+    env.push(("OBJDUMP", format!("{}-objdump", triplet)));
+    env.push(("NM", format!("{}-nm", triplet)));
+    env.push(("PKG_CONFIG", format!("{}-pkg-config", triplet)));
+    // Standard autotools cross-compilation vars
+    env.push(("BUILD", std::env::consts::ARCH.to_string()));
+    env.push(("HOST", triplet.to_string()));
+    env.push(("CROSS_COMPILE", format!("{}-", triplet)));
+    env
+}
+
+/// Apply cross-compilation env vars to a command.
+fn apply_cross_env(cmd: &mut std::process::Command, cross_env: &[(&'static str, String)]) {
+    for (key, val) in cross_env {
+        cmd.env(key, val);
+    }
+}
+
+/// Read-only bind of `path` into the sandbox, if it exists on the host.
+fn ro_bind_if_exists(cmd: &mut std::process::Command, path: &str) {
+    if Path::new(path).exists() {
+        cmd.arg("--ro-bind").arg(path).arg(path);
+    }
+}
+
+/// Host path roots bound read-only into the build sandbox (see
+/// [`bind_system_ro_paths`]). This is the sandbox's entire view of the host
+/// filesystem apart from the resolver/trust files of
+/// [`SANDBOX_ETC_RO_PATHS`]: a build tool resolves inside the sandbox only
+/// if its PATH entry lives under one of these roots. Entries elsewhere (e.g. a
+/// project's `.devbox` profile dir) are invisible to sandboxed builds, and
+/// a `nix store` garbage collection can delete `/nix/store` paths a stale
+/// shell still exports — both turn a working host setup into an obscure
+/// mid-build failure. Doctor and the sandboxed build runner resolve tools
+/// against this same list so that failure mode becomes a named pre-flight
+/// diagnostic instead.
+pub const SANDBOX_RO_ROOTS: [&str; 6] = [
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/nix",
+    "/bin",
+    "/run/current-system",
+];
+
+/// Name-resolution and CA-trust paths bound read-only into the build
+/// sandbox (issue #176), on top of [`SANDBOX_RO_ROOTS`]. The FHS roots
+/// carry no `/etc`, so a build command that fetches over the network had
+/// neither a resolver (`curl: (6) Could not resolve host`) nor TLS trust
+/// (the merged build prefix's curl is a bare pod payload — the #130 class;
+/// the #138 wrapper only lands in installed payloads, not build prefixes).
+/// Kept separate from [`SANDBOX_RO_ROOTS`] because that list is also the
+/// doctor's tool-visibility root set and the declared-app confinement's
+/// bind set — these files are neither tool roots nor app grants, and the
+/// declared-app sandboxes stay untouched. Each path binds only when it
+/// exists on the host (`ro_bind_if_exists`): distros without
+/// `/etc/ssl/certs` keep building, exactly as before.
+pub const SANDBOX_ETC_RO_PATHS: [&str; 3] = ["/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs"];
+
+/// The CA bundle the build env defaults `CURL_CA_BUNDLE` to (issue #176).
+/// The same file the ca-certificates payload installs; the sandbox binds
+/// its directory read-only ([`SANDBOX_ETC_RO_PATHS`]), so the default
+/// resolves inside the sandbox exactly when it exists on the host.
+pub const SANDBOX_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+/// Where the fetched dependency closure (ADR-0017, issue #13) is mounted
+/// inside the build sandbox (read-only), and what `$NAU_DEPS_DIR`
+/// points the build command at.
+pub const SANDBOX_DEPS_DIR: &str = "/nau-deps";
+
+/// Where the merged build prefix (ADR-0018 Decision 2, issue #17) is
+/// mounted inside the build sandbox (read-only), and what
+/// `$NAU_BUILD_PREFIX` points the build command at. The prefix holds
+/// the payload files of the package's `requires` + `build_deps` entries,
+/// merged into one `/usr`-like tree, so `./configure`, `pkg-config`, and
+/// compilers consume pool libraries unmodified.
+pub const SANDBOX_BUILD_PREFIX: &str = "/nau-build-prefix";
+
+/// The env a build command sees for the merged build prefix: the prefix
+/// root plus the standard variables that steer `./configure`, `pkg-config`,
+/// and the compiler at it. `prefix` is the path AS THE BUILD SEES IT — the
+/// sandbox path under bwrap, the host path in degraded direct mode.
+///
+/// `PKG_CONFIG_SYSROOT_DIR` makes pkg-config rewrite the `/usr`-rooted
+/// paths baked into pool `.pc` files onto the prefix (ncurses ships
+/// `prefix=/usr` in its `.pc`); `CPPFLAGS`/`LDFLAGS` cover configure's
+/// header/link probes when no `.pc` file exists.
+pub fn build_prefix_env(prefix: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("NAU_BUILD_PREFIX", prefix.to_string()),
+        (
+            "CPPFLAGS",
+            format!("-I{}/usr/include -I{}/usr/usr/include", prefix, prefix),
+        ),
+        // Aligned with LIBRARY_PATH below (#209 watch item): one -L per
+        // dir, same order — configure/meson/libtool probes that read
+        // LDFLAGS get the multiarch dirs the cc shim's -L translation
+        // already covers.
+        ("LDFLAGS", build_prefix_ld_flags(prefix)),
+        // Build-time execution of prefix binaries needs the prefix's own
+        // libs on the loader path: the portable-ELF machinery (#12) strips
+        // RUNPATHs from pod-built payloads, so e.g. the lua interpreter in
+        // the prefix cannot find its merged readline/ncurses without this
+        // (observed as luarocks' configure failing its version probe with
+        // a silent exit 127). Replaces any inherited value — the sandbox
+        // is hermetic and the project already drops inherited LD pollution
+        // (hermetic_sandbox_drops_inherited_ldflags_pollution).
+        //
+        // The deb-gcc payload (#164) stages under the multiarch dir —
+        // cc1's own DT_NEEDED (libisl, libmpc, libmpfr, zstd) live at
+        // usr/lib/<triplet>/, not usr/lib — and the driver execs cc1 with
+        // this env, so a prefix carrying gcc misses them without it
+        // (#180 item 2: git's build died at cc1 exec). Adding the common
+        // multiarch dirs unconditionally is safe: nonexistent dirs on
+        // LD_LIBRARY_PATH are ignored by the loader.
+        //
+        // {prefix}/lib64: the pool glibc payload's source build stages
+        // its runtime (slibdir: ld-linux, libc.so.6, libm.so.6, ...) at
+        // the ROOT lib64 while the dev half (ld scripts, crt, .a) lands
+        // at usr/lib64 — the linker resolves the clean `libc.so` script
+        // to bare `libc.so.6` and only searches -L/LIBRARY_PATH dirs for
+        // it, so the runtime slibdir has to be on this list too.
+        ("LD_LIBRARY_PATH", build_prefix_ld_library_path(prefix)),
+        // The gcc payload's cc/c++ shims compose -L/-idirafter flags from
+        // these (gcc.lua shim contract: it mirrors the farm LD wrapper,
+        // which exports them for farm-side builds). Without them the shim
+        // execs the driver with an empty link/include search and every
+        // sanity link dies on unresolvable -lgcc_s/libc (#180 item 2b).
+        ("LIBRARY_PATH", build_prefix_ld_library_path(prefix)),
+        ("CPATH", build_prefix_usr_include_dirs(prefix)),
+        ("PKG_CONFIG_PATH", build_prefix_pkgconfig_dirs(prefix)),
+        ("PKG_CONFIG_SYSROOT_DIR", prefix.to_string()),
+    ]
+}
+
+/// The lib dirs `LIBRARY_PATH` exposes for the merged prefix: the same
+/// dirs as the LD list. The gcc payload's cc shims turn these into `-L`
+/// flags (gcc.lua shim contract), so link-time searches — libgcc_s.so.1,
+/// libc_nonshared.a, crt files — resolve against the prefix the same way
+/// loader-time searches do (#180 item 2b). Includes the prefix's root
+/// `lib64` — the glibc payload's slibdir (runtime) half, see
+/// `build_prefix_env` (#180 follow-up: the linker's `libc.so` script
+/// resolves to a bare `libc.so.6` only a listed dir can satisfy).
+///
+/// Foreign-arch caveat (#209 watch item): the triplet dirs are listed
+/// unconditionally, in a FIXED order (x86_64, aarch64, armhf), and the
+/// order is load-bearing the day a payload populates a dir it does not
+/// belong to. Today it is inert — a payload stages only its own arch's
+/// set (gcc.lua selects one deb set per build on
+/// `$CONFIGURE_TARGET`/`uname -m`), so at most one triplet dir exists.
+/// But the loader and the linker both take the FIRST dir carrying a
+/// soname: if a future payload ever stages a foreign arch's libs (or
+/// several arches at once), this amd64-first list would silently prefer
+/// x86_64 libraries for an aarch64/armhf link. Re-order or arch-filter
+/// this list before shipping such a payload — don't rely on the accident.
+fn build_prefix_ld_library_path(prefix: &str) -> String {
+    format!(
+        "{}/usr/lib:{}/usr/lib64:{}/lib64:{}/usr/lib/x86_64-linux-gnu:{}/usr/lib/aarch64-linux-gnu:{}/usr/lib/arm-linux-gnueabihf",
+        prefix, prefix, prefix, prefix, prefix, prefix
+    )
+}
+
+/// The `-L` list `LDFLAGS` exposes for the merged prefix: one flag per
+/// dir of [`build_prefix_ld_library_path`], same order. Configure,
+/// meson, and libtool link probes read `LDFLAGS` directly — without the
+/// multiarch entries a link line that bypasses the gcc cc shim's
+/// LIBRARY_PATH→-L translation searched `{prefix}/usr/lib` only and
+/// missed the deb payloads' multiarch-staged libs (#209 watch item).
+/// The first flag is unchanged (`usr/lib` keeps priority), so existing
+/// consumers' search order only widens.
+fn build_prefix_ld_flags(prefix: &str) -> String {
+    build_prefix_ld_library_path(prefix)
+        .split(':')
+        .map(|dir| format!("-L{dir}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The include/pc dirs the merged prefix serves: the deb payloads keep
+/// the dpkg `./usr` doubling inside their trees (usr/usr/...), and the
+/// raw recursive merge preserves it, so pkg-config and bare `-I` probes
+/// need both spellings (#180: git's libsecret helper missed
+/// libsecret-1.pc at {prefix}/usr/usr/lib/pkgconfig).
+fn build_prefix_usr_include_dirs(prefix: &str) -> String {
+    format!("{}/usr/include:{}/usr/usr/include", prefix, prefix)
+}
+
+fn build_prefix_pkgconfig_dirs(prefix: &str) -> String {
+    format!(
+        "{}/usr/lib/pkgconfig:{}/usr/lib64/pkgconfig:{}/usr/share/pkgconfig:{}/usr/usr/lib/pkgconfig:{}/usr/usr/share/pkgconfig",
+        prefix, prefix, prefix, prefix, prefix
+    )
+}
+
+/// The `CURL_CA_BUNDLE` env pair the build env defaults to (issue #176), or
+/// `None` when no default may be set. Two gates:
+///
+/// * `ambient` is Some when the caller/recipe already defines
+///   `CURL_CA_BUNDLE` — the #138 ambient-trust/never-clobber rule: the
+///   caller's own trust choice is never overwritten. In the sandboxed
+///   build the ambient env is dropped by design (issue #10 hermetic), so
+///   the recipe's `extra_env` pair is the only trust declaration that can
+///   exist ahead of this default; in degraded-direct mode the caller's
+///   real env rides through and is honored here.
+/// * `bundle_exists` reports the host bundle file: pointing
+///   `CURL_CA_BUNDLE` at a missing file turns every TLS fetch into an
+///   "error setting certificate verify locations" failure, so the default
+///   is issued only when the file is actually there — which is exactly
+///   the condition under which the sandbox bound `/etc/ssl/certs`
+///   ([`SANDBOX_ETC_RO_PATHS`]).
+fn default_curl_ca_bundle(
+    ambient: Option<&str>,
+    bundle_exists: bool,
+) -> Option<(&'static str, String)> {
+    if ambient.is_some() || !bundle_exists {
+        return None;
+    }
+    Some(("CURL_CA_BUNDLE", SANDBOX_CA_BUNDLE.to_string()))
+}
+
+/// The C-toolchain env the merged build prefix contributes (issue #44):
+/// `CC`/`CXX` pointed at the pool toolchain drivers (bare names — the
+/// prefix's `usr/bin` leads the sandbox PATH in both the bwrap and
+/// degraded-direct modes, so the name resolves to the pool compiler, not
+/// a coincidental host one).
+///
+/// Probed from the prefix, not hardcoded: a prefix without a compiler
+/// (a docs tool, a pure-Go consumer's `go`-only closure) contributes
+/// nothing, and a clang toolchain (ADR-0007 naming scheme) contributes
+/// its own driver names. Cross builds are unaffected — `cross_compile_env`
+/// applies after this and overrides both vars with the triplet-prefixed
+/// drivers.
+///
+/// Nothing here sets `CGO_ENABLED` — that stays the recipe's declaration,
+/// and [`ensure_cgo_toolchain`] holds the fail-closed line under it.
+///
+/// The staged compiler needs no RUNPATH wiring inside the sandbox — and
+/// the payload carries none. gcc.lua is a pure file-copy of the Debian
+/// trixie debs (no rebuild step, nothing bakes a RUNPATH), and the leak
+/// scan FAILS produced binaries carrying prefix RUNPATHs — it never
+/// mints them. cc1/cc1plus resolve their own DT_NEEDED (libisl, libmpc,
+/// libmpfr, libgmp, libzstd, staged under the payload's multiarch dir)
+/// through [`build_prefix_env`]'s LD_LIBRARY_PATH alone — the #210-lane
+/// LD_DEBUG capture attributes every cc1 probe to LD_LIBRARY_PATH
+/// entries with no RUNPATH candidate — and link searches ride the cc
+/// shim's LIBRARY_PATH→-L translation (the gcc.lua shim contract). The
+/// earlier "cc1 carries RUNPATH=/nau-build-prefix/usr/lib{,64}"
+/// claim here described the pre-#164 source-built gcc recipe and died
+/// with it (#209 watch item).
+pub fn build_prefix_toolchain_env(prefix: &Path) -> Vec<(&'static str, String)> {
+    let bin = prefix.join("usr/bin");
+    [
+        ("CC", ["gcc", "clang"].as_slice()),
+        ("CXX", ["g++", "clang++"].as_slice()),
+    ]
+    .into_iter()
+    .filter_map(|(var, names)| {
+        names
+            .iter()
+            .find(|n| bin.join(n).exists())
+            .map(|n| (var, (*n).to_string()))
+    })
+    .collect()
+}
+
+/// True when a build command (or a plugin env pair) declares
+/// `CGO_ENABLED=1` — the recipe's explicit opt-in to C compilation. The
+/// plain-substring contract is fail-closed by construction: it can only
+/// over-trigger (a literal echo of the string), never miss an opt-in that
+/// spells the variable the standard way.
+fn declares_cgo(cmd: &str, extra_env: &[(String, String)]) -> bool {
+    cmd.contains("CGO_ENABLED=1")
+        || extra_env
+            .iter()
+            .any(|(k, v)| k == "CGO_ENABLED" && v == "1")
+}
+
+/// Whether `prefix` (the merged build prefix, at its host path in both
+/// sandboxed and degraded-direct modes) provides a C compiler at its
+/// `usr/bin`.
+fn prefix_has_c_compiler(prefix: &Path) -> bool {
+    ["gcc", "cc", "clang"]
+        .iter()
+        .any(|n| prefix.join("usr/bin").join(n).exists())
+}
+
+/// Fail closed (issue #44): a build that declares `CGO_ENABLED=1` without a
+/// C toolchain in its `build_deps` cannot compile C — and rather than dying
+/// mid-Go with `cgo: C compiler "gcc" not found in $PATH`, or silently
+/// building against a coincidental host compiler that leaked through the
+/// sandbox's system binds, the build refuses up front and names the fix.
+///
+/// Cross builds are exempt: `target` routes the C compiler through the
+/// sysroot machinery (`cross_compile_env`), not the merged prefix.
+pub fn ensure_cgo_toolchain(
+    cmd: &str,
+    extra_env: &[(String, String)],
+    build_prefix: Option<&Path>,
+    target: Option<&str>,
+) -> miette::Result<()> {
+    if target.is_some() || !declares_cgo(cmd, extra_env) {
+        return Ok(());
+    }
+    let has_compiler = build_prefix.map(prefix_has_c_compiler).unwrap_or(false);
+    if !has_compiler {
+        miette::bail!(
+            "build command enables CGO (CGO_ENABLED=1) but no C toolchain is \
+             declared for the build sandbox\n\n\
+             fix: add the pool toolchain (plus pkg-config and every C library \
+             you link) to build_deps:\n\n    \
+             build_deps = {{ \"toolchain\", \"pkg-config\", ... }}\n\n\
+             A library you link must also appear in requires — the build/link \
+             split is ADR-0018's explicit-duplication norm."
+        );
+    }
+    Ok(())
+}
+
+/// The process PATH split into absolute directory entries. Relative and
+/// empty entries are dropped — the sandbox only ever mirrors absolute host
+/// paths.
+pub fn path_entries() -> Vec<PathBuf> {
+    std::env::var("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .filter(|e| e.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True if `path` lives under a sandbox bind root ([`SANDBOX_RO_ROOTS`])
+/// — the sandbox binds those roots at the same host path, so anything
+/// under them is visible to a sandboxed build. Component-wise, so a
+/// sibling prefix (`/usrlocal`) does not match.
+pub fn sandbox_visible(path: &Path) -> bool {
+    SANDBOX_RO_ROOTS.iter().any(|root| path.starts_with(root))
+}
+
+/// PATH entries the sandbox can actually see: under a bind root AND still
+/// present on the host. A garbage-collected `/nix/store/...` entry is
+/// bound via `/nix` but its directory no longer exists — it resolves
+/// nothing and is dropped, matching what the sandbox would see.
+pub fn sandbox_visible_entries(entries: &[PathBuf]) -> Vec<PathBuf> {
+    sandbox_visible_entries_with(entries, &[])
+}
+
+/// Like [`sandbox_visible_entries`], but `extra_roots` are host paths the
+/// sandbox binds at their own location — the stage dir is rw-bound at its
+/// host path, so tools under it resolve inside the sandbox.
+///
+/// Each entry is first resolved to its canonical path (symlinks followed):
+/// a devbox/nix profile dir like `$PROJECT/.devbox/nix/profile/default/bin`
+/// is a symlink into `/nix/store`, so canonicalizing maps it onto a bound
+/// root and keeps the tools it exposes usable inside the sandbox (the
+/// sandbox binds `/nix`, but binds the *profile* dir nowhere). Entries that
+/// do not exist (a garbage-collected store path, a missing dir) resolve to
+/// nothing and are dropped, matching what the sandbox would see.
+pub fn sandbox_visible_entries_with(entries: &[PathBuf], extra_roots: &[PathBuf]) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .filter_map(|e| std::fs::canonicalize(e).ok())
+        .filter(|e| {
+            (sandbox_visible(e) || extra_roots.iter().any(|r| e.starts_with(r))) && e.is_dir()
+        })
+        .collect()
+}
+
+/// The `PATH` the sandbox can actually see for the given `extra_roots`
+/// (a colon-joined [`sandbox_visible_entries_with`]) — the hermetic
+/// sandbox PATH baseline so inherited host env (devbox/nix-shell paths
+/// that are NOT bound) never leaks into the build. The sandboxed build
+/// ([`run_bwrapped`]) prepends the merged build prefix's bin dir when one
+/// is bound, so build_deps tooling shadows coincidental host tools.
+pub fn sandbox_path(extra_roots: &[PathBuf]) -> std::ffi::OsString {
+    let entries = sandbox_visible_entries_with(&path_entries(), extra_roots);
+    std::env::join_paths(entries).unwrap_or_default()
+}
+
+/// First existing, executable match for `name` in `entries` (PATH order —
+/// the same resolution `sh` performs).
+pub fn resolve_in_path(name: &str, entries: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    entries
+        .iter()
+        .map(|entry| entry.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+/// Shell keywords and POSIX sh builtins — never resolved through PATH.
+const SHELL_WORDS: [&str; 59] = [
+    "if", "then", "else", "elif", "fi", "do", "done", "case", "esac", "while", "until", "for",
+    "in", "function", "select", "time", "{", "}", "!", "[[", "]]", ":", ".", "alias", "bg",
+    "break", "cd", "command", "continue", "echo", "eval", "exec", "exit", "export", "false", "fg",
+    "getopts", "hash", "jobs", "kill", "local", "printf", "pwd", "read", "readonly", "return",
+    "set", "shift", "test", "times", "trap", "true", "type", "ulimit", "umask", "unalias", "unset",
+    "wait", "[",
+];
+
+/// Command words in `cmd` that `sh` would resolve through PATH: the first
+/// word of each `&&`/`||`/`;`/`|`/newline-separated segment, after
+/// skipping leading variable assignments (`DESTDIR=$STAGE cmake ...`).
+/// Only `&&` separates commands — a lone `&` is a background mark or part
+/// of a redirection (`2>&1`) and must not split the segment. Words naming
+/// a direct path, a variable, a glob, or a shell builtin resolve outside
+/// PATH and are not probed.
+///
+/// Two kinds of non-command text never probe (issue #33): heredoc bodies
+/// and their terminator lines — text the redirecting command consumes,
+/// whose lines otherwise surface as phantom segments (empirically
+/// `tool 'from'` off a Python launcher heredoc) — and separators inside
+/// quotes, where they are argument text (`sh -c 'a; b'` runs ONE command,
+/// `sh`). Command-substitution interiors never probe either (issue #39):
+/// a `$(...)` is a runtime sub-command of the outer command — and an
+/// assignment like `v=$(go version)` otherwise tears into interior words
+/// (`version)`) that surface as phantom missing tools.
+fn path_resolved_words(cmd: &str) -> Vec<String> {
+    let heredoc_stripped = strip_heredoc_bodies(cmd);
+    let stripped = strip_command_substitutions(&heredoc_stripped);
+    let mut words = Vec::new();
+    for segment in split_segments(&stripped) {
+        for word in segment.split_whitespace() {
+            if is_variable_assignment(word) {
+                continue;
+            }
+            let word = unquote(word);
+            if is_path_resolved_word(word) {
+                words.push(word.to_string());
+            }
+            break;
+        }
+    }
+    words
+}
+
+/// Drop heredoc bodies (and their terminator lines) from `cmd`: after a
+/// `<<DELIM` redirection every following line up to the line that is
+/// exactly `DELIM` is text the redirecting command consumes — not commands
+/// of their own. The line carrying the redirection is kept. Input without
+/// a heredoc operator comes back unchanged (borrowed).
+fn strip_heredoc_bodies(cmd: &str) -> std::borrow::Cow<'_, str> {
+    if !cmd.contains("<<") {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    // Some while inside a heredoc body: (delimiter, `<<-` dash form —
+    // leading tabs allowed on the terminator line).
+    let mut body: Option<(String, bool)> = None;
+    for line in cmd.split('\n') {
+        if let Some((delimiter, dash)) = &body {
+            let candidate = if *dash {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if candidate.trim_end() == delimiter {
+                body = None;
+            }
+            continue;
+        }
+        if let Some((delimiter, dash)) = heredoc_delimiter(line) {
+            body = Some((delimiter, dash));
+        }
+        kept.push(line);
+    }
+    if kept.len() == cmd.split('\n').count() {
+        std::borrow::Cow::Borrowed(cmd)
+    } else {
+        std::borrow::Cow::Owned(kept.join("\n"))
+    }
+}
+
+/// Replace every `$( ... )` command-substitution span in `cmd` with a bare
+/// `$`: the interior is a sub-command the outer command consumes at
+/// runtime — not a build command of its own — so its words must never
+/// probe, and its `|`/`;`/`&&` must not split segments. The scan is
+/// paren-depth aware (nested substitutions and subshells like
+/// `$(a $(b))` close at the matching `)`, as does `$((...))` arithmetic)
+/// and quote-aware (`")"` is argument text; a substitution inside double
+/// quotes still evaluates, one inside single quotes does not). The `$`
+/// placeholder keeps the surrounding word non-PATH-resolvable
+/// (`foo$(x)bar` stays `$`-tainted). Input without `$(` comes back
+/// unchanged (borrowed).
+fn strip_command_substitutions(cmd: &str) -> std::borrow::Cow<'_, str> {
+    if !cmd.contains("$(") {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+    let bytes = cmd.as_bytes();
+    let mut kept = String::with_capacity(cmd.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    // Open command-substitution parens; 0 = outside any substitution.
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'$' if !in_single && bytes.get(i + 1) == Some(&b'(') => {
+                let opening = depth == 0;
+                depth += 1;
+                if opening {
+                    kept.push('$');
+                }
+                i += 1; // skip the `(`
+            }
+            b'(' if depth > 0 && !in_single && !in_double => depth += 1,
+            b')' if depth > 0 && !in_single && !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    i += 1;
+                    continue; // closing paren: dropped with the interior
+                }
+            }
+            _ if depth > 0 => {} // substitution interior — dropped
+            b => kept.push(char::from(b)),
+        }
+        i += 1;
+    }
+    std::borrow::Cow::Owned(kept)
+}
+
+/// The heredoc delimiter a line's `<<` redirection opens: `Some((delimiter,
+/// dash-form))`. Quoted delimiters (`<<'EOF'`, `<<"EOF"`) unquote; a
+/// space-separated one (`cat << EOF`) is found after the blanks. `None`
+/// when the line opens no heredoc: `<<` inside quotes is argument text,
+/// `<<<` is a here-string, and the heuristic requires a plausible
+/// delimiter word (alphabetic/underscore/quoted first char — arithmetic
+/// like `$((1<<10))` is not a heredoc).
+fn heredoc_delimiter(line: &str) -> Option<(String, bool)> {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'<' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'<') => {
+                if bytes.get(i + 2) == Some(&b'<') {
+                    i += 2; // `<<<` here-string — no body lines follow
+                } else if let Some(d) = heredoc_delimiter_after(line, i + 2) {
+                    return Some(d);
+                }
+                // An implausible delimiter (arithmetic `1<<10`) keeps the
+                // scan going — a real heredoc may open later on the line.
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse the `<<` redirection at byte offset `op` (just past the two
+/// `<`): an optional `-` dash form, then the delimiter word — attached,
+/// or after blanks — quoted or bare. Shell metacharacters end a bare
+/// delimiter word just like blanks do.
+fn heredoc_delimiter_after(line: &str, op: usize) -> Option<(String, bool)> {
+    let bytes = line.as_bytes();
+    let dash = bytes.get(op) == Some(&b'-');
+    let word_start = if dash { op + 1 } else { op };
+    if let Some(word) = delimited_word(line, word_start) {
+        return Some((word, dash));
+    }
+    // Space-separated form: `cat << EOF`.
+    let mut k = word_start;
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    delimited_word(line, k).map(|word| (word, dash))
+}
+
+/// The bare-or-quoted delimiter word starting at `start`, if one is
+/// present and plausible (first char alphabetic, `_`, or a quote — a
+/// digit-leading word is arithmetic like `$((1<<10))`, not a heredoc).
+fn delimited_word(line: &str, start: usize) -> Option<String> {
+    let bytes = line.as_bytes();
+    let quoted = matches!(bytes.get(start), Some(b'\'') | Some(b'"'));
+    let mut end = start;
+    while end < bytes.len() {
+        let b = bytes[end];
+        if b.is_ascii_whitespace() || matches!(b, b';' | b'&' | b'(' | b')' | b'|') {
+            break;
+        }
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    let word = line[start..end].trim_matches(|c| c == '\'' || c == '"');
+    let plausible = !word.is_empty()
+        && (quoted || word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'));
+    plausible.then(|| word.to_string())
+}
+
+/// Split `cmd` into command segments at the separators `sh` honors — `&&`,
+/// `||`, `|`, `;`, newline — skipping separators inside single or double
+/// quotes, where they are argument text. A lone `&` never splits
+/// (background mark / redirection).
+fn split_segments(cmd: &str) -> Vec<&str> {
+    let bytes = cmd.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'&' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'&') => {
+                segments.push(&cmd[start..i]);
+                i += 1;
+                start = i + 1;
+            }
+            b'|' | b';' | b'\n' if !in_single && !in_double => {
+                segments.push(&cmd[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    segments.push(&cmd[start..]);
+    segments
+}
+
+/// True if `word` (unquoted) is a bare command name the shell resolves
+/// through PATH — no path separators, variables, globs, redirections,
+/// quotes, or shell keywords/builtins.
+fn is_path_resolved_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && !word.contains(['/', '$', '`', '<', '>', '*', '?', '[', '"', '\''])
+        && !SHELL_WORDS.contains(&word)
+}
+
+/// Strip one layer of matching surrounding quotes.
+fn unquote(word: &str) -> &str {
+    let quoted = word.len() >= 2
+        && (word.starts_with('"') && word.ends_with('"')
+            || word.starts_with('\'') && word.ends_with('\''));
+    if quoted {
+        &word[1..word.len() - 1]
+    } else {
+        word
+    }
+}
+
+/// True for `NAME=value` words — environment assignments prefixing a
+/// command, not the command itself.
+fn is_variable_assignment(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) => {
+            let mut chars = name.chars();
+            match chars.next() {
+                Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+                _ => return false,
+            }
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// Fail a sandboxed build BEFORE running it when its command needs a tool
+/// the sandbox cannot see. Each PATH-resolved command word is resolved
+/// against the sandbox-visible PATH ([`sandbox_visible_entries`]); an
+/// invisible tool becomes a named error instead of an obscure mid-build
+/// failure (e.g. autotools `config.status` breaking because `make` sat
+/// only on an unbound PATH entry or was garbage-collected out of
+/// /nix/store). Tools shadowed by an unbound entry but also present under
+/// a bind root resolve fine and pass.
+pub fn preflight_sandbox_tools(cmd: &str, entries: &[PathBuf]) -> miette::Result<()> {
+    preflight_sandbox_tools_with(cmd, entries, &[])
+}
+
+/// Like [`preflight_sandbox_tools`], with `extra_roots`: host paths the
+/// sandbox binds at their own location (the stage dir), so PATH entries
+/// under them count as sandbox-visible.
+pub fn preflight_sandbox_tools_with(
+    cmd: &str,
+    entries: &[PathBuf],
+    extra_roots: &[PathBuf],
+) -> miette::Result<()> {
+    let visible = sandbox_visible_entries_with(entries, extra_roots);
+    for word in path_resolved_words(cmd) {
+        if resolve_in_path(&word, &visible).is_some() {
+            continue;
+        }
+        return Err(sandbox_tool_error(&word, entries));
+    }
+    Ok(())
+}
+
+/// The named, actionable error for a build tool the sandbox cannot see.
+fn sandbox_tool_error(tool: &str, entries: &[PathBuf]) -> miette::Error {
+    let roots = SANDBOX_RO_ROOTS.join(", ");
+    match resolve_in_path(tool, entries) {
+        Some(host_path) => miette::miette!(
+            "tool '{tool}' resolves on the host to '{host}' via PATH entry '{entry}', which is \
+             outside the sandbox bind roots ({roots}) — sandboxed builds cannot see it. \
+             Fix: install it system-wide or under another bound root (devbox profile dirs \
+             like .devbox/nix/profile are not bound).",
+            host = host_path.display(),
+            entry = host_path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+        None => miette::miette!(
+            "tool '{tool}' was not found in any sandbox-visible PATH directory (bind roots: \
+             {roots}). Fix: install it — e.g. add its package to devbox.json and re-run from \
+             a fresh devbox shell (a 'nix store' GC can remove /nix/store paths a stale shell \
+             still exports on PATH).",
+        ),
+    }
+}
+
+/// Best-effort markers that a failed build was trying to reach the network.
+/// The sandbox unshares the net, so a build that downloads anything fails
+/// confusingly — sources must come from the definition instead.
+const NETWORK_FETCH_MARKERS: [&str; 5] = ["curl", "wget", "fetch", "clon", "download"];
+
+/// True if captured build output looks like a failed download attempt
+/// (best-effort substring match over the lowercased text).
+fn stderr_suggests_network_fetch(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    NETWORK_FETCH_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// One-line hint printed when a failed build looks like it tried to
+/// download something. Best-effort: matched against the build's stderr
+/// text, not a parser.
+fn warn_no_network_hint(stderr: &str) {
+    if stderr_suggests_network_fetch(stderr) {
+        output::warn(
+            "build failed and its output mentions a download (sandbox has no network — fetch sources via the definition's source/inputs)",
+        );
+    }
+}
+
+/// When set, build-child stderr is buffered per call instead of streamed
+/// to our stderr (issue #55). Set around the parallel dep-build phase:
+/// several concurrent make logs sharing one stderr interleave into
+/// garbage, so the output is instead attached to the build's failure
+/// error and printed as one prefixed block by the scheduler. Scoped: set
+/// once around the whole phase while the orchestrator thread blocks,
+/// never mutated per-build — it does not race (ADR-0022 addendum).
+static BUFFER_CHILD_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// Buffer build-child stderr instead of streaming it (issue #55).
+pub fn set_buffer_child_stderr(on: bool) {
+    BUFFER_CHILD_STDERR.store(on, Ordering::SeqCst);
+}
+
+/// True while build-child stderr should be buffered, not streamed.
+fn buffer_child_stderr() -> bool {
+    BUFFER_CHILD_STDERR.load(Ordering::SeqCst)
+}
+
+/// Cap on the buffered build-output tail attached to a failure error.
+const FAILURE_TAIL_LINES: usize = 80;
+
+/// The last `max` lines of `text`, for the buffered failure dump. The
+/// sequential path streams everything live; the buffered dump keeps the
+/// tail (where the actual failure lives) so a wild build cannot blow up
+/// the final error message.
+fn tail_lines(text: &str, max: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max);
+    lines[start..].join("\n")
+}
+
+/// Spawn a build command, forwarding its stderr to our stderr line-by-line
+/// (output still streams live) while also collecting it, so a failure can
+/// be inspected. Reading to EOF before reaping avoids pipe deadlock.
+/// Under [`buffer_child_stderr`] the lines are only collected — the
+/// parallel scheduler owns attribution and dumps them prefixed on failure.
+fn run_build_child(
+    mut cmd_proc: std::process::Command,
+) -> std::io::Result<(std::process::ExitStatus, String)> {
+    use std::io::BufRead;
+    use std::process::Stdio;
+    cmd_proc.stderr(Stdio::piped());
+    let mut child = cmd_proc.spawn()?;
+    let forward = !buffer_child_stderr();
+    let collected = match child.stderr.take() {
+        Some(stderr) => std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stderr);
+            let mut collected = String::new();
+            for line in reader.lines().map_while(Result::ok) {
+                if forward {
+                    eprintln!("{line}");
+                }
+                collected.push_str(&line);
+                collected.push('\n');
+            }
+            collected
+        })
+        .join()
+        .unwrap_or_default(),
+        None => String::new(),
+    };
+    let status = child.wait()?;
+    Ok((status, collected))
+}
+
+/// Read-only system paths for toolchain, shebangs, and Nix/devbox builds.
+/// The bind set is [`SANDBOX_RO_ROOTS`] — doctor's sandbox-visibility
+/// check and the build pre-flight resolve tools against the same list —
+/// plus the resolver/trust files of [`SANDBOX_ETC_RO_PATHS`] (issue #176).
+/// Each root is bound only when it exists (bwrap errors on missing bind
+/// sources; the FHS roots exist on every host where sandboxed builds run).
+fn bind_system_ro_paths(cmd: &mut std::process::Command) {
+    for root in SANDBOX_RO_ROOTS {
+        ro_bind_if_exists(cmd, root);
+    }
+    for path in SANDBOX_ETC_RO_PATHS {
+        ro_bind_if_exists(cmd, path);
+    }
+}
+
+/// Run the build command inside a bubblewrap sandbox.
+#[allow(clippy::too_many_arguments)]
+fn run_bwrapped(
+    bwrap_bin: &str,
+    cmd: &str,
+    build_path: &Path,
+    work_dir: &Path,
+    src_dir: &Path,
+    stage_dir: &Path,
+    target: Option<&str>,
+    cross_env: &[(&'static str, String)],
+    part_name: Option<&str>,
+    extra_env: &[(String, String)],
+    deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
+) -> miette::Result<()> {
+    // Tool resolution must work the way the sandbox will see it — fail
+    // here, naming the tool, instead of mid-build (see
+    // `preflight_sandbox_tools_with`). The stage dir is bound at its own
+    // host path, so PATH entries under it are visible. The merged build
+    // prefix's bin dir joins the probe set the same way: the sandbox PATH
+    // (below) carries it, so bare `cmake`/`ninja`/`meson` from build_deps
+    // resolve exactly as they will inside the sandbox (issue #33).
+    let prefix_bin = build_prefix.map(|p| p.join("usr/bin"));
+    let mut entries = path_entries();
+    let mut extra_roots = vec![stage_dir.to_path_buf()];
+    if let Some(bin) = &prefix_bin {
+        entries.push(bin.clone());
+        extra_roots.push(bin.clone());
+    }
+    preflight_sandbox_tools_with(cmd, &entries, &extra_roots)?;
+    // Map a host path under the build dir to its sandbox path under /build.
+    let to_inner = |p: &Path| -> std::path::PathBuf {
+        if p == build_path {
+            Path::new("/build").to_path_buf()
+        } else {
+            let rel = p.strip_prefix(build_path).unwrap_or(Path::new(""));
+            Path::new("/build").join(rel)
+        }
+    };
+    let inner_src = to_inner(src_dir);
+    let inner_cwd = to_inner(work_dir);
+
+    let mut cmd_proc = std::process::Command::new(bwrap_bin);
+    cmd_proc
+        .arg("--unshare-user")
+        .arg("--unshare-pid")
+        .arg("--unshare-ipc")
+        .arg("--unshare-net")
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--dev")
+        .arg("/dev")
+        // Private /tmp for build temp files. Mounted BEFORE the binds below:
+        // bwrap applies mounts in argument order, so a later stage bind must
+        // win over the tmpfs for stage dirs that live under /tmp.
+        .arg("--tmpfs")
+        .arg("/tmp")
+        // Mount build dir at /build inside sandbox
+        .arg("--bind")
+        .arg(build_path)
+        .arg("/build")
+        // Mount stage dir at its absolute host path
+        .arg("--bind")
+        .arg(stage_dir)
+        .arg(stage_dir);
+    // Dependency closure (ADR-0017, issue #13): the fetched tree is bound
+    // READ-ONLY at a fixed sandbox path — the only view of the closure a
+    // build gets. It is never writable and never the shared host cache.
+    if let Some(deps) = deps_dir {
+        cmd_proc.arg("--ro-bind").arg(deps).arg(SANDBOX_DEPS_DIR);
+    }
+    // Merged build prefix (ADR-0018 Decision 2, issue #17): the payloads of
+    // `requires` + `build_deps`, merged into one /usr-like tree, bound
+    // READ-ONLY at a fixed sandbox path — the same discipline as the deps
+    // closure above.
+    if let Some(prefix) = build_prefix {
+        cmd_proc
+            .arg("--ro-bind")
+            .arg(prefix)
+            .arg(SANDBOX_BUILD_PREFIX);
+    }
+    bind_system_ro_paths(&mut cmd_proc);
+    // Cross-compilation sysroot mount
+    if let Some(triplet) = target {
+        let sysroot = Path::new("/usr").join(triplet);
+        if sysroot.exists() {
+            cmd_proc.arg("--ro-bind").arg(&sysroot).arg(&sysroot);
+        }
+    }
+    cmd_proc.arg("--chdir").arg(&inner_cwd);
+    // Hermetic sandbox (issue #10): drop the inherited host env so
+    // `NIX_LD`/`NIX_CFLAGS_COMPILE`/devbox PATH cannot leak host-nix store
+    // paths into built artifacts, then export a controlled PATH limited to
+    // the sandbox-visible toolchain dirs (symlinks canonicalized onto the
+    // bound roots — see `sandbox_visible_entries_with`) plus the build vars.
+    // With a merged build prefix, its bin dir leads the PATH (issue #33):
+    // build_deps are the declared source of build tooling, so pool
+    // cmake/ninja/meson shadow coincidental host tools of the same name —
+    // and inside the sandbox the prefix is bound at SANDBOX_BUILD_PREFIX,
+    // which is the entry the PATH carries.
+    cmd_proc.env_clear();
+    let mut path_dirs = sandbox_visible_entries_with(&path_entries(), &[stage_dir.to_path_buf()]);
+    if prefix_bin.is_some() {
+        path_dirs.insert(0, Path::new(SANDBOX_BUILD_PREFIX).join("usr/bin"));
+    }
+    cmd_proc
+        .env("PATH", std::env::join_paths(&path_dirs).unwrap_or_default())
+        .env("STAGE", stage_dir)
+        .env("SRC", &inner_src)
+        // Default HOME (issue #39): the cleared env leaves cargo — and
+        // cmake-method dependency lookups (meson's cmake method) — refusing
+        // to run without one. The sandbox's private /tmp tmpfs is the one
+        // writable scratch path every build has, so it is the HOME of last
+        // resort; build scripts may still export their own, and the cross /
+        // extra env applied below overrides this default.
+        .env("HOME", "/tmp");
+    // TLS trust default (issue #176): the sandbox has no ambient env, so
+    // the recipe's extra_env is the only pre-existing CURL_CA_BUNDLE; the
+    // default (the bound /etc/ssl/certs bundle) fills the gap otherwise.
+    let ambient_ca = extra_env
+        .iter()
+        .find(|(k, _)| k == "CURL_CA_BUNDLE")
+        .map(|(_, v)| v.as_str());
+    if let Some((key, val)) =
+        default_curl_ca_bundle(ambient_ca, Path::new(SANDBOX_CA_BUNDLE).exists())
+    {
+        cmd_proc.env(key, val);
+    }
+    if deps_dir.is_some() {
+        cmd_proc.env("NAU_DEPS_DIR", SANDBOX_DEPS_DIR);
+    }
+    if let Some(prefix) = build_prefix {
+        for (key, val) in build_prefix_env(SANDBOX_BUILD_PREFIX) {
+            cmd_proc.env(key, val);
+        }
+        // C-toolchain wiring (issue #44): CC/CXX at the pool drivers when
+        // the prefix provides them — the CGO host contract.
+        for (key, val) in build_prefix_toolchain_env(prefix) {
+            cmd_proc.env(key, val);
+        }
+    }
+    if let Some(name) = part_name {
+        cmd_proc.env("PART_NAME", name);
+    }
+    apply_cross_env(&mut cmd_proc, cross_env);
+    apply_extra_env(&mut cmd_proc, extra_env);
+    cmd_proc.arg("sh").arg("-c").arg(cmd);
+
+    let (status, stderr_text) =
+        run_build_child(cmd_proc).map_err(|e| miette::miette!("bwrap execution failed: {}", e))?;
+
+    if !status.success() {
+        warn_no_network_hint(&stderr_text);
+        Err(build_child_error(
+            &stderr_text,
+            "build command exited with error (in sandbox)",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Fallback: run the build command directly on host (no sandbox).
+#[allow(clippy::too_many_arguments)]
+fn run_direct(
+    cmd: &str,
+    work_dir: &Path,
+    src_dir: &Path,
+    stage_dir: &Path,
+    cross_env: &[(&'static str, String)],
+    part_name: Option<&str>,
+    extra_env: &[(String, String)],
+    deps_dir: Option<&Path>,
+    build_prefix: Option<&Path>,
+) -> miette::Result<()> {
+    let mut cmd_proc = std::process::Command::new("sh");
+    cmd_proc
+        .args(["-c", cmd])
+        .env("STAGE", stage_dir)
+        .env("SRC", src_dir);
+    // No sandbox means no read-only bind — the closure tree is exposed at
+    // its host path (degraded mode only; the bwrap path binds it RO).
+    if let Some(deps) = deps_dir {
+        cmd_proc.env("NAU_DEPS_DIR", deps);
+    }
+    // Same for the merged build prefix: exposed at its host path with the
+    // prefix env pointing there (degraded mode only).
+    if let Some(prefix) = build_prefix {
+        let host = prefix.to_string_lossy().into_owned();
+        for (key, val) in build_prefix_env(&host) {
+            cmd_proc.env(key, val);
+        }
+        // Same C-toolchain wiring as the sandboxed path (issue #44).
+        for (key, val) in build_prefix_toolchain_env(prefix) {
+            cmd_proc.env(key, val);
+        }
+        // Degraded mode keeps the sandbox's tool order (issue #33): the
+        // prefix bin dir first, so bare cmake/ninja/meson resolve to the
+        // pool build_deps tooling, not coincidental host tools.
+        let mut path_dirs = vec![prefix.join("usr/bin")];
+        path_dirs.extend(path_entries());
+        cmd_proc.env("PATH", std::env::join_paths(&path_dirs).unwrap_or_default());
+    }
+    if let Some(name) = part_name {
+        cmd_proc.env("PART_NAME", name);
+    }
+    // TLS trust default (issue #176), degraded mode: the caller's real env
+    // rides through here, so an ambient CURL_CA_BUNDLE is honored (the #138
+    // never-clobber rule) and the default fills only its absence.
+    if let Some((key, val)) = default_curl_ca_bundle(
+        std::env::var("CURL_CA_BUNDLE").ok().as_deref(),
+        Path::new(SANDBOX_CA_BUNDLE).exists(),
+    ) {
+        cmd_proc.env(key, val);
+    }
+    apply_cross_env(&mut cmd_proc, cross_env);
+    apply_extra_env(&mut cmd_proc, extra_env);
+    cmd_proc.current_dir(work_dir);
+
+    let (status, stderr_text) =
+        run_build_child(cmd_proc).map_err(|e| miette::miette!("failed to execute build: {}", e))?;
+
+    if !status.success() {
+        warn_no_network_hint(&stderr_text);
+        Err(build_child_error(
+            &stderr_text,
+            "build command exited with error",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The failure error for an exited build child. Sequential builds already
+/// streamed the child's output live; under [`buffer_child_stderr`] the
+/// captured tail rides along in the error so the parallel scheduler can
+/// print it as one attributable block.
+fn build_child_error(stderr_text: &str, base: &str) -> miette::Error {
+    if buffer_child_stderr() && !stderr_text.trim().is_empty() {
+        let tail = tail_lines(stderr_text, FAILURE_TAIL_LINES);
+        let shown = tail.lines().count();
+        return miette::miette!("{base}\n--- build output (last {shown} lines) ---\n{tail}");
+    }
+    miette::miette!("{base}")
+}
+
+/// Export plugin BuildPlan env vars to a command (ADR-0014 Decision 4).
+fn apply_extra_env(cmd: &mut std::process::Command, extra_env: &[(String, String)]) {
+    for (key, val) in extra_env {
+        cmd.env(key, val);
+    }
+}
+
+// Moved to nau-chart::pkg_source with the tarball vocabulary it serves
+// (issue #326; dep_fetch shares the seam). Re-exported so the root
+// fetch/parse path and this module tests keep resolving.
+pub use nau_infra::archive::extract_tarball;
+
+fn find_source_root(dir: &Path) -> Option<std::path::PathBuf> {
+    let mut entries: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(read) = std::fs::read_dir(dir) {
+        for entry in read.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir())
+                && !entry.file_name().to_string_lossy().starts_with('.')
+            {
+                entries.push(entry.path());
+            }
+        }
+    }
+    if entries.len() == 1 {
+        Some(entries.into_iter().next().unwrap())
+    } else {
+        None
+    }
+}
+
+/// Resolve a build-time file reference (hook script, icon) from the DSL.
+///
+/// Absolute paths pass through unchanged. Relative paths resolve against
+/// the definition file's directory first — so a definition in a subpackage
+/// dir can reference sibling files regardless of where `nau build` runs
+/// — falling back to the process CWD for definitions that predate
+/// definition-relative resolution (and for `definition_dir: None`).
+fn resolve_definition_relative(definition_dir: Option<&Path>, path: &str) -> std::path::PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    if let Some(dir) = definition_dir {
+        let candidate = dir.join(p);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    p.to_path_buf()
+}
+
+/// True if `path` has the owner execute bit set.
+fn is_owner_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o100 != 0)
+        .unwrap_or(false)
+}
+
+/// Warning for a hook script whose mode lacks owner+x: snapd executes hooks
+/// directly, so a non-executable copy would never run. `None` when the
+/// script is executable.
+fn hook_exec_warning(name: &str, src: &Path) -> Option<String> {
+    if is_owner_executable(src) {
+        return None;
+    }
+    Some(format!(
+        "hook '{name}': '{}' is not executable (mode lacks owner x) — snapd runs hooks directly; chmod +x the source file",
+        src.display()
+    ))
+}
+
+/// Copy hook scripts from the DSL's source paths into `<build_root>/meta/hooks/<name>`.
+///
+/// Relative paths resolve against the definition file's directory first,
+/// then the project directory `nau build` runs from. A script whose
+/// mode lacks owner+x is copied but warned about — snapd would never run it.
+fn copy_hook_scripts(meta: &SnapMeta, build_root: &Path) -> miette::Result<()> {
+    let Some(hooks) = &meta.hooks else {
+        return Ok(());
+    };
+    let hooks_dir = build_root.join("meta").join("hooks");
+    for (name, hook) in hooks {
+        std::fs::create_dir_all(&hooks_dir)
+            .map_err(|e| miette::miette!("failed to create meta/hooks/: {}", e))?;
+        let src = resolve_definition_relative(meta.definition_dir.as_deref(), &hook.source);
+        if !src.is_file() {
+            return Err(miette::miette!(
+                "hook '{name}': script not found: {} (relative paths resolve from the definition's directory, then the project directory)",
+                hook.source
+            ));
+        }
+        if let Some(warning) = hook_exec_warning(name, &src) {
+            output::warn(warning);
+        }
+        std::fs::copy(&src, hooks_dir.join(name))
+            .map_err(|e| miette::miette!("failed to copy hook '{name}': {}", e))?;
+    }
+    Ok(())
+}
+
+/// Copy the icon source file to `<build_root>/<icon>` (meta/gui/icon.<ext>).
+///
+/// Relative paths resolve against the definition file's directory first,
+/// then the project directory (see [`resolve_definition_relative`]).
+fn copy_icon(meta: &SnapMeta, build_root: &Path) -> miette::Result<()> {
+    let (Some(src), Some(target)) = (&meta.icon_source, &meta.icon) else {
+        return Ok(());
+    };
+    let dst = build_root.join(target);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| miette::miette!("failed to create {}: {}", parent.display(), e))?;
+    }
+    let src_path = resolve_definition_relative(meta.definition_dir.as_deref(), src);
+    if !src_path.is_file() {
+        return Err(miette::miette!(
+            "icon: file not found: {src} (relative paths resolve from the definition's directory, then the project directory)"
+        ));
+    }
+    std::fs::copy(&src_path, &dst)
+        .map_err(|e| miette::miette!("failed to copy icon {src}: {e}"))?;
+    Ok(())
+}
+
+// Moved down to nau_core::snap_types (issue #326): pure SnapMeta vocabulary
+// the chart manifest builder shares. Re-exported so every
+// `crate::snap::resolve_archs` path keeps resolving.
+pub use nau_core::snap_types::resolve_archs;
+
+/// Recursive copy of directory contents into destination.
+///
+/// Symlinks are recreated as symlinks, not dereferenced: a payload stage
+/// legitimately carries relative symlinks (deb-relayout trees ship
+/// `gcc-14 -> x86_64-linux-gnu-gcc-14`-style links; `std::fs::copy`
+/// follows them, silently duplicating target content for resolvable
+/// links and failing with ENOENT for links that only resolve after the
+/// payload is merged into its final tree). Dangling links are preserved
+/// verbatim — squashfs packs them as-is.
+fn cp_r(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut dirs = vec![src.to_path_buf()];
+    while let Some(current) = dirs.pop() {
+        let relative = current.strip_prefix(src).unwrap();
+        let target = dst.join(relative);
+
+        if current.is_dir() && current != src {
+            std::fs::create_dir_all(&target)?;
+        }
+
+        if let Ok(read) = std::fs::read_dir(&current) {
+            for entry in read {
+                let entry = entry?;
+                let path = entry.path();
+                let rel = path.strip_prefix(src).unwrap();
+                let dest = dst.join(rel);
+
+                if path.is_symlink() {
+                    // Replace whatever a previous generation left at dest
+                    // (symlink_metadata, not exists() — a dangling dest
+                    // link still counts).
+                    if dest.symlink_metadata().is_ok() {
+                        std::fs::remove_file(&dest)?;
+                    }
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(std::fs::read_link(&path)?, &dest)?;
+                } else if path.is_dir() {
+                    std::fs::create_dir_all(&dest)?;
+                    dirs.push(path);
+                } else {
+                    std::fs::copy(&path, &dest)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // The §4 sanctioned dev-edge (ADR-0053): the Lua-side constructors
+    // and the `FromLua*`/`FromPinTable` extension traits live in
+    // nau-chart (orphan rule); the build tests drive them here until the
+    // final reconciliation dissolves the edge.
+    use nau_chart::snap_lua::{
+        deps_lock_spec_from_lua, parse_submodule_spec, FromLuaTable, FromLuaTableNamed,
+    };
+
+    /// SHA3-384 hex of a file's bytes, streamed — the store-ingest
+    /// digest. Duplicated from the root crate's `store.rs` (the moved
+    /// build tests need it; the runtime store domain stays root, and a
+    /// cross-crate test-only import would be a new edge).
+    fn sha3_384_file(path: &Path) -> miette::Result<String> {
+        use sha3::Digest;
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| miette::miette!("failed to open {}: {}", path.display(), e))?;
+        let mut hasher = sha3::Sha3_384::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .map_err(|e| miette::miette!("failed to read {}: {}", path.display(), e))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let hash = hasher.finalize();
+        Ok(hash.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    // ── Build-input digest (issue #113) ──
+
+    /// Bare SnapMeta with every optional field empty (mirrors the test
+    /// helpers in manifest.rs / pod.rs).
+    fn bare_meta(name: &str, version: &str) -> SnapMeta {
+        SnapMeta {
+            name: name.into(),
+            version: version.into(),
+            summary: None,
+            description: None,
+            license: None,
+            source: None,
+            sources: None,
+            build: None,
+            parts: None,
+            architectures: None,
+            grade: "stable".into(),
+            confinement: "strict".into(),
+            type_: None,
+            adopt_info: None,
+            version_adopted: false,
+            icon_source: None,
+            icon: None,
+            compression: None,
+            compression_level: None,
+            environment: None,
+            layout: None,
+            hooks: None,
+            plugs: None,
+            slots: None,
+            aliases: vec![],
+            requires: vec![],
+            build_deps: vec![],
+            leaks_ok: vec![],
+            target: None,
+            toolchain: None,
+            inputs: None,
+            confined: None,
+            apps: HashMap::new(),
+            services: BTreeMap::new(),
+            deps: None,
+            floating: false,
+            definition_dir: None,
+        }
+    }
+
+    /// The digest contract is determinism across processes: Rust
+    /// randomizes HashMap iteration order per process, so two metas
+    /// whose HashMap-backed fields (`apps`, `inputs`) were populated in
+    /// different orders MUST digest identically.
+    #[test]
+    fn build_input_digest_is_stable_over_hashmap_insertion_order() {
+        let mut first = bare_meta("tool", "1.0");
+        first.apps.insert(
+            "zapp".to_string(),
+            SnapApp {
+                command: "bin/z".into(),
+                daemon: None,
+                plugs: None,
+                slots: None,
+                environment: None,
+                desktop: None,
+                interpreter: None,
+                confined: None,
+            },
+        );
+        first.apps.insert(
+            "app".to_string(),
+            SnapApp {
+                command: "bin/a".into(),
+                daemon: None,
+                plugs: None,
+                slots: None,
+                environment: None,
+                desktop: None,
+                interpreter: None,
+                confined: None,
+            },
+        );
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "pkgs".to_string(),
+            PackageInput {
+                url: "github:rbelem/nau/main".into(),
+                submodules: None,
+            },
+        );
+        inputs.insert(
+            "defs".to_string(),
+            PackageInput {
+                url: "path:/home/user/pkgs".into(),
+                submodules: None,
+            },
+        );
+        first.inputs = Some(inputs);
+
+        let mut second = bare_meta("tool", "1.0");
+        // Reverse insertion order for both maps.
+        second.apps.insert(
+            "app".to_string(),
+            SnapApp {
+                command: "bin/a".into(),
+                daemon: None,
+                plugs: None,
+                slots: None,
+                environment: None,
+                desktop: None,
+                interpreter: None,
+                confined: None,
+            },
+        );
+        second.apps.insert(
+            "zapp".to_string(),
+            SnapApp {
+                command: "bin/z".into(),
+                daemon: None,
+                plugs: None,
+                slots: None,
+                environment: None,
+                desktop: None,
+                interpreter: None,
+                confined: None,
+            },
+        );
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "defs".to_string(),
+            PackageInput {
+                url: "path:/home/user/pkgs".into(),
+                submodules: None,
+            },
+        );
+        inputs.insert(
+            "pkgs".to_string(),
+            PackageInput {
+                url: "github:rbelem/nau/main".into(),
+                submodules: None,
+            },
+        );
+        second.inputs = Some(inputs);
+
+        assert_eq!(
+            first.build_input_digest(),
+            second.build_input_digest(),
+            "HashMap iteration order must not reach the digest"
+        );
+    }
+
+    /// The build command is a build input: changing it must flip the
+    /// digest so a plain sync rebuilds the package.
+    #[test]
+    fn build_input_digest_changes_when_the_build_command_changes() {
+        let mut old = bare_meta("tool", "1.0");
+        old.build = Some("make && make install".into());
+        let mut new = old.clone();
+        new.build = Some("make && make PREFIX=/usr install".into());
+        assert_ne!(old.build_input_digest(), new.build_input_digest());
+        // Control: an identical meta still digests identically.
+        let same = old.clone();
+        assert_eq!(old.build_input_digest(), same.build_input_digest());
+    }
+
+    /// The build_deps declaration is a build input: adding one must
+    /// flip the digest (the merged prefix changes with it).
+    #[test]
+    fn build_input_digest_changes_when_build_deps_change() {
+        let mut old = bare_meta("tool", "1.0");
+        old.build = Some("./configure && make".into());
+        old.build_deps = vec!["toolchain-gcc-gnu-x86_64".to_string()];
+        let mut new = old.clone();
+        new.build_deps.push("libfoo".to_string());
+        assert_ne!(old.build_input_digest(), new.build_input_digest());
+    }
+
+    #[test]
+    fn pip_deps_spec_parses_python_and_exclude() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return { lock = "uv.lock", python = "3.14", exclude = { "yara-python" } }
+            "#,
+            )
+            .unwrap();
+        let spec = deps_lock_spec_from_lua("pip", &table).unwrap();
+        assert_eq!(spec.lock, "uv.lock");
+        assert_eq!(spec.python.as_deref(), Some("3.14"));
+        assert_eq!(spec.exclude, vec!["yara-python".to_string()]);
+    }
+
+    #[test]
+    fn pip_deps_spec_rejects_python_globs_in_exclude_and_non_pip_python() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(r#"return { lock = "l", exclude = { "*" } }"#)
+            .unwrap();
+        assert!(deps_lock_spec_from_lua("pip", &table).is_err());
+
+        let npm_table = env
+            .eval(r#"return { lock = "l", python = "3.14" }"#)
+            .unwrap();
+        assert!(deps_lock_spec_from_lua("npm", &npm_table).is_err());
+    }
+
+    /// A deps block whose lockfiles are ALL recipe-local resolves from
+    /// the recipe directory (ADR-0017 addendum) — it needs no `source`,
+    /// which is what lets a multi-source build (`sources`) carry an
+    /// ecosystem closure (agentmemory: recipe-local npm lock + a
+    /// `sources` map for the artifacts the sandbox cannot fetch).
+    #[test]
+    fn deps_recipe_local_locks_parse_without_source() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "agentmemory", version = "0.9.29",
+                sources = {
+                    npm = {
+                        url = "https://example.com/pkg.tgz",
+                        sha256 = "e9b1d4d5f3c0b2a1d9c8f7e6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b",
+                    },
+                },
+                deps = { npm = { lock = "recipe/package-lock.json" } },
+            }
+            "#,
+            )
+            .unwrap();
+        let meta = SnapMeta::from_lua_table(&table).unwrap();
+        assert!(meta.deps.as_ref().unwrap().all_locks_recipe_local());
+    }
+
+    /// A source-relative lockfile has no recipe-dir fallback: without
+    /// `source` the closure could never fetch — still fail at the
+    /// parse boundary (the Lua prelude rejects first; the Rust
+    /// boundary mirrors it).
+    #[test]
+    fn deps_source_relative_lock_still_requires_source() {
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return snap {
+                name = "hybrid", version = "1.0",
+                deps = { cargo = { lock = "Cargo.lock" } },
+            }
+            "#,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("'deps' requires 'source'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Evaluate with DSL and get top-level table (keeps Lua alive for the duration).
+    struct LuaEnv {
+        lua: mlua::Lua,
+    }
+
+    impl LuaEnv {
+        fn new() -> Self {
+            let lua = mlua::Lua::new();
+            lua.load(nau_chart::dsl::prelude())
+                .exec()
+                .expect("DSL init failed");
+            LuaEnv { lua }
+        }
+
+        fn eval(&self, source: &str) -> miette::Result<mlua::Table> {
+            let value: Value = self
+                .lua
+                .load(source)
+                .eval()
+                .map_err(|e| miette::miette!("{}", e))?;
+            match value {
+                Value::Table(t) => Ok(t),
+                other => Err(miette::miette!("expected table, got {}", other.type_name())),
+            }
+        }
+    }
+
+    // ── SourceSpec tests ──
+
+    #[test]
+    fn test_source_spec_unverified() {
+        let s = SourceSpec::Unverified("https://example.com/tarball.tar.gz".into());
+        assert_eq!(s.url(), "https://example.com/tarball.tar.gz");
+        assert!(s.expected_sha256().is_none());
+    }
+
+    #[test]
+    fn test_source_spec_pinned() {
+        let hash = "e9b1d4d5f3c0b2a1d9c8f7e6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b";
+        let s = SourceSpec::Pinned {
+            url: "https://example.com/tarball.tar.gz".into(),
+            sha256: hash.into(),
+        };
+        assert_eq!(s.url(), "https://example.com/tarball.tar.gz");
+        assert_eq!(s.expected_sha256(), Some(hash));
+    }
+
+    #[test]
+    fn test_source_spec_serialize_as_url() {
+        let s = SourceSpec::Pinned {
+            url: "https://example.com/pkg.tar.gz".into(),
+            sha256: "abc123".into(),
+        };
+        let yaml = serde_yaml::to_string(&s).unwrap();
+        assert_eq!(yaml.trim(), "https://example.com/pkg.tar.gz");
+    }
+
+    #[test]
+    fn test_source_spec_dsl_string() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "legacy",
+                    version = "1.0",
+                    source = "https://example.com/old.tar.gz",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        match meta.source {
+            Some(SourceSpec::Unverified(url)) => {
+                assert_eq!(url, "https://example.com/old.tar.gz");
+            }
+            other => panic!("expected Unverified, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_source_spec_dsl_table_pinned() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "pinned",
+                    version = "1.0",
+                    source = {
+                        url = "https://example.com/pkg.tar.gz",
+                        sha256 = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        match meta.source {
+            Some(SourceSpec::Pinned { url, sha256 }) => {
+                assert_eq!(url, "https://example.com/pkg.tar.gz");
+                assert_eq!(
+                    sha256,
+                    "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                );
+            }
+            other => panic!("expected Pinned, got {:?}", other),
+        }
+    }
+
+    // ── Issue #43: `submodules` on input declarations ──
+
+    #[test]
+    fn test_submodule_spec_parse_forms() {
+        let all = parse_submodule_spec(mlua::Value::Boolean(true), "inputs['x']").unwrap();
+        assert_eq!(all, Some(SubmoduleSpec::All(true)));
+        assert!(all.as_ref().unwrap().active());
+
+        // `false` normalizes to absent.
+        let off = parse_submodule_spec(mlua::Value::Boolean(false), "inputs['x']").unwrap();
+        assert_eq!(off, None);
+
+        // Absent field → None.
+        let absent = parse_submodule_spec(mlua::Value::Nil, "inputs['x']").unwrap();
+        assert_eq!(absent, None);
+    }
+
+    #[test]
+    fn test_submodule_spec_dsl_table_and_list() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                all = snap {
+                    name = "sub-all",
+                    version = "1.0",
+                    inputs = { src = { url = "github:o/r", submodules = true } },
+                },
+                named = snap {
+                    name = "sub-named",
+                    version = "1.0",
+                    inputs = { src = { url = "github:o/r", submodules = { "libfoo", "libbar" } } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let all: mlua::Table = table.get("all").unwrap();
+        let meta = SnapMeta::from_lua_table(&all).unwrap();
+        let inputs = meta.inputs.unwrap();
+        assert_eq!(
+            inputs["src"].submodules,
+            Some(SubmoduleSpec::All(true)),
+            "submodules = true parses through per-snap inputs"
+        );
+
+        let named: mlua::Table = table.get("named").unwrap();
+        let meta = SnapMeta::from_lua_table(&named).unwrap();
+        let inputs = meta.inputs.unwrap();
+        assert_eq!(
+            inputs["src"].submodules,
+            Some(SubmoduleSpec::Named(vec!["libfoo".into(), "libbar".into()])),
+            "named list parses and preserves order"
+        );
+    }
+
+    #[test]
+    fn test_submodule_spec_dsl_rejects_bad_shapes() {
+        let env = LuaEnv::new();
+        for (body, expected) in [
+            ("submodules = 1", "'submodules' must be true or a list"),
+            ("submodules = { }", "'submodules' list must not be empty"),
+        ] {
+            let src = format!(
+                r#"
+            return {{
+                bad = snap {{
+                    name = "bad",
+                    version = "1.0",
+                    inputs = {{ src = {{ url = "github:o/r", {body} }} }},
+                }},
+            }}
+            "#
+            );
+            let table = env.eval(&src).unwrap();
+            let bad: mlua::Table = table.get("bad").unwrap();
+            let err = SnapMeta::from_lua_table(&bad)
+                .expect_err("malformed submodules declaration must fail");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?} in: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_submodule_spec_serializes_for_lua_roundtrip() {
+        // The eval subprocess serializes inputs to JSON and rehydrates them
+        // as a Lua table — the untagged shapes must be JSON-native.
+        let all = serde_json::to_value(SubmoduleSpec::All(true)).unwrap();
+        assert_eq!(all, serde_json::Value::Bool(true));
+        let named =
+            serde_json::to_value(SubmoduleSpec::Named(vec!["a".into(), "b".into()])).unwrap();
+        assert_eq!(
+            named,
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("a".into()),
+                serde_json::Value::String("b".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_source_spec_dsl_table_no_hash() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "no-hash",
+                    version = "1.0",
+                    source = {
+                        url = "https://example.com/pkg.tar.gz",
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        match meta.source {
+            Some(SourceSpec::Unverified(url)) => {
+                assert_eq!(url, "https://example.com/pkg.tar.gz");
+            }
+            other => panic!("expected Unverified, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_source_none_when_unset() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "no-source",
+                    version = "1.0",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert!(meta.source.is_none());
+    }
+
+    #[test]
+    fn test_sha256_file_known_content() {
+        // Create a temp file with known content and verify its hash
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, b"hello world\n").unwrap();
+        let hash = super::sha256_file(&path).unwrap();
+        // SHA-256 of "hello world\n"
+        assert_eq!(
+            hash,
+            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+    }
+
+    // ── Phase 3 tests: struct conversion ──
+
+    #[test]
+    fn test_snap_meta_from_lua_full() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "hello",
+                    version = "2.10",
+                    summary = "GNU Hello",
+                    description = "Prints a greeting",
+                    license = "GPL-3.0-or-later",
+                    grade = "stable",
+                    confinement = "strict",
+                    source = "http://example.com/tarball.tar.gz",
+                    architectures = { "amd64", "arm64" },
+                    apps = {
+                        hello = app { command = "bin/hello" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        assert_eq!(meta.name, "hello");
+        assert_eq!(meta.version, "2.10");
+        assert_eq!(meta.summary.as_deref(), Some("GNU Hello"));
+        assert_eq!(meta.grade, "stable");
+        assert_eq!(meta.confinement, "strict");
+        let archs = meta.architectures.as_ref().unwrap();
+        assert_eq!(archs, &vec!["amd64".to_string(), "arm64".to_string()]);
+        assert_eq!(meta.apps.len(), 1);
+        assert_eq!(meta.apps["hello"].command, "bin/hello");
+    }
+
+    #[test]
+    fn test_snap_meta_from_lua_minimal() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "minimal",
+                    version = "1.0",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        assert_eq!(meta.name, "minimal");
+        assert_eq!(meta.version, "1.0");
+        assert!(meta.summary.is_none());
+        assert_eq!(meta.grade, "stable"); // default
+        assert_eq!(meta.confinement, "strict"); // default
+        assert!(meta.apps.is_empty());
+    }
+
+    #[test]
+    fn test_snap_app_from_lua() {
+        let env = LuaEnv::new();
+        let value: Value = env
+            .lua
+            .load(r#"return app { command = "bin/serve", daemon = "simple" }"#)
+            .eval()
+            .unwrap();
+
+        let _ = env; // keep alive for the value reference
+
+        let table = match value {
+            Value::Table(t) => t,
+            _ => panic!("expected table"),
+        };
+        let app = SnapApp::from_lua_table("serve", &table).unwrap();
+
+        assert_eq!(app.command, "bin/serve");
+        assert_eq!(app.daemon.as_deref(), Some("simple"));
+        assert!(app.plugs.is_none());
+    }
+
+    #[test]
+    fn test_app_unknown_field_rejected_with_named_error() {
+        // Hand-built app table (bypasses the DSL's app()): the Rust-side
+        // conversion must reject unknown fields naming the app, not drop
+        // them silently.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "drifted",
+                version = "1.0",
+                apps = {
+                    svc = {
+                        command = "bin/svc",
+                        restart_condition = "on-abnormal",
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let err = SnapMeta::from_lua_table(&table).unwrap_err().to_string();
+        assert!(
+            err.contains("app 'svc': unknown field 'restart_condition'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_app_unknown_field_lists_valid_fields() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "desktoped",
+                version = "1.0",
+                apps = { svc = { command = "bin/svc", desktop = "share/applications/svc.desktop" } },
+            }
+            "#,
+            )
+            .unwrap();
+        let meta = SnapMeta::from_lua_table(&table).unwrap();
+        assert_eq!(
+            meta.apps["svc"].desktop.as_deref(),
+            Some("share/applications/svc.desktop")
+        );
+        // The field flows into the emitted snap.yaml (the payload's
+        // meta/snap.yaml is what the install-time launcher recorder
+        // reads, issue #7).
+        let yaml = meta.to_yaml().unwrap();
+        assert!(
+            yaml.contains("desktop: share/applications/svc.desktop"),
+            "yaml: {yaml}"
+        );
+    }
+
+    #[test]
+    fn test_app_desktop_field_is_validated() {
+        let env = LuaEnv::new();
+        let cases: &[(&str, &str)] = &[
+            ("absolute path", "/etc/x.desktop"),
+            ("parent escape", "../x.desktop"),
+            ("wrong extension", "share/applications/x.txt"),
+            ("empty", ""),
+        ];
+        for (what, value) in cases {
+            let table = env
+                .eval(&format!(
+                    r#"
+                return snap {{
+                    name = "bad",
+                    version = "1.0",
+                    apps = {{ svc = {{ command = "bin/svc", desktop = "{value}" }} }},
+                }}
+                "#
+                ))
+                .unwrap();
+            let err = SnapMeta::from_lua_table(&table).unwrap_err().to_string();
+            assert!(
+                err.contains("'desktop'"),
+                "{what}: error must name the field, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_app_known_fields_still_accepted() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "ok",
+                version = "1.0",
+                apps = {
+                    svc = {
+                        command = "bin/svc",
+                        daemon = "simple",
+                        plugs = { "network" },
+                        slots = { "s" },
+                        environment = { MODE = "x" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let meta = SnapMeta::from_lua_table(&table).unwrap();
+        let app = &meta.apps["svc"];
+        assert_eq!(app.daemon.as_deref(), Some("simple"));
+        assert_eq!(app.environment.as_ref().unwrap()["MODE"], "x");
+    }
+
+    // ── pkgs/lib templates validate against the app schema (drift guard) ──
+
+    /// Run one pkgs/lib template's `M.app` through the DSL's app() and the
+    /// Rust conversion — the exact path a definition's apps table takes.
+    fn template_app_validates(template: &str, template_name: &str) {
+        let env = LuaEnv::new();
+        let src = format!(
+            "return (function()\nlocal M = (function()\n{}end)()\n\
+             return snap {{\nname = \"tmpl\", version = \"1.0\",\n\
+             apps = {{ svc = M.app {{ command = \"bin/svc\" }} }},\n}}\nend)()",
+            template
+        );
+        let value: Value = env.lua.load(&src).eval().unwrap();
+        let table = match value {
+            Value::Table(t) => t,
+            other => panic!("expected table, got {}", other.type_name()),
+        };
+        let meta = SnapMeta::from_lua_table(&table)
+            .unwrap_or_else(|e| panic!("{template_name} template must validate: {e}"));
+        assert_eq!(meta.apps["svc"].command, "bin/svc");
+    }
+
+    #[test]
+    fn test_daemon_template_validates() {
+        template_app_validates(include_str!("../../../pkgs/lib/daemon.lua"), "daemon");
+    }
+
+    #[test]
+    fn test_cli_template_validates() {
+        template_app_validates(include_str!("../../../pkgs/lib/cli.lua"), "cli");
+    }
+
+    #[test]
+    fn test_desktop_template_validates() {
+        template_app_validates(include_str!("../../../pkgs/lib/desktop.lua"), "desktop");
+    }
+
+    #[test]
+    fn test_daemon_template_emits_no_schema_unknown_keys() {
+        // The drift this guards against: daemon.lua used to emit
+        // restart_condition, which the schema silently dropped.
+        let env = LuaEnv::new();
+        let src = format!(
+            "M = (function()\n{}end)()\nreturn M.app {{ command = \"bin/x\" }}",
+            include_str!("../../../pkgs/lib/daemon.lua")
+        );
+        let app_value: Value = env.lua.load(&src).set_name("daemon.lua").eval().unwrap();
+        let app_table = match app_value {
+            Value::Table(t) => t,
+            other => panic!("expected app table, got {}", other.type_name()),
+        };
+        assert!(
+            app_table
+                .get::<Value>("restart_condition")
+                .unwrap()
+                .is_nil(),
+            "daemon template must not emit keys outside the app schema"
+        );
+    }
+
+    // ── Service declarations (ADR-0032, issue #105) ──
+
+    /// Parse a service table (the Rust conversion boundary).
+    fn svc(env: &LuaEnv, body: &str) -> miette::Result<ServiceDecl> {
+        let table = env.eval(&format!("return {{ {body} }}"))?;
+        ServiceDecl::from_lua_table("svc", &table)
+    }
+
+    #[test]
+    fn service_minimal_valid_parses_with_defaults() {
+        let env = LuaEnv::new();
+        let decl = svc(&env, r#"command = "bin/svc""#).unwrap();
+        assert_eq!(decl.command, "bin/svc");
+        assert_eq!(decl.daemon, ServiceDaemon::Simple);
+        assert!(decl.args.is_empty());
+        assert!(decl.options.is_empty());
+        assert!(decl.after.is_empty());
+        assert!(decl.environment.is_empty());
+        assert!(decl.backend_options.is_empty());
+    }
+
+    #[test]
+    fn service_full_vocabulary_parses() {
+        let env = LuaEnv::new();
+        let decl = svc(
+            &env,
+            r#"
+            command = "bin/valkey-server",
+            daemon = "notify",
+            args = { "--port", "${port}" },
+            options = { port = 6379, data_dir = "%h/.local/share/x", enabled = false },
+            after = { "other" },
+            environment = { VALKEY_QUIET = "yes" },
+            backend_options = { systemd = { RestartSec = 5 } },
+        "#,
+        )
+        .unwrap();
+        assert_eq!(decl.daemon, ServiceDaemon::Notify);
+        assert_eq!(decl.args, vec!["--port".to_string(), "${port}".to_string()]);
+        assert_eq!(decl.options["port"], serde_json::json!(6379));
+        assert_eq!(decl.options["enabled"], serde_json::json!(false));
+        assert_eq!(decl.after, vec!["other".to_string()]);
+        assert_eq!(decl.environment["VALKEY_QUIET"], "yes");
+        assert_eq!(
+            decl.backend_options["systemd"]["RestartSec"],
+            serde_json::json!(5)
+        );
+    }
+
+    #[test]
+    fn service_unknown_field_error_names_valid_fields() {
+        let env = LuaEnv::new();
+        let err = svc(&env, r#"command = "bin/x", restart = true"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("service 'svc': unknown field(s) 'restart'")
+                && err.contains(
+                    "valid fields: command, daemon, args, options, after, environment, \
+                     backend_options"
+                ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn service_bad_daemon_kind_errors() {
+        let env = LuaEnv::new();
+        let err = svc(&env, r#"command = "bin/x", daemon = "supervisord""#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("field 'daemon'") && err.contains("supervisord"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn service_oneshot_named_out_of_scope() {
+        let env = LuaEnv::new();
+        let err = svc(&env, r#"command = "bin/x", daemon = "oneshot""#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'oneshot'") && err.contains("out of scope"),
+            "got: {err}"
+        );
+    }
+
+    /// Service names are the map key; validate through the `services`
+    /// parse loop where the name is first known.
+    fn services_meta(env: &LuaEnv, entries: &str) -> miette::Result<SnapMeta> {
+        let table = env.eval(&format!(
+            "return snap {{ name = \"p\", version = \"1.0\", services = {{ {entries} }} }}"
+        ))?;
+        SnapMeta::from_lua_table(&table)
+    }
+
+    #[test]
+    fn service_name_constraint_rejections() {
+        let env = LuaEnv::new();
+        for bad in ["Web", "my_svc", ""] {
+            let entries = if bad.is_empty() {
+                r#"[""] = { command = "bin/x" }"#.to_string()
+            } else {
+                format!(r#"{bad} = {{ command = "bin/x" }}"#)
+            };
+            let err = services_meta(&env, &entries).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid service name"),
+                "name {bad:?} must be rejected, got: {err}"
+            );
+        }
+        services_meta(&env, r#"["a-b-c9"] = { command = "bin/x" }"#)
+            .expect("kebab-case names are valid");
+    }
+
+    #[test]
+    fn service_unit_text_rejects_injection_at_parse() {
+        // Issue #109 S5: strings that land verbatim in a manager-parsed
+        // file reject control characters and quotes at the parse
+        // boundary, each error naming the field.
+        let env = LuaEnv::new();
+        let cases: [(&str, &str); 6] = [
+            (
+                "after[1]",
+                r#"command = "bin/x", after = { "db\nKillMode=never" }"#,
+            ),
+            ("after[1]", r#"command = "bin/x", after = { "db\"x" }"#),
+            (
+                "backend_options.systemd",
+                r#"command = "bin/x", backend_options = { systemd = { ["Nice\nKillMode=never"] = 1 } }"#,
+            ),
+            (
+                "backend_options.systemd.Nice",
+                r#"command = "bin/x", backend_options = { systemd = { Nice = "5\nKillMode=never" } }"#,
+            ),
+            (
+                "environment",
+                r#"command = "bin/x", environment = { ["A\"B"] = "v" }"#,
+            ),
+            (
+                "environment.A",
+                r#"command = "bin/x", environment = { A = "v\nB=c" }"#,
+            ),
+        ];
+        for (field, body) in cases {
+            let err = svc(&env, body).unwrap_err().to_string();
+            assert!(
+                err.contains("not allowed") && err.contains(field),
+                "{field} must reject the injection, got: {err}"
+            );
+        }
+        // Quotes in environment VALUES stay legal — they are
+        // render-escaped, not injected (the parse only rejects control
+        // characters there).
+        svc(&env, r#"command = "bin/x", environment = { A = "v\"q" }"#)
+            .expect("quoted env values are render-escaped, not rejected");
+    }
+
+    #[test]
+    fn service_exec_text_rejects_control_chars_but_not_quotes() {
+        // Issue #109 S5: command / args / option string values reach
+        // the ExecStart line — a raw newline terminates the directive
+        // and the remainder would parse as fresh unit directives, so
+        // control characters are rejected at parse, naming the field.
+        let env = LuaEnv::new();
+        let cases: [(&str, &str); 3] = [
+            ("command", r#"command = "bin/x\nKillMode=never""#),
+            (
+                "args[2]",
+                r#"command = "bin/x", args = { "--msg", "hi\nKillMode=never" }"#,
+            ),
+            (
+                "options.msg",
+                r#"command = "bin/x", options = { msg = "hi\nKillMode=never" }"#,
+            ),
+        ];
+        for (field, body) in cases {
+            let err = svc(&env, body).unwrap_err().to_string();
+            assert!(
+                err.contains("control characters") && err.contains(field),
+                "{field} must reject the newline by name, got: {err}"
+            );
+        }
+        // Quotes are legitimate on this surface: the emitter
+        // single-quotes every arg, so a quoted arg stays legal.
+        svc(
+            &env,
+            r#"command = "bin/x", args = { "--msg", "it's a \"quoted\" value" }"#,
+        )
+        .expect("quoted args must stay legal");
+    }
+
+    #[test]
+    fn service_interpolation_vocabulary() {
+        let env = LuaEnv::new();
+        let options = r#"options = { port = 6379 }"#;
+        // Declared option resolves; the one built-in resolves; %h/%p/%%
+        // and a trailing non-letter % are legal.
+        svc(
+            &env,
+            &format!(r#"command = "bin/x ${{port}} ${{extensions}} %h %p 50%% 50%", {options}"#),
+        )
+        .expect("declared refs + legal %-tokens must parse");
+        // Unknown ref, in command, in an args entry, and in an option value.
+        for (needle, body) in [
+            ("command", r#"command = "bin/x ${db_host}""#),
+            (
+                "args[2]",
+                r#"command = "bin/x", args = { "--host", "${db_host}" }"#,
+            ),
+            (
+                "options.port",
+                r#"command = "bin/x ${port}", options = { port = "${db_host}" }"#,
+            ),
+        ] {
+            let err = svc(&env, body).unwrap_err().to_string();
+            assert!(
+                err.contains("${db_host}") && err.contains(needle),
+                "{needle} must name the unknown ref, got: {err}"
+            );
+        }
+        // %-tokens: only %h, %p, %% pass; %z is rejected.
+        svc(&env, r#"command = "run %h %p a%%b""#).expect("%h/%p/%% must parse");
+        let err = svc(&env, r#"command = "systemd-escape %z""#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("%z") && err.contains("not a nau specifier"),
+            "got: {err}"
+        );
+        // Unterminated ${ fails closed.
+        assert!(svc(&env, r#"command = "bin/x ${open""#).is_err());
+    }
+
+    #[test]
+    fn service_options_scalars_only() {
+        let env = LuaEnv::new();
+        let err = svc(
+            &env,
+            r#"command = "bin/x", options = { nested = { deeper = 1 } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("options.nested") && err.contains("scalar"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn service_options_enabled_must_be_boolean() {
+        let env = LuaEnv::new();
+        let err = svc(&env, r#"command = "bin/x", options = { enabled = "yes" }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("options.enabled"), "got: {err}");
+    }
+
+    #[test]
+    fn service_environment_literals_enforced() {
+        let env = LuaEnv::new();
+        for value in [r#""${port}""#, r#""home %h""#] {
+            let err = svc(
+                &env,
+                &format!(r#"command = "bin/x", options = {{ port = 1 }}, environment = {{ FOO = {value} }}"#),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("environment.FOO") && err.contains("literals"),
+                "env value {value} must be rejected, got: {err}"
+            );
+        }
+        // A % followed by a non-letter is a literal.
+        svc(
+            &env,
+            r#"command = "bin/x", environment = { FOO = "100% sure" }"#,
+        )
+        .expect("non-letter % in an env literal must parse");
+    }
+
+    #[test]
+    fn service_backend_options_key_validation() {
+        let env = LuaEnv::new();
+        let err = svc(
+            &env,
+            r#"command = "bin/x", backend_options = { upstart = { job = "x" } }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("backend_options.upstart") && err.contains("unknown backend"),
+            "got: {err}"
+        );
+        let err = svc(
+            &env,
+            r#"command = "bin/x", backend_options = { systemd = "raw string" }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("backend_options.systemd"), "got: {err}");
+        let decl = svc(
+            &env,
+            r#"command = "bin/x", backend_options = { launchd = { KeepAlive = true } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decl.backend_options["launchd"]["KeepAlive"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// The daemon.lua `service()` constructor rides the full DSL → Rust
+    /// path (drift guard): defaults deep-merge so `enabled = false`
+    /// survives an override that replaces sibling options.
+    #[test]
+    fn test_daemon_service_template_validates() {
+        let env = LuaEnv::new();
+        let src = format!(
+            "return (function()\nlocal M = (function()\n{}end)()\n\
+             return snap {{\nname = \"tmpl\", version = \"1.0\",\n\
+             services = {{ svc = M.service {{ command = \"bin/svc\", \
+             options = {{ port = 6379 }} }} }},\n}}\nend)()",
+            include_str!("../../../pkgs/lib/daemon.lua")
+        );
+        let value: Value = env.lua.load(&src).eval().unwrap();
+        let table = match value {
+            Value::Table(t) => t,
+            other => panic!("expected table, got {}", other.type_name()),
+        };
+        let meta = SnapMeta::from_lua_table(&table)
+            .unwrap_or_else(|e| panic!("daemon template service must validate: {e}"));
+        let svc_decl = &meta.services["svc"];
+        assert_eq!(svc_decl.command, "bin/svc");
+        assert_eq!(svc_decl.daemon, ServiceDaemon::Simple);
+        assert_eq!(svc_decl.options["port"], serde_json::json!(6379));
+        assert_eq!(
+            svc_decl.options["enabled"],
+            serde_json::json!(false),
+            "the enabled=false default must deep-merge beside overrides"
+        );
+        // Services ride snap.yaml (the build → install pipeline).
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("services:"), "got: {yaml}");
+        assert!(yaml.contains("bin/svc"), "got: {yaml}");
+    }
+
+    // ── Phase 4 tests: YAML output ──
+
+    #[test]
+    fn test_snap_yaml_full() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "hello",
+                    version = "2.10",
+                    summary = "GNU Hello",
+                    description = "Prints a greeting",
+                    grade = "stable",
+                    confinement = "strict",
+                    architectures = { "amd64" },
+                    apps = {
+                        hello = app { command = "bin/hello" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let yaml = meta.to_yaml().unwrap();
+
+        assert!(yaml.contains("name: hello"));
+        assert!(yaml.contains("version: '2.10'"));
+        assert!(yaml.contains("bin/hello"));
+        assert!(yaml.contains("amd64"));
+        assert!(yaml.contains("summary:")); // present, not skipped
+    }
+
+    #[test]
+    fn test_snap_yaml_minimal_omits_optionals() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "minimal",
+                    version = "1.0",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let yaml = meta.to_yaml().unwrap();
+
+        assert!(yaml.contains("name: minimal"));
+        assert!(yaml.contains("grade: stable"));
+        assert!(yaml.contains("confinement: strict"));
+        assert!(!yaml.contains("summary:")); // skipped
+        assert!(!yaml.contains("description:")); // skipped
+    }
+
+    // ── Phase 5/6 tests: build pipeline ──
+
+    #[test]
+    fn test_build_snap_creates_snap_file() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "test-snap",
+                    version = "0.1.0",
+                    architectures = { "amd64" },
+                    apps = {
+                        hello = app { command = "bin/hello" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let stage_dir = std::path::Path::new("test-fixtures");
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let result = build_snap(
+            &meta,
+            stage_dir,
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Default,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(result.is_ok());
+
+        let build_result = result.unwrap();
+        assert_eq!(build_result.snap_filename, "test-snap_0.1.0_amd64.snap");
+        // No source pinned, so source_infos is empty
+        assert!(build_result.source_infos.is_empty());
+
+        let snap_path = output_dir.path().join(&build_result.snap_filename);
+        assert!(
+            snap_path.exists(),
+            "snap file should exist at {:?}",
+            snap_path
+        );
+
+        // Verify it's a valid SquashFS via unsquashfs
+        let unsquashfs = floor_tool(nau_infra::tools::ToolName::Unsquashfs)
+            .expect("unsquashfs should be available");
+        let check = std::process::Command::new(&unsquashfs)
+            .args(["-l", &snap_path.to_string_lossy()])
+            .output()
+            .expect("unsquashfs should be available");
+
+        let stdout = String::from_utf8_lossy(&check.stdout);
+        assert!(
+            stdout.contains("meta/snap.yaml"),
+            "snap should contain meta/snap.yaml"
+        );
+    }
+
+    #[test]
+    fn test_build_multi_arch() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "multi-test",
+                    version = "2.0",
+                    architectures = { "amd64", "arm64" },
+                    apps = {
+                        hello = app { command = "bin/hello" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let stage_dir = std::path::Path::new("test-fixtures");
+
+        // Build amd64
+        let snap_amd64 = build_snap(
+            &meta,
+            stage_dir,
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Default,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(snap_amd64.snap_filename, "multi-test_2.0_amd64.snap");
+        assert!(output_dir.path().join(&snap_amd64.snap_filename).exists());
+
+        // Build arm64
+        let snap_arm64 = build_snap(
+            &meta,
+            stage_dir,
+            output_dir.path(),
+            "arm64",
+            StagePolicy::Default,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(snap_arm64.snap_filename, "multi-test_2.0_arm64.snap");
+        assert!(output_dir.path().join(&snap_arm64.snap_filename).exists());
+
+        // Verify both have correct arch in YAML
+        for snap_result in [&snap_amd64, &snap_arm64] {
+            let unsquashfs = floor_tool(nau_infra::tools::ToolName::Unsquashfs)
+                .expect("unsquashfs should be available");
+            let check = std::process::Command::new(&unsquashfs)
+                .args([
+                    "-l",
+                    &output_dir
+                        .path()
+                        .join(&snap_result.snap_filename)
+                        .to_string_lossy(),
+                ])
+                .output()
+                .expect("unsquashfs should be available");
+            let stdout = String::from_utf8_lossy(&check.stdout);
+            assert!(stdout.contains("meta/snap.yaml"), "missing snap.yaml");
+        }
+    }
+
+    #[test]
+    fn test_resolve_archs_defaults_to_meta() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "t",
+                    version = "1",
+                    architectures = { "amd64", "arm64" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let archs = resolve_archs(&meta, &[]);
+        assert_eq!(archs, vec!["amd64", "arm64"]);
+    }
+
+    #[test]
+    fn test_resolve_archs_cli_overrides_meta() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "t",
+                    version = "1",
+                    architectures = { "amd64", "arm64" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let archs = resolve_archs(&meta, &["arm64".to_string()]);
+        assert_eq!(archs, vec!["arm64"]);
+    }
+
+    #[test]
+    fn test_resolve_archs_defaults_to_all() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "t",
+                    version = "1",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let archs = resolve_archs(&meta, &[]);
+        assert_eq!(archs, vec!["all"]);
+    }
+
+    // ── Phase 15 tests: complete snap.yaml coverage ──
+
+    #[test]
+    fn test_layout_dsl_and_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "laid-out",
+                    version = "1.0",
+                    layout = {
+                        ["/etc/myapp.conf"] = { bind_file = "$SNAP_DATA/etc/myapp.conf" },
+                        ["/var/run/myapp"] = { symlink = "$SNAP_COMMON/run" },
+                        ["/usr/share/fonts"] = { bind = "$SNAP/fonts" },
+                        ["/tmp/cache"] = { tmpfs = { size = "100M" } },
+                        ["/run/lock"] = { tmpfs = true },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let layout = meta.layout.as_ref().unwrap();
+        assert_eq!(layout.len(), 5);
+        assert_eq!(
+            layout["/etc/myapp.conf"],
+            LayoutEntry::BindFile("$SNAP_DATA/etc/myapp.conf".into())
+        );
+        assert_eq!(
+            layout["/var/run/myapp"],
+            LayoutEntry::Symlink("$SNAP_COMMON/run".into())
+        );
+        assert_eq!(
+            layout["/usr/share/fonts"],
+            LayoutEntry::Bind("$SNAP/fonts".into())
+        );
+        assert_eq!(
+            layout["/tmp/cache"],
+            LayoutEntry::Tmpfs(TmpfsSpec::Sized {
+                size: "100M".into()
+            })
+        );
+        assert_eq!(
+            layout["/run/lock"],
+            LayoutEntry::Tmpfs(TmpfsSpec::Bare(true))
+        );
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("layout:"));
+        assert!(yaml.contains("bind-file: $SNAP_DATA/etc/myapp.conf"));
+        assert!(yaml.contains("symlink: $SNAP_COMMON/run"));
+        assert!(yaml.contains("bind: $SNAP/fonts"));
+        assert!(yaml.contains("size: 100M"));
+    }
+
+    #[test]
+    fn test_layout_validation_errors() {
+        let env = LuaEnv::new();
+        // No type key
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = {} },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "layout['/etc/x'] must have exactly one of bind, bind_file, symlink, tmpfs"
+            ),
+            "got: {err}"
+        );
+
+        // Two type keys
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = { bind = "$SNAP/a", symlink = "$SNAP/b" } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "layout['/etc/x'] must have exactly one of bind, bind_file, symlink, tmpfs (got 2)"
+            ),
+            "got: {err}"
+        );
+
+        // Non-string bind value
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = { bind = 42 } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("layout['/etc/x'].bind must be a string, got number"),
+            "got: {err}"
+        );
+
+        // Bad tmpfs value
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = { tmpfs = "yes" } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "layout['/etc/x'].tmpfs must be true or a table with optional string 'size'"
+            ),
+            "got: {err}"
+        );
+
+        // tmpfs table with non-string size
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = { tmpfs = { size = 100 } } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("layout['/etc/x'].tmpfs.size must be a string, got number"),
+            "got: {err}"
+        );
+
+        // Entry not a table
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "l", version = "1",
+                    layout = { ["/etc/x"] = "bind" },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("layout['/etc/x'] must be a table, got string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_hooks_dsl_struct_and_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "hooked",
+                    version = "1.0",
+                    hooks = {
+                        configure = "scripts/configure.sh",
+                        install = "scripts/install.sh",
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let hooks = meta.hooks.as_ref().unwrap();
+        assert_eq!(hooks["configure"].command, "meta/hooks/configure");
+        assert_eq!(hooks["configure"].source, "scripts/configure.sh");
+        assert_eq!(hooks["install"].command, "meta/hooks/install");
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("hooks:"));
+        assert!(yaml.contains("command: meta/hooks/configure"));
+        assert!(yaml.contains("command: meta/hooks/install"));
+        // Source paths are build-time only — never in snap.yaml.
+        assert!(!yaml.contains("scripts/configure.sh"));
+    }
+
+    #[test]
+    fn test_hooks_validation_error() {
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "h", version = "1",
+                    hooks = { configure = 42 },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("hooks['configure'] must be a string script path, got number"),
+            "got: {err}"
+        );
+    }
+
+    // ── Hook/icon source resolution (definition-relative) ──
+
+    /// Set the owner execute bit on `path`.
+    fn chmod_owner_x(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(perms.mode() | 0o100);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// Meta for one hook resolved against `definition_dir`.
+    fn hook_meta(env: &LuaEnv, script_ref: &str) -> SnapMeta {
+        let src = format!(
+            r#"
+            return snap {{
+                name = "hooked", version = "1.0",
+                hooks = {{ configure = "{}" }},
+            }}
+            "#,
+            script_ref
+        );
+        SnapMeta::from_lua_table(&env.eval(&src).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_hook_resolves_relative_to_definition() {
+        // A definition in a subdirectory referencing a sibling script must
+        // build regardless of the process CWD.
+        let project = tempfile::tempdir().unwrap();
+        let def_dir = project.path().join("pkgs/s/mypkg");
+        std::fs::create_dir_all(&def_dir).unwrap();
+        let script = def_dir.join("configure.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        chmod_owner_x(&script);
+
+        let env = LuaEnv::new();
+        let mut meta = hook_meta(&env, "configure.sh");
+        meta.definition_dir = Some(def_dir.clone());
+
+        let build_root = tempfile::tempdir().unwrap();
+        super::copy_hook_scripts(&meta, build_root.path()).unwrap();
+        let copied = build_root.path().join("meta/hooks/configure");
+        assert!(copied.is_file(), "hook must be copied into the snap");
+        let content = std::fs::read_to_string(&copied).unwrap();
+        assert!(content.contains("exit 0"), "copied content must match");
+    }
+
+    #[test]
+    fn test_hook_missing_reports_both_resolution_roots() {
+        let project = tempfile::tempdir().unwrap();
+        let def_dir = project.path().join("def");
+        std::fs::create_dir_all(&def_dir).unwrap();
+
+        let env = LuaEnv::new();
+        let mut meta = hook_meta(&env, "nowhere.sh");
+        meta.definition_dir = Some(def_dir);
+
+        let build_root = tempfile::tempdir().unwrap();
+        let err = super::copy_hook_scripts(&meta, build_root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("hook 'configure': script not found: nowhere.sh"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("definition's directory, then the project directory"),
+            "error must name both resolution roots: {err}"
+        );
+    }
+
+    #[test]
+    fn test_hook_warns_when_not_executable() {
+        // Default 0o644 — no execute bit. The hook is copied (the emitted
+        // snap.yaml already points at meta/hooks/configure) but a warning
+        // is raised instead of the copy passing silently.
+        let project = tempfile::tempdir().unwrap();
+        let def_dir = project.path().join("def");
+        std::fs::create_dir_all(&def_dir).unwrap();
+        let script = def_dir.join("configure.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(
+            super::hook_exec_warning("configure", &script).is_some(),
+            "non-executable script must produce a warning"
+        );
+
+        let env = LuaEnv::new();
+        let mut meta = hook_meta(&env, "configure.sh");
+        meta.definition_dir = Some(def_dir);
+
+        let build_root = tempfile::tempdir().unwrap();
+        super::copy_hook_scripts(&meta, build_root.path()).unwrap();
+        assert!(build_root.path().join("meta/hooks/configure").is_file());
+    }
+
+    #[test]
+    fn test_hook_exec_warning_none_when_executable() {
+        let project = tempfile::tempdir().unwrap();
+        let script = project.path().join("configure.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        chmod_owner_x(&script);
+        assert!(super::hook_exec_warning("configure", &script).is_none());
+    }
+
+    #[test]
+    fn test_icon_resolves_relative_to_definition() {
+        let project = tempfile::tempdir().unwrap();
+        let def_dir = project.path().join("assets-nested");
+        std::fs::create_dir_all(&def_dir).unwrap();
+        std::fs::write(def_dir.join("logo.png"), b"fake png").unwrap();
+
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return snap {
+                name = "iconic", version = "1.0",
+                icon = "logo.png",
+            }
+            "#,
+            )
+            .unwrap();
+        let mut meta = SnapMeta::from_lua_table(&table).unwrap();
+        meta.definition_dir = Some(def_dir);
+
+        let build_root = tempfile::tempdir().unwrap();
+        super::copy_icon(&meta, build_root.path()).unwrap();
+        let copied = build_root.path().join("meta/gui/icon.png");
+        assert!(copied.is_file(), "icon must be copied into the snap");
+    }
+
+    // ── Build-failure network hint (sandbox unshares the net) ──
+
+    #[test]
+    fn test_stderr_suggests_network_fetch() {
+        assert!(super::stderr_suggests_network_fetch(
+            "curl: (6) Could not resolve host: example.com"
+        ));
+        assert!(super::stderr_suggests_network_fetch(
+            "wget: unable to resolve host address 'example.com'"
+        ));
+        assert!(super::stderr_suggests_network_fetch(
+            "Performing download step (download, verify, extract) for 'dep'"
+        ));
+        assert!(super::stderr_suggests_network_fetch(
+            "Cloning into 'lib'..."
+        ));
+        assert!(!super::stderr_suggests_network_fetch(
+            "make: *** [Makefile:42: all] Error 1"
+        ));
+        assert!(!super::stderr_suggests_network_fetch(""));
+    }
+
+    #[test]
+    fn test_typed_plugs_and_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "plugged",
+                    version = "1.0",
+                    plugs = {
+                        network = { interface = "network" },
+                        ["shared-data"] = {
+                            interface = "content",
+                            content = "my-content",
+                            target = "$SNAP/data",
+                            default_provider = "producer",
+                        },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let plugs = meta.plugs.as_ref().unwrap();
+        match &plugs["network"] {
+            SnapPlug::Typed(p) => {
+                assert_eq!(p.interface, "network");
+                assert!(p.attributes.is_empty());
+            }
+            other => panic!("expected Typed plug, got {other:?}"),
+        }
+        match &plugs["shared-data"] {
+            SnapPlug::Typed(p) => {
+                assert_eq!(p.interface, "content");
+                assert_eq!(
+                    p.attributes.get("content").map(String::as_str),
+                    Some("my-content")
+                );
+                assert_eq!(
+                    p.attributes.get("target").map(String::as_str),
+                    Some("$SNAP/data")
+                );
+                assert_eq!(
+                    p.attributes.get("default_provider").map(String::as_str),
+                    Some("producer")
+                );
+            }
+            other => panic!("expected Typed plug, got {other:?}"),
+        }
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("plugs:"));
+        assert!(yaml.contains("interface: content"));
+        assert!(yaml.contains("content: my-content"));
+        assert!(yaml.contains("target: $SNAP/data"));
+        assert!(yaml.contains("default_provider: producer"));
+    }
+
+    #[test]
+    fn test_string_plugs_back_compat() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "legacy-plugs",
+                    version = "1.0",
+                    plugs = { "network", "network-bind" },
+                    slots = { "home" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        assert_eq!(
+            meta.plugs.as_ref().unwrap()["network"],
+            SnapPlug::Name("network".into())
+        );
+        assert_eq!(
+            meta.plugs.as_ref().unwrap()["network-bind"],
+            SnapPlug::Name("network-bind".into())
+        );
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("network: network"));
+        assert!(yaml.contains("network-bind: network-bind"));
+        assert!(yaml.contains("home: home"));
+    }
+
+    #[test]
+    fn test_typed_slots_and_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "slotted",
+                    version = "1.0",
+                    slots = {
+                        ["shared-data"] = {
+                            interface = "content",
+                            content = "my-content",
+                            read = "$SNAP/data",
+                        },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let slots = meta.slots.as_ref().unwrap();
+        match &slots["shared-data"] {
+            SnapPlug::Typed(p) => {
+                assert_eq!(p.interface, "content");
+                assert_eq!(
+                    p.attributes.get("content").map(String::as_str),
+                    Some("my-content")
+                );
+            }
+            other => panic!("expected Typed slot, got {other:?}"),
+        }
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("slots:"));
+        assert!(yaml.contains("interface: content"));
+    }
+
+    #[test]
+    fn test_plug_map_validation_errors() {
+        let env = LuaEnv::new();
+
+        // Non-string, non-table value
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "p", version = "1",
+                    plugs = { network = 42 },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("plugs['network'] must be a string or table, got number"),
+            "got: {err}"
+        );
+
+        // Typed entry without interface
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "p", version = "1",
+                    plugs = { shared = { content = "x" } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("plugs['shared'].interface must be a string, got nil"),
+            "got: {err}"
+        );
+
+        // Non-string attribute
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "p", version = "1",
+                    slots = { shared = { interface = "content", content = 7 } },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("slots['shared'].content must be a string, got number"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_global_environment_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "envy",
+                    version = "1.0",
+                    environment = { MY_VAR = "hello", OTHER_VAR = "world" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let env_map = meta.environment.as_ref().unwrap();
+        assert_eq!(env_map.get("MY_VAR").map(String::as_str), Some("hello"));
+        assert_eq!(env_map.get("OTHER_VAR").map(String::as_str), Some("world"));
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("environment:"));
+        assert!(yaml.contains("MY_VAR: hello"));
+        assert!(yaml.contains("OTHER_VAR: world"));
+    }
+
+    #[test]
+    fn test_environment_validation_error() {
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "e", version = "1",
+                    environment = { VAR = 42 },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("environment['VAR'] must be a string, got number"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_icon_target_and_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "iconic",
+                    version = "1.0",
+                    icon = "assets/logo.png",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        assert_eq!(meta.icon_source.as_deref(), Some("assets/logo.png"));
+        assert_eq!(meta.icon.as_deref(), Some("meta/gui/icon.png"));
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("icon: meta/gui/icon.png"));
+        // Source path stays out of snap.yaml.
+        assert!(!yaml.contains("assets/logo.png"));
+    }
+
+    #[test]
+    fn test_icon_requires_extension() {
+        let env = LuaEnv::new();
+        let result = env.eval(
+            r#"
+            return {
+                default = snap {
+                    name = "i", version = "1",
+                    icon = "assets/README",
+                },
+            }
+            "#,
+        );
+        // DSL accepts the string; Rust derivation rejects the missing extension.
+        let table = result.unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'icon' must have a file extension"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_compression_validation() {
+        let env = LuaEnv::new();
+        for comp in ["zstd", "xz", "lzo"] {
+            let table = env
+                .eval(&format!(
+                    r#"
+                    return {{
+                        default = snap {{
+                            name = "c", version = "1",
+                            compression = "{comp}",
+                        }},
+                    }}
+                    "#
+                ))
+                .unwrap();
+            let default_table: mlua::Table = table.get("default").unwrap();
+            let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+            assert_eq!(meta.compression.as_deref(), Some(comp));
+        }
+
+        // Absent compression is legal — the zstd default applies at pack
+        // time (argv), not at parse time.
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "c", version = "1" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.compression, None);
+
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "c", version = "1",
+                    compression = "lzip",
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'compression' must be one of: zstd, xz, lzo"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_compression_level_validation() {
+        let env = LuaEnv::new();
+
+        // Accepted: zstd 1-22 (explicit and via the absent default), lzo 1-9.
+        for (comp, want) in [
+            (Some("zstd"), Some(1u32)),
+            (Some("zstd"), Some(22)),
+            (None, Some(6)), // absent compression defaults to zstd — level applies to it
+            (Some("lzo"), Some(1)),
+            (Some("lzo"), Some(9)),
+        ] {
+            let comp_arg = comp
+                .map(|c| format!("compression = \"{c}\","))
+                .unwrap_or_default();
+            let level_arg = want
+                .map(|l| format!("compression_level = {l},"))
+                .unwrap_or_default();
+            let table = env
+                .eval(&format!(
+                    r#"
+                    return {{
+                        default = snap {{
+                            name = "c", version = "1",
+                            {comp_arg}
+                            {level_arg}
+                        }},
+                    }}
+                    "#
+                ))
+                .unwrap_or_else(|e| panic!("lua should accept {comp_arg} {level_arg}: {e}"));
+            let default_table: mlua::Table = table.get("default").unwrap();
+            let meta = SnapMeta::from_lua_table(&default_table)
+                .unwrap_or_else(|e| panic!("rust should accept {comp_arg} {level_arg}: {e}"));
+            assert_eq!(meta.compression_level, want, "for {comp_arg}");
+        }
+
+        // Junk levels rejected at the DSL boundary.
+        for bad in ["0", "23", "-1", "6.5", "\"6\""] {
+            let err = env
+                .eval(&format!(
+                    r#"
+                    return {{
+                        default = snap {{
+                            name = "c", version = "1",
+                            compression = "zstd",
+                            compression_level = {bad},
+                        }},
+                    }}
+                    "#
+                ))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("'compression_level'"),
+                "level {bad} should be rejected, got: {err}"
+            );
+        }
+
+        // lzo bounds.
+        for bad in ["0", "10"] {
+            let err = env
+                .eval(&format!(
+                    r#"
+                    return {{
+                        default = snap {{
+                            name = "c", version = "1",
+                            compression = "lzo",
+                            compression_level = {bad},
+                        }},
+                    }}
+                    "#
+                ))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("must be between 1 and 9 for compression = \"lzo\""),
+                "lzo level {bad} should be rejected, got: {err}"
+            );
+        }
+
+        // xz takes no level — rejected at parse time (the wrapper does not
+        // implement -Xcompression-level).
+        let err = env
+            .eval(
+                r#"
+                return {
+                    default = snap {
+                        name = "c", version = "1",
+                        compression = "xz",
+                        compression_level = 6,
+                    },
+                }
+                "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'compression_level' is not supported with compression = \"xz\""),
+            "got: {err}"
+        );
+
+        // The Rust boundary re-checks even for non-DSL constructors.
+        let err = validate_compression_level(Some("xz"), Some(6))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not supported with compression = \"xz\""),
+            "got: {err}"
+        );
+        assert!(validate_compression_choice(Some("gzip")).is_err());
+        assert!(validate_compression_choice(Some("zstd")).is_ok());
+        assert!(validate_compression_choice(None).is_ok());
+    }
+
+    #[test]
+    fn test_type_snapd_types_emitted() {
+        let env = LuaEnv::new();
+
+        // base emits type: base
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "b", version = "1", type = "base" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let yaml = meta.to_yaml().unwrap();
+        assert!(yaml.contains("type: base"), "got: {yaml}");
+
+        // app is snapd's default — omitted
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "a", version = "1", type = "app" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let yaml = meta.to_yaml().unwrap();
+        assert!(!yaml.contains("type:"), "got: {yaml}");
+
+        // Internal build classifications stay out of snap.yaml
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "s", version = "1", type = "source" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.type_.as_deref(), Some("source")); // build metadata preserved
+        let yaml = meta.to_yaml().unwrap();
+        assert!(!yaml.contains("type:"), "got: {yaml}");
+    }
+
+    #[test]
+    fn test_type_validation_error() {
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "t", version = "1", type = "os" },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "'type' must be one of: source, meta, store, app, base, gadget, kernel, snapd"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_adopt_info_relaxes_version() {
+        let env = LuaEnv::new();
+
+        // adopt-info without version: accepted, version placeholder —
+        // marked as adopted so it never reads as a declared version.
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "adopted",
+                    adopt_info = "my-part",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.adopt_info.as_deref(), Some("my-part"));
+        assert_eq!(meta.version, "0"); // placeholder — resolved at build time
+        assert!(meta.version_adopted);
+        assert_eq!(meta.display_version(), "(version adopted at build)");
+
+        // adopt-info is a snapcraft build-time key, not snapd schema — it
+        // must never be emitted into snap.yaml (same bug class as `source:`).
+        let yaml = meta.to_yaml().unwrap();
+        assert!(
+            !yaml.contains("adopt-info"),
+            "adopt-info must not be emitted to snap.yaml, got: {yaml}"
+        );
+
+        // adopt-info with explicit version: version preserved and marked
+        // declared.
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "adopted",
+                    version = "2.5",
+                    adopt_info = "my-part",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.version, "2.5");
+        assert!(!meta.version_adopted);
+        assert_eq!(meta.display_version(), "2.5");
+    }
+
+    // ── adopt-info: build-time extraction ladder ──
+
+    /// Eval a definition with adopt-info into a SnapMeta.
+    fn adopt_meta(lua_snap_body: &str) -> SnapMeta {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(&format!(
+                "return {{ default = snap {{ {lua_snap_body} }} }}"
+            ))
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        SnapMeta::from_lua_table(&default_table).unwrap()
+    }
+
+    /// A source tree + stage pair for extraction fixtures, with `files`
+    /// written under `src_root` or `stage` respectively.
+    fn adopt_fixtures(
+        src_files: &[(&str, &str)],
+        stage_files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, tempfile::TempDir) {
+        let src = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        for (name, content) in src_files {
+            std::fs::write(src.path().join(name), content).unwrap();
+        }
+        for (name, content) in stage_files {
+            let path = stage.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        (src, stage)
+    }
+
+    #[test]
+    fn test_adopt_info_metadata_json_supplies_fields() {
+        let meta = adopt_meta(
+            r#"name = "adopted", adopt_info = "core", parts = { core = { plugin = "make" } }"#,
+        );
+        let (src, stage) = adopt_fixtures(
+            &[],
+            &[(
+                "snap/metadata.json",
+                r#"{"version": "7.4", "summary": "Adopted summary", "description": "Adopted description"}"#,
+            )],
+        );
+        let adopted = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap()
+            .expect("adopt metadata extracted");
+        let version = adopted.version.expect("version extracted");
+        assert_eq!(version.value, "7.4");
+        assert_eq!(version.from, "snap/metadata.json");
+        assert_eq!(adopted.summary.as_deref(), Some("Adopted summary"));
+        assert_eq!(adopted.description, Some("Adopted description".into()));
+        assert!(adopted.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_adopt_info_metadata_json_unparsable_is_an_error() {
+        let meta = adopt_meta(
+            r#"name = "adopted", adopt_info = "core", parts = { core = { plugin = "make" } }"#,
+        );
+        let (src, stage) = adopt_fixtures(&[], &[("snap/metadata.json", "{not json")]);
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not valid JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn test_adopt_info_explicit_version_wins_with_warning() {
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", version = "2.5", adopt_info = "core",
+            parts = { core = { plugin = "autotools" } }
+            "#,
+        );
+        let (src, stage) = adopt_fixtures(
+            &[("configure.ac", "AC_INIT([adopted], [7.4])\n")],
+            &[("snap/metadata.json", r#"{"summary": "Stage summary"}"#)],
+        );
+        let adopted = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap()
+            .unwrap();
+        // Explicit version wins outright — it feeds cache identity and the
+        // snap filename, so it never moves silently.
+        assert!(adopted.version.is_none());
+        assert_eq!(meta.version, "2.5");
+        // The divergence is warned about, naming both sides.
+        assert!(
+            adopted
+                .warnings
+                .iter()
+                .any(|w| w.contains("explicit version '2.5' wins")
+                    && w.contains("7.4")
+                    && w.contains("configure.ac")),
+            "got: {:?}",
+            adopted.warnings
+        );
+        // Explicit version wins per-field only: summary still adopted.
+        assert_eq!(adopted.summary.as_deref(), Some("Stage summary"));
+    }
+
+    #[test]
+    fn test_adopt_info_plugin_extractors_on_fixture_trees() {
+        // The registry plugins with canonical version files (meson has an
+        // extractor too, but no plugin — tested at the plugins.rs level).
+        let cases: Vec<(&str, &str, &str, &str)> = vec![
+            // (plugin, fixture file, fixture content, expected version)
+            (
+                "autotools",
+                "configure.ac",
+                "AC_INIT([pkg], [7.4])\n",
+                "7.4",
+            ),
+            (
+                "cargo",
+                "Cargo.toml",
+                "[package]\nname = \"pkg\"\nversion = \"0.8.2\"\n",
+                "0.8.2",
+            ),
+            (
+                "cmake",
+                "CMakeLists.txt",
+                "project(pkg VERSION 5.6.4 LANGUAGES C)\n",
+                "5.6.4",
+            ),
+        ];
+        for (plugin, file, content, expected) in cases {
+            let meta = adopt_meta(&format!(
+                r#"name = "adopted", adopt_info = "core", parts = {{ core = {{ plugin = "{plugin}" }} }}"#
+            ));
+            let (src, stage) = adopt_fixtures(&[(file, content)], &[]);
+            let adopted = extract_adopted_meta(&meta, src.path(), stage.path())
+                .unwrap_or_else(|e| panic!("{plugin}: {e}"))
+                .unwrap();
+            let version = adopted
+                .version
+                .unwrap_or_else(|| panic!("{plugin}: no version extracted"));
+            assert_eq!(version.value, expected, "plugin {plugin}");
+            assert!(!version.from.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_adopt_info_version_disagreement_is_an_error() {
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "autotools" } }
+            "#,
+        );
+        let (src, stage) = adopt_fixtures(
+            &[
+                ("configure.ac", "AC_INIT([pkg], [1.0])\n"),
+                ("configure.in", "AC_INIT([pkg], [2.0])\n"),
+            ],
+            &[],
+        );
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("conflicting version metadata within part 'core'")
+                && err.contains("configure.ac says '1.0'")
+                && err.contains("configure.in says '2.0'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_adopt_info_absent_version_is_an_error_never_placeholder() {
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "autotools" } }
+            "#,
+        );
+        // No metadata anywhere — extraction must fail, never fall back to "0".
+        let (src, stage) = adopt_fixtures(&[], &[]);
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no version metadata found for part 'core'"),
+            "got: {err}"
+        );
+
+        // A make part has no canonical version file either — same error,
+        // naming the plugin.
+        let meta = adopt_meta(
+            r#"name = "adopted", adopt_info = "core", parts = { core = { plugin = "make" } }"#,
+        );
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plugin 'make'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_adopt_info_field_caps_error_never_truncate() {
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        // Over-limit version (33 bytes > snapd's 32-byte cap): snapd
+        // measures version in bytes.
+        let long_version = "a".repeat(33);
+        let (src, stage) = adopt_fixtures(
+            &[],
+            &[(
+                "snap/metadata.json",
+                &format!(r#"{{"version": "{long_version}"}}"#),
+            )],
+        );
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds snapd's 32-byte limit"), "got: {err}");
+
+        // Same for an over-long summary (129 codepoints > 128)...
+        let long_summary = "s".repeat(129);
+        let (src, stage) = adopt_fixtures(
+            &[],
+            &[(
+                "snap/metadata.json",
+                &format!(r#"{{"version": "1.0", "summary": "{long_summary}"}}"#),
+            )],
+        );
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("extracted summary") && err.contains("128-character limit"),
+            "got: {err}"
+        );
+
+        // ...and an over-long description (4097 codepoints > 4096).
+        let long_description = "d".repeat(4097);
+        let (src, stage) = adopt_fixtures(
+            &[],
+            &[(
+                "snap/metadata.json",
+                &format!(r#"{{"version": "1.0", "description": "{long_description}"}}"#),
+            )],
+        );
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("extracted description") && err.contains("4096-character limit"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_adopt_info_field_caps_at_limit_pass() {
+        // At-limit values pass: version counts BYTES, summary/description
+        // count Unicode codepoints — 128 'é' are 256 bytes but exactly at
+        // snapd's 128-codepoint summary cap.
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        let version = "a".repeat(32);
+        let summary = "é".repeat(128);
+        let description = "é".repeat(4096);
+        let metadata = format!(
+            r#"{{"version": "{version}", "summary": "{summary}", "description": "{description}"}}"#
+        );
+        let (src, stage) = adopt_fixtures(&[], &[("snap/metadata.json", &metadata)]);
+        let adopted = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap()
+            .expect("at-limit values must pass");
+        assert_eq!(adopted.version.unwrap().value, version);
+        assert_eq!(adopted.summary.as_deref(), Some(summary.as_str()));
+        assert_eq!(adopted.description.as_deref(), Some(description.as_str()));
+    }
+
+    #[test]
+    fn test_adopt_info_version_charset_is_enforced() {
+        // snapd also constrains the version charset (snap/validate.go):
+        // starts alphanumeric, ends alphanumeric or `+`/`~`, interior may
+        // additionally be one of `: . + ~ -` — same hard-error stance.
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        let cases: &[(&str, bool)] = &[
+            ("7.4", true),
+            ("1.0-beta+build.2", true),
+            ("2", true),
+            ("-1.0", false),     // must start alphanumeric
+            ("1.", false),       // must end alphanumeric or +/~
+            ("1.0 beta", false), // space is not in the charset
+            ("1.0λ", false),     // non-ASCII never matches
+            ("", false),         // empty is not a version
+        ];
+        for (version, ok) in cases {
+            let metadata = format!(r#"{{"version": "{version}"}}"#);
+            let (src, stage) = adopt_fixtures(&[], &[("snap/metadata.json", &metadata)]);
+            let result = extract_adopted_meta(&meta, src.path(), stage.path());
+            assert_eq!(result.is_ok(), *ok, "version {version:?}: got {result:?}");
+        }
+        // The rejection names the charset, not the length.
+        let (src, stage) =
+            adopt_fixtures(&[], &[("snap/metadata.json", r#"{"version": "1.0 beta"}"#)]);
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("version charset"), "got: {err}");
+    }
+
+    #[test]
+    fn test_adopt_info_metainfo_supplies_summary_description() {
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "core",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        let (src, stage) = adopt_fixtures(
+            &[],
+            &[(
+                "snap/metadata.json",
+                r#"{"version": "7.4"}"#,
+            ),
+            (
+                "usr/share/metainfo/pkg.metainfo.xml",
+                "<component>\n  <summary>  Short one-line summary </summary>\n  <description>\n\
+                 <p>First.</p>\n<p xml:lang=\"en\">Second.</p>\n\
+                 </description>\n</component>\n",
+            )],
+        );
+        let adopted = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap()
+            .unwrap();
+        // Version comes from rung 2 (metadata.json); summary/description
+        // per-field from the metainfo rung.
+        assert_eq!(adopted.version.unwrap().value, "7.4");
+        assert_eq!(adopted.summary.as_deref(), Some("Short one-line summary"));
+        assert_eq!(adopted.description.as_deref(), Some("First.\n\nSecond."));
+    }
+
+    #[test]
+    fn test_adopt_info_names_must_reference_a_real_part() {
+        // Unknown part name.
+        let meta = adopt_meta(
+            r#"
+            name = "adopted", adopt_info = "nope",
+            parts = { core = { plugin = "make" } }
+            "#,
+        );
+        let (src, stage) = adopt_fixtures(&[], &[]);
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("adopt-info names part 'nope'") && err.contains("no such part"),
+            "got: {err}"
+        );
+
+        // No parts at all (single `build` snap).
+        let meta = adopt_meta(r#"name = "adopted", adopt_info = "core", build = "true""#);
+        let err = extract_adopted_meta(&meta, src.path(), stage.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("has no parts (adopt-info refers to a parts: entry)"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_version_still_required_without_adopt_info() {
+        let env = LuaEnv::new();
+        let result = env.eval(
+            r#"
+            return {
+                default = snap { name = "strict" },
+            }
+            "#,
+        );
+        // Lua-side rejection
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing required field 'version'"),
+            "got: {err}"
+        );
+
+        // Rust-side rejection (table smuggled past Lua validation)
+        let table = env
+            .eval(
+                r#"
+            return { default = { name = "strict" } }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("field 'version' is required"), "got: {err}");
+    }
+
+    // ── Phase 15 integration: all new fields at once ──
+
+    #[test]
+    fn test_phase15_all_fields_snap_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "my-app",
+                    version = "1.0",
+                    summary = "Full-coverage app",
+                    description = "Exercises every Phase 15 field",
+                    type = "app",
+                    compression = "lzo",
+                    icon = "my-icon.svg",
+                    adopt_info = nil, -- explicit version above
+                    environment = { APP_MODE = "production" },
+                    layout = {
+                        ["/etc/myapp.conf"] = { bind_file = "$SNAP_DATA/etc/myapp.conf" },
+                        ["/var/run/myapp"] = { symlink = "$SNAP_COMMON/run" },
+                        ["/var/cache/myapp"] = { tmpfs = { size = "100M" } },
+                    },
+                    hooks = {
+                        configure = "scripts/configure.sh",
+                        install = "scripts/install.sh",
+                    },
+                    plugs = {
+                        network = { interface = "network" },
+                        ["shared-data"] = {
+                            interface = "content",
+                            content = "my-content",
+                            target = "$SNAP/data",
+                            default_provider = "producer",
+                        },
+                    },
+                    slots = {
+                        ["shared-data"] = { interface = "content", content = "my-content" },
+                    },
+                    apps = {
+                        hello = app { command = "bin/hello" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let yaml = meta.to_yaml().unwrap();
+
+        // layout block
+        assert!(yaml.contains("layout:"));
+        assert!(yaml.contains("bind-file: $SNAP_DATA/etc/myapp.conf"));
+        assert!(yaml.contains("symlink: $SNAP_COMMON/run"));
+        assert!(yaml.contains("tmpfs:"));
+        assert!(yaml.contains("size: 100M"));
+
+        // hooks block
+        assert!(yaml.contains("hooks:"));
+        assert!(yaml.contains("configure:"));
+        assert!(yaml.contains("command: meta/hooks/configure"));
+        assert!(yaml.contains("install:"));
+        assert!(yaml.contains("command: meta/hooks/install"));
+
+        // plugs/slots blocks
+        assert!(yaml.contains("plugs:"));
+        assert!(yaml.contains("network:"));
+        assert!(yaml.contains("shared-data:"));
+        assert!(yaml.contains("interface: content"));
+        assert!(yaml.contains("default_provider: producer"));
+        assert!(yaml.contains("slots:"));
+
+        // global environment, icon, compression (build-only), type (default omitted)
+        assert!(yaml.contains("environment:"));
+        assert!(yaml.contains("APP_MODE: production"));
+        assert!(yaml.contains("icon: meta/gui/icon.svg"));
+        assert!(!yaml.contains("compression")); // build-time only (incl. compression_level)
+        assert!(!yaml.contains("compression_level")); // build-time only
+        assert!(!yaml.contains("type:")); // app is snapd's default
+    }
+
+    #[test]
+    fn test_phase15_build_copies_hooks_icon_and_compression() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Real files for hook scripts and the icon (absolute paths).
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("scripts")).unwrap();
+        std::fs::write(
+            project.path().join("scripts/configure.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::write(project.path().join("my-icon.png"), b"fake png bytes").unwrap();
+
+        let env = LuaEnv::new();
+        let src = format!(
+            r#"
+            return {{
+                default = snap {{
+                    name = "phase15-build",
+                    version = "1.0",
+                    compression = "lzo",
+                    icon = "{}",
+                    hooks = {{
+                        configure = "{}",
+                    }},
+                }},
+            }}
+            "#,
+            project.path().join("my-icon.png").display(),
+            project.path().join("scripts/configure.sh").display(),
+        );
+        let table = env.eval(&src).unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let stage_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let result = build_snap(
+            &meta,
+            stage_dir.path(),
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Default,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let snap_path = output_dir.path().join(&result.snap_filename);
+        assert!(snap_path.exists());
+
+        // Hook script and icon must be inside the snap.
+        let unsquashfs = floor_tool(nau_infra::tools::ToolName::Unsquashfs)
+            .expect("unsquashfs should be available");
+        let listing = std::process::Command::new(&unsquashfs)
+            .args(["-l", &snap_path.to_string_lossy()])
+            .output()
+            .expect("unsquashfs should be available");
+        let stdout = String::from_utf8_lossy(&listing.stdout);
+        assert!(stdout.contains("meta/hooks/configure"), "got: {stdout}");
+        assert!(stdout.contains("meta/gui/icon.png"), "got: {stdout}");
+
+        // Extract snap.yaml and check the emitted hook command + icon path.
+        let extract_dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(&unsquashfs)
+            .args([
+                "-f",
+                "-d",
+                &extract_dir.path().to_string_lossy(),
+                &snap_path.to_string_lossy(),
+                "meta/snap.yaml",
+            ])
+            .status()
+            .expect("unsquashfs should be available");
+        assert!(status.success());
+        let yaml = std::fs::read_to_string(extract_dir.path().join("meta/snap.yaml")).unwrap();
+        assert!(
+            yaml.contains("command: meta/hooks/configure"),
+            "got: {yaml}"
+        );
+        assert!(yaml.contains("icon: meta/gui/icon.png"), "got: {yaml}");
+
+        // compression = "lzo" was wired into mksquashfs — an invalid -comp
+        // value would have failed the build above.
+        assert_eq!(meta.compression.as_deref(), Some("lzo"));
+    }
+
+    // ── Ticket #154: zstd default compression ──
+
+    #[test]
+    fn test_mksquashfs_compression_args_default_is_zstd_6_1m() {
+        // The default path (no compression declared) carries level 6 and
+        // 1M blocks (ticket #154, ADR-0038 decisions 1-3).
+        assert_eq!(
+            mksquashfs_compression_args(None, None),
+            vec!["zstd", "-Xcompression-level", "6", "-b", "1M"]
+        );
+        // An explicit zstd level rides through; 1M blocks stay.
+        assert_eq!(
+            mksquashfs_compression_args(Some("zstd"), Some(9)),
+            vec!["zstd", "-Xcompression-level", "9", "-b", "1M"]
+        );
+    }
+
+    #[test]
+    fn test_mksquashfs_compression_args_xz_byte_identical_to_legacy() {
+        // Explicit xz keeps today's argv exactly: -comp xz, no -b (xz at
+        // 1M blocks regresses pack time ~16%), no level (the xz wrapper
+        // takes none).
+        assert_eq!(mksquashfs_compression_args(Some("xz"), None), vec!["xz"]);
+    }
+
+    #[test]
+    fn test_mksquashfs_compression_args_lzo_level_only_when_declared() {
+        assert_eq!(
+            mksquashfs_compression_args(Some("lzo"), Some(4)),
+            vec!["lzo", "-Xcompression-level", "4"]
+        );
+        assert_eq!(mksquashfs_compression_args(Some("lzo"), None), vec!["lzo"]);
+    }
+
+    #[test]
+    fn test_default_pack_is_zstd_1m_and_roundtrips() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A payload the pack must carry. Explicit stage: user-authored,
+        // never wiped (Default would wipe only if a build phase ran — this
+        // meta has none — but Explicit states the intent).
+        let stage_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            stage_dir.path().join("payload.txt"),
+            b"zstd roundtrip payload\n",
+        )
+        .unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "zstd-default", version = "1.0" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let result = build_snap(
+            &meta,
+            stage_dir.path(),
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Explicit,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let snap_path = output_dir.path().join(&result.snap_filename);
+        assert!(snap_path.exists());
+
+        let unsquashfs = floor_tool(nau_infra::tools::ToolName::Unsquashfs)
+            .expect("unsquashfs should be available");
+        let extract_dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(&unsquashfs)
+            .args([
+                "-f",
+                "-d",
+                &extract_dir.path().to_string_lossy(),
+                &snap_path.to_string_lossy(),
+            ])
+            .status()
+            .expect("unsquashfs should be available");
+        assert!(status.success());
+
+        // Roundtrip reads the payload.
+        let payload = std::fs::read_to_string(extract_dir.path().join("payload.txt")).unwrap();
+        assert_eq!(payload, "zstd roundtrip payload\n");
+
+        // compression / compression_level stay out of snap.yaml.
+        let yaml = std::fs::read_to_string(extract_dir.path().join("meta/snap.yaml")).unwrap();
+        assert!(!yaml.contains("compression"), "got: {yaml}");
+
+        // The image really is zstd at 1M blocks.
+        let superblock = std::process::Command::new(&unsquashfs)
+            .args(["-s", &snap_path.to_string_lossy()])
+            .output()
+            .expect("unsquashfs should be available");
+        let out = format!(
+            "{} {}",
+            String::from_utf8_lossy(&superblock.stdout),
+            String::from_utf8_lossy(&superblock.stderr)
+        )
+        .to_lowercase();
+        assert!(
+            out.contains("zstd"),
+            "superblock should name zstd, got: {out}"
+        );
+        assert!(
+            out.contains("1048576"),
+            "block size should be 1M, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_zstd_pack_is_reproducible() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SOURCE_DATE_EPOCH", "946684800");
+        let stage_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            stage_dir.path().join("payload.txt"),
+            b"reproducible payload\n",
+        )
+        .unwrap();
+
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "zstd-repro", version = "1.0" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let out1 = tempfile::tempdir().unwrap();
+        let out2 = tempfile::tempdir().unwrap();
+        for out in [&out1, &out2] {
+            build_snap(
+                &meta,
+                stage_dir.path(),
+                out.path(),
+                "amd64",
+                StagePolicy::Explicit,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        }
+        std::env::remove_var("SOURCE_DATE_EPOCH");
+
+        let hash1 = sha3_384_file(&out1.path().join("zstd-repro_1.0_amd64.snap")).unwrap();
+        let hash2 = sha3_384_file(&out2.path().join("zstd-repro_1.0_amd64.snap")).unwrap();
+        assert_eq!(
+            hash1, hash2,
+            "two packs of the same tree must hash identically"
+        );
+    }
+
+    #[test]
+    fn test_zstd_less_mksquashfs_fails_closed_with_actionable_error() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A fake mksquashfs that behaves like a squashfs-tools build
+        // without zstd: the tiny probe pack fails.
+        let fake_dir = tempfile::tempdir().unwrap();
+        let fake = fake_dir.path().join("mksquashfs");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho \"mksquashfs: zstd support is not enabled\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The probe resolves through the same mechanism the pack uses —
+        // pin it via the tools module's override.
+        let override_var = nau_infra::tools::ToolName::Mksquashfs.env_var();
+        std::env::set_var(&override_var, &fake);
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "zstd-less", version = "1" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let stage_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let outcome = build_snap(
+            &meta,
+            stage_dir.path(),
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Default,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        std::env::remove_var(&override_var);
+
+        let err = outcome.unwrap_err().to_string();
+        assert!(err.contains("zstd-enabled squashfs-tools"), "got: {err}");
+        assert!(err.contains("compression = \"xz\""), "got: {err}");
+        assert!(
+            !output_dir.path().join("zstd-less_1_amd64.snap").exists(),
+            "no silent fallback — no image may be produced"
+        );
+    }
+
+    // ── Phase 18 tests: multi-part builds ──
+
+    #[test]
+    fn test_parts_dsl_roundtrip() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "multi",
+                    version = "1.0",
+                    parts = {
+                        ui = { build = "npm run build", after = { "core" } },
+                        core = { build = "make" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let parts = meta.parts.as_ref().expect("parts extracted");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts["core"].build, "make");
+        assert!(parts["core"].after.is_empty());
+        assert_eq!(parts["ui"].build, "npm run build");
+        assert_eq!(parts["ui"].after, vec!["core".to_string()]);
+        assert!(meta.build.is_none());
+    }
+
+    #[test]
+    fn test_implicit_single_part_back_compat() {
+        // `build = "..."` stays valid and never produces parts.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "legacy",
+                    version = "1.0",
+                    build = "make && make install DESTDIR=$STAGE",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(
+            meta.build.as_deref(),
+            Some("make && make install DESTDIR=$STAGE")
+        );
+        assert!(meta.parts.is_none());
+    }
+
+    #[test]
+    fn test_parts_stay_out_of_snap_yaml() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "multi",
+                    version = "1.0",
+                    parts = { core = { build = "make" } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let yaml = meta.to_yaml().unwrap();
+        assert!(!yaml.contains("parts:"));
+        assert!(!yaml.contains("build:"));
+    }
+
+    fn eval_parts_source_error(lua_source: &str) -> String {
+        let env = LuaEnv::new();
+        let src = format!(
+            r#"
+            return {{
+                default = snap {{
+                    name = "bad-parts",
+                    version = "1.0",
+                    {lua_source}
+                }},
+            }}
+            "#
+        );
+        env.eval(&src).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn test_parts_conflict_with_build_dsl() {
+        let err =
+            eval_parts_source_error(r#"build = "make", parts = { core = { build = "make" } }"#);
+        assert!(
+            err.contains("mutually exclusive"),
+            "error should mention the build/parts conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_must_be_table_dsl() {
+        let err = eval_parts_source_error(r#"parts = "core""#);
+        assert!(
+            err.contains("'parts' must be a table"),
+            "error should mention parts type: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_must_not_be_empty_dsl() {
+        let err = eval_parts_source_error("parts = {}");
+        assert!(
+            err.contains("'parts' must not be empty"),
+            "error should mention empty parts: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_entry_must_be_table_dsl() {
+        let err = eval_parts_source_error(r#"parts = { core = "make" }"#);
+        assert!(
+            err.contains("parts['core'] must be a table"),
+            "error should mention part type: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_build_must_be_non_empty_string_dsl() {
+        let err = eval_parts_source_error("parts = { core = { after = {} } }");
+        assert!(
+            err.contains("parts['core'].build must be a non-empty string"),
+            "error should mention missing build: {err}"
+        );
+
+        let err = eval_parts_source_error(r#"parts = { core = { build = "" } }"#);
+        assert!(
+            err.contains("parts['core'].build must be a non-empty string"),
+            "error should mention empty build: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_after_must_be_string_array_dsl() {
+        let err =
+            eval_parts_source_error(r#"parts = { core = { build = "make", after = "libs" } }"#);
+        assert!(
+            err.contains("parts['core'].after must be an array"),
+            "error should mention after type: {err}"
+        );
+
+        let err =
+            eval_parts_source_error(r#"parts = { core = { build = "make", after = { 42 } } }"#);
+        assert!(
+            err.contains("parts['core'].after[1] must be a string"),
+            "error should mention after element type: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_unknown_after_dsl() {
+        let err =
+            eval_parts_source_error(r#"parts = { core = { build = "make", after = { "libs" } } }"#);
+        assert!(
+            err.contains("parts['core'].after references unknown part 'libs'"),
+            "error should mention the unknown part: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_self_cycle_dsl() {
+        let err = eval_parts_source_error(r#"parts = { a = { build = "make", after = { "a" } } }"#);
+        assert!(
+            err.contains("circular dependency in parts: a -> a"),
+            "error should report the cycle path: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parts_two_node_cycle_dsl() {
+        let err = eval_parts_source_error(
+            r#"
+            parts = {
+                a = { build = "make", after = { "b" } },
+                b = { build = "make", after = { "a" } },
+            }
+            "#,
+        );
+        assert!(
+            err.contains("circular dependency in parts") && err.contains("->"),
+            "error should report the cycle path: {err}"
+        );
+    }
+
+    #[test]
+    fn test_order_parts_dependency_respecting_with_name_tiebreak() {
+        // Diamond: libs has no after and is the only runnable part first;
+        // among {app, cli, zzz} after libs completes, name order applies.
+        let parts: BTreeMap<String, SnapPart> = [
+            (
+                "app",
+                SnapPart {
+                    build: "make app".into(),
+                    after: vec!["libs".into()],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+            (
+                "cli",
+                SnapPart {
+                    build: "make cli".into(),
+                    after: vec!["libs".into()],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+            (
+                "libs",
+                SnapPart {
+                    build: "make libs".into(),
+                    after: vec![],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+            (
+                "zzz",
+                SnapPart {
+                    build: "make zzz".into(),
+                    after: vec![],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        assert_eq!(
+            order_parts(&parts).unwrap(),
+            vec!["libs", "app", "cli", "zzz"]
+        );
+    }
+
+    #[test]
+    fn test_order_parts_chain() {
+        let parts: BTreeMap<String, SnapPart> = [
+            (
+                "c",
+                SnapPart {
+                    build: "c".into(),
+                    after: vec!["b".into()],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+            (
+                "b",
+                SnapPart {
+                    build: "b".into(),
+                    after: vec!["a".into()],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+            (
+                "a",
+                SnapPart {
+                    build: "a".into(),
+                    after: vec![],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        assert_eq!(order_parts(&parts).unwrap(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_order_parts_rejects_cycle_in_rust() {
+        // Non-DSL constructors can bypass Lua validation; the scheduler
+        // must not hang.
+        let parts: BTreeMap<String, SnapPart> = [
+            (
+                "a",
+                SnapPart {
+                    build: "a".into(),
+                    after: vec!["b".into()],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+            (
+                "b",
+                SnapPart {
+                    build: "b".into(),
+                    after: vec!["a".into()],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        let err = order_parts(&parts).unwrap_err().to_string();
+        assert!(
+            err.contains("circular or unsatisfiable dependency among parts"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_order_parts_rejects_invalid_names() {
+        let make = |name: &str| {
+            BTreeMap::from([(
+                name.to_string(),
+                SnapPart {
+                    build: "true".into(),
+                    after: vec![],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            )])
+        };
+        assert!(order_parts(&make("source")).is_err()); // reserved
+        assert!(order_parts(&make("a/b")).is_err());
+        assert!(order_parts(&make("..")).is_err());
+        assert!(order_parts(&make(".")).is_err());
+    }
+
+    #[test]
+    fn test_run_parts_ordering_shared_stage_and_part_env() {
+        let tree = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let abs_stage = std::fs::canonicalize(stage.path()).unwrap();
+        std::fs::create_dir_all(tree.path().join(SOURCE_DIR_NAME)).unwrap();
+
+        let parts: BTreeMap<String, SnapPart> = [
+            (
+                "b",
+                SnapPart {
+                    // Proves: $PART_NAME, `after` blocked until `a` was done
+                    // (its marker exists), and cwd is b's own work dir.
+                    build: r#"test "$PART_NAME" = "b" && test -f "$STAGE/a.done" && pwd > "$STAGE/b.pwd""#.into(),
+                    after: vec!["a".into()],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+            (
+                "a",
+                SnapPart {
+                    build: r#"test "$PART_NAME" = "a" && touch "$STAGE/a.done""#.into(),
+                    after: vec![], plugin: None,
+ plugin_options: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        run_parts(
+            &parts,
+            tree.path(),
+            &tree.path().join(SOURCE_DIR_NAME),
+            &abs_stage,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Shared stage: both parts installed into the same dir.
+        assert!(abs_stage.join("a.done").exists(), "a must have run");
+        let pwd = std::fs::read_to_string(abs_stage.join("b.pwd")).unwrap();
+        let pwd = pwd.trim_end();
+        assert!(
+            pwd.ends_with("/b"),
+            "b must run in its own work dir under the build tree, got: {pwd}"
+        );
+        assert!(tree.path().join("b").is_dir());
+    }
+
+    #[test]
+    fn test_run_parts_fails_when_after_dependency_missing_marker() {
+        // If ordering were violated, b's marker check would fail.
+        let tree = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let abs_stage = std::fs::canonicalize(stage.path()).unwrap();
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "b",
+            SnapPart {
+                build: r#"test -f "$STAGE/never-created""#.into(),
+                after: vec![],
+                plugin: None,
+                plugin_options: None,
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        assert!(run_parts(
+            &parts,
+            tree.path(),
+            tree.path(),
+            &abs_stage,
+            None,
+            None,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_run_build_rejects_build_and_parts_conflict() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "conflict", version = "1.0", build = "make" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let mut meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        meta.parts = Some(BTreeMap::from([(
+            "core".to_string(),
+            SnapPart {
+                build: "make".into(),
+                after: vec![],
+                plugin: None,
+                plugin_options: None,
+            },
+        )]));
+
+        let err = run_build(
+            &meta,
+            Path::new("/nonexistent-stage"),
+            StagePolicy::Default,
+            None,
+            None,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("both 'build' and 'parts'"), "got: {err}");
+    }
+
+    #[test]
+    fn test_run_build_rejects_empty_parts() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "empty-parts", version = "1.0" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let mut meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        meta.build = None;
+        meta.parts = Some(BTreeMap::new());
+
+        let err = run_build(
+            &meta,
+            Path::new("/nonexistent-stage"),
+            StagePolicy::Default,
+            None,
+            None,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("'parts' must not be empty"), "got: {err}");
+    }
+
+    // ── Source extraction (issue #170) ──
+
+    /// A 256-byte .tar.xz compressed with a 65 MiB LZMA2 dictionary
+    /// (CRC64 check). Busybox tar — the `tar` a devbox caller PATH
+    /// carries, via `pkgsStatic.busybox` — refuses xz dictionaries above
+    /// 64 MiB with an instant "corrupted data / short read"; the rust
+    /// dist tarball that surfaced #170 is the same class of stream at
+    /// 128 MiB. GNU tar and the in-process xz2 decoder both read it.
+    const HIGH_DICT_XZ_TAR: &str = "/Td6WFoAAATm1rRGBMC/AYBQIQEdAAAAAAAAAKKgclfgJ/8At10AOhvs2GRsWPuPK925ZjPx+H3MtnsiTz1OPmTRHm9K/83eT4zKuTCAA/ooz828VMufwT2klR9q4WqIpgx2likGbDG/5NH43mm9fyuQhcR7oqLir5NwgOIHJVh/ViLfz/ce/znyLiKwu6iDmkl0oj3IufkhW9V5P4w1A+gQ3Dyef54xUgYwdMHansYUPcYmaJY80y/OyW6WNj47tZolCihjb8rxOo2JPrlC4UGrHT5QHgIwlTo+6ptSAAB6/k+UDXORqAAB2wGAUAAACokpB7HEZ/sCAAAAAARZWg==";
+
+    /// Decode the embedded fixture. Its single top-level dir is
+    /// `toolchain-demo-1.0/` holding an executable `echo.txt` and a
+    /// symlink `echo-link` → `echo.txt`.
+    fn high_dict_xz_tarball() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(HIGH_DICT_XZ_TAR)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_extract_tarball_reads_high_dict_xz_in_process() {
+        // The extraction seam decodes toolchain-class xz streams itself,
+        // never through the caller PATH's `tar` binary (issue #170).
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("toolchain.tar.xz");
+        std::fs::write(&archive, high_dict_xz_tarball()).unwrap();
+        let dest = tmp.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        extract_tarball(&archive, &dest).unwrap();
+
+        let tree = dest.join("toolchain-demo-1.0");
+        assert_eq!(
+            std::fs::read_to_string(tree.join("echo.txt")).unwrap(),
+            "#!/bin/sh\n"
+        );
+        assert!(tree.join("echo-link").is_file(), "symlink survived");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tree.join("echo.txt"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "exec bit survived");
+        }
+    }
+
+    #[test]
+    fn test_extract_tarball_gz_and_plain_roundtrip() {
+        use std::io::Write;
+        // One tree, packed two ways: plain .tar and .tar.gz. Both must
+        // land identically through the in-process seam.
+        for name in ["demo.tar", "demo.tar.gz"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let payload = tmp.path().join("payload/demo-1.0");
+            std::fs::create_dir_all(&payload).unwrap();
+            std::fs::write(payload.join("f.txt"), "x").unwrap();
+
+            let mut builder = tar::Builder::new(Vec::new());
+            builder.append_dir_all("demo-1.0", &payload).unwrap();
+            let raw = builder.into_inner().unwrap();
+            let archive = tmp.path().join(name);
+            if name.ends_with(".gz") {
+                let mut enc = flate2::write::GzEncoder::new(
+                    std::fs::File::create(&archive).unwrap(),
+                    flate2::Compression::default(),
+                );
+                enc.write_all(&raw).unwrap();
+                enc.finish().unwrap();
+            } else {
+                std::fs::write(&archive, &raw).unwrap();
+            }
+
+            let dest = tmp.path().join("out");
+            std::fs::create_dir_all(&dest).unwrap();
+            extract_tarball(&archive, &dest).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dest.join("demo-1.0/f.txt")).unwrap(),
+                "x",
+                "{name} roundtrip"
+            );
+        }
+    }
+
+    /// RED/GREEN for #170: a full `run_build` whose source is a
+    /// toolchain-class .tar.xz (65 MiB dictionary — above the busybox
+    /// decode cap). Pre-fix, extraction spawned whatever `tar` the
+    /// process PATH carried: under the devbox gate that is busybox tar,
+    /// which failed exactly like the reported repro ("corrupted data" /
+    /// "short read" / "failed to extract"), so this test fails there.
+    /// Post-fix the in-process xz2 decoder extracts it everywhere. (A
+    /// GNU-tar PATH also passed pre-fix — the test distinguishes
+    /// implementations only where an impaired `tar` leads PATH, which is
+    /// the devbox gate where the bug was found.)
+    #[test]
+    fn test_run_build_extracts_toolchain_profile_xz() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let bytes = high_dict_xz_tarball();
+        std::fs::write(server.path().join("toolchain.tar.xz"), &bytes).unwrap();
+        let port = serve_dir(server.path());
+        let hash = sha256_hex(&bytes);
+
+        let env = LuaEnv::new();
+        let table = env
+            .eval(&format!(
+                r#"
+            return {{
+                default = snap {{
+                    name = "toolchain-demo",
+                    version = "1.0",
+                    type = "source",
+                    source = {{
+                        url = "http://127.0.0.1:{port}/toolchain.tar.xz",
+                        sha256 = "{hash}",
+                    }},
+                    build = 'test -f "$SRC/echo.txt" && touch "$STAGE/ok"',
+                }},
+            }}
+            "#
+            ))
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        // Scratch HOME: the pinned fetch now populates the source cache,
+        // and a 65 MiB test tarball must not land in the user's real one.
+        with_scratch_home(|_| {
+            let stage = tempfile::tempdir().unwrap();
+            let outcome = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("extraction must survive the caller PATH's tar: {e:#}"));
+            assert_eq!(outcome.sources.len(), 1);
+            assert_eq!(outcome.sources[0].sha256, hash);
+            // The build command ran against the extracted tree.
+            assert!(stage.path().join("ok").exists());
+        })
+    }
+
+    // ── Source cache wiring (ADR-0048 Phase 2) ──
+
+    /// Serve a directory over loopback HTTP, counting accepted
+    /// connections in `hits` — the network-contact counter a cache hit
+    /// must be able to keep flat.
+    fn serve_dir_counting(dir: &Path, hits: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let root = dir.to_path_buf();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                loop {
+                    use std::io::Read;
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&data);
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                use std::io::Write;
+                let mut file = root.join(path.trim_start_matches('/'));
+                if file.is_dir() {
+                    file = file.join("index.html");
+                }
+                let (status, body) = match std::fs::read(&file) {
+                    Ok(b) => ("200 OK", b),
+                    Err(_) => ("404 Not Found", b"not found".to_vec()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    /// Run `f` with HOME pointed at a scratch dir so the source cache
+    /// (resolved via HOME at fetch time) lands in a throwaway tree.
+    /// HOME is process-global, so callers hold ENV_LOCK.
+    fn with_scratch_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home.path());
+        let out = f(home.path());
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        out
+    }
+
+    fn loopback_source_meta(env: &LuaEnv, port: u16, hash: &str, extra: &str) -> SnapMeta {
+        let table = env
+            .eval(&format!(
+                r#"
+            return {{
+                default = snap {{
+                    name = "src-cache-demo",
+                    version = "1.0",
+                    type = "source",
+                    source = {{
+                        url = "http://127.0.0.1:{port}/src.txt",
+                        sha256 = "{hash}",
+                    }},
+                    floating = {extra},
+                    build = "true",
+                }},
+            }}
+            "#
+            ))
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        SnapMeta::from_lua_table(&default_table).unwrap()
+    }
+
+    fn loopback_unpinned_meta(env: &LuaEnv, port: u16) -> SnapMeta {
+        let table = env
+            .eval(&format!(
+                r#"
+            return {{
+                default = snap {{
+                    name = "src-cache-demo",
+                    version = "1.0",
+                    type = "source",
+                    source = "http://127.0.0.1:{port}/src.txt",
+                    build = "true",
+                }},
+            }}
+            "#
+            ))
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        SnapMeta::from_lua_table(&default_table).unwrap()
+    }
+
+    /// A pinned, non-floating source stores on the first build and the
+    /// second build is served from the cache with zero network contact,
+    /// byte-identical (ADR-0048 Phase 2).
+    #[test]
+    fn test_pinned_source_second_build_skips_the_network() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let bytes = b"cacheable pinned source bytes\n";
+        std::fs::write(server.path().join("src.txt"), bytes).unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = serve_dir_counting(server.path(), hits.clone());
+        let hash = sha256_hex(bytes);
+
+        with_scratch_home(|_| {
+            let env = LuaEnv::new();
+            let meta = loopback_source_meta(&env, port, &hash, "false");
+
+            let stage = tempfile::tempdir().unwrap();
+            let first = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "first build downloads"
+            );
+
+            let second = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "second build must be served from the source cache, not the network"
+            );
+            assert_eq!(first.sources[0].sha256, hash);
+            assert_eq!(second.sources[0].sha256, first.sources[0].sha256);
+
+            // The entry exists at the documented layout under HOME.
+            let entry = crate::source_cache::default_root()
+                .join(&hash[..2])
+                .join(&hash);
+            assert_eq!(std::fs::read(&entry).unwrap(), bytes);
+        });
+    }
+
+    /// Floating sources never consult the cache in either direction
+    /// (issue #175): every build re-observes upstream, and no entry is
+    /// ever created.
+    #[test]
+    fn test_floating_source_never_consults_the_source_cache() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let bytes = b"floating source bytes\n";
+        std::fs::write(server.path().join("src.txt"), bytes).unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = serve_dir_counting(server.path(), hits.clone());
+        let hash = sha256_hex(bytes);
+
+        with_scratch_home(|_| {
+            let env = LuaEnv::new();
+            let meta = loopback_source_meta(&env, port, &hash, "true");
+
+            let stage = tempfile::tempdir().unwrap();
+            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
+            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "floating must re-download every build"
+            );
+            assert!(
+                !crate::source_cache::default_root().exists(),
+                "floating sources must not populate the cache"
+            );
+        });
+    }
+
+    /// Unpinned sources never consult the cache in either direction: a
+    /// URL-keyed memo would silently convert an unpinned source into a
+    /// pinned one (ADR-0048).
+    #[test]
+    fn test_unpinned_source_never_consults_the_source_cache() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let bytes = b"unpinned source bytes\n";
+        std::fs::write(server.path().join("src.txt"), bytes).unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = serve_dir_counting(server.path(), hits.clone());
+
+        with_scratch_home(|_| {
+            let env = LuaEnv::new();
+            let meta = loopback_unpinned_meta(&env, port);
+
+            let stage = tempfile::tempdir().unwrap();
+            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("first build must succeed: {e:#}"));
+            run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_or_else(|e| panic!("second build must succeed: {e:#}"));
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "unpinned must re-download every build"
+            );
+            assert!(
+                !crate::source_cache::default_root().exists(),
+                "unpinned sources must not populate the cache"
+            );
+        });
+    }
+
+    // ── Issue #41: multi-source build inputs ──
+
+    /// Serve a directory's files over loopback HTTP and return the port.
+    /// The thread runs for the process's lifetime (tests are not
+    /// concurrent enough to exhaust the listener's backlog).
+    fn serve_dir(dir: &Path) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let root = dir.to_path_buf();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                loop {
+                    use std::io::Read;
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&data);
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                use std::io::Write;
+                let mut file = root.join(path.trim_start_matches('/'));
+                if file.is_dir() {
+                    file = file.join("index.html");
+                }
+                let (status, body) = match std::fs::read(&file) {
+                    Ok(b) => ("200 OK", b),
+                    Err(_) => ("404 Not Found", b"not found".to_vec()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    /// Make a tarball in `dir` containing exactly one top-level directory
+    /// `top/` with a single file `echo.txt`; returns the tarball bytes.
+    fn make_single_root_tarball(dir: &Path, top: &str) -> Vec<u8> {
+        let payload = dir.join("payload");
+        std::fs::create_dir_all(payload.join(top)).unwrap();
+        std::fs::write(payload.join(top).join("echo.txt"), top).unwrap();
+        let tar_bin = floor_tool(nau_infra::tools::ToolName::Tar).expect("tar should be available");
+        let tar = std::process::Command::new(&tar_bin)
+            .args(["czf", "-", "-C"])
+            .arg(&payload)
+            .arg(top)
+            .output()
+            .unwrap();
+        assert!(tar.status.success(), "tar failed");
+        tar.stdout
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let d = sha2::Sha256::digest(bytes);
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Build a SnapMeta with a two-source declaration and a build command
+    /// that asserts both trees are present at `$SRC/<name>/`.
+    fn two_source_meta(env: &LuaEnv, port: u16, h1: &str, h2: &str) -> SnapMeta {
+        let table = env
+            .eval(&format!(
+                r#"
+            return {{
+                default = snap {{
+                    name = "two-src",
+                    version = "1.0",
+                    type = "source",
+                    sources = {{
+                        foo = {{ url = "http://127.0.0.1:{port}/foo.tar.gz", sha256 = "{h1}" }},
+                        bar = {{ url = "http://127.0.0.1:{port}/bar.tar.gz", sha256 = "{h2}" }},
+                    }},
+                    build = 'test -d "$SRC/foo" && test -d "$SRC/bar" && touch "$STAGE/ok"',
+                }},
+            }}
+            "#,
+            ))
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        SnapMeta::from_lua_table(&default_table).unwrap()
+    }
+
+    #[test]
+    fn test_multi_source_parse_roundtrip() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "multi",
+                    version = "1.0",
+                    type = "source",
+                    sources = {
+                        one = { url = "http://example.com/one.tar.gz", sha256 = "aaaa" },
+                        two = { url = "http://example.com/two.tar.gz", sha256 = "bbbb" },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let sources = meta.sources.as_ref().expect("sources parsed");
+        assert_eq!(sources.len(), 2);
+        assert!(sources["one"].expected_sha256().is_some());
+        assert!(sources["two"].expected_sha256().is_some());
+        // BTreeMap order is sorted by name.
+        assert_eq!(sources.keys().next().map(String::as_str), Some("one"));
+        // Not emitted into snap.yaml (build-time only).
+        let yaml = meta.to_yaml().unwrap();
+        assert!(!yaml.contains("sources:"));
+    }
+
+    #[test]
+    fn test_multi_source_rejects_alongside_single_source() {
+        // The DSL rejects the declaration, but the Rust boundary must too
+        // (a non-DSL constructor could produce both). Build a raw table
+        // bypassing the DSL so the Rust conversion receives both keys.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = {
+                    name = "conflict", version = "1.0",
+                    source = { url = "http://example.com/a.tar.gz" },
+                    sources = { a = { url = "http://example.com/b.tar.gz", sha256 = "cc" } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn test_multi_source_rejects_empty_map() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = {
+                    name = "empty", version = "1.0",
+                    sources = {},
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'sources' must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn test_multi_source_rejects_missing_sha256() {
+        let env = LuaEnv::new();
+        // The Lua DSL rejects unpinned entries before Rust sees them.
+        let result: Result<mlua::Value, mlua::Error> = env
+            .lua
+            .load(
+                r#"
+            return snap {
+                name = "unpinned", version = "1.0",
+                sources = { a = { url = "http://example.com/a.tar.gz" } },
+            }
+            "#,
+            )
+            .eval();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("sha256"), "got: {err}");
+    }
+
+    #[test]
+    fn test_fetch_and_extract_source_flat_lands_at_name_dir() {
+        // `find_source_root` flattening: foo-1.2.tar.gz with a single
+        // top-level dir lands at `<build>/<name>`/ contents, NOT
+        // <build>/<name>/<name>-1.2/.
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let bytes = make_single_root_tarball(server.path(), "foo-1.2");
+        std::fs::write(server.path().join("foo.tar.gz"), &bytes).unwrap();
+        let port = serve_dir(server.path());
+        let hash = sha256_hex(&bytes);
+
+        let build = tempfile::tempdir().unwrap();
+        let spec = SourceSpec::Pinned {
+            url: format!("http://127.0.0.1:{port}/foo.tar.gz"),
+            sha256: hash.clone(),
+        };
+        // Scratch HOME: the fetch now consults the source cache, and
+        // this test must not populate the user's real one.
+        with_scratch_home(|_| {
+            let info = fetch_and_extract_source("foo", &spec, build.path(), false, false).unwrap();
+            assert_eq!(info.url, spec.url());
+            assert_eq!(info.sha256, hash);
+            // The flattening landed the *contents* of foo-1.2 at $SRC/foo.
+            assert!(build.path().join("foo/echo.txt").exists());
+            assert!(!build.path().join("foo/foo-1.2").exists());
+        });
+    }
+
+    #[test]
+    fn test_fetch_and_extract_source_non_tarball_lands_as_file() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let bytes = b"deb-data-placeholder".to_vec();
+        std::fs::write(server.path().join("deps.deb"), &bytes).unwrap();
+        let port = serve_dir(server.path());
+        let hash = sha256_hex(&bytes);
+
+        let build = tempfile::tempdir().unwrap();
+        let spec = SourceSpec::Pinned {
+            url: format!("http://127.0.0.1:{port}/deps.deb"),
+            sha256: hash.clone(),
+        };
+        let info = with_scratch_home(|_| {
+            fetch_and_extract_source("deps", &spec, build.path(), false, false).unwrap()
+        });
+        assert_eq!(info.sha256, hash);
+        // Non-tarball lands at $SRC/<name> as the file itself, addressable
+        // by its declared source name.
+        assert_eq!(std::fs::read(build.path().join("deps")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn test_fetch_and_extract_source_hash_mismatch_fails() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let bytes = make_single_root_tarball(server.path(), "pkg");
+        std::fs::write(server.path().join("pkg.tar.gz"), &bytes).unwrap();
+        let port = serve_dir(server.path());
+
+        let build = tempfile::tempdir().unwrap();
+        let spec = SourceSpec::Pinned {
+            url: format!("http://127.0.0.1:{port}/pkg.tar.gz"),
+            sha256: "deadbeef".repeat(8), // wrong
+        };
+        let err = with_scratch_home(|_| {
+            fetch_and_extract_source("pkg", &spec, build.path(), false, false)
+                .unwrap_err()
+                .to_string()
+        });
+        assert!(err.contains("SHA-256 mismatch"), "got: {err}");
+        assert!(err.contains("expected: deadbeef"), "got: {err}");
+    }
+
+    #[test]
+    fn test_run_build_two_source_materialization() {
+        // Full two-source build: both trees present at $SRC/<name>/; the
+        // build command verifies and writes into the stage. This is the
+        // acceptance demo of the mechanism.
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let foo = make_single_root_tarball(server.path(), "foo-1.0");
+        let bar = make_single_root_tarball(server.path(), "bar-2.0");
+        std::fs::write(server.path().join("foo.tar.gz"), &foo).unwrap();
+        std::fs::write(server.path().join("bar.tar.gz"), &bar).unwrap();
+        let port = serve_dir(server.path());
+        let h1 = sha256_hex(&foo);
+        let h2 = sha256_hex(&bar);
+
+        with_scratch_home(|_| {
+            let env = LuaEnv::new();
+            let meta = two_source_meta(&env, port, &h1, &h2);
+
+            let stage = tempfile::tempdir().unwrap();
+            let outcome =
+                run_build(&meta, stage.path(), StagePolicy::Default, None, None, false).unwrap();
+            // Two source infos recorded — one per named source, in BTreeMap
+            // (sorted-by-name) order.
+            assert_eq!(outcome.sources.len(), 2);
+            assert_eq!(
+                outcome.sources[0].url,
+                format!("http://127.0.0.1:{port}/bar.tar.gz")
+            );
+            assert_eq!(
+                outcome.sources[1].url,
+                format!("http://127.0.0.1:{port}/foo.tar.gz")
+            );
+            assert_eq!(outcome.sources[0].sha256, h2);
+            assert_eq!(outcome.sources[1].sha256, h1);
+            // The build command's `touch $STAGE/ok` ran (both trees were seen).
+            assert!(stage.path().join("ok").exists());
+        })
+    }
+
+    #[test]
+    fn test_run_build_two_source_hash_mismatch_fails_precisely() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = tempfile::tempdir().unwrap();
+        let foo = make_single_root_tarball(server.path(), "foo-1.0");
+        let bar = make_single_root_tarball(server.path(), "bar-2.0");
+        std::fs::write(server.path().join("foo.tar.gz"), &foo).unwrap();
+        std::fs::write(server.path().join("bar.tar.gz"), &bar).unwrap();
+        let port = serve_dir(server.path());
+        let h1 = sha256_hex(&foo);
+        let h2 = sha256_hex(&bar);
+
+        with_scratch_home(|_| {
+            let env = LuaEnv::new();
+            // Corrupt hash for the SECOND source: the error must name it
+            // precisely (and its pin) after a real download.
+            let mut meta = two_source_meta(&env, port, &h1, &h2);
+            let wrong = "feedfacedeadbeef".repeat(8);
+            let sources = meta.sources.as_mut().unwrap();
+            *sources.get_mut("bar").unwrap() = SourceSpec::Pinned {
+                url: format!("http://127.0.0.1:{port}/bar.tar.gz"),
+                sha256: wrong,
+            };
+
+            let stage = tempfile::tempdir().unwrap();
+            let err = run_build(&meta, stage.path(), StagePolicy::Default, None, None, false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("source 'bar'"), "got: {err}");
+            assert!(err.contains("SHA-256 mismatch"), "got: {err}");
+        })
+    }
+
+    #[test]
+    fn test_multi_source_rejects_bad_names() {
+        let env = LuaEnv::new();
+        for bad in ["a/b", "..", ".", "source"] {
+            // The Lua DSL rejects these names before Rust sees them; for
+            // the ones it lets through, the Rust boundary must catch.
+            let result: Result<mlua::Value, mlua::Error> = env
+                .lua
+                .load(format!(
+                    r#"
+                return snap {{
+                    name = "bad", version = "1.0",
+                    sources = {{ ["{bad}"] = {{ url = "http://x/a.tar.gz", sha256 = "aa" }} }},
+                }}
+                "#
+                ))
+                .eval();
+            match result {
+                Err(e) => {
+                    let err = e.to_string();
+                    assert!(
+                        err.contains("directory name") || err.contains("reserved"),
+                        "name '{bad}' should be rejected by the DSL, got: {err}"
+                    );
+                }
+                Ok(value) => {
+                    // DSL accepted it (or did not reach it); Rust must
+                    // reject at the parse boundary.
+                    let table = match value {
+                        Value::Table(t) => t,
+                        _ => panic!("expected table"),
+                    };
+                    let err = SnapMeta::from_lua_table(&table).unwrap_err().to_string();
+                    assert!(
+                        err.contains("source name") || err.contains("reserved"),
+                        "name '{bad}' should be rejected, got: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── ADR-0014: built-in builder plugins ──
+
+    #[test]
+    fn test_plugin_part_dsl_roundtrip() {
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "plugins",
+                    version = "1.0",
+                    parts = {
+                        core = {
+                            plugin = "make",
+                            options = { target = "all" },
+                        },
+                        docs = { build = "true", after = { "core" } },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let parts = meta.parts.as_ref().expect("parts extracted");
+        let core = &parts["core"];
+        assert_eq!(core.plugin.as_deref(), Some("make"));
+        assert_eq!(core.build, "", "plugin parts carry an empty build marker");
+        assert_eq!(
+            core.plugin_options.as_ref().expect("options extracted")["target"],
+            nau_core::plugins::PluginValue::Str("all".into())
+        );
+        assert!(parts["docs"].plugin.is_none());
+        // Plugin must not leak into snap.yaml.
+        let yaml = meta.to_yaml().unwrap();
+        assert!(!yaml.contains("parts:"));
+        assert!(!yaml.contains("options"));
+    }
+
+    #[test]
+    fn test_plugin_conflicts_with_build_dsl() {
+        let err =
+            eval_parts_source_error(r#"parts = { core = { plugin = "make", build = "make" } }"#);
+        assert!(
+            err.contains("parts['core'] must have exactly one of 'build' or 'plugin'"),
+            "error should mention the per-part conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn test_plugin_unknown_name_dsl() {
+        let err = eval_parts_source_error(r#"parts = { core = { plugin = "gmake" } }"#);
+        assert!(
+            err.contains("parts['core'].plugin must be one of:")
+                && err.contains("autotools")
+                && err.contains("cargo")
+                && err.contains("cmake")
+                && err.contains("make")
+                && err.contains("gmake"),
+            "error should list available plugins: {err}"
+        );
+    }
+
+    #[test]
+    fn test_plugin_must_be_string_dsl() {
+        let err = eval_parts_source_error("parts = { core = { plugin = 42 } }");
+        assert!(
+            err.contains("parts['core'].plugin must be a non-empty string"),
+            "got: {err}"
+        );
+        let err = eval_parts_source_error(r#"parts = { core = { plugin = "" } }"#);
+        assert!(
+            err.contains("parts['core'].plugin must be a non-empty string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_plugin_options_must_be_table_dsl() {
+        let err =
+            eval_parts_source_error(r#"parts = { core = { plugin = "make", options = "x" } }"#);
+        assert!(
+            err.contains("parts['core'].options must be a table"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_plugin_options_deep_validated_at_rust_boundary() {
+        // The Lua layer accepts any options table; the named error comes
+        // from the plugin boundary (ADR-0014 Decision 3).
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "bad-options",
+                    version = "1.0",
+                    parts = { core = { plugin = "cargo", options = { channel = "fork" } } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("parts['core']")
+                && err.contains("cargo: option 'channel' must be one of: stable, beta, nightly"),
+            "got: {err}"
+        );
+
+        // Wrong option type.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "bad-options",
+                    version = "1.0",
+                    parts = { core = { plugin = "cargo", options = { channel = { "stable" } } } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cargo: option 'channel' must be a string"),
+            "got: {err}"
+        );
+
+        // Unknown option.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "bad-options",
+                    version = "1.0",
+                    parts = { core = { plugin = "make", options = { jobs = "4" } } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let err = SnapMeta::from_lua_table(&default_table)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("make: unknown option 'jobs'"), "got: {err}");
+
+        // Booleans and string maps pass the boundary (registry v2 growth:
+        // make `install`, autotools `in_source`, make `variables`).
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "grown-options",
+                    version = "1.0",
+                    parts = {
+                        core = {
+                            plugin = "make",
+                            options = {
+                                install = false,
+                                variables = { CFLAGS = "-O2" },
+                            },
+                        },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        let options = meta.parts.as_ref().expect("parts extracted")["core"]
+            .plugin_options
+            .as_ref()
+            .expect("options extracted");
+        assert_eq!(
+            options["install"],
+            nau_core::plugins::PluginValue::Bool(false)
+        );
+        assert_eq!(
+            options["variables"],
+            nau_core::plugins::PluginValue::Map(
+                [("CFLAGS".to_string(), "-O2".to_string())]
+                    .into_iter()
+                    .collect()
+            )
+        );
+    }
+
+    #[test]
+    fn test_build_deps_parse() {
+        // ADR-0018 (issue #17): build_deps parses alongside requires,
+        // validates as a string array, and never reaches snap.yaml
+        // (build metadata only, like requires).
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "linked-app",
+                    version = "1.0",
+                    requires = { "glibc", "ncurses" },
+                    build_deps = { "ncurses", "pkgconf" },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(
+            meta.build_deps,
+            vec!["ncurses".to_string(), "pkgconf".to_string()]
+        );
+        assert_eq!(
+            meta.requires,
+            vec!["glibc".to_string(), "ncurses".to_string()]
+        );
+
+        // Build metadata only — never emitted into snap.yaml.
+        let yaml = meta.to_yaml().unwrap();
+        assert!(
+            !yaml.contains("build_deps"),
+            "yaml must not carry build_deps: {yaml}"
+        );
+        // Issue #110 (ADR-0034): requires IS emitted now — the runtime
+        // emitter records it so the farm emit can tell libs-carrying
+        // packages from self-contained ones.
+        assert!(
+            yaml.contains("requires"),
+            "yaml must carry requires: {yaml}"
+        );
+
+        // Absent → empty.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap { name = "plain", version = "1.0" },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert!(meta.build_deps.is_empty());
+        assert!(meta.leaks_ok.is_empty());
+    }
+
+    #[test]
+    fn test_leaks_ok_parse() {
+        // ADR-0018 Decision 3 (issue #22): leaks_ok parses as a string
+        // array alongside requires/build_deps; build metadata only (never
+        // emitted to snap.yaml).
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "linked-app",
+                    version = "1.0",
+                    build_deps = { "ncurses", "pkgconf" },
+                    leaks_ok = {
+                        "/nau-build-prefix/usr/lib",
+                        "libncurses.so.6",
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(
+            meta.leaks_ok,
+            vec![
+                "/nau-build-prefix/usr/lib".to_string(),
+                "libncurses.so.6".to_string()
+            ]
+        );
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(
+            !yaml.contains("leaks_ok"),
+            "yaml must not carry leaks_ok: {yaml}"
+        );
+    }
+
+    #[test]
+    fn test_build_deps_rejects_non_string_entries() {
+        // Same validation treatment as `requires` (the shared
+        // check_string_array gate in the DSL).
+        let env = LuaEnv::new();
+        let err = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "bad",
+                    version = "1.0",
+                    build_deps = { "ok", 123 },
+                },
+            }
+            "#,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("build_deps"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cargo_plugin_appends_toolchain_as_build_dep_not_requires() {
+        // ADR-0018 Decision 5 (issue #26): plugin toolchains land in
+        // `build_deps` — they reach the build sandbox's merged prefix but
+        // never the runtime closure. `requires` must NOT carry the
+        // toolchain.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "rust-app",
+                    version = "1.0",
+                    requires = { "zlib" },
+                    parts = { core = { plugin = "cargo", options = { channel = "beta" } } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert_eq!(meta.requires, vec!["zlib".to_string()]);
+        assert_eq!(
+            meta.build_deps,
+            vec!["toolchain-gcc-gnu-x86_64".to_string()]
+        );
+
+        // Deduplicated on repeat plugin parts.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "rust-app",
+                    version = "1.0",
+                    parts = {
+                        a = { plugin = "cargo" },
+                        b = { plugin = "cargo", after = { "a" } },
+                    },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert!(meta.requires.is_empty());
+        assert_eq!(
+            meta.build_deps,
+            vec!["toolchain-gcc-gnu-x86_64".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_part_build_plan_rejects_corrupt_parts() {
+        // Non-DSL constructors can bypass Lua validation.
+        let both = SnapPart {
+            build: "make".into(),
+            after: vec![],
+            plugin: Some("make".into()),
+            plugin_options: None,
+        };
+        let err = part_build_plan("core", &both).unwrap_err().to_string();
+        assert!(
+            err.contains("part 'core' must have exactly one of 'build' or 'plugin'"),
+            "got: {err}"
+        );
+
+        let neither = SnapPart {
+            build: String::new(),
+            after: vec![],
+            plugin: None,
+            plugin_options: None,
+        };
+        let err = part_build_plan("core", &neither).unwrap_err().to_string();
+        assert!(
+            err.contains("part 'core' must have exactly one of 'build' or 'plugin'"),
+            "got: {err}"
+        );
+    }
+
+    // ── ADR-0014 E2E: plugin parts through run_parts ──
+    //
+    // Every host tool is stubbed (a stage-local PATH prepend), so these run
+    // identically with and without bwrap: the stub directory lives under the
+    // stage, which the sandbox binds at its absolute host path. Stubbed:
+    // `make`, `cmake`, `cargo`. `sh` and coreutils are real. The `configure`
+    // fixture for autotools is a plain sh script written by the test — no
+    // real autotools involved. No network access is needed or performed.
+
+    /// Prepend `dir` to PATH for the duration of `f`, restoring afterwards
+    /// (even if `f` panics). Serialized: PATH is process-global, so parallel
+    /// E2E tests must not interleave set/restore.
+    fn with_path_prepend<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        // The ONE crate-global test-env lock (src/test_env.rs): PATH is
+        // process-global, so parallel E2E tests must not interleave
+        // set/restore — a per-module static would exclude nothing across
+        // modules.
+        let guard = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", dir.display()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::env::set_var("PATH", old);
+        drop(guard);
+        result.unwrap()
+    }
+
+    /// The path `$SRC` expands to for commands: the build tree is mounted at
+    /// `/build` inside the bwrap sandbox, so assertions on expanded `$SRC`
+    /// must expect the sandbox path there (host path in direct mode).
+    fn expected_src(src: &Path) -> std::path::PathBuf {
+        if detect_bwrap().is_some() {
+            Path::new("/build").join(SOURCE_DIR_NAME)
+        } else {
+            src.to_path_buf()
+        }
+    }
+
+    /// Create an executable stub script at `dir/<name>`.
+    fn write_stub(dir: &Path, name: &str, body: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Shared plugin-E2E scaffolding: build tree with a source dir, stage
+    /// (canonicalized, like run_build does for DESTDIR), and the stub dir
+    /// under the stage.
+    struct PluginE2e {
+        tree: tempfile::TempDir,
+        src: std::path::PathBuf,
+        stage: std::path::PathBuf,
+        stubs: std::path::PathBuf,
+        _stage_dir: tempfile::TempDir,
+    }
+
+    impl PluginE2e {
+        fn new() -> Self {
+            let tree = tempfile::tempdir().unwrap();
+            let stage_dir = tempfile::tempdir().unwrap();
+            let stage = std::fs::canonicalize(stage_dir.path()).unwrap();
+            let src = tree.path().join(SOURCE_DIR_NAME);
+            std::fs::create_dir_all(&src).unwrap();
+            let stubs = stage.join(".stubs");
+            std::fs::create_dir_all(&stubs).unwrap();
+            PluginE2e {
+                tree,
+                src,
+                stage,
+                stubs,
+                _stage_dir: stage_dir,
+            }
+        }
+
+        fn invocations(&self) -> String {
+            std::fs::read_to_string(self.stage.join("invocations.log")).unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn test_e2e_make_plugin_expands_and_installs_into_stage() {
+        let e2e = PluginE2e::new();
+        std::fs::write(
+            e2e.src.join("Makefile"),
+            "# real Makefile (unused by the stub; proves -C $SRC wiring)\n",
+        )
+        .unwrap();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+# DESTDIR arrives as a make command-line arg (make install DESTDIR=...), not env.
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+if [ -n "$DESTDIR" ]; then
+  mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/hello"
+fi
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("make".into()),
+                plugin_options: Some(
+                    [(
+                        "target".to_string(),
+                        nau_core::plugins::PluginValue::Str("all".into()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        });
+
+        let inner_src = expected_src(&e2e.src);
+        let log = e2e.invocations();
+        assert!(
+            log.contains(&format!("make -C {} all", inner_src.display())),
+            "build command must run make against $SRC with the target: {log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "make -C {} PREFIX=/usr install DESTDIR={}",
+                inner_src.display(),
+                e2e.stage.display()
+            )),
+            "install command must honor PREFIX=/usr + DESTDIR=$STAGE: {log}"
+        );
+        assert!(e2e.stage.join("usr/bin/hello").exists());
+    }
+
+    #[test]
+    fn test_e2e_make_plugin_variables_reach_command_line() {
+        let e2e = PluginE2e::new();
+        std::fs::write(
+            e2e.src.join("Makefile"),
+            "# real Makefile (unused by the stub; proves -C $SRC wiring)\n",
+        )
+        .unwrap();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+# DESTDIR arrives as a make command-line arg (make install DESTDIR=...), not env.
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+if [ -n "$DESTDIR" ]; then
+  mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/hello"
+fi
+"#,
+        );
+
+        // pciutils-shaped part: PREFIX supplied via variables (which replaces
+        // the prefix-derived one), inserted out of order to prove sorting.
+        let parts: BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("make".into()),
+                plugin_options: Some(
+                    [(
+                        "variables".to_string(),
+                        nau_core::plugins::PluginValue::Map(
+                            [
+                                ("ZFLAG".to_string(), "1".to_string()),
+                                ("AFLAG".to_string(), "2".to_string()),
+                                ("PREFIX".to_string(), "/usr".to_string()),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        });
+
+        let inner_src = expected_src(&e2e.src);
+        let log = e2e.invocations();
+        let vars = "AFLAG=2 PREFIX=/usr ZFLAG=1";
+        assert!(
+            log.contains(&format!("make -C {} {vars}", inner_src.display())),
+            "variables must reach the build command line, sorted: {log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "make -C {} {vars} install DESTDIR={}",
+                inner_src.display(),
+                e2e.stage.display()
+            )),
+            "variables must reach the install command line: {log}"
+        );
+        assert!(e2e.stage.join("usr/bin/hello").exists());
+    }
+
+    #[test]
+    fn test_e2e_make_plugin_install_false_skips_install_step() {
+        let e2e = PluginE2e::new();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+if [ -n "$DESTDIR" ]; then
+  mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/hello"
+fi
+"#,
+        );
+
+        // Lib-only part (bzip2 shared-lib pattern): staging is arranged by
+        // an earlier part; install = false must emit no install step.
+        let parts: BTreeMap<String, SnapPart> = [(
+            "lib",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("make".into()),
+                plugin_options: Some(
+                    [(
+                        "install".to_string(),
+                        nau_core::plugins::PluginValue::Bool(false),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        });
+
+        let inner_src = expected_src(&e2e.src);
+        let log = e2e.invocations();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "install = false must emit exactly one command: {log}"
+        );
+        assert_eq!(
+            lines[0],
+            format!("make -C {}", inner_src.display()),
+            "and it must be the build command only: {log}"
+        );
+        assert!(
+            !e2e.stage.join("usr/bin/hello").exists(),
+            "no install step means nothing was staged"
+        );
+    }
+
+    #[test]
+    fn test_e2e_autotools_in_source_configures_in_src() {
+        let e2e = PluginE2e::new();
+        // Non-autoconf configure (dhcpcd-style): writes its Makefile next to
+        // itself, in $SRC — regardless of the caller's cwd. This is exactly
+        // the layout the VPATH expansion breaks.
+        std::fs::write(
+            e2e.src.join("configure"),
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/configure.log\"\ncat > \"$(dirname \"$0\")/Makefile\" <<'EOF'\nall:\n\t: > \"$(dirname \"$0\")/built\"\ninstall:\n\tmkdir -p $(DESTDIR)/usr/sbin && : > $(DESTDIR)/usr/sbin/dhcpcd\nEOF\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            e2e.src.join("configure"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+case " $* " in
+  *" install "*)
+    mkdir -p "$DESTDIR/usr/sbin" && : > "$DESTDIR/usr/sbin/dhcpcd" ;;
+  *) : > built ;;
+esac
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "lib",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("autotools".into()),
+                plugin_options: Some(
+                    [
+                        (
+                            "in_source".to_string(),
+                            nau_core::plugins::PluginValue::Bool(true),
+                        ),
+                        (
+                            "args".to_string(),
+                            nau_core::plugins::PluginValue::Arr(vec!["--sysconfdir=/etc".into()]),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        });
+
+        // configure ran inside $SRC with --prefix=/usr and the args, and its
+        // Makefile landed there; make's `built` marker followed (cwd = $SRC).
+        let configure_log = std::fs::read_to_string(e2e.src.join("configure.log")).unwrap();
+        let lines: Vec<&str> = configure_log.lines().collect();
+        assert_eq!(lines, vec!["--prefix=/usr", "--sysconfdir=/etc"]);
+        assert!(
+            e2e.src.join("Makefile").exists() && e2e.src.join("built").exists(),
+            "in_source build must run entirely inside $SRC"
+        );
+        assert!(
+            !e2e.tree.path().join("lib/built").exists(),
+            "nothing may land in the VPATH work dir"
+        );
+
+        let log = e2e.invocations();
+        assert!(
+            log.contains("make \n"),
+            "plain make must run before install: {log}"
+        );
+        assert!(
+            log.contains(&format!("make install DESTDIR={}", e2e.stage.display())),
+            "install must honor DESTDIR=$STAGE: {log}"
+        );
+        assert!(e2e.stage.join("usr/sbin/dhcpcd").exists());
+    }
+
+    #[test]
+    fn test_e2e_autotools_plugin_configures_vpath_and_installs_into_stage() {
+        let e2e = PluginE2e::new();
+        // Fake configure: records its args and emits a Makefile in the cwd
+        // (the part work dir — a VPATH build).
+        std::fs::write(
+            e2e.src.join("configure"),
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > configure.log\ncat > Makefile <<'EOF'\nall:\n\t: > built\ninstall:\n\tmkdir -p $(DESTDIR)/usr/bin && : > $(DESTDIR)/usr/bin/demo\nEOF\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            e2e.src.join("configure"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+# DESTDIR arrives as a make command-line arg, not env.
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+case " $* " in
+  *" install "*)
+    mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/demo" ;;
+  *) : > built ;;
+esac
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "lib",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("autotools".into()),
+                plugin_options: Some(
+                    [(
+                        "args".to_string(),
+                        nau_core::plugins::PluginValue::Arr(vec![
+                            "--disable-nls".into(),
+                            "--with-ssl".into(),
+                        ]),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        });
+
+        // configure ran with --prefix=/usr and the args, in order, and its
+        // output landed in the part work dir (not $SRC).
+        let configure_log =
+            std::fs::read_to_string(e2e.tree.path().join("lib/configure.log")).unwrap();
+        let lines: Vec<&str> = configure_log.lines().collect();
+        assert_eq!(lines, vec!["--prefix=/usr", "--disable-nls", "--with-ssl"]);
+        assert!(
+            !e2e.src.join("Makefile").exists(),
+            "configure must not write into $SRC"
+        );
+        assert!(
+            e2e.tree.path().join("lib/built").exists(),
+            "make ran in the work dir"
+        );
+
+        let log = e2e.invocations();
+        assert!(
+            log.contains("make \n"),
+            "plain make must run before install: {log}"
+        );
+        assert!(
+            log.contains(&format!("make install DESTDIR={}", e2e.stage.display())),
+            "install must honor DESTDIR=$STAGE: {log}"
+        );
+        assert!(e2e.stage.join("usr/bin/demo").exists());
+    }
+
+    #[test]
+    fn test_e2e_cmake_plugin_configures_builds_and_installs_into_stage() {
+        let e2e = PluginE2e::new();
+        write_stub(
+            &e2e.stubs,
+            "cmake",
+            r#"printf 'cmake %s\n' "$*" >> "$STAGE/invocations.log"
+case "$1" in
+  -S) mkdir -p build ;;
+  --build) : ;;
+  --install)
+    printf 'DESTDIR=%s\n' "$DESTDIR" >> "$STAGE/invocations.log"
+    mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/app" ;;
+esac
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("cmake".into()),
+                plugin_options: Some(
+                    [
+                        (
+                            "generator".to_string(),
+                            nau_core::plugins::PluginValue::Str("Ninja".into()),
+                        ),
+                        (
+                            "defines".to_string(),
+                            nau_core::plugins::PluginValue::Map(
+                                [("USE_SSL".to_string(), "ON".to_string())]
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        });
+
+        let inner_src = expected_src(&e2e.src);
+        let log = e2e.invocations();
+        assert!(
+            log.contains(&format!(
+                "cmake -S {} -B build -G Ninja -DUSE_SSL=ON -DCMAKE_INSTALL_PREFIX=/usr",
+                inner_src.display()
+            )),
+            "configure must point at $SRC with generator + defines: {log}"
+        );
+        assert!(log.contains("cmake --build build"), "must build: {log}");
+        assert!(
+            log.contains("cmake --install build")
+                && log.contains(&format!("DESTDIR={}", e2e.stage.display())),
+            "install must honor DESTDIR=$STAGE: {log}"
+        );
+        assert!(e2e.stage.join("usr/bin/app").exists());
+    }
+
+    #[test]
+    fn test_e2e_cargo_plugin_runs_stubbed_toolchain_with_channel_env() {
+        let e2e = PluginE2e::new();
+        // Stub cargo: logs the invocation AND the channel env the plugin
+        // exported, then "installs" a binary into $STAGE/bin.
+        write_stub(
+            &e2e.stubs,
+            "cargo",
+            r#"printf 'cargo %s\n' "$*" >> "$STAGE/invocations.log"
+printf 'RUSTUP_TOOLCHAIN=%s\n' "$RUSTUP_TOOLCHAIN" >> "$STAGE/invocations.log"
+mkdir -p "$STAGE/bin" && : > "$STAGE/bin/app"
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [(
+            "core",
+            SnapPart {
+                build: String::new(),
+                after: vec![],
+                plugin: Some("cargo".into()),
+                plugin_options: Some(
+                    [(
+                        "channel".to_string(),
+                        nau_core::plugins::PluginValue::Str("nightly".into()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        )]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        });
+
+        let inner_src = expected_src(&e2e.src);
+        let log = e2e.invocations();
+        assert!(
+            log.contains(&format!(
+                "cargo install --path {} --root {}",
+                inner_src.display(),
+                e2e.stage.display()
+            )),
+            "cargo must build from $SRC and install into $STAGE: {log}"
+        );
+        assert!(
+            log.contains("RUSTUP_TOOLCHAIN=nightly"),
+            "channel option must be exported as RUSTUP_TOOLCHAIN: {log}"
+        );
+        assert!(e2e.stage.join("bin/app").exists());
+    }
+
+    #[test]
+    fn test_e2e_plugin_and_command_parts_share_stage_and_ordering() {
+        // Mixed spec: a command part, then a plugin part after it — both
+        // install into the same shared $STAGE in `after` order.
+        let e2e = PluginE2e::new();
+        write_stub(
+            &e2e.stubs,
+            "make",
+            r#"printf 'make %s\n' "$*" >> "$STAGE/invocations.log"
+# DESTDIR arrives as a make command-line arg, not env.
+for a in "$@"; do
+  case "$a" in DESTDIR=*) DESTDIR="${a#DESTDIR=}" ;; esac
+done
+if [ -n "$DESTDIR" ]; then
+  printf 'saw=%s\n' "$(cat "$STAGE/a.done" 2>/dev/null)" >> "$STAGE/invocations.log"
+  mkdir -p "$DESTDIR/usr/bin" && : > "$DESTDIR/usr/bin/hello"
+fi
+"#,
+        );
+
+        let parts: BTreeMap<String, SnapPart> = [
+            (
+                "a",
+                SnapPart {
+                    build: "printf 'first\\n' > \"$STAGE/a.done\"".into(),
+                    after: vec![],
+                    plugin: None,
+                    plugin_options: None,
+                },
+            ),
+            (
+                "b",
+                SnapPart {
+                    build: String::new(),
+                    after: vec!["a".into()],
+                    plugin: Some("make".into()),
+                    plugin_options: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        with_path_prepend(&e2e.stubs, || {
+            run_parts(
+                &parts,
+                e2e.tree.path(),
+                &e2e.src,
+                &e2e.stage,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        });
+
+        let log = e2e.invocations();
+        assert!(
+            log.contains("saw=first"),
+            "plugin part must run after the command part and see its stage output: {log}"
+        );
+        assert!(e2e.stage.join("usr/bin/hello").exists());
+    }
+
+    // ── Stage hygiene (stage-reuse correctness) ──
+
+    #[test]
+    fn test_clear_stage_dir_wipes_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(stage.join("usr/bin")).unwrap();
+        std::fs::write(stage.join("usr/bin/pciutils"), b"stale").unwrap();
+
+        clear_stage_dir(&stage).unwrap();
+
+        assert!(stage.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&stage).unwrap().count(),
+            0,
+            "default stage must be wiped before a build populates it"
+        );
+    }
+
+    #[test]
+    fn test_check_explicit_stage_refuses_nonempty() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("user-file"), b"precious").unwrap();
+
+        let err = check_explicit_stage(&stage).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--stage"),
+            "error should point at --stage handling: {msg}"
+        );
+        assert!(
+            stage.join("user-file").exists(),
+            "an explicit stage is never deleted"
+        );
+    }
+
+    #[test]
+    fn test_check_explicit_stage_allows_empty_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(check_explicit_stage(&empty).is_ok());
+
+        let missing = dir.path().join("missing");
+        assert!(check_explicit_stage(&missing).is_ok());
+    }
+
+    #[test]
+    fn test_stage_lock_path_is_sibling_of_stage() {
+        assert_eq!(
+            stage_lock_path(Path::new("./stage/")).unwrap(),
+            Path::new("./stage.lock")
+        );
+        // A stage path with no file name cannot carry a sibling lock.
+        assert!(stage_lock_path(Path::new("/")).is_none());
+    }
+
+    #[test]
+    fn test_stage_lock_excludes_second_holder_then_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+
+        let _first = StageLock::acquire(&stage).unwrap();
+        // The lock lives next to the stage, never inside it: the wipe
+        // removes the stage dir, which must not strand the lock.
+        assert!(dir.path().join("stage.lock").is_file());
+        assert_eq!(
+            std::fs::read_dir(&stage).unwrap().count(),
+            0,
+            "lock file must not be created inside the stage"
+        );
+
+        // Non-blocking: the second concurrent holder fails loudly instead
+        // of waiting (flock conflicts across independent fds, so this is
+        // the same mutual exclusion a second process would hit).
+        let err = StageLock::acquire(&stage).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("held by another nau build"),
+            "conflict error must name the holder: {msg}"
+        );
+        assert!(
+            msg.contains("--stage"),
+            "conflict error must point at the --stage escape hatch: {msg}"
+        );
+
+        // Release on drop: the next build proceeds.
+        drop(_first);
+        wait_stage_lock_released(&stage);
+    }
+
+    #[test]
+    fn test_stage_locks_are_per_stage_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let _lock_a = StageLock::acquire(&a).unwrap();
+        let _lock_b = StageLock::acquire(&b).unwrap();
+    }
+
+    // ── stage.lock hardening (issue #173) ──
+
+    fn set_stage_lock_swap_hook(lock_path: &Path, hook: Option<StageLockHook>) {
+        let mut hooks = STAGE_LOCK_TEST_SWAP
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        hooks.retain(|(target, _)| target != lock_path);
+        if let Some(hook) = hook {
+            hooks.push((lock_path.to_path_buf(), hook));
+        }
+    }
+
+    /// Proves release-on-drop with a bounded re-acquire. `drop(lock)`
+    /// closes our fd, but flock lives as long as ANY reference to the
+    /// open file description — a `fork(2)`ed, not-yet-exec'd child of a
+    /// concurrent test (the build/image suites spawn tools) pins the
+    /// description for a few microseconds past our close, and
+    /// `/proc/locks` keeps naming the original owner pid. The build
+    /// contract stays fail-loud; only this release assertion tolerates
+    /// that scheduling window.
+    fn wait_stage_lock_released(stage: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match StageLock::acquire(stage) {
+                Ok(lock) => {
+                    drop(lock);
+                    return;
+                }
+                Err(err) if std::time::Instant::now() < deadline => {
+                    assert!(
+                        format!("{err:#}").contains("held by another nau build"),
+                        "unexpected lock error while waiting for release: {err:#}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("stage lock was not released on drop: {err:#}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_stage_lock_identity_check_detects_replaced_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stage.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            stage_lock_identity_holds(&file, &path),
+            "a freshly opened fd must match the path"
+        );
+
+        // External sweeper: unlink + recreate puts a fresh inode at the
+        // path — the orphaned fd must no longer match.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            !stage_lock_identity_holds(&file, &path),
+            "a replaced file must fail the identity check"
+        );
+
+        // A vanished path (unlink only, no recreate) is a mismatch too.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!stage_lock_identity_holds(&file, &path));
+    }
+
+    #[test]
+    fn test_stage_lock_recovers_when_lock_file_is_swapped_mid_acquire() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let lock_path = dir.path().join("stage.lock");
+        let hook_path = lock_path.clone();
+        let swaps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_swaps = swaps.clone();
+        set_stage_lock_swap_hook(
+            &lock_path,
+            Some(Box::new(move |_| {
+                // A one-shot external sweeper racing the acquire: unlink +
+                // recreate exactly once, then leave the fresh file alone.
+                if hook_swaps.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    std::fs::remove_file(&hook_path).unwrap();
+                    std::fs::write(&hook_path, b"").unwrap();
+                }
+            })),
+        );
+        let lock = StageLock::acquire(&stage);
+        set_stage_lock_swap_hook(&lock_path, None);
+
+        let lock = lock.unwrap();
+        assert!(
+            swaps.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the swap hook must have fired during the acquire"
+        );
+        // The held lock is the file NOW at the path: a second acquirer
+        // is excluded, proving the retry took the fresh inode.
+        let err = StageLock::acquire(&stage).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("held by another nau build"),
+            "retry must land on the current inode: {err:#}"
+        );
+        drop(lock);
+        wait_stage_lock_released(&stage);
+    }
+
+    #[test]
+    fn test_stage_lock_fails_loudly_when_lock_file_keeps_changing() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let lock_path = dir.path().join("stage.lock");
+        let hook_path = lock_path.clone();
+        set_stage_lock_swap_hook(
+            &lock_path,
+            Some(Box::new(move |_| {
+                std::fs::remove_file(&hook_path).unwrap();
+                std::fs::write(&hook_path, b"").unwrap();
+            })),
+        );
+        let result = StageLock::acquire(&stage);
+        set_stage_lock_swap_hook(&lock_path, None);
+
+        let err = result.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("was replaced"),
+            "exhausted retries must fail loudly: {msg}"
+        );
+        assert!(
+            msg.contains("stage.lock"),
+            "the loud failure must name the lock file: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_stage_lock_refuses_symlinked_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A victim inode with a symlink planted at another stage's lock
+        // path, pointing at it.
+        let victim = dir.path().join("victimstage.lock");
+        std::fs::write(&victim, b"").unwrap();
+        let stage = dir.path().join("otherstage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("otherstage.lock")).unwrap();
+
+        let err = StageLock::acquire(&stage).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("symlink"),
+            "a planted link must be refused, not followed: {msg}"
+        );
+
+        // The fd never flocked the victim: the stage owning that lock
+        // path still acquires cleanly.
+        let victim_stage = dir.path().join("victimstage");
+        std::fs::create_dir_all(&victim_stage).unwrap();
+        StageLock::acquire(&victim_stage).unwrap();
+    }
+
+    #[test]
+    fn test_buildless_snap_keeps_default_stage_contents() {
+        // A build-less snap's stage is the INPUT (pre-built binaries staged
+        // by hand) — the Default-policy wipe only fires when a build phase
+        // populates the stage, so the pre-built workflow still works.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "prebuilt",
+                    version = "1",
+                    apps = { hello = app { command = "bin/hello" } },
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+
+        let stage_dir = tempfile::tempdir().unwrap();
+        let bin = stage_dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("hello"), b"#!/bin/sh\necho hi\n").unwrap();
+
+        let output_dir = tempfile::tempdir().unwrap();
+        build_snap(
+            &meta,
+            stage_dir.path(),
+            output_dir.path(),
+            "amd64",
+            StagePolicy::Default,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            bin.join("hello").exists(),
+            "build-less snap must consume, not wipe, the pre-populated stage"
+        );
+    }
+
+    // ── Cross-build arch guard ──
+
+    #[test]
+    fn test_check_cross_build_allows_host_arch() {
+        assert!(check_cross_build(host_arch(), None).is_ok());
+    }
+
+    #[test]
+    fn test_check_cross_build_allows_all() {
+        assert!(check_cross_build("all", None).is_ok());
+    }
+
+    #[test]
+    fn test_check_cross_build_refuses_foreign_arch_without_target() {
+        let other = if host_arch() == "amd64" {
+            "arm64"
+        } else {
+            "amd64"
+        };
+        let err = check_cross_build(other, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--target"),
+            "error must explain the --target escape hatch: {msg}"
+        );
+        assert!(msg.contains(other));
+    }
+
+    #[test]
+    fn test_check_cross_build_allows_matching_target() {
+        assert!(check_cross_build("arm64", Some("aarch64-linux-gnu")).is_ok());
+        assert!(check_cross_build("amd64", Some("x86_64-linux-gnu")).is_ok());
+        // A target for a DIFFERENT arch does not unlock the build.
+        assert!(check_cross_build("arm64", Some("x86_64-linux-gnu")).is_err());
+    }
+
+    #[test]
+    fn test_triplet_arch_mapping() {
+        assert_eq!(triplet_arch("aarch64-linux-gnu"), Some("arm64"));
+        assert_eq!(triplet_arch("x86_64-linux-gnu"), Some("amd64"));
+        assert_eq!(triplet_arch("arm-linux-gnueabihf"), Some("armhf"));
+        assert_eq!(triplet_arch("riscv64-linux-gnu"), Some("riscv64"));
+    }
+
+    // ── snap.yaml schema honesty ──
+
+    #[test]
+    fn test_yaml_omits_top_level_source_key() {
+        // snapd's schema has no top-level `source:` key; emitting it risks
+        // rejection. Source identity lives in the lockfile/cache instead.
+        let env = LuaEnv::new();
+        let table = env
+            .eval(
+                r#"
+            return {
+                default = snap {
+                    name = "s", version = "1",
+                    source = "https://example.com/pkg.tar.gz",
+                    build = "make",
+                },
+            }
+            "#,
+            )
+            .unwrap();
+        let default_table: mlua::Table = table.get("default").unwrap();
+        let meta = SnapMeta::from_lua_table(&default_table).unwrap();
+        assert!(
+            meta.source.is_some(),
+            "source identity still tracked in meta"
+        );
+
+        let yaml = meta.to_yaml().unwrap();
+        assert!(
+            !yaml.contains("source"),
+            "snap.yaml must not carry a source key, got: {yaml}"
+        );
+    }
+
+    // ── sandbox tool visibility (bind roots, build pre-flight) ──
+
+    use std::path::PathBuf;
+
+    fn write_exec(dir: &Path, name: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn sandbox_visible_matches_bind_roots_componentwise() {
+        assert!(sandbox_visible(Path::new("/usr/bin/make")));
+        assert!(sandbox_visible(Path::new(
+            "/nix/store/abc-gnumake-4.4.1/bin/make"
+        )));
+        assert!(sandbox_visible(Path::new("/run/current-system/sw/bin/ls")));
+        // Component-wise: a sibling prefix must not match.
+        assert!(!sandbox_visible(Path::new("/usrlocal/bin/make")));
+        assert!(!sandbox_visible(Path::new("/nixpkgs/bin/make")));
+        // The failure fixtures: unbound profile dirs and relative paths.
+        assert!(!sandbox_visible(Path::new(
+            "/home/u/proj/.devbox/nix/profile/default/bin/bison"
+        )));
+        assert!(!sandbox_visible(Path::new("relative/bin/make")));
+    }
+
+    #[test]
+    fn build_prefix_env_points_everything_at_the_prefix() {
+        // ADR-0018 (issue #17): the env a build sees for the merged prefix —
+        // root, configure probes, and pkg-config with the sysroot rewrite
+        // that fixes `/usr`-rooted .pc files.
+        let env = build_prefix_env("/nau-build-prefix");
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing {k}"))
+        };
+        assert_eq!(get("NAU_BUILD_PREFIX"), "/nau-build-prefix");
+        assert_eq!(
+            get("CPPFLAGS"),
+            "-I/nau-build-prefix/usr/include -I/nau-build-prefix/usr/usr/include",
+            "the dpkg usr/usr doubling: deb payloads keep their ./usr tree, \
+             so include probes need both spellings (#180)"
+        );
+        assert_eq!(
+            get("LIBRARY_PATH"),
+            "/nau-build-prefix/usr/lib:/nau-build-prefix/usr/lib64:\
+             /nau-build-prefix/lib64:\
+             /nau-build-prefix/usr/lib/x86_64-linux-gnu:\
+             /nau-build-prefix/usr/lib/aarch64-linux-gnu:\
+             /nau-build-prefix/usr/lib/arm-linux-gnueabihf",
+            "the gcc cc-shim composes -L from this (gcc.lua contract) (#180); \
+             /lib64 is the glibc source build's slibdir (08061c8)"
+        );
+        assert_eq!(
+            get("LDFLAGS"),
+            "-L/nau-build-prefix/usr/lib -L/nau-build-prefix/usr/lib64 \
+             -L/nau-build-prefix/lib64 \
+             -L/nau-build-prefix/usr/lib/x86_64-linux-gnu \
+             -L/nau-build-prefix/usr/lib/aarch64-linux-gnu \
+             -L/nau-build-prefix/usr/lib/arm-linux-gnueabihf",
+            "one -L per LIBRARY_PATH dir, same order — configure/meson probes \
+             get the multiarch dirs the cc shim covers (#209); usr/lib keeps \
+             priority so existing search order only widens"
+        );
+        assert_eq!(
+            get("LD_LIBRARY_PATH"),
+            "/nau-build-prefix/usr/lib:/nau-build-prefix/usr/lib64:\
+             /nau-build-prefix/lib64:\
+             /nau-build-prefix/usr/lib/x86_64-linux-gnu:\
+             /nau-build-prefix/usr/lib/aarch64-linux-gnu:\
+             /nau-build-prefix/usr/lib/arm-linux-gnueabihf",
+            "prefix-built ELFs carry no RUNPATH (#12) — build-time execs \
+             resolve merged libs through this var; the deb-gcc multiarch \
+             dir rides along for cc1's own DT_NEEDED (#180)"
+        );
+        assert_eq!(
+            get("PKG_CONFIG_PATH"),
+            "/nau-build-prefix/usr/lib/pkgconfig:\
+             /nau-build-prefix/usr/lib64/pkgconfig:\
+             /nau-build-prefix/usr/share/pkgconfig:\
+             /nau-build-prefix/usr/usr/lib/pkgconfig:\
+             /nau-build-prefix/usr/usr/share/pkgconfig",
+            "deb payload pc files live under the usr/usr doubling (#180)"
+        );
+        assert_eq!(get("PKG_CONFIG_SYSROOT_DIR"), "/nau-build-prefix");
+    }
+
+    // ── C-toolchain prefix wiring (issue #44) ──
+
+    /// Touch `usr/bin/<name>` inside a tempdir standing in for the merged
+    /// build prefix.
+    fn stage_driver(dir: &Path, name: &str) {
+        let bin = dir.join("usr/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(name), "#!/bin/sh\n").unwrap();
+    }
+
+    #[test]
+    fn build_prefix_toolchain_env_sets_cc_cxx_from_gcc() {
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "gcc");
+        stage_driver(prefix.path(), "g++");
+        let env = build_prefix_toolchain_env(prefix.path());
+        assert_eq!(
+            env,
+            vec![("CC", "gcc".to_string()), ("CXX", "g++".to_string())]
+        );
+    }
+
+    #[test]
+    fn build_prefix_toolchain_env_falls_back_to_clang_names() {
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "clang");
+        stage_driver(prefix.path(), "clang++");
+        let env = build_prefix_toolchain_env(prefix.path());
+        assert_eq!(
+            env,
+            vec![("CC", "clang".to_string()), ("CXX", "clang++".to_string())]
+        );
+    }
+
+    #[test]
+    fn build_prefix_toolchain_env_empty_prefix_sets_nothing() {
+        let prefix = tempfile::tempdir().unwrap();
+        assert!(build_prefix_toolchain_env(prefix.path()).is_empty());
+    }
+
+    #[test]
+    fn build_prefix_toolchain_env_partial_prefix_sets_cc_only() {
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "gcc");
+        let env = build_prefix_toolchain_env(prefix.path());
+        assert_eq!(env, vec![("CC", "gcc".to_string())]);
+    }
+
+    #[test]
+    fn declares_cgo_matches_command_and_plugin_env() {
+        assert!(declares_cgo("export CGO_ENABLED=1 && go build ./...", &[]));
+        assert!(declares_cgo(
+            "go build",
+            &[("CGO_ENABLED".into(), "1".into())]
+        ));
+        // Not opt-ins: explicit disable, unrelated env, plain go builds.
+        assert!(!declares_cgo("export CGO_ENABLED=0 && go build ./...", &[]));
+        assert!(!declares_cgo(
+            "go build",
+            &[("GOFLAGS".into(), "-mod=mod".into())]
+        ));
+        assert!(!declares_cgo("go build", &[]));
+    }
+
+    #[test]
+    fn ensure_cgo_toolchain_fails_closed_without_prefix_naming_the_fix() {
+        let err = ensure_cgo_toolchain("export CGO_ENABLED=1 && go build ./...", &[], None, None)
+            .expect_err("CGO without a prefix must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("CGO_ENABLED=1"), "names the trigger: {msg}");
+        assert!(msg.contains("toolchain"), "names the toolchain dep: {msg}");
+        assert!(msg.contains("build_deps"), "names the field: {msg}");
+    }
+
+    #[test]
+    fn ensure_cgo_toolchain_fails_closed_with_compilerless_prefix() {
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "go"); // a build_dep toolchain, not a C one
+        let err = ensure_cgo_toolchain(
+            "CGO_ENABLED=1 go build ./...",
+            &[],
+            Some(prefix.path()),
+            None,
+        )
+        .expect_err("prefix without a C compiler must fail");
+        assert!(format!("{err}").contains("build_deps"));
+    }
+
+    #[test]
+    fn ensure_cgo_toolchain_passes_with_declared_toolchain() {
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "gcc");
+        ensure_cgo_toolchain(
+            "export CGO_ENABLED=1 && go build ./...",
+            &[],
+            Some(prefix.path()),
+            None,
+        )
+        .expect("a prefix with a C compiler satisfies the CGO gate");
+    }
+
+    #[test]
+    fn ensure_cgo_toolchain_passes_on_cgo_free_builds_and_cross_targets() {
+        // No CGO declaration → gate inert even with no prefix at all.
+        ensure_cgo_toolchain("go build ./...", &[], None, None)
+            .expect("plain builds are not gated");
+        // Explicit disable → inert.
+        ensure_cgo_toolchain("CGO_ENABLED=0 go build ./...", &[], None, None)
+            .expect("CGO_ENABLED=0 is not a CGO opt-in");
+        // Cross targets route the compiler through the sysroot machinery.
+        ensure_cgo_toolchain(
+            "export CGO_ENABLED=1 && make",
+            &[],
+            None,
+            Some("aarch64-linux-gnu"),
+        )
+        .expect("cross builds are exempt");
+        // Plugin env pair counts as the declaration.
+        let prefix = tempfile::tempdir().unwrap();
+        stage_driver(prefix.path(), "gcc");
+        ensure_cgo_toolchain(
+            "go build ./...",
+            &[("CGO_ENABLED".into(), "1".into())],
+            Some(prefix.path()),
+            None,
+        )
+        .expect("plugin env CGO_ENABLED=1 with a toolchain passes");
+    }
+
+    #[test]
+    fn sandbox_visible_entries_keep_bound_existing_dirs_only() {
+        let unbound = tempfile::tempdir().unwrap();
+        // Whichever bind root exists on this host (FHS /usr, or /nix on a
+        // NixOS/devbox box).
+        let bound_root = SANDBOX_RO_ROOTS
+            .iter()
+            .find(|r| Path::new(r).is_dir())
+            .map(PathBuf::from)
+            .expect("test host must have at least one sandbox bind root");
+        // A /nix path that does not exist is invisible exactly like a
+        // garbage-collected store path — bound via /nix, resolves nothing.
+        let entries = vec![
+            bound_root.clone(),
+            unbound.path().to_path_buf(),
+            PathBuf::from("/nix/store/00000000000000000000000000000000-gnumake-4.4.1/bin"),
+        ];
+        assert_eq!(sandbox_visible_entries(&entries), vec![bound_root]);
+    }
+
+    #[test]
+    fn resolve_in_path_follows_path_order_and_checks_exec() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        write_exec(first.path(), "tool-probe");
+        let entries = vec![second.path().to_path_buf(), first.path().to_path_buf()];
+        assert_eq!(
+            resolve_in_path("tool-probe", &entries),
+            Some(first.path().join("tool-probe"))
+        );
+        // A non-executable file is not resolved.
+        std::fs::write(first.path().join("plain"), "").unwrap();
+        assert_eq!(resolve_in_path("plain", &entries), None);
+        assert_eq!(resolve_in_path("absent", &entries), None);
+    }
+
+    #[test]
+    fn preflight_names_tool_visible_only_on_unbound_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "make");
+        let entries = vec![dir.path().to_path_buf()];
+        let err = preflight_sandbox_tools("make -C $SRC", &entries)
+            .expect_err("tool on an unbound PATH entry must fail preflight");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("make"), "error must name the tool: {msg}");
+        assert!(
+            msg.contains(&dir.path().display().to_string()),
+            "error must name the invisible PATH entry: {msg}"
+        );
+        assert!(msg.contains("not bound"), "error must carry the fix: {msg}");
+    }
+
+    #[test]
+    fn preflight_names_tool_missing_after_store_gc() {
+        // A garbage-collected /nix/store entry: under a bind root but the
+        // dir no longer exists — invisible to the sandbox.
+        let entries = vec![
+            PathBuf::from("/nix/store/00000000000000000000000000000000-gnumake-4.4.1/bin"),
+            PathBuf::from("/usr/bin"),
+        ];
+        let err = preflight_sandbox_tools("make-gc-victim", &entries)
+            .expect_err("a GC'd store path must fail preflight");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("make-gc-victim"),
+            "error must name the tool: {msg}"
+        );
+        assert!(
+            msg.contains("GC"),
+            "error must mention the GC failure mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_probes_only_bare_path_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = vec![dir.path().to_path_buf()];
+        // Nothing here resolves through PATH: assignments, direct paths,
+        // variables, builtins, redirections are all skipped.
+        preflight_sandbox_tools(
+            "DESTDIR=$STAGE ./configure --prefix=/usr && $SRC/configure --prefix=/usr \
+             && cd $SRC && echo built > log 2>&1",
+            &entries,
+        )
+        .expect("no bare PATH-resolved words to probe");
+    }
+
+    #[test]
+    fn preflight_probes_each_segments_command() {
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "flex");
+        let entries = vec![dir.path().to_path_buf()];
+        // The second segment's command is probed even though the first
+        // segment's word (./configure) is a direct path.
+        let err = preflight_sandbox_tools("./configure --prefix=/usr && flex -o out", &entries)
+            .expect_err("flex is only on an unbound entry");
+        assert!(format!("{err:#}").contains("flex"));
+    }
+
+    #[test]
+    fn preflight_probes_command_after_assignment_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "bison");
+        let entries = vec![dir.path().to_path_buf()];
+        let err = preflight_sandbox_tools("BISON_PKGDATADIR=$SRC bison -d grammar.y", &entries)
+            .expect_err("assignment prefixes must not hide the command");
+        assert!(format!("{err:#}").contains("bison"));
+    }
+
+    #[test]
+    fn preflight_accepts_tools_under_the_stage_bind() {
+        // The stage dir is rw-bound at its own host path, so stub tools
+        // under it (the plugin-e2e harness pattern) are sandbox-visible.
+        let stage = tempfile::tempdir().unwrap();
+        let stubs = stage.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_exec(&stubs, "cmake");
+        let entries = vec![stubs];
+        let stage_root = stage.path().to_path_buf();
+        preflight_sandbox_tools_with(
+            "DESTDIR=$STAGE cmake -S $SRC -B build",
+            &entries,
+            std::slice::from_ref(&stage_root),
+        )
+        .expect("stage-bound tools are visible to the sandbox");
+        // The same setup fails without the stage bind.
+        assert!(preflight_sandbox_tools_with("cmake -S $SRC", &entries, &[]).is_err());
+    }
+
+    #[test]
+    fn preflight_accepts_tools_in_the_merged_build_prefix() {
+        // build_deps tooling materializes into the merged build prefix
+        // (issue #33): its bin dir joins the preflight probe set the same
+        // way the sandbox PATH carries it, so a build script invoking bare
+        // `cmake` (a build_dep) passes preflight instead of erroring on a
+        // host PATH that has no cmake.
+        let prefix = tempfile::tempdir().unwrap();
+        let bin = prefix.path().join("usr/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_exec(&bin, "cmake");
+        let entries = vec![bin];
+        let prefix_root = prefix.path().to_path_buf();
+        preflight_sandbox_tools_with(
+            "cmake -S $SRC -B build -DCMAKE_INSTALL_PREFIX=/usr",
+            &entries,
+            std::slice::from_ref(&prefix_root),
+        )
+        .expect("merged-prefix tools are visible to the sandbox");
+        // Without the prefix root the same command fails preflight.
+        assert!(preflight_sandbox_tools_with("cmake -S $SRC", &entries, &[]).is_err());
+    }
+
+    #[test]
+    fn preflight_heredoc_bodies_and_terminators_never_probe() {
+        // The empirical false positive (issue #33): a launcher-emitting
+        // build whose heredoc body carries `from x import y` lines — the
+        // parser probed `from` (and the `EOF` terminator) as missing
+        // sandbox commands. Heredoc text is not a command: only `cat` is
+        // probed, and it resolves via the tempdir bind root.
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "cat");
+        let entries = vec![dir.path().to_path_buf()];
+        let root = dir.path().to_path_buf();
+        preflight_sandbox_tools_with(
+            "cat > launcher <<'PYEOF'\n\
+             #!/bin/sh\n\
+             from mesonbuild.mesonmain import main\n\
+             import sys; sys.exit(main())\n\
+             PYEOF",
+            &entries,
+            std::slice::from_ref(&root),
+        )
+        .expect("heredoc bodies and terminator lines are text, not commands");
+    }
+
+    #[test]
+    fn preflight_quoted_fragments_are_argument_text() {
+        // `sh -c 'a; b'` runs ONE command (`sh`) — separators inside
+        // quotes are argument text, so `b` must not be probed (issue #33).
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "sh");
+        let entries = vec![dir.path().to_path_buf()];
+        let root = dir.path().to_path_buf();
+        preflight_sandbox_tools_with(
+            "sh -c 'mkdir -p out; exec make install'",
+            &entries,
+            std::slice::from_ref(&root),
+        )
+        .expect("quoted ; fragments are one command's argument text");
+    }
+
+    #[test]
+    fn path_resolved_words_skip_heredocs_and_quoted_separators() {
+        // Real commands around heredocs and quoted fragments still probe;
+        // bodies, terminator lines, and quoted separators do not.
+        assert_eq!(
+            path_resolved_words("cmake -S $SRC && cat <<EOF\nfrom x import y\nEOF\nninja -C build"),
+            vec!["cmake".to_string(), "cat".to_string(), "ninja".to_string()]
+        );
+        assert_eq!(
+            path_resolved_words("sh -c 'a; b | c' && make"),
+            vec!["sh".to_string(), "make".to_string()]
+        );
+    }
+
+    #[test]
+    fn path_resolved_words_heredoc_delimiter_variants() {
+        // Dash form with a space-separated delimiter and a tab-indented
+        // terminator; the body never probes.
+        assert_eq!(
+            path_resolved_words("cat <<- EOM\nbody line\n\tEOM\nstrip"),
+            vec!["cat".to_string(), "strip".to_string()]
+        );
+        // `<<<` is a here-string (no body); arithmetic `1<<10` is no
+        // heredoc either.
+        assert_eq!(
+            path_resolved_words("cat <<< text && strip"),
+            vec!["cat".to_string(), "strip".to_string()]
+        );
+        assert_eq!(
+            path_resolved_words("expr $((1<<10)) + 0 && strip"),
+            vec!["expr".to_string(), "strip".to_string()]
+        );
+    }
+
+    #[test]
+    fn path_resolved_words_skip_command_substitutions() {
+        // Issue #39: the interior of a `$(...)` is a runtime sub-command,
+        // not a build command — and an assignment like `v=$(go version)`
+        // tears under whitespace-splitting into interior words (`version)`)
+        // that surfaced as phantom missing tools. Interiors never probe,
+        // nested substitutions close at the matching paren, and separators
+        // inside them never split segments.
+        assert_eq!(
+            path_resolved_words("ver=$(go version) && echo \"$ver\""),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            path_resolved_words("echo \"go $(go version)\" > go-version.txt"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            path_resolved_words("x=$(echo $(cat a.txt)) && grep -q p x"),
+            vec!["grep".to_string()]
+        );
+        assert_eq!(
+            path_resolved_words("out=$(go env GOROOT | head -1) && cp \"$out\" y"),
+            vec!["cp".to_string()]
+        );
+    }
+
+    #[test]
+    fn preflight_accepts_nested_command_substitutions() {
+        // The empirical false positive (issue #39): the go-probe fixture
+        // needed a redirect-form workaround because `v=$(go version)` made
+        // the parser probe the interior word `version)` as a missing
+        // sandbox tool. Substitution interiors are consumed at runtime;
+        // only the outer commands probe.
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(dir.path(), "grep");
+        let entries = vec![dir.path().to_path_buf()];
+        let root = dir.path().to_path_buf();
+        preflight_sandbox_tools_with(
+            "ver=$(go version) && grep -q 'go1.27.1' ver.txt",
+            &entries,
+            std::slice::from_ref(&root),
+        )
+        .expect("command-substitution interiors never probe");
+    }
+
+    #[test]
+    fn bind_system_ro_paths_binds_declared_roots_that_exist() {
+        let mut cmd = std::process::Command::new("true");
+        bind_system_ro_paths(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for root in SANDBOX_RO_ROOTS {
+            if !Path::new(root).exists() {
+                continue;
+            }
+            assert!(
+                args.windows(3).any(|w| w == ["--ro-bind", root, root]),
+                "expected --ro-bind {root} {root}, got {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_system_ro_paths_binds_resolver_and_ca_paths() {
+        // Issue #176: the build sandbox's FHS bind roots carry no /etc, so
+        // build-step downloads had no resolver and no CA trust. The
+        // constructed spec must carry all three read-only binds.
+        let mut cmd = std::process::Command::new("true");
+        bind_system_ro_paths(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for path in SANDBOX_ETC_RO_PATHS {
+            if !Path::new(path).exists() {
+                continue;
+            }
+            assert!(
+                args.windows(3).any(|w| w == ["--ro-bind", path, path]),
+                "expected --ro-bind {path} {path}, got {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_curl_ca_bundle_sets_the_exact_pair_when_absent() {
+        let (key, val) = default_curl_ca_bundle(None, true).expect("default issued");
+        assert_eq!(key, "CURL_CA_BUNDLE");
+        assert_eq!(val, "/etc/ssl/certs/ca-certificates.crt");
+        assert_eq!(val, SANDBOX_CA_BUNDLE);
+    }
+
+    #[test]
+    fn default_curl_ca_bundle_never_clobbers_an_ambient_value() {
+        // The #138 ambient-trust rule: the caller's own trust choice wins.
+        assert!(default_curl_ca_bundle(Some("/my/own/bundle.pem"), true).is_none());
+    }
+
+    #[test]
+    fn default_curl_ca_bundle_skips_a_missing_bundle_file() {
+        // Pointing CURL_CA_BUNDLE at a missing file would turn TLS into a
+        // certificate-verify-locations error — worse than no default.
+        assert!(default_curl_ca_bundle(None, false).is_none());
+    }
+}
+
+/// Issue #9: build-time interpreter wrappers (see [`emit_build_wrappers`]).
+#[cfg(test)]
+mod wrapper_tests {
+    use super::*;
+
+    fn stage_file(stage: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+        let p = stage.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// Minimal SnapMeta carrying a single declared app (all other fields
+    /// default to their empty/None values — `emit_build_wrappers` only
+    /// reads `name`, `apps[].command`, and `apps[].interpreter`).
+    fn meta_with_app(app_name: &str, command: &str, interpreter: Option<&str>) -> SnapMeta {
+        let app = SnapApp {
+            command: command.to_string(),
+            daemon: None,
+            plugs: None,
+            slots: None,
+            environment: None,
+            desktop: None,
+            interpreter: interpreter.map(|s| s.to_string()),
+            confined: None,
+        };
+        let mut apps = HashMap::new();
+        apps.insert(app_name.to_string(), app);
+        SnapMeta {
+            name: "pkg".into(),
+            version: "1.0".into(),
+            summary: None,
+            description: None,
+            license: None,
+            source: None,
+            sources: None,
+            architectures: None,
+            build: None,
+            parts: None,
+            grade: "stable".into(),
+            confinement: "strict".into(),
+            type_: None,
+            adopt_info: None,
+            version_adopted: false,
+            icon_source: None,
+            icon: None,
+            compression: None,
+            compression_level: None,
+            environment: None,
+            layout: None,
+            hooks: None,
+            plugs: None,
+            slots: None,
+            aliases: Vec::new(),
+            requires: Vec::new(),
+            build_deps: Vec::new(),
+            leaks_ok: Vec::new(),
+            inputs: None,
+            target: None,
+            toolchain: None,
+            confined: None,
+            apps,
+            services: BTreeMap::new(),
+            deps: None,
+            floating: false,
+            definition_dir: None,
+        }
+    }
+
+    fn store_fixture(dir: &Path) -> nau_core::blob_store::BlobStore {
+        // The old fixture built a `RuntimeStore` at `dir`; its blob seam
+        // rooted the content store at `dir/store` (`store_dir()`). The
+        // wrapper tests assert the baked blob paths byte-for-byte, so the
+        // layout must not change.
+        nau_core::blob_store::BlobStore::new(dir.join("store"))
+    }
+
+    #[test]
+    fn is_elf_detects_magic() {
+        let stage = tempfile::tempdir().unwrap();
+        let elf = stage_file(stage.path(), "bin/t", b"\x7fELFrest");
+        assert!(is_elf(&elf));
+        let script = stage_file(stage.path(), "bin/s", b"#!/bin/sh\necho hi\n");
+        assert!(!is_elf(&script));
+        let empty = stage_file(stage.path(), "bin/e", b"");
+        assert!(!is_elf(&empty));
+        let missing = stage.path().join("bin/nope");
+        assert!(!is_elf(&missing));
+    }
+
+    #[test]
+    fn interpreter_app_wraps_a_script_at_build_time() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "bin/zg",
+            b"#!/usr/bin/env node\nconsole.log('zg')\n",
+        );
+        let meta = meta_with_app("zg", "bin/zg", Some("node"));
+
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
+
+        // The command path is now the wrapper: a single exec of the
+        // interpreter with the script's extension-tree path (the #94
+        // routing — a flat store-blob path strands arg[0]-derived
+        // module lookups).
+        let wrapper = std::fs::read_to_string(&script).unwrap();
+        assert!(wrapper.starts_with("#!/bin/sh\n"));
+        assert!(
+            wrapper.contains("exec \"node\""),
+            "wrapper must exec the interpreter: {wrapper}"
+        );
+        assert!(
+            wrapper.contains(
+                "TREE=\"$PODROOT/active/extensions/pkg/usr/bin/zg.real\"\n\
+                 [ -f \"$TREE\" ] || TREE=\"$(dirname \"$(dirname \"$SCRIPT\")\")/bin/zg.real\"\n\
+                 exec \"node\" \"$TREE\" \"$@\""
+            ),
+            "wrapper must exec the tree script with the #210 generation-tree \
+             fallback: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("PODROOT="),
+            "wrapper must derive the pod root from its own blob: {wrapper}"
+        );
+
+        // The original script is preserved at the sibling `.real` path.
+        let real = stage.path().join("bin/zg.real");
+        assert!(real.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "#!/usr/bin/env node\nconsole.log('zg')\n"
+        );
+    }
+
+    #[test]
+    fn interpreter_wrapper_preserves_extension() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let _script = stage_file(
+            stage.path(),
+            "lib/cli/index.js",
+            b"#!/usr/bin/env node\nconsole.log('zg')\n",
+        );
+        let meta = meta_with_app("zg", "lib/cli/index.js", Some("node"));
+
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
+
+        // The preserved sibling keeps the extension (node's ESM loader
+        // dispatches on it) — `index.real.js`, not `index.js.real`.
+        let real = stage.path().join("lib/cli/index.real.js");
+        assert!(real.is_file(), "extension must survive the .real rename");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "#!/usr/bin/env node\nconsole.log('zg')\n"
+        );
+    }
+
+    #[test]
+    fn real_sibling_name_inserts_before_extension() {
+        assert_eq!(real_sibling_name("index.js"), "index.real.js");
+        assert_eq!(real_sibling_name("cli.mjs"), "cli.real.mjs");
+        assert_eq!(real_sibling_name("index.min.js"), "index.min.real.js");
+        assert_eq!(real_sibling_name("zdemo"), "zdemo.real");
+        // A dotfile has no extension — append.
+        assert_eq!(real_sibling_name(".profile"), ".profile.real");
+    }
+
+    #[test]
+    fn python_stdlib_elf_gets_tree_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        // A CPython payload: the interpreter ELF plus its stdlib tree.
+        let elf = stage_file(
+            stage.path(),
+            "usr/bin/python3.12",
+            b"\x7fELF\x02\x01\x01rest",
+        );
+        std::fs::create_dir_all(stage.path().join("usr/lib/python3.12")).unwrap();
+        std::fs::write(stage.path().join("usr/lib/python3.12/os.py"), b"# stdlib\n").unwrap();
+        let meta = meta_with_app("python3", "usr/bin/python3.12", None);
+
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
+
+        // The command path became a wrapper that execs the ELF from the
+        // generation's extension tree (stdlib discovery needs its tree,
+        // not a flat store blob). The tree places the stage content under
+        // extensions/<pkg>/usr/, so the stage-relative usr/bin path doubles.
+        let wrapper = std::fs::read_to_string(elf).unwrap();
+        assert!(
+            wrapper.contains("extensions/pkg/usr/usr/bin/python3.real.12"),
+            "wrapper must exec the tree ELF: {wrapper}"
+        );
+        // #210: the gen-tree hardlink invocation falls back to the
+        // payload root two dirnames up, appending the command's own
+        // (usr/-doubled) rel path.
+        assert!(
+            wrapper.contains(
+                "TREE=\"$PODROOT/active/extensions/pkg/usr/usr/bin/python3.real.12\"\n\
+                 [ -f \"$TREE\" ] || TREE=\"$(dirname \"$(dirname \"$SCRIPT\")\")/usr/bin/python3.real.12\"\n\
+                 exec \"$TREE\" \"$@\""
+            ),
+            "ELF tree wrapper must carry the gen-tree fallback: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("readlink -f"),
+            "PODROOT derivation: {wrapper}"
+        );
+        // #94: the wrapper threads every extension's site-packages so
+        // the pod interpreter imports cross-package modules
+        // (mesonbuild from the meson extension).
+        assert!(
+            wrapper.contains(
+                "for sp in \"$PODROOT\"/active/extensions/*/usr/usr/lib/python3.*/site-packages"
+            ),
+            "wrapper must sweep extension site-packages onto PYTHONPATH: {wrapper}"
+        );
+        // The preserved sibling keeps the ELF and the extension segment.
+        let real = stage.path().join("usr/bin/python3.real.12");
+        assert_eq!(std::fs::read(&real).unwrap(), b"\x7fELF\x02\x01\x01rest");
+    }
+
+    #[test]
+    fn python_tree_script_sets_pythonpath_for_site_packages() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "usr/bin/tool",
+            b"#!/usr/bin/env python3\nimport tool\n",
+        );
+        // meta_with_app names the package "pkg"; the tree wrapper is
+        // now the routing for every interpreter script (#94), deps or
+        // not.
+        let meta = meta_with_app("tool", "usr/bin/tool", Some("python3"));
+
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
+
+        let wrapper = std::fs::read_to_string(script).unwrap();
+        assert!(
+            wrapper.contains("lib/python3.*/site-packages"),
+            "wrapper must put the tree's site-packages on PYTHONPATH: {wrapper}"
+        );
+        assert!(wrapper.contains("export PYTHONPATH"), "{wrapper}");
+        // Issue #9 criterion: a single exec that forwards the tool's
+        // arguments (`exec "$interpreter" "$script" "$@"`), with the
+        // script resolved through the #210 tree-target variable.
+        assert!(
+            wrapper.contains("exec \"python3\" \"$TREE\""),
+            "wrapper must exec the tree script: {wrapper}"
+        );
+        assert_eq!(
+            wrapper
+                .lines()
+                .filter(|l| l.trim_start().starts_with("exec "))
+                .count(),
+            1,
+            "wrapper must contain exactly one exec: {wrapper}"
+        );
+        assert!(
+            wrapper.trim_end().ends_with("\"$@\""),
+            "tree wrapper must forward the tool's arguments: {wrapper}"
+        );
+    }
+
+    #[test]
+    fn node_tree_script_forwards_args_without_pythonpath() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "lib/node_modules/tool/cli.js",
+            b"#!/usr/bin/env node\nrequire('dep')\n",
+        );
+        // A node interpreter app WITH a deps closure runs from the
+        // extension tree (ADR-0017) — issue #9's Node-style package. Node
+        // resolves modules by adjacency, so unlike python there is no
+        // PYTHONPATH block, but the args still forward.
+        let mut meta = meta_with_app("tool", "lib/node_modules/tool/cli.js", Some("node"));
+        meta.deps = Some(crate::snap::PackageDeps {
+            npm: None,
+            pip: None,
+            cargo: None,
+            go: None,
+        });
+
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
+
+        let wrapper = std::fs::read_to_string(script).unwrap();
+        assert!(
+            wrapper.contains("extensions/pkg/usr/lib/node_modules/tool/cli.real.js"),
+            "wrapper must exec the tree script: {wrapper}"
+        );
+        assert!(
+            !wrapper.contains("PYTHONPATH"),
+            "node needs no PYTHONPATH handoff: {wrapper}"
+        );
+        assert!(
+            wrapper.trim_end().ends_with("\"$@\""),
+            "tree wrapper must forward the tool's arguments: {wrapper}"
+        );
+    }
+
+    #[test]
+    fn native_elf_command_gets_no_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        // A minimal ELF magic-prefixed binary is enough — is_elf keys on
+        // the magic; the build path never wraps a real ELF.
+        let elf = stage_file(stage.path(), "bin/ztool", b"\x7fELF\x02\x01\x01rest");
+        let meta = meta_with_app("ztool", "bin/ztool", Some("node"));
+
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
+
+        // The command binary is untouched (still the ELF magic), and no
+        // sibling `.real` script was created.
+        assert_eq!(std::fs::read(&elf).unwrap(), b"\x7fELF\x02\x01\x01rest");
+        assert!(!stage.path().join("bin/ztool.real").exists());
+    }
+
+    #[test]
+    fn no_interpreter_means_no_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(stage.path(), "bin/plain", b"#!/bin/sh\necho hi\n");
+        let meta = meta_with_app("plain", "bin/plain", None);
+
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+        assert!(!stage.path().join("bin/plain.real").exists());
+    }
+
+    // ── Issue #90: shebang-resolved interpreter wrappers ──
+
+    /// A listings fixture: `payloads` maps package → basenames, `runtime`
+    /// names the runtime-closure members among them.
+    fn listings_fixture(
+        payloads: &[(&str, &[&str])],
+        runtime: &[&str],
+    ) -> crate::leak_scan::PayloadListings {
+        crate::leak_scan::PayloadListings {
+            payloads: payloads
+                .iter()
+                .map(|(pkg, files)| {
+                    (
+                        pkg.to_string(),
+                        files.iter().map(|f| f.to_string()).collect(),
+                    )
+                })
+                .collect(),
+            runtime: runtime.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    /// Perltidy's shape (issue #90): the command is a perl script with
+    /// shebang `#!/usr/bin/perl`, authored against the pod's root-mounted
+    /// closure. `perl` is a declared requires, so the wrapper family must
+    /// fire: the script is preserved at the `.real` sibling and the command
+    /// path becomes a wrapper execing the pod interpreter by bare name —
+    /// exactly what the farm's PATH provides.
+    #[test]
+    fn shebang_interpreter_from_requires_lands_a_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "usr/bin/perltidy",
+            b"#!/usr/bin/perl\nuse Perl::Tidy;\n",
+        );
+        let meta = meta_with_app("perltidy", "usr/bin/perltidy", None);
+        let listings = listings_fixture(
+            &[("perl", &["perl", "perldoc"]), ("glibc", &["ld.so"])],
+            &["glibc", "perl"],
+        );
+
+        emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap();
+
+        let wrapper = std::fs::read_to_string(&script).unwrap();
+        assert!(
+            wrapper.starts_with("#!/bin/sh\n")
+                && wrapper
+                    .contains("TREE=\"$PODROOT/active/extensions/pkg/usr/usr/bin/perltidy.real\"")
+                && wrapper.contains("exec \"perl\" \"$TREE\" \"$@\""),
+            "the command path must become a tree wrapper execing the requires \
+             interpreter by bare name from the extension tree (#94): {wrapper}"
+        );
+        assert!(
+            wrapper.contains("PODROOT=") && wrapper.trim_end().ends_with("\"$@\""),
+            "wrapper must derive the pod root and forward args: {wrapper}"
+        );
+        let real = stage.path().join("usr/bin/perltidy.real");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "#!/usr/bin/perl\nuse Perl::Tidy;\n",
+            "the original script must be preserved at the .real sibling"
+        );
+    }
+
+    /// Fail closed: the shebang interpreter resolves ONLY into a build-only
+    /// payload — nothing in the runtime closure provides it, so the wrapper
+    /// would be broken the moment it shipped.
+    #[test]
+    fn shebang_interpreter_from_build_only_payload_fails_closed() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        stage_file(
+            stage.path(),
+            "usr/bin/tool",
+            b"#!/usr/bin/python3\nimport buildtool\n",
+        );
+        let meta = meta_with_app("tool", "usr/bin/tool", None);
+        let listings = listings_fixture(
+            &[("python", &["python3"])],
+            // python is build-only here: not in the runtime set.
+            &[],
+        );
+
+        let err = emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("python3"), "names the interpreter: {msg}");
+        assert!(
+            msg.contains("build-only payload 'python'"),
+            "names the build-only provider: {msg}"
+        );
+    }
+
+    /// Fail closed: the shebang interpreter resolves to neither the payload
+    /// nor a declared requires — no merged payload provides it.
+    #[test]
+    fn shebang_interpreter_unresolvable_fails_closed() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        stage_file(stage.path(), "usr/bin/tool", b"#!/usr/bin/gone-lang\nx\n");
+        let meta = meta_with_app("tool", "usr/bin/tool", None);
+        let listings = listings_fixture(&[("perl", &["perl"])], &["perl"]);
+
+        let err = emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("gone-lang"), "names the interpreter: {msg}");
+        assert!(
+            msg.contains("neither the payload nor a declared requires"),
+            "states the fail-closed condition: {msg}"
+        );
+    }
+
+    /// A PATH-resolved shebang (`/usr/bin/env`) resolves from the farm
+    /// today — untouched, no wrapper, no error.
+    #[test]
+    fn shebang_env_script_stays_untouched() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "usr/bin/tool",
+            b"#!/usr/bin/env bash\necho hi\n",
+        );
+        let meta = meta_with_app("tool", "usr/bin/tool", None);
+        let listings = listings_fixture(&[], &[]);
+
+        emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            "#!/usr/bin/env bash\necho hi\n"
+        );
+        assert!(!stage.path().join("usr/bin/tool.real").exists());
+    }
+
+    /// An interpreter provided by the package's OWN payload resolves too:
+    /// the payload itself is one of the two accepted sources.
+    #[test]
+    fn shebang_interpreter_from_own_payload_lands_a_wrapper() {
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        stage_file(stage.path(), "usr/bin/perl", b"\x7fELF-perl");
+        let script = stage_file(stage.path(), "usr/bin/tool", b"#!/usr/bin/perl\nx\n");
+        let meta = meta_with_app("tool", "usr/bin/tool", None);
+        let listings = listings_fixture(&[("glibc", &["ld.so"])], &["glibc"]);
+
+        emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap();
+
+        let wrapper = std::fs::read_to_string(&script).unwrap();
+        assert!(
+            wrapper.starts_with("#!/bin/sh\n")
+                && wrapper
+                    .contains("TREE=\"$PODROOT/active/extensions/pkg/usr/usr/bin/tool.real\"")
+                && wrapper.contains("exec \"perl\" \"$TREE\" \"$@\""),
+            "own-payload interpreter wraps with the tree shape: {wrapper}"
+        );
+    }
+
+    /// Perltidy's real payload shape (issue #90): the script AND its perl
+    /// module tree (`usr/lib/perl5/...`) ship together. The wrapper must be
+    /// the tree shape — PERL5LIB re-pointing @INC at the extension tree's
+    /// module dirs, script exec'd from the tree — or Perl::Tidy.pm strands
+    /// on the farm even with a resolvable perl.
+    #[test]
+    fn shebang_perl_with_module_tree_gets_the_perl5lib_tree_wrapper() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let script = stage_file(
+            stage.path(),
+            "usr/bin/perltidy",
+            b"#!/usr/bin/perl\nuse Perl::Tidy;\n",
+        );
+        stage_file(
+            stage.path(),
+            "usr/lib/perl5/site_perl/5.40.5/Perl/Tidy.pm",
+            b"package Perl::Tidy; 1;\n",
+        );
+        stage_file(
+            stage.path(),
+            "usr/lib/perl5/site_perl/5.40.5/x86_64-linux-thread-multi/auto/.keep",
+            b"",
+        );
+        let meta = meta_with_app("perltidy", "usr/bin/perltidy", None);
+        let listings = listings_fixture(&[("perl", &["perl"])], &["perl"]);
+
+        emit_build_wrappers(&meta, stage.path(), &store, Some(&listings)).unwrap();
+
+        let wrapper = std::fs::read_to_string(&script).unwrap();
+        assert!(
+            wrapper.contains("PERL5LIB"),
+            "module-tree payloads must hand @INC to the farm wrapper: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("usr/lib/perl5/*/*/"),
+            "PERL5LIB must sweep the version and arch dirs under the \
+             extension tree's usr level: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("TREE=\"$PODROOT/active/extensions/pkg/usr/usr/bin/perltidy.real\""),
+            "the script must exec from the extension tree: {wrapper}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stage.path().join("usr/bin/perltidy.real")).unwrap(),
+            "#!/usr/bin/perl\nuse Perl::Tidy;\n",
+            "the original script must be preserved at the .real sibling"
+        );
+    }
+
+    // ── Issue #10 part B: native-ELF runtime-lib wrappers ──
+
+    /// True when a C compiler (`$CC` or `cc`) is available to build the
+    /// native-ELF fixtures.
+    fn cc_available() -> bool {
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+        std::process::Command::new(&cc)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Compile a tiny shared library (SONAME `lib<n>.so.1`) and an
+    /// executable linking it, into `stage/usr/lib` and `stage/usr/bin`.
+    /// Returns the app path. Gated on `cc_available()`.
+    fn build_c_fixture(stage: &Path, name: &str) -> Option<std::path::PathBuf> {
+        if !cc_available() {
+            return None;
+        }
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+        let libdir = stage.join("usr/lib");
+        let bindir = stage.join("usr/bin");
+        let srcdir = stage.join("src");
+        std::fs::create_dir_all(&libdir).unwrap();
+        std::fs::create_dir_all(&bindir).unwrap();
+        std::fs::create_dir_all(&srcdir).unwrap();
+        let sym = format!("lib{name}");
+        let hdr = srcdir.join(format!("{sym}.c"));
+        std::fs::write(&hdr, format!("int {name}_value(void){{ return 42; }}\n")).unwrap();
+        std::fs::write(
+            srcdir.join(format!("{name}.c")),
+            format!(
+                "#include <stdio.h>\nint {name}_value(void);\nint main(){{ printf(\"{name}-ran %d\\n\", {name}_value()); return 0; }}\n"
+            ),
+        )
+        .unwrap();
+        let so1 = libdir.join(format!("{sym}.so.1"));
+        let so = libdir.join(format!("{sym}.so"));
+        let status = std::process::Command::new(&cc)
+            .args([
+                "-shared",
+                "-fPIC",
+                &format!("-Wl,-soname,{sym}.so.1"),
+                "-o",
+                so1.to_str().unwrap(),
+                hdr.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "building shared lib failed");
+        // A non-symlink `lib<name>.so` (same bytes) so `-l<name>` links
+        // against it; the SONAME `lib<name>.so.1` is what the binary needs
+        // at runtime and what the bundled-lib detector keys on.
+        std::fs::copy(&so1, &so).unwrap();
+        let app = bindir.join(name);
+        let out = std::process::Command::new(&cc)
+            .args([
+                "-o",
+                app.to_str().unwrap(),
+                srcdir.join(format!("{name}.c")).to_str().unwrap(),
+                &format!("-L{}", libdir.display()),
+                &format!("-l{name}"),
+            ])
+            .output()
+            .unwrap();
+        if !out.status.success() {
+            panic!(
+                "linking app failed: {}\nlibdir={}\napp={}",
+                String::from_utf8_lossy(&out.stderr),
+                libdir.display(),
+                app.display(),
+            );
+        }
+        Some(app)
+    }
+
+    #[test]
+    fn is_shared_lib_name_matches_so_and_soname_variants() {
+        assert!(is_shared_lib_name("libjq.so"));
+        assert!(is_shared_lib_name("libjq.so.1"));
+        assert!(is_shared_lib_name("libonig.so.5.5.0"));
+        assert!(!is_shared_lib_name("jq"));
+        assert!(!is_shared_lib_name("libjq.a"));
+        assert!(!is_shared_lib_name("libjq.so.1.extra"));
+        assert!(!is_shared_lib_name(".so"));
+    }
+
+    #[test]
+    fn elf_needed_libs_reads_the_test_binary_dynamic_deps() {
+        // The test binary itself is a real native ELF with DT_NEEDED libs
+        // (libc at minimum); the parser must return names, not fail.
+        let exe = std::env::current_exe().unwrap();
+        let needed = elf_needed_libs(&exe);
+        assert!(needed.is_some(), "current exe must parse as ELF");
+        let needed = needed.unwrap();
+        assert!(!needed.is_empty(), "test binary must have DT_NEEDED libs");
+        assert!(
+            needed.iter().any(|n| n.contains("libc")),
+            "test binary must need libc, got {needed:?}"
+        );
+    }
+
+    #[test]
+    fn native_elf_with_bundled_lib_gets_wrapper() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let Some(app) = build_c_fixture(stage.path(), "jtool") else {
+            eprintln!("skipping: no C compiler available");
+            return;
+        };
+        let meta = meta_with_app("jtool", "usr/bin/jtool", None);
+
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
+
+        let wrapper = std::fs::read_to_string(&app).unwrap();
+        assert!(
+            wrapper.starts_with("#!/bin/sh"),
+            "native-ELF with bundled lib must be wrapped: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("LD_LIBRARY_PATH"),
+            "wrapper must set LD_LIBRARY_PATH: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("usr/lib"),
+            "wrapper must point at the payload lib dir: {wrapper}"
+        );
+        // The real ELF is preserved at the sibling `.real` path.
+        let real = app.with_file_name("jtool.real");
+        assert!(real.is_file(), "real ELF must be preserved as jtool.real");
+        let real_sha = sha256_file(&real).unwrap();
+        assert!(
+            wrapper.contains(&store.blob_path(&real_sha).display().to_string()),
+            "wrapper must exec the real binary's store blob: {wrapper}"
+        );
+    }
+
+    #[test]
+    fn native_elf_without_bundled_lib_gets_no_wrapper() {
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stage = tempfile::tempdir().unwrap();
+        let store = store_fixture(&stage.path().join("store"));
+        let Some(app) = build_c_fixture(stage.path(), "ktool") else {
+            eprintln!("skipping: no C compiler available");
+            return;
+        };
+        // Remove the bundled lib: the app now needs only system libs.
+        std::fs::remove_file(stage.path().join("usr/lib/libktool.so.1")).unwrap();
+        std::fs::remove_file(stage.path().join("usr/lib/libktool.so")).unwrap();
+        let meta = meta_with_app("ktool", "usr/bin/ktool", None);
+
+        emit_build_wrappers(&meta, stage.path(), &store, None).unwrap();
+
+        // Still the real ELF (magic), no `.real` sibling, no wrapper.
+        assert!(is_elf(&app), "app must remain a native ELF");
+        assert!(
+            !app.with_file_name("ktool.real").exists(),
+            "no .real sibling for a resolvable ELF"
+        );
+    }
+}
+
+// Moved back from the #326 carve: the caller (source verify in the root
+// fetch path) stayed build-side; only the lockfile warners went chart-side.
+/// Verify a downloaded single-source tarball against its pin (issue
+/// #175). A locked source enforces the pin exactly: changed bytes
+/// refuse. A FLOATING source re-resolves instead — its recorded pin is
+/// a moving target by design (sync re-resolves it the same way), so a
+/// mismatch warns and continues; the computed hash rides out as the
+/// build's `SourceInfo`, which the pod reconcile restamps into the
+/// lockfile after the rebuild lands (TOFU: the record follows the
+/// bytes actually built). An unpinned source keeps the legacy
+/// pin-suggestion notice.
+fn verify_source_download(
+    meta: &SnapMeta,
+    spec: &SourceSpec,
+    url: &str,
+    computed: &str,
+) -> miette::Result<()> {
+    let Some(expected) = spec.expected_sha256() else {
+        if !output::is_json() {
+            output::info(format!(
+                "source hash: {:.16}... (add to source.sha256 to pin)",
+                computed
+            ));
+        }
+        return Ok(());
+    };
+    if computed == expected {
+        output::ok(format!("SHA-256 verified: {:.16}...", computed));
+        return Ok(());
+    }
+    if meta.floating {
+        output::warn(format!(
+            "floating source of {} re-resolved: {:.12}… → {:.12}… (restamping the pin)",
+            meta.name, expected, computed
+        ));
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "SHA-256 mismatch for {}:\n  expected: {}\n  got:      {}",
+        url,
+        expected,
+        computed
+    ))
+}

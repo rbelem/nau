@@ -676,7 +676,7 @@ mod tests {
                 plugin_options: Some(
                     [(
                         "target".to_string(),
-                        crate::plugins::PluginValue::Str("all".into()),
+                        nau_core::plugins::PluginValue::Str("all".into()),
                     )]
                     .into_iter()
                     .collect(),
@@ -706,7 +706,7 @@ mod tests {
                     [
                         (
                             "variables".to_string(),
-                            crate::plugins::PluginValue::Map(
+                            nau_core::plugins::PluginValue::Map(
                                 [
                                     ("ZED".to_string(), "1".to_string()),
                                     ("ALPHA".to_string(), "2".to_string()),
@@ -717,7 +717,7 @@ mod tests {
                         ),
                         (
                             "install".to_string(),
-                            crate::plugins::PluginValue::Bool(false),
+                            nau_core::plugins::PluginValue::Bool(false),
                         ),
                     ]
                     .into_iter()
@@ -779,7 +779,7 @@ mod tests {
             .plugin_options = Some(
             [(
                 "target".to_string(),
-                crate::plugins::PluginValue::Str("all".into()),
+                nau_core::plugins::PluginValue::Str("all".into()),
             )]
             .into(),
         );
@@ -797,7 +797,7 @@ mod tests {
             .plugin_options = Some(
             [(
                 "target".to_string(),
-                crate::plugins::PluginValue::Str("install".into()),
+                nau_core::plugins::PluginValue::Str("install".into()),
             )]
             .into(),
         );
@@ -827,7 +827,7 @@ mod tests {
             Some(
                 [(
                     "variables".to_string(),
-                    crate::plugins::PluginValue::Map(
+                    nau_core::plugins::PluginValue::Map(
                         [("CFLAGS".to_string(), value.to_string())]
                             .into_iter()
                             .collect(),
@@ -863,7 +863,7 @@ mod tests {
         part.plugin_options = Some(
             [(
                 "install".to_string(),
-                crate::plugins::PluginValue::Bool(false),
+                nau_core::plugins::PluginValue::Bool(false),
             )]
             .into_iter()
             .collect(),
@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn test_pinned_member_from_lock_data() {
         // Lock-only data (no I/O, works offline) resolves pin + content hash.
-        let mut lock = crate::lock::LockFile {
+        let mut lock = nau_core::lock::LockFile {
             version: 1,
             sources: std::collections::HashMap::new(),
             snaps: std::collections::HashMap::new(),

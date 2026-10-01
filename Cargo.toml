@@ -9,7 +9,12 @@ license = "GPL-3.0-only"
 # the lib's domain seams peel off into member crates one per PR. resolver
 # "2" is implied by the root package's edition 2021, pinned here explicitly.
 [workspace]
-members = ["crates/nau-core", "crates/nau-infra", "crates/nau-chart"]
+members = [
+    "crates/nau-core",
+    "crates/nau-infra",
+    "crates/nau-chart",
+    "crates/nau-build",
+]
 resolver = "2"
 
 [dependencies]
@@ -24,6 +29,11 @@ nau-infra = { path = "crates/nau-infra" }
 # check/lint/audit/lock/index/deps. May depend on nau-core and nau-infra
 # only — never sideways; the root composes every domain.
 nau-chart = { path = "crates/nau-chart" }
+# The build domain (issue #326 PR 2): the snap build machinery, the build
+# cache, merged build prefixes, the leak scan, the source cache. May
+# depend on nau-core and nau-infra only — never sideways; the root
+# composes every domain.
+nau-build = { path = "crates/nau-build" }
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["luau"] }
 miette = { version = "7", features = ["fancy"] }

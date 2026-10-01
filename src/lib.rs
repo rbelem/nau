@@ -8,10 +8,8 @@ pub use nau_chart::{
 pub mod assert;
 pub mod boot_test;
 pub mod build_orch;
-pub mod build_prefix;
 pub mod build_sched;
 pub mod ca;
-pub mod cache;
 pub mod cli;
 pub mod command;
 pub mod commands;
@@ -41,10 +39,15 @@ pub mod serve;
 pub mod services;
 pub mod sign;
 pub mod slot_recovery;
-pub mod snap;
+// The build domain (issue #326 PR 2): snap/cache/build_prefix/
+// source_cache moved to nau-build; the plain re-export keeps every
+// `crate::<module>::` path resolving. snap and leak_scan stay root shim
+// FILES instead (they also carry chart-side re-exports, respectively the
+// root-only `listings_for_build`) — see src/snap.rs, src/leak_scan.rs.
+pub use nau_build::{build_prefix, cache, source_cache};
 pub use nau_core::manifest_ir;
 pub use nau_core::snap_types;
-pub mod source_cache;
+pub mod snap;
 pub mod ssh_exec;
 pub mod store;
 #[cfg(test)]
