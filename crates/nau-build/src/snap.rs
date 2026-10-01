@@ -3626,18 +3626,12 @@ pub fn ensure_cgo_toolchain(
     Ok(())
 }
 
-/// The process PATH split into absolute directory entries. Relative and
-/// empty entries are dropped — the sandbox only ever mirrors absolute host
-/// paths.
-pub fn path_entries() -> Vec<PathBuf> {
-    std::env::var("PATH")
-        .map(|p| {
-            std::env::split_paths(&p)
-                .filter(|e| e.is_absolute())
-                .collect()
-        })
-        .unwrap_or_default()
-}
+/// The PATH-search mechanism moved to `nau_infra::pathsearch` (issue #326
+/// PR 3 down-move: generic host mechanism, consumed by the image domain
+/// and the doctor too). Re-exported so every `crate::snap::path_entries` /
+/// `crate::snap::resolve_in_path` path — including this module's sandbox
+/// plumbing — keeps resolving.
+pub use nau_infra::pathsearch::{path_entries, resolve_in_path};
 
 /// True if `path` lives under a sandbox bind root ([`SANDBOX_RO_ROOTS`])
 /// — the sandbox binds those roots at the same host path, so anything
@@ -3685,20 +3679,6 @@ pub fn sandbox_visible_entries_with(entries: &[PathBuf], extra_roots: &[PathBuf]
 pub fn sandbox_path(extra_roots: &[PathBuf]) -> std::ffi::OsString {
     let entries = sandbox_visible_entries_with(&path_entries(), extra_roots);
     std::env::join_paths(entries).unwrap_or_default()
-}
-
-/// First existing, executable match for `name` in `entries` (PATH order —
-/// the same resolution `sh` performs).
-pub fn resolve_in_path(name: &str, entries: &[PathBuf]) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    entries
-        .iter()
-        .map(|entry| entry.join(name))
-        .find(|candidate| {
-            std::fs::metadata(candidate)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        })
 }
 
 /// Shell keywords and POSIX sh builtins — never resolved through PATH.
@@ -10864,22 +10844,6 @@ fi
             PathBuf::from("/nix/store/00000000000000000000000000000000-gnumake-4.4.1/bin"),
         ];
         assert_eq!(sandbox_visible_entries(&entries), vec![bound_root]);
-    }
-
-    #[test]
-    fn resolve_in_path_follows_path_order_and_checks_exec() {
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        write_exec(first.path(), "tool-probe");
-        let entries = vec![second.path().to_path_buf(), first.path().to_path_buf()];
-        assert_eq!(
-            resolve_in_path("tool-probe", &entries),
-            Some(first.path().join("tool-probe"))
-        );
-        // A non-executable file is not resolved.
-        std::fs::write(first.path().join("plain"), "").unwrap();
-        assert_eq!(resolve_in_path("plain", &entries), None);
-        assert_eq!(resolve_in_path("absent", &entries), None);
     }
 
     #[test]

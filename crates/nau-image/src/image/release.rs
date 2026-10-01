@@ -34,7 +34,7 @@
 //!
 //! The signed body is [`super::verify::image_manifest_canonical_bytes`] —
 //! the typed image manifest serialized with the signatures map emptied —
-//! NEVER the eval manifest's [`crate::sign::eval_manifest_canonical_bytes`]
+//! NEVER the eval manifest's [`nau_core::sign::eval_manifest_canonical_bytes`]
 //! (a different type, a different scheme; the eval signer is named for
 //! what it signs so this sentence can be checked mechanically). The
 //! signature is a bare base64 Ed25519 entry under the operator key's id,
@@ -45,7 +45,7 @@
 //!
 //! The SHA256SUMS signature is deliberately NOT part of that scheme
 //! family: systemd-sysupdate enforces it itself (OpenPGP, raw bytes — no
-//! canonicalization), via [`crate::sign::sign_sysupdate_manifest`].
+//! canonicalization), via [`crate::sysupdate::sign_sysupdate_manifest`].
 //!
 //! # The baked-in release checklist (ADR-0044 D8)
 //!
@@ -159,10 +159,10 @@ pub(crate) fn update_payloads(
 /// map), so re-signing under a successor key is a plain second call.
 pub fn sign_image_manifest(
     manifest: &mut ImageManifest,
-    kp: &crate::sign::KeyPair,
+    kp: &nau_core::sign::KeyPair,
 ) -> miette::Result<()> {
     let canonical = super::verify::image_manifest_canonical_bytes(manifest)?;
-    let signature = crate::sign::sign_bytes(&canonical, kp);
+    let signature = nau_core::sign::sign_bytes(&canonical, kp);
     manifest
         .signatures
         .insert(kp.key_id(), serde_json::Value::String(signature));
@@ -180,7 +180,7 @@ pub fn sign_image_manifest(
 /// ([`super::verify::operator_home`], #285/#293 item 8) — an unset HOME
 /// refuses instead of anchoring trust from the CWD.
 pub fn publish(
-    runner: &dyn crate::command::CommandRunner,
+    runner: &dyn nau_infra::command::CommandRunner,
     img: &Path,
     manifest: &ImageManifest,
     arch: &str,
@@ -199,7 +199,7 @@ pub fn publish(
         &dir,
         &img_name,
         &manifest_name,
-        &crate::sign::keys_dir(&home),
+        &nau_core::sign::keys_dir(&home),
         super::verity::find_veritysetup().as_deref(),
         super::verity::find_host_tool("mcopy").as_deref(),
         &kp,
@@ -229,14 +229,14 @@ pub fn publish(
 /// hurry; a set that cannot verify its own bytes is not a release.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn self_check(
-    runner: &dyn crate::command::CommandRunner,
+    runner: &dyn nau_infra::command::CommandRunner,
     dir: &Path,
     img_name: &str,
     manifest_name: &str,
     keys_dir: &Path,
     veritysetup: Option<&Path>,
     mcopy: Option<&Path>,
-    kp: &crate::sign::KeyPair,
+    kp: &nau_core::sign::KeyPair,
 ) -> miette::Result<()> {
     let args = super::VerifyImageArgs {
         device: dir.join(img_name),
@@ -248,11 +248,11 @@ pub(crate) fn self_check(
     let sums = std::fs::read(dir.join("SHA256SUMS"))
         .into_diagnostic()
         .wrap_err("reading the published SHA256SUMS")?;
-    let sig = std::fs::read(dir.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME))
+    let sig = std::fs::read(dir.join(crate::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME))
         .into_diagnostic()
         .wrap_err("reading the published SHA256SUMS signature")?;
-    let pubring = crate::sign::import_pubring_pgp(kp)?;
-    crate::sign::verify_sysupdate_manifest_signature(&pubring, &sums, &sig)?;
+    let pubring = crate::sysupdate::import_pubring_pgp(kp)?;
+    crate::sysupdate::verify_sysupdate_manifest_signature(&pubring, &sums, &sig)?;
     eprintln!(
         "  ✓ release self-check passed in-process: verify-image device policy \
          over the published set (slot {}, roothash {}…) and the device-side \
@@ -276,7 +276,7 @@ pub(crate) fn publish_with(
     arch: &str,
     args: &ReleaseArgs,
     payloads: &[ReleasePayload],
-) -> miette::Result<(PathBuf, String, String, crate::sign::KeyPair)> {
+) -> miette::Result<(PathBuf, String, String, nau_core::sign::KeyPair)> {
     // The signing key is the same ceremony key the build already demanded
     // for update_source images: load fail-closed, never mint.
     let kp = super::load_signing_key_fail_closed(home)?;
@@ -343,7 +343,7 @@ fn publish_payloads(dir: &Path, payloads: &[ReleasePayload]) -> miette::Result<(
 }
 
 /// Write `SHA256SUMS` + its detached OpenPGP signature
-/// ([`crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME`], #267) under
+/// ([`crate::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME`], #267) under
 /// `dir`, returning the sums body the signature covers.
 fn write_sums_and_signature(
     dir: &Path,
@@ -352,15 +352,15 @@ fn write_sums_and_signature(
     manifest_json: &[u8],
     manifest_name: &str,
     payloads: &[ReleasePayload],
-    kp: &crate::sign::KeyPair,
+    kp: &nau_core::sign::KeyPair,
 ) -> miette::Result<String> {
     let sums_body = sha256sums_body(img, img_name, manifest_json, manifest_name, payloads)?;
     let sums_path = dir.join("SHA256SUMS");
     std::fs::write(&sums_path, &sums_body)
         .into_diagnostic()
         .wrap_err_with(|| format!("writing {}", sums_path.display()))?;
-    let sums_sig = crate::sign::sign_sysupdate_manifest(kp, sums_body.as_bytes())?;
-    let sums_sig_path = dir.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
+    let sums_sig = crate::sysupdate::sign_sysupdate_manifest(kp, sums_body.as_bytes())?;
+    let sums_sig_path = dir.join(crate::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME);
     std::fs::write(&sums_sig_path, &sums_sig)
         .into_diagnostic()
         .wrap_err_with(|| format!("writing {}", sums_sig_path.display()))?;
@@ -373,7 +373,7 @@ fn write_sums_and_signature(
 fn write_published_manifest(
     dir: &Path,
     manifest: &ImageManifest,
-    kp: &crate::sign::KeyPair,
+    kp: &nau_core::sign::KeyPair,
     manifest_name: &str,
 ) -> miette::Result<String> {
     let mut published = manifest.clone();
@@ -417,7 +417,7 @@ fn report_media_set(
     img_name: &str,
     manifest_name: &str,
     payloads: &[ReleasePayload],
-    kp: &crate::sign::KeyPair,
+    kp: &nau_core::sign::KeyPair,
 ) {
     let epoch = std::env::var("SOURCE_DATE_EPOCH").unwrap_or_else(|_| "<unset>".into());
     eprintln!(
@@ -432,7 +432,7 @@ fn report_media_set(
     eprintln!("      SHA256SUMS");
     eprintln!(
         "      {}  (Verify=yes anchor: import-pubring.pgp in the base rootfs)",
-        crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME
+        crate::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME
     );
     if !payloads.is_empty() {
         eprintln!(
@@ -441,7 +441,7 @@ fn report_media_set(
              SHA256SUMS and every MatchPattern name RELATIVE to the transfer's \
              Path= (the update_source URL), so this directory is the served \
              update root (#274).",
-            crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME
+            crate::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME
         );
     }
     eprintln!(
@@ -495,10 +495,10 @@ mod tests {
     /// The canonical test keypair (deterministic seed) — the same helper
     /// verify.rs's tests use, so both sides of the round-trip share one
     /// key shape.
-    fn test_kp(seed_byte: u8) -> crate::sign::KeyPair {
+    fn test_kp(seed_byte: u8) -> nau_core::sign::KeyPair {
         let seed = [seed_byte; 32];
         let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-        crate::sign::KeyPair {
+        nau_core::sign::KeyPair {
             seed,
             public: sk.verifying_key().to_bytes(),
         }
@@ -548,13 +548,13 @@ mod tests {
         let home = dir.path().join(tag);
         std::fs::create_dir_all(&home).unwrap();
         // The ceremony key lives at <home>/.config/nau/secret-key.
-        let keys = crate::sign::secret_key_path(&home);
+        let keys = nau_core::sign::secret_key_path(&home);
         std::fs::create_dir_all(keys.parent().unwrap()).unwrap();
         (dir, home)
     }
 
-    fn write_secret_key(home: &Path, kp: &crate::sign::KeyPair) {
-        let path = crate::sign::secret_key_path(home);
+    fn write_secret_key(home: &Path, kp: &nau_core::sign::KeyPair) {
+        let path = nau_core::sign::secret_key_path(home);
         std::fs::write(
             &path,
             format!(
@@ -592,9 +592,9 @@ mod tests {
     #[test]
     fn release_signature_verifies_through_the_verify_side_seam() {
         let (_guard, home) = temp_home("home");
-        let keys_dir = crate::sign::keys_dir(&home);
+        let keys_dir = nau_core::sign::keys_dir(&home);
         let kp = test_kp(7);
-        crate::sign::install_public_key(&kp, &keys_dir).unwrap();
+        nau_core::sign::install_public_key(&kp, &keys_dir).unwrap();
 
         let mut m = manifest();
         sign_image_manifest(&mut m, &kp).unwrap();
@@ -609,9 +609,9 @@ mod tests {
     #[test]
     fn release_signature_covers_the_canonical_body_tamper_refuses() {
         let (_guard, home) = temp_home("home");
-        let keys_dir = crate::sign::keys_dir(&home);
+        let keys_dir = nau_core::sign::keys_dir(&home);
         let kp = test_kp(7);
-        crate::sign::install_public_key(&kp, &keys_dir).unwrap();
+        nau_core::sign::install_public_key(&kp, &keys_dir).unwrap();
 
         let mut m = manifest();
         sign_image_manifest(&mut m, &kp).unwrap();
@@ -630,9 +630,9 @@ mod tests {
     #[test]
     fn foreign_anchor_refuses_a_release_signature() {
         let (_guard, home) = temp_home("home");
-        let keys_dir = crate::sign::keys_dir(&home);
+        let keys_dir = nau_core::sign::keys_dir(&home);
         // Anchored on a DIFFERENT operator key than the signer.
-        crate::sign::install_public_key(&test_kp(9), &keys_dir).unwrap();
+        nau_core::sign::install_public_key(&test_kp(9), &keys_dir).unwrap();
 
         let mut m = manifest();
         sign_image_manifest(&mut m, &test_kp(7)).unwrap();
@@ -642,9 +642,9 @@ mod tests {
     #[test]
     fn revoked_signer_refuses_before_any_anchor_check() {
         let (_guard, home) = temp_home("home");
-        let keys_dir = crate::sign::keys_dir(&home);
+        let keys_dir = nau_core::sign::keys_dir(&home);
         let kp = test_kp(7);
-        crate::sign::install_public_key(&kp, &keys_dir).unwrap();
+        nau_core::sign::install_public_key(&kp, &keys_dir).unwrap();
         // ADR-0024 §4: the revocation list outranks the anchor set.
         std::fs::write(keys_dir.join("revoked-keys"), format!("{}\n", kp.key_id())).unwrap();
 
@@ -661,8 +661,8 @@ mod tests {
     #[test]
     fn unsigned_body_never_verifies_even_with_anchors() {
         let (_guard, home) = temp_home("home");
-        let keys_dir = crate::sign::keys_dir(&home);
-        crate::sign::install_public_key(&test_kp(7), &keys_dir).unwrap();
+        let keys_dir = nau_core::sign::keys_dir(&home);
+        nau_core::sign::install_public_key(&test_kp(7), &keys_dir).unwrap();
         assert!(super::verify::verify_manifest_signature_at(&manifest(), None, &keys_dir).is_err());
     }
 
@@ -737,7 +737,7 @@ mod tests {
         for name in [
             "nau-cassini-1.0.0-amd64.manifest.json".to_string(),
             "SHA256SUMS".to_string(),
-            crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME.to_string(),
+            crate::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME.to_string(),
             format!("root_{FIXTURE_VERSION}_{data_guid}.img"),
             format!("verity-hash_{FIXTURE_VERSION}_{hash_guid}.img"),
             format!("{FIXTURE_IMAGE_NAME}_{FIXTURE_VERSION}.efi"),
@@ -757,17 +757,18 @@ mod tests {
         // the exact release output.
         let (_g, _h, dir, _a, _payload_names) = publish_fixture("release");
         let sums = std::fs::read(dir.join("SHA256SUMS")).unwrap();
-        let sig = std::fs::read(dir.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME)).unwrap();
+        let sig =
+            std::fs::read(dir.join(crate::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME)).unwrap();
         assert!(!sig.is_empty(), "a published release carries a signature");
-        let pubring = crate::sign::import_pubring_pgp(&test_kp(7)).unwrap();
-        crate::sign::verify_sysupdate_manifest_signature(&pubring, &sums, &sig)
+        let pubring = crate::sysupdate::import_pubring_pgp(&test_kp(7)).unwrap();
+        crate::sysupdate::verify_sysupdate_manifest_signature(&pubring, &sums, &sig)
             .expect("the published SHA256SUMS.gpg verifies under the ceremony anchor");
 
         // A tampered SHA256SUMS refuses BY NAME.
         let mut tampered = sums.clone();
         let last = tampered.len() - 2;
         tampered[last] ^= 0x01;
-        let err = crate::sign::verify_sysupdate_manifest_signature(&pubring, &tampered, &sig)
+        let err = crate::sysupdate::verify_sysupdate_manifest_signature(&pubring, &tampered, &sig)
             .expect_err("tampered sysupdate manifest must refuse");
         assert!(
             format!("{err:#}").contains("SHA256SUMS"),
@@ -847,9 +848,10 @@ mod tests {
         // The signed sums body — read from the published file its .gpg
         // covers, signature verified against the ceremony anchor first.
         let sums = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap();
-        let sig = std::fs::read(dir.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME)).unwrap();
-        let pubring = crate::sign::import_pubring_pgp(&test_kp(7)).unwrap();
-        crate::sign::verify_sysupdate_manifest_signature(&pubring, sums.as_bytes(), &sig)
+        let sig =
+            std::fs::read(dir.join(crate::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME)).unwrap();
+        let pubring = crate::sysupdate::import_pubring_pgp(&test_kp(7)).unwrap();
+        crate::sysupdate::verify_sysupdate_manifest_signature(&pubring, sums.as_bytes(), &sig)
             .expect("the sums carrying the MatchPattern contract are the signed ones");
         let names: Vec<&str> = sums
             .lines()
@@ -997,8 +999,8 @@ mod tests {
         assert_eq!(m.signatures.len(), 2, "DUAL-signature shape");
 
         let (_guard, home) = temp_home("home");
-        let keys_dir = crate::sign::keys_dir(&home);
-        crate::sign::install_public_key(&new, &keys_dir).unwrap();
+        let keys_dir = nau_core::sign::keys_dir(&home);
+        nau_core::sign::install_public_key(&new, &keys_dir).unwrap();
         // ANY-anchor: the successor key alone satisfies the device policy.
         let key_id = super::verify::verify_manifest_signature_at(&m, None, &keys_dir).unwrap();
         assert_eq!(key_id, new.key_id());
@@ -1077,12 +1079,12 @@ mod tests {
         }
     }
 
-    impl crate::command::CommandRunner for FakeTools {
-        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+    impl nau_infra::command::CommandRunner for FakeTools {
+        fn run(&self, argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
             let tool = argv.first().map(String::as_str).unwrap_or("");
             let out = if tool.ends_with("veritysetup") {
-                crate::command::RunnerOutput {
+                nau_infra::command::RunnerOutput {
                     code: self.verity_code,
                     stdout: Vec::new(),
                     stderr: "hash mismatch".to_string(),
@@ -1093,7 +1095,7 @@ mod tests {
                     .iter()
                     .map(|n| format!("::/EFI/Linux/{n}\n"))
                     .collect::<String>();
-                crate::command::RunnerOutput {
+                nau_infra::command::RunnerOutput {
                     code: self.mdir_code,
                     stdout: stdout.into_bytes(),
                     stderr: if self.mdir_code == 0 {
@@ -1107,20 +1109,20 @@ mod tests {
                     Some(bytes) => {
                         std::fs::write(argv.last().expect("mcopy target"), bytes)
                             .expect("fake mcopy write");
-                        crate::command::RunnerOutput {
+                        nau_infra::command::RunnerOutput {
                             code: 0,
                             stdout: Vec::new(),
                             stderr: String::new(),
                         }
                     }
-                    None => crate::command::RunnerOutput {
+                    None => nau_infra::command::RunnerOutput {
                         code: 1,
                         stdout: Vec::new(),
                         stderr: "File \"::/EFI/Linux/…\" not found".to_string(),
                     },
                 }
             } else {
-                crate::command::RunnerOutput {
+                nau_infra::command::RunnerOutput {
                     code: 0,
                     stdout: self.sfdisk_body.clone().into_bytes(),
                     stderr: String::new(),
@@ -1156,7 +1158,7 @@ mod tests {
     /// keychain dir, signing key).
     fn self_check_fixture(
         tag: &str,
-    ) -> (tempfile::TempDir, PathBuf, PathBuf, crate::sign::KeyPair) {
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, nau_core::sign::KeyPair) {
         let work = tempfile::tempdir().unwrap();
         let release = work.path().join(tag);
         std::fs::create_dir_all(&release).unwrap();
@@ -1179,17 +1181,17 @@ mod tests {
         // The published sums + their detached signature (the release shape).
         let sums = "deadbeefdeadbeef  some-file\n";
         std::fs::write(release.join("SHA256SUMS"), sums).unwrap();
-        let sig = crate::sign::sign_sysupdate_manifest(&kp, sums.as_bytes()).unwrap();
+        let sig = crate::sysupdate::sign_sysupdate_manifest(&kp, sums.as_bytes()).unwrap();
         std::fs::write(
-            release.join(crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME),
+            release.join(crate::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME),
             sig,
         )
         .unwrap();
         // The keychain the release signed under — anchors installed.
         let keys_home = work.path().join("keys-home");
         std::fs::create_dir_all(&keys_home).unwrap();
-        let keys = crate::sign::keys_dir(&keys_home);
-        crate::sign::install_public_key(&kp, &keys).unwrap();
+        let keys = nau_core::sign::keys_dir(&keys_home);
+        nau_core::sign::install_public_key(&kp, &keys).unwrap();
         (work, release, keys, kp)
     }
 
@@ -1331,8 +1333,8 @@ mod tests {
         let foreign = test_kp(9);
         let foreign_home = _work.path().join("foreign-home");
         std::fs::create_dir_all(&foreign_home).unwrap();
-        let foreign_keys = crate::sign::keys_dir(&foreign_home);
-        crate::sign::install_public_key(&foreign, &foreign_keys).unwrap();
+        let foreign_keys = nau_core::sign::keys_dir(&foreign_home);
+        nau_core::sign::install_public_key(&foreign, &foreign_keys).unwrap();
         let runner = FakeTools::new(golden_gpt_json(), 0);
         assert!(
             self_check(

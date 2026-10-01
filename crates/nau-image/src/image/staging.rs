@@ -6,7 +6,7 @@ use miette::{IntoDiagnostic, WrapErr};
 use serde::Deserialize;
 
 use super::*;
-use crate::store::{ResolvedSnap, StoreClient};
+use nau_infra::store::{ResolvedSnap, StoreClient};
 
 // ── ADR-0019: base-aware kernel/gadget resolution ──
 
@@ -72,11 +72,11 @@ pub(crate) fn check_declared_base(
 /// The unsquashfs argv[0] (issue #101 seam): resolved through the tools
 /// module (provisioned-first, PATH fallback).
 fn unsquashfs_argv0() -> miette::Result<String> {
-    let resolved = crate::tools::resolve(crate::tools::ToolName::Unsquashfs)
+    let resolved = nau_infra::tools::resolve(nau_infra::tools::ToolName::Unsquashfs)
         .map_err(|e| miette::miette!("resolve unsquashfs: {e}"))?;
     Ok(match resolved {
-        crate::tools::ResolvedTool::Provisioned { path, .. }
-        | crate::tools::ResolvedTool::Path { path, .. } => path.to_string_lossy().into_owned(),
+        nau_infra::tools::ResolvedTool::Provisioned { path, .. }
+        | nau_infra::tools::ResolvedTool::Path { path, .. } => path.to_string_lossy().into_owned(),
     })
 }
 
@@ -177,8 +177,8 @@ fn resolve_image_snaps(
     // the CWD (the same seam the eval worker uses). Loaded once per build.
     let index_path = std::env::var("NAU_INDEX_PATH")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
-    let image_index = crate::index::PackageIndex::load_or_default(&index_path).ok();
+        .unwrap_or_else(|_| std::path::PathBuf::from(nau_core::index::DEFAULT_INDEX));
+    let image_index = nau_core::index::PackageIndex::load_or_default(&index_path).ok();
 
     let mut entries: Vec<(&SnapRef, SnapRole)> = vec![(&image.base, SnapRole::Base)];
     if let Some(ref k) = image.kernel {
@@ -364,16 +364,16 @@ fn resolve_image_snaps(
 /// Returns `Some(resolved)` when the pin was used; the caller then skips
 /// store resolution for this snap.
 fn try_index_pin(
-    entry: &crate::index::IndexEntry,
-    pins: &HashMap<String, crate::index::PinEntry>,
+    entry: &nau_core::index::IndexEntry,
+    pins: &HashMap<String, nau_core::index::PinEntry>,
     local_name: &str,
     arch: &str,
     effective_channel: &str,
     cache_dir: &Path,
 ) -> Option<ResolvedSnap> {
-    let Some(pin_entry) = crate::index::PackageIndex::channel_pin(pins, arch, effective_channel)
+    let Some(pin_entry) = nau_core::index::PackageIndex::channel_pin(pins, arch, effective_channel)
     else {
-        if crate::index::PackageIndex::has_arch_pins(pins, arch) {
+        if nau_core::index::PackageIndex::has_arch_pins(pins, arch) {
             eprintln!(
                 "  ⚠ {local_name}: index pins exist but none for channel \
                  '{effective_channel}' — not trusting them (issue #69)"
@@ -564,7 +564,7 @@ fn anchor_elf_to_guest(
             return Err(miette::miette!("cannot inspect {label} with patchelf: {e}"));
         }
     };
-    if crate::command::exit_code(&out) != 0 {
+    if nau_infra::command::exit_code(&out) != 0 {
         eprintln!("  ℹ {label}: not a dynamically linked ELF — no guest anchoring needed");
         return Ok(());
     }
@@ -616,7 +616,7 @@ fn apply_rpath_only(
             staged_str.to_string(),
         ])
         .map_err(|e| miette::miette!("patchelf failed: {e}"))?;
-    if crate::command::exit_code(&out) != 0 {
+    if nau_infra::command::exit_code(&out) != 0 {
         return Err(miette::miette!(
             "patchelf could not set the RUNPATH of {label} to '{dir}' — \
              refusing to ship a binary whose dependencies cannot resolve in \
@@ -663,7 +663,7 @@ fn rewrite_interpreter(
     let out = runner
         .run(&argv)
         .map_err(|e| miette::miette!("patchelf failed: {e}"))?;
-    if crate::command::exit_code(&out) != 0 {
+    if nau_infra::command::exit_code(&out) != 0 {
         return Err(miette::miette!(
             "patchelf could not re-anchor {label} to '{guest}' — refusing to \
              ship a binary the guest cannot exec (#81)"
@@ -849,13 +849,13 @@ fn bless_tooling_version(runner: &dyn CommandRunner, bless: &Path) -> miette::Re
                 bless.display()
             )
         })?;
-    if crate::command::exit_code(&out) != 0 {
+    if nau_infra::command::exit_code(&out) != 0 {
         return Err(miette::miette!(
             "the host's systemd-bless-boot ({}) exited {} on --version — \
              refusing to stage tooling whose version cannot be proven (#85, \
              gate #79)",
             bless.display(),
-            crate::command::exit_code(&out),
+            nau_infra::command::exit_code(&out),
         ));
     }
     let major = systemd_major_from_version_output(&String::from_utf8_lossy(&out.stdout))
@@ -933,7 +933,7 @@ fn resolve_tooling_lib(
             staged_lib.to_string_lossy().into_owned(),
         ])
         .map_err(|e| miette::miette!("patchelf failed: {e}"))?;
-    if crate::command::exit_code(&out) != 0 {
+    if nau_infra::command::exit_code(&out) != 0 {
         return Err(miette::miette!(
             "patchelf could not strip the host RUNPATH from the staged \
              libsystemd-shared-{major}.so — refusing to ship host store paths \
@@ -1066,7 +1066,7 @@ fn locate_generator(
 /// resolved path is read from stdout — an empty one is not a hit).
 fn which(runner: &dyn CommandRunner, name: &str) -> Option<PathBuf> {
     let out = runner.run(&["which".to_string(), name.to_string()]).ok()?;
-    if crate::command::exit_code(&out) != 0 {
+    if nau_infra::command::exit_code(&out) != 0 {
         return None;
     }
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1583,7 +1583,7 @@ fn run_base_unsquashfs(
     let out = runner
         .run(&argv)
         .map_err(|e| miette::miette!("unsquashfs not found: {e}"))?;
-    let exit_code = crate::command::exit_code(&out);
+    let exit_code = nau_infra::command::exit_code(&out);
     if exit_code >= 128 {
         return Err(match policy {
             KernelPayloadPolicy::BestEffort => {
@@ -1713,7 +1713,7 @@ fn build_native_initramfs_for_snap(
 ) -> miette::Result<PathBuf> {
     let version = payload.version.as_str();
     let modules_root = kernel_dir.join("modules").join(version);
-    let config = crate::doctor::find_kernel_config(kernel_dir, version).ok_or_else(|| {
+    let config = crate::audit::find_kernel_config(kernel_dir, version).ok_or_else(|| {
         miette::miette!(
             "no kernel config found under {} for {version} — cannot derive the \
              initramfs boot-chain modules, so refusing to build an initramfs \
@@ -1745,7 +1745,7 @@ fn unsquashfs_kernel(
     let out = runner
         .run(&argv)
         .map_err(|e| miette::miette!("unsquashfs: {e}"))?;
-    if crate::command::exit_code(&out) < 128 {
+    if nau_infra::command::exit_code(&out) < 128 {
         return Ok(true);
     }
     match policy {
@@ -1937,7 +1937,7 @@ mod tests {
         // Real patchelf against a REAL dynamic ELF (a copy of this test
         // binary, whose nix toolchain interpreter is a host-store path) —
         // proving the anchoring the guest needs, not just the seam shape.
-        if !crate::command::RealRunner
+        if !nau_infra::command::RealRunner
             .run(&["which".to_string(), "patchelf".to_string()])
             .ok()
             .is_some_and(|o| o.code == 0)
@@ -1950,9 +1950,9 @@ mod tests {
         let staged = root.path().join("nau");
         std::fs::copy(&source, &staged).unwrap();
 
-        anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
+        anchor_binary_to_guest(&nau_infra::command::RealRunner, &staged, "amd64").unwrap();
 
-        let out = crate::command::RealRunner
+        let out = nau_infra::command::RealRunner
             .run(&[
                 "patchelf".to_string(),
                 "--print-interpreter".to_string(),
@@ -1964,7 +1964,7 @@ mod tests {
             "/lib64/ld-linux-x86-64.so.2",
             "interpreter re-anchored to the guest loader"
         );
-        let out = crate::command::RealRunner
+        let out = nau_infra::command::RealRunner
             .run(&[
                 "patchelf".to_string(),
                 "--print-rpath".to_string(),
@@ -1985,13 +1985,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let staged = root.path().join("nau");
         std::fs::write(&staged, b"not-an-elf").unwrap();
-        anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
+        anchor_binary_to_guest(&nau_infra::command::RealRunner, &staged, "amd64").unwrap();
         assert!(staged.is_file(), "file untouched");
     }
 
     #[test]
     fn anchor_is_a_noop_when_the_interpreter_already_matches_the_guest() {
-        if !crate::command::RealRunner
+        if !nau_infra::command::RealRunner
             .run(&["which".to_string(), "patchelf".to_string()])
             .ok()
             .is_some_and(|o| o.code == 0)
@@ -2005,9 +2005,9 @@ mod tests {
         std::fs::copy(&source, &staged).unwrap();
         // First anchor, then anchor again: the second pass must observe the
         // guest interpreter and change nothing (no second set call).
-        anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
+        anchor_binary_to_guest(&nau_infra::command::RealRunner, &staged, "amd64").unwrap();
         let before = std::fs::read(&staged).unwrap();
-        anchor_binary_to_guest(&crate::command::RealRunner, &staged, "amd64").unwrap();
+        anchor_binary_to_guest(&nau_infra::command::RealRunner, &staged, "amd64").unwrap();
         let after = std::fs::read(&staged).unwrap();
         assert_eq!(before, after, "second anchor is a byte-identical no-op");
     }
@@ -2057,8 +2057,8 @@ mod tests {
         }
     }
 
-    impl crate::command::CommandRunner for BlessRunner {
-        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+    impl nau_infra::command::CommandRunner for BlessRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
             let program = argv.first().map(String::as_str).unwrap_or("");
             let (code, stdout) = match program {
                 "which" => match argv.get(1).map(String::as_str) {
@@ -2076,7 +2076,7 @@ mod tests {
                 _ if argv.iter().any(|a| a == "--version") => (0, self.version.to_string()),
                 _ => (0, String::new()),
             };
-            Ok(crate::command::RunnerOutput {
+            Ok(nau_infra::command::RunnerOutput {
                 code,
                 stdout: stdout.into_bytes(),
                 stderr: String::new(),
@@ -2088,8 +2088,8 @@ mod tests {
     /// tooling at all.
     struct NoRunner;
 
-    impl crate::command::CommandRunner for NoRunner {
-        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+    impl nau_infra::command::CommandRunner for NoRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
             panic!("no host command expected, saw {argv:?}");
         }
     }
@@ -2291,11 +2291,11 @@ mod tests {
             return;
         }
         struct NothingRunner;
-        impl crate::command::CommandRunner for NothingRunner {
-            fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+        impl nau_infra::command::CommandRunner for NothingRunner {
+            fn run(&self, argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
                 let program = argv.first().map(String::as_str).unwrap_or("");
                 if program == "which" {
-                    return Ok(crate::command::RunnerOutput {
+                    return Ok(nau_infra::command::RunnerOutput {
                         code: 1,
                         stdout: Vec::new(),
                         stderr: String::new(),
@@ -2452,7 +2452,7 @@ mod tests {
     /// dir — the exact anchoring the shipped binaries need on-device.
     #[test]
     fn anchor_repoints_real_bless_tooling_with_an_rpath() {
-        if !crate::command::RealRunner
+        if !nau_infra::command::RealRunner
             .run(&["which".to_string(), "patchelf".to_string()])
             .ok()
             .is_some_and(|o| o.code == 0)
@@ -2470,7 +2470,7 @@ mod tests {
         std::fs::copy(&source, &staged).unwrap();
 
         anchor_elf_to_guest(
-            &crate::command::RealRunner,
+            &nau_infra::command::RealRunner,
             &staged,
             "amd64",
             "/usr/lib/systemd/systemd-bless-boot",
@@ -2479,7 +2479,7 @@ mod tests {
         .unwrap();
 
         let print = |flag: &str| {
-            let out = crate::command::RealRunner
+            let out = nau_infra::command::RealRunner
                 .run(&[
                     "patchelf".to_string(),
                     flag.to_string(),
@@ -2541,8 +2541,8 @@ mod tests {
         }
     }
 
-    impl crate::command::CommandRunner for NoStoreRunner {
-        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+    impl nau_infra::command::CommandRunner for NoStoreRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
             Err(std::io::Error::other("store must not be queried"))
         }

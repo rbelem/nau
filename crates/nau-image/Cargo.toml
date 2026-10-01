@@ -1,0 +1,53 @@
+[package]
+name = "nau-image"
+version = "0.1.0"
+edition = "2021"
+description = "nau's image domain: UC image build/verify, partitions, boot, initramfs, verity, release media, UC seed assertions (ADR-0051, ADR-0053)"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The spine (ADR-0051 Decision 3): snap value types, manifest IR, the
+# unit vocabulary, the keychain, the default-path vocabulary.
+nau-core = { path = "../nau-core" }
+# The mechanism leaf (issue #326): command seam, store client +
+# assertion gate, tool provisioning, output, PATH search.
+nau-infra = { path = "../nau-infra" }
+# Error vocabulary (unified with the root's fancy feature).
+miette = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Payload meta/snap.yaml parsing and the seed user-data.
+serde_yaml = "0.9"
+# Digests: payload/UKI hashes, verity roots.
+sha2 = "0.10"
+# Staged temp trees and release-artifact assembly.
+tempfile = "3"
+# Wrapper/pubring encodings.
+base64 = "0.22"
+# The sysupdate OpenPGP layer (ADR-0024 §4): detached SHA256SUMS
+# signatures and the device import pubring.
+pgp = "0.20"
+# The UC seed assertion keys: RSA-2048/4096 keygen + PKCS#8 persistence
+# (ADR-0037; snapd's assertion crypto is RSA-SHA512 only).
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
+# Stage-lock flocking and partition-table probing helpers.
+# boot_test/verify: the boot-test enum and slot selector are
+# ValueEnum-derived (the CLI wires them directly).
+clap = { version = "4", features = ["derive"] }
+# staging/verity: gzip/zstd/xz initrd layer decompression (in-process).
+flate2 = "1"
+# boot/verify/release: sha3-384 payload digests.
+sha3 = "0.10"
+libc = "0.2"
+
+[dev-dependencies]
+# The §4 sanctioned dev-edge (ADR-0053 §4 + council amendment): the
+# image tests drive `image_declaration_from_lua` and `dsl::INIT_LUA`
+# through nau-chart. EXPIRES at the final reconciliation PR.
+nau-chart = { path = "../nau-chart" }
+# The tests drive the real Luau VM (recipe loading).
+mlua = { version = "0.12", features = ["luau"] }
+# The verify/release tests pin Ed25519 fixture keys (deterministic
+# seeds through the same signing substrate as `nau_core::sign`).
+ed25519-dalek = "2"

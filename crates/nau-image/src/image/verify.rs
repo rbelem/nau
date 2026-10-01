@@ -164,7 +164,7 @@ pub struct VerifyOutcome {
 /// over `args.device`; every failure names the region that refused.
 /// Resolves `veritysetup` and mtools' `mcopy` from the host PATH.
 pub fn verify_device(
-    runner: &dyn crate::command::CommandRunner,
+    runner: &dyn nau_infra::command::CommandRunner,
     args: &VerifyImageArgs,
 ) -> miette::Result<VerifyOutcome> {
     let veritysetup = find_veritysetup();
@@ -175,12 +175,12 @@ pub fn verify_device(
 /// [`verify_device`] with the tools injected — the fail-closed seam the
 /// tests drive (mirrors [`verity_format_with`]).
 pub(crate) fn verify_device_with(
-    runner: &dyn crate::command::CommandRunner,
+    runner: &dyn nau_infra::command::CommandRunner,
     args: &VerifyImageArgs,
     veritysetup: Option<&Path>,
     mcopy: Option<&Path>,
 ) -> miette::Result<VerifyOutcome> {
-    let keys_dir = crate::sign::keys_dir(&operator_home()?);
+    let keys_dir = nau_core::sign::keys_dir(&operator_home()?);
     verify_device_at(runner, args, veritysetup, mcopy, &keys_dir)
 }
 
@@ -189,7 +189,7 @@ pub(crate) fn verify_device_with(
 /// prove the published set verifies under the SAME keychain it signed
 /// with, independent of the process's HOME.
 pub(crate) fn verify_device_at(
-    runner: &dyn crate::command::CommandRunner,
+    runner: &dyn nau_infra::command::CommandRunner,
     args: &VerifyImageArgs,
     veritysetup: Option<&Path>,
     mcopy: Option<&Path>,
@@ -285,7 +285,7 @@ fn load_signed_manifest(path: &Path) -> miette::Result<ImageManifest> {
 
 /// Canonical signature input for the image manifest: serialized with the
 /// signatures map emptied — byte-stable, and a signature never covers
-/// itself. The exact scheme [`crate::sign::eval_manifest_canonical_bytes`]
+/// itself. The exact scheme [`nau_core::sign::eval_manifest_canonical_bytes`]
 /// applies to the eval manifest, applied to the image one. This — NOT the
 /// eval scheme — is what `nau image --release` signs (#266) and what
 /// this module verifies.
@@ -330,10 +330,10 @@ pub(crate) fn verify_manifest_signature_at(
              (a mission image publishes a SIGNED manifest; ADR-0044 D4)"
         ));
     }
-    let mut chain = crate::sign::Keychain::load_dir(keys_dir)?;
+    let mut chain = nau_core::sign::Keychain::load_dir(keys_dir)?;
     if let Some(key) = extra_key {
         chain.merge(
-            crate::sign::Keychain::load_pub_file(key)
+            nau_core::sign::Keychain::load_pub_file(key)
                 .wrap_err_with(|| format!("loading trust anchor {}", key.display()))?,
         );
     }
@@ -347,10 +347,10 @@ pub(crate) fn verify_manifest_signature_at(
     }
     // ADR-0024 §4: a signature under a revoked key id is a hard refusal
     // before any anchor check.
-    let revoked = crate::sign::read_revoked_keys(keys_dir)?;
-    crate::sign::reject_revoked(&manifest.signatures, &revoked)?;
+    let revoked = nau_core::sign::read_revoked_keys(keys_dir)?;
+    nau_core::sign::reject_revoked(&manifest.signatures, &revoked)?;
     let canonical = image_manifest_canonical_bytes(manifest)?;
-    crate::sign::verify_keychain(&canonical, &manifest.signatures, &chain)
+    nau_core::sign::verify_keychain(&canonical, &manifest.signatures, &chain)
 }
 
 /// The dm-verity roothash every later step recomputes against. A
@@ -481,7 +481,10 @@ fn parse_gpt(json: &str) -> miette::Result<GptTable> {
 }
 
 /// Read the target's partition table with one read-only `sfdisk -J` call.
-fn read_gpt(runner: &dyn crate::command::CommandRunner, device: &Path) -> miette::Result<GptTable> {
+fn read_gpt(
+    runner: &dyn nau_infra::command::CommandRunner,
+    device: &Path,
+) -> miette::Result<GptTable> {
     let argv = vec![
         "sfdisk".to_string(),
         "-J".to_string(),
@@ -495,7 +498,7 @@ fn read_gpt(runner: &dyn crate::command::CommandRunner, device: &Path) -> miette
             "cannot read a partition table from {} ({}): {} — refusing to verify a \
              medium with no readable GPT (wrong device, or the flash never landed?)",
             device.display(),
-            crate::command::exit_code(&out),
+            nau_infra::command::exit_code(&out),
             out.stderr.trim()
         ));
     }
@@ -937,7 +940,7 @@ fn uki_esp_name_matches(listed: &str, uki: &str) -> bool {
 /// Read-only (measured: a listing and an `mcopy -i` extraction leave the
 /// image byte-identical).
 fn list_esp_linux(
-    runner: &dyn crate::command::CommandRunner,
+    runner: &dyn nau_infra::command::CommandRunner,
     esp: &GptEntry,
     esp_img: &Path,
 ) -> miette::Result<Vec<String>> {
@@ -979,7 +982,7 @@ fn list_esp_linux(
 /// (`mcopy -i`, byte-exact — the same access the build's populate uses
 /// in reverse).
 fn extract_esp_uki(
-    runner: &dyn crate::command::CommandRunner,
+    runner: &dyn nau_infra::command::CommandRunner,
     mcopy: &Path,
     esp_img: &Path,
     name: &str,
@@ -1016,7 +1019,7 @@ fn extract_esp_uki(
 /// predating ESP coverage (UKI named, no digest), a missing or foreign
 /// ESP, a replaced/tampered/flipped UKI.
 fn check_esp_content(
-    runner: &dyn crate::command::CommandRunner,
+    runner: &dyn nau_infra::command::CommandRunner,
     device: &Path,
     esp: &GptEntry,
     manifest: &ImageManifest,
@@ -1098,7 +1101,7 @@ fn check_esp_content(
         }
     };
     let extracted = extract_esp_uki(runner, mcopy, &esp_img, &name, scratch.path())?;
-    let actual = crate::store::sha3_384_file(&extracted)?;
+    let actual = nau_infra::store::sha3_384_file(&extracted)?;
     if actual != expected {
         return Err(miette::miette!(
             "ESP content mismatch: partition '{}' (#{}) carries EFI/Linux/{name} \
@@ -1172,7 +1175,7 @@ fn verity_verify_args(data: &Path, hash: &Path, roothash: &str) -> Vec<String> {
 /// dm-verity mapping demands at boot (read-only, unprivileged). The tool
 /// is injected; the public entry resolves it from the host PATH.
 fn run_verity_verify_with(
-    runner: &dyn crate::command::CommandRunner,
+    runner: &dyn nau_infra::command::CommandRunner,
     device: &Path,
     root: &GptEntry,
     hash: &GptEntry,
@@ -1216,7 +1219,7 @@ fn run_verity_verify_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::RunnerOutput;
+    use nau_infra::command::RunnerOutput;
 
     const ROOTHASH: &str = "1111111122222222333333334444444455555555666666667777777788888888";
 
@@ -1253,7 +1256,7 @@ mod tests {
     /// A runner that must never be reached (guards the fail-closed paths).
     struct NoTools;
 
-    impl crate::command::CommandRunner for NoTools {
+    impl nau_infra::command::CommandRunner for NoTools {
         fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput> {
             panic!("no tool should run on this path: {argv:?}");
         }
@@ -1271,10 +1274,10 @@ mod tests {
     }
 
     /// The canonical test keypair (deterministic seed).
-    fn test_kp(seed_byte: u8) -> crate::sign::KeyPair {
+    fn test_kp(seed_byte: u8) -> nau_core::sign::KeyPair {
         let seed = [seed_byte; 32];
         let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-        crate::sign::KeyPair {
+        nau_core::sign::KeyPair {
             seed,
             public: sk.verifying_key().to_bytes(),
         }
@@ -1297,11 +1300,11 @@ mod tests {
     }
 
     /// Sign `m` under `kp` and return it with the signature attached.
-    fn signed(mut m: ImageManifest, kp: &crate::sign::KeyPair) -> ImageManifest {
+    fn signed(mut m: ImageManifest, kp: &nau_core::sign::KeyPair) -> ImageManifest {
         let canonical = image_manifest_canonical_bytes(&m).unwrap();
         m.signatures.insert(
             kp.key_id(),
-            serde_json::Value::String(crate::sign::sign_bytes(&canonical, kp)),
+            serde_json::Value::String(nau_core::sign::sign_bytes(&canonical, kp)),
         );
         m
     }
@@ -1415,7 +1418,7 @@ mod tests {
         }
     }
 
-    impl crate::command::CommandRunner for FakeTools {
+    impl nau_infra::command::CommandRunner for FakeTools {
         fn run(&self, argv: &[String]) -> std::io::Result<RunnerOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
             let tool = argv.first().map(String::as_str).unwrap_or("");
@@ -1511,7 +1514,7 @@ mod tests {
         let manifest_path = dir.join("m.manifest.json");
         std::fs::write(&manifest_path, serde_json::to_string_pretty(&m).unwrap()).unwrap();
         let anchor = dir.join("anchor.pub");
-        std::fs::write(&anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         (manifest_path, anchor)
     }
 
@@ -1531,7 +1534,7 @@ mod tests {
         std::fs::write(&manifest_path, serde_json::to_string_pretty(&m).unwrap()).unwrap();
 
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
         let outcome = verify_device_with(
             &runner,
@@ -1605,7 +1608,7 @@ mod tests {
         m.version = "9.9.9".into();
         let keys = dir.path().join("keys");
         std::fs::create_dir_all(&keys).unwrap();
-        crate::sign::install_public_key(&kp, &keys).unwrap();
+        nau_core::sign::install_public_key(&kp, &keys).unwrap();
         let err = verify_manifest_signature_at(&m, None, &keys)
             .unwrap_err()
             .to_string();
@@ -1635,7 +1638,7 @@ mod tests {
         let keys = dir.path().join("keys"); // exists but empty
         std::fs::create_dir_all(&keys).unwrap();
         let key_file = dir.path().join("downloaded.pub");
-        std::fs::write(&key_file, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_file, nau_core::sign::public_key_file(&kp)).unwrap();
         let key_id = verify_manifest_signature_at(&m, Some(&key_file), &keys).unwrap();
         assert_eq!(key_id, kp.key_id(), "--key anchors the downloaded trust");
     }
@@ -1668,7 +1671,7 @@ mod tests {
         let m = signed(manifest(Some(ROOTHASH), None), &kp);
         let keys = dir.path().join("keys");
         std::fs::create_dir_all(&keys).unwrap();
-        crate::sign::install_public_key(&kp, &keys).unwrap();
+        nau_core::sign::install_public_key(&kp, &keys).unwrap();
         std::fs::write(keys.join("revoked-keys"), format!("{}\n", kp.key_id())).unwrap();
         let err = verify_manifest_signature_at(&m, None, &keys)
             .unwrap_err()
@@ -1695,7 +1698,7 @@ mod tests {
         let manifest_path = dir.path().join("newer.manifest.json");
         std::fs::write(&manifest_path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let err = verify_device_with(
             &NoTools,
             &args(&device, &manifest_path, Some(&key_anchor)),
@@ -1735,7 +1738,7 @@ mod tests {
         let manifest_path = dir.path().join("legacy.manifest.json");
         std::fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
         let err = verify_device_with(
             &runner,
@@ -1776,7 +1779,7 @@ mod tests {
         let manifest_path = dir.path().join("m.json");
         std::fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let runner = FakeTools::new(dos_gpt_json(), 0);
         let err = verify_device_with(
             &runner,
@@ -1823,7 +1826,7 @@ mod tests {
         let manifest_path = dir.path().join("m.json");
         std::fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let runner = FakeTools::new(rootless_gpt_json(), 0);
         let err = verify_device_with(
             &runner,
@@ -1849,7 +1852,7 @@ mod tests {
         let manifest_path = dir.path().join("m.json");
         std::fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let runner = FakeTools::new(
             golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), // ≠ the manifest's ESP
             0,
@@ -1875,7 +1878,7 @@ mod tests {
         let manifest_path = dir.path().join("m.json");
         std::fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
         verify_device_with(
             &runner,
@@ -2107,7 +2110,7 @@ mod tests {
         let manifest_path = dir.path().join("m.json");
         std::fs::write(&manifest_path, serde_json::to_string_pretty(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let (data_up, hash_up) = expected_guids();
         let body = format!(
             r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
@@ -2146,7 +2149,7 @@ mod tests {
         let manifest_path = dir.path().join("m.json");
         std::fs::write(&manifest_path, serde_json::to_string_pretty(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
         let err = verify_device_with(
             &runner,
@@ -2240,7 +2243,7 @@ mod tests {
         let manifest_path = dir.path().join("m.json");
         std::fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let (data_up, hash_up) = expected_guids();
         let body = format!(
             r#"{{"partitiontable": {{"label": "gpt", "sectorsize": 512, "partitions": [
@@ -2414,7 +2417,7 @@ mod tests {
         let manifest_path = dir.path().join("m.json");
         std::fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 0);
         let err = verify_device_with(
             &runner,
@@ -2465,7 +2468,7 @@ mod tests {
         let manifest_path = dir.path().join("m.json");
         std::fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         // veritysetup reports the mismatch (a flipped byte inside slot A).
         let runner = FakeTools::new(golden_gpt_json("aabbccdd-0011-2233-4455-667788990011"), 1);
         let err = verify_device_with(
@@ -2525,7 +2528,7 @@ mod tests {
         let manifest_path = dir.path().join("m.json");
         std::fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
         let key_anchor = dir.path().join("anchor.pub");
-        std::fs::write(&key_anchor, crate::sign::public_key_file(&kp)).unwrap();
+        std::fs::write(&key_anchor, nau_core::sign::public_key_file(&kp)).unwrap();
         let runner = FakeTools::new(String::new(), 0);
         let err = verify_device_with(
             &runner,

@@ -1739,6 +1739,7 @@ dependencies = [
  "nau-build",
  "nau-chart",
  "nau-core",
+ "nau-image",
  "nau-infra",
  "pgp",
  "rand",
@@ -1801,11 +1802,39 @@ dependencies = [
 name = "nau-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "ed25519-dalek",
  "miette",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
+ "sha3",
+ "tempfile",
+]
+
+[[package]]
+name = "nau-image"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "ed25519-dalek",
+ "flate2",
+ "libc",
+ "miette",
+ "mlua",
+ "nau-chart",
+ "nau-core",
+ "nau-infra",
+ "pgp",
+ "rand",
+ "rsa",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sha3",
  "tempfile",
 ]
 
@@ -1813,13 +1842,17 @@ dependencies = [
 name = "nau-infra"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "flate2",
  "indicatif",
  "miette",
+ "nau-core",
  "owo-colors",
+ "pgp",
  "serde",
  "serde_json",
  "sha2",
+ "sha3",
  "tar",
  "tempfile",
  "toml",

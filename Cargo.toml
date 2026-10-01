@@ -14,6 +14,7 @@ members = [
     "crates/nau-infra",
     "crates/nau-chart",
     "crates/nau-build",
+    "crates/nau-image",
 ]
 resolver = "2"
 
@@ -34,6 +35,9 @@ nau-chart = { path = "crates/nau-chart" }
 # depend on nau-core and nau-infra only — never sideways; the root
 # composes every domain.
 nau-build = { path = "crates/nau-build" }
+# The image domain (issue #326 PR 3): the UC image build/verify pipeline,
+# the release media, the UC seed, the app-runtime unit emission.
+nau-image = { path = "crates/nau-image" }
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["luau"] }
 miette = { version = "7", features = ["fancy"] }

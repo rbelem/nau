@@ -54,12 +54,12 @@ pub(crate) const STATE_MOUNT: &str = "/var/lib";
 pub(crate) const VAR_MOUNT: &str = "/var";
 
 /// The always-present state directories, created at boot by tmpfiles —
-/// the nau store ([`crate::runtime::DEFAULT_STATE_DIR`]) and the
-/// sysext link directory ([`crate::runtime::DEFAULT_EXTENSIONS_LINK_DIR`]).
+/// the nau store ([`nau_core::paths::DEFAULT_STATE_DIR`]) and the
+/// sysext link directory ([`nau_core::paths::DEFAULT_EXTENSIONS_LINK_DIR`]).
 pub(crate) fn state_dirs() -> [&'static str; 2] {
     [
-        crate::runtime::DEFAULT_STATE_DIR,
-        crate::runtime::DEFAULT_EXTENSIONS_LINK_DIR,
+        nau_core::paths::DEFAULT_STATE_DIR,
+        nau_core::paths::DEFAULT_EXTENSIONS_LINK_DIR,
     ]
 }
 
@@ -196,8 +196,8 @@ pub(crate) fn resolve_state_split(
              partition with role = \"state\" (sized once — partition layouts are hard to \
              change after deploy; ADR-0023)",
             name = image.name,
-            state = crate::runtime::DEFAULT_STATE_DIR,
-            ext = crate::runtime::DEFAULT_EXTENSIONS_LINK_DIR,
+            state = nau_core::paths::DEFAULT_STATE_DIR,
+            ext = nau_core::paths::DEFAULT_EXTENSIONS_LINK_DIR,
         ));
     };
     Ok(StateSplit {
@@ -848,8 +848,8 @@ mod tests {
     #[test]
     fn stamp_failure_is_fail_open_not_fatal() {
         struct Failing;
-        impl crate::command::CommandRunner for Failing {
-            fn run(&self, _argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+        impl nau_infra::command::CommandRunner for Failing {
+            fn run(&self, _argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
                 Err(std::io::Error::other("sfdisk vanished"))
             }
         }

@@ -1515,9 +1515,27 @@ mod tests {
             "conflict must point at the escape hatch: {msg}"
         );
 
-        // Release on drop: the next build proceeds.
+        // Release on drop: the next build proceeds. A bounded re-acquire,
+        // per the fork(2) window nau-build's StageLock tests document: a
+        // concurrent test's forked-not-yet-exec'd child (the pod fixture
+        // builds spawn tools) can pin the inherited lock fd for a few
+        // microseconds past our close. The contract stays fail-loud; only
+        // this release assertion tolerates that scheduling window.
         drop(lock);
-        let (_p, _pol, again) = resolve_stage(None).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let again = loop {
+            match resolve_stage(None) {
+                Ok((_, _, lock)) => break lock,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    assert!(
+                        format!("{err:#}").contains("held by another nau build"),
+                        "re-acquire must fail only on the documented contention: {err:#}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(err) => panic!("stage lock never released after drop: {err:#}"),
+            }
+        };
         assert!(again.is_some());
     }
 

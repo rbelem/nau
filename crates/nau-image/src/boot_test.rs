@@ -98,7 +98,7 @@ use std::time::Duration;
 
 use miette::{IntoDiagnostic, WrapErr};
 
-use crate::command::{CommandRunner, RunnerOutput};
+use nau_infra::command::{CommandRunner, RunnerOutput};
 
 /// Default boot timeout, in seconds. A full systemd boot under KVM is
 /// typically tens of seconds; the default leaves generous headroom.
@@ -510,7 +510,7 @@ pub fn run_sequence(
                     image: boot_image,
                 });
             }
-            crate::output::warn(format!(
+            nau_infra::output::warn(format!(
                 "ESP inspection unavailable ({err}); boot counting was not observed"
             ));
             None
@@ -1044,7 +1044,7 @@ fn is_kvm_failure(code: i32, stderr: &str, log: &str) -> bool {
 pub fn run_boot(runner: &dyn CommandRunner, test: &BootTest) -> miette::Result<Outcome> {
     let mut accel = test.accel;
     if accel == Accel::Kvm && !test.kvm_available {
-        crate::output::warn(
+        nau_infra::output::warn(
             "KVM unavailable (/dev/kvm not accessible) — falling back to TCG (slow)",
         );
         accel = Accel::Tcg;
@@ -1055,7 +1055,7 @@ pub fn run_boot(runner: &dyn CommandRunner, test: &BootTest) -> miette::Result<O
     let mut text = read_log(&test.log);
 
     if accel == Accel::Kvm && is_kvm_failure(out.code, &out.stderr, &text) {
-        crate::output::warn("QEMU could not use KVM — retrying with TCG (slow)");
+        nau_infra::output::warn("QEMU could not use KVM — retrying with TCG (slow)");
         accel = Accel::Tcg;
         argv = wrapper_argv(test, accel);
         out = run_command(runner, &argv)?;

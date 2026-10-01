@@ -19,7 +19,7 @@
 //! `modules.dep` maps a module path (`kernel/drivers/md/dm-verity.ko`) to
 //! that module's dependency paths, all relative to the `modules/<ver>/`
 //! directory. Nau's boot-chain requirement is expressed as module
-//! *names* (`dm-verity`, from [`crate::doctor::required_initrd_modules`]),
+//! *names* (`dm-verity`, from [`crate::audit::required_initrd_modules`]),
 //! so [`module_closure`] resolves each name to its one `.ko` path (a
 //! `.ko.xz`/`.ko.zst`/`.ko.gz` on-disk spelling resolves to the same
 //! module — Ubuntu kernels ≥ 6.x ship compressed modules), walks the
@@ -433,7 +433,7 @@ const TOOL_PACKAGES: [(&str, &str, &str); 3] = [
 /// static tools there directly.
 pub(crate) fn discover_initramfs_tools() -> miette::Result<InitramfsTools> {
     let static_bins = devbox_static_bins();
-    let entries = crate::snap::path_entries();
+    let entries = nau_infra::pathsearch::path_entries();
     let resolve = |name: &str| -> miette::Result<PathBuf> {
         let (package, owner) = TOOL_PACKAGES
             .iter()
@@ -451,7 +451,7 @@ pub(crate) fn discover_initramfs_tools() -> miette::Result<InitramfsTools> {
                 return Ok(path.clone());
             }
         }
-        crate::snap::resolve_in_path(name, &entries).ok_or_else(|| {
+        nau_infra::pathsearch::resolve_in_path(name, &entries).ok_or_else(|| {
             miette::miette!(
                 "initramfs tool '{name}' not found — nau builds a native initramfs \
                  for a prebuilt-UKI kernel and needs {name}; run 'nau doctor' and \
@@ -568,7 +568,7 @@ fn required_modules(config_path: &Path) -> miette::Result<Vec<String>> {
             config_path.display()
         )
     })?;
-    Ok(crate::doctor::required_initrd_modules(&text))
+    Ok(crate::audit::required_initrd_modules(&text))
 }
 
 /// The ordered module paths (relative to `modules_root`) for `required`,
@@ -810,7 +810,7 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
     const DM_VERITY: &str = "kernel/drivers/md/dm-verity.ko";
 
     fn required() -> Vec<String> {
-        crate::doctor::required_initrd_modules("CONFIG_DM_VERITY=m\nCONFIG_VIRTIO_BLK=m\n")
+        crate::audit::required_initrd_modules("CONFIG_DM_VERITY=m\nCONFIG_VIRTIO_BLK=m\n")
     }
 
     #[test]
@@ -961,7 +961,7 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
     fn newc_archive_round_trips_through_doctor_reader() {
         let entries = fixture_entries();
         let archive = newc_archive(&entries);
-        let members = crate::doctor::cpio_newc_members(&archive).expect("reader accepts writer");
+        let members = crate::audit::cpio_newc_members(&archive).expect("reader accepts writer");
         assert_eq!(
             members,
             vec![
@@ -1065,7 +1065,7 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
         assert!(archive_path.is_file(), "returns the written path");
 
         let raw = gunzip(&std::fs::read(&archive_path).unwrap());
-        let members = crate::doctor::cpio_newc_members(&raw).expect("reader accepts archive");
+        let members = crate::audit::cpio_newc_members(&raw).expect("reader accepts archive");
         for expected in [
             "init",
             "modules.load",
@@ -1223,7 +1223,7 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
         // The archive carries the DECOMPRESSED module: the plain `.ko`
         // member is present, the `.ko.xz` spelling is not.
         let gz = std::fs::read(&initramfs).unwrap();
-        let members = crate::doctor::cpio_newc_members(&gunzip(&gz)).unwrap();
+        let members = crate::audit::cpio_newc_members(&gunzip(&gz)).unwrap();
         let bufio_member = format!("lib/modules/{FIXTURE_VERSION}/kernel/drivers/md/dm-bufio.ko");
         assert!(
             members.iter().any(|m| m == &bufio_member),

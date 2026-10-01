@@ -21,8 +21,8 @@ pub struct RunnerOutput {
     pub stderr: String,
 }
 
-/// Injectable command seam (the [`RuntimeTools`][crate::runtime::RuntimeTools]
-/// precedent): production uses [`RealRunner`] (a real subprocess); hermetic
+/// Injectable command seam (the `RuntimeTools` precedent from the root
+/// runtime module): production uses [`RealRunner`] (a real subprocess); hermetic
 /// tests inject fakes.
 ///
 /// # Contract

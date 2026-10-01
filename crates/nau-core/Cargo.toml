@@ -6,7 +6,13 @@ description = "Shared vocabulary of nau: snap value types, manifest IR, plugin o
 license = "GPL-3.0-only"
 
 [dependencies]
+# The ceremony ledger and the keychain persist as JSON.
 serde = { version = "1", features = ["derive"] }
+# sign.rs: Ed25519 update-manifest signing (ADR-0011 step d; already
+# locked transitively via the root — no new vendored code).
+ed25519-dalek = "2"
+# sign.rs: base64 signature envelopes.
+base64 = "0.22"
 serde_json = "1"
 # snap_types::SnapMeta::to_yaml renders the meta/snap.yaml content.
 serde_yaml = "0.9"
@@ -19,6 +25,9 @@ miette = "7"
 # content-hash vocabulary is spine material — build cache keys and the
 # pod blob store both speak sha256.
 sha2 = "0.10"
+# sign.rs: the provenance subject digest (sha3-384 over canonical body
+# bytes) and the store-side sha3 vocabulary.
+sha3 = "0.10"
 # pkg_source::materialize_embedded stages embedded packages through
 # tempdirs whose lifetime outlives the call (issue #326).
 tempfile = "3"

@@ -15,10 +15,13 @@ pub mod channels;
 pub mod index;
 pub mod lock;
 pub mod manifest_ir;
+pub mod paths;
 pub mod pkg_source;
 pub mod plugins;
+pub mod sign;
 pub mod snap;
 pub mod snap_types;
+pub mod store;
 pub mod units;
 
 /// The parallel build-phase worker budget (ADR-0022). The constant is

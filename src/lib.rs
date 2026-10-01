@@ -1,4 +1,4 @@
-pub use nau_infra::{output, tools};
+pub use nau_infra::{command, output, store, tools};
 
 pub use nau_chart::{
     analysis, audit, checks, dep_fetch, deps, dsl, index, isolate, lint, lock, lua, manifest,
@@ -6,25 +6,20 @@ pub use nau_chart::{
 };
 
 pub mod assert;
-pub mod boot_test;
 pub mod build_orch;
 pub mod build_sched;
 pub mod ca;
 pub mod cli;
-pub mod command;
 pub mod commands;
 pub mod confine;
 pub mod coordinator;
 pub mod desktop;
 pub mod discovery;
 pub mod doctor;
-pub mod emit;
-pub mod esp;
 pub mod export;
 pub mod farm;
 pub mod farm_dispatch;
 pub mod fonts;
-pub mod image;
 pub mod leak_scan;
 pub mod oci;
 pub mod pkg_manifest;
@@ -47,11 +42,13 @@ pub mod slot_recovery;
 pub use nau_build::{build_prefix, cache, source_cache};
 pub use nau_core::manifest_ir;
 pub use nau_core::snap_types;
+// The image domain (issue #326 PR 3): image/uc/boot_test/esp/emit moved
+// to nau-image; units stays a root shim FILE (it carries the unit
+// vocabulary re-export; the emission half lives in nau-image::units).
+pub use nau_image::{boot_test, emit, esp, image, uc};
 pub mod snap;
 pub mod ssh_exec;
-pub mod store;
 #[cfg(test)]
 pub(crate) mod test_env;
-pub mod uc;
 pub mod units;
 pub mod worker;
