@@ -369,7 +369,7 @@ pub fn sha3_384_file(path: &Path) -> miette::Result<String> {
 mod tests {
     use super::*;
     use crate::command::RunnerOutput;
-    use crate::snap::FromPinTable;
+    use crate::snap::snap_ref_from_pin;
     use std::sync::Mutex;
 
     #[test]
@@ -412,7 +412,7 @@ mod tests {
             .eval()
             .unwrap();
 
-        let snap_ref = SnapRef::from_pin_table(&table).unwrap();
+        let snap_ref = snap_ref_from_pin(&table).unwrap();
         assert_eq!(snap_ref.name, "core22");
         assert_eq!(snap_ref.revision, Some(1847));
         assert_eq!(snap_ref.sha3_384.as_deref(), Some("abcdef1234567890"));
@@ -430,7 +430,7 @@ mod tests {
             .eval()
             .unwrap();
 
-        let snap_ref = SnapRef::from_pin_table(&table).unwrap();
+        let snap_ref = snap_ref_from_pin(&table).unwrap();
         assert_eq!(snap_ref.name, "core22");
         assert!(snap_ref.revision.is_none());
         assert!(snap_ref.sha3_384.is_none());
@@ -440,7 +440,7 @@ mod tests {
     fn test_snap_ref_from_pin_table_missing_name() {
         let lua = mlua::Lua::new();
         let table: mlua::Table = lua.load(r#"return { revision = 42 }"#).eval().unwrap();
-        let result = SnapRef::from_pin_table(&table);
+        let result = snap_ref_from_pin(&table);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("name"), "error should mention name: {err}");

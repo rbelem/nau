@@ -15,8 +15,15 @@ use std::path::{Path, PathBuf};
 
 use mlua::Value;
 use nau_core::channels::BOOTLOADER_PIBOOT;
+// The mksquashfs compression contract + the source dir name down-moved to
+// the core vocabulary (ADR-0053 pre-PR-2); re-exported so every
+// `nau_chart::snap_lua::*` path — and this module's own callers — keep
+// resolving unchanged.
 use nau_core::manifest_ir::{
     BootloaderConfig, DiskLayout, ImageDeclaration, KernelEntry, Partition, StagedFile, SwapConfig,
+};
+pub use nau_core::snap::{
+    effective_compression, validate_compression_choice, validate_compression_level, SOURCE_DIR_NAME,
 };
 use nau_core::snap_types::PackageInput;
 use nau_core::snap_types::{
@@ -508,6 +515,38 @@ pub fn confinement_from_lua(table: &mlua::Table) -> miette::Result<Confinement> 
         devices,
         backend_options,
     })
+}
+
+// ── §4 free functions (ADR-0053 council amendment): the passive Rust
+// conversion boundary as plain functions, so the root build machinery
+// consumes the vocabulary without naming the traits. The trait impls
+// above stay the definitions; these are thin forwarders in the same
+// style as [`confinement_from_lua`].
+
+/// The `snap { … }` identity block (`name`, `version`, optional
+/// `summary`) as a [`SnapRef`].
+pub fn snap_ref_from_pin(table: &mlua::Table) -> miette::Result<SnapRef> {
+    <SnapRef as FromPinTable>::from_pin_table(table)
+}
+
+/// A full `image { … }` declaration table as an [`ImageDeclaration`].
+pub fn image_declaration_from_lua(table: &mlua::Table) -> miette::Result<ImageDeclaration> {
+    <ImageDeclaration as FromLuaTable>::from_lua_table(table)
+}
+
+/// A parsed `snap { … }` table as a [`SnapMeta`].
+pub fn snap_meta_from_lua_table(table: &mlua::Table) -> miette::Result<SnapMeta> {
+    <SnapMeta as FromLuaTable>::from_lua_table(table)
+}
+
+/// One `app "name" { … }` table as a [`SnapApp`].
+pub fn snap_app_from_lua_table(name: &str, table: &mlua::Table) -> miette::Result<SnapApp> {
+    <SnapApp as FromLuaTableNamed>::from_lua_table(name, table)
+}
+
+/// One `service "name" { … }` table as a [`ServiceDecl`].
+pub fn service_decl_from_lua_table(name: &str, table: &mlua::Table) -> miette::Result<ServiceDecl> {
+    <ServiceDecl as FromLuaTableNamed>::from_lua_table(name, table)
 }
 
 /// Extract `backend_options`: a per-backend map of raw string values.
@@ -1258,64 +1297,6 @@ fn get_opt_table(table: &mlua::Table, key: &str) -> miette::Result<Option<mlua::
         Value::Nil => Ok(None),
         _ => Ok(None),
     }
-}
-
-/// Compression choices mksquashfs accepts here (ticket #154). zstd is the
-/// absent default; gzip dropped — strictly dominated by zstd (ADR-0038
-/// evidence table).
-const VALID_COMPRESSIONS: [&str; 3] = ["zstd", "xz", "lzo"];
-
-/// The effective compressor: the declared value, else the zstd default
-/// (ticket #154). Single point where the default lives on the Rust side.
-pub fn effective_compression(compression: Option<&str>) -> &str {
-    compression.unwrap_or("zstd")
-}
-
-pub fn validate_compression_choice(compression: Option<&str>) -> miette::Result<()> {
-    if let Some(c) = compression {
-        if !VALID_COMPRESSIONS.contains(&c) {
-            return Err(miette::miette!(
-                "snap meta: 'compression' must be one of: zstd, xz, lzo, got {c:?}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// `compression_level` bounds per compressor (ticket #154): zstd 1-22,
-/// lzo 1-9; rejected for xz — mksquashfs' xz wrapper does not implement
-/// `-Xcompression-level`, so a declared level would silently no-op.
-pub fn validate_compression_level(
-    compression: Option<&str>,
-    level: Option<u32>,
-) -> miette::Result<()> {
-    let Some(level) = level else {
-        return Ok(());
-    };
-    match effective_compression(compression) {
-        "zstd" => {
-            if !(1..=22).contains(&level) {
-                return Err(miette::miette!(
-                    "snap meta: 'compression_level' must be between 1 and 22 for compression = \"zstd\", got {level}"
-                ));
-            }
-        }
-        "lzo" => {
-            if !(1..=9).contains(&level) {
-                return Err(miette::miette!(
-                    "snap meta: 'compression_level' must be between 1 and 9 for compression = \"lzo\", got {level}"
-                ));
-            }
-        }
-        "xz" => {
-            return Err(miette::miette!(
-                "snap meta: 'compression_level' is not supported with compression = \"xz\" — \
-                 mksquashfs' xz wrapper does not implement -Xcompression-level"
-            ));
-        }
-        other => unreachable!("validated by validate_compression_choice: {other}"),
-    }
-    Ok(())
 }
 
 /// Extract an optional integer `compression_level`, rejecting fractional
@@ -2307,11 +2288,6 @@ pub fn validate_exec_text(service: &str, field: &str, value: &str) -> miette::Re
     }
     Ok(())
 }
-
-/// Subdirectory of the build tree holding the shared downloaded/extracted
-/// source in multi-part builds. Part work dirs are siblings of it, so the
-/// name is reserved as a part name.
-pub const SOURCE_DIR_NAME: &str = "source";
 
 // ── Service validation vocabulary (moved with the service Lua-parse, #326) ──
 

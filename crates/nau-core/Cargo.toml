@@ -19,6 +19,9 @@ miette = "7"
 # content-hash vocabulary is spine material — build cache keys and the
 # pod blob store both speak sha256.
 sha2 = "0.10"
+# pkg_source::materialize_embedded stages embedded packages through
+# tempdirs whose lifetime outlives the call (issue #326).
+tempfile = "3"
 
 [dev-dependencies]
 # blob_store tests stage a store root.

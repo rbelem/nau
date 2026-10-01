@@ -28,7 +28,6 @@ base64 = "0.22"
 # module zips; uv.lock is TOML.
 flate2 = "1"
 tar = "0.4"
-xz2 = "0.1"
 zip = "2"
 toml = "0.8"
 # Worker containment (rlimits) and fetch staging.

@@ -60,7 +60,7 @@ pub use nau_core::cache_key::{BuildClosure, RequiresMember, SourceClosureMember}
 
 // `pinned_member` lives with the lockfile vocabulary it reads
 // (nau-chart::lock, issue #326); re-exported for the build path.
-pub use nau_chart::lock::pinned_member;
+pub use nau_core::lock::pinned_member;
 
 /// Binary package cache for built snaps.
 #[derive(Debug, Clone)]

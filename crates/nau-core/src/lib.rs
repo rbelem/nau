@@ -12,8 +12,12 @@
 pub mod blob_store;
 pub mod cache_key;
 pub mod channels;
+pub mod index;
+pub mod lock;
 pub mod manifest_ir;
+pub mod pkg_source;
 pub mod plugins;
+pub mod snap;
 pub mod snap_types;
 pub mod units;
 
@@ -22,3 +26,6 @@ pub mod units;
 /// default worker config (issue #326), so it lives in the spine; the
 /// root `build_sched` re-exports it.
 pub const MAX_PARALLEL_BUILD_WORKERS: usize = 3;
+
+#[cfg(test)]
+pub(crate) mod test_env;

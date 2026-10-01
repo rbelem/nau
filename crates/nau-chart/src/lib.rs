@@ -22,13 +22,10 @@ pub mod dsl;
 pub mod index;
 pub mod isolate;
 pub mod lint;
-pub mod lock;
+pub use nau_core::lock;
 pub mod lua;
 pub mod manifest;
-pub mod pkg_source;
+pub use nau_core::pkg_source;
 pub mod snap_lua;
 
 pub use snap_lua::{FromLuaTable, FromLuaTableNamed, FromLuaValue, FromPinTable};
-
-#[cfg(test)]
-pub(crate) mod test_env;

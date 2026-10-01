@@ -25,7 +25,7 @@ use crate::command::CommandRunner;
 use crate::doctor;
 use crate::lock::LockFile;
 #[cfg(test)]
-use crate::snap::FromLuaTable;
+use crate::snap::image_declaration_from_lua;
 use crate::snap::SnapRef;
 use crate::store::ResolvedSnap;
 
@@ -1414,7 +1414,7 @@ mod tests {
             _ => panic!("expected table"),
         };
 
-        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let decl = image_declaration_from_lua(&table).unwrap();
         assert_eq!(decl.name, "my-system");
         assert_eq!(decl.version, "1.0.0");
         assert_eq!(decl.base.name, "core22");
@@ -1451,7 +1451,7 @@ mod tests {
             _ => panic!("expected table"),
         };
 
-        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let decl = image_declaration_from_lua(&table).unwrap();
         assert_eq!(decl.name, "minimal");
         assert_eq!(decl.base.name, "core22");
         assert!(decl.kernel.is_none());
@@ -1504,7 +1504,7 @@ mod tests {
             _ => panic!("expected table"),
         };
 
-        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let decl = image_declaration_from_lua(&table).unwrap();
         let all: Vec<&str> = decl.all_snaps().iter().map(|s| s.name.as_str()).collect();
         assert_eq!(all, vec!["core22", "pc-kernel", "pi-gadget", "lxd", "app"]);
     }
@@ -1624,7 +1624,7 @@ mod tests {
             _ => panic!("expected table"),
         };
 
-        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let decl = image_declaration_from_lua(&table).unwrap();
         let kernel = decl.kernel.as_ref().unwrap();
         assert_eq!(kernel.snap.name, "pc-kernel");
         assert_eq!(kernel.params, vec!["quiet", "splash"]);
@@ -1654,7 +1654,7 @@ mod tests {
             _ => panic!("expected table"),
         };
 
-        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let decl = image_declaration_from_lua(&table).unwrap();
         let bl = decl.bootloader.as_ref().unwrap();
         assert_eq!(bl.type_, "systemd-boot");
         assert_eq!(bl.timeout, 5);
@@ -1685,7 +1685,7 @@ mod tests {
             _ => panic!("expected table"),
         };
 
-        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let decl = image_declaration_from_lua(&table).unwrap();
         let bl = decl.bootloader.as_ref().unwrap();
         assert_eq!(bl.type_, "piboot");
         assert_eq!(bl.timeout, 1);
@@ -1717,7 +1717,7 @@ mod tests {
             _ => panic!("expected table"),
         };
 
-        let err = ImageDeclaration::from_lua_table(&table)
+        let err = image_declaration_from_lua(&table)
             .expect_err("grub must fail declaration validation (issue #71)");
         let msg = err.to_string();
         assert!(
@@ -1755,7 +1755,7 @@ mod tests {
             _ => panic!("expected table"),
         };
 
-        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let decl = image_declaration_from_lua(&table).unwrap();
         let bl = decl.bootloader.as_ref().unwrap();
         assert_eq!(bl.type_, "systemd-boot");
         assert_eq!(bl.timeout, 5);
@@ -1790,7 +1790,7 @@ mod tests {
             _ => panic!("expected table"),
         };
 
-        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let decl = image_declaration_from_lua(&table).unwrap();
         let disk = decl.disk.as_ref().unwrap();
         assert_eq!(disk.label, "gpt");
         assert_eq!(disk.partitions.len(), 2);
@@ -2402,7 +2402,7 @@ mod tests {
             Value::Table(t) => t,
             _ => panic!("expected table"),
         };
-        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let decl = image_declaration_from_lua(&table).unwrap();
         let disk = decl.disk.as_ref().unwrap();
         assert_eq!(disk.partitions[2].role, "state");
         assert!(is_state_partition(&disk.partitions[2]));
@@ -3932,7 +3932,7 @@ CONFIG_EXT4_FS=m
             )
             .eval()
             .unwrap();
-        let decl = ImageDeclaration::from_lua_table(off.as_table().unwrap()).unwrap();
+        let decl = image_declaration_from_lua(off.as_table().unwrap()).unwrap();
         assert!(!decl.disk.as_ref().unwrap().ab, "ab defaults off");
         assert!(decl.update_source.is_none(), "update_source defaults off");
 
@@ -3948,7 +3948,7 @@ CONFIG_EXT4_FS=m
             )
             .eval()
             .unwrap();
-        let decl = ImageDeclaration::from_lua_table(on.as_table().unwrap()).unwrap();
+        let decl = image_declaration_from_lua(on.as_table().unwrap()).unwrap();
         assert!(decl.disk.as_ref().unwrap().ab, "disk.ab = true parses");
         assert_eq!(
             decl.update_source.as_deref(),
@@ -5717,7 +5717,7 @@ RequiredBy=boot-complete.target
             Value::Table(t) => t,
             _ => panic!("expected table"),
         };
-        let decl = ImageDeclaration::from_lua_table(&table).unwrap();
+        let decl = image_declaration_from_lua(&table).unwrap();
         assert_eq!(
             decl.kernel.as_ref().unwrap().channel.as_deref(),
             Some("latest/stable")

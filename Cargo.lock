@@ -1773,7 +1773,6 @@ dependencies = [
  "tar",
  "tempfile",
  "toml",
- "xz2",
  "zip",
 ]
 
@@ -1793,14 +1792,18 @@ dependencies = [
 name = "nau-infra"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "indicatif",
+ "miette",
  "owo-colors",
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tempfile",
  "toml",
  "ureq",
+ "xz2",
 ]
 
 [[package]]
