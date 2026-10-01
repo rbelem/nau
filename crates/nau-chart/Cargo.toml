@@ -1,0 +1,43 @@
+[package]
+name = "nau-chart"
+version = "0.1.0"
+edition = "2021"
+description = "nau's definition/eval domain: Lua DSL, eval, analysis, check/lint/audit/lock/index/deps (ADR-0051, ADR-0053)"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The spine (ADR-0051 Decision 3): snap value types, manifest IR, channel
+# math, the unit planner, cache keys, the blob-store seam, plugin names.
+nau-core = { path = "../nau-core" }
+# The non-domain leaf (issue #326): terminal presentation and external
+# tool provisioning.
+nau-infra = { path = "../nau-infra" }
+# Eval engine and worker VMs.
+mlua = { version = "0.12", features = ["luau"] }
+# The strict-analyzer Rust-side gate: definitions are Luau; the `luau`
+# feature is load-bearing (type annotations).
+full_moon = { version = "2", features = ["luau"] }
+# Error vocabulary (unified with the root's fancy feature).
+miette = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Content hashes: dep-closure pins, source verification.
+sha2 = "0.10"
+base64 = "0.22"
+# Dependency-closure fetch (ADR-0017): npm/pip/cargo/go tarballs, wheels,
+# module zips; uv.lock is TOML.
+flate2 = "1"
+tar = "0.4"
+xz2 = "0.1"
+zip = "2"
+toml = "0.8"
+# Worker containment (rlimits) and fetch staging.
+libc = "0.2"
+tempfile = "3"
+
+[build-dependencies]
+# Luau analyzer build (see build.rs + shim/): upstream C++ compiled with cc.
+cc = { version = "1.2", features = ["parallel"] }
+# build.rs unpacks the vendored Luau analyzer tarball.
+flate2 = "1"
+tar = "0.4"

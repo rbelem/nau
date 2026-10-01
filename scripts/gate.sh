@@ -107,6 +107,32 @@ else
     echo "gate: loop-device axis: losetup absent — verify_image_verifies_a_real_block_device will SKIP (visible by policy)"
 fi
 
+# ── dep-direction (ADR-0051 R1) ──
+# The crate walls are compiler-enforced, but the ALLOWED edges need an
+# assertion while the workspace grows (issue #326 acceptance): nau-core
+# and nau-infra depend on NO workspace crate; nau-chart's workspace
+# deps ⊆ {nau-core, nau-infra}; the root composes everything. Read from
+# `cargo tree` (the resolved graph, not the manifest's hopes). Runs
+# before the long axes: a violating edge fails the gate in seconds.
+echo "gate: dep-direction (ADR-0051 R1): checking workspace edges"
+dep_dir_fail() {
+    echo "gate: FAIL — dep-direction (ADR-0051 R1): $1" >&2
+    exit 1
+}
+tree_nau_names() { # $1 = crate; every nau-* crate name in its normal+build+dev graph
+    local out
+    out="$(cargo tree -p "$1" -e normal,build,dev --prefix none)" \
+        || dep_dir_fail "cargo tree -p $1 failed — fix the invocation, never trust an empty graph"
+    printf '%s\n' "$out" | sed -E 's/^ *//; s/ v.*//' | grep -E '^nau-' | sort -u
+}
+offenders="$(tree_nau_names nau-core | grep -vx nau-core || true)"
+[ -z "$offenders" ] || dep_dir_fail "nau-core -> {$(echo $offenders)}: nau-core depends on a workspace crate (ADR-0051 R1: the spine depends on nothing)"
+offenders="$(tree_nau_names nau-infra | grep -vx nau-infra || true)"
+[ -z "$offenders" ] || dep_dir_fail "nau-infra -> {$(echo $offenders)}: nau-infra depends on a workspace crate (the leaf depends on nothing)"
+offenders="$(tree_nau_names nau-chart | grep -vx -e nau-chart -e nau-core -e nau-infra || true)"
+[ -z "$offenders" ] || dep_dir_fail "nau-chart -> {$(echo $offenders)}: nau-chart workspace deps must be within {nau-core, nau-infra}"
+echo "gate: dep-direction (ADR-0051 R1): nau-core ok; nau-infra ok; nau-chart ok (root composes all)"
+
 NAU_SYSTEMD=off cargo test
 cargo clippy -- -D warnings
 cargo fmt --check

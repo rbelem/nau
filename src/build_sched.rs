@@ -45,18 +45,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
-/// The coordinator's default build-slot count (issue #55), also the
-/// default of the `workers.local_jobs` config key (ADR-0040 Decision 3):
-/// the pool is config-driven now, and this constant is only the value
-/// an absent `workers` table falls back to.
-///
-/// Deliberately a fixed constant, not `nproc`: every worker runs a full
-/// toolchain invocation (compiler + mksquashfs), so RAM and I/O multiply
-/// with concurrency (the ADR-0022 sizing caveat — this bound exists so a
-/// 15 GB build box is not exhausted). 3 saturates the ready sets of the
-/// current package graph; raising it via `local_jobs`/`jobs` multiplies
-/// RAM and I/O the same way, so size the pool to the box.
-pub const MAX_PARALLEL_BUILD_WORKERS: usize = 3;
+// Moved down to nau-core (issue #326): the chart eval engine shares the
+// pool budget as vocabulary. Re-exported so every
+// `crate::build_sched::MAX_PARALLEL_BUILD_WORKERS` path keeps resolving.
+pub use nau_core::MAX_PARALLEL_BUILD_WORKERS;
 
 /// Why a scheduled run stopped short of building every node.
 #[derive(Debug, Clone, PartialEq, Eq)]

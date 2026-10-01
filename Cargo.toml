@@ -9,7 +9,7 @@ license = "GPL-3.0-only"
 # the lib's domain seams peel off into member crates one per PR. resolver
 # "2" is implied by the root package's edition 2021, pinned here explicitly.
 [workspace]
-members = ["crates/nau-core"]
+members = ["crates/nau-core", "crates/nau-infra", "crates/nau-chart"]
 resolver = "2"
 
 [dependencies]
@@ -17,15 +17,19 @@ resolver = "2"
 # manifest IR, plugin option values. Domains may depend on it; it never
 # depends on a domain or on this root package.
 nau-core = { path = "crates/nau-core" }
+# The non-domain leaf (issue #326): terminal presentation and external
+# tool provisioning. Same direction rule as nau-core.
+nau-infra = { path = "crates/nau-infra" }
+# The chart domain (issue #326): Lua DSL, eval, analysis,
+# check/lint/audit/lock/index/deps. May depend on nau-core and nau-infra
+# only — never sideways; the root composes every domain.
+nau-chart = { path = "crates/nau-chart" }
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.12", features = ["luau"] }
 miette = { version = "7", features = ["fancy"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-# uv.lock parsing for the pip resolver (ADR-0017): uv's cross-platform
-# Python lockfile is TOML.
-toml = "0.8"
 base64 = "0.22"
 # Snap Store assertion verification (ADR-0011 step b): OpenPGP v4
 # RSA-SHA512 over assertion wire bytes (see src/assert.rs).
@@ -45,7 +49,6 @@ ed25519-dalek = "2"
 sha2 = "0.10"
 sha3 = "0.10"
 tempfile = "3"
-indicatif = "0.18"
 # Dependency-closure fetch (ADR-0017, issue #13): npm registry tarballs are
 # gzip tarballs — decode + extract with the same crates build.rs already
 # vendors (kept at identical versions; no new vendored code).
@@ -57,17 +60,8 @@ tar = "0.4"
 # the caller's PATH happens to carry: busybox tar rejects the high-dictionary
 # xz streams toolchain tarballs ship (rust dist = 128 MiB dict).
 xz2 = "0.1"
-# Go module zips (ADR-0017 extension, issue #40): the module proxy serves
-# each module as a ZIP archive (not a tar), read in-process at fetch time
-# with the standard library's DEFLATE stack — data-only, nothing executes.
-zip = "2"
-owo-colors = "4"
 libc = "0.2"
 clap_complete = "4"
-# The Rust-side definition parser (single parser for require seeding,
-# literal-require enforcement, and schema-diagnostic spans). The `luau`
-# feature is load-bearing: definitions are Luau, incl. type annotations.
-full_moon = { version = "2", features = ["luau"] }
 # LAN peer discovery (ADR-0033 Decisions 3+4, src/discovery.rs): the ONE
 # new runtime crate of the peer-sharing feature. mdns-sd is synchronous
 # pure Rust with no async-runtime dependency. Its transitive tree (from
@@ -100,13 +94,6 @@ dbus-secret-service = { version = "4", features = ["crypto-rust", "vendored"] }
 # bundled — no reliance on the host trust store); the gzip/json/charset
 # defaults are dead weight for streaming raw binaries — off.
 ureq = { version = "2", default-features = false, features = ["tls"] }
-
-[build-dependencies]
-# Luau analyzer build (see build.rs + shim/): upstream C++ compiled with cc.
-cc = { version = "1.2", features = ["parallel"] }
-# build.rs unpacks the vendored Luau analyzer tarball.
-flate2 = "1"
-tar = "0.4"
 
 [profile.release]
 # The image build embeds this binary into every image it builds at

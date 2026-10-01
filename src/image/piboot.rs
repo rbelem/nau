@@ -51,9 +51,10 @@ use miette::{IntoDiagnostic, WrapErr};
 
 use super::*;
 
-/// The `bootloader.type` value selecting this backend — the gadget.yaml
-/// bootloader name the pi gadget itself declares (`bootloader: piboot`).
-pub(crate) const BOOTLOADER_PIBOOT: &str = "piboot";
+// The name moved down to nau_core::channels (issue #326): the chart lint
+// battery asserts against it. pub(crate) use (not a plain use) so the
+// module globs in image/mod.rs keep carrying `crate::image::BOOTLOADER_PIBOOT`.
+pub(crate) use nau_core::channels::BOOTLOADER_PIBOOT;
 
 /// `true` when the image declared `bootloader.type = "piboot"`.
 pub(crate) fn is_piboot_boot(image: &ImageDeclaration) -> bool {

@@ -667,11 +667,11 @@ fn cache_write(cache_dir: &Path, query: &serde_json::Value, fetched: &Fetched) {
 /// resolves PATH-first with the provisioned fallback, and `ensure` is its
 /// mid-build entry (for curl it is the resolve path).
 fn curl_tool() -> miette::Result<PathBuf> {
-    let resolved = crate::tools::ensure(crate::tools::ToolName::Curl)
+    let resolved = nau_infra::tools::ensure(nau_infra::tools::ToolName::Curl)
         .map_err(|e| miette::miette!("resolve curl: {e}"))?;
     Ok(match resolved {
-        crate::tools::ResolvedTool::Provisioned { path, .. }
-        | crate::tools::ResolvedTool::Path { path, .. } => path,
+        nau_infra::tools::ResolvedTool::Provisioned { path, .. }
+        | nau_infra::tools::ResolvedTool::Path { path, .. } => path,
     })
 }
 
@@ -761,7 +761,7 @@ fn fetch_queries(cfg: &AuditConfig, queries: &[serde_json::Value]) -> FetchOutco
             }
             Err(reason) => {
                 degraded = true;
-                crate::output::warn(format!(
+                nau_infra::output::warn(format!(
                     "OSV querybatch failed — serving what the local cache has: {reason}"
                 ));
             }

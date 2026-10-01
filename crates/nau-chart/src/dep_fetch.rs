@@ -32,15 +32,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::lock::PackageDepsLock;
-use crate::runtime::RuntimeStore;
-use crate::snap::{DepsLockSpec, SnapMeta};
+use nau_core::blob_store::BlobStore;
+use nau_core::snap_types::{DepsLockSpec, SnapMeta};
 
 /// Default PyPI simple index for pip resolvers (overridable per resolver
 /// via `deps.pip.index` — tests point it at a loopback server).
@@ -73,7 +73,7 @@ pub const DEFAULT_GO_PROXY: &str = "https://proxy.golang.org";
 /// keep the last-known pin intact until the caller commits the new one —
 /// rollback stays hash-pinned either way (ADR-0017 Decision 5).
 pub fn ensure_pod_deps(
-    store: &RuntimeStore,
+    store: &BlobStore,
     meta: &SnapMeta,
     prev: Option<&PackageDepsLock>,
     floating: bool,
@@ -116,7 +116,7 @@ pub fn ensure_pod_deps(
                     hash
                 );
             }
-            crate::output::warn(format!(
+            nau_infra::output::warn(format!(
                 "floating package '{}': dependency closure changed ({:.12} → {:.12})",
                 meta.name, old, hash
             ));
@@ -129,7 +129,7 @@ pub fn ensure_pod_deps(
         None => {
             // TOFU (ADR-0017 Decision 3): print the hash; the lockfile IS
             // the pin record.
-            crate::output::ok(format!(
+            nau_infra::output::ok(format!(
                 "pinned dependency closure for '{}': {:.12}… (recorded in nau.lock)",
                 meta.name, hash
             ));
@@ -148,9 +148,9 @@ pub fn ensure_pod_deps(
 /// directory (`recipe/` lock path — the audit field beside the pin);
 /// `None` for source-tree locks.
 fn fetch_deps_closure(
-    store: &RuntimeStore,
+    store: &BlobStore,
     meta: &SnapMeta,
-    deps: &crate::snap::PackageDeps,
+    deps: &nau_core::snap_types::PackageDeps,
     recipe_dir: Option<&Path>,
 ) -> miette::Result<(String, Option<String>)> {
     let work = tempfile::tempdir().map_err(|e| miette::miette!("tempdir: {e}"))?;
@@ -172,7 +172,7 @@ fn fetch_deps_closure(
     let tree = fetch_tree_dir(work.path())?;
     fetch_all_resolvers(deps, &src_root, recipe_dir, &tree, work.path())?;
     let bytes = pack_canonical(&tree)?;
-    let hash = write_store_blob(store, &bytes)?;
+    let hash = store.write_blob(&bytes)?;
     Ok((hash, lock_sha256))
 }
 
@@ -185,7 +185,7 @@ fn fetch_tree_dir(work: &Path) -> miette::Result<PathBuf> {
 
 /// Run every declared ecosystem resolver against the fetched source tree.
 fn fetch_all_resolvers(
-    deps: &crate::snap::PackageDeps,
+    deps: &nau_core::snap_types::PackageDeps,
     src_root: &Path,
     recipe_dir: Option<&Path>,
     tree: &Path,
@@ -210,7 +210,7 @@ fn fetch_all_resolvers(
 /// fresh temp dir for the build sandbox to mount read-only (ADR-0017
 /// Decision 3: "the sandbox build verifies the hash before use").
 pub fn materialize_deps_entry(
-    store: &RuntimeStore,
+    store: &BlobStore,
     deps_hash: &str,
 ) -> miette::Result<tempfile::TempDir> {
     let blob = store.blob_path(deps_hash);
@@ -256,7 +256,7 @@ fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<PathBuf> {
     }
     let filename = url.rsplit('/').next().unwrap_or("source.tar.gz");
     let tarball = work.join(filename);
-    let spinner = crate::output::spinner(&format!(
+    let spinner = nau_infra::output::spinner(&format!(
         "fetching dependency closure for {} (downloading source)...",
         meta.name
     ));
@@ -273,7 +273,7 @@ fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<PathBuf> {
                     "SHA-256 mismatch for {url}:\n  expected: {expected}\n  got:      {sha}"
                 ));
             }
-            crate::output::warn(format!(
+            nau_infra::output::warn(format!(
                 "floating source of {} re-resolved: {:.12}… → {:.12}… (restamping the pin)",
                 meta.name, expected, sha
             ));
@@ -282,11 +282,11 @@ fn fetch_source_tree(meta: &SnapMeta, work: &Path) -> miette::Result<PathBuf> {
     let src_dir = work.join("src");
     std::fs::create_dir_all(&src_dir)
         .map_err(|e| miette::miette!("creating {}: {e}", src_dir.display()))?;
-    // Issue #170: extraction is in-process (crate::snap::extract_tarball) —
+    // Issue #170: extraction is in-process (crate::pkg_source::extract_tarball) —
     // never at the mercy of the caller PATH's `tar` binary.
-    crate::snap::extract_tarball(&tarball, &src_dir)
+    crate::pkg_source::extract_tarball(&tarball, &src_dir)
         .map_err(|e| e.wrap_err(format!("failed to extract {filename}")))?;
-    crate::output::finish_ok(&spinner, &format!("fetched source of {}", meta.name));
+    nau_infra::output::finish_ok(&spinner, &format!("fetched source of {}", meta.name));
     Ok(find_source_root(&src_dir))
 }
 
@@ -414,7 +414,7 @@ fn apply_npm_exclude(mut artifacts: Vec<NpmArtifact>, exclude: &[String]) -> Vec
         {
             Some(i) => {
                 matched[i] = true;
-                crate::output::warn(format!(
+                nau_infra::output::warn(format!(
                     "npm closure: excluding '{}' (matched deps.npm.exclude '{}')",
                     artifact.key, exclude[i]
                 ));
@@ -423,13 +423,13 @@ fn apply_npm_exclude(mut artifacts: Vec<NpmArtifact>, exclude: &[String]) -> Vec
             None => true,
         }
     });
-    crate::output::info(format!(
+    nau_infra::output::info(format!(
         "npm exclude: {} of {total} package(s) dropped by deps.npm.exclude",
         total - artifacts.len()
     ));
     for (pattern, hit) in exclude.iter().zip(&matched) {
         if !hit {
-            crate::output::warn(format!(
+            nau_infra::output::warn(format!(
                 "npm closure: exclude pattern '{pattern}' matched nothing (typo?)"
             ));
         }
@@ -457,7 +457,7 @@ fn fetch_npm_closure(
     if !spec.exclude.is_empty() {
         artifacts = apply_npm_exclude(artifacts, &spec.exclude);
     }
-    crate::output::info(format!(
+    nau_infra::output::info(format!(
         "npm closure: {} package(s) from {}",
         artifacts.len(),
         spec.lock
@@ -765,7 +765,7 @@ fn parse_uv_lock(bytes: &[u8], target_minor: Option<u8>) -> miette::Result<Vec<P
         }
     }
     if !dev_skipped.is_empty() {
-        crate::output::warn(format!(
+        nau_infra::output::warn(format!(
             "uv.lock: skipping {} dev-only package(s): {}",
             dev_skipped.len(),
             truncated_name_list(&dev_skipped)
@@ -784,7 +784,7 @@ fn parse_uv_lock(bytes: &[u8], target_minor: Option<u8>) -> miette::Result<Vec<P
 /// the pod interpreter cannot import.
 fn pin_for_package(pkg: &UvPackage, target_minor: Option<u8>) -> Option<PipPin> {
     let Some(wheels) = &pkg.wheels else {
-        crate::output::warn(format!(
+        nau_infra::output::warn(format!(
             "uv.lock: {} {} has no wheels (sdist-only or non-registry source) — skipped",
             pkg.name, pkg.version
         ));
@@ -796,7 +796,7 @@ fn pin_for_package(pkg: &UvPackage, target_minor: Option<u8>) -> Option<PipPin> 
         .and_then(|s| s.registry.as_deref())
         .is_none()
     {
-        crate::output::warn(format!(
+        nau_infra::output::warn(format!(
             "uv.lock: {} {} is not from a registry — skipped",
             pkg.name, pkg.version
         ));
@@ -819,7 +819,7 @@ fn pin_for_package(pkg: &UvPackage, target_minor: Option<u8>) -> Option<PipPin> 
         })
         .min_by_key(|w| wheel_python_rank(w, target_minor))
     else {
-        crate::output::warn(format!(
+        nau_infra::output::warn(format!(
             "uv.lock: {} {} has no wheel for this platform — skipped",
             pkg.name, pkg.version
         ));
@@ -1035,7 +1035,7 @@ fn fetch_pip_closure(
     let lock_bytes = read_lock_file(src_root, recipe_dir, &spec.lock)?;
     let target_python = spec.python.as_deref().map(parse_python_minor).transpose()?;
     let pins = parse_pip_pins(&lock_bytes, target_python)?;
-    crate::output::info(format!(
+    nau_infra::output::info(format!(
         "pip closure: {} package(s) from {} via {index}",
         pins.len(),
         spec.lock
@@ -1043,7 +1043,7 @@ fn fetch_pip_closure(
     let excludes: Vec<String> = spec.exclude.iter().map(|n| normalize_name(n)).collect();
     for pin in &pins {
         if excludes.contains(&normalize_name(&pin.name)) {
-            crate::output::info(format!(
+            nau_infra::output::info(format!(
                 "pip closure: skipping {} (deps.pip exclude)",
                 pin.name
             ));
@@ -1144,7 +1144,7 @@ fn fetch_pip_wheel_direct(
         }
         None => {
             let actual = sha256_file(&dest)?;
-            crate::output::warn(format!(
+            nau_infra::output::warn(format!(
                 "pip: wheel {filename} fetched unpinned (hash {actual:.16}… — pin it in the lock)"
             ));
             Ok(())
@@ -1203,7 +1203,7 @@ fn fetch_pip_wheel_index(
         }
         None => {
             let actual = sha256_file(&dest)?;
-            crate::output::warn(format!(
+            nau_infra::output::warn(format!(
                 "pip: wheel {filename} fetched unpinned (hash {actual:.16}… — add --hash=sha256 to the lock to pin)"
             ));
         }
@@ -1414,7 +1414,7 @@ fn fetch_cargo_closure(
     let api = spec.index.as_deref().unwrap_or(DEFAULT_CRATES_API);
     let lock_bytes = read_lock_file(src_root, recipe_dir, &spec.lock)?;
     let crates = parse_cargo_lock(&lock_bytes)?;
-    crate::output::info(format!(
+    nau_infra::output::info(format!(
         "cargo closure: {} crate(s) from {}",
         crates.len(),
         spec.lock
@@ -1616,7 +1616,7 @@ fn fetch_go_closure(
     let sum_bytes = read_lock_file(src_root, recipe_dir, sum_path)?;
     let modules = parse_go_requires(&mod_bytes)?;
     let sums = parse_go_sum(&sum_bytes)?;
-    crate::output::info(format!(
+    nau_infra::output::info(format!(
         "go closure: {} module(s) from {} (go.sum)",
         modules.len(),
         spec.lock
@@ -2055,34 +2055,7 @@ fn unpack_file_entry(line: &str, body: &[u8], dest: &Path) -> miette::Result<usi
 
 // ── Store blob plumbing ──
 
-/// Write `bytes` into the pod store content-addressed by its sha256
-/// (atomic: temp file + rename). Returns the hash (= the `deps_hash`).
-fn write_store_blob(store: &RuntimeStore, bytes: &[u8]) -> miette::Result<String> {
-    let hash = hex_sha256(bytes);
-    let path = store.blob_path(&hash);
-    if path.exists() {
-        return Ok(hash);
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| miette::miette!("blob path has no parent"))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| miette::miette!("creating {}: {e}", parent.display()))?;
-    let tmp = parent.join(format!(
-        ".blob-tmp-{}-{}",
-        std::process::id(),
-        &hash[..12.min(hash.len())]
-    ));
-    {
-        let mut f =
-            File::create(&tmp).map_err(|e| miette::miette!("creating {}: {e}", tmp.display()))?;
-        f.write_all(bytes)
-            .map_err(|e| miette::miette!("writing {}: {e}", tmp.display()))?;
-    }
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| miette::miette!("finalizing {}: {e}", path.display()))?;
-    Ok(hash)
-}
+// ── Store blob plumbing: writes go through nau_core::blob_store::BlobStore ──
 
 // ── Small shared helpers ──
 
@@ -2090,11 +2063,11 @@ fn write_store_blob(store: &RuntimeStore, bytes: &[u8]) -> miette::Result<String
 /// resolves PATH-first with the provisioned fallback, and `ensure` is its
 /// mid-build entry (for curl it is the resolve path).
 fn curl_tool() -> miette::Result<PathBuf> {
-    let resolved = crate::tools::ensure(crate::tools::ToolName::Curl)
+    let resolved = nau_infra::tools::ensure(nau_infra::tools::ToolName::Curl)
         .map_err(|e| miette::miette!("resolve curl: {e}"))?;
     Ok(match resolved {
-        crate::tools::ResolvedTool::Provisioned { path, .. }
-        | crate::tools::ResolvedTool::Path { path, .. } => path,
+        nau_infra::tools::ResolvedTool::Provisioned { path, .. }
+        | nau_infra::tools::ResolvedTool::Path { path, .. } => path,
     })
 }
 
@@ -2226,7 +2199,7 @@ fn resolve_lock(
 /// missing recipe lock fails BEFORE any source download; the per-resolver
 /// fetches re-read the same files.
 fn recipe_lock_sha256(
-    deps: &crate::snap::PackageDeps,
+    deps: &nau_core::snap_types::PackageDeps,
     src_root: &Path,
     recipe_dir: Option<&Path>,
 ) -> miette::Result<Option<String>> {
@@ -2310,6 +2283,8 @@ fn iso_date(epoch_secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -3159,8 +3134,8 @@ require github.com/only/one v0.1.0
         let dir = tempfile::tempdir().unwrap();
         // Build two zips with identical content in different member
         // insertion order.
-        let mut a = zip::ZipWriter::new(std::fs::File::create(dir.path().join("a.zip")).unwrap());
-        let mut b = zip::ZipWriter::new(std::fs::File::create(dir.path().join("b.zip")).unwrap());
+        let a = zip::ZipWriter::new(std::fs::File::create(dir.path().join("a.zip")).unwrap());
+        let b = zip::ZipWriter::new(std::fs::File::create(dir.path().join("b.zip")).unwrap());
         let afile = b"package a\n";
         let bfile = b"package b\n";
         // a.zip: b then a; b.zip: a then b.

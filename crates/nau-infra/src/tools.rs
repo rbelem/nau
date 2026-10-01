@@ -83,11 +83,13 @@ const STAMP: &str = ".stamp";
 const DEFAULT_ROOT_SUFFIX: &str = ".local/share/nau/tools";
 const ENV_TOOLS_DIR: &str = "NAU_TOOLS_DIR";
 /// Provisioning moves a few MB total; generous body ceiling, short
-/// connect fail-fast.
-pub(crate) const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Crate-visible so the vault source (src/secrets.rs) rides the SAME
-/// timeout contract as the fetch stack instead of duplicating numbers.
-pub(crate) const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+/// connect fail-fast. Pub: the vault source (the root crate's
+/// secrets.rs) rides the SAME timeout contract as the fetch stack
+/// instead of duplicating numbers.
+pub const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The fetch total-timeout twin of [`FETCH_CONNECT_TIMEOUT`] (see the
+/// note there — shared with the root crate's vault source).
+pub const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Exec-probe budget: three tries with a short gap covers the flaky
 /// ETXTBSY a heavily forking host can return for a just-closed file.
 const PROBE_ATTEMPTS: u32 = 3;
@@ -322,7 +324,7 @@ impl std::error::Error for ToolsError {
 
 /// The in-tree manifest bytes, compiled into the binary: the git repo is
 /// the root of trust, same as the nau binary itself.
-pub const MANIFEST_TOML: &str = include_str!("../tools-manifest.toml");
+pub const MANIFEST_TOML: &str = include_str!("../../../tools-manifest.toml");
 
 /// Parse manifest bytes. Tolerates an empty tools list (the shipped state
 /// until the CI lane attaches artifacts).
@@ -812,8 +814,8 @@ mod tests {
 
     /// Env vars are process-global; cargo runs tests in parallel threads.
     /// Every test that reads or mutates tool-related env holds this lock —
-    /// the shared crate-wide one (src/test_env.rs); the per-module
-    /// statics of the pre-#186 era excluded nothing across modules.
+    /// the shared crate-wide one (the infra-local `test_env` copy); the
+    /// per-module statics of the pre-#186 era excluded nothing across modules.
     use crate::test_env::ENV_LOCK;
 
     /// Points `NAU_TOOLS_DIR` at a tempdir for the test's lifetime and

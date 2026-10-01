@@ -739,3 +739,24 @@ pub struct SnapPart {
     /// boundary). Build-time only — never emitted to snap.yaml.
     pub plugin_options: Option<BTreeMap<String, PluginValue>>,
 }
+
+// ── Arch resolution (issue #326 down-move) ──
+
+/// Determine the set of architectures to build.
+///
+/// * If `cli_archs` is non-empty, use those (from `--arch` flags).
+/// * Otherwise use the architectures declared in `meta`.
+/// * If neither is set, default to `["all"]`.
+///
+/// Pure vocabulary over [`SnapMeta`], consumed by the build path and the
+/// chart manifest builder alike (ADR-0051 Decision 3).
+pub fn resolve_archs(meta: &SnapMeta, cli_archs: &[String]) -> Vec<String> {
+    if !cli_archs.is_empty() {
+        cli_archs.to_vec()
+    } else {
+        meta.architectures
+            .clone()
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| vec!["all".to_string()])
+    }
+}

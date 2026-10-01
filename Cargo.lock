@@ -1727,20 +1727,18 @@ name = "nau"
 version = "0.1.0"
 dependencies = [
  "base64",
- "cc",
  "clap",
  "clap_complete",
  "dbus-secret-service",
  "ed25519-dalek",
  "flate2",
- "full_moon",
- "indicatif",
  "libc",
  "mdns-sd",
  "miette",
  "mlua",
+ "nau-chart",
  "nau-core",
- "owo-colors",
+ "nau-infra",
  "pgp",
  "rand",
  "rsa",
@@ -1751,8 +1749,30 @@ dependencies = [
  "sha3",
  "tar",
  "tempfile",
- "toml",
  "ureq",
+ "xz2",
+ "zip",
+]
+
+[[package]]
+name = "nau-chart"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "cc",
+ "flate2",
+ "full_moon",
+ "libc",
+ "miette",
+ "mlua",
+ "nau-core",
+ "nau-infra",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "toml",
  "xz2",
  "zip",
 ]
@@ -1765,6 +1785,22 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "nau-infra"
+version = "0.1.0"
+dependencies = [
+ "indicatif",
+ "owo-colors",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+ "ureq",
 ]
 
 [[package]]

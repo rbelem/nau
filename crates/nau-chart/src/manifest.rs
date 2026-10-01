@@ -67,14 +67,14 @@ use std::path::Path;
 
 use miette::WrapErr;
 
-use crate::image::ImageDeclaration;
 use crate::lock::LockFile;
 use crate::lua::Outputs;
-use crate::snap::{PackageInput, SnapMeta, SnapRef};
+use nau_core::manifest_ir::ImageDeclaration;
+use nau_core::snap_types::{PackageInput, SnapMeta, SnapRef};
 
 // Re-exported from the IR home ([`crate::manifest_ir`], #317) so every
 // pre-existing `crate::manifest::` path keeps compiling.
-pub use crate::manifest_ir::{
+pub use nau_core::manifest_ir::{
     Artifact, ArtifactState, BuiltBlob, ImageEntry, ImageManifest, ManifestInput, ManifestSnap,
     PinSource, SnapOutputEntry, SnapRole, MANIFEST_VERSION,
 };
@@ -210,7 +210,7 @@ fn snap_output_entry(meta: &SnapMeta, lockfile: &LockFile) -> miette::Result<Sna
             Some(meta.version.clone())
         },
         version_adopted: meta.version_adopted,
-        archs: crate::snap::resolve_archs(meta, &[]),
+        archs: nau_core::snap_types::resolve_archs(meta, &[]),
         closure_key: Some(closure_key),
         artifact: Artifact::unbuilt(),
     })
@@ -383,18 +383,18 @@ fn closure_key_for(meta: &SnapMeta, lockfile: &LockFile) -> miette::Result<Strin
         .iter()
         .map(|n| requires_member(n, lockfile))
         .collect();
-    Ok(crate::cache::BuildClosure::for_meta(meta, requires, build_deps).cache_key())
+    Ok(nau_core::cache_key::BuildClosure::for_meta(meta, requires, build_deps).cache_key())
 }
 
 /// One requires-closure member: lockfile pin when present (pure data),
 /// else declared-version pinning with `hash: None` — the exact fallback
 /// the binary cache uses.
-fn requires_member(name: &str, lockfile: &LockFile) -> crate::cache::RequiresMember {
-    if let Some(member) = crate::cache::pinned_member(name, lockfile) {
+fn requires_member(name: &str, lockfile: &LockFile) -> nau_core::cache_key::RequiresMember {
+    if let Some(member) = crate::lock::pinned_member(name, lockfile) {
         return member;
     }
     let pin = crate::deps::load_meta(name).ok().map(|meta| meta.version);
-    crate::cache::RequiresMember {
+    nau_core::cache_key::RequiresMember {
         name: name.to_string(),
         pin,
         hash: None,
@@ -512,7 +512,7 @@ mod tests {
             name: "kernel-system".into(),
             version: "2.0.0".into(),
             base: pinned("core22", 1847, HASH_A),
-            kernel: Some(crate::image::KernelEntry {
+            kernel: Some(nau_core::manifest_ir::KernelEntry {
                 snap: pinned("pc-kernel", 1241, HASH_B),
                 params: vec!["quiet".into(), "console=ttyS0".into()],
                 modules: vec!["btrfs".into()],
@@ -572,7 +572,7 @@ mod tests {
         // Declared: echoed so downstream consumers see the update config.
         let mut decl = image_with_snaps(pinned("core22", 1847, HASH_A), vec![]);
         decl.update_source = Some("https://updates.example.com/os/".into());
-        decl.disk = Some(crate::image::DiskLayout {
+        decl.disk = Some(nau_core::manifest_ir::DiskLayout {
             label: "gpt".into(),
             partitions: vec![],
             swap: None,

@@ -943,10 +943,10 @@ fn build_worker_lua(req: &EvalRequest) -> miette::Result<mlua::Lua> {
                     "fetch(): only http(s) URLs are supported",
                 ));
             }
-            let curl = match crate::tools::ensure(crate::tools::ToolName::Curl) {
+            let curl = match nau_infra::tools::ensure(nau_infra::tools::ToolName::Curl) {
                 Ok(resolved) => match resolved {
-                    crate::tools::ResolvedTool::Provisioned { path, .. }
-                    | crate::tools::ResolvedTool::Path { path, .. } => path,
+                    nau_infra::tools::ResolvedTool::Provisioned { path, .. }
+                    | nau_infra::tools::ResolvedTool::Path { path, .. } => path,
                 },
                 Err(e) => return Err(mlua::Error::runtime(format!("fetch(): {e}"))),
             };
