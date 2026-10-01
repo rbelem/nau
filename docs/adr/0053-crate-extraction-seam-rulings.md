@@ -85,6 +85,39 @@ Amended 2026-10-01 (council, 4 seats; same day, before PR 2):
    `(state_root, &BlobStore)` — the `<state-root>/store` pairing
    invariant is documented at both construction sites; promote the pair
    to a struct if more consumers appear.
+9. **Amended 2026-10-01 (PR 6, operator-granted #326 run):** the
+   `nau-pod` extraction's seven ruling-level deviations, verified
+   forced by the reviewer: (a) `services.rs` STAYS ROOT — `&RuntimeTools`
+   systemctl actuation in four production fns plus
+   `resolve_service_options` (root pod-grammar validation, pinned
+   STAY ROOT); the `farm::emit`→`services::emit` chain is replaced by
+   the root `emit_pod_surfaces` orchestrator (composition order
+   verified unobservable — services consumes only `units.json` recorded
+   at install); (b) `secrets.rs` SPLITS — the resolve half (providers,
+   envfile layer, `SecretSource`) moves to nau-pod, the verb layer
+   (eval-coupled via `load_declaration`, RuntimeTools-coupled via
+   refresh) stays root with its 61-test suite driving crate internals
+   through a doc-hidden seam; (c) the loader seam:
+   `PodDeclLoader<'a> = &dyn Fn(&str) -> Result<PodDeclaration>` is
+   injected into the moved loads/folds so eval stays root without
+   duplicating the walks — the §4-style alternative (down-move
+   `PodDeclaration`/`SecretSource` to core, eval to nau-chart) remains
+   a DEFERRED slot, not a rejection; (d) `list_packages`/`PodListEntry`
+   stay root (eval + `load_spec_meta` coupled); (e)
+   `split_version_suffix` down-moves chart::lint → `nau_core::snap_types`
+   (farm's collision classifier consumes it); (f) the zero-churn rule
+   is amended: no semantic test changes, but seam-forced mechanical
+   call-site adaptations in tests/ are sanctioned under review (PR 6:
+   4 lines, `&store` → `&store.store_view()`); (g) the root-suite
+   doc-hidden `pub` surface on nau-pod is 20 items (re-privatize at the
+   final reconciliation). Pre-moves recorded: `SANDBOX_RO_ROOTS` →
+   `nau_core::snap_types`; `generation_view` promoted to
+   `StoreView { state_root, blob_store }` (amendment 8's promotion,
+   now consumer-justified) with `RuntimeStore::store_view()` as the
+   adapter; ureq/dbus-secret-service follow their consumer into
+   nau-pod (dbus as root dev-dep for the live-D-Bus gated test).
+   Known pre-existing flake candidate (not this diff): doctor's bwrap
+   probe can hit an ETXTBSY spawn race under parallel load.
 
 ## Context
 
