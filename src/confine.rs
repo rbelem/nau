@@ -781,7 +781,7 @@ mod tests {
                     .collect();
                 for flag in BWRAP_ACCEPTED_FLAGS {
                     assert!(
-                        tokens.contains(&flag),
+                        tokens.contains(flag),
                         "hardcoded flag {flag} missing from real bwrap --help"
                     );
                 }

@@ -7399,8 +7399,10 @@ pod {
 
         let mut meta = bare_meta("tool", "1.0");
         meta.build = Some("echo new".into());
-        let mut build = ReconcileBuild::default();
-        build.refresh_members = std::collections::BTreeSet::from(["other".to_string()]);
+        let mut build = ReconcileBuild {
+            refresh_members: std::collections::BTreeSet::from(["other".to_string()]),
+            ..Default::default()
+        };
         let scope =
             scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
         assert!(matches!(scope, OwnScope::SkipInstalled));
@@ -7412,8 +7414,10 @@ pod {
         );
 
         // The NAMED member of the same refresh still rebuilds.
-        let mut build = ReconcileBuild::default();
-        build.refresh_members = std::collections::BTreeSet::from(["tool".to_string()]);
+        let mut build = ReconcileBuild {
+            refresh_members: std::collections::BTreeSet::from(["tool".to_string()]),
+            ..Default::default()
+        };
         let scope =
             scope_own_package(&fixture.ctx(), true, false, false, &mut meta, &mut build).unwrap();
         assert!(matches!(scope, OwnScope::Build));
@@ -7745,15 +7749,19 @@ pod {
         let meta = bare_meta("tool", "1.0");
         let mut fixture = hold_fixture(installed_loaded_tool(Some(meta.build_input_digest())));
 
-        let mut build = ReconcileBuild::default();
-        build.refresh_members = std::collections::BTreeSet::from(["tool".to_string()]);
+        let build = ReconcileBuild {
+            refresh_members: std::collections::BTreeSet::from(["tool".to_string()]),
+            ..Default::default()
+        };
         assert!(
             loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
             "a refresh-named loaded member must rebuild"
         );
 
-        let mut build = ReconcileBuild::default();
-        build.recipe_drift_members = std::collections::BTreeSet::from(["tool".to_string()]);
+        let build = ReconcileBuild {
+            recipe_drift_members: std::collections::BTreeSet::from(["tool".to_string()]),
+            ..Default::default()
+        };
         assert!(
             loaded_hold_record(&fixture.ctx(), &meta, &build).is_none(),
             "a recipe-drifted loaded member must rebuild"
@@ -7933,7 +7941,7 @@ pod {
         lock.save(&pod_lock_path(dir.path(), "upstream")).unwrap();
 
         let mut consumer_lock = LockFile::empty();
-        let mut ctx = ReconcileCtx {
+        let ctx = ReconcileCtx {
             store: &store,
             lock: &mut consumer_lock,
             lock_path: dir.path(),
@@ -7947,7 +7955,7 @@ pod {
             source_pod: Some("upstream".into()),
         };
         let mut build = ReconcileBuild::default();
-        build_loaded_member(&mut ctx, &meta, &contributed, &mut build)
+        build_loaded_member(&ctx, &meta, &contributed, &mut build)
             .expect("the declaring pod's pin must route the build past the gate");
         assert_eq!(build.pending.len(), 1, "the member must queue a build");
         assert_eq!(build.pending[0].name, "codegraph");
@@ -7980,7 +7988,7 @@ pod {
             .unwrap();
 
         let mut consumer_lock = LockFile::empty();
-        let mut ctx = ReconcileCtx {
+        let ctx = ReconcileCtx {
             store: &store,
             lock: &mut consumer_lock,
             lock_path: dir.path(),
@@ -7994,7 +8002,7 @@ pod {
             source_pod: Some("upstream".into()),
         };
         let mut build = ReconcileBuild::default();
-        let err = build_loaded_member(&mut ctx, &meta, &contributed, &mut build).unwrap_err();
+        let err = build_loaded_member(&ctx, &meta, &contributed, &mut build).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("loaded package 'codegraph' (from pod 'upstream')"),

@@ -1712,7 +1712,7 @@ gated_test!(missing_lock_failure_names_both_candidate_paths, &[], {
 /// go.mod. `say` is what the dependency's exported function returns —
 /// the closure's identity.
 fn write_go_dep_module(server: &Path, module: &str, version: &str, say: &str) -> (String, String) {
-    let escaped = module.replace('!', "!");
+    let escaped = module.to_string();
     let mdir = server.join(format!("{escaped}/@v"));
     let _ = std::fs::remove_dir_all(server.join(&escaped));
     std::fs::create_dir_all(&mdir).unwrap();

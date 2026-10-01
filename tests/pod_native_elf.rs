@@ -245,7 +245,7 @@ gated_test!(native_elf_with_bundled_lib_builds_wrapper_and_farm_execs, {
         .unwrap()
         .to_path_buf();
     assert!(
-        target.starts_with(&gen_dir.join("ld-wrappers")),
+        target.starts_with(gen_dir.join("ld-wrappers")),
         "farm entry must target the emit-time LD wrapper: {target:?}"
     );
     let store_dir = std::fs::canonicalize(pod_dir(root.path(), "default").join("store")).unwrap();
@@ -402,7 +402,7 @@ gated_test!(hermetic_sandbox_drops_inherited_ldflags_pollution, {
         .unwrap()
         .to_path_buf();
     assert!(
-        target.starts_with(&gen_dir.join("ld-wrappers")),
+        target.starts_with(gen_dir.join("ld-wrappers")),
         "farm entry must target the emit-time LD wrapper: {target:?}"
     );
     let real_elf = gen_dir.join("extensions/nelf/usr/usr/bin").join("app.real");

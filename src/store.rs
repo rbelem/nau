@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn env_snap_id_parses_name_id_pairs_across_separators() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("NAU_SNAP_IDS");
         assert_eq!(env_snap_id("hello-world"), None);
 
@@ -626,7 +626,7 @@ mod tests {
 
     #[test]
     fn snap_id_with_prefers_the_env_override_without_a_store_query() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("NAU_SNAP_IDS", "hello-world=snapid123");
         let id = StoreClient::snap_id_with(&NoRunner, "hello-world").unwrap();
         assert_eq!(id, "snapid123");
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn snap_id_with_reports_a_missing_snap_id_and_names_the_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let runner = FakeStore::new().route(
             "snaps/info/",
             ok_json(r#"{"channel-map": [], "snap-id": null}"#),

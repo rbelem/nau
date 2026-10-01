@@ -1336,7 +1336,7 @@ kernel/drivers/md/dm-verity.ko: kernel/drivers/md/dm-bufio.ko
         // Mirrors `discover_initramfs_tools`' selection: a busybox findfs
         // candidate sorts first (busybox-static < util-linux-static) and must
         // not win for the `findfs` tool.
-        let bins = vec![
+        let bins = [
             PathBuf::from("/nix/store/aaa-busybox-static-x/bin/findfs"),
             PathBuf::from("/nix/store/ccc-util-linux-static-x/bin/findfs"),
         ];

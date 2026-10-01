@@ -705,7 +705,7 @@ fn cross_pod_same_endpoint_collides_without_bus_calls() {
     for name in ["alpha", "beta"] {
         let pod = rig.pod(name);
         let unit = service_unit("valkey", true, "hash-a", &["--port", "6379"]);
-        seed_generation(&pod, 1, &[unit.clone()]);
+        seed_generation(&pod, 1, std::slice::from_ref(&unit));
         seed_generation(&pod, 2, &[unit]);
         set_active(&pod, 2);
     }
@@ -750,12 +750,12 @@ fn cross_pod_same_endpoint_with_one_disabled_coexists() {
     let rig = RollbackRig::new();
     let alpha = rig.pod("alpha");
     let unit = service_unit("valkey", true, "hash-a", &["--port", "6379"]);
-    seed_generation(&alpha, 1, &[unit.clone()]);
+    seed_generation(&alpha, 1, std::slice::from_ref(&unit));
     seed_generation(&alpha, 2, &[unit]);
     set_active(&alpha, 2);
     let beta = rig.pod("beta");
     let disabled = service_unit("valkey", false, "hash-a", &["--port", "6379"]);
-    seed_generation(&beta, 1, &[disabled.clone()]);
+    seed_generation(&beta, 1, std::slice::from_ref(&disabled));
     seed_generation(&beta, 2, &[disabled]);
     set_active(&beta, 2);
 

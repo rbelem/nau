@@ -1829,7 +1829,7 @@ mod tests {
         copy_kernel_tree(kdir.path(), root.path()).unwrap();
 
         let staged_modules = root.path().join("lib/modules");
-        let staged_ver = staged_modules.join(&version);
+        let staged_ver = staged_modules.join(version);
         // A REAL directory — never the symlink spelling copied verbatim.
         let meta = std::fs::symlink_metadata(&staged_modules).unwrap();
         assert!(

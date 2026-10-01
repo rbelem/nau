@@ -264,7 +264,7 @@ mod tests {
     impl CommandRunner for FakeKeygen {
         fn run(&self, argv: &[String]) -> io::Result<RunnerOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
-            let mut fail = self.fail_after.lock().unwrap();
+            let fail = self.fail_after.lock().unwrap();
             if let Some(n) = *fail {
                 if self.calls.lock().unwrap().len() > n {
                     return Ok(RunnerOutput {

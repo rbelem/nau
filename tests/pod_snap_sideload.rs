@@ -122,6 +122,7 @@ fn make_tarball(server_dir: &Path, name: &str) {
 
 /// Write a resolvable package that builds a real executable into
 /// $STAGE/bin/<bin> and exposes it as the app `app`.
+#[allow(clippy::too_many_arguments)] // clippy-mechanical: fixture mirrors the real 8-arg shape
 fn write_pkg_version(
     project: &Path,
     name: &str,
@@ -151,6 +152,7 @@ fn write_pkg_version(
 /// Build `name` in a BUILDER pod and copy the built payload out of the
 /// pod's downloads dir into `dest_dir`, preserving the artifact
 /// filename. Returns the copied payload's path.
+#[allow(clippy::too_many_arguments)] // clippy-mechanical: fixture mirrors the real 10-arg shape
 fn build_payload(
     project: &Path,
     root: &Path,
@@ -1267,7 +1269,7 @@ fn active_generation_link(root: &Path, pod: &str) -> u64 {
     let target = std::fs::read_link(pod_dir(root, pod).join("active")).unwrap();
     target
         .components()
-        .last()
+        .next_back()
         .unwrap()
         .as_os_str()
         .to_str()

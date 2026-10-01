@@ -1126,9 +1126,7 @@ vda7  0657fd6d-a4ab-43c4-84e5-0933c84b4f4f vda\n"
         assert_eq!(root_a.partlabel, "nau-80_1.0_a");
         assert_eq!(root_a.partno, Some(2));
         assert_eq!(root_a.pkname, "vda");
-        assert!(parts
-            .iter()
-            .all(|p| p.parttype.chars().all(|c| c.is_ascii())));
+        assert!(parts.iter().all(|p| p.parttype.is_ascii()));
     }
 
     #[test]
