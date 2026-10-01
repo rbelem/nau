@@ -8,6 +8,12 @@ maintainability** — explicitly not binary size (ADR-0050 measured that gate
 NO-GO). One shipped binary stands; the modularity is delivered as an
 internal crate workspace along ADR-0049's domain seams.
 
+Amended 2026-10-01 by ADR-0053 (operator-ratified): Decision 2's
+"vendored analyzer + `build.rs` in `nau-build` ONLY" allocation moves to
+`nau-chart` — the consumption evidence placed every analyzer consumer in
+the chart domain. Decision 5's gate-day budget starts early: the
+dep-direction graph assertion lands with the `nau-chart` PR.
+
 ## Context
 
 ADR-0050 closed the second-artifact split on measurement. The operator then
