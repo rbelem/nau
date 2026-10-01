@@ -65,6 +65,26 @@ Amended 2026-10-01 (council, 4 seats; same day, before PR 2):
    `nau-core::{units, store}`; runtime's default-path consts
    (`DEFAULT_STATE_DIR`, `DEFAULT_EXTENSIONS_LINK_DIR`) likewise, with
    runtime re-exporting.
+8. **Amended 2026-10-01 (PR 5, operator-granted #326 run):** the
+   amendment-3 records pattern repeats ahead of the consuming crate:
+   `InstalledPackage`, `Generation`, and `farm::ClaimLayer` move DOWN
+   into `nau_core::pkg_manifest` (peer consumes them; nau-runtime
+   extracts later and keeps root re-exports), together with the
+   pkg_manifest mint half (`mint_manifest`, `load_signing_key`,
+   `union_inbox`, `inbox_manifests`) — the root file becomes a pure
+   re-export shim. The pod layout grammar (`DEFAULT_POD`, `pod_dir`,
+   `validate_pod_name`, `resolve_pod_dir_under`) lands in
+   `nau_core::paths`; the env-reading `pod_root` STAYS root until the
+   pod PR rules it (same shape as amendment 3's GLOBAL_PATHS ruling —
+   recorded here so it is not decided silently). `DEFAULT_SERVE_ADDRESS`
+   moves to `nau_core::paths` with chart re-exporting (chart has no
+   business owning a serve default). The runtime generation-read seam
+   is completed per the design note already in `runtime.rs`:
+   `nau_core::generation_view` owns `generation_dir`/`active_generation`
+   verbatim, `RuntimeStore` delegates, and peer's serve/export take
+   `(state_root, &BlobStore)` — the `<state-root>/store` pairing
+   invariant is documented at both construction sites; promote the pair
+   to a struct if more consumers appear.
 
 ## Context
 
