@@ -232,7 +232,7 @@ pub(crate) fn assert_piboot_preconditions(
 const PIBOOT_REQUIRED_BUILTIN: [&str; 3] = ["CONFIG_EXT4_FS", "CONFIG_MMC", "CONFIG_MMC_BLOCK"];
 
 /// `true` when the config text carries the exact `CONFIG_X=y` line (same
-/// match rule as [`doctor::audit_kernel_verity_config`]).
+/// match rule as [`audit::audit_kernel_verity_config`]).
 fn has_builtin_line(config_text: &str, config: &str) -> bool {
     let wanted = format!("{config}=y");
     config_text.lines().any(|l| l.trim() == wanted)
@@ -296,7 +296,7 @@ pub(crate) fn audit_piboot_kernel(
              no-initramfs boot contract is unverified (issue #87)"
         )
     })?;
-    let path = doctor::find_kernel_config(dir, version).ok_or_else(|| {
+    let path = audit::find_kernel_config(dir, version).ok_or_else(|| {
         miette::miette!(
             "no kernel config found under {} for {version} — the piboot chain boots \
              without an initramfs, so built-in ext4/MMC support must be auditable from \
@@ -334,11 +334,11 @@ pub(crate) struct PiBootStage<'a> {
 /// The unsquashfs argv[0] (issue #101 seam): resolved through the tools
 /// module (provisioned-first, PATH fallback).
 fn unsquashfs_argv0() -> miette::Result<String> {
-    let resolved = crate::tools::resolve(crate::tools::ToolName::Unsquashfs)
+    let resolved = nau_infra::tools::resolve(nau_infra::tools::ToolName::Unsquashfs)
         .map_err(|e| miette::miette!("resolve unsquashfs: {e}"))?;
     Ok(match resolved {
-        crate::tools::ResolvedTool::Provisioned { path, .. }
-        | crate::tools::ResolvedTool::Path { path, .. } => path.to_string_lossy().into_owned(),
+        nau_infra::tools::ResolvedTool::Provisioned { path, .. }
+        | nau_infra::tools::ResolvedTool::Path { path, .. } => path.to_string_lossy().into_owned(),
     })
 }
 
@@ -356,7 +356,7 @@ fn unsquashfs_gadget(runner: &dyn CommandRunner, snap: &Path, dir: &Path) -> mie
     let out = runner
         .run(&argv)
         .map_err(|e| miette::miette!("unsquashfs: {e}"))?;
-    if crate::command::exit_code(&out) < 128 {
+    if nau_infra::command::exit_code(&out) < 128 {
         Ok(())
     } else {
         Err(miette::miette!(
@@ -535,7 +535,7 @@ pub(crate) fn stage_pi_boot_assets(inp: PiBootStage) -> miette::Result<PathBuf> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::RunnerOutput;
+    use nau_infra::command::RunnerOutput;
 
     /// The stock pi-gadget rev 132 `config.txt` head (measured, 2026-09-13):
     /// the lines the backend depends on, plus a board section that must

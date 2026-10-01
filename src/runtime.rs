@@ -100,17 +100,17 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 use crate::store::StoreClient;
-use crate::units::{
+// The unit vocabulary is all core now (PR-3 down-move: the payload
+// structs + classification joined the planner in `nau_core::units`).
+use nau_core::units::{
     classify, plan_app, spec_from_payload_app, DaemonUnit, PayloadSnap, RuntimeClass,
 };
 
 // ── Constants ──
 
-/// Default state root for generations + the content store.
-pub const DEFAULT_STATE_DIR: &str = "/var/lib/nau";
-
-/// Default systemd-sysext scan directory the activation links live in.
-pub const DEFAULT_EXTENSIONS_LINK_DIR: &str = "/var/lib/extensions";
+// The default-path vocabulary moved DOWN into `nau_core::paths` (issue
+// #326 PR 3, R4: the image state layer names the same defaults).
+pub use nau_core::paths::{DEFAULT_EXTENSIONS_LINK_DIR, DEFAULT_STATE_DIR};
 
 /// On-device trust anchor embedded at image build time (ADR-0011 step (d)).
 pub const DEVICE_ANCHOR: &str = "/etc/nau/update-key.pub";
@@ -4143,7 +4143,7 @@ plugs:
         // the signature is valid (it covers body ++ provenance) and the
         // subject digest binds the body — only the materials lie. The
         // device path must refuse the attestation by name.
-        let mut lying = crate::sign::Provenance::for_manifest(
+        let mut lying = crate::sign::provenance_for_manifest(
             "9.9.9",
             "amd64",
             "latest/stable",

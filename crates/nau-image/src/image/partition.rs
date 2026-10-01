@@ -508,7 +508,7 @@ pub(crate) fn read_partition_extents(
     if out.code != 0 {
         return Err(miette::miette!(
             "sfdisk -J failed reading back the partition table ({}): {}",
-            crate::command::exit_code(&out),
+            nau_infra::command::exit_code(&out),
             out.stderr.trim()
         ));
     }
@@ -694,7 +694,7 @@ pub(crate) fn build_ext4_partition(
             "{tool} -d failed to build the {} partition '{}' (exit {}): {}",
             part.fs,
             part.name,
-            crate::command::exit_code(&out),
+            nau_infra::command::exit_code(&out),
             out.stderr.trim()
         ));
     }
@@ -1046,7 +1046,7 @@ fn mkfs_vfat_partition(
              mkfs.vfat cannot produce one",
             part.fs,
             part.name,
-            crate::command::exit_code(&out),
+            nau_infra::command::exit_code(&out),
             out.stderr.trim()
         ));
     }
@@ -1599,7 +1599,7 @@ fn resolve_snap_ids(
                  it to the image declaration"
             ));
         }
-        let id = crate::store::StoreClient::snap_id_with(runner, &store_name_for(name))?;
+        let id = nau_infra::store::StoreClient::snap_id_with(runner, &store_name_for(name))?;
         eprintln!("  ✓ snap-id {name} = {id}");
         ids.insert(name.to_string(), id);
     }
@@ -1611,8 +1611,8 @@ fn resolve_snap_ids(
 fn store_name_for(name: &str) -> String {
     let path = std::env::var("NAU_INDEX_PATH")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(crate::index::DEFAULT_INDEX));
-    let Ok(index) = crate::index::PackageIndex::load_or_default(&path) else {
+        .unwrap_or_else(|_| std::path::PathBuf::from(nau_core::index::DEFAULT_INDEX));
+    let Ok(index) = nau_core::index::PackageIndex::load_or_default(&path) else {
         return name.to_string();
     };
     index
@@ -1624,11 +1624,11 @@ fn store_name_for(name: &str) -> String {
 /// The unsquashfs argv[0] (issue #101 seam): resolved through the tools
 /// module (provisioned-first, PATH fallback).
 fn unsquashfs_argv0() -> miette::Result<String> {
-    let resolved = crate::tools::resolve(crate::tools::ToolName::Unsquashfs)
+    let resolved = nau_infra::tools::resolve(nau_infra::tools::ToolName::Unsquashfs)
         .map_err(|e| miette::miette!("resolve unsquashfs: {e}"))?;
     Ok(match resolved {
-        crate::tools::ResolvedTool::Provisioned { path, .. }
-        | crate::tools::ResolvedTool::Path { path, .. } => path.to_string_lossy().into_owned(),
+        nau_infra::tools::ResolvedTool::Provisioned { path, .. }
+        | nau_infra::tools::ResolvedTool::Path { path, .. } => path.to_string_lossy().into_owned(),
     })
 }
 
@@ -1758,9 +1758,9 @@ mod tests {
         stdout: String,
     }
 
-    impl crate::command::CommandRunner for SfdiskReader {
-        fn run(&self, _argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
-            Ok(crate::command::RunnerOutput {
+    impl nau_infra::command::CommandRunner for SfdiskReader {
+        fn run(&self, _argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
+            Ok(nau_infra::command::RunnerOutput {
                 code: self.code,
                 stdout: self.stdout.clone().into_bytes(),
                 stderr: if self.code == 0 {
@@ -1906,15 +1906,15 @@ mod tests {
         }
     }
 
-    impl crate::command::CommandRunner for RecordingRunner {
-        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+    impl nau_infra::command::CommandRunner for RecordingRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
             let code = if argv.first().is_some_and(|p| p == "mkfs.ext4") {
                 self.mkfs_code
             } else {
                 0
             };
-            Ok(crate::command::RunnerOutput {
+            Ok(nau_infra::command::RunnerOutput {
                 code,
                 stdout: Vec::new(),
                 stderr: String::new(),

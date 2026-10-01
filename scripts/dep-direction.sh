@@ -17,13 +17,17 @@
 # A workspace member with NO row in the table fails loudly: the policy
 # must grow deliberately, never by omission.
 #
-# Table (ADR-0053 council amendments):
+# Table (ADR-0053 council amendments + issue #326 PR 3 rulings):
 #   nau-core   {}                      — the spine depends on nothing
-#   nau-infra  {}                      — the leaf depends on nothing
+#   nau-infra  {nau-core}              — the mechanism leaf consumes the
+#                                        spine (store/assert → SnapRef)
 #   nau-chart  {nau-core, nau-infra}   — the eval domain
 #   nau-build  {nau-core, nau-infra}   — the build domain; dev-edge:
 #              nau-chart (§4 constructors + dsl prelude in tests;
 #              expires at the final reconciliation, ADR-0053)
+#   nau-image  {nau-core, nau-infra}   — the image domain; dev-edge:
+#              nau-chart (§4 image_declaration_from_lua + INIT_LUA in
+#              tests; expires at the final reconciliation, ADR-0053)
 #   nau (root) exempt                  — the root composes everything
 set -euo pipefail
 
@@ -39,9 +43,10 @@ fail() {
 allowed_normal() {
     case "$1" in
         nau-core)   echo "" ;;
-        nau-infra)  echo "" ;;
+        nau-infra)  echo "nau-core" ;;
         nau-chart)  echo "nau-core nau-infra" ;;
         nau-build)  echo "nau-core nau-infra" ;;
+        nau-image)  echo "nau-core nau-infra" ;;
         *)          return 1 ;;
     esac
 }
@@ -55,6 +60,10 @@ dev_allowed() {
         # nau-chart (orphan rule pins them there). EXPIRES at the final
         # reconciliation PR (ADR-0053).
         nau-build)  echo "nau-chart" ;;
+        # §4 sanctioned entry: the image tests drive
+        # image_declaration_from_lua + dsl::INIT_LUA through nau-chart.
+        # EXPIRES at the final reconciliation PR (ADR-0053).
+        nau-image)  echo "nau-chart" ;;
         *) return 1 ;;
     esac
 }

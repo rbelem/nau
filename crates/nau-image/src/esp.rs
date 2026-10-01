@@ -16,7 +16,7 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, WrapErr};
 
-use crate::command::{exit_code, CommandRunner};
+use nau_infra::command::{exit_code, CommandRunner};
 
 /// The directory on the ESP where systemd-boot discovers UKIs.
 pub const ESP_UKI_DIR: &str = "/EFI/Linux";
@@ -128,7 +128,7 @@ pub fn parse_partition_offset(json: &str, name: &str) -> miette::Result<u64> {
     ))
 }
 
-fn check_success(out: &crate::command::RunnerOutput, what: &str) -> miette::Result<()> {
+fn check_success(out: &nau_infra::command::RunnerOutput, what: &str) -> miette::Result<()> {
     let code = exit_code(out);
     if code != 0 {
         return Err(miette::miette!(
@@ -142,7 +142,7 @@ fn check_success(out: &crate::command::RunnerOutput, what: &str) -> miette::Resu
 fn run(
     runner: &dyn CommandRunner,
     argv: &[String],
-) -> miette::Result<crate::command::RunnerOutput> {
+) -> miette::Result<nau_infra::command::RunnerOutput> {
     runner.run(argv).into_diagnostic().wrap_err_with(|| {
         format!(
             "failed to run '{}'",

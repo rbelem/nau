@@ -21,21 +21,24 @@ use miette::{IntoDiagnostic, WrapErr};
 use mlua::Value;
 use serde::{Deserialize, Serialize};
 
-use crate::command::CommandRunner;
-use crate::doctor;
-use crate::lock::LockFile;
+use crate::audit;
 #[cfg(test)]
-use crate::snap::image_declaration_from_lua;
-use crate::snap::SnapRef;
-use crate::store::ResolvedSnap;
+use nau_chart::snap_lua::image_declaration_from_lua;
+use nau_core::lock::LockFile;
+use nau_core::snap_types::SnapRef;
+use nau_core::store::ResolvedSnap;
+use nau_infra::command::CommandRunner;
 
-// Moved to the IR home ([`crate::manifest_ir`], #317); re-exported so
+// Moved to the IR home ([`nau_core::manifest_ir`], #317); re-exported so
 // every pre-existing `crate::image::` path keeps compiling.
-pub use crate::manifest_ir::{
+pub use nau_core::manifest_ir::{
     BootloaderConfig, DiskLayout, ImageDeclaration, KernelEntry, Partition, StagedFile, SwapConfig,
 };
 
-#[cfg(test)]
+// The `cfg(test)` gate came off for the uc seed-assertion relocation
+// (issue #326 PR 3): the root integration tests build their fixture
+// through this module, so it ships as (hidden) public fixture surface.
+#[doc(hidden)]
 pub mod test_support {
     //! Shared test fixtures — a minimal UC image declaration usable from
     //! sibling module tests (e.g. [`crate::uc`]). Constructing an
@@ -43,7 +46,7 @@ pub mod test_support {
     //! builder keeps sibling test modules from duplicating it.
 
     use super::{ImageDeclaration, KernelEntry};
-    use crate::snap::SnapRef;
+    use nau_core::snap_types::SnapRef;
 
     pub fn sample_image() -> ImageDeclaration {
         ImageDeclaration {
@@ -95,7 +98,7 @@ pub type ImageOutputs = HashMap<String, ImageDeclaration>;
 /// through this adapter. (`RealRunner` executes the exact argv handed to it;
 /// `build_image`/`build_disk_image` pass this unit value down. Kept a named
 /// alias so the seam has ONE production spelling for the whole pipeline.)
-pub(crate) use crate::command::RealRunner as ImageTools;
+pub(crate) use nau_infra::command::RealRunner as ImageTools;
 
 // ── Image assembly pipeline ──
 
@@ -420,7 +423,7 @@ pub(crate) fn build_disk_image_with(
         // it refuses.
         let home = verify::operator_home()?;
         let kp = load_signing_key_fail_closed(&home)?;
-        let pubring = crate::sign::sysupdate_pubring_pgp(&kp, &home)
+        let pubring = crate::sysupdate::sysupdate_pubring_pgp(&kp, &home)
             .wrap_err("deriving the sysupdate import-pubring.pgp trust set")?;
         embed_import_pubring(&root, &pubring)?;
         // #291 (council M2): the anchor's verifier is the GUEST's gpg —
@@ -475,10 +478,10 @@ pub(crate) fn build_disk_image_with(
         // 5d-i. The trusted key set: every local anchor, plus the current
         // signing key (its anchor is installed by `keygen`/`promote`, but
         // be defensive — an operator who deleted the anchor still signs).
-        let keys_dir = crate::sign::keys_dir(&home);
-        let trusted_dir = root.join(crate::sign::TRUSTED_KEYS_EMBED_DIR);
+        let keys_dir = nau_core::sign::keys_dir(&home);
+        let trusted_dir = root.join(nau_core::sign::TRUSTED_KEYS_EMBED_DIR);
         std::fs::create_dir_all(&trusted_dir).into_diagnostic()?;
-        let chain = crate::sign::Keychain::load_dir(&keys_dir)?;
+        let chain = nau_core::sign::Keychain::load_dir(&keys_dir)?;
         let mut embedded = 0usize;
         for anchor in &local_anchor_files(&keys_dir)? {
             let name = anchor
@@ -492,7 +495,7 @@ pub(crate) fn build_disk_image_with(
             embedded += 1;
         }
         if !chain.key_ids().contains(&kp.key_id()) {
-            let path = crate::sign::install_public_key(&kp, &trusted_dir)?;
+            let path = nau_core::sign::install_public_key(&kp, &trusted_dir)?;
             eprintln!(
                 "  ℹ embedding the signing key as its own trust anchor: {}",
                 path.file_name().unwrap().to_string_lossy()
@@ -502,26 +505,26 @@ pub(crate) fn build_disk_image_with(
 
         // 5d-ii. The revocation list (ids only, no key material) — the
         // device distinguisher between "revoked" and "never trusted".
-        let revoked = crate::sign::read_revoked_keys(&keys_dir)?;
+        let revoked = nau_core::sign::read_revoked_keys(&keys_dir)?;
         let revoked_body: String = revoked.iter().map(|id| format!("{id}\n")).collect();
         std::fs::write(
-            root.join(crate::sign::REVOKED_KEYS_EMBED_PATH),
+            root.join(nau_core::sign::REVOKED_KEYS_EMBED_PATH),
             revoked_body,
         )
         .into_diagnostic()
-        .wrap_err_with(|| format!("writing /{}", crate::sign::REVOKED_KEYS_EMBED_PATH))?;
+        .wrap_err_with(|| format!("writing /{}", nau_core::sign::REVOKED_KEYS_EMBED_PATH))?;
 
         // 5d-iii. Backward-compatible signing-key anchor.
-        let key_path = root.join(crate::sign::PUBKEY_EMBED_PATH);
+        let key_path = root.join(nau_core::sign::PUBKEY_EMBED_PATH);
         std::fs::create_dir_all(key_path.parent().unwrap()).into_diagnostic()?;
-        std::fs::write(&key_path, crate::sign::public_key_file(&kp)).into_diagnostic()?;
+        std::fs::write(&key_path, nau_core::sign::public_key_file(&kp)).into_diagnostic()?;
         eprintln!(
             "  ✓ update trust material embedded: /{}/ ({} anchor(s), {} revoked) + /{} \
              (key id {})",
-            crate::sign::TRUSTED_KEYS_EMBED_DIR,
+            nau_core::sign::TRUSTED_KEYS_EMBED_DIR,
             embedded,
             revoked.len(),
-            crate::sign::PUBKEY_EMBED_PATH,
+            nau_core::sign::PUBKEY_EMBED_PATH,
             kp.key_id()
         );
     }
@@ -543,7 +546,7 @@ pub(crate) fn build_disk_image_with(
     // The doctor readiness twin (issue #65): warn-never-fail, unlike the
     // fail-closed `resolve_state_split` below. Reports on the same
     // condition so the build output carries the doctor's named finding.
-    doctor::audit_state_partition(image, disk_layout);
+    audit::audit_state_partition(image, disk_layout);
     // ADR-0024 §3: a declared non-root mount (notably the ESP) must reach
     // /etc/fstab or `systemd-bless-boot good` cannot find the ESP. The
     // fstab is emitted when EITHER a declared mount exists OR the state
@@ -604,7 +607,7 @@ pub(crate) fn build_disk_image_with(
                 .as_ref()
                 .map(|d| d.path().join("kernel-snap"))
                 .unwrap_or_else(|| root.clone());
-            doctor::audit_kernel_verity_config(&config_dir, &payload.version);
+            audit::audit_kernel_verity_config(&config_dir, &payload.version);
             // ADR-0024 §1 hard gate: the initrd must carry the boot-chain
             // modules the kernel config builds as modules. Fail closed
             // BEFORE any destructive step — a kernel that cannot see its
@@ -613,7 +616,7 @@ pub(crate) fn build_disk_image_with(
             let config_dir = config_dir.as_path();
             // Doctor's initrd inventory report line (issue #65) —
             // warn-never-fail; the gate below is the hard one.
-            doctor::audit_kernel_initrd_modules(
+            audit::audit_kernel_initrd_modules(
                 runner,
                 config_dir,
                 &payload.version,
@@ -1141,13 +1144,13 @@ pub(super) fn calculate_disk_size_mb(layout: &DiskLayout) -> u64 {
 /// CLOSED when there is none (ADR-0024 §4). A build never mints or trusts
 /// a key: the ceremony (`nau key keygen`) is the operator's, and a
 /// key minted but not promoted must not anchor device verification.
-fn load_signing_key_fail_closed(home: &Path) -> miette::Result<crate::sign::KeyPair> {
-    crate::sign::load_secret_key(home)?.ok_or_else(|| {
+fn load_signing_key_fail_closed(home: &Path) -> miette::Result<nau_core::sign::KeyPair> {
+    nau_core::sign::load_secret_key(home)?.ok_or_else(|| {
         miette::miette!(
             "image declares update_source but no signing key exists at {} — run \
              `nau key keygen` first (a build never mints a key: an untrusted key \
              cannot anchor device verification)",
-            crate::sign::secret_key_path(home).display()
+            nau_core::sign::secret_key_path(home).display()
         )
     })
 }
@@ -1155,7 +1158,7 @@ fn load_signing_key_fail_closed(home: &Path) -> miette::Result<crate::sign::KeyP
 /// Every `*.pub` file in a local trust-anchor directory, sorted (the
 /// byte-stable order an image embed needs). A missing directory is an
 /// empty set — the build's no-anchor case fails earlier on the missing
-/// signing key. Mirrors [`crate::sign::Keychain::load_dir`]'s selection.
+/// signing key. Mirrors [`nau_core::sign::Keychain::load_dir`]'s selection.
 fn local_anchor_files(dir: &Path) -> miette::Result<Vec<PathBuf>> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Ok(Vec::new());
@@ -1350,6 +1353,9 @@ pub(super) fn cp_r(src: &Path, dst: &Path) -> miette::Result<()> {
 // `pub(crate) use` globs re-export every moved item so existing
 // `crate::image::<item>` paths keep resolving without widening visibility.
 mod boot;
+// The root slot_recovery module (runtime domain) names these two through
+// the root crate's `crate::image::` shim (issue #326 PR 3).
+pub use boot::{root_transfer, SYSUPDATE_DIR};
 mod initramfs;
 mod mounts;
 mod partition;
@@ -1381,7 +1387,7 @@ mod tests {
 
     fn lua_env() -> mlua::Lua {
         let lua = mlua::Lua::new();
-        lua.load(crate::dsl::INIT_LUA)
+        lua.load(nau_chart::dsl::INIT_LUA)
             .exec()
             .expect("DSL init failed");
         lua
@@ -2228,8 +2234,8 @@ mod tests {
         assert!(
             err.contains("no state partition")
                 && err.contains("role = \"state\"")
-                && err.contains(crate::runtime::DEFAULT_STATE_DIR)
-                && err.contains(crate::runtime::DEFAULT_EXTENSIONS_LINK_DIR),
+                && err.contains(nau_core::paths::DEFAULT_STATE_DIR)
+                && err.contains(nau_core::paths::DEFAULT_EXTENSIONS_LINK_DIR),
             "precise fail-closed message: {err}"
         );
 
@@ -3104,8 +3110,8 @@ WantedBy=multi-user.target
         }
     }
 
-    impl crate::command::CommandRunner for ObjcopyRunner {
-        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+    impl nau_infra::command::CommandRunner for ObjcopyRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
             let section = argv[3].clone();
             let out = &argv[5];
@@ -3118,7 +3124,7 @@ WantedBy=multi-user.target
                 _ => "newc-initrd".to_string(),
             };
             std::fs::write(out, body).unwrap();
-            Ok(crate::command::RunnerOutput {
+            Ok(nau_infra::command::RunnerOutput {
                 code: 0,
                 stdout: Vec::new(),
                 stderr: String::new(),
@@ -3260,9 +3266,9 @@ WantedBy=multi-user.target
 
     struct FailingObjcopyRunner;
 
-    impl crate::command::CommandRunner for FailingObjcopyRunner {
-        fn run(&self, _argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
-            Ok(crate::command::RunnerOutput {
+    impl nau_infra::command::CommandRunner for FailingObjcopyRunner {
+        fn run(&self, _argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
+            Ok(nau_infra::command::RunnerOutput {
                 code: 1,
                 stdout: Vec::new(),
                 stderr: "no such section".into(),
@@ -3442,13 +3448,13 @@ WantedBy=multi-user.target
         calls: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
-    impl crate::command::CommandRunner for RecordingUkifyRunner {
-        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+    impl nau_infra::command::CommandRunner for RecordingUkifyRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
             if let Some(output) = argv.iter().find(|a| a.starts_with("--output=")) {
                 std::fs::write(&output["--output=".len()..], b"MZ-fake-uki").unwrap();
             }
-            Ok(crate::command::RunnerOutput {
+            Ok(nau_infra::command::RunnerOutput {
                 code: 0,
                 stdout: Vec::new(),
                 stderr: String::new(),
@@ -3571,10 +3577,10 @@ WantedBy=multi-user.target
         }
     }
 
-    impl crate::command::CommandRunner for GateRunner {
-        fn run(&self, argv: &[String]) -> std::io::Result<crate::command::RunnerOutput> {
+    impl nau_infra::command::CommandRunner for GateRunner {
+        fn run(&self, argv: &[String]) -> std::io::Result<nau_infra::command::RunnerOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
-            Ok(crate::command::RunnerOutput {
+            Ok(nau_infra::command::RunnerOutput {
                 code: 0,
                 stdout: self.stdout.clone(),
                 stderr: String::new(),
@@ -4231,18 +4237,21 @@ CONFIG_EXT4_FS=m
         // (sysupdate.d(5)); deterministic from the ceremony trust set, so
         // two builds at the same epoch embed identical bytes.
         let home = tempfile::tempdir().unwrap();
-        let kp = crate::sign::create_secret_key(home.path()).unwrap();
+        let kp = nau_core::sign::create_secret_key(home.path()).unwrap();
         let root = tempfile::tempdir().unwrap();
         embed_import_pubring(
             root.path(),
-            &crate::sign::sysupdate_pubring_pgp(&kp, home.path()).unwrap(),
+            &crate::sysupdate::sysupdate_pubring_pgp(&kp, home.path()).unwrap(),
         )
         .unwrap();
-        let embedded =
-            std::fs::read(root.path().join(crate::sign::IMPORT_PUBRING_EMBED_PATH)).unwrap();
+        let embedded = std::fs::read(
+            root.path()
+                .join(crate::sysupdate::IMPORT_PUBRING_EMBED_PATH),
+        )
+        .unwrap();
         assert_eq!(
             embedded,
-            crate::sign::sysupdate_pubring_pgp(&kp, home.path()).unwrap()
+            crate::sysupdate::sysupdate_pubring_pgp(&kp, home.path()).unwrap()
         );
         // A public key: parses, and carries no secret material.
         use pgp::composed::Deserializable;
@@ -5895,7 +5904,7 @@ RequiredBy=boot-complete.target
 
     mod command_seam {
         use super::*;
-        use crate::command::{CommandRunner, RunnerOutput};
+        use nau_infra::command::{CommandRunner, RunnerOutput};
         use std::sync::Mutex;
 
         /// The production base pin used by the e2e fixtures; the dummy
@@ -6280,7 +6289,7 @@ RequiredBy=boot-complete.target
             let dir = tempfile::tempdir().unwrap();
             let payload = dir.path().join("payload.snap");
             std::fs::write(&payload, b"dummy-snap").unwrap();
-            let digest = crate::store::sha3_384_file(&payload).unwrap();
+            let digest = nau_infra::store::sha3_384_file(&payload).unwrap();
             let named = dir
                 .path()
                 .join(format!("{BASE_NAME}_{BASE_REV}_{digest}.snap"));
@@ -6739,8 +6748,9 @@ RequiredBy=boot-complete.target
             let home_dir = tempfile::tempdir().unwrap();
             std::env::set_var("HOME", home_dir.path());
             let _home_guard = HomeGuard { old: old_home };
-            let kp = crate::sign::create_secret_key(home_dir.path()).unwrap();
-            crate::sign::install_public_key(&kp, &crate::sign::keys_dir(home_dir.path())).unwrap();
+            let kp = nau_core::sign::create_secret_key(home_dir.path()).unwrap();
+            nau_core::sign::install_public_key(&kp, &nau_core::sign::keys_dir(home_dir.path()))
+                .unwrap();
 
             let (_cache_dir, cache, digest) = cache_fixture();
             let image = ImageDeclaration {
@@ -7126,7 +7136,7 @@ RequiredBy=boot-complete.target
             "the error tells the operator to run keygen: {err:#}"
         );
         assert!(
-            !crate::sign::secret_key_path(home.path()).exists(),
+            !nau_core::sign::secret_key_path(home.path()).exists(),
             "a build must never mint a key"
         );
     }
@@ -7134,7 +7144,7 @@ RequiredBy=boot-complete.target
     #[test]
     fn update_source_with_a_promoted_key_uses_it() {
         let home = tempfile::tempdir().unwrap();
-        let kp = crate::sign::create_secret_key(home.path()).unwrap();
+        let kp = nau_core::sign::create_secret_key(home.path()).unwrap();
         let loaded = load_signing_key_fail_closed(home.path()).unwrap();
         assert_eq!(loaded, kp);
     }

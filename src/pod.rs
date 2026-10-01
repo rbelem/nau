@@ -7903,6 +7903,14 @@ pod {
     /// The blob is a minimal canonical archive (an empty closure tree).
     #[test]
     fn test_loaded_member_builds_through_the_declaring_pods_deps_pin() {
+        // The build resolves tools through the process-global
+        // `NAU_TOOLS_DIR` — hold the env lock so a concurrent doctor
+        // fixture cannot repoint it mid-build (issue #326 PR 3: the
+        // shrunken root suite re-ordered this test into the doctor
+        // fixtures' windows).
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use sha2::{Digest, Sha256};
         let content = b"END\n";
         let hash: String = Sha256::digest(content)

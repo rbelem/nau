@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use miette::{IntoDiagnostic, WrapErr};
 
 use super::*;
-use crate::snap;
-use crate::store::ResolvedSnap;
+use nau_core::store::ResolvedSnap;
+use nau_infra::pathsearch;
 
 /// sysupdate.d file name prefix for nau-generated transfers — ordering
 /// keeps root+verity ahead of the UKI within one sysupdate transaction.
-pub(crate) const SYSUPDATE_DIR: &str = "usr/lib/sysupdate.d";
+pub const SYSUPDATE_DIR: &str = "usr/lib/sysupdate.d";
 
 /// systemd-sysupdate trigger pair (ADR-0024 §2, #62). These are systemd's
 /// own unit names — nau ships no update daemon (ADR-0011 §5).
@@ -807,7 +807,7 @@ pub(crate) fn transfer_header() -> String {
 /// `Verify=yes` turns systemd-sysupdate into the update channel's
 /// enforcer: sysupdate fetches the release media's `SHA256SUMS` manifest
 /// together with its detached OpenPGP signature (`SHA256SUMS.gpg`,
-/// [`crate::sign::SYSUPDATE_MANIFEST_SIGNATURE_NAME`]) and refuses the
+/// [`crate::sysupdate::SYSUPDATE_MANIFEST_SIGNATURE_NAME`]) and refuses the
 /// whole transaction unless the signature verifies with gpg against
 /// `/usr/lib/systemd/import-pubring.pgp` inside the running (verity-
 /// protected) rootfs — sysupdate.d(5).
@@ -840,11 +840,11 @@ pub(crate) fn transfer_header() -> String {
 /// with the vendor keyring
 /// (`/usr/lib/systemd/import-pubring.pgp`, wired through
 /// `VENDOR_KEYRING_PATH` upstream) as the only trust input — the exact
-/// file the build embeds at [`crate::sign::IMPORT_PUBRING_EMBED_PATH`]
+/// file the build embeds at [`crate::sysupdate::IMPORT_PUBRING_EMBED_PATH`]
 /// before the root is hashed, so the anchor is covered by the dm-verity
 /// the device boots. The signature itself is OpenPGP over the RAW sums
 /// bytes (no canonicalization) with an **EdDSALegacy (algorithm 22)**
-/// Ed25519 identity — the framing `crate::sign::sign_sysupdate_manifest`
+/// Ed25519 identity — the framing `crate::sysupdate::sign_sysupdate_manifest`
 /// produces and what a `gpg --list-packets` on `SHA256SUMS.gpg` shows.
 /// sysupdate's SHA256SUMS parser then checks every payload hash
 /// UNCONDITIONALLY (`Verify=no` only lifts the signature gate, never the
@@ -869,23 +869,23 @@ Verify=yes";
 
 /// Embed the device trust SET for `Verify=yes`: the ceremony's OpenPGP
 /// identities at `/usr/lib/systemd/import-pubring.pgp`
-/// ([`crate::sign::IMPORT_PUBRING_EMBED_PATH`]), the exact file
+/// ([`crate::sysupdate::IMPORT_PUBRING_EMBED_PATH`]), the exact file
 /// systemd-sysupdate hands to gpg (sysupdate.d(5)). The bytes derive
 /// deterministically from the ceremony trust set
-/// ([`crate::sign::sysupdate_pubring_pgp`] — active key + designated
+/// ([`crate::sysupdate::sysupdate_pubring_pgp`] — active key + designated
 /// successor + rotated-out keys during the overlap window, #290) — same
 /// keys, same keyring, every build — and the file lands BEFORE root
 /// populate + dm-verity so it is hashed into the tree the device will
 /// trust.
 pub(crate) fn embed_import_pubring(root: &Path, pubring: &[u8]) -> miette::Result<()> {
-    let path = root.join(crate::sign::IMPORT_PUBRING_EMBED_PATH);
+    let path = root.join(crate::sysupdate::IMPORT_PUBRING_EMBED_PATH);
     std::fs::create_dir_all(path.parent().expect("pubring path has a parent")).into_diagnostic()?;
     std::fs::write(&path, pubring)
         .into_diagnostic()
-        .wrap_err_with(|| format!("writing /{}", crate::sign::IMPORT_PUBRING_EMBED_PATH))?;
+        .wrap_err_with(|| format!("writing /{}", crate::sysupdate::IMPORT_PUBRING_EMBED_PATH))?;
     eprintln!(
         "  ✓ sysupdate trust anchor set: /{} (gpg verifies SHA256SUMS.gpg, Verify=yes)",
-        crate::sign::IMPORT_PUBRING_EMBED_PATH
+        crate::sysupdate::IMPORT_PUBRING_EMBED_PATH
     );
     Ok(())
 }
@@ -911,7 +911,7 @@ pub(crate) fn embed_import_pubring(root: &Path, pubring: &[u8]) -> miette::Resul
 /// honors implicitly, NOT a match-pattern arm: every `MatchPattern=`
 /// string must carry `@v`, and a literal `_empty` arm makes the whole
 /// transfer file refuse to parse (measured: systemd 261).
-pub(crate) fn root_transfer(image_name: &str, base_url: &str) -> String {
+pub fn root_transfer(image_name: &str, base_url: &str) -> String {
     format!(
         "{header}\n\
          [Transfer]\n\
@@ -1456,14 +1456,14 @@ fn extract_pe_section(
 /// brick, so this FAILS CLOSED — an unavailable config, an unreadable or
 /// unrecognized initrd, and a missing module are all hard errors naming
 /// the exact cause. The required set is derived from the kernel config
-/// ([`doctor::inspect_initrd_modules`]), never hardcoded.
+/// ([`audit::inspect_initrd_modules`]), never hardcoded.
 pub(crate) fn audit_initrd_modules(
     runner: &dyn CommandRunner,
     payload_dir: &Path,
     payload: &KernelPayload,
 ) -> miette::Result<()> {
-    use crate::doctor::InitrdModuleAudit;
-    match doctor::inspect_initrd_modules(runner, payload_dir, &payload.version, &payload.initrd) {
+    use crate::audit::InitrdModuleAudit;
+    match audit::inspect_initrd_modules(runner, payload_dir, &payload.version, &payload.initrd) {
         InitrdModuleAudit::Satisfied(modules) if modules.is_empty() => {
             eprintln!(
                 "  ✓ initrd module audit: kernel {} builds the boot chain in — no \
@@ -1541,11 +1541,11 @@ pub(crate) fn discover_kernel_version(root: &Path) -> miette::Result<String> {
 }
 
 /// Resolve ukify with the same bind-aware PATH resolution the sandbox
-/// toolchain uses ([`crate::snap::resolve_in_path`]). ukify runs host-side
+/// toolchain uses ([`nau_infra::pathsearch::resolve_in_path`]). ukify runs host-side
 /// — like mksquashfs/dd — so the full host PATH is the right search set;
 /// the shared helper keeps one resolution behavior across nau.
 pub(crate) fn find_ukify() -> Option<PathBuf> {
-    snap::resolve_in_path("ukify", &snap::path_entries())
+    pathsearch::resolve_in_path("ukify", &pathsearch::path_entries())
 }
 
 /// The prebuilt UKI name in the real Ubuntu Core `pc-kernel` snap (#70).
@@ -1555,7 +1555,7 @@ pub(crate) const KERNEL_EFI_NAME: &str = "kernel.efi";
 /// [`find_ukify`] uses. Needed only for the prebuilt-UKI payload fallback
 /// (#70): a `kernel.efi` has no raw `vmlinuz`/`initrd` to read.
 pub(crate) fn find_objcopy() -> Option<PathBuf> {
-    snap::resolve_in_path("objcopy", &snap::path_entries())
+    pathsearch::resolve_in_path("objcopy", &pathsearch::path_entries())
 }
 
 /// Length of the bzImage probe window. The setup header (and, for builds
@@ -1862,7 +1862,7 @@ pub(crate) fn assemble_uki(
     // ESP (`install_uki`/mtools copy the file verbatim), so the signed
     // manifest pins the boot content the flashed medium must carry. The
     // ESP is outside the dm-verity set — this is its only coverage.
-    let uki_sha3_384 = crate::store::sha3_384_file(&uki_stage)
+    let uki_sha3_384 = nau_infra::store::sha3_384_file(&uki_stage)
         .wrap_err_with(|| format!("digesting the staged UKI {}", uki_stage.display()))?;
     eprintln!("  ✓ UKI sha3-384 pinned for the manifest: {uki_sha3_384}");
     if let Some(sbat) = payload.sbat.as_deref() {

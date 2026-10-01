@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::snap;
+use nau_infra::pathsearch;
 
 // ── dm-verity over the root partition (ADR-0011 step (c)) ──
 
@@ -202,7 +202,7 @@ pub(crate) fn append_verity_hash_partition_at(
 /// Resolve `veritysetup` with the same bind-aware PATH resolution ukify
 /// uses ([`find_ukify`]).
 pub(crate) fn find_veritysetup() -> Option<PathBuf> {
-    snap::resolve_in_path("veritysetup", &snap::path_entries())
+    pathsearch::resolve_in_path("veritysetup", &pathsearch::path_entries())
 }
 
 /// Host tool pre-flight for kernel disk images — fail closed BEFORE any
@@ -276,10 +276,10 @@ pub(crate) fn populate_tool_package(name: &str) -> &'static str {
 }
 
 /// Resolve a host build tool with the shared bind-aware PATH resolution
-/// ([`crate::snap::resolve_in_path`]) — the same search set as
+/// ([`nau_infra::pathsearch::resolve_in_path`]) — the same search set as
 /// [`find_ukify`]/[`find_veritysetup`].
 pub(crate) fn find_host_tool(name: &str) -> Option<PathBuf> {
-    snap::resolve_in_path(name, &snap::path_entries())
+    pathsearch::resolve_in_path(name, &pathsearch::path_entries())
 }
 
 /// veritysetup argv for a sha256/4K format-1 invocation, optional pinned
@@ -364,7 +364,7 @@ pub(crate) fn verity_format_with(
     if out.code != 0 {
         return Err(miette::miette!(
             "veritysetup format failed ({}): {}",
-            crate::command::exit_code(&out),
+            nau_infra::command::exit_code(&out),
             out.stderr.trim()
         ));
     }

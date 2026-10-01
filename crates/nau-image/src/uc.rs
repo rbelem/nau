@@ -255,7 +255,10 @@ impl SnapdAssertionKey {
         Ok(key)
     }
 
-    fn from_secret(secret: rsa::RsaPrivateKey) -> miette::Result<Self> {
+    /// Construct from an existing RSA secret — the uc seed-assertion
+    /// integration tests' fixture entry (issue #326 PR 3); production
+    /// loads through [`Self::load_or_create`].
+    pub fn from_secret(secret: rsa::RsaPrivateKey) -> miette::Result<Self> {
         // The public-key packet's creation time is snapd's OWN
         // v1FixedTimestamp (2016-01-01): `RSAPublicKey()` rebuilds every
         // decoded key with that constant before computing the sha3-384
@@ -295,7 +298,10 @@ impl SnapdAssertionKey {
 
     /// The public-key packet parsed back (verification handle — the same
     /// object snapd's decoder would hold).
-    pub(crate) fn public_key(&self) -> miette::Result<PublicKey> {
+    /// The OpenPGP public key (the verifier input for emitted
+    /// assertions). `pub` — the seed-assertion integration tests verify
+    /// against it (issue #326 PR 3).
+    pub fn public_key(&self) -> miette::Result<PublicKey> {
         let mut reader = Cursor::new(&self.public_packet);
         let header = pgp::packet::PacketHeader::try_from_reader(&mut reader)
             .map_err(|e| miette::miette!("public-key packet header: {e}"))?;
@@ -1329,55 +1335,6 @@ mod tests {
     }
 
     #[test]
-    fn signed_assertion_matches_the_snapd_wire_format() {
-        let key = test_key();
-        let image = sample_image();
-        let model = ModelAssertion::from_image(&image, "amd64", &snap_ids()).unwrap();
-        let assert_text = model.to_assert(&key).unwrap();
-
-        // Split at the LAST header's newline + the blank separator.
-        let key_id = key.key_id();
-        let header_tail = format!("sign-key-sha3-384: {key_id}\n");
-        let pos = assert_text
-            .find(&header_tail)
-            .expect("stamped key id header present");
-        let headers_end = pos + header_tail.len();
-        // No body: the signed content ends at the LAST HEADER'S VALUE —
-        // the separator after it supplies the final newline (snapd's
-        // writer convention, matches the store's own wire samples).
-        let content = &assert_text[..headers_end - 1];
-        let rest = &assert_text[headers_end - 1..];
-        assert!(
-            rest.starts_with("\n\n"),
-            "the blank separator completes the content/signature split"
-        );
-
-        // Envelope: base64( [0x01] ++ OpenPGP v4 RSA-SHA512 signature
-        // packet ), verified with the public key — snapd's exact verify
-        // path (content hash + signature trailer + RSA). assert.rs's
-        // parser can't handle the model's multi-line `snaps:` list header
-        // (store assertions have none), so assemble the verifier input
-        // directly: content bytes + 0x01-stripped OpenPGP packets.
-        let sig_text = rest[1..].trim_end();
-        let joined: String = sig_text.split_whitespace().collect();
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(joined.as_bytes())
-            .unwrap();
-        assert_eq!(raw[0], 1, "x/crypto v1 envelope prefix");
-        let assertion = crate::assert::Assertion {
-            assertion_type: "model".into(),
-            authority_id: model.brand_id.clone(),
-            sign_key_id: key_id,
-            headers: BTreeMap::new(),
-            content: content.as_bytes().to_vec(),
-            body: Vec::new(),
-            signature_packets: raw[1..].to_vec(),
-        };
-        crate::assert::verify_signature("model", "model", &assertion, &key.public_key().unwrap())
-            .unwrap();
-    }
-
-    #[test]
     fn snapd_key_id_is_base64url_sha3_384_of_the_public_key() {
         let key = test_key();
         let id = key.key_id();
@@ -1394,33 +1351,6 @@ mod tests {
         assert!(id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-    }
-
-    #[test]
-    fn account_chain_bootstraps_the_brand_trust() {
-        let key = test_key();
-        let brand = "test-brand";
-        let ts = "2026-01-01T00:00:00.0Z";
-        let ak = account_key_assertion(&key, brand, ts).unwrap();
-        let acc = account_assertion(&key, brand, ts).unwrap();
-        // Drive OUR OWN snapd-grammar verifier over the emitted bytes —
-        // the same parse + envelope + OpenPGP verification assert.rs runs
-        // against Store assertions.
-        let ak_parsed = crate::assert::parse_assertion("account-key", &ak).unwrap();
-        assert_eq!(ak_parsed.assertion_type, "account-key");
-        // The body carries the public key packet (0x01 ‖ packet).
-        assert!(!ak_parsed.body.is_empty(), "account-key body present");
-        let pk =
-            crate::assert::public_key_from_body("account-key", "body", &ak_parsed.body).unwrap();
-        crate::assert::verify_signature("account-key", "self", &ak_parsed, &pk).unwrap();
-        // The account-key id header matches snapd's derivation over the body key.
-        assert!(ak.contains(&format!("public-key-sha3-384: {}\n", key.key_id())));
-        assert!(ak.contains("body-length: "));
-
-        // The account is signed by the SAME key and verifies against it.
-        let acc_parsed = crate::assert::parse_assertion("account", &acc).unwrap();
-        assert!(acc.contains("validation: certified\n"));
-        crate::assert::verify_signature("account", "account", &acc_parsed, &pk).unwrap();
     }
 
     #[test]

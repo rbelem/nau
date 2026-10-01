@@ -6,6 +6,10 @@ description = "nau's non-domain leaf: terminal presentation and external-tool pr
 license = "GPL-3.0-only"
 
 [dependencies]
+# R1/R5 (issue #326 PR 3): the store client and the assertion gate name
+# spine vocabulary (`SnapRef`) — the mechanism leaf consumes the spine,
+# never the reverse.
+nau-core = { path = "../nau-core" }
 # archive.rs: in-process source-archive extraction (issue #170 seam).
 flate2 = "1"
 tar = "0.4"
@@ -21,6 +25,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # tools.rs: sha256 verification of provisioned artifacts.
 sha2 = "0.10"
+# store.rs/assert.rs: sha3-384 store digests.
+sha3 = "0.10"
+# assert.rs: base64url assertion bodies and signature envelopes.
+base64 = "0.22"
+# assert.rs: Snap Store assertion OpenPGP verification (ADR-0011 step b).
+pgp = "0.20"
 # tools.rs: staged temp files and atomic pointer flips.
 tempfile = "3"
 # tools.rs: parsing the in-tree tools-manifest.toml.

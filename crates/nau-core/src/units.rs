@@ -5,6 +5,10 @@
 
 use std::collections::BTreeMap;
 
+use serde::Deserialize;
+
+use crate::snap_types::{Confinement, ServiceDecl};
+
 // ── Planner input/output ──
 
 /// One snap-level plug as the unit planner sees it: the plug name plus
@@ -287,5 +291,217 @@ pub fn spec_from_snap_app(
         app_plugs: app.plugs.clone().unwrap_or_default(),
         environment: app.environment.clone().unwrap_or_default(),
         snap_plugs,
+    }
+}
+
+// ── Payload meta/snap.yaml parsing (serde side, PR-3 down-move) ──
+//
+// The payload-facing vocabulary of the runtime emitter: the subset of a
+// payload's `meta/snap.yaml` the emitter needs, plus the type-field
+// classification. Pure data + pure classification over `snap_types`
+// values — the image emitter and the runtime domain name both, so they
+// are shared vocabulary (ADR-0051 Decision 3).
+
+/// Build a planner spec from a parsed payload app (used by the
+/// image-build emission path).
+pub fn spec_from_payload_app(
+    snap: &str,
+    app_name: &str,
+    app: &PayloadApp,
+    snap_plugs: Vec<PlugRef>,
+) -> AppUnitSpec {
+    AppUnitSpec {
+        snap: snap.to_string(),
+        app: app_name.to_string(),
+        command: app.command.clone(),
+        daemon: app.daemon.is_some(),
+        app_plugs: app.plugs.clone(),
+        environment: app.environment.clone(),
+        snap_plugs,
+    }
+}
+
+/// The subset of a payload's `meta/snap.yaml` the runtime emitter needs.
+#[derive(Debug, Deserialize)]
+pub struct PayloadSnap {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(rename = "type", default)]
+    pub snap_type: Option<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
+    pub confinement: Option<String>,
+    /// The snap-level icon target inside the payload (e.g.
+    /// `meta/gui/icon.png`) — the icon the desktop launcher links
+    /// alongside the generated entry (issue #7).
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub apps: BTreeMap<String, PayloadApp>,
+    #[serde(default)]
+    pub plugs: BTreeMap<String, PayloadPlug>,
+    /// Runtime confinement grants (ADR-0016, ticket #11): the package-level
+    /// `confined` declaration, preserved in snap.yaml so the runtime
+    /// emitter records it in the generation manifest. Absent = unconfined.
+    #[serde(default)]
+    pub confined: Option<Confinement>,
+    /// Services declared by this package (ADR-0032, issue #105), carried
+    /// through meta/snap.yaml (written by SnapMeta's Serialize) so the
+    /// runtime planner records them in the generation manifest at
+    /// install time (issue #106).
+    #[serde(default)]
+    pub services: BTreeMap<String, ServiceDecl>,
+}
+
+/// One app entry in a payload `meta/snap.yaml`.
+#[derive(Debug, Deserialize)]
+pub struct PayloadApp {
+    pub command: String,
+    /// Presence makes the app daemon-bearing; the value (simple,
+    /// forking, notify, …) does not change the emitted unit shape.
+    #[serde(default)]
+    pub daemon: Option<String>,
+    #[serde(default)]
+    pub plugs: Vec<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    /// Path to the app's `.desktop` file inside the payload (issue #7,
+    /// like snapd's `desktop:` app key) — the launcher's metadata source.
+    #[serde(default)]
+    pub desktop: Option<String>,
+    /// Per-app runtime confinement override (ticket #11): wins over the
+    /// snap-level `confined`. Absent = inherit the snap's.
+    #[serde(default)]
+    pub confined: Option<Confinement>,
+}
+
+/// A snap-level plug value in a payload `meta/snap.yaml`: a bare
+/// interface string or an attribute table with `interface` + attrs.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum PayloadPlug {
+    Interface(String),
+    Typed {
+        interface: String,
+        #[serde(flatten)]
+        attributes: BTreeMap<String, serde_yaml::Value>,
+    },
+}
+
+impl PayloadPlug {
+    /// Coerce to the planner's plug shape, keeping only string-valued
+    /// attributes (real-world snap.yaml attributes can be ints/bools).
+    pub fn to_plug_ref(&self, name: &str) -> PlugRef {
+        match self {
+            PayloadPlug::Interface(interface) => PlugRef::new(name, interface),
+            PayloadPlug::Typed {
+                interface,
+                attributes,
+            } => {
+                let mut plug = PlugRef::new(name, interface);
+                for (k, v) in attributes {
+                    if let serde_yaml::Value::String(s) = v {
+                        plug.attributes.insert(k.clone(), s.clone());
+                    }
+                }
+                plug
+            }
+        }
+    }
+}
+
+// ── Classification ──
+
+/// How the runtime emitter treats one staged payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeClass {
+    /// Shoot-built app payload — receive binaries + units.
+    ShootBuilt,
+    /// `type = "store"` — skipped, with an explicit build note.
+    Store,
+    /// snapd infrastructure (`base`/`gadget`/`kernel`/`snapd`) — no app
+    /// runtime, skipped quietly.
+    Infrastructure,
+}
+
+/// Classify a payload by its `type` field. An absent type is the snapd
+/// app default — and the shape every shoot-built payload serializes
+/// with (nau never emits `source`/`meta` into snap.yaml), so it is
+/// shoot-built.
+pub fn classify(snap_type: Option<&str>) -> RuntimeClass {
+    match snap_type {
+        Some("base" | "gadget" | "kernel" | "snapd") => RuntimeClass::Infrastructure,
+        Some("store") => RuntimeClass::Store,
+        _ => RuntimeClass::ShootBuilt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classification_follows_the_type_field() {
+        assert_eq!(classify(None), RuntimeClass::ShootBuilt);
+        assert_eq!(classify(Some("source")), RuntimeClass::ShootBuilt);
+        assert_eq!(classify(Some("meta")), RuntimeClass::ShootBuilt);
+        assert_eq!(classify(Some("store")), RuntimeClass::Store);
+        assert_eq!(classify(Some("base")), RuntimeClass::Infrastructure);
+        assert_eq!(classify(Some("gadget")), RuntimeClass::Infrastructure);
+        assert_eq!(classify(Some("kernel")), RuntimeClass::Infrastructure);
+        assert_eq!(classify(Some("snapd")), RuntimeClass::Infrastructure);
+    }
+
+    #[test]
+    fn payload_yaml_with_typed_plugs_parses() {
+        let yaml = "\
+name: my-snap
+version: '1.0'
+confinement: strict
+apps:
+  srv:
+    command: bin/serve --port 80
+    daemon: simple
+    plugs: [network, bus]
+    environment:
+      GREETING: hi
+plugs:
+  network: network
+  bus:
+    interface: dbus
+    name: com.example.Srv
+";
+        let meta: PayloadSnap = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(meta.name.as_deref(), Some("my-snap"));
+        assert_eq!(meta.snap_type, None);
+        assert_eq!(meta.confinement.as_deref(), Some("strict"));
+        let app = meta.apps.get("srv").unwrap();
+        assert_eq!(app.command, "bin/serve --port 80");
+        assert!(app.daemon.is_some());
+        assert_eq!(app.plugs, vec!["network".to_string(), "bus".to_string()]);
+        let bus = meta.plugs.get("bus").unwrap().to_plug_ref("bus");
+        assert_eq!(bus.interface, "dbus");
+        assert_eq!(
+            bus.attributes.get("name").map(String::as_str),
+            Some("com.example.Srv")
+        );
+        let spec = spec_from_payload_app(
+            "my-snap",
+            "srv",
+            app,
+            vec![
+                meta.plugs.get("network").unwrap().to_plug_ref("network"),
+                bus,
+            ],
+        );
+        let plan = plan_app(&spec);
+        assert!(plan.daemon.is_some());
+        assert!(plan
+            .daemon
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("BusName=com.example.Srv"));
     }
 }
