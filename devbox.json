@@ -37,11 +37,11 @@
     ],
     "scripts": {
       "build": "cargo build",
-      "test": "NAU_SYSTEMD=off cargo test",
-      "clippy": "cargo clippy -- -D warnings",
-      "fmt": "cargo fmt",
-      "fmt-check": "cargo fmt --check",
-      "check": "NAU_SYSTEMD=off cargo test && cargo clippy -- -D warnings && cargo fmt --check"
+      "test": "NAU_SYSTEMD=off cargo test --workspace",
+      "clippy": "cargo clippy --workspace --all-targets -- -D warnings",
+      "fmt": "cargo fmt --all",
+      "fmt-check": "cargo fmt --all --check",
+      "check": "NAU_SYSTEMD=off cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check"
     }
   }
 }

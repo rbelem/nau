@@ -1155,8 +1155,7 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let wrapper = format!(
-            "#!/bin/sh\n\
+        let wrapper = "#!/bin/sh\n\
              SCRIPT=\"$(readlink -f \"$0\")\"\n\
              PODROOT=\"$(dirname \"$(dirname \"$(dirname \"$SCRIPT\")\")\")\"\n\
              TREE=\"$PODROOT/active/extensions/cli/usr/usr/bin/cli.real\"\n\
@@ -1168,7 +1167,7 @@ mod tests {
              \x20        done\n\
              \x20        export PYTHONPATH\n\
              exec \"python3\" \"$TREE\" \"$@\"\n"
-        );
+            .to_string();
         let snap = make_snap(
             &tmp.path().join("cli"),
             &[

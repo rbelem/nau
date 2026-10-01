@@ -1868,7 +1868,7 @@ mod link_tests {
             path,
             machines_dir(home).join(format!(
                 "machine-{}.json",
-                crate::oci::sha256_hex(address.as_bytes())[..16].to_string()
+                &crate::oci::sha256_hex(address.as_bytes())[..16]
             ))
         );
         let link = machine_link(home, address).unwrap().expect("linked");

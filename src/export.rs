@@ -658,7 +658,7 @@ mod tests {
             _home: home,
             kp,
             store,
-            out: state.into_path().join("tree"),
+            out: state.keep().join("tree"),
         }
     }
 

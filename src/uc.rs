@@ -1384,7 +1384,7 @@ mod tests {
         use sha3::Digest;
         let mut hashed = Vec::new();
         hashed.push(1u8);
-        hashed.extend_from_slice(&key.public_packet_bytes());
+        hashed.extend_from_slice(key.public_packet_bytes());
         let digest = sha3::Sha3_384::digest(&hashed);
         let expect = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
         assert_eq!(id, expect);

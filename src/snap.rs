@@ -514,9 +514,10 @@ const STAGE_LOCK_IDENTITY_ATTEMPTS: usize = 5;
 /// unit tests run in parallel, so a single global hook would either fire
 /// inside a concurrent test's acquire or be replaced by it.
 #[cfg(test)]
-static STAGE_LOCK_TEST_SWAP: std::sync::Mutex<
-    Vec<(std::path::PathBuf, Box<dyn Fn(&Path) + Send>)>,
-> = std::sync::Mutex::new(Vec::new());
+type StageLockHook = Box<dyn Fn(&Path) + Send>;
+#[cfg(test)]
+static STAGE_LOCK_TEST_SWAP: std::sync::Mutex<Vec<(std::path::PathBuf, StageLockHook)>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn run_stage_lock_test_swap(lock_path: &Path) {
@@ -5037,10 +5038,10 @@ mod tests {
     fn test_submodule_spec_serializes_for_lua_roundtrip() {
         // The eval subprocess serializes inputs to JSON and rehydrates them
         // as a Lua table — the untagged shapes must be JSON-native.
-        let all = serde_json::to_value(&SubmoduleSpec::All(true)).unwrap();
+        let all = serde_json::to_value(SubmoduleSpec::All(true)).unwrap();
         assert_eq!(all, serde_json::Value::Bool(true));
         let named =
-            serde_json::to_value(&SubmoduleSpec::Named(vec!["a".into(), "b".into()])).unwrap();
+            serde_json::to_value(SubmoduleSpec::Named(vec!["a".into(), "b".into()])).unwrap();
         assert_eq!(
             named,
             serde_json::Value::Array(vec![
@@ -9057,7 +9058,7 @@ mod tests {
             // the ones it lets through, the Rust boundary must catch.
             let result: Result<mlua::Value, mlua::Error> = env
                 .lua
-                .load(&format!(
+                .load(format!(
                     r#"
                 return snap {{
                     name = "bad", version = "1.0",
@@ -10318,7 +10319,7 @@ fi
 
     // ── stage.lock hardening (issue #173) ──
 
-    fn set_stage_lock_swap_hook(lock_path: &Path, hook: Option<Box<dyn Fn(&Path) + Send>>) {
+    fn set_stage_lock_swap_hook(lock_path: &Path, hook: Option<StageLockHook>) {
         let mut hooks = STAGE_LOCK_TEST_SWAP
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -10362,6 +10363,7 @@ fi
         let path = dir.path().join("stage.lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&path)
             .unwrap();

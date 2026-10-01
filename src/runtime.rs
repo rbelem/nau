@@ -2917,10 +2917,7 @@ mod tests {
             Other
         );
         assert_eq!(
-            classify_hardlink_failure(&std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "no errno behind it"
-            )),
+            classify_hardlink_failure(&std::io::Error::other("no errno behind it")),
             Other,
             "non-errno errors propagate, never fall back"
         );

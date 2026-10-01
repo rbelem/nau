@@ -3356,7 +3356,7 @@ mod tests {
     /// binary asserts env-derived values.
     fn with_source_date_epoch<T>(secs: u64, f: impl FnOnce() -> T) -> T {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _held = ENV_LOCK.lock().unwrap();
+        let _held = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("SOURCE_DATE_EPOCH").ok();
         std::env::set_var("SOURCE_DATE_EPOCH", secs.to_string());
         let out = f();

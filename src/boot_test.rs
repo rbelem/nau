@@ -1747,6 +1747,7 @@ Press enter to configure.\n";
         assert_eq!(strip_ansi_escapes(raw), "abcde");
     }
 
+    #[test]
     fn console_conf_stall_fails_by_default() {
         // The regression from issue #84: userspace is up and nau's own
         // /init handed off, but the boot parks on console-conf and never

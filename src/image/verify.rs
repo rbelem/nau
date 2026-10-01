@@ -1242,7 +1242,7 @@ mod tests {
     fn fixture_uki_sha3() -> String {
         use sha3::Digest;
         let mut hasher = sha3::Sha3_384::new();
-        hasher.update(&fixture_uki());
+        hasher.update(fixture_uki());
         hasher
             .finalize()
             .iter()

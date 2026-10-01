@@ -2,4 +2,4 @@
 # *scripts* but not Mode::Definition syntax (`declare name: type`),
 # which is exactly what this prelude uses. It is checked by the
 # check-stage Luau gate instead.
-src/nau-prelude.d.luau
+crates/nau-chart/src/nau-prelude.d.luau

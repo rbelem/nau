@@ -764,8 +764,7 @@ mod tests {
         };
         phdr(phoff, PT_LOAD, 0, 0, total, 0x1000, 5);
         phdr(phoff + 56, PT_DYNAMIC, dyn_off, dyn_off, dyn_len, 8, 4);
-        if interp_seg.is_some() {
-            let iseg = interp_seg.as_ref().unwrap();
+        if let Some(iseg) = &interp_seg {
             // INTERP segment placed right after the dynamic table.
             phdr(
                 phoff + 112,
@@ -849,7 +848,7 @@ mod tests {
 
     #[test]
     fn needed_resolves_runtime_closure_library() {
-        let mut own = BTreeSet::new();
+        let own = BTreeSet::new();
         let l = listings(
             &[
                 ("ncurses", &["libncurses.so.6"]),
@@ -862,14 +861,14 @@ mod tests {
 
     #[test]
     fn needed_resolves_system_library() {
-        let mut own = BTreeSet::new();
+        let own = BTreeSet::new();
         let l = listings(&[("ncurses", &["libncurses.so.6"])], &["ncurses"]);
         assert_eq!(resolve_needed("libc.so.6", &own, &l), None);
     }
 
     #[test]
     fn needed_flags_build_only_payload() {
-        let mut own = BTreeSet::new();
+        let own = BTreeSet::new();
         let l = listings(
             &[
                 ("ncurses", &["libncurses.so.6"]),
@@ -886,7 +885,7 @@ mod tests {
     #[test]
     fn runtime_presence_wins_over_build_only() {
         // A lib present in both a runtime and a build-only payload resolves.
-        let mut own = BTreeSet::new();
+        let own = BTreeSet::new();
         let l = listings(
             &[
                 ("ncurses", &["libncurses.so.6"]),

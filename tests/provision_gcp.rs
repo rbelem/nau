@@ -986,7 +986,7 @@ fn user_data_carries_the_publish_callback_and_one_time_token() {
         ttl_expiry_epoch: MARKER_EPOCH,
     });
     assert!(user_data.contains("path: /etc/nau/publish.env\n    permissions: \"0600\""));
-    assert!(user_data.contains(&format!("MACHINE_IDENTITY='nau-worker-abc-01'")));
+    assert!(user_data.contains(&"MACHINE_IDENTITY='nau-worker-abc-01'".to_string()));
     assert!(user_data.contains(&format!("PUBLISH_URL='{PUBLISH_URL}'")));
     assert!(user_data.contains(&format!("PUBLISH_TOKEN='{token}'")));
     assert!(user_data.contains("path: /etc/nau/publish-host-key.sh\n    permissions: \"0700\""));

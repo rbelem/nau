@@ -2434,7 +2434,8 @@ mod tests {
 
         for tool in ["cc", "c++"] {
             let (name, fix) = pod_tool(tool);
-            let check = check_pod_toolchain_tool_with(name, fix, &entries, &[farm.clone()]);
+            let check =
+                check_pod_toolchain_tool_with(name, fix, &entries, std::slice::from_ref(&farm));
             assert!(
                 matches!(check.status, CheckStatus::Ok),
                 "pod-provided {tool} must pass: {check:?}"

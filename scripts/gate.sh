@@ -133,7 +133,9 @@ offenders="$(tree_nau_names nau-chart | grep -vx -e nau-chart -e nau-core -e nau
 [ -z "$offenders" ] || dep_dir_fail "nau-chart -> {$(echo $offenders)}: nau-chart workspace deps must be within {nau-core, nau-infra}"
 echo "gate: dep-direction (ADR-0051 R1): nau-core ok; nau-infra ok; nau-chart ok (root composes all)"
 
-NAU_SYSTEMD=off cargo test
-cargo clippy -- -D warnings
-cargo fmt --check
+NAU_SYSTEMD=off cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+# cargo-fmt spells whole-workspace coverage `--all` (--workspace is a
+# test/clippy flag; cargo-fmt 1.97 rejects it: "unexpected argument").
+cargo fmt --all --check
 echo "gate: ALL AXES GREEN"

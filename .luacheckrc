@@ -33,5 +33,5 @@ globals = {
 }
 
 exclude_files = {
-    "src/nau-prelude.d.luau",
+    "crates/nau-chart/src/nau-prelude.d.luau",
 }

@@ -399,7 +399,9 @@ static SECRET_SERVICE_LOOKUP: Mutex<AttributeLookup> = Mutex::new(secret_service
 
 /// The reseated lookup — the single call site in production paths.
 fn attribute_lookup(attributes: &BTreeMap<String, String>) -> miette::Result<Option<Vec<u8>>> {
-    let f = SECRET_SERVICE_LOOKUP.lock().unwrap();
+    let f = SECRET_SERVICE_LOOKUP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     f(attributes)
 }
 
@@ -1491,7 +1493,7 @@ mod tests {
 
     #[test]
     fn env_source_resolves_the_caller_var() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("NAU_SECRETS_TEST_OK", SENTINEL);
         let refs = BTreeMap::from([("K".to_string(), env_ref("NAU_SECRETS_TEST_OK"))]);
@@ -1509,7 +1511,7 @@ mod tests {
 
     #[test]
     fn env_source_missing_var_fails_named_and_leaks_nothing() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("NAU_SECRETS_TEST_MISSING");
         let refs = BTreeMap::from([("API_TOKEN".to_string(), env_ref("NAU_SECRETS_TEST_MISSING"))]);
         let err = format!(
@@ -1555,7 +1557,7 @@ mod tests {
         // The counting provider shells out to `cat` (an EXTERNAL command
         // resolved via PATH), so the spawn window must exclude every
         // env-mutating test (PATH swaps) — same ENV_LOCK discipline.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
         let counter = tmp.path().join("calls");
@@ -1659,7 +1661,7 @@ mod tests {
             vec![host.clone()],
             "the pod-rooted PATH entry must be scrubbed"
         );
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved_path = std::env::var("PATH").ok();
         std::env::set_var("PATH", &raw_path);
         let resolved = resolve_exec_program(&pod, "K", "exec", "shadow");
@@ -1680,7 +1682,7 @@ mod tests {
         // (a) The search form: the farm is the ONLY holder of the name,
         // but the D4 scrub removes pod-rooted PATH entries before the
         // search, so the honest answer is "not found on the host PATH".
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved_path = std::env::var("PATH").ok();
         std::env::set_var("PATH", &farm);
         let err = format!(
@@ -1716,7 +1718,7 @@ mod tests {
     #[test]
     fn exec_program_not_on_host_path_fails_named() {
         let tmp = tempfile::tempdir().unwrap();
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved_path = std::env::var("PATH").ok();
         std::env::set_var("PATH", tmp.path());
         let err = format!(
@@ -1811,7 +1813,7 @@ mod tests {
         // The counting provider shells out to `cat` (external, found
         // via PATH) — hold ENV_LOCK so concurrent PATH swaps cannot
         // break the provider spawn.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
         let counter = tmp.path().join("calls");
@@ -1977,12 +1979,15 @@ mod tests {
         );
         // …including a NEWLY-added consumer, and NOT a removed one.
         assert_eq!(
-            restart_on_digest_change(Some("old"), Some("new"), &[web.clone()]),
+            restart_on_digest_change(Some("old"), Some("new"), std::slice::from_ref(&web)),
             vec![web.clone()]
         );
         // Unchanged digest: nothing restarts, whatever the set.
         assert!(restart_on_digest_change(Some("same"), Some("same"), &both).is_empty());
-        assert!(restart_on_digest_change(Some("same"), Some("same"), &[web.clone()]).is_empty());
+        assert!(
+            restart_on_digest_change(Some("same"), Some("same"), std::slice::from_ref(&web))
+                .is_empty()
+        );
         // Missing before (the envfile was gone — the D3 boot story):
         // every consumer is stale by construction.
         assert_eq!(restart_on_digest_change(None, Some("new"), &both), both);
@@ -2003,7 +2008,7 @@ mod tests {
 
     #[test]
     fn refresh_restarts_exactly_the_changed_digest_consumers() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
         let valuefile = tmp.path().join("value.txt");
@@ -2079,7 +2084,7 @@ mod tests {
 
     #[test]
     fn refresh_without_systemctl_skips_the_restart_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
         let provider = valuefile_provider(tmp.path(), &tmp.path().join("value.txt"));
@@ -2121,7 +2126,7 @@ mod tests {
 
     #[test]
     fn refresh_fails_loud_naming_a_unit_the_restart_cannot_move() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
         let valuefile = tmp.path().join("value.txt");
@@ -2183,7 +2188,7 @@ mod tests {
                 },
             ),
         ]);
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("NAU_SECRETS_TEST_SERVE", "plain");
         let served = serve_pod(&pod, "p", 5, &refs, Some(&cache)).unwrap();
         std::env::remove_var("NAU_SECRETS_TEST_SERVE");
@@ -2264,7 +2269,7 @@ end'"#
 
     #[test]
     fn serve_pod_with_no_references_needs_no_runtime_dir() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let refs: BTreeMap<String, SecretSource> = BTreeMap::new();
@@ -2284,7 +2289,7 @@ end'"#
             ("GOOD".to_string(), env_ref("NAU_SECRETS_TEST_GOOD")),
             ("BAD".to_string(), env_ref("NAU_SECRETS_TEST_ABSENT")),
         ]);
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("NAU_SECRETS_TEST_GOOD", "v");
         let err = format!(
             "{}",
@@ -2359,7 +2364,7 @@ end'"#
 
     #[test]
     fn pod_envfile_path_passive_derives_from_the_refs_and_fails_named_without_runtime_dir() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let refs = BTreeMap::from([("K".to_string(), env_ref("ANY"))]);
@@ -2388,7 +2393,7 @@ end'"#
 
     #[test]
     fn empty_reference_set_needs_no_runtime_dir_and_resolves_empty() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let refs: BTreeMap<String, SecretSource> = BTreeMap::new();
@@ -2401,7 +2406,7 @@ end'"#
 
     #[test]
     fn xdg_runtime_dir_absent_is_a_hard_failure_naming_the_gap() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let refs = BTreeMap::from([("K".to_string(), env_ref("ANY"))]);
@@ -2457,7 +2462,7 @@ end'"#
 
     #[test]
     fn list_reports_references_and_cache_state_never_values() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, _counter) = list_fixture();
         let cache = tmp.path().join("cache");
         // Miss before resolve.
@@ -2648,7 +2653,7 @@ end'"#
 
     #[test]
     fn vault_happy_path_reads_field_through_the_kv_v2_route() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let server = VaultServer::start("200 OK", &vault_body(SENTINEL));
@@ -2670,7 +2675,7 @@ end'"#
 
     #[test]
     fn vault_wrong_token_403_fails_named_and_the_body_never_leaks() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         // The canned body carries the sentinel AND the "wrong" token:
@@ -2703,7 +2708,7 @@ end'"#
 
     #[test]
     fn vault_missing_path_404_fails_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let server = VaultServer::start("404 Not Found", &format!("no such path {SENTINEL}"));
@@ -2728,7 +2733,7 @@ end'"#
 
     #[test]
     fn vault_missing_field_fails_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         // The sentinel hides in a DIFFERENT field of the same secret.
@@ -2755,7 +2760,7 @@ end'"#
 
     #[test]
     fn vault_non_string_field_fails_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let body = format!(r#"{{"data":{{"data":{{"token":42,"other":"{SENTINEL}"}}}}}}"#);
@@ -2778,7 +2783,7 @@ end'"#
 
     #[test]
     fn vault_empty_field_fails_named_never_an_empty_value() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let server = VaultServer::start("200 OK", &vault_body(""));
@@ -2799,7 +2804,7 @@ end'"#
 
     #[test]
     fn vault_malformed_json_body_fails_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let server = VaultServer::start("200 OK", &format!("totally not json {SENTINEL}"));
@@ -2824,7 +2829,7 @@ end'"#
 
     #[test]
     fn vault_data_levels_missing_or_non_object_fail_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let cases: [(&str, String); 4] = [
@@ -2862,7 +2867,7 @@ end'"#
 
     #[test]
     fn vault_trailing_slash_addr_is_normalized_before_joining() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let server = VaultServer::start("200 OK", &vault_body(SENTINEL));
@@ -2886,7 +2891,7 @@ end'"#
 
     #[test]
     fn vault_addr_and_token_missing_or_empty_fail_named_separately() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let resolve_err = || -> String {
@@ -2927,7 +2932,7 @@ end'"#
 
     #[test]
     fn vault_transport_failure_fails_named_without_touching_values() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         // Port 1: nothing listens — a fast, deterministic refusal.
@@ -2949,7 +2954,7 @@ end'"#
 
     #[test]
     fn vault_interior_newlines_in_the_value_survive() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let body = r#"{"data":{"data":{"token":"-----BEGIN\nLINE2\n-----END"}}}"#;
@@ -3006,7 +3011,7 @@ end'"#
 
     #[test]
     fn check_reports_per_source_health_and_fails_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tmp, server, _env) = check_fixture();
         std::env::remove_var("NAU_SECRETS_TEST_CHECK");
         let rows = check_pod(tmp.path(), "work").unwrap();
@@ -3064,7 +3069,7 @@ end'"#
 
     #[test]
     fn refresh_with_no_references_needs_no_runtime_dir() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let tmp = tempfile::tempdir().unwrap();
@@ -3173,7 +3178,7 @@ end'"#
 
     #[test]
     fn bitwarden_happy_path_extracts_the_json_value_field() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let counter = tmp.path().join("calls");
@@ -3195,7 +3200,7 @@ end'"#
 
     #[test]
     fn bitwarden_calls_bws_with_the_exact_argv_shape() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let argv = tmp.path().join("argv");
@@ -3227,7 +3232,7 @@ end'"#
 
     #[test]
     fn bitwarden_interior_newlines_in_the_value_survive() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         // The \n inside the literal is the JSON escape: the parsed
@@ -3252,7 +3257,7 @@ end'"#
 
     #[test]
     fn bitwarden_nonzero_exit_fails_named_and_suppresses_stderr() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         // The failing fake leaks the sentinel on BOTH stderr and
@@ -3284,7 +3289,7 @@ end'"#
 
     #[test]
     fn bitwarden_malformed_json_fails_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let _bws = bws_script(tmp.path(), "not json at all", 0, None);
@@ -3307,7 +3312,7 @@ end'"#
 
     #[test]
     fn bitwarden_missing_value_field_fails_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let _bws = bws_script(tmp.path(), r#"{"id":"8848"}"#, 0, None);
@@ -3329,7 +3334,7 @@ end'"#
 
     #[test]
     fn bitwarden_non_string_value_fails_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let _bws = bws_script(tmp.path(), r#"{"value":42}"#, 0, None);
@@ -3351,7 +3356,7 @@ end'"#
 
     #[test]
     fn bitwarden_empty_value_fails_named_never_an_empty_secret() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let _bws = bws_script(tmp.path(), r#"{"value":""}"#, 0, None);
@@ -3373,7 +3378,7 @@ end'"#
 
     #[test]
     fn bitwarden_missing_token_fails_named_before_bws_runs() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let counter = tmp.path().join("calls");
@@ -3403,7 +3408,7 @@ end'"#
 
     #[test]
     fn bitwarden_empty_token_fails_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let _bws = bws_script(tmp.path(), r#"{"value":"v"}"#, 0, None);
@@ -3426,7 +3431,7 @@ end'"#
 
     #[test]
     fn bitwarden_bws_missing_from_the_host_path_fails_named() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let empty = tempfile::tempdir().unwrap();
@@ -3456,7 +3461,11 @@ end'"#
         Mutex::new(BTreeMap::new());
 
     fn fake_lookup(attributes: &BTreeMap<String, String>) -> miette::Result<Option<Vec<u8>>> {
-        Ok(FAKE_STORE.lock().unwrap().get(attributes).cloned())
+        Ok(FAKE_STORE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(attributes)
+            .cloned())
     }
 
     fn failing_lookup(_attributes: &BTreeMap<String, String>) -> miette::Result<Option<Vec<u8>>> {
@@ -3465,7 +3474,9 @@ end'"#
 
     /// Swap the seam; returns the previous fn for restoration.
     fn reseat_lookup(f: AttributeLookup) -> AttributeLookup {
-        let mut seam = SECRET_SERVICE_LOOKUP.lock().unwrap();
+        let mut seam = SECRET_SERVICE_LOOKUP
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::mem::replace(&mut *seam, f)
     }
 
@@ -3476,7 +3487,7 @@ end'"#
             .collect();
         FAKE_STORE
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(map.clone(), value.to_vec());
         map
     }
@@ -3492,7 +3503,7 @@ end'"#
 
     #[test]
     fn libsecret_set_then_resolve_round_trips_through_the_seam() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let attrs = seed_fake_store(&[("bitwarden", "sm-access-token")], SENTINEL.as_bytes());
@@ -3510,7 +3521,7 @@ end'"#
         )
         .unwrap();
         reseat_lookup(previous);
-        FAKE_STORE.lock().unwrap().clear();
+        FAKE_STORE.lock().unwrap_or_else(|e| e.into_inner()).clear();
         assert_eq!(
             values.get("LS_TOKEN").map(String::as_str),
             Some(SENTINEL),
@@ -3520,7 +3531,7 @@ end'"#
 
     #[test]
     fn libsecret_missing_entry_fails_named_and_distinct_from_transport() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let previous = reseat_lookup(fake_lookup);
@@ -3561,14 +3572,14 @@ end'"#
             .unwrap_err()
         );
         reseat_lookup(previous);
-        FAKE_STORE.lock().unwrap().clear();
+        FAKE_STORE.lock().unwrap_or_else(|e| e.into_inner()).clear();
         assert!(err.contains("bus hole"), "{err}");
         assert!(!err.contains("no Secret Service entry"), "{err}");
     }
 
     #[test]
     fn libsecret_non_utf8_and_empty_content_fail_named_without_the_content() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let pod = pod_state_root(tmp.path());
         let previous = reseat_lookup(fake_lookup);
@@ -3608,7 +3619,7 @@ end'"#
             .unwrap_err()
         );
         reseat_lookup(previous);
-        FAKE_STORE.lock().unwrap().clear();
+        FAKE_STORE.lock().unwrap_or_else(|e| e.into_inner()).clear();
         assert!(err.contains("empty"), "{err}");
     }
 
@@ -3617,7 +3628,7 @@ end'"#
     /// item, reads it back through the PRODUCTION seam fn, deletes it.
     #[test]
     fn live_dbus_secret_service_round_trip_when_gated_on() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if std::env::var("NAU_SECRETS_LIVE_DBUS").as_deref() != Ok("1") {
             return;
         }
@@ -3654,7 +3665,7 @@ end'"#
     /// set is the exit-0 shape.
     #[test]
     fn check_pod_end_to_end_bitwarden_libsecret_vault_ok_exit_0() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         seed_pod(
             tmp.path(),
@@ -3678,7 +3689,7 @@ end'"#
         seed_fake_store(&[("bitwarden", "sm-access-token")], b"ring-stored");
         let rows = check_pod(tmp.path(), "work").unwrap();
         reseat_lookup(previous);
-        FAKE_STORE.lock().unwrap().clear();
+        FAKE_STORE.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let by_key = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
         assert_eq!(by_key("BW_ITEM").status, "ok");
         assert_eq!(by_key("LS_TOKEN").status, "ok");
@@ -3701,7 +3712,7 @@ end'"#
     /// VAULT_ADDR fails its row named while the other two stay green.
     #[test]
     fn check_pod_end_to_end_vault_transport_failure_is_the_exit_1_shape() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         seed_pod(
             tmp.path(),
@@ -3725,7 +3736,7 @@ end'"#
         seed_fake_store(&[("bitwarden", "sm-access-token")], b"ring-stored");
         let rows = check_pod(tmp.path(), "work").unwrap();
         reseat_lookup(previous);
-        FAKE_STORE.lock().unwrap().clear();
+        FAKE_STORE.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let by_key = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
         assert_eq!(by_key("BW_ITEM").status, "ok");
         assert_eq!(by_key("LS_TOKEN").status, "ok");

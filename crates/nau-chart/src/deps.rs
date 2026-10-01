@@ -501,7 +501,17 @@ mod tests {
 
     #[test]
     fn test_resolve_path() {
-        // Package name -> pkgs/<letter>/<name>.lua (single file)
+        // Package name -> pkgs/<letter>/<name>.lua (single file), pinned
+        // through an input source: cargo runs the test binary with the
+        // crate dir as cwd (crates/nau-chart), so the repo-root `pkgs/`
+        // tree the local probe would find pre-extraction is invisible
+        // here — the source seam carries the same name->path mapping
+        // without a cwd assumption.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("pkgs/g")).unwrap();
+        std::fs::write(src.path().join("pkgs/g/gcc.lua"), "-- recipe body").unwrap();
+        let _guard = INPUTS_LOCK.lock().unwrap();
+        init_local_input_source(src.path());
         let p = resolve_path("gcc");
         assert!(p.to_string_lossy().ends_with("pkgs/g/gcc.lua"));
 

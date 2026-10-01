@@ -73,7 +73,7 @@ fn no_raw_floor_tool_spawns_outside_the_tools_module() {
     let unexpected: Vec<String> = offenders
         .iter()
         .filter(|o| !EXCEPTIONS.iter().any(|(path, _)| o.starts_with(*path)))
-        .map(|o| o.clone())
+        .cloned()
         .collect();
     assert!(
         unexpected.is_empty(),

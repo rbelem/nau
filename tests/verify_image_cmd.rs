@@ -455,7 +455,7 @@ gated_test!(verify_image_refuses_an_unsigned_manifest, {
     let unsigned = fx.dir.path().join("unsigned.manifest.json");
     std::fs::write(&unsigned, serde_json::to_string_pretty(&v).unwrap()).unwrap();
 
-    let args = vec![
+    let args = [
         "image".to_string(),
         "verify".to_string(),
         "--device".to_string(),
@@ -579,7 +579,7 @@ gated_test!(verify_image_verifies_the_boot_counted_uki_name, {
             "-i",
             esp.to_str().unwrap(),
             payload.to_str().unwrap(),
-            &format!("::/EFI/Linux/nau-demo_1.0.0+3-0.efi"),
+            "::/EFI/Linux/nau-demo_1.0.0+3-0.efi",
         ],
     );
     run_tool(
@@ -628,7 +628,7 @@ gated_test!(verify_image_refuses_a_manifest_predating_esp_coverage, {
     let legacy = fx.dir.path().join("legacy.manifest.json");
     std::fs::write(&legacy, serde_json::to_string_pretty(&reduced).unwrap()).unwrap();
 
-    let args = vec![
+    let args = [
         "image".to_string(),
         "verify".to_string(),
         "--device".to_string(),
