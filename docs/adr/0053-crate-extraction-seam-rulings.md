@@ -45,6 +45,26 @@ Amended 2026-10-01 (council, 4 seats; same day, before PR 2):
    within one test binary); copies verbatim, recover with
    `into_inner()`, never cross-crate dev-deps for this. The final-PR
    "dedupe" is dropped.
+7. **Amended 2026-10-01 (PR 3, operator-granted #326 run):** the
+   `nau-infra` charter tightens from "depends on nothing in-workspace"
+   to **"depends only on `nau-core`"** — mechanism consuming vocabulary
+   is the honest layering, and `store` (the snap-store client: curl
+   subprocess via CommandRunner, sha3 digests, plus its ADR-0011
+   assertion-verification gate slice) lands in nau-infra rather than
+   the spine; ADR-0051's "store" sketch line moves to nau-infra
+   accordingly, and the infra dep-direction row becomes
+   `{nau-core}`. The `sign` split follows ADR-0051's own spine text:
+   the generic keychain + ceremony ledger + the serde-only Provenance
+   envelope/verify cluster live in `nau-core::sign`; the
+   chart-coupled attest/cosign/rotate/ledger-verification half and the
+   pgp sysupdate half stay root until their domains extract, except
+   the release-flow-only sysupdate-pgp helpers which land in
+   nau-image (pgp never enters the spine). The units payload
+   vocabulary (`classify`, `spec_from_payload_app`, `PayloadSnap/App/
+   Plug`, `RuntimeClass`) and `ResolvedSnap` move DOWN into
+   `nau-core::{units, store}`; runtime's default-path consts
+   (`DEFAULT_STATE_DIR`, `DEFAULT_EXTENSIONS_LINK_DIR`) likewise, with
+   runtime re-exporting.
 
 ## Context
 
