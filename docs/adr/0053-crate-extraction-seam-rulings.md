@@ -9,6 +9,43 @@ assets that ADR-0051 named explicitly, which is above the ticket's
 rather than a silent amendment. ADR-0052 stays reserved for the
 package-freshness design (pod lane).
 
+Amended 2026-10-01 (council, 4 seats; same day, before PR 2):
+
+1. **Gate scope (§5 extended):** all gate axes are workspace-scoped —
+   `cargo test --workspace`, `clippy --workspace --all-targets`,
+   `fmt --workspace --check` in `gate.sh` AND `devbox.json`. Plain
+   invocations at a non-virtual workspace root select the root package
+   only, which silently amputated the moved crates' ~340 unit tests
+   from every pre-amendment green run.
+2. **§4 mechanism replaced, timeline accelerated:** the nau-core
+   off-by-default `mlua` feature plan is STRUCK — under `resolver = "2"`
+   feature unification it would link mlua + the vendored Luau into
+   every crate touching the spine, defeating the spine charter and the
+   gate's own dev-edge assertion. Instead: the cross-domain-needed
+   constructors become free functions in `nau-chart` (e.g.
+   `image_declaration_from_lua`, `snap_ref_from_pin`, mirroring the
+   existing `confinement_from_lua`), so the final-PR "dissolution"
+   becomes a deletion. Deadline: before `nau-image` (PR 3) extracts;
+   earliest sensible slot is PR 2's first commit.
+3. **Second-spine down-moves pre-ratified:** `lock` (+`pinned_member`)
+   and `index` move DOWN to `nau-core` before/with PR 2 (both depend
+   only on std+serde+`nau_core::snap_types` — pure moves); `manifest`
+   follows before PR 4. `pkg_source`'s `GLOBAL_PATHS` process-global
+   gets an explicit ruling before PR 2 (down-move or chart-as-injected-
+   service) — never a silent build→chart runtime coupling.
+4. **Dep-direction enforcement grows with the graph:** the gate's
+   hand-enumerated crate list must gain a row in the SAME commit that
+   adds a crate (missing row = FAIL), and the assertion must reach CI
+   (extract `scripts/dep-direction.sh`; strict normal+build allowlist
+   vs named, expiring sanctioned dev edges).
+5. **§2 charter note:** `nau-infra` owns mechanism (modes, spinner,
+   record emission); domain record shapes (`*Json` structs) move with
+   their owning domain, not into the leaf.
+6. **ENV_LOCK:** per-crate test copies are accepted (lock serializes
+   within one test binary); copies verbatim, recover with
+   `into_inner()`, never cross-crate dev-deps for this. The final-PR
+   "dedupe" is dropped.
+
 ## Context
 
 The #326 recon (module map + dependency edges at `f4a420d`) put every
