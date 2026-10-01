@@ -156,6 +156,14 @@ jobs:
           cache-on-failure: true
           workspaces: .
 
+      # The crate walls are compiler-enforced, but the ALLOWED edges are
+      # policy: the data-driven dep-direction table (ADR-0051 R1, rows
+      # per the ADR-0053 council amendments) fails in seconds — before
+      # any build — when a workspace edge lands without a deliberate
+      # row.
+      - name: Dependency direction (ADR-0051 R1)
+        run: devbox run -- bash scripts/dep-direction.sh
+
       # Cheap format gate before the expensive build: a whitespace-only
       # PR learns about it in seconds, not after build+test+clippy.
       - name: Format check
